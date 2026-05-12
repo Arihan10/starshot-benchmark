@@ -1,26 +1,24 @@
 """Phase 1 — recursive top-down decomposition into a tree of zone Nodes.
 
 Flow per node:
-  1. ZONE PLAN (LLM) — high-level character/intent for this zone. Pure
-     planning, no structural decisions, no individual objects. Runs for
-     EVERY zone, root included; the root's plan IS the scene plan.
+  1. ZONE PLAN (LLM) — high-level character/intent for this zone AND the
+     is_atomic decision. Runs for EVERY zone, root included; the root's
+     plan IS the scene plan.
   2. (root only) Overall bounding box (LLM) — sizes the canvas to match
      the silhouette implied by the root's plan.
-  3. ZONE DECOMPOSE (LLM) — decides atomic vs subdivides; if subdivides,
-     emits each child fully structured (id, prompt, proxy_shape,
-     relationships) in one call. Subdivision and per-child anchoring
-     are codependent, so they share the same step. The
-     sibling-relationship DAG is checked for cycles; any cycle is
-     logged and accepted (advisory).
-  4. Batch-resolve a bbox for EVERY child in one LLM call.
-  5. Hand each placed child to Phase 2 generation for its encapsulating
+  3. If ATOMIC, hand to Phase 2 generation for anchor-object population.
+  4. ZONE DECOMPOSE (LLM) — only for non-atomic zones. Emits each child
+     fully structured (id, prompt, proxy_shape, relationships) in one
+     call. The sibling-relationship DAG is checked for cycles; any cycle
+     is logged and accepted (advisory).
+  5. Batch-resolve a bbox for EVERY child in one LLM call.
+  6. Hand each placed child to Phase 2 generation for its encapsulating
      geometry (walls, moat, fence, etc.) as objects.
-  6. Recurse on each child. Children arrive with `plan=None`; step 1
+  7. Recurse on each child. Children arrive with `plan=None`; step 1
      authors their plan fresh.
 
-Atomic leaves skip the recursion and are handed to Phase 2 generation for
-anchor-object population. Root gets no encapsulating pass; it does get a
-final negative-space pass at the end of the run.
+Root gets no encapsulating pass; it does get a final negative-space pass
+at the end of the run.
 """
 
 from __future__ import annotations
@@ -32,6 +30,7 @@ from app.core.prompts import (
     ChildNodeSpec,
     OverallBboxOutput,
     SYSTEM_OVERALL_BBOX,
+    SYSTEM_ROOT_ZONE_PLAN,
     SYSTEM_ZONE_BBOX_BATCH,
     SYSTEM_ZONE_DECOMPOSE,
     SYSTEM_ZONE_PLAN,
@@ -106,11 +105,12 @@ async def _plan_zone(
     zone_prompt: str,
     ancestors: list[tuple[str, str, str]],
     objects: list[tuple[str, str, str | None]],
-) -> str:
-    """Author the high-level plan for a zone. Works for any zone (root or
-    nested) — the root just passes empty ancestors. Returns the plan string."""
-    out = await llm.call_llm(
-        system=SYSTEM_ZONE_PLAN,
+) -> ZonePlanOutput:
+    """Author the high-level plan for a zone and decide whether it is atomic.
+    Works for any zone (root or nested) — the root just passes empty ancestors."""
+    system = SYSTEM_ROOT_ZONE_PLAN if not ancestors else SYSTEM_ZONE_PLAN
+    return await llm.call_llm(
+        system=system,
         user=render_zone_plan(
             zone_id=zone_id,
             zone_prompt=zone_prompt,
@@ -119,15 +119,13 @@ async def _plan_zone(
         ),
         output_schema=ZonePlanOutput,
     )
-    return out.plan
 
 
 async def _decompose_zone(
     *, node: Node, all_nodes: list[Node],
 ) -> ZoneDecomposeOutput:
-    """Decide atomic vs subdivides for an already-planned zone, and (if
-    subdividing) emit each child fully structured (id, prompt,
-    proxy_shape, relationships) in one call."""
+    """Emit child zones for a non-atomic zone. Each child is fully
+    structured (id, prompt, proxy_shape, relationships) in one call."""
     assert node.plan is not None, "zone must be planned before decomposition"
     root = all_nodes[0]
     assert root.plan is not None, "root.plan must be set before decomposition"
@@ -165,33 +163,29 @@ async def _resolve_child_bboxes_batch(
 
 async def _build(
     *, node: Node, runs_dir: Path, run_id: str, all_nodes: list[Node],
+    is_atomic: bool | None = None,
 ) -> None:
     if node.plan is None:
         logging.emit_step(node.id, "planning")
-        plan = await _plan_zone(
+        plan_out = await _plan_zone(
             zone_id=node.id,
             zone_prompt=node.prompt,
             ancestors=_ancestors(node, all_nodes),
             objects=_generated_objects(all_nodes),
         )
-        # Node is frozen; swap the planned copy into the shared registry so
-        # later steps read the plan rather than the stale pre-plan version.
-        planned = node.model_copy(update={"plan": plan})
+        planned = node.model_copy(update={"plan": plan_out.plan})
         idx = all_nodes.index(node)
         all_nodes[idx] = planned
         node = planned
-        logging.log("divider.zone_plan", node=node.id, plan=plan)
+        is_atomic = plan_out.is_atomic
+        logging.log(
+            "divider.zone_plan",
+            node=node.id, plan=plan_out.plan, is_atomic=is_atomic,
+        )
 
-    logging.emit_step(node.id, "decomposing")
-    decomp = await _decompose_zone(node=node, all_nodes=all_nodes)
-    logging.log(
-        "divider.zone_decompose",
-        node=node.id,
-        is_atomic=decomp.is_atomic,
-        children=[c.model_dump() for c in decomp.children],
-    )
+    assert is_atomic is not None, "is_atomic must be set by plan or caller"
 
-    if decomp.is_atomic:
+    if is_atomic:
         logging.emit_step(node.id, "generating_anchor")
         await generation.run(
             zone=node, runs_dir=runs_dir, run_id=run_id,
@@ -199,6 +193,14 @@ async def _build(
         )
         logging.emit_step(node.id, "done")
         return
+
+    logging.emit_step(node.id, "decomposing")
+    decomp = await _decompose_zone(node=node, all_nodes=all_nodes)
+    logging.log(
+        "divider.zone_decompose",
+        node=node.id,
+        children=[c.model_dump() for c in decomp.children],
+    )
 
     try:
         validate_sibling_relationships_acyclic(decomp.children)
@@ -252,17 +254,23 @@ async def run(
 ) -> Node:
     llm.set_model(model)
     logging.emit_step("root", "planning")
-    scene_plan = await _plan_zone(
+    plan_out = await _plan_zone(
         zone_id="root", zone_prompt=prompt, ancestors=[], objects=[],
     )
-    logging.log("divider.zone_plan", node="root", plan=scene_plan)
-    bbox = await _pick_overall_bbox(prompt, scene_plan)
+    logging.log(
+        "divider.zone_plan",
+        node="root", plan=plan_out.plan, is_atomic=plan_out.is_atomic,
+    )
+    bbox = await _pick_overall_bbox(prompt, plan_out.plan)
     logging.emit_bbox("root", bbox, parent_id=None, prompt=prompt, kind="zone")
     root = Node(
-        id="root", prompt=prompt, bbox=bbox, parent_id=None, plan=scene_plan,
+        id="root", prompt=prompt, bbox=bbox, parent_id=None, plan=plan_out.plan,
     )
     all_nodes: list[Node] = [root]
-    await _build(node=root, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes)
+    await _build(
+        node=root, runs_dir=runs_dir, run_id=run_id,
+        all_nodes=all_nodes, is_atomic=plan_out.is_atomic,
+    )
     logging.emit_step(root.id, "generating_negative_space")
     await generation.run(
         zone=root, runs_dir=runs_dir, run_id=run_id,

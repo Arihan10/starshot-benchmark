@@ -25,14 +25,14 @@ import math
 import numpy as np
 import trimesh
 
-from app.core.types import BoundingBox
+from app.core.types import BoundingBox, Orientation
 
 
 def rescale_mesh_to_bbox(
     mesh: trimesh.Trimesh | trimesh.Scene,
     bbox: BoundingBox,
     *,
-    orientation: int = 0,
+    orientation: Orientation = 0,
 ) -> trimesh.Trimesh | trimesh.Scene:
     if mesh.is_empty:
         raise ValueError("cannot rescale an empty mesh")

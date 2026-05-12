@@ -10,10 +10,13 @@ convention.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 Vec3Tuple = tuple[float, float, float]
+
+Orientation = Literal[-180, -135, -90, -45, 0, 45, 90, 135, 180]
 
 Vec3Cm = tuple[float, float, float]
 
@@ -134,13 +137,7 @@ class Node(BaseModel):
     prompt: str
     bbox: BoundingBox
     proxy_shape: ProxyShape | None = None
-    # Yaw, integer degrees, world-frame rotation about +Y. Zero = the mesh's
-    # canonical front (Trellis output's +Z) faces world +Z (toward viewer).
-    # Positive = right-handed yaw (front rotates toward world -X). Stored
-    # as a bounded int rather than free-float radians because unconstrained
-    # float schemas let some providers loop in the exponent grammar
-    # (`0.03e-30557580…`), eating the whole token budget on a single field.
-    orientation: int = 0
+    orientation: Orientation = 0
     relationships: list[Relationship] = Field(default_factory=list)
     mesh_url: str | None = None
     parent_id: str | None = None

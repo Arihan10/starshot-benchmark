@@ -148,6 +148,11 @@ def current_events() -> list[dict[str, Any]]:
     return _current.get().state["events"]
 
 
+def slot_dir() -> Path:
+    """Directory for the currently-bound slot (parent of events.jsonl)."""
+    return _current.get().events_path.parent
+
+
 def log(kind: str, **data: Any) -> None:
     _current.get().log(kind, **data)
 

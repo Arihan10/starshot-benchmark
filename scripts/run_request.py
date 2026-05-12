@@ -102,6 +102,7 @@ def main() -> int:
             "uv", "run", "uvicorn", "app.main:app",
             "--host", SERVER_HOST, "--port", str(SERVER_PORT),
             "--log-level", "info",
+            "--reload",
         ],
         cwd=SERVER_DIR,
         env=env,

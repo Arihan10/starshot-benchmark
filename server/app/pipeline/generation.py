@@ -54,7 +54,7 @@ from app.core.prompts import (
     render_object_decomp,
     wrap_image_prompt,
 )
-from app.core.types import BoundingBox, Node, ProxyShape
+from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.services import llm, threed
 from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
@@ -70,7 +70,7 @@ def _artifact_url(runs_dir: Path, path: Path) -> str:
 # shape can evolve without combing every call site.
 def _scene_view(
     nodes: list[Node],
-) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, int]]:
+) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]]:
     return [
         (n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation)
         for n in nodes
@@ -114,7 +114,7 @@ async def _decompose_objects_validated(
                 zone=zone.id, attempt=attempt, reason=reason,
                 emitted=[s.model_dump() for s in specs],
             )
-            prior_attempts.append((specs, reason))
+            raise  # TEMP: stop pipeline on first validation failure
     logging.log(
         "generation.decompose.accept_invalid",
         zone=zone.id, reason=prior_attempts[-1][1] if prior_attempts else "",
@@ -155,7 +155,7 @@ async def _next_object_validated(
                 zone=zone.id, attempt=attempt, reason=reason,
                 emitted=decision.object.model_dump(),
             )
-            prior_attempts.append((decision.object, reason))
+            raise  # TEMP: stop pipeline on first validation failure
     assert decision is not None
     logging.log(
         "generation.next.accept_invalid",

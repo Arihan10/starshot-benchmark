@@ -212,6 +212,13 @@ let treeRootId = null;
 let treeActiveId = null;
 let treeOrderCounter = 0;
 
+// Per-node visibility overrides driven from the tree. A node in this set
+// hides its own bbox/proxy/mesh; hiding a parent transitively hides every
+// descendant in the scene (computed lazily via ancestor walk). State is
+// per-run — cleared on slot switch / rewind / reset alongside the rest of
+// the tree, and not persisted.
+const hiddenIds = new Set();
+
 function treeUpsert(id, patch) {
   const cur = treeNodes.get(id);
   if (!cur) {
@@ -266,8 +273,41 @@ function treeClear() {
   treeRootId = null;
   treeActiveId = null;
   treeOrderCounter = 0;
+  hiddenIds.clear();
   treeBodyEl.innerHTML = "";
   treeActiveEl.textContent = "";
+}
+
+// True if `id` itself or any ancestor is in `hiddenIds`. The descendant
+// case is what makes hiding a zone hide everything underneath it without
+// having to mark each child individually.
+function effectivelyHidden(id) {
+  let cur = treeNodes.get(id);
+  while (cur) {
+    if (hiddenIds.has(cur.id)) return true;
+    cur = cur.parentId ? treeNodes.get(cur.parentId) : null;
+  }
+  return false;
+}
+
+function toggleNodeHidden(id) {
+  if (hiddenIds.has(id)) hiddenIds.delete(id);
+  else hiddenIds.add(id);
+  // Effective-hidden status changed for this node and (potentially) every
+  // descendant, so re-evaluate visibility for the whole subtree.
+  refreshSubtreeVisibility(id);
+  renderTree();
+}
+
+function refreshSubtreeVisibility(rootId) {
+  const stack = [rootId];
+  while (stack.length) {
+    const cur = stack.pop();
+    applyModelVisibility(cur);
+    applyBboxVisibility(cur);
+    const kids = treeChildren.get(cur) ?? [];
+    for (const k of kids) stack.push(k);
+  }
 }
 
 function truncate(s, n = 60) {
@@ -284,6 +324,7 @@ function renderTreeNode(id, ctx) {
   if (id === treeActiveId) classes.push("active");
   if (id === selectedBboxId) classes.push("selected");
   if (ctx && ctx.matches.has(id)) classes.push("matched", "match-highlight");
+  if (effectivelyHidden(id)) classes.push("vis-hidden");
   wrap.className = classes.join(" ");
   wrap.dataset.id = id;
 
@@ -294,6 +335,21 @@ function renderTreeNode(id, ctx) {
     ev.stopPropagation();
     selectTreeNode(id);
   });
+
+  // Per-node visibility toggle. Reflects only the self-hidden state — a
+  // descendant of a hidden ancestor still shows ● because its own bit is
+  // off; the row's `vis-hidden` class communicates effective state.
+  const visBtn = document.createElement("button");
+  visBtn.type = "button";
+  const selfHidden = hiddenIds.has(id);
+  visBtn.className = `tree-vis-toggle${selfHidden ? " hidden" : ""}`;
+  visBtn.textContent = selfHidden ? "○" : "●";
+  visBtn.title = selfHidden ? "Show node" : "Hide node";
+  visBtn.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    toggleNodeHidden(id);
+  });
+  row.appendChild(visBtn);
 
   const idEl = document.createElement("span");
   idEl.className = `tree-id ${node.kind}`;
@@ -501,6 +557,15 @@ const BBOX_COLOR_HOVER = 0xffe14a;
 const BBOX_COLOR_SELECTED = 0x4af0e0;
 let selectedBboxId = null;
 
+const raycaster = new THREE.Raycaster();
+const pointer = new THREE.Vector2();
+const bboxPickPoint = new THREE.Vector3();
+const bboxPickSize = new THREE.Vector3();
+let pointerDirty = false;
+let lastPointerClientX = 0;
+let lastPointerClientY = 0;
+let controlsInteracting = false;
+
 const tooltip = document.createElement("div");
 tooltip.id = "bbox-tooltip";
 tooltip.style.cssText = [
@@ -536,6 +601,13 @@ controls.update();
 let cameraUserMoved = false;
 controls.addEventListener("start", () => {
   cameraUserMoved = true;
+  controlsInteracting = true;
+  setHoveredBbox(null);
+  tooltip.style.display = "none";
+});
+controls.addEventListener("end", () => {
+  controlsInteracting = false;
+  pointerDirty = true;
 });
 
 // --- WASD fly controls (complementary to OrbitControls) --------------------
@@ -707,6 +779,18 @@ function animate() {
   const camDist = Math.max(1, camera.position.distanceTo(controls.target));
   gridMat.uniforms.uFadeStart.value = camDist * 0.5;
   gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
+
+  if (pointerDirty && !controlsInteracting) {
+    pointerDirty = false;
+    raycaster.setFromCamera(pointer, camera);
+    const hoveredId = pickHoveredBboxId();
+    setHoveredBbox(hoveredId);
+    if (hoveredId !== null) {
+      positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+    } else {
+      tooltip.style.display = "none";
+    }
+  }
 
   renderer.render(scene, camera);
 }
@@ -921,9 +1005,6 @@ function buildProxyWireframe(proxyShape, origin, dimensions) {
   return mesh;
 }
 
-const raycaster = new THREE.Raycaster();
-const pointer = new THREE.Vector2();
-
 function applyBboxColor(id) {
   const helper = id !== null ? bboxes.get(id) : null;
   if (!helper) return;
@@ -942,7 +1023,12 @@ function applyBboxColor(id) {
 }
 
 function applyBboxVisibility(id) {
-  const visible = bboxesShown || id === hoveredBboxId || id === selectedBboxId;
+  // Tree-driven hide always wins — hovering or selecting a hidden node
+  // doesn't sneak its bbox back into view.
+  const userVisible = !effectivelyHidden(id);
+  const visible =
+    userVisible &&
+    (bboxesShown || id === hoveredBboxId || id === selectedBboxId);
   const helper = bboxes.get(id);
   if (helper) helper.visible = visible;
   const proxy = proxies.get(id);
@@ -957,7 +1043,8 @@ function applyModelVisibility(id) {
   const model = modelsById.get(id);
   if (!model) return;
   const isFrame = treeNodes.get(id)?.kind === "frame";
-  model.visible = isFrame ? framesShown : true;
+  const frameOk = isFrame ? framesShown : true;
+  model.visible = frameOk && !effectivelyHidden(id);
 }
 
 function refreshAllFrameModelVisibility() {
@@ -1021,31 +1108,44 @@ function positionTooltip(clientX, clientY, text) {
   tooltip.style.display = "block";
 }
 
+function pickHoveredBboxId() {
+  let bestId = null;
+  let bestKindRank = Infinity;
+  let bestDistance = Infinity;
+  let bestSize = Infinity;
+  for (const [id, model] of modelsById) {
+    if (!model.visible) continue;
+    const helper = bboxes.get(id);
+    if (!helper) continue;
+    if (!raycaster.ray.intersectBox(helper.box, bboxPickPoint)) continue;
+
+    const kind = treeNodes.get(id)?.kind;
+    const kindRank = kind === "object" ? 0 : kind === "frame" ? 1 : 2;
+    const distance = bboxPickPoint.distanceToSquared(camera.position);
+    helper.box.getSize(bboxPickSize);
+    const sizeTieBreaker = bboxPickSize.lengthSq();
+
+    if (
+      kindRank < bestKindRank ||
+      (kindRank === bestKindRank && distance < bestDistance) ||
+      (kindRank === bestKindRank && distance === bestDistance && sizeTieBreaker < bestSize)
+    ) {
+      bestId = id;
+      bestKindRank = kindRank;
+      bestDistance = distance;
+      bestSize = sizeTieBreaker;
+    }
+  }
+  return bestId;
+}
+
 renderer.domElement.addEventListener("pointermove", (ev) => {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  // Raycast against the actual loaded meshes, not against bbox wireframes:
-  // hovering on the object reveals its bbox + name even when the bbox
-  // overlay is toggled off.
-  const hits = raycaster.intersectObject(sceneRoot, true);
-  let hoveredId = null;
-  if (hits.length > 0) {
-    let obj = hits[0].object;
-    while (obj && obj.parent && obj.parent !== sceneRoot) obj = obj.parent;
-    if (obj && obj !== sceneRoot) {
-      const name = obj.name || "";
-      const colon = name.indexOf(":");
-      if (colon > 0) hoveredId = name.slice(colon + 1);
-    }
-  }
-  setHoveredBbox(hoveredId);
-  if (hoveredId !== null) {
-    positionTooltip(ev.clientX, ev.clientY, hoveredId);
-  } else {
-    tooltip.style.display = "none";
-  }
+  lastPointerClientX = ev.clientX;
+  lastPointerClientY = ev.clientY;
+  pointerDirty = true;
 });
 
 renderer.domElement.addEventListener("pointerleave", () => {

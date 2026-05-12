@@ -349,6 +349,36 @@
                 align-items: baseline;
                 gap: 6px;
             }
+            .tree-vis-toggle {
+                flex-shrink: 0;
+                width: 14px;
+                height: 14px;
+                padding: 0;
+                margin: 0;
+                border: 1px solid #2a2d35;
+                border-radius: 2px;
+                background: #16181d;
+                color: #8bd17c;
+                font: inherit;
+                font-size: 9px;
+                line-height: 1;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+                align-self: center;
+            }
+            .tree-vis-toggle:hover {
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            .tree-vis-toggle.hidden {
+                color: #5a5e68;
+                background: #0c0d10;
+            }
+            .tree-node.vis-hidden > .tree-row > :not(.tree-vis-toggle) {
+                opacity: 0.45;
+            }
             .tree-id {
                 color: #e0c271;
                 font-weight: 600;

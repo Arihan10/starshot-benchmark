@@ -17,8 +17,8 @@ SLOTS: list[Slot] = [
     Slot("modern-house", "A modern house"),
     Slot("platformer-level", "A super mario bros type platformer level"),
     Slot("battle-arena", "A battle arena for a two player game"),
-    Slot("urban-city", "A modern, urban city"),
-    Slot("planetary-system", "A planetary system in space with an alien battle happening"),
+    Slot("urban-city", "An imperial japanese house"),
+    Slot("waterloo-campus", "University of Waterloo Campus"),
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}

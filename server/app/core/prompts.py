@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.types import BoundingBox, ProxyShape, Relationship
+from app.core.types import BoundingBox, Orientation, ProxyShape, Relationship
 
 
 # Shared proxy-shape documentation injected into every prompt that lets
@@ -144,45 +144,103 @@ is not.\
 
 class ZonePlanOutput(BaseModel):
     plan: str
+    is_atomic: bool
 
 
-SYSTEM_ZONE_PLAN = (
+SYSTEM_ROOT_ZONE_PLAN = (
     """\
-You are authoring the HIGH-LEVEL PLAN for a region of a 3D scene \
-being built for StarshotBench — a head-to-head LLM benchmark where \
-your scene is rendered and judged against another LLM's rendering of \
-the same user prompt. Judges weigh prompt fidelity, compositional \
-coherence, recognizability, detail richness, and creativity; they see \
-only the final scene, not the prompts, not the plan.
+You are authoring the SCENE PLAN for a 3D scene being built for \
+StarshotBench — a head-to-head LLM benchmark for spatial reasoning \
+where your generated 3D environment is rendered and judged against \
+another LLM's environment from the same user prompt. As a spatial \
+reasoning competition, judges weigh creativity & impressiveness, \
+compositional coherence, recognizability and plausibility. Remember, \
+they see only the final scene after the entire pipeline has run \
+through hundreds of downstream generation steps; NOT the prompts and \
+NOT the plan.
 
-Your job is to TRANSFORM the region's prompt into a vivid, \
-opinionated, concrete vision for what this region IS. The prompt is a \
-seed (e.g. "a beautiful modern mansion", "a low muddy island", "the \
-imperial box"). Your output is the AUTHORED VISION that makes the \
-seed specific, distinctive, and memorable. A vague, template-y plan \
-produces a region that reads as stock assets. A vivid, committed plan \
-propagates specificity all the way to the rendered mesh — and the \
-judges see the difference. Don't play it safe. Commit to a point of \
-view: an adequate plan calls a region "a medium muddy island"; a \
-winning plan makes it "a low hummock fringed with twisted cypress \
-roots, dominated by a lone lightning-split stump that reads as the \
-island's character from any angle".
+Your job is to TRANSFORM the user's prompt into a vivid, opinionated, \
+concrete vision for what this scene IS. The prompt is a seed \
+(e.g. "a beautiful modern mansion", "a low muddy island", "the \
+imperial box"). Your output is the AUTHORED VISION — the north-star \
+that every descendant zone inherits — that makes the seed specific, \
+distinctive, and memorable. A vague, template-y plan produces a scene \
+that reads as stock assets. A vivid, committed plan propagates \
+specificity all the way to the rendered mesh — and the judges see \
+the difference. Don't play it safe.
 
-If this region is the ROOT (the whole scene), this plan IS the SCENE \
-PLAN — the north-star that every descendant inherits. The ROOT is a \
-PURELY ABSTRACT, INTANGIBLE META-CONTAINER for the entire world — \
-it has no walls, no floor, no ceiling, no surface, no skin, and \
-never gets a frame, mesh, or geometry of its own. It is the canvas \
-inside which the actual scene (rooms, buildings, terrain, enclosures) \
-is placed as CHILD zones. If the user prompt names a single tangible \
-enclosure that needs walls/floor/ceiling (a hotel room, a throne \
-room, a garage, a cockpit), the ROOT is NOT that enclosure — the \
-enclosure is a child zone INSIDE the root, and the root's plan \
-should describe the enclosure as the singular subzone within an \
-otherwise empty world canvas. If it is a NESTED region, your plan \
-must stay consistent with the character your direct ancestors \
-committed to (shown in the inputs) and must not contradict any \
-concrete object already generated in the scene.
+You are planning the ROOT zone. The root is a PURELY ABSTRACT, \
+INTANGIBLE META-CONTAINER for the entire world — it has no walls, \
+no floor, no ceiling, no surface, no skin, and never gets a frame, \
+mesh, or geometry of its own. It is the canvas inside which the \
+actual scene (rooms, buildings, terrain, enclosures) is placed as \
+CHILD zones. If the user prompt names a single tangible enclosure \
+that needs walls/floor/ceiling (a hotel room, a throne room, a \
+garage, a cockpit), the ROOT is NOT that enclosure — the enclosure \
+is a child zone INSIDE the root, and the root's plan should describe \
+the enclosure as the singular subzone within an otherwise empty world \
+canvas.
+
+<zone_definition>
+A zone is a REGION OF THE SCENE — a subscene, an area, a place large \
+enough to contain multiple distinct objects arranged inside it (a \
+master bedroom, the left audience stand of an arena, an entire mansion, a city \
+block, etc.). It is SPATIAL — it has room inside it, and its \
+character comes from the ensemble of things that live there, not from \
+any single object. A single landmark, monument, trophy, centerpiece, \
+or hero prop — no matter how important — is an OBJECT inside a zone, \
+NOT a zone of its own.
+</zone_definition>
+
+<atomic_vs_subdivides>
+You also decide whether this zone is ATOMIC — a leaf whose content \
+is individual objects, generated later — or SUBDIVIDES into child \
+zones with their own plans. This is the single most consequential \
+structural decision in the pipeline.
+
+Over-subdivide and the scene splinters into geography without focus — \
+an island split into "north end / central mound / south end" becomes \
+three forgettable regions where there should be ONE memorable island. \
+Under-subdivide and loci of genuine interest disappear into \
+undifferentiated masses — a palace interior treated as one atomic zone becomes \
+a blob where there should be a downstairs zone with a throne room zone, a great hall, \
+a war room, etc. and an upstairs zone with multiple bedrooms, bathrooms, showers, etc.
+
+Default to ATOMIC. Subdivision is opt-in. A zone subdivides ONLY \
+when it genuinely contains TWO OR MORE distinct loci of interest, \
+each deserving its own dedicated plan and generation pass. Let your \
+plan guide the decision: if it names multiple distinct loci (a \
+mansion's house + garden + stables; a hotel room's bedroom + \
+bathroom), set is_atomic=false. If it describes a single coherent \
+place, set is_atomic=true.
+
+The root is a PURELY ABSTRACT, INTANGIBLE META-CONTAINER with no \
+walls, floor, ceiling, or geometry of its own — only child zones \
+get those. If the user prompt names a single tangible enclosure that \
+needs a frame (a hotel room, a throne room, a garage, a cockpit — \
+anything with walls/floor/ceiling), you MUST set is_atomic=false. \
+Marking the root atomic leaves the scene with no enclosure at all.
+
+If you cannot give each proposed sub-region a unique, named reason \
+to exist beyond "this is the left part" or "this is the denser \
+part", set is_atomic=true.
+
+The sharpest test: if the "thing" you would carve out is essentially \
+ONE SINGLE ARTIFACT — a statue, a monument, a throne, a fountain, \
+a hearth, a single tree — it is an OBJECT inside a zone, NOT a zone \
+of its own.
+
+A zone is NEVER: an individual object; a distribution/scatter of \
+similar items; a surface or connective medium; a band/ring/core \
+defined only by density; or NEGATIVE SPACE (the ambient medium \
+between zones — a separate pass fills this).
+
+Good: mansion grounds → house, formal garden, stables, rear orchard. \
+Good: hotel room → bathroom, bedroom. \
+Bad: swamp → open water, lilypad distribution, log debris. \
+Bad: island → north end, central mound, south end. \
+Bad: bedroom → bed area, dresser area, reading nook.
+</atomic_vs_subdivides>
 
 <what_to_write>
 ONE cohesive paragraph (no headers, no lists), roughly 5-10 \
@@ -197,11 +255,143 @@ sentences, that:
     at (a stone hearth, a central fountain, a writing desk, a lone \
     lightning-split stump). Be concrete about what makes each \
     distinctive.
-  * For the ROOT only: also suggest the OVERALL SILHOUETTE / SHAPE \
-    of the scene — tall and narrow (a skyscraper), long and flat (a \
-    river), wide and shallow (a coastal vista), roughly cubic (a \
-    room). This feeds directly into the next step, which sizes the \
-    canvas.
+  * Suggests the OVERALL SILHOUETTE / SHAPE of the scene — tall and \
+    narrow (a skyscraper), long and flat (a river), wide and shallow \
+    (a coastal vista), roughly cubic (a room). This feeds directly \
+    into the next step, which sizes the canvas.
+</what_to_write>
+
+<what_NOT_to_write>
+  * Do NOT enumerate CHILD ZONES. Do not list specific sub-regions \
+    as a planned tree ("the children are X, Y, Z") or structure the \
+    subtree. You decide is_atomic (whether this zone subdivides at \
+    all); a downstream ZONE DECOMPOSE step authors the actual \
+    children. You may describe the region as containing distinct \
+    loci of character to support your is_atomic decision.
+  * Do NOT enumerate individual OBJECTS. No "a fountain", "a chair", \
+    "a chandelier", "a single tree", "a red flag" as a list of \
+    things to place. Object selection happens later in each atomic \
+    region's generation pass — those steps need AGENCY to pick \
+    objects in service of your character. You may describe the \
+    character those objects will collectively express ("the imperial \
+    box reads as ornate and ceremonial"), but stop short of listing \
+    the props.
+  * Do NOT pick coordinates, dimensions, counts, materials by brand, \
+    or specific instances. Stay at the level of mood, palette, \
+    identity, and silhouette.
+  * Do NOT describe camera, framing, or rendering. The pipeline \
+    handles those.
+</what_NOT_to_write>
+
+<no_ephemera>
+"""
+    + NO_EPHEMERA_DOC
+    + """
+</no_ephemera>
+
+<inputs>
+  * The zone being planned: its id ('root') and the user's prompt.
+  * The GENERATED OBJECTS — every concrete (mesh-bearing) object \
+    placed anywhere in the scene so far, with its parent. These are \
+    what the scene actually LOOKS like at this point in the run; \
+    lean on them to know what is already real and to avoid \
+    contradicting them.
+  There is no ancestor chain — this IS the root.
+</inputs>
+
+Respond with ONE JSON object matching the schema. `plan` holds the \
+paragraph; `is_atomic` is true if this zone is a leaf (no child \
+zones), false if it should subdivide. No prose, no markdown, no \
+code fences.\
+"""
+)
+
+
+SYSTEM_ZONE_PLAN = (
+    """\
+You are authoring the HIGH-LEVEL PROMPT for a region of a 3D scene being built for StarshotBench — a head-to-head LLM benchmark for spatial reasoning where your generated 3D environment is rendered and judged against another LLM's environment from the same user prompt. As a spatial reasoning competition, judges weigh creativity & impressiveness, compositional coherence, recognizability and plausibility. Remember, they see only the final scene after the entire pipeline has run through hundreds of downstream generation steps; NOT the prompts and NOT the plan. 
+
+Your job is to TRANSFORM the region's prompt into a vivid, \
+opinionated, concrete vision for what this region IS. The prompt is a \
+seed (e.g. "a beautiful modern mansion", "a low muddy island", "the \
+imperial box"). Your output is the AUTHORED VISION that makes the \
+seed specific, distinctive, and memorable. A vague, template-y plan \
+produces a region that reads as stock assets. A vivid, committed plan \
+propagates specificity all the way to the rendered mesh — and the \
+judges see the difference. Don't play it safe.
+
+This is a NESTED region — your plan must stay consistent with the \
+character your direct ancestors committed to (shown in the inputs) \
+and must not contradict any concrete object already generated in the \
+scene.
+
+<zone_definition>
+A zone is a REGION OF THE SCENE — a subscene, an area, a place large \
+enough to contain multiple distinct objects arranged inside it (a \
+master bedroom, the left audience stand of an arena, an entire mansion, a city \
+block, etc.). It is SPATIAL — it has room inside it, and its \
+character comes from the ensemble of things that live there, not from \
+any single object. A single landmark, monument, trophy, centerpiece, \
+or hero prop — no matter how important — is an OBJECT inside a zone, \
+NOT a zone of its own.
+</zone_definition>
+
+<atomic_vs_subdivides>
+You also decide whether this zone is ATOMIC — a leaf whose content \
+is individual objects, generated later — or SUBDIVIDES into child \
+zones with their own plans. This is the single most consequential \
+structural decision in the pipeline.
+
+Over-subdivide and the scene splinters into geography without focus — \
+an island split into "north end / central mound / south end" becomes \
+three forgettable regions where there should be ONE memorable island. \
+Under-subdivide and loci of genuine interest disappear into \
+undifferentiated masses — a palace interior treated as one atomic zone becomes \
+a blob where there should be a downstairs zone with a throne room zone, a great hall, \
+a war room, etc. and an upstairs zone with multiple bedrooms, bathrooms, showers, etc.
+
+Default to ATOMIC. Subdivision is opt-in. A zone subdivides ONLY \
+when it genuinely contains TWO OR MORE distinct loci of interest, \
+each deserving its own dedicated plan and generation pass. Let your \
+plan guide the decision: if it names multiple distinct loci (a \
+mansion's house + garden + stables; a hotel room's bedroom + \
+bathroom), set is_atomic=false. If it describes a single coherent \
+place, set is_atomic=true.
+
+If you cannot give each proposed sub-region a unique, named reason \
+to exist beyond "this is the left part" or "this is the denser \
+part", set is_atomic=true.
+
+The sharpest test: if the "thing" you would carve out is essentially \
+ONE SINGLE ARTIFACT — a statue, a monument, a throne, a fountain, \
+a hearth, a single tree — it is an OBJECT inside a zone, NOT a zone \
+of its own.
+
+A zone is NEVER: an individual object; a distribution/scatter of \
+similar items; a surface or connective medium; a band/ring/core \
+defined only by density; or NEGATIVE SPACE (the ambient medium \
+between zones — a separate pass fills this).
+
+Good: mansion grounds → house, formal garden, stables, rear orchard. \
+Good: hotel room → bathroom, bedroom. \
+Bad: swamp → open water, lilypad distribution, log debris. \
+Bad: island → north end, central mound, south end. \
+Bad: bedroom → bed area, dresser area, reading nook.
+</atomic_vs_subdivides>
+
+<what_to_write>
+ONE cohesive paragraph (no headers, no lists), roughly 5-10 \
+sentences, that:
+  * Sets the CHARACTER — the mood, era, palette, materials, lighting \
+    feel, silhouette of this region. Commit to a point of view: is \
+    the mansion sun-bleached coastal modernism or brooding hillside \
+    concrete? Is the island lush moss-cushioned or bleached \
+    salt-crusted? The user did not pick; you do.
+  * Names the FEATURES OF INTEREST that give the region its \
+    identity — focal points, landmarks, anchors a viewer would point \
+    at (a stone hearth, a central fountain, a writing desk, a lone \
+    lightning-split stump). Be concrete about what makes each \
+    distinctive.
 </what_to_write>
 
 <what_NOT_to_write>
@@ -238,8 +428,7 @@ sentences, that:
   * The region being planned: its id and prompt.
   * The ANCESTOR CHAIN — every region above this one in the tree, \
     root first, each with its plan. The root's plan IS the SCENE \
-    PLAN. Empty for the root region (no ancestors — only the user \
-    prompt).
+    PLAN.
   * The GENERATED OBJECTS — every concrete (mesh-bearing) object \
     placed anywhere in the scene so far, with its parent. These are \
     what the scene actually LOOKS like at this point in the run; \
@@ -249,8 +438,10 @@ sentences, that:
     your context.
 </inputs>
 
-Respond with ONE JSON object matching the schema. The `plan` field \
-holds the paragraph. No prose, no markdown, no code fences.\
+Respond with ONE JSON object matching the schema. `plan` holds the \
+paragraph; `is_atomic` is true if this zone is a leaf (no child \
+zones), false if it should subdivide. No prose, no markdown, no \
+code fences.\
 """
 )
 
@@ -358,7 +549,7 @@ class ChildNodeSpec(BaseModel):
     id: str
     prompt: str
     proxy_shape: ProxyShape | None = None
-    relationships: list[Relationship] = Field(default_factory=list)
+    relationships: list[Relationship]
 
     @field_validator("proxy_shape", mode="before")
     @classmethod
@@ -371,166 +562,57 @@ class ChildNodeSpec(BaseModel):
 
 
 class ZoneDecomposeOutput(BaseModel):
-    is_atomic: bool
-    children: list[ChildNodeSpec] = Field(default_factory=list)
+    children: list[ChildNodeSpec]
 
 
 SYSTEM_ZONE_DECOMPOSE = (
     """\
-You are deciding the STRUCTURE of a zone in a 3D scene built for \
-StarshotBench. The zone's HIGH-LEVEL PLAN was already authored by the \
-upstream ZONE PLAN step and is shown to you in the inputs as the ZONE \
-PLAN. Your job: decide whether this zone is ATOMIC (a leaf — its \
-next level of detail is individual anchor objects, materialized later \
-by the generation pipeline) or SUBDIVIDES into child zones, and if it \
-subdivides, emit each child fully structured — `id`, `prompt`, \
+You are deciding the STRUCTURE of a zone in a 3D scene being built for \
+StarshotBench — a head-to-head LLM benchmark for spatial reasoning where your \
+generated 3D environment is rendered and judged against another LLM's environment from \
+the same user prompt. As a spatial reasoning competition, judges weigh creativity \
+& impressiveness, compositional coherence, recognizability, detail richness, and \
+plausibility. Remember, they see only the final scene; not the prompts, not the plan. 
+
+The zone's HIGH-LEVEL PLAN was already authored by an \
+upstream step and is shown to you in the inputs as the ZONE \
+PLAN. Specifically, it was decided that this zone should decompose into further zones. \
+
+Your job: Based on the HIGH-LEVEL PLAN for this zone, create its STRUCTURE by describing \
+all of the sub-zones that exist within it. You are taking an idea and fleshing out the \
+structure and details from it.
+
+Emit each child created in the zone fully structured — `id`, `prompt`, \
 optional `proxy_shape`, and the `relationships` that anchor it inside \
 the parent. Subdivision and per-child structure are codependent (you \
 cannot anchor children you have not committed to, and you cannot \
 commit to children without imagining their layout), so they belong \
 in the same step.
 
-You do NOT (re-)author the zone's plan and do NOT author each child's \
-full plan. Each child's high-level plan is authored later, by the \
-child's own ZONE PLAN step when the pipeline recurses into it. You \
-also do NOT pick concrete bbox coordinates or dimensions — a \
+You do NOT author each child's full, fleshed out plan. Each child's detailed plan \
+is authored later, by the child's own ZONE PLAN step when the pipeline \
+recurses into it. You also do NOT pick concrete bbox coordinates or dimensions — a \
 downstream batch step resolves each child's bbox from its \
 relationships and prompt.
 
 <zone_definition>
 A zone is a REGION OF THE SCENE — a subscene, an area, a place large \
-enough to contain multiple distinct objects arranged inside it (a \
+enough to contain multiple distinct objects arranged inside it (e.g a \
 master bedroom, the left audience stand of an arena, the formal front \
 garden of a mansion). It is SPATIAL — it has room inside it, and its \
 character comes from the ensemble of things that live there, not from \
 any single object. A single landmark, monument, trophy, centerpiece, \
 or hero prop — no matter how important — is an OBJECT inside a zone, \
-NOT a zone of its own.
+NOT a zone of its own. Zones often contain other zones within them, and these zones can have different structures - e.g the bottom floor of a massive palace might contain a \
+war zone and a living zone, where the war zone then further decomposes into a set of war rooms, armory rooms and a fighting arena, and the living zone decomposes into the \
+great hall, throne room, the front entrance, the king and queen's chambers, a garden, \
+etc. Or, the entire bottom floor zone might decompose directly into a set of zones \
+for the grand entrance, inner courtyard, great hall, trophy gallery, king and \
+queen's chambers, throne room and bathrooms (as individual zones).
+
+Zones are designed realistically, based on the given input, intended creative direction \
+and amount of world space available to define them within.
 </zone_definition>
-
-<atomic_vs_subdivides>
-This is the single most consequential structural decision in the \
-pipeline. You are answering: which regions of this zone deserve their \
-own dedicated plan and generation pass, and which melt into ambient \
-background?
-
-Over-subdivide and the scene splinters into geography without focus — \
-an island split into "north end / central mound / south end" becomes \
-three forgettable regions where there should be ONE memorable island. \
-Judges see a scene that has no place to look.
-
-Under-subdivide and loci of genuine interest disappear into \
-undifferentiated masses — a palace treated as one atomic zone becomes \
-a blob where there should be a throne room, a great hall, and a \
-garden. Judges see a scene that's all exterior, no authored spaces.
-
-Default to ATOMIC. Subdivision is opt-in. A zone subdivides ONLY \
-when it genuinely contains TWO OR MORE distinct loci of interest, \
-each deserving its own dedicated plan and focus. The ZONE PLAN above \
-is your primary signal: if it implies multiple distinct loci (a \
-mansion's house + garden + stables; a hotel room's bedroom + \
-bathroom), subdivide. If it implies a single coherent place, mark it \
-atomic.
-
-ROOT EXCEPTION — the ROOT zone (no ancestors) is a PURELY ABSTRACT, \
-INTANGIBLE META-CONTAINER for the whole world. It has no walls, \
-floor, ceiling, or geometry of its own and never receives a frame \
-pass — only NON-root child zones get walls/floor/ceiling. Therefore \
-if the user prompt names a single tangible enclosure that needs a \
-frame (a hotel room, a throne room, a chapel, a garage, a cockpit, \
-a shipping container, a jail cell — anything with walls/floor/ceiling \
-or an explicit shell), the ROOT MUST SUBDIVIDE into at least one \
-child zone that IS that enclosure. Marking such a root atomic is \
-WRONG — it leaves the scene with no walls/floor/ceiling at all, \
-because the root never gets a frame. In this single-enclosure case, \
-emit one subzone whose prompt names the enclosure (e.g. "the hotel \
-room interior — its walls, floor, ceiling, and the volume they \
-contain"); that single child becomes a legitimate atomic zone of \
-its own when ZONE DECOMPOSE recurses into it. A root with multiple \
-distinct loci subdivides the normal way (mansion → house + garden + \
-stables). If you cannot give each proposed child a unique, named \
-reason to exist beyond "this is the left part of the parent" or \
-"this is the denser part of the parent", STOP — emit is_atomic=true \
-with children=[].
-
-The sharpest test: if the "thing" you would carve out is essentially \
-ONE SINGLE ARTIFACT — a statue, a monument, an obelisk, a trophy, a \
-throne, a fountain, a hearth, a chandelier, a single tree, a single \
-vehicle — it is an OBJECT that lives INSIDE some zone, NOT a zone of \
-its own. This is true even when the artifact is the most important, \
-most visually prominent thing in its area. An arena's trophy obelisk \
-is an anchor object of the imperial-box zone, not its own zone. A \
-palace's throne is an anchor object of the throne-room zone, not its \
-own zone. The focal landmark always belongs to the surrounding \
-region; it does not replace it.
-
-A zone is NEVER any of the following:
-  * An individual OBJECT — furniture, a flag, a prop, a single tree, \
-    a statue, a monument, a fountain, any single artifact. Objects \
-    are materialized later by the generation pipeline that fills \
-    atomic zones with generated meshes; they do NOT get their own \
-    zone no matter how prominent they are.
-  * A DISTRIBUTION, scatter, field, cover, crowd, or dressing layer \
-    of similar items — lilypad clusters, grass patches, floating \
-    debris, a crowd of people, a star field, a patch of flowers. \
-    These are populations of instanced objects and live INSIDE an \
-    atomic zone as individual objects, not as a subtree of zones.
-  * A SURFACE or connective medium — the water skin of a pond, the \
-    floor of a plaza, the sky, the asphalt of a street, a patch of \
-    mist, a bank of fog, a cloud layer. Same rule: not a zone — and \
-    gaseous/atmospheric media in particular are NEVER scene content \
-    (see NO EPHEMERA below).
-  * A BAND, RING, CORE, FRINGE, or REGION of something homogeneous, \
-    defined only by density or proximity — dense core vs. sparse \
-    edge, inner ring vs. outer ring, north half vs. south half. \
-    Homogeneous content does not split into zones.
-  * NEGATIVE SPACE — the ambient, connective, interstitial medium \
-    BETWEEN the zones of interest: the swamp water expanse sprawling \
-    between islands, the open sky around a cluster of towers, the \
-    grassy meadow filling the gaps between named landmarks, the \
-    ocean between ships. Negative space is whatever remains once the \
-    loci of interest are carved out. Do NOT emit it as a child zone. \
-    A separate negative-space pass at the end of the pipeline \
-    enumerates the ambient content that fills it. If you find \
-    yourself reaching for a child whose prompt is "the water", "the \
-    sky", "the space between", or "the expanse", you are describing \
-    negative space — leave it out.
-
-    EXCEPTION: a named feature located WITHIN what would otherwise \
-    be negative space IS a zone ONLY IF it is itself a small region \
-    with multiple distinct objects inside it — a named whirlpool \
-    with its debris ring, a shipwreck with its scattered cargo and \
-    spars, a village of stilt huts in open swamp. A SINGLE drifting \
-    artifact (a lone hot-air balloon, a single buoy, one tethered \
-    lantern) is NOT a zone — it is a negative-space OBJECT picked up \
-    by the negative-space pass.
-
-Good subdivision — a mansion's grounds → the house, the formal \
-front garden, the stables, the rear orchard. Four distinct places, \
-four distinct characters.
-Good subdivision — a hotel room → bathroom, bedroom. Two rooms with \
-different functions and fixtures.
-Good subdivision — a battle arena → left audience stand, right \
-audience stand, rear audience stand, imperial box. Four distinct \
-seating regions with different characters. The trophy obelisk in \
-front of the imperial box is NOT a fifth zone — it is an anchor \
-object of the imperial-box zone.
-Bad subdivision — a swamp → open water, lilypad distribution, log \
-debris. The swamp-water expanse is NEGATIVE SPACE; the lilypad and \
-log scatters are populations of instanced objects.
-Bad subdivision — an island → north end, central mound, south end. \
-Pure geographic slicing with no distinct intent per piece.
-Bad subdivision — a bedroom → bed area, dresser area, reading nook. \
-Micro-regions of a single room — the bed, dresser, and chair are \
-anchor OBJECTS inside the room, not sub-zones.
-Bad subdivision — an arena → audience stands, imperial box, trophy \
-obelisk. The first two are regions; the trophy obelisk is a single \
-artifact and must live as an anchor object inside the imperial-box \
-zone.
-Bad subdivision — a lilypad colony → dense core, transitional apron, \
-frayed fringe. Density bands of a homogeneous scatter — always \
-atomic.
-</atomic_vs_subdivides>
 
 <inputs>
   * The zone being decomposed: its id (PARENT_ID), prompt, and \
@@ -552,16 +634,11 @@ atomic.
 </inputs>
 
 <output>
-Emit a single ZoneDecomposeOutput with two fields:
+Emit a single ZoneDecomposeOutput:
 
-  * `is_atomic` — bool. True iff this zone is a LEAF (no child \
-    zones); its next level of detail is individual anchor objects, \
-    materialized later by the generation pipeline. Most zones end \
-    up atomic.
-
-  * `children` — list of ChildNodeSpec. EMPTY when is_atomic=true. \
-    REQUIRED when is_atomic=false: at least two children (or \
-    exactly one for the ROOT EXCEPTION case). Each ChildNodeSpec has:
+  * `children` — list of ChildNodeSpec. At least two children (or \
+    exactly one when the root names a single tangible enclosure). \
+    Each ChildNodeSpec has:
       - `id` — unique within the whole scene (do not collide with \
         any existing id, including the ancestor chain or generated \
         objects).
@@ -662,10 +739,9 @@ def render_zone_decompose(
         f"{prior_block}\n\n"
         f"Generated objects placed so far:\n{obj_block}\n\n"
         f"{zone_block}\n\n"
-        "Decide whether this zone is atomic or subdivides. If it "
-        "subdivides, emit one ChildNodeSpec per child — id, prompt, "
-        "optional proxy_shape, and the relationships that anchor it "
-        "inside the parent."
+        "This zone has been determined to subdivide. Emit one "
+        "ChildNodeSpec per child — id, prompt, optional proxy_shape, "
+        "and the relationships that anchor it inside the parent."
     )
 
 
@@ -778,14 +854,7 @@ class ObjectSpec(ChildNodeSpec):
     """A single object in a zone. Inherits id/prompt/relationships."""
 
     parent: str
-    # Yaw, integer degrees, world-frame rotation about +Y. 0 = front faces
-    # world +Z (toward viewer); 90 = front faces world -X (rotated
-    # right-hand). The mesh comes back from Trellis with its intrinsic
-    # front along +Z; this field rotates it into the world pose the LLM
-    # intends. Bounded `[-180, 180]` so the JSON Schema integer grammar
-    # caps tokens — a free-float field lets some providers loop forever
-    # in the exponent (`e-3055758…`) and torch the response.
-    orientation: int = Field(default=0, ge=-180, le=180)
+    orientation: Orientation = 0
 
 
 class ObjectDecompOutput(BaseModel):
@@ -795,14 +864,15 @@ class ObjectDecompOutput(BaseModel):
 SYSTEM_OBJECT_DECOMP = (
     """\
 You are enumerating the OBJECTS that populate a 3D scene zone inside \
-StarshotBench — a head-to-head competitive benchmark where your scene \
-will be rendered and judged against another LLM's rendering of the \
+StarshotBench — a head-to-head competitive benchmark for 3D spartial reasoning \
+where your scene will be rendered and judged against another LLM's rendering of the \
 same user prompt.
 
-The object list you produce here is WHAT THE JUDGES ACTUALLY SEE. \
+The final spatial and aesthetic output of the scene you produce here \
+is WHAT THE JUDGES ACTUALLY SEE. \
 Zones and plans are scaffolding; objects are the scene. Thoughtful \
 anchor choices make a zone unmistakably, immediately recognizable as \
-its subject — a meeting room's long conference table and screen on \
+its subject — a meeting room's long conference table, chairs and screen on \
 the end wall; a castle throne room's raised dais, carved chair, and \
 flanking banners; an island's lone lightning-split stump, knotted \
 roots at the waterline, and the red objective flag planted at its \
@@ -818,6 +888,8 @@ wall-mounted 75-inch display, a whiteboard, a water pitcher on a \
 tray at one end". Specificity propagates all the way to the rendered \
 mesh — the image model, the 3D model, and the final render are \
 directly downstream of the words you write.
+
+Remember to give each zone a story, and make it as impressive as possible.
 
 Three modes are available — ANCHOR, ENCAPSULATING, NEGATIVE-SPACE. \
 Read the MODE header carefully; each has its own purpose and its own \
@@ -892,7 +964,7 @@ You operate in one of three MODES:
 
 <inputs>
 You are given the CURRENT SCENE — every node already placed anywhere in \
-the run so far, with id, prompt, bbox, and parent. Reason about it \
+the run so far, with id, prompt, bbox, and parent. Reason about it thoroughly \
 before emitting.
 </inputs>
 
@@ -925,26 +997,21 @@ For each object, emit:
     resting on the actual dome. Omit for architectural shells (walls, \
     floors, ceilings, fences) and any object whose bbox is already a \
     good silhouette.
-  * `orientation` — REQUIRED INTEGER DEGREES in [-180, 180] (default 0). \
-    MUST be a small whole number like `0`, `90`, `-90`, `180`, `45`. \
-    DO NOT emit a float, scientific notation, fractional value, or any \
-    number outside [-180, 180]; values outside this range are rejected. \
-    World-frame yaw about +Y for the generated mesh. The image-to-3D \
-    model receives an ORTHOGRAPHIC FRONT VIEW of the object, so its \
-    mesh comes back with the visible front face along world +Z. \
-    `orientation` is the additional rotation needed to point the \
-    object's "front" the right way in the world. Right-handed about +Y: \
-    `0` keeps the front facing +Z (the viewer); `90` rotates the front \
-    to face -X; `180` (or `-180`) faces -Z (away); `-90` faces +X. \
-    Examples: a sofa whose seat opens toward the room centre needs \
-    orientation set so its front (the seat side) faces the room's \
-    interior, not the wall. A door in a wall on the +X face of a room \
-    needs orientation `-90` so the door faces +X. The bbox stays an \
-    AABB regardless — orientation only rotates the mesh inside it, so \
-    a long object's bbox dimensions must match its long axis AFTER \
-    rotation. Omit (or set 0) for symmetric objects with no preferred \
-    facing (boulders, balls, columns, generic terrain).
-  * `relationships` — how this object is anchored spatially. EVERY object \
+  * `orientation` — world-frame yaw about +Y in degrees. MUST be one of \
+    the allowed values: -180, -135, -90, -45, 0, 45, 90, 135, 180. \
+    The image-to-3D model receives an ORTHOGRAPHIC FRONT VIEW of the \
+    object, so its mesh comes back with the visible front face along \
+    world +Z. `orientation` rotates the mesh into the intended world \
+    pose. Right-handed about +Y: `0` = front faces +Z (toward viewer); \
+    `90` = front faces -X; `180` = front faces -Z (away); `-90` = \
+    front faces +X. Examples: a sofa whose seat opens toward the room \
+    centre needs orientation set so its front faces the room interior, \
+    not the wall. A door in a wall on the +X face of a room needs \
+    `-90` so the door faces +X. The bbox stays an AABB — orientation \
+    only rotates the mesh inside it, so a long object's bbox dimensions \
+    must match its long axis AFTER rotation. Use 0 for symmetric \
+    objects with no preferred facing.
+  * `relationships` — how this object is anchored in the scene spatially. EVERY object \
     is REQUIRED to include at least one relationship whose `target` is \
     EXACTLY EQUAL to that same object's `parent` field. This is the \
     primary anchor, it is NOT optional, and any object that lacks it is \
@@ -953,6 +1020,7 @@ For each object, emit:
     whose `parent` is the zone id must list the zone id as the target of \
     at least one of its relationships. Additional relationships may \
     target sibling objects (i.e. other objects listed in this call).
+    
 
 A Relationship has:
   * `target` — the parent (zone or another object in this list) or a \
@@ -962,6 +1030,16 @@ A Relationship has:
     front view (+X right, +Y up, +Z front). One of: TOP_LEFT_FRONT, \
     TOP_LEFT_BACK, TOP_RIGHT_FRONT, TOP_RIGHT_BACK, BOTTOM_LEFT_FRONT, \
     BOTTOM_LEFT_BACK, BOTTOM_RIGHT_FRONT, BOTTOM_RIGHT_BACK.
+
+Besides the choice of objects themselves and their aesthetic, the SPATIAL \
+RELATIONSHIPS and COHERENCE of the scene is the most important part of the benchmark. \
+Always reason thoroughly about all the spatial relationships each object has \
+with the other objects in the scene, and generate EACH ONE as a distinct \
+relationship. This will be used singularly to determine the POSITION of each \
+object within the scene.
+
+REMINDER: EVERY object must have a RELATIONSHIP that refers DIRECTLY TO ITS PARENT \
+and the spatial anchoring between them as an explicit relationship object, IN ADDITION to the parent field itself. 
 
 The parent graph across listed objects must form a DAG (no cycles). Do \
 NOT pick concrete coordinates here — a downstream step resolves each \
@@ -980,7 +1058,9 @@ object's bbox.
     + """
 </no_ephemera>
 
-Respond with ONE JSON object matching the schema. No prose, no markdown, no code fences.\
+ALWAYS think deeply before responding.
+
+Respond with ONLY ONE JSON object matching the schema. No prose, no markdown, no code fences.\
 """
 )
 
@@ -991,7 +1071,7 @@ def render_object_decomp(
     zone_prompt: str,
     zone_bbox: BoundingBox,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
-    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, int]],
+    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
     mode = {
@@ -1136,7 +1216,7 @@ def render_object_bbox_batch(
     zone_prompt: str,
     zone_bbox: BoundingBox,
     objects: list[ObjectSpec],
-    peers: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, int]],
+    peers: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
 ) -> str:
     peer_lines = (
         "\n".join(
@@ -1212,17 +1292,14 @@ legibility or character. Same rules as the bulk decomposition step:
   * `parent` — either this zone's id, or the id of ANY already-placed \
     node in the scene (typically an object already placed in THIS \
     zone, like a cup on a previously-placed desk).
-  * `orientation` — REQUIRED INTEGER DEGREES in [-180, 180] (default 0). \
-    MUST be a small whole number like `0`, `90`, `-90`, `180`, `45`. \
-    DO NOT emit a float, scientific notation, fractional value, or any \
-    number outside [-180, 180]; values outside this range are rejected. \
-    World-frame yaw about +Y. The mesh comes back from the image-to-3D \
-    model with its visible front along world +Z; orientation rotates \
-    it into the pose you intend. `0` = front faces +Z (toward viewer), \
-    `90` = front faces -X, `180` = front faces -Z (away), `-90` = \
-    front faces +X. Pick a non-zero value when the object has a clear \
-    "front" that should face a specific direction in the scene; leave \
-    0 for symmetric objects.
+  * `orientation` — world-frame yaw about +Y in degrees. MUST be one of: \
+    -180, -135, -90, -45, 0, 45, 90, 135, 180. The mesh comes back \
+    with its front along world +Z; orientation rotates it into the \
+    pose you intend. `0` = front faces +Z (toward viewer), `90` = \
+    front faces -X, `180` = front faces -Z (away), `-90` = front \
+    faces +X. Pick a non-zero value when the object has a clear \
+    "front" that should face a specific direction; use 0 for symmetric \
+    objects.
   * `relationships` — REQUIRED to include at least one relationship \
     whose `target` is EXACTLY EQUAL to this emitted object's `parent` \
     field. This is the primary anchor, it is NOT optional, and any \
@@ -1397,7 +1474,7 @@ def render_next_object(
     zone_id: str,
     zone_prompt: str,
     zone_bbox: BoundingBox,
-    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, int]],
+    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
     prior_attempts: list[tuple[ObjectSpec, str]] | None = None,
 ) -> str:
     scene_lines = (

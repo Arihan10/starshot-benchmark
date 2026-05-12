@@ -12,12 +12,15 @@ import asyncio
 import json
 import os
 import sys
+from pathlib import Path
 
 from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError
 from pydantic import BaseModel, ValidationError
 
 from app.utils import cache, logging
+
+_call_seq: dict[str, int] = {}
 
 # Lift Python 3.11+'s 4300-digit ceiling on int<->str conversion.
 # When an LLM hallucinates a runaway numeric literal into a structured-
@@ -147,6 +150,8 @@ def _normalize_schema(schema: object) -> object:
         schema. Anthropic rejects `prefixItems` outright. We assume
         homogeneous tuples (all our tuples are `Vec3` of floats); the
         first prefix item is reused as `items`.
+      * Inject `additionalProperties: false` on every object node —
+        OpenAI strict mode requires it; Anthropic accepts it.
 
     Pydantic still enforces the original constraints on the parsed
     response, so loosening the wire schema is safe."""
@@ -160,6 +165,8 @@ def _normalize_schema(schema: object) -> object:
                     out["items"] = _normalize_schema(v[0])
                 continue
             out[k] = _normalize_schema(v)
+        if out.get("type") == "object" and "properties" in out:
+            out["additionalProperties"] = False
         return out
     if isinstance(schema, list):
         return [_normalize_schema(v) for v in schema]
