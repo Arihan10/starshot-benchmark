@@ -380,8 +380,8 @@ Bad: bedroom → bed area, dresser area, reading nook.
 </atomic_vs_subdivides>
 
 <what_to_write>
-ONE cohesive paragraph (no headers, no lists), roughly 5-10 \
-sentences, that:
+  * ONE cohesive paragraph (no headers, no lists), roughly 5-10 \
+  sentences, that:
   * Sets the CHARACTER — the mood, era, palette, materials, lighting \
     feel, silhouette of this region. Commit to a point of view: is \
     the mansion sun-bleached coastal modernism or brooding hillside \
@@ -437,6 +437,10 @@ sentences, that:
     are NOT shown — only ancestors and concrete objects flow into \
     your context.
 </inputs>
+
+<what_to_think>
+Decide the concrete vision for this zone should be within the context of the broader given scene, and based on that, whether it should subdivide 
+</what_to_think>
 
 Respond with ONE JSON object matching the schema. `plan` holds the \
 paragraph; `is_atomic` is true if this zone is a leaf (no child \
