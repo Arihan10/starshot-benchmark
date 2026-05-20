@@ -57,7 +57,13 @@ class SlotLog:
                 line = line.strip()
                 if not line:
                     continue
-                event = json.loads(line)
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    _console.print(
+                        f"[dim]\\[{self.slot_id}][/dim] [red]skipping malformed line in {self.events_path}[/red]"
+                    )
+                    continue
                 self.state["events"].append(event)
                 if event.get("kind") == "run.start" and self.state["prompt"] is None:
                     self.state["prompt"] = event.get("prompt")

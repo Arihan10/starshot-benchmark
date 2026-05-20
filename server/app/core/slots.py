@@ -23,4 +23,4 @@ SLOTS: list[Slot] = [
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
 
-DEFAULT_MODEL = "anthropic/claude-opus-4.7"
+DEFAULT_MODEL = "anthropic/claude-opus-4.6"

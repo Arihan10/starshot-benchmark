@@ -15,6 +15,7 @@ const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
 const slotsEl = document.getElementById("slots");
 const resetEl = document.getElementById("slot-reset");
+const resumeEl = document.getElementById("slot-resume");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
 const exportGlbEl = document.getElementById("export-glb");
@@ -1229,6 +1230,7 @@ function dispatch(event) {
 let currentSource = null;
 let currentSlotId = null;
 let slotSummaries = [];  // latest /slots payload, for tab rendering
+let slotNeedsResume = false;
 
 function renderSlotTabs() {
   // Wipe any existing .slot-tab children; keep the #slot-reset button.
@@ -1255,12 +1257,34 @@ function renderSlotTabs() {
   }
 }
 
+function updateResumeButton() {
+  const slot = slotSummaries.find((s) => s.id === currentSlotId);
+  const status = slot?.status;
+  resumeEl.className = "";
+  resumeEl.style.display = "none";
+  if (status === "paused") {
+    resumeEl.style.display = "";
+    resumeEl.className = "paused";
+    resumeEl.textContent = "resume";
+    resumeEl.title = "Resume the interrupted run";
+  } else if (status === "error") {
+    resumeEl.style.display = "";
+    resumeEl.className = "error";
+    resumeEl.textContent = "retry";
+    resumeEl.title = "Retry the failed run";
+  } else if (slotNeedsResume && currentSlotId !== null) {
+    slotNeedsResume = false;
+    subscribe(slotEventsUrl(currentSlotId));
+  }
+}
+
 async function refreshSlots() {
   try {
     const res = await fetch(new URL("/slots", SERVER_URL));
     if (!res.ok) return;
     slotSummaries = await res.json();
     renderSlotTabs();
+    updateResumeButton();
   } catch {
     // Transient; next tick will retry.
   }
@@ -1279,9 +1303,18 @@ function switchSlot(id) {
   highestEventIndex = -1;
   currentSlotId = id;
   try { localStorage.setItem(SLOT_STORAGE_KEY, id); } catch {}
+
+  const slot = slotSummaries.find((s) => s.id === id);
+  const status = slot?.status;
+  slotNeedsResume = status === "paused" || status === "error";
   renderSlotTabs();
-  setStatus(`slot :: ${id}`);
-  subscribe(slotEventsUrl(id));
+  updateResumeButton();
+  if (slotNeedsResume) {
+    setStatus(`slot :: ${id} — ${status}`);
+  } else {
+    setStatus(`slot :: ${id}`);
+    subscribe(slotEventsUrl(id));
+  }
 }
 
 function slotEventsUrl(id) {
@@ -1312,6 +1345,7 @@ async function resetSlot(id) {
     clearAssets();
     treeClear();
     highestEventIndex = -1;
+    slotNeedsResume = false;
     setStatus(`slot ${id} reset — streaming events…`);
     subscribe(slotEventsUrl(id));
     refreshSlots();
@@ -1374,6 +1408,7 @@ async function rewindTo(index) {
     setStatus(`HTTP ${res.status}: ${await res.text()}`, "err");
     return;
   }
+  slotNeedsResume = false;
   setStatus(`rewound to ${index} — streaming events…`);
   subscribe(slotEventsUrl(currentSlotId));
   refreshSlots();
@@ -1381,6 +1416,41 @@ async function rewindTo(index) {
 
 resetEl.addEventListener("click", () => {
   if (currentSlotId !== null) resetSlot(currentSlotId);
+});
+
+async function resumeSlot(id) {
+  resumeEl.disabled = true;
+  try {
+    const res = await fetch(
+      new URL(`/slots/${encodeURIComponent(id)}/resume`, SERVER_URL),
+      { method: "POST" },
+    );
+    if (!res.ok) {
+      setStatus(`resume failed: HTTP ${res.status}`, "err");
+      return;
+    }
+    slotNeedsResume = false;
+    if (currentSource) {
+      currentSource.close();
+      currentSource = null;
+    }
+    clearScene();
+    clearLog();
+    clearAssets();
+    treeClear();
+    highestEventIndex = -1;
+    setStatus(`resumed — streaming events…`);
+    subscribe(slotEventsUrl(id));
+    refreshSlots();
+  } catch (e) {
+    setStatus(`resume failed: ${e.message}`, "err");
+  } finally {
+    resumeEl.disabled = false;
+  }
+}
+
+resumeEl.addEventListener("click", () => {
+  if (currentSlotId !== null) resumeSlot(currentSlotId);
 });
 
 document.getElementById("zoom-in").addEventListener("click", () => _dolly(0.8));

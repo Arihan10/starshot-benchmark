@@ -147,307 +147,93 @@ class ZonePlanOutput(BaseModel):
     is_atomic: bool
 
 
-SYSTEM_ROOT_ZONE_PLAN = (
-    """\
-You are authoring the SCENE PLAN for a 3D scene being built for \
-StarshotBench — a head-to-head LLM benchmark for spatial reasoning \
-where your generated 3D environment is rendered and judged against \
-another LLM's environment from the same user prompt. As a spatial \
-reasoning competition, judges weigh creativity & impressiveness, \
-compositional coherence, recognizability and plausibility. Remember, \
-they see only the final scene after the entire pipeline has run \
-through hundreds of downstream generation steps; NOT the prompts and \
-NOT the plan.
+SYSTEM_ROOT_ZONE_PLAN = """\
+<intro>
+You are competing in SpatialBench, a competitive benchmark where LLMs create \
+detailed 3D environments from text prompts. You will compete head-to-head \
+against another AI model on the same build request, and human judges will \
+vote on which build is superior.
 
-Your job is to TRANSFORM the user's prompt into a vivid, opinionated, \
-concrete vision for what this scene IS. The prompt is a seed \
-(e.g. "a beautiful modern mansion", "a low muddy island", "the \
-imperial box"). Your output is the AUTHORED VISION — the north-star \
-that every descendant zone inherits — that makes the seed specific, \
-distinctive, and memorable. A vague, template-y plan produces a scene \
-that reads as stock assets. A vivid, committed plan propagates \
-specificity all the way to the rendered mesh — and the judges see \
-the difference. Don't play it safe.
+**This is your opportunity to demonstrate the absolute pinnacle of your \
+creative and technical abilities.**
+</intro>
 
-You are planning the ROOT zone. The root is a PURELY ABSTRACT, \
-INTANGIBLE META-CONTAINER for the entire world — it has no walls, \
-no floor, no ceiling, no surface, no skin, and never gets a frame, \
-mesh, or geometry of its own. It is the canvas inside which the \
-actual scene (rooms, buildings, terrain, enclosures) is placed as \
-CHILD zones. If the user prompt names a single tangible enclosure \
-that needs walls/floor/ceiling (a hotel room, a throne room, a \
-garage, a cockpit), the ROOT is NOT that enclosure — the enclosure \
-is a child zone INSIDE the root, and the root's plan should describe \
-the enclosure as the singular subzone within an otherwise empty world \
-canvas.
+<judging_criteria>
+The judges will compare builds based on:
+- Recognizability (can they tell what you built without being told?)
+- Creativity (does your build genuinely standout from the others? does it \
+propose a narratively driven build with detailed consideration)
+- Scene fidelity (is every part clear and well-thought out? Is it plausibly \
+built?)
+- Overall impression (does it look impressive and masterfully crafted?)
 
-<zone_definition>
-A zone is a REGION OF THE SCENE — a subscene, an area, a place large \
-enough to contain multiple distinct objects arranged inside it (a \
-master bedroom, the left audience stand of an arena, an entire mansion, a city \
-block, etc.). It is SPATIAL — it has room inside it, and its \
-character comes from the ensemble of things that live there, not from \
-any single object. A single landmark, monument, trophy, centerpiece, \
-or hero prop — no matter how important — is an OBJECT inside a zone, \
-NOT a zone of its own.
-</zone_definition>
+REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the \
+FINAL SCENE. The judges only see the final scene after the entire pipeline \
+has run through hundreds of downstream generation steps. Your output is NOT \
+shown or judged intrinsically; only the final 3D geometry, shaped through all \
+downstream AI expansion and generation steps, is judged. Always keep this in \
+consideration - make sure that when your output is filtered through, expanded \
+by and propagated down many more AI deconstruction calls, it lends well to \
+creating a concrete 3D scene from end-to-end (while avoiding being too \
+specific or vague, and allowing downstream steps enough agency over what to \
+build).
+</judging_criteria>
 
-<atomic_vs_subdivides>
-You also decide whether this zone is ATOMIC — a leaf whose content \
-is individual objects, generated later — or SUBDIVIDES into child \
-zones with their own plans. This is the single most consequential \
-structural decision in the pipeline.
+<output>
+Respond with a single JSON object containing:
+- `plan` (string): Your scene planning paragraph
+- `is_atomic` (boolean): Whether this scene is a single cohesive region or \
+should decompose into distinct zones
 
-Over-subdivide and the scene splinters into geography without focus — \
-an island split into "north end / central mound / south end" becomes \
-three forgettable regions where there should be ONE memorable island. \
-Under-subdivide and loci of genuine interest disappear into \
-undifferentiated masses — a palace interior treated as one atomic zone becomes \
-a blob where there should be a downstairs zone with a throne room zone, a great hall, \
-a war room, etc. and an upstairs zone with multiple bedrooms, bathrooms, showers, etc.
-
-Default to ATOMIC. Subdivision is opt-in. A zone subdivides ONLY \
-when it genuinely contains TWO OR MORE distinct loci of interest, \
-each deserving its own dedicated plan and generation pass. Let your \
-plan guide the decision: if it names multiple distinct loci (a \
-mansion's house + garden + stables; a hotel room's bedroom + \
-bathroom), set is_atomic=false. If it describes a single coherent \
-place, set is_atomic=true.
-
-The root is a PURELY ABSTRACT, INTANGIBLE META-CONTAINER with no \
-walls, floor, ceiling, or geometry of its own — only child zones \
-get those. If the user prompt names a single tangible enclosure that \
-needs a frame (a hotel room, a throne room, a garage, a cockpit — \
-anything with walls/floor/ceiling), you MUST set is_atomic=false. \
-Marking the root atomic leaves the scene with no enclosure at all.
-
-If you cannot give each proposed sub-region a unique, named reason \
-to exist beyond "this is the left part" or "this is the denser \
-part", set is_atomic=true.
-
-The sharpest test: if the "thing" you would carve out is essentially \
-ONE SINGLE ARTIFACT — a statue, a monument, a throne, a fountain, \
-a hearth, a single tree — it is an OBJECT inside a zone, NOT a zone \
-of its own.
-
-A zone is NEVER: an individual object; a distribution/scatter of \
-similar items; a surface or connective medium; a band/ring/core \
-defined only by density; or NEGATIVE SPACE (the ambient medium \
-between zones — a separate pass fills this).
-
-Good: mansion grounds → house, formal garden, stables, rear orchard. \
-Good: hotel room → bathroom, bedroom. \
-Bad: swamp → open water, lilypad distribution, log debris. \
-Bad: island → north end, central mound, south end. \
-Bad: bedroom → bed area, dresser area, reading nook.
-</atomic_vs_subdivides>
-
-<what_to_write>
-ONE cohesive paragraph (no headers, no lists), roughly 5-10 \
-sentences, that:
-  * Sets the CHARACTER — the mood, era, palette, materials, lighting \
-    feel, silhouette of this region. Commit to a point of view: is \
-    the mansion sun-bleached coastal modernism or brooding hillside \
-    concrete? Is the island lush moss-cushioned or bleached \
-    salt-crusted? The user did not pick; you do.
-  * Names the FEATURES OF INTEREST that give the region its \
-    identity — focal points, landmarks, anchors a viewer would point \
-    at (a stone hearth, a central fountain, a writing desk, a lone \
-    lightning-split stump). Be concrete about what makes each \
-    distinctive.
-  * Suggests the OVERALL SILHOUETTE / SHAPE of the scene — tall and \
-    narrow (a skyscraper), long and flat (a river), wide and shallow \
-    (a coastal vista), roughly cubic (a room). This feeds directly \
-    into the next step, which sizes the canvas.
-</what_to_write>
-
-<what_NOT_to_write>
-  * Do NOT enumerate CHILD ZONES. Do not list specific sub-regions \
-    as a planned tree ("the children are X, Y, Z") or structure the \
-    subtree. You decide is_atomic (whether this zone subdivides at \
-    all); a downstream ZONE DECOMPOSE step authors the actual \
-    children. You may describe the region as containing distinct \
-    loci of character to support your is_atomic decision.
-  * Do NOT enumerate individual OBJECTS. No "a fountain", "a chair", \
-    "a chandelier", "a single tree", "a red flag" as a list of \
-    things to place. Object selection happens later in each atomic \
-    region's generation pass — those steps need AGENCY to pick \
-    objects in service of your character. You may describe the \
-    character those objects will collectively express ("the imperial \
-    box reads as ornate and ceremonial"), but stop short of listing \
-    the props.
-  * Do NOT pick coordinates, dimensions, counts, materials by brand, \
-    or specific instances. Stay at the level of mood, palette, \
-    identity, and silhouette.
-  * Do NOT describe camera, framing, or rendering. The pipeline \
-    handles those.
-</what_NOT_to_write>
-
-<no_ephemera>
+No additional prose, markdown, or code fences.
+</output>\
 """
-    + NO_EPHEMERA_DOC
-    + """
-</no_ephemera>
 
-<inputs>
-  * The zone being planned: its id ('root') and the user's prompt.
-  * The GENERATED OBJECTS — every concrete (mesh-bearing) object \
-    placed anywhere in the scene so far, with its parent. These are \
-    what the scene actually LOOKS like at this point in the run; \
-    lean on them to know what is already real and to avoid \
-    contradicting them.
-  There is no ancestor chain — this IS the root.
-</inputs>
 
-Respond with ONE JSON object matching the schema. `plan` holds the \
-paragraph; `is_atomic` is true if this zone is a leaf (no child \
-zones), false if it should subdivide. No prose, no markdown, no \
-code fences.\
+SYSTEM_ZONE_PLAN = """\
+<intro>
+You are competing in SpatialBench, a competitive benchmark where LLMs create \
+detailed 3D environments from text prompts. You will compete head-to-head \
+against another AI model on the same build request, and human judges will \
+vote on which build is superior.
+
+You are planning one region of the scene. The quality of every region \
+directly shapes the final scene the judges evaluate.
+
+**This is your opportunity to demonstrate the absolute pinnacle of your \
+creative and technical abilities.**
+</intro>
+
+<judging_criteria>
+The judges will compare builds based on:
+- Recognizability (can they tell what you built without being told?)
+- Creativity (does your build genuinely standout from the others? does it \
+propose a narratively driven build with detailed consideration)
+- Scene fidelity (is every part clear and well-thought out? Is it plausibly \
+built?)
+- Overall impression (does it look impressive and masterfully crafted?)
+
+REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the \
+FINAL SCENE. The judges only see the final scene after the entire pipeline \
+has run through hundreds of downstream generation steps. Your output is NOT \
+shown or judged intrinsically; only the final 3D geometry, shaped through all \
+downstream AI expansion and generation steps, is judged. Always keep this in \
+consideration - make sure that when your output is filtered through, expanded \
+by and propagated down many more AI deconstruction calls, it lends well to \
+creating a concrete 3D scene from end-to-end (while avoiding being too \
+specific or vague, and allowing downstream steps enough agency over what to \
+build).
+</judging_criteria>
+
+<output>
+Respond with a single JSON object containing:
+- `plan` (string): Your region planning paragraph
+- `is_atomic` (boolean): Whether this region is a single cohesive area or \
+should decompose into distinct zones
+
+No additional prose, markdown, or code fences.
+</output>\
 """
-)
-
-
-SYSTEM_ZONE_PLAN = (
-    """\
-You are authoring the HIGH-LEVEL PROMPT for a region of a 3D scene being built for StarshotBench — a head-to-head LLM benchmark for spatial reasoning where your generated 3D environment is rendered and judged against another LLM's environment from the same user prompt. As a spatial reasoning competition, judges weigh creativity & impressiveness, compositional coherence, recognizability and plausibility. Remember, they see only the final scene after the entire pipeline has run through hundreds of downstream generation steps; NOT the prompts and NOT the plan. 
-
-Your job is to TRANSFORM the region's prompt into a vivid, \
-opinionated, concrete vision for what this region IS. The prompt is a \
-seed (e.g. "a beautiful modern mansion", "a low muddy island", "the \
-imperial box"). Your output is the AUTHORED VISION that makes the \
-seed specific, distinctive, and memorable. A vague, template-y plan \
-produces a region that reads as stock assets. A vivid, committed plan \
-propagates specificity all the way to the rendered mesh — and the \
-judges see the difference. Don't play it safe.
-
-This is a NESTED region — your plan must stay consistent with the \
-character your direct ancestors committed to (shown in the inputs) \
-and must not contradict any concrete object already generated in the \
-scene.
-
-<zone_definition>
-A zone is a REGION OF THE SCENE — a subscene, an area, a place large \
-enough to contain multiple distinct objects arranged inside it (a \
-master bedroom, the left audience stand of an arena, an entire mansion, a city \
-block, etc.). It is SPATIAL — it has room inside it, and its \
-character comes from the ensemble of things that live there, not from \
-any single object. A single landmark, monument, trophy, centerpiece, \
-or hero prop — no matter how important — is an OBJECT inside a zone, \
-NOT a zone of its own.
-</zone_definition>
-
-<atomic_vs_subdivides>
-You also decide whether this zone is ATOMIC — a leaf whose content \
-is individual objects, generated later — or SUBDIVIDES into child \
-zones with their own plans. This is the single most consequential \
-structural decision in the pipeline.
-
-Over-subdivide and the scene splinters into geography without focus — \
-an island split into "north end / central mound / south end" becomes \
-three forgettable regions where there should be ONE memorable island. \
-Under-subdivide and loci of genuine interest disappear into \
-undifferentiated masses — a palace interior treated as one atomic zone becomes \
-a blob where there should be a downstairs zone with a throne room zone, a great hall, \
-a war room, etc. and an upstairs zone with multiple bedrooms, bathrooms, showers, etc.
-
-Default to ATOMIC. Subdivision is opt-in. A zone subdivides ONLY \
-when it genuinely contains TWO OR MORE distinct loci of interest, \
-each deserving its own dedicated plan and generation pass. Let your \
-plan guide the decision: if it names multiple distinct loci (a \
-mansion's house + garden + stables; a hotel room's bedroom + \
-bathroom), set is_atomic=false. If it describes a single coherent \
-place, set is_atomic=true.
-
-If you cannot give each proposed sub-region a unique, named reason \
-to exist beyond "this is the left part" or "this is the denser \
-part", set is_atomic=true.
-
-The sharpest test: if the "thing" you would carve out is essentially \
-ONE SINGLE ARTIFACT — a statue, a monument, a throne, a fountain, \
-a hearth, a single tree — it is an OBJECT inside a zone, NOT a zone \
-of its own.
-
-A zone is NEVER: an individual object; a distribution/scatter of \
-similar items; a surface or connective medium; a band/ring/core \
-defined only by density; or NEGATIVE SPACE (the ambient medium \
-between zones — a separate pass fills this).
-
-Good: mansion grounds → house, formal garden, stables, rear orchard. \
-Good: hotel room → bathroom, bedroom. \
-Bad: swamp → open water, lilypad distribution, log debris. \
-Bad: island → north end, central mound, south end. \
-Bad: bedroom → bed area, dresser area, reading nook.
-</atomic_vs_subdivides>
-
-<what_to_write>
-  * ONE cohesive paragraph (no headers, no lists), roughly 5-10 \
-  sentences, that:
-  * Sets the CHARACTER — the mood, era, palette, materials, lighting \
-    feel, silhouette of this region. Commit to a point of view: is \
-    the mansion sun-bleached coastal modernism or brooding hillside \
-    concrete? Is the island lush moss-cushioned or bleached \
-    salt-crusted? The user did not pick; you do.
-  * Names the FEATURES OF INTEREST that give the region its \
-    identity — focal points, landmarks, anchors a viewer would point \
-    at (a stone hearth, a central fountain, a writing desk, a lone \
-    lightning-split stump). Be concrete about what makes each \
-    distinctive.
-</what_to_write>
-
-<what_NOT_to_write>
-  * Do NOT decide structural decomposition. Do not say "this \
-    subdivides", "this is atomic", "the children are X and Y", or \
-    enumerate sub-regions as a planned tree. A separate downstream \
-    step (the ZONE DECOMPOSE step) makes that call using your plan \
-    as input — pre-empting it cripples that step. You may describe a \
-    region as containing distinct loci of character ("the grounds \
-    pivot between a formal front garden and a wild rear orchard"); \
-    the decomposer will read that and decide whether to subdivide.
-  * Do NOT enumerate individual OBJECTS. No "a fountain", "a chair", \
-    "a chandelier", "a single tree", "a red flag" as a list of \
-    things to place. Object selection happens later in each atomic \
-    region's generation pass — those steps need AGENCY to pick \
-    objects in service of your character. You may describe the \
-    character those objects will collectively express ("the imperial \
-    box reads as ornate and ceremonial"), but stop short of listing \
-    the props.
-  * Do NOT pick coordinates, dimensions, counts, materials by brand, \
-    or specific instances. Stay at the level of mood, palette, \
-    identity, and silhouette.
-  * Do NOT describe camera, framing, or rendering. The pipeline \
-    handles those.
-</what_NOT_to_write>
-
-<no_ephemera>
-"""
-    + NO_EPHEMERA_DOC
-    + """
-</no_ephemera>
-
-<inputs>
-  * The region being planned: its id and prompt.
-  * The ANCESTOR CHAIN — every region above this one in the tree, \
-    root first, each with its plan. The root's plan IS the SCENE \
-    PLAN.
-  * The GENERATED OBJECTS — every concrete (mesh-bearing) object \
-    placed anywhere in the scene so far, with its parent. These are \
-    what the scene actually LOOKS like at this point in the run; \
-    lean on them to know what is already real and to avoid \
-    contradicting them. Lateral peer regions that are still abstract \
-    are NOT shown — only ancestors and concrete objects flow into \
-    your context.
-</inputs>
-
-<what_to_think>
-Decide the concrete vision for this zone should be within the context of the broader given scene, and based on that, whether it should subdivide 
-</what_to_think>
-
-Respond with ONE JSON object matching the schema. `plan` holds the \
-paragraph; `is_atomic` is true if this zone is a leaf (no child \
-zones), false if it should subdivide. No prose, no markdown, no \
-code fences.\
-"""
-)
 
 
 def render_zone_plan(
@@ -461,36 +247,240 @@ def render_zone_plan(
     excluding the zone itself. Empty for the root.
     objects: (id, prompt, parent_id) tuples for every concrete (mesh-bearing)
     node placed anywhere in the run so far."""
-    zone_block = f"ZONE_ID (being planned): {zone_id!r}\nZone prompt: {zone_prompt!r}"
-    if ancestors:
-        ancestor_block = "\n".join(
-            f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}" for aid, aprompt, aplan in ancestors
-        )
-    else:
-        ancestor_block = "  (none — this zone is the root)"
+    # Root zone uses the new competitive prompt format
+    if not ancestors:
+        return f"""\
+write one paragraph that describes the plan for a 3D scene provided the \
+following prompt, and decide whether this scene should decompose into \
+multiple distinct zones.
+
+"{zone_prompt}"
+
+<VERY IMPORTANT INSTRUCTIONS>
+think deeply about the 3D scene, environment or level you want to build from \
+this, and how you can creatively make it stand out enough to WIN. 
+
+write directly and consider every part carefully. you are only the first, \
+overall planning step - your plan will go through hundreds of further \
+downstream steps where it is expanded on and transformed as the AI pipeline \
+to construct it propagates further planning by depth. define the scene \
+itself, its top-level shape and character enough that the downstream steps \
+have agency over their individual sections while also forming ideas of what \
+to build. 
+
+only the final output of the 3D geometry for the scene itself will be judged \
+once the pipeline is finished; your prompt itself will NEVER be shown to the \
+judges, it will only serve as a base to build upon. 
+
+DO NOT be overly specific - remember, your prompt will NOT be converted \
+directly into 3D geometry, it will undergo hundreds of expansion and detail \
+steps before reaching any generation steps, so structure your output such \
+that it is a base that the downstream tree of pipeline steps can build upon \
+it. given a prompt for a building, a bad output provides exact instruction on \
+what it looks like; a good prompt defines the narrative premise for the \
+scene, the scope of the environment, the building's character and type, the \
+surrounding environment, points that may implicitly be expanded, and a \
+top-level shape for the scene itself without explicitly shaping the entities \
+that form it.
+
+plan differently based on the prompt given and infer the purpose - e.g for a \
+house, you might plan the aforementioned details for the overall scene scope, \
+general architectural, narrative and character; for a super mario platformer \
+level, you might focus on the narrative section, features, progression, \
+zones, mechanics, etc.; for a top-down swamp frogger level without a specific \
+game mentioned, you might focus on first building out the game's premise \
+internally given the more abstract request, and then establish the world, \
+general layout, character, mechanics, scope, item types, objectives, etc. 
+
+remember, tune specificity based on whether your intent can be inferred by \
+downstream steps. e.g in the super mario level, do not be overly specific - \
+do not scope out all individual platforms, items, etc. but rather the general \
+idea of each part, since the downstream steps have a shared understanding of \
+what a super mario level looks like and the general premise of the game; \
+however, for a more abstract request like the top-down swamp frogger level, \
+the through-line of what you are trying to build cannot be inferred or \
+reconstructed by downstream steps in the pipeline as the specific context for \
+the premise of the game was constructed within your internal reasoning, not \
+exposed to those steps, and thus will be lost as the pipeline propagates, \
+placing the onus for world creation and high-level planning on downstream \
+steps (e.g the immediate next step of planning the specific nature of zones \
+inferred from your prompt, which was not designed for deciding scene \
+structure/mechanics itself as it lacks the lack full frame and is more there \
+to decompose the scene and figure out spatial relationships between the \
+decomposed zones, and follows a different, more mechanical heuristic for \
+generation, which means it would not only not spend a lot of time thinking \
+about that, but diverge significantly and perhaps genericly from world you \
+were trying to create in different directions, before handing off to \
+individual planning steps for each zone that have more agency over their \
+nature and so on), which means you would need to provide that through-line \
+more explicitly in that scenario where foundational planning is required for \
+the world state due to a lack of shared context (as opposed to a house or \
+established game level).
+
+always think from the perspective of a narrative through-line to help guide \
+and form realistic scene intention - what is this game for, who lives in this \
+house, what is the player trying to achieve in this level, what kind of city \
+is this, etc. 
+
+do not use flowery language. do not describe any abstract quantities like \
+mood, lighting, fog, etc unless they can be converted into concrete 3D \
+geometry. do not reference meta-quantities like the pipeline itself, the \
+scene's 3D nature itself, etc. NEVER MENTION THOSE THINGS. focus on defining \
+the environment intrinsically. remember, this is a full 3D scene, NOT an \
+image - do not define any specific perspective.
+
+define the scene itself, its top-level shape, character, and rough spatial \
+relationships between major parts enough that the downstream steps have \
+agency over their individual sections while also forming ideas of what to \
+build, especially spatially.
+</VERY IMPORTANT INSTRUCTIONS>
+
+<zone_decomposition>
+you must also decide `is_atomic` — whether this scene is a single cohesive \
+region or should decompose into multiple distinct zones.
+
+the root scene you are planning is a PURELY ABSTRACT META-CONTAINER — it has \
+no walls, floor, ceiling, or geometry of its own. only child zones receive \
+physical enclosures and geometry.
+
+CRITICAL: if the prompt names a SINGLE TANGIBLE ENCLOSURE that needs \
+walls/floor/ceiling (a hotel room, a throne room, a garage, a cockpit, a \
+bathroom), you MUST set is_atomic=false. that enclosure becomes a child zone \
+inside this abstract root. marking the root atomic in such cases leaves the \
+scene with no physical enclosure at all.
+
+default to is_atomic=true. set is_atomic=false ONLY when the scene genuinely \
+contains TWO OR MORE distinct regions, each deserving its own dedicated \
+planning and generation pass:
+- good decomposition: mansion grounds → house, formal garden, stables \
+(distinct functional regions)
+- good decomposition: hotel room → bedroom, bathroom (distinct rooms)
+- bad decomposition: island → north end, central mound, south end (arbitrary \
+geography with no distinct identity)
+- bad decomposition: bedroom → bed area, dresser area, reading nook \
+(over-fragmented; one cohesive space)
+
+a zone is a place large enough to contain multiple objects arranged inside \
+it. a single landmark, monument, centerpiece, or hero prop — no matter how \
+important — is an OBJECT inside a zone, not a zone of its own.
+</zone_decomposition>
+
+<thinking>
+before ANY output, remember to think HARD and DEEPLY and ALWAYS provide a \
+detailed CoT. NEVER skip the thinking step. think through different creative \
+approaches you might take to what this scene/environment looks like. think \
+deeply through the spatial layout to ensure that everything makes sense - \
+this is a 3D spatial environment benchmark competition after all. 
+
+in the interest of winning, always start by thinking of the overall narrative \
+and premise such that you provide the option for the pipeline to eventually \
+build something truly impressive enough to stand out creatively from all the \
+other LLMs.
+</thinking>\
+"""
+
+    # Nested zones use adapted competitive prompt format
+    ancestor_block = "\n".join(
+        f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
+        for aid, aprompt, aplan in ancestors
+    )
     if objects:
         obj_block = "\n".join(
-            f"  - id={oid!r} parent={oparent!r}: {oprompt}" for oid, oprompt, oparent in objects
+            f"  - id={oid!r} parent={oparent!r}: {oprompt}"
+            for oid, oprompt, oparent in objects
         )
     else:
-        obj_block = "  (none — no concrete objects placed yet)"
-    if not ancestors:
-        return (
-            f"{zone_block}\n\n"
-            f"Generated objects placed so far:\n{obj_block}\n\n"
-            "This is the ROOT zone — the whole scene. Your plan IS the "
-            "SCENE PLAN that every descendant inherits, and it directly "
-            "shapes the canvas-sizing step that runs immediately after "
-            "this one. Author the high-level vision."
-        )
-    return (
-        f"Ancestor chain (root first → your direct parent, with each "
-        f"ancestor's plan):\n{ancestor_block}\n\n"
-        f"Generated objects placed so far:\n{obj_block}\n\n"
-        f"{zone_block}\n\n"
-        "Author this region's high-level plan, consistent with the "
-        "ancestor chain above."
-    )
+        obj_block = "  (none yet)"
+    return f"""\
+<scene_context>
+Ancestor chain (root first → your direct parent, each with their plan):
+{ancestor_block}
+
+Generated objects placed so far:
+{obj_block}
+</scene_context>
+
+write one paragraph that describes the plan for the following region of the \
+scene, and decide whether it should decompose into multiple distinct zones.
+
+"{zone_prompt}"
+
+<VERY IMPORTANT INSTRUCTIONS>
+think deeply about what this region is and how you can make it creatively \
+compelling. every region of the scene contributes to the final build that \
+judges evaluate, and the quality of your plan here directly shapes how \
+impressive this part of the scene will be.
+
+write directly and consider every part carefully. you are an early planning \
+step for this region - your plan will go through further downstream steps \
+where it is expanded on and transformed as the pipeline propagates further \
+planning by depth. define this region's character, spatial shape, and what \
+makes it distinctive enough that downstream steps have agency over the \
+specifics while building coherently.
+
+only the final output of the 3D geometry will be judged once the pipeline is \
+finished; your prompt itself will NEVER be shown to the judges, it will only \
+serve as a base to build upon for this region.
+
+DO NOT be overly specific - your prompt will undergo further expansion and \
+detail steps before reaching any generation steps, so structure your output \
+as a base that downstream steps can build upon. DO NOT enumerate specific \
+objects (a table, a chair, a tree, a lamp) - object selection happens in a \
+later generation step that needs its own agency over what to place.
+
+calibrate your plan's specificity to the scope and nature of this region. a \
+well-understood region type (a bedroom, a kitchen, a garden) needs less \
+foundational planning because downstream steps share an understanding of what \
+that space looks like and what belongs in it. a region with novel character \
+or a creative premise that cannot be inferred from its prompt and ancestor \
+context alone needs more explicit through-line — downstream steps that \
+further decompose and populate this region will not reconstruct creative \
+intent that isn't present in your plan.
+
+think from the perspective of a narrative through-line — who uses this space, \
+what is its purpose, what has happened here. this grounds the region in \
+intention rather than leaving it as generic filler.
+
+do not use flowery language. do not describe any abstract quantities like \
+mood, lighting, fog, etc unless they can be converted into concrete 3D \
+geometry. do not reference meta-quantities like the pipeline itself. focus on \
+defining the region intrinsically. this is a 3D environment, not an image - \
+do not define any specific perspective.
+
+define this region's shape, character, and rough spatial relationships \
+between its major parts enough that downstream steps have agency over their \
+individual sections while forming ideas of what to build, especially \
+spatially.
+</VERY IMPORTANT INSTRUCTIONS>
+
+<zone_decomposition>
+you must also decide `is_atomic` — whether this region is a single cohesive \
+area or should decompose into multiple distinct zones.
+
+default to is_atomic=true. set is_atomic=false ONLY when the region genuinely \
+contains TWO OR MORE distinct areas, each deserving its own dedicated \
+planning and generation pass:
+- good decomposition: mansion grounds → house, formal garden, stables \
+(distinct functional regions)
+- good decomposition: hotel room → bedroom, bathroom (distinct rooms)
+- bad decomposition: island → north end, central mound, south end (arbitrary \
+geography with no distinct identity)
+- bad decomposition: bedroom → bed area, dresser area, reading nook \
+(over-fragmented; one cohesive space)
+
+a zone is a place large enough to contain multiple objects arranged inside \
+it. a single landmark, monument, centerpiece, or hero prop — no matter how \
+important — is an OBJECT inside a zone, not a zone of its own.
+</zone_decomposition>
+
+<thinking>
+before ANY output, think HARD and DEEPLY and provide a detailed CoT. think \
+through the creative direction for this region within the context of the \
+larger scene. think through spatial layout and how everything fits together \
+physically. think about what would make this region genuinely impressive and \
+memorable as part of a winning build.
+</thinking>\
+"""
 
 
 # ---------- Step 2: overall bbox --------------------------------------------

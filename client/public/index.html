@@ -70,6 +70,7 @@
             .slot-dot.status-running { background: #e0c271; }
             .slot-dot.status-done    { background: #8bd17c; }
             .slot-dot.status-error   { background: #ff8080; }
+            .slot-dot.status-paused  { background: #e09050; }
             .slot-dot.status-idle    { background: #5a5e68; }
             #slot-reset {
                 margin-left: auto;
@@ -89,6 +90,41 @@
                 color: #e6e6e6;
             }
             #slot-reset:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            #slot-resume {
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #slot-resume.paused {
+                background: #2a2510;
+                border-color: #b89840;
+                color: #e0c271;
+            }
+            #slot-resume.paused:hover:not(:disabled) {
+                background: #3a3520;
+                border-color: #e0c271;
+                color: #ffe14a;
+            }
+            #slot-resume.error {
+                background: #2a1515;
+                border-color: #804040;
+                color: #ff8080;
+            }
+            #slot-resume.error:hover:not(:disabled) {
+                background: #3a2020;
+                border-color: #ff8080;
+                color: #ffaaaa;
+            }
+            #slot-resume:disabled {
                 opacity: 0.5;
                 cursor: default;
             }
@@ -584,6 +620,7 @@
             <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
             <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
             <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
+            <button id="slot-resume" type="button" style="display:none">resume</button>
             <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
         </div>
         <div id="status"><p class="line hdr">ready</p></div>

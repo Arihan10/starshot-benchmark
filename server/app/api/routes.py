@@ -1,11 +1,12 @@
 """HTTP API — slot-scoped endpoints.
 
-All seven benchmark slots (see app.core.slots) auto-boot on lifespan
-startup: fresh slots are seeded with a `run.start`, resumable slots drop
-their trailing `run.error` (if any) and continue from where they stopped,
-completed slots stay idle. Every asyncio task is bound to its SlotLog via
-a ContextVar, so concurrent pipeline work routes events to the right
-slot without threading a handle through every call site.
+All seven benchmark slots (see app.core.slots) are initialized on lifespan
+startup: fresh slots are seeded with a `run.start` and auto-launched,
+completed slots stay idle, and interrupted or errored slots are left
+paused for manual resume via POST /slots/{id}/resume. Every asyncio task
+is bound to its SlotLog via a ContextVar, so concurrent pipeline work
+routes events to the right slot without threading a handle through every
+call site.
 """
 
 from __future__ import annotations
@@ -108,6 +109,25 @@ def create_app() -> FastAPI:
         _tasks[slot.id] = asyncio.create_task(_run(slot.id))
         return {"slot_id": slot.id, "events": new_len}
 
+    @app.post("/slots/{slot_id}/resume")
+    async def slot_resume(slot_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        slot = _require_slot(slot_id)
+        slot_log = _slot_logs[slot_id]
+        status = slot_log.state.get("status")
+        if status not in ("paused", "error"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"slot is {status}, not resumable",
+            )
+        await _cancel_task(slot_id)
+        events = slot_log.state["events"]
+        if events and events[-1].get("kind") == "run.error":
+            slot_log.truncate_events_to(len(events) - 1)
+        slot_log.state["model"] = DEFAULT_MODEL
+        slot_log.state["status"] = "running"
+        _tasks[slot.id] = asyncio.create_task(_run(slot.id))
+        return {"slot_id": slot.id}
+
     @app.post("/slots/{slot_id}/reset")
     async def slot_reset(slot_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         slot = _require_slot(slot_id)
@@ -146,25 +166,20 @@ def _slot_summary(slot: Slot) -> dict[str, object]:
 
 
 def _maybe_launch(slot: Slot, slot_log: SlotLog) -> None:
-    """Seed or resume the slot and kick off a task if there's work to do.
-    Completed slots (last event == run.done) stay idle."""
+    """Seed fresh slots and kick off a task. Completed slots stay idle.
+    Interrupted or errored slots are left paused for manual resume."""
     events = slot_log.state["events"]
     if not events:
         slot_log.start_run(slot.prompt, DEFAULT_MODEL)
         _tasks[slot.id] = asyncio.create_task(_run(slot.id))
         return
-    # Resume on the current default model, regardless of which model the
-    # original run.start was recorded under. The on-disk event log keeps
-    # its history; only the in-memory routing changes.
     slot_log.state["model"] = DEFAULT_MODEL
     last_kind = events[-1].get("kind")
     if last_kind == "run.done":
         return
-    if last_kind == "run.error":
-        # Drop the trailing error so SSE snapshot replay doesn't terminate
-        # mid-stream on the fresh retry about to run.
-        slot_log.truncate_events_to(len(events) - 1)
-    _tasks[slot.id] = asyncio.create_task(_run(slot.id))
+    # Interrupted or errored — mark resumable but don't auto-start.
+    if last_kind != "run.error":
+        slot_log.state["status"] = "paused"
 
 
 def _require_slot(slot_id: str) -> Slot:
