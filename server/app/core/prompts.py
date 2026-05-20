@@ -561,108 +561,61 @@ class ZoneDecomposeOutput(BaseModel):
 
 SYSTEM_ZONE_DECOMPOSE = (
     """\
-You are deciding the STRUCTURE of a zone in a 3D scene being built for \
-StarshotBench — a head-to-head LLM benchmark for spatial reasoning where your \
-generated 3D environment is rendered and judged against another LLM's environment from \
-the same user prompt. As a spatial reasoning competition, judges weigh creativity \
-& impressiveness, compositional coherence, recognizability, detail richness, and \
-plausibility. Remember, they see only the final scene; not the prompts, not the plan. 
+You are now the SPATIAL REASONING and ZONE DECOMPOSITION step for this pipeline, called DECOMP.
 
-The zone's HIGH-LEVEL PLAN was already authored by an \
-upstream step and is shown to you in the inputs as the ZONE \
-PLAN. Specifically, it was decided that this zone should decompose into further zones. \
+Your job: Based on the HIGH-LEVEL PLAN for this scene, create its STRUCTURE by describing all of the sub-zones that exist within it. You are taking an idea and fleshing out the structure and details from it.
 
-Your job: Based on the HIGH-LEVEL PLAN for this zone, create its STRUCTURE by describing \
-all of the sub-zones that exist within it. You are taking an idea and fleshing out the \
-structure and details from it.
+<i/o>
+You output a JSON containing each zone generated from the above plan. For each child zone, you output the `id`, `prompt`, optional `proxy_shape`, the `relationships` that anchor it inside the parent and any 'relationships' with the zones around it. Subdivision and per-child structure are codependent (you cannot anchor children you have not committed to, and you cannot commit to children without imagining their layout), so they belong in the same step.
 
-Emit each child created in the zone fully structured — `id`, `prompt`, \
-optional `proxy_shape`, and the `relationships` that anchor it inside \
-the parent. Subdivision and per-child structure are codependent (you \
-cannot anchor children you have not committed to, and you cannot \
-commit to children without imagining their layout), so they belong \
-in the same step.
-
-You do NOT author each child's full, fleshed out plan. Each child's detailed plan \
-is authored later, by the child's own ZONE PLAN step when the pipeline \
-recurses into it. You also do NOT pick concrete bbox coordinates or dimensions — a \
-downstream batch step resolves each child's bbox from its \
-relationships and prompt.
-
-<zone_definition>
-A zone is a REGION OF THE SCENE — a subscene, an area, a place large \
-enough to contain multiple distinct objects arranged inside it (e.g a \
-master bedroom, the left audience stand of an arena, the formal front \
-garden of a mansion). It is SPATIAL — it has room inside it, and its \
-character comes from the ensemble of things that live there, not from \
-any single object. A single landmark, monument, trophy, centerpiece, \
-or hero prop — no matter how important — is an OBJECT inside a zone, \
-NOT a zone of its own. Zones often contain other zones within them, and these zones can have different structures - e.g the bottom floor of a massive palace might contain a \
-war zone and a living zone, where the war zone then further decomposes into a set of war rooms, armory rooms and a fighting arena, and the living zone decomposes into the \
-great hall, throne room, the front entrance, the king and queen's chambers, a garden, \
-etc. Or, the entire bottom floor zone might decompose directly into a set of zones \
-for the grand entrance, inner courtyard, great hall, trophy gallery, king and \
-queen's chambers, throne room and bathrooms (as individual zones).
-
-Zones are designed realistically, based on the given input, intended creative direction \
-and amount of world space available to define them within.
-</zone_definition>
-
-<inputs>
-  * The zone being decomposed: its id (PARENT_ID), prompt, and \
-    axis-aligned bounding box (in meters, under the canonical front \
-    view: +X right, +Y up, +Z front).
-  * The ZONE PLAN — the high-level character/intent plan authored \
-    upstream for this zone. This is your primary signal. Let its \
-    named features and implied loci drive your decision.
-  * The SCENE PROMPT and SCENE PLAN — the root's prompt and plan, \
-    the north-star for the whole scene.
-  * The ANCESTOR CHAIN — every zone above this one in the tree, \
-    root first, each with its plan.
-  * The PRIOR ZONES — every non-root zone already declared in the \
-    run, with its parent and plan. Lateral context: siblings, \
-    cousins, and earlier subtrees may inform how THIS zone is \
-    structured and anchored.
-  * The GENERATED OBJECTS — every concrete (mesh-bearing) object \
-    placed anywhere in the scene so far, with its parent.
-</inputs>
+<input>
+  * The zone being decomposed: its id (PARENT_ID), prompt, and axis-aligned bounding box (in meters, under the canonical front view: +X right, +Y up, +Z front).
+  * The ZONE PLAN — the high-level character/intent plan authored upstream for this zone. This is your primary signal. Let its named features and implied loci drive your decision.
+  * The SCENE PROMPT and SCENE PLAN — the root's prompt and plan, the north-star for the whole scene.
+  * The ANCESTOR CHAIN — every zone above this one in the tree, root first, each with its plan.
+  * The PRIOR ZONES — every non-root zone already declared in the run, with its parent and plan. Lateral context: siblings, cousins, and earlier subtrees may inform how THIS zone is structured and anchored.
+  * The GENERATED OBJECTS — every concrete (mesh-bearing) object placed anywhere in the scene so far, with its parent.
+</input>
 
 <output>
 Emit a single ZoneDecomposeOutput:
 
-  * `children` — list of ChildNodeSpec. At least two children (or \
-    exactly one when the root names a single tangible enclosure). \
-    Each ChildNodeSpec has:
-      - `id` — unique within the whole scene (do not collide with \
-        any existing id, including the ancestor chain or generated \
-        objects).
-      - `prompt` — a 1-2 sentence concrete description of the child \
-        zone — rich enough to seed the child's own high-level plan \
-        when its ZONE PLAN step runs, but NOT a full plan. Name \
-        the region and its defining feature; do not pre-author its \
-        mood, palette, or list of objects.
-      - `proxy_shape` — OPTIONAL. The child zone's collision-proxy \
-        shape, chosen from the silhouette implied by the prompt (a \
-        domed island → HEMISPHERE; a column or trunk-shaped region \
-        → CAPSULE; most architectural zones → omit). See the PROXY \
-        SHAPE section below.
-      - `relationships` — REQUIRED, at least one per child. Anchors \
-        the child inside the parent.
+  * `children` — list of ChildNodeSpec. At least two children. Each ChildNodeSpec has:
+      - `id` — unique within the whole scene (do not collide with any existing id, including the ancestor chain or generated objects).
+      - `prompt` — a short description of the child zone that is rich enough to seed the child's own high-level plan when its ZONE PLAN step runs, but NOT a full plan.
+      - `proxy_shape` — OPTIONAL. The child zone's collision-proxy shape, chosen from the silhouette implied by the prompt (a domed island → HEMISPHERE; a column or trunk-shaped region → CAPSULE; most architectural zones → omit). See the PROXY SHAPE section below.
+      - `relationships` — REQUIRED, at least one per child. This anchors the child inside the parent and describes its position relative to other zones/objects in the scene.
 
 A Relationship has:
-  * `target` — either PARENT_ID or the `id` of an earlier sibling \
-    already listed in this call's `children`.
+  * `target` — either PARENT_ID or the `id` of an earlier sibling already listed in this call's `children`.
   * `kind` — one of: ON, BESIDE, BELOW, ABOVE, ATTACHED.
-  * `reference_point` — which CORNER of the TARGET's bbox this \
-    relationship anchors against, under the canonical front view \
-    (+X right, +Y up, +Z front). One of: TOP_LEFT_FRONT, \
-    TOP_LEFT_BACK, TOP_RIGHT_FRONT, TOP_RIGHT_BACK, \
-    BOTTOM_LEFT_FRONT, BOTTOM_LEFT_BACK, BOTTOM_RIGHT_FRONT, \
-    BOTTOM_RIGHT_BACK.
+  * `reference_point` — which CORNER of the TARGET's bbox this relationship anchors against, under the canonical front view (+X right, +Y up, +Z front). One of: TOP_LEFT_FRONT, TOP_LEFT_BACK, TOP_RIGHT_FRONT, TOP_RIGHT_BACK, BOTTOM_LEFT_FRONT, BOTTOM_LEFT_BACK, BOTTOM_RIGHT_FRONT, BOTTOM_RIGHT_BACK).
 
-Do NOT pick concrete coordinates or dimensions — a downstream batch \
-step resolves each child's bbox from its relationships and prompt.
+DO NOT pick concrete coordinates or dimensions — a downstream batch step resolves each child's bbox from its relationships and prompt.
 </output>
+
+<zone_definition>
+A zone is a REGION OF THE SCENE — a subscene, an area, a place large enough to contain multiple distinct objects arranged inside it (e.g a master bedroom, the left audience stand of an arena, the formal front garden of a mansion, the downtown section of a city). It has room inside it, and its character comes from the ensemble of things that live there, not from any single object. A single landmark, monument, trophy, centerpiece, or hero prop — no matter how important — is an OBJECT inside a zone, NOT a zone of its own. Zones often contain other zones within them, and these zones can have different structures - e.g the bottom floor of a massive palace might contain a war zone and a living zone, where the war zone then further decomposes into a set of war rooms, armory rooms and a fighting arena, and the living zone decomposes into the great hall, throne room, the front entrance, the king and queen's chambers, a garden, etc. Or, the entire bottom floor zone might decompose directly into a set of zones for the grand entrance, inner courtyard, great hall, trophy gallery, king and queen's chambers, throne room and bathrooms (as individual zones), etc.
+
+Zones are designed realistically, based on the given input, intended creative direction and amount of world space available to define them within.
+</zone_definition>
+</i/o>
+
+You do NOT author each child's full, fleshed out plan. Each child's detailed plan is authored later, by the child's own ZONE PLAN step when the pipeline recurses into it. You also do NOT pick concrete bbox coordinates or dimensions — a downstream batch step resolves each child's bbox from its relationships and prompt.
+
+Think very deeply about what type of scene you want this to be. Use the HIGH-LEVEL PLAN generated upstream as a north-star for the scene, while expanding with your own opinionated decisions along the way.
+
+<guidance>
+Think very intricately and SPATIALLY about zone placements. If this is a shooter map, how does the player move through the areas, if this is a building, how do the floorplans look and where are all the rooms with respect to each other, etc. Also consider NARRATIVE, ARCHITECTURE, REALISM, etc.
+
+Often times, the upstream prompt will only communicate an idea, and it will be your job to expand internally on that idea, whether that is from an actual planning capacity, or the intricacies of its mechanics. Always begin by thinking of the overall ideas for what could be involved in this scene (in cohesion with the spatial layout of how it would all fit together, affect the topological traversal, etc.). Given a more specific upstream prompt for an area, you would adhere more strictly to serving just as a through-line for it, as opposed to coming up with novel areas from the upstream idea if it is left abstract.
+
+After this step, each ZONE will go into its own individual planning step, similar to the ROOT PLANNING step above. Your output acts as both planning to seed that with a prompt that gives it enough agency to figure out the intricacies itself, while also planning more cohesively about the overall zone from a spatial perspective and providing a through-line between the previous upstream zone plan and the downstream planning areas. DO NOT BE OVERLY SPECIFIC - think specific so you can figure out what zones should exist (because obviously you need to think that out very deeply and plan out trajectories through them and such), but within the prompts for each zone, keep them as a base to communicate the idea into the individual zone planning steps that each will recurse into, and as a through-line from the upstream planning to downstream.
+
+Remember, this is not necessarily an end-all be-all; zones can keep decomposing into more zones recursively, or end there if that is appropriate. Follow the overall context and principles from before, and keep the seeding prompts short (but think deeply about them and what they represent to you internally, even if not every single one of those details is necessarily communicated, and make them meaningfully and directly convey intention the same way as the root zone plan prompt).
+
+Always decompose at the TOP MOST LEVEL - e.g never go straight from the root plan for a house scene involving a backyard, driveway, house, etc. straight to backyard pool zone, backyard grass zone, house basement, house first floor, house second floor, etc.; it should decompose to the top level of the entire house as a zone (unless for instance it is the kind of house to be spread out with multiple wings over a property or something, but for a standard contained house you treat the whole house as a single top-level zone and let downstream recursions split it into floors and rooms). The same principle holds everywhere: emit only the zones that exist at THIS level of the hierarchy, and trust the recursive planning + decompose passes underneath each of them to handle the next layer down.
+</guidance>
 
 <proxy_shape>
 """
@@ -699,11 +652,18 @@ def render_zone_decompose(
     node placed anywhere in the run so far.
     prior_zones: (id, prompt, plan, parent_id) for every non-root zone
     already declared in the run, in declaration order."""
+    is_root = not ancestors
     zone_block = (
         f"PARENT_ID (the zone being decomposed): {zone_id!r}\n"
         f"Zone prompt: {zone_prompt!r}\n"
-        f"Zone bbox: {zone_bbox.model_dump_json()}\n"
-        f"ZONE PLAN (authored upstream — your primary signal):\n{zone_plan}"
+        f"Zone bbox: {zone_bbox.model_dump_json()}"
+        if is_root
+        else (
+            f"PARENT_ID (the zone being decomposed): {zone_id!r}\n"
+            f"Zone prompt: {zone_prompt!r}\n"
+            f"Zone bbox: {zone_bbox.model_dump_json()}\n"
+            f"ZONE PLAN (authored upstream — your primary signal):\n{zone_plan}"
+        )
     )
     if ancestors:
         ancestor_block = "\n".join(
@@ -724,9 +684,15 @@ def render_zone_decompose(
         )
     else:
         obj_block = "  (none — no concrete objects placed yet)"
+    scene_plan_header = (
+        "SCENE PLAN (the north-star for the whole scene — this zone IS the root, "
+        "so its plan is the scene plan and serves as your primary signal):"
+        if is_root
+        else "SCENE PLAN (the north-star for the whole scene):"
+    )
     return (
         f"Overall scene prompt: {scene_prompt!r}\n\n"
-        f"SCENE PLAN (the north-star for the whole scene):\n{scene_plan}\n\n"
+        f"{scene_plan_header}\n{scene_plan}\n\n"
         f"Ancestor chain (root first → your direct parent, with each "
         f"ancestor's plan):\n{ancestor_block}\n\n"
         f"Prior zones declared so far (lateral scene context):\n"
@@ -1431,7 +1397,7 @@ def wrap_image_prompt(
         f"{base} The object's dimensions are exactly "
         f"{w:.2f}m by {h:.2f}m by {d:.2f}m (width by height by depth)."
         "Capture the entire model in the image. Render against a "
-        "clean, empty white background with no other objects or graphics."
+        "clean, empty white background with no other objects, dimension markings, or graphics."
     )
 
 
