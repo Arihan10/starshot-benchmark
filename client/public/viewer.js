@@ -21,6 +21,60 @@ const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
 const pickInnerToggleEl = document.getElementById("pick-inner-toggle");
 const exportGlbEl = document.getElementById("export-glb");
+const replayGifEl = document.getElementById("replay-gif");
+const replayModalEl = document.getElementById("replay-modal");
+const replayCloseEl = document.getElementById("replay-close");
+const replayEventCountEl = document.getElementById("replay-event-count");
+const replayDurationEstEl = document.getElementById("replay-duration-est");
+const replaySpeedEl = document.getElementById("replay-speed");
+const replaySpeedValEl = document.getElementById("replay-speed-val");
+const replayFpsEl = document.getElementById("replay-fps");
+const replayFpsValEl = document.getElementById("replay-fps-val");
+const replayProgressBarEl = document.getElementById("replay-progress-bar");
+const replayStatusEl = document.getElementById("replay-status");
+const replayPreviewEl = document.getElementById("replay-preview");
+const replayRenderEl = document.getElementById("replay-render");
+const replayDownloadEl = document.getElementById("replay-download");
+const replayStageEl = document.getElementById("replay-stage");
+const replayPreviewCanvasEl = document.getElementById("replay-preview-canvas");
+const replayResultImgEl = document.getElementById("replay-result-img");
+const replayPreviewCtx = replayPreviewCanvasEl.getContext("2d");
+
+// URL of the last-encoded gif blob, kept so we can revoke when the modal
+// closes or a fresh render starts.
+let lastGifUrl = null;
+let lastGifBlob = null;
+
+function showReplayPlaceholder() {
+  replayStageEl.classList.remove("show-result");
+  replayStageEl.classList.add("empty");
+  replayPreviewCtx.clearRect(0, 0, replayPreviewCanvasEl.width, replayPreviewCanvasEl.height);
+}
+
+function drawReplayFrame(srcCanvas) {
+  // Match the preview canvas's backing buffer to the source so frames keep
+  // their native aspect; CSS object-fit handles the visual letterboxing.
+  if (
+    replayPreviewCanvasEl.width !== srcCanvas.width ||
+    replayPreviewCanvasEl.height !== srcCanvas.height
+  ) {
+    replayPreviewCanvasEl.width = srcCanvas.width;
+    replayPreviewCanvasEl.height = srcCanvas.height;
+  }
+  replayPreviewCtx.drawImage(srcCanvas, 0, 0);
+  replayStageEl.classList.remove("empty");
+  replayStageEl.classList.remove("show-result");
+}
+
+function showReplayGifResult(blob) {
+  if (lastGifUrl) URL.revokeObjectURL(lastGifUrl);
+  lastGifBlob = blob;
+  lastGifUrl = URL.createObjectURL(blob);
+  replayResultImgEl.src = lastGifUrl;
+  replayStageEl.classList.add("show-result");
+  replayStageEl.classList.remove("empty");
+  replayDownloadEl.disabled = false;
+}
 const assetsEl = document.getElementById("assets");
 const assetsBodyEl = document.getElementById("assets-body");
 const assetsCountEl = document.getElementById("assets-count");
@@ -525,7 +579,10 @@ treeSearchClearEl.addEventListener("click", () => {
 // --- three.js scene ---------------------------------------------------------
 
 const host = document.getElementById("canvas-host");
-const renderer = new THREE.WebGLRenderer({ antialias: true });
+// preserveDrawingBuffer keeps the WebGL framebuffer readable after present,
+// which is required for the gif export path (gif.js calls getImageData on
+// the canvas). Small perf cost on every frame; acceptable for a debug tool.
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x101114);
@@ -1129,6 +1186,49 @@ function frameBbox(box) {
   controls.update();
 }
 
+// Frame `box` so that *every* corner is guaranteed inside the frustum, with
+// a small padding margin. Differs from frameBbox in two ways:
+//   1) uses the bounding-sphere radius (box diagonal) so any viewing angle
+//      that doesn't align with a face still fits;
+//   2) picks the limiting FOV between vertical and horizontal (aspect-aware)
+//      so portrait windows still capture the whole box.
+// Used by the gif replay to lock the camera at a framing that captures the
+// entire scene volume for the duration of the export.
+function frameBoxFully(box, { padding = 1.1, dirVec = null } = {}) {
+  const size = box.getSize(new THREE.Vector3());
+  const center = box.getCenter(new THREE.Vector3());
+  const radius = Math.max(0.5 * size.length(), 0.5);
+  controls.target.copy(center);
+  const fovV = (camera.fov * Math.PI) / 180;
+  const fovH = 2 * Math.atan(Math.tan(fovV / 2) * camera.aspect);
+  const limitingHalfFov = Math.min(fovV, fovH) / 2;
+  const dist = (radius * padding) / Math.sin(limitingHalfFov);
+  const dv = dirVec ?? new THREE.Vector3(1, 0.7, 1).normalize();
+  camera.position.copy(center).addScaledVector(dv, dist);
+  camera.near = Math.max(0.01, dist / 1000);
+  camera.far = Math.max(100, dist * 10);
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+// Find the root zone's bbox in a snapshot of recorded events. Returns a
+// THREE.Box3 if found, or null. The root is identified by parent_id === null
+// (which is how the server emits it) so we don't have to hard-code the id.
+function findRootBboxFromEvents(events) {
+  for (const ev of events) {
+    if (ev.kind !== "bbox") continue;
+    if (ev.parent_id != null) continue;
+    if (!Array.isArray(ev.origin) || !Array.isArray(ev.dimensions)) continue;
+    const ox = ev.origin[0], oy = ev.origin[1], oz = ev.origin[2];
+    const fx = ox + ev.dimensions[0], fy = oy + ev.dimensions[1], fz = oz + ev.dimensions[2];
+    return new THREE.Box3(
+      new THREE.Vector3(Math.min(ox, fx), Math.min(oy, fy), Math.min(oz, fz)),
+      new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
+    );
+  }
+  return null;
+}
+
 function selectTreeNode(id) {
   const prev = selectedBboxId;
   // Toggle off if re-clicking the same node.
@@ -1489,11 +1589,19 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
 // rewind), where a fresh replay genuinely needs to be re-applied.
 let highestEventIndex = -1;
 
+// Buffered event log for the active slot — captured as events stream in so
+// the replay-to-gif feature can re-dispatch the build from scratch. Reset by
+// the same hooks that reset `highestEventIndex` (slot switch / rewind /
+// reset). Stored in dispatch order, deduped by index.
+const recordedEvents = [];
+
 function dispatch(event) {
   if (typeof event.index === "number") {
     if (event.index <= highestEventIndex) return;
     highestEventIndex = event.index;
   }
+  recordedEvents.push(event);
+  updateReplayButton();
   appendEvent(event);
   switch (event.kind) {
     case "run.start":
@@ -1643,6 +1751,8 @@ function switchSlot(id) {
   clearAssets();
   treeClear();
   highestEventIndex = -1;
+  recordedEvents.length = 0;
+  updateReplayButton();
   currentSlotId = id;
   try { localStorage.setItem(SLOT_STORAGE_KEY, id); } catch {}
 
@@ -1687,6 +1797,8 @@ async function resetSlot(id) {
     clearAssets();
     treeClear();
     highestEventIndex = -1;
+    recordedEvents.length = 0;
+    updateReplayButton();
     slotNeedsResume = false;
     setStatus(`slot ${id} reset — streaming events…`);
     subscribe(slotEventsUrl(id));
@@ -1730,6 +1842,8 @@ async function rewindTo(index) {
   clearAssets();
   treeClear();
   highestEventIndex = -1;
+  recordedEvents.length = 0;
+  updateReplayButton();
   setStatus(`POST /slots/${currentSlotId}/rewind to ${index} …`);
 
   let res;
@@ -1781,6 +1895,8 @@ async function resumeSlot(id) {
     clearAssets();
     treeClear();
     highestEventIndex = -1;
+    recordedEvents.length = 0;
+    updateReplayButton();
     setStatus(`resumed — streaming events…`);
     subscribe(slotEventsUrl(id));
     refreshSlots();
@@ -1849,3 +1965,365 @@ exportGlbEl.addEventListener("click", async () => {
 
 // Keep tab status dots fresh for slots the user isn't viewing.
 setInterval(refreshSlots, 2000);
+
+// --- replay → gif ----------------------------------------------------------
+//
+// User clicks "replay → gif" → a modal opens. The user can preview the
+// build (re-dispatches the entire `recordedEvents` log against the live
+// scene at controlled speed) and then export an animated GIF.
+//
+// Mechanism: we wipe the current scene, then walk the recorded log,
+// chunking events into per-frame batches. Each batch is dispatched, the
+// renderer draws once, and (in record mode) the canvas pixels are pushed
+// into a gif.js encoder. Mesh GLB loads remain async — they'll pop into
+// the gif whenever the loader resolves, which for cached artifacts is
+// usually within a frame or two.
+
+function updateReplayButton() {
+  if (!replayGifEl) return;
+  replayGifEl.disabled = recordedEvents.length === 0;
+}
+updateReplayButton();
+
+let replayActive = false;       // true while preview or record is running
+let replayCancelRequested = false;
+let replayInProgress = false;   // gates concurrent invocations of run()
+
+function setReplayStatus(text, cls = "") {
+  replayStatusEl.textContent = text;
+  replayStatusEl.className = cls;
+}
+
+function setReplayProgress(frac) {
+  replayProgressBarEl.style.width = `${Math.max(0, Math.min(1, frac)) * 100}%`;
+}
+
+function readReplaySpeed() {
+  return parseFloat(replaySpeedEl.value) || 1;
+}
+
+function readReplayFps() {
+  return parseInt(replayFpsEl.value, 10) || 15;
+}
+
+// Walk the buffered events and group them into per-frame batches so the
+// preview/recording can advance at a fixed framerate. `eventsPerFrame =
+// max(1, round(totalEvents / targetTotalFrames))`, where targetTotalFrames
+// derives from the chosen fps and a base "1 event = 1/speed seconds" pace.
+function planFrames(events, fps, speed) {
+  // Target a build that takes roughly events / speed seconds at 1× — so
+  // total frames at our fps is (events / speed) * fps. Cap at 600 frames
+  // so very long runs don't try to encode minute-long gifs.
+  const targetFrames = Math.min(
+    600,
+    Math.max(8, Math.round((events.length / Math.max(0.25, speed)) * (fps / 30))),
+  );
+  const perFrame = Math.max(1, Math.ceil(events.length / targetFrames));
+  const batches = [];
+  for (let i = 0; i < events.length; i += perFrame) {
+    batches.push(events.slice(i, i + perFrame));
+  }
+  return batches;
+}
+
+function updateDurationEstimate() {
+  const fps = readReplayFps();
+  const speed = readReplaySpeed();
+  const batches = planFrames(recordedEvents, fps, speed);
+  const seconds = batches.length / fps;
+  replayEventCountEl.textContent = String(recordedEvents.length);
+  replayDurationEstEl.textContent = batches.length === 0
+    ? "—"
+    : `${seconds.toFixed(1)}s · ${batches.length} frames`;
+}
+
+replaySpeedEl.addEventListener("input", () => {
+  replaySpeedValEl.textContent = `${parseFloat(replaySpeedEl.value).toFixed(2)}×`;
+  updateDurationEstimate();
+});
+replayFpsEl.addEventListener("input", () => {
+  replayFpsValEl.textContent = `${replayFpsEl.value} fps`;
+  updateDurationEstimate();
+});
+
+function openReplayModal() {
+  if (recordedEvents.length === 0) return;
+  replayModalEl.classList.add("open");
+  replaySpeedValEl.textContent = `${parseFloat(replaySpeedEl.value).toFixed(2)}×`;
+  replayFpsValEl.textContent = `${replayFpsEl.value} fps`;
+  updateDurationEstimate();
+  setReplayStatus("idle");
+  setReplayProgress(0);
+  showReplayPlaceholder();
+}
+
+function closeReplayModal() {
+  // If a replay is mid-run, request cancellation; the run loop checks the
+  // flag between frames and bails out, then we close. If nothing is
+  // running, close immediately.
+  if (replayActive) {
+    replayCancelRequested = true;
+    return;
+  }
+  replayModalEl.classList.remove("open");
+  // Free the gif blob URL when the modal closes — keeping it alive across
+  // sessions would leak memory if the user repeatedly opens/saves.
+  if (lastGifUrl) {
+    URL.revokeObjectURL(lastGifUrl);
+    lastGifUrl = null;
+    lastGifBlob = null;
+    replayResultImgEl.removeAttribute("src");
+    replayDownloadEl.disabled = true;
+  }
+}
+
+replayGifEl.addEventListener("click", openReplayModal);
+replayCloseEl.addEventListener("click", closeReplayModal);
+replayModalEl.addEventListener("click", (ev) => {
+  if (ev.target === replayModalEl) closeReplayModal();
+});
+
+// Snapshot the live scene + ephemeral UI state, wipe everything, replay the
+// recorded log, optionally encode frames into a gif, then leave the scene
+// holding the final-state of the replay (which matches the live state).
+// Returns the encoded blob in record mode, or null in preview mode.
+async function runReplay({ record }) {
+  if (replayInProgress) return null;
+  replayInProgress = true;
+  replayActive = true;
+  replayCancelRequested = false;
+  setReplayProgress(0);
+
+  // Disconnect from the live SSE stream so server-pushed events don't race
+  // the replay. The user can reconnect via the resume / slot-switch paths
+  // afterwards; for a finished run nothing's incoming anyway.
+  const reconnectAfter = currentSource !== null;
+  const slotForReconnect = currentSlotId;
+  if (currentSource) {
+    currentSource.close();
+    currentSource = null;
+  }
+
+  // Snapshot the recorded log + the current camera state so we restore them
+  // after the replay finishes (or the user cancels). The replay reuses the
+  // same dispatch path which resets `highestEventIndex` and clears state, so
+  // we have to take care to leave the user where they started.
+  const events = recordedEvents.slice();
+  const camSnapshot = {
+    pos: camera.position.clone(),
+    target: controls.target.clone(),
+    userMoved: cameraUserMoved,
+  };
+
+  // Wipe everything that the replay will rebuild.
+  clearScene();
+  clearLog();
+  clearAssets();
+  treeClear();
+  highestEventIndex = -1;
+  recordedEvents.length = 0;
+  updateReplayButton();
+
+  const fps = readReplayFps();
+  const speed = readReplaySpeed();
+  const batches = planFrames(events, fps, speed);
+  const frameIntervalMs = 1000 / fps;
+
+  let gif = null;
+  if (record) {
+    if (typeof window.GIF === "undefined") {
+      setReplayStatus("gif.js library failed to load", "err");
+      replayActive = false;
+      replayInProgress = false;
+      return null;
+    }
+    gif = new window.GIF({
+      workers: 2,
+      quality: 10,
+      workerScript: "/vendor/gifjs/gif.worker.js",
+      width: renderer.domElement.width,
+      height: renderer.domElement.height,
+      background: "#101114",
+    });
+    setReplayStatus("recording…", "recording");
+  } else {
+    setReplayStatus("previewing…");
+  }
+
+  // Lock the camera for the duration of the replay — otherwise fitToScene
+  // would refit on every mesh load and the gif would jitter. The user's
+  // original camera framing is restored from camSnapshot at the end.
+  cameraUserMoved = true;
+
+  // Frame the camera on the root zone bbox so the entire scene volume sits
+  // inside the gif frustum. We look it up in the event snapshot rather than
+  // the live scene because clearScene() just dropped every bbox helper.
+  const rootBox = findRootBboxFromEvents(events);
+  if (rootBox && !rootBox.isEmpty()) {
+    frameBoxFully(rootBox, { padding: 1.12 });
+  }
+
+  // Start the preview stage with a blank frame so the user sees the modal
+  // switch out of the placeholder state immediately.
+  replayStageEl.classList.remove("show-result");
+  replayStageEl.classList.remove("empty");
+
+  for (let i = 0; i < batches.length; i++) {
+    if (replayCancelRequested) break;
+    const batch = batches[i];
+    for (const ev of batch) dispatchForReplay(ev);
+    // One render after each batch (renderer.render is also driven by the
+    // animate() loop, but doing it explicitly here guarantees a fresh frame
+    // before capture).
+    controls.update();
+    renderer.render(scene, camera);
+    if (gif) {
+      gif.addFrame(renderer.domElement, { copy: true, delay: frameIntervalMs });
+    }
+    // Mirror the freshly-rendered frame into the in-modal preview canvas
+    // so the user can watch the build play out without needing to look
+    // past the modal at the main viewport.
+    drawReplayFrame(renderer.domElement);
+    setReplayProgress(i / batches.length);
+    // Yield to the browser so it can paint the preview frame and the user
+    // can see progress in real time.
+    await sleep(frameIntervalMs);
+  }
+  setReplayProgress(1);
+
+  let blob = null;
+  if (gif && !replayCancelRequested) {
+    setReplayStatus("encoding gif…", "recording");
+    blob = await new Promise((resolve) => {
+      gif.on("finished", resolve);
+      gif.render();
+    });
+    setReplayStatus(`gif ready · ${(blob.size / 1024).toFixed(1)} KB`, "done");
+    // Swap the stage to an <img> of the encoded blob — animated gifs loop
+    // by default in the browser, so the user sees the final result play.
+    showReplayGifResult(blob);
+  } else if (replayCancelRequested) {
+    setReplayStatus("cancelled");
+  } else {
+    setReplayStatus("preview done", "done");
+  }
+
+  // Restore camera state.
+  camera.position.copy(camSnapshot.pos);
+  controls.target.copy(camSnapshot.target);
+  cameraUserMoved = camSnapshot.userMoved;
+  controls.update();
+
+  replayActive = false;
+  replayInProgress = false;
+  // recordedEvents has been refilled by dispatchForReplay during the loop;
+  // re-enable the button to reflect that.
+  updateReplayButton();
+
+  // Reconnect to the live stream so newly-arriving events flow back into
+  // the buffer. The server replays the snapshot from index 0 on reconnect,
+  // which re-populates `recordedEvents` for the next gif export.
+  if (reconnectAfter && slotForReconnect !== null) {
+    subscribe(slotEventsUrl(slotForReconnect));
+  }
+
+  // If the user clicked the close button while a replay was running, honor
+  // that now that we've cleaned up.
+  if (replayCancelRequested) {
+    replayModalEl.classList.remove("open");
+  }
+  return blob;
+}
+
+// Sibling of dispatch() used during replay. The buffer was wiped before
+// replay started; we refill it as we re-dispatch so the user can immediately
+// run another preview/export without waiting for an SSE reconnect.
+function dispatchForReplay(event) {
+  if (typeof event.index === "number") {
+    if (event.index <= highestEventIndex) return;
+    highestEventIndex = event.index;
+  }
+  recordedEvents.push(event);
+  appendEvent(event);
+  switch (event.kind) {
+    case "run.start": setStatus(`run :: ${event.model}`); break;
+    case "run.done": setStatus("run complete"); break;
+    case "run.error": setStatus(`error: ${event.message}`, "err"); break;
+    case "bbox":
+      loadBbox(event);
+      treeUpsert(event.id, {
+        parentId: event.parent_id ?? null,
+        prompt: event.prompt ?? null,
+        kind: event.node_kind ?? "zone",
+        origin: event.origin,
+        dimensions: event.dimensions,
+        proxyShape: event.proxy_shape ?? null,
+      });
+      renderTree();
+      break;
+    case "divider.decompose":
+      for (const c of event.children ?? []) {
+        treeUpsert(c.id, { parentId: event.node, prompt: c.prompt, kind: "zone" });
+      }
+      renderTree();
+      break;
+    case "divider.zone_plan":
+      if (event.node && typeof event.plan === "string") {
+        treeUpsert(event.node, { plan: event.plan });
+      }
+      break;
+    case "step": treeSetPhase(event.node, event.phase); break;
+    case "mesh.submit": treeSetPhase(event.id, "generating_mesh"); break;
+    case "image":
+      upsertAsset(event.id, { imageUrl: event.url, prompt: event.prompt });
+      if (typeof event.prompt === "string") {
+        treeUpsert(event.id, { imagePrompt: event.prompt });
+      }
+      break;
+    case "model": loadModel(event); treeSetPhase(event.id, "done"); break;
+  }
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function lockReplayButtons(locked) {
+  replayPreviewEl.disabled = locked;
+  replayRenderEl.disabled = locked;
+  // Download stays disabled until a successful render completes — flip it
+  // off here so an in-flight render can't be re-downloaded mid-encode, but
+  // don't blindly re-enable on unlock; showReplayGifResult will.
+  if (locked) replayDownloadEl.disabled = true;
+}
+
+replayPreviewEl.addEventListener("click", async () => {
+  if (replayInProgress) return;
+  lockReplayButtons(true);
+  try {
+    await runReplay({ record: false });
+  } finally {
+    lockReplayButtons(false);
+    // Re-enable download only if we still have a previously-rendered gif.
+    replayDownloadEl.disabled = lastGifBlob === null;
+  }
+});
+
+replayRenderEl.addEventListener("click", async () => {
+  if (replayInProgress) return;
+  lockReplayButtons(true);
+  try {
+    await runReplay({ record: true });
+  } finally {
+    lockReplayButtons(false);
+    replayDownloadEl.disabled = lastGifBlob === null;
+  }
+});
+
+replayDownloadEl.addEventListener("click", () => {
+  if (!lastGifBlob) return;
+  const a = document.createElement("a");
+  a.href = lastGifUrl;
+  a.download = `${currentSlotId ?? "replay"}.gif`;
+  a.click();
+});
