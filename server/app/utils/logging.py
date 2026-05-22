@@ -73,6 +73,8 @@ class SlotLog:
             self.state["status"] = "done"
         elif last_kind == "run.error":
             self.state["status"] = "error"
+        elif last_kind == "run.paused":
+            self.state["status"] = "paused"
         elif self.state["events"]:
             self.state["status"] = "running"
         else:
@@ -95,6 +97,8 @@ class SlotLog:
             self.state["status"] = "done"
         elif last_kind == "run.error":
             self.state["status"] = "error"
+        elif last_kind == "run.paused":
+            self.state["status"] = "paused"
         elif self.state["events"]:
             self.state["status"] = "running"
         else:

@@ -128,7 +128,6 @@ def main() -> int:
             "uv", "run", "uvicorn", "app.main:app",
             "--host", SERVER_HOST, "--port", str(server_port),
             "--log-level", "info",
-            "--reload",
         ],
         cwd=SERVER_DIR,
         env={**env, "STARSHOT_RUNS_DIR": str(runs_dir)},

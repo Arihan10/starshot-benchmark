@@ -98,6 +98,7 @@ const KIND_COLOR = {
   "run.start": "#9ad4ff",
   "run.done": "#8bd17c",
   "run.error": "#ff8080",
+  "run.paused": "#e09050",
   "bbox": "#e0c271",
   "image": "#f6a96a",
   "model": "#c586d1",
@@ -627,6 +628,7 @@ framesToggleEl.addEventListener("click", () => {
   localStorage.setItem(FRAMES_VISIBLE_STORAGE_KEY, framesShown ? "1" : "0");
   applyFramesToggleLabel();
   refreshAllFrameModelVisibility();
+  refreshAllSolidFillVisibility();
 });
 
 // "pick: inner" — only matters in bbox-only mode (bboxes: on). When ON,
@@ -1234,7 +1236,13 @@ function rebuildAllSolidFills() {
 function applySolidFillVisibility(id) {
   const mesh = solidFills.get(id);
   if (!mesh) return;
-  mesh.visible = !effectivelyHidden(id);
+  const isFrame = treeNodes.get(id)?.kind === "frame";
+  const frameOk = isFrame ? framesShown : true;
+  mesh.visible = frameOk && !effectivelyHidden(id);
+}
+
+function refreshAllSolidFillVisibility() {
+  for (const id of solidFills.keys()) applySolidFillVisibility(id);
 }
 
 function applyBboxColor(id) {
@@ -1740,6 +1748,11 @@ function dispatch(event) {
       if (currentSource) { currentSource.close(); currentSource = null; }
       refreshSlots();
       break;
+    case "run.paused":
+      setStatus("paused");
+      if (currentSource) { currentSource.close(); currentSource = null; }
+      refreshSlots();
+      break;
     case "bbox":
       loadBbox(event);
       treeUpsert(event.id, {
@@ -1850,6 +1863,11 @@ function updateResumeButton() {
     resumeEl.className = "error";
     resumeEl.textContent = "retry";
     resumeEl.title = "Retry the failed run";
+  } else if (status === "running") {
+    resumeEl.style.display = "";
+    resumeEl.className = "running";
+    resumeEl.textContent = "pause";
+    resumeEl.title = "Pause this run";
   } else if (slotNeedsResume && currentSlotId !== null) {
     slotNeedsResume = false;
     subscribe(slotEventsUrl(currentSlotId));
@@ -2035,8 +2053,34 @@ async function resumeSlot(id) {
   }
 }
 
+async function pauseSlot(id) {
+  resumeEl.disabled = true;
+  try {
+    const res = await fetch(
+      new URL(`/slots/${encodeURIComponent(id)}/pause`, SERVER_URL),
+      { method: "POST" },
+    );
+    if (!res.ok) {
+      setStatus(`pause failed: HTTP ${res.status}`, "err");
+      return;
+    }
+    setStatus("paused");
+    refreshSlots();
+  } catch (e) {
+    setStatus(`pause failed: ${e.message}`, "err");
+  } finally {
+    resumeEl.disabled = false;
+  }
+}
+
 resumeEl.addEventListener("click", () => {
-  if (currentSlotId !== null) resumeSlot(currentSlotId);
+  if (currentSlotId === null) return;
+  const slot = slotSummaries.find((s) => s.id === currentSlotId);
+  if (slot?.status === "running") {
+    pauseSlot(currentSlotId);
+  } else {
+    resumeSlot(currentSlotId);
+  }
 });
 
 document.getElementById("zoom-in").addEventListener("click", () => _dolly(0.8));
@@ -2377,6 +2421,7 @@ function dispatchForReplay(event) {
     case "run.start": setStatus(`run :: ${event.model}`); break;
     case "run.done": setStatus("run complete"); break;
     case "run.error": setStatus(`error: ${event.message}`, "err"); break;
+    case "run.paused": setStatus("paused"); break;
     case "bbox":
       loadBbox(event);
       treeUpsert(event.id, {

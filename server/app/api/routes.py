@@ -130,11 +130,31 @@ def create_app() -> FastAPI:
             # anchor its events. From here on it's identical to a resume.
             slot_log.start_run(slot.prompt, DEFAULT_MODEL)
         else:
-            if events and events[-1].get("kind") == "run.error":
+            # Drop the terminal sentinel so cache lookups don't trip over it
+            # and so the resumed run lands clean events after the prior tail.
+            if events and events[-1].get("kind") in ("run.error", "run.paused"):
                 slot_log.truncate_events_to(len(events) - 1)
             slot_log.state["model"] = DEFAULT_MODEL
             slot_log.state["status"] = "running"
         _tasks[slot.id] = asyncio.create_task(_run(slot.id))
+        return {"slot_id": slot.id}
+
+    @app.post("/slots/{slot_id}/pause")
+    async def slot_pause(slot_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        slot = _require_slot(slot_id)
+        slot_log = _slot_logs[slot_id]
+        status = slot_log.state.get("status")
+        if status != "running":
+            raise HTTPException(
+                status_code=400,
+                detail=f"slot is {status}, not pausable",
+            )
+        await _cancel_task(slot_id)
+        # _cancel_task awaits the cancellation, so the pipeline task has
+        # already torn down (including generation.cancel_pending via _run's
+        # CancelledError branch) by the time we emit the sentinel.
+        slot_log.state["status"] = "paused"
+        slot_log.log("run.paused")
         return {"slot_id": slot.id}
 
     @app.post("/slots/{slot_id}/reset")
@@ -229,12 +249,12 @@ async def _sse(
     try:
         for event in snapshot:
             yield f"data: {json.dumps(event)}\n\n"
-            if event["kind"] in {"run.done", "run.error"}:
+            if event["kind"] in {"run.done", "run.error", "run.paused"}:
                 return
         while True:
             event = await q.get()
             yield f"data: {json.dumps(event)}\n\n"
-            if event["kind"] in {"run.done", "run.error"}:
+            if event["kind"] in {"run.done", "run.error", "run.paused"}:
                 return
     finally:
         slot_log.unsubscribe(q)
