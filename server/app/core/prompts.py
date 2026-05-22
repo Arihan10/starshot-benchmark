@@ -363,6 +363,8 @@ geography with no distinct identity)
 a zone is a place large enough to contain multiple objects arranged inside \
 it. a single landmark, monument, centerpiece, or hero prop — no matter how \
 important — is an OBJECT inside a zone, not a zone of its own.
+
+DO NOT design your prompt around the concept of explicit zonal fragmentation; keep this concept of "zones" in mind ONLY for the is_atomic assessment AFTER the base plan is generated.
 </zone_decomposition>
 
 <thinking>
@@ -376,7 +378,7 @@ in the interest of winning, always start by thinking of the overall narrative \
 and premise such that you provide the option for the pipeline to eventually \
 build something truly impressive enough to stand out creatively from all the \
 other LLMs.
-</thinking>\
+</thinking>
 """
 
     # Nested zones use adapted competitive prompt format

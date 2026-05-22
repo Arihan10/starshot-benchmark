@@ -10,13 +10,26 @@ convention.
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, BeforeValidator, ConfigDict, Field
 
 Vec3Tuple = tuple[float, float, float]
 
-Orientation = Literal[-180, -135, -90, -45, 0, 45, 90, 135, 180]
+
+def _coerce_int(v: object) -> object:
+    if isinstance(v, str):
+        try:
+            return int(v)
+        except ValueError:
+            pass
+    return v
+
+
+Orientation = Annotated[
+    Literal[-180, -135, -90, -45, 0, 45, 90, 135, 180],
+    BeforeValidator(_coerce_int),
+]
 
 Vec3Cm = tuple[float, float, float]
 
