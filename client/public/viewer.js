@@ -10,6 +10,7 @@ const SERVER_URL = document
 const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
+const PICK_INNER_STORAGE_KEY = "starshot.pickInner";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
@@ -18,6 +19,7 @@ const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
+const pickInnerToggleEl = document.getElementById("pick-inner-toggle");
 const exportGlbEl = document.getElementById("export-glb");
 const assetsEl = document.getElementById("assets");
 const assetsBodyEl = document.getElementById("assets-body");
@@ -26,6 +28,7 @@ const assetsHeaderEl = document.getElementById("assets-header");
 const assetsToggleEl = document.getElementById("assets-toggle");
 const treeEl = document.getElementById("tree");
 const treeBodyEl = document.getElementById("tree-body");
+const treeDetailEl = document.getElementById("tree-detail");
 const treeHeaderEl = document.getElementById("tree-header");
 const treeToggleEl = document.getElementById("tree-toggle");
 const treeActiveEl = document.getElementById("tree-active");
@@ -64,8 +67,16 @@ function fmtValue(v) {
   return String(v);
 }
 
+// Fields whose values are LLM thinking / chain-of-thought traces. Stripped at
+// the display layer so the log panel stays focused on pipeline signal; the
+// underlying events.jsonl still contains them for debugging.
+const HIDDEN_LOG_FIELDS = new Set(["reasoning", "thinking"]);
+
 function appendEvent(event) {
-  const { kind, index, ...fields } = event;
+  const { kind, index, ...rest } = event;
+  const fields = Object.fromEntries(
+    Object.entries(rest).filter(([k]) => !HIDDEN_LOG_FIELDS.has(k)),
+  );
   const p = document.createElement("p");
   p.className = "line";
   if (typeof index === "number") p.dataset.eventIndex = String(index);
@@ -207,7 +218,12 @@ assetsHeaderEl.addEventListener("click", () => {
 // placed) or by `divider.decompose` (announces children before their bboxes
 // are resolved, so the tree shows pending placeholders). The `step` event
 // drives the per-node phase badge and the global "active" highlight.
-const treeNodes = new Map(); // id -> { id, parentId, prompt, kind, phase, order }
+//
+// Extra fields used by the hover tooltip:
+//   plan         — zone plan text from `divider.zone_plan` (zones only)
+//   imagePrompt  — noun phrase actually sent to Banana+Trellis, from the
+//                  `image` event (objects/frames once they've been generated)
+const treeNodes = new Map(); // id -> { id, parentId, prompt, kind, phase, order, plan?, imagePrompt? }
 const treeChildren = new Map(); // parentId -> [childIds] in insertion order
 let treeRootId = null;
 let treeActiveId = null;
@@ -266,6 +282,7 @@ function treeSetPhase(id, phase) {
     // the highlight on it until the next step event moves it.
   }
   renderTree();
+  if (id === selectedBboxId) renderTreeDetail();
 }
 
 function treeClear() {
@@ -277,6 +294,8 @@ function treeClear() {
   hiddenIds.clear();
   treeBodyEl.innerHTML = "";
   treeActiveEl.textContent = "";
+  treeDetailEl.innerHTML = "";
+  treeEl.classList.remove("detail-open");
 }
 
 // True if `id` itself or any ancestor is in `hiddenIds`. The descendant
@@ -531,6 +550,10 @@ bboxToggleEl.addEventListener("click", () => {
   localStorage.setItem(BBOX_VISIBLE_STORAGE_KEY, bboxesShown ? "1" : "0");
   applyBboxToggleLabel();
   refreshAllBboxVisibility();
+  // Picking rule depends on bboxesShown — re-pick at the current cursor
+  // position so the hover updates immediately instead of waiting for a
+  // mouse move.
+  pointerDirty = true;
 });
 
 let framesShown = localStorage.getItem(FRAMES_VISIBLE_STORAGE_KEY) !== "0";
@@ -544,6 +567,25 @@ framesToggleEl.addEventListener("click", () => {
   localStorage.setItem(FRAMES_VISIBLE_STORAGE_KEY, framesShown ? "1" : "0");
   applyFramesToggleLabel();
   refreshAllFrameModelVisibility();
+});
+
+// "pick: inner" — only matters in bbox-only mode (bboxes: on). When ON,
+// picking prefers the smallest/innermost bbox under the cursor so a nested
+// object inside another object's bbox can be hovered & selected. When OFF,
+// picking uses closest ray-entry (the visible wireframe face you're pointing
+// at wins). Default OFF so newly-loaded sessions keep the "what you see is
+// what you pick" behaviour.
+let pickInner = localStorage.getItem(PICK_INNER_STORAGE_KEY) === "1";
+function applyPickInnerToggleLabel() {
+  pickInnerToggleEl.textContent = `pick: ${pickInner ? "inner" : "outer"}`;
+  pickInnerToggleEl.classList.toggle("off", !pickInner);
+}
+applyPickInnerToggleLabel();
+pickInnerToggleEl.addEventListener("click", () => {
+  pickInner = !pickInner;
+  localStorage.setItem(PICK_INNER_STORAGE_KEY, pickInner ? "1" : "0");
+  applyPickInnerToggleLabel();
+  pointerDirty = true;
 });
 const bboxes = new Map(); // id -> THREE.Box3Helper
 const proxies = new Map(); // id -> THREE.Mesh (wireframe proxy silhouette)
@@ -571,8 +613,8 @@ const tooltip = document.createElement("div");
 tooltip.id = "bbox-tooltip";
 tooltip.style.cssText = [
   "position: fixed",
-  "padding: 3px 8px",
-  "background: rgba(22, 24, 29, 0.92)",
+  "padding: 5px 9px",
+  "background: rgba(22, 24, 29, 0.94)",
   "color: #e6e6e6",
   "border: 1px solid #2a2d35",
   "border-radius: 4px",
@@ -580,8 +622,17 @@ tooltip.style.cssText = [
   "pointer-events: none",
   "display: none",
   "z-index: 10",
+  "max-width: 360px",
+  "white-space: pre-wrap",
+  "line-height: 1.35",
 ].join("; ");
 document.body.appendChild(tooltip);
+
+const TOOLTIP_KIND_COLOR = {
+  zone: "#9ad4ff",
+  object: "#8bd17c",
+  frame: "#7fb3d5",
+};
 
 const camera = new THREE.PerspectiveCamera(
   50,
@@ -1091,6 +1142,7 @@ function selectTreeNode(id) {
     applyBboxVisibility(selectedBboxId);
   }
   renderTree();
+  renderTreeDetail();
   if (selectedBboxId !== null) {
     const helper = bboxes.get(selectedBboxId);
     if (helper) {
@@ -1102,11 +1154,224 @@ function selectTreeNode(id) {
   }
 }
 
-function positionTooltip(clientX, clientY, text) {
-  tooltip.textContent = text;
-  tooltip.style.left = `${clientX + 12}px`;
-  tooltip.style.top = `${clientY + 12}px`;
+// --- detail panel -----------------------------------------------------------
+// When a node is selected, the tree-body is hidden and this panel takes over
+// the same slot to show the full prompts/plans/image-prompts for that node.
+// The panel re-renders on every event that mutates the selected node (bbox,
+// zone_plan, image, step) so it stays in sync with streamed updates.
+
+function fmtMeters(arr) {
+  if (!Array.isArray(arr) || arr.length !== 3) return "—";
+  return arr.map((n) => (Number.isInteger(n) ? String(n) : n.toFixed(2))).join(", ");
+}
+
+function ancestorChain(id) {
+  const chain = [];
+  let cur = treeNodes.get(id)?.parentId ?? null;
+  while (cur !== null) {
+    const node = treeNodes.get(cur);
+    if (!node) break;
+    chain.unshift(node);
+    cur = node.parentId ?? null;
+  }
+  return chain;
+}
+
+function renderTreeDetail() {
+  const id = selectedBboxId;
+  if (id === null) {
+    treeEl.classList.remove("detail-open");
+    treeDetailEl.innerHTML = "";
+    return;
+  }
+  const node = treeNodes.get(id);
+  if (!node) {
+    treeEl.classList.remove("detail-open");
+    treeDetailEl.innerHTML = "";
+    return;
+  }
+  treeEl.classList.add("detail-open");
+  treeDetailEl.textContent = "";
+
+  // Back-to-tree button — also clears the selection so the bbox highlight
+  // drops and the tree resumes its normal listing.
+  const back = document.createElement("button");
+  back.type = "button";
+  back.className = "detail-back";
+  back.textContent = "← back to tree";
+  back.addEventListener("click", () => selectTreeNode(id)); // toggle off
+  treeDetailEl.appendChild(back);
+
+  // Header row: kind tag + id.
+  const idRow = document.createElement("div");
+  idRow.className = "detail-id-row";
+  const kindTag = document.createElement("span");
+  kindTag.className = "detail-kind";
+  kindTag.textContent = `[${node.kind ?? "zone"}]`;
+  idRow.appendChild(kindTag);
+  const idEl = document.createElement("span");
+  idEl.className = `detail-id ${node.kind ?? "zone"}`;
+  idEl.textContent = node.id;
+  idRow.appendChild(idEl);
+  treeDetailEl.appendChild(idRow);
+
+  // Breadcrumb of ancestors — each clickable to jump selection up the tree.
+  const chain = ancestorChain(id);
+  if (chain.length > 0) {
+    const path = document.createElement("div");
+    path.className = "detail-path";
+    for (let i = 0; i < chain.length; i++) {
+      const a = document.createElement("a");
+      a.textContent = chain[i].id;
+      const targetId = chain[i].id;
+      a.addEventListener("click", () => selectTreeNode(targetId));
+      path.appendChild(a);
+      const sep = document.createElement("span");
+      sep.className = "sep";
+      sep.textContent = "›";
+      path.appendChild(sep);
+    }
+    const here = document.createElement("span");
+    here.textContent = node.id;
+    here.style.color = "#8a8f99";
+    path.appendChild(here);
+    treeDetailEl.appendChild(path);
+  }
+
+  // Meta row: phase / bbox / proxy shape.
+  const meta = document.createElement("div");
+  meta.className = "detail-meta-row";
+  function metaEntry(label, value) {
+    const span = document.createElement("span");
+    const lbl = document.createElement("span");
+    lbl.textContent = `${label} `;
+    span.appendChild(lbl);
+    const b = document.createElement("b");
+    b.textContent = value;
+    span.appendChild(b);
+    return span;
+  }
+  meta.appendChild(metaEntry("phase:", node.phase ?? "pending"));
+  if (Array.isArray(node.origin) && Array.isArray(node.dimensions)) {
+    meta.appendChild(metaEntry("origin:", `[${fmtMeters(node.origin)}]`));
+    meta.appendChild(metaEntry("size:", `[${fmtMeters(node.dimensions)}] m`));
+  }
+  if (node.proxyShape) {
+    meta.appendChild(metaEntry("proxy:", node.proxyShape));
+  }
+  treeDetailEl.appendChild(meta);
+
+  // Prompt / plan / image-prompt sections — labelled so a reader can tell
+  // which pipeline step authored each piece of text.
+  function section(label, text) {
+    const wrap = document.createElement("div");
+    wrap.className = "detail-section";
+    const lab = document.createElement("div");
+    lab.className = "label";
+    lab.textContent = label;
+    wrap.appendChild(lab);
+    const body = document.createElement("div");
+    body.className = "body";
+    if (text) {
+      body.textContent = text;
+    } else {
+      body.classList.add("detail-empty");
+      body.textContent = "(not yet authored)";
+    }
+    wrap.appendChild(body);
+    treeDetailEl.appendChild(wrap);
+  }
+
+  section("seed prompt", node.prompt);
+  if (node.kind === "zone" || node.plan) {
+    section("zone plan", node.plan);
+  }
+  if (node.kind !== "zone") {
+    section("image prompt", node.imagePrompt);
+  }
+
+  // Children list — for zones with sub-zones, lets the user drill into a
+  // child without leaving the detail view.
+  const childIds = treeChildren.get(id) ?? [];
+  if (childIds.length > 0) {
+    const wrap = document.createElement("div");
+    wrap.className = "detail-section";
+    const lab = document.createElement("div");
+    lab.className = "label";
+    lab.textContent = `children (${childIds.length})`;
+    wrap.appendChild(lab);
+    const list = document.createElement("div");
+    list.className = "detail-children";
+    for (const cid of childIds) {
+      const a = document.createElement("a");
+      const cn = treeNodes.get(cid);
+      a.textContent = cn ? `${cn.id} — ${truncate(cn.prompt ?? "", 60)}` : cid;
+      a.addEventListener("click", () => selectTreeNode(cid));
+      list.appendChild(a);
+    }
+    wrap.appendChild(list);
+    treeDetailEl.appendChild(wrap);
+  }
+
+  treeDetailEl.scrollTop = 0;
+}
+
+function positionTooltip(clientX, clientY, id) {
+  const node = treeNodes.get(id);
+  const kind = node?.kind ?? "zone";
+  const kindColor = TOOLTIP_KIND_COLOR[kind] ?? "#e6e6e6";
+
+  // Build with DOM nodes rather than innerHTML so the prompt (LLM-authored
+  // text) can't smuggle markup into the tooltip.
+  tooltip.textContent = "";
+  const head = document.createElement("div");
+  const kindEl = document.createElement("span");
+  kindEl.textContent = `[${kind}]`;
+  kindEl.style.color = kindColor;
+  head.appendChild(kindEl);
+  head.appendChild(document.createTextNode(` ${id}`));
+  tooltip.appendChild(head);
+
+  // Sections: each carries a small label so the user can tell which prompt
+  // came from which pipeline step. Order is "earliest in the pipeline first"
+  // so reading top-to-bottom matches the order of LLM rewrites.
+  //   seed  — zone_decompose / object_decomp output (what the LLM was given
+  //           as the brief for this node)
+  //   plan  — zone_plan output (zones only)
+  //   image — image-prompt noun phrase actually sent to Banana+Trellis
+  //           (objects/frames only, once generated)
+  const sections = [];
+  if (node?.prompt) sections.push(["seed", node.prompt]);
+  if (kind === "zone" && node?.plan) sections.push(["plan", node.plan]);
+  if (kind !== "zone" && node?.imagePrompt && node.imagePrompt !== node.prompt) {
+    sections.push(["image", node.imagePrompt]);
+  }
+  for (const [label, text] of sections) {
+    const row = document.createElement("div");
+    row.style.marginTop = "4px";
+    row.style.color = "#bdbdbd";
+    const lbl = document.createElement("span");
+    lbl.textContent = `${label}: `;
+    lbl.style.color = "#7a8190";
+    row.appendChild(lbl);
+    row.appendChild(document.createTextNode(text));
+    tooltip.appendChild(row);
+  }
+
+  // Flip left/up when the tooltip would overflow the viewport so the cursor
+  // can keep approaching the hovered bbox from any direction.
   tooltip.style.display = "block";
+  tooltip.style.left = "0px";
+  tooltip.style.top = "0px";
+  const w = tooltip.offsetWidth;
+  const h = tooltip.offsetHeight;
+  const pad = 12;
+  let x = clientX + pad;
+  let y = clientY + pad;
+  if (x + w > window.innerWidth) x = clientX - pad - w;
+  if (y + h > window.innerHeight) y = clientY - pad - h;
+  tooltip.style.left = `${Math.max(0, x)}px`;
+  tooltip.style.top = `${Math.max(0, y)}px`;
 }
 
 function pickHoveredBboxId() {
@@ -1114,23 +1379,38 @@ function pickHoveredBboxId() {
   let bestKindRank = Infinity;
   let bestDistance = Infinity;
   let bestSize = Infinity;
-  for (const [id, model] of modelsById) {
-    if (!model.visible) continue;
-    const helper = bboxes.get(id);
-    if (!helper) continue;
+  // Three regimes:
+  //  - bboxes: off → user is visually pointing at meshes. Prefer the inner
+  //    object/frame so a tiny prop inside a big zone is still pickable.
+  //  - bboxes: on, pick: outer → wireframes are visible; pick the one whose
+  //    face the ray hits first (closest entry point), so hovering matches
+  //    what's drawn.
+  //  - bboxes: on, pick: inner → still in bbox-only mode, but the user is
+  //    drilling into nested objects: prefer the smallest/innermost bbox so
+  //    an object enclosed by another object's bbox becomes pickable.
+  const innerPreferred = !bboxesShown || pickInner;
+  for (const [id, helper] of bboxes) {
+    if (effectivelyHidden(id)) continue;
+    const kind = treeNodes.get(id)?.kind;
     if (!raycaster.ray.intersectBox(helper.box, bboxPickPoint)) continue;
 
-    const kind = treeNodes.get(id)?.kind;
     const kindRank = kind === "object" ? 0 : kind === "frame" ? 1 : 2;
     const distance = bboxPickPoint.distanceToSquared(camera.position);
     helper.box.getSize(bboxPickSize);
     const sizeTieBreaker = bboxPickSize.lengthSq();
 
-    if (
-      kindRank < bestKindRank ||
-      (kindRank === bestKindRank && distance < bestDistance) ||
-      (kindRank === bestKindRank && distance === bestDistance && sizeTieBreaker < bestSize)
-    ) {
+    const better = innerPreferred
+      ? (
+          kindRank < bestKindRank ||
+          (kindRank === bestKindRank && sizeTieBreaker < bestSize) ||
+          (kindRank === bestKindRank && sizeTieBreaker === bestSize && distance < bestDistance)
+        )
+      : (
+          distance < bestDistance ||
+          (distance === bestDistance && kindRank < bestKindRank) ||
+          (distance === bestDistance && kindRank === bestKindRank && sizeTieBreaker < bestSize)
+        );
+    if (better) {
       bestId = id;
       bestKindRank = kindRank;
       bestDistance = distance;
@@ -1152,6 +1432,49 @@ renderer.domElement.addEventListener("pointermove", (ev) => {
 renderer.domElement.addEventListener("pointerleave", () => {
   setHoveredBbox(null);
   tooltip.style.display = "none";
+});
+
+// Click-to-select on the canvas. OrbitControls also listens for pointerdown
+// to start orbiting, so we have to distinguish a click from the end of an
+// orbit drag. Approach: snapshot the down position + time, and only treat
+// pointerup as a selection click when the cursor barely moved and the gesture
+// was short. Anything more is a camera drag — pass through to OrbitControls.
+const CLICK_MAX_MOVE_PX = 4;
+const CLICK_MAX_DURATION_MS = 400;
+let _downX = 0;
+let _downY = 0;
+let _downT = 0;
+let _downButton = -1;
+
+renderer.domElement.addEventListener("pointerdown", (ev) => {
+  _downX = ev.clientX;
+  _downY = ev.clientY;
+  _downT = performance.now();
+  _downButton = ev.button;
+});
+
+renderer.domElement.addEventListener("pointerup", (ev) => {
+  if (_downButton !== 0 || ev.button !== 0) return; // left-click only
+  const dx = ev.clientX - _downX;
+  const dy = ev.clientY - _downY;
+  const dt = performance.now() - _downT;
+  if (Math.hypot(dx, dy) > CLICK_MAX_MOVE_PX || dt > CLICK_MAX_DURATION_MS) return;
+
+  // Reuse the hover picker — same kind-rank / inner-vs-outer rules apply
+  // so selecting matches whatever the hover tooltip is showing.
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const id = pickHoveredBboxId();
+  if (id !== null) {
+    selectTreeNode(id);
+    // Scroll the corresponding tree row into view so the link between the
+    // 3D click and the (now-open) detail panel is obvious if the user closes
+    // the detail view.
+    const row = treeBodyEl.querySelector(`.tree-node[data-id="${CSS.escape(id)}"]`);
+    if (row) row.scrollIntoView({ block: "nearest" });
+  }
 });
 
 // --- event dispatch ---------------------------------------------------------
@@ -1192,8 +1515,12 @@ function dispatch(event) {
         parentId: event.parent_id ?? null,
         prompt: event.prompt ?? null,
         kind: event.node_kind ?? "zone",
+        origin: event.origin,
+        dimensions: event.dimensions,
+        proxyShape: event.proxy_shape ?? null,
       });
       renderTree();
+      if (event.id === selectedBboxId) renderTreeDetail();
       break;
     case "divider.decompose":
       // Pre-declare children so the tree shows them (in pending state) before
@@ -1202,6 +1529,15 @@ function dispatch(event) {
         treeUpsert(c.id, { parentId: event.node, prompt: c.prompt, kind: "zone" });
       }
       renderTree();
+      break;
+    case "divider.zone_plan":
+      // Stash the authored zone plan on the node so the tooltip can surface
+      // it. The plan often arrives before the bbox is resolved, so upsert
+      // (which tolerates a half-formed node) rather than gating on existence.
+      if (event.node && typeof event.plan === "string") {
+        treeUpsert(event.node, { plan: event.plan });
+        if (event.node === selectedBboxId) renderTreeDetail();
+      }
       break;
     case "step":
       treeSetPhase(event.node, event.phase);
@@ -1212,6 +1548,12 @@ function dispatch(event) {
       break;
     case "image":
       upsertAsset(event.id, { imageUrl: event.url, prompt: event.prompt });
+      // Image-prompt noun phrase (post-rewrite) — distinct from the seed
+      // prompt stored on the bbox event. Tooltip + detail panel show both.
+      if (typeof event.prompt === "string") {
+        treeUpsert(event.id, { imagePrompt: event.prompt });
+        if (event.id === selectedBboxId) renderTreeDetail();
+      }
       break;
     case "model":
       loadModel(event);

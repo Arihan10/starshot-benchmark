@@ -130,6 +130,7 @@
             }
             #bbox-toggle,
             #frames-toggle,
+            #pick-inner-toggle,
             #export-glb {
                 padding: 5px 10px;
                 border-radius: 4px;
@@ -146,6 +147,7 @@
             }
             #bbox-toggle:hover,
             #frames-toggle:hover,
+            #pick-inner-toggle:hover,
             #export-glb:hover {
                 border-color: #4a8fd8;
                 color: #e6e6e6;
@@ -155,7 +157,8 @@
                 cursor: default;
             }
             #bbox-toggle.off,
-            #frames-toggle.off {
+            #frames-toggle.off,
+            #pick-inner-toggle.off {
                 background: #2a2d35;
                 color: #5a5e68;
             }
@@ -476,6 +479,123 @@
                 color: #5a5e68;
                 border-color: #2a2d35;
             }
+            /* Detail panel — replaces tree body when a node is selected */
+            #tree.detail-open #tree-body,
+            #tree.detail-open #tree-search-row {
+                display: none;
+            }
+            #tree-detail {
+                display: none;
+                overflow: auto;
+                padding: 8px 10px 10px;
+                font-size: 11px;
+                line-height: 1.45;
+            }
+            #tree.detail-open #tree-detail {
+                display: block;
+            }
+            #tree-detail .detail-back {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                padding: 3px 8px;
+                margin-bottom: 8px;
+                background: #16181d;
+                border: 1px solid #2a2d35;
+                border-radius: 3px;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+            }
+            #tree-detail .detail-back:hover {
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            #tree-detail .detail-id-row {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+                margin-bottom: 4px;
+                flex-wrap: wrap;
+            }
+            #tree-detail .detail-id {
+                font-weight: 600;
+                font-size: 12px;
+                word-break: break-all;
+            }
+            #tree-detail .detail-id.zone { color: #e0c271; }
+            #tree-detail .detail-id.object { color: #c586d1; }
+            #tree-detail .detail-id.frame { color: #7fb3d5; }
+            #tree-detail .detail-kind {
+                color: #8a8f99;
+                text-transform: uppercase;
+                font-size: 10px;
+                letter-spacing: 0.04em;
+            }
+            #tree-detail .detail-path {
+                color: #5a5e68;
+                font-size: 10px;
+                word-break: break-all;
+                margin-bottom: 8px;
+            }
+            #tree-detail .detail-path .sep { color: #3a3d45; padding: 0 3px; }
+            #tree-detail .detail-path a {
+                color: inherit;
+                text-decoration: none;
+                cursor: pointer;
+            }
+            #tree-detail .detail-path a:hover { color: #b8bcc4; }
+            #tree-detail .detail-meta-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px 12px;
+                margin-bottom: 8px;
+                color: #8a8f99;
+                font-size: 10px;
+            }
+            #tree-detail .detail-meta-row span b {
+                color: #b8bcc4;
+                font-weight: normal;
+            }
+            #tree-detail .detail-section {
+                margin-top: 10px;
+                padding-top: 8px;
+                border-top: 1px solid #2a2d35;
+            }
+            #tree-detail .detail-section .label {
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                margin-bottom: 3px;
+            }
+            #tree-detail .detail-section .body {
+                color: #d6d9df;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+            }
+            #tree-detail .detail-empty {
+                color: #5a5e68;
+                font-style: italic;
+            }
+            #tree-detail .detail-children {
+                margin-top: 4px;
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            #tree-detail .detail-children a {
+                color: #b8bcc4;
+                text-decoration: none;
+                cursor: pointer;
+                padding: 2px 4px;
+                border-radius: 2px;
+            }
+            #tree-detail .detail-children a:hover {
+                background: rgba(74, 143, 216, 0.15);
+                color: #e6e6e6;
+            }
             .tree-children {
                 padding-left: 12px;
                 border-left: 1px dashed #2a2d35;
@@ -619,6 +739,7 @@
         <div id="slots">
             <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
             <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
+            <button id="pick-inner-toggle" type="button" title="In bbox-only mode: prefer the innermost (smallest) bbox under the cursor, so nested objects can be picked through their containers">pick: inner</button>
             <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
             <button id="slot-resume" type="button" style="display:none">resume</button>
             <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
@@ -636,6 +757,7 @@
                 <span id="tree-search-count"></span>
             </div>
             <div id="tree-body"></div>
+            <div id="tree-detail"></div>
         </div>
         <div id="assets">
             <div id="assets-header">

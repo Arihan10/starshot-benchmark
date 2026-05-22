@@ -607,7 +607,59 @@ zone's silhouette is non-rectangular, otherwise null/omitted
 parent or to an earlier sibling already listed
 
 No additional prose, markdown, or code fences.
-</output>\
+</output>
+
+<input>
+  * The zone being decomposed: its id (PARENT_ID), prompt, and axis-aligned \
+bounding box (in meters, under the canonical front view: +X right, +Y up, +Z \
+front).
+  * The ZONE PLAN — the high-level character/intent plan authored upstream \
+for this zone. This is your primary signal. Let its named features and \
+implied loci drive your decision.
+  * The SCENE PROMPT and SCENE PLAN — the root's prompt and plan, the \
+north-star for the whole scene.
+  * The ANCESTOR CHAIN — every zone above this one in the tree, root first, \
+each with its plan.
+  * The PRIOR ZONES — every non-root zone already declared in the run, with \
+its parent and plan. Lateral context: siblings, cousins, and earlier subtrees \
+may inform how THIS zone is structured and anchored.
+  * The GENERATED OBJECTS — every concrete (mesh-bearing) object placed \
+anywhere in the scene so far, with its parent.
+</input>
+
+<additional_context>
+A Relationship has:
+  * `target` — either PARENT_ID or the `id` of an earlier sibling already \
+listed in this call's `children`.
+  * `kind` — one of: ON, BESIDE, BELOW, ABOVE, ATTACHED.
+  * `reference_point` — which CORNER of the TARGET's bbox this relationship \
+anchors against, under the canonical front view (+X right, +Y up, +Z front). \
+One of: TOP_LEFT_FRONT, TOP_LEFT_BACK, TOP_RIGHT_FRONT, TOP_RIGHT_BACK, \
+BOTTOM_LEFT_FRONT, BOTTOM_LEFT_BACK, BOTTOM_RIGHT_FRONT, BOTTOM_RIGHT_BACK).
+
+DO NOT pick concrete coordinates or dimensions — a downstream batch step \
+resolves each child's bbox from its relationships and prompt.
+
+A zone is a REGION OF THE SCENE — a subscene, an area, a place large enough \
+to contain multiple distinct objects arranged inside it (e.g a master \
+bedroom, the left audience stand of an arena, the formal front garden of a \
+mansion, the downtown section of a city). It has room inside it, and its \
+character comes from the ensemble of things that live there, not from any \
+single object. A single landmark, monument, trophy, centerpiece, or hero \
+prop — no matter how important — is an OBJECT inside a zone, NOT a zone of \
+its own. Zones often contain other zones within them, and these zones can \
+have different structures - e.g the bottom floor of a massive palace might \
+contain a war zone and a living zone, where the war zone then further \
+decomposes into a set of war rooms, armory rooms and a fighting arena, and \
+the living zone decomposes into the great hall, throne room, the front \
+entrance, the king and queen's chambers, a garden, etc. Or, the entire \
+bottom floor zone might decompose directly into a set of zones for the \
+grand entrance, inner courtyard, great hall, trophy gallery, king and \
+queen's chambers, throne room and bathrooms (as individual zones), etc.
+
+Zones are designed realistically, based on the given input, intended \
+creative direction and amount of world space available to define them within.
+</additional_context>\
 """
 
 
@@ -629,7 +681,6 @@ def render_zone_decompose(
     node placed anywhere in the run so far.
     prior_zones: (id, prompt, plan, parent_id) for every non-root zone
     already declared in the run, in declaration order."""
-    is_root = not ancestors
     if ancestors:
         ancestor_block = "\n".join(
             f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
@@ -651,33 +702,51 @@ def render_zone_decompose(
         )
     else:
         obj_block = "  (none — no concrete objects placed yet)"
-    scene_plan_header = (
-        "SCENE PLAN (the north-star for the whole scene — this zone IS the root, "
-        "so its plan is the scene plan and serves as your primary signal):"
-        if is_root
-        else "SCENE PLAN (the north-star for the whole scene):"
-    )
-    zone_block = (
-        f"PARENT_ID (the zone being decomposed): {zone_id!r}\n"
-        f"Zone prompt: \"{zone_prompt}\"\n"
-        f"Zone bbox (axis-aligned, meters): {zone_bbox.model_dump_json()}"
-        if is_root
-        else (
-            f"PARENT_ID (the zone being decomposed): {zone_id!r}\n"
-            f"Zone prompt: \"{zone_prompt}\"\n"
-            f"Zone bbox (axis-aligned, meters): {zone_bbox.model_dump_json()}\n"
-            f"ZONE PLAN (authored upstream — your primary signal):\n{zone_plan}"
-        )
-    )
-    return (
-        f"""\
-<scene_context>
-Overall scene prompt: "{scene_prompt}"
+    return f"""\
+Generate a list of subzones that should be present in the following scene, \
+based on its description:
 
-{scene_plan_header}
-{scene_plan}
+{zone_plan}
 
-Ancestor chain (root first → your direct parent, with each ancestor's plan):
+<IMPORTANT_INSTRUCTIONS>
+
+<ZONE_SPLITTING_GUIDANCE>
+Child zones can keep decomposing into more zones recursively in subsequent \
+passes, or end there as atomic leaves if that is appropriate. so always \
+decompose at the TOP MOST LEVEL of the current zone — e.g. for a house \
+scene with backyard, driveway, and house, do not skip straight to \
+backyard-pool zone, backyard-grass zone, house-basement, house-first-floor, \
+etc.; decompose into "the house", "the backyard", "the driveway" as \
+top-level children, and let the next recursion split the house into floors \
+and the backyard into pool and grass. the same principle holds everywhere: \
+emit only the zones that exist at THIS level of the hierarchy, and trust \
+the recursive planning + decompose passes underneath each of them to handle \
+the next layer down.
+</ZONE_SPLITTING_GUIDANCE>
+Think very intricately and spatially about how this zone splits. Your goal \
+is to reason a subzone decomposition layout that fits the narrative \
+presented by the scene plan given above as well as the additional plans of \
+ancestor scenes in the scene context section given below, while paying \
+attention to the semantic relationships between the subzones.
+
+The seed prompt you output for each subzone should be a 1-2 sentences long \
+description that explains the subzone's shape and character. Be concrete \
+about its description while leaving room for this prompt to be a seed for a \
+more detailed plan. The prompt should be succinct without mentioning going \
+overly into detail on the subzone's contents, but should mention the the \
+narrative meaning behind its existence and the narrative meaning behind its \
+relative placement to other subzones.
+
+Keep the prompt tight: the goal is not to plan out the subzone's contents, \
+but to establish its character as a piece of the larger scene as a whole.
+</IMPORTANT_INSTRUCTIONS>
+
+<SCENE_CONTEXT>
+
+Overall scene prompt for the entire world generation: "{scene_prompt}"
+
+Ancestor chain (use this to guide your generation to maintain plans from \
+higher levels) (root first → your direct parent, with each ancestor's plan):
 {ancestor_block}
 
 Prior zones declared so far (lateral scene context):
@@ -685,136 +754,12 @@ Prior zones declared so far (lateral scene context):
 
 Generated objects placed so far:
 {obj_block}
-</scene_context>
 
-decompose the following zone into its top-level child sub-zones. emit each \
-child as a structured object with `id`, `prompt`, optional `proxy_shape`, \
-and `relationships` that anchor it inside the parent and against earlier \
-siblings.
+PARENT_ID (the zone being decomposed): {zone_id!r}
+Zone prompt: "{zone_prompt}"
+Zone bbox (axis-aligned, meters): {zone_bbox.model_dump_json()}
 
-{zone_block}
-
-<VERY IMPORTANT INSTRUCTIONS>
-think very intricately and SPATIALLY about how this zone splits. if this is \
-a shooter map, think about how the player moves through the areas; if this \
-is a building, think about how the floorplan looks and where each room sits \
-with respect to the others; if this is a landscape, think about traversal \
-lines, elevation, and what dominates the silhouette from a distance. also \
-consider NARRATIVE, ARCHITECTURE, REALISM, etc.
-
-often the upstream prompt only communicates an idea, and it is your job to \
-expand on it internally — whether that means filling in implicit \
-architectural conventions, working out the mechanics of a game level, or \
-fleshing out narrative pacing. always begin by thinking of the overall \
-structure of what should be involved in this zone, in cohesion with the \
-spatial layout, how each child fits with the others, how the viewer or \
-player would move through it, and what the through-line is. given a more \
-specific upstream plan, you should adhere more strictly to serving as a \
-through-line for it; given a more abstract upstream plan, you have more \
-agency to commit to a structural interpretation, but that interpretation \
-must remain consistent with everything the upstream plan already named.
-
-after this step, each child zone you emit will go into its own individual \
-planning step, similar to the upstream ZONE PLAN step that produced the \
-plan you are reading now. your output here acts as both planning to seed \
-those downstream steps with a prompt that gives each one enough agency to \
-figure out the intricacies itself, and as the spatial layout that decides \
-where each child sits in relation to its siblings. DO NOT BE OVERLY SPECIFIC \
-in the child prompts — think specifically internally so you can decide what \
-zones should exist (and so you can plan trajectories, sightlines, and \
-adjacencies between them), but the prompts you EMIT should be short bases \
-that communicate the IDEA of each child without enumerating its furniture, \
-fixtures, materials, palette, or specific objects. those decisions belong \
-to the downstream planning step that recurses into each child.
-
-a good child prompt names the region and its defining feature (e.g. "the \
-main bedroom and lounge area of the suite, anchored to the floor-to-ceiling \
-window wall"). a bad child prompt lists furniture, materials, and palette \
-(e.g. "open-plan hotel suite bedroom and lounge with a king platform bed \
-against an upholstered headboard wall, a compact sitting area with \
-low-profile sofa, glass coffee table, and armchair near the \
-floor-to-ceiling window wall... warm wood paneling, matte charcoal walls, \
-brass accent fixtures, plush neutral-toned carpet"). that latter form \
-pre-empts the entire downstream planning chain and bakes specific choices \
-into the seed before they have been argued for. keep the seed short and \
-let the next step author the detail.
-
-remember, this is not necessarily an end-all be-all; child zones can keep \
-decomposing into more zones recursively in subsequent passes, or end there \
-as atomic leaves if that is appropriate. so always decompose at the TOP \
-MOST LEVEL of the current zone — e.g. for a house scene with backyard, \
-driveway, and house, do not skip straight to backyard-pool zone, \
-backyard-grass zone, house-basement, house-first-floor, etc.; decompose \
-into "the house", "the backyard", "the driveway" as top-level children, \
-and let the next recursion split the house into floors and the backyard \
-into pool and grass. the same principle holds everywhere: emit only the \
-zones that exist at THIS level of the hierarchy, and trust the recursive \
-planning + decompose passes underneath each of them to handle the next \
-layer down.
-
-think realistically about how many children this zone actually has at its \
-scale. for a generously-sized region with multiple distinct programmatic \
-functions, do not under-decompose into two children when four would more \
-honestly reflect the space. for a small or single-purpose region, do not \
-over-decompose into arbitrary geographic slices that share no distinct \
-identity.
-
-do not use flowery language. do not describe abstract quantities like \
-mood, lighting, fog, or atmosphere unless they can be converted into \
-concrete 3D geometry. do not reference meta-quantities like the pipeline \
-itself, the scene's 3D nature, or the benchmark. focus on defining the \
-structural decomposition intrinsically. this is a 3D environment, not an \
-image — do not define any specific perspective.
-</VERY IMPORTANT INSTRUCTIONS>
-
-<relationships>
-each child you emit MUST carry at least one relationship that anchors it \
-to either the parent (PARENT_ID) or to an earlier sibling already listed \
-in the same `children` list. do NOT forward-reference siblings that come \
-later in the list.
-
-a relationship has three fields:
-- `target` — either PARENT_ID or the `id` of an earlier sibling already \
-listed in this same call's `children`.
-- `kind` — one of: ON, BESIDE, BELOW, ABOVE, ATTACHED.
-- `reference_point` — which CORNER of the TARGET's bbox this relationship \
-anchors against, under the canonical front view (+X right, +Y up, +Z front). \
-one of: TOP_LEFT_FRONT, TOP_LEFT_BACK, TOP_RIGHT_FRONT, TOP_RIGHT_BACK, \
-BOTTOM_LEFT_FRONT, BOTTOM_LEFT_BACK, BOTTOM_RIGHT_FRONT, BOTTOM_RIGHT_BACK.
-
-you do NOT pick concrete coordinates or dimensions. a downstream batch \
-step resolves each child's bbox from its relationships and prompt; you \
-are constraining WHERE each child sits, not how big it is.
-</relationships>
-
-<proxy_shape>
-"""
-        + PROXY_SHAPE_DOC
-        + """
-</proxy_shape>
-
-<no_ephemera>
-"""
-        + NO_EPHEMERA_DOC
-        + """
-</no_ephemera>
-
-<thinking>
-before ANY output, think HARD and DEEPLY and provide a detailed CoT. NEVER \
-skip the thinking step. think through different ways this zone could be \
-structurally decomposed, how the children would sit relative to each other \
-in 3D space, what the traversal or sightlines would look like between them, \
-and what the right number of children is at this level of the hierarchy.
-
-in the interest of winning, always start by thinking about how the \
-decomposition serves the upstream plan's intent and narrative \
-through-line — a decomposition that mechanically subdivides the volume \
-without honoring the plan's character produces a generic scene; a \
-decomposition that commits to a layout opinionated enough to read as \
-INTENTIONAL produces something that stands out.
-</thinking>\
-"""
-    )
+</SCENE_CONTEXT>"""
 
 
 # ---------- Step 4: zone bbox batch resolution (all siblings at once) -------
