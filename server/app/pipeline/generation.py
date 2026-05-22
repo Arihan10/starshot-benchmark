@@ -85,6 +85,7 @@ async def _decompose_objects_validated(
     zone: Node,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
+    ancestors: list[tuple[str, str, str]],
 ) -> list[ObjectSpec]:
     prior_attempts: list[tuple[list[ObjectSpec], str]] = []
     existing_ids = {n.id for n in all_nodes}
@@ -95,8 +96,9 @@ async def _decompose_objects_validated(
             system=SYSTEM_OBJECT_DECOMP,
             user=render_object_decomp(
                 zone_id=zone.id,
-                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 zone_bbox=zone.bbox,
+                ancestors=ancestors,
                 scenario=scenario,
                 scene=scene,
                 prior_attempts=prior_attempts,
@@ -124,6 +126,7 @@ async def _decompose_objects_validated(
 
 async def _next_object_validated(
     *, zone: Node, all_nodes: list[Node],
+    ancestors: list[tuple[str, str, str]],
 ) -> NextObjectOutput:
     prior_attempts: list[tuple[ObjectSpec, str]] = []
     existing_ids = {n.id for n in all_nodes}
@@ -134,8 +137,9 @@ async def _next_object_validated(
             system=SYSTEM_NEXT_OBJECT,
             user=render_next_object(
                 zone_id=zone.id,
-                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 zone_bbox=zone.bbox,
+                ancestors=ancestors,
                 scene=scene,
                 prior_attempts=prior_attempts,
             ),
@@ -220,7 +224,13 @@ async def _resolve_and_generate(
     # Every object (anchor, completion, encapsulating alike) goes through
     # the image-prompt rewrite: Nano Banana needs an isolated studio
     # reference shot — any environmental context bleeds into the mesh.
-    committed_image_prompts = [
+    #
+    # The "prior subjects" context fed to the LLM is the bare subject
+    # phrases of already-placed nodes (Node.prompt), NOT their full
+    # Nano-Banana directives (Node.image_prompt). Leaking the wrapper
+    # boilerplate would just teach the LLM to echo "Generate a direct,
+    # perfect orthographic..." back into every new phrase.
+    committed_subjects = [
         n.prompt for n in all_nodes if n.mesh_url is not None
     ]
     resolved: list[Node] = []
@@ -232,14 +242,15 @@ async def _resolve_and_generate(
             kind="frame" if scenario == "encapsulating" else "object",
             proxy_shape=spec.proxy_shape,
         )
-        prior_prompts = committed_image_prompts + [r.prompt for r in resolved]
-        image_prompt = await _build_image_prompt(
+        prior_subjects = committed_subjects + [r.prompt for r in resolved]
+        subject_prompt, image_prompt = await _build_image_prompt(
             prompt=spec.prompt, bbox=bbox, proxy_shape=spec.proxy_shape,
-            prior_prompts=prior_prompts,
+            prior_prompts=prior_subjects,
         )
         resolved.append(Node(
             id=spec.id,
-            prompt=image_prompt,
+            prompt=subject_prompt,
+            image_prompt=image_prompt,
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
@@ -258,7 +269,11 @@ async def _build_image_prompt(
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
     prior_prompts: list[str],
-) -> str:
+) -> tuple[str, str]:
+    """Returns (subject_phrase, wrapped_image_prompt). The subject phrase is
+    the LLM's bare noun phrase — what gets stored on Node.prompt and shown
+    in context. The wrapped prompt is the full Nano-Banana studio-shot
+    directive — used only at the image-generation boundary."""
     out = await llm.call_llm(
         system=SYSTEM_IMAGE_PROMPT,
         user=render_image_prompt(
@@ -267,7 +282,7 @@ async def _build_image_prompt(
         ),
         output_schema=ImagePromptOutput,
     )
-    return wrap_image_prompt(out.prompt, proxy_shape, bbox.size)
+    return out.prompt, wrap_image_prompt(out.prompt, proxy_shape, bbox.size)
 
 
 _pending: dict[str, list[asyncio.Task[None]]] = {}
@@ -291,8 +306,11 @@ async def _generate_one(
     runs_dir: Path,
 ) -> None:
     try:
+        # Nano Banana sees the wrapped studio-shot directive; node.prompt
+        # stays the bare subject phrase for everything else.
+        banana_prompt = node.image_prompt or node.prompt
         paths = await threed.generate_mesh(
-            node.prompt, output_path=raw, image_stem=image_stem,
+            banana_prompt, output_path=raw, image_stem=image_stem,
         )
         logging.log(
             "image",
@@ -373,9 +391,10 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
+    ancestors: list[tuple[str, str, str]],
 ) -> None:
     specs = await _decompose_objects_validated(
-        zone=zone, scenario=scenario, all_nodes=all_nodes,
+        zone=zone, scenario=scenario, all_nodes=all_nodes, ancestors=ancestors,
     )
     logging.log(
         "generation.decompose",
@@ -395,7 +414,9 @@ async def run(
         return
 
     while True:
-        decision = await _next_object_validated(zone=zone, all_nodes=all_nodes)
+        decision = await _next_object_validated(
+            zone=zone, all_nodes=all_nodes, ancestors=ancestors,
+        )
         if decision.done or decision.object is None:
             logging.log("generation.next.done", zone=zone.id)
             return

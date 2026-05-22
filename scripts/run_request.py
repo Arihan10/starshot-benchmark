@@ -13,6 +13,7 @@ Usage: ./scripts/run_request.py
 
 from __future__ import annotations
 
+import argparse
 import os
 import signal
 import socket
@@ -26,9 +27,6 @@ SERVER_DIR = REPO_ROOT / "server"
 CLIENT_DIR = REPO_ROOT / "client"
 
 SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 8765
-CLIENT_PORT = 8766
-SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 
 def _child_env() -> dict[str, str]:
@@ -42,6 +40,14 @@ def _child_env() -> dict[str, str]:
     """
     env = {k: v for k, v in os.environ.items() if k not in {"VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}}
     return env
+
+
+def _pick_free_port() -> int:
+    """Ask the OS for a free TCP port. Race-prone (another process could
+    grab it before uvicorn binds), but good enough for local multi-run."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((SERVER_HOST, 0))
+        return s.getsockname()[1]
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -87,6 +93,15 @@ def _wait_for_port(
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Boot the full-pipeline API server + viewer.")
+    parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=SERVER_DIR / "runs",
+        help="Directory the server writes per-slot run artifacts to. Created if missing.",
+    )
+    args = parser.parse_args()
+
     if not (CLIENT_DIR / "node_modules" / "three").exists():
         print(
             "[run_request] client/node_modules/three missing — run `npm install` in client/ first",
@@ -94,34 +109,45 @@ def main() -> int:
         )
         return 1
 
+    runs_dir = args.runs_dir.resolve()
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    server_port = _pick_free_port()
+    client_port = _pick_free_port()
+    server_url = f"http://{SERVER_HOST}:{server_port}"
+    client_url = f"http://{SERVER_HOST}:{client_port}"
+
     env = _child_env()
 
-    print(f"[run_request] starting API server on {SERVER_URL}", flush=True)
+    print(
+        f"[run_request] starting API server on {server_url} (runs={runs_dir})",
+        flush=True,
+    )
     server = subprocess.Popen(
         [
             "uv", "run", "uvicorn", "app.main:app",
-            "--host", SERVER_HOST, "--port", str(SERVER_PORT),
+            "--host", SERVER_HOST, "--port", str(server_port),
             "--log-level", "info",
             "--reload",
         ],
         cwd=SERVER_DIR,
-        env=env,
+        env={**env, "STARSHOT_RUNS_DIR": str(runs_dir)},
         process_group=0,
     )
 
-    if not _wait_for_port(SERVER_HOST, SERVER_PORT, proc=server, timeout=30.0):
+    if not _wait_for_port(SERVER_HOST, server_port, proc=server, timeout=30.0):
         print(
-            f"[run_request] server never became reachable at {SERVER_URL} — aborting",
+            f"[run_request] server never became reachable at {server_url} — aborting",
             file=sys.stderr,
         )
         _shutdown(server)
         return 1
-    print(f"[run_request] server ready, launching viewer", flush=True)
+    print(f"[run_request] server ready, launching viewer at {client_url}", flush=True)
 
     client = subprocess.Popen(
         ["node", "server.mjs"],
         cwd=CLIENT_DIR,
-        env={**env, "SERVER_URL": SERVER_URL, "PORT": str(CLIENT_PORT)},
+        env={**env, "SERVER_URL": server_url, "PORT": str(client_port)},
         process_group=0,
     )
     try:

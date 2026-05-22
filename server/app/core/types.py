@@ -144,6 +144,13 @@ class Node(BaseModel):
     parent id; the full tree is recoverable via the run-scoped flat
     registry, but the pipeline emits state to clients incrementally via
     SSE events rather than by traversing the Node graph.
+
+    `prompt` is always the bare subject phrase — what the node *is* in plain
+    language. `image_prompt` is the Nano-Banana–specific directive (the
+    studio-shot wrapper around the subject phrase) used only at the
+    image-generation boundary. Keeping them separate prevents the wrapper
+    boilerplate from leaking into LLM context lookups like "objects placed
+    so far" / "prior subject phrases in this scene".
     """
 
     id: str
@@ -153,5 +160,6 @@ class Node(BaseModel):
     orientation: Orientation = 0
     relationships: list[Relationship] = Field(default_factory=list)
     mesh_url: str | None = None
+    image_prompt: str | None = None
     parent_id: str | None = None
     plan: str | None = None

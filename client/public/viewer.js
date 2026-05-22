@@ -11,6 +11,7 @@ const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
 const PICK_INNER_STORAGE_KEY = "starshot.pickInner";
+const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
@@ -20,6 +21,7 @@ const resumeEl = document.getElementById("slot-resume");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
 const pickInnerToggleEl = document.getElementById("pick-inner-toggle");
+const solidFillToggleEl = document.getElementById("solid-fill-toggle");
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
 const replayModalEl = document.getElementById("replay-modal");
@@ -379,6 +381,7 @@ function refreshSubtreeVisibility(rootId) {
     const cur = stack.pop();
     applyModelVisibility(cur);
     applyBboxVisibility(cur);
+    applySolidFillVisibility(cur);
     const kids = treeChildren.get(cur) ?? [];
     for (const k of kids) stack.push(k);
   }
@@ -644,8 +647,28 @@ pickInnerToggleEl.addEventListener("click", () => {
   applyPickInnerToggleLabel();
   pointerDirty = true;
 });
+
+// Solid-fill mode — drops a solid mesh into every object/frame bbox using its
+// proxy shape (or the AABB itself when no proxy_shape is set). Zones stay
+// wireframe. Intended for bbox-only mode so the scene reads as solids without
+// running Trellis. Independent of the bbox wireframe toggle.
+let solidFillShown = localStorage.getItem(SOLID_FILL_STORAGE_KEY) === "1";
+function applySolidFillToggleLabel() {
+  solidFillToggleEl.textContent = `fill: ${solidFillShown ? "on" : "off"}`;
+  solidFillToggleEl.classList.toggle("off", !solidFillShown);
+}
+applySolidFillToggleLabel();
+solidFillToggleEl.addEventListener("click", () => {
+  solidFillShown = !solidFillShown;
+  localStorage.setItem(SOLID_FILL_STORAGE_KEY, solidFillShown ? "1" : "0");
+  applySolidFillToggleLabel();
+  if (solidFillShown) rebuildAllSolidFills();
+  else clearSolidFills();
+});
+
 const bboxes = new Map(); // id -> THREE.Box3Helper
 const proxies = new Map(); // id -> THREE.Mesh (wireframe proxy silhouette)
+const solidFills = new Map(); // id -> THREE.Mesh (solid proxy/AABB fill)
 const modelsById = new Map(); // id -> THREE.Object3D (the loaded gltf.scene)
 let hoveredBboxId = null;
 
@@ -930,6 +953,7 @@ function clearScene() {
     mesh.material?.dispose?.();
   }
   proxies.clear();
+  clearSolidFills();
   modelsById.clear();
   hoveredBboxId = null;
   selectedBboxId = null;
@@ -1041,6 +1065,7 @@ function loadBbox(event) {
     prev.material?.dispose?.();
     proxies.delete(id);
   }
+  disposeSolidFill(id);
   const ox = origin[0], oy = origin[1], oz = origin[2];
   const fx = ox + dimensions[0], fy = oy + dimensions[1], fz = oz + dimensions[2];
   const box3 = new THREE.Box3(
@@ -1049,8 +1074,11 @@ function loadBbox(event) {
   );
   const helper = new THREE.Box3Helper(box3, BBOX_COLOR_DEFAULT);
   helper.userData.bboxId = id;
-  helper.userData.nodeKind = event.node_kind ?? "zone";
+  const nodeKind = event.node_kind ?? "zone";
+  helper.userData.nodeKind = nodeKind;
   helper.userData.proxyShape = event.proxy_shape ?? null;
+  helper.userData.origin = origin;
+  helper.userData.dimensions = dimensions;
   bboxRoot.add(helper);
   bboxes.set(id, helper);
 
@@ -1059,6 +1087,16 @@ function loadBbox(event) {
     bboxRoot.add(proxyMesh);
     proxies.set(id, proxyMesh);
   }
+
+  if (solidFillShown && nodeKind !== "zone") {
+    const fill = buildSolidFill(event.proxy_shape, origin, dimensions, nodeKind);
+    if (fill !== null) {
+      bboxRoot.add(fill);
+      solidFills.set(id, fill);
+      applySolidFillVisibility(id);
+    }
+  }
+
   // If this id is already selected (user clicked before bbox arrived, or a
   // bbox is being replaced), reapply the selection color.
   applyBboxColor(id);
@@ -1112,6 +1150,91 @@ function buildProxyWireframe(proxyShape, origin, dimensions) {
   mesh.position.set(cx, anchorY, cz);
   mesh.renderOrder = 1;
   return mesh;
+}
+
+// Solid-fill counterpart to buildProxyWireframe. Same geometry math, but
+// returns a lit, opaque mesh. When proxyShape is null/unset we fall back to
+// a solid AABB box — types.py treats a missing proxy_shape as "the AABB is
+// the proxy". `nodeKind` only steers the tint so frames read as walls vs.
+// objects in the scene.
+const SOLID_FILL_COLOR = {
+  object: 0x4f7a45,
+  frame: 0x4a6a82,
+};
+
+function buildSolidFill(proxyShape, origin, dimensions, nodeKind) {
+  const sx = Math.abs(dimensions[0]);
+  const sy = Math.abs(dimensions[1]);
+  const sz = Math.abs(dimensions[2]);
+  if (sx === 0 || sy === 0 || sz === 0) return null;
+  const cx = origin[0] + dimensions[0] / 2;
+  const cy = origin[1] + dimensions[1] / 2;
+  const cz = origin[2] + dimensions[2] / 2;
+  const yMin = Math.min(origin[1], origin[1] + dimensions[1]);
+
+  let geom;
+  let anchorY = cy;
+  if (proxyShape === "SPHERE") {
+    geom = new THREE.SphereGeometry(0.5, 32, 20);
+    geom.scale(sx, sy, sz);
+  } else if (proxyShape === "HEMISPHERE") {
+    geom = new THREE.SphereGeometry(
+      0.5, 32, 20,
+      0, Math.PI * 2,
+      0, Math.PI / 2,
+    );
+    geom.scale(sx, sy * 2, sz);
+    anchorY = yMin;
+  } else if (proxyShape === "CAPSULE") {
+    const r = Math.min(sx, sz) / 2;
+    const cylHeight = Math.max(0, sy - 2 * r);
+    geom = new THREE.CapsuleGeometry(r, cylHeight, 12, 32);
+  } else {
+    // No proxy: fill the AABB itself as a solid box.
+    geom = new THREE.BoxGeometry(sx, sy, sz);
+  }
+
+  const mat = new THREE.MeshLambertMaterial({
+    color: SOLID_FILL_COLOR[nodeKind] ?? SOLID_FILL_COLOR.object,
+  });
+  const mesh = new THREE.Mesh(geom, mat);
+  mesh.position.set(cx, anchorY, cz);
+  return mesh;
+}
+
+function disposeSolidFill(id) {
+  const prev = solidFills.get(id);
+  if (!prev) return;
+  bboxRoot.remove(prev);
+  prev.geometry?.dispose?.();
+  prev.material?.dispose?.();
+  solidFills.delete(id);
+}
+
+function clearSolidFills() {
+  for (const id of Array.from(solidFills.keys())) disposeSolidFill(id);
+}
+
+function rebuildAllSolidFills() {
+  clearSolidFills();
+  for (const [id, helper] of bboxes) {
+    const nodeKind = helper.userData.nodeKind ?? "zone";
+    if (nodeKind === "zone") continue;
+    const origin = helper.userData.origin;
+    const dimensions = helper.userData.dimensions;
+    if (!origin || !dimensions) continue;
+    const fill = buildSolidFill(helper.userData.proxyShape ?? null, origin, dimensions, nodeKind);
+    if (fill === null) continue;
+    bboxRoot.add(fill);
+    solidFills.set(id, fill);
+    applySolidFillVisibility(id);
+  }
+}
+
+function applySolidFillVisibility(id) {
+  const mesh = solidFills.get(id);
+  if (!mesh) return;
+  mesh.visible = !effectivelyHidden(id);
 }
 
 function applyBboxColor(id) {
@@ -1712,7 +1835,12 @@ function updateResumeButton() {
   const status = slot?.status;
   resumeEl.className = "";
   resumeEl.style.display = "none";
-  if (status === "paused") {
+  if (status === "idle") {
+    resumeEl.style.display = "";
+    resumeEl.className = "paused";
+    resumeEl.textContent = "start";
+    resumeEl.title = "Start this run";
+  } else if (status === "paused") {
     resumeEl.style.display = "";
     resumeEl.className = "paused";
     resumeEl.textContent = "resume";
@@ -1758,7 +1886,7 @@ function switchSlot(id) {
 
   const slot = slotSummaries.find((s) => s.id === id);
   const status = slot?.status;
-  slotNeedsResume = status === "paused" || status === "error";
+  slotNeedsResume = status === "idle" || status === "paused" || status === "error";
   renderSlotTabs();
   updateResumeButton();
   if (slotNeedsResume) {

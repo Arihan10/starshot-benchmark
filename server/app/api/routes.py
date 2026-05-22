@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import shutil
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -31,7 +32,10 @@ from app.services import llm, threed
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
-RUNS_DIR = Path("./runs")
+# Where this process writes per-slot run artifacts. Set STARSHOT_RUNS_DIR to
+# point at a different directory so multiple simultaneous processes don't
+# trample each other.
+RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
 LEGACY_CURRENT_DIR = RUNS_DIR / "current"
 
 _slot_logs: dict[str, SlotLog] = {}
@@ -114,17 +118,22 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         slot_log = _slot_logs[slot_id]
         status = slot_log.state.get("status")
-        if status not in ("paused", "error"):
+        if status not in ("idle", "paused", "error"):
             raise HTTPException(
                 status_code=400,
-                detail=f"slot is {status}, not resumable",
+                detail=f"slot is {status}, not startable",
             )
         await _cancel_task(slot_id)
         events = slot_log.state["events"]
-        if events and events[-1].get("kind") == "run.error":
-            slot_log.truncate_events_to(len(events) - 1)
-        slot_log.state["model"] = DEFAULT_MODEL
-        slot_log.state["status"] = "running"
+        if status == "idle" and not events:
+            # Fresh slot — emit run.start now so the run has somewhere to
+            # anchor its events. From here on it's identical to a resume.
+            slot_log.start_run(slot.prompt, DEFAULT_MODEL)
+        else:
+            if events and events[-1].get("kind") == "run.error":
+                slot_log.truncate_events_to(len(events) - 1)
+            slot_log.state["model"] = DEFAULT_MODEL
+            slot_log.state["status"] = "running"
         _tasks[slot.id] = asyncio.create_task(_run(slot.id))
         return {"slot_id": slot.id}
 
@@ -166,12 +175,19 @@ def _slot_summary(slot: Slot) -> dict[str, object]:
 
 
 def _maybe_launch(slot: Slot, slot_log: SlotLog) -> None:
-    """Seed fresh slots and kick off a task. Completed slots stay idle.
-    Interrupted or errored slots are left paused for manual resume."""
+    """Prepare each slot for manual start. Nothing auto-runs at boot — the
+    user clicks start/resume/retry per slot from the viewer. Fresh slots
+    sit idle with their seed prompt prefilled; previously-running slots
+    come back as paused (resumable); errored slots come back as error
+    (retry-able); completed slots stay done."""
     events = slot_log.state["events"]
     if not events:
-        slot_log.start_run(slot.prompt, DEFAULT_MODEL)
-        _tasks[slot.id] = asyncio.create_task(_run(slot.id))
+        # Pre-seed the prompt + model so slot_resume can start_run() without
+        # the client having to send them. status="idle" tells the viewer to
+        # render a "start" button.
+        slot_log.state["prompt"] = slot.prompt
+        slot_log.state["model"] = DEFAULT_MODEL
+        slot_log.state["status"] = "idle"
         return
     slot_log.state["model"] = DEFAULT_MODEL
     last_kind = events[-1].get("kind")
