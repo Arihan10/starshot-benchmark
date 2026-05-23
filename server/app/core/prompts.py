@@ -918,123 +918,12 @@ class ObjectDecompOutput(BaseModel):
     objects: list[ObjectSpec] = Field(default_factory=list)
 
 
-SYSTEM_OBJECT_DECOMP = (
+# Universal scaffolding shared across all three decomposition modes:
+# per-object schema, proxy_shape vocabulary, no-ephemera rule, and the
+# final "JSON only" output reminder. Each mode-specific system prompt
+# concatenates its own intro+rules with this tail.
+_OBJECT_DECOMP_TAIL = (
     """\
-You are enumerating the OBJECTS that populate a 3D scene zone inside \
-StarshotBench — a head-to-head competitive benchmark for 3D spartial reasoning \
-where your scene will be rendered and judged against another LLM's rendering of the \
-same user prompt.
-
-The final spatial and aesthetic output of the scene you produce here \
-is WHAT THE JUDGES ACTUALLY SEE. \
-Zones and plans are scaffolding; objects are the scene. Thoughtful \
-anchor choices make a zone unmistakably, immediately recognizable as \
-its subject — a meeting room's long conference table, chairs and screen on \
-the end wall; a castle throne room's raised dais, carved chair, and \
-flanking banners; an island's lone lightning-split stump, knotted \
-roots at the waterline, and the red objective flag planted at its \
-crest. Generic choices — "a chair", "a tree", "a stone" — make the \
-zone read as a stock kit of parts. The delta between a masterful \
-scene and a mediocre one is largely the quality of your object \
-decisions HERE.
-
-Push past the obvious first pick. An adequate LLM emits "a wooden \
-table, four chairs, a TV"; a winning LLM emits "a scarred oak \
-boardroom table with leather conference chairs around it, a \
-wall-mounted 75-inch display, a whiteboard, a water pitcher on a \
-tray at one end". Specificity propagates all the way to the rendered \
-mesh — the image model, the 3D model, and the final render are \
-directly downstream of the words you write.
-
-Remember to give each zone a story, and make it as impressive as possible.
-
-Three modes are available — ANCHOR, ENCAPSULATING, NEGATIVE-SPACE. \
-Read the MODE header carefully; each has its own purpose and its own \
-rules.
-
-<modes>
-You operate in one of three MODES:
-
-* ANCHOR mode — the zone is an atomic leaf (e.g. "meeting room", "toilet \
-  area", "hero island"). Enumerate the DEFINING anchor objects that make \
-  the zone unmistakably what it is. A meeting room: a large table, chairs \
-  around it, a TV on the end wall. A toilet area: a toilet, a toilet \
-  paper holder. An island: the flag, the roots at the waterline, a \
-  gnarled tree. Do NOT include decorative filler; a later iterative step \
-  adds more objects one at a time.
-
-  GROUND-AWARENESS RULE. This zone may already have a GROUND / SHELL \
-  peer placed by the encapsulating pass (an island dome, a crater bowl, \
-  a curved floor, the walls+floor of a room) — look at the CURRENT SCENE \
-  for a peer whose parent is this zone and whose prompt describes \
-  terrain or enclosure geometry. If such a peer exists, every anchor \
-  object in this zone whose physical support IS that terrain/floor \
-  MUST set its `parent` to the ground/shell peer's id (NOT the zone id) \
-  and include an ON relationship targeting it. The peer's \
-  `proxy_shape` (shown alongside its bbox in the CURRENT SCENE) is the \
-  authoritative descriptor of its surface — a HEMISPHERE peer is a \
-  dome whose real surface dips from the AABB centre to the edges. \
-  You are NOT placing bboxes at this step, but choose the right \
-  parent and relationship now: the downstream bbox-resolution step \
-  will compute the dome's surface height at each anchor's XZ from \
-  the peer's proxy formula and rest the anchor on that surface. Do \
-  NOT re-emit the ground itself in anchor mode; the encapsulating \
-  pass already placed it.
-
-* ENCAPSULATING mode — the zone needs its physical SHELL / FLOOR / \
-  BOUNDARY placed before anything else populates it. For architectural \
-  zones about to be decomposed further: the walls, ceiling, floor, \
-  enclosing fence, moat, cliff face — whatever physically bounds this \
-  zone. For atomic-terrain zones: the GROUND mesh itself (an island \
-  dome, a crater bowl, a hill, a curved floor, a mound). Emit one \
-  object per shell element. Each object's prompt is sent verbatim to a \
-  text-to-3D model, so describe it as a concrete artifact — and for \
-  ground/terrain shells, describe the actual surface SHAPE in concrete \
-  terms so later anchor-mode placements can reason about the surface \
-  height at any XZ ("a muddy domed island raised ~1.2m at the centre, \
-  tapering to the waterline at irregular edges"; "a rocky crater bowl \
-  with steep inner walls descending ~3m below the rim"; "a tall stone \
-  wall with ivy"; "a wooden plank floor").
-
-* NEGATIVE-SPACE mode — you are filling the AMBIENT, CONNECTIVE, \
-  INTERSTITIAL space of the scene (or a zone) with drifting, background, \
-  or distribution-style content that doesn't belong to any specific \
-  zone: lilypads drifting across swamp water between islands, grass \
-  tufts scattered over a meadow, floating logs and driftwood across \
-  open water, scattered stones across a plain, loose paper blowing \
-  across a plaza. Every item must be a SOLID, BOUNDED object (see NO \
-  EPHEMERA below) — no clouds, no mist, no fog banks, no smoke plumes, \
-  no light shafts; if the scene calls for atmosphere, convey it through \
-  the solid, weathered surfaces it leaves behind. This mode runs over the scene root (or \
-  another zone that explicitly owns its negative space) once its zones \
-  and anchors are placed, so the CURRENT SCENE lists every zone and \
-  object already committed. Enumerate the ambient/drifting objects that \
-  the scene prompt implies should populate the space BETWEEN and AROUND \
-  those placed nodes — individual instanced objects, not abstractions. \
-  Set each object's `parent` to the zone id UNLESS it physically rests \
-  on an existing peer (a lilypad on an implicit water surface still \
-  parents to the zone; a barnacle crusting a sunken log parents to the \
-  log). Do NOT re-emit anything that already exists as a zone or a \
-  zone's anchor — negative-space content is strictly the ambient layer \
-  that named zones do not own.
-</modes>
-
-<inputs>
-You are given the CURRENT SCENE — every node already placed anywhere in \
-the run so far, with id, prompt, bbox, and parent. Reason about it thoroughly \
-before emitting.
-</inputs>
-
-<global_rules>
-  * DO NOT DUPLICATE GEOMETRY. If an ancestor zone or an adjacent sibling \
-    zone has already placed a wall / floor / ceiling that covers one of \
-    this zone's faces, do NOT emit another one for that face. A \
-    neighbouring wall that sits exactly on the shared plane is already \
-    doing the job; emitting a second wall there produces a duplicate \
-    mesh. This matters most in ENCAPSULATING mode, where thin slabs at \
-    zone boundaries are easy to accidentally re-emit.
-</global_rules>
-
 <per_object_fields>
 For each object, emit:
   * `id` — unique within this call.
@@ -1048,12 +937,7 @@ For each object, emit:
     desk's bbox; it sits on top.
   * `proxy_shape` — OPTIONAL. The object's collision-proxy shape if its \
     silhouette is noticeably non-rectilinear (see PROXY SHAPE section \
-    below). CRITICAL for TERRAIN SHELLS in encapsulating mode: a domed \
-    island MUST set proxy_shape=HEMISPHERE, otherwise every anchor \
-    object placed ON it will float above its AABB top instead of \
-    resting on the actual dome. Omit for architectural shells (walls, \
-    floors, ceilings, fences) and any object whose bbox is already a \
-    good silhouette.
+    below). Omit for objects whose bbox is already a good silhouette.
   * `orientation` — world-frame yaw about +Y in degrees. MUST be one of \
     the allowed values: -180, -135, -90, -45, 0, 45, 90, 135, 180. \
     The image-to-3D model receives an ORTHOGRAPHIC FRONT VIEW of the \
@@ -1072,12 +956,9 @@ For each object, emit:
     is REQUIRED to include at least one relationship whose `target` is \
     EXACTLY EQUAL to that same object's `parent` field. This is the \
     primary anchor, it is NOT optional, and any object that lacks it is \
-    malformed and will be rejected by the validator. Encapsulating \
-    elements are no exception: a wall, floor, ceiling, moat, or fence \
-    whose `parent` is the zone id must list the zone id as the target of \
-    at least one of its relationships. Additional relationships may \
-    target sibling objects (i.e. other objects listed in this call).
-    
+    malformed and will be rejected by the validator. Additional \
+    relationships may target sibling objects (i.e. other objects listed \
+    in this call).
 
 A Relationship has:
   * `target` — the parent (zone or another object in this list) or a \
@@ -1096,7 +977,7 @@ relationship. This will be used singularly to determine the POSITION of each \
 object within the scene.
 
 REMINDER: EVERY object must have a RELATIONSHIP that refers DIRECTLY TO ITS PARENT \
-and the spatial anchoring between them as an explicit relationship object, IN ADDITION to the parent field itself. 
+and the spatial anchoring between them as an explicit relationship object, IN ADDITION to the parent field itself.
 
 The parent graph across listed objects must form a DAG (no cycles). Do \
 NOT pick concrete coordinates here — a downstream step resolves each \
@@ -1122,80 +1003,395 @@ Respond with ONLY ONE JSON object matching the schema. No prose, no markdown, no
 )
 
 
-def render_object_decomp(
+SYSTEM_ANCHOR_DECOMP = (
+    """\
+You are enumerating the DEFINING ANCHOR OBJECTS of an atomic leaf zone \
+inside StarshotBench — a head-to-head competitive benchmark for 3D \
+spatial reasoning where your scene will be rendered and judged against \
+another LLM's rendering of the same user prompt.
+
+The final spatial and aesthetic output of the scene you produce here \
+is WHAT THE JUDGES ACTUALLY SEE. Zones and plans are scaffolding; \
+objects are the scene. Thoughtful anchor choices make a zone \
+unmistakably, immediately recognizable as its subject — a meeting \
+room's long conference table, chairs and screen on the end wall; a \
+castle throne room's raised dais, carved chair, and flanking banners; \
+an island's lone lightning-split stump, knotted roots at the \
+waterline, and the red objective flag planted at its crest. Generic \
+choices — "a chair", "a tree", "a stone" — make the zone read as a \
+stock kit of parts. The delta between a masterful scene and a \
+mediocre one is largely the quality of your object decisions HERE.
+
+Push past the obvious first pick. An adequate LLM emits "a wooden \
+table, four chairs, a TV"; a winning LLM emits "a scarred oak \
+boardroom table with leather conference chairs around it, a \
+wall-mounted 75-inch display, a whiteboard, a water pitcher on a \
+tray at one end". Specificity propagates all the way to the rendered \
+mesh — the image model, the 3D model, and the final render are \
+directly downstream of the words you write.
+
+Give the zone a story; make it as impressive as possible.
+
+<task>
+Enumerate the DEFINING anchor objects that make this zone unmistakably \
+what it is. A meeting room: a large table, chairs around it, a TV on \
+the end wall. A toilet area: a toilet, a toilet paper holder. An \
+island: the flag, the roots at the waterline, a gnarled tree. Do NOT \
+include decorative filler — a later iterative step adds more objects \
+one at a time on top of your anchors.
+</task>
+
+<ground_awareness_rule>
+This zone may already have a GROUND / SHELL peer placed by the \
+encapsulating pass (an island dome, a crater bowl, a curved floor, \
+the walls+floor of a room) — look at the CURRENT SCENE for a peer \
+whose parent is this zone and whose prompt describes terrain or \
+enclosure geometry. If such a peer exists, every anchor object in \
+this zone whose physical support IS that terrain/floor MUST set its \
+`parent` to the ground/shell peer's id (NOT the zone id) and include \
+an ON relationship targeting it. The peer's `proxy_shape` (shown \
+alongside its bbox in the CURRENT SCENE) is the authoritative \
+descriptor of its surface — a HEMISPHERE peer is a dome whose real \
+surface dips from the AABB centre to the edges. You are NOT placing \
+bboxes at this step, but choose the right parent and relationship \
+now: the downstream bbox-resolution step will compute the dome's \
+surface height at each anchor's XZ from the peer's proxy formula and \
+rest the anchor on that surface. Do NOT re-emit the ground itself in \
+anchor mode; the encapsulating pass already placed it.
+</ground_awareness_rule>
+
+<inputs>
+You are given the ANCESTOR CHAIN (the root → parent path, each with \
+their plan) and the CURRENT SCENE — every node already placed \
+anywhere in the run so far, with id, prompt, bbox, proxy_shape, \
+orientation, and parent. Reason about both thoroughly before \
+emitting.
+</inputs>
+
+<global_rules>
+  * DO NOT DUPLICATE GEOMETRY. If a parent zone or sibling has already \
+    placed a wall / floor / ceiling that covers one of this zone's \
+    faces, do NOT emit another one for that face. A neighbouring wall \
+    that sits exactly on the shared plane is already doing the job; \
+    emitting a second wall there produces a duplicate mesh.
+</global_rules>
+
+"""
+    + _OBJECT_DECOMP_TAIL
+)
+
+
+SYSTEM_ENCAPSULATING_DECOMP = (
+    """\
+You are enumerating the PHYSICAL SHELL of a zone inside StarshotBench \
+— a head-to-head competitive benchmark for 3D spatial reasoning where \
+your scene will be rendered and judged against another LLM's \
+rendering of the same user prompt.
+
+The shell you emit here is what every subsequent object inside this \
+zone rests on, leans against, or is bounded by. Get the surface shape \
+right and the downstream anchor pass places its objects coherently; \
+get it wrong (a flat slab where a dome belongs, a missing back wall, \
+duplicated floor at a shared face) and the whole interior reads as \
+broken. Encapsulating decisions propagate to every anchor placed \
+afterward.
+
+<task>
+Emit the geometry that PHYSICALLY BOUNDS this zone before anything \
+else populates it.
+
+  * For architectural zones about to be decomposed further: the \
+    walls, ceiling, floor, enclosing fence, moat, cliff face — \
+    whatever physically bounds this zone.
+  * For atomic-terrain zones: the GROUND mesh itself — an island \
+    dome, a crater bowl, a hill, a curved floor, a mound.
+
+Emit one object per shell element. Each object's prompt is sent \
+verbatim to a text-to-3D model, so describe it as a concrete \
+artifact. For ground/terrain shells, describe the actual surface \
+SHAPE in concrete terms so later anchor-mode placements can reason \
+about the surface height at any XZ — "a muddy domed island raised \
+~1.2m at the centre, tapering to the waterline at irregular edges"; \
+"a rocky crater bowl with steep inner walls descending ~3m below the \
+rim"; "a tall stone wall with ivy"; "a wooden plank floor".
+</task>
+
+<proxy_shape_rule>
+For TERRAIN SHELLS this is CRITICAL: a domed island MUST set \
+`proxy_shape=HEMISPHERE`, otherwise every anchor object placed ON it \
+will float above its AABB top instead of resting on the actual dome. \
+Boulders use SPHERE, columnar shells use CAPSULE, architectural \
+shells (walls, floors, ceilings, fences) leave proxy_shape unset.
+</proxy_shape_rule>
+
+<inputs>
+You are given the ANCESTOR CHAIN (the root → parent path, each with \
+their plan) and the CURRENT SCENE — every node already placed \
+anywhere in the run so far. The most important things to scan for \
+are slabs at this zone's boundary planes that a neighbour or parent \
+has already emitted — see the duplicate-geometry rule below.
+</inputs>
+
+<global_rules>
+  * DO NOT DUPLICATE GEOMETRY. If an ancestor zone or an adjacent \
+    sibling zone has already placed a wall / floor / ceiling that \
+    covers one of this zone's faces, do NOT emit another one for \
+    that face. A neighbouring wall that sits exactly on the shared \
+    plane is already doing the job; emitting a second wall there \
+    produces a duplicate mesh. Thin slabs at zone boundaries are the \
+    easiest thing to accidentally re-emit, so audit the CURRENT \
+    SCENE for boundary-plane peers before adding any shell face.
+</global_rules>
+
+"""
+    + _OBJECT_DECOMP_TAIL
+)
+
+
+SYSTEM_NEGATIVE_SPACE_DECOMP = (
+    """\
+You are filling the AMBIENT, CONNECTIVE, INTERSTITIAL space between \
+the named zones of a 3D scene inside StarshotBench — a head-to-head \
+competitive benchmark for 3D spatial reasoning where your scene will \
+be rendered and judged against another LLM's rendering of the same \
+user prompt.
+
+Every named zone of the scene has already been decomposed and \
+populated. What remains is the layer the named zones do not own: \
+lilypads drifting across swamp water between islands, grass tufts \
+scattered over a meadow, floating logs and driftwood across open \
+water, scattered stones across a plain, loose paper blowing across a \
+plaza. This ambient layer is what binds the scene together — without \
+it the named zones read as isolated dioramas; with it the scene \
+reads as a continuous world.
+
+<task>
+Generate a list of objects that fill the negative, unfilled space \
+between the zones and objects already placed in the scene. Each item \
+must be a SOLID, BOUNDED, instanced object — individual things \
+populating the gaps, not abstractions.
+
+Set each object's `parent` to the zone id UNLESS it physically rests \
+on an existing peer (a lilypad on an implicit water surface still \
+parents to the zone; a barnacle crusting a sunken log parents to the \
+log).
+
+Do NOT re-emit anything that already exists as a zone or as a zone's \
+anchor — negative-space content is strictly the ambient layer the \
+named zones do not own.
+</task>
+
+<inputs>
+You are given two views of the scene:
+
+  * ZONE LIST — every zone in the scene tree with its plan and \
+    bbox. This is the structure you are filling the gaps BETWEEN. \
+    Use it to reason about where the negative space actually lives \
+    (between which zones, around which features, across what \
+    implied surface).
+  * CURRENTLY PLACED OBJECTS — every node already placed anywhere \
+    in the run so far (zones AND concrete objects). Use it to avoid \
+    duplicating geometry that already exists, and to reason about \
+    what surface each ambient item rests on.
+</inputs>
+
+<solid_only>
+"""
+    + NO_EPHEMERA_DOC
+    + """
+</solid_only>
+
+<global_rules>
+  * DO NOT DUPLICATE GEOMETRY. Do not re-emit any zone or anchor \
+    object that already appears in CURRENTLY PLACED OBJECTS. Your \
+    job is the ambient layer that BETWEEN-zone space implies, not a \
+    second pass over the named zones.
+  * STAY IN THE GAPS. Keep each item's implied volume inside this \
+    zone's bbox but OUTSIDE the bboxes of any already-placed peer. \
+    Items should populate the unclaimed interstitial regions.
+</global_rules>
+
+"""
+    + _OBJECT_DECOMP_TAIL
+)
+
+
+def _render_ancestor_block(ancestors: list[tuple[str, str, str]]) -> str:
+    if not ancestors:
+        return "  (none — this is the root)"
+    return "\n".join(
+        f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
+        for aid, aprompt, aplan in ancestors
+    )
+
+
+def _render_zone_plan_block(zone_plan: str | None) -> str:
+    if zone_plan is not None:
+        return f"Zone plan: {zone_plan}"
+    return (
+        "Zone plan: (not yet authored — this zone has been declared by "
+        "its parent but not individually planned; rely on the ancestor "
+        "plans above for intent)"
+    )
+
+
+def _render_scene_lines(
+    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
+) -> str:
+    if not scene:
+        return "  (none)"
+    return "\n".join(
+        f"  - {nid}: prompt={prompt!r} bbox={bbox.model_dump_json()} "
+        f"proxy_shape={_render_proxy_shape(proxy)} "
+        f"orientation={orient}deg parent={pid!r}"
+        for nid, prompt, bbox, pid, proxy, orient in scene
+    )
+
+
+def _render_zone_list(zones: list[tuple[str, str, BoundingBox]]) -> str:
+    if not zones:
+        return "  (none)"
+    return "\n".join(
+        f"  - {zid}: bbox={zbbox.model_dump_json()}\n    plan: {zplan}"
+        for zid, zplan, zbbox in zones
+    )
+
+
+def _render_retry_block(
+    prior_attempts: list[tuple[list[ObjectSpec], str]] | None,
+) -> str:
+    if not prior_attempts:
+        return ""
+    attempt_lines = "\n\n".join(
+        f"  attempt {i}:\n"
+        f"    emitted: [{', '.join(s.model_dump_json() for s in specs)}]\n"
+        f"    rejected: {reason}"
+        for i, (specs, reason) in enumerate(prior_attempts)
+    )
+    return (
+        "\n\nPRIOR ATTEMPTS — every decomposition below was ALREADY "
+        "rejected. Do NOT re-emit the same set of object specs, and do "
+        "not repeat the same structural mistake. Treat every listed "
+        "reason as a hard constraint you must satisfy this time:\n"
+        f"{attempt_lines}\n\n"
+        "Produce a NEW decomposition that fixes every listed reason. In "
+        "particular, ensure every object's `relationships` list contains "
+        "at least one item whose `target` is EXACTLY EQUAL to that same "
+        "object's `parent` field."
+    )
+
+
+def render_anchor_decomp(
     *,
     zone_id: str,
     zone_plan: str | None,
     zone_bbox: BoundingBox,
     ancestors: list[tuple[str, str, str]],
-    scenario: Literal["anchor", "encapsulating", "negative-space"],
     scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
-    mode = {
-        "anchor": "ANCHOR",
-        "encapsulating": "ENCAPSULATING",
-        "negative-space": "NEGATIVE-SPACE",
-    }[scenario]
-    ancestor_block = (
-        "\n".join(
-            f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
-            for aid, aprompt, aplan in ancestors
-        )
-        if ancestors
-        else "  (none — this is the root)"
-    )
-    zone_plan_block = (
-        f"Zone plan: {zone_plan}"
-        if zone_plan is not None
-        else "Zone plan: (not yet authored — this zone has been declared by "
-             "its parent but not individually planned; rely on the ancestor "
-             "plans above for intent)"
-    )
-    scene_lines = (
-        "\n".join(
-            f"  - {nid}: prompt={prompt!r} bbox={bbox.model_dump_json()} "
-            f"proxy_shape={_render_proxy_shape(proxy)} "
-            f"orientation={orient}deg parent={pid!r}"
-            for nid, prompt, bbox, pid, proxy, orient in scene
-        )
-        if scene
-        else "  (none)"
-    )
-    if prior_attempts:
-        attempt_lines = "\n\n".join(
-            f"  attempt {i}:\n"
-            f"    emitted: [{', '.join(s.model_dump_json() for s in specs)}]\n"
-            f"    rejected: {reason}"
-            for i, (specs, reason) in enumerate(prior_attempts)
-        )
-        retry_block = (
-            "\n\nPRIOR ATTEMPTS — every decomposition below was ALREADY "
-            "rejected. Do NOT re-emit the same set of object specs, and do "
-            "not repeat the same structural mistake. Treat every listed "
-            "reason as a hard constraint you must satisfy this time:\n"
-            f"{attempt_lines}\n\n"
-            "Produce a NEW decomposition that fixes every listed reason. In "
-            "particular, ensure every object's `relationships` list contains "
-            "at least one item whose `target` is EXACTLY EQUAL to that same "
-            "object's `parent` field."
-        )
-    else:
-        retry_block = ""
     return (
-        f"MODE: {mode}\n"
+        "Generate a list of defining anchor objects that make the zone "
+        "described below unmistakably what it is, based on the attached "
+            "context and zone plan. This zone is the lowest possible breakdown level: no other subzones can exist within, so it is defined by the anchor objects you are responsible for generating. Although the plan will be specific, the objects that the plan mentions may not be the end all be all: you should extrapolate meaning from the plan and higher-level ideas communicated in the ancestor chain to populate and style the objects in the list you generate based on a narrative understanding of the scene. \n\n"
+        "<scene_context>\n"
         f"ZONE_ID: {zone_id!r}\n"
         f"Zone bbox: {zone_bbox.model_dump_json()}\n"
-        f"{zone_plan_block}\n\n"
-        f"Ancestor chain (root first → your direct parent, each with their plan):\n{ancestor_block}\n\n"
-        f"Current scene (every node placed so far across the run):\n{scene_lines}\n\n"
-        "List the objects for this zone in the mode above. Each object has "
-        "an id, prompt, parent (zone id or another object in this list), "
-        "and at least one relationship whose target is its parent. Respect "
-        "the CURRENT SCENE: do not duplicate geometry another zone has "
+        f"{_render_zone_plan_block(zone_plan)}\n\n"
+        "Ancestor chain (root first → your direct parent, each with "
+        "their plan to help you ground this zone in its surrounding "
+        "context):\n"
+        f"{_render_ancestor_block(ancestors)}\n\n"
+        "Currently placed objects (every node placed so far across the "
+        "run, not just this scene):\n"
+        f"{_render_scene_lines(scene)}\n"
+        "</scene_context>\n\n"
+        "Each anchor object in your resultant list has an id, prompt, "
+        "parent (zone id or another object in this list), and at least "
+        "one relationship whose target is its parent. Respect the "
+        "CURRENT SCENE: anchor onto any ground/shell peer already "
+        "placed by the encapsulating pass, do not duplicate geometry "
+        "another zone has already emitted, and keep bboxes inside this "
+        "zone so they do not volumetrically overlap any peer.\n\n"        f"{_render_retry_block(prior_attempts)}"
+    )
+
+
+def render_encapsulating_decomp(
+    *,
+    zone_id: str,
+    zone_plan: str | None,
+    zone_bbox: BoundingBox,
+    ancestors: list[tuple[str, str, str]],
+    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
+    prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
+) -> str:
+    return (
+        "Generate a list of shell, floor, and boundary geometry "
+        "elements that physically bound the zone described below, "
+        "based on the attached context and the plan for the zone.\n\n"
+        "<scene_context>\n"
+        f"ZONE_ID: {zone_id!r}\n"
+        f"Zone bbox: {zone_bbox.model_dump_json()}\n"
+        f"{_render_zone_plan_block(zone_plan)}\n\n"
+        "Ancestor chain (root first → your direct parent, each with "
+        "their plan to help you ground this zone in its surrounding "
+        "context):\n"
+        f"{_render_ancestor_block(ancestors)}\n\n"
+        "Currently placed objects (every node placed so far across the "
+        "run, not just this scene):\n"
+        f"{_render_scene_lines(scene)}\n"
+        "</scene_context>\n\n"
+        "Each shell element in your resultant list has an id, prompt, "
+        "parent (the zone id), and at least one relationship whose "
+        "target is its parent. Respect the CURRENT SCENE: do not "
+        "duplicate geometry an ancestor or sibling zone has already "
+        "emitted on a shared face, and keep bboxes inside this zone so "
+        "they do not volumetrically overlap any peer.\n\n"
+        "The primary purpose of these shell elements, if necessary, is to physically "
+        "bound the zone before its interior is populated, so every "
+        "later object inside this zone has a coherent surface to rest "
+        "on, lean against, or be enclosed by. Do NOT generate frames if they are not necessary to the current zone, evaluated based on its plan and additional context."
+        f"{_render_retry_block(prior_attempts)}"
+    )
+
+
+def render_negative_space_decomp(
+    *,
+    zone_id: str,
+    zone_plan: str | None,
+    zone_bbox: BoundingBox,
+    zones: list[tuple[str, str, BoundingBox]],
+    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
+    prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
+) -> str:
+    return (
+        "Generate a list of objects that would cover the negative, "
+        "unfilled space between the objects in the zone described "
+        "below, based on the attached context.\n\n"
+        "<scene_context>\n"
+        f"ZONE_ID: {zone_id!r}\n"
+        f"Zone bbox: {zone_bbox.model_dump_json()}\n"
+        f"{_render_zone_plan_block(zone_plan)}\n\n"
+        "Zone list (each with their plan to help you plan out the "
+        "negative space prompts):\n"
+        f"{_render_zone_list(zones)}\n\n"
+        "Currently placed objects (every node placed so far across the "
+        "run, not just this scene):\n"
+        f"{_render_scene_lines(scene)}\n"
+        "</scene_context>\n\n"
+        "Each negative space object in your resultant list has an id, "
+        "prompt, parent (zone id or another object in this list), and at "
+        "least one relationship whose target is its parent. Respect the "
+        "CURRENT SCENE: do not duplicate geometry another zone has "
         "already emitted on a shared face, and keep bboxes inside this "
-        "zone so they do not volumetrically overlap any peer."
-        f"{retry_block}"
+        "zone so they do not volumetrically overlap any peer.\n\n"
+        "The primary purpose of these negative space objects is to make "
+        "the scene feel coherent and cohesive, filling in the gaps "
+        "between subzones or objects. As such, for each negative space "
+        "to fill in, it is imperative to analyze the existing placed "
+        "objects and zones surrounding it to create a smooth filling "
+        "that does not look out of place."
+        f"{_render_retry_block(prior_attempts)}"
     )
 
 

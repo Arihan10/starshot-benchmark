@@ -1,12 +1,16 @@
-"""Two-stage asset generation: text -> image (Nano Banana Pro) -> 3D (Trellis 2).
+"""Two-stage asset generation: text -> image (Nano Banana / Gemini) -> 3D (Trellis 2).
 
 Text-to-3D alone produces unreliable geometry for thin architectural shells
 (walls, ceilings, floors). Going through an image model first gives Trellis
 a concrete visual reference with correct proportions, which is much more
 robust.
 
-Both stages run on Runware (https://runware.ai/) over its WebSocket SDK. We
-use a caller-supplied `taskUUID` per stage so the resumption record (logged
+The Banana stage calls Google's GenAI API directly (model `gemini-2.5-flash-image`
+for nano-banana, `gemini-3-pro-image-preview` for nano-banana-pro). The
+generated image is saved to disk and base64-encoded for the Trellis input.
+
+The Trellis stage runs on Runware (https://runware.ai/) over its WebSocket
+SDK. We use a caller-supplied `taskUUID` so the resumption record (logged
 as `runware.submit`) can survive process restarts: on the next attempt the
 same UUID is reused via `getResponse` and the in-flight or recently-finished
 job returns its result without re-billing.
@@ -19,6 +23,7 @@ project dependency (see pyproject.toml) for that reason.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import os
 import uuid
@@ -26,11 +31,12 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+from google import genai
+from google.genai import errors as genai_errors
 from runware import (
     I3dInference,
     I3dInputs,
     IAsyncTaskResponse,
-    IImageInference,
     ISettings,
     Runware,
     RunwareAPIError,
@@ -38,42 +44,42 @@ from runware import (
 
 from app.utils import cache, logging
 
-NANO_BANANA_PRO = "google:4@2"
-NANO_BANANA_2 = "google:4@3"
+# Google GenAI model IDs. `gemini-2.5-flash-image` is the public alias for
+# "nano-banana"; `gemini-3-pro-image-preview` is nano-banana-pro.
+NANO_BANANA_PRO = "gemini-3-pro-image-preview"
+NANO_BANANA_2 = "gemini-2.5-flash-image"
 
 NANO_BANANA_MODEL = os.environ.get("NANO_BANANA_MODEL", NANO_BANANA_2)
 TRELLIS_MODEL = os.environ.get("TRELLIS_MODEL", "microsoft:trellis-2@4b")
 
 
-def banana_settings_for(model: str) -> dict[str, Any]:
-    """Per-model production settings for the Runware imageInference call.
-
-    Runware rejects `resolution` for text-to-image (the preset is only
-    meaningful when `referenceImages` is set, where it matches the input
-    aspect ratio). For pure text-to-image, `width`/`height` are required.
-    nano-banana-2 (`google:4@3`) runs at 512×512 with thinking=MINIMAL;
-    nano-banana-pro (`google:4@2`) runs at 1024×1024.
-    """
-    if model == NANO_BANANA_2:
-        return {
-            "width": 512,
-            "height": 512,
-            "thinking": "MINIMAL",
-        }
-    if model == NANO_BANANA_PRO:
-        return {
-            "width": 1024,
-            "height": 1024,
-        }
-    return {}
 MAX_ATTEMPTS = 3
-# Transient failures we retry on: Runware API errors AND the httpx
+# Trellis-side transients we retry on: Runware API errors, the httpx
 # network-layer errors (RemoteProtocolError "stream closed", ReadError,
-# ConnectError, timeouts, etc.) raised by the GLB / image downloads.
+# ConnectError, timeouts, etc.) raised by the GLB download, and
+# TimeoutError — the SDK raises this when its internal
+# `asyncio.wait_for(future, ...)` fires because the WS reader stalled
+# and no response message ever arrived. TimeoutError + ConnectionError
+# from the WS path are specifically the signals that the shared
+# WebSocket is sick; on those, the retry loop also recreates the
+# client (see _get_client below) so the next attempt runs on a fresh
+# WS instead of the same wedged one.
 RETRYABLE: tuple[type[BaseException], ...] = (
     RunwareAPIError,
     httpx.HTTPError,
     ConnectionError,
+    TimeoutError,
+)
+
+# Banana-side transients: any Google API error (covers ServerError and
+# ClientError subclasses; the SDK's own retry logic is disabled so we
+# see them here) plus generic network failures from the underlying HTTP
+# transport.
+GENAI_RETRYABLE: tuple[type[BaseException], ...] = (
+    genai_errors.APIError,
+    httpx.HTTPError,
+    ConnectionError,
+    TimeoutError,
 )
 
 
@@ -85,9 +91,26 @@ _client: Runware | None = None
 _client_lock = asyncio.Lock()
 
 
-async def _get_client() -> Runware:
+async def _get_client(known_bad: Runware | None = None) -> Runware:
+    """Return the shared Runware client.
+
+    Pass `known_bad` to force a fresh connection after a WS-level
+    failure (TimeoutError / ConnectionError). The check `_client is
+    known_bad` makes recreation idempotent: if 50 tasks all timed out
+    against the same wedged client and all reach this point, the
+    first one through the lock discards the old client and builds a
+    new one; the rest see that `_client` is no longer their bad
+    client (someone already replaced it) and just use the new one.
+    Without this guard, concurrent retriers would keep discarding
+    each other's freshly-built clients in a thrash."""
     global _client
     async with _client_lock:
+        if known_bad is not None and _client is known_bad:
+            # Bound disconnect with its own timeout — the underlying
+            # WS is sick and a clean close may itself never return.
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(_client.disconnect(), timeout=10)
+            _client = None
         if _client is None:
             _client = Runware(
                 api_key=os.environ["RUNWARE_API_KEY"],
@@ -111,94 +134,131 @@ async def disconnect_runware() -> None:
             _client = None
 
 
-def _build_request(
-    stage: str, arguments: dict[str, Any], task_uuid: str,
-) -> IImageInference | I3dInference:
-    """Translate the stage-agnostic arguments dict into the Runware
-    request dataclass for that stage. Caller-supplied `task_uuid` is the
-    resumption key — same value goes into the `runware.submit` event log
-    and into the request itself."""
-    if stage == "banana":
-        settings = (
-            ISettings(thinking=arguments["thinking"])
-            if arguments.get("thinking") is not None
-            else None
-        )
-        return IImageInference(
-            taskUUID=task_uuid,
-            model=arguments["model"],
-            positivePrompt=arguments["positivePrompt"],
-            width=arguments.get("width"),
-            height=arguments.get("height"),
-            resolution=arguments.get("resolution"),
-            settings=settings,
-            outputFormat=arguments["outputFormat"],
-            outputType=arguments["outputType"],
-            deliveryMethod="async",
-            numberResults=1,
-        )
-    if stage == "trellis":
-        return I3dInference(
-            taskUUID=task_uuid,
-            model=arguments["model"],
-            inputs=I3dInputs(image=arguments["image"]),
-            settings=ISettings(
-                remesh=arguments["remesh"],
-                resolution=arguments["resolution"],
-                textureSize=arguments["textureSize"],
-            ),
-            outputFormat=arguments["outputFormat"],
-            outputType=arguments["outputType"],
-            deliveryMethod="async",
-            numberResults=1,
-        )
-    raise ValueError(f"unknown stage: {stage!r}")
+# Module-level Google GenAI client. Cheap to construct but we still keep
+# a singleton so we don't churn HTTP pools on every Banana call.
+_genai_client: genai.Client | None = None
+_genai_client_lock = asyncio.Lock()
 
 
-async def _dispatch(
-    client: Runware, stage: str, request: IImageInference | I3dInference,
-) -> Any:
-    if stage == "banana":
-        assert isinstance(request, IImageInference)
-        return await client.imageInference(requestImage=request)
-    if stage == "trellis":
-        assert isinstance(request, I3dInference)
-        return await client.inference3d(request3d=request)
-    raise ValueError(f"unknown stage: {stage!r}")
+async def _get_genai_client() -> genai.Client:
+    global _genai_client
+    async with _genai_client_lock:
+        if _genai_client is None:
+            _genai_client = genai.Client(api_key=os.environ["GOOGLE_API_KEY"])
+        return _genai_client
 
 
-def _unwrap(stage: str, item: Any) -> dict[str, Any]:
-    """Normalize the SDK's per-stage result dataclass into the plain dict
-    `generate_mesh` consumes. Banana yields a single image URL; Trellis
-    yields a GLB URL nested under `outputs.files[0]`."""
-    if stage == "banana":
-        url = getattr(item, "imageURL", None)
-        if not url:
-            raise RuntimeError(f"Banana result missing imageURL: {item!r}")
-        return {"image_url": url}
-    if stage == "trellis":
-        outputs = getattr(item, "outputs", None)
-        files = getattr(outputs, "files", None) if outputs else None
-        if not files:
-            raise RuntimeError(f"Trellis result missing outputs.files: {item!r}")
-        first = files[0]
-        url = first.get("url") if isinstance(first, dict) else getattr(first, "url", None)
-        if not url:
-            raise RuntimeError(f"Trellis result missing url: {first!r}")
-        return {"glb_url": url}
-    raise ValueError(f"unknown stage: {stage!r}")
+async def generate_banana_image(
+    prompt: str, *, node_id: str, model: str | None = None,
+) -> tuple[bytes, str]:
+    """Call Google's GenAI image-generation model and return
+    (image_bytes, mime_type). Retries transient API/network errors up to
+    MAX_ATTEMPTS; on the final attempt the exception propagates."""
+    client = await _get_genai_client()
+    use_model = model or NANO_BANANA_MODEL
+    for attempt in range(MAX_ATTEMPTS):
+        try:
+            response = await client.aio.models.generate_content(
+                model=use_model,
+                contents=prompt,
+            )
+            candidates = response.candidates or []
+            for cand in candidates:
+                content = getattr(cand, "content", None)
+                parts = getattr(content, "parts", None) or []
+                for part in parts:
+                    data = getattr(part, "inline_data", None)
+                    if data is not None and data.data:
+                        return data.data, data.mime_type or "image/png"
+            raise RuntimeError(
+                f"banana returned no inline image (model={use_model!r})"
+            )
+        except GENAI_RETRYABLE as e:
+            if attempt == MAX_ATTEMPTS - 1:
+                raise
+            logging.log(
+                "nano_banana.retry",
+                node_id=node_id,
+                attempt=attempt,
+                reason=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+    raise AssertionError("unreachable")
 
 
-async def _submit_resumable(
+_MIME_EXT = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+}
+
+
+def _ext_from_mime(mime_type: str) -> str:
+    return _MIME_EXT.get(mime_type.lower(), ".png")
+
+
+def _mime_from_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    for mime, ext in _MIME_EXT.items():
+        if ext == suffix or (ext == ".jpg" and suffix == ".jpeg"):
+            return mime
+    return "image/png"
+
+
+def image_to_data_uri(image_bytes: bytes, mime_type: str) -> str:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{mime_type};base64,{encoded}"
+
+
+def file_to_data_uri(path: Path) -> str:
+    return image_to_data_uri(path.read_bytes(), _mime_from_path(path))
+
+
+def _build_trellis_request(
+    arguments: dict[str, Any], task_uuid: str,
+) -> I3dInference:
+    """Translate the trellis arguments dict into the Runware request
+    dataclass. Caller-supplied `task_uuid` is the resumption key — same
+    value goes into the `runware.submit` event log and into the request."""
+    return I3dInference(
+        taskUUID=task_uuid,
+        model=arguments["model"],
+        inputs=I3dInputs(image=arguments["image"]),
+        settings=ISettings(
+            remesh=arguments["remesh"],
+            resolution=arguments["resolution"],
+            textureSize=arguments["textureSize"],
+        ),
+        outputFormat=arguments["outputFormat"],
+        outputType=arguments["outputType"],
+        deliveryMethod="async",
+        numberResults=1,
+    )
+
+
+def _unwrap_trellis(item: Any) -> dict[str, Any]:
+    """Normalize Trellis's SDK result dataclass into the plain dict
+    `generate_mesh` consumes. The GLB URL is nested under
+    `outputs.files[0]`."""
+    outputs = getattr(item, "outputs", None)
+    files = getattr(outputs, "files", None) if outputs else None
+    if not files:
+        raise RuntimeError(f"Trellis result missing outputs.files: {item!r}")
+    first = files[0]
+    url = first.get("url") if isinstance(first, dict) else getattr(first, "url", None)
+    if not url:
+        raise RuntimeError(f"Trellis result missing url: {first!r}")
+    return {"glb_url": url}
+
+
+async def _submit_trellis(
     arguments: dict[str, Any],
     *,
     node_id: str,
-    stage: str,
 ) -> dict[str, Any]:
-    """Submit a Runware job with restart-resilient resumption.
+    """Submit a Runware Trellis job with restart-resilient resumption.
 
     On entry, scan the events log for a prior `runware.submit` matching
-    (node_id, stage, input_hash). If found, attempt
+    (node_id, stage="trellis", input_hash). If found, attempt
     `client.getResponse(taskUUID=...)` against the persisted UUID —
     Runware keeps task results around long enough that an in-flight or
     recently-completed job returns immediately with no new billing. On
@@ -210,6 +270,7 @@ async def _submit_resumable(
     resumption record is durable as soon as `SlotLog.log` flushes — no
     dependency on the response landing.
     """
+    stage = "trellis"
     model = arguments["model"]
     input_hash = cache.hash_runware_input(model, arguments)
     prior = cache.find_runware_submit(
@@ -229,7 +290,7 @@ async def _submit_resumable(
                     task_uuid=prior["task_uuid"],
                     outcome="success",
                 )
-                return _unwrap(stage, results[0])
+                return _unwrap_trellis(results[0])
             # Empty result list — treat as expired and submit fresh.
             logging.log(
                 "runware.reattach",
@@ -239,10 +300,13 @@ async def _submit_resumable(
                 outcome="expired",
                 reason="empty_result",
             )
-        except RunwareAPIError as e:
-            # v1: any error on reattach -> fall through to fresh submit.
+        except (RunwareAPIError, TimeoutError, ConnectionError) as e:
+            # Any error on reattach -> fall through to fresh submit.
             # The new submit's task_uuid overwrites the lookup, so the
             # next restart reattaches to the new task — no double-bill.
+            # TimeoutError / ConnectionError additionally signal that
+            # the WS is sick, so we discard the client before the
+            # fresh-submit loop below opens a new one.
             logging.log(
                 "runware.reattach",
                 node_id=node_id,
@@ -251,11 +315,13 @@ async def _submit_resumable(
                 outcome="expired",
                 reason=f"{type(e).__name__}: {str(e)[:200]}",
             )
+            if isinstance(e, (TimeoutError, ConnectionError)):
+                client = await _get_client(known_bad=client)
 
     for attempt in range(MAX_ATTEMPTS):
         task_uuid = str(uuid.uuid4())
         try:
-            request = _build_request(stage, arguments, task_uuid)
+            request = _build_trellis_request(arguments, task_uuid)
             logging.log(
                 "runware.submit",
                 node_id=node_id,
@@ -264,7 +330,7 @@ async def _submit_resumable(
                 task_uuid=task_uuid,
                 input_hash=input_hash,
             )
-            ack = await _dispatch(client, stage, request)
+            ack = await client.inference3d(request3d=request)
             if isinstance(ack, IAsyncTaskResponse):
                 results = await client.getResponse(
                     taskUUID=task_uuid, numberResults=1,
@@ -273,7 +339,7 @@ async def _submit_resumable(
                 results = ack
             if not results:
                 raise RuntimeError(f"empty result list for task {task_uuid}")
-            return _unwrap(stage, results[0])
+            return _unwrap_trellis(results[0])
         except RETRYABLE as e:
             if attempt == MAX_ATTEMPTS - 1:
                 raise
@@ -282,6 +348,14 @@ async def _submit_resumable(
                 attempt=attempt,
                 reason=f"{type(e).__name__}: {str(e)[:200]}",
             )
+            # TimeoutError / ConnectionError mean the WS that delivered
+            # (or failed to deliver) this response is unhealthy. Swap to
+            # a fresh client so the next attempt isn't going to the same
+            # wedged socket. Other RETRYABLE errors (RunwareAPIError,
+            # httpx.HTTPError) are application- or download-layer and
+            # don't indicate the WS is the problem — keep the client.
+            if isinstance(e, (TimeoutError, ConnectionError)):
+                client = await _get_client(known_bad=client)
     raise AssertionError("unreachable")
 
 
@@ -304,24 +378,6 @@ async def _download_with_retry(url: str, *, stage: str) -> bytes:
                 reason=f"{type(e).__name__}: {str(e)[:200]}",
             )
     raise AssertionError("unreachable")
-
-
-_CONTENT_TYPE_EXT = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/webp": ".webp",
-}
-
-
-def _ext_from_url(url: str) -> str:
-    """Pick a saved-image extension from the URL when no Content-Type
-    header is available. Runware's image URLs end with `.png` for our
-    PNG-output requests; default to `.png` if nothing else matches."""
-    lower = url.lower().split("?", 1)[0]
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        if lower.endswith(ext):
-            return ext if ext != ".jpeg" else ".jpg"
-    return ".png"
 
 
 async def generate_mesh(
@@ -347,55 +403,44 @@ async def generate_mesh(
             return {"glb": cached_raw, "image": cached_image}
 
     # Banana-skip gate: if Banana already finished for this node and the
-    # saved image is still on disk, skip the Banana stage and pass the
-    # cached Runware-hosted URL straight to Trellis. Closes the Banana
-    # re-bill window for process deaths between Banana and Trellis.
+    # saved image is still on disk, skip the Banana call and reuse the
+    # local file. Closes the Banana re-bill window for process deaths
+    # between Banana and Trellis.
     image_path: Path | None = None
-    remote_image_url: str | None = None
     banana_hit = cache.find_banana_done(logging.current_events(), node_id)
     if banana_hit is not None:
         candidate = Path(banana_hit["saved"])
         if candidate.exists():
             image_path = candidate
-            remote_image_url = banana_hit["remote_url"]
             logging.log("nano_banana.skip", node_id=node_id)
 
-    if image_path is None or remote_image_url is None:
-        banana_args: dict[str, Any] = {
-            "model": NANO_BANANA_MODEL,
-            "positivePrompt": prompt,
-            "outputFormat": "PNG",
-            "outputType": "URL",
-            **banana_settings_for(NANO_BANANA_MODEL),
-        }
-        img = await _submit_resumable(
-            banana_args, node_id=node_id, stage="banana",
+    if image_path is None:
+        image_bytes, mime_type = await generate_banana_image(
+            prompt, node_id=node_id, model=NANO_BANANA_MODEL,
         )
-        remote_image_url = str(img["image_url"])
-        ext = _ext_from_url(remote_image_url)
+        ext = _ext_from_mime(mime_type)
         image_path = image_stem.parent / (image_stem.name + ext)
         image_path.parent.mkdir(parents=True, exist_ok=True)
-        image_bytes = await _download_with_retry(remote_image_url, stage="nano_banana")
         image_path.write_bytes(image_bytes)
         logging.log(
             "nano_banana.done",
             node_id=node_id,
-            remote_url=remote_image_url,
             saved=str(image_path),
         )
 
+    # Trellis accepts the image as a base64 data URI in I3dInputs.image.
+    # Re-reading from disk on every call keeps the Banana-skip path and
+    # the fresh path symmetric — both encode the same on-disk bytes.
     trellis_args: dict[str, Any] = {
         "model": TRELLIS_MODEL,
-        "image": remote_image_url,
+        "image": file_to_data_uri(image_path),
         "remesh": False,
         "resolution": 512,
         "textureSize": 1024,
         "outputFormat": "GLB",
         "outputType": "URL",
     }
-    mesh = await _submit_resumable(
-        trellis_args, node_id=node_id, stage="trellis",
-    )
+    mesh = await _submit_trellis(trellis_args, node_id=node_id)
     glb_url = mesh["glb_url"]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

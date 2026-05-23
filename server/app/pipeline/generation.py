@@ -44,14 +44,18 @@ from app.core.prompts import (
     NextObjectOutput,
     ObjectDecompOutput,
     ObjectSpec,
+    SYSTEM_ANCHOR_DECOMP,
+    SYSTEM_ENCAPSULATING_DECOMP,
     SYSTEM_IMAGE_PROMPT,
+    SYSTEM_NEGATIVE_SPACE_DECOMP,
     SYSTEM_NEXT_OBJECT,
     SYSTEM_OBJECT_BBOX_BATCH,
-    SYSTEM_OBJECT_DECOMP,
+    render_anchor_decomp,
+    render_encapsulating_decomp,
     render_image_prompt,
+    render_negative_space_decomp,
     render_next_object,
     render_object_bbox_batch,
-    render_object_decomp,
     wrap_image_prompt,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
@@ -92,17 +96,48 @@ async def _decompose_objects_validated(
     scene = _scene_view(all_nodes)
     specs: list[ObjectSpec] = []
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
-        out = await llm.call_llm(
-            system=SYSTEM_OBJECT_DECOMP,
-            user=render_object_decomp(
+        if scenario == "anchor":
+            system = SYSTEM_ANCHOR_DECOMP
+            user = render_anchor_decomp(
                 zone_id=zone.id,
                 zone_plan=zone.plan,
                 zone_bbox=zone.bbox,
                 ancestors=ancestors,
-                scenario=scenario,
                 scene=scene,
                 prior_attempts=prior_attempts,
-            ),
+            )
+        elif scenario == "encapsulating":
+            system = SYSTEM_ENCAPSULATING_DECOMP
+            user = render_encapsulating_decomp(
+                zone_id=zone.id,
+                zone_plan=zone.plan,
+                zone_bbox=zone.bbox,
+                ancestors=ancestors,
+                scene=scene,
+                prior_attempts=prior_attempts,
+            )
+        else:
+            # negative-space mode: feed the full zone-list (every zone in the
+            # tree with its plan + bbox) instead of the ancestor chain.
+            # Filling gaps between siblings/cousins needs the whole tree's
+            # spatial layout, not the path to root.
+            zones = [
+                (n.id, n.plan, n.bbox)
+                for n in all_nodes
+                if n.plan is not None
+            ]
+            system = SYSTEM_NEGATIVE_SPACE_DECOMP
+            user = render_negative_space_decomp(
+                zone_id=zone.id,
+                zone_plan=zone.plan,
+                zone_bbox=zone.bbox,
+                zones=zones,
+                scene=scene,
+                prior_attempts=prior_attempts,
+            )
+        out = await llm.call_llm(
+            system=system,
+            user=user,
             output_schema=ObjectDecompOutput,
         )
         specs = list(out.objects)
