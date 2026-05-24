@@ -70,9 +70,31 @@ _RESUMABLE_SCOPE = "google.banana"
 _FALLBACK_429_DELAY_S = 30.0
 _MAX_429_RETRIES = 8
 
+class NanoBananaTransientError(Exception):
+    """Model-side weirdness where the call returns no image with a
+    finish_reason that historically clears on retry (e.g.
+    MALFORMED_FUNCTION_CALL — the model's internal image-emit tool
+    routing occasionally trips). Distinct from RuntimeError, which we
+    reserve for deterministic refusals (RECITATION / SAFETY / etc.)
+    where retrying would just waste budget."""
+
+
+# finish_reason values that are worth retrying. Anything else (RECITATION,
+# SAFETY, PROHIBITED_CONTENT, ...) is a deterministic refusal — re-issuing
+# the same prompt will produce the same refusal, so we surface immediately.
+_TRANSIENT_FINISH_REASONS = frozenset({
+    "MALFORMED_FUNCTION_CALL",
+    "FINISH_REASON_UNSPECIFIED",
+    "OTHER",
+})
+
 # Transient non-429 errors retried via the resumable wrapper (network
-# blips, 5xx, transport timeouts). 429s are filtered out above.
-_RETRYABLE: tuple[type[BaseException], ...] = (genai_errors.APIError,)
+# blips, 5xx, transport timeouts, model-side transient no-image returns).
+# 429s are filtered out above.
+_RETRYABLE: tuple[type[BaseException], ...] = (
+    genai_errors.APIError,
+    NanoBananaTransientError,
+)
 _MAX_ATTEMPTS = 3
 # Exponential backoff base between resumable-wrapper retries:
 # sleep `base * 2**attempt` + jitter seconds before re-trying.
@@ -124,12 +146,39 @@ def _unwrap(response: types.GenerateContentResponse) -> NanoBananaResult:
     """Pull the first image out of the response and normalize it to PNG.
     Gemini's Developer API ignores `output_mime_type` and returns JPEG
     by default; we re-encode here so downstream consumers (Trellis) see
-    a single consistent format."""
+    a single consistent format.
+
+    When the response carries no image, we read the candidate's
+    finish_reason to decide whether to raise a transient (retryable)
+    or deterministic (terminal) exception. The bare response repr is
+    100+ lines of SDK objects, so we include just the finish_reason in
+    the message and drop the rest."""
     for part in response.parts or []:
         inline = part.inline_data
         if inline and inline.data:
             return _to_png(inline.data, inline.mime_type or "image/jpeg")
-    raise RuntimeError(f"Nano Banana returned no image: {response!r}")
+    finish_reason = _finish_reason_name(response)
+    if finish_reason in _TRANSIENT_FINISH_REASONS:
+        raise NanoBananaTransientError(
+            f"transient empty response (finish_reason={finish_reason})"
+        )
+    raise RuntimeError(
+        f"Nano Banana returned no image (finish_reason={finish_reason})"
+    )
+
+
+def _finish_reason_name(response: types.GenerateContentResponse) -> str | None:
+    """Best-effort extraction of the first candidate's finish_reason as
+    its enum name (e.g. 'MALFORMED_FUNCTION_CALL'). Returns None when
+    the response shape is unexpected so the caller can fall back to
+    treating it as deterministic."""
+    candidates = response.candidates or []
+    if not candidates:
+        return None
+    fr = getattr(candidates[0], "finish_reason", None)
+    if fr is None:
+        return None
+    return getattr(fr, "name", None) or str(fr)
 
 
 def _to_png(data: bytes, src_mime: str) -> NanoBananaResult:
