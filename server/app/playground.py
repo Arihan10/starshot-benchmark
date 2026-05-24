@@ -4,13 +4,16 @@ A minimal FastAPI app with:
   * `GET  /`         — single-page UI for prompt experimentation.
   * `GET  /presets`  — preset subject phrases + proxy shapes + bboxes
                        that previously produced cropped renders.
-  * `POST /banana`   — text → image. Returns a base64 data URI.
+  * `POST /banana`   — text → image. Returns the Runware image URL.
   * `POST /trellis`  — image → 3D. Returns the Runware GLB URL.
 
-Banana runs on Google's GenAI API directly; Trellis still runs on
-Runware. The compare flow renders the same wrapped prompt on
-`nano-banana` (gemini-2.5-flash-image) and `nano-banana-pro`
-(gemini-3-pro-image-preview) side-by-side.
+Both stages run on Runware so the playground can exercise both
+nano-banana-2 vs nano-banana-pro side-by-side. The production
+pipeline now uses Google GenAI Nano Banana (see
+`app.services.nano_banana`) and Runware Trellis (see
+`app.services.threed`); this playground stays Runware-only for the
+image-gen comparison view. Model IDs and per-model settings are
+inlined below since `app.services.threed` no longer carries them.
 
 Run via `enx playground` (or `uv run scripts/run_playground.py`).
 """
@@ -34,27 +37,44 @@ from runware import (
     I3dInference,
     I3dInputs,
     IAsyncTaskResponse,
+    IImageInference,
     ISettings,
     Runware,
 )
 
 from app.core.prompts import wrap_image_prompt
 from app.core.types import ProxyShape
-from app.services.threed import (
-    NANO_BANANA_2,
-    NANO_BANANA_PRO,
-    generate_banana_image,
-    image_to_data_uri,
-)
 
 load_dotenv()
 
 TRELLIS_MODEL = os.environ.get("TRELLIS_MODEL", "microsoft:trellis-2@4b")
 
+# Runware Nano Banana model IDs. Inlined here (previously imported from
+# app.services.threed) because the production pipeline no longer goes
+# through Runware for image-gen; threed.py is now Trellis-only.
+NANO_BANANA_2 = "google:4@3"
+NANO_BANANA_PRO = "google:4@2"
+
 _BANANA_MODELS: dict[str, str] = {
     "nano-banana-2": NANO_BANANA_2,
     "nano-banana-pro": NANO_BANANA_PRO,
 }
+
+
+def banana_settings_for(model: str) -> dict[str, Any]:
+    """Per-model production settings for the Runware imageInference call.
+
+    Runware rejects `resolution` for text-to-image (the preset is only
+    meaningful when `referenceImages` is set, where it matches the input
+    aspect ratio). For pure text-to-image, `width`/`height` are required.
+    nano-banana-2 (`google:4@3`) runs at 512×512 with thinking=MINIMAL;
+    nano-banana-pro (`google:4@2`) runs at 1024×1024.
+    """
+    if model == NANO_BANANA_2:
+        return {"width": 512, "height": 512, "thinking": "MINIMAL"}
+    if model == NANO_BANANA_PRO:
+        return {"width": 1024, "height": 1024}
+    return {}
 
 
 _PROXY_SHAPES: dict[str, ProxyShape | None] = {
@@ -274,16 +294,45 @@ def create_app() -> FastAPI:
             req.prompt, proxy, (req.width, req.height, req.depth),
         )
         model_id = _BANANA_MODELS[req.model]
+        settings_dict = banana_settings_for(model_id)
+        gen_settings = (
+            ISettings(thinking=settings_dict["thinking"])
+            if "thinking" in settings_dict
+            else None
+        )
         try:
-            image_bytes, mime_type = await generate_banana_image(
-                final_prompt, node_id=f"playground:{req.model}", model=model_id,
+            client = await _get_client()
+            task_uuid = str(uuid.uuid4())
+            request = IImageInference(
+                taskUUID=task_uuid,
+                model=model_id,
+                positivePrompt=final_prompt,
+                width=settings_dict.get("width"),
+                height=settings_dict.get("height"),
+                resolution=settings_dict.get("resolution"),
+                settings=gen_settings,
+                outputFormat="PNG",
+                outputType="URL",
+                deliveryMethod="async",
+                numberResults=1,
             )
+            ack = await client.imageInference(requestImage=request)
+            results = (
+                await client.getResponse(taskUUID=task_uuid, numberResults=1)
+                if isinstance(ack, IAsyncTaskResponse)
+                else ack
+            )
+            if not results:
+                raise RuntimeError(f"empty result list for task {task_uuid}")
+            image = results[0]
         except Exception as e:
             raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+        url = getattr(image, "imageURL", None) or ""
         return {
-            "image_url": image_to_data_uri(image_bytes, mime_type),
+            "image_url": url,
             "wrapped_prompt": final_prompt,
             "model_id": model_id,
+            "settings": settings_dict,
         }
 
     @app.post("/trellis")
@@ -450,14 +499,14 @@ _PAGE = """<!doctype html>
       </div>
     </fieldset>
 
-    <button id="btn-compare" type="button" class="primary">Compare nano-banana vs nano-banana-pro image (parallel)</button>
-    <button id="btn-compare-3d" type="button" disabled>Compare nano-banana vs nano-banana-pro 3D (parallel)</button>
+    <button id="btn-compare" type="button" class="primary">Compare nano-banana-2 vs nano-banana-pro image (parallel)</button>
+    <button id="btn-compare-3d" type="button" disabled>Compare nano-banana-2 vs nano-banana-pro 3D (parallel)</button>
 
     <div style="font-size:10px;color:#5a5e68;border:1px solid #2a2d35;border-radius:4px;padding:6px 8px;">
-      Models (locked, identical to <code>app.services.threed</code>):<br>
-      • <b>nano-banana</b>: <code>gemini-2.5-flash-image</code> (Google GenAI)<br>
-      • <b>nano-banana-pro</b>: <code>gemini-3-pro-image-preview</code> (Google GenAI)<br>
-      • <b>trellis</b>: Runware, remesh=off, resolution=512, textureSize=1024
+      Production settings (locked, identical to <code>app.services.threed</code>):<br>
+      • <b>nano-banana-2</b> (<code>google:4@3</code>): 512×512, thinking=MINIMAL<br>
+      • <b>nano-banana-pro</b> (<code>google:4@2</code>): 1024×1024<br>
+      • <b>trellis</b>: remesh=off, resolution=512, textureSize=1024
     </div>
 
     <div id="status"></div>
@@ -466,7 +515,7 @@ _PAGE = """<!doctype html>
       <summary style="cursor:pointer;color:#8a8f99;font-size:11px;text-transform:uppercase;letter-spacing:0.06em;">wrapped prompts (debug)</summary>
       <div style="margin-top:6px;display:flex;flex-direction:column;gap:8px;">
         <div>
-          <div style="color:#c89a9a;font-size:10px;text-transform:uppercase;">nano-banana (left)</div>
+          <div style="color:#c89a9a;font-size:10px;text-transform:uppercase;">nano-banana-2 (left)</div>
           <div id="wrapped-old" style="font-size:10px;color:#8a8f99;background:#0c0d10;border:1px solid #2a2d35;border-radius:3px;padding:6px;white-space:pre-wrap;word-break:break-word;max-height:140px;overflow-y:auto;"></div>
         </div>
         <div>
@@ -480,7 +529,7 @@ _PAGE = """<!doctype html>
   <div id="stage">
     <div class="col" data-side="old">
       <div class="col-header old">
-        <span>nano-banana (gemini-2.5-flash-image)</span>
+        <span>nano-banana-2 (google:4@3, 512×512, thinking=MINIMAL)</span>
       </div>
       <div class="stage-pane" data-pane="image-old">
         <span class="pane-label">image</span>
@@ -494,7 +543,7 @@ _PAGE = """<!doctype html>
     </div>
     <div class="col" data-side="new">
       <div class="col-header new">
-        <span>nano-banana-pro (gemini-3-pro-image-preview)</span>
+        <span>nano-banana-pro (google:4@2, 1024×1024)</span>
       </div>
       <div class="stage-pane" data-pane="image-new">
         <span class="pane-label">image</span>
@@ -676,7 +725,7 @@ btnCompare.addEventListener("click", async () => {
     showImageEmpty(side, "generating…");
     setPaneStatus($(`[data-pane="image-${side}"]`), "generating…");
   }
-  setStatus("generating nano-banana and nano-banana-pro in parallel…");
+  setStatus("generating nano-banana-2 and nano-banana-pro in parallel…");
   wrappedOldEl.textContent = "";
   wrappedNewEl.textContent = "";
   const t0 = performance.now();

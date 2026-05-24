@@ -66,7 +66,7 @@ def create_app() -> FastAPI:
             for task in list(_tasks.values()):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
-            await threed.disconnect_runware()
+            await threed.disconnect_http()
 
     app = FastAPI(
         docs_url=None,

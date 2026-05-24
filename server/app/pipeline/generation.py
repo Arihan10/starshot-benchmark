@@ -59,7 +59,7 @@ from app.core.prompts import (
     wrap_image_prompt,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
-from app.services import llm, threed
+from app.services import llm, nano_banana, threed
 from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
 from app.utils.topology import validate_object_relationships
@@ -151,7 +151,11 @@ async def _decompose_objects_validated(
                 zone=zone.id, attempt=attempt, reason=reason,
                 emitted=[s.model_dump() for s in specs],
             )
-            raise  # TEMP: stop pipeline on first validation failure
+            # Feed this failure back into the next prompt so the LLM has
+            # something to react to instead of re-emitting the same invalid
+            # set. After exhausting attempts we fall through to the
+            # accept_invalid branch below.
+            prior_attempts.append((specs, reason))
     logging.log(
         "generation.decompose.accept_invalid",
         zone=zone.id, reason=prior_attempts[-1][1] if prior_attempts else "",
@@ -194,7 +198,7 @@ async def _next_object_validated(
                 zone=zone.id, attempt=attempt, reason=reason,
                 emitted=decision.object.model_dump(),
             )
-            raise  # TEMP: stop pipeline on first validation failure
+            prior_attempts.append((decision.object, reason))
     assert decision is not None
     logging.log(
         "generation.next.accept_invalid",
@@ -325,10 +329,10 @@ _pending: dict[str, list[asyncio.Task[None]]] = {}
 # Run-scoped set of every id that has been admitted into _resolve_and_generate
 # for this run. Populated *synchronously* before the bbox-resolution LLM call,
 # so concurrent specs (within or across decomposition steps) can't both pass
-# the dedup check and race into Banana+Trellis. The artifact cache catches
-# *most* repeats, but two specs that submit before either has logged a
-# `cache.artifact` will both miss the cache and double-bill — this guard
-# closes that window.
+# the dedup check and race into Banana+Trellis. The per-stage `.done`
+# completion cache catches *most* repeats, but two specs that submit before
+# either has logged a `trellis.done` will both miss the cache and
+# double-bill — this guard closes that window.
 _admitted_ids: dict[str, set[str]] = {}
 
 
@@ -344,14 +348,21 @@ async def _generate_one(
         # Nano Banana sees the wrapped studio-shot directive; node.prompt
         # stays the bare subject phrase for everything else.
         banana_prompt = node.image_prompt or node.prompt
-        paths = await threed.generate_mesh(
-            banana_prompt, output_path=raw, image_stem=image_stem,
+        image_path = image_stem.parent / f"{image_stem.name}.png"
+        image = await nano_banana.generate_resumable(
+            banana_prompt, job_id=node.id, save_to=image_path,
         )
         logging.log(
             "image",
             id=node.id,
-            url=_artifact_url(runs_dir, paths["image"]),
+            url=_artifact_url(runs_dir, image_path),
             prompt=node.prompt,
+        )
+        await threed.generate_mesh(
+            image.image_bytes,
+            output_path=raw,
+            job_id=node.id,
+            image_mime=image.mime_type,
         )
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, raw)

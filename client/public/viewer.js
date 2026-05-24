@@ -105,6 +105,7 @@ const KIND_COLOR = {
   "step": "#4a8fd8",
   "divider.decompose": "#e0c271",
   "generation.decompose": "#c586d1",
+  "mesh.error": "#ff8080",
 };
 
 function setStatus(text, cls = "hdr") {
@@ -185,6 +186,32 @@ function appendEvent(event) {
 
 function clearLog() {
   logEl.innerHTML = "";
+}
+
+// id -> error message for every mesh that errored during the current run.
+// Drives the per-node "error" phase in the tree and the aggregated count
+// shown on run.done so silent partial failures don't slip past as success.
+const meshErrors = new Map();
+
+function clearMeshErrors() {
+  meshErrors.clear();
+}
+
+function showRunCompleteWithErrors() {
+  statusEl.innerHTML = "";
+  const head = document.createElement("p");
+  head.className = "line warn";
+  const n = meshErrors.size;
+  head.textContent = `run complete — ${n} mesh${n === 1 ? "" : "es"} failed`;
+  statusEl.appendChild(head);
+  const ids = [...meshErrors.keys()];
+  const shown = ids.slice(0, 6);
+  const detail = document.createElement("p");
+  detail.className = "line warn";
+  const suffix = ids.length > shown.length ? `, +${ids.length - shown.length} more` : "";
+  detail.textContent = shown.join(", ") + suffix;
+  detail.title = ids.map((id) => `${id}: ${meshErrors.get(id)}`).join("\n");
+  statusEl.appendChild(detail);
 }
 
 // --- asset browser ----------------------------------------------------------
@@ -1739,7 +1766,8 @@ function dispatch(event) {
       setStatus(`run :: ${event.model}`);
       break;
     case "run.done":
-      setStatus("run complete");
+      if (meshErrors.size > 0) showRunCompleteWithErrors();
+      else setStatus("run complete");
       if (currentSource) { currentSource.close(); currentSource = null; }
       refreshSlots();
       break;
@@ -1752,6 +1780,14 @@ function dispatch(event) {
       setStatus("paused");
       if (currentSource) { currentSource.close(); currentSource = null; }
       refreshSlots();
+      break;
+    case "mesh.error":
+      // Surface the failure: track for the run.done summary, paint the
+      // tree node + asset card as errored so users see it without grepping
+      // the log panel.
+      meshErrors.set(event.id, event.message ?? "unknown error");
+      treeSetPhase(event.id, "error");
+      upsertAsset(event.id, { status: "error", errorMessage: event.message });
       break;
     case "bbox":
       loadBbox(event);
@@ -1896,6 +1932,7 @@ function switchSlot(id) {
   clearLog();
   clearAssets();
   treeClear();
+  clearMeshErrors();
   highestEventIndex = -1;
   recordedEvents.length = 0;
   updateReplayButton();
@@ -1942,6 +1979,7 @@ async function resetSlot(id) {
     clearLog();
     clearAssets();
     treeClear();
+    clearMeshErrors();
     highestEventIndex = -1;
     recordedEvents.length = 0;
     updateReplayButton();
@@ -1987,6 +2025,7 @@ async function rewindTo(index) {
   clearLog();
   clearAssets();
   treeClear();
+  clearMeshErrors();
   highestEventIndex = -1;
   recordedEvents.length = 0;
   updateReplayButton();
@@ -2040,6 +2079,7 @@ async function resumeSlot(id) {
     clearLog();
     clearAssets();
     treeClear();
+    clearMeshErrors();
     highestEventIndex = -1;
     recordedEvents.length = 0;
     updateReplayButton();
@@ -2292,6 +2332,7 @@ async function runReplay({ record }) {
   clearLog();
   clearAssets();
   treeClear();
+  clearMeshErrors();
   highestEventIndex = -1;
   recordedEvents.length = 0;
   updateReplayButton();
@@ -2419,9 +2460,17 @@ function dispatchForReplay(event) {
   appendEvent(event);
   switch (event.kind) {
     case "run.start": setStatus(`run :: ${event.model}`); break;
-    case "run.done": setStatus("run complete"); break;
+    case "run.done":
+      if (meshErrors.size > 0) showRunCompleteWithErrors();
+      else setStatus("run complete");
+      break;
     case "run.error": setStatus(`error: ${event.message}`, "err"); break;
     case "run.paused": setStatus("paused"); break;
+    case "mesh.error":
+      meshErrors.set(event.id, event.message ?? "unknown error");
+      treeSetPhase(event.id, "error");
+      upsertAsset(event.id, { status: "error", errorMessage: event.message });
+      break;
     case "bbox":
       loadBbox(event);
       treeUpsert(event.id, {
