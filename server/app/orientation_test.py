@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any, Literal, NamedTuple
 
 import httpx
+import trimesh
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,6 +50,7 @@ load_dotenv()
 
 TRELLIS_MODEL = os.environ.get("TRELLIS_MODEL", "microsoft:trellis-2@4b")
 ORIENTATION_RUNS_DIR = Path("./runs/orientation-test")
+TEST_OBJECTS_PATH = ORIENTATION_RUNS_DIR / "test_objects.json"
 _RUN_ID_PATTERN = r"^[A-Za-z0-9_.-]{1,80}$"
 
 BananaModelName = Literal["nano-banana-2", "nano-banana-pro"]
@@ -75,7 +78,7 @@ class ObjectCase(NamedTuple):
     dimensions: tuple[float, float, float]
 
 
-_CASES: tuple[ObjectCase, ...] = (
+_DEFAULT_CASES: tuple[ObjectCase, ...] = (
     ObjectCase(
         "arrow_rover",
         "arrow rover",
@@ -173,6 +176,36 @@ _CASES: tuple[ObjectCase, ...] = (
         (1.8, 1.5, 0.8),
     ),
 )
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return slug[:56].strip("_") or "object"
+
+
+def _load_cases_from_file(path: Path) -> tuple[ObjectCase, ...] | None:
+    if not path.exists():
+        return None
+    data = json.loads(path.read_text())
+    if not isinstance(data, list):
+        raise ValueError(f"{path} must contain a JSON list")
+    cases: list[ObjectCase] = []
+    for i, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path} item {i} must be an object")
+        prompt = item.get("prompt")
+        bbox = item.get("bbox_m")
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError(f"{path} item {i} has invalid prompt")
+        if not isinstance(bbox, list) or len(bbox) != 3:
+            raise ValueError(f"{path} item {i} has invalid bbox_m")
+        dimensions = (float(bbox[0]), float(bbox[1]), float(bbox[2]))
+        case_id = f"{i:03d}_{_slugify(prompt)}"
+        cases.append(ObjectCase(case_id, f"{i:03d}", prompt.strip(), None, dimensions))
+    return tuple(cases)
+
+
+_CASES = _load_cases_from_file(TEST_OBJECTS_PATH) or _DEFAULT_CASES
 
 
 class OrientationBananaRequest(BaseModel):
@@ -344,44 +377,67 @@ def _compare_bboxes(
     reference_label: str = "target",
     candidate_label: str = "candidate",
 ) -> dict[str, Any]:
-    axis_order = ("width_x", "height_y", "depth_z")
-    matched_axis_index = min(range(3), key=lambda i: reference_bbox[i])
-    reference_edge = reference_bbox[matched_axis_index]
-    candidate_edge = candidate_bbox[matched_axis_index]
-    if candidate_edge <= 0:
+    dimension_order = ("shortest", "middle", "longest")
+    reference_sorted = tuple(sorted(reference_bbox))
+    candidate_sorted = tuple(sorted(candidate_bbox))
+    reference_shortest = reference_sorted[0]
+    candidate_shortest = candidate_sorted[0]
+    if reference_shortest <= 0 or candidate_shortest <= 0:
         raise HTTPException(status_code=400, detail="bbox dimensions must be positive")
-    scale = reference_edge / candidate_edge
-    scaled_candidate = tuple(v * scale for v in candidate_bbox)
-    delta = tuple(scaled_candidate[i] - reference_bbox[i] for i in range(3))
-    abs_delta = tuple(abs(v) for v in delta)
+    scale = reference_shortest / candidate_shortest
+    scaled_candidate_sorted = tuple(v * scale for v in candidate_sorted)
+    reference_ratios = tuple(v / reference_shortest for v in reference_sorted)
+    candidate_ratios = tuple(v / candidate_shortest for v in candidate_sorted)
+    ratio_delta = tuple(candidate_ratios[i] - reference_ratios[i] for i in range(3))
     percent_delta = tuple(
-        (delta[i] / reference_bbox[i]) * 100 if reference_bbox[i] else 0
+        (ratio_delta[i] / reference_ratios[i]) * 100
+        if reference_ratios[i] else 0
         for i in range(3)
     )
-    other_axis_percent_delta = {
-        axis_order[i]: percent_delta[i]
-        for i in range(3)
-        if i != matched_axis_index
+    delta = tuple(scaled_candidate_sorted[i] - reference_sorted[i] for i in range(3))
+    abs_delta = tuple(abs(v) for v in delta)
+    matched_dimension_percent_delta = {
+        dimension_order[i]: percent_delta[i]
+        for i in range(1, 3)
     }
     return {
-        "axis_order": list(axis_order),
+        "comparison_basis": "sorted_internal_proportions",
+        "dimension_order": list(dimension_order),
+        "axis_order": ["width_x", "height_y", "depth_z"],
         "reference_label": reference_label,
         "candidate_label": candidate_label,
         "reference_bbox": list(reference_bbox),
         "candidate_bbox": list(candidate_bbox),
+        "reference_sorted_bbox": list(reference_sorted),
+        "candidate_sorted_bbox": list(candidate_sorted),
         "matched_edge_alignment": {
-            "matched_axis": axis_order[matched_axis_index],
-            "matched_axis_index": matched_axis_index,
-            "reference_edge": reference_edge,
-            "candidate_edge": candidate_edge,
+            "matched_dimension": "shortest",
+            "matched_dimension_index": 0,
+            "reference_edge": reference_shortest,
+            "candidate_edge": candidate_shortest,
             "scale_candidate_to_reference": scale,
         },
-        "scaled_candidate_bbox": list(scaled_candidate),
+        "scaled_candidate_sorted_bbox": list(scaled_candidate_sorted),
+        "reference_internal_ratios": list(reference_ratios),
+        "candidate_internal_ratios": list(candidate_ratios),
+        "ratio_delta_candidate_minus_reference": list(ratio_delta),
         "delta_scaled_candidate_minus_reference": list(delta),
         "absolute_delta": list(abs_delta),
         "percent_delta": list(percent_delta),
-        "other_axis_percent_delta": other_axis_percent_delta,
+        "matched_dimension_percent_delta": matched_dimension_percent_delta,
     }
+
+
+def measure_glb_bbox(path: Path) -> tuple[float, float, float]:
+    loaded = trimesh.load(path, force="scene")
+    bounds = getattr(loaded, "bounds", None)
+    if bounds is None:
+        raise RuntimeError(f"GLB has no bounds: {path}")
+    return (
+        float(bounds[1][0] - bounds[0][0]),
+        float(bounds[1][1] - bounds[0][1]),
+        float(bounds[1][2] - bounds[0][2]),
+    )
 
 
 def _comparison_from_case_views(case_data: dict[str, Any]) -> dict[str, Any] | None:
@@ -1201,10 +1257,10 @@ function showTargetComparison(caseId, view, comparison) {
   if (!card) return;
   const el = $(`.comparison[data-view="${view}"]`, card);
   const align = comparison.matched_edge_alignment;
-  const pct = Object.entries(comparison.other_axis_percent_delta)
-    .map(([axis, value]) => `${axis} ${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(3)}%`)
+  const pct = Object.entries(comparison.matched_dimension_percent_delta)
+    .map(([dim, value]) => `${dim} ${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(3)}%`)
     .join(" / ");
-  el.textContent = `${VIEW_LABELS[view]} vs target: match ${align.matched_axis}, scale ${align.scale_candidate_to_reference.toFixed(6)} / other-edge ratio delta ${pct}`;
+  el.textContent = `${VIEW_LABELS[view]} vs target: sorted ratios, match ${align.matched_dimension}, scale ${align.scale_candidate_to_reference.toFixed(6)} / ratio delta ${pct}`;
   el.classList.remove("pending");
 }
 
@@ -1214,10 +1270,10 @@ function showViewComparison(caseId, comparison) {
   if (!card) return;
   const el = $(".view-comparison", card);
   const align = comparison.matched_edge_alignment;
-  const pct = Object.entries(comparison.other_axis_percent_delta)
-    .map(([axis, value]) => `${axis} ${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(3)}%`)
+  const pct = Object.entries(comparison.matched_dimension_percent_delta)
+    .map(([dim, value]) => `${dim} ${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(3)}%`)
     .join(" / ");
-  el.textContent = `front vs 3/4 dimension ratio: match ${align.matched_axis}, scale ${align.scale_candidate_to_reference.toFixed(6)} / other-edge ratio delta ${pct}`;
+  el.textContent = `front vs 3/4 dimension ratio: sorted ratios, match ${align.matched_dimension}, scale ${align.scale_candidate_to_reference.toFixed(6)} / ratio delta ${pct}`;
   el.classList.remove("pending");
 }
 
