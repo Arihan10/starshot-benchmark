@@ -54,6 +54,10 @@ description = "Run test suite"
 command = "uv run --script scripts/run_playground.py"
 description = "Boot the prompt → Nano Banana → Trellis 2 dev playground"
 
+[tasks.orientation-test]
+command = "uv run --script scripts/run_orientation_test.py"
+description = "Boot the Trellis 2 orientation-fidelity test client"
+
 # [open] maps target name -> URL or shell command for `enx open <target>`.
 [open]
 repo = "https://github.com/enxilium/starshot-benchmark"

@@ -1,5 +1,6 @@
 .env
 server/runs/
+server/previous_runs/
 client/node_modules/
 .ruff_cache/
 **/__pycache__/
