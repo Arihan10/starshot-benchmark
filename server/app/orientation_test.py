@@ -63,11 +63,15 @@ _BANANA_MODELS: dict[BananaModelName, str] = {
 }
 
 _HITBOX_TERMS: dict[ProxyShape | None, tuple[str, str]] = {
-    None: ("rectangular prism", "rectangular prism"),
-    ProxyShape.SPHERE: ("ellipsoid", "sphere"),
-    ProxyShape.CAPSULE: ("vertical capsule", "capsule"),
-    ProxyShape.HEMISPHERE: ("upright hemisphere", "hemisphere"),
+    None: ("rectangular prism", "rectangle"),
+    ProxyShape.SPHERE: ("ellipsoid", "ellipse"),
+    ProxyShape.CAPSULE: ("vertical capsule", "pill"),
+    ProxyShape.HEMISPHERE: ("dome", "dome"),
 }
+
+
+def _article(word: str) -> str:
+    return "an" if word[:1].lower() in "aeiou" else "a"
 
 
 class ObjectCase(NamedTuple):
@@ -473,25 +477,24 @@ def _wrap_orthographic_prompt(
     hitbox, silhouette = _HITBOX_TERMS[proxy_shape]
     width, height, depth = dimensions
     return (
-        "Generate a clean orthographic three-quarter product render of "
-        f"{description} that roughly can be captured within a {hitbox} "
-        "hitbox without bending or deforming the object's natural proportions. "
-        f"The object should not fully be in a {silhouette} shape unless its "
-        "dimensions and nature dictate it is naturally that shape. Prioritize "
-        "realism over confinement to the hitbox shape. "
-        "This is an orientation-fidelity source image for a 3D reconstruction "
-        "test, so the object's heading must be unambiguous. Use one consistent "
-        "default orientation for every object: an orthographic front-right "
-        "three-quarter view with parallel projection, about 35 degrees above "
-        "the object, so the front, right side, and top are all visible. The "
+        "Generate a direct, perfect orthographic front-right three-quarter "
+        f"view of {description} "
+        f"that roughly can be captured within {_article(hitbox)} {hitbox} "
+        "hitbox without bending or deforming the object's natural "
+        f"proportions. The object should not fully be in {_article(silhouette)} "
+        f"{silhouette} shape unless its dimensions and nature dictate it is "
+        "naturally that shape. Prioritize realism over confinement to the "
+        "hitbox shape. Use parallel projection, about 35 degrees above the "
+        "object, so the front, right side, and top are all visible. The "
         "object's front must face toward the lower-right of the image every "
-        "time, with the rear pointing toward the upper-left. Do not rotate the "
-        "object to a different heading, do not use a side view, and do not mirror "
-        "left/right markings. "
-        f"The object's dimensions are exactly {width:.2f}m by {height:.2f}m by "
-        f"{depth:.2f}m (width by height by depth). Capture the entire model in "
-        "the image. Render against a clean, empty white background with no "
-        "other objects, dimension markings, labels, axes, or graphics."
+        "time, with the rear pointing toward the upper-left. Do not rotate "
+        "the object to a different heading, do not use a side view, and do "
+        "not mirror left/right markings. "
+        f"The object's dimensions are exactly {width:.2f}m by {height:.2f}m "
+        f"by {depth:.2f}m (width by height by depth). "
+        "Capture the entire model in the image. Render against a clean, "
+        "empty white background with no other objects, dimension markings, "
+        "or graphics."
     )
 
 
