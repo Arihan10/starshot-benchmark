@@ -3,8 +3,9 @@ Domain types for the pipeline.
 
 Coordinates: Y-up, right-handed, meters.
 Canonical front view: +X = right, +Y = up, +Z = toward the viewer.
-All bounding boxes, corners, and relationships are expressed under this
-convention.
+All bounding boxes are expressed under this convention. Spatial
+relationships between nodes are carried as prose `placement`
+descriptions on each Node (resolved by the bbox-resolution LLM step).
 """
 
 from __future__ import annotations
@@ -32,19 +33,6 @@ Orientation = Annotated[
 ]
 
 Vec3Cm = tuple[float, float, float]
-
-
-class Corner(StrEnum):
-    """One of the 8 corners of an AABB under the canonical front view."""
-
-    TOP_LEFT_FRONT = "TOP_LEFT_FRONT"
-    TOP_LEFT_BACK = "TOP_LEFT_BACK"
-    TOP_RIGHT_FRONT = "TOP_RIGHT_FRONT"
-    TOP_RIGHT_BACK = "TOP_RIGHT_BACK"
-    BOTTOM_LEFT_FRONT = "BOTTOM_LEFT_FRONT"
-    BOTTOM_LEFT_BACK = "BOTTOM_LEFT_BACK"
-    BOTTOM_RIGHT_FRONT = "BOTTOM_RIGHT_FRONT"
-    BOTTOM_RIGHT_BACK = "BOTTOM_RIGHT_BACK"
 
 
 class BoundingBox(BaseModel):
@@ -98,21 +86,6 @@ class BoundingBox(BaseModel):
     def max_dimension(self) -> float:
         return max(self.size)
 
-    def corner_point(self, corner: Corner) -> Vec3Tuple:
-        lo, hi = self.min_corner, self.max_corner
-        x = hi[0] if "_RIGHT_" in corner.value else lo[0]
-        y = hi[1] if corner.value.startswith("TOP") else lo[1]
-        z = hi[2] if corner.value.endswith("FRONT") else lo[2]
-        return (x, y, z)
-
-
-class RelationshipKind(StrEnum):
-    ON = "ON"
-    BESIDE = "BESIDE"
-    BELOW = "BELOW"
-    ABOVE = "ABOVE"
-    ATTACHED = "ATTACHED"
-
 
 class ProxyShape(StrEnum):
     """Optional collision-proxy primitive describing the mesh's silhouette
@@ -123,16 +96,6 @@ class ProxyShape(StrEnum):
     SPHERE = "SPHERE"
     CAPSULE = "CAPSULE"
     HEMISPHERE = "HEMISPHERE"
-
-
-class Relationship(BaseModel):
-    """Anchors a node's bbox to a target corner of another node's bbox."""
-
-    model_config = ConfigDict(frozen=True)
-
-    target: str
-    kind: RelationshipKind
-    reference_point: Corner
 
 
 class Node(BaseModel):
@@ -151,6 +114,13 @@ class Node(BaseModel):
     image-generation boundary. Keeping them separate prevents the wrapper
     boilerplate from leaking into LLM context lookups like "objects placed
     so far" / "prior subject phrases in this scene".
+
+    `placement` is the prose description of where this node sits in the
+    scene, authored at the decomposition step and resolved by the
+    bbox-resolution step. `referenced_ids` lists every node id mentioned
+    in `placement` — `referenced_ids[0]` is the structural parent by
+    prompting convention (the load-bearing supporter or the containing
+    zone). Both are None/empty for the root node only.
     """
 
     id: str
@@ -158,7 +128,8 @@ class Node(BaseModel):
     bbox: BoundingBox
     proxy_shape: ProxyShape | None = None
     orientation: Orientation = 0
-    relationships: list[Relationship] = Field(default_factory=list)
+    placement: str | None = None
+    referenced_ids: list[str] = Field(default_factory=list)
     mesh_url: str | None = None
     image_prompt: str | None = None
     parent_id: str | None = None

@@ -45,7 +45,7 @@ from app.core.types import BoundingBox, Node
 from app.pipeline import generation
 from app.services import llm
 from app.utils import logging
-from app.utils.topology import validate_sibling_relationships_acyclic
+from app.utils.topology import validate_referenced_ids
 
 
 async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
@@ -221,10 +221,14 @@ async def _build(
     )
 
     try:
-        validate_sibling_relationships_acyclic(decomp.children)
+        validate_referenced_ids(
+            decomp.children,
+            parent_id=node.id,
+            existing_ids={n.id for n in all_nodes},
+        )
     except ValueError as e:
         logging.log(
-            "divider.validate.relationships.accept_invalid",
+            "divider.validate.referenced_ids.accept_invalid",
             node=node.id, reason=str(e),
         )
 
@@ -246,7 +250,8 @@ async def _build(
             prompt=spec.prompt,
             bbox=child_bbox,
             proxy_shape=spec.proxy_shape,
-            relationships=list(spec.relationships),
+            placement=spec.placement,
+            referenced_ids=list(spec.referenced_ids),
             parent_id=node.id,
             plan=None,
         )

@@ -62,7 +62,7 @@ from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.services import llm, nano_banana, threed
 from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
-from app.utils.topology import validate_object_relationships
+from app.utils.topology import validate_referenced_ids
 
 
 def _artifact_url(runs_dir: Path, path: Path) -> str:
@@ -142,7 +142,7 @@ async def _decompose_objects_validated(
         )
         specs = list(out.objects)
         try:
-            validate_object_relationships(specs, zone_id=zone.id, existing_ids=existing_ids)
+            validate_referenced_ids(specs, parent_id=zone.id, existing_ids=existing_ids)
             return specs
         except ValueError as e:
             reason = str(e)
@@ -187,8 +187,8 @@ async def _next_object_validated(
         if decision.done or decision.object is None:
             return decision
         try:
-            validate_object_relationships(
-                [decision.object], zone_id=zone.id, existing_ids=existing_ids,
+            validate_referenced_ids(
+                [decision.object], parent_id=zone.id, existing_ids=existing_ids,
             )
             return decision
         except ValueError as e:
@@ -275,9 +275,10 @@ async def _resolve_and_generate(
     resolved: list[Node] = []
     for spec in specs:
         bbox = bboxes[spec.id]
+        parent_id = spec.referenced_ids[0]
         logging.emit_bbox(
             spec.id, bbox,
-            parent_id=spec.parent, prompt=spec.prompt,
+            parent_id=parent_id, prompt=spec.prompt,
             kind="frame" if scenario == "encapsulating" else "object",
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
@@ -294,8 +295,9 @@ async def _resolve_and_generate(
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
-            relationships=list(spec.relationships),
-            parent_id=spec.parent,
+            placement=spec.placement,
+            referenced_ids=list(spec.referenced_ids),
+            parent_id=parent_id,
         ))
 
     return await _spawn_meshes(

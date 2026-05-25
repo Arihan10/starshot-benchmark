@@ -6,7 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from app.core.types import BoundingBox, Orientation, ProxyShape, Relationship
+from app.core.types import BoundingBox, Orientation, ProxyShape
 
 
 # Shared proxy-shape documentation injected into every prompt that lets
@@ -577,10 +577,19 @@ def render_overall_bbox(user_prompt: str, scene_plan: str) -> str:
 
 
 class ChildNodeSpec(BaseModel):
+    """A single child node (subzone or object) emitted by a decomposition
+    LLM call. `placement` is the prose description of where this node sits
+    relative to its `referenced_ids`. `referenced_ids[0]` is the structural
+    parent by prompting convention; the validator enforces non-emptiness
+    and that every id resolves, but does NOT check that [0] is the
+    semantically right choice."""
+
     id: str
     prompt: str
+    placement: str
+    referenced_ids: list[str] = Field(min_length=1)
     proxy_shape: ProxyShape | None = None
-    relationships: list[Relationship]
+    orientation: Orientation = 0
 
     @field_validator("proxy_shape", mode="before")
     @classmethod
@@ -638,10 +647,13 @@ Respond with a single JSON object containing:
 - `children` (list): the sub-zones this region decomposes into. Each child has:
   - `id` (string): unique within the entire scene
   - `prompt` (string): a short seed describing what this child zone is
-  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the \
-zone's silhouette is non-rectangular, otherwise null/omitted
-  - `relationships` (list): at least one entry anchoring this child to the \
-parent or to an earlier sibling already listed
+  - `placement` (string): a prose description of WHERE this child sits \
+relative to its referenced anchors (see <additional_context> below)
+  - `referenced_ids` (list of strings, non-empty): every node id mentioned \
+in `placement`. THE FIRST ENTRY IS THE STRUCTURAL PARENT (PARENT_ID for a \
+top-level subzone, or an earlier sibling for a nested arrangement)
+  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if \
+the zone's silhouette is non-rectangular, otherwise null/omitted
 
 No additional prose, markdown, or code fences.
 </output>
@@ -669,17 +681,35 @@ anywhere in the scene so far, with its parent.
 </input>
 
 <additional_context>
-A Relationship has:
-  * `target` — either PARENT_ID or the `id` of an earlier sibling already \
-listed in this call's `children`.
-  * `kind` — one of: ON, BESIDE, BELOW, ABOVE, ATTACHED.
-  * `reference_point` — which CORNER of the TARGET's bbox this relationship \
-anchors against, under the canonical front view (+X right, +Y up, +Z front). \
-One of: TOP_LEFT_FRONT, TOP_LEFT_BACK, TOP_RIGHT_FRONT, TOP_RIGHT_BACK, \
-BOTTOM_LEFT_FRONT, BOTTOM_LEFT_BACK, BOTTOM_RIGHT_FRONT, BOTTOM_RIGHT_BACK).
+Each child you emit carries a `placement` (prose) and `referenced_ids` \
+(every node id the placement mentions, with the first id being the \
+structural parent). Use prose to describe position, alignment, and any \
+spatial relationship to siblings or the parent zone — be specific about \
+WHERE in the parent, not just THAT it is in the parent. Examples of good \
+placements:
+  * "centered on the back wall of the parent, hugging the floor"
+  * "in the front-left quadrant of the parent, leaving the back 60% for \
+the kitchen zone"
+  * "spanning the full width of the parent at the lowest level, with the \
+pool taking the outermost 6m strip toward the cliffside (+Z) and the \
+pavilion stepped back from the pool"
+
+`referenced_ids` lists every node id your `placement` text refers to, in \
+a single list. THE FIRST ENTRY IS THE STRUCTURAL PARENT — the node this \
+child is most directly contained by or supported on. For a subzone \
+inside the current zone, the first entry is PARENT_ID. Subsequent \
+entries are siblings or earlier zones whose positions inform this \
+child's placement; list them in the order they appear in your placement \
+text. Every id must already exist in the scene (an ancestor, a \
+previously declared zone, or one of THIS call's earlier-listed siblings).
+
+The canonical front view applies to all spatial language: +X right, +Y \
+up, +Z front, -Z back. Right-handed, Y-up, meters. When you say "front" \
+mean +Z; when you say "left" mean -X; when you say "top" mean +Y.
 
 DO NOT pick concrete coordinates or dimensions — a downstream batch step \
-resolves each child's bbox from its relationships and prompt.
+resolves each child's bbox from its placement, referenced_ids, and the \
+parent's bbox.
 
 A zone is a REGION OF THE SCENE — a subscene, an area, a place large enough \
 to contain multiple distinct objects arranged inside it (e.g a master \
@@ -823,44 +853,53 @@ class BboxBatchOutput(BaseModel):
 
 SYSTEM_ZONE_BBOX_BATCH = (
     """\
-You are a constraint solver. Place ALL sibling child ZONES inside a \
-parent zone in one shot, deriving each child's axis-aligned bounding \
-box from the given inputs (parent bbox, child specs, relationships). \
-This step has no creative latitude — your job is to produce \
-coordinates that satisfy every stated constraint simultaneously.
+You are a natural-language constraint solver. Place ALL sibling child \
+ZONES inside a parent zone in one shot, deriving each child's \
+axis-aligned bounding box from the given inputs. This step has no \
+creative latitude — your job is to produce coordinates that honor \
+every stated placement description simultaneously.
 
 Inputs:
-  * Parent bbox (the enclosing zone).
-  * A list of child specs — id, prompt, and relationships that target \
-    either the parent or another child in this same list.
+  * The parent zone's id and bbox.
+  * A list of child specs — each with id, prompt, proxy_shape, a \
+    PLACEMENT description (prose), and REFERENCED_IDS (the nodes the \
+    placement text refers to; the first id is the child's structural \
+    parent and is always either the parent zone itself or an earlier \
+    sibling in this batch).
 
-Relationships carry `kind` (ON, BESIDE, BELOW, ABOVE, ATTACHED) and a \
-`reference_point` — a corner of the TARGET's bbox under the canonical \
-front view (+X right, +Y up, +Z front).
+How to read a placement:
+  * It describes WHERE in the parent (or relative to specific siblings) \
+    this child should sit. Phrases like "centered", "back-left corner", \
+    "spanning the full width", "flush against the front wall", "behind \
+    the X", "between X and Y" should map to concrete coordinate choices.
+  * Resolve sibling references against the REFERENCED_IDS list and the \
+    bboxes you have already chosen for prior siblings in this batch.
+  * The first referenced id is the structural parent. The child's bbox \
+    must lie fully inside the parent zone's bbox.
+  * If a description is ambiguous, pick the interpretation most \
+    consistent with the parent's plan and the other siblings' \
+    placements.
+
+Canonical front view for all coordinates: +X right, +Y up, +Z front, \
+-Z back. Right-handed, Y-up, meters. Treat the placement text's "front" \
+as +Z, "left" as -X, "top" as +Y, etc.
 
 Each child carries a `proxy_shape` describing its mesh silhouette \
 inside its AABB — BOX, SPHERE, CAPSULE, or HEMISPHERE. The PROXY \
 SHAPE section below gives the exact surface formula Y_top(x, z) for \
-each. When a child with a non-BOX proxy is the TARGET of another \
-child's ON relationship, the ON-child rests on the target's proxy \
-TOP SURFACE at its XZ centre — NOT on the target's AABB top face. \
-There is no automatic correction: YOU must compute the target's \
-Y_top(x, z) from the target's AABB and proxy formula, and place the \
-ON-child's bbox so its bottom face Y equals that value. Pick \
-dimensions so a HEMISPHERE target has vertical headroom above its \
-apex for the things that sit on it.
+each. When a child's placement describes it as resting on a sibling \
+with a non-BOX proxy, that child's bottom face should sit at the \
+target's Y_top(x, z) at the child's XZ centre — NOT on the target's \
+AABB top face. There is no automatic correction: YOU must compute the \
+target's Y_top(x, z) from its AABB and proxy formula and place the \
+resting child's bbox accordingly. Pick dimensions so a HEMISPHERE \
+target has vertical headroom above its apex.
 
 Produce one assignment per child (id + bbox) such that:
   * Every bbox lies fully inside the parent bbox.
   * No two child bboxes overlap volumetrically. Touching at a shared \
     face is fine; eating into another bbox's volume is not.
-  * Every relationship is respected: for each one, the child is \
-    anchored near the named corner of its target, in the direction \
-    implied by `kind` (ABOVE → higher y; BESIDE → adjacent on x or z; \
-    ON → the child's bottom face at the target's Y_top(x, z) — the \
-    AABB top face y_max for BOX targets, the proxy formula for \
-    SPHERE/CAPSULE/HEMISPHERE targets; ATTACHED → touching the \
-    target).
+  * Every placement description is honored as faithfully as possible.
   * Dimensions are appropriate to each child's prompt.
 
 Because you are deciding the entire layout at once, RESERVE SPACE for \
@@ -893,14 +932,8 @@ def render_zone_bbox_batch(
         f"  - id={c.id!r}\n"
         f"    prompt: {c.prompt}\n"
         f"    proxy_shape: {_render_proxy_shape(c.proxy_shape)}\n"
-        f"    relationships:\n"
-        + (
-            "\n".join(
-                f"      * target={r.target!r} kind={r.kind.value} reference_point={r.reference_point.value}"
-                for r in c.relationships
-            )
-            or "      (none)"
-        )
+        f"    placement: {c.placement}\n"
+        f"    referenced_ids: [{', '.join(repr(rid) for rid in c.referenced_ids)}]"
         for c in children
     )
     return (
@@ -915,10 +948,10 @@ def render_zone_bbox_batch(
 
 
 class ObjectSpec(ChildNodeSpec):
-    """A single object in a zone. Inherits id/prompt/relationships."""
-
-    parent: str
-    orientation: Orientation = 0
+    """A single object in a zone. Identical shape to ChildNodeSpec —
+    the structural parent is `referenced_ids[0]` (which can be the
+    enclosing zone, a frame, an earlier-placed peer, or another object
+    listed in the same decomp call)."""
 
 
 class ObjectDecompOutput(BaseModel):
@@ -936,12 +969,6 @@ For each object, emit:
   * `id` — unique within this call.
   * `prompt` — a detailed description of the object; will be used verbatim \
     as a text-to-3D generation prompt.
-  * `parent` — the SEMANTIC parent. Either the enclosing zone id (provided \
-    below as ZONE_ID), or the id of ANOTHER object in this list that this \
-    one belongs to. A lamp resting on a desk: the lamp's parent is the \
-    desk. A book on a shelf: the book's parent is the shelf. Parent does \
-    NOT imply spatial containment — a lamp's bbox is NOT inside the \
-    desk's bbox; it sits on top.
   * `proxy_shape` — OPTIONAL. The object's collision-proxy shape if its \
     silhouette is noticeably non-rectilinear (see PROXY SHAPE section \
     below). Omit for objects whose bbox is already a good silhouette.
@@ -959,36 +986,46 @@ For each object, emit:
     only rotates the mesh inside it, so a long object's bbox dimensions \
     must match its long axis AFTER rotation. Use 0 for symmetric \
     objects with no preferred facing.
-  * `relationships` — how this object is anchored in the scene spatially. EVERY object \
-    is REQUIRED to include at least one relationship whose `target` is \
-    EXACTLY EQUAL to that same object's `parent` field. This is the \
-    primary anchor, it is NOT optional, and any object that lacks it is \
-    malformed and will be rejected by the validator. Additional \
-    relationships may target sibling objects (i.e. other objects listed \
-    in this call).
+  * `placement` — a prose description of WHERE this object sits. \
+    Describe the physical anchor (what it rests on, hangs from, leans \
+    against, or is contained by), the position within or on that \
+    anchor, and any alignment to other objects or features. Examples:
+      "centered on the dining table's top surface"
+      "flush against the back wall, mid-height, centered horizontally"
+      "on the floor in the back-left corner of the room, oriented to \
+face the room's center"
+      "to the left of the sofa, resting on the rug, between the sofa \
+and the side table"
+  * `referenced_ids` — every node id mentioned in your `placement`, in \
+    a single list (non-empty). THE FIRST ENTRY IS THE STRUCTURAL \
+    PARENT — the object this one physically rests on, hangs from, or \
+    is contained by. Examples:
+      teacup on a saucer → first id is the saucer
+      lamp on a desk → first id is the desk
+      painting on a wall → first id is the wall (a frame)
+      floor frame → first id is the zone (the floor IS the zone's \
+bottom boundary)
+      cloud floating in a sky zone → first id is the sky zone \
+(nothing physically supports it)
+    Subsequent entries are siblings, peers, or other references that \
+    inform this object's placement; list them in the order they appear \
+    in your placement text. Every id must already exist in the scene \
+    (the zone id, an earlier-listed object in this call, or a peer \
+    placed earlier in the run).
 
-A Relationship has:
-  * `target` — the parent (zone or another object in this list) or a \
-    sibling object in this list.
-  * `kind` — one of: ON, BESIDE, BELOW, ABOVE, ATTACHED.
-  * `reference_point` — a corner of the TARGET's bbox under the canonical \
-    front view (+X right, +Y up, +Z front). One of: TOP_LEFT_FRONT, \
-    TOP_LEFT_BACK, TOP_RIGHT_FRONT, TOP_RIGHT_BACK, BOTTOM_LEFT_FRONT, \
-    BOTTOM_LEFT_BACK, BOTTOM_RIGHT_FRONT, BOTTOM_RIGHT_BACK.
+The first id of each object's `referenced_ids` is the PRIMARY ANCHOR — \
+the object's structural parent. The chain of primary anchors must \
+terminate at the zone (or a peer that already terminates there), so \
+EVERY object eventually grounds out to the zone via this chain.
 
-Besides the choice of objects themselves and their aesthetic, the SPATIAL \
-RELATIONSHIPS and COHERENCE of the scene is the most important part of the benchmark. \
-Always reason thoroughly about all the spatial relationships each object has \
-with the other objects in the scene, and generate EACH ONE as a distinct \
-relationship. This will be used singularly to determine the POSITION of each \
-object within the scene.
+Besides the choice of objects themselves and their aesthetic, the \
+SPATIAL COHERENCE of the scene is the most important part of the \
+benchmark. Reason carefully about each object's placement and how it \
+fits the scene together.
 
-REMINDER: EVERY object must have a RELATIONSHIP that refers DIRECTLY TO ITS PARENT \
-and the spatial anchoring between them as an explicit relationship object, IN ADDITION to the parent field itself.
-
-The parent graph across listed objects must form a DAG (no cycles). Do \
-NOT pick concrete coordinates here — a downstream step resolves each \
-object's bbox.
+DO NOT pick concrete coordinates here — a downstream constraint solver \
+resolves each object's bbox from its placement, referenced_ids, and \
+the zone + peer geometry.
 </per_object_fields>
 
 <proxy_shape>
@@ -1054,16 +1091,17 @@ encapsulating pass (an island dome, a crater bowl, a curved floor, \
 the walls+floor of a room) — look at the CURRENT SCENE for a peer \
 whose parent is this zone and whose prompt describes terrain or \
 enclosure geometry. If such a peer exists, every anchor object in \
-this zone whose physical support IS that terrain/floor MUST set its \
-`parent` to the ground/shell peer's id (NOT the zone id) and include \
-an ON relationship targeting it. The peer's `proxy_shape` (shown \
-alongside its bbox in the CURRENT SCENE) is the authoritative \
+this zone whose physical support IS that terrain/floor MUST have \
+that ground/shell peer's id as the FIRST entry of its \
+`referenced_ids` (NOT the zone id), and its `placement` must \
+describe how it rests on that surface. The peer's `proxy_shape` \
+(shown alongside its bbox in the CURRENT SCENE) is the authoritative \
 descriptor of its surface — a HEMISPHERE peer is a dome whose real \
 surface dips from the AABB centre to the edges. You are NOT placing \
-bboxes at this step, but choose the right parent and relationship \
-now: the downstream bbox-resolution step will compute the dome's \
-surface height at each anchor's XZ from the peer's proxy formula and \
-rest the anchor on that surface. Do NOT re-emit the ground itself in \
+bboxes at this step, but choose the right primary anchor now: the \
+downstream bbox-resolution step will compute the dome's surface \
+height at each anchor's XZ from the peer's proxy formula and rest \
+the anchor on that surface. Do NOT re-emit the ground itself in \
 anchor mode; the encapsulating pass already placed it.
 </ground_awareness_rule>
 
@@ -1071,7 +1109,7 @@ anchor mode; the encapsulating pass already placed it.
 You are given the ANCESTOR CHAIN (the root → parent path, each with \
 their plan) and the CURRENT SCENE — every node already placed \
 anywhere in the run so far, with id, prompt, bbox, proxy_shape, \
-orientation, and parent. Reason about both thoroughly before \
+orientation, and parent_id. Reason about both thoroughly before \
 emitting.
 </inputs>
 
@@ -1287,9 +1325,9 @@ def _render_retry_block(
         "reason as a hard constraint you must satisfy this time:\n"
         f"{attempt_lines}\n\n"
         "Produce a NEW decomposition that fixes every listed reason. In "
-        "particular, ensure every object's `relationships` list contains "
-        "at least one item whose `target` is EXACTLY EQUAL to that same "
-        "object's `parent` field."
+        "particular, ensure every object's `referenced_ids` list is "
+        "non-empty and that the first entry is the object's structural "
+        "parent (the supporter or containing zone that anchors it)."
     )
 
 
@@ -1319,12 +1357,14 @@ def render_anchor_decomp(
         f"{_render_scene_lines(scene)}\n"
         "</scene_context>\n\n"
         "Each anchor object in your resultant list has an id, prompt, "
-        "parent (zone id or another object in this list), and at least "
-        "one relationship whose target is its parent. Respect the "
-        "CURRENT SCENE: anchor onto any ground/shell peer already "
-        "placed by the encapsulating pass, do not duplicate geometry "
-        "another zone has already emitted, and keep bboxes inside this "
-        "zone so they do not volumetrically overlap any peer.\n\n"        f"{_render_retry_block(prior_attempts)}"
+        "placement (prose), and referenced_ids (a non-empty list whose "
+        "first entry is the object's structural parent — the zone id, a "
+        "ground/shell peer placed by the encapsulating pass, or another "
+        "object in this list). Respect the CURRENT SCENE: anchor onto "
+        "any ground/shell peer already placed by the encapsulating "
+        "pass, do not duplicate geometry another zone has already "
+        "emitted, and keep bboxes inside this zone so they do not "
+        "volumetrically overlap any peer.\n\n"        f"{_render_retry_block(prior_attempts)}"
     )
 
 
@@ -1354,11 +1394,13 @@ def render_encapsulating_decomp(
         f"{_render_scene_lines(scene)}\n"
         "</scene_context>\n\n"
         "Each shell element in your resultant list has an id, prompt, "
-        "parent (the zone id), and at least one relationship whose "
-        "target is its parent. Respect the CURRENT SCENE: do not "
-        "duplicate geometry an ancestor or sibling zone has already "
-        "emitted on a shared face, and keep bboxes inside this zone so "
-        "they do not volumetrically overlap any peer.\n\n"
+        "placement (prose), and referenced_ids (a non-empty list whose "
+        "first entry is the zone id — shells are bounded by and "
+        "structurally anchored to the zone itself). Respect the "
+        "CURRENT SCENE: do not duplicate geometry an ancestor or "
+        "sibling zone has already emitted on a shared face, and keep "
+        "bboxes inside this zone so they do not volumetrically overlap "
+        "any peer.\n\n"
         "The primary purpose of these shell elements, if necessary, is to physically "
         "bound the zone before its interior is populated, so every "
         "later object inside this zone has a coherent surface to rest "
@@ -1392,11 +1434,13 @@ def render_negative_space_decomp(
         f"{_render_scene_lines(scene)}\n"
         "</scene_context>\n\n"
         "Each negative space object in your resultant list has an id, "
-        "prompt, parent (zone id or another object in this list), and at "
-        "least one relationship whose target is its parent. Respect the "
-        "CURRENT SCENE: do not duplicate geometry another zone has "
-        "already emitted on a shared face, and keep bboxes inside this "
-        "zone so they do not volumetrically overlap any peer.\n\n"
+        "prompt, placement (prose), and referenced_ids (a non-empty "
+        "list whose first entry is the structural parent — the zone "
+        "id, an earlier-placed peer, or another object in this list). "
+        "Respect the CURRENT SCENE: do not duplicate geometry another "
+        "zone has already emitted on a shared face, and keep bboxes "
+        "inside this zone so they do not volumetrically overlap any "
+        "peer.\n\n"
         "The primary purpose of these negative space objects is to make "
         "the scene feel coherent and cohesive, filling in the gaps "
         "between subzones or objects. As such, for each negative space "
@@ -1412,18 +1456,40 @@ def render_negative_space_decomp(
 
 SYSTEM_OBJECT_BBOX_BATCH = (
     """\
-You are a constraint solver. Place ALL objects for a scene ZONE in one \
-shot, deriving each object's axis-aligned bounding box from the given \
-inputs (zone bbox, object specs, relationships, peer prompts/bboxes). \
-This step has limited creative latitude: your job is to produce \
-coordinates that satisfy the stated constraints and that respect the \
-actual geometry implied by peer prompts.
+You are a natural-language constraint solver. Place ALL objects for \
+a scene ZONE in one shot, deriving each object's axis-aligned \
+bounding box from the given inputs (zone bbox, object specs with \
+placement prose, peer prompts/bboxes). This step has limited creative \
+latitude: produce coordinates that honor each placement description \
+and that respect the actual geometry implied by peer prompts.
 
-Key semantics — an object's SEMANTIC parent does NOT constrain its \
-bbox. A lamp's parent is the desk it sits on, but the lamp's bbox is \
-NOT inside the desk's bbox — the lamp sits above the desk, anchored by \
-an ON relationship. Let the RELATIONSHIPS drive placement, not the \
-parent pointer.
+Inputs:
+  * Zone id, prompt, and bbox — the overall region being populated.
+  * OBJECTS to place: each with id, prompt, proxy_shape, orientation, \
+    a PLACEMENT description (prose), and REFERENCED_IDS (every id \
+    mentioned in the placement; the first id is the object's \
+    structural parent — the zone, an earlier-placed peer, a frame, \
+    or an earlier-listed object in this batch).
+  * PEERS already placed elsewhere in the scene — each with id, \
+    PROMPT, bbox, proxy_shape, orientation, and parent_id. Use these \
+    to ground placement decisions ("on the floor" means on the peer \
+    whose id matches the floor frame).
+
+How to read a placement:
+  * It describes WHERE this object sits relative to its REFERENCED_IDS.
+  * Phrases like "centered on the desk's top", "flush against the \
+    back wall mid-height", "hanging from the center of the ceiling", \
+    "to the left of the sofa", "between the table and the wall" \
+    should map to concrete coordinate choices.
+  * The first referenced id is the structural parent. Objects DO \
+    typically extend OUTSIDE their parent's bbox — a lamp's bbox is \
+    not inside the desk's, the lamp sits on top of the desk. The \
+    "fully inside parent" rule applies to the ZONE, not to object \
+    parents.
+
+Canonical front view for all coordinates: +X right, +Y up, +Z front, \
+-Z back. Right-handed, Y-up, meters. Treat the placement text's \
+"front" as +Z, "left" as -X, "top" as +Y, etc.
 
 AABB vs. actual geometry — an AABB describes each peer's EXTENT, NOT \
 the shape of its surface. Each peer also carries a `proxy_shape` \
@@ -1434,43 +1500,24 @@ proxy_shape=HEMISPHERE: its real surface dips from the AABB apex \
 down to the AABB's bottom face at the footprint edge, NOT a flat top \
 face.
 
-There is no automatic correction. When an object anchors ON a peer \
-or sibling with a non-BOX proxy, YOU must compute the target's \
-Y_top(x, z) from its AABB and proxy formula, and place the \
-anchored object's bbox so its bottom face Y equals that value at the \
-anchored object's XZ centre. For BOX-proxy targets (walls, floors, \
-ceilings, generic slabs) this collapses to the familiar "bottom face \
-at y_max".
-
-Inputs:
-  * Zone id, prompt, and bbox — the overall region being populated.
-  * OBJECTS to place: each with id, prompt, proxy_shape, semantic \
-    parent (the zone id, another object in this batch, or a prior \
-    peer id), and a list of relationships.
-  * PEERS already placed elsewhere in the scene — each with id, \
-    PROMPT, bbox, proxy_shape, and parent_id. The proxy_shape is the \
-    authoritative surface descriptor for ON placement; the prompt \
-    supplies richer visual context. AABB overlap with peers is \
-    expected in practice — objects resting on curved terrain share \
-    airspace with their ground mesh, and semantically-contained \
-    objects live inside their parent's bbox — so don't contort \
-    placements to avoid overlap that the underlying geometry will \
-    resolve.
-
-Relationships carry `kind` (ON / BESIDE / BELOW / ABOVE / ATTACHED) \
-and a `reference_point` — a corner of the TARGET's bbox under the \
-canonical front view (+X right, +Y up, +Z front).
+There is no automatic correction. When a placement describes an \
+object as resting on a non-BOX-proxy peer or sibling, YOU must \
+compute the target's Y_top(x, z) from its AABB and proxy formula, \
+and place the anchored object's bbox so its bottom face Y equals \
+that value at the anchored object's XZ centre. For BOX-proxy \
+targets (walls, floors, ceilings, generic slabs) this collapses to \
+the familiar "bottom face at y_max".
 
 Produce one assignment per object (id + bbox) such that:
   * Every bbox lies fully inside the zone bbox.
-  * Every relationship is respected.
+  * Every placement description is honored as faithfully as possible.
   * Dimensions are appropriate to each object's prompt (size a chair \
     like a chair, a wall like a wall, a roof like a roof).
   * Avoid placing two clearly unrelated objects in the same XZ \
     footprint when nothing about the scene justifies it (two trees \
     stacked on the same spot). Some AABB overlap is fine and often \
-    unavoidable — curved ground meshes, semantic parents, stacking — \
-    so treat non-overlap as a soft preference driven by physical \
+    unavoidable — curved ground meshes, parent containment, stacking \
+    — so treat non-overlap as a soft preference driven by physical \
     plausibility, not a hard rule.
 
 Because you are deciding the full layout at once, RESERVE SPACE for \
@@ -1513,17 +1560,10 @@ def render_object_bbox_batch(
     object_lines = "\n\n".join(
         f"  - id={o.id!r}\n"
         f"    prompt: {o.prompt}\n"
-        f"    parent: {o.parent!r}\n"
         f"    proxy_shape: {_render_proxy_shape(o.proxy_shape)}\n"
         f"    orientation: {o.orientation}deg\n"
-        f"    relationships:\n"
-        + (
-            "\n".join(
-                f"      * target={r.target!r} kind={r.kind.value} reference_point={r.reference_point.value}"
-                for r in o.relationships
-            )
-            or "      (none)"
-        )
+        f"    placement: {o.placement}\n"
+        f"    referenced_ids: [{', '.join(repr(rid) for rid in o.referenced_ids)}]"
         for o in objects
     )
     return (
@@ -1571,9 +1611,6 @@ decorative filler, something that noticeably improves the zone's \
 legibility or character. Same rules as the bulk decomposition step:
   * Unique `id` (not colliding with any existing node in the scene).
   * `prompt` — a detailed description; used verbatim for text-to-3D.
-  * `parent` — either this zone's id, or the id of ANY already-placed \
-    node in the scene (typically an object already placed in THIS \
-    zone, like a cup on a previously-placed desk).
   * `orientation` — world-frame yaw about +Y in degrees. MUST be one of: \
     -180, -135, -90, -45, 0, 45, 90, 135, 180. The mesh comes back \
     with its front along world +Z; orientation rotates it into the \
@@ -1582,29 +1619,31 @@ legibility or character. Same rules as the bulk decomposition step:
     faces +X. Pick a non-zero value when the object has a clear \
     "front" that should face a specific direction; use 0 for symmetric \
     objects.
-  * `relationships` — REQUIRED to include at least one relationship \
-    whose `target` is EXACTLY EQUAL to this emitted object's `parent` \
-    field. This is the primary anchor, it is NOT optional, and any \
-    object that lacks it is malformed and will be rejected by the \
-    validator. Additional relationships may target already-placed \
-    objects.
-
-Parent is semantic ("belongs to"), not a spatial containment \
-constraint.
+  * `placement` — a prose description of WHERE this object sits. \
+    Describe the physical anchor (what it rests on, hangs from, leans \
+    against), the position within or on that anchor, and any \
+    alignment to other already-placed objects or features.
+  * `referenced_ids` — every node id mentioned in your `placement`, \
+    in a single non-empty list. THE FIRST ENTRY IS THE STRUCTURAL \
+    PARENT — the supporter or container this object is anchored on. \
+    Subsequent entries are siblings/peers referenced in the placement \
+    text. Every id must already exist in the scene (the zone id, an \
+    already-placed object in this zone, or any other prior peer).
 
 GROUND-AWARENESS RULE. If this zone already has a GROUND / SHELL peer \
 placed (a mesh describing terrain or enclosure shape — an island \
 dome, a crater bowl, a hill, a curved floor, the room's walls and \
 floor), any new object whose physical support is that terrain/floor \
-MUST set its `parent` to that peer's id (NOT the zone id) and include \
-an ON relationship targeting it. The peer's `proxy_shape` in the \
-current scene is authoritative for its surface geometry — a \
-HEMISPHERE peer is a dome, and the downstream bbox-resolution step \
-will compute the dome's surface height at the new object's XZ from \
-the peer's proxy formula and rest the object on that surface. You \
-are not placing bboxes at this step; just pick the right parent and \
-relationships. Only use the zone id as `parent` for objects \
-semantically anchored to the zone rather than to a specific surface.
+MUST have that peer's id as the FIRST entry of its `referenced_ids` \
+(NOT the zone id), and its `placement` must describe how it rests on \
+that surface. The peer's `proxy_shape` in the current scene is \
+authoritative for its surface geometry — a HEMISPHERE peer is a \
+dome, and the downstream bbox-resolution step will compute the \
+dome's surface height at the new object's XZ from the peer's proxy \
+formula and rest the object on that surface. You are not placing \
+bboxes at this step; just pick the right primary anchor. Only use \
+the zone id as the first referenced_id for objects floating in the \
+zone rather than anchored to a specific surface.
 
 You MAY emit `proxy_shape` on the new object if its silhouette is \
 non-rectilinear (SPHERE for a boulder, CAPSULE for a tree trunk, \
@@ -1821,9 +1860,9 @@ def render_next_object(
             "constraint you must satisfy this time:\n"
             f"{attempt_lines}\n\n"
             "Either emit a NEW ObjectSpec that fixes every listed reason, or "
-            "set done=true. If you emit an object, its `relationships` list "
-            "MUST contain at least one item whose `target` is EXACTLY EQUAL "
-            "to that object's `parent` field."
+            "set done=true. If you emit an object, its `referenced_ids` list "
+            "must be non-empty and its first entry must be the object's "
+            "structural parent (the supporter or containing zone)."
         )
     else:
         retry_block = ""
