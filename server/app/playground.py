@@ -7,12 +7,13 @@ A minimal FastAPI app with:
   * `POST /banana`   — text → image. Returns the Runware image URL.
   * `POST /trellis`  — image → 3D. Returns the Runware GLB URL.
 
-Both stages run on Runware so the playground can exercise the same
-models the production pipeline uses. The compare flow renders the
-same wrapped prompt on `nano-banana-2` (`google:4@3`, resolution
-0.5K + thinking=MINIMAL) and `nano-banana-pro` (`google:4@2`,
-resolution 1K) side-by-side. Per-model production settings live in
-`app.services.threed.banana_settings_for`.
+Both stages run on Runware so the playground can exercise both
+nano-banana-2 vs nano-banana-pro side-by-side. The production
+pipeline now uses Google GenAI Nano Banana (see
+`app.services.nano_banana`) and Runware Trellis (see
+`app.services.threed`); this playground stays Runware-only for the
+image-gen comparison view. Model IDs and per-model settings are
+inlined below since `app.services.threed` no longer carries them.
 
 Run via `enx playground` (or `uv run scripts/run_playground.py`).
 """
@@ -43,20 +44,37 @@ from runware import (
 
 from app.core.prompts import wrap_image_prompt
 from app.core.types import ProxyShape
-from app.services.threed import (
-    NANO_BANANA_2,
-    NANO_BANANA_PRO,
-    banana_settings_for,
-)
 
 load_dotenv()
 
 TRELLIS_MODEL = os.environ.get("TRELLIS_MODEL", "microsoft:trellis-2@4b")
 
+# Runware Nano Banana model IDs. Inlined here (previously imported from
+# app.services.threed) because the production pipeline no longer goes
+# through Runware for image-gen; threed.py is now Trellis-only.
+NANO_BANANA_2 = "google:4@3"
+NANO_BANANA_PRO = "google:4@2"
+
 _BANANA_MODELS: dict[str, str] = {
     "nano-banana-2": NANO_BANANA_2,
     "nano-banana-pro": NANO_BANANA_PRO,
 }
+
+
+def banana_settings_for(model: str) -> dict[str, Any]:
+    """Per-model production settings for the Runware imageInference call.
+
+    Runware rejects `resolution` for text-to-image (the preset is only
+    meaningful when `referenceImages` is set, where it matches the input
+    aspect ratio). For pure text-to-image, `width`/`height` are required.
+    nano-banana-2 (`google:4@3`) runs at 512×512 with thinking=MINIMAL;
+    nano-banana-pro (`google:4@2`) runs at 1024×1024.
+    """
+    if model == NANO_BANANA_2:
+        return {"width": 512, "height": 512, "thinking": "MINIMAL"}
+    if model == NANO_BANANA_PRO:
+        return {"width": 1024, "height": 1024}
+    return {}
 
 
 _PROXY_SHAPES: dict[str, ProxyShape | None] = {

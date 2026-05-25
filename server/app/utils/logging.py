@@ -4,12 +4,15 @@ Every emitted event is a dict with a `kind` and arbitrary extra fields.
 Each slot owns a `SlotLog` that fans events out to: (a) an in-memory buffer
 for snapshotting late subscribers, (b) the rich console as a pretty
 per-field block (prefixed with the slot id), (c) every active SSE queue
-for that slot, (d) a persistent JSONL file that doubles as the cache (see
-utils/cache.py — `cache.llm` and `cache.artifact` events are hits).
+for that slot, (d) a persistent JSONL file that doubles as the cache.
 
 Pipeline code calls the module-level `log()` / `emit_*()` helpers, which
 route to the `SlotLog` bound to the current asyncio task via a ContextVar.
 Each task binds itself at entry, so no pipeline signature changes.
+
+Two utility modules read the persisted log: `utils/cache.py`
+(`cache.llm` hits) and `utils/resumable.py` (`<scope>.submit` /
+`<scope>.done` for restart-resilient remote-job submission).
 """
 
 from __future__ import annotations
@@ -73,6 +76,8 @@ class SlotLog:
             self.state["status"] = "done"
         elif last_kind == "run.error":
             self.state["status"] = "error"
+        elif last_kind == "run.paused":
+            self.state["status"] = "paused"
         elif self.state["events"]:
             self.state["status"] = "running"
         else:
@@ -95,6 +100,8 @@ class SlotLog:
             self.state["status"] = "done"
         elif last_kind == "run.error":
             self.state["status"] = "error"
+        elif last_kind == "run.paused":
+            self.state["status"] = "paused"
         elif self.state["events"]:
             self.state["status"] = "running"
         else:
@@ -150,7 +157,7 @@ def bind(slot_log: SlotLog) -> None:
 
 def current_events() -> list[dict[str, Any]]:
     """Snapshot of the bound slot's event list. Used by cache lookups
-    (cache.find_llm_cache_hit / find_artifact_cache_hit)."""
+    (cache.find_llm_cache_hit, resumable.find_done, etc.)."""
     return _current.get().state["events"]
 
 

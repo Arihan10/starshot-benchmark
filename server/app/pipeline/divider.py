@@ -190,6 +190,7 @@ async def _build(
         await generation.run(
             zone=node, runs_dir=runs_dir, run_id=run_id,
             scenario="anchor", all_nodes=all_nodes,
+            ancestors=_ancestors(node, all_nodes),
         )
         logging.emit_step(node.id, "done")
         return
@@ -240,6 +241,7 @@ async def _build(
         await generation.run(
             zone=child, runs_dir=runs_dir, run_id=run_id,
             scenario="encapsulating", all_nodes=all_nodes,
+            ancestors=_ancestors(child, all_nodes),
         )
 
     for child in placed:
@@ -275,6 +277,7 @@ async def run(
     await generation.run(
         zone=root, runs_dir=runs_dir, run_id=run_id,
         scenario="negative-space", all_nodes=all_nodes,
+        ancestors=_ancestors(root, all_nodes),
     )
     logging.emit_step(root.id, "done")
     return root

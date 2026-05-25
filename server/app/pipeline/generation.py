@@ -44,18 +44,22 @@ from app.core.prompts import (
     NextObjectOutput,
     ObjectDecompOutput,
     ObjectSpec,
+    SYSTEM_ANCHOR_DECOMP,
+    SYSTEM_ENCAPSULATING_DECOMP,
     SYSTEM_IMAGE_PROMPT,
+    SYSTEM_NEGATIVE_SPACE_DECOMP,
     SYSTEM_NEXT_OBJECT,
     SYSTEM_OBJECT_BBOX_BATCH,
-    SYSTEM_OBJECT_DECOMP,
+    render_anchor_decomp,
+    render_encapsulating_decomp,
     render_image_prompt,
+    render_negative_space_decomp,
     render_next_object,
     render_object_bbox_batch,
-    render_object_decomp,
     wrap_image_prompt,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
-from app.services import llm, threed
+from app.services import llm, nano_banana, threed
 from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
 from app.utils.topology import validate_object_relationships
@@ -85,22 +89,55 @@ async def _decompose_objects_validated(
     zone: Node,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
+    ancestors: list[tuple[str, str, str]],
 ) -> list[ObjectSpec]:
     prior_attempts: list[tuple[list[ObjectSpec], str]] = []
     existing_ids = {n.id for n in all_nodes}
     scene = _scene_view(all_nodes)
     specs: list[ObjectSpec] = []
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
-        out = await llm.call_llm(
-            system=SYSTEM_OBJECT_DECOMP,
-            user=render_object_decomp(
+        if scenario == "anchor":
+            system = SYSTEM_ANCHOR_DECOMP
+            user = render_anchor_decomp(
                 zone_id=zone.id,
-                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 zone_bbox=zone.bbox,
-                scenario=scenario,
+                ancestors=ancestors,
                 scene=scene,
                 prior_attempts=prior_attempts,
-            ),
+            )
+        elif scenario == "encapsulating":
+            system = SYSTEM_ENCAPSULATING_DECOMP
+            user = render_encapsulating_decomp(
+                zone_id=zone.id,
+                zone_plan=zone.plan,
+                zone_bbox=zone.bbox,
+                ancestors=ancestors,
+                scene=scene,
+                prior_attempts=prior_attempts,
+            )
+        else:
+            # negative-space mode: feed the full zone-list (every zone in the
+            # tree with its plan + bbox) instead of the ancestor chain.
+            # Filling gaps between siblings/cousins needs the whole tree's
+            # spatial layout, not the path to root.
+            zones = [
+                (n.id, n.plan, n.bbox)
+                for n in all_nodes
+                if n.plan is not None
+            ]
+            system = SYSTEM_NEGATIVE_SPACE_DECOMP
+            user = render_negative_space_decomp(
+                zone_id=zone.id,
+                zone_plan=zone.plan,
+                zone_bbox=zone.bbox,
+                zones=zones,
+                scene=scene,
+                prior_attempts=prior_attempts,
+            )
+        out = await llm.call_llm(
+            system=system,
+            user=user,
             output_schema=ObjectDecompOutput,
         )
         specs = list(out.objects)
@@ -114,7 +151,11 @@ async def _decompose_objects_validated(
                 zone=zone.id, attempt=attempt, reason=reason,
                 emitted=[s.model_dump() for s in specs],
             )
-            raise  # TEMP: stop pipeline on first validation failure
+            # Feed this failure back into the next prompt so the LLM has
+            # something to react to instead of re-emitting the same invalid
+            # set. After exhausting attempts we fall through to the
+            # accept_invalid branch below.
+            prior_attempts.append((specs, reason))
     logging.log(
         "generation.decompose.accept_invalid",
         zone=zone.id, reason=prior_attempts[-1][1] if prior_attempts else "",
@@ -124,6 +165,7 @@ async def _decompose_objects_validated(
 
 async def _next_object_validated(
     *, zone: Node, all_nodes: list[Node],
+    ancestors: list[tuple[str, str, str]],
 ) -> NextObjectOutput:
     prior_attempts: list[tuple[ObjectSpec, str]] = []
     existing_ids = {n.id for n in all_nodes}
@@ -134,8 +176,9 @@ async def _next_object_validated(
             system=SYSTEM_NEXT_OBJECT,
             user=render_next_object(
                 zone_id=zone.id,
-                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 zone_bbox=zone.bbox,
+                ancestors=ancestors,
                 scene=scene,
                 prior_attempts=prior_attempts,
             ),
@@ -155,7 +198,7 @@ async def _next_object_validated(
                 zone=zone.id, attempt=attempt, reason=reason,
                 emitted=decision.object.model_dump(),
             )
-            raise  # TEMP: stop pipeline on first validation failure
+            prior_attempts.append((decision.object, reason))
     assert decision is not None
     logging.log(
         "generation.next.accept_invalid",
@@ -220,7 +263,13 @@ async def _resolve_and_generate(
     # Every object (anchor, completion, encapsulating alike) goes through
     # the image-prompt rewrite: Nano Banana needs an isolated studio
     # reference shot — any environmental context bleeds into the mesh.
-    committed_image_prompts = [
+    #
+    # The "prior subjects" context fed to the LLM is the bare subject
+    # phrases of already-placed nodes (Node.prompt), NOT their full
+    # Nano-Banana directives (Node.image_prompt). Leaking the wrapper
+    # boilerplate would just teach the LLM to echo "Generate a direct,
+    # perfect orthographic..." back into every new phrase.
+    committed_subjects = [
         n.prompt for n in all_nodes if n.mesh_url is not None
     ]
     resolved: list[Node] = []
@@ -232,14 +281,15 @@ async def _resolve_and_generate(
             kind="frame" if scenario == "encapsulating" else "object",
             proxy_shape=spec.proxy_shape,
         )
-        prior_prompts = committed_image_prompts + [r.prompt for r in resolved]
-        image_prompt = await _build_image_prompt(
+        prior_subjects = committed_subjects + [r.prompt for r in resolved]
+        subject_prompt, image_prompt = await _build_image_prompt(
             prompt=spec.prompt, bbox=bbox, proxy_shape=spec.proxy_shape,
-            prior_prompts=prior_prompts,
+            prior_prompts=prior_subjects,
         )
         resolved.append(Node(
             id=spec.id,
-            prompt=image_prompt,
+            prompt=subject_prompt,
+            image_prompt=image_prompt,
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
@@ -258,7 +308,11 @@ async def _build_image_prompt(
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
     prior_prompts: list[str],
-) -> str:
+) -> tuple[str, str]:
+    """Returns (subject_phrase, wrapped_image_prompt). The subject phrase is
+    the LLM's bare noun phrase — what gets stored on Node.prompt and shown
+    in context. The wrapped prompt is the full Nano-Banana studio-shot
+    directive — used only at the image-generation boundary."""
     out = await llm.call_llm(
         system=SYSTEM_IMAGE_PROMPT,
         user=render_image_prompt(
@@ -267,7 +321,7 @@ async def _build_image_prompt(
         ),
         output_schema=ImagePromptOutput,
     )
-    return wrap_image_prompt(out.prompt, proxy_shape, bbox.size)
+    return out.prompt, wrap_image_prompt(out.prompt, proxy_shape, bbox.size)
 
 
 _pending: dict[str, list[asyncio.Task[None]]] = {}
@@ -275,10 +329,10 @@ _pending: dict[str, list[asyncio.Task[None]]] = {}
 # Run-scoped set of every id that has been admitted into _resolve_and_generate
 # for this run. Populated *synchronously* before the bbox-resolution LLM call,
 # so concurrent specs (within or across decomposition steps) can't both pass
-# the dedup check and race into Banana+Trellis. The artifact cache catches
-# *most* repeats, but two specs that submit before either has logged a
-# `cache.artifact` will both miss the cache and double-bill — this guard
-# closes that window.
+# the dedup check and race into Banana+Trellis. The per-stage `.done`
+# completion cache catches *most* repeats, but two specs that submit before
+# either has logged a `trellis.done` will both miss the cache and
+# double-bill — this guard closes that window.
 _admitted_ids: dict[str, set[str]] = {}
 
 
@@ -291,14 +345,24 @@ async def _generate_one(
     runs_dir: Path,
 ) -> None:
     try:
-        paths = await threed.generate_mesh(
-            node.prompt, output_path=raw, image_stem=image_stem,
+        # Nano Banana sees the wrapped studio-shot directive; node.prompt
+        # stays the bare subject phrase for everything else.
+        banana_prompt = node.image_prompt or node.prompt
+        image_path = image_stem.parent / f"{image_stem.name}.png"
+        image = await nano_banana.generate_resumable(
+            banana_prompt, job_id=node.id, save_to=image_path,
         )
         logging.log(
             "image",
             id=node.id,
-            url=_artifact_url(runs_dir, paths["image"]),
+            url=_artifact_url(runs_dir, image_path),
             prompt=node.prompt,
+        )
+        await threed.generate_mesh(
+            image.image_bytes,
+            output_path=raw,
+            job_id=node.id,
+            image_mime=image.mime_type,
         )
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, raw)
@@ -373,9 +437,10 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
+    ancestors: list[tuple[str, str, str]],
 ) -> None:
     specs = await _decompose_objects_validated(
-        zone=zone, scenario=scenario, all_nodes=all_nodes,
+        zone=zone, scenario=scenario, all_nodes=all_nodes, ancestors=ancestors,
     )
     logging.log(
         "generation.decompose",
@@ -395,7 +460,9 @@ async def run(
         return
 
     while True:
-        decision = await _next_object_validated(zone=zone, all_nodes=all_nodes)
+        decision = await _next_object_validated(
+            zone=zone, all_nodes=all_nodes, ancestors=ancestors,
+        )
         if decision.done or decision.object is None:
             logging.log("generation.next.done", zone=zone.id)
             return

@@ -124,6 +124,16 @@
                 border-color: #ff8080;
                 color: #ffaaaa;
             }
+            #slot-resume.running {
+                background: #1a1d24;
+                border-color: #3a4a6a;
+                color: #9ab4d8;
+            }
+            #slot-resume.running:hover:not(:disabled) {
+                background: #242a36;
+                border-color: #4a8fd8;
+                color: #c8d8f0;
+            }
             #slot-resume:disabled {
                 opacity: 0.5;
                 cursor: default;
@@ -131,7 +141,9 @@
             #bbox-toggle,
             #frames-toggle,
             #pick-inner-toggle,
-            #export-glb {
+            #solid-fill-toggle,
+            #export-glb,
+            #replay-gif {
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #2a2d35;
@@ -148,17 +160,196 @@
             #bbox-toggle:hover,
             #frames-toggle:hover,
             #pick-inner-toggle:hover,
-            #export-glb:hover {
+            #solid-fill-toggle:hover,
+            #export-glb:hover,
+            #replay-gif:hover {
                 border-color: #4a8fd8;
                 color: #e6e6e6;
             }
-            #export-glb:disabled {
+            #export-glb:disabled,
+            #replay-gif:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            #replay-gif.recording {
+                background: #2a3a5a;
+                color: #9ad4ff;
+                border-color: #4a8fd8;
+            }
+            /* Replay preview modal */
+            #replay-modal {
+                position: fixed;
+                inset: 0;
+                background: rgba(8, 9, 12, 0.85);
+                backdrop-filter: blur(4px);
+                z-index: 1000;
+                display: none;
+                align-items: center;
+                justify-content: center;
+            }
+            #replay-modal.open {
+                display: flex;
+            }
+            #replay-panel {
+                width: min(720px, 90vw);
+                max-height: 90vh;
+                display: flex;
+                flex-direction: column;
+                background: #16181d;
+                border: 1px solid #2a2d35;
+                border-radius: 8px;
+                overflow: hidden;
+                font-size: 12px;
+                color: #e6e6e6;
+            }
+            #replay-panel header {
+                padding: 10px 14px;
+                background: #1c1e24;
+                border-bottom: 1px solid #2a2d35;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+            }
+            #replay-panel header h2 {
+                margin: 0;
+                font-size: 13px;
+                font-weight: 600;
+                color: #9ad4ff;
+            }
+            #replay-close {
+                background: none;
+                border: none;
+                color: #8a8f99;
+                font-size: 18px;
+                cursor: pointer;
+                padding: 0 4px;
+                line-height: 1;
+            }
+            #replay-close:hover { color: #e6e6e6; }
+            #replay-body {
+                padding: 14px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+                overflow: auto;
+            }
+            #replay-stage {
+                position: relative;
+                width: 100%;
+                aspect-ratio: 16 / 10;
+                background: #0c0d10;
+                border: 1px solid #2a2d35;
+                border-radius: 4px;
+                overflow: hidden;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+            }
+            #replay-preview-canvas,
+            #replay-result-img {
+                position: absolute;
+                inset: 0;
+                width: 100%;
+                height: 100%;
+                object-fit: contain;
+                display: block;
+            }
+            #replay-result-img { display: none; }
+            #replay-stage.show-result #replay-preview-canvas { display: none; }
+            #replay-stage.show-result #replay-result-img { display: block; }
+            #replay-stage.empty::after {
+                content: "click preview or save to render the build";
+                position: absolute;
+                color: #5a5e68;
+                font-size: 11px;
+                font-style: italic;
+            }
+            #replay-info {
+                color: #8a8f99;
+                font-size: 11px;
+                line-height: 1.5;
+            }
+            #replay-info b { color: #b8bcc4; font-weight: normal; }
+            .replay-row {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+            }
+            .replay-row label {
+                color: #8a8f99;
+                font-size: 11px;
+                min-width: 80px;
+            }
+            #replay-speed,
+            #replay-fps {
+                flex: 1;
+                accent-color: #4a8fd8;
+            }
+            #replay-speed-val,
+            #replay-fps-val {
+                color: #e6e6e6;
+                font-variant-numeric: tabular-nums;
+                min-width: 50px;
+                text-align: right;
+            }
+            #replay-progress {
+                height: 6px;
+                background: #0c0d10;
+                border-radius: 3px;
+                overflow: hidden;
+                margin-top: 4px;
+            }
+            #replay-progress-bar {
+                height: 100%;
+                background: #4a8fd8;
+                transition: width 0.12s linear;
+                width: 0%;
+            }
+            #replay-status {
+                color: #8a8f99;
+                font-size: 11px;
+                min-height: 16px;
+            }
+            #replay-status.recording { color: #f6a96a; }
+            #replay-status.done { color: #8bd17c; }
+            #replay-actions {
+                display: flex;
+                gap: 8px;
+                padding: 10px 14px;
+                background: #1c1e24;
+                border-top: 1px solid #2a2d35;
+                justify-content: flex-end;
+            }
+            #replay-actions button {
+                padding: 6px 14px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+            }
+            #replay-actions button:hover:not(:disabled) {
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            #replay-actions button.primary {
+                background: #2a3a5a;
+                color: #9ad4ff;
+                border-color: #4a8fd8;
+            }
+            #replay-actions button.primary:hover:not(:disabled) {
+                background: #34466a;
+            }
+            #replay-actions button:disabled {
                 opacity: 0.5;
                 cursor: default;
             }
             #bbox-toggle.off,
             #frames-toggle.off,
-            #pick-inner-toggle.off {
+            #pick-inner-toggle.off,
+            #solid-fill-toggle.off {
                 background: #2a2d35;
                 color: #5a5e68;
             }
@@ -183,6 +374,9 @@
             }
             #status .line.err {
                 color: #ff8080;
+            }
+            #status .line.warn {
+                color: #e09050;
             }
             #status .line.hdr {
                 color: #9ad4ff;
@@ -479,6 +673,10 @@
                 color: #5a5e68;
                 border-color: #2a2d35;
             }
+            .phase-error {
+                color: #ff8080;
+                border-color: #6e2a2a;
+            }
             /* Detail panel — replaces tree body when a node is selected */
             #tree.detail-open #tree-body,
             #tree.detail-open #tree-search-row {
@@ -740,7 +938,9 @@
             <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
             <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
             <button id="pick-inner-toggle" type="button" title="In bbox-only mode: prefer the innermost (smallest) bbox under the cursor, so nested objects can be picked through their containers">pick: inner</button>
+            <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
             <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
+            <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>
             <button id="slot-resume" type="button" style="display:none">resume</button>
             <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
         </div>
@@ -771,6 +971,44 @@
             <button id="zoom-in" type="button" title="Zoom in (R)">+</button>
             <button id="zoom-out" type="button" title="Zoom out (F)">−</button>
         </div>
+        <div id="replay-modal">
+            <div id="replay-panel">
+                <header>
+                    <h2>replay → gif</h2>
+                    <button id="replay-close" type="button" title="Close">×</button>
+                </header>
+                <div id="replay-body">
+                    <div id="replay-stage">
+                        <canvas id="replay-preview-canvas"></canvas>
+                        <img id="replay-result-img" alt="gif preview" />
+                    </div>
+                    <div id="replay-info">
+                        events: <b id="replay-event-count">0</b> ·
+                        duration at current speed: <b id="replay-duration-est">—</b>
+                    </div>
+                    <div class="replay-row">
+                        <label for="replay-speed">speed</label>
+                        <input id="replay-speed" type="range" min="0.25" max="8" step="0.25" value="2" />
+                        <span id="replay-speed-val">2.00×</span>
+                    </div>
+                    <div class="replay-row">
+                        <label for="replay-fps">fps</label>
+                        <input id="replay-fps" type="range" min="6" max="30" step="1" value="15" />
+                        <span id="replay-fps-val">15 fps</span>
+                    </div>
+                    <div id="replay-progress"><div id="replay-progress-bar"></div></div>
+                    <div id="replay-status">idle</div>
+                </div>
+                <div id="replay-actions">
+                    <button id="replay-preview" type="button" title="Play the build in the preview area without encoding a gif">preview</button>
+                    <button id="replay-render" type="button" title="Replay the build and encode an animated gif">render gif</button>
+                    <button id="replay-download" type="button" class="primary" disabled title="Download the rendered gif">download</button>
+                </div>
+            </div>
+        </div>
+        <!-- gif.js loaded as a global because the npm dist is UMD/CJS and
+             not friendly to ESM imports; window.GIF is what we use. -->
+        <script src="/vendor/gifjs/gif.js"></script>
         <script type="module" src="/viewer.js"></script>
     </body>
 </html>

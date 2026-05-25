@@ -1,410 +1,396 @@
-"""Two-stage asset generation: text -> image (Nano Banana Pro) -> 3D (Trellis 2).
+"""Trellis 2 mesh generation via the hosted spawn-and-poll HTTP API.
 
-Text-to-3D alone produces unreliable geometry for thin architectural shells
-(walls, ceilings, floors). Going through an image model first gives Trellis
-a concrete visual reference with correct proportions, which is much more
-robust.
+`POST /generate` uploads an image (multipart) and returns a
+server-assigned `job_id` immediately — the GPU work runs detached so
+the request itself doesn't have to outlive Modal's ~60s HTTP edge
+timeout. `GET /jobs/{job_id}` is the non-blocking status probe;
+`GET /jobs/{job_id}/result` streams the GLB binary back once status
+flips to `done`.
 
-Both stages run on Runware (https://runware.ai/) over its WebSocket SDK. We
-use a caller-supplied `taskUUID` per stage so the resumption record (logged
-as `runware.submit`) can survive process restarts: on the next attempt the
-same UUID is reused via `getResponse` and the in-flight or recently-finished
-job returns its result without re-billing.
+Image generation lives in `app.services.nano_banana` — callers run that
+first, then pass the resulting bytes (or a hosted URL) here.
 
-The returned GLB has textures embedded in its binary chunk, but trimesh
-cannot decode them unless Pillow is installed at import time. Pillow is a
-project dependency (see pyproject.toml) for that reason.
+Restart-resilience (in-flight reattach + completion caching) lives in
+`app.utils.resumable`; we record the server's `job_id` under our own
+`task_id` slot so a process restart can re-poll the same job instead
+of re-billing it. Submissions whose server job is gone (404 / failed)
+fall through to a fresh `POST /generate`.
+
+The returned GLB has textures embedded in its binary chunk, but
+trimesh cannot decode them unless Pillow is installed at import time.
+Pillow is a project dependency (see pyproject.toml) for that reason.
 """
 
 from __future__ import annotations
 
 import asyncio
-import contextlib
+import hashlib
 import os
-import uuid
+import random
 from pathlib import Path
 from typing import Any
 
 import httpx
-from runware import (
-    I3dInference,
-    I3dInputs,
-    IAsyncTaskResponse,
-    IImageInference,
-    ISettings,
-    Runware,
-    RunwareAPIError,
+
+from app.utils import logging, resumable
+
+TRELLIS_BASE_URL = os.environ.get(
+    "TRELLIS_BASE_URL",
+    "https://starshot-aitools--trellis2-image-to-3d-router-fastapi-app.modal.run",
 )
 
-from app.utils import cache, logging
+# Trellis production knobs. Kept module-level so the playground / batch
+# scripts can read or override them without round-tripping through env.
+# `resolution` is a string per the API contract ("512" | "1024" | "1536").
+TRELLIS_RESOLUTION = "512"
+TRELLIS_TEXTURE_SIZE = 1024
+TRELLIS_DECIMATION_TARGET = 500_000
+TRELLIS_SEED = 0
 
-NANO_BANANA_PRO = "google:4@2"
-NANO_BANANA_2 = "google:4@3"
+# Spawn-and-poll cadence. The API caps any single job at ~10 min
+# wall-clock; warm 512-res jobs finish in ~3s, 1536-res in ~60s, cold
+# starts add 30-90s. 10s × GENERATE_CONCURRENCY=8 = 48 polls/min,
+# comfortably under the per-IP-per-container `/jobs/{id}` rate limit
+# (60/60s) even if Modal's load balancer pins us to a single container.
+POLL_INTERVAL_SECONDS = 10.0
+POLL_TIMEOUT_SECONDS = 600.0
 
-NANO_BANANA_MODEL = os.environ.get("NANO_BANANA_MODEL", NANO_BANANA_2)
-TRELLIS_MODEL = os.environ.get("TRELLIS_MODEL", "microsoft:trellis-2@4b")
-
-
-def banana_settings_for(model: str) -> dict[str, Any]:
-    """Per-model production settings for the Runware imageInference call.
-
-    Runware rejects `resolution` for text-to-image (the preset is only
-    meaningful when `referenceImages` is set, where it matches the input
-    aspect ratio). For pure text-to-image, `width`/`height` are required.
-    nano-banana-2 (`google:4@3`) runs at 512×512 with thinking=MINIMAL;
-    nano-banana-pro (`google:4@2`) runs at 1024×1024.
-    """
-    if model == NANO_BANANA_2:
-        return {
-            "width": 512,
-            "height": 512,
-            "thinking": "MINIMAL",
-        }
-    if model == NANO_BANANA_PRO:
-        return {
-            "width": 1024,
-            "height": 1024,
-        }
-    return {}
 MAX_ATTEMPTS = 3
-# Transient failures we retry on: Runware API errors AND the httpx
-# network-layer errors (RemoteProtocolError "stream closed", ReadError,
-# ConnectError, timeouts, etc.) raised by the GLB / image downloads.
+# Download has its own (larger) budget. The status endpoint can flip to
+# "done" a few hundred ms before the GLB is committed to storage, so
+# the result endpoint may 425 ("Too Early") for several seconds after.
+# We don't want to give up — the job ran, the bytes are coming.
+DOWNLOAD_MAX_ATTEMPTS = 8
+# Exponential backoff between retries: sleep `base * 2**attempt` + jitter
+# seconds before re-trying, capped to keep the schedule sane. Honors
+# `Retry-After` on 429 responses when Modal sets it; otherwise the
+# exponential schedule applies.
+RETRY_BACKOFF_BASE_S = 4.0
+RETRY_BACKOFF_MAX_S = 60.0
+# Transient failures we retry on: the httpx network-layer errors
+# (RemoteProtocolError, ReadError, ConnectError, timeouts) raised by
+# spawn/poll/download, plus TimeoutError from our own poll budget.
 RETRYABLE: tuple[type[BaseException], ...] = (
-    RunwareAPIError,
     httpx.HTTPError,
     ConnectionError,
+    TimeoutError,
 )
 
-
-# Module-level singleton Runware client. Lazy-init on first call so the
-# server can come up even if Runware is briefly unreachable; reused across
-# all calls because the SDK manages a single WebSocket connection that
-# multiplexes requests internally.
-_client: Runware | None = None
-_client_lock = asyncio.Lock()
-
-
-async def _get_client() -> Runware:
-    global _client
-    async with _client_lock:
-        if _client is None:
-            _client = Runware(
-                api_key=os.environ["RUNWARE_API_KEY"],
-                timeout=180,
-                max_retries=0,            # outer loop manages retries
-            )
-            await _client.connect()
-        else:
-            await _client.ensureConnection()
-        return _client
+# Cap the number of in-flight Trellis jobs at any moment. Modal's
+# FastAPI router returns 429 once concurrent inputs exceed its
+# per-container × container-count budget; this gates the full
+# submit→poll→download lifecycle so we never overshoot.
+GENERATE_CONCURRENCY = 8
+_generate_slot = asyncio.Semaphore(GENERATE_CONCURRENCY)
 
 
-async def disconnect_runware() -> None:
-    """Close the singleton WebSocket. Call once during FastAPI lifespan
+def _retry_delay(attempt: int, err: BaseException) -> float:
+    """Sleep before the next retry. 429s with a `Retry-After` header use
+    that hint verbatim; everything else uses exponential backoff capped
+    at `RETRY_BACKOFF_MAX_S` with [0, 1)s jitter."""
+    if (
+        isinstance(err, httpx.HTTPStatusError)
+        and err.response.status_code == 429
+    ):
+        retry_after = err.response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                return float(retry_after)
+            except ValueError:
+                pass
+    raw = RETRY_BACKOFF_BASE_S * (2 ** attempt)
+    return min(raw, RETRY_BACKOFF_MAX_S) + random.random()
+
+
+# Shared async HTTP client, lazily initialized. Single client so HTTP/2
+# connection pooling kicks in across concurrent jobs.
+_http: httpx.AsyncClient | None = None
+_http_lock = asyncio.Lock()
+
+
+async def _get_http() -> httpx.AsyncClient:
+    global _http
+    async with _http_lock:
+        if _http is None:
+            _http = httpx.AsyncClient(follow_redirects=True)
+        return _http
+
+
+async def disconnect_http() -> None:
+    """Close the shared HTTP client. Call once during FastAPI lifespan
     teardown so the server exits cleanly."""
-    global _client
-    async with _client_lock:
-        if _client is not None:
-            with contextlib.suppress(Exception):
-                await _client.disconnect()
-            _client = None
+    global _http
+    async with _http_lock:
+        if _http is not None:
+            try:
+                await _http.aclose()
+            except Exception:  # noqa: BLE001
+                pass
+            _http = None
 
 
-def _build_request(
-    stage: str, arguments: dict[str, Any], task_uuid: str,
-) -> IImageInference | I3dInference:
-    """Translate the stage-agnostic arguments dict into the Runware
-    request dataclass for that stage. Caller-supplied `task_uuid` is the
-    resumption key — same value goes into the `runware.submit` event log
-    and into the request itself."""
-    if stage == "banana":
-        settings = (
-            ISettings(thinking=arguments["thinking"])
-            if arguments.get("thinking") is not None
-            else None
-        )
-        return IImageInference(
-            taskUUID=task_uuid,
-            model=arguments["model"],
-            positivePrompt=arguments["positivePrompt"],
-            width=arguments.get("width"),
-            height=arguments.get("height"),
-            resolution=arguments.get("resolution"),
-            settings=settings,
-            outputFormat=arguments["outputFormat"],
-            outputType=arguments["outputType"],
-            deliveryMethod="async",
-            numberResults=1,
-        )
-    if stage == "trellis":
-        return I3dInference(
-            taskUUID=task_uuid,
-            model=arguments["model"],
-            inputs=I3dInputs(image=arguments["image"]),
-            settings=ISettings(
-                remesh=arguments["remesh"],
-                resolution=arguments["resolution"],
-                textureSize=arguments["textureSize"],
-            ),
-            outputFormat=arguments["outputFormat"],
-            outputType=arguments["outputType"],
-            deliveryMethod="async",
-            numberResults=1,
-        )
-    raise ValueError(f"unknown stage: {stage!r}")
+async def _fetch_url(url: str) -> bytes:
+    http = await _get_http()
+    resp = await http.get(url, timeout=180.0)
+    resp.raise_for_status()
+    return resp.content
 
 
-async def _dispatch(
-    client: Runware, stage: str, request: IImageInference | I3dInference,
-) -> Any:
-    if stage == "banana":
-        assert isinstance(request, IImageInference)
-        return await client.imageInference(requestImage=request)
-    if stage == "trellis":
-        assert isinstance(request, I3dInference)
-        return await client.inference3d(request3d=request)
-    raise ValueError(f"unknown stage: {stage!r}")
-
-
-def _unwrap(stage: str, item: Any) -> dict[str, Any]:
-    """Normalize the SDK's per-stage result dataclass into the plain dict
-    `generate_mesh` consumes. Banana yields a single image URL; Trellis
-    yields a GLB URL nested under `outputs.files[0]`."""
-    if stage == "banana":
-        url = getattr(item, "imageURL", None)
-        if not url:
-            raise RuntimeError(f"Banana result missing imageURL: {item!r}")
-        return {"image_url": url}
-    if stage == "trellis":
-        outputs = getattr(item, "outputs", None)
-        files = getattr(outputs, "files", None) if outputs else None
-        if not files:
-            raise RuntimeError(f"Trellis result missing outputs.files: {item!r}")
-        first = files[0]
-        url = first.get("url") if isinstance(first, dict) else getattr(first, "url", None)
-        if not url:
-            raise RuntimeError(f"Trellis result missing url: {first!r}")
-        return {"glb_url": url}
-    raise ValueError(f"unknown stage: {stage!r}")
-
-
-async def _submit_resumable(
-    arguments: dict[str, Any],
-    *,
-    node_id: str,
-    stage: str,
-) -> dict[str, Any]:
-    """Submit a Runware job with restart-resilient resumption.
-
-    On entry, scan the events log for a prior `runware.submit` matching
-    (node_id, stage, input_hash). If found, attempt
-    `client.getResponse(taskUUID=...)` against the persisted UUID —
-    Runware keeps task results around long enough that an in-flight or
-    recently-completed job returns immediately with no new billing. On
-    any RunwareAPIError from the reattach we treat the prior task as
-    expired and fall through to a fresh submit.
-
-    Fresh submits log `runware.submit` *before* awaiting the SDK call.
-    Because we generate the taskUUID client-side (UUID v4), the
-    resumption record is durable as soon as `SlotLog.log` flushes — no
-    dependency on the response landing.
-    """
-    model = arguments["model"]
-    input_hash = cache.hash_runware_input(model, arguments)
-    prior = cache.find_runware_submit(
-        logging.current_events(), node_id, stage, input_hash,
+async def _post_generate(image_bytes: bytes, image_mime: str) -> str:
+    http = await _get_http()
+    files = {"image": ("image.png", image_bytes, image_mime)}
+    data = {
+        "seed": str(TRELLIS_SEED),
+        "resolution": TRELLIS_RESOLUTION,
+        "texture_size": str(TRELLIS_TEXTURE_SIZE),
+        "decimation_target": str(TRELLIS_DECIMATION_TARGET),
+    }
+    resp = await http.post(
+        f"{TRELLIS_BASE_URL}/generate",
+        files=files, data=data, timeout=60.0,
     )
-    client = await _get_client()
-    if prior is not None:
+    resp.raise_for_status()
+    body = resp.json()
+    server_job_id = body.get("job_id")
+    if not server_job_id:
+        raise RuntimeError(f"trellis /generate returned no job_id: {body!r}")
+    return str(server_job_id)
+
+
+async def _poll_status(server_job_id: str) -> dict[str, Any]:
+    """Single non-blocking status probe. Caller drives the poll loop."""
+    http = await _get_http()
+    resp = await http.get(
+        f"{TRELLIS_BASE_URL}/jobs/{server_job_id}", timeout=30.0,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+async def _poll_until_done(server_job_id: str, *, timeout: float) -> None:
+    """Block until status flips to `done`. Raises on `failed` or our
+    own poll-timeout budget.
+
+    Transient errors on the status endpoint (429s, network blips) do
+    NOT tear out of the poll — they log a `trellis.poll.retry` and
+    back off, then the loop checks status again. The Modal job is
+    still running; we just lost a probe."""
+    deadline = asyncio.get_running_loop().time() + timeout
+    transient_count = 0
+    while True:
+        if asyncio.get_running_loop().time() >= deadline:
+            raise TimeoutError(
+                f"trellis job {server_job_id} did not finish in {timeout:.0f}s"
+            )
+        await asyncio.sleep(POLL_INTERVAL_SECONDS)
         try:
-            results = await client.getResponse(
-                taskUUID=prior["task_uuid"], numberResults=1,
-            )
-            if results:
-                logging.log(
-                    "runware.reattach",
-                    node_id=node_id,
-                    stage=stage,
-                    task_uuid=prior["task_uuid"],
-                    outcome="success",
-                )
-                return _unwrap(stage, results[0])
-            # Empty result list — treat as expired and submit fresh.
+            status = await _poll_status(server_job_id)
+        except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
+            delay = _retry_delay(transient_count, e)
             logging.log(
-                "runware.reattach",
-                node_id=node_id,
-                stage=stage,
-                task_uuid=prior["task_uuid"],
-                outcome="expired",
-                reason="empty_result",
-            )
-        except RunwareAPIError as e:
-            # v1: any error on reattach -> fall through to fresh submit.
-            # The new submit's task_uuid overwrites the lookup, so the
-            # next restart reattaches to the new task — no double-bill.
-            logging.log(
-                "runware.reattach",
-                node_id=node_id,
-                stage=stage,
-                task_uuid=prior["task_uuid"],
-                outcome="expired",
+                "trellis.poll.retry",
+                task_id=server_job_id,
+                attempt=transient_count,
+                delay_s=delay,
                 reason=f"{type(e).__name__}: {str(e)[:200]}",
             )
-
-    for attempt in range(MAX_ATTEMPTS):
-        task_uuid = str(uuid.uuid4())
-        try:
-            request = _build_request(stage, arguments, task_uuid)
-            logging.log(
-                "runware.submit",
-                node_id=node_id,
-                stage=stage,
-                model=model,
-                task_uuid=task_uuid,
-                input_hash=input_hash,
+            transient_count += 1
+            await asyncio.sleep(delay)
+            continue
+        transient_count = 0
+        s = status.get("status")
+        if s == "done":
+            return
+        if s == "failed":
+            err = status.get("error", {})
+            raise RuntimeError(
+                f"trellis worker failed: "
+                f"{err.get('type', '?')}: {err.get('message', '?')}"
             )
-            ack = await _dispatch(client, stage, request)
-            if isinstance(ack, IAsyncTaskResponse):
-                results = await client.getResponse(
-                    taskUUID=task_uuid, numberResults=1,
-                )
-            else:
-                results = ack
-            if not results:
-                raise RuntimeError(f"empty result list for task {task_uuid}")
-            return _unwrap(stage, results[0])
-        except RETRYABLE as e:
-            if attempt == MAX_ATTEMPTS - 1:
-                raise
-            logging.log(
-                f"{stage}.retry",
-                attempt=attempt,
-                reason=f"{type(e).__name__}: {str(e)[:200]}",
-            )
-    raise AssertionError("unreachable")
+        # "pending" → keep polling
 
 
-async def _download_with_retry(url: str, *, stage: str) -> bytes:
-    for attempt in range(MAX_ATTEMPTS):
+async def _download_result(server_job_id: str) -> bytes:
+    http = await _get_http()
+    for attempt in range(DOWNLOAD_MAX_ATTEMPTS):
         try:
-            async with httpx.AsyncClient(
+            resp = await http.get(
+                f"{TRELLIS_BASE_URL}/jobs/{server_job_id}/result",
                 timeout=180.0,
-                follow_redirects=True,
-            ) as http:
-                resp = await http.get(url)
-                resp.raise_for_status()
-                return resp.content
+            )
+            resp.raise_for_status()
+            return resp.content
         except httpx.HTTPError as e:
-            if attempt == MAX_ATTEMPTS - 1:
+            if attempt == DOWNLOAD_MAX_ATTEMPTS - 1:
                 raise
+            delay = _retry_delay(attempt, e)
             logging.log(
-                f"{stage}.download.retry",
+                "trellis.download.retry",
+                task_id=server_job_id,
                 attempt=attempt,
+                delay_s=delay,
                 reason=f"{type(e).__name__}: {str(e)[:200]}",
             )
+            await asyncio.sleep(delay)
     raise AssertionError("unreachable")
 
 
-_CONTENT_TYPE_EXT = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/webp": ".webp",
-}
+async def _try_reattach(server_job_id: str) -> bytes | None:
+    """Probe a previously-submitted server job. Returns GLB bytes if
+    the job is done or finishes within the poll budget; None if the
+    job is gone (404) or surfaced a worker failure (caller treats both
+    as "fall through to a fresh submit"). Re-raises only on network
+    errors that should bubble up as retryable."""
+    http = await _get_http()
+    try:
+        resp = await http.get(
+            f"{TRELLIS_BASE_URL}/jobs/{server_job_id}", timeout=30.0,
+        )
+    except httpx.HTTPError:
+        raise
+    if resp.status_code == 404:
+        return None
+    resp.raise_for_status()
+    status = resp.json()
+    s = status.get("status")
+    if s == "failed":
+        return None
+    if s == "pending":
+        try:
+            await _poll_until_done(
+                server_job_id, timeout=POLL_TIMEOUT_SECONDS,
+            )
+        except (RuntimeError, TimeoutError):
+            return None
+    return await _download_result(server_job_id)
 
 
-def _ext_from_url(url: str) -> str:
-    """Pick a saved-image extension from the URL when no Content-Type
-    header is available. Runware's image URLs end with `.png` for our
-    PNG-output requests; default to `.png` if nothing else matches."""
-    lower = url.lower().split("?", 1)[0]
-    for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        if lower.endswith(ext):
-            return ext if ext != ".jpeg" else ".jpg"
-    return ".png"
+def _input_hash(image_bytes: bytes) -> str:
+    """Stable hash of every input that would change the GLB. Same
+    payload + same settings → same hash → reattach to the prior
+    submit; any change invalidates and forces a fresh submit."""
+    return resumable.hash_input({
+        "base_url": TRELLIS_BASE_URL,
+        "resolution": TRELLIS_RESOLUTION,
+        "texture_size": TRELLIS_TEXTURE_SIZE,
+        "decimation_target": TRELLIS_DECIMATION_TARGET,
+        "seed": TRELLIS_SEED,
+        "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+    })
 
 
 async def generate_mesh(
-    prompt: str,
+    image: bytes | str,
     *,
     output_path: Path,
-    image_stem: Path,
-) -> dict[str, Path]:
-    """Run text -> image -> 3D. Saves the reference image alongside the
-    GLB so the client asset browser can display it. Returns both paths."""
-    node_id = image_stem.name
-    hit = cache.find_artifact_cache_hit(logging.current_events(), node_id)
-    if hit is not None:
-        cached_raw = Path(hit["raw_glb_path"])
-        cached_image = Path(hit["image_path"])
-        if cached_raw.exists() and cached_image.exists():
-            logging.log(
-                "cache.artifact.hit",
-                node_id=node_id,
-                image_path=str(cached_image),
-                raw_glb_path=str(cached_raw),
-            )
-            return {"glb": cached_raw, "image": cached_image}
+    job_id: str,
+    image_mime: str = "image/png",
+    skip_reattach: bool = False,
+) -> Path:
+    """Run Trellis 2 on `image` and save the textured GLB to `output_path`.
 
-    # Banana-skip gate: if Banana already finished for this node and the
-    # saved image is still on disk, skip the Banana stage and pass the
-    # cached Runware-hosted URL straight to Trellis. Closes the Banana
-    # re-bill window for process deaths between Banana and Trellis.
-    image_path: Path | None = None
-    remote_image_url: str | None = None
-    banana_hit = cache.find_banana_done(logging.current_events(), node_id)
-    if banana_hit is not None:
-        candidate = Path(banana_hit["saved"])
-        if candidate.exists():
-            image_path = candidate
-            remote_image_url = banana_hit["remote_url"]
-            logging.log("nano_banana.skip", node_id=node_id)
+    `image` is either raw image bytes uploaded via multipart, or a
+    remote URL which we fetch to bytes first (the new API doesn't
+    accept URLs server-side).
 
-    if image_path is None or remote_image_url is None:
-        banana_args: dict[str, Any] = {
-            "model": NANO_BANANA_MODEL,
-            "positivePrompt": prompt,
-            "outputFormat": "PNG",
-            "outputType": "URL",
-            **banana_settings_for(NANO_BANANA_MODEL),
-        }
-        img = await _submit_resumable(
-            banana_args, node_id=node_id, stage="banana",
-        )
-        remote_image_url = str(img["image_url"])
-        ext = _ext_from_url(remote_image_url)
-        image_path = image_stem.parent / (image_stem.name + ext)
-        image_path.parent.mkdir(parents=True, exist_ok=True)
-        image_bytes = await _download_with_retry(remote_image_url, stage="nano_banana")
-        image_path.write_bytes(image_bytes)
-        logging.log(
-            "nano_banana.done",
-            node_id=node_id,
-            remote_url=remote_image_url,
-            saved=str(image_path),
-        )
+    Restart-resilient: if `trellis.done` was previously logged for
+    `job_id` and the file at the recorded path still exists, the call
+    short-circuits. Otherwise we look up the most recent
+    `trellis.submit` matching `(job_id, input_hash)` and probe its
+    server-assigned job; on a hit we download the result, on a miss
+    we fall through to a fresh `POST /generate`.
 
-    trellis_args: dict[str, Any] = {
-        "model": TRELLIS_MODEL,
-        "image": remote_image_url,
-        "remesh": False,
-        "resolution": 512,
-        "textureSize": 1024,
-        "outputFormat": "GLB",
-        "outputType": "URL",
-    }
-    mesh = await _submit_resumable(
-        trellis_args, node_id=node_id, stage="trellis",
-    )
-    glb_url = mesh["glb_url"]
+    `skip_reattach=True` bypasses the prior-submit probe and goes
+    straight to a fresh submit.
+    """
+    done = resumable.find_done(scope="trellis", job_id=job_id)
+    if done is not None:
+        cached = Path(str(done["saved"]))
+        if cached.exists():
+            return cached
+
+    image_bytes = await _fetch_url(image) if isinstance(image, str) else image
+    input_hash = _input_hash(image_bytes)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    content = await _download_with_retry(glb_url, stage="trellis")
-    output_path.write_bytes(content)
-    logging.log(
-        "cache.artifact",
-        node_id=node_id,
-        image_path=str(image_path),
-        raw_glb_path=str(output_path),
-    )
-    return {"glb": output_path, "image": image_path}
+
+    async with _generate_slot:
+        if not skip_reattach:
+            prior = resumable.find_prior_submit(
+                scope="trellis", job_id=job_id, input_hash=input_hash,
+            )
+            if prior is not None:
+                server_job_id = str(prior.get("task_id"))
+                ctx = {"scope": "trellis", "job_id": job_id, "task_id": server_job_id}
+                try:
+                    recovered = await _try_reattach(server_job_id)
+                    if recovered is not None:
+                        output_path.write_bytes(recovered)
+                        logging.log(
+                            "trellis.reattach", outcome="success", **ctx,
+                        )
+                        resumable.log_done(
+                            scope="trellis", job_id=job_id,
+                            server_job_id=server_job_id,
+                            saved=str(output_path),
+                        )
+                        return output_path
+                    logging.log(
+                        "trellis.reattach",
+                        outcome="expired",
+                        reason="job_gone_or_failed",
+                        **ctx,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    logging.log(
+                        "trellis.reattach",
+                        outcome="expired",
+                        reason=f"{type(e).__name__}: {str(e)[:200]}",
+                        **ctx,
+                    )
+
+        # Hold `server_job_id` across outer retries. Once we have one,
+        # we NEVER call `_post_generate` again in this lifecycle —
+        # any retryable failure during poll or download re-enters the
+        # same Modal job instead of orphaning it and burning a fresh
+        # generation. (The previous design re-submitted on poll/download
+        # errors, leaving the original job to finish on Modal with no
+        # client able to download it.)
+        server_job_id: str | None = None
+        for attempt in range(MAX_ATTEMPTS):
+            try:
+                if server_job_id is None:
+                    server_job_id = await _post_generate(image_bytes, image_mime)
+                    logging.log(
+                        "trellis.submit",
+                        job_id=job_id,
+                        task_id=server_job_id,
+                        input_hash=input_hash,
+                        attempt=attempt,
+                    )
+                await _poll_until_done(
+                    server_job_id, timeout=POLL_TIMEOUT_SECONDS,
+                )
+                content = await _download_result(server_job_id)
+                output_path.write_bytes(content)
+                resumable.log_done(
+                    scope="trellis",
+                    job_id=job_id,
+                    server_job_id=server_job_id,
+                    saved=str(output_path),
+                )
+                return output_path
+            except RETRYABLE as e:
+                if attempt == MAX_ATTEMPTS - 1:
+                    raise
+                delay = _retry_delay(attempt, e)
+                logging.log(
+                    "trellis.retry",
+                    job_id=job_id,
+                    task_id=server_job_id,
+                    attempt=attempt,
+                    delay_s=delay,
+                    reason=f"{type(e).__name__}: {str(e)[:200]}",
+                )
+                await asyncio.sleep(delay)
+        raise AssertionError("unreachable")

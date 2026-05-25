@@ -13,6 +13,8 @@ Usage: ./scripts/run_request.py
 
 from __future__ import annotations
 
+import argparse
+import json
 import os
 import signal
 import socket
@@ -26,9 +28,6 @@ SERVER_DIR = REPO_ROOT / "server"
 CLIENT_DIR = REPO_ROOT / "client"
 
 SERVER_HOST = "127.0.0.1"
-SERVER_PORT = 8765
-CLIENT_PORT = 8766
-SERVER_URL = f"http://{SERVER_HOST}:{SERVER_PORT}"
 
 
 def _child_env() -> dict[str, str]:
@@ -42,6 +41,14 @@ def _child_env() -> dict[str, str]:
     """
     env = {k: v for k, v in os.environ.items() if k not in {"VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}}
     return env
+
+
+def _pick_free_port() -> int:
+    """Ask the OS for a free TCP port. Race-prone (another process could
+    grab it before uvicorn binds), but good enough for local multi-run."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind((SERVER_HOST, 0))
+        return s.getsockname()[1]
 
 
 def _signal_group(pgid: int, sig: int) -> None:
@@ -86,7 +93,83 @@ def _wait_for_port(
     return False
 
 
+def _promote_runs_dir(runs_dir: Path) -> int:
+    """Flip every bbox-only completed slot in `runs_dir` into a resumable
+    state so the full-pipeline server picks it up as paused. Identifies
+    candidates as slots whose events.jsonl ends in `run.done` with zero
+    `model` events (i.e. main_nomesh.py's _spawn_meshes was patched in
+    and never wrote real meshes). The promotion just strips the trailing
+    `run.done` line — every LLM decision is already cached in earlier
+    `cache.llm` events, so the resumed run replays phase 1 instantly and
+    runs phase 2 for real."""
+    if not runs_dir.is_dir():
+        print(f"[promote] runs dir not found: {runs_dir}", file=sys.stderr)
+        return 1
+    promoted = 0
+    skipped = 0
+    for slot_dir in sorted(runs_dir.iterdir()):
+        if not slot_dir.is_dir():
+            continue
+        events_path = slot_dir / "events.jsonl"
+        if not events_path.exists():
+            continue
+        events: list[dict[str, object]] = []
+        with events_path.open("r") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    print(
+                        f"[promote] {slot_dir.name}: malformed line, aborting this slot",
+                        file=sys.stderr,
+                    )
+                    events = []
+                    break
+        if not events:
+            continue
+        last_kind = events[-1].get("kind")
+        if last_kind != "run.done":
+            print(f"[promote] {slot_dir.name}: last event is {last_kind!r}, skipping")
+            skipped += 1
+            continue
+        if any(e.get("kind") == "model" for e in events):
+            print(f"[promote] {slot_dir.name}: already has mesh `model` events, skipping")
+            skipped += 1
+            continue
+        events.pop()
+        with events_path.open("w") as f:
+            for e in events:
+                f.write(json.dumps(e) + "\n")
+        print(f"[promote] {slot_dir.name}: dropped run.done — resume to generate meshes")
+        promoted += 1
+    print(f"[promote] done: promoted={promoted}, skipped={skipped}")
+    return 0
+
+
 def main() -> int:
+    parser = argparse.ArgumentParser(description="Boot the full-pipeline API server + viewer.")
+    parser.add_argument(
+        "--runs-dir",
+        type=Path,
+        default=SERVER_DIR / "runs",
+        help="Directory the server writes per-slot run artifacts to. Created if missing.",
+    )
+    parser.add_argument(
+        "--promote",
+        action="store_true",
+        help="Promote bbox-only completed slots in --runs-dir to resumable so the "
+             "next server boot picks them up as paused. LLM decisions replay from "
+             "the events.jsonl cache; mesh generation runs for real on resume. "
+             "Exits after promotion — does NOT boot the server.",
+    )
+    args = parser.parse_args()
+
+    if args.promote:
+        return _promote_runs_dir(args.runs_dir.resolve())
+
     if not (CLIENT_DIR / "node_modules" / "three").exists():
         print(
             "[run_request] client/node_modules/three missing — run `npm install` in client/ first",
@@ -94,34 +177,44 @@ def main() -> int:
         )
         return 1
 
+    runs_dir = args.runs_dir.resolve()
+    runs_dir.mkdir(parents=True, exist_ok=True)
+
+    server_port = _pick_free_port()
+    client_port = _pick_free_port()
+    server_url = f"http://{SERVER_HOST}:{server_port}"
+    client_url = f"http://{SERVER_HOST}:{client_port}"
+
     env = _child_env()
 
-    print(f"[run_request] starting API server on {SERVER_URL}", flush=True)
+    print(
+        f"[run_request] starting API server on {server_url} (runs={runs_dir})",
+        flush=True,
+    )
     server = subprocess.Popen(
         [
             "uv", "run", "uvicorn", "app.main:app",
-            "--host", SERVER_HOST, "--port", str(SERVER_PORT),
+            "--host", SERVER_HOST, "--port", str(server_port),
             "--log-level", "info",
-            "--reload",
         ],
         cwd=SERVER_DIR,
-        env=env,
+        env={**env, "STARSHOT_RUNS_DIR": str(runs_dir)},
         process_group=0,
     )
 
-    if not _wait_for_port(SERVER_HOST, SERVER_PORT, proc=server, timeout=30.0):
+    if not _wait_for_port(SERVER_HOST, server_port, proc=server, timeout=30.0):
         print(
-            f"[run_request] server never became reachable at {SERVER_URL} — aborting",
+            f"[run_request] server never became reachable at {server_url} — aborting",
             file=sys.stderr,
         )
         _shutdown(server)
         return 1
-    print(f"[run_request] server ready, launching viewer", flush=True)
+    print(f"[run_request] server ready, launching viewer at {client_url}", flush=True)
 
     client = subprocess.Popen(
         ["node", "server.mjs"],
         cwd=CLIENT_DIR,
-        env={**env, "SERVER_URL": SERVER_URL, "PORT": str(CLIENT_PORT)},
+        env={**env, "SERVER_URL": server_url, "PORT": str(client_port)},
         process_group=0,
     )
     try:
