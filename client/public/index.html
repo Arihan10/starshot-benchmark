@@ -452,6 +452,124 @@
                 line-height: 1.4;
                 z-index: 5;
             }
+            #trellis-queue {
+                position: fixed;
+                right: 12px;
+                top: calc(40vh + 24px);
+                width: 320px;
+                max-height: 32vh;
+                display: flex;
+                flex-direction: column;
+                border-radius: 6px;
+                background: rgba(22, 24, 29, 0.82);
+                backdrop-filter: blur(6px);
+                font-size: 11px;
+                line-height: 1.4;
+                z-index: 5;
+            }
+            #trellis-queue.collapsed #trellis-queue-body {
+                display: none;
+            }
+            #trellis-queue-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding: 6px 10px;
+                border-bottom: 1px solid #2a2d35;
+                color: #9ad4ff;
+                cursor: pointer;
+                user-select: none;
+            }
+            #trellis-queue.collapsed #trellis-queue-header {
+                border-bottom: none;
+            }
+            #trellis-queue-counts {
+                color: #8a8f99;
+                font-size: 10px;
+                margin-left: 4px;
+            }
+            #trellis-queue-body {
+                overflow: auto;
+                padding: 6px 8px 8px;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            #trellis-queue .tq-section {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            #trellis-queue .tq-label {
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            #trellis-queue .tq-cap {
+                color: #5a5e68;
+                text-transform: none;
+                letter-spacing: 0;
+                font-size: 10px;
+                margin-left: 4px;
+            }
+            #trellis-queue .tq-list {
+                display: flex;
+                flex-direction: column;
+                gap: 1px;
+            }
+            #trellis-queue .tq-row {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+                padding: 2px 4px;
+                border-radius: 2px;
+                color: #b8bcc4;
+                cursor: pointer;
+                line-height: 1.3;
+            }
+            #trellis-queue .tq-row:hover {
+                background: rgba(74, 143, 216, 0.15);
+                color: #e6e6e6;
+            }
+            #trellis-queue .tq-row.processing .tq-dot { background: #e0c271; }
+            #trellis-queue .tq-row.waiting    .tq-dot { background: #5a5e68; }
+            #trellis-queue .tq-row.other-slot {
+                opacity: 0.55;
+                cursor: default;
+            }
+            #trellis-queue .tq-row.other-slot:hover {
+                background: transparent;
+            }
+            #trellis-queue .tq-slot-tag {
+                color: #7a8190;
+                font-size: 9px;
+                text-transform: uppercase;
+                letter-spacing: 0.03em;
+            }
+            #trellis-queue .tq-dot {
+                width: 6px;
+                height: 6px;
+                border-radius: 50%;
+                flex-shrink: 0;
+                align-self: center;
+            }
+            #trellis-queue .tq-id {
+                font-weight: 600;
+                word-break: break-all;
+                color: #c586d1;
+            }
+            #trellis-queue .tq-elapsed {
+                color: #7a8190;
+                font-size: 10px;
+                margin-left: auto;
+                white-space: nowrap;
+            }
+            #trellis-queue .tq-empty {
+                color: #5a5e68;
+                font-style: italic;
+                padding: 2px 4px;
+            }
             #tree {
                 position: fixed;
                 top: 160px;
@@ -731,19 +849,62 @@
                 font-size: 10px;
                 letter-spacing: 0.04em;
             }
-            #tree-detail .detail-path {
-                color: #5a5e68;
-                font-size: 10px;
-                word-break: break-all;
+            #tree-detail .detail-hierarchy {
+                display: flex;
+                flex-direction: column;
+                gap: 1px;
                 margin-bottom: 8px;
+                padding: 4px 0;
+                border-top: 1px solid #2a2d35;
+                border-bottom: 1px solid #2a2d35;
+                font-size: 10px;
             }
-            #tree-detail .detail-path .sep { color: #3a3d45; padding: 0 3px; }
-            #tree-detail .detail-path a {
-                color: inherit;
+            #tree-detail .detail-hier-row {
+                display: flex;
+                align-items: baseline;
+                gap: 5px;
+                padding: 2px 4px;
+                border-radius: 2px;
+                color: #b8bcc4;
                 text-decoration: none;
                 cursor: pointer;
+                line-height: 1.3;
             }
-            #tree-detail .detail-path a:hover { color: #b8bcc4; }
+            #tree-detail .detail-hier-row:hover {
+                background: rgba(74, 143, 216, 0.15);
+                color: #e6e6e6;
+            }
+            #tree-detail .detail-hier-row.current {
+                background: rgba(74, 143, 216, 0.18);
+                color: #e6e6e6;
+                cursor: default;
+            }
+            #tree-detail .detail-hier-branch {
+                color: #3a3d45;
+                margin-right: -2px;
+            }
+            #tree-detail .detail-hier-kind {
+                color: #5a5e68;
+                font-size: 9px;
+                text-transform: uppercase;
+                letter-spacing: 0.03em;
+            }
+            #tree-detail .detail-hier-id {
+                font-weight: 600;
+                word-break: break-all;
+            }
+            #tree-detail .detail-hier-id.zone { color: #e0c271; }
+            #tree-detail .detail-hier-id.object { color: #c586d1; }
+            #tree-detail .detail-hier-id.frame { color: #7fb3d5; }
+            #tree-detail .detail-hier-prompt {
+                color: #7a8190;
+                font-size: 10px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                flex: 1;
+                min-width: 0;
+            }
             #tree-detail .detail-meta-row {
                 display: flex;
                 flex-wrap: wrap;
@@ -776,6 +937,41 @@
             #tree-detail .detail-empty {
                 color: #5a5e68;
                 font-style: italic;
+            }
+            #tree-detail .detail-preview {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            #tree-detail .detail-preview-image-link {
+                display: block;
+                line-height: 0;
+                border: 1px solid #2a2d35;
+                border-radius: 3px;
+                overflow: hidden;
+            }
+            #tree-detail .detail-preview-image-link:hover {
+                border-color: #4a8fd8;
+            }
+            #tree-detail .detail-preview-image {
+                width: 100%;
+                height: auto;
+                display: block;
+            }
+            #tree-detail .detail-preview-viewer {
+                border: 1px solid #2a2d35;
+                border-radius: 3px;
+                background: #0e1014;
+                overflow: hidden;
+                position: relative;
+                touch-action: none;
+            }
+            #tree-detail .detail-mini-canvas {
+                display: block;
+                cursor: grab;
+            }
+            #tree-detail .detail-mini-canvas:active {
+                cursor: grabbing;
             }
             #tree-detail .detail-children {
                 margin-top: 4px;
@@ -895,6 +1091,329 @@
             .asset-prompt.expanded {
                 -webkit-line-clamp: unset;
             }
+            .asset-retry {
+                align-self: flex-start;
+                margin-top: 4px;
+                padding: 3px 8px;
+                border-radius: 3px;
+                border: 1px solid #804040;
+                background: #2a1515;
+                color: #ff8080;
+                font: inherit;
+                font-size: 10px;
+                cursor: pointer;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            .asset-retry:hover:not(:disabled) {
+                background: #3a2020;
+                border-color: #ff8080;
+                color: #ffaaaa;
+            }
+            .asset-retry:disabled {
+                opacity: 0.55;
+                cursor: default;
+            }
+            .asset-retry.retrying {
+                background: #1a1d24;
+                border-color: #3a4a6a;
+                color: #9ab4d8;
+            }
+            #tree-detail .detail-retry {
+                margin-top: 8px;
+                padding: 5px 10px;
+                border-radius: 3px;
+                border: 1px solid #804040;
+                background: #2a1515;
+                color: #ff8080;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+            }
+            #tree-detail .detail-retry:hover:not(:disabled) {
+                background: #3a2020;
+                border-color: #ff8080;
+                color: #ffaaaa;
+            }
+            #tree-detail .detail-retry:disabled {
+                opacity: 0.55;
+                cursor: default;
+            }
+            #tree-detail .detail-retry.retrying {
+                background: #1a1d24;
+                border-color: #3a4a6a;
+                color: #9ab4d8;
+            }
+            #tree-expand {
+                width: 22px;
+                height: 18px;
+                padding: 0;
+                margin: 0 4px 0 4px;
+                border-radius: 3px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 12px;
+                line-height: 1;
+                cursor: pointer;
+            }
+            #tree-expand:hover {
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            #tree.collapsed #tree-expand {
+                display: none;
+            }
+            #tree-detail .detail-open-full {
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+                margin-left: 8px;
+                padding: 3px 8px;
+                background: #16181d;
+                border: 1px solid #2a4a78;
+                border-radius: 3px;
+                color: #9ad4ff;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+            }
+            #tree-detail .detail-open-full:hover {
+                background: #2a3a5a;
+                border-color: #4a8fd8;
+                color: #c8d8f0;
+            }
+            #tree-modal {
+                position: fixed;
+                inset: 0;
+                background: rgba(8, 9, 12, 0.88);
+                backdrop-filter: blur(6px);
+                z-index: 1100;
+                display: none;
+                align-items: center;
+                justify-content: center;
+            }
+            #tree-modal.open { display: flex; }
+            #tree-modal-panel {
+                width: min(1280px, 96vw);
+                max-height: 94vh;
+                display: flex;
+                flex-direction: column;
+                background: #16181d;
+                border: 1px solid #2a2d35;
+                border-radius: 8px;
+                overflow: hidden;
+                font-size: 12px;
+                color: #e6e6e6;
+            }
+            #tree-modal-panel header {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 10px 14px;
+                background: #1c1e24;
+                border-bottom: 1px solid #2a2d35;
+            }
+            #tree-modal-panel header h2 {
+                margin: 0;
+                font-size: 13px;
+                font-weight: 600;
+                color: #9ad4ff;
+                flex-shrink: 0;
+            }
+            #tree-modal-controls {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                margin-left: auto;
+            }
+            #tree-modal-search {
+                width: 240px;
+                padding: 4px 8px;
+                background: #0c0d10;
+                border: 1px solid #2a2d35;
+                border-radius: 3px;
+                color: #e6e6e6;
+                font: inherit;
+                font-size: 11px;
+            }
+            #tree-modal-search:focus {
+                outline: none;
+                border-color: #4a8fd8;
+            }
+            #tree-modal-image-toggle-label {
+                color: #b8bcc4;
+                font-size: 11px;
+                cursor: pointer;
+                user-select: none;
+                display: inline-flex;
+                align-items: center;
+                gap: 4px;
+            }
+            #tree-modal-image-toggle {
+                accent-color: #4a8fd8;
+            }
+            #tree-modal-close {
+                background: none;
+                border: none;
+                color: #8a8f99;
+                font-size: 22px;
+                cursor: pointer;
+                padding: 0 4px;
+                line-height: 1;
+            }
+            #tree-modal-close:hover { color: #e6e6e6; }
+            #tree-modal-body {
+                padding: 12px 14px 20px;
+                overflow: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            #tree-modal-body .tm-empty {
+                color: #5a5e68;
+                font-style: italic;
+                padding: 30px;
+                text-align: center;
+            }
+            .tm-card {
+                position: relative;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                padding: 10px 12px;
+                border: 1px solid #2a2d35;
+                border-left-width: 3px;
+                border-radius: 4px;
+                background: #1a1c22;
+            }
+            .tm-card.kind-zone   { border-left-color: #e0c271; }
+            .tm-card.kind-object { border-left-color: #c586d1; }
+            .tm-card.kind-frame  { border-left-color: #7fb3d5; }
+            .tm-card.selected {
+                background: #1f2632;
+                outline: 1px solid #4a8fd8;
+            }
+            .tm-card.dimmed { opacity: 0.32; }
+            .tm-card.hit { background: #232618; }
+            .tm-card-head {
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .tm-depth {
+                color: #3a3d45;
+                font-variant-numeric: tabular-nums;
+                font-size: 10px;
+            }
+            .tm-kind {
+                color: #8a8f99;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            .tm-id {
+                font-weight: 600;
+                font-size: 13px;
+                word-break: break-all;
+                cursor: pointer;
+            }
+            .tm-id.zone   { color: #e0c271; }
+            .tm-id.object { color: #c586d1; }
+            .tm-id.frame  { color: #7fb3d5; }
+            .tm-id:hover { text-decoration: underline; }
+            .tm-phase {
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                padding: 0 5px;
+                border-radius: 2px;
+                background: #16181d;
+                border: 1px solid #2a2d35;
+            }
+            .tm-parent {
+                font-size: 10px;
+                color: #7a8190;
+                cursor: pointer;
+            }
+            .tm-parent:hover { color: #c8d8f0; text-decoration: underline; }
+            .tm-meta {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 4px 14px;
+                color: #8a8f99;
+                font-size: 10px;
+            }
+            .tm-meta b { color: #b8bcc4; font-weight: normal; }
+            .tm-card-body {
+                display: grid;
+                grid-template-columns: 1fr;
+                gap: 8px;
+            }
+            .tm-card.has-thumb .tm-card-body {
+                grid-template-columns: minmax(0, 1fr) 180px;
+            }
+            .tm-sections {
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                min-width: 0;
+            }
+            .tm-section {
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            .tm-section-label {
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            .tm-section-body {
+                color: #d6d9df;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                line-height: 1.45;
+            }
+            .tm-section-body.empty {
+                color: #5a5e68;
+                font-style: italic;
+            }
+            .tm-thumb {
+                width: 180px;
+                height: 180px;
+                border: 1px solid #2a2d35;
+                border-radius: 3px;
+                background: #0e1014;
+                object-fit: contain;
+                cursor: pointer;
+            }
+            .tm-children-block {
+                margin-top: 4px;
+                padding-top: 6px;
+                border-top: 1px dashed #2a2d35;
+                display: flex;
+                flex-wrap: wrap;
+                gap: 4px 8px;
+                color: #7a8190;
+                font-size: 10px;
+            }
+            .tm-children-block a {
+                color: #b8bcc4;
+                cursor: pointer;
+                text-decoration: none;
+                padding: 1px 5px;
+                border-radius: 2px;
+                background: #14161b;
+                border: 1px solid #232631;
+            }
+            .tm-children-block a:hover {
+                color: #e6e6e6;
+                border-color: #4a8fd8;
+            }
             #zoom-controls {
                 position: fixed;
                 right: 12px;
@@ -949,6 +1468,7 @@
             <div id="tree-header">
                 <span>tree</span>
                 <span id="tree-active"></span>
+                <button id="tree-expand" type="button" title="Open the full scene tree in a modal — every node's prompt, plan, bbox, and preview side-by-side">⛶</button>
                 <span id="tree-toggle">▾</span>
             </div>
             <div id="tree-search-row">
@@ -965,6 +1485,22 @@
                 <span id="assets-toggle">▾</span>
             </div>
             <div id="assets-body"></div>
+        </div>
+        <div id="trellis-queue">
+            <div id="trellis-queue-header">
+                <span>trellis queue <span id="trellis-queue-counts">0 processing · 0 waiting</span></span>
+                <span id="trellis-queue-toggle">▾</span>
+            </div>
+            <div id="trellis-queue-body">
+                <div class="tq-section">
+                    <div class="tq-label">processing on modal <span class="tq-cap" id="tq-processing-cap">(0/10)</span></div>
+                    <div class="tq-list" id="tq-processing"></div>
+                </div>
+                <div class="tq-section">
+                    <div class="tq-label">waiting in queue <span class="tq-cap" id="tq-waiting-cap">(0)</span></div>
+                    <div class="tq-list" id="tq-waiting"></div>
+                </div>
+            </div>
         </div>
         <div id="log"></div>
         <div id="zoom-controls">
@@ -1004,6 +1540,19 @@
                     <button id="replay-render" type="button" title="Replay the build and encode an animated gif">render gif</button>
                     <button id="replay-download" type="button" class="primary" disabled title="Download the rendered gif">download</button>
                 </div>
+            </div>
+        </div>
+        <div id="tree-modal">
+            <div id="tree-modal-panel">
+                <header>
+                    <h2>scene tree — full prompts &amp; plans</h2>
+                    <div id="tree-modal-controls">
+                        <input id="tree-modal-search" type="text" placeholder="filter by id or prompt" autocomplete="off" spellcheck="false" />
+                        <label id="tree-modal-image-toggle-label" title="Show generated image thumbnails inline"><input id="tree-modal-image-toggle" type="checkbox" checked /> images</label>
+                        <button id="tree-modal-close" type="button" title="Close (Esc)">×</button>
+                    </div>
+                </header>
+                <div id="tree-modal-body"></div>
             </div>
         </div>
         <!-- gif.js loaded as a global because the npm dist is UMD/CJS and

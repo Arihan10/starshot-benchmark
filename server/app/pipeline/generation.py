@@ -89,7 +89,7 @@ async def _decompose_objects_validated(
     zone: Node,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
 ) -> list[ObjectSpec]:
     prior_attempts: list[tuple[list[ObjectSpec], str]] = []
     existing_ids = {n.id for n in all_nodes}
@@ -165,7 +165,7 @@ async def _decompose_objects_validated(
 
 async def _next_object_validated(
     *, zone: Node, all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
 ) -> NextObjectOutput:
     prior_attempts: list[tuple[ObjectSpec, str]] = []
     existing_ids = {n.id for n in all_nodes}
@@ -280,6 +280,7 @@ async def _resolve_and_generate(
             parent_id=spec.parent, prompt=spec.prompt,
             kind="frame" if scenario == "encapsulating" else "object",
             proxy_shape=spec.proxy_shape,
+            orientation=spec.orientation,
         )
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
         subject_prompt, image_prompt = await _build_image_prompt(
@@ -412,6 +413,39 @@ async def _spawn_meshes(
     return out
 
 
+async def retry_node(
+    *,
+    node: Node,
+    runs_dir: Path,
+    run_id: str,
+) -> asyncio.Task[None]:
+    """Standalone re-generation of a single failed mesh — always FRESH:
+    every prior on-disk artifact for this node is unlinked so the
+    cache-aware checks inside `nano_banana.generate_resumable` and
+    `threed.generate_mesh` miss and issue new API calls. The user is
+    asking for "give this object another shot," not "reuse what we had,"
+    so a stale banana image (e.g. one that produced a broken Trellis run)
+    doesn't get recycled. Registered on `_pending` so `cancel_pending`
+    (slot reset / teardown) can tear it down alongside in-flight
+    pipeline meshes."""
+    objs_dir = runs_dir / run_id / "objects"
+    objs_dir.mkdir(parents=True, exist_ok=True)
+    raw = objs_dir / f"{node.id}.raw.glb"
+    path = objs_dir / f"{node.id}.glb"
+    image_stem = objs_dir / node.id
+    image_path = image_stem.parent / f"{image_stem.name}.png"
+    for artifact in (image_path, raw, path):
+        artifact.unlink(missing_ok=True)
+    logging.log("mesh.retry", id=node.id, prompt=node.prompt)
+    task = asyncio.create_task(
+        _generate_one(
+            node, raw=raw, path=path, image_stem=image_stem, runs_dir=runs_dir,
+        ),
+    )
+    _pending.setdefault(run_id, []).append(task)
+    return task
+
+
 async def await_pending(run_id: str) -> None:
     """Block until every background mesh task for this run has finished.
     Errors inside individual tasks were logged + swallowed by `_generate_one`,
@@ -437,7 +471,7 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
 ) -> None:
     specs = await _decompose_objects_validated(
         zone=zone, scenario=scenario, all_nodes=all_nodes, ancestors=ancestors,

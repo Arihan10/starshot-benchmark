@@ -19,11 +19,11 @@ SLOTS: list[Slot] = [
     Slot("platformer-level", "A super mario bros type platformer level"),
     Slot("battle-arena", "A battle arena for a two player game"),
     Slot("urban-city", "An imperial japanese house"),
-    Slot("waterloo-campus", "University of Waterloo Campus"),
+    Slot("waterloo-campus", "A modern house"),
     Slot("shooter", "FPS 5v5 3 lane map"),
     Slot("racetrack", "A car racing track")
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
 
-DEFAULT_MODEL = "google/gemini-3.5-flash"
+DEFAULT_MODEL = "openai/gpt-5.5"

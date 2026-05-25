@@ -240,11 +240,11 @@ def render_zone_plan(
     *,
     zone_id: str,
     zone_prompt: str,
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
     objects: list[tuple[str, str, str | None]],
 ) -> str:
-    """ancestors: (id, prompt, plan) tuples from root → parent of this zone,
-    excluding the zone itself. Empty for the root.
+    """ancestors: (id, prompt, plan, bbox) tuples from root → parent of this
+    zone, excluding the zone itself. Empty for the root.
     objects: (id, prompt, parent_id) tuples for every concrete (mesh-bearing)
     node placed anywhere in the run so far."""
     # Root zone uses the new competitive prompt format
@@ -382,10 +382,7 @@ other LLMs.
 """
 
     # Nested zones use adapted competitive prompt format
-    ancestor_block = "\n".join(
-        f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
-        for aid, aprompt, aplan in ancestors
-    )
+    ancestor_block = _render_ancestor_block(ancestors)
     if objects:
         obj_block = "\n".join(
             f"  - id={oid!r} parent={oparent!r}: {oprompt}"
@@ -659,10 +656,14 @@ implied loci drive your decision.
   * The SCENE PROMPT and SCENE PLAN — the root's prompt and plan, the \
 north-star for the whole scene.
   * The ANCESTOR CHAIN — every zone above this one in the tree, root first, \
-each with its plan.
+each with its plan and bbox.
   * The PRIOR ZONES — every non-root zone already declared in the run, with \
-its parent and plan. Lateral context: siblings, cousins, and earlier subtrees \
-may inform how THIS zone is structured and anchored.
+its parent, bbox, and plan. Lateral context: siblings, cousins, and earlier \
+subtrees may inform how THIS zone is structured and anchored. Some prior \
+zones may show `plan: (not yet authored …)` — they have been declared by \
+their parent's decomposition and have a resolved bbox, but the depth-first \
+walk hasn't recursed into them yet. Treat their bbox as the load-bearing \
+signal: their footprint is fixed even though their detailed plan isn't.
   * The GENERATED OBJECTS — every concrete (mesh-bearing) object placed \
 anywhere in the scene so far, with its parent.
 </input>
@@ -709,30 +710,36 @@ def render_zone_decompose(
     zone_prompt: str,
     zone_bbox: BoundingBox,
     zone_plan: str,
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
     objects: list[tuple[str, str, str | None]],
     scene_prompt: str,
     scene_plan: str,
-    prior_zones: list[tuple[str, str, str, str]],
+    prior_zones: list[tuple[str, str, str | None, str, BoundingBox]],
 ) -> str:
-    """ancestors: (id, prompt, plan) tuples from root → parent of this zone,
-    excluding the zone itself. Empty for the root.
+    """ancestors: (id, prompt, plan, bbox) tuples from root → parent of this
+    zone, excluding the zone itself. Empty for the root.
     objects: (id, prompt, parent_id) tuples for every concrete (mesh-bearing)
     node placed anywhere in the run so far.
-    prior_zones: (id, prompt, plan, parent_id) for every non-root zone
-    already declared in the run, in declaration order."""
-    if ancestors:
-        ancestor_block = "\n".join(
-            f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
-            for aid, aprompt, aplan in ancestors
-        )
-    else:
-        ancestor_block = "  (none — this zone is the root)"
+    prior_zones: (id, prompt, plan_or_None, parent_id, bbox) for every
+    non-root zone already declared in the run, in declaration order. `plan`
+    is None for zones that have been declared (bbox resolved) but not yet
+    recursed into for individual planning."""
+    ancestor_block = _render_ancestor_block(ancestors)
     if prior_zones:
-        prior_block = "\n".join(
-            f"  - id={zid!r} parent={zparent!r}\n    prompt: {zprompt}\n    plan: {zplan}"
-            for zid, zprompt, zplan, zparent in prior_zones
-        )
+        def _render_prior(zid, zprompt, zplan, zparent, zbbox):
+            plan_line = (
+                f"\n    plan: {zplan}"
+                if zplan is not None
+                else "\n    plan: (not yet authored — declared by its parent "
+                "decomposition, recursion into it has not started)"
+            )
+            return (
+                f"  - id={zid!r} parent={zparent!r}\n"
+                f"    prompt: {zprompt}\n"
+                f"    bbox: {zbbox.model_dump_json()}"
+                f"{plan_line}"
+            )
+        prior_block = "\n".join(_render_prior(*z) for z in prior_zones)
     else:
         prior_block = "  (none)"
     if objects:
@@ -1216,12 +1223,17 @@ You are given two views of the scene:
 )
 
 
-def _render_ancestor_block(ancestors: list[tuple[str, str, str]]) -> str:
+def _render_ancestor_block(
+    ancestors: list[tuple[str, str, str, BoundingBox]],
+) -> str:
     if not ancestors:
         return "  (none — this is the root)"
     return "\n".join(
-        f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
-        for aid, aprompt, aplan in ancestors
+        f"  - id={aid!r}\n"
+        f"    prompt: {aprompt}\n"
+        f"    bbox: {abbox.model_dump_json()}\n"
+        f"    plan: {aplan}"
+        for aid, aprompt, aplan, abbox in ancestors
     )
 
 
@@ -1286,7 +1298,7 @@ def render_anchor_decomp(
     zone_id: str,
     zone_plan: str | None,
     zone_bbox: BoundingBox,
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
     scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
@@ -1321,7 +1333,7 @@ def render_encapsulating_decomp(
     zone_id: str,
     zone_plan: str | None,
     zone_bbox: BoundingBox,
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
     scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
@@ -1777,18 +1789,11 @@ def render_next_object(
     zone_id: str,
     zone_plan: str | None,
     zone_bbox: BoundingBox,
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
     scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]],
     prior_attempts: list[tuple[ObjectSpec, str]] | None = None,
 ) -> str:
-    ancestor_block = (
-        "\n".join(
-            f"  - id={aid!r}\n    prompt: {aprompt}\n    plan: {aplan}"
-            for aid, aprompt, aplan in ancestors
-        )
-        if ancestors
-        else "  (none — this is the root)"
-    )
+    ancestor_block = _render_ancestor_block(ancestors)
     zone_plan_block = (
         f"Zone plan: {zone_plan}"
         if zone_plan is not None

@@ -26,7 +26,7 @@ from typing import Any
 from rich.console import Console
 from rich.markup import escape
 
-from app.core.types import BoundingBox, ProxyShape
+from app.core.types import BoundingBox, Orientation, ProxyShape
 
 _console = Console()
 
@@ -161,6 +161,13 @@ def current_events() -> list[dict[str, Any]]:
     return _current.get().state["events"]
 
 
+def current_slot_id() -> str | None:
+    """Slot id of the currently-bound task, or None if no binding (e.g.
+    called from a script or before bind())."""
+    log = _current.get(None)
+    return log.slot_id if log is not None else None
+
+
 def slot_dir() -> Path:
     """Directory for the currently-bound slot (parent of events.jsonl)."""
     return _current.get().events_path.parent
@@ -178,6 +185,7 @@ def emit_bbox(
     prompt: str,
     kind: str,
     proxy_shape: ProxyShape | None = None,
+    orientation: Orientation = 0,
 ) -> None:
     log(
         "bbox",
@@ -188,6 +196,7 @@ def emit_bbox(
         prompt=prompt,
         node_kind=kind,
         proxy_shape=proxy_shape.value if proxy_shape is not None else None,
+        orientation=orientation,
     )
 
 

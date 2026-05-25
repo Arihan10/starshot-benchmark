@@ -129,27 +129,20 @@ async def replay_slot(
     ok = 0
     err = 0
 
-    # Serial, one node at a time, with a per-node hard timeout.
-    # Reattach should return quickly (the server's status probe is
-    # cheap); a hang past `per_node_timeout` usually means the server
-    # job is gone and we need a fresh submit. The fresh-submit retry
-    # gets 3× the budget since it actually runs the model.
-    fresh_submit_timeout = per_node_timeout * 3
+    # Serial, one node at a time, with a per-node hard timeout. Every
+    # replay is a fresh Trellis submit — reattach was removed because
+    # Modal GCs prior task_ids on its own schedule and probing them
+    # under rate-limit pressure was more cost than benefit.
     for i, (nid, subject_prompt, bbox, proxy) in enumerate(stuck, start=1):
         banana_prompt = wrap_image_prompt(subject_prompt, proxy, bbox.size)
         raw = objs_dir / f"{nid}.raw.glb"
         image_path = objs_dir / f"{nid}.png"
         print(f"  [{i}/{len(stuck)}] {nid}", flush=True)
 
-        async def _replay(nid: str = nid, *, skip_reattach: bool = False) -> None:
+        async def _replay(nid: str = nid) -> None:
             # Prefer the hosted banana URL when we have it (migrated
-            # runs carry it on google.banana.done). The migrated
-            # trellis.submit's input_hash was recomputed assuming
-            # image=remote_url, so passing the same URL here makes
-            # the wrapper's input_hash match and the prior server
-            # job is reattached — no Trellis re-bill. Passing
-            # image_bytes instead would hash different content and
-            # miss the prior submit, forcing a fresh paid generation.
+            # runs carry it on google.banana.done); otherwise re-fetch
+            # the image via the banana resumable cache.
             banana_done = resumable.find_done(
                 scope="google.banana", job_id=nid,
             )
@@ -168,7 +161,6 @@ async def replay_slot(
                 output_path=raw,
                 job_id=nid,
                 image_mime=image_mime,
-                skip_reattach=skip_reattach,
             )
 
         try:
@@ -176,32 +168,11 @@ async def replay_slot(
             ok += 1
             print(f"    ok  {nid}", flush=True)
         except asyncio.TimeoutError:
-            # Reattach hung — the server job is almost certainly
-            # gone. Retry with a fresh submit, accepting the re-bill.
+            err += 1
             print(
-                f"    timeout {nid} after {per_node_timeout:.0f}s "
-                f"— resubmitting fresh",
+                f"    err {nid}: timed out after {per_node_timeout:.0f}s",
                 flush=True,
             )
-            try:
-                await asyncio.wait_for(
-                    _replay(skip_reattach=True), timeout=fresh_submit_timeout,
-                )
-                ok += 1
-                print(f"    ok  {nid} (fresh submit)", flush=True)
-            except asyncio.TimeoutError:
-                err += 1
-                print(
-                    f"    err {nid}: fresh submit also timed out "
-                    f"after {fresh_submit_timeout:.0f}s",
-                    flush=True,
-                )
-            except Exception as e:  # noqa: BLE001
-                err += 1
-                print(
-                    f"    err {nid} (fresh submit): {type(e).__name__}: {e}",
-                    flush=True,
-                )
         except Exception as e:  # noqa: BLE001
             err += 1
             print(f"    err {nid}: {type(e).__name__}: {e}", flush=True)

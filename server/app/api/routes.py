@@ -26,7 +26,9 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from app.core.prompts import wrap_image_prompt
 from app.core.slots import DEFAULT_MODEL, SLOTS, SLOTS_BY_ID, Slot
+from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import divider, generation
 from app.services import llm, threed
 from app.utils import logging as rlog
@@ -86,6 +88,17 @@ def create_app() -> FastAPI:
     @app.get("/slots")
     async def list_slots() -> list[dict[str, object]]:  # pyright: ignore[reportUnusedFunction]
         return [_slot_summary(s) for s in SLOTS]
+
+    @app.get("/trellis/queue")
+    async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live snapshot of the process-global Trellis in-flight queue.
+        The client polls this instead of inferring queue state from the
+        replayed event log (historical submits without matching .done
+        events leak as stale "processing" rows otherwise)."""
+        return {
+            "cap": threed.GENERATE_CONCURRENCY,
+            "entries": threed.queue_snapshot(),
+        }
 
     @app.get("/slots/{slot_id}/events")
     async def slot_events(slot_id: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
@@ -157,10 +170,32 @@ def create_app() -> FastAPI:
         slot_log.log("run.paused")
         return {"slot_id": slot.id}
 
+    @app.post("/slots/{slot_id}/retry-mesh/{node_id}")
+    async def slot_retry_mesh(slot_id: str, node_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        slot = _require_slot(slot_id)
+        slot_log = _slot_logs[slot_id]
+        node = _reconstruct_node(slot_log, node_id)
+        if node is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no bbox event found for node: {node_id}",
+            )
+        async def _do_retry() -> None:
+            rlog.bind(slot_log)
+            await generation.retry_node(
+                node=node, runs_dir=RUNS_DIR, run_id=slot.id,
+            )
+        asyncio.create_task(_do_retry())
+        return {"slot_id": slot.id, "node_id": node_id}
+
     @app.post("/slots/{slot_id}/reset")
     async def slot_reset(slot_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         slot = _require_slot(slot_id)
         await _cancel_task(slot_id)
+        # Cancel any standalone retries (registered on generation._pending
+        # but with no owning _run task to drive cleanup) that the running
+        # task wouldn't have touched.
+        generation.cancel_pending(slot.id)
         slot_dir = RUNS_DIR / slot.id
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
@@ -218,6 +253,78 @@ def _maybe_launch(slot: Slot, slot_log: SlotLog) -> None:
         slot_log.state["status"] = "paused"
 
 
+_WRAPPED_PROMPT_PREFIX = "Generate a direct,"
+
+
+def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
+    """Rebuild a minimal Node from the slot's event log so a standalone
+    retry can call into `_generate_one` without re-running the divider.
+
+    The bbox event carries everything the rescale step needs (origin,
+    dimensions, proxy_shape, orientation). `image_prompt` is what banana
+    actually sees, so we want to preserve whatever the prior run sent it
+    rather than re-deriving from a "subject phrase" that may not exist
+    anymore.
+
+    Two log shapes coexist in practice:
+      * NEW (current pipeline): `bbox.prompt` and `image.prompt` are bare
+        subject phrases. The wrapping happens at the banana boundary.
+      * OLD (pre-refactor logs still on disk): `bbox.prompt` and
+        `image.prompt` are already the full wrapped studio-shot directive,
+        because the pipeline wrapped earlier.
+
+    Detect by sniffing the prefix. For a wrapped string we pass it through
+    as `image_prompt` verbatim — re-wrapping would nest the template inside
+    itself and produce a malformed banana prompt that Gemini refuses with
+    MALFORMED_FUNCTION_CALL. For a bare subject we wrap normally.
+    """
+    events = slot_log.state["events"]
+    bbox_event: dict[str, object] | None = None
+    image_event: dict[str, object] | None = None
+    for event in events:
+        if event.get("id") != node_id:
+            continue
+        kind = event.get("kind")
+        if kind == "bbox":
+            bbox_event = event
+        elif kind == "image":
+            image_event = event
+    if bbox_event is None:
+        return None
+    origin = bbox_event.get("origin")
+    dimensions = bbox_event.get("dimensions")
+    if not isinstance(origin, list) or not isinstance(dimensions, list):
+        return None
+    bbox = BoundingBox(
+        origin=(float(origin[0]), float(origin[1]), float(origin[2])),
+        dimensions=(float(dimensions[0]), float(dimensions[1]), float(dimensions[2])),
+    )
+    proxy_raw = bbox_event.get("proxy_shape")
+    proxy_shape = ProxyShape(proxy_raw) if isinstance(proxy_raw, str) else None
+    orientation_raw = bbox_event.get("orientation", 0)
+    orientation: Orientation = int(orientation_raw) if isinstance(orientation_raw, (int, float, str)) else 0  # type: ignore[assignment]
+    raw_prompt = (
+        image_event.get("prompt") if image_event is not None else bbox_event.get("prompt")
+    )
+    raw_str = str(raw_prompt) if raw_prompt is not None else ""
+    if raw_str.lstrip().startswith(_WRAPPED_PROMPT_PREFIX):
+        image_prompt = raw_str
+        subject_str = raw_str
+    else:
+        subject_str = raw_str
+        image_prompt = wrap_image_prompt(subject_str, proxy_shape, bbox.size)
+    parent_id = bbox_event.get("parent_id")
+    return Node(
+        id=node_id,
+        prompt=subject_str,
+        bbox=bbox,
+        proxy_shape=proxy_shape,
+        orientation=orientation,
+        image_prompt=image_prompt,
+        parent_id=str(parent_id) if isinstance(parent_id, str) else None,
+    )
+
+
 def _require_slot(slot_id: str) -> Slot:
     slot = SLOTS_BY_ID.get(slot_id)
     if slot is None:
@@ -246,11 +353,15 @@ async def _sse(
 ) -> AsyncIterator[str]:
     # All events ride the default SSE "message" type; the client dispatches
     # by `event.kind` internally. Keeps the client listener table flat.
+    #
+    # Snapshot terminal events do NOT close the stream — only live ones
+    # do. That way a client re-subscribing to a finished slot (to drive a
+    # standalone mesh retry) gets the historical timeline and then waits
+    # on the live queue for the retry's new events, instead of being
+    # disconnected the instant the past `run.done` replays.
     try:
         for event in snapshot:
             yield f"data: {json.dumps(event)}\n\n"
-            if event["kind"] in {"run.done", "run.error", "run.paused"}:
-                return
         while True:
             event = await q.get()
             yield f"data: {json.dumps(event)}\n\n"

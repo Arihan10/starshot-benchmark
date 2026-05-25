@@ -10,11 +10,13 @@ flips to `done`.
 Image generation lives in `app.services.nano_banana` — callers run that
 first, then pass the resulting bytes (or a hosted URL) here.
 
-Restart-resilience (in-flight reattach + completion caching) lives in
-`app.utils.resumable`; we record the server's `job_id` under our own
-`task_id` slot so a process restart can re-poll the same job instead
-of re-billing it. Submissions whose server job is gone (404 / failed)
-fall through to a fresh `POST /generate`.
+Restart-resilience on completed work lives in `app.utils.resumable`:
+if `trellis.done` was logged and the saved GLB still exists, we
+short-circuit and reuse it. Anything not done re-submits fresh —
+we don't probe stale Modal task_ids because Modal GCs them on its
+own schedule and the in-flight semaphore (capped at Modal's
+container count) keeps Modal-side queueing at zero, so each fresh
+submit goes straight to a GPU.
 
 The returned GLB has textures embedded in its binary chunk, but
 trimesh cannot decode them unless Pillow is installed at import time.
@@ -27,6 +29,7 @@ import asyncio
 import hashlib
 import os
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -49,11 +52,11 @@ TRELLIS_SEED = 0
 
 # Spawn-and-poll cadence. The API caps any single job at ~10 min
 # wall-clock; warm 512-res jobs finish in ~3s, 1536-res in ~60s, cold
-# starts add 30-90s. 10s × GENERATE_CONCURRENCY=8 = 48 polls/min,
-# comfortably under the per-IP-per-container `/jobs/{id}` rate limit
-# (60/60s) even if Modal's load balancer pins us to a single container.
-POLL_INTERVAL_SECONDS = 10.0
-POLL_TIMEOUT_SECONDS = 600.0
+# starts add 30-90s. 12s × GENERATE_CONCURRENCY=10 = 50 polls/min,
+# under the per-IP-per-container `/jobs/{id}` rate limit (60/60s) even
+# if Modal's load balancer pins us to a single container.
+POLL_INTERVAL_SECONDS = 12.0
+POLL_TIMEOUT_SECONDS = 1200.0
 
 MAX_ATTEMPTS = 3
 # Download has its own (larger) budget. The status endpoint can flip to
@@ -76,12 +79,64 @@ RETRYABLE: tuple[type[BaseException], ...] = (
     TimeoutError,
 )
 
-# Cap the number of in-flight Trellis jobs at any moment. Modal's
-# FastAPI router returns 429 once concurrent inputs exceed its
-# per-container × container-count budget; this gates the full
-# submit→poll→download lifecycle so we never overshoot.
-GENERATE_CONCURRENCY = 8
-_generate_slot = asyncio.Semaphore(GENERATE_CONCURRENCY)
+# Cap the number of in-flight Trellis jobs at any moment. Set to match
+# Modal's actual GPU container count for our Trellis app — we own the
+# endpoint and are the only client, so submitting at exactly this many
+# means Modal never queues on its side and every "pending" status maps
+# to active GPU processing rather than queue wait. The semaphore acts
+# as our FIFO queue (process-global, across all benchmark slots).
+GENERATE_CONCURRENCY = 10
+_inflight_sem = asyncio.Semaphore(GENERATE_CONCURRENCY)
+
+# Live snapshot of in-flight Trellis work. Process-global so the queue
+# view reflects the same scope as the semaphore. Keyed by (slot_id,
+# job_id) since node ids are unique within a slot but can collide
+# across slots. Lifecycle:
+#   waiting    — `generate_mesh` was called, awaiting `_inflight_sem`
+#   processing — semaphore acquired, Modal task_id assigned
+#   (removed)  — `generate_mesh` returned (success) or raised
+# Read via `queue_snapshot()`; the GET /trellis/queue endpoint hands
+# it to the client, which polls every ~1.5s. We expose this instead
+# of letting the client infer state from the streamed event log
+# because the event log replays historical submits on every SSE
+# subscribe, with no way to distinguish "still running" from "process
+# was killed before it could log .done" — so historical inference
+# leaks stale rows. Live state, by contrast, resets to empty on
+# process restart, which is exactly the truth.
+_QUEUE: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def queue_snapshot() -> list[dict[str, Any]]:
+    """Current in-flight + waiting Trellis jobs across all slots."""
+    out: list[dict[str, Any]] = []
+    for (slot_id, job_id), entry in _QUEUE.items():
+        out.append({
+            "slot_id": slot_id,
+            "job_id": job_id,
+            "state": entry["state"],
+            "since": entry["since"],
+            "task_id": entry.get("task_id"),
+        })
+    return out
+
+
+def _queue_set(slot_id: str | None, job_id: str, state: str, **extra: Any) -> None:
+    if slot_id is None:
+        return
+    key = (slot_id, job_id)
+    cur = _QUEUE.get(key)
+    _QUEUE[key] = {
+        "state": state,
+        "since": cur["since"] if cur and cur["state"] == state else time.time(),
+        **({k: v for k, v in (cur or {}).items() if k not in {"state", "since"}}),
+        **extra,
+    }
+
+
+def _queue_drop(slot_id: str | None, job_id: str) -> None:
+    if slot_id is None:
+        return
+    _QUEUE.pop((slot_id, job_id), None)
 
 
 def _retry_delay(attempt: int, err: BaseException) -> float:
@@ -235,40 +290,10 @@ async def _download_result(server_job_id: str) -> bytes:
     raise AssertionError("unreachable")
 
 
-async def _try_reattach(server_job_id: str) -> bytes | None:
-    """Probe a previously-submitted server job. Returns GLB bytes if
-    the job is done or finishes within the poll budget; None if the
-    job is gone (404) or surfaced a worker failure (caller treats both
-    as "fall through to a fresh submit"). Re-raises only on network
-    errors that should bubble up as retryable."""
-    http = await _get_http()
-    try:
-        resp = await http.get(
-            f"{TRELLIS_BASE_URL}/jobs/{server_job_id}", timeout=30.0,
-        )
-    except httpx.HTTPError:
-        raise
-    if resp.status_code == 404:
-        return None
-    resp.raise_for_status()
-    status = resp.json()
-    s = status.get("status")
-    if s == "failed":
-        return None
-    if s == "pending":
-        try:
-            await _poll_until_done(
-                server_job_id, timeout=POLL_TIMEOUT_SECONDS,
-            )
-        except (RuntimeError, TimeoutError):
-            return None
-    return await _download_result(server_job_id)
-
-
 def _input_hash(image_bytes: bytes) -> str:
-    """Stable hash of every input that would change the GLB. Same
-    payload + same settings → same hash → reattach to the prior
-    submit; any change invalidates and forces a fresh submit."""
+    """Stable hash of every input that would change the GLB. Logged on
+    `trellis.submit` for audit so two submits with identical inputs are
+    visibly equivalent."""
     return resumable.hash_input({
         "base_url": TRELLIS_BASE_URL,
         "resolution": TRELLIS_RESOLUTION,
@@ -285,7 +310,6 @@ async def generate_mesh(
     output_path: Path,
     job_id: str,
     image_mime: str = "image/png",
-    skip_reattach: bool = False,
 ) -> Path:
     """Run Trellis 2 on `image` and save the textured GLB to `output_path`.
 
@@ -293,15 +317,13 @@ async def generate_mesh(
     remote URL which we fetch to bytes first (the new API doesn't
     accept URLs server-side).
 
-    Restart-resilient: if `trellis.done` was previously logged for
-    `job_id` and the file at the recorded path still exists, the call
-    short-circuits. Otherwise we look up the most recent
-    `trellis.submit` matching `(job_id, input_hash)` and probe its
-    server-assigned job; on a hit we download the result, on a miss
-    we fall through to a fresh `POST /generate`.
-
-    `skip_reattach=True` bypasses the prior-submit probe and goes
-    straight to a fresh submit.
+    Restart-resilient on completed work: if `trellis.done` was
+    previously logged for `job_id` and the file at the recorded path
+    still exists, the call short-circuits. Otherwise we always issue
+    a fresh `POST /generate` — we don't probe prior Modal task_ids
+    because Modal GCs them on its own schedule, and the in-flight
+    semaphore (`_inflight_sem`) gates submits at Modal's container
+    count so Modal never queues on its side.
     """
     done = resumable.find_done(scope="trellis", job_id=job_id)
     if done is not None:
@@ -314,83 +336,58 @@ async def generate_mesh(
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    async with _generate_slot:
-        if not skip_reattach:
-            prior = resumable.find_prior_submit(
-                scope="trellis", job_id=job_id, input_hash=input_hash,
-            )
-            if prior is not None:
-                server_job_id = str(prior.get("task_id"))
-                ctx = {"scope": "trellis", "job_id": job_id, "task_id": server_job_id}
+    slot_id = logging.current_slot_id()
+    _queue_set(slot_id, job_id, "waiting")
+    try:
+        async with _inflight_sem:
+            # Hold `server_job_id` across outer retries. Once we have one,
+            # we NEVER call `_post_generate` again in this lifecycle —
+            # any retryable failure during poll or download re-enters the
+            # same Modal job instead of orphaning it and burning a fresh
+            # generation. (The previous design re-submitted on poll/download
+            # errors, leaving the original job to finish on Modal with no
+            # client able to download it.)
+            server_job_id: str | None = None
+            for attempt in range(MAX_ATTEMPTS):
                 try:
-                    recovered = await _try_reattach(server_job_id)
-                    if recovered is not None:
-                        output_path.write_bytes(recovered)
+                    if server_job_id is None:
+                        server_job_id = await _post_generate(image_bytes, image_mime)
+                        _queue_set(slot_id, job_id, "processing", task_id=server_job_id)
                         logging.log(
-                            "trellis.reattach", outcome="success", **ctx,
+                            "trellis.submit",
+                            job_id=job_id,
+                            task_id=server_job_id,
+                            input_hash=input_hash,
+                            attempt=attempt,
                         )
-                        resumable.log_done(
-                            scope="trellis", job_id=job_id,
-                            server_job_id=server_job_id,
-                            saved=str(output_path),
-                        )
-                        return output_path
-                    logging.log(
-                        "trellis.reattach",
-                        outcome="expired",
-                        reason="job_gone_or_failed",
-                        **ctx,
+                    await _poll_until_done(
+                        server_job_id, timeout=POLL_TIMEOUT_SECONDS,
                     )
-                except Exception as e:  # noqa: BLE001
-                    logging.log(
-                        "trellis.reattach",
-                        outcome="expired",
-                        reason=f"{type(e).__name__}: {str(e)[:200]}",
-                        **ctx,
+                    content = await _download_result(server_job_id)
+                    output_path.write_bytes(content)
+                    resumable.log_done(
+                        scope="trellis",
+                        job_id=job_id,
+                        server_job_id=server_job_id,
+                        saved=str(output_path),
                     )
-
-        # Hold `server_job_id` across outer retries. Once we have one,
-        # we NEVER call `_post_generate` again in this lifecycle —
-        # any retryable failure during poll or download re-enters the
-        # same Modal job instead of orphaning it and burning a fresh
-        # generation. (The previous design re-submitted on poll/download
-        # errors, leaving the original job to finish on Modal with no
-        # client able to download it.)
-        server_job_id: str | None = None
-        for attempt in range(MAX_ATTEMPTS):
-            try:
-                if server_job_id is None:
-                    server_job_id = await _post_generate(image_bytes, image_mime)
+                    return output_path
+                except RETRYABLE as e:
+                    if attempt == MAX_ATTEMPTS - 1:
+                        raise
+                    delay = _retry_delay(attempt, e)
                     logging.log(
-                        "trellis.submit",
+                        "trellis.retry",
                         job_id=job_id,
                         task_id=server_job_id,
-                        input_hash=input_hash,
                         attempt=attempt,
+                        delay_s=delay,
+                        reason=f"{type(e).__name__}: {str(e)[:200]}",
                     )
-                await _poll_until_done(
-                    server_job_id, timeout=POLL_TIMEOUT_SECONDS,
-                )
-                content = await _download_result(server_job_id)
-                output_path.write_bytes(content)
-                resumable.log_done(
-                    scope="trellis",
-                    job_id=job_id,
-                    server_job_id=server_job_id,
-                    saved=str(output_path),
-                )
-                return output_path
-            except RETRYABLE as e:
-                if attempt == MAX_ATTEMPTS - 1:
-                    raise
-                delay = _retry_delay(attempt, e)
-                logging.log(
-                    "trellis.retry",
-                    job_id=job_id,
-                    task_id=server_job_id,
-                    attempt=attempt,
-                    delay_s=delay,
-                    reason=f"{type(e).__name__}: {str(e)[:200]}",
-                )
-                await asyncio.sleep(delay)
-        raise AssertionError("unreachable")
+                    await asyncio.sleep(delay)
+            raise AssertionError("unreachable")
+    finally:
+        # Whether we succeeded, errored, or were cancelled, the job is no
+        # longer in flight. Drop unconditionally so a crashed task can't
+        # leak into the queue snapshot.
+        _queue_drop(slot_id, job_id)

@@ -167,8 +167,10 @@ def _normalize_schema(schema: object) -> object:
             out[k] = _normalize_schema(v)
         if out.get("type") == "object" and "properties" in out:
             out["additionalProperties"] = False
-            if _current_model and _current_model.startswith("google/"):
-                out["required"] = sorted(out["properties"].keys())
+            # OpenAI strict mode and Google both require every property to
+            # appear in `required`. Pydantic still validates the parsed
+            # response, so widening the wire schema is safe.
+            out["required"] = sorted(out["properties"].keys())
         if (
             _current_model and _current_model.startswith("google/")
             and out.get("type") == "integer"

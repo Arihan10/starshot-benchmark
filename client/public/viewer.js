@@ -82,15 +82,33 @@ const assetsBodyEl = document.getElementById("assets-body");
 const assetsCountEl = document.getElementById("assets-count");
 const assetsHeaderEl = document.getElementById("assets-header");
 const assetsToggleEl = document.getElementById("assets-toggle");
+const trellisQueueEl = document.getElementById("trellis-queue");
+const trellisQueueHeaderEl = document.getElementById("trellis-queue-header");
+const trellisQueueToggleEl = document.getElementById("trellis-queue-toggle");
+const trellisQueueCountsEl = document.getElementById("trellis-queue-counts");
+const tqProcessingEl = document.getElementById("tq-processing");
+const tqProcessingCapEl = document.getElementById("tq-processing-cap");
+const tqWaitingEl = document.getElementById("tq-waiting");
+const tqWaitingCapEl = document.getElementById("tq-waiting-cap");
+// Server-side `GENERATE_CONCURRENCY` (threed.py). Hard-coded mirror so the
+// "X/10" cap reads correctly; bump alongside the server constant if it
+// changes.
+const TRELLIS_CONCURRENCY_CAP = 10;
 const treeEl = document.getElementById("tree");
 const treeBodyEl = document.getElementById("tree-body");
 const treeDetailEl = document.getElementById("tree-detail");
 const treeHeaderEl = document.getElementById("tree-header");
 const treeToggleEl = document.getElementById("tree-toggle");
 const treeActiveEl = document.getElementById("tree-active");
+const treeExpandEl = document.getElementById("tree-expand");
 const treeSearchEl = document.getElementById("tree-search");
 const treeSearchClearEl = document.getElementById("tree-search-clear");
 const treeSearchCountEl = document.getElementById("tree-search-count");
+const treeModalEl = document.getElementById("tree-modal");
+const treeModalBodyEl = document.getElementById("tree-modal-body");
+const treeModalCloseEl = document.getElementById("tree-modal-close");
+const treeModalSearchEl = document.getElementById("tree-modal-search");
+const treeModalImageToggleEl = document.getElementById("tree-modal-image-toggle");
 
 // --- log panel --------------------------------------------------------------
 
@@ -195,6 +213,110 @@ const meshErrors = new Map();
 
 function clearMeshErrors() {
   meshErrors.clear();
+  retryingIds.clear();
+  runFinished = false;
+}
+
+// ids that the user clicked "retry" on whose follow-up image/model/mesh.error
+// hasn't landed yet. Drives button disabled state + label so the user can't
+// double-fire a retry mid-flight. Cleared on slot switch / reset / rewind
+// (same lifecycle as meshErrors). The set is also pruned when a retry-targeted
+// event arrives (mesh.error → retry available again; image/model → success).
+const retryingIds = new Set();
+
+// Flips to true on the live `run.done` for this slot. Lets post-run mesh
+// updates (retry success / retry failure) refresh the top status line so a
+// stale "run complete — N meshes failed" doesn't outlive the N it counted.
+// Reset on slot switch / reset / rewind / resume alongside the rest of the
+// per-slot state.
+let runFinished = false;
+
+function refreshPostRunStatus() {
+  if (!runFinished) return;
+  const inFlight = retryingIds.size;
+  if (inFlight > 0) {
+    const ids = [...retryingIds];
+    const head = ids.slice(0, 3).join(", ");
+    const suffix = ids.length > 3 ? `, +${ids.length - 3}` : "";
+    setStatus(`retrying ${inFlight} mesh${inFlight === 1 ? "" : "es"}: ${head}${suffix}`);
+    return;
+  }
+  if (meshErrors.size > 0) showRunCompleteWithErrors();
+  else setStatus("run complete");
+}
+
+async function retryMesh(id) {
+  if (currentSlotId === null) return;
+  if (retryingIds.has(id)) return;
+  retryingIds.add(id);
+  // Local optimistic state: clear the error so the asset/tree both reflect
+  // an in-flight retry. The server-side mesh.retry event will arrive too,
+  // but doing it locally first removes the visible-flicker between click
+  // and the SSE round-trip.
+  meshErrors.delete(id);
+  upsertAsset(id, { status: "pending", errorMessage: null });
+  if (treeNodes.has(id)) treeSetPhase(id, "generating_mesh");
+
+  // The slot's SSE may have closed itself on the prior run's run.done.
+  // Re-subscribe (without resetting highestEventIndex) so the snapshot
+  // is deduped and the retry's new events flow through the live queue.
+  if (currentSource === null) {
+    subscribe(slotEventsUrl(currentSlotId));
+  }
+
+  try {
+    const res = await fetch(
+      new URL(
+        `/slots/${encodeURIComponent(currentSlotId)}/retry-mesh/${encodeURIComponent(id)}`,
+        SERVER_URL,
+      ),
+      { method: "POST" },
+    );
+    if (!res.ok) {
+      const detail = await res.text();
+      const msg = `retry failed: HTTP ${res.status} ${detail}`;
+      retryingIds.delete(id);
+      meshErrors.set(id, msg);
+      treeSetPhase(id, "error");
+      upsertAsset(id, { status: "error", errorMessage: msg });
+    }
+  } catch (e) {
+    retryingIds.delete(id);
+    const msg = `retry failed: ${e.message}`;
+    meshErrors.set(id, msg);
+    treeSetPhase(id, "error");
+    upsertAsset(id, { status: "error", errorMessage: msg });
+  }
+}
+
+// Render-or-update a retry button inside `container`. `status` is the asset
+// status; the button is shown only for `error` (retry) or while a prior retry
+// is in flight (greyed out so the user can't double-click). `cls` lets the
+// caller scope the CSS (`asset-retry` vs `detail-retry`).
+function syncRetryButton(container, id, status, cls) {
+  let btn = container.querySelector(`.${cls}`);
+  const retrying = retryingIds.has(id);
+  const visible = status === "error" || retrying;
+  if (!visible) {
+    if (btn) btn.remove();
+    return;
+  }
+  if (!btn) {
+    btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = cls;
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      retryMesh(id);
+    });
+    container.appendChild(btn);
+  }
+  btn.classList.toggle("retrying", retrying);
+  btn.disabled = retrying;
+  btn.textContent = retrying ? "retrying…" : "retry mesh";
+  btn.title = retrying
+    ? "Re-running banana + Trellis for this mesh"
+    : "Re-run banana + Trellis for this mesh (fresh API calls)";
 }
 
 function showRunCompleteWithErrors() {
@@ -228,6 +350,7 @@ function upsertAsset(id, patch) {
   assets.set(id, { ...cur, ...patch });
   renderAsset(id);
   assetsCountEl.textContent = `(${assets.size})`;
+  if (id === selectedBboxId) renderTreeDetail();
 }
 
 function renderAsset(id) {
@@ -263,6 +386,7 @@ function renderAsset(id) {
   statusTag.textContent = status === "error" && a.errorMessage
     ? `error: ${a.errorMessage}`
     : status;
+  syncRetryButton(card.querySelector(".asset-body"), id, status, "asset-retry");
 
   const link = card.querySelector(".asset-thumb-link");
   const thumb = card.querySelector(".asset-thumb");
@@ -295,6 +419,131 @@ assetsHeaderEl.addEventListener("click", () => {
   const collapsed = assetsEl.classList.toggle("collapsed");
   assetsToggleEl.textContent = collapsed ? "▸" : "▾";
 });
+
+// --- trellis queue panel ----------------------------------------------------
+//
+// Authoritative state comes from the server via GET /trellis/queue. We do
+// NOT derive queue state from streamed events: SSE replays the full event
+// log on every subscribe, and any historical `trellis.submit` whose run
+// was killed before logging `trellis.done` would leak as a stale
+// "processing" row forever. Polling the live snapshot sidesteps that
+// entirely — a server restart resets the queue to empty (correct
+// behaviour), and a single poll trumps any amount of historical noise.
+//
+// The semaphore is process-global across all 7 benchmark slots, so the
+// "cap" we display is the global concurrency. Rows from slots other than
+// the one currently being viewed are shown with a slot tag and aren't
+// clickable (their node ids aren't in this slot's tree).
+
+// Latest snapshot from /trellis/queue: { cap, entries: [{slot_id, job_id, state, since, task_id?}, ...] }
+// `since` is the server's epoch-seconds timestamp from when the job entered
+// the queue (set on the server side, persists across client reconnects).
+// Render uses it directly so the elapsed timer reflects true wall-clock
+// age, not "time since this browser first noticed the row".
+let trellisQueueSnapshot = { cap: 10, entries: [] };
+
+function fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  return `${Math.floor(m / 60)}h ${m % 60}m`;
+}
+
+async function pollTrellisQueue() {
+  try {
+    const resp = await fetch(`${SERVER_URL}/trellis/queue`, { cache: "no-store" });
+    if (!resp.ok) return;
+    trellisQueueSnapshot = await resp.json();
+    renderTrellisQueue();
+  } catch {
+    // Server transiently down / network blip — keep the last good snapshot
+    // on screen. Next tick will refresh.
+  }
+}
+
+function renderTrellisQueue() {
+  const now = Date.now();
+  const cap = trellisQueueSnapshot.cap ?? TRELLIS_CONCURRENCY_CAP;
+  const entries = trellisQueueSnapshot.entries ?? [];
+  const processing = [];
+  const waiting = [];
+  for (const e of entries) {
+    // Server `since` is epoch seconds (time.time() at the moment the job
+    // was admitted to the queue). Convert to ms once so each row carries
+    // a value comparable to Date.now().
+    const sinceMs = (e.since ?? 0) * 1000;
+    const row = { ...e, sinceMs };
+    if (e.state === "processing") processing.push(row);
+    else waiting.push(row);
+  }
+  processing.sort((a, b) => a.sinceMs - b.sinceMs);
+  waiting.sort((a, b) => a.sinceMs - b.sinceMs);
+
+  trellisQueueCountsEl.textContent =
+    `${processing.length} processing · ${waiting.length} waiting`;
+  tqProcessingCapEl.textContent = `(${processing.length}/${cap})`;
+  tqWaitingCapEl.textContent = `(${waiting.length})`;
+
+  function renderList(parent, rows, kind) {
+    parent.textContent = "";
+    if (rows.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "tq-empty";
+      empty.textContent = kind === "processing" ? "(idle)" : "(none)";
+      parent.appendChild(empty);
+      return;
+    }
+    for (const row of rows) {
+      const el = document.createElement("div");
+      el.className = `tq-row ${kind}`;
+      const inThisSlot = row.slot_id === currentSlotId;
+      if (inThisSlot) {
+        el.addEventListener("click", () => selectTreeNode(row.job_id));
+      } else {
+        el.classList.add("other-slot");
+        el.title = `from slot ${row.slot_id} — switch slots to inspect`;
+      }
+      const dot = document.createElement("span");
+      dot.className = "tq-dot";
+      el.appendChild(dot);
+      const idEl = document.createElement("span");
+      idEl.className = "tq-id";
+      idEl.textContent = row.job_id;
+      el.appendChild(idEl);
+      if (!inThisSlot) {
+        const slotTag = document.createElement("span");
+        slotTag.className = "tq-slot-tag";
+        slotTag.textContent = row.slot_id;
+        el.appendChild(slotTag);
+      }
+      const elapsed = document.createElement("span");
+      elapsed.className = "tq-elapsed";
+      elapsed.textContent = fmtElapsed(Math.max(0, now - row.sinceMs));
+      el.appendChild(elapsed);
+      parent.appendChild(el);
+    }
+  }
+  renderList(tqProcessingEl, processing, "processing");
+  renderList(tqWaitingEl, waiting, "waiting");
+}
+
+// Poll every 1.5s. Cheap (an in-memory dict snapshot on the server) and
+// keeps the UI within a heartbeat of reality without flooding.
+setInterval(pollTrellisQueue, 1500);
+// Re-render once a second between polls so elapsed timers tick smoothly.
+setInterval(() => {
+  if ((trellisQueueSnapshot.entries ?? []).length > 0) renderTrellisQueue();
+}, 1000);
+// Kick an initial fetch so the panel populates without waiting a full tick.
+pollTrellisQueue();
+
+trellisQueueHeaderEl.addEventListener("click", () => {
+  const collapsed = trellisQueueEl.classList.toggle("collapsed");
+  trellisQueueToggleEl.textContent = collapsed ? "▸" : "▾";
+});
+
+renderTrellisQueue();
 
 // --- tree view --------------------------------------------------------------
 
@@ -367,6 +616,7 @@ function treeSetPhase(id, phase) {
   }
   renderTree();
   if (id === selectedBboxId) renderTreeDetail();
+  if (treeModalOpen) renderTreeModal();
 }
 
 function treeClear() {
@@ -378,6 +628,7 @@ function treeClear() {
   hiddenIds.clear();
   treeBodyEl.innerHTML = "";
   treeActiveEl.textContent = "";
+  destroyDetailPreview();
   treeDetailEl.innerHTML = "";
   treeEl.classList.remove("detail-open");
 }
@@ -1435,20 +1686,200 @@ function ancestorChain(id) {
   return chain;
 }
 
+// Persistent preview state for the detail panel. We hold onto the container
+// and live WebGL viewer across `renderTreeDetail` calls so frequent re-renders
+// (phase ticks, sibling bbox updates) don't reset the user's camera or thrash
+// the GLB load. Rebuilt only when the selected id or its underlying urls
+// change; destroyed on deselect / slot switch.
+let detailPreviewState = null; // { id, modelUrl, imageUrl, container, viewer }
+
+function destroyDetailPreview() {
+  if (detailPreviewState?.viewer) {
+    try { detailPreviewState.viewer.dispose(); } catch {}
+  }
+  if (detailPreviewState?.container?.parentNode) {
+    detailPreviewState.container.parentNode.removeChild(detailPreviewState.container);
+  }
+  detailPreviewState = null;
+}
+
+// Stand-alone GLB viewer inside the detail panel. Lives in its own scene/
+// camera/renderer (separate from the main sandbox) so spinning the preview
+// doesn't move the main camera. Returns a dispose() handle.
+function mountMiniViewer(container, modelUrl) {
+  const scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x0e1014);
+  const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
+  camera.position.set(2, 2, 3);
+  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setPixelRatio(window.devicePixelRatio || 1);
+  renderer.outputColorSpace = THREE.SRGBColorSpace;
+  renderer.domElement.className = "detail-mini-canvas";
+  container.appendChild(renderer.domElement);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.1;
+  controls.enablePan = true;
+  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+  const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+  dir.position.set(5, 8, 6);
+  scene.add(dir);
+
+  function resize() {
+    const w = container.clientWidth || 280;
+    const h = Math.max(180, Math.round(w * 0.7));
+    renderer.setSize(w, h, false);
+    renderer.domElement.style.width = w + "px";
+    renderer.domElement.style.height = h + "px";
+    camera.aspect = w / h;
+    camera.updateProjectionMatrix();
+  }
+  resize();
+  const ro = new ResizeObserver(resize);
+  ro.observe(container);
+
+  let disposed = false;
+  let model = null;
+  const localLoader = new GLTFLoader();
+  localLoader.loadAsync(new URL(modelUrl, SERVER_URL).toString())
+    .then((gltf) => {
+      if (disposed) return;
+      model = gltf.scene;
+      model.traverse((c) => {
+        if (c.isMesh && c.material) {
+          const mats = Array.isArray(c.material) ? c.material : [c.material];
+          for (const m of mats) m.side = THREE.DoubleSide;
+        }
+      });
+      scene.add(model);
+      const box = new THREE.Box3().setFromObject(model);
+      if (!box.isEmpty()) {
+        const center = new THREE.Vector3();
+        box.getCenter(center);
+        const size = new THREE.Vector3();
+        box.getSize(size);
+        const maxDim = Math.max(size.x, size.y, size.z) || 1;
+        const dist = maxDim * 2.2;
+        camera.position.copy(center).add(new THREE.Vector3(dist, dist * 0.7, dist));
+        camera.near = Math.max(maxDim / 1000, 0.001);
+        camera.far = Math.max(maxDim * 100, 100);
+        camera.updateProjectionMatrix();
+        controls.target.copy(center);
+        controls.update();
+      }
+    })
+    .catch(() => { /* keep the empty viewer; user already sees an error in the asset row */ });
+
+  let rafId = 0;
+  function tick() {
+    if (disposed) return;
+    controls.update();
+    renderer.render(scene, camera);
+    rafId = requestAnimationFrame(tick);
+  }
+  tick();
+
+  return {
+    dispose() {
+      disposed = true;
+      cancelAnimationFrame(rafId);
+      try { ro.disconnect(); } catch {}
+      try { controls.dispose(); } catch {}
+      if (model) {
+        model.traverse((n) => {
+          if (n.isMesh) {
+            n.geometry?.dispose?.();
+            const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
+            for (const m of mats) m.dispose?.();
+          }
+        });
+      }
+      try { renderer.dispose(); } catch {}
+      if (renderer.domElement.parentNode) {
+        renderer.domElement.parentNode.removeChild(renderer.domElement);
+      }
+    },
+  };
+}
+
+// Builds (or returns the cached) preview container for `node`. Returns null
+// when nothing has been generated yet so the caller can skip the section.
+function ensureDetailPreview(node) {
+  const a = assets.get(node.id);
+  const imageUrl = a?.imageUrl ?? null;
+  const modelUrl = a?.modelUrl ?? null;
+  const modelLoaded = !!modelUrl && a?.status === "loaded";
+  if (!imageUrl && !modelLoaded) {
+    destroyDetailPreview();
+    return null;
+  }
+  if (
+    detailPreviewState
+    && detailPreviewState.id === node.id
+    && detailPreviewState.imageUrl === imageUrl
+    && detailPreviewState.modelUrl === (modelLoaded ? modelUrl : null)
+  ) {
+    return detailPreviewState.container;
+  }
+  destroyDetailPreview();
+
+  const wrap = document.createElement("div");
+  wrap.className = "detail-section detail-preview";
+  const label = document.createElement("div");
+  label.className = "label";
+  label.textContent = "preview";
+  wrap.appendChild(label);
+
+  if (imageUrl) {
+    const absImg = new URL(imageUrl, SERVER_URL).toString();
+    const link = document.createElement("a");
+    link.className = "detail-preview-image-link";
+    link.href = absImg;
+    link.target = "_blank";
+    link.rel = "noopener";
+    const img = document.createElement("img");
+    img.className = "detail-preview-image";
+    img.loading = "lazy";
+    img.alt = node.id;
+    img.src = absImg;
+    link.appendChild(img);
+    wrap.appendChild(link);
+  }
+
+  let viewer = null;
+  if (modelLoaded) {
+    const viewerWrap = document.createElement("div");
+    viewerWrap.className = "detail-preview-viewer";
+    wrap.appendChild(viewerWrap);
+    viewer = mountMiniViewer(viewerWrap, modelUrl);
+  }
+
+  detailPreviewState = { id: node.id, imageUrl, modelUrl: modelLoaded ? modelUrl : null, container: wrap, viewer };
+  return wrap;
+}
+
 function renderTreeDetail() {
   const id = selectedBboxId;
   if (id === null) {
+    destroyDetailPreview();
     treeEl.classList.remove("detail-open");
     treeDetailEl.innerHTML = "";
     return;
   }
   const node = treeNodes.get(id);
   if (!node) {
+    destroyDetailPreview();
     treeEl.classList.remove("detail-open");
     treeDetailEl.innerHTML = "";
     return;
   }
   treeEl.classList.add("detail-open");
+  // Detach the live preview before wiping the panel so its WebGL canvas and
+  // OrbitControls listeners survive the rebuild and we don't lose the user's
+  // camera position on every event tick.
+  if (detailPreviewState?.container?.parentNode === treeDetailEl) {
+    treeDetailEl.removeChild(detailPreviewState.container);
+  }
   treeDetailEl.textContent = "";
 
   // Back-to-tree button — also clears the selection so the bbox highlight
@@ -1459,6 +1890,15 @@ function renderTreeDetail() {
   back.textContent = "← back to tree";
   back.addEventListener("click", () => selectTreeNode(id)); // toggle off
   treeDetailEl.appendChild(back);
+  // Quick jump into the full-tree modal — keeps the user's current selection
+  // so they land on the same card in the larger view.
+  const openFull = document.createElement("button");
+  openFull.type = "button";
+  openFull.className = "detail-open-full";
+  openFull.textContent = "open full tree ⛶";
+  openFull.title = "Open every node's prompts, plans, and bboxes in a modal";
+  openFull.addEventListener("click", openTreeModal);
+  treeDetailEl.appendChild(openFull);
 
   // Header row: kind tag + id.
   const idRow = document.createElement("div");
@@ -1473,27 +1913,52 @@ function renderTreeDetail() {
   idRow.appendChild(idEl);
   treeDetailEl.appendChild(idRow);
 
-  // Breadcrumb of ancestors — each clickable to jump selection up the tree.
+  // Hierarchy — vertical, indented list of ancestors with the current node
+  // at the bottom. Each ancestor row is clickable to jump selection. Shows
+  // the [kind] tag and a short prompt preview so the user can see *what*
+  // each parent is, not just its id.
   const chain = ancestorChain(id);
   if (chain.length > 0) {
-    const path = document.createElement("div");
-    path.className = "detail-path";
-    for (let i = 0; i < chain.length; i++) {
-      const a = document.createElement("a");
-      a.textContent = chain[i].id;
-      const targetId = chain[i].id;
-      a.addEventListener("click", () => selectTreeNode(targetId));
-      path.appendChild(a);
-      const sep = document.createElement("span");
-      sep.className = "sep";
-      sep.textContent = "›";
-      path.appendChild(sep);
+    const hier = document.createElement("div");
+    hier.className = "detail-hierarchy";
+    function hierRow(n, depth, isCurrent) {
+      const row = document.createElement(isCurrent ? "div" : "a");
+      row.className = `detail-hier-row${isCurrent ? " current" : ""}`;
+      row.style.paddingLeft = `${depth * 12}px`;
+      if (!isCurrent) {
+        row.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          selectTreeNode(n.id);
+        });
+      }
+      if (depth > 0) {
+        const branch = document.createElement("span");
+        branch.className = "detail-hier-branch";
+        branch.textContent = "└";
+        row.appendChild(branch);
+      }
+      const kindEl = document.createElement("span");
+      kindEl.className = `detail-hier-kind ${n.kind ?? "zone"}`;
+      kindEl.textContent = `[${n.kind ?? "zone"}]`;
+      row.appendChild(kindEl);
+      const idEl2 = document.createElement("span");
+      idEl2.className = `detail-hier-id ${n.kind ?? "zone"}`;
+      idEl2.textContent = n.id;
+      row.appendChild(idEl2);
+      if (n.prompt) {
+        const promptEl2 = document.createElement("span");
+        promptEl2.className = "detail-hier-prompt";
+        promptEl2.textContent = truncate(n.prompt, 50);
+        promptEl2.title = n.prompt;
+        row.appendChild(promptEl2);
+      }
+      return row;
     }
-    const here = document.createElement("span");
-    here.textContent = node.id;
-    here.style.color = "#8a8f99";
-    path.appendChild(here);
-    treeDetailEl.appendChild(path);
+    for (let i = 0; i < chain.length; i++) {
+      hier.appendChild(hierRow(chain[i], i, false));
+    }
+    hier.appendChild(hierRow(node, chain.length, true));
+    treeDetailEl.appendChild(hier);
   }
 
   // Meta row: phase / bbox / proxy shape.
@@ -1548,6 +2013,26 @@ function renderTreeDetail() {
     section("image prompt", node.imagePrompt);
   }
 
+  // Retry control — only meaningful for non-zone meshes that errored (or are
+  // mid-retry from this client). Zones never produce meshes, so a retry would
+  // have nothing to regenerate.
+  if (node.kind !== "zone") {
+    const a = assets.get(id);
+    const status = a ? assetStatus(a) : "pending";
+    if (status === "error" || retryingIds.has(id)) {
+      const wrap = document.createElement("div");
+      wrap.className = "detail-section";
+      syncRetryButton(wrap, id, status, "detail-retry");
+      treeDetailEl.appendChild(wrap);
+    }
+  }
+
+  // Generated image + interactive mini 3D viewer when this node has assets.
+  // Built (or reused) by ensureDetailPreview so the WebGL context isn't torn
+  // down on incidental re-renders.
+  const preview = ensureDetailPreview(node);
+  if (preview) treeDetailEl.appendChild(preview);
+
   // Children list — for zones with sub-zones, lets the user drill into a
   // child without leaving the detail view.
   const childIds = treeChildren.get(id) ?? [];
@@ -1573,6 +2058,269 @@ function renderTreeDetail() {
 
   treeDetailEl.scrollTop = 0;
 }
+
+// --- full-tree modal -------------------------------------------------------
+// Renders every node as a "detail card" in a single scrollable column,
+// indented by depth, so the user can read all prompts/plans/bboxes
+// side-by-side without clicking through nodes one at a time. Auto-refreshes
+// while open so streaming runs update in place. Keep this rendering cheap
+// (no live WebGL viewers per node — just static thumbnails) so big trees
+// stay responsive.
+
+let treeModalOpen = false;
+let treeModalQuery = "";
+let treeModalImagesOn = true;
+
+function openTreeModal() {
+  treeModalOpen = true;
+  treeModalEl.classList.add("open");
+  renderTreeModal();
+  // Defer focus so the modal is in layout first.
+  setTimeout(() => treeModalSearchEl?.focus(), 0);
+}
+
+function closeTreeModal() {
+  treeModalOpen = false;
+  treeModalEl.classList.remove("open");
+}
+
+function treeOrderedDepthFirst() {
+  // DFS from the root, yielding [node, depth] in render order. Falls back to
+  // insertion-ordered nodes when there is no root yet (early in a run).
+  const out = [];
+  if (treeRootId === null) {
+    const sorted = [...treeNodes.values()].sort((a, b) => a.order - b.order);
+    for (const n of sorted) out.push([n, 0]);
+    return out;
+  }
+  const stack = [[treeRootId, 0]];
+  while (stack.length) {
+    const [id, depth] = stack.pop();
+    const node = treeNodes.get(id);
+    if (!node) continue;
+    out.push([node, depth]);
+    const kids = treeChildren.get(id) ?? [];
+    for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth + 1]);
+  }
+  return out;
+}
+
+function renderTreeModalCard(node, depth) {
+  const card = document.createElement("div");
+  const kind = node.kind ?? "zone";
+  card.className = `tm-card kind-${kind}`;
+  card.dataset.id = node.id;
+  card.style.marginLeft = `${Math.min(depth, 8) * 18}px`;
+  if (node.id === selectedBboxId) card.classList.add("selected");
+
+  // Head row: depth, kind, id (clicks select), parent crumb, phase
+  const head = document.createElement("div");
+  head.className = "tm-card-head";
+  if (depth > 0) {
+    const d = document.createElement("span");
+    d.className = "tm-depth";
+    d.textContent = `d${depth}`;
+    head.appendChild(d);
+  }
+  const kindEl = document.createElement("span");
+  kindEl.className = "tm-kind";
+  kindEl.textContent = `[${kind}]`;
+  head.appendChild(kindEl);
+  const idEl = document.createElement("span");
+  idEl.className = `tm-id ${kind}`;
+  idEl.textContent = node.id;
+  idEl.title = "Click to select in scene";
+  idEl.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (selectedBboxId !== node.id) selectTreeNode(node.id);
+    // Keep the modal open — user is doing observability, not navigating away.
+    renderTreeModal();
+  });
+  head.appendChild(idEl);
+  if (node.parentId) {
+    const parent = treeNodes.get(node.parentId);
+    if (parent) {
+      const p = document.createElement("span");
+      p.className = "tm-parent";
+      p.textContent = `↑ ${parent.id}`;
+      p.title = `Jump to parent: ${parent.id}`;
+      p.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        const target = treeModalBodyEl.querySelector(`.tm-card[data-id="${CSS.escape(parent.id)}"]`);
+        if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+        if (selectedBboxId !== parent.id) selectTreeNode(parent.id);
+        renderTreeModal();
+      });
+      head.appendChild(p);
+    }
+  }
+  const phaseEl = document.createElement("span");
+  phaseEl.className = `tm-phase phase-${node.phase ?? "pending"}`;
+  phaseEl.textContent = node.phase ?? "pending";
+  head.appendChild(phaseEl);
+  card.appendChild(head);
+
+  // Meta line: bbox + proxy shape, all on one row so the eye can scan a
+  // column of cards quickly.
+  if (Array.isArray(node.origin) || Array.isArray(node.dimensions) || node.proxyShape) {
+    const meta = document.createElement("div");
+    meta.className = "tm-meta";
+    function metaCell(label, value) {
+      const s = document.createElement("span");
+      const l = document.createElement("span"); l.textContent = `${label} `; s.appendChild(l);
+      const b = document.createElement("b"); b.textContent = value; s.appendChild(b);
+      return s;
+    }
+    if (Array.isArray(node.origin)) meta.appendChild(metaCell("origin:", `[${fmtMeters(node.origin)}]`));
+    if (Array.isArray(node.dimensions)) meta.appendChild(metaCell("size:", `[${fmtMeters(node.dimensions)}] m`));
+    if (node.proxyShape) meta.appendChild(metaCell("proxy:", node.proxyShape));
+    card.appendChild(meta);
+  }
+
+  // Body: sections on the left, optional thumbnail on the right. Wrapping
+  // it in a grid keeps the thumbnail aligned to the top regardless of
+  // section height.
+  const body = document.createElement("div");
+  body.className = "tm-card-body";
+  const sections = document.createElement("div");
+  sections.className = "tm-sections";
+  body.appendChild(sections);
+
+  function addSection(label, text) {
+    const wrap = document.createElement("div");
+    wrap.className = "tm-section";
+    const lab = document.createElement("div");
+    lab.className = "tm-section-label";
+    lab.textContent = label;
+    wrap.appendChild(lab);
+    const b = document.createElement("div");
+    b.className = "tm-section-body";
+    if (text) {
+      b.textContent = text;
+    } else {
+      b.classList.add("empty");
+      b.textContent = "(not yet authored)";
+    }
+    wrap.appendChild(b);
+    sections.appendChild(wrap);
+  }
+
+  addSection("seed prompt", node.prompt);
+  if (kind === "zone" || node.plan) addSection("zone plan", node.plan);
+  if (kind !== "zone") addSection("image prompt", node.imagePrompt);
+
+  // Thumbnail: image only, never a live WebGL viewer (rendering N viewers
+  // would torpedo the page for big trees). Click jumps to the asset.
+  const a = assets.get(node.id);
+  if (treeModalImagesOn && a?.imageUrl) {
+    card.classList.add("has-thumb");
+    const img = document.createElement("img");
+    img.className = "tm-thumb";
+    img.loading = "lazy";
+    img.alt = node.id;
+    img.src = new URL(a.imageUrl, SERVER_URL).toString();
+    img.title = "Click to select in scene";
+    img.addEventListener("click", () => {
+      if (selectedBboxId !== node.id) selectTreeNode(node.id);
+      renderTreeModal();
+    });
+    body.appendChild(img);
+  }
+  card.appendChild(body);
+
+  // Children quick-nav: id chips so the user can hop down without finding
+  // the row visually. Useful for fan-out zones with 20+ kids.
+  const childIds = treeChildren.get(node.id) ?? [];
+  if (childIds.length > 0) {
+    const cwrap = document.createElement("div");
+    cwrap.className = "tm-children-block";
+    const lab = document.createElement("span");
+    lab.textContent = `children (${childIds.length}):`;
+    cwrap.appendChild(lab);
+    for (const cid of childIds) {
+      const link = document.createElement("a");
+      link.textContent = cid;
+      link.addEventListener("click", () => {
+        const target = treeModalBodyEl.querySelector(`.tm-card[data-id="${CSS.escape(cid)}"]`);
+        if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
+        if (selectedBboxId !== cid) selectTreeNode(cid);
+        renderTreeModal();
+      });
+      cwrap.appendChild(link);
+    }
+    card.appendChild(cwrap);
+  }
+
+  return card;
+}
+
+function renderTreeModal() {
+  if (!treeModalOpen) return;
+  treeModalBodyEl.innerHTML = "";
+  const ordered = treeOrderedDepthFirst();
+  if (ordered.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "tm-empty";
+    empty.textContent = "no nodes yet — start a run to populate the tree";
+    treeModalBodyEl.appendChild(empty);
+    return;
+  }
+  const q = treeModalQuery.trim().toLowerCase();
+  const hits = q
+    ? new Set(ordered
+        .filter(([n]) => n.id.toLowerCase().includes(q)
+          || (n.prompt ?? "").toLowerCase().includes(q)
+          || (n.plan ?? "").toLowerCase().includes(q)
+          || (n.imagePrompt ?? "").toLowerCase().includes(q))
+        .map(([n]) => n.id))
+    : null;
+
+  for (const [node, depth] of ordered) {
+    const card = renderTreeModalCard(node, depth);
+    if (hits) {
+      if (hits.has(node.id)) card.classList.add("hit");
+      else card.classList.add("dimmed");
+    }
+    treeModalBodyEl.appendChild(card);
+  }
+
+  // Scroll the selected node into view on first open so the user lands at
+  // their context, not at the root.
+  if (selectedBboxId) {
+    const sel = treeModalBodyEl.querySelector(`.tm-card[data-id="${CSS.escape(selectedBboxId)}"]`);
+    if (sel) sel.scrollIntoView({ block: "center" });
+  }
+}
+
+treeExpandEl?.addEventListener("click", (ev) => {
+  ev.stopPropagation(); // don't toggle the tree-header collapse
+  openTreeModal();
+});
+treeModalCloseEl?.addEventListener("click", closeTreeModal);
+treeModalEl?.addEventListener("click", (ev) => {
+  // Click on the backdrop (not the panel) closes — matches the replay modal.
+  if (ev.target === treeModalEl) closeTreeModal();
+});
+treeModalSearchEl?.addEventListener("input", () => {
+  treeModalQuery = treeModalSearchEl.value;
+  renderTreeModal();
+});
+treeModalImageToggleEl?.addEventListener("change", () => {
+  treeModalImagesOn = treeModalImageToggleEl.checked;
+  renderTreeModal();
+});
+window.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && treeModalOpen) {
+    // Don't steal Escape from the search input — let it clear there first.
+    if (document.activeElement === treeModalSearchEl && treeModalSearchEl.value) {
+      treeModalSearchEl.value = "";
+      treeModalQuery = "";
+      renderTreeModal();
+      return;
+    }
+    closeTreeModal();
+  }
+});
 
 function positionTooltip(clientX, clientY, id) {
   const node = treeNodes.get(id);
@@ -1766,17 +2514,20 @@ function dispatch(event) {
       setStatus(`run :: ${event.model}`);
       break;
     case "run.done":
+      runFinished = true;
       if (meshErrors.size > 0) showRunCompleteWithErrors();
       else setStatus("run complete");
       if (currentSource) { currentSource.close(); currentSource = null; }
       refreshSlots();
       break;
     case "run.error":
+      runFinished = true;
       setStatus(`error: ${event.message}`, "err");
       if (currentSource) { currentSource.close(); currentSource = null; }
       refreshSlots();
       break;
     case "run.paused":
+      runFinished = true;
       setStatus("paused");
       if (currentSource) { currentSource.close(); currentSource = null; }
       refreshSlots();
@@ -1785,9 +2536,22 @@ function dispatch(event) {
       // Surface the failure: track for the run.done summary, paint the
       // tree node + asset card as errored so users see it without grepping
       // the log panel.
+      retryingIds.delete(event.id);
       meshErrors.set(event.id, event.message ?? "unknown error");
       treeSetPhase(event.id, "error");
       upsertAsset(event.id, { status: "error", errorMessage: event.message });
+      refreshPostRunStatus();
+      break;
+    case "mesh.retry":
+      // Server-side retry kickoff. The user may have triggered it from
+      // *this* client (retryingIds already set) or another tab; either
+      // way, clear the prior error state so the asset/tree both flip back
+      // to in-flight and the retry button greys out.
+      retryingIds.add(event.id);
+      meshErrors.delete(event.id);
+      upsertAsset(event.id, { status: "pending", errorMessage: null });
+      if (treeNodes.has(event.id)) treeSetPhase(event.id, "generating_mesh");
+      refreshPostRunStatus();
       break;
     case "bbox":
       loadBbox(event);
@@ -1801,6 +2565,7 @@ function dispatch(event) {
       });
       renderTree();
       if (event.id === selectedBboxId) renderTreeDetail();
+      if (treeModalOpen) renderTreeModal();
       break;
     case "divider.decompose":
       // Pre-declare children so the tree shows them (in pending state) before
@@ -1809,6 +2574,7 @@ function dispatch(event) {
         treeUpsert(c.id, { parentId: event.node, prompt: c.prompt, kind: "zone" });
       }
       renderTree();
+      if (treeModalOpen) renderTreeModal();
       break;
     case "divider.zone_plan":
       // Stash the authored zone plan on the node so the tooltip can surface
@@ -1817,6 +2583,7 @@ function dispatch(event) {
       if (event.node && typeof event.plan === "string") {
         treeUpsert(event.node, { plan: event.plan });
         if (event.node === selectedBboxId) renderTreeDetail();
+        if (treeModalOpen) renderTreeModal();
       }
       break;
     case "step":
@@ -1834,10 +2601,23 @@ function dispatch(event) {
         treeUpsert(event.id, { imagePrompt: event.prompt });
         if (event.id === selectedBboxId) renderTreeDetail();
       }
+      if (treeModalOpen) renderTreeModal();
       break;
     case "model":
       loadModel(event);
       treeSetPhase(event.id, "done");
+      retryingIds.delete(event.id);
+      // A `model` event for this id is proof the mesh exists now, so any
+      // prior `mesh.error` for the same id is stale. Without this clear,
+      // snapshot replay (where a past error then a later success both
+      // appear in the recorded log) leaves `meshErrors` permanently
+      // overcounted — the tree shows `done` but the run-complete summary
+      // still reads "N meshes failed". Equally applies to in-pipeline
+      // recoveries that ship a `model` without a preceding `mesh.retry`.
+      meshErrors.delete(event.id);
+      if (event.id === selectedBboxId) renderTreeDetail();
+      if (treeModalOpen) renderTreeModal();
+      refreshPostRunStatus();
       break;
     // Everything else is already shown as a log line above.
   }
@@ -2471,6 +3251,11 @@ function dispatchForReplay(event) {
       treeSetPhase(event.id, "error");
       upsertAsset(event.id, { status: "error", errorMessage: event.message });
       break;
+    case "mesh.retry":
+      meshErrors.delete(event.id);
+      upsertAsset(event.id, { status: "pending", errorMessage: null });
+      if (treeNodes.has(event.id)) treeSetPhase(event.id, "generating_mesh");
+      break;
     case "bbox":
       loadBbox(event);
       treeUpsert(event.id, {
@@ -2502,7 +3287,11 @@ function dispatchForReplay(event) {
         treeUpsert(event.id, { imagePrompt: event.prompt });
       }
       break;
-    case "model": loadModel(event); treeSetPhase(event.id, "done"); break;
+    case "model":
+      loadModel(event);
+      treeSetPhase(event.id, "done");
+      meshErrors.delete(event.id);
+      break;
   }
 }
 

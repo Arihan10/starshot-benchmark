@@ -57,24 +57,41 @@ async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
     return out.bbox
 
 
-def _prior_zones(all_nodes: list[Node]) -> list[tuple[str, str, str, str]]:
-    """Every non-root zone already declared AND planned. Used as lateral
-    scene context for the decomposition step so siblings/cousins can
-    inform a zone's structure and relationships."""
-    out: list[tuple[str, str, str, str]] = []
+def _prior_zones(
+    all_nodes: list[Node],
+) -> list[tuple[str, str, str | None, str, BoundingBox]]:
+    """Every non-root zone already declared. Used as lateral scene
+    context for the decomposition step so siblings/cousins can inform
+    a zone's structure and relationships.
+
+    We include zones whose plan hasn't been authored yet — depth-first
+    traversal plans-then-decomposes one branch at a time, so the rest
+    of the parent's siblings (declared in the same batch, recursed
+    into later) sit here as `plan=None`. Their bboxes are the
+    load-bearing piece: a cousin zone the decomposer is about to plan
+    around needs to know where its already-placed neighbors sit, even
+    if those neighbors' detailed plans don't exist yet.
+    """
+    out: list[tuple[str, str, str | None, str, BoundingBox]] = []
     for n in all_nodes:
         if n.mesh_url is not None:
             continue
-        if n.parent_id is None or n.plan is None:
+        if n.parent_id is None:
             continue
-        out.append((n.id, n.prompt, n.plan, n.parent_id))
+        out.append((n.id, n.prompt, n.plan, n.parent_id, n.bbox))
     return out
 
 
-def _ancestors(node: Node, all_nodes: list[Node]) -> list[tuple[str, str, str]]:
+def _ancestors(
+    node: Node, all_nodes: list[Node],
+) -> list[tuple[str, str, str, BoundingBox]]:
     """Walk parent_id pointers up to the root, then return root-first →
-    parent-of-`node`, excluding `node` itself. Each tuple is (id, prompt,
-    plan). Empty for the root."""
+    parent-of-`node`, excluding `node` itself. Each tuple is (id,
+    prompt, plan, bbox). Empty for the root.
+
+    Ancestors are always planned by the time we recurse into a child
+    (the depth-first walk plans before decomposing), so `plan` is
+    never None here."""
     by_id = {n.id: n for n in all_nodes}
     chain: list[Node] = []
     parent_id = node.parent_id
@@ -83,10 +100,10 @@ def _ancestors(node: Node, all_nodes: list[Node]) -> list[tuple[str, str, str]]:
         chain.append(parent)
         parent_id = parent.parent_id
     chain.reverse()
-    out: list[tuple[str, str, str]] = []
+    out: list[tuple[str, str, str, BoundingBox]] = []
     for a in chain:
         assert a.plan is not None, f"ancestor {a.id} must be planned"
-        out.append((a.id, a.prompt, a.plan))
+        out.append((a.id, a.prompt, a.plan, a.bbox))
     return out
 
 
@@ -103,7 +120,7 @@ async def _plan_zone(
     *,
     zone_id: str,
     zone_prompt: str,
-    ancestors: list[tuple[str, str, str]],
+    ancestors: list[tuple[str, str, str, BoundingBox]],
     objects: list[tuple[str, str, str | None]],
 ) -> ZonePlanOutput:
     """Author the high-level plan for a zone and decide whether it is atomic.
