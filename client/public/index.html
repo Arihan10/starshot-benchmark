@@ -1414,6 +1414,261 @@
                 color: #e6e6e6;
                 border-color: #4a8fd8;
             }
+            /* --- observability modal additions --- */
+            .tm-obs-breadcrumb {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: baseline;
+                gap: 4px;
+                padding: 4px 2px 8px;
+                font-size: 11px;
+                color: #7a8190;
+                border-bottom: 1px dashed #232631;
+                margin-bottom: 4px;
+            }
+            .tm-obs-crumb-label { color: #5a5e68; margin-right: 4px; }
+            .tm-obs-crumb {
+                cursor: pointer;
+                padding: 1px 6px;
+                border-radius: 3px;
+                background: #14161b;
+                border: 1px solid #232631;
+                text-decoration: none;
+                color: #b8bcc4;
+                font-weight: 600;
+            }
+            .tm-obs-crumb.zone   { color: #e0c271; }
+            .tm-obs-crumb.object { color: #c586d1; }
+            .tm-obs-crumb.frame  { color: #7fb3d5; }
+            .tm-obs-crumb:hover { border-color: #4a8fd8; }
+            .tm-obs-crumb.current {
+                outline: 1px solid #4a8fd8;
+                background: #1c2230;
+            }
+            .tm-obs-crumb-sep {
+                color: #3a3d45;
+                font-weight: 600;
+                padding: 0 1px;
+            }
+            .tm-obs-heading {
+                display: flex;
+                align-items: baseline;
+                gap: 10px;
+                padding: 12px 2px 4px;
+                border-top: 1px solid #232631;
+            }
+            .tm-obs-heading:first-of-type { border-top: none; padding-top: 4px; }
+            .tm-obs-heading-label {
+                color: #9ad4ff;
+                font-size: 11px;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                font-weight: 600;
+            }
+            .tm-obs-heading-count {
+                color: #5a5e68;
+                font-size: 10px;
+                font-variant-numeric: tabular-nums;
+            }
+            .tm-obs-heading-hint {
+                color: #5a5e68;
+                font-size: 10px;
+                font-style: italic;
+            }
+            .tm-obs-card {
+                padding: 0;
+                gap: 0;
+            }
+            .tm-obs-card.role-focus {
+                background: #1a2230;
+                outline: 1px solid #4a8fd8;
+                box-shadow: 0 0 0 1px rgba(74, 143, 216, 0.12);
+            }
+            .tm-obs-card.role-ancestor { opacity: 0.92; }
+            .tm-obs-card.role-descendant { opacity: 0.88; }
+            .tm-obs-details > summary {
+                list-style: none;
+                cursor: pointer;
+                padding: 8px 12px;
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                flex-wrap: wrap;
+            }
+            .tm-obs-details > summary::-webkit-details-marker { display: none; }
+            .tm-obs-details > summary::before {
+                content: "▸";
+                color: #5a5e68;
+                font-size: 10px;
+                transition: transform 0.1s;
+                transform-origin: center;
+                display: inline-block;
+                width: 8px;
+            }
+            .tm-obs-details[open] > summary::before { transform: rotate(90deg); }
+            .tm-obs-role {
+                font-size: 9px;
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                color: #5a5e68;
+                background: #0e1014;
+                border: 1px solid #232631;
+                border-radius: 2px;
+                padding: 1px 5px;
+            }
+            .tm-obs-role.role-focus {
+                color: #9ad4ff;
+                border-color: #4a8fd8;
+            }
+            .tm-obs-callcount {
+                font-size: 10px;
+                color: #5a5e68;
+                margin-left: auto;
+                font-variant-numeric: tabular-nums;
+            }
+            .tm-obs-teaser {
+                color: #8a8f99;
+                font-size: 11px;
+                font-style: italic;
+                flex-basis: 100%;
+                margin-left: 18px;
+            }
+            .tm-obs-body {
+                padding: 0 12px 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 10px;
+            }
+            .tm-llm-calls {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+            }
+            .tm-llm-empty {
+                color: #5a5e68;
+                font-size: 11px;
+                font-style: italic;
+                padding: 4px 0;
+            }
+            .tm-llm-call {
+                border: 1px solid #232631;
+                border-radius: 3px;
+                background: #0f1116;
+            }
+            .tm-llm-call.cached { border-style: dashed; }
+            .tm-llm-call > summary {
+                list-style: none;
+                cursor: pointer;
+                padding: 6px 10px;
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+            }
+            .tm-llm-call > summary::-webkit-details-marker { display: none; }
+            .tm-llm-call > summary::before {
+                content: "▸";
+                color: #5a5e68;
+                font-size: 9px;
+                display: inline-block;
+                width: 8px;
+            }
+            .tm-llm-call[open] > summary::before { content: "▾"; }
+            .tm-llm-step {
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 11px;
+                color: #9ad4ff;
+                font-weight: 600;
+            }
+            .tm-llm-model {
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 10px;
+                color: #7a8190;
+            }
+            .tm-llm-tag {
+                font-size: 9px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                padding: 1px 5px;
+                border-radius: 2px;
+                background: #1a1c22;
+                border: 1px solid #2a2d35;
+                color: #b8bcc4;
+            }
+            .tm-llm-tag.cached {
+                color: #c0a070;
+                border-color: #4a3a20;
+                background: #1f1a12;
+            }
+            .tm-llm-section {
+                padding: 6px 10px 8px;
+                border-top: 1px solid #1a1c22;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            .tm-llm-section-head {
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+            }
+            .tm-llm-section-label {
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                color: #7a8190;
+            }
+            .tm-llm-subblock {
+                border: 1px dashed #232631;
+                border-radius: 3px;
+                padding: 4px 6px;
+                background: #0c0d10;
+            }
+            .tm-llm-subblock > summary {
+                cursor: pointer;
+                color: #8a8f99;
+                font-size: 10px;
+                padding: 1px 0;
+                list-style: none;
+            }
+            .tm-llm-subblock > summary::-webkit-details-marker { display: none; }
+            .tm-llm-subblock > summary::before {
+                content: "▸ ";
+                color: #5a5e68;
+                font-size: 9px;
+            }
+            .tm-llm-subblock[open] > summary::before { content: "▾ "; }
+            .tm-pre {
+                margin: 4px 0 0;
+                padding: 8px 10px;
+                background: #0a0b0e;
+                border: 1px solid #1a1c22;
+                border-radius: 3px;
+                color: #d6d9df;
+                font-size: 11px;
+                line-height: 1.45;
+                white-space: pre-wrap;
+                word-wrap: break-word;
+                overflow: auto;
+            }
+            .tm-pre.mono {
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+            }
+            .tm-copy {
+                align-self: flex-start;
+                margin-top: 4px;
+                background: #14161b;
+                border: 1px solid #232631;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 10px;
+                padding: 2px 7px;
+                border-radius: 2px;
+                cursor: pointer;
+            }
+            .tm-copy:hover {
+                color: #e6e6e6;
+                border-color: #4a8fd8;
+            }
             #zoom-controls {
                 position: fixed;
                 right: 12px;
@@ -1468,7 +1723,7 @@
             <div id="tree-header">
                 <span>tree</span>
                 <span id="tree-active"></span>
-                <button id="tree-expand" type="button" title="Open the full scene tree in a modal — every node's prompt, plan, bbox, and preview side-by-side">⛶</button>
+                <button id="tree-expand" type="button" title="Open pipeline observability — every LLM call (system / input / output / reasoning) for the focused node, plus its ancestors and descendants">⛶</button>
                 <span id="tree-toggle">▾</span>
             </div>
             <div id="tree-search-row">
@@ -1545,10 +1800,9 @@
         <div id="tree-modal">
             <div id="tree-modal-panel">
                 <header>
-                    <h2>scene tree — full prompts &amp; plans</h2>
+                    <h2>pipeline observability</h2>
                     <div id="tree-modal-controls">
-                        <input id="tree-modal-search" type="text" placeholder="filter by id or prompt" autocomplete="off" spellcheck="false" />
-                        <label id="tree-modal-image-toggle-label" title="Show generated image thumbnails inline"><input id="tree-modal-image-toggle" type="checkbox" checked /> images</label>
+                        <input id="tree-modal-search" type="text" placeholder="filter by id, step, or prompt text" autocomplete="off" spellcheck="false" />
                         <button id="tree-modal-close" type="button" title="Close (Esc)">×</button>
                     </div>
                 </header>

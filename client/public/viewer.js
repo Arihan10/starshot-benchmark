@@ -108,7 +108,6 @@ const treeModalEl = document.getElementById("tree-modal");
 const treeModalBodyEl = document.getElementById("tree-modal-body");
 const treeModalCloseEl = document.getElementById("tree-modal-close");
 const treeModalSearchEl = document.getElementById("tree-modal-search");
-const treeModalImageToggleEl = document.getElementById("tree-modal-image-toggle");
 
 // --- log panel --------------------------------------------------------------
 
@@ -558,6 +557,13 @@ renderTrellisQueue();
 //                  `image` event (objects/frames once they've been generated)
 const treeNodes = new Map(); // id -> { id, parentId, prompt, kind, phase, order, plan?, imagePrompt? }
 const treeChildren = new Map(); // parentId -> [childIds] in insertion order
+// LLM call traces per node. Populated from `llm.call` events as they stream;
+// every entry is one structured-output call (system + user + output +
+// reasoning) tagged with the pipeline step that issued it. The observability
+// modal reads this to show every prompt that shaped each node, side-by-side
+// with the node's ancestors and descendants. Insertion order is preserved so
+// the calls render in the order the pipeline made them.
+const nodeLlmCalls = new Map(); // id -> [{step, system, user, output, reasoning, model, cached, eventIndex}]
 let treeRootId = null;
 let treeActiveId = null;
 let treeOrderCounter = 0;
@@ -616,12 +622,32 @@ function treeSetPhase(id, phase) {
   }
   renderTree();
   if (id === selectedBboxId) renderTreeDetail();
-  if (treeModalOpen) renderTreeModal();
+}
+
+function recordLlmCall(event) {
+  // Bucket the call under its `node` id. The server stamps that field on
+  // every `llm.call`; if it's missing (older log line, or a call site we
+  // haven't tagged) bucket it under "_unattributed" so the modal can still
+  // surface it under the root view rather than dropping it on the floor.
+  const id = event.node || "_unattributed";
+  const list = nodeLlmCalls.get(id) ?? [];
+  list.push({
+    step: event.step || "(unknown step)",
+    system: event.system ?? "",
+    user: event.user ?? "",
+    output: event.output ?? null,
+    reasoning: event.reasoning ?? "",
+    model: event.model ?? "",
+    cached: !!event.cached,
+    eventIndex: typeof event.index === "number" ? event.index : null,
+  });
+  nodeLlmCalls.set(id, list);
 }
 
 function treeClear() {
   treeNodes.clear();
   treeChildren.clear();
+  nodeLlmCalls.clear();
   treeRootId = null;
   treeActiveId = null;
   treeOrderCounter = 0;
@@ -2059,23 +2085,49 @@ function renderTreeDetail() {
   treeDetailEl.scrollTop = 0;
 }
 
-// --- full-tree modal -------------------------------------------------------
-// Renders every node as a "detail card" in a single scrollable column,
-// indented by depth, so the user can read all prompts/plans/bboxes
-// side-by-side without clicking through nodes one at a time. Auto-refreshes
-// while open so streaming runs update in place. Keep this rendering cheap
-// (no live WebGL viewers per node — just static thumbnails) so big trees
-// stay responsive.
+// --- pipeline observability modal ------------------------------------------
+// Focused on ONE node at a time. The modal shows that node's full LLM call
+// trace (system instruction + user input + output + reasoning for every
+// pipeline step that touched it) alongside the same trace for every
+// ancestor and every descendant. This is the "why did the LLM author this?"
+// view — not a clone of the sidebar tree.
+//
+// The focus follows `selectedBboxId`. Clicking any id inside the modal
+// re-selects + re-focuses. With nothing selected we focus the root so the
+// modal still shows something useful when the user just wants to read the
+// scene plan.
 
 let treeModalOpen = false;
 let treeModalQuery = "";
-let treeModalImagesOn = true;
+// `treeModalFocusId` lets the modal hold its own focus without clobbering
+// the scene selection. Pinned only via the in-modal id-click; otherwise we
+// follow `selectedBboxId` (or root as a final fallback).
+let treeModalFocusId = null;
+// User-controlled expand/collapse overrides per node, so re-renders during
+// a streaming run don't snap their `<details>` shut. Default per-node state
+// derives from role (ancestor/focus/descendant); this map only stores the
+// deltas the user toggled.
+const treeModalNodeOpen = new Map(); // id -> bool
+
+function modalFocusId() {
+  if (treeModalFocusId && treeNodes.has(treeModalFocusId)) {
+    return treeModalFocusId;
+  }
+  if (selectedBboxId && treeNodes.has(selectedBboxId)) {
+    return selectedBboxId;
+  }
+  return treeRootId;
+}
 
 function openTreeModal() {
   treeModalOpen = true;
+  // Snap focus to the current selection on open, so the modal opens on
+  // the node the user was looking at — not whatever they last pinned in
+  // a previous modal session.
+  treeModalFocusId = selectedBboxId ?? treeRootId;
+  treeModalNodeOpen.clear();
   treeModalEl.classList.add("open");
   renderTreeModal();
-  // Defer focus so the modal is in layout first.
   setTimeout(() => treeModalSearchEl?.focus(), 0);
 }
 
@@ -2084,109 +2136,239 @@ function closeTreeModal() {
   treeModalEl.classList.remove("open");
 }
 
-function treeOrderedDepthFirst() {
-  // DFS from the root, yielding [node, depth] in render order. Falls back to
-  // insertion-ordered nodes when there is no root yet (early in a run).
+function focusModalOn(id) {
+  if (!treeNodes.has(id)) return;
+  treeModalFocusId = id;
+  // Auto-open the new focus so the user immediately sees its calls.
+  treeModalNodeOpen.set(id, true);
+  if (selectedBboxId !== id) selectTreeNode(id);
+  renderTreeModal();
+  // Scroll the focused card into view so the layout shift doesn't strand
+  // the user at the top of the modal.
+  requestAnimationFrame(() => {
+    const target = treeModalBodyEl.querySelector(
+      `.tm-card[data-id="${CSS.escape(id)}"]`,
+    );
+    if (target) target.scrollIntoView({ block: "center" });
+  });
+}
+
+function descendantsDFS(id) {
+  // (node, depth-from-focus) pairs, focus excluded. Used to render the
+  // descendant section below the focused card.
   const out = [];
-  if (treeRootId === null) {
-    const sorted = [...treeNodes.values()].sort((a, b) => a.order - b.order);
-    for (const n of sorted) out.push([n, 0]);
-    return out;
-  }
-  const stack = [[treeRootId, 0]];
+  const start = treeChildren.get(id) ?? [];
+  const stack = start.map((cid) => [cid, 1]);
   while (stack.length) {
-    const [id, depth] = stack.pop();
-    const node = treeNodes.get(id);
+    const [cid, depth] = stack.shift();
+    const node = treeNodes.get(cid);
     if (!node) continue;
     out.push([node, depth]);
-    const kids = treeChildren.get(id) ?? [];
-    for (let i = kids.length - 1; i >= 0; i--) stack.push([kids[i], depth + 1]);
+    const kids = treeChildren.get(cid) ?? [];
+    for (const k of kids) stack.push([k, depth + 1]);
   }
   return out;
 }
 
-function renderTreeModalCard(node, depth) {
+// `<pre>` block that holds an LLM prompt verbatim. Wrapped, scrollable when
+// large, capped in height so the modal layout doesn't get blown out by a
+// 4k-line user prompt — the user can scroll inside if they want more.
+function preBlock(text, { mono = true, cap = "320px" } = {}) {
+  const pre = document.createElement("pre");
+  pre.className = mono ? "tm-pre mono" : "tm-pre";
+  pre.style.maxHeight = cap;
+  pre.textContent = text ?? "";
+  return pre;
+}
+
+function copyButton(text, label = "copy") {
+  const b = document.createElement("button");
+  b.type = "button";
+  b.className = "tm-copy";
+  b.textContent = label;
+  b.title = "copy to clipboard";
+  b.addEventListener("click", async (ev) => {
+    ev.stopPropagation();
+    try {
+      await navigator.clipboard.writeText(text ?? "");
+      b.textContent = "copied";
+      setTimeout(() => { b.textContent = label; }, 900);
+    } catch {
+      b.textContent = "copy failed";
+      setTimeout(() => { b.textContent = label; }, 1200);
+    }
+  });
+  return b;
+}
+
+function llmCallBlock(call, { defaultOpen }) {
+  const det = document.createElement("details");
+  det.className = "tm-llm-call";
+  if (call.cached) det.classList.add("cached");
+  det.open = defaultOpen;
+
+  const sum = document.createElement("summary");
+  sum.className = "tm-llm-summary";
+  const stepEl = document.createElement("span");
+  stepEl.className = "tm-llm-step";
+  stepEl.textContent = call.step;
+  sum.appendChild(stepEl);
+  if (call.model) {
+    const modelEl = document.createElement("span");
+    modelEl.className = "tm-llm-model";
+    modelEl.textContent = call.model;
+    sum.appendChild(modelEl);
+  }
+  if (call.cached) {
+    const tag = document.createElement("span");
+    tag.className = "tm-llm-tag cached";
+    tag.textContent = "cached";
+    tag.title = "Output reused from a previous identical (model, system, user) call in this run.";
+    sum.appendChild(tag);
+  }
+  det.appendChild(sum);
+
+  function section(label, body, extra) {
+    const wrap = document.createElement("div");
+    wrap.className = "tm-llm-section";
+    const head = document.createElement("div");
+    head.className = "tm-llm-section-head";
+    const lab = document.createElement("span");
+    lab.className = "tm-llm-section-label";
+    lab.textContent = label;
+    head.appendChild(lab);
+    if (extra) head.appendChild(extra);
+    wrap.appendChild(head);
+    wrap.appendChild(body);
+    return wrap;
+  }
+
+  // System instruction — the prompt that defines the LLM's role for this
+  // step. Usually long-ish boilerplate; collapsed by default so the user
+  // sees the dynamic input + output first.
+  const sysWrap = document.createElement("details");
+  sysWrap.className = "tm-llm-subblock";
+  const sysSum = document.createElement("summary");
+  sysSum.textContent = `system instruction (${call.system.length.toLocaleString()} chars)`;
+  sysWrap.appendChild(sysSum);
+  sysWrap.appendChild(preBlock(call.system, { cap: "260px" }));
+  sysWrap.appendChild(copyButton(call.system, "copy system"));
+  det.appendChild(section("system", sysWrap));
+
+  // User input — the actual rendered context for this call. This is the
+  // most-changing part call-to-call so it's open by default inside the
+  // already-open detail block.
+  const userWrap = document.createElement("div");
+  userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
+  userWrap.appendChild(copyButton(call.user, "copy input"));
+  det.appendChild(section(
+    `input (${call.user.length.toLocaleString()} chars)`,
+    userWrap,
+  ));
+
+  // Output — pretty-print JSON. We render with json formatting because the
+  // structured-output schema is what the rest of the pipeline consumes.
+  const outText = call.output === null
+    ? "(no output)"
+    : (() => { try { return JSON.stringify(call.output, null, 2); } catch { return String(call.output); } })();
+  const outWrap = document.createElement("div");
+  outWrap.appendChild(preBlock(outText, { cap: "360px" }));
+  outWrap.appendChild(copyButton(outText, "copy output"));
+  det.appendChild(section("output", outWrap));
+
+  // Reasoning is optional (only present when the provider returns CoT).
+  // Collapsed by default — it's noisy.
+  if (call.reasoning) {
+    const reasWrap = document.createElement("details");
+    reasWrap.className = "tm-llm-subblock";
+    const reasSum = document.createElement("summary");
+    reasSum.textContent = `reasoning (${call.reasoning.length.toLocaleString()} chars)`;
+    reasWrap.appendChild(reasSum);
+    reasWrap.appendChild(preBlock(call.reasoning, { cap: "260px" }));
+    det.appendChild(section("reasoning", reasWrap));
+  }
+
+  return det;
+}
+
+function renderObsCard(node, { role, depth }) {
+  // role: "ancestor" | "focus" | "descendant"
+  // depth is only used to indent descendants visually.
   const card = document.createElement("div");
   const kind = node.kind ?? "zone";
-  card.className = `tm-card kind-${kind}`;
+  card.className = `tm-card tm-obs-card kind-${kind} role-${role}`;
   card.dataset.id = node.id;
-  card.style.marginLeft = `${Math.min(depth, 8) * 18}px`;
-  if (node.id === selectedBboxId) card.classList.add("selected");
-
-  // Head row: depth, kind, id (clicks select), parent crumb, phase
-  const head = document.createElement("div");
-  head.className = "tm-card-head";
-  if (depth > 0) {
-    const d = document.createElement("span");
-    d.className = "tm-depth";
-    d.textContent = `d${depth}`;
-    head.appendChild(d);
+  if (role === "focus") card.classList.add("selected");
+  if (role === "descendant" && depth > 0) {
+    card.style.marginLeft = `${Math.min(depth, 6) * 16}px`;
   }
+
+  // Decide default open/closed. The focused node opens by default; ancestors
+  // and descendants stay closed so the focus stays visually dominant.
+  // User-toggled state takes precedence.
+  const userPref = treeModalNodeOpen.get(node.id);
+  const detailsOpen = userPref !== undefined ? userPref : (role === "focus");
+
+  const det = document.createElement("details");
+  det.className = "tm-obs-details";
+  det.open = detailsOpen;
+  det.addEventListener("toggle", () => {
+    treeModalNodeOpen.set(node.id, det.open);
+  });
+
+  const sum = document.createElement("summary");
+  sum.className = "tm-obs-summary";
+
+  const roleEl = document.createElement("span");
+  roleEl.className = `tm-obs-role role-${role}`;
+  roleEl.textContent = role === "focus" ? "focus" :
+    role === "ancestor" ? "ancestor" : `child ·d${depth}`;
+  sum.appendChild(roleEl);
+
   const kindEl = document.createElement("span");
   kindEl.className = "tm-kind";
   kindEl.textContent = `[${kind}]`;
-  head.appendChild(kindEl);
+  sum.appendChild(kindEl);
+
   const idEl = document.createElement("span");
   idEl.className = `tm-id ${kind}`;
   idEl.textContent = node.id;
-  idEl.title = "Click to select in scene";
+  idEl.title = "Click to focus this node";
   idEl.addEventListener("click", (ev) => {
     ev.stopPropagation();
-    if (selectedBboxId !== node.id) selectTreeNode(node.id);
-    // Keep the modal open — user is doing observability, not navigating away.
-    renderTreeModal();
+    ev.preventDefault();
+    focusModalOn(node.id);
   });
-  head.appendChild(idEl);
-  if (node.parentId) {
-    const parent = treeNodes.get(node.parentId);
-    if (parent) {
-      const p = document.createElement("span");
-      p.className = "tm-parent";
-      p.textContent = `↑ ${parent.id}`;
-      p.title = `Jump to parent: ${parent.id}`;
-      p.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        const target = treeModalBodyEl.querySelector(`.tm-card[data-id="${CSS.escape(parent.id)}"]`);
-        if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
-        if (selectedBboxId !== parent.id) selectTreeNode(parent.id);
-        renderTreeModal();
-      });
-      head.appendChild(p);
-    }
-  }
+  sum.appendChild(idEl);
+
   const phaseEl = document.createElement("span");
   phaseEl.className = `tm-phase phase-${node.phase ?? "pending"}`;
   phaseEl.textContent = node.phase ?? "pending";
-  head.appendChild(phaseEl);
-  card.appendChild(head);
+  sum.appendChild(phaseEl);
 
-  // Meta line: bbox + proxy shape, all on one row so the eye can scan a
-  // column of cards quickly.
-  if (Array.isArray(node.origin) || Array.isArray(node.dimensions) || node.proxyShape) {
-    const meta = document.createElement("div");
-    meta.className = "tm-meta";
-    function metaCell(label, value) {
-      const s = document.createElement("span");
-      const l = document.createElement("span"); l.textContent = `${label} `; s.appendChild(l);
-      const b = document.createElement("b"); b.textContent = value; s.appendChild(b);
-      return s;
-    }
-    if (Array.isArray(node.origin)) meta.appendChild(metaCell("origin:", `[${fmtMeters(node.origin)}]`));
-    if (Array.isArray(node.dimensions)) meta.appendChild(metaCell("size:", `[${fmtMeters(node.dimensions)}] m`));
-    if (node.proxyShape) meta.appendChild(metaCell("proxy:", node.proxyShape));
-    card.appendChild(meta);
+  const calls = nodeLlmCalls.get(node.id) ?? [];
+  const callsTag = document.createElement("span");
+  callsTag.className = "tm-obs-callcount";
+  callsTag.textContent = calls.length === 1 ? "1 llm call" : `${calls.length} llm calls`;
+  sum.appendChild(callsTag);
+
+  if (node.prompt) {
+    const promptTeaser = document.createElement("span");
+    promptTeaser.className = "tm-obs-teaser";
+    promptTeaser.textContent = truncate(node.prompt, 80);
+    promptTeaser.title = node.prompt;
+    sum.appendChild(promptTeaser);
   }
 
-  // Body: sections on the left, optional thumbnail on the right. Wrapping
-  // it in a grid keeps the thumbnail aligned to the top regardless of
-  // section height.
-  const body = document.createElement("div");
-  body.className = "tm-card-body";
-  const sections = document.createElement("div");
-  sections.className = "tm-sections";
-  body.appendChild(sections);
+  det.appendChild(sum);
 
-  function addSection(label, text) {
+  // Body: the per-node prompts captured by the pipeline (seed/plan/image)
+  // plus every llm.call recorded against this node.
+  const body = document.createElement("div");
+  body.className = "tm-obs-body";
+
+  function addTextSection(label, text) {
+    if (!text) return;
     const wrap = document.createElement("div");
     wrap.className = "tm-section";
     const lab = document.createElement("div");
@@ -2195,100 +2377,194 @@ function renderTreeModalCard(node, depth) {
     wrap.appendChild(lab);
     const b = document.createElement("div");
     b.className = "tm-section-body";
-    if (text) {
-      b.textContent = text;
-    } else {
-      b.classList.add("empty");
-      b.textContent = "(not yet authored)";
-    }
+    b.textContent = text;
     wrap.appendChild(b);
-    sections.appendChild(wrap);
+    body.appendChild(wrap);
   }
 
-  addSection("seed prompt", node.prompt);
-  if (kind === "zone" || node.plan) addSection("zone plan", node.plan);
-  if (kind !== "zone") addSection("image prompt", node.imagePrompt);
+  addTextSection("seed prompt", node.prompt);
+  if (kind === "zone" && node.plan) addTextSection("zone plan", node.plan);
+  if (kind !== "zone" && node.imagePrompt) addTextSection("image prompt", node.imagePrompt);
 
-  // Thumbnail: image only, never a live WebGL viewer (rendering N viewers
-  // would torpedo the page for big trees). Click jumps to the asset.
-  const a = assets.get(node.id);
-  if (treeModalImagesOn && a?.imageUrl) {
-    card.classList.add("has-thumb");
-    const img = document.createElement("img");
-    img.className = "tm-thumb";
-    img.loading = "lazy";
-    img.alt = node.id;
-    img.src = new URL(a.imageUrl, SERVER_URL).toString();
-    img.title = "Click to select in scene";
-    img.addEventListener("click", () => {
-      if (selectedBboxId !== node.id) selectTreeNode(node.id);
-      renderTreeModal();
-    });
-    body.appendChild(img);
-  }
-  card.appendChild(body);
-
-  // Children quick-nav: id chips so the user can hop down without finding
-  // the row visually. Useful for fan-out zones with 20+ kids.
-  const childIds = treeChildren.get(node.id) ?? [];
-  if (childIds.length > 0) {
-    const cwrap = document.createElement("div");
-    cwrap.className = "tm-children-block";
-    const lab = document.createElement("span");
-    lab.textContent = `children (${childIds.length}):`;
-    cwrap.appendChild(lab);
-    for (const cid of childIds) {
-      const link = document.createElement("a");
-      link.textContent = cid;
-      link.addEventListener("click", () => {
-        const target = treeModalBodyEl.querySelector(`.tm-card[data-id="${CSS.escape(cid)}"]`);
-        if (target) target.scrollIntoView({ behavior: "smooth", block: "center" });
-        if (selectedBboxId !== cid) selectTreeNode(cid);
-        renderTreeModal();
-      });
-      cwrap.appendChild(link);
+  // LLM call traces — the heart of the modal.
+  const callsWrap = document.createElement("div");
+  callsWrap.className = "tm-llm-calls";
+  if (calls.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "tm-llm-empty";
+    empty.textContent = "(no LLM calls captured yet for this node)";
+    callsWrap.appendChild(empty);
+  } else {
+    // Focus card opens every call; ancestors/descendants leave them collapsed.
+    const callDefaultOpen = role === "focus";
+    for (const call of calls) {
+      callsWrap.appendChild(llmCallBlock(call, { defaultOpen: callDefaultOpen }));
     }
-    card.appendChild(cwrap);
   }
+  body.appendChild(callsWrap);
 
+  det.appendChild(body);
+  card.appendChild(det);
   return card;
+}
+
+function renderModalSectionHeading(label, count, hint) {
+  const h = document.createElement("div");
+  h.className = "tm-obs-heading";
+  const lab = document.createElement("span");
+  lab.className = "tm-obs-heading-label";
+  lab.textContent = label;
+  h.appendChild(lab);
+  const c = document.createElement("span");
+  c.className = "tm-obs-heading-count";
+  c.textContent = count === 1 ? "1 node" : `${count} nodes`;
+  h.appendChild(c);
+  if (hint) {
+    const hi = document.createElement("span");
+    hi.className = "tm-obs-heading-hint";
+    hi.textContent = hint;
+    h.appendChild(hi);
+  }
+  return h;
+}
+
+function callMatchesQuery(call, q) {
+  return call.step.toLowerCase().includes(q)
+    || call.system.toLowerCase().includes(q)
+    || call.user.toLowerCase().includes(q)
+    || (call.model || "").toLowerCase().includes(q)
+    || JSON.stringify(call.output ?? "").toLowerCase().includes(q);
+}
+
+function nodeMatchesQuery(node, q) {
+  if (node.id.toLowerCase().includes(q)) return true;
+  if ((node.prompt ?? "").toLowerCase().includes(q)) return true;
+  if ((node.plan ?? "").toLowerCase().includes(q)) return true;
+  if ((node.imagePrompt ?? "").toLowerCase().includes(q)) return true;
+  const calls = nodeLlmCalls.get(node.id) ?? [];
+  return calls.some((c) => callMatchesQuery(c, q));
 }
 
 function renderTreeModal() {
   if (!treeModalOpen) return;
+  // Re-renders happen on every streamed event while the modal is open. Plain
+  // `scrollTop` preservation isn't enough — when new LLM calls land on the
+  // focused card (or any card above the user's viewport), absolute pixel
+  // positions shift downward and the user ends up looking at a different
+  // card. Anchor the restore to whichever card is currently closest to the
+  // top of the viewport, then snap that same card back to the same offset
+  // after the rebuild.
+  const bodyRectTop = treeModalBodyEl.getBoundingClientRect().top;
+  let anchorId = null;
+  let anchorOffset = 0;
+  for (const card of treeModalBodyEl.querySelectorAll(".tm-card")) {
+    const r = card.getBoundingClientRect();
+    const offset = r.top - bodyRectTop;
+    // Pick the first card whose top is at or below the viewport top — that's
+    // the one the user is reading. Bail once we pass it; cards lower down
+    // can't be a better anchor.
+    if (offset >= -2) {
+      anchorId = card.dataset.id;
+      anchorOffset = offset;
+      break;
+    }
+  }
   treeModalBodyEl.innerHTML = "";
-  const ordered = treeOrderedDepthFirst();
-  if (ordered.length === 0) {
+
+  if (treeNodes.size === 0) {
     const empty = document.createElement("div");
     empty.className = "tm-empty";
-    empty.textContent = "no nodes yet — start a run to populate the tree";
+    empty.textContent = "no nodes yet — start a run to populate observability";
     treeModalBodyEl.appendChild(empty);
     return;
   }
-  const q = treeModalQuery.trim().toLowerCase();
-  const hits = q
-    ? new Set(ordered
-        .filter(([n]) => n.id.toLowerCase().includes(q)
-          || (n.prompt ?? "").toLowerCase().includes(q)
-          || (n.plan ?? "").toLowerCase().includes(q)
-          || (n.imagePrompt ?? "").toLowerCase().includes(q))
-        .map(([n]) => n.id))
-    : null;
 
-  for (const [node, depth] of ordered) {
-    const card = renderTreeModalCard(node, depth);
-    if (hits) {
-      if (hits.has(node.id)) card.classList.add("hit");
-      else card.classList.add("dimmed");
+  const focusId = modalFocusId();
+  if (!focusId) {
+    const empty = document.createElement("div");
+    empty.className = "tm-empty";
+    empty.textContent = "no focused node — click a node in the sidebar tree";
+    treeModalBodyEl.appendChild(empty);
+    return;
+  }
+  const focusNode = treeNodes.get(focusId);
+  if (!focusNode) return;
+
+  const ancestors = ancestorChain(focusId); // root → ... → parent
+  const descendants = descendantsDFS(focusId); // [[node, depth], ...]
+
+  const q = treeModalQuery.trim().toLowerCase();
+
+  // Header strip: shows the active focus path so the user has a breadcrumb
+  // back to the root even when the ancestors section is collapsed.
+  const breadcrumb = document.createElement("div");
+  breadcrumb.className = "tm-obs-breadcrumb";
+  const crumbLabel = document.createElement("span");
+  crumbLabel.className = "tm-obs-crumb-label";
+  crumbLabel.textContent = "path:";
+  breadcrumb.appendChild(crumbLabel);
+  const chain = [...ancestors, focusNode];
+  chain.forEach((n, i) => {
+    if (i > 0) {
+      const sep = document.createElement("span");
+      sep.className = "tm-obs-crumb-sep";
+      sep.textContent = "›";
+      breadcrumb.appendChild(sep);
     }
-    treeModalBodyEl.appendChild(card);
+    const link = document.createElement("a");
+    link.className = `tm-obs-crumb ${n.kind ?? "zone"}${n.id === focusId ? " current" : ""}`;
+    link.textContent = n.id;
+    link.addEventListener("click", (ev) => {
+      ev.preventDefault();
+      focusModalOn(n.id);
+    });
+    breadcrumb.appendChild(link);
+  });
+  treeModalBodyEl.appendChild(breadcrumb);
+
+  // Ancestors block — collapsed by default per-card.
+  if (ancestors.length > 0) {
+    treeModalBodyEl.appendChild(renderModalSectionHeading(
+      "ancestors",
+      ancestors.length,
+      "every LLM call that shaped the chain from root → focus",
+    ));
+    for (const a of ancestors) {
+      if (q && !nodeMatchesQuery(a, q)) continue;
+      treeModalBodyEl.appendChild(renderObsCard(a, { role: "ancestor", depth: 0 }));
+    }
   }
 
-  // Scroll the selected node into view on first open so the user lands at
-  // their context, not at the root.
-  if (selectedBboxId) {
-    const sel = treeModalBodyEl.querySelector(`.tm-card[data-id="${CSS.escape(selectedBboxId)}"]`);
-    if (sel) sel.scrollIntoView({ block: "center" });
+  // Focus block.
+  treeModalBodyEl.appendChild(renderModalSectionHeading(
+    "focused node",
+    1,
+    "every LLM call captured for this node, expanded",
+  ));
+  treeModalBodyEl.appendChild(renderObsCard(focusNode, { role: "focus", depth: 0 }));
+
+  // Descendants block.
+  if (descendants.length > 0) {
+    treeModalBodyEl.appendChild(renderModalSectionHeading(
+      "descendants",
+      descendants.length,
+      "indented by depth from focus",
+    ));
+    for (const [d, depth] of descendants) {
+      if (q && !nodeMatchesQuery(d, q)) continue;
+      treeModalBodyEl.appendChild(renderObsCard(d, { role: "descendant", depth }));
+    }
+  }
+
+  if (anchorId) {
+    const target = treeModalBodyEl.querySelector(
+      `.tm-card[data-id="${CSS.escape(anchorId)}"]`,
+    );
+    if (target) {
+      const newOffset = target.getBoundingClientRect().top
+        - treeModalBodyEl.getBoundingClientRect().top;
+      treeModalBodyEl.scrollTop += (newOffset - anchorOffset);
+    }
   }
 }
 
@@ -2298,20 +2574,14 @@ treeExpandEl?.addEventListener("click", (ev) => {
 });
 treeModalCloseEl?.addEventListener("click", closeTreeModal);
 treeModalEl?.addEventListener("click", (ev) => {
-  // Click on the backdrop (not the panel) closes — matches the replay modal.
   if (ev.target === treeModalEl) closeTreeModal();
 });
 treeModalSearchEl?.addEventListener("input", () => {
   treeModalQuery = treeModalSearchEl.value;
   renderTreeModal();
 });
-treeModalImageToggleEl?.addEventListener("change", () => {
-  treeModalImagesOn = treeModalImageToggleEl.checked;
-  renderTreeModal();
-});
 window.addEventListener("keydown", (ev) => {
   if (ev.key === "Escape" && treeModalOpen) {
-    // Don't steal Escape from the search input — let it clear there first.
     if (document.activeElement === treeModalSearchEl && treeModalSearchEl.value) {
       treeModalSearchEl.value = "";
       treeModalQuery = "";
@@ -2565,7 +2835,6 @@ function dispatch(event) {
       });
       renderTree();
       if (event.id === selectedBboxId) renderTreeDetail();
-      if (treeModalOpen) renderTreeModal();
       break;
     case "divider.decompose":
       // Pre-declare children so the tree shows them (in pending state) before
@@ -2574,7 +2843,6 @@ function dispatch(event) {
         treeUpsert(c.id, { parentId: event.node, prompt: c.prompt, kind: "zone" });
       }
       renderTree();
-      if (treeModalOpen) renderTreeModal();
       break;
     case "divider.zone_plan":
       // Stash the authored zone plan on the node so the tooltip can surface
@@ -2583,7 +2851,6 @@ function dispatch(event) {
       if (event.node && typeof event.plan === "string") {
         treeUpsert(event.node, { plan: event.plan });
         if (event.node === selectedBboxId) renderTreeDetail();
-        if (treeModalOpen) renderTreeModal();
       }
       break;
     case "step":
@@ -2601,7 +2868,6 @@ function dispatch(event) {
         treeUpsert(event.id, { imagePrompt: event.prompt });
         if (event.id === selectedBboxId) renderTreeDetail();
       }
-      if (treeModalOpen) renderTreeModal();
       break;
     case "model":
       loadModel(event);
@@ -2616,8 +2882,10 @@ function dispatch(event) {
       // recoveries that ship a `model` without a preceding `mesh.retry`.
       meshErrors.delete(event.id);
       if (event.id === selectedBboxId) renderTreeDetail();
-      if (treeModalOpen) renderTreeModal();
       refreshPostRunStatus();
+      break;
+    case "cache.llm":
+      recordLlmCall(event);
       break;
     // Everything else is already shown as a log line above.
   }
@@ -3291,6 +3559,9 @@ function dispatchForReplay(event) {
       loadModel(event);
       treeSetPhase(event.id, "done");
       meshErrors.delete(event.id);
+      break;
+    case "cache.llm":
+      recordLlmCall(event);
       break;
   }
 }
