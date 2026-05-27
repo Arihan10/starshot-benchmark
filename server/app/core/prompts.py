@@ -686,14 +686,6 @@ Child zones can keep decomposing into more zones recursively in subsequent passe
 
 </ZONE_SPLITTING_GUIDANCE>
 
-<PHYSICAL_GROUNDING>
-For EVERY child subzone you propose, before writing its placement, explicitly answer in your reasoning: "what physically holds this child up?" The answer must point at something CONCRETE — the parent's floor plane, the top face of a sibling subzone in this batch, an existing peer in the scene context, or an attachment face on the parent. Writing a justification only in placement prose ("rests on supporting columns descending from the combat floor") does NOT make those columns exist; placement text is consumed by the downstream bbox-resolution step, it does not spawn new nodes. If your answer references support that does not already exist as a node and that you have not committed to emit as another child in THIS call, ADD that support as a sibling subzone in this same `children` list — a peer subzone whose role is to physically ground or connect the dependent child. The bbox of that support subzone must claim the airspace it occupies, so it ends up as a real physical region in the layout, not just an idea.
-
-If you genuinely believe the child needs no physical support, you must justify it from the scene's PHYSICAL REGIME as established by the scene plan and ancestor plans — e.g. a vacuum / outer-space setting, an explicit antigravity field, a cloud-natured or particulate entity, a dreamscape. A vague "it floats" with no grounding in the scene's physics is not acceptable; the rest of the pipeline will treat it as a physically present zone and place objects inside it as if it were solid ground.
-
-This question is per-child and load-bearing: if it surfaces a gap between what the plan promises and what you have actually committed to emit, the fix is to emit the missing support node now — not to paper over it in prose.
-</PHYSICAL_GROUNDING>
-
 Think very intricately and spatially about how this zone splits. Your goal is to reason a subzone decomposition layout that fits the narrative presented by the scene plan given above as well as the additional plans of ancestor scenes in the scene context section given below, while paying attention to the semantic relationships between the subzones.
 
 The seed prompt you output for each subzone should be a 1-2 sentences long description that explains the subzone's shape and character. Be concrete about its description while leaving room for this prompt to be a seed for a more detailed plan. The prompt should be succinct without mentioning going overly into detail on the subzone's contents, but should mention the the narrative meaning behind its existence and the narrative meaning behind its relative placement to other subzones.
