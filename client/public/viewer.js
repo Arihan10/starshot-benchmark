@@ -2384,14 +2384,8 @@ function renderObsCard(node, { role, depth }) {
   idEl.className = `tm-id ${kind}`;
   idEl.textContent = node.id;
   idEl.title = "Click to focus this node";
-  idEl.title = "Click to focus this node";
   idEl.addEventListener("click", (ev) => {
     ev.stopPropagation();
-    ev.preventDefault();
-    focusModalOn(node.id);
-  });
-  sum.appendChild(idEl);
-
     ev.preventDefault();
     focusModalOn(node.id);
   });
@@ -2436,10 +2430,7 @@ function renderObsCard(node, { role, depth }) {
   // plus every llm.call recorded against this node.
   const body = document.createElement("div");
   body.className = "tm-obs-body";
-  body.className = "tm-obs-body";
 
-  function addTextSection(label, text) {
-    if (!text) return;
   function addTextSection(label, text) {
     if (!text) return;
     const wrap = document.createElement("div");
@@ -2451,15 +2442,10 @@ function renderObsCard(node, { role, depth }) {
     const b = document.createElement("div");
     b.className = "tm-section-body";
     b.textContent = text;
-    b.textContent = text;
     wrap.appendChild(b);
-    body.appendChild(wrap);
     body.appendChild(wrap);
   }
 
-  addTextSection("seed prompt", node.prompt);
-  if (kind === "zone" && node.plan) addTextSection("zone plan", node.plan);
-  if (kind !== "zone" && node.imagePrompt) addTextSection("image prompt", node.imagePrompt);
   addTextSection("seed prompt", node.prompt);
   if (kind === "zone" && node.plan) addTextSection("zone plan", node.plan);
   if (kind !== "zone" && node.imagePrompt) addTextSection("image prompt", node.imagePrompt);
