@@ -13,17 +13,17 @@ class Slot:
 
 
 SLOTS: list[Slot] = [
-    Slot("swamp-land", "A swamp with islands, designed as a top-down arcade level where a frog can jump from island to island"),
+    # Slot("swamp-land", "A swamp with islands, designed as a top-down arcade level where a frog can jump from island to island"),
     Slot("hotel-room", "A modern hotel room"),
     Slot("modern-house", "A modern house"),
-    Slot("platformer-level", "A super mario bros type platformer level"),
-    Slot("battle-arena", "A battle arena for a two player game"),
-    Slot("urban-city", "An imperial japanese house"),
-    Slot("waterloo-campus", "A modern house"),
-    Slot("shooter", "FPS 5v5 3 lane map"),
-    Slot("racetrack", "A car racing track")
+    # Slot("platformer-level", "A super mario bros type platformer level"),
+    # Slot("battle-arena", "A battle arena for a two player game"),
+    # Slot("urban-city", "An imperial japanese house"),
+    # Slot("waterloo-campus", "A modern house"),
+    # Slot("shooter", "FPS 5v5 3 lane map"),
+    # Slot("racetrack", "A car racing track")
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
 
-DEFAULT_MODEL = "openai/gpt-5.5"
+DEFAULT_MODEL = "google/gemini-3.5-flash"

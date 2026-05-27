@@ -1,0 +1,4002 @@
+[
+	{
+		"id": "exterior-stucco-wall-panel",
+		"description": "Exterior Stucco Wall Panel"
+	},
+	{
+		"id": "exterior-brick-wall-panel",
+		"description": "Exterior Brick Wall Panel"
+	},
+	{
+		"id": "exterior-concrete-wall-panel",
+		"description": "Exterior Concrete Wall Panel"
+	},
+	{
+		"id": "exterior-glass-curtain-wall",
+		"description": "Exterior Glass Curtain Wall"
+	},
+	{
+		"id": "exterior-stone-cladding-wall",
+		"description": "Exterior Stone Cladding Wall"
+	},
+	{
+		"id": "exterior-render-plaster-wall",
+		"description": "Exterior Render/Plaster Wall"
+	},
+	{
+		"id": "exterior-wood-siding-wall-panel",
+		"description": "Exterior Wood Siding Wall Panel"
+	},
+	{
+		"id": "exterior-corrugated-metal-wall-panel",
+		"description": "Exterior Corrugated Metal Wall Panel"
+	},
+	{
+		"id": "exterior-cement-board-wall-panel",
+		"description": "Exterior Cement Board Wall Panel"
+	},
+	{
+		"id": "interior-drywall-panel-light",
+		"description": "Interior Drywall Panel (Light)"
+	},
+	{
+		"id": "interior-drywall-panel-dark-accent",
+		"description": "Interior Drywall Panel (Dark/Accent)"
+	},
+	{
+		"id": "interior-half-wall-partition",
+		"description": "Interior Half-Wall Partition"
+	},
+	{
+		"id": "interior-wood-slat-accent-wall",
+		"description": "Interior Wood Slat Accent Wall"
+	},
+	{
+		"id": "interior-walnut-veneer-feature-wall",
+		"description": "Interior Walnut Veneer Feature Wall"
+	},
+	{
+		"id": "interior-glass-partition-wall",
+		"description": "Interior Glass Partition Wall"
+	},
+	{
+		"id": "interior-slate-tile-wall",
+		"description": "Interior Slate Tile Wall"
+	},
+	{
+		"id": "interior-shiplap-wall-panel",
+		"description": "Interior Shiplap Wall Panel"
+	},
+	{
+		"id": "interior-board-and-batten-wall-panel",
+		"description": "Interior Board-and-Batten Wall Panel"
+	},
+	{
+		"id": "interior-exposed-brick-wall",
+		"description": "Interior Exposed Brick Wall"
+	},
+	{
+		"id": "interior-stone-accent-wall",
+		"description": "Interior Stone Accent Wall"
+	},
+	{
+		"id": "interior-concrete-accent-wall",
+		"description": "Interior Concrete Accent Wall"
+	},
+	{
+		"id": "interior-fabric-upholstered-wall-panel",
+		"description": "Interior Fabric/Upholstered Wall Panel"
+	},
+	{
+		"id": "hardwood-floor-panel-oak",
+		"description": "Hardwood Floor Panel (Oak)"
+	},
+	{
+		"id": "hardwood-floor-panel-walnut",
+		"description": "Hardwood Floor Panel (Walnut)"
+	},
+	{
+		"id": "herringbone-parquet-floor-panel",
+		"description": "Herringbone Parquet Floor Panel"
+	},
+	{
+		"id": "wide-plank-engineered-wood-floor",
+		"description": "Wide Plank Engineered Wood Floor"
+	},
+	{
+		"id": "bamboo-floor-panel",
+		"description": "Bamboo Floor Panel"
+	},
+	{
+		"id": "porcelain-tile-floor-panel",
+		"description": "Porcelain Tile Floor Panel"
+	},
+	{
+		"id": "marble-tile-floor-panel",
+		"description": "Marble Tile Floor Panel"
+	},
+	{
+		"id": "terrazzo-floor-panel",
+		"description": "Terrazzo Floor Panel"
+	},
+	{
+		"id": "polished-concrete-floor-slab",
+		"description": "Polished Concrete Floor Slab"
+	},
+	{
+		"id": "slate-tile-floor-panel",
+		"description": "Slate Tile Floor Panel"
+	},
+	{
+		"id": "carpet-floor-panel",
+		"description": "Carpet Floor Panel"
+	},
+	{
+		"id": "vinyl-plank-floor-panel",
+		"description": "Vinyl Plank Floor Panel"
+	},
+	{
+		"id": "cork-floor-panel",
+		"description": "Cork Floor Panel"
+	},
+	{
+		"id": "brick-floor-panel",
+		"description": "Brick Floor Panel"
+	},
+	{
+		"id": "pebble-river-rock-floor-tile",
+		"description": "Pebble/River Rock Floor Tile"
+	},
+	{
+		"id": "garage-epoxy-floor",
+		"description": "Garage Epoxy Floor"
+	},
+	{
+		"id": "raised-platform-floor-section",
+		"description": "Raised Platform Floor Section"
+	},
+	{
+		"id": "subfloor-panel",
+		"description": "Subfloor Panel"
+	},
+	{
+		"id": "flat-painted-ceiling-panel",
+		"description": "Flat Painted Ceiling Panel"
+	},
+	{
+		"id": "dropped-suspended-ceiling-grid",
+		"description": "Dropped/Suspended Ceiling Grid"
+	},
+	{
+		"id": "exposed-wood-beam-ceiling",
+		"description": "Exposed Wood Beam Ceiling"
+	},
+	{
+		"id": "wood-slat-ceiling-panel",
+		"description": "Wood Slat Ceiling Panel"
+	},
+	{
+		"id": "shiplap-ceiling-panel",
+		"description": "Shiplap Ceiling Panel"
+	},
+	{
+		"id": "exposed-concrete-ceiling",
+		"description": "Exposed Concrete Ceiling"
+	},
+	{
+		"id": "tray-ceiling-panel",
+		"description": "Tray Ceiling Panel"
+	},
+	{
+		"id": "coffered-ceiling-panel",
+		"description": "Coffered Ceiling Panel"
+	},
+	{
+		"id": "vaulted-ceiling-panel",
+		"description": "Vaulted Ceiling Panel"
+	},
+	{
+		"id": "metal-tin-pressed-ceiling-panel",
+		"description": "Metal Tin/Pressed Ceiling Panel"
+	},
+	{
+		"id": "skylight-panel-flat",
+		"description": "Skylight Panel (Flat)"
+	},
+	{
+		"id": "skylight-panel-domed",
+		"description": "Skylight Panel (Domed)"
+	},
+	{
+		"id": "interior-flush-door",
+		"description": "Interior Flush Door"
+	},
+	{
+		"id": "interior-panel-door",
+		"description": "Interior Panel Door"
+	},
+	{
+		"id": "interior-sliding-barn-door",
+		"description": "Interior Sliding Barn Door"
+	},
+	{
+		"id": "interior-pocket-door",
+		"description": "Interior Pocket Door"
+	},
+	{
+		"id": "interior-french-doors",
+		"description": "Interior French Doors"
+	},
+	{
+		"id": "interior-glass-door",
+		"description": "Interior Glass Door"
+	},
+	{
+		"id": "front-door-modern-pivot",
+		"description": "Front Door (Modern Pivot)"
+	},
+	{
+		"id": "front-door-traditional-panel",
+		"description": "Front Door (Traditional Panel)"
+	},
+	{
+		"id": "front-door-double-entry",
+		"description": "Front Door (Double Entry)"
+	},
+	{
+		"id": "sliding-glass-patio-door",
+		"description": "Sliding Glass Patio Door"
+	},
+	{
+		"id": "door-frame-standard",
+		"description": "Door Frame (Standard)"
+	},
+	{
+		"id": "hotel-room-door-heavy",
+		"description": "Hotel Room Door (Heavy)"
+	},
+	{
+		"id": "closet-bifold-door",
+		"description": "Closet Bifold Door"
+	},
+	{
+		"id": "dutch-door",
+		"description": "Dutch Door"
+	},
+	{
+		"id": "single-hung-window",
+		"description": "Single-Hung Window"
+	},
+	{
+		"id": "double-hung-window",
+		"description": "Double-Hung Window"
+	},
+	{
+		"id": "casement-window",
+		"description": "Casement Window"
+	},
+	{
+		"id": "floor-to-ceiling-window-panel",
+		"description": "Floor-to-Ceiling Window Panel"
+	},
+	{
+		"id": "transom-window",
+		"description": "Transom Window"
+	},
+	{
+		"id": "picture-window-large-fixed",
+		"description": "Picture Window (Large Fixed)"
+	},
+	{
+		"id": "awning-window",
+		"description": "Awning Window"
+	},
+	{
+		"id": "clerestory-window-strip",
+		"description": "Clerestory Window Strip"
+	},
+	{
+		"id": "corner-window-unit",
+		"description": "Corner Window Unit"
+	},
+	{
+		"id": "window-frame-modern-slim",
+		"description": "Window Frame (Modern Slim)"
+	},
+	{
+		"id": "window-frame-traditional",
+		"description": "Window Frame (Traditional)"
+	},
+	{
+		"id": "bay-window-unit",
+		"description": "Bay Window Unit"
+	},
+	{
+		"id": "round-porthole-window",
+		"description": "Round/Porthole Window"
+	},
+	{
+		"id": "straight-staircase-section",
+		"description": "Straight Staircase Section"
+	},
+	{
+		"id": "l-shaped-staircase",
+		"description": "L-Shaped Staircase"
+	},
+	{
+		"id": "spiral-staircase",
+		"description": "Spiral Staircase"
+	},
+	{
+		"id": "floating-stair-treads",
+		"description": "Floating Stair Treads"
+	},
+	{
+		"id": "wide-architectural-transition-steps",
+		"description": "Wide Architectural Transition Steps"
+	},
+	{
+		"id": "glass-railing-panel",
+		"description": "Glass Railing Panel"
+	},
+	{
+		"id": "metal-cable-railing",
+		"description": "Metal Cable Railing"
+	},
+	{
+		"id": "metal-handrail",
+		"description": "Metal Handrail"
+	},
+	{
+		"id": "wood-handrail",
+		"description": "Wood Handrail"
+	},
+	{
+		"id": "wood-baluster-set",
+		"description": "Wood Baluster Set"
+	},
+	{
+		"id": "flat-roof-panel",
+		"description": "Flat Roof Panel"
+	},
+	{
+		"id": "pitched-roof-section-shingle",
+		"description": "Pitched Roof Section (Shingle)"
+	},
+	{
+		"id": "pitched-roof-section-metal-standing-seam",
+		"description": "Pitched Roof Section (Metal Standing Seam)"
+	},
+	{
+		"id": "pitched-roof-section-tile",
+		"description": "Pitched Roof Section (Tile)"
+	},
+	{
+		"id": "pitched-roof-section-slate",
+		"description": "Pitched Roof Section (Slate)"
+	},
+	{
+		"id": "cantilevered-canopy-roof-overhang",
+		"description": "Cantilevered Canopy Roof/Overhang"
+	},
+	{
+		"id": "gutter-section",
+		"description": "Gutter Section"
+	},
+	{
+		"id": "downspout",
+		"description": "Downspout"
+	},
+	{
+		"id": "fascia-board",
+		"description": "Fascia Board"
+	},
+	{
+		"id": "soffit-panel",
+		"description": "Soffit Panel"
+	},
+	{
+		"id": "square-load-bearing-column",
+		"description": "Square Load-Bearing Column"
+	},
+	{
+		"id": "round-decorative-pillar",
+		"description": "Round Decorative Pillar"
+	},
+	{
+		"id": "exposed-steel-i-beam",
+		"description": "Exposed Steel I-Beam"
+	},
+	{
+		"id": "exposed-wood-beam",
+		"description": "Exposed Wood Beam"
+	},
+	{
+		"id": "concrete-support-column",
+		"description": "Concrete Support Column"
+	},
+	{
+		"id": "matte-black-steel-column",
+		"description": "Matte-Black Steel Column"
+	},
+	{
+		"id": "concrete-foundation-block",
+		"description": "Concrete Foundation Block"
+	},
+	{
+		"id": "plinth-base-platform",
+		"description": "Plinth/Base Platform"
+	},
+	{
+		"id": "baseboard-modern-flat",
+		"description": "Baseboard (Modern Flat)"
+	},
+	{
+		"id": "baseboard-traditional-profile",
+		"description": "Baseboard (Traditional Profile)"
+	},
+	{
+		"id": "crown-molding",
+		"description": "Crown Molding"
+	},
+	{
+		"id": "chair-rail",
+		"description": "Chair Rail"
+	},
+	{
+		"id": "wainscoting-panel",
+		"description": "Wainscoting Panel"
+	},
+	{
+		"id": "window-sill-casing-trim",
+		"description": "Window Sill/Casing Trim"
+	},
+	{
+		"id": "cornice",
+		"description": "Cornice"
+	},
+	{
+		"id": "open-archway",
+		"description": "Open Archway"
+	},
+	{
+		"id": "rectangular-pass-through",
+		"description": "Rectangular Pass-Through"
+	},
+	{
+		"id": "slatted-wood-room-divider",
+		"description": "Slatted Wood Room Divider"
+	},
+	{
+		"id": "freestanding-room-divider-screen",
+		"description": "Freestanding Room Divider Screen"
+	},
+	{
+		"id": "kitchen-pass-through-window",
+		"description": "Kitchen Pass-Through Window"
+	},
+	{
+		"id": "modern-garage-door-panel",
+		"description": "Modern Garage Door (Panel)"
+	},
+	{
+		"id": "traditional-garage-door-carriage",
+		"description": "Traditional Garage Door (Carriage)"
+	},
+	{
+		"id": "utility-service-door-metal",
+		"description": "Utility/Service Door (Metal)"
+	},
+	{
+		"id": "balcony-slab",
+		"description": "Balcony Slab"
+	},
+	{
+		"id": "teak-deck-plank-section",
+		"description": "Teak Deck Plank Section"
+	},
+	{
+		"id": "composite-deck-section",
+		"description": "Composite Deck Section"
+	},
+	{
+		"id": "terrace-tile-surface",
+		"description": "Terrace Tile Surface"
+	},
+	{
+		"id": "balcony-glass-railing",
+		"description": "Balcony Glass Railing"
+	},
+	{
+		"id": "balcony-metal-railing",
+		"description": "Balcony Metal Railing"
+	},
+	{
+		"id": "modern-3-seat-sofa",
+		"description": "Modern 3-Seat Sofa"
+	},
+	{
+		"id": "l-shaped-sectional-sofa",
+		"description": "L-Shaped Sectional Sofa"
+	},
+	{
+		"id": "loveseat",
+		"description": "Loveseat"
+	},
+	{
+		"id": "mid-century-modern-sofa",
+		"description": "Mid-Century Modern Sofa"
+	},
+	{
+		"id": "sleeper-sofa",
+		"description": "Sleeper Sofa"
+	},
+	{
+		"id": "upholstered-accent-chair",
+		"description": "Upholstered Accent Chair"
+	},
+	{
+		"id": "mid-century-armchair",
+		"description": "Mid-Century Armchair"
+	},
+	{
+		"id": "wingback-chair",
+		"description": "Wingback Chair"
+	},
+	{
+		"id": "leather-club-chair",
+		"description": "Leather Club Chair"
+	},
+	{
+		"id": "recliner",
+		"description": "Recliner"
+	},
+	{
+		"id": "sculptural-lounge-chair",
+		"description": "Sculptural Lounge Chair"
+	},
+	{
+		"id": "dining-chair-upholstered",
+		"description": "Dining Chair (Upholstered)"
+	},
+	{
+		"id": "dining-chair-wood",
+		"description": "Dining Chair (Wood)"
+	},
+	{
+		"id": "dining-chair-metal",
+		"description": "Dining Chair (Metal)"
+	},
+	{
+		"id": "bar-stool-backless",
+		"description": "Bar Stool (Backless)"
+	},
+	{
+		"id": "bar-stool-with-back",
+		"description": "Bar Stool (With Back)"
+	},
+	{
+		"id": "counter-stool",
+		"description": "Counter Stool"
+	},
+	{
+		"id": "ergonomic-office-chair",
+		"description": "Ergonomic Office Chair"
+	},
+	{
+		"id": "mid-century-desk-chair",
+		"description": "Mid-Century Desk Chair"
+	},
+	{
+		"id": "upholstered-bench",
+		"description": "Upholstered Bench"
+	},
+	{
+		"id": "storage-ottoman",
+		"description": "Storage Ottoman"
+	},
+	{
+		"id": "round-pouf-ottoman",
+		"description": "Round Pouf Ottoman"
+	},
+	{
+		"id": "entryway-bench",
+		"description": "Entryway Bench"
+	},
+	{
+		"id": "end-of-bed-bench",
+		"description": "End-of-Bed Bench"
+	},
+	{
+		"id": "window-seat-bench",
+		"description": "Window Seat Bench"
+	},
+	{
+		"id": "patio-lounge-chair",
+		"description": "Patio Lounge Chair"
+	},
+	{
+		"id": "adirondack-chair",
+		"description": "Adirondack Chair"
+	},
+	{
+		"id": "outdoor-dining-chair",
+		"description": "Outdoor Dining Chair"
+	},
+	{
+		"id": "outdoor-chaise-lounge",
+		"description": "Outdoor Chaise Lounge"
+	},
+	{
+		"id": "hammock",
+		"description": "Hammock"
+	},
+	{
+		"id": "porch-rocking-chair",
+		"description": "Porch Rocking Chair"
+	},
+	{
+		"id": "rectangular-coffee-table",
+		"description": "Rectangular Coffee Table"
+	},
+	{
+		"id": "round-coffee-table",
+		"description": "Round Coffee Table"
+	},
+	{
+		"id": "stone-block-coffee-table",
+		"description": "Stone Block Coffee Table"
+	},
+	{
+		"id": "nesting-side-tables-set",
+		"description": "Nesting Side Tables (Set)"
+	},
+	{
+		"id": "c-shaped-side-table",
+		"description": "C-Shaped Side Table"
+	},
+	{
+		"id": "cylindrical-side-table",
+		"description": "Cylindrical Side Table"
+	},
+	{
+		"id": "rectangular-dining-table",
+		"description": "Rectangular Dining Table"
+	},
+	{
+		"id": "round-dining-table",
+		"description": "Round Dining Table"
+	},
+	{
+		"id": "oval-dining-table",
+		"description": "Oval Dining Table"
+	},
+	{
+		"id": "extendable-dining-table",
+		"description": "Extendable Dining Table"
+	},
+	{
+		"id": "entryway-console-table",
+		"description": "Entryway Console Table"
+	},
+	{
+		"id": "narrow-hallway-console",
+		"description": "Narrow Hallway Console"
+	},
+	{
+		"id": "sofa-back-console-table",
+		"description": "Sofa Back Console Table"
+	},
+	{
+		"id": "modern-writing-desk",
+		"description": "Modern Writing Desk"
+	},
+	{
+		"id": "executive-desk",
+		"description": "Executive Desk"
+	},
+	{
+		"id": "compact-hotel-desk",
+		"description": "Compact Hotel Desk"
+	},
+	{
+		"id": "floating-wall-desk",
+		"description": "Floating Wall Desk"
+	},
+	{
+		"id": "standing-desk",
+		"description": "Standing Desk"
+	},
+	{
+		"id": "nightstand-drawer-shelf",
+		"description": "Nightstand (Drawer + Shelf)"
+	},
+	{
+		"id": "wall-mounted-floating-nightstand",
+		"description": "Wall-Mounted Floating Nightstand"
+	},
+	{
+		"id": "patio-dining-table",
+		"description": "Patio Dining Table"
+	},
+	{
+		"id": "outdoor-bistro-table",
+		"description": "Outdoor Bistro Table"
+	},
+	{
+		"id": "outdoor-side-table",
+		"description": "Outdoor Side Table"
+	},
+	{
+		"id": "outdoor-bar-height-table",
+		"description": "Outdoor Bar-Height Table"
+	},
+	{
+		"id": "platform-bed-frame",
+		"description": "Platform Bed Frame"
+	},
+	{
+		"id": "upholstered-headboard",
+		"description": "Upholstered Headboard"
+	},
+	{
+		"id": "wood-headboard",
+		"description": "Wood Headboard"
+	},
+	{
+		"id": "full-wall-headboard-panel-hotel",
+		"description": "Full Wall Headboard Panel (Hotel)"
+	},
+	{
+		"id": "four-poster-bed-frame",
+		"description": "Four-Poster Bed Frame"
+	},
+	{
+		"id": "canopy-bed-frame",
+		"description": "Canopy Bed Frame"
+	},
+	{
+		"id": "mattress",
+		"description": "Mattress"
+	},
+	{
+		"id": "dressed-mattress-bedding-set-complete",
+		"description": "Dressed Mattress & Bedding Set (Complete)"
+	},
+	{
+		"id": "daybed",
+		"description": "Daybed"
+	},
+	{
+		"id": "tall-bookshelf",
+		"description": "Tall Bookshelf"
+	},
+	{
+		"id": "low-bookshelf",
+		"description": "Low Bookshelf"
+	},
+	{
+		"id": "wall-mounted-floating-shelf",
+		"description": "Wall-Mounted Floating Shelf"
+	},
+	{
+		"id": "ladder-shelf",
+		"description": "Ladder Shelf"
+	},
+	{
+		"id": "corner-shelf-unit",
+		"description": "Corner Shelf Unit"
+	},
+	{
+		"id": "wide-dresser",
+		"description": "Wide Dresser"
+	},
+	{
+		"id": "tall-chest-of-drawers",
+		"description": "Tall Chest of Drawers"
+	},
+	{
+		"id": "low-credenza",
+		"description": "Low Credenza"
+	},
+	{
+		"id": "freestanding-wardrobe",
+		"description": "Freestanding Wardrobe"
+	},
+	{
+		"id": "armoire",
+		"description": "Armoire"
+	},
+	{
+		"id": "sliding-door-wardrobe",
+		"description": "Sliding Door Wardrobe"
+	},
+	{
+		"id": "hotel-open-wardrobe-closet",
+		"description": "Hotel Open Wardrobe/Closet"
+	},
+	{
+		"id": "sideboard-buffet",
+		"description": "Sideboard/Buffet"
+	},
+	{
+		"id": "storage-cabinet-2-door",
+		"description": "Storage Cabinet (2-Door)"
+	},
+	{
+		"id": "bar-cabinet",
+		"description": "Bar Cabinet"
+	},
+	{
+		"id": "walk-in-closet-shelf-system",
+		"description": "Walk-In Closet Shelf System"
+	},
+	{
+		"id": "reach-in-closet-rod-shelf",
+		"description": "Reach-In Closet Rod & Shelf"
+	},
+	{
+		"id": "built-in-bookcase-unit",
+		"description": "Built-In Bookcase Unit"
+	},
+	{
+		"id": "shoe-rack",
+		"description": "Shoe Rack"
+	},
+	{
+		"id": "wall-mounted-coat-rack",
+		"description": "Wall-Mounted Coat Rack"
+	},
+	{
+		"id": "freestanding-coat-rack-tree",
+		"description": "Freestanding Coat Rack/Tree"
+	},
+	{
+		"id": "hall-tree-with-bench",
+		"description": "Hall Tree with Bench"
+	},
+	{
+		"id": "low-media-console",
+		"description": "Low Media Console"
+	},
+	{
+		"id": "floating-tv-unit-wall-mounted",
+		"description": "Floating TV Unit (Wall-Mounted)"
+	},
+	{
+		"id": "entertainment-center",
+		"description": "Entertainment Center"
+	},
+	{
+		"id": "french-door-refrigerator",
+		"description": "French Door Refrigerator"
+	},
+	{
+		"id": "side-by-side-refrigerator",
+		"description": "Side-by-Side Refrigerator"
+	},
+	{
+		"id": "gas-range-oven",
+		"description": "Gas Range/Oven"
+	},
+	{
+		"id": "electric-range-oven",
+		"description": "Electric Range/Oven"
+	},
+	{
+		"id": "wall-mounted-double-oven",
+		"description": "Wall-Mounted Double Oven"
+	},
+	{
+		"id": "built-in-dishwasher",
+		"description": "Built-In Dishwasher"
+	},
+	{
+		"id": "over-the-range-microwave",
+		"description": "Over-the-Range Microwave"
+	},
+	{
+		"id": "countertop-microwave",
+		"description": "Countertop Microwave"
+	},
+	{
+		"id": "cooktop-gas",
+		"description": "Cooktop (Gas)"
+	},
+	{
+		"id": "cooktop-induction",
+		"description": "Cooktop (Induction)"
+	},
+	{
+		"id": "front-load-washing-machine",
+		"description": "Front-Load Washing Machine"
+	},
+	{
+		"id": "front-load-dryer",
+		"description": "Front-Load Dryer"
+	},
+	{
+		"id": "drip-coffee-maker",
+		"description": "Drip Coffee Maker"
+	},
+	{
+		"id": "espresso-machine",
+		"description": "Espresso Machine"
+	},
+	{
+		"id": "single-serve-coffee-maker-pod",
+		"description": "Single-Serve Coffee Maker (Pod)"
+	},
+	{
+		"id": "toaster",
+		"description": "Toaster"
+	},
+	{
+		"id": "toaster-oven",
+		"description": "Toaster Oven"
+	},
+	{
+		"id": "electric-kettle",
+		"description": "Electric Kettle"
+	},
+	{
+		"id": "blender",
+		"description": "Blender"
+	},
+	{
+		"id": "stand-mixer",
+		"description": "Stand Mixer"
+	},
+	{
+		"id": "food-processor",
+		"description": "Food Processor"
+	},
+	{
+		"id": "rice-cooker-instant-pot",
+		"description": "Rice Cooker / Instant Pot"
+	},
+	{
+		"id": "air-fryer",
+		"description": "Air Fryer"
+	},
+	{
+		"id": "upper-wall-cabinet-single-door",
+		"description": "Upper Wall Cabinet (Single Door)"
+	},
+	{
+		"id": "upper-wall-cabinet-double-door",
+		"description": "Upper Wall Cabinet (Double Door)"
+	},
+	{
+		"id": "lower-base-cabinet-drawer-door",
+		"description": "Lower Base Cabinet (Drawer + Door)"
+	},
+	{
+		"id": "lower-base-cabinet-drawers-only",
+		"description": "Lower Base Cabinet (Drawers Only)"
+	},
+	{
+		"id": "corner-cabinet",
+		"description": "Corner Cabinet"
+	},
+	{
+		"id": "tall-pantry-cabinet",
+		"description": "Tall Pantry Cabinet"
+	},
+	{
+		"id": "open-shelf-cabinet",
+		"description": "Open Shelf Cabinet"
+	},
+	{
+		"id": "glass-front-display-cabinet",
+		"description": "Glass-Front Display Cabinet"
+	},
+	{
+		"id": "kitchen-island-large-with-seating",
+		"description": "Kitchen Island (Large with Seating)"
+	},
+	{
+		"id": "kitchen-island-small-prep",
+		"description": "Kitchen Island (Small/Prep)"
+	},
+	{
+		"id": "countertop-section-granite",
+		"description": "Countertop Section (Granite)"
+	},
+	{
+		"id": "countertop-section-quartz",
+		"description": "Countertop Section (Quartz)"
+	},
+	{
+		"id": "countertop-section-marble",
+		"description": "Countertop Section (Marble)"
+	},
+	{
+		"id": "countertop-section-butcher-block",
+		"description": "Countertop Section (Butcher Block)"
+	},
+	{
+		"id": "kitchen-backsplash-subway-tile",
+		"description": "Kitchen Backsplash (Subway Tile)"
+	},
+	{
+		"id": "kitchen-backsplash-mosaic",
+		"description": "Kitchen Backsplash (Mosaic)"
+	},
+	{
+		"id": "undermount-kitchen-sink-single-bowl",
+		"description": "Undermount Kitchen Sink (Single Bowl)"
+	},
+	{
+		"id": "undermount-kitchen-sink-double-bowl",
+		"description": "Undermount Kitchen Sink (Double Bowl)"
+	},
+	{
+		"id": "farmhouse-apron-sink",
+		"description": "Farmhouse/Apron Sink"
+	},
+	{
+		"id": "kitchen-faucet-pull-down",
+		"description": "Kitchen Faucet (Pull-Down)"
+	},
+	{
+		"id": "wall-mount-range-hood",
+		"description": "Wall-Mount Range Hood"
+	},
+	{
+		"id": "island-range-hood",
+		"description": "Island Range Hood"
+	},
+	{
+		"id": "under-cabinet-range-hood",
+		"description": "Under-Cabinet Range Hood"
+	},
+	{
+		"id": "knife-block-set",
+		"description": "Knife Block Set"
+	},
+	{
+		"id": "utensil-crock",
+		"description": "Utensil Crock"
+	},
+	{
+		"id": "hanging-pot-rack",
+		"description": "Hanging Pot Rack"
+	},
+	{
+		"id": "cutting-board",
+		"description": "Cutting Board"
+	},
+	{
+		"id": "pot-pan-on-stove",
+		"description": "Pot/Pan on Stove"
+	},
+	{
+		"id": "oven-mitt-hanging",
+		"description": "Oven Mitt (Hanging)"
+	},
+	{
+		"id": "colander",
+		"description": "Colander"
+	},
+	{
+		"id": "mixing-bowl-set",
+		"description": "Mixing Bowl Set"
+	},
+	{
+		"id": "dinner-plate-stack",
+		"description": "Dinner Plate Stack"
+	},
+	{
+		"id": "bowl-stack",
+		"description": "Bowl Stack"
+	},
+	{
+		"id": "coffee-mug-set",
+		"description": "Coffee Mug Set"
+	},
+	{
+		"id": "wine-glass-set",
+		"description": "Wine Glass Set"
+	},
+	{
+		"id": "drinking-glass-set",
+		"description": "Drinking Glass Set"
+	},
+	{
+		"id": "fruit-bowl-with-fruit",
+		"description": "Fruit Bowl (with Fruit)"
+	},
+	{
+		"id": "serving-platter",
+		"description": "Serving Platter"
+	},
+	{
+		"id": "salt-pepper-shakers",
+		"description": "Salt & Pepper Shakers"
+	},
+	{
+		"id": "oil-vinegar-set",
+		"description": "Oil & Vinegar Set"
+	},
+	{
+		"id": "paper-towel-holder",
+		"description": "Paper Towel Holder"
+	},
+	{
+		"id": "dish-drying-rack",
+		"description": "Dish Drying Rack"
+	},
+	{
+		"id": "spice-rack",
+		"description": "Spice Rack"
+	},
+	{
+		"id": "kitchen-canisters-set",
+		"description": "Kitchen Canisters (Set)"
+	},
+	{
+		"id": "bread-box",
+		"description": "Bread Box"
+	},
+	{
+		"id": "wine-rack-countertop",
+		"description": "Wine Rack (Countertop)"
+	},
+	{
+		"id": "wine-bottle",
+		"description": "Wine Bottle"
+	},
+	{
+		"id": "cookbook-open-standing",
+		"description": "Cookbook (Open/Standing)"
+	},
+	{
+		"id": "banana-hanger-fruit-hook",
+		"description": "Banana Hanger/Fruit Hook"
+	},
+	{
+		"id": "kitchen-scale",
+		"description": "Kitchen Scale"
+	},
+	{
+		"id": "soap-dispenser-sponge-caddy-sink",
+		"description": "Soap Dispenser & Sponge Caddy (Sink)"
+	},
+	{
+		"id": "reusable-water-bottle",
+		"description": "Reusable Water Bottle"
+	},
+	{
+		"id": "travel-mug-thermos",
+		"description": "Travel Mug / Thermos"
+	},
+	{
+		"id": "grocery-bag-reusable-tote",
+		"description": "Grocery Bag (Reusable Tote)"
+	},
+	{
+		"id": "modern-wall-hung-toilet",
+		"description": "Modern Wall-Hung Toilet"
+	},
+	{
+		"id": "one-piece-toilet",
+		"description": "One-Piece Toilet"
+	},
+	{
+		"id": "bidet",
+		"description": "Bidet"
+	},
+	{
+		"id": "toilet-paper-holder-wall-mount",
+		"description": "Toilet Paper Holder (Wall-Mount)"
+	},
+	{
+		"id": "single-vanity-with-sink",
+		"description": "Single Vanity with Sink"
+	},
+	{
+		"id": "double-vanity-with-sinks",
+		"description": "Double Vanity with Sinks"
+	},
+	{
+		"id": "wall-mounted-floating-vanity",
+		"description": "Wall-Mounted Floating Vanity"
+	},
+	{
+		"id": "pedestal-sink",
+		"description": "Pedestal Sink"
+	},
+	{
+		"id": "vessel-sink-bowl",
+		"description": "Vessel Sink (Bowl)"
+	},
+	{
+		"id": "bathroom-faucet-deck-mount",
+		"description": "Bathroom Faucet (Deck-Mount)"
+	},
+	{
+		"id": "bathroom-faucet-wall-mount",
+		"description": "Bathroom Faucet (Wall-Mount)"
+	},
+	{
+		"id": "freestanding-soaking-tub",
+		"description": "Freestanding Soaking Tub"
+	},
+	{
+		"id": "freestanding-clawfoot-tub",
+		"description": "Freestanding Clawfoot Tub"
+	},
+	{
+		"id": "built-in-alcove-bathtub",
+		"description": "Built-In Alcove Bathtub"
+	},
+	{
+		"id": "floor-mounted-tub-filler-faucet",
+		"description": "Floor-Mounted Tub Filler Faucet"
+	},
+	{
+		"id": "wall-mounted-tub-faucet",
+		"description": "Wall-Mounted Tub Faucet"
+	},
+	{
+		"id": "walk-in-shower-enclosure-glass",
+		"description": "Walk-In Shower Enclosure (Glass)"
+	},
+	{
+		"id": "glass-shower-door-frameless",
+		"description": "Glass Shower Door (Frameless)"
+	},
+	{
+		"id": "shower-tub-combo-with-curtain-rod",
+		"description": "Shower/Tub Combo with Curtain Rod"
+	},
+	{
+		"id": "rain-shower-head-ceiling-mount",
+		"description": "Rain Shower Head (Ceiling-Mount)"
+	},
+	{
+		"id": "handheld-shower-head",
+		"description": "Handheld Shower Head"
+	},
+	{
+		"id": "thermostatic-shower-control-panel",
+		"description": "Thermostatic Shower Control Panel"
+	},
+	{
+		"id": "shower-niche-shelf-built-in",
+		"description": "Shower Niche/Shelf (Built-In)"
+	},
+	{
+		"id": "floating-shower-bench",
+		"description": "Floating Shower Bench"
+	},
+	{
+		"id": "rectangular-vanity-mirror",
+		"description": "Rectangular Vanity Mirror"
+	},
+	{
+		"id": "round-vanity-mirror",
+		"description": "Round Vanity Mirror"
+	},
+	{
+		"id": "medicine-cabinet-mirrored",
+		"description": "Medicine Cabinet (Mirrored)"
+	},
+	{
+		"id": "led-backlit-mirror",
+		"description": "LED Backlit Mirror"
+	},
+	{
+		"id": "towel-bar-wall-mount",
+		"description": "Towel Bar (Wall-Mount)"
+	},
+	{
+		"id": "towel-ring",
+		"description": "Towel Ring"
+	},
+	{
+		"id": "robe-hook",
+		"description": "Robe Hook"
+	},
+	{
+		"id": "heated-towel-rack",
+		"description": "Heated Towel Rack"
+	},
+	{
+		"id": "leaning-towel-ladder",
+		"description": "Leaning Towel Ladder"
+	},
+	{
+		"id": "bathroom-wall-cabinet",
+		"description": "Bathroom Wall Cabinet"
+	},
+	{
+		"id": "over-toilet-storage-shelf",
+		"description": "Over-Toilet Storage Shelf"
+	},
+	{
+		"id": "freestanding-bathroom-shelf-tower",
+		"description": "Freestanding Bathroom Shelf Tower"
+	},
+	{
+		"id": "shower-caddy-hanging",
+		"description": "Shower Caddy (Hanging)"
+	},
+	{
+		"id": "soap-dispenser",
+		"description": "Soap Dispenser"
+	},
+	{
+		"id": "soap-dish",
+		"description": "Soap Dish"
+	},
+	{
+		"id": "toothbrush-holder",
+		"description": "Toothbrush Holder"
+	},
+	{
+		"id": "bathroom-trash-can",
+		"description": "Bathroom Trash Can"
+	},
+	{
+		"id": "bathroom-scale",
+		"description": "Bathroom Scale"
+	},
+	{
+		"id": "toiletries-tray-soap-lotion-bottles",
+		"description": "Toiletries Tray (Soap/Lotion Bottles)"
+	},
+	{
+		"id": "electric-toothbrush-on-charger",
+		"description": "Electric Toothbrush (on Charger)"
+	},
+	{
+		"id": "hair-dryer",
+		"description": "Hair Dryer"
+	},
+	{
+		"id": "flat-iron-curling-iron",
+		"description": "Flat Iron / Curling Iron"
+	},
+	{
+		"id": "makeup-bag-toiletry-bag",
+		"description": "Makeup Bag / Toiletry Bag"
+	},
+	{
+		"id": "cotton-ball-swab-jar",
+		"description": "Cotton Ball/Swab Jar"
+	},
+	{
+		"id": "prescription-pill-bottles-grouped",
+		"description": "Prescription Pill Bottles (Grouped)"
+	},
+	{
+		"id": "perfume-cologne-bottles-grouped",
+		"description": "Perfume/Cologne Bottles (Grouped)"
+	},
+	{
+		"id": "modern-chandelier",
+		"description": "Modern Chandelier"
+	},
+	{
+		"id": "crystal-chandelier",
+		"description": "Crystal Chandelier"
+	},
+	{
+		"id": "single-pendant-light-dome",
+		"description": "Single Pendant Light (Dome)"
+	},
+	{
+		"id": "single-pendant-light-globe",
+		"description": "Single Pendant Light (Globe)"
+	},
+	{
+		"id": "cluster-pendant-light",
+		"description": "Cluster Pendant Light"
+	},
+	{
+		"id": "linear-pendant-light-bar",
+		"description": "Linear Pendant Light (Bar)"
+	},
+	{
+		"id": "drum-pendant-light",
+		"description": "Drum Pendant Light"
+	},
+	{
+		"id": "flush-mount-ceiling-light",
+		"description": "Flush Mount Ceiling Light"
+	},
+	{
+		"id": "semi-flush-mount-ceiling-light",
+		"description": "Semi-Flush Mount Ceiling Light"
+	},
+	{
+		"id": "recessed-downlight-can-light",
+		"description": "Recessed Downlight (Can Light)"
+	},
+	{
+		"id": "track-lighting-rail",
+		"description": "Track Lighting Rail"
+	},
+	{
+		"id": "ceiling-fan-with-light",
+		"description": "Ceiling Fan with Light"
+	},
+	{
+		"id": "wall-sconce-modern",
+		"description": "Wall Sconce (Modern)"
+	},
+	{
+		"id": "wall-sconce-traditional",
+		"description": "Wall Sconce (Traditional)"
+	},
+	{
+		"id": "swing-arm-wall-lamp",
+		"description": "Swing-Arm Wall Lamp"
+	},
+	{
+		"id": "vanity-light-bar",
+		"description": "Vanity Light Bar"
+	},
+	{
+		"id": "picture-light",
+		"description": "Picture Light"
+	},
+	{
+		"id": "arc-floor-lamp",
+		"description": "Arc Floor Lamp"
+	},
+	{
+		"id": "tripod-floor-lamp",
+		"description": "Tripod Floor Lamp"
+	},
+	{
+		"id": "torchiere-floor-lamp",
+		"description": "Torchiere Floor Lamp"
+	},
+	{
+		"id": "task-floor-lamp-adjustable",
+		"description": "Task Floor Lamp (Adjustable)"
+	},
+	{
+		"id": "table-lamp-ceramic-base",
+		"description": "Table Lamp (Ceramic Base)"
+	},
+	{
+		"id": "table-lamp-glass-globe",
+		"description": "Table Lamp (Glass Globe)"
+	},
+	{
+		"id": "table-lamp-metal-base",
+		"description": "Table Lamp (Metal Base)"
+	},
+	{
+		"id": "desk-lamp-articulating-arm",
+		"description": "Desk Lamp (Articulating Arm)"
+	},
+	{
+		"id": "bedside-table-lamp",
+		"description": "Bedside Table Lamp"
+	},
+	{
+		"id": "outdoor-wall-lantern",
+		"description": "Outdoor Wall Lantern"
+	},
+	{
+		"id": "pathway-bollard-light",
+		"description": "Pathway Bollard Light"
+	},
+	{
+		"id": "landscape-spotlight",
+		"description": "Landscape Spotlight"
+	},
+	{
+		"id": "outdoor-string-lights",
+		"description": "Outdoor String Lights"
+	},
+	{
+		"id": "post-light-lamp-post",
+		"description": "Post Light (Lamp Post)"
+	},
+	{
+		"id": "porch-ceiling-light",
+		"description": "Porch Ceiling Light"
+	},
+	{
+		"id": "led-strip-under-cabinet",
+		"description": "LED Strip (Under-Cabinet)"
+	},
+	{
+		"id": "led-strip-cove-architectural",
+		"description": "LED Strip (Cove/Architectural)"
+	},
+	{
+		"id": "neon-sign-decorative",
+		"description": "Neon Sign (Decorative)"
+	},
+	{
+		"id": "candelabra",
+		"description": "Candelabra"
+	},
+	{
+		"id": "decorative-lantern-tabletop",
+		"description": "Decorative Lantern (Tabletop)"
+	},
+	{
+		"id": "large-canvas-art",
+		"description": "Large Canvas Art"
+	},
+	{
+		"id": "framed-print",
+		"description": "Framed Print"
+	},
+	{
+		"id": "gallery-wall-frame-set",
+		"description": "Gallery Wall Frame Set"
+	},
+	{
+		"id": "metal-wall-art",
+		"description": "Metal Wall Art"
+	},
+	{
+		"id": "macram\u00e9-wall-hanging",
+		"description": "Macram\u00e9 Wall Hanging"
+	},
+	{
+		"id": "plaster-relief-artwork",
+		"description": "Plaster Relief Artwork"
+	},
+	{
+		"id": "tapestry-woven-wall-hanging",
+		"description": "Tapestry / Woven Wall Hanging"
+	},
+	{
+		"id": "tall-ceramic-vase",
+		"description": "Tall Ceramic Vase"
+	},
+	{
+		"id": "short-round-vase",
+		"description": "Short Round Vase"
+	},
+	{
+		"id": "glass-vase-clear",
+		"description": "Glass Vase (Clear)"
+	},
+	{
+		"id": "bud-vase",
+		"description": "Bud Vase"
+	},
+	{
+		"id": "textured-stoneware-vase",
+		"description": "Textured Stoneware Vase"
+	},
+	{
+		"id": "ceramic-vase-with-dried-branches",
+		"description": "Ceramic Vase with Dried Branches"
+	},
+	{
+		"id": "abstract-sculpture",
+		"description": "Abstract Sculpture"
+	},
+	{
+		"id": "bookend-set",
+		"description": "Bookend Set"
+	},
+	{
+		"id": "decorative-sphere",
+		"description": "Decorative Sphere"
+	},
+	{
+		"id": "decorative-geometric-object",
+		"description": "Decorative Geometric Object"
+	},
+	{
+		"id": "wall-clock",
+		"description": "Wall Clock"
+	},
+	{
+		"id": "mantel-clock",
+		"description": "Mantel Clock"
+	},
+	{
+		"id": "digital-alarm-clock",
+		"description": "Digital Alarm Clock"
+	},
+	{
+		"id": "coffee-table-book-stack",
+		"description": "Coffee Table Book Stack"
+	},
+	{
+		"id": "book-row-shelf-filler",
+		"description": "Book Row (Shelf Filler)"
+	},
+	{
+		"id": "magazine-stack",
+		"description": "Magazine Stack"
+	},
+	{
+		"id": "decorative-tray",
+		"description": "Decorative Tray"
+	},
+	{
+		"id": "decorative-bowl-wood",
+		"description": "Decorative Bowl (Wood)"
+	},
+	{
+		"id": "decorative-bowl-stone",
+		"description": "Decorative Bowl (Stone)"
+	},
+	{
+		"id": "water-carafe-glass-set",
+		"description": "Water Carafe & Glass Set"
+	},
+	{
+		"id": "whiskey-decanter-tumbler-set",
+		"description": "Whiskey Decanter & Tumbler Set"
+	},
+	{
+		"id": "serving-tray-with-pitcher-glasses",
+		"description": "Serving Tray with Pitcher & Glasses"
+	},
+	{
+		"id": "pillar-candle",
+		"description": "Pillar Candle"
+	},
+	{
+		"id": "taper-candle-holder",
+		"description": "Taper Candle Holder"
+	},
+	{
+		"id": "votive-tea-light-holder",
+		"description": "Votive/Tea Light Holder"
+	},
+	{
+		"id": "scented-candle-in-jar",
+		"description": "Scented Candle in Jar"
+	},
+	{
+		"id": "hurricane-candle-holder",
+		"description": "Hurricane Candle Holder"
+	},
+	{
+		"id": "area-rug-rectangular",
+		"description": "Area Rug (Rectangular)"
+	},
+	{
+		"id": "area-rug-round",
+		"description": "Area Rug (Round)"
+	},
+	{
+		"id": "runner-rug-hallway",
+		"description": "Runner Rug (Hallway)"
+	},
+	{
+		"id": "doormat",
+		"description": "Doormat"
+	},
+	{
+		"id": "sheepskin-hide-rug",
+		"description": "Sheepskin/Hide Rug"
+	},
+	{
+		"id": "curtain-panels-floor-length",
+		"description": "Curtain Panels (Floor-Length)"
+	},
+	{
+		"id": "sheer-curtain-panels",
+		"description": "Sheer Curtain Panels"
+	},
+	{
+		"id": "roller-blind",
+		"description": "Roller Blind"
+	},
+	{
+		"id": "roman-shade",
+		"description": "Roman Shade"
+	},
+	{
+		"id": "venetian-blinds",
+		"description": "Venetian Blinds"
+	},
+	{
+		"id": "plantation-shutters",
+		"description": "Plantation Shutters"
+	},
+	{
+		"id": "curtain-rod-hardware",
+		"description": "Curtain Rod & Hardware"
+	},
+	{
+		"id": "throw-pillow-square",
+		"description": "Throw Pillow (Square)"
+	},
+	{
+		"id": "lumbar-pillow",
+		"description": "Lumbar Pillow"
+	},
+	{
+		"id": "floor-cushion",
+		"description": "Floor Cushion"
+	},
+	{
+		"id": "outdoor-throw-pillow",
+		"description": "Outdoor Throw Pillow"
+	},
+	{
+		"id": "knit-throw-blanket",
+		"description": "Knit Throw Blanket"
+	},
+	{
+		"id": "woven-throw-blanket",
+		"description": "Woven Throw Blanket"
+	},
+	{
+		"id": "faux-fur-throw",
+		"description": "Faux Fur Throw"
+	},
+	{
+		"id": "duvet-comforter-set",
+		"description": "Duvet/Comforter Set"
+	},
+	{
+		"id": "bed-sheet-set",
+		"description": "Bed Sheet Set"
+	},
+	{
+		"id": "bed-pillows-pair",
+		"description": "Bed Pillows (Pair)"
+	},
+	{
+		"id": "euro-sham-pillows-pair",
+		"description": "Euro Sham Pillows (Pair)"
+	},
+	{
+		"id": "bed-runner-decorative",
+		"description": "Bed Runner (Decorative)"
+	},
+	{
+		"id": "dressed-bed-complete-set",
+		"description": "Dressed Bed (Complete Set)"
+	},
+	{
+		"id": "bath-towel-folded",
+		"description": "Bath Towel (Folded)"
+	},
+	{
+		"id": "towel-stack-folded-set",
+		"description": "Towel Stack (Folded Set)"
+	},
+	{
+		"id": "plush-bath-mat",
+		"description": "Plush Bath Mat"
+	},
+	{
+		"id": "placemat-set",
+		"description": "Placemat Set"
+	},
+	{
+		"id": "tablecloth",
+		"description": "Tablecloth"
+	},
+	{
+		"id": "table-runner",
+		"description": "Table Runner"
+	},
+	{
+		"id": "fiddle-leaf-fig-large-floor",
+		"description": "Fiddle Leaf Fig (Large Floor)"
+	},
+	{
+		"id": "monstera-large-floor",
+		"description": "Monstera (Large Floor)"
+	},
+	{
+		"id": "snake-plant",
+		"description": "Snake Plant"
+	},
+	{
+		"id": "pothos-trailing",
+		"description": "Pothos (Trailing)"
+	},
+	{
+		"id": "rubber-plant",
+		"description": "Rubber Plant"
+	},
+	{
+		"id": "palm-plant-indoor",
+		"description": "Palm Plant (Indoor)"
+	},
+	{
+		"id": "zz-plant",
+		"description": "ZZ Plant"
+	},
+	{
+		"id": "succulent-in-pot",
+		"description": "Succulent in Pot"
+	},
+	{
+		"id": "cactus-in-pot",
+		"description": "Cactus in Pot"
+	},
+	{
+		"id": "orchid-in-pot",
+		"description": "Orchid in Pot"
+	},
+	{
+		"id": "herb-garden-pots-set",
+		"description": "Herb Garden Pots (Set)"
+	},
+	{
+		"id": "olive-tree-in-planter",
+		"description": "Olive Tree in Planter"
+	},
+	{
+		"id": "fern-potted",
+		"description": "Fern (Potted)"
+	},
+	{
+		"id": "hanging-planter-macram\u00e9",
+		"description": "Hanging Planter (Macram\u00e9)"
+	},
+	{
+		"id": "hanging-planter-ceramic",
+		"description": "Hanging Planter (Ceramic)"
+	},
+	{
+		"id": "artificial-flower-arrangement",
+		"description": "Artificial Flower Arrangement"
+	},
+	{
+		"id": "dried-flower-branch-arrangement",
+		"description": "Dried Flower/Branch Arrangement"
+	},
+	{
+		"id": "fresh-cut-flowers-in-vase",
+		"description": "Fresh Cut Flowers in Vase"
+	},
+	{
+		"id": "glass-terrarium",
+		"description": "Glass Terrarium"
+	},
+	{
+		"id": "wall-mounted-flat-screen-tv",
+		"description": "Wall-Mounted Flat Screen TV"
+	},
+	{
+		"id": "tv-on-stand",
+		"description": "TV on Stand"
+	},
+	{
+		"id": "computer-monitor",
+		"description": "Computer Monitor"
+	},
+	{
+		"id": "soundbar",
+		"description": "Soundbar"
+	},
+	{
+		"id": "bookshelf-speakers-pair",
+		"description": "Bookshelf Speakers (Pair)"
+	},
+	{
+		"id": "smart-speaker",
+		"description": "Smart Speaker"
+	},
+	{
+		"id": "turntable-record-player",
+		"description": "Turntable / Record Player"
+	},
+	{
+		"id": "vinyl-record-collection-shelf-crate",
+		"description": "Vinyl Record Collection (Shelf/Crate)"
+	},
+	{
+		"id": "headphones-on-stand",
+		"description": "Headphones (on Stand)"
+	},
+	{
+		"id": "smartphone-on-surface",
+		"description": "Smartphone (on Surface)"
+	},
+	{
+		"id": "tablet-on-stand",
+		"description": "Tablet on Stand"
+	},
+	{
+		"id": "wireless-charging-pad",
+		"description": "Wireless Charging Pad"
+	},
+	{
+		"id": "laptop-open",
+		"description": "Laptop (Open)"
+	},
+	{
+		"id": "laptop-closed",
+		"description": "Laptop (Closed)"
+	},
+	{
+		"id": "e-reader",
+		"description": "E-Reader"
+	},
+	{
+		"id": "smart-thermostat",
+		"description": "Smart Thermostat"
+	},
+	{
+		"id": "smart-display",
+		"description": "Smart Display"
+	},
+	{
+		"id": "video-doorbell",
+		"description": "Video Doorbell"
+	},
+	{
+		"id": "security-camera-indoor",
+		"description": "Security Camera (Indoor)"
+	},
+	{
+		"id": "game-console",
+		"description": "Game Console"
+	},
+	{
+		"id": "game-controller",
+		"description": "Game Controller"
+	},
+	{
+		"id": "vr-headset",
+		"description": "VR Headset"
+	},
+	{
+		"id": "wall-hvac-vent-register",
+		"description": "Wall HVAC Vent/Register"
+	},
+	{
+		"id": "ceiling-hvac-vent",
+		"description": "Ceiling HVAC Vent"
+	},
+	{
+		"id": "floor-hvac-vent-register",
+		"description": "Floor HVAC Vent/Register"
+	},
+	{
+		"id": "hotel-ptac-unit-under-window",
+		"description": "Hotel PTAC Unit (Under Window)"
+	},
+	{
+		"id": "baseboard-radiator",
+		"description": "Baseboard Radiator"
+	},
+	{
+		"id": "wall-thermostat-digital",
+		"description": "Wall Thermostat (Digital)"
+	},
+	{
+		"id": "light-switch-dimmer-panel",
+		"description": "Light Switch/Dimmer Panel"
+	},
+	{
+		"id": "lever-door-handle",
+		"description": "Lever Door Handle"
+	},
+	{
+		"id": "round-door-knob",
+		"description": "Round Door Knob"
+	},
+	{
+		"id": "deadbolt-lock",
+		"description": "Deadbolt Lock"
+	},
+	{
+		"id": "bar-pull-handle",
+		"description": "Bar Pull Handle"
+	},
+	{
+		"id": "round-cabinet-knob",
+		"description": "Round Cabinet Knob"
+	},
+	{
+		"id": "switch-plate",
+		"description": "Switch Plate"
+	},
+	{
+		"id": "standard-outlet-plate",
+		"description": "Standard Outlet Plate"
+	},
+	{
+		"id": "modern-house-numbers-set",
+		"description": "Modern House Numbers (Set)"
+	},
+	{
+		"id": "wall-mount-mailbox",
+		"description": "Wall-Mount Mailbox"
+	},
+	{
+		"id": "deciduous-tree-oak-maple",
+		"description": "Deciduous Tree (Oak/Maple)"
+	},
+	{
+		"id": "deciduous-tree-small-ornamental",
+		"description": "Deciduous Tree (Small Ornamental)"
+	},
+	{
+		"id": "evergreen-tree-tall-pine-fir",
+		"description": "Evergreen Tree (Tall Pine/Fir)"
+	},
+	{
+		"id": "evergreen-tree-medium-spruce",
+		"description": "Evergreen Tree (Medium Spruce)"
+	},
+	{
+		"id": "dwarf-japanese-pine",
+		"description": "Dwarf Japanese Pine"
+	},
+	{
+		"id": "palm-tree",
+		"description": "Palm Tree"
+	},
+	{
+		"id": "flowering-tree-cherry-magnolia",
+		"description": "Flowering Tree (Cherry/Magnolia)"
+	},
+	{
+		"id": "olive-tree",
+		"description": "Olive Tree"
+	},
+	{
+		"id": "birch-tree",
+		"description": "Birch Tree"
+	},
+	{
+		"id": "japanese-maple",
+		"description": "Japanese Maple"
+	},
+	{
+		"id": "boxwood-hedge-section",
+		"description": "Boxwood Hedge Section"
+	},
+	{
+		"id": "topiary-ball",
+		"description": "Topiary Ball"
+	},
+	{
+		"id": "flowering-shrub-hydrangea",
+		"description": "Flowering Shrub (Hydrangea)"
+	},
+	{
+		"id": "evergreen-shrub-juniper",
+		"description": "Evergreen Shrub (Juniper)"
+	},
+	{
+		"id": "ornamental-grass-clump",
+		"description": "Ornamental Grass Clump"
+	},
+	{
+		"id": "tall-privacy-hedge-section",
+		"description": "Tall Privacy Hedge Section"
+	},
+	{
+		"id": "coastal-windswept-shrub",
+		"description": "Coastal/Windswept Shrub"
+	},
+	{
+		"id": "flower-bed-section-mixed",
+		"description": "Flower Bed Section (Mixed)"
+	},
+	{
+		"id": "rose-bush",
+		"description": "Rose Bush"
+	},
+	{
+		"id": "lavender-plant-cluster",
+		"description": "Lavender Plant Cluster"
+	},
+	{
+		"id": "fern-cluster",
+		"description": "Fern Cluster"
+	},
+	{
+		"id": "succulent-ground-cover-patch",
+		"description": "Succulent Ground Cover Patch"
+	},
+	{
+		"id": "garden-bed-edging-stone",
+		"description": "Garden Bed Edging (Stone)"
+	},
+	{
+		"id": "grass-lawn-section",
+		"description": "Grass Lawn Section"
+	},
+	{
+		"id": "moss-patch",
+		"description": "Moss Patch"
+	},
+	{
+		"id": "ivy-ground-cover",
+		"description": "Ivy Ground Cover"
+	},
+	{
+		"id": "climbing-wall-ivy-vertical",
+		"description": "Climbing Wall Ivy (Vertical)"
+	},
+	{
+		"id": "bark-mulch-section",
+		"description": "Bark Mulch Section"
+	},
+	{
+		"id": "pea-gravel-section",
+		"description": "Pea Gravel Section"
+	},
+	{
+		"id": "river-rock-section",
+		"description": "River Rock Section"
+	},
+	{
+		"id": "decorative-stone-section",
+		"description": "Decorative Stone Section"
+	},
+	{
+		"id": "flagstone-section",
+		"description": "Flagstone Section"
+	},
+	{
+		"id": "flat-ground-plane-grass",
+		"description": "Flat Ground Plane (Grass)"
+	},
+	{
+		"id": "flat-ground-plane-dirt",
+		"description": "Flat Ground Plane (Dirt)"
+	},
+	{
+		"id": "sand-patch",
+		"description": "Sand Patch"
+	},
+	{
+		"id": "crushed-gravel-ground",
+		"description": "Crushed Gravel Ground"
+	},
+	{
+		"id": "gentle-grass-hill",
+		"description": "Gentle Grass Hill"
+	},
+	{
+		"id": "steep-embankment",
+		"description": "Steep Embankment"
+	},
+	{
+		"id": "terraced-hillside",
+		"description": "Terraced Hillside"
+	},
+	{
+		"id": "rolling-terrain-section",
+		"description": "Rolling Terrain Section"
+	},
+	{
+		"id": "cliff-face-section",
+		"description": "Cliff Face Section"
+	},
+	{
+		"id": "rock-wall-section",
+		"description": "Rock Wall Section"
+	},
+	{
+		"id": "exposed-rock-outcropping",
+		"description": "Exposed Rock Outcropping"
+	},
+	{
+		"id": "large-boulder",
+		"description": "Large Boulder"
+	},
+	{
+		"id": "medium-boulder",
+		"description": "Medium Boulder"
+	},
+	{
+		"id": "small-rock-cluster",
+		"description": "Small Rock Cluster"
+	},
+	{
+		"id": "driftwood-log",
+		"description": "Driftwood Log"
+	},
+	{
+		"id": "garden-fountain",
+		"description": "Garden Fountain"
+	},
+	{
+		"id": "wall-fountain",
+		"description": "Wall Fountain"
+	},
+	{
+		"id": "garden-pond",
+		"description": "Garden Pond"
+	},
+	{
+		"id": "stream-section",
+		"description": "Stream Section"
+	},
+	{
+		"id": "birdbath",
+		"description": "Birdbath"
+	},
+	{
+		"id": "concrete-driveway-section",
+		"description": "Concrete Driveway Section"
+	},
+	{
+		"id": "paver-driveway-section",
+		"description": "Paver Driveway Section"
+	},
+	{
+		"id": "gravel-driveway-section",
+		"description": "Gravel Driveway Section"
+	},
+	{
+		"id": "asphalt-driveway-section",
+		"description": "Asphalt Driveway Section"
+	},
+	{
+		"id": "concrete-walkway-section",
+		"description": "Concrete Walkway Section"
+	},
+	{
+		"id": "brick-path-section",
+		"description": "Brick Path Section"
+	},
+	{
+		"id": "flagstone-path-section",
+		"description": "Flagstone Path Section"
+	},
+	{
+		"id": "stepping-stones-embedded",
+		"description": "Stepping Stones (Embedded)"
+	},
+	{
+		"id": "gravel-path-section",
+		"description": "Gravel Path Section"
+	},
+	{
+		"id": "concrete-patio-slab",
+		"description": "Concrete Patio Slab"
+	},
+	{
+		"id": "paver-patio-section",
+		"description": "Paver Patio Section"
+	},
+	{
+		"id": "stamped-concrete-patio-section",
+		"description": "Stamped Concrete Patio Section"
+	},
+	{
+		"id": "stone-retaining-wall-section",
+		"description": "Stone Retaining Wall Section"
+	},
+	{
+		"id": "concrete-retaining-wall-section",
+		"description": "Concrete Retaining Wall Section"
+	},
+	{
+		"id": "low-decorative-garden-wall",
+		"description": "Low Decorative Garden Wall"
+	},
+	{
+		"id": "concrete-outdoor-steps",
+		"description": "Concrete Outdoor Steps"
+	},
+	{
+		"id": "stone-outdoor-steps",
+		"description": "Stone Outdoor Steps"
+	},
+	{
+		"id": "wood-deck-steps",
+		"description": "Wood Deck Steps"
+	},
+	{
+		"id": "wood-privacy-fence-section",
+		"description": "Wood Privacy Fence Section"
+	},
+	{
+		"id": "wood-picket-fence-section",
+		"description": "Wood Picket Fence Section"
+	},
+	{
+		"id": "metal-wrought-iron-fence-section",
+		"description": "Metal/Wrought Iron Fence Section"
+	},
+	{
+		"id": "horizontal-slat-fence-modern",
+		"description": "Horizontal Slat Fence (Modern)"
+	},
+	{
+		"id": "chain-link-fence-section",
+		"description": "Chain-Link Fence Section"
+	},
+	{
+		"id": "pedestrian-gate-wood",
+		"description": "Pedestrian Gate (Wood)"
+	},
+	{
+		"id": "pedestrian-gate-metal",
+		"description": "Pedestrian Gate (Metal)"
+	},
+	{
+		"id": "driveway-gate",
+		"description": "Driveway Gate"
+	},
+	{
+		"id": "garden-arbor",
+		"description": "Garden Arbor"
+	},
+	{
+		"id": "trellis-panel",
+		"description": "Trellis Panel"
+	},
+	{
+		"id": "stone-property-wall-section",
+		"description": "Stone Property Wall Section"
+	},
+	{
+		"id": "brick-property-wall-section",
+		"description": "Brick Property Wall Section"
+	},
+	{
+		"id": "stucco-property-wall-section",
+		"description": "Stucco Property Wall Section"
+	},
+	{
+		"id": "hedge-boundary-section",
+		"description": "Hedge Boundary Section"
+	},
+	{
+		"id": "living-green-wall-panel",
+		"description": "Living Green Wall Panel"
+	},
+	{
+		"id": "wood-pergola",
+		"description": "Wood Pergola"
+	},
+	{
+		"id": "metal-pergola",
+		"description": "Metal Pergola"
+	},
+	{
+		"id": "gazebo",
+		"description": "Gazebo"
+	},
+	{
+		"id": "shade-sail",
+		"description": "Shade Sail"
+	},
+	{
+		"id": "gas-grill-freestanding",
+		"description": "Gas Grill (Freestanding)"
+	},
+	{
+		"id": "built-in-outdoor-kitchen-island",
+		"description": "Built-In Outdoor Kitchen Island"
+	},
+	{
+		"id": "round-fire-pit",
+		"description": "Round Fire Pit"
+	},
+	{
+		"id": "rectangular-fire-table",
+		"description": "Rectangular Fire Table"
+	},
+	{
+		"id": "outdoor-fireplace",
+		"description": "Outdoor Fireplace"
+	},
+	{
+		"id": "in-ground-pool-rectangular",
+		"description": "In-Ground Pool (Rectangular)"
+	},
+	{
+		"id": "infinity-edge-pool",
+		"description": "Infinity-Edge Pool"
+	},
+	{
+		"id": "hot-tub-spa",
+		"description": "Hot Tub/Spa"
+	},
+	{
+		"id": "pool-decking-section",
+		"description": "Pool Decking Section"
+	},
+	{
+		"id": "pool-ladder",
+		"description": "Pool Ladder"
+	},
+	{
+		"id": "garden-shed",
+		"description": "Garden Shed"
+	},
+	{
+		"id": "freestanding-outdoor-shower",
+		"description": "Freestanding Outdoor Shower"
+	},
+	{
+		"id": "outdoor-privacy-screen-slat-panel",
+		"description": "Outdoor Privacy Screen (Slat Panel)"
+	},
+	{
+		"id": "outdoor-dining-set",
+		"description": "Outdoor Dining Set"
+	},
+	{
+		"id": "outdoor-chaise-lounge-607",
+		"description": "Outdoor Chaise Lounge"
+	},
+	{
+		"id": "outdoor-daybed",
+		"description": "Outdoor Daybed"
+	},
+	{
+		"id": "outdoor-sectional-sofa",
+		"description": "Outdoor Sectional Sofa"
+	},
+	{
+		"id": "outdoor-lounge-chair",
+		"description": "Outdoor Lounge Chair"
+	},
+	{
+		"id": "outdoor-coffee-table",
+		"description": "Outdoor Coffee Table"
+	},
+	{
+		"id": "outdoor-side-table-612",
+		"description": "Outdoor Side Table"
+	},
+	{
+		"id": "outdoor-bench-concrete",
+		"description": "Outdoor Bench (Concrete)"
+	},
+	{
+		"id": "outdoor-bench-wood",
+		"description": "Outdoor Bench (Wood)"
+	},
+	{
+		"id": "patio-umbrella-center-pole",
+		"description": "Patio Umbrella (Center Pole)"
+	},
+	{
+		"id": "patio-umbrella-cantilever",
+		"description": "Patio Umbrella (Cantilever)"
+	},
+	{
+		"id": "large-outdoor-planter-concrete",
+		"description": "Large Outdoor Planter (Concrete)"
+	},
+	{
+		"id": "large-outdoor-planter-ceramic",
+		"description": "Large Outdoor Planter (Ceramic)"
+	},
+	{
+		"id": "tall-cylindrical-planter",
+		"description": "Tall Cylindrical Planter"
+	},
+	{
+		"id": "long-rectangular-planter-box",
+		"description": "Long Rectangular Planter Box"
+	},
+	{
+		"id": "window-box-planter",
+		"description": "Window Box Planter"
+	},
+	{
+		"id": "raised-garden-bed",
+		"description": "Raised Garden Bed"
+	},
+	{
+		"id": "freestanding-outdoor-lantern",
+		"description": "Freestanding Outdoor Lantern"
+	},
+	{
+		"id": "firewood-stack-in-cradle",
+		"description": "Firewood Stack in Cradle"
+	},
+	{
+		"id": "garden-hose-on-reel",
+		"description": "Garden Hose on Reel"
+	},
+	{
+		"id": "wheelbarrow",
+		"description": "Wheelbarrow"
+	},
+	{
+		"id": "lawn-mower",
+		"description": "Lawn Mower"
+	},
+	{
+		"id": "watering-can",
+		"description": "Watering Can"
+	},
+	{
+		"id": "potting-soil-bag",
+		"description": "Potting Soil Bag"
+	},
+	{
+		"id": "bird-feeder",
+		"description": "Bird Feeder"
+	},
+	{
+		"id": "wind-chime",
+		"description": "Wind Chime"
+	},
+	{
+		"id": "garden-statue-ornament",
+		"description": "Garden Statue/Ornament"
+	},
+	{
+		"id": "outdoor-rug",
+		"description": "Outdoor Rug"
+	},
+	{
+		"id": "sedan-parked",
+		"description": "Sedan (Parked)"
+	},
+	{
+		"id": "suv-parked",
+		"description": "SUV (Parked)"
+	},
+	{
+		"id": "pickup-truck",
+		"description": "Pickup Truck"
+	},
+	{
+		"id": "ev-charging-station",
+		"description": "EV Charging Station"
+	},
+	{
+		"id": "bicycle",
+		"description": "Bicycle"
+	},
+	{
+		"id": "motorcycle",
+		"description": "Motorcycle"
+	},
+	{
+		"id": "electric-scooter",
+		"description": "Electric Scooter"
+	},
+	{
+		"id": "luggage-rack-folding",
+		"description": "Luggage Rack (Folding)"
+	},
+	{
+		"id": "valet-stand",
+		"description": "Valet Stand"
+	},
+	{
+		"id": "rolling-suitcase",
+		"description": "Rolling Suitcase"
+	},
+	{
+		"id": "travel-duffel-bag",
+		"description": "Travel Duffel Bag"
+	},
+	{
+		"id": "mini-fridge-under-counter",
+		"description": "Mini Fridge (Under Counter)"
+	},
+	{
+		"id": "minibar-cabinet",
+		"description": "Minibar Cabinet"
+	},
+	{
+		"id": "room-service-cart",
+		"description": "Room Service Cart"
+	},
+	{
+		"id": "room-service-tray",
+		"description": "Room Service Tray"
+	},
+	{
+		"id": "welcome-amenity-tray",
+		"description": "Welcome Amenity Tray"
+	},
+	{
+		"id": "in-room-safe",
+		"description": "In-Room Safe"
+	},
+	{
+		"id": "ironing-board-folded",
+		"description": "Ironing Board (Folded)"
+	},
+	{
+		"id": "iron",
+		"description": "Iron"
+	},
+	{
+		"id": "room-number-plaque",
+		"description": "Room Number Plaque"
+	},
+	{
+		"id": "do-not-disturb-door-hanger",
+		"description": "Do-Not-Disturb Door Hanger"
+	},
+	{
+		"id": "exit-sign",
+		"description": "Exit Sign"
+	},
+	{
+		"id": "hotel-information-binder",
+		"description": "Hotel Information Binder"
+	},
+	{
+		"id": "wayfinding-corridor-sign",
+		"description": "Wayfinding Corridor Sign"
+	},
+	{
+		"id": "electronic-door-lock-keycard",
+		"description": "Electronic Door Lock (Keycard)"
+	},
+	{
+		"id": "key-card-on-surface",
+		"description": "Key Card on Surface"
+	},
+	{
+		"id": "bathrobe-hanging",
+		"description": "Bathrobe (Hanging)"
+	},
+	{
+		"id": "slippers-pair",
+		"description": "Slippers (Pair)"
+	},
+	{
+		"id": "amenity-bottles-set",
+		"description": "Amenity Bottles (Set)"
+	},
+	{
+		"id": "vanity-makeup-mirror-magnifying",
+		"description": "Vanity Makeup Mirror (Magnifying)"
+	},
+	{
+		"id": "ice-bucket-with-tongs",
+		"description": "Ice Bucket with Tongs"
+	},
+	{
+		"id": "stationery-set-notepad-pen",
+		"description": "Stationery Set (Notepad & Pen)"
+	},
+	{
+		"id": "tissue-box",
+		"description": "Tissue Box"
+	},
+	{
+		"id": "coffee-tea-hospitality-station",
+		"description": "Coffee/Tea Hospitality Station"
+	},
+	{
+		"id": "complimentary-water-bottle",
+		"description": "Complimentary Water Bottle"
+	},
+	{
+		"id": "fruit-bowl-welcome-amenity",
+		"description": "Fruit Bowl (Welcome Amenity)"
+	},
+	{
+		"id": "bedside-phone",
+		"description": "Bedside Phone"
+	},
+	{
+		"id": "modern-gas-fireplace-recessed",
+		"description": "Modern Gas Fireplace (Recessed)"
+	},
+	{
+		"id": "traditional-wood-fireplace",
+		"description": "Traditional Wood Fireplace"
+	},
+	{
+		"id": "fireplace-mantel-shelf",
+		"description": "Fireplace Mantel Shelf"
+	},
+	{
+		"id": "fireplace-screen",
+		"description": "Fireplace Screen"
+	},
+	{
+		"id": "decorative-log-stack",
+		"description": "Decorative Log Stack"
+	},
+	{
+		"id": "full-length-floor-mirror",
+		"description": "Full-Length Floor Mirror"
+	},
+	{
+		"id": "round-wall-mirror-decorative",
+		"description": "Round Wall Mirror (Decorative)"
+	},
+	{
+		"id": "rectangular-wall-mirror-entryway",
+		"description": "Rectangular Wall Mirror (Entryway)"
+	},
+	{
+		"id": "kitchen-trash-can",
+		"description": "Kitchen Trash Can"
+	},
+	{
+		"id": "kitchen-recycling-bin",
+		"description": "Kitchen Recycling Bin"
+	},
+	{
+		"id": "small-room-wastebasket",
+		"description": "Small Room Wastebasket"
+	},
+	{
+		"id": "broom-dustpan",
+		"description": "Broom & Dustpan"
+	},
+	{
+		"id": "vacuum-cleaner-upright",
+		"description": "Vacuum Cleaner (Upright)"
+	},
+	{
+		"id": "robot-vacuum",
+		"description": "Robot Vacuum"
+	},
+	{
+		"id": "mop-bucket",
+		"description": "Mop & Bucket"
+	},
+	{
+		"id": "spray-bottle-cleaning-supplies-caddy",
+		"description": "Spray Bottle & Cleaning Supplies Caddy"
+	},
+	{
+		"id": "umbrella-stand",
+		"description": "Umbrella Stand"
+	},
+	{
+		"id": "key-bowl-tray",
+		"description": "Key Bowl/Tray"
+	},
+	{
+		"id": "mail-pile-letter-stack",
+		"description": "Mail Pile / Letter Stack"
+	},
+	{
+		"id": "shoes-pair-by-door",
+		"description": "Shoes (Pair by Door)"
+	},
+	{
+		"id": "backpack-leaning",
+		"description": "Backpack (Leaning)"
+	},
+	{
+		"id": "purse-handbag-on-hook-or-surface",
+		"description": "Purse / Handbag (on Hook or Surface)"
+	},
+	{
+		"id": "sunglasses-on-surface",
+		"description": "Sunglasses (on Surface)"
+	},
+	{
+		"id": "reusable-shopping-bags-hanging",
+		"description": "Reusable Shopping Bags (Hanging)"
+	},
+	{
+		"id": "laundry-basket-hamper",
+		"description": "Laundry Basket / Hamper"
+	},
+	{
+		"id": "laundry-detergent-bottle",
+		"description": "Laundry Detergent Bottle"
+	},
+	{
+		"id": "drying-rack-foldable",
+		"description": "Drying Rack (Foldable)"
+	},
+	{
+		"id": "desk-organizer-pen-cup",
+		"description": "Desk Organizer / Pen Cup"
+	},
+	{
+		"id": "sticky-note-pad",
+		"description": "Sticky Note Pad"
+	},
+	{
+		"id": "desk-fan",
+		"description": "Desk Fan"
+	},
+	{
+		"id": "monitor-stand-laptop-riser",
+		"description": "Monitor Stand / Laptop Riser"
+	},
+	{
+		"id": "mouse-pad",
+		"description": "Mouse Pad"
+	},
+	{
+		"id": "external-hard-drive",
+		"description": "External Hard Drive"
+	},
+	{
+		"id": "desk-tray-paper-tray",
+		"description": "Desk Tray / Paper Tray"
+	},
+	{
+		"id": "notebook-journal-closed",
+		"description": "Notebook / Journal (Closed)"
+	},
+	{
+		"id": "pen-pencil-set",
+		"description": "Pen/Pencil Set"
+	},
+	{
+		"id": "desktop-printer",
+		"description": "Desktop Printer"
+	},
+	{
+		"id": "paper-shredder",
+		"description": "Paper Shredder"
+	},
+	{
+		"id": "filing-cabinet",
+		"description": "Filing Cabinet"
+	},
+	{
+		"id": "banker-s-box-storage-box",
+		"description": "Banker's Box / Storage Box"
+	},
+	{
+		"id": "desktop-file-organizer",
+		"description": "Desktop File Organizer"
+	},
+	{
+		"id": "clothing-draped-over-chair",
+		"description": "Clothing Draped Over Chair"
+	},
+	{
+		"id": "shoes-by-bed-pair",
+		"description": "Shoes by Bed (Pair)"
+	},
+	{
+		"id": "pajamas-folded-on-bed",
+		"description": "Pajamas (Folded on Bed)"
+	},
+	{
+		"id": "reading-glasses-on-nightstand",
+		"description": "Reading Glasses (on Nightstand)"
+	},
+	{
+		"id": "phone-charging-cable",
+		"description": "Phone Charging Cable"
+	},
+	{
+		"id": "jewelry-box",
+		"description": "Jewelry Box"
+	},
+	{
+		"id": "watch-on-surface",
+		"description": "Watch (on Surface)"
+	},
+	{
+		"id": "perfume-cologne-bottle",
+		"description": "Perfume/Cologne Bottle"
+	},
+	{
+		"id": "framed-photo-personal",
+		"description": "Framed Photo (Personal)"
+	},
+	{
+		"id": "glass-of-water-bedside",
+		"description": "Glass of Water (Bedside)"
+	},
+	{
+		"id": "sleep-mask",
+		"description": "Sleep Mask"
+	},
+	{
+		"id": "remote-control",
+		"description": "Remote Control"
+	},
+	{
+		"id": "coaster-set",
+		"description": "Coaster Set"
+	},
+	{
+		"id": "board-game-box",
+		"description": "Board Game Box"
+	},
+	{
+		"id": "puzzle-box-on-table",
+		"description": "Puzzle Box (on Table)"
+	},
+	{
+		"id": "playing-card-deck",
+		"description": "Playing Card Deck"
+	},
+	{
+		"id": "wine-glass-half-full-on-table",
+		"description": "Wine Glass (Half Full on Table)"
+	},
+	{
+		"id": "coffee-cup-on-surface",
+		"description": "Coffee Cup (on Surface)"
+	},
+	{
+		"id": "snack-bowl-on-coffee-table",
+		"description": "Snack Bowl (on Coffee Table)"
+	},
+	{
+		"id": "tv-remote-caddy",
+		"description": "TV Remote Caddy"
+	},
+	{
+		"id": "blanket-draped-over-sofa-arm",
+		"description": "Blanket Draped Over Sofa Arm"
+	},
+	{
+		"id": "coffee-cup-dirty-on-counter",
+		"description": "Coffee Cup (Dirty on Counter)"
+	},
+	{
+		"id": "open-cereal-box",
+		"description": "Open Cereal Box"
+	},
+	{
+		"id": "fruit-on-counter-loose-apples-bananas",
+		"description": "Fruit on Counter (Loose Apples/Bananas)"
+	},
+	{
+		"id": "open-laptop-on-counter",
+		"description": "Open Laptop on Counter"
+	},
+	{
+		"id": "pizza-box",
+		"description": "Pizza Box"
+	},
+	{
+		"id": "takeout-container",
+		"description": "Takeout Container"
+	},
+	{
+		"id": "lunch-box",
+		"description": "Lunch Box"
+	},
+	{
+		"id": "baby-bottle-sippy-cup",
+		"description": "Baby Bottle / Sippy Cup"
+	},
+	{
+		"id": "magnetic-fridge-photos-magnets",
+		"description": "Magnetic Fridge Photos/Magnets"
+	},
+	{
+		"id": "shopping-list-on-fridge",
+		"description": "Shopping List (on Fridge)"
+	},
+	{
+		"id": "brown-paper-grocery-bag-full",
+		"description": "Brown Paper Grocery Bag (Full)"
+	},
+	{
+		"id": "dog-bowl-set",
+		"description": "Dog Bowl Set"
+	},
+	{
+		"id": "cat-bowl-set",
+		"description": "Cat Bowl Set"
+	},
+	{
+		"id": "acoustic-guitar-on-stand",
+		"description": "Acoustic Guitar (on Stand)"
+	},
+	{
+		"id": "electric-guitar-on-stand",
+		"description": "Electric Guitar (on Stand)"
+	},
+	{
+		"id": "keyboard-digital-piano",
+		"description": "Keyboard / Digital Piano"
+	},
+	{
+		"id": "guitar-amp",
+		"description": "Guitar Amp"
+	},
+	{
+		"id": "ukulele",
+		"description": "Ukulele"
+	},
+	{
+		"id": "yoga-mat-rolled",
+		"description": "Yoga Mat (Rolled)"
+	},
+	{
+		"id": "dumbbell-set",
+		"description": "Dumbbell Set"
+	},
+	{
+		"id": "kettlebell",
+		"description": "Kettlebell"
+	},
+	{
+		"id": "foam-roller",
+		"description": "Foam Roller"
+	},
+	{
+		"id": "resistance-bands",
+		"description": "Resistance Bands"
+	},
+	{
+		"id": "exercise-ball",
+		"description": "Exercise Ball"
+	},
+	{
+		"id": "pull-up-bar-doorframe",
+		"description": "Pull-Up Bar (Doorframe)"
+	},
+	{
+		"id": "basketball",
+		"description": "Basketball"
+	},
+	{
+		"id": "soccer-ball",
+		"description": "Soccer Ball"
+	},
+	{
+		"id": "tennis-racket",
+		"description": "Tennis Racket"
+	},
+	{
+		"id": "baseball-glove-ball",
+		"description": "Baseball Glove & Ball"
+	},
+	{
+		"id": "skateboard-leaning",
+		"description": "Skateboard (Leaning)"
+	},
+	{
+		"id": "surfboard-leaning",
+		"description": "Surfboard (Leaning)"
+	},
+	{
+		"id": "snowboard-leaning",
+		"description": "Snowboard (Leaning)"
+	},
+	{
+		"id": "ski-poles-skis-leaning",
+		"description": "Ski Poles & Skis (Leaning)"
+	},
+	{
+		"id": "golf-bag-with-clubs",
+		"description": "Golf Bag with Clubs"
+	},
+	{
+		"id": "knitting-crochet-basket",
+		"description": "Knitting/Crochet Basket"
+	},
+	{
+		"id": "sewing-machine",
+		"description": "Sewing Machine"
+	},
+	{
+		"id": "art-easel",
+		"description": "Art Easel"
+	},
+	{
+		"id": "paint-supplies-jars-brushes",
+		"description": "Paint Supplies (Jars/Brushes)"
+	},
+	{
+		"id": "book-open-face-down",
+		"description": "Book (Open Face-Down)"
+	},
+	{
+		"id": "magazine-open",
+		"description": "Magazine (Open)"
+	},
+	{
+		"id": "crossword-sudoku-book",
+		"description": "Crossword/Sudoku Book"
+	},
+	{
+		"id": "chess-set",
+		"description": "Chess Set"
+	},
+	{
+		"id": "stuffed-animal",
+		"description": "Stuffed Animal"
+	},
+	{
+		"id": "building-block-set-container",
+		"description": "Building Block Set (Container)"
+	},
+	{
+		"id": "toy-car",
+		"description": "Toy Car"
+	},
+	{
+		"id": "dollhouse",
+		"description": "Dollhouse"
+	},
+	{
+		"id": "action-figure-collectible-on-shelf",
+		"description": "Action Figure / Collectible (on Shelf)"
+	},
+	{
+		"id": "pet-bed-dog-cat",
+		"description": "Pet Bed (Dog/Cat)"
+	},
+	{
+		"id": "pet-crate-kennel",
+		"description": "Pet Crate / Kennel"
+	},
+	{
+		"id": "cat-scratching-post",
+		"description": "Cat Scratching Post"
+	},
+	{
+		"id": "cat-tree-tower",
+		"description": "Cat Tree / Tower"
+	},
+	{
+		"id": "dog-leash-collar-hanging",
+		"description": "Dog Leash & Collar (Hanging)"
+	},
+	{
+		"id": "pet-toy-chew-ball",
+		"description": "Pet Toy (Chew/Ball)"
+	},
+	{
+		"id": "fish-tank-aquarium",
+		"description": "Fish Tank / Aquarium"
+	},
+	{
+		"id": "bird-cage",
+		"description": "Bird Cage"
+	},
+	{
+		"id": "step-stool-step-ladder",
+		"description": "Step Stool / Step Ladder"
+	},
+	{
+		"id": "toolbox",
+		"description": "Toolbox"
+	},
+	{
+		"id": "power-strip-surge-protector",
+		"description": "Power Strip / Surge Protector"
+	},
+	{
+		"id": "extension-cord-coiled",
+		"description": "Extension Cord (Coiled)"
+	},
+	{
+		"id": "fire-extinguisher",
+		"description": "Fire Extinguisher"
+	},
+	{
+		"id": "first-aid-kit",
+		"description": "First Aid Kit"
+	},
+	{
+		"id": "flashlight",
+		"description": "Flashlight"
+	},
+	{
+		"id": "batteries-pack",
+		"description": "Batteries (Pack)"
+	},
+	{
+		"id": "portable-fan-standing",
+		"description": "Portable Fan (Standing)"
+	},
+	{
+		"id": "space-heater",
+		"description": "Space Heater"
+	},
+	{
+		"id": "humidifier",
+		"description": "Humidifier"
+	},
+	{
+		"id": "air-purifier",
+		"description": "Air Purifier"
+	},
+	{
+		"id": "dehumidifier",
+		"description": "Dehumidifier"
+	},
+	{
+		"id": "plastic-storage-bin-with-lid",
+		"description": "Plastic Storage Bin (with Lid)"
+	},
+	{
+		"id": "moving-box-cardboard",
+		"description": "Moving Box (Cardboard)"
+	},
+	{
+		"id": "wicker-storage-basket",
+		"description": "Wicker Storage Basket"
+	},
+	{
+		"id": "fabric-storage-cube",
+		"description": "Fabric Storage Cube"
+	},
+	{
+		"id": "under-bed-storage-box",
+		"description": "Under-Bed Storage Box"
+	},
+	{
+		"id": "wine-bottle-806",
+		"description": "Wine Bottle"
+	},
+	{
+		"id": "beer-bottles-six-pack",
+		"description": "Beer Bottles (Six-Pack)"
+	},
+	{
+		"id": "liquor-bottle",
+		"description": "Liquor Bottle"
+	},
+	{
+		"id": "soda-sparkling-water-can",
+		"description": "Soda/Sparkling Water Can"
+	},
+	{
+		"id": "juice-carton",
+		"description": "Juice Carton"
+	},
+	{
+		"id": "water-bottle-plastic",
+		"description": "Water Bottle (Plastic)"
+	},
+	{
+		"id": "coffee-bag-whole-bean",
+		"description": "Coffee Bag (Whole Bean)"
+	},
+	{
+		"id": "bread-loaf",
+		"description": "Bread Loaf"
+	},
+	{
+		"id": "cheese-wheel-block",
+		"description": "Cheese Wheel/Block"
+	},
+	{
+		"id": "fruit-bowl-full",
+		"description": "Fruit Bowl (Full)"
+	},
+	{
+		"id": "olive-oil-bottle",
+		"description": "Olive Oil Bottle"
+	},
+	{
+		"id": "honey-jar",
+		"description": "Honey Jar"
+	},
+	{
+		"id": "jam-jar",
+		"description": "Jam Jar"
+	},
+	{
+		"id": "butter-dish",
+		"description": "Butter Dish"
+	},
+	{
+		"id": "egg-carton",
+		"description": "Egg Carton"
+	},
+	{
+		"id": "bag-of-chips-sealed",
+		"description": "Bag of Chips (Sealed)"
+	},
+	{
+		"id": "candy-cookie-jar",
+		"description": "Candy/Cookie Jar"
+	},
+	{
+		"id": "cake-stand-with-cake",
+		"description": "Cake Stand with Cake"
+	},
+	{
+		"id": "workbench",
+		"description": "Workbench"
+	},
+	{
+		"id": "pegboard-tool-wall",
+		"description": "Pegboard Tool Wall"
+	},
+	{
+		"id": "power-drill",
+		"description": "Power Drill"
+	},
+	{
+		"id": "circular-saw",
+		"description": "Circular Saw"
+	},
+	{
+		"id": "tool-chest-rolling",
+		"description": "Tool Chest (Rolling)"
+	},
+	{
+		"id": "plastic-storage-shelving-unit",
+		"description": "Plastic Storage Shelving Unit"
+	},
+	{
+		"id": "garage-ceiling-storage-rack",
+		"description": "Garage Ceiling Storage Rack"
+	},
+	{
+		"id": "folding-table",
+		"description": "Folding Table"
+	},
+	{
+		"id": "shop-vac",
+		"description": "Shop Vac"
+	},
+	{
+		"id": "generator",
+		"description": "Generator"
+	},
+	{
+		"id": "holiday-decoration-box-stored",
+		"description": "Holiday Decoration Box (Stored)"
+	},
+	{
+		"id": "camping-gear-tent-bag-cooler",
+		"description": "Camping Gear (Tent Bag/Cooler)"
+	},
+	{
+		"id": "suitcase-stored",
+		"description": "Suitcase (Stored)"
+	},
+	{
+		"id": "ski-snowboard-rack-wall",
+		"description": "Ski/Snowboard Rack (Wall)"
+	},
+	{
+		"id": "wreath-door",
+		"description": "Wreath (Door)"
+	},
+	{
+		"id": "string-lights-indoor-decorative",
+		"description": "String Lights (Indoor Decorative)"
+	},
+	{
+		"id": "advent-calendar",
+		"description": "Advent Calendar"
+	},
+	{
+		"id": "menorah",
+		"description": "Menorah"
+	},
+	{
+		"id": "pumpkin-decorative",
+		"description": "Pumpkin (Decorative)"
+	},
+	{
+		"id": "stocking-hung-by-fireplace",
+		"description": "Stocking (Hung by Fireplace)"
+	},
+	{
+		"id": "jacket-on-hook-chair",
+		"description": "Jacket (on Hook/Chair)"
+	},
+	{
+		"id": "hat-on-hook-shelf",
+		"description": "Hat (on Hook/Shelf)"
+	},
+	{
+		"id": "scarf-draped",
+		"description": "Scarf (Draped)"
+	},
+	{
+		"id": "boots-pair-by-door",
+		"description": "Boots (Pair by Door)"
+	},
+	{
+		"id": "sneakers-pair",
+		"description": "Sneakers (Pair)"
+	},
+	{
+		"id": "high-heels-pair",
+		"description": "High Heels (Pair)"
+	},
+	{
+		"id": "flip-flops-sandals-pair",
+		"description": "Flip Flops / Sandals (Pair)"
+	},
+	{
+		"id": "slippers-pair-851",
+		"description": "Slippers (Pair)"
+	},
+	{
+		"id": "gym-bag",
+		"description": "Gym Bag"
+	},
+	{
+		"id": "messenger-bag-laptop-bag",
+		"description": "Messenger Bag / Laptop Bag"
+	},
+	{
+		"id": "tote-bag",
+		"description": "Tote Bag"
+	},
+	{
+		"id": "diaper-bag",
+		"description": "Diaper Bag"
+	},
+	{
+		"id": "wallet-on-surface",
+		"description": "Wallet (on Surface)"
+	},
+	{
+		"id": "keys-on-surface-hook",
+		"description": "Keys (on Surface/Hook)"
+	},
+	{
+		"id": "belt-draped-hung",
+		"description": "Belt (Draped/Hung)"
+	},
+	{
+		"id": "child-s-backpack",
+		"description": "Child's Backpack"
+	},
+	{
+		"id": "crayons-coloring-book",
+		"description": "Crayons & Coloring Book"
+	},
+	{
+		"id": "baby-monitor",
+		"description": "Baby Monitor"
+	},
+	{
+		"id": "high-chair",
+		"description": "High Chair"
+	},
+	{
+		"id": "stroller-folded",
+		"description": "Stroller (Folded)"
+	},
+	{
+		"id": "toy-bin-toy-chest",
+		"description": "Toy Bin / Toy Chest"
+	},
+	{
+		"id": "kid-s-art-taped-to-fridge-wall",
+		"description": "Kid's Art (Taped to Fridge/Wall)"
+	},
+	{
+		"id": "wet-towel-draped-on-hook",
+		"description": "Wet Towel (Draped on Hook)"
+	},
+	{
+		"id": "shampoo-conditioner-bottles-shower-ledge",
+		"description": "Shampoo/Conditioner Bottles (Shower Ledge)"
+	},
+	{
+		"id": "body-wash-bottle",
+		"description": "Body Wash Bottle"
+	},
+	{
+		"id": "razor-on-shelf",
+		"description": "Razor (on Shelf)"
+	},
+	{
+		"id": "loofah-sponge-hanging",
+		"description": "Loofah/Sponge (Hanging)"
+	},
+	{
+		"id": "hair-brush",
+		"description": "Hair Brush"
+	},
+	{
+		"id": "hair-ties-bobby-pins-scattered",
+		"description": "Hair Ties & Bobby Pins (Scattered)"
+	},
+	{
+		"id": "nail-polish-bottles-grouped",
+		"description": "Nail Polish Bottles (Grouped)"
+	},
+	{
+		"id": "skincare-products-grouped",
+		"description": "Skincare Products (Grouped)"
+	},
+	{
+		"id": "contact-lens-case",
+		"description": "Contact Lens Case"
+	},
+	{
+		"id": "garden-gloves",
+		"description": "Garden Gloves"
+	},
+	{
+		"id": "kids-outdoor-toys-scattered",
+		"description": "Kids' Outdoor Toys (Scattered)"
+	},
+	{
+		"id": "pool-noodle-pool-float",
+		"description": "Pool Noodle / Pool Float"
+	},
+	{
+		"id": "outdoor-citronella-candle",
+		"description": "Outdoor Citronella Candle"
+	},
+	{
+		"id": "sprinkler",
+		"description": "Sprinkler"
+	},
+	{
+		"id": "garden-kneeling-pad",
+		"description": "Garden Kneeling Pad"
+	},
+	{
+		"id": "cooler-portable",
+		"description": "Cooler (Portable)"
+	},
+	{
+		"id": "trash-can-outdoor-wheeled",
+		"description": "Trash Can (Outdoor Wheeled)"
+	},
+	{
+		"id": "hose-uncoiled-on-ground",
+		"description": "Hose (Uncoiled on Ground)"
+	},
+	{
+		"id": "bicycle-helmet",
+		"description": "Bicycle Helmet"
+	},
+	{
+		"id": "newspaper-on-table",
+		"description": "Newspaper (on Table)"
+	},
+	{
+		"id": "opened-delivery-package-amazon-box",
+		"description": "Opened Delivery Package / Amazon Box"
+	},
+	{
+		"id": "laptop-charger-coiled-on-floor",
+		"description": "Laptop Charger (Coiled on Floor)"
+	},
+	{
+		"id": "throw-blanket-bunched-on-sofa",
+		"description": "Throw Blanket (Bunched on Sofa)"
+	},
+	{
+		"id": "webcam-on-monitor",
+		"description": "Webcam (on Monitor)"
+	},
+	{
+		"id": "desktop-microphone",
+		"description": "Desktop Microphone"
+	},
+	{
+		"id": "ring-light",
+		"description": "Ring Light"
+	},
+	{
+		"id": "whiteboard-wall-mounted",
+		"description": "Whiteboard (Wall-Mounted)"
+	},
+	{
+		"id": "corkboard-pin-board",
+		"description": "Corkboard / Pin Board"
+	},
+	{
+		"id": "wall-calendar",
+		"description": "Wall Calendar"
+	},
+	{
+		"id": "desk-plant-small-succulent-cactus",
+		"description": "Desk Plant (Small Succulent/Cactus)"
+	},
+	{
+		"id": "cable-management-tray",
+		"description": "Cable Management Tray"
+	},
+	{
+		"id": "book-on-nightstand-open-closed",
+		"description": "Book (on Nightstand Open/Closed)"
+	},
+	{
+		"id": "white-noise-machine",
+		"description": "White Noise Machine"
+	},
+	{
+		"id": "nightlight-plug-in",
+		"description": "Nightlight (Plug-In)"
+	},
+	{
+		"id": "humidifier-bedside",
+		"description": "Humidifier (Bedside)"
+	},
+	{
+		"id": "laundry-pile-on-chair-bed",
+		"description": "Laundry Pile (on Chair/Bed)"
+	},
+	{
+		"id": "dishes-in-sink-dirty-stack",
+		"description": "Dishes in Sink (Dirty Stack)"
+	},
+	{
+		"id": "tupperware-food-storage-containers",
+		"description": "Tupperware / Food Storage Containers"
+	},
+	{
+		"id": "apron-hanging-on-hook",
+		"description": "Apron (Hanging on Hook)"
+	},
+	{
+		"id": "child-s-drawing-on-fridge",
+		"description": "Child's Drawing (on Fridge)"
+	},
+	{
+		"id": "medication-vitamin-bottles-counter",
+		"description": "Medication / Vitamin Bottles (Counter)"
+	},
+	{
+		"id": "paper-plate-napkin-stack",
+		"description": "Paper Plate / Napkin Stack"
+	},
+	{
+		"id": "shower-curtain-fabric",
+		"description": "Shower Curtain (Fabric)"
+	},
+	{
+		"id": "toilet-brush-holder",
+		"description": "Toilet Brush & Holder"
+	},
+	{
+		"id": "plunger-behind-toilet",
+		"description": "Plunger (Behind Toilet)"
+	},
+	{
+		"id": "bathroom-reading-material-magazine",
+		"description": "Bathroom Reading Material (Magazine)"
+	},
+	{
+		"id": "kids-bath-toys-in-tub",
+		"description": "Kids' Bath Toys (in Tub)"
+	},
+	{
+		"id": "step-stool-kids-bathroom",
+		"description": "Step Stool (Kids' Bathroom)"
+	},
+	{
+		"id": "ladder-full-size-folding",
+		"description": "Ladder (Full-Size Folding)"
+	},
+	{
+		"id": "hand-tool-set-hanging",
+		"description": "Hand Tool Set (Hanging)"
+	},
+	{
+		"id": "paint-cans-stacked",
+		"description": "Paint Cans (Stacked)"
+	},
+	{
+		"id": "bicycle-pump",
+		"description": "Bicycle Pump"
+	},
+	{
+		"id": "cooler-large",
+		"description": "Cooler (Large)"
+	},
+	{
+		"id": "extension-ladder-wall-mounted",
+		"description": "Extension Ladder (Wall-Mounted)"
+	},
+	{
+		"id": "snow-shovel",
+		"description": "Snow Shovel"
+	},
+	{
+		"id": "leaf-blower",
+		"description": "Leaf Blower"
+	},
+	{
+		"id": "string-trimmer-weed-whacker",
+		"description": "String Trimmer / Weed Whacker"
+	},
+	{
+		"id": "chainsaw",
+		"description": "Chainsaw"
+	},
+	{
+		"id": "pressure-washer",
+		"description": "Pressure Washer"
+	},
+	{
+		"id": "porch-swing",
+		"description": "Porch Swing"
+	},
+	{
+		"id": "basketball-hoop-portable",
+		"description": "Basketball Hoop (Portable)"
+	},
+	{
+		"id": "trampoline",
+		"description": "Trampoline"
+	},
+	{
+		"id": "swing-set",
+		"description": "Swing Set"
+	},
+	{
+		"id": "kiddie-pool-inflatable",
+		"description": "Kiddie Pool (Inflatable)"
+	},
+	{
+		"id": "outdoor-toy-bin",
+		"description": "Outdoor Toy Bin"
+	},
+	{
+		"id": "rain-barrel",
+		"description": "Rain Barrel"
+	},
+	{
+		"id": "compost-bin",
+		"description": "Compost Bin"
+	},
+	{
+		"id": "trash-can-wheeled-recycling",
+		"description": "Trash Can (Wheeled Recycling)"
+	},
+	{
+		"id": "flag-flag-holder-house-mount",
+		"description": "Flag / Flag Holder (House-Mount)"
+	},
+	{
+		"id": "baby-gate",
+		"description": "Baby Gate"
+	},
+	{
+		"id": "play-mat-foam-tiles",
+		"description": "Play Mat (Foam Tiles)"
+	},
+	{
+		"id": "toy-train-set",
+		"description": "Toy Train Set"
+	},
+	{
+		"id": "kids-table-chair-set",
+		"description": "Kids' Table & Chair Set"
+	},
+	{
+		"id": "child-s-bicycle-with-training-wheels",
+		"description": "Child's Bicycle (with Training Wheels)"
+	},
+	{
+		"id": "toy-box-chest",
+		"description": "Toy Box / Chest"
+	},
+	{
+		"id": "litter-box",
+		"description": "Litter Box"
+	},
+	{
+		"id": "pet-food-bag-leaning",
+		"description": "Pet Food Bag (Leaning)"
+	},
+	{
+		"id": "pet-gate",
+		"description": "Pet Gate"
+	},
+	{
+		"id": "bathrobe-on-hook",
+		"description": "Bathrobe (on Hook)"
+	},
+	{
+		"id": "suit-jacket-on-hanger-chair",
+		"description": "Suit Jacket (on Hanger/Chair)"
+	},
+	{
+		"id": "umbrella-closed",
+		"description": "Umbrella (Closed)"
+	},
+	{
+		"id": "jewelry-stand-tree",
+		"description": "Jewelry Stand / Tree"
+	},
+	{
+		"id": "tie-rack",
+		"description": "Tie Rack"
+	},
+	{
+		"id": "wristwatch-box-display",
+		"description": "Wristwatch Box / Display"
+	},
+	{
+		"id": "spice-jar-set-row",
+		"description": "Spice Jar Set (Row)"
+	},
+	{
+		"id": "baguette-in-paper-bag",
+		"description": "Baguette (in Paper Bag)"
+	},
+	{
+		"id": "pasta-box-dry-goods",
+		"description": "Pasta Box / Dry Goods"
+	},
+	{
+		"id": "tea-box-collection",
+		"description": "Tea Box Collection"
+	},
+	{
+		"id": "smoothie-protein-shake-bottle",
+		"description": "Smoothie / Protein Shake Bottle"
+	},
+	{
+		"id": "smoke-detector-ceiling",
+		"description": "Smoke Detector (Ceiling)"
+	},
+	{
+		"id": "carbon-monoxide-detector",
+		"description": "Carbon Monoxide Detector"
+	},
+	{
+		"id": "wifi-router",
+		"description": "WiFi Router"
+	},
+	{
+		"id": "cable-modem",
+		"description": "Cable Modem"
+	},
+	{
+		"id": "power-bank-on-surface",
+		"description": "Power Bank (on Surface)"
+	},
+	{
+		"id": "flashlight-rechargeable-stand",
+		"description": "Flashlight (Rechargeable Stand)"
+	},
+	{
+		"id": "window-ac-unit",
+		"description": "Window AC Unit"
+	},
+	{
+		"id": "tower-fan",
+		"description": "Tower Fan"
+	},
+	{
+		"id": "christmas-tree-with-ornaments",
+		"description": "Christmas Tree (with Ornaments)"
+	},
+	{
+		"id": "gift-boxes-wrapped",
+		"description": "Gift Boxes (Wrapped)"
+	},
+	{
+		"id": "easter-basket",
+		"description": "Easter Basket"
+	},
+	{
+		"id": "patriotic-bunting",
+		"description": "Patriotic Bunting"
+	},
+	{
+		"id": "potted-poinsettia",
+		"description": "Potted Poinsettia"
+	},
+	{
+		"id": "spring-flower-wreath",
+		"description": "Spring Flower Wreath"
+	},
+	{
+		"id": "sheet-music-stand",
+		"description": "Sheet Music Stand"
+	},
+	{
+		"id": "violin-case",
+		"description": "Violin Case"
+	},
+	{
+		"id": "craft-supply-box",
+		"description": "Craft Supply Box"
+	},
+	{
+		"id": "scrapbook-photo-album",
+		"description": "Scrapbook / Photo Album"
+	},
+	{
+		"id": "jigsaw-puzzle-in-progress-on-table",
+		"description": "Jigsaw Puzzle (In Progress on Table)"
+	},
+	{
+		"id": "lego-set-built-display",
+		"description": "LEGO Set (Built Display)"
+	},
+	{
+		"id": "model-ship-plane",
+		"description": "Model Ship/Plane"
+	},
+	{
+		"id": "globe",
+		"description": "Globe"
+	},
+	{
+		"id": "yoga-block-set",
+		"description": "Yoga Block Set"
+	},
+	{
+		"id": "jump-rope",
+		"description": "Jump Rope"
+	},
+	{
+		"id": "boxing-gloves",
+		"description": "Boxing Gloves"
+	},
+	{
+		"id": "fishing-rod-leaning",
+		"description": "Fishing Rod (Leaning)"
+	},
+	{
+		"id": "bike-helmet",
+		"description": "Bike Helmet"
+	},
+	{
+		"id": "hiking-boots-pair",
+		"description": "Hiking Boots (Pair)"
+	},
+	{
+		"id": "camping-backpack",
+		"description": "Camping Backpack"
+	},
+	{
+		"id": "dog-leash-on-hook",
+		"description": "Dog Leash (on Hook)"
+	},
+	{
+		"id": "boot-tray-shoe-mat",
+		"description": "Boot Tray / Shoe Mat"
+	},
+	{
+		"id": "package-delivered-box-on-porch",
+		"description": "Package (Delivered Box on Porch)"
+	},
+	{
+		"id": "welcome-sign-wall",
+		"description": "Welcome Sign (Wall)"
+	},
+	{
+		"id": "iron-989",
+		"description": "Iron"
+	},
+	{
+		"id": "ironing-board-standing",
+		"description": "Ironing Board (Standing)"
+	},
+	{
+		"id": "laundry-basket-full-overflowing",
+		"description": "Laundry Basket (Full/Overflowing)"
+	},
+	{
+		"id": "dryer-sheets-fabric-softener",
+		"description": "Dryer Sheets / Fabric Softener"
+	},
+	{
+		"id": "swiffer-dust-mop",
+		"description": "Swiffer / Dust Mop"
+	},
+	{
+		"id": "cleaning-supply-bucket",
+		"description": "Cleaning Supply Bucket"
+	},
+	{
+		"id": "lint-roller",
+		"description": "Lint Roller"
+	},
+	{
+		"id": "bluetooth-earbuds-case",
+		"description": "Bluetooth Earbuds Case"
+	},
+	{
+		"id": "portable-charger-battery-pack",
+		"description": "Portable Charger / Battery Pack"
+	},
+	{
+		"id": "smart-watch-on-charger",
+		"description": "Smart Watch (on Charger)"
+	},
+	{
+		"id": "digital-photo-frame",
+		"description": "Digital Photo Frame"
+	},
+	{
+		"id": "portable-bluetooth-speaker",
+		"description": "Portable Bluetooth Speaker"
+	}
+]

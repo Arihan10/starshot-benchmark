@@ -1697,7 +1697,7 @@ def _article(word: str) -> str:
     return "an" if word[:1].lower() in "aeiou" else "a"
 
 
-ImageView = Literal["front", "side", "top"]
+ImageView = Literal["front", "side", "top", "three-quarter"]
 
 
 def wrap_image_prompt(
@@ -1720,10 +1720,11 @@ def wrap_image_prompt(
         "front": "orthographic front view",
         "side": "orthographic side profile view (looking along the +X axis at the object's right-hand side)",
         "top": "orthographic top-down view (looking straight down at the object from directly above)",
+        "three-quarter": "3/4 perspective view (camera positioned above and to the right at roughly 30-45 degrees, showing the front face, top face, and one side face simultaneously)",
     }[view]
     reference_clause = (
         ""
-        if view == "front"
+        if view in ("front", "three-quarter")
         else (
             " A reference image showing the orthographic FRONT view of THE SAME "
             "object is provided — preserve its silhouette, proportions, "
@@ -1738,7 +1739,9 @@ def wrap_image_prompt(
         f"proportions. The object should not fully be in {_article(silhouette)} "
         f"{silhouette} shape unless its dimensions and nature dictate it is naturally that shape. Prioritize "
         "realism over confinement to the hitbox shape."
-        f"{reference_clause}"
+        f"{reference_clause} "
+        "Capture the entire model in the image. Render against a "
+        "clean, empty white background with no other objects, dimension markings, or graphics."
     )
     if dimensions is None:
         return base
@@ -1746,8 +1749,6 @@ def wrap_image_prompt(
     return (
         f"{base} The object's dimensions are exactly "
         f"{w:.2f}m by {h:.2f}m by {d:.2f}m (width by height by depth)."
-        "Capture the entire model in the image. Render against a "
-        "clean, empty white background with no other objects, dimension markings, or graphics."
     )
 
 
