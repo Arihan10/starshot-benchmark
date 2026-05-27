@@ -13,6 +13,7 @@ from pathlib import Path
 
 from pydantic import BaseModel
 
+from app.core.slots import MODELS
 from app.services import llm
 
 _LIBRARY_DIR = Path(__file__).resolve().parent.parent / "assets_library"
@@ -70,11 +71,18 @@ async def match(prompt: str) -> LibraryMatchOutput:
         f"Available library assets:\n{items}\n\n"
         "Pick the best-matching asset id."
     )
-    return await llm.call_llm(
-        system=SYSTEM_LIBRARY_MATCH,
-        user=user,
-        output_schema=LibraryMatchOutput,
-    )
+    # Library matching is always run on gemini-flash regardless of the run's
+    # configured model — the match step is a cheap retrieval, not part of the
+    # spatial-reasoning benchmark surface.
+    token = llm._current_model.set(MODELS["gemini-flash"])
+    try:
+        return await llm.call_llm(
+            system=SYSTEM_LIBRARY_MATCH,
+            user=user,
+            output_schema=LibraryMatchOutput,
+        )
+    finally:
+        llm._current_model.reset(token)
 
 
 def asset_path(library_id: str) -> Path:
