@@ -592,11 +592,13 @@ let treeRootId = null;
 let treeActiveId = null;
 let treeOrderCounter = 0;
 
-// Per-node visibility overrides driven from the tree. A node in this set
-// hides its own bbox/proxy/mesh; hiding a parent transitively hides every
-// descendant in the scene (computed lazily via ancestor walk). State is
-// per-run — cleared on slot switch / rewind / reset alongside the rest of
-// the tree, and not persisted.
+// Per-node mesh-visibility overrides. Toggled from two places that share
+// this state: the tree's per-row visibility button and right-clicking a
+// mesh on the canvas. Hides the mesh + solid fill but LEAVES the bbox
+// wireframe visible — useful for peeking through an outer object without
+// losing the volumetric reference. Hiding a parent transitively hides
+// every descendant (ancestor walk in `effectivelyHidden`). State is
+// per-run — cleared on slot switch / rewind / reset, not persisted.
 const hiddenIds = new Set();
 
 function treeUpsert(id, patch) {
@@ -1617,12 +1619,11 @@ function applyBboxColor(id) {
 }
 
 function applyBboxVisibility(id) {
-  // Tree-driven hide always wins — hovering or selecting a hidden node
-  // doesn't sneak its bbox back into view.
-  const userVisible = !effectivelyHidden(id);
+  // Bbox visibility is independent of the per-node hide state — hiding a
+  // node hides only its mesh + solid fill, leaving the wireframe bbox as
+  // a volumetric reference (and as the right-click handle for un-hiding).
   const visible =
-    userVisible &&
-    (bboxesShown || id === hoveredBboxId || id === selectedBboxId);
+    bboxesShown || id === hoveredBboxId || id === selectedBboxId;
   const helper = bboxes.get(id);
   if (helper) helper.visible = visible;
   const proxy = proxies.get(id);
@@ -2790,6 +2791,29 @@ function pickHoveredBboxId() {
   return null;
 }
 
+// Right-click picker. Tries the mesh picker first, then falls back to a
+// bbox raycast so a hidden object (whose bbox is still visible) can be
+// re-clicked to bring its mesh back. The fallback intentionally does NOT
+// filter by `effectivelyHidden` — hidden ids are exactly what we want to
+// be able to click on the bbox to un-hide.
+const _rightClickBoxHit = new THREE.Vector3();
+function pickRightClickId() {
+  const meshId = pickHoveredBboxId();
+  if (meshId !== null) return meshId;
+  let bestId = null;
+  let bestDist = Infinity;
+  for (const [id, helper] of bboxes) {
+    if (!helper.visible) continue;
+    if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit)) continue;
+    const dist = _rightClickBoxHit.distanceToSquared(camera.position);
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestId = id;
+    }
+  }
+  return bestId;
+}
+
 renderer.domElement.addEventListener("pointermove", (ev) => {
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
@@ -2845,6 +2869,20 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
     const row = treeBodyEl.querySelector(`.tree-node[data-id="${CSS.escape(id)}"]`);
     if (row) row.scrollIntoView({ block: "nearest" });
   }
+});
+
+// Right-click toggles per-node hide for the picked id — same Set as the
+// tree's per-row visibility button, so the two stay in sync. The mesh
+// disappears, the bbox stays as a volumetric reference and as the click
+// target for un-hiding. Suppresses the browser's default context menu.
+renderer.domElement.addEventListener("contextmenu", (ev) => {
+  ev.preventDefault();
+  const rect = renderer.domElement.getBoundingClientRect();
+  pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+  pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+  raycaster.setFromCamera(pointer, camera);
+  const id = pickRightClickId();
+  if (id !== null) toggleNodeHidden(id);
 });
 
 // --- event dispatch ---------------------------------------------------------
