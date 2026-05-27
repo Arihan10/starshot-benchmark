@@ -1,4 +1,10 @@
-"""Fixed benchmark slots. Each is a resumable pipeline run keyed by id."""
+"""Fixed benchmark slots. Each is a resumable pipeline run keyed by id.
+
+A "run" is a (slot, model) cell — every slot can be driven by any of the
+aliased LLMs in parallel, and the dashboard switches between cells by
+flipping the active model. Aliases map to the OpenRouter model IDs the
+llm service feeds straight into chat.send_async.
+"""
 
 from __future__ import annotations
 
@@ -26,4 +32,19 @@ SLOTS: list[Slot] = [
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
 
-DEFAULT_MODEL = "google/gemini-3.5-flash"
+# Short alias -> OpenRouter model id. Aliases are the stable identifiers
+# the client + storage layout key on; the OpenRouter id is what llm.py
+# passes into the SDK call. Order is the order the dashboard renders.
+MODELS: dict[str, str] = {
+    "gemini-flash": "google/gemini-3.5-flash",
+    "gemini-pro": "google/gemini-3.1-pro-preview",
+    "gpt": "openai/gpt-5.5",
+    "opus": "anthropic/claude-opus-4.6",
+    "deepseek": "deepseek/deepseek-v4-pro",
+}
+
+MODEL_ALIASES: list[str] = list(MODELS.keys())
+
+DEFAULT_MODEL_ALIAS = "gemini-flash"
+
+DEFAULT_MODEL = MODELS[DEFAULT_MODEL_ALIAS]

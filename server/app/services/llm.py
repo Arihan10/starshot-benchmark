@@ -1,7 +1,9 @@
 """Single-shot structured call to OpenRouter via `response_format: json_schema`.
 
-The model is run-global. Configure it once via `set_model()` at the start
-of a run; every subsequent `call_llm()` uses it.
+The model is task-local: each `_run` task calls `set_model()` once with
+the OpenRouter id for its alias, and every `call_llm()` on that task
+inherits via a ContextVar. Concurrent runs against the same slot with
+different models therefore don't race on a module global.
 
 Up to 4 resamples on parse / validation failures.
 """
@@ -12,6 +14,7 @@ import asyncio
 import json
 import os
 import sys
+from contextvars import ContextVar
 from pathlib import Path
 
 from openrouter import OpenRouter
@@ -31,12 +34,11 @@ _call_seq: dict[str, int] = {}
 # bad field name instead of a cryptic conversion error.
 sys.set_int_max_str_digits(0)
 
-_current_model: str | None = None
+_current_model: ContextVar[str | None] = ContextVar("_current_model", default=None)
 
 
 def set_model(model: str) -> None:
-    global _current_model
-    _current_model = model
+    _current_model.set(model)
 
 
 async def call_llm[T: BaseModel](
@@ -47,10 +49,11 @@ async def call_llm[T: BaseModel](
     node_id: str | None = None,
     step: str | None = None,
 ) -> T:
-    if _current_model is None:
+    model = _current_model.get()
+    if model is None:
         raise RuntimeError("llm.set_model() must be called before call_llm()")
     key = cache.hash_llm_call(
-        model=_current_model,
+        model=model,
         system=system,
         user=user,
         schema_name=output_schema.__name__,
@@ -81,7 +84,7 @@ async def call_llm[T: BaseModel](
                 timeout_ms=180_000,
             ) as client:
                 response = await client.chat.send_async(
-                    model=_current_model,
+                    model=model,
                     messages=[
                         {"role": "system", "content": system},
                         {"role": "user", "content": user},
@@ -111,7 +114,7 @@ async def call_llm[T: BaseModel](
                 key=key,
                 node=node_id,
                 step=step,
-                model=_current_model,
+                model=model,
                 system=system,
                 user=user,
                 output=validated.model_dump(mode="json"),
@@ -183,8 +186,9 @@ def _normalize_schema(schema: object) -> object:
             # appear in `required`. Pydantic still validates the parsed
             # response, so widening the wire schema is safe.
             out["required"] = sorted(out["properties"].keys())
+        current = _current_model.get()
         if (
-            _current_model and _current_model.startswith("google/")
+            current and current.startswith("google/")
             and out.get("type") == "integer"
             and "enum" in out
         ):

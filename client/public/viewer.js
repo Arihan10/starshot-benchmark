@@ -8,6 +8,7 @@ const SERVER_URL = document
   .getAttribute("content");
 
 const SLOT_STORAGE_KEY = "starshot.selectedSlot";
+const MODEL_STORAGE_KEY = "starshot.selectedModel";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
 const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
@@ -17,6 +18,8 @@ const logEl = document.getElementById("log");
 const slotsEl = document.getElementById("slots");
 const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
+const modelPickerEl = document.getElementById("model-picker");
+const resumeAllEl = document.getElementById("resume-all");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
 const solidFillToggleEl = document.getElementById("solid-fill-toggle");
@@ -260,13 +263,13 @@ async function retryMesh(id) {
   // Re-subscribe (without resetting highestEventIndex) so the snapshot
   // is deduped and the retry's new events flow through the live queue.
   if (currentSource === null) {
-    subscribe(slotEventsUrl(currentSlotId));
+    subscribe(slotEventsUrl(currentSlotId, currentModel));
   }
 
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/retry-mesh/${encodeURIComponent(id)}`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -496,12 +499,19 @@ function renderTrellisQueue() {
     for (const row of rows) {
       const el = document.createElement("div");
       el.className = `tq-row ${kind}`;
-      const inThisSlot = row.slot_id === currentSlotId;
+      // Queue rows tag slot_id with the composite "slot/model" so we can
+      // filter to the cell currently on screen — other cells stay visible
+      // (still inflight on the shared queue) but greyed and not clickable.
+      const currentCompositeId =
+        currentSlotId !== null && currentModel !== null
+          ? `${currentSlotId}/${currentModel}`
+          : null;
+      const inThisSlot = row.slot_id === currentCompositeId;
       if (inThisSlot) {
         el.addEventListener("click", () => selectTreeNode(row.job_id));
       } else {
         el.classList.add("other-slot");
-        el.title = `from slot ${row.slot_id} — switch slots to inspect`;
+        el.title = `from cell ${row.slot_id} — switch to inspect`;
       }
       const dot = document.createElement("span");
       dot.className = "tq-dot";
@@ -1035,6 +1045,9 @@ const BBOX_COLOR_FRAME = 0x7fb3d5;
 const BBOX_COLOR_PROXY = 0xb46aff;
 const BBOX_COLOR_HOVER = 0xffe14a;
 const BBOX_COLOR_SELECTED = 0x4af0e0;
+const BBOX_DIM_OPACITY = 0.35;
+const PROXY_BASE_OPACITY = 0.55;
+const PROXY_DIM_OPACITY = 0.2;
 let selectedBboxId = null;
 
 const raycaster = new THREE.Raycaster();
@@ -1429,6 +1442,10 @@ function loadBbox(event) {
     new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
   );
   const helper = new THREE.Box3Helper(box3, BBOX_COLOR_DEFAULT);
+  // Always-transparent so we can dim non-selected bboxes by adjusting opacity
+  // without triggering shader recompiles (toggling `transparent` would).
+  helper.material.transparent = true;
+  helper.material.opacity = 1;
   helper.userData.bboxId = id;
   const nodeKind = event.node_kind ?? "zone";
   helper.userData.nodeKind = nodeKind;
@@ -1501,7 +1518,7 @@ function buildProxyWireframe(proxyShape, origin, dimensions) {
   }
 
   const mat = new THREE.MeshBasicMaterial({
-    color: BBOX_COLOR_DEFAULT, wireframe: true, transparent: true, opacity: 0.55,
+    color: BBOX_COLOR_DEFAULT, wireframe: true, transparent: true, opacity: PROXY_BASE_OPACITY,
   });
   const mesh = new THREE.Mesh(geom, mat);
   mesh.position.set(cx, anchorY, cz);
@@ -1622,12 +1639,29 @@ function applyBboxVisibility(id) {
   // Bbox visibility is independent of the per-node hide state — hiding a
   // node hides only its mesh + solid fill, leaving the wireframe bbox as
   // a volumetric reference (and as the right-click handle for un-hiding).
+  //
+  // When something is selected, every OTHER bbox is dimmed (not hidden) so
+  // the selected one stands out without losing the rest of the scene as
+  // spatial reference. Hover gets full opacity so the user can see what
+  // they're about to pick.
   const visible =
-    bboxesShown || id === hoveredBboxId || id === selectedBboxId;
+    id === selectedBboxId ||
+    id === hoveredBboxId ||
+    bboxesShown;
+  const dim =
+    selectedBboxId !== null &&
+    id !== selectedBboxId &&
+    id !== hoveredBboxId;
   const helper = bboxes.get(id);
-  if (helper) helper.visible = visible;
+  if (helper) {
+    helper.visible = visible;
+    helper.material.opacity = dim ? BBOX_DIM_OPACITY : 1;
+  }
   const proxy = proxies.get(id);
-  if (proxy) proxy.visible = visible;
+  if (proxy) {
+    proxy.visible = visible;
+    proxy.material.opacity = dim ? PROXY_DIM_OPACITY : PROXY_BASE_OPACITY;
+  }
 }
 
 function refreshAllBboxVisibility() {
@@ -1719,14 +1753,13 @@ function selectTreeNode(id) {
   const prev = selectedBboxId;
   // Toggle off if re-clicking the same node.
   selectedBboxId = prev === id ? null : id;
-  if (prev !== null) {
-    applyBboxColor(prev);
-    applyBboxVisibility(prev);
-  }
-  if (selectedBboxId !== null) {
-    applyBboxColor(selectedBboxId);
-    applyBboxVisibility(selectedBboxId);
-  }
+  if (prev !== null) applyBboxColor(prev);
+  if (selectedBboxId !== null) applyBboxColor(selectedBboxId);
+  // Selection state gates every other bbox's visibility (see
+  // applyBboxVisibility) — when none→something or something→none, every
+  // peer's visibility flips. A→B leaves the peers untouched, but the
+  // refresh is cheap, so just re-apply uniformly.
+  refreshAllBboxVisibility();
   renderTree();
   renderTreeDetail();
   if (selectedBboxId !== null) {
@@ -3023,16 +3056,26 @@ function dispatch(event) {
   }
 }
 
-// --- slot picker + run lifecycle --------------------------------------------
+// --- slot picker + model picker + run lifecycle ------------------------------
 
-// All seven pipelines run in the background on the server. The client
-// chooses which one to view — switching closes the active SSE, clears the
-// scene, and reconnects to the selected slot's stream.
+// Every slot has N parallel runs — one per model alias from `availableModels`.
+// The viewer shows one (slot, model) cell at a time; switching either
+// dimension closes the active SSE, clears the scene, and reconnects to that
+// cell's stream. The Trellis queue is global, so other cells stay in-flight
+// on the same Modal pool while we're looking at one of them.
 
 let currentSource = null;
 let currentSlotId = null;
-let slotSummaries = [];  // latest /slots payload, for tab rendering
+let currentModel = null;
+let availableModels = [];
+let defaultModelAlias = null;
+let slotSummaries = [];  // latest /slots `slots` array, for tab rendering
 let slotNeedsResume = false;
+
+function currentRunInfo() {
+  const slot = slotSummaries.find((s) => s.id === currentSlotId);
+  return slot?.runs?.[currentModel] ?? null;
+}
 
 function renderSlotTabs() {
   // Wipe any existing .slot-tab children; keep the #slot-reset button.
@@ -3046,8 +3089,11 @@ function renderSlotTabs() {
     tab.dataset.slotId = s.id;
     tab.title = s.prompt ?? "";
 
+    // Dot reflects the (slot, currentModel) cell's status — the active model
+    // dimension picks which of the N parallel runs we're watching.
+    const status = s.runs?.[currentModel]?.status ?? "idle";
     const dot = document.createElement("span");
-    dot.className = `slot-dot status-${s.status ?? "idle"}`;
+    dot.className = `slot-dot status-${status}`;
     tab.appendChild(dot);
 
     const label = document.createElement("span");
@@ -3059,9 +3105,19 @@ function renderSlotTabs() {
   }
 }
 
+function populateModelPicker() {
+  modelPickerEl.innerHTML = "";
+  for (const alias of availableModels) {
+    const opt = document.createElement("option");
+    opt.value = alias;
+    opt.textContent = alias;
+    modelPickerEl.appendChild(opt);
+  }
+  if (currentModel) modelPickerEl.value = currentModel;
+}
+
 function updateResumeButton() {
-  const slot = slotSummaries.find((s) => s.id === currentSlotId);
-  const status = slot?.status;
+  const status = currentRunInfo()?.status;
   resumeEl.className = "";
   resumeEl.style.display = "none";
   if (status === "idle") {
@@ -3084,9 +3140,9 @@ function updateResumeButton() {
     resumeEl.className = "running";
     resumeEl.textContent = "pause";
     resumeEl.title = "Pause this run";
-  } else if (slotNeedsResume && currentSlotId !== null) {
+  } else if (slotNeedsResume && currentSlotId !== null && currentModel !== null) {
     slotNeedsResume = false;
-    subscribe(slotEventsUrl(currentSlotId));
+    subscribe(slotEventsUrl(currentSlotId, currentModel));
   }
 }
 
@@ -3094,7 +3150,15 @@ async function refreshSlots() {
   try {
     const res = await fetch(new URL("/slots", SERVER_URL));
     if (!res.ok) return;
-    slotSummaries = await res.json();
+    const payload = await res.json();
+    availableModels = payload.models ?? [];
+    defaultModelAlias = payload.default_model ?? availableModels[0] ?? null;
+    slotSummaries = payload.slots ?? [];
+    // Re-populate the picker if the model list changed (or this is the
+    // first refresh). Cheap to redo every tick — the <option>s are flat.
+    if (modelPickerEl.options.length !== availableModels.length) {
+      populateModelPicker();
+    }
     renderSlotTabs();
     updateResumeButton();
   } catch {
@@ -3102,8 +3166,11 @@ async function refreshSlots() {
   }
 }
 
-function switchSlot(id) {
-  if (id === currentSlotId) return;
+function switchView(slotId, modelAlias) {
+  // Common path for both slot and model switches: tear down the current
+  // SSE + scene, persist the new selection, and either subscribe (if the
+  // cell is running/done) or set status to "idle/paused/error — click
+  // start" (handled via slotNeedsResume).
   if (currentSource) {
     currentSource.close();
     currentSource = null;
@@ -3116,35 +3183,55 @@ function switchSlot(id) {
   highestEventIndex = -1;
   recordedEvents.length = 0;
   updateReplayButton();
-  currentSlotId = id;
-  try { localStorage.setItem(SLOT_STORAGE_KEY, id); } catch {}
+  currentSlotId = slotId;
+  currentModel = modelAlias;
+  try { localStorage.setItem(SLOT_STORAGE_KEY, slotId); } catch {}
+  try { localStorage.setItem(MODEL_STORAGE_KEY, modelAlias); } catch {}
+  if (modelPickerEl.value !== modelAlias) modelPickerEl.value = modelAlias;
 
-  const slot = slotSummaries.find((s) => s.id === id);
-  const status = slot?.status;
+  const status = currentRunInfo()?.status;
   slotNeedsResume = status === "idle" || status === "paused" || status === "error";
   renderSlotTabs();
   updateResumeButton();
+  const cellLabel = `${slotId} · ${modelAlias}`;
   if (slotNeedsResume) {
-    setStatus(`slot :: ${id} — ${status}`);
+    setStatus(`slot :: ${cellLabel} — ${status}`);
   } else {
-    setStatus(`slot :: ${id}`);
-    subscribe(slotEventsUrl(id));
+    setStatus(`slot :: ${cellLabel}`);
+    subscribe(slotEventsUrl(slotId, modelAlias));
   }
 }
 
-function slotEventsUrl(id) {
-  return new URL(`/slots/${encodeURIComponent(id)}/events`, SERVER_URL).toString();
+function switchSlot(id) {
+  if (id === currentSlotId) return;
+  switchView(id, currentModel);
 }
 
-async function resetSlot(id) {
+function switchModel(alias) {
+  if (alias === currentModel) return;
+  if (!availableModels.includes(alias)) return;
+  switchView(currentSlotId, alias);
+}
+
+function slotEventsUrl(slotId, model) {
+  return new URL(
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events`,
+    SERVER_URL,
+  ).toString();
+}
+
+async function resetSlot(id, model) {
   const ok = window.confirm(
-    `Wipe runs/${id}/ and restart the pipeline for this slot?`,
+    `Wipe runs/${id}/${model}/ and restart the pipeline for this cell?`,
   );
   if (!ok) return;
   resetEl.disabled = true;
   try {
     const res = await fetch(
-      new URL(`/slots/${encodeURIComponent(id)}/reset`, SERVER_URL),
+      new URL(
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/reset`,
+        SERVER_URL,
+      ),
       { method: "POST" },
     );
     if (!res.ok) {
@@ -3164,8 +3251,8 @@ async function resetSlot(id) {
     recordedEvents.length = 0;
     updateReplayButton();
     slotNeedsResume = false;
-    setStatus(`slot ${id} reset — streaming events…`);
-    subscribe(slotEventsUrl(id));
+    setStatus(`slot ${id} · ${model} reset — streaming events…`);
+    subscribe(slotEventsUrl(id, model));
     refreshSlots();
   } catch (e) {
     setStatus(`reset failed: ${e.message}`, "err");
@@ -3196,7 +3283,7 @@ function subscribe(url) {
 }
 
 async function rewindTo(index) {
-  if (currentSlotId === null) return;
+  if (currentSlotId === null || currentModel === null) return;
   if (currentSource) {
     currentSource.close();
     currentSource = null;
@@ -3209,12 +3296,15 @@ async function rewindTo(index) {
   highestEventIndex = -1;
   recordedEvents.length = 0;
   updateReplayButton();
-  setStatus(`POST /slots/${currentSlotId}/rewind to ${index} …`);
+  setStatus(`POST /slots/${currentSlotId}/${currentModel}/rewind to ${index} …`);
 
   let res;
   try {
     res = await fetch(
-      new URL(`/slots/${encodeURIComponent(currentSlotId)}/rewind`, SERVER_URL),
+      new URL(
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind`,
+        SERVER_URL,
+      ),
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -3231,19 +3321,81 @@ async function rewindTo(index) {
   }
   slotNeedsResume = false;
   setStatus(`rewound to ${index} — streaming events…`);
-  subscribe(slotEventsUrl(currentSlotId));
+  subscribe(slotEventsUrl(currentSlotId, currentModel));
   refreshSlots();
 }
 
 resetEl.addEventListener("click", () => {
-  if (currentSlotId !== null) resetSlot(currentSlotId);
+  if (currentSlotId !== null && currentModel !== null) {
+    resetSlot(currentSlotId, currentModel);
+  }
 });
 
-async function resumeSlot(id) {
+modelPickerEl.addEventListener("change", () => {
+  switchModel(modelPickerEl.value);
+});
+
+async function resumeAll() {
+  // Fans out POST /slots/<slot>/<model>/resume for every cell on the active
+  // model whose status is startable (idle/paused/error). Running and done
+  // cells are skipped. If the viewed cell gets resumed, route it through
+  // resumeSlot() so the scene + SSE rewire — non-viewed cells just need
+  // the kick, their events will flow next time the user switches to them.
+  if (currentModel === null) return;
+  const model = currentModel;
+  const startable = slotSummaries.filter((s) =>
+    ["idle", "paused", "error"].includes(s.runs?.[model]?.status),
+  );
+  if (startable.length === 0) {
+    setStatus(`no startable cells on ${model}`);
+    return;
+  }
+  resumeAllEl.disabled = true;
+  try {
+    const tasks = startable.map((s) => {
+      if (s.id === currentSlotId) {
+        // Viewed cell — wire SSE + clear scene via the existing helper.
+        return resumeSlot(s.id, model);
+      }
+      return fetch(
+        new URL(
+          `/slots/${encodeURIComponent(s.id)}/${encodeURIComponent(model)}/resume`,
+          SERVER_URL,
+        ),
+        { method: "POST" },
+      ).then((r) => ({ slot: s.id, ok: r.ok, status: r.status }));
+    });
+    const results = await Promise.all(tasks);
+    const failures = results.filter((r) => r && r.ok === false);
+    if (failures.length > 0) {
+      const names = failures.map((f) => f.slot).join(", ");
+      setStatus(
+        `resume all on ${model}: ${startable.length - failures.length} ok, ${failures.length} failed (${names})`,
+        "err",
+      );
+    } else {
+      setStatus(
+        `resumed ${startable.length} cell${startable.length === 1 ? "" : "s"} on ${model}`,
+      );
+    }
+    refreshSlots();
+  } catch (e) {
+    setStatus(`resume all failed: ${e.message}`, "err");
+  } finally {
+    resumeAllEl.disabled = false;
+  }
+}
+
+resumeAllEl.addEventListener("click", resumeAll);
+
+async function resumeSlot(id, model) {
   resumeEl.disabled = true;
   try {
     const res = await fetch(
-      new URL(`/slots/${encodeURIComponent(id)}/resume`, SERVER_URL),
+      new URL(
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/resume`,
+        SERVER_URL,
+      ),
       { method: "POST" },
     );
     if (!res.ok) {
@@ -3264,7 +3416,7 @@ async function resumeSlot(id) {
     recordedEvents.length = 0;
     updateReplayButton();
     setStatus(`resumed — streaming events…`);
-    subscribe(slotEventsUrl(id));
+    subscribe(slotEventsUrl(id, model));
     refreshSlots();
   } catch (e) {
     setStatus(`resume failed: ${e.message}`, "err");
@@ -3273,11 +3425,14 @@ async function resumeSlot(id) {
   }
 }
 
-async function pauseSlot(id) {
+async function pauseSlot(id, model) {
   resumeEl.disabled = true;
   try {
     const res = await fetch(
-      new URL(`/slots/${encodeURIComponent(id)}/pause`, SERVER_URL),
+      new URL(
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/pause`,
+        SERVER_URL,
+      ),
       { method: "POST" },
     );
     if (!res.ok) {
@@ -3294,12 +3449,12 @@ async function pauseSlot(id) {
 }
 
 resumeEl.addEventListener("click", () => {
-  if (currentSlotId === null) return;
-  const slot = slotSummaries.find((s) => s.id === currentSlotId);
-  if (slot?.status === "running") {
-    pauseSlot(currentSlotId);
+  if (currentSlotId === null || currentModel === null) return;
+  const status = currentRunInfo()?.status;
+  if (status === "running") {
+    pauseSlot(currentSlotId, currentModel);
   } else {
-    resumeSlot(currentSlotId);
+    resumeSlot(currentSlotId, currentModel);
   }
 });
 
@@ -3331,7 +3486,10 @@ exportGlbEl.addEventListener("click", async () => {
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${currentSlotId ?? "scene"}.glb`;
+    const stem = currentSlotId && currentModel
+      ? `${currentSlotId}_${currentModel}`
+      : (currentSlotId ?? "scene");
+    a.download = `${stem}.glb`;
     a.click();
     URL.revokeObjectURL(url);
   } catch (e) {
@@ -3342,17 +3500,28 @@ exportGlbEl.addEventListener("click", async () => {
   }
 });
 
-// Boot: load slot list, pick the remembered slot (or the first), subscribe.
+// Boot: load slot + model lists, pick remembered (or defaults), subscribe.
 (async () => {
   await refreshSlots();
   if (slotSummaries.length === 0) {
     setStatus("no slots reported by server", "err");
     return;
   }
-  let saved = null;
-  try { saved = localStorage.getItem(SLOT_STORAGE_KEY); } catch {}
-  const pick = slotSummaries.find((s) => s.id === saved)?.id ?? slotSummaries[0].id;
-  switchSlot(pick);
+  if (availableModels.length === 0) {
+    setStatus("no models reported by server", "err");
+    return;
+  }
+  let savedSlot = null;
+  let savedModel = null;
+  try { savedSlot = localStorage.getItem(SLOT_STORAGE_KEY); } catch {}
+  try { savedModel = localStorage.getItem(MODEL_STORAGE_KEY); } catch {}
+  const slotPick =
+    slotSummaries.find((s) => s.id === savedSlot)?.id ?? slotSummaries[0].id;
+  const modelPick =
+    availableModels.includes(savedModel)
+      ? savedModel
+      : (defaultModelAlias ?? availableModels[0]);
+  switchView(slotPick, modelPick);
 })();
 
 // Keep tab status dots fresh for slots the user isn't viewing.
@@ -3491,6 +3660,7 @@ async function runReplay({ record }) {
   // afterwards; for a finished run nothing's incoming anyway.
   const reconnectAfter = currentSource !== null;
   const slotForReconnect = currentSlotId;
+  const modelForReconnect = currentModel;
   if (currentSource) {
     currentSource.close();
     currentSource = null;
@@ -3616,8 +3786,8 @@ async function runReplay({ record }) {
   // Reconnect to the live stream so newly-arriving events flow back into
   // the buffer. The server replays the snapshot from index 0 on reconnect,
   // which re-populates `recordedEvents` for the next gif export.
-  if (reconnectAfter && slotForReconnect !== null) {
-    subscribe(slotEventsUrl(slotForReconnect));
+  if (reconnectAfter && slotForReconnect !== null && modelForReconnect !== null) {
+    subscribe(slotEventsUrl(slotForReconnect, modelForReconnect));
   }
 
   // If the user clicked the close button while a replay was running, honor
@@ -3738,6 +3908,9 @@ replayDownloadEl.addEventListener("click", () => {
   if (!lastGifBlob) return;
   const a = document.createElement("a");
   a.href = lastGifUrl;
-  a.download = `${currentSlotId ?? "replay"}.gif`;
+  const gifStem = currentSlotId && currentModel
+    ? `${currentSlotId}_${currentModel}`
+    : (currentSlotId ?? "replay");
+  a.download = `${gifStem}.gif`;
   a.click();
 });

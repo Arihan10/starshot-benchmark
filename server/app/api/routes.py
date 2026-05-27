@@ -1,12 +1,18 @@
-"""HTTP API — slot-scoped endpoints.
+"""HTTP API — endpoints scoped to a (slot, model) run.
 
-All seven benchmark slots (see app.core.slots) are initialized on lifespan
-startup: fresh slots are seeded with a `run.start` and auto-launched,
-completed slots stay idle, and interrupted or errored slots are left
-paused for manual resume via POST /slots/{id}/resume. Every asyncio task
-is bound to its SlotLog via a ContextVar, so concurrent pipeline work
-routes events to the right slot without threading a handle through every
-call site.
+Every benchmark slot can be driven by any of the aliased LLMs in
+`app.core.slots.MODELS` in parallel — each (slot, model) cell is its own
+resumable run with its own events.jsonl, mesh artifacts, and SSE stream.
+On lifespan startup every cell is hydrated from disk: fresh ones sit
+idle, interrupted ones come back as paused, completed ones stay done.
+Nothing auto-launches; the viewer drives start/resume/reset per cell.
+
+Every asyncio task is bound to its SlotLog via a ContextVar, so
+concurrent pipeline work (e.g. running `hotel-room` against gpt and
+opus at the same time) routes events to the right cell without
+threading a handle through every call site. The Trellis queue is
+process-global; its rows tag `slot_id` with the composite
+`slot/model_alias` so the dashboard can filter to the visible cell.
 """
 
 from __future__ import annotations
@@ -27,7 +33,14 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from app.core.prompts import wrap_image_prompt
-from app.core.slots import DEFAULT_MODEL, SLOTS, SLOTS_BY_ID, Slot
+from app.core.slots import (
+    DEFAULT_MODEL_ALIAS,
+    MODEL_ALIASES,
+    MODELS,
+    SLOTS,
+    SLOTS_BY_ID,
+    Slot,
+)
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import divider, generation
 from app.services import llm, threed
@@ -38,28 +51,42 @@ from app.utils.logging import SlotLog
 # point at a different directory so multiple simultaneous processes don't
 # trample each other.
 RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
-LEGACY_CURRENT_DIR = RUNS_DIR / "current"
 
-_slot_logs: dict[str, SlotLog] = {}
-_tasks: dict[str, asyncio.Task[None]] = {}
+# Keyed by (slot_id, model_alias). Each cell is an independent run.
+RunKey = tuple[str, str]
+_slot_logs: dict[RunKey, SlotLog] = {}
+_tasks: dict[RunKey, asyncio.Task[None]] = {}
 
 
 class RewindRequest(BaseModel):
     to_event_index: int
 
 
+def _run_id(slot_id: str, model_alias: str) -> str:
+    """Composite id used as `run_id` in pipeline code (divider, generation,
+    threed queue, SlotLog.slot_id). The slash makes it work as a filesystem
+    subpath under RUNS_DIR and as an artifact URL segment under /artifacts."""
+    return f"{slot_id}/{model_alias}"
+
+
+def _slot_dir(slot_id: str, model_alias: str) -> Path:
+    return RUNS_DIR / slot_id / model_alias
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        llm.set_model(DEFAULT_MODEL)
         for slot in SLOTS:
-            slot_dir = RUNS_DIR / slot.id
-            slot_dir.mkdir(parents=True, exist_ok=True)
-            slot_log = SlotLog(slot.id, slot_dir / "events.jsonl")
-            slot_log.hydrate_from_disk()
-            _slot_logs[slot.id] = slot_log
-            _maybe_launch(slot, slot_log)
+            for alias in MODEL_ALIASES:
+                slot_dir = _slot_dir(slot.id, alias)
+                slot_dir.mkdir(parents=True, exist_ok=True)
+                slot_log = SlotLog(
+                    _run_id(slot.id, alias), slot_dir / "events.jsonl"
+                )
+                slot_log.hydrate_from_disk()
+                _slot_logs[(slot.id, alias)] = slot_log
+                _maybe_launch(slot, alias, slot_log)
         try:
             yield
         finally:
@@ -86,8 +113,12 @@ def create_app() -> FastAPI:
     app.mount("/artifacts", StaticFiles(directory=RUNS_DIR), name="artifacts")
 
     @app.get("/slots")
-    async def list_slots() -> list[dict[str, object]]:  # pyright: ignore[reportUnusedFunction]
-        return [_slot_summary(s) for s in SLOTS]
+    async def list_slots() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        return {
+            "models": MODEL_ALIASES,
+            "default_model": DEFAULT_MODEL_ALIAS,
+            "slots": [_slot_summary(s) for s in SLOTS],
+        }
 
     @app.get("/trellis/queue")
     async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -100,9 +131,9 @@ def create_app() -> FastAPI:
             "entries": threed.queue_snapshot(),
         }
 
-    @app.get("/slots/{slot_id}/events")
-    async def slot_events(slot_id: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
-        slot_log = _require_slot_log(slot_id)
+    @app.get("/slots/{slot_id}/{model_alias}/events")
+    async def slot_events(slot_id: str, model_alias: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        slot_log = _require_slot_log(slot_id, model_alias)
         # Subscribe and snapshot synchronously — no await between them, so no
         # log() call can land in both the snapshot and the live queue.
         q = slot_log.subscribe()
@@ -112,68 +143,77 @@ def create_app() -> FastAPI:
             media_type="text/event-stream",
         )
 
-    @app.post("/slots/{slot_id}/rewind")
-    async def slot_rewind(slot_id: str, req: RewindRequest) -> dict[str, int | str]:  # pyright: ignore[reportUnusedFunction]
+    @app.post("/slots/{slot_id}/{model_alias}/rewind")
+    async def slot_rewind(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, req: RewindRequest,
+    ) -> dict[str, int | str]:
         slot = _require_slot(slot_id)
-        slot_log = _slot_logs[slot_id]
+        _require_model(model_alias)
+        slot_log = _require_slot_log(slot_id, model_alias)
         if slot_log.state.get("prompt") is None or slot_log.state.get("model") is None:
             raise HTTPException(
                 status_code=400,
                 detail="slot has no run to rewind",
             )
-        await _cancel_task(slot_id)
+        await _cancel_task(slot_id, model_alias)
         new_len = slot_log.truncate_events_to(req.to_event_index)
-        _tasks[slot.id] = asyncio.create_task(_run(slot.id))
-        return {"slot_id": slot.id, "events": new_len}
+        _tasks[(slot.id, model_alias)] = asyncio.create_task(_run(slot.id, model_alias))
+        return {"slot_id": slot.id, "model": model_alias, "events": new_len}
 
-    @app.post("/slots/{slot_id}/resume")
-    async def slot_resume(slot_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    @app.post("/slots/{slot_id}/{model_alias}/resume")
+    async def slot_resume(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         slot = _require_slot(slot_id)
-        slot_log = _slot_logs[slot_id]
+        _require_model(model_alias)
+        slot_log = _require_slot_log(slot_id, model_alias)
         status = slot_log.state.get("status")
         if status not in ("idle", "paused", "error"):
             raise HTTPException(
                 status_code=400,
                 detail=f"slot is {status}, not startable",
             )
-        await _cancel_task(slot_id)
+        await _cancel_task(slot_id, model_alias)
         events = slot_log.state["events"]
+        model_id = MODELS[model_alias]
         if status == "idle" and not events:
-            # Fresh slot — emit run.start now so the run has somewhere to
+            # Fresh cell — emit run.start now so the run has somewhere to
             # anchor its events. From here on it's identical to a resume.
-            slot_log.start_run(slot.prompt, DEFAULT_MODEL)
+            slot_log.start_run(slot.prompt, model_id)
         else:
             # Drop the terminal sentinel so cache lookups don't trip over it
             # and so the resumed run lands clean events after the prior tail.
             if events and events[-1].get("kind") in ("run.error", "run.paused"):
                 slot_log.truncate_events_to(len(events) - 1)
-            slot_log.state["model"] = DEFAULT_MODEL
+            slot_log.state["model"] = model_id
             slot_log.state["status"] = "running"
-        _tasks[slot.id] = asyncio.create_task(_run(slot.id))
-        return {"slot_id": slot.id}
+        _tasks[(slot.id, model_alias)] = asyncio.create_task(_run(slot.id, model_alias))
+        return {"slot_id": slot.id, "model": model_alias}
 
-    @app.post("/slots/{slot_id}/pause")
-    async def slot_pause(slot_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    @app.post("/slots/{slot_id}/{model_alias}/pause")
+    async def slot_pause(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         slot = _require_slot(slot_id)
-        slot_log = _slot_logs[slot_id]
+        _require_model(model_alias)
+        slot_log = _require_slot_log(slot_id, model_alias)
         status = slot_log.state.get("status")
         if status != "running":
             raise HTTPException(
                 status_code=400,
                 detail=f"slot is {status}, not pausable",
             )
-        await _cancel_task(slot_id)
+        await _cancel_task(slot_id, model_alias)
         # _cancel_task awaits the cancellation, so the pipeline task has
         # already torn down (including generation.cancel_pending via _run's
         # CancelledError branch) by the time we emit the sentinel.
         slot_log.state["status"] = "paused"
         slot_log.log("run.paused")
-        return {"slot_id": slot.id}
+        return {"slot_id": slot.id, "model": model_alias}
 
-    @app.post("/slots/{slot_id}/retry-mesh/{node_id}")
-    async def slot_retry_mesh(slot_id: str, node_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    @app.post("/slots/{slot_id}/{model_alias}/retry-mesh/{node_id}")
+    async def slot_retry_mesh(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, node_id: str,
+    ) -> dict[str, str]:
         slot = _require_slot(slot_id)
-        slot_log = _slot_logs[slot_id]
+        _require_model(model_alias)
+        slot_log = _require_slot_log(slot_id, model_alias)
         node = _reconstruct_node(slot_log, node_id)
         if node is None:
             raise HTTPException(
@@ -182,69 +222,74 @@ def create_app() -> FastAPI:
             )
         async def _do_retry() -> None:
             rlog.bind(slot_log)
+            llm.set_model(MODELS[model_alias])
             await generation.retry_node(
-                node=node, runs_dir=RUNS_DIR, run_id=slot.id,
+                node=node, runs_dir=RUNS_DIR,
+                run_id=_run_id(slot.id, model_alias),
             )
         asyncio.create_task(_do_retry())
-        return {"slot_id": slot.id, "node_id": node_id}
+        return {"slot_id": slot.id, "model": model_alias, "node_id": node_id}
 
-    @app.post("/slots/{slot_id}/reset")
-    async def slot_reset(slot_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    @app.post("/slots/{slot_id}/{model_alias}/reset")
+    async def slot_reset(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         slot = _require_slot(slot_id)
-        await _cancel_task(slot_id)
+        _require_model(model_alias)
+        await _cancel_task(slot_id, model_alias)
         # Cancel any standalone retries (registered on generation._pending
         # but with no owning _run task to drive cleanup) that the running
         # task wouldn't have touched.
-        generation.cancel_pending(slot.id)
-        slot_dir = RUNS_DIR / slot.id
+        generation.cancel_pending(_run_id(slot.id, model_alias))
+        slot_dir = _slot_dir(slot.id, model_alias)
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
-        slot_log = SlotLog(slot.id, slot_dir / "events.jsonl")
-        _slot_logs[slot.id] = slot_log
-        slot_log.start_run(slot.prompt, DEFAULT_MODEL)
-        _tasks[slot.id] = asyncio.create_task(_run(slot.id))
-        return {"slot_id": slot.id}
+        slot_log = SlotLog(_run_id(slot.id, model_alias), slot_dir / "events.jsonl")
+        _slot_logs[(slot.id, model_alias)] = slot_log
+        slot_log.start_run(slot.prompt, MODELS[model_alias])
+        _tasks[(slot.id, model_alias)] = asyncio.create_task(_run(slot.id, model_alias))
+        return {"slot_id": slot.id, "model": model_alias}
 
     return app
 
 
 def _slot_summary(slot: Slot) -> dict[str, object]:
-    slot_log = _slot_logs.get(slot.id)
-    state = (
-        slot_log.state
-        if slot_log is not None
-        else {
-            "status": "idle",
-            "prompt": slot.prompt,
-            "events": [],
+    runs: dict[str, dict[str, object]] = {}
+    for alias in MODEL_ALIASES:
+        slot_log = _slot_logs.get((slot.id, alias))
+        state = (
+            slot_log.state
+            if slot_log is not None
+            else {"status": "idle", "events": []}
+        )
+        events = state.get("events", [])
+        runs[alias] = {
+            "status": state.get("status", "idle"),
+            "events_count": len(events),
+            "last_kind": events[-1]["kind"] if events else None,
         }
-    )
-    events = state.get("events", [])
     return {
         "id": slot.id,
-        "prompt": state.get("prompt") or slot.prompt,
-        "status": state.get("status", "idle"),
-        "events_count": len(events),
-        "last_kind": events[-1]["kind"] if events else None,
+        "prompt": slot.prompt,
+        "runs": runs,
     }
 
 
-def _maybe_launch(slot: Slot, slot_log: SlotLog) -> None:
-    """Prepare each slot for manual start. Nothing auto-runs at boot — the
-    user clicks start/resume/retry per slot from the viewer. Fresh slots
-    sit idle with their seed prompt prefilled; previously-running slots
-    come back as paused (resumable); errored slots come back as error
-    (retry-able); completed slots stay done."""
+def _maybe_launch(slot: Slot, model_alias: str, slot_log: SlotLog) -> None:
+    """Prepare each (slot, model) cell for manual start. Nothing auto-runs
+    at boot — the user clicks start/resume/retry per cell from the viewer.
+    Fresh cells sit idle with their seed prompt prefilled; previously-
+    running cells come back as paused (resumable); errored cells come
+    back as error (retry-able); completed cells stay done."""
+    model_id = MODELS[model_alias]
     events = slot_log.state["events"]
     if not events:
         # Pre-seed the prompt + model so slot_resume can start_run() without
         # the client having to send them. status="idle" tells the viewer to
         # render a "start" button.
         slot_log.state["prompt"] = slot.prompt
-        slot_log.state["model"] = DEFAULT_MODEL
+        slot_log.state["model"] = model_id
         slot_log.state["status"] = "idle"
         return
-    slot_log.state["model"] = DEFAULT_MODEL
+    slot_log.state["model"] = model_id
     last_kind = events[-1].get("kind")
     if last_kind == "run.done":
         return
@@ -332,13 +377,25 @@ def _require_slot(slot_id: str) -> Slot:
     return slot
 
 
-def _require_slot_log(slot_id: str) -> SlotLog:
+def _require_model(model_alias: str) -> None:
+    if model_alias not in MODELS:
+        raise HTTPException(status_code=404, detail=f"unknown model: {model_alias}")
+
+
+def _require_slot_log(slot_id: str, model_alias: str) -> SlotLog:
     _require_slot(slot_id)
-    return _slot_logs[slot_id]
+    _require_model(model_alias)
+    log = _slot_logs.get((slot_id, model_alias))
+    if log is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no run for slot={slot_id} model={model_alias}",
+        )
+    return log
 
 
-async def _cancel_task(slot_id: str) -> None:
-    task = _tasks.pop(slot_id, None)
+async def _cancel_task(slot_id: str, model_alias: str) -> None:
+    task = _tasks.pop((slot_id, model_alias), None)
     if task is None or task.done():
         return
     task.cancel()
@@ -371,23 +428,24 @@ async def _sse(
         slot_log.unsubscribe(q)
 
 
-async def _run(slot_id: str) -> None:
-    slot_log = _slot_logs[slot_id]
+async def _run(slot_id: str, model_alias: str) -> None:
+    slot_log = _slot_logs[(slot_id, model_alias)]
     rlog.bind(slot_log)
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]
+    run_id = _run_id(slot_id, model_alias)
     try:
         await divider.run(
-            run_id=slot_id,
+            run_id=run_id,
             prompt=prompt,
             model=model,
             runs_dir=RUNS_DIR,
         )
     except asyncio.CancelledError:
-        generation.cancel_pending(slot_id)
+        generation.cancel_pending(run_id)
         raise
     except Exception as e:
-        generation.cancel_pending(slot_id)
+        generation.cancel_pending(run_id)
         # OpenRouter SDK errors only stringify to the top-level "Provider
         # returned error" message; the actually useful detail (upstream
         # provider's complaint, the request body that tripped it) lives on
@@ -410,5 +468,5 @@ async def _run(slot_id: str) -> None:
         return
     # Pipeline tree is fully resolved; meshes may still be in flight.
     # Hold the run open until they all land so `run.done` truly means done.
-    await generation.await_pending(slot_id)
+    await generation.await_pending(run_id)
     slot_log.finish_run()
