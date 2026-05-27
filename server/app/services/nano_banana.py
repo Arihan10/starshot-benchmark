@@ -70,18 +70,35 @@ _RESUMABLE_SCOPE = "google.banana"
 _FALLBACK_429_DELAY_S = 30.0
 _MAX_429_RETRIES = 8
 
+# IMAGE_RECITATION retries — the recitation filter fires probabilistically
+# and almost always clears on a re-roll, so absorb it inside _generate_once
+# with a generous budget instead of spending the wrapper's general-transient
+# budget on it.
+_MAX_RECITATION_RETRIES = 15
+_RECITATION_BACKOFF_BASE_S = 0.5
+_RECITATION_BACKOFF_CAP_S = 5.0
+
 class NanoBananaTransientError(Exception):
     """Model-side weirdness where the call returns no image with a
     finish_reason that historically clears on retry (e.g.
     MALFORMED_FUNCTION_CALL — the model's internal image-emit tool
     routing occasionally trips). Distinct from RuntimeError, which we
-    reserve for deterministic refusals (RECITATION / SAFETY / etc.)
-    where retrying would just waste budget."""
+    reserve for deterministic refusals (SAFETY / PROHIBITED_CONTENT /
+    etc.) where retrying would just waste budget."""
 
 
-# finish_reason values that are worth retrying. Anything else (RECITATION,
-# SAFETY, PROHIBITED_CONTENT, ...) is a deterministic refusal — re-issuing
-# the same prompt will produce the same refusal, so we surface immediately.
+class NanoBananaRecitationError(Exception):
+    """IMAGE_RECITATION refusal. Absorbed inside _generate_once with
+    its own retry budget — not a NanoBananaTransientError so the
+    resumable wrapper doesn't double-retry on top of the internal
+    retries."""
+
+
+# finish_reason values that are worth retrying via the resumable wrapper.
+# IMAGE_RECITATION is handled separately (see NanoBananaRecitationError).
+# Anything else (SAFETY, PROHIBITED_CONTENT, ...) is a deterministic
+# refusal — re-issuing the same prompt will produce the same refusal, so
+# we surface immediately.
 _TRANSIENT_FINISH_REASONS = frozenset({
     "MALFORMED_FUNCTION_CALL",
     "FINISH_REASON_UNSPECIFIED",
@@ -158,6 +175,10 @@ def _unwrap(response: types.GenerateContentResponse) -> NanoBananaResult:
         if inline and inline.data:
             return _to_png(inline.data, inline.mime_type or "image/jpeg")
     finish_reason = _finish_reason_name(response)
+    if finish_reason == "IMAGE_RECITATION":
+        raise NanoBananaRecitationError(
+            f"recitation refusal (finish_reason={finish_reason})"
+        )
     if finish_reason in _TRANSIENT_FINISH_REASONS:
         raise NanoBananaTransientError(
             f"transient empty response (finish_reason={finish_reason})"
@@ -259,6 +280,43 @@ def _retry_after_seconds(err: genai_errors.APIError) -> float | None:
 
 
 async def _generate_once(prompt: str) -> NanoBananaResult:
+    """Single image generation, with two internal absorption loops:
+
+      * 429 rate-limit backoff (shared across callers via _backoff_until),
+        absorbed inside `_call_with_429_absorption`.
+      * IMAGE_RECITATION refusals, absorbed here with their own budget —
+        the filter is probabilistic on re-rolls of the same prompt, so a
+        long backoff-capped retry chain usually pushes through. Spending
+        the resumable wrapper's general-transient budget on these would
+        leave nothing for actual transient errors.
+
+    Both absorptions are invisible to the resumable wrapper: only
+    terminal failures (budget exhausted, deterministic refusals,
+    non-retryable APIErrors) surface."""
+    for recitation_attempt in range(_MAX_RECITATION_RETRIES + 1):
+        try:
+            return await _call_with_429_absorption(prompt)
+        except NanoBananaRecitationError as e:
+            if recitation_attempt >= _MAX_RECITATION_RETRIES:
+                raise RuntimeError(
+                    f"Nano Banana recitation refusal after "
+                    f"{recitation_attempt + 1} attempts: {e}"
+                ) from e
+            delay = min(
+                _RECITATION_BACKOFF_CAP_S,
+                _RECITATION_BACKOFF_BASE_S * (2 ** recitation_attempt),
+            )
+            _emit(
+                "google.banana.recitation_retry",
+                attempt=recitation_attempt,
+                delay_s=delay,
+                reason=str(e),
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")
+
+
+async def _call_with_429_absorption(prompt: str) -> NanoBananaResult:
     """Single Google GenAI call, gated by the shared 429 backoff and a
     concurrency semaphore. A 429 here pushes the shared backoff forward
     and the call retries — other in-flight and new callers waiting at

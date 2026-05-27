@@ -140,7 +140,6 @@
             }
             #bbox-toggle,
             #frames-toggle,
-            #pick-inner-toggle,
             #solid-fill-toggle,
             #export-glb,
             #replay-gif {
@@ -159,7 +158,6 @@
             }
             #bbox-toggle:hover,
             #frames-toggle:hover,
-            #pick-inner-toggle:hover,
             #solid-fill-toggle:hover,
             #export-glb:hover,
             #replay-gif:hover {
@@ -348,7 +346,6 @@
             }
             #bbox-toggle.off,
             #frames-toggle.off,
-            #pick-inner-toggle.off,
             #solid-fill-toggle.off {
                 background: #2a2d35;
                 color: #5a5e68;
@@ -1776,7 +1773,6 @@
         <div id="slots">
             <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
             <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
-            <button id="pick-inner-toggle" type="button" title="In bbox-only mode: prefer the innermost (smallest) bbox under the cursor, so nested objects can be picked through their containers">pick: inner</button>
             <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
             <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
             <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>

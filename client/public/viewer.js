@@ -10,7 +10,6 @@ const SERVER_URL = document
 const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
-const PICK_INNER_STORAGE_KEY = "starshot.pickInner";
 const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 
 const statusEl = document.getElementById("status");
@@ -20,7 +19,6 @@ const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
-const pickInnerToggleEl = document.getElementById("pick-inner-toggle");
 const solidFillToggleEl = document.getElementById("solid-fill-toggle");
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
@@ -1005,25 +1003,6 @@ framesToggleEl.addEventListener("click", () => {
   refreshAllSolidFillVisibility();
 });
 
-// "pick: inner" — only matters in bbox-only mode (bboxes: on). When ON,
-// picking prefers the smallest/innermost bbox under the cursor so a nested
-// object inside another object's bbox can be hovered & selected. When OFF,
-// picking uses closest ray-entry (the visible wireframe face you're pointing
-// at wins). Default OFF so newly-loaded sessions keep the "what you see is
-// what you pick" behaviour.
-let pickInner = localStorage.getItem(PICK_INNER_STORAGE_KEY) === "1";
-function applyPickInnerToggleLabel() {
-  pickInnerToggleEl.textContent = `pick: ${pickInner ? "inner" : "outer"}`;
-  pickInnerToggleEl.classList.toggle("off", !pickInner);
-}
-applyPickInnerToggleLabel();
-pickInnerToggleEl.addEventListener("click", () => {
-  pickInner = !pickInner;
-  localStorage.setItem(PICK_INNER_STORAGE_KEY, pickInner ? "1" : "0");
-  applyPickInnerToggleLabel();
-  pointerDirty = true;
-});
-
 // Solid-fill mode — drops a solid mesh into every object/frame bbox using its
 // proxy shape (or the AABB itself when no proxy_shape is set). Zones stay
 // wireframe. Intended for bbox-only mode so the scene reads as solids without
@@ -1058,8 +1037,6 @@ let selectedBboxId = null;
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-const bboxPickPoint = new THREE.Vector3();
-const bboxPickSize = new THREE.Vector3();
 let pointerDirty = false;
 let lastPointerClientX = 0;
 let lastPointerClientY = 0;
@@ -1395,6 +1372,7 @@ async function _loadModelNow(event, gen) {
       }
     });
     gltf.scene.name = `${event.artifact_kind}:${event.id}`;
+    gltf.scene.userData.pickId = event.id;
     const prevModel = modelsById.get(event.id);
     if (prevModel) {
       sceneRoot.remove(prevModel);
@@ -1467,6 +1445,7 @@ function loadBbox(event) {
   if (solidFillShown && nodeKind !== "zone") {
     const fill = buildSolidFill(event.proxy_shape, origin, dimensions, nodeKind);
     if (fill !== null) {
+      fill.userData.pickId = id;
       bboxRoot.add(fill);
       solidFills.set(id, fill);
       applySolidFillVisibility(id);
@@ -1601,6 +1580,7 @@ function rebuildAllSolidFills() {
     if (!origin || !dimensions) continue;
     const fill = buildSolidFill(helper.userData.proxyShape ?? null, origin, dimensions, nodeKind);
     if (fill === null) continue;
+    fill.userData.pickId = id;
     bboxRoot.add(fill);
     solidFills.set(id, fill);
     applySolidFillVisibility(id);
@@ -2784,50 +2764,30 @@ function positionTooltip(clientX, clientY, id) {
   tooltip.style.top = `${Math.max(0, y)}px`;
 }
 
+// Mesh-based picking: raycast against actual geometry the user sees —
+// loaded GLB meshes first, then solid-fill proxies when the model hasn't
+// arrived. Zones never have meshes, so they're unreachable here and must
+// be selected from the tree.
+const _pickRoots = [];
 function pickHoveredBboxId() {
-  let bestId = null;
-  let bestKindRank = Infinity;
-  let bestDistance = Infinity;
-  let bestSize = Infinity;
-  // Three regimes:
-  //  - bboxes: off → user is visually pointing at meshes. Prefer the inner
-  //    object/frame so a tiny prop inside a big zone is still pickable.
-  //  - bboxes: on, pick: outer → wireframes are visible; pick the one whose
-  //    face the ray hits first (closest entry point), so hovering matches
-  //    what's drawn.
-  //  - bboxes: on, pick: inner → still in bbox-only mode, but the user is
-  //    drilling into nested objects: prefer the smallest/innermost bbox so
-  //    an object enclosed by another object's bbox becomes pickable.
-  const innerPreferred = !bboxesShown || pickInner;
-  for (const [id, helper] of bboxes) {
-    if (effectivelyHidden(id)) continue;
-    const kind = treeNodes.get(id)?.kind;
-    if (!raycaster.ray.intersectBox(helper.box, bboxPickPoint)) continue;
-
-    const kindRank = kind === "object" ? 0 : kind === "frame" ? 1 : 2;
-    const distance = bboxPickPoint.distanceToSquared(camera.position);
-    helper.box.getSize(bboxPickSize);
-    const sizeTieBreaker = bboxPickSize.lengthSq();
-
-    const better = innerPreferred
-      ? (
-          kindRank < bestKindRank ||
-          (kindRank === bestKindRank && sizeTieBreaker < bestSize) ||
-          (kindRank === bestKindRank && sizeTieBreaker === bestSize && distance < bestDistance)
-        )
-      : (
-          distance < bestDistance ||
-          (distance === bestDistance && kindRank < bestKindRank) ||
-          (distance === bestDistance && kindRank === bestKindRank && sizeTieBreaker < bestSize)
-        );
-    if (better) {
-      bestId = id;
-      bestKindRank = kindRank;
-      bestDistance = distance;
-      bestSize = sizeTieBreaker;
+  _pickRoots.length = 0;
+  for (const model of modelsById.values()) {
+    if (model.visible) _pickRoots.push(model);
+  }
+  for (const fill of solidFills.values()) {
+    if (fill.visible) _pickRoots.push(fill);
+  }
+  if (_pickRoots.length === 0) return null;
+  const hits = raycaster.intersectObjects(_pickRoots, true);
+  for (const hit of hits) {
+    let node = hit.object;
+    while (node) {
+      const pid = node.userData?.pickId;
+      if (pid != null && !effectivelyHidden(pid)) return pid;
+      node = node.parent;
     }
   }
-  return bestId;
+  return null;
 }
 
 renderer.domElement.addEventListener("pointermove", (ev) => {
@@ -2870,8 +2830,8 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
   const dt = performance.now() - _downT;
   if (Math.hypot(dx, dy) > CLICK_MAX_MOVE_PX || dt > CLICK_MAX_DURATION_MS) return;
 
-  // Reuse the hover picker — same kind-rank / inner-vs-outer rules apply
-  // so selecting matches whatever the hover tooltip is showing.
+  // Reuse the hover picker so selecting matches whatever the hover
+  // tooltip is showing.
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
