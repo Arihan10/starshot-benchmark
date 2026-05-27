@@ -141,12 +141,12 @@ def render_zone_plan(
     interior anchor objects."""
     # Root zone uses the new competitive prompt format
     if not ancestors:
-        return f"""write one paragraph that describes the plan for a 3D scene provided the following prompt, and decide whether this scene should decompose into multiple distinct zones.
+        return f"""you are the first step in the SpatialBench pipeline and the step responsible for determining the high-level description and direction of the overall scene. write one paragraph that describes a 3D scene imagined from the following prompt, and decide whether this scene should decompose into multiple distinct zones.
 
 "{zone_prompt}"
 
 <VERY IMPORTANT INSTRUCTIONS>
-think deeply about the 3D scene, environment or level you want to build from this, and how you can creatively make it stand out enough to WIN. 
+think deeply about the 3D scene, environment or level you want to build from this provided prompt, and how you can creatively make it stand out enough to WIN against the other submissions. think about the narrative through-line that will help guide and form realistic scene intention - what is this game for, who lives in this house, what is the player trying to achieve in this level, what kind of city is this, and so on. instead of a stoic description that focuses only on the architectural qualities and layout of the scene, the plan you describe should also introduce a high-level story to the scene while allowing downstream planning steps to build on the narrative further. your goal is to write a guiding plan that downstream steps can build upon to complete a cohesive 3D scene for the given prompt that follows the narrative you imagine.
 
 write directly and consider every part carefully. you are only the first, overall planning step - your plan will go through hundreds of further downstream steps where it is expanded on and transformed as the AI pipeline to construct it propagates further planning by depth. define the scene itself, its top-level shape and character enough that the downstream steps have agency over their individual sections while also forming ideas of what to build. 
 
@@ -158,11 +158,7 @@ plan differently based on the prompt given and infer the purpose - e.g for a hou
 
 remember, tune specificity based on whether your intent can be inferred by downstream steps. e.g in the super mario level, do not be overly specific - do not scope out all individual platforms, items, etc. but rather the general idea of each part, since the downstream steps have a shared understanding of what a super mario level looks like and the general premise of the game; however, for a more abstract request like the top-down swamp frogger level, the through-line of what you are trying to build cannot be inferred or reconstructed by downstream steps in the pipeline as the specific context for the premise of the game was constructed within your internal reasoning, not exposed to those steps, and thus will be lost as the pipeline propagates, placing the onus for world creation and high-level planning on downstream steps (e.g the immediate next step of planning the specific nature of zones inferred from your prompt, which was not designed for deciding scene structure/mechanics itself as it lacks the lack full frame and is more there to decompose the scene and figure out spatial relationships between the decomposed zones, and follows a different, more mechanical heuristic for generation, which means it would not only not spend a lot of time thinking about that, but diverge significantly and perhaps genericly from world you were trying to create in different directions, before handing off to individual planning steps for each zone that have more agency over their nature and so on), which means you would need to provide that through-line more explicitly in that scenario where foundational planning is required for the world state due to a lack of shared context (as opposed to a house or established game level).
 
-always think from the perspective of a narrative through-line to help guide and form realistic scene intention - what is this game for, who lives in this house, what is the player trying to achieve in this level, what kind of city is this, and so on. instead of a stoic description that focuses only on the architectural qualities and layout of the scene, the plan you describe should also introduce a high-level story to the scene while allowing downstream planning steps to build on the narrative further. 
-- good plan: describes high-level layout of the scene + narrative context of the scene
-- bad plan: only describes high-level layout and structural qualities
-
-do not use flowery language. do not describe any abstract quantities like mood, lighting, fog, etc unless they can be converted into concrete 3D geometry. do not reference meta-quantities like the pipeline itself, the scene's 3D nature itself, etc. NEVER MENTION THOSE THINGS. focus on defining the environment intrinsically. remember, this is a full 3D scene, NOT an image - do not define any specific perspective.
+the output plan should be literal - do not use flowery language. do not describe any abstract quantities like mood, lighting, fog, etc unless they can be converted into concrete 3D geometry. do not reference meta-quantities like the pipeline itself, the scene's 3D nature itself, etc. NEVER MENTION THOSE THINGS. focus on defining the environment intrinsically. remember, this is a full 3D scene, NOT an image - do not define any specific perspective.
 
 define the scene itself, its top-level shape, character, and rough spatial relationships between major parts enough that the downstream steps have agency over their individual sections while also forming ideas of what to build, especially spatially.
 </VERY IMPORTANT INSTRUCTIONS>
@@ -205,11 +201,11 @@ in the interest of winning, always start by thinking of the overall narrative an
         for oid, oprompt, oparent, obbox, oplacement, _okind in objects
     ]
     obj_block = _render_section("OBJECTS", obj_entries, "none yet")
-    return f"""write one paragraph that describes the plan for the following region, and decide whether it should decompose into multiple distinct subzones.
+    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular region within the larger overall scene. write one paragraph that describes the plan for the following region, and decide whether it should decompose into multiple distinct subzones.
 
 "{zone_prompt}"
 
-This region is ONE PART of the larger scene. The following is the ancestor chain for the current region:
+The following is the ancestor chain for the current region:
 
 {ancestor_block}
 
@@ -624,7 +620,7 @@ def render_zone_decompose(
         prior_zones=prior_zones,
         objects=objects,
     )
-    return f"""Generate a list of subzones that should be present in the following scene, based on its description:
+    return f"""You are the step in the SpatialBench pipeline responsible for breaking down a given area into its top-level subregions, enriching the scene's detailedness in terms of both narrative and physical architecture. Generate a list of subzones that should be present in the following scene, based on its description:
 
 {zone_plan}
 
@@ -636,9 +632,9 @@ A subzone is an area of spatial interest whose bounding box sits within the pare
 Subzones can keep decomposing into more zones recursively in subsequent passes, or end there as atomic leaves if that is appropriate. so always decompose at the TOP MOST LEVEL of the current zone — e.g. for a house scene with backyard, driveway, and house, do not skip straight to backyard-pool zone, backyard-grass zone, house-basement, house-first-floor, etc.; decompose into "the house", "the backyard", "the driveway" as top-level children, and let the next recursion split the house into floors and the backyard into pool and grass. the same principle holds everywhere: emit only the zones that exist at THIS level of the hierarchy, and trust the recursive planning + decompose passes underneath each of them to handle the next layer down.
 </ZONE_SPLITTING_GUIDANCE>
 
-Think very intricately and spatially about how this zone splits. Your goal is to reason a subzone decomposition layout that fits the narrative presented by the scene plan given above as well as the additional plans of ancestor scenes in the scene context section given below, while paying attention to the semantic relationships between the subzones. The subzones presented should each flesh out the guiding narrative further in some way, carrying relevant ideas from previously defined plans (in the scene context below) while also adding some new ones without being contradictory.
+Think very intricately and spatially about how this zone splits. Your goal is to reason a subzone decomposition layout that fits the narrative presented by the scene plan given above as well as the additional plans of ancestor scenes in the scene context section given below, while paying attention to the semantic relationships between the subzones. The subzones presented should each flesh out the guiding narrative further in some way, carrying relevant ideas from previously defined plans (in the scene context below) while also introducing some new ones without being contradictory.
 
-The seed prompt you output for each subzone should be a 1-2 sentences long description that explains the subzone's shape and character. Be concrete about its description while leaving room for this prompt to be a seed for a more detailed plan. The prompt should be succinct without mentioning going overly into detail on the subzone's contents, but should mention the the narrative meaning behind its existence and the narrative meaning behind its relative placement to other subzones.
+The seed prompt you output for each subzone should be a 1-2 sentences long description that explains the subzone's shape, character, and the new narrative ideas presented by this subzone, if any. Be concrete about its description while leaving room for this prompt to be a seed for a more detailed plan. The prompt should be succinct without mentioning going overly into detail on the subzone's contents.
 
 Keep the prompt tight: the goal is not to plan out the subzone's contents, but to establish its character as a piece of the larger scene as a whole.
 </IMPORTANT_INSTRUCTIONS>
