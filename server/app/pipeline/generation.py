@@ -71,12 +71,16 @@ def _artifact_url(runs_dir: Path, path: Path) -> str:
 
 # Projection of the live node registry into the tuple shape every render
 # function expects for "what's already in the scene". Centralised so the
-# shape can evolve without combing every call site.
+# shape can evolve without combing every call site. Tuple:
+# (id, prompt, bbox, parent_id, proxy_shape, orientation, placement, plan).
+# `placement` is None only for the root node; every decomposed child has
+# one. `plan` is set on zone nodes and None on objects/frames — used by
+# the renderer to split context into <ZONES> and <OBJECTS> sections.
 def _scene_view(
     nodes: list[Node],
-) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation]]:
+) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]]:
     return [
-        (n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation)
+        (n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation, n.placement, n.plan)
         for n in nodes
     ]
 
@@ -89,7 +93,7 @@ async def _decompose_objects_validated(
     zone: Node,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str, BoundingBox]],
+    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
 ) -> list[ObjectSpec]:
     prior_attempts: list[tuple[list[ObjectSpec], str]] = []
     existing_ids = {n.id for n in all_nodes}
@@ -117,21 +121,14 @@ async def _decompose_objects_validated(
                 prior_attempts=prior_attempts,
             )
         else:
-            # negative-space mode: feed the full zone-list (every zone in the
-            # tree with its plan + bbox) instead of the ancestor chain.
-            # Filling gaps between siblings/cousins needs the whole tree's
-            # spatial layout, not the path to root.
-            zones = [
-                (n.id, n.plan, n.bbox)
-                for n in all_nodes
-                if n.plan is not None
-            ]
+            # negative-space mode: scene (via _render_scene_lines) already
+            # splits into <ZONES> + <OBJECTS> across every node in the run,
+            # so the explicit zone-list is redundant.
             system = SYSTEM_NEGATIVE_SPACE_DECOMP
             user = render_negative_space_decomp(
                 zone_id=zone.id,
                 zone_plan=zone.plan,
                 zone_bbox=zone.bbox,
-                zones=zones,
                 scene=scene,
                 prior_attempts=prior_attempts,
             )
@@ -139,6 +136,8 @@ async def _decompose_objects_validated(
             system=system,
             user=user,
             output_schema=ObjectDecompOutput,
+            node_id=zone.id,
+            step=f"{scenario.replace('-', '_')}_decompose",
         )
         specs = list(out.objects)
         try:
@@ -165,7 +164,7 @@ async def _decompose_objects_validated(
 
 async def _next_object_validated(
     *, zone: Node, all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str, BoundingBox]],
+    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
 ) -> NextObjectOutput:
     prior_attempts: list[tuple[ObjectSpec, str]] = []
     existing_ids = {n.id for n in all_nodes}
@@ -183,6 +182,8 @@ async def _next_object_validated(
                 prior_attempts=prior_attempts,
             ),
             output_schema=NextObjectOutput,
+            node_id=zone.id,
+            step="next_object",
         )
         if decision.done or decision.object is None:
             return decision
@@ -257,6 +258,8 @@ async def _resolve_and_generate(
             peers=_scene_view(all_nodes),
         ),
         output_schema=BboxBatchOutput,
+        node_id=zone.id,
+        step="object_bbox_batch",
     )
     bboxes = {a.id: a.bbox for a in out.assignments}
 
@@ -275,7 +278,7 @@ async def _resolve_and_generate(
     resolved: list[Node] = []
     for spec in specs:
         bbox = bboxes[spec.id]
-        parent_id = spec.referenced_ids[0]
+        parent_id = spec.parent
         logging.emit_bbox(
             spec.id, bbox,
             parent_id=parent_id, prompt=spec.prompt,
@@ -285,6 +288,7 @@ async def _resolve_and_generate(
         )
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
         subject_prompt, image_prompt = await _build_image_prompt(
+            spec_id=spec.id,
             prompt=spec.prompt, bbox=bbox, proxy_shape=spec.proxy_shape,
             prior_prompts=prior_subjects,
         )
@@ -298,6 +302,7 @@ async def _resolve_and_generate(
             placement=spec.placement,
             referenced_ids=list(spec.referenced_ids),
             parent_id=parent_id,
+            parent_kind=spec.parent_kind,
         ))
 
     return await _spawn_meshes(
@@ -307,6 +312,7 @@ async def _resolve_and_generate(
 
 async def _build_image_prompt(
     *,
+    spec_id: str,
     prompt: str,
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
@@ -323,6 +329,8 @@ async def _build_image_prompt(
             prior_prompts=prior_prompts,
         ),
         output_schema=ImagePromptOutput,
+        node_id=spec_id,
+        step="image_prompt",
     )
     return out.prompt, wrap_image_prompt(out.prompt, proxy_shape, bbox.size)
 
@@ -473,7 +481,7 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str, BoundingBox]],
+    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
 ) -> None:
     specs = await _decompose_objects_validated(
         zone=zone, scenario=scenario, all_nodes=all_nodes, ancestors=ancestors,

@@ -1533,6 +1533,71 @@
                 flex-basis: 100%;
                 margin-left: 18px;
             }
+            .tm-obs-via {
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                font-size: 10px;
+                padding: 1px 6px;
+                border-radius: 2px;
+                background: #14161b;
+                border: 1px solid #2a2d35;
+                color: #b8bcc4;
+            }
+            /* Step-specific tinting so anchor vs next vs encapsulating
+               vs negative-space vs zone-decompose vs child-bbox-batch
+               jump out at a glance. */
+            .tm-obs-via.via-anchor_decompose          { color: #c586d1; border-color: #5c3a64; }
+            .tm-obs-via.via-next_object               { color: #d1a386; border-color: #6c4a32; }
+            .tm-obs-via.via-encapsulating_decompose   { color: #7fb3d5; border-color: #2f5b7a; }
+            .tm-obs-via.via-negative_space_decompose  { color: #9ad4ff; border-color: #2f5b7a; }
+            .tm-obs-via.via-zone_decompose            { color: #e0c271; border-color: #6c5520; }
+            .tm-obs-provenance {
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                padding: 8px;
+                border: 1px dashed #324050;
+                border-radius: 4px;
+                background: #0e1218;
+            }
+            .tm-obs-provenance-label {
+                color: #9ad4ff;
+                font-weight: 600;
+            }
+            .tm-obs-provenance-rel {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+                font-size: 10px;
+            }
+            .tm-obs-provenance-tag {
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                padding: 1px 5px;
+                border-radius: 2px;
+                background: #1a1c22;
+                border: 1px solid #2a2d35;
+                color: #b8bcc4;
+            }
+            .tm-obs-provenance-tag.rel-emitted_by {
+                color: #d1a386;
+                border-color: #5c3a20;
+            }
+            .tm-obs-provenance-tag.rel-placed_by {
+                color: #9ad4ff;
+                border-color: #2f5b7a;
+            }
+            .tm-obs-provenance-on {
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                color: #b8bcc4;
+                cursor: pointer;
+                text-decoration: none;
+            }
+            .tm-obs-provenance-on:hover { color: #e6e6e6; text-decoration: underline; }
+            .tm-obs-provenance-on.dead { cursor: default; color: #5a5e68; }
+            .tm-llm-calls-label {
+                color: #7a8190;
+                padding-top: 2px;
+            }
             .tm-obs-body {
                 padding: 0 12px 12px;
                 display: flex;

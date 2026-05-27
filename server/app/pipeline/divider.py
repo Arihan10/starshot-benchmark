@@ -53,13 +53,15 @@ async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
         system=SYSTEM_OVERALL_BBOX,
         user=render_overall_bbox(prompt, scene_plan),
         output_schema=OverallBboxOutput,
+        node_id="root",
+        step="overall_bbox",
     )
     return out.bbox
 
 
 def _prior_zones(
     all_nodes: list[Node],
-) -> list[tuple[str, str, str | None, str, BoundingBox]]:
+) -> list[tuple[str, str, str | None, str, BoundingBox, str | None]]:
     """Every non-root zone already declared. Used as lateral scene
     context for the decomposition step so siblings/cousins can inform
     a zone's structure and relationships.
@@ -67,31 +69,38 @@ def _prior_zones(
     We include zones whose plan hasn't been authored yet — depth-first
     traversal plans-then-decomposes one branch at a time, so the rest
     of the parent's siblings (declared in the same batch, recursed
-    into later) sit here as `plan=None`. Their bboxes are the
-    load-bearing piece: a cousin zone the decomposer is about to plan
-    around needs to know where its already-placed neighbors sit, even
-    if those neighbors' detailed plans don't exist yet.
+    into later) sit here as `plan=None`. Their bboxes and placement
+    text are the load-bearing pieces: a cousin zone the decomposer is
+    about to plan around needs to know where its already-placed
+    neighbors sit, even if those neighbors' detailed plans don't exist
+    yet. Tuple: (id, prompt, plan_or_None, parent_id, bbox, placement).
     """
-    out: list[tuple[str, str, str | None, str, BoundingBox]] = []
+    out: list[tuple[str, str, str | None, str, BoundingBox, str | None]] = []
     for n in all_nodes:
         if n.mesh_url is not None:
             continue
         if n.parent_id is None:
             continue
-        out.append((n.id, n.prompt, n.plan, n.parent_id, n.bbox))
+        out.append((n.id, n.prompt, n.plan, n.parent_id, n.bbox, n.placement))
     return out
 
 
 def _ancestors(
     node: Node, all_nodes: list[Node],
-) -> list[tuple[str, str, str, BoundingBox]]:
+) -> list[tuple[str, str, str, BoundingBox, str | None]]:
     """Walk parent_id pointers up to the root, then return root-first →
     parent-of-`node`, excluding `node` itself. Each tuple is (id,
-    prompt, plan, bbox). Empty for the root.
+    prompt, plan, bbox, placement). `placement` is None for the root
+    (which has no parent and thus no placement); non-None for every
+    other ancestor.
 
-    Ancestors are always planned by the time we recurse into a child
-    (the depth-first walk plans before decomposing), so `plan` is
-    never None here."""
+    Most ancestors are planned by the time we recurse into a child (the
+    depth-first walk plans before decomposing). One exception: when a
+    child is sibling-parented to another subzone declared in the same
+    decompose batch, the encapsulating pass for that child runs before
+    its sibling-parent has been planned. In that case we fall back to
+    the sibling's seed prompt with a label so the downstream LLM knows
+    the level of detail is reduced for that ancestor."""
     by_id = {n.id: n for n in all_nodes}
     chain: list[Node] = []
     parent_id = node.parent_id
@@ -100,19 +109,36 @@ def _ancestors(
         chain.append(parent)
         parent_id = parent.parent_id
     chain.reverse()
-    out: list[tuple[str, str, str, BoundingBox]] = []
+    out: list[tuple[str, str, str, BoundingBox, str | None]] = []
     for a in chain:
-        assert a.plan is not None, f"ancestor {a.id} must be planned"
-        out.append((a.id, a.prompt, a.plan, a.bbox))
+        if a.plan is not None:
+            plan_text = a.plan
+        else:
+            plan_text = (
+                f"(seed prompt — full plan not yet authored): {a.prompt}"
+            )
+        out.append((a.id, a.prompt, plan_text, a.bbox, a.placement))
     return out
 
 
-def _generated_objects(all_nodes: list[Node]) -> list[tuple[str, str, str | None]]:
+def _generated_objects(
+    all_nodes: list[Node],
+) -> list[tuple[str, str, str | None, BoundingBox, str | None, str | None]]:
     """Every concrete (mesh-bearing) node placed so far, in declaration
-    order. Used to ground planning context in what the scene actually
-    looks like, not just what's been promised."""
+    order, with its bbox, placement prose, and parent_kind. Used to
+    ground planning context in what the scene actually looks like, not
+    just what's been promised — and so these nodes are valid
+    `referenced_ids` targets in downstream placement text. Tuple: (id,
+    prompt, parent_id, bbox, placement, parent_kind). `parent_kind` lets
+    the zone-decompose narrative split shell frames (ATTACHED) from
+    interior anchor objects (ON / IN)."""
     return [
-        (n.id, n.prompt, n.parent_id) for n in all_nodes if n.mesh_url is not None
+        (
+            n.id, n.prompt, n.parent_id, n.bbox, n.placement,
+            n.parent_kind.value if n.parent_kind is not None else None,
+        )
+        for n in all_nodes
+        if n.mesh_url is not None
     ]
 
 
@@ -120,8 +146,8 @@ async def _plan_zone(
     *,
     zone_id: str,
     zone_prompt: str,
-    ancestors: list[tuple[str, str, str, BoundingBox]],
-    objects: list[tuple[str, str, str | None]],
+    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
+    objects: list[tuple[str, str, str | None, BoundingBox, str | None]],
 ) -> ZonePlanOutput:
     """Author the high-level plan for a zone and decide whether it is atomic.
     Works for any zone (root or nested) — the root just passes empty ancestors."""
@@ -135,6 +161,8 @@ async def _plan_zone(
             objects=objects,
         ),
         output_schema=ZonePlanOutput,
+        node_id=zone_id,
+        step="zone_plan",
     )
 
 
@@ -160,6 +188,8 @@ async def _decompose_zone(
             prior_zones=_prior_zones(all_nodes),
         ),
         output_schema=ZoneDecomposeOutput,
+        node_id=node.id,
+        step="zone_decompose",
     )
 
 
@@ -174,6 +204,8 @@ async def _resolve_child_bboxes_batch(
             children=children,
         ),
         output_schema=BboxBatchOutput,
+        node_id=parent.id,
+        step="child_bbox_batch",
     )
     return {a.id: a.bbox for a in out.assignments}
 
@@ -252,7 +284,8 @@ async def _build(
             proxy_shape=spec.proxy_shape,
             placement=spec.placement,
             referenced_ids=list(spec.referenced_ids),
-            parent_id=node.id,
+            parent_id=spec.parent,
+            parent_kind=spec.parent_kind,
             plan=None,
         )
         placed.append(child)

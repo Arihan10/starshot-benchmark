@@ -1,0 +1,39 @@
+<scene_context> // EXAMPLE: ZONE DECOMP
+
+Here is a list of zones that have already been declared and/or planned beforehand. You should use their plans and locations to aid you in <task>. Starting with the root zone encapsulating the entire scene, here is its plan:
+
+<plan>
+
+The root is 50m by 20m by 40m and origins at (0, 0, 0). Inside, it contains a living room with the following plan:
+
+<plan for living room>. The living room is framed by frame 1, frame 2, ... , and it contains object 1 (placement for object 1), object 2 (placement for object 2), ...
+
+The living room is 20m by 10m by 5m. Inside, it contains a lounge area with the following plan:
+
+...
+
+You are to decide on the structural decomposition of this lounge area. To that end, here's some more context on the other areas inside the scene. You should reference this information to help you in <task>.
+
+Other areas in root:
+
+1. Bathroom (50m by 20m by 1m, origin (2, 4, 6))
+
+<plan for bathroom>. The bathroom is framed by frame 1, frame 2, ... , and it contains object 1 (placement for object 1), object 2 (placement for object 2), ...
+  
+    
+    Areas in bathroom:
+
+    1. ...
+
+2. Bedroom ...
+    
+    Areas in bedroom:
+
+    1. 
+
+...
+
+Other areas in living room <- the lounge area you are to decompose exists here:
+...
+
+</scene_context>

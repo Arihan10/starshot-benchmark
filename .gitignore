@@ -1,6 +1,6 @@
 .env
-server/runs/
-server/previous_runs/
+**/.DS_STORE
+runs/
 client/node_modules/
 .ruff_cache/
 **/__pycache__/
@@ -11,5 +11,3 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-zone_plan_*/
-no_more_runware/
