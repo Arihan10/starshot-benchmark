@@ -27,10 +27,13 @@ relationship validator on the single emitted spec.
 from __future__ import annotations
 
 import asyncio
+import os
 from pathlib import Path
 from typing import Literal
 
 import trimesh
+
+_USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
 
 # Guards the trimesh load -> rescale -> export block. API calls and GLB
 # downloads stay fully parallel across slots; only the RAM-heavy mesh
@@ -41,6 +44,7 @@ _MESH_IO = asyncio.Semaphore(1)
 from app.core.prompts import (
     BboxBatchOutput,
     ImagePromptOutput,
+    ImageView,
     NextObjectOutput,
     ObjectDecompOutput,
     ObjectSpec,
@@ -260,6 +264,12 @@ async def _resolve_and_generate(
     )
     bboxes = {a.id: a.bbox for a in out.assignments}
 
+    if _USE_ASSET_LIBRARY:
+        return await _match_library_assets(
+            specs=specs, bboxes=bboxes, scenario=scenario,
+            runs_dir=runs_dir, run_id=run_id,
+        )
+
     # Every object (anchor, completion, encapsulating alike) goes through
     # the image-prompt rewrite: Nano Banana needs an isolated studio
     # reference shot — any environmental context bleeds into the mesh.
@@ -283,9 +293,10 @@ async def _resolve_and_generate(
             orientation=spec.orientation,
         )
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
+        view: ImageView = "three-quarter" if scenario == "encapsulating" else "front"
         subject_prompt, image_prompt = await _build_image_prompt(
             prompt=spec.prompt, bbox=bbox, proxy_shape=spec.proxy_shape,
-            prior_prompts=prior_subjects,
+            prior_prompts=prior_subjects, view=view,
         )
         resolved.append(Node(
             id=spec.id,
@@ -303,17 +314,89 @@ async def _resolve_and_generate(
     )
 
 
+async def _match_library_assets(
+    *,
+    specs: list[ObjectSpec],
+    bboxes: dict[str, BoundingBox],
+    scenario: Literal["anchor", "encapsulating", "negative-space"],
+    runs_dir: Path,
+    run_id: str,
+) -> list[Node]:
+    from app.services import library
+
+    objs_dir = runs_dir / run_id / "objects"
+    objs_dir.mkdir(parents=True, exist_ok=True)
+
+    resolved: list[Node] = []
+    for spec in specs:
+        bbox = bboxes[spec.id]
+        logging.emit_bbox(
+            spec.id, bbox,
+            parent_id=spec.parent, prompt=spec.prompt,
+            kind="frame" if scenario == "encapsulating" else "object",
+            proxy_shape=spec.proxy_shape,
+            orientation=spec.orientation,
+        )
+
+        match = await library.match(spec.prompt)
+        asset = library.asset_path(match.library_id)
+        path = objs_dir / f"{spec.id}.glb"
+        url = _artifact_url(runs_dir, path)
+
+        logging.log(
+            "library.match",
+            id=spec.id, prompt=spec.prompt, library_id=match.library_id,
+        )
+
+        if asset.exists():
+            async with _MESH_IO:
+                scene = await asyncio.to_thread(trimesh.load, asset)
+                rescaled = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, scene, bbox,
+                    orientation=spec.orientation,
+                )
+                await asyncio.to_thread(rescaled.export, path, file_type="glb")
+                del scene, rescaled
+            logging.emit_model(
+                spec.id, artifact_kind="object", url=url,
+            )
+        else:
+            logging.log(
+                "library.asset_missing",
+                id=spec.id, library_id=match.library_id,
+            )
+
+        resolved.append(Node(
+            id=spec.id,
+            prompt=spec.prompt,
+            bbox=bbox,
+            proxy_shape=spec.proxy_shape,
+            orientation=spec.orientation,
+            relationships=list(spec.relationships),
+            parent_id=spec.parent,
+            mesh_url=url,
+        ))
+
+    return resolved
+
+
 async def _build_image_prompt(
     *,
     prompt: str,
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
     prior_prompts: list[str],
+    view: ImageView = "front",
+    include_dimensions: bool = True,
 ) -> tuple[str, str]:
     """Returns (subject_phrase, wrapped_image_prompt). The subject phrase is
     the LLM's bare noun phrase — what gets stored on Node.prompt and shown
     in context. The wrapped prompt is the full Nano-Banana studio-shot
-    directive — used only at the image-generation boundary."""
+    directive — used only at the image-generation boundary.
+
+    Set include_dimensions=False for library generation where objects have
+    no meaningful bbox — omits the dimension constraint from the image
+    prompt so the model renders natural proportions."""
     out = await llm.call_llm(
         system=SYSTEM_IMAGE_PROMPT,
         user=render_image_prompt(
@@ -322,7 +405,8 @@ async def _build_image_prompt(
         ),
         output_schema=ImagePromptOutput,
     )
-    return out.prompt, wrap_image_prompt(out.prompt, proxy_shape, bbox.size)
+    dims = bbox.size if include_dimensions else None
+    return out.prompt, wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
 
 
 _pending: dict[str, list[asyncio.Task[None]]] = {}
