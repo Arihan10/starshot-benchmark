@@ -379,7 +379,7 @@ async def _match_library_assets(
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
-            relationships=list(spec.relationships),
+            referenced_ids=list(spec.referenced_ids),
             parent_id=spec.parent,
             mesh_url=url,
         ))

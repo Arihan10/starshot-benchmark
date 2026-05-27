@@ -66,7 +66,7 @@ async def match(prompt: str) -> LibraryMatchOutput:
         for item in catalog
     )
     user = (
-        f"Object to match: {prompt!r} (id: {id!r})\n\n"
+        f"Object to match: {prompt!r}\n\n"
         f"Available library assets:\n{items}\n\n"
         "Pick the best-matching asset id."
     )
