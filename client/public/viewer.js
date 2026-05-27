@@ -10,7 +10,6 @@ const SERVER_URL = document
 const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
-const PICK_INNER_STORAGE_KEY = "starshot.pickInner";
 const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 
 const statusEl = document.getElementById("status");
@@ -20,7 +19,6 @@ const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
-const pickInnerToggleEl = document.getElementById("pick-inner-toggle");
 const solidFillToggleEl = document.getElementById("solid-fill-toggle");
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
@@ -197,8 +195,10 @@ function appendEvent(event) {
       p.appendChild(kv);
     }
   }
+  const atBottom =
+    logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 1;
   logEl.appendChild(p);
-  logEl.scrollTop = logEl.scrollHeight;
+  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
 }
 
 function clearLog() {
@@ -516,10 +516,16 @@ function renderTrellisQueue() {
         slotTag.textContent = row.slot_id;
         el.appendChild(slotTag);
       }
-      const elapsed = document.createElement("span");
-      elapsed.className = "tq-elapsed";
-      elapsed.textContent = fmtElapsed(Math.max(0, now - row.sinceMs));
-      el.appendChild(elapsed);
+      // Elapsed only shown for processing rows — we want to measure how
+      // long Modal takes to return a mesh once it actually starts, not how
+      // long a row sat in the local FIFO. Server's `since` resets on state
+      // transition, so this is true processing-elapsed when shown.
+      if (kind === "processing") {
+        const elapsed = document.createElement("span");
+        elapsed.className = "tq-elapsed";
+        elapsed.textContent = fmtElapsed(Math.max(0, now - row.sinceMs));
+        el.appendChild(elapsed);
+      }
       parent.appendChild(el);
     }
   }
@@ -531,8 +537,12 @@ function renderTrellisQueue() {
 // keeps the UI within a heartbeat of reality without flooding.
 setInterval(pollTrellisQueue, 1500);
 // Re-render once a second between polls so elapsed timers tick smoothly.
+// Only the processing rows show an elapsed timer, so this is a no-op when
+// the queue is empty or only contains waiting entries.
 setInterval(() => {
-  if ((trellisQueueSnapshot.entries ?? []).length > 0) renderTrellisQueue();
+  const hasProcessing = (trellisQueueSnapshot.entries ?? [])
+    .some((e) => e.state === "processing");
+  if (hasProcessing) renderTrellisQueue();
 }, 1000);
 // Kick an initial fetch so the panel populates without waiting a full tick.
 pollTrellisQueue();
@@ -564,6 +574,20 @@ const treeChildren = new Map(); // parentId -> [childIds] in insertion order
 // with the node's ancestors and descendants. Insertion order is preserved so
 // the calls render in the order the pipeline made them.
 const nodeLlmCalls = new Map(); // id -> [{step, system, user, output, reasoning, model, cached, eventIndex}]
+// Provenance per node — the LLM calls that *brought this node into existence*
+// (rather than calls *issued from* it). Filled in as we observe `cache.llm`
+// events whose outputs name this id. The two relations we care about:
+//   "emitted_by" — a decomposition call whose output named this id
+//                  (zone_decompose, anchor_decompose, encapsulating_decompose,
+//                  negative_space_decompose, next_object). The emitting step
+//                  is also what tells us "was this an anchor object or a
+//                  follow-up next_object loop pick?" — the user explicitly
+//                  asked for this distinction.
+//   "placed_by"  — a bbox-batch call that assigned this id its concrete bbox
+//                  (child_bbox_batch, object_bbox_batch).
+// Same shape as `nodeLlmCalls` entries plus a `relation` tag and the parent
+// `node` id from the call (so the UI can label "via parent_zone.anchor_decompose").
+const nodeProvenance = new Map(); // id -> [{relation, call: {...}}]
 let treeRootId = null;
 let treeActiveId = null;
 let treeOrderCounter = 0;
@@ -630,8 +654,7 @@ function recordLlmCall(event) {
   // haven't tagged) bucket it under "_unattributed" so the modal can still
   // surface it under the root view rather than dropping it on the floor.
   const id = event.node || "_unattributed";
-  const list = nodeLlmCalls.get(id) ?? [];
-  list.push({
+  const call = {
     step: event.step || "(unknown step)",
     system: event.system ?? "",
     user: event.user ?? "",
@@ -640,14 +663,59 @@ function recordLlmCall(event) {
     model: event.model ?? "",
     cached: !!event.cached,
     eventIndex: typeof event.index === "number" ? event.index : null,
-  });
+    // The "node" field on the event is the call site's node id — for
+    // decompose/bbox-batch calls, that's the *parent*. Carried through so the
+    // provenance render can label "from parent_zone.anchor_decompose".
+    parentNode: event.node || null,
+  };
+  const list = nodeLlmCalls.get(id) ?? [];
+  list.push(call);
   nodeLlmCalls.set(id, list);
+  // Now scan the output for ids this call brought into existence and back-
+  // fill provenance for each. The output shape is structured-output, so we
+  // know exactly which fields name child ids:
+  //   * `children: [{id, ...}]`          — divider.zone_decompose
+  //   * `assignments: [{id, bbox}]`      — child_bbox_batch + object_bbox_batch
+  //   * `objects: [{id, ...}]`           — anchor_decompose, encapsulating_decompose,
+  //                                        negative_space_decompose
+  //   * `object: {id, ...}` (non-null)   — next_object (single emitted spec)
+  // Anything else (zone_plan, image_prompt, overall_bbox) doesn't emit ids.
+  const out = event.output;
+  if (!out || typeof out !== "object") return;
+  const isBboxStep = call.step === "child_bbox_batch"
+    || call.step === "object_bbox_batch";
+  const relation = isBboxStep ? "placed_by" : "emitted_by";
+  function tag(childId) {
+    if (!childId || childId === id) return; // never attach a node to itself
+    const arr = nodeProvenance.get(childId) ?? [];
+    // Dedup on (step + parentNode + eventIndex) — events can replay during
+    // SSE reconnects and we don't want the same trace entry twice.
+    const key = `${call.step}|${call.parentNode}|${call.eventIndex}`;
+    if (arr.some((e) => `${e.call.step}|${e.call.parentNode}|${e.call.eventIndex}` === key)) {
+      return;
+    }
+    arr.push({ relation, call });
+    nodeProvenance.set(childId, arr);
+  }
+  if (Array.isArray(out.children)) {
+    for (const c of out.children) tag(c?.id);
+  }
+  if (Array.isArray(out.assignments)) {
+    for (const a of out.assignments) tag(a?.id);
+  }
+  if (Array.isArray(out.objects)) {
+    for (const o of out.objects) tag(o?.id);
+  }
+  if (out.object && typeof out.object === "object") {
+    tag(out.object.id);
+  }
 }
 
 function treeClear() {
   treeNodes.clear();
   treeChildren.clear();
   nodeLlmCalls.clear();
+  nodeProvenance.clear();
   treeRootId = null;
   treeActiveId = null;
   treeOrderCounter = 0;
@@ -935,25 +1003,6 @@ framesToggleEl.addEventListener("click", () => {
   refreshAllSolidFillVisibility();
 });
 
-// "pick: inner" — only matters in bbox-only mode (bboxes: on). When ON,
-// picking prefers the smallest/innermost bbox under the cursor so a nested
-// object inside another object's bbox can be hovered & selected. When OFF,
-// picking uses closest ray-entry (the visible wireframe face you're pointing
-// at wins). Default OFF so newly-loaded sessions keep the "what you see is
-// what you pick" behaviour.
-let pickInner = localStorage.getItem(PICK_INNER_STORAGE_KEY) === "1";
-function applyPickInnerToggleLabel() {
-  pickInnerToggleEl.textContent = `pick: ${pickInner ? "inner" : "outer"}`;
-  pickInnerToggleEl.classList.toggle("off", !pickInner);
-}
-applyPickInnerToggleLabel();
-pickInnerToggleEl.addEventListener("click", () => {
-  pickInner = !pickInner;
-  localStorage.setItem(PICK_INNER_STORAGE_KEY, pickInner ? "1" : "0");
-  applyPickInnerToggleLabel();
-  pointerDirty = true;
-});
-
 // Solid-fill mode — drops a solid mesh into every object/frame bbox using its
 // proxy shape (or the AABB itself when no proxy_shape is set). Zones stay
 // wireframe. Intended for bbox-only mode so the scene reads as solids without
@@ -988,8 +1037,6 @@ let selectedBboxId = null;
 
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
-const bboxPickPoint = new THREE.Vector3();
-const bboxPickSize = new THREE.Vector3();
 let pointerDirty = false;
 let lastPointerClientX = 0;
 let lastPointerClientY = 0;
@@ -1325,6 +1372,7 @@ async function _loadModelNow(event, gen) {
       }
     });
     gltf.scene.name = `${event.artifact_kind}:${event.id}`;
+    gltf.scene.userData.pickId = event.id;
     const prevModel = modelsById.get(event.id);
     if (prevModel) {
       sceneRoot.remove(prevModel);
@@ -1397,6 +1445,7 @@ function loadBbox(event) {
   if (solidFillShown && nodeKind !== "zone") {
     const fill = buildSolidFill(event.proxy_shape, origin, dimensions, nodeKind);
     if (fill !== null) {
+      fill.userData.pickId = id;
       bboxRoot.add(fill);
       solidFills.set(id, fill);
       applySolidFillVisibility(id);
@@ -1531,6 +1580,7 @@ function rebuildAllSolidFills() {
     if (!origin || !dimensions) continue;
     const fill = buildSolidFill(helper.userData.proxyShape ?? null, origin, dimensions, nodeKind);
     if (fill === null) continue;
+    fill.userData.pickId = id;
     bboxRoot.add(fill);
     solidFills.set(id, fill);
     applySolidFillVisibility(id);
@@ -2334,8 +2384,14 @@ function renderObsCard(node, { role, depth }) {
   idEl.className = `tm-id ${kind}`;
   idEl.textContent = node.id;
   idEl.title = "Click to focus this node";
+  idEl.title = "Click to focus this node";
   idEl.addEventListener("click", (ev) => {
     ev.stopPropagation();
+    ev.preventDefault();
+    focusModalOn(node.id);
+  });
+  sum.appendChild(idEl);
+
     ev.preventDefault();
     focusModalOn(node.id);
   });
@@ -2352,6 +2408,20 @@ function renderObsCard(node, { role, depth }) {
   callsTag.textContent = calls.length === 1 ? "1 llm call" : `${calls.length} llm calls`;
   sum.appendChild(callsTag);
 
+  // "via {step}" pill — surfaces which decomposition step admitted this
+  // node at a glance, so the user can immediately see anchor vs next_object
+  // vs encapsulating vs negative_space vs zone_decompose, without expanding.
+  // Pulled from the provenance trace (first emitted_by entry).
+  const provenance = nodeProvenance.get(node.id) ?? [];
+  const emittedBy = provenance.find((p) => p.relation === "emitted_by");
+  if (emittedBy) {
+    const via = document.createElement("span");
+    via.className = `tm-obs-via via-${emittedBy.call.step}`;
+    via.textContent = `via ${emittedBy.call.step}`;
+    via.title = `Emitted by ${emittedBy.call.step} call on ${emittedBy.call.parentNode || "?"}`;
+    sum.appendChild(via);
+  }
+
   if (node.prompt) {
     const promptTeaser = document.createElement("span");
     promptTeaser.className = "tm-obs-teaser";
@@ -2366,7 +2436,10 @@ function renderObsCard(node, { role, depth }) {
   // plus every llm.call recorded against this node.
   const body = document.createElement("div");
   body.className = "tm-obs-body";
+  body.className = "tm-obs-body";
 
+  function addTextSection(label, text) {
+    if (!text) return;
   function addTextSection(label, text) {
     if (!text) return;
     const wrap = document.createElement("div");
@@ -2378,21 +2451,72 @@ function renderObsCard(node, { role, depth }) {
     const b = document.createElement("div");
     b.className = "tm-section-body";
     b.textContent = text;
+    b.textContent = text;
     wrap.appendChild(b);
+    body.appendChild(wrap);
     body.appendChild(wrap);
   }
 
   addTextSection("seed prompt", node.prompt);
   if (kind === "zone" && node.plan) addTextSection("zone plan", node.plan);
   if (kind !== "zone" && node.imagePrompt) addTextSection("image prompt", node.imagePrompt);
+  addTextSection("seed prompt", node.prompt);
+  if (kind === "zone" && node.plan) addTextSection("zone plan", node.plan);
+  if (kind !== "zone" && node.imagePrompt) addTextSection("image prompt", node.imagePrompt);
 
-  // LLM call traces — the heart of the modal.
+  // Provenance — the LLM calls that *brought this node into existence*.
+  // Distinct from the calls section below (which is calls *issued from* this
+  // node). For an object, this is the only place to see the anchor_decompose
+  // / next_object / object_bbox_batch calls that named & placed it — those
+  // calls live on the parent zone's id. Surfaced as full collapsible call
+  // blocks so the user can read the exact system + user + output that drove
+  // the placement decision.
+  if (provenance.length > 0) {
+    const provWrap = document.createElement("div");
+    provWrap.className = "tm-obs-provenance";
+    const lab = document.createElement("div");
+    lab.className = "tm-section-label tm-obs-provenance-label";
+    lab.textContent = "provenance — calls that emitted & placed this node";
+    provWrap.appendChild(lab);
+    const callDefaultOpen = role === "focus";
+    for (const entry of provenance) {
+      const relLine = document.createElement("div");
+      relLine.className = "tm-obs-provenance-rel";
+      const rel = document.createElement("span");
+      rel.className = `tm-obs-provenance-tag rel-${entry.relation}`;
+      rel.textContent = entry.relation === "emitted_by" ? "emitted by" : "placed by";
+      relLine.appendChild(rel);
+      const onNode = document.createElement("a");
+      onNode.className = "tm-obs-provenance-on";
+      onNode.textContent = `${entry.call.step} on ${entry.call.parentNode || "?"}`;
+      if (entry.call.parentNode && treeNodes.has(entry.call.parentNode)) {
+        onNode.title = `Click to focus ${entry.call.parentNode}`;
+        onNode.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          focusModalOn(entry.call.parentNode);
+        });
+      } else {
+        onNode.classList.add("dead");
+      }
+      relLine.appendChild(onNode);
+      provWrap.appendChild(relLine);
+      provWrap.appendChild(llmCallBlock(entry.call, { defaultOpen: callDefaultOpen }));
+    }
+    body.appendChild(provWrap);
+  }
+
+  // LLM call traces — calls issued *from* this node (zone_plan,
+  // zone_decompose, anchor_decompose, image_prompt, etc).
   const callsWrap = document.createElement("div");
   callsWrap.className = "tm-llm-calls";
+  const callsHeader = document.createElement("div");
+  callsHeader.className = "tm-section-label tm-llm-calls-label";
+  callsHeader.textContent = "calls issued from this node";
+  callsWrap.appendChild(callsHeader);
   if (calls.length === 0) {
     const empty = document.createElement("div");
     empty.className = "tm-llm-empty";
-    empty.textContent = "(no LLM calls captured yet for this node)";
+    empty.textContent = "(no LLM calls issued from this node)";
     callsWrap.appendChild(empty);
   } else {
     // Focus card opens every call; ancestors/descendants leave them collapsed.
@@ -2442,7 +2566,11 @@ function nodeMatchesQuery(node, q) {
   if ((node.plan ?? "").toLowerCase().includes(q)) return true;
   if ((node.imagePrompt ?? "").toLowerCase().includes(q)) return true;
   const calls = nodeLlmCalls.get(node.id) ?? [];
-  return calls.some((c) => callMatchesQuery(c, q));
+  if (calls.some((c) => callMatchesQuery(c, q))) return true;
+  // Also match provenance calls — searching for an emitting step name like
+  // "anchor_decompose" should surface every object that was emitted by one.
+  const prov = nodeProvenance.get(node.id) ?? [];
+  return prov.some((p) => callMatchesQuery(p.call, q));
 }
 
 function renderTreeModal() {
@@ -2650,50 +2778,30 @@ function positionTooltip(clientX, clientY, id) {
   tooltip.style.top = `${Math.max(0, y)}px`;
 }
 
+// Mesh-based picking: raycast against actual geometry the user sees —
+// loaded GLB meshes first, then solid-fill proxies when the model hasn't
+// arrived. Zones never have meshes, so they're unreachable here and must
+// be selected from the tree.
+const _pickRoots = [];
 function pickHoveredBboxId() {
-  let bestId = null;
-  let bestKindRank = Infinity;
-  let bestDistance = Infinity;
-  let bestSize = Infinity;
-  // Three regimes:
-  //  - bboxes: off → user is visually pointing at meshes. Prefer the inner
-  //    object/frame so a tiny prop inside a big zone is still pickable.
-  //  - bboxes: on, pick: outer → wireframes are visible; pick the one whose
-  //    face the ray hits first (closest entry point), so hovering matches
-  //    what's drawn.
-  //  - bboxes: on, pick: inner → still in bbox-only mode, but the user is
-  //    drilling into nested objects: prefer the smallest/innermost bbox so
-  //    an object enclosed by another object's bbox becomes pickable.
-  const innerPreferred = !bboxesShown || pickInner;
-  for (const [id, helper] of bboxes) {
-    if (effectivelyHidden(id)) continue;
-    const kind = treeNodes.get(id)?.kind;
-    if (!raycaster.ray.intersectBox(helper.box, bboxPickPoint)) continue;
-
-    const kindRank = kind === "object" ? 0 : kind === "frame" ? 1 : 2;
-    const distance = bboxPickPoint.distanceToSquared(camera.position);
-    helper.box.getSize(bboxPickSize);
-    const sizeTieBreaker = bboxPickSize.lengthSq();
-
-    const better = innerPreferred
-      ? (
-          kindRank < bestKindRank ||
-          (kindRank === bestKindRank && sizeTieBreaker < bestSize) ||
-          (kindRank === bestKindRank && sizeTieBreaker === bestSize && distance < bestDistance)
-        )
-      : (
-          distance < bestDistance ||
-          (distance === bestDistance && kindRank < bestKindRank) ||
-          (distance === bestDistance && kindRank === bestKindRank && sizeTieBreaker < bestSize)
-        );
-    if (better) {
-      bestId = id;
-      bestKindRank = kindRank;
-      bestDistance = distance;
-      bestSize = sizeTieBreaker;
+  _pickRoots.length = 0;
+  for (const model of modelsById.values()) {
+    if (model.visible) _pickRoots.push(model);
+  }
+  for (const fill of solidFills.values()) {
+    if (fill.visible) _pickRoots.push(fill);
+  }
+  if (_pickRoots.length === 0) return null;
+  const hits = raycaster.intersectObjects(_pickRoots, true);
+  for (const hit of hits) {
+    let node = hit.object;
+    while (node) {
+      const pid = node.userData?.pickId;
+      if (pid != null && !effectivelyHidden(pid)) return pid;
+      node = node.parent;
     }
   }
-  return bestId;
+  return null;
 }
 
 renderer.domElement.addEventListener("pointermove", (ev) => {
@@ -2736,8 +2844,8 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
   const dt = performance.now() - _downT;
   if (Math.hypot(dx, dy) > CLICK_MAX_MOVE_PX || dt > CLICK_MAX_DURATION_MS) return;
 
-  // Reuse the hover picker — same kind-rank / inner-vs-outer rules apply
-  // so selecting matches whatever the hover tooltip is showing.
+  // Reuse the hover picker so selecting matches whatever the hover
+  // tooltip is showing.
   const rect = renderer.domElement.getBoundingClientRect();
   pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;

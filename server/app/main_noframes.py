@@ -5,7 +5,8 @@ wireframes in the viewer (kind="frame", same red as zones).
 
 Bbox validators are advisory in production (see divider / generation),
 so this entry only needs to short-circuit the frame mesh pass.
-Relationship validators still abort the run on cycles / unknown targets.
+The referenced_ids validator still aborts the run on cycles /
+unknown targets.
 
 Used by `scripts/run_noframes.py`.
 """

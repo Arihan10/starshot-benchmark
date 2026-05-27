@@ -152,23 +152,27 @@ def _promote_runs_dir(runs_dir: Path) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Boot the full-pipeline API server + viewer.")
     parser.add_argument(
-        "--runs-dir",
-        type=Path,
-        default=SERVER_DIR / "runs",
-        help="Directory the server writes per-slot run artifacts to. Created if missing.",
+        "--run",
+        dest="run",
+        default=None,
+        help="Subfolder name under <repo>/runs/ to write per-slot artifacts into. "
+             "Omit to use <repo>/runs/ directly.",
     )
     parser.add_argument(
         "--promote",
         action="store_true",
-        help="Promote bbox-only completed slots in --runs-dir to resumable so the "
+        help="Promote bbox-only completed slots in --run to resumable so the "
              "next server boot picks them up as paused. LLM decisions replay from "
              "the events.jsonl cache; mesh generation runs for real on resume. "
              "Exits after promotion — does NOT boot the server.",
     )
     args = parser.parse_args()
 
+    runs_root = REPO_ROOT / "runs"
+    runs_dir = (runs_root / args.run if args.run else runs_root).resolve()
+
     if args.promote:
-        return _promote_runs_dir(args.runs_dir.resolve())
+        return _promote_runs_dir(runs_dir)
 
     if not (CLIENT_DIR / "node_modules" / "three").exists():
         print(
@@ -177,7 +181,6 @@ def main() -> int:
         )
         return 1
 
-    runs_dir = args.runs_dir.resolve()
     runs_dir.mkdir(parents=True, exist_ok=True)
 
     server_port = _pick_free_port()

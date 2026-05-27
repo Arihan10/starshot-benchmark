@@ -1,99 +1,92 @@
-"""Graph utilities."""
+"""Graph utilities for the v2 prose-placement spec.
+
+The decomposition LLM emits `ChildNodeSpec`s (subzones) or `ObjectSpec`s
+(objects), each carrying an explicit `parent: str` (its structural
+anchor) and an optional `referenced_ids: list[Relationship]` listing
+secondary spatial relationships. We validate the well-formedness of
+the spec graph here. We do NOT check that the chosen parent is the
+"semantically right" one; the prompt is responsible for that.
+"""
 
 from __future__ import annotations
 
-from app.core.prompts import ChildNodeSpec, ObjectSpec
+from app.core.prompts import ChildNodeSpec
 
 
-def validate_sibling_relationships_acyclic(children: list[ChildNodeSpec]) -> None:
-    """Raise ValueError if any set of siblings forms a cyclic relationship.
-
-    The batch bbox resolver places every sibling in one shot, so ordering
-    doesn't matter — but a cyclic relationship graph (A ABOVE B, B ABOVE A)
-    is semantically contradictory and should be caught before the LLM is
-    asked to satisfy it. Relationships targeting the parent (or any
-    non-sibling id) don't contribute edges. Self-loops are ignored.
-    """
-    by_id = {c.id: c for c in children}
-    deps: dict[str, set[str]] = {c.id: set() for c in children}
-    for c in children:
-        for r in c.relationships:
-            if r.target in by_id and r.target != c.id:
-                deps[c.id].add(r.target)
-
-    color: dict[str, int] = {}  # 0=unseen, 1=on-stack, 2=done
-
-    def visit(node_id: str) -> None:
-        state = color.get(node_id, 0)
-        if state == 1:
-            raise ValueError(
-                f"cyclic sibling relationships through {node_id!r}"
-            )
-        if state == 2:
-            return
-        color[node_id] = 1
-        for dep in deps[node_id]:
-            visit(dep)
-        color[node_id] = 2
-
-    for c in children:
-        visit(c.id)
-
-
-def validate_object_relationships(
-    specs: list[ObjectSpec],
+def validate_referenced_ids(
+    specs: list[ChildNodeSpec],
     *,
-    zone_id: str,
+    parent_id: str,
     existing_ids: set[str],
+    depth_cap: int = 32,
 ) -> None:
-    """Raise ValueError if the object graph is malformed.
+    """Raise ValueError if the spec graph is malformed.
 
     Checks:
       1. ids unique within `specs` and disjoint from `existing_ids`.
-      2. `spec.parent` resolves to `zone_id`, another spec id, or a prior
-         existing id.
-      3. At least one relationship per spec targets `spec.parent`.
-      4. Every relationship target resolves to `zone_id`, a spec id, or a
-         prior existing id.
-      5. Object-to-object parent edges among `specs` form a DAG.
+      2. `spec.parent` resolves to `parent_id`, another spec in
+         `specs`, or an `existing_ids` entry. No dangling parents.
+      3. `spec.parent != self.id`. No self-parent.
+      4. Every `referenced_ids[i].target` resolves the same way.
+      5. Every `referenced_ids[i].target != self.id`. No self-loops.
+      6. Walking `spec.parent` as parent edges within `specs`, the
+         chain is acyclic and terminates at `parent_id` or any
+         `existing_ids` entry within `depth_cap` hops. We do not
+         chase chains through `existing_ids` — those nodes were
+         validated by their own decompose call.
     """
     spec_ids = [s.id for s in specs]
     if len(spec_ids) != len(set(spec_ids)):
-        raise ValueError(f"duplicate ids among object specs: {spec_ids}")
+        raise ValueError(f"duplicate ids among specs: {spec_ids}")
     collisions = set(spec_ids) & existing_ids
     if collisions:
-        raise ValueError(f"object ids collide with existing nodes: {sorted(collisions)}")
+        raise ValueError(
+            f"spec ids collide with existing nodes: {sorted(collisions)}"
+        )
 
-    known = {zone_id} | existing_ids | set(spec_ids)
+    known = {parent_id} | existing_ids | set(spec_ids)
+    by_id = {s.id: s for s in specs}
     for s in specs:
+        if s.parent == s.id:
+            raise ValueError(f"spec {s.id!r} lists itself as parent")
         if s.parent not in known:
-            raise ValueError(f"object {s.id!r} has unknown parent {s.parent!r}")
-        if not any(r.target == s.parent for r in s.relationships):
             raise ValueError(
-                f"object {s.id!r} has no relationship targeting its parent {s.parent!r}"
+                f"spec {s.id!r} has unknown parent {s.parent!r}"
             )
-        for r in s.relationships:
-            if r.target not in known:
+        for rel in s.referenced_ids:
+            if rel.target == s.id:
                 raise ValueError(
-                    f"object {s.id!r} has relationship with unknown target {r.target!r}"
+                    f"spec {s.id!r} has a relationship targeting itself"
+                )
+            if rel.target not in known:
+                raise ValueError(
+                    f"spec {s.id!r} has a relationship with unknown "
+                    f"target {rel.target!r}"
                 )
 
-    by_id = {s.id: s for s in specs}
-    color: dict[str, int] = {}  # 0=unseen, 1=on-stack, 2=done
-
-    def visit(node_id: str) -> None:
-        state = color.get(node_id, 0)
-        if state == 1:
-            raise ValueError(f"cyclic object-parent chain through {node_id!r}")
-        if state == 2:
-            return
-        color[node_id] = 1
-        parent = by_id[node_id].parent
-        if parent in by_id:
-            visit(parent)
-        color[node_id] = 2
-
+    # Walk parent edges within `specs`. Each chain must terminate at
+    # parent_id or an existing_ids node within depth_cap hops; cycles
+    # inside `specs` are rejected.
     for s in specs:
-        visit(s.id)
-
-    validate_sibling_relationships_acyclic(specs)
+        seen: set[str] = {s.id}
+        cur: str = s.parent
+        hops = 1
+        while cur in by_id:
+            if cur in seen:
+                raise ValueError(
+                    f"cyclic parent chain through {s.id!r}"
+                )
+            if hops > depth_cap:
+                raise ValueError(
+                    f"parent chain from {s.id!r} exceeds depth cap "
+                    f"of {depth_cap}"
+                )
+            seen.add(cur)
+            cur = by_id[cur].parent
+            hops += 1
+        # cur is now either parent_id or in existing_ids; both terminate.
+        if cur != parent_id and cur not in existing_ids:
+            raise ValueError(
+                f"parent chain from {s.id!r} terminates at unknown "
+                f"id {cur!r}"
+            )

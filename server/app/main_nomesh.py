@@ -7,8 +7,8 @@ never attempts a mesh fetch.
 
 Bbox validation runs in production but is advisory (see divider /
 generation), so this entry doesn't need to stub anything beyond the mesh
-pass. Relationship validators still abort the run on cycles / unknown
-targets, in this mode and every other.
+pass. The referenced_ids validator still aborts the run on cycles /
+unknown targets, in this mode and every other.
 
 Used by `scripts/run_bboxes_only.py`.
 """

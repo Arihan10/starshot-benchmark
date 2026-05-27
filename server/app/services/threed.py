@@ -79,6 +79,15 @@ RETRYABLE: tuple[type[BaseException], ...] = (
     TimeoutError,
 )
 
+
+class JobLostError(Exception):
+    """Modal's job registry returned 404 for our task_id. The job is
+    permanently gone — most often because the worker container that
+    held the in-memory job table restarted (auto-scale, deploy, OOM).
+    Polling the same id again is hopeless; the outer retry loop should
+    treat this as a resubmit signal: drop the dead task_id and call
+    `_post_generate` again on the next attempt."""
+
 # Cap the number of in-flight Trellis jobs at any moment. Set to match
 # Modal's actual GPU container count for our Trellis app — we own the
 # endpoint and are the only client, so submitting at exactly this many
@@ -223,13 +232,15 @@ async def _poll_status(server_job_id: str) -> dict[str, Any]:
 
 
 async def _poll_until_done(server_job_id: str, *, timeout: float) -> None:
-    """Block until status flips to `done`. Raises on `failed` or our
-    own poll-timeout budget.
+    """Block until status flips to `done`. Raises on `failed`, our own
+    poll-timeout budget, or `JobLostError` when Modal returns 404 for
+    the task_id.
 
     Transient errors on the status endpoint (429s, network blips) do
     NOT tear out of the poll — they log a `trellis.poll.retry` and
-    back off, then the loop checks status again. The Modal job is
-    still running; we just lost a probe."""
+    back off, then the loop checks status again. 404, on the other
+    hand, is terminal: the worker that held this job is gone and
+    polling the same id will never recover."""
     deadline = asyncio.get_running_loop().time() + timeout
     transient_count = 0
     while True:
@@ -240,6 +251,23 @@ async def _poll_until_done(server_job_id: str, *, timeout: float) -> None:
         await asyncio.sleep(POLL_INTERVAL_SECONDS)
         try:
             status = await _poll_status(server_job_id)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise JobLostError(
+                    f"trellis job {server_job_id} not found on server "
+                    "(Modal worker likely restarted; resubmitting)"
+                ) from e
+            delay = _retry_delay(transient_count, e)
+            logging.log(
+                "trellis.poll.retry",
+                task_id=server_job_id,
+                attempt=transient_count,
+                delay_s=delay,
+                reason=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+            transient_count += 1
+            await asyncio.sleep(delay)
+            continue
         except (httpx.HTTPError, ConnectionError, TimeoutError) as e:
             delay = _retry_delay(transient_count, e)
             logging.log(
@@ -275,6 +303,24 @@ async def _download_result(server_job_id: str) -> bytes:
             )
             resp.raise_for_status()
             return resp.content
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                raise JobLostError(
+                    f"trellis job {server_job_id} not found on server "
+                    "during result download (Modal worker likely restarted; "
+                    "resubmitting)"
+                ) from e
+            if attempt == DOWNLOAD_MAX_ATTEMPTS - 1:
+                raise
+            delay = _retry_delay(attempt, e)
+            logging.log(
+                "trellis.download.retry",
+                task_id=server_job_id,
+                attempt=attempt,
+                delay_s=delay,
+                reason=f"{type(e).__name__}: {str(e)[:200]}",
+            )
+            await asyncio.sleep(delay)
         except httpx.HTTPError as e:
             if attempt == DOWNLOAD_MAX_ATTEMPTS - 1:
                 raise
@@ -340,13 +386,13 @@ async def generate_mesh(
     _queue_set(slot_id, job_id, "waiting")
     try:
         async with _inflight_sem:
-            # Hold `server_job_id` across outer retries. Once we have one,
-            # we NEVER call `_post_generate` again in this lifecycle —
+            # By default we hold `server_job_id` across outer retries —
             # any retryable failure during poll or download re-enters the
             # same Modal job instead of orphaning it and burning a fresh
-            # generation. (The previous design re-submitted on poll/download
-            # errors, leaving the original job to finish on Modal with no
-            # client able to download it.)
+            # generation. The exception is JobLostError (404 from Modal):
+            # the worker that held the in-memory job table is gone, and
+            # polling the same id is pointless. On JobLost we clear
+            # `server_job_id` so the next attempt does a fresh submit.
             server_job_id: str | None = None
             for attempt in range(MAX_ATTEMPTS):
                 try:
@@ -372,10 +418,36 @@ async def generate_mesh(
                         saved=str(output_path),
                     )
                     return output_path
-                except RETRYABLE as e:
+                except JobLostError as e:
+                    logging.log(
+                        "trellis.job_lost",
+                        job_id=job_id,
+                        task_id=server_job_id,
+                        attempt=attempt,
+                        reason=str(e)[:200],
+                    )
+                    server_job_id = None
                     if attempt == MAX_ATTEMPTS - 1:
                         raise
                     delay = _retry_delay(attempt, e)
+                    await asyncio.sleep(delay)
+                except RETRYABLE as e:
+                    if attempt == MAX_ATTEMPTS - 1:
+                        raise
+                    # A 404 on POST /generate (server_job_id still None) is a
+                    # flapping-deployment signal, not load: Modal is between
+                    # versions, or the router cold-routed before the worker was
+                    # ready. The exponential schedule (4s → 8s → ... → 60s)
+                    # exists for rate limits and transient network errors; for
+                    # 404, just immediately resubmit with the same image bytes.
+                    # `server_job_id` is already None, so the next loop hits
+                    # the fresh POST path.
+                    is_fresh_post_404 = (
+                        server_job_id is None
+                        and isinstance(e, httpx.HTTPStatusError)
+                        and e.response.status_code == 404
+                    )
+                    delay = 0.0 if is_fresh_post_404 else _retry_delay(attempt, e)
                     logging.log(
                         "trellis.retry",
                         job_id=job_id,
@@ -384,7 +456,8 @@ async def generate_mesh(
                         delay_s=delay,
                         reason=f"{type(e).__name__}: {str(e)[:200]}",
                     )
-                    await asyncio.sleep(delay)
+                    if delay > 0:
+                        await asyncio.sleep(delay)
             raise AssertionError("unreachable")
     finally:
         # Whether we succeeded, errored, or were cancelled, the job is no

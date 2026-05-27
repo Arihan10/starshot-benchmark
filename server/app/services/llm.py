@@ -44,6 +44,8 @@ async def call_llm[T: BaseModel](
     system: str,
     user: str,
     output_schema: type[T],
+    node_id: str | None = None,
+    step: str | None = None,
 ) -> T:
     if _current_model is None:
         raise RuntimeError("llm.set_model() must be called before call_llm()")
@@ -99,9 +101,19 @@ async def call_llm[T: BaseModel](
             args = json.loads(content) if isinstance(content, str) else content
             validated = output_schema.model_validate(args)
             reasoning = getattr(message, "reasoning", None) or ""
+            # cache.llm carries everything needed for both the LLM-call cache
+            # (key + output) and the observability view (node + step + model
+            # + system + user + reasoning). Older log lines that lacked the
+            # new fields still replay correctly — the client treats them as
+            # unattributed.
             logging.log(
                 "cache.llm",
                 key=key,
+                node=node_id,
+                step=step,
+                model=_current_model,
+                system=system,
+                user=user,
                 output=validated.model_dump(mode="json"),
                 reasoning=reasoning,
             )

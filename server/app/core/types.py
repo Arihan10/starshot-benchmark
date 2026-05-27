@@ -3,8 +3,9 @@ Domain types for the pipeline.
 
 Coordinates: Y-up, right-handed, meters.
 Canonical front view: +X = right, +Y = up, +Z = toward the viewer.
-All bounding boxes, corners, and relationships are expressed under this
-convention.
+All bounding boxes are expressed under this convention. Spatial
+relationships between nodes are carried as prose `placement`
+descriptions on each Node (resolved by the bbox-resolution LLM step).
 """
 
 from __future__ import annotations
@@ -32,19 +33,6 @@ Orientation = Annotated[
 ]
 
 Vec3Cm = tuple[float, float, float]
-
-
-class Corner(StrEnum):
-    """One of the 8 corners of an AABB under the canonical front view."""
-
-    TOP_LEFT_FRONT = "TOP_LEFT_FRONT"
-    TOP_LEFT_BACK = "TOP_LEFT_BACK"
-    TOP_RIGHT_FRONT = "TOP_RIGHT_FRONT"
-    TOP_RIGHT_BACK = "TOP_RIGHT_BACK"
-    BOTTOM_LEFT_FRONT = "BOTTOM_LEFT_FRONT"
-    BOTTOM_LEFT_BACK = "BOTTOM_LEFT_BACK"
-    BOTTOM_RIGHT_FRONT = "BOTTOM_RIGHT_FRONT"
-    BOTTOM_RIGHT_BACK = "BOTTOM_RIGHT_BACK"
 
 
 class BoundingBox(BaseModel):
@@ -98,21 +86,6 @@ class BoundingBox(BaseModel):
     def max_dimension(self) -> float:
         return max(self.size)
 
-    def corner_point(self, corner: Corner) -> Vec3Tuple:
-        lo, hi = self.min_corner, self.max_corner
-        x = hi[0] if "_RIGHT_" in corner.value else lo[0]
-        y = hi[1] if corner.value.startswith("TOP") else lo[1]
-        z = hi[2] if corner.value.endswith("FRONT") else lo[2]
-        return (x, y, z)
-
-
-class RelationshipKind(StrEnum):
-    ON = "ON"
-    BESIDE = "BESIDE"
-    BELOW = "BELOW"
-    ABOVE = "ABOVE"
-    ATTACHED = "ATTACHED"
-
 
 class ProxyShape(StrEnum):
     """Optional collision-proxy primitive describing the mesh's silhouette
@@ -125,14 +98,58 @@ class ProxyShape(StrEnum):
     HEMISPHERE = "HEMISPHERE"
 
 
+class RelationshipKind(StrEnum):
+    """Abstract category of a spatial relationship between two nodes.
+    The category is structural — precise positioning is carried in the
+    node's `placement` prose. Used to compose multi-target constraints
+    without needing per-corner anchor points."""
+
+    ON = "ON"          # child rests on / against target's outward surface
+    BESIDE = "BESIDE"  # child adjacent to target (X or Z axis), non-stacked
+    ABOVE = "ABOVE"    # child higher in Y than target, no contact required
+    BELOW = "BELOW"    # child lower in Y than target, no contact required
+    ATTACHED = "ATTACHED"  # child flush against target (any face)
+    IN = "IN"          # child contained inside target's volume / footprint
+
+
+class ParentRelationshipKind(StrEnum):
+    """Subset of `RelationshipKind` that's valid as a parent-child anchor.
+
+    A parent edge encodes structural support / containment, so only
+    contact-bearing kinds make sense:
+      * ON      — child rests on the parent's outward (top) surface.
+      * ATTACHED — child is flush against any of the parent's faces
+                   (wall mounts, ceiling fixtures, magnets, sconces).
+      * IN      — child is contained inside the parent's volume or
+                  footprint (subzone inside a zone, fish inside a tank,
+                  floating drone inside an enclosing dome, particles
+                  inside a fog volume).
+
+    `BESIDE` / `ABOVE` / `BELOW` describe peer/sibling arrangements
+    without contact, so they're not load-bearing and would not give a
+    layout solver a real anchor; they remain in `RelationshipKind` and
+    can still appear in `referenced_ids` for secondary peer hints.
+    """
+
+    ON = "ON"
+    ATTACHED = "ATTACHED"
+    IN = "IN"
+
+
 class Relationship(BaseModel):
-    """Anchors a node's bbox to a target corner of another node's bbox."""
+    """One secondary structural relationship between a node and a peer.
+
+    The `target` is another node's id; `kind` is the abstract category
+    of the relationship. There is NO `reference_point` — precise
+    positioning lives in the placement prose. Use `Relationship` for
+    secondary anchors only; a node's primary structural parent lives in
+    `Node.parent_id` (and is authored as `ChildNodeSpec.parent`).
+    """
 
     model_config = ConfigDict(frozen=True)
 
     target: str
     kind: RelationshipKind
-    reference_point: Corner
 
 
 class Node(BaseModel):
@@ -151,6 +168,19 @@ class Node(BaseModel):
     image-generation boundary. Keeping them separate prevents the wrapper
     boilerplate from leaking into LLM context lookups like "objects placed
     so far" / "prior subject phrases in this scene".
+
+    `placement` is the prose description of where this node sits in the
+    scene, authored at the decomposition step and resolved by the
+    bbox-resolution step. `parent_id` is the structural anchor (the
+    load-bearing supporter or the containing zone), and `parent_kind`
+    classifies that anchor as `ON` (rests on parent's surface), `ATTACHED`
+    (flush against any of the parent's faces), or `IN` (contained inside
+    the parent's volume / footprint). `referenced_ids` is an optional
+    list of *secondary* relationships — each carrying a target id and a
+    `RelationshipKind` — used when the node's placement text references
+    more than one peer. The parent is NOT repeated in `referenced_ids`;
+    that's what `parent_id`+`parent_kind` are for. `placement`, `parent_id`,
+    and `parent_kind` are None only for the root.
     """
 
     id: str
@@ -158,8 +188,13 @@ class Node(BaseModel):
     bbox: BoundingBox
     proxy_shape: ProxyShape | None = None
     orientation: Orientation = 0
-    relationships: list[Relationship] = Field(default_factory=list)
+    placement: str | None = None
+    referenced_ids: list[Relationship] = Field(default_factory=list)
     mesh_url: str | None = None
     image_prompt: str | None = None
     parent_id: str | None = None
+    # How this node anchors to its parent: ON (rest), ATTACHED (flush
+    # mount), or IN (containment). None only for the root, which has no
+    # parent.
+    parent_kind: ParentRelationshipKind | None = None
     plan: str | None = None
