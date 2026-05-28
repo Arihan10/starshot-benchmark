@@ -805,7 +805,7 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are enumerating the physical shell of a zone — the walls, ceiling, floor, ground mesh, or other geometry that physically bounds it before anything else populates the interior. Every structural element named in the zone's plan must either be (a) emitted as a new shell element in `objects`, or (b) bound to an existing peer that already satisfies it via a `bound_existing` entry.
+You are defining a list of objects that represent the perimeter of the given region, ONLY if needed.
 </role>
 
 <input>
@@ -1027,7 +1027,15 @@ def render_encapsulating_decomp(
     scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
-    return f"""Generate a list of shell, floor, and boundary geometry elements that physically bound the zone described below, based on the attached context and the plan for the zone.
+    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a physical perimeter for the following region.
+
+{_render_zone_plan_block(zone_plan)}
+
+The list of objects should work together to form a cohesive perimeter or partial perimeter of any arbitrary shape. The purpose of this list of objects is to form a sense of boundary for the given region in every dimension that makes sense based on its plan - perimeter does not necessarily mean in the horizontal axis but in all possible directions, but also vertical direction. 
+
+Object should be individualistic - composite objects should be broken down into individual or partial objects (abstract fragments that are meant to combine into a more complex object) and placed accordingly, allowing for more granular control of the region's boundary. Objects and partial objects can be stacked, strung, pieced to form larger, cohesive sections for the perimeter.
+
+When generating the list of objects, keep in mind traversal between various regions both horizontally and vertically that mighrequire more complex boundary objects made up of partial objects, keep in mind the semantic meaning of objects that allow passage.
 
 <scene_context>
 {_SCENE_CONTEXT_INTRO}
@@ -1040,20 +1048,6 @@ Zone bbox: {zone_bbox.model_dump_json()}
 
 {_render_scene_lines(scene)}
 </scene_context>
-
-Each shell element in your resultant list has an id, prompt, parent (the zone id — shells are structurally anchored to the zone itself), parent_kind (use `ATTACHED` for all shell elements: walls/floor/ceiling/roof are flush against the zone's faces by definition; only use `IN` for free-floating enclosure pieces that have no contact face, and `ON` is rare for shells — BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for any secondary relationships; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN, e.g. a roof slab supported by walls below it would reference each wall with kind=ON). Shell elements MUST lie fully inside the zone bbox — they are the zone's physical boundary, and protruding outside it would create an inside-out shell. (Non-shell objects emitted in later passes are allowed to overhang the zone; shells are not.)
-
-The purpose of these shell elements is to physically bound the zone before its interior is populated, so every later object inside this zone has a coherent surface to rest on, lean against, or be enclosed by.
-
-It is imperative that every structural element named in this zone's plan (walls, partitions, floor, ceiling, roof, columns, shells, enclosing geometry of any kind) MUST be bound to a real node id by the end of this call. For each one, you have exactly two options, and your output has a SEPARATE LIST for each:
-  (a) Emit a new shell element for it — add an entry to the `objects` list (id, prompt, parent, parent_kind, placement, referenced_ids, proxy_shape, orientation). Use this when no existing peer satisfies the role.
-  (b) Point to an existing peer that already satisfies it — add an entry to the `bound_existing` list with `plan_element` (the plan's noun phrase verbatim, e.g. "rear partition wall") and `peer_id` (the id of a node already present in <OBJECTS> with a concrete bbox that physically covers that role). DO NOT also add an `objects` entry for the same element — option (b) is the entire response for that structural element.
-
-The `bound_existing` list is an audit trail: it proves you consciously bound each plan-named element, and it is dropped before any downstream pipeline step. Only entries in `objects` become new nodes.
-
-Frames that follow a specific complex shape should be separated into parametric, individual objects. You should own the placement of these frames from end-to-end as much as possible instead of relying on downstream 3D model generation steps to follow your provided seed prompt for each object.
-
-Silently omitting a plan-named structural element from BOTH lists is NOT allowed. Do NOT assume a future sibling, cousin, or descendant zone will emit it later: encapsulation runs independently per zone, and downstream anchor-object generation will reference these structures by id — if the node doesn't exist now, the anchor step will hallucinate around a non-existent reference. Duplicate-avoidance is satisfied by option (b), not by silently skipping.
 
 {_render_retry_block(prior_attempts)}"""
 
