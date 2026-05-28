@@ -49,9 +49,9 @@ from app.pipeline import divider  # noqa: E402
 from app.utils.logging import SlotLog  # noqa: E402
 
 PROMPTS = [
-    "A modern hotel room",
-    "A modern house",
-    "A super mario bros type platformer level",
+    "A campsite in the middle of a forest",
+    "A swamp with islands, designed as a top-down arcade level where a frog can jump from island to island"
+    
 ]
 RUNS_PER_PROMPT = 5
 MODEL = "google/gemini-3.5-flash"
