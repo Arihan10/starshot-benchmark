@@ -23,11 +23,23 @@
             #canvas-host canvas {
                 display: block;
             }
-            #slots {
+            #topbar {
                 position: fixed;
                 top: 12px;
                 left: 12px;
                 right: 12px;
+                display: flex;
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 8px;
+                pointer-events: none;
+                z-index: 10;
+            }
+            #topbar > * {
+                pointer-events: auto;
+            }
+            #slots {
+                width: 100%;
                 max-width: 900px;
                 display: flex;
                 flex-wrap: wrap;
@@ -37,6 +49,7 @@
                 border-radius: 6px;
                 background: rgba(22, 24, 29, 0.82);
                 backdrop-filter: blur(6px);
+                box-sizing: border-box;
             }
             .slot-tab {
                 display: flex;
@@ -168,6 +181,8 @@
             }
             #bbox-toggle,
             #frames-toggle,
+            #meshes-toggle,
+            #select-mode-toggle,
             #solid-fill-toggle,
             #export-glb,
             #replay-gif {
@@ -186,6 +201,8 @@
             }
             #bbox-toggle:hover,
             #frames-toggle:hover,
+            #meshes-toggle:hover,
+            #select-mode-toggle:hover,
             #solid-fill-toggle:hover,
             #export-glb:hover,
             #replay-gif:hover {
@@ -374,15 +391,14 @@
             }
             #bbox-toggle.off,
             #frames-toggle.off,
+            #meshes-toggle.off,
+            #select-mode-toggle.zones,
             #solid-fill-toggle.off {
                 background: #2a2d35;
                 color: #5a5e68;
             }
             #status {
-                position: fixed;
-                top: 64px;
-                left: 12px;
-                right: 12px;
+                width: 100%;
                 max-width: 560px;
                 padding: 10px 12px;
                 border-radius: 6px;
@@ -391,6 +407,7 @@
                 font-size: 12px;
                 line-height: 1.4;
                 pointer-events: none;
+                box-sizing: border-box;
             }
             #status .line {
                 margin: 0;
@@ -1798,9 +1815,12 @@
     </head>
     <body>
         <div id="canvas-host"></div>
+        <div id="topbar">
         <div id="slots">
             <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
             <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
+            <button id="meshes-toggle" type="button" title="Show or hide all generated meshes (bboxes-only view)">meshes: on</button>
+            <button id="select-mode-toggle" type="button" title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it">select: all</button>
             <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
             <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
             <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>
@@ -1810,6 +1830,7 @@
             <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
         </div>
         <div id="status"><p class="line hdr">ready</p></div>
+        </div>
         <div id="tree">
             <div id="tree-header">
                 <span>tree</span>

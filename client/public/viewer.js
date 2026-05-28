@@ -11,6 +11,8 @@ const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const MODEL_STORAGE_KEY = "starshot.selectedModel";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
+const MESHES_VISIBLE_STORAGE_KEY = "starshot.meshesVisible";
+const SELECT_MODE_STORAGE_KEY = "starshot.selectMode";
 const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 
 const statusEl = document.getElementById("status");
@@ -22,6 +24,8 @@ const modelPickerEl = document.getElementById("model-picker");
 const resumeAllEl = document.getElementById("resume-all");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
+const meshesToggleEl = document.getElementById("meshes-toggle");
+const selectModeToggleEl = document.getElementById("select-mode-toggle");
 const solidFillToggleEl = document.getElementById("solid-fill-toggle");
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
@@ -606,8 +610,10 @@ let treeOrderCounter = 0;
 // this state: the tree's per-row visibility button and right-clicking a
 // mesh on the canvas. Hides the mesh + solid fill but LEAVES the bbox
 // wireframe visible — useful for peeking through an outer object without
-// losing the volumetric reference. Hiding a parent transitively hides
-// every descendant (ancestor walk in `effectivelyHidden`). State is
+// losing the volumetric reference. Hiding a zone transitively hides every
+// descendant (ancestor walk in `effectivelyHidden`); hiding a frame or
+// object only hides that node itself, since you usually want to peek
+// past a single piece of geometry without losing its contents. State is
 // per-run — cleared on slot switch / rewind / reset, not persisted.
 const hiddenIds = new Set();
 
@@ -739,14 +745,18 @@ function treeClear() {
   treeEl.classList.remove("detail-open");
 }
 
-// True if `id` itself or any ancestor is in `hiddenIds`. The descendant
-// case is what makes hiding a zone hide everything underneath it without
-// having to mark each child individually.
+// True if `id` itself is hidden, or any ZONE ancestor is hidden. The
+// zone-only ancestor rule is what makes hiding a zone hide everything
+// underneath it without having to mark each child individually, while
+// still letting the user hide a single frame/object to peek inside it
+// without taking its children offscreen too.
 function effectivelyHidden(id) {
   let cur = treeNodes.get(id);
+  let isSelf = true;
   while (cur) {
-    if (hiddenIds.has(cur.id)) return true;
+    if (hiddenIds.has(cur.id) && (isSelf || cur.kind === "zone")) return true;
     cur = cur.parentId ? treeNodes.get(cur.parentId) : null;
+    isSelf = false;
   }
   return false;
 }
@@ -1013,6 +1023,44 @@ framesToggleEl.addEventListener("click", () => {
   applyFramesToggleLabel();
   refreshAllFrameModelVisibility();
   refreshAllSolidFillVisibility();
+});
+
+// Master switch for all generated GLB meshes (objects + frames). Off = pure
+// bbox view. Independent of the frames toggle, which scopes only to frame
+// meshes; meshes:off wins over frames:on.
+let meshesShown = localStorage.getItem(MESHES_VISIBLE_STORAGE_KEY) !== "0";
+function applyMeshesToggleLabel() {
+  meshesToggleEl.textContent = `meshes: ${meshesShown ? "on" : "off"}`;
+  meshesToggleEl.classList.toggle("off", !meshesShown);
+}
+applyMeshesToggleLabel();
+meshesToggleEl.addEventListener("click", () => {
+  meshesShown = !meshesShown;
+  localStorage.setItem(MESHES_VISIBLE_STORAGE_KEY, meshesShown ? "1" : "0");
+  applyMeshesToggleLabel();
+  refreshAllFrameModelVisibility();
+  // Picking falls back to solid fills / bboxes when meshes are hidden — kick
+  // the hover so it re-evaluates without waiting for the next mouse move.
+  pointerDirty = true;
+});
+
+// Selection-mode switch: "all" (default — mesh/fill picking, every kind is
+// selectable) vs. "zones" (only zone bboxes are pickable, so the user can
+// click a containing zone to see how frames/objects sit inside it via the
+// dim-on-select highlight).
+let selectMode = localStorage.getItem(SELECT_MODE_STORAGE_KEY) === "zones" ? "zones" : "all";
+function applySelectModeToggleLabel() {
+  selectModeToggleEl.textContent = `select: ${selectMode}`;
+  selectModeToggleEl.classList.toggle("zones", selectMode === "zones");
+}
+applySelectModeToggleLabel();
+selectModeToggleEl.addEventListener("click", () => {
+  selectMode = selectMode === "zones" ? "all" : "zones";
+  localStorage.setItem(SELECT_MODE_STORAGE_KEY, selectMode);
+  applySelectModeToggleLabel();
+  // Hover under the cursor is now stale — different pick set — so re-evaluate
+  // immediately instead of waiting for the next mouse move.
+  pointerDirty = true;
 });
 
 // Solid-fill mode — drops a solid mesh into every object/frame bbox using its
@@ -1673,7 +1721,7 @@ function applyModelVisibility(id) {
   if (!model) return;
   const isFrame = treeNodes.get(id)?.kind === "frame";
   const frameOk = isFrame ? framesShown : true;
-  model.visible = frameOk && !effectivelyHidden(id);
+  model.visible = meshesShown && frameOk && !effectivelyHidden(id);
 }
 
 function refreshAllFrameModelVisibility() {
@@ -2801,9 +2849,10 @@ function positionTooltip(clientX, clientY, id) {
 // Mesh-based picking: raycast against actual geometry the user sees —
 // loaded GLB meshes first, then solid-fill proxies when the model hasn't
 // arrived. Zones never have meshes, so they're unreachable here and must
-// be selected from the tree.
+// be selected from the tree (or via zone-mode picking, below).
 const _pickRoots = [];
 function pickHoveredBboxId() {
+  if (selectMode === "zones") return pickHoveredZoneBboxId();
   _pickRoots.length = 0;
   for (const model of modelsById.values()) {
     if (model.visible) _pickRoots.push(model);
@@ -2824,6 +2873,29 @@ function pickHoveredBboxId() {
   return null;
 }
 
+// Zone-only picker. Zones nest (children fit inside their parent and
+// siblings don't overlap), so the smallest-volume zone whose AABB the ray
+// crosses is the deepest one containing the click — which is what the user
+// wants when they say "select this zone." Hidden zones are skipped.
+const _zoneHit = new THREE.Vector3();
+const _zoneSize = new THREE.Vector3();
+function pickHoveredZoneBboxId() {
+  let bestId = null;
+  let bestVol = Infinity;
+  for (const [id, helper] of bboxes) {
+    if (helper.userData.nodeKind !== "zone") continue;
+    if (effectivelyHidden(id)) continue;
+    if (!raycaster.ray.intersectBox(helper.box, _zoneHit)) continue;
+    helper.box.getSize(_zoneSize);
+    const vol = _zoneSize.x * _zoneSize.y * _zoneSize.z;
+    if (vol < bestVol) {
+      bestVol = vol;
+      bestId = id;
+    }
+  }
+  return bestId;
+}
+
 // Right-click picker. Tries the mesh picker first, then falls back to a
 // bbox raycast so a hidden object (whose bbox is still visible) can be
 // re-clicked to bring its mesh back. The fallback intentionally does NOT
@@ -2837,6 +2909,10 @@ function pickRightClickId() {
   let bestDist = Infinity;
   for (const [id, helper] of bboxes) {
     if (!helper.visible) continue;
+    // In zone-only mode the bbox fallback must also stay zone-restricted —
+    // otherwise right-clicking past a zone hit would hide a non-zone the
+    // user can't even select via left-click.
+    if (selectMode === "zones" && helper.userData.nodeKind !== "zone") continue;
     if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit)) continue;
     const dist = _rightClickBoxHit.distanceToSquared(camera.position);
     if (dist < bestDist) {
