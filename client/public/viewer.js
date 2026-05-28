@@ -1406,12 +1406,61 @@ const loader = new GLTFLoader();
 // (rewind / fresh snapshot on reconnect).
 let sceneGen = 0;
 
+// When the gif replay is running, every GLB has been preloaded up front (see
+// preloadReplayGlbs) and stashed here keyed by node id. `loadModel` checks
+// this first so `model` events attach the cached scene synchronously and the
+// gif frame containing the event also contains the mesh — instead of the
+// mesh popping in several frames later when the async fetch finally lands.
+let replayPreloadCache = null;
+
 function resetModelQueue() {
   sceneGen += 1;
 }
 
 function loadModel(event) {
+  if (replayPreloadCache) {
+    const cached = replayPreloadCache.get(event.id);
+    if (cached) {
+      if (cached.gltf) {
+        attachPreloadedGlb(event, cached.gltf);
+      } else if (cached.error) {
+        appendEvent({ kind: "model.error", id: event.id, message: cached.error.message });
+        upsertAsset(event.id, { status: "error", errorMessage: cached.error.message });
+      }
+      return;
+    }
+  }
   _loadModelNow(event, sceneGen);
+}
+
+// Attach a pre-fetched GLB scene to the live tree. Mirrors the second half
+// of _loadModelNow (after the await) so the live and replay paths agree on
+// material side-fixing, prev-model disposal, and asset bookkeeping.
+function attachPreloadedGlb(event, gltf) {
+  gltf.scene.traverse((child) => {
+    if (child.isMesh && child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const m of mats) m.side = THREE.DoubleSide;
+    }
+  });
+  gltf.scene.name = `${event.artifact_kind}:${event.id}`;
+  gltf.scene.userData.pickId = event.id;
+  const prevModel = modelsById.get(event.id);
+  if (prevModel) {
+    sceneRoot.remove(prevModel);
+    prevModel.traverse?.((n) => {
+      if (n.isMesh) {
+        n.geometry?.dispose?.();
+        const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
+        for (const m of mats) m.dispose?.();
+      }
+    });
+  }
+  sceneRoot.add(gltf.scene);
+  modelsById.set(event.id, gltf.scene);
+  applyModelVisibility(event.id);
+  fitToScene();
+  upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
 }
 
 async function _loadModelNow(event, gen) {
@@ -1752,49 +1801,6 @@ function frameBbox(box) {
   camera.far = Math.max(100, radius * 100);
   camera.updateProjectionMatrix();
   controls.update();
-}
-
-// Frame `box` so that *every* corner is guaranteed inside the frustum, with
-// a small padding margin. Differs from frameBbox in two ways:
-//   1) uses the bounding-sphere radius (box diagonal) so any viewing angle
-//      that doesn't align with a face still fits;
-//   2) picks the limiting FOV between vertical and horizontal (aspect-aware)
-//      so portrait windows still capture the whole box.
-// Used by the gif replay to lock the camera at a framing that captures the
-// entire scene volume for the duration of the export.
-function frameBoxFully(box, { padding = 1.1, dirVec = null } = {}) {
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  const radius = Math.max(0.5 * size.length(), 0.5);
-  controls.target.copy(center);
-  const fovV = (camera.fov * Math.PI) / 180;
-  const fovH = 2 * Math.atan(Math.tan(fovV / 2) * camera.aspect);
-  const limitingHalfFov = Math.min(fovV, fovH) / 2;
-  const dist = (radius * padding) / Math.sin(limitingHalfFov);
-  const dv = dirVec ?? new THREE.Vector3(1, 0.7, 1).normalize();
-  camera.position.copy(center).addScaledVector(dv, dist);
-  camera.near = Math.max(0.01, dist / 1000);
-  camera.far = Math.max(100, dist * 10);
-  camera.updateProjectionMatrix();
-  controls.update();
-}
-
-// Find the root zone's bbox in a snapshot of recorded events. Returns a
-// THREE.Box3 if found, or null. The root is identified by parent_id === null
-// (which is how the server emits it) so we don't have to hard-code the id.
-function findRootBboxFromEvents(events) {
-  for (const ev of events) {
-    if (ev.kind !== "bbox") continue;
-    if (ev.parent_id != null) continue;
-    if (!Array.isArray(ev.origin) || !Array.isArray(ev.dimensions)) continue;
-    const ox = ev.origin[0], oy = ev.origin[1], oz = ev.origin[2];
-    const fx = ox + ev.dimensions[0], fy = oy + ev.dimensions[1], fz = oz + ev.dimensions[2];
-    return new THREE.Box3(
-      new THREE.Vector3(Math.min(ox, fx), Math.min(oy, fy), Math.min(oz, fz)),
-      new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
-    );
-  }
-  return null;
 }
 
 function selectTreeNode(id) {
@@ -3626,6 +3632,11 @@ let replayActive = false;       // true while preview or record is running
 let replayCancelRequested = false;
 let replayInProgress = false;   // gates concurrent invocations of run()
 
+// Max output width for the encoded gif. The renderer's backing buffer can be
+// 2-3× the CSS size on retina, which makes gifs enormous; we downscale every
+// captured frame through an offscreen canvas to this cap before encoding.
+const GIF_MAX_WIDTH = 540;
+
 function setReplayStatus(text, cls = "") {
   replayStatusEl.textContent = text;
   replayStatusEl.className = cls;
@@ -3720,6 +3731,44 @@ replayModalEl.addEventListener("click", (ev) => {
   if (ev.target === replayModalEl) closeReplayModal();
 });
 
+// Walk the events for every `model` emission and fetch + parse each GLB in
+// parallel before dispatch starts. The returned Map<id, { gltf } | { error }>
+// is consumed by loadModel during dispatch so meshes attach synchronously
+// and land in the same gif frame as their emitting event. Re-emissions of
+// the same id collapse to the latest url (mirrors the live last-write-wins
+// behavior).
+async function preloadReplayGlbs(events) {
+  const byId = new Map();
+  for (const e of events) {
+    if (e.kind === "model" && e.url) byId.set(e.id, e);
+  }
+  const total = byId.size;
+  const cache = new Map();
+  setReplayProgress(0);
+  if (total === 0) {
+    setReplayStatus("no meshes to preload");
+    return cache;
+  }
+  setReplayStatus(`preloading meshes… 0/${total}`, "recording");
+  let done = 0;
+  await Promise.all(
+    Array.from(byId.values()).map(async (e) => {
+      const absUrl = new URL(e.url, SERVER_URL).toString();
+      try {
+        const gltf = await loader.loadAsync(absUrl);
+        cache.set(e.id, { gltf });
+      } catch (err) {
+        cache.set(e.id, { error: err });
+      } finally {
+        done += 1;
+        setReplayStatus(`preloading meshes… ${done}/${total}`, "recording");
+        setReplayProgress(done / total);
+      }
+    }),
+  );
+  return cache;
+}
+
 // Snapshot the live scene + ephemeral UI state, wipe everything, replay the
 // recorded log, optionally encode frames into a gif, then leave the scene
 // holding the final-state of the replay (which matches the live state).
@@ -3769,6 +3818,8 @@ async function runReplay({ record }) {
   const frameIntervalMs = 1000 / fps;
 
   let gif = null;
+  let gifScaler = null;
+  let gifScalerCtx = null;
   if (record) {
     if (typeof window.GIF === "undefined") {
       setReplayStatus("gif.js library failed to load", "err");
@@ -3776,36 +3827,57 @@ async function runReplay({ record }) {
       replayInProgress = false;
       return null;
     }
+    // The renderer's backing buffer is `cssSize * devicePixelRatio`, so on
+    // a retina display this is 2-3× the visible canvas. Feeding that
+    // straight into gif.js produces enormous (10-100MB) gifs. Downscale
+    // every frame through an offscreen canvas to a sane max width before
+    // adding it. 720px is a good balance of legibility and file size.
+    const srcW = renderer.domElement.width;
+    const srcH = renderer.domElement.height;
+    const scale = Math.min(1, GIF_MAX_WIDTH / srcW);
+    const gifW = Math.max(2, Math.round(srcW * scale));
+    const gifH = Math.max(2, Math.round(srcH * scale));
+    gifScaler = document.createElement("canvas");
+    gifScaler.width = gifW;
+    gifScaler.height = gifH;
+    gifScalerCtx = gifScaler.getContext("2d");
     gif = new window.GIF({
       workers: 2,
-      quality: 10,
+      // gif.js's `quality` is inverted: HIGHER = coarser palette quantization
+      // = smaller files. 10 is the default; 30 trims size further with mild
+      // banding in mesh gradients (fine for benchmark gifs of mostly flat
+      // wireframes + a dark background).
+      quality: 30,
       workerScript: "/vendor/gifjs/gif.worker.js",
-      width: renderer.domElement.width,
-      height: renderer.domElement.height,
+      width: gifW,
+      height: gifH,
       background: "#101114",
     });
-    setReplayStatus("recording…", "recording");
-  } else {
-    setReplayStatus("previewing…");
   }
 
   // Lock the camera for the duration of the replay — otherwise fitToScene
   // would refit on every mesh load and the gif would jitter. The user's
-  // original camera framing is restored from camSnapshot at the end.
+  // current view persists through clearScene() (camera is in its own scene
+  // graph), so the gif captures whatever angle they're looking at right now;
+  // camSnapshot still restores the same view afterwards.
   cameraUserMoved = true;
-
-  // Frame the camera on the root zone bbox so the entire scene volume sits
-  // inside the gif frustum. We look it up in the event snapshot rather than
-  // the live scene because clearScene() just dropped every bbox helper.
-  const rootBox = findRootBboxFromEvents(events);
-  if (rootBox && !rootBox.isEmpty()) {
-    frameBoxFully(rootBox, { padding: 1.12 });
-  }
 
   // Start the preview stage with a blank frame so the user sees the modal
   // switch out of the placeholder state immediately.
   replayStageEl.classList.remove("show-result");
   replayStageEl.classList.remove("empty");
+
+  // Preload every GLB referenced by the recorded events so the dispatch
+  // loop can attach meshes synchronously — otherwise mesh fetches lag the
+  // events that triggered them and the gif cuts off mid-load. If the user
+  // cancels during preload, fall through: the dispatch loop will see the
+  // cancel flag, skip itself, and let the normal cleanup tail run (which
+  // restores the camera + reconnects the SSE stream).
+  replayPreloadCache = await preloadReplayGlbs(events);
+  setReplayProgress(0);
+  if (!replayCancelRequested) {
+    setReplayStatus(record ? "recording…" : "previewing…", record ? "recording" : "");
+  }
 
   for (let i = 0; i < batches.length; i++) {
     if (replayCancelRequested) break;
@@ -3817,7 +3889,10 @@ async function runReplay({ record }) {
     controls.update();
     renderer.render(scene, camera);
     if (gif) {
-      gif.addFrame(renderer.domElement, { copy: true, delay: frameIntervalMs });
+      gifScalerCtx.drawImage(
+        renderer.domElement, 0, 0, gifScaler.width, gifScaler.height,
+      );
+      gif.addFrame(gifScaler, { copy: true, delay: frameIntervalMs });
     }
     // Mirror the freshly-rendered frame into the in-modal preview canvas
     // so the user can watch the build play out without needing to look
@@ -3827,6 +3902,19 @@ async function runReplay({ record }) {
     // Yield to the browser so it can paint the preview frame and the user
     // can see progress in real time.
     await sleep(frameIntervalMs);
+  }
+
+  // Final hold frame so viewers see the completed scene linger for a beat
+  // before the gif loops. 1500ms is long enough to register without making
+  // the loop feel stuck.
+  if (gif && !replayCancelRequested) {
+    controls.update();
+    renderer.render(scene, camera);
+    gifScalerCtx.drawImage(
+      renderer.domElement, 0, 0, gifScaler.width, gifScaler.height,
+    );
+    gif.addFrame(gifScaler, { copy: true, delay: 1500 });
+    drawReplayFrame(renderer.domElement);
   }
   setReplayProgress(1);
 
@@ -3855,6 +3943,7 @@ async function runReplay({ record }) {
 
   replayActive = false;
   replayInProgress = false;
+  replayPreloadCache = null;
   // recordedEvents has been refilled by dispatchForReplay during the loop;
   // re-enable the button to reflect that.
   updateReplayButton();

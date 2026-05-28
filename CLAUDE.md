@@ -78,7 +78,7 @@ Entry: `(prompt, model, run_id, runs_dir)`. Exit: a root `Node` with the full su
       Each realized frame becomes a concrete child `Node` of the placed child, with `mesh_url` pointing at its `.glb`.
 7. **Recurse** into each placed child and go back to step 3. Each child arrives with its `plan` pre-seeded from the parent's planning step. Atomic leaves stop recursing and (eventually) flow into phase 2.
 
-The root is never fed through the frame decider — frames belong to decomposed zones, not to the world-scale canvas.
+The root also gets a frame pass — its world-scale boundary — running immediately after root's children are placed and before their per-child frame passes, so the world boundary is in scene context when each child frame is decided.
 
 ### Phase 2 — Generation (stub)
 
