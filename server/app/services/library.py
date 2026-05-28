@@ -24,6 +24,7 @@ ASSETS_DIR = _LIBRARY_DIR / "assets"
 class LibraryItem(BaseModel):
     id: str
     description: str
+    category: str = ""
 
 
 class LibraryMatchOutput(BaseModel):
@@ -62,13 +63,17 @@ best-matching library asset. No prose, no markdown, no code fences.\
 
 async def match(prompt: str) -> LibraryMatchOutput:
     catalog = _load_catalog()
-    items = "\n".join(
-        f"  - id={item.id!r}: {item.description}"
-        for item in catalog
-    )
+    by_cat: dict[str, list[LibraryItem]] = {}
+    for item in catalog:
+        by_cat.setdefault(item.category or "UNCATEGORIZED", []).append(item)
+    sections = []
+    for cat in sorted(by_cat):
+        lines = "\n".join(f"    - id={it.id!r}: {it.description}" for it in by_cat[cat])
+        sections.append(f"  [{cat}]\n{lines}")
+    items_block = "\n\n".join(sections)
     user = (
         f"Object to match: {prompt!r}\n\n"
-        f"Available library assets:\n{items}\n\n"
+        f"Available library assets (grouped by category):\n{items_block}\n\n"
         "Pick the best-matching asset id."
     )
     # Library matching is always run on gemini-flash regardless of the run's
