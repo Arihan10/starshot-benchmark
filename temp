@@ -1,39 +1,13 @@
-<scene_context> // EXAMPLE: ZONE DECOMP
+Each shell element in your resultant list has an id, prompt, parent (the zone id — shells are structurally anchored to the zone itself), parent_kind (use `ATTACHED` for all shell elements: walls/floor/ceiling/roof are flush against the zone's faces by definition; only use `IN` for free-floating enclosure pieces that have no contact face, and `ON` is rare for shells — BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for any secondary relationships; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN, e.g. a roof slab supported by walls below it would reference each wall with kind=ON). Shell elements MUST lie fully inside the zone bbox — they are the zone's physical boundary, and protruding outside it would create an inside-out shell. (Non-shell objects emitted in later passes are allowed to overhang the zone; shells are not.)
 
-Here is a list of zones that have already been declared and/or planned beforehand. You should use their plans and locations to aid you in <task>. Starting with the root zone encapsulating the entire scene, here is its plan:
+The purpose of these shell elements is to physically bound the zone before its interior is populated, so every later object inside this zone has a coherent surface to rest on, lean against, or be enclosed by.
 
-<plan>
+It is imperative that every structural element named in this zone's plan MUST be bound to a real node id by the end of this call. For each one, you have exactly two options, and your output has a SEPARATE LIST for each:
+  (a) Emit a new shell element for it — add an entry to the `objects` list (id, prompt, parent, parent_kind, placement, referenced_ids, proxy_shape, orientation). Use this when no existing peer satisfies the role.
+  (b) Point to an existing peer that already satisfies it — add an entry to the `bound_existing` list with `plan_element` (the plan's noun phrase verbatim, e.g. "rear partition wall") and `peer_id` (the id of a node already present in <OBJECTS> with a concrete bbox that physically covers that role). DO NOT also add an `objects` entry for the same element — option (b) is the entire response for that structural element.
 
-The root is 50m by 20m by 40m and origins at (0, 0, 0). Inside, it contains a living room with the following plan:
+The `bound_existing` list is an audit trail: it proves you consciously bound each plan-named element, and it is dropped before any downstream pipeline step. Only entries in `objects` become new nodes.
 
-<plan for living room>. The living room is framed by frame 1, frame 2, ... , and it contains object 1 (placement for object 1), object 2 (placement for object 2), ...
+Frames that follow a specific complex shape should be separated into parametric, individual objects. You should own the placement of these frames from end-to-end as much as possible instead of relying on downstream 3D model generation steps to follow your provided seed prompt for each object.
 
-The living room is 20m by 10m by 5m. Inside, it contains a lounge area with the following plan:
-
-...
-
-You are to decide on the structural decomposition of this lounge area. To that end, here's some more context on the other areas inside the scene. You should reference this information to help you in <task>.
-
-Other areas in root:
-
-1. Bathroom (50m by 20m by 1m, origin (2, 4, 6))
-
-<plan for bathroom>. The bathroom is framed by frame 1, frame 2, ... , and it contains object 1 (placement for object 1), object 2 (placement for object 2), ...
-  
-    
-    Areas in bathroom:
-
-    1. ...
-
-2. Bedroom ...
-    
-    Areas in bedroom:
-
-    1. 
-
-...
-
-Other areas in living room <- the lounge area you are to decompose exists here:
-...
-
-</scene_context>
+Silently omitting a plan-named structural element from BOTH lists is NOT allowed. Do NOT assume a future sibling, cousin, or descendant zone will emit it later: encapsulation runs independently per zone, and downstream anchor-object generation will reference these structures by id — if the node doesn't exist now, the anchor step will hallucinate around a non-existent reference. Duplicate-avoidance is satisfied by option (b), not by silently skipping.
