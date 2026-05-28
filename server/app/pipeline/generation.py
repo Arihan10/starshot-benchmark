@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 from pathlib import Path
 from typing import Literal
 
@@ -337,6 +338,22 @@ async def _match_library_assets(
     resolved: list[Node] = []
     for spec in specs:
         bbox = bboxes[spec.id]
+        path = objs_dir / f"{spec.id}.glb"
+        url = _artifact_url(runs_dir, path)
+
+        if path.exists():
+            resolved.append(Node(
+                id=spec.id,
+                prompt=spec.prompt,
+                bbox=bbox,
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=spec.parent,
+                mesh_url=url,
+            ))
+            continue
+
         logging.emit_bbox(
             spec.id, bbox,
             parent_id=spec.parent, prompt=spec.prompt,
@@ -347,13 +364,22 @@ async def _match_library_assets(
 
         match = await library.match(spec.prompt)
         asset = library.asset_path(match.library_id)
-        path = objs_dir / f"{spec.id}.glb"
-        url = _artifact_url(runs_dir, path)
 
         logging.log(
             "library.match",
             id=spec.id, prompt=spec.prompt, library_id=match.library_id,
         )
+
+        ref_image = asset.with_suffix(".png")
+        if ref_image.exists():
+            dest_image = objs_dir / f"{spec.id}.png"
+            await asyncio.to_thread(shutil.copy2, ref_image, dest_image)
+            logging.log(
+                "image",
+                id=spec.id,
+                url=_artifact_url(runs_dir, dest_image),
+                prompt=spec.prompt,
+            )
 
         if asset.exists():
             async with _MESH_IO:

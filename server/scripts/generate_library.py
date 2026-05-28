@@ -1,21 +1,27 @@
 """Generate library assets from a CSV catalog.
 
-Reads asset_library_v3.csv and runs each object through the EXACT same
-generation pipeline as the main scene builder:
+Reads a CSV and runs each object through the EXACT same generation
+pipeline as the main scene builder:
   1. _build_image_prompt  — LLM noun phrase + wrap_image_prompt (with
      orthographic/perspective instructions, dimensions, proxy shape)
   2. nano_banana.generate_resumable — Gemini image generation
   3. threed.generate_mesh — Trellis 2 mesh generation (raw, no rescale)
 
-Outputs land in server/app/assets_library/assets/{slug}.png and .glb.
+Outputs land in {output_dir}/assets/{slug}.png and .glb.
 Resumable: re-running skips items whose image and mesh are already done
 (via the SlotLog event cache).
 
-Usage:  cd server && uv run python scripts/generate_library.py
+Usage:
+  cd server && uv run python scripts/generate_library.py
+  cd server && uv run python scripts/generate_library.py \\
+    --csv scripts/platformer_asset_library_v2.csv \\
+    --output-dir app/assets_library_platformer \\
+    --style "for a colorful Super Mario Bros-style 3D platformer game — chunky, rounded, toylike proportions with bright saturated colors and clean cartoon surfaces"
 """
 
 from __future__ import annotations
 
+import argparse
 import asyncio
 import csv
 import json
@@ -41,16 +47,21 @@ _THREE_QUARTER_CATEGORIES = {
     "OUTDOOR — Terrain & Land Forms",
     "OUTDOOR — Hardscape & Pathways",
     "OUTDOOR — Fencing & Boundaries",
+    "TERRAIN — Ground Blocks",
+    "TERRAIN — Platforms",
+    "TERRAIN — Walls & Ceilings",
+    "TERRAIN — Cliffs & Slopes",
+    "SPECIAL BLOCKS",
+    "PIPES & PORTALS",
 }
 from app.services import llm, nano_banana, threed  # noqa: E402
 from app.utils import logging as rlog  # noqa: E402
 from app.utils.logging import SlotLog  # noqa: E402
 
-CSV_PATH = _SERVER_DIR / "dry_runs" / "asset_library_v3.csv"
-ASSETS_DIR = _SERVER_DIR / "app" / "assets_library" / "assets"
-EVENTS_PATH = _SERVER_DIR / "app" / "assets_library" / "generate_events.jsonl"
-MODEL = "openai/gpt-5.5"
-MAX_CONCURRENT = 20
+_DEFAULT_CSV = _SERVER_DIR / "dry_runs" / "asset_library_v3.csv"
+_DEFAULT_OUTPUT_DIR = _SERVER_DIR / "app" / "assets_library"
+MODEL = "google/gemini-3.5-flash"
+MAX_CONCURRENT = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_S = 5.0
 
@@ -77,13 +88,16 @@ async def _generate_one(
     csv_id: str,
     name: str,
     category: str,
+    *,
+    assets_dir: Path,
+    style: str | None = None,
 ) -> dict[str, object]:
     """Run a single CSV item through the exact same pipeline as
     generation._build_image_prompt -> generation._generate_one."""
     global _done_count, _skip_count, _fail_count
 
-    glb_path = ASSETS_DIR / f"{item_id}.glb"
-    image_path = ASSETS_DIR / f"{item_id}.png"
+    glb_path = assets_dir / f"{item_id}.glb"
+    image_path = assets_dir / f"{item_id}.png"
 
     if glb_path.exists() and image_path.exists():
         _skip_count += 1
@@ -97,11 +111,13 @@ async def _generate_one(
             "three-quarter" if category in _THREE_QUARTER_CATEGORIES
             else "front"
         )
+        prompt = f"{name} — {style}" if style else name
         last_err: Exception | None = None
         for attempt in range(MAX_RETRIES):
             try:
                 subject, image_prompt = await _build_image_prompt(
-                    prompt=name,
+                    spec_id=item_id,
+                    prompt=prompt,
                     bbox=_DEFAULT_BBOX,
                     proxy_shape=None,
                     prior_prompts=[],
@@ -170,13 +186,36 @@ async def _generate_one(
         }
 
 
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Generate library assets from a CSV catalog.")
+    p.add_argument("--csv", type=Path, default=_DEFAULT_CSV, help="Path to the CSV catalog")
+    p.add_argument("--output-dir", type=Path, default=_DEFAULT_OUTPUT_DIR, help="Output directory (assets/ subdir created inside)")
+    p.add_argument("--style", type=str, default=None, help="Style context appended to every object prompt")
+    p.add_argument("--trellis-concurrency", type=int, default=None, help="Override Trellis in-flight job cap (default: 10)")
+    p.add_argument("--concurrent", type=int, default=MAX_CONCURRENT, help="Max concurrent items in pipeline (default: 30)")
+    return p.parse_args()
+
+
 async def main() -> None:
-    global _total
-    ASSETS_DIR.mkdir(parents=True, exist_ok=True)
+    global _total, _semaphore
+    args = _parse_args()
+    csv_path = args.csv if args.csv.is_absolute() else _SERVER_DIR / args.csv
+    output_dir = args.output_dir if args.output_dir.is_absolute() else _SERVER_DIR / args.output_dir
+    assets_dir = output_dir / "assets"
+    events_path = output_dir / "generate_events.jsonl"
+    style: str | None = args.style
+
+    if args.trellis_concurrency is not None:
+        threed.GENERATE_CONCURRENCY = args.trellis_concurrency
+        threed._inflight_sem = asyncio.Semaphore(args.trellis_concurrency)
+    if args.concurrent != MAX_CONCURRENT:
+        _semaphore = asyncio.Semaphore(args.concurrent)
+
+    assets_dir.mkdir(parents=True, exist_ok=True)
 
     items: list[tuple[str, str, str, str]] = []
     seen_slugs: set[str] = set()
-    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+    with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
             csv_id = row["ID"]
@@ -190,7 +229,7 @@ async def main() -> None:
 
     _total = len(items)
 
-    slot_log = SlotLog("library-gen", EVENTS_PATH)
+    slot_log = SlotLog("library-gen", events_path)
     slot_log.hydrate_from_disk()
     if not slot_log.state["events"]:
         slot_log.start_run("library generation", MODEL)
@@ -201,8 +240,8 @@ async def main() -> None:
 
     already = sum(
         1 for slug, _, _, _ in items
-        if (ASSETS_DIR / f"{slug}.glb").exists()
-        and (ASSETS_DIR / f"{slug}.png").exists()
+        if (assets_dir / f"{slug}.glb").exists()
+        and (assets_dir / f"{slug}.png").exists()
     )
     remaining = _total - already
     print(
@@ -214,7 +253,9 @@ async def main() -> None:
     t0 = time.monotonic()
 
     tasks = [
-        asyncio.create_task(_generate_one(slug, csv_id, name, cat))
+        asyncio.create_task(
+            _generate_one(slug, csv_id, name, cat, assets_dir=assets_dir, style=style),
+        )
         for slug, csv_id, name, cat in items
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -227,7 +268,7 @@ async def main() -> None:
         else:
             manifest.append(r)
 
-    manifest_path = ASSETS_DIR.parent / "generate_manifest.json"
+    manifest_path = output_dir / "generate_manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2))
 
     slot_log.finish_run()
