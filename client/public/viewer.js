@@ -21,6 +21,8 @@ const slotsEl = document.getElementById("slots");
 const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
 const modelPickerEl = document.getElementById("model-picker");
+const runPickerEl = document.getElementById("run-picker");
+const runNewEl = document.getElementById("run-new");
 const resumeAllEl = document.getElementById("resume-all");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
@@ -503,12 +505,13 @@ function renderTrellisQueue() {
     for (const row of rows) {
       const el = document.createElement("div");
       el.className = `tq-row ${kind}`;
-      // Queue rows tag slot_id with the composite "slot/model" so we can
-      // filter to the cell currently on screen — other cells stay visible
-      // (still inflight on the shared queue) but greyed and not clickable.
+      // Queue rows tag slot_id with the composite "run/slot/model" so we
+      // can filter to the cell currently on screen — other cells stay
+      // visible (still inflight on the shared queue) but greyed and not
+      // clickable.
       const currentCompositeId =
-        currentSlotId !== null && currentModel !== null
-          ? `${currentSlotId}/${currentModel}`
+        currentRun !== null && currentSlotId !== null && currentModel !== null
+          ? `${currentRun}/${currentSlotId}/${currentModel}`
           : null;
       const inThisSlot = row.slot_id === currentCompositeId;
       if (inThisSlot) {
@@ -3149,7 +3152,9 @@ function dispatch(event) {
 let currentSource = null;
 let currentSlotId = null;
 let currentModel = null;
+let currentRun = null;
 let availableModels = [];
+let availableRuns = [];  // [{name, modified_at, has_prompt_snapshot}, ...]
 let defaultModelAlias = null;
 let slotSummaries = [];  // latest /slots `slots` array, for tab rendering
 let slotNeedsResume = false;
@@ -3236,6 +3241,13 @@ async function refreshSlots() {
     availableModels = payload.models ?? [];
     defaultModelAlias = payload.default_model ?? availableModels[0] ?? null;
     slotSummaries = payload.slots ?? [];
+    if (payload.run && payload.run !== currentRun) {
+      // Another client (or the create-run endpoint) flipped the active run
+      // out from under us — keep our local state in sync so renders and
+      // composite ids match.
+      currentRun = payload.run;
+      if (runPickerEl.value !== currentRun) runPickerEl.value = currentRun;
+    }
     // Re-populate the picker if the model list changed (or this is the
     // first refresh). Cheap to redo every tick — the <option>s are flat.
     if (modelPickerEl.options.length !== availableModels.length) {
@@ -3245,6 +3257,108 @@ async function refreshSlots() {
     updateResumeButton();
   } catch {
     // Transient; next tick will retry.
+  }
+}
+
+function populateRunPicker() {
+  runPickerEl.innerHTML = "";
+  for (const r of availableRuns) {
+    const opt = document.createElement("option");
+    opt.value = r.name;
+    opt.textContent = r.has_prompt_snapshot ? r.name : `${r.name} (no snapshot)`;
+    runPickerEl.appendChild(opt);
+  }
+  if (currentRun) runPickerEl.value = currentRun;
+}
+
+async function refreshRuns() {
+  try {
+    const res = await fetch(new URL("/runs", SERVER_URL));
+    if (!res.ok) return;
+    const payload = await res.json();
+    availableRuns = payload.runs ?? [];
+    if (!currentRun) currentRun = payload.current ?? null;
+    populateRunPicker();
+  } catch {
+    // Transient; next tick will retry.
+  }
+}
+
+function resetClientStateForRunSwitch() {
+  // Switching to a different run means every cached scene/log/asset/tree
+  // entry is stale — they belong to the prior run's (slot, model) cells.
+  // Tear down before we refetch slots and re-subscribe.
+  if (currentSource) {
+    currentSource.close();
+    currentSource = null;
+  }
+  clearScene();
+  clearLog();
+  clearAssets();
+  treeClear();
+  clearMeshErrors();
+  highestEventIndex = -1;
+  recordedEvents.length = 0;
+  updateReplayButton();
+}
+
+async function switchRun(name) {
+  if (!name || name === currentRun) return;
+  runPickerEl.disabled = true;
+  try {
+    const res = await fetch(
+      new URL(`/runs/${encodeURIComponent(name)}/activate`, SERVER_URL),
+      { method: "POST" },
+    );
+    if (!res.ok) {
+      setStatus(`run switch failed: HTTP ${res.status}`, "err");
+      // Snap the picker back to whatever the server still thinks is active.
+      if (currentRun) runPickerEl.value = currentRun;
+      return;
+    }
+    currentRun = name;
+    setStatus(`run :: ${name}`);
+    resetClientStateForRunSwitch();
+    await refreshSlots();
+    if (currentSlotId && currentModel) {
+      // Re-render the same (slot, model) selection, now backed by the new
+      // run's events.jsonl + idle/paused/done state.
+      switchView(currentSlotId, currentModel);
+    }
+  } finally {
+    runPickerEl.disabled = false;
+  }
+}
+
+async function createRun() {
+  const name = window.prompt(
+    "New run name (e.g. iteration14, ab_test_v3):",
+    "",
+  );
+  if (!name) return;
+  runNewEl.disabled = true;
+  try {
+    const res = await fetch(new URL("/runs", SERVER_URL), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: name.trim() }),
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      setStatus(`create run failed: ${detail}`, "err");
+      return;
+    }
+    const payload = await res.json();
+    currentRun = payload.current;
+    setStatus(`run created :: ${currentRun}`);
+    await refreshRuns();
+    resetClientStateForRunSwitch();
+    await refreshSlots();
+    if (currentSlotId && currentModel) {
+      switchView(currentSlotId, currentModel);
+    }
+  } finally {
+    runNewEl.disabled = false;
   }
 }
 
@@ -3417,6 +3531,12 @@ modelPickerEl.addEventListener("change", () => {
   switchModel(modelPickerEl.value);
 });
 
+runPickerEl.addEventListener("change", () => {
+  switchRun(runPickerEl.value);
+});
+
+runNewEl.addEventListener("click", createRun);
+
 async function resumeAll() {
   // Fans out POST /slots/<slot>/<model>/resume for every cell on the active
   // model whose status is startable (idle/paused/error). Running and done
@@ -3582,8 +3702,10 @@ exportGlbEl.addEventListener("click", async () => {
   }
 });
 
-// Boot: load slot + model lists, pick remembered (or defaults), subscribe.
+// Boot: fetch active run first (so /slots reflects the right cell set),
+// then load slot + model lists, pick remembered (or defaults), subscribe.
 (async () => {
+  await refreshRuns();
   await refreshSlots();
   if (slotSummaries.length === 0) {
     setStatus("no slots reported by server", "err");
@@ -3606,8 +3728,10 @@ exportGlbEl.addEventListener("click", async () => {
   switchView(slotPick, modelPick);
 })();
 
-// Keep tab status dots fresh for slots the user isn't viewing.
+// Keep tab status dots + run list fresh — runs change less often, so a
+// slower cadence is fine.
 setInterval(refreshSlots, 2000);
+setInterval(refreshRuns, 10000);
 
 // --- replay → gif ----------------------------------------------------------
 //

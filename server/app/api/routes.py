@@ -1,18 +1,22 @@
-"""HTTP API — endpoints scoped to a (slot, model) run.
+"""HTTP API — endpoints scoped to a (run, slot, model) cell.
 
-Every benchmark slot can be driven by any of the aliased LLMs in
-`app.core.slots.MODELS` in parallel — each (slot, model) cell is its own
-resumable run with its own events.jsonl, mesh artifacts, and SSE stream.
-On lifespan startup every cell is hydrated from disk: fresh ones sit
-idle, interrupted ones come back as paused, completed ones stay done.
-Nothing auto-launches; the viewer drives start/resume/reset per cell.
+`RUNS_DIR` is now a parent directory holding many named *runs*; each run
+is a versioned set of (slot, model) cells with its own prompt snapshot,
+events.jsonl, mesh artifacts, and SSE streams. The viewer picks the
+active run at runtime via `GET /runs` / `POST /runs/{name}/activate` —
+no more relaunching the server with a different `STARSHOT_RUNS_DIR`.
 
-Every asyncio task is bound to its SlotLog via a ContextVar, so
-concurrent pipeline work (e.g. running `hotel-room` against gpt and
-opus at the same time) routes events to the right cell without
+For each (run, slot, model) cell: fresh ones sit idle, interrupted ones
+come back as paused, completed ones stay done. Nothing auto-launches;
+the viewer drives start/resume/reset per cell. Runs are hydrated lazily
+on activation; the initial active run is the newest subdir of RUNS_DIR
+(or `default` if RUNS_DIR is empty).
+
+Every asyncio task is bound to its SlotLog via a ContextVar so
+concurrent pipeline work routes events to the right cell without
 threading a handle through every call site. The Trellis queue is
-process-global; its rows tag `slot_id` with the composite
-`slot/model_alias` so the dashboard can filter to the visible cell.
+process-global; rows tag `slot_id` with the composite
+`run/slot/model_alias` so the dashboard filters to the visible cell.
 """
 
 from __future__ import annotations
@@ -47,46 +51,100 @@ from app.services import llm, threed
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
-# Where this process writes per-slot run artifacts. Set STARSHOT_RUNS_DIR to
-# point at a different directory so multiple simultaneous processes don't
-# trample each other.
+# Parent directory holding many named runs. Each immediate subdirectory
+# is one run; cells live at RUNS_DIR/<run>/<slot>/<model>.
 RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
 
-# Keyed by (slot_id, model_alias). Each cell is an independent run.
-RunKey = tuple[str, str]
+# Source file we snapshot into each newly-created run so prompt-versioned
+# AB tests are reproducible after the source has moved on.
+PROMPTS_SOURCE = Path(__file__).resolve().parent.parent / "core" / "prompts.py"
+PROMPT_SNAPSHOT_NAME = "prompts_snapshot.py"
+
+# Keyed by (run_name, slot_id, model_alias). Each cell is an independent
+# pipeline. Lazy-populated: only runs the user has activated are loaded.
+RunKey = tuple[str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
+_hydrated_runs: set[str] = set()
+_current_run: str = ""
 
 
 class RewindRequest(BaseModel):
     to_event_index: int
 
 
-def _run_id(slot_id: str, model_alias: str) -> str:
+class CreateRunRequest(BaseModel):
+    name: str
+
+
+def _run_id(run: str, slot_id: str, model_alias: str) -> str:
     """Composite id used as `run_id` in pipeline code (divider, generation,
-    threed queue, SlotLog.slot_id). The slash makes it work as a filesystem
+    threed queue, SlotLog.slot_id). The slashes make it work as a filesystem
     subpath under RUNS_DIR and as an artifact URL segment under /artifacts."""
-    return f"{slot_id}/{model_alias}"
+    return f"{run}/{slot_id}/{model_alias}"
 
 
-def _slot_dir(slot_id: str, model_alias: str) -> Path:
-    return RUNS_DIR / slot_id / model_alias
+def _run_dir(run: str) -> Path:
+    return RUNS_DIR / run
+
+
+def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
+    return RUNS_DIR / run / slot_id / model_alias
+
+
+def _pick_initial_run() -> str:
+    """Most-recently-modified subdirectory of RUNS_DIR, or `default` if
+    none exist yet. Picked once at startup; subsequent activations are
+    driven by the client."""
+    if RUNS_DIR.exists():
+        subdirs = [p for p in RUNS_DIR.iterdir() if p.is_dir()]
+        if subdirs:
+            latest = max(subdirs, key=lambda p: p.stat().st_mtime)
+            return latest.name
+    return "default"
+
+
+def _ensure_prompt_snapshot(run: str) -> None:
+    """Copy the live prompts.py into RUNS_DIR/<run>/ if not already there.
+    Called only when a brand-new run is created via POST /runs; legacy
+    runs that pre-date this feature keep whatever (or nothing) they had,
+    so we never overwrite the historical record."""
+    target = _run_dir(run) / PROMPT_SNAPSHOT_NAME
+    if target.exists():
+        return
+    if PROMPTS_SOURCE.exists():
+        target.write_text(PROMPTS_SOURCE.read_text())
+
+
+def _hydrate_run(run: str) -> None:
+    """Build SlotLogs for every (slot, model) cell under RUNS_DIR/<run>/.
+    Idempotent — calling twice is a no-op. Hydration is per-run so the
+    /runs/ parent can hold many old run sets without paying their startup
+    cost until the user clicks one."""
+    if run in _hydrated_runs:
+        return
+    run_dir = _run_dir(run)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    for slot in SLOTS:
+        for alias in MODEL_ALIASES:
+            slot_dir = _slot_dir(run, slot.id, alias)
+            slot_dir.mkdir(parents=True, exist_ok=True)
+            slot_log = SlotLog(
+                _run_id(run, slot.id, alias), slot_dir / "events.jsonl"
+            )
+            slot_log.hydrate_from_disk()
+            _slot_logs[(run, slot.id, alias)] = slot_log
+            _maybe_launch(slot, alias, slot_log)
+    _hydrated_runs.add(run)
 
 
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
-        for slot in SLOTS:
-            for alias in MODEL_ALIASES:
-                slot_dir = _slot_dir(slot.id, alias)
-                slot_dir.mkdir(parents=True, exist_ok=True)
-                slot_log = SlotLog(
-                    _run_id(slot.id, alias), slot_dir / "events.jsonl"
-                )
-                slot_log.hydrate_from_disk()
-                _slot_logs[(slot.id, alias)] = slot_log
-                _maybe_launch(slot, alias, slot_log)
+        global _current_run
+        _current_run = _pick_initial_run()
+        _hydrate_run(_current_run)
         try:
             yield
         finally:
@@ -112,12 +170,54 @@ def create_app() -> FastAPI:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
     app.mount("/artifacts", StaticFiles(directory=RUNS_DIR), name="artifacts")
 
+    @app.get("/runs")
+    async def list_runs() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        items: list[dict[str, object]] = []
+        if RUNS_DIR.exists():
+            for p in sorted(
+                (p for p in RUNS_DIR.iterdir() if p.is_dir()),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            ):
+                items.append({
+                    "name": p.name,
+                    "modified_at": p.stat().st_mtime,
+                    "has_prompt_snapshot": (p / PROMPT_SNAPSHOT_NAME).exists(),
+                })
+        return {"runs": items, "current": _current_run}
+
+    @app.post("/runs")
+    async def create_run(req: CreateRunRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        name = req.name.strip()
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid run name")
+        run_dir = _run_dir(name)
+        if run_dir.exists():
+            raise HTTPException(status_code=409, detail=f"run already exists: {name}")
+        run_dir.mkdir(parents=True)
+        _ensure_prompt_snapshot(name)
+        _hydrate_run(name)
+        global _current_run
+        _current_run = name
+        return {"current": name}
+
+    @app.post("/runs/{name}/activate")
+    async def activate_run(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        run_dir = _run_dir(name)
+        if not run_dir.is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown run: {name}")
+        _hydrate_run(name)
+        global _current_run
+        _current_run = name
+        return {"current": name}
+
     @app.get("/slots")
     async def list_slots() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         return {
+            "run": _current_run,
             "models": MODEL_ALIASES,
             "default_model": DEFAULT_MODEL_ALIAS,
-            "slots": [_slot_summary(s) for s in SLOTS],
+            "slots": [_slot_summary(s, _current_run) for s in SLOTS],
         }
 
     @app.get("/trellis/queue")
@@ -133,7 +233,8 @@ def create_app() -> FastAPI:
 
     @app.get("/slots/{slot_id}/{model_alias}/events")
     async def slot_events(slot_id: str, model_alias: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
-        slot_log = _require_slot_log(slot_id, model_alias)
+        run = _current_run
+        slot_log = _require_slot_log(run, slot_id, model_alias)
         # Subscribe and snapshot synchronously — no await between them, so no
         # log() call can land in both the snapshot and the live queue.
         q = slot_log.subscribe()
@@ -147,31 +248,35 @@ def create_app() -> FastAPI:
     async def slot_rewind(  # pyright: ignore[reportUnusedFunction]
         slot_id: str, model_alias: str, req: RewindRequest,
     ) -> dict[str, int | str]:
+        run = _current_run
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
         if slot_log.state.get("prompt") is None or slot_log.state.get("model") is None:
             raise HTTPException(
                 status_code=400,
                 detail="slot has no run to rewind",
             )
-        await _cancel_task(slot_id, model_alias)
+        await _cancel_task(run, slot_id, model_alias)
         new_len = slot_log.truncate_events_to(req.to_event_index)
-        _tasks[(slot.id, model_alias)] = asyncio.create_task(_run(slot.id, model_alias))
-        return {"slot_id": slot.id, "model": model_alias, "events": new_len}
+        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(
+            _run(run, slot.id, model_alias)
+        )
+        return {"run": run, "slot_id": slot.id, "model": model_alias, "events": new_len}
 
     @app.post("/slots/{slot_id}/{model_alias}/resume")
     async def slot_resume(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        run = _current_run
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
         status = slot_log.state.get("status")
         if status not in ("idle", "paused", "error"):
             raise HTTPException(
                 status_code=400,
                 detail=f"slot is {status}, not startable",
             )
-        await _cancel_task(slot_id, model_alias)
+        await _cancel_task(run, slot_id, model_alias)
         events = slot_log.state["events"]
         model_id = MODELS[model_alias]
         if status == "idle" and not events:
@@ -185,35 +290,39 @@ def create_app() -> FastAPI:
                 slot_log.truncate_events_to(len(events) - 1)
             slot_log.state["model"] = model_id
             slot_log.state["status"] = "running"
-        _tasks[(slot.id, model_alias)] = asyncio.create_task(_run(slot.id, model_alias))
-        return {"slot_id": slot.id, "model": model_alias}
+        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(
+            _run(run, slot.id, model_alias)
+        )
+        return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.post("/slots/{slot_id}/{model_alias}/pause")
     async def slot_pause(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        run = _current_run
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
         status = slot_log.state.get("status")
         if status != "running":
             raise HTTPException(
                 status_code=400,
                 detail=f"slot is {status}, not pausable",
             )
-        await _cancel_task(slot_id, model_alias)
+        await _cancel_task(run, slot_id, model_alias)
         # _cancel_task awaits the cancellation, so the pipeline task has
         # already torn down (including generation.cancel_pending via _run's
         # CancelledError branch) by the time we emit the sentinel.
         slot_log.state["status"] = "paused"
         slot_log.log("run.paused")
-        return {"slot_id": slot.id, "model": model_alias}
+        return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.post("/slots/{slot_id}/{model_alias}/retry-mesh/{node_id}")
     async def slot_retry_mesh(  # pyright: ignore[reportUnusedFunction]
         slot_id: str, model_alias: str, node_id: str,
     ) -> dict[str, str]:
+        run = _current_run
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
         node = _reconstruct_node(slot_log, node_id)
         if node is None:
             raise HTTPException(
@@ -225,36 +334,41 @@ def create_app() -> FastAPI:
             llm.set_model(MODELS[model_alias])
             await generation.retry_node(
                 node=node, runs_dir=RUNS_DIR,
-                run_id=_run_id(slot.id, model_alias),
+                run_id=_run_id(run, slot.id, model_alias),
             )
         asyncio.create_task(_do_retry())
-        return {"slot_id": slot.id, "model": model_alias, "node_id": node_id}
+        return {"run": run, "slot_id": slot.id, "model": model_alias, "node_id": node_id}
 
     @app.post("/slots/{slot_id}/{model_alias}/reset")
     async def slot_reset(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        run = _current_run
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        await _cancel_task(slot_id, model_alias)
+        await _cancel_task(run, slot_id, model_alias)
         # Cancel any standalone retries (registered on generation._pending
         # but with no owning _run task to drive cleanup) that the running
         # task wouldn't have touched.
-        generation.cancel_pending(_run_id(slot.id, model_alias))
-        slot_dir = _slot_dir(slot.id, model_alias)
+        generation.cancel_pending(_run_id(run, slot.id, model_alias))
+        slot_dir = _slot_dir(run, slot.id, model_alias)
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
-        slot_log = SlotLog(_run_id(slot.id, model_alias), slot_dir / "events.jsonl")
-        _slot_logs[(slot.id, model_alias)] = slot_log
+        slot_log = SlotLog(
+            _run_id(run, slot.id, model_alias), slot_dir / "events.jsonl"
+        )
+        _slot_logs[(run, slot.id, model_alias)] = slot_log
         slot_log.start_run(slot.prompt, MODELS[model_alias])
-        _tasks[(slot.id, model_alias)] = asyncio.create_task(_run(slot.id, model_alias))
-        return {"slot_id": slot.id, "model": model_alias}
+        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(
+            _run(run, slot.id, model_alias)
+        )
+        return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     return app
 
 
-def _slot_summary(slot: Slot) -> dict[str, object]:
+def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
-        slot_log = _slot_logs.get((slot.id, alias))
+        slot_log = _slot_logs.get((run, slot.id, alias))
         state = (
             slot_log.state
             if slot_log is not None
@@ -382,20 +496,20 @@ def _require_model(model_alias: str) -> None:
         raise HTTPException(status_code=404, detail=f"unknown model: {model_alias}")
 
 
-def _require_slot_log(slot_id: str, model_alias: str) -> SlotLog:
+def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
     _require_slot(slot_id)
     _require_model(model_alias)
-    log = _slot_logs.get((slot_id, model_alias))
+    log = _slot_logs.get((run, slot_id, model_alias))
     if log is None:
         raise HTTPException(
             status_code=404,
-            detail=f"no run for slot={slot_id} model={model_alias}",
+            detail=f"no run for run={run} slot={slot_id} model={model_alias}",
         )
     return log
 
 
-async def _cancel_task(slot_id: str, model_alias: str) -> None:
-    task = _tasks.pop((slot_id, model_alias), None)
+async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
+    task = _tasks.pop((run, slot_id, model_alias), None)
     if task is None or task.done():
         return
     task.cancel()
@@ -428,12 +542,12 @@ async def _sse(
         slot_log.unsubscribe(q)
 
 
-async def _run(slot_id: str, model_alias: str) -> None:
-    slot_log = _slot_logs[(slot_id, model_alias)]
+async def _run(run: str, slot_id: str, model_alias: str) -> None:
+    slot_log = _slot_logs[(run, slot_id, model_alias)]
     rlog.bind(slot_log)
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]
-    run_id = _run_id(slot_id, model_alias)
+    run_id = _run_id(run, slot_id, model_alias)
     try:
         await divider.run(
             run_id=run_id,

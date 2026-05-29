@@ -86,6 +86,31 @@ class BoundingBox(BaseModel):
     def max_dimension(self) -> float:
         return max(self.size)
 
+    def to_local_frame(self, parent: BoundingBox) -> BoundingBox:
+        """Translate this world-frame bbox into `parent`'s local frame.
+
+        The local frame's origin sits at `parent.min_corner` and uses
+        the same canonical axes (+X right, +Y up, +Z front), so the
+        transform is a pure translation — signed dimensions are
+        preserved.
+        """
+        px, py, pz = parent.min_corner
+        ox, oy, oz = self.origin
+        return BoundingBox(
+            origin=(ox - px, oy - py, oz - pz),
+            dimensions=self.dimensions,
+        )
+
+    def to_world_frame(self, parent: BoundingBox) -> BoundingBox:
+        """Inverse of `to_local_frame`: translate a bbox expressed in
+        `parent`'s local frame back to world coordinates."""
+        px, py, pz = parent.min_corner
+        ox, oy, oz = self.origin
+        return BoundingBox(
+            origin=(ox + px, oy + py, oz + pz),
+            dimensions=self.dimensions,
+        )
+
 
 class ProxyShape(StrEnum):
     """Optional collision-proxy primitive describing the mesh's silhouette

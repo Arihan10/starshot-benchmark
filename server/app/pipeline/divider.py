@@ -214,7 +214,10 @@ async def _resolve_child_bboxes_batch(
         node_id=parent.id,
         step="child_bbox_batch",
     )
-    return {a.id: a.bbox for a in out.assignments}
+    # LLM emits bboxes in the parent's local frame (origin at
+    # parent.min_corner, same canonical axes). Translate back to world
+    # coordinates before handing them downstream.
+    return {a.id: a.bbox.to_world_frame(parent.bbox) for a in out.assignments}
 
 
 async def _build(

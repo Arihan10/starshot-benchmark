@@ -65,6 +65,7 @@ def _deepseek_suffix() -> str:
     # DeepSeek's reasoning tends to spiral; the injected blurb pins it
     # to a concrete plan. Local import avoids a cycle at module load.
     from app.services.llm import _current_model
+
     model = _current_model.get()
     if model and "deepseek" in model.lower():
         return DEEPSEEK_INJECTION
@@ -166,7 +167,7 @@ think deeply about the 3D scene, environment or level you want to build from thi
 
 write directly and consider every part carefully. you are only the first, overall planning step - your plan will go through hundreds of further downstream steps where it is expanded on and transformed as the AI pipeline to construct it propagates further planning by depth. define the scene itself, its top-level shape and character enough that the downstream steps have agency over their individual sections while also forming ideas of what to build. 
 
-only the final output of the 3D geometry for the scene itself will be judged once the pipeline is finished; your prompt itself will NEVER be shown to the judges, it will only serve as a base to build upon. the narrative you construct, while creative, should not deviate from the original prompt - the judges should be able to look at the final scene and still call it "{zone_prompt}".
+only the final output of the 3D geometry for the scene itself will be judged once the pipeline is finished; your prompt itself will NEVER be shown to the judges, it will only serve as a base to build upon.
 
 In your plan, DO NOT be overly specific - remember, your prompt will NOT be converted directly into 3D geometry, it will undergo hundreds of expansion and detail steps before reaching any generation steps, so structure your output such that it is a base that the downstream tree of pipeline steps can build upon it. given a prompt for a building, a bad output provides exact instruction on what it looks like; a good prompt defines the narrative premise for the scene, the scope of the environment, the building's character and type, the surrounding environment, points that may implicitly be expanded, and a top-level shape for the scene itself without explicitly shaping the entities that form it.
 
@@ -382,7 +383,7 @@ Respond with a single JSON object containing:
 - `children` (list): the subzones this region decomposes into. Each child has:
   - `id` (string): unique within the entire scene
   - `prompt` (string): a short seed describing what this child zone is
-  - `parent` (string): the id of this child's structural parent — the containing zone (PARENT_ID for a top-level subzone), or an earlier sibling in this call whose interior/footprint this child sits within
+  - `parent` (string): the id of this child's structural parent. For a top-level subzone, this is the literal id of the zone being decomposed (the value labelled "Parent zone id" in the user message — e.g. if the user message says `Parent zone id: 'living_room'`, emit `"parent": "living_room"`, NOT the string "PARENT_ID" or any other placeholder). For a child anchored to an earlier sibling in this call, use that sibling's id verbatim.
   - `parent_kind` (string): how this child anchors to its `parent`. Exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here — they are peer hints, reserved for `referenced_ids`.
   - `placement` (string): prose describing WHERE this child sits within / against / relative to its parent and any referenced peers. The bbox-resolution step uses this verbatim.
   - `referenced_ids` (list of {target, kind}): OPTIONAL secondary relationships to other already-placed nodes referenced in the placement text. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
@@ -421,27 +422,43 @@ def _scene_context_zone_decompose_narrative(
     for i, (aid, aprompt, aplan, abbox, aplacement) in enumerate(ancestors):
         ap = None if i == 0 else ancestors[i - 1][0]
         bag[aid] = dict(
-            prompt=aprompt, bbox=abbox, plan=aplan,
-            parent_id=ap, placement=aplacement, kind="zone",
+            prompt=aprompt,
+            bbox=abbox,
+            plan=aplan,
+            parent_id=ap,
+            placement=aplacement,
+            kind="zone",
         )
     target_parent = ancestors[-1][0] if ancestors else None
     bag[target_zone_id] = dict(
-        prompt=target_zone_prompt, bbox=target_zone_bbox, plan=target_zone_plan,
-        parent_id=target_parent, placement=None, kind="zone",
+        prompt=target_zone_prompt,
+        bbox=target_zone_bbox,
+        plan=target_zone_plan,
+        parent_id=target_parent,
+        placement=None,
+        kind="zone",
     )
     for zid, zprompt, zplan, zparent, zbbox, zplacement in prior_zones:
         if zid in bag:
             continue
         bag[zid] = dict(
-            prompt=zprompt, bbox=zbbox, plan=zplan,
-            parent_id=zparent, placement=zplacement, kind="zone",
+            prompt=zprompt,
+            bbox=zbbox,
+            plan=zplan,
+            parent_id=zparent,
+            placement=zplacement,
+            kind="zone",
         )
     for oid, oprompt, oparent, obbox, oplacement, oparent_kind in objects:
         if oid in bag:
             continue
         bag[oid] = dict(
-            prompt=oprompt, bbox=obbox, plan=None,
-            parent_id=oparent, placement=oplacement, kind="object",
+            prompt=oprompt,
+            bbox=obbox,
+            plan=None,
+            parent_id=oparent,
+            placement=oplacement,
+            kind="object",
             parent_kind=oparent_kind,
         )
 
@@ -457,18 +474,12 @@ def _scene_context_zone_decompose_narrative(
     def fmt_dims_sentence(b: BoundingBox) -> str:
         w, h, d = b.size
         ox, oy, oz = b.origin
-        return (
-            f"{w:.2f}m by {h:.2f}m by {d:.2f}m and origins at "
-            f"({ox:.2f}, {oy:.2f}, {oz:.2f})"
-        )
+        return f"{w:.2f}m by {h:.2f}m by {d:.2f}m and origins at ({ox:.2f}, {oy:.2f}, {oz:.2f})"
 
     def fmt_dims_inline(b: BoundingBox) -> str:
         w, h, d = b.size
         ox, oy, oz = b.origin
-        return (
-            f"{w:.2f}m by {h:.2f}m by {d:.2f}m, origin "
-            f"({ox:.2f}, {oy:.2f}, {oz:.2f})"
-        )
+        return f"{w:.2f}m by {h:.2f}m by {d:.2f}m, origin ({ox:.2f}, {oy:.2f}, {oz:.2f})"
 
     def fmt_plan(plan: str | None) -> str:
         if plan is None:
@@ -503,8 +514,10 @@ def _scene_context_zone_decompose_narrative(
 
         if frames and anchors:
             return (
-                f" The {zone_id} is framed by " + ", ".join(frames)
-                + ", and it contains " + ", ".join(fmt_anchor(a) for a in anchors)
+                f" The {zone_id} is framed by "
+                + ", ".join(frames)
+                + ", and it contains "
+                + ", ".join(fmt_anchor(a) for a in anchors)
                 + "."
             )
         if frames:
@@ -548,7 +561,7 @@ def _scene_context_zone_decompose_narrative(
     out.append(
         "Nested sub-area lists below use `> ` as a depth delimiter: every line "
         "is prefixed with one `> ` per level of nesting below its enclosing "
-        "\"Other areas in X\" or \"Areas in X\" header (top-level entries have "
+        '"Other areas in X" or "Areas in X" header (top-level entries have '
         "no prefix; their sub-areas get one `> `; sub-sub-areas get `> > `; etc.)."
     )
     out.append("")
@@ -579,17 +592,13 @@ def _scene_context_zone_decompose_narrative(
         parent_id = spine[i]
         path_child = spine[i + 1]
         sibling_zone_ids = [
-            k for k in children.get(parent_id, [])
-            if bag[k]["kind"] == "zone" and k != path_child
+            k for k in children.get(parent_id, []) if bag[k]["kind"] == "zone" and k != path_child
         ]
         if not sibling_zone_ids:
             continue
         any_siblings = True
         is_target_parent = parent_id == target_parent
-        marker = (
-            f" <- the {target_zone_id} you are to decompose exists here"
-            if is_target_parent else ""
-        )
+        marker = f" <- the {target_zone_id} you are to decompose exists here" if is_target_parent else ""
         out.append(f"Other areas in {parent_id}:{marker}")
         out.append("")
         for j, sib in enumerate(sibling_zone_ids, 1):
@@ -660,7 +669,7 @@ Keep the prompt tight: the goal is not to plan out the subzone's contents, but t
 <SCENE_CONTEXT>
 {narrative}
 
-PARENT_ID (the zone being decomposed): {zone_id!r}
+Parent zone id (use this id literally as `parent` for top-level subzones): {zone_id!r}
 Zone prompt: "{zone_prompt}"
 Zone bbox (axis-aligned, meters): {zone_bbox.model_dump_json()}
 
@@ -693,7 +702,7 @@ The user message contains the parent zone's id and bbox, and a list of child spe
 </input>
 
 <output>
-Respond with a single JSON object matching the schema: one `assignment` per child (id + bbox). Coordinates in meters under the canonical front view (+X right, +Y up, +Z front, -Z back), centimeter precision (multiples of 0.01). Use a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis. Emit exactly one assignment per requested child id — no extras, no omissions.
+Respond with a single JSON object matching the schema: one `assignment` per child (id + bbox). All bbox coordinates are in the PARENT'S LOCAL FRAME — origin (0,0,0) is the parent's minimum corner; the axes still follow the canonical front view (+X right, +Y up, +Z front, -Z back). The parent bbox you receive is already expressed in this frame (its origin is (0,0,0) and its dimensions are the parent's extent). Emit every child bbox in this same frame: a child flush against the parent's minimum corner has origin (0,0,0); a child resting on the parent's floor at the parent's centre has origin near (parent_width/2, 0, parent_depth/2) minus the child's footprint. Use centimeter precision (multiples of 0.01) and a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis. Emit exactly one assignment per requested child id — no extras, no omissions.
 
 No prose, no markdown, no code fences.
 </output>
@@ -719,6 +728,10 @@ def render_zone_bbox_batch(
     parent_bbox: BoundingBox,
     children: list["ChildNodeSpec"],
 ) -> str:
+    # Parent is its own local frame: origin (0,0,0), dimensions unchanged.
+    # Rendered explicitly (rather than dropping origin) so the LLM sees a
+    # complete bbox in the frame it is expected to emit children in.
+    parent_local = BoundingBox(origin=(0.0, 0.0, 0.0), dimensions=parent_bbox.dimensions)
     child_lines = "\n\n".join(
         f"""  - id={c.id!r}
     parent: {c.parent!r}
@@ -730,12 +743,12 @@ def render_zone_bbox_batch(
         for c in children
     )
     return f"""Parent id: {parent_id!r}
-Parent bbox: {parent_bbox.model_dump_json()}
+Parent bbox (in parent local frame, origin at parent's min corner): {parent_local.model_dump_json()}
 
 Children to place ({len(children)}):
 {child_lines}
 
-Produce a bbox for every child in a single coherent layout.
+Produce a bbox for every child in a single coherent layout. Emit every child bbox in the parent's local frame (the same frame the parent bbox above is expressed in).
 {_deepseek_suffix()}"""
 
 
@@ -882,6 +895,7 @@ The user message contains this zone's id, bbox, and plan, plus the scene context
 # guarantees field order and quoting are consistent so the LLM never has
 # to recover from inconsistent layouts mid-prompt.
 
+
 def _render_node_entry(
     *,
     nid: str,
@@ -946,9 +960,7 @@ def _render_ancestor_block(
         )
         for i, (aid, aprompt, aplan, abbox, aplacement) in enumerate(ancestors)
     ]
-    return _render_section(
-        "ANCESTOR_CHAIN", entries, "none — this is the root"
-    )
+    return _render_section("ANCESTOR_CHAIN", entries, "none — this is the root")
 
 
 def _render_zone_plan_block(zone_plan: str | None) -> str:
@@ -958,7 +970,9 @@ def _render_zone_plan_block(zone_plan: str | None) -> str:
 
 
 def _render_scene_lines(
-    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+    ],
 ) -> str:
     """Split the run-wide scene snapshot into two sections — <ZONES>
     (abstract regions, identified by `plan is not None`) and <OBJECTS>
@@ -1001,7 +1015,7 @@ def _render_retry_block(
         return ""
     attempt_lines = "\n\n".join(
         f"""  attempt {i}:
-    emitted: [{', '.join(s.model_dump_json() for s in specs)}]
+    emitted: [{", ".join(s.model_dump_json() for s in specs)}]
     rejected: {reason}"""
         for i, (specs, reason) in enumerate(prior_attempts)
     )
@@ -1019,7 +1033,9 @@ def render_anchor_decomp(
     zone_plan: str | None,
     zone_bbox: BoundingBox,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+    ],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
     return f"""You are the step in the SpatialBench pipeline responsible for determining the list of objects that define a certain region.
@@ -1057,7 +1073,9 @@ def render_encapsulating_decomp(
     zone_plan: str | None,
     zone_bbox: BoundingBox,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+    ],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
     return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following region. If the former, then your final output object list should just be empty.
@@ -1070,7 +1088,11 @@ the list of objects you output, if any, should work together to form a cohesive 
 
 Object should be individualistic - composite objects should be broken down into individual or partial objects (abstract fragments that are meant to combine into a more complex object) and placed accordingly, allowing for more granular control of the region's boundary. Objects and partial objects can be stacked, strung, pieced to form larger, cohesive sections for the perimeter. there is no limit on the number of objects in your output list - always prefer individual objects placed close to each other over a single composite object with a prompt to generate them together at once. if the region calls for it, we can have as high fidelity of a perimeter as we want. if a dense perimeter makes sense for the given region, then make it dense - as many objects as you see fit, their bounding boxes right next to each other. You are in control - do not rely on downstream generation steps to output composite geometry: organize your list of objects so that you are in direct control of positioning to form that composite geometry yourself using the individual partial objects.
 
-When generating the list of objects, keep in mind traversal between various regions both horizontally and vertically that might require more complex boundary objects made up of partial objects, keep in mind the semantic meaning of objects that allow passage. Using the scene context provided, carefully determine if passage is needed from this region to another, and if so, what kind of partial objects would be needed to piece together the complicated shapes that would allow that traversal. A good example of this is a wall in a building that has a door embedded within: the wall would be made of multiple rectanglular regions that when pieced together form an arch looking shape, with a door object filling that space in. Apply this same idea of leaving empty gaps or embedding other objects wherever it makes sense to do so. Pay especial attention to the context provided in the plan thes of other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Use this thinking to guide you in the generation and placement of your list of objects.
+When generating a list of objects, keep in mind connectives between this region and others, in all directions; using objects and partial objects to leave free space, semantically relevant transition objects, constructed composite structures, etc. The space should be realsitic and traversable. 
+
+If you need to embed free space or other objects within a greater bounding section for any purpose, piece objects and partial objects together like a puzzle around the gap or embed.
+
+Pay especial attention to the context provided in the plans of other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Use this thinking to guide you in the generation and placement of your list of objects.
 
 be wary of duplicate geometry - for two neighboring regions separated by some sort of divider, it is only necessary to generate the divider once. study the provided scene context to determine if generating something is necessary.
 </IMPORTANT_INSTRUCTIONS_ONLY_IF_BOUNDING_NEEDED>
@@ -1098,7 +1120,9 @@ def render_negative_space_decomp(
     zone_id: str,
     zone_plan: str | None,
     zone_bbox: BoundingBox,
-    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+    ],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
     return f"""Generate a list of objects that would cover the negative, unfilled space between the objects in the zone described below, based on the attached context.
@@ -1135,7 +1159,7 @@ The user message contains the zone id/prompt/bbox, a list of objects to place (e
 </input>
 
 <output>
-Respond with a single JSON object matching the schema: one `assignment` per object (id + bbox). Coordinates in meters under the canonical front view (+X right, +Y up, +Z front, -Z back), centimeter precision (multiples of 0.01). Use a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis. Emit exactly one assignment per requested object id — no extras, no omissions.
+Respond with a single JSON object matching the schema: one `assignment` per object (id + bbox). All bbox coordinates are in the ZONE'S LOCAL FRAME — origin (0,0,0) is the zone's minimum corner; the axes still follow the canonical front view (+X right, +Y up, +Z front, -Z back). Every bbox in the user message — the zone bbox AND every peer bbox — is already expressed in this same frame, so peers that sit far outside the zone may have negative components or components larger than the zone's extent. Emit every object bbox in this same frame and use centimeter precision (multiples of 0.01). Use a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis. Emit exactly one assignment per requested object id — no extras, no omissions.
 
 No prose, no markdown, no code fences.
 </output>
@@ -1151,11 +1175,17 @@ def render_object_bbox_batch(
     zone_prompt: str,
     zone_bbox: BoundingBox,
     objects: list[ObjectSpec],
-    peers: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
+    peers: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+    ],
 ) -> str:
+    # Render every bbox in the zone's local frame so the LLM emits child
+    # bboxes in that same frame; `to_world_frame(zone.bbox)` in
+    # generation._resolve_and_generate translates the emissions back.
+    zone_local = BoundingBox(origin=(0.0, 0.0, 0.0), dimensions=zone_bbox.dimensions)
     peer_lines = (
         "\n".join(
-            f"  - {pid}: prompt={pprompt!r} bbox={pbbox.model_dump_json()} proxy_shape={_render_proxy_shape(pproxy)} orientation={porient}deg parent={pparent!r} placement={pplacement!r}"
+            f"  - {pid}: prompt={pprompt!r} bbox={pbbox.to_local_frame(zone_bbox).model_dump_json()} proxy_shape={_render_proxy_shape(pproxy)} orientation={porient}deg parent={pparent!r} placement={pplacement!r}"
             for pid, pprompt, pbbox, pparent, pproxy, porient, pplacement, _pplan in peers
         )
         if peers
@@ -1174,15 +1204,15 @@ def render_object_bbox_batch(
     )
     return f"""Zone id: {zone_id!r}
 Zone prompt: {zone_prompt!r}
-Zone bbox: {zone_bbox.model_dump_json()}
+Zone bbox (in zone local frame, origin at zone's min corner): {zone_local.model_dump_json()}
 
 Objects to place ({len(objects)}):
 {object_lines}
 
-Peers already placed in the run:
+Peers already placed in the run (bboxes are in this zone's local frame; peers from other zones may have negative or out-of-extent components):
 {peer_lines}
 
-Produce a bbox for every object in a single coherent layout.
+Produce a bbox for every object in a single coherent layout. Emit every object bbox in the zone's local frame (the same frame the zone and peer bboxes above are expressed in).
 {_deepseek_suffix()}"""
 
 
@@ -1362,7 +1392,9 @@ def render_next_object(
     zone_plan: str | None,
     zone_bbox: BoundingBox,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+    ],
     prior_attempts: list[tuple[ObjectSpec, str]] | None = None,
 ) -> str:
     ancestor_block = _render_ancestor_block(ancestors)

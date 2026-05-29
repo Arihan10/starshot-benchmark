@@ -31,7 +31,8 @@ SLOTS: list[Slot] = [
     Slot("campsite", "A campsite in the middle of a forest"),
     Slot("desert", "a desert landscape"),
     Slot("campsites", "three family campsites in an open field"),
-    Slot("outer space", "a planetary system")
+    Slot("outer space", "a planetary system"),
+    Slot("suburban home", "a traditional two-story suburban house")
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
@@ -45,7 +46,7 @@ MODELS: dict[str, str] = {
     "gpt": "openai/gpt-5.5",
     "opus": "anthropic/claude-opus-4.6",
     "deepseek": "deepseek/deepseek-v4-pro",
-    "opus-new": "anthropic/claude-opus-4.8-fast"
+    "opus-new": "anthropic/claude-opus-4.8"
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())

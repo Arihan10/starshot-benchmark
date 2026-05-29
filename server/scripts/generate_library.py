@@ -60,7 +60,7 @@ from app.utils.logging import SlotLog  # noqa: E402
 
 _DEFAULT_CSV = _SERVER_DIR / "dry_runs" / "asset_library_v3.csv"
 _DEFAULT_OUTPUT_DIR = _SERVER_DIR / "app" / "assets_library"
-MODEL = "google/gemini-3.5-flash"
+MODEL = "google/gemini-3.1-flash-lite"
 MAX_CONCURRENT = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_S = 5.0

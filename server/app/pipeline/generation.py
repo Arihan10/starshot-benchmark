@@ -272,7 +272,10 @@ async def _resolve_and_generate(
         node_id=zone.id,
         step="object_bbox_batch",
     )
-    bboxes = {a.id: a.bbox for a in out.assignments}
+    # LLM emits bboxes in the zone's local frame (origin at
+    # zone.bbox.min_corner, same canonical axes). Translate back to
+    # world coordinates before handing them downstream.
+    bboxes = {a.id: a.bbox.to_world_frame(zone.bbox) for a in out.assignments}
 
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(

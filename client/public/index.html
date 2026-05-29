@@ -85,7 +85,8 @@
             .slot-dot.status-error   { background: #ff8080; }
             .slot-dot.status-paused  { background: #e09050; }
             .slot-dot.status-idle    { background: #5a5e68; }
-            #model-picker {
+            #model-picker,
+            #run-picker {
                 margin-left: 4px;
                 padding: 4px 8px;
                 border-radius: 4px;
@@ -96,12 +97,34 @@
                 font-size: 11px;
                 cursor: pointer;
             }
-            #model-picker:hover {
+            #model-picker:hover,
+            #run-picker:hover {
                 border-color: #4a8fd8;
             }
-            #model-picker:focus {
+            #model-picker:focus,
+            #run-picker:focus {
                 outline: none;
                 border-color: #4a8fd8;
+            }
+            #run-new {
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #run-new:hover:not(:disabled) {
+                background: #1c2a36;
+                border-color: #4a8fd8;
+                color: #c8d8f0;
+            }
+            #run-new:disabled {
+                opacity: 0.5;
+                cursor: default;
             }
             #slot-reset {
                 margin-left: auto;
@@ -1824,6 +1847,8 @@
             <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
             <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
             <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>
+            <select id="run-picker" title="Switch the active run (versioned directory under /runs). Each run is an independent set of (slot, model) cells with its own prompt snapshot."></select>
+            <button id="run-new" type="button" title="Create a new run. Snapshots the current prompts.py into runs/<name>/prompts_snapshot.py and switches to it.">+ new run</button>
             <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
             <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
             <button id="slot-resume" type="button" style="display:none">resume</button>
