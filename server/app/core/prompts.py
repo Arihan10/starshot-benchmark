@@ -166,9 +166,9 @@ think deeply about the 3D scene, environment or level you want to build from thi
 
 write directly and consider every part carefully. you are only the first, overall planning step - your plan will go through hundreds of further downstream steps where it is expanded on and transformed as the AI pipeline to construct it propagates further planning by depth. define the scene itself, its top-level shape and character enough that the downstream steps have agency over their individual sections while also forming ideas of what to build. 
 
-only the final output of the 3D geometry for the scene itself will be judged once the pipeline is finished; your prompt itself will NEVER be shown to the judges, it will only serve as a base to build upon. 
+only the final output of the 3D geometry for the scene itself will be judged once the pipeline is finished; your prompt itself will NEVER be shown to the judges, it will only serve as a base to build upon. the narrative you construct, while creative, should not deviate from the original prompt - the judges should be able to look at the final scene and still call it "{zone_prompt}".
 
-DO NOT be overly specific - remember, your prompt will NOT be converted directly into 3D geometry, it will undergo hundreds of expansion and detail steps before reaching any generation steps, so structure your output such that it is a base that the downstream tree of pipeline steps can build upon it. given a prompt for a building, a bad output provides exact instruction on what it looks like; a good prompt defines the narrative premise for the scene, the scope of the environment, the building's character and type, the surrounding environment, points that may implicitly be expanded, and a top-level shape for the scene itself without explicitly shaping the entities that form it.
+In your plan, DO NOT be overly specific - remember, your prompt will NOT be converted directly into 3D geometry, it will undergo hundreds of expansion and detail steps before reaching any generation steps, so structure your output such that it is a base that the downstream tree of pipeline steps can build upon it. given a prompt for a building, a bad output provides exact instruction on what it looks like; a good prompt defines the narrative premise for the scene, the scope of the environment, the building's character and type, the surrounding environment, points that may implicitly be expanded, and a top-level shape for the scene itself without explicitly shaping the entities that form it.
 
 plan differently based on the prompt given and infer the purpose - e.g for a house, you might plan the aforementioned details for the overall scene scope, general architectural, narrative and character; for a super mario platformer level, you might focus on the narrative section, features, progression, zones, mechanics, etc.; for a top-down swamp frogger level without a specific game mentioned, you might focus on first building out the game's premise internally given the more abstract request, and then establish the world, general layout, character, mechanics, scope, item types, objectives, etc. 
 
@@ -776,6 +776,10 @@ class ObjectDecompOutput(BaseModel):
     # event log (visible in the observability view) but dropped before
     # downstream pipeline steps.
     bound_existing: list[BoundExistingFrame] = Field(default_factory=list)
+    # Encapsulating-only gate: if False, the zone needs no bounding
+    # perimeter and `objects` is ignored even when non-empty. Anchor and
+    # negative-space decompositions ignore this field.
+    bounding_required: bool = True
 
 
 # Shared output schema + additional_context for the three object
@@ -794,6 +798,7 @@ Respond with a single JSON object containing:
   - `placement` (string): prose describing WHERE this object sits — position within / on / against the parent, plus alignment to any referenced peers.
   - `referenced_ids` (list of {{target, kind}}): OPTIONAL secondary relationships when placement text refers to nodes other than the parent. Each entry: `target` (peer's id) and `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine.
 - `bound_existing` (list): used only by the encapsulating step (anchor and negative-space leave this empty). Each entry has `plan_element` (the plan's noun phrase verbatim) and `peer_id` (the id of an existing node that already satisfies it).
+- `bounding_required` (bool): used only by the encapsulating step (anchor and negative-space leave this as the default `true`). Set to `false` when the region needs no bounding perimeter at all — `objects` is then ignored downstream even if non-empty. Set to `true` when at least one bounding object is being emitted.
 
 No additional prose, markdown, or code fences.
 </output>
@@ -825,7 +830,9 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are defining a list of objects that represent the perimeter of the given region, ONLY if needed.
+You are deciding whether the given region requires any bounding objects to make up its perimeter.
+
+If and ONLY if so, you are to output a list of objects that represent the perimeter of the given region.
 </role>
 
 <input>
@@ -1053,17 +1060,22 @@ def render_encapsulating_decomp(
     scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
-    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following region.
+    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following region. If the former, then your final output object list should just be empty.
 
 {_render_zone_plan_block(zone_plan)}
+Think very carefully about whether the given region actually needs any bounding objects. Reason about the structure of the region, whether it is closed vs. open, and the narrative in its plan. Not every region necessarily needs to have any bounding objects: only do so when it absolutely makes sense to do so.
 
-The list of objects should work together to form a cohesive perimeter or partial perimeter of any arbitrary shape. The purpose of this list of objects is to form a sense of boundary for the given region in every dimension that makes sense based on its plan - perimeter does not necessarily mean in the horizontal axis but in all possible directions, including the vertical direction (e.g. bases, covers). In this case, perimeter or boundary does not automatically imply physically bounding the region on all sides (though depending on the region's plan, that may be the case). You should think carefully and reason spatially about what objects should go in this list to form a well-defined, physically and narratively reasonable boundary for the zone. You are in a canvas that contains only the objects listed below in the scene context - do not assume any models, foundations, ground, etc. exist outside the provided scene context.
+<IMPORTANT_INSTRUCTIONS_ONLY_IF_BOUNDING_NEEDED>
+the list of objects you output, if any, should work together to form a cohesive perimeter or partial perimeter of any arbitrary shape. The purpose of this list of objects is to form a sense of boundary for the given region in every dimension that makes sense based on its plan - perimeter does not necessarily mean in the horizontal axis but in all possible directions, including the vertical direction (e.g. bases, covers). In this case, perimeter or boundary does not automatically imply physically bounding the region on all sides (though depending on the region's plan, that may be the case). You should think carefully and reason spatially about what objects should go in this list to form a well-defined, physically and narratively reasonable boundary for the zone. You are in a canvas that contains only the objects listed below in the scene context - do not assume any models, foundations, ground, etc. exist outside the provided scene context.
 
 Object should be individualistic - composite objects should be broken down into individual or partial objects (abstract fragments that are meant to combine into a more complex object) and placed accordingly, allowing for more granular control of the region's boundary. Objects and partial objects can be stacked, strung, pieced to form larger, cohesive sections for the perimeter. there is no limit on the number of objects in your output list - always prefer individual objects placed close to each other over a single composite object with a prompt to generate them together at once. if the region calls for it, we can have as high fidelity of a perimeter as we want. if a dense perimeter makes sense for the given region, then make it dense - as many objects as you see fit, their bounding boxes right next to each other. You are in control - do not rely on downstream generation steps to output composite geometry: organize your list of objects so that you are in direct control of positioning to form that composite geometry yourself using the individual partial objects.
 
 When generating the list of objects, keep in mind traversal between various regions both horizontally and vertically that might require more complex boundary objects made up of partial objects, keep in mind the semantic meaning of objects that allow passage. Using the scene context provided, carefully determine if passage is needed from this region to another, and if so, what kind of partial objects would be needed to piece together the complicated shapes that would allow that traversal. A good example of this is a wall in a building that has a door embedded within: the wall would be made of multiple rectanglular regions that when pieced together form an arch looking shape, with a door object filling that space in. Apply this same idea of leaving empty gaps or embedding other objects wherever it makes sense to do so. Pay especial attention to the context provided in the plan thes of other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Use this thinking to guide you in the generation and placement of your list of objects.
 
 be wary of duplicate geometry - for two neighboring regions separated by some sort of divider, it is only necessary to generate the divider once. study the provided scene context to determine if generating something is necessary.
+</IMPORTANT_INSTRUCTIONS_ONLY_IF_BOUNDING_NEEDED>
+
+Output bounding_required = False if no bounding objects are needed. Otherwise, set bounding_required = True and objects to be the list of bounding objects.
 
 <scene_context>
 {_SCENE_CONTEXT_INTRO}

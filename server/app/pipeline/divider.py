@@ -1,28 +1,31 @@
 """Phase 1 — recursive top-down decomposition into a tree of zone Nodes.
 
-Flow per node:
-  1. ZONE PLAN (LLM) — high-level character/intent for this zone AND the
-     is_atomic decision. Runs for EVERY zone, root included; the root's
-     plan IS the scene plan.
-  2. (root only) Overall bounding box (LLM) — sizes the canvas to match
-     the silhouette implied by the root's plan.
+Per-node flow:
+  1. ZONE PLAN (LLM) — high-level character/intent AND the is_atomic
+     decision. Authored at the parent level (before this zone's
+     encapsulating pass) so the plan paragraph is in scope when its
+     own shell is generated. Root is planned in `run()` before
+     `_build(root)`.
+  2. (root only) Overall bounding box (LLM) — sizes the canvas to the
+     silhouette implied by the root's plan.
   3. If ATOMIC, hand to Phase 2 generation for anchor-object population.
-  4. ZONE DECOMPOSE (LLM) — only for non-atomic zones. Emits each child
-     fully structured (id, prompt, proxy_shape, relationships) in one
-     call. The sibling-relationship DAG is checked for cycles; any cycle
-     is logged and accepted (advisory).
+  4. ZONE DECOMPOSE (LLM) — non-atomic zones only. Emits each child as
+     a seed (id, prompt, proxy_shape, relationships) in one call. The
+     sibling-relationship DAG is checked for cycles; any cycle is
+     logged and accepted (advisory).
   5. Batch-resolve a bbox for EVERY child in one LLM call.
-  6. Hand each placed child to Phase 2 generation for its encapsulating
-     geometry (walls, moat, fence, etc.) as objects.
-  7. Recurse on each child. Children arrive with `plan=None`; step 1
-     authors their plan fresh.
+  6. For each placed child, in declaration order: author the child's
+     plan (LLM), run its encapsulating pass with the plan in scope,
+     then recurse. Interleaving ensures the shell author sees the
+     child's own structural intent (vertical penetrations, voids,
+     double-height spaces) rather than only the one-sentence seed.
 
 Root also gets an encapsulating pass — its world-scale boundary. When
-root is non-atomic, it runs immediately after root's children are
-placed and before their per-child encapsulating passes, so the world
-boundary is in the scene context every child frame sees. When root is
-atomic, it runs before root's anchor pass for the same reason. Root
-additionally gets a final negative-space pass at the end of the run.
+root is non-atomic, it runs after root's children are placed and
+before any child's plan-encap-recurse iteration, so the world
+boundary is in the scene context every child sees. When root is
+atomic, it runs before root's anchor pass. Root additionally gets a
+final negative-space pass at the end of the run.
 """
 
 from __future__ import annotations
@@ -216,27 +219,9 @@ async def _resolve_child_bboxes_batch(
 
 async def _build(
     *, node: Node, runs_dir: Path, run_id: str, all_nodes: list[Node],
-    is_atomic: bool | None = None,
+    is_atomic: bool,
 ) -> None:
-    if node.plan is None:
-        logging.emit_step(node.id, "planning")
-        plan_out = await _plan_zone(
-            zone_id=node.id,
-            zone_prompt=node.prompt,
-            ancestors=_ancestors(node, all_nodes),
-            objects=_generated_objects(all_nodes),
-        )
-        planned = node.model_copy(update={"plan": plan_out.plan})
-        idx = all_nodes.index(node)
-        all_nodes[idx] = planned
-        node = planned
-        is_atomic = plan_out.is_atomic
-        logging.log(
-            "divider.zone_plan",
-            node=node.id, plan=plan_out.plan, is_atomic=is_atomic,
-        )
-
-    assert is_atomic is not None, "is_atomic must be set by plan or caller"
+    assert node.plan is not None, "node.plan must be set by caller"
 
     if is_atomic:
         if node.parent_id is None:
@@ -311,16 +296,31 @@ async def _build(
         )
 
     for child in placed:
-        logging.emit_step(child.id, "generating_frame")
-        await generation.run(
-            zone=child, runs_dir=runs_dir, run_id=run_id,
-            scenario="encapsulating", all_nodes=all_nodes,
+        logging.emit_step(child.id, "planning")
+        plan_out = await _plan_zone(
+            zone_id=child.id,
+            zone_prompt=child.prompt,
             ancestors=_ancestors(child, all_nodes),
+            objects=_generated_objects(all_nodes),
+        )
+        planned = child.model_copy(update={"plan": plan_out.plan})
+        idx = all_nodes.index(child)
+        all_nodes[idx] = planned
+        logging.log(
+            "divider.zone_plan",
+            node=planned.id, plan=plan_out.plan, is_atomic=plan_out.is_atomic,
         )
 
-    for child in placed:
+        logging.emit_step(planned.id, "generating_frame")
+        await generation.run(
+            zone=planned, runs_dir=runs_dir, run_id=run_id,
+            scenario="encapsulating", all_nodes=all_nodes,
+            ancestors=_ancestors(planned, all_nodes),
+        )
+
         await _build(
-            node=child, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes,
+            node=planned, runs_dir=runs_dir, run_id=run_id,
+            all_nodes=all_nodes, is_atomic=plan_out.is_atomic,
         )
     logging.emit_step(node.id, "done")
 

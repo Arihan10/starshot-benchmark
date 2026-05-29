@@ -144,6 +144,12 @@ async def _decompose_objects_validated(
             node_id=zone.id,
             step=f"{scenario.replace('-', '_')}_decompose",
         )
+        if scenario == "encapsulating" and not out.bounding_required:
+            logging.log(
+                "generation.decompose.no_bounding",
+                zone=zone.id, emitted=[s.model_dump() for s in out.objects],
+            )
+            return []
         specs = list(out.objects)
         try:
             validate_referenced_ids(specs, parent_id=zone.id, existing_ids=existing_ids)
