@@ -63,7 +63,7 @@ from app.core.prompts import (
     render_object_bbox_batch,
     wrap_image_prompt,
 )
-from app.core.types import BoundingBox, Node, Orientation, ProxyShape
+from app.core.types import BoundingBox, Node, Orientation, ParentRelationshipKind, ProxyShape
 from app.services import llm, nano_banana, threed
 from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
@@ -103,6 +103,7 @@ async def _decompose_objects_validated(
     prior_attempts: list[tuple[list[ObjectSpec], str]] = []
     existing_ids = {n.id for n in all_nodes}
     scene = _scene_view(all_nodes)
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
     specs: list[ObjectSpec] = []
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
         if scenario == "anchor":
@@ -114,6 +115,7 @@ async def _decompose_objects_validated(
                 ancestors=ancestors,
                 scene=scene,
                 prior_attempts=prior_attempts,
+                bbox_by_id=bbox_by_id,
             )
         elif scenario == "encapsulating":
             system = SYSTEM_ENCAPSULATING_DECOMP
@@ -124,11 +126,9 @@ async def _decompose_objects_validated(
                 ancestors=ancestors,
                 scene=scene,
                 prior_attempts=prior_attempts,
+                bbox_by_id=bbox_by_id,
             )
         else:
-            # negative-space mode: scene (via _render_scene_lines) already
-            # splits into <ZONES> + <OBJECTS> across every node in the run,
-            # so the explicit zone-list is redundant.
             system = SYSTEM_NEGATIVE_SPACE_DECOMP
             user = render_negative_space_decomp(
                 zone_id=zone.id,
@@ -136,6 +136,7 @@ async def _decompose_objects_validated(
                 zone_bbox=zone.bbox,
                 scene=scene,
                 prior_attempts=prior_attempts,
+                bbox_by_id=bbox_by_id,
             )
         out = await llm.call_llm(
             system=system,
@@ -180,6 +181,7 @@ async def _next_object_validated(
     prior_attempts: list[tuple[ObjectSpec, str]] = []
     existing_ids = {n.id for n in all_nodes}
     scene = _scene_view(all_nodes)
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
     decision: NextObjectOutput | None = None
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
         decision = await llm.call_llm(
@@ -191,6 +193,7 @@ async def _next_object_validated(
                 ancestors=ancestors,
                 scene=scene,
                 prior_attempts=prior_attempts,
+                bbox_by_id=bbox_by_id,
             ),
             output_schema=NextObjectOutput,
             node_id=zone.id,
@@ -259,6 +262,10 @@ async def _resolve_and_generate(
     admitted.update(seen_in_call)
     specs = deduped
 
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
+    parent_kind_by_id: dict[str, ParentRelationshipKind | None] = {
+        n.id: n.parent_kind for n in all_nodes
+    }
     out = await llm.call_llm(
         system=SYSTEM_OBJECT_BBOX_BATCH,
         user=render_object_bbox_batch(
@@ -267,15 +274,43 @@ async def _resolve_and_generate(
             zone_bbox=zone.bbox,
             objects=specs,
             peers=_scene_view(all_nodes),
+            bbox_by_id=bbox_by_id,
+            parent_kind_by_id=parent_kind_by_id,
         ),
         output_schema=BboxBatchOutput,
         node_id=zone.id,
         step="object_bbox_batch",
     )
-    # LLM emits bboxes in the zone's local frame (origin at
-    # zone.bbox.min_corner, same canonical axes). Translate back to
-    # world coordinates before handing them downstream.
-    bboxes = {a.id: a.bbox.to_world_frame(zone.bbox) for a in out.assignments}
+    # LLM emits each object's bbox in that object's parent's local
+    # frame. Convert to world coordinates per-object. Handle
+    # intra-batch parents (spec B parents to spec A in same batch) via
+    # topological resolution order.
+    spec_parent = {s.id: s.parent for s in specs}
+    assignments_by_id = {a.id: a.bbox for a in out.assignments}
+    bboxes: dict[str, BoundingBox] = {}
+    # Resolve in passes: each pass converts objects whose parent bbox
+    # is already known. Terminates when all are resolved or no progress
+    # (cycle — fall back to zone frame).
+    remaining = set(assignments_by_id.keys())
+    while remaining:
+        progress = False
+        for obj_id in list(remaining):
+            parent_id = spec_parent.get(obj_id, zone.id)
+            if parent_id in bboxes:
+                parent_bbox = bboxes[parent_id]
+            elif parent_id in bbox_by_id:
+                parent_bbox = bbox_by_id[parent_id]
+            elif parent_id in remaining:
+                continue
+            else:
+                parent_bbox = zone.bbox
+            bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
+            remaining.discard(obj_id)
+            progress = True
+        if not progress:
+            for obj_id in list(remaining):
+                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
+            remaining.clear()
 
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(

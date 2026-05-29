@@ -155,6 +155,7 @@ async def _plan_zone(
     zone_prompt: str,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
     objects: list[tuple[str, str, str | None, BoundingBox, str | None]],
+    bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> ZonePlanOutput:
     """Author the high-level plan for a zone and decide whether it is atomic.
     Works for any zone (root or nested) — the root just passes empty ancestors."""
@@ -166,6 +167,7 @@ async def _plan_zone(
             zone_prompt=zone_prompt,
             ancestors=ancestors,
             objects=objects,
+            bbox_by_id=bbox_by_id,
         ),
         output_schema=ZonePlanOutput,
         node_id=zone_id,
@@ -181,6 +183,7 @@ async def _decompose_zone(
     assert node.plan is not None, "zone must be planned before decomposition"
     root = all_nodes[0]
     assert root.plan is not None, "root.plan must be set before decomposition"
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
     return await llm.call_llm(
         system=SYSTEM_ZONE_DECOMPOSE,
         user=render_zone_decompose(
@@ -193,6 +196,7 @@ async def _decompose_zone(
             scene_prompt=root.prompt,
             scene_plan=root.plan,
             prior_zones=_prior_zones(all_nodes),
+            bbox_by_id=bbox_by_id,
         ),
         output_schema=ZoneDecomposeOutput,
         node_id=node.id,
@@ -201,23 +205,49 @@ async def _decompose_zone(
 
 
 async def _resolve_child_bboxes_batch(
-    *, parent: Node, children: list[ChildNodeSpec],
+    *, parent: Node, children: list[ChildNodeSpec], all_nodes: list[Node],
 ) -> dict[str, BoundingBox]:
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
+    bbox_by_id[parent.id] = parent.bbox
     out = await llm.call_llm(
         system=SYSTEM_ZONE_BBOX_BATCH,
         user=render_zone_bbox_batch(
             parent_id=parent.id,
             parent_bbox=parent.bbox,
             children=children,
+            bbox_by_id=bbox_by_id,
         ),
         output_schema=BboxBatchOutput,
         node_id=parent.id,
         step="child_bbox_batch",
     )
-    # LLM emits bboxes in the parent's local frame (origin at
-    # parent.min_corner, same canonical axes). Translate back to world
-    # coordinates before handing them downstream.
-    return {a.id: a.bbox.to_world_frame(parent.bbox) for a in out.assignments}
+    # LLM emits each child's bbox in that child's parent's local frame.
+    # Convert to world coordinates per-child with topological ordering
+    # for intra-batch parents (child B parents to child A in same batch).
+    spec_parent = {c.id: c.parent for c in children}
+    assignments_by_id = {a.id: a.bbox for a in out.assignments}
+    bboxes: dict[str, BoundingBox] = {}
+    remaining = set(assignments_by_id.keys())
+    while remaining:
+        progress = False
+        for child_id in list(remaining):
+            parent_id = spec_parent.get(child_id, parent.id)
+            if parent_id in bboxes:
+                parent_bbox_resolved = bboxes[parent_id]
+            elif parent_id in bbox_by_id:
+                parent_bbox_resolved = bbox_by_id[parent_id]
+            elif parent_id in remaining:
+                continue
+            else:
+                parent_bbox_resolved = parent.bbox
+            bboxes[child_id] = assignments_by_id[child_id].to_world_frame(parent_bbox_resolved)
+            remaining.discard(child_id)
+            progress = True
+        if not progress:
+            for child_id in list(remaining):
+                bboxes[child_id] = assignments_by_id[child_id].to_world_frame(parent.bbox)
+            remaining.clear()
+    return bboxes
 
 
 async def _build(
@@ -265,7 +295,7 @@ async def _build(
 
     logging.emit_step(node.id, "resolving_bboxes", parent=node.id)
     bboxes = await _resolve_child_bboxes_batch(
-        parent=node, children=decomp.children,
+        parent=node, children=decomp.children, all_nodes=all_nodes,
     )
 
     placed: list[Node] = []
@@ -305,6 +335,7 @@ async def _build(
             zone_prompt=child.prompt,
             ancestors=_ancestors(child, all_nodes),
             objects=_generated_objects(all_nodes),
+            bbox_by_id={n.id: n.bbox for n in all_nodes},
         )
         planned = child.model_copy(update={"plan": plan_out.plan})
         idx = all_nodes.index(child)
