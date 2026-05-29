@@ -17,11 +17,12 @@ Flow per node:
   7. Recurse on each child. Children arrive with `plan=None`; step 1
      authors their plan fresh.
 
-Root also gets an encapsulating pass — its world-scale boundary —
-which runs immediately after root's children are placed and before
-their per-child encapsulating passes, so the world boundary is in the
-scene context every child frame sees. Root additionally gets a final
-negative-space pass at the end of the run.
+Root also gets an encapsulating pass — its world-scale boundary. When
+root is non-atomic, it runs immediately after root's children are
+placed and before their per-child encapsulating passes, so the world
+boundary is in the scene context every child frame sees. When root is
+atomic, it runs before root's anchor pass for the same reason. Root
+additionally gets a final negative-space pass at the end of the run.
 """
 
 from __future__ import annotations
@@ -238,6 +239,13 @@ async def _build(
     assert is_atomic is not None, "is_atomic must be set by plan or caller"
 
     if is_atomic:
+        if node.parent_id is None:
+            logging.emit_step(node.id, "generating_frame")
+            await generation.run(
+                zone=node, runs_dir=runs_dir, run_id=run_id,
+                scenario="encapsulating", all_nodes=all_nodes,
+                ancestors=_ancestors(node, all_nodes),
+            )
         logging.emit_step(node.id, "generating_anchor")
         await generation.run(
             zone=node, runs_dir=runs_dir, run_id=run_id,

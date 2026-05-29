@@ -54,6 +54,22 @@ Valid values:
 
 ON-RELATIONSHIP CONSEQUENCE. When you anchor a node ON a target with a non-BOX proxy, the AABB's top face is NOT the resting surface. Compute the target's Y_top at the anchored node's XZ centre using the target's AABB and the formula above, then set the anchored node's bbox so its bottom face Y equals Y_top. Example: a 0.8m tree placed ON a HEMISPHERE island whose AABB is (x_min=-5, y_min=0, z_min=-5) → (x_max=5, y_max=1.2, z_max=5), at XZ = (3, 0), rests at Y_top = 0 + 1.2·√(1 − 0.36) = 0.96, so its bbox spans y ∈ [0.96, 1.76] — NOT [1.20, 2.00]. Getting this wrong leaves the tree visibly floating or sunk. For BOX targets the rule collapses to the familiar "bottom face at y_max"."""
 
+DEEPSEEK_INJECTION = """
+<IMPORTANT_THINKING>
+Be very opinionated in your thinking - do not go around in circles. Once a conclusion is reached, stick to it. Aim to end reasoning as soon as a concrete plan has been formed.
+</IMPORTANT_THINKING>
+"""
+
+
+def _deepseek_suffix() -> str:
+    # DeepSeek's reasoning tends to spiral; the injected blurb pins it
+    # to a concrete plan. Local import avoids a cycle at module load.
+    from app.services.llm import _current_model
+    model = _current_model.get()
+    if model and "deepseek" in model.lower():
+        return DEEPSEEK_INJECTION
+    return ""
+
 
 def _render_proxy_shape(p: ProxyShape | None) -> str:
     return p.value if p is not None else "BOX"
@@ -186,7 +202,7 @@ before ANY output, remember to think HARD and DEEPLY and ALWAYS provide a detail
 
 in the interest of winning, always start by thinking of the overall narrative and premise such that you provide the option for the pipeline to eventually build something truly impressive enough to stand out creatively from all the other LLMs.
 </thinking>
-"""
+{_deepseek_suffix()}"""
 
     # Nested zones use adapted competitive prompt format
     ancestor_block = _render_ancestor_block(ancestors)
@@ -252,7 +268,8 @@ The following objects are already fixed in the world. Refer to them by what they
 <scene_context>
 {obj_block}
 </scene_context>
-</thinking>"""
+</thinking>
+{_deepseek_suffix()}"""
 
 
 # ---------- Step 2: overall bbox --------------------------------------------
@@ -287,7 +304,8 @@ def render_overall_bbox(user_prompt: str, scene_plan: str) -> str:
 SCENE PLAN (authored upstream — size the canvas to match its implied silhouette):
 {scene_plan}
 
-Produce the overall bounding box for the whole scene."""
+Produce the overall bounding box for the whole scene.
+{_deepseek_suffix()}"""
 
 
 # ---------- Step 3: zone decompose (atomic vs subzones; runs after plan) ----
@@ -620,14 +638,14 @@ def render_zone_decompose(
         prior_zones=prior_zones,
         objects=objects,
     )
-    return f"""You are the step in the SpatialBench pipeline responsible for breaking down a given area into its top-level subregions, enriching the scene's detailedness in terms of both narrative and physical architecture. Generate a list of subzones that should be present in the following scene, based on its description:
+    return f"""You are the step in the SpatialBench pipeline responsible for breaking down a given area into its top-level subregions. Generate a list of subareas that should be present in the following scene, based on its description:
 
 {zone_plan}
 
 <IMPORTANT_INSTRUCTIONS>
 
 <ZONE_SPLITTING_GUIDANCE>
-A subzone is an area of spatial interest whose bounding box sits within the parent bounding box and can be treated individually as its own region due to a combination of physical and narrative reasons.
+A subzone is an area of spatial interest whose bounding box sits within the parent bounding box and can be treated individually as its own region due to a combination of physical and narrative reasons. The goal of subzones is to guide downstream steps so they can focus on just one area and use the rest as context, allowing for more fleshed-out designs and scenes.
 
 Subzones can keep decomposing into more zones recursively in subsequent passes, or end there as atomic leaves if that is appropriate. so always decompose at the TOP MOST LEVEL of the current zone — e.g. for a house scene with backyard, driveway, and house, do not skip straight to backyard-pool zone, backyard-grass zone, house-basement, house-first-floor, etc.; decompose into "the house", "the backyard", "the driveway" as top-level children, and let the next recursion split the house into floors and the backyard into pool and grass. the same principle holds everywhere: emit only the zones that exist at THIS level of the hierarchy, and trust the recursive planning + decompose passes underneath each of them to handle the next layer down.
 </ZONE_SPLITTING_GUIDANCE>
@@ -646,7 +664,8 @@ PARENT_ID (the zone being decomposed): {zone_id!r}
 Zone prompt: "{zone_prompt}"
 Zone bbox (axis-aligned, meters): {zone_bbox.model_dump_json()}
 
-</SCENE_CONTEXT>"""
+</SCENE_CONTEXT>
+{_deepseek_suffix()}"""
 
 
 # ---------- Step 4: zone bbox batch resolution (all siblings at once) -------
@@ -716,7 +735,8 @@ Parent bbox: {parent_bbox.model_dump_json()}
 Children to place ({len(children)}):
 {child_lines}
 
-Produce a bbox for every child in a single coherent layout."""
+Produce a bbox for every child in a single coherent layout.
+{_deepseek_suffix()}"""
 
 
 # ---------- Step 5: object decomposition (Phase 2) --------------------------
@@ -995,14 +1015,19 @@ def render_anchor_decomp(
     scene: list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
-    return f"""Generate a list of defining anchor objects that make the zone described below unmistakably what it is, based on the attached context and zone plan. This zone is the lowest possible breakdown level: no other subzones can exist within, so it is defined by the anchor objects you are responsible for generating. Although the plan will be specific, the objects that the plan mentions may not be the end all be all: you should extrapolate meaning from the plan and higher-level ideas communicated in the ancestor chain to populate and style the objects in the list you generate based on a narrative understanding of the scene. Each object should be treated atomically, in the sense that collections of objects should be broken down into individual objects that allow more granular, precise positioning by you instead of relying on the outputted model's shape of downstream generation steps.
+    return f"""You are the step in the SpatialBench pipeline responsible for determining the list of objects that define a certain region.
+
+Generate a list of defining anchor objects that make the region described below unmistakably what it is:
+
+{_render_zone_plan_block(zone_plan)}
+
+This region is the lowest possible breakdown level: no other subareas can exist within, so it is defined by the anchor objects you are responsible for generating. Although the above plan is specific, the objects that the plan mentions may not be the end all be all - you should extrapolate meaning from the plan and higher-level ideas communicated in the ancestor chain to populate and style the objects in the list you generate based on a narrative understanding of the scene. Each object should be treated atomically, in the sense that collections of objects should be broken down into individual objects that allow more granular, precise positioning by you instead of relying on the outputted model's shape of downstream generation steps. Object count is not a concern: always split pairs, groups, or collections of objects into individual objects positioned in the way you deem fit.
 
 <scene_context>
 {_SCENE_CONTEXT_INTRO}
 
 ZONE_ID: {zone_id!r}
 Zone bbox: {zone_bbox.model_dump_json()}
-{_render_zone_plan_block(zone_plan)}
 
 {_render_ancestor_block(ancestors)}
 
@@ -1015,7 +1040,8 @@ The concept of a parent should be grounded in a concrete, physical relationship,
 Each anchor object in your resultant list has an id, prompt, parent (the structural anchor id — the zone, a ground/shell peer from the encapsulating pass, or another object in this list), parent_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: `ON` for resting on an outward surface, `ATTACHED` for wall/ceiling/face mounts, `IN` for free containment inside the parent's volume — BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for secondary relationships your placement text mentions; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: anchor onto any ground/shell peer already placed by the encapsulating pass, do not duplicate geometry another zone has already emitted. Anchor objects are expected to live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified — the object remains semantically part of this zone even though its geometry overhangs. Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry. In your final output, each object's placement text should be direct and parametric. Avoid flowery language that states the narrative purpose of the positioning. Do not state the abstract reason of the positioning, only details that ground the position concretely. The position description should be absolute and succinct, leaving no creative liberty for the downstream constraint solver.
 </output_guidance>
 
-{_render_retry_block(prior_attempts)}"""
+{_render_retry_block(prior_attempts)}
+{_deepseek_suffix()}"""
 
 
 def render_encapsulating_decomp(
@@ -1031,11 +1057,11 @@ def render_encapsulating_decomp(
 
 {_render_zone_plan_block(zone_plan)}
 
-The list of objects should work together to form a cohesive perimeter or partial perimeter of any arbitrary shape. The purpose of this list of objects is to form a sense of boundary for the given region in every dimension that makes sense based on its plan - perimeter does not necessarily mean in the horizontal axis but in all possible directions, including the vertical direction (e.g. bases, covers). In this case, perimeter or boundary does not automatically imply physically bounding the region on all sides (though depending on the region's plan, that may be the case). You should think carefully and reason spatially about what objects should go in this list to form a well-defined, physically and narratively reasonable boundary for the zone.
+The list of objects should work together to form a cohesive perimeter or partial perimeter of any arbitrary shape. The purpose of this list of objects is to form a sense of boundary for the given region in every dimension that makes sense based on its plan - perimeter does not necessarily mean in the horizontal axis but in all possible directions, including the vertical direction (e.g. bases, covers). In this case, perimeter or boundary does not automatically imply physically bounding the region on all sides (though depending on the region's plan, that may be the case). You should think carefully and reason spatially about what objects should go in this list to form a well-defined, physically and narratively reasonable boundary for the zone. You are in a canvas that contains only the objects listed below in the scene context - do not assume any models, foundations, ground, etc. exist outside the provided scene context.
 
 Object should be individualistic - composite objects should be broken down into individual or partial objects (abstract fragments that are meant to combine into a more complex object) and placed accordingly, allowing for more granular control of the region's boundary. Objects and partial objects can be stacked, strung, pieced to form larger, cohesive sections for the perimeter. there is no limit on the number of objects in your output list - always prefer individual objects placed close to each other over a single composite object with a prompt to generate them together at once. if the region calls for it, we can have as high fidelity of a perimeter as we want. if a dense perimeter makes sense for the given region, then make it dense - as many objects as you see fit, their bounding boxes right next to each other. You are in control - do not rely on downstream generation steps to output composite geometry: organize your list of objects so that you are in direct control of positioning to form that composite geometry yourself using the individual partial objects.
 
-When generating the list of objects, keep in mind traversal between various regions both horizontally and vertically that might require more complex boundary objects made up of partial objects, keep in mind the semantic meaning of objects that allow passage. Using the scene context provided, carefully determine if passage is needed from this region to another, and if so, what kind of partial objects would be needed to piece together the complicated shapes that would allow that traversal. A good example of this is a wall in a building that has a door embedded within: the wall would be made of multiple rectanglular regions that when pieced together form an arch looking shape, with a door object filling that space in. Apply this same idea of leaving empty gaps or embedding other objects wherever it makes sense to do so. Pay especial attention to the context provided in the plans of the other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Use this thinking to guide you in the generation and placement of your list of objects.
+When generating the list of objects, keep in mind traversal between various regions both horizontally and vertically that might require more complex boundary objects made up of partial objects, keep in mind the semantic meaning of objects that allow passage. Using the scene context provided, carefully determine if passage is needed from this region to another, and if so, what kind of partial objects would be needed to piece together the complicated shapes that would allow that traversal. A good example of this is a wall in a building that has a door embedded within: the wall would be made of multiple rectanglular regions that when pieced together form an arch looking shape, with a door object filling that space in. Apply this same idea of leaving empty gaps or embedding other objects wherever it makes sense to do so. Pay especial attention to the context provided in the plan thes of other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Use this thinking to guide you in the generation and placement of your list of objects.
 
 be wary of duplicate geometry - for two neighboring regions separated by some sort of divider, it is only necessary to generate the divider once. study the provided scene context to determine if generating something is necessary.
 
@@ -1051,7 +1077,8 @@ Zone bbox: {zone_bbox.model_dump_json()}
 {_render_scene_lines(scene)}
 </scene_context>
 
-{_render_retry_block(prior_attempts)}"""
+{_render_retry_block(prior_attempts)}
+{_deepseek_suffix()}"""
 
 
 def render_negative_space_decomp(
@@ -1076,7 +1103,8 @@ Zone bbox: {zone_bbox.model_dump_json()}
 
 Each negative space object in your resultant list has an id, prompt, parent (structural anchor — the zone, an earlier-placed peer, or another object in this list), parent_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: most negative-space pieces sit `ON` a ground/floor peer, `ATTACHED` for things mounted flush to a wall/ceiling, `IN` for free-floating pieces inside an enclosing volume; BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for secondary relationships your placement text mentions; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: do not duplicate geometry another zone has already emitted on a shared face. Negative-space pieces live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified (a vine draped over a wall, a banner hanging off an edge, drifting smoke crossing into an adjacent zone, a connective walkway or rope-bridge reaching toward a peer zone, a stabilizing strut or buttress extending below to ground against a peer). Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry.
 
-The primary purpose of these negative space objects is to make the scene feel coherent and cohesive, filling in the gaps between subzones or objects. As such, for each negative space to fill in, it is imperative to analyze the existing placed objects and zones surrounding it to create a smooth filling that does not look out of place.{_render_retry_block(prior_attempts)}"""
+The primary purpose of these negative space objects is to make the scene feel coherent and cohesive, filling in the gaps between subzones or objects. As such, for each negative space to fill in, it is imperative to analyze the existing placed objects and zones surrounding it to create a smooth filling that does not look out of place.{_render_retry_block(prior_attempts)}
+{_deepseek_suffix()}"""
 
 
 # ---------- Step 6: object bbox resolution ----------------------------------
@@ -1142,7 +1170,8 @@ Objects to place ({len(objects)}):
 Peers already placed in the run:
 {peer_lines}
 
-Produce a bbox for every object in a single coherent layout."""
+Produce a bbox for every object in a single coherent layout.
+{_deepseek_suffix()}"""
 
 
 # ---------- Step 7: iterative next-object decision --------------------------
@@ -1352,4 +1381,5 @@ Zone bbox: {zone_bbox.model_dump_json()}
 {scene_block}
 </scene_context>
 
-Decide whether another object is needed in this zone. If yes, emit exactly one ObjectSpec; otherwise set done=true.{retry_block}"""
+Decide whether another object is needed in this zone. If yes, emit exactly one ObjectSpec; otherwise set done=true.{retry_block}
+{_deepseek_suffix()}"""

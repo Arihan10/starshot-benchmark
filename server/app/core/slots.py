@@ -21,14 +21,14 @@ class Slot:
 SLOTS: list[Slot] = [
     Slot("swamp-land", "A swamp with islands, designed as a top-down arcade level where a frog can jump from island to island"),
     Slot("hotel-room", "A hotel room"),
-    Slot("modern-house", "A two-story house"),
+    Slot("modern-house", "A modern house"),
     Slot("platformer-level", "A super mario bros type platformer level"),
     Slot("battle-arena", "A battle arena for a two player game"),
     Slot("urban-city", "An imperial japanese house"),
-    Slot("waterloo-campus", "Floating natural island archipelago connected by bridges, with an ancient temple on the center island"),
+    Slot("university-campus", "An open university-campus"),
     Slot("shooter", "FPS 5v5 3 lane map"),
     Slot("racetrack", "A car racing track"),
-    Slot("campsite", "A campsite in the middle of a forest")
+    Slot("campsite", "A campsite in the middle of a forest"),
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
@@ -42,6 +42,7 @@ MODELS: dict[str, str] = {
     "gpt": "openai/gpt-5.5",
     "opus": "anthropic/claude-opus-4.6",
     "deepseek": "deepseek/deepseek-v4-pro",
+    "opus-new": "anthropic/claude-opus-4.8-fast"
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())
