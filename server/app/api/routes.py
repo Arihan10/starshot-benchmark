@@ -37,7 +37,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.core.prompts import wrap_image_prompt
+from app.core import prompt_runtime
 from app.core.slots import (
     DEFAULT_MODEL_ALIAS,
     MODEL_ALIASES,
@@ -66,6 +66,7 @@ PROMPT_SNAPSHOT_NAME = "prompts_snapshot.py"
 RunKey = tuple[str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
+_retry_tasks: set[asyncio.Task[None]] = set()
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
 
@@ -117,6 +118,13 @@ def _ensure_prompt_snapshot(run: str) -> None:
         target.write_text(PROMPTS_SOURCE.read_text())
 
 
+def _prompt_module_for_run(run: str):
+    snapshot = _run_dir(run) / PROMPT_SNAPSHOT_NAME
+    if snapshot.exists():
+        return prompt_runtime.load_snapshot(snapshot)
+    return None
+
+
 def _hydrate_run(run: str) -> None:
     """Build SlotLogs for every (slot, model) cell under RUNS_DIR/<run>/.
     Idempotent — calling twice is a no-op. Hydration is per-run so the
@@ -130,9 +138,7 @@ def _hydrate_run(run: str) -> None:
         for alias in MODEL_ALIASES:
             slot_dir = _slot_dir(run, slot.id, alias)
             slot_dir.mkdir(parents=True, exist_ok=True)
-            slot_log = SlotLog(
-                _run_id(run, slot.id, alias), slot_dir / "events.jsonl"
-            )
+            slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
             slot_log.hydrate_from_disk()
             _slot_logs[(run, slot.id, alias)] = slot_log
             _maybe_launch(slot, alias, slot_log)
@@ -151,7 +157,12 @@ def create_app() -> FastAPI:
         finally:
             for task in _tasks.values():
                 task.cancel()
+            for task in _retry_tasks:
+                task.cancel()
             for task in list(_tasks.values()):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            for task in list(_retry_tasks):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             await threed.disconnect_http()
@@ -180,11 +191,13 @@ def create_app() -> FastAPI:
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             ):
-                items.append({
-                    "name": p.name,
-                    "modified_at": p.stat().st_mtime,
-                    "has_prompt_snapshot": (p / PROMPT_SNAPSHOT_NAME).exists(),
-                })
+                items.append(
+                    {
+                        "name": p.name,
+                        "modified_at": p.stat().st_mtime,
+                        "has_prompt_snapshot": (p / PROMPT_SNAPSHOT_NAME).exists(),
+                    }
+                )
         return {"runs": items, "current": _current_run}
 
     @app.post("/runs")
@@ -260,7 +273,9 @@ def create_app() -> FastAPI:
 
     @app.post("/slots/{slot_id}/{model_alias}/rewind")
     async def slot_rewind(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str, model_alias: str, req: RewindRequest,
+        slot_id: str,
+        model_alias: str,
+        req: RewindRequest,
     ) -> dict[str, int | str]:
         run = _current_run
         slot = _require_slot(slot_id)
@@ -273,9 +288,7 @@ def create_app() -> FastAPI:
             )
         await _cancel_task(run, slot_id, model_alias)
         new_len = slot_log.truncate_events_to(req.to_event_index)
-        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(
-            _run(run, slot.id, model_alias)
-        )
+        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
         return {"run": run, "slot_id": slot.id, "model": model_alias, "events": new_len}
 
     @app.post("/slots/{slot_id}/{model_alias}/resume")
@@ -304,9 +317,7 @@ def create_app() -> FastAPI:
                 slot_log.truncate_events_to(len(events) - 1)
             slot_log.state["model"] = model_id
             slot_log.state["status"] = "running"
-        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(
-            _run(run, slot.id, model_alias)
-        )
+        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.post("/slots/{slot_id}/{model_alias}/pause")
@@ -331,27 +342,41 @@ def create_app() -> FastAPI:
 
     @app.post("/slots/{slot_id}/{model_alias}/retry-mesh/{node_id}")
     async def slot_retry_mesh(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str, model_alias: str, node_id: str,
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
     ) -> dict[str, str]:
         run = _current_run
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
+        prompt_runtime.bind(_prompt_module_for_run(run))
         node = _reconstruct_node(slot_log, node_id)
         if node is None:
             raise HTTPException(
                 status_code=404,
                 detail=f"no bbox event found for node: {node_id}",
             )
+
         async def _do_retry() -> None:
             rlog.bind(slot_log)
             llm.set_model(MODELS[model_alias])
+            prompt_runtime.bind(_prompt_module_for_run(run))
             await generation.retry_node(
-                node=node, runs_dir=RUNS_DIR,
+                node=node,
+                runs_dir=RUNS_DIR,
                 run_id=_run_id(run, slot.id, model_alias),
             )
-        asyncio.create_task(_do_retry())
-        return {"run": run, "slot_id": slot.id, "model": model_alias, "node_id": node_id}
+
+        task = asyncio.create_task(_do_retry())
+        _retry_tasks.add(task)
+        task.add_done_callback(_retry_tasks.discard)
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+        }
 
     @app.post("/slots/{slot_id}/{model_alias}/reset")
     async def slot_reset(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -366,14 +391,10 @@ def create_app() -> FastAPI:
         slot_dir = _slot_dir(run, slot.id, model_alias)
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
-        slot_log = SlotLog(
-            _run_id(run, slot.id, model_alias), slot_dir / "events.jsonl"
-        )
+        slot_log = SlotLog(_run_id(run, slot.id, model_alias), slot_dir / "events.jsonl")
         _slot_logs[(run, slot.id, model_alias)] = slot_log
         slot_log.start_run(slot.prompt, MODELS[model_alias])
-        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(
-            _run(run, slot.id, model_alias)
-        )
+        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     return app
@@ -383,11 +404,7 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
         slot_log = _slot_logs.get((run, slot.id, alias))
-        state = (
-            slot_log.state
-            if slot_log is not None
-            else {"status": "idle", "events": []}
-        )
+        state = slot_log.state if slot_log is not None else {"status": "idle", "events": []}
         events = state.get("events", [])
         runs[alias] = {
             "status": state.get("status", "idle"),
@@ -476,16 +493,15 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
     proxy_shape = ProxyShape(proxy_raw) if isinstance(proxy_raw, str) else None
     orientation_raw = bbox_event.get("orientation", 0)
     orientation: Orientation = int(orientation_raw) if isinstance(orientation_raw, (int, float, str)) else 0  # type: ignore[assignment]
-    raw_prompt = (
-        image_event.get("prompt") if image_event is not None else bbox_event.get("prompt")
-    )
+    raw_prompt = image_event.get("prompt") if image_event is not None else bbox_event.get("prompt")
     raw_str = str(raw_prompt) if raw_prompt is not None else ""
     if raw_str.lstrip().startswith(_WRAPPED_PROMPT_PREFIX):
         image_prompt = raw_str
         subject_str = raw_str
     else:
         subject_str = raw_str
-        image_prompt = wrap_image_prompt(subject_str, proxy_shape, bbox.size)
+        p = prompt_runtime.current()
+        image_prompt = p.wrap_image_prompt(subject_str, proxy_shape, bbox.size)
     parent_id = bbox_event.get("parent_id")
     return Node(
         id=node_id,
@@ -559,6 +575,7 @@ async def _sse(
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
     slot_log = _slot_logs[(run, slot_id, model_alias)]
     rlog.bind(slot_log)
+    prompt_runtime.bind(_prompt_module_for_run(run))
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]
     run_id = _run_id(run, slot_id, model_alias)

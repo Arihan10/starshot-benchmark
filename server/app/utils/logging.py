@@ -161,6 +161,24 @@ def current_events() -> list[dict[str, Any]]:
     return _current.get().state["events"]
 
 
+def find_event(kind: str, **fields: Any) -> dict[str, Any] | None:
+    """Most recent event whose kind and selected fields match exactly."""
+    for event in reversed(current_events()):
+        if event.get("kind") != kind:
+            continue
+        if all(event.get(k) == v for k, v in fields.items()):
+            return event
+    return None
+
+
+def log_once(kind: str, *, match_fields: tuple[str, ...], **data: Any) -> None:
+    """Append `kind` only if no prior event has the same semantic key."""
+    match = {k: data.get(k) for k in match_fields}
+    if find_event(kind, **match) is not None:
+        return
+    log(kind, **data)
+
+
 def current_slot_id() -> str | None:
     """Slot id of the currently-bound task, or None if no binding (e.g.
     called from a script or before bind())."""
@@ -187,6 +205,8 @@ def emit_bbox(
     proxy_shape: ProxyShape | None = None,
     orientation: Orientation = 0,
 ) -> None:
+    if find_event("bbox", id=node_id) is not None:
+        return
     log(
         "bbox",
         id=node_id,
@@ -201,6 +221,8 @@ def emit_bbox(
 
 
 def emit_model(node_id: str, artifact_kind: str, url: str) -> None:
+    if find_event("model", id=node_id, artifact_kind=artifact_kind) is not None:
+        return
     log("model", id=node_id, artifact_kind=artifact_kind, url=url)
 
 
@@ -208,6 +230,8 @@ def emit_step(node_id: str, phase: str, **extra: Any) -> None:
     """Current-location marker: emitted at the start of each pipeline phase
     for a given node. The client uses these to light up the active node in
     the tree view."""
+    if find_event("step", node=node_id, phase=phase) is not None:
+        return
     log("step", node=node_id, phase=phase, **extra)
 
 

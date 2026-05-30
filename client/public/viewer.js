@@ -651,12 +651,12 @@ const hiddenIds = new Set();
 function treeUpsert(id, patch) {
   const cur = treeNodes.get(id);
   if (!cur) {
+    const parentId = patch.parentId ?? null;
     treeNodes.set(id, {
-      id, parentId: null, prompt: null, kind: "zone",
+      id, parentId, prompt: null, kind: "zone",
       phase: "pending", order: treeOrderCounter++,
       ...patch,
     });
-    const parentId = patch.parentId ?? null;
     if (parentId !== null) {
       const arr = treeChildren.get(parentId) ?? [];
       if (!arr.includes(id)) arr.push(id);
@@ -666,15 +666,26 @@ function treeUpsert(id, patch) {
     }
     return;
   }
-  // Existing node: merge patch, but if parentId changes from null to a real
-  // one, wire it into the children index lazily.
+  // Existing node: merge patch, and keep the parent -> children index in
+  // sync. Decompose events may only know "this was emitted by parent X",
+  // while the later bbox event carries the actual structural parent.
   const prevParent = cur.parentId;
   Object.assign(cur, patch);
-  if (prevParent === null && cur.parentId) {
-    const arr = treeChildren.get(cur.parentId) ?? [];
-    if (!arr.includes(id)) arr.push(id);
-    treeChildren.set(cur.parentId, arr);
-    if (treeRootId === id) treeRootId = null; // was mis-rooted
+  const nextParent = cur.parentId ?? null;
+  if (prevParent !== nextParent) {
+    if (prevParent !== null) {
+      const prevKids = treeChildren.get(prevParent) ?? [];
+      treeChildren.set(prevParent, prevKids.filter((cid) => cid !== id));
+    } else if (treeRootId === id) {
+      treeRootId = null; // was mis-rooted
+    }
+    if (nextParent !== null) {
+      const nextKids = treeChildren.get(nextParent) ?? [];
+      if (!nextKids.includes(id)) nextKids.push(id);
+      treeChildren.set(nextParent, nextKids);
+    } else if (treeRootId === null) {
+      treeRootId = id;
+    }
   }
 }
 
@@ -694,7 +705,9 @@ function treeSetPhase(id, phase) {
     // the highlight on it until the next step event moves it.
   }
   renderTree();
-  if (id === selectedBboxId) renderTreeDetail();
+  if (id === selectedBboxId || (selectedBboxId && treeIsAncestorOf(selectedBboxId, id))) {
+    renderTreeDetail();
+  }
 }
 
 function recordLlmCall(event) {
@@ -818,6 +831,45 @@ function truncate(s, n = 60) {
   return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
+function treeIsAncestorOf(ancestorId, descendantId) {
+  let cur = treeNodes.get(descendantId)?.parentId ?? null;
+  while (cur !== null) {
+    if (cur === ancestorId) return true;
+    cur = treeNodes.get(cur)?.parentId ?? null;
+  }
+  return false;
+}
+
+function treeHasDescendantPhase(id, predicate) {
+  const stack = [...(treeChildren.get(id) ?? [])];
+  while (stack.length) {
+    const curId = stack.pop();
+    const node = treeNodes.get(curId);
+    if (!node) continue;
+    if (predicate(node.phase ?? "pending")) return true;
+    const kids = treeChildren.get(curId) ?? [];
+    for (const kid of kids) stack.push(kid);
+  }
+  return false;
+}
+
+function treeDisplayPhase(id) {
+  const node = treeNodes.get(id);
+  const ownPhase = node?.phase ?? "pending";
+  if (ownPhase === "error") return "error";
+  if (treeHasDescendantPhase(id, (phase) => phase === "error")) return "error";
+
+  const active = treeActiveId !== null ? treeNodes.get(treeActiveId) : null;
+  const activePhase = active?.phase ?? null;
+  const hasActiveDescendant = treeActiveId !== null
+    && treeActiveId !== id
+    && activePhase !== "done"
+    && activePhase !== "error"
+    && treeIsAncestorOf(id, treeActiveId);
+  if (hasActiveDescendant) return "building_children";
+  return ownPhase;
+}
+
 function renderTreeNode(id, ctx) {
   const node = treeNodes.get(id);
   if (!node) return null;
@@ -866,8 +918,9 @@ function renderTreeNode(id, ctx) {
   row.appendChild(promptEl);
 
   const phaseEl = document.createElement("span");
-  phaseEl.className = `tree-phase phase-${node.phase}`;
-  phaseEl.textContent = node.phase;
+  const displayPhase = treeDisplayPhase(id);
+  phaseEl.className = `tree-phase phase-${displayPhase}`;
+  phaseEl.textContent = displayPhase;
   row.appendChild(phaseEl);
 
   wrap.appendChild(row);
@@ -947,7 +1000,9 @@ function renderTree() {
   }
   if (treeActiveId !== null) {
     const n = treeNodes.get(treeActiveId);
-    if (n) treeActiveEl.textContent = `${n.phase} · ${n.id}`;
+    if (n) treeActiveEl.textContent = `${treeDisplayPhase(n.id)} · ${n.id}`;
+  } else {
+    treeActiveEl.textContent = "";
   }
   if (filter) {
     const n = filter.matches.size;
@@ -2169,7 +2224,7 @@ function renderTreeDetail() {
     span.appendChild(b);
     return span;
   }
-  meta.appendChild(metaEntry("phase:", node.phase ?? "pending"));
+  meta.appendChild(metaEntry("phase:", treeDisplayPhase(node.id)));
   if (Array.isArray(node.origin) && Array.isArray(node.dimensions)) {
     meta.appendChild(metaEntry("origin:", `[${fmtMeters(node.origin)}]`));
     meta.appendChild(metaEntry("size:", `[${fmtMeters(node.dimensions)}] m`));
@@ -2511,8 +2566,9 @@ function renderObsCard(node, { role, depth }) {
   sum.appendChild(idEl);
 
   const phaseEl = document.createElement("span");
-  phaseEl.className = `tm-phase phase-${node.phase ?? "pending"}`;
-  phaseEl.textContent = node.phase ?? "pending";
+  const displayPhase = treeDisplayPhase(node.id);
+  phaseEl.className = `tm-phase phase-${displayPhase}`;
+  phaseEl.textContent = displayPhase;
   sum.appendChild(phaseEl);
 
   const calls = nodeLlmCalls.get(node.id) ?? [];
@@ -3115,10 +3171,12 @@ function dispatch(event) {
       if (event.id === selectedBboxId) renderTreeDetail();
       break;
     case "divider.decompose":
+    case "divider.zone_decompose":
       // Pre-declare children so the tree shows them (in pending state) before
-      // their bboxes resolve. `children` ships as [{id, prompt}, ...].
+      // their bboxes resolve. Use the child's structural parent when present;
+      // sibling-parented zones should not be shown under the emitting node.
       for (const c of event.children ?? []) {
-        treeUpsert(c.id, { parentId: event.node, prompt: c.prompt, kind: "zone" });
+        treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
       }
       renderTree();
       break;
@@ -4206,8 +4264,9 @@ function dispatchForReplay(event) {
       renderTree();
       break;
     case "divider.decompose":
+    case "divider.zone_decompose":
       for (const c of event.children ?? []) {
-        treeUpsert(c.id, { parentId: event.node, prompt: c.prompt, kind: "zone" });
+        treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
       }
       renderTree();
       break;
