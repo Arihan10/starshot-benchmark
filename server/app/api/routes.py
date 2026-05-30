@@ -336,6 +336,7 @@ def create_app() -> FastAPI:
         slot_id: str,
         model_alias: str,
         node_id: str,
+        mode: str | None = None,
     ) -> dict[str, str]:
         run = _current_run
         slot = _require_slot(slot_id)
@@ -348,11 +349,16 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"no bbox event found for node: {node_id}",
             )
+        # Regenerate into the asset set the client is viewing, so re-retrying a
+        # generated-mode mesh lands in objects_generated/ (and emits a
+        # generated-tagged model event) instead of the library dir.
+        retry_mode = mode if mode in generation.ASSET_MODES else generation.DEFAULT_ASSET_MODE
 
         async def _do_retry() -> None:
             rlog.bind(slot_log)
             llm.set_model(MODELS[model_alias])
             prompt_runtime.bind(_prompt_module_for_run(run))
+            generation.set_asset_mode(retry_mode)
             await generation.retry_node(
                 node=node,
                 runs_dir=RUNS_DIR,
@@ -626,12 +632,18 @@ async def _sse(
     #
     # Snapshot terminal events do NOT close the stream — only live ones
     # do. That way a client re-subscribing to a finished slot (to drive a
-    # standalone mesh retry) gets the historical timeline and then waits
-    # on the live queue for the retry's new events, instead of being
-    # disconnected the instant the past `run.done` replays.
+    # standalone mesh retry, or on-demand asset generation) gets the
+    # historical timeline and then waits on the live queue for new events,
+    # instead of being disconnected the instant the past `run.done` replays.
+    #
+    # The `snapshot.synced` marker separates the replayed history from the
+    # live tail: the client must only close on a *live* terminal event, since
+    # a finished run's events (retries / generated assets) are appended after
+    # the historical `run.done` and would otherwise be stranded behind it.
     try:
         for event in snapshot:
             yield f"data: {json.dumps(event)}\n\n"
+        yield f"data: {json.dumps({'kind': 'snapshot.synced'})}\n\n"
         while True:
             event = await q.get()
             yield f"data: {json.dumps(event)}\n\n"

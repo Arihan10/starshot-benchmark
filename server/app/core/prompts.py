@@ -119,6 +119,38 @@ def _scene_tuples(
     ]
 
 
+def _child_zones(nodes: list[Node], parent_zone_id: str) -> list[Node]:
+    """Abstract subzones nested under `parent_zone_id`, in declaration order.
+
+    Consumed by the encapsulating step, which now runs once the zone's own
+    decomposition + child bbox solver have placed its subzones. At that point
+    the only abstract descendants of the zone are exactly those just-placed
+    subzones — grandchildren and the zone's own frames/anchors don't exist yet
+    — so the shell author can frame its perimeter around them.
+
+    Captures direct children (`parent_id == parent_zone_id`) and batch-nested
+    children (anchored to a sibling subzone) via an ancestry walk, while
+    excluding the zone's own not-yet-planned siblings (whose chains reach a
+    different ancestor)."""
+    by_id = _by_id(nodes)
+
+    def reaches_parent(n: Node) -> bool:
+        cur: Node | None = n
+        seen: set[str] = set()
+        while cur is not None and cur.parent_id is not None and cur.id not in seen:
+            seen.add(cur.id)
+            if cur.parent_id == parent_zone_id:
+                return True
+            cur = by_id.get(cur.parent_id)
+        return False
+
+    return [
+        n
+        for n in nodes
+        if n.id != parent_zone_id and not _is_concrete(n) and reaches_parent(n)
+    ]
+
+
 # Shared proxy-shape documentation injected into every prompt that lets
 # the LLM emit or reason about proxies. Keep the vocabulary and the math
 # identical across decomposition and bbox-resolution steps so there is
@@ -1248,7 +1280,34 @@ def render_encapsulating_decomp(
     zone_bbox = zone.bbox
     ancestors = _ancestor_tuples(nodes, zone_id)
     bbox_by_id = _bbox_by_id(nodes)
-    scene = _scene_tuples(nodes, exclude_ids={zone_id, *(a[0] for a in ancestors)})
+    # The subzones this region was just decomposed into. They are rendered in
+    # their own <CHILD_ZONES> block (the perimeter must frame around them), so
+    # exclude them from the generic scene snapshot to avoid double-rendering
+    # them as plain <OBJECTS> (they carry no plan yet).
+    child_zones = _child_zones(nodes, zone_id)
+    child_zone_ids = {c.id for c in child_zones}
+    scene = _scene_tuples(
+        nodes, exclude_ids={zone_id, *(a[0] for a in ancestors), *child_zone_ids}
+    )
+    child_zone_entries = [
+        _render_node_entry(
+            nid=c.id,
+            parent=c.parent_id,
+            prompt=c.prompt,
+            bbox=c.bbox,
+            bbox_by_id=bbox_by_id,
+            placement=c.placement,
+            proxy_shape=c.proxy_shape,
+            plan=c.plan,
+            plan_unset_label="(not yet individually planned — placed by this region's decomposition)",
+        )
+        for c in child_zones
+    ]
+    child_zones_block = _render_section(
+        "CHILD_ZONES",
+        child_zone_entries,
+        "none — this region was not split into subzones",
+    )
     zone_parent_id = ancestors[-1][0] if ancestors else None
     if zone_parent_id and bbox_by_id and zone_parent_id in bbox_by_id:
         parent_bbox = bbox_by_id[zone_parent_id]
@@ -1282,6 +1341,10 @@ Output bounding_required = False if no bounding objects are needed. Otherwise, s
 ZONE_ID: {zone_id!r}
 {zone_bbox_line}
 {_render_zone_plan_block(zone_plan)}
+
+These are subregions that are directly decomposed from this region and their bounding box/positions
+
+{child_zones_block}
 
 {_render_ancestor_block(ancestors, bbox_by_id=bbox_by_id)}
 

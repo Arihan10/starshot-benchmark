@@ -191,7 +191,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--csv", type=Path, default=_DEFAULT_CSV, help="Path to the CSV catalog")
     p.add_argument("--output-dir", type=Path, default=_DEFAULT_OUTPUT_DIR, help="Output directory (assets/ subdir created inside)")
     p.add_argument("--style", type=str, default=None, help="Style context appended to every object prompt")
-    p.add_argument("--trellis-concurrency", type=int, default=None, help="Override Trellis in-flight job cap (default: 10)")
+    p.add_argument("--trellis-concurrency", type=int, default=None, help="Override Trellis in-flight job cap (default: 25)")
     p.add_argument("--concurrent", type=int, default=MAX_CONCURRENT, help="Max concurrent items in pipeline (default: 30)")
     return p.parse_args()
 

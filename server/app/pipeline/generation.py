@@ -61,17 +61,26 @@ DEFAULT_ASSET_MODE = (
 _asset_mode: ContextVar[str] = ContextVar("asset_mode", default=DEFAULT_ASSET_MODE)
 
 
+def set_asset_mode(mode: str) -> None:
+    """Bind the asset mode for the current task. Child tasks spawned afterwards
+    (e.g. `_generate_one`) inherit it via context copy, so a retry / on-demand
+    pass realizes into the right per-mode dir and tags its events accordingly."""
+    _asset_mode.set(mode if mode in ASSET_MODES else DEFAULT_ASSET_MODE)
+
+
 def current_asset_mode() -> str:
     return _asset_mode.get()
 
 
 def objects_dir(runs_dir: Path, run_id: str, mode: str | None = None) -> Path:
-    """Per-mode artifact directory. The env-default mode keeps the canonical
-    `objects/` dir (so existing runs, retries, and scripts are untouched); the
-    on-demand secondary mode gets its own `objects_<mode>/` dir so both asset
-    sets coexist for one build."""
+    """Per-mode artifact directory. `objects/` is the canonical asset-library
+    directory — backwards compatible with runs predating per-mode dirs, whose
+    meshes (and untagged `model` events) all live there. The generated set gets
+    its own `objects_generated/` dir so both asset sets coexist for one build.
+    This mapping is fixed regardless of the env default, so the legacy
+    `objects/` layout is always read back as the library."""
     mode = mode or current_asset_mode()
-    name = "objects" if mode == DEFAULT_ASSET_MODE else f"objects_{mode}"
+    name = "objects" if mode == "library" else f"objects_{mode}"
     return runs_dir / run_id / name
 
 # Guards the trimesh load -> rescale -> export block. API calls and GLB

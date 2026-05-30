@@ -52,9 +52,11 @@ TRELLIS_SEED = 0
 
 # Spawn-and-poll cadence. The API caps any single job at ~10 min
 # wall-clock; warm 512-res jobs finish in ~3s, 1536-res in ~60s, cold
-# starts add 30-90s. 12s × GENERATE_CONCURRENCY=10 = 50 polls/min,
-# under the per-IP-per-container `/jobs/{id}` rate limit (60/60s) even
-# if Modal's load balancer pins us to a single container.
+# starts add 30-90s. 12s × GENERATE_CONCURRENCY=25 = 125 polls/min:
+# if Modal pinned every job to a single container that would exceed the
+# per-IP-per-container `/jobs/{id}` rate limit (60/60s), but jobs normally
+# land on separate containers (one per in-flight job) and any 429 is
+# absorbed by the poll-retry backoff below.
 POLL_INTERVAL_SECONDS = 12.0
 POLL_TIMEOUT_SECONDS = 1200.0
 
@@ -94,7 +96,7 @@ class JobLostError(Exception):
 # means Modal never queues on its side and every "pending" status maps
 # to active GPU processing rather than queue wait. The semaphore acts
 # as our FIFO queue (process-global, across all benchmark slots).
-GENERATE_CONCURRENCY = 10
+GENERATE_CONCURRENCY = 25
 _inflight_sem = asyncio.Semaphore(GENERATE_CONCURRENCY)
 
 # Live snapshot of in-flight Trellis work. Process-global so the queue
@@ -364,9 +366,13 @@ async def generate_mesh(
     accept URLs server-side).
 
     Restart-resilient on completed work: if `trellis.done` was
-    previously logged for `job_id` and the file at the recorded path
-    still exists, the call short-circuits. Otherwise we always issue
-    a fresh `POST /generate` — we don't probe prior Modal task_ids
+    previously logged for `job_id`, the recorded file still exists, AND
+    it sits at this same `output_path`, the call short-circuits. (The
+    path check matters because the same node can be realized into more
+    than one dir — e.g. the library `objects/` set vs the on-demand
+    `objects_generated/` set — and a hit for one must not be served for
+    the other.) Otherwise we always issue a fresh `POST /generate` — we
+    don't probe prior Modal task_ids
     because Modal GCs them on its own schedule, and the in-flight
     semaphore (`_inflight_sem`) gates submits at Modal's container
     count so Modal never queues on its side.
@@ -374,7 +380,15 @@ async def generate_mesh(
     done = resumable.find_done(scope="trellis", job_id=job_id)
     if done is not None:
         cached = Path(str(done["saved"]))
-        if cached.exists():
+        # Reuse a cached mesh only when it lives at the path we were asked to
+        # write. `trellis.done` is keyed by job_id (the node id) alone, so a
+        # prior completion for this node under a *different* output_path — an
+        # earlier retry that targeted another asset-mode dir (objects/ vs
+        # objects_generated/), or a relocated runs dir — must NOT satisfy a
+        # request for this output_path. Returning that stale path would skip
+        # writing output_path, and the caller (which loads output_path) would
+        # then fail with "string is not a file".
+        if cached.exists() and cached.resolve() == output_path.resolve():
             return cached
 
     image_bytes = await _fetch_url(image) if isinstance(image, str) else image

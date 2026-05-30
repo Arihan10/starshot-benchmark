@@ -1,26 +1,26 @@
 """Phase 1 — recursive top-down decomposition into a tree of zone Nodes.
 
-Per-node flow:
+Per-node flow (inside `_build`, which receives the node already planned):
   1. ZONE PLAN (LLM) — high-level character/intent AND the is_atomic
-     decision. Authored at the parent level (before this zone's
-     encapsulating pass) so the plan paragraph is in scope when its
-     own shell is generated. Root is planned in `run()` before
-     `_build(root)`.
-  2. (root only) Overall bounding box (LLM) — sizes the canvas to the
-     silhouette implied by the root's plan.
-  3. (root only) Encapsulating pass — generates the world-scale boundary
-     immediately so root's own decomposition can see it in scene context.
-  4. If ATOMIC, hand to Phase 2 generation for anchor-object population.
-  5. ZONE DECOMPOSE (LLM) — non-atomic zones only. Emits each child as
-     a seed (id, prompt, proxy_shape, relationships) in one call. The
-     sibling-relationship DAG is checked for cycles; any cycle is
-     logged and accepted (advisory).
-  6. Batch-resolve a bbox for EVERY child in one LLM call.
-  7. For each placed child, in declaration order: author the child's
-     plan (LLM), run its encapsulating pass with the plan in scope,
-     then recurse. Interleaving ensures the shell author sees the
-     child's own structural intent (vertical penetrations, voids,
-     double-height spaces) rather than only the one-sentence seed.
+     decision. Authored at the parent level (in the parent's child loop)
+     so the plan paragraph is in scope by the time this zone's own shell
+     is generated. Root is planned in `run()` before `_build(root)`; the
+     root's overall bounding box (LLM) is also sized there.
+  2. If ATOMIC: run the encapsulating pass (shell / floor / ground),
+     then hand to Phase 2 generation for anchor-object population.
+  3. If NON-ATOMIC: ZONE DECOMPOSE (LLM) — emit each child as a seed
+     (id, prompt, proxy_shape, relationships) in one call. The sibling-
+     relationship DAG is checked for cycles; any cycle is logged and
+     accepted (advisory).
+  4. Batch-resolve a bbox for EVERY child in one LLM call.
+  5. Encapsulating pass — runs AFTER this zone's own decomposition + child
+     bbox solver, so the shell author sees where the zone's children are
+     actually placed (their bboxes/footprints) rather than only the bare
+     zone plan. Generates walls+floor+ceiling for architectural zones and
+     a single ground mesh for atomic terrain zones.
+  6. For each placed child, in declaration order: author the child's plan
+     (LLM), then recurse. Each child's own encapsulating pass runs inside
+     its recursion (step 5), once the child's decomposition is known.
 
 Root additionally gets a final negative-space pass at the end of the run.
 """
@@ -154,6 +154,17 @@ async def _build(
     assert node.plan is not None, "node.plan must be set by caller"
 
     if is_atomic:
+        # No decomposition for atomic leaves, so the encapsulating pass runs
+        # right before anchor population (the same relative order it had when
+        # it lived in the parent's child loop).
+        logging.emit_step(node.id, "generating_frame")
+        await generation.run(
+            zone=node,
+            runs_dir=runs_dir,
+            run_id=run_id,
+            scenario="encapsulating",
+            all_nodes=all_nodes,
+        )
         logging.emit_step(node.id, "generating_anchor")
         await generation.run(
             zone=node,
@@ -219,6 +230,18 @@ async def _build(
         placed.append(child)
         all_nodes.append(child)
 
+    # Encapsulating pass runs AFTER this zone's decomposition + child bbox
+    # solver: the children are now in `all_nodes` with resolved bboxes, so the
+    # shell author sees where they sit and can frame the perimeter around them.
+    logging.emit_step(node.id, "generating_frame")
+    await generation.run(
+        zone=node,
+        runs_dir=runs_dir,
+        run_id=run_id,
+        scenario="encapsulating",
+        all_nodes=all_nodes,
+    )
+
     for child in placed:
         logging.emit_step(child.id, "planning")
         plan_out = await _plan_zone(
@@ -237,15 +260,8 @@ async def _build(
             is_atomic=plan_out.is_atomic,
         )
 
-        logging.emit_step(planned.id, "generating_frame")
-        await generation.run(
-            zone=planned,
-            runs_dir=runs_dir,
-            run_id=run_id,
-            scenario="encapsulating",
-            all_nodes=all_nodes,
-        )
-
+        # The child's own encapsulating pass runs inside this recursion, once
+        # the child's decomposition + child bbox solver have run.
         await _build(
             node=planned,
             runs_dir=runs_dir,
@@ -287,14 +303,9 @@ async def run(
         plan=plan_out.plan,
     )
     all_nodes: list[Node] = [root]
-    logging.emit_step(root.id, "generating_frame")
-    await generation.run(
-        zone=root,
-        runs_dir=runs_dir,
-        run_id=run_id,
-        scenario="encapsulating",
-        all_nodes=all_nodes,
-    )
+    # The root's encapsulating pass now runs inside `_build(root)`, after the
+    # root's own decomposition + child bbox solver (or, if the root is atomic,
+    # just before its anchor population).
     await _build(
         node=root,
         runs_dir=runs_dir,
