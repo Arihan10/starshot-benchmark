@@ -72,6 +72,8 @@ async def _decompose_objects_validated(
             system = p.SYSTEM_ANCHOR_DECOMP
             user = p.render_anchor_decomp(
                 zone_id=zone.id,
+                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 nodes=all_nodes,
                 prior_attempts=prior_attempts,
             )
@@ -79,6 +81,8 @@ async def _decompose_objects_validated(
             system = p.SYSTEM_ENCAPSULATING_DECOMP
             user = p.render_encapsulating_decomp(
                 zone_id=zone.id,
+                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 nodes=all_nodes,
                 prior_attempts=prior_attempts,
             )
@@ -86,6 +90,7 @@ async def _decompose_objects_validated(
             system = p.SYSTEM_NEGATIVE_SPACE_DECOMP
             user = p.render_negative_space_decomp(
                 zone_id=zone.id,
+                zone_prompt=zone.prompt,
                 nodes=all_nodes,
                 prior_attempts=prior_attempts,
             )
@@ -147,6 +152,7 @@ async def _next_object_validated(
             system=p.SYSTEM_NEXT_OBJECT,
             user=p.render_next_object(
                 zone_id=zone.id,
+                zone_prompt=zone.prompt,
                 nodes=all_nodes,
                 prior_attempts=prior_attempts,
             ),
@@ -236,6 +242,8 @@ async def _resolve_and_generate(
         system=p.SYSTEM_OBJECT_BBOX_BATCH,
         user=p.render_object_bbox_batch(
             zone_id=zone.id,
+            zone_prompt=zone.prompt,
+            zone_plan=zone.plan,
             objects=specs,
             nodes=all_nodes,
         ),

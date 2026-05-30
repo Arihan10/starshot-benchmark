@@ -239,3 +239,9 @@ class Node(BaseModel):
     # parent.
     parent_kind: ParentRelationshipKind | None = None
     plan: str | None = None
+    # True for subzone/region nodes, set at divider decomposition time; False
+    # for concrete objects/frames. A zone is flagged the moment it is placed —
+    # before its `plan` is authored — so scene-context renderers treat it as a
+    # subregion (seed prompt + bbox) instead of misreading a plan-less zone as
+    # a concrete object.
+    is_zone: bool = False

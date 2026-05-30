@@ -297,6 +297,16 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
+        # A completed run is terminal: resuming it would re-enter the pipeline
+        # and generate a second run into the same cell. `run.done` is sticky
+        # in the status derivation so the guard below normally catches this;
+        # the explicit check encodes the rule directly (complete ⇒ reset-only)
+        # and is robust to any stale in-memory status.
+        if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
+            raise HTTPException(
+                status_code=409,
+                detail="run is complete; reset to start a new run",
+            )
         status = slot_log.state.get("status")
         if status not in ("idle", "paused", "error"):
             raise HTTPException(
@@ -435,11 +445,14 @@ def _maybe_launch(slot: Slot, model_alias: str, slot_log: SlotLog) -> None:
         slot_log.state["status"] = "idle"
         return
     slot_log.state["model"] = model_id
-    last_kind = events[-1].get("kind")
-    if last_kind == "run.done":
-        return
-    # Interrupted or errored — mark resumable but don't auto-start.
-    if last_kind != "run.error":
+    # hydrate_from_disk already derived the status from the full event log
+    # (done/error/paused are sticky terminal states; a log with no terminal
+    # marker reads as "running"). The only boot-time adjustment is that a
+    # process killed mid-run leaves a "running" log with no sentinel —
+    # surface that as paused so the user can resume it. A completed run stays
+    # "done" (resume blocked, reset only) even when a post-run mesh retry
+    # appended events after run.done; an errored run stays "error" (retry).
+    if slot_log.state["status"] == "running":
         slot_log.state["status"] = "paused"
 
 

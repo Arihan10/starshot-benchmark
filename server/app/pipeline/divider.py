@@ -86,6 +86,7 @@ async def _decompose_zone(
         system=p.SYSTEM_ZONE_DECOMPOSE,
         user=p.render_zone_decompose(
             zone_id=node.id,
+            zone_prompt=node.prompt,
             zone_plan=node.plan,
             nodes=all_nodes,
         ),
@@ -107,6 +108,7 @@ async def _resolve_child_bboxes_batch(
         system=p.SYSTEM_ZONE_BBOX_BATCH,
         user=p.render_zone_bbox_batch(
             parent_id=parent.id,
+            parent_prompt=parent.prompt,
             children=children,
             nodes=all_nodes,
         ),
@@ -215,6 +217,7 @@ async def _build(
             parent_id=spec.parent,
             parent_kind=spec.parent_kind,
             plan=None,
+            is_zone=True,
         )
         placed.append(child)
         all_nodes.append(child)
@@ -285,6 +288,7 @@ async def run(
         bbox=bbox,
         parent_id=None,
         plan=plan_out.plan,
+        is_zone=True,
     )
     all_nodes: list[Node] = [root]
     logging.emit_step(root.id, "generating_frame")

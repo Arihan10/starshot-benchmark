@@ -31,6 +31,32 @@ from app.core.types import BoundingBox, Orientation, ProxyShape
 _console = Console()
 
 
+def _derive_status(events: list[dict[str, Any]]) -> str:
+    """Map an event log to a slot status.
+
+    `run.done` is STICKY: once a run has completed it stays "done" no matter
+    what lands afterward. A standalone post-run mesh retry (`/retry-mesh`)
+    appends mesh.retry/image/model events *after* run.done; keying status off
+    only the final event would mis-read those as an interrupted run, letting
+    the cell be resumed and re-enter the entire pipeline on top of a finished
+    run. A completed run is terminal — the only way back to a runnable state
+    is reset.
+
+    error/paused are recognized only as the latest event (a resume strips
+    that sentinel before re-running). A non-empty log with no terminal marker
+    is a process that died mid-run ("running"); an empty log is "idle"."""
+    if any(e.get("kind") == "run.done" for e in events):
+        return "done"
+    last_kind = events[-1]["kind"] if events else None
+    if last_kind == "run.error":
+        return "error"
+    if last_kind == "run.paused":
+        return "paused"
+    if events:
+        return "running"
+    return "idle"
+
+
 class SlotLog:
     """Owns state + disk + subscribers for one slot."""
 
@@ -71,17 +97,7 @@ class SlotLog:
                 if event.get("kind") == "run.start" and self.state["prompt"] is None:
                     self.state["prompt"] = event.get("prompt")
                     self.state["model"] = event.get("model")
-        last_kind = self.state["events"][-1]["kind"] if self.state["events"] else None
-        if last_kind == "run.done":
-            self.state["status"] = "done"
-        elif last_kind == "run.error":
-            self.state["status"] = "error"
-        elif last_kind == "run.paused":
-            self.state["status"] = "paused"
-        elif self.state["events"]:
-            self.state["status"] = "running"
-        else:
-            self.state["status"] = "idle"
+        self.state["status"] = _derive_status(self.state["events"])
 
     def truncate_events_to(self, n: int) -> int:
         """Keep only the first `n` events on disk and in memory. Returns
@@ -95,17 +111,8 @@ class SlotLog:
                 for event in self.state["events"]:
                     f.write(json.dumps(event) + "\n")
         # Status may have changed (e.g. error cleared, or now mid-run).
-        last_kind = self.state["events"][-1]["kind"] if self.state["events"] else None
-        if last_kind == "run.done":
-            self.state["status"] = "done"
-        elif last_kind == "run.error":
-            self.state["status"] = "error"
-        elif last_kind == "run.paused":
-            self.state["status"] = "paused"
-        elif self.state["events"]:
-            self.state["status"] = "running"
-        else:
-            self.state["status"] = "idle"
+        # Completion stays sticky — see _derive_status.
+        self.state["status"] = _derive_status(self.state["events"])
         return n
 
     def start_run(self, prompt: str, model: str) -> None:
