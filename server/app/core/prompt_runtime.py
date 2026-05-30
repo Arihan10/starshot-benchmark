@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import sys
 from contextvars import ContextVar
 from pathlib import Path
 from types import ModuleType
@@ -41,6 +42,7 @@ def load_snapshot(path: Path) -> ModuleType:
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot load prompt snapshot: {path}")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     _cache[path] = module
     return module

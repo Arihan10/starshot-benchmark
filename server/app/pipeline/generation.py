@@ -30,9 +30,16 @@ import asyncio
 import os
 import shutil
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 import trimesh
+
+from app.core import prompt_runtime
+from app.core.types import BoundingBox, Node, ProxyShape
+from app.services import llm, nano_banana, threed
+from app.utils import logging
+from app.utils.geometry import rescale_mesh_to_bbox
+from app.utils.topology import validate_referenced_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
 
@@ -42,52 +49,9 @@ _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "tr
 # texture buffers and trip the OOM killer.
 _MESH_IO = asyncio.Semaphore(1)
 
-from app.core.prompts import (
-    BboxBatchOutput,
-    ImagePromptOutput,
-    ImageView,
-    NextObjectOutput,
-    ObjectDecompOutput,
-    ObjectSpec,
-    SYSTEM_ANCHOR_DECOMP,
-    SYSTEM_ENCAPSULATING_DECOMP,
-    SYSTEM_IMAGE_PROMPT,
-    SYSTEM_NEGATIVE_SPACE_DECOMP,
-    SYSTEM_NEXT_OBJECT,
-    SYSTEM_OBJECT_BBOX_BATCH,
-    render_anchor_decomp,
-    render_encapsulating_decomp,
-    render_image_prompt,
-    render_negative_space_decomp,
-    render_next_object,
-    render_object_bbox_batch,
-    wrap_image_prompt,
-)
-from app.core.types import BoundingBox, Node, Orientation, ParentRelationshipKind, ProxyShape
-from app.services import llm, nano_banana, threed
-from app.utils import logging
-from app.utils.geometry import rescale_mesh_to_bbox
-from app.utils.topology import validate_referenced_ids
-
 
 def _artifact_url(runs_dir: Path, path: Path) -> str:
     return f"/artifacts/{path.relative_to(runs_dir).as_posix()}"
-
-
-# Projection of the live node registry into the tuple shape every render
-# function expects for "what's already in the scene". Centralised so the
-# shape can evolve without combing every call site. Tuple:
-# (id, prompt, bbox, parent_id, proxy_shape, orientation, placement, plan).
-# `placement` is None only for the root node; every decomposed child has
-# one. `plan` is set on zone nodes and None on objects/frames — used by
-# the renderer to split context into <ZONES> and <OBJECTS> sections.
-def _scene_view(
-    nodes: list[Node],
-) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]]:
-    return [
-        (n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation, n.placement, n.plan)
-        for n in nodes
-    ]
 
 
 RELATIONSHIP_RETRY_ATTEMPTS = 3
@@ -98,60 +62,51 @@ async def _decompose_objects_validated(
     zone: Node,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-) -> list[ObjectSpec]:
-    prior_attempts: list[tuple[list[ObjectSpec], str]] = []
+) -> list[Any]:
+    prior_attempts: list[tuple[list[Any], str]] = []
     existing_ids = {n.id for n in all_nodes}
-    scene = _scene_view(all_nodes)
-    bbox_by_id = {n.id: n.bbox for n in all_nodes}
-    specs: list[ObjectSpec] = []
+    specs: list[Any] = []
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
+        p = prompt_runtime.current()
         if scenario == "anchor":
-            system = SYSTEM_ANCHOR_DECOMP
-            user = render_anchor_decomp(
+            system = p.SYSTEM_ANCHOR_DECOMP
+            user = p.render_anchor_decomp(
                 zone_id=zone.id,
-                zone_plan=zone.plan,
-                zone_bbox=zone.bbox,
-                ancestors=ancestors,
-                scene=scene,
+                nodes=all_nodes,
                 prior_attempts=prior_attempts,
-                bbox_by_id=bbox_by_id,
             )
         elif scenario == "encapsulating":
-            system = SYSTEM_ENCAPSULATING_DECOMP
-            user = render_encapsulating_decomp(
+            system = p.SYSTEM_ENCAPSULATING_DECOMP
+            user = p.render_encapsulating_decomp(
                 zone_id=zone.id,
-                zone_plan=zone.plan,
-                zone_bbox=zone.bbox,
-                ancestors=ancestors,
-                scene=scene,
+                nodes=all_nodes,
                 prior_attempts=prior_attempts,
-                bbox_by_id=bbox_by_id,
             )
         else:
-            system = SYSTEM_NEGATIVE_SPACE_DECOMP
-            user = render_negative_space_decomp(
+            system = p.SYSTEM_NEGATIVE_SPACE_DECOMP
+            user = p.render_negative_space_decomp(
                 zone_id=zone.id,
-                zone_plan=zone.plan,
-                zone_bbox=zone.bbox,
-                scene=scene,
+                nodes=all_nodes,
                 prior_attempts=prior_attempts,
-                bbox_by_id=bbox_by_id,
             )
         out = await llm.call_llm(
             system=system,
             user=user,
-            output_schema=ObjectDecompOutput,
+            output_schema=p.ObjectDecompOutput,
             node_id=zone.id,
             step=f"{scenario.replace('-', '_')}_decompose",
         )
         if scenario == "encapsulating" and not out.bounding_required:
-            logging.log(
+            logging.log_once(
                 "generation.decompose.no_bounding",
-                zone=zone.id, emitted=[s.model_dump() for s in out.objects],
+                match_fields=("zone",),
+                zone=zone.id,
+                emitted=[s.model_dump() for s in out.objects],
             )
             return []
         specs = list(out.objects)
+        if scenario == "encapsulating":
+            specs = [s.model_copy(update={"parent": zone.id}) for s in specs]
         try:
             validate_referenced_ids(specs, parent_id=zone.id, existing_ids=existing_ids)
             return specs
@@ -159,7 +114,9 @@ async def _decompose_objects_validated(
             reason = str(e)
             logging.log(
                 "generation.decompose.retry",
-                zone=zone.id, attempt=attempt, reason=reason,
+                zone=zone.id,
+                attempt=attempt,
+                reason=reason,
                 emitted=[s.model_dump() for s in specs],
             )
             # Feed this failure back into the next prompt so the LLM has
@@ -167,35 +124,33 @@ async def _decompose_objects_validated(
             # set. After exhausting attempts we fall through to the
             # accept_invalid branch below.
             prior_attempts.append((specs, reason))
-    logging.log(
+    logging.log_once(
         "generation.decompose.accept_invalid",
-        zone=zone.id, reason=prior_attempts[-1][1] if prior_attempts else "",
+        match_fields=("zone",),
+        zone=zone.id,
+        reason=prior_attempts[-1][1] if prior_attempts else "",
     )
     return specs
 
 
 async def _next_object_validated(
-    *, zone: Node, all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-) -> NextObjectOutput:
-    prior_attempts: list[tuple[ObjectSpec, str]] = []
+    *,
+    zone: Node,
+    all_nodes: list[Node],
+) -> Any:
+    prior_attempts: list[tuple[Any, str]] = []
     existing_ids = {n.id for n in all_nodes}
-    scene = _scene_view(all_nodes)
-    bbox_by_id = {n.id: n.bbox for n in all_nodes}
-    decision: NextObjectOutput | None = None
+    decision: Any | None = None
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
+        p = prompt_runtime.current()
         decision = await llm.call_llm(
-            system=SYSTEM_NEXT_OBJECT,
-            user=render_next_object(
+            system=p.SYSTEM_NEXT_OBJECT,
+            user=p.render_next_object(
                 zone_id=zone.id,
-                zone_plan=zone.plan,
-                zone_bbox=zone.bbox,
-                ancestors=ancestors,
-                scene=scene,
+                nodes=all_nodes,
                 prior_attempts=prior_attempts,
-                bbox_by_id=bbox_by_id,
             ),
-            output_schema=NextObjectOutput,
+            output_schema=p.NextObjectOutput,
             node_id=zone.id,
             step="next_object",
         )
@@ -203,34 +158,43 @@ async def _next_object_validated(
             return decision
         try:
             validate_referenced_ids(
-                [decision.object], parent_id=zone.id, existing_ids=existing_ids,
+                [decision.object],
+                parent_id=zone.id,
+                existing_ids=existing_ids,
             )
             return decision
         except ValueError as e:
             reason = str(e)
             logging.log(
                 "generation.next.retry",
-                zone=zone.id, attempt=attempt, reason=reason,
+                zone=zone.id,
+                attempt=attempt,
+                reason=reason,
                 emitted=decision.object.model_dump(),
             )
             prior_attempts.append((decision.object, reason))
     assert decision is not None
-    logging.log(
+    logging.log_once(
         "generation.next.accept_invalid",
-        zone=zone.id, reason=prior_attempts[-1][1] if prior_attempts else "",
+        match_fields=("zone",),
+        zone=zone.id,
+        reason=prior_attempts[-1][1] if prior_attempts else "",
     )
     return decision
 
 
 async def _resolve_and_generate(
     *,
-    specs: list[ObjectSpec],
+    specs: list[Any],
     zone: Node,
     all_nodes: list[Node],
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     runs_dir: Path,
     run_id: str,
 ) -> list[Node]:
+    if scenario == "encapsulating":
+        specs = [s.model_copy(update={"parent": zone.id}) for s in specs]
+
     # Run-wide dedup. The LLM occasionally emits the same id twice in one
     # decomposition (e.g. duplicate floor slabs in encapsulating mode), and
     # later recursion levels can re-surface an id already in flight. Drop
@@ -241,16 +205,20 @@ async def _resolve_and_generate(
     # concurrent submissions.
     admitted = _admitted_ids.setdefault(run_id, set())
     placed_ids = {n.id for n in all_nodes}
-    deduped: list[ObjectSpec] = []
+    deduped: list[Any] = []
     seen_in_call: set[str] = set()
     for s in specs:
         if s.id in seen_in_call or s.id in admitted or s.id in placed_ids:
             logging.log(
                 "generation.dedup_drop",
-                zone=zone.id, scenario=scenario, id=s.id,
+                zone=zone.id,
+                scenario=scenario,
+                id=s.id,
                 reason=(
-                    "duplicate_in_call" if s.id in seen_in_call
-                    else "already_placed" if s.id in placed_ids
+                    "duplicate_in_call"
+                    if s.id in seen_in_call
+                    else "already_placed"
+                    if s.id in placed_ids
                     else "already_in_flight"
                 ),
             )
@@ -263,21 +231,15 @@ async def _resolve_and_generate(
     specs = deduped
 
     bbox_by_id = {n.id: n.bbox for n in all_nodes}
-    parent_kind_by_id: dict[str, ParentRelationshipKind | None] = {
-        n.id: n.parent_kind for n in all_nodes
-    }
+    p = prompt_runtime.current()
     out = await llm.call_llm(
-        system=SYSTEM_OBJECT_BBOX_BATCH,
-        user=render_object_bbox_batch(
+        system=p.SYSTEM_OBJECT_BBOX_BATCH,
+        user=p.render_object_bbox_batch(
             zone_id=zone.id,
-            zone_prompt=zone.prompt,
-            zone_bbox=zone.bbox,
             objects=specs,
-            peers=_scene_view(all_nodes),
-            bbox_by_id=bbox_by_id,
-            parent_kind_by_id=parent_kind_by_id,
+            nodes=all_nodes,
         ),
-        output_schema=BboxBatchOutput,
+        output_schema=p.BboxBatchOutput,
         node_id=zone.id,
         step="object_bbox_batch",
     )
@@ -314,8 +276,11 @@ async def _resolve_and_generate(
 
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(
-            specs=specs, bboxes=bboxes, scenario=scenario,
-            runs_dir=runs_dir, run_id=run_id,
+            specs=specs,
+            bboxes=bboxes,
+            scenario=scenario,
+            runs_dir=runs_dir,
+            run_id=run_id,
         )
 
     # Every object (anchor, completion, encapsulating alike) goes through
@@ -327,48 +292,56 @@ async def _resolve_and_generate(
     # Nano-Banana directives (Node.image_prompt). Leaking the wrapper
     # boilerplate would just teach the LLM to echo "Generate a direct,
     # perfect orthographic..." back into every new phrase.
-    committed_subjects = [
-        n.prompt for n in all_nodes if n.mesh_url is not None
-    ]
+    committed_subjects = [n.prompt for n in all_nodes if n.mesh_url is not None]
     resolved: list[Node] = []
     for spec in specs:
         bbox = bboxes[spec.id]
         parent_id = spec.parent
         logging.emit_bbox(
-            spec.id, bbox,
-            parent_id=parent_id, prompt=spec.prompt,
+            spec.id,
+            bbox,
+            parent_id=parent_id,
+            prompt=spec.prompt,
             kind="frame" if scenario == "encapsulating" else "object",
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
         )
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
-        view: ImageView = "three-quarter" if scenario == "encapsulating" else "front"
+        view = "three-quarter" if scenario == "encapsulating" else "front"
         subject_prompt, image_prompt = await _build_image_prompt(
             spec_id=spec.id,
-            prompt=spec.prompt, bbox=bbox, proxy_shape=spec.proxy_shape,
-            prior_prompts=prior_subjects, view=view,
-        )
-        resolved.append(Node(
-            id=spec.id,
-            prompt=subject_prompt,
-            image_prompt=image_prompt,
+            prompt=spec.prompt,
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
-            placement=spec.placement,
-            referenced_ids=list(spec.referenced_ids),
-            parent_id=parent_id,
-            parent_kind=spec.parent_kind,
-        ))
+            prior_prompts=prior_subjects,
+            view=view,
+        )
+        resolved.append(
+            Node(
+                id=spec.id,
+                prompt=subject_prompt,
+                image_prompt=image_prompt,
+                bbox=bbox,
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+                placement=spec.placement,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=parent_id,
+                parent_kind=spec.parent_kind,
+            )
+        )
 
     return await _spawn_meshes(
-        resolved=resolved, runs_dir=runs_dir, run_id=run_id, scenario=scenario,
+        resolved=resolved,
+        runs_dir=runs_dir,
+        run_id=run_id,
+        scenario=scenario,
     )
 
 
 async def _match_library_assets(
     *,
-    specs: list[ObjectSpec],
+    specs: list[Any],
     bboxes: dict[str, BoundingBox],
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     runs_dir: Path,
@@ -386,21 +359,25 @@ async def _match_library_assets(
         url = _artifact_url(runs_dir, path)
 
         if path.exists():
-            resolved.append(Node(
-                id=spec.id,
-                prompt=spec.prompt,
-                bbox=bbox,
-                proxy_shape=spec.proxy_shape,
-                orientation=spec.orientation,
-                referenced_ids=list(spec.referenced_ids),
-                parent_id=spec.parent,
-                mesh_url=url,
-            ))
+            resolved.append(
+                Node(
+                    id=spec.id,
+                    prompt=spec.prompt,
+                    bbox=bbox,
+                    proxy_shape=spec.proxy_shape,
+                    orientation=spec.orientation,
+                    referenced_ids=list(spec.referenced_ids),
+                    parent_id=spec.parent,
+                    mesh_url=url,
+                )
+            )
             continue
 
         logging.emit_bbox(
-            spec.id, bbox,
-            parent_id=spec.parent, prompt=spec.prompt,
+            spec.id,
+            bbox,
+            parent_id=spec.parent,
+            prompt=spec.prompt,
             kind="frame" if scenario == "encapsulating" else "object",
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
@@ -411,7 +388,9 @@ async def _match_library_assets(
 
         logging.log(
             "library.match",
-            id=spec.id, prompt=spec.prompt, library_id=match.library_id,
+            id=spec.id,
+            prompt=spec.prompt,
+            library_id=match.library_id,
         )
 
         ref_image = asset.with_suffix(".png")
@@ -429,32 +408,39 @@ async def _match_library_assets(
             async with _MESH_IO:
                 scene = await asyncio.to_thread(trimesh.load, asset)
                 rescaled = await asyncio.to_thread(
-                    rescale_mesh_to_bbox, scene, bbox,
+                    rescale_mesh_to_bbox,
+                    scene,
+                    bbox,
                     orientation=spec.orientation,
                 )
                 await asyncio.to_thread(rescaled.export, path, file_type="glb")
                 del scene, rescaled
             logging.emit_model(
-                spec.id, artifact_kind="object", url=url,
+                spec.id,
+                artifact_kind="object",
+                url=url,
             )
         else:
             logging.log(
                 "library.asset_missing",
-                id=spec.id, library_id=match.library_id,
+                id=spec.id,
+                library_id=match.library_id,
             )
 
-        resolved.append(Node(
-            id=spec.id,
-            prompt=spec.prompt,
-            bbox=bbox,
-            proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
-            placement=spec.placement,
-            referenced_ids=list(spec.referenced_ids),
-            parent_id=spec.parent,
-            parent_kind=spec.parent_kind,
-            mesh_url=url,
-        ))
+        resolved.append(
+            Node(
+                id=spec.id,
+                prompt=spec.prompt,
+                bbox=bbox,
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+                placement=spec.placement,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=spec.parent,
+                parent_kind=spec.parent_kind,
+                mesh_url=url,
+            )
+        )
 
     return resolved
 
@@ -466,7 +452,7 @@ async def _build_image_prompt(
     bbox: BoundingBox,
     proxy_shape: ProxyShape | None,
     prior_prompts: list[str],
-    view: ImageView = "front",
+    view: str = "front",
     include_dimensions: bool = True,
 ) -> tuple[str, str]:
     """Returns (subject_phrase, wrapped_image_prompt). The subject phrase is
@@ -477,18 +463,21 @@ async def _build_image_prompt(
     Set include_dimensions=False for library generation where objects have
     no meaningful bbox — omits the dimension constraint from the image
     prompt so the model renders natural proportions."""
+    p = prompt_runtime.current()
     out = await llm.call_llm(
-        system=SYSTEM_IMAGE_PROMPT,
-        user=render_image_prompt(
-            prompt=prompt, bbox=bbox, proxy_shape=proxy_shape,
+        system=p.SYSTEM_IMAGE_PROMPT,
+        user=p.render_image_prompt(
+            prompt=prompt,
+            bbox=bbox,
+            proxy_shape=proxy_shape,
             prior_prompts=prior_prompts,
         ),
-        output_schema=ImagePromptOutput,
+        output_schema=p.ImagePromptOutput,
         node_id=spec_id,
         step="image_prompt",
     )
     dims = bbox.size if include_dimensions else None
-    return out.prompt, wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
+    return out.prompt, p.wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
 
 
 _pending: dict[str, list[asyncio.Task[None]]] = {}
@@ -516,15 +505,19 @@ async def _generate_one(
         # stays the bare subject phrase for everything else.
         banana_prompt = node.image_prompt or node.prompt
         image_path = image_stem.parent / f"{image_stem.name}.png"
+        had_image = image_path.exists() and logging.find_event("image", id=node.id) is not None
         image = await nano_banana.generate_resumable(
-            banana_prompt, job_id=node.id, save_to=image_path,
+            banana_prompt,
+            job_id=node.id,
+            save_to=image_path,
         )
-        logging.log(
-            "image",
-            id=node.id,
-            url=_artifact_url(runs_dir, image_path),
-            prompt=node.prompt,
-        )
+        if not had_image:
+            logging.log(
+                "image",
+                id=node.id,
+                url=_artifact_url(runs_dir, image_path),
+                prompt=node.prompt,
+            )
         await threed.generate_mesh(
             image.image_bytes,
             output_path=raw,
@@ -534,15 +527,19 @@ async def _generate_one(
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, raw)
             rescaled = await asyncio.to_thread(
-                rescale_mesh_to_bbox, scene, node.bbox,
+                rescale_mesh_to_bbox,
+                scene,
+                node.bbox,
                 orientation=node.orientation,
             )
             await asyncio.to_thread(rescaled.export, path, file_type="glb")
             del scene, rescaled
         logging.emit_model(
-            node.id, artifact_kind="object", url=_artifact_url(runs_dir, path),
+            node.id,
+            artifact_kind="object",
+            url=_artifact_url(runs_dir, path),
         )
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
 
 
@@ -563,6 +560,10 @@ async def _spawn_meshes(
         path = objs_dir / f"{node.id}.glb"
         image_stem = objs_dir / node.id
         url = _artifact_url(runs_dir, path)
+        if path.exists():
+            logging.emit_model(node.id, artifact_kind="object", url=url)
+            out.append(node.model_copy(update={"mesh_url": url}))
+            continue
         logging.log("mesh.submit", id=node.id, prompt=node.prompt)
         pending.append(
             asyncio.create_task(
@@ -605,7 +606,11 @@ async def retry_node(
     logging.log("mesh.retry", id=node.id, prompt=node.prompt)
     task = asyncio.create_task(
         _generate_one(
-            node, raw=raw, path=path, image_stem=image_stem, runs_dir=runs_dir,
+            node,
+            raw=raw,
+            path=path,
+            image_stem=image_stem,
+            runs_dir=runs_dir,
         ),
     )
     _pending.setdefault(run_id, []).append(task)
@@ -637,13 +642,15 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
 ) -> None:
     specs = await _decompose_objects_validated(
-        zone=zone, scenario=scenario, all_nodes=all_nodes, ancestors=ancestors,
+        zone=zone,
+        scenario=scenario,
+        all_nodes=all_nodes,
     )
-    logging.log(
+    logging.log_once(
         "generation.decompose",
+        match_fields=("zone", "scenario"),
         zone=zone.id,
         scenario=scenario,
         objects=[s.id for s in specs],
@@ -651,8 +658,12 @@ async def run(
 
     if specs:
         placed = await _resolve_and_generate(
-            specs=specs, zone=zone, all_nodes=all_nodes, scenario=scenario,
-            runs_dir=runs_dir, run_id=run_id,
+            specs=specs,
+            zone=zone,
+            all_nodes=all_nodes,
+            scenario=scenario,
+            runs_dir=runs_dir,
+            run_id=run_id,
         )
         all_nodes.extend(placed)
 
@@ -661,15 +672,28 @@ async def run(
 
     while True:
         decision = await _next_object_validated(
-            zone=zone, all_nodes=all_nodes, ancestors=ancestors,
+            zone=zone,
+            all_nodes=all_nodes,
         )
         if decision.done or decision.object is None:
-            logging.log("generation.next.done", zone=zone.id)
+            logging.log_once(
+                "generation.next.done",
+                match_fields=("zone",),
+                zone=zone.id,
+            )
             return
-        logging.log("generation.next", zone=zone.id, id=decision.object.id)
+        logging.log_once(
+            "generation.next",
+            match_fields=("zone", "id"),
+            zone=zone.id,
+            id=decision.object.id,
+        )
         new_nodes = await _resolve_and_generate(
-            specs=[decision.object], zone=zone, all_nodes=all_nodes,
+            specs=[decision.object],
+            zone=zone,
+            all_nodes=all_nodes,
             scenario="anchor",
-            runs_dir=runs_dir, run_id=run_id,
+            runs_dir=runs_dir,
+            run_id=run_id,
         )
         all_nodes.extend(new_nodes)
