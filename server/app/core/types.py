@@ -34,6 +34,22 @@ Orientation = Annotated[
 
 Vec3Cm = tuple[float, float, float]
 
+# Frame transforms translate an origin by adding/subtracting a parent corner.
+# Those sums reintroduce IEEE-754 dust (0.1 + 0.0 lands on a double whose
+# shortest repr is "0.09999999999999998"). Since every coordinate is authored
+# on a centimeter grid, snapping the translated origin back to micrometer
+# precision strips the dust without touching any real authored value, and —
+# crucially — stops the dust from propagating into child placements.
+_COORD_DECIMALS = 6
+
+
+def _round_vec(v: Vec3Tuple) -> Vec3Cm:
+    return (
+        round(v[0], _COORD_DECIMALS),
+        round(v[1], _COORD_DECIMALS),
+        round(v[2], _COORD_DECIMALS),
+    )
+
 
 class BoundingBox(BaseModel):
     """
@@ -97,7 +113,7 @@ class BoundingBox(BaseModel):
         px, py, pz = parent.min_corner
         ox, oy, oz = self.origin
         return BoundingBox(
-            origin=(ox - px, oy - py, oz - pz),
+            origin=_round_vec((ox - px, oy - py, oz - pz)),
             dimensions=self.dimensions,
         )
 
@@ -107,7 +123,7 @@ class BoundingBox(BaseModel):
         px, py, pz = parent.min_corner
         ox, oy, oz = self.origin
         return BoundingBox(
-            origin=(ox + px, oy + py, oz + pz),
+            origin=_round_vec((ox + px, oy + py, oz + pz)),
             dimensions=self.dimensions,
         )
 

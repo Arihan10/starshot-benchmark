@@ -17,12 +17,18 @@ const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
-const slotsEl = document.getElementById("slots");
+const logToggleEl = document.getElementById("log-toggle");
+const slotBarEl = document.getElementById("slot-bar");
+const slotBarToggleEl = document.getElementById("slot-bar-toggle");
+const controlsBarEl = document.getElementById("controls-bar");
+const controlsBarToggleEl = document.getElementById("controls-bar-toggle");
 const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
 const modelPickerEl = document.getElementById("model-picker");
 const runPickerEl = document.getElementById("run-picker");
 const runNewEl = document.getElementById("run-new");
+const saveAllEl = document.getElementById("save-all");
+const snapshotAllEl = document.getElementById("snapshot-all");
 const resumeAllEl = document.getElementById("resume-all");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
@@ -211,8 +217,30 @@ function appendEvent(event) {
 }
 
 function clearLog() {
-  logEl.innerHTML = "";
+  for (const child of Array.from(logEl.querySelectorAll(".line"))) {
+    child.remove();
+  }
 }
+
+// --- collapsible bars --------------------------------------------------------
+
+function toggleCollapse(el, toggleEl) {
+  const collapsed = el.classList.toggle("collapsed");
+  toggleEl.textContent = collapsed ? "▸" : "▾";
+}
+
+slotBarToggleEl.addEventListener("click", () =>
+  toggleCollapse(slotBarEl, slotBarToggleEl),
+);
+slotBarEl.querySelector(".bar-label").addEventListener("click", () =>
+  toggleCollapse(slotBarEl, slotBarToggleEl),
+);
+controlsBarEl.querySelector(".ctrl-header").addEventListener("click", () =>
+  toggleCollapse(controlsBarEl, controlsBarToggleEl),
+);
+document.getElementById("log-header").addEventListener("click", () =>
+  toggleCollapse(logEl, logToggleEl),
+);
 
 // id -> error message for every mesh that errored during the current run.
 // Drives the per-node "error" phase in the tree and the aggregated count
@@ -3165,8 +3193,7 @@ function currentRunInfo() {
 }
 
 function renderSlotTabs() {
-  // Wipe any existing .slot-tab children; keep the #slot-reset button.
-  for (const child of Array.from(slotsEl.querySelectorAll(".slot-tab"))) {
+  for (const child of Array.from(slotBarEl.querySelectorAll(".slot-tab"))) {
     child.remove();
   }
   for (const s of slotSummaries) {
@@ -3176,8 +3203,6 @@ function renderSlotTabs() {
     tab.dataset.slotId = s.id;
     tab.title = s.prompt ?? "";
 
-    // Dot reflects the (slot, currentModel) cell's status — the active model
-    // dimension picks which of the N parallel runs we're watching.
     const status = s.runs?.[currentModel]?.status ?? "idle";
     const dot = document.createElement("span");
     dot.className = `slot-dot status-${status}`;
@@ -3188,7 +3213,7 @@ function renderSlotTabs() {
     tab.appendChild(label);
 
     tab.addEventListener("click", () => switchSlot(s.id));
-    slotsEl.insertBefore(tab, resetEl);
+    slotBarEl.insertBefore(tab, slotBarToggleEl);
   }
 }
 
@@ -3536,6 +3561,59 @@ runPickerEl.addEventListener("change", () => {
 });
 
 runNewEl.addEventListener("click", createRun);
+
+async function saveAllAndNew() {
+  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  const name = `save_${ts}`;
+  saveAllEl.disabled = true;
+  try {
+    const res = await fetch(new URL("/runs", SERVER_URL), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name }),
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      setStatus(`save all failed: ${detail}`, "err");
+      return;
+    }
+    const prevRun = currentRun;
+    const payload = await res.json();
+    currentRun = payload.current;
+    setStatus(`saved run "${prevRun}" — switched to fresh run "${currentRun}"`);
+    await refreshRuns();
+    resetClientStateForRunSwitch();
+    await refreshSlots();
+    if (currentSlotId && currentModel) {
+      switchView(currentSlotId, currentModel);
+    }
+  } finally {
+    saveAllEl.disabled = false;
+  }
+}
+
+saveAllEl.addEventListener("click", saveAllAndNew);
+
+async function snapshotAll() {
+  snapshotAllEl.disabled = true;
+  try {
+    const res = await fetch(new URL("/runs/snapshot", SERVER_URL), {
+      method: "POST",
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      setStatus(`snapshot failed: ${detail}`, "err");
+      return;
+    }
+    const payload = await res.json();
+    setStatus(`snapshot saved as "${payload.snapshot}"`);
+    await refreshRuns();
+  } finally {
+    snapshotAllEl.disabled = false;
+  }
+}
+
+snapshotAllEl.addEventListener("click", snapshotAll);
 
 async function resumeAll() {
   // Fans out POST /slots/<slot>/<model>/resume for every cell on the active

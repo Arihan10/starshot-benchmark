@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import shutil
+from datetime import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -200,6 +201,19 @@ def create_app() -> FastAPI:
         global _current_run
         _current_run = name
         return {"current": name}
+
+    @app.post("/runs/snapshot")
+    async def snapshot_run() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        src = _run_dir(_current_run)
+        if not src.is_dir():
+            raise HTTPException(status_code=404, detail=f"current run not found: {_current_run}")
+        ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        name = f"save_{ts}"
+        dst = _run_dir(name)
+        if dst.exists():
+            raise HTTPException(status_code=409, detail=f"snapshot already exists: {name}")
+        shutil.copytree(src, dst)
+        return {"snapshot": name}
 
     @app.post("/runs/{name}/activate")
     async def activate_run(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]

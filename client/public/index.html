@@ -38,7 +38,7 @@
             #topbar > * {
                 pointer-events: auto;
             }
-            #slots {
+            #slot-bar {
                 width: 100%;
                 max-width: 900px;
                 display: flex;
@@ -50,6 +50,60 @@
                 background: rgba(22, 24, 29, 0.82);
                 backdrop-filter: blur(6px);
                 box-sizing: border-box;
+            }
+            #controls-bar {
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+                padding: 6px 8px;
+                border-radius: 6px;
+                background: rgba(22, 24, 29, 0.82);
+                backdrop-filter: blur(6px);
+                box-sizing: border-box;
+            }
+            .bar-label {
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                user-select: none;
+                flex-shrink: 0;
+            }
+            .bar-toggle {
+                color: #5a5e68;
+                cursor: pointer;
+                user-select: none;
+                margin-left: auto;
+                flex-shrink: 0;
+            }
+            .bar-toggle:hover { color: #e6e6e6; }
+            #slot-bar.collapsed .slot-tab { display: none; }
+            #controls-bar.collapsed .ctrl-row { display: none; }
+            .ctrl-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                cursor: pointer;
+                user-select: none;
+            }
+            .ctrl-row {
+                display: flex;
+                flex-wrap: wrap;
+                gap: 6px;
+                align-items: center;
+            }
+            .ctrl-label {
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                flex-shrink: 0;
+            }
+            .ctrl-sep {
+                width: 1px;
+                height: 16px;
+                background: #2a2d35;
+                flex-shrink: 0;
             }
             .slot-tab {
                 display: flex;
@@ -106,7 +160,9 @@
                 outline: none;
                 border-color: #4a8fd8;
             }
-            #run-new {
+            #run-new,
+            #save-all,
+            #snapshot-all {
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #2a2d35;
@@ -117,17 +173,20 @@
                 cursor: pointer;
                 white-space: nowrap;
             }
-            #run-new:hover:not(:disabled) {
+            #run-new:hover:not(:disabled),
+            #save-all:hover:not(:disabled),
+            #snapshot-all:hover:not(:disabled) {
                 background: #1c2a36;
                 border-color: #4a8fd8;
                 color: #c8d8f0;
             }
-            #run-new:disabled {
+            #run-new:disabled,
+            #save-all:disabled,
+            #snapshot-all:disabled {
                 opacity: 0.5;
                 cursor: default;
             }
             #slot-reset {
-                margin-left: auto;
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #2a2d35;
@@ -218,9 +277,6 @@
                 font-size: 11px;
                 cursor: pointer;
                 white-space: nowrap;
-            }
-            #bbox-toggle {
-                margin-left: auto;
             }
             #bbox-toggle:hover,
             #frames-toggle:hover,
@@ -502,6 +558,25 @@
             #log .rewind:hover {
                 color: #e0c271;
             }
+            #log-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                padding-bottom: 6px;
+                margin-bottom: 4px;
+                border-bottom: 1px solid #2a2d35;
+                color: #9ad4ff;
+                font-size: 11px;
+                cursor: pointer;
+                user-select: none;
+            }
+            #log.collapsed .line { display: none; }
+            #log.collapsed { max-height: none; overflow: hidden; }
+            #log.collapsed #log-header {
+                margin-bottom: 0;
+                padding-bottom: 0;
+                border-bottom: none;
+            }
             #assets {
                 position: fixed;
                 top: 12px;
@@ -637,10 +712,10 @@
             }
             #tree {
                 position: fixed;
-                top: 160px;
+                top: 200px;
                 left: 12px;
                 width: 360px;
-                max-height: calc(100vh - 180px - 30vh);
+                max-height: calc(100vh - 220px - 30vh);
                 display: flex;
                 flex-direction: column;
                 border-radius: 6px;
@@ -1839,20 +1914,40 @@
     <body>
         <div id="canvas-host"></div>
         <div id="topbar">
-        <div id="slots">
-            <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
-            <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
-            <button id="meshes-toggle" type="button" title="Show or hide all generated meshes (bboxes-only view)">meshes: on</button>
-            <button id="select-mode-toggle" type="button" title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it">select: all</button>
-            <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
-            <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
-            <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>
-            <select id="run-picker" title="Switch the active run (versioned directory under /runs). Each run is an independent set of (slot, model) cells with its own prompt snapshot."></select>
-            <button id="run-new" type="button" title="Create a new run. Snapshots the current prompts.py into runs/<name>/prompts_snapshot.py and switches to it.">+ new run</button>
-            <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
-            <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
-            <button id="slot-resume" type="button" style="display:none">resume</button>
-            <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
+        <div id="slot-bar">
+            <span class="bar-label">slots</span>
+            <span class="bar-toggle" id="slot-bar-toggle">▾</span>
+        </div>
+        <div id="controls-bar">
+            <div class="ctrl-header">
+                <span class="bar-label">controls</span>
+                <span class="bar-toggle" id="controls-bar-toggle">▾</span>
+            </div>
+            <div class="ctrl-row">
+                <span class="ctrl-label">run</span>
+                <select id="run-picker" title="Switch the active run (versioned directory under /runs). Each run is an independent set of (slot, model) cells with its own prompt snapshot."></select>
+                <button id="run-new" type="button" title="Create a new run. Snapshots the current prompts.py into runs/<name>/prompts_snapshot.py and switches to it.">+ new run</button>
+                <button id="save-all" type="button" title="Save the current state of all slots across all models by creating a timestamped run, then switch to it so you can start fresh experiments.">save all & new</button>
+                <button id="snapshot-all" type="button" title="Copy all slot data across every model into a timestamped snapshot. Stays on the current run so you can keep working or create a new run for fresh testing.">snapshot all</button>
+                <div class="ctrl-sep"></div>
+                <span class="ctrl-label">model</span>
+                <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
+                <button id="slot-resume" type="button" style="display:none">resume</button>
+                <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
+                <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
+            </div>
+            <div class="ctrl-row">
+                <span class="ctrl-label">view</span>
+                <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
+                <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
+                <button id="meshes-toggle" type="button" title="Show or hide all generated meshes (bboxes-only view)">meshes: on</button>
+                <button id="select-mode-toggle" type="button" title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it">select: all</button>
+                <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
+                <div class="ctrl-sep"></div>
+                <span class="ctrl-label">export</span>
+                <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
+                <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>
+            </div>
         </div>
         <div id="status"><p class="line hdr">ready</p></div>
         </div>
@@ -1894,7 +1989,12 @@
                 </div>
             </div>
         </div>
-        <div id="log"></div>
+        <div id="log">
+            <div id="log-header">
+                <span>log</span>
+                <span id="log-toggle">▾</span>
+            </div>
+        </div>
         <div id="zoom-controls">
             <button id="zoom-in" type="button" title="Zoom in (R)">+</button>
             <button id="zoom-out" type="button" title="Zoom out (F)">−</button>
