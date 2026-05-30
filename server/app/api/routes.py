@@ -230,6 +230,11 @@ def create_app() -> FastAPI:
             "run": _current_run,
             "models": MODEL_ALIASES,
             "default_model": DEFAULT_MODEL_ALIAS,
+            # Env-configured default asset mode + the full set, so the client
+            # can initialize its asset-mode toggle and decide when to surface
+            # the on-demand "start asset generation" button.
+            "default_asset_mode": generation.DEFAULT_ASSET_MODE,
+            "asset_modes": list(generation.ASSET_MODES),
             "slots": [_slot_summary(s, _current_run) for s in SLOTS],
         }
 
@@ -362,6 +367,59 @@ def create_app() -> FastAPI:
             "slot_id": slot.id,
             "model": model_alias,
             "node_id": node_id,
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/generate-assets")
+    async def slot_generate_assets(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+    ) -> dict[str, str]:
+        """Realize the *other* asset set for an already-resolved cell so the
+        viewer can toggle between the library and generated meshes of the same
+        build. Reconstructs every mesh-bearing node from the event log and runs
+        `generation.generate_assets` in the background; new events stream over
+        the cell's existing SSE."""
+        run = _current_run
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        if slot_log.state.get("status") == "running":
+            raise HTTPException(
+                status_code=400,
+                detail="cell is running; wait for it to finish first",
+            )
+        prompt_runtime.bind(_prompt_module_for_run(run))
+        nodes = _reconstruct_mesh_nodes(slot_log)
+        if not nodes:
+            raise HTTPException(
+                status_code=400,
+                detail="no resolved scene to generate assets for",
+            )
+        # The primary run produced the env-default set; this pass fills the
+        # other mode.
+        target_mode = (
+            "generated" if generation.DEFAULT_ASSET_MODE == "library" else "library"
+        )
+
+        async def _do_generate() -> None:
+            rlog.bind(slot_log)
+            llm.set_model(MODELS[model_alias])
+            prompt_runtime.bind(_prompt_module_for_run(run))
+            await generation.generate_assets(
+                nodes=nodes,
+                runs_dir=RUNS_DIR,
+                run_id=_run_id(run, slot.id, model_alias),
+                mode=target_mode,
+            )
+
+        task = asyncio.create_task(_do_generate())
+        _retry_tasks.add(task)
+        task.add_done_callback(_retry_tasks.discard)
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "mode": target_mode,
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/reset")
@@ -498,6 +556,31 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
         image_prompt=image_prompt,
         parent_id=str(parent_id) if isinstance(parent_id, str) else None,
     )
+
+
+def _reconstruct_mesh_nodes(slot_log: SlotLog) -> list[tuple[Node, str]]:
+    """Rebuild every mesh-bearing node (objects + frames; abstract zones
+    excluded) from the cell's event log, paired with its node_kind. Lets the
+    on-demand asset pass re-realize the already-resolved scene in the alternate
+    mode without re-running the divider."""
+    kinds: dict[str, str] = {}
+    order: list[str] = []
+    for event in slot_log.state["events"]:
+        if event.get("kind") != "bbox":
+            continue
+        node_id = event.get("id")
+        node_kind = event.get("node_kind", "object")
+        if not isinstance(node_id, str) or node_kind not in ("object", "frame"):
+            continue
+        if node_id not in kinds:
+            order.append(node_id)
+        kinds[node_id] = node_kind
+    out: list[tuple[Node, str]] = []
+    for node_id in order:
+        node = _reconstruct_node(slot_log, node_id)
+        if node is not None:
+            out.append((node, kinds[node_id]))
+    return out
 
 
 def _require_slot(slot_id: str) -> Slot:

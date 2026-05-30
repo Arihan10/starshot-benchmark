@@ -29,6 +29,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Literal
 
@@ -41,7 +42,37 @@ from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
 from app.utils.topology import validate_referenced_ids
 
-_USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
+# Asset realization has two modes: "library" (LLM-match each object to a
+# pre-built catalog asset, then copy + rescale it) and "generated" (the full
+# Nano-Banana image -> Trellis mesh path). USE_ASSET_LIBRARY in .env picks the
+# DEFAULT mode for a fresh run; the client can realize the *other* mode on
+# demand (see `generate_assets`) so one resolved scene can be toggled between
+# both asset sets.
+ASSET_MODES = ("library", "generated")
+DEFAULT_ASSET_MODE = (
+    "library"
+    if os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
+    else "generated"
+)
+
+# Request-scoped asset mode for the current pipeline task, defaulting to the
+# env-configured mode. Bound per-task like `llm._current_model`, so no
+# call-site plumbing is needed.
+_asset_mode: ContextVar[str] = ContextVar("asset_mode", default=DEFAULT_ASSET_MODE)
+
+
+def current_asset_mode() -> str:
+    return _asset_mode.get()
+
+
+def objects_dir(runs_dir: Path, run_id: str, mode: str | None = None) -> Path:
+    """Per-mode artifact directory. The env-default mode keeps the canonical
+    `objects/` dir (so existing runs, retries, and scripts are untouched); the
+    on-demand secondary mode gets its own `objects_<mode>/` dir so both asset
+    sets coexist for one build."""
+    mode = mode or current_asset_mode()
+    name = "objects" if mode == DEFAULT_ASSET_MODE else f"objects_{mode}"
+    return runs_dir / run_id / name
 
 # Guards the trimesh load -> rescale -> export block. API calls and GLB
 # downloads stay fully parallel across slots; only the RAM-heavy mesh
@@ -274,7 +305,7 @@ async def _resolve_and_generate(
                 bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
             remaining.clear()
 
-    if _USE_ASSET_LIBRARY:
+    if current_asset_mode() == "library":
         return await _match_library_assets(
             specs=specs,
             bboxes=bboxes,
@@ -349,7 +380,7 @@ async def _match_library_assets(
 ) -> list[Node]:
     from app.services import library
 
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = objects_dir(runs_dir, run_id, "library")
     objs_dir.mkdir(parents=True, exist_ok=True)
 
     resolved: list[Node] = []
@@ -419,6 +450,7 @@ async def _match_library_assets(
                 spec.id,
                 artifact_kind="object",
                 url=url,
+                mode="library",
             )
         else:
             logging.log(
@@ -538,6 +570,7 @@ async def _generate_one(
             node.id,
             artifact_kind="object",
             url=_artifact_url(runs_dir, path),
+            mode=current_asset_mode(),
         )
     except Exception as e:
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
@@ -550,7 +583,7 @@ async def _spawn_meshes(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
 ) -> list[Node]:
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = objects_dir(runs_dir, run_id, "generated")
     objs_dir.mkdir(parents=True, exist_ok=True)
 
     out: list[Node] = []
@@ -561,7 +594,7 @@ async def _spawn_meshes(
         image_stem = objs_dir / node.id
         url = _artifact_url(runs_dir, path)
         if path.exists():
-            logging.emit_model(node.id, artifact_kind="object", url=url)
+            logging.emit_model(node.id, artifact_kind="object", url=url, mode="generated")
             out.append(node.model_copy(update={"mesh_url": url}))
             continue
         logging.log("mesh.submit", id=node.id, prompt=node.prompt)
@@ -595,7 +628,7 @@ async def retry_node(
     doesn't get recycled. Registered on `_pending` so `cancel_pending`
     (slot reset / teardown) can tear it down alongside in-flight
     pipeline meshes."""
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = objects_dir(runs_dir, run_id)
     objs_dir.mkdir(parents=True, exist_ok=True)
     raw = objs_dir / f"{node.id}.raw.glb"
     path = objs_dir / f"{node.id}.glb"
@@ -633,6 +666,120 @@ def cancel_pending(run_id: str) -> None:
     _admitted_ids.pop(run_id, None)
     for t in _pending.pop(run_id, []):
         t.cancel()
+
+
+async def _realize_library_node(
+    node: Node,
+    *,
+    objs_dir: Path,
+    runs_dir: Path,
+) -> None:
+    """Match + bake one already-resolved node into a library asset. Mirrors
+    the per-spec body of `_match_library_assets` but works from a Node so the
+    on-demand pass can reuse the divider's resolved scene."""
+    from app.services import library
+
+    path = objs_dir / f"{node.id}.glb"
+    url = _artifact_url(runs_dir, path)
+    if path.exists():
+        logging.emit_model(node.id, artifact_kind="object", url=url, mode="library")
+        return
+    match = await library.match(node.prompt)
+    asset = library.asset_path(match.library_id)
+    logging.log("library.match", id=node.id, prompt=node.prompt, library_id=match.library_id)
+    ref_image = asset.with_suffix(".png")
+    if ref_image.exists():
+        dest_image = objs_dir / f"{node.id}.png"
+        await asyncio.to_thread(shutil.copy2, ref_image, dest_image)
+        logging.log("image", id=node.id, url=_artifact_url(runs_dir, dest_image), prompt=node.prompt)
+    if asset.exists():
+        async with _MESH_IO:
+            scene = await asyncio.to_thread(trimesh.load, asset)
+            rescaled = await asyncio.to_thread(
+                rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation
+            )
+            await asyncio.to_thread(rescaled.export, path, file_type="glb")
+            del scene, rescaled
+        logging.emit_model(node.id, artifact_kind="object", url=url, mode="library")
+    else:
+        logging.log("library.asset_missing", id=node.id, library_id=match.library_id)
+
+
+async def generate_assets(
+    *,
+    nodes: list[tuple[Node, str]],
+    runs_dir: Path,
+    run_id: str,
+    mode: str,
+) -> None:
+    """On-demand realization of an already-resolved scene in a specific asset
+    `mode`, reusing the divider's bboxes/specs (no divider re-run). Produces an
+    apples-to-apples alternate to the cell's primary set: meshes land in a
+    mode-specific dir and emit `model` events tagged with `mode` so the client
+    can freely toggle between the two. `nodes` is [(node, node_kind), ...] for
+    every mesh-bearing node, reconstructed from the cell's event log."""
+    token = _asset_mode.set(mode)
+    logging.log("assets.start", mode=mode, count=len(nodes))
+    spawned: list[asyncio.Task[None]] = []
+    try:
+        objs_dir = objects_dir(runs_dir, run_id, mode)
+        objs_dir.mkdir(parents=True, exist_ok=True)
+
+        if mode == "library":
+            for node, _kind in nodes:
+                await _realize_library_node(node, objs_dir=objs_dir, runs_dir=runs_dir)
+        else:
+            # Generated: rebuild the studio-shot image prompt per node (same
+            # LLM rewrite the live pipeline does), then run banana -> Trellis.
+            # Register tasks on `_pending` so a slot reset can cancel them.
+            pending = _pending.setdefault(run_id, [])
+            committed_subjects: list[str] = []
+            for node, kind in nodes:
+                path = objs_dir / f"{node.id}.glb"
+                url = _artifact_url(runs_dir, path)
+                if path.exists():
+                    logging.emit_model(node.id, artifact_kind="object", url=url, mode=mode)
+                    committed_subjects.append(node.prompt)
+                    continue
+                view = "three-quarter" if kind == "frame" else "front"
+                subject, image_prompt = await _build_image_prompt(
+                    spec_id=node.id,
+                    prompt=node.prompt,
+                    bbox=node.bbox,
+                    proxy_shape=node.proxy_shape,
+                    prior_prompts=list(committed_subjects),
+                    view=view,
+                )
+                committed_subjects.append(subject)
+                gen_node = node.model_copy(
+                    update={"prompt": subject, "image_prompt": image_prompt}
+                )
+                logging.log("mesh.submit", id=node.id, prompt=subject)
+                task = asyncio.create_task(
+                    _generate_one(
+                        gen_node,
+                        raw=objs_dir / f"{node.id}.raw.glb",
+                        path=path,
+                        image_stem=objs_dir / node.id,
+                        runs_dir=runs_dir,
+                    )
+                )
+                spawned.append(task)
+                pending.append(task)
+            if spawned:
+                await asyncio.gather(*spawned, return_exceptions=True)
+        logging.log("assets.done", mode=mode)
+    finally:
+        # Drop our (now-finished) tasks from the shared pending list so it
+        # doesn't leak across runs; cancel_pending may already have cleared it.
+        cur = _pending.get(run_id)
+        if cur is not None:
+            for t in spawned:
+                if t in cur:
+                    cur.remove(t)
+            if not cur:
+                _pending.pop(run_id, None)
+        _asset_mode.reset(token)
 
 
 async def run(

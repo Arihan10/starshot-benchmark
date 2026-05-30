@@ -220,10 +220,15 @@ def emit_bbox(
     )
 
 
-def emit_model(node_id: str, artifact_kind: str, url: str) -> None:
-    if find_event("model", id=node_id, artifact_kind=artifact_kind) is not None:
+def emit_model(
+    node_id: str, artifact_kind: str, url: str, mode: str | None = None
+) -> None:
+    # `mode` ("library" | "generated") lets one node carry both asset sets:
+    # the dedup key includes it so realizing the alternate mode for an
+    # already-meshed node emits a fresh event instead of being suppressed.
+    if find_event("model", id=node_id, artifact_kind=artifact_kind, mode=mode) is not None:
         return
-    log("model", id=node_id, artifact_kind=artifact_kind, url=url)
+    log("model", id=node_id, artifact_kind=artifact_kind, url=url, mode=mode)
 
 
 def emit_step(node_id: str, phase: str, **extra: Any) -> None:
