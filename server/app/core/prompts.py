@@ -8,12 +8,115 @@ from pydantic import BaseModel, Field, field_validator
 
 from app.core.types import (
     BoundingBox,
+    Node,
     Orientation,
     ParentRelationshipKind,
     ProxyShape,
     Relationship,
     RelationshipKind,
 )
+
+
+# ---------- scene-graph projections ----------------------------------------
+#
+# The pipeline (divider + generation) threads a single flat `nodes` list —
+# the run-scoped registry of every placed Node — into each prompt renderer.
+# The renderers need several differently-shaped views of that list (the
+# ancestor spine, the concrete-object list, the abstract-zone list, the full
+# scene snapshot, plus id->bbox / id->parent_kind maps). These helpers derive
+# those views so every render entry point can take the same `nodes` argument
+# the call sites pass.
+#
+# Zone vs. object classification: concrete (mesh-bearing) nodes are produced
+# by the generation phase and always carry a `mesh_url`; abstract zones (root,
+# declared, planned) never do. That single bit classifies a node.
+
+
+def _by_id(nodes: list[Node]) -> dict[str, Node]:
+    return {n.id: n for n in nodes}
+
+
+def _bbox_by_id(nodes: list[Node]) -> dict[str, BoundingBox]:
+    return {n.id: n.bbox for n in nodes}
+
+
+def _parent_kind_by_id(nodes: list[Node]) -> dict[str, ParentRelationshipKind | None]:
+    return {n.id: n.parent_kind for n in nodes}
+
+
+def _is_concrete(n: Node) -> bool:
+    return n.mesh_url is not None
+
+
+def _root_node(nodes: list[Node]) -> Node | None:
+    return next((n for n in nodes if n.parent_id is None), None)
+
+
+def _ancestor_tuples(
+    nodes: list[Node], zone_id: str
+) -> list[tuple[str, str, str | None, BoundingBox, str | None]]:
+    """Spine from root -> parent of `zone_id` (excluding the zone itself), as
+    (id, prompt, plan, bbox, placement) tuples. Empty for the root."""
+    by_id = _by_id(nodes)
+    zone = by_id.get(zone_id)
+    chain: list[Node] = []
+    seen: set[str] = set()
+    cur = by_id.get(zone.parent_id) if zone and zone.parent_id else None
+    while cur is not None and cur.id not in seen:
+        seen.add(cur.id)
+        chain.append(cur)
+        cur = by_id.get(cur.parent_id) if cur.parent_id else None
+    chain.reverse()
+    return [(n.id, n.prompt, n.plan, n.bbox, n.placement) for n in chain]
+
+
+def _object_tuples(
+    nodes: list[Node],
+) -> list[tuple[str, str, str | None, BoundingBox, str | None, str | None]]:
+    """Concrete (mesh-bearing) nodes as
+    (id, prompt, parent_id, bbox, placement, parent_kind) tuples."""
+    return [
+        (
+            n.id,
+            n.prompt,
+            n.parent_id,
+            n.bbox,
+            n.placement,
+            n.parent_kind.value if n.parent_kind is not None else None,
+        )
+        for n in nodes
+        if _is_concrete(n)
+    ]
+
+
+def _prior_zone_tuples(
+    nodes: list[Node], *, exclude_id: str
+) -> list[tuple[str, str, str | None, str | None, BoundingBox, str | None]]:
+    """Every non-root abstract zone declared so far (excluding `exclude_id`),
+    as (id, prompt, plan_or_None, parent_id, bbox, placement) tuples."""
+    return [
+        (n.id, n.prompt, n.plan, n.parent_id, n.bbox, n.placement)
+        for n in nodes
+        if not _is_concrete(n) and n.parent_id is not None and n.id != exclude_id
+    ]
+
+
+def _scene_tuples(
+    nodes: list[Node],
+    *,
+    exclude_ids: set[str] | None = None,
+) -> list[
+    tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+]:
+    """Full snapshot of placed nodes (minus `exclude_ids`) as 8-tuples
+    (id, prompt, bbox, parent_id, proxy_shape, orientation, placement, plan).
+    `_render_scene_lines` splits these into <ZONES>/<OBJECTS> by `plan`."""
+    skip = exclude_ids or set()
+    return [
+        (n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation, n.placement, n.plan)
+        for n in nodes
+        if n.id not in skip
+    ]
 
 
 # Shared proxy-shape documentation injected into every prompt that lets
@@ -102,15 +205,19 @@ class ZonePlanOutput(BaseModel):
 
 SYSTEM_ROOT_ZONE_PLAN = """<intro>
 You are competing in SpatialBench, a competitive benchmark where LLMs create detailed 3D environments from text prompts. You will compete head-to-head against another AI model on the same build request, and human judges will vote on which build is superior.
+
+**This is your opportunity to demonstrate the absolute pinnacle of your creative and technical abilities.**
 </intro>
 
-<role>
-You are authoring the top-level plan for the scene from the user prompt, and deciding whether it is a single cohesive region or should decompose into distinct zones.
-</role>
+<judging_criteria>
+The judges will compare builds based on:
+- Recognizability (can they tell what you built without being told?)
+- Creativity (does your build genuinely standout from the others? does it propose a narratively driven build with detailed consideration)
+- Scene fidelity (is every part clear and well-thought out? Is it plausibly built?)
+- Overall impression (does it look impressive and masterfully crafted?)
 
-<input>
-The user message contains the user prompt for the scene, plus guidance on how to author the plan and how to decide `is_atomic`.
-</input>
+REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the FINAL SCENE. The judges only see the final scene after the entire pipeline has run through hundreds of downstream generation steps. Your output is NOT shown or judged intrinsically; only the final 3D geometry, shaped through all downstream AI expansion and generation steps, is judged. Always keep this in consideration - make sure that when your output is filtered through, expanded by and propagated down many more AI deconstruction calls, it lends well to creating a concrete 3D scene from end-to-end (while avoiding being too specific or vague, and allowing downstream steps enough agency over what to build).
+</judging_criteria>
 
 <output>
 Respond with a single JSON object containing:
@@ -146,20 +253,22 @@ def render_zone_plan(
     *,
     zone_id: str,
     zone_prompt: str,
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    objects: list[tuple[str, str, str | None, BoundingBox, str | None, str | None]],
-    bbox_by_id: dict[str, BoundingBox] | None = None,
+    nodes: list[Node],
 ) -> str:
-    """ancestors: (id, prompt, plan, bbox, placement) tuples from root → parent of this
-    zone, excluding the zone itself. Empty for the root.
-    objects: (id, prompt, parent_id, bbox, placement, parent_kind) tuples
-    for every concrete (mesh-bearing) node placed anywhere in the run so
-    far. `parent_kind` is unused here; consumed only by
-    `_scene_context_zone_decompose_narrative` to split frames from
-    interior anchor objects."""
+    """Author the high-level plan for `zone_id`. The ancestor spine and the
+    concrete-object list are derived from the run-wide `nodes` registry; an
+    empty `nodes` (the root, planned before it exists as a Node) yields the
+    root competitive prompt format.
+
+    objects (derived): concrete (mesh-bearing) nodes. `parent_kind` is unused
+    here; consumed only by `_scene_context_zone_decompose_narrative` to split
+    frames from interior anchor objects."""
+    ancestors = _ancestor_tuples(nodes, zone_id)
+    objects = _object_tuples(nodes)
+    bbox_by_id = _bbox_by_id(nodes)
     # Root zone uses the new competitive prompt format
     if not ancestors:
-        return f"""you are the first step in the SpatialBench pipeline and the step responsible for determining the high-level description and direction of the overall scene. write one paragraph that describes a 3D scene imagined from the following prompt, and decide whether this scene should decompose into multiple distinct zones.
+        return f"""you are the first step in the SpatialBench pipeline and the step responsible for determining the high-level description and direction of the overall scene. write one paragraph that describes a 3D scene imagined from the following prompt.
 
 "{zone_prompt}"
 
@@ -635,27 +744,29 @@ def _scene_context_zone_decompose_narrative(
 def render_zone_decompose(
     *,
     zone_id: str,
-    zone_prompt: str,
-    zone_bbox: BoundingBox,
     zone_plan: str,
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    objects: list[tuple[str, str, str | None, BoundingBox, str | None, str | None]],
-    scene_prompt: str,
-    scene_plan: str,
-    prior_zones: list[tuple[str, str, str | None, str, BoundingBox, str | None]],
-    bbox_by_id: dict[str, BoundingBox] | None = None,
+    nodes: list[Node],
 ) -> str:
-    """ancestors: (id, prompt, plan, bbox, placement) tuples from root →
-    parent of this zone, excluding the zone itself. Empty for the root.
-    `placement` is None for root only.
-    objects: (id, prompt, parent_id, bbox, placement, parent_kind) tuples
-    for every concrete (mesh-bearing) node placed anywhere in the run so
-    far. `parent_kind` is `'ATTACHED'` for shell frames and `'ON' / 'IN'`
-    for interior anchor objects.
-    prior_zones: (id, prompt, plan_or_None, parent_id, bbox, placement)
-    for every non-root zone already declared in the run, in declaration
-    order. `plan` is None for zones that have been declared (bbox
-    resolved) but not yet recursed into for individual planning."""
+    """Break `zone_id` into top-level subzones. The full scene context is
+    derived from the run-wide `nodes` registry:
+      ancestors: spine root -> parent of this zone (excluding it).
+      objects:   concrete (mesh-bearing) nodes — frames (parent_kind ATTACHED)
+                 and interior anchors (ON / IN).
+      prior_zones: every other non-root abstract zone declared so far; `plan`
+                 is None for zones declared (bbox resolved) but not yet
+                 individually planned.
+      scene_prompt/scene_plan: the root zone's prompt and plan."""
+    by_id = _by_id(nodes)
+    zone = by_id[zone_id]
+    zone_prompt = zone.prompt
+    zone_bbox = zone.bbox
+    ancestors = _ancestor_tuples(nodes, zone_id)
+    objects = _object_tuples(nodes)
+    prior_zones = _prior_zone_tuples(nodes, exclude_id=zone_id)
+    bbox_by_id = _bbox_by_id(nodes)
+    root = _root_node(nodes) or zone
+    scene_prompt = root.prompt
+    scene_plan = root.plan or zone_plan
     narrative = _scene_context_zone_decompose_narrative(
         target_zone_id=zone_id,
         target_zone_prompt=zone_prompt,
@@ -752,10 +863,11 @@ def _render_relationships(rels: list[Relationship]) -> str:
 def render_zone_bbox_batch(
     *,
     parent_id: str,
-    parent_bbox: BoundingBox,
     children: list["ChildNodeSpec"],
-    bbox_by_id: dict[str, BoundingBox],
+    nodes: list[Node],
 ) -> str:
+    parent_bbox = _by_id(nodes)[parent_id].bbox
+    bbox_by_id = _bbox_by_id(nodes)
     child_ids = {c.id for c in children}
 
     def _child_parent_dims(c: "ChildNodeSpec") -> str:
@@ -1078,15 +1190,18 @@ Produce a NEW decomposition that fixes every listed reason. In particular, ensur
 def render_anchor_decomp(
     *,
     zone_id: str,
-    zone_plan: str | None,
-    zone_bbox: BoundingBox,
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
-    ],
+    nodes: list[Node],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
-    bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> str:
+    zone = _by_id(nodes)[zone_id]
+    zone_plan = zone.plan
+    zone_bbox = zone.bbox
+    ancestors = _ancestor_tuples(nodes, zone_id)
+    bbox_by_id = _bbox_by_id(nodes)
+    # `scene` excludes the zone itself and its ancestor spine — those are
+    # rendered separately (zone_plan block + ANCESTOR_CHAIN), so leaving them
+    # in <ZONES> would double-render them.
+    scene = _scene_tuples(nodes, exclude_ids={zone_id, *(a[0] for a in ancestors)})
     zone_parent_id = ancestors[-1][0] if ancestors else None
     if zone_parent_id and bbox_by_id and zone_parent_id in bbox_by_id:
         parent_bbox = bbox_by_id[zone_parent_id]
@@ -1125,15 +1240,15 @@ Each anchor object in your resultant list has an id, prompt, parent (the structu
 def render_encapsulating_decomp(
     *,
     zone_id: str,
-    zone_plan: str | None,
-    zone_bbox: BoundingBox,
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
-    ],
+    nodes: list[Node],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
-    bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> str:
+    zone = _by_id(nodes)[zone_id]
+    zone_plan = zone.plan
+    zone_bbox = zone.bbox
+    ancestors = _ancestor_tuples(nodes, zone_id)
+    bbox_by_id = _bbox_by_id(nodes)
+    scene = _scene_tuples(nodes, exclude_ids={zone_id, *(a[0] for a in ancestors)})
     zone_parent_id = ancestors[-1][0] if ancestors else None
     if zone_parent_id and bbox_by_id and zone_parent_id in bbox_by_id:
         parent_bbox = bbox_by_id[zone_parent_id]
@@ -1180,14 +1295,14 @@ ZONE_ID: {zone_id!r}
 def render_negative_space_decomp(
     *,
     zone_id: str,
-    zone_plan: str | None,
-    zone_bbox: BoundingBox,
-    scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
-    ],
+    nodes: list[Node],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
-    bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> str:
+    zone = _by_id(nodes)[zone_id]
+    zone_plan = zone.plan
+    zone_bbox = zone.bbox
+    bbox_by_id = _bbox_by_id(nodes)
+    scene = _scene_tuples(nodes, exclude_ids={zone_id})
     zone_bbox_line = f"Zone bbox_dimensions: [{zone_bbox.size[0]:.2f}, {zone_bbox.size[1]:.2f}, {zone_bbox.size[2]:.2f}]"
     return f"""Generate a list of objects that would cover the negative, unfilled space between the objects in the zone described below, based on the attached context.
 
@@ -1236,15 +1351,18 @@ No prose, no markdown, no code fences.
 def render_object_bbox_batch(
     *,
     zone_id: str,
-    zone_prompt: str,
-    zone_bbox: BoundingBox,
     objects: list[ObjectSpec],
-    peers: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
-    ],
-    bbox_by_id: dict[str, BoundingBox],
-    parent_kind_by_id: dict[str, "ParentRelationshipKind | None"],
+    nodes: list[Node],
 ) -> str:
+    zone = _by_id(nodes)[zone_id]
+    zone_prompt = zone.prompt
+    zone_bbox = zone.bbox
+    # Peers are every other placed node (the objects being resolved are still
+    # specs, not yet in `nodes`); the zone itself is shown via the Zone bbox
+    # line, so it is excluded here.
+    peers = _scene_tuples(nodes, exclude_ids={zone_id})
+    bbox_by_id = _bbox_by_id(nodes)
+    parent_kind_by_id = _parent_kind_by_id(nodes)
     # Each peer bbox is rendered relative to that peer's own semantic
     # parent (origin at parent.min_corner). The LLM emits each new
     # object's bbox in its parent's local frame as well;
@@ -1477,15 +1595,15 @@ Produce ONE short noun phrase naming the subject."""
 def render_next_object(
     *,
     zone_id: str,
-    zone_plan: str | None,
-    zone_bbox: BoundingBox,
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
-    ],
+    nodes: list[Node],
     prior_attempts: list[tuple[ObjectSpec, str]] | None = None,
-    bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> str:
+    zone = _by_id(nodes)[zone_id]
+    zone_plan = zone.plan
+    zone_bbox = zone.bbox
+    ancestors = _ancestor_tuples(nodes, zone_id)
+    bbox_by_id = _bbox_by_id(nodes)
+    scene = _scene_tuples(nodes, exclude_ids={zone_id, *(a[0] for a in ancestors)})
     zone_parent_id = ancestors[-1][0] if ancestors else None
     if zone_parent_id and bbox_by_id and zone_parent_id in bbox_by_id:
         parent_bbox = bbox_by_id[zone_parent_id]
