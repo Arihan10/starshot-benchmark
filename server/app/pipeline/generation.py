@@ -39,7 +39,7 @@ from app.core.types import BoundingBox, Node, ProxyShape
 from app.services import llm, nano_banana, threed
 from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
-from app.utils.topology import validate_referenced_ids
+from app.utils.topology import validate_parents, validate_referenced_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
 
@@ -129,6 +129,10 @@ async def _decompose_objects_validated(
             # set. After exhausting attempts we fall through to the
             # accept_invalid branch below.
             prior_attempts.append((specs, reason))
+    # Retries exhausted. Unresolvable parents are a hard fail (orphaned
+    # objects would ship a mesh yet be invisible to every later step);
+    # secondary referenced_ids stay advisory and are accepted with a log.
+    validate_parents(specs, parent_id=zone.id, existing_ids=existing_ids)
     logging.log_once(
         "generation.decompose.accept_invalid",
         match_fields=("zone",),
@@ -180,6 +184,10 @@ async def _next_object_validated(
             )
             prior_attempts.append((decision.object, reason))
     assert decision is not None
+    # Retries exhausted. An unresolvable parent on the emitted object is a
+    # hard fail; a dangling secondary referenced_id is accepted with a log.
+    if decision.object is not None:
+        validate_parents([decision.object], parent_id=zone.id, existing_ids=existing_ids)
     logging.log_once(
         "generation.next.accept_invalid",
         match_fields=("zone",),
@@ -244,6 +252,7 @@ async def _resolve_and_generate(
             zone_id=zone.id,
             zone_prompt=zone.prompt,
             zone_plan=zone.plan,
+            zone_bbox=zone.bbox,
             objects=specs,
             nodes=all_nodes,
         ),

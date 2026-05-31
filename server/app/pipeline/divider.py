@@ -2,25 +2,27 @@
 
 Per-node flow:
   1. ZONE PLAN (LLM) — high-level character/intent AND the is_atomic
-     decision. Authored at the parent level (before this zone's
-     encapsulating pass) so the plan paragraph is in scope when its
-     own shell is generated. Root is planned in `run()` before
-     `_build(root)`.
+     decision. Authored at the parent level (before this zone's own
+     `_build` pass) so the plan paragraph is in scope when its own
+     shell is generated. Root is planned in `run()` before `_build(root)`.
   2. (root only) Overall bounding box (LLM) — sizes the canvas to the
      silhouette implied by the root's plan.
-  3. (root only) Encapsulating pass — generates the world-scale boundary
-     immediately so root's own decomposition can see it in scene context.
-  4. If ATOMIC, hand to Phase 2 generation for anchor-object population.
-  5. ZONE DECOMPOSE (LLM) — non-atomic zones only. Emits each child as
-     a seed (id, prompt, proxy_shape, relationships) in one call. The
-     sibling-relationship DAG is checked for cycles; any cycle is
-     logged and accepted (advisory).
-  6. Batch-resolve a bbox for EVERY child in one LLM call.
+  3. ZONE DECOMPOSE (LLM) — non-atomic zones only. Emits each child as
+     a seed (id, prompt, proxy_shape, relationships) in one call. Each
+     child's `parent` must resolve (HARD fail via `validate_parents` —
+     an orphaned subzone would render nowhere yet still ship a mesh);
+     secondary `referenced_ids` are advisory (a dangling peer hint is
+     logged and accepted).
+  4. Batch-resolve a bbox for EVERY child in one LLM call, then place them.
+  5. Encapsulating pass — generates this zone's physical shell / ground.
+     TEMPORARY ORDER SWAP: this now runs AFTER decomposition (steps 3-4)
+     so the shell author sees the placed child zones in scene context.
+     The original order ran it before decomposing (and, for the root,
+     before `_build` was even entered). Atomic zones skip steps 3-4 and
+     run this pass directly before Phase 2.
+  6. If ATOMIC, hand to Phase 2 generation for anchor-object population.
   7. For each placed child, in declaration order: author the child's
-     plan (LLM), run its encapsulating pass with the plan in scope,
-     then recurse. Interleaving ensures the shell author sees the
-     child's own structural intent (vertical penetrations, voids,
-     double-height spaces) rather than only the one-sentence seed.
+     plan (LLM), then recurse.
 
 Root additionally gets a final negative-space pass at the end of the run.
 """
@@ -35,7 +37,7 @@ from app.core.types import BoundingBox, Node
 from app.pipeline import generation
 from app.services import llm
 from app.utils import logging
-from app.utils.topology import validate_referenced_ids
+from app.utils.topology import validate_parents, validate_referenced_ids
 
 
 async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
@@ -109,6 +111,8 @@ async def _resolve_child_bboxes_batch(
         user=p.render_zone_bbox_batch(
             parent_id=parent.id,
             parent_prompt=parent.prompt,
+            parent_plan=parent.plan,
+            parent_bbox=parent.bbox,
             children=children,
             nodes=all_nodes,
         ),
@@ -155,6 +159,87 @@ async def _build(
 ) -> None:
     assert node.plan is not None, "node.plan must be set by caller"
 
+    placed: list[Node] = []
+    if not is_atomic:
+        logging.emit_step(node.id, "decomposing")
+        decomp = await _decompose_zone(node=node, all_nodes=all_nodes)
+        logging.log_once(
+            "divider.zone_decompose",
+            match_fields=("node",),
+            node=node.id,
+            children=[c.model_dump() for c in decomp.children],
+        )
+
+        existing_ids = {n.id for n in all_nodes}
+        # Unresolvable parents are a hard fail — an orphaned subzone would
+        # be generated into the scene yet invisible to every later step.
+        # `_run` catches this and turns it into a clean run.error.
+        validate_parents(
+            decomp.children,
+            parent_id=node.id,
+            existing_ids=existing_ids,
+        )
+        # Secondary referenced_ids stay advisory: a dangling peer hint is
+        # logged (a benchmark signal) but doesn't orphan anything.
+        try:
+            validate_referenced_ids(
+                decomp.children,
+                parent_id=node.id,
+                existing_ids=existing_ids,
+            )
+        except ValueError as e:
+            logging.log(
+                "divider.validate.referenced_ids.accept_invalid",
+                node=node.id,
+                reason=str(e),
+            )
+
+        logging.emit_step(node.id, "resolving_bboxes", parent=node.id)
+        bboxes = await _resolve_child_bboxes_batch(
+            parent=node,
+            children=decomp.children,
+            all_nodes=all_nodes,
+        )
+
+        for spec in decomp.children:
+            child_bbox = bboxes[spec.id]
+            logging.emit_bbox(
+                spec.id,
+                child_bbox,
+                parent_id=node.id,
+                prompt=spec.prompt,
+                kind="zone",
+                proxy_shape=spec.proxy_shape,
+            )
+            child = Node(
+                id=spec.id,
+                prompt=spec.prompt,
+                bbox=child_bbox,
+                proxy_shape=spec.proxy_shape,
+                placement=spec.placement,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=spec.parent,
+                parent_kind=spec.parent_kind,
+                plan=None,
+                is_zone=True,
+            )
+            placed.append(child)
+            all_nodes.append(child)
+
+    # TEMPORARY ORDER SWAP: the encapsulating shell is generated AFTER this
+    # zone's decomposition (above) so the shell author sees the placed child
+    # zones in scene context. The original order generated the shell before
+    # decomposing. Atomic leaves have no decomposition and frame directly
+    # before anchor population.
+    logging.emit_step(node.id, "generating_frame")
+    await generation.run(
+        zone=node,
+        runs_dir=runs_dir,
+        run_id=run_id,
+        scenario="encapsulating",
+        all_nodes=all_nodes,
+    )
+
     if is_atomic:
         logging.emit_step(node.id, "generating_anchor")
         await generation.run(
@@ -166,61 +251,6 @@ async def _build(
         )
         logging.emit_step(node.id, "done")
         return
-
-    logging.emit_step(node.id, "decomposing")
-    decomp = await _decompose_zone(node=node, all_nodes=all_nodes)
-    logging.log_once(
-        "divider.zone_decompose",
-        match_fields=("node",),
-        node=node.id,
-        children=[c.model_dump() for c in decomp.children],
-    )
-
-    try:
-        validate_referenced_ids(
-            decomp.children,
-            parent_id=node.id,
-            existing_ids={n.id for n in all_nodes},
-        )
-    except ValueError as e:
-        logging.log(
-            "divider.validate.referenced_ids.accept_invalid",
-            node=node.id,
-            reason=str(e),
-        )
-
-    logging.emit_step(node.id, "resolving_bboxes", parent=node.id)
-    bboxes = await _resolve_child_bboxes_batch(
-        parent=node,
-        children=decomp.children,
-        all_nodes=all_nodes,
-    )
-
-    placed: list[Node] = []
-    for spec in decomp.children:
-        child_bbox = bboxes[spec.id]
-        logging.emit_bbox(
-            spec.id,
-            child_bbox,
-            parent_id=node.id,
-            prompt=spec.prompt,
-            kind="zone",
-            proxy_shape=spec.proxy_shape,
-        )
-        child = Node(
-            id=spec.id,
-            prompt=spec.prompt,
-            bbox=child_bbox,
-            proxy_shape=spec.proxy_shape,
-            placement=spec.placement,
-            referenced_ids=list(spec.referenced_ids),
-            parent_id=spec.parent,
-            parent_kind=spec.parent_kind,
-            plan=None,
-            is_zone=True,
-        )
-        placed.append(child)
-        all_nodes.append(child)
 
     for child in placed:
         logging.emit_step(child.id, "planning")
@@ -238,15 +268,6 @@ async def _build(
             node=planned.id,
             plan=plan_out.plan,
             is_atomic=plan_out.is_atomic,
-        )
-
-        logging.emit_step(planned.id, "generating_frame")
-        await generation.run(
-            zone=planned,
-            runs_dir=runs_dir,
-            run_id=run_id,
-            scenario="encapsulating",
-            all_nodes=all_nodes,
         )
 
         await _build(
@@ -291,14 +312,10 @@ async def run(
         is_zone=True,
     )
     all_nodes: list[Node] = [root]
-    logging.emit_step(root.id, "generating_frame")
-    await generation.run(
-        zone=root,
-        runs_dir=runs_dir,
-        run_id=run_id,
-        scenario="encapsulating",
-        all_nodes=all_nodes,
-    )
+    # TEMPORARY ORDER SWAP: root's encapsulating shell is no longer generated
+    # here (before decomposition). `_build(root)` now runs it after root's own
+    # decomposition, so the world boundary is authored knowing the top-level
+    # zones.
     await _build(
         node=root,
         runs_dir=runs_dir,
