@@ -139,6 +139,51 @@
             .slot-dot.status-error   { background: #ff8080; }
             .slot-dot.status-paused  { background: #e09050; }
             .slot-dot.status-idle    { background: #5a5e68; }
+            #version-bar {
+                display: flex;
+                gap: 4px;
+                flex-wrap: wrap;
+            }
+            .version-tab {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 5px 9px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            .version-tab:hover { border-color: #4a8fd8; }
+            .version-tab.active {
+                background: #2a4a78;
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            #version-launch-all {
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #2a4a78;
+                background: #16181d;
+                color: #9ad4ff;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #version-launch-all:hover:not(:disabled) {
+                background: #2a3a5a;
+                border-color: #4a8fd8;
+                color: #c8d8f0;
+            }
+            #version-launch-all:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
             #model-picker,
             #run-picker {
                 margin-left: 4px;
@@ -186,7 +231,8 @@
                 opacity: 0.5;
                 cursor: default;
             }
-            #slot-reset {
+            #slot-reset,
+            #reset-all {
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #2a2d35;
@@ -197,12 +243,14 @@
                 cursor: pointer;
                 white-space: nowrap;
             }
-            #slot-reset:hover:not(:disabled) {
+            #slot-reset:hover:not(:disabled),
+            #reset-all:hover:not(:disabled) {
                 background: #3a2a2a;
                 border-color: #6a3a3a;
                 color: #e6e6e6;
             }
-            #slot-reset:disabled {
+            #slot-reset:disabled,
+            #reset-all:disabled {
                 opacity: 0.5;
                 cursor: default;
             }
@@ -1929,6 +1977,11 @@
                 <span class="bar-toggle" id="controls-bar-toggle">▾</span>
             </div>
             <div class="ctrl-row">
+                <span class="ctrl-label">version</span>
+                <div id="version-bar"></div>
+                <button id="version-launch-all" type="button" title="Start all three pipeline versions (V1 legacy-XML, V2 new-context frame-first, V3 new-context decomp-first) on the current slot + model so they run concurrently. Switch which one you are viewing with the buttons; the others keep running in the background.">launch all 3</button>
+            </div>
+            <div class="ctrl-row">
                 <span class="ctrl-label">run</span>
                 <select id="run-picker" title="Switch the active run (versioned directory under /runs). Each run is an independent set of (slot, model) cells with its own prompt snapshot."></select>
                 <button id="run-new" type="button" title="Create a new run. Snapshots the current prompts.py into runs/<name>/prompts_snapshot.py and switches to it.">+ new run</button>
@@ -1940,6 +1993,7 @@
                 <button id="slot-resume" type="button" style="display:none">resume</button>
                 <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
                 <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
+                <button id="reset-all" type="button" title="Wipe and restart every started cell across ALL models on the current run (every slot × model that has data). Skips never-run cells. Useful for re-running a v1/v2/v3 AB test from scratch.">reset all</button>
             </div>
             <div class="ctrl-row">
                 <span class="ctrl-label">view</span>

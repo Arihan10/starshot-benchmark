@@ -47,7 +47,7 @@ from app.core.slots import (
     Slot,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
-from app.pipeline import divider, generation
+from app.pipeline import versions
 from app.services import llm, threed
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
@@ -94,18 +94,6 @@ def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
     return RUNS_DIR / run / slot_id / model_alias
 
 
-def _pick_initial_run() -> str:
-    """Most-recently-modified subdirectory of RUNS_DIR, or `default` if
-    none exist yet. Picked once at startup; subsequent activations are
-    driven by the client."""
-    if RUNS_DIR.exists():
-        subdirs = [p for p in RUNS_DIR.iterdir() if p.is_dir()]
-        if subdirs:
-            latest = max(subdirs, key=lambda p: p.stat().st_mtime)
-            return latest.name
-    return "default"
-
-
 def _ensure_prompt_snapshot(run: str) -> None:
     """Copy the live prompts.py into RUNS_DIR/<run>/ if not already there.
     Called only when a brand-new run is created via POST /runs; legacy
@@ -150,8 +138,11 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         global _current_run
-        _current_run = _pick_initial_run()
-        _hydrate_run(_current_run)
+        # Seed the three reserved version runs so their cells exist and can
+        # stream status from boot; the viewer opens on v3 (today's behavior).
+        for ver in versions.VERSIONS:
+            _hydrate_run(ver.run_name)
+        _current_run = versions.DEFAULT_VERSION.run_name
         try:
             yield
         finally:
@@ -313,21 +304,7 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail=f"slot is {status}, not startable",
             )
-        await _cancel_task(run, slot_id, model_alias)
-        events = slot_log.state["events"]
-        model_id = MODELS[model_alias]
-        if status == "idle" and not events:
-            # Fresh cell — emit run.start now so the run has somewhere to
-            # anchor its events. From here on it's identical to a resume.
-            slot_log.start_run(slot.prompt, model_id)
-        else:
-            # Drop the terminal sentinel so cache lookups don't trip over it
-            # and so the resumed run lands clean events after the prior tail.
-            if events and events[-1].get("kind") in ("run.error", "run.paused"):
-                slot_log.truncate_events_to(len(events) - 1)
-            slot_log.state["model"] = model_id
-            slot_log.state["status"] = "running"
-        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
+        await _start_cell(run, slot_id, model_alias)
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.post("/slots/{slot_id}/{model_alias}/pause")
@@ -360,7 +337,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
-        prompt_runtime.bind(_prompt_module_for_run(run))
+        ver = versions.for_run(run)
+        prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
         node = _reconstruct_node(slot_log, node_id)
         if node is None:
             raise HTTPException(
@@ -371,8 +349,8 @@ def create_app() -> FastAPI:
         async def _do_retry() -> None:
             rlog.bind(slot_log)
             llm.set_model(MODELS[model_alias])
-            prompt_runtime.bind(_prompt_module_for_run(run))
-            await generation.retry_node(
+            prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+            await ver.generation.retry_node(
                 node=node,
                 runs_dir=RUNS_DIR,
                 run_id=_run_id(run, slot.id, model_alias),
@@ -393,11 +371,12 @@ def create_app() -> FastAPI:
         run = _current_run
         slot = _require_slot(slot_id)
         _require_model(model_alias)
+        ver = versions.for_run(run)
         await _cancel_task(run, slot_id, model_alias)
-        # Cancel any standalone retries (registered on generation._pending
-        # but with no owning _run task to drive cleanup) that the running
-        # task wouldn't have touched.
-        generation.cancel_pending(_run_id(run, slot.id, model_alias))
+        # Cancel any standalone retries (registered on this version's
+        # generation._pending but with no owning _run task to drive cleanup)
+        # that the running task wouldn't have touched.
+        ver.generation.cancel_pending(_run_id(run, slot.id, model_alias))
         slot_dir = _slot_dir(run, slot.id, model_alias)
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
@@ -406,6 +385,70 @@ def create_app() -> FastAPI:
         slot_log.start_run(slot.prompt, MODELS[model_alias])
         _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
         return {"run": run, "slot_id": slot.id, "model": model_alias}
+
+    @app.get("/versions")
+    async def list_versions(  # pyright: ignore[reportUnusedFunction]
+        slot: str | None = None,
+        model: str | None = None,
+    ) -> dict[str, object]:
+        """The three pipeline versions for the version bar. When `slot` and
+        `model` are given, each entry carries that cell's status (for the
+        per-version status dots); the runs are seeded at boot so their cells
+        always exist."""
+        items: list[dict[str, object]] = []
+        for ver in versions.VERSIONS:
+            slot_log = None
+            if slot is not None and model is not None:
+                slot_log = _slot_logs.get((ver.run_name, slot, model))
+            status = slot_log.state.get("status") if slot_log is not None else None
+            items.append(
+                {
+                    "id": ver.id,
+                    "run_name": ver.run_name,
+                    "label": ver.label,
+                    "status": status,
+                }
+            )
+        return {"versions": items, "current": _current_run}
+
+    @app.post("/versions/{slot_id}/{model_alias}/launch")
+    async def launch_versions(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+    ) -> dict[str, object]:
+        """Start all three pipeline versions on one (slot, model) cell so they
+        run concurrently and fully isolated. Independent of `_current_run`;
+        each version is its own reserved run and keeps running regardless of
+        which one the viewer is currently showing. A version whose cell is
+        already complete is left untouched."""
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        results: list[dict[str, object]] = []
+        for ver in versions.VERSIONS:
+            run = ver.run_name
+            try:
+                _hydrate_run(run)
+                slot_log = _require_slot_log(run, slot_id, model_alias)
+                if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
+                    results.append(
+                        {"id": ver.id, "run_name": run, "status": "done", "started": False}
+                    )
+                    continue
+                await _start_cell(run, slot_id, model_alias)
+                results.append(
+                    {"id": ver.id, "run_name": run, "status": "running", "started": True}
+                )
+            except Exception as e:
+                results.append(
+                    {
+                        "id": ver.id,
+                        "run_name": run,
+                        "status": "error",
+                        "started": False,
+                        "error": str(e),
+                    }
+                )
+        return {"slot_id": slot_id, "model": model_alias, "versions": results}
 
     return app
 
@@ -560,6 +603,27 @@ async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
         await task
 
 
+async def _start_cell(run: str, slot_id: str, model_alias: str) -> None:
+    """Cancel any in-flight task for this cell, then (re)start its pipeline.
+    A fresh cell emits run.start; a paused/errored cell drops its terminal
+    sentinel and resumes. Shared by slot_resume and the version launcher —
+    callers own any precondition guards (e.g. blocking a completed run)."""
+    slot = _require_slot(slot_id)
+    slot_log = _require_slot_log(run, slot_id, model_alias)
+    status = slot_log.state.get("status")
+    await _cancel_task(run, slot_id, model_alias)
+    events = slot_log.state["events"]
+    model_id = MODELS[model_alias]
+    if status == "idle" and not events:
+        slot_log.start_run(slot.prompt, model_id)
+    else:
+        if events and events[-1].get("kind") in ("run.error", "run.paused"):
+            slot_log.truncate_events_to(len(events) - 1)
+        slot_log.state["model"] = model_id
+        slot_log.state["status"] = "running"
+    _tasks[(run, slot_id, model_alias)] = asyncio.create_task(_run(run, slot_id, model_alias))
+
+
 async def _sse(
     slot_log: SlotLog,
     q: asyncio.Queue[dict[str, object]],
@@ -588,22 +652,23 @@ async def _sse(
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
     slot_log = _slot_logs[(run, slot_id, model_alias)]
     rlog.bind(slot_log)
-    prompt_runtime.bind(_prompt_module_for_run(run))
+    ver = versions.for_run(run)
+    prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]
     run_id = _run_id(run, slot_id, model_alias)
     try:
-        await divider.run(
+        await ver.run(
             run_id=run_id,
             prompt=prompt,
             model=model,
             runs_dir=RUNS_DIR,
         )
     except asyncio.CancelledError:
-        generation.cancel_pending(run_id)
+        ver.generation.cancel_pending(run_id)
         raise
     except Exception as e:
-        generation.cancel_pending(run_id)
+        ver.generation.cancel_pending(run_id)
         # OpenRouter SDK errors only stringify to the top-level "Provider
         # returned error" message; the actually useful detail (upstream
         # provider's complaint, the request body that tripped it) lives on
@@ -626,5 +691,5 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         return
     # Pipeline tree is fully resolved; meshes may still be in flight.
     # Hold the run open until they all land so `run.done` truly means done.
-    await generation.await_pending(run_id)
+    await ver.generation.await_pending(run_id)
     slot_log.finish_run()

@@ -9,6 +9,7 @@ const SERVER_URL = document
 
 const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const MODEL_STORAGE_KEY = "starshot.selectedModel";
+const VERSION_STORAGE_KEY = "starshot.selectedVersion";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
 const MESHES_VISIBLE_STORAGE_KEY = "starshot.meshesVisible";
@@ -30,6 +31,9 @@ const runNewEl = document.getElementById("run-new");
 const saveAllEl = document.getElementById("save-all");
 const snapshotAllEl = document.getElementById("snapshot-all");
 const resumeAllEl = document.getElementById("resume-all");
+const resetAllEl = document.getElementById("reset-all");
+const versionBarEl = document.getElementById("version-bar");
+const versionLaunchAllEl = document.getElementById("version-launch-all");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
 const meshesToggleEl = document.getElementById("meshes-toggle");
@@ -3241,6 +3245,7 @@ let currentModel = null;
 let currentRun = null;
 let availableModels = [];
 let availableRuns = [];  // [{name, modified_at, has_prompt_snapshot}, ...]
+let availableVersions = [];  // [{id, run_name, label, status}, ...] from GET /versions
 let defaultModelAlias = null;
 let slotSummaries = [];  // latest /slots `slots` array, for tab rendering
 let slotNeedsResume = false;
@@ -3413,6 +3418,99 @@ async function switchRun(name) {
   }
 }
 
+// --- pipeline versions (V1/V2/V3) -------------------------------------------
+//
+// Each version is a reserved run (v1-legacy-xml / v2-frame-first /
+// v3-decomp-first). The version bar is a specialized run-switcher: clicking a
+// button activates that run via switchRun() (single-canvas swap), and "launch
+// all 3" starts every version's cell on the current (slot, model) so they
+// generate concurrently and isolated. The dot on each button mirrors that
+// version's cell status for the viewed (slot, model).
+
+function renderVersionBar() {
+  versionBarEl.innerHTML = "";
+  for (const v of availableVersions) {
+    const tab = document.createElement("button");
+    tab.type = "button";
+    tab.className = "version-tab" + (v.run_name === currentRun ? " active" : "");
+    tab.title = `${v.label} — run "${v.run_name}"`;
+    const dot = document.createElement("span");
+    dot.className = `slot-dot status-${v.status ?? "idle"}`;
+    tab.appendChild(dot);
+    const label = document.createElement("span");
+    label.textContent = v.label;
+    tab.appendChild(label);
+    tab.addEventListener("click", () => selectVersion(v.run_name));
+    versionBarEl.appendChild(tab);
+  }
+}
+
+async function refreshVersions() {
+  try {
+    const url = new URL("/versions", SERVER_URL);
+    if (currentSlotId) url.searchParams.set("slot", currentSlotId);
+    if (currentModel) url.searchParams.set("model", currentModel);
+    const res = await fetch(url);
+    if (!res.ok) return;
+    const payload = await res.json();
+    availableVersions = payload.versions ?? [];
+    renderVersionBar();
+  } catch {
+    // Transient; next tick will retry.
+  }
+}
+
+async function selectVersion(runName) {
+  // Persist the choice and swap which version the single canvas is viewing.
+  // switchRun handles activate + teardown + re-subscribe; the other versions'
+  // background tasks are untouched and keep generating.
+  try { localStorage.setItem(VERSION_STORAGE_KEY, runName); } catch {}
+  await switchRun(runName);
+  renderVersionBar();
+}
+
+async function launchAllVersions() {
+  // Start all three versions on the current (slot, model) cell so they run
+  // concurrently and isolated, then re-subscribe the viewed cell's stream.
+  if (currentSlotId === null || currentModel === null) {
+    setStatus("pick a slot + model before launching versions", "warn");
+    return;
+  }
+  versionLaunchAllEl.disabled = true;
+  try {
+    const res = await fetch(
+      new URL(
+        `/versions/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/launch`,
+        SERVER_URL,
+      ),
+      { method: "POST" },
+    );
+    if (!res.ok) {
+      setStatus(`launch all failed: HTTP ${res.status}`, "err");
+      return;
+    }
+    const payload = await res.json();
+    const started = (payload.versions ?? []).filter((v) => v.started).length;
+    setStatus(
+      `launched ${started}/3 versions on ${currentSlotId} · ${currentModel} — streaming current…`,
+    );
+    // Mirror resumeSlot: tear the viewed cell down and re-subscribe so its
+    // freshly-started stream shows immediately. The other versions stream in
+    // the background; switch to them with the version buttons.
+    slotNeedsResume = false;
+    resetClientStateForRunSwitch();
+    subscribe(slotEventsUrl(currentSlotId, currentModel));
+    refreshSlots();
+    refreshVersions();
+  } catch (e) {
+    setStatus(`launch all failed: ${e.message}`, "err");
+  } finally {
+    versionLaunchAllEl.disabled = false;
+  }
+}
+
+versionLaunchAllEl.addEventListener("click", launchAllVersions);
+
 async function createRun() {
   const name = window.prompt(
     "New run name (e.g. iteration14, ab_test_v3):",
@@ -3499,11 +3597,13 @@ function slotEventsUrl(slotId, model) {
   ).toString();
 }
 
-async function resetSlot(id, model) {
-  const ok = window.confirm(
-    `Wipe runs/${id}/${model}/ and restart the pipeline for this cell?`,
-  );
-  if (!ok) return;
+async function resetSlot(id, model, skipConfirm = false) {
+  if (!skipConfirm) {
+    const ok = window.confirm(
+      `Wipe runs/${id}/${model}/ and restart the pipeline for this cell?`,
+    );
+    if (!ok) return;
+  }
   resetEl.disabled = true;
   try {
     const res = await fetch(
@@ -3609,6 +3709,68 @@ resetEl.addEventListener("click", () => {
     resetSlot(currentSlotId, currentModel);
   }
 });
+
+async function resetAll() {
+  // Wipe + restart every started cell on the current run, fanned out across
+  // all slots × all models. Mirrors resumeAll's fan-out, but reset deletes a
+  // cell's events + artifacts before restarting it, so we only touch cells
+  // that have data (events_count > 0) — the run is a 14×6 matrix and one
+  // click should not spawn 80+ fresh pipelines for never-run cells. The
+  // viewed cell routes through resetSlot (skipping its own confirm) so its
+  // scene + SSE rewire to the fresh run; the rest just get the POST.
+  const cells = [];
+  for (const s of slotSummaries) {
+    for (const model of availableModels) {
+      if ((s.runs?.[model]?.events_count ?? 0) > 0) {
+        cells.push({ id: s.id, model });
+      }
+    }
+  }
+  if (cells.length === 0) {
+    setStatus(`no started cells to reset on run "${currentRun}"`);
+    return;
+  }
+  const ok = window.confirm(
+    `Wipe and restart ${cells.length} started cell(s) across all models on run "${currentRun}"?\n\nThis permanently deletes their generated meshes + event logs.`,
+  );
+  if (!ok) return;
+  resetAllEl.disabled = true;
+  try {
+    const tasks = cells.map((c) => {
+      if (c.id === currentSlotId && c.model === currentModel) {
+        // Viewed cell — clear scene + rewire SSE via the existing helper.
+        return resetSlot(c.id, c.model, true);
+      }
+      return fetch(
+        new URL(
+          `/slots/${encodeURIComponent(c.id)}/${encodeURIComponent(c.model)}/reset`,
+          SERVER_URL,
+        ),
+        { method: "POST" },
+      ).then((r) => ({ cell: `${c.id}·${c.model}`, ok: r.ok, status: r.status }));
+    });
+    const results = await Promise.all(tasks);
+    const failures = results.filter((r) => r && r.ok === false);
+    if (failures.length > 0) {
+      const names = failures.map((f) => f.cell).join(", ");
+      setStatus(
+        `reset all on "${currentRun}": ${cells.length - failures.length} ok, ${failures.length} failed (${names})`,
+        "err",
+      );
+    } else {
+      setStatus(
+        `reset ${cells.length} cell${cells.length === 1 ? "" : "s"} on run "${currentRun}" — restarting…`,
+      );
+    }
+    refreshSlots();
+  } catch (e) {
+    setStatus(`reset all failed: ${e.message}`, "err");
+  } finally {
+    resetAllEl.disabled = false;
+  }
+}
+
+resetAllEl.addEventListener("click", resetAll);
 
 modelPickerEl.addEventListener("change", () => {
   switchModel(modelPickerEl.value);
@@ -3862,12 +4024,24 @@ exportGlbEl.addEventListener("click", async () => {
       ? savedModel
       : (defaultModelAlias ?? availableModels[0]);
   switchView(slotPick, modelPick);
+  await refreshVersions();
+  // Restore the last-viewed version (switches the active run if different).
+  let savedVersion = null;
+  try { savedVersion = localStorage.getItem(VERSION_STORAGE_KEY); } catch {}
+  if (
+    savedVersion &&
+    savedVersion !== currentRun &&
+    availableVersions.some((v) => v.run_name === savedVersion)
+  ) {
+    switchRun(savedVersion);
+  }
 })();
 
 // Keep tab status dots + run list fresh — runs change less often, so a
 // slower cadence is fine.
 setInterval(refreshSlots, 2000);
 setInterval(refreshRuns, 10000);
+setInterval(refreshVersions, 2000);
 
 // --- replay → gif ----------------------------------------------------------
 //
