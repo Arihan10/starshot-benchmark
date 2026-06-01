@@ -126,6 +126,33 @@
                 opacity: 0.5;
                 cursor: default;
             }
+            #prompt-variant-toggle {
+                margin-left: 4px;
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #prompt-variant-toggle:hover {
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            /* v2 active = a distinct cell from the v1 default; tint it so it's
+               obvious you're driving the alternate prompt structure. */
+            #prompt-variant-toggle.v2 {
+                background: #34225a;
+                border-color: #7a4ad8;
+                color: #c8a8ff;
+            }
+            #prompt-variant-toggle.v2:hover {
+                border-color: #9a6aff;
+                color: #e0c8ff;
+            }
             #slot-reset {
                 margin-left: auto;
                 padding: 5px 10px;
@@ -1855,6 +1882,7 @@
             <select id="run-picker" title="Switch the active run (versioned directory under /runs). Each run is an independent set of (slot, model) cells with its own prompt snapshot."></select>
             <button id="run-new" type="button" title="Create a new run. Snapshots the current prompts.py into runs/<name>/prompts_snapshot.py and switches to it.">+ new run</button>
             <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
+            <button id="prompt-variant-toggle" type="button" title="Toggle the prompt structure between the default (v1) and the alternate v2 build. v2 runs as its own parallel scene within the slot — independent events + meshes — exactly like switching the model.">prompts: v1</button>
             <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
             <button id="slot-resume" type="button" style="display:none">resume</button>
             <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>

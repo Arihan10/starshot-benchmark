@@ -1,6 +1,8 @@
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
+import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 
 const SERVER_URL = document
@@ -9,6 +11,7 @@ const SERVER_URL = document
 
 const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const MODEL_STORAGE_KEY = "starshot.selectedModel";
+const VARIANT_STORAGE_KEY = "starshot.promptVariant";
 const BBOX_VISIBLE_STORAGE_KEY = "starshot.bboxesVisible";
 const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
 const MESHES_VISIBLE_STORAGE_KEY = "starshot.meshesVisible";
@@ -24,6 +27,7 @@ const modelPickerEl = document.getElementById("model-picker");
 const runPickerEl = document.getElementById("run-picker");
 const runNewEl = document.getElementById("run-new");
 const resumeAllEl = document.getElementById("resume-all");
+const promptVariantToggleEl = document.getElementById("prompt-variant-toggle");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
 const meshesToggleEl = document.getElementById("meshes-toggle");
@@ -269,13 +273,13 @@ async function retryMesh(id) {
   // Re-subscribe (without resetting highestEventIndex) so the snapshot
   // is deduped and the retry's new events flow through the live queue.
   if (currentSource === null) {
-    subscribe(slotEventsUrl(currentSlotId, currentModel));
+    subscribe(slotEventsUrl(currentSlotId, effectiveModel()));
   }
 
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(effectiveModel())}/retry-mesh/${encodeURIComponent(id)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -511,7 +515,7 @@ function renderTrellisQueue() {
       // clickable.
       const currentCompositeId =
         currentRun !== null && currentSlotId !== null && currentModel !== null
-          ? `${currentRun}/${currentSlotId}/${currentModel}`
+          ? `${currentRun}/${currentSlotId}/${effectiveModel()}`
           : null;
       const inThisSlot = row.slot_id === currentCompositeId;
       if (inThisSlot) {
@@ -676,7 +680,7 @@ function treeSetPhase(id, phase) {
     // A node finishing doesn't move the focus elsewhere on its own; leave
     // the highlight on it until the next step event moves it.
   }
-  renderTree();
+  scheduleRenderTree();
   if (id === selectedBboxId || (selectedBboxId && treeIsAncestorOf(selectedBboxId, id))) {
     renderTreeDetail();
   }
@@ -963,7 +967,22 @@ function orderedMatches(filter) {
   return sorted.map((n) => n.id);
 }
 
+// Coalesced tree re-render. A single SSE snapshot can fire `renderTree`
+// hundreds of times (one per bbox / step / model), and each call rebuilds the
+// entire tree DOM — O(events × nodes), a major contributor to switch lag.
+// Streaming paths call `scheduleRenderTree`, which only flips a flag; the
+// animate() loop drains it with a single rebuild per frame. User-interaction
+// paths (search / select / hide) keep calling `renderTree` directly so their
+// feedback stays synchronous (and so code that reads the freshly-built DOM on
+// the next line still works).
+let _treeRenderPending = false;
+function scheduleRenderTree() {
+  _treeRenderPending = true;
+}
+
 function renderTree() {
+  // A synchronous render satisfies any pending coalesced one.
+  _treeRenderPending = false;
   treeBodyEl.innerHTML = "";
   const filter = computeTreeFilter();
   if (treeRootId !== null) {
@@ -1038,11 +1057,24 @@ const host = document.getElementById("canvas-host");
 // preserveDrawingBuffer keeps the WebGL framebuffer readable after present,
 // which is required for the gif export path (gif.js calls getImageData on
 // the canvas). Small perf cost on every frame; acceptable for a debug tool.
-const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, powerPreference: "high-performance" });
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x101114);
 host.appendChild(renderer.domElement);
+
+// Decoders for the optimized asset library: KTX2/Basis textures
+// (KHR_texture_basisu) and Meshopt-compressed + quantized geometry
+// (EXT_meshopt_compression / KHR_mesh_quantization). Shared across every
+// GLTFLoader instance; the basis transcoder + meshopt wasm are served from
+// the vendored three addons. Uncompressed GLBs ignore these and load as before.
+const ktx2Loader = new KTX2Loader()
+  .setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
+  // A scene is hundreds of meshes × ~2 KTX2 textures each; the default 4-worker
+  // transcode pool serializes them and is the main load-time bottleneck. Scale
+  // it to the machine so transcodes run in parallel.
+  .setWorkerLimit(Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4)))
+  .detectSupport(renderer);
 
 const scene = new THREE.Scene();
 const sceneRoot = new THREE.Group();
@@ -1373,6 +1405,14 @@ window.addEventListener("resize", () => {
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
+// Coalescing flag for fitToScene (defined below). Declared here, before
+// animate() first runs, so the per-frame drain check never hits a
+// temporal-dead-zone read on this `let`.
+let _fitScenePending = false;
+function scheduleFitToScene() {
+  _fitScenePending = true;
+}
+
 function animate() {
   requestAnimationFrame(animate);
   const now = performance.now();
@@ -1380,6 +1420,15 @@ function animate() {
   _lastMoveT = now;
   _applyKeyboardMove(dt);
   controls.update();
+
+  // Drain coalesced UI work once per frame: collapse a burst of streamed tree
+  // mutations into one DOM rebuild, and a burst of mesh completions into one
+  // camera refit. Both run before render so the frame reflects them.
+  if (_treeRenderPending) renderTree();
+  if (_fitScenePending) {
+    _fitScenePending = false;
+    fitToScene();
+  }
 
   gridMat.uniforms.uCameraPos.value.copy(camera.position);
   const camDist = Math.max(1, camera.position.distanceTo(controls.target));
@@ -1402,18 +1451,39 @@ function animate() {
 }
 animate();
 
+// Dispose a material *and* every texture it references. THREE's
+// `material.dispose()` frees the shader program but leaves the uploaded
+// textures (map / normalMap / roughnessMap / …) resident in GPU memory until
+// each texture is disposed individually. Iterating the material's own
+// properties and disposing anything that is a texture covers every map slot
+// without hardcoding names.
+function disposeMaterial(material) {
+  if (!material) return;
+  for (const value of Object.values(material)) {
+    if (value && value.isTexture) value.dispose();
+  }
+  material.dispose?.();
+}
+
+// Walk an Object3D subtree and release all GPU resources it owns: geometry,
+// materials, and (critically) the materials' textures. Used everywhere a
+// loaded GLB leaves the scene so switching cells doesn't strand the previous
+// scene's 1024² Trellis textures in the long-lived renderer's VRAM.
+function disposeObject3D(root) {
+  root?.traverse?.((n) => {
+    if (!n.isMesh) return;
+    n.geometry?.dispose?.();
+    const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
+    for (const m of mats) disposeMaterial(m);
+  });
+}
+
 function clearScene() {
   resetModelQueue();
   while (sceneRoot.children.length > 0) {
     const child = sceneRoot.children[0];
     sceneRoot.remove(child);
-    child.traverse?.((n) => {
-      if (n.isMesh) {
-        n.geometry?.dispose?.();
-        const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-        for (const m of mats) m.dispose?.();
-      }
-    });
+    disposeObject3D(child);
   }
   for (const helper of bboxes.values()) {
     bboxRoot.remove(helper);
@@ -1435,7 +1505,9 @@ function clearScene() {
 }
 
 // Fit controls to the union of all loaded models after each addition.
-// Skipped once the user has manually adjusted the camera.
+// Skipped once the user has manually adjusted the camera. Callers use
+// scheduleFitToScene() so a burst of model completions coalesces into one
+// refit per frame instead of one O(scene) Box3 traversal per mesh.
 function fitToScene() {
   if (cameraUserMoved) return;
   const box = new THREE.Box3().setFromObject(sceneRoot);
@@ -1457,6 +1529,8 @@ function fitToScene() {
 // --- model loading ----------------------------------------------------------
 
 const loader = new GLTFLoader();
+loader.setKTX2Loader(ktx2Loader);
+loader.setMeshoptDecoder(MeshoptDecoder);
 
 // Concurrent loads — each GLB fetches/parses/uploads independently. The
 // browser's per-origin connection limit (~6) naturally throttles the network
@@ -1475,7 +1549,181 @@ function resetModelQueue() {
   sceneGen += 1;
 }
 
-function loadModel(event) {
+// --- one-connection scene bundle (streamed + progressive) ------------------
+//
+// Switching to a built scene used to fire one HTTP GET per object GLB, which
+// the browser caps at ~6 concurrent per origin (and which contend with the SSE
+// stream + polls on the same origin). Instead we pull the whole cell's GLBs
+// over ONE connection — GET /slots/<slot>/<model>/meshes streams a
+// length-prefixed binary bundle — and attach each mesh AS IT ARRIVES.
+//
+// Streaming (rather than buffering the whole response) is essential: a large
+// scene's bundle is multiple GB — far past what a single ArrayBuffer can hold —
+// so we read it frame-by-frame and parse + attach a small bounded window of
+// GLBs concurrently, dropping each one's bytes as it lands. JS memory stays
+// bounded to that window (not the whole multi-GB scene) regardless of size, and
+// meshes appear progressively instead of after the entire snapshot replays.
+//
+// Model events coordinate via `streamDone`: once the stream finishes, an id the
+// bundle already attached needs only bookkeeping; anything it didn't carry (a
+// mesh generated after the snapshot, a retry, or a parse miss) falls back to an
+// individual fetch. Tied to `sceneGen` so a stale scene's bundle is ignored.
+const _MESH_BUNDLE_MAGIC = "SMB1";
+let meshBundle = { gen: -1, attached: new Set(), streamDone: Promise.resolve(), abort: null };
+
+function prefetchMeshBundle(slotId, model, gen) {
+  if (!slotId || !model) return;
+  // Supersede any still-streaming bundle from a scene we've left.
+  meshBundle.abort?.abort?.();
+  const abort = new AbortController();
+  let resolveDone;
+  const streamDone = new Promise((r) => { resolveDone = r; });
+  const state = { gen, attached: new Set(), streamDone, abort };
+  meshBundle = state;
+  (async () => {
+    try {
+      const res = await fetch(slotMeshesUrl(slotId, model), {
+        cache: "no-store",
+        signal: abort.signal,
+      });
+      if (res.ok && res.body) {
+        await consumeMeshBundleStream(res.body.getReader(), state);
+      }
+    } catch {
+      // Aborted (superseded) / network / parse error — whatever attached so
+      // far stays; the rest is picked up per-object by the model-event
+      // fallback once streamDone resolves.
+    } finally {
+      resolveDone();
+    }
+  })();
+}
+
+// Pull exact byte counts out of a ReadableStream reader, holding only the
+// not-yet-consumed chunks (each is dropped as it's read), so peak memory tracks
+// the largest single frame — never the whole multi-GB bundle.
+function _byteStreamReader(reader) {
+  const chunks = [];
+  let avail = 0;
+  let ended = false;
+  async function readExact(n) {
+    while (avail < n) {
+      if (ended) return null;
+      const { done, value } = await reader.read();
+      if (done) { ended = true; continue; }
+      if (value && value.length) { chunks.push(value); avail += value.length; }
+    }
+    const out = new Uint8Array(n);
+    let filled = 0;
+    while (filled < n) {
+      const c = chunks[0];
+      const take = Math.min(c.length, n - filled);
+      out.set(c.subarray(0, take), filled);
+      filled += take;
+      if (take === c.length) chunks.shift();
+      else chunks[0] = c.subarray(take);
+      avail -= take;
+    }
+    return out;
+  }
+  return { readExact };
+}
+
+// Walk the streamed bundle frame-by-frame, attaching each mesh as it lands.
+// Framing: magic "SMB1", then repeat <u32 idLen LE><id utf-8><u32 glbLen LE><glb>.
+// Parse + attach up to this many meshes concurrently. Reading frames off the
+// stream stays sequential on the single connection; only the parse/decode fans
+// out, overlapping each GLB's texture decode with the next frames' download.
+// The cap bounds peak memory to ~MAX_INFLIGHT in-flight GLBs (not the whole
+// multi-GB scene) and backpressures the stream once that many are decoding.
+const MESH_BUNDLE_MAX_INFLIGHT = 20;
+
+async function consumeMeshBundleStream(reader, state) {
+  const r = _byteStreamReader(reader);
+  const dec = new TextDecoder();
+  const magic = await r.readExact(4);
+  if (!magic || dec.decode(magic) !== _MESH_BUNDLE_MAGIC) return;
+  const inflight = new Set();
+  const stats = { t0: performance.now(), count: 0, bytes: 0, parseMs: 0, attachMs: 0 };
+  while (true) {
+    if (state.gen !== sceneGen || state.abort.signal.aborted) break;
+    const idLenB = await r.readExact(4);
+    if (!idLenB) break;
+    const idLen = new DataView(idLenB.buffer).getUint32(0, true);
+    const idB = await r.readExact(idLen);
+    if (!idB) break;
+    const id = dec.decode(idB);
+    const glbLenB = await r.readExact(4);
+    if (!glbLenB) break;
+    const glbLen = new DataView(glbLenB.buffer).getUint32(0, true);
+    const glbB = await r.readExact(glbLen);
+    if (!glbB) break;
+    stats.count += 1;
+    stats.bytes += glbLen;
+    const p = attachBundleMesh(id, glbB.buffer, state.gen, state, stats)
+      .finally(() => inflight.delete(p));
+    inflight.add(p);
+    // Hold the read at MAX_INFLIGHT in-flight parses; resume once one drains.
+    if (inflight.size >= MESH_BUNDLE_MAX_INFLIGHT) await Promise.race(inflight);
+  }
+  // Let the last in-flight parses finish before signalling the stream is done.
+  await Promise.allSettled(inflight);
+  // TEMP load-timing readout. parse-sum overlaps (MAX_INFLIGHT parses at once);
+  // attach-sum is synchronous main-thread work so it doesn't overlap — if it
+  // approaches wall time, the main-thread attach (scene add / DOM) is the limit.
+  const wall = (performance.now() - stats.t0) / 1000;
+  console.log(
+    `[bundle] ${stats.count} meshes · ${(stats.bytes / 1048576).toFixed(1)}MB · ` +
+      `wall ${wall.toFixed(1)}s (${((wall * 1000) / Math.max(1, stats.count)).toFixed(0)}ms/mesh) · ` +
+      `parse-sum ${(stats.parseMs / 1000).toFixed(1)}s · attach-sum ${(stats.attachMs / 1000).toFixed(1)}s · ` +
+      `hw=${navigator.hardwareConcurrency}`,
+  );
+}
+
+function parseGlb(arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    loader.parse(arrayBuffer, "", resolve, reject);
+  });
+}
+
+// Parse one streamed GLB and add it to the scene. Mirrors the attach half of
+// `_loadModelNow`; on a parse failure it bails without attaching, leaving the
+// id for the model-event fallback to fetch fresh.
+async function attachBundleMesh(id, glbBuffer, gen, state, stats) {
+  if (gen !== sceneGen) return;
+  let gltf;
+  const tParse = performance.now();
+  try {
+    gltf = await parseGlb(glbBuffer);
+  } catch {
+    return;
+  }
+  if (stats) stats.parseMs += performance.now() - tParse;
+  if (gen !== sceneGen) { disposeObject3D(gltf.scene); return; }
+  const tAttach = performance.now();
+  gltf.scene.traverse((child) => {
+    if (child.isMesh && child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const m of mats) m.side = THREE.DoubleSide;
+    }
+  });
+  gltf.scene.name = `mesh:${id}`;
+  gltf.scene.userData.pickId = id;
+  const prev = modelsById.get(id);
+  if (prev) {
+    sceneRoot.remove(prev);
+    disposeObject3D(prev);
+  }
+  sceneRoot.add(gltf.scene);
+  modelsById.set(id, gltf.scene);
+  state.attached.add(id);
+  applyModelVisibility(id);
+  scheduleFitToScene();
+  upsertAsset(id, { status: "loaded" });
+  if (stats) stats.attachMs += performance.now() - tAttach;
+}
+
+async function loadModel(event) {
   if (replayPreloadCache) {
     const cached = replayPreloadCache.get(event.id);
     if (cached) {
@@ -1488,7 +1736,22 @@ function loadModel(event) {
       return;
     }
   }
-  _loadModelNow(event, sceneGen);
+  // A scene bundle streaming for this generation attaches meshes progressively.
+  // Wait for it to finish, then adopt what it attached (bookkeeping only) or
+  // fetch this id individually if the bundle didn't carry it (a mesh generated
+  // after the snapshot, a retry, or a parse miss).
+  const gen = sceneGen;
+  const bundle = meshBundle;
+  if (bundle.gen === gen) {
+    await bundle.streamDone;
+    if (gen !== sceneGen) return;
+    if (modelsById.has(event.id)) {
+      applyModelVisibility(event.id);
+      upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
+      return;
+    }
+  }
+  _loadModelNow(event, gen);
 }
 
 // Attach a pre-fetched GLB scene to the live tree. Mirrors the second half
@@ -1506,24 +1769,17 @@ function attachPreloadedGlb(event, gltf) {
   const prevModel = modelsById.get(event.id);
   if (prevModel) {
     sceneRoot.remove(prevModel);
-    prevModel.traverse?.((n) => {
-      if (n.isMesh) {
-        n.geometry?.dispose?.();
-        const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-        for (const m of mats) m.dispose?.();
-      }
-    });
+    disposeObject3D(prevModel);
   }
   sceneRoot.add(gltf.scene);
   modelsById.set(event.id, gltf.scene);
   applyModelVisibility(event.id);
-  fitToScene();
+  scheduleFitToScene();
   upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
 }
 
 async function _loadModelNow(event, gen) {
   if (gen !== sceneGen) return;
-  const absUrl = new URL(event.url, SERVER_URL).toString();
   // Skip a re-load when this id already errored on the *same URL* during
   // this scene generation. The server occasionally emits `model` more
   // than once for one id (anchor completion loop, cached replay), and
@@ -1533,6 +1789,7 @@ async function _loadModelNow(event, gen) {
   if (prior?.status === "error" && prior.modelUrl === event.url) return;
   upsertAsset(event.id, { modelUrl: event.url });
   try {
+    const absUrl = new URL(event.url, SERVER_URL).toString();
     const gltf = await loader.loadAsync(absUrl);
     if (gen !== sceneGen) return;
     gltf.scene.traverse((child) => {
@@ -1546,18 +1803,12 @@ async function _loadModelNow(event, gen) {
     const prevModel = modelsById.get(event.id);
     if (prevModel) {
       sceneRoot.remove(prevModel);
-      prevModel.traverse?.((n) => {
-        if (n.isMesh) {
-          n.geometry?.dispose?.();
-          const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-          for (const m of mats) m.dispose?.();
-        }
-      });
+      disposeObject3D(prevModel);
     }
     sceneRoot.add(gltf.scene);
     modelsById.set(event.id, gltf.scene);
     applyModelVisibility(event.id);
-    fitToScene();
+    scheduleFitToScene();
     upsertAsset(event.id, { status: "loaded" });
   } catch (e) {
     appendEvent({ kind: "model.error", id: event.id, message: e.message });
@@ -1933,7 +2184,7 @@ function mountMiniViewer(container, modelUrl) {
   scene.background = new THREE.Color(0x0e1014);
   const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
   camera.position.set(2, 2, 3);
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   renderer.domElement.className = "detail-mini-canvas";
@@ -1963,6 +2214,8 @@ function mountMiniViewer(container, modelUrl) {
   let disposed = false;
   let model = null;
   const localLoader = new GLTFLoader();
+  localLoader.setKTX2Loader(ktx2Loader);
+  localLoader.setMeshoptDecoder(MeshoptDecoder);
   localLoader.loadAsync(new URL(modelUrl, SERVER_URL).toString())
     .then((gltf) => {
       if (disposed) return;
@@ -2008,13 +2261,7 @@ function mountMiniViewer(container, modelUrl) {
       try { ro.disconnect(); } catch {}
       try { controls.dispose(); } catch {}
       if (model) {
-        model.traverse((n) => {
-          if (n.isMesh) {
-            n.geometry?.dispose?.();
-            const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-            for (const m of mats) m.dispose?.();
-          }
-        });
+        disposeObject3D(model);
       }
       try { renderer.dispose(); } catch {}
       if (renderer.domElement.parentNode) {
@@ -3071,6 +3318,12 @@ renderer.domElement.addEventListener("contextmenu", (ev) => {
 // rewind), where a fresh replay genuinely needs to be re-applied.
 let highestEventIndex = -1;
 
+// TEMP: main-thread cost of replaying the event log (JSON.parse + dispatch),
+// to compare against the mesh-bundle wall time — they share the main thread.
+let _sseT0 = null;
+let _sseCount = 0;
+let _sseMs = 0;
+
 // Buffered event log for the active slot — captured as events stream in so
 // the replay-to-gif feature can re-dispatch the build from scratch. Reset by
 // the same hooks that reset `highestEventIndex` (slot switch / rewind /
@@ -3139,7 +3392,7 @@ function dispatch(event) {
         dimensions: event.dimensions,
         proxyShape: event.proxy_shape ?? null,
       });
-      renderTree();
+      scheduleRenderTree();
       if (event.id === selectedBboxId) renderTreeDetail();
       break;
     case "divider.decompose":
@@ -3150,7 +3403,7 @@ function dispatch(event) {
       for (const c of event.children ?? []) {
         treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
       }
-      renderTree();
+      scheduleRenderTree();
       break;
     case "divider.zone_plan":
       // Stash the authored zone plan on the node so the tooltip can surface
@@ -3216,10 +3469,26 @@ let availableRuns = [];  // [{name, modified_at, has_prompt_snapshot}, ...]
 let defaultModelAlias = null;
 let slotSummaries = [];  // latest /slots `slots` array, for tab rendering
 let slotNeedsResume = false;
+let currentVariant = "v1";   // "v1" (default prompts) | "v2" (alternate prompts_v2)
+let variantSuffix = "__v2";  // alias suffix selecting v2; overridden by /slots
+
+// The server addresses a cell as (slot, effective-model). The model picker
+// stays on base aliases; the prompt-variant toggle appends the v2 suffix so
+// v2 is a parallel cell — its own events + meshes — exactly like another
+// model. Every server call + cell-status lookup routes through this.
+function effectiveModel() {
+  if (currentModel === null) return null;
+  return currentVariant === "v2" ? currentModel + variantSuffix : currentModel;
+}
+
+function updatePromptVariantToggle() {
+  promptVariantToggleEl.textContent = `prompts: ${currentVariant}`;
+  promptVariantToggleEl.classList.toggle("v2", currentVariant === "v2");
+}
 
 function currentRunInfo() {
   const slot = slotSummaries.find((s) => s.id === currentSlotId);
-  return slot?.runs?.[currentModel] ?? null;
+  return slot?.runs?.[effectiveModel()] ?? null;
 }
 
 function renderSlotTabs() {
@@ -3234,9 +3503,9 @@ function renderSlotTabs() {
     tab.dataset.slotId = s.id;
     tab.title = s.prompt ?? "";
 
-    // Dot reflects the (slot, currentModel) cell's status — the active model
-    // dimension picks which of the N parallel runs we're watching.
-    const status = s.runs?.[currentModel]?.status ?? "idle";
+    // Dot reflects the (slot, effective-model) cell's status — the active
+    // model + prompt-variant pick which parallel run we're watching.
+    const status = s.runs?.[effectiveModel()]?.status ?? "idle";
     const dot = document.createElement("span");
     dot.className = `slot-dot status-${status}`;
     tab.appendChild(dot);
@@ -3287,7 +3556,7 @@ function updateResumeButton() {
     resumeEl.title = "Pause this run";
   } else if (slotNeedsResume && currentSlotId !== null && currentModel !== null) {
     slotNeedsResume = false;
-    subscribe(slotEventsUrl(currentSlotId, currentModel));
+    subscribe(slotEventsUrl(currentSlotId, effectiveModel()));
   }
 }
 
@@ -3298,6 +3567,7 @@ async function refreshSlots() {
     const payload = await res.json();
     availableModels = payload.models ?? [];
     defaultModelAlias = payload.default_model ?? availableModels[0] ?? null;
+    variantSuffix = payload.prompt_variant_suffix ?? variantSuffix;
     slotSummaries = payload.slots ?? [];
     if (payload.run && payload.run !== currentRun) {
       // Another client (or the create-run endpoint) flipped the active run
@@ -3447,12 +3717,14 @@ function switchView(slotId, modelAlias) {
   slotNeedsResume = status === "idle" || status === "paused" || status === "error";
   renderSlotTabs();
   updateResumeButton();
-  const cellLabel = `${slotId} · ${modelAlias}`;
+  const cellLabel = `${slotId} · ${modelAlias}${currentVariant === "v2" ? " · v2" : ""}`;
   if (slotNeedsResume) {
     setStatus(`slot :: ${cellLabel} — ${status}`);
   } else {
     setStatus(`slot :: ${cellLabel}`);
-    subscribe(slotEventsUrl(slotId, modelAlias));
+    // CQRS: paint from the /scene projection + tail live, instead of replaying
+    // the whole event log. (reset/rewind/resume keep the full-replay subscribe.)
+    loadCellScene(slotId, effectiveModel());
   }
 }
 
@@ -3470,6 +3742,30 @@ function switchModel(alias) {
 function slotEventsUrl(slotId, model) {
   return new URL(
     `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events`,
+    SERVER_URL,
+  ).toString();
+}
+
+function slotMeshesUrl(slotId, model) {
+  return new URL(
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes`,
+    SERVER_URL,
+  ).toString();
+}
+
+function slotSceneUrl(slotId, model) {
+  return new URL(
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene`,
+    SERVER_URL,
+  ).toString();
+}
+
+// The full event log on disk, served by the /artifacts static mount. Used to
+// backfill the side panels (log / observability / gif) in the background after
+// the scene is already painted from /scene — no SSE replay.
+function historyUrl(slotId, model) {
+  return new URL(
+    `/artifacts/${encodeURIComponent(currentRun)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events.jsonl`,
     SERVER_URL,
   ).toString();
 }
@@ -3506,7 +3802,7 @@ async function resetSlot(id, model) {
     updateReplayButton();
     slotNeedsResume = false;
     setStatus(`slot ${id} · ${model} reset — streaming events…`);
-    subscribe(slotEventsUrl(id, model));
+    loadCellScene(id, model, { forceLive: true });
     refreshSlots();
   } catch (e) {
     setStatus(`reset failed: ${e.message}`, "err");
@@ -3516,16 +3812,34 @@ async function resetSlot(id, model) {
 }
 
 function subscribe(url) {
+  // Fresh scene loads (highestEventIndex === -1) replay the whole snapshot, so
+  // prefetch the cell's GLBs in one request; _loadModelNow consumes the bundle
+  // as `model` events arrive. Mid-run re-subscribes (mesh retry, post-replay
+  // reconnect) keep their already-loaded meshes — those events are deduped by
+  // index — so they skip the prefetch.
+  if (highestEventIndex === -1 && currentSlotId !== null && currentModel !== null) {
+    prefetchMeshBundle(currentSlotId, effectiveModel(), sceneGen);
+  }
   const es = new EventSource(url);
   currentSource = es;
   es.onmessage = (ev) => {
+    const _t = performance.now();
     let data;
     try {
       data = JSON.parse(ev.data);
     } catch {
       return;
     }
+    if (data.kind === "run.start") { _sseT0 = _t; _sseCount = 0; _sseMs = 0; }
     dispatch(data);
+    _sseCount += 1;
+    _sseMs += performance.now() - _t;
+    if (data.kind === "run.done" || data.kind === "run.error" || data.kind === "run.paused") {
+      const wall = _sseT0 != null ? (performance.now() - _sseT0) / 1000 : 0;
+      console.log(
+        `[sse] ${_sseCount} events · dispatch-sum ${(_sseMs / 1000).toFixed(1)}s · wall ${wall.toFixed(1)}s`,
+      );
+    }
   };
   es.onerror = () => {
     // EventSource auto-reconnects on transient failures; only surface a hard close.
@@ -3536,8 +3850,145 @@ function subscribe(url) {
   };
 }
 
+// --- CQRS scene load (derive-on-read) --------------------------------------
+//
+// Opening an existing cell no longer replays the whole event log. Instead:
+//   1. GET /scene → a folded projection of the current scene; paint it directly
+//      (bboxes + tree + asset cards) by driving the same builders dispatch uses.
+//   2. Start the mesh bundle.
+//   3. If the run is still active, tail the live SSE at ?since=last_index
+//      (catch-up + new events only — no history).
+//   4. After the meshes have streamed, backfill the FULL event log into the
+//      side panels (log / observability / gif) in the background, WITHOUT
+//      re-running any scene handlers (the projection already built the scene).
+//
+// `subscribe()` (full replay) stays for fresh/resumed runs (reset/rewind/resume)
+// where history is empty or being freshly built.
+
+// Build scene + tree + asset panel directly from the /scene projection. Reuses
+// the live builders so there's a single source of truth for how a node renders.
+function applySceneProjection(nodes) {
+  for (const n of nodes) {
+    const patch = {
+      parentId: n.parent_id ?? null,
+      prompt: n.prompt ?? null,
+      kind: n.node_kind ?? "zone",
+    };
+    if (n.plan != null) patch.plan = n.plan;
+    if (n.image_prompt != null) patch.imagePrompt = n.image_prompt;
+    if (n.origin != null) patch.origin = n.origin;
+    if (n.dimensions != null) patch.dimensions = n.dimensions;
+    if (n.proxy_shape != null) patch.proxyShape = n.proxy_shape;
+    treeUpsert(n.id, patch);
+    if (n.origin && n.dimensions) {
+      loadBbox({
+        id: n.id,
+        origin: n.origin,
+        dimensions: n.dimensions,
+        proxy_shape: n.proxy_shape,
+        node_kind: n.node_kind,
+      });
+    }
+    if (n.image_url) {
+      upsertAsset(n.id, { imageUrl: n.image_url, prompt: n.image_prompt ?? n.prompt ?? null });
+    }
+    if (n.mesh_url) upsertAsset(n.id, { modelUrl: n.mesh_url });
+    if (n.error) {
+      meshErrors.set(n.id, n.error);
+      upsertAsset(n.id, { status: "error", errorMessage: n.error });
+    }
+    if (n.phase) {
+      // Set the phase directly rather than via treeSetPhase() to skip its
+      // per-call render/focus churn across hundreds of nodes; one render below.
+      const cur = treeNodes.get(n.id);
+      if (cur) cur.phase = n.phase;
+    }
+  }
+  scheduleRenderTree();
+}
+
+// Panel-only consumer for the background history load: feeds the gif buffer,
+// log panel, and observability modal — never the scene (projection owns it).
+function backfillPanels(event) {
+  recordedEvents.push(event);
+  appendEvent(event);
+  if (event.kind === "cache.llm") recordLlmCall(event);
+}
+
+// Stream the full event log into the side panels AFTER the meshes have loaded,
+// so the heavy ~46 MB parse never contends with KTX2 texture finalization.
+// Chunked so it yields to the main thread instead of freezing it.
+async function backfillHistoryInBackground(slotId, model, gen) {
+  try { await meshBundle.streamDone; } catch {}
+  if (gen !== sceneGen) return;
+  let text;
+  try {
+    const res = await fetch(historyUrl(slotId, model), { cache: "no-store" });
+    if (!res.ok) return;
+    text = await res.text();
+  } catch {
+    return;
+  }
+  if (gen !== sceneGen) return;
+  const lines = text.split("\n");
+  let i = 0;
+  const step = () => {
+    if (gen !== sceneGen) return;
+    const end = Math.min(i + 200, lines.length);
+    for (; i < end; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      backfillPanels(event);
+    }
+    if (i < lines.length) setTimeout(step, 0);
+    else updateReplayButton();
+  };
+  step();
+}
+
+async function loadCellScene(slotId, model, { forceLive = false } = {}) {
+  const gen = sceneGen;
+  const t0 = performance.now();
+  let payload;
+  try {
+    const res = await fetch(slotSceneUrl(slotId, model), { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    payload = await res.json();
+  } catch (e) {
+    setStatus(`scene load failed: ${e.message}`, "err");
+    return;
+  }
+  // Bail if the user switched cells while /scene was in flight.
+  if (gen !== sceneGen || currentSlotId !== slotId || effectiveModel() !== model) return;
+
+  applySceneProjection(payload.nodes ?? []);
+  highestEventIndex = typeof payload.last_index === "number" ? payload.last_index : -1;
+  prefetchMeshBundle(slotId, model, sceneGen);
+  console.log(
+    `[scene] ${(payload.nodes ?? []).length} nodes painted in ${((performance.now() - t0) / 1000).toFixed(2)}s`,
+  );
+
+  if (forceLive || currentRunInfo()?.status === "running") {
+    // Active run (or just reset/rewound/resumed): tail only the events past
+    // the projection cut. forceLive bypasses the status check, which is racy
+    // right after a POST flips the run to running.
+    subscribe(`${slotEventsUrl(slotId, model)}?since=${highestEventIndex}`);
+  } else {
+    // Finished cell: no live stream. Mark the run done so post-run mesh
+    // retries refresh the status line correctly.
+    runFinished = true;
+    if (meshErrors.size > 0) showRunCompleteWithErrors();
+    else setStatus("run complete");
+  }
+
+  backfillHistoryInBackground(slotId, model, gen);
+}
+
 async function rewindTo(index) {
   if (currentSlotId === null || currentModel === null) return;
+  const model = effectiveModel();
   if (currentSource) {
     currentSource.close();
     currentSource = null;
@@ -3550,13 +4001,13 @@ async function rewindTo(index) {
   highestEventIndex = -1;
   recordedEvents.length = 0;
   updateReplayButton();
-  setStatus(`POST /slots/${currentSlotId}/${currentModel}/rewind to ${index} …`);
+  setStatus(`POST /slots/${currentSlotId}/${model}/rewind to ${index} …`);
 
   let res;
   try {
     res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(model)}/rewind`,
         SERVER_URL,
       ),
       {
@@ -3575,13 +4026,13 @@ async function rewindTo(index) {
   }
   slotNeedsResume = false;
   setStatus(`rewound to ${index} — streaming events…`);
-  subscribe(slotEventsUrl(currentSlotId, currentModel));
+  loadCellScene(currentSlotId, model, { forceLive: true });
   refreshSlots();
 }
 
 resetEl.addEventListener("click", () => {
   if (currentSlotId !== null && currentModel !== null) {
-    resetSlot(currentSlotId, currentModel);
+    resetSlot(currentSlotId, effectiveModel());
   }
 });
 
@@ -3595,6 +4046,21 @@ runPickerEl.addEventListener("change", () => {
 
 runNewEl.addEventListener("click", createRun);
 
+// Flip the active cell between the v1 (default) and v2 prompt structures.
+// Same (slot, model), different prompt pipeline → an independent parallel
+// scene, switched in exactly like a model change: tear down + re-subscribe
+// to the other variant's cell.
+function togglePromptVariant() {
+  currentVariant = currentVariant === "v2" ? "v1" : "v2";
+  try { localStorage.setItem(VARIANT_STORAGE_KEY, currentVariant); } catch {}
+  updatePromptVariantToggle();
+  if (currentSlotId !== null && currentModel !== null) {
+    switchView(currentSlotId, currentModel);
+  }
+}
+
+promptVariantToggleEl.addEventListener("click", togglePromptVariant);
+
 async function resumeAll() {
   // Fans out POST /slots/<slot>/<model>/resume for every cell on the active
   // model whose status is startable (idle/paused/error). Running and done
@@ -3602,7 +4068,7 @@ async function resumeAll() {
   // resumeSlot() so the scene + SSE rewire — non-viewed cells just need
   // the kick, their events will flow next time the user switches to them.
   if (currentModel === null) return;
-  const model = currentModel;
+  const model = effectiveModel();
   const startable = slotSummaries.filter((s) =>
     ["idle", "paused", "error"].includes(s.runs?.[model]?.status),
   );
@@ -3676,7 +4142,7 @@ async function resumeSlot(id, model) {
     recordedEvents.length = 0;
     updateReplayButton();
     setStatus(`resumed — streaming events…`);
-    subscribe(slotEventsUrl(id, model));
+    loadCellScene(id, model, { forceLive: true });
     refreshSlots();
   } catch (e) {
     setStatus(`resume failed: ${e.message}`, "err");
@@ -3712,9 +4178,9 @@ resumeEl.addEventListener("click", () => {
   if (currentSlotId === null || currentModel === null) return;
   const status = currentRunInfo()?.status;
   if (status === "running") {
-    pauseSlot(currentSlotId, currentModel);
+    pauseSlot(currentSlotId, effectiveModel());
   } else {
-    resumeSlot(currentSlotId, currentModel);
+    resumeSlot(currentSlotId, effectiveModel());
   }
 });
 
@@ -3747,7 +4213,7 @@ exportGlbEl.addEventListener("click", async () => {
     const a = document.createElement("a");
     a.href = url;
     const stem = currentSlotId && currentModel
-      ? `${currentSlotId}_${currentModel}`
+      ? `${currentSlotId}_${effectiveModel()}`
       : (currentSlotId ?? "scene");
     a.download = `${stem}.glb`;
     a.click();
@@ -3775,8 +4241,12 @@ exportGlbEl.addEventListener("click", async () => {
   }
   let savedSlot = null;
   let savedModel = null;
+  let savedVariant = null;
   try { savedSlot = localStorage.getItem(SLOT_STORAGE_KEY); } catch {}
   try { savedModel = localStorage.getItem(MODEL_STORAGE_KEY); } catch {}
+  try { savedVariant = localStorage.getItem(VARIANT_STORAGE_KEY); } catch {}
+  if (savedVariant === "v2") currentVariant = "v2";
+  updatePromptVariantToggle();
   const slotPick =
     slotSummaries.find((s) => s.id === savedSlot)?.id ?? slotSummaries[0].id;
   const modelPick =
@@ -3967,7 +4437,7 @@ async function runReplay({ record }) {
   // afterwards; for a finished run nothing's incoming anyway.
   const reconnectAfter = currentSource !== null;
   const slotForReconnect = currentSlotId;
-  const modelForReconnect = currentModel;
+  const modelForReconnect = effectiveModel();
   if (currentSource) {
     currentSource.close();
     currentSource = null;
@@ -4183,14 +4653,14 @@ function dispatchForReplay(event) {
         dimensions: event.dimensions,
         proxyShape: event.proxy_shape ?? null,
       });
-      renderTree();
+      scheduleRenderTree();
       break;
     case "divider.decompose":
     case "divider.zone_decompose":
       for (const c of event.children ?? []) {
         treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
       }
-      renderTree();
+      scheduleRenderTree();
       break;
     case "divider.zone_plan":
       if (event.node && typeof event.plan === "string") {
@@ -4257,7 +4727,7 @@ replayDownloadEl.addEventListener("click", () => {
   const a = document.createElement("a");
   a.href = lastGifUrl;
   const gifStem = currentSlotId && currentModel
-    ? `${currentSlotId}_${currentModel}`
+    ? `${currentSlotId}_${effectiveModel()}`
     : (currentSlotId ?? "replay");
   a.download = `${gifStem}.gif`;
   a.click();

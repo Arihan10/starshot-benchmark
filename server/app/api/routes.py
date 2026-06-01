@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import shutil
+import struct
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -36,7 +37,7 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from app.core import prompt_runtime
+from app.core import prompt_runtime, prompts_v2
 from app.core.slots import (
     DEFAULT_MODEL_ALIAS,
     MODEL_ALIASES,
@@ -55,10 +56,25 @@ from app.utils.logging import SlotLog
 # is one run; cells live at RUNS_DIR/<run>/<slot>/<model>.
 RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
 
+# Which per-cell mesh directory the scene bundle streams from. Defaults to the
+# originals ("objects"); set STARSHOT_OBJECTS_SUBDIR=objects-optimized to serve
+# the re-baked optimized set (scripts/rebake_runs.py) instead. Falls back to
+# "objects" for any cell that hasn't been migrated.
+OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
+
 # Source file we snapshot into each newly-created run so prompt-versioned
 # AB tests are reproducible after the source has moved on.
 PROMPTS_SOURCE = Path(__file__).resolve().parent.parent / "core" / "prompts.py"
 PROMPT_SNAPSHOT_NAME = "prompts_snapshot.py"
+
+# Prompt-variant axis. A cell's `model_alias` may carry this trailing
+# suffix to select the alternate "v2" prompt structure (app/core/prompts_v2.py)
+# instead of the run's default prompts. The base alias (suffix stripped) is
+# what maps to an OpenRouter model id. Both variants of a (slot, model) cell
+# are fully independent runs — own events.jsonl, own artifacts, own pipeline —
+# exactly like two different models, so the dashboard can drive and compare
+# them side by side within the same slot.
+PROMPT_VARIANT_SUFFIX = "__v2"
 
 # Keyed by (run_name, slot_id, model_alias). Each cell is an independent
 # pipeline. Lazy-populated: only runs the user has activated are loaded.
@@ -124,6 +140,34 @@ def _prompt_module_for_run(run: str):
     return None
 
 
+def _split_variant(model_alias: str) -> tuple[str, str]:
+    """(base_alias, variant) for a possibly-suffixed cell alias. The base is
+    the OpenRouter-mapped model; the variant selects the prompt module."""
+    if model_alias.endswith(PROMPT_VARIANT_SUFFIX):
+        return model_alias[: -len(PROMPT_VARIANT_SUFFIX)], "v2"
+    return model_alias, "v1"
+
+
+def _model_id(model_alias: str) -> str:
+    """OpenRouter model id for a cell alias, ignoring any variant suffix."""
+    return MODELS[_split_variant(model_alias)[0]]
+
+
+def _hydrate_aliases() -> list[str]:
+    """Every cell alias to materialise per slot: each model in both prompt
+    variants (base alias = v1, suffixed alias = v2)."""
+    return MODEL_ALIASES + [a + PROMPT_VARIANT_SUFFIX for a in MODEL_ALIASES]
+
+
+def _prompt_module_for(run: str, model_alias: str):
+    """Prompt module bound for a cell: the v2 module for v2-variant cells,
+    otherwise the run's snapshot (or the live module when none exists)."""
+    _, variant = _split_variant(model_alias)
+    if variant == "v2":
+        return prompts_v2
+    return _prompt_module_for_run(run)
+
+
 def _hydrate_run(run: str) -> None:
     """Build SlotLogs for every (slot, model) cell under RUNS_DIR/<run>/.
     Idempotent — calling twice is a no-op. Hydration is per-run so the
@@ -134,7 +178,7 @@ def _hydrate_run(run: str) -> None:
     run_dir = _run_dir(run)
     run_dir.mkdir(parents=True, exist_ok=True)
     for slot in SLOTS:
-        for alias in MODEL_ALIASES:
+        for alias in _hydrate_aliases():
             slot_dir = _slot_dir(run, slot.id, alias)
             slot_dir.mkdir(parents=True, exist_ok=True)
             slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
@@ -230,6 +274,7 @@ def create_app() -> FastAPI:
             "run": _current_run,
             "models": MODEL_ALIASES,
             "default_model": DEFAULT_MODEL_ALIAS,
+            "prompt_variant_suffix": PROMPT_VARIANT_SUFFIX,
             "slots": [_slot_summary(s, _current_run) for s in SLOTS],
         }
 
@@ -245,16 +290,56 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/slots/{slot_id}/{model_alias}/events")
-    async def slot_events(slot_id: str, model_alias: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_events(slot_id: str, model_alias: str, since: int = -1) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         run = _current_run
         slot_log = _require_slot_log(run, slot_id, model_alias)
         # Subscribe and snapshot synchronously — no await between them, so no
         # log() call can land in both the snapshot and the live queue.
         q = slot_log.subscribe()
         snapshot = list(slot_log.state["events"])
+        # `since` is the CQRS live-tail cut: the client already painted the
+        # scene from /scene (folded up to `since`) and loads the full history
+        # directly, so it only needs events *after* that index here. The gap
+        # between the /scene read and this subscribe is covered because we
+        # filter the fresh snapshot, not a stale copy. Default -1 = full
+        # snapshot (legacy replay path, still used by reset/rewind).
+        if since >= 0:
+            snapshot = [
+                e for e in snapshot
+                if isinstance(e.get("index"), int) and e["index"] > since
+            ]
         return StreamingResponse(
             _sse(slot_log, q, snapshot),
             media_type="text/event-stream",
+        )
+
+    @app.get("/slots/{slot_id}/{model_alias}/scene")
+    async def slot_scene(slot_id: str, model_alias: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # CQRS read model: fold the event log into the minimal renderable scene
+        # state so the client paints directly instead of replaying ~2k events.
+        # Returns `last_index` (the fold's cut) so the client can pick up the
+        # live tail at `?since=last_index` with no gap or overlap.
+        run = _current_run
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        return _scene_projection(list(slot_log.state["events"]))
+
+    @app.get("/slots/{slot_id}/{model_alias}/meshes")
+    async def slot_meshes(slot_id: str, model_alias: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        # One-request scene bundle: stream every finished GLB for this cell in
+        # a single length-prefixed response so the client loads a whole scene
+        # over one connection instead of one HTTP request per mesh (browsers
+        # cap those at ~6 per origin, and they'd contend with the SSE stream
+        # and polls on this same origin). The client keys each blob to its
+        # `model` event by file stem; see `_mesh_bundle`.
+        run = _current_run
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        objects_dir = slot_log.events_path.parent / OBJECTS_SUBDIR
+        if not objects_dir.is_dir():
+            objects_dir = slot_log.events_path.parent / "objects"
+        return StreamingResponse(
+            _mesh_bundle(objects_dir),
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.post("/slots/{slot_id}/{model_alias}/rewind")
@@ -291,7 +376,7 @@ def create_app() -> FastAPI:
             )
         await _cancel_task(run, slot_id, model_alias)
         events = slot_log.state["events"]
-        model_id = MODELS[model_alias]
+        model_id = _model_id(model_alias)
         if status == "idle" and not events:
             # Fresh cell — emit run.start now so the run has somewhere to
             # anchor its events. From here on it's identical to a resume.
@@ -336,7 +421,7 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
-        prompt_runtime.bind(_prompt_module_for_run(run))
+        prompt_runtime.bind(_prompt_module_for(run, model_alias))
         node = _reconstruct_node(slot_log, node_id)
         if node is None:
             raise HTTPException(
@@ -346,8 +431,8 @@ def create_app() -> FastAPI:
 
         async def _do_retry() -> None:
             rlog.bind(slot_log)
-            llm.set_model(MODELS[model_alias])
-            prompt_runtime.bind(_prompt_module_for_run(run))
+            llm.set_model(_model_id(model_alias))
+            prompt_runtime.bind(_prompt_module_for(run, model_alias))
             await generation.retry_node(
                 node=node,
                 runs_dir=RUNS_DIR,
@@ -379,7 +464,7 @@ def create_app() -> FastAPI:
         slot_dir.mkdir(parents=True, exist_ok=True)
         slot_log = SlotLog(_run_id(run, slot.id, model_alias), slot_dir / "events.jsonl")
         _slot_logs[(run, slot.id, model_alias)] = slot_log
-        slot_log.start_run(slot.prompt, MODELS[model_alias])
+        slot_log.start_run(slot.prompt, _model_id(model_alias))
         _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
@@ -388,7 +473,7 @@ def create_app() -> FastAPI:
 
 def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
-    for alias in MODEL_ALIASES:
+    for alias in _hydrate_aliases():
         slot_log = _slot_logs.get((run, slot.id, alias))
         state = slot_log.state if slot_log is not None else {"status": "idle", "events": []}
         events = state.get("events", [])
@@ -410,7 +495,7 @@ def _maybe_launch(slot: Slot, model_alias: str, slot_log: SlotLog) -> None:
     Fresh cells sit idle with their seed prompt prefilled; previously-
     running cells come back as paused (resumable); errored cells come
     back as error (retry-able); completed cells stay done."""
-    model_id = MODELS[model_alias]
+    model_id = _model_id(model_alias)
     events = slot_log.state["events"]
     if not events:
         # Pre-seed the prompt + model so slot_resume can start_run() without
@@ -508,7 +593,8 @@ def _require_slot(slot_id: str) -> Slot:
 
 
 def _require_model(model_alias: str) -> None:
-    if model_alias not in MODELS:
+    base, _ = _split_variant(model_alias)
+    if base not in MODELS:
         raise HTTPException(status_code=404, detail=f"unknown model: {model_alias}")
 
 
@@ -531,6 +617,116 @@ async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await task
+
+
+_MESH_BUNDLE_MAGIC = b"SMB1"
+
+
+async def _mesh_bundle(objects_dir: Path) -> AsyncIterator[bytes]:
+    """Stream every finished GLB under `objects_dir` as one length-prefixed
+    binary bundle, so a client can fetch an entire scene in a single request
+    instead of one HTTP round-trip per mesh. Framing (little-endian):
+
+        b"SMB1"
+        repeat: <uint32 id_len><id utf-8><uint32 glb_len><glb bytes>
+
+    The id is the file stem, which matches the `model` event's `id`. Files are
+    read off the event loop via a thread so a large scene doesn't stall it.
+    """
+    yield _MESH_BUNDLE_MAGIC
+    if not objects_dir.is_dir():
+        return
+    for path in sorted(objects_dir.glob("*.glb")):
+        # Skip pre-processing intermediates (`<id>.raw.glb`); only the finished
+        # `<id>.glb` is what the client renders.
+        if path.name.endswith(".raw.glb"):
+            continue
+        node_id = path.name[: -len(".glb")]
+        data = await asyncio.to_thread(path.read_bytes)
+        id_bytes = node_id.encode("utf-8")
+        yield struct.pack("<I", len(id_bytes)) + id_bytes
+        yield struct.pack("<I", len(data)) + data
+
+
+def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
+    """Fold the event log into the minimal renderable scene state — the read
+    model the client paints directly instead of replaying every event.
+
+    Mirrors the *scene-building* cases of the client's `dispatch()` (bbox,
+    divider.*, step, mesh.*, image, model). Deliberately ignores `cache.llm`
+    and the other log/observability-only kinds — those stay in the full event
+    log, which the client backfills into the side panels separately.
+
+    Returns `{ "nodes": [...], "last_index": N }` where N is the highest event
+    index folded, so the client can subscribe to the live tail at index > N.
+    """
+    nodes: dict[str, dict[str, object]] = {}
+    last_index = -1
+
+    def node(node_id: str) -> dict[str, object]:
+        n = nodes.get(node_id)
+        if n is None:
+            n = {"id": node_id}
+            nodes[node_id] = n
+        return n
+
+    for e in events:
+        idx = e.get("index")
+        if isinstance(idx, int):
+            last_index = max(last_index, idx)
+        kind = e.get("kind")
+        nid = e.get("id")
+        if kind == "bbox" and isinstance(nid, str):
+            n = node(nid)
+            n["parent_id"] = e.get("parent_id")
+            n["prompt"] = e.get("prompt")
+            n["node_kind"] = e.get("node_kind", "zone")
+            n["origin"] = e.get("origin")
+            n["dimensions"] = e.get("dimensions")
+            n["proxy_shape"] = e.get("proxy_shape")
+        elif kind in ("divider.decompose", "divider.zone_decompose"):
+            children = e.get("children")
+            if isinstance(children, list):
+                for c in children:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("id")
+                    if not isinstance(cid, str):
+                        continue
+                    n = node(cid)
+                    n.setdefault("parent_id", c.get("parent") or e.get("node"))
+                    n.setdefault("prompt", c.get("prompt"))
+                    n.setdefault("node_kind", "zone")
+        elif kind == "divider.zone_plan":
+            anchor = e.get("node")
+            if isinstance(anchor, str) and isinstance(e.get("plan"), str):
+                node(anchor)["plan"] = e["plan"]
+        elif kind == "step":
+            anchor = e.get("node")
+            if isinstance(anchor, str):
+                node(anchor)["phase"] = e.get("phase")
+        elif kind == "mesh.submit" and isinstance(nid, str):
+            node(nid)["phase"] = "generating_mesh"
+        elif kind == "image" and isinstance(nid, str):
+            n = node(nid)
+            n["image_url"] = e.get("url")
+            if isinstance(e.get("prompt"), str):
+                n["image_prompt"] = e.get("prompt")
+        elif kind == "model" and isinstance(nid, str):
+            n = node(nid)
+            n["mesh_url"] = e.get("url")
+            n["phase"] = "done"
+            n.pop("error", None)
+        elif kind == "mesh.error" and isinstance(nid, str):
+            n = node(nid)
+            n["phase"] = "error"
+            n["error"] = e.get("message", "unknown error")
+        elif kind == "mesh.retry" and isinstance(nid, str):
+            n = node(nid)
+            n["phase"] = "generating_mesh"
+            n.pop("error", None)
+
+    return {"nodes": list(nodes.values()), "last_index": last_index}
 
 
 async def _sse(
@@ -561,7 +757,7 @@ async def _sse(
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
     slot_log = _slot_logs[(run, slot_id, model_alias)]
     rlog.bind(slot_log)
-    prompt_runtime.bind(_prompt_module_for_run(run))
+    prompt_runtime.bind(_prompt_module_for(run, model_alias))
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]
     run_id = _run_id(run, slot_id, model_alias)
