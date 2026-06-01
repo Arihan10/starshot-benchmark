@@ -2,13 +2,15 @@
 
 When USE_ASSET_LIBRARY is set, the generation pipeline skips image and 3D
 generation entirely, instead using an LLM call to match each object's
-prompt to the closest item in the library catalog, then copies + rescales
-the pre-built .glb into the run's output directory.
+prompt to the closest item in the library catalog, then bakes a placement
+transform into the pre-built .glb (see app.utils.glb_place) under the run's
+output directory.
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -18,7 +20,10 @@ from app.services import llm
 
 _LIBRARY_DIR = Path(__file__).resolve().parent.parent / "assets_library"
 _CATALOG_PATH = _LIBRARY_DIR / "library.json"
-ASSETS_DIR = _LIBRARY_DIR / "assets"
+# Default to the optimized library (decimated geometry, Meshopt + KTX2). Set
+# LIBRARY_ASSETS_SUBDIR=assets to fall back to the raw Trellis assets.
+ASSETS_DIR = _LIBRARY_DIR / os.environ.get("LIBRARY_ASSETS_SUBDIR", "assets-optimized")
+_MANIFEST_PATH = ASSETS_DIR / "optimize_manifest.json"
 
 
 class LibraryItem(BaseModel):
@@ -92,3 +97,37 @@ async def match(prompt: str) -> LibraryMatchOutput:
 
 def asset_path(library_id: str) -> Path:
     return ASSETS_DIR / f"{library_id}.glb"
+
+
+_bounds_by_id: dict[str, dict[str, dict[str, list[float]]]] | None = None
+
+
+def _load_bounds() -> dict[str, dict[str, dict[str, list[float]]]]:
+    """Per-asset, per-orientation world-space AABBs from optimize_manifest.json.
+    The placement bake needs the rotated extents to fill a target bbox, but the
+    optimized GLBs are Meshopt/KTX2-compressed and can't be measured server-side,
+    so the bounds are precomputed (see tools/optimize-assets/augment-bounds.mjs)."""
+    global _bounds_by_id
+    if _bounds_by_id is None:
+        _bounds_by_id = {}
+        if _MANIFEST_PATH.exists():
+            data = json.loads(_MANIFEST_PATH.read_text())
+            for entry in data.get("assets", []):
+                bbo = entry.get("bounds_by_orientation")
+                if bbo:
+                    _bounds_by_id[entry["id"]] = bbo
+    return _bounds_by_id
+
+
+def asset_rotated_bounds(
+    library_id: str, orientation: int
+) -> tuple[list[float], list[float]] | None:
+    """(min, max) world-space AABB of `library_id` after the given yaw, or None
+    when the asset is absent from the manifest or lacks augmented bounds."""
+    bbo = _load_bounds().get(library_id)
+    if not bbo:
+        return None
+    entry = bbo.get(str(int(orientation)))
+    if not entry:
+        return None
+    return entry["min"], entry["max"]

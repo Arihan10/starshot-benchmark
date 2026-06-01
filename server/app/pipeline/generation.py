@@ -37,7 +37,7 @@ import trimesh
 from app.core import prompt_runtime
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.services import llm, nano_banana, threed
-from app.utils import logging
+from app.utils import glb_place, logging
 from app.utils.geometry import rescale_mesh_to_bbox
 from app.utils.topology import validate_parents, validate_referenced_ids
 
@@ -422,16 +422,29 @@ async def _match_library_assets(
             )
 
         if asset.exists():
-            async with _MESH_IO:
-                scene = await asyncio.to_thread(trimesh.load, asset)
-                rescaled = await asyncio.to_thread(
-                    rescale_mesh_to_bbox,
-                    scene,
-                    bbox,
+            # The optimized asset is Meshopt/KTX2-compressed, so we bake the
+            # placement as a node-graph transform (preserving the compressed
+            # bytes) instead of decoding + re-exporting through trimesh.
+            bounds = library.asset_rotated_bounds(match.library_id, spec.orientation)
+            if bounds is not None:
+                await asyncio.to_thread(
+                    glb_place.place_glb,
+                    src=asset,
+                    dst=path,
+                    bbox=bbox,
                     orientation=spec.orientation,
+                    rotated_min=bounds[0],
+                    rotated_max=bounds[1],
                 )
-                await asyncio.to_thread(rescaled.export, path, file_type="glb")
-                del scene, rescaled
+            else:
+                # Asset missing from the manifest: copy through unscaled so the
+                # placement still renders rather than vanishing.
+                await asyncio.to_thread(shutil.copyfile, asset, path)
+                logging.log(
+                    "library.bounds_missing",
+                    id=spec.id,
+                    library_id=match.library_id,
+                )
             logging.emit_model(
                 spec.id,
                 artifact_kind="object",

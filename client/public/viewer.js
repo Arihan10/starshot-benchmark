@@ -1507,7 +1507,177 @@ function resetModelQueue() {
   sceneGen += 1;
 }
 
-function loadModel(event) {
+// Dispose a material *and* every texture it references — material.dispose()
+// frees the shader program but leaves uploaded textures resident in GPU memory
+// until each is disposed individually. Used by the streamed bundle path so
+// swapping a mesh never strands the previous GLB's textures in VRAM.
+function disposeMaterial(material) {
+  if (!material) return;
+  for (const value of Object.values(material)) {
+    if (value && value.isTexture) value.dispose();
+  }
+  material.dispose?.();
+}
+
+function disposeObject3D(root) {
+  root?.traverse?.((n) => {
+    if (!n.isMesh) return;
+    n.geometry?.dispose?.();
+    const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
+    for (const m of mats) disposeMaterial(m);
+  });
+}
+
+function parseGlb(arrayBuffer) {
+  return new Promise((resolve, reject) => {
+    loader.parse(arrayBuffer, "", resolve, reject);
+  });
+}
+
+// --- one-connection scene bundle (streamed + progressive) ------------------
+//
+// Opening a built scene used to fire one HTTP GET per object GLB, which the
+// browser caps at ~6 concurrent per origin (and which contend with the SSE
+// stream + polls on the same origin). Instead we pull the whole cell's GLBs
+// over ONE connection — GET /slots/<slot>/<model>/meshes streams a
+// length-prefixed binary bundle — and attach each mesh AS IT ARRIVES.
+//
+// Streaming (not buffering the whole response) keeps JS memory bounded to a
+// small window of in-flight GLBs regardless of total scene size, and meshes
+// appear progressively. `model` events coordinate via `streamDone`: an id the
+// bundle already attached needs only bookkeeping; anything it didn't carry (a
+// post-snapshot mesh, a retry, a parse miss) falls back to an individual fetch.
+// Tied to `sceneGen` so a stale scene's bundle is ignored.
+const _MESH_BUNDLE_MAGIC = "SMB1";
+let meshBundle = { gen: -1, attached: new Set(), streamDone: Promise.resolve(), abort: null };
+
+function prefetchMeshBundle(slotId, model, gen) {
+  if (!slotId || !model) return;
+  // Supersede any still-streaming bundle from a scene we've left.
+  meshBundle.abort?.abort?.();
+  const abort = new AbortController();
+  let resolveDone;
+  const streamDone = new Promise((r) => { resolveDone = r; });
+  const state = { gen, attached: new Set(), streamDone, abort };
+  meshBundle = state;
+  (async () => {
+    try {
+      const res = await fetch(slotMeshesUrl(slotId, model), {
+        cache: "no-store",
+        signal: abort.signal,
+      });
+      if (res.ok && res.body) {
+        await consumeMeshBundleStream(res.body.getReader(), state);
+      }
+    } catch {
+      // Aborted (superseded) / network / parse error — whatever attached so
+      // far stays; the rest is picked up per-object by the model-event
+      // fallback once streamDone resolves.
+    } finally {
+      resolveDone();
+    }
+  })();
+}
+
+// Pull exact byte counts out of a ReadableStream reader, holding only the
+// not-yet-consumed chunks (each dropped as it's read), so peak memory tracks
+// the largest single frame — never the whole multi-GB bundle.
+function _byteStreamReader(reader) {
+  const chunks = [];
+  let avail = 0;
+  let ended = false;
+  async function readExact(n) {
+    while (avail < n) {
+      if (ended) return null;
+      const { done, value } = await reader.read();
+      if (done) { ended = true; continue; }
+      if (value && value.length) { chunks.push(value); avail += value.length; }
+    }
+    const out = new Uint8Array(n);
+    let filled = 0;
+    while (filled < n) {
+      const c = chunks[0];
+      const take = Math.min(c.length, n - filled);
+      out.set(c.subarray(0, take), filled);
+      filled += take;
+      if (take === c.length) chunks.shift();
+      else chunks[0] = c.subarray(take);
+      avail -= take;
+    }
+    return out;
+  }
+  return { readExact };
+}
+
+// Parse + attach up to this many meshes concurrently. Reading frames off the
+// stream stays sequential on the one connection; only the parse/decode fans
+// out, bounding peak memory to ~MAX_INFLIGHT in-flight GLBs.
+const MESH_BUNDLE_MAX_INFLIGHT = 20;
+
+async function consumeMeshBundleStream(reader, state) {
+  const r = _byteStreamReader(reader);
+  const dec = new TextDecoder();
+  const magic = await r.readExact(4);
+  if (!magic || dec.decode(magic) !== _MESH_BUNDLE_MAGIC) return;
+  const inflight = new Set();
+  while (true) {
+    if (state.gen !== sceneGen || state.abort.signal.aborted) break;
+    const idLenB = await r.readExact(4);
+    if (!idLenB) break;
+    const idLen = new DataView(idLenB.buffer).getUint32(0, true);
+    const idB = await r.readExact(idLen);
+    if (!idB) break;
+    const id = dec.decode(idB);
+    const glbLenB = await r.readExact(4);
+    if (!glbLenB) break;
+    const glbLen = new DataView(glbLenB.buffer).getUint32(0, true);
+    const glbB = await r.readExact(glbLen);
+    if (!glbB) break;
+    const p = attachBundleMesh(id, glbB.buffer, state.gen, state)
+      .finally(() => inflight.delete(p));
+    inflight.add(p);
+    // Hold the read at MAX_INFLIGHT in-flight parses; resume once one drains.
+    if (inflight.size >= MESH_BUNDLE_MAX_INFLIGHT) await Promise.race(inflight);
+  }
+  await Promise.allSettled(inflight);
+  // One camera refit after the whole bundle lands — a per-mesh fitToScene()
+  // is an O(scene) Box3 traversal, i.e. quadratic across a large scene.
+  if (state.gen === sceneGen) fitToScene();
+}
+
+// Parse one streamed GLB and add it to the scene. Mirrors the attach half of
+// _loadModelNow; on a parse failure it bails without attaching, leaving the id
+// for the model-event fallback to fetch fresh.
+async function attachBundleMesh(id, glbBuffer, gen, state) {
+  if (gen !== sceneGen) return;
+  let gltf;
+  try {
+    gltf = await parseGlb(glbBuffer);
+  } catch {
+    return;
+  }
+  if (gen !== sceneGen) { disposeObject3D(gltf.scene); return; }
+  gltf.scene.traverse((child) => {
+    if (child.isMesh && child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const m of mats) m.side = THREE.DoubleSide;
+    }
+  });
+  gltf.scene.name = `mesh:${id}`;
+  gltf.scene.userData.pickId = id;
+  const prev = modelsById.get(id);
+  if (prev) {
+    sceneRoot.remove(prev);
+    disposeObject3D(prev);
+  }
+  sceneRoot.add(gltf.scene);
+  modelsById.set(id, gltf.scene);
+  state.attached.add(id);
+  applyModelVisibility(id);
+  upsertAsset(id, { status: "loaded" });
+}
+
+async function loadModel(event) {
   if (replayPreloadCache) {
     const cached = replayPreloadCache.get(event.id);
     if (cached) {
@@ -1520,7 +1690,22 @@ function loadModel(event) {
       return;
     }
   }
-  _loadModelNow(event, sceneGen);
+  // A scene bundle streaming for this generation attaches meshes progressively.
+  // Wait for it to finish, then adopt what it attached (bookkeeping only) or
+  // fetch this id individually if the bundle didn't carry it (a mesh generated
+  // after the snapshot, a retry, or a parse miss).
+  const gen = sceneGen;
+  const bundle = meshBundle;
+  if (bundle.gen === gen) {
+    await bundle.streamDone;
+    if (gen !== sceneGen) return;
+    if (modelsById.has(event.id)) {
+      applyModelVisibility(event.id);
+      upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
+      return;
+    }
+  }
+  _loadModelNow(event, gen);
 }
 
 // Attach a pre-fetched GLB scene to the live tree. Mirrors the second half
@@ -3575,7 +3760,7 @@ function switchView(slotId, modelAlias) {
     setStatus(`slot :: ${cellLabel} — ${status}`);
   } else {
     setStatus(`slot :: ${cellLabel}`);
-    subscribe(slotEventsUrl(slotId, modelAlias));
+    loadCellScene(slotId, modelAlias);
   }
 }
 
@@ -3593,6 +3778,30 @@ function switchModel(alias) {
 function slotEventsUrl(slotId, model) {
   return new URL(
     `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events`,
+    SERVER_URL,
+  ).toString();
+}
+
+function slotMeshesUrl(slotId, model) {
+  return new URL(
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes`,
+    SERVER_URL,
+  ).toString();
+}
+
+function slotSceneUrl(slotId, model) {
+  return new URL(
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene`,
+    SERVER_URL,
+  ).toString();
+}
+
+// The full event log on disk, served by the /artifacts static mount. Used to
+// backfill the side panels (log / observability / gif) in the background after
+// the scene is already painted from /scene — no SSE replay.
+function historyUrl(slotId, model) {
+  return new URL(
+    `/artifacts/${encodeURIComponent(currentRun)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events.jsonl`,
     SERVER_URL,
   ).toString();
 }
@@ -3631,7 +3840,7 @@ async function resetSlot(id, model, skipConfirm = false) {
     updateReplayButton();
     slotNeedsResume = false;
     setStatus(`slot ${id} · ${model} reset — streaming events…`);
-    subscribe(slotEventsUrl(id, model));
+    loadCellScene(id, model, { forceLive: true });
     refreshSlots();
   } catch (e) {
     setStatus(`reset failed: ${e.message}`, "err");
@@ -3641,6 +3850,14 @@ async function resetSlot(id, model, skipConfirm = false) {
 }
 
 function subscribe(url) {
+  // Fresh scene loads (highestEventIndex === -1) replay the whole snapshot, so
+  // prefetch the cell's GLBs in one request; loadModel consumes the bundle as
+  // `model` events arrive. Mid-run re-subscribes (mesh retry, post-replay
+  // reconnect) keep their already-loaded meshes — those events dedupe by index
+  // — so they skip the prefetch.
+  if (highestEventIndex === -1 && currentSlotId !== null && currentModel !== null) {
+    prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
+  }
   const es = new EventSource(url);
   currentSource = es;
   es.onmessage = (ev) => {
@@ -3659,6 +3876,135 @@ function subscribe(url) {
       currentSource = null;
     }
   };
+}
+
+// --- CQRS scene load (derive-on-read) --------------------------------------
+//
+// Opening an existing cell no longer replays the whole event log. Instead:
+//   1. GET /scene → a folded projection of the current scene; paint it directly
+//      (bboxes + tree + asset cards) via the same builders dispatch() uses.
+//   2. Start the one-connection mesh bundle.
+//   3. If the run is still active, tail the live SSE at ?since=last_index
+//      (catch-up + new events only — no history).
+//   4. Once the meshes have streamed, backfill the FULL event log into the side
+//      panels (log / observability / gif) in the background, WITHOUT re-running
+//      scene handlers (the projection already built the scene).
+//
+// subscribe() (full replay) stays for fresh/resumed runs (reset/rewind/retry)
+// where history is empty or being freshly built.
+
+// Build scene + tree + asset panel directly from the /scene projection. Reuses
+// the live builders so there's a single source of truth for how a node renders.
+function applySceneProjection(nodes) {
+  for (const n of nodes) {
+    const patch = {
+      parentId: n.parent_id ?? null,
+      prompt: n.prompt ?? null,
+      kind: n.node_kind ?? "zone",
+    };
+    if (n.plan != null) patch.plan = n.plan;
+    if (n.image_prompt != null) patch.imagePrompt = n.image_prompt;
+    treeUpsert(n.id, patch);
+    if (n.origin && n.dimensions) {
+      loadBbox({
+        id: n.id,
+        origin: n.origin,
+        dimensions: n.dimensions,
+        proxy_shape: n.proxy_shape,
+        node_kind: n.node_kind,
+      });
+    }
+    if (n.image_url) {
+      upsertAsset(n.id, { imageUrl: n.image_url, prompt: n.image_prompt ?? n.prompt ?? null });
+    }
+    if (n.mesh_url) upsertAsset(n.id, { modelUrl: n.mesh_url });
+    if (n.error) {
+      meshErrors.set(n.id, n.error);
+      upsertAsset(n.id, { status: "error", errorMessage: n.error });
+    }
+    if (n.phase) {
+      // Set phase directly (not treeSetPhase) to skip its per-call render/focus
+      // churn across hundreds of nodes; the single renderTree() below covers all.
+      const cur = treeNodes.get(n.id);
+      if (cur) cur.phase = n.phase;
+    }
+  }
+  renderTree();
+}
+
+// Panel-only consumer for the background history load: feeds the gif buffer,
+// log panel, and observability modal — never the scene (the projection owns it).
+function backfillPanels(event) {
+  recordedEvents.push(event);
+  appendEvent(event);
+  if (event.kind === "cache.llm") recordLlmCall(event);
+}
+
+// Stream the full event log into the side panels AFTER the meshes have loaded,
+// so the heavy parse never contends with GLB texture finalization. Chunked so
+// it yields to the main thread instead of freezing it.
+async function backfillHistoryInBackground(slotId, model, gen) {
+  try { await meshBundle.streamDone; } catch {}
+  if (gen !== sceneGen) return;
+  let text;
+  try {
+    const res = await fetch(historyUrl(slotId, model), { cache: "no-store" });
+    if (!res.ok) return;
+    text = await res.text();
+  } catch {
+    return;
+  }
+  if (gen !== sceneGen) return;
+  const lines = text.split("\n");
+  let i = 0;
+  const step = () => {
+    if (gen !== sceneGen) return;
+    const end = Math.min(i + 200, lines.length);
+    for (; i < end; i++) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      backfillPanels(event);
+    }
+    if (i < lines.length) setTimeout(step, 0);
+    else updateReplayButton();
+  };
+  step();
+}
+
+async function loadCellScene(slotId, model, { forceLive = false } = {}) {
+  const gen = sceneGen;
+  let payload;
+  try {
+    const res = await fetch(slotSceneUrl(slotId, model), { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    payload = await res.json();
+  } catch (e) {
+    setStatus(`scene load failed: ${e.message}`, "err");
+    return;
+  }
+  // Bail if the user switched cells while /scene was in flight.
+  if (gen !== sceneGen || currentSlotId !== slotId || currentModel !== model) return;
+
+  applySceneProjection(payload.nodes ?? []);
+  highestEventIndex = typeof payload.last_index === "number" ? payload.last_index : -1;
+  prefetchMeshBundle(slotId, model, sceneGen);
+
+  if (forceLive || currentRunInfo()?.status === "running") {
+    // Active run (or just reset/resumed): tail only the events past the
+    // projection cut. forceLive bypasses the status check, which is racy right
+    // after a POST flips the run to running.
+    subscribe(`${slotEventsUrl(slotId, model)}?since=${highestEventIndex}`);
+  } else {
+    // Finished cell: no live stream. Mark the run done so post-run mesh retries
+    // refresh the status line correctly.
+    runFinished = true;
+    if (meshErrors.size > 0) showRunCompleteWithErrors();
+    else setStatus("run complete");
+  }
+
+  backfillHistoryInBackground(slotId, model, gen);
 }
 
 async function rewindTo(index) {

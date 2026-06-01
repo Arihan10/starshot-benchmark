@@ -57,32 +57,7 @@ Relates a node to a target (parent id, sibling id, or a frame id):
 
 ## Pipeline
 
-The pipeline has two phases. Phase 1 (divider) recursively decomposes the prompt into a tree of Nodes with resolved bboxes. Phase 2 (generation) realizes meshes for atomic leaves. Phase 2 is currently a stub.
-
-### Phase 1 — Divider (recursive top-down)
-
-Entry: `(prompt, model, run_id, runs_dir)`. Exit: a root `Node` with the full subtree.
-
-1. **Receive user prompt.**
-2. **Overall bounding box (LLM).** Size the root bbox to the scene shape (tall+narrow skyscraper, long+flat river, etc.). Interpreted under the canonical front view above.
-3. **Zone planning (LLM).** One call authors three things together: (a) this zone's character/intent `plan`, (b) the `is_atomic` decision (does it subdivide?), and (c) when subdividing, a list of `SubzoneSeed`s — each with `id`, `prompt`, and a fully-authored child `plan`. The structural decision and the per-subzone plans live in the same call deliberately: parent intent and child identity are deeply linked. Non-root zones receive their seed's plan as `inherited_plan` and re-emit it (the seed plan is authoritative; this step's job for the child is to make the structural decision and seed _its_ children). If `is_atomic`, the zone hands off to phase-2 anchor generation.
-4. **Children materialization (LLM).** Runs only when step 3 said subdivides. Takes the subzone seeds and assigns each a `proxy_shape` (optional) and `Relationship`s anchoring it to the parent or earlier siblings. It does **not** re-decide atomicity, add/drop children, or rewrite plans — `id`/`prompt` are copied from the seeds verbatim. The LLM does **not** pick concrete coordinates here.
-5. **Topologically order children** by their sibling relationships so each is placed after every sibling it depends on. Cycles are an error.
-6. **Per child, in topo order:**
-   1. **Bounding box resolution (LLM).** Given the parent bbox, sibling bboxes already placed, the child's prompt, and its relationships, the LLM produces the child's concrete AABB. Must lie inside the parent bbox, not overlap siblings, and respect each relationship's `kind` + `reference_point`.
-   2. **Frame decider (LLM).** Decide whether this child needs architectural geometry (walls, floor, ceiling, roof, curved enclosure). If yes, produce frame specs. Frames are realized **deterministically**:
-      - `plane` — flat rectangular surface.
-      - `curve` — vertically-extruded Catmull-Rom spline; closed loops get floor + ceiling caps.
-      - `generated` — escape hatch: Trellis 2 produces the shell mesh, we rescale it into the child's bbox.
-
-      Each realized frame becomes a concrete child `Node` of the placed child, with `mesh_url` pointing at its `.glb`.
-7. **Recurse** into each placed child and go back to step 3. Each child arrives with its `plan` pre-seeded from the parent's planning step. Atomic leaves stop recursing and (eventually) flow into phase 2.
-
-The root also gets a frame pass — its world-scale boundary — running immediately after root's children are placed and before their per-child frame passes, so the world boundary is in scene context when each child frame is decided.
-
-### Phase 2 — Generation (stub)
-
-Not implemented. When implemented, it will take an atomic leaf `Node` and populate it / its children with Trellis 2 meshes. Anchor-object resolution, relationship DAG validation, per-object bbox resolution, mesh generation, rescaling, state-driven completion loop, and assembly all belong here. Until phase 2 exists, atomic leaves just stay abstract in the tree.
+The pipeline has two phases. Phase 1 (divider) recursively decomposes the prompt into a tree of Nodes with resolved bboxes. Phase 2 (generation) realizes meshes for atomic leaves.
 
 ## Cross-cutting concerns
 

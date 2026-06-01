@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import shutil
+import struct
 from datetime import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -55,6 +56,12 @@ from app.utils.logging import SlotLog
 # Parent directory holding many named runs. Each immediate subdirectory
 # is one run; cells live at RUNS_DIR/<run>/<slot>/<model>.
 RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
+
+# Which per-cell mesh directory the scene bundle streams from. Defaults to the
+# originals ("objects"); set STARSHOT_OBJECTS_SUBDIR=objects-optimized to serve
+# the re-baked optimized set (scripts/rebake_runs.py) instead. Falls back to
+# "objects" for any cell that hasn't been migrated.
+OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
 
 # Source file we snapshot into each newly-created run so prompt-versioned
 # AB tests are reproducible after the source has moved on.
@@ -250,16 +257,56 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/slots/{slot_id}/{model_alias}/events")
-    async def slot_events(slot_id: str, model_alias: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_events(slot_id: str, model_alias: str, since: int = -1) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         run = _current_run
         slot_log = _require_slot_log(run, slot_id, model_alias)
         # Subscribe and snapshot synchronously — no await between them, so no
         # log() call can land in both the snapshot and the live queue.
         q = slot_log.subscribe()
         snapshot = list(slot_log.state["events"])
+        # `since` is the CQRS live-tail cut: the client already painted the
+        # scene from /scene (folded up to `since`) and loads the full history
+        # directly, so it only needs events *after* that index here. The gap
+        # between the /scene read and this subscribe is covered because we
+        # filter the fresh snapshot, not a stale copy. Default -1 = full
+        # snapshot (legacy replay path, still used by reset/rewind).
+        if since >= 0:
+            snapshot = [
+                e for e in snapshot
+                if isinstance(e.get("index"), int) and e["index"] > since
+            ]
         return StreamingResponse(
             _sse(slot_log, q, snapshot),
             media_type="text/event-stream",
+        )
+
+    @app.get("/slots/{slot_id}/{model_alias}/scene")
+    async def slot_scene(slot_id: str, model_alias: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # CQRS read model: fold the event log into the minimal renderable scene
+        # state so the client paints directly instead of replaying ~2k events.
+        # Returns `last_index` (the fold's cut) so the client can pick up the
+        # live tail at `?since=last_index` with no gap or overlap.
+        run = _current_run
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        return _scene_projection(list(slot_log.state["events"]))
+
+    @app.get("/slots/{slot_id}/{model_alias}/meshes")
+    async def slot_meshes(slot_id: str, model_alias: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        # One-request scene bundle: stream every finished GLB for this cell in
+        # a single length-prefixed response so the client loads a whole scene
+        # over one connection instead of one HTTP request per mesh (browsers
+        # cap those at ~6 per origin, and they'd contend with the SSE stream
+        # and polls on this same origin). The client keys each blob to its
+        # `model` event by file stem; see `_mesh_bundle`.
+        run = _current_run
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        objects_dir = slot_log.events_path.parent / OBJECTS_SUBDIR
+        if not objects_dir.is_dir():
+            objects_dir = slot_log.events_path.parent / "objects"
+        return StreamingResponse(
+            _mesh_bundle(objects_dir),
+            media_type="application/octet-stream",
+            headers={"Cache-Control": "no-store"},
         )
 
     @app.post("/slots/{slot_id}/{model_alias}/rewind")
@@ -622,6 +669,116 @@ async def _start_cell(run: str, slot_id: str, model_alias: str) -> None:
         slot_log.state["model"] = model_id
         slot_log.state["status"] = "running"
     _tasks[(run, slot_id, model_alias)] = asyncio.create_task(_run(run, slot_id, model_alias))
+
+
+_MESH_BUNDLE_MAGIC = b"SMB1"
+
+
+async def _mesh_bundle(objects_dir: Path) -> AsyncIterator[bytes]:
+    """Stream every finished GLB under `objects_dir` as one length-prefixed
+    binary bundle, so a client can fetch an entire scene in a single request
+    instead of one HTTP round-trip per mesh. Framing (little-endian):
+
+        b"SMB1"
+        repeat: <uint32 id_len><id utf-8><uint32 glb_len><glb bytes>
+
+    The id is the file stem, which matches the `model` event's `id`. Files are
+    read off the event loop via a thread so a large scene doesn't stall it.
+    """
+    yield _MESH_BUNDLE_MAGIC
+    if not objects_dir.is_dir():
+        return
+    for path in sorted(objects_dir.glob("*.glb")):
+        # Skip pre-processing intermediates (`<id>.raw.glb`); only the finished
+        # `<id>.glb` is what the client renders.
+        if path.name.endswith(".raw.glb"):
+            continue
+        node_id = path.name[: -len(".glb")]
+        data = await asyncio.to_thread(path.read_bytes)
+        id_bytes = node_id.encode("utf-8")
+        yield struct.pack("<I", len(id_bytes)) + id_bytes
+        yield struct.pack("<I", len(data)) + data
+
+
+def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
+    """Fold the event log into the minimal renderable scene state — the read
+    model the client paints directly instead of replaying every event.
+
+    Mirrors the *scene-building* cases of the client's `dispatch()` (bbox,
+    divider.*, step, mesh.*, image, model). Deliberately ignores `cache.llm`
+    and the other log/observability-only kinds — those stay in the full event
+    log, which the client backfills into the side panels separately.
+
+    Returns `{ "nodes": [...], "last_index": N }` where N is the highest event
+    index folded, so the client can subscribe to the live tail at index > N.
+    """
+    nodes: dict[str, dict[str, object]] = {}
+    last_index = -1
+
+    def node(node_id: str) -> dict[str, object]:
+        n = nodes.get(node_id)
+        if n is None:
+            n = {"id": node_id}
+            nodes[node_id] = n
+        return n
+
+    for e in events:
+        idx = e.get("index")
+        if isinstance(idx, int):
+            last_index = max(last_index, idx)
+        kind = e.get("kind")
+        nid = e.get("id")
+        if kind == "bbox" and isinstance(nid, str):
+            n = node(nid)
+            n["parent_id"] = e.get("parent_id")
+            n["prompt"] = e.get("prompt")
+            n["node_kind"] = e.get("node_kind", "zone")
+            n["origin"] = e.get("origin")
+            n["dimensions"] = e.get("dimensions")
+            n["proxy_shape"] = e.get("proxy_shape")
+        elif kind in ("divider.decompose", "divider.zone_decompose"):
+            children = e.get("children")
+            if isinstance(children, list):
+                for c in children:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("id")
+                    if not isinstance(cid, str):
+                        continue
+                    n = node(cid)
+                    n.setdefault("parent_id", c.get("parent") or e.get("node"))
+                    n.setdefault("prompt", c.get("prompt"))
+                    n.setdefault("node_kind", "zone")
+        elif kind == "divider.zone_plan":
+            anchor = e.get("node")
+            if isinstance(anchor, str) and isinstance(e.get("plan"), str):
+                node(anchor)["plan"] = e["plan"]
+        elif kind == "step":
+            anchor = e.get("node")
+            if isinstance(anchor, str):
+                node(anchor)["phase"] = e.get("phase")
+        elif kind == "mesh.submit" and isinstance(nid, str):
+            node(nid)["phase"] = "generating_mesh"
+        elif kind == "image" and isinstance(nid, str):
+            n = node(nid)
+            n["image_url"] = e.get("url")
+            if isinstance(e.get("prompt"), str):
+                n["image_prompt"] = e.get("prompt")
+        elif kind == "model" and isinstance(nid, str):
+            n = node(nid)
+            n["mesh_url"] = e.get("url")
+            n["phase"] = "done"
+            n.pop("error", None)
+        elif kind == "mesh.error" and isinstance(nid, str):
+            n = node(nid)
+            n["phase"] = "error"
+            n["error"] = e.get("message", "unknown error")
+        elif kind == "mesh.retry" and isinstance(nid, str):
+            n = node(nid)
+            n["phase"] = "generating_mesh"
+            n.pop("error", None)
+
+    return {"nodes": list(nodes.values()), "last_index": last_index}
 
 
 async def _sse(
