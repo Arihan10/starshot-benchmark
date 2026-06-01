@@ -553,7 +553,7 @@ Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion that we are planning:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
@@ -750,7 +750,7 @@ Here is the overall scene that is being built by the pipeline:
 
 {f"""
 You are subdividing the scene itself into its first set of top-level subregions based on its overall plan.
-""" if zone_id == root.id else f"""You are subdividing one of the subregions in the scene into further subregions. This is the plan for the subregion within this overall scene that you are to break down and decompose:
+""" if zone_id == root.id else f"""This is the plan for the subregion within this overall scene that you are to break down and decompose:
 
 Subregion name: {zone_id!r}
 Subregion description: {zone_prompt}
@@ -1020,7 +1020,7 @@ Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion we are generating the anchors for:
 
 Subregion name: {zone_id!r}
 Subregion description: {zone_prompt}
@@ -1060,7 +1060,7 @@ Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion that we are deciciding needs a boundary or not and generating boundary objects for if so:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
@@ -1164,7 +1164,7 @@ def render_object_bbox_batch(
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion that we are calculating the bounding boxes of its objects for:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
