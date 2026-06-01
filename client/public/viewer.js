@@ -110,7 +110,7 @@ const tqWaitingCapEl = document.getElementById("tq-waiting-cap");
 // Server-side `GENERATE_CONCURRENCY` (threed.py). Hard-coded mirror so the
 // "X/10" cap reads correctly; bump alongside the server constant if it
 // changes.
-const TRELLIS_CONCURRENCY_CAP = 10;
+const TRELLIS_CONCURRENCY_CAP = 20;
 const treeEl = document.getElementById("tree");
 const treeBodyEl = document.getElementById("tree-body");
 const treeDetailEl = document.getElementById("tree-detail");

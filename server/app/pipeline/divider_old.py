@@ -48,7 +48,7 @@ from app.core.prompts_old import (
     render_zone_decompose,
     render_zone_plan,
 )
-from app.core.types import BoundingBox, Node
+from app.core.types import BoundingBox, Node, Orientation, ProxyShape, Relationship
 from app.pipeline import generation_old as generation
 from app.services import llm
 from app.utils import logging
@@ -128,6 +128,22 @@ def _ancestors(
     return out
 
 
+def _scene_view(
+    all_nodes: list[Node],
+) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]]:
+    """Every node placed so far (zones and concrete objects alike) as
+    flat scene tuples for `_render_scene_lines`. Tuple: (id, prompt,
+    bbox, parent_id, proxy_shape, orientation, placement, plan,
+    parent_kind, referenced_ids, is_zone)."""
+    return [
+        (
+            n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation, n.placement, n.plan,
+            n.parent_kind.value if n.parent_kind is not None else None, n.referenced_ids, n.is_zone,
+        )
+        for n in all_nodes
+    ]
+
+
 def _generated_objects(
     all_nodes: list[Node],
 ) -> list[tuple[str, str, str | None, BoundingBox, str | None, str | None]]:
@@ -154,7 +170,9 @@ async def _plan_zone(
     zone_id: str,
     zone_prompt: str,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    objects: list[tuple[str, str, str | None, BoundingBox, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+    ],
     bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> ZonePlanOutput:
     """Author the high-level plan for a zone and decide whether it is atomic.
@@ -166,7 +184,7 @@ async def _plan_zone(
             zone_id=zone_id,
             zone_prompt=zone_prompt,
             ancestors=ancestors,
-            objects=objects,
+            scene=scene,
             bbox_by_id=bbox_by_id,
         ),
         output_schema=ZonePlanOutput,
@@ -215,6 +233,8 @@ async def _resolve_child_bboxes_batch(
             parent_id=parent.id,
             parent_bbox=parent.bbox,
             children=children,
+            ancestors=_ancestors(parent, all_nodes),
+            scene=_scene_view(all_nodes),
             bbox_by_id=bbox_by_id,
         ),
         output_schema=BboxBatchOutput,
@@ -316,6 +336,7 @@ async def _build(
             parent_id=spec.parent,
             parent_kind=spec.parent_kind,
             plan=None,
+            is_zone=True,
         )
         placed.append(child)
         all_nodes.append(child)
@@ -334,7 +355,7 @@ async def _build(
             zone_id=child.id,
             zone_prompt=child.prompt,
             ancestors=_ancestors(child, all_nodes),
-            objects=_generated_objects(all_nodes),
+            scene=_scene_view(all_nodes),
             bbox_by_id={n.id: n.bbox for n in all_nodes},
         )
         planned = child.model_copy(update={"plan": plan_out.plan})
@@ -365,7 +386,7 @@ async def run(
     llm.set_model(model)
     logging.emit_step("root", "planning")
     plan_out = await _plan_zone(
-        zone_id="root", zone_prompt=prompt, ancestors=[], objects=[],
+        zone_id="root", zone_prompt=prompt, ancestors=[], scene=[],
     )
     logging.log(
         "divider.zone_plan",
@@ -375,6 +396,7 @@ async def run(
     logging.emit_bbox("root", bbox, parent_id=None, prompt=prompt, kind="zone")
     root = Node(
         id="root", prompt=prompt, bbox=bbox, parent_id=None, plan=plan_out.plan,
+        is_zone=True,
     )
     all_nodes: list[Node] = [root]
     await _build(
