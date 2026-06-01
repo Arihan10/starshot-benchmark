@@ -212,7 +212,7 @@ in the interest of winning, always start by thinking of the overall narrative an
     # Nested zones use adapted competitive prompt format
     ancestor_block = _render_ancestor_block(ancestors, bbox_by_id=bbox_by_id)
     scene_block = _render_scene_lines(scene, bbox_by_id=bbox_by_id)
-    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular region within the larger overall scene. write one paragraph that describes the plan for the following region, and decide whether it should decompose into multiple distinct subzones.
+    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular subregion within the larger overall scene. write one paragraph that describes the plan for the following subregion, and decide whether it should decompose into multiple distinct subregion.
 
 "{zone_prompt}"
 
@@ -632,6 +632,9 @@ def render_zone_decompose(
     zone_plan: str,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
     objects: list[tuple[str, str, str | None, BoundingBox, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
+    ],
     scene_prompt: str,
     scene_plan: str,
     prior_zones: list[tuple[str, str, str | None, str, BoundingBox, str | None]],
@@ -644,6 +647,11 @@ def render_zone_decompose(
     for every concrete (mesh-bearing) node placed anywhere in the run so
     far. `parent_kind` is `'ATTACHED'` for shell frames and `'ON' / 'IN'`
     for interior anchor objects.
+    scene: the full run-wide node snapshot (same 11-tuple shape every
+    other step uses) — rendered into a full-detail <OBJECTS> block so the
+    decomposer sees the actual geometry of the concrete objects the
+    narrative only names by id (notably this zone's own shell/ground from
+    its encapsulating pass).
     prior_zones: (id, prompt, plan_or_None, parent_id, bbox, placement)
     for every non-root zone already declared in the run, in declaration
     order. `plan` is None for zones that have been declared (bbox
@@ -660,6 +668,7 @@ def render_zone_decompose(
         objects=objects,
         bbox_by_id=bbox_by_id,
     )
+    objects_block = _render_objects_block(scene, bbox_by_id=bbox_by_id)
     zone_parent_id = ancestors[-1][0] if ancestors else None
     if zone_parent_id and bbox_by_id and zone_parent_id in bbox_by_id:
         parent_bbox = bbox_by_id[zone_parent_id]
@@ -687,6 +696,10 @@ Keep the prompt tight: the goal is not to plan out the subzone's contents, but t
 
 <SCENE_CONTEXT>
 {narrative}
+
+The following is a list of all the objects that the scene is composed of, and the zones they are parented to:
+
+{objects_block}
 
 Parent zone id (use this id literally as `parent` for top-level subzones): {zone_id!r}
 Zone prompt: "{zone_prompt}"
@@ -1084,6 +1097,41 @@ def _render_scene_lines(
     return f"{zones_block}\n\n{objects_block}"
 
 
+def _render_objects_block(
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
+    ],
+    bbox_by_id: dict[str, BoundingBox] | None = None,
+) -> str:
+    """Render every concrete (mesh-bearing) node in the scene as a full
+    <OBJECTS> block — the same per-node detail every other step gets via
+    `_render_scene_lines`. Zones are omitted: the zone-decompose narrative
+    already drills the region hierarchy, and the only thing it leaves as
+    bare ids are the concrete frames, ground, and anchors. Surfacing their
+    geometry here keeps the decomposer from being blind to the surfaces
+    its subzones must anchor against — most importantly the zone's own
+    shell/ground from its encapsulating pass, which (for the root) is the
+    only concrete geometry present at decompose time."""
+    object_entries = [
+        _render_node_entry(
+            nid=nid,
+            parent=pid,
+            prompt=prompt,
+            bbox=bbox,
+            bbox_by_id=bbox_by_id,
+            placement=placement,
+            placement_unset_label="(root — has no parent)",
+            proxy_shape=proxy,
+            orientation=orient,
+            parent_kind=parent_kind,
+            referenced_ids=refs,
+        )
+        for nid, prompt, bbox, pid, proxy, orient, placement, plan, parent_kind, refs, is_zone in scene
+        if not (is_zone or plan is not None)
+    ]
+    return _render_section("OBJECTS", object_entries, "none — no concrete meshes placed yet")
+
+
 # Shared one-paragraph header at the top of every <scene_context> block.
 # Gives the model a quick map of what tags it's about to see and what
 # they mean, so the structure isn't a surprise mid-prompt.
@@ -1174,7 +1222,7 @@ def render_encapsulating_decomp(
         zone_bbox_line = f"Zone bbox (relative to parent {zone_parent_id!r}): {zone_bbox.to_local_frame(parent_bbox).model_dump_json()}\n  Zone parent_dimensions: [{parent_bbox.size[0]:.2f}, {parent_bbox.size[1]:.2f}, {parent_bbox.size[2]:.2f}]"
     else:
         zone_bbox_line = f"Zone bbox_dimensions: [{zone_bbox.size[0]:.2f}, {zone_bbox.size[1]:.2f}, {zone_bbox.size[2]:.2f}]"
-    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following region. If the former, then your final output object list should just be empty.
+    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given subregion, and if so, what that perimeter is made up of. Not every subregion needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following subregion. If the former, then your final output object list should just be empty.
 
 {_render_zone_plan_block(zone_plan)}
 Think very carefully about whether the given region actually needs any bounding objects. Reason about the structure of the region, whether it is closed vs. open, and the narrative in its plan. Not every region necessarily needs to have any bounding objects: only do so when it absolutely makes sense to do so.

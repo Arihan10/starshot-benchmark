@@ -20,12 +20,12 @@ Per-node flow:
      child's own structural intent (vertical penetrations, voids,
      double-height spaces) rather than only the one-sentence seed.
 
-Root also gets an encapsulating pass — its world-scale boundary. When
-root is non-atomic, it runs after root's children are placed and
-before any child's plan-encap-recurse iteration, so the world
-boundary is in the scene context every child sees. When root is
-atomic, it runs before root's anchor pass. Root additionally gets a
-final negative-space pass at the end of the run.
+Root also gets an encapsulating pass — its world-scale boundary. It
+runs before root is decomposed (and, when root is atomic, before its
+anchor pass), mirroring every other zone, which its parent frames
+right before recursion. The world boundary is therefore in the scene
+context every child sees. Root additionally gets a final
+negative-space pass at the end of the run.
 """
 
 from __future__ import annotations
@@ -211,6 +211,7 @@ async def _decompose_zone(
             zone_plan=node.plan,
             ancestors=_ancestors(node, all_nodes),
             objects=_generated_objects(all_nodes),
+            scene=_scene_view(all_nodes),
             scene_prompt=root.prompt,
             scene_plan=root.plan,
             prior_zones=_prior_zones(all_nodes),
@@ -276,14 +277,21 @@ async def _build(
 ) -> None:
     assert node.plan is not None, "node.plan must be set by caller"
 
+    # The root frames itself before anything else it does — before its
+    # zone-decompose pass when non-atomic, before its anchor pass when
+    # atomic. Every other zone is framed by its parent's per-child loop
+    # right before recursion, so frame-before-decompose is the order they
+    # all follow; the root has no parent loop to do this for it, so it
+    # frames itself here, first, to stay in lockstep.
+    if node.parent_id is None:
+        logging.emit_step(node.id, "generating_frame")
+        await generation.run(
+            zone=node, runs_dir=runs_dir, run_id=run_id,
+            scenario="encapsulating", all_nodes=all_nodes,
+            ancestors=_ancestors(node, all_nodes),
+        )
+
     if is_atomic:
-        if node.parent_id is None:
-            logging.emit_step(node.id, "generating_frame")
-            await generation.run(
-                zone=node, runs_dir=runs_dir, run_id=run_id,
-                scenario="encapsulating", all_nodes=all_nodes,
-                ancestors=_ancestors(node, all_nodes),
-            )
         logging.emit_step(node.id, "generating_anchor")
         await generation.run(
             zone=node, runs_dir=runs_dir, run_id=run_id,
@@ -340,14 +348,6 @@ async def _build(
         )
         placed.append(child)
         all_nodes.append(child)
-
-    if node.parent_id is None:
-        logging.emit_step(node.id, "generating_frame")
-        await generation.run(
-            zone=node, runs_dir=runs_dir, run_id=run_id,
-            scenario="encapsulating", all_nodes=all_nodes,
-            ancestors=_ancestors(node, all_nodes),
-        )
 
     for child in placed:
         logging.emit_step(child.id, "planning")

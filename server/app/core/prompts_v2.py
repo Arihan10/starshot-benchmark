@@ -109,11 +109,13 @@ _TARGET_MARKER = "<-- TARGET:"
 
 
 def _root_scene_header(root: Node) -> str:
-    """Root prompt, plan, and overall bounding box — injected at the top of every prompt that shows scene context."""
+    """Root prompt, plan, and overall bounding box — injected at the top of every prompt that shows scene context. The root bbox is delivered in natural language — its `W by H by D` dimensions plus its origin corner, tagged `(scene root)` — instead of the raw `origin/dimensions` coordinate dump, while still surfacing every value the box carries."""
+    dx, dy, dz = root.bbox.dimensions
+    ox, oy, oz = root.bbox.origin
     return (
         f"Prompt: {root.prompt}\n"
         f"Plan: {root.plan}\n"
-        f"Overall scene (root) bounding box coordinates: {util.format_global_bbox(root.bbox)}"
+        f"Overall scene (root) bounding box: {dx:.2f}m by {dy:.2f}m by {dz:.2f}m, with its origin corner at ({ox:.2f}, {oy:.2f}, {oz:.2f}) m (scene root)"
     )
 
 
@@ -545,15 +547,13 @@ in the interest of winning, always start by thinking of the overall narrative an
     assert root is not None, "nested zone planning requires a root node in scope"
     context = render_embedded_block(nodes, node_id=zone_id, text="This is the zone you are to plan and flesh out from.")
 
-    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular region within the larger overall scene. This is a text to 3D scene pipeline that takes a seed prompt and imagines an entire 3D scene from it. 
+    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular subregion within the larger overall scene. write one paragraph that describes the plan for the following subregion, and decide whether it should decompose into multiple distinct subzones.
     
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
-
-You are designing the plan for one of the subregions in the scene. This is the short description for the subregion that you are trying to plan and flesh out from:
+This is the subregion:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
@@ -742,7 +742,7 @@ def render_zone_decompose(
     root_objects = render_root_objects_block(nodes)
     filled = render_filled_block(nodes)
 
-    return f"""You are the step in the SpatialBench pipeline responsible for breaking down a given region of the overall scene into its top-level subregions. This pipeline is a text to 3D scene one that takes a seed prompt and imagines an entire 3D scene from it.
+    return f"""You are the step in the SpatialBench pipeline responsible for breaking down a given area into its top-level subregions. Generate a list of subareas that should be present in the following scene, based on its description:
 
 Here is the overall scene that is being built by the pipeline:
 
@@ -756,6 +756,8 @@ Subregion name: {zone_id!r}
 Subregion description: {zone_prompt}
 Subregion plan: {zone_plan}
 """}
+
+Parent zone id: {zone_id!r}
 
 Here's the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline) and a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
 
@@ -1009,18 +1011,16 @@ def render_anchor_decomp(
 ) -> str:
     root = util.find_root(nodes)
     assert root is not None, "anchor decomposition requires a root node in scope"
-    context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to generate a list of anchor objects for.")
-    return f"""You are the step in the SpatialBench pipeline responsible for determining the list of objects that define a certain region.
+    context = render_embedded_block(nodes, node_id=zone_id, text="This is the subregion you are to generate a list of anchor objects for.")
+    return f"""You are the step in the SpatialBench pipeline responsible for determining the list of objects that define a certain subregion.
 
-Generate a list of defining anchor objects that make the region described below unmistakably what it is:
+Generate a list of defining anchor objects that make the subregion described below unmistakably what it is:
 
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
-
-You are generating the list of objects that fill out and define a particular subregion of the overall scene. This is the subregion you are to generate a list of anchor objects for:
+This is the subregion:
 
 Subregion name: {zone_id!r}
 Subregion description: {zone_prompt}
@@ -1053,15 +1053,14 @@ def render_encapsulating_decomp(
     root = util.find_root(nodes)
     assert root is not None, "encapsulating decomposition requires a root node in scope"
     context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to decide whether a boundary is needed for, and if so, what objects form that boundary")
-    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following region. If the former, then your final output object list should just be empty.
+    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given subregion, and if so, what that perimeter is made up of. Not every subregion needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following subregion. If the former, then your final output object list should just be empty.
+
 
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
-
-You are determining if a particular subregion within the overall scene requires objects bounding it. If and only if so, you are to determine what the objects making up that boundary are. This is the plan of the subregion you are to do this for:
+This is the subregion:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
@@ -1105,7 +1104,7 @@ def render_negative_space_decomp(
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
     scene_tree = render_scene_tree(nodes=nodes)
-    return f"""You are the step in the SpatialBench pipeline responsible for generating a list of objects that would cover the negative, unfilled space between the objects in the scene.
+    return f"""Generate a list of objects that would cover the negative, unfilled space between the objects in the zone described below, based on the attached context.
 
 You are filling the negative space within this subregion:
 
@@ -1159,15 +1158,13 @@ def render_object_bbox_batch(
     root = util.find_root(nodes)
     assert root is not None, "object bbox resolution requires a root node in scope"
     by_id = {n.id: n for n in nodes}
-    context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to calculate the bounding boxes of its objects for.")
+    context = render_embedded_block(nodes, node_id=zone_id, text="This is the subregion you are to calculate the bounding boxes of its objects for.")
 
     return f"""Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
-
-You are calculating the bounding boxes for a list of objects within a subregion of the larger overall scene. This is the subregion you are to calculate the bounding boxes of its objects for:
+This is the subregion:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
