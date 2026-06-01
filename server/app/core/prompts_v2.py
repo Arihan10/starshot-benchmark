@@ -553,7 +553,7 @@ Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion that we are planning:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
@@ -1020,7 +1020,7 @@ Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion we are generating the anchors for:
 
 Subregion name: {zone_id!r}
 Subregion description: {zone_prompt}
@@ -1060,7 +1060,7 @@ Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion that we are deciciding needs a boundary or not and generating boundary objects for:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
@@ -1164,7 +1164,7 @@ def render_object_bbox_batch(
 
 {_root_scene_header(root)}
 
-This is the subregion:
+This is the subregion that we are calculating the bounding boxes of its objects for:
 
 Subregion name: {zone_id}
 Subregion description: {zone_prompt}
