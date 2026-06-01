@@ -40,13 +40,16 @@ from typing import Any, Literal
 
 from app.core import prompt_runtime
 from app.core.types import BoundingBox, Node
-from app.pipeline import generation
+from app.pipeline import committed, generation
 from app.services import llm
 from app.utils import logging
 from app.utils.topology import validate_parents, validate_referenced_ids
 
 
 async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
+    hit = committed.bbox("root")
+    if hit is not None:
+        return hit
     p = prompt_runtime.current()
     out = await llm.call_llm(
         system=p.SYSTEM_OVERALL_BBOX,
@@ -66,6 +69,9 @@ async def _plan_zone(
 ) -> Any:
     """Author the high-level plan for a zone and decide whether it is atomic.
     Works for any zone (root or nested) — the root just passes empty `nodes`."""
+    hit = committed.zone_plan(zone_id)
+    if hit is not None:
+        return hit
     p = prompt_runtime.current()
     system = p.SYSTEM_ROOT_ZONE_PLAN if not nodes else p.SYSTEM_ZONE_PLAN
     return await llm.call_llm(
@@ -89,6 +95,9 @@ async def _decompose_zone(
     """Emit child zones for a non-atomic zone. Each child is fully
     structured (id, prompt, proxy_shape, relationships) in one call."""
     assert node.plan is not None, "zone must be planned before decomposition"
+    hit = committed.zone_decompose(node.id)
+    if hit is not None:
+        return hit
     p = prompt_runtime.current()
     return await llm.call_llm(
         system=p.SYSTEM_ZONE_DECOMPOSE,
@@ -110,6 +119,13 @@ async def _resolve_child_bboxes_batch(
     children: list[Any],
     all_nodes: list[Node],
 ) -> dict[str, BoundingBox]:
+    # Resume: any child already placed (a committed `bbox` event) keeps its
+    # exact world position. If every child is committed we skip the LLM
+    # entirely; otherwise we resolve the batch and overwrite the committed
+    # ones so only never-placed children take a fresh assignment.
+    committed_bboxes = {c.id: committed.bbox(c.id) for c in children}
+    if all(b is not None for b in committed_bboxes.values()):
+        return {cid: b for cid, b in committed_bboxes.items() if b is not None}
     bbox_by_id = {n.id: n.bbox for n in all_nodes}
     p = prompt_runtime.current()
     out = await llm.call_llm(
@@ -152,6 +168,9 @@ async def _resolve_child_bboxes_batch(
             for child_id in list(remaining):
                 bboxes[child_id] = assignments_by_id[child_id].to_world_frame(parent.bbox)
             remaining.clear()
+    for child_id, b in committed_bboxes.items():
+        if b is not None:
+            bboxes[child_id] = b
     return bboxes
 
 

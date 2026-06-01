@@ -97,6 +97,7 @@ class SlotLog:
                 if event.get("kind") == "run.start" and self.state["prompt"] is None:
                     self.state["prompt"] = event.get("prompt")
                     self.state["model"] = event.get("model")
+        _hydrate_cache_call_indices(self.state["events"])
         self.state["status"] = _derive_status(self.state["events"])
 
     def truncate_events_to(self, n: int) -> int:
@@ -151,6 +152,32 @@ class SlotLog:
     def unsubscribe(self, q: asyncio.Queue[dict[str, Any]]) -> None:
         if q in self.subscribers:
             self.subscribers.remove(q)
+
+
+def _hydrate_cache_call_indices(events: list[dict[str, Any]]) -> None:
+    """Derive semantic LLM-call ordinals for logs written before call_index.
+
+    Resume restarts the pipeline from root. The ordinal lets a replayed
+    (node, step) call reuse the same historical decision even when the exact
+    rendered prompt cache key changed. This is an in-memory compatibility pass;
+    the events file stays append-only and untouched.
+    """
+    seq: dict[tuple[str, str], int] = {}
+    for event in events:
+        if event.get("kind") != "cache.llm":
+            continue
+        node = event.get("node")
+        step = event.get("step")
+        if not isinstance(node, str) or not isinstance(step, str):
+            continue
+        key = (node, step)
+        existing = event.get("call_index")
+        if isinstance(existing, int):
+            seq[key] = max(seq.get(key, 0), existing + 1)
+            continue
+        index = seq.get(key, 0)
+        event["call_index"] = index
+        seq[key] = index + 1
 
 
 _current: ContextVar[SlotLog] = ContextVar("current_slot_log")

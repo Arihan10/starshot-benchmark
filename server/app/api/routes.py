@@ -809,6 +809,7 @@ async def _sse(
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
     slot_log = _slot_logs[(run, slot_id, model_alias)]
     rlog.bind(slot_log)
+    llm.reset_call_sequence()
     ver = versions.for_run(run)
     prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
     prompt = slot_log.state["prompt"]
