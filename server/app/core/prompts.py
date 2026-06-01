@@ -752,6 +752,8 @@ Subregion description: {zone_prompt}
 Subregion plan: {zone_plan}
 """}
 
+Parent zone id: {zone_id!r}
+
 The scene is composed as a tree with every object or region parented to another object or region. Here's the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline) and a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
 
 {subregions}

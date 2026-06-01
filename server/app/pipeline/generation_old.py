@@ -63,7 +63,7 @@ from app.core.prompts_old import (
     render_object_bbox_batch,
     wrap_image_prompt,
 )
-from app.core.types import BoundingBox, Node, Orientation, ParentRelationshipKind, ProxyShape
+from app.core.types import BoundingBox, Node, Orientation, ParentRelationshipKind, ProxyShape, Relationship
 from app.services import llm, nano_banana, threed
 from app.utils import logging
 from app.utils.geometry import rescale_mesh_to_bbox
@@ -83,9 +83,12 @@ def _artifact_url(runs_dir: Path, path: Path) -> str:
 # the renderer to split context into <ZONES> and <OBJECTS> sections.
 def _scene_view(
     nodes: list[Node],
-) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]]:
+) -> list[tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]]:
     return [
-        (n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation, n.placement, n.plan)
+        (
+            n.id, n.prompt, n.bbox, n.parent_id, n.proxy_shape, n.orientation, n.placement, n.plan,
+            n.parent_kind.value if n.parent_kind is not None else None, n.referenced_ids, n.is_zone,
+        )
         for n in nodes
     ]
 
@@ -392,8 +395,10 @@ async def _match_library_assets(
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
                 orientation=spec.orientation,
+                placement=spec.placement,
                 referenced_ids=list(spec.referenced_ids),
                 parent_id=spec.parent,
+                parent_kind=spec.parent_kind,
                 mesh_url=url,
             ))
             continue

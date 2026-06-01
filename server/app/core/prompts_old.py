@@ -147,16 +147,19 @@ def render_zone_plan(
     zone_id: str,
     zone_prompt: str,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    objects: list[tuple[str, str, str | None, BoundingBox, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
+    ],
     bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> str:
     """ancestors: (id, prompt, plan, bbox, placement) tuples from root → parent of this
     zone, excluding the zone itself. Empty for the root.
-    objects: (id, prompt, parent_id, bbox, placement, parent_kind) tuples
-    for every concrete (mesh-bearing) node placed anywhere in the run so
-    far. `parent_kind` is unused here; consumed only by
-    `_scene_context_zone_decompose_narrative` to split frames from
-    interior anchor objects."""
+    scene: (id, prompt, bbox, parent_id, proxy_shape, orientation,
+    placement, plan, parent_kind, referenced_ids, is_zone) tuples for
+    every node placed anywhere in the run so far — zones and concrete
+    objects alike. Rendered as <ZONES> + <OBJECTS> so the planner sees
+    non-ancestor regions and placed geometry, not just its own ancestor
+    chain."""
     # Root zone uses the new competitive prompt format
     if not ancestors:
         return f"""you are the first step in the SpatialBench pipeline and the step responsible for determining the high-level description and direction of the overall scene. write one paragraph that describes a 3D scene imagined from the following prompt, and decide whether this scene should decompose into multiple distinct zones.
@@ -208,19 +211,8 @@ in the interest of winning, always start by thinking of the overall narrative an
 
     # Nested zones use adapted competitive prompt format
     ancestor_block = _render_ancestor_block(ancestors, bbox_by_id=bbox_by_id)
-    obj_entries = [
-        _render_node_entry(
-            nid=oid,
-            parent=oparent,
-            prompt=oprompt,
-            bbox=obbox,
-            bbox_by_id=bbox_by_id,
-            placement=oplacement,
-        )
-        for oid, oprompt, oparent, obbox, oplacement, _okind in objects
-    ]
-    obj_block = _render_section("OBJECTS", obj_entries, "none yet")
-    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular region within the larger overall scene. write one paragraph that describes the plan for the following region, and decide whether it should decompose into multiple distinct subzones.
+    scene_block = _render_scene_lines(scene, bbox_by_id=bbox_by_id)
+    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular subregion within the larger overall scene. write one paragraph that describes the plan for the following subregion, and decide whether it should decompose into multiple distinct subregion.
 
 "{zone_prompt}"
 
@@ -269,7 +261,7 @@ before ANY output, think HARD and DEEPLY and provide a detailed CoT. think throu
 The following objects are already fixed in the world. Refer to them by what they are (not ids) when you need a positional anchor, but do not redescribe them.
 
 <scene_context>
-{obj_block}
+{scene_block}
 </scene_context>
 </thinking>
 {_deepseek_suffix()}"""
@@ -640,6 +632,9 @@ def render_zone_decompose(
     zone_plan: str,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
     objects: list[tuple[str, str, str | None, BoundingBox, str | None, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
+    ],
     scene_prompt: str,
     scene_plan: str,
     prior_zones: list[tuple[str, str, str | None, str, BoundingBox, str | None]],
@@ -652,6 +647,11 @@ def render_zone_decompose(
     for every concrete (mesh-bearing) node placed anywhere in the run so
     far. `parent_kind` is `'ATTACHED'` for shell frames and `'ON' / 'IN'`
     for interior anchor objects.
+    scene: the full run-wide node snapshot (same 11-tuple shape every
+    other step uses) — rendered into a full-detail <OBJECTS> block so the
+    decomposer sees the actual geometry of the concrete objects the
+    narrative only names by id (notably this zone's own shell/ground from
+    its encapsulating pass).
     prior_zones: (id, prompt, plan_or_None, parent_id, bbox, placement)
     for every non-root zone already declared in the run, in declaration
     order. `plan` is None for zones that have been declared (bbox
@@ -668,6 +668,7 @@ def render_zone_decompose(
         objects=objects,
         bbox_by_id=bbox_by_id,
     )
+    objects_block = _render_objects_block(scene, bbox_by_id=bbox_by_id)
     zone_parent_id = ancestors[-1][0] if ancestors else None
     if zone_parent_id and bbox_by_id and zone_parent_id in bbox_by_id:
         parent_bbox = bbox_by_id[zone_parent_id]
@@ -695,6 +696,10 @@ Keep the prompt tight: the goal is not to plan out the subzone's contents, but t
 
 <SCENE_CONTEXT>
 {narrative}
+
+The following is a list of all the objects that the scene is composed of, and the zones they are parented to:
+
+{objects_block}
 
 Parent zone id (use this id literally as `parent` for top-level subzones): {zone_id!r}
 Zone prompt: "{zone_prompt}"
@@ -754,6 +759,10 @@ def render_zone_bbox_batch(
     parent_id: str,
     parent_bbox: BoundingBox,
     children: list["ChildNodeSpec"],
+    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
+    ],
     bbox_by_id: dict[str, BoundingBox],
 ) -> str:
     child_ids = {c.id for c in children}
@@ -783,6 +792,14 @@ Zone bbox (dimensions): [{parent_bbox.size[0]:.2f}, {parent_bbox.size[1]:.2f}, {
 
 Children to place ({len(children)}):
 {child_lines}
+
+<scene_context>
+{_SCENE_CONTEXT_INTRO}
+
+{_render_ancestor_block(ancestors, bbox_by_id=bbox_by_id)}
+
+{_render_scene_lines(scene, bbox_by_id=bbox_by_id)}
+</scene_context>
 
 Produce a bbox for every child. Each child's bbox must be in that CHILD'S PARENT's local frame — origin (0,0,0) is the parent's minimum corner. The parent's dimensions are listed above for each child.
 {_deepseek_suffix()}"""
@@ -945,16 +962,24 @@ def _render_node_entry(
     orientation: int | None = None,
     plan: str | None = None,
     plan_unset_label: str | None = None,
+    parent_kind: str | None = None,
+    referenced_ids: list[Relationship] | None = None,
 ) -> str:
     """Render one node as a `<node>...</node>` block. When `bbox_by_id`
     is provided, the bbox is expressed relative to the node's parent
     (origin (0,0,0) = parent's min corner) and parent_dimensions is
-    shown. Without it, falls back to raw bbox output."""
+    shown. Without it, falls back to raw bbox output. `parent_kind` and
+    `referenced_ids` are passed only for concrete objects (their
+    structural-anchor kind and secondary peer relationships); zones omit
+    them, matching how the embedded-tree renderer surfaces these only on
+    objects."""
     parent_attr = f' parent="{parent}"' if parent is not None else ' parent="(none)"'
     head = f'<node id="{nid}"{parent_attr}>'
     lines: list[str] = []
     if prompt is not None:
         lines.append(f"  prompt: {prompt}")
+    if parent_kind is not None:
+        lines.append(f"  parent_kind: {parent_kind}")
     if bbox is not None:
         if bbox_by_id and parent and parent in bbox_by_id:
             parent_bbox = bbox_by_id[parent]
@@ -972,6 +997,8 @@ def _render_node_entry(
         lines.append(f"  placement: {placement}")
     elif placement_unset_label is not None:
         lines.append(f"  placement: {placement_unset_label}")
+    if referenced_ids is not None:
+        lines.append(f"  referenced_ids: {_render_relationships(referenced_ids)}")
     if plan is not None:
         lines.append(f"  plan: {plan}")
     elif plan_unset_label is not None:
@@ -1017,19 +1044,76 @@ def _render_zone_plan_block(zone_plan: str | None) -> str:
 
 def _render_scene_lines(
     scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
     ],
     bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> str:
     """Split the run-wide scene snapshot into two sections — <ZONES>
-    (abstract regions, identified by `plan is not None`) and <OBJECTS>
-    (concrete frames/anchors/negative-space, identified by `plan is
-    None`). Both blocks are emitted, joined by a blank line, so the
-    caller can drop the result straight into <scene_context>."""
+    (abstract regions) and <OBJECTS> (concrete frames/anchors/
+    negative-space). A node is a region if it is flagged `is_zone` OR
+    carries a `plan`, so a declared-but-not-yet-planned subzone still
+    surfaces under <ZONES> instead of being misread as a concrete
+    object. `parent_kind` and `referenced_ids` are rendered only for
+    objects (zones omit them). Both blocks are emitted, joined by a
+    blank line, so the caller can drop the result straight into
+    <scene_context>."""
     zone_entries: list[str] = []
     object_entries: list[str] = []
-    for nid, prompt, bbox, pid, proxy, orient, placement, plan in scene:
-        entry = _render_node_entry(
+    for nid, prompt, bbox, pid, proxy, orient, placement, plan, parent_kind, refs, is_zone in scene:
+        if is_zone or plan is not None:
+            zone_entries.append(
+                _render_node_entry(
+                    nid=nid,
+                    parent=pid,
+                    prompt=prompt,
+                    bbox=bbox,
+                    bbox_by_id=bbox_by_id,
+                    placement=placement,
+                    placement_unset_label="(root — has no parent)",
+                    proxy_shape=proxy,
+                    orientation=orient,
+                    plan=plan,
+                )
+            )
+        else:
+            object_entries.append(
+                _render_node_entry(
+                    nid=nid,
+                    parent=pid,
+                    prompt=prompt,
+                    bbox=bbox,
+                    bbox_by_id=bbox_by_id,
+                    placement=placement,
+                    placement_unset_label="(root — has no parent)",
+                    proxy_shape=proxy,
+                    orientation=orient,
+                    plan=plan,
+                    parent_kind=parent_kind,
+                    referenced_ids=refs,
+                )
+            )
+    zones_block = _render_section("ZONES", zone_entries, "none")
+    objects_block = _render_section("OBJECTS", object_entries, "none")
+    return f"{zones_block}\n\n{objects_block}"
+
+
+def _render_objects_block(
+    scene: list[
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
+    ],
+    bbox_by_id: dict[str, BoundingBox] | None = None,
+) -> str:
+    """Render every concrete (mesh-bearing) node in the scene as a full
+    <OBJECTS> block — the same per-node detail every other step gets via
+    `_render_scene_lines`. Zones are omitted: the zone-decompose narrative
+    already drills the region hierarchy, and the only thing it leaves as
+    bare ids are the concrete frames, ground, and anchors. Surfacing their
+    geometry here keeps the decomposer from being blind to the surfaces
+    its subzones must anchor against — most importantly the zone's own
+    shell/ground from its encapsulating pass, which (for the root) is the
+    only concrete geometry present at decompose time."""
+    object_entries = [
+        _render_node_entry(
             nid=nid,
             parent=pid,
             prompt=prompt,
@@ -1039,15 +1123,13 @@ def _render_scene_lines(
             placement_unset_label="(root — has no parent)",
             proxy_shape=proxy,
             orientation=orient,
-            plan=plan,
+            parent_kind=parent_kind,
+            referenced_ids=refs,
         )
-        if plan is not None:
-            zone_entries.append(entry)
-        else:
-            object_entries.append(entry)
-    zones_block = _render_section("ZONES", zone_entries, "none")
-    objects_block = _render_section("OBJECTS", object_entries, "none")
-    return f"{zones_block}\n\n{objects_block}"
+        for nid, prompt, bbox, pid, proxy, orient, placement, plan, parent_kind, refs, is_zone in scene
+        if not (is_zone or plan is not None)
+    ]
+    return _render_section("OBJECTS", object_entries, "none — no concrete meshes placed yet")
 
 
 # Shared one-paragraph header at the top of every <scene_context> block.
@@ -1082,7 +1164,7 @@ def render_anchor_decomp(
     zone_bbox: BoundingBox,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
     scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
     ],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
     bbox_by_id: dict[str, BoundingBox] | None = None,
@@ -1129,7 +1211,7 @@ def render_encapsulating_decomp(
     zone_bbox: BoundingBox,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
     scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
     ],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
     bbox_by_id: dict[str, BoundingBox] | None = None,
@@ -1140,7 +1222,7 @@ def render_encapsulating_decomp(
         zone_bbox_line = f"Zone bbox (relative to parent {zone_parent_id!r}): {zone_bbox.to_local_frame(parent_bbox).model_dump_json()}\n  Zone parent_dimensions: [{parent_bbox.size[0]:.2f}, {parent_bbox.size[1]:.2f}, {parent_bbox.size[2]:.2f}]"
     else:
         zone_bbox_line = f"Zone bbox_dimensions: [{zone_bbox.size[0]:.2f}, {zone_bbox.size[1]:.2f}, {zone_bbox.size[2]:.2f}]"
-    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following region. If the former, then your final output object list should just be empty.
+    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given subregion, and if so, what that perimeter is made up of. Not every subregion needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following subregion. If the former, then your final output object list should just be empty.
 
 {_render_zone_plan_block(zone_plan)}
 Think very carefully about whether the given region actually needs any bounding objects. Reason about the structure of the region, whether it is closed vs. open, and the narrative in its plan. Not every region necessarily needs to have any bounding objects: only do so when it absolutely makes sense to do so.
@@ -1187,7 +1269,7 @@ def render_negative_space_decomp(
     zone_plan: str | None,
     zone_bbox: BoundingBox,
     scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
     ],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
     bbox_by_id: dict[str, BoundingBox] | None = None,
@@ -1244,7 +1326,7 @@ def render_object_bbox_batch(
     zone_bbox: BoundingBox,
     objects: list[ObjectSpec],
     peers: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
     ],
     bbox_by_id: dict[str, BoundingBox],
     parent_kind_by_id: dict[str, "ParentRelationshipKind | None"],
@@ -1255,7 +1337,7 @@ def render_object_bbox_batch(
     # generation._resolve_and_generate converts per-parent-local back
     # to world coordinates.
 
-    def _peer_line(pid: str, pprompt: str, pbbox: BoundingBox, pparent: str | None, pproxy: ProxyShape | None, porient: Orientation, pplacement: str | None) -> str:
+    def _peer_line(pid: str, pprompt: str, pbbox: BoundingBox, pparent: str | None, pproxy: ProxyShape | None, porient: Orientation, pplacement: str | None, prefs: list[Relationship]) -> str:
         pkind = parent_kind_by_id.get(pid)
         pkind_str = pkind.value if pkind else "IN"
         if pparent is not None and pparent in bbox_by_id:
@@ -1266,12 +1348,12 @@ def render_object_bbox_batch(
             local_bbox = pbbox
             parent_dims = None
         dims_str = f" parent_dimensions=[{parent_dims[0]:.2f}, {parent_dims[1]:.2f}, {parent_dims[2]:.2f}]" if parent_dims else ""
-        return f"  - {pid}: prompt={pprompt!r} bbox={local_bbox.model_dump_json()} parent={pparent!r} parent_kind={pkind_str}{dims_str} proxy_shape={_render_proxy_shape(pproxy)} orientation={porient}deg placement={pplacement!r}"
+        return f"  - {pid}: prompt={pprompt!r} bbox={local_bbox.model_dump_json()} parent={pparent!r} parent_kind={pkind_str}{dims_str} proxy_shape={_render_proxy_shape(pproxy)} orientation={porient}deg placement={pplacement!r} referenced_ids={_render_relationships(prefs)}"
 
     peer_lines = (
         "\n".join(
-            _peer_line(pid, pprompt, pbbox, pparent, pproxy, porient, pplacement)
-            for pid, pprompt, pbbox, pparent, pproxy, porient, pplacement, _pplan in peers
+            _peer_line(pid, pprompt, pbbox, pparent, pproxy, porient, pplacement, prefs)
+            for pid, pprompt, pbbox, pparent, pproxy, porient, pplacement, _pplan, _pkind, prefs, _piszone in peers
         )
         if peers
         else "  (none)"
@@ -1485,7 +1567,7 @@ def render_next_object(
     zone_bbox: BoundingBox,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
     scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None]
+        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
     ],
     prior_attempts: list[tuple[ObjectSpec, str]] | None = None,
     bbox_by_id: dict[str, BoundingBox] | None = None,
