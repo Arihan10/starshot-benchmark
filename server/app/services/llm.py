@@ -16,6 +16,7 @@ import os
 import sys
 from contextvars import ContextVar
 from pathlib import Path
+from typing import TypeVar
 
 from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError
@@ -23,7 +24,11 @@ from pydantic import BaseModel, ValidationError
 
 from app.utils import cache, logging
 
-_call_seq: dict[str, int] = {}
+T = TypeVar("T", bound=BaseModel)
+_call_seq: ContextVar[dict[tuple[str | None, str | None], int] | None] = ContextVar(
+    "_call_seq",
+    default=None,
+)
 
 # Lift Python 3.11+'s 4300-digit ceiling on int<->str conversion.
 # When an LLM hallucinates a runaway numeric literal into a structured-
@@ -41,7 +46,67 @@ def set_model(model: str) -> None:
     _current_model.set(model)
 
 
-async def call_llm[T: BaseModel](
+def reset_call_sequence() -> None:
+    """Start semantic LLM-call ordinals from zero for a pipeline replay.
+
+    Resume re-enters the pipeline from root and expects the first
+    (node, step) call to reuse the first prior decision for that same
+    semantic call, the second to reuse the second, and so on.
+    """
+    _call_seq.set({})
+
+
+def _next_call_index(node_id: str | None, step: str | None) -> int | None:
+    if node_id is None or step is None:
+        return None
+    seq = _call_seq.get()
+    if seq is None:
+        seq = {}
+        _call_seq.set(seq)
+    key = (node_id, step)
+    index = seq.get(key, 0)
+    seq[key] = index + 1
+    return index
+
+
+def _find_semantic_cache_hit(
+    *,
+    node_id: str | None,
+    step: str | None,
+    call_index: int | None,
+    schema_name: str,
+) -> dict[str, object] | None:
+    if node_id is None or step is None:
+        return None
+    exact: dict[str, object] | None = None
+    legacy: list[dict[str, object]] = []
+    for event in logging.current_events():
+        if (
+            event.get("kind") != "cache.llm"
+            or event.get("node") != node_id
+            or event.get("step") != step
+        ):
+            continue
+        if event.get("schema") not in (None, schema_name):
+            continue
+        output = event.get("output")
+        if not isinstance(output, dict):
+            continue
+        if call_index is not None and event.get("call_index") == call_index:
+            exact = output
+        elif event.get("call_index") is None:
+            legacy.append(output)
+    if exact is not None:
+        return exact
+    # Older logs predate call_index. Only reuse unindexed semantic hits when
+    # there is exactly one possible match; repeated steps such as next_object
+    # are ambiguous and must fall back to the full cache key.
+    if call_index == 0 and len(legacy) == 1:
+        return legacy[0]
+    return None
+
+
+async def call_llm(
     *,
     system: str,
     user: str,
@@ -52,13 +117,22 @@ async def call_llm[T: BaseModel](
     model = _current_model.get()
     if model is None:
         raise RuntimeError("llm.set_model() must be called before call_llm()")
+    call_index = _next_call_index(node_id, step)
+    schema_name = output_schema.__name__
     key = cache.hash_llm_call(
         model=model,
         system=system,
         user=user,
-        schema_name=output_schema.__name__,
+        schema_name=schema_name,
     )
     hit = cache.find_llm_cache_hit(logging.current_events(), key)
+    if hit is None:
+        hit = _find_semantic_cache_hit(
+            node_id=node_id,
+            step=step,
+            call_index=call_index,
+            schema_name=schema_name,
+        )
     if hit is not None:
         return output_schema.model_validate(hit)
 
@@ -114,7 +188,9 @@ async def call_llm[T: BaseModel](
                 key=key,
                 node=node_id,
                 step=step,
+                call_index=call_index,
                 model=model,
+                schema=schema_name,
                 system=system,
                 user=user,
                 output=validated.model_dump(mode="json"),

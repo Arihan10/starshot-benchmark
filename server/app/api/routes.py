@@ -65,7 +65,9 @@ OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
 # Source file we snapshot into each newly-created run so prompt-versioned
 # AB tests are reproducible after the source has moved on.
 PROMPTS_SOURCE = Path(__file__).resolve().parent.parent / "core" / "prompts.py"
+PROMPTS_V2_SOURCE = Path(__file__).resolve().parent.parent / "core" / "prompts_v2.py"
 PROMPT_SNAPSHOT_NAME = "prompts_snapshot.py"
+PROMPT_V2_SNAPSHOT_NAME = "prompts_v2_snapshot.py"
 
 # Prompt-variant axis. A cell's `model_alias` may carry this trailing
 # suffix to select the alternate "v2" prompt structure (app/core/prompts_v2.py)
@@ -122,15 +124,19 @@ def _pick_initial_run() -> str:
 
 
 def _ensure_prompt_snapshot(run: str) -> None:
-    """Copy the live prompts.py into RUNS_DIR/<run>/ if not already there.
+    """Copy live prompt modules into RUNS_DIR/<run>/ if not already there.
     Called only when a brand-new run is created via POST /runs; legacy
     runs that pre-date this feature keep whatever (or nothing) they had,
     so we never overwrite the historical record."""
-    target = _run_dir(run) / PROMPT_SNAPSHOT_NAME
-    if target.exists():
-        return
-    if PROMPTS_SOURCE.exists():
-        target.write_text(PROMPTS_SOURCE.read_text())
+    for source, name in (
+        (PROMPTS_SOURCE, PROMPT_SNAPSHOT_NAME),
+        (PROMPTS_V2_SOURCE, PROMPT_V2_SNAPSHOT_NAME),
+    ):
+        target = _run_dir(run) / name
+        if target.exists():
+            continue
+        if source.exists():
+            target.write_text(source.read_text())
 
 
 def _prompt_module_for_run(run: str):
@@ -138,6 +144,13 @@ def _prompt_module_for_run(run: str):
     if snapshot.exists():
         return prompt_runtime.load_snapshot(snapshot)
     return None
+
+
+def _prompt_v2_module_for_run(run: str):
+    snapshot = _run_dir(run) / PROMPT_V2_SNAPSHOT_NAME
+    if snapshot.exists():
+        return prompt_runtime.load_snapshot(snapshot)
+    return prompts_v2
 
 
 def _split_variant(model_alias: str) -> tuple[str, str]:
@@ -164,7 +177,7 @@ def _prompt_module_for(run: str, model_alias: str):
     otherwise the run's snapshot (or the live module when none exists)."""
     _, variant = _split_variant(model_alias)
     if variant == "v2":
-        return prompts_v2
+        return _prompt_v2_module_for_run(run)
     return _prompt_module_for_run(run)
 
 
@@ -757,6 +770,7 @@ async def _sse(
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
     slot_log = _slot_logs[(run, slot_id, model_alias)]
     rlog.bind(slot_log)
+    llm.reset_call_sequence()
     prompt_runtime.bind(_prompt_module_for(run, model_alias))
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]

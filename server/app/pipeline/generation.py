@@ -36,6 +36,7 @@ import trimesh
 
 from app.core import prompt_runtime
 from app.core.types import BoundingBox, Node, ProxyShape
+from app.pipeline import committed
 from app.services import llm, nano_banana, threed
 from app.utils import glb_place, logging
 from app.utils.geometry import rescale_mesh_to_bbox
@@ -63,6 +64,12 @@ async def _decompose_objects_validated(
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
 ) -> list[Any]:
+    # Resume: if this (zone, scenario) pass already committed its object set
+    # to the log, replay those specs verbatim (ids fixed) instead of asking
+    # the LLM to re-decompose — which is exactly where new ids leak in.
+    committed_specs = committed.object_specs(zone.id, scenario)
+    if committed_specs is not None:
+        return committed_specs
     prior_attempts: list[tuple[list[Any], str]] = []
     existing_ids = {n.id for n in all_nodes}
     specs: list[Any] = []
@@ -230,49 +237,62 @@ async def _resolve_and_generate(
     admitted.update(seen_in_call)
     specs = deduped
 
-    bbox_by_id = {n.id: n.bbox for n in all_nodes}
-    p = prompt_runtime.current()
-    out = await llm.call_llm(
-        system=p.SYSTEM_OBJECT_BBOX_BATCH,
-        user=p.render_object_bbox_batch(
-            zone_id=zone.id,
-            objects=specs,
-            nodes=all_nodes,
-        ),
-        output_schema=p.BboxBatchOutput,
-        node_id=zone.id,
-        step="object_bbox_batch",
-    )
-    # LLM emits each object's bbox in that object's parent's local
-    # frame. Convert to world coordinates per-object. Handle
-    # intra-batch parents (spec B parents to spec A in same batch) via
-    # topological resolution order.
-    spec_parent = {s.id: s.parent for s in specs}
-    assignments_by_id = {a.id: a.bbox for a in out.assignments}
-    bboxes: dict[str, BoundingBox] = {}
-    # Resolve in passes: each pass converts objects whose parent bbox
-    # is already known. Terminates when all are resolved or no progress
-    # (cycle — fall back to zone frame).
-    remaining = set(assignments_by_id.keys())
-    while remaining:
-        progress = False
-        for obj_id in list(remaining):
-            parent_id = spec_parent.get(obj_id, zone.id)
-            if parent_id in bboxes:
-                parent_bbox = bboxes[parent_id]
-            elif parent_id in bbox_by_id:
-                parent_bbox = bbox_by_id[parent_id]
-            elif parent_id in remaining:
-                continue
-            else:
-                parent_bbox = zone.bbox
-            bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
-            remaining.discard(obj_id)
-            progress = True
-        if not progress:
+    # Resume: objects already placed (a committed `bbox` event) keep their
+    # exact world position. Skip the LLM when every object is committed;
+    # otherwise resolve the batch and overwrite the committed ones so only
+    # never-placed objects take a fresh assignment.
+    committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
+    if all(b is not None for b in committed_bboxes.values()):
+        bboxes: dict[str, BoundingBox] = {
+            sid: b for sid, b in committed_bboxes.items() if b is not None
+        }
+    else:
+        bbox_by_id = {n.id: n.bbox for n in all_nodes}
+        p = prompt_runtime.current()
+        out = await llm.call_llm(
+            system=p.SYSTEM_OBJECT_BBOX_BATCH,
+            user=p.render_object_bbox_batch(
+                zone_id=zone.id,
+                objects=specs,
+                nodes=all_nodes,
+            ),
+            output_schema=p.BboxBatchOutput,
+            node_id=zone.id,
+            step="object_bbox_batch",
+        )
+        # LLM emits each object's bbox in that object's parent's local
+        # frame. Convert to world coordinates per-object. Handle
+        # intra-batch parents (spec B parents to spec A in same batch) via
+        # topological resolution order.
+        spec_parent = {s.id: s.parent for s in specs}
+        assignments_by_id = {a.id: a.bbox for a in out.assignments}
+        bboxes = {}
+        # Resolve in passes: each pass converts objects whose parent bbox
+        # is already known. Terminates when all are resolved or no progress
+        # (cycle — fall back to zone frame).
+        remaining = set(assignments_by_id.keys())
+        while remaining:
+            progress = False
             for obj_id in list(remaining):
-                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
-            remaining.clear()
+                parent_id = spec_parent.get(obj_id, zone.id)
+                if parent_id in bboxes:
+                    parent_bbox = bboxes[parent_id]
+                elif parent_id in bbox_by_id:
+                    parent_bbox = bbox_by_id[parent_id]
+                elif parent_id in remaining:
+                    continue
+                else:
+                    parent_bbox = zone.bbox
+                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
+                remaining.discard(obj_id)
+                progress = True
+            if not progress:
+                for obj_id in list(remaining):
+                    bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
+                remaining.clear()
+        for sid, b in committed_bboxes.items():
+            if b is not None:
+                bboxes[sid] = b
 
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(
@@ -477,6 +497,12 @@ async def _build_image_prompt(
     no meaningful bbox — omits the dimension constraint from the image
     prompt so the model renders natural proportions."""
     p = prompt_runtime.current()
+    dims = bbox.size if include_dimensions else None
+    # Resume: reuse the committed subject phrase so a replayed object keeps
+    # the exact prompt the rest of the scene already references downstream.
+    subject = committed.image_subject(spec_id)
+    if subject is not None:
+        return subject, p.wrap_image_prompt(subject, proxy_shape, dims, view=view)
     out = await llm.call_llm(
         system=p.SYSTEM_IMAGE_PROMPT,
         user=p.render_image_prompt(
@@ -489,7 +515,6 @@ async def _build_image_prompt(
         node_id=spec_id,
         step="image_prompt",
     )
-    dims = bbox.size if include_dimensions else None
     return out.prompt, p.wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
 
 
@@ -666,7 +691,7 @@ async def run(
         match_fields=("zone", "scenario"),
         zone=zone.id,
         scenario=scenario,
-        objects=[s.id for s in specs],
+        objects=[s.model_dump(mode="json") for s in specs],
     )
 
     if specs:
@@ -681,6 +706,24 @@ async def run(
         all_nodes.extend(placed)
 
     if scenario != "anchor":
+        return
+
+    # Resume: replay the anchor completion loop's already-committed object
+    # decisions in order (re-resolving from the log, re-spawning only the
+    # meshes still missing), then stop if the loop had run to completion.
+    # Otherwise fall through and continue from the frontier with fresh
+    # `next_object` decisions.
+    for spec in committed.next_object_specs(zone.id):
+        replayed = await _resolve_and_generate(
+            specs=[spec],
+            zone=zone,
+            all_nodes=all_nodes,
+            scenario="anchor",
+            runs_dir=runs_dir,
+            run_id=run_id,
+        )
+        all_nodes.extend(replayed)
+    if committed.next_done(zone.id):
         return
 
     while True:
@@ -700,6 +743,7 @@ async def run(
             match_fields=("zone", "id"),
             zone=zone.id,
             id=decision.object.id,
+            object=decision.object.model_dump(mode="json"),
         )
         new_nodes = await _resolve_and_generate(
             specs=[decision.object],
