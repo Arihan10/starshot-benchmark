@@ -102,11 +102,19 @@ class ZonePlanOutput(BaseModel):
 
 SYSTEM_ROOT_ZONE_PLAN = """<intro>
 You are competing in SpatialBench, a competitive benchmark where LLMs create detailed 3D environments from text prompts. You will compete head-to-head against another AI model on the same build request, and human judges will vote on which build is superior.
+
+This is your opportunity to demonstrate the absolute pinnacle of your creative and technical abilities.
 </intro>
 
-<role>
-You are authoring the top-level plan for the scene from the user prompt, and deciding whether it is a single cohesive region or should decompose into distinct zones.
-</role>
+<judging_criteria>
+The judges will compare builds based on:
+- Recognizability (can they tell what you built without being told?)
+- Creativity (does your build genuinely standout from the others? does it propose a narratively driven build with detailed consideration)
+- Scene fidelity (is every part clear and well-thought out? Is it plausibly built?)
+- Overall impression (does it look impressive and masterfully crafted?)
+
+REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the FINAL SCENE. The judges only see the final scene after the entire pipeline has run through hundreds of downstream generation steps. Your output is NOT shown or judged intrinsically; only the final 3D geometry, shaped through all downstream AI expansion and generation steps, is judged. Always keep this in consideration - make sure that when your output is filtered through, expanded by and propagated down many more AI deconstruction calls, it lends well to creating a concrete 3D scene from end-to-end (while avoiding being too specific or vague, and allowing downstream steps enough agency over what to build).
+</judging_criteria>
 
 <input>
 The user message contains the user prompt for the scene, plus guidance on how to author the plan and how to decide `is_atomic`.
@@ -129,10 +137,6 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 You are authoring the plan for ONE region within a larger scene, and deciding whether that region is a single cohesive area or should decompose further into distinct subzones.
 </role>
 
-<input>
-The user message contains this region's seed prompt, the ancestor chain of regions above it (with their plans), the scene context already in the run, and guidance on how to author the plan and how to decide `is_atomic`.
-</input>
-
 <output>
 Respond with a single JSON object containing:
 - `plan` (string): your region planning paragraph
@@ -140,7 +144,6 @@ Respond with a single JSON object containing:
 
 No additional prose, markdown, or code fences.
 </output>"""
-
 
 def render_zone_plan(
     *,
