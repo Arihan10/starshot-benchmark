@@ -97,7 +97,8 @@ You receive the new object's id and description, plus a catalog of existing \
 assets (each with an id and description). Reuse an existing asset ONLY when it \
 is essentially the SAME object — a repeat or near-identical instance that would \
 look correct if the existing mesh were dropped into the new object's slot (it \
-will be rescaled to fit).
+will be rescaled to fit). Do not get caught up by flourishes in the mesh's \
+description, identify the exact type of object it is and match if a similar mesh exists. 
 
 Respond with ONE JSON object: set `reuse_id` to the id of the asset to reuse, or \
 to an empty string "" to generate a fresh asset. No prose, no markdown, no code \
