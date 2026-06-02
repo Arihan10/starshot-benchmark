@@ -37,6 +37,7 @@ def _child_env() -> dict[str, str]:
         for k, v in os.environ.items()
         if k not in {"VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}
     }
+    env.setdefault("PYTHONUNBUFFERED", "1")
     return env
 
 

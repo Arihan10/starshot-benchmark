@@ -84,7 +84,7 @@ async def match(prompt: str) -> LibraryMatchOutput:
     # Library matching is always run on gemini-flash regardless of the run's
     # configured model — the match step is a cheap retrieval, not part of the
     # spatial-reasoning benchmark surface.
-    token = llm._current_model.set(MODELS["gemini-flash"])
+    token = llm._current_model.set(MODELS["gemini-flash-lite"])
     try:
         return await llm.call_llm(
             system=SYSTEM_LIBRARY_MATCH,

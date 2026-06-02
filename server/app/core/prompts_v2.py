@@ -178,6 +178,15 @@ def _region_plan_entry(
     local = _local_coords_line(region, by_id)
     if local is not None:
         lines.append(local)
+    if region.parent_id is not None and region.parent_id in by_id:
+        parent = by_id[region.parent_id]
+        parent_placement = parent.placement if parent.placement is not None else "(none)"
+        parent_lines = [
+            f"parent_name: {parent.id}",
+            f"parent_placement: {parent_placement}",
+            f"parent_global_coordinates: {util.format_global_bbox(parent.bbox)}",
+        ]
+        lines.append("parent_region: " + util.braces("\n".join(parent_lines)))
     lines.append(f"Objects: {', '.join(o.id for o in objects) if objects else '(none)'}")
     if subregions:
         lines += [

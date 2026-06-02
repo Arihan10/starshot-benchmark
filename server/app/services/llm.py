@@ -18,6 +18,7 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TypeVar
 
+import httpx
 from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError
 from pydantic import BaseModel, ValidationError
@@ -209,7 +210,12 @@ async def call_llm(
             if final:
                 raise
             parse_attempt += 1
-        except OpenRouterError as e:
+        except (OpenRouterError, httpx.HTTPError) as e:
+            # httpx.RemoteProtocolError ("incomplete chunked read") and kin
+            # surface when OpenRouter or an upstream provider drops the HTTP
+            # connection mid-response. The SDK does not always wrap these as
+            # OpenRouterError, so treat all httpx transport failures like the
+            # other provider flaps we already retry.
             if transport_attempt >= TRANSPORT_MAX - 1:
                 raise
             backoff = TRANSPORT_BACKOFF[

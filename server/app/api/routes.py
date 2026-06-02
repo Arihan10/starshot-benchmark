@@ -34,8 +34,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.core import prompt_runtime
@@ -62,6 +61,10 @@ RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
 # the re-baked optimized set (scripts/rebake_runs.py) instead. Falls back to
 # "objects" for any cell that hasn't been migrated.
 OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
+
+# Python's mimetypes doesn't know glTF; without these the artifact route would
+# hand the loader its GLBs as text/plain.
+_ARTIFACT_MEDIA_TYPES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json"}
 
 # Source file we snapshot into each newly-created run so prompt-versioned
 # AB tests are reproducible after the source has moved on.
@@ -99,6 +102,30 @@ def _run_dir(run: str) -> Path:
 
 def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
     return RUNS_DIR / run / slot_id / model_alias
+
+
+def _resolve_run(run: str | None) -> str:
+    """Every cell endpoint names its target run/version explicitly so the
+    three concurrently-running versions never route through a shared global.
+    The client always sends `?run=`; `_current_run` is only the fallback for a
+    client that hasn't picked one yet (boot, or a legacy caller)."""
+    return run or _current_run
+
+
+def _run_has_data(run: str) -> bool:
+    """True when any (slot, model) cell under this run has a non-empty
+    events.jsonl — i.e. there is a rendition worth archiving. Lets the
+    version snapshot skip versions the user never launched."""
+    run_dir = _run_dir(run)
+    if not run_dir.is_dir():
+        return False
+    for events_path in run_dir.glob("*/*/events.jsonl"):
+        try:
+            if events_path.stat().st_size > 0:
+                return True
+        except OSError:
+            continue
+    return False
 
 
 def _ensure_prompt_snapshot(run: str) -> None:
@@ -153,6 +180,13 @@ def create_app() -> FastAPI:
         try:
             yield
         finally:
+            rlog.suppress_console()
+            for slot_log in _slot_logs.values():
+                slot_log.close()
+            for run_name, slot_id, model_alias in list(_slot_logs.keys()):
+                versions.for_run(run_name).generation.cancel_pending(
+                    _run_id(run_name, slot_id, model_alias),
+                )
             for task in _tasks.values():
                 task.cancel()
             for task in _retry_tasks:
@@ -178,7 +212,27 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
-    app.mount("/artifacts", StaticFiles(directory=RUNS_DIR), name="artifacts")
+
+    @app.get("/artifacts/{artifact_path:path}")
+    async def artifact(artifact_path: str) -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        # Per-cell artifacts (events.jsonl, reference PNGs, GLBs). The URLs are
+        # baked into the event log as `<cell>/objects/<id>.<ext>`. Cells migrated
+        # onto the optimized library (rebake_runs.py --prune-originals) hold those
+        # files under `objects-optimized/` instead, with `objects/` deleted — so a
+        # miss there transparently falls back to the optimized twin.
+        base = RUNS_DIR.resolve()
+        target = (base / artifact_path).resolve()
+        if not target.is_relative_to(base):
+            raise HTTPException(status_code=404)
+        rooted = f"/{artifact_path}"
+        if not target.is_file() and "/objects/" in rooted:
+            alt_rel = rooted.replace("/objects/", "/objects-optimized/", 1).lstrip("/")
+            alt = (base / alt_rel).resolve()
+            if alt.is_relative_to(base) and alt.is_file():
+                target = alt
+        if not target.is_file():
+            raise HTTPException(status_code=404)
+        return FileResponse(target, media_type=_ARTIFACT_MEDIA_TYPES.get(target.suffix.lower()))
 
     @app.get("/runs")
     async def list_runs() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -237,12 +291,13 @@ def create_app() -> FastAPI:
         return {"current": name}
 
     @app.get("/slots")
-    async def list_slots() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def list_slots(run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
         return {
-            "run": _current_run,
+            "run": run,
             "models": MODEL_ALIASES,
             "default_model": DEFAULT_MODEL_ALIAS,
-            "slots": [_slot_summary(s, _current_run) for s in SLOTS],
+            "slots": [_slot_summary(s, run) for s in SLOTS],
         }
 
     @app.get("/trellis/queue")
@@ -257,8 +312,8 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/slots/{slot_id}/{model_alias}/events")
-    async def slot_events(slot_id: str, model_alias: str, since: int = -1) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
-        run = _current_run
+    async def slot_events(slot_id: str, model_alias: str, since: int = -1, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         # Subscribe and snapshot synchronously — no await between them, so no
         # log() call can land in both the snapshot and the live queue.
@@ -281,28 +336,34 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/slots/{slot_id}/{model_alias}/scene")
-    async def slot_scene(slot_id: str, model_alias: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def slot_scene(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         # CQRS read model: fold the event log into the minimal renderable scene
         # state so the client paints directly instead of replaying ~2k events.
         # Returns `last_index` (the fold's cut) so the client can pick up the
         # live tail at `?since=last_index` with no gap or overlap.
-        run = _current_run
+        run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         return _scene_projection(list(slot_log.state["events"]))
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
         # cap those at ~6 per origin, and they'd contend with the SSE stream
         # and polls on this same origin). The client keys each blob to its
         # `model` event by file stem; see `_mesh_bundle`.
-        run = _current_run
+        run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
-        objects_dir = slot_log.events_path.parent / OBJECTS_SUBDIR
+        cell_dir = slot_log.events_path.parent
+        objects_dir = cell_dir / OBJECTS_SUBDIR
         if not objects_dir.is_dir():
-            objects_dir = slot_log.events_path.parent / "objects"
+            # Migrated cells keep only objects-optimized (rebake_runs.py
+            # --prune-originals); pre-migration cells keep only objects.
+            objects_dir = next(
+                (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
+                objects_dir,
+            )
         return StreamingResponse(
             _mesh_bundle(objects_dir),
             media_type="application/octet-stream",
@@ -314,8 +375,9 @@ def create_app() -> FastAPI:
         slot_id: str,
         model_alias: str,
         req: RewindRequest,
+        run: str | None = None,
     ) -> dict[str, int | str]:
-        run = _current_run
+        run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
@@ -330,8 +392,8 @@ def create_app() -> FastAPI:
         return {"run": run, "slot_id": slot.id, "model": model_alias, "events": new_len}
 
     @app.post("/slots/{slot_id}/{model_alias}/resume")
-    async def slot_resume(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        run = _current_run
+    async def slot_resume(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
@@ -355,8 +417,8 @@ def create_app() -> FastAPI:
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.post("/slots/{slot_id}/{model_alias}/pause")
-    async def slot_pause(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        run = _current_run
+    async def slot_pause(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
@@ -379,8 +441,9 @@ def create_app() -> FastAPI:
         slot_id: str,
         model_alias: str,
         node_id: str,
+        run: str | None = None,
     ) -> dict[str, str]:
-        run = _current_run
+        run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
@@ -414,8 +477,13 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/reset")
-    async def slot_reset(slot_id: str, model_alias: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        run = _current_run
+    async def slot_reset(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+        start: bool = True,
+    ) -> dict[str, str]:
+        run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         ver = versions.for_run(run)
@@ -427,10 +495,23 @@ def create_app() -> FastAPI:
         slot_dir = _slot_dir(run, slot.id, model_alias)
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
+        old_log = _slot_logs.get((run, slot.id, model_alias))
+        if old_log is not None:
+            old_log.close()
         slot_log = SlotLog(_run_id(run, slot.id, model_alias), slot_dir / "events.jsonl")
         _slot_logs[(run, slot.id, model_alias)] = slot_log
-        slot_log.start_run(slot.prompt, MODELS[model_alias])
-        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
+        if start:
+            slot_log.start_run(slot.prompt, MODELS[model_alias])
+            _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
+        else:
+            # Wipe back to a fresh idle cell — prompt + model pre-seeded (so a
+            # later /resume can start_run without the client resending them) but
+            # no pipeline task launched. Lets "reset all" clear an A/B matrix
+            # without spawning dozens of runs; the user then starts exactly the
+            # (version, slot, model) cells they pick.
+            slot_log.state["prompt"] = slot.prompt
+            slot_log.state["model"] = MODELS[model_alias]
+            slot_log.state["status"] = "idle"
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.get("/versions")
@@ -496,6 +577,35 @@ def create_app() -> FastAPI:
                     }
                 )
         return {"slot_id": slot_id, "model": model_alias, "versions": results}
+
+    @app.post("/versions/snapshot")
+    async def snapshot_versions() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Archive every reserved version run (V1/V2/V3) that has data into a
+        timestamped, loadable copy, so the live version cells can be reset and
+        re-run for a fresh V1 vs V2 without losing the current rendition. The
+        originals are untouched and stay active; each archive shows up in the
+        run picker like any other run and is self-contained (meshes stream
+        from its own dir). Versions the user never launched are skipped. A
+        shared timestamp keeps the batch grouped in the picker."""
+        ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+        snapshots: list[dict[str, str]] = []
+        skipped: list[str] = []
+        for ver in versions.VERSIONS:
+            if not _run_has_data(ver.run_name):
+                skipped.append(ver.run_name)
+                continue
+            name = f"{ver.run_name}@{ts}"
+            dst = _run_dir(name)
+            if dst.exists():
+                skipped.append(ver.run_name)
+                continue
+            # copytree of a cell's objects/ can be hundreds of MB — run it off
+            # the event loop so SSE streams and status polls don't stall.
+            await asyncio.to_thread(shutil.copytree, _run_dir(ver.run_name), dst)
+            snapshots.append({"run_name": ver.run_name, "snapshot": name})
+        if not snapshots:
+            raise HTTPException(status_code=404, detail="no version data to archive yet")
+        return {"snapshots": snapshots, "skipped": skipped}
 
     return app
 

@@ -31,10 +31,12 @@ PORT = 8767
 
 
 def _child_env() -> dict[str, str]:
-    return {
+    env = {
         k: v for k, v in os.environ.items()
         if k not in {"VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}
     }
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    return env
 
 
 def _signal_group(pgid: int, sig: int) -> None:

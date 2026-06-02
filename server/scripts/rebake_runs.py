@@ -1,10 +1,17 @@
 """Re-bake existing library-mode runs onto the optimized asset library.
 
-NON-DESTRUCTIVE: writes optimized, placement-baked objects to
+By default NON-DESTRUCTIVE: writes optimized, placement-baked objects to
 ``<cell>/objects-optimized/`` alongside the untouched original
 ``<cell>/objects/``. The server serves whichever you point it at via
 ``STARSHOT_OBJECTS_SUBDIR`` (default ``objects``), so the two sets coexist and
 you can switch back and forth.
+
+Pass ``--prune-originals`` to reclaim disk as you go: once every convertible
+object in a cell has a non-empty optimized twin, that cell's ``objects/`` is
+deleted. This bounds peak disk to one cell's optimized output at a time, which
+is what makes a full conversion fit when the raw ``objects/`` already fill the
+volume. Cells with no library matches (pure Trellis generations) are never
+touched.
 
 A "cell" is one (run/slot/model) directory — anything containing an
 events.jsonl. For each cell whose log has library matches, the placement of
@@ -23,6 +30,7 @@ Usage (from server/):
   uv run python scripts/rebake_runs.py --cell default/hotel-room/gpt
   uv run python scripts/rebake_runs.py --cell <c> --limit 5      # first 5 objects
   uv run python scripts/rebake_runs.py --force                   # redo existing
+  uv run python scripts/rebake_runs.py --prune-originals         # convert + delete objects/
 """
 
 from __future__ import annotations
@@ -80,7 +88,7 @@ def _parse_cell(events_path: Path) -> tuple[dict[str, str], dict[str, tuple]]:
     return lib_by_id, bbox_by_id
 
 
-def rebake_cell(cell_dir: Path, *, force: bool, limit: int) -> dict[str, int] | None:
+def rebake_cell(cell_dir: Path, *, force: bool, limit: int, prune: bool) -> dict | None:
     events_path = cell_dir / "events.jsonl"
     if not events_path.exists():
         return None
@@ -90,42 +98,74 @@ def rebake_cell(cell_dir: Path, *, force: bool, limit: int) -> dict[str, int] | 
 
     objects_dir = cell_dir / "objects"
     out_dir = cell_dir / OPTIMIZED_SUBDIR
+
+    # Convertible objects: a library match that actually produced a baked
+    # object (didn't error mid-run) and whose placement we can recover.
+    targets = [
+        node_id
+        for node_id in lib_by_id
+        if bbox_by_id.get(node_id) is not None and (objects_dir / f"{node_id}.glb").exists()
+    ]
+
+    if not objects_dir.exists():
+        # Already pruned by an earlier pass (or the cell never produced objects).
+        return {
+            "baked": 0, "already": 0, "unconvertible": 0, "pruned": False,
+            "orig_mb": 0.0, "opt_mb": _dir_size_mb(out_dir),
+            "status": "already_pruned" if out_dir.exists() else "no_objects",
+        }
+
     out_dir.mkdir(exist_ok=True)
+    orig_mb = _dir_size_mb(objects_dir)
 
-    done = skipped = missing = 0
-    for node_id, library_id in lib_by_id.items():
-        if done >= limit:
-            break
-        src_object = objects_dir / f"{node_id}.glb"
-        bb = bbox_by_id.get(node_id)
-        if not src_object.exists() or bb is None:
-            # The original object never landed (errored mid-run) or has no bbox.
-            skipped += 1
-            continue
-        dst = out_dir / f"{node_id}.glb"
-        if dst.exists() and not force:
-            skipped += 1
-            continue
-        origin, dims, orientation = bb
-        asset = library.asset_path(library_id)
-        bounds = library.asset_rotated_bounds(library_id, orientation)
-        if not asset.exists() or bounds is None:
-            missing += 1
-            continue
-        glb_place.place_glb(
-            src=asset,
-            dst=dst,
-            bbox=BoundingBox(origin=tuple(origin), dimensions=tuple(dims)),
-            orientation=orientation,
-            rotated_min=bounds[0],
-            rotated_max=bounds[1],
-        )
-        png = asset.with_suffix(".png")
-        if png.exists():
-            shutil.copyfile(png, out_dir / f"{node_id}.png")
-        done += 1
+    def _have(node_id: str) -> bool:
+        twin = out_dir / f"{node_id}.glb"
+        return twin.exists() and twin.stat().st_size > 0
 
-    return {"done": done, "skipped": skipped, "missing": missing}
+    baked = unconvertible = already = 0
+    if targets and not force and all(_have(nid) for nid in targets):
+        already = len(targets)
+    else:
+        # Re-bake the whole convertible set rather than only the gaps, so a
+        # half-written file from an interrupted pass can't survive into the
+        # optimized set and then get treated as complete.
+        count = 0
+        for node_id in targets:
+            if count >= limit:
+                break
+            origin, dims, orientation = bbox_by_id[node_id]
+            asset = library.asset_path(lib_by_id[node_id])
+            bounds = library.asset_rotated_bounds(lib_by_id[node_id], orientation)
+            if not asset.exists() or bounds is None:
+                unconvertible += 1
+                continue
+            glb_place.place_glb(
+                src=asset,
+                dst=out_dir / f"{node_id}.glb",
+                bbox=BoundingBox(origin=tuple(origin), dimensions=tuple(dims)),
+                orientation=orientation,
+                rotated_min=bounds[0],
+                rotated_max=bounds[1],
+            )
+            png = asset.with_suffix(".png")
+            if png.exists():
+                shutil.copyfile(png, out_dir / f"{node_id}.png")
+            baked += 1
+            count += 1
+
+    # Prune only when every convertible object now has a non-empty optimized
+    # twin — never when an asset was missing or a --limit left gaps.
+    complete = bool(targets) and unconvertible == 0 and all(_have(nid) for nid in targets)
+    pruned = False
+    if prune and complete:
+        shutil.rmtree(objects_dir)
+        pruned = True
+
+    return {
+        "baked": baked, "already": already, "unconvertible": unconvertible,
+        "pruned": pruned, "orig_mb": orig_mb, "opt_mb": _dir_size_mb(out_dir),
+        "status": "ok",
+    }
 
 
 def _discover_cells(runs_dir: Path, cell: str | None) -> list[Path]:
@@ -140,32 +180,52 @@ def main() -> None:
     parser.add_argument("--cell", type=str, default=None, help="run/slot/model under runs-dir; omit for all")
     parser.add_argument("--limit", type=int, default=10**9, help="max objects per cell (testing)")
     parser.add_argument("--force", action="store_true", help="re-bake even if the optimized object exists")
+    parser.add_argument(
+        "--prune-originals",
+        action="store_true",
+        help="delete a cell's objects/ once every convertible object has a non-empty optimized twin",
+    )
     args = parser.parse_args()
 
     cells = _discover_cells(args.runs_dir, args.cell)
-    grand = {"done": 0, "skipped": 0, "missing": 0}
+    grand = {"baked": 0, "already": 0, "unconvertible": 0, "pruned_cells": 0}
     rebaked_cells = 0
+    kept: list[str] = []
     for cell_dir in cells:
-        result = rebake_cell(cell_dir, force=args.force, limit=args.limit)
+        result = rebake_cell(
+            cell_dir, force=args.force, limit=args.limit, prune=args.prune_originals
+        )
         if result is None:
             continue
         rebaked_cells += 1
         rel = cell_dir.relative_to(args.runs_dir).as_posix()
-        orig_mb = _dir_size_mb(cell_dir / "objects")
-        opt_mb = _dir_size_mb(cell_dir / OPTIMIZED_SUBDIR)
-        for k in grand:
-            grand[k] += result[k]
+        grand["baked"] += result["baked"]
+        grand["already"] += result["already"]
+        grand["unconvertible"] += result["unconvertible"]
+        if result["pruned"]:
+            grand["pruned_cells"] += 1
+        elif args.prune_originals and result["status"] == "ok":
+            kept.append(rel)
         print(
-            f"[rebake] {rel}: {result['done']} baked, {result['skipped']} skipped, "
-            f"{result['missing']} missing  |  objects {orig_mb}MB -> optimized {opt_mb}MB",
+            f"[rebake] {rel}: baked={result['baked']} already={result['already']} "
+            f"unconvertible={result['unconvertible']} pruned={result['pruned']}  |  "
+            f"objects {result['orig_mb']}MB -> optimized {result['opt_mb']}MB",
             flush=True,
         )
 
     print(
-        f"\n[rebake] {rebaked_cells} library cells  "
-        f"done={grand['done']} skipped={grand['skipped']} missing={grand['missing']}",
+        f"\n[rebake] {rebaked_cells} library cells  baked={grand['baked']} "
+        f"already={grand['already']} unconvertible={grand['unconvertible']} "
+        f"pruned_cells={grand['pruned_cells']}",
         flush=True,
     )
+    if args.prune_originals and kept:
+        print(
+            f"[rebake] kept objects/ for {len(kept)} cell(s) (incomplete or unconvertible):",
+            flush=True,
+        )
+        for rel in kept:
+            print(f"  - {rel}", flush=True)
 
 
 if __name__ == "__main__":

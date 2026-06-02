@@ -52,9 +52,10 @@ TRELLIS_SEED = 0
 
 # Spawn-and-poll cadence. The API caps any single job at ~10 min
 # wall-clock; warm 512-res jobs finish in ~3s, 1536-res in ~60s, cold
-# starts add 30-90s. 12s × GENERATE_CONCURRENCY=10 = 50 polls/min,
-# under the per-IP-per-container `/jobs/{id}` rate limit (60/60s) even
-# if Modal's load balancer pins us to a single container.
+# starts add 30-90s. 12s × GENERATE_CONCURRENCY=20 = 100 polls/min
+# aggregate — OK while Modal's LB spreads it across the 20 containers
+# (~5/min each, under the per-IP-per-container `/jobs/{id}` 60/60s limit),
+# but a pin to a single container would now exceed it.
 POLL_INTERVAL_SECONDS = 12.0
 POLL_TIMEOUT_SECONDS = 1200.0
 
@@ -94,7 +95,7 @@ class JobLostError(Exception):
 # means Modal never queues on its side and every "pending" status maps
 # to active GPU processing rather than queue wait. The semaphore acts
 # as our FIFO queue (process-global, across all benchmark slots).
-GENERATE_CONCURRENCY = 10
+GENERATE_CONCURRENCY = 20
 _inflight_sem = asyncio.Semaphore(GENERATE_CONCURRENCY)
 
 # Live snapshot of in-flight Trellis work. Process-global so the queue

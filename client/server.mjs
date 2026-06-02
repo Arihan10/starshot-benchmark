@@ -28,6 +28,7 @@ const MIME = {
   ".png": "image/png",
   ".glb": "model/gltf-binary",
   ".gltf": "model/gltf+json",
+  ".wasm": "application/wasm",
 };
 
 function resolveUnder(root, urlPath) {

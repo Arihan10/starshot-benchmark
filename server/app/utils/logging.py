@@ -19,16 +19,34 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from contextvars import ContextVar
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 from rich.console import Console
 from rich.markup import escape
 
 from app.core.types import BoundingBox, Orientation, ProxyShape
 
+# Uvicorn and subprocess wrappers can leave stdout block-buffered even in a
+# TTY, so Rich batches huge cache.llm blocks until flush — Ctrl-C then dumps
+# the backlog for a long time. Line-buffer + explicit flush keeps the terminal
+# live; verbose kinds still omit megabyte fields from the console (jsonl/SSE
+# keep the full payload).
+try:
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+except (AttributeError, OSError, ValueError):
+    pass
+
 _console = Console()
+_console_suppressed = False
+
+# Full prompts/reasoning live in events.jsonl; printing them here fills the
+# stdout buffer and makes shutdown look like an endless flush.
+_CONSOLE_OMIT_FIELDS = frozenset({"system", "user", "output", "reasoning", "content"})
+_CONSOLE_COMPACT_KINDS = frozenset({"cache.llm"})
+_CONSOLE_STR_MAX = 240
 
 
 def _derive_status(events: list[dict[str, Any]]) -> str:
@@ -70,6 +88,28 @@ class SlotLog:
             "events": [],
         }
         self.subscribers: list[asyncio.Queue[dict[str, Any]]] = []
+        # Append handle kept open for the life of the cell. Opening events.jsonl
+        # on every log() event (hundreds per run × many parallel cells) was
+        # blowing through macOS's default 256-fd soft limit.
+        self._events_file: TextIO | None = None
+
+    def close(self) -> None:
+        """Release the append handle (shutdown / cell reset)."""
+        if self._events_file is not None:
+            try:
+                self._events_file.close()
+            except OSError:
+                pass
+            self._events_file = None
+
+    def _ensure_events_append(self) -> TextIO:
+        if self._events_file is None or self._events_file.closed:
+            self.events_path.parent.mkdir(parents=True, exist_ok=True)
+            self._events_file = self.events_path.open("a", encoding="utf-8")
+        return self._events_file
+
+    def _close_events_file(self) -> None:
+        self.close()
 
     def hydrate_from_disk(self) -> None:
         """Load state from an existing events.jsonl. Prompt + model come
@@ -103,12 +143,13 @@ class SlotLog:
     def truncate_events_to(self, n: int) -> int:
         """Keep only the first `n` events on disk and in memory. Returns
         the new length."""
+        self._close_events_file()
         n = max(0, min(n, len(self.state["events"])))
         self.state["events"] = self.state["events"][:n]
         if n == 0:
             self.events_path.write_text("")
         else:
-            with self.events_path.open("w") as f:
+            with self.events_path.open("w", encoding="utf-8") as f:
                 for event in self.state["events"]:
                     f.write(json.dumps(event) + "\n")
         # Status may have changed (e.g. error cleared, or now mid-run).
@@ -117,6 +158,7 @@ class SlotLog:
         return n
 
     def start_run(self, prompt: str, model: str) -> None:
+        self._close_events_file()
         self.state["status"] = "running"
         self.state["prompt"] = prompt
         self.state["model"] = model
@@ -138,8 +180,9 @@ class SlotLog:
         self.state["events"].append(event)
         if kind == "run.error":
             self.state["status"] = "error"
-        with self.events_path.open("a") as f:
-            f.write(json.dumps(event) + "\n")
+        f = self._ensure_events_append()
+        f.write(json.dumps(event) + "\n")
+        f.flush()
         _print(self.slot_id, event)
         for q in self.subscribers:
             q.put_nowait(event)
@@ -280,18 +323,43 @@ _KIND_COLOR = {
 }
 
 
+def suppress_console() -> None:
+    """Stop terminal output during process teardown (jsonl/SSE unaffected)."""
+    global _console_suppressed
+    _console_suppressed = True
+
+
+def _console_fields(event: dict[str, Any]) -> list[tuple[str, Any]]:
+    kind = str(event.get("kind", "?"))
+    fields = [(k, v) for k, v in event.items() if k != "kind"]
+    if kind in _CONSOLE_COMPACT_KINDS:
+        fields = [(k, v) for k, v in fields if k not in _CONSOLE_OMIT_FIELDS]
+    return fields
+
+
 def _print(slot_id: str, event: dict[str, Any]) -> None:
+    if _console_suppressed:
+        return
     kind = str(event.get("kind", "?"))
     color = _KIND_COLOR.get(kind, "blue")
-    fields = [(k, v) for k, v in event.items() if k != "kind"]
+    fields = _console_fields(event)
     _console.print(
         f"[dim]\\[{slot_id}][/dim] [bold {color}]{kind}[/bold {color}]",
     )
     if not fields:
+        _flush_stdout()
         return
     width = max(len(k) for k, _ in fields)
     for k, v in fields:
         _console.print(f"  [dim]{k.ljust(width)}[/dim]  {escape(_fmt(v))}")
+    _flush_stdout()
+
+
+def _flush_stdout() -> None:
+    try:
+        sys.stdout.flush()
+    except OSError:
+        pass
 
 
 def _fmt(value: Any) -> str:
@@ -303,5 +371,7 @@ def _fmt(value: Any) -> str:
         parts = [f"{k}={_fmt(v)}" for k, v in value.items()]
         return "{" + ", ".join(parts) + "}"
     if isinstance(value, str):
+        if len(value) > _CONSOLE_STR_MAX:
+            return f"{value[:_CONSOLE_STR_MAX]}… ({len(value)} chars)"
         return value
     return repr(value)

@@ -42,6 +42,7 @@ SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
 # passes into the SDK call. Order is the order the dashboard renders.
 MODELS: dict[str, str] = {
     "gemini-flash": "google/gemini-3.5-flash",
+    "gemini-flash-lite": "google/gemini-3.1-flash-lite",
     "gemini-pro": "google/gemini-3.1-pro-preview",
     "gpt": "openai/gpt-5.5",
     "opus": "anthropic/claude-opus-4.6",

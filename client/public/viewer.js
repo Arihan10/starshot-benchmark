@@ -2,6 +2,8 @@ import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
+import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 
 const SERVER_URL = document
   .querySelector('meta[name="server-url"]')
@@ -15,6 +17,8 @@ const FRAMES_VISIBLE_STORAGE_KEY = "starshot.framesVisible";
 const MESHES_VISIBLE_STORAGE_KEY = "starshot.meshesVisible";
 const SELECT_MODE_STORAGE_KEY = "starshot.selectMode";
 const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
+const GRID_VISIBLE_STORAGE_KEY = "starshot.gridVisible";
+const TABS_STORAGE_KEY = "starshot.openTabs";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
@@ -27,18 +31,30 @@ const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
 const modelPickerEl = document.getElementById("model-picker");
 const runPickerEl = document.getElementById("run-picker");
+const runTabsBarEl = document.getElementById("run-tabs-bar");
+const runTabAddEl = document.getElementById("run-tab-add");
 const runNewEl = document.getElementById("run-new");
 const saveAllEl = document.getElementById("save-all");
 const snapshotAllEl = document.getElementById("snapshot-all");
 const resumeAllEl = document.getElementById("resume-all");
 const resetAllEl = document.getElementById("reset-all");
+const startCellsEl = document.getElementById("start-cells");
+const startModalEl = document.getElementById("start-modal");
+const startModalCloseEl = document.getElementById("start-modal-close");
+const startVersionsEl = document.getElementById("start-versions");
+const startModelsEl = document.getElementById("start-models");
+const startSlotsEl = document.getElementById("start-slots");
+const startModalCountEl = document.getElementById("start-modal-count");
+const startModalGoEl = document.getElementById("start-modal-go");
 const versionBarEl = document.getElementById("version-bar");
 const versionLaunchAllEl = document.getElementById("version-launch-all");
+const versionArchiveAllEl = document.getElementById("version-archive-all");
 const bboxToggleEl = document.getElementById("bbox-toggle");
 const framesToggleEl = document.getElementById("frames-toggle");
 const meshesToggleEl = document.getElementById("meshes-toggle");
 const selectModeToggleEl = document.getElementById("select-mode-toggle");
 const solidFillToggleEl = document.getElementById("solid-fill-toggle");
+const gridToggleEl = document.getElementById("grid-toggle");
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
 const replayModalEl = document.getElementById("replay-modal");
@@ -108,7 +124,7 @@ const tqProcessingCapEl = document.getElementById("tq-processing-cap");
 const tqWaitingEl = document.getElementById("tq-waiting");
 const tqWaitingCapEl = document.getElementById("tq-waiting-cap");
 // Server-side `GENERATE_CONCURRENCY` (threed.py). Hard-coded mirror so the
-// "X/10" cap reads correctly; bump alongside the server constant if it
+// "X/20" cap reads correctly; bump alongside the server constant if it
 // changes.
 const TRELLIS_CONCURRENCY_CAP = 20;
 const treeEl = document.getElementById("tree");
@@ -307,7 +323,7 @@ async function retryMesh(id) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -708,7 +724,7 @@ function treeSetPhase(id, phase) {
     // A node finishing doesn't move the focus elsewhere on its own; leave
     // the highlight on it until the next step event moves it.
   }
-  renderTree();
+  scheduleRenderTree();
   if (id === selectedBboxId || (selectedBboxId && treeIsAncestorOf(selectedBboxId, id))) {
     renderTreeDetail();
   }
@@ -995,7 +1011,22 @@ function orderedMatches(filter) {
   return sorted.map((n) => n.id);
 }
 
+// Coalesced tree re-render. A single SSE snapshot can fire `renderTree`
+// hundreds of times (one per bbox / step / model), and each call rebuilds the
+// entire tree DOM — O(events × nodes), a major contributor to switch lag.
+// Streaming paths call `scheduleRenderTree`, which only flips a flag; the
+// animate() loop drains it with a single rebuild per frame. User-interaction
+// paths (search / select / hide) keep calling `renderTree` directly so their
+// feedback stays synchronous (and so code that reads the freshly-built DOM on
+// the next line still works).
+let _treeRenderPending = false;
+function scheduleRenderTree() {
+  _treeRenderPending = true;
+}
+
 function renderTree() {
+  // A synchronous render satisfies any pending coalesced one.
+  _treeRenderPending = false;
   treeBodyEl.innerHTML = "";
   const filter = computeTreeFilter();
   if (treeRootId !== null) {
@@ -1399,11 +1430,32 @@ const groundGrid = new THREE.Mesh(gridGeom, gridMat);
 groundGrid.renderOrder = -1;
 scene.add(groundGrid);
 
+let gridShown = localStorage.getItem(GRID_VISIBLE_STORAGE_KEY) !== "0";
+function applyGridToggle() {
+  gridToggleEl.textContent = `grid: ${gridShown ? "on" : "off"}`;
+  gridToggleEl.classList.toggle("off", !gridShown);
+  groundGrid.visible = gridShown;
+}
+applyGridToggle();
+gridToggleEl.addEventListener("click", () => {
+  gridShown = !gridShown;
+  localStorage.setItem(GRID_VISIBLE_STORAGE_KEY, gridShown ? "1" : "0");
+  applyGridToggle();
+});
+
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
 });
+
+// Coalescing flag for fitToScene (drained once per frame in animate, below):
+// a burst of per-mesh attach completions collapses into one O(scene) Box3
+// refit per frame instead of one traversal per mesh.
+let _fitScenePending = false;
+function scheduleFitToScene() {
+  _fitScenePending = true;
+}
 
 function animate() {
   requestAnimationFrame(animate);
@@ -1412,6 +1464,15 @@ function animate() {
   _lastMoveT = now;
   _applyKeyboardMove(dt);
   controls.update();
+
+  // Drain coalesced UI work once per frame: collapse a burst of streamed tree
+  // mutations into one DOM rebuild, and a burst of mesh completions into one
+  // camera refit. Both run before render so the frame reflects them.
+  if (_treeRenderPending) renderTree();
+  if (_fitScenePending) {
+    _fitScenePending = false;
+    fitToScene();
+  }
 
   gridMat.uniforms.uCameraPos.value.copy(camera.position);
   const camDist = Math.max(1, camera.position.distanceTo(controls.target));
@@ -1439,13 +1500,7 @@ function clearScene() {
   while (sceneRoot.children.length > 0) {
     const child = sceneRoot.children[0];
     sceneRoot.remove(child);
-    child.traverse?.((n) => {
-      if (n.isMesh) {
-        n.geometry?.dispose?.();
-        const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-        for (const m of mats) m.dispose?.();
-      }
-    });
+    disposeObject3D(child);
   }
   for (const helper of bboxes.values()) {
     bboxRoot.remove(helper);
@@ -1488,7 +1543,24 @@ function fitToScene() {
 
 // --- model loading ----------------------------------------------------------
 
-const loader = new GLTFLoader();
+// Optimized-library GLBs (assets-optimized + rebake_runs.py) are Meshopt-
+// compressed with KTX2/Basis textures — extensionsRequired lists
+// EXT_meshopt_compression, KHR_mesh_quantization, KHR_texture_basisu — so a bare
+// GLTFLoader can't parse them. Wire the Basis transcoder (shipped with three,
+// served at /vendor/three/... by client/server.mjs) and the Meshopt decoder into
+// every loader. detectSupport(renderer) picks the GPU's transcode target.
+const ktx2Loader = new KTX2Loader()
+  .setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
+  // The default 4-worker transcode pool serializes a scene's hundreds of KTX2
+  // textures and is the main load-time bottleneck; scale it to the machine.
+  .setWorkerLimit(Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4)))
+  .detectSupport(renderer);
+
+function configureGltfLoader(gltfLoader) {
+  return gltfLoader.setKTX2Loader(ktx2Loader).setMeshoptDecoder(MeshoptDecoder);
+}
+
+const loader = configureGltfLoader(new GLTFLoader());
 
 // Concurrent loads — each GLB fetches/parses/uploads independently. The
 // browser's per-origin connection limit (~6) naturally throttles the network
@@ -1723,18 +1795,12 @@ function attachPreloadedGlb(event, gltf) {
   const prevModel = modelsById.get(event.id);
   if (prevModel) {
     sceneRoot.remove(prevModel);
-    prevModel.traverse?.((n) => {
-      if (n.isMesh) {
-        n.geometry?.dispose?.();
-        const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-        for (const m of mats) m.dispose?.();
-      }
-    });
+    disposeObject3D(prevModel);
   }
   sceneRoot.add(gltf.scene);
   modelsById.set(event.id, gltf.scene);
   applyModelVisibility(event.id);
-  fitToScene();
+  scheduleFitToScene();
   upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
 }
 
@@ -1763,18 +1829,12 @@ async function _loadModelNow(event, gen) {
     const prevModel = modelsById.get(event.id);
     if (prevModel) {
       sceneRoot.remove(prevModel);
-      prevModel.traverse?.((n) => {
-        if (n.isMesh) {
-          n.geometry?.dispose?.();
-          const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-          for (const m of mats) m.dispose?.();
-        }
-      });
+      disposeObject3D(prevModel);
     }
     sceneRoot.add(gltf.scene);
     modelsById.set(event.id, gltf.scene);
     applyModelVisibility(event.id);
-    fitToScene();
+    scheduleFitToScene();
     upsertAsset(event.id, { status: "loaded" });
   } catch (e) {
     appendEvent({ kind: "model.error", id: event.id, message: e.message });
@@ -2179,7 +2239,7 @@ function mountMiniViewer(container, modelUrl) {
 
   let disposed = false;
   let model = null;
-  const localLoader = new GLTFLoader();
+  const localLoader = configureGltfLoader(new GLTFLoader());
   localLoader.loadAsync(new URL(modelUrl, SERVER_URL).toString())
     .then((gltf) => {
       if (disposed) return;
@@ -2225,13 +2285,7 @@ function mountMiniViewer(container, modelUrl) {
       try { ro.disconnect(); } catch {}
       try { controls.dispose(); } catch {}
       if (model) {
-        model.traverse((n) => {
-          if (n.isMesh) {
-            n.geometry?.dispose?.();
-            const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-            for (const m of mats) m.dispose?.();
-          }
-        });
+        disposeObject3D(model);
       }
       try { renderer.dispose(); } catch {}
       if (renderer.domElement.parentNode) {
@@ -3356,7 +3410,7 @@ function dispatch(event) {
         dimensions: event.dimensions,
         proxyShape: event.proxy_shape ?? null,
       });
-      renderTree();
+      scheduleRenderTree();
       if (event.id === selectedBboxId) renderTreeDetail();
       break;
     case "divider.decompose":
@@ -3367,7 +3421,7 @@ function dispatch(event) {
       for (const c of event.children ?? []) {
         treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
       }
-      renderTree();
+      scheduleRenderTree();
       break;
     case "divider.zone_plan":
       // Stash the authored zone plan on the node so the tooltip can surface
@@ -3434,6 +3488,17 @@ let availableVersions = [];  // [{id, run_name, label, status}, ...] from GET /v
 let defaultModelAlias = null;
 let slotSummaries = [];  // latest /slots `slots` array, for tab rendering
 let slotNeedsResume = false;
+
+// --- run tabs (multiple open run-views) -------------------------------------
+//
+// Each tab pins a (run, slot, model) position; the active tab is what the
+// single canvas shows. Switching tabs reuses switchRun/switchView, so only one
+// cell streams at a time (one WebGL context, one SSE) while the others stay one
+// click away — the natural way to A/B-compare renditions across runs. The run
+// picker, version bar, slot bar, and model picker all edit the *active* tab
+// (via syncActiveTab in switchView); openTabs persists across reloads.
+const openTabs = [];   // [{ id, run, slot, model }]
+let activeTabId = null;
 
 function currentRunInfo() {
   const slot = slotSummaries.find((s) => s.id === currentSlotId);
@@ -3508,16 +3573,22 @@ function updateResumeButton() {
 
 async function refreshSlots() {
   try {
-    const res = await fetch(new URL("/slots", SERVER_URL));
+    // Scope the status poll to OUR viewed run. Every cell request is
+    // run-scoped now, so we must ask for this version's statuses explicitly
+    // rather than whatever run happens to be the server's last-activated
+    // global — otherwise another tab/version flips our dots out from under us.
+    const url = new URL("/slots", SERVER_URL);
+    if (currentRun) url.searchParams.set("run", currentRun);
+    const res = await fetch(url);
     if (!res.ok) return;
     const payload = await res.json();
     availableModels = payload.models ?? [];
     defaultModelAlias = payload.default_model ?? availableModels[0] ?? null;
     slotSummaries = payload.slots ?? [];
-    if (payload.run && payload.run !== currentRun) {
-      // Another client (or the create-run endpoint) flipped the active run
-      // out from under us — keep our local state in sync so renders and
-      // composite ids match.
+    if (payload.run && !currentRun) {
+      // First load only: adopt the server's default run. We never *steal* a
+      // run another client activated — requests are run-scoped, so a global
+      // flip elsewhere no longer means our view should follow it.
       currentRun = payload.run;
       if (runPickerEl.value !== currentRun) runPickerEl.value = currentRun;
     }
@@ -3696,6 +3767,42 @@ async function launchAllVersions() {
 
 versionLaunchAllEl.addEventListener("click", launchAllVersions);
 
+async function archiveAllVersions() {
+  // Copy every version run (V1/V2/V3) that has data into timestamped,
+  // loadable archive runs, so the live version cells can be reset and re-run
+  // for a fresh V1 vs V2 without losing the current rendition. Stays on the
+  // current version; archives appear in the run picker and stream meshes from
+  // their own dir, so each copy is self-contained.
+  versionArchiveAllEl.disabled = true;
+  const prevLabel = versionArchiveAllEl.textContent;
+  versionArchiveAllEl.textContent = "archiving…";
+  try {
+    const res = await fetch(new URL("/versions/snapshot", SERVER_URL), {
+      method: "POST",
+    });
+    if (!res.ok) {
+      const detail = await res.text();
+      setStatus(`archive failed: ${detail}`, "err");
+      return;
+    }
+    const payload = await res.json();
+    const names = (payload.snapshots ?? []).map((s) => s.snapshot);
+    setStatus(
+      names.length
+        ? `archived ${names.length} version run${names.length === 1 ? "" : "s"} → ${names.join(", ")} — load any of them from the run picker later`
+        : "nothing to archive yet",
+    );
+    await refreshRuns();
+  } catch (e) {
+    setStatus(`archive failed: ${e.message}`, "err");
+  } finally {
+    versionArchiveAllEl.disabled = false;
+    versionArchiveAllEl.textContent = prevLabel;
+  }
+}
+
+versionArchiveAllEl.addEventListener("click", archiveAllVersions);
+
 async function createRun() {
   const name = window.prompt(
     "New run name (e.g. iteration14, ab_test_v3):",
@@ -3730,9 +3837,9 @@ async function createRun() {
 
 function switchView(slotId, modelAlias) {
   // Common path for both slot and model switches: tear down the current
-  // SSE + scene, persist the new selection, and either subscribe (if the
-  // cell is running/done) or set status to "idle/paused/error — click
-  // start" (handled via slotNeedsResume).
+  // SSE + scene, persist the new selection, and load the cell (scene +
+  // log backfill) unless it's idle. Error/paused cells still load so the
+  // log panel shows what happened; slotNeedsResume drives retry/resume UI.
   if (currentSource) {
     currentSource.close();
     currentSource = null;
@@ -3756,12 +3863,19 @@ function switchView(slotId, modelAlias) {
   renderSlotTabs();
   updateResumeButton();
   const cellLabel = `${slotId} · ${modelAlias}`;
-  if (slotNeedsResume) {
-    setStatus(`slot :: ${cellLabel} — ${status}`);
+  if (status === "idle") {
+    setStatus(`slot :: ${cellLabel} — idle`);
   } else {
-    setStatus(`slot :: ${cellLabel}`);
+    if (slotNeedsResume) {
+      setStatus(`slot :: ${cellLabel} — ${status}`);
+    } else {
+      setStatus(`slot :: ${cellLabel}`);
+    }
+    // Error/paused cells still have an events.jsonl — load scene + backfill
+    // logs so switching to a failed run shows what went wrong.
     loadCellScene(slotId, modelAlias);
   }
+  syncActiveTab();
 }
 
 function switchSlot(id) {
@@ -3775,33 +3889,201 @@ function switchModel(alias) {
   switchView(currentSlotId, alias);
 }
 
-function slotEventsUrl(slotId, model) {
+// --- run tab bar -------------------------------------------------------------
+
+function nextTabId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+}
+
+function runExists(run) {
+  return availableRuns.some((r) => r.name === run);
+}
+
+function persistTabs() {
+  try {
+    localStorage.setItem(
+      TABS_STORAGE_KEY,
+      JSON.stringify({ tabs: openTabs, active: activeTabId }),
+    );
+  } catch {}
+}
+
+// Pull the loaded run/slot/model back onto the active tab so the pickers,
+// version bar, slot bar, and model picker all "edit" whichever tab is open.
+// Called at the tail of switchView (the single choke point for run/slot/model
+// changes), so every selection path keeps the tab + its label in sync.
+function syncActiveTab() {
+  const tab = openTabs.find((t) => t.id === activeTabId);
+  if (!tab) return;
+  tab.run = currentRun;
+  tab.slot = currentSlotId;
+  tab.model = currentModel;
+  persistTabs();
+  renderTabBar();
+  // Keep the run picker + version highlight reflecting the active tab's run
+  // immediately (otherwise they'd lag until the next refresh poll).
+  if (currentRun && runPickerEl.value !== currentRun) {
+    runPickerEl.value = currentRun;
+  }
+  renderVersionBar();
+}
+
+function renderTabBar() {
+  if (!runTabsBarEl) return;
+  for (const el of Array.from(runTabsBarEl.querySelectorAll(".run-tab"))) {
+    el.remove();
+  }
+  for (const tab of openTabs) {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "run-tab" + (tab.id === activeTabId ? " active" : "");
+    btn.title = `${tab.run} · ${tab.slot ?? "—"} · ${tab.model ?? "—"}`;
+
+    const label = document.createElement("span");
+    label.className = "rt-label";
+    label.textContent = tab.run ?? "(run)";
+    btn.appendChild(label);
+
+    const subText = [tab.slot, tab.model].filter(Boolean).join(" · ");
+    if (subText) {
+      const sub = document.createElement("span");
+      sub.className = "rt-sub";
+      sub.textContent = subText;
+      btn.appendChild(sub);
+    }
+
+    btn.addEventListener("click", () => activateTab(tab.id));
+
+    // The last tab can't be closed — there's always one open view.
+    if (openTabs.length > 1) {
+      const close = document.createElement("span");
+      close.className = "run-tab-close";
+      close.textContent = "×";
+      close.title = "Close this tab";
+      close.addEventListener("click", (ev) => {
+        ev.stopPropagation();
+        closeTab(tab.id);
+      });
+      btn.appendChild(close);
+    }
+
+    runTabsBarEl.insertBefore(btn, runTabAddEl);
+  }
+}
+
+// Make `id` the active tab and load its (run, slot, model) into the canvas.
+// Reuses the existing switch machinery: a different run goes through switchRun
+// (activate + teardown + reload); a same-run/different-cell tab swaps via
+// switchView; an identical view (e.g. a freshly duplicated tab) is a no-op.
+async function activateTab(id) {
+  const tab = openTabs.find((t) => t.id === id);
+  if (!tab) return;
+  activeTabId = id;
+  const wantSlot = tab.slot ?? currentSlotId ?? slotSummaries[0]?.id ?? null;
+  const wantModel =
+    tab.model ?? currentModel ?? defaultModelAlias ?? availableModels[0] ?? null;
+  renderTabBar();
+
+  if (tab.run === currentRun && wantSlot === currentSlotId && wantModel === currentModel) {
+    syncActiveTab();
+    return;
+  }
+  if (tab.run !== currentRun) {
+    // Pre-seed the cell so switchRun's trailing switchView targets it.
+    currentSlotId = wantSlot;
+    currentModel = wantModel;
+    await switchRun(tab.run);
+  } else {
+    switchView(wantSlot, wantModel);
+  }
+}
+
+// Open a new tab cloning the active view; the user then retargets its run via
+// the run picker / version bar to compare against the original.
+function addTab() {
+  const base = openTabs.find((t) => t.id === activeTabId);
+  const tab = {
+    id: nextTabId(),
+    run: base?.run ?? currentRun,
+    slot: base?.slot ?? currentSlotId,
+    model: base?.model ?? currentModel,
+  };
+  openTabs.push(tab);
+  activateTab(tab.id);
+}
+
+function closeTab(id) {
+  if (openTabs.length <= 1) return;
+  const idx = openTabs.findIndex((t) => t.id === id);
+  if (idx === -1) return;
+  const wasActive = id === activeTabId;
+  openTabs.splice(idx, 1);
+  if (wasActive) {
+    const next = openTabs[Math.min(idx, openTabs.length - 1)];
+    activateTab(next.id);
+  } else {
+    persistTabs();
+    renderTabBar();
+  }
+}
+
+// Restore persisted tabs on boot, dropping any whose run no longer exists.
+// Returns null when there's nothing valid to restore (first run, or all runs
+// deleted) so the caller seeds a fresh single tab.
+function loadSavedTabs() {
+  let raw = null;
+  try { raw = localStorage.getItem(TABS_STORAGE_KEY); } catch {}
+  if (!raw) return null;
+  let parsed;
+  try { parsed = JSON.parse(raw); } catch { return null; }
+  // Drop tabs whose run is gone; repair a slot/model the server no longer
+  // reports to null so the loader falls back to a valid default.
+  const tabs = (parsed?.tabs ?? [])
+    .filter((t) => t && typeof t.run === "string" && runExists(t.run))
+    .map((t) => ({
+      id: typeof t.id === "string" ? t.id : nextTabId(),
+      run: t.run,
+      slot: slotSummaries.some((s) => s.id === t.slot) ? t.slot : null,
+      model: availableModels.includes(t.model) ? t.model : null,
+    }));
+  if (tabs.length === 0) return null;
+  return { tabs, active: parsed.active };
+}
+
+runTabAddEl.addEventListener("click", addTab);
+
+// Every cell request names its run/version explicitly so the three
+// concurrently-running versions can't bleed into one another through a shared
+// server-side selector. `run` defaults to the viewed run; the start picker
+// passes other versions' run names to drive their cells in the background.
+function slotEventsUrl(slotId, model, run = currentRun) {
   return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events`,
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events?run=${encodeURIComponent(run)}`,
     SERVER_URL,
   ).toString();
 }
 
-function slotMeshesUrl(slotId, model) {
+function slotMeshesUrl(slotId, model, run = currentRun) {
   return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes`,
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}`,
     SERVER_URL,
   ).toString();
 }
 
-function slotSceneUrl(slotId, model) {
+function slotSceneUrl(slotId, model, run = currentRun) {
   return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene`,
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene?run=${encodeURIComponent(run)}`,
     SERVER_URL,
   ).toString();
 }
 
 // The full event log on disk, served by the /artifacts static mount. Used to
 // backfill the side panels (log / observability / gif) in the background after
-// the scene is already painted from /scene — no SSE replay.
-function historyUrl(slotId, model) {
+// the scene is already painted from /scene — no SSE replay. Artifacts are
+// genuinely path-scoped by run, so this already isolates per version.
+function historyUrl(slotId, model, run = currentRun) {
   return new URL(
-    `/artifacts/${encodeURIComponent(currentRun)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events.jsonl`,
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events.jsonl`,
     SERVER_URL,
   ).toString();
 }
@@ -3817,7 +4099,7 @@ async function resetSlot(id, model, skipConfirm = false) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/reset`,
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/reset?run=${encodeURIComponent(currentRun)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -3904,6 +4186,12 @@ function applySceneProjection(nodes) {
     };
     if (n.plan != null) patch.plan = n.plan;
     if (n.image_prompt != null) patch.imagePrompt = n.image_prompt;
+    // Mirror the live `dispatch` "bbox" handler so renderTreeDetail's
+    // origin/size/proxy rows render the same whether the cell was opened
+    // from /scene or watched live over SSE.
+    if (n.origin != null) patch.origin = n.origin;
+    if (n.dimensions != null) patch.dimensions = n.dimensions;
+    if (n.proxy_shape != null) patch.proxyShape = n.proxy_shape;
     treeUpsert(n.id, patch);
     if (n.origin && n.dimensions) {
       loadBbox({
@@ -3924,12 +4212,12 @@ function applySceneProjection(nodes) {
     }
     if (n.phase) {
       // Set phase directly (not treeSetPhase) to skip its per-call render/focus
-      // churn across hundreds of nodes; the single renderTree() below covers all.
+      // churn across hundreds of nodes; the single scheduleRenderTree() below covers all.
       const cur = treeNodes.get(n.id);
       if (cur) cur.phase = n.phase;
     }
   }
-  renderTree();
+  scheduleRenderTree();
 }
 
 // Panel-only consumer for the background history load: feeds the gif buffer,
@@ -3995,13 +4283,17 @@ async function loadCellScene(slotId, model, { forceLive = false } = {}) {
     // Active run (or just reset/resumed): tail only the events past the
     // projection cut. forceLive bypasses the status check, which is racy right
     // after a POST flips the run to running.
-    subscribe(`${slotEventsUrl(slotId, model)}?since=${highestEventIndex}`);
+    subscribe(`${slotEventsUrl(slotId, model)}&since=${highestEventIndex}`);
   } else {
     // Finished cell: no live stream. Mark the run done so post-run mesh retries
-    // refresh the status line correctly.
+    // refresh the status line correctly. Error/paused keep the status line
+    // switchView already set — backfill will populate the log panel.
     runFinished = true;
-    if (meshErrors.size > 0) showRunCompleteWithErrors();
-    else setStatus("run complete");
+    const status = currentRunInfo()?.status;
+    if (status !== "error" && status !== "paused") {
+      if (meshErrors.size > 0) showRunCompleteWithErrors();
+      else setStatus("run complete");
+    }
   }
 
   backfillHistoryInBackground(slotId, model, gen);
@@ -4027,7 +4319,7 @@ async function rewindTo(index) {
   try {
     res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind?run=${encodeURIComponent(currentRun)}`,
         SERVER_URL,
       ),
       {
@@ -4057,13 +4349,13 @@ resetEl.addEventListener("click", () => {
 });
 
 async function resetAll() {
-  // Wipe + restart every started cell on the current run, fanned out across
-  // all slots × all models. Mirrors resumeAll's fan-out, but reset deletes a
-  // cell's events + artifacts before restarting it, so we only touch cells
-  // that have data (events_count > 0) — the run is a 14×6 matrix and one
-  // click should not spawn 80+ fresh pipelines for never-run cells. The
-  // viewed cell routes through resetSlot (skipping its own confirm) so its
-  // scene + SSE rewire to the fresh run; the rest just get the POST.
+  // Wipe every started cell on the current run back to IDLE — fanned out
+  // across all slots × all models — WITHOUT restarting anything. We only touch
+  // cells that have data (events_count > 0); never-run cells are already idle.
+  // Reset no longer implies "start": the user then opens "start cells…" and
+  // launches exactly the (version, slot, model) cells they want, so one click
+  // can't spawn dozens of pipelines.
+  const run = currentRun;
   const cells = [];
   for (const s of slotSummaries) {
     for (const model of availableModels) {
@@ -4073,42 +4365,62 @@ async function resetAll() {
     }
   }
   if (cells.length === 0) {
-    setStatus(`no started cells to reset on run "${currentRun}"`);
+    setStatus(`no started cells to reset on run "${run}"`);
     return;
   }
   const ok = window.confirm(
-    `Wipe and restart ${cells.length} started cell(s) across all models on run "${currentRun}"?\n\nThis permanently deletes their generated meshes + event logs.`,
+    `Wipe ${cells.length} started cell(s) across all models on run "${run}" back to idle?\n\nThis permanently deletes their generated meshes + event logs. Nothing is restarted — use "start cells…" to launch the ones you want.`,
   );
   if (!ok) return;
   resetAllEl.disabled = true;
   try {
-    const tasks = cells.map((c) => {
-      if (c.id === currentSlotId && c.model === currentModel) {
-        // Viewed cell — clear scene + rewire SSE via the existing helper.
-        return resetSlot(c.id, c.model, true);
+    const viewedReset = cells.some(
+      (c) => c.id === currentSlotId && c.model === currentModel,
+    );
+    const results = await Promise.all(
+      cells.map((c) =>
+        fetch(
+          new URL(
+            `/slots/${encodeURIComponent(c.id)}/${encodeURIComponent(c.model)}/reset?run=${encodeURIComponent(run)}&start=false`,
+            SERVER_URL,
+          ),
+          { method: "POST" },
+        )
+          .then((r) => ({ cell: `${c.id}·${c.model}`, ok: r.ok }))
+          .catch(() => ({ cell: `${c.id}·${c.model}`, ok: false })),
+      ),
+    );
+    if (viewedReset) {
+      // The on-screen cell is now an empty idle cell — tear its scene down so
+      // it doesn't keep showing stale meshes from the wiped run.
+      if (currentSource) {
+        currentSource.close();
+        currentSource = null;
       }
-      return fetch(
-        new URL(
-          `/slots/${encodeURIComponent(c.id)}/${encodeURIComponent(c.model)}/reset`,
-          SERVER_URL,
-        ),
-        { method: "POST" },
-      ).then((r) => ({ cell: `${c.id}·${c.model}`, ok: r.ok, status: r.status }));
-    });
-    const results = await Promise.all(tasks);
+      clearScene();
+      clearLog();
+      clearAssets();
+      treeClear();
+      clearMeshErrors();
+      highestEventIndex = -1;
+      recordedEvents.length = 0;
+      updateReplayButton();
+      slotNeedsResume = false;
+    }
     const failures = results.filter((r) => r && r.ok === false);
     if (failures.length > 0) {
       const names = failures.map((f) => f.cell).join(", ");
       setStatus(
-        `reset all on "${currentRun}": ${cells.length - failures.length} ok, ${failures.length} failed (${names})`,
+        `reset all on "${run}": ${cells.length - failures.length} ok, ${failures.length} failed (${names})`,
         "err",
       );
     } else {
       setStatus(
-        `reset ${cells.length} cell${cells.length === 1 ? "" : "s"} on run "${currentRun}" — restarting…`,
+        `reset ${cells.length} cell${cells.length === 1 ? "" : "s"} on "${run}" to idle — pick cells to start`,
       );
     }
-    refreshSlots();
+    await refreshSlots();
+    refreshVersions();
   } catch (e) {
     setStatus(`reset all failed: ${e.message}`, "err");
   } finally {
@@ -4117,6 +4429,179 @@ async function resetAll() {
 }
 
 resetAllEl.addEventListener("click", resetAll);
+
+// --- start picker: launch exactly the chosen version × model × slot cells ---
+//
+// "reset all" wipes cells to idle without starting them; this is how you then
+// start precisely the cells you want. The three checkbox groups are
+// independent and the launch set is their cross product. Cells that are
+// already running/done are skipped server-side (resume returns 400/409), so
+// over-selecting is harmless.
+
+function startCheckedValues(containerEl) {
+  return Array.from(
+    containerEl.querySelectorAll("input[type=checkbox]:checked"),
+  ).map((cb) => cb.value);
+}
+
+function updateStartCount() {
+  const v = startCheckedValues(startVersionsEl).length;
+  const m = startCheckedValues(startModelsEl).length;
+  const s = startCheckedValues(startSlotsEl).length;
+  const n = v * m * s;
+  startModalCountEl.textContent =
+    `${n} cell${n === 1 ? "" : "s"} — ${v} version${v === 1 ? "" : "s"} × ${m} model${m === 1 ? "" : "s"} × ${s} slot${s === 1 ? "" : "s"}`;
+  startModalGoEl.disabled = n === 0;
+  startModalGoEl.textContent = n === 0 ? "start selected" : `start ${n} cell${n === 1 ? "" : "s"}`;
+}
+
+function buildStartOptions(containerEl, items) {
+  containerEl.innerHTML = "";
+  for (const it of items) {
+    const label = document.createElement("label");
+    label.className = "start-opt";
+    label.title = it.title ?? "";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.value = it.value;
+    cb.checked = !!it.checked;
+    cb.addEventListener("change", updateStartCount);
+    const text = document.createElement("span");
+    text.textContent = it.label;
+    label.append(cb, text);
+    containerEl.appendChild(label);
+  }
+}
+
+function openStartModal() {
+  if (
+    availableVersions.length === 0 ||
+    availableModels.length === 0 ||
+    slotSummaries.length === 0
+  ) {
+    setStatus("nothing to start yet — versions/models/slots not loaded", "warn");
+    return;
+  }
+  // Default to the version + model you're currently viewing, with no slots
+  // pre-checked so the count starts at 0 and you opt slots in deliberately.
+  buildStartOptions(
+    startVersionsEl,
+    availableVersions.map((ver) => ({
+      value: ver.run_name,
+      label: ver.label ?? ver.run_name,
+      checked: ver.run_name === currentRun,
+    })),
+  );
+  buildStartOptions(
+    startModelsEl,
+    availableModels.map((m) => ({ value: m, label: m, checked: m === currentModel })),
+  );
+  buildStartOptions(
+    startSlotsEl,
+    slotSummaries.map((s) => ({
+      value: s.id,
+      label: s.id,
+      title: s.prompt ?? "",
+      checked: false,
+    })),
+  );
+  updateStartCount();
+  startModalEl.classList.add("open");
+}
+
+function closeStartModal() {
+  startModalEl.classList.remove("open");
+}
+
+async function startSelectedCells() {
+  const runs = startCheckedValues(startVersionsEl);
+  const models = startCheckedValues(startModelsEl);
+  const slots = startCheckedValues(startSlotsEl);
+  const cells = [];
+  for (const run of runs) {
+    for (const slot of slots) {
+      for (const model of models) cells.push({ run, slot, model });
+    }
+  }
+  if (cells.length === 0) return;
+  startModalGoEl.disabled = true;
+  try {
+    const results = await Promise.all(
+      cells.map((c) =>
+        fetch(
+          new URL(
+            `/slots/${encodeURIComponent(c.slot)}/${encodeURIComponent(c.model)}/resume?run=${encodeURIComponent(c.run)}`,
+            SERVER_URL,
+          ),
+          { method: "POST" },
+        )
+          .then((r) => ({ ...c, ok: r.ok }))
+          .catch(() => ({ ...c, ok: false })),
+      ),
+    );
+    const started = results.filter((r) => r.ok).length;
+    const skipped = results.length - started;
+    setStatus(
+      `started ${started}/${results.length} cell${results.length === 1 ? "" : "s"}` +
+        (skipped ? ` — ${skipped} skipped (already running/done)` : ""),
+    );
+    const viewedStarted = cells.some(
+      (c) =>
+        c.run === currentRun &&
+        c.slot === currentSlotId &&
+        c.model === currentModel,
+    );
+    closeStartModal();
+    if (viewedStarted) {
+      // The viewed cell just started — rewire its scene + SSE so it streams
+      // live instead of waiting for the next manual reselect.
+      if (currentSource) {
+        currentSource.close();
+        currentSource = null;
+      }
+      clearScene();
+      clearLog();
+      clearAssets();
+      treeClear();
+      clearMeshErrors();
+      highestEventIndex = -1;
+      recordedEvents.length = 0;
+      updateReplayButton();
+      slotNeedsResume = false;
+      loadCellScene(currentSlotId, currentModel, { forceLive: true });
+    }
+    await refreshSlots();
+    refreshVersions();
+  } finally {
+    startModalGoEl.disabled = false;
+    updateStartCount();
+  }
+}
+
+startCellsEl.addEventListener("click", openStartModal);
+startModalGoEl.addEventListener("click", startSelectedCells);
+startModalCloseEl.addEventListener("click", closeStartModal);
+startModalEl.addEventListener("click", (ev) => {
+  // Click on the dimmed backdrop (outside the panel) closes.
+  if (ev.target === startModalEl) closeStartModal();
+  // Select-all / -none chips in each column header.
+  const bulk = ev.target.closest("[data-start-bulk]");
+  if (bulk) {
+    const container = document.getElementById(bulk.dataset.startTarget);
+    if (container) {
+      const check = bulk.dataset.startBulk === "all";
+      for (const cb of container.querySelectorAll("input[type=checkbox]")) {
+        cb.checked = check;
+      }
+      updateStartCount();
+    }
+  }
+});
+document.addEventListener("keydown", (ev) => {
+  if (ev.key === "Escape" && startModalEl.classList.contains("open")) {
+    closeStartModal();
+  }
+});
 
 modelPickerEl.addEventListener("change", () => {
   switchModel(modelPickerEl.value);
@@ -4205,7 +4690,7 @@ async function resumeAll() {
       }
       return fetch(
         new URL(
-          `/slots/${encodeURIComponent(s.id)}/${encodeURIComponent(model)}/resume`,
+          `/slots/${encodeURIComponent(s.id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
           SERVER_URL,
         ),
         { method: "POST" },
@@ -4239,7 +4724,7 @@ async function resumeSlot(id, model) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/resume`,
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -4276,7 +4761,7 @@ async function pauseSlot(id, model) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/pause`,
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/pause?run=${encodeURIComponent(currentRun)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -4369,18 +4854,40 @@ exportGlbEl.addEventListener("click", async () => {
     availableModels.includes(savedModel)
       ? savedModel
       : (defaultModelAlias ?? availableModels[0]);
-  switchView(slotPick, modelPick);
-  await refreshVersions();
-  // Restore the last-viewed version (switches the active run if different).
-  let savedVersion = null;
-  try { savedVersion = localStorage.getItem(VERSION_STORAGE_KEY); } catch {}
-  if (
-    savedVersion &&
-    savedVersion !== currentRun &&
-    availableVersions.some((v) => v.run_name === savedVersion)
-  ) {
-    switchRun(savedVersion);
+
+  // Restore the open tabs (each pins a run + slot + model). First boot after
+  // this feature ships has none → seed a single tab, honoring the previously-
+  // remembered version run so existing users land where they left off.
+  const saved = loadSavedTabs();
+  if (saved) {
+    openTabs.push(...saved.tabs);
+    activeTabId = saved.tabs.some((t) => t.id === saved.active)
+      ? saved.active
+      : saved.tabs[0].id;
+  } else {
+    let savedVersion = null;
+    try { savedVersion = localStorage.getItem(VERSION_STORAGE_KEY); } catch {}
+    const initRun =
+      savedVersion && runExists(savedVersion) ? savedVersion : currentRun;
+    const tab = { id: nextTabId(), run: initRun, slot: slotPick, model: modelPick };
+    openTabs.push(tab);
+    activeTabId = tab.id;
   }
+  renderTabBar();
+
+  // Drive the initial canvas from the active tab.
+  const active = openTabs.find((t) => t.id === activeTabId);
+  const bootSlot = active.slot ?? slotPick;
+  const bootModel = active.model ?? modelPick;
+  if (active.run && active.run !== currentRun) {
+    // Pre-seed the cell so switchRun's trailing switchView targets it.
+    currentSlotId = bootSlot;
+    currentModel = bootModel;
+    await switchRun(active.run);
+  } else {
+    switchView(bootSlot, bootModel);
+  }
+  await refreshVersions();
 })();
 
 // Keep tab status dots + run list fresh — runs change less often, so a
@@ -4781,14 +5288,14 @@ function dispatchForReplay(event) {
         dimensions: event.dimensions,
         proxyShape: event.proxy_shape ?? null,
       });
-      renderTree();
+      scheduleRenderTree();
       break;
     case "divider.decompose":
     case "divider.zone_decompose":
       for (const c of event.children ?? []) {
         treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
       }
-      renderTree();
+      scheduleRenderTree();
       break;
     case "divider.zone_plan":
       if (event.node && typeof event.plan === "string") {
