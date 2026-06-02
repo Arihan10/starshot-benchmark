@@ -27,14 +27,13 @@ relationship validator on the single emitted spec.
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
 from pathlib import Path
 from typing import Any, Literal
 
 import trimesh
 
-from app.core import prompt_runtime
+from app.core import asset_modes, prompt_runtime
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
 from app.services import llm, nano_banana, threed
@@ -42,7 +41,22 @@ from app.utils import glb_place, logging
 from app.utils.geometry import rescale_mesh_to_bbox
 from app.utils.topology import validate_parents, validate_referenced_ids
 
-_USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
+
+def _objects_dir(runs_dir: Path, run_id: str, mode: str | None = None) -> Path:
+    """Per-cell mesh output dir for the given (or currently-bound) asset
+    mode: `objects/` for library, `objects-generated/` for generated. The
+    two modes coexist side by side under the same cell so a library build
+    and a generated build never clobber each other."""
+    return runs_dir / run_id / asset_modes.objects_subdir(mode)
+
+
+def _track_key(run_id: str, mode: str | None = None) -> str:
+    """Key for the in-flight `_pending` / `_admitted_ids` tables. A cell's
+    library and generated builds can run concurrently (start library, then
+    gate generated), so the table key carries the mode — otherwise a reset
+    of one mode would cancel the other's in-flight meshes."""
+    return f"{run_id}::{asset_modes.normalize(mode if mode is not None else asset_modes.current())}"
+
 
 # Guards the trimesh load -> rescale -> export block. API calls and GLB
 # downloads stay fully parallel across slots; only the RAM-heavy mesh
@@ -224,7 +238,7 @@ async def _resolve_and_generate(
     # we re-bill Banana + Trellis for every duplicate, since the artifact
     # cache key is the node id but the cache lookup races against
     # concurrent submissions.
-    admitted = _admitted_ids.setdefault(run_id, set())
+    admitted = _admitted_ids.setdefault(_track_key(run_id), set())
     placed_ids = {n.id for n in all_nodes}
     deduped: list[Any] = []
     seen_in_call: set[str] = set()
@@ -311,7 +325,7 @@ async def _resolve_and_generate(
             if b is not None:
                 bboxes[sid] = b
 
-    if _USE_ASSET_LIBRARY:
+    if asset_modes.uses_library():
         return await _match_library_assets(
             specs=specs,
             bboxes=bboxes,
@@ -386,7 +400,7 @@ async def _match_library_assets(
 ) -> list[Node]:
     from app.services import library
 
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = _objects_dir(runs_dir, run_id)
     objs_dir.mkdir(parents=True, exist_ok=True)
 
     resolved: list[Node] = []
@@ -607,11 +621,11 @@ async def _spawn_meshes(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
 ) -> list[Node]:
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = _objects_dir(runs_dir, run_id)
     objs_dir.mkdir(parents=True, exist_ok=True)
 
     out: list[Node] = []
-    pending = _pending.setdefault(run_id, [])
+    pending = _pending.setdefault(_track_key(run_id), [])
     for node in resolved:
         raw = objs_dir / f"{node.id}.raw.glb"
         path = objs_dir / f"{node.id}.glb"
@@ -642,6 +656,7 @@ async def retry_node(
     node: Node,
     runs_dir: Path,
     run_id: str,
+    mode: str | None = None,
 ) -> asyncio.Task[None]:
     """Standalone re-generation of a single failed mesh — always FRESH:
     every prior on-disk artifact for this node is unlinked so the
@@ -652,7 +667,7 @@ async def retry_node(
     doesn't get recycled. Registered on `_pending` so `cancel_pending`
     (slot reset / teardown) can tear it down alongside in-flight
     pipeline meshes."""
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = _objects_dir(runs_dir, run_id, mode)
     objs_dir.mkdir(parents=True, exist_ok=True)
     raw = objs_dir / f"{node.id}.raw.glb"
     path = objs_dir / f"{node.id}.glb"
@@ -670,25 +685,27 @@ async def retry_node(
             runs_dir=runs_dir,
         ),
     )
-    _pending.setdefault(run_id, []).append(task)
+    _pending.setdefault(_track_key(run_id, mode), []).append(task)
     return task
 
 
-async def await_pending(run_id: str) -> None:
+async def await_pending(run_id: str, mode: str | None = None) -> None:
     """Block until every background mesh task for this run has finished.
     Errors inside individual tasks were logged + swallowed by `_generate_one`,
     so this gather only waits — it never raises."""
-    tasks = _pending.pop(run_id, [])
-    _admitted_ids.pop(run_id, None)
+    key = _track_key(run_id, mode)
+    tasks = _pending.pop(key, [])
+    _admitted_ids.pop(key, None)
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def cancel_pending(run_id: str) -> None:
+def cancel_pending(run_id: str, mode: str | None = None) -> None:
     """Cancel any in-flight mesh tasks for this run. Called when the run
     itself is being torn down (cancellation or fatal error)."""
-    _admitted_ids.pop(run_id, None)
-    for t in _pending.pop(run_id, []):
+    key = _track_key(run_id, mode)
+    _admitted_ids.pop(key, None)
+    for t in _pending.pop(key, []):
         t.cancel()
 
 

@@ -2210,6 +2210,63 @@
                 border-color: #4a8fd8;
                 color: #e6e6e6;
             }
+            /* assets mode toggle (library ▸ generated) + the generate gate */
+            #asset-mode-toggle {
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #asset-mode-toggle:hover {
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            /* generated mode is the from-scratch (Nano-Banana + Trellis) path —
+               tint it the same purple the tree uses for generated objects. */
+            #asset-mode-toggle.generated {
+                background: #241a2c;
+                border-color: #5c3a64;
+                color: #d7a6e2;
+            }
+            #asset-mode-toggle.generated:hover {
+                border-color: #c586d1;
+                color: #f0d2f7;
+            }
+            #generate-gate {
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #6a3f86;
+                background: #2a1d33;
+                color: #e2b6f0;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #generate-gate:hover:not(:disabled) {
+                background: #3a2747;
+                border-color: #c586d1;
+                color: #f5e2fb;
+            }
+            #generate-gate:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            #generate-gate.regenerate {
+                border-color: #804040;
+                background: #2a1515;
+                color: #ff9a9a;
+            }
+            #generate-gate.regenerate:hover:not(:disabled) {
+                background: #3a2020;
+                border-color: #ff8080;
+                color: #ffbcbc;
+            }
         </style>
         <script type="importmap">
             {
@@ -2251,6 +2308,10 @@
                 <div class="ctrl-sep"></div>
                 <span class="ctrl-label">model</span>
                 <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
+                <div class="ctrl-sep"></div>
+                <span class="ctrl-label">assets</span>
+                <button id="asset-mode-toggle" type="button" title="Switch which asset source this cell shows. 'library' matches each object to the pre-built asset library (the default, stored in objects/). 'generated' shows the from-scratch Nano-Banana + Trellis build (stored in objects-generated/). Switching reloads the cell from that build's folder + event log; the two coexist.">assets: library</button>
+                <button id="generate-gate" type="button" style="display:none" title="Start the from-scratch asset generation (Nano-Banana + Trellis) for this cell. Reuses the library build's layout when one exists — same bounding boxes, freshly generated meshes — so it's an apples-to-apples comparison. This is the gate: generation only starts when you press it.">⚡ generate assets</button>
                 <button id="slot-resume" type="button" style="display:none">resume</button>
                 <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
                 <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>

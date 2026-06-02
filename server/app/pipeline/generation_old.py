@@ -27,21 +27,21 @@ relationship validator on the single emitted spec.
 from __future__ import annotations
 
 import asyncio
-import os
 import shutil
 from pathlib import Path
 from typing import Literal
 
 import trimesh
 
-_USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
-
 # Shared with `generation` so the RAM-heavy mesh decode is serialized
 # across ALL pipeline versions as a single global guard (not just within
 # this module). Guards the trimesh load -> rescale -> export block; API
-# calls and GLB downloads stay fully parallel across slots.
-from app.pipeline.generation import _MESH_IO
+# calls and GLB downloads stay fully parallel across slots. The per-cell
+# asset-mode helpers (objects dir + in-flight table key) are shared too so
+# V1 lands meshes in the same `objects/` vs `objects-generated/` split.
+from app.pipeline.generation import _MESH_IO, _objects_dir, _track_key
 
+from app.core import asset_modes
 from app.core.prompts_old import (
     BboxBatchOutput,
     ImagePromptOutput,
@@ -242,7 +242,7 @@ async def _resolve_and_generate(
     # we re-bill Banana + Trellis for every duplicate, since the artifact
     # cache key is the node id but the cache lookup races against
     # concurrent submissions.
-    admitted = _admitted_ids.setdefault(run_id, set())
+    admitted = _admitted_ids.setdefault(_track_key(run_id), set())
     placed_ids = {n.id for n in all_nodes}
     deduped: list[ObjectSpec] = []
     seen_in_call: set[str] = set()
@@ -315,7 +315,7 @@ async def _resolve_and_generate(
                 bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
             remaining.clear()
 
-    if _USE_ASSET_LIBRARY:
+    if asset_modes.uses_library():
         return await _match_library_assets(
             specs=specs, bboxes=bboxes, scenario=scenario,
             runs_dir=runs_dir, run_id=run_id,
@@ -379,7 +379,7 @@ async def _match_library_assets(
 ) -> list[Node]:
     from app.services import library
 
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = _objects_dir(runs_dir, run_id)
     objs_dir.mkdir(parents=True, exist_ok=True)
 
     resolved: list[Node] = []
@@ -571,11 +571,11 @@ async def _spawn_meshes(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
 ) -> list[Node]:
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = _objects_dir(runs_dir, run_id)
     objs_dir.mkdir(parents=True, exist_ok=True)
 
     out: list[Node] = []
-    pending = _pending.setdefault(run_id, [])
+    pending = _pending.setdefault(_track_key(run_id), [])
     for node in resolved:
         raw = objs_dir / f"{node.id}.raw.glb"
         path = objs_dir / f"{node.id}.glb"
@@ -602,6 +602,7 @@ async def retry_node(
     node: Node,
     runs_dir: Path,
     run_id: str,
+    mode: str | None = None,
 ) -> asyncio.Task[None]:
     """Standalone re-generation of a single failed mesh — always FRESH:
     every prior on-disk artifact for this node is unlinked so the
@@ -612,7 +613,7 @@ async def retry_node(
     doesn't get recycled. Registered on `_pending` so `cancel_pending`
     (slot reset / teardown) can tear it down alongside in-flight
     pipeline meshes."""
-    objs_dir = runs_dir / run_id / "objects"
+    objs_dir = _objects_dir(runs_dir, run_id, mode)
     objs_dir.mkdir(parents=True, exist_ok=True)
     raw = objs_dir / f"{node.id}.raw.glb"
     path = objs_dir / f"{node.id}.glb"
@@ -626,25 +627,27 @@ async def retry_node(
             node, raw=raw, path=path, image_stem=image_stem, runs_dir=runs_dir,
         ),
     )
-    _pending.setdefault(run_id, []).append(task)
+    _pending.setdefault(_track_key(run_id, mode), []).append(task)
     return task
 
 
-async def await_pending(run_id: str) -> None:
+async def await_pending(run_id: str, mode: str | None = None) -> None:
     """Block until every background mesh task for this run has finished.
     Errors inside individual tasks were logged + swallowed by `_generate_one`,
     so this gather only waits — it never raises."""
-    tasks = _pending.pop(run_id, [])
-    _admitted_ids.pop(run_id, None)
+    key = _track_key(run_id, mode)
+    tasks = _pending.pop(key, [])
+    _admitted_ids.pop(key, None)
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-def cancel_pending(run_id: str) -> None:
+def cancel_pending(run_id: str, mode: str | None = None) -> None:
     """Cancel any in-flight mesh tasks for this run. Called when the run
     itself is being torn down (cancellation or fatal error)."""
-    _admitted_ids.pop(run_id, None)
-    for t in _pending.pop(run_id, []):
+    key = _track_key(run_id, mode)
+    _admitted_ids.pop(key, None)
+    for t in _pending.pop(key, []):
         t.cancel()
 
 

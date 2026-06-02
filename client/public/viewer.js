@@ -19,6 +19,7 @@ const SELECT_MODE_STORAGE_KEY = "starshot.selectMode";
 const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 const GRID_VISIBLE_STORAGE_KEY = "starshot.gridVisible";
 const TABS_STORAGE_KEY = "starshot.openTabs";
+const ASSET_MODE_STORAGE_KEY = "starshot.assetMode";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
@@ -29,6 +30,8 @@ const controlsBarEl = document.getElementById("controls-bar");
 const controlsBarToggleEl = document.getElementById("controls-bar-toggle");
 const resetEl = document.getElementById("slot-reset");
 const resumeEl = document.getElementById("slot-resume");
+const assetModeToggleEl = document.getElementById("asset-mode-toggle");
+const generateGateEl = document.getElementById("generate-gate");
 const modelPickerEl = document.getElementById("model-picker");
 const runPickerEl = document.getElementById("run-picker");
 const runTabsBarEl = document.getElementById("run-tabs-bar");
@@ -323,7 +326,7 @@ async function retryMesh(id) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&mode=${encodeURIComponent(currentAssetMode)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -3482,6 +3485,20 @@ let currentSource = null;
 let currentSlotId = null;
 let currentModel = null;
 let currentRun = null;
+// Which build of the current cell the canvas shows: "library" (LLM-matched
+// pre-built assets, the default, served from objects/) or "generated"
+// (from-scratch Nano-Banana + Trellis, served from objects-generated/). A
+// global view preference (persisted) — every cell request carries it as
+// `?mode=`. The two builds coexist server-side; switching just re-points the
+// canvas at the other build's event log + folder.
+let currentAssetMode = (() => {
+  try {
+    const m = localStorage.getItem(ASSET_MODE_STORAGE_KEY);
+    return m === "generated" ? "generated" : "library";
+  } catch {
+    return "library";
+  }
+})();
 let availableModels = [];
 let availableRuns = [];  // [{name, modified_at, has_prompt_snapshot}, ...]
 let availableVersions = [];  // [{id, run_name, label, status}, ...] from GET /versions
@@ -3543,9 +3560,33 @@ function populateModelPicker() {
 
 function updateResumeButton() {
   const status = currentRunInfo()?.status;
+  const generated = currentAssetMode === "generated";
   resumeEl.className = "";
   resumeEl.style.display = "none";
+  // The gate is the explicit trigger for the from-scratch (Nano-Banana +
+  // Trellis) build: it shows ONLY in generated mode for a cell with no build
+  // yet. Once a generated build exists (running/paused/error/done), the normal
+  // resume/pause/retry button drives it — so generation is never started
+  // except by pressing the gate.
+  if (generateGateEl) {
+    const showGate = generated && status === "idle";
+    generateGateEl.style.display = showGate ? "" : "none";
+    if (showGate) {
+      // Asset regeneration is only allowed once the library scene is finished
+      // (it reuses that completed layout). library_status rides on the /slots
+      // summary, so we can gate without a second poll.
+      const libDone = currentRunInfo()?.library_status === "done";
+      generateGateEl.disabled = !libDone;
+      generateGateEl.title = libDone
+        ? "Generate from-scratch assets (Nano-Banana + Trellis), reusing the finished library layout — same bounding boxes, freshly generated meshes."
+        : "Finish the library build first — generation reuses its completed layout (the library build isn't done yet).";
+    }
+  }
   if (status === "idle") {
+    if (generated) {
+      // Gate owns starting in generated mode — suppress the plain "start".
+      return;
+    }
     resumeEl.style.display = "";
     resumeEl.className = "paused";
     resumeEl.textContent = "start";
@@ -3579,6 +3620,7 @@ async function refreshSlots() {
     // global — otherwise another tab/version flips our dots out from under us.
     const url = new URL("/slots", SERVER_URL);
     if (currentRun) url.searchParams.set("run", currentRun);
+    url.searchParams.set("mode", currentAssetMode);
     const res = await fetch(url);
     if (!res.ok) return;
     const payload = await res.json();
@@ -3706,6 +3748,7 @@ async function refreshVersions() {
     const url = new URL("/versions", SERVER_URL);
     if (currentSlotId) url.searchParams.set("slot", currentSlotId);
     if (currentModel) url.searchParams.set("model", currentModel);
+    url.searchParams.set("mode", currentAssetMode);
     const res = await fetch(url);
     if (!res.ok) return;
     const payload = await res.json();
@@ -4058,21 +4101,21 @@ runTabAddEl.addEventListener("click", addTab);
 // passes other versions' run names to drive their cells in the background.
 function slotEventsUrl(slotId, model, run = currentRun) {
   return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events?run=${encodeURIComponent(run)}`,
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events?run=${encodeURIComponent(run)}&mode=${encodeURIComponent(currentAssetMode)}`,
     SERVER_URL,
   ).toString();
 }
 
 function slotMeshesUrl(slotId, model, run = currentRun) {
   return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}`,
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}&mode=${encodeURIComponent(currentAssetMode)}`,
     SERVER_URL,
   ).toString();
 }
 
 function slotSceneUrl(slotId, model, run = currentRun) {
   return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene?run=${encodeURIComponent(run)}`,
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene?run=${encodeURIComponent(run)}&mode=${encodeURIComponent(currentAssetMode)}`,
     SERVER_URL,
   ).toString();
 }
@@ -4082,8 +4125,13 @@ function slotSceneUrl(slotId, model, run = currentRun) {
 // the scene is already painted from /scene — no SSE replay. Artifacts are
 // genuinely path-scoped by run, so this already isolates per version.
 function historyUrl(slotId, model, run = currentRun) {
+  // The generated build keeps its log in events.generated.jsonl alongside the
+  // library build's events.jsonl, so the static-mount backfill must name the
+  // mode's file.
+  const file =
+    currentAssetMode === "generated" ? "events.generated.jsonl" : "events.jsonl";
   return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events.jsonl`,
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/${file}`,
     SERVER_URL,
   ).toString();
 }
@@ -4091,7 +4139,8 @@ function historyUrl(slotId, model, run = currentRun) {
 async function resetSlot(id, model, skipConfirm = false) {
   if (!skipConfirm) {
     const ok = window.confirm(
-      `Wipe runs/${id}/${model}/ and restart the pipeline for this cell?`,
+      `Wipe the ${currentAssetMode} build of ${id} · ${model} and restart the ` +
+        `pipeline? The other build is kept.`,
     );
     if (!ok) return;
   }
@@ -4099,7 +4148,7 @@ async function resetSlot(id, model, skipConfirm = false) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/reset?run=${encodeURIComponent(currentRun)}`,
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/reset?run=${encodeURIComponent(currentRun)}&mode=${encodeURIComponent(currentAssetMode)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -4319,7 +4368,7 @@ async function rewindTo(index) {
   try {
     res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind?run=${encodeURIComponent(currentRun)}`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind?run=${encodeURIComponent(currentRun)}&mode=${encodeURIComponent(currentAssetMode)}`,
         SERVER_URL,
       ),
       {
@@ -4381,7 +4430,7 @@ async function resetAll() {
       cells.map((c) =>
         fetch(
           new URL(
-            `/slots/${encodeURIComponent(c.id)}/${encodeURIComponent(c.model)}/reset?run=${encodeURIComponent(run)}&start=false`,
+            `/slots/${encodeURIComponent(c.id)}/${encodeURIComponent(c.model)}/reset?run=${encodeURIComponent(run)}&start=false&mode=${encodeURIComponent(currentAssetMode)}`,
             SERVER_URL,
           ),
           { method: "POST" },
@@ -4530,7 +4579,7 @@ async function startSelectedCells() {
       cells.map((c) =>
         fetch(
           new URL(
-            `/slots/${encodeURIComponent(c.slot)}/${encodeURIComponent(c.model)}/resume?run=${encodeURIComponent(c.run)}`,
+            `/slots/${encodeURIComponent(c.slot)}/${encodeURIComponent(c.model)}/resume?run=${encodeURIComponent(c.run)}&mode=${encodeURIComponent(currentAssetMode)}`,
             SERVER_URL,
           ),
           { method: "POST" },
@@ -4690,7 +4739,7 @@ async function resumeAll() {
       }
       return fetch(
         new URL(
-          `/slots/${encodeURIComponent(s.id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
+          `/slots/${encodeURIComponent(s.id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}&mode=${encodeURIComponent(currentAssetMode)}`,
           SERVER_URL,
         ),
         { method: "POST" },
@@ -4724,7 +4773,7 @@ async function resumeSlot(id, model) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}&mode=${encodeURIComponent(currentAssetMode)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -4761,7 +4810,7 @@ async function pauseSlot(id, model) {
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/pause?run=${encodeURIComponent(currentRun)}`,
+        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/pause?run=${encodeURIComponent(currentRun)}&mode=${encodeURIComponent(currentAssetMode)}`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -4788,6 +4837,84 @@ resumeEl.addEventListener("click", () => {
     resumeSlot(currentSlotId, currentModel);
   }
 });
+
+// --- asset mode: library ▸ generated -----------------------------------------
+//
+// A global view toggle. Each cell holds two coexisting builds — the LLM-matched
+// library build (objects/) and the from-scratch generated build
+// (objects-generated/). Flipping the toggle re-points every cell request at the
+// other build's event log + folder; the generated build is only ever STARTED
+// via the gate button, never implicitly.
+
+// Bulk launchers act on the library build only (generation is gated per cell),
+// so remember their tooltips to restore when leaving generated mode.
+for (const el of [resumeAllEl, resetAllEl, startCellsEl, versionLaunchAllEl]) {
+  if (el) el.dataset.baseTitle = el.title;
+}
+
+function applyAssetModeUI() {
+  const generated = currentAssetMode === "generated";
+  if (assetModeToggleEl) {
+    assetModeToggleEl.textContent = `assets: ${currentAssetMode}`;
+    assetModeToggleEl.classList.toggle("generated", generated);
+  }
+  // Bulk launchers can't be aimed at the generated builds (that would bypass
+  // the per-cell gate), so disable them in generated view to keep them from
+  // acting on the library builds while the dots show generated statuses.
+  for (const el of [resumeAllEl, resetAllEl, startCellsEl, versionLaunchAllEl]) {
+    if (!el) continue;
+    el.disabled = generated;
+    el.title = generated
+      ? "Disabled in generated view — bulk start/reset act on the library build; use ⚡ generate per cell"
+      : (el.dataset.baseTitle ?? el.title);
+  }
+}
+
+async function setAssetMode(mode) {
+  if (mode !== "library" && mode !== "generated") return;
+  if (mode === currentAssetMode) return;
+  currentAssetMode = mode;
+  try { localStorage.setItem(ASSET_MODE_STORAGE_KEY, mode); } catch {}
+  applyAssetModeUI();
+  // Pull statuses for the new build first so currentRunInfo()/the dots reflect
+  // it, then repaint the canvas from that build's log + mesh folder.
+  await refreshSlots();
+  if (currentSlotId !== null && currentModel !== null) {
+    switchView(currentSlotId, currentModel);
+  }
+  refreshVersions();
+}
+
+assetModeToggleEl?.addEventListener("click", () => {
+  setAssetMode(currentAssetMode === "library" ? "generated" : "library");
+});
+
+// The gate: the additional, deliberate press that kicks off from-scratch asset
+// generation for the viewed cell. Routes through resumeSlot, which POSTs
+// /resume?mode=generated — server-side that seeds the library layout (so the
+// bboxes are reused and only the meshes are regenerated) and starts the run.
+async function startGeneratedAssets() {
+  if (currentSlotId === null || currentModel === null) return;
+  // Only regenerate from a finished scene — the server enforces this too; this
+  // is the friendly client-side stop so the disabled button can't be bypassed.
+  if (currentRunInfo()?.library_status !== "done") {
+    setStatus("finish the library build before generating assets", "warn");
+    return;
+  }
+  const ok = window.confirm(
+    `Generate assets from scratch for ${currentSlotId} · ${currentModel}?\n\n` +
+      `Runs the Nano-Banana + Trellis pipeline into objects-generated/, reusing ` +
+      `the finished library build's layout (same bounding boxes). This costs API ` +
+      `calls and can take a while.`,
+  );
+  if (!ok) return;
+  if (generateGateEl) generateGateEl.disabled = true;
+  resumeSlot(currentSlotId, currentModel);
+}
+
+generateGateEl?.addEventListener("click", startGeneratedAssets);
+
+applyAssetModeUI();
 
 document.getElementById("zoom-in").addEventListener("click", () => _dolly(0.8));
 document.getElementById("zoom-out").addEventListener("click", () => _dolly(1.25));

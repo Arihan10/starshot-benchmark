@@ -37,7 +37,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app.core import prompt_runtime
+from app.core import asset_modes, prompt_runtime
 from app.core.slots import (
     DEFAULT_MODEL_ALIAS,
     MODEL_ALIASES,
@@ -71,9 +71,12 @@ _ARTIFACT_MEDIA_TYPES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json"
 PROMPTS_SOURCE = Path(__file__).resolve().parent.parent / "core" / "prompts.py"
 PROMPT_SNAPSHOT_NAME = "prompts_snapshot.py"
 
-# Keyed by (run_name, slot_id, model_alias). Each cell is an independent
-# pipeline. Lazy-populated: only runs the user has activated are loaded.
-RunKey = tuple[str, str, str]
+# Keyed by (run_name, slot_id, model_alias, asset_mode). Each cell is now
+# TWO independent pipelines — a "library" build and a "generated" build that
+# coexist (separate event logs + object folders under the same cell dir), so
+# the key carries the asset mode. Lazy-populated: only runs the user has
+# activated are loaded.
+RunKey = tuple[str, str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
 _retry_tasks: set[asyncio.Task[None]] = set()
@@ -102,6 +105,86 @@ def _run_dir(run: str) -> Path:
 
 def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
     return RUNS_DIR / run / slot_id / model_alias
+
+
+def _events_path(run: str, slot_id: str, model_alias: str, mode: str) -> Path:
+    """Per-mode event log inside a cell dir: the legacy `events.jsonl` for the
+    library build, `events.generated.jsonl` for the generated build."""
+    return _slot_dir(run, slot_id, model_alias) / asset_modes.events_filename(mode)
+
+
+# STRUCTURE events the generated build inherits from the library build so it
+# reuses the exact layout (zones + bboxes) instead of re-decomposing. Anything
+# mesh/realization-flavored (image, model, mesh.*, library.*, *.submit/.done)
+# is intentionally excluded so the generated build still produces fresh meshes;
+# `committed.py` replays these to skip the divider LLM calls.
+_STRUCTURE_EVENT_KINDS = frozenset({
+    "bbox",
+    "divider.zone_plan",
+    "divider.decompose",
+    "divider.zone_decompose",
+    "generation.decompose",
+    "generation.next",
+    "generation.next.done",
+})
+
+
+def _structure_seed(run: str, slot_id: str, model_alias: str) -> list[dict[str, object]] | None:
+    """The library build's structure events for this cell, to seed a generated
+    build's log with. Returns None when there's no library build to reuse (the
+    generated build then decomposes from scratch). Only meaningful for the
+    committed-replay pipeline (v2/v3); see `_supports_layout_reuse`."""
+    lib = _slot_logs.get((run, slot_id, model_alias, asset_modes.LIBRARY))
+    if lib is None:
+        return None
+    seed = [e for e in lib.state["events"] if e.get("kind") in _STRUCTURE_EVENT_KINDS]
+    return seed or None
+
+
+def _reset_object_subdirs(mode: str) -> tuple[str, ...]:
+    """Mesh folders to delete when resetting one build. A library reset also
+    clears the optimized twin (a stale re-bake of the same build); a generated
+    reset only touches its own folder."""
+    if asset_modes.normalize(mode) == asset_modes.GENERATED:
+        return (asset_modes.objects_subdir(asset_modes.GENERATED),)
+    return ("objects", "objects-optimized")
+
+
+def _supports_layout_reuse(run: str) -> bool:
+    """V1 (legacy XML) drives `generation_old`/`divider_old`, which don't
+    consult `committed.py`, so seeding structure into a V1 generated build
+    wouldn't be replayed (and would desync the displayed bbox from the
+    freshly-decided one). Reuse applies to the committed-replay versions
+    (v2/v3) and any ad-hoc run (which falls back to v3)."""
+    return versions.for_run(run).id != "v1"
+
+
+def _require_finished_scene_for_generated(
+    run: str, slot_id: str, model_alias: str, mode: str, *, fresh: bool
+) -> None:
+    """Guard: a generated build may only START once its cell's library build
+    has finished (`run.done` → status "done").
+
+    Seeding the layout from a half-built library would reuse a partial scene
+    and then fresh-decompose the rest, so the two builds diverge; requiring the
+    library run to be complete keeps the reuse faithful (same bboxes, only the
+    meshes regenerate). `fresh` is True only when this call would SEED a
+    brand-new generated build — the gate on an idle cell, or a
+    reset-and-regenerate. Resuming an already-started generated build
+    (`fresh=False`) is self-contained (it has its own seeded layout) and is
+    always allowed."""
+    if mode != asset_modes.GENERATED or not fresh:
+        return
+    lib = _slot_logs.get((run, slot_id, model_alias, asset_modes.LIBRARY))
+    lib_status = lib.state.get("status") if lib is not None else "idle"
+    if lib_status != "done":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "finish the library build before generating assets — generation "
+                f"reuses its completed layout (library build is '{lib_status}', not 'done')"
+            ),
+        )
 
 
 def _resolve_run(run: str | None) -> str:
@@ -160,10 +243,19 @@ def _hydrate_run(run: str) -> None:
         for alias in MODEL_ALIASES:
             slot_dir = _slot_dir(run, slot.id, alias)
             slot_dir.mkdir(parents=True, exist_ok=True)
-            slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
-            slot_log.hydrate_from_disk()
-            _slot_logs[(run, slot.id, alias)] = slot_log
-            _maybe_launch(slot, alias, slot_log)
+            # Each cell holds a library build and a generated build side by
+            # side (own event log + object folder). The slot_id TAG stays the
+            # mode-agnostic `run/slot/model` so the Trellis queue + console
+            # group both builds under one cell; the builds are kept apart by
+            # their distinct event files and the mode-keyed in-flight tables.
+            for mode in asset_modes.ASSET_MODES:
+                slot_log = SlotLog(
+                    _run_id(run, slot.id, alias),
+                    _events_path(run, slot.id, alias, mode),
+                )
+                slot_log.hydrate_from_disk()
+                _slot_logs[(run, slot.id, alias, mode)] = slot_log
+                _maybe_launch(slot, alias, slot_log)
     _hydrated_runs.add(run)
 
 
@@ -183,9 +275,10 @@ def create_app() -> FastAPI:
             rlog.suppress_console()
             for slot_log in _slot_logs.values():
                 slot_log.close()
-            for run_name, slot_id, model_alias in list(_slot_logs.keys()):
+            for run_name, slot_id, model_alias, mode in list(_slot_logs.keys()):
                 versions.for_run(run_name).generation.cancel_pending(
                     _run_id(run_name, slot_id, model_alias),
+                    mode,
                 )
             for task in _tasks.values():
                 task.cancel()
@@ -291,13 +384,17 @@ def create_app() -> FastAPI:
         return {"current": name}
 
     @app.get("/slots")
-    async def list_slots(run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def list_slots(run: str | None = None, mode: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
+        mode = asset_modes.normalize(mode)
         return {
             "run": run,
             "models": MODEL_ALIASES,
             "default_model": DEFAULT_MODEL_ALIAS,
-            "slots": [_slot_summary(s, run) for s in SLOTS],
+            "asset_modes": list(asset_modes.ASSET_MODES),
+            "asset_mode": mode,
+            "default_asset_mode": asset_modes.DEFAULT_ASSET_MODE,
+            "slots": [_slot_summary(s, run, mode) for s in SLOTS],
         }
 
     @app.get("/trellis/queue")
@@ -312,9 +409,9 @@ def create_app() -> FastAPI:
         }
 
     @app.get("/slots/{slot_id}/{model_alias}/events")
-    async def slot_events(slot_id: str, model_alias: str, since: int = -1, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_events(slot_id: str, model_alias: str, since: int = -1, run: str | None = None, mode: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias, mode)
         # Subscribe and snapshot synchronously — no await between them, so no
         # log() call can land in both the snapshot and the live queue.
         q = slot_log.subscribe()
@@ -336,17 +433,17 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/slots/{slot_id}/{model_alias}/scene")
-    async def slot_scene(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def slot_scene(slot_id: str, model_alias: str, run: str | None = None, mode: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         # CQRS read model: fold the event log into the minimal renderable scene
         # state so the client paints directly instead of replaying ~2k events.
         # Returns `last_index` (the fold's cut) so the client can pick up the
         # live tail at `?since=last_index` with no gap or overlap.
         run = _resolve_run(run)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias, mode)
         return _scene_projection(list(slot_log.state["events"]))
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, mode: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
@@ -354,16 +451,9 @@ def create_app() -> FastAPI:
         # and polls on this same origin). The client keys each blob to its
         # `model` event by file stem; see `_mesh_bundle`.
         run = _resolve_run(run)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias, mode)
         cell_dir = slot_log.events_path.parent
-        objects_dir = cell_dir / OBJECTS_SUBDIR
-        if not objects_dir.is_dir():
-            # Migrated cells keep only objects-optimized (rebake_runs.py
-            # --prune-originals); pre-migration cells keep only objects.
-            objects_dir = next(
-                (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
-                objects_dir,
-            )
+        objects_dir = _serve_objects_dir(cell_dir, asset_modes.normalize(mode))
         return StreamingResponse(
             _mesh_bundle(objects_dir),
             media_type="application/octet-stream",
@@ -376,27 +466,30 @@ def create_app() -> FastAPI:
         model_alias: str,
         req: RewindRequest,
         run: str | None = None,
+        mode: str | None = None,
     ) -> dict[str, int | str]:
         run = _resolve_run(run)
+        mode = asset_modes.normalize(mode)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias, mode)
         if slot_log.state.get("prompt") is None or slot_log.state.get("model") is None:
             raise HTTPException(
                 status_code=400,
                 detail="slot has no run to rewind",
             )
-        await _cancel_task(run, slot_id, model_alias)
+        await _cancel_task(run, slot_id, model_alias, mode)
         new_len = slot_log.truncate_events_to(req.to_event_index)
-        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
+        _tasks[(run, slot.id, model_alias, mode)] = asyncio.create_task(_run(run, slot.id, model_alias, mode))
         return {"run": run, "slot_id": slot.id, "model": model_alias, "events": new_len}
 
     @app.post("/slots/{slot_id}/{model_alias}/resume")
-    async def slot_resume(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    async def slot_resume(slot_id: str, model_alias: str, run: str | None = None, mode: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
+        mode = asset_modes.normalize(mode)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias, mode)
         # A completed run is terminal: resuming it would re-enter the pipeline
         # and generate a second run into the same cell. `run.done` is sticky
         # in the status derivation so the guard below normally catches this;
@@ -413,22 +506,29 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail=f"slot is {status}, not startable",
             )
-        await _start_cell(run, slot_id, model_alias)
+        # A fresh generated build (no events yet → about to seed the layout)
+        # requires the library build to be done; resuming a paused/errored
+        # generated build already has its own layout, so it isn't gated.
+        _require_finished_scene_for_generated(
+            run, slot_id, model_alias, mode, fresh=not slot_log.state["events"],
+        )
+        await _start_cell(run, slot_id, model_alias, mode)
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.post("/slots/{slot_id}/{model_alias}/pause")
-    async def slot_pause(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    async def slot_pause(slot_id: str, model_alias: str, run: str | None = None, mode: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
+        mode = asset_modes.normalize(mode)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias, mode)
         status = slot_log.state.get("status")
         if status != "running":
             raise HTTPException(
                 status_code=400,
                 detail=f"slot is {status}, not pausable",
             )
-        await _cancel_task(run, slot_id, model_alias)
+        await _cancel_task(run, slot_id, model_alias, mode)
         # _cancel_task awaits the cancellation, so the pipeline task has
         # already torn down (including generation.cancel_pending via _run's
         # CancelledError branch) by the time we emit the sentinel.
@@ -442,11 +542,13 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        mode: str | None = None,
     ) -> dict[str, str]:
         run = _resolve_run(run)
+        mode = asset_modes.normalize(mode)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias, mode)
         ver = versions.for_run(run)
         prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
         node = _reconstruct_node(slot_log, node_id)
@@ -459,11 +561,13 @@ def create_app() -> FastAPI:
         async def _do_retry() -> None:
             rlog.bind(slot_log)
             llm.set_model(MODELS[model_alias])
+            asset_modes.bind(mode)
             prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
             await ver.generation.retry_node(
                 node=node,
                 runs_dir=RUNS_DIR,
                 run_id=_run_id(run, slot.id, model_alias),
+                mode=mode,
             )
 
         task = asyncio.create_task(_do_retry())
@@ -482,27 +586,45 @@ def create_app() -> FastAPI:
         model_alias: str,
         run: str | None = None,
         start: bool = True,
+        mode: str | None = None,
     ) -> dict[str, str]:
         run = _resolve_run(run)
+        mode = asset_modes.normalize(mode)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         ver = versions.for_run(run)
-        await _cancel_task(run, slot_id, model_alias)
+        # A reset-and-regenerate re-seeds a fresh generated build, so it's
+        # gated on the library build being done — checked BEFORE any wipe so a
+        # blocked reset doesn't destroy the existing build.
+        if start:
+            _require_finished_scene_for_generated(
+                run, slot_id, model_alias, mode, fresh=True,
+            )
+        await _cancel_task(run, slot_id, model_alias, mode)
         # Cancel any standalone retries (registered on this version's
         # generation._pending but with no owning _run task to drive cleanup)
         # that the running task wouldn't have touched.
-        ver.generation.cancel_pending(_run_id(run, slot.id, model_alias))
+        ver.generation.cancel_pending(_run_id(run, slot.id, model_alias), mode)
         slot_dir = _slot_dir(run, slot.id, model_alias)
-        shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
-        old_log = _slot_logs.get((run, slot.id, model_alias))
+        # Mode-scoped wipe: only this build's event log + mesh folder(s) are
+        # cleared, so the sibling build (the other asset mode) is preserved —
+        # that coexistence is the whole point of the separate folders.
+        _events_path(run, slot.id, model_alias, mode).unlink(missing_ok=True)
+        for sub in _reset_object_subdirs(mode):
+            shutil.rmtree(slot_dir / sub, ignore_errors=True)
+        old_log = _slot_logs.get((run, slot.id, model_alias, mode))
         if old_log is not None:
             old_log.close()
-        slot_log = SlotLog(_run_id(run, slot.id, model_alias), slot_dir / "events.jsonl")
-        _slot_logs[(run, slot.id, model_alias)] = slot_log
+        slot_log = SlotLog(
+            _run_id(run, slot.id, model_alias),
+            _events_path(run, slot.id, model_alias, mode),
+        )
+        _slot_logs[(run, slot.id, model_alias, mode)] = slot_log
         if start:
-            slot_log.start_run(slot.prompt, MODELS[model_alias])
-            _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
+            # _start_cell seeds a generated build from the library structure
+            # so a reset-and-regenerate still reuses the layout.
+            await _start_cell(run, slot_id, model_alias, mode)
         else:
             # Wipe back to a fresh idle cell — prompt + model pre-seeded (so a
             # later /resume can start_run without the client resending them) but
@@ -518,16 +640,18 @@ def create_app() -> FastAPI:
     async def list_versions(  # pyright: ignore[reportUnusedFunction]
         slot: str | None = None,
         model: str | None = None,
+        mode: str | None = None,
     ) -> dict[str, object]:
         """The three pipeline versions for the version bar. When `slot` and
         `model` are given, each entry carries that cell's status (for the
-        per-version status dots); the runs are seeded at boot so their cells
-        always exist."""
+        per-version status dots) for the requested asset mode; the runs are
+        seeded at boot so their cells always exist."""
+        mode = asset_modes.normalize(mode)
         items: list[dict[str, object]] = []
         for ver in versions.VERSIONS:
             slot_log = None
             if slot is not None and model is not None:
-                slot_log = _slot_logs.get((ver.run_name, slot, model))
+                slot_log = _slot_logs.get((ver.run_name, slot, model, mode))
             status = slot_log.state.get("status") if slot_log is not None else None
             items.append(
                 {
@@ -551,18 +675,22 @@ def create_app() -> FastAPI:
         already complete is left untouched."""
         _require_slot(slot_id)
         _require_model(model_alias)
+        # The version comparison is about prompt/pipeline structure, not asset
+        # source, and from-scratch generation is gated per-cell — so launching
+        # all three versions always starts the (cheap) library build.
+        launch_mode = asset_modes.LIBRARY
         results: list[dict[str, object]] = []
         for ver in versions.VERSIONS:
             run = ver.run_name
             try:
                 _hydrate_run(run)
-                slot_log = _require_slot_log(run, slot_id, model_alias)
+                slot_log = _require_slot_log(run, slot_id, model_alias, launch_mode)
                 if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
                     results.append(
                         {"id": ver.id, "run_name": run, "status": "done", "started": False}
                     )
                     continue
-                await _start_cell(run, slot_id, model_alias)
+                await _start_cell(run, slot_id, model_alias, launch_mode)
                 results.append(
                     {"id": ver.id, "run_name": run, "status": "running", "started": True}
                 )
@@ -610,16 +738,21 @@ def create_app() -> FastAPI:
     return app
 
 
-def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
+def _slot_summary(slot: Slot, run: str, mode: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
-        slot_log = _slot_logs.get((run, slot.id, alias))
+        slot_log = _slot_logs.get((run, slot.id, alias, mode))
         state = slot_log.state if slot_log is not None else {"status": "idle", "events": []}
         events = state.get("events", [])
+        # Always surface the library build's status alongside the requested
+        # mode's, so the client can gate the "generate" button (only allowed
+        # once the library scene is done) without a second poll.
+        lib_log = _slot_logs.get((run, slot.id, alias, asset_modes.LIBRARY))
         runs[alias] = {
             "status": state.get("status", "idle"),
             "events_count": len(events),
             "last_kind": events[-1]["kind"] if events else None,
+            "library_status": lib_log.state.get("status", "idle") if lib_log is not None else "idle",
         }
     return {
         "id": slot.id,
@@ -739,20 +872,21 @@ def _require_model(model_alias: str) -> None:
         raise HTTPException(status_code=404, detail=f"unknown model: {model_alias}")
 
 
-def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
+def _require_slot_log(run: str, slot_id: str, model_alias: str, mode: str | None = None) -> SlotLog:
     _require_slot(slot_id)
     _require_model(model_alias)
-    log = _slot_logs.get((run, slot_id, model_alias))
+    mode = asset_modes.normalize(mode)
+    log = _slot_logs.get((run, slot_id, model_alias, mode))
     if log is None:
         raise HTTPException(
             status_code=404,
-            detail=f"no run for run={run} slot={slot_id} model={model_alias}",
+            detail=f"no run for run={run} slot={slot_id} model={model_alias} mode={mode}",
         )
     return log
 
 
-async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
-    task = _tasks.pop((run, slot_id, model_alias), None)
+async def _cancel_task(run: str, slot_id: str, model_alias: str, mode: str) -> None:
+    task = _tasks.pop((run, slot_id, model_alias, mode), None)
     if task is None or task.done():
         return
     task.cancel()
@@ -760,28 +894,58 @@ async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
         await task
 
 
-async def _start_cell(run: str, slot_id: str, model_alias: str) -> None:
-    """Cancel any in-flight task for this cell, then (re)start its pipeline.
-    A fresh cell emits run.start; a paused/errored cell drops its terminal
-    sentinel and resumes. Shared by slot_resume and the version launcher —
-    callers own any precondition guards (e.g. blocking a completed run)."""
+async def _start_cell(run: str, slot_id: str, model_alias: str, mode: str) -> None:
+    """Cancel any in-flight task for this cell+mode, then (re)start its
+    pipeline. A fresh cell emits run.start; a paused/errored cell drops its
+    terminal sentinel and resumes. Shared by slot_resume and the version
+    launcher — callers own any precondition guards (e.g. blocking a completed
+    run).
+
+    A fresh GENERATED build seeds its log with the library build's structure
+    (when one exists and the version supports committed replay), so it reuses
+    the exact layout and only regenerates the meshes — no second decomposition."""
     slot = _require_slot(slot_id)
-    slot_log = _require_slot_log(run, slot_id, model_alias)
+    slot_log = _require_slot_log(run, slot_id, model_alias, mode)
     status = slot_log.state.get("status")
-    await _cancel_task(run, slot_id, model_alias)
+    await _cancel_task(run, slot_id, model_alias, mode)
     events = slot_log.state["events"]
     model_id = MODELS[model_alias]
     if status == "idle" and not events:
-        slot_log.start_run(slot.prompt, model_id)
+        seed = (
+            _structure_seed(run, slot_id, model_alias)
+            if mode == asset_modes.GENERATED and _supports_layout_reuse(run)
+            else None
+        )
+        slot_log.start_run(slot.prompt, model_id, asset_mode=mode, seed_events=seed)
     else:
         if events and events[-1].get("kind") in ("run.error", "run.paused"):
             slot_log.truncate_events_to(len(events) - 1)
         slot_log.state["model"] = model_id
         slot_log.state["status"] = "running"
-    _tasks[(run, slot_id, model_alias)] = asyncio.create_task(_run(run, slot_id, model_alias))
+    _tasks[(run, slot_id, model_alias, mode)] = asyncio.create_task(_run(run, slot_id, model_alias, mode))
 
 
 _MESH_BUNDLE_MAGIC = b"SMB1"
+
+
+def _serve_objects_dir(cell_dir: Path, mode: str) -> Path:
+    """Which folder a cell's meshes stream from for the given asset mode.
+
+    Generated builds always live in `objects-generated/`. Library builds use
+    the configured `OBJECTS_SUBDIR` ("objects" by default; "objects-optimized"
+    for re-baked sets) and fall back across the optimized/original twins for
+    cells that were migrated either way."""
+    if mode == asset_modes.GENERATED:
+        return cell_dir / asset_modes.objects_subdir(asset_modes.GENERATED)
+    objects_dir = cell_dir / OBJECTS_SUBDIR
+    if not objects_dir.is_dir():
+        # Migrated cells keep only objects-optimized (rebake_runs.py
+        # --prune-originals); pre-migration cells keep only objects.
+        objects_dir = next(
+            (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
+            objects_dir,
+        )
+    return objects_dir
 
 
 async def _mesh_bundle(objects_dir: Path) -> AsyncIterator[bytes]:
@@ -916,9 +1080,10 @@ async def _sse(
         slot_log.unsubscribe(q)
 
 
-async def _run(run: str, slot_id: str, model_alias: str) -> None:
-    slot_log = _slot_logs[(run, slot_id, model_alias)]
+async def _run(run: str, slot_id: str, model_alias: str, mode: str) -> None:
+    slot_log = _slot_logs[(run, slot_id, model_alias, mode)]
     rlog.bind(slot_log)
+    asset_modes.bind(mode)
     llm.reset_call_sequence()
     ver = versions.for_run(run)
     prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
@@ -933,10 +1098,10 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
             runs_dir=RUNS_DIR,
         )
     except asyncio.CancelledError:
-        ver.generation.cancel_pending(run_id)
+        ver.generation.cancel_pending(run_id, mode)
         raise
     except Exception as e:
-        ver.generation.cancel_pending(run_id)
+        ver.generation.cancel_pending(run_id, mode)
         # OpenRouter SDK errors only stringify to the top-level "Provider
         # returned error" message; the actually useful detail (upstream
         # provider's complaint, the request body that tripped it) lives on
@@ -959,5 +1124,5 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         return
     # Pipeline tree is fully resolved; meshes may still be in flight.
     # Hold the run open until they all land so `run.done` truly means done.
-    await ver.generation.await_pending(run_id)
+    await ver.generation.await_pending(run_id, mode)
     slot_log.finish_run()

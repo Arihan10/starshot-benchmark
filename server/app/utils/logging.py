@@ -157,7 +157,24 @@ class SlotLog:
         self.state["status"] = _derive_status(self.state["events"])
         return n
 
-    def start_run(self, prompt: str, model: str) -> None:
+    def start_run(
+        self,
+        prompt: str,
+        model: str,
+        *,
+        asset_mode: str = "library",
+        seed_events: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Begin a fresh run. `asset_mode` is recorded on `run.start` so the
+        log self-describes which build it is.
+
+        `seed_events` pre-populates the log with already-decided STRUCTURE
+        events (zone plans, bboxes, decompositions) copied from a sibling
+        build, so a generated build reuses the library build's layout: the
+        pipeline replays that structure via `committed.py` with zero divider
+        LLM calls and only regenerates the meshes. The seeds are appended
+        quietly (re-indexed, no console/SSE fan-out — there are no
+        subscribers at start) right after `run.start`."""
         self._close_events_file()
         self.state["status"] = "running"
         self.state["prompt"] = prompt
@@ -165,7 +182,17 @@ class SlotLog:
         self.state["events"] = []
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
         self.events_path.write_text("")
-        self.log("run.start", prompt=prompt, model=model)
+        self.log("run.start", prompt=prompt, model=model, asset_mode=asset_mode)
+        if seed_events:
+            f = self._ensure_events_append()
+            for ev in seed_events:
+                event = {
+                    "index": len(self.state["events"]),
+                    **{k: v for k, v in ev.items() if k != "index"},
+                }
+                self.state["events"].append(event)
+                f.write(json.dumps(event) + "\n")
+            f.flush()
 
     def finish_run(self) -> None:
         self.state["status"] = "done"
