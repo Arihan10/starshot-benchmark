@@ -113,6 +113,7 @@ async def call_llm(
     output_schema: type[T],
     node_id: str | None = None,
     step: str | None = None,
+    log_call: bool = True,
 ) -> T:
     model = _current_model.get()
     if model is None:
@@ -183,19 +184,27 @@ async def call_llm(
             # + system + user + reasoning). Older log lines that lacked the
             # new fields still replay correctly — the client treats them as
             # unattributed.
-            logging.log(
-                "cache.llm",
-                key=key,
-                node=node_id,
-                step=step,
-                call_index=call_index,
-                model=model,
-                schema=schema_name,
-                system=system,
-                user=user,
-                output=validated.model_dump(mode="json"),
-                reasoning=reasoning,
-            )
+            #
+            # log_call=False suppresses the event entirely for off-benchmark
+            # retrieval calls (e.g. asset-library matching) so their system
+            # prompt, full catalog input, output, and reasoning never reach
+            # the event log or observability view. Such calls forgo the
+            # hash-key cache, which is immaterial for steps already made
+            # idempotent by their on-disk artifact.
+            if log_call:
+                logging.log(
+                    "cache.llm",
+                    key=key,
+                    node=node_id,
+                    step=step,
+                    call_index=call_index,
+                    model=model,
+                    schema=schema_name,
+                    system=system,
+                    user=user,
+                    output=validated.model_dump(mode="json"),
+                    reasoning=reasoning,
+                )
             return validated
         except json.JSONDecodeError as e:
             final = parse_attempt >= PARSE_MAX - 1

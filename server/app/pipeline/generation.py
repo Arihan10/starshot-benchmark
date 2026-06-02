@@ -754,3 +754,11 @@ async def run(
             run_id=run_id,
         )
         all_nodes.extend(new_nodes)
+        # No-progress guard for duplicated ids. 
+        if not new_nodes:
+            logging.log_once(
+                "generation.next.done",
+                match_fields=("zone",),
+                zone=zone.id,
+            )
+            return

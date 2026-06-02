@@ -83,13 +83,18 @@ async def match(prompt: str) -> LibraryMatchOutput:
     )
     # Library matching is always run on gemini-flash regardless of the run's
     # configured model — the match step is a cheap retrieval, not part of the
-    # spatial-reasoning benchmark surface.
+    # spatial-reasoning benchmark surface. log_call=False keeps this call out
+    # of the event log / observability view entirely: its system prompt, the
+    # full catalog it sends as input, the chosen id, and the model's reasoning
+    # are all retrieval noise. The lightweight `library.match` event emitted by
+    # the caller remains the record of the routing decision.
     token = llm._current_model.set(MODELS["gemini-flash"])
     try:
         return await llm.call_llm(
             system=SYSTEM_LIBRARY_MATCH,
             user=user,
             output_schema=LibraryMatchOutput,
+            log_call=False,
         )
     finally:
         llm._current_model.reset(token)
