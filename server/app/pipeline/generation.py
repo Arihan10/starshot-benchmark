@@ -35,7 +35,7 @@ import trimesh
 
 from app.core import asset_modes, prompt_runtime
 from app.core.types import BoundingBox, Node, ProxyShape
-from app.pipeline import committed
+from app.pipeline import committed, prefabs
 from app.services import llm, nano_banana, threed
 from app.utils import glb_place, logging
 from app.utils.geometry import rescale_mesh_to_bbox
@@ -334,17 +334,23 @@ async def _resolve_and_generate(
             run_id=run_id,
         )
 
-    # Every object (anchor, completion, encapsulating alike) goes through
-    # the image-prompt rewrite: Nano Banana needs an isolated studio
-    # reference shot — any environmental context bleeds into the mesh.
+    # Generated mode. Before paying for a fresh image + mesh, the prefab system
+    # asks a lightweight LLM whether this object can REUSE an asset already
+    # built (or in flight) in this scene — repeated wall panels, matching
+    # chairs, etc. A reuse rescales the matched asset's GLB into this bbox (no
+    # Nano-Banana, no Trellis); a miss falls through to fresh generation.
     #
-    # The "prior subjects" context fed to the LLM is the bare subject
-    # phrases of already-placed nodes (Node.prompt), NOT their full
-    # Nano-Banana directives (Node.image_prompt). Leaking the wrapper
-    # boilerplate would just teach the LLM to echo "Generate a direct,
-    # perfect orthographic..." back into every new phrase.
+    # Originals go through the image-prompt rewrite: Nano Banana needs an
+    # isolated studio reference shot — any environmental context bleeds into
+    # the mesh. The "prior subjects" context fed to that LLM is the bare
+    # subject phrases of already-placed nodes (Node.prompt), NOT their full
+    # Nano-Banana directives (leaking the wrapper boilerplate would just teach
+    # the LLM to echo "Generate a direct, perfect orthographic..." back).
+    track_key = _track_key(run_id)
+    objs_dir = _objects_dir(runs_dir, run_id)
     committed_subjects = [n.prompt for n in all_nodes if n.mesh_url is not None]
     resolved: list[Node] = []
+    reuse_plan: list[tuple[Node, str]] = []
     for spec in specs:
         bbox = bboxes[spec.id]
         parent_id = spec.parent
@@ -357,6 +363,28 @@ async def _resolve_and_generate(
             proxy_shape=spec.proxy_shape,
             orientation=spec.orientation,
         )
+        prefab_id = await _decide_prefab(spec, track_key=track_key, objs_dir=objs_dir)
+        if prefab_id is not None:
+            # Reuse: no image-prompt / Nano-Banana — the mesh comes from the
+            # matched asset. The node keeps the bare subject phrase.
+            node = Node(
+                id=spec.id,
+                prompt=spec.prompt,
+                bbox=bbox,
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+                placement=spec.placement,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=parent_id,
+                parent_kind=spec.parent_kind,
+            )
+            # NOTE: reuses are deliberately NOT registered as prefabs — only
+            # originals are (they own the raw Trellis mesh a reuse rescales).
+            # A later object matches the original directly, so nothing is lost,
+            # and there are no reuse-of-reuse chains.
+            reuse_plan.append((node, prefab_id))
+            resolved.append(node)
+            continue
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
         view = "three-quarter" if scenario == "encapsulating" else "front"
         subject_prompt, image_prompt = await _build_image_prompt(
@@ -367,27 +395,65 @@ async def _resolve_and_generate(
             prior_prompts=prior_subjects,
             view=view,
         )
-        resolved.append(
-            Node(
-                id=spec.id,
-                prompt=subject_prompt,
-                image_prompt=image_prompt,
-                bbox=bbox,
-                proxy_shape=spec.proxy_shape,
-                orientation=spec.orientation,
-                placement=spec.placement,
-                referenced_ids=list(spec.referenced_ids),
-                parent_id=parent_id,
-                parent_kind=spec.parent_kind,
-            )
+        node = Node(
+            id=spec.id,
+            prompt=subject_prompt,
+            image_prompt=image_prompt,
+            bbox=bbox,
+            proxy_shape=spec.proxy_shape,
+            orientation=spec.orientation,
+            placement=spec.placement,
+            referenced_ids=list(spec.referenced_ids),
+            parent_id=parent_id,
+            parent_kind=spec.parent_kind,
         )
+        prefabs.register(track_key, spec.id, spec.prompt)
+        resolved.append(node)
 
-    return await _spawn_meshes(
-        resolved=resolved,
+    reuse_ids = {n.id for n, _ in reuse_plan}
+    originals = [n for n in resolved if n.id not in reuse_ids]
+    placed = await _spawn_meshes(
+        resolved=originals,
         runs_dir=runs_dir,
         run_id=run_id,
         scenario=scenario,
     )
+    placed += _spawn_reuses(reuse_plan, runs_dir=runs_dir, run_id=run_id)
+    # Preserve the original spec order in the returned node list.
+    by_id = {n.id: n for n in placed}
+    return [by_id[n.id] for n in resolved if n.id in by_id]
+
+
+async def _decide_prefab(
+    spec: Any, *, track_key: str, objs_dir: Path
+) -> str | None:
+    """Decide whether `spec` should reuse an already-built asset. Returns the
+    prefab's node id to reuse, or None to generate it fresh.
+
+    Resume-safe: a committed `prefab.reuse` decision is replayed verbatim; an
+    object already built as an original (its own GLB on disk, no reuse marker)
+    stays an original; only genuinely-new objects reach the match LLM."""
+    decided = logging.find_event("prefab.reuse", id=spec.id)
+    if decided is not None:
+        pid = decided.get("prefab_id")
+        return pid if isinstance(pid, str) and pid else None
+    # Already an original (its own image committed, in-flight or done — or its
+    # GLB already on disk) and no reuse marker -> keep it an original so a
+    # resume doesn't flip it into a reuse. _spawn_meshes reuses the on-disk GLB
+    # when present.
+    if logging.find_event("image", id=spec.id) is not None or (objs_dir / f"{spec.id}.glb").exists():
+        return None
+    cands = prefabs.candidates(track_key, exclude_id=spec.id)
+    prefab_id = await prefabs.match(spec.prompt, cands, node_id=spec.id)
+    if prefab_id is not None:
+        logging.log_once(
+            "prefab.reuse",
+            match_fields=("id",),
+            id=spec.id,
+            prefab_id=prefab_id,
+            description=spec.prompt,
+        )
+    return prefab_id
 
 
 async def _match_library_assets(
@@ -570,6 +636,7 @@ async def _generate_one(
     path: Path,
     image_stem: Path,
     runs_dir: Path,
+    track_key: str | None = None,
 ) -> None:
     try:
         # Nano Banana sees the wrapped studio-shot directive; node.prompt
@@ -612,6 +679,110 @@ async def _generate_one(
         )
     except Exception as e:
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
+    finally:
+        # Whether the mesh landed or errored, unblock any prefab reuse waiting
+        # on this asset — it checks the GLB and falls back to an error if none.
+        if track_key is not None:
+            prefabs.mark_ready(track_key, node.id)
+
+
+async def _reuse_one(
+    node: Node,
+    *,
+    prefab_id: str,
+    runs_dir: Path,
+    run_id: str,
+    track_key: str,
+) -> None:
+    """Produce `node`'s mesh by reusing prefab `prefab_id`'s GLB — rescaled into
+    `node.bbox` — instead of generating from scratch. Waits for the source's
+    mesh if it is still being built; if the source ultimately produced nothing,
+    emits `mesh.error` (the node is then retryable, which regenerates it fresh)."""
+    objs_dir = _objects_dir(runs_dir, run_id)
+    # Reuse the source's RAW Trellis mesh (intrinsic +Z-front pose), not its
+    # final GLB: the final is already yaw-rotated + scaled to the source's own
+    # bbox, so re-applying this node's orientation to it would double-rotate.
+    # Rescaling the raw with this node's bbox + orientation is exactly what an
+    # original does, so the reused asset lands identically posed.
+    src_raw = objs_dir / f"{prefab_id}.raw.glb"
+    src_png = objs_dir / f"{prefab_id}.png"
+    path = objs_dir / f"{node.id}.glb"
+    try:
+        await prefabs.await_ready(track_key, prefab_id)
+        if not src_raw.exists():
+            logging.log(
+                "mesh.error",
+                id=node.id,
+                message=f"prefab source '{prefab_id}' produced no mesh to reuse",
+            )
+            return
+        # Reuse the source's reference image for the asset panel (cosmetic).
+        if src_png.exists():
+            dest_png = objs_dir / f"{node.id}.png"
+            if not dest_png.exists():
+                await asyncio.to_thread(shutil.copy2, src_png, dest_png)
+            logging.log(
+                "image",
+                id=node.id,
+                url=_artifact_url(runs_dir, dest_png),
+                prompt=node.prompt,
+            )
+        async with _MESH_IO:
+            scene = await asyncio.to_thread(trimesh.load, src_raw)
+            rescaled = await asyncio.to_thread(
+                rescale_mesh_to_bbox,
+                scene,
+                node.bbox,
+                orientation=node.orientation,
+            )
+            await asyncio.to_thread(rescaled.export, path, file_type="glb")
+            del scene, rescaled
+        logging.emit_model(
+            node.id,
+            artifact_kind="object",
+            url=_artifact_url(runs_dir, path),
+        )
+    except Exception as e:
+        logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
+    finally:
+        prefabs.mark_ready(track_key, node.id)
+
+
+def _spawn_reuses(
+    reuse_plan: list[tuple[Node, str]],
+    *,
+    runs_dir: Path,
+    run_id: str,
+) -> list[Node]:
+    """Spawn a background `_reuse_one` task per planned reuse. Mirrors
+    `_spawn_meshes`: already-produced nodes (resume) short-circuit to emit_model
+    and the rest run in the background, registered on `_pending`."""
+    objs_dir = _objects_dir(runs_dir, run_id)
+    track_key = _track_key(run_id)
+    pending = _pending.setdefault(track_key, [])
+    out: list[Node] = []
+    for node, prefab_id in reuse_plan:
+        path = objs_dir / f"{node.id}.glb"
+        url = _artifact_url(runs_dir, path)
+        if path.exists():
+            logging.emit_model(node.id, artifact_kind="object", url=url)
+            prefabs.mark_ready(track_key, node.id)
+            out.append(node.model_copy(update={"mesh_url": url}))
+            continue
+        logging.log("mesh.submit", id=node.id, prompt=node.prompt, prefab=prefab_id)
+        pending.append(
+            asyncio.create_task(
+                _reuse_one(
+                    node,
+                    prefab_id=prefab_id,
+                    runs_dir=runs_dir,
+                    run_id=run_id,
+                    track_key=track_key,
+                ),
+            )
+        )
+        out.append(node.model_copy(update={"mesh_url": url}))
+    return out
 
 
 async def _spawn_meshes(
@@ -625,7 +796,8 @@ async def _spawn_meshes(
     objs_dir.mkdir(parents=True, exist_ok=True)
 
     out: list[Node] = []
-    pending = _pending.setdefault(_track_key(run_id), [])
+    track_key = _track_key(run_id)
+    pending = _pending.setdefault(track_key, [])
     for node in resolved:
         raw = objs_dir / f"{node.id}.raw.glb"
         path = objs_dir / f"{node.id}.glb"
@@ -633,6 +805,8 @@ async def _spawn_meshes(
         url = _artifact_url(runs_dir, path)
         if path.exists():
             logging.emit_model(node.id, artifact_kind="object", url=url)
+            # Already on disk -> let any reuse waiting on this asset proceed.
+            prefabs.mark_ready(track_key, node.id)
             out.append(node.model_copy(update={"mesh_url": url}))
             continue
         logging.log("mesh.submit", id=node.id, prompt=node.prompt)
@@ -644,6 +818,7 @@ async def _spawn_meshes(
                     path=path,
                     image_stem=image_stem,
                     runs_dir=runs_dir,
+                    track_key=track_key,
                 ),
             )
         )
@@ -683,6 +858,7 @@ async def retry_node(
             path=path,
             image_stem=image_stem,
             runs_dir=runs_dir,
+            track_key=_track_key(run_id, mode),
         ),
     )
     _pending.setdefault(_track_key(run_id, mode), []).append(task)
@@ -698,6 +874,7 @@ async def await_pending(run_id: str, mode: str | None = None) -> None:
     _admitted_ids.pop(key, None)
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+    prefabs.clear(key)
 
 
 def cancel_pending(run_id: str, mode: str | None = None) -> None:
@@ -707,6 +884,7 @@ def cancel_pending(run_id: str, mode: str | None = None) -> None:
     _admitted_ids.pop(key, None)
     for t in _pending.pop(key, []):
         t.cancel()
+    prefabs.clear(key)
 
 
 async def run(
