@@ -37,7 +37,7 @@ import trimesh
 from app.core import prompt_runtime
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
-from app.services import llm, nano_banana, threed
+from app.services import llm, nano_banana, prefabs, threed
 from app.utils import glb_place, logging
 from app.utils.geometry import rescale_mesh_to_bbox
 from app.utils.topology import validate_parents, validate_referenced_ids
@@ -722,18 +722,25 @@ async def generate_assets(
 
     Each node carries the bbox / orientation / image_prompt reconstructed from
     the library build's log, so every generated mesh is rescaled into the exact
-    same bounding box the library asset occupied — an apples-to-apples swap of a
-    matched asset for a freshly generated one. Nodes that already have an
+    same bounding box the library asset occupied. Nodes that already have an
     OPTIMIZED twin are skipped, so re-running this is how the gate "resumes": it
     regenerates only the failed/interrupted assets and leaves finished ones
     untouched.
+
+    PREFAB REUSE: before generating an object fresh, a lightweight LLM
+    (`prefabs.match`) checks whether it is essentially the SAME object as one
+    already built (or in flight) earlier in this scene. On a hit the object skips
+    Nano-Banana + Trellis entirely — its mesh is the matched asset's raw Trellis
+    output rescaled into this object's bbox (identical geometry, fitted to the
+    slot) — for visual consistency and to avoid paying for duplicates. Decisions
+    are logged as `prefab.match` and replayed on resume so they stay stable.
 
     Up to `_GENERATE_FANOUT` assets run at once; threed's `_pace_submit` spaces
     the actual Trellis submits ~1s apart so the batch ramps onto Modal instead of
     bursting into a 429 storm.
 
-    Requires a bound SlotLog: `_generate_one` and the nano_banana / threed
-    services record their resumable submit/done bookkeeping there. The caller
+    Requires a bound SlotLog: `_generate_one`, `prefabs.match`, and the
+    nano_banana / threed services record their bookkeeping there. The caller
     binds a dedicated log (events.generated.jsonl) so none of this lands in the
     library build's event stream."""
     raw_dir = runs_dir / run_id / "objects-generated"
@@ -741,25 +748,95 @@ async def generate_assets(
     raw_dir.mkdir(parents=True, exist_ok=True)
     opt_dir.mkdir(parents=True, exist_ok=True)
 
-    async def _bounded(node: Node) -> None:
+    # Per-scene prefab state: an ordered catalog of canonical assets (the reuse
+    # candidates) and a "raw on disk" event per canonical so a reuse can wait for
+    # a source still in flight. Local to this call — the whole scene is processed
+    # in one pass, in node order, so a node only matches against earlier ones.
+    catalog: list[tuple[str, str]] = []
+    canonical_ids: set[str] = set()
+    raw_ready: dict[str, asyncio.Event] = {}
+
+    def _has_raw(node_id: str) -> bool:
+        return (raw_dir / f"{node_id}.raw.glb").exists()
+
+    async def _fresh(node: Node) -> None:
         async with _GENERATE_FANOUT:
             rescaled = raw_dir / f"{node.id}.glb"
-            await _generate_one(
-                node,
-                raw=raw_dir / f"{node.id}.raw.glb",
-                path=rescaled,
-                image_stem=raw_dir / node.id,
-                runs_dir=runs_dir,
-            )
-            # Optimize into the served dir; only the optimized twin is shown.
+            try:
+                await _generate_one(
+                    node,
+                    raw=raw_dir / f"{node.id}.raw.glb",
+                    path=rescaled,
+                    image_stem=raw_dir / node.id,
+                    runs_dir=runs_dir,
+                )
+            finally:
+                # Raw is on disk now (or generation failed) — unblock any reuse
+                # waiting on this asset; it re-checks the file and bails if none.
+                raw_ready[node.id].set()
             if rescaled.exists():
                 await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
 
-    tasks = [
-        asyncio.create_task(_bounded(node))
-        for node in nodes
-        if not (opt_dir / f"{node.id}.glb").exists()
-    ]
+    async def _reuse(node: Node, source_id: str) -> None:
+        # Wait (outside the fanout, so we don't pin a slot) for the source's
+        # mesh, then rescale ITS raw Trellis output — the intrinsic +Z-front
+        # pose — into this node's bbox + orientation, exactly as a fresh build
+        # would, so the reuse lands identically posed. No Nano-Banana, no Trellis.
+        await raw_ready[source_id].wait()
+        src_raw = raw_dir / f"{source_id}.raw.glb"
+        if not src_raw.exists():
+            logging.log("prefab.reuse_missing", id=node.id, source=source_id)
+            return
+        try:
+            async with _GENERATE_FANOUT:
+                rescaled = raw_dir / f"{node.id}.glb"
+                async with _MESH_IO:
+                    scene = await asyncio.to_thread(trimesh.load, src_raw)
+                    placed = await asyncio.to_thread(
+                        rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
+                    )
+                    await asyncio.to_thread(placed.export, rescaled, file_type="glb")
+                    del scene, placed
+                # Carry over the source's reference image for the asset panel.
+                src_png = raw_dir / f"{source_id}.png"
+                if src_png.exists():
+                    await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{node.id}.png")
+                await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
+
+    tasks: list[asyncio.Task[None]] = []
+    for node in nodes:
+        done = (opt_dir / f"{node.id}.glb").exists()
+        decided = logging.find_event("prefab.match", id=node.id)
+        if decided is not None:
+            reuse_id = str(decided.get("reuse_id") or "")
+        elif done or _has_raw(node.id):
+            # An original built before prefabs (or a prior resume) — keep it an
+            # original so resume never flips an already-built asset into a reuse.
+            reuse_id = ""
+        else:
+            reuse_id = await prefabs.match(
+                new_id=node.id, new_description=node.prompt, catalog=catalog,
+            )
+            logging.log("prefab.match", id=node.id, reuse_id=reuse_id, description=node.prompt)
+
+        is_reuse = bool(reuse_id) and reuse_id in canonical_ids
+        if not is_reuse:
+            # Canonical: matchable by later objects; reuses rescale its raw mesh.
+            catalog.append((node.id, node.prompt))
+            canonical_ids.add(node.id)
+            ev = raw_ready.setdefault(node.id, asyncio.Event())
+            if done or _has_raw(node.id):
+                ev.set()
+
+        if done:
+            continue
+        if is_reuse:
+            tasks.append(asyncio.create_task(_reuse(node, reuse_id)))
+        else:
+            tasks.append(asyncio.create_task(_fresh(node)))
+
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
 

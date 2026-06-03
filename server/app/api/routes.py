@@ -320,6 +320,67 @@ def create_app() -> FastAPI:
             "entries": threed.queue_snapshot(),
         }
 
+    @app.post("/generations/stop")
+    async def stop_all_generations() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Preemptively terminate every in-flight generation — process-wide,
+        across all runs, versions, and (slot, model) cells — without wiping any
+        state, so each can be resumed/retried afterward:
+
+          * Pipeline builds (`_tasks`) are cancelled, then their cell is flipped
+            to `paused` + `run.paused` (identical to a per-cell pause), so the
+            dashboard shows it as resumable and `/resume` re-enters the pipeline,
+            short-circuiting everything already on disk.
+          * From-scratch builds (`_generate_tasks`) are cancelled; re-pressing
+            generate resumes them (finished optimized twins are skipped).
+          * Standalone mesh retries (`_retry_tasks`) are cancelled.
+
+        Underlying Trellis/Banana mesh tasks live on each version's
+        `generation._pending`; a cancelled retry's wrapper has already returned
+        and no longer owns its mesh, so we drain `_pending` for every hydrated
+        cell to be sure none leak. On-disk artifacts + event logs are untouched
+        — only in-memory tasks die, which is what makes this resumable rather
+        than destructive."""
+        pipeline_keys = [k for k, t in _tasks.items() if not t.done()]
+        generate_keys = [k for k, t in _generate_tasks.items() if not t.done()]
+        retry_tasks = [t for t in _retry_tasks if not t.done()]
+
+        # Fire every cancellation before awaiting any, so in-flight network
+        # awaits unwind concurrently instead of one cancellation at a time.
+        pipeline_tasks = [_tasks.pop(k) for k in pipeline_keys]
+        generate_tasks = [_generate_tasks.pop(k) for k in generate_keys]
+        for task in (*pipeline_tasks, *generate_tasks, *retry_tasks):
+            task.cancel()
+
+        # Drain the per-run mesh-task tables on every hydrated cell, dispatched
+        # to each run's generation module (v1 → generation_old, v2/v3 → generation).
+        for run_name, slot_id, model_alias in list(_slot_logs.keys()):
+            versions.for_run(run_name).generation.cancel_pending(
+                _run_id(run_name, slot_id, model_alias),
+            )
+
+        for task in (*pipeline_tasks, *generate_tasks, *retry_tasks):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+        # Flip each stopped pipeline cell to paused (resumable) + sentinel —
+        # only while still "running", so a status the task wrote just before
+        # cancellation landed (run.done / run.error) is never clobbered.
+        paused: list[str] = []
+        for key in pipeline_keys:
+            slot_log = _slot_logs.get(key)
+            if slot_log is None or slot_log.state.get("status") != "running":
+                continue
+            slot_log.state["status"] = "paused"
+            slot_log.log("run.paused")
+            paused.append(_run_id(*key))
+
+        return {
+            "stopped_pipelines": [_run_id(*k) for k in pipeline_keys],
+            "stopped_generates": [_run_id(*k) for k in generate_keys],
+            "stopped_retries": len(retry_tasks),
+            "paused": paused,
+        }
+
     @app.get("/slots/{slot_id}/{model_alias}/events")
     async def slot_events(slot_id: str, model_alias: str, since: int = -1, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)

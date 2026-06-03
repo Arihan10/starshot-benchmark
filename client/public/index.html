@@ -356,6 +356,26 @@
                 opacity: 0.5;
                 cursor: default;
             }
+            #stop-all {
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #5a4422;
+                background: #16181d;
+                color: #e0a050;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #stop-all:hover:not(:disabled) {
+                background: #3a2e1a;
+                border-color: #e09050;
+                color: #ffce8a;
+            }
+            #stop-all:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
             #start-cells {
                 padding: 5px 10px;
                 border-radius: 4px;
@@ -2295,6 +2315,7 @@
                 <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
                 <button id="slot-resume" type="button" style="display:none">resume</button>
                 <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
+                <button id="stop-all" type="button" title="Preemptively halt EVERY in-flight generation across ALL runs and versions — pipeline builds, from-scratch generates, and mesh retries. Running cells become paused; nothing is deleted, so resume a cell or re-press generate/retry to pick up where it left off.">stop all</button>
                 <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
                 <button id="reset-all" type="button" title="Wipe every started cell across ALL models on the current run (every slot × model that has data) back to idle. Skips never-run cells. Nothing is restarted — use 'start cells…' to launch the ones you want.">reset all</button>
                 <button id="start-cells" type="button" title="Pick exactly which cells to start: choose any combination of versions × models × slots and launch them at once. Cells that are already running or done are skipped.">start cells…</button>

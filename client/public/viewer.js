@@ -38,6 +38,7 @@ const runNewEl = document.getElementById("run-new");
 const saveAllEl = document.getElementById("save-all");
 const snapshotAllEl = document.getElementById("snapshot-all");
 const resumeAllEl = document.getElementById("resume-all");
+const stopAllEl = document.getElementById("stop-all");
 const resetAllEl = document.getElementById("reset-all");
 const startCellsEl = document.getElementById("start-cells");
 const startModalEl = document.getElementById("start-modal");
@@ -4734,6 +4735,49 @@ async function resumeAll() {
 }
 
 resumeAllEl.addEventListener("click", resumeAll);
+
+async function stopAll() {
+  // Preemptive global kill switch: POST /generations/stop halts EVERY in-flight
+  // generation process-wide (all runs, all versions, all cells) — pipeline
+  // builds, from-scratch generates, and mesh retries — and leaves them
+  // resumable/retryable (running cells become paused). Nothing on disk is
+  // touched, so this is a safe interrupt, not a reset. The viewed cell's open
+  // SSE stream delivers its own run.paused; refreshSlots/refreshVersions repaint
+  // the rest of the dashboard's status dots.
+  const ok = window.confirm(
+    'Stop ALL in-flight generations across every run and version?\n\nRunning pipeline cells become paused and from-scratch builds halt. Nothing is deleted — resume a cell or re-press generate/retry to pick up where it left off.',
+  );
+  if (!ok) return;
+  stopAllEl.disabled = true;
+  try {
+    const res = await fetch(new URL("/generations/stop", SERVER_URL), {
+      method: "POST",
+    });
+    if (!res.ok) {
+      setStatus(`stop all failed: HTTP ${res.status}`, "err");
+      return;
+    }
+    const payload = await res.json();
+    const np = (payload.stopped_pipelines ?? []).length;
+    const ng = (payload.stopped_generates ?? []).length;
+    const nr = payload.stopped_retries ?? 0;
+    if (np + ng + nr === 0) {
+      setStatus("nothing in flight to stop");
+    } else {
+      setStatus(
+        `stopped ${np} pipeline${np === 1 ? "" : "s"}, ${ng} generate${ng === 1 ? "" : "s"}, ${nr} retr${nr === 1 ? "y" : "ies"} — all resumable`,
+      );
+    }
+    refreshSlots();
+    refreshVersions();
+  } catch (e) {
+    setStatus(`stop all failed: ${e.message}`, "err");
+  } finally {
+    stopAllEl.disabled = false;
+  }
+}
+
+stopAllEl.addEventListener("click", stopAll);
 
 async function resumeSlot(id, model) {
   resumeEl.disabled = true;
