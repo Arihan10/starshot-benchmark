@@ -784,9 +784,9 @@ def render_zone_bbox_batch(
     parent: {c.parent!r}
     parent_kind: {c.parent_kind.value}
 {_child_parent_dims(c)}
-    prompt: {c.prompt}
+    prompt: "{c.prompt}"
     proxy_shape: {_render_proxy_shape(c.proxy_shape)}
-    placement: {c.placement}
+    placement: "{c.placement}"
     referenced_ids: {_render_relationships(c.referenced_ids)}"""
         for c in children
     )
@@ -980,7 +980,7 @@ def _render_node_entry(
     head = f'<node id="{nid}"{parent_attr}>'
     lines: list[str] = []
     if prompt is not None:
-        lines.append(f"  prompt: {prompt}")
+        lines.append(f'  prompt: "{prompt}"')
     if parent_kind is not None:
         lines.append(f"  parent_kind: {parent_kind}")
     if bbox is not None:
@@ -997,13 +997,13 @@ def _render_node_entry(
     if orientation is not None:
         lines.append(f"  orientation: {orientation}deg")
     if placement is not None:
-        lines.append(f"  placement: {placement}")
+        lines.append(f'  placement: "{placement}"')
     elif placement_unset_label is not None:
         lines.append(f"  placement: {placement_unset_label}")
     if referenced_ids is not None:
         lines.append(f"  referenced_ids: {_render_relationships(referenced_ids)}")
     if plan is not None:
-        lines.append(f"  plan: {plan}")
+        lines.append(f'  plan: "{plan}"')
     elif plan_unset_label is not None:
         lines.append(f"  plan: {plan_unset_label}")
     return head + "\n" + "\n".join(lines) + "\n</node>"
@@ -1372,10 +1372,10 @@ def render_object_bbox_batch(
     parent: {o.parent!r}
     parent_kind: {o.parent_kind.value}
 {_parent_dims_line(o)}
-    prompt: {o.prompt}
+    prompt: "{o.prompt}"
     proxy_shape: {_render_proxy_shape(o.proxy_shape)}
     orientation: {o.orientation}deg
-    placement: {o.placement}
+    placement: "{o.placement}"
     referenced_ids: {_render_relationships(o.referenced_ids)}"""
         for o in objects
     )

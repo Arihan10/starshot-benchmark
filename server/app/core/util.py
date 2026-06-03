@@ -74,6 +74,21 @@ def format_local_bbox(bbox: BoundingBox, parent: BoundingBox) -> str:
     return format_global_bbox(bbox.to_local_frame(parent))
 
 
+def format_dimensions(bbox: BoundingBox) -> str:
+    """The bbox's signed `dimensions` vector in meters, rendered on its own line so the global and parent-local frames need not each repeat it."""
+    return f"{_fmt_vec(bbox.dimensions)} m"
+
+
+def format_global_origin(bbox: BoundingBox) -> str:
+    """World-space origin corner of a bbox in meters; its size is rendered separately via `format_dimensions`. The caller supplies the leading label (e.g. "Global origin corner:")."""
+    return f"{_fmt_vec(bbox.origin)} m"
+
+
+def format_local_origin(bbox: BoundingBox, parent: BoundingBox) -> str:
+    """`bbox`'s origin corner measured from `parent`'s minimum corner (i.e. in `parent`'s local frame), in meters. The caller supplies the leading label."""
+    return f"{_fmt_vec(bbox.to_local_frame(parent).origin)} m"
+
+
 # --- brace-block indentation -------------------------------------------------
 
 
