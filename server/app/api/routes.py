@@ -366,11 +366,13 @@ def create_app() -> FastAPI:
         # `mode=generated` streams the from-scratch build's sibling folder
         # instead of the library `objects/`; this is the only thing the client's
         # asset toggle flips. The two builds coexist under the same cell dir.
+        # Generated meshes are served from their OPTIMIZED twin (decimated +
+        # KTX2 + Meshopt) — raw Trellis output is far too heavy to stream.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         cell_dir = slot_log.events_path.parent
         if mode == "generated":
-            objects_dir = cell_dir / "objects-generated"
+            objects_dir = cell_dir / "objects-generated-optimized"
         else:
             objects_dir = cell_dir / OBJECTS_SUBDIR
             if not objects_dir.is_dir():
@@ -573,7 +575,9 @@ def create_app() -> FastAPI:
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
         task = _generate_tasks.get((run, slot_id, model_alias))
-        gen_dir = _slot_dir(run, slot_id, model_alias) / "objects-generated"
+        # Report the OPTIMIZED twins — those are what's served, and an id only
+        # lands here once its optimize pass has fully finished.
+        gen_dir = _slot_dir(run, slot_id, model_alias) / "objects-generated-optimized"
         ids = (
             sorted(p.name[: -len(".glb")] for p in gen_dir.glob("*.glb") if not p.name.endswith(".raw.glb"))
             if gen_dir.is_dir()

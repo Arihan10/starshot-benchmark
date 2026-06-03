@@ -57,6 +57,63 @@ _MESH_IO = asyncio.Semaphore(1)
 # whole scene can be in flight without exceeding the Trellis in-flight cap.
 _GENERATE_FANOUT = asyncio.Semaphore(100)
 
+# The asset-library optimizer (tools/optimize-assets/optimize.mjs) — the same
+# weld/decimate/prune + KTX2 + Meshopt pass every library asset goes through.
+# Raw Trellis output is ~500k tris / ~10-20MB each; this brings every generated
+# asset down to the library's ~15-20k-tri, GPU-compressed footprint so the
+# generated view streams and renders like the library one. CPU/RAM-heavy (sharp
+# decode + Basis encode), so cap concurrent node subprocesses well below the
+# number of assets that may be in flight.
+_OPTIMIZE_DIR = Path(__file__).resolve().parents[2] / "tools" / "optimize-assets"
+_OPTIMIZE_SCRIPT = _OPTIMIZE_DIR / "optimize.mjs"
+_NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
+_OPTIMIZE_FANOUT = asyncio.Semaphore(4)
+
+
+async def _optimize_asset(src: Path, dst: Path) -> bool:
+    """Run one freshly generated GLB through the library optimizer into `dst`.
+    Atomic via a temp file (in src's dir, which isn't served) so a crash can't
+    leave a half-written optimized asset that resume would treat as finished.
+    On any failure `dst` is left absent, so a re-run retries it — cheaply, since
+    the raw mesh and Trellis cache are reused."""
+    # Absolute paths: the subprocess runs with cwd=_OPTIMIZE_DIR, and RUNS_DIR
+    # may be relative to the server's cwd, so relative paths would resolve wrong.
+    src = src.resolve()
+    dst = dst.resolve()
+    async with _OPTIMIZE_FANOUT:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = src.with_name(f"{src.stem}.opt-tmp.glb")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _NODE_BIN, str(_OPTIMIZE_SCRIPT),
+                "--file", str(src), "--out-file", str(tmp),
+                cwd=str(_OPTIMIZE_DIR),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as e:
+            logging.log("generate.optimize_error", id=src.stem, message=f"{type(e).__name__}: {e}")
+            return False
+        try:
+            _, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            proc.kill()
+            tmp.unlink(missing_ok=True)
+            raise
+        if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, dst)
+            png = src.with_suffix(".png")
+            if png.exists():
+                await asyncio.to_thread(shutil.copyfile, png, dst.with_suffix(".png"))
+            return True
+        tmp.unlink(missing_ok=True)
+        logging.log(
+            "generate.optimize_error",
+            id=src.stem,
+            message=(stderr.decode(errors="replace")[:500] if stderr else f"node exit {proc.returncode}"),
+        )
+        return False
+
 
 def _artifact_url(runs_dir: Path, path: Path) -> str:
     return f"/artifacts/{path.relative_to(runs_dir).as_posix()}"
@@ -653,16 +710,23 @@ async def generate_assets(
     runs_dir: Path,
     run_id: str,
 ) -> None:
-    """From-scratch (Nano-Banana + Trellis) build of `nodes` into the cell's
-    `objects-generated/` dir — the client's "generate" gate, independent of
-    `_USE_ASSET_LIBRARY` and the library build's `objects/`.
+    """From-scratch (Nano-Banana + Trellis) build of `nodes` for the client's
+    "generate" gate, independent of `_USE_ASSET_LIBRARY` and the library build's
+    `objects/`. Two dirs under the cell:
+
+      * `objects-generated/`            raw Trellis meshes (intermediate)
+      * `objects-generated-optimized/`  the served set — each raw mesh run
+        through the SAME optimizer the asset library uses (decimate + prune +
+        KTX2 textures + Meshopt), so a generated asset is never streamed
+        un-optimized (raw Trellis output is ~500k tris / tens of MB each).
 
     Each node carries the bbox / orientation / image_prompt reconstructed from
     the library build's log, so every generated mesh is rescaled into the exact
     same bounding box the library asset occupied — an apples-to-apples swap of a
-    matched asset for a freshly generated one. Nodes whose GLB already exists are
-    skipped, so re-running this is how the gate "resumes": it regenerates only
-    the failed/interrupted assets and leaves finished ones untouched.
+    matched asset for a freshly generated one. Nodes that already have an
+    OPTIMIZED twin are skipped, so re-running this is how the gate "resumes": it
+    regenerates only the failed/interrupted assets and leaves finished ones
+    untouched.
 
     Up to `_GENERATE_FANOUT` assets run at once; threed's `_pace_submit` spaces
     the actual Trellis submits ~1s apart so the batch ramps onto Modal instead of
@@ -672,23 +736,29 @@ async def generate_assets(
     services record their resumable submit/done bookkeeping there. The caller
     binds a dedicated log (events.generated.jsonl) so none of this lands in the
     library build's event stream."""
-    objs_dir = runs_dir / run_id / "objects-generated"
-    objs_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir = runs_dir / run_id / "objects-generated"
+    opt_dir = runs_dir / run_id / "objects-generated-optimized"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    opt_dir.mkdir(parents=True, exist_ok=True)
 
     async def _bounded(node: Node) -> None:
         async with _GENERATE_FANOUT:
+            rescaled = raw_dir / f"{node.id}.glb"
             await _generate_one(
                 node,
-                raw=objs_dir / f"{node.id}.raw.glb",
-                path=objs_dir / f"{node.id}.glb",
-                image_stem=objs_dir / node.id,
+                raw=raw_dir / f"{node.id}.raw.glb",
+                path=rescaled,
+                image_stem=raw_dir / node.id,
                 runs_dir=runs_dir,
             )
+            # Optimize into the served dir; only the optimized twin is shown.
+            if rescaled.exists():
+                await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
 
     tasks = [
         asyncio.create_task(_bounded(node))
         for node in nodes
-        if not (objs_dir / f"{node.id}.glb").exists()
+        if not (opt_dir / f"{node.id}.glb").exists()
     ]
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)

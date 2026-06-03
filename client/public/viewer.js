@@ -4962,8 +4962,10 @@ function reloadMeshesForAssetMode() {
 }
 
 function generatedArtifactUrl(slotId, model, run, id) {
+  // Served from the optimized twin (decimated + KTX2 + Meshopt) — same as the
+  // /meshes?mode=generated bundle.
   return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated/${encodeURIComponent(id)}.glb`,
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated-optimized/${encodeURIComponent(id)}.glb`,
     SERVER_URL,
   ).toString();
 }
