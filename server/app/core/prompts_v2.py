@@ -453,7 +453,7 @@ You are authoring the plan for ONE region within a larger scene, and deciding wh
 </role>
 
 <input>
-The user message contains this region's seed prompt, the ancestor chain of regions above it (with their plans), the scene context already in the run, and guidance on how to author the plan and how to decide `is_atomic`.
+The user message contains this region's seed prompt, the scene context already in the run, and guidance on how to author the plan and how to decide `is_atomic`.
 </input>
 
 <output>
@@ -685,7 +685,7 @@ You are deciding the structural decomposition of one region of the scene — how
 </role>
 
 <input>
-The user message contains this zone's id, prompt, bbox, and plan, plus the scene context (ancestor chain and every other zone/object already placed in the run, which you may reference by id).
+The user message contains this zone's id, prompt, bbox, and plan, plus the (every other zone/object already placed in the run, which you may reference by id).
 </input>
 
 <output>
@@ -917,7 +917,7 @@ You are enumerating the defining anchor objects of an atomic leaf zone — the o
 </role>
 
 <input>
-The user message contains this zone's id, bbox, and plan, plus the scene context (ancestor chain and every other zone/object already placed in the run, which you may reference by id).
+The user message contains this zone's id, bbox, and plan, plus the scene context (every other zone/object already placed in the run, which you may reference by id).
 </input>
 
 {_OBJECT_DECOMP_TAIL}"""
@@ -934,7 +934,7 @@ If and ONLY if so, you are to output a list of objects that represent the perime
 </role>
 
 <input>
-The user message contains this zone's id, bbox, and plan, plus the scene context (ancestor chain and every other zone/object already placed in the run, which you may reference by id).
+The user message contains this zone's id, bbox, and plan, plus the scene context (every other zone/object already placed in the run, which you may reference by id).
 </input>
 
 {_OBJECT_DECOMP_TAIL}"""
