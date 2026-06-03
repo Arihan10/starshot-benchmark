@@ -52,8 +52,8 @@ TRELLIS_SEED = 0
 
 # Spawn-and-poll cadence. The API caps any single job at ~10 min
 # wall-clock; warm 512-res jobs finish in ~3s, 1536-res in ~60s, cold
-# starts add 30-90s. 12s × GENERATE_CONCURRENCY=20 = 100 polls/min
-# aggregate — OK while Modal's LB spreads it across the 20 containers
+# starts add 30-90s. 12s × GENERATE_CONCURRENCY=100 = 500 polls/min
+# aggregate — OK while Modal's LB spreads it across the 100 containers
 # (~5/min each, under the per-IP-per-container `/jobs/{id}` 60/60s limit),
 # but a pin to a single container would now exceed it.
 POLL_INTERVAL_SECONDS = 12.0
@@ -89,14 +89,34 @@ class JobLostError(Exception):
     treat this as a resubmit signal: drop the dead task_id and call
     `_post_generate` again on the next attempt."""
 
-# Cap the number of in-flight Trellis jobs at any moment. Set to match
-# Modal's actual GPU container count for our Trellis app — we own the
-# endpoint and are the only client, so submitting at exactly this many
-# means Modal never queues on its side and every "pending" status maps
-# to active GPU processing rather than queue wait. The semaphore acts
-# as our FIFO queue (process-global, across all benchmark slots).
-GENERATE_CONCURRENCY = 20
+# Cap on in-flight Trellis jobs at any moment (process-global FIFO across all
+# slots). Submits are additionally spaced by `_pace_submit` so a burst up to
+# this many ramps onto the endpoint instead of hitting it all at once — Trellis
+# 429s on bursts. Modal autoscales / queues beyond its live GPU count, so a
+# "pending" status here can mean queued rather than actively processing.
+GENERATE_CONCURRENCY = 100
 _inflight_sem = asyncio.Semaphore(GENERATE_CONCURRENCY)
+
+# Minimum spacing between successive `POST /generate` submits, process-globally.
+# The in-flight cap governs how MANY jobs run at once; this governs how FAST we
+# hand them to Modal. Without it, a batch (the generate gate firing a whole
+# scene, or a large zone) bursts every submit simultaneously and trips the
+# endpoint's 429 rate limit; spacing them ~1/s keeps us under it while still
+# letting up to GENERATE_CONCURRENCY run concurrently. The read-modify-write of
+# `_next_submit_at` needs no lock — asyncio runs it without an intervening await.
+_SUBMIT_MIN_INTERVAL_S = 1.0
+_next_submit_at = 0.0
+
+
+async def _pace_submit() -> None:
+    global _next_submit_at
+    loop = asyncio.get_running_loop()
+    now = loop.time()
+    target = max(now, _next_submit_at)
+    _next_submit_at = target + _SUBMIT_MIN_INTERVAL_S
+    delay = target - now
+    if delay > 0:
+        await asyncio.sleep(delay)
 
 # Live snapshot of in-flight Trellis work. Process-global so the queue
 # view reflects the same scope as the semaphore. Keyed by (slot_id,
@@ -398,6 +418,9 @@ async def generate_mesh(
             for attempt in range(MAX_ATTEMPTS):
                 try:
                     if server_job_id is None:
+                        # Space submits ~1/s globally so a batch ramps onto
+                        # Modal instead of bursting into a 429 storm.
+                        await _pace_submit()
                         server_job_id = await _post_generate(image_bytes, image_mime)
                         _queue_set(slot_id, job_id, "processing", task_id=server_job_id)
                         logging.log(

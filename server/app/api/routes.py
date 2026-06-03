@@ -47,7 +47,7 @@ from app.core.slots import (
     Slot,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
-from app.pipeline import versions
+from app.pipeline import generation, versions
 from app.services import llm, threed
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
@@ -77,6 +77,10 @@ RunKey = tuple[str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
 _retry_tasks: set[asyncio.Task[None]] = set()
+# In-flight "generate from-scratch assets" task per cell. Drives the client's
+# generate gate (a cell can't re-trigger until its current build finishes) and
+# lets shutdown / reset cancel a build cleanly.
+_generate_tasks: dict[RunKey, asyncio.Task[None]] = {}
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
 
@@ -191,10 +195,15 @@ def create_app() -> FastAPI:
                 task.cancel()
             for task in _retry_tasks:
                 task.cancel()
+            for task in _generate_tasks.values():
+                task.cancel()
             for task in list(_tasks.values()):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             for task in list(_retry_tasks):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            for task in list(_generate_tasks.values()):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             await threed.disconnect_http()
@@ -346,24 +355,31 @@ def create_app() -> FastAPI:
         return _scene_projection(list(slot_log.state["events"]))
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, mode: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
         # cap those at ~6 per origin, and they'd contend with the SSE stream
         # and polls on this same origin). The client keys each blob to its
         # `model` event by file stem; see `_mesh_bundle`.
+        #
+        # `mode=generated` streams the from-scratch build's sibling folder
+        # instead of the library `objects/`; this is the only thing the client's
+        # asset toggle flips. The two builds coexist under the same cell dir.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         cell_dir = slot_log.events_path.parent
-        objects_dir = cell_dir / OBJECTS_SUBDIR
-        if not objects_dir.is_dir():
-            # Migrated cells keep only objects-optimized (rebake_runs.py
-            # --prune-originals); pre-migration cells keep only objects.
-            objects_dir = next(
-                (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
-                objects_dir,
-            )
+        if mode == "generated":
+            objects_dir = cell_dir / "objects-generated"
+        else:
+            objects_dir = cell_dir / OBJECTS_SUBDIR
+            if not objects_dir.is_dir():
+                # Migrated cells keep only objects-optimized (rebake_runs.py
+                # --prune-originals); pre-migration cells keep only objects.
+                objects_dir = next(
+                    (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
+                    objects_dir,
+                )
         return StreamingResponse(
             _mesh_bundle(objects_dir),
             media_type="application/octet-stream",
@@ -476,6 +492,95 @@ def create_app() -> FastAPI:
             "node_id": node_id,
         }
 
+    @app.post("/slots/{slot_id}/{model_alias}/generate")
+    async def slot_generate(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """The generate gate: build from-scratch (Nano-Banana + Trellis) assets
+        for this cell into `objects-generated/`, reusing the library build's
+        layout — every object's existing bbox/orientation — so the client's
+        "generated" view is an apples-to-apples swap of matched assets for
+        freshly generated ones. Only one build per cell at a time; re-pressing
+        while one is in flight returns 409 (the gate). Resumable + side-effect
+        free for the library build: bookkeeping lands in events.generated.jsonl,
+        never the library log, and meshes already on disk are skipped."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key = (run, slot_id, model_alias)
+        in_flight = _generate_tasks.get(key)
+        if in_flight is not None and not in_flight.done():
+            raise HTTPException(status_code=409, detail="generation already running")
+
+        # Reconstruct every concrete (object/frame) node from the library log so
+        # generation reuses the exact layout instead of re-running the divider.
+        ver = versions.for_run(run)
+        prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+        seen: set[str] = set()
+        nodes: list[Node] = []
+        for event in lib_log.state["events"]:
+            if event.get("kind") != "bbox" or event.get("node_kind") == "zone":
+                continue
+            node_id = event.get("id")
+            if not isinstance(node_id, str) or node_id in seen:
+                continue
+            seen.add(node_id)
+            node = _reconstruct_node(lib_log, node_id)
+            if node is not None:
+                nodes.append(node)
+        if not nodes:
+            raise HTTPException(
+                status_code=400,
+                detail="no scene to generate from; build the library scene first",
+            )
+
+        # Dedicated log for the build's resumable bookkeeping (nano_banana /
+        # threed require a bound SlotLog). Kept apart from the library log so the
+        # toggle stays a pure folder switch and the library stream is untouched.
+        gen_log = SlotLog(
+            _run_id(run, slot.id, model_alias) + "::generated",
+            _slot_dir(run, slot.id, model_alias) / "events.generated.jsonl",
+        )
+        gen_log.hydrate_from_disk()
+        run_id = _run_id(run, slot.id, model_alias)
+
+        async def _do_generate() -> None:
+            rlog.bind(gen_log)
+            prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+            try:
+                await generation.generate_assets(
+                    nodes=nodes, runs_dir=RUNS_DIR, run_id=run_id,
+                )
+            finally:
+                gen_log.close()
+
+        _generate_tasks[key] = asyncio.create_task(_do_generate())
+        return {"run": run, "slot_id": slot.id, "model": model_alias, "nodes": len(nodes)}
+
+    @app.get("/slots/{slot_id}/{model_alias}/generate")
+    async def slot_generate_status(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Gate state for the client: whether a from-scratch build is in flight,
+        plus the ids of every finished GLB in `objects-generated/`. Polled while
+        the "generated" view is active so the client can enable/disable the gate
+        and attach freshly-built meshes one by one as they land."""
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        task = _generate_tasks.get((run, slot_id, model_alias))
+        gen_dir = _slot_dir(run, slot_id, model_alias) / "objects-generated"
+        ids = (
+            sorted(p.name[: -len(".glb")] for p in gen_dir.glob("*.glb") if not p.name.endswith(".raw.glb"))
+            if gen_dir.is_dir()
+            else []
+        )
+        return {"running": task is not None and not task.done(), "count": len(ids), "ids": ids}
+
     @app.post("/slots/{slot_id}/{model_alias}/reset")
     async def slot_reset(  # pyright: ignore[reportUnusedFunction]
         slot_id: str,
@@ -488,6 +593,13 @@ def create_app() -> FastAPI:
         _require_model(model_alias)
         ver = versions.for_run(run)
         await _cancel_task(run, slot_id, model_alias)
+        # Tear down an in-flight from-scratch build too, so its meshes aren't
+        # being written into the dir we're about to wipe.
+        gen_task = _generate_tasks.pop((run, slot_id, model_alias), None)
+        if gen_task is not None and not gen_task.done():
+            gen_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await gen_task
         # Cancel any standalone retries (registered on this version's
         # generation._pending but with no owning _run task to drive cleanup)
         # that the running task wouldn't have touched.

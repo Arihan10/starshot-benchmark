@@ -444,6 +444,48 @@
                 opacity: 0.5;
                 cursor: default;
             }
+            /* assets mode toggle (library ▸ generated) + the generate gate */
+            #asset-mode-toggle,
+            #generate-gate {
+                padding: 5px 10px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #asset-mode-toggle:hover {
+                border-color: #4a8fd8;
+                color: #e6e6e6;
+            }
+            /* generated mode is the from-scratch (Nano-Banana + Trellis) path —
+               tint it the purple used elsewhere for generated content. */
+            #asset-mode-toggle.generated {
+                background: #241a2c;
+                border-color: #6a4a7a;
+                color: #d8b8f0;
+            }
+            #asset-mode-toggle.generated:hover {
+                border-color: #c586d1;
+                color: #f0d8ff;
+            }
+            #generate-gate {
+                background: #241a2c;
+                border-color: #6a4a7a;
+                color: #d8b8f0;
+            }
+            #generate-gate:hover:not(:disabled) {
+                background: #3a2747;
+                border-color: #c586d1;
+                color: #f0d8ff;
+            }
+            #generate-gate:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
             #replay-gif.recording {
                 background: #2a3a5a;
                 color: #9ad4ff;
@@ -2265,6 +2307,10 @@
                 <button id="select-mode-toggle" type="button" title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it">select: all</button>
                 <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
                 <button id="grid-toggle" type="button" title="Show or hide the infinite ground grid">grid: on</button>
+                <div class="ctrl-sep"></div>
+                <span class="ctrl-label">assets</span>
+                <button id="asset-mode-toggle" type="button" title="Switch which asset source this cell renders: 'library' shows the meshes matched from the pre-built asset library (objects/, the default); 'generated' shows the from-scratch Nano-Banana + Trellis build (objects-generated/). Only the meshes swap — same scene layout.">assets: library</button>
+                <button id="generate-gate" type="button" style="display:none" title="Start from-scratch asset generation (Nano-Banana + Trellis) into objects-generated/, reusing the library build's layout — same bounding boxes, freshly generated meshes. Disabled until the current build finishes.">⚡ generate</button>
                 <div class="ctrl-sep"></div>
                 <span class="ctrl-label">export</span>
                 <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>

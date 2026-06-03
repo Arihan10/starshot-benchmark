@@ -50,6 +50,13 @@ _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "tr
 # texture buffers and trip the OOM killer.
 _MESH_IO = asyncio.Semaphore(1)
 
+# How many assets the generate gate works on at once (process-global, shared
+# across simultaneous generates). The burst of submits is smoothed by threed's
+# `_pace_submit` (≥1s between Trellis `POST /generate`), so this just bounds how
+# many pipelines are live concurrently; matches threed.GENERATE_CONCURRENCY so a
+# whole scene can be in flight without exceeding the Trellis in-flight cap.
+_GENERATE_FANOUT = asyncio.Semaphore(100)
+
 
 def _artifact_url(runs_dir: Path, path: Path) -> str:
     return f"/artifacts/{path.relative_to(runs_dir).as_posix()}"
@@ -575,14 +582,17 @@ async def _generate_one(
                 url=_artifact_url(runs_dir, image_path),
                 prompt=node.prompt,
             )
-        await threed.generate_mesh(
+        # generate_mesh writes `raw` on a fresh run but returns a *cached* path
+        # on a resumable hit (which may not be `raw` when the bound log was
+        # hydrated from another build). Load whatever it actually produced.
+        produced = await threed.generate_mesh(
             image.image_bytes,
             output_path=raw,
             job_id=node.id,
             image_mime=image.mime_type,
         )
         async with _MESH_IO:
-            scene = await asyncio.to_thread(trimesh.load, raw)
+            scene = await asyncio.to_thread(trimesh.load, produced)
             rescaled = await asyncio.to_thread(
                 rescale_mesh_to_bbox,
                 scene,
@@ -635,6 +645,53 @@ async def _spawn_meshes(
         )
         out.append(node.model_copy(update={"mesh_url": url}))
     return out
+
+
+async def generate_assets(
+    *,
+    nodes: list[Node],
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """From-scratch (Nano-Banana + Trellis) build of `nodes` into the cell's
+    `objects-generated/` dir — the client's "generate" gate, independent of
+    `_USE_ASSET_LIBRARY` and the library build's `objects/`.
+
+    Each node carries the bbox / orientation / image_prompt reconstructed from
+    the library build's log, so every generated mesh is rescaled into the exact
+    same bounding box the library asset occupied — an apples-to-apples swap of a
+    matched asset for a freshly generated one. Nodes whose GLB already exists are
+    skipped, so re-running this is how the gate "resumes": it regenerates only
+    the failed/interrupted assets and leaves finished ones untouched.
+
+    Up to `_GENERATE_FANOUT` assets run at once; threed's `_pace_submit` spaces
+    the actual Trellis submits ~1s apart so the batch ramps onto Modal instead of
+    bursting into a 429 storm.
+
+    Requires a bound SlotLog: `_generate_one` and the nano_banana / threed
+    services record their resumable submit/done bookkeeping there. The caller
+    binds a dedicated log (events.generated.jsonl) so none of this lands in the
+    library build's event stream."""
+    objs_dir = runs_dir / run_id / "objects-generated"
+    objs_dir.mkdir(parents=True, exist_ok=True)
+
+    async def _bounded(node: Node) -> None:
+        async with _GENERATE_FANOUT:
+            await _generate_one(
+                node,
+                raw=objs_dir / f"{node.id}.raw.glb",
+                path=objs_dir / f"{node.id}.glb",
+                image_stem=objs_dir / node.id,
+                runs_dir=runs_dir,
+            )
+
+    tasks = [
+        asyncio.create_task(_bounded(node))
+        for node in nodes
+        if not (objs_dir / f"{node.id}.glb").exists()
+    ]
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def retry_node(

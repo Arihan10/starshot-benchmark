@@ -19,6 +19,7 @@ const SELECT_MODE_STORAGE_KEY = "starshot.selectMode";
 const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 const GRID_VISIBLE_STORAGE_KEY = "starshot.gridVisible";
 const TABS_STORAGE_KEY = "starshot.openTabs";
+const ASSET_MODE_STORAGE_KEY = "starshot.assetMode";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
@@ -55,6 +56,18 @@ const meshesToggleEl = document.getElementById("meshes-toggle");
 const selectModeToggleEl = document.getElementById("select-mode-toggle");
 const solidFillToggleEl = document.getElementById("solid-fill-toggle");
 const gridToggleEl = document.getElementById("grid-toggle");
+const assetModeToggleEl = document.getElementById("asset-mode-toggle");
+const generateGateEl = document.getElementById("generate-gate");
+// Asset source the cell renders: "library" (pre-built meshes matched from the
+// asset library, served from objects/ — the default) or "generated" (the
+// from-scratch Nano-Banana + Trellis build, served from objects-generated/).
+// A pure view switch: only the /meshes folder changes; the scene tree, log,
+// and event stream all stay on the library build. Declared up here so
+// slotMeshesUrl() can read it from its first call.
+let assetMode = localStorage.getItem(ASSET_MODE_STORAGE_KEY) === "generated" ? "generated" : "library";
+let generating = false;          // a from-scratch build is in flight for the open cell
+let _genWasRunning = false;      // last poll saw a build running (to detect completion)
+let _genCellKey = null;          // cell the gen-gate poll is tracking
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
 const replayModalEl = document.getElementById("replay-modal");
@@ -126,7 +139,7 @@ const tqWaitingCapEl = document.getElementById("tq-waiting-cap");
 // Server-side `GENERATE_CONCURRENCY` (threed.py). Hard-coded mirror so the
 // "X/20" cap reads correctly; bump alongside the server constant if it
 // changes.
-const TRELLIS_CONCURRENCY_CAP = 20;
+const TRELLIS_CONCURRENCY_CAP = 100;
 const treeEl = document.getElementById("tree");
 const treeBodyEl = document.getElementById("tree-body");
 const treeDetailEl = document.getElementById("tree-detail");
@@ -4064,8 +4077,11 @@ function slotEventsUrl(slotId, model, run = currentRun) {
 }
 
 function slotMeshesUrl(slotId, model, run = currentRun) {
+  // `mode` is the asset toggle — the only request it touches. "library" streams
+  // objects/; "generated" streams objects-generated/. Everything else (scene,
+  // events, history) stays pinned to the library build.
   return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}`,
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}&mode=${encodeURIComponent(assetMode)}`,
     SERVER_URL,
   ).toString();
 }
@@ -4895,6 +4911,192 @@ exportGlbEl.addEventListener("click", async () => {
 setInterval(refreshSlots, 2000);
 setInterval(refreshRuns, 10000);
 setInterval(refreshVersions, 2000);
+
+// --- asset mode: library ▸ generated ----------------------------------------
+//
+// A pure client-side view switch over the SAME scene. The tree, bboxes, log,
+// and event stream always come from the library build (events.jsonl); flipping
+// the toggle only re-points the one-connection mesh bundle at the other folder
+// (objects/ ▸ objects-generated/). The generated build is produced on demand by
+// the gate button, which runs Nano-Banana + Trellis into objects-generated/
+// reusing the library layout — same bboxes, freshly generated meshes.
+
+function slotGenerateUrl(slotId, model, run = currentRun) {
+  return new URL(
+    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generate?run=${encodeURIComponent(run)}`,
+    SERVER_URL,
+  ).toString();
+}
+
+function updateGenerateGate() {
+  if (!generateGateEl) return;
+  if (assetMode !== "generated") {
+    generateGateEl.style.display = "none";
+    return;
+  }
+  generateGateEl.style.display = "";
+  generateGateEl.disabled = generating || currentSlotId === null || currentModel === null;
+  generateGateEl.textContent = generating ? "generating…" : "⚡ generate";
+}
+
+function applyAssetModeUI() {
+  if (assetModeToggleEl) {
+    assetModeToggleEl.textContent = `assets: ${assetMode}`;
+    assetModeToggleEl.classList.toggle("generated", assetMode === "generated");
+  }
+  updateGenerateGate();
+}
+
+// Swap the rendered meshes for the active asset mode WITHOUT disturbing the
+// tree/bboxes: drop the attached GLBs, bump sceneGen so any in-flight bundle is
+// ignored, then re-stream from the now-current mode's folder.
+function reloadMeshesForAssetMode() {
+  if (currentSlotId === null || currentModel === null) return;
+  for (const obj of modelsById.values()) {
+    sceneRoot.remove(obj);
+    disposeObject3D(obj);
+  }
+  modelsById.clear();
+  resetModelQueue();
+  prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
+}
+
+function generatedArtifactUrl(slotId, model, run, id) {
+  return new URL(
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated/${encodeURIComponent(id)}.glb`,
+    SERVER_URL,
+  ).toString();
+}
+
+// Attach one generated GLB by id. Mirrors attachBundleMesh's attach half. On a
+// load failure (the file can be caught mid-write while a build is running) it
+// bails WITHOUT recording an error, so the next poll simply retries it once the
+// export has finished — no permanent skip, no completion-time full reload.
+const _genLoading = new Set();
+async function loadGeneratedMesh(id, url, gen) {
+  if (gen !== sceneGen) return;
+  let gltf;
+  try {
+    gltf = await loader.loadAsync(url);
+  } catch {
+    return;
+  }
+  if (gen !== sceneGen) { disposeObject3D(gltf.scene); return; }
+  gltf.scene.traverse((child) => {
+    if (child.isMesh && child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const m of mats) m.side = THREE.DoubleSide;
+    }
+  });
+  gltf.scene.name = `mesh:${id}`;
+  gltf.scene.userData.pickId = id;
+  const prev = modelsById.get(id);
+  if (prev) {
+    sceneRoot.remove(prev);
+    disposeObject3D(prev);
+  }
+  sceneRoot.add(gltf.scene);
+  modelsById.set(id, gltf.scene);
+  applyModelVisibility(id);
+  upsertAsset(id, { status: "loaded" });
+  scheduleFitToScene();
+}
+
+// Progressive load: pull in any finished generated meshes not already attached.
+// Driven by the gate poll so meshes pop in as the build produces them, instead
+// of only after the whole build finishes.
+function loadNewGeneratedMeshes(ids, slotId, model, run) {
+  for (const id of ids) {
+    if (modelsById.has(id) || _genLoading.has(id)) continue;
+    _genLoading.add(id);
+    const gen = sceneGen;
+    loadGeneratedMesh(id, generatedArtifactUrl(slotId, model, run, id), gen)
+      .finally(() => _genLoading.delete(id));
+  }
+}
+
+// The gate: kick off a from-scratch build for the open cell. The button is
+// disabled while one is in flight (and re-enabled once the poll sees it done),
+// so a build can't be triggered on top of itself.
+async function startGenerate() {
+  if (generating || currentSlotId === null || currentModel === null) return;
+  try {
+    const res = await fetch(slotGenerateUrl(currentSlotId, currentModel), { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      setStatus(`generate failed: ${body.detail ?? `HTTP ${res.status}`}`, "err");
+      return;
+    }
+  } catch (e) {
+    setStatus(`generate failed: ${e.message}`, "err");
+    return;
+  }
+  generating = true;
+  _genWasRunning = true;
+  updateGenerateGate();
+  setStatus("generating assets — Nano-Banana + Trellis (this can take a while)…");
+}
+
+// Poll the open cell's build state while the generated view is active: keep the
+// gate's disabled state in sync, and pull the freshly built meshes in the
+// moment a build we were watching finishes.
+async function refreshGenerateGate() {
+  const cellKey =
+    currentSlotId !== null && currentModel !== null
+      ? `${currentRun}/${currentSlotId}/${currentModel}`
+      : null;
+  if (cellKey !== _genCellKey) {
+    _genCellKey = cellKey;
+    _genWasRunning = false;
+  }
+  if (assetMode !== "generated" || cellKey === null) {
+    _genWasRunning = false;
+    return;
+  }
+  const slotId = currentSlotId;
+  const model = currentModel;
+  const run = currentRun;
+  let status;
+  try {
+    const res = await fetch(slotGenerateUrl(slotId, model, run), { cache: "no-store" });
+    if (!res.ok) return;
+    status = await res.json();
+  } catch {
+    return;
+  }
+  // Bail if the user switched cell/mode while the poll was in flight.
+  if (
+    assetMode !== "generated" ||
+    currentSlotId !== slotId ||
+    currentModel !== model ||
+    currentRun !== run
+  ) {
+    return;
+  }
+  generating = !!status.running;
+  updateGenerateGate();
+  // Attach freshly-built meshes as they land. A node caught mid-write just
+  // isn't added this tick and is retried on the next one (loadGeneratedMesh
+  // doesn't cache the failure), so by the time a build finishes everything that
+  // succeeded is on screen — no need to leave the cell and come back.
+  loadNewGeneratedMeshes(status.ids ?? [], slotId, model, run);
+  if (_genWasRunning && !status.running) {
+    setStatus(`generated ${status.count} asset(s) — showing objects-generated/`);
+  }
+  _genWasRunning = !!status.running;
+}
+
+assetModeToggleEl?.addEventListener("click", () => {
+  assetMode = assetMode === "library" ? "generated" : "library";
+  try { localStorage.setItem(ASSET_MODE_STORAGE_KEY, assetMode); } catch {}
+  applyAssetModeUI();
+  // Bulk-load the target build's meshes over one connection; the gate poll then
+  // tops up any that finish afterward and syncs the gate's enabled state.
+  reloadMeshesForAssetMode();
+});
+generateGateEl?.addEventListener("click", startGenerate);
+applyAssetModeUI();
+setInterval(refreshGenerateGate, 2000);
 
 // --- replay → gif ----------------------------------------------------------
 //
