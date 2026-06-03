@@ -48,7 +48,7 @@ from app.core.slots import (
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import generation, versions
-from app.services import llm, threed
+from app.services import llm, prefabs, threed
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
@@ -81,6 +81,14 @@ _retry_tasks: set[asyncio.Task[None]] = set()
 # generate gate (a cell can't re-trigger until its current build finishes) and
 # lets shutdown / reset cancel a build cleanly.
 _generate_tasks: dict[RunKey, asyncio.Task[None]] = {}
+# Per-cell regeneration worker + its FIFO of (node_id, propagate) requests.
+# `_regen_tasks` holds the single worker task per cell; `_regen_queues` is the
+# work it drains concurrently (parallel across prefab groups, serialized within
+# one), sharing one generated-events log. Requests enqueue rather than 409 between
+# each other; still gated against _generate_tasks so a regen and a whole-scene
+# build never write the same dirs concurrently.
+_regen_tasks: dict[RunKey, asyncio.Task[None]] = {}
+_regen_queues: dict[RunKey, asyncio.Queue[tuple[str, bool]]] = {}
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
 
@@ -197,6 +205,8 @@ def create_app() -> FastAPI:
                 task.cancel()
             for task in _generate_tasks.values():
                 task.cancel()
+            for task in _regen_tasks.values():
+                task.cancel()
             for task in list(_tasks.values()):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
@@ -204,6 +214,9 @@ def create_app() -> FastAPI:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             for task in list(_generate_tasks.values()):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            for task in list(_regen_tasks.values()):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             await threed.disconnect_http()
@@ -342,13 +355,15 @@ def create_app() -> FastAPI:
         than destructive."""
         pipeline_keys = [k for k, t in _tasks.items() if not t.done()]
         generate_keys = [k for k, t in _generate_tasks.items() if not t.done()]
+        regen_keys = [k for k, t in _regen_tasks.items() if not t.done()]
         retry_tasks = [t for t in _retry_tasks if not t.done()]
 
         # Fire every cancellation before awaiting any, so in-flight network
         # awaits unwind concurrently instead of one cancellation at a time.
         pipeline_tasks = [_tasks.pop(k) for k in pipeline_keys]
         generate_tasks = [_generate_tasks.pop(k) for k in generate_keys]
-        for task in (*pipeline_tasks, *generate_tasks, *retry_tasks):
+        regen_tasks = [_regen_tasks.pop(k) for k in regen_keys]
+        for task in (*pipeline_tasks, *generate_tasks, *regen_tasks, *retry_tasks):
             task.cancel()
 
         # Drain the per-run mesh-task tables on every hydrated cell, dispatched
@@ -358,7 +373,7 @@ def create_app() -> FastAPI:
                 _run_id(run_name, slot_id, model_alias),
             )
 
-        for task in (*pipeline_tasks, *generate_tasks, *retry_tasks):
+        for task in (*pipeline_tasks, *generate_tasks, *regen_tasks, *retry_tasks):
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
 
@@ -377,6 +392,7 @@ def create_app() -> FastAPI:
         return {
             "stopped_pipelines": [_run_id(*k) for k in pipeline_keys],
             "stopped_generates": [_run_id(*k) for k in generate_keys],
+            "stopped_regens": [_run_id(*k) for k in regen_keys],
             "stopped_retries": len(retry_tasks),
             "paused": paused,
         }
@@ -577,6 +593,12 @@ def create_app() -> FastAPI:
         in_flight = _generate_tasks.get(key)
         if in_flight is not None and not in_flight.done():
             raise HTTPException(status_code=409, detail="generation already running")
+        regen_worker = _regen_tasks.get(key)
+        regen_queue = _regen_queues.get(key)
+        if (regen_worker is not None and not regen_worker.done()) or (
+            regen_queue is not None and not regen_queue.empty()
+        ):
+            raise HTTPException(status_code=409, detail="regeneration in progress")
 
         # Reconstruct every concrete (object/frame) node from the library log so
         # generation reuses the exact layout instead of re-running the divider.
@@ -635,16 +657,90 @@ def create_app() -> FastAPI:
         and attach freshly-built meshes one by one as they land."""
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
-        task = _generate_tasks.get((run, slot_id, model_alias))
-        # Report the OPTIMIZED twins — those are what's served, and an id only
-        # lands here once its optimize pass has fully finished.
-        gen_dir = _slot_dir(run, slot_id, model_alias) / "objects-generated-optimized"
-        ids = (
-            sorted(p.name[: -len(".glb")] for p in gen_dir.glob("*.glb") if not p.name.endswith(".raw.glb"))
-            if gen_dir.is_dir()
-            else []
+        key = (run, slot_id, model_alias)
+        gen_task = _generate_tasks.get(key)
+        regen_task = _regen_tasks.get(key)
+        regen_queue = _regen_queues.get(key)
+        running = (
+            (gen_task is not None and not gen_task.done())
+            or (regen_task is not None and not regen_task.done())
+            or (regen_queue is not None and not regen_queue.empty())
         )
-        return {"running": task is not None and not task.done(), "count": len(ids), "ids": ids}
+        # Report the OPTIMIZED twins — those are what's served, and an id only
+        # lands here once its optimize pass has fully finished. Each carries the
+        # GLB's mtime as a version token so the client can detect a regenerated
+        # asset (same id, new bytes) and reload just it with a cache-busted URL.
+        gen_dir = _slot_dir(run, slot_id, model_alias) / "objects-generated-optimized"
+        meshes: list[dict[str, object]] = []
+        if gen_dir.is_dir():
+            for p in sorted(gen_dir.glob("*.glb")):
+                if p.name.endswith(".raw.glb"):
+                    continue
+                try:
+                    version = p.stat().st_mtime_ns
+                except OSError:
+                    continue
+                meshes.append({"id": p.name[: -len(".glb")], "v": version})
+        ids = [m["id"] for m in meshes]
+        return {"running": running, "count": len(ids), "ids": ids, "meshes": meshes}
+
+    @app.post("/slots/{slot_id}/{model_alias}/regenerate/{node_id}")
+    async def slot_regenerate(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+        propagate: bool = False,
+    ) -> dict[str, object]:
+        """Enqueue a from-scratch regeneration of a GENERATED asset onto this
+        cell's regen worker. With `propagate=true` (the client default) the worker
+        rebuilds the prefab CANONICAL behind `node_id` and re-derives every object
+        that reuses it, so a shared prefab updates everywhere at once.
+
+        Requests ENQUEUE rather than 409 against each other: a single per-cell
+        worker (`_regen_worker`) drains the queue concurrently — in parallel across
+        prefab groups, serialized within one — sharing one generated-events log and
+        resolving each item's prefab group at execution time (so a regen enqueued
+        later sees a reuse→canonical promotion an earlier one made). Still 409s
+        while a whole-scene generate is in flight (both write the same dirs). Queued
+        items show as `waiting` rows in the shared /trellis/queue panel until the
+        worker picks them up."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key = (run, slot_id, model_alias)
+        gen_task = _generate_tasks.get(key)
+        if gen_task is not None and not gen_task.done():
+            raise HTTPException(status_code=409, detail="generation already running")
+
+        # Validate the node exists in the library layout up front (fast 404); the
+        # worker reconstructs it + resolves the prefab group again at execution.
+        ver = versions.for_run(run)
+        prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+
+        gen_slot_id = _run_id(run, slot.id, model_alias) + "::generated"
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait((node_id, propagate))
+        # Surface the queued regen in the shared Trellis queue panel until the
+        # worker dequeues it (then generate_mesh manages its own entry).
+        threed.mark_queued(gen_slot_id, node_id)
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(_regen_worker(run, slot.id, model_alias))
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "propagate": propagate,
+            "queued": True,
+            "depth": queue.qsize(),
+        }
 
     @app.post("/slots/{slot_id}/{model_alias}/reset")
     async def slot_reset(  # pyright: ignore[reportUnusedFunction]
@@ -665,6 +761,14 @@ def create_app() -> FastAPI:
             gen_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await gen_task
+        # Tear down the cell's regeneration worker + drop its queue (same dirs).
+        # The worker's finally clears any still-queued rows from the queue panel.
+        regen_task = _regen_tasks.pop((run, slot_id, model_alias), None)
+        if regen_task is not None and not regen_task.done():
+            regen_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await regen_task
+        _regen_queues.pop((run, slot_id, model_alias), None)
         # Cancel any standalone retries (registered on this version's
         # generation._pending but with no owning _run task to drive cleanup)
         # that the running task wouldn't have touched.
@@ -1023,6 +1127,7 @@ def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
             n["origin"] = e.get("origin")
             n["dimensions"] = e.get("dimensions")
             n["proxy_shape"] = e.get("proxy_shape")
+            n["orientation"] = e.get("orientation", 0)
         elif kind in ("divider.decompose", "divider.zone_decompose"):
             children = e.get("children")
             if isinstance(children, list):
@@ -1091,6 +1196,130 @@ async def _sse(
                 return
     finally:
         slot_log.unsubscribe(q)
+
+
+# How long the regen worker blocks on in-flight builds before looping back to
+# re-drain its queue. Bounds how long a regen enqueued mid-batch waits before it
+# starts (it shouldn't wait for a prior build to finish); the worker only spins
+# this while it has builds in flight, and exits outright once idle.
+_REGEN_POLL_INTERVAL_S = 0.25
+
+
+async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
+    """Drain a cell's regeneration queue CONCURRENTLY. One worker per cell owns a
+    single generated-events log for the whole drain; `SlotLog.log()` is synchronous,
+    so concurrent items append through it atomically (unique indices, no torn
+    lines). Items run in parallel ACROSS prefab groups but are serialized WITHIN a
+    group by a per-canonical lock — so two regens that resolve to the same canonical
+    (a stray double-enqueue, or a reuse plus its canonical) can't race the same
+    files, and the second re-resolves under the lock to see the first's promotion.
+    Spawns are unbounded; the heavy work is throttled by the process-global Banana
+    / Trellis / mesh-IO / optimize semaphores. Exits when the queue is empty and
+    nothing is in flight; the next enqueue restarts it. Cancellation (reset / stop
+    / teardown) cancels in-flight builds and clears any still-queued rows from the
+    shared Trellis queue panel."""
+    key = (run, slot_id, model_alias)
+    queue = _regen_queues.get(key)
+    if queue is None:
+        return
+    lib_log = _slot_logs.get(key)
+    ver = versions.for_run(run)
+    run_id = _run_id(run, slot_id, model_alias)
+    gen_slot_id = run_id + "::generated"
+    gen_log = SlotLog(gen_slot_id, _slot_dir(run, slot_id, model_alias) / "events.generated.jsonl")
+    gen_log.hydrate_from_disk()
+    rlog.bind(gen_log)
+    llm.set_model(MODELS[model_alias])
+    prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+    canon_locks: dict[str, asyncio.Lock] = {}
+
+    async def _process(node_id: str, propagate: bool) -> None:
+        if lib_log is None:
+            return
+        try:
+            # Pick the per-canonical lock by this node's current group, then do the
+            # real resolution + build UNDER the lock so same-group items serialize
+            # and a later one observes an earlier item's promotion.
+            canonical0, _ = prefabs.resolve_group(gen_log.state["events"], node_id)
+            async with canon_locks.setdefault(canonical0, asyncio.Lock()):
+                target = _reconstruct_node(lib_log, node_id)
+                if target is None:
+                    gen_log.log("mesh.error", id=node_id, message="regenerate: no bbox event for node")
+                    return
+                canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
+                if propagate:
+                    build_node = _reconstruct_node(lib_log, canonical_id)
+                    if build_node is None:
+                        gen_log.log(
+                            "mesh.error", id=node_id,
+                            message=f"regenerate: no bbox event for canonical {canonical_id}",
+                        )
+                        return
+                    reuses = [
+                        n for cid in reuse_ids if (n := _reconstruct_node(lib_log, cid)) is not None
+                    ]
+                else:
+                    build_node = target
+                    reuses = []
+                await generation.regenerate_one(
+                    node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                    subdir="objects-generated", optimize=True,
+                )
+                if propagate:
+                    await generation.propagate_reuses(
+                        canonical_id=canonical_id, reuses=reuses,
+                        runs_dir=RUNS_DIR, run_id=run_id,
+                    )
+                elif canonical_id != node_id:
+                    # A reuse regenerated on its own now owns a fresh mesh + raw —
+                    # record it as canonical so a later propagate of its old source
+                    # can't clobber it.
+                    gen_log.log(
+                        "prefab.match", id=node_id, reuse_id="", description=build_node.prompt,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            gen_log.log("mesh.error", id=node_id, message=f"{type(e).__name__}: {e}")
+
+    inflight: set[asyncio.Task[None]] = set()
+    try:
+        while True:
+            # Spawn every currently-queued item; the semaphores bound the real work.
+            while True:
+                try:
+                    node_id, propagate = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                # Worker owns the entry now; generate_mesh re-registers it on submit.
+                threed.unmark_queued(gen_slot_id, node_id)
+                inflight.add(asyncio.create_task(_process(node_id, propagate)))
+            if not inflight:
+                break
+            # Wait for a build to finish OR a short tick to elapse, then loop back
+            # to the drain — so a regen enqueued WHILE these run starts promptly
+            # (concurrently) instead of only after a prior build completes.
+            inflight = (
+                await asyncio.wait(
+                    inflight,
+                    timeout=_REGEN_POLL_INTERVAL_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            )[1]
+    finally:
+        for t in inflight:
+            t.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        # Clear any items still queued (e.g. drained early by cancellation) from
+        # the shared queue panel so they don't linger as phantom waiting rows.
+        while True:
+            try:
+                pending_id, _ = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            threed.unmark_queued(gen_slot_id, pending_id)
+        gen_log.close()
 
 
 async def _run(run: str, slot_id: str, model_alias: str) -> None:

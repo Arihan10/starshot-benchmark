@@ -39,7 +39,7 @@ from app.utils import logging, resumable
 
 TRELLIS_BASE_URL = os.environ.get(
     "TRELLIS_BASE_URL",
-    "https://starshot-aitools--trellis2-image-to-3d-router-fastapi-app.modal.run",
+    "https://starshot-aitools--starshot-assets-router-fastapi-app.modal.run",
 )
 
 # Trellis production knobs. Kept module-level so the playground / batch
@@ -167,6 +167,21 @@ def _queue_drop(slot_id: str | None, job_id: str) -> None:
     if slot_id is None:
         return
     _QUEUE.pop((slot_id, job_id), None)
+
+
+def mark_queued(slot_id: str | None, job_id: str) -> None:
+    """Register an externally-managed job (e.g. a regeneration awaiting its turn
+    in a per-cell worker) as `waiting` in the shared queue snapshot, so it shows
+    in the same `/trellis/queue` panel as live Trellis work. When the job actually
+    submits, `generate_mesh` takes over the (slot_id, job_id) entry; pair this
+    with `unmark_queued` at hand-off / cancellation so it can't leak."""
+    _queue_set(slot_id, job_id, "waiting")
+
+
+def unmark_queued(slot_id: str | None, job_id: str) -> None:
+    """Drop an entry registered via `mark_queued` — the job is starting (so
+    `generate_mesh` will manage its own entry) or was cancelled before it ran."""
+    _queue_drop(slot_id, job_id)
 
 
 def _retry_delay(attempt: int, err: BaseException) -> float:

@@ -76,9 +76,15 @@
                 margin-left: auto;
                 flex-shrink: 0;
             }
-            .bar-toggle:hover { color: #e6e6e6; }
-            #slot-bar.collapsed .slot-tab { display: none; }
-            #controls-bar.collapsed .ctrl-row { display: none; }
+            .bar-toggle:hover {
+                color: #e6e6e6;
+            }
+            #slot-bar.collapsed .slot-tab {
+                display: none;
+            }
+            #controls-bar.collapsed .ctrl-row {
+                display: none;
+            }
             .ctrl-header {
                 display: flex;
                 align-items: center;
@@ -134,11 +140,21 @@
                 flex-shrink: 0;
                 background: #5a5e68;
             }
-            .slot-dot.status-running { background: #e0c271; }
-            .slot-dot.status-done    { background: #8bd17c; }
-            .slot-dot.status-error   { background: #ff8080; }
-            .slot-dot.status-paused  { background: #e09050; }
-            .slot-dot.status-idle    { background: #5a5e68; }
+            .slot-dot.status-running {
+                background: #e0c271;
+            }
+            .slot-dot.status-done {
+                background: #8bd17c;
+            }
+            .slot-dot.status-error {
+                background: #ff8080;
+            }
+            .slot-dot.status-paused {
+                background: #e09050;
+            }
+            .slot-dot.status-idle {
+                background: #5a5e68;
+            }
             #version-bar {
                 display: flex;
                 gap: 4px;
@@ -158,7 +174,9 @@
                 cursor: pointer;
                 white-space: nowrap;
             }
-            .version-tab:hover { border-color: #4a8fd8; }
+            .version-tab:hover {
+                border-color: #4a8fd8;
+            }
             .version-tab.active {
                 background: #2a4a78;
                 border-color: #4a8fd8;
@@ -212,7 +230,9 @@
                 cursor: pointer;
                 white-space: nowrap;
             }
-            .run-tab:hover { border-color: #4a8fd8; }
+            .run-tab:hover {
+                border-color: #4a8fd8;
+            }
             .run-tab.active {
                 background: #2a4a78;
                 border-color: #4a8fd8;
@@ -232,7 +252,9 @@
                 white-space: nowrap;
                 max-width: 120px;
             }
-            .run-tab.active .rt-sub { color: #9ab4d8; }
+            .run-tab.active .rt-sub {
+                color: #9ab4d8;
+            }
             .run-tab-close {
                 color: #7a8190;
                 font-size: 13px;
@@ -560,7 +582,9 @@
                 padding: 0 4px;
                 line-height: 1;
             }
-            #replay-close:hover { color: #e6e6e6; }
+            #replay-close:hover {
+                color: #e6e6e6;
+            }
             #replay-body {
                 padding: 14px;
                 display: flex;
@@ -589,9 +613,15 @@
                 object-fit: contain;
                 display: block;
             }
-            #replay-result-img { display: none; }
-            #replay-stage.show-result #replay-preview-canvas { display: none; }
-            #replay-stage.show-result #replay-result-img { display: block; }
+            #replay-result-img {
+                display: none;
+            }
+            #replay-stage.show-result #replay-preview-canvas {
+                display: none;
+            }
+            #replay-stage.show-result #replay-result-img {
+                display: block;
+            }
             #replay-stage.empty::after {
                 content: "click preview or save to render the build";
                 position: absolute;
@@ -604,7 +634,10 @@
                 font-size: 11px;
                 line-height: 1.5;
             }
-            #replay-info b { color: #b8bcc4; font-weight: normal; }
+            #replay-info b {
+                color: #b8bcc4;
+                font-weight: normal;
+            }
             .replay-row {
                 display: flex;
                 align-items: center;
@@ -645,8 +678,12 @@
                 font-size: 11px;
                 min-height: 16px;
             }
-            #replay-status.recording { color: #f6a96a; }
-            #replay-status.done { color: #8bd17c; }
+            #replay-status.recording {
+                color: #f6a96a;
+            }
+            #replay-status.done {
+                color: #8bd17c;
+            }
             #replay-actions {
                 display: flex;
                 gap: 8px;
@@ -784,8 +821,13 @@
                 cursor: pointer;
                 user-select: none;
             }
-            #log.collapsed .line { display: none; }
-            #log.collapsed { max-height: none; overflow: hidden; }
+            #log.collapsed .line {
+                display: none;
+            }
+            #log.collapsed {
+                max-height: none;
+                overflow: hidden;
+            }
             #log.collapsed #log-header {
                 margin-bottom: 0;
                 padding-bottom: 0;
@@ -886,8 +928,12 @@
                 background: rgba(74, 143, 216, 0.15);
                 color: #e6e6e6;
             }
-            #trellis-queue .tq-row.processing .tq-dot { background: #e0c271; }
-            #trellis-queue .tq-row.waiting    .tq-dot { background: #5a5e68; }
+            #trellis-queue .tq-row.processing .tq-dot {
+                background: #e0c271;
+            }
+            #trellis-queue .tq-row.waiting .tq-dot {
+                background: #5a5e68;
+            }
             #trellis-queue .tq-row.other-slot {
                 opacity: 0.55;
                 cursor: default;
@@ -1199,9 +1245,15 @@
                 font-size: 12px;
                 word-break: break-all;
             }
-            #tree-detail .detail-id.zone { color: #e0c271; }
-            #tree-detail .detail-id.object { color: #c586d1; }
-            #tree-detail .detail-id.frame { color: #7fb3d5; }
+            #tree-detail .detail-id.zone {
+                color: #e0c271;
+            }
+            #tree-detail .detail-id.object {
+                color: #c586d1;
+            }
+            #tree-detail .detail-id.frame {
+                color: #7fb3d5;
+            }
             #tree-detail .detail-kind {
                 color: #8a8f99;
                 text-transform: uppercase;
@@ -1252,9 +1304,15 @@
                 font-weight: 600;
                 word-break: break-all;
             }
-            #tree-detail .detail-hier-id.zone { color: #e0c271; }
-            #tree-detail .detail-hier-id.object { color: #c586d1; }
-            #tree-detail .detail-hier-id.frame { color: #7fb3d5; }
+            #tree-detail .detail-hier-id.zone {
+                color: #e0c271;
+            }
+            #tree-detail .detail-hier-id.object {
+                color: #c586d1;
+            }
+            #tree-detail .detail-hier-id.frame {
+                color: #7fb3d5;
+            }
             #tree-detail .detail-hier-prompt {
                 color: #7a8190;
                 font-size: 10px;
@@ -1554,7 +1612,9 @@
                 align-items: center;
                 justify-content: center;
             }
-            #start-modal.open { display: flex; }
+            #start-modal.open {
+                display: flex;
+            }
             #start-modal-panel {
                 width: min(900px, 94vw);
                 max-height: 88vh;
@@ -1596,7 +1656,9 @@
                 padding: 0 4px;
                 line-height: 1;
             }
-            #start-modal-close:hover { color: #e6e6e6; }
+            #start-modal-close:hover {
+                color: #e6e6e6;
+            }
             #start-modal-body {
                 display: grid;
                 grid-template-columns: 1fr 1fr 1fr;
@@ -1625,7 +1687,9 @@
                 font-size: 10px;
                 letter-spacing: 0.04em;
             }
-            .start-col-head span { margin-right: auto; }
+            .start-col-head span {
+                margin-right: auto;
+            }
             .start-col-head button {
                 background: #0c0d10;
                 border: 1px solid #2a2d35;
@@ -1657,8 +1721,13 @@
                 color: #d2d6de;
                 user-select: none;
             }
-            .start-opt:hover { background: #1d2027; }
-            .start-opt input { accent-color: #4a8fd8; flex-shrink: 0; }
+            .start-opt:hover {
+                background: #1d2027;
+            }
+            .start-opt input {
+                accent-color: #4a8fd8;
+                flex-shrink: 0;
+            }
             .start-opt span {
                 white-space: nowrap;
                 overflow: hidden;
@@ -1705,7 +1774,9 @@
                 align-items: center;
                 justify-content: center;
             }
-            #tree-modal.open { display: flex; }
+            #tree-modal.open {
+                display: flex;
+            }
             #tree-modal-panel {
                 width: min(1280px, 96vw);
                 max-height: 94vh;
@@ -1774,7 +1845,9 @@
                 padding: 0 4px;
                 line-height: 1;
             }
-            #tree-modal-close:hover { color: #e6e6e6; }
+            #tree-modal-close:hover {
+                color: #e6e6e6;
+            }
             #tree-modal-body {
                 padding: 12px 14px 20px;
                 overflow: auto;
@@ -1799,15 +1872,25 @@
                 border-radius: 4px;
                 background: #1a1c22;
             }
-            .tm-card.kind-zone   { border-left-color: #e0c271; }
-            .tm-card.kind-object { border-left-color: #c586d1; }
-            .tm-card.kind-frame  { border-left-color: #7fb3d5; }
+            .tm-card.kind-zone {
+                border-left-color: #e0c271;
+            }
+            .tm-card.kind-object {
+                border-left-color: #c586d1;
+            }
+            .tm-card.kind-frame {
+                border-left-color: #7fb3d5;
+            }
             .tm-card.selected {
                 background: #1f2632;
                 outline: 1px solid #4a8fd8;
             }
-            .tm-card.dimmed { opacity: 0.32; }
-            .tm-card.hit { background: #232618; }
+            .tm-card.dimmed {
+                opacity: 0.32;
+            }
+            .tm-card.hit {
+                background: #232618;
+            }
             .tm-card-head {
                 display: flex;
                 align-items: baseline;
@@ -1831,10 +1914,18 @@
                 word-break: break-all;
                 cursor: pointer;
             }
-            .tm-id.zone   { color: #e0c271; }
-            .tm-id.object { color: #c586d1; }
-            .tm-id.frame  { color: #7fb3d5; }
-            .tm-id:hover { text-decoration: underline; }
+            .tm-id.zone {
+                color: #e0c271;
+            }
+            .tm-id.object {
+                color: #c586d1;
+            }
+            .tm-id.frame {
+                color: #7fb3d5;
+            }
+            .tm-id:hover {
+                text-decoration: underline;
+            }
             .tm-phase {
                 font-size: 10px;
                 text-transform: uppercase;
@@ -1849,7 +1940,10 @@
                 color: #7a8190;
                 cursor: pointer;
             }
-            .tm-parent:hover { color: #c8d8f0; text-decoration: underline; }
+            .tm-parent:hover {
+                color: #c8d8f0;
+                text-decoration: underline;
+            }
             .tm-meta {
                 display: flex;
                 flex-wrap: wrap;
@@ -1857,7 +1951,10 @@
                 color: #8a8f99;
                 font-size: 10px;
             }
-            .tm-meta b { color: #b8bcc4; font-weight: normal; }
+            .tm-meta b {
+                color: #b8bcc4;
+                font-weight: normal;
+            }
             .tm-card-body {
                 display: grid;
                 grid-template-columns: 1fr;
@@ -1937,7 +2034,10 @@
                 border-bottom: 1px dashed #232631;
                 margin-bottom: 4px;
             }
-            .tm-obs-crumb-label { color: #5a5e68; margin-right: 4px; }
+            .tm-obs-crumb-label {
+                color: #5a5e68;
+                margin-right: 4px;
+            }
             .tm-obs-crumb {
                 cursor: pointer;
                 padding: 1px 6px;
@@ -1948,10 +2048,18 @@
                 color: #b8bcc4;
                 font-weight: 600;
             }
-            .tm-obs-crumb.zone   { color: #e0c271; }
-            .tm-obs-crumb.object { color: #c586d1; }
-            .tm-obs-crumb.frame  { color: #7fb3d5; }
-            .tm-obs-crumb:hover { border-color: #4a8fd8; }
+            .tm-obs-crumb.zone {
+                color: #e0c271;
+            }
+            .tm-obs-crumb.object {
+                color: #c586d1;
+            }
+            .tm-obs-crumb.frame {
+                color: #7fb3d5;
+            }
+            .tm-obs-crumb:hover {
+                border-color: #4a8fd8;
+            }
             .tm-obs-crumb.current {
                 outline: 1px solid #4a8fd8;
                 background: #1c2230;
@@ -1968,7 +2076,10 @@
                 padding: 12px 2px 4px;
                 border-top: 1px solid #232631;
             }
-            .tm-obs-heading:first-of-type { border-top: none; padding-top: 4px; }
+            .tm-obs-heading:first-of-type {
+                border-top: none;
+                padding-top: 4px;
+            }
             .tm-obs-heading-label {
                 color: #9ad4ff;
                 font-size: 11px;
@@ -1995,8 +2106,12 @@
                 outline: 1px solid #4a8fd8;
                 box-shadow: 0 0 0 1px rgba(74, 143, 216, 0.12);
             }
-            .tm-obs-card.role-ancestor { opacity: 0.92; }
-            .tm-obs-card.role-descendant { opacity: 0.88; }
+            .tm-obs-card.role-ancestor {
+                opacity: 0.92;
+            }
+            .tm-obs-card.role-descendant {
+                opacity: 0.88;
+            }
             .tm-obs-details > summary {
                 list-style: none;
                 cursor: pointer;
@@ -2006,7 +2121,9 @@
                 gap: 8px;
                 flex-wrap: wrap;
             }
-            .tm-obs-details > summary::-webkit-details-marker { display: none; }
+            .tm-obs-details > summary::-webkit-details-marker {
+                display: none;
+            }
             .tm-obs-details > summary::before {
                 content: "▸";
                 color: #5a5e68;
@@ -2016,7 +2133,9 @@
                 display: inline-block;
                 width: 8px;
             }
-            .tm-obs-details[open] > summary::before { transform: rotate(90deg); }
+            .tm-obs-details[open] > summary::before {
+                transform: rotate(90deg);
+            }
             .tm-obs-role {
                 font-size: 9px;
                 text-transform: uppercase;
@@ -2056,11 +2175,26 @@
             /* Step-specific tinting so anchor vs next vs encapsulating
                vs negative-space vs zone-decompose vs child-bbox-batch
                jump out at a glance. */
-            .tm-obs-via.via-anchor_decompose          { color: #c586d1; border-color: #5c3a64; }
-            .tm-obs-via.via-next_object               { color: #d1a386; border-color: #6c4a32; }
-            .tm-obs-via.via-encapsulating_decompose   { color: #7fb3d5; border-color: #2f5b7a; }
-            .tm-obs-via.via-negative_space_decompose  { color: #9ad4ff; border-color: #2f5b7a; }
-            .tm-obs-via.via-zone_decompose            { color: #e0c271; border-color: #6c5520; }
+            .tm-obs-via.via-anchor_decompose {
+                color: #c586d1;
+                border-color: #5c3a64;
+            }
+            .tm-obs-via.via-next_object {
+                color: #d1a386;
+                border-color: #6c4a32;
+            }
+            .tm-obs-via.via-encapsulating_decompose {
+                color: #7fb3d5;
+                border-color: #2f5b7a;
+            }
+            .tm-obs-via.via-negative_space_decompose {
+                color: #9ad4ff;
+                border-color: #2f5b7a;
+            }
+            .tm-obs-via.via-zone_decompose {
+                color: #e0c271;
+                border-color: #6c5520;
+            }
             .tm-obs-provenance {
                 display: flex;
                 flex-direction: column;
@@ -2103,8 +2237,14 @@
                 cursor: pointer;
                 text-decoration: none;
             }
-            .tm-obs-provenance-on:hover { color: #e6e6e6; text-decoration: underline; }
-            .tm-obs-provenance-on.dead { cursor: default; color: #5a5e68; }
+            .tm-obs-provenance-on:hover {
+                color: #e6e6e6;
+                text-decoration: underline;
+            }
+            .tm-obs-provenance-on.dead {
+                cursor: default;
+                color: #5a5e68;
+            }
             .tm-llm-calls-label {
                 color: #7a8190;
                 padding-top: 2px;
@@ -2131,7 +2271,9 @@
                 border-radius: 3px;
                 background: #0f1116;
             }
-            .tm-llm-call.cached { border-style: dashed; }
+            .tm-llm-call.cached {
+                border-style: dashed;
+            }
             .tm-llm-call > summary {
                 list-style: none;
                 cursor: pointer;
@@ -2140,7 +2282,9 @@
                 align-items: baseline;
                 gap: 8px;
             }
-            .tm-llm-call > summary::-webkit-details-marker { display: none; }
+            .tm-llm-call > summary::-webkit-details-marker {
+                display: none;
+            }
             .tm-llm-call > summary::before {
                 content: "▸";
                 color: #5a5e68;
@@ -2148,7 +2292,9 @@
                 display: inline-block;
                 width: 8px;
             }
-            .tm-llm-call[open] > summary::before { content: "▾"; }
+            .tm-llm-call[open] > summary::before {
+                content: "▾";
+            }
             .tm-llm-step {
                 font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
                 font-size: 11px;
@@ -2206,13 +2352,17 @@
                 padding: 1px 0;
                 list-style: none;
             }
-            .tm-llm-subblock > summary::-webkit-details-marker { display: none; }
+            .tm-llm-subblock > summary::-webkit-details-marker {
+                display: none;
+            }
             .tm-llm-subblock > summary::before {
                 content: "▸ ";
                 color: #5a5e68;
                 font-size: 9px;
             }
-            .tm-llm-subblock[open] > summary::before { content: "▾ "; }
+            .tm-llm-subblock[open] > summary::before {
+                content: "▾ ";
+            }
             .tm-pre {
                 margin: 4px 0 0;
                 padding: 8px 10px;
@@ -2227,7 +2377,8 @@
                 overflow: auto;
             }
             .tm-pre.mono {
-                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-family:
+                    ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
             }
             .tm-copy {
                 align-self: flex-start;
@@ -2285,71 +2436,232 @@
     <body>
         <div id="canvas-host"></div>
         <div id="topbar">
-        <div id="run-tabs-bar">
-            <span class="bar-label" title="Open run views. Each tab pins a run together with its slot + model; click a tab to switch which run the canvas shows. The run picker and version bar retarget the active tab.">tabs</span>
-            <button id="run-tab-add" type="button" title="Open a new tab — duplicates the active run/slot/model, then point it at a different run (run picker / version bar) to compare renditions side by side.">+ tab</button>
-        </div>
-        <div id="slot-bar">
-            <span class="bar-label">slots</span>
-            <span class="bar-toggle" id="slot-bar-toggle">▾</span>
-        </div>
-        <div id="controls-bar">
-            <div class="ctrl-header">
-                <span class="bar-label">controls</span>
-                <span class="bar-toggle" id="controls-bar-toggle">▾</span>
+            <div id="run-tabs-bar">
+                <span
+                    class="bar-label"
+                    title="Open run views. Each tab pins a run together with its slot + model; click a tab to switch which run the canvas shows. The run picker and version bar retarget the active tab."
+                    >tabs</span
+                >
+                <button
+                    id="run-tab-add"
+                    type="button"
+                    title="Open a new tab — duplicates the active run/slot/model, then point it at a different run (run picker / version bar) to compare renditions side by side."
+                >
+                    + tab
+                </button>
             </div>
-            <div class="ctrl-row">
-                <span class="ctrl-label">version</span>
-                <div id="version-bar"></div>
-                <button id="version-launch-all" type="button" title="Start all three pipeline versions (V1 legacy-XML, V2 new-context frame-first, V3 new-context decomp-first) on the current slot + model so they run concurrently. Switch which one you are viewing with the buttons; the others keep running in the background.">launch all 3</button>
-                <button id="version-archive-all" type="button" title="Archive every version run (V1/V2/V3) that has data into timestamped, loadable copies, so you can reset and re-run V1 vs V2 fresh without losing the current rendition. Originals stay active; each archive appears in the run picker for normal loading later.">archive all</button>
+            <div id="slot-bar">
+                <span class="bar-label">slots</span>
+                <span class="bar-toggle" id="slot-bar-toggle">▾</span>
             </div>
-            <div class="ctrl-row">
-                <span class="ctrl-label">run</span>
-                <select id="run-picker" title="Switch the active run (versioned directory under /runs). Each run is an independent set of (slot, model) cells with its own prompt snapshot."></select>
-                <button id="run-new" type="button" title="Create a new run. Snapshots the current prompts.py into runs/<name>/prompts_snapshot.py and switches to it.">+ new run</button>
-                <button id="save-all" type="button" title="Save the current state of all slots across all models by creating a timestamped run, then switch to it so you can start fresh experiments.">save all & new</button>
-                <button id="snapshot-all" type="button" title="Copy all slot data across every model into a timestamped snapshot. Stays on the current run so you can keep working or create a new run for fresh testing.">snapshot all</button>
-                <div class="ctrl-sep"></div>
-                <span class="ctrl-label">model</span>
-                <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
-                <button id="slot-resume" type="button" style="display:none">resume</button>
-                <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
-                <button id="stop-all" type="button" title="Preemptively halt EVERY in-flight generation across ALL runs and versions — pipeline builds, from-scratch generates, and mesh retries. Running cells become paused; nothing is deleted, so resume a cell or re-press generate/retry to pick up where it left off.">stop all</button>
-                <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
-                <button id="reset-all" type="button" title="Wipe every started cell across ALL models on the current run (every slot × model that has data) back to idle. Skips never-run cells. Nothing is restarted — use 'start cells…' to launch the ones you want.">reset all</button>
-                <button id="start-cells" type="button" title="Pick exactly which cells to start: choose any combination of versions × models × slots and launch them at once. Cells that are already running or done are skipped.">start cells…</button>
+            <div id="controls-bar">
+                <div class="ctrl-header">
+                    <span class="bar-label">controls</span>
+                    <span class="bar-toggle" id="controls-bar-toggle">▾</span>
+                </div>
+                <div class="ctrl-row">
+                    <span class="ctrl-label">version</span>
+                    <div id="version-bar"></div>
+                    <button
+                        id="version-launch-all"
+                        type="button"
+                        title="Start all three pipeline versions (V1 legacy-XML, V2 new-context frame-first, V3 new-context decomp-first) on the current slot + model so they run concurrently. Switch which one you are viewing with the buttons; the others keep running in the background."
+                    >
+                        launch all 3
+                    </button>
+                    <button
+                        id="version-archive-all"
+                        type="button"
+                        title="Archive every version run (V1/V2/V3) that has data into timestamped, loadable copies, so you can reset and re-run V1 vs V2 fresh without losing the current rendition. Originals stay active; each archive appears in the run picker for normal loading later."
+                    >
+                        archive all
+                    </button>
+                </div>
+                <div class="ctrl-row">
+                    <span class="ctrl-label">run</span>
+                    <select
+                        id="run-picker"
+                        title="Switch the active run (versioned directory under /runs). Each run is an independent set of (slot, model) cells with its own prompt snapshot."
+                    ></select>
+                    <button
+                        id="run-new"
+                        type="button"
+                        title="Create a new run. Snapshots the current prompts.py into runs/<name>/prompts_snapshot.py and switches to it."
+                    >
+                        + new run
+                    </button>
+                    <button
+                        id="save-all"
+                        type="button"
+                        title="Save the current state of all slots across all models by creating a timestamped run, then switch to it so you can start fresh experiments."
+                    >
+                        save all & new
+                    </button>
+                    <button
+                        id="snapshot-all"
+                        type="button"
+                        title="Copy all slot data across every model into a timestamped snapshot. Stays on the current run so you can keep working or create a new run for fresh testing."
+                    >
+                        snapshot all
+                    </button>
+                    <div class="ctrl-sep"></div>
+                    <span class="ctrl-label">model</span>
+                    <select
+                        id="model-picker"
+                        title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."
+                    ></select>
+                    <button
+                        id="slot-resume"
+                        type="button"
+                        style="display: none"
+                    >
+                        resume
+                    </button>
+                    <button
+                        id="resume-all"
+                        type="button"
+                        title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done."
+                    >
+                        resume all
+                    </button>
+                    <button
+                        id="stop-all"
+                        type="button"
+                        title="Preemptively halt EVERY in-flight generation across ALL runs and versions — pipeline builds, from-scratch generates, and mesh retries. Running cells become paused; nothing is deleted, so resume a cell or re-press generate/retry to pick up where it left off."
+                    >
+                        stop all
+                    </button>
+                    <button
+                        id="slot-reset"
+                        type="button"
+                        title="Wipe this slot and start a fresh run"
+                    >
+                        reset
+                    </button>
+                    <button
+                        id="reset-all"
+                        type="button"
+                        title="Wipe every started cell across ALL models on the current run (every slot × model that has data) back to idle. Skips never-run cells. Nothing is restarted — use 'start cells…' to launch the ones you want."
+                    >
+                        reset all
+                    </button>
+                    <button
+                        id="start-cells"
+                        type="button"
+                        title="Pick exactly which cells to start: choose any combination of versions × models × slots and launch them at once. Cells that are already running or done are skipped."
+                    >
+                        start cells…
+                    </button>
+                </div>
+                <div class="ctrl-row">
+                    <span class="ctrl-label">view</span>
+                    <button
+                        id="bbox-toggle"
+                        type="button"
+                        title="Show or hide bounding-box wireframes (meshes-only view)"
+                    >
+                        bboxes: on
+                    </button>
+                    <button
+                        id="frames-toggle"
+                        type="button"
+                        title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors"
+                    >
+                        frames: on
+                    </button>
+                    <button
+                        id="meshes-toggle"
+                        type="button"
+                        title="Show or hide all generated meshes (bboxes-only view)"
+                    >
+                        meshes: on
+                    </button>
+                    <button
+                        id="select-mode-toggle"
+                        type="button"
+                        title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it"
+                    >
+                        select: all
+                    </button>
+                    <button
+                        id="solid-fill-toggle"
+                        type="button"
+                        title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation."
+                    >
+                        fill: off
+                    </button>
+                    <button
+                        id="grid-toggle"
+                        type="button"
+                        title="Show or hide the infinite ground grid"
+                    >
+                        grid: on
+                    </button>
+                    <div class="ctrl-sep"></div>
+                    <span class="ctrl-label">assets</span>
+                    <button
+                        id="asset-mode-toggle"
+                        type="button"
+                        title="Switch which asset source this cell renders: 'library' shows the meshes matched from the pre-built asset library (objects/, the default); 'generated' shows the from-scratch Nano-Banana + Trellis build (objects-generated/). Only the meshes swap — same scene layout."
+                    >
+                        assets: library
+                    </button>
+                    <button
+                        id="generate-gate"
+                        type="button"
+                        style="display: none"
+                        title="Start from-scratch asset generation (Nano-Banana + Trellis) into objects-generated/, reusing the library build's layout — same bounding boxes, freshly generated meshes. Disabled until the current build finishes."
+                    >
+                        ⚡ generate
+                    </button>
+                    <div class="ctrl-sep"></div>
+                    <span class="ctrl-label">export</span>
+                    <button
+                        id="export-glb"
+                        type="button"
+                        title="Download the entire scene as a single .glb file"
+                    >
+                        export .glb
+                    </button>
+                    <button
+                        id="replay-gif"
+                        type="button"
+                        title="Replay the recorded event log and export an animated GIF of the build"
+                    >
+                        replay → gif
+                    </button>
+                </div>
             </div>
-            <div class="ctrl-row">
-                <span class="ctrl-label">view</span>
-                <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
-                <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
-                <button id="meshes-toggle" type="button" title="Show or hide all generated meshes (bboxes-only view)">meshes: on</button>
-                <button id="select-mode-toggle" type="button" title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it">select: all</button>
-                <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
-                <button id="grid-toggle" type="button" title="Show or hide the infinite ground grid">grid: on</button>
-                <div class="ctrl-sep"></div>
-                <span class="ctrl-label">assets</span>
-                <button id="asset-mode-toggle" type="button" title="Switch which asset source this cell renders: 'library' shows the meshes matched from the pre-built asset library (objects/, the default); 'generated' shows the from-scratch Nano-Banana + Trellis build (objects-generated/). Only the meshes swap — same scene layout.">assets: library</button>
-                <button id="generate-gate" type="button" style="display:none" title="Start from-scratch asset generation (Nano-Banana + Trellis) into objects-generated/, reusing the library build's layout — same bounding boxes, freshly generated meshes. Disabled until the current build finishes.">⚡ generate</button>
-                <div class="ctrl-sep"></div>
-                <span class="ctrl-label">export</span>
-                <button id="export-glb" type="button" title="Download the entire scene as a single .glb file">export .glb</button>
-                <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>
-            </div>
-        </div>
-        <div id="status"><p class="line hdr">ready</p></div>
+            <div id="status"><p class="line hdr">ready</p></div>
         </div>
         <div id="tree">
             <div id="tree-header">
                 <span>tree</span>
                 <span id="tree-active"></span>
-                <button id="tree-expand" type="button" title="Open pipeline observability — every LLM call (system / input / output / reasoning) for the focused node, plus its ancestors and descendants">⛶</button>
+                <button
+                    id="tree-expand"
+                    type="button"
+                    title="Open pipeline observability — every LLM call (system / input / output / reasoning) for the focused node, plus its ancestors and descendants"
+                >
+                    ⛶
+                </button>
                 <span id="tree-toggle">▾</span>
             </div>
             <div id="tree-search-row">
-                <input id="tree-search" type="text" placeholder="search id or prompt — Enter cycles matches (Shift+Enter back)" autocomplete="off" spellcheck="false" />
-                <button id="tree-search-clear" type="button" title="Clear search">×</button>
+                <input
+                    id="tree-search"
+                    type="text"
+                    placeholder="search id or prompt — Enter cycles matches (Shift+Enter back)"
+                    autocomplete="off"
+                    spellcheck="false"
+                />
+                <button
+                    id="tree-search-clear"
+                    type="button"
+                    title="Clear search"
+                >
+                    ×
+                </button>
                 <span id="tree-search-count"></span>
             </div>
             <div id="tree-body"></div>
@@ -2364,16 +2676,29 @@
         </div>
         <div id="trellis-queue">
             <div id="trellis-queue-header">
-                <span>trellis queue <span id="trellis-queue-counts">0 processing · 0 waiting</span></span>
+                <span
+                    >trellis queue
+                    <span id="trellis-queue-counts"
+                        >0 processing · 0 waiting</span
+                    ></span
+                >
                 <span id="trellis-queue-toggle">▾</span>
             </div>
             <div id="trellis-queue-body">
                 <div class="tq-section">
-                    <div class="tq-label">processing on modal <span class="tq-cap" id="tq-processing-cap">(0/10)</span></div>
+                    <div class="tq-label">
+                        processing on modal
+                        <span class="tq-cap" id="tq-processing-cap"
+                            >(0/10)</span
+                        >
+                    </div>
                     <div class="tq-list" id="tq-processing"></div>
                 </div>
                 <div class="tq-section">
-                    <div class="tq-label">waiting in queue <span class="tq-cap" id="tq-waiting-cap">(0)</span></div>
+                    <div class="tq-label">
+                        waiting in queue
+                        <span class="tq-cap" id="tq-waiting-cap">(0)</span>
+                    </div>
                     <div class="tq-list" id="tq-waiting"></div>
                 </div>
             </div>
@@ -2392,7 +2717,9 @@
             <div id="replay-panel">
                 <header>
                     <h2>replay → gif</h2>
-                    <button id="replay-close" type="button" title="Close">×</button>
+                    <button id="replay-close" type="button" title="Close">
+                        ×
+                    </button>
                 </header>
                 <div id="replay-body">
                     <div id="replay-stage">
@@ -2400,26 +2727,62 @@
                         <img id="replay-result-img" alt="gif preview" />
                     </div>
                     <div id="replay-info">
-                        events: <b id="replay-event-count">0</b> ·
-                        duration at current speed: <b id="replay-duration-est">—</b>
+                        events: <b id="replay-event-count">0</b> · duration at
+                        current speed: <b id="replay-duration-est">—</b>
                     </div>
                     <div class="replay-row">
                         <label for="replay-speed">speed</label>
-                        <input id="replay-speed" type="range" min="0.25" max="8" step="0.25" value="2" />
+                        <input
+                            id="replay-speed"
+                            type="range"
+                            min="0.25"
+                            max="8"
+                            step="0.25"
+                            value="2"
+                        />
                         <span id="replay-speed-val">2.00×</span>
                     </div>
                     <div class="replay-row">
                         <label for="replay-fps">fps</label>
-                        <input id="replay-fps" type="range" min="6" max="30" step="1" value="15" />
+                        <input
+                            id="replay-fps"
+                            type="range"
+                            min="6"
+                            max="30"
+                            step="1"
+                            value="15"
+                        />
                         <span id="replay-fps-val">15 fps</span>
                     </div>
-                    <div id="replay-progress"><div id="replay-progress-bar"></div></div>
+                    <div id="replay-progress">
+                        <div id="replay-progress-bar"></div>
+                    </div>
                     <div id="replay-status">idle</div>
                 </div>
                 <div id="replay-actions">
-                    <button id="replay-preview" type="button" title="Play the build in the preview area without encoding a gif">preview</button>
-                    <button id="replay-render" type="button" title="Replay the build and encode an animated gif">render gif</button>
-                    <button id="replay-download" type="button" class="primary" disabled title="Download the rendered gif">download</button>
+                    <button
+                        id="replay-preview"
+                        type="button"
+                        title="Play the build in the preview area without encoding a gif"
+                    >
+                        preview
+                    </button>
+                    <button
+                        id="replay-render"
+                        type="button"
+                        title="Replay the build and encode an animated gif"
+                    >
+                        render gif
+                    </button>
+                    <button
+                        id="replay-download"
+                        type="button"
+                        class="primary"
+                        disabled
+                        title="Download the rendered gif"
+                    >
+                        download
+                    </button>
                 </div>
             </div>
         </div>
@@ -2427,38 +2790,90 @@
             <div id="start-modal-panel">
                 <header>
                     <h2>start cells</h2>
-                    <span class="start-modal-sub">launch the cross product of your selection — running/done cells are skipped</span>
-                    <button id="start-modal-close" type="button" title="Close (Esc)">×</button>
+                    <span class="start-modal-sub"
+                        >launch the cross product of your selection —
+                        running/done cells are skipped</span
+                    >
+                    <button
+                        id="start-modal-close"
+                        type="button"
+                        title="Close (Esc)"
+                    >
+                        ×
+                    </button>
                 </header>
                 <div id="start-modal-body">
                     <div class="start-col">
                         <div class="start-col-head">
                             <span>versions</span>
-                            <button type="button" data-start-bulk="all" data-start-target="start-versions">all</button>
-                            <button type="button" data-start-bulk="none" data-start-target="start-versions">none</button>
+                            <button
+                                type="button"
+                                data-start-bulk="all"
+                                data-start-target="start-versions"
+                            >
+                                all
+                            </button>
+                            <button
+                                type="button"
+                                data-start-bulk="none"
+                                data-start-target="start-versions"
+                            >
+                                none
+                            </button>
                         </div>
                         <div id="start-versions" class="start-options"></div>
                     </div>
                     <div class="start-col">
                         <div class="start-col-head">
                             <span>models</span>
-                            <button type="button" data-start-bulk="all" data-start-target="start-models">all</button>
-                            <button type="button" data-start-bulk="none" data-start-target="start-models">none</button>
+                            <button
+                                type="button"
+                                data-start-bulk="all"
+                                data-start-target="start-models"
+                            >
+                                all
+                            </button>
+                            <button
+                                type="button"
+                                data-start-bulk="none"
+                                data-start-target="start-models"
+                            >
+                                none
+                            </button>
                         </div>
                         <div id="start-models" class="start-options"></div>
                     </div>
                     <div class="start-col">
                         <div class="start-col-head">
                             <span>slots</span>
-                            <button type="button" data-start-bulk="all" data-start-target="start-slots">all</button>
-                            <button type="button" data-start-bulk="none" data-start-target="start-slots">none</button>
+                            <button
+                                type="button"
+                                data-start-bulk="all"
+                                data-start-target="start-slots"
+                            >
+                                all
+                            </button>
+                            <button
+                                type="button"
+                                data-start-bulk="none"
+                                data-start-target="start-slots"
+                            >
+                                none
+                            </button>
                         </div>
                         <div id="start-slots" class="start-options"></div>
                     </div>
                 </div>
                 <footer id="start-modal-footer">
                     <span id="start-modal-count">0 cells selected</span>
-                    <button id="start-modal-go" type="button" class="primary" disabled>start selected</button>
+                    <button
+                        id="start-modal-go"
+                        type="button"
+                        class="primary"
+                        disabled
+                    >
+                        start selected
+                    </button>
                 </footer>
             </div>
         </div>
@@ -2467,8 +2882,20 @@
                 <header>
                     <h2>pipeline observability</h2>
                     <div id="tree-modal-controls">
-                        <input id="tree-modal-search" type="text" placeholder="filter by id, step, or prompt text" autocomplete="off" spellcheck="false" />
-                        <button id="tree-modal-close" type="button" title="Close (Esc)">×</button>
+                        <input
+                            id="tree-modal-search"
+                            type="text"
+                            placeholder="filter by id, step, or prompt text"
+                            autocomplete="off"
+                            spellcheck="false"
+                        />
+                        <button
+                            id="tree-modal-close"
+                            type="button"
+                            title="Close (Esc)"
+                        >
+                            ×
+                        </button>
                     </div>
                 </header>
                 <div id="tree-modal-body"></div>

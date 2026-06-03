@@ -667,6 +667,40 @@ async def _generate_one(
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
 
 
+async def _rescale_reuse_from_raw(
+    node: Node,
+    *,
+    src_raw: Path,
+    raw_dir: Path,
+    opt_dir: Path,
+    source_id: str,
+) -> None:
+    """Rescale a canonical's raw Trellis mesh into `node`'s bbox + orientation
+    (the prefab-reuse path — no Nano-Banana, no Trellis), carry over the
+    canonical's reference image, then optimize into the served twin. Shared by
+    the generate gate's in-scene reuse and standalone prefab propagation. A
+    missing source raw is logged and skipped rather than raising."""
+    if not src_raw.exists():
+        logging.log("prefab.reuse_missing", id=node.id, source=source_id)
+        return
+    try:
+        async with _GENERATE_FANOUT:
+            rescaled = raw_dir / f"{node.id}.glb"
+            async with _MESH_IO:
+                scene = await asyncio.to_thread(trimesh.load, src_raw)
+                placed = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
+                )
+                await asyncio.to_thread(placed.export, rescaled, file_type="glb")
+                del scene, placed
+            src_png = raw_dir / f"{source_id}.png"
+            if src_png.exists():
+                await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{node.id}.png")
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+    except Exception as e:  # noqa: BLE001
+        logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
+
+
 async def _spawn_meshes(
     *,
     resolved: list[Node],
@@ -779,31 +813,17 @@ async def generate_assets(
 
     async def _reuse(node: Node, source_id: str) -> None:
         # Wait (outside the fanout, so we don't pin a slot) for the source's
-        # mesh, then rescale ITS raw Trellis output — the intrinsic +Z-front
-        # pose — into this node's bbox + orientation, exactly as a fresh build
-        # would, so the reuse lands identically posed. No Nano-Banana, no Trellis.
+        # mesh to land, then rescale ITS raw Trellis output into this node's
+        # slot — exactly as a fresh build would, so the reuse lands identically
+        # posed. No Nano-Banana, no Trellis.
         await raw_ready[source_id].wait()
-        src_raw = raw_dir / f"{source_id}.raw.glb"
-        if not src_raw.exists():
-            logging.log("prefab.reuse_missing", id=node.id, source=source_id)
-            return
-        try:
-            async with _GENERATE_FANOUT:
-                rescaled = raw_dir / f"{node.id}.glb"
-                async with _MESH_IO:
-                    scene = await asyncio.to_thread(trimesh.load, src_raw)
-                    placed = await asyncio.to_thread(
-                        rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
-                    )
-                    await asyncio.to_thread(placed.export, rescaled, file_type="glb")
-                    del scene, placed
-                # Carry over the source's reference image for the asset panel.
-                src_png = raw_dir / f"{source_id}.png"
-                if src_png.exists():
-                    await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{node.id}.png")
-                await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
-        except Exception as e:  # noqa: BLE001
-            logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
+        await _rescale_reuse_from_raw(
+            node,
+            src_raw=raw_dir / f"{source_id}.raw.glb",
+            raw_dir=raw_dir,
+            opt_dir=opt_dir,
+            source_id=source_id,
+        )
 
     tasks: list[asyncio.Task[None]] = []
     for node in nodes:
@@ -841,22 +861,26 @@ async def generate_assets(
         await asyncio.gather(*tasks, return_exceptions=True)
 
 
-async def retry_node(
+async def regenerate_one(
     *,
     node: Node,
     runs_dir: Path,
     run_id: str,
-) -> asyncio.Task[None]:
-    """Standalone re-generation of a single failed mesh — always FRESH:
-    every prior on-disk artifact for this node is unlinked so the
-    cache-aware checks inside `nano_banana.generate_resumable` and
-    `threed.generate_mesh` miss and issue new API calls. The user is
-    asking for "give this object another shot," not "reuse what we had,"
-    so a stale banana image (e.g. one that produced a broken Trellis run)
-    doesn't get recycled. Registered on `_pending` so `cancel_pending`
-    (slot reset / teardown) can tear it down alongside in-flight
-    pipeline meshes."""
-    objs_dir = runs_dir / run_id / "objects"
+    subdir: str = "objects",
+    optimize: bool = False,
+) -> None:
+    """Rebuild a single mesh FRESH: unlink every prior on-disk artifact for this
+    node under `subdir` so the cache-aware checks inside
+    `nano_banana.generate_resumable` and `threed.generate_mesh` miss and issue
+    new API calls, then re-run Nano-Banana + Trellis + rescale. With
+    `optimize=True` the freshly built mesh is run through the library optimizer
+    into the `objects-generated-optimized/` served twin (the from-scratch
+    generated pipeline); the library path leaves it off.
+
+    Awaitable core shared by the library single-mesh retry (`retry_node`, a
+    detached + `_pending`-tracked wrapper) and standalone generated-asset
+    regeneration (awaited directly under its own cell task)."""
+    objs_dir = runs_dir / run_id / subdir
     objs_dir.mkdir(parents=True, exist_ok=True)
     raw = objs_dir / f"{node.id}.raw.glb"
     path = objs_dir / f"{node.id}.glb"
@@ -865,17 +889,54 @@ async def retry_node(
     for artifact in (image_path, raw, path):
         artifact.unlink(missing_ok=True)
     logging.log("mesh.retry", id=node.id, prompt=node.prompt)
+    await _generate_one(node, raw=raw, path=path, image_stem=image_stem, runs_dir=runs_dir)
+    if optimize and path.exists():
+        await _optimize_asset(
+            path, runs_dir / run_id / "objects-generated-optimized" / f"{node.id}.glb",
+        )
+
+
+async def retry_node(
+    *,
+    node: Node,
+    runs_dir: Path,
+    run_id: str,
+) -> asyncio.Task[None]:
+    """Standalone re-generation of a single failed mesh in the LIBRARY pipeline
+    (`objects/`). Fire-and-forget: the fresh build (`regenerate_one`) runs as a
+    detached task registered on `_pending` so `cancel_pending` (slot reset /
+    teardown) can tear it down alongside in-flight pipeline meshes."""
     task = asyncio.create_task(
-        _generate_one(
-            node,
-            raw=raw,
-            path=path,
-            image_stem=image_stem,
-            runs_dir=runs_dir,
-        ),
+        regenerate_one(node=node, runs_dir=runs_dir, run_id=run_id),
     )
     _pending.setdefault(run_id, []).append(task)
     return task
+
+
+async def propagate_reuses(
+    *,
+    canonical_id: str,
+    reuses: list[Node],
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Re-derive every `reuses` node from `canonical_id`'s raw Trellis mesh —
+    rescaling it into each reuse's own bbox/orientation and optimizing into the
+    served twin. Pairs with a prior FRESH build of the canonical
+    (`regenerate_one` with optimize=True) to push a regenerated prefab out to
+    every object that shares it. Awaited under the caller's cell task, so a
+    cancellation there tears the fan-out down via the gather."""
+    raw_dir = runs_dir / run_id / "objects-generated"
+    opt_dir = runs_dir / run_id / "objects-generated-optimized"
+    src_raw = raw_dir / f"{canonical_id}.raw.glb"
+    coros = [
+        _rescale_reuse_from_raw(
+            node, src_raw=src_raw, raw_dir=raw_dir, opt_dir=opt_dir, source_id=canonical_id,
+        )
+        for node in reuses
+    ]
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
 
 
 async def await_pending(run_id: str) -> None:

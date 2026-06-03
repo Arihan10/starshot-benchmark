@@ -32,7 +32,8 @@ SLOTS: list[Slot] = [
     Slot("desert", "a desert landscape"),
     Slot("campsites", "three family campsites in an open field"),
     Slot("outer space", "a planetary system"),
-    Slot("suburban home", "a traditional two-story suburban house")
+    Slot("suburban home", "a traditional two-story suburban house"),
+    Slot("toy room", "shrunk down in gigantic toy room")
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}

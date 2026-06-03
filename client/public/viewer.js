@@ -69,6 +69,15 @@ let assetMode = localStorage.getItem(ASSET_MODE_STORAGE_KEY) === "generated" ? "
 let generating = false;          // a from-scratch build is in flight for the open cell
 let _genWasRunning = false;      // last poll saw a build running (to detect completion)
 let _genCellKey = null;          // cell the gen-gate poll is tracking
+// id -> version token (the optimized GLB's mtime, from GET /generate) for each
+// attached generated mesh. Lets the gate poll spot a regenerated asset (same
+// id, new bytes) and reload just it with a cache-busted URL. Reset on cell
+// switch (clearScene) and asset-mode reload.
+const genMeshVersions = new Map();
+// ids the user clicked "regenerate" on whose new mesh hasn't landed yet — drives
+// the detail button's disabled/label state. Cleared when the new version lands
+// or the build goes idle.
+const regeneratingIds = new Set();
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
 const replayModalEl = document.getElementById("replay-modal");
@@ -387,6 +396,44 @@ function syncRetryButton(container, id, status, cls) {
   btn.title = retrying
     ? "Re-running banana + Trellis for this mesh"
     : "Re-run banana + Trellis for this mesh (fresh API calls)";
+}
+
+// Re-roll a GENERATED asset from scratch (Nano-Banana + Trellis + optimize),
+// propagating across its prefab group: the canonical is rebuilt and every object
+// sharing its mesh is re-derived (propagate=true). Fire-and-forget on the server;
+// the gate poll detects each changed mesh by its bumped version token and swaps
+// it in. `regeneratingIds` drives the detail button's disabled/label state.
+async function regenerateAsset(id) {
+  if (currentSlotId === null || currentModel === null) return;
+  if (regeneratingIds.has(id)) return;
+  regeneratingIds.add(id);
+  if (id === selectedBboxId) renderTreeDetail();
+  setStatus(`regenerating ${id} + objects sharing its mesh — Nano-Banana + Trellis (this can take a while)…`);
+  try {
+    const res = await fetch(
+      new URL(
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/regenerate/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&propagate=true`,
+        SERVER_URL,
+      ),
+      { method: "POST" },
+    );
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      setStatus(`regenerate failed: ${body.detail ?? `HTTP ${res.status}`}`, "err");
+      regeneratingIds.delete(id);
+      if (id === selectedBboxId) renderTreeDetail();
+      return;
+    }
+    // Reflect the in-flight build immediately; the gate poll confirms + swaps in
+    // the new mesh once its optimize pass lands.
+    generating = true;
+    _genWasRunning = true;
+    updateGenerateGate();
+  } catch (e) {
+    setStatus(`regenerate failed: ${e.message}`, "err");
+    regeneratingIds.delete(id);
+    if (id === selectedBboxId) renderTreeDetail();
+  }
 }
 
 function showRunCompleteWithErrors() {
@@ -1228,6 +1275,7 @@ const BBOX_COLOR_FRAME = 0x7fb3d5;
 const BBOX_COLOR_PROXY = 0xb46aff;
 const BBOX_COLOR_HOVER = 0xffe14a;
 const BBOX_COLOR_SELECTED = 0x4af0e0;
+const BBOX_COLOR_ORIENT = 0xffa033;
 const BBOX_DIM_OPACITY = 0.35;
 const PROXY_BASE_OPACITY = 0.55;
 const PROXY_DIM_OPACITY = 0.2;
@@ -1530,8 +1578,11 @@ function clearScene() {
   proxies.clear();
   clearSolidFills();
   modelsById.clear();
+  genMeshVersions.clear();
+  regeneratingIds.clear();
   hoveredBboxId = null;
   selectedBboxId = null;
+  updateOrientationIndicator();
   tooltip.style.display = "none";
 }
 
@@ -1898,6 +1949,7 @@ function loadBbox(event) {
   helper.userData.proxyShape = event.proxy_shape ?? null;
   helper.userData.origin = origin;
   helper.userData.dimensions = dimensions;
+  helper.userData.orientation = event.orientation ?? 0;
   bboxRoot.add(helper);
   bboxes.set(id, helper);
 
@@ -1921,6 +1973,7 @@ function loadBbox(event) {
   // bbox is being replaced), reapply the selection color.
   applyBboxColor(id);
   applyBboxVisibility(id);
+  if (id === selectedBboxId) updateOrientationIndicator();
 }
 
 function buildProxyWireframe(proxyShape, origin, dimensions) {
@@ -2136,6 +2189,65 @@ function setHoveredBbox(id) {
   if (id !== null) applyBboxVisibility(id);
 }
 
+// --- orientation indicator --------------------------------------------------
+// When an object is selected, an arrow from its bbox center points along the
+// node's authored facing so the user can read its intended orientation. The
+// facing reproduces the placement bake (server glb_place.py `_quat_y`): the
+// asset's front — +Z at orientation 0 — yawed by `orientation` degrees about
+// +Y, the same rotation three.js applies to the mesh, so the arrow lines up
+// with the rendered object. Zones/frames carry no meaningful facing, so the
+// arrow is shown for objects only. One reusable helper, repositioned per
+// selection and hidden when nothing (or a non-object) is selected.
+const _orientAxisY = new THREE.Vector3(0, 1, 0);
+let orientationArrow = null;
+
+function updateOrientationIndicator() {
+  const helper = selectedBboxId !== null ? bboxes.get(selectedBboxId) : null;
+  const origin = helper?.userData.origin;
+  const dimensions = helper?.userData.dimensions;
+  if (!helper || helper.userData.nodeKind !== "object" || !origin || !dimensions) {
+    if (orientationArrow) orientationArrow.visible = false;
+    return;
+  }
+  const deg = Number(helper.userData.orientation) || 0;
+  const facing = new THREE.Vector3(0, 0, 1).applyQuaternion(
+    new THREE.Quaternion().setFromAxisAngle(_orientAxisY, THREE.MathUtils.degToRad(deg)),
+  );
+  const center = new THREE.Vector3(
+    origin[0] + dimensions[0] / 2,
+    origin[1] + dimensions[1] / 2,
+    origin[2] + dimensions[2] / 2,
+  );
+  // Length: distance from center to the front face along `facing`, plus ~50%
+  // so the head clears the wireframe. Using the exit distance (not a raw max
+  // extent) keeps the arrow proportional for thin/elongated objects too.
+  const hx = Math.abs(dimensions[0]) / 2;
+  const hz = Math.abs(dimensions[2]) / 2;
+  let reach = Infinity;
+  if (Math.abs(facing.x) > 1e-6) reach = Math.min(reach, hx / Math.abs(facing.x));
+  if (Math.abs(facing.z) > 1e-6) reach = Math.min(reach, hz / Math.abs(facing.z));
+  if (!isFinite(reach)) reach = Math.max(hx, hz);
+  const length = Math.max(0.15, reach * 1.5);
+  if (!orientationArrow) {
+    orientationArrow = new THREE.ArrowHelper(facing, center, length, BBOX_COLOR_ORIENT);
+    // Draw over the mesh/bbox so the direction stays legible even when the
+    // arrow's base sits inside a solid object.
+    orientationArrow.renderOrder = 3;
+    for (const part of [orientationArrow.line, orientationArrow.cone]) {
+      part.material.depthTest = false;
+      part.material.depthWrite = false;
+      part.material.transparent = true;
+    }
+    bboxRoot.add(orientationArrow);
+  } else {
+    orientationArrow.position.copy(center);
+    orientationArrow.setDirection(facing);
+    orientationArrow.setColor(BBOX_COLOR_ORIENT);
+  }
+  orientationArrow.setLength(length, length * 0.32, length * 0.22);
+  orientationArrow.visible = true;
+}
+
 // Fit the camera to a single Box3 — parameterised variant of fitToScene.
 // Used by tree-click selection.
 function frameBbox(box) {
@@ -2163,6 +2275,7 @@ function selectTreeNode(id) {
   // peer's visibility flips. A→B leaves the peers untouched, but the
   // refresh is cheap, so just re-apply uniformly.
   refreshAllBboxVisibility();
+  updateOrientationIndicator();
   renderTree();
   renderTreeDetail();
   if (selectedBboxId !== null) {
@@ -2223,7 +2336,9 @@ function mountMiniViewer(container, modelUrl) {
   const scene = new THREE.Scene();
   scene.background = new THREE.Color(0x0e1014);
   const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
-  camera.position.set(2, 2, 3);
+  // Default to a +Z-facing front view (overwritten once the model's bounds are
+  // known); keeps the orientation reference consistent even pre-load.
+  camera.position.set(0, 1.2, 3);
   const renderer = new THREE.WebGLRenderer({ antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio || 1);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -2272,8 +2387,12 @@ function mountMiniViewer(container, modelUrl) {
         const size = new THREE.Vector3();
         box.getSize(size);
         const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        const dist = maxDim * 2.2;
-        camera.position.copy(center).add(new THREE.Vector3(dist, dist * 0.7, dist));
+        const dist = maxDim * 2.8;
+        // Frame from world +Z (the canonical front: +Z = toward viewer) with a
+        // gentle elevation, so the world +Z axis always faces the camera. That
+        // fixed reference lets the user gauge the base model's orientation —
+        // azimuth is pinned to +Z (no X offset), only a slight downward tilt.
+        camera.position.copy(center).add(new THREE.Vector3(0, 0.4, 1).normalize().multiplyScalar(dist));
         camera.near = Math.max(maxDim / 1000, 0.001);
         camera.far = Math.max(maxDim * 100, 100);
         camera.updateProjectionMatrix();
@@ -2309,13 +2428,37 @@ function mountMiniViewer(container, modelUrl) {
   };
 }
 
+// The image + mesh the detail preview renders, resolved for the active asset
+// mode. "generated" previews the from-scratch build — both served from
+// objects-generated-optimized/<id>.{png,glb} — gated on the mesh having
+// attached for this cell, so the preview tracks what's on screen and never
+// points at a not-yet-built file. "library" reads the folded scene projection
+// / live events (the assets map), as before.
+function detailPreviewUrls(node) {
+  if (assetMode === "generated") {
+    if (currentSlotId === null || currentModel === null || !modelsById.has(node.id)) {
+      return { imageUrl: null, modelUrl: null };
+    }
+    // Carry the version token so a regenerate (which bumps it) changes the urls
+    // → ensureDetailPreview rebuilds the image + mini-viewer with fresh bytes.
+    const v = genMeshVersions.get(node.id);
+    return {
+      imageUrl: generatedImageUrl(currentSlotId, currentModel, currentRun, node.id, v),
+      modelUrl: generatedArtifactUrl(currentSlotId, currentModel, currentRun, node.id, v),
+    };
+  }
+  const a = assets.get(node.id);
+  return {
+    imageUrl: a?.imageUrl ?? null,
+    modelUrl: a && a.status === "loaded" ? a.modelUrl ?? null : null,
+  };
+}
+
 // Builds (or returns the cached) preview container for `node`. Returns null
 // when nothing has been generated yet so the caller can skip the section.
 function ensureDetailPreview(node) {
-  const a = assets.get(node.id);
-  const imageUrl = a?.imageUrl ?? null;
-  const modelUrl = a?.modelUrl ?? null;
-  const modelLoaded = !!modelUrl && a?.status === "loaded";
+  const { imageUrl, modelUrl } = detailPreviewUrls(node);
+  const modelLoaded = !!modelUrl;
   if (!imageUrl && !modelLoaded) {
     destroyDetailPreview();
     return null;
@@ -2324,7 +2467,7 @@ function ensureDetailPreview(node) {
     detailPreviewState
     && detailPreviewState.id === node.id
     && detailPreviewState.imageUrl === imageUrl
-    && detailPreviewState.modelUrl === (modelLoaded ? modelUrl : null)
+    && detailPreviewState.modelUrl === modelUrl
   ) {
     return detailPreviewState.container;
   }
@@ -2361,7 +2504,7 @@ function ensureDetailPreview(node) {
     viewer = mountMiniViewer(viewerWrap, modelUrl);
   }
 
-  detailPreviewState = { id: node.id, imageUrl, modelUrl: modelLoaded ? modelUrl : null, container: wrap, viewer };
+  detailPreviewState = { id: node.id, imageUrl, modelUrl, container: wrap, viewer };
   return wrap;
 }
 
@@ -2532,6 +2675,31 @@ function renderTreeDetail() {
       syncRetryButton(wrap, id, status, "detail-retry");
       treeDetailEl.appendChild(wrap);
     }
+  }
+
+  // Regenerate control — generated mode only. Re-rolls this one generated asset
+  // from scratch (Nano-Banana + Trellis + optimize); the gate poll swaps the new
+  // mesh in once it lands. Available for any non-zone node, including ones whose
+  // generated asset failed or hasn't been built yet.
+  if (assetMode === "generated" && node.kind !== "zone") {
+    const regenerating = regeneratingIds.has(id);
+    const wrap = document.createElement("div");
+    wrap.className = "detail-section";
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "detail-retry";
+    btn.classList.toggle("retrying", regenerating);
+    btn.disabled = regenerating;
+    btn.textContent = regenerating ? "regenerating…" : "regenerate asset";
+    btn.title = regenerating
+      ? "Re-running Nano-Banana + Trellis for this generated asset"
+      : "Re-run Nano-Banana + Trellis for this asset and re-derive every object sharing its prefab mesh";
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      regenerateAsset(id);
+    });
+    wrap.appendChild(btn);
+    treeDetailEl.appendChild(wrap);
   }
 
   // Generated image + interactive mini 3D viewer when this node has assets.
@@ -4217,6 +4385,7 @@ function applySceneProjection(nodes) {
         dimensions: n.dimensions,
         proxy_shape: n.proxy_shape,
         node_kind: n.node_kind,
+        orientation: n.orientation,
       });
     }
     if (n.image_url) {
@@ -5001,15 +5170,33 @@ function reloadMeshesForAssetMode() {
     disposeObject3D(obj);
   }
   modelsById.clear();
+  // Bundle reload re-attaches everything; drop version baselines so the next
+  // gate poll re-establishes them against the freshly streamed meshes.
+  genMeshVersions.clear();
   resetModelQueue();
   prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
 }
 
-function generatedArtifactUrl(slotId, model, run, id) {
+function generatedArtifactUrl(slotId, model, run, id, v) {
   // Served from the optimized twin (decimated + KTX2 + Meshopt) — same as the
-  // /meshes?mode=generated bundle.
+  // /meshes?mode=generated bundle. `v` (the GLB's mtime) busts the loader +
+  // browser cache so a regenerated asset re-fetches instead of serving stale
+  // bytes keyed on the bare URL.
+  const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
   return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated-optimized/${encodeURIComponent(id)}.glb`,
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated-optimized/${encodeURIComponent(id)}.glb${bust}`,
+    SERVER_URL,
+  ).toString();
+}
+
+// The generated build's preview image: the Nano-Banana render copied beside
+// each optimized mesh (objects-generated-optimized/<id>.png by _optimize_asset),
+// so the detail preview's image matches the mesh shown in "generated" mode.
+// `v` busts the cache on regenerate, same as the GLB.
+function generatedImageUrl(slotId, model, run, id, v) {
+  const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
+  return new URL(
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated-optimized/${encodeURIComponent(id)}.png${bust}`,
     SERVER_URL,
   ).toString();
 }
@@ -5048,16 +5235,33 @@ async function loadGeneratedMesh(id, url, gen) {
   scheduleFitToScene();
 }
 
-// Progressive load: pull in any finished generated meshes not already attached.
-// Driven by the gate poll so meshes pop in as the build produces them, instead
-// of only after the whole build finishes.
-function loadNewGeneratedMeshes(ids, slotId, model, run) {
-  for (const id of ids) {
-    if (modelsById.has(id) || _genLoading.has(id)) continue;
+// Reconcile attached generated meshes against the gate's reported set. `meshes`
+// is [{id, v}] where v is the optimized GLB's mtime. Three cases per id:
+//   * not attached            → load it (a build producing meshes as it goes).
+//   * attached, version unseen → record the baseline (bundle-loaded), no reload.
+//   * attached, version changed → a regenerate landed; reload in place with a
+//     cache-busted URL (loadGeneratedMesh disposes the old mesh and swaps the
+//     new one in), then clear the regenerating flag + refresh the open detail.
+function syncGeneratedMeshes(meshes, slotId, model, run) {
+  for (const { id, v } of meshes) {
+    if (_genLoading.has(id)) continue;
+    const attached = modelsById.has(id);
+    const known = genMeshVersions.get(id);
+    if (attached && known === undefined) {
+      genMeshVersions.set(id, v);   // bundle-loaded — baseline only, don't reload
+      continue;
+    }
+    if (attached && known === v) continue;   // unchanged
+    const isReload = attached;
+    genMeshVersions.set(id, v);
     _genLoading.add(id);
     const gen = sceneGen;
-    loadGeneratedMesh(id, generatedArtifactUrl(slotId, model, run, id), gen)
-      .finally(() => _genLoading.delete(id));
+    loadGeneratedMesh(id, generatedArtifactUrl(slotId, model, run, id, v), gen)
+      .finally(() => {
+        _genLoading.delete(id);
+        const wasRegenerating = regeneratingIds.delete(id);
+        if ((isReload || wasRegenerating) && id === selectedBboxId) renderTreeDetail();
+      });
   }
 }
 
@@ -5121,13 +5325,21 @@ async function refreshGenerateGate() {
   }
   generating = !!status.running;
   updateGenerateGate();
-  // Attach freshly-built meshes as they land. A node caught mid-write just
-  // isn't added this tick and is retried on the next one (loadGeneratedMesh
-  // doesn't cache the failure), so by the time a build finishes everything that
-  // succeeded is on screen — no need to leave the cell and come back.
-  loadNewGeneratedMeshes(status.ids ?? [], slotId, model, run);
+  // Reconcile attached meshes with the build's set: new ones pop in as the build
+  // produces them, and a regenerated asset (same id, bumped version) reloads in
+  // place. A node caught mid-write just isn't added this tick and is retried on
+  // the next one (loadGeneratedMesh doesn't cache the failure).
+  const meshes = status.meshes ?? (status.ids ?? []).map((id) => ({ id, v: null }));
+  syncGeneratedMeshes(meshes, slotId, model, run);
   if (_genWasRunning && !status.running) {
     setStatus(`generated ${status.count} asset(s) — showing objects-generated/`);
+    // Build idle: anything still flagged regenerating either landed (cleared in
+    // syncGeneratedMeshes) or failed without changing — drop the stragglers so
+    // the detail button doesn't stick on "regenerating…".
+    if (regeneratingIds.size > 0) {
+      regeneratingIds.clear();
+      if (selectedBboxId !== null) renderTreeDetail();
+    }
   }
   _genWasRunning = !!status.running;
 }
@@ -5139,6 +5351,9 @@ assetModeToggleEl?.addEventListener("click", () => {
   // Bulk-load the target build's meshes over one connection; the gate poll then
   // tops up any that finish afterward and syncs the gate's enabled state.
   reloadMeshesForAssetMode();
+  // Re-resolve the open detail preview for the new mode (its urls read
+  // assetMode); the generated mesh repaints once the bundle re-streams it.
+  if (selectedBboxId !== null) renderTreeDetail();
 });
 generateGateEl?.addEventListener("click", startGenerate);
 applyAssetModeUI();

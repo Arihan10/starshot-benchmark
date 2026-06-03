@@ -16,6 +16,8 @@ live in the generation module that drives this.
 
 from __future__ import annotations
 
+from typing import Any
+
 from pydantic import BaseModel
 
 from app.core.slots import MODELS
@@ -70,3 +72,28 @@ async def match(*, new_id: str, new_description: str, catalog: list[tuple[str, s
     finally:
         llm._current_model.reset(token)
     return (out.reuse_id or "").strip()
+
+
+def resolve_group(events: list[dict[str, Any]], node_id: str) -> tuple[str, list[str]]:
+    """Resolve `node_id`'s prefab group from a generated log's `prefab.match`
+    events. Returns `(canonical_id, reuse_ids)`:
+
+      * canonical_id — the asset whose raw Trellis mesh the group's geometry is
+        derived from: `node_id` itself when it's a canonical, else its source.
+      * reuse_ids    — every OTHER node that reuses that canonical.
+
+    Decisions are folded in log order so the LATEST `prefab.match` per id wins —
+    a reuse promoted to canonical by a standalone regen reads back as canonical.
+    The prefab graph is a flat star (a reuse_id always points at a canonical,
+    never another reuse), so no transitive resolution is needed.
+    """
+    reuse_of: dict[str, str] = {}
+    for e in events:
+        if e.get("kind") != "prefab.match":
+            continue
+        nid = e.get("id")
+        if isinstance(nid, str):
+            reuse_of[nid] = str(e.get("reuse_id") or "")
+    canonical = reuse_of.get(node_id) or node_id
+    reuses = [oid for oid, rid in reuse_of.items() if rid == canonical and oid != canonical]
+    return canonical, reuses
