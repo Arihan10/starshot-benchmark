@@ -14,6 +14,7 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import Callable, Iterable
 from contextvars import ContextVar
 from pathlib import Path
 from typing import TypeVar
@@ -26,10 +27,6 @@ from pydantic import BaseModel, ValidationError
 from app.utils import cache, logging
 
 T = TypeVar("T", bound=BaseModel)
-_call_seq: ContextVar[dict[tuple[str | None, str | None], int] | None] = ContextVar(
-    "_call_seq",
-    default=None,
-)
 
 # Lift Python 3.11+'s 4300-digit ceiling on int<->str conversion.
 # When an LLM hallucinates a runaway numeric literal into a structured-
@@ -47,64 +44,34 @@ def set_model(model: str) -> None:
     _current_model.set(model)
 
 
-def reset_call_sequence() -> None:
-    """Start semantic LLM-call ordinals from zero for a pipeline replay.
+class OutputValidationError(Exception):
+    """A structured output parsed cleanly but failed a caller-supplied semantic
+    check — e.g. a batch step echoing back ids that don't match the ones it was
+    asked to place (a model-level output defect, not a pipeline decision).
 
-    Resume re-enters the pipeline from root and expects the first
-    (node, step) call to reuse the first prior decision for that same
-    semantic call, the second to reuse the second, and so on.
-    """
-    _call_seq.set({})
-
-
-def _next_call_index(node_id: str | None, step: str | None) -> int | None:
-    if node_id is None or step is None:
-        return None
-    seq = _call_seq.get()
-    if seq is None:
-        seq = {}
-        _call_seq.set(seq)
-    key = (node_id, step)
-    index = seq.get(key, 0)
-    seq[key] = index + 1
-    return index
+    `call_llm` resamples on it up to ID_VALIDATION_MAX times, and because it is
+    raised BEFORE the `cache.llm` event is written, no failing output is ever
+    cached — so every resample (and any later manual retry) re-runs the call
+    fresh instead of replaying the bad result."""
 
 
-def _find_semantic_cache_hit(
-    *,
-    node_id: str | None,
-    step: str | None,
-    call_index: int | None,
-    schema_name: str,
-) -> dict[str, object] | None:
-    if node_id is None or step is None:
-        return None
-    exact: dict[str, object] | None = None
-    legacy: list[dict[str, object]] = []
-    for event in logging.current_events():
-        if (
-            event.get("kind") != "cache.llm"
-            or event.get("node") != node_id
-            or event.get("step") != step
-        ):
-            continue
-        if event.get("schema") not in (None, schema_name):
-            continue
-        output = event.get("output")
-        if not isinstance(output, dict):
-            continue
-        if call_index is not None and event.get("call_index") == call_index:
-            exact = output
-        elif event.get("call_index") is None:
-            legacy.append(output)
-    if exact is not None:
-        return exact
-    # Older logs predate call_index. Only reuse unindexed semantic hits when
-    # there is exactly one possible match; repeated steps such as next_object
-    # are ambiguous and must fall back to the full cache key.
-    if call_index == 0 and len(legacy) == 1:
-        return legacy[0]
-    return None
+def require_matching_ids(
+    *, produced: Iterable[str], expected: Iterable[str], step: str
+) -> None:
+    """Assert a batch step's output ids are exactly the ids it was given — no
+    missing, extra, or duplicated ids — raising OutputValidationError otherwise.
+    Catches the model mangling an id when echoing the request (e.g. emitting
+    `foo_balustraded_1` for the requested `foo_balustrade_1`)."""
+    produced_list = list(produced)
+    want = set(expected)
+    got = set(produced_list)
+    if want != got or len(produced_list) != len(want):
+        dupes = sorted({i for i in produced_list if produced_list.count(i) > 1})
+        raise OutputValidationError(
+            f"{step}: output ids != requested ids "
+            f"(missing={sorted(want - got)}, "
+            f"unexpected={sorted(got - want)}, duplicated={dupes})"
+        )
 
 
 async def call_llm(
@@ -114,11 +81,11 @@ async def call_llm(
     output_schema: type[T],
     node_id: str | None = None,
     step: str | None = None,
+    validate: Callable[[T], None] | None = None,
 ) -> T:
     model = _current_model.get()
     if model is None:
         raise RuntimeError("llm.set_model() must be called before call_llm()")
-    call_index = _next_call_index(node_id, step)
     schema_name = output_schema.__name__
     key = cache.hash_llm_call(
         model=model,
@@ -127,15 +94,15 @@ async def call_llm(
         schema_name=schema_name,
     )
     hit = cache.find_llm_cache_hit(logging.current_events(), key)
-    if hit is None:
-        hit = _find_semantic_cache_hit(
-            node_id=node_id,
-            step=step,
-            call_index=call_index,
-            schema_name=schema_name,
-        )
     if hit is not None:
-        return output_schema.model_validate(hit)
+        cached = output_schema.model_validate(hit)
+        # Post-fix runs never cache an output that fails `validate`, so a hit is
+        # normally valid. A cell poisoned by an older run can still hold a bad
+        # entry though — surface it as a clean OutputValidationError (→ run.error,
+        # reset to re-run) rather than a cryptic downstream KeyError.
+        if validate is not None:
+            validate(cached)
+        return cached
 
     # Two independent budgets:
     #   * `parse_attempt` — JSON-decode / Pydantic-validation failures.
@@ -148,8 +115,14 @@ async def call_llm(
     #     provider hiccup doesn't fail the run.
     parse_attempt = 0
     transport_attempt = 0
+    id_validation_attempt = 0
     PARSE_MAX = 4
     TRANSPORT_MAX = 8
+    # Auto-resample when a batch step echoes back ids that don't match its
+    # request (see `validate`). Each attempt is a fresh call; exhausting the
+    # budget raises a hard error (the bad output was never cached, so a manual
+    # retry re-runs it too).
+    ID_VALIDATION_MAX = 5
     TRANSPORT_BACKOFF = [2, 4, 8, 16, 30, 30, 30, 30]
     while True:
         content: object = None
@@ -178,6 +151,11 @@ async def call_llm(
             content = message.content
             args = json.loads(content) if isinstance(content, str) else content
             validated = output_schema.model_validate(args)
+            if validate is not None:
+                # Semantic check (e.g. batch id echo). Raised BEFORE the
+                # cache.llm log below, so a failing output is never cached and
+                # each resample re-runs the call fresh.
+                validate(validated)
             reasoning = getattr(message, "reasoning", None) or ""
             # cache.llm carries everything needed for both the LLM-call cache
             # (key + output) and the observability view (node + step + model
@@ -189,7 +167,6 @@ async def call_llm(
                 key=key,
                 node=node_id,
                 step=step,
-                call_index=call_index,
                 model=model,
                 schema=schema_name,
                 system=system,
@@ -198,6 +175,16 @@ async def call_llm(
                 reasoning=reasoning,
             )
             return validated
+        except OutputValidationError as e:
+            if id_validation_attempt >= ID_VALIDATION_MAX - 1:
+                raise
+            logging.log(
+                "llm.validation_retry",
+                step=step,
+                reason=str(e),
+                attempt=id_validation_attempt,
+            )
+            id_validation_attempt += 1
         except json.JSONDecodeError as e:
             final = parse_attempt >= PARSE_MAX - 1
             logging.log(

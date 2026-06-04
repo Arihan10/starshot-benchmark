@@ -106,7 +106,7 @@ def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
 
 def _resolve_run(run: str | None) -> str:
     """Every cell endpoint names its target run/version explicitly so the
-    three concurrently-running versions never route through a shared global.
+    concurrently-running versions never route through a shared global.
     The client always sends `?run=`; `_current_run` is only the fallback for a
     client that hasn't picked one yet (boot, or a legacy caller)."""
     return run or _current_run
@@ -172,7 +172,7 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         global _current_run
-        # Seed the three reserved version runs so their cells exist and can
+        # Seed the reserved version runs so their cells exist and can
         # stream status from boot; the viewer opens on v3 (today's behavior).
         for ver in versions.VERSIONS:
             _hydrate_run(ver.run_name)
@@ -519,7 +519,7 @@ def create_app() -> FastAPI:
         slot: str | None = None,
         model: str | None = None,
     ) -> dict[str, object]:
-        """The three pipeline versions for the version bar. When `slot` and
+        """The pipeline versions for the version bar. When `slot` and
         `model` are given, each entry carries that cell's status (for the
         per-version status dots); the runs are seeded at boot so their cells
         always exist."""
@@ -544,7 +544,7 @@ def create_app() -> FastAPI:
         slot_id: str,
         model_alias: str,
     ) -> dict[str, object]:
-        """Start all three pipeline versions on one (slot, model) cell so they
+        """Start every pipeline version on one (slot, model) cell so they
         run concurrently and fully isolated. Independent of `_current_run`;
         each version is its own reserved run and keeps running regardless of
         which one the viewer is currently showing. A version whose cell is
@@ -580,9 +580,9 @@ def create_app() -> FastAPI:
 
     @app.post("/versions/snapshot")
     async def snapshot_versions() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Archive every reserved version run (V1/V2/V3) that has data into a
+        """Archive every reserved version run (V1/V2/V3/V4) that has data into a
         timestamped, loadable copy, so the live version cells can be reset and
-        re-run for a fresh V1 vs V2 without losing the current rendition. The
+        re-run fresh without losing the current rendition. The
         originals are untouched and stay active; each archive shows up in the
         run picker like any other run and is self-contained (meshes stream
         from its own dir). Versions the user never launched are skipped. A
@@ -919,7 +919,6 @@ async def _sse(
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
     slot_log = _slot_logs[(run, slot_id, model_alias)]
     rlog.bind(slot_log)
-    llm.reset_call_sequence()
     ver = versions.for_run(run)
     prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
     prompt = slot_log.state["prompt"]

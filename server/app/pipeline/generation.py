@@ -16,9 +16,10 @@ Three scenarios:
 
 Per scenario: decompose objects (LLM) -> validate relationships and retry
 on failure (this is the only validating retry left in the pipeline) ->
-batch-resolve every object's bbox in a single LLM call (trusted, no
-retry) -> spawn background Trellis 2 jobs that fan out via SSE events
-as each mesh lands.
+resolve every object's bbox (one at a time for sequential-placement
+versions so each placement sees its already-positioned peers, or in a
+single batch call otherwise; trusted, no retry) -> spawn background
+Trellis 2 jobs that fan out via SSE events as each mesh lands.
 
 The anchor-loop's "is another object needed?" step uses the same
 relationship validator on the single emitted spec.
@@ -40,7 +41,7 @@ from app.pipeline import committed
 from app.services import llm, nano_banana, threed
 from app.utils import glb_place, logging
 from app.utils.geometry import rescale_mesh_to_bbox
-from app.utils.topology import validate_parents, validate_referenced_ids
+from app.utils.topology import placement_order, validate_parents, validate_referenced_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
 
@@ -98,6 +99,7 @@ async def _decompose_objects_validated(
             user = p.render_negative_space_decomp(
                 zone_id=zone.id,
                 zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 nodes=all_nodes,
                 prior_attempts=prior_attempts,
             )
@@ -204,6 +206,153 @@ async def _next_object_validated(
     return decision
 
 
+async def _resolve_object_bboxes_batch(
+    *,
+    specs: list[Any],
+    zone: Node,
+    all_nodes: list[Node],
+) -> dict[str, BoundingBox]:
+    """Place every object in `specs` in ONE batch LLM call (the V2 strategy).
+    Returns `{id: world-frame bbox}`. Objects already committed (resume) keep
+    their world position and the LLM is skipped entirely when all are."""
+    committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
+    if all(b is not None for b in committed_bboxes.values()):
+        return {sid: b for sid, b in committed_bboxes.items() if b is not None}
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
+    p = prompt_runtime.current()
+    out = await llm.call_llm(
+        system=p.SYSTEM_OBJECT_BBOX_BATCH,
+        user=p.render_object_bbox_batch(
+            zone_id=zone.id,
+            zone_prompt=zone.prompt,
+            zone_plan=zone.plan,
+            zone_bbox=zone.bbox,
+            objects=specs,
+            nodes=all_nodes,
+        ),
+        output_schema=p.BboxBatchOutput,
+        node_id=zone.id,
+        step="object_bbox_batch",
+        validate=lambda o: llm.require_matching_ids(
+            produced=[a.id for a in o.assignments],
+            expected=[s.id for s in specs],
+            step="object_bbox_batch",
+        ),
+    )
+    # LLM emits each object's bbox in that object's parent's local frame.
+    # Convert to world coordinates per-object. Handle intra-batch parents
+    # (spec B parents to spec A in same batch) via topological resolution.
+    spec_parent = {s.id: s.parent for s in specs}
+    assignments_by_id = {a.id: a.bbox for a in out.assignments}
+    bboxes: dict[str, BoundingBox] = {}
+    remaining = set(assignments_by_id.keys())
+    while remaining:
+        progress = False
+        for obj_id in list(remaining):
+            parent_id = spec_parent.get(obj_id, zone.id)
+            if parent_id in bboxes:
+                parent_bbox = bboxes[parent_id]
+            elif parent_id in bbox_by_id:
+                parent_bbox = bbox_by_id[parent_id]
+            elif parent_id in remaining:
+                continue
+            else:
+                parent_bbox = zone.bbox
+            bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
+            remaining.discard(obj_id)
+            progress = True
+        if not progress:
+            for obj_id in list(remaining):
+                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
+            remaining.clear()
+    for sid, b in committed_bboxes.items():
+        if b is not None:
+            bboxes[sid] = b
+    return bboxes
+
+
+async def _resolve_object_bboxes_sequential(
+    *,
+    specs: list[Any],
+    zone: Node,
+    all_nodes: list[Node],
+    scenario: Literal["anchor", "encapsulating", "negative-space"],
+) -> dict[str, BoundingBox]:
+    """Place each object in `specs` in its OWN LLM call, one at a time (the
+    V3/V4 placement strategy, used for anchor, encapsulating, and
+    negative-space objects alike). Each placement sees the scene context with
+    every earlier-placed object already positioned, plus the still-unplaced
+    objects as context so it can reserve room for them.
+
+    Objects are visited in `placement_order` so an in-batch parent (e.g. a
+    table) is placed before any object anchored to it (e.g. a lamp ON it). An
+    object already committed (resume) keeps its world bbox and is folded into
+    the context without an LLM call. Returns the same `{id: world-frame bbox}`
+    contract as the batch resolver."""
+    p = prompt_runtime.current()
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
+    context_nodes = list(all_nodes)
+    placed_world: dict[str, BoundingBox] = {}
+    bboxes: dict[str, BoundingBox] = {}
+    kind = "frame" if scenario == "encapsulating" else "object"
+    order = placement_order(specs)
+    for idx, spec in enumerate(order):
+        pending = order[idx + 1:]
+        hit = committed.bbox(spec.id)
+        if hit is not None:
+            world_bbox = hit
+        else:
+            out = await llm.call_llm(
+                system=p.SYSTEM_OBJECT_BBOX_SINGLE,
+                user=p.render_object_bbox_single(
+                    zone_id=zone.id,
+                    zone_prompt=zone.prompt,
+                    zone_plan=zone.plan,
+                    zone_bbox=zone.bbox,
+                    target=spec,
+                    pending=pending,
+                    nodes=context_nodes,
+                ),
+                output_schema=p.BboxSingleOutput,
+                node_id=spec.id,
+                step="object_bbox_single",
+            )
+            if spec.parent in placed_world:
+                parent_bbox = placed_world[spec.parent]
+            elif spec.parent in bbox_by_id:
+                parent_bbox = bbox_by_id[spec.parent]
+            else:
+                parent_bbox = zone.bbox
+            world_bbox = out.bbox.to_world_frame(parent_bbox)
+            # Commit immediately (the later image-prompt loop's emit_bbox then
+            # no-ops) so a crash mid-loop resumes from this frontier.
+            logging.emit_bbox(
+                spec.id,
+                world_bbox,
+                parent_id=spec.parent,
+                prompt=spec.prompt,
+                kind=kind,
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+            )
+        bboxes[spec.id] = world_bbox
+        placed_world[spec.id] = world_bbox
+        context_nodes.append(
+            Node(
+                id=spec.id,
+                prompt=spec.prompt,
+                bbox=world_bbox,
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+                placement=spec.placement,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=spec.parent,
+                parent_kind=spec.parent_kind,
+            )
+        )
+    return bboxes
+
+
 async def _resolve_and_generate(
     *,
     specs: list[Any],
@@ -212,6 +361,7 @@ async def _resolve_and_generate(
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     runs_dir: Path,
     run_id: str,
+    sequential_placement: bool = False,
 ) -> list[Node]:
     if scenario == "encapsulating":
         specs = [s.model_copy(update={"parent": zone.id}) for s in specs]
@@ -251,65 +401,26 @@ async def _resolve_and_generate(
     admitted.update(seen_in_call)
     specs = deduped
 
-    # Resume: objects already placed (a committed `bbox` event) keep their
-    # exact world position. Skip the LLM when every object is committed;
-    # otherwise resolve the batch and overwrite the committed ones so only
-    # never-placed objects take a fresh assignment.
-    committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
-    if all(b is not None for b in committed_bboxes.values()):
-        bboxes: dict[str, BoundingBox] = {
-            sid: b for sid, b in committed_bboxes.items() if b is not None
-        }
-    else:
-        bbox_by_id = {n.id: n.bbox for n in all_nodes}
-        p = prompt_runtime.current()
-        out = await llm.call_llm(
-            system=p.SYSTEM_OBJECT_BBOX_BATCH,
-            user=p.render_object_bbox_batch(
-                zone_id=zone.id,
-                zone_prompt=zone.prompt,
-                zone_plan=zone.plan,
-                zone_bbox=zone.bbox,
-                objects=specs,
-                nodes=all_nodes,
-            ),
-            output_schema=p.BboxBatchOutput,
-            node_id=zone.id,
-            step="object_bbox_batch",
+    # Resolve each object's world-frame bbox. V3/V4 place objects one at a
+    # time across EVERY scenario (anchor, encapsulating, negative-space), so
+    # each placement sees its already-positioned peers and reserves room for
+    # the still-pending ones; V2 places the whole set in one batch call. Both
+    # honor committed bboxes for resume. The single-object completion loop
+    # calls this with one spec, which the sequential path handles as a
+    # length-1 loop (empty pending list).
+    if sequential_placement:
+        bboxes = await _resolve_object_bboxes_sequential(
+            specs=specs,
+            zone=zone,
+            all_nodes=all_nodes,
+            scenario=scenario,
         )
-        # LLM emits each object's bbox in that object's parent's local
-        # frame. Convert to world coordinates per-object. Handle
-        # intra-batch parents (spec B parents to spec A in same batch) via
-        # topological resolution order.
-        spec_parent = {s.id: s.parent for s in specs}
-        assignments_by_id = {a.id: a.bbox for a in out.assignments}
-        bboxes = {}
-        # Resolve in passes: each pass converts objects whose parent bbox
-        # is already known. Terminates when all are resolved or no progress
-        # (cycle — fall back to zone frame).
-        remaining = set(assignments_by_id.keys())
-        while remaining:
-            progress = False
-            for obj_id in list(remaining):
-                parent_id = spec_parent.get(obj_id, zone.id)
-                if parent_id in bboxes:
-                    parent_bbox = bboxes[parent_id]
-                elif parent_id in bbox_by_id:
-                    parent_bbox = bbox_by_id[parent_id]
-                elif parent_id in remaining:
-                    continue
-                else:
-                    parent_bbox = zone.bbox
-                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
-                remaining.discard(obj_id)
-                progress = True
-            if not progress:
-                for obj_id in list(remaining):
-                    bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
-                remaining.clear()
-        for sid, b in committed_bboxes.items():
-            if b is not None:
-                bboxes[sid] = b
+    else:
+        bboxes = await _resolve_object_bboxes_batch(
+            specs=specs,
+            zone=zone,
+            all_nodes=all_nodes,
+        )
 
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(
@@ -699,6 +810,7 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
+    sequential_placement: bool = False,
 ) -> None:
     specs = await _decompose_objects_validated(
         zone=zone,
@@ -721,6 +833,7 @@ async def run(
             scenario=scenario,
             runs_dir=runs_dir,
             run_id=run_id,
+            sequential_placement=sequential_placement,
         )
         all_nodes.extend(placed)
 
@@ -740,11 +853,21 @@ async def run(
             scenario="anchor",
             runs_dir=runs_dir,
             run_id=run_id,
+            sequential_placement=sequential_placement,
         )
         all_nodes.extend(replayed)
     if committed.next_done(zone.id):
         return
 
+    # The next_object loop normally terminates on the model's `done`, but the
+    # model can also get stuck re-proposing an object that can never be admitted
+    # — e.g. one whose bbox the batch step omitted, so it was admitted into
+    # `_admitted_ids` but never placed into `all_nodes`, and so never shows up
+    # as already-present in the next_object context. _resolve_and_generate
+    # dedups that repeat to nothing (`generation.dedup_drop`), so without a
+    # progress guard the loop spins forever re-billing next_object. Track the
+    # ids attempted this loop; a repeat means no progress is possible — stop.
+    attempted: set[str] = set()
     while True:
         decision = await _next_object_validated(
             zone=zone,
@@ -757,11 +880,21 @@ async def run(
                 zone=zone.id,
             )
             return
+        obj_id = decision.object.id
+        if obj_id in attempted:
+            logging.log_once(
+                "generation.next.stuck",
+                match_fields=("zone",),
+                zone=zone.id,
+                id=obj_id,
+            )
+            return
+        attempted.add(obj_id)
         logging.log_once(
             "generation.next",
             match_fields=("zone", "id"),
             zone=zone.id,
-            id=decision.object.id,
+            id=obj_id,
             object=decision.object.model_dump(mode="json"),
         )
         new_nodes = await _resolve_and_generate(
@@ -771,5 +904,6 @@ async def run(
             scenario="anchor",
             runs_dir=runs_dir,
             run_id=run_id,
+            sequential_placement=sequential_placement,
         )
         all_nodes.extend(new_nodes)

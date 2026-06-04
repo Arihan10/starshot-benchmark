@@ -1,6 +1,6 @@
-"""Manual inspection harness for the scene-context tree renderers in `app.core.prompts`.
+"""Manual inspection harness for the scene-context tree renderer in `app.core.prompts`.
 
-Prints `render_scene_tree` (separate objects) and `render_scene_tree_embedded` (objects inline) for a few scenarios so the rendered prompt text can be eyeballed in the terminal — there are no assertions here, just output to read:
+Prints `render_scene_tree` (the zone tree followed by a flat list of every object) for a few scenarios so the rendered prompt text can be eyeballed in the terminal — there are no assertions here, just output to read:
 
     uv run python scripts/test_scene_tree.py
 
@@ -15,7 +15,7 @@ from pathlib import Path
 # Make `app` importable when invoked as a loose script from server/.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from app.core.prompts import render_scene_tree, render_scene_tree_embedded
+from app.core.prompts import render_scene_tree
 from app.core.types import BoundingBox, Node, ParentRelationshipKind
 
 PK = ParentRelationshipKind
@@ -92,10 +92,8 @@ def hotel_room_scene() -> list[Node]:
 def show(title: str, nodes: list[Node]) -> None:
     bar = "=" * 96
     print(f"\n{bar}\n=== SCENARIO: {title}  ({len(nodes)} node(s))\n{bar}")
-    print("\n----- render_scene_tree (separate objects) -----\n")
+    print("\n----- render_scene_tree (zone tree + flat object list) -----\n")
     print(render_scene_tree(nodes=nodes))
-    print("\n----- render_scene_tree_embedded (objects inline) -----\n")
-    print(render_scene_tree_embedded(nodes=nodes))
 
 
 def main() -> None:

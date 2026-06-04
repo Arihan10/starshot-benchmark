@@ -629,8 +629,11 @@
                 color: #5a5e68;
             }
             #status {
-                width: 100%;
-                max-width: 560px;
+                position: fixed;
+                top: 12px;
+                right: 344px;
+                width: 320px;
+                max-width: calc(100vw - 356px);
                 padding: 10px 12px;
                 border-radius: 6px;
                 background: rgba(22, 24, 29, 0.78);
@@ -639,6 +642,7 @@
                 line-height: 1.4;
                 pointer-events: none;
                 box-sizing: border-box;
+                z-index: 6;
             }
             #status .line {
                 margin: 0;
@@ -2210,6 +2214,346 @@
                 border-color: #4a8fd8;
                 color: #e6e6e6;
             }
+            /* tree-header flow-graph launcher (mirrors #tree-expand) */
+            #tree-flow {
+                width: 22px;
+                height: 18px;
+                padding: 0;
+                margin: 0 0 0 4px;
+                border-radius: 3px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #9ad4ff;
+                font: inherit;
+                line-height: 1;
+                cursor: pointer;
+                display: inline-flex;
+                align-items: center;
+                justify-content: center;
+            }
+            #tree-flow:hover {
+                border-color: #4a8fd8;
+                color: #c8d8f0;
+            }
+            #tree.collapsed #tree-flow { display: none; }
+            /* --- execution-flow graph modal --- */
+            #flow-modal {
+                position: fixed;
+                inset: 0;
+                background: rgba(8, 9, 12, 0.9);
+                backdrop-filter: blur(6px);
+                z-index: 1090;
+                display: none;
+            }
+            #flow-modal.open { display: flex; }
+            #flow-panel {
+                margin: 2.5vh auto;
+                width: 96vw;
+                height: 95vh;
+                display: flex;
+                flex-direction: column;
+                background: #121419;
+                border: 1px solid #2a2d35;
+                border-radius: 8px;
+                overflow: hidden;
+                color: #e6e6e6;
+            }
+            #flow-panel > header {
+                display: flex;
+                align-items: center;
+                gap: 14px;
+                padding: 9px 14px;
+                background: #1c1e24;
+                border-bottom: 1px solid #2a2d35;
+                flex-shrink: 0;
+            }
+            #flow-panel > header h2 {
+                margin: 0;
+                font-size: 13px;
+                font-weight: 600;
+                color: #9ad4ff;
+                flex-shrink: 0;
+            }
+            #flow-legend {
+                display: flex;
+                gap: 12px;
+                font-size: 10px;
+                color: #8a8f99;
+            }
+            .flow-legend-item {
+                display: inline-flex;
+                align-items: center;
+                gap: 5px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            .flow-sw {
+                width: 9px;
+                height: 9px;
+                border-radius: 2px;
+                display: inline-block;
+            }
+            .flow-sw.zone { background: #e0c271; }
+            .flow-sw.object { background: #c586d1; }
+            .flow-sw.frame { background: #7fb3d5; }
+            .flow-sw.step { background: #6a7080; }
+            #flow-controls {
+                margin-left: auto;
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            #flow-search {
+                width: 220px;
+                padding: 4px 8px;
+                background: #0c0d10;
+                border: 1px solid #2a2d35;
+                border-radius: 3px;
+                color: #e6e6e6;
+                font: inherit;
+                font-size: 11px;
+            }
+            #flow-search:focus { outline: none; border-color: #4a8fd8; }
+            #flow-controls button {
+                min-width: 28px;
+                height: 26px;
+                padding: 0 8px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 13px;
+                line-height: 1;
+                cursor: pointer;
+            }
+            #flow-controls button:hover { border-color: #4a8fd8; color: #e6e6e6; }
+            #flow-close { font-size: 18px !important; }
+            #flow-viewport {
+                position: relative;
+                flex: 1;
+                overflow: hidden;
+                cursor: grab;
+                background-color: #0c0d10;
+                background-image: radial-gradient(circle, #20242c 1px, transparent 1px);
+                background-size: 24px 24px;
+                background-position: 0 0;
+            }
+            #flow-viewport.grabbing { cursor: grabbing; }
+            #flow-stage {
+                position: absolute;
+                top: 0;
+                left: 0;
+                transform-origin: 0 0;
+                will-change: transform;
+            }
+            #flow-edges {
+                position: absolute;
+                top: 0;
+                left: 0;
+                overflow: visible;
+                pointer-events: none;
+            }
+            .flow-edge {
+                fill: none;
+                stroke: #39404d;
+                stroke-width: 1.5;
+            }
+            .flow-edge.to-object { stroke: #5c4668; }
+            .flow-edge.to-frame { stroke: #2f4a5e; }
+            #flow-nodes { position: absolute; top: 0; left: 0; }
+            .flow-node {
+                position: absolute;
+                box-sizing: border-box;
+                background: #16181d;
+                border: 1px solid #2a2d35;
+                border-left-width: 3px;
+                border-radius: 5px;
+                padding: 5px 8px 6px;
+                cursor: pointer;
+                user-select: none;
+                overflow: hidden;
+            }
+            .flow-node:hover { border-color: #4a8fd8; }
+            .flow-node.zone { border-left-color: #e0c271; }
+            .flow-node.object { border-left-color: #c586d1; }
+            .flow-node.frame { border-left-color: #7fb3d5; }
+            .flow-node.active {
+                box-shadow: 0 0 0 1px #4a8fd8, 0 0 14px rgba(74, 143, 216, 0.4);
+                border-color: #4a8fd8;
+            }
+            .flow-node.selected {
+                box-shadow: 0 0 0 1px #4af0e0;
+                border-color: #4af0e0;
+            }
+            .flow-node.dimmed { opacity: 0.28; }
+            .flow-node.hit { box-shadow: 0 0 0 1px #e0c271; }
+            .flow-node-head {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+            }
+            .flow-dot {
+                width: 7px;
+                height: 7px;
+                border-radius: 50%;
+                flex-shrink: 0;
+                background: #5a5e68;
+            }
+            .flow-dot.phase-planning { background: #9ad4ff; }
+            .flow-dot.phase-decomposing { background: #e0c271; }
+            .flow-dot.phase-resolving_bbox,
+            .flow-dot.phase-resolving_bboxes { background: #f6a96a; }
+            .flow-dot.phase-building_children { background: #f6a96a; }
+            .flow-dot.phase-generating_frame { background: #c586d1; }
+            .flow-dot.phase-generating_anchor { background: #8bd17c; }
+            .flow-dot.phase-generating_mesh { background: #6ac2c2; }
+            .flow-dot.phase-generating_negative_space { background: #9ad4ff; }
+            .flow-dot.phase-done { background: #5a8a55; }
+            .flow-dot.phase-error { background: #ff8080; }
+            .flow-node-id {
+                font-weight: 600;
+                font-size: 11px;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                flex: 1;
+                min-width: 0;
+            }
+            .flow-node.zone .flow-node-id { color: #e0c271; }
+            .flow-node.object .flow-node-id { color: #c586d1; }
+            .flow-node.frame .flow-node-id { color: #7fb3d5; }
+            .flow-seq {
+                flex-shrink: 0;
+                font-size: 9px;
+                font-variant-numeric: tabular-nums;
+                color: #6a7080;
+                background: #0c0d10;
+                border: 1px solid #232631;
+                border-radius: 8px;
+                padding: 0 5px;
+                line-height: 14px;
+            }
+            .flow-node-prompt {
+                margin-top: 2px;
+                font-size: 10px;
+                color: #9aa0ab;
+                line-height: 1.3;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            /* step nodes — one card per LLM call, visually distinct from scene cards */
+            .flow-node.flow-step {
+                background: #131519;
+                border-color: #242833;
+                padding: 5px 8px;
+            }
+            .flow-node.flow-step.cached { border-style: dashed; }
+            .flow-step-head {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+            }
+            .flow-step-name {
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 11px;
+                font-weight: 600;
+                color: #b8bcc4;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                flex: 1;
+                min-width: 0;
+            }
+            .flow-step-gen {
+                flex-shrink: 0;
+                font-size: 9px;
+                color: #8bd17c;
+                background: #14201a;
+                border: 1px solid #2a4a2a;
+                border-radius: 8px;
+                padding: 0 5px;
+                line-height: 14px;
+            }
+            .flow-step-cached {
+                flex-shrink: 0;
+                font-size: 8.5px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                color: #c0a070;
+                border: 1px solid #4a3a20;
+                background: #1f1a12;
+                border-radius: 2px;
+                padding: 0 4px;
+                line-height: 13px;
+            }
+            .flow-step-sub {
+                margin-top: 2px;
+                font-size: 9.5px;
+                color: #6a7080;
+                font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            /* step-node left border + name tint per step (mirrors the obs "via" palette) */
+            .flow-step.s-zone_plan { border-left-color: #9ad4ff; }
+            .flow-step.s-zone_plan .flow-step-name { color: #9ad4ff; }
+            .flow-step.s-overall_bbox { border-left-color: #6ac2c2; }
+            .flow-step.s-overall_bbox .flow-step-name { color: #6ac2c2; }
+            .flow-step.s-zone_decompose { border-left-color: #e0c271; }
+            .flow-step.s-zone_decompose .flow-step-name { color: #e0c271; }
+            .flow-step.s-child_bbox_single,
+            .flow-step.s-child_bbox_batch { border-left-color: #f6a96a; }
+            .flow-step.s-child_bbox_single .flow-step-name,
+            .flow-step.s-child_bbox_batch .flow-step-name { color: #f6a96a; }
+            .flow-step.s-anchor_decompose { border-left-color: #8bd17c; }
+            .flow-step.s-anchor_decompose .flow-step-name { color: #8bd17c; }
+            .flow-step.s-encapsulating_decompose { border-left-color: #7fb3d5; }
+            .flow-step.s-encapsulating_decompose .flow-step-name { color: #7fb3d5; }
+            .flow-step.s-negative_space_decompose { border-left-color: #9ad4ff; }
+            .flow-step.s-negative_space_decompose .flow-step-name { color: #9ad4ff; }
+            .flow-step.s-object_bbox_single,
+            .flow-step.s-object_bbox_batch { border-left-color: #f6a96a; }
+            .flow-step.s-object_bbox_single .flow-step-name,
+            .flow-step.s-object_bbox_batch .flow-step-name { color: #f6a96a; }
+            .flow-step.s-next_object { border-left-color: #d1a386; }
+            .flow-step.s-next_object .flow-step-name { color: #d1a386; }
+            .flow-step.s-image_prompt { border-left-color: #c586d1; }
+            .flow-step.s-image_prompt .flow-step-name { color: #c586d1; }
+            .flow-edge.to-step { stroke: #313845; stroke-dasharray: 3 3; }
+            /* keep the sidebar tree usable, floating above the flow canvas */
+            body.flow-open #tree { z-index: 1095; }
+            /* brief flash when a step-node click lands on its call in the obs modal */
+            .tm-llm-call.tm-llm-flash {
+                outline: 1px solid #4a8fd8;
+                box-shadow: 0 0 0 2px rgba(74, 143, 216, 0.25);
+            }
+            #flow-empty {
+                position: absolute;
+                inset: 0;
+                display: none;
+                align-items: center;
+                justify-content: center;
+                color: #5a5e68;
+                font-style: italic;
+                font-size: 12px;
+                pointer-events: none;
+            }
+            #flow-empty.show { display: flex; }
+            #flow-hint {
+                position: absolute;
+                left: 12px;
+                bottom: 10px;
+                padding: 4px 9px;
+                border-radius: 5px;
+                background: rgba(12, 13, 16, 0.78);
+                border: 1px solid #232631;
+                color: #6a7080;
+                font-size: 10px;
+                pointer-events: none;
+            }
         </style>
         <script type="importmap">
             {
@@ -2239,8 +2583,8 @@
             <div class="ctrl-row">
                 <span class="ctrl-label">version</span>
                 <div id="version-bar"></div>
-                <button id="version-launch-all" type="button" title="Start all three pipeline versions (V1 legacy-XML, V2 new-context frame-first, V3 new-context decomp-first) on the current slot + model so they run concurrently. Switch which one you are viewing with the buttons; the others keep running in the background.">launch all 3</button>
-                <button id="version-archive-all" type="button" title="Archive every version run (V1/V2/V3) that has data into timestamped, loadable copies, so you can reset and re-run V1 vs V2 fresh without losing the current rendition. Originals stay active; each archive appears in the run picker for normal loading later.">archive all</button>
+                <button id="version-launch-all" type="button" title="Start all four pipeline versions (V1 legacy-XML, V2 frame-first, V3 decomp-first root, V4 decomp-first all zones) on the current slot + model so they run concurrently. Switch which one you are viewing with the buttons; the others keep running in the background.">launch all 4</button>
+                <button id="version-archive-all" type="button" title="Archive every version run (V1/V2/V3/V4) that has data into timestamped, loadable copies, so you can reset and re-run fresh without losing the current rendition. Originals stay active; each archive appears in the run picker for normal loading later.">archive all</button>
             </div>
             <div class="ctrl-row">
                 <span class="ctrl-label">run</span>
@@ -2252,7 +2596,7 @@
                 <span class="ctrl-label">model</span>
                 <select id="model-picker" title="Choose which LLM drives every reasoning step for the active slot. Each (slot, model) cell is its own resumable run."></select>
                 <button id="slot-resume" type="button" style="display:none">resume</button>
-                <button id="resume-all" type="button" title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done.">resume all</button>
+                <button id="resume-all" type="button" title="Resume every paused run and retry every errored run on the currently-selected model. Skips idle (never-started), running, and done cells — use 'start cells…' to launch idle cells.">resume all</button>
                 <button id="slot-reset" type="button" title="Wipe this slot and start a fresh run">reset</button>
                 <button id="reset-all" type="button" title="Wipe every started cell across ALL models on the current run (every slot × model that has data) back to idle. Skips never-run cells. Nothing is restarted — use 'start cells…' to launch the ones you want.">reset all</button>
                 <button id="start-cells" type="button" title="Pick exactly which cells to start: choose any combination of versions × models × slots and launch them at once. Cells that are already running or done are skipped.">start cells…</button>
@@ -2262,7 +2606,7 @@
                 <button id="bbox-toggle" type="button" title="Show or hide bounding-box wireframes (meshes-only view)">bboxes: on</button>
                 <button id="frames-toggle" type="button" title="Show or hide frame meshes (walls/floors/ceilings) so you can see scene interiors">frames: on</button>
                 <button id="meshes-toggle" type="button" title="Show or hide all generated meshes (bboxes-only view)">meshes: on</button>
-                <button id="select-mode-toggle" type="button" title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it">select: all</button>
+                <button id="select-mode-toggle" type="button" title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it. Hold Shift to do this momentarily without flipping the toggle.">select: all</button>
                 <button id="solid-fill-toggle" type="button" title="Fill every object/frame bbox with a solid mesh matching its proxy shape (zones stay wireframe). Useful in bbox-only mode to see the scene's volumetric silhouette without running mesh generation.">fill: off</button>
                 <button id="grid-toggle" type="button" title="Show or hide the infinite ground grid">grid: on</button>
                 <div class="ctrl-sep"></div>
@@ -2271,12 +2615,14 @@
                 <button id="replay-gif" type="button" title="Replay the recorded event log and export an animated GIF of the build">replay → gif</button>
             </div>
         </div>
-        <div id="status"><p class="line hdr">ready</p></div>
         </div>
         <div id="tree">
             <div id="tree-header">
                 <span>tree</span>
                 <span id="tree-active"></span>
+                <button id="tree-flow" type="button" title="Open the execution-flow graph — a pannable canvas of every pipeline node in execution order. Subregions branch into separate paths; anchor objects chain in the order they were placed. Click any node for its observability pipeline.">
+                    <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="3" cy="8" r="1.7"/><circle cx="13" cy="3.6" r="1.7"/><circle cx="13" cy="12.4" r="1.7"/><path d="M4.7 8 L11.3 4.2"/><path d="M4.7 8 L11.3 11.8"/></svg>
+                </button>
                 <button id="tree-expand" type="button" title="Open pipeline observability — every LLM call (system / input / output / reasoning) for the focused node, plus its ancestors and descendants">⛶</button>
                 <span id="tree-toggle">▾</span>
             </div>
@@ -2288,6 +2634,7 @@
             <div id="tree-body"></div>
             <div id="tree-detail"></div>
         </div>
+        <div id="status"><p class="line hdr">ready</p></div>
         <div id="assets">
             <div id="assets-header">
                 <span>assets <span id="assets-count">(0)</span></span>
@@ -2405,6 +2752,34 @@
                     </div>
                 </header>
                 <div id="tree-modal-body"></div>
+            </div>
+        </div>
+        <div id="flow-modal">
+            <div id="flow-panel">
+                <header>
+                    <h2>execution flow</h2>
+                    <div id="flow-legend">
+                        <span class="flow-legend-item"><i class="flow-sw zone"></i>zone</span>
+                        <span class="flow-legend-item"><i class="flow-sw object"></i>object</span>
+                        <span class="flow-legend-item"><i class="flow-sw frame"></i>frame</span>
+                        <span class="flow-legend-item"><i class="flow-sw step"></i>step</span>
+                    </div>
+                    <div id="flow-controls">
+                        <input id="flow-search" type="text" placeholder="locate id or prompt…" autocomplete="off" spellcheck="false" />
+                        <button id="flow-fit" type="button" title="Fit the whole graph to view">fit</button>
+                        <button id="flow-zoom-out" type="button" title="Zoom out">−</button>
+                        <button id="flow-zoom-in" type="button" title="Zoom in">+</button>
+                        <button id="flow-close" type="button" title="Close (Esc)">×</button>
+                    </div>
+                </header>
+                <div id="flow-viewport">
+                    <div id="flow-stage">
+                        <svg id="flow-edges" xmlns="http://www.w3.org/2000/svg"></svg>
+                        <div id="flow-nodes"></div>
+                    </div>
+                    <div id="flow-empty">no pipeline nodes yet — start a run, then reopen this graph</div>
+                    <div id="flow-hint">drag to pan · scroll to zoom · scene node → observability · step node → its input/output/reasoning · sidebar click centers here</div>
+                </div>
             </div>
         </div>
         <!-- gif.js loaded as a global because the npm dist is UMD/CJS and

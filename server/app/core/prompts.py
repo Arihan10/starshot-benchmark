@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core import util
 from app.core.types import (
@@ -67,7 +67,7 @@ def _deepseek_suffix() -> str:
     from app.services.llm import _current_model
 
     model = _current_model.get()
-    if model and ("deepseek" in model.lower() or "gpt" in model.lower()):
+    if model and ("deepseek" in model.lower()):
         return DEEPSEEK_INJECTION
     return ""
 
@@ -77,7 +77,7 @@ def _render_proxy_shape(p: ProxyShape | None) -> str:
 
 
 # Shared anti-ephemera guidance injected into every prompt that authors
-# scene content (zone plans, zone decomposition, object decomposition,
+# scene content (region plans, region decomposition, object decomposition,
 # next-object polish). The downstream text-to-3D model produces solid
 # meshes; gaseous, volumetric, or luminous phenomena render as garbage
 # blobs that drag the whole scene down. Centralised here so the
@@ -94,54 +94,75 @@ You MAY still IMPLY these phenomena through tangible, solid consequences that DO
 
 # --- canonical scene-context tree --------------------------------------------
 #
-# Every prompt that shows the LLM "what does the scene look like right now" routes through one of the two renderers below.
-# `render_scene_tree` keeps the object detail in a second pass grouped by region; `render_scene_tree_embedded` inlines each region's objects under it.
-# Both share the entry/formatting helpers here and the type-agnostic utilities in `util`.
+# Every prompt that shows the LLM "what does the scene look like right now" routes through the renderers below.
+# They render one data shape: the subregion tree (regions only) followed by a flat list of every object. Objects are never nested under regions — each object entry carries its own `parent` (structural anchor) and `parent_region`, so the rendered information mirrors V1's flat <ZONES>/<OBJECTS> dump.
+# They share the entry/formatting helpers here and the type-agnostic utilities in `util`.
 
 _NO_NODES_MESSAGE = "(no regions or objects have been placed yet — this is the very start of the run)"
 _NO_SUBREGIONS_MESSAGE = "{(none - no other subregions have been planned yet)}"
 
 # Inline marker appended to a targeted subregion's name line in the
 # embedded block. The arrow points back at the node id and labels it as
-# the target so a prompt can call the LLM's attention to one zone; the
+# the target so a prompt can call the LLM's attention to one region; the
 # caller-supplied text follows it.
 _TARGET_MARKER = "<-- TARGET:"
 
 
 def _root_scene_header(root: Node) -> str:
-    """Root prompt, plan, and overall bounding box — injected at the top of every prompt that shows scene context."""
+    """Root prompt, plan, and overall bounding box — injected at the top of every prompt that shows scene context. The root bbox is delivered in natural language — its `W by H by D` dimensions plus its origin corner, tagged `(scene root)` — instead of the raw `origin/dimensions` coordinate dump, while still surfacing every value the box carries."""
+    dx, dy, dz = root.bbox.dimensions
+    ox, oy, oz = root.bbox.origin
     return (
-        f"Prompt: {root.prompt}\n"
-        f"Plan: {root.plan}\n"
-        f"Overall scene bounding box coordinates: {util.format_global_bbox(root.bbox)}"
+        f'Prompt: "{root.prompt}"\n'
+        f'Plan: "{root.plan}"\n'
+        f"Overall scene (root) bounding box: {dx:.2f}m by {dy:.2f}m by {dz:.2f}m, with its origin corner at ({ox:.2f}, {oy:.2f}, {oz:.2f}) m (scene root)"
     )
 
 
 def _local_coords_line(node: Node, by_id: dict[str, Node]) -> str | None:
     """`Local coordinates relative to its parent (<pid>): ...` line, or None for the root / a node whose parent is absent from the snapshot."""
     if node.parent_id is not None and node.parent_id in by_id:
-        coords = util.format_local_bbox(node.bbox, by_id[node.parent_id].bbox)
-        return f"Local coordinates relative to its parent ({node.parent_id}): {coords}"
+        coords = util.format_local_origin(node.bbox, by_id[node.parent_id].bbox)
+        return f"Local origin corner (relative to {node.parent_id}, measured from its min corner): {coords}"
     return None
 
 
-def _object_entry(obj: Node, by_id: dict[str, Node]) -> str:
-    """Full-detail entry for one concrete object (no plan)."""
+def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str) -> str:
+    """Full-detail entry for one concrete object (no plan), rendered as a member of the scene's flat object list.
+
+    `parent` is the object's structural-anchor block — `parent_id` (the peer object or region this object physically rests on / attaches to / sits inside), `parent_relationship_kind` (ON / ATTACHED / IN), and `parent_dimensions` (that parent's size) — modeled on the `parent_region` block in `_region_plan_entry`. `parent_region` is the id of the subregion this object belongs to and `parent_region_dimensions` is that region's size; both are omitted when `parent_region` would equal `parent_id` (the object anchors directly to its region — the `parent` block already states them), and they are shown only when the object anchors to a peer object (e.g. a lamp ON a nightstand has parent_id=nightstand, parent_region=<the subregion the nightstand is in>). Together they carry the same information V1's flat <OBJECTS> dump splits across the `parent` pointer and the node's position in the tree."""
     lines = [
         f"Name: {obj.id}",
-        f"Description: {obj.prompt}",
+        f'Description: "{obj.prompt}"',
     ]
     if obj.parent_id is not None:
         kind_str = obj.parent_kind.value if obj.parent_kind is not None else "(unknown)"
-        lines.append(f"parent: {obj.parent_id}  kind: {kind_str}")
+        parent_lines = [
+            f"parent_id: {obj.parent_id}",
+            f"parent_relationship_kind: {kind_str}",
+        ]
+        if obj.parent_id in by_id:
+            parent_lines.append(
+                f"parent_dimensions: {util.format_dimensions(by_id[obj.parent_id].bbox)}"
+            )
+        lines.append("parent: " + util.braces("\n".join(parent_lines)))
+    if parent_zone != obj.parent_id:
+        lines.append(f"parent_region: {parent_zone}")
+        if parent_zone in by_id:
+            lines.append(
+                f"parent_region_dimensions: {util.format_dimensions(by_id[parent_zone].bbox)}"
+            )
     if obj.placement is not None:
-        lines.append(f"placement: {obj.placement}")
+        lines.append(f'placement: "{obj.placement}"')
     if obj.referenced_ids:
         refs = ", ".join(f"{r.target}: {r.kind.value}" for r in obj.referenced_ids)
-        lines.append(f"referenced_ids: [{refs}]")
+        lines.append(f"relationship_ids: [{refs}]")
     else:
-        lines.append("referenced_ids: []")
-    lines.append(f"Global bounding box coordinates: {util.format_global_bbox(obj.bbox)}")
+        lines.append("relationship_ids: []")
+    lines.append(f"proxy_shape: {_render_proxy_shape(obj.proxy_shape)}")
+    lines.append(f"orientation: {obj.orientation}deg")
+    lines.append(f"Dimensions: {util.format_dimensions(obj.bbox)}")
+    lines.append(f"Global origin corner: {util.format_global_origin(obj.bbox)}")
     local = _local_coords_line(obj, by_id)
     if local is not None:
         lines.append(local)
@@ -155,50 +176,44 @@ def _region_plan_entry(
     target_id: str | None = None,
     target_text: str = "",
 ) -> str:
-    """Separate-objects format, pass 1: a subregion's fields, the names of its objects, and (recursively) its nested subregions. No object detail here. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one zone."""
-    objects, subregions = util.split_region_members(region.id, idx)
+    """Subregion tree, regions only: a subregion's fields and (recursively) its nested subregions. Objects are no longer listed here — every object in the scene is rendered once in the flat list produced by `render_objects_flat`, each carrying its own `parent_region`. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one region."""
+    _, subregions = util.split_region_members(region.id, idx)
     name_line = f"Name: {region.id}"
     if target_id is not None and region.id == target_id:
         name_line += f"   {_TARGET_MARKER} {target_text}".rstrip()
     lines = [
         name_line,
-        f"Description: {region.prompt}",
+        f'Description: "{region.prompt}"',
     ]
     if region.plan is not None:
-        lines.append(f"Plan for this region: {region.plan}")
-    lines.append(f"Global bounding box coordinates: {util.format_global_bbox(region.bbox)}")
+        lines.append(f'Plan for this region: "{region.plan}"')
+    if region.placement is not None:
+        lines.append(f'placement: "{region.placement}"')
+    lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
+    lines.append(f"orientation: {region.orientation}deg")
+    lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
+    lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
     local = _local_coords_line(region, by_id)
     if local is not None:
         lines.append(local)
-    lines.append(f"Objects: {', '.join(o.id for o in objects) if objects else '(none)'}")
+    if region.parent_id is not None and region.parent_id in by_id:
+        parent = by_id[region.parent_id]
+        parent_placement = f'"{parent.placement}"' if parent.placement is not None else "(none)"
+        parent_lines = [
+            f"parent_name: {parent.id}",
+            f"parent_placement: {parent_placement}",
+            f"parent_dimensions: {util.format_dimensions(parent.bbox)}",
+            f"parent_global_origin_corner: {util.format_global_origin(parent.bbox)}",
+        ]
+        lines.append("parent_region: " + util.braces("\n".join(parent_lines)))
     if subregions:
         lines += [
             "",
-            "This subregion decomposes into the following further subregions.",
+            f'"{region.id}" decomposes into the following further subregions.',
             "",
             util.brace_group(
                 [_region_plan_entry(s, idx, by_id, target_id, target_text) for s in subregions]
             ),
-        ]
-    return util.braces("\n".join(lines))
-
-
-def _region_objects_entry(region: Node, idx: dict[str | None, list[Node]], by_id: dict[str, Node]) -> str:
-    """Separate-objects format, pass 2: the full detail of a subregion's objects and (recursively) the same for its nested subregions."""
-    objects, subregions = util.split_region_members(region.id, idx)
-    lines = [
-        f"Subregion name: {region.id}",
-        "",
-        "Here's the list of objects that have been placed for this subregion.",
-        "",
-        util.brace_group([_object_entry(o, by_id) for o in objects]),
-    ]
-    if subregions:
-        lines += [
-            "",
-            "This subregion's further subregions also have their own objects. Here's a list of further subregions.",
-            "",
-            util.brace_group([_region_objects_entry(s, idx, by_id) for s in subregions]),
         ]
     return util.braces("\n".join(lines))
 
@@ -210,31 +225,47 @@ def _region_embedded_entry(
     target_id: str | None = None,
     target_text: str = "",
 ) -> str:
-    """Embedded format: a subregion's fields, its objects inline, then (recursively) its nested subregions. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one zone."""
+    """Subregion tree (embedded form): a subregion's fields, then a FLAT list of the objects placed directly inside it, then (recursively) its nested subregions. Objects are never nested under one another — a peer-anchored object names its anchor in its own `parent` block rather than nesting beneath it. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one region."""
     objects, subregions = util.split_region_members(region.id, idx)
     name_line = f"Subregion name: {region.id}"
     if target_id is not None and region.id == target_id:
         name_line += f"   {_TARGET_MARKER} {target_text}".rstrip()
     lines = [
         name_line,
-        f"Description: {region.prompt}",
+        f'Description: "{region.prompt}"',
     ]
     if region.plan is not None:
-        lines.append(f"Plan for this region: {region.plan}")
-    lines.append(f"Global bounding box coordinates: {util.format_global_bbox(region.bbox)}")
+        lines.append(f'Plan for this region: "{region.plan}"')
+    if region.placement is not None:
+        lines.append(f'placement: "{region.placement}"')
+    lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
+    lines.append(f"orientation: {region.orientation}deg")
+    lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
+    lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
     local = _local_coords_line(region, by_id)
     if local is not None:
         lines.append(local)
-    lines += [
-        "",
-        "Here's the list of objects that have been placed for this subregion.",
-        "",
-        util.brace_group([_object_entry(o, by_id) for o in objects]),
-    ]
+    if region.parent_id is not None and region.parent_id in by_id:
+        parent = by_id[region.parent_id]
+        parent_placement = f'"{parent.placement}"' if parent.placement is not None else "(none)"
+        parent_lines = [
+            f"parent_name: {parent.id}",
+            f"parent_placement: {parent_placement}",
+            f"parent_dimensions: {util.format_dimensions(parent.bbox)}",
+            f"parent_global_origin_corner: {util.format_global_origin(parent.bbox)}",
+        ]
+        lines.append("parent_region: " + util.braces("\n".join(parent_lines)))
+    if objects:
+        lines += [
+            "",
+            f'Objects placed directly within "{region.id}" (a flat list — an object anchored to a peer object names that peer in its `parent` block rather than nesting beneath it):',
+            "",
+            util.brace_group([_object_entry(o, by_id, parent_zone=region.id) for o in objects]),
+        ]
     if subregions:
         lines += [
             "",
-            "Here's the list of subregions that are present within this region.",
+            f'Here\'s the list of subregions that are present within "{region.id}".',
             "",
             util.brace_group(
                 [_region_embedded_entry(s, idx, by_id, target_id, target_text) for s in subregions]
@@ -246,42 +277,47 @@ def _region_embedded_entry(
 def _render_to_place_block(
     to_place: list[ChildNodeSpec] | list[ObjectSpec] | None,
     by_id: dict[str, Node],
+    parent_zone: str | None = None,
 ) -> str:
-    """Trailing block listing the children/objects whose bboxes a bbox-batch step must determine. Empty string when there is nothing to place."""
+    """Pseudo-JSON block of the children/objects whose bboxes a bbox-batch step must determine — the caller writes the introducing sentence. Empty string when there is nothing to place.
+
+    `parent_zone` is the id of the region these specs are being generated as a part of (the region the bbox step is resolving) and is emitted on each spec as `parent_region`. When supplied, every spec whose structural `parent` is NOT that region also carries `parent_region` + `parent_region_dimensions`, mirroring `_object_entry`: a spec anchored to a peer still names the region it belongs to, while a spec anchored directly to the region omits it (its `parent` block already names it)."""
     if not to_place:
         return ""
-    kind = "objects" if isinstance(to_place[0], ObjectSpec) else "sub-regions"
     to_place_ids = {c.id for c in to_place}
     entries: list[str] = []
     for c in to_place:
         kind_str = c.parent_kind.value
         if c.parent in by_id:
-            pdims = by_id[c.parent].bbox.size
-            pdims_str = f"[{pdims[0]:.2f}, {pdims[1]:.2f}, {pdims[2]:.2f}]"
+            pdims_str = util.format_dimensions(by_id[c.parent].bbox)
         elif c.parent in to_place_ids:
             pdims_str = "(parent is also being placed in this batch — use your emitted dimensions for it)"
         else:
             pdims_str = "(parent id not recognised in current scene)"
         lines = [
             f"id: {c.id}",
-            f"parent: {c.parent}  kind: {kind_str}",
+            f"parent: {c.parent}",
+            f"parent_relationship_kind: {kind_str}",
             f"parent_dimensions: {pdims_str}",
-            f"proxy_shape: {_render_proxy_shape(c.proxy_shape)}",
         ]
+        if parent_zone is not None and c.parent != parent_zone:
+            lines.append(f"parent_region: {parent_zone}")
+            if parent_zone in by_id:
+                lines.append(
+                    f"parent_region_dimensions: {util.format_dimensions(by_id[parent_zone].bbox)}"
+                )
+        lines.append(f"proxy_shape: {_render_proxy_shape(c.proxy_shape)}")
         if c.orientation:
             lines.append(f"orientation: {c.orientation}deg")
-        lines.append(f"prompt: {c.prompt}")
-        lines.append(f"placement: {c.placement}")
+        lines.append(f'prompt: "{c.prompt}"')
+        lines.append(f'placement: "{c.placement}"')
         if c.referenced_ids:
             refs = ", ".join(f"{r.target}: {r.kind.value}" for r in c.referenced_ids)
-            lines.append(f"referenced_ids: [{refs}]")
+            lines.append(f"relationship_ids: [{refs}]")
         else:
-            lines.append("referenced_ids: []")
+            lines.append("relationship_ids: []")
         entries.append(util.braces("\n".join(lines)))
-    return (
-        f"\n\nHere's the list of {kind} to place (bbox is yours to determine for each):\n\n"
-        + util.brace_group(entries)
-    )
+    return util.brace_group(entries)
 
 
 def render_subregions_block(
@@ -290,9 +326,9 @@ def render_subregions_block(
     node_id: str | None = None,
     text: str = "",
 ) -> str:
-    """Pseudo-JSON block of the scene's top-level subregions in the separate-objects format: each carries its plan, bbox, and object names, recursing into nested subregions. Renders the single-region placeholder when the scene is one undivided region.
+    """Pseudo-JSON block of the scene's subregion tree (regions only): each carries its plan and bbox, recursing into nested subregions. Objects are rendered separately in the flat list (`render_objects_flat`). Renders the single-region placeholder when the scene is one undivided region.
 
-    Pass `node_id` to point the LLM at one specific zone: the subregion whose id matches gets an inline target marker carrying `text` appended to its name line, found at any depth of the tree. With `node_id` unset (the default) the block renders exactly as before."""
+    Pass `node_id` to point the LLM at one specific region: the subregion whose id matches gets an inline target marker carrying `text` appended to its name line, found at any depth of the tree. With `node_id` unset (the default) the block renders exactly as before."""
     root = util.find_root(nodes)
     if root is None:
         return _NO_SUBREGIONS_MESSAGE
@@ -306,26 +342,59 @@ def render_subregions_block(
     )
 
 
-def render_root_objects_block(nodes: list[Node]) -> str:
-    """Pseudo-JSON block of the objects parented directly to the scene root, each in full detail. Renders an empty `{}` block when the root has no direct objects."""
+def render_direct_subregions(nodes: list[Node], zone_id: str) -> str:
+    """Pseudo-JSON block of `zone_id`'s DIRECT child subregions (regions only), rendered exactly like the scene's top-level subregion list (`render_subregions_block`): each entry carries its plan and bbox and recurses into its own nested subregions. Objects are not listed here — every object in the scene lives in the flat list produced by `render_objects_flat`. Renders the single-region placeholder when `zone_id` has no child subregions of its own."""
+    by_id = {n.id: n for n in nodes}
+    idx = util.index_children(nodes)
+    _, subregions = util.split_region_members(zone_id, idx)
+    if not subregions:
+        return _NO_SUBREGIONS_MESSAGE
+    return util.brace_group(
+        [_region_plan_entry(s, idx, by_id) for s in subregions]
+    )
+
+
+def render_objects_flat(nodes: list[Node]) -> str:
+    """Pseudo-JSON block of EVERY object in the scene as a single flat list — no nesting under regions. Each object is rendered once via `_object_entry`, tagged with its `parent_region` (the subregion it belongs to) + `parent_region_dimensions` and its `parent` block (structural anchor). Objects are walked region by region (root first, then a depth-first descent through subregions) so the list is deterministic; an object whose structural parent is a peer object still appears under the region that contains it. Renders an empty `{}` block when the scene has no objects yet."""
     root = util.find_root(nodes)
     if root is None:
         return util.brace_group([])
     by_id = {n.id: n for n in nodes}
     idx = util.index_children(nodes)
-    objects, _ = util.split_region_members(root.id, idx)
-    return util.brace_group([_object_entry(o, by_id) for o in objects])
+    entries: list[str] = []
+
+    def walk(region: Node) -> None:
+        objects, subregions = util.split_region_members(region.id, idx)
+        entries.extend(_object_entry(o, by_id, parent_zone=region.id) for o in objects)
+        for s in subregions:
+            walk(s)
+
+    walk(root)
+    return util.brace_group(entries)
 
 
-def render_filled_block(nodes: list[Node]) -> str:
-    """Pseudo-JSON block giving the full object detail of every top-level subregion (and its nested subregions) — the separate-objects format's second pass. Renders an empty `{}` block when the scene has no subregions."""
+def render_root_objects(nodes: list[Node]) -> str:
+    """Flat list of the objects anchored directly to the scene root — the
+    shared geometry (shells, ground planes, ambient root-level fill) the whole
+    scene rests on. Split out of `render_embedded_block` because this is GLOBAL
+    context: every region sits within it, so it reads best next to the root
+    scene header rather than buried inside the per-subregion tree. Callers wire
+    it in wherever that placement makes sense. Returns a short placeholder when
+    the root carries no such geometry yet."""
     root = util.find_root(nodes)
     if root is None:
-        return util.brace_group([])
+        return _NO_NODES_MESSAGE
     by_id = {n.id: n for n in nodes}
     idx = util.index_children(nodes)
-    _, subregions = util.split_region_members(root.id, idx)
-    return util.brace_group([_region_objects_entry(s, idx, by_id) for s in subregions])
+    root_objects, _ = util.split_region_members(root.id, idx)
+    if not root_objects:
+        return "No objects are parented directly to the root yet."
+    return (
+        "Here's a list of objects parented directly to the root (parent_id = root):\n\n"
+        + util.brace_group(
+            [_object_entry(o, by_id, parent_zone=root.id) for o in root_objects]
+        )
+    )
 
 
 def render_embedded_block(
@@ -334,29 +403,20 @@ def render_embedded_block(
     node_id: str | None = None,
     text: str = "",
 ) -> str:
-    """Pseudo-JSON block of the scene's top-level subregions in the embedded format: each carries its objects inline, followed by its nested subregions. Renders the single-region placeholder when the scene has no subregions.
+    """Scene context in EMBEDDED form: the subregion tree where each subregion lists the objects placed directly inside it inline as a FLAT list — objects are never nested under one another, a peer-anchored object just names its anchor in its own `parent` block — and then recurses into its nested subregions. Objects anchored directly to the scene root (the shell/ground meshes from the root's encapsulating pass) are NOT included here — they are global geometry, rendered separately by `render_root_objects`, which callers place next to the root scene header. Renders the single-region placeholder when the scene has no subregions yet.
 
-    Objects parented directly to the scene root (e.g. the shell/ground meshes from the root's encapsulating pass) are appended in a trailing section whenever the root owns any — the embedded walk starts at the root's subregions and would otherwise drop them, leaving downstream steps (bbox resolution, decomposition) blind to geometry their children anchor against.
-
-    Pass `node_id` to point the LLM at one specific zone: the subregion whose id matches gets an inline target marker carrying `text` appended to its name line, found at any depth of the embedded tree. With `node_id` unset (the default) the block renders exactly as before."""
+    Pass `node_id` to point the LLM at one specific region: the subregion whose id matches gets an inline target marker carrying `text` appended to its name line, found at any depth of the embedded tree. With `node_id` unset (the default) no marker is drawn."""
     root = util.find_root(nodes)
     if root is None:
         return _NO_SUBREGIONS_MESSAGE
     by_id = {n.id: n for n in nodes}
     idx = util.index_children(nodes)
-    root_objects, subregions = util.split_region_members(root.id, idx)
-    if subregions:
-        block = util.brace_group(
-            [_region_embedded_entry(s, idx, by_id, node_id, text) for s in subregions]
-        )
-    else:
-        block = _NO_SUBREGIONS_MESSAGE
-    if root_objects:
-        block += (
-            "\n\nHere's the list of objects parented directly to the overall scene root:\n\n"
-            + util.brace_group([_object_entry(o, by_id) for o in root_objects])
-        )
-    return block
+    _, subregions = util.split_region_members(root.id, idx)
+    if not subregions:
+        return _NO_SUBREGIONS_MESSAGE
+    return util.brace_group(
+        [_region_embedded_entry(s, idx, by_id, node_id, text) for s in subregions]
+    )
 
 
 def render_scene_tree(
@@ -364,7 +424,7 @@ def render_scene_tree(
     nodes: list[Node],
     to_place: list[ChildNodeSpec] | list[ObjectSpec] | None = None,
 ) -> str:
-    """Render the scene-context tree in the SEPARATE-OBJECTS format: each subregion lists only its object names, and every object's full detail is rendered in a second pass grouped by region. `render_scene_tree_embedded` renders the alternative EMBEDDED format. Both formats are specified below (the second is under the "EMBEDDED OBJECTS IN ZONE LIST ver." divider).
+    """Render the scene context as the subregion tree (regions only) followed by the flat list of every object in the scene. Each object appears exactly once in the flat list, tagged with its `parent` (structural anchor) and `parent_region` — there is no nesting of objects under regions.
     """
     if not nodes:
         return _NO_NODES_MESSAGE
@@ -372,60 +432,25 @@ def render_scene_tree(
     if root is None:
         return _NO_NODES_MESSAGE
     by_id = {n.id: n for n in nodes}
-    _, top_subregions = util.split_region_members(root.id, util.index_children(nodes))
 
     body = f"""This is the overall plan for the entire scene.
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it.
+Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside; the objects that fill the scene are listed separately as a flat list below.
 
-Here's the list of subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built and a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D vector that marks the opposite corner. Additionally, each subregion will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
+Here's the list of subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built, its dimensions, and a global coordinate marking its origin corner. Additionally, each subregion will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
 
 {render_subregions_block(nodes)}
 
-Each region is being filled with its respective objects. Each object has a description detailing what it is and a bounding box that defines its global position in the scene. Additionally, each object will also have a set of local coordinates that define its position relative to its parent, which can either be another object or the region it belongs to itself.
+The objects that fill these regions are listed below as a single flat list. Objects are not nested under their regions. Each object has a description detailing what it is, a `parent` block (its structural anchor — `parent_id`, `parent_relationship_kind`, and `parent_dimensions`; the parent can either be another object or the region it belongs to itself), a `parent_region` (the region it belongs to) with `parent_region_dimensions`, its dimensions, a global coordinate marking its origin corner, and a set of local coordinates that define that origin relative to its parent. An object's `parent_region`/`parent_region_dimensions` are omitted when its structural parent is its region, since the `parent` block already states them.
 
-Here's a list of objects that are parented to the global scene itself.
-
-{render_root_objects_block(nodes)}"""
-
-    if top_subregions:
-        body += f"""
-
-Here's the list of subregions that have already been filled with their respective objects.
-
-{render_filled_block(nodes)}"""
+{render_objects_flat(nodes)}"""
 
     return body + _render_to_place_block(to_place, by_id)
 
 
-def render_scene_tree_embedded(
-    *,
-    nodes: list[Node],
-    to_place: list[ChildNodeSpec] | list[ObjectSpec] | None = None,
-) -> str:
-    """Render the scene-context tree in the EMBEDDED format: every subregion carries the full detail of its own objects inline, immediately followed by its nested subregions. This is the "EMBEDDED OBJECTS IN ZONE LIST ver." variant specified in `render_scene_tree`'s docstring; `render_scene_tree` renders the separate-objects variant. Identical signature, so the two are drop-in interchangeable at every call site."""
-    if not nodes:
-        return _NO_NODES_MESSAGE
-    root = util.find_root(nodes)
-    if root is None:
-        return _NO_NODES_MESSAGE
-    by_id = {n.id: n for n in nodes}
-
-    body = f"""This is the overall plan for the entire scene.
-
-{_root_scene_header(root)}
-
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region.
-
-Here's the list of subregions that have been planned for this scene so far, followed by any objects parented directly to the scene root. Each subregion has a plan for how it should be built, a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner, as well as a list of objects present in that subregion (which each come with their own description and bounding boxes). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (which can be either another region or another object), where the origin is the actual minimum corner of the parent's bounding box.
-
-{render_embedded_block(nodes)}"""
-    return body + _render_to_place_block(to_place, by_id)
-
-
-# ---------- Step 1: zone plan (high-level authoring; runs for every zone) ---
+# ---------- Step 1: region plan (high-level authoring; runs for every region) ---
 
 
 class ZonePlanOutput(BaseModel):
@@ -456,24 +481,27 @@ The user message contains the user prompt for the scene, plus guidance on how to
 <output>
 Respond with a single JSON object containing:
 - `plan` (string): your scene planning paragraph
-- `is_atomic` (boolean): whether this scene is a single cohesive region or should decompose into distinct zones
+- `is_atomic` (boolean): whether this scene is a single cohesive space or should decompose into distinct subregions
 
 No additional prose, markdown, or code fences.
 </output>"""
-
 
 SYSTEM_ZONE_PLAN = """<intro>
 You are competing in SpatialBench, a competitive benchmark where LLMs create detailed 3D environments from text prompts. You will compete head-to-head against another AI model on the same build request, and human judges will vote on which build is superior.
 </intro>
 
 <role>
-You are authoring the plan for ONE region within a larger scene, and deciding whether that region is a single cohesive area or should decompose further into distinct subzones.
+You are authoring the plan for ONE region within a larger scene, and deciding whether that region is a single cohesive space or should decompose further into distinct subregions.
 </role>
+
+<input>
+The user message contains this region's seed prompt, the scene context already in the run, and guidance on how to author the plan and how to decide `is_atomic`.
+</input>
 
 <output>
 Respond with a single JSON object containing:
 - `plan` (string): your region planning paragraph
-- `is_atomic` (boolean): whether this region is a single cohesive area or should decompose into distinct subzones
+- `is_atomic` (boolean): whether this region is a single cohesive space or should decompose into distinct subregions
 
 No additional prose, markdown, or code fences.
 </output>"""
@@ -485,9 +513,9 @@ def render_zone_plan(
     zone_prompt: str,
     nodes: list[Node],
 ) -> str:
-    """Author the plan for one region. `nodes` is the full scene snapshot so far. Empty list means we're planning the root (no scene exists yet); in that case the root-specific prompt is emitted and `nodes` is unused. For nested zones, the canonical scene tree is injected for context."""
+    """Author the plan for one region. `nodes` is the full scene snapshot so far. Empty list means we're planning the root (no scene exists yet); in that case the root-specific prompt is emitted and `nodes` is unused. For nested regions, the canonical scene tree is injected for context."""
     if not nodes:
-        return f"""you are the first step in the SpatialBench pipeline and the step responsible for determining the high-level description and direction of the overall scene. write one paragraph that describes a 3D scene imagined from the following prompt.
+        return f"""You are the first step in the SpatialBench pipeline and the step responsible for determining the high-level description and direction of the overall scene. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. You sit at the very top of that process: the plan you author here is the seed that every downstream step expands on, and nothing exists in the scene yet beyond the prompt below. write one paragraph that describes a 3D scene imagined from the following prompt, and decide whether this scene should decompose into multiple distinct subregions.
 
 "{zone_prompt}"
 
@@ -500,21 +528,21 @@ only the final output of the 3D geometry for the scene itself will be judged onc
 
 In your plan, DO NOT be overly specific - remember, your prompt will NOT be converted directly into 3D geometry, it will undergo hundreds of expansion and detail steps before reaching any generation steps, so structure your output such that it is a base that the downstream tree of pipeline steps can build upon it. given a prompt for a building, a bad output provides exact instruction on what it looks like; a good prompt defines the narrative premise for the scene, the scope of the environment, the building's character and type, the surrounding environment, points that may implicitly be expanded, and a top-level shape for the scene itself without explicitly shaping the entities that form it.
 
-plan differently based on the prompt given and infer the purpose - e.g for a house, you might plan the aforementioned details for the overall scene scope, general architectural, narrative and character; for a super mario platformer level, you might focus on the narrative section, features, progression, zones, mechanics, etc.; for a top-down swamp frogger level without a specific game mentioned, you might focus on first building out the game's premise internally given the more abstract request, and then establish the world, general layout, character, mechanics, scope, item types, objectives, etc. 
+plan differently based on the prompt given and infer the purpose - e.g for a house, you might plan the aforementioned details for the overall scene scope, general architectural, narrative and character; for a super mario platformer level, you might focus on the narrative section, features, progression, regions, mechanics, etc.; for a top-down swamp frogger level without a specific game mentioned, you might focus on first building out the game's premise internally given the more abstract request, and then establish the world, general layout, character, mechanics, scope, item types, objectives, etc. 
 
-remember, tune specificity based on whether your intent can be inferred by downstream steps. e.g in the super mario level, do not be overly specific - do not scope out all individual platforms, items, etc. but rather the general idea of each part, since the downstream steps have a shared understanding of what a super mario level looks like and the general premise of the game; however, for a more abstract request like the top-down swamp frogger level, the through-line of what you are trying to build cannot be inferred or reconstructed by downstream steps in the pipeline as the specific context for the premise of the game was constructed within your internal reasoning, not exposed to those steps, and thus will be lost as the pipeline propagates, placing the onus for world creation and high-level planning on downstream steps (e.g the immediate next step of planning the specific nature of zones inferred from your prompt, which was not designed for deciding scene structure/mechanics itself as it lacks the lack full frame and is more there to decompose the scene and figure out spatial relationships between the decomposed zones, and follows a different, more mechanical heuristic for generation, which means it would not only not spend a lot of time thinking about that, but diverge significantly and perhaps genericly from world you were trying to create in different directions, before handing off to individual planning steps for each zone that have more agency over their nature and so on), which means you would need to provide that through-line more explicitly in that scenario where foundational planning is required for the world state due to a lack of shared context (as opposed to a house or established game level).
+remember, tune specificity based on whether your intent can be inferred by downstream steps. e.g in the super mario level, do not be overly specific - do not scope out all individual platforms, items, etc. but rather the general idea of each part, since the downstream steps have a shared understanding of what a super mario level looks like and the general premise of the game; however, for a more abstract request like the top-down swamp frogger level, the through-line of what you are trying to build cannot be inferred or reconstructed by downstream steps in the pipeline as the specific context for the premise of the game was constructed within your internal reasoning, not exposed to those steps, and thus will be lost as the pipeline propagates, placing the onus for world creation and high-level planning on downstream steps (e.g the immediate next step of planning the specific nature of subregions inferred from your prompt, which was not designed for deciding scene structure/mechanics itself as it lacks the lack full frame and is more there to decompose the scene and figure out spatial relationships between the decomposed subregions, and follows a different, more mechanical heuristic for generation, which means it would not only not spend a lot of time thinking about that, but diverge significantly and perhaps genericly from world you were trying to create in different directions, before handing off to individual planning steps for each region that have more agency over their nature and so on), which means you would need to provide that through-line more explicitly in that scenario where foundational planning is required for the world state due to a lack of shared context (as opposed to a house or established game level).
 
 the output plan should be literal - do not use flowery language. do not describe any abstract quantities like mood, lighting, fog, etc unless they can be converted into concrete 3D geometry. do not reference meta-quantities like the pipeline itself, the scene's 3D nature itself, etc. NEVER MENTION THOSE THINGS. focus on defining the environment intrinsically. remember, this is a full 3D scene, NOT an image - do not define any specific perspective.
 
 define the scene itself, its top-level shape, character, and rough spatial relationships between major parts enough that the downstream steps have agency over their individual sections while also forming ideas of what to build, especially spatially.
 </VERY IMPORTANT INSTRUCTIONS>
 
-<zone_decomposition>
-once the plan for the scene is written, you must state in an explicit, separate property `is_atomic` whether the scene has multiple distinct regions with
+<region_decomposition>
+you must also decide `is_atomic` — whether this scene is a single cohesive space or should decompose into multiple distinct subregions.
 
-— whether this scene is a single cohesive region or should decompose into multiple distinct zones.
+the root scene you are planning is a PURELY ABSTRACT META-CONTAINER — it has no walls, floor, ceiling, or geometry of its own. only child regions receive physical enclosures and geometry.
 
-CRITICAL: if the prompt names a SINGLE TANGIBLE ENCLOSURE that needs walls/floor/ceiling (a hotel room, a throne room, a garage, a cockpit, a bathroom), you MUST set is_atomic=false. that enclosure becomes a child zone inside this abstract root. marking the root atomic in such cases leaves the scene with no physical enclosure at all.
+CRITICAL: if the prompt names a SINGLE TANGIBLE ENCLOSURE that needs walls/floor/ceiling (a hotel room, a throne room, a garage, a cockpit, a bathroom), you MUST set is_atomic=false. that enclosure becomes a child region inside this abstract root. marking the root atomic in such cases leaves the scene with no physical enclosure at all.
 
 default to is_atomic=true. set is_atomic=false ONLY when the scene genuinely contains TWO OR MORE distinct regions, each deserving its own dedicated planning and generation pass:
 - good decomposition: mansion grounds → house, formal garden, stables (distinct functional regions)
@@ -522,9 +550,10 @@ default to is_atomic=true. set is_atomic=false ONLY when the scene genuinely con
 - bad decomposition: island → north end, central mound, south end (arbitrary geography with no distinct identity)
 - bad decomposition: bedroom → bed area, dresser area, reading nook (over-fragmented; one cohesive space)
 
+a region is a place large enough to contain multiple objects arranged inside it. a single landmark, monument, centerpiece, or hero prop — no matter how important — is an OBJECT inside a region, not a region of its own.
 
-DO NOT design your prompt around the concept of explicit zonal fragmentation; keep this concept of "zones" in mind ONLY for the is_atomic assessment AFTER the base plan is generated.
-</zone_decomposition>
+DO NOT design your prompt around the concept of explicit regional fragmentation; keep this concept of "regions" in mind ONLY for the is_atomic assessment AFTER the base plan is generated.
+</region_decomposition>
 
 <thinking>
 before ANY output, remember to think HARD and DEEPLY and ALWAYS provide a detailed CoT. NEVER skip the thinking step. think through different creative approaches you might take to what this scene/environment looks like. think deeply through the spatial layout to ensure that everything makes sense - this is a 3D spatial environment benchmark competition after all. 
@@ -533,29 +562,29 @@ in the interest of winning, always start by thinking of the overall narrative an
 </thinking>
 {_deepseek_suffix()}"""
 
-    # Nested zones use adapted competitive prompt format
+    # Nested regions use adapted competitive prompt format
     root = util.find_root(nodes)
-    assert root is not None, "nested zone planning requires a root node in scope"
-    context = render_embedded_block(nodes, node_id=zone_id, text="This is the zone you are to plan and flesh out from.")
+    assert root is not None, "nested region planning requires a root node in scope"
+    context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to plan and flesh out from.")
 
-    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular region within the larger overall scene. This is a text to 3D scene pipeline that takes a seed prompt and imagines an entire 3D scene from it. 
-    
+    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular subregion within the larger overall scene. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. You author the plan for one such region, which further downstream steps then expand on, decompose, and populate. 
+
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
+{render_root_objects(nodes)}
 
-You are designing the plan for one of the subregions in the scene. This is the short description for the subregion that you are trying to plan and flesh out from:
+This is the subregion that we are planning:
 
 Subregion name: {zone_id}
-Subregion description: {zone_prompt}
+Subregion description: "{zone_prompt}"
 
-Here's the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner, as well as a list of objects present in that subregion (which each come with their own description and bounding boxes). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (which can be either another region or another object), where the origin is the actual minimum corner of the parent's bounding box.
+Here's the scene's subregion tree, with the objects placed in each subregion listed inline as a flat list beneath it, recursing into nested subregions. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), its dimensions, and a global coordinate marking its origin corner, then a flat list of the objects placed directly inside it, then its nested subregions. Each object carries its description, a `parent` block (its structural anchor — `parent_id`, `parent_relationship_kind`, `parent_dimensions`), and — when it anchors to a peer object rather than directly to its subregion — a `parent_region` (the subregion it belongs to) and `parent_region_dimensions` (that region's size); objects are never nested under one another. Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (which can be either another region or another object), where the origin is the actual minimum corner of the parent's bounding box.
 
 {context}
 
-Your goal is to write one paragraph describing the region you are to plan out. The design you write in your plan should elaborate and add to the narrative painted by the ancestor plans, but also leave sufficient room for further downstream steps to expand on more using their own agency. what constitutes "sufficient" depends on the specificity of the current region: larger, higher-level regions should have less details, while smaller, more constrained regions nearing the atomic level should have more details. calibrate your plan's specificity to the scope and nature of this region. a well-understood region type (a bedroom, a kitchen, a garden) needs less foundational planning because downstream steps share an understanding of what that space looks like and what belongs in it. a region with novel character or a creative premise that cannot be inferred from its prompt and ancestor context alone needs more explicit through-line — downstream steps that further decompose and populate this region will not reconstruct creative intent that isn't present in your plan. furthermore, a tightly-constrained region that cannot be broken down into further subregions would require more specificity in terms of object enumeration as you are the final planning step before the actual object list gets generated by a downstream step.
+Your goal is to elaborate and add to the narrative painted by the ancestor plans through the plan for this region, but also leave sufficient room in your plan for further downstream steps to expand on more using their own agency. what constitutes "sufficient" depends on the specificity of the current region: larger, higher-level regions should have less specificity, while smaller, more constrained regions nearing the atomic level should have more specificity.
 
 <VERY IMPORTANT INSTRUCTIONS>
 think deeply about what this region is and how you can make it creatively compelling. every region of the scene contributes to the final build that judges evaluate, and the quality of your plan here directly shapes how impressive this part of the scene will be.
@@ -564,7 +593,9 @@ write directly and consider every part carefully. you are the planning step for 
 
 only the final output of the 3D geometry will be judged once the pipeline is finished; your prompt itself will NEVER be shown to the judges, it will only serve as a base to build upon for this region. thus, making the prompt dramatic and sound impressive will only have a contradictory effect, since it will confuse downstream steps when generation actually happens as they don't understand flowery language.
 
-Again, DO NOT be overly specific - your prompt will undergo further subzone divisions, expansion, and detail steps before reaching any generation steps, so structure your output as a base that downstream steps can build upon. DO NOT enumerate specific objects (a table, a chair, a tree, a lamp) - object selection happens in a later generation step that needs its own agency over what to place.
+DO NOT be overly specific - your prompt will undergo further subregion divisions, expansion, and detail steps before reaching any generation steps, so structure your output as a base that downstream steps can build upon. DO NOT enumerate specific objects (a table, a chair, a tree, a lamp) - object selection happens in a later generation step that needs its own agency over what to place.
+
+calibrate your plan's specificity to the scope and nature of this region. a well-understood region type (a bedroom, a kitchen, a garden) needs less foundational planning because downstream steps share an understanding of what that space looks like and what belongs in it. a region with novel character or a creative premise that cannot be inferred from its prompt and ancestor context alone needs more explicit through-line — downstream steps that further decompose and populate this region will not reconstruct creative intent that isn't present in your plan. furthermore, a tightly-constrained region that cannot be broken down into further subregions would require more specificity in terms of object enumeration as you are the final planning step before the actual object list gets generated by a downstream step.
 
 your prompt should focus on just the current region: it can reference other defined regions and objects as context, but do not overtly describe them apart from using them as an anchor for relative positioning.
 
@@ -575,26 +606,22 @@ In the plan you write, do not use flowery language. do not describe any abstract
 define this region's shape, character, and rough spatial relationships between its major parts enough that downstream steps have agency over their individual sections while forming ideas of what to build, especially spatially.
 </VERY IMPORTANT INSTRUCTIONS>
 
-<zone_decomposition>
-you must also decide is_atomic — whether this region is a single cohesive area or should decompose into multiple distinct zones.
+<region_decomposition>
+you must also decide is_atomic — whether this region is a single cohesive space or should decompose into multiple distinct subregions.
 
-default to is_atomic=true. set is_atomic=false ONLY when the region genuinely contains TWO OR MORE distinct areas, each deserving its own dedicated planning and generation pass:
+default to is_atomic=true. set is_atomic=false ONLY when the region genuinely contains TWO OR MORE distinct regions, each deserving its own dedicated planning and generation pass:
 
     good decomposition: mansion grounds → house, formal garden, stables (distinct functional regions)
     good decomposition: hotel room → bedroom, bathroom (distinct rooms)
     bad decomposition: island → north end, central mound, south end (arbitrary geography with no distinct identity)
     bad decomposition: bedroom → bed area, dresser area, reading nook (over-fragmented; one cohesive space)
 
-a zone is a place large enough to contain multiple objects arranged inside it. a single landmark, monument, centerpiece, or hero prop — no matter how important — is an OBJECT inside a zone, not a zone of its own.
-</zone_decomposition>
+a region is a place large enough to contain multiple objects arranged inside it. a single landmark, monument, centerpiece, or hero prop — no matter how important — is an OBJECT inside a region, not a region of its own.
+</region_decomposition>
 
 <thinking>
 before ANY output, think HARD and DEEPLY and provide a detailed CoT. think through the creative direction for this region within the context of the larger scene. think through spatial layout and how everything fits together physically. think about the constructed narrative of the ancestor plans and how this particular region could add onto it as a detail. think about what would make this region genuinely impressive and memorable as part of a winning build.
 </thinking>
-
-<output_guidance>
-Your plan should be written as a description, not an instruction (i.e. do not start the plan with "Create", "Plan", etc.)
-</output_guidance>
 {_deepseek_suffix()}"""
 
 
@@ -634,46 +661,56 @@ Produce the overall bounding box for the whole scene.
 {_deepseek_suffix()}"""
 
 
-# ---------- Step 3: zone decompose (atomic vs subzones; runs after plan) ----
+# ---------- Step 3: region decompose (atomic vs subregions; runs after plan) ----
 
 
 class ChildNodeSpec(BaseModel):
-    """A single child node (subzone or object) emitted by a decomposition
+    """A single child node (subregion or object) emitted by a decomposition
     LLM call.
 
     Fields:
       * `parent` — the structural anchor id: the supporter (object or
-        frame) this node physically rests on, or the containing zone
+        frame) this node physically rests on, or the containing region
         when there's no physical supporter (floating objects, frames
-        themselves, subzones inside a parent zone).
-      * `parent_kind` — how this node relates to its `parent`. MUST be
+        themselves, subregions inside a parent region).
+      * `parent_relationship_kind` — how this node relates to its `parent`. MUST be
         one of ON / ATTACHED / IN:
           - ON: rests on parent's outward surface (most often top face).
           - ATTACHED: flush against any face of the parent (wall mount,
             ceiling fixture, magnet, hanger).
           - IN: contained inside the parent's volume or footprint
-            (subzone inside a zone, fish inside a tank, cloud inside a
-            sky zone, embedded particle).
+            (subregion inside a region, fish inside a tank, cloud inside a
+            sky region, embedded particle).
         BESIDE / ABOVE / BELOW are reserved for sibling/peer hints in
-        `referenced_ids` and are NOT valid here.
+        `relationship_ids` and are NOT valid here.
       * `placement` — prose describing where this node sits, with
         precise positioning (centered, edge-aligned, two-thirds along,
         etc.). The bbox-resolution step uses this verbatim to choose
         coordinates.
-      * `referenced_ids` — optional list of *secondary* relationships
-        to other already-placed peers. Each entry is a Relationship
-        with `target` (the peer's id) and `kind` (ON, BESIDE, ABOVE,
-        BELOW, ATTACHED, IN) — categorical, no anchor point. Do NOT
-        repeat the parent here. Empty list is fine when the placement
-        only references the parent.
+      * `relationship_ids` — optional list of spatial relationships to
+        other already-placed nodes that assist the downstream spatial
+        resolver. Each entry is a Relationship with `target` (the peer's
+        id) and `kind` (ON, BESIDE, ABOVE, BELOW, ATTACHED, IN) —
+        categorical, no anchor point. Do NOT repeat the parent here.
+        Empty list is fine when the placement only references the parent.
     """
+
+    # Two LLM-facing field names are aliased so the schema/wire names match the
+    # prompt text, while the Python attributes stay the names the shared
+    # divider/generation/topology + Node use across every version:
+    # `relationship_ids` -> attr `referenced_ids`, `parent_relationship_kind`
+    # -> attr `parent_kind`. `populate_by_name` lets committed-event replay
+    # (which dumps by attribute name) round-trip back in.
+    model_config = ConfigDict(populate_by_name=True)
 
     id: str
     prompt: str
     parent: str
-    parent_kind: ParentRelationshipKind
+    parent_kind: ParentRelationshipKind = Field(alias="parent_relationship_kind")
     placement: str
-    referenced_ids: list[Relationship] = Field(default_factory=list)
+    referenced_ids: list[Relationship] = Field(
+        default_factory=list, alias="relationship_ids"
+    )
     proxy_shape: ProxyShape | None = None
     orientation: Orientation = 0
 
@@ -696,23 +733,23 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are deciding the structural decomposition of one region of the scene — how it splits into its top-level subzones. Each subzone you emit becomes its own planning and recursive decomposition branch downstream.
+You are deciding the structural decomposition of one region of the scene — how it splits into its top-level subregions. Each subregion you emit becomes its own planning and recursive decomposition branch downstream.
 </role>
 
 <input>
-The user message contains this zone's id, prompt, bbox, and plan, plus the scene context (ancestor chain and every other zone/object already placed in the run, which you may reference by id).
+The user message contains this region's id, prompt, bbox, and plan, plus the scene context (every other region/object already placed in the run, which you may reference by id).
 </input>
 
 <output>
 Respond with a single JSON object containing:
-- `children` (list): the subzones this region decomposes into. Each child has:
+- `children` (list): the subregions this region decomposes into. Each child has:
   - `id` (string): unique within the entire scene
-  - `prompt` (string): a short seed describing what this child zone is
-  - `parent` (string): the id of this child's structural parent. Usually this is the literal id of the zone being decomposed (the value labelled "Parent zone id" in the user message — e.g. if the user message says `Parent zone id: 'living_room'`, emit `"parent": "living_room"`, NOT the string "PARENT_ID" or any other placeholder). The subzones you emit do NOT all have to be flat siblings of that zone, however: when one subzone you are emitting lies inside, is wrapped/enclosed by, or occupies the same volume as another subzone in this same batch, set its `parent` to that other subzone's id (verbatim, naming it earlier in the list) with `parent_kind: IN`. A nested subzone's box is then resolved INSIDE its container's box rather than laid out as a peer beside it — so a region that contains another is encoded as nesting, never as two regions fighting for the same space at the same level. This is purely how you record a containment you have already decided on; do not invent containment that isn't there, and keep regions as plain siblings of the decomposed zone when they sit side by side.
-  - `parent_kind` (string): how this child anchors to its `parent`. Exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint — this is also the kind to use when nesting one subzone inside another subzone from this batch). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here — they are peer hints, reserved for `referenced_ids`.
-  - `placement` (string): prose describing WHERE this child sits within / against / relative to its parent and any referenced peers. The bbox-resolution step uses this verbatim.
-  - `referenced_ids` (list of {target, kind}): OPTIONAL secondary relationships to other already-placed nodes referenced in the placement text. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
-  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the zone's silhouette is non-rectangular, otherwise null/omitted.
+  - `prompt` (string): a short seed describing what this child region is
+  - `parent` (string): the id of this child's structural parent. For a top-level subregion, this is the literal id of the region being decomposed (the value labelled "Parent region id" in the user message — e.g. if the user message says `Parent region id: 'living_room'`, emit `"parent": "living_room"`, NOT the string "PARENT_ID" or any other placeholder). For a child anchored to an earlier sibling in this call, use that sibling's id verbatim.
+  - `parent_relationship_kind` (string): how this child anchors to its `parent`. Exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here — they are peer hints, reserved for `relationship_ids`.
+  - `placement` (string): one string describing where this child sits within the scene relative to other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the subregion is located. Think very deeply about where each region should lie spatially and designing the placement string for it.
+  - `relationship_ids` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
+  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the region's silhouette is non-rectangular, otherwise null/omitted.
 
 No additional prose, markdown, or code fences.
 </output>"""
@@ -725,84 +762,81 @@ def render_zone_decompose(
     zone_plan: str,
     nodes: list[Node],
 ) -> str:
-    """Decompose one zone into top-level subzones. `nodes` is the full
-    scene snapshot; the target zone must be present in it with its plan
+    """Decompose one region into top-level subregions. `nodes` is the full
+    scene snapshot; the target region must be present in it with its plan
     already set."""
     
     root = util.find_root(nodes)
-    assert root is not None, "zone decomposition requires a root node in scope"
-    subregions = render_subregions_block(nodes, node_id=zone_id, text="This is the zone you are to break down and decompose.")
-    root_objects = render_root_objects_block(nodes)
-    filled = render_filled_block(nodes)
+    assert root is not None, "region decomposition requires a root node in scope"
+    subregions = render_subregions_block(nodes, node_id=zone_id, text="This is the region you are to break down and decompose.")
+    objects_flat = render_objects_flat(nodes)
 
-    return f"""You are the step in the SpatialBench pipeline responsible for breaking down a given region of the overall scene into its top-level subregions. This pipeline is a text to 3D scene one that takes a seed prompt and imagines an entire 3D scene from it.
-
-Here is the overall scene that is being built by the pipeline:
+    return f"""You are the step in the SpatialBench pipeline responsible for breaking down a given region into its top-level subregions. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individiually - you are the step that performs and determines this subdivison. This is the overall scene we are trying to generate:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Subregions are later recursed into downstream in the pipeline, meaning each subregion can contain further subregions inside or the set of objects that forms it (if no further subregions make sense). The splitting of subregions allows for downstream steps to focus on one particular area of the larger scene at a time which yields better, more cohesive and detailed scenes. The subregion division you make here directly affects the downstream steps of the pipeline responsible for building out each of these subregions, so think very carefully about the way you want to split your assigned region.
-
 {f"""
-You are subdividing the scene itself into its first set of top-level subregions based on its overall plan.
-""" if zone_id == root.id else f"""You are subdividing one of the subregions in the scene into further subregions. This is the plan for the subregion within this overall scene that you are to break down and decompose:
+You are subdividing the scene itself (root) into its first set of top-level subregions based on its overall plan.
+""" if zone_id == root.id else f"""This is the plan for the subregion within this overall scene that you are to break down and decompose:
 
 Subregion name: {zone_id!r}
-Subregion description: {zone_prompt}
-Subregion plan: {zone_plan}
+Subregion description: "{zone_prompt}"
+Subregion plan: "{zone_plan}"
+Parent region id: {zone_id!r}
 """}
 
-Parent zone id: {zone_id!r}
-
-The scene is composed as a tree with every object or region parented to another object or region. Here's the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline) and a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
+Here's the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), its dimensions, and a global coordinate marking its origin corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
 
 {subregions}
 
-Here is a list of objects in the scene that are parented to the overall bounding box itself:
+The following is the flat list of all the objects that the scene is composed of. Each object carries a `parent` block (its structural anchor — `parent_id`, `parent_relationship_kind`, and `parent_dimensions`; the parent may be another object or the region itself), a `parent_region` (the id of the subregion it is placed in), and `parent_region_dimensions` (that region's size). An object's `parent_region`/`parent_region_dimensions` are omitted when its structural parent is its region, since the `parent` block already states them:
 
-{root_objects}
+{objects_flat}
 
-The following is a list of all the objects that the scene is composed of, and the zones they are parented to:
+<IMPORTANT_INSTRUCTIONS>
 
-{filled}
+<REGION_SPLITTING_GUIDANCE>
+A subregion is a portion of the parent whose bounding box sits within the parent bounding box and can be treated individually as its own region due to a combination of physical and narrative reasons. The goal of subregions is to guide downstream steps so they can focus on just one region and use the rest as context, allowing for more fleshed-out designs and scenes.
 
-Using this provided scene context, think through the spatial layout and how everything fits together physically in order to decide the subregions that the given region of {zone_id!r} should be cleanly divided into. Think about the constructed narrative of the ancestor plans and how the subregions you come up with for the region you are to break down fit into that narrative. Think about what would make the subregions you devise genuinely impressive and memorable as part of a winning build.
+Subregions can keep decomposing into more subregions recursively in subsequent passes, or end there as atomic leaves if that is appropriate. so always decompose at the TOP MOST LEVEL of the current region — e.g. for a house scene with backyard, driveway, and house, do not skip straight to backyard-pool region, backyard-grass region, house-basement, house-first-floor, etc.; decompose into "the house", "the backyard", "the driveway" as top-level children, and let the next recursion split the house into floors and the backyard into pool and grass. the same principle holds everywhere: emit only the regions that exist at THIS level of the hierarchy, and trust the recursive planning + decompose passes underneath each of them to handle the next layer down.
+</REGION_SPLITTING_GUIDANCE>
 
-Think very intricately and spatially about the region you are to break down and how it splits into further subregions. Your goal is to reason and come up with a decomposition layout for this region that follows the ideas of the region's plan and that of the region's ancestors. For each subregion, write a 1-2 sentence long description that explains the subregion's shape, character, and the new narrative ideas presented by this subregion, if any. Be concrete about its description while leaving room for this prompt to be a seed for a more detailed plan. The prompt should be succinct and avoid going overly into detail on the subregion's contents. Instead, focus on how each subregion fleshes out the guiding narrative further in some way, and include those ideas within the descriptions of the subregions. 
+Think very intricately and spatially about how this region splits. Your goal is to reason a subregion decomposition layout that fits the narrative presented by the scene plan given above as well as the additional plans of ancestor scenes in the scene context section given below, while paying attention to the semantic relationships between the subregions. The subregions presented should each flesh out the guiding narrative further in some way, carrying relevant ideas from previously defined plans (in the scene context below) while also introducing some new ones without being contradictory.
 
+The seed prompt you output for each subregion should be a 1-2 sentences long description that explains the subregion's shape, character, and the new narrative ideas presented by this subregion, if any. Be concrete about its description while leaving room for this prompt to be a seed for a more detailed plan. The prompt should be succinct without mentioning going overly into detail on the subregion's contents.
 
-<ZONE_SPLITTING_GUIDANCE>
-Subzones can keep decomposing into more zones recursively in subsequent passes, or end there as atomic leaves if that is appropriate. so always decompose at the TOP MOST LEVEL of the current zone — e.g. for a house scene with backyard, driveway, and house, do not skip straight to backyard-pool zone, backyard-grass zone, house-basement, house-first-floor, etc.; decompose into "the house", "the backyard", "the driveway" as top-level children, and let the next recursion split the house into floors and the backyard into pool and grass. the same principle holds everywhere: emit only the zones that exist at THIS level of the hierarchy, and trust the recursive planning + decompose passes underneath each of them to handle the next layer down.
-</ZONE_SPLITTING_GUIDANCE>
+Keep the prompt tight: the goal is not to plan out the subregion's contents, but to establish its character as a piece of the larger scene as a whole.
+
+The placement text you output for each subregion should only be a semantic, but detailed description of where the subregion is located - actual coordinates will get resolved in a downstream step.
+</IMPORTANT_INSTRUCTIONS>
+
 {_deepseek_suffix()}"""
 
 
-# ---------- Step 4: zone bbox batch resolution (all siblings at once) -------
+# ---------- Step 4: region bbox resolution (one subregion per call) -----------
 
 
-class BboxAssignment(BaseModel):
-    id: str
+class BboxSingleOutput(BaseModel):
+    # One bbox per call, for the one-at-a-time (sequential) placement steps the
+    # divider and generation use — subregion and object resolution alike. No id
+    # is echoed: the caller already knows which node it asked to place.
     bbox: BoundingBox
 
 
-class BboxBatchOutput(BaseModel):
-    assignments: list[BboxAssignment] = Field(default_factory=list)
-
-
-SYSTEM_ZONE_BBOX_BATCH = f"""<intro>
+SYSTEM_ZONE_BBOX_SINGLE = f"""<intro>
 You are competing in SpatialBench, a competitive benchmark where LLMs create detailed 3D environments from text prompts. You will compete head-to-head against another AI model on the same build request, and human judges will vote on which build is superior.
 </intro>
 
 <role>
-You are a constraint solver placing ALL sibling child zones inside a parent zone in one shot — deriving each child's axis-aligned bounding box from its placement prose, parent_kind, referenced_ids, and the parent's dimensions.
+You are a constraint solver placing ONE child region inside a parent region — deriving its axis-aligned bounding box from its placement string, parent_relationship_kind, relationship_ids, and the parent's dimensions. The parent's sibling subregions are placed one at a time across separate calls: some are already positioned (they appear in the scene context) and the rest are still unplaced (listed for you so you can reserve room for them). You place exactly the one target subregion in this call.
 </role>
 
 <input>
-The user message contains the parent zone's id and dimensions, and a list of child specs to place. Each child has `id`, `prompt`, `proxy_shape`, `parent`, `parent_kind`, `parent_dimensions`, `placement`, and `referenced_ids`. A child's parent may be the zone being decomposed, an existing node, or another child in this same batch.
+The user message contains the parent region's id, plan, and dimensions; the scene context (including any already-placed sibling subregions); the list of sibling subregions still awaiting placement (context only — do NOT place them); and the single target subregion to place. The target has `id`, `prompt`, `proxy_shape`, `parent`, `parent_relationship_kind`, `parent_dimensions`, `placement`, and `relationship_ids`. Its parent may be the region being decomposed, an existing node, or a sibling already placed in an earlier call.
 </input>
 
 <output>
-Respond with a single JSON object matching the schema: one `assignment` per child (id + bbox). Each child's bbox must be in THAT CHILD'S PARENT's local frame — origin (0,0,0) is the parent's minimum corner; axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The parent's dimensions are provided for each child — use them as the bounding extent. A child flush against its parent's minimum corner has origin (0,0,0); a child resting on its parent's floor at the parent's centre has origin near (parent_width/2, 0, parent_depth/2) minus the child's footprint. Use centimeter precision (multiples of 0.01) and a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis. Emit exactly one assignment per requested child id — no extras, no omissions.
+Respond with a single JSON object matching the schema: a `bbox` for the target subregion only. It must be in the TARGET'S PARENT's local frame — origin (0,0,0) is the parent's minimum corner; axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The parent's dimensions are provided — use them as the bounding extent. A child flush against its parent's minimum corner has origin (0,0,0); a child resting on its parent's floor at the parent's centre has origin near (parent_width/2, 0, parent_depth/2) minus the child's footprint. Use centimeter precision (multiples of 0.01) and a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis.
 
 No prose, no markdown, no code fences.
 </output>
@@ -812,48 +846,61 @@ No prose, no markdown, no code fences.
 </additional_context>"""
 
 
-def render_zone_bbox_batch(
+def render_zone_bbox_single(
     *,
     parent_id: str,
     parent_prompt: str,
     parent_plan: str,
     parent_bbox: BoundingBox,
-    children: list["ChildNodeSpec"],
+    target: "ChildNodeSpec",
+    pending: list["ChildNodeSpec"],
     nodes: list[Node],
 ) -> str:
-    """Place every sibling child zone of `parent_id` in one shot. The full scene tree is shown for context, with the children-to-place listed beneath it (bbox blank — that is the LLM's job)."""
+    """Place ONE sibling child region of `parent_id`. `nodes` is the scene
+    snapshot including any siblings already placed; `pending` is the siblings
+    still awaiting their own placement call (rendered for context so the LLM
+    can reserve room for them); `target` is the single region to place now (bbox
+    blank — that is the LLM's job)."""
     root = util.find_root(nodes)
-    assert root is not None, "zone bbox resolution requires a root node in scope"
+    assert root is not None, "region bbox resolution requires a root node in scope"
     by_id = {n.id: n for n in nodes}
-    context = render_embedded_block(nodes, node_id=parent_id, text="This is the region you are to calculate the bounding box of its subregions for.")
+    context = render_embedded_block(nodes, node_id=parent_id, text="This is the region whose subregion you are to place.")
+    pending_block = (
+        _render_to_place_block(pending, by_id, parent_zone=parent_id)
+        if pending
+        else "(none — every other subregion of this region has already been placed; this is the last one)"
+    )
 
-
-    return f"""You are the step in the SpatialBench pipeline responsible for calculating the actual bounding box coordinates for a list of subregions within the larger overall scene, relative to the larger parent region they are part of. This pipeline is a text to 3D scene pipeline that takes a seed prompt and imagines an entire 3D scene from it.
+    return f"""You are the step in the SpatialBench pipeline responsible for resolving the bounding box of a single subregion within its parent region. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. An upstream step has already chosen this region's subregions and written a semantic placement for each; you turn those placements into concrete axis-aligned bounding boxes ONE AT A TIME, and right now you place exactly one of them — the remaining siblings are shown to you still unplaced so you can leave room for them.
 
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Subregions are later recursed into downstream in the pipeline, meaning each subregion can contain further subregions inside or the set of objects that forms it (if no further subregions make sense). The splitting of subregions allows for downstream steps to focus on one particular area of the larger scene at a time which yields better, more cohesive and detailed scenes. You are calculating the bounding boxes for a list of subregions within the larger parent region they are part of. You have been provided a short blurb describing the location of each subregion within the scene. The exact coordinates you choose to resolve those descriptions te directly affects the downstream steps of the pipeline responsible for building out each of these subregions. 
+{render_root_objects(nodes)}
 
-This is the region you are to calculate the bounding boxes of its subregions for:
+This is the region whose subregion you are placing:
 
 Parent region name: {parent_id!r}
-Parent region description: {parent_prompt}
-Parent region plan: {parent_plan}
-Parent region global bounding box coordinates: {util.format_global_bbox(parent_bbox)}
+Parent prompt: "{parent_prompt}"
+Parent region plan: "{parent_plan}"
+Parent region dimensions: {util.format_dimensions(parent_bbox)}
+Parent region global origin corner: {util.format_global_origin(parent_bbox)}
 
-{_render_to_place_block(children, by_id)}
-
-The scene is composed as a tree with every object or region parented to another object or region. Here is the list of subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline) and a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
+For reference, here is the scene context — every subregion and object placed so far, including any sibling subregions of this region that have already been positioned. Each carries its dimensions, a global origin corner, and local coordinates relative to its parent.
 
 {context}
 
-For each subregion listed below the parent region you are to calculate the bounding boxes of its subregions for, calculate the bounding box coordinates for that subregion, relative to the parent region it is part of. The bounding box coordinates you output for each subregion must be in the parent region's local frame, where the origin is the parent region's minimum corner.
+The following sibling subregions of this region have been planned but have NOT been placed yet. Do NOT place them now — they are listed only so you can account for the space they will occupy:
 
-Think very carefully and intricately about the bounding box coordinates you come up with for each subregion. Downstream generation steps within each subregion will unconditionally trust the bounding box coordinates you generate, so assume they will utilize the full space you allot with the bounding boxes you output. The bounding boxes you create have a direct impact on the judging of the final scene - poorly chosen bounding boxes will result in an incoherent scene.
+{pending_block}
 
-In particular, consider the bounding boxes of the other regions and objects listed in the scene context above. If any of the subregion bounding boxes you output have an overlap with an existing bounding box, you must justify why in your reasoning.
+This is the single subregion you must place right now:
+
+{_render_to_place_block([target], by_id, parent_zone=parent_id)}
+
+Produce the bounding box for {target.id!r} only, in its parent's local frame — origin (0,0,0) is the parent's minimum corner. The parent's dimensions are listed above.
+
 {_deepseek_suffix()}"""
 
 
@@ -861,10 +908,10 @@ In particular, consider the bounding boxes of the other regions and objects list
 
 
 class ObjectSpec(ChildNodeSpec):
-    """A single object in a zone. Identical shape to ChildNodeSpec.
-    The structural parent (`parent` field) may be the enclosing zone,
+    """A single object in a region. Identical shape to ChildNodeSpec.
+    The structural parent (`parent` field) may be the enclosing region,
     a frame, an earlier-placed peer, or another object listed in the
-    same decomp call. Secondary relationships (`referenced_ids`)
+    same decomp call. Secondary relationships (`relationship_ids`)
     capture additional spatial connections — sibling alignment, the
     wall a painting hangs against, etc."""
 
@@ -872,7 +919,7 @@ class ObjectSpec(ChildNodeSpec):
 class BoundExistingFrame(BaseModel):
     """Audit entry for the encapsulating step's BINDING CONTRACT.
 
-    When a structural element named in the zone's plan is already
+    When a structural element named in the region's plan is already
     satisfied by an existing peer (option (b) of the contract), the LLM
     records the binding here instead of emitting a new shell node. These
     entries do NOT become Nodes and do NOT flow into bbox-resolution or
@@ -881,7 +928,7 @@ class BoundExistingFrame(BaseModel):
     skipping the plan-named element.
     """
 
-    plan_element: str  # noun phrase from the zone plan (e.g. "rear partition wall")
+    plan_element: str  # noun phrase from the region plan (e.g. "rear partition wall")
     peer_id: str  # id of an existing node in <OBJECTS> that satisfies it
 
 
@@ -894,7 +941,7 @@ class ObjectDecompOutput(BaseModel):
     # event log (visible in the observability view) but dropped before
     # downstream pipeline steps.
     bound_existing: list[BoundExistingFrame] = Field(default_factory=list)
-    # Encapsulating-only gate: if False, the zone needs no bounding
+    # Encapsulating-only gate: if False, the region needs no bounding
     # perimeter and `objects` is ignored even when non-empty. Anchor and
     # negative-space decompositions ignore this field.
     bounding_required: bool = True
@@ -910,11 +957,11 @@ Respond with a single JSON object containing:
   - `id` (string): unique within this call
   - `prompt` (string): detailed description; used verbatim as the text-to-3D generation prompt
   - `parent` (string): id of this object's structural parent (what it physically rests on, hangs from, leans against, or is contained by)
-  - `parent_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent — wall/ceiling mounts, embedded fittings, shell-frame-to-zone), or `IN` (contained inside the parent's volume / footprint with no specific contact face). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
+  - `parent_relationship_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent — wall/ceiling mounts, embedded fittings, shell-frame-to-region), or `IN` (contained inside the parent's volume / footprint with no specific contact face). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
   - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the object's silhouette is non-rectilinear, otherwise null/omitted.
   - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z (toward viewer), `90` = front faces -X, `180` = front faces -Z, `-90` = front faces +X. Use 0 for symmetric objects.
-  - `placement` (string): prose describing WHERE this object sits — position within / on / against the parent, plus alignment to any referenced peers.
-  - `referenced_ids` (list of {{target, kind}}): OPTIONAL secondary relationships when placement text refers to nodes other than the parent. Each entry: `target` (peer's id) and `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine.
+  - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
+  - `relationship_ids` (list of {{target, kind}}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
 - `bound_existing` (list): used only by the encapsulating step (anchor and negative-space leave this empty). Each entry has `plan_element` (the plan's noun phrase verbatim) and `peer_id` (the id of an existing node that already satisfies it).
 - `bounding_required` (bool): used only by the encapsulating step (anchor and negative-space leave this as the default `true`). Set to `false` when the region needs no bounding perimeter at all — `objects` is then ignored downstream even if non-empty. Set to `true` when at least one bounding object is being emitted.
 
@@ -933,11 +980,11 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are enumerating the defining anchor objects of an atomic leaf zone — the objects that make this zone unmistakably what it is. A later iterative pass adds more objects one at a time on top of these anchors.
+You are enumerating the defining anchor objects of an atomic leaf region — the objects that make this region unmistakably what it is. A later iterative pass adds more objects one at a time on top of these anchors.
 </role>
 
 <input>
-The user message contains this zone's id, bbox, and plan, plus the scene context (ancestor chain and every other zone/object already placed in the run, which you may reference by id).
+The user message contains this region's id, description, and plan, plus the scene context (every region and object already placed in the run, which you may reference by id).
 </input>
 
 {_OBJECT_DECOMP_TAIL}"""
@@ -954,7 +1001,7 @@ If and ONLY if so, you are to output a list of objects that represent the perime
 </role>
 
 <input>
-The user message contains this zone's id, bbox, and plan, plus the scene context (ancestor chain and every other zone/object already placed in the run, which you may reference by id).
+The user message contains this region's id, description, and plan, plus the scene context (every region and object already placed in the run, which you may reference by id).
 </input>
 
 {_OBJECT_DECOMP_TAIL}"""
@@ -965,11 +1012,11 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are filling the ambient, connective, interstitial space between the named zones and objects of the scene — the layer of small instanced solids that binds the scene into a continuous world (lilypads across swamp water, grass tufts over a meadow, scattered stones across a plain). Every named zone has already been decomposed and populated; what remains is the layer the named zones do not own.
+You are filling the ambient, connective, interstitial space between the named regions and objects of the scene — the layer of small instanced solids that binds the scene into a continuous world (lilypads across swamp water, grass tufts over a meadow, scattered stones across a plain). Every named region has already been decomposed and populated; what remains is the layer the named regions do not own.
 </role>
 
 <input>
-The user message contains this zone's id, bbox, and plan, plus the scene context (every zone and object already placed in the run, which you may reference by id).
+The user message contains this region's id, description, and plan, plus the scene context (every region and object already placed in the run, which you may reference by id).
 </input>
 
 {_OBJECT_DECOMP_TAIL}"""
@@ -991,7 +1038,7 @@ def _render_retry_block(
 PRIOR ATTEMPTS — every decomposition below was ALREADY rejected. Do NOT re-emit the same set of object specs, and do not repeat the same structural mistake. Treat every listed reason as a hard constraint you must satisfy this time:
 {attempt_lines}
 
-Produce a NEW decomposition that fixes every listed reason. In particular, ensure every object's `parent` field is set to a valid existing id (the supporter or containing zone that anchors it), and every `referenced_ids` entry has a `target` that exists in the scene context."""
+Produce a NEW decomposition that fixes every listed reason. In particular, ensure every object's `parent` field is set to a valid existing id (the supporter or containing region that anchors it), and every `relationship_ids` entry has a `target` that exists in the scene context."""
 
 
 def render_anchor_decomp(
@@ -1004,33 +1051,37 @@ def render_anchor_decomp(
 ) -> str:
     root = util.find_root(nodes)
     assert root is not None, "anchor decomposition requires a root node in scope"
-    context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to generate a list of anchor objects for.")
-    return f"""You are the step in the SpatialBench pipeline responsible for determining the list of objects that define a certain region. This pipeline is a text to 3D scene pipeline that takes a seed prompt and imagines an entire 3D scene from it - your goal is to help the pipeline concretely fill out a particular region in the overall scene with objects that are meaningful to the region and follow the plan for the region authored by upstream steps.
+    context = render_embedded_block(nodes, node_id=zone_id, text="This is the subregion you are to generate a list of anchor objects for.")
+    return f"""You are the step in the SpatialBench pipeline responsible for determining the list of objects that define a certain subregion. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. This subregion is an atomic leaf that the pipeline has decided not to subdivide any further, so instead of splitting it again you are the step that fills it with the objects that define it.
 
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
+{render_root_objects(nodes)}
 
-You are generating the list of objects that fill out and define a particular subregion of the overall scene. This is the subregion you are to generate a list of anchor objects for:
+This is the subregion we are generating the anchors for:
 
 Subregion name: {zone_id!r}
-Subregion description: {zone_prompt}
-Subregion plan: {zone_plan}
+Subregion description: "{zone_prompt}"
+Subregion plan: "{zone_plan}"
 
-Here is the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline) and a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
+Here is the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), its dimensions, and a global coordinate marking its origin corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
 
 {context}
 
-Think very carefully about what objects should be included in the list you generate. Consider the region's plan and the plans of its ancestors to help you come up with a list of objects that are meaningful to the region and follow the plan for the region authored by upstream steps. Think about the spatial layout and how everything fits together physically. Think about how the objects you generate contribute to the narrative in the region's plan and purpose of the region itself, as well as how the region will, as a result, fit into the larger scene. Think about what would make the region genuinely impressive and memorable as part of a winning build.
-
-Although the plan for the region you are to list out the anchor objects for is specific, the objects that the plan mentions may not be the end all be all - you should extrapolate meaning from the plan and higher-level ideas communicated in the ancestor chain to populate and style the objects in the list you generate based on a narrative understanding of the scene. Each object should be treated atomically, in the sense that collections of objects should be broken down into individual objects. This allows for more controlled, granular, and precise positioning by you instead of relying on the outputted model's shape of downstream generation steps, and the more control you have, the more consistent and good the final scene will be. Object count is not a concern: always split pairs, groups, or collections of objects into individual objects positioned in the way you deem fit.
+This region is the lowest possible breakdown level: no other subregions can exist within, so it is defined by the anchor objects you are responsible for generating. Although the above plan is specific, the objects that the plan mentions may not be the end all be all - you should extrapolate meaning from the plan and higher-level ideas communicated in the ancestor chain to populate and style the objects in the list you generate based on a narrative understanding of the scene. Each object should be treated atomically, in the sense that collections of objects should be broken down into individual objects that allow more granular, precise positioning by you instead of relying on the outputted model's shape of downstream generation steps. Object count is not a concern: always split pairs, groups, or collections of objects into individual objects positioned in the way you deem fit.
 
 <output_guidance>
-The concept of a parent should be grounded in a concrete, physical relationship, not a conceptual one. A cantilevered object would be parented to the surface or wall it's cantilevered to with relationship type 'ATTACHED', not parented to the floor below with relationship 'ON'. If no physical relationship is found with another object or frame, the relationship should be of type 'IN', and parented to the zone itself.
+The concept of a parent should be grounded in a concrete, physical relationship, not a conceptual one. A cantilevered object would be parented to the surface or wall it's cantilevered to with relationship type 'ATTACHED', not parented to the floor below with relationship 'ON'. If no physical relationship is found with another object or frame, the relationship should be of type 'IN', and parented to the region itself.
 
-Each anchor object in your resultant list has an id, prompt, parent (the structural anchor id — the zone, a ground/shell peer from the encapsulating pass, or another object in this list), parent_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: `ON` for resting on an outward surface, `ATTACHED` for wall/ceiling/face mounts, `IN` for free containment inside the parent's volume — BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for secondary relationships your placement text mentions; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: anchor onto any ground/shell peer already placed by the encapsulating pass, do not duplicate geometry another zone has already emitted. Anchor objects are expected to live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified — the object remains semantically part of this zone even though its geometry overhangs. Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry. In your final output, each object's placement text should be direct and parametric. Avoid flowery language that states the narrative purpose of the positioning. Do not state the abstract reason of the positioning, only details that ground the position concretely. The position description should be absolute and succinct, leaving no creative liberty for the downstream constraint solver.
+Each anchor object in your resultant list's parent_relationship_kind (one of ON / ATTACHED / IN) describes how the object physically anchors to that parent: `ON` for resting on an outward surface, `ATTACHED` for wall/ceiling/face mounts, `IN` for free containment inside the parent's volume — BESIDE/ABOVE/BELOW are NOT valid here.
+
+The placement string is a one sentence description of where the object is placed in terms of the spatial layout of the region its in relative to its containing region or other objects present in the region. This is not meant to be an exact, coordinate-level descriptor, but rather a more semantic description of how the object sits spatially relative to its surroundings.
+
+The relationship_ids list for each object is an optional list of `{{target, kind}}` for spatial relationships to other nodes that assist the downstream solver; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). This will be used in conjunction with the placement string you provide by the downstream coordinate solver to calculate the precise coordinates of how to place the object in the scene.
+
+Respect the scene context: anchor onto any ground/shell peer already placed by the encapsulating pass, do not duplicate geometry another region has already emitted. Anchor objects are expected to live primarily inside this region, but their bboxes MAY protrude modestly outside the region bbox when narratively justified — the object remains semantically part of this region even though its geometry overhangs. Do not use this as license to claim airspace far from the region or to volumetrically intersect another region's load-bearing geometry. In your final output, each object's placement text should be direct and parametric. Avoid flowery language that states the narrative purpose of the positioning. Do not state the abstract reason of the positioning, only details that ground the position concretely. The position description should be absolute and succinct, leaving no creative liberty for the downstream constraint solver.
 </output_guidance>
 
 {_render_retry_block(prior_attempts)}
@@ -1048,43 +1099,54 @@ def render_encapsulating_decomp(
     root = util.find_root(nodes)
     assert root is not None, "encapsulating decomposition requires a root node in scope"
     context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to decide whether a boundary is needed for, and if so, what objects form that boundary")
-    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given region, and if so, what that perimeter is made up of. This is a text to 3D scene pipeline that takes a seed prompt and imagines an entire 3D scene from it - your goal is to first decide whether a particualr subregion within the overall scene needs objects to form a boundary or partial boundary around it, and if so, what those objects are.
+    return f"""You are the step in the SpatialBench pipeline responsible for determining whether a perimeter is needed for the given subregion, and if so, what that perimeter is made up of. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual subregions to allow downstream steps to recurse into them and focus on each one individually. Each region within the larger scene may or may not require objects to form a boundary or partial boundary around it - it is your role to decide whether it is absolutely required for a given subregion, and if it is, then generate a list of bounding geometry elements that form this boundary.
 
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
+{render_root_objects(nodes)}
 
-You are determining if a particular subregion within the overall scene requires objects bounding it. If and only if so, you are to determine what the objects making up that boundary are. This is the plan of the subregion you are to do this for:
+This is the subregion that we are deciciding needs a boundary or not and generating boundary objects for if so:
 
 Subregion name: {zone_id}
-Subregion description: {zone_prompt}
-Subregion plan: {zone_plan}
+Subregion description: "{zone_prompt}"
+Subregion plan: "{zone_plan}"
 
-Here's the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner, as well as a list of objects present in that subregion (which each come with their own description and bounding boxes). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (which can be either another region or another object), where the origin is the actual minimum corner of the parent's bounding box.
+Here's the list of other subregions that have been planned for this scene so far, followed by a flat list of the objects placed within those subregions. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), its dimensions, and a global coordinate marking its origin corner. Each object carries its description, a `parent` block (its structural anchor — `parent_id`, `parent_relationship_kind`, `parent_dimensions`), a `parent_region` (the subregion it belongs to), and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (which can be either another region or another object), where the origin is the actual minimum corner of the parent's bounding box.
 
 {context}
 
 Think very carefully about whether the given region actually needs any bounding objects. Reason about the structure of the region, whether it is closed vs. open, and the narrative in its plan. Not every region necessarily needs to have any bounding objects: only do so when it absolutely makes sense to do so.
 
 <IMPORTANT_INSTRUCTIONS_ONLY_IF_BOUNDING_NEEDED>
-the list of objects you output, if any, should work together to form a cohesive perimeter or partial perimeter of any arbitrary shape. The purpose of this list of objects is to form a sense of boundary for the given region in every dimension that makes sense based on its plan - perimeter does not necessarily mean in the horizontal axis but in all possible directions, including the vertical direction (e.g. bases, covers). In this case, perimeter or boundary does not automatically imply physically bounding the region on all sides (though depending on the region's plan, that may be the case). You should think carefully and reason spatially about what objects should go in this list to form a well-defined, physically and narratively reasonable boundary for the zone. You are in a canvas that contains only the objects listed below in the scene context - do not assume any models, foundations, ground, etc. exist outside the provided scene context.
+the list of objects you output, if any, should work together to form a cohesive perimeter or partial perimeter of any arbitrary shape. The purpose of this list of objects is to form a sense of boundary for the given region in every dimension that makes sense based on its plan - perimeter does not necessarily mean in the horizontal axis but in all possible directions, including the vertical direction (e.g. bases, covers). In this case, perimeter or boundary does not automatically imply physically bounding the region on all sides (though depending on the region's plan, that may be the case). You should think carefully and reason spatially about what objects should go in this list to form a well-defined, physically and narratively reasonable boundary for the region. You are in a canvas that contains only the objects listed below in the scene context - do not assume any models, foundations, ground, etc. exist outside the provided scene context.
 
-Each object should be treated atomically or even subatomically, in the sense that collections of objects should be broken down into individual objects, and in certain scenarios, objects should be broken down into partial objects. This allows for more controlled, granular, and precise positioning by you instead of relying on the outputted model's shape of downstream generation steps, and the more control you have, the more consistent and good the final scene will be. Object count is not a concern: always split pairs, groups, or collections of objects into individual objects or partial objects positioned in the way you deem fit.
+Object should be individualistic - composite objects should be broken down into individual or partial objects (abstract fragments that are meant to combine into a more complex object) and placed accordingly, allowing for more granular control of the region's boundary. Objects and partial objects can be stacked, strung, pieced to form larger, cohesive sections for the perimeter. there is no limit on the number of objects in your output list - always prefer individual objects placed close to each other over a single composite object with a prompt to generate them together at once. if the region calls for it, we can have as high fidelity of a perimeter as we want, the number of objects you can output is truly unbounded. if a dense perimeter makes sense for the given region, then make it dense - as many objects as you see fit, their bounding boxes right next to each other. You are in control - do not rely on downstream generation steps to output composite geometry: organize your list of objects so that you are in direct control of positioning to form that composite geometry yourself using the individual partial objects.
 
-To elaborate on the idea of partial objects, these are subatomic meshes of what usually would be considered a single object. objects and partial objects can be stacked, strung, pieced to form larger, cohesive sections for the perimeter. A few good examples include a door or window embedded within a wall, a square manhole, etc. - wherever it makes sense to do so for a more functional, lifelike scene that goes beyond just visuals. keep in mind connectives between this region and others, in all directions; using objects and partial objects to leave free space, semantically relevant transition objects, constructed composite structures, etc. The space should be realsitic and traversable.
+When generating a list of objects, keep in mind connectives between this region and others, in all directions; using objects and partial objects to leave free space, embed semantically relevant transition objects, construct composite structures, etc. The space should be realistic and traversable.
 
-note that there is no limit on the number of objects in your output list - always prefer individual objects placed close to each other over a single composite object with a prompt to generate them together at once. if the region calls for it, we can have as high fidelity of a perimeter as we want. if a dense perimeter makes sense for the given region, then make it dense - as many objects as you see fit, their bounding boxes right next to each other. You are in control - do not rely on downstream generation steps to output composite geometry: organize your list of objects so that you are in direct control of positioning to form that composite geometry yourself using the individual partial objects.
+If you need to leave a hole/gap or embed other objects within a greater bounding section for any purpose, piece objects and partial objects together like a puzzle around the gap or embed. For example, a door or window embedded within a wall, a roofed forest underpass, an ice fishing hole, a concave crater in the ground, etc. Do not rely on downstream steps to generate such kinds of complex geometry or abstract shapes - you are responsible for owning this step and using partial objects and piecing them together to achieve the kind of geometry you want.
 
-Not every zone needs a perimeter, decide whether it is absolutely required. If the latter, generate a list of bounding geometry elements that form a perimeter for the following region. If the former, then your final output object list should just be empty.
-
-Pay especial attention to the context provided in the plans of other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Use this thinking to guide you in the generation and placement of your list of objects.
+Pay special attention to the context provided in the plans of other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Pay especial attention to the traversal from {zone_id} to its neighboring regions and how the boundary formed by the objects you generate support that. Use this thinking to guide you in the generation and placement of your list of objects or partial objects.
 
 be wary of duplicate geometry - for two neighboring regions separated by some sort of divider, it is only necessary to generate the divider once. study the provided scene context to determine if generating something is necessary.
+
+This region may be broken down into smaller subregions by a downstream step, ONLY generate objects relevant to THIS region, trust downstream steps to generate bounding objects for subregions if those bounding objects are more relevant there.
+
+Ensure the space makes perfect sense and is cohesive with the goal; ex. nothing is missing. 
+
 </IMPORTANT_INSTRUCTIONS_ONLY_IF_BOUNDING_NEEDED>
 
+<output_guidance>
+Each boundary object in your resultant list's parent_relationship_kind (one of ON / ATTACHED / IN) describes how the object physically anchors to that parent: `ON` for resting on an outward surface, `ATTACHED` for wall/ceiling/face mounts, `IN` for free containment inside the parent's volume — BESIDE/ABOVE/BELOW are NOT valid here.
+
+The placement string is a one sentence description of where the object is placed in terms of the spatial layout of the region its in relative to its containing region or other objects present in the region. This is not meant to be an exact, coordinate-level descriptor, but rather a more semantic description of how the object sits spatially relative to its surroundings.
+
+The relationship_ids list for each object is an optional list of `{{target, kind}}` for spatial relationships to other nodes that assist the downstream solver; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). This will be used in conjunction with the placement string you provide by the downstream coordinate solver to calculate the precise coordinates of how to place the object in the scene.
+
 Output bounding_required = False if no bounding objects are needed. Otherwise, set bounding_required = True and objects to be the list of bounding objects.
+</output_guidance>
 
 {_render_retry_block(prior_attempts)}
 {_deepseek_suffix()}"""
@@ -1094,42 +1156,63 @@ def render_negative_space_decomp(
     *,
     zone_id: str,
     zone_prompt: str,
+    zone_plan: str,
     nodes: list[Node],
     prior_attempts: list[tuple[list[ObjectSpec], str]] | None = None,
 ) -> str:
-    scene_tree = render_scene_tree(nodes=nodes)
-    return f"""You are the step in the SpatialBench pipeline responsible for generating a list of objects that would cover the negative, unfilled space between the objects in the scene.
+    root = util.find_root(nodes)
+    assert root is not None, "negative-space decomposition requires a root node in scope"
+    direct_subregions = render_direct_subregions(nodes, zone_id)
+    root_objects = render_root_objects(nodes)
+    context = render_embedded_block(nodes)
+    return f"""You are the step in the SpatialBench pipeline responsible for filling in the negative space of a given subregion. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual subregions to allow downstream steps to recurse into them and focus on each one individually. When a region subdivides into subregions, there may be negative space left between the subregions that need to be filled in. Your role is to come up with a list of objects to fill this negative space for the following region:
 
-You are filling the negative space within this subregion:
+    Region name: {zone_id}
+    Region prompt: {zone_prompt}
+    Region plan: {zone_plan}
 
-Subregion name: {zone_id}
-Subregion description: {zone_prompt}
+Here are the direct subregions of {zone_id} — the subregions whose interstitial gaps you are filling:
 
-{scene_tree}
+{direct_subregions}
 
-Each negative space object in your resultant list has an id, prompt, parent (structural anchor — the zone, an earlier-placed peer, or another object in this list), parent_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: most negative-space pieces sit `ON` a ground/floor peer, `ATTACHED` for things mounted flush to a wall/ceiling, `IN` for free-floating pieces inside an enclosing volume; BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for secondary relationships your placement text mentions; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: do not duplicate geometry another zone has already emitted on a shared face. Negative-space pieces live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified (a vine draped over a wall, a banner hanging off an edge, drifting smoke crossing into an adjacent zone, a connective walkway or rope-bridge reaching toward a peer zone, a stabilizing strut or buttress extending below to ground against a peer). Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry.
+{root_objects}
 
-The primary purpose of these negative space objects is to make the scene feel coherent and cohesive, filling in the gaps between subzones or objects. As such, for each negative space to fill in, it is imperative to analyze the existing placed objects and zones surrounding it to create a smooth filling that does not look out of place.{_render_retry_block(prior_attempts)}
+The following is the full scene context in embedded form — every subregion with the objects placed inside it listed inline beneath it:
+
+{context}
+
+The primary purpose of these negative space objects is to make the scene feel coherent and cohesive, filling in the gaps between subregions or objects. As such, for each negative space to fill in, it is imperative to analyze the existing placed objects and regions surrounding it to create a smooth filling that does not look out of place.
+
+<output_guidance>
+Each object in your resultant list's parent_relationship_kind (one of ON / ATTACHED / IN) describes how the object physically anchors to that parent: `ON` for resting on an outward surface, `ATTACHED` for wall/ceiling/face mounts, `IN` for free containment inside the parent's volume — BESIDE/ABOVE/BELOW are NOT valid here.
+
+The placement string is a one sentence description of where the object is placed in terms of the spatial layout of the region its in relative to its containing region or other objects present in the region. This is not meant to be an exact, coordinate-level descriptor, but rather a more semantic description of how the object sits spatially relative to its surroundings.
+
+The relationship_ids list for each object is an optional list of `{{target, kind}}` for spatial relationships to other nodes that assist the downstream solver; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). This will be used in conjunction with the placement string you provide by the downstream coordinate solver to calculate the precise coordinates of how to place the object in the scene.
+
+</output_guidance>
+
+{_render_retry_block(prior_attempts)}
 {_deepseek_suffix()}"""
 
 
 # ---------- Step 6: object bbox resolution ----------------------------------
 
 
-SYSTEM_OBJECT_BBOX_BATCH = f"""<intro>
+SYSTEM_OBJECT_BBOX_SINGLE = f"""<intro>
 You are competing in SpatialBench, a competitive benchmark where LLMs create detailed 3D environments from text prompts. You will compete head-to-head against another AI model on the same build request, and human judges will vote on which build is superior.
 </intro>
 
 <role>
-You are a constraint solver placing ALL objects for a scene zone in one shot — deriving each object's axis-aligned bounding box from its placement prose, parent_kind, referenced_ids, the parent's dimensions, and peer geometry.
+You are a constraint solver placing an object inside a scene region — deriving its axis-aligned bounding box from its placement string, parent_relationship_kind, relationship_ids, the parent's dimensions, and peer geometry. The region's other objects are placed one at a time across separate calls: some are already positioned (they appear in the scene context) and the rest are still unplaced (listed for you so you can reserve room for them). You place exactly the one target object in this call.
 </role>
 
 <input>
-The user message contains the zone id/prompt/dimensions, a list of objects to place (each with `id`, `prompt`, `proxy_shape`, `orientation`, `parent`, `parent_kind`, `parent_dimensions`, `placement`, `referenced_ids`), and a list of peers already placed in the scene. Each peer's bbox is expressed relative to THAT PEER'S OWN parent's minimum corner (origin (0,0,0) = parent's min corner). Use siblings (peers sharing the same parent as the object you are placing) for direct spatial reasoning; peers under different parents provide broader scene context.
+The user message contains the region id/prompt/plan/dimensions; the scene context with any already-placed objects and peers (each peer's bbox is expressed relative to that peer's own parent's minimum corner); the list of objects still awaiting placement (context only — do NOT place them); and the single target object to place (with `id`, `prompt`, `proxy_shape`, `orientation`, `parent`, `parent_relationship_kind`, `parent_dimensions`, `placement`, `relationship_ids`). The target's parent may be the region, an existing node, or a peer already placed in an earlier call.
 </input>
 
 <output>
-Respond with a single JSON object matching the schema: one `assignment` per object (id + bbox). Each object's bbox must be in THAT OBJECT'S PARENT's local frame — origin (0,0,0) is the parent's minimum corner; axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The parent's dimensions are provided for each object — use them as the bounding extent. Use centimeter precision (multiples of 0.01) and a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis. Emit exactly one assignment per requested object id — no extras, no omissions.
+Respond with a single JSON object matching the schema: a `bbox` for the target object only, in the TARGET'S PARENT's local frame — origin (0,0,0) is the parent's minimum corner; axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The parent's dimensions are provided — use them as the bounding extent. Use centimeter precision (multiples of 0.01) and a signed `dimensions` vector from an `origin` vertex; sign chooses expansion direction along each axis.
 
 No prose, no markdown, no code fences.
 </output>
@@ -1139,45 +1222,60 @@ No prose, no markdown, no code fences.
 </additional_context>"""
 
 
-def render_object_bbox_batch(
+def render_object_bbox_single(
     *,
     zone_id: str,
     zone_prompt: str,
     zone_plan: str,
     zone_bbox: BoundingBox,
-    objects: list[ObjectSpec],
+    target: ObjectSpec,
+    pending: list[ObjectSpec],
     nodes: list[Node],
 ) -> str:
-    """Place every object specified by `objects` in one shot. The full scene tree is shown for context, with the objects-to-place listed beneath it (bbox blank — the LLM's job)."""
+    """Place ONE object in `zone_id`. `nodes` is the scene snapshot including
+    any objects already placed; `pending` is the objects still awaiting their
+    own placement call (rendered for context so the LLM can reserve room for
+    them); `target` is the single object to place now (bbox blank — the LLM's
+    job)."""
     root = util.find_root(nodes)
     assert root is not None, "object bbox resolution requires a root node in scope"
     by_id = {n.id: n for n in nodes}
-    context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to calculate the bounding boxes of its objects for.")
+    context = render_embedded_block(nodes, node_id=zone_id, text="This is the subregion whose object you are to place.")
+    pending_block = (
+        _render_to_place_block(pending, by_id, parent_zone=zone_id)
+        if pending
+        else "(none — every other object of this subregion has already been placed; this is the last one)"
+    )
 
-    return f"""You are the step in the SpatialBench pipeline responsible for calculating the actual bounding box coordinates for a list of objects within a subregion of the larger overall scene. This pipeline is a text to 3D scene pipeline that takes a seed prompt and imagines an entire 3D scene from it - your goal is to help the pipeline concretely place the objects in the scene in a way that is coherent and cohesive.
+    return f"""You are the step in the SpatialBench pipeline responsible for resolving the bounding box of a single object within its subregion. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. Once a region has been populated with objects and a semantic placement written for each, you turn those placements into concrete axis-aligned bounding boxes ONE AT A TIME, and right now you place exactly one of them — the remaining objects are shown to you still unplaced so you can leave room for them.
 
 Here is the overall scene that is being built by the pipeline:
 
 {_root_scene_header(root)}
 
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside or the set of objects that forms it. The scene is composed as a tree with every object or region parented to another object or region. 
+{render_root_objects(nodes)}
 
-You are calculating the bounding boxes for a list of objects within a subregion of the larger overall scene. This is the region you are to calculate the bounding boxes of its objects for:
+This is the subregion whose object you are placing:
 
-Region name: {zone_id}
-Region description: {zone_prompt}
-Region plan: {zone_plan}
-Region global bounding box coordinates: {util.format_global_bbox(zone_bbox)}
+Subregion name: {zone_id}
+Subregion description: "{zone_prompt}"
+Subregion plan: "{zone_plan}"
+Subregion dimensions: {util.format_dimensions(zone_bbox)}
+Subregion global origin corner: {util.format_global_origin(zone_bbox)}
 
-{_render_to_place_block(objects, by_id)}
-
-Here is the list of subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline) and a bounding box that defines its global position in the scene, given as a 3D coordinate marking one corner and a 3D dimensions vector that marks the opposite corner. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
+For reference, here is the scene context — every subregion and object placed so far, including any objects of this subregion that have already been positioned. Each carries its dimensions, a global origin corner, and local coordinates relative to its parent.
 
 {context}
 
-For each object listed below the assigned subregion, calculate the bounding box coordinates for that object, relative to its parent. The placement is already described in the scene tree - stay loyal to it and calculate the bounding box coordinates for that object based on the placement text. The bounding box coordinates you output for each object must be in its parent's local frame, where the origin is the parent's absolute minimum corner. The canonical front view is +Z, +Y is up, and +X is right.
+The following objects of this subregion have been planned but have NOT been placed yet. Do NOT place them now — they are listed only so you can account for the space they will occupy:
 
-Think very carefully and intricately about the bounding box coordinates you come up with for each object. The bounding boxes you create have a direct impact on the judging of the final scene - poorly chosen bounding boxes will result in an incoherent scene. In particular, consider the bounding boxes of the other objects listed in the scene context above. If any of the object bounding boxes you output have an overlap with an existing bounding box, you must justify why in your reasoning.
+{pending_block}
+
+This is the single object you must place right now:
+
+{_render_to_place_block([target], by_id, parent_zone=zone_id)}
+
+Produce the bounding box for {target.id!r} only, in its parent's local frame — origin (0,0,0) is the parent's minimum corner. The parent's dimensions are listed above.
 {_deepseek_suffix()}"""
 
 
@@ -1194,11 +1292,11 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are iteratively refining a 3D scene zone whose defining anchor objects are already placed. Decide whether ONE more object would make this zone read as complete, or whether the zone is already right. When you emit an object, emit exactly one.
+You are iteratively refining a 3D scene region whose defining anchor objects are already placed. Decide whether ONE more object would make this region read as complete, or whether the region is already right. When you emit an object, emit exactly one.
 </role>
 
 <input>
-The user message contains this zone's id, bbox, and plan, plus the scene context (every zone and object already placed in the run, which you may reference by id).
+The user message contains this region's id and description, plus the scene context (every region and object already placed in the run, which you may reference by id).
 </input>
 
 <output>
@@ -1210,11 +1308,11 @@ Each object spec has the same fields as the bulk decomposition step:
   - `id` (string): unique, not colliding with any existing node in the scene
   - `prompt` (string): detailed description; used verbatim for text-to-3D
   - `parent` (string): id of the structural anchor (what this object physically rests on, hangs from, leans against, or is contained by)
-  - `parent_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
+  - `parent_relationship_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
   - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the object's silhouette is non-rectilinear, otherwise null/omitted.
   - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z, `90` = front faces -X, `180` = front faces -Z, `-90` = front faces +X. Use 0 for symmetric objects.
-  - `placement` (string): prose describing WHERE this object sits within / on / against its parent, plus alignment to any referenced peers.
-  - `referenced_ids` (list of {{target, kind}}): OPTIONAL secondary relationships when the placement text refers to nodes other than the parent. Each entry: `target` (peer's id) and `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine.
+  - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
+  - `relationship_ids` (list of {{target, kind}}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
 
 No additional prose, markdown, or code fences.
 </output>
@@ -1358,7 +1456,9 @@ def render_next_object(
     nodes: list[Node],
     prior_attempts: list[tuple[ObjectSpec, str]] | None = None,
 ) -> str:
-    scene_tree = render_scene_tree(nodes=nodes)
+    root = util.find_root(nodes)
+    assert root is not None, "next-object decision requires a root node in scope"
+    context = render_embedded_block(nodes, node_id=zone_id, text="This is the subregion you are deciding whether to add another object to.")
     if prior_attempts:
         attempt_lines = "\n".join(
             f"  attempt {i}: emitted {spec.model_dump_json()}\n             rejected: {reason}"
@@ -1369,15 +1469,23 @@ def render_next_object(
 PRIOR ATTEMPTS — every object spec below was ALREADY rejected. Do NOT re-emit the same spec, and do not repeat the same structural mistake. Treat every listed reason as a hard constraint you must satisfy this time:
 {attempt_lines}
 
-Either emit a NEW ObjectSpec that fixes every listed reason, or set done=true. If you emit an object, its `referenced_ids` list must be non-empty and its first entry must be the object's structural parent (the supporter or containing zone)."""
+Either emit a NEW ObjectSpec that fixes every listed reason, or set done=true. If you emit an object, its `relationship_ids` list must be non-empty and its first entry must be the object's structural parent (the supporter or containing region)."""
     else:
         retry_block = ""
-    return f"""{scene_tree}
+    return f"""Here is the overall scene that is being built by the pipeline:
+
+{_root_scene_header(root)}
+
+{render_root_objects(nodes)}
+
+Here's the scene's subregion tree, with the objects placed in each subregion listed inline as a flat list beneath it, recursing into nested subregions. An object anchored to a peer object names that peer in its `parent` block rather than nesting beneath it.
+
+{context}
 
 You are deciding whether another object is needed in this subregion:
 
 Subregion name: {zone_id}
-Subregion description: {zone_prompt}
+Subregion description: "{zone_prompt}"
 
-Decide whether another object is needed in this zone. If yes, emit exactly one ObjectSpec; otherwise set done=true.{retry_block}
+Decide whether another object is needed in this subregion. If yes, emit exactly one ObjectSpec; otherwise set done=true.{retry_block}
 {_deepseek_suffix()}"""

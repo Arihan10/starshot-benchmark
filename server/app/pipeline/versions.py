@@ -1,31 +1,46 @@
-"""Pipeline version registry for the A/B/C benchmark.
+"""Pipeline version registry for the A/B benchmark.
 
 A *version* bundles a prompt module with a divider/generation code path.
-The three versions isolate two independent variables:
 
-  * v1-legacy-xml   - the original pipeline verbatim: XML-node prompts
+  * v1-legacy-xml       - the original pipeline verbatim: XML-node prompts
     (`prompts_old`) on the extracted `divider_old`/`generation_old`, which
     frame each zone BEFORE decomposing it.
-  * v2-frame-first  - the prompt WORDING pinned to commit 28830e8
-    (`prompts_v2`) on the current `divider`/`generation`, framing BEFORE
-    decomposition.
-  * v3-decomp-first - the latest "jace" prompt wording (live `prompts.py`),
-    framing AFTER decomposition (today's default behavior).
+  * v2-frame-first      - the pinned `prompts_v2` snapshot on the current
+    `divider`/`generation`, framing EVERY zone BEFORE it is decomposed
+    (the root included).
+  * v3-decomp-first     - the live `prompts.py` on the current
+    `divider`/`generation`, framing the ROOT AFTER its own decomposition
+    but every other zone BEFORE — today's default behavior. Also places
+    subregions and anchor objects ONE AT A TIME (sequential placement).
+  * v4-decomp-first-all - identical to v3 (same live `prompts.py`, same
+    `divider`/`generation`, same sequential placement), except it frames
+    EVERY zone AFTER its own decomposition, not just the root.
 
-v2 and v3 share every context/data improvement made since 28830e8; they
-carry different prompt WORDING (pinned-old vs latest) — the variable the
-A/B test isolates — and currently also differ in `frame_order`. v1 swaps
-the whole reasoning/prompt structure. All three share the mesh backend,
-event schema, `types`, and geometry, so the comparison measures
-pipeline/prompt structure rather than infra.
+v3 and v4 bind the SAME live `prompts.py`, so their prompt wording is
+identical; v2 binds the pinned `prompts_v2` snapshot (which `prompts.py` was
+copied from but has since picked up small prompt edits). The variable the
+benchmark isolates across v2/v3/v4 is `frame_order` — when each zone is framed
+relative to its own decomposition:
+  * v2 = "before"     (every zone framed before it is decomposed)
+  * v3 = "after_root" (root framed after; every other zone before)
+  * v4 = "after"      (every zone framed after it is decomposed)
+
+A second axis, `sequential_placement`, separates the two prompts.py versions
+from the snapshot baseline: v3/v4 resolve subregion and anchor-object bounding
+boxes ONE AT A TIME (each placement sees its already-positioned siblings and
+the still-unplaced ones), while v2 resolves each sibling set in a single batch
+call. Encapsulating shells and negative-space fill stay batch in every version.
+v1 swaps the whole reasoning/prompt structure. All share the mesh backend,
+event schema, `types`, and geometry, so the comparison measures pipeline
+structure rather than infra.
 
 Each version is modeled as a reserved *run* (`runs/<run_name>/...`), so the
 existing per-run isolation (prompt_runtime binding, per-cell asyncio tasks,
-separate events.jsonl + artifacts) keeps the three from leaking into one
+separate events.jsonl + artifacts) keeps the versions from leaking into one
 another. The `_pending`/`_admitted_ids` task tables live in whichever
 generation module a version uses AND are keyed by the composite `run_id`
-(which embeds `run_name`), so v2 and v3 never collide and v1 lives in its
-own module entirely.
+(which embeds `run_name`), so v2/v3/v4 never collide and v1 lives in its own
+module entirely.
 """
 
 from __future__ import annotations
@@ -81,14 +96,21 @@ async def _run_v1(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> No
 async def _run_v2(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> Node:
     return await divider.run(
         run_id=run_id, prompt=prompt, model=model, runs_dir=runs_dir,
-        frame_order="before",
+        frame_order="before", sequential_placement=False,
     )
 
 
 async def _run_v3(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> Node:
     return await divider.run(
         run_id=run_id, prompt=prompt, model=model, runs_dir=runs_dir,
-        frame_order="after",
+        frame_order="after_root", sequential_placement=True,
+    )
+
+
+async def _run_v4(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> Node:
+    return await divider.run(
+        run_id=run_id, prompt=prompt, model=model, runs_dir=runs_dir,
+        frame_order="after", sequential_placement=True,
     )
 
 
@@ -104,7 +126,7 @@ VERSIONS: list[PipelineVersion] = [
     PipelineVersion(
         id="v2",
         run_name="v2-frame-first",
-        label="V2: Old prompts (frame-first)",
+        label="V2: shared prompts, root framed before decompose",
         run=_run_v2,
         generation=generation,
         prompt_module=prompts_v2,
@@ -112,8 +134,16 @@ VERSIONS: list[PipelineVersion] = [
     PipelineVersion(
         id="v3",
         run_name="v3-decomp-first",
-        label="V3: New prompts (decomp-first)",
+        label="V3: improved prompts, root framed after decompose",
         run=_run_v3,
+        generation=generation,
+        prompt_module=None,
+    ),
+    PipelineVersion(
+        id="v4",
+        run_name="v4-decomp-first-all",
+        label="V4: improved prompts, every zone framed after decompose",
+        run=_run_v4,
         generation=generation,
         prompt_module=None,
     ),
@@ -128,5 +158,5 @@ _BY_RUN_NAME: dict[str, PipelineVersion] = {v.run_name: v for v in VERSIONS}
 
 def for_run(run_name: str) -> PipelineVersion:
     """The version that owns `run_name`, or DEFAULT_VERSION (v3) for any run
-    that isn't one of the three reserved version runs."""
+    that isn't one of the reserved version runs."""
     return _BY_RUN_NAME.get(run_name, DEFAULT_VERSION)

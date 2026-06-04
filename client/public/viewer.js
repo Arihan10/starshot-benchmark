@@ -141,6 +141,51 @@ const treeModalEl = document.getElementById("tree-modal");
 const treeModalBodyEl = document.getElementById("tree-modal-body");
 const treeModalCloseEl = document.getElementById("tree-modal-close");
 const treeModalSearchEl = document.getElementById("tree-modal-search");
+const treeFlowEl = document.getElementById("tree-flow");
+const flowModalEl = document.getElementById("flow-modal");
+const flowViewportEl = document.getElementById("flow-viewport");
+const flowStageEl = document.getElementById("flow-stage");
+const flowEdgesEl = document.getElementById("flow-edges");
+const flowNodesEl = document.getElementById("flow-nodes");
+const flowEmptyEl = document.getElementById("flow-empty");
+const flowSearchEl = document.getElementById("flow-search");
+const flowFitEl = document.getElementById("flow-fit");
+const flowZoomInEl = document.getElementById("flow-zoom-in");
+const flowZoomOutEl = document.getElementById("flow-zoom-out");
+const flowCloseEl = document.getElementById("flow-close");
+
+// Execution-flow graph layout constants + state. Declared up here (before
+// `animate()` first runs) because the render loop reads `flowModalOpen` /
+// `_flowRenderPending` / `_flowLastRender` every frame — leaving them in a
+// `let` further down would put them in the temporal dead zone on the first
+// synchronous `animate()` call. The graph's functions live lower in the file.
+const FLOW = {
+  INDENT: 32, // horizontal indent per depth level (outline)
+  ROW_H: 56, // vertical slot per node row
+  GUTTER: 14, // connector spine offset inside a node's left edge
+  NODE_W: 210,
+  NODE_H: 42, // nominal node height (edge anchors + bbox height)
+  PAD: 80, // breathing room around the whole graph
+  GRID: 24, // background dot pitch (matches the viewport CSS)
+};
+let flowModalOpen = false;
+let flowPanX = 0;
+let flowPanY = 0;
+let flowZoom = 1;
+let flowSearchQuery = "";
+let _flowRenderPending = false;
+let _flowLastRender = 0;
+let _flowLastWidth = 0;
+let _flowLastHeight = 0;
+let _flowPanning = false;
+let _flowStartX = 0;
+let _flowStartY = 0;
+let _flowStartPanX = 0;
+let _flowStartPanY = 0;
+// Last-rendered exec graph + node positions, cached so sidebar clicks and the
+// locate search can center the canvas without rebuilding the layout.
+let _flowGraph = null;
+let _flowPositions = new Map();
 
 // --- log panel --------------------------------------------------------------
 
@@ -173,6 +218,17 @@ function fmtValue(v) {
     return "{" + Object.entries(v).map(([k, x]) => `${k}=${fmtValue(x)}`).join(", ") + "}";
   if (typeof v === "string") return v;
   return String(v);
+}
+
+// The log panel is a glanceable activity feed, not a payload inspector — some
+// events (e.g. cache.llm) carry hundreds of KB of prompt/output text. Each
+// rendered field value is clipped to a short preview; the full value still
+// lives in events.jsonl and the observability modal.
+const MAX_LOG_VALUE_LEN = 40;
+function truncateLogValue(text) {
+  return text.length > MAX_LOG_VALUE_LEN
+    ? text.slice(0, MAX_LOG_VALUE_LEN) + "…"
+    : text;
 }
 
 // Fields whose values are LLM thinking / chain-of-thought traces. Stripped at
@@ -226,7 +282,7 @@ function appendEvent(event) {
       label.className = "k";
       label.textContent = ` ${k}=`;
       kv.appendChild(label);
-      kv.appendChild(document.createTextNode(fmtValue(v)));
+      kv.appendChild(document.createTextNode(truncateLogValue(fmtValue(v))));
       p.appendChild(kv);
     }
   }
@@ -653,6 +709,10 @@ const nodeLlmCalls = new Map(); // id -> [{step, system, user, output, reasoning
 // Same shape as `nodeLlmCalls` entries plus a `relation` tag and the parent
 // `node` id from the call (so the UI can label "via parent_zone.anchor_decompose").
 const nodeProvenance = new Map(); // id -> [{relation, call: {...}}]
+// Monotonic id stamped on every recorded LLM call so the execution-flow graph
+// can give each step node a stable key, and a step-node click can scroll the
+// observability modal to that exact call block (`data-call-key`).
+let _llmCallUid = 0;
 let treeRootId = null;
 let treeActiveId = null;
 let treeOrderCounter = 0;
@@ -737,6 +797,7 @@ function recordLlmCall(event) {
   // surface it under the root view rather than dropping it on the floor.
   const id = event.node || "_unattributed";
   const call = {
+    uid: _llmCallUid++,
     step: event.step || "(unknown step)",
     system: event.system ?? "",
     user: event.user ?? "",
@@ -753,6 +814,10 @@ function recordLlmCall(event) {
   const list = nodeLlmCalls.get(id) ?? [];
   list.push(call);
   nodeLlmCalls.set(id, list);
+  // A new call adds a step node (and maybe scene children) to the exec graph;
+  // flag a refresh so it appears live even when no tree mutation accompanies
+  // this cache.llm event. Drained, throttled, by the animate() loop.
+  if (flowModalOpen) _flowRenderPending = true;
   // Now scan the output for ids this call brought into existence and back-
   // fill provenance for each. The output shape is structured-output, so we
   // know exactly which fields name child ids:
@@ -909,6 +974,12 @@ function renderTreeNode(id, ctx) {
   row.addEventListener("click", (ev) => {
     ev.stopPropagation();
     selectTreeNode(id);
+    // When the execution-flow canvas is open, a sidebar click also zooms it
+    // onto the matching scene node so the two views stay coupled.
+    if (flowModalOpen) {
+      renderFlow();
+      flowCenterOnScene(id);
+    }
   });
 
   // Per-node visibility toggle. Reflects only the self-hidden state — a
@@ -1222,6 +1293,10 @@ let selectedBboxId = null;
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 let pointerDirty = false;
+// Whether the cursor is currently over the WebGL canvas. Gates Shift-driven
+// hover refreshes so the zones-only override never paints a phantom highlight
+// when the pointer is off-canvas.
+let pointerInsideCanvas = false;
 let lastPointerClientX = 0;
 let lastPointerClientY = 0;
 let controlsInteracting = false;
@@ -1299,16 +1374,28 @@ window.addEventListener("keydown", (ev) => {
     pressedKeys.add(k);
     ev.preventDefault();
   } else if (k === "shift") {
-    pressedKeys.add("shift");
+    // First Shift press also flips picking to zones-only; refresh hover so the
+    // highlight reflects the new pick set without needing a mouse jiggle.
+    if (!pressedKeys.has("shift")) {
+      pressedKeys.add("shift");
+      if (pointerInsideCanvas) pointerDirty = true;
+    }
   }
 });
 
 window.addEventListener("keyup", (ev) => {
-  pressedKeys.delete(ev.key.toLowerCase());
+  const k = ev.key.toLowerCase();
+  pressedKeys.delete(k);
+  // Releasing Shift drops the zones-only override; refresh hover for the
+  // full pick set.
+  if (k === "shift" && pointerInsideCanvas) pointerDirty = true;
 });
 
 // Alt-tab / focus-loss: drop held keys so they don't stick on.
-window.addEventListener("blur", () => pressedKeys.clear());
+window.addEventListener("blur", () => {
+  pressedKeys.clear();
+  if (pointerInsideCanvas) pointerDirty = true;
+});
 
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
@@ -1468,10 +1555,21 @@ function animate() {
   // Drain coalesced UI work once per frame: collapse a burst of streamed tree
   // mutations into one DOM rebuild, and a burst of mesh completions into one
   // camera refit. Both run before render so the frame reflects them.
-  if (_treeRenderPending) renderTree();
+  if (_treeRenderPending) {
+    renderTree();
+    if (flowModalOpen) _flowRenderPending = true;
+  }
   if (_fitScenePending) {
     _fitScenePending = false;
     fitToScene();
+  }
+  // Refresh the execution-flow graph from the same coalesced tree mutations,
+  // throttled so a burst of streamed nodes rebuilds the canvas at most a few
+  // times a second rather than every frame.
+  if (flowModalOpen && _flowRenderPending && now - _flowLastRender > 150) {
+    _flowRenderPending = false;
+    _flowLastRender = now;
+    renderFlow();
   }
 
   gridMat.uniforms.uCameraPos.value.copy(camera.position);
@@ -1549,12 +1647,23 @@ function fitToScene() {
 // GLTFLoader can't parse them. Wire the Basis transcoder (shipped with three,
 // served at /vendor/three/... by client/server.mjs) and the Meshopt decoder into
 // every loader. detectSupport(renderer) picks the GPU's transcode target.
+// Both geometry (Meshopt) and texture (KTX2) decode default to a single thread,
+// which serializes a scene's hundreds of meshes and is the main load-time
+// bottleneck. Give each a worker pool scaled to the machine so they decode in
+// parallel, off the main thread. One knob drives both.
+const DECODE_WORKERS = Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4));
+
 const ktx2Loader = new KTX2Loader()
   .setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
-  // The default 4-worker transcode pool serializes a scene's hundreds of KTX2
-  // textures and is the main load-time bottleneck; scale it to the machine.
-  .setWorkerLimit(Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4)))
+  .setWorkerLimit(DECODE_WORKERS)
   .detectSupport(renderer);
+
+// EXT_meshopt_compression decode otherwise runs synchronously on the main
+// thread even though GLTFLoader awaits it (decodeGltfBufferAsync just wraps a
+// blocking WASM call); a worker pool routes it off-thread so vertex/index
+// decode parallelizes across the streamed bundle like KTX2 above. Called once
+// on the shared singleton — every GLTFLoader that uses it inherits the pool.
+MeshoptDecoder.useWorkers(DECODE_WORKERS);
 
 function configureGltfLoader(gltfLoader) {
   return gltfLoader.setKTX2Loader(ktx2Loader).setMeshoptDecoder(MeshoptDecoder);
@@ -1681,6 +1790,10 @@ function _byteStreamReader(reader) {
   return { readExact };
 }
 
+// Diagnostic: log per-phase first-switch load timings to the console under a
+// `[load]` prefix. Flip off once the bottleneck is understood.
+const LOAD_TIMING = true;
+
 // Parse + attach up to this many meshes concurrently. Reading frames off the
 // stream stays sequential on the one connection; only the parse/decode fans
 // out, bounding peak memory to ~MAX_INFLIGHT in-flight GLBs.
@@ -1691,6 +1804,10 @@ async function consumeMeshBundleStream(reader, state) {
   const dec = new TextDecoder();
   const magic = await r.readExact(4);
   if (!magic || dec.decode(magic) !== _MESH_BUNDLE_MAGIC) return;
+  const t0 = performance.now();
+  let count = 0;
+  let bytes = 0;
+  let firstMeshMs = 0;
   const inflight = new Set();
   while (true) {
     if (state.gen !== sceneGen || state.abort.signal.aborted) break;
@@ -1705,13 +1822,22 @@ async function consumeMeshBundleStream(reader, state) {
     const glbLen = new DataView(glbLenB.buffer).getUint32(0, true);
     const glbB = await r.readExact(glbLen);
     if (!glbB) break;
+    count++;
+    bytes += glbLen;
     const p = attachBundleMesh(id, glbB.buffer, state.gen, state)
+      .then(() => { if (firstMeshMs === 0) firstMeshMs = performance.now() - t0; })
       .finally(() => inflight.delete(p));
     inflight.add(p);
     // Hold the read at MAX_INFLIGHT in-flight parses; resume once one drains.
     if (inflight.size >= MESH_BUNDLE_MAX_INFLIGHT) await Promise.race(inflight);
   }
   await Promise.allSettled(inflight);
+  if (LOAD_TIMING) {
+    console.info(
+      `[load] mesh bundle: ${count} meshes · ${(bytes / 1e6).toFixed(1)}MB · ` +
+        `first paint ${firstMeshMs | 0}ms · decode+attach ${(performance.now() - t0) | 0}ms`,
+    );
+  }
   // One camera refit after the whole bundle lands — a per-mesh fitToScene()
   // is an O(scene) Box3 traversal, i.e. quadratic across a large scene.
   if (state.gen === sceneGen) fitToScene();
@@ -2668,11 +2794,29 @@ function copyButton(text, label = "copy") {
   return b;
 }
 
-function llmCallBlock(call, { defaultOpen }) {
+function llmCallBlock(call, { defaultOpen, query = "" }) {
+  const filtering = query.length > 0;
+
+  // Output is pretty-printed JSON because the structured-output schema is what
+  // the rest of the pipeline consumes; match against the same text the user sees.
+  const outText = call.output === null
+    ? "(no output)"
+    : (() => { try { return JSON.stringify(call.output, null, 2); } catch { return String(call.output); } })();
+
+  // When searching, only the boxes containing the term render. A call with no
+  // matching box is dropped entirely (return null) so "calls issued from this
+  // node" / provenance collapse to just the hits.
+  const sysHit = !!call.system && call.system.toLowerCase().includes(query);
+  const userHit = !!call.user && call.user.toLowerCase().includes(query);
+  const outHit = outText.toLowerCase().includes(query);
+  const reasHit = !!call.reasoning && call.reasoning.toLowerCase().includes(query);
+  if (filtering && !sysHit && !userHit && !outHit && !reasHit) return null;
+
   const det = document.createElement("details");
   det.className = "tm-llm-call";
   if (call.cached) det.classList.add("cached");
-  det.open = defaultOpen;
+  if (call.uid != null) det.dataset.callKey = String(call.uid);
+  det.open = filtering ? true : defaultOpen;
 
   const sum = document.createElement("summary");
   sum.className = "tm-llm-summary";
@@ -2712,42 +2856,47 @@ function llmCallBlock(call, { defaultOpen }) {
 
   // System instruction — the prompt that defines the LLM's role for this
   // step. Usually long-ish boilerplate; collapsed by default so the user
-  // sees the dynamic input + output first.
-  const sysWrap = document.createElement("details");
-  sysWrap.className = "tm-llm-subblock";
-  const sysSum = document.createElement("summary");
-  sysSum.textContent = `system instruction (${call.system.length.toLocaleString()} chars)`;
-  sysWrap.appendChild(sysSum);
-  sysWrap.appendChild(preBlock(call.system, { cap: "260px" }));
-  sysWrap.appendChild(copyButton(call.system, "copy system"));
-  det.appendChild(section("system", sysWrap));
+  // sees the dynamic input + output first (opened when it's the search hit).
+  if (!filtering || sysHit) {
+    const sysWrap = document.createElement("details");
+    sysWrap.className = "tm-llm-subblock";
+    if (sysHit) sysWrap.open = true;
+    const sysSum = document.createElement("summary");
+    sysSum.textContent = `system instruction (${call.system.length.toLocaleString()} chars)`;
+    sysWrap.appendChild(sysSum);
+    sysWrap.appendChild(preBlock(call.system, { cap: "260px" }));
+    sysWrap.appendChild(copyButton(call.system, "copy system"));
+    det.appendChild(section("system", sysWrap));
+  }
 
   // User input — the actual rendered context for this call. This is the
   // most-changing part call-to-call so it's open by default inside the
   // already-open detail block.
-  const userWrap = document.createElement("div");
-  userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
-  userWrap.appendChild(copyButton(call.user, "copy input"));
-  det.appendChild(section(
-    `input (${call.user.length.toLocaleString()} chars)`,
-    userWrap,
-  ));
+  if (!filtering || userHit) {
+    const userWrap = document.createElement("div");
+    userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
+    userWrap.appendChild(copyButton(call.user, "copy input"));
+    det.appendChild(section(
+      `input (${call.user.length.toLocaleString()} chars)`,
+      userWrap,
+    ));
+  }
 
   // Output — pretty-print JSON. We render with json formatting because the
   // structured-output schema is what the rest of the pipeline consumes.
-  const outText = call.output === null
-    ? "(no output)"
-    : (() => { try { return JSON.stringify(call.output, null, 2); } catch { return String(call.output); } })();
-  const outWrap = document.createElement("div");
-  outWrap.appendChild(preBlock(outText, { cap: "360px" }));
-  outWrap.appendChild(copyButton(outText, "copy output"));
-  det.appendChild(section("output", outWrap));
+  if (!filtering || outHit) {
+    const outWrap = document.createElement("div");
+    outWrap.appendChild(preBlock(outText, { cap: "360px" }));
+    outWrap.appendChild(copyButton(outText, "copy output"));
+    det.appendChild(section("output", outWrap));
+  }
 
   // Reasoning is optional (only present when the provider returns CoT).
-  // Collapsed by default — it's noisy.
-  if (call.reasoning) {
+  // Collapsed by default — it's noisy (opened when it's the search hit).
+  if (call.reasoning && (!filtering || reasHit)) {
     const reasWrap = document.createElement("details");
     reasWrap.className = "tm-llm-subblock";
+    if (reasHit) reasWrap.open = true;
     const reasSum = document.createElement("summary");
     reasSum.textContent = `reasoning (${call.reasoning.length.toLocaleString()} chars)`;
     reasWrap.appendChild(reasSum);
@@ -2758,9 +2907,15 @@ function llmCallBlock(call, { defaultOpen }) {
   return det;
 }
 
-function renderObsCard(node, { role, depth }) {
+function renderObsCard(node, { role, depth, query = "" }) {
   // role: "ancestor" | "focus" | "descendant"
   // depth is only used to indent descendants visually.
+  // When `query` is set the card is filtered down to the text boxes that
+  // contain the term; if nothing in it matches we bail and return null so the
+  // caller drops the card (and its section heading) entirely.
+  const filtering = query.length > 0;
+  if (filtering && !nodeMatchesQuery(node, query)) return null;
+
   const card = document.createElement("div");
   const kind = node.kind ?? "zone";
   card.className = `tm-card tm-obs-card kind-${kind} role-${role}`;
@@ -2772,14 +2927,20 @@ function renderObsCard(node, { role, depth }) {
 
   // Decide default open/closed. The focused node opens by default; ancestors
   // and descendants stay closed so the focus stays visually dominant.
-  // User-toggled state takes precedence.
+  // User-toggled state takes precedence — but a live query forces open so the
+  // matching boxes are visible without extra clicks.
   const userPref = treeModalNodeOpen.get(node.id);
-  const detailsOpen = userPref !== undefined ? userPref : (role === "focus");
+  const detailsOpen = filtering
+    ? true
+    : (userPref !== undefined ? userPref : (role === "focus"));
 
   const det = document.createElement("details");
   det.className = "tm-obs-details";
   det.open = detailsOpen;
   det.addEventListener("toggle", () => {
+    // Don't persist open/closed while a search is forcing matches open — that
+    // would clobber the user's pre-search expand state, which we restore on clear.
+    if (treeModalQuery.trim()) return;
     treeModalNodeOpen.set(node.id, det.open);
   });
 
@@ -2849,8 +3010,13 @@ function renderObsCard(node, { role, depth }) {
   const body = document.createElement("div");
   body.className = "tm-obs-body";
 
+  // Count every box left after filtering so the card can drop itself when a
+  // query matches nothing inside it (despite passing the cheap node-level bail).
+  let visibleBoxes = 0;
+
   function addTextSection(label, text) {
     if (!text) return;
+    if (filtering && !text.toLowerCase().includes(query)) return;
     const wrap = document.createElement("div");
     wrap.className = "tm-section";
     const lab = document.createElement("div");
@@ -2862,6 +3028,7 @@ function renderObsCard(node, { role, depth }) {
     b.textContent = text;
     wrap.appendChild(b);
     body.appendChild(wrap);
+    visibleBoxes++;
   }
 
   addTextSection("seed prompt", node.prompt);
@@ -2883,7 +3050,10 @@ function renderObsCard(node, { role, depth }) {
     lab.textContent = "provenance — calls that emitted & placed this node";
     provWrap.appendChild(lab);
     const callDefaultOpen = role === "focus";
+    let shownProv = 0;
     for (const entry of provenance) {
+      const block = llmCallBlock(entry.call, { defaultOpen: callDefaultOpen, query });
+      if (!block) continue; // filtered out — drop its relation line too
       const relLine = document.createElement("div");
       relLine.className = "tm-obs-provenance-rel";
       const rel = document.createElement("span");
@@ -2904,9 +3074,13 @@ function renderObsCard(node, { role, depth }) {
       }
       relLine.appendChild(onNode);
       provWrap.appendChild(relLine);
-      provWrap.appendChild(llmCallBlock(entry.call, { defaultOpen: callDefaultOpen }));
+      provWrap.appendChild(block);
+      shownProv++;
     }
-    body.appendChild(provWrap);
+    if (shownProv > 0) {
+      body.appendChild(provWrap);
+      visibleBoxes += shownProv;
+    }
   }
 
   // LLM call traces — calls issued *from* this node (zone_plan,
@@ -2917,22 +3091,40 @@ function renderObsCard(node, { role, depth }) {
   callsHeader.className = "tm-section-label tm-llm-calls-label";
   callsHeader.textContent = "calls issued from this node";
   callsWrap.appendChild(callsHeader);
+  let shownCalls = 0;
   if (calls.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "tm-llm-empty";
-    empty.textContent = "(no LLM calls issued from this node)";
-    callsWrap.appendChild(empty);
+    // No calls at all — keep the explanatory placeholder only when not
+    // filtering (a search shouldn't surface an empty section).
+    if (!filtering) {
+      const empty = document.createElement("div");
+      empty.className = "tm-llm-empty";
+      empty.textContent = "(no LLM calls issued from this node)";
+      callsWrap.appendChild(empty);
+    }
   } else {
     // Focus card opens every call; ancestors/descendants leave them collapsed.
     const callDefaultOpen = role === "focus";
     for (const call of calls) {
-      callsWrap.appendChild(llmCallBlock(call, { defaultOpen: callDefaultOpen }));
+      const block = llmCallBlock(call, { defaultOpen: callDefaultOpen, query });
+      if (!block) continue;
+      callsWrap.appendChild(block);
+      shownCalls++;
     }
   }
-  body.appendChild(callsWrap);
+  // When filtering, only surface the calls section if it has a hit; otherwise
+  // keep it (it carries the always-on section / "(no LLM calls…)" placeholder).
+  if (!filtering || shownCalls > 0) {
+    body.appendChild(callsWrap);
+    visibleBoxes += shownCalls;
+  }
 
   det.appendChild(body);
   card.appendChild(det);
+
+  // A query that matched the node-level bail but no actual box (e.g. matched
+  // only output's compact JSON, not the pretty form shown) leaves nothing to
+  // read — drop the card so only boxes containing the term remain.
+  if (filtering && visibleBoxes === 0) return null;
   return card;
 }
 
@@ -2956,23 +3148,26 @@ function renderModalSectionHeading(label, count, hint) {
   return h;
 }
 
+// Box-level inclusion tests for the modal search. A search filters the modal
+// down to the text boxes that actually contain the term, so these only consider
+// box content — system / input / output / reasoning for calls, and the per-node
+// seed / plan / image prompts. id / step / model labels are deliberately
+// excluded, since they aren't text boxes. The authoritative per-box filtering
+// lives in llmCallBlock + renderObsCard; these just let a card bail before it
+// builds its DOM (and the final empty-card guard keeps the result exact).
 function callMatchesQuery(call, q) {
-  return call.step.toLowerCase().includes(q)
-    || call.system.toLowerCase().includes(q)
-    || call.user.toLowerCase().includes(q)
-    || (call.model || "").toLowerCase().includes(q)
+  return (!!call.system && call.system.toLowerCase().includes(q))
+    || (!!call.user && call.user.toLowerCase().includes(q))
+    || (!!call.reasoning && call.reasoning.toLowerCase().includes(q))
     || JSON.stringify(call.output ?? "").toLowerCase().includes(q);
 }
 
 function nodeMatchesQuery(node, q) {
-  if (node.id.toLowerCase().includes(q)) return true;
   if ((node.prompt ?? "").toLowerCase().includes(q)) return true;
   if ((node.plan ?? "").toLowerCase().includes(q)) return true;
   if ((node.imagePrompt ?? "").toLowerCase().includes(q)) return true;
   const calls = nodeLlmCalls.get(node.id) ?? [];
   if (calls.some((c) => callMatchesQuery(c, q))) return true;
-  // Also match provenance calls — searching for an emitting step name like
-  // "anchor_decompose" should surface every object that was emitted by one.
   const prov = nodeProvenance.get(node.id) ?? [];
   return prov.some((p) => callMatchesQuery(p.call, q));
 }
@@ -3054,38 +3249,65 @@ function renderTreeModal() {
   });
   treeModalBodyEl.appendChild(breadcrumb);
 
+  // Each block builds its cards first so the section heading can report the
+  // post-filter count, and an entire section (heading included) drops out when
+  // a query filters it to nothing.
+  let visibleCards = 0;
+
   // Ancestors block — collapsed by default per-card.
   if (ancestors.length > 0) {
-    treeModalBodyEl.appendChild(renderModalSectionHeading(
-      "ancestors",
-      ancestors.length,
-      "every LLM call that shaped the chain from root → focus",
-    ));
+    const cards = [];
     for (const a of ancestors) {
-      if (q && !nodeMatchesQuery(a, q)) continue;
-      treeModalBodyEl.appendChild(renderObsCard(a, { role: "ancestor", depth: 0 }));
+      const card = renderObsCard(a, { role: "ancestor", depth: 0, query: q });
+      if (card) cards.push(card);
+    }
+    if (cards.length > 0) {
+      treeModalBodyEl.appendChild(renderModalSectionHeading(
+        "ancestors",
+        cards.length,
+        q ? "matching boxes only" : "every LLM call that shaped the chain from root → focus",
+      ));
+      for (const card of cards) treeModalBodyEl.appendChild(card);
+      visibleCards += cards.length;
     }
   }
 
   // Focus block.
-  treeModalBodyEl.appendChild(renderModalSectionHeading(
-    "focused node",
-    1,
-    "every LLM call captured for this node, expanded",
-  ));
-  treeModalBodyEl.appendChild(renderObsCard(focusNode, { role: "focus", depth: 0 }));
+  const focusCard = renderObsCard(focusNode, { role: "focus", depth: 0, query: q });
+  if (focusCard) {
+    treeModalBodyEl.appendChild(renderModalSectionHeading(
+      "focused node",
+      1,
+      q ? "matching boxes only" : "every LLM call captured for this node, expanded",
+    ));
+    treeModalBodyEl.appendChild(focusCard);
+    visibleCards++;
+  }
 
   // Descendants block.
   if (descendants.length > 0) {
-    treeModalBodyEl.appendChild(renderModalSectionHeading(
-      "descendants",
-      descendants.length,
-      "indented by depth from focus",
-    ));
+    const cards = [];
     for (const [d, depth] of descendants) {
-      if (q && !nodeMatchesQuery(d, q)) continue;
-      treeModalBodyEl.appendChild(renderObsCard(d, { role: "descendant", depth }));
+      const card = renderObsCard(d, { role: "descendant", depth, query: q });
+      if (card) cards.push(card);
     }
+    if (cards.length > 0) {
+      treeModalBodyEl.appendChild(renderModalSectionHeading(
+        "descendants",
+        cards.length,
+        q ? "matching boxes only" : "indented by depth from focus",
+      ));
+      for (const card of cards) treeModalBodyEl.appendChild(card);
+      visibleCards += cards.length;
+    }
+  }
+
+  // A query that hit nothing anywhere — say so instead of a blank modal.
+  if (q && visibleCards === 0) {
+    const empty = document.createElement("div");
+    empty.className = "tm-empty";
+    empty.textContent = `no matches for “${treeModalQuery.trim()}”`;
+    treeModalBodyEl.appendChild(empty);
   }
 
   if (anchorId) {
@@ -3123,6 +3345,475 @@ window.addEventListener("keydown", (ev) => {
     closeTreeModal();
   }
 });
+
+// ===========================================================================
+// Execution-flow graph — a pannable canvas of the ACTUAL run, not the semantic
+// scene tree. Two interleaved node kinds:
+//   * scene node `s:<id>`  — a zone/object/frame the run produced.
+//   * step node  `t:<uid>` — one LLM call (zone_plan, zone_decompose,
+//                            anchor_decompose, object_bbox_single, …).
+// Parenting reflects ONLY which step generated what: a scene node's children
+// are the steps issued from it (in execution order); a step node's children
+// are the scene nodes its output emitted — so a scene node's parent is the
+// step that created it. Clicking a scene node opens its observability; clicking
+// a step node opens that exact call's system / input / output / reasoning. The
+// graph reads the same `treeNodes`/`nodeLlmCalls` state the sidebar and the
+// observability modal maintain, so it stays in sync with the live SSE stream
+// and replay scrubbing for free (see the `animate()` refresh hook). State +
+// layout constants are declared near the top of the file (before the render
+// loop first runs); the functions and wiring live here.
+// ===========================================================================
+
+function flowSceneKindClass(kind) {
+  return kind === "object" ? "object" : kind === "frame" ? "frame" : "zone";
+}
+
+// The scene ids a step's output brought into existence. We read the emitting
+// fields only (children / objects / object) — NOT bbox `assignments` — so each
+// scene node has exactly one generating step and the graph stays a tree.
+function execEmittedIds(call) {
+  const out = call?.output;
+  if (!out || typeof out !== "object") return [];
+  const ids = [];
+  if (Array.isArray(out.children)) for (const c of out.children) if (c?.id) ids.push(c.id);
+  if (Array.isArray(out.objects)) for (const o of out.objects) if (o?.id) ids.push(o.id);
+  if (out.object && typeof out.object === "object" && out.object.id) ids.push(out.object.id);
+  return ids;
+}
+
+// Assemble the exec graph from the recorded LLM calls + scene nodes.
+function buildExecGraph() {
+  const nodes = new Map();
+  const childrenOf = new Map();
+  const addChild = (parentKey, childKey) => {
+    const arr = childrenOf.get(parentKey);
+    if (arr) arr.push(childKey);
+    else childrenOf.set(parentKey, [childKey]);
+  };
+
+  for (const [id, n] of treeNodes) {
+    nodes.set(`s:${id}`, {
+      key: `s:${id}`, type: "scene", id,
+      sceneKind: n.kind ?? "zone", prompt: n.prompt ?? null,
+      phase: n.phase ?? "pending", order: n.order ?? 0,
+    });
+  }
+
+  const hasParent = new Set();
+  // Each recorded call becomes a step node under the scene that issued it; its
+  // emitted ids become that step's scene children (first emitter wins).
+  for (const [ownerId, calls] of nodeLlmCalls) {
+    const ownerKey = `s:${ownerId}`;
+    if (!nodes.has(ownerKey)) {
+      // Call issued from an id with no scene node (e.g. "_unattributed").
+      nodes.set(ownerKey, {
+        key: ownerKey, type: "scene", id: ownerId,
+        sceneKind: "zone", prompt: null, phase: "pending", order: -1, synthetic: true,
+      });
+    }
+    const ordered = calls
+      .map((c, i) => ({ c, i }))
+      .sort((a, b) => (a.c.eventIndex ?? a.i) - (b.c.eventIndex ?? b.i));
+    for (const { c } of ordered) {
+      const stepKey = `t:${c.uid}`;
+      const emitted = [...new Set(execEmittedIds(c))];
+      nodes.set(stepKey, {
+        key: stepKey, type: "step", step: c.step || "(step)",
+        ownerId, call: c, eventIndex: c.eventIndex ?? null,
+        cached: !!c.cached, model: c.model || "", generated: emitted.length,
+      });
+      addChild(ownerKey, stepKey);
+      hasParent.add(stepKey);
+      for (const gid of emitted) {
+        const childKey = `s:${gid}`;
+        if (!nodes.has(childKey) || hasParent.has(childKey)) continue;
+        addChild(stepKey, childKey);
+        hasParent.add(childKey);
+      }
+    }
+  }
+
+  // Roots: the real scene root first, then anything still unparented (orphan
+  // scenes whose generating call we never saw, synthetic owners, etc.).
+  const roots = [];
+  if (treeRootId && nodes.has(`s:${treeRootId}`)) roots.push(`s:${treeRootId}`);
+  for (const [key] of nodes) {
+    if (key === `s:${treeRootId}`) continue;
+    if (!hasParent.has(key)) roots.push(key);
+  }
+  return { nodes, childrenOf, roots };
+}
+
+// Indented-outline layout: every node takes its own row (top-to-bottom in
+// execution / emission order) and is indented by depth. Width is bounded by the
+// tree's depth instead of its leaf count, so deep/bushy graphs grow downward
+// rather than sprawling sideways. Same-depth nodes do NOT share a row — that
+// rigid banding is what made the old layout spread too thin horizontally.
+function flowLayout(graph) {
+  const positions = new Map();
+  const visited = new Set();
+  let row = 0;
+  function place(key, depth) {
+    visited.add(key);
+    positions.set(key, { x: depth * FLOW.INDENT, y: row * FLOW.ROW_H, depth });
+    row += 1;
+    for (const k of graph.childrenOf.get(key) ?? []) {
+      if (graph.nodes.has(k) && !visited.has(k)) place(k, depth + 1);
+    }
+  }
+  for (const r of graph.roots) {
+    if (visited.has(r)) continue;
+    place(r, 0);
+    row += 1; // blank spacer row between separate root trees
+  }
+  for (const [key] of graph.nodes) if (!visited.has(key)) place(key, 0);
+  let maxX = 0;
+  let maxY = 0;
+  for (const p of positions.values()) {
+    if (p.x > maxX) maxX = p.x;
+    if (p.y > maxY) maxY = p.y;
+  }
+  return {
+    positions,
+    width: maxX + FLOW.NODE_W + FLOW.PAD * 2,
+    height: maxY + FLOW.NODE_H + FLOW.PAD * 2,
+  };
+}
+
+function flowSearchHit(text) {
+  const q = flowSearchQuery.trim().toLowerCase();
+  if (!q) return null;
+  return (text ?? "").toLowerCase().includes(q);
+}
+
+function buildSceneFlowNode(node, pos) {
+  const el = document.createElement("div");
+  el.className = `flow-node flow-scene ${flowSceneKindClass(node.sceneKind)}`;
+  el.dataset.key = node.key;
+  el.dataset.id = node.id;
+  el.style.left = `${pos.x + FLOW.PAD}px`;
+  el.style.top = `${pos.y + FLOW.PAD}px`;
+  el.style.width = `${FLOW.NODE_W}px`;
+  if (node.id === treeActiveId) el.classList.add("active");
+  if (node.id === selectedBboxId) el.classList.add("selected");
+  const hit = flowSearchHit(`${node.id} ${node.prompt ?? ""}`);
+  if (hit === true) el.classList.add("hit");
+  else if (hit === false) el.classList.add("dimmed");
+
+  const head = document.createElement("div");
+  head.className = "flow-node-head";
+  const dot = document.createElement("span");
+  dot.className = `flow-dot phase-${node.phase ?? "pending"}`;
+  head.appendChild(dot);
+  const idEl = document.createElement("span");
+  idEl.className = "flow-node-id";
+  idEl.textContent = node.id;
+  head.appendChild(idEl);
+  el.appendChild(head);
+
+  if (node.prompt) {
+    const p = document.createElement("div");
+    p.className = "flow-node-prompt";
+    p.textContent = truncate(node.prompt, 52);
+    el.appendChild(p);
+  }
+  el.title = `${node.sceneKind} ${node.id} — click for observability`;
+  el.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    openObsFor(node.id);
+  });
+  return el;
+}
+
+function buildStepFlowNode(node, pos) {
+  const el = document.createElement("div");
+  el.className = `flow-node flow-step s-${node.step}`;
+  el.dataset.key = node.key;
+  el.style.left = `${pos.x + FLOW.PAD}px`;
+  el.style.top = `${pos.y + FLOW.PAD}px`;
+  el.style.width = `${FLOW.NODE_W}px`;
+  if (node.cached) el.classList.add("cached");
+  const hit = flowSearchHit(`${node.step} ${node.ownerId}`);
+  if (hit === true) el.classList.add("hit");
+  else if (hit === false) el.classList.add("dimmed");
+
+  const head = document.createElement("div");
+  head.className = "flow-step-head";
+  const nameEl = document.createElement("span");
+  nameEl.className = "flow-step-name";
+  nameEl.textContent = node.step;
+  head.appendChild(nameEl);
+  if (node.generated > 0) {
+    const gen = document.createElement("span");
+    gen.className = "flow-step-gen";
+    gen.textContent = `→${node.generated}`;
+    gen.title = `emitted ${node.generated} node${node.generated === 1 ? "" : "s"}`;
+    head.appendChild(gen);
+  }
+  if (node.cached) {
+    const c = document.createElement("span");
+    c.className = "flow-step-cached";
+    c.textContent = "cached";
+    head.appendChild(c);
+  }
+  el.appendChild(head);
+  const sub = document.createElement("div");
+  sub.className = "flow-step-sub";
+  sub.textContent = node.model || `on ${node.ownerId}`;
+  el.appendChild(sub);
+
+  el.title = `${node.step} on ${node.ownerId} — click for input / output / reasoning`;
+  el.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    openObsForStep(node.ownerId, node.call.uid);
+  });
+  return el;
+}
+
+function renderFlow() {
+  if (!flowModalOpen) return;
+  const graph = buildExecGraph();
+  const { positions, width, height } = flowLayout(graph);
+  _flowGraph = graph;
+  _flowPositions = positions;
+  _flowLastWidth = width;
+  _flowLastHeight = height;
+
+  flowEmptyEl.classList.toggle("show", positions.size === 0);
+  flowStageEl.style.width = `${width}px`;
+  flowStageEl.style.height = `${height}px`;
+
+  // Edges: an outline connector per parent — a spine dropping from the parent's
+  // gutter with a rounded tick into each child's left edge. Children of a given
+  // node share a type, so the overlapping spine stays one color. Tinted by child.
+  flowEdgesEl.setAttribute("width", String(width));
+  flowEdgesEl.setAttribute("height", String(height));
+  let edges = "";
+  const R = 6; // connector corner radius
+  for (const [key, p] of positions) {
+    const sx = p.x + FLOW.PAD + FLOW.GUTTER; // spine x, just inside the parent's left edge
+    const sy = p.y + FLOW.PAD + FLOW.NODE_H; // parent bottom
+    for (const ck of graph.childrenOf.get(key) ?? []) {
+      const cp = positions.get(ck);
+      if (!cp) continue;
+      const child = graph.nodes.get(ck);
+      const cy = cp.y + FLOW.PAD + FLOW.NODE_H / 2; // child vertical center
+      const cx = cp.x + FLOW.PAD; // child left edge
+      const cls = child.type === "step" ? "to-step" : `to-${child.sceneKind}`;
+      edges += `<path class="flow-edge ${cls}" d="M ${sx.toFixed(1)} ${sy.toFixed(1)} L ${sx.toFixed(1)} ${(cy - R).toFixed(1)} Q ${sx.toFixed(1)} ${cy.toFixed(1)} ${(sx + R).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${cy.toFixed(1)}" />`;
+    }
+  }
+  flowEdgesEl.innerHTML = edges;
+
+  const frag = document.createDocumentFragment();
+  for (const [key, p] of positions) {
+    const node = graph.nodes.get(key);
+    frag.appendChild(node.type === "step" ? buildStepFlowNode(node, p) : buildSceneFlowNode(node, p));
+  }
+  flowNodesEl.replaceChildren(frag);
+  applyFlowTransform();
+}
+
+function applyFlowTransform() {
+  flowStageEl.style.transform = `translate(${flowPanX}px, ${flowPanY}px) scale(${flowZoom})`;
+  // Pan/zoom the background dot-grid with the content for an infinite-canvas feel.
+  flowViewportEl.style.backgroundPosition = `${flowPanX}px ${flowPanY}px`;
+  flowViewportEl.style.backgroundSize = `${FLOW.GRID * flowZoom}px ${FLOW.GRID * flowZoom}px`;
+}
+
+function flowClampZoom(z) {
+  return Math.max(0.15, Math.min(2.5, z));
+}
+
+function flowZoomAt(cx, cy, factor) {
+  const next = flowClampZoom(flowZoom * factor);
+  const k = next / flowZoom;
+  flowPanX = cx - (cx - flowPanX) * k;
+  flowPanY = cy - (cy - flowPanY) * k;
+  flowZoom = next;
+  applyFlowTransform();
+}
+
+function fitFlow() {
+  const w = _flowLastWidth || 1;
+  const h = _flowLastHeight || 1;
+  const vw = flowViewportEl.clientWidth || 1;
+  const vh = flowViewportEl.clientHeight || 1;
+  // The outline is narrow and grows downward: fit its width at up to 1:1 so
+  // nodes stay readable, then anchor to the top and let the user scroll down —
+  // shrinking a tall tree to fit vertically would make everything tiny.
+  flowZoom = flowClampZoom(Math.min(vw / w, 1) * 0.94);
+  flowPanX = (vw - w * flowZoom) / 2;
+  flowPanY = h * flowZoom <= vh ? (vh - h * flowZoom) / 2 : 0;
+  applyFlowTransform();
+}
+
+function openObsFor(id) {
+  if (!treeNodes.has(id)) return;
+  if (!treeModalOpen) openTreeModal();
+  focusModalOn(id);
+}
+
+// Step-node click: open the observability modal on the step's owner node and
+// scroll its specific call block (system / input / output / reasoning) into
+// view — the exact panes the observability pipeline shows.
+function openObsForStep(ownerId, callUid) {
+  if (!treeModalOpen) openTreeModal();
+  if (treeNodes.has(ownerId)) focusModalOn(ownerId);
+  requestAnimationFrame(() => {
+    const focusCard = treeModalBodyEl.querySelector(".tm-obs-card.role-focus") || treeModalBodyEl;
+    const block = focusCard.querySelector(
+      `.tm-llm-call[data-call-key="${CSS.escape(String(callUid))}"]`,
+    );
+    if (!block) return;
+    block.open = true;
+    block.scrollIntoView({ block: "center" });
+    block.classList.add("tm-llm-flash");
+    setTimeout(() => block.classList.remove("tm-llm-flash"), 1400);
+  });
+}
+
+// Center the canvas on a scene node — used when a sidebar-tree row is clicked
+// while the flow canvas is open. Bumps zoom in if the user was zoomed far out.
+function flowCenterOnScene(id) {
+  const pos = _flowPositions.get(`s:${id}`);
+  if (!pos) return;
+  if (flowZoom < 0.75) flowZoom = 0.9;
+  const vw = flowViewportEl.clientWidth || 1;
+  const vh = flowViewportEl.clientHeight || 1;
+  const nx = pos.x + FLOW.PAD + FLOW.NODE_W / 2;
+  const ny = pos.y + FLOW.PAD + FLOW.NODE_H / 2;
+  flowPanX = vw / 2 - nx * flowZoom;
+  flowPanY = vh / 2 - ny * flowZoom;
+  applyFlowTransform();
+}
+
+function openFlowModal() {
+  flowModalOpen = true;
+  flowModalEl.classList.add("open");
+  // Float the sidebar tree above the canvas so it stays usable while the flow
+  // graph is open (CSS bumps #tree's z-index under body.flow-open).
+  document.body.classList.add("flow-open");
+  flowSearchEl.value = flowSearchQuery;
+  renderFlow();
+  // Defer fit until the viewport has its open dimensions.
+  requestAnimationFrame(() => {
+    renderFlow();
+    fitFlow();
+  });
+}
+
+function closeFlowModal() {
+  flowModalOpen = false;
+  flowModalEl.classList.remove("open");
+  document.body.classList.remove("flow-open");
+}
+
+function toggleFlowModal() {
+  if (flowModalOpen) closeFlowModal();
+  else openFlowModal();
+}
+
+// Center the view on the first node (scene or step) matching the query.
+function flowLocate(query) {
+  const q = query.trim().toLowerCase();
+  if (!q || !_flowGraph) return;
+  for (const [key, p] of _flowPositions) {
+    const node = _flowGraph.nodes.get(key);
+    if (!node) continue;
+    const hay = node.type === "step"
+      ? `${node.step} ${node.ownerId}`
+      : `${node.id} ${node.prompt ?? ""}`;
+    if (hay.toLowerCase().includes(q)) {
+      const vw = flowViewportEl.clientWidth || 1;
+      const vh = flowViewportEl.clientHeight || 1;
+      const nx = p.x + FLOW.PAD + FLOW.NODE_W / 2;
+      const ny = p.y + FLOW.PAD + FLOW.NODE_H / 2;
+      flowPanX = vw / 2 - nx * flowZoom;
+      flowPanY = vh / 2 - ny * flowZoom;
+      applyFlowTransform();
+      return;
+    }
+  }
+}
+
+treeFlowEl?.addEventListener("click", (ev) => {
+  ev.stopPropagation(); // don't toggle the tree-header collapse
+  toggleFlowModal();
+});
+flowCloseEl?.addEventListener("click", closeFlowModal);
+flowFitEl?.addEventListener("click", fitFlow);
+flowZoomInEl?.addEventListener("click", () =>
+  flowZoomAt(flowViewportEl.clientWidth / 2, flowViewportEl.clientHeight / 2, 1.2),
+);
+flowZoomOutEl?.addEventListener("click", () =>
+  flowZoomAt(flowViewportEl.clientWidth / 2, flowViewportEl.clientHeight / 2, 1 / 1.2),
+);
+flowSearchEl?.addEventListener("input", () => {
+  flowSearchQuery = flowSearchEl.value;
+  renderFlow();
+  flowLocate(flowSearchQuery);
+});
+flowModalEl?.addEventListener("pointerdown", (ev) => {
+  // Backdrop (area outside the panel) closes the modal.
+  if (ev.target === flowModalEl) closeFlowModal();
+});
+flowViewportEl?.addEventListener("pointerdown", (ev) => {
+  if (ev.button !== 0) return;
+  if (ev.target.closest(".flow-node")) return; // let the node handle its click
+  _flowPanning = true;
+  _flowStartX = ev.clientX;
+  _flowStartY = ev.clientY;
+  _flowStartPanX = flowPanX;
+  _flowStartPanY = flowPanY;
+  flowViewportEl.classList.add("grabbing");
+  flowViewportEl.setPointerCapture?.(ev.pointerId);
+});
+flowViewportEl?.addEventListener("pointermove", (ev) => {
+  if (!_flowPanning) return;
+  const dx = ev.clientX - _flowStartX;
+  const dy = ev.clientY - _flowStartY;
+  flowPanX = _flowStartPanX + dx;
+  flowPanY = _flowStartPanY + dy;
+  applyFlowTransform();
+});
+function flowEndPan(ev) {
+  if (!_flowPanning) return;
+  _flowPanning = false;
+  flowViewportEl.classList.remove("grabbing");
+  flowViewportEl.releasePointerCapture?.(ev.pointerId);
+}
+flowViewportEl?.addEventListener("pointerup", flowEndPan);
+flowViewportEl?.addEventListener("pointercancel", flowEndPan);
+flowViewportEl?.addEventListener(
+  "wheel",
+  (ev) => {
+    ev.preventDefault();
+    const rect = flowViewportEl.getBoundingClientRect();
+    const factor = ev.deltaY < 0 ? 1.05 : 1 / 1.05;
+    flowZoomAt(ev.clientX - rect.left, ev.clientY - rect.top, factor);
+  },
+  { passive: false },
+);
+// Capture-phase Escape so the observability modal (a bubble-phase handler that
+// sits on top, z-index 1100) closes first; only once it is gone does Escape
+// close the flow graph beneath it.
+window.addEventListener(
+  "keydown",
+  (ev) => {
+    if (ev.key !== "Escape") return;
+    if (!flowModalOpen || treeModalOpen) return;
+    if (document.activeElement === flowSearchEl && flowSearchEl.value) {
+      flowSearchEl.value = "";
+      flowSearchQuery = "";
+      renderFlow();
+      return;
+    }
+    ev.stopImmediatePropagation();
+    closeFlowModal();
+  },
+  true,
+);
 
 function positionTooltip(clientX, clientY, id) {
   const node = treeNodes.get(id);
@@ -3182,13 +3873,20 @@ function positionTooltip(clientX, clientY, id) {
   tooltip.style.top = `${Math.max(0, y)}px`;
 }
 
+// Zones-only picking is active when the toggle is set to "zones" OR the user
+// is holding Shift — a momentary override to grab the containing zone without
+// flipping (and persisting) the saved mode.
+function zonesOnlyActive() {
+  return selectMode === "zones" || pressedKeys.has("shift");
+}
+
 // Mesh-based picking: raycast against actual geometry the user sees —
 // loaded GLB meshes first, then solid-fill proxies when the model hasn't
 // arrived. Zones never have meshes, so they're unreachable here and must
 // be selected from the tree (or via zone-mode picking, below).
 const _pickRoots = [];
 function pickHoveredBboxId() {
-  if (selectMode === "zones") return pickHoveredZoneBboxId();
+  if (zonesOnlyActive()) return pickHoveredZoneBboxId();
   _pickRoots.length = 0;
   for (const model of modelsById.values()) {
     if (model.visible) _pickRoots.push(model);
@@ -3248,7 +3946,7 @@ function pickRightClickId() {
     // In zone-only mode the bbox fallback must also stay zone-restricted —
     // otherwise right-clicking past a zone hit would hide a non-zone the
     // user can't even select via left-click.
-    if (selectMode === "zones" && helper.userData.nodeKind !== "zone") continue;
+    if (zonesOnlyActive() && helper.userData.nodeKind !== "zone") continue;
     if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit)) continue;
     const dist = _rightClickBoxHit.distanceToSquared(camera.position);
     if (dist < bestDist) {
@@ -3265,10 +3963,12 @@ renderer.domElement.addEventListener("pointermove", (ev) => {
   pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
   lastPointerClientX = ev.clientX;
   lastPointerClientY = ev.clientY;
+  pointerInsideCanvas = true;
   pointerDirty = true;
 });
 
 renderer.domElement.addEventListener("pointerleave", () => {
+  pointerInsideCanvas = false;
   setHoveredBbox(null);
   tooltip.style.display = "none";
 });
@@ -3674,14 +4374,14 @@ async function switchRun(name) {
   }
 }
 
-// --- pipeline versions (V1/V2/V3) -------------------------------------------
+// --- pipeline versions (V1/V2/V3/V4) ----------------------------------------
 //
 // Each version is a reserved run (v1-legacy-xml / v2-frame-first /
-// v3-decomp-first). The version bar is a specialized run-switcher: clicking a
-// button activates that run via switchRun() (single-canvas swap), and "launch
-// all 3" starts every version's cell on the current (slot, model) so they
-// generate concurrently and isolated. The dot on each button mirrors that
-// version's cell status for the viewed (slot, model).
+// v3-decomp-first / v4-decomp-first-all). The version bar is a specialized
+// run-switcher: clicking a button activates that run via switchRun()
+// (single-canvas swap), and "launch all" starts every version's cell on the
+// current (slot, model) so they generate concurrently and isolated. The dot on
+// each button mirrors that version's cell status for the viewed (slot, model).
 
 function renderVersionBar() {
   versionBarEl.innerHTML = "";
@@ -4234,6 +4934,7 @@ function backfillPanels(event) {
 async function backfillHistoryInBackground(slotId, model, gen) {
   try { await meshBundle.streamDone; } catch {}
   if (gen !== sceneGen) return;
+  const t0 = performance.now();
   let text;
   try {
     const res = await fetch(historyUrl(slotId, model), { cache: "no-store" });
@@ -4243,8 +4944,10 @@ async function backfillHistoryInBackground(slotId, model, gen) {
     return;
   }
   if (gen !== sceneGen) return;
+  const tFetched = performance.now();
   const lines = text.split("\n");
   let i = 0;
+  let count = 0;
   const step = () => {
     if (gen !== sceneGen) return;
     const end = Math.min(i + 200, lines.length);
@@ -4254,15 +4957,25 @@ async function backfillHistoryInBackground(slotId, model, gen) {
       let event;
       try { event = JSON.parse(line); } catch { continue; }
       backfillPanels(event);
+      count++;
     }
     if (i < lines.length) setTimeout(step, 0);
-    else updateReplayButton();
+    else {
+      updateReplayButton();
+      if (LOAD_TIMING) {
+        console.info(
+          `[load] backfill: ${count} events · ${(text.length / 1e6).toFixed(1)}MB · ` +
+            `fetch ${(tFetched - t0) | 0}ms · parse+render ${(performance.now() - tFetched) | 0}ms`,
+        );
+      }
+    }
   };
   step();
 }
 
 async function loadCellScene(slotId, model, { forceLive = false } = {}) {
   const gen = sceneGen;
+  const t0 = performance.now();
   let payload;
   try {
     const res = await fetch(slotSceneUrl(slotId, model), { cache: "no-store" });
@@ -4275,7 +4988,14 @@ async function loadCellScene(slotId, model, { forceLive = false } = {}) {
   // Bail if the user switched cells while /scene was in flight.
   if (gen !== sceneGen || currentSlotId !== slotId || currentModel !== model) return;
 
+  const tFetch = performance.now();
   applySceneProjection(payload.nodes ?? []);
+  if (LOAD_TIMING) {
+    console.info(
+      `[load] /scene: ${payload.nodes?.length ?? 0} nodes · ` +
+        `fetch ${(tFetch - t0) | 0}ms · projection ${(performance.now() - tFetch) | 0}ms`,
+    );
+  }
   highestEventIndex = typeof payload.last_index === "number" ? payload.last_index : -1;
   prefetchMeshBundle(slotId, model, sceneGen);
 
@@ -4667,23 +5387,25 @@ async function snapshotAll() {
 snapshotAllEl.addEventListener("click", snapshotAll);
 
 async function resumeAll() {
-  // Fans out POST /slots/<slot>/<model>/resume for every cell on the active
-  // model whose status is startable (idle/paused/error). Running and done
-  // cells are skipped. If the viewed cell gets resumed, route it through
-  // resumeSlot() so the scene + SSE rewire — non-viewed cells just need
-  // the kick, their events will flow next time the user switches to them.
+  // Fans out POST /slots/<slot>/<model>/resume for every PAUSED or ERRORED
+  // cell on the active model: paused cells continue, errored cells retry.
+  // Idle (never-started), running, and done cells are skipped — idle cells
+  // are launched from "start cells…", not here. If the viewed cell gets
+  // resumed, route it through resumeSlot() so the scene + SSE rewire —
+  // non-viewed cells just need the kick, their events will flow next time
+  // the user switches to them.
   if (currentModel === null) return;
   const model = currentModel;
-  const startable = slotSummaries.filter((s) =>
-    ["idle", "paused", "error"].includes(s.runs?.[model]?.status),
+  const resumable = slotSummaries.filter((s) =>
+    ["paused", "error"].includes(s.runs?.[model]?.status),
   );
-  if (startable.length === 0) {
-    setStatus(`no startable cells on ${model}`);
+  if (resumable.length === 0) {
+    setStatus(`no paused or errored cells on ${model}`);
     return;
   }
   resumeAllEl.disabled = true;
   try {
-    const tasks = startable.map((s) => {
+    const tasks = resumable.map((s) => {
       if (s.id === currentSlotId) {
         // Viewed cell — wire SSE + clear scene via the existing helper.
         return resumeSlot(s.id, model);
@@ -4701,12 +5423,12 @@ async function resumeAll() {
     if (failures.length > 0) {
       const names = failures.map((f) => f.slot).join(", ");
       setStatus(
-        `resume all on ${model}: ${startable.length - failures.length} ok, ${failures.length} failed (${names})`,
+        `resume all on ${model}: ${resumable.length - failures.length} ok, ${failures.length} failed (${names})`,
         "err",
       );
     } else {
       setStatus(
-        `resumed ${startable.length} cell${startable.length === 1 ? "" : "s"} on ${model}`,
+        `resumed ${resumable.length} cell${resumable.length === 1 ? "" : "s"} on ${model}`,
       );
     }
     refreshSlots();
