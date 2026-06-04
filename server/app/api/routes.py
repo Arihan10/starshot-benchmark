@@ -38,6 +38,7 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from app.core import prompt_runtime
+from app.core.prompts import ImageView
 from app.core.slots import (
     DEFAULT_MODEL_ALIAS,
     MODEL_ALIASES,
@@ -995,7 +996,8 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
     else:
         subject_str = raw_str
         p = prompt_runtime.current()
-        image_prompt = p.wrap_image_prompt(subject_str, proxy_shape, bbox.size)
+        view: ImageView = "three-quarter" if bbox_event.get("node_kind") == "frame" else "front"
+        image_prompt = p.wrap_image_prompt(subject_str, proxy_shape, bbox.size, view=view)
     parent_id = bbox_event.get("parent_id")
     return Node(
         id=node_id,

@@ -57,7 +57,7 @@ TRELLIS_SEED = 0
 # (~5/min each, under the per-IP-per-container `/jobs/{id}` 60/60s limit),
 # but a pin to a single container would now exceed it.
 POLL_INTERVAL_SECONDS = 12.0
-POLL_TIMEOUT_SECONDS = 1200.0
+POLL_TIMEOUT_SECONDS = 3600.0 
 
 MAX_ATTEMPTS = 3
 # Download has its own (larger) budget. The status endpoint can flip to

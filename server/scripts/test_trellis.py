@@ -22,7 +22,7 @@ import httpx
 
 BASE_URL = os.environ.get(
     "TRELLIS_BASE_URL",
-    "https://starshot-aitools--trellis2-image-to-3d-router-fastapi-app.modal.run",
+    "https://starshot-aitools--starshot-assets-router-fastapi-app.modal.run",
 )
 
 DEFAULT_IMAGE = Path(__file__).resolve().parent.parent / "runs" / "modern-house" / "objects" / "pavilion_roof.png"
