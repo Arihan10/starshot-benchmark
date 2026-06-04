@@ -37,7 +37,7 @@ import trimesh
 from app.core import prompt_runtime
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
-from app.services import llm, nano_banana, prefabs, threed
+from app.services import hunyuan, llm, nano_banana, prefabs, structural, threed
 from app.utils import glb_place, logging
 from app.utils.geometry import rescale_mesh_to_bbox
 from app.utils.topology import validate_parents, validate_referenced_ids
@@ -621,6 +621,14 @@ async def _generate_one(
     image_stem: Path,
     runs_dir: Path,
 ) -> None:
+    # Backend-agnostic resume guard: if the rescaled mesh already exists (built
+    # by EITHER Trellis or Hunyuan on a prior run), reuse it instead of
+    # regenerating. Without this, a node whose structural classification routes
+    # it to a different backend than last run is rebuilt there — double-billing
+    # and, on a Trellis->Hunyuan flip, flooding the slower endpoint.
+    if path.exists():
+        logging.emit_model(node.id, artifact_kind="object", url=_artifact_url(runs_dir, path))
+        return
     try:
         # Nano Banana sees the wrapped studio-shot directive; node.prompt
         # stays the bare subject phrase for everything else.
@@ -639,15 +647,36 @@ async def _generate_one(
                 url=_artifact_url(runs_dir, image_path),
                 prompt=node.prompt,
             )
-        # generate_mesh writes `raw` on a fresh run but returns a *cached* path
+        # Structural shell geometry (walls, slabs, roofs) routes to the
+        # bbox-conditioned Hunyuan endpoint; everything else to Trellis. The
+        # classification is a cheap, cached LLM call that replays on resume.
+        is_structural = await structural.classify(
+            node_id=node.id, description=node.prompt,
+        )
+        logging.log_once(
+            "structural.classify",
+            match_fields=("id",),
+            id=node.id,
+            structural=is_structural,
+        )
+        # The generator writes `raw` on a fresh run but returns a *cached* path
         # on a resumable hit (which may not be `raw` when the bound log was
         # hydrated from another build). Load whatever it actually produced.
-        produced = await threed.generate_mesh(
-            image.image_bytes,
-            output_path=raw,
-            job_id=node.id,
-            image_mime=image.mime_type,
-        )
+        if is_structural:
+            produced = await hunyuan.generate_structural_mesh(
+                image.image_bytes,
+                output_path=raw,
+                job_id=node.id,
+                bbox=node.bbox,
+                image_mime=image.mime_type,
+            )
+        else:
+            produced = await threed.generate_mesh(
+                image.image_bytes,
+                output_path=raw,
+                job_id=node.id,
+                image_mime=image.mime_type,
+            )
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, produced)
             rescaled = await asyncio.to_thread(

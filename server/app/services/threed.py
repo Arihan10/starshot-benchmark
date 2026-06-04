@@ -30,6 +30,7 @@ import hashlib
 import os
 import random
 import time
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any
 
@@ -386,6 +387,108 @@ def _input_hash(image_bytes: bytes) -> str:
     })
 
 
+async def run_spawn_poll(
+    *,
+    scope: str,
+    job_id: str,
+    input_hash: str,
+    output_path: Path,
+    sem: asyncio.Semaphore,
+    submit: Callable[[], Awaitable[str]],
+    fetch: Callable[[str], Awaitable[bytes]],
+) -> Path:
+    """Shared spawn-and-poll driver for the hosted image-to-3D backends
+    (Trellis here, Hunyuan in `app.services.hunyuan`).
+
+    Owns everything common to both: the in-flight queue snapshot, the
+    per-backend in-flight cap (`sem`), global submit pacing, the retry loop,
+    and the `<scope>.done` completion log. Each backend supplies only the two
+    steps whose wire format actually differs:
+
+      * `submit()` — POST the job, return the server task id.
+      * `fetch(task_id)` — poll to completion and return the GLB bytes.
+
+    Callers run the `<scope>.done` short-circuit themselves (before resolving
+    the image / hashing) so a resumable hit stays free. The server task id is
+    held across retryable poll/download failures so we re-enter the same job
+    instead of orphaning it and burning a fresh generation; a `JobLostError`
+    (the server 404'd the id) clears it so the next attempt resubmits.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    slot_id = logging.current_slot_id()
+    _queue_set(slot_id, job_id, "waiting")
+    try:
+        async with sem:
+            task_id: str | None = None
+            for attempt in range(MAX_ATTEMPTS):
+                try:
+                    if task_id is None:
+                        # Space submits ~1/s globally so a batch ramps onto
+                        # Modal instead of bursting into a 429 storm.
+                        await _pace_submit()
+                        task_id = await submit()
+                        _queue_set(slot_id, job_id, "processing", task_id=task_id)
+                        logging.log(
+                            f"{scope}.submit",
+                            job_id=job_id,
+                            task_id=task_id,
+                            input_hash=input_hash,
+                            attempt=attempt,
+                        )
+                    content = await fetch(task_id)
+                    output_path.write_bytes(content)
+                    resumable.log_done(
+                        scope=scope,
+                        job_id=job_id,
+                        server_job_id=task_id,
+                        saved=str(output_path),
+                    )
+                    return output_path
+                except JobLostError as e:
+                    logging.log(
+                        f"{scope}.job_lost",
+                        job_id=job_id,
+                        task_id=task_id,
+                        attempt=attempt,
+                        reason=str(e)[:200],
+                    )
+                    task_id = None
+                    if attempt == MAX_ATTEMPTS - 1:
+                        raise
+                    await asyncio.sleep(_retry_delay(attempt, e))
+                except RETRYABLE as e:
+                    if attempt == MAX_ATTEMPTS - 1:
+                        raise
+                    # A 404 on a fresh submit (task_id still None) is a
+                    # flapping-deployment signal, not load: the app is between
+                    # versions, or the router cold-routed before the worker was
+                    # ready. Resubmit immediately rather than burning the
+                    # exponential backoff meant for rate limits / network blips.
+                    is_fresh_submit_404 = (
+                        task_id is None
+                        and isinstance(e, httpx.HTTPStatusError)
+                        and e.response.status_code == 404
+                    )
+                    delay = 0.0 if is_fresh_submit_404 else _retry_delay(attempt, e)
+                    logging.log(
+                        f"{scope}.retry",
+                        job_id=job_id,
+                        task_id=task_id,
+                        attempt=attempt,
+                        delay_s=delay,
+                        reason=f"{type(e).__name__}: {str(e)[:200]}",
+                    )
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+            raise AssertionError("unreachable")
+    finally:
+        # Whether we succeeded, errored, or were cancelled, the job is no
+        # longer in flight. Drop unconditionally so a crashed task can't
+        # leak into the queue snapshot.
+        _queue_drop(slot_id, job_id)
+
+
 async def generate_mesh(
     image: bytes | str,
     *,
@@ -401,11 +504,10 @@ async def generate_mesh(
 
     Restart-resilient on completed work: if `trellis.done` was
     previously logged for `job_id` and the file at the recorded path
-    still exists, the call short-circuits. Otherwise we always issue
-    a fresh `POST /generate` — we don't probe prior Modal task_ids
-    because Modal GCs them on its own schedule, and the in-flight
-    semaphore (`_inflight_sem`) gates submits at Modal's container
-    count so Modal never queues on its side.
+    still exists, the call short-circuits. Otherwise the shared
+    spawn-and-poll driver issues a fresh `POST /generate` under the
+    in-flight cap (`_inflight_sem`) — we don't probe prior Modal
+    task_ids because Modal GCs them on its own schedule.
     """
     done = resumable.find_done(scope="trellis", job_id=job_id)
     if done is not None:
@@ -416,90 +518,19 @@ async def generate_mesh(
     image_bytes = await _fetch_url(image) if isinstance(image, str) else image
     input_hash = _input_hash(image_bytes)
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    async def _submit() -> str:
+        return await _post_generate(image_bytes, image_mime)
 
-    slot_id = logging.current_slot_id()
-    _queue_set(slot_id, job_id, "waiting")
-    try:
-        async with _inflight_sem:
-            # By default we hold `server_job_id` across outer retries —
-            # any retryable failure during poll or download re-enters the
-            # same Modal job instead of orphaning it and burning a fresh
-            # generation. The exception is JobLostError (404 from Modal):
-            # the worker that held the in-memory job table is gone, and
-            # polling the same id is pointless. On JobLost we clear
-            # `server_job_id` so the next attempt does a fresh submit.
-            server_job_id: str | None = None
-            for attempt in range(MAX_ATTEMPTS):
-                try:
-                    if server_job_id is None:
-                        # Space submits ~1/s globally so a batch ramps onto
-                        # Modal instead of bursting into a 429 storm.
-                        await _pace_submit()
-                        server_job_id = await _post_generate(image_bytes, image_mime)
-                        _queue_set(slot_id, job_id, "processing", task_id=server_job_id)
-                        logging.log(
-                            "trellis.submit",
-                            job_id=job_id,
-                            task_id=server_job_id,
-                            input_hash=input_hash,
-                            attempt=attempt,
-                        )
-                    await _poll_until_done(
-                        server_job_id, timeout=POLL_TIMEOUT_SECONDS,
-                    )
-                    content = await _download_result(server_job_id)
-                    output_path.write_bytes(content)
-                    resumable.log_done(
-                        scope="trellis",
-                        job_id=job_id,
-                        server_job_id=server_job_id,
-                        saved=str(output_path),
-                    )
-                    return output_path
-                except JobLostError as e:
-                    logging.log(
-                        "trellis.job_lost",
-                        job_id=job_id,
-                        task_id=server_job_id,
-                        attempt=attempt,
-                        reason=str(e)[:200],
-                    )
-                    server_job_id = None
-                    if attempt == MAX_ATTEMPTS - 1:
-                        raise
-                    delay = _retry_delay(attempt, e)
-                    await asyncio.sleep(delay)
-                except RETRYABLE as e:
-                    if attempt == MAX_ATTEMPTS - 1:
-                        raise
-                    # A 404 on POST /generate (server_job_id still None) is a
-                    # flapping-deployment signal, not load: Modal is between
-                    # versions, or the router cold-routed before the worker was
-                    # ready. The exponential schedule (4s → 8s → ... → 60s)
-                    # exists for rate limits and transient network errors; for
-                    # 404, just immediately resubmit with the same image bytes.
-                    # `server_job_id` is already None, so the next loop hits
-                    # the fresh POST path.
-                    is_fresh_post_404 = (
-                        server_job_id is None
-                        and isinstance(e, httpx.HTTPStatusError)
-                        and e.response.status_code == 404
-                    )
-                    delay = 0.0 if is_fresh_post_404 else _retry_delay(attempt, e)
-                    logging.log(
-                        "trellis.retry",
-                        job_id=job_id,
-                        task_id=server_job_id,
-                        attempt=attempt,
-                        delay_s=delay,
-                        reason=f"{type(e).__name__}: {str(e)[:200]}",
-                    )
-                    if delay > 0:
-                        await asyncio.sleep(delay)
-            raise AssertionError("unreachable")
-    finally:
-        # Whether we succeeded, errored, or were cancelled, the job is no
-        # longer in flight. Drop unconditionally so a crashed task can't
-        # leak into the queue snapshot.
-        _queue_drop(slot_id, job_id)
+    async def _fetch(task_id: str) -> bytes:
+        await _poll_until_done(task_id, timeout=POLL_TIMEOUT_SECONDS)
+        return await _download_result(task_id)
+
+    return await run_spawn_poll(
+        scope="trellis",
+        job_id=job_id,
+        input_hash=input_hash,
+        output_path=output_path,
+        sem=_inflight_sem,
+        submit=_submit,
+        fetch=_fetch,
+    )
