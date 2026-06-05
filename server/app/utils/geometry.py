@@ -24,6 +24,7 @@ import math
 
 import numpy as np
 import trimesh
+from trimesh.intersections import slice_faces_plane
 
 from app.core.types import BoundingBox, Orientation
 
@@ -86,4 +87,66 @@ def rescale_mesh_to_bbox(
         C[:3, :3] = np.diag(correction_scale)
         C[:3, 3] = target_center - np.diag(correction_scale) @ final_center
         out.apply_transform(C)
+    return out
+
+
+def symmetrize_mesh(
+    mesh: trimesh.Trimesh | trimesh.Scene,
+    *,
+    axis: int = 2,
+    keep_positive: bool = True,
+) -> trimesh.Trimesh:
+    """Mirror one half of `mesh` onto the other so it's symmetric across a plane.
+
+    The mesh is cut at its AABB midpoint along `axis` (mesh frame; default 2 = Z,
+    Trellis's intrinsic front/back). The `keep_positive` half is kept — the +Z
+    front by default, the side that matches the source image — and reflected
+    across the plane to replace the other half. Trellis hallucinates the back
+    from a single front view, so mirroring the clean front over it yields an
+    object that reads well from every side.
+
+    The reflected half reuses the kept half's UVs and material verbatim, so the
+    new back samples the front's texture — the image itself is never touched.
+    Winding is reversed on the mirror so normals stay outward, and cut-plane
+    vertices map onto themselves so the seam welds shut.
+
+    Cuts with `slice_faces_plane`, which is scipy-free, so no optional trimesh
+    dependency is pulled in.
+    """
+    if axis not in (0, 1, 2):
+        raise ValueError(f"axis must be 0, 1, or 2; got {axis!r}")
+    m = mesh.to_mesh() if isinstance(mesh, trimesh.Scene) else mesh
+    if m.is_empty:
+        raise ValueError("cannot symmetrize an empty mesh")
+
+    plane_origin = m.bounds.mean(axis=0)
+    plane = float(plane_origin[axis])
+    normal = np.zeros(3)
+    normal[axis] = 1.0 if keep_positive else -1.0
+
+    src_uv = getattr(m.visual, "uv", None)
+    verts, faces, uv = slice_faces_plane(
+        np.asarray(m.vertices, dtype=np.float64),
+        np.asarray(m.faces),
+        normal,
+        plane_origin,
+        uv=None if src_uv is None else np.asarray(src_uv, dtype=np.float64),
+    )
+    if len(faces) == 0:
+        raise ValueError("cut plane left an empty half; cannot symmetrize")
+
+    mirror = verts.copy()
+    mirror[:, axis] = 2.0 * plane - mirror[:, axis]
+    all_verts = np.vstack([verts, mirror])
+    # Reverse winding on the mirrored faces so the reflection keeps normals
+    # outward, and offset their indices into the appended mirror block.
+    all_faces = np.vstack([faces, faces[:, ::-1] + len(verts)])
+
+    visual = None
+    if uv is not None:
+        visual = trimesh.visual.TextureVisuals(
+            uv=np.vstack([uv, uv]), material=m.visual.material
+        )
+    out = trimesh.Trimesh(vertices=all_verts, faces=all_faces, visual=visual, process=False)
+    out.merge_vertices()
     return out

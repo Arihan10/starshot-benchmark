@@ -21,6 +21,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from app.core.slots import MODELS
+from app.core.types import BoundingBox
 from app.services import llm
 
 SYSTEM_PREFAB_MATCH = """\
@@ -29,12 +30,16 @@ the scene visually consistent AND avoid regenerating duplicates, you decide \
 whether a NEW object can REUSE an asset that has already been built (or is being \
 built) elsewhere in the SAME scene.
 
-You receive the new object's id and description, plus a catalog of existing \
-assets (each with an id and description). Reuse an existing asset ONLY when it \
+You receive the new object's id, description, and bounding-box size \
+(width×height×depth, in metres), plus a catalog of existing assets (each with the \
+same fields). Reuse an existing asset ONLY when it \
 is essentially the SAME object — a repeat or near-identical instance that would \
 look correct if the existing mesh were dropped into the new object's slot (it \
 will be rescaled to fit). Do not get caught up by flourishes in the mesh's \
 description, identify the exact type of object it is and match if a similar mesh exists. 
+
+A reused mesh is rescaled per-axis to exactly fill the new object's bounding box, \
+which does not preserve proportions.
 
 Respond with ONE JSON object: set reuse_id to the id of the asset to reuse, or \
 to an empty string "" to generate a fresh asset. No prose, no markdown, no code \
@@ -47,17 +52,32 @@ class PrefabMatchOutput(BaseModel):
     reuse_id: str = ""
 
 
-async def match(*, new_id: str, new_description: str, catalog: list[tuple[str, str]]) -> str:
+def _fmt_size(bbox: BoundingBox) -> str:
+    w, h, d = bbox.size
+    return f"{w:.2f}×{h:.2f}×{d:.2f}m"
+
+
+async def match(
+    *,
+    new_id: str,
+    new_description: str,
+    new_bbox: BoundingBox,
+    catalog: list[tuple[str, str, BoundingBox]],
+) -> str:
     """Lightweight check: can the new object reuse one of `catalog` (each an
-    `(id, description)`)? Returns the chosen id, or "" to generate fresh. Always
-    runs on gemini-flash-lite. The caller is responsible for validating the
-    returned id against the catalog (guards a hallucinated id)."""
+    `(id, description, bbox)`)? Returns the chosen id, or "" to generate fresh.
+    Always runs on gemini-flash-lite. The caller is responsible for validating
+    the returned id against the catalog (guards a hallucinated id)."""
     if not catalog:
         return ""
-    listing = "\n".join(f"  - id={cid!r}: {desc}" for cid, desc in catalog)
+    listing = "\n".join(
+        f"  - id={cid!r} [{_fmt_size(bbox)}]: {desc}" for cid, desc, bbox in catalog
+    )
     user = (
-        f"New object:\n  id={new_id!r}: {new_description}\n\n"
-        f"Existing assets already in this scene:\n{listing}\n\n"
+        f"New object:\n  id={new_id!r} [{_fmt_size(new_bbox)}]: {new_description}\n\n"
+        "Existing assets already in this scene "
+        "(id, [bounding-box size as width×height×depth in metres], description):\n"
+        f"{listing}\n\n"
         'Return the id of the asset to reuse, or "" to generate fresh.'
     )
     token = llm._current_model.set(MODELS["gemini-flash-lite"])

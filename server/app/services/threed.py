@@ -45,8 +45,8 @@ TRELLIS_BASE_URL = os.environ.get(
 # Trellis production knobs. Kept module-level so the playground / batch
 # scripts can read or override them without round-tripping through env.
 # `resolution` is a string per the API contract ("512" | "1024" | "1536").
-TRELLIS_RESOLUTION = "512"
-TRELLIS_TEXTURE_SIZE = 1024
+TRELLIS_RESOLUTION = "1024"
+TRELLIS_TEXTURE_SIZE = 2048
 TRELLIS_DECIMATION_TARGET = 500_000
 TRELLIS_SEED = 0
 
@@ -236,7 +236,7 @@ async def _fetch_url(url: str) -> bytes:
     return resp.content
 
 
-async def _post_generate(image_bytes: bytes, image_mime: str) -> str:
+async def _post_generate(image_bytes: bytes, image_mime: str, object_name: str) -> str:
     http = await _get_http()
     files = {"image": ("image.png", image_bytes, image_mime)}
     data = {
@@ -244,6 +244,7 @@ async def _post_generate(image_bytes: bytes, image_mime: str) -> str:
         "resolution": TRELLIS_RESOLUTION,
         "texture_size": str(TRELLIS_TEXTURE_SIZE),
         "decimation_target": str(TRELLIS_DECIMATION_TARGET),
+        "object_name": object_name,
     }
     resp = await http.post(
         f"{TRELLIS_BASE_URL}/generate",
@@ -372,7 +373,7 @@ async def _download_result(server_job_id: str) -> bytes:
     raise AssertionError("unreachable")
 
 
-def _input_hash(image_bytes: bytes) -> str:
+def _input_hash(image_bytes: bytes, object_name: str) -> str:
     """Stable hash of every input that would change the GLB. Logged on
     `trellis.submit` for audit so two submits with identical inputs are
     visibly equivalent."""
@@ -382,6 +383,7 @@ def _input_hash(image_bytes: bytes) -> str:
         "texture_size": TRELLIS_TEXTURE_SIZE,
         "decimation_target": TRELLIS_DECIMATION_TARGET,
         "seed": TRELLIS_SEED,
+        "object_name": object_name,
         "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
     })
 
@@ -414,7 +416,7 @@ async def generate_mesh(
             return cached
 
     image_bytes = await _fetch_url(image) if isinstance(image, str) else image
-    input_hash = _input_hash(image_bytes)
+    input_hash = _input_hash(image_bytes, job_id)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -436,7 +438,9 @@ async def generate_mesh(
                         # Space submits ~1/s globally so a batch ramps onto
                         # Modal instead of bursting into a 429 storm.
                         await _pace_submit()
-                        server_job_id = await _post_generate(image_bytes, image_mime)
+                        server_job_id = await _post_generate(
+                            image_bytes, image_mime, job_id,
+                        )
                         _queue_set(slot_id, job_id, "processing", task_id=server_job_id)
                         logging.log(
                             "trellis.submit",

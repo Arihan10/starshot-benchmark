@@ -31,6 +31,7 @@ from datetime import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +51,7 @@ from app.core.slots import (
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import generation, versions
 from app.services import llm, prefabs, threed
+from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
@@ -75,21 +77,25 @@ PROMPT_SNAPSHOT_NAME = "prompts_snapshot.py"
 # Keyed by (run_name, slot_id, model_alias). Each cell is an independent
 # pipeline. Lazy-populated: only runs the user has activated are loaded.
 RunKey = tuple[str, str, str]
+# Generated-asset builds are scoped to ONE version of a cell, so their task
+# tables key on (run, slot, model, version) — distinct versions build / regen
+# concurrently and fully isolated (own dirs + log).
+GenKey = tuple[str, str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
 _retry_tasks: set[asyncio.Task[None]] = set()
-# In-flight "generate from-scratch assets" task per cell. Drives the client's
-# generate gate (a cell can't re-trigger until its current build finishes) and
-# lets shutdown / reset cancel a build cleanly.
-_generate_tasks: dict[RunKey, asyncio.Task[None]] = {}
-# Per-cell regeneration worker + its FIFO of (node_id, propagate) requests.
-# `_regen_tasks` holds the single worker task per cell; `_regen_queues` is the
-# work it drains concurrently (parallel across prefab groups, serialized within
-# one), sharing one generated-events log. Requests enqueue rather than 409 between
-# each other; still gated against _generate_tasks so a regen and a whole-scene
-# build never write the same dirs concurrently.
-_regen_tasks: dict[RunKey, asyncio.Task[None]] = {}
-_regen_queues: dict[RunKey, asyncio.Queue[tuple[str, bool]]] = {}
+# In-flight "generate from-scratch assets" task per (cell, version). Drives the
+# client's generate gate (a version can't re-trigger until its current build
+# finishes) and lets shutdown / reset cancel a build cleanly.
+_generate_tasks: dict[GenKey, asyncio.Task[None]] = {}
+# Per-(cell, version) regeneration worker + its FIFO of (node_id, propagate)
+# requests. `_regen_tasks` holds the single worker task per version; `_regen_queues`
+# is the work it drains concurrently (parallel across prefab groups, serialized
+# within one), sharing that version's generated-events log. Requests enqueue rather
+# than 409 between each other; still gated against _generate_tasks so a regen and a
+# whole-scene build never write the same version's dirs concurrently.
+_regen_tasks: dict[GenKey, asyncio.Task[None]] = {}
+_regen_queues: dict[GenKey, asyncio.Queue[tuple[str, bool]]] = {}
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
 
@@ -115,6 +121,52 @@ def _run_dir(run: str) -> Path:
 
 def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
     return RUNS_DIR / run / slot_id / model_alias
+
+
+def _gen_slot_id(run: str, slot_id: str, model_alias: str, version: str) -> str:
+    """SlotLog id for one generated version — used as the bound log's slot_id
+    and the Trellis queue key, so distinct versions never collide on either."""
+    return f"{_run_id(run, slot_id, model_alias)}::generated::{version}"
+
+
+def _safe_version(version: str | None) -> str | None:
+    """Validate a client-supplied generated version id (a positive integer) so
+    it stays a safe path segment, normalizing leading zeros. None passes through
+    (the caller then falls back to latest / a freshly allocated id)."""
+    if version is None:
+        return None
+    v = version.strip()
+    if not v.isdigit() or int(v) < 1:
+        raise HTTPException(status_code=400, detail=f"invalid version: {version}")
+    return str(int(v))
+
+
+def _read_gen_version(
+    run: str, slot_id: str, model_alias: str, version: str | None,
+) -> str | None:
+    """Resolve a READ's target generated version: the requested one (validated),
+    else the latest existing, else None when the cell has no versions yet."""
+    v = _safe_version(version)
+    if v is not None:
+        return v
+    existing = generation.list_generated_versions(RUNS_DIR, _run_id(run, slot_id, model_alias))
+    return existing[-1] if existing else None
+
+
+def _write_gen_version(
+    run: str, slot_id: str, model_alias: str, version: str | None, new: bool,
+) -> str:
+    """Resolve a WRITE's target generated version: a freshly allocated id when
+    `new`, else the requested one (created on demand), else the latest existing,
+    else "1" for a cell's first build."""
+    rid = _run_id(run, slot_id, model_alias)
+    if new:
+        return generation.next_generated_version(RUNS_DIR, rid)
+    v = _safe_version(version)
+    if v is not None:
+        return v
+    existing = generation.list_generated_versions(RUNS_DIR, rid)
+    return existing[-1] if existing else "1"
 
 
 def _resolve_run(run: str | None) -> str:
@@ -173,6 +225,9 @@ def _hydrate_run(run: str) -> None:
         for alias in MODEL_ALIASES:
             slot_dir = _slot_dir(run, slot.id, alias)
             slot_dir.mkdir(parents=True, exist_ok=True)
+            # One-time fold of any pre-versioning generated build into
+            # generated/1/ so existing artifacts render under the new layout.
+            generation.migrate_legacy_generated(RUNS_DIR, _run_id(run, slot.id, alias))
             slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
             slot_log.hydrate_from_disk()
             _slot_logs[(run, slot.id, alias)] = slot_log
@@ -392,8 +447,8 @@ def create_app() -> FastAPI:
 
         return {
             "stopped_pipelines": [_run_id(*k) for k in pipeline_keys],
-            "stopped_generates": [_run_id(*k) for k in generate_keys],
-            "stopped_regens": [_run_id(*k) for k in regen_keys],
+            "stopped_generates": [_gen_slot_id(*k) for k in generate_keys],
+            "stopped_regens": [_gen_slot_id(*k) for k in regen_keys],
             "stopped_retries": len(retry_tasks),
             "paused": paused,
         }
@@ -433,7 +488,7 @@ def create_app() -> FastAPI:
         return _scene_projection(list(slot_log.state["events"]))
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, mode: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, mode: str | None = None, version: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
@@ -441,16 +496,25 @@ def create_app() -> FastAPI:
         # and polls on this same origin). The client keys each blob to its
         # `model` event by file stem; see `_mesh_bundle`.
         #
-        # `mode=generated` streams the from-scratch build's sibling folder
-        # instead of the library `objects/`; this is the only thing the client's
-        # asset toggle flips. The two builds coexist under the same cell dir.
+        # `mode=generated` streams one VERSION of the from-scratch build instead
+        # of the library `objects/`; `version` picks which (latest when omitted).
+        # The asset toggle + version picker are the only things the client flips.
+        # The library and every generated version coexist under the same cell dir.
         # Generated meshes are served from their OPTIMIZED twin (decimated +
         # KTX2 + Meshopt) — raw Trellis output is far too heavy to stream.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         cell_dir = slot_log.events_path.parent
         if mode == "generated":
-            objects_dir = cell_dir / "objects-generated-optimized"
+            rid = _run_id(run, slot_id, model_alias)
+            resolved = _read_gen_version(run, slot_id, model_alias, version)
+            # No version yet → point at the (glb-less) version root so the
+            # bundle streams empty rather than 404ing.
+            objects_dir = (
+                generation.generated_dirs(RUNS_DIR, rid, resolved)[1]
+                if resolved is not None
+                else generation.generated_version_root(RUNS_DIR, rid)
+            )
         else:
             objects_dir = cell_dir / OBJECTS_SUBDIR
             if not objects_dir.is_dir():
@@ -577,20 +641,34 @@ def create_app() -> FastAPI:
         slot_id: str,
         model_alias: str,
         run: str | None = None,
+        version: str | None = None,
+        new: bool = False,
     ) -> dict[str, object]:
         """The generate gate: build from-scratch (Nano-Banana + Trellis) assets
-        for this cell into `objects-generated/`, reusing the library build's
-        layout — every object's existing bbox/orientation — so the client's
-        "generated" view is an apples-to-apples swap of matched assets for
-        freshly generated ones. Only one build per cell at a time; re-pressing
-        while one is in flight returns 409 (the gate). Resumable + side-effect
-        free for the library build: bookkeeping lands in events.generated.jsonl,
-        never the library log, and meshes already on disk are skipped."""
+        for this cell into ONE generated `version` (`generated/<version>/`),
+        reusing the library build's layout — every object's existing
+        bbox/orientation — so the client's "generated" view is an apples-to-apples
+        swap of matched assets for freshly generated ones.
+
+        `new=true` allocates a brand-new version (a fresh from-scratch take on the
+        same scene); otherwise the targeted/latest version is resumed — meshes
+        already on disk for THAT version are skipped, and bookkeeping lands in its
+        own events.generated.jsonl. Any number of versions coexist; each builds
+        independently. Only one build per (cell, version) at a time; re-pressing
+        the same version while it's in flight returns 409 (the gate). The library
+        build (objects/ + events.jsonl) is never touched."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key = (run, slot_id, model_alias)
+        gen_version = _write_gen_version(run, slot_id, model_alias, version, new)
+        # Reserve the version dir synchronously so a rapid second `new=true`
+        # allocates the next id instead of colliding before the build task
+        # (which mkdirs) has run.
+        generation.generated_dirs(RUNS_DIR, _run_id(run, slot.id, model_alias), gen_version)[0].mkdir(
+            parents=True, exist_ok=True
+        )
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         in_flight = _generate_tasks.get(key)
         if in_flight is not None and not in_flight.done():
             raise HTTPException(status_code=409, detail="generation already running")
@@ -623,67 +701,88 @@ def create_app() -> FastAPI:
                 detail="no scene to generate from; build the library scene first",
             )
 
-        # Dedicated log for the build's resumable bookkeeping (nano_banana /
-        # threed require a bound SlotLog). Kept apart from the library log so the
-        # toggle stays a pure folder switch and the library stream is untouched.
+        # Dedicated per-version log for the build's resumable bookkeeping
+        # (nano_banana / threed require a bound SlotLog). Kept apart from the
+        # library log so the toggle stays a pure folder switch and the library
+        # stream is untouched; one log per version isolates each version's resume.
+        run_id = _run_id(run, slot.id, model_alias)
         gen_log = SlotLog(
-            _run_id(run, slot.id, model_alias) + "::generated",
-            _slot_dir(run, slot.id, model_alias) / "events.generated.jsonl",
+            _gen_slot_id(run, slot.id, model_alias, gen_version),
+            generation.generated_events_path(RUNS_DIR, run_id, gen_version),
         )
         gen_log.hydrate_from_disk()
-        run_id = _run_id(run, slot.id, model_alias)
 
         async def _do_generate() -> None:
             rlog.bind(gen_log)
             prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
             try:
                 await generation.generate_assets(
-                    nodes=nodes, runs_dir=RUNS_DIR, run_id=run_id,
+                    nodes=nodes, runs_dir=RUNS_DIR, run_id=run_id, version=gen_version,
                 )
             finally:
                 gen_log.close()
 
         _generate_tasks[key] = asyncio.create_task(_do_generate())
-        return {"run": run, "slot_id": slot.id, "model": model_alias, "nodes": len(nodes)}
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "version": gen_version,
+            "nodes": len(nodes),
+        }
 
     @app.get("/slots/{slot_id}/{model_alias}/generate")
     async def slot_generate_status(  # pyright: ignore[reportUnusedFunction]
         slot_id: str,
         model_alias: str,
         run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
-        """Gate state for the client: whether a from-scratch build is in flight,
-        plus the ids of every finished GLB in `objects-generated/`. Polled while
-        the "generated" view is active so the client can enable/disable the gate
-        and attach freshly-built meshes one by one as they land."""
+        """Gate state for the client: every generated version of this cell, plus —
+        for the targeted version (`version`, else latest) — whether a build is in
+        flight and the ids of its finished GLBs. Polled while the "generated" view
+        is active so the client can populate the version picker, enable/disable the
+        gate, and attach freshly-built meshes one by one as they land."""
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
-        key = (run, slot_id, model_alias)
-        gen_task = _generate_tasks.get(key)
-        regen_task = _regen_tasks.get(key)
-        regen_queue = _regen_queues.get(key)
-        running = (
-            (gen_task is not None and not gen_task.done())
-            or (regen_task is not None and not regen_task.done())
-            or (regen_queue is not None and not regen_queue.empty())
-        )
-        # Report the OPTIMIZED twins — those are what's served, and an id only
-        # lands here once its optimize pass has fully finished. Each carries the
-        # GLB's mtime as a version token so the client can detect a regenerated
-        # asset (same id, new bytes) and reload just it with a cache-busted URL.
-        gen_dir = _slot_dir(run, slot_id, model_alias) / "objects-generated-optimized"
+        rid = _run_id(run, slot_id, model_alias)
+        all_versions = generation.list_generated_versions(RUNS_DIR, rid)
+        resolved = _read_gen_version(run, slot_id, model_alias, version)
+        running = False
         meshes: list[dict[str, object]] = []
-        if gen_dir.is_dir():
-            for p in sorted(gen_dir.glob("*.glb")):
-                if p.name.endswith(".raw.glb"):
-                    continue
-                try:
-                    version = p.stat().st_mtime_ns
-                except OSError:
-                    continue
-                meshes.append({"id": p.name[: -len(".glb")], "v": version})
+        if resolved is not None:
+            key: GenKey = (run, slot_id, model_alias, resolved)
+            gen_task = _generate_tasks.get(key)
+            regen_task = _regen_tasks.get(key)
+            regen_queue = _regen_queues.get(key)
+            running = (
+                (gen_task is not None and not gen_task.done())
+                or (regen_task is not None and not regen_task.done())
+                or (regen_queue is not None and not regen_queue.empty())
+            )
+            # Report the OPTIMIZED twins — those are what's served, and an id only
+            # lands here once its optimize pass has fully finished. Each carries the
+            # GLB's mtime as a version token so the client can detect a regenerated
+            # asset (same id, new bytes) and reload just it with a cache-busted URL.
+            gen_dir = generation.generated_dirs(RUNS_DIR, rid, resolved)[1]
+            if gen_dir.is_dir():
+                for p in sorted(gen_dir.glob("*.glb")):
+                    if p.name.endswith(".raw.glb"):
+                        continue
+                    try:
+                        mtime = p.stat().st_mtime_ns
+                    except OSError:
+                        continue
+                    meshes.append({"id": p.name[: -len(".glb")], "v": mtime})
         ids = [m["id"] for m in meshes]
-        return {"running": running, "count": len(ids), "ids": ids, "meshes": meshes}
+        return {
+            "running": running,
+            "version": resolved,
+            "versions": all_versions,
+            "count": len(ids),
+            "ids": ids,
+            "meshes": meshes,
+        }
 
     @app.post("/slots/{slot_id}/{model_alias}/regenerate/{node_id}")
     async def slot_regenerate(  # pyright: ignore[reportUnusedFunction]
@@ -691,26 +790,29 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         propagate: bool = False,
     ) -> dict[str, object]:
-        """Enqueue a from-scratch regeneration of a GENERATED asset onto this
-        cell's regen worker. With `propagate=true` (the client default) the worker
-        rebuilds the prefab CANONICAL behind `node_id` and re-derives every object
-        that reuses it, so a shared prefab updates everywhere at once.
+        """Enqueue a from-scratch regeneration of a GENERATED asset (in the
+        targeted `version`, else the latest) onto that version's regen worker. With
+        `propagate=true` (the client default) the worker rebuilds the prefab
+        CANONICAL behind `node_id` and re-derives every object that reuses it, so a
+        shared prefab updates everywhere within the version at once.
 
-        Requests ENQUEUE rather than 409 against each other: a single per-cell
+        Requests ENQUEUE rather than 409 against each other: a single per-version
         worker (`_regen_worker`) drains the queue concurrently — in parallel across
-        prefab groups, serialized within one — sharing one generated-events log and
-        resolving each item's prefab group at execution time (so a regen enqueued
-        later sees a reuse→canonical promotion an earlier one made). Still 409s
-        while a whole-scene generate is in flight (both write the same dirs). Queued
-        items show as `waiting` rows in the shared /trellis/queue panel until the
-        worker picks them up."""
+        prefab groups, serialized within one — sharing that version's generated-events
+        log and resolving each item's prefab group at execution time (so a regen
+        enqueued later sees a reuse→canonical promotion an earlier one made). Still
+        409s while a whole-scene generate of the SAME version is in flight (both write
+        the same dirs). Queued items show as `waiting` rows in the shared
+        /trellis/queue panel until the worker picks them up."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key = (run, slot_id, model_alias)
+        gen_version = _read_gen_version(run, slot_id, model_alias, version) or "1"
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         gen_task = _generate_tasks.get(key)
         if gen_task is not None and not gen_task.done():
             raise HTTPException(status_code=409, detail="generation already running")
@@ -724,7 +826,7 @@ def create_app() -> FastAPI:
                 status_code=404, detail=f"no bbox event found for node: {node_id}",
             )
 
-        gen_slot_id = _run_id(run, slot.id, model_alias) + "::generated"
+        gen_slot_id = _gen_slot_id(run, slot.id, model_alias, gen_version)
         queue = _regen_queues.setdefault(key, asyncio.Queue())
         queue.put_nowait((node_id, propagate))
         # Surface the queued regen in the shared Trellis queue panel until the
@@ -732,11 +834,14 @@ def create_app() -> FastAPI:
         threed.mark_queued(gen_slot_id, node_id)
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
-            _regen_tasks[key] = asyncio.create_task(_regen_worker(run, slot.id, model_alias))
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias, gen_version)
+            )
         return {
             "run": run,
             "slot_id": slot.id,
             "model": model_alias,
+            "version": gen_version,
             "node_id": node_id,
             "propagate": propagate,
             "queued": True,
@@ -755,21 +860,26 @@ def create_app() -> FastAPI:
         _require_model(model_alias)
         ver = versions.for_run(run)
         await _cancel_task(run, slot_id, model_alias)
-        # Tear down an in-flight from-scratch build too, so its meshes aren't
-        # being written into the dir we're about to wipe.
-        gen_task = _generate_tasks.pop((run, slot_id, model_alias), None)
-        if gen_task is not None and not gen_task.done():
-            gen_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await gen_task
-        # Tear down the cell's regeneration worker + drop its queue (same dirs).
+        # Tear down every in-flight from-scratch build for this cell (any version)
+        # too, so their meshes aren't being written into the dir we're about to
+        # wipe. Tasks are keyed per (cell, version); match on the cell prefix.
+        cell = (run, slot_id, model_alias)
+        for gkey in [k for k in _generate_tasks if k[:3] == cell]:
+            gen_task = _generate_tasks.pop(gkey, None)
+            if gen_task is not None and not gen_task.done():
+                gen_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await gen_task
+        # Tear down each version's regeneration worker + drop its queue (same dirs).
         # The worker's finally clears any still-queued rows from the queue panel.
-        regen_task = _regen_tasks.pop((run, slot_id, model_alias), None)
-        if regen_task is not None and not regen_task.done():
-            regen_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await regen_task
-        _regen_queues.pop((run, slot_id, model_alias), None)
+        for gkey in [k for k in _regen_tasks if k[:3] == cell]:
+            regen_task = _regen_tasks.pop(gkey, None)
+            if regen_task is not None and not regen_task.done():
+                regen_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await regen_task
+        for gkey in [k for k in _regen_queues if k[:3] == cell]:
+            _regen_queues.pop(gkey, None)
         # Cancel any standalone retries (registered on this version's
         # generation._pending but with no owning _run task to drive cleanup)
         # that the running task wouldn't have touched.
@@ -990,13 +1100,23 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
     orientation: Orientation = int(orientation_raw) if isinstance(orientation_raw, (int, float, str)) else 0  # type: ignore[assignment]
     raw_prompt = image_event.get("prompt") if image_event is not None else bbox_event.get("prompt")
     raw_str = str(raw_prompt) if raw_prompt is not None else ""
+    cut_plane: Literal["none", "xy", "xz"] = "none"
+    for event in events:
+        if event.get("id") == node_id and event.get("kind") == "symmetry.decision":
+            raw_cp = event.get("cut_plane")
+            if raw_cp in ("none", "xy", "xz"):
+                cut_plane = raw_cp  # type: ignore[assignment]
+            break
+    encapsulating = bbox_event.get("node_kind") == "frame"
     if raw_str.lstrip().startswith(_WRAPPED_PROMPT_PREFIX):
         image_prompt = raw_str
         subject_str = raw_str
     else:
         subject_str = raw_str
         p = prompt_runtime.current()
-        view: ImageView = "three-quarter" if bbox_event.get("node_kind") == "frame" else "front"
+        view = sym_svc.image_view_for(
+            cut_plane=cut_plane, encapsulating=bool(encapsulating),
+        )
         image_prompt = p.wrap_image_prompt(subject_str, proxy_shape, bbox.size, view=view)
     parent_id = bbox_event.get("parent_id")
     return Node(
@@ -1006,6 +1126,7 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
         proxy_shape=proxy_shape,
         orientation=orientation,
         image_prompt=image_prompt,
+        symmetry_cut_plane=cut_plane,
         parent_id=str(parent_id) if isinstance(parent_id, str) else None,
     )
 
@@ -1207,28 +1328,29 @@ async def _sse(
 _REGEN_POLL_INTERVAL_S = 0.25
 
 
-async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
-    """Drain a cell's regeneration queue CONCURRENTLY. One worker per cell owns a
-    single generated-events log for the whole drain; `SlotLog.log()` is synchronous,
-    so concurrent items append through it atomically (unique indices, no torn
-    lines). Items run in parallel ACROSS prefab groups but are serialized WITHIN a
-    group by a per-canonical lock — so two regens that resolve to the same canonical
-    (a stray double-enqueue, or a reuse plus its canonical) can't race the same
-    files, and the second re-resolves under the lock to see the first's promotion.
-    Spawns are unbounded; the heavy work is throttled by the process-global Banana
-    / Trellis / mesh-IO / optimize semaphores. Exits when the queue is empty and
-    nothing is in flight; the next enqueue restarts it. Cancellation (reset / stop
-    / teardown) cancels in-flight builds and clears any still-queued rows from the
-    shared Trellis queue panel."""
-    key = (run, slot_id, model_alias)
+async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) -> None:
+    """Drain one (cell, version)'s regeneration queue CONCURRENTLY. One worker per
+    version owns that version's generated-events log for the whole drain;
+    `SlotLog.log()` is synchronous, so concurrent items append through it atomically
+    (unique indices, no torn lines). Items run in parallel ACROSS prefab groups but
+    are serialized WITHIN a group by a per-canonical lock — so two regens that
+    resolve to the same canonical (a stray double-enqueue, or a reuse plus its
+    canonical) can't race the same files, and the second re-resolves under the lock
+    to see the first's promotion. Spawns are unbounded; the heavy work is throttled
+    by the process-global Banana / Trellis / mesh-IO / optimize semaphores. Exits
+    when the queue is empty and nothing is in flight; the next enqueue restarts it.
+    Cancellation (reset / stop / teardown) cancels in-flight builds and clears any
+    still-queued rows from the shared Trellis queue panel."""
+    key: GenKey = (run, slot_id, model_alias, version)
     queue = _regen_queues.get(key)
     if queue is None:
         return
-    lib_log = _slot_logs.get(key)
+    lib_log = _slot_logs.get((run, slot_id, model_alias))
     ver = versions.for_run(run)
     run_id = _run_id(run, slot_id, model_alias)
-    gen_slot_id = run_id + "::generated"
-    gen_log = SlotLog(gen_slot_id, _slot_dir(run, slot_id, model_alias) / "events.generated.jsonl")
+    gen_slot_id = _gen_slot_id(run, slot_id, model_alias, version)
+    raw_subdir = f"{generation.GENERATED_DIR}/{version}/{generation.GENERATED_RAW_SUBDIR}"
+    gen_log = SlotLog(gen_slot_id, generation.generated_events_path(RUNS_DIR, run_id, version))
     gen_log.hydrate_from_disk()
     rlog.bind(gen_log)
     llm.set_model(MODELS[model_alias])
@@ -1265,12 +1387,12 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     reuses = []
                 await generation.regenerate_one(
                     node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
-                    subdir="objects-generated", optimize=True,
+                    subdir=raw_subdir, optimize=True,
                 )
                 if propagate:
                     await generation.propagate_reuses(
                         canonical_id=canonical_id, reuses=reuses,
-                        runs_dir=RUNS_DIR, run_id=run_id,
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif canonical_id != node_id:
                     # A reuse regenerated on its own now owns a fresh mesh + raw —

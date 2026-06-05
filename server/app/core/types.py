@@ -233,6 +233,9 @@ class Node(BaseModel):
     referenced_ids: list[Relationship] = Field(default_factory=list)
     mesh_url: str | None = None
     image_prompt: str | None = None
+    # Set before Nano Banana from `symmetry.resolve_cut_plane`. Drives the
+    # reference-image view (3/4 when not `none`) and the post-Trellis mirror.
+    symmetry_cut_plane: Literal["none", "xy", "xz"] = "none"
     parent_id: str | None = None
     # How this node anchors to its parent: ON (rest), ATTACHED (flush
     # mount), or IN (containment). None only for the root, which has no
