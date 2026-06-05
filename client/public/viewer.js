@@ -23,7 +23,9 @@ const ASSET_MODE_STORAGE_KEY = "starshot.assetMode";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
+const logBodyEl = document.getElementById("log-body");
 const logToggleEl = document.getElementById("log-toggle");
+const logGenerateEl = document.getElementById("log-generate");
 const slotBarEl = document.getElementById("slot-bar");
 const slotBarToggleEl = document.getElementById("slot-bar-toggle");
 const controlsBarEl = document.getElementById("controls-bar");
@@ -59,16 +61,26 @@ const solidFillToggleEl = document.getElementById("solid-fill-toggle");
 const gridToggleEl = document.getElementById("grid-toggle");
 const assetModeToggleEl = document.getElementById("asset-mode-toggle");
 const generateGateEl = document.getElementById("generate-gate");
+const genVersionPickerEl = document.getElementById("gen-version-picker");
+const genVersionNewEl = document.getElementById("gen-version-new");
 // Asset source the cell renders: "library" (pre-built meshes matched from the
-// asset library, served from objects/ — the default) or "generated" (the
-// from-scratch Nano-Banana + Trellis build, served from objects-generated/).
-// A pure view switch: only the /meshes folder changes; the scene tree, log,
-// and event stream all stay on the library build. Declared up here so
-// slotMeshesUrl() can read it from its first call.
+// asset library, served from objects/ — the default) or "generated" (a
+// from-scratch Nano-Banana + Trellis build, served from one version's
+// generated/<version>/objects-generated-optimized/). A pure view switch: only
+// the /meshes folder changes; the scene tree, log, and event stream all stay on
+// the library build. Declared up here so slotMeshesUrl() can read it from its
+// first call.
 let assetMode = localStorage.getItem(ASSET_MODE_STORAGE_KEY) === "generated" ? "generated" : "library";
-let generating = false;          // a from-scratch build is in flight for the open cell
+// Which generated VERSION the cell is viewing in "generated" mode, and the full
+// set available. A cell holds any number of from-scratch versions (same layout,
+// independently generated assets), each in generated/<version>/. `genVersion` is
+// null until resolved (the gate poll adopts the latest); `genVersions` drives the
+// picker. Both reset on cell switch (clearScene); not persisted across cells.
+let genVersion = null;
+let genVersions = [];
+let generating = false;          // a from-scratch build is in flight for the selected version
 let _genWasRunning = false;      // last poll saw a build running (to detect completion)
-let _genCellKey = null;          // cell the gen-gate poll is tracking
+let _genCellKey = null;          // (cell, version) the gen-gate poll is tracking
 // id -> version token (the optimized GLB's mtime, from GET /generate) for each
 // attached generated mesh. Lets the gate poll spot a regenerated asset (same
 // id, new bytes) and reload just it with a cache-busted URL. Reset on cell
@@ -136,6 +148,7 @@ function showReplayGifResult(blob) {
 const assetsEl = document.getElementById("assets");
 const assetsBodyEl = document.getElementById("assets-body");
 const assetsCountEl = document.getElementById("assets-count");
+const assetsMissingEl = document.getElementById("assets-missing");
 const assetsHeaderEl = document.getElementById("assets-header");
 const assetsToggleEl = document.getElementById("assets-toggle");
 const trellisQueueEl = document.getElementById("trellis-queue");
@@ -203,7 +216,10 @@ function fmtValue(v) {
 // underlying events.jsonl still contains them for debugging.
 const HIDDEN_LOG_FIELDS = new Set(["reasoning", "thinking"]);
 
-function appendEvent(event) {
+// Build a single log line (<p>) for an event. Kept separate from insertion so
+// the on-demand "generate log" backfill can batch every buffered event into a
+// fragment instead of thrashing layout one append at a time.
+function buildLogLine(event) {
   const { kind, index, ...rest } = event;
   const fields = Object.fromEntries(
     Object.entries(rest).filter(([k]) => !HIDDEN_LOG_FIELDS.has(k)),
@@ -253,16 +269,42 @@ function appendEvent(event) {
       p.appendChild(kv);
     }
   }
+  return p;
+}
+
+// The log panel is gated: a <p> per event is too expensive to build for every
+// event on large runs, so events accumulate in `recordedEvents` (cheap) and are
+// only materialized into the DOM once the user clicks "generate log". Until
+// then appendEvent is a no-op; the tree, assets, and observability still update.
+let logEnabled = false;
+
+function appendEvent(event) {
+  if (!logEnabled) return;
   const atBottom =
-    logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 1;
-  logEl.appendChild(p);
-  if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+    logBodyEl.scrollHeight - logBodyEl.scrollTop - logBodyEl.clientHeight < 1;
+  logBodyEl.appendChild(buildLogLine(event));
+  if (atBottom) logBodyEl.scrollTop = logBodyEl.scrollHeight;
 }
 
 function clearLog() {
-  for (const child of Array.from(logEl.querySelectorAll(".line"))) {
+  for (const child of Array.from(logBodyEl.querySelectorAll(".line"))) {
     child.remove();
   }
+  logEnabled = false;
+  logGenerateEl.style.display = "";
+}
+
+// Materialize every buffered event into the log on demand, then keep appending
+// live. Batched through a fragment so even a multi-thousand-event run renders
+// in a single layout pass.
+function generateLog() {
+  if (logEnabled) return;
+  logEnabled = true;
+  logGenerateEl.style.display = "none";
+  const frag = document.createDocumentFragment();
+  for (const event of recordedEvents) frag.appendChild(buildLogLine(event));
+  logBodyEl.appendChild(frag);
+  logBodyEl.scrollTop = logBodyEl.scrollHeight;
 }
 
 // --- collapsible bars --------------------------------------------------------
@@ -284,6 +326,10 @@ controlsBarEl.querySelector(".ctrl-header").addEventListener("click", () =>
 document.getElementById("log-header").addEventListener("click", () =>
   toggleCollapse(logEl, logToggleEl),
 );
+logGenerateEl.addEventListener("click", (e) => {
+  e.stopPropagation(); // don't also toggle the header's collapse
+  generateLog();
+});
 
 // id -> error message for every mesh that errored during the current run.
 // Drives the per-node "error" phase in the tree and the aggregated count
@@ -404,15 +450,15 @@ function syncRetryButton(container, id, status, cls) {
 // the gate poll detects each changed mesh by its bumped version token and swaps
 // it in. `regeneratingIds` drives the detail button's disabled/label state.
 async function regenerateAsset(id) {
-  if (currentSlotId === null || currentModel === null) return;
+  if (currentSlotId === null || currentModel === null || genVersion == null) return;
   if (regeneratingIds.has(id)) return;
   regeneratingIds.add(id);
   if (id === selectedBboxId) renderTreeDetail();
-  setStatus(`regenerating ${id} + objects sharing its mesh — Nano-Banana + Trellis (this can take a while)…`);
+  setStatus(`regenerating ${id} + objects sharing its mesh in v${genVersion} — Nano-Banana + Trellis (this can take a while)…`);
   try {
     const res = await fetch(
       new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/regenerate/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&propagate=true`,
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/regenerate/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&version=${encodeURIComponent(genVersion)}&propagate=true`,
         SERVER_URL,
       ),
       { method: "POST" },
@@ -467,6 +513,7 @@ function upsertAsset(id, patch) {
   assets.set(id, { ...cur, ...patch });
   renderAsset(id);
   assetsCountEl.textContent = `(${assets.size})`;
+  updateMissingMeshCount();
   if (id === selectedBboxId) renderTreeDetail();
 }
 
@@ -530,6 +577,32 @@ function clearAssets() {
   assets.clear();
   assetsBodyEl.innerHTML = "";
   assetsCountEl.textContent = "(0)";
+}
+
+// True once the server has produced a mesh for this node. A recorded
+// `mesh.error` makes it false even if a stale modelUrl from a pre-error
+// attempt lingers. In library mode we trust the projection/`model` event's
+// modelUrl so opening a finished cell doesn't flash every mesh as missing
+// while the bundle is still streaming; in generated mode that url points at
+// the library mesh, not the viewed version's, so only an attached mesh counts.
+function nodeHasMesh(id) {
+  const a = assets.get(id);
+  if (a?.status === "error") return false;
+  if (modelsById.has(id)) return true;
+  return assetMode === "library" && !!a?.modelUrl;
+}
+
+// Count concrete nodes (objects + frames — zones are abstract and never carry
+// a mesh) whose mesh never landed, and surface it in the assets header so a
+// partial or interrupted build's gaps are visible at a glance.
+function updateMissingMeshCount() {
+  let missing = 0;
+  for (const node of treeNodes.values()) {
+    if (node.kind !== "object" && node.kind !== "frame") continue;
+    if (!nodeHasMesh(node.id)) missing += 1;
+  }
+  assetsMissingEl.textContent = `· ${missing} missing`;
+  assetsMissingEl.classList.toggle("has-missing", missing > 0);
 }
 
 assetsHeaderEl.addEventListener("click", () => {
@@ -868,6 +941,7 @@ function treeClear() {
   destroyDetailPreview();
   treeDetailEl.innerHTML = "";
   treeEl.classList.remove("detail-open");
+  updateMissingMeshCount();
 }
 
 // True if `id` itself is hidden, or any ZONE ancestor is hidden. The
@@ -1112,6 +1186,7 @@ function renderTree() {
   } else {
     treeSearchCountEl.textContent = "";
   }
+  updateMissingMeshCount();
 }
 
 treeHeaderEl.addEventListener("click", () => {
@@ -1580,6 +1655,10 @@ function clearScene() {
   modelsById.clear();
   genMeshVersions.clear();
   regeneratingIds.clear();
+  // The next cell resolves its own generated versions; the gate poll re-adopts
+  // the latest and repopulates the picker.
+  genVersion = null;
+  genVersions = [];
   hoveredBboxId = null;
   selectedBboxId = null;
   updateOrientationIndicator();
@@ -2429,22 +2508,23 @@ function mountMiniViewer(container, modelUrl) {
 }
 
 // The image + mesh the detail preview renders, resolved for the active asset
-// mode. "generated" previews the from-scratch build — both served from
-// objects-generated-optimized/<id>.{png,glb} — gated on the mesh having
+// mode. "generated" previews the selected version's from-scratch build — both
+// served from generated/<version>/objects-generated-optimized/<id>.{png,glb} —
+// gated on the mesh having
 // attached for this cell, so the preview tracks what's on screen and never
 // points at a not-yet-built file. "library" reads the folded scene projection
 // / live events (the assets map), as before.
 function detailPreviewUrls(node) {
   if (assetMode === "generated") {
-    if (currentSlotId === null || currentModel === null || !modelsById.has(node.id)) {
+    if (currentSlotId === null || currentModel === null || genVersion == null || !modelsById.has(node.id)) {
       return { imageUrl: null, modelUrl: null };
     }
     // Carry the version token so a regenerate (which bumps it) changes the urls
     // → ensureDetailPreview rebuilds the image + mini-viewer with fresh bytes.
     const v = genMeshVersions.get(node.id);
     return {
-      imageUrl: generatedImageUrl(currentSlotId, currentModel, currentRun, node.id, v),
-      modelUrl: generatedArtifactUrl(currentSlotId, currentModel, currentRun, node.id, v),
+      imageUrl: generatedImageUrl(currentSlotId, currentModel, currentRun, genVersion, node.id, v),
+      modelUrl: generatedArtifactUrl(currentSlotId, currentModel, currentRun, genVersion, node.id, v),
     };
   }
   const a = assets.get(node.id);
@@ -2681,7 +2761,7 @@ function renderTreeDetail() {
   // from scratch (Nano-Banana + Trellis + optimize); the gate poll swaps the new
   // mesh in once it lands. Available for any non-zone node, including ones whose
   // generated asset failed or hasn't been built yet.
-  if (assetMode === "generated" && node.kind !== "zone") {
+  if (assetMode === "generated" && genVersion != null && node.kind !== "zone") {
     const regenerating = regeneratingIds.has(id);
     const wrap = document.createElement("div");
     wrap.className = "detail-section";
@@ -4247,12 +4327,17 @@ function slotEventsUrl(slotId, model, run = currentRun) {
 
 function slotMeshesUrl(slotId, model, run = currentRun) {
   // `mode` is the asset toggle — the only request it touches. "library" streams
-  // objects/; "generated" streams objects-generated/. Everything else (scene,
-  // events, history) stays pinned to the library build.
-  return new URL(
+  // objects/; "generated" streams generated/<version>/objects-generated-optimized
+  // (the selected version, or the server's latest when `version` is omitted).
+  // Everything else (scene, events, history) stays pinned to the library build.
+  const u = new URL(
     `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}&mode=${encodeURIComponent(assetMode)}`,
     SERVER_URL,
-  ).toString();
+  );
+  if (assetMode === "generated" && genVersion != null) {
+    u.searchParams.set("version", genVersion);
+  }
+  return u.toString();
 }
 
 function slotSceneUrl(slotId, model, run = currentRun) {
@@ -4464,6 +4549,9 @@ async function loadCellScene(slotId, model, { forceLive = false } = {}) {
   applySceneProjection(payload.nodes ?? []);
   highestEventIndex = typeof payload.last_index === "number" ? payload.last_index : -1;
   prefetchMeshBundle(slotId, model, sceneGen);
+  // In generated mode, resolve this cell's versions + selected version now so the
+  // picker populates immediately instead of after the next poll tick.
+  if (assetMode === "generated") refreshGenerateGate();
 
   if (forceLive || currentRunInfo()?.status === "running") {
     // Active run (or just reset/resumed): tail only the events past the
@@ -5130,26 +5218,66 @@ setInterval(refreshVersions, 2000);
 // A pure client-side view switch over the SAME scene. The tree, bboxes, log,
 // and event stream always come from the library build (events.jsonl); flipping
 // the toggle only re-points the one-connection mesh bundle at the other folder
-// (objects/ ▸ objects-generated/). The generated build is produced on demand by
-// the gate button, which runs Nano-Banana + Trellis into objects-generated/
+// (objects/ ▸ generated/<version>/objects-generated-optimized/). Each generated
+// version is an independent from-scratch take on the same layout; a version is
+// produced on demand by the gate button ("⚡ generate" resumes the selected
+// version, "+ new version" forks a fresh one), which runs Nano-Banana + Trellis
 // reusing the library layout — same bboxes, freshly generated meshes.
 
-function slotGenerateUrl(slotId, model, run = currentRun) {
-  return new URL(
+function slotGenerateUrl(slotId, model, run = currentRun, version = genVersion) {
+  // Shared by the GET poll and the POST resume — both target one version
+  // (omitted ⇒ the server's latest, used before a version is resolved).
+  const u = new URL(
     `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generate?run=${encodeURIComponent(run)}`,
     SERVER_URL,
-  ).toString();
+  );
+  if (version != null) u.searchParams.set("version", version);
+  return u.toString();
 }
 
 function updateGenerateGate() {
-  if (!generateGateEl) return;
-  if (assetMode !== "generated") {
-    generateGateEl.style.display = "none";
-    return;
+  const cellReady = currentSlotId !== null && currentModel !== null;
+  const show = assetMode === "generated";
+  if (generateGateEl) {
+    generateGateEl.style.display = show ? "" : "none";
+    generateGateEl.disabled = generating || !cellReady;
+    // No version yet → the first press creates version 1; otherwise it resumes
+    // the selected version.
+    generateGateEl.textContent = generating
+      ? "generating…"
+      : genVersion == null
+        ? "⚡ generate"
+        : `⚡ generate v${genVersion}`;
   }
-  generateGateEl.style.display = "";
-  generateGateEl.disabled = generating || currentSlotId === null || currentModel === null;
-  generateGateEl.textContent = generating ? "generating…" : "⚡ generate";
+  if (genVersionNewEl) {
+    // A new version is its own isolated build, so it stays available even while
+    // the currently-viewed version is mid-build (the server runs versions
+    // concurrently); only the ⚡ resume button is gated on `generating`.
+    genVersionNewEl.style.display = show ? "" : "none";
+    genVersionNewEl.disabled = !cellReady;
+  }
+  if (genVersionPickerEl) {
+    // Only meaningful once at least one version exists; hidden in library mode.
+    genVersionPickerEl.style.display = show && genVersions.length > 0 ? "" : "none";
+    genVersionPickerEl.disabled = !cellReady;
+  }
+}
+
+// Repopulate the version dropdown from `genVersions`, keeping `genVersion`
+// selected. Cheap enough to call on every gate poll; rebuilds only on change.
+function renderGenVersionPicker() {
+  if (!genVersionPickerEl) return;
+  const want = genVersions.map((v) => `v${v}`).join("|") + `@${genVersion ?? ""}`;
+  if (genVersionPickerEl.dataset.sig === want) return;
+  genVersionPickerEl.dataset.sig = want;
+  genVersionPickerEl.innerHTML = "";
+  for (const v of genVersions) {
+    const opt = document.createElement("option");
+    opt.value = v;
+    opt.textContent = `v${v}`;
+    if (v === genVersion) opt.selected = true;
+    genVersionPickerEl.appendChild(opt);
+  }
 }
 
 function applyAssetModeUI() {
@@ -5157,6 +5285,7 @@ function applyAssetModeUI() {
     assetModeToggleEl.textContent = `assets: ${assetMode}`;
     assetModeToggleEl.classList.toggle("generated", assetMode === "generated");
   }
+  renderGenVersionPicker();
   updateGenerateGate();
 }
 
@@ -5174,29 +5303,30 @@ function reloadMeshesForAssetMode() {
   // gate poll re-establishes them against the freshly streamed meshes.
   genMeshVersions.clear();
   resetModelQueue();
+  updateMissingMeshCount();
   prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
 }
 
-function generatedArtifactUrl(slotId, model, run, id, v) {
-  // Served from the optimized twin (decimated + KTX2 + Meshopt) — same as the
-  // /meshes?mode=generated bundle. `v` (the GLB's mtime) busts the loader +
-  // browser cache so a regenerated asset re-fetches instead of serving stale
-  // bytes keyed on the bare URL.
+function generatedArtifactUrl(slotId, model, run, version, id, v) {
+  // Served from the selected version's optimized twin (decimated + KTX2 +
+  // Meshopt) — same as the /meshes?mode=generated bundle. `v` (the GLB's mtime)
+  // busts the loader + browser cache so a regenerated asset re-fetches instead
+  // of serving stale bytes keyed on the bare URL.
   const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
   return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated-optimized/${encodeURIComponent(id)}.glb${bust}`,
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generated/${encodeURIComponent(version)}/objects-generated-optimized/${encodeURIComponent(id)}.glb${bust}`,
     SERVER_URL,
   ).toString();
 }
 
-// The generated build's preview image: the Nano-Banana render copied beside
-// each optimized mesh (objects-generated-optimized/<id>.png by _optimize_asset),
-// so the detail preview's image matches the mesh shown in "generated" mode.
-// `v` busts the cache on regenerate, same as the GLB.
-function generatedImageUrl(slotId, model, run, id, v) {
+// The generated build's preview image: the Nano-Banana render copied beside each
+// optimized mesh (generated/<version>/objects-generated-optimized/<id>.png by
+// _optimize_asset), so the detail preview's image matches the mesh shown in
+// "generated" mode. `v` busts the cache on regenerate, same as the GLB.
+function generatedImageUrl(slotId, model, run, version, id, v) {
   const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
   return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/objects-generated-optimized/${encodeURIComponent(id)}.png${bust}`,
+    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generated/${encodeURIComponent(version)}/objects-generated-optimized/${encodeURIComponent(id)}.png${bust}`,
     SERVER_URL,
   ).toString();
 }
@@ -5242,7 +5372,7 @@ async function loadGeneratedMesh(id, url, gen) {
 //   * attached, version changed → a regenerate landed; reload in place with a
 //     cache-busted URL (loadGeneratedMesh disposes the old mesh and swaps the
 //     new one in), then clear the regenerating flag + refresh the open detail.
-function syncGeneratedMeshes(meshes, slotId, model, run) {
+function syncGeneratedMeshes(meshes, slotId, model, run, version) {
   for (const { id, v } of meshes) {
     if (_genLoading.has(id)) continue;
     const attached = modelsById.has(id);
@@ -5256,7 +5386,7 @@ function syncGeneratedMeshes(meshes, slotId, model, run) {
     genMeshVersions.set(id, v);
     _genLoading.add(id);
     const gen = sceneGen;
-    loadGeneratedMesh(id, generatedArtifactUrl(slotId, model, run, id, v), gen)
+    loadGeneratedMesh(id, generatedArtifactUrl(slotId, model, run, version, id, v), gen)
       .finally(() => {
         _genLoading.delete(id);
         const wasRegenerating = regeneratingIds.delete(id);
@@ -5270,10 +5400,12 @@ function syncGeneratedMeshes(meshes, slotId, model, run) {
 // so a build can't be triggered on top of itself.
 async function startGenerate() {
   if (generating || currentSlotId === null || currentModel === null) return;
+  const slotId = currentSlotId, model = currentModel, run = currentRun;
+  let body;
   try {
-    const res = await fetch(slotGenerateUrl(currentSlotId, currentModel), { method: "POST" });
+    const res = await fetch(slotGenerateUrl(slotId, model, run, genVersion), { method: "POST" });
+    body = await res.json().catch(() => ({}));
     if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
       setStatus(`generate failed: ${body.detail ?? `HTTP ${res.status}`}`, "err");
       return;
     }
@@ -5281,10 +5413,57 @@ async function startGenerate() {
     setStatus(`generate failed: ${e.message}`, "err");
     return;
   }
+  // Adopt the version the server resolved (creates v1 when the cell had none),
+  // switching the view to it if it differs from what we were showing.
+  if (body.version != null && body.version !== genVersion) {
+    selectGenVersion(body.version);
+  }
   generating = true;
   _genWasRunning = true;
   updateGenerateGate();
-  setStatus("generating assets — Nano-Banana + Trellis (this can take a while)…");
+  setStatus(`generating v${genVersion ?? body.version} assets — Nano-Banana + Trellis (this can take a while)…`);
+}
+
+// Switch the viewed generated version: stream that version's finished meshes now;
+// the gate poll tops up the rest and records per-mesh version tokens.
+function selectGenVersion(v) {
+  if (v == null) return;
+  const next = String(v);
+  if (next === genVersion) return;
+  genVersion = next;
+  if (!genVersions.includes(next)) {
+    genVersions = [...genVersions, next].sort((a, b) => Number(a) - Number(b));
+  }
+  applyAssetModeUI();
+  reloadMeshesForAssetMode();
+  if (selectedBboxId !== null) renderTreeDetail();
+}
+
+// Create a fresh from-scratch version of this scene (its own generated/<v>/
+// folder) and start building into it. The new (empty) version is selected
+// immediately; assets pop in as the build produces them.
+async function newGenVersion() {
+  if (currentSlotId === null || currentModel === null) return;
+  const slotId = currentSlotId, model = currentModel, run = currentRun;
+  let body;
+  try {
+    const u = new URL(slotGenerateUrl(slotId, model, run, null));
+    u.searchParams.set("new", "true");
+    const res = await fetch(u.toString(), { method: "POST" });
+    body = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      setStatus(`new version failed: ${body.detail ?? `HTTP ${res.status}`}`, "err");
+      return;
+    }
+  } catch (e) {
+    setStatus(`new version failed: ${e.message}`, "err");
+    return;
+  }
+  if (body.version != null) selectGenVersion(body.version);
+  generating = true;
+  _genWasRunning = true;
+  updateGenerateGate();
+  setStatus(`generating new version v${body.version} — Nano-Banana + Trellis (this can take a while)…`);
 }
 
 // Poll the open cell's build state while the generated view is active: keep the
@@ -5293,46 +5472,62 @@ async function startGenerate() {
 async function refreshGenerateGate() {
   const cellKey =
     currentSlotId !== null && currentModel !== null
-      ? `${currentRun}/${currentSlotId}/${currentModel}`
+      ? `${currentRun}/${currentSlotId}/${currentModel}/${genVersion ?? ""}`
       : null;
   if (cellKey !== _genCellKey) {
     _genCellKey = cellKey;
     _genWasRunning = false;
   }
-  if (assetMode !== "generated" || cellKey === null) {
+  if (assetMode !== "generated" || currentSlotId === null || currentModel === null) {
     _genWasRunning = false;
     return;
   }
   const slotId = currentSlotId;
   const model = currentModel;
   const run = currentRun;
+  const reqVersion = genVersion;   // version this poll asked about (may be null)
   let status;
   try {
-    const res = await fetch(slotGenerateUrl(slotId, model, run), { cache: "no-store" });
+    const res = await fetch(slotGenerateUrl(slotId, model, run, reqVersion), { cache: "no-store" });
     if (!res.ok) return;
     status = await res.json();
   } catch {
     return;
   }
-  // Bail if the user switched cell/mode while the poll was in flight.
+  // Bail if the user switched cell/mode or picked a different version while the
+  // poll was in flight — a later poll handles the new selection.
   if (
     assetMode !== "generated" ||
     currentSlotId !== slotId ||
     currentModel !== model ||
-    currentRun !== run
+    currentRun !== run ||
+    genVersion !== reqVersion
   ) {
     return;
   }
+  // Refresh the available versions + picker.
+  const nextVersions = status.versions ?? [];
+  const versionsChanged = nextVersions.join("|") !== genVersions.join("|");
+  genVersions = nextVersions;
+  // Adopt the server's resolved version when we hadn't picked one yet. The cell
+  // load already streamed the latest (version omitted), which equals this, so no
+  // reload — syncGeneratedMeshes below just records the per-mesh version tokens.
+  if (genVersion == null && status.version != null) {
+    genVersion = status.version;
+  }
+  if (versionsChanged || genVersionPickerEl?.value !== genVersion) renderGenVersionPicker();
   generating = !!status.running;
   updateGenerateGate();
-  // Reconcile attached meshes with the build's set: new ones pop in as the build
-  // produces them, and a regenerated asset (same id, bumped version) reloads in
-  // place. A node caught mid-write just isn't added this tick and is retried on
-  // the next one (loadGeneratedMesh doesn't cache the failure).
-  const meshes = status.meshes ?? (status.ids ?? []).map((id) => ({ id, v: null }));
-  syncGeneratedMeshes(meshes, slotId, model, run);
+  // Reconcile attached meshes with the build's set for the version we're viewing:
+  // new ones pop in as the build produces them, and a regenerated asset (same id,
+  // bumped version) reloads in place. A node caught mid-write just isn't added
+  // this tick and is retried next (loadGeneratedMesh doesn't cache the failure).
+  if (status.version === genVersion && genVersion != null) {
+    const meshes = status.meshes ?? (status.ids ?? []).map((id) => ({ id, v: null }));
+    syncGeneratedMeshes(meshes, slotId, model, run, genVersion);
+  }
   if (_genWasRunning && !status.running) {
-    setStatus(`generated ${status.count} asset(s) — showing objects-generated/`);
+    setStatus(`generated ${status.count} asset(s) — showing v${genVersion}`);
     // Build idle: anything still flagged regenerating either landed (cleared in
     // syncGeneratedMeshes) or failed without changing — drop the stragglers so
     // the detail button doesn't stick on "regenerating…".
@@ -5354,7 +5549,14 @@ assetModeToggleEl?.addEventListener("click", () => {
   // Re-resolve the open detail preview for the new mode (its urls read
   // assetMode); the generated mesh repaints once the bundle re-streams it.
   if (selectedBboxId !== null) renderTreeDetail();
+  // Populate the version picker + resolve the selected version now rather than
+  // waiting up to a full poll tick.
+  if (assetMode === "generated") refreshGenerateGate();
 });
+genVersionPickerEl?.addEventListener("change", () => {
+  selectGenVersion(genVersionPickerEl.value);
+});
+genVersionNewEl?.addEventListener("click", newGenVersion);
 generateGateEl?.addEventListener("click", startGenerate);
 applyAssetModeUI();
 setInterval(refreshGenerateGate, 2000);

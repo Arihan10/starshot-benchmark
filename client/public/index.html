@@ -486,9 +486,11 @@
                 opacity: 0.5;
                 cursor: default;
             }
-            /* assets mode toggle (library ▸ generated) + the generate gate */
+            /* assets mode toggle (library ▸ generated) + the generate gate +
+               the new-version button */
             #asset-mode-toggle,
-            #generate-gate {
+            #generate-gate,
+            #gen-version-new {
                 padding: 5px 10px;
                 border-radius: 4px;
                 border: 1px solid #2a2d35;
@@ -514,17 +516,45 @@
                 border-color: #c586d1;
                 color: #f0d8ff;
             }
-            #generate-gate {
+            /* generate gate + new-version button + version dropdown all wear the
+               generated-path purple so the generated-asset cluster reads as one. */
+            #generate-gate,
+            #gen-version-new {
                 background: #241a2c;
                 border-color: #6a4a7a;
                 color: #d8b8f0;
             }
-            #generate-gate:hover:not(:disabled) {
+            #generate-gate:hover:not(:disabled),
+            #gen-version-new:hover:not(:disabled) {
                 background: #3a2747;
                 border-color: #c586d1;
                 color: #f0d8ff;
             }
-            #generate-gate:disabled {
+            #generate-gate:disabled,
+            #gen-version-new:disabled {
+                opacity: 0.5;
+                cursor: default;
+            }
+            /* version dropdown: same structure as the run/model selects, in the
+               generated purple. */
+            #gen-version-picker {
+                margin-left: 4px;
+                padding: 4px 8px;
+                border-radius: 4px;
+                border: 1px solid #6a4a7a;
+                background: #241a2c;
+                color: #d8b8f0;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+            }
+            #gen-version-picker:hover,
+            #gen-version-picker:focus {
+                outline: none;
+                border-color: #c586d1;
+                color: #f0d8ff;
+            }
+            #gen-version-picker:disabled {
                 opacity: 0.5;
                 cursor: default;
             }
@@ -759,7 +789,9 @@
                 left: 12px;
                 right: 12px;
                 max-height: 28vh;
-                overflow: auto;
+                display: flex;
+                flex-direction: column;
+                overflow: hidden;
                 padding: 8px 12px;
                 border-radius: 6px;
                 background: rgba(22, 24, 29, 0.78);
@@ -767,6 +799,10 @@
                 font-size: 11px;
                 line-height: 1.45;
                 pointer-events: auto;
+            }
+            #log-body {
+                overflow: auto;
+                min-height: 0;
             }
             #log .line {
                 margin: 0;
@@ -821,7 +857,27 @@
                 cursor: pointer;
                 user-select: none;
             }
-            #log.collapsed .line {
+            .log-header-left {
+                display: inline-flex;
+                align-items: center;
+                gap: 8px;
+            }
+            #log-generate {
+                padding: 1px 8px;
+                border-radius: 3px;
+                border: 1px solid #2a4a78;
+                background: #16181d;
+                color: #9ad4ff;
+                font: inherit;
+                font-size: 10px;
+                cursor: pointer;
+            }
+            #log-generate:hover {
+                background: #1c2a36;
+                border-color: #4a8fd8;
+                color: #c8d8f0;
+            }
+            #log.collapsed #log-body {
                 display: none;
             }
             #log.collapsed {
@@ -1432,6 +1488,14 @@
             #assets-count {
                 color: #8a8f99;
                 font-weight: normal;
+            }
+            #assets-missing {
+                margin-left: 6px;
+                font-weight: normal;
+                color: #5a8a55;
+            }
+            #assets-missing.has-missing {
+                color: #e0a050;
             }
             #assets-body {
                 overflow-y: auto;
@@ -2602,15 +2666,28 @@
                     <button
                         id="asset-mode-toggle"
                         type="button"
-                        title="Switch which asset source this cell renders: 'library' shows the meshes matched from the pre-built asset library (objects/, the default); 'generated' shows the from-scratch Nano-Banana + Trellis build (objects-generated/). Only the meshes swap — same scene layout."
+                        title="Switch which asset source this cell renders: 'library' shows the meshes matched from the pre-built asset library (objects/, the default); 'generated' shows a from-scratch Nano-Banana + Trellis build (generated/<version>/). Only the meshes swap — same scene layout."
                     >
                         assets: library
+                    </button>
+                    <select
+                        id="gen-version-picker"
+                        style="display: none"
+                        title="Which generated version of this scene to view. Each version is an independent from-scratch take on the same layout (same bboxes/log), with its own assets."
+                    ></select>
+                    <button
+                        id="gen-version-new"
+                        type="button"
+                        style="display: none"
+                        title="Create a new generated version: a fresh from-scratch Nano-Banana + Trellis take on the same scene layout, stored in its own generated/<version>/ folder. Existing versions are untouched."
+                    >
+                        + new version
                     </button>
                     <button
                         id="generate-gate"
                         type="button"
                         style="display: none"
-                        title="Start from-scratch asset generation (Nano-Banana + Trellis) into objects-generated/, reusing the library build's layout — same bounding boxes, freshly generated meshes. Disabled until the current build finishes."
+                        title="Generate (or resume) the selected version's from-scratch assets (Nano-Banana + Trellis) into generated/<version>/, reusing the library build's layout — same bounding boxes, freshly generated meshes. Disabled until the current build finishes."
                     >
                         ⚡ generate
                     </button>
@@ -2669,7 +2746,14 @@
         </div>
         <div id="assets">
             <div id="assets-header">
-                <span>assets <span id="assets-count">(0)</span></span>
+                <span
+                    >assets <span id="assets-count">(0)</span
+                    ><span
+                        id="assets-missing"
+                        title="Objects and frames whose mesh never landed — errored out, interrupted by a server stop, or not yet generated"
+                        >· 0 missing</span
+                    ></span
+                >
                 <span id="assets-toggle">▾</span>
             </div>
             <div id="assets-body"></div>
@@ -2705,9 +2789,19 @@
         </div>
         <div id="log">
             <div id="log-header">
-                <span>log</span>
+                <span class="log-header-left">
+                    <span>log</span>
+                    <button
+                        id="log-generate"
+                        type="button"
+                        title="Render the event log for this run. Skipped by default because building a DOM node per event is expensive on large runs."
+                    >
+                        generate log
+                    </button>
+                </span>
                 <span id="log-toggle">▾</span>
             </div>
+            <div id="log-body"></div>
         </div>
         <div id="zoom-controls">
             <button id="zoom-in" type="button" title="Zoom in (R)">+</button>
