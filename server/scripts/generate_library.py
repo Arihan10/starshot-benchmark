@@ -54,7 +54,7 @@ _THREE_QUARTER_CATEGORIES = {
     "SPECIAL BLOCKS",
     "PIPES & PORTALS",
 }
-from app.services import llm, nano_banana, threed  # noqa: E402
+from app.services import llm, mesh_jobs, nano_banana, threed  # noqa: E402
 from app.utils import logging as rlog  # noqa: E402
 from app.utils.logging import SlotLog  # noqa: E402
 
@@ -206,8 +206,10 @@ async def main() -> None:
     style: str | None = args.style
 
     if args.trellis_concurrency is not None:
-        threed.GENERATE_CONCURRENCY = args.trellis_concurrency
-        threed._inflight_sem = asyncio.Semaphore(args.trellis_concurrency)
+        # The in-flight cap + semaphore live in the shared core now (threed is a
+        # thin adapter), so override them there or the change is a no-op.
+        mesh_jobs.GENERATE_CONCURRENCY = args.trellis_concurrency
+        mesh_jobs._inflight_sem = asyncio.Semaphore(args.trellis_concurrency)
     if args.concurrent != MAX_CONCURRENT:
         _semaphore = asyncio.Semaphore(args.concurrent)
 
