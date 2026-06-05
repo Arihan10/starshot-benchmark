@@ -10,11 +10,12 @@ A *version* bundles a prompt module with a divider/generation code path.
     (the root included).
   * v3-decomp-first     - the live `prompts.py` on the current
     `divider`/`generation`, framing the ROOT AFTER its own decomposition
-    but every other zone BEFORE — today's default behavior. Also places
-    subregions and anchor objects ONE AT A TIME (sequential placement).
+    but every other zone BEFORE — today's default behavior. Its
+    anchor-completion (next_object) step proposes a LIST of objects per
+    round.
   * v4-decomp-first-all - identical to v3 (same live `prompts.py`, same
-    `divider`/`generation`, same sequential placement), except it frames
-    EVERY zone AFTER its own decomposition, not just the root.
+    `divider`/`generation`, same list-based anchor completion), except it
+    frames EVERY zone AFTER its own decomposition, not just the root.
 
 v3 and v4 bind the SAME live `prompts.py`, so their prompt wording is
 identical; v2 binds the pinned `prompts_v2` snapshot (which `prompts.py` was
@@ -25,14 +26,13 @@ relative to its own decomposition:
   * v3 = "after_root" (root framed after; every other zone before)
   * v4 = "after"      (every zone framed after it is decomposed)
 
-A second axis, `sequential_placement`, separates the two prompts.py versions
-from the snapshot baseline: v3/v4 resolve subregion and anchor-object bounding
-boxes ONE AT A TIME (each placement sees its already-positioned siblings and
-the still-unplaced ones), while v2 resolves each sibling set in a single batch
-call. Encapsulating shells and negative-space fill stay batch in every version.
-v1 swaps the whole reasoning/prompt structure. All share the mesh backend,
-event schema, `types`, and geometry, so the comparison measures pipeline
-structure rather than infra.
+A second axis, `batch_next_object`, separates the two prompts.py versions from
+the snapshot baseline: in the anchor-completion (next_object) loop, v3/v4 let
+the model propose a LIST of objects per round, while v2 proposes one object at a
+time. Bounding-box resolution is a single batch call per sibling set in every
+version. v1 swaps the whole reasoning/prompt structure. All share the mesh
+backend, event schema, `types`, and geometry, so the comparison measures
+pipeline structure rather than infra.
 
 Each version is modeled as a reserved *run* (`runs/<run_name>/...`), so the
 existing per-run isolation (prompt_runtime binding, per-cell asyncio tasks,
@@ -96,21 +96,21 @@ async def _run_v1(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> No
 async def _run_v2(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> Node:
     return await divider.run(
         run_id=run_id, prompt=prompt, model=model, runs_dir=runs_dir,
-        frame_order="before", sequential_placement=False,
+        frame_order="before", batch_next_object=False,
     )
 
 
 async def _run_v3(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> Node:
     return await divider.run(
         run_id=run_id, prompt=prompt, model=model, runs_dir=runs_dir,
-        frame_order="after_root", sequential_placement=True,
+        frame_order="after_root", batch_next_object=True,
     )
 
 
 async def _run_v4(*, run_id: str, prompt: str, model: str, runs_dir: Path) -> Node:
     return await divider.run(
         run_id=run_id, prompt=prompt, model=model, runs_dir=runs_dir,
-        frame_order="after", sequential_placement=True,
+        frame_order="after", batch_next_object=True,
     )
 
 

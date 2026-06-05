@@ -54,7 +54,7 @@ from app.core.types import BoundingBox, Node
 from app.pipeline import committed, generation
 from app.services import llm
 from app.utils import logging
-from app.utils.topology import placement_order, validate_parents, validate_referenced_ids
+from app.utils.topology import validate_parents, validate_referenced_ids
 
 
 async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
@@ -190,96 +190,12 @@ async def _resolve_child_bboxes_batch(
     return bboxes
 
 
-async def _resolve_child_bboxes_sequential(
-    *,
-    parent: Node,
-    children: list[Any],
-    all_nodes: list[Node],
-) -> dict[str, BoundingBox]:
-    """Place each sibling child zone of `parent` in its OWN LLM call, one at a
-    time (the V3/V4 placement strategy). Each placement sees the scene context
-    with every earlier-placed sibling already positioned, plus the
-    still-unplaced siblings as context so it can reserve room for them.
-
-    Children are visited in `placement_order` so an in-batch parent is placed
-    before any child that anchors to it. A child already committed (resume)
-    keeps its world bbox and is folded into the context without an LLM call.
-    Returns the same `{id: world-frame bbox}` contract as the batch resolver,
-    so `_build` is agnostic to which strategy ran."""
-    p = prompt_runtime.current()
-    bbox_by_id = {n.id: n.bbox for n in all_nodes}
-    context_nodes = list(all_nodes)
-    placed_world: dict[str, BoundingBox] = {}
-    bboxes: dict[str, BoundingBox] = {}
-    order = placement_order(children)
-    for idx, spec in enumerate(order):
-        pending = order[idx + 1:]
-        hit = committed.bbox(spec.id)
-        if hit is not None:
-            world_bbox = hit
-        else:
-            out = await llm.call_llm(
-                system=p.SYSTEM_ZONE_BBOX_SINGLE,
-                user=p.render_zone_bbox_single(
-                    parent_id=parent.id,
-                    parent_prompt=parent.prompt,
-                    parent_plan=parent.plan,
-                    parent_bbox=parent.bbox,
-                    target=spec,
-                    pending=pending,
-                    nodes=context_nodes,
-                ),
-                output_schema=p.BboxSingleOutput,
-                node_id=spec.id,
-                step="child_bbox_single",
-            )
-            # Convert from the target's parent local frame to world. The
-            # parent is either an already-placed sibling (placed_world), a
-            # pre-existing node (bbox_by_id), or the zone being decomposed.
-            if spec.parent in placed_world:
-                parent_bbox = placed_world[spec.parent]
-            elif spec.parent in bbox_by_id:
-                parent_bbox = bbox_by_id[spec.parent]
-            else:
-                parent_bbox = parent.bbox
-            world_bbox = out.bbox.to_world_frame(parent_bbox)
-            # Commit immediately (matches `_build`'s later emit, which then
-            # no-ops) so a crash mid-loop resumes from this frontier rather
-            # than re-placing every sibling.
-            logging.emit_bbox(
-                spec.id,
-                world_bbox,
-                parent_id=parent.id,
-                prompt=spec.prompt,
-                kind="zone",
-                proxy_shape=spec.proxy_shape,
-            )
-        bboxes[spec.id] = world_bbox
-        placed_world[spec.id] = world_bbox
-        context_nodes.append(
-            Node(
-                id=spec.id,
-                prompt=spec.prompt,
-                bbox=world_bbox,
-                proxy_shape=spec.proxy_shape,
-                placement=spec.placement,
-                referenced_ids=list(spec.referenced_ids),
-                parent_id=spec.parent,
-                parent_kind=spec.parent_kind,
-                plan=None,
-                is_zone=True,
-            )
-        )
-    return bboxes
-
-
 async def _encapsulate(
     zone: Node,
     *,
     runs_dir: Path,
     run_id: str,
     all_nodes: list[Node],
-    sequential_placement: bool,
 ) -> None:
     """Generate a zone's physical shell / ground (the encapsulating pass).
 
@@ -293,7 +209,6 @@ async def _encapsulate(
         run_id=run_id,
         scenario="encapsulating",
         all_nodes=all_nodes,
-        sequential_placement=sequential_placement,
     )
 
 
@@ -305,7 +220,7 @@ async def _build(
     all_nodes: list[Node],
     is_atomic: bool,
     frame_order: Literal["before", "after_root", "after"],
-    sequential_placement: bool,
+    batch_next_object: bool,
 ) -> None:
     assert node.plan is not None, "node.plan must be set by caller"
 
@@ -345,21 +260,12 @@ async def _build(
             )
 
         logging.emit_step(node.id, "resolving_bboxes", parent=node.id)
-        # V3/V4 place subregions one at a time, each in its own LLM call, so
-        # every placement sees its already-positioned siblings; V2 places the
-        # whole sibling set in a single batch call.
-        if sequential_placement:
-            bboxes = await _resolve_child_bboxes_sequential(
-                parent=node,
-                children=decomp.children,
-                all_nodes=all_nodes,
-            )
-        else:
-            bboxes = await _resolve_child_bboxes_batch(
-                parent=node,
-                children=decomp.children,
-                all_nodes=all_nodes,
-            )
+        # Resolve every child subregion's bbox in one batch LLM call.
+        bboxes = await _resolve_child_bboxes_batch(
+            parent=node,
+            children=decomp.children,
+            all_nodes=all_nodes,
+        )
 
         for spec in decomp.children:
             child_bbox = bboxes[spec.id]
@@ -393,7 +299,7 @@ async def _build(
     # framed before it was decomposed (the root in `run()`, every other zone
     # in its parent's per-child loop below).
     if frame_order == "after" or (node.parent_id is None and frame_order == "after_root"):
-        await _encapsulate(node, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes, sequential_placement=sequential_placement)
+        await _encapsulate(node, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes)
 
     if is_atomic:
         logging.emit_step(node.id, "generating_anchor")
@@ -403,7 +309,7 @@ async def _build(
             run_id=run_id,
             scenario="anchor",
             all_nodes=all_nodes,
-            sequential_placement=sequential_placement,
+            batch_next_object=batch_next_object,
         )
         logging.emit_step(node.id, "done")
         return
@@ -433,7 +339,7 @@ async def _build(
         # child is instead framed inside its own `_build`, after it has been
         # decomposed, so it is skipped here.
         if frame_order in ("before", "after_root"):
-            await _encapsulate(planned, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes, sequential_placement=sequential_placement)
+            await _encapsulate(planned, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes)
 
         await _build(
             node=planned,
@@ -442,7 +348,7 @@ async def _build(
             all_nodes=all_nodes,
             is_atomic=plan_out.is_atomic,
             frame_order=frame_order,
-            sequential_placement=sequential_placement,
+            batch_next_object=batch_next_object,
         )
 
     # V3/V4 push the root's negative-space pass down the hierarchy: every
@@ -460,7 +366,6 @@ async def _build(
             run_id=run_id,
             scenario="negative-space",
             all_nodes=all_nodes,
-            sequential_placement=sequential_placement,
         )
     logging.emit_step(node.id, "done")
 
@@ -472,7 +377,7 @@ async def run(
     model: str,
     runs_dir: Path,
     frame_order: Literal["before", "after_root", "after"] = "after_root",
-    sequential_placement: bool = False,
+    batch_next_object: bool = False,
 ) -> Node:
     llm.set_model(model)
     logging.emit_step("root", "planning")
@@ -504,7 +409,7 @@ async def run(
     # "after_root" (V3) and "after" (V4) the root is instead framed inside
     # `_build(root)` after the root's own decomposition.
     if frame_order == "before":
-        await _encapsulate(root, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes, sequential_placement=sequential_placement)
+        await _encapsulate(root, runs_dir=runs_dir, run_id=run_id, all_nodes=all_nodes)
     await _build(
         node=root,
         runs_dir=runs_dir,
@@ -512,7 +417,7 @@ async def run(
         all_nodes=all_nodes,
         is_atomic=plan_out.is_atomic,
         frame_order=frame_order,
-        sequential_placement=sequential_placement,
+        batch_next_object=batch_next_object,
     )
     logging.emit_step(root.id, "generating_negative_space")
     await generation.run(
@@ -521,7 +426,6 @@ async def run(
         run_id=run_id,
         scenario="negative-space",
         all_nodes=all_nodes,
-        sequential_placement=sequential_placement,
     )
     logging.emit_step(root.id, "done")
     return root

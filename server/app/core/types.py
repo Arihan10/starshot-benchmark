@@ -238,6 +238,15 @@ class Node(BaseModel):
     # mount), or IN (containment). None only for the root, which has no
     # parent.
     parent_kind: ParentRelationshipKind | None = None
+    # The region that owns this node for scene-context grouping: the zone whose
+    # generation pass emitted this object. Unlike `parent_id` (the structural
+    # anchor — what the node rests on / attaches to, which may sit in another
+    # region), this always names the region the object belongs to, so context
+    # renderers can group it under its zone instead of walking `parent_id` up to
+    # whatever it structurally rests on. Set on concrete objects/frames by V3/V4
+    # generation; None for zones (grouped by `parent_id`) and the root. V1/V2
+    # ignore it.
+    parent_region: str | None = None
     plan: str | None = None
     # True for subzone/region nodes, set at divider decomposition time; False
     # for concrete objects/frames. A zone is flagged the moment it is placed —

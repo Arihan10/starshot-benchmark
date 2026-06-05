@@ -90,6 +90,7 @@ async def match(prompt: str) -> LibraryMatchOutput:
             system=SYSTEM_LIBRARY_MATCH,
             user=user,
             output_schema=LibraryMatchOutput,
+            step="library_match",
         )
     finally:
         llm._current_model.reset(token)

@@ -116,39 +116,3 @@ def validate_referenced_ids(
                     f"spec {s.id!r} has a relationship with unknown "
                     f"target {rel.target!r}"
                 )
-
-
-def placement_order(specs: list[ChildNodeSpec]) -> list[ChildNodeSpec]:
-    """Order `specs` so any whose structural `parent` is another spec in the
-    same batch is placed AFTER that parent.
-
-    Sequential (one-at-a-time) placement resolves each spec's bbox in its
-    parent's local frame, then converts to world coordinates using the
-    parent's already-resolved world bbox. That conversion only works if an
-    in-batch parent (e.g. a table a lamp rests ON) is placed first. Specs
-    whose parent is external to the batch (the zone itself, or a node placed
-    in an earlier pass) keep their declaration order; an unbreakable cycle —
-    which `validate_parents` rejects upstream — falls back to declaration
-    order for whatever remains.
-    """
-    in_batch = {s.id for s in specs}
-    placed: set[str] = set()
-    order: list[ChildNodeSpec] = []
-    remaining = list(specs)
-    while remaining:
-        progress = False
-        deferred: list[ChildNodeSpec] = []
-        for s in remaining:
-            # Defer only when the parent is a sibling in this batch that has
-            # not been emitted yet; external parents resolve immediately.
-            if s.parent in in_batch and s.parent not in placed:
-                deferred.append(s)
-            else:
-                order.append(s)
-                placed.add(s.id)
-                progress = True
-        remaining = deferred
-        if not progress:
-            order.extend(remaining)
-            break
-    return order

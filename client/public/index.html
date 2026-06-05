@@ -628,9 +628,129 @@
                 background: #2a2d35;
                 color: #5a5e68;
             }
-            #status {
+            /* Per-run LLM spend tracker — collapsible pill in the top-right
+               run-status column. The pill sits at top:12; #status is nudged
+               down to 52 so the two stack without overlap. */
+            #cost-tracker {
                 position: fixed;
                 top: 12px;
+                right: 344px;
+                width: 320px;
+                max-width: calc(100vw - 356px);
+                box-sizing: border-box;
+                z-index: 8;
+                font-size: 11px;
+                line-height: 1.4;
+            }
+            #cost-pill {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                width: 100%;
+                padding: 6px 10px;
+                border: 1px solid rgba(255, 255, 255, 0.06);
+                border-radius: 6px;
+                background: rgba(22, 24, 29, 0.82);
+                backdrop-filter: blur(6px);
+                color: #e6e6e6;
+                font: inherit;
+                cursor: pointer;
+                box-sizing: border-box;
+                text-align: left;
+            }
+            #cost-pill:hover { background: rgba(34, 37, 44, 0.92); }
+            #cost-pill .cost-caret { color: #7a8190; width: 9px; }
+            #cost-tracker.collapsed #cost-pill .cost-caret::before { content: "\25B8"; }
+            #cost-tracker:not(.collapsed) #cost-pill .cost-caret::before { content: "\25BE"; }
+            #cost-pill .cost-pill-label {
+                color: #7a8190;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+                font-size: 10px;
+            }
+            #cost-pill .cost-pill-summary {
+                margin-left: auto;
+                color: #9ad4ff;
+                font-variant-numeric: tabular-nums;
+            }
+            #cost-dropdown {
+                margin-top: 6px;
+                padding: 8px 10px;
+                border-radius: 6px;
+                background: rgba(22, 24, 29, 0.94);
+                backdrop-filter: blur(6px);
+                max-height: 62vh;
+                overflow: auto;
+                box-sizing: border-box;
+            }
+            #cost-tracker.collapsed #cost-dropdown { display: none; }
+            .cost-section { margin-bottom: 8px; }
+            .cost-section:last-child { margin-bottom: 0; }
+            .cost-section-head {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+                color: #cdd3dd;
+                margin-bottom: 3px;
+            }
+            .cost-section-head .cost-sec-name { font-weight: 600; }
+            .cost-section-head .cost-sec-model {
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.03em;
+            }
+            .cost-section-head .cost-sec-sum {
+                margin-left: auto;
+                color: #9ad4ff;
+                font-variant-numeric: tabular-nums;
+            }
+            .cost-row {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+                padding: 1px 0 1px 10px;
+            }
+            .cost-row .cost-step { color: #9aa3b2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .cost-row .cost-count {
+                margin-left: auto;
+                color: #7a8190;
+                font-variant-numeric: tabular-nums;
+                min-width: 30px;
+                text-align: right;
+            }
+            .cost-row .cost-amt {
+                color: #cdd3dd;
+                font-variant-numeric: tabular-nums;
+                min-width: 66px;
+                text-align: right;
+            }
+            .cost-divider { height: 1px; background: rgba(255, 255, 255, 0.08); margin: 6px 0; }
+            .cost-total {
+                display: flex;
+                align-items: baseline;
+                gap: 6px;
+                color: #e6e6e6;
+                font-weight: 600;
+            }
+            .cost-total .cost-count {
+                margin-left: auto;
+                color: #b8c0cc;
+                font-variant-numeric: tabular-nums;
+                min-width: 30px;
+                text-align: right;
+            }
+            .cost-total .cost-amt {
+                color: #9ad4ff;
+                font-variant-numeric: tabular-nums;
+                min-width: 66px;
+                text-align: right;
+            }
+            .cost-est-note { color: #7a8190; font-size: 10px; margin-top: 6px; }
+            .cost-empty { color: #7a8190; padding: 2px 0; }
+            #status {
+                position: fixed;
+                top: 52px;
                 right: 344px;
                 width: 320px;
                 max-width: calc(100vw - 356px);
@@ -2633,6 +2753,14 @@
             </div>
             <div id="tree-body"></div>
             <div id="tree-detail"></div>
+        </div>
+        <div id="cost-tracker" class="collapsed">
+            <button id="cost-pill" type="button" title="Estimated OpenRouter spend for this run (selected model + gemini-flash-lite matching). Click to break down requests by pipeline step.">
+                <span class="cost-caret"></span>
+                <span class="cost-pill-label">spend</span>
+                <span class="cost-pill-summary">$0.00 · 0 req</span>
+            </button>
+            <div id="cost-dropdown"></div>
         </div>
         <div id="status"><p class="line hdr">ready</p></div>
         <div id="assets">

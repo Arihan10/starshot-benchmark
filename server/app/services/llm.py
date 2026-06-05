@@ -157,6 +157,12 @@ async def call_llm(
                 # each resample re-runs the call fresh.
                 validate(validated)
             reasoning = getattr(message, "reasoning", None) or ""
+            # Token counts for the client's per-run spend tracker. `usage` is
+            # absent on the rare provider that omits it; cost falls back to a
+            # char-length estimate client-side. completion_tokens already
+            # includes reasoning tokens (OpenRouter bills them at the
+            # completion rate), so no separate reasoning field is needed.
+            usage = getattr(response, "usage", None)
             # cache.llm carries everything needed for both the LLM-call cache
             # (key + output) and the observability view (node + step + model
             # + system + user + reasoning). Older log lines that lacked the
@@ -173,6 +179,8 @@ async def call_llm(
                 user=user,
                 output=validated.model_dump(mode="json"),
                 reasoning=reasoning,
+                tokens_in=getattr(usage, "prompt_tokens", None),
+                tokens_out=getattr(usage, "completion_tokens", None),
             )
             return validated
         except OutputValidationError as e:

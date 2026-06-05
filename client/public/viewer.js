@@ -21,6 +21,10 @@ const GRID_VISIBLE_STORAGE_KEY = "starshot.gridVisible";
 const TABS_STORAGE_KEY = "starshot.openTabs";
 
 const statusEl = document.getElementById("status");
+const costTrackerEl = document.getElementById("cost-tracker");
+const costPillEl = document.getElementById("cost-pill");
+const costPillSummaryEl = costPillEl.querySelector(".cost-pill-summary");
+const costDropdownEl = document.getElementById("cost-dropdown");
 const logEl = document.getElementById("log");
 const logToggleEl = document.getElementById("log-toggle");
 const slotBarEl = document.getElementById("slot-bar");
@@ -791,6 +795,9 @@ function treeSetPhase(id, phase) {
 }
 
 function recordLlmCall(event) {
+  // Feed the per-run spend tracker (keyed by event index, so the backfill /
+  // live-tail overlap doesn't double-count).
+  trackLlmCost(event);
   // Bucket the call under its `node` id. The server stamps that field on
   // every `llm.call`; if it's missing (older log line, or a call site we
   // haven't tagged) bucket it under "_unattributed" so the modal can still
@@ -872,7 +879,211 @@ function treeClear() {
   destroyDetailPreview();
   treeDetailEl.innerHTML = "";
   treeEl.classList.remove("detail-open");
+  // The per-run spend tracker shares the tree's lifecycle: a view switch /
+  // reset / rewind wipes the LLM calls it aggregates.
+  clearCostTracker();
 }
+
+// --- per-run LLM spend tracker ----------------------------------------------
+//
+// Every billable LLM request lands as a `cache.llm` event. We bucket the run's
+// reasoning calls (the selected model) by pipeline step and pool the
+// gemini-flash-lite library-matching calls separately, then price each with
+// OpenRouter's published per-token rates. The map is keyed by the event's
+// `index` so the same call arriving via both the history backfill and the live
+// SSE tail (their ranges can overlap) is counted once.
+
+// USD per token (prompt / completion). Source: OpenRouter model catalog
+// (openrouter.ai/api/v1/models), captured 2026-06. Keyed by the OpenRouter
+// model id stamped on each cache.llm event. An id missing here contributes 0
+// cost but is still counted as a request, so a newly-added model degrades to a
+// request-only row until its price is filled in.
+const MODEL_PRICING = {
+  "google/gemini-3.5-flash":       { in: 0.0000015,    out: 0.000009 },
+  "google/gemini-3.1-flash-lite":  { in: 0.00000025,   out: 0.0000015 },
+  "google/gemini-3.1-pro-preview": { in: 0.000002,     out: 0.000012 },
+  "openai/gpt-5.5":                { in: 0.000005,      out: 0.00003 },
+  "anthropic/claude-opus-4.6":     { in: 0.000005,      out: 0.000025 },
+  "deepseek/deepseek-v4-pro":      { in: 0.000000435,   out: 0.00000087 },
+  "anthropic/claude-opus-4.8":     { in: 0.000005,      out: 0.000025 },
+};
+
+// eventIndex -> { step, model, tokensIn, tokensOut, isMatch, exact }
+const llmCostCalls = new Map();
+let _costFallbackKey = 0;
+let _costRenderPending = false;
+
+// Rough token count when the server didn't log usage (older runs). ~4 chars per
+// token is the usual English heuristic — fine for a spend *estimate*.
+function estTokens(s) {
+  return s ? Math.ceil(String(s).length / 4) : 0;
+}
+
+function trackLlmCost(event) {
+  const key = typeof event.index === "number" ? event.index : `u${_costFallbackKey++}`;
+  const haveUsage =
+    Number.isFinite(event.tokens_in) && Number.isFinite(event.tokens_out);
+  const tokensIn = Number.isFinite(event.tokens_in)
+    ? event.tokens_in
+    : estTokens(event.system) + estTokens(event.user);
+  const out = event.output;
+  const outText = typeof out === "string" ? out : out == null ? "" : JSON.stringify(out);
+  const tokensOut = Number.isFinite(event.tokens_out)
+    ? event.tokens_out
+    : estTokens(outText) + estTokens(event.reasoning);
+  // Library matching always runs on gemini-flash-lite. Identify it by its
+  // step (new logs) or output schema (every prior log) so the split survives
+  // even when the run's reasoning model is also flash-lite.
+  const isMatch =
+    event.step === "library_match" || event.schema === "LibraryMatchOutput";
+  llmCostCalls.set(key, {
+    step: event.step || "(unknown step)",
+    model: event.model || "",
+    tokensIn,
+    tokensOut,
+    isMatch,
+    exact: haveUsage,
+  });
+  scheduleCostRender();
+}
+
+function llmCallCost(c) {
+  const p = MODEL_PRICING[c.model];
+  if (!p) return 0;
+  return c.tokensIn * p.in + c.tokensOut * p.out;
+}
+
+function fmtCost(v) {
+  v = v || 0;
+  return v >= 1 ? "$" + v.toFixed(2) : "$" + v.toFixed(4);
+}
+
+function clearCostTracker() {
+  llmCostCalls.clear();
+  scheduleCostRender();
+}
+
+function scheduleCostRender() {
+  if (_costRenderPending) return;
+  _costRenderPending = true;
+  requestAnimationFrame(() => {
+    _costRenderPending = false;
+    renderCostTracker();
+  });
+}
+
+function costRow(label, count, cost, className) {
+  const row = document.createElement("div");
+  row.className = className;
+  const step = document.createElement("span");
+  step.className = "cost-step";
+  step.textContent = label;
+  const reqs = document.createElement("span");
+  reqs.className = "cost-count";
+  reqs.textContent = String(count);
+  const amt = document.createElement("span");
+  amt.className = "cost-amt";
+  amt.textContent = fmtCost(cost);
+  row.append(step, reqs, amt);
+  return row;
+}
+
+function costSectionHead(name, tag, count, cost) {
+  const head = document.createElement("div");
+  head.className = "cost-section-head";
+  const nameEl = document.createElement("span");
+  nameEl.className = "cost-sec-name";
+  nameEl.textContent = name;
+  const tagEl = document.createElement("span");
+  tagEl.className = "cost-sec-model";
+  tagEl.textContent = tag;
+  const sumEl = document.createElement("span");
+  sumEl.className = "cost-sec-sum";
+  sumEl.textContent = `${fmtCost(cost)} · ${count} req`;
+  head.append(nameEl, tagEl, sumEl);
+  return head;
+}
+
+function renderCostTracker() {
+  const byStep = new Map(); // step -> { count, cost }
+  let reasoningCount = 0;
+  let reasoningCost = 0;
+  let matchCount = 0;
+  let matchCost = 0;
+  let anyEstimated = false;
+  for (const c of llmCostCalls.values()) {
+    const cost = llmCallCost(c);
+    if (!c.exact) anyEstimated = true;
+    if (c.isMatch) {
+      matchCount += 1;
+      matchCost += cost;
+    } else {
+      reasoningCount += 1;
+      reasoningCost += cost;
+      const e = byStep.get(c.step) ?? { count: 0, cost: 0 };
+      e.count += 1;
+      e.cost += cost;
+      byStep.set(c.step, e);
+    }
+  }
+  const totalCount = reasoningCount + matchCount;
+  const totalCost = reasoningCost + matchCost;
+  costPillSummaryEl.textContent = `${fmtCost(totalCost)} · ${totalCount} req`;
+
+  costDropdownEl.innerHTML = "";
+  if (totalCount === 0) {
+    const empty = document.createElement("div");
+    empty.className = "cost-empty";
+    empty.textContent = "no LLM requests yet";
+    costDropdownEl.appendChild(empty);
+    return;
+  }
+
+  if (reasoningCount > 0) {
+    const section = document.createElement("div");
+    section.className = "cost-section";
+    section.appendChild(
+      costSectionHead(currentModel ?? "selected model", "reasoning", reasoningCount, reasoningCost),
+    );
+    const steps = [...byStep.entries()].sort((a, b) => b[1].cost - a[1].cost);
+    for (const [step, agg] of steps) {
+      section.appendChild(costRow(step.replace(/_/g, " "), agg.count, agg.cost, "cost-row"));
+    }
+    costDropdownEl.appendChild(section);
+  }
+
+  if (matchCount > 0) {
+    const div = document.createElement("div");
+    div.className = "cost-divider";
+    costDropdownEl.appendChild(div);
+    const section = document.createElement("div");
+    section.className = "cost-section";
+    section.appendChild(
+      costSectionHead("gemini-flash-lite", "matching", matchCount, matchCost),
+    );
+    costDropdownEl.appendChild(section);
+  }
+
+  const div = document.createElement("div");
+  div.className = "cost-divider";
+  costDropdownEl.appendChild(div);
+  costDropdownEl.appendChild(costRow("total", totalCount, totalCost, "cost-total"));
+
+  if (anyEstimated) {
+    const note = document.createElement("div");
+    note.className = "cost-est-note";
+    note.textContent = "≈ some calls estimated from text (no token log)";
+    costDropdownEl.appendChild(note);
+  }
+}
+
+costPillEl.addEventListener("click", () => {
+  costTrackerEl.classList.toggle("collapsed");
+});
+
+// Paint the empty state on boot. Deferred via rAF (scheduleCostRender), so it
+// runs after module init — `currentModel` is no longer in its TDZ by then.
+scheduleCostRender();
 
 // True if `id` itself is hidden, or any ZONE ancestor is hidden. The
 // zone-only ancestor rule is what makes hiding a zone hide everything
