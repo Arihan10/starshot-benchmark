@@ -104,6 +104,62 @@ async def call_llm(
             validate(cached)
         return cached
 
+    validated, reasoning, usage = await call_llm_once(
+        system=system,
+        user=user,
+        output_schema=output_schema,
+        model=model,
+        validate=validate,
+        step=step,
+    )
+    # cache.llm carries everything needed for both the LLM-call cache
+    # (key + output) and the observability view (node + step + model
+    # + system + user + reasoning). Older log lines that lacked the
+    # new fields still replay correctly — the client treats them as
+    # unattributed.
+    logging.log(
+        "cache.llm",
+        key=key,
+        node=node_id,
+        step=step,
+        model=model,
+        schema=schema_name,
+        system=system,
+        user=user,
+        output=validated.model_dump(mode="json"),
+        reasoning=reasoning,
+        tokens_in=getattr(usage, "prompt_tokens", None),
+        tokens_out=getattr(usage, "completion_tokens", None),
+    )
+    return validated
+
+
+async def call_llm_once(
+    *,
+    system: str,
+    user: str,
+    output_schema: type[T],
+    model: str,
+    validate: Callable[[T], None] | None = None,
+    step: str | None = None,
+    log_retries: bool = True,
+) -> tuple[T, str, object]:
+    """One structured-output call with the full resample/backoff budget,
+    WITHOUT the content-addressed cache lookup or the `cache.llm` log write
+    that `call_llm` wraps around it. Returns `(validated, reasoning, usage)`.
+
+    The prompt-tuning sandbox (`POST /llm/test`) calls this directly so a
+    throwaway "what if I edited this prompt" test re-runs the exact step's
+    call yet never reads or mutates any cell's event log — its result is
+    rendered transiently and discarded. `call_llm` is the cached, logged
+    pipeline path. `log_retries=False` (the sandbox runs outside any cell's
+    SlotLog binding) skips the per-attempt diagnostic events so no `logging`
+    ContextVar is required."""
+
+    def _retry_log(kind: str, **data: object) -> None:
+        if log_retries:
+            logging.log(kind, **data)
+
     # Two independent budgets:
     #   * `parse_attempt` — JSON-decode / Pydantic-validation failures.
     #     The model misbehaved; resampling fixes it. 4 tries.
@@ -153,8 +209,8 @@ async def call_llm(
             validated = output_schema.model_validate(args)
             if validate is not None:
                 # Semantic check (e.g. batch id echo). Raised BEFORE the
-                # cache.llm log below, so a failing output is never cached and
-                # each resample re-runs the call fresh.
+                # caller's cache.llm log, so a failing output is never cached
+                # and each resample re-runs the call fresh.
                 validate(validated)
             reasoning = getattr(message, "reasoning", None) or ""
             # Token counts for the client's per-run spend tracker. `usage` is
@@ -163,30 +219,11 @@ async def call_llm(
             # includes reasoning tokens (OpenRouter bills them at the
             # completion rate), so no separate reasoning field is needed.
             usage = getattr(response, "usage", None)
-            # cache.llm carries everything needed for both the LLM-call cache
-            # (key + output) and the observability view (node + step + model
-            # + system + user + reasoning). Older log lines that lacked the
-            # new fields still replay correctly — the client treats them as
-            # unattributed.
-            logging.log(
-                "cache.llm",
-                key=key,
-                node=node_id,
-                step=step,
-                model=model,
-                schema=schema_name,
-                system=system,
-                user=user,
-                output=validated.model_dump(mode="json"),
-                reasoning=reasoning,
-                tokens_in=getattr(usage, "prompt_tokens", None),
-                tokens_out=getattr(usage, "completion_tokens", None),
-            )
-            return validated
+            return validated, reasoning, usage
         except OutputValidationError as e:
             if id_validation_attempt >= ID_VALIDATION_MAX - 1:
                 raise
-            logging.log(
+            _retry_log(
                 "llm.validation_retry",
                 step=step,
                 reason=str(e),
@@ -195,7 +232,7 @@ async def call_llm(
             id_validation_attempt += 1
         except json.JSONDecodeError as e:
             final = parse_attempt >= PARSE_MAX - 1
-            logging.log(
+            _retry_log(
                 "llm.json_decode_error",
                 reason=f"JSONDecodeError: {e}",
                 attempt=parse_attempt,
@@ -216,7 +253,7 @@ async def call_llm(
             backoff = TRANSPORT_BACKOFF[
                 min(transport_attempt, len(TRANSPORT_BACKOFF) - 1)
             ]
-            logging.log(
+            _retry_log(
                 "llm.transport_retry",
                 reason=f"{type(e).__name__}: {str(e)[:200]}",
                 attempt=transport_attempt,
@@ -227,7 +264,7 @@ async def call_llm(
         except (ValidationError, ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
             if parse_attempt >= PARSE_MAX - 1:
                 raise
-            logging.log("llm.retry", reason=f"{type(e).__name__}: {str(e)[:160]}")
+            _retry_log("llm.retry", reason=f"{type(e).__name__}: {str(e)[:160]}")
             parse_attempt += 1
 
 

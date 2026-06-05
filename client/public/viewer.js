@@ -157,6 +157,29 @@ const flowFitEl = document.getElementById("flow-fit");
 const flowZoomInEl = document.getElementById("flow-zoom-in");
 const flowZoomOutEl = document.getElementById("flow-zoom-out");
 const flowCloseEl = document.getElementById("flow-close");
+const flowPauseEl = document.getElementById("flow-pause");
+const sandboxPanelEl = document.getElementById("sandbox-panel");
+const sandboxStepPillEl = document.getElementById("sandbox-step-pill");
+const sandboxStepMetaEl = document.getElementById("sandbox-step-meta");
+const sandboxPosEl = document.getElementById("sandbox-pos");
+const sandboxSystemEl = document.getElementById("sandbox-system");
+const sandboxUserEl = document.getElementById("sandbox-user");
+const sandboxSystemFieldEl = document.getElementById("sandbox-system-field");
+const sandboxUserFieldEl = document.getElementById("sandbox-user-field");
+const sandboxOutputWrapEl = document.getElementById("sandbox-output-wrap");
+const sandboxOutputEl = document.getElementById("sandbox-output");
+const sandboxRenderNoteEl = document.getElementById("sandbox-render-note");
+const sandboxReasoningEl = document.getElementById("sandbox-reasoning");
+const sandboxReasoningBodyEl = document.getElementById("sandbox-reasoning-body");
+const sandboxTestEl = document.getElementById("sandbox-test");
+const sandboxResetEl = document.getElementById("sandbox-reset");
+const sandboxPrevEl = document.getElementById("sandbox-prev");
+const sandboxNextEl = document.getElementById("sandbox-next");
+const sandboxBreakoutEl = document.getElementById("sandbox-breakout");
+const sandboxCloseEl = document.getElementById("sandbox-close");
+const sandboxStatusEl = document.getElementById("sandbox-status");
+const sandboxExpandEl = document.getElementById("sandbox-expand");
+const sandboxCopyEl = document.getElementById("sandbox-copy");
 
 // Execution-flow graph layout constants + state. Declared up here (before
 // `animate()` first runs) because the render loop reads `flowModalOpen` /
@@ -806,6 +829,10 @@ function recordLlmCall(event) {
   const call = {
     uid: _llmCallUid++,
     step: event.step || "(unknown step)",
+    // Output-schema class name (e.g. "BboxBatchOutput"). The prompt-tuning
+    // sandbox sends this to POST /llm/test so the server can resolve the
+    // right schema to re-run this exact step under an edited prompt.
+    schema: event.schema ?? null,
     system: event.system ?? "",
     user: event.user ?? "",
     output: event.output ?? null,
@@ -1397,6 +1424,37 @@ scene.add(sceneRoot);
 // and so clearScene can nuke them independently.
 const bboxRoot = new THREE.Group();
 scene.add(bboxRoot);
+
+// --- prompt-tuning sandbox state --------------------------------------------
+//
+// The sandbox lets the user rewind the canvas to a single pipeline step and
+// re-run that step's LLM call under an edited prompt — non-destructively. The
+// real run is never mutated: we PAUSE it (server), detach the SSE, and
+// simulate the rewind purely by toggling the visibility of already-loaded
+// scene objects (every object remembers the event index that created it, and
+// while `rewindCutoffIndex` is set, anything created at/after the cursor is
+// hidden). A tested step's output is drawn into `sandboxOverlayRoot` on top of
+// that rewound state. Breaking out clears the cutoff + overlay, restoring the
+// exact scene, and resumes the run if we were the ones who paused it.
+const sandboxOverlayRoot = new THREE.Group();
+scene.add(sandboxOverlayRoot);
+let sandboxActive = false;
+// Ordered list of every recorded LLM-call step (across all nodes) by event
+// index — the spine the user walks with prev/next. Each entry is a
+// nodeLlmCalls `call` object.
+let sandboxSteps = [];
+let sandboxCursor = -1;
+// Whether THIS sandbox session paused the run (so break-out knows to resume).
+let sandboxPausedByUs = false;
+// While set, scene-object visibility is gated to "created before this event
+// index"; null = show everything (normal mode).
+let rewindCutoffIndex = null;
+// id -> event index at which its bbox / model first appeared. Built from
+// `recordedEvents` when a sandbox session starts.
+const bboxCreatedIndex = new Map();
+const modelCreatedIndex = new Map();
+// In-flight POST /llm/test guard so double-clicks can't stack calls.
+let sandboxTesting = false;
 let bboxesShown = localStorage.getItem(BBOX_VISIBLE_STORAGE_KEY) !== "0";
 function applyBboxToggleLabel() {
   bboxToggleEl.textContent = `bboxes: ${bboxesShown ? "on" : "off"}`;
@@ -1825,6 +1883,7 @@ function clearScene() {
   proxies.clear();
   clearSolidFills();
   modelsById.clear();
+  clearSandboxOverlay();
   hoveredBboxId = null;
   selectedBboxId = null;
   tooltip.style.display = "none";
@@ -2375,12 +2434,25 @@ function rebuildAllSolidFills() {
   }
 }
 
+// Rewind gate for the prompt-tuning sandbox: the scene is "rewound" to a step
+// by hiding every object created at/after the cursor's event index. Outside
+// the sandbox (`rewindCutoffIndex === null`) everything passes. An id with no
+// recorded creation index (log still backfilling) is treated as present so we
+// never spuriously blank a node we simply lack provenance for.
+function withinRewind(id, kind) {
+  if (rewindCutoffIndex === null) return true;
+  const map = kind === "model" ? modelCreatedIndex : bboxCreatedIndex;
+  const created = map.get(id);
+  if (created === undefined) return true;
+  return created < rewindCutoffIndex;
+}
+
 function applySolidFillVisibility(id) {
   const mesh = solidFills.get(id);
   if (!mesh) return;
   const isFrame = treeNodes.get(id)?.kind === "frame";
   const frameOk = isFrame ? framesShown : true;
-  mesh.visible = frameOk && !effectivelyHidden(id);
+  mesh.visible = frameOk && !effectivelyHidden(id) && withinRewind(id, "bbox");
 }
 
 function refreshAllSolidFillVisibility() {
@@ -2414,9 +2486,10 @@ function applyBboxVisibility(id) {
   // spatial reference. Hover gets full opacity so the user can see what
   // they're about to pick.
   const visible =
-    id === selectedBboxId ||
-    id === hoveredBboxId ||
-    bboxesShown;
+    (id === selectedBboxId ||
+      id === hoveredBboxId ||
+      bboxesShown) &&
+    withinRewind(id, "bbox");
   const dim =
     selectedBboxId !== null &&
     id !== selectedBboxId &&
@@ -2442,11 +2515,21 @@ function applyModelVisibility(id) {
   if (!model) return;
   const isFrame = treeNodes.get(id)?.kind === "frame";
   const frameOk = isFrame ? framesShown : true;
-  model.visible = meshesShown && frameOk && !effectivelyHidden(id);
+  model.visible =
+    meshesShown && frameOk && !effectivelyHidden(id) && withinRewind(id, "model");
 }
 
 function refreshAllFrameModelVisibility() {
   for (const id of modelsById.keys()) applyModelVisibility(id);
+}
+
+// Re-apply every visibility rule across bboxes, proxies, solid fills, and
+// meshes. The sandbox calls this whenever the rewind cutoff moves so the whole
+// scene snaps to the rewound state in one pass.
+function refreshAllVisibility() {
+  refreshAllBboxVisibility();
+  refreshAllSolidFillVisibility();
+  refreshAllFrameModelVisibility();
 }
 
 function setHoveredBbox(id) {
@@ -3767,13 +3850,29 @@ function buildStepFlowNode(node, pos) {
     c.textContent = "cached";
     head.appendChild(c);
   }
+  // "Rewind & tune here": exits the graph, rewinds the canvas to this step,
+  // and opens the prompt-tuning sandbox on it. Only meaningful for steps with
+  // a recorded event index (the position the rewind cuts at).
+  if (node.eventIndex != null) {
+    const tune = document.createElement("button");
+    tune.type = "button";
+    tune.className = "flow-step-tune";
+    tune.textContent = "⤺ tune";
+    tune.title =
+      "Rewind the canvas to this step and edit its prompt — re-runs only this step, non-destructively";
+    tune.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      enterSandboxAtStep(node.call);
+    });
+    head.appendChild(tune);
+  }
   el.appendChild(head);
   const sub = document.createElement("div");
   sub.className = "flow-step-sub";
   sub.textContent = node.model || `on ${node.ownerId}`;
   el.appendChild(sub);
 
-  el.title = `${node.step} on ${node.ownerId} — click for input / output / reasoning`;
+  el.title = `${node.step} on ${node.ownerId} — click for input / output / reasoning · ⤺ tune to rewind & edit its prompt`;
   el.addEventListener("click", (ev) => {
     ev.stopPropagation();
     openObsForStep(node.ownerId, node.call.uid);
@@ -3906,6 +4005,7 @@ function openFlowModal() {
   // graph is open (CSS bumps #tree's z-index under body.flow-open).
   document.body.classList.add("flow-open");
   flowSearchEl.value = flowSearchQuery;
+  updateFlowPauseButton();
   renderFlow();
   // Defer fit until the viewport has its open dimensions.
   requestAnimationFrame(() => {
@@ -4026,6 +4126,448 @@ window.addEventListener(
   true,
 );
 
+// ============================================================================
+// Prompt-tuning sandbox
+//
+// Rewind the canvas to a single pipeline step and re-run that step's LLM call
+// under an edited prompt, non-destructively. We never touch the recorded log:
+// the run is PAUSED (server) and the SSE detached so client state freezes, the
+// rewind is faked by hiding scene objects created at/after the step (see
+// `withinRewind`), and a tested step's output is drawn into
+// `sandboxOverlayRoot`. Break-out clears the cutoff + overlay (instant restore)
+// and resumes the run if we paused it.
+// ============================================================================
+
+const SANDBOX_OVERLAY_COLOR = 0xff4fdd; // vivid magenta — distinct from every bbox color
+// True when the viewed run was live (running) at sandbox entry, so break-out
+// reconnects the SSE to catch up on what the resumed pipeline emits.
+let sandboxWasLive = false;
+// Synchronous re-entrancy latch: enterSandboxAtStep awaits the pause POST, so a
+// fast second click would otherwise start a parallel entry and clobber
+// sandboxPausedByUs. Held from the first click until setup completes.
+let sandboxEntering = false;
+// Expanded (near-fullscreen) panel preference — persisted so it sticks across
+// sessions, like the other view toggles.
+const SANDBOX_EXPANDED_KEY = "starshot:sandbox-expanded";
+let sandboxExpanded = (() => {
+  try { return localStorage.getItem(SANDBOX_EXPANDED_KEY) === "1"; } catch { return false; }
+})();
+
+function applySandboxExpanded() {
+  sandboxPanelEl.classList.toggle("expanded", sandboxExpanded);
+  if (sandboxExpandEl) {
+    sandboxExpandEl.textContent = sandboxExpanded ? "⤡" : "⤢";
+    sandboxExpandEl.title = sandboxExpanded
+      ? "Collapse the panel"
+      : "Expand the panel for easier reading of the system / input / output";
+  }
+}
+
+function clearSandboxOverlay() {
+  while (sandboxOverlayRoot.children.length > 0) {
+    const child = sandboxOverlayRoot.children[0];
+    sandboxOverlayRoot.remove(child);
+    // Overlay boxes are Box3Helpers (LineSegments, not meshes) — dispose
+    // their geometry/material directly; disposeObject3D only walks meshes.
+    child.geometry?.dispose?.();
+    child.material?.dispose?.();
+  }
+}
+
+// Record the event index each node's bbox / mesh first appeared at, so the
+// rewind cutoff can hide everything created from a given step onward.
+function buildCreationIndexMaps() {
+  bboxCreatedIndex.clear();
+  modelCreatedIndex.clear();
+  for (const e of recordedEvents) {
+    if (typeof e.index !== "number" || typeof e.id !== "string") continue;
+    if (e.kind === "bbox") {
+      if (!bboxCreatedIndex.has(e.id)) bboxCreatedIndex.set(e.id, e.index);
+    } else if (e.kind === "model") {
+      if (!modelCreatedIndex.has(e.id)) modelCreatedIndex.set(e.id, e.index);
+    }
+  }
+}
+
+// Every recorded LLM-call step across all nodes, ordered by the event index it
+// was logged at — the execution-order spine prev/next walks. Steps without an
+// event index (legacy logs) can't be positioned, so they're skipped, and
+// duplicates are collapsed by event index: the live tail and the background
+// history backfill both feed recordLlmCall with no per-index dedup, so a cell
+// opened mid-run can hold two entries for one call. They carry identical
+// content, so keeping the first is exact.
+function collectSandboxSteps() {
+  const byIndex = new Map();
+  for (const [, calls] of nodeLlmCalls) {
+    for (const c of calls) {
+      if (typeof c.eventIndex === "number" && !byIndex.has(c.eventIndex)) {
+        byIndex.set(c.eventIndex, c);
+      }
+    }
+  }
+  return [...byIndex.values()].sort((a, b) => a.eventIndex - b.eventIndex);
+}
+
+function setSandboxStatus(msg, cls = "") {
+  if (!sandboxStatusEl) return;
+  sandboxStatusEl.textContent = msg || "";
+  sandboxStatusEl.className = cls; // "", "err", or "ok"
+}
+
+// Flag the system/user fields whose text diverges from the recorded prompt.
+function markSandboxEdited() {
+  const call = sandboxSteps[sandboxCursor];
+  if (!call) return;
+  sandboxSystemFieldEl.classList.toggle("edited", sandboxSystemEl.value !== (call.system ?? ""));
+  sandboxUserFieldEl.classList.toggle("edited", sandboxUserEl.value !== (call.user ?? ""));
+}
+
+async function enterSandboxAtStep(call) {
+  if (call == null || typeof call.eventIndex !== "number") return;
+  if (sandboxActive) {
+    // Already tuning — just jump the cursor to the clicked step. Match by
+    // event index (stable) rather than uid, which differs across the
+    // dedup-collapsed duplicates.
+    const idx = sandboxSteps.findIndex((c) => c.eventIndex === call.eventIndex);
+    if (idx >= 0) gotoSandboxStep(idx);
+    return;
+  }
+  if (sandboxEntering) return; // a parallel entry is mid-flight (async pause)
+  sandboxEntering = true;
+  try {
+    // Freeze the run for the session: detach the SSE FIRST (so the run.paused
+    // sentinel never lands in our recorded log / bumps highestEventIndex), then
+    // pause it server-side if it was live.
+    const wasRunning = currentRunInfo()?.status === "running";
+    sandboxWasLive = wasRunning;
+    if (currentSource) { currentSource.close(); currentSource = null; }
+    sandboxPausedByUs = false;
+    if (wasRunning && currentSlotId && currentModel) {
+      try {
+        const res = await fetch(
+          new URL(
+            `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/pause?run=${encodeURIComponent(currentRun)}`,
+            SERVER_URL,
+          ),
+          { method: "POST" },
+        );
+        if (res.ok) sandboxPausedByUs = true;
+      } catch {}
+    }
+
+    sandboxActive = true;
+    buildCreationIndexMaps();
+    sandboxSteps = collectSandboxSteps();
+    const cursor = sandboxSteps.findIndex((c) => c.eventIndex === call.eventIndex);
+    // Clear any selection so the rewound scene isn't dimmed by it.
+    if (selectedBboxId !== null) {
+      const prev = selectedBboxId;
+      selectedBboxId = null;
+      applyBboxColor(prev);
+    }
+    closeFlowModal();
+    sandboxPanelEl.classList.add("open");
+    document.body.classList.add("sandbox-open");
+    applySandboxExpanded();
+    gotoSandboxStep(cursor >= 0 ? cursor : 0);
+    refreshSlots();
+  } finally {
+    sandboxEntering = false;
+  }
+}
+
+// Rewind to step `i`: hide everything from its event index onward, prefill the
+// editors with its recorded prompts, and reset the output area.
+function gotoSandboxStep(i) {
+  if (!sandboxActive || i < 0 || i >= sandboxSteps.length) return;
+  sandboxCursor = i;
+  const call = sandboxSteps[i];
+  clearSandboxOverlay();
+  rewindCutoffIndex = call.eventIndex;
+  refreshAllVisibility();
+
+  sandboxSystemEl.value = call.system ?? "";
+  sandboxUserEl.value = call.user ?? "";
+  markSandboxEdited();
+
+  sandboxStepPillEl.textContent = call.step ?? "(step)";
+  sandboxStepMetaEl.textContent = "";
+  const onEl = document.createElement("span");
+  onEl.textContent = "on ";
+  const ownerEl = document.createElement("b");
+  ownerEl.textContent = call.parentNode ?? "—";
+  sandboxStepMetaEl.append(onEl, ownerEl);
+  if (call.model) {
+    const modEl = document.createElement("span");
+    modEl.textContent = `   ·   ${call.model}`;
+    sandboxStepMetaEl.append(modEl);
+  }
+  sandboxPosEl.textContent = `step ${i + 1} / ${sandboxSteps.length}`;
+
+  sandboxOutputWrapEl.classList.remove("show");
+  sandboxOutputEl.textContent = "";
+  sandboxReasoningBodyEl.textContent = "";
+  sandboxPrevEl.disabled = i <= 0;
+  sandboxNextEl.disabled = i >= sandboxSteps.length - 1;
+  sandboxTestEl.disabled = !call.schema;
+  if (!call.schema) {
+    setSandboxStatus("no recorded output schema for this step — can't re-run it", "err");
+  } else {
+    setSandboxStatus("rewound — edit a prompt and test, or step through with prev / next");
+  }
+}
+
+async function testSandboxStep() {
+  if (!sandboxActive || sandboxTesting) return;
+  const call = sandboxSteps[sandboxCursor];
+  if (!call || !call.schema) return;
+  sandboxTesting = true;
+  sandboxTestEl.classList.add("busy");
+  sandboxTestEl.disabled = true;
+  setSandboxStatus("re-running this step…");
+  try {
+    const res = await fetch(
+      new URL(`/llm/test?run=${encodeURIComponent(currentRun)}`, SERVER_URL),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          system: sandboxSystemEl.value,
+          user: sandboxUserEl.value,
+          schema_name: call.schema,
+          model: call.model || "",
+        }),
+      },
+    );
+    if (!res.ok) {
+      setSandboxStatus(`test failed: HTTP ${res.status} — ${await res.text()}`, "err");
+      return;
+    }
+    showSandboxResult(call, await res.json());
+  } catch (e) {
+    setSandboxStatus(`test failed: ${e.message}`, "err");
+  } finally {
+    sandboxTesting = false;
+    sandboxTestEl.classList.remove("busy");
+    // Only re-own the button state if we're still on the step we tested —
+    // otherwise gotoSandboxStep already set it for the step the user moved to.
+    if (sandboxActive && sandboxSteps[sandboxCursor]?.uid === call.uid) {
+      sandboxTestEl.disabled = !call.schema;
+    }
+  }
+}
+
+function showSandboxResult(call, data) {
+  // Guard against a result landing after the user already broke out or stepped.
+  if (!sandboxActive || sandboxSteps[sandboxCursor]?.uid !== call.uid) return;
+  const output = data.output ?? null;
+  sandboxOutputWrapEl.classList.add("show");
+  sandboxOutputEl.textContent = JSON.stringify(output, null, 2);
+  const reasoning = (data.reasoning ?? "").trim();
+  sandboxReasoningEl.style.display = reasoning ? "" : "none";
+  sandboxReasoningBodyEl.textContent = reasoning;
+
+  const rendered = renderSandboxOverlay(call, output);
+  if (rendered > 0) {
+    sandboxRenderNoteEl.textContent = `▲ ${rendered} box${rendered === 1 ? "" : "es"} rendered on the canvas (magenta)`;
+    sandboxRenderNoteEl.classList.remove("nothing");
+  } else {
+    sandboxRenderNoteEl.textContent = "no spatial geometry in this step's output — shown as JSON below";
+    sandboxRenderNoteEl.classList.add("nothing");
+  }
+  const tok = data.tokens_in != null ? ` · ${data.tokens_in}+${data.tokens_out ?? 0} tok` : "";
+  setSandboxStatus(`done${tok}`, "ok");
+}
+
+// Min corner of an axis-aligned box given a (possibly signed-dimension) origin.
+function bboxMinCorner(origin, dims) {
+  return [
+    Math.min(origin[0], origin[0] + dims[0]),
+    Math.min(origin[1], origin[1] + dims[1]),
+    Math.min(origin[2], origin[2] + dims[2]),
+  ];
+}
+
+// Draw the renderable part of a tested step's output as magenta overlay boxes
+// on top of the rewound scene. Returns how many boxes were drawn.
+//   * overall_bbox  → one world-frame box (the root canvas)
+//   * *_bbox_batch  → one box per assignment, converted from the owner
+//                     region's local frame back to world coordinates
+// Decompose / plan / next_object / image_prompt outputs carry no geometry → 0.
+function renderSandboxOverlay(call, output) {
+  clearSandboxOverlay();
+  if (!output || typeof output !== "object") return 0;
+  const boxes = [];
+  if (output.bbox && Array.isArray(output.bbox.origin) && Array.isArray(output.bbox.dimensions)) {
+    boxes.push({ origin: output.bbox.origin, dimensions: output.bbox.dimensions });
+  }
+  if (Array.isArray(output.assignments)) {
+    // Batch assignments are authored in the parent region's local frame; the
+    // owner (call.parentNode) was placed before this step so its world bbox is
+    // known. Sibling-anchored children (rare) are approximated against the
+    // region — fine for a preview.
+    const owner = treeNodes.get(call.parentNode);
+    const pmin =
+      owner && Array.isArray(owner.origin) && Array.isArray(owner.dimensions)
+        ? bboxMinCorner(owner.origin, owner.dimensions)
+        : [0, 0, 0];
+    for (const a of output.assignments) {
+      const bb = a && a.bbox;
+      if (!bb || !Array.isArray(bb.origin) || !Array.isArray(bb.dimensions)) continue;
+      boxes.push({
+        origin: [bb.origin[0] + pmin[0], bb.origin[1] + pmin[1], bb.origin[2] + pmin[2]],
+        dimensions: bb.dimensions,
+      });
+    }
+  }
+  for (const b of boxes) addSandboxOverlayBox(b.origin, b.dimensions);
+  return boxes.length;
+}
+
+function addSandboxOverlayBox(origin, dimensions) {
+  const ox = origin[0], oy = origin[1], oz = origin[2];
+  const fx = ox + dimensions[0], fy = oy + dimensions[1], fz = oz + dimensions[2];
+  const box3 = new THREE.Box3(
+    new THREE.Vector3(Math.min(ox, fx), Math.min(oy, fy), Math.min(oz, fz)),
+    new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
+  );
+  const helper = new THREE.Box3Helper(box3, SANDBOX_OVERLAY_COLOR);
+  // Draw on top of everything so the proposed box reads clearly against the
+  // rewound scene regardless of depth.
+  helper.material.depthTest = false;
+  helper.material.transparent = true;
+  helper.renderOrder = 999;
+  sandboxOverlayRoot.add(helper);
+}
+
+// Break out: discard all tuning, restore the full scene instantly (the objects
+// were only hidden), resume the run if we paused it, and reconnect the SSE if
+// the run had been live.
+async function exitSandbox() {
+  if (!sandboxActive) return;
+  // Capture the cell we're restoring — clearing `sandbox-open` below re-enables
+  // the chrome, so the user could switch cells during the resume await; the
+  // resume must target the cell we paused, and the reconnect must bail if we've
+  // since navigated away.
+  const slotId = currentSlotId;
+  const model = currentModel;
+  const run = currentRun;
+  sandboxActive = false;
+  rewindCutoffIndex = null;
+  clearSandboxOverlay();
+  refreshAllVisibility();
+  sandboxPanelEl.classList.remove("open");
+  document.body.classList.remove("sandbox-open");
+  sandboxSteps = [];
+  sandboxCursor = -1;
+  const resume = sandboxPausedByUs;
+  const reconnect = sandboxWasLive;
+  sandboxPausedByUs = false;
+  sandboxWasLive = false;
+  if (resume && slotId && model) {
+    try {
+      await fetch(
+        new URL(
+          `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(run)}`,
+          SERVER_URL,
+        ),
+        { method: "POST" },
+      );
+    } catch {}
+  }
+  // Only reconnect if we're still viewing the same cell (a switch during the
+  // await already tore down + reloaded its own stream).
+  if (reconnect && currentSlotId === slotId && currentModel === model && !currentSource) {
+    setStatus("tuning discarded — original run restored, streaming events…");
+    subscribe(`${slotEventsUrl(slotId, model)}&since=${highestEventIndex}`);
+  } else if (currentSlotId === slotId && currentModel === model) {
+    setStatus("tuning discarded — original run restored");
+  }
+  refreshSlots();
+}
+
+// Hard teardown with no server calls — used when the cell itself is going away
+// (slot/model/run switch, reset). The follow-up clearScene wipes the overlay.
+function teardownSandboxSilently() {
+  if (!sandboxActive) return;
+  sandboxActive = false;
+  rewindCutoffIndex = null;
+  clearSandboxOverlay();
+  sandboxPanelEl.classList.remove("open");
+  document.body.classList.remove("sandbox-open");
+  sandboxSteps = [];
+  sandboxCursor = -1;
+  sandboxPausedByUs = false;
+  sandboxWasLive = false;
+}
+
+function updateFlowPauseButton() {
+  if (!flowPauseEl) return;
+  const running = currentRunInfo()?.status === "running";
+  flowPauseEl.disabled = !running;
+  flowPauseEl.classList.toggle("is-running", running);
+}
+
+async function pauseCurrentCell() {
+  if (!currentSlotId || !currentModel) return;
+  if (currentRunInfo()?.status !== "running") return;
+  flowPauseEl.disabled = true;
+  try {
+    const res = await fetch(
+      new URL(
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/pause?run=${encodeURIComponent(currentRun)}`,
+        SERVER_URL,
+      ),
+      { method: "POST" },
+    );
+    if (res.ok) {
+      // slot_pause flips the cell to "paused" synchronously, so awaiting the
+      // status refresh before re-reading lets the button settle correctly
+      // (the run.paused SSE event also lands and closes the live stream).
+      setStatus("run paused — open a step and 'tune' to rewind & edit its prompt");
+      await refreshSlots();
+    } else {
+      setStatus(`pause failed: HTTP ${res.status}`, "err");
+    }
+  } catch (e) {
+    setStatus(`pause failed: ${e.message}`, "err");
+  }
+  updateFlowPauseButton();
+}
+
+sandboxTestEl?.addEventListener("click", testSandboxStep);
+sandboxResetEl?.addEventListener("click", () => {
+  const call = sandboxSteps[sandboxCursor];
+  if (!call) return;
+  sandboxSystemEl.value = call.system ?? "";
+  sandboxUserEl.value = call.user ?? "";
+  markSandboxEdited();
+  setSandboxStatus("prompts reset to the recorded values");
+});
+sandboxPrevEl?.addEventListener("click", () => gotoSandboxStep(sandboxCursor - 1));
+sandboxNextEl?.addEventListener("click", () => gotoSandboxStep(sandboxCursor + 1));
+sandboxBreakoutEl?.addEventListener("click", () => exitSandbox());
+sandboxCloseEl?.addEventListener("click", () => exitSandbox());
+sandboxSystemEl?.addEventListener("input", markSandboxEdited);
+sandboxUserEl?.addEventListener("input", markSandboxEdited);
+sandboxExpandEl?.addEventListener("click", () => {
+  sandboxExpanded = !sandboxExpanded;
+  try { localStorage.setItem(SANDBOX_EXPANDED_KEY, sandboxExpanded ? "1" : "0"); } catch {}
+  applySandboxExpanded();
+});
+sandboxCopyEl?.addEventListener("click", async () => {
+  const text = sandboxOutputEl.textContent || "";
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+    sandboxCopyEl.textContent = "✓ copied";
+    setTimeout(() => { sandboxCopyEl.textContent = "⧉ copy"; }, 1200);
+  } catch {
+    setSandboxStatus("copy failed — select the output text manually", "err");
+  }
+});
+flowPauseEl?.addEventListener("click", pauseCurrentCell);
+
 function positionTooltip(clientX, clientY, id) {
   const node = treeNodes.get(id);
   const kind = node?.kind ?? "zone";
@@ -4130,6 +4672,7 @@ function pickHoveredZoneBboxId() {
   for (const [id, helper] of bboxes) {
     if (helper.userData.nodeKind !== "zone") continue;
     if (effectivelyHidden(id)) continue;
+    if (!withinRewind(id, "bbox")) continue; // don't grab a rewound-away zone
     if (!raycaster.ray.intersectBox(helper.box, _zoneHit)) continue;
     helper.box.getSize(_zoneSize);
     const vol = _zoneSize.x * _zoneSize.y * _zoneSize.z;
@@ -4260,6 +4803,11 @@ let highestEventIndex = -1;
 const recordedEvents = [];
 
 function dispatch(event) {
+  // While the prompt-tuning sandbox is open the live stream is detached and
+  // client state is frozen — ignore any stray event so recordedEvents / tree /
+  // scene stay exactly as they were. Break-out reconnects with ?since= to
+  // catch up, so nothing is lost.
+  if (sandboxActive) return;
   if (typeof event.index === "number") {
     if (event.index <= highestEventIndex) return;
     highestEventIndex = event.index;
@@ -4510,6 +5058,9 @@ async function refreshSlots() {
     }
     renderSlotTabs();
     updateResumeButton();
+    // Keep the flow-modal pause button in sync with the live run status
+    // (e.g. when a run finishes on its own while the graph is open).
+    updateFlowPauseButton();
   } catch {
     // Transient; next tick will retry.
   }
@@ -4559,6 +5110,7 @@ function resetClientStateForRunSwitch() {
 
 async function switchRun(name) {
   if (!name || name === currentRun) return;
+  teardownSandboxSilently();
   runPickerEl.disabled = true;
   try {
     const res = await fetch(
@@ -4751,6 +5303,8 @@ function switchView(slotId, modelAlias) {
   // SSE + scene, persist the new selection, and load the cell (scene +
   // log backfill) unless it's idle. Error/paused cells still load so the
   // log panel shows what happened; slotNeedsResume drives retry/resume UI.
+  // Abandon any open tuning session first — the cell it rewound is going away.
+  teardownSandboxSilently();
   if (currentSource) {
     currentSource.close();
     currentSource = null;
@@ -5006,6 +5560,7 @@ async function resetSlot(id, model, skipConfirm = false) {
     );
     if (!ok) return;
   }
+  teardownSandboxSilently();
   resetEl.disabled = true;
   try {
     const res = await fetch(
@@ -5231,6 +5786,9 @@ async function loadCellScene(slotId, model, { forceLive = false } = {}) {
 }
 
 async function rewindTo(index) {
+  // The prompt-tuning sandbox owns the scene + freezes the log; a real
+  // (destructive) rewind here would truncate events.jsonl out from under it.
+  if (sandboxActive) return;
   if (currentSlotId === null || currentModel === null) return;
   if (currentSource) {
     currentSource.close();
@@ -5995,6 +6553,9 @@ async function preloadReplayGlbs(events) {
 // Returns the encoded blob in record mode, or null in preview mode.
 async function runReplay({ record }) {
   if (replayInProgress) return null;
+  // Replay tears the scene down and re-dispatches the log; refuse while the
+  // prompt-tuning sandbox owns the canvas + frozen state.
+  if (sandboxActive) return null;
   replayInProgress = true;
   replayActive = true;
   replayCancelRequested = false;

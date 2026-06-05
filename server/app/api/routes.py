@@ -89,6 +89,20 @@ class CreateRunRequest(BaseModel):
     name: str
 
 
+class StepTestRequest(BaseModel):
+    """One-off "what if I edited this prompt" replay of a single pipeline
+    step. `system`/`user` are the (possibly hand-edited) messages;
+    `schema_name` is the output-schema class name recorded on the original
+    `cache.llm` event (resolved against the run's bound prompt module);
+    `model` is the OpenRouter id to run it on. Deliberately carries no slot
+    id — the call never reads or writes any cell's event log."""
+
+    system: str
+    user: str
+    schema_name: str
+    model: str
+
+
 def _run_id(run: str, slot_id: str, model_alias: str) -> str:
     """Composite id used as `run_id` in pipeline code (divider, generation,
     threed queue, SlotLog.slot_id). The slashes make it work as a filesystem
@@ -289,6 +303,51 @@ def create_app() -> FastAPI:
         global _current_run
         _current_run = name
         return {"current": name}
+
+    @app.post("/llm/test")
+    async def llm_test(  # pyright: ignore[reportUnusedFunction]
+        req: StepTestRequest,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Re-run ONE pipeline step's LLM call with (optionally edited)
+        system/user prompts and hand back the parsed output — the engine
+        behind the prompt-tuning sandbox. Resolves the output schema against
+        the run's prompt module (so v1/v2 snapshots and live v3/v4 all work),
+        then calls `llm.call_llm_once`, which neither reads the LLM cache nor
+        writes a `cache.llm` event. The result is rendered transiently in the
+        client and discarded; nothing about any run is mutated."""
+        run = _resolve_run(run)
+        ver = versions.for_run(run)
+        module = ver.prompt_module or _prompt_module_for_run(run)
+        prompt_runtime.bind(module)
+        schema_cls = getattr(prompt_runtime.current(), req.schema_name, None)
+        if not (isinstance(schema_cls, type) and issubclass(schema_cls, BaseModel)):
+            raise HTTPException(
+                status_code=404,
+                detail=f"unknown output schema: {req.schema_name}",
+            )
+        if not req.model:
+            raise HTTPException(status_code=400, detail="model is required")
+        llm.set_model(req.model)
+        try:
+            validated, reasoning, usage = await llm.call_llm_once(
+                system=req.system,
+                user=req.user,
+                output_schema=schema_cls,
+                model=req.model,
+                log_retries=False,
+            )
+        except Exception as e:
+            # Surface provider/parse failures as a clean 502 the sandbox can
+            # show inline, rather than a 500 with a stack trace.
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+        return {
+            "output": validated.model_dump(mode="json"),
+            "reasoning": reasoning,
+            "schema": req.schema_name,
+            "tokens_in": getattr(usage, "prompt_tokens", None),
+            "tokens_out": getattr(usage, "completion_tokens", None),
+        }
 
     @app.get("/slots")
     async def list_slots(run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

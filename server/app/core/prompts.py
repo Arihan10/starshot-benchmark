@@ -228,6 +228,9 @@ def _region_plan_entry(
         lines.append(f'Plan for this region: "{region.plan}"')
     if region.placement is not None:
         lines.append(f'placement: "{region.placement}"')
+    if region.referenced_ids:
+        refs = ", ".join(f"{r.target}: {r.kind.value}" for r in region.referenced_ids)
+        lines.append(f"relationships: [{refs}]")
     lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
     lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
     lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")

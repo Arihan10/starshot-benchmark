@@ -999,7 +999,11 @@
                 backdrop-filter: blur(6px);
                 font-size: 11px;
                 line-height: 1.4;
-                z-index: 5;
+                /* Above #topbar (z-index 10): the controls bar grows tall enough
+                   to overhang the tree's top edge, and at z-index 5 it covered
+                   the tree header — burying the flow-graph + observability
+                   launch buttons. Sitting above the bar keeps them clickable. */
+                z-index: 20;
             }
             #tree.collapsed #tree-body {
                 display: none;
@@ -2674,6 +2678,297 @@
                 font-size: 10px;
                 pointer-events: none;
             }
+            /* --- flow step-node "rewind & tune here" affordance --- */
+            .flow-step-tune {
+                margin-left: auto;
+                flex-shrink: 0;
+                padding: 1px 6px;
+                border-radius: 3px;
+                border: 1px solid #3a3f4b;
+                background: #1b1d23;
+                color: #cdb4e6;
+                font: inherit;
+                font-size: 9px;
+                line-height: 1.5;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            .flow-step-tune:hover { border-color: #b07fd8; color: #e9d8f7; }
+            /* flow-modal pause button turns amber while the viewed run is live */
+            #flow-pause.is-running { border-color: #e0a050; color: #f0c070; }
+            #flow-pause:disabled { opacity: 0.4; cursor: default; }
+            /* --- prompt-tuning sandbox panel --- */
+            #sandbox-panel {
+                position: fixed;
+                left: 50%;
+                bottom: 14px;
+                transform: translateX(-50%);
+                width: min(780px, calc(100vw - 24px));
+                max-height: 66vh;
+                display: none;
+                flex-direction: column;
+                background: rgba(18, 20, 25, 0.97);
+                border: 1px solid #4a3a5e;
+                border-radius: 8px;
+                box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+                color: #e6e6e6;
+                z-index: 60;
+                overflow: hidden;
+            }
+            #sandbox-panel.open { display: flex; }
+            #sandbox-head {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 12px;
+                background: #1f1828;
+                border-bottom: 1px solid #4a3a5e;
+                flex-shrink: 0;
+            }
+            #sandbox-head h2 {
+                margin: 0;
+                font-size: 12px;
+                font-weight: 600;
+                color: #cdb4e6;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+                flex-shrink: 0;
+            }
+            #sandbox-step-pill {
+                padding: 2px 8px;
+                border-radius: 10px;
+                background: #2a2233;
+                border: 1px solid #4a3a5e;
+                color: #d9c7ec;
+                font-size: 11px;
+                font-weight: 600;
+                white-space: nowrap;
+            }
+            #sandbox-step-meta {
+                color: #8a8f99;
+                font-size: 11px;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                white-space: nowrap;
+                flex: 1;
+            }
+            #sandbox-step-meta b { color: #b8bcc4; font-weight: 600; }
+            #sandbox-pos {
+                color: #7a8190;
+                font-size: 11px;
+                flex-shrink: 0;
+            }
+            #sandbox-expand {
+                background: none;
+                border: 1px solid #3a3f4b;
+                border-radius: 3px;
+                color: #9aa0aa;
+                font-size: 12px;
+                line-height: 1;
+                cursor: pointer;
+                padding: 3px 6px;
+                flex-shrink: 0;
+            }
+            #sandbox-expand:hover { color: #e6e6e6; border-color: #b07fd8; }
+            #sandbox-close {
+                background: none;
+                border: none;
+                color: #8a8f99;
+                font-size: 18px;
+                line-height: 1;
+                cursor: pointer;
+                padding: 0 2px;
+                flex-shrink: 0;
+            }
+            #sandbox-close:hover { color: #e6e6e6; }
+            #sandbox-body {
+                padding: 10px 12px;
+                overflow: auto;
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+            }
+            #sandbox-note {
+                color: #7a8190;
+                font-size: 10.5px;
+                line-height: 1.4;
+            }
+            #sandbox-note b { color: #cdb4e6; font-weight: 600; }
+            .sandbox-field { display: flex; flex-direction: column; gap: 3px; }
+            .sandbox-field > label {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+            }
+            .sandbox-field .sandbox-edited {
+                color: #e0a050;
+                font-size: 9px;
+                text-transform: none;
+                letter-spacing: 0;
+                display: none;
+            }
+            .sandbox-field.edited .sandbox-edited { display: inline; }
+            .sandbox-field textarea {
+                width: 100%;
+                box-sizing: border-box;
+                background: #0c0d10;
+                border: 1px solid #2a2d35;
+                border-radius: 4px;
+                color: #d6dae2;
+                font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+                line-height: 1.45;
+                padding: 6px 8px;
+                resize: vertical;
+            }
+            .sandbox-field textarea:focus { outline: none; border-color: #b07fd8; }
+            #sandbox-system { height: 96px; min-height: 40px; }
+            #sandbox-user { height: 150px; min-height: 60px; }
+            #sandbox-output-wrap { display: none; flex-direction: column; gap: 3px; }
+            #sandbox-output-wrap.show { display: flex; }
+            #sandbox-output-label {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                color: #7a8190;
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.05em;
+            }
+            #sandbox-render-note {
+                color: #8bd17c;
+                font-size: 9.5px;
+                text-transform: none;
+                letter-spacing: 0;
+            }
+            #sandbox-render-note.nothing { color: #7a8190; }
+            #sandbox-copy {
+                margin-left: auto;
+                flex-shrink: 0;
+                padding: 2px 8px;
+                border-radius: 3px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 10px;
+                text-transform: none;
+                letter-spacing: 0;
+                cursor: pointer;
+            }
+            #sandbox-copy:hover { border-color: #4a8fd8; color: #e6e6e6; }
+            #sandbox-output {
+                margin: 0;
+                background: #0c0d10;
+                border: 1px solid #2a2d35;
+                border-radius: 4px;
+                color: #c6d0c0;
+                font: 10.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+                line-height: 1.45;
+                padding: 6px 8px;
+                max-height: 180px;
+                overflow: auto;
+                white-space: pre-wrap;
+                word-break: break-word;
+            }
+            #sandbox-reasoning { color: #8a8f99; font-size: 10.5px; }
+            #sandbox-reasoning summary { cursor: pointer; color: #7a8190; }
+            #sandbox-reasoning pre {
+                margin: 4px 0 0;
+                white-space: pre-wrap;
+                word-break: break-word;
+                color: #9aa0aa;
+                max-height: 160px;
+                overflow: auto;
+            }
+            #sandbox-foot {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 8px 12px;
+                background: #15171c;
+                border-top: 1px solid #2a2d35;
+                flex-shrink: 0;
+                flex-wrap: wrap;
+            }
+            #sandbox-foot button {
+                padding: 5px 11px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            #sandbox-foot button:hover:not(:disabled) { border-color: #4a8fd8; color: #e6e6e6; }
+            #sandbox-foot button:disabled { opacity: 0.4; cursor: default; }
+            #sandbox-test {
+                background: #3a2a52;
+                border-color: #6a4a8e;
+                color: #ead9f7;
+                font-weight: 600;
+            }
+            #sandbox-test:hover:not(:disabled) { background: #4a3568; border-color: #b07fd8; }
+            #sandbox-test.busy { opacity: 0.7; cursor: wait; }
+            #sandbox-foot .sandbox-spacer { flex: 1; }
+            #sandbox-breakout {
+                border-color: #6a3a3a !important;
+                color: #e09a9a !important;
+            }
+            #sandbox-breakout:hover { background: #3a2020; border-color: #c05050 !important; color: #f0c0c0 !important; }
+            #sandbox-status {
+                color: #8a8f99;
+                font-size: 10.5px;
+                flex-basis: 100%;
+                min-height: 13px;
+            }
+            #sandbox-status.err { color: #ff8080; }
+            #sandbox-status.ok { color: #8bd17c; }
+            /* Expanded panel: grow to near-fullscreen and let the system / user /
+               output sections each flex to fill the height (scrolling inside)
+               so long prompts and outputs are readable at a glance. */
+            #sandbox-panel.expanded {
+                top: 2.5vh;
+                bottom: auto;
+                width: 92vw;
+                height: 95vh;
+                max-height: 95vh;
+            }
+            #sandbox-panel.expanded #sandbox-body { flex: 1 1 auto; min-height: 0; }
+            #sandbox-panel.expanded .sandbox-field { flex: 1 1 0; min-height: 90px; }
+            #sandbox-panel.expanded .sandbox-field textarea {
+                flex: 1 1 auto;
+                height: auto;
+                min-height: 0;
+            }
+            #sandbox-panel.expanded #sandbox-output-wrap.show { flex: 1 1 0; min-height: 90px; }
+            #sandbox-panel.expanded #sandbox-output {
+                flex: 1 1 auto;
+                max-height: none;
+                min-height: 0;
+            }
+            /* While tuning, the sandbox owns the session: dim + disable every
+               other control surface so a stray click on log-rewind, replay,
+               resume/retry, reset, or a run/slot/model switch can't fight the
+               frozen state. The 3D canvas and the sandbox panel stay live. */
+            body.sandbox-open #run-tabs-bar,
+            body.sandbox-open #slot-bar,
+            body.sandbox-open #controls-bar,
+            body.sandbox-open #tree,
+            body.sandbox-open #log,
+            body.sandbox-open #assets,
+            body.sandbox-open #trellis-queue,
+            body.sandbox-open #cost-tracker,
+            body.sandbox-open #zoom-controls {
+                pointer-events: none;
+                opacity: 0.4;
+                filter: grayscale(0.4);
+            }
         </style>
         <script type="importmap">
             {
@@ -2894,6 +3189,7 @@
                     </div>
                     <div id="flow-controls">
                         <input id="flow-search" type="text" placeholder="locate id or prompt…" autocomplete="off" spellcheck="false" />
+                        <button id="flow-pause" type="button" title="Pause this run so you can rewind into a step and tune its prompt without the pipeline moving on. Only active while the viewed cell is running.">⏸ pause</button>
                         <button id="flow-fit" type="button" title="Fit the whole graph to view">fit</button>
                         <button id="flow-zoom-out" type="button" title="Zoom out">−</button>
                         <button id="flow-zoom-in" type="button" title="Zoom in">+</button>
@@ -2906,8 +3202,50 @@
                         <div id="flow-nodes"></div>
                     </div>
                     <div id="flow-empty">no pipeline nodes yet — start a run, then reopen this graph</div>
-                    <div id="flow-hint">drag to pan · scroll to zoom · scene node → observability · step node → its input/output/reasoning · sidebar click centers here</div>
+                    <div id="flow-hint">drag to pan · scroll to zoom · scene node → observability · step node → input/output/reasoning · <b>tune → rewind &amp; edit this step's prompt</b> · sidebar click centers here</div>
                 </div>
+            </div>
+        </div>
+        <div id="sandbox-panel">
+            <div id="sandbox-head">
+                <h2>tune</h2>
+                <span id="sandbox-step-pill">step</span>
+                <span id="sandbox-step-meta"></span>
+                <span id="sandbox-pos"></span>
+                <button id="sandbox-expand" type="button" title="Expand the panel for easier reading of the system / input / output">⤢</button>
+                <button id="sandbox-close" type="button" title="Break out — discard all tuning and restore the original run">×</button>
+            </div>
+            <div id="sandbox-body">
+                <div id="sandbox-note">The scene is <b>rewound</b> to just before this step. Editing re-runs <b>only this step</b> against the recorded scene state and renders its output here — <b>nothing is saved</b>. Break out to restore the original run.</div>
+                <div class="sandbox-field" id="sandbox-system-field">
+                    <label>system prompt <span class="sandbox-edited">· edited</span></label>
+                    <textarea id="sandbox-system" spellcheck="false" autocomplete="off"></textarea>
+                </div>
+                <div class="sandbox-field" id="sandbox-user-field">
+                    <label>user prompt (rendered input) <span class="sandbox-edited">· edited</span></label>
+                    <textarea id="sandbox-user" spellcheck="false" autocomplete="off"></textarea>
+                </div>
+                <div id="sandbox-output-wrap">
+                    <div id="sandbox-output-label">
+                        <span>output</span>
+                        <span id="sandbox-render-note"></span>
+                        <button id="sandbox-copy" type="button" title="Copy this output to the clipboard so you can paste it into the next step's input">⧉ copy</button>
+                    </div>
+                    <pre id="sandbox-output"></pre>
+                    <details id="sandbox-reasoning">
+                        <summary>reasoning</summary>
+                        <pre id="sandbox-reasoning-body"></pre>
+                    </details>
+                </div>
+            </div>
+            <div id="sandbox-foot">
+                <button id="sandbox-test" type="button" title="Re-run this step with the prompts above and render the result">⏵ test step</button>
+                <button id="sandbox-reset" type="button" title="Restore the original recorded prompts for this step">reset prompt</button>
+                <span class="sandbox-spacer"></span>
+                <button id="sandbox-prev" type="button" title="Rewind to the previous step in execution order">◀ prev</button>
+                <button id="sandbox-next" type="button" title="Continue to the next step in the pipeline (you can tune it too)">next ▶</button>
+                <button id="sandbox-breakout" type="button" title="Discard all tuning and restore the original run">break out</button>
+                <div id="sandbox-status"></div>
             </div>
         </div>
         <!-- gif.js loaded as a global because the npm dist is UMD/CJS and
