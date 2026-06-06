@@ -378,6 +378,24 @@ async def _resolve_and_generate(
         all_nodes=all_nodes,
     )
 
+    # Emit EVERY resolved bbox upfront — before the per-object image-prompt /
+    # library-match calls below — so the whole sibling set appears at once right
+    # after the batch step (matching how the divider emits child bboxes). Without
+    # this the boxes dribble out one at a time, paused behind each per-object
+    # call in the step-through. emit_bbox dedups, so the reuse paths below are
+    # unaffected.
+    _bbox_kind = "frame" if scenario == "encapsulating" else "object"
+    for spec in specs:
+        logging.emit_bbox(
+            spec.id,
+            bboxes[spec.id],
+            parent_id=spec.parent,
+            prompt=spec.prompt,
+            kind=_bbox_kind,
+            proxy_shape=spec.proxy_shape,
+            orientation=spec.orientation,
+        )
+
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(
             specs=specs,
@@ -402,15 +420,7 @@ async def _resolve_and_generate(
     for spec in specs:
         bbox = bboxes[spec.id]
         parent_id = spec.parent
-        logging.emit_bbox(
-            spec.id,
-            bbox,
-            parent_id=parent_id,
-            prompt=spec.prompt,
-            kind="frame" if scenario == "encapsulating" else "object",
-            proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
-        )
+        # bbox already emitted upfront above.
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
         view = "three-quarter" if scenario == "encapsulating" else "front"
         subject_prompt, image_prompt = await _build_image_prompt(
@@ -483,16 +493,7 @@ async def _match_library_assets(
             )
             continue
 
-        logging.emit_bbox(
-            spec.id,
-            bbox,
-            parent_id=spec.parent,
-            prompt=spec.prompt,
-            kind="frame" if scenario == "encapsulating" else "object",
-            proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
-        )
-
+        # bbox already emitted upfront in _resolve_and_generate.
         match = await library.match(spec.prompt)
         asset = library.asset_path(match.library_id)
 

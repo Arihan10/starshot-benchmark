@@ -2915,6 +2915,28 @@
             }
             #sandbox-test:hover:not(:disabled) { background: #4a3568; border-color: #b07fd8; }
             #sandbox-test.busy { opacity: 0.7; cursor: wait; }
+            #sandbox-simulate, #sandbox-runstep {
+                background: #1f3a2a;
+                border-color: #3a6a4e !important;
+                color: #c0f0d0 !important;
+                font-weight: 600;
+            }
+            #sandbox-simulate:hover:not(:disabled),
+            #sandbox-runstep:hover:not(:disabled) { background: #2a5038; border-color: #5ac080 !important; color: #d6f7e0 !important; }
+            /* Re-run is destructive (invalidates every later step) — amber accent. */
+            #sandbox-rerun {
+                background: #3a2f1a;
+                border-color: #7a5a2e !important;
+                color: #f0d8a8 !important;
+                font-weight: 600;
+            }
+            #sandbox-rerun:hover:not(:disabled) { background: #50421f; border-color: #c0902e !important; color: #f7e6c0 !important; }
+            /* Branch (downstream step-through) mode: green accent; prompts stay
+               editable so each downstream step's re-rendered prompt can be tuned. */
+            #sandbox-panel.branch-mode { border-color: #3a6a4e; }
+            #sandbox-panel.branch-mode #sandbox-head { background: #16281d; border-bottom-color: #3a6a4e; }
+            #sandbox-panel.branch-mode h2 { color: #8bd17c; }
+            #sandbox-panel.branch-mode #sandbox-step-pill { background: #1f3a2a; border-color: #3a6a4e; color: #c0f0d0; }
             #sandbox-foot .sandbox-spacer { flex: 1; }
             #sandbox-breakout {
                 border-color: #6a3a3a !important;
@@ -3241,9 +3263,14 @@
             <div id="sandbox-foot">
                 <button id="sandbox-test" type="button" title="Re-run this step with the prompts above and render the result">⏵ test step</button>
                 <button id="sandbox-reset" type="button" title="Restore the original recorded prompts for this step">reset prompt</button>
+                <button id="sandbox-simulate" type="button" title="Fork the run from this step and step through the pipeline downstream — it pauses at each step so you can edit its (pre-filled, re-rendered) prompt and run it.">⑃ simulate downstream</button>
                 <span class="sandbox-spacer"></span>
-                <button id="sandbox-prev" type="button" title="Rewind to the previous step in execution order">◀ prev</button>
-                <button id="sandbox-next" type="button" title="Continue to the next step in the pipeline (you can tune it too)">next ▶</button>
+                <button id="sandbox-prev" type="button" title="View the previous step in the simulation (its committed prompt + output) — non-destructive">◀ prev</button>
+                <button id="sandbox-next" type="button" title="View the next step in the simulation — non-destructive">next ▶</button>
+                <button id="sandbox-runstep" type="button" title="Run this step with the prompt above, then pause at the next one">▶ run step</button>
+                <button id="sandbox-rerun" type="button" title="Re-run this committed step with the edited prompt — INVALIDATES every step after it">↻ re-run step</button>
+                <button id="sandbox-runrest" type="button" title="Run the rest of the branch without pausing">⏩ run rest</button>
+                <button id="sandbox-back" type="button" title="Discard the simulation and go back to editing the original step">← back to edit</button>
                 <button id="sandbox-breakout" type="button" title="Discard all tuning and restore the original run">break out</button>
                 <div id="sandbox-status"></div>
             </div>

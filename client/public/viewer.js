@@ -175,6 +175,11 @@ const sandboxTestEl = document.getElementById("sandbox-test");
 const sandboxResetEl = document.getElementById("sandbox-reset");
 const sandboxPrevEl = document.getElementById("sandbox-prev");
 const sandboxNextEl = document.getElementById("sandbox-next");
+const sandboxSimulateEl = document.getElementById("sandbox-simulate");
+const sandboxRunStepEl = document.getElementById("sandbox-runstep");
+const sandboxRerunEl = document.getElementById("sandbox-rerun");
+const sandboxRunRestEl = document.getElementById("sandbox-runrest");
+const sandboxBackEl = document.getElementById("sandbox-back");
 const sandboxBreakoutEl = document.getElementById("sandbox-breakout");
 const sandboxCloseEl = document.getElementById("sandbox-close");
 const sandboxStatusEl = document.getElementById("sandbox-status");
@@ -1455,6 +1460,35 @@ const bboxCreatedIndex = new Map();
 const modelCreatedIndex = new Map();
 // In-flight POST /llm/test guard so double-clicks can't stack calls.
 let sandboxTesting = false;
+// --- branch (downstream step-through) state ---
+// When `branchActive`, the cell has been forked at the tuned step (server-side,
+// under <cell>/_branch) and the deviated subtree is re-simulating one step at a
+// time: the pipeline PAUSES before each downstream LLM call so you can edit its
+// (pre-filled, re-rendered) prompt. We keep the original scene rewound to the
+// deviation point and render the branch's downstream nodes — bboxes AND real
+// meshes — into sandboxOverlayRoot as its events stream. Break-out deletes it.
+let branchActive = false;
+let branchSource = null;        // EventSource over /branch/events
+let branchDeviationIndex = -1;  // original event index the fork deviated at
+let branchGen = 0;              // bumped per session to bail stale async mesh loads
+let branchDone = false;
+// `branchSteps` is the ordered list of the branch's steps: the committed ones
+// (each carries the prompt that was actually committed to the branch log, plus
+// its output + reasoning) followed by the live frontier (the next, un-run step,
+// editable to run). `branchCursor` is the step being viewed; prev/next move it
+// NON-destructively (observability). Only an explicit re-run truncates +
+// invalidates downstream.
+let branchSteps = [];
+let branchCursor = -1;
+let branchStepBusy = false;      // a proceed / re-run is in flight
+let branchAuto = false;          // "run rest" is streaming autonomously (no pauses)
+let branchRebuilding = false;    // a re-run reopen's snapshot is replaying
+let branchReopenTarget = 0;      // cursor to settle on once a rebuild finishes
+// The in-progress prompt carried from EDIT mode into the branch's first step,
+// so entering simulation doesn't make you retype the edit. Consumed once.
+let branchFirstPrompt = null;
+const branchOverlayBboxIds = new Set(); // deviated ids already drawn as overlay wireframes
+const branchOverlayMeshes = new Map();  // id -> loaded GLB object3d in the overlay
 let bboxesShown = localStorage.getItem(BBOX_VISIBLE_STORAGE_KEY) !== "0";
 function applyBboxToggleLabel() {
   bboxToggleEl.textContent = `bboxes: ${bboxesShown ? "on" : "off"}`;
@@ -1582,7 +1616,9 @@ tooltip.style.cssText = [
   "font: 12px ui-monospace, SFMono-Regular, Menlo, monospace",
   "pointer-events: none",
   "display: none",
-  "z-index: 10",
+  // Above the chrome incl. the sandbox panel (z-index 60) so a hover label on a
+  // magenta overlay box near the panel edge isn't occluded; still below modals.
+  "z-index: 70",
   "max-width: 360px",
   "white-space: pre-wrap",
   "line-height: 1.35",
@@ -1849,12 +1885,32 @@ function animate() {
   if (pointerDirty && !controlsInteracting) {
     pointerDirty = false;
     raycaster.setFromCamera(pointer, camera);
-    const hoveredId = pickHoveredBboxId();
-    setHoveredBbox(hoveredId);
-    if (hoveredId !== null) {
-      positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+    if (sandboxActive) {
+      // The magenta overlay boxes take priority; fall back to the still-visible
+      // frozen context (pre-rewind originals) so those keep their tooltip too.
+      const oid = pickHoveredOverlayId();
+      if (oid !== null) {
+        setHoveredOverlay(oid);
+        setHoveredBbox(null);
+        positionOverlayTooltip(lastPointerClientX, lastPointerClientY, oid);
+      } else {
+        setHoveredOverlay(null);
+        const hoveredId = pickHoveredBboxId();
+        setHoveredBbox(hoveredId);
+        if (hoveredId !== null) {
+          positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+        } else {
+          tooltip.style.display = "none";
+        }
+      }
     } else {
-      tooltip.style.display = "none";
+      const hoveredId = pickHoveredBboxId();
+      setHoveredBbox(hoveredId);
+      if (hoveredId !== null) {
+        positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+      } else {
+        tooltip.style.display = "none";
+      }
     }
   }
 
@@ -4139,6 +4195,14 @@ window.addEventListener(
 // ============================================================================
 
 const SANDBOX_OVERLAY_COLOR = 0xff4fdd; // vivid magenta — distinct from every bbox color
+// Every magenta box drawn into sandboxOverlayRoot is registered here with the
+// metadata needed to identify it (id, kind, prompt), so it hovers (tooltip +
+// highlight) and selects exactly like a normal-canvas bbox. Cleared with the
+// overlay. Hover/select reuse the canvas hover/selected colors for consistency.
+const sandboxOverlayBoxes = new Map(); // overlayId -> { helper, box, id, kind, prompt }
+let _overlayBoxSeq = 0;
+let hoveredOverlayId = null;
+let selectedOverlayId = null;
 // True when the viewed run was live (running) at sandbox entry, so break-out
 // reconnects the SSE to catch up on what the resumed pipeline emits.
 let sandboxWasLive = false;
@@ -4167,11 +4231,16 @@ function clearSandboxOverlay() {
   while (sandboxOverlayRoot.children.length > 0) {
     const child = sandboxOverlayRoot.children[0];
     sandboxOverlayRoot.remove(child);
-    // Overlay boxes are Box3Helpers (LineSegments, not meshes) — dispose
-    // their geometry/material directly; disposeObject3D only walks meshes.
+    // disposeObject3D walks meshes (branch GLB groups); the direct dispose
+    // covers Box3Helpers (LineSegments — not meshes, so the walk skips them).
+    disposeObject3D(child);
     child.geometry?.dispose?.();
     child.material?.dispose?.();
   }
+  sandboxOverlayBoxes.clear();
+  hoveredOverlayId = null;
+  selectedOverlayId = null;
+  if (sandboxActive) tooltip.style.display = "none";
 }
 
 // Record the event index each node's bbox / mesh first appeared at, so the
@@ -4216,10 +4285,12 @@ function setSandboxStatus(msg, cls = "") {
 
 // Flag the system/user fields whose text diverges from the recorded prompt.
 function markSandboxEdited() {
-  const call = sandboxSteps[sandboxCursor];
-  if (!call) return;
-  sandboxSystemFieldEl.classList.toggle("edited", sandboxSystemEl.value !== (call.system ?? ""));
-  sandboxUserFieldEl.classList.toggle("edited", sandboxUserEl.value !== (call.user ?? ""));
+  // Baseline is the viewed branch step when stepping through a branch,
+  // otherwise the original recorded step being tuned.
+  const base = branchActive ? branchSteps[branchCursor] : sandboxSteps[sandboxCursor];
+  if (!base) return;
+  sandboxSystemFieldEl.classList.toggle("edited", sandboxSystemEl.value !== (base.system ?? ""));
+  sandboxUserFieldEl.classList.toggle("edited", sandboxUserEl.value !== (base.user ?? ""));
 }
 
 async function enterSandboxAtStep(call) {
@@ -4269,6 +4340,7 @@ async function enterSandboxAtStep(call) {
     sandboxPanelEl.classList.add("open");
     document.body.classList.add("sandbox-open");
     applySandboxExpanded();
+    applySandboxMode(); // fresh session is always edit-mode (Phase A)
     gotoSandboxStep(cursor >= 0 ? cursor : 0);
     refreshSlots();
   } finally {
@@ -4307,18 +4379,17 @@ function gotoSandboxStep(i) {
   sandboxOutputWrapEl.classList.remove("show");
   sandboxOutputEl.textContent = "";
   sandboxReasoningBodyEl.textContent = "";
+  updateSimulateButton();
   sandboxPrevEl.disabled = i <= 0;
   sandboxNextEl.disabled = i >= sandboxSteps.length - 1;
   sandboxTestEl.disabled = !call.schema;
-  if (!call.schema) {
-    setSandboxStatus("no recorded output schema for this step — can't re-run it", "err");
-  } else {
-    setSandboxStatus("rewound — edit a prompt and test, or step through with prev / next");
-  }
+  setSandboxStatus(
+    "rewound — optionally test, or 'simulate downstream' to step through from here",
+  );
 }
 
 async function testSandboxStep() {
-  if (!sandboxActive || sandboxTesting) return;
+  if (!sandboxActive || branchActive || sandboxTesting) return;
   const call = sandboxSteps[sandboxCursor];
   if (!call || !call.schema) return;
   sandboxTesting = true;
@@ -4399,7 +4470,11 @@ function renderSandboxOverlay(call, output) {
   if (!output || typeof output !== "object") return 0;
   const boxes = [];
   if (output.bbox && Array.isArray(output.bbox.origin) && Array.isArray(output.bbox.dimensions)) {
-    boxes.push({ origin: output.bbox.origin, dimensions: output.bbox.dimensions });
+    boxes.push({
+      origin: output.bbox.origin,
+      dimensions: output.bbox.dimensions,
+      meta: { id: call.parentNode ?? null, kind: treeNodes.get(call.parentNode)?.kind ?? null },
+    });
   }
   if (Array.isArray(output.assignments)) {
     // Batch assignments are authored in the parent region's local frame; the
@@ -4417,14 +4492,18 @@ function renderSandboxOverlay(call, output) {
       boxes.push({
         origin: [bb.origin[0] + pmin[0], bb.origin[1] + pmin[1], bb.origin[2] + pmin[2]],
         dimensions: bb.dimensions,
+        meta: { id: a.id ?? null, prompt: typeof a.prompt === "string" ? a.prompt : null },
       });
     }
   }
-  for (const b of boxes) addSandboxOverlayBox(b.origin, b.dimensions);
+  for (const b of boxes) addSandboxOverlayBox(b.origin, b.dimensions, b.meta);
   return boxes.length;
 }
 
-function addSandboxOverlayBox(origin, dimensions) {
+// Draw one magenta overlay box. `meta` ({id, kind, prompt}) is what the
+// hover tooltip / selection surface to say "what this box is"; anonymous boxes
+// (no id) still register so they can be hovered, just with a generic label.
+function addSandboxOverlayBox(origin, dimensions, meta = null) {
   const ox = origin[0], oy = origin[1], oz = origin[2];
   const fx = ox + dimensions[0], fy = oy + dimensions[1], fz = oz + dimensions[2];
   const box3 = new THREE.Box3(
@@ -4437,7 +4516,580 @@ function addSandboxOverlayBox(origin, dimensions) {
   helper.material.depthTest = false;
   helper.material.transparent = true;
   helper.renderOrder = 999;
+  const overlayId = meta?.id ?? `__overlay_${_overlayBoxSeq++}`;
+  helper.userData.overlayId = overlayId;
   sandboxOverlayRoot.add(helper);
+  sandboxOverlayBoxes.set(overlayId, {
+    helper,
+    box: box3,
+    id: meta?.id ?? null,
+    kind: meta?.kind ?? null,
+    prompt: meta?.prompt ?? null,
+  });
+  applyOverlayColor(overlayId);
+  return helper;
+}
+
+// Paint a single overlay box's color from its hover/selected state — selected
+// (cyan) beats hovered (yellow) beats the default magenta.
+function applyOverlayColor(oid) {
+  if (oid == null) return;
+  const entry = sandboxOverlayBoxes.get(oid);
+  if (!entry) return;
+  const color =
+    oid === selectedOverlayId ? BBOX_COLOR_SELECTED
+    : oid === hoveredOverlayId ? BBOX_COLOR_HOVER
+    : SANDBOX_OVERLAY_COLOR;
+  entry.helper.material.color.setHex(color);
+}
+
+function setHoveredOverlay(oid) {
+  if (oid === hoveredOverlayId) return;
+  const prev = hoveredOverlayId;
+  hoveredOverlayId = oid;
+  applyOverlayColor(prev);
+  applyOverlayColor(oid);
+}
+
+function selectOverlay(oid) {
+  const prev = selectedOverlayId;
+  selectedOverlayId = prev === oid ? null : oid; // re-click clears
+  applyOverlayColor(prev);
+  applyOverlayColor(selectedOverlayId);
+}
+
+// Smallest-volume overlay box the ray crosses — the deepest/most-specific box
+// under the cursor, matching the zone picker (boxes nest + overlap).
+const _overlayHit = new THREE.Vector3();
+const _overlaySize = new THREE.Vector3();
+function pickHoveredOverlayId() {
+  let bestId = null;
+  let bestVol = Infinity;
+  for (const [oid, entry] of sandboxOverlayBoxes) {
+    if (!entry.helper.visible) continue;
+    if (!raycaster.ray.intersectBox(entry.box, _overlayHit)) continue;
+    entry.box.getSize(_overlaySize);
+    const vol = _overlaySize.x * _overlaySize.y * _overlaySize.z;
+    if (vol < bestVol) {
+      bestVol = vol;
+      bestId = oid;
+    }
+  }
+  return bestId;
+}
+
+// ===========================================================================
+// Downstream simulation (branch)
+//
+// "Simulate downstream" commits the current step's tested output as a deviation
+// (POST /branch) and the server re-runs the whole pipeline from there in an
+// isolated `<cell>/_branch`. We keep the original scene rewound to the
+// deviation point and stream the branch's DOWNSTREAM nodes — bboxes + real
+// meshes — into the overlay as they're produced, so the change visibly
+// cascades. The panel flips to read-only and shows the branch's re-rendered
+// prompts. "Back to edit" drops the branch and returns to tuning; break-out
+// deletes it and restores the original run.
+// ===========================================================================
+
+function updateSimulateButton() {
+  if (!sandboxSimulateEl) return;
+  // Downstream simulation is just a mode — no test required. Enabled on any
+  // step (it forks before that step and steps through from there).
+  sandboxSimulateEl.disabled = !(sandboxActive && !branchActive && !!sandboxSteps[sandboxCursor]);
+}
+
+// Toggle the panel between EDIT (Phase A — tune the original) and BRANCH
+// (Phase B — step through the simulated downstream, editing each step's
+// re-rendered prompt before it runs).
+function applySandboxMode() {
+  const branch = branchActive;
+  sandboxPanelEl.classList.toggle("branch-mode", branch);
+  // Prompts stay editable in both modes (tune the original in EDIT; edit each
+  // step's prompt in BRANCH to run / re-run it).
+  sandboxSystemEl.readOnly = false;
+  sandboxUserEl.readOnly = false;
+  // EDIT-only buttons.
+  for (const el of [sandboxTestEl, sandboxResetEl, sandboxSimulateEl]) {
+    if (el) el.style.display = branch ? "none" : "";
+  }
+  // BRANCH-only buttons (runstep/rerun/runrest visibility within branch is
+  // refined per viewed step by updateBranchControls).
+  for (const el of [sandboxRunStepEl, sandboxRerunEl, sandboxRunRestEl, sandboxBackEl]) {
+    if (el) el.style.display = branch ? "" : "none";
+  }
+  // prev / next exist in both modes (navigate original steps in EDIT, branch
+  // steps in BRANCH).
+  for (const el of [sandboxPrevEl, sandboxNextEl]) {
+    if (el) el.style.display = "";
+  }
+  if (branch) updateBranchControls();
+  else updateSimulateButton();
+}
+
+async function simulateDownstream() {
+  if (!sandboxActive || branchActive) return;
+  const call = sandboxSteps[sandboxCursor];
+  if (!call) return;
+  sandboxSimulateEl.disabled = true;
+  setSandboxStatus("forking a branch & stepping through downstream…");
+  // Carry the in-progress edit into the first pause (this very step) so you
+  // don't retype it; consumed on the first branch.step.pending.
+  branchFirstPrompt = { system: sandboxSystemEl.value, user: sandboxUserEl.value };
+  let res;
+  try {
+    res = await fetch(
+      new URL(
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch?run=${encodeURIComponent(currentRun)}`,
+        SERVER_URL,
+      ),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deviation_index: call.eventIndex }),
+      },
+    );
+  } catch (e) {
+    setSandboxStatus(`branch failed: ${e.message}`, "err");
+    branchFirstPrompt = null;
+    updateSimulateButton();
+    return;
+  }
+  if (!res.ok) {
+    setSandboxStatus(`branch failed: HTTP ${res.status} — ${await res.text()}`, "err");
+    branchFirstPrompt = null;
+    updateSimulateButton();
+    return;
+  }
+  enterBranchView(call.eventIndex);
+}
+
+function enterBranchView(deviationIndex) {
+  branchActive = true;
+  branchDone = false;
+  branchSteps = [];
+  branchCursor = -1;
+  branchRebuilding = false;
+  branchStepBusy = false;
+  branchAuto = false;
+  branchDeviationIndex = deviationIndex;
+  branchGen += 1;
+  branchOverlayBboxIds.clear();
+  branchOverlayMeshes.clear();
+  // Keep the original scene rewound to the fork point; the branch's downstream
+  // renders on top (bboxes + meshes) as it streams.
+  clearSandboxOverlay();
+  rewindCutoffIndex = deviationIndex;
+  refreshAllVisibility();
+  applySandboxMode();
+  sandboxStepPillEl.textContent = "branch";
+  sandboxStepMetaEl.textContent = "simulating downstream…";
+  sandboxPosEl.textContent = "";
+  sandboxOutputWrapEl.classList.remove("show");
+  setSandboxStatus("forked — resolving the first downstream step…");
+  openBranchStream();
+}
+
+function openBranchStream() {
+  closeBranchStream();
+  const gen = branchGen;
+  const url = new URL(
+    `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch/events?run=${encodeURIComponent(currentRun)}`,
+    SERVER_URL,
+  );
+  const es = new EventSource(url);
+  branchSource = es;
+  es.onmessage = (ev) => {
+    if (gen !== branchGen) return;
+    let data;
+    try { data = JSON.parse(ev.data); } catch { return; }
+    dispatchBranchEvent(data);
+  };
+  es.onerror = () => {
+    if (es.readyState === EventSource.CLOSED && branchSource === es) branchSource = null;
+  };
+}
+
+function closeBranchStream() {
+  if (branchSource) {
+    branchSource.close();
+    branchSource = null;
+  }
+}
+
+function dispatchBranchEvent(e) {
+  const kind = e.kind;
+  const idx = typeof e.index === "number" ? e.index : -1;
+  if (kind === "branch.step.pending") {
+    // A new frontier pause (the next, un-run step). A pause means we're not
+    // running autonomously.
+    branchAuto = false;
+    branchSteps.push({
+      step: e.step || "(step)", owner: e.node || null, model: e.model || "",
+      system: e.system ?? "", user: e.user ?? "", output: null, reasoning: "",
+      ran: false, pauseIndex: idx, llmIndex: null,
+    });
+    branchStepBusy = false;
+    onBranchStepsGrew();
+    return;
+  }
+  if (kind === "cache.llm") {
+    if (idx <= branchDeviationIndex) return;
+    // A step ran → commit it. Normally it's the current frontier (last, un-run);
+    // under "run rest" (no pauses) there's no frontier, so append it.
+    const last = branchSteps[branchSteps.length - 1];
+    if (last && !last.ran) {
+      last.ran = true;
+      if (typeof e.system === "string") last.system = e.system;
+      if (typeof e.user === "string") last.user = e.user;
+      last.output = e.output ?? null;
+      last.reasoning = e.reasoning ?? "";
+      last.llmIndex = idx;
+    } else {
+      branchSteps.push({
+        step: e.step || "(step)", owner: e.node || null, model: e.model || "",
+        system: e.system ?? "", user: e.user ?? "", output: e.output ?? null,
+        reasoning: e.reasoning ?? "", ran: true, pauseIndex: null, llmIndex: idx,
+      });
+    }
+    // Stay busy while running autonomously so the controls don't flicker open
+    // mid-stream; "run.done" clears it.
+    if (!branchAuto) branchStepBusy = false;
+    onBranchStepsGrew();
+    return;
+  }
+  if (kind === "bbox" && typeof e.id === "string") {
+    if (idx > branchDeviationIndex) addBranchBbox(e);
+    return;
+  }
+  if (kind === "model" && typeof e.id === "string") {
+    if (idx > branchDeviationIndex) loadBranchMesh(e.id, e.url);
+    return;
+  }
+  if (kind === "run.done") {
+    branchDone = true;
+    branchAuto = false;
+    branchStepBusy = false;
+    if (branchRebuilding) { maybeSettleRebuild(); return; }
+    if (branchCursor >= 0) renderBranchStep(branchCursor);
+    else updateBranchControls();
+    return;
+  }
+  if (kind === "run.error") {
+    branchAuto = false;
+    branchStepBusy = false;
+    branchRebuilding = false; // don't leave the controls wedged if a rebuild errors
+    if (branchCursor < 0 && branchSteps.length) branchCursor = branchSteps.length - 1;
+    setSandboxStatus(`branch error: ${e.message ?? "unknown"}`, "err");
+    if (branchCursor >= 0) renderBranchStep(branchCursor);
+    else updateBranchControls();
+  }
+}
+
+// React to branchSteps changing. During a rebuild (after a re-run reopen), hold
+// until the re-run target step re-commits, then settle the cursor on it.
+// Otherwise focus the first step on the initial pause (carrying the EDIT-mode
+// edit) or refresh the currently-viewed step (its controls / result).
+function onBranchStepsGrew() {
+  if (branchRebuilding) { maybeSettleRebuild(); return; }
+  if (branchCursor === -1) {
+    const carried = branchFirstPrompt;
+    branchFirstPrompt = null;
+    renderBranchStep(0, carried);
+  } else {
+    renderBranchStep(branchCursor);
+  }
+}
+
+// A re-run reopen replays the (fast) committed prefix and then makes a REAL
+// (slow) LLM call for the re-run target itself. So we can't settle on a timer —
+// we settle once the target step has actually re-committed (or the branch ends),
+// landing the cursor on the target's fresh result.
+function maybeSettleRebuild() {
+  const t = branchReopenTarget;
+  const ready = branchDone || (t >= 0 && t < branchSteps.length && !!branchSteps[t] && branchSteps[t].ran);
+  if (!ready) {
+    setSandboxStatus("re-running this step (invalidating later steps)…");
+    return;
+  }
+  branchRebuilding = false;
+  branchStepBusy = false;
+  const target = branchSteps.length ? Math.max(0, Math.min(t, branchSteps.length - 1)) : -1;
+  if (target >= 0) renderBranchStep(target);
+  else updateBranchControls();
+}
+
+// Set the step header (pill + "<verb> <owner> · model").
+function setBranchHeader(verb, step, owner, model) {
+  sandboxStepPillEl.textContent = step ?? "(step)";
+  sandboxStepMetaEl.textContent = "";
+  const v = document.createElement("span");
+  v.textContent = `${verb} `;
+  const o = document.createElement("b");
+  o.textContent = owner ?? "—";
+  sandboxStepMetaEl.append(v, o);
+  if (model) {
+    const m = document.createElement("span");
+    m.textContent = `   ·   ${model}`;
+    sandboxStepMetaEl.append(m);
+  }
+  sandboxPosEl.textContent = "";
+}
+
+// Render the step at `i`. The frontier (un-run, last) shows its editable
+// re-rendered prompt to run. A committed step shows the prompt that was
+// actually committed to the branch log + its output + reasoning, editable so
+// it can be re-run. `override` seeds the textareas (the carried EDIT-mode edit
+// on the first step).
+function renderBranchStep(i, override) {
+  if (i < 0 || i >= branchSteps.length) { updateBranchControls(); return; }
+  branchCursor = i;
+  const s = branchSteps[i];
+  const isFrontier = !s.ran;
+  setBranchHeader(isFrontier ? "paused before" : "committed", s.step, s.owner, s.model);
+  sandboxPosEl.textContent = `step ${i + 1} / ${branchSteps.length}`;
+  sandboxSystemEl.readOnly = false;
+  sandboxUserEl.readOnly = false;
+  sandboxSystemEl.value = override ? (override.system ?? "") : (s.system ?? "");
+  sandboxUserEl.value = override ? (override.user ?? "") : (s.user ?? "");
+  markSandboxEdited();
+  if (s.ran && s.output != null) {
+    sandboxOutputWrapEl.classList.add("show");
+    sandboxOutputEl.textContent = JSON.stringify(s.output, null, 2);
+    sandboxRenderNoteEl.textContent = "output of this step";
+    sandboxRenderNoteEl.classList.remove("nothing");
+    const r = (s.reasoning ?? "").trim();
+    sandboxReasoningEl.style.display = r ? "" : "none";
+    sandboxReasoningBodyEl.textContent = r;
+  } else {
+    sandboxOutputWrapEl.classList.remove("show");
+    sandboxOutputEl.textContent = "";
+    sandboxReasoningEl.style.display = "none";
+    sandboxReasoningBodyEl.textContent = "";
+  }
+  if (isFrontier) {
+    setSandboxStatus("paused — edit this step's prompt, then run it (or run the rest)");
+  } else {
+    setSandboxStatus("committed step — edit + re-run to change it (invalidates later steps)");
+  }
+  updateBranchControls();
+}
+
+function updateBranchControls() {
+  if (!branchActive) return;
+  const s = branchSteps[branchCursor];
+  const onFrontier = !!s && !s.ran;
+  const onCommitted = !!s && s.ran;
+  const idle = !branchStepBusy && !branchRebuilding;
+  // prev / next: pure (non-destructive) observability navigation.
+  if (sandboxPrevEl) sandboxPrevEl.disabled = !(idle && branchCursor > 0);
+  if (sandboxNextEl) sandboxNextEl.disabled = !(idle && branchCursor < branchSteps.length - 1);
+  // Run (frontier) — run the next, un-run step.
+  if (sandboxRunStepEl) {
+    sandboxRunStepEl.style.display = onFrontier ? "" : "none";
+    sandboxRunStepEl.disabled = !(onFrontier && idle && !branchDone);
+  }
+  // Re-run (committed) — DESTRUCTIVE: invalidates everything after this step.
+  if (sandboxRerunEl) {
+    sandboxRerunEl.style.display = onCommitted ? "" : "none";
+    sandboxRerunEl.disabled = !(onCommitted && idle && s.llmIndex != null);
+  }
+  // Run rest — only from the frontier.
+  if (sandboxRunRestEl) {
+    sandboxRunRestEl.style.display = onFrontier ? "" : "none";
+    sandboxRunRestEl.disabled = !(onFrontier && idle && !branchDone);
+  }
+}
+
+// Low-level: tell the server to advance past the current pause. Returns true on
+// success. Does not manage busy — callers do.
+async function sendBranchProceed(body) {
+  try {
+    const res = await fetch(
+      new URL(
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch/step?run=${encodeURIComponent(currentRun)}`,
+        SERVER_URL,
+      ),
+      { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+    );
+    if (!res.ok) {
+      setSandboxStatus(`step failed: HTTP ${res.status}`, "err");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    setSandboxStatus(`step failed: ${err.message}`, "err");
+    return false;
+  }
+}
+
+async function sendBranchRerun(llmIndex, system, user) {
+  try {
+    const res = await fetch(
+      new URL(
+        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch/rerun?run=${encodeURIComponent(currentRun)}`,
+        SERVER_URL,
+      ),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ llm_index: llmIndex, system, user }),
+      },
+    );
+    if (!res.ok) {
+      setSandboxStatus(`re-run failed: HTTP ${res.status}`, "err");
+      return false;
+    }
+    return true;
+  } catch (err) {
+    setSandboxStatus(`re-run failed: ${err.message}`, "err");
+    return false;
+  }
+}
+
+// Observability navigation — non-destructive (just moves the viewed step).
+function navBranch(delta) {
+  if (!branchActive || branchStepBusy || branchRebuilding) return;
+  const i = branchCursor + delta;
+  if (i < 0 || i >= branchSteps.length) return;
+  renderBranchStep(i);
+}
+
+// Run the frontier step with the edited prompt; the stream commits it + appends
+// the next frontier.
+async function runBranchStep() {
+  if (!branchActive || branchStepBusy || branchRebuilding) return;
+  const s = branchSteps[branchCursor];
+  if (!s || s.ran) return;
+  branchStepBusy = true;
+  updateBranchControls();
+  setSandboxStatus("running this step…");
+  const ok = await sendBranchProceed({ system: sandboxSystemEl.value, user: sandboxUserEl.value });
+  if (!ok) { branchStepBusy = false; updateBranchControls(); }
+}
+
+// Run the rest of the branch from the frontier with no further pauses.
+async function runBranchRest() {
+  if (!branchActive || branchStepBusy || branchRebuilding || branchDone) return;
+  const s = branchSteps[branchCursor];
+  if (!s || s.ran) return; // only from the frontier
+  branchStepBusy = true;
+  branchAuto = true;
+  updateBranchControls();
+  setSandboxStatus("running the rest of the branch…");
+  const ok = await sendBranchProceed({
+    system: sandboxSystemEl.value, user: sandboxUserEl.value, auto: true,
+  });
+  if (!ok) { branchStepBusy = false; branchAuto = false; updateBranchControls(); }
+}
+
+// Re-run a COMMITTED step with the edited prompt: invalidates everything after
+// it (server truncates + replays), then re-syncs from the rebuilt branch log,
+// landing back on this step's new result.
+async function reRunBranchStep() {
+  if (!branchActive || branchStepBusy || branchRebuilding) return;
+  const s = branchSteps[branchCursor];
+  if (!s || !s.ran || s.llmIndex == null) return;
+  const target = branchCursor;
+  branchStepBusy = true;
+  branchAuto = false; // re-run drops us back into interactive stepping
+  updateBranchControls();
+  setSandboxStatus("re-running this step (invalidating later steps)…");
+  const ok = await sendBranchRerun(s.llmIndex, sandboxSystemEl.value, sandboxUserEl.value);
+  if (!ok) { branchStepBusy = false; updateBranchControls(); return; }
+  // Rebuild from the truncated + re-run log; settle the cursor back on this step.
+  branchReopenTarget = target;
+  branchRebuilding = true;
+  branchSteps = [];
+  branchCursor = -1;
+  branchDone = false;
+  branchGen += 1; // invalidate stale mesh loads from the undone steps
+  branchOverlayBboxIds.clear();
+  branchOverlayMeshes.clear();
+  clearSandboxOverlay();
+  openBranchStream(); // fresh snapshot rebuilds the overlay + the step history
+}
+
+// Draw a deviated branch node's (world-frame) bbox into the overlay. The branch
+// emits world coordinates already, so no parent-frame conversion is needed.
+function addBranchBbox(e) {
+  if (branchOverlayBboxIds.has(e.id)) return;
+  if (!Array.isArray(e.origin) || !Array.isArray(e.dimensions)) return;
+  branchOverlayBboxIds.add(e.id);
+  addSandboxOverlayBox(e.origin, e.dimensions, {
+    id: e.id,
+    kind: e.node_kind ?? "object",
+    prompt: typeof e.prompt === "string" ? e.prompt : null,
+  });
+}
+
+async function loadBranchMesh(id, url) {
+  if (!url) return;
+  const gen = branchGen;
+  let gltf;
+  try {
+    gltf = await loader.loadAsync(new URL(url, SERVER_URL).toString());
+  } catch {
+    return;
+  }
+  if (gen !== branchGen || !branchActive) {
+    disposeObject3D(gltf.scene);
+    return;
+  }
+  gltf.scene.traverse((child) => {
+    if (child.isMesh && child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const m of mats) m.side = THREE.DoubleSide;
+    }
+  });
+  const prev = branchOverlayMeshes.get(id);
+  if (prev) {
+    sandboxOverlayRoot.remove(prev);
+    disposeObject3D(prev);
+  }
+  sandboxOverlayRoot.add(gltf.scene);
+  branchOverlayMeshes.set(id, gltf.scene);
+}
+
+// Local-only branch teardown (no DELETE) — shared by discardBranch + the silent
+// cell-switch teardown.
+function clearBranchStateLocal() {
+  branchActive = false;
+  branchGen += 1; // invalidate any pending mesh loads
+  branchDone = false;
+  branchSteps = [];
+  branchCursor = -1;
+  branchRebuilding = false;
+  branchStepBusy = false;
+  branchAuto = false;
+  branchFirstPrompt = null;
+  closeBranchStream();
+  branchOverlayBboxIds.clear();
+  branchOverlayMeshes.clear();
+  clearSandboxOverlay();
+}
+
+async function discardBranch() {
+  if (!branchActive) return;
+  const slotId = currentSlotId, model = currentModel, run = currentRun;
+  clearBranchStateLocal();
+  try {
+    await fetch(
+      new URL(
+        `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/branch?run=${encodeURIComponent(run)}`,
+        SERVER_URL,
+      ),
+      { method: "DELETE" },
+    );
+  } catch {}
+}
+
+// Phase B -> Phase A: drop the branch and return to tuning the step we forked.
+async function backToEdit() {
+  if (!branchActive) return;
+  const cursor = sandboxCursor;
+  await discardBranch();
+  applySandboxMode();
+  gotoSandboxStep(cursor);
 }
 
 // Break out: discard all tuning, restore the full scene instantly (the objects
@@ -4452,6 +5104,8 @@ async function exitSandbox() {
   const slotId = currentSlotId;
   const model = currentModel;
   const run = currentRun;
+  // Drop any active branch (cancels its server task + deletes the temp dir).
+  if (branchActive) await discardBranch();
   sandboxActive = false;
   rewindCutoffIndex = null;
   clearSandboxOverlay();
@@ -4486,10 +5140,26 @@ async function exitSandbox() {
   refreshSlots();
 }
 
-// Hard teardown with no server calls — used when the cell itself is going away
-// (slot/model/run switch, reset). The follow-up clearScene wipes the overlay.
+// Hard teardown with no awaited server calls — used when the cell itself is
+// going away (slot/model/run switch, reset). The follow-up clearScene wipes the
+// overlay. Fires a best-effort branch DELETE for the cell we're leaving.
 function teardownSandboxSilently() {
-  if (!sandboxActive) return;
+  if (!sandboxActive && !branchActive) return;
+  if (branchActive) {
+    const slotId = currentSlotId, model = currentModel, run = currentRun;
+    clearBranchStateLocal();
+    if (slotId && model && run) {
+      try {
+        fetch(
+          new URL(
+            `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/branch?run=${encodeURIComponent(run)}`,
+            SERVER_URL,
+          ),
+          { method: "DELETE", keepalive: true },
+        ).catch(() => {});
+      } catch {}
+    }
+  }
   sandboxActive = false;
   rewindCutoffIndex = null;
   clearSandboxOverlay();
@@ -4544,8 +5214,13 @@ sandboxResetEl?.addEventListener("click", () => {
   markSandboxEdited();
   setSandboxStatus("prompts reset to the recorded values");
 });
-sandboxPrevEl?.addEventListener("click", () => gotoSandboxStep(sandboxCursor - 1));
-sandboxNextEl?.addEventListener("click", () => gotoSandboxStep(sandboxCursor + 1));
+sandboxPrevEl?.addEventListener("click", () => (branchActive ? navBranch(-1) : gotoSandboxStep(sandboxCursor - 1)));
+sandboxNextEl?.addEventListener("click", () => (branchActive ? navBranch(1) : gotoSandboxStep(sandboxCursor + 1)));
+sandboxSimulateEl?.addEventListener("click", simulateDownstream);
+sandboxRunStepEl?.addEventListener("click", runBranchStep);
+sandboxRerunEl?.addEventListener("click", reRunBranchStep);
+sandboxRunRestEl?.addEventListener("click", runBranchRest);
+sandboxBackEl?.addEventListener("click", backToEdit);
 sandboxBreakoutEl?.addEventListener("click", () => exitSandbox());
 sandboxCloseEl?.addEventListener("click", () => exitSandbox());
 sandboxSystemEl?.addEventListener("input", markSandboxEdited);
@@ -4610,8 +5285,13 @@ function positionTooltip(clientX, clientY, id) {
     tooltip.appendChild(row);
   }
 
-  // Flip left/up when the tooltip would overflow the viewport so the cursor
-  // can keep approaching the hovered bbox from any direction.
+  placeTooltip(clientX, clientY);
+}
+
+// Flip left/up when the tooltip would overflow the viewport so the cursor can
+// keep approaching the hovered box from any direction. Assumes tooltip content
+// is already set.
+function placeTooltip(clientX, clientY) {
   tooltip.style.display = "block";
   tooltip.style.left = "0px";
   tooltip.style.top = "0px";
@@ -4624,6 +5304,37 @@ function positionTooltip(clientX, clientY, id) {
   if (y + h > window.innerHeight) y = clientY - pad - h;
   tooltip.style.left = `${Math.max(0, x)}px`;
   tooltip.style.top = `${Math.max(0, y)}px`;
+}
+
+// Tooltip for a magenta overlay box — same look as the canvas bbox tooltip,
+// built from the box's own metadata (the branch/tested node isn't in the tree).
+function positionOverlayTooltip(clientX, clientY, oid) {
+  const entry = sandboxOverlayBoxes.get(oid);
+  if (!entry) { tooltip.style.display = "none"; return; }
+  const kind = entry.kind;
+  tooltip.textContent = "";
+  const head = document.createElement("div");
+  if (kind) {
+    const kindEl = document.createElement("span");
+    kindEl.textContent = `[${kind}]`;
+    kindEl.style.color = TOOLTIP_KIND_COLOR[kind] ?? "#e6e6e6";
+    head.appendChild(kindEl);
+    head.appendChild(document.createTextNode(" "));
+  }
+  head.appendChild(document.createTextNode(entry.id ?? "(box)"));
+  tooltip.appendChild(head);
+  if (entry.prompt) {
+    const row = document.createElement("div");
+    row.style.marginTop = "4px";
+    row.style.color = "#bdbdbd";
+    const lbl = document.createElement("span");
+    lbl.textContent = "seed: ";
+    lbl.style.color = "#7a8190";
+    row.appendChild(lbl);
+    row.appendChild(document.createTextNode(entry.prompt));
+    tooltip.appendChild(row);
+  }
+  placeTooltip(clientX, clientY);
 }
 
 // Zones-only picking is active when the toggle is set to "zones" OR the user
@@ -4724,6 +5435,7 @@ renderer.domElement.addEventListener("pointermove", (ev) => {
 renderer.domElement.addEventListener("pointerleave", () => {
   pointerInsideCanvas = false;
   setHoveredBbox(null);
+  setHoveredOverlay(null);
   tooltip.style.display = "none";
 });
 
@@ -4759,6 +5471,11 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
   pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
   pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
   raycaster.setFromCamera(pointer, camera);
+  if (sandboxActive) {
+    // Select the magenta overlay box (highlight it); the tooltip already names it.
+    selectOverlay(pickHoveredOverlayId());
+    return;
+  }
   const id = pickHoveredBboxId();
   if (id !== null) {
     selectTreeNode(id);

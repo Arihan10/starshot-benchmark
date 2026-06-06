@@ -14,7 +14,7 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from pathlib import Path
 from typing import TypeVar
@@ -42,6 +42,20 @@ _current_model: ContextVar[str | None] = ContextVar("_current_model", default=No
 
 def set_model(model: str) -> None:
     _current_model.set(model)
+
+
+# Optional per-task breakpoint. When set, `call_llm` awaits it right before
+# issuing a REAL (cache-miss) call, handing over the rendered call context and
+# receiving back the (possibly hand-edited) `(system, user)` to actually send.
+# The prompt-tuning branch binds one in its task so it can PAUSE at every
+# downstream step for editing; every other task leaves it None (the default),
+# so the normal pipeline never blocks.
+StepGate = Callable[..., Awaitable[tuple[str, str]]]
+_step_gate: ContextVar[StepGate | None] = ContextVar("_step_gate", default=None)
+
+
+def set_step_gate(gate: StepGate | None) -> None:
+    _step_gate.set(gate)
 
 
 class OutputValidationError(Exception):
@@ -104,7 +118,26 @@ async def call_llm(
             validate(cached)
         return cached
 
-    validated, reasoning, usage = await call_llm_once(
+    # Breakpoint: a bound step gate (the prompt-tuning branch) pauses here —
+    # AFTER the cache check, so committed/cached steps replay untouched and only
+    # genuinely-new frontier steps stop — to let the user edit this step's
+    # re-rendered prompt before it runs. The (possibly edited) prompt then
+    # drives the call and is what gets cached/logged.
+    gate = _step_gate.get()
+    if gate is not None:
+        system, user = await gate(
+            node_id=node_id,
+            step=step,
+            system=system,
+            user=user,
+            schema_name=schema_name,
+            model=model,
+        )
+        key = cache.hash_llm_call(
+            model=model, system=system, user=user, schema_name=schema_name,
+        )
+
+    validated, reasoning, usage, raw = await call_llm_once(
         system=system,
         user=user,
         output_schema=output_schema,
@@ -126,7 +159,7 @@ async def call_llm(
         schema=schema_name,
         system=system,
         user=user,
-        output=validated.model_dump(mode="json"),
+        output=raw,
         reasoning=reasoning,
         tokens_in=getattr(usage, "prompt_tokens", None),
         tokens_out=getattr(usage, "completion_tokens", None),
@@ -143,7 +176,7 @@ async def call_llm_once(
     validate: Callable[[T], None] | None = None,
     step: str | None = None,
     log_retries: bool = True,
-) -> tuple[T, str, object]:
+) -> tuple[T, str, object, object]:
     """One structured-output call with the full resample/backoff budget,
     WITHOUT the content-addressed cache lookup or the `cache.llm` log write
     that `call_llm` wraps around it. Returns `(validated, reasoning, usage)`.
@@ -219,7 +252,11 @@ async def call_llm_once(
             # includes reasoning tokens (OpenRouter bills them at the
             # completion rate), so no separate reasoning field is needed.
             usage = getattr(response, "usage", None)
-            return validated, reasoning, usage
+            # Return the raw parsed response (`args`) alongside the validated
+            # model so callers can log EXACTLY what the model emitted — the wire
+            # field names and values — rather than a re-serialized, attribute-
+            # named `model_dump`.
+            return validated, reasoning, usage, args
         except OutputValidationError as e:
             if id_validation_attempt >= ID_VALIDATION_MAX - 1:
                 raise

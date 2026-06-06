@@ -702,8 +702,9 @@ class ChildNodeSpec(BaseModel):
     # divider/generation/topology + Node use across every version:
     # `relationship_ids` -> attr `referenced_ids`, `parent_relationship_kind`
     # -> attr `parent_kind`. `populate_by_name` lets committed-event replay
-    # (which dumps by attribute name) round-trip back in.
-    model_config = ConfigDict(populate_by_name=True)
+    # (which dumps by attribute name) round-trip back in; `serialize_by_alias`
+    # now makes new dumps use the alias names so logs match the wire.
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     id: str
     prompt: str

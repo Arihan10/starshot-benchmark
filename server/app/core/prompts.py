@@ -132,7 +132,7 @@ The per-axis fill never crops and never auto-rotates, so a box whose X:Z proport
 # --- canonical scene-context tree --------------------------------------------
 #
 # Every prompt that shows the LLM "what does the scene look like right now" routes through the renderers below.
-# They render one data shape: the subregion tree (regions only) followed by a flat list of every object. Objects are never nested under regions — each object entry carries its own `parent` (structural anchor) and `parent_region`, so the rendered information mirrors V1's flat <ZONES>/<OBJECTS> dump.
+# They render the scene as an embedded subregion tree: each subregion lists the objects placed inside it inline beneath it, then its nested subregions. Objects are never nested under one another — each object entry carries its own `parent` (structural anchor) and `parent_region`.
 # They share the entry/formatting helpers here and the type-agnostic utilities in `util`.
 
 _NO_NODES_MESSAGE = "(no regions or objects have been placed yet — this is the very start of the run)"
@@ -167,7 +167,7 @@ def _local_coords_line(node: Node, by_id: dict[str, Node]) -> str | None:
 def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str) -> str:
     """Full-detail entry for one concrete object (no plan), rendered as a member of the scene's flat object list.
 
-    `parent` is the object's structural-anchor block — `parent_id` (the peer object or region this object physically rests on / attaches to / sits inside), `parent_relationship_kind` (ON / ATTACHED / IN), `parent_dimensions` (that parent's size), and `parent_global_origin_corner` (its world position) — modeled on the `parent_region` block in `_region_plan_entry`. `parent_region` is the id of the subregion this object belongs to and `parent_region_dimensions` is that region's size; both are omitted when `parent_region` would equal `parent_id` (the object anchors directly to its region — the `parent` block already states them), and they are shown only when the object anchors to a peer object (e.g. a lamp ON a nightstand has parent_id=nightstand, parent_region=<the subregion the nightstand is in>). Together they carry the same information V1's flat <OBJECTS> dump splits across the `parent` pointer and the node's position in the tree."""
+    `parent` is the object's structural-anchor block — `parent_id` (the peer object or region this object physically rests on / attaches to / sits inside), `parent_relationship_kind` (ON / ATTACHED / IN), `parent_dimensions` (that parent's size), and `parent_global_origin_corner` (its world position). `parent_region` is the id of the subregion this object belongs to and `parent_region_dimensions` is that region's size; both are omitted when `parent_region` would equal `parent_id` (the object anchors directly to its region — the `parent` block already states them), and they are shown only when the object anchors to a peer object (e.g. a lamp ON a nightstand has parent_id=nightstand, parent_region=<the subregion the nightstand is in>)."""
     lines = [
         f"Name: {obj.id}",
         f'Description: "{obj.prompt}"',
@@ -207,58 +207,6 @@ def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str) -> str:
         lines.append(local)
     return util.braces("\n".join(lines))
 
-
-def _region_plan_entry(
-    region: Node,
-    idx: dict[str | None, list[Node]],
-    by_id: dict[str, Node],
-    target_id: str | None = None,
-    target_text: str = "",
-) -> str:
-    """Subregion tree, regions only: a subregion's fields and (recursively) its nested subregions. Objects are no longer listed here — every object in the scene is rendered once in the flat list produced by `render_objects_flat`, each carrying its own `parent_region`. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one region."""
-    _, subregions = util.split_region_members(region.id, idx)
-    name_line = f"Name: {region.id}"
-    if target_id is not None and region.id == target_id:
-        name_line += f"   {_TARGET_MARKER} {target_text}".rstrip()
-    lines = [
-        name_line,
-        f'Description: "{region.prompt}"',
-    ]
-    if region.plan is not None:
-        lines.append(f'Plan for this region: "{region.plan}"')
-    if region.placement is not None:
-        lines.append(f'placement: "{region.placement}"')
-    if region.referenced_ids:
-        refs = ", ".join(f"{r.target}: {r.kind.value}" for r in region.referenced_ids)
-        lines.append(f"relationships: [{refs}]")
-    lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
-    lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
-    lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
-    local = _local_coords_line(region, by_id)
-    if local is not None:
-        lines.append(local)
-    if region.parent_id is not None and region.parent_id in by_id:
-        parent = by_id[region.parent_id]
-        parent_placement = f'"{parent.placement}"' if parent.placement is not None else "(none)"
-        parent_lines = [
-            f"parent_name: {parent.id}",
-            f"parent_placement: {parent_placement}",
-            f"parent_dimensions: {util.format_dimensions(parent.bbox)}",
-            f"parent_global_origin_corner: {util.format_global_origin(parent.bbox)}",
-        ]
-        lines.append("parent_region: " + util.braces("\n".join(parent_lines)))
-    if subregions:
-        lines += [
-            "",
-            f'"{region.id}" decomposes into the following further subregions.',
-            "",
-            util.brace_group(
-                [_region_plan_entry(s, idx, by_id, target_id, target_text) for s in subregions]
-            ),
-        ]
-    return util.braces("\n".join(lines))
-
-
 def _region_embedded_entry(
     region: Node,
     idx: dict[str | None, list[Node]],
@@ -280,6 +228,11 @@ def _region_embedded_entry(
         lines.append(f'Plan for this region: "{region.plan}"')
     if region.placement is not None:
         lines.append(f'placement: "{region.placement}"')
+    if region.referenced_ids:
+        refs = ", ".join(f"{r.target}: {r.kind.value}" for r in region.referenced_ids)
+        lines.append(f"relationships: [{refs}]")
+    else:
+        lines.append("relationships: []")
     lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
     lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
     lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
@@ -366,60 +319,6 @@ def _render_to_place_block(
     return util.brace_group(entries)
 
 
-def render_subregions_block(
-    nodes: list[Node],
-    *,
-    node_id: str | None = None,
-    text: str = "",
-) -> str:
-    """Pseudo-JSON block of the scene's subregion tree (regions only): each carries its plan and bbox, recursing into nested subregions. Objects are rendered separately in the flat list (`render_objects_flat`). Renders the single-region placeholder when the scene is one undivided region.
-
-    Pass `node_id` to point the LLM at one specific region: the subregion whose id matches gets an inline target marker carrying `text` appended to its name line, found at any depth of the tree. With `node_id` unset (the default) the block renders exactly as before."""
-    root = util.find_root(nodes)
-    if root is None:
-        return _NO_SUBREGIONS_MESSAGE
-    by_id = {n.id: n for n in nodes}
-    idx = util.index_children(nodes)
-    _, subregions = util.split_region_members(root.id, idx)
-    if not subregions:
-        return _NO_SUBREGIONS_MESSAGE
-    return util.brace_group(
-        [_region_plan_entry(s, idx, by_id, node_id, text) for s in subregions]
-    )
-
-
-def render_direct_subregions(nodes: list[Node], zone_id: str) -> str:
-    """Pseudo-JSON block of `zone_id`'s DIRECT child subregions (regions only), rendered exactly like the scene's top-level subregion list (`render_subregions_block`): each entry carries its plan and bbox and recurses into its own nested subregions. Objects are not listed here — every object in the scene lives in the flat list produced by `render_objects_flat`. Renders the single-region placeholder when `zone_id` has no child subregions of its own."""
-    by_id = {n.id: n for n in nodes}
-    idx = util.index_children(nodes)
-    _, subregions = util.split_region_members(zone_id, idx)
-    if not subregions:
-        return _NO_SUBREGIONS_MESSAGE
-    return util.brace_group(
-        [_region_plan_entry(s, idx, by_id) for s in subregions]
-    )
-
-
-def render_objects_flat(nodes: list[Node]) -> str:
-    """Pseudo-JSON block of EVERY object in the scene as a single flat list — no nesting under regions. Each object is rendered once via `_object_entry`, tagged with its `parent_region` (the subregion it belongs to) + `parent_region_dimensions` and its `parent` block (structural anchor). Objects are walked region by region (root first, then a depth-first descent through subregions) so the list is deterministic; an object whose structural parent is a peer object still appears under the region that contains it. Renders an empty `{}` block when the scene has no objects yet."""
-    root = util.find_root(nodes)
-    if root is None:
-        return util.brace_group([])
-    by_id = {n.id: n for n in nodes}
-    idx = util.index_children(nodes)
-    oidx = util.index_objects_by_region(nodes)
-    entries: list[str] = []
-
-    def walk(region: Node) -> None:
-        objects, subregions = util.split_region_members_owned(region.id, idx, oidx)
-        entries.extend(_object_entry(o, by_id, parent_zone=region.id) for o in objects)
-        for s in subregions:
-            walk(s)
-
-    walk(root)
-    return util.brace_group(entries)
-
-
 def render_root_objects(nodes: list[Node]) -> str:
     """Flat list of the objects anchored directly to the scene root — the
     shared geometry (shells, ground planes, ambient root-level fill) the whole
@@ -465,37 +364,6 @@ def render_embedded_block(
     return util.brace_group(
         [_region_embedded_entry(s, idx, oidx, by_id, node_id, text) for s in subregions]
     )
-
-
-def render_scene_tree(
-    *,
-    nodes: list[Node],
-    to_place: list[ChildNodeSpec] | list[ObjectSpec] | None = None,
-) -> str:
-    """Render the scene context as the subregion tree (regions only) followed by the flat list of every object in the scene. Each object appears exactly once in the flat list, tagged with its `parent` (structural anchor) and `parent_region` — there is no nesting of objects under regions.
-    """
-    if not nodes:
-        return _NO_NODES_MESSAGE
-    root = util.find_root(nodes)
-    if root is None:
-        return _NO_NODES_MESSAGE
-    by_id = {n.id: n for n in nodes}
-
-    body = f"""This is the overall plan for the entire scene.
-
-{_root_scene_header(root)}
-
-Each scene is always subdivided into a set of subregions. Each subregion can contain further subregions inside; the objects that fill the scene are listed separately as a flat list below.
-
-Here's the list of subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built, its dimensions, and a global coordinate marking its origin corner. Additionally, each subregion will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.
-
-{render_subregions_block(nodes)}
-
-The objects that fill these regions are listed below as a single flat list. Objects are not nested under their regions. Each object has a description detailing what it is, a `parent` block (its structural anchor — `parent_id`, `parent_relationship_kind`, and `parent_dimensions`; the parent can either be another object or the region it belongs to itself), a `parent_region` (the region it belongs to) with `parent_region_dimensions`, its dimensions, a global coordinate marking its origin corner, and a set of local coordinates that define that origin relative to its parent. An object's `parent_region`/`parent_region_dimensions` are omitted when its structural parent is its region, since the `parent` block already states them.
-
-{render_objects_flat(nodes)}"""
-
-    return body + _render_to_place_block(to_place, by_id)
 
 
 # ---------- Step 1: region plan (high-level authoring; runs for every region) ---
@@ -748,9 +616,11 @@ class ChildNodeSpec(BaseModel):
     # prompt text, while the Python attributes stay the names the shared
     # divider/generation/topology + Node use across every version:
     # `relationships` -> attr `referenced_ids`, `parent_relationship_kind`
-    # -> attr `parent_kind`. `populate_by_name` lets committed-event replay
-    # (which dumps by attribute name) round-trip back in.
-    model_config = ConfigDict(populate_by_name=True)
+    # -> attr `parent_kind`. `serialize_by_alias` makes every model_dump (the
+    # observability/committed logs) emit the alias names, so logs match exactly
+    # what the model is shown and emits; `populate_by_name` still accepts the
+    # attribute names so older logs dumped before this round-trip back in.
+    model_config = ConfigDict(populate_by_name=True, serialize_by_alias=True)
 
     id: str
     prompt: str
@@ -954,35 +824,12 @@ class ObjectSpec(ChildNodeSpec):
     capture additional spatial connections — sibling alignment, the
     wall a painting hangs against, etc."""
 
-
-class BoundExistingFrame(BaseModel):
-    """Audit entry for the encapsulating step's BINDING CONTRACT.
-
-    When a structural element named in the region's plan is already
-    satisfied by an existing peer (option (b) of the contract), the LLM
-    records the binding here instead of emitting a new shell node. These
-    entries do NOT become Nodes and do NOT flow into bbox-resolution or
-    any downstream step — they're a per-call audit trail proving the
-    LLM made the binding choice deliberately rather than silently
-    skipping the plan-named element.
-    """
-
-    plan_element: str  # noun phrase from the region plan (e.g. "rear partition wall")
-    peer_id: str  # id of an existing node in <OBJECTS> that satisfies it
-
-
 class ObjectDecompOutput(BaseModel):
     # NEWLY EMITTED shell/object specs. These become Nodes downstream.
     objects: list[ObjectSpec] = Field(default_factory=list)
-    # OPTION (b) audit entries for the encapsulating step's binding
-    # contract. Used only by the encapsulating decomposer; anchor and
-    # negative-space decompositions leave this empty. Captured in the
-    # event log (visible in the observability view) but dropped before
-    # downstream pipeline steps.
-    bound_existing: list[BoundExistingFrame] = Field(default_factory=list)
-    # Encapsulating-only gate: if False, the region needs no bounding
-    # perimeter and `objects` is ignored even when non-empty. Anchor and
-    # negative-space decompositions ignore this field.
+    # Encapsulating-only gate: when the model sets this False the region needs no
+    # bounding perimeter and `objects` is ignored even if non-empty. Anchor and
+    # negative-space decompositions leave it at the default True.
     bounding_required: bool = True
 
 
@@ -1001,7 +848,6 @@ Respond with a single JSON object containing:
   - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z (toward viewer), `90` = front faces +X (to the right), `180` = front faces -Z (away), `-90` = front faces -X (to the left); positive degrees swing the front toward +X (right), negative toward -X (left). Use 0 for symmetric objects.
   - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
   - `relationships` (list of {{target, kind}}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
-- `bound_existing` (list): used only by the encapsulating step (anchor and negative-space leave this empty). Each entry has `plan_element` (the plan's noun phrase verbatim) and `peer_id` (the id of an existing node that already satisfies it).
 - `bounding_required` (bool): used only by the encapsulating step (anchor and negative-space leave this as the default `true`). Set to `false` when the region needs no bounding perimeter at all — `objects` is then ignored downstream even if non-empty. Set to `true` when at least one bounding object is being emitted.
 
 No additional prose, markdown, or code fences.
@@ -1544,5 +1390,5 @@ Subregion global origin corner: {util.format_global_origin(zone_bbox)}
 
 If you choose yes, output a list of ObjectSpecs describing the objects to add this round — that may be a single object or several at once. The pipeline will then place them and loop back to this step again, and this continues until you say no (by which point the region should feel complete). If you choose no, set done = true and the pipeline moves onto another region.
 
-Each object you generate should be individualistic - do not rely on the downstream 3D model generation step to be able to parse complex arrangements of objects or objects of composite shape properly; you are instead responsible for breaking what you want to add into discrete, self-contained partial objects, each emitted as its own entry in the list with its own placement text. This will allow the downstream step responsible for coming up with the concrete bounding box locations for each object to properly lay out the partial objects in the exact way you want. {retry_block}
+Each object you generate should be individualistic - do not rely on the downstream 3D model generation step to be able to parse complex arrangements of objects or objects of composite shape properly; you are instead responsible for breaking what you want to add into discrete, self-contained partial objects, each emitted as its own entry in the list with its own placement text. This will allow the downstream step responsible for coming up with the concrete bounding box locations for each object to properly lay out the partial objects in the exact way you want. When deciding whether more objects are needed and placing these objets, also consider the rest of the scene context and how the objects you add and place might protrude on the bounding boxes of neighboring regions or objects, and if this protrusion is well justified from the narrative provided in the scene context thus far.{retry_block}
 {_deepseek_suffix()}"""
