@@ -703,6 +703,50 @@ function assetStatus(a) {
 	return a.status ?? "pending";
 }
 
+// Baked artifact urls (the image/model events' `url`, the scene projection's
+// image_url/mesh_url) freeze the run/slot/model the cell was generated under, so
+// renaming, snapshotting, or copying a run leaves them pointing at a dir that no
+// longer exists (404). Re-root the cell prefix onto the live cell so the file
+// resolves wherever the events.jsonl now lives; a no-op when the names match.
+function rerootArtifactUrl(url) {
+	if (typeof url !== "string") return url;
+	if (currentRun === null || currentSlotId === null || currentModel === null)
+		return url;
+	const m = url.match(/\/artifacts\/[^/]+\/[^/]+\/[^/]+\/(.+)$/);
+	if (!m) return url;
+	return `/artifacts/${encodeURIComponent(currentRun)}/${encodeURIComponent(
+		currentSlotId,
+	)}/${encodeURIComponent(currentModel)}/${m[1]}`;
+}
+
+// Thumbnail url for an asset card, resolved for the active asset mode so the
+// list agrees with the detail preview. "generated": the selected version's
+// render, built from the LIVE cell and gated on the mesh having attached so an
+// un-built asset shows the placeholder instead of 404ing. "library": the baked
+// reference image, re-rooted onto the live cell.
+function assetImageUrl(id) {
+	if (assetMode === "generated") {
+		if (
+			currentRun === null ||
+			currentSlotId === null ||
+			currentModel === null ||
+			genVersion == null ||
+			!modelsById.has(id)
+		)
+			return null;
+		return generatedImageUrl(
+			currentSlotId,
+			currentModel,
+			currentRun,
+			genVersion,
+			id,
+			genMeshVersions.get(id),
+		);
+	}
+	const a = assets.get(id);
+	return a?.imageUrl ? rerootArtifactUrl(a.imageUrl) : null;
+}
+
 function upsertAsset(id, patch) {
 	const cur = assets.get(id) ?? {
 		imageUrl: null,
@@ -760,8 +804,9 @@ function renderAsset(id) {
 
 	const link = card.querySelector(".asset-thumb-link");
 	const thumb = card.querySelector(".asset-thumb");
-	if (a.imageUrl) {
-		const absImg = new URL(a.imageUrl, SERVER_URL).toString();
+	const imageUrl = assetImageUrl(id);
+	if (imageUrl) {
+		const absImg = new URL(imageUrl, SERVER_URL).toString();
 		link.href = absImg;
 		if (thumb.tagName !== "IMG") {
 			const img = document.createElement("img");
@@ -3435,8 +3480,11 @@ function detailPreviewUrls(node) {
 	}
 	const a = assets.get(node.id);
 	return {
-		imageUrl: a?.imageUrl ?? null,
-		modelUrl: a && a.status === "loaded" ? (a.modelUrl ?? null) : null,
+		imageUrl: a?.imageUrl ? rerootArtifactUrl(a.imageUrl) : null,
+		modelUrl:
+			a && a.status === "loaded" && a.modelUrl
+				? rerootArtifactUrl(a.modelUrl)
+				: null,
 	};
 }
 
