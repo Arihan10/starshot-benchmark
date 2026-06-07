@@ -4,10 +4,11 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 const SERVER_URL = document
-  .querySelector('meta[name="server-url"]')
-  .getAttribute("content");
+	.querySelector('meta[name="server-url"]')
+	.getAttribute("content");
 
 const SLOT_STORAGE_KEY = "starshot.selectedSlot";
 const MODEL_STORAGE_KEY = "starshot.selectedModel";
@@ -20,6 +21,8 @@ const SOLID_FILL_STORAGE_KEY = "starshot.solidFill";
 const GRID_VISIBLE_STORAGE_KEY = "starshot.gridVisible";
 const TABS_STORAGE_KEY = "starshot.openTabs";
 const ASSET_MODE_STORAGE_KEY = "starshot.assetMode";
+const GEN_OPTIMIZED_STORAGE_KEY = "starshot.genOptimized";
+const REGEN_SOURCE_STORAGE_KEY = "starshot.regenSource";
 
 const statusEl = document.getElementById("status");
 const logEl = document.getElementById("log");
@@ -60,9 +63,11 @@ const selectModeToggleEl = document.getElementById("select-mode-toggle");
 const solidFillToggleEl = document.getElementById("solid-fill-toggle");
 const gridToggleEl = document.getElementById("grid-toggle");
 const assetModeToggleEl = document.getElementById("asset-mode-toggle");
+const genOptimizeToggleEl = document.getElementById("gen-optimize-toggle");
 const generateGateEl = document.getElementById("generate-gate");
 const genVersionPickerEl = document.getElementById("gen-version-picker");
 const genVersionNewEl = document.getElementById("gen-version-new");
+const genFromImagesEl = document.getElementById("gen-from-images");
 // Asset source the cell renders: "library" (pre-built meshes matched from the
 // asset library, served from objects/ — the default) or "generated" (a
 // from-scratch Nano-Banana + Trellis build, served from one version's
@@ -70,7 +75,18 @@ const genVersionNewEl = document.getElementById("gen-version-new");
 // the /meshes folder changes; the scene tree, log, and event stream all stay on
 // the library build. Declared up here so slotMeshesUrl() can read it from its
 // first call.
-let assetMode = localStorage.getItem(ASSET_MODE_STORAGE_KEY) === "generated" ? "generated" : "library";
+let assetMode =
+	localStorage.getItem(ASSET_MODE_STORAGE_KEY) === "generated"
+		? "generated"
+		: "library";
+// Within "generated" mode only: render the OPTIMIZED twin
+// (objects-generated-optimized/ — decimated + KTX2 + Meshopt, the served
+// default) or the raw, un-optimized Trellis mesh (objects-generated/<id>.glb —
+// already bbox-fitted but ~100x heavier). A pure view switch over the same
+// scene: flipping it re-streams the mesh bundle (and re-points every per-mesh
+// url) at the other folder. Persisted across cells like assetMode; never
+// touches the library build.
+let genOptimized = localStorage.getItem(GEN_OPTIMIZED_STORAGE_KEY) !== "raw";
 // Which generated VERSION the cell is viewing in "generated" mode, and the full
 // set available. A cell holds any number of from-scratch versions (same layout,
 // independently generated assets), each in generated/<version>/. `genVersion` is
@@ -78,28 +94,64 @@ let assetMode = localStorage.getItem(ASSET_MODE_STORAGE_KEY) === "generated" ? "
 // picker. Both reset on cell switch (clearScene); not persisted across cells.
 let genVersion = null;
 let genVersions = [];
-let generating = false;          // a from-scratch build is in flight for the selected version
-let _genWasRunning = false;      // last poll saw a build running (to detect completion)
-let _genCellKey = null;          // (cell, version) the gen-gate poll is tracking
+let generating = false; // a from-scratch build is in flight for the selected version
+let _genWasRunning = false; // last poll saw a build running (to detect completion)
+let _genCellKey = null; // (cell, version) the gen-gate poll is tracking
 // id -> version token (the optimized GLB's mtime, from GET /generate) for each
 // attached generated mesh. Lets the gate poll spot a regenerated asset (same
 // id, new bytes) and reload just it with a cache-busted URL. Reset on cell
 // switch (clearScene) and asset-mode reload.
 const genMeshVersions = new Map();
+// id -> current symmetry plane ("none" | "xy" | "xz") for each generated mesh,
+// from GET /generate. Drives the detail panel's symmetry readout + the
+// un-symmetrize button's state. Same lifecycle as genMeshVersions (per version).
+const genMeshSymmetry = new Map();
+// id -> bool: a per-asset OVERRIDE of the scene-wide `genOptimized` setting,
+// set from the detail panel's per-asset toggle. Empty on every fresh scene load
+// (so each asset follows the scene setting, as before); an entry flips just that
+// mesh to the other folder (optimized twin ↔ raw Trellis mesh) while the rest of
+// the scene stays put. Cleared whenever the scene re-streams (clearScene +
+// reloadMeshesForAssetMode) so a freshly loaded scene always starts uniform.
+const genMeshOptimized = new Map();
 // ids the user clicked "regenerate" on whose new mesh hasn't landed yet — drives
 // the detail button's disabled/label state. Cleared when the new version lands
 // or the build goes idle.
 const regeneratingIds = new Set();
+// ids the user clicked "un-symmetrize" on whose reprocessed mesh hasn't landed
+// yet. Same lifecycle as regeneratingIds; both gate the detail action buttons so
+// only one rebuild op runs per node at a time.
+const unsymmetrizingIds = new Set();
+// Regenerate image source (persisted). false = "from scratch" (new Nano-Banana
+// image + new mesh); true = "from image" (reuse the existing image, rebuild only
+// the mesh). Read by regenerateAsset; toggled from the object detail panel.
+let regenReuseImage =
+	localStorage.getItem(REGEN_SOURCE_STORAGE_KEY) === "image";
+
+// Active (run, slot, model) cell selection + the lists backing the run / model /
+// version pickers. Declared here — above the queue panel, which renders during
+// module init — so that first paint can read these without hitting the temporal
+// dead zone. Mutated by the slot/run lifecycle functions further down.
+let currentSource = null;
+let currentSlotId = null;
+let currentModel = null;
+let currentRun = null;
+let availableModels = [];
+let availableRuns = []; // [{name, modified_at, has_prompt_snapshot}, ...]
+let availableVersions = []; // [{id, run_name, label, status}, ...] from GET /versions
+let defaultModelAlias = null;
+let slotSummaries = []; // latest /slots `slots` array, for tab rendering
+let slotNeedsResume = false;
+
 const exportGlbEl = document.getElementById("export-glb");
 const replayGifEl = document.getElementById("replay-gif");
 const replayModalEl = document.getElementById("replay-modal");
 const replayCloseEl = document.getElementById("replay-close");
 const replayEventCountEl = document.getElementById("replay-event-count");
 const replayDurationEstEl = document.getElementById("replay-duration-est");
-const replaySpeedEl = document.getElementById("replay-speed");
-const replaySpeedValEl = document.getElementById("replay-speed-val");
-const replayFpsEl = document.getElementById("replay-fps");
-const replayFpsValEl = document.getElementById("replay-fps-val");
+const replayIntervalEl = document.getElementById("replay-interval");
+const replayIntervalValEl = document.getElementById("replay-interval-val");
+const replayResolutionEl = document.getElementById("replay-resolution");
+const replayResolutionValEl = document.getElementById("replay-resolution-val");
 const replayProgressBarEl = document.getElementById("replay-progress-bar");
 const replayStatusEl = document.getElementById("replay-status");
 const replayPreviewEl = document.getElementById("replay-preview");
@@ -116,34 +168,39 @@ let lastGifUrl = null;
 let lastGifBlob = null;
 
 function showReplayPlaceholder() {
-  replayStageEl.classList.remove("show-result");
-  replayStageEl.classList.add("empty");
-  replayPreviewCtx.clearRect(0, 0, replayPreviewCanvasEl.width, replayPreviewCanvasEl.height);
+	replayStageEl.classList.remove("show-result");
+	replayStageEl.classList.add("empty");
+	replayPreviewCtx.clearRect(
+		0,
+		0,
+		replayPreviewCanvasEl.width,
+		replayPreviewCanvasEl.height,
+	);
 }
 
 function drawReplayFrame(srcCanvas) {
-  // Match the preview canvas's backing buffer to the source so frames keep
-  // their native aspect; CSS object-fit handles the visual letterboxing.
-  if (
-    replayPreviewCanvasEl.width !== srcCanvas.width ||
-    replayPreviewCanvasEl.height !== srcCanvas.height
-  ) {
-    replayPreviewCanvasEl.width = srcCanvas.width;
-    replayPreviewCanvasEl.height = srcCanvas.height;
-  }
-  replayPreviewCtx.drawImage(srcCanvas, 0, 0);
-  replayStageEl.classList.remove("empty");
-  replayStageEl.classList.remove("show-result");
+	// Match the preview canvas's backing buffer to the source so frames keep
+	// their native aspect; CSS object-fit handles the visual letterboxing.
+	if (
+		replayPreviewCanvasEl.width !== srcCanvas.width ||
+		replayPreviewCanvasEl.height !== srcCanvas.height
+	) {
+		replayPreviewCanvasEl.width = srcCanvas.width;
+		replayPreviewCanvasEl.height = srcCanvas.height;
+	}
+	replayPreviewCtx.drawImage(srcCanvas, 0, 0);
+	replayStageEl.classList.remove("empty");
+	replayStageEl.classList.remove("show-result");
 }
 
 function showReplayGifResult(blob) {
-  if (lastGifUrl) URL.revokeObjectURL(lastGifUrl);
-  lastGifBlob = blob;
-  lastGifUrl = URL.createObjectURL(blob);
-  replayResultImgEl.src = lastGifUrl;
-  replayStageEl.classList.add("show-result");
-  replayStageEl.classList.remove("empty");
-  replayDownloadEl.disabled = false;
+	if (lastGifUrl) URL.revokeObjectURL(lastGifUrl);
+	lastGifBlob = blob;
+	lastGifUrl = URL.createObjectURL(blob);
+	replayResultImgEl.src = lastGifUrl;
+	replayStageEl.classList.add("show-result");
+	replayStageEl.classList.remove("empty");
+	replayDownloadEl.disabled = false;
 }
 const assetsEl = document.getElementById("assets");
 const assetsBodyEl = document.getElementById("assets-body");
@@ -155,14 +212,15 @@ const trellisQueueEl = document.getElementById("trellis-queue");
 const trellisQueueHeaderEl = document.getElementById("trellis-queue-header");
 const trellisQueueToggleEl = document.getElementById("trellis-queue-toggle");
 const trellisQueueCountsEl = document.getElementById("trellis-queue-counts");
-const tqProcessingEl = document.getElementById("tq-processing");
-const tqProcessingCapEl = document.getElementById("tq-processing-cap");
-const tqWaitingEl = document.getElementById("tq-waiting");
-const tqWaitingCapEl = document.getElementById("tq-waiting-cap");
-// Server-side `GENERATE_CONCURRENCY` (threed.py). Hard-coded mirror so the
-// "X/20" cap reads correctly; bump alongside the server constant if it
-// changes.
-const TRELLIS_CONCURRENCY_CAP = 100;
+// The body is rendered dynamically — one section per concurrency pool — from
+// the `pools` the server reports, so its inner markup lives in JS, not HTML.
+const trellisQueueBodyEl = document.getElementById("trellis-queue-body");
+// Fallback pool sections used only if a snapshot predates the per-pool `pools`
+// shape (e.g. an old server). Live caps/labels come from `/trellis/queue`.
+const FALLBACK_QUEUE_POOLS = [
+	{ id: "modal", label: "Trellis · Modal", cap: 100 },
+	{ id: "hunyuan-tencent", label: "Hunyuan 3.1 · Tencent", cap: 1 },
+];
 const treeEl = document.getElementById("tree");
 const treeBodyEl = document.getElementById("tree-body");
 const treeDetailEl = document.getElementById("tree-detail");
@@ -181,34 +239,41 @@ const treeModalSearchEl = document.getElementById("tree-modal-search");
 // --- log panel --------------------------------------------------------------
 
 const KIND_COLOR = {
-  "run.start": "#9ad4ff",
-  "run.done": "#8bd17c",
-  "run.error": "#ff8080",
-  "run.paused": "#e09050",
-  "bbox": "#e0c271",
-  "image": "#f6a96a",
-  "model": "#c586d1",
-  "step": "#4a8fd8",
-  "divider.decompose": "#e0c271",
-  "generation.decompose": "#c586d1",
-  "mesh.error": "#ff8080",
+	"run.start": "#9ad4ff",
+	"run.done": "#8bd17c",
+	"run.error": "#ff8080",
+	"run.paused": "#e09050",
+	bbox: "#e0c271",
+	image: "#f6a96a",
+	model: "#c586d1",
+	step: "#4a8fd8",
+	"divider.decompose": "#e0c271",
+	"generation.decompose": "#c586d1",
+	"mesh.error": "#ff8080",
 };
 
 function setStatus(text, cls = "hdr") {
-  statusEl.innerHTML = "";
-  const p = document.createElement("p");
-  p.className = `line ${cls}`;
-  p.textContent = text;
-  statusEl.appendChild(p);
+	statusEl.innerHTML = "";
+	const p = document.createElement("p");
+	p.className = `line ${cls}`;
+	p.textContent = text;
+	statusEl.appendChild(p);
 }
 
 function fmtValue(v) {
-  if (Array.isArray(v)) return "[" + v.map(fmtValue).join(", ") + "]";
-  if (typeof v === "number") return Number.isInteger(v) ? String(v) : v.toFixed(2);
-  if (v && typeof v === "object")
-    return "{" + Object.entries(v).map(([k, x]) => `${k}=${fmtValue(x)}`).join(", ") + "}";
-  if (typeof v === "string") return v;
-  return String(v);
+	if (Array.isArray(v)) return "[" + v.map(fmtValue).join(", ") + "]";
+	if (typeof v === "number")
+		return Number.isInteger(v) ? String(v) : v.toFixed(2);
+	if (v && typeof v === "object")
+		return (
+			"{" +
+			Object.entries(v)
+				.map(([k, x]) => `${k}=${fmtValue(x)}`)
+				.join(", ") +
+			"}"
+		);
+	if (typeof v === "string") return v;
+	return String(v);
 }
 
 // Fields whose values are LLM thinking / chain-of-thought traces. Stripped at
@@ -220,56 +285,56 @@ const HIDDEN_LOG_FIELDS = new Set(["reasoning", "thinking"]);
 // the on-demand "generate log" backfill can batch every buffered event into a
 // fragment instead of thrashing layout one append at a time.
 function buildLogLine(event) {
-  const { kind, index, ...rest } = event;
-  const fields = Object.fromEntries(
-    Object.entries(rest).filter(([k]) => !HIDDEN_LOG_FIELDS.has(k)),
-  );
-  const p = document.createElement("p");
-  p.className = "line";
-  if (typeof index === "number") p.dataset.eventIndex = String(index);
+	const { kind, index, ...rest } = event;
+	const fields = Object.fromEntries(
+		Object.entries(rest).filter(([k]) => !HIDDEN_LOG_FIELDS.has(k)),
+	);
+	const p = document.createElement("p");
+	p.className = "line";
+	if (typeof index === "number") p.dataset.eventIndex = String(index);
 
-  if (typeof index === "number") {
-    const btn = document.createElement("button");
-    btn.className = "rewind";
-    btn.type = "button";
-    btn.textContent = "↶ rewind";
-    btn.title = `Rewind to event ${index} (discards this event and everything after)`;
-    btn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      rewindTo(index);
-    });
-    p.appendChild(btn);
-  }
+	if (typeof index === "number") {
+		const btn = document.createElement("button");
+		btn.className = "rewind";
+		btn.type = "button";
+		btn.textContent = "↶ rewind";
+		btn.title = `Rewind to event ${index} (discards this event and everything after)`;
+		btn.addEventListener("click", (ev) => {
+			ev.stopPropagation();
+			rewindTo(index);
+		});
+		p.appendChild(btn);
+	}
 
-  if (typeof index === "number") {
-    const idx = document.createElement("span");
-    idx.className = "idx";
-    idx.textContent = `#${index}`;
-    p.appendChild(idx);
-  }
+	if (typeof index === "number") {
+		const idx = document.createElement("span");
+		idx.className = "idx";
+		idx.textContent = `#${index}`;
+		p.appendChild(idx);
+	}
 
-  const tag = document.createElement("span");
-  tag.className = "step";
-  tag.textContent = `[${kind}]`;
-  tag.style.color = KIND_COLOR[kind] ?? "#8bd17c";
-  p.appendChild(tag);
+	const tag = document.createElement("span");
+	tag.className = "step";
+	tag.textContent = `[${kind}]`;
+	tag.style.color = KIND_COLOR[kind] ?? "#8bd17c";
+	p.appendChild(tag);
 
-  const entries = Object.entries(fields);
-  if (entries.length === 0) {
-    p.appendChild(document.createTextNode(""));
-  } else {
-    for (const [k, v] of entries) {
-      const kv = document.createElement("span");
-      kv.className = "kv";
-      const label = document.createElement("span");
-      label.className = "k";
-      label.textContent = ` ${k}=`;
-      kv.appendChild(label);
-      kv.appendChild(document.createTextNode(fmtValue(v)));
-      p.appendChild(kv);
-    }
-  }
-  return p;
+	const entries = Object.entries(fields);
+	if (entries.length === 0) {
+		p.appendChild(document.createTextNode(""));
+	} else {
+		for (const [k, v] of entries) {
+			const kv = document.createElement("span");
+			kv.className = "kv";
+			const label = document.createElement("span");
+			label.className = "k";
+			label.textContent = ` ${k}=`;
+			kv.appendChild(label);
+			kv.appendChild(document.createTextNode(fmtValue(v)));
+			p.appendChild(kv);
+		}
+	}
+	return p;
 }
 
 // The log panel is gated: a <p> per event is too expensive to build for every
@@ -279,56 +344,61 @@ function buildLogLine(event) {
 let logEnabled = false;
 
 function appendEvent(event) {
-  if (!logEnabled) return;
-  const atBottom =
-    logBodyEl.scrollHeight - logBodyEl.scrollTop - logBodyEl.clientHeight < 1;
-  logBodyEl.appendChild(buildLogLine(event));
-  if (atBottom) logBodyEl.scrollTop = logBodyEl.scrollHeight;
+	if (!logEnabled) return;
+	const atBottom =
+		logBodyEl.scrollHeight - logBodyEl.scrollTop - logBodyEl.clientHeight <
+		1;
+	logBodyEl.appendChild(buildLogLine(event));
+	if (atBottom) logBodyEl.scrollTop = logBodyEl.scrollHeight;
 }
 
 function clearLog() {
-  for (const child of Array.from(logBodyEl.querySelectorAll(".line"))) {
-    child.remove();
-  }
-  logEnabled = false;
-  logGenerateEl.style.display = "";
+	for (const child of Array.from(logBodyEl.querySelectorAll(".line"))) {
+		child.remove();
+	}
+	logEnabled = false;
+	logGenerateEl.style.display = "";
 }
 
 // Materialize every buffered event into the log on demand, then keep appending
 // live. Batched through a fragment so even a multi-thousand-event run renders
 // in a single layout pass.
 function generateLog() {
-  if (logEnabled) return;
-  logEnabled = true;
-  logGenerateEl.style.display = "none";
-  const frag = document.createDocumentFragment();
-  for (const event of recordedEvents) frag.appendChild(buildLogLine(event));
-  logBodyEl.appendChild(frag);
-  logBodyEl.scrollTop = logBodyEl.scrollHeight;
+	if (logEnabled) return;
+	logEnabled = true;
+	logGenerateEl.style.display = "none";
+	const frag = document.createDocumentFragment();
+	for (const event of recordedEvents) frag.appendChild(buildLogLine(event));
+	logBodyEl.appendChild(frag);
+	logBodyEl.scrollTop = logBodyEl.scrollHeight;
 }
 
 // --- collapsible bars --------------------------------------------------------
 
 function toggleCollapse(el, toggleEl) {
-  const collapsed = el.classList.toggle("collapsed");
-  toggleEl.textContent = collapsed ? "▸" : "▾";
+	const collapsed = el.classList.toggle("collapsed");
+	toggleEl.textContent = collapsed ? "▸" : "▾";
 }
 
 slotBarToggleEl.addEventListener("click", () =>
-  toggleCollapse(slotBarEl, slotBarToggleEl),
+	toggleCollapse(slotBarEl, slotBarToggleEl),
 );
-slotBarEl.querySelector(".bar-label").addEventListener("click", () =>
-  toggleCollapse(slotBarEl, slotBarToggleEl),
-);
-controlsBarEl.querySelector(".ctrl-header").addEventListener("click", () =>
-  toggleCollapse(controlsBarEl, controlsBarToggleEl),
-);
-document.getElementById("log-header").addEventListener("click", () =>
-  toggleCollapse(logEl, logToggleEl),
-);
+slotBarEl
+	.querySelector(".bar-label")
+	.addEventListener("click", () =>
+		toggleCollapse(slotBarEl, slotBarToggleEl),
+	);
+controlsBarEl
+	.querySelector(".ctrl-header")
+	.addEventListener("click", () =>
+		toggleCollapse(controlsBarEl, controlsBarToggleEl),
+	);
+document
+	.getElementById("log-header")
+	.addEventListener("click", () => toggleCollapse(logEl, logToggleEl));
 logGenerateEl.addEventListener("click", (e) => {
-  e.stopPropagation(); // don't also toggle the header's collapse
-  generateLog();
+	e.stopPropagation(); // don't also toggle the header's collapse
+	generateLog();
 });
 
 // id -> error message for every mesh that errored during the current run.
@@ -337,9 +407,9 @@ logGenerateEl.addEventListener("click", (e) => {
 const meshErrors = new Map();
 
 function clearMeshErrors() {
-  meshErrors.clear();
-  retryingIds.clear();
-  runFinished = false;
+	meshErrors.clear();
+	retryingIds.clear();
+	runFinished = false;
 }
 
 // ids that the user clicked "retry" on whose follow-up image/model/mesh.error
@@ -357,61 +427,63 @@ const retryingIds = new Set();
 let runFinished = false;
 
 function refreshPostRunStatus() {
-  if (!runFinished) return;
-  const inFlight = retryingIds.size;
-  if (inFlight > 0) {
-    const ids = [...retryingIds];
-    const head = ids.slice(0, 3).join(", ");
-    const suffix = ids.length > 3 ? `, +${ids.length - 3}` : "";
-    setStatus(`retrying ${inFlight} mesh${inFlight === 1 ? "" : "es"}: ${head}${suffix}`);
-    return;
-  }
-  if (meshErrors.size > 0) showRunCompleteWithErrors();
-  else setStatus("run complete");
+	if (!runFinished) return;
+	const inFlight = retryingIds.size;
+	if (inFlight > 0) {
+		const ids = [...retryingIds];
+		const head = ids.slice(0, 3).join(", ");
+		const suffix = ids.length > 3 ? `, +${ids.length - 3}` : "";
+		setStatus(
+			`retrying ${inFlight} mesh${inFlight === 1 ? "" : "es"}: ${head}${suffix}`,
+		);
+		return;
+	}
+	if (meshErrors.size > 0) showRunCompleteWithErrors();
+	else setStatus("run complete");
 }
 
 async function retryMesh(id) {
-  if (currentSlotId === null) return;
-  if (retryingIds.has(id)) return;
-  retryingIds.add(id);
-  // Local optimistic state: clear the error so the asset/tree both reflect
-  // an in-flight retry. The server-side mesh.retry event will arrive too,
-  // but doing it locally first removes the visible-flicker between click
-  // and the SSE round-trip.
-  meshErrors.delete(id);
-  upsertAsset(id, { status: "pending", errorMessage: null });
-  if (treeNodes.has(id)) treeSetPhase(id, "generating_mesh");
+	if (currentSlotId === null) return;
+	if (retryingIds.has(id)) return;
+	retryingIds.add(id);
+	// Local optimistic state: clear the error so the asset/tree both reflect
+	// an in-flight retry. The server-side mesh.retry event will arrive too,
+	// but doing it locally first removes the visible-flicker between click
+	// and the SSE round-trip.
+	meshErrors.delete(id);
+	upsertAsset(id, { status: "pending", errorMessage: null });
+	if (treeNodes.has(id)) treeSetPhase(id, "generating_mesh");
 
-  // The slot's SSE may have closed itself on the prior run's run.done.
-  // Re-subscribe (without resetting highestEventIndex) so the snapshot
-  // is deduped and the retry's new events flow through the live queue.
-  if (currentSource === null) {
-    subscribe(slotEventsUrl(currentSlotId, currentModel));
-  }
+	// The slot's SSE may have closed itself on the prior run's run.done.
+	// Re-subscribe (without resetting highestEventIndex) so the snapshot
+	// is deduped and the retry's new events flow through the live queue.
+	if (currentSource === null) {
+		subscribe(slotEventsUrl(currentSlotId, currentModel));
+	}
 
-  try {
-    const res = await fetch(
-      new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}`,
-        SERVER_URL,
-      ),
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      const detail = await res.text();
-      const msg = `retry failed: HTTP ${res.status} ${detail}`;
-      retryingIds.delete(id);
-      meshErrors.set(id, msg);
-      treeSetPhase(id, "error");
-      upsertAsset(id, { status: "error", errorMessage: msg });
-    }
-  } catch (e) {
-    retryingIds.delete(id);
-    const msg = `retry failed: ${e.message}`;
-    meshErrors.set(id, msg);
-    treeSetPhase(id, "error");
-    upsertAsset(id, { status: "error", errorMessage: msg });
-  }
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/retry-mesh/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			const detail = await res.text();
+			const msg = `retry failed: HTTP ${res.status} ${detail}`;
+			retryingIds.delete(id);
+			meshErrors.set(id, msg);
+			treeSetPhase(id, "error");
+			upsertAsset(id, { status: "error", errorMessage: msg });
+		}
+	} catch (e) {
+		retryingIds.delete(id);
+		const msg = `retry failed: ${e.message}`;
+		meshErrors.set(id, msg);
+		treeSetPhase(id, "error");
+		upsertAsset(id, { status: "error", errorMessage: msg });
+	}
 }
 
 // Render-or-update a retry button inside `container`. `status` is the asset
@@ -419,29 +491,29 @@ async function retryMesh(id) {
 // is in flight (greyed out so the user can't double-click). `cls` lets the
 // caller scope the CSS (`asset-retry` vs `detail-retry`).
 function syncRetryButton(container, id, status, cls) {
-  let btn = container.querySelector(`.${cls}`);
-  const retrying = retryingIds.has(id);
-  const visible = status === "error" || retrying;
-  if (!visible) {
-    if (btn) btn.remove();
-    return;
-  }
-  if (!btn) {
-    btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = cls;
-    btn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      retryMesh(id);
-    });
-    container.appendChild(btn);
-  }
-  btn.classList.toggle("retrying", retrying);
-  btn.disabled = retrying;
-  btn.textContent = retrying ? "retrying…" : "retry mesh";
-  btn.title = retrying
-    ? "Re-running banana + Trellis for this mesh"
-    : "Re-run banana + Trellis for this mesh (fresh API calls)";
+	let btn = container.querySelector(`.${cls}`);
+	const retrying = retryingIds.has(id);
+	const visible = status === "error" || retrying;
+	if (!visible) {
+		if (btn) btn.remove();
+		return;
+	}
+	if (!btn) {
+		btn = document.createElement("button");
+		btn.type = "button";
+		btn.className = cls;
+		btn.addEventListener("click", (ev) => {
+			ev.stopPropagation();
+			retryMesh(id);
+		});
+		container.appendChild(btn);
+	}
+	btn.classList.toggle("retrying", retrying);
+	btn.disabled = retrying;
+	btn.textContent = retrying ? "retrying…" : "retry mesh";
+	btn.title = retrying
+		? "Re-running banana + Trellis for this mesh"
+		: "Re-run banana + Trellis for this mesh (fresh API calls)";
 }
 
 // Re-roll a GENERATED asset from scratch (Nano-Banana + Trellis + optimize),
@@ -449,54 +521,114 @@ function syncRetryButton(container, id, status, cls) {
 // sharing its mesh is re-derived (propagate=true). Fire-and-forget on the server;
 // the gate poll detects each changed mesh by its bumped version token and swaps
 // it in. `regeneratingIds` drives the detail button's disabled/label state.
-async function regenerateAsset(id) {
-  if (currentSlotId === null || currentModel === null || genVersion == null) return;
-  if (regeneratingIds.has(id)) return;
-  regeneratingIds.add(id);
-  if (id === selectedBboxId) renderTreeDetail();
-  setStatus(`regenerating ${id} + objects sharing its mesh in v${genVersion} — Nano-Banana + Trellis (this can take a while)…`);
-  try {
-    const res = await fetch(
-      new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/regenerate/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&version=${encodeURIComponent(genVersion)}&propagate=true`,
-        SERVER_URL,
-      ),
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      setStatus(`regenerate failed: ${body.detail ?? `HTTP ${res.status}`}`, "err");
-      regeneratingIds.delete(id);
-      if (id === selectedBboxId) renderTreeDetail();
-      return;
-    }
-    // Reflect the in-flight build immediately; the gate poll confirms + swaps in
-    // the new mesh once its optimize pass lands.
-    generating = true;
-    _genWasRunning = true;
-    updateGenerateGate();
-  } catch (e) {
-    setStatus(`regenerate failed: ${e.message}`, "err");
-    regeneratingIds.delete(id);
-    if (id === selectedBboxId) renderTreeDetail();
-  }
+async function regenerateAsset(id, backend = "trellis") {
+	if (currentSlotId === null || currentModel === null || genVersion == null)
+		return;
+	if (regeneratingIds.has(id)) return;
+	regeneratingIds.add(id);
+	if (id === selectedBboxId) renderTreeDetail();
+	const backendLabel =
+		backend === "hunyuan-tencent"
+			? "Hunyuan 3.1"
+			: backend === "hunyuan"
+				? "Hunyuan"
+				: "Trellis";
+	const sourceLabel = regenReuseImage
+		? "reusing existing image"
+		: "Nano-Banana";
+	setStatus(
+		`regenerating ${id} + objects sharing its mesh in v${genVersion} — ${sourceLabel} + ${backendLabel} (this can take a while)…`,
+	);
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/regenerate/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&version=${encodeURIComponent(genVersion)}&propagate=true&backend=${encodeURIComponent(backend)}&reuse_image=${regenReuseImage}`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			setStatus(
+				`regenerate failed: ${body.detail ?? `HTTP ${res.status}`}`,
+				"err",
+			);
+			regeneratingIds.delete(id);
+			if (id === selectedBboxId) renderTreeDetail();
+			return;
+		}
+		// Reflect the in-flight build immediately; the gate poll confirms + swaps in
+		// the new mesh once its optimize pass lands.
+		generating = true;
+		_genWasRunning = true;
+		updateGenerateGate();
+	} catch (e) {
+		setStatus(`regenerate failed: ${e.message}`, "err");
+		regeneratingIds.delete(id);
+		if (id === selectedBboxId) renderTreeDetail();
+	}
+}
+
+// Reveal a GENERATED asset's full, un-mirrored mesh. The server reprocesses the
+// existing raw mesh with the symmetry mirror turned off — no Nano-Banana, no mesh
+// backend, so it's effectively instant — and propagates across the prefab group
+// like regenerate. The gate poll detects the changed mesh by its bumped version
+// token and swaps it in; `unsymmetrizingIds` drives the button's disabled/label.
+async function unsymmetrizeAsset(id) {
+	if (currentSlotId === null || currentModel === null || genVersion == null)
+		return;
+	if (regeneratingIds.has(id) || unsymmetrizingIds.has(id)) return;
+	unsymmetrizingIds.add(id);
+	if (id === selectedBboxId) renderTreeDetail();
+	setStatus(
+		`un-symmetrizing ${id} + objects sharing its mesh in v${genVersion} — reprocessing the existing mesh (no AI)…`,
+	);
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/unsymmetrize/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&version=${encodeURIComponent(genVersion)}&propagate=true`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			setStatus(
+				`un-symmetrize failed: ${body.detail ?? `HTTP ${res.status}`}`,
+				"err",
+			);
+			unsymmetrizingIds.delete(id);
+			if (id === selectedBboxId) renderTreeDetail();
+			return;
+		}
+		// Reflect the in-flight reprocess immediately; the gate poll confirms + swaps
+		// the un-mirrored mesh in once its optimize pass lands.
+		generating = true;
+		_genWasRunning = true;
+		updateGenerateGate();
+	} catch (e) {
+		setStatus(`un-symmetrize failed: ${e.message}`, "err");
+		unsymmetrizingIds.delete(id);
+		if (id === selectedBboxId) renderTreeDetail();
+	}
 }
 
 function showRunCompleteWithErrors() {
-  statusEl.innerHTML = "";
-  const head = document.createElement("p");
-  head.className = "line warn";
-  const n = meshErrors.size;
-  head.textContent = `run complete — ${n} mesh${n === 1 ? "" : "es"} failed`;
-  statusEl.appendChild(head);
-  const ids = [...meshErrors.keys()];
-  const shown = ids.slice(0, 6);
-  const detail = document.createElement("p");
-  detail.className = "line warn";
-  const suffix = ids.length > shown.length ? `, +${ids.length - shown.length} more` : "";
-  detail.textContent = shown.join(", ") + suffix;
-  detail.title = ids.map((id) => `${id}: ${meshErrors.get(id)}`).join("\n");
-  statusEl.appendChild(detail);
+	statusEl.innerHTML = "";
+	const head = document.createElement("p");
+	head.className = "line warn";
+	const n = meshErrors.size;
+	head.textContent = `run complete — ${n} mesh${n === 1 ? "" : "es"} failed`;
+	statusEl.appendChild(head);
+	const ids = [...meshErrors.keys()];
+	const shown = ids.slice(0, 6);
+	const detail = document.createElement("p");
+	detail.className = "line warn";
+	const suffix =
+		ids.length > shown.length ? `, +${ids.length - shown.length} more` : "";
+	detail.textContent = shown.join(", ") + suffix;
+	detail.title = ids.map((id) => `${id}: ${meshErrors.get(id)}`).join("\n");
+	statusEl.appendChild(detail);
 }
 
 // --- asset browser ----------------------------------------------------------
@@ -505,27 +637,32 @@ function showRunCompleteWithErrors() {
 const assets = new Map();
 
 function assetStatus(a) {
-  return a.status ?? "pending";
+	return a.status ?? "pending";
 }
 
 function upsertAsset(id, patch) {
-  const cur = assets.get(id) ?? { imageUrl: null, prompt: null, modelUrl: null, status: "pending" };
-  assets.set(id, { ...cur, ...patch });
-  renderAsset(id);
-  assetsCountEl.textContent = `(${assets.size})`;
-  updateMissingMeshCount();
-  if (id === selectedBboxId) renderTreeDetail();
+	const cur = assets.get(id) ?? {
+		imageUrl: null,
+		prompt: null,
+		modelUrl: null,
+		status: "pending",
+	};
+	assets.set(id, { ...cur, ...patch });
+	renderAsset(id);
+	assetsCountEl.textContent = `(${assets.size})`;
+	updateMissingMeshCount();
+	if (id === selectedBboxId) renderTreeDetail();
 }
 
 function renderAsset(id) {
-  const a = assets.get(id);
-  if (!a) return;
-  let card = assetsBodyEl.querySelector(`[data-id="${CSS.escape(id)}"]`);
-  if (!card) {
-    card = document.createElement("div");
-    card.className = "asset-card";
-    card.dataset.id = id;
-    card.innerHTML = `
+	const a = assets.get(id);
+	if (!a) return;
+	let card = assetsBodyEl.querySelector(`[data-id="${CSS.escape(id)}"]`);
+	if (!card) {
+		card = document.createElement("div");
+		card.className = "asset-card";
+		card.dataset.id = id;
+		card.innerHTML = `
       <a class="asset-thumb-link" target="_blank" rel="noopener">
         <div class="asset-thumb placeholder">no image</div>
       </a>
@@ -535,48 +672,54 @@ function renderAsset(id) {
         <div class="asset-prompt"></div>
       </div>
     `;
-    assetsBodyEl.appendChild(card);
-    const promptEl = card.querySelector(".asset-prompt");
-    promptEl.addEventListener("click", () => {
-      promptEl.classList.toggle("expanded");
-    });
-  }
-  card.querySelector(".asset-id").textContent = id;
+		assetsBodyEl.appendChild(card);
+		const promptEl = card.querySelector(".asset-prompt");
+		promptEl.addEventListener("click", () => {
+			promptEl.classList.toggle("expanded");
+		});
+	}
+	card.querySelector(".asset-id").textContent = id;
 
-  const status = assetStatus(a);
-  card.className = `asset-card status-${status}`;
-  const statusTag = card.querySelector(".asset-status");
-  statusTag.className = `asset-status ${status}`;
-  statusTag.textContent = status === "error" && a.errorMessage
-    ? `error: ${a.errorMessage}`
-    : status;
-  syncRetryButton(card.querySelector(".asset-body"), id, status, "asset-retry");
+	const status = assetStatus(a);
+	card.className = `asset-card status-${status}`;
+	const statusTag = card.querySelector(".asset-status");
+	statusTag.className = `asset-status ${status}`;
+	statusTag.textContent =
+		status === "error" && a.errorMessage
+			? `error: ${a.errorMessage}`
+			: status;
+	syncRetryButton(
+		card.querySelector(".asset-body"),
+		id,
+		status,
+		"asset-retry",
+	);
 
-  const link = card.querySelector(".asset-thumb-link");
-  const thumb = card.querySelector(".asset-thumb");
-  if (a.imageUrl) {
-    const absImg = new URL(a.imageUrl, SERVER_URL).toString();
-    link.href = absImg;
-    if (thumb.tagName !== "IMG") {
-      const img = document.createElement("img");
-      img.className = "asset-thumb";
-      img.loading = "lazy";
-      img.alt = id;
-      img.src = absImg;
-      thumb.replaceWith(img);
-    } else if (thumb.src !== absImg) {
-      thumb.src = absImg;
-    }
-  }
+	const link = card.querySelector(".asset-thumb-link");
+	const thumb = card.querySelector(".asset-thumb");
+	if (a.imageUrl) {
+		const absImg = new URL(a.imageUrl, SERVER_URL).toString();
+		link.href = absImg;
+		if (thumb.tagName !== "IMG") {
+			const img = document.createElement("img");
+			img.className = "asset-thumb";
+			img.loading = "lazy";
+			img.alt = id;
+			img.src = absImg;
+			thumb.replaceWith(img);
+		} else if (thumb.src !== absImg) {
+			thumb.src = absImg;
+		}
+	}
 
-  const promptEl = card.querySelector(".asset-prompt");
-  promptEl.textContent = a.prompt ?? "";
+	const promptEl = card.querySelector(".asset-prompt");
+	promptEl.textContent = a.prompt ?? "";
 }
 
 function clearAssets() {
-  assets.clear();
-  assetsBodyEl.innerHTML = "";
-  assetsCountEl.textContent = "(0)";
+	assets.clear();
+	assetsBodyEl.innerHTML = "";
+	assetsCountEl.textContent = "(0)";
 }
 
 // True once the server has produced a mesh for this node. A recorded
@@ -586,28 +729,28 @@ function clearAssets() {
 // while the bundle is still streaming; in generated mode that url points at
 // the library mesh, not the viewed version's, so only an attached mesh counts.
 function nodeHasMesh(id) {
-  const a = assets.get(id);
-  if (a?.status === "error") return false;
-  if (modelsById.has(id)) return true;
-  return assetMode === "library" && !!a?.modelUrl;
+	const a = assets.get(id);
+	if (a?.status === "error") return false;
+	if (modelsById.has(id)) return true;
+	return assetMode === "library" && !!a?.modelUrl;
 }
 
 // Count concrete nodes (objects + frames — zones are abstract and never carry
 // a mesh) whose mesh never landed, and surface it in the assets header so a
 // partial or interrupted build's gaps are visible at a glance.
 function updateMissingMeshCount() {
-  let missing = 0;
-  for (const node of treeNodes.values()) {
-    if (node.kind !== "object" && node.kind !== "frame") continue;
-    if (!nodeHasMesh(node.id)) missing += 1;
-  }
-  assetsMissingEl.textContent = `· ${missing} missing`;
-  assetsMissingEl.classList.toggle("has-missing", missing > 0);
+	let missing = 0;
+	for (const node of treeNodes.values()) {
+		if (node.kind !== "object" && node.kind !== "frame") continue;
+		if (!nodeHasMesh(node.id)) missing += 1;
+	}
+	assetsMissingEl.textContent = `· ${missing} missing`;
+	assetsMissingEl.classList.toggle("has-missing", missing > 0);
 }
 
 assetsHeaderEl.addEventListener("click", () => {
-  const collapsed = assetsEl.classList.toggle("collapsed");
-  assetsToggleEl.textContent = collapsed ? "▸" : "▾";
+	const collapsed = assetsEl.classList.toggle("collapsed");
+	assetsToggleEl.textContent = collapsed ? "▸" : "▾";
 });
 
 // --- trellis queue panel ----------------------------------------------------
@@ -620,116 +763,207 @@ assetsHeaderEl.addEventListener("click", () => {
 // entirely — a server restart resets the queue to empty (correct
 // behaviour), and a single poll trumps any amount of historical noise.
 //
-// The semaphore is process-global across all 7 benchmark slots, so the
-// "cap" we display is the global concurrency. Rows from slots other than
-// the one currently being viewed are shown with a slot tag and aren't
-// clickable (their node ids aren't in this slot's tree).
+// Each backend declares a concurrency POOL (Trellis/Modal vs Hunyuan 3.1/
+// Tencent); the server tags every row with its `backend` + `pool`, and the
+// panel renders one section per pool, each with its OWN cap — so the two never
+// look like one shared budget. Rows from cells other than the one currently
+// viewed are shown greyed with a slot tag and aren't clickable (their node ids
+// aren't in this cell's tree).
 
-// Latest snapshot from /trellis/queue: { cap, entries: [{slot_id, job_id, state, since, task_id?}, ...] }
+// Latest snapshot from /trellis/queue:
+//   { pools: [{id, label, cap}, ...],
+//     entries: [{slot_id, job_id, state, since, task_id?, backend, pool}, ...] }
 // `since` is the server's epoch-seconds timestamp from when the job entered
 // the queue (set on the server side, persists across client reconnects).
 // Render uses it directly so the elapsed timer reflects true wall-clock
-// age, not "time since this browser first noticed the row".
-let trellisQueueSnapshot = { cap: 10, entries: [] };
+// age, not "time since this browser first noticed the row". `pool` buckets the
+// row into its section; `backend` drives the per-row badge.
+let trellisQueueSnapshot = { pools: [], entries: [] };
+
+// Short display label for a backend scope (as tagged on a queue row), so a
+// Hunyuan 3.1 row is unmistakable even within its section.
+function backendLabel(backend) {
+	switch (backend) {
+		case "hunyuan_tencent":
+		case "hunyuan-tencent":
+			return "Hunyuan 3.1";
+		case "hunyuan":
+		case "hunyuan-omni":
+			return "Hunyuan";
+		case "trellis":
+			return "Trellis";
+		default:
+			return backend || "?";
+	}
+}
 
 function fmtElapsed(ms) {
-  const s = Math.floor(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
+	const s = Math.floor(ms / 1000);
+	if (s < 60) return `${s}s`;
+	const m = Math.floor(s / 60);
+	if (m < 60) return `${m}m ${s % 60}s`;
+	return `${Math.floor(m / 60)}h ${m % 60}m`;
 }
 
 async function pollTrellisQueue() {
-  try {
-    const resp = await fetch(`${SERVER_URL}/trellis/queue`, { cache: "no-store" });
-    if (!resp.ok) return;
-    trellisQueueSnapshot = await resp.json();
-    renderTrellisQueue();
-  } catch {
-    // Server transiently down / network blip — keep the last good snapshot
-    // on screen. Next tick will refresh.
-  }
+	try {
+		const resp = await fetch(`${SERVER_URL}/trellis/queue`, {
+			cache: "no-store",
+		});
+		if (!resp.ok) return;
+		trellisQueueSnapshot = await resp.json();
+		renderTrellisQueue();
+	} catch {
+		// Server transiently down / network blip — keep the last good snapshot
+		// on screen. Next tick will refresh.
+	}
+}
+
+// One queue row. Greyed + non-clickable when it belongs to a cell other than
+// the one on screen (its node id isn't in this cell's tree). Carries a backend
+// badge so a Hunyuan 3.1 row reads differently from a Trellis one.
+function renderQueueRow(row, kind, currentCompositeId, now) {
+	const el = document.createElement("div");
+	el.className = `tq-row ${kind}`;
+	const inThisSlot = row.slot_id === currentCompositeId;
+	if (inThisSlot) {
+		el.addEventListener("click", () => selectTreeNode(row.job_id));
+	} else {
+		el.classList.add("other-slot");
+		el.title = `from cell ${row.slot_id} — switch to inspect`;
+	}
+	const dot = document.createElement("span");
+	dot.className = "tq-dot";
+	el.appendChild(dot);
+	if (row.backend) {
+		const badge = document.createElement("span");
+		badge.className = `tq-backend backend-${row.pool ?? "modal"}`;
+		badge.textContent = backendLabel(row.backend);
+		el.appendChild(badge);
+	}
+	const idEl = document.createElement("span");
+	idEl.className = "tq-id";
+	idEl.textContent = row.job_id;
+	el.appendChild(idEl);
+	if (!inThisSlot) {
+		const slotTag = document.createElement("span");
+		slotTag.className = "tq-slot-tag";
+		slotTag.textContent = row.slot_id;
+		el.appendChild(slotTag);
+	}
+	// Elapsed only shown for processing rows — we want to measure how long the
+	// backend takes to return a mesh once it actually starts, not how long a row
+	// sat in the local FIFO. Server's `since` resets on state transition, so this
+	// is true processing-elapsed when shown.
+	if (kind === "processing") {
+		const elapsed = document.createElement("span");
+		elapsed.className = "tq-elapsed";
+		elapsed.textContent = fmtElapsed(Math.max(0, now - row.sinceMs));
+		el.appendChild(elapsed);
+	}
+	return el;
+}
+
+// A processing/waiting sub-list inside a pool section.
+function renderQueueList(rows, kind, cap, currentCompositeId, now) {
+	const wrap = document.createElement("div");
+	wrap.className = "tq-section";
+	const label = document.createElement("div");
+	label.className = "tq-label";
+	label.textContent = kind;
+	const capEl = document.createElement("span");
+	capEl.className = "tq-cap";
+	capEl.textContent =
+		kind === "processing" && cap != null
+			? `(${rows.length}/${cap})`
+			: `(${rows.length})`;
+	label.appendChild(document.createTextNode(" "));
+	label.appendChild(capEl);
+	wrap.appendChild(label);
+
+	const list = document.createElement("div");
+	list.className = "tq-list";
+	if (rows.length === 0) {
+		const empty = document.createElement("div");
+		empty.className = "tq-empty";
+		empty.textContent = kind === "processing" ? "(idle)" : "(none)";
+		list.appendChild(empty);
+	} else {
+		for (const row of rows)
+			list.appendChild(
+				renderQueueRow(row, kind, currentCompositeId, now),
+			);
+	}
+	wrap.appendChild(list);
+	return wrap;
 }
 
 function renderTrellisQueue() {
-  const now = Date.now();
-  const cap = trellisQueueSnapshot.cap ?? TRELLIS_CONCURRENCY_CAP;
-  const entries = trellisQueueSnapshot.entries ?? [];
-  const processing = [];
-  const waiting = [];
-  for (const e of entries) {
-    // Server `since` is epoch seconds (time.time() at the moment the job
-    // was admitted to the queue). Convert to ms once so each row carries
-    // a value comparable to Date.now().
-    const sinceMs = (e.since ?? 0) * 1000;
-    const row = { ...e, sinceMs };
-    if (e.state === "processing") processing.push(row);
-    else waiting.push(row);
-  }
-  processing.sort((a, b) => a.sinceMs - b.sinceMs);
-  waiting.sort((a, b) => a.sinceMs - b.sinceMs);
+	const now = Date.now();
+	const entries = trellisQueueSnapshot.entries ?? [];
+	const pools =
+		trellisQueueSnapshot.pools && trellisQueueSnapshot.pools.length
+			? trellisQueueSnapshot.pools
+			: FALLBACK_QUEUE_POOLS;
 
-  trellisQueueCountsEl.textContent =
-    `${processing.length} processing · ${waiting.length} waiting`;
-  tqProcessingCapEl.textContent = `(${processing.length}/${cap})`;
-  tqWaitingCapEl.textContent = `(${waiting.length})`;
+	// Bucket every entry by its server-tagged pool; an unknown pool falls into the
+	// first (Modal) section so nothing is dropped.
+	const byPool = new Map(pools.map((p) => [p.id, []]));
+	for (const e of entries) {
+		const poolId = byPool.has(e.pool) ? e.pool : pools[0].id;
+		byPool.get(poolId).push({ ...e, sinceMs: (e.since ?? 0) * 1000 });
+	}
 
-  function renderList(parent, rows, kind) {
-    parent.textContent = "";
-    if (rows.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "tq-empty";
-      empty.textContent = kind === "processing" ? "(idle)" : "(none)";
-      parent.appendChild(empty);
-      return;
-    }
-    for (const row of rows) {
-      const el = document.createElement("div");
-      el.className = `tq-row ${kind}`;
-      // Queue rows tag slot_id with the composite "run/slot/model" so we
-      // can filter to the cell currently on screen — other cells stay
-      // visible (still inflight on the shared queue) but greyed and not
-      // clickable.
-      const currentCompositeId =
-        currentRun !== null && currentSlotId !== null && currentModel !== null
-          ? `${currentRun}/${currentSlotId}/${currentModel}`
-          : null;
-      const inThisSlot = row.slot_id === currentCompositeId;
-      if (inThisSlot) {
-        el.addEventListener("click", () => selectTreeNode(row.job_id));
-      } else {
-        el.classList.add("other-slot");
-        el.title = `from cell ${row.slot_id} — switch to inspect`;
-      }
-      const dot = document.createElement("span");
-      dot.className = "tq-dot";
-      el.appendChild(dot);
-      const idEl = document.createElement("span");
-      idEl.className = "tq-id";
-      idEl.textContent = row.job_id;
-      el.appendChild(idEl);
-      if (!inThisSlot) {
-        const slotTag = document.createElement("span");
-        slotTag.className = "tq-slot-tag";
-        slotTag.textContent = row.slot_id;
-        el.appendChild(slotTag);
-      }
-      // Elapsed only shown for processing rows — we want to measure how
-      // long Modal takes to return a mesh once it actually starts, not how
-      // long a row sat in the local FIFO. Server's `since` resets on state
-      // transition, so this is true processing-elapsed when shown.
-      if (kind === "processing") {
-        const elapsed = document.createElement("span");
-        elapsed.className = "tq-elapsed";
-        elapsed.textContent = fmtElapsed(Math.max(0, now - row.sinceMs));
-        el.appendChild(elapsed);
-      }
-      parent.appendChild(el);
-    }
-  }
-  renderList(tqProcessingEl, processing, "processing");
-  renderList(tqWaitingEl, waiting, "waiting");
+	const currentCompositeId =
+		currentRun !== null && currentSlotId !== null && currentModel !== null
+			? `${currentRun}/${currentSlotId}/${currentModel}`
+			: null;
+
+	trellisQueueBodyEl.textContent = "";
+	let totalProcessing = 0;
+	let totalWaiting = 0;
+
+	for (const pool of pools) {
+		const rows = byPool.get(pool.id) ?? [];
+		const processing = rows
+			.filter((r) => r.state === "processing")
+			.sort((a, b) => a.sinceMs - b.sinceMs);
+		const waiting = rows
+			.filter((r) => r.state !== "processing")
+			.sort((a, b) => a.sinceMs - b.sinceMs);
+		totalProcessing += processing.length;
+		totalWaiting += waiting.length;
+
+		const section = document.createElement("div");
+		section.className = `tq-pool pool-${pool.id}`;
+		const head = document.createElement("div");
+		head.className = "tq-pool-head";
+		const title = document.createElement("span");
+		title.className = "tq-pool-title";
+		title.textContent = pool.label ?? pool.id;
+		head.appendChild(title);
+		const summary = document.createElement("span");
+		summary.className = "tq-pool-summary";
+		summary.textContent = `${processing.length}/${pool.cap ?? "—"} · ${waiting.length} waiting`;
+		head.appendChild(summary);
+		section.appendChild(head);
+
+		section.appendChild(
+			renderQueueList(
+				processing,
+				"processing",
+				pool.cap,
+				currentCompositeId,
+				now,
+			),
+		);
+		section.appendChild(
+			renderQueueList(waiting, "waiting", null, currentCompositeId, now),
+		);
+		trellisQueueBodyEl.appendChild(section);
+	}
+
+	trellisQueueCountsEl.textContent = `${totalProcessing} processing · ${totalWaiting} waiting`;
 }
 
 // Poll every 1.5s. Cheap (an in-memory dict snapshot on the server) and
@@ -739,16 +973,17 @@ setInterval(pollTrellisQueue, 1500);
 // Only the processing rows show an elapsed timer, so this is a no-op when
 // the queue is empty or only contains waiting entries.
 setInterval(() => {
-  const hasProcessing = (trellisQueueSnapshot.entries ?? [])
-    .some((e) => e.state === "processing");
-  if (hasProcessing) renderTrellisQueue();
+	const hasProcessing = (trellisQueueSnapshot.entries ?? []).some(
+		(e) => e.state === "processing",
+	);
+	if (hasProcessing) renderTrellisQueue();
 }, 1000);
 // Kick an initial fetch so the panel populates without waiting a full tick.
 pollTrellisQueue();
 
 trellisQueueHeaderEl.addEventListener("click", () => {
-  const collapsed = trellisQueueEl.classList.toggle("collapsed");
-  trellisQueueToggleEl.textContent = collapsed ? "▸" : "▾";
+	const collapsed = trellisQueueEl.classList.toggle("collapsed");
+	trellisQueueToggleEl.textContent = collapsed ? "▸" : "▾";
 });
 
 renderTrellisQueue();
@@ -803,145 +1038,161 @@ let treeOrderCounter = 0;
 const hiddenIds = new Set();
 
 function treeUpsert(id, patch) {
-  const cur = treeNodes.get(id);
-  if (!cur) {
-    const parentId = patch.parentId ?? null;
-    treeNodes.set(id, {
-      id, parentId, prompt: null, kind: "zone",
-      phase: "pending", order: treeOrderCounter++,
-      ...patch,
-    });
-    if (parentId !== null) {
-      const arr = treeChildren.get(parentId) ?? [];
-      if (!arr.includes(id)) arr.push(id);
-      treeChildren.set(parentId, arr);
-    } else if (treeRootId === null) {
-      treeRootId = id;
-    }
-    return;
-  }
-  // Existing node: merge patch, and keep the parent -> children index in
-  // sync. Decompose events may only know "this was emitted by parent X",
-  // while the later bbox event carries the actual structural parent.
-  const prevParent = cur.parentId;
-  Object.assign(cur, patch);
-  const nextParent = cur.parentId ?? null;
-  if (prevParent !== nextParent) {
-    if (prevParent !== null) {
-      const prevKids = treeChildren.get(prevParent) ?? [];
-      treeChildren.set(prevParent, prevKids.filter((cid) => cid !== id));
-    } else if (treeRootId === id) {
-      treeRootId = null; // was mis-rooted
-    }
-    if (nextParent !== null) {
-      const nextKids = treeChildren.get(nextParent) ?? [];
-      if (!nextKids.includes(id)) nextKids.push(id);
-      treeChildren.set(nextParent, nextKids);
-    } else if (treeRootId === null) {
-      treeRootId = id;
-    }
-  }
+	const cur = treeNodes.get(id);
+	if (!cur) {
+		const parentId = patch.parentId ?? null;
+		treeNodes.set(id, {
+			id,
+			parentId,
+			prompt: null,
+			kind: "zone",
+			phase: "pending",
+			order: treeOrderCounter++,
+			...patch,
+		});
+		if (parentId !== null) {
+			const arr = treeChildren.get(parentId) ?? [];
+			if (!arr.includes(id)) arr.push(id);
+			treeChildren.set(parentId, arr);
+		} else if (treeRootId === null) {
+			treeRootId = id;
+		}
+		return;
+	}
+	// Existing node: merge patch, and keep the parent -> children index in
+	// sync. Decompose events may only know "this was emitted by parent X",
+	// while the later bbox event carries the actual structural parent.
+	const prevParent = cur.parentId;
+	Object.assign(cur, patch);
+	const nextParent = cur.parentId ?? null;
+	if (prevParent !== nextParent) {
+		if (prevParent !== null) {
+			const prevKids = treeChildren.get(prevParent) ?? [];
+			treeChildren.set(
+				prevParent,
+				prevKids.filter((cid) => cid !== id),
+			);
+		} else if (treeRootId === id) {
+			treeRootId = null; // was mis-rooted
+		}
+		if (nextParent !== null) {
+			const nextKids = treeChildren.get(nextParent) ?? [];
+			if (!nextKids.includes(id)) nextKids.push(id);
+			treeChildren.set(nextParent, nextKids);
+		} else if (treeRootId === null) {
+			treeRootId = id;
+		}
+	}
 }
 
 function treeSetPhase(id, phase) {
-  const cur = treeNodes.get(id);
-  if (!cur) {
-    // Step fired before any bbox / decompose — stash the phase so it renders
-    // as soon as we have the node.
-    treeUpsert(id, { phase });
-  } else {
-    cur.phase = phase;
-  }
-  if (phase !== "done") {
-    treeActiveId = id;
-  } else if (treeActiveId === id) {
-    // A node finishing doesn't move the focus elsewhere on its own; leave
-    // the highlight on it until the next step event moves it.
-  }
-  scheduleRenderTree();
-  if (id === selectedBboxId || (selectedBboxId && treeIsAncestorOf(selectedBboxId, id))) {
-    renderTreeDetail();
-  }
+	const cur = treeNodes.get(id);
+	if (!cur) {
+		// Step fired before any bbox / decompose — stash the phase so it renders
+		// as soon as we have the node.
+		treeUpsert(id, { phase });
+	} else {
+		cur.phase = phase;
+	}
+	if (phase !== "done") {
+		treeActiveId = id;
+	} else if (treeActiveId === id) {
+		// A node finishing doesn't move the focus elsewhere on its own; leave
+		// the highlight on it until the next step event moves it.
+	}
+	scheduleRenderTree();
+	if (
+		id === selectedBboxId ||
+		(selectedBboxId && treeIsAncestorOf(selectedBboxId, id))
+	) {
+		renderTreeDetail();
+	}
 }
 
 function recordLlmCall(event) {
-  // Bucket the call under its `node` id. The server stamps that field on
-  // every `llm.call`; if it's missing (older log line, or a call site we
-  // haven't tagged) bucket it under "_unattributed" so the modal can still
-  // surface it under the root view rather than dropping it on the floor.
-  const id = event.node || "_unattributed";
-  const call = {
-    step: event.step || "(unknown step)",
-    system: event.system ?? "",
-    user: event.user ?? "",
-    output: event.output ?? null,
-    reasoning: event.reasoning ?? "",
-    model: event.model ?? "",
-    cached: !!event.cached,
-    eventIndex: typeof event.index === "number" ? event.index : null,
-    // The "node" field on the event is the call site's node id — for
-    // decompose/bbox-batch calls, that's the *parent*. Carried through so the
-    // provenance render can label "from parent_zone.anchor_decompose".
-    parentNode: event.node || null,
-  };
-  const list = nodeLlmCalls.get(id) ?? [];
-  list.push(call);
-  nodeLlmCalls.set(id, list);
-  // Now scan the output for ids this call brought into existence and back-
-  // fill provenance for each. The output shape is structured-output, so we
-  // know exactly which fields name child ids:
-  //   * `children: [{id, ...}]`          — divider.zone_decompose
-  //   * `assignments: [{id, bbox}]`      — child_bbox_batch + object_bbox_batch
-  //   * `objects: [{id, ...}]`           — anchor_decompose, encapsulating_decompose,
-  //                                        negative_space_decompose
-  //   * `object: {id, ...}` (non-null)   — next_object (single emitted spec)
-  // Anything else (zone_plan, image_prompt, overall_bbox) doesn't emit ids.
-  const out = event.output;
-  if (!out || typeof out !== "object") return;
-  const isBboxStep = call.step === "child_bbox_batch"
-    || call.step === "object_bbox_batch";
-  const relation = isBboxStep ? "placed_by" : "emitted_by";
-  function tag(childId) {
-    if (!childId || childId === id) return; // never attach a node to itself
-    const arr = nodeProvenance.get(childId) ?? [];
-    // Dedup on (step + parentNode + eventIndex) — events can replay during
-    // SSE reconnects and we don't want the same trace entry twice.
-    const key = `${call.step}|${call.parentNode}|${call.eventIndex}`;
-    if (arr.some((e) => `${e.call.step}|${e.call.parentNode}|${e.call.eventIndex}` === key)) {
-      return;
-    }
-    arr.push({ relation, call });
-    nodeProvenance.set(childId, arr);
-  }
-  if (Array.isArray(out.children)) {
-    for (const c of out.children) tag(c?.id);
-  }
-  if (Array.isArray(out.assignments)) {
-    for (const a of out.assignments) tag(a?.id);
-  }
-  if (Array.isArray(out.objects)) {
-    for (const o of out.objects) tag(o?.id);
-  }
-  if (out.object && typeof out.object === "object") {
-    tag(out.object.id);
-  }
+	// Bucket the call under its `node` id. The server stamps that field on
+	// every `llm.call`; if it's missing (older log line, or a call site we
+	// haven't tagged) bucket it under "_unattributed" so the modal can still
+	// surface it under the root view rather than dropping it on the floor.
+	const id = event.node || "_unattributed";
+	const call = {
+		step: event.step || "(unknown step)",
+		system: event.system ?? "",
+		user: event.user ?? "",
+		output: event.output ?? null,
+		reasoning: event.reasoning ?? "",
+		model: event.model ?? "",
+		cached: !!event.cached,
+		eventIndex: typeof event.index === "number" ? event.index : null,
+		// The "node" field on the event is the call site's node id — for
+		// decompose/bbox-batch calls, that's the *parent*. Carried through so the
+		// provenance render can label "from parent_zone.anchor_decompose".
+		parentNode: event.node || null,
+	};
+	const list = nodeLlmCalls.get(id) ?? [];
+	list.push(call);
+	nodeLlmCalls.set(id, list);
+	// Now scan the output for ids this call brought into existence and back-
+	// fill provenance for each. The output shape is structured-output, so we
+	// know exactly which fields name child ids:
+	//   * `children: [{id, ...}]`          — divider.zone_decompose
+	//   * `assignments: [{id, bbox}]`      — child_bbox_batch + object_bbox_batch
+	//   * `objects: [{id, ...}]`           — anchor_decompose, encapsulating_decompose,
+	//                                        negative_space_decompose
+	//   * `object: {id, ...}` (non-null)   — next_object (single emitted spec)
+	// Anything else (zone_plan, image_prompt, overall_bbox) doesn't emit ids.
+	const out = event.output;
+	if (!out || typeof out !== "object") return;
+	const isBboxStep =
+		call.step === "child_bbox_batch" || call.step === "object_bbox_batch";
+	const relation = isBboxStep ? "placed_by" : "emitted_by";
+	function tag(childId) {
+		if (!childId || childId === id) return; // never attach a node to itself
+		const arr = nodeProvenance.get(childId) ?? [];
+		// Dedup on (step + parentNode + eventIndex) — events can replay during
+		// SSE reconnects and we don't want the same trace entry twice.
+		const key = `${call.step}|${call.parentNode}|${call.eventIndex}`;
+		if (
+			arr.some(
+				(e) =>
+					`${e.call.step}|${e.call.parentNode}|${e.call.eventIndex}` ===
+					key,
+			)
+		) {
+			return;
+		}
+		arr.push({ relation, call });
+		nodeProvenance.set(childId, arr);
+	}
+	if (Array.isArray(out.children)) {
+		for (const c of out.children) tag(c?.id);
+	}
+	if (Array.isArray(out.assignments)) {
+		for (const a of out.assignments) tag(a?.id);
+	}
+	if (Array.isArray(out.objects)) {
+		for (const o of out.objects) tag(o?.id);
+	}
+	if (out.object && typeof out.object === "object") {
+		tag(out.object.id);
+	}
 }
 
 function treeClear() {
-  treeNodes.clear();
-  treeChildren.clear();
-  nodeLlmCalls.clear();
-  nodeProvenance.clear();
-  treeRootId = null;
-  treeActiveId = null;
-  treeOrderCounter = 0;
-  hiddenIds.clear();
-  treeBodyEl.innerHTML = "";
-  treeActiveEl.textContent = "";
-  destroyDetailPreview();
-  treeDetailEl.innerHTML = "";
-  treeEl.classList.remove("detail-open");
-  updateMissingMeshCount();
+	treeNodes.clear();
+	treeChildren.clear();
+	nodeLlmCalls.clear();
+	nodeProvenance.clear();
+	treeRootId = null;
+	treeActiveId = null;
+	treeOrderCounter = 0;
+	hiddenIds.clear();
+	treeBodyEl.innerHTML = "";
+	treeActiveEl.textContent = "";
+	destroyDetailPreview();
+	treeDetailEl.innerHTML = "";
+	treeEl.classList.remove("detail-open");
+	updateMissingMeshCount();
 }
 
 // True if `id` itself is hidden, or any ZONE ancestor is hidden. The
@@ -950,147 +1201,150 @@ function treeClear() {
 // still letting the user hide a single frame/object to peek inside it
 // without taking its children offscreen too.
 function effectivelyHidden(id) {
-  let cur = treeNodes.get(id);
-  let isSelf = true;
-  while (cur) {
-    if (hiddenIds.has(cur.id) && (isSelf || cur.kind === "zone")) return true;
-    cur = cur.parentId ? treeNodes.get(cur.parentId) : null;
-    isSelf = false;
-  }
-  return false;
+	let cur = treeNodes.get(id);
+	let isSelf = true;
+	while (cur) {
+		if (hiddenIds.has(cur.id) && (isSelf || cur.kind === "zone"))
+			return true;
+		cur = cur.parentId ? treeNodes.get(cur.parentId) : null;
+		isSelf = false;
+	}
+	return false;
 }
 
 function toggleNodeHidden(id) {
-  if (hiddenIds.has(id)) hiddenIds.delete(id);
-  else hiddenIds.add(id);
-  // Effective-hidden status changed for this node and (potentially) every
-  // descendant, so re-evaluate visibility for the whole subtree.
-  refreshSubtreeVisibility(id);
-  renderTree();
+	if (hiddenIds.has(id)) hiddenIds.delete(id);
+	else hiddenIds.add(id);
+	// Effective-hidden status changed for this node and (potentially) every
+	// descendant, so re-evaluate visibility for the whole subtree.
+	refreshSubtreeVisibility(id);
+	renderTree();
 }
 
 function refreshSubtreeVisibility(rootId) {
-  const stack = [rootId];
-  while (stack.length) {
-    const cur = stack.pop();
-    applyModelVisibility(cur);
-    applyBboxVisibility(cur);
-    applySolidFillVisibility(cur);
-    const kids = treeChildren.get(cur) ?? [];
-    for (const k of kids) stack.push(k);
-  }
+	const stack = [rootId];
+	while (stack.length) {
+		const cur = stack.pop();
+		applyModelVisibility(cur);
+		applyBboxVisibility(cur);
+		applySolidFillVisibility(cur);
+		const kids = treeChildren.get(cur) ?? [];
+		for (const k of kids) stack.push(k);
+	}
 }
 
 function truncate(s, n = 60) {
-  if (!s) return "";
-  return s.length > n ? s.slice(0, n - 1) + "…" : s;
+	if (!s) return "";
+	return s.length > n ? s.slice(0, n - 1) + "…" : s;
 }
 
 function treeIsAncestorOf(ancestorId, descendantId) {
-  let cur = treeNodes.get(descendantId)?.parentId ?? null;
-  while (cur !== null) {
-    if (cur === ancestorId) return true;
-    cur = treeNodes.get(cur)?.parentId ?? null;
-  }
-  return false;
+	let cur = treeNodes.get(descendantId)?.parentId ?? null;
+	while (cur !== null) {
+		if (cur === ancestorId) return true;
+		cur = treeNodes.get(cur)?.parentId ?? null;
+	}
+	return false;
 }
 
 function treeHasDescendantPhase(id, predicate) {
-  const stack = [...(treeChildren.get(id) ?? [])];
-  while (stack.length) {
-    const curId = stack.pop();
-    const node = treeNodes.get(curId);
-    if (!node) continue;
-    if (predicate(node.phase ?? "pending")) return true;
-    const kids = treeChildren.get(curId) ?? [];
-    for (const kid of kids) stack.push(kid);
-  }
-  return false;
+	const stack = [...(treeChildren.get(id) ?? [])];
+	while (stack.length) {
+		const curId = stack.pop();
+		const node = treeNodes.get(curId);
+		if (!node) continue;
+		if (predicate(node.phase ?? "pending")) return true;
+		const kids = treeChildren.get(curId) ?? [];
+		for (const kid of kids) stack.push(kid);
+	}
+	return false;
 }
 
 function treeDisplayPhase(id) {
-  const node = treeNodes.get(id);
-  const ownPhase = node?.phase ?? "pending";
-  if (ownPhase === "error") return "error";
-  if (treeHasDescendantPhase(id, (phase) => phase === "error")) return "error";
+	const node = treeNodes.get(id);
+	const ownPhase = node?.phase ?? "pending";
+	if (ownPhase === "error") return "error";
+	if (treeHasDescendantPhase(id, (phase) => phase === "error"))
+		return "error";
 
-  const active = treeActiveId !== null ? treeNodes.get(treeActiveId) : null;
-  const activePhase = active?.phase ?? null;
-  const hasActiveDescendant = treeActiveId !== null
-    && treeActiveId !== id
-    && activePhase !== "done"
-    && activePhase !== "error"
-    && treeIsAncestorOf(id, treeActiveId);
-  if (hasActiveDescendant) return "building_children";
-  return ownPhase;
+	const active = treeActiveId !== null ? treeNodes.get(treeActiveId) : null;
+	const activePhase = active?.phase ?? null;
+	const hasActiveDescendant =
+		treeActiveId !== null &&
+		treeActiveId !== id &&
+		activePhase !== "done" &&
+		activePhase !== "error" &&
+		treeIsAncestorOf(id, treeActiveId);
+	if (hasActiveDescendant) return "building_children";
+	return ownPhase;
 }
 
 function renderTreeNode(id, ctx) {
-  const node = treeNodes.get(id);
-  if (!node) return null;
-  if (ctx && !ctx.visible.has(id)) return null;
-  const wrap = document.createElement("div");
-  const classes = ["tree-node"];
-  if (id === treeActiveId) classes.push("active");
-  if (id === selectedBboxId) classes.push("selected");
-  if (ctx && ctx.matches.has(id)) classes.push("matched", "match-highlight");
-  if (effectivelyHidden(id)) classes.push("vis-hidden");
-  wrap.className = classes.join(" ");
-  wrap.dataset.id = id;
+	const node = treeNodes.get(id);
+	if (!node) return null;
+	if (ctx && !ctx.visible.has(id)) return null;
+	const wrap = document.createElement("div");
+	const classes = ["tree-node"];
+	if (id === treeActiveId) classes.push("active");
+	if (id === selectedBboxId) classes.push("selected");
+	if (ctx && ctx.matches.has(id)) classes.push("matched", "match-highlight");
+	if (effectivelyHidden(id)) classes.push("vis-hidden");
+	wrap.className = classes.join(" ");
+	wrap.dataset.id = id;
 
-  const row = document.createElement("div");
-  row.className = "tree-row";
-  // Click the row (not a nested child-tree row) to select this node.
-  row.addEventListener("click", (ev) => {
-    ev.stopPropagation();
-    selectTreeNode(id);
-  });
+	const row = document.createElement("div");
+	row.className = "tree-row";
+	// Click the row (not a nested child-tree row) to select this node.
+	row.addEventListener("click", (ev) => {
+		ev.stopPropagation();
+		selectTreeNode(id);
+	});
 
-  // Per-node visibility toggle. Reflects only the self-hidden state — a
-  // descendant of a hidden ancestor still shows ● because its own bit is
-  // off; the row's `vis-hidden` class communicates effective state.
-  const visBtn = document.createElement("button");
-  visBtn.type = "button";
-  const selfHidden = hiddenIds.has(id);
-  visBtn.className = `tree-vis-toggle${selfHidden ? " hidden" : ""}`;
-  visBtn.textContent = selfHidden ? "○" : "●";
-  visBtn.title = selfHidden ? "Show node" : "Hide node";
-  visBtn.addEventListener("click", (ev) => {
-    ev.stopPropagation();
-    toggleNodeHidden(id);
-  });
-  row.appendChild(visBtn);
+	// Per-node visibility toggle. Reflects only the self-hidden state — a
+	// descendant of a hidden ancestor still shows ● because its own bit is
+	// off; the row's `vis-hidden` class communicates effective state.
+	const visBtn = document.createElement("button");
+	visBtn.type = "button";
+	const selfHidden = hiddenIds.has(id);
+	visBtn.className = `tree-vis-toggle${selfHidden ? " hidden" : ""}`;
+	visBtn.textContent = selfHidden ? "○" : "●";
+	visBtn.title = selfHidden ? "Show node" : "Hide node";
+	visBtn.addEventListener("click", (ev) => {
+		ev.stopPropagation();
+		toggleNodeHidden(id);
+	});
+	row.appendChild(visBtn);
 
-  const idEl = document.createElement("span");
-  idEl.className = `tree-id ${node.kind}`;
-  idEl.textContent = node.id;
-  row.appendChild(idEl);
+	const idEl = document.createElement("span");
+	idEl.className = `tree-id ${node.kind}`;
+	idEl.textContent = node.id;
+	row.appendChild(idEl);
 
-  const promptEl = document.createElement("span");
-  promptEl.className = "tree-prompt";
-  promptEl.textContent = truncate(node.prompt, 80);
-  promptEl.title = node.prompt ?? "";
-  row.appendChild(promptEl);
+	const promptEl = document.createElement("span");
+	promptEl.className = "tree-prompt";
+	promptEl.textContent = truncate(node.prompt, 80);
+	promptEl.title = node.prompt ?? "";
+	row.appendChild(promptEl);
 
-  const phaseEl = document.createElement("span");
-  const displayPhase = treeDisplayPhase(id);
-  phaseEl.className = `tree-phase phase-${displayPhase}`;
-  phaseEl.textContent = displayPhase;
-  row.appendChild(phaseEl);
+	const phaseEl = document.createElement("span");
+	const displayPhase = treeDisplayPhase(id);
+	phaseEl.className = `tree-phase phase-${displayPhase}`;
+	phaseEl.textContent = displayPhase;
+	row.appendChild(phaseEl);
 
-  wrap.appendChild(row);
+	wrap.appendChild(row);
 
-  const childIds = treeChildren.get(id) ?? [];
-  if (childIds.length > 0) {
-    const kidsEl = document.createElement("div");
-    kidsEl.className = "tree-children";
-    for (const cid of childIds) {
-      const cEl = renderTreeNode(cid, ctx);
-      if (cEl) kidsEl.appendChild(cEl);
-    }
-    if (kidsEl.childNodes.length > 0) wrap.appendChild(kidsEl);
-  }
-  return wrap;
+	const childIds = treeChildren.get(id) ?? [];
+	if (childIds.length > 0) {
+		const kidsEl = document.createElement("div");
+		kidsEl.className = "tree-children";
+		for (const cid of childIds) {
+			const cEl = renderTreeNode(cid, ctx);
+			if (cEl) kidsEl.appendChild(cEl);
+		}
+		if (kidsEl.childNodes.length > 0) wrap.appendChild(kidsEl);
+	}
+	return wrap;
 }
 
 let treeSearchQuery = "";
@@ -1103,47 +1357,47 @@ let treeMatchIndex = -1;
 // `visible` = matches ∪ ancestors-of-matches ∪ descendants-of-matches.
 // Returns null when no query (everything visible, no match highlighting).
 function computeTreeFilter() {
-  const q = treeSearchQuery.trim().toLowerCase();
-  if (!q) return null;
-  const matches = new Set();
-  for (const [id, node] of treeNodes) {
-    const idHit = id.toLowerCase().includes(q);
-    const promptHit = (node.prompt ?? "").toLowerCase().includes(q);
-    if (idHit || promptHit) matches.add(id);
-  }
-  const visible = new Set(matches);
-  // Walk ancestors up.
-  for (const id of matches) {
-    let cur = treeNodes.get(id);
-    while (cur && cur.parentId) {
-      if (visible.has(cur.parentId)) break;
-      visible.add(cur.parentId);
-      cur = treeNodes.get(cur.parentId);
-    }
-  }
-  // Walk descendants down so users can see the matched subtree expanded.
-  const stack = [...matches];
-  while (stack.length) {
-    const id = stack.pop();
-    const kids = treeChildren.get(id) ?? [];
-    for (const cid of kids) {
-      if (!visible.has(cid)) {
-        visible.add(cid);
-        stack.push(cid);
-      }
-    }
-  }
-  return { matches, visible };
+	const q = treeSearchQuery.trim().toLowerCase();
+	if (!q) return null;
+	const matches = new Set();
+	for (const [id, node] of treeNodes) {
+		const idHit = id.toLowerCase().includes(q);
+		const promptHit = (node.prompt ?? "").toLowerCase().includes(q);
+		if (idHit || promptHit) matches.add(id);
+	}
+	const visible = new Set(matches);
+	// Walk ancestors up.
+	for (const id of matches) {
+		let cur = treeNodes.get(id);
+		while (cur && cur.parentId) {
+			if (visible.has(cur.parentId)) break;
+			visible.add(cur.parentId);
+			cur = treeNodes.get(cur.parentId);
+		}
+	}
+	// Walk descendants down so users can see the matched subtree expanded.
+	const stack = [...matches];
+	while (stack.length) {
+		const id = stack.pop();
+		const kids = treeChildren.get(id) ?? [];
+		for (const cid of kids) {
+			if (!visible.has(cid)) {
+				visible.add(cid);
+				stack.push(cid);
+			}
+		}
+	}
+	return { matches, visible };
 }
 
 // Match order for "Enter selects first match" — use insertion order so
 // the first match in the rendered tree is what gets selected.
 function orderedMatches(filter) {
-  if (!filter) return [];
-  const sorted = [...treeNodes.values()]
-    .filter((n) => filter.matches.has(n.id))
-    .sort((a, b) => a.order - b.order);
-  return sorted.map((n) => n.id);
+	if (!filter) return [];
+	const sorted = [...treeNodes.values()]
+		.filter((n) => filter.matches.has(n.id))
+		.sort((a, b) => a.order - b.order);
+	return sorted.map((n) => n.id);
 }
 
 // Coalesced tree re-render. A single SSE snapshot can fire `renderTree`
@@ -1156,79 +1410,82 @@ function orderedMatches(filter) {
 // the next line still works).
 let _treeRenderPending = false;
 function scheduleRenderTree() {
-  _treeRenderPending = true;
+	_treeRenderPending = true;
 }
 
 function renderTree() {
-  // A synchronous render satisfies any pending coalesced one.
-  _treeRenderPending = false;
-  treeBodyEl.innerHTML = "";
-  const filter = computeTreeFilter();
-  if (treeRootId !== null) {
-    const el = renderTreeNode(treeRootId, filter);
-    if (el) treeBodyEl.appendChild(el);
-  }
-  if (treeActiveId !== null) {
-    const n = treeNodes.get(treeActiveId);
-    if (n) treeActiveEl.textContent = `${treeDisplayPhase(n.id)} · ${n.id}`;
-  } else {
-    treeActiveEl.textContent = "";
-  }
-  if (filter) {
-    const n = filter.matches.size;
-    if (n === 0) {
-      treeSearchCountEl.textContent = "no matches";
-    } else if (treeMatchIndex >= 0) {
-      treeSearchCountEl.textContent = `${(treeMatchIndex % n) + 1}/${n}`;
-    } else {
-      treeSearchCountEl.textContent = `${n} match${n === 1 ? "" : "es"}`;
-    }
-  } else {
-    treeSearchCountEl.textContent = "";
-  }
-  updateMissingMeshCount();
+	// A synchronous render satisfies any pending coalesced one.
+	_treeRenderPending = false;
+	treeBodyEl.innerHTML = "";
+	const filter = computeTreeFilter();
+	if (treeRootId !== null) {
+		const el = renderTreeNode(treeRootId, filter);
+		if (el) treeBodyEl.appendChild(el);
+	}
+	if (treeActiveId !== null) {
+		const n = treeNodes.get(treeActiveId);
+		if (n) treeActiveEl.textContent = `${treeDisplayPhase(n.id)} · ${n.id}`;
+	} else {
+		treeActiveEl.textContent = "";
+	}
+	if (filter) {
+		const n = filter.matches.size;
+		if (n === 0) {
+			treeSearchCountEl.textContent = "no matches";
+		} else if (treeMatchIndex >= 0) {
+			treeSearchCountEl.textContent = `${(treeMatchIndex % n) + 1}/${n}`;
+		} else {
+			treeSearchCountEl.textContent = `${n} match${n === 1 ? "" : "es"}`;
+		}
+	} else {
+		treeSearchCountEl.textContent = "";
+	}
+	updateMissingMeshCount();
 }
 
 treeHeaderEl.addEventListener("click", () => {
-  const collapsed = treeEl.classList.toggle("collapsed");
-  treeToggleEl.textContent = collapsed ? "▸" : "▾";
+	const collapsed = treeEl.classList.toggle("collapsed");
+	treeToggleEl.textContent = collapsed ? "▸" : "▾";
 });
 
 treeSearchEl.addEventListener("input", () => {
-  treeSearchQuery = treeSearchEl.value;
-  treeSearchClearEl.classList.toggle("visible", treeSearchQuery.length > 0);
-  treeMatchIndex = -1;
-  renderTree();
+	treeSearchQuery = treeSearchEl.value;
+	treeSearchClearEl.classList.toggle("visible", treeSearchQuery.length > 0);
+	treeMatchIndex = -1;
+	renderTree();
 });
 
 treeSearchEl.addEventListener("keydown", (ev) => {
-  if (ev.key === "Enter") {
-    ev.preventDefault();
-    const ordered = orderedMatches(computeTreeFilter());
-    if (ordered.length === 0) return;
-    if (treeMatchIndex < 0) {
-      treeMatchIndex = ev.shiftKey ? ordered.length - 1 : 0;
-    } else {
-      const delta = ev.shiftKey ? -1 : 1;
-      treeMatchIndex = (treeMatchIndex + delta + ordered.length) % ordered.length;
-    }
-    const target = ordered[treeMatchIndex];
-    // Bypass selectTreeNode's toggle behaviour — re-pressing Enter on the
-    // same node should cycle, not deselect.
-    if (selectedBboxId !== target) selectTreeNode(target);
-    const row = treeBodyEl.querySelector(`.tree-node[data-id="${CSS.escape(target)}"]`);
-    if (row) row.scrollIntoView({ block: "nearest", behavior: "smooth" });
-    renderTree();
-  } else if (ev.key === "Escape") {
-    treeSearchEl.value = "";
-    treeSearchEl.dispatchEvent(new Event("input"));
-  }
+	if (ev.key === "Enter") {
+		ev.preventDefault();
+		const ordered = orderedMatches(computeTreeFilter());
+		if (ordered.length === 0) return;
+		if (treeMatchIndex < 0) {
+			treeMatchIndex = ev.shiftKey ? ordered.length - 1 : 0;
+		} else {
+			const delta = ev.shiftKey ? -1 : 1;
+			treeMatchIndex =
+				(treeMatchIndex + delta + ordered.length) % ordered.length;
+		}
+		const target = ordered[treeMatchIndex];
+		// Bypass selectTreeNode's toggle behaviour — re-pressing Enter on the
+		// same node should cycle, not deselect.
+		if (selectedBboxId !== target) selectTreeNode(target);
+		const row = treeBodyEl.querySelector(
+			`.tree-node[data-id="${CSS.escape(target)}"]`,
+		);
+		if (row) row.scrollIntoView({ block: "nearest", behavior: "smooth" });
+		renderTree();
+	} else if (ev.key === "Escape") {
+		treeSearchEl.value = "";
+		treeSearchEl.dispatchEvent(new Event("input"));
+	}
 });
 
 treeSearchClearEl.addEventListener("click", () => {
-  treeSearchEl.value = "";
-  treeSearchEl.dispatchEvent(new Event("input"));
-  treeSearchEl.focus();
+	treeSearchEl.value = "";
+	treeSearchEl.dispatchEvent(new Event("input"));
+	treeSearchEl.focus();
 });
 
 // --- three.js scene ---------------------------------------------------------
@@ -1237,10 +1494,22 @@ const host = document.getElementById("canvas-host");
 // preserveDrawingBuffer keeps the WebGL framebuffer readable after present,
 // which is required for the gif export path (gif.js calls getImageData on
 // the canvas). Small perf cost on every frame; acceptable for a debug tool.
-const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({
+	antialias: true,
+	preserveDrawingBuffer: true,
+});
 renderer.setPixelRatio(window.devicePixelRatio);
 renderer.setSize(window.innerWidth, window.innerHeight);
 renderer.setClearColor(0x101114);
+// Physically-based output so streamed PBR GLBs read with real depth instead of
+// flat: sRGB framebuffer + ACES filmic tonemapping (graceful highlight rolloff)
+// and soft shadow maps. The IBL environment + key light are set up with the
+// scene below.
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.0;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 host.appendChild(renderer.domElement);
 
 const scene = new THREE.Scene();
@@ -1253,33 +1522,33 @@ const bboxRoot = new THREE.Group();
 scene.add(bboxRoot);
 let bboxesShown = localStorage.getItem(BBOX_VISIBLE_STORAGE_KEY) !== "0";
 function applyBboxToggleLabel() {
-  bboxToggleEl.textContent = `bboxes: ${bboxesShown ? "on" : "off"}`;
-  bboxToggleEl.classList.toggle("off", !bboxesShown);
+	bboxToggleEl.textContent = `bboxes: ${bboxesShown ? "on" : "off"}`;
+	bboxToggleEl.classList.toggle("off", !bboxesShown);
 }
 applyBboxToggleLabel();
 bboxToggleEl.addEventListener("click", () => {
-  bboxesShown = !bboxesShown;
-  localStorage.setItem(BBOX_VISIBLE_STORAGE_KEY, bboxesShown ? "1" : "0");
-  applyBboxToggleLabel();
-  refreshAllBboxVisibility();
-  // Picking rule depends on bboxesShown — re-pick at the current cursor
-  // position so the hover updates immediately instead of waiting for a
-  // mouse move.
-  pointerDirty = true;
+	bboxesShown = !bboxesShown;
+	localStorage.setItem(BBOX_VISIBLE_STORAGE_KEY, bboxesShown ? "1" : "0");
+	applyBboxToggleLabel();
+	refreshAllBboxVisibility();
+	// Picking rule depends on bboxesShown — re-pick at the current cursor
+	// position so the hover updates immediately instead of waiting for a
+	// mouse move.
+	pointerDirty = true;
 });
 
 let framesShown = localStorage.getItem(FRAMES_VISIBLE_STORAGE_KEY) !== "0";
 function applyFramesToggleLabel() {
-  framesToggleEl.textContent = `frames: ${framesShown ? "on" : "off"}`;
-  framesToggleEl.classList.toggle("off", !framesShown);
+	framesToggleEl.textContent = `frames: ${framesShown ? "on" : "off"}`;
+	framesToggleEl.classList.toggle("off", !framesShown);
 }
 applyFramesToggleLabel();
 framesToggleEl.addEventListener("click", () => {
-  framesShown = !framesShown;
-  localStorage.setItem(FRAMES_VISIBLE_STORAGE_KEY, framesShown ? "1" : "0");
-  applyFramesToggleLabel();
-  refreshAllFrameModelVisibility();
-  refreshAllSolidFillVisibility();
+	framesShown = !framesShown;
+	localStorage.setItem(FRAMES_VISIBLE_STORAGE_KEY, framesShown ? "1" : "0");
+	applyFramesToggleLabel();
+	refreshAllFrameModelVisibility();
+	refreshAllSolidFillVisibility();
 });
 
 // Master switch for all generated GLB meshes (objects + frames). Off = pure
@@ -1287,37 +1556,38 @@ framesToggleEl.addEventListener("click", () => {
 // meshes; meshes:off wins over frames:on.
 let meshesShown = localStorage.getItem(MESHES_VISIBLE_STORAGE_KEY) !== "0";
 function applyMeshesToggleLabel() {
-  meshesToggleEl.textContent = `meshes: ${meshesShown ? "on" : "off"}`;
-  meshesToggleEl.classList.toggle("off", !meshesShown);
+	meshesToggleEl.textContent = `meshes: ${meshesShown ? "on" : "off"}`;
+	meshesToggleEl.classList.toggle("off", !meshesShown);
 }
 applyMeshesToggleLabel();
 meshesToggleEl.addEventListener("click", () => {
-  meshesShown = !meshesShown;
-  localStorage.setItem(MESHES_VISIBLE_STORAGE_KEY, meshesShown ? "1" : "0");
-  applyMeshesToggleLabel();
-  refreshAllFrameModelVisibility();
-  // Picking falls back to solid fills / bboxes when meshes are hidden — kick
-  // the hover so it re-evaluates without waiting for the next mouse move.
-  pointerDirty = true;
+	meshesShown = !meshesShown;
+	localStorage.setItem(MESHES_VISIBLE_STORAGE_KEY, meshesShown ? "1" : "0");
+	applyMeshesToggleLabel();
+	refreshAllFrameModelVisibility();
+	// Picking falls back to solid fills / bboxes when meshes are hidden — kick
+	// the hover so it re-evaluates without waiting for the next mouse move.
+	pointerDirty = true;
 });
 
 // Selection-mode switch: "all" (default — mesh/fill picking, every kind is
 // selectable) vs. "zones" (only zone bboxes are pickable, so the user can
 // click a containing zone to see how frames/objects sit inside it via the
 // dim-on-select highlight).
-let selectMode = localStorage.getItem(SELECT_MODE_STORAGE_KEY) === "zones" ? "zones" : "all";
+let selectMode =
+	localStorage.getItem(SELECT_MODE_STORAGE_KEY) === "zones" ? "zones" : "all";
 function applySelectModeToggleLabel() {
-  selectModeToggleEl.textContent = `select: ${selectMode}`;
-  selectModeToggleEl.classList.toggle("zones", selectMode === "zones");
+	selectModeToggleEl.textContent = `select: ${selectMode}`;
+	selectModeToggleEl.classList.toggle("zones", selectMode === "zones");
 }
 applySelectModeToggleLabel();
 selectModeToggleEl.addEventListener("click", () => {
-  selectMode = selectMode === "zones" ? "all" : "zones";
-  localStorage.setItem(SELECT_MODE_STORAGE_KEY, selectMode);
-  applySelectModeToggleLabel();
-  // Hover under the cursor is now stale — different pick set — so re-evaluate
-  // immediately instead of waiting for the next mouse move.
-  pointerDirty = true;
+	selectMode = selectMode === "zones" ? "all" : "zones";
+	localStorage.setItem(SELECT_MODE_STORAGE_KEY, selectMode);
+	applySelectModeToggleLabel();
+	// Hover under the cursor is now stale — different pick set — so re-evaluate
+	// immediately instead of waiting for the next mouse move.
+	pointerDirty = true;
 });
 
 // Solid-fill mode — drops a solid mesh into every object/frame bbox using its
@@ -1326,16 +1596,16 @@ selectModeToggleEl.addEventListener("click", () => {
 // running Trellis. Independent of the bbox wireframe toggle.
 let solidFillShown = localStorage.getItem(SOLID_FILL_STORAGE_KEY) === "1";
 function applySolidFillToggleLabel() {
-  solidFillToggleEl.textContent = `fill: ${solidFillShown ? "on" : "off"}`;
-  solidFillToggleEl.classList.toggle("off", !solidFillShown);
+	solidFillToggleEl.textContent = `fill: ${solidFillShown ? "on" : "off"}`;
+	solidFillToggleEl.classList.toggle("off", !solidFillShown);
 }
 applySolidFillToggleLabel();
 solidFillToggleEl.addEventListener("click", () => {
-  solidFillShown = !solidFillShown;
-  localStorage.setItem(SOLID_FILL_STORAGE_KEY, solidFillShown ? "1" : "0");
-  applySolidFillToggleLabel();
-  if (solidFillShown) rebuildAllSolidFills();
-  else clearSolidFills();
+	solidFillShown = !solidFillShown;
+	localStorage.setItem(SOLID_FILL_STORAGE_KEY, solidFillShown ? "1" : "0");
+	applySolidFillToggleLabel();
+	if (solidFillShown) rebuildAllSolidFills();
+	else clearSolidFills();
 });
 
 const bboxes = new Map(); // id -> THREE.Box3Helper
@@ -1366,33 +1636,33 @@ let controlsInteracting = false;
 const tooltip = document.createElement("div");
 tooltip.id = "bbox-tooltip";
 tooltip.style.cssText = [
-  "position: fixed",
-  "padding: 5px 9px",
-  "background: rgba(22, 24, 29, 0.94)",
-  "color: #e6e6e6",
-  "border: 1px solid #2a2d35",
-  "border-radius: 4px",
-  "font: 12px ui-monospace, SFMono-Regular, Menlo, monospace",
-  "pointer-events: none",
-  "display: none",
-  "z-index: 10",
-  "max-width: 360px",
-  "white-space: pre-wrap",
-  "line-height: 1.35",
+	"position: fixed",
+	"padding: 5px 9px",
+	"background: rgba(22, 24, 29, 0.94)",
+	"color: #e6e6e6",
+	"border: 1px solid #2a2d35",
+	"border-radius: 4px",
+	"font: 12px ui-monospace, SFMono-Regular, Menlo, monospace",
+	"pointer-events: none",
+	"display: none",
+	"z-index: 10",
+	"max-width: 360px",
+	"white-space: pre-wrap",
+	"line-height: 1.35",
 ].join("; ");
 document.body.appendChild(tooltip);
 
 const TOOLTIP_KIND_COLOR = {
-  zone: "#9ad4ff",
-  object: "#8bd17c",
-  frame: "#7fb3d5",
+	zone: "#9ad4ff",
+	object: "#8bd17c",
+	frame: "#7fb3d5",
 };
 
 const camera = new THREE.PerspectiveCamera(
-  50,
-  window.innerWidth / window.innerHeight,
-  0.05,
-  5000,
+	50,
+	window.innerWidth / window.innerHeight,
+	0.05,
+	5000,
 );
 camera.position.set(8, 6, 10);
 
@@ -1406,14 +1676,14 @@ controls.update();
 // preserve their chosen angle. The flag deliberately survives clearScene.
 let cameraUserMoved = false;
 controls.addEventListener("start", () => {
-  cameraUserMoved = true;
-  controlsInteracting = true;
-  setHoveredBbox(null);
-  tooltip.style.display = "none";
+	cameraUserMoved = true;
+	controlsInteracting = true;
+	setHoveredBbox(null);
+	tooltip.style.display = "none";
 });
 controls.addEventListener("end", () => {
-  controlsInteracting = false;
-  pointerDirty = true;
+	controlsInteracting = false;
+	pointerDirty = true;
 });
 
 // --- WASD fly controls (complementary to OrbitControls) --------------------
@@ -1425,23 +1695,27 @@ let _lastMoveT = performance.now();
 const _MOVE_KEYS = new Set(["w", "a", "s", "d", "q", "e", "r", "f"]);
 
 function _isTypingTarget(t) {
-  return t instanceof HTMLElement &&
-    (t.tagName === "INPUT" || t.tagName === "TEXTAREA" || t.isContentEditable);
+	return (
+		t instanceof HTMLElement &&
+		(t.tagName === "INPUT" ||
+			t.tagName === "TEXTAREA" ||
+			t.isContentEditable)
+	);
 }
 
 window.addEventListener("keydown", (ev) => {
-  if (_isTypingTarget(ev.target)) return;
-  const k = ev.key.toLowerCase();
-  if (_MOVE_KEYS.has(k)) {
-    pressedKeys.add(k);
-    ev.preventDefault();
-  } else if (k === "shift") {
-    pressedKeys.add("shift");
-  }
+	if (_isTypingTarget(ev.target)) return;
+	const k = ev.key.toLowerCase();
+	if (_MOVE_KEYS.has(k)) {
+		pressedKeys.add(k);
+		ev.preventDefault();
+	} else if (k === "shift") {
+		pressedKeys.add("shift");
+	}
 });
 
 window.addEventListener("keyup", (ev) => {
-  pressedKeys.delete(ev.key.toLowerCase());
+	pressedKeys.delete(ev.key.toLowerCase());
 });
 
 // Alt-tab / focus-loss: drop held keys so they don't stick on.
@@ -1453,60 +1727,440 @@ const _worldUp = new THREE.Vector3(0, 1, 0);
 const _move = new THREE.Vector3();
 
 function _applyKeyboardMove(dt) {
-  if (pressedKeys.size === 0) return;
-  const shifted = pressedKeys.has("shift");
-  const speed = 2 * (shifted ? 3 : 1) * dt;
+	if (pressedKeys.size === 0) return;
+	const shifted = pressedKeys.has("shift");
+	const speed = 2 * (shifted ? 3 : 1) * dt;
 
-  _fwd.subVectors(controls.target, camera.position);
-  _fwd.y = 0;
-  if (_fwd.lengthSq() === 0) return;
-  _fwd.normalize();
-  _right.crossVectors(_fwd, _worldUp).normalize();
+	_fwd.subVectors(controls.target, camera.position);
+	_fwd.y = 0;
+	if (_fwd.lengthSq() === 0) return;
+	_fwd.normalize();
+	_right.crossVectors(_fwd, _worldUp).normalize();
 
-  _move.set(0, 0, 0);
-  if (pressedKeys.has("w")) _move.addScaledVector(_fwd, speed);
-  if (pressedKeys.has("s")) _move.addScaledVector(_fwd, -speed);
-  if (pressedKeys.has("d")) _move.addScaledVector(_right, speed);
-  if (pressedKeys.has("a")) _move.addScaledVector(_right, -speed);
-  if (pressedKeys.has("e")) _move.addScaledVector(_worldUp, speed);
-  if (pressedKeys.has("q")) _move.addScaledVector(_worldUp, -speed);
+	_move.set(0, 0, 0);
+	if (pressedKeys.has("w")) _move.addScaledVector(_fwd, speed);
+	if (pressedKeys.has("s")) _move.addScaledVector(_fwd, -speed);
+	if (pressedKeys.has("d")) _move.addScaledVector(_right, speed);
+	if (pressedKeys.has("a")) _move.addScaledVector(_right, -speed);
+	if (pressedKeys.has("e")) _move.addScaledVector(_worldUp, speed);
+	if (pressedKeys.has("q")) _move.addScaledVector(_worldUp, -speed);
 
-  if (_move.lengthSq() !== 0) {
-    camera.position.add(_move);
-    controls.target.add(_move);
-    cameraUserMoved = true;
-  }
+	if (_move.lengthSq() !== 0) {
+		camera.position.add(_move);
+		controls.target.add(_move);
+		cameraUserMoved = true;
+	}
 
-  // Dolly toward / away from the orbit target. Held key = continuous zoom;
-  // ~1.5x per second baseline, 4x with shift.
-  if (pressedKeys.has("r") || pressedKeys.has("f")) {
-    const rate = shifted ? 4 : 1.5;
-    let factor = 1;
-    if (pressedKeys.has("r")) factor *= Math.pow(1 / rate, dt);
-    if (pressedKeys.has("f")) factor *= Math.pow(rate, dt);
-    _dolly(factor);
-  }
+	// Dolly toward / away from the orbit target. Held key = continuous zoom;
+	// ~1.5x per second baseline, 4x with shift.
+	if (pressedKeys.has("r") || pressedKeys.has("f")) {
+		const rate = shifted ? 4 : 1.5;
+		let factor = 1;
+		if (pressedKeys.has("r")) factor *= Math.pow(1 / rate, dt);
+		if (pressedKeys.has("f")) factor *= Math.pow(rate, dt);
+		_dolly(factor);
+	}
 }
 
 function _dolly(factor) {
-  // factor < 1 zooms in, factor > 1 zooms out. Implemented as scaling the
-  // camera->target distance so OrbitControls' pivot semantics stay intact.
-  const offset = camera.position.clone().sub(controls.target);
-  const dist = offset.length();
-  if (dist === 0) return;
-  const minDist = 0.05;
-  const maxDist = 4000;
-  const newDist = Math.max(minDist, Math.min(maxDist, dist * factor));
-  offset.multiplyScalar(newDist / dist);
-  camera.position.copy(controls.target).add(offset);
-  cameraUserMoved = true;
+	// factor < 1 zooms in, factor > 1 zooms out. Implemented as scaling the
+	// camera->target distance so OrbitControls' pivot semantics stay intact.
+	const offset = camera.position.clone().sub(controls.target);
+	const dist = offset.length();
+	if (dist === 0) return;
+	const minDist = 0.05;
+	const maxDist = 4000;
+	const newDist = Math.max(minDist, Math.min(maxDist, dist * factor));
+	offset.multiplyScalar(newDist / dist);
+	camera.position.copy(controls.target).add(offset);
+	cameraUserMoved = true;
 }
 
-scene.add(new THREE.HemisphereLight(0xffffff, 0x202028, 0.9));
-const dir = new THREE.DirectionalLight(0xffffff, 0.9);
-dir.position.set(8, 12, 6);
+// Image-based lighting. A prefiltered RoomEnvironment drives indirect light +
+// reflections on every PBR mesh — this is what lifts the streamed GLBs out of
+// "flat": without an environment, MeshStandardMaterial has nothing to reflect.
+// Passing the renderer calibrates the room's intensity for physically-based
+// lights (the renderer default since three r155), so the IBL isn't ~180x dim.
+// The returned PMREM texture outlives the generator, so both temporaries are
+// disposed immediately.
+{
+	const pmrem = new THREE.PMREMGenerator(renderer);
+	const envScene = new RoomEnvironment(renderer);
+	scene.environment = pmrem.fromScene(envScene, 0.04).texture;
+	envScene.dispose();
+	pmrem.dispose();
+}
+// The IBL is calibrated bright; keep it as fill + reflections only so the key
+// light below can actually shape the scene. At full strength it washes out all
+// directionality and shadows. Tunable live via the lighting panel.
+scene.environmentIntensity = 0.35;
+
+// Gentle sky/ground fill on top of the IBL so undersides never read fully black.
+const hemiLight = new THREE.HemisphereLight(0xffffff, 0x202028, 0.2);
+scene.add(hemiLight);
+
+// Key light — the only shadow caster. Its position, target, and shadow frustum
+// are fit to the scene bounds whenever geometry changes (updateSceneLighting),
+// so shadows stay crisp whether the scene is a small room or a large arena.
+const SHADOW_MAP_SIZE = 4096;
+const dir = new THREE.DirectionalLight(0xffffff, 3.5);
+dir.castShadow = true;
+dir.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+dir.shadow.bias = -0.0001;
+// normalBias is set per-scene in updateSceneLighting, scaled to the shadow
+// texel's world size — a fixed value over-/under-biases as the frustum scales,
+// which is the main cause of the self-shadow acne flicker on large scenes.
 scene.add(dir);
-scene.add(new THREE.AxesHelper(1));
+scene.add(dir.target);
+
+// Shadow reception is re-gated on this shared uniform (see
+// patchMaterialReceiveShadow) instead of three's per-object `receiveShadow`
+// uniform, which doesn't reach these streamed PBR materials. The "cast shadows"
+// toggle flips `.value`; the caster itself stays on so toggling needs no
+// recompile.
+const _forceReceiveShadow = { value: true };
+
+const axesHelper = new THREE.AxesHelper(1);
+axesHelper.material.toneMapped = false; // keep the reference axes' raw colors
+scene.add(axesHelper);
+
+// Ground plane that renders ONLY the shadows cast onto it (transparent
+// everywhere else), so contact shadows read clearly and the panel's "shadow"
+// slider has something to drive. Lives on `scene` (not `sceneRoot`), so it's
+// excluded from fit-to-scene, picking, and the .glb export. depthWrite off +
+// depthTest on means it overlays the ground but is occluded by objects in front.
+const shadowCatcher = new THREE.Mesh(
+	new THREE.PlaneGeometry(1, 1),
+	new THREE.ShadowMaterial({ opacity: 0.4, depthWrite: false }),
+);
+shadowCatcher.rotation.x = -Math.PI / 2;
+shadowCatcher.receiveShadow = true;
+shadowCatcher.renderOrder = -1;
+scene.add(shadowCatcher);
+
+// Fixed key-light direction (upper front-right); only the distance + shadow
+// frustum scale with the scene. Recomputed from the sceneRoot bounds so the
+// shadow map tightly wraps the geometry at any scale. `box` may be null/empty
+// (bbox-only or freshly-cleared scenes) — fall back to a sane default volume.
+const _LIGHT_DIR = new THREE.Vector3(4, 8, 6).normalize();
+const _lightCenter = new THREE.Vector3();
+const _lightSize = new THREE.Vector3();
+// Remembered so the lighting panel can refit the shadow frustum to the current
+// scene when only the sun direction changes — no fresh Box3 traversal needed.
+let _lastSceneBox = null;
+function updateSceneLighting(box) {
+	const hasGeom = !!box && !box.isEmpty();
+	_lastSceneBox = hasGeom ? box : null;
+	if (hasGeom) {
+		box.getCenter(_lightCenter);
+		box.getSize(_lightSize);
+	} else {
+		_lightCenter.set(0, 0, 0);
+		_lightSize.set(20, 20, 20);
+	}
+	// True bounding-sphere radius (half the diagonal), not half the max extent —
+	// so the ortho shadow frustum actually encloses the whole scene and its
+	// texels/depth precision are spent tightly on the geometry (crisp contact
+	// shadows) rather than on empty margin.
+	const radius = Math.max(
+		0.5,
+		0.5 *
+			Math.sqrt(
+				_lightSize.x * _lightSize.x +
+					_lightSize.y * _lightSize.y +
+					_lightSize.z * _lightSize.z,
+			),
+	);
+	const minY = hasGeom ? box.min.y : 0;
+	const dist = radius * 3;
+
+	dir.position.copy(_lightCenter).addScaledVector(_LIGHT_DIR, dist);
+	dir.target.position.copy(_lightCenter);
+	dir.target.updateMatrixWorld();
+
+	const cam = dir.shadow.camera;
+	// Hug the bounding sphere: lateral extent just covers it, near/far bracket it
+	// tightly so depth resolution (and thus contact-shadow accuracy) is maximized.
+	const extent = radius * 1.05;
+	cam.left = -extent;
+	cam.right = extent;
+	cam.top = extent;
+	cam.bottom = -extent;
+	cam.near = Math.max(0.01, dist - radius * 1.1);
+	cam.far = dist + radius * 1.1;
+	cam.updateProjectionMatrix();
+
+	// Normal-offset bias scaled to the shadow texel's world size (~2 texels) —
+	// the primary defense against self-shadow acne. Generated/decimated meshes
+	// (computed smooth normals that diverge from their flat faces) flicker badly
+	// without it; scaling to the frustum keeps acne suppression consistent from a
+	// small room to a large arena instead of a fixed value that's too weak when
+	// the scene (and thus each texel) is large.
+	dir.shadow.normalBias = ((2 * extent) / SHADOW_MAP_SIZE) * 2.0;
+
+	// Sit the catcher just above the lowest geometry so its contact shadows
+	// overlay the floor (or open ground) and stay visible from above.
+	shadowCatcher.position.set(
+		_lightCenter.x,
+		minY + radius * 0.003,
+		_lightCenter.z,
+	);
+	shadowCatcher.scale.set(radius * 6, radius * 6, 1);
+}
+updateSceneLighting(null);
+
+// --- lighting panel ---------------------------------------------------------
+// Live controls for the lighting configured above. Each input writes straight
+// to the renderer / lights so the scene updates as you drag; values persist.
+// Bumped to .v2 to discard any pre-rebalance saved state (the old defaults let
+// the environment wash out all directional lighting + shadows).
+const LIGHTING_STORAGE_KEY = "starshot.lighting.v2";
+const LIGHTING_DEFAULTS = {
+	exposure: 1.0,
+	key: 3.5, // directional dominates so the scene has a clear lit/shadowed side
+	fill: 0.2,
+	env: 0.35, // IBL is fill + reflections only, not the main light
+	shadow: 0.4,
+	azimuth: 34, // ≈ atan2(4, 6) — matches the initial (4, 8, 6) key direction
+	elevation: 48, // ≈ asin(8 / |(4, 8, 6)|)
+	shadows: true,
+};
+// Each slider field maps to inputs #lp-<field> + readout #lp-<field>-val.
+const LP_CONTROLS = [
+	{ field: "exposure", fmt: (v) => v.toFixed(2) },
+	{ field: "key", fmt: (v) => v.toFixed(1) },
+	{ field: "fill", fmt: (v) => v.toFixed(2) },
+	{ field: "env", fmt: (v) => v.toFixed(2) },
+	{ field: "shadow", fmt: (v) => v.toFixed(2) },
+	{ field: "azimuth", fmt: (v) => `${Math.round(v)}°` },
+	{ field: "elevation", fmt: (v) => `${Math.round(v)}°` },
+];
+
+const lightingState = (() => {
+	let saved = null;
+	try {
+		saved = JSON.parse(
+			localStorage.getItem(LIGHTING_STORAGE_KEY) || "null",
+		);
+	} catch {}
+	return {
+		...LIGHTING_DEFAULTS,
+		...(saved && typeof saved === "object" ? saved : {}),
+	};
+})();
+
+function persistLighting() {
+	try {
+		localStorage.setItem(
+			LIGHTING_STORAGE_KEY,
+			JSON.stringify(lightingState),
+		);
+	} catch {}
+}
+
+// Sun direction from azimuth (0°=+Z front, 90°=+X right) + elevation, then
+// refit the shadow frustum to the last known scene bounds.
+function setLightDirFromAngles(azDeg, elDeg) {
+	const az = THREE.MathUtils.degToRad(azDeg);
+	const el = THREE.MathUtils.degToRad(elDeg);
+	const cosEl = Math.cos(el);
+	_LIGHT_DIR
+		.set(Math.sin(az) * cosEl, Math.sin(el), Math.cos(az) * cosEl)
+		.normalize();
+	updateSceneLighting(_lastSceneBox);
+}
+
+// Scalar params apply directly to the live objects (read each render).
+function applyScalarLighting() {
+	renderer.toneMappingExposure = lightingState.exposure;
+	dir.intensity = lightingState.key;
+	hemiLight.intensity = lightingState.fill;
+	scene.environmentIntensity = lightingState.env;
+	shadowCatcher.material.opacity = lightingState.shadow;
+	// Caster stays on (dir.castShadow set once at init); gate reception through
+	// the shared uniform so toggling needs no shader recompile and can't black
+	// out the scene by emptying the shadow-map array mid-run.
+	_forceReceiveShadow.value = lightingState.shadows;
+	shadowCatcher.visible = lightingState.shadows;
+}
+
+function applyLightingState() {
+	applyScalarLighting();
+	setLightDirFromAngles(lightingState.azimuth, lightingState.elevation);
+}
+
+function syncLightingControls() {
+	for (const c of LP_CONTROLS) {
+		document.getElementById(`lp-${c.field}`).value = lightingState[c.field];
+		document.getElementById(`lp-${c.field}-val`).textContent = c.fmt(
+			lightingState[c.field],
+		);
+	}
+	document.getElementById("lp-shadows-enabled").checked =
+		lightingState.shadows;
+}
+
+for (const c of LP_CONTROLS) {
+	const input = document.getElementById(`lp-${c.field}`);
+	const val = document.getElementById(`lp-${c.field}-val`);
+	input.addEventListener("input", () => {
+		lightingState[c.field] = parseFloat(input.value);
+		val.textContent = c.fmt(lightingState[c.field]);
+		if (c.field === "azimuth" || c.field === "elevation") {
+			setLightDirFromAngles(
+				lightingState.azimuth,
+				lightingState.elevation,
+			);
+		} else {
+			applyScalarLighting();
+		}
+		persistLighting();
+	});
+}
+
+document
+	.getElementById("lp-shadows-enabled")
+	.addEventListener("change", (ev) => {
+		lightingState.shadows = ev.target.checked;
+		applyScalarLighting();
+		persistLighting();
+	});
+
+const lightingPanelEl = document.getElementById("lighting-panel");
+const lightingToggleEl = document.getElementById("lighting-toggle");
+function setLightingPanelOpen(open) {
+	lightingPanelEl.classList.toggle("open", open);
+	lightingToggleEl.classList.toggle("active", open);
+}
+lightingToggleEl.addEventListener("click", () =>
+	setLightingPanelOpen(!lightingPanelEl.classList.contains("open")),
+);
+document
+	.getElementById("lighting-close")
+	.addEventListener("click", () => setLightingPanelOpen(false));
+document.getElementById("lighting-reset").addEventListener("click", () => {
+	Object.assign(lightingState, LIGHTING_DEFAULTS);
+	applyLightingState();
+	syncLightingControls();
+	persistLighting();
+});
+
+// Push persisted/default values onto both the scene and the controls now that
+// the lights + DOM exist.
+syncLightingControls();
+applyLightingState();
+
+// Debug hook: inspect the live lighting/shadow state from the devtools console
+// via `__lighting.report()`. Handy for diagnosing whether the shadow-camera
+// frustum actually encloses the scene.
+window.__lighting = {
+	dir,
+	hemiLight,
+	shadowCatcher,
+	renderer,
+	scene,
+	sceneRoot,
+	updateSceneLighting,
+	report() {
+		const box = new THREE.Box3().setFromObject(sceneRoot);
+		const empty = box.isEmpty();
+		const size = empty
+			? [0, 0, 0]
+			: box.getSize(new THREE.Vector3()).toArray();
+		const center = empty
+			? [0, 0, 0]
+			: box.getCenter(new THREE.Vector3()).toArray();
+		let meshes = 0;
+		let casters = 0;
+		let receivers = 0;
+		const matTypes = new Set();
+		sceneRoot.traverse((o) => {
+			if (!o.isMesh) return;
+			meshes++;
+			if (o.castShadow) casters++;
+			if (o.receiveShadow) receivers++;
+			const m = Array.isArray(o.material) ? o.material[0] : o.material;
+			if (m) matTypes.add(m.type);
+		});
+		const c = dir.shadow.camera;
+		return {
+			boxEmpty: empty,
+			size,
+			center,
+			lightPos: dir.position.toArray(),
+			targetPos: dir.target.position.toArray(),
+			dirCastShadow: dir.castShadow,
+			shadowMapEnabled: renderer.shadowMap.enabled,
+			shadowCam: {
+				l: c.left,
+				r: c.right,
+				t: c.top,
+				b: c.bottom,
+				near: c.near,
+				far: c.far,
+			},
+			meshes,
+			casters,
+			receivers,
+			matTypes: [...matTypes],
+		};
+	},
+	// Drop a fresh box caster onto a fresh plane receiver (both vanilla
+	// MeshStandardMaterial, no Meshopt/quantization, standard three shadow path)
+	// at the scene center. If THIS box shadows THIS plane, three's shadows work
+	// for ordinary standard receivers here and the bug is specific to the loaded
+	// (quantized) GLBs; if it doesn't, the break is global to standard materials.
+	shadowTest() {
+		this.clearTest();
+		const box = new THREE.Box3().setFromObject(sceneRoot);
+		const center = box.isEmpty()
+			? new THREE.Vector3()
+			: box.getCenter(new THREE.Vector3());
+		const size = box.isEmpty()
+			? new THREE.Vector3(10, 10, 10)
+			: box.getSize(new THREE.Vector3());
+		const r = Math.max(2, 0.25 * Math.max(size.x, size.y, size.z));
+		const y0 = box.isEmpty() ? 0 : box.min.y;
+
+		const plane = new THREE.Mesh(
+			new THREE.PlaneGeometry(r * 4, r * 4),
+			new THREE.MeshStandardMaterial({ color: 0x888888, roughness: 1 }),
+		);
+		plane.rotation.x = -Math.PI / 2;
+		plane.position.set(center.x, y0 + r * 0.5, center.z);
+		plane.receiveShadow = true;
+		plane.castShadow = false;
+
+		const cube = new THREE.Mesh(
+			new THREE.BoxGeometry(r, r, r),
+			new THREE.MeshStandardMaterial({ color: 0xff5533, roughness: 0.8 }),
+		);
+		cube.position.set(center.x, y0 + r * 1.4, center.z);
+		cube.castShadow = true;
+		cube.receiveShadow = true;
+
+		scene.add(plane);
+		scene.add(cube);
+		this._test = [plane, cube];
+		// Make sure the shadow frustum encloses the test rig (it sits at center,
+		// already covered, but refit defensively).
+		updateSceneLighting(new THREE.Box3().setFromObject(sceneRoot));
+		console.log(
+			"shadowTest: red cube on gray plane at scene center (y=",
+			(y0 + r * 0.5).toFixed(2),
+			"). Orbit to it — does the cube cast a shadow on the gray plane?",
+		);
+		return "added test rig — call __lighting.clearTest() to remove";
+	},
+	clearTest() {
+		for (const o of this._test ?? []) {
+			scene.remove(o);
+			o.geometry?.dispose?.();
+			o.material?.dispose?.();
+		}
+		this._test = [];
+	},
+};
 
 // Infinite ground grid: a huge plane with a procedural grid shader. Lines
 // antialias via screen-space derivatives and fade with distance so the plane
@@ -1515,16 +2169,16 @@ scene.add(new THREE.AxesHelper(1));
 const gridGeom = new THREE.PlaneGeometry(100000, 100000);
 gridGeom.rotateX(-Math.PI / 2);
 const gridMat = new THREE.ShaderMaterial({
-  uniforms: {
-    uCameraPos: { value: new THREE.Vector3() },
-    uMinorColor: { value: new THREE.Color(0x202020) },
-    uMajorColor: { value: new THREE.Color(0x505050) },
-    uMinorSpacing: { value: 1.0 },
-    uMajorSpacing: { value: 10.0 },
-    uFadeStart: { value: 20.0 },
-    uFadeEnd: { value: 200.0 },
-  },
-  vertexShader: `
+	uniforms: {
+		uCameraPos: { value: new THREE.Vector3() },
+		uMinorColor: { value: new THREE.Color(0x202020) },
+		uMajorColor: { value: new THREE.Color(0x505050) },
+		uMinorSpacing: { value: 1.0 },
+		uMajorSpacing: { value: 10.0 },
+		uFadeStart: { value: 20.0 },
+		uFadeEnd: { value: 200.0 },
+	},
+	vertexShader: `
     varying vec3 vWorldPos;
     void main() {
       vec4 wp = modelMatrix * vec4(position, 1.0);
@@ -1532,7 +2186,7 @@ const gridMat = new THREE.ShaderMaterial({
       gl_Position = projectionMatrix * viewMatrix * wp;
     }
   `,
-  fragmentShader: `
+	fragmentShader: `
     uniform vec3 uCameraPos;
     uniform vec3 uMinorColor;
     uniform vec3 uMajorColor;
@@ -1559,9 +2213,9 @@ const gridMat = new THREE.ShaderMaterial({
       gl_FragColor = vec4(col, alpha);
     }
   `,
-  transparent: true,
-  depthWrite: false,
-  side: THREE.DoubleSide,
+	transparent: true,
+	depthWrite: false,
+	side: THREE.DoubleSide,
 });
 const groundGrid = new THREE.Mesh(gridGeom, gridMat);
 groundGrid.renderOrder = -1;
@@ -1569,21 +2223,21 @@ scene.add(groundGrid);
 
 let gridShown = localStorage.getItem(GRID_VISIBLE_STORAGE_KEY) !== "0";
 function applyGridToggle() {
-  gridToggleEl.textContent = `grid: ${gridShown ? "on" : "off"}`;
-  gridToggleEl.classList.toggle("off", !gridShown);
-  groundGrid.visible = gridShown;
+	gridToggleEl.textContent = `grid: ${gridShown ? "on" : "off"}`;
+	gridToggleEl.classList.toggle("off", !gridShown);
+	groundGrid.visible = gridShown;
 }
 applyGridToggle();
 gridToggleEl.addEventListener("click", () => {
-  gridShown = !gridShown;
-  localStorage.setItem(GRID_VISIBLE_STORAGE_KEY, gridShown ? "1" : "0");
-  applyGridToggle();
+	gridShown = !gridShown;
+	localStorage.setItem(GRID_VISIBLE_STORAGE_KEY, gridShown ? "1" : "0");
+	applyGridToggle();
 });
 
 window.addEventListener("resize", () => {
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-  renderer.setSize(window.innerWidth, window.innerHeight);
+	camera.aspect = window.innerWidth / window.innerHeight;
+	camera.updateProjectionMatrix();
+	renderer.setSize(window.innerWidth, window.innerHeight);
 });
 
 // Coalescing flag for fitToScene (drained once per frame in animate, below):
@@ -1591,98 +2245,105 @@ window.addEventListener("resize", () => {
 // refit per frame instead of one traversal per mesh.
 let _fitScenePending = false;
 function scheduleFitToScene() {
-  _fitScenePending = true;
+	_fitScenePending = true;
 }
 
 function animate() {
-  requestAnimationFrame(animate);
-  const now = performance.now();
-  const dt = Math.min(0.1, (now - _lastMoveT) / 1000);
-  _lastMoveT = now;
-  _applyKeyboardMove(dt);
-  controls.update();
+	requestAnimationFrame(animate);
+	const now = performance.now();
+	const dt = Math.min(0.1, (now - _lastMoveT) / 1000);
+	_lastMoveT = now;
+	_applyKeyboardMove(dt);
+	controls.update();
 
-  // Drain coalesced UI work once per frame: collapse a burst of streamed tree
-  // mutations into one DOM rebuild, and a burst of mesh completions into one
-  // camera refit. Both run before render so the frame reflects them.
-  if (_treeRenderPending) renderTree();
-  if (_fitScenePending) {
-    _fitScenePending = false;
-    fitToScene();
-  }
+	// Drain coalesced UI work once per frame: collapse a burst of streamed tree
+	// mutations into one DOM rebuild, and a burst of mesh completions into one
+	// camera refit. Both run before render so the frame reflects them.
+	if (_treeRenderPending) renderTree();
+	if (_fitScenePending) {
+		_fitScenePending = false;
+		fitToScene();
+	}
 
-  gridMat.uniforms.uCameraPos.value.copy(camera.position);
-  const camDist = Math.max(1, camera.position.distanceTo(controls.target));
-  gridMat.uniforms.uFadeStart.value = camDist * 0.5;
-  gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
+	gridMat.uniforms.uCameraPos.value.copy(camera.position);
+	const camDist = Math.max(1, camera.position.distanceTo(controls.target));
+	gridMat.uniforms.uFadeStart.value = camDist * 0.5;
+	gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
 
-  if (pointerDirty && !controlsInteracting) {
-    pointerDirty = false;
-    raycaster.setFromCamera(pointer, camera);
-    const hoveredId = pickHoveredBboxId();
-    setHoveredBbox(hoveredId);
-    if (hoveredId !== null) {
-      positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
-    } else {
-      tooltip.style.display = "none";
-    }
-  }
+	if (pointerDirty && !controlsInteracting) {
+		pointerDirty = false;
+		raycaster.setFromCamera(pointer, camera);
+		const hoveredId = pickHoveredBboxId();
+		setHoveredBbox(hoveredId);
+		if (hoveredId !== null) {
+			positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+		} else {
+			tooltip.style.display = "none";
+		}
+	}
 
-  renderer.render(scene, camera);
+	renderer.render(scene, camera);
 }
 animate();
 
 function clearScene() {
-  resetModelQueue();
-  while (sceneRoot.children.length > 0) {
-    const child = sceneRoot.children[0];
-    sceneRoot.remove(child);
-    disposeObject3D(child);
-  }
-  for (const helper of bboxes.values()) {
-    bboxRoot.remove(helper);
-    helper.geometry?.dispose?.();
-    helper.material?.dispose?.();
-  }
-  bboxes.clear();
-  for (const mesh of proxies.values()) {
-    bboxRoot.remove(mesh);
-    mesh.geometry?.dispose?.();
-    mesh.material?.dispose?.();
-  }
-  proxies.clear();
-  clearSolidFills();
-  modelsById.clear();
-  genMeshVersions.clear();
-  regeneratingIds.clear();
-  // The next cell resolves its own generated versions; the gate poll re-adopts
-  // the latest and repopulates the picker.
-  genVersion = null;
-  genVersions = [];
-  hoveredBboxId = null;
-  selectedBboxId = null;
-  updateOrientationIndicator();
-  tooltip.style.display = "none";
+	resetModelQueue();
+	while (sceneRoot.children.length > 0) {
+		const child = sceneRoot.children[0];
+		sceneRoot.remove(child);
+		disposeObject3D(child);
+	}
+	for (const helper of bboxes.values()) {
+		bboxRoot.remove(helper);
+		helper.geometry?.dispose?.();
+		helper.material?.dispose?.();
+	}
+	bboxes.clear();
+	for (const mesh of proxies.values()) {
+		bboxRoot.remove(mesh);
+		mesh.geometry?.dispose?.();
+		mesh.material?.dispose?.();
+	}
+	proxies.clear();
+	clearSolidFills();
+	modelsById.clear();
+	genMeshVersions.clear();
+	genMeshSymmetry.clear();
+	genMeshOptimized.clear();
+	regeneratingIds.clear();
+	unsymmetrizingIds.clear();
+	// The next cell resolves its own generated versions; the gate poll re-adopts
+	// the latest and repopulates the picker.
+	genVersion = null;
+	genVersions = [];
+	hoveredBboxId = null;
+	selectedBboxId = null;
+	updateOrientationIndicator();
+	tooltip.style.display = "none";
 }
 
 // Fit controls to the union of all loaded models after each addition.
 // Skipped once the user has manually adjusted the camera.
 function fitToScene() {
-  if (cameraUserMoved) return;
-  const box = new THREE.Box3().setFromObject(sceneRoot);
-  if (box.isEmpty()) return;
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  const radius = 0.5 * Math.max(size.x, size.y, size.z);
-  if (!isFinite(radius) || radius === 0) return;
-  controls.target.copy(center);
-  const dist = radius / Math.tan((camera.fov * Math.PI) / 360);
-  const dirVec = new THREE.Vector3(1, 0.7, 1).normalize();
-  camera.position.copy(center).addScaledVector(dirVec, dist * 1.6);
-  camera.near = Math.max(0.01, radius / 100);
-  camera.far = Math.max(100, radius * 100);
-  camera.updateProjectionMatrix();
-  controls.update();
+	const box = new THREE.Box3().setFromObject(sceneRoot);
+	// Refit the key light + shadow frustum to the scene whenever geometry
+	// changes — even after the user has taken camera control, so only the
+	// camera-fit half below bails on cameraUserMoved.
+	updateSceneLighting(box);
+	if (cameraUserMoved) return;
+	if (box.isEmpty()) return;
+	const size = box.getSize(new THREE.Vector3());
+	const center = box.getCenter(new THREE.Vector3());
+	const radius = 0.5 * Math.max(size.x, size.y, size.z);
+	if (!isFinite(radius) || radius === 0) return;
+	controls.target.copy(center);
+	const dist = radius / Math.tan((camera.fov * Math.PI) / 360);
+	const dirVec = new THREE.Vector3(1, 0.7, 1).normalize();
+	camera.position.copy(center).addScaledVector(dirVec, dist * 1.6);
+	camera.near = Math.max(0.01, radius / 100);
+	camera.far = Math.max(100, radius * 100);
+	camera.updateProjectionMatrix();
+	controls.update();
 }
 
 // --- model loading ----------------------------------------------------------
@@ -1694,17 +2355,90 @@ function fitToScene() {
 // served at /vendor/three/... by client/server.mjs) and the Meshopt decoder into
 // every loader. detectSupport(renderer) picks the GPU's transcode target.
 const ktx2Loader = new KTX2Loader()
-  .setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
-  // The default 4-worker transcode pool serializes a scene's hundreds of KTX2
-  // textures and is the main load-time bottleneck; scale it to the machine.
-  .setWorkerLimit(Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4)))
-  .detectSupport(renderer);
+	.setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
+	// The default 4-worker transcode pool serializes a scene's hundreds of KTX2
+	// textures and is the main load-time bottleneck; scale it to the machine.
+	.setWorkerLimit(
+		Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4)),
+	)
+	.detectSupport(renderer);
 
 function configureGltfLoader(gltfLoader) {
-  return gltfLoader.setKTX2Loader(ktx2Loader).setMeshoptDecoder(MeshoptDecoder);
+	return gltfLoader
+		.setKTX2Loader(ktx2Loader)
+		.setMeshoptDecoder(MeshoptDecoder);
 }
 
 const loader = configureGltfLoader(new GLTFLoader());
+
+// Re-gate a material's shadow term on our `_forceReceiveShadow` uniform instead
+// of three's per-object `receiveShadow`, which doesn't reach these streamed PBR
+// materials (so they'd never sample the shadow map). The replaced chunk lives
+// inside `#if defined( USE_SHADOWMAP )`, so this is inert in the mini-viewer
+// (no shadow map → block compiled out; the injected uniform is just unused).
+function patchMaterialReceiveShadow(m) {
+	if (!m || m.userData.__recvPatched) return;
+	m.userData.__recvPatched = true;
+	const prevCompile = m.onBeforeCompile;
+	m.onBeforeCompile = (shader, rndr) => {
+		if (prevCompile) prevCompile(shader, rndr);
+		shader.uniforms.uForceReceiveShadow = _forceReceiveShadow;
+		shader.fragmentShader = shader.fragmentShader
+			.replace(
+				"#include <common>",
+				"#include <common>\nuniform bool uForceReceiveShadow;",
+			)
+			.replace(
+				"#include <lights_fragment_begin>",
+				THREE.ShaderChunk.lights_fragment_begin.replace(
+					/\(\s*directLight\.visible\s*&&\s*receiveShadow\s*\)/g,
+					"( directLight.visible && uForceReceiveShadow )",
+				),
+			);
+	};
+	// Distinct, stable cache key so patched materials get their own program
+	// (and three doesn't warn about onBeforeCompile without a cache key).
+	const prevKey = m.customProgramCacheKey?.bind(m);
+	m.customProgramCacheKey = () => "recvForce1|" + (prevKey ? prevKey() : "");
+	m.needsUpdate = true;
+}
+
+// Every streamed/loaded GLB gets the same treatment: double-sided (Trellis
+// shells are often single-sided), shadow-enabled so the key light grounds them
+// and they self-shadow, and the receive-shadow re-gate above. The shadow flags
+// are harmless no-ops in the mini-viewer, whose renderer has no shadow map.
+function prepareLoadedScene(root) {
+	root.traverse((child) => {
+		if (!child.isMesh) return;
+		child.castShadow = true;
+		child.receiveShadow = true;
+		// Generated (Trellis) GLBs ship without a NORMAL attribute. Lighting still
+		// works (three derives flat normals per-fragment) and casting works (the
+		// depth pass ignores normals), but the shadow-RECEIVE vertex shader does
+		// normalize(transformedNormal) → normalize(0) = NaN, making
+		// vDirectionalShadowCoord NaN so getShadow() always returns "lit" — no
+		// received shadows, no acne even at zero bias. Computing normals gives a
+		// valid shadow coordinate, which is what lets generated meshes receive.
+		if (child.geometry && !child.geometry.getAttribute("normal")) {
+			child.geometry.computeVertexNormals();
+		}
+		if (!child.material) return;
+		const mats = Array.isArray(child.material)
+			? child.material
+			: [child.material];
+		for (const m of mats) {
+			m.side = THREE.DoubleSide;
+			// Cast only back faces into the shadow map (front-face culling). A lit
+			// front face is then always in front of the stored (far) depth, so it
+			// can never self-compare into shadow — the robust cure for self-shadow
+			// acne, independent of the vertex normals normalBias relies on (which
+			// diverge from the faces on decimated/optimized meshes). normalBias
+			// above still covers thin/flat pieces where front≈back.
+			m.shadowSide = THREE.BackSide;
+			patchMaterialReceiveShadow(m);
+		}
+	});
+}
 
 // Concurrent loads — each GLB fetches/parses/uploads independently. The
 // browser's per-origin connection limit (~6) naturally throttles the network
@@ -1720,7 +2454,7 @@ let sceneGen = 0;
 let replayPreloadCache = null;
 
 function resetModelQueue() {
-  sceneGen += 1;
+	sceneGen += 1;
 }
 
 // Dispose a material *and* every texture it references — material.dispose()
@@ -1728,26 +2462,30 @@ function resetModelQueue() {
 // until each is disposed individually. Used by the streamed bundle path so
 // swapping a mesh never strands the previous GLB's textures in VRAM.
 function disposeMaterial(material) {
-  if (!material) return;
-  for (const value of Object.values(material)) {
-    if (value && value.isTexture) value.dispose();
-  }
-  material.dispose?.();
+	if (!material) return;
+	for (const value of Object.values(material)) {
+		if (value && value.isTexture) value.dispose();
+	}
+	material.dispose?.();
 }
 
 function disposeObject3D(root) {
-  root?.traverse?.((n) => {
-    if (!n.isMesh) return;
-    n.geometry?.dispose?.();
-    const mats = Array.isArray(n.material) ? n.material : n.material ? [n.material] : [];
-    for (const m of mats) disposeMaterial(m);
-  });
+	root?.traverse?.((n) => {
+		if (!n.isMesh) return;
+		n.geometry?.dispose?.();
+		const mats = Array.isArray(n.material)
+			? n.material
+			: n.material
+				? [n.material]
+				: [];
+		for (const m of mats) disposeMaterial(m);
+	});
 }
 
 function parseGlb(arrayBuffer) {
-  return new Promise((resolve, reject) => {
-    loader.parse(arrayBuffer, "", resolve, reject);
-  });
+	return new Promise((resolve, reject) => {
+		loader.parse(arrayBuffer, "", resolve, reject);
+	});
 }
 
 // --- one-connection scene bundle (streamed + progressive) ------------------
@@ -1765,64 +2503,87 @@ function parseGlb(arrayBuffer) {
 // post-snapshot mesh, a retry, a parse miss) falls back to an individual fetch.
 // Tied to `sceneGen` so a stale scene's bundle is ignored.
 const _MESH_BUNDLE_MAGIC = "SMB1";
-let meshBundle = { gen: -1, attached: new Set(), streamDone: Promise.resolve(), abort: null };
+let meshBundle = {
+	gen: -1,
+	attached: new Set(),
+	streamDone: Promise.resolve(),
+	abort: null,
+};
 
 function prefetchMeshBundle(slotId, model, gen) {
-  if (!slotId || !model) return;
-  // Supersede any still-streaming bundle from a scene we've left.
-  meshBundle.abort?.abort?.();
-  const abort = new AbortController();
-  let resolveDone;
-  const streamDone = new Promise((r) => { resolveDone = r; });
-  const state = { gen, attached: new Set(), streamDone, abort };
-  meshBundle = state;
-  (async () => {
-    try {
-      const res = await fetch(slotMeshesUrl(slotId, model), {
-        cache: "no-store",
-        signal: abort.signal,
-      });
-      if (res.ok && res.body) {
-        await consumeMeshBundleStream(res.body.getReader(), state);
-      }
-    } catch {
-      // Aborted (superseded) / network / parse error — whatever attached so
-      // far stays; the rest is picked up per-object by the model-event
-      // fallback once streamDone resolves.
-    } finally {
-      resolveDone();
-    }
-  })();
+	if (!slotId || !model) return;
+	// Supersede any still-streaming bundle from a scene we've left.
+	meshBundle.abort?.abort?.();
+	const abort = new AbortController();
+	let resolveDone;
+	const streamDone = new Promise((r) => {
+		resolveDone = r;
+	});
+	// `streaming` is a synchronous flag (streamDone is a promise) so the gate
+	// poll can cheaply tell a bundle is still in flight and defer its not-yet-
+	// attached ids to it rather than racing it with per-mesh fetches.
+	const state = {
+		gen,
+		attached: new Set(),
+		streamDone,
+		abort,
+		streaming: true,
+	};
+	meshBundle = state;
+	(async () => {
+		try {
+			const res = await fetch(slotMeshesUrl(slotId, model), {
+				cache: "no-store",
+				signal: abort.signal,
+			});
+			if (res.ok && res.body) {
+				await consumeMeshBundleStream(res.body.getReader(), state);
+			}
+		} catch {
+			// Aborted (superseded) / network / parse error — whatever attached so
+			// far stays; the rest is picked up per-object by the model-event
+			// fallback once streamDone resolves.
+		} finally {
+			state.streaming = false;
+			resolveDone();
+		}
+	})();
 }
 
 // Pull exact byte counts out of a ReadableStream reader, holding only the
 // not-yet-consumed chunks (each dropped as it's read), so peak memory tracks
 // the largest single frame — never the whole multi-GB bundle.
 function _byteStreamReader(reader) {
-  const chunks = [];
-  let avail = 0;
-  let ended = false;
-  async function readExact(n) {
-    while (avail < n) {
-      if (ended) return null;
-      const { done, value } = await reader.read();
-      if (done) { ended = true; continue; }
-      if (value && value.length) { chunks.push(value); avail += value.length; }
-    }
-    const out = new Uint8Array(n);
-    let filled = 0;
-    while (filled < n) {
-      const c = chunks[0];
-      const take = Math.min(c.length, n - filled);
-      out.set(c.subarray(0, take), filled);
-      filled += take;
-      if (take === c.length) chunks.shift();
-      else chunks[0] = c.subarray(take);
-      avail -= take;
-    }
-    return out;
-  }
-  return { readExact };
+	const chunks = [];
+	let avail = 0;
+	let ended = false;
+	async function readExact(n) {
+		while (avail < n) {
+			if (ended) return null;
+			const { done, value } = await reader.read();
+			if (done) {
+				ended = true;
+				continue;
+			}
+			if (value && value.length) {
+				chunks.push(value);
+				avail += value.length;
+			}
+		}
+		const out = new Uint8Array(n);
+		let filled = 0;
+		while (filled < n) {
+			const c = chunks[0];
+			const take = Math.min(c.length, n - filled);
+			out.set(c.subarray(0, take), filled);
+			filled += take;
+			if (take === c.length) chunks.shift();
+			else chunks[0] = c.subarray(take);
+			avail -= take;
+		}
+		return out;
+	}
+	return { readExact };
 }
 
 // Parse + attach up to this many meshes concurrently. Reading frames off the
@@ -1831,159 +2592,156 @@ function _byteStreamReader(reader) {
 const MESH_BUNDLE_MAX_INFLIGHT = 20;
 
 async function consumeMeshBundleStream(reader, state) {
-  const r = _byteStreamReader(reader);
-  const dec = new TextDecoder();
-  const magic = await r.readExact(4);
-  if (!magic || dec.decode(magic) !== _MESH_BUNDLE_MAGIC) return;
-  const inflight = new Set();
-  while (true) {
-    if (state.gen !== sceneGen || state.abort.signal.aborted) break;
-    const idLenB = await r.readExact(4);
-    if (!idLenB) break;
-    const idLen = new DataView(idLenB.buffer).getUint32(0, true);
-    const idB = await r.readExact(idLen);
-    if (!idB) break;
-    const id = dec.decode(idB);
-    const glbLenB = await r.readExact(4);
-    if (!glbLenB) break;
-    const glbLen = new DataView(glbLenB.buffer).getUint32(0, true);
-    const glbB = await r.readExact(glbLen);
-    if (!glbB) break;
-    const p = attachBundleMesh(id, glbB.buffer, state.gen, state)
-      .finally(() => inflight.delete(p));
-    inflight.add(p);
-    // Hold the read at MAX_INFLIGHT in-flight parses; resume once one drains.
-    if (inflight.size >= MESH_BUNDLE_MAX_INFLIGHT) await Promise.race(inflight);
-  }
-  await Promise.allSettled(inflight);
-  // One camera refit after the whole bundle lands — a per-mesh fitToScene()
-  // is an O(scene) Box3 traversal, i.e. quadratic across a large scene.
-  if (state.gen === sceneGen) fitToScene();
+	const r = _byteStreamReader(reader);
+	const dec = new TextDecoder();
+	const magic = await r.readExact(4);
+	if (!magic || dec.decode(magic) !== _MESH_BUNDLE_MAGIC) return;
+	const inflight = new Set();
+	while (true) {
+		if (state.gen !== sceneGen || state.abort.signal.aborted) break;
+		const idLenB = await r.readExact(4);
+		if (!idLenB) break;
+		const idLen = new DataView(idLenB.buffer).getUint32(0, true);
+		const idB = await r.readExact(idLen);
+		if (!idB) break;
+		const id = dec.decode(idB);
+		const glbLenB = await r.readExact(4);
+		if (!glbLenB) break;
+		const glbLen = new DataView(glbLenB.buffer).getUint32(0, true);
+		const glbB = await r.readExact(glbLen);
+		if (!glbB) break;
+		const p = attachBundleMesh(id, glbB.buffer, state.gen, state).finally(
+			() => inflight.delete(p),
+		);
+		inflight.add(p);
+		// Hold the read at MAX_INFLIGHT in-flight parses; resume once one drains.
+		if (inflight.size >= MESH_BUNDLE_MAX_INFLIGHT)
+			await Promise.race(inflight);
+	}
+	await Promise.allSettled(inflight);
+	// One camera refit after the whole bundle lands — a per-mesh fitToScene()
+	// is an O(scene) Box3 traversal, i.e. quadratic across a large scene.
+	if (state.gen === sceneGen) fitToScene();
 }
 
 // Parse one streamed GLB and add it to the scene. Mirrors the attach half of
 // _loadModelNow; on a parse failure it bails without attaching, leaving the id
 // for the model-event fallback to fetch fresh.
 async function attachBundleMesh(id, glbBuffer, gen, state) {
-  if (gen !== sceneGen) return;
-  let gltf;
-  try {
-    gltf = await parseGlb(glbBuffer);
-  } catch {
-    return;
-  }
-  if (gen !== sceneGen) { disposeObject3D(gltf.scene); return; }
-  gltf.scene.traverse((child) => {
-    if (child.isMesh && child.material) {
-      const mats = Array.isArray(child.material) ? child.material : [child.material];
-      for (const m of mats) m.side = THREE.DoubleSide;
-    }
-  });
-  gltf.scene.name = `mesh:${id}`;
-  gltf.scene.userData.pickId = id;
-  const prev = modelsById.get(id);
-  if (prev) {
-    sceneRoot.remove(prev);
-    disposeObject3D(prev);
-  }
-  sceneRoot.add(gltf.scene);
-  modelsById.set(id, gltf.scene);
-  state.attached.add(id);
-  applyModelVisibility(id);
-  upsertAsset(id, { status: "loaded" });
+	if (gen !== sceneGen) return;
+	let gltf;
+	try {
+		gltf = await parseGlb(glbBuffer);
+	} catch {
+		return;
+	}
+	if (gen !== sceneGen) {
+		disposeObject3D(gltf.scene);
+		return;
+	}
+	prepareLoadedScene(gltf.scene);
+	gltf.scene.name = `mesh:${id}`;
+	gltf.scene.userData.pickId = id;
+	const prev = modelsById.get(id);
+	if (prev) {
+		sceneRoot.remove(prev);
+		disposeObject3D(prev);
+	}
+	sceneRoot.add(gltf.scene);
+	modelsById.set(id, gltf.scene);
+	state.attached.add(id);
+	applyModelVisibility(id);
+	upsertAsset(id, { status: "loaded" });
 }
 
 async function loadModel(event) {
-  if (replayPreloadCache) {
-    const cached = replayPreloadCache.get(event.id);
-    if (cached) {
-      if (cached.gltf) {
-        attachPreloadedGlb(event, cached.gltf);
-      } else if (cached.error) {
-        appendEvent({ kind: "model.error", id: event.id, message: cached.error.message });
-        upsertAsset(event.id, { status: "error", errorMessage: cached.error.message });
-      }
-      return;
-    }
-  }
-  // A scene bundle streaming for this generation attaches meshes progressively.
-  // Wait for it to finish, then adopt what it attached (bookkeeping only) or
-  // fetch this id individually if the bundle didn't carry it (a mesh generated
-  // after the snapshot, a retry, or a parse miss).
-  const gen = sceneGen;
-  const bundle = meshBundle;
-  if (bundle.gen === gen) {
-    await bundle.streamDone;
-    if (gen !== sceneGen) return;
-    if (modelsById.has(event.id)) {
-      applyModelVisibility(event.id);
-      upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
-      return;
-    }
-  }
-  _loadModelNow(event, gen);
+	if (replayPreloadCache) {
+		const cached = replayPreloadCache.get(event.id);
+		if (cached) {
+			if (cached.gltf) {
+				attachPreloadedGlb(event, cached.gltf);
+			} else if (cached.error) {
+				appendEvent({
+					kind: "model.error",
+					id: event.id,
+					message: cached.error.message,
+				});
+				upsertAsset(event.id, {
+					status: "error",
+					errorMessage: cached.error.message,
+				});
+			}
+			return;
+		}
+	}
+	// A scene bundle streaming for this generation attaches meshes progressively.
+	// Wait for it to finish, then adopt what it attached (bookkeeping only) or
+	// fetch this id individually if the bundle didn't carry it (a mesh generated
+	// after the snapshot, a retry, or a parse miss).
+	const gen = sceneGen;
+	const bundle = meshBundle;
+	if (bundle.gen === gen) {
+		await bundle.streamDone;
+		if (gen !== sceneGen) return;
+		if (modelsById.has(event.id)) {
+			applyModelVisibility(event.id);
+			upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
+			return;
+		}
+	}
+	_loadModelNow(event, gen);
 }
 
 // Attach a pre-fetched GLB scene to the live tree. Mirrors the second half
 // of _loadModelNow (after the await) so the live and replay paths agree on
 // material side-fixing, prev-model disposal, and asset bookkeeping.
 function attachPreloadedGlb(event, gltf) {
-  gltf.scene.traverse((child) => {
-    if (child.isMesh && child.material) {
-      const mats = Array.isArray(child.material) ? child.material : [child.material];
-      for (const m of mats) m.side = THREE.DoubleSide;
-    }
-  });
-  gltf.scene.name = `${event.artifact_kind}:${event.id}`;
-  gltf.scene.userData.pickId = event.id;
-  const prevModel = modelsById.get(event.id);
-  if (prevModel) {
-    sceneRoot.remove(prevModel);
-    disposeObject3D(prevModel);
-  }
-  sceneRoot.add(gltf.scene);
-  modelsById.set(event.id, gltf.scene);
-  applyModelVisibility(event.id);
-  scheduleFitToScene();
-  upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
+	prepareLoadedScene(gltf.scene);
+	gltf.scene.name = `${event.artifact_kind}:${event.id}`;
+	gltf.scene.userData.pickId = event.id;
+	const prevModel = modelsById.get(event.id);
+	if (prevModel) {
+		sceneRoot.remove(prevModel);
+		disposeObject3D(prevModel);
+	}
+	sceneRoot.add(gltf.scene);
+	modelsById.set(event.id, gltf.scene);
+	applyModelVisibility(event.id);
+	scheduleFitToScene();
+	upsertAsset(event.id, { status: "loaded", modelUrl: event.url });
 }
 
 async function _loadModelNow(event, gen) {
-  if (gen !== sceneGen) return;
-  const absUrl = new URL(event.url, SERVER_URL).toString();
-  // Skip a re-load when this id already errored on the *same URL* during
-  // this scene generation. The server occasionally emits `model` more
-  // than once for one id (anchor completion loop, cached replay), and
-  // re-running GLTFLoader on a known-bad GLB just spams the same parse
-  // error. A new URL or a new sceneGen still goes through.
-  const prior = assets.get(event.id);
-  if (prior?.status === "error" && prior.modelUrl === event.url) return;
-  upsertAsset(event.id, { modelUrl: event.url });
-  try {
-    const gltf = await loader.loadAsync(absUrl);
-    if (gen !== sceneGen) return;
-    gltf.scene.traverse((child) => {
-      if (child.isMesh && child.material) {
-        const mats = Array.isArray(child.material) ? child.material : [child.material];
-        for (const m of mats) m.side = THREE.DoubleSide;
-      }
-    });
-    gltf.scene.name = `${event.artifact_kind}:${event.id}`;
-    gltf.scene.userData.pickId = event.id;
-    const prevModel = modelsById.get(event.id);
-    if (prevModel) {
-      sceneRoot.remove(prevModel);
-      disposeObject3D(prevModel);
-    }
-    sceneRoot.add(gltf.scene);
-    modelsById.set(event.id, gltf.scene);
-    applyModelVisibility(event.id);
-    scheduleFitToScene();
-    upsertAsset(event.id, { status: "loaded" });
-  } catch (e) {
-    appendEvent({ kind: "model.error", id: event.id, message: e.message });
-    upsertAsset(event.id, { status: "error", errorMessage: e.message });
-  }
+	if (gen !== sceneGen) return;
+	const absUrl = new URL(event.url, SERVER_URL).toString();
+	// Skip a re-load when this id already errored on the *same URL* during
+	// this scene generation. The server occasionally emits `model` more
+	// than once for one id (anchor completion loop, cached replay), and
+	// re-running GLTFLoader on a known-bad GLB just spams the same parse
+	// error. A new URL or a new sceneGen still goes through.
+	const prior = assets.get(event.id);
+	if (prior?.status === "error" && prior.modelUrl === event.url) return;
+	upsertAsset(event.id, { modelUrl: event.url });
+	try {
+		const gltf = await loader.loadAsync(absUrl);
+		if (gen !== sceneGen) return;
+		prepareLoadedScene(gltf.scene);
+		gltf.scene.name = `${event.artifact_kind}:${event.id}`;
+		gltf.scene.userData.pickId = event.id;
+		const prevModel = modelsById.get(event.id);
+		if (prevModel) {
+			sceneRoot.remove(prevModel);
+			disposeObject3D(prevModel);
+		}
+		sceneRoot.add(gltf.scene);
+		modelsById.set(event.id, gltf.scene);
+		applyModelVisibility(event.id);
+		scheduleFitToScene();
+		upsertAsset(event.id, { status: "loaded" });
+	} catch (e) {
+		appendEvent({ kind: "model.error", id: event.id, message: e.message });
+		upsertAsset(event.id, { status: "error", errorMessage: e.message });
+	}
 }
 
 // --- bbox overlays ----------------------------------------------------------
@@ -1995,113 +2753,135 @@ async function _loadModelNow(event, gen) {
 // wireframe so the user can see what the LLM and surface-snap are
 // actually reasoning about.
 function loadBbox(event) {
-  const { id, origin, dimensions } = event;
-  if (bboxes.has(id)) {
-    const prev = bboxes.get(id);
-    bboxRoot.remove(prev);
-    prev.geometry?.dispose?.();
-    prev.material?.dispose?.();
-    if (hoveredBboxId === id) hoveredBboxId = null;
-  }
-  if (proxies.has(id)) {
-    const prev = proxies.get(id);
-    bboxRoot.remove(prev);
-    prev.geometry?.dispose?.();
-    prev.material?.dispose?.();
-    proxies.delete(id);
-  }
-  disposeSolidFill(id);
-  const ox = origin[0], oy = origin[1], oz = origin[2];
-  const fx = ox + dimensions[0], fy = oy + dimensions[1], fz = oz + dimensions[2];
-  const box3 = new THREE.Box3(
-    new THREE.Vector3(Math.min(ox, fx), Math.min(oy, fy), Math.min(oz, fz)),
-    new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
-  );
-  const helper = new THREE.Box3Helper(box3, BBOX_COLOR_DEFAULT);
-  // Always-transparent so we can dim non-selected bboxes by adjusting opacity
-  // without triggering shader recompiles (toggling `transparent` would).
-  helper.material.transparent = true;
-  helper.material.opacity = 1;
-  helper.userData.bboxId = id;
-  const nodeKind = event.node_kind ?? "zone";
-  helper.userData.nodeKind = nodeKind;
-  helper.userData.proxyShape = event.proxy_shape ?? null;
-  helper.userData.origin = origin;
-  helper.userData.dimensions = dimensions;
-  helper.userData.orientation = event.orientation ?? 0;
-  bboxRoot.add(helper);
-  bboxes.set(id, helper);
+	const { id, origin, dimensions } = event;
+	if (bboxes.has(id)) {
+		const prev = bboxes.get(id);
+		bboxRoot.remove(prev);
+		prev.geometry?.dispose?.();
+		prev.material?.dispose?.();
+		if (hoveredBboxId === id) hoveredBboxId = null;
+	}
+	if (proxies.has(id)) {
+		const prev = proxies.get(id);
+		bboxRoot.remove(prev);
+		prev.geometry?.dispose?.();
+		prev.material?.dispose?.();
+		proxies.delete(id);
+	}
+	disposeSolidFill(id);
+	const ox = origin[0],
+		oy = origin[1],
+		oz = origin[2];
+	const fx = ox + dimensions[0],
+		fy = oy + dimensions[1],
+		fz = oz + dimensions[2];
+	const box3 = new THREE.Box3(
+		new THREE.Vector3(Math.min(ox, fx), Math.min(oy, fy), Math.min(oz, fz)),
+		new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
+	);
+	const helper = new THREE.Box3Helper(box3, BBOX_COLOR_DEFAULT);
+	// Always-transparent so we can dim non-selected bboxes by adjusting opacity
+	// without triggering shader recompiles (toggling `transparent` would).
+	helper.material.transparent = true;
+	helper.material.opacity = 1;
+	helper.material.toneMapped = false; // keep the exact debug palette under ACES
+	helper.userData.bboxId = id;
+	const nodeKind = event.node_kind ?? "zone";
+	helper.userData.nodeKind = nodeKind;
+	helper.userData.proxyShape = event.proxy_shape ?? null;
+	helper.userData.origin = origin;
+	helper.userData.dimensions = dimensions;
+	helper.userData.orientation = event.orientation ?? 0;
+	bboxRoot.add(helper);
+	bboxes.set(id, helper);
 
-  const proxyMesh = buildProxyWireframe(event.proxy_shape, origin, dimensions);
-  if (proxyMesh !== null) {
-    bboxRoot.add(proxyMesh);
-    proxies.set(id, proxyMesh);
-  }
+	const proxyMesh = buildProxyWireframe(
+		event.proxy_shape,
+		origin,
+		dimensions,
+	);
+	if (proxyMesh !== null) {
+		bboxRoot.add(proxyMesh);
+		proxies.set(id, proxyMesh);
+	}
 
-  if (solidFillShown && nodeKind !== "zone") {
-    const fill = buildSolidFill(event.proxy_shape, origin, dimensions, nodeKind);
-    if (fill !== null) {
-      fill.userData.pickId = id;
-      bboxRoot.add(fill);
-      solidFills.set(id, fill);
-      applySolidFillVisibility(id);
-    }
-  }
+	if (solidFillShown && nodeKind !== "zone") {
+		const fill = buildSolidFill(
+			event.proxy_shape,
+			origin,
+			dimensions,
+			nodeKind,
+		);
+		if (fill !== null) {
+			fill.userData.pickId = id;
+			bboxRoot.add(fill);
+			solidFills.set(id, fill);
+			applySolidFillVisibility(id);
+		}
+	}
 
-  // If this id is already selected (user clicked before bbox arrived, or a
-  // bbox is being replaced), reapply the selection color.
-  applyBboxColor(id);
-  applyBboxVisibility(id);
-  if (id === selectedBboxId) updateOrientationIndicator();
+	// If this id is already selected (user clicked before bbox arrived, or a
+	// bbox is being replaced), reapply the selection color.
+	applyBboxColor(id);
+	applyBboxVisibility(id);
+	if (id === selectedBboxId) updateOrientationIndicator();
 }
 
 function buildProxyWireframe(proxyShape, origin, dimensions) {
-  if (!proxyShape) return null;
-  const sx = Math.abs(dimensions[0]);
-  const sy = Math.abs(dimensions[1]);
-  const sz = Math.abs(dimensions[2]);
-  if (sx === 0 || sy === 0 || sz === 0) return null;
-  const cx = origin[0] + dimensions[0] / 2;
-  const cy = origin[1] + dimensions[1] / 2;
-  const cz = origin[2] + dimensions[2] / 2;
-  const yMin = Math.min(origin[1], origin[1] + dimensions[1]);
+	if (!proxyShape) return null;
+	const sx = Math.abs(dimensions[0]);
+	const sy = Math.abs(dimensions[1]);
+	const sz = Math.abs(dimensions[2]);
+	if (sx === 0 || sy === 0 || sz === 0) return null;
+	const cx = origin[0] + dimensions[0] / 2;
+	const cy = origin[1] + dimensions[1] / 2;
+	const cz = origin[2] + dimensions[2] / 2;
+	const yMin = Math.min(origin[1], origin[1] + dimensions[1]);
 
-  let geom;
-  let anchorY;
-  if (proxyShape === "SPHERE") {
-    // Ellipsoid inscribed in the AABB: unit sphere (diameter 1) scaled
-    // to each AABB extent.
-    geom = new THREE.SphereGeometry(0.5, 24, 16);
-    geom.scale(sx, sy, sz);
-    anchorY = cy;
-  } else if (proxyShape === "HEMISPHERE") {
-    // Top hemisphere with equatorial disk on the AABB's bottom face.
-    // thetaLength = PI/2 starting at the north pole gives the upper half.
-    geom = new THREE.SphereGeometry(
-      0.5, 24, 16,
-      0, Math.PI * 2,
-      0, Math.PI / 2,
-    );
-    // The unit hemisphere spans y in [0, 0.5]; scale y by (sy / 0.5) so
-    // the apex reaches +sy above the equator.
-    geom.scale(sx, sy * 2, sz);
-    anchorY = yMin;
-  } else if (proxyShape === "CAPSULE") {
-    const r = Math.min(sx, sz) / 2;
-    const cylHeight = Math.max(0, sy - 2 * r);
-    geom = new THREE.CapsuleGeometry(r, cylHeight, 8, 24);
-    anchorY = cy;
-  } else {
-    return null;
-  }
+	let geom;
+	let anchorY;
+	if (proxyShape === "SPHERE") {
+		// Ellipsoid inscribed in the AABB: unit sphere (diameter 1) scaled
+		// to each AABB extent.
+		geom = new THREE.SphereGeometry(0.5, 24, 16);
+		geom.scale(sx, sy, sz);
+		anchorY = cy;
+	} else if (proxyShape === "HEMISPHERE") {
+		// Top hemisphere with equatorial disk on the AABB's bottom face.
+		// thetaLength = PI/2 starting at the north pole gives the upper half.
+		geom = new THREE.SphereGeometry(
+			0.5,
+			24,
+			16,
+			0,
+			Math.PI * 2,
+			0,
+			Math.PI / 2,
+		);
+		// The unit hemisphere spans y in [0, 0.5]; scale y by (sy / 0.5) so
+		// the apex reaches +sy above the equator.
+		geom.scale(sx, sy * 2, sz);
+		anchorY = yMin;
+	} else if (proxyShape === "CAPSULE") {
+		const r = Math.min(sx, sz) / 2;
+		const cylHeight = Math.max(0, sy - 2 * r);
+		geom = new THREE.CapsuleGeometry(r, cylHeight, 8, 24);
+		anchorY = cy;
+	} else {
+		return null;
+	}
 
-  const mat = new THREE.MeshBasicMaterial({
-    color: BBOX_COLOR_DEFAULT, wireframe: true, transparent: true, opacity: PROXY_BASE_OPACITY,
-  });
-  const mesh = new THREE.Mesh(geom, mat);
-  mesh.position.set(cx, anchorY, cz);
-  mesh.renderOrder = 1;
-  return mesh;
+	const mat = new THREE.MeshBasicMaterial({
+		color: BBOX_COLOR_DEFAULT,
+		wireframe: true,
+		transparent: true,
+		opacity: PROXY_BASE_OPACITY,
+		toneMapped: false,
+	});
+	const mesh = new THREE.Mesh(geom, mat);
+	mesh.position.set(cx, anchorY, cz);
+	mesh.renderOrder = 1;
+	return mesh;
 }
 
 // Solid-fill counterpart to buildProxyWireframe. Same geometry math, but
@@ -2110,162 +2890,173 @@ function buildProxyWireframe(proxyShape, origin, dimensions) {
 // the proxy". `nodeKind` only steers the tint so frames read as walls vs.
 // objects in the scene.
 const SOLID_FILL_COLOR = {
-  object: 0x4f7a45,
-  frame: 0x4a6a82,
+	object: 0x4f7a45,
+	frame: 0x4a6a82,
 };
 
 function buildSolidFill(proxyShape, origin, dimensions, nodeKind) {
-  const sx = Math.abs(dimensions[0]);
-  const sy = Math.abs(dimensions[1]);
-  const sz = Math.abs(dimensions[2]);
-  if (sx === 0 || sy === 0 || sz === 0) return null;
-  const cx = origin[0] + dimensions[0] / 2;
-  const cy = origin[1] + dimensions[1] / 2;
-  const cz = origin[2] + dimensions[2] / 2;
-  const yMin = Math.min(origin[1], origin[1] + dimensions[1]);
+	const sx = Math.abs(dimensions[0]);
+	const sy = Math.abs(dimensions[1]);
+	const sz = Math.abs(dimensions[2]);
+	if (sx === 0 || sy === 0 || sz === 0) return null;
+	const cx = origin[0] + dimensions[0] / 2;
+	const cy = origin[1] + dimensions[1] / 2;
+	const cz = origin[2] + dimensions[2] / 2;
+	const yMin = Math.min(origin[1], origin[1] + dimensions[1]);
 
-  let geom;
-  let anchorY = cy;
-  if (proxyShape === "SPHERE") {
-    geom = new THREE.SphereGeometry(0.5, 32, 20);
-    geom.scale(sx, sy, sz);
-  } else if (proxyShape === "HEMISPHERE") {
-    geom = new THREE.SphereGeometry(
-      0.5, 32, 20,
-      0, Math.PI * 2,
-      0, Math.PI / 2,
-    );
-    geom.scale(sx, sy * 2, sz);
-    anchorY = yMin;
-  } else if (proxyShape === "CAPSULE") {
-    const r = Math.min(sx, sz) / 2;
-    const cylHeight = Math.max(0, sy - 2 * r);
-    geom = new THREE.CapsuleGeometry(r, cylHeight, 12, 32);
-  } else {
-    // No proxy: fill the AABB itself as a solid box.
-    geom = new THREE.BoxGeometry(sx, sy, sz);
-  }
+	let geom;
+	let anchorY = cy;
+	if (proxyShape === "SPHERE") {
+		geom = new THREE.SphereGeometry(0.5, 32, 20);
+		geom.scale(sx, sy, sz);
+	} else if (proxyShape === "HEMISPHERE") {
+		geom = new THREE.SphereGeometry(
+			0.5,
+			32,
+			20,
+			0,
+			Math.PI * 2,
+			0,
+			Math.PI / 2,
+		);
+		geom.scale(sx, sy * 2, sz);
+		anchorY = yMin;
+	} else if (proxyShape === "CAPSULE") {
+		const r = Math.min(sx, sz) / 2;
+		const cylHeight = Math.max(0, sy - 2 * r);
+		geom = new THREE.CapsuleGeometry(r, cylHeight, 12, 32);
+	} else {
+		// No proxy: fill the AABB itself as a solid box.
+		geom = new THREE.BoxGeometry(sx, sy, sz);
+	}
 
-  const mat = new THREE.MeshLambertMaterial({
-    color: SOLID_FILL_COLOR[nodeKind] ?? SOLID_FILL_COLOR.object,
-  });
-  const mesh = new THREE.Mesh(geom, mat);
-  mesh.position.set(cx, anchorY, cz);
-  return mesh;
+	const mat = new THREE.MeshLambertMaterial({
+		color: SOLID_FILL_COLOR[nodeKind] ?? SOLID_FILL_COLOR.object,
+	});
+	const mesh = new THREE.Mesh(geom, mat);
+	mesh.position.set(cx, anchorY, cz);
+	return mesh;
 }
 
 function disposeSolidFill(id) {
-  const prev = solidFills.get(id);
-  if (!prev) return;
-  bboxRoot.remove(prev);
-  prev.geometry?.dispose?.();
-  prev.material?.dispose?.();
-  solidFills.delete(id);
+	const prev = solidFills.get(id);
+	if (!prev) return;
+	bboxRoot.remove(prev);
+	prev.geometry?.dispose?.();
+	prev.material?.dispose?.();
+	solidFills.delete(id);
 }
 
 function clearSolidFills() {
-  for (const id of Array.from(solidFills.keys())) disposeSolidFill(id);
+	for (const id of Array.from(solidFills.keys())) disposeSolidFill(id);
 }
 
 function rebuildAllSolidFills() {
-  clearSolidFills();
-  for (const [id, helper] of bboxes) {
-    const nodeKind = helper.userData.nodeKind ?? "zone";
-    if (nodeKind === "zone") continue;
-    const origin = helper.userData.origin;
-    const dimensions = helper.userData.dimensions;
-    if (!origin || !dimensions) continue;
-    const fill = buildSolidFill(helper.userData.proxyShape ?? null, origin, dimensions, nodeKind);
-    if (fill === null) continue;
-    fill.userData.pickId = id;
-    bboxRoot.add(fill);
-    solidFills.set(id, fill);
-    applySolidFillVisibility(id);
-  }
+	clearSolidFills();
+	for (const [id, helper] of bboxes) {
+		const nodeKind = helper.userData.nodeKind ?? "zone";
+		if (nodeKind === "zone") continue;
+		const origin = helper.userData.origin;
+		const dimensions = helper.userData.dimensions;
+		if (!origin || !dimensions) continue;
+		const fill = buildSolidFill(
+			helper.userData.proxyShape ?? null,
+			origin,
+			dimensions,
+			nodeKind,
+		);
+		if (fill === null) continue;
+		fill.userData.pickId = id;
+		bboxRoot.add(fill);
+		solidFills.set(id, fill);
+		applySolidFillVisibility(id);
+	}
 }
 
 function applySolidFillVisibility(id) {
-  const mesh = solidFills.get(id);
-  if (!mesh) return;
-  const isFrame = treeNodes.get(id)?.kind === "frame";
-  const frameOk = isFrame ? framesShown : true;
-  mesh.visible = frameOk && !effectivelyHidden(id);
+	const mesh = solidFills.get(id);
+	if (!mesh) return;
+	const isFrame = treeNodes.get(id)?.kind === "frame";
+	const frameOk = isFrame ? framesShown : true;
+	mesh.visible = frameOk && !effectivelyHidden(id);
 }
 
 function refreshAllSolidFillVisibility() {
-  for (const id of solidFills.keys()) applySolidFillVisibility(id);
+	for (const id of solidFills.keys()) applySolidFillVisibility(id);
 }
 
 function applyBboxColor(id) {
-  const helper = id !== null ? bboxes.get(id) : null;
-  if (!helper) return;
-  const base =
-    helper.userData.proxyShape ? BBOX_COLOR_PROXY
-    : helper.userData.nodeKind === "object" ? BBOX_COLOR_OBJECT
-    : helper.userData.nodeKind === "frame" ? BBOX_COLOR_FRAME
-    : BBOX_COLOR_DEFAULT;
-  const color =
-    id === selectedBboxId ? BBOX_COLOR_SELECTED
-    : id === hoveredBboxId ? BBOX_COLOR_HOVER
-    : base;
-  helper.material.color.setHex(color);
-  const proxy = proxies.get(id);
-  if (proxy) proxy.material.color.setHex(color);
+	const helper = id !== null ? bboxes.get(id) : null;
+	if (!helper) return;
+	const base = helper.userData.proxyShape
+		? BBOX_COLOR_PROXY
+		: helper.userData.nodeKind === "object"
+			? BBOX_COLOR_OBJECT
+			: helper.userData.nodeKind === "frame"
+				? BBOX_COLOR_FRAME
+				: BBOX_COLOR_DEFAULT;
+	const color =
+		id === selectedBboxId
+			? BBOX_COLOR_SELECTED
+			: id === hoveredBboxId
+				? BBOX_COLOR_HOVER
+				: base;
+	helper.material.color.setHex(color);
+	const proxy = proxies.get(id);
+	if (proxy) proxy.material.color.setHex(color);
 }
 
 function applyBboxVisibility(id) {
-  // Bbox visibility is independent of the per-node hide state — hiding a
-  // node hides only its mesh + solid fill, leaving the wireframe bbox as
-  // a volumetric reference (and as the right-click handle for un-hiding).
-  //
-  // When something is selected, every OTHER bbox is dimmed (not hidden) so
-  // the selected one stands out without losing the rest of the scene as
-  // spatial reference. Hover gets full opacity so the user can see what
-  // they're about to pick.
-  const visible =
-    id === selectedBboxId ||
-    id === hoveredBboxId ||
-    bboxesShown;
-  const dim =
-    selectedBboxId !== null &&
-    id !== selectedBboxId &&
-    id !== hoveredBboxId;
-  const helper = bboxes.get(id);
-  if (helper) {
-    helper.visible = visible;
-    helper.material.opacity = dim ? BBOX_DIM_OPACITY : 1;
-  }
-  const proxy = proxies.get(id);
-  if (proxy) {
-    proxy.visible = visible;
-    proxy.material.opacity = dim ? PROXY_DIM_OPACITY : PROXY_BASE_OPACITY;
-  }
+	// Bbox visibility is independent of the per-node hide state — hiding a
+	// node hides only its mesh + solid fill, leaving the wireframe bbox as
+	// a volumetric reference (and as the right-click handle for un-hiding).
+	//
+	// When something is selected, every OTHER bbox is dimmed (not hidden) so
+	// the selected one stands out without losing the rest of the scene as
+	// spatial reference. Hover gets full opacity so the user can see what
+	// they're about to pick.
+	const visible =
+		id === selectedBboxId || id === hoveredBboxId || bboxesShown;
+	const dim =
+		selectedBboxId !== null &&
+		id !== selectedBboxId &&
+		id !== hoveredBboxId;
+	const helper = bboxes.get(id);
+	if (helper) {
+		helper.visible = visible;
+		helper.material.opacity = dim ? BBOX_DIM_OPACITY : 1;
+	}
+	const proxy = proxies.get(id);
+	if (proxy) {
+		proxy.visible = visible;
+		proxy.material.opacity = dim ? PROXY_DIM_OPACITY : PROXY_BASE_OPACITY;
+	}
 }
 
 function refreshAllBboxVisibility() {
-  for (const id of bboxes.keys()) applyBboxVisibility(id);
+	for (const id of bboxes.keys()) applyBboxVisibility(id);
 }
 
 function applyModelVisibility(id) {
-  const model = modelsById.get(id);
-  if (!model) return;
-  const isFrame = treeNodes.get(id)?.kind === "frame";
-  const frameOk = isFrame ? framesShown : true;
-  model.visible = meshesShown && frameOk && !effectivelyHidden(id);
+	const model = modelsById.get(id);
+	if (!model) return;
+	const isFrame = treeNodes.get(id)?.kind === "frame";
+	const frameOk = isFrame ? framesShown : true;
+	model.visible = meshesShown && frameOk && !effectivelyHidden(id);
 }
 
 function refreshAllFrameModelVisibility() {
-  for (const id of modelsById.keys()) applyModelVisibility(id);
+	for (const id of modelsById.keys()) applyModelVisibility(id);
 }
 
 function setHoveredBbox(id) {
-  if (id === hoveredBboxId) return;
-  const prev = hoveredBboxId;
-  hoveredBboxId = id;
-  applyBboxColor(prev);
-  applyBboxColor(id);
-  if (prev !== null) applyBboxVisibility(prev);
-  if (id !== null) applyBboxVisibility(id);
+	if (id === hoveredBboxId) return;
+	const prev = hoveredBboxId;
+	hoveredBboxId = id;
+	applyBboxColor(prev);
+	applyBboxColor(id);
+	if (prev !== null) applyBboxVisibility(prev);
+	if (id !== null) applyBboxVisibility(id);
 }
 
 // --- orientation indicator --------------------------------------------------
@@ -2281,91 +3072,107 @@ const _orientAxisY = new THREE.Vector3(0, 1, 0);
 let orientationArrow = null;
 
 function updateOrientationIndicator() {
-  const helper = selectedBboxId !== null ? bboxes.get(selectedBboxId) : null;
-  const origin = helper?.userData.origin;
-  const dimensions = helper?.userData.dimensions;
-  if (!helper || helper.userData.nodeKind !== "object" || !origin || !dimensions) {
-    if (orientationArrow) orientationArrow.visible = false;
-    return;
-  }
-  const deg = Number(helper.userData.orientation) || 0;
-  const facing = new THREE.Vector3(0, 0, 1).applyQuaternion(
-    new THREE.Quaternion().setFromAxisAngle(_orientAxisY, THREE.MathUtils.degToRad(deg)),
-  );
-  const center = new THREE.Vector3(
-    origin[0] + dimensions[0] / 2,
-    origin[1] + dimensions[1] / 2,
-    origin[2] + dimensions[2] / 2,
-  );
-  // Length: distance from center to the front face along `facing`, plus ~50%
-  // so the head clears the wireframe. Using the exit distance (not a raw max
-  // extent) keeps the arrow proportional for thin/elongated objects too.
-  const hx = Math.abs(dimensions[0]) / 2;
-  const hz = Math.abs(dimensions[2]) / 2;
-  let reach = Infinity;
-  if (Math.abs(facing.x) > 1e-6) reach = Math.min(reach, hx / Math.abs(facing.x));
-  if (Math.abs(facing.z) > 1e-6) reach = Math.min(reach, hz / Math.abs(facing.z));
-  if (!isFinite(reach)) reach = Math.max(hx, hz);
-  const length = Math.max(0.15, reach * 1.5);
-  if (!orientationArrow) {
-    orientationArrow = new THREE.ArrowHelper(facing, center, length, BBOX_COLOR_ORIENT);
-    // Draw over the mesh/bbox so the direction stays legible even when the
-    // arrow's base sits inside a solid object.
-    orientationArrow.renderOrder = 3;
-    for (const part of [orientationArrow.line, orientationArrow.cone]) {
-      part.material.depthTest = false;
-      part.material.depthWrite = false;
-      part.material.transparent = true;
-    }
-    bboxRoot.add(orientationArrow);
-  } else {
-    orientationArrow.position.copy(center);
-    orientationArrow.setDirection(facing);
-    orientationArrow.setColor(BBOX_COLOR_ORIENT);
-  }
-  orientationArrow.setLength(length, length * 0.32, length * 0.22);
-  orientationArrow.visible = true;
+	const helper = selectedBboxId !== null ? bboxes.get(selectedBboxId) : null;
+	const origin = helper?.userData.origin;
+	const dimensions = helper?.userData.dimensions;
+	if (
+		!helper ||
+		helper.userData.nodeKind !== "object" ||
+		!origin ||
+		!dimensions
+	) {
+		if (orientationArrow) orientationArrow.visible = false;
+		return;
+	}
+	const deg = Number(helper.userData.orientation) || 0;
+	const facing = new THREE.Vector3(0, 0, 1).applyQuaternion(
+		new THREE.Quaternion().setFromAxisAngle(
+			_orientAxisY,
+			THREE.MathUtils.degToRad(deg),
+		),
+	);
+	const center = new THREE.Vector3(
+		origin[0] + dimensions[0] / 2,
+		origin[1] + dimensions[1] / 2,
+		origin[2] + dimensions[2] / 2,
+	);
+	// Length: distance from center to the front face along `facing`, plus ~50%
+	// so the head clears the wireframe. Using the exit distance (not a raw max
+	// extent) keeps the arrow proportional for thin/elongated objects too.
+	const hx = Math.abs(dimensions[0]) / 2;
+	const hz = Math.abs(dimensions[2]) / 2;
+	let reach = Infinity;
+	if (Math.abs(facing.x) > 1e-6)
+		reach = Math.min(reach, hx / Math.abs(facing.x));
+	if (Math.abs(facing.z) > 1e-6)
+		reach = Math.min(reach, hz / Math.abs(facing.z));
+	if (!isFinite(reach)) reach = Math.max(hx, hz);
+	const length = Math.max(0.15, reach * 1.5);
+	if (!orientationArrow) {
+		orientationArrow = new THREE.ArrowHelper(
+			facing,
+			center,
+			length,
+			BBOX_COLOR_ORIENT,
+		);
+		// Draw over the mesh/bbox so the direction stays legible even when the
+		// arrow's base sits inside a solid object.
+		orientationArrow.renderOrder = 3;
+		for (const part of [orientationArrow.line, orientationArrow.cone]) {
+			part.material.depthTest = false;
+			part.material.depthWrite = false;
+			part.material.transparent = true;
+			part.material.toneMapped = false;
+		}
+		bboxRoot.add(orientationArrow);
+	} else {
+		orientationArrow.position.copy(center);
+		orientationArrow.setDirection(facing);
+		orientationArrow.setColor(BBOX_COLOR_ORIENT);
+	}
+	orientationArrow.setLength(length, length * 0.32, length * 0.22);
+	orientationArrow.visible = true;
 }
 
 // Fit the camera to a single Box3 — parameterised variant of fitToScene.
 // Used by tree-click selection.
 function frameBbox(box) {
-  const size = box.getSize(new THREE.Vector3());
-  const center = box.getCenter(new THREE.Vector3());
-  const radius = Math.max(0.5 * Math.max(size.x, size.y, size.z), 0.5);
-  controls.target.copy(center);
-  const dist = radius / Math.tan((camera.fov * Math.PI) / 360);
-  const dirVec = new THREE.Vector3(1, 0.7, 1).normalize();
-  camera.position.copy(center).addScaledVector(dirVec, dist * 1.8);
-  camera.near = Math.max(0.01, radius / 100);
-  camera.far = Math.max(100, radius * 100);
-  camera.updateProjectionMatrix();
-  controls.update();
+	const size = box.getSize(new THREE.Vector3());
+	const center = box.getCenter(new THREE.Vector3());
+	const radius = Math.max(0.5 * Math.max(size.x, size.y, size.z), 0.5);
+	controls.target.copy(center);
+	const dist = radius / Math.tan((camera.fov * Math.PI) / 360);
+	const dirVec = new THREE.Vector3(1, 0.7, 1).normalize();
+	camera.position.copy(center).addScaledVector(dirVec, dist * 1.8);
+	camera.near = Math.max(0.01, radius / 100);
+	camera.far = Math.max(100, radius * 100);
+	camera.updateProjectionMatrix();
+	controls.update();
 }
 
 function selectTreeNode(id) {
-  const prev = selectedBboxId;
-  // Toggle off if re-clicking the same node.
-  selectedBboxId = prev === id ? null : id;
-  if (prev !== null) applyBboxColor(prev);
-  if (selectedBboxId !== null) applyBboxColor(selectedBboxId);
-  // Selection state gates every other bbox's visibility (see
-  // applyBboxVisibility) — when none→something or something→none, every
-  // peer's visibility flips. A→B leaves the peers untouched, but the
-  // refresh is cheap, so just re-apply uniformly.
-  refreshAllBboxVisibility();
-  updateOrientationIndicator();
-  renderTree();
-  renderTreeDetail();
-  if (selectedBboxId !== null) {
-    const helper = bboxes.get(selectedBboxId);
-    if (helper) {
-      // User took explicit camera control — stop auto-fit from later snapping
-      // the view back to the full scene when new meshes land.
-      cameraUserMoved = true;
-      frameBbox(helper.box);
-    }
-  }
+	const prev = selectedBboxId;
+	// Toggle off if re-clicking the same node.
+	selectedBboxId = prev === id ? null : id;
+	if (prev !== null) applyBboxColor(prev);
+	if (selectedBboxId !== null) applyBboxColor(selectedBboxId);
+	// Selection state gates every other bbox's visibility (see
+	// applyBboxVisibility) — when none→something or something→none, every
+	// peer's visibility flips. A→B leaves the peers untouched, but the
+	// refresh is cheap, so just re-apply uniformly.
+	refreshAllBboxVisibility();
+	updateOrientationIndicator();
+	renderTree();
+	renderTreeDetail();
+	if (selectedBboxId !== null) {
+		const helper = bboxes.get(selectedBboxId);
+		if (helper) {
+			// User took explicit camera control — stop auto-fit from later snapping
+			// the view back to the full scene when new meshes land.
+			cameraUserMoved = true;
+			frameBbox(helper.box);
+		}
+	}
 }
 
 // --- detail panel -----------------------------------------------------------
@@ -2375,20 +3182,22 @@ function selectTreeNode(id) {
 // zone_plan, image, step) so it stays in sync with streamed updates.
 
 function fmtMeters(arr) {
-  if (!Array.isArray(arr) || arr.length !== 3) return "—";
-  return arr.map((n) => (Number.isInteger(n) ? String(n) : n.toFixed(2))).join(", ");
+	if (!Array.isArray(arr) || arr.length !== 3) return "—";
+	return arr
+		.map((n) => (Number.isInteger(n) ? String(n) : n.toFixed(2)))
+		.join(", ");
 }
 
 function ancestorChain(id) {
-  const chain = [];
-  let cur = treeNodes.get(id)?.parentId ?? null;
-  while (cur !== null) {
-    const node = treeNodes.get(cur);
-    if (!node) break;
-    chain.unshift(node);
-    cur = node.parentId ?? null;
-  }
-  return chain;
+	const chain = [];
+	let cur = treeNodes.get(id)?.parentId ?? null;
+	while (cur !== null) {
+		const node = treeNodes.get(cur);
+		if (!node) break;
+		chain.unshift(node);
+		cur = node.parentId ?? null;
+	}
+	return chain;
 }
 
 // Persistent preview state for the detail panel. We hold onto the container
@@ -2399,112 +3208,126 @@ function ancestorChain(id) {
 let detailPreviewState = null; // { id, modelUrl, imageUrl, container, viewer }
 
 function destroyDetailPreview() {
-  if (detailPreviewState?.viewer) {
-    try { detailPreviewState.viewer.dispose(); } catch {}
-  }
-  if (detailPreviewState?.container?.parentNode) {
-    detailPreviewState.container.parentNode.removeChild(detailPreviewState.container);
-  }
-  detailPreviewState = null;
+	if (detailPreviewState?.viewer) {
+		try {
+			detailPreviewState.viewer.dispose();
+		} catch {}
+	}
+	if (detailPreviewState?.container?.parentNode) {
+		detailPreviewState.container.parentNode.removeChild(
+			detailPreviewState.container,
+		);
+	}
+	detailPreviewState = null;
 }
 
 // Stand-alone GLB viewer inside the detail panel. Lives in its own scene/
 // camera/renderer (separate from the main sandbox) so spinning the preview
 // doesn't move the main camera. Returns a dispose() handle.
 function mountMiniViewer(container, modelUrl) {
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x0e1014);
-  const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
-  // Default to a +Z-facing front view (overwritten once the model's bounds are
-  // known); keeps the orientation reference consistent even pre-load.
-  camera.position.set(0, 1.2, 3);
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(window.devicePixelRatio || 1);
-  renderer.outputColorSpace = THREE.SRGBColorSpace;
-  renderer.domElement.className = "detail-mini-canvas";
-  container.appendChild(renderer.domElement);
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-  controls.dampingFactor = 0.1;
-  controls.enablePan = true;
-  scene.add(new THREE.AmbientLight(0xffffff, 0.85));
-  const dir = new THREE.DirectionalLight(0xffffff, 0.7);
-  dir.position.set(5, 8, 6);
-  scene.add(dir);
+	const scene = new THREE.Scene();
+	scene.background = new THREE.Color(0x0e1014);
+	const camera = new THREE.PerspectiveCamera(45, 1, 0.01, 1000);
+	// Default to a +Z-facing front view (overwritten once the model's bounds are
+	// known); keeps the orientation reference consistent even pre-load.
+	camera.position.set(0, 1.2, 3);
+	const renderer = new THREE.WebGLRenderer({ antialias: true });
+	renderer.setPixelRatio(window.devicePixelRatio || 1);
+	renderer.outputColorSpace = THREE.SRGBColorSpace;
+	renderer.domElement.className = "detail-mini-canvas";
+	container.appendChild(renderer.domElement);
+	const controls = new OrbitControls(camera, renderer.domElement);
+	controls.enableDamping = true;
+	controls.dampingFactor = 0.1;
+	controls.enablePan = true;
+	scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+	const dir = new THREE.DirectionalLight(0xffffff, 0.7);
+	dir.position.set(5, 8, 6);
+	scene.add(dir);
 
-  function resize() {
-    const w = container.clientWidth || 280;
-    const h = Math.max(180, Math.round(w * 0.7));
-    renderer.setSize(w, h, false);
-    renderer.domElement.style.width = w + "px";
-    renderer.domElement.style.height = h + "px";
-    camera.aspect = w / h;
-    camera.updateProjectionMatrix();
-  }
-  resize();
-  const ro = new ResizeObserver(resize);
-  ro.observe(container);
+	function resize() {
+		const w = container.clientWidth || 280;
+		const h = Math.max(180, Math.round(w * 0.7));
+		renderer.setSize(w, h, false);
+		renderer.domElement.style.width = w + "px";
+		renderer.domElement.style.height = h + "px";
+		camera.aspect = w / h;
+		camera.updateProjectionMatrix();
+	}
+	resize();
+	const ro = new ResizeObserver(resize);
+	ro.observe(container);
 
-  let disposed = false;
-  let model = null;
-  const localLoader = configureGltfLoader(new GLTFLoader());
-  localLoader.loadAsync(new URL(modelUrl, SERVER_URL).toString())
-    .then((gltf) => {
-      if (disposed) return;
-      model = gltf.scene;
-      model.traverse((c) => {
-        if (c.isMesh && c.material) {
-          const mats = Array.isArray(c.material) ? c.material : [c.material];
-          for (const m of mats) m.side = THREE.DoubleSide;
-        }
-      });
-      scene.add(model);
-      const box = new THREE.Box3().setFromObject(model);
-      if (!box.isEmpty()) {
-        const center = new THREE.Vector3();
-        box.getCenter(center);
-        const size = new THREE.Vector3();
-        box.getSize(size);
-        const maxDim = Math.max(size.x, size.y, size.z) || 1;
-        const dist = maxDim * 2.8;
-        // Frame from world +Z (the canonical front: +Z = toward viewer) with a
-        // gentle elevation, so the world +Z axis always faces the camera. That
-        // fixed reference lets the user gauge the base model's orientation —
-        // azimuth is pinned to +Z (no X offset), only a slight downward tilt.
-        camera.position.copy(center).add(new THREE.Vector3(0, 0.4, 1).normalize().multiplyScalar(dist));
-        camera.near = Math.max(maxDim / 1000, 0.001);
-        camera.far = Math.max(maxDim * 100, 100);
-        camera.updateProjectionMatrix();
-        controls.target.copy(center);
-        controls.update();
-      }
-    })
-    .catch(() => { /* keep the empty viewer; user already sees an error in the asset row */ });
+	let disposed = false;
+	let model = null;
+	const localLoader = configureGltfLoader(new GLTFLoader());
+	localLoader
+		.loadAsync(new URL(modelUrl, SERVER_URL).toString())
+		.then((gltf) => {
+			if (disposed) return;
+			model = gltf.scene;
+			prepareLoadedScene(model);
+			scene.add(model);
+			const box = new THREE.Box3().setFromObject(model);
+			if (!box.isEmpty()) {
+				const center = new THREE.Vector3();
+				box.getCenter(center);
+				const size = new THREE.Vector3();
+				box.getSize(size);
+				const maxDim = Math.max(size.x, size.y, size.z) || 1;
+				const dist = maxDim * 2.8;
+				// Frame from world +Z (the canonical front: +Z = toward viewer) with a
+				// gentle elevation, so the world +Z axis always faces the camera. That
+				// fixed reference lets the user gauge the base model's orientation —
+				// azimuth is pinned to +Z (no X offset), only a slight downward tilt.
+				camera.position
+					.copy(center)
+					.add(
+						new THREE.Vector3(0, 0.4, 1)
+							.normalize()
+							.multiplyScalar(dist),
+					);
+				camera.near = Math.max(maxDim / 1000, 0.001);
+				camera.far = Math.max(maxDim * 100, 100);
+				camera.updateProjectionMatrix();
+				controls.target.copy(center);
+				controls.update();
+			}
+		})
+		.catch(() => {
+			/* keep the empty viewer; user already sees an error in the asset row */
+		});
 
-  let rafId = 0;
-  function tick() {
-    if (disposed) return;
-    controls.update();
-    renderer.render(scene, camera);
-    rafId = requestAnimationFrame(tick);
-  }
-  tick();
+	let rafId = 0;
+	function tick() {
+		if (disposed) return;
+		controls.update();
+		renderer.render(scene, camera);
+		rafId = requestAnimationFrame(tick);
+	}
+	tick();
 
-  return {
-    dispose() {
-      disposed = true;
-      cancelAnimationFrame(rafId);
-      try { ro.disconnect(); } catch {}
-      try { controls.dispose(); } catch {}
-      if (model) {
-        disposeObject3D(model);
-      }
-      try { renderer.dispose(); } catch {}
-      if (renderer.domElement.parentNode) {
-        renderer.domElement.parentNode.removeChild(renderer.domElement);
-      }
-    },
-  };
+	return {
+		dispose() {
+			disposed = true;
+			cancelAnimationFrame(rafId);
+			try {
+				ro.disconnect();
+			} catch {}
+			try {
+				controls.dispose();
+			} catch {}
+			if (model) {
+				disposeObject3D(model);
+			}
+			try {
+				renderer.dispose();
+			} catch {}
+			if (renderer.domElement.parentNode) {
+				renderer.domElement.parentNode.removeChild(renderer.domElement);
+			}
+		},
+	};
 }
 
 // The image + mesh the detail preview renders, resolved for the active asset
@@ -2515,303 +3338,468 @@ function mountMiniViewer(container, modelUrl) {
 // points at a not-yet-built file. "library" reads the folded scene projection
 // / live events (the assets map), as before.
 function detailPreviewUrls(node) {
-  if (assetMode === "generated") {
-    if (currentSlotId === null || currentModel === null || genVersion == null || !modelsById.has(node.id)) {
-      return { imageUrl: null, modelUrl: null };
-    }
-    // Carry the version token so a regenerate (which bumps it) changes the urls
-    // → ensureDetailPreview rebuilds the image + mini-viewer with fresh bytes.
-    const v = genMeshVersions.get(node.id);
-    return {
-      imageUrl: generatedImageUrl(currentSlotId, currentModel, currentRun, genVersion, node.id, v),
-      modelUrl: generatedArtifactUrl(currentSlotId, currentModel, currentRun, genVersion, node.id, v),
-    };
-  }
-  const a = assets.get(node.id);
-  return {
-    imageUrl: a?.imageUrl ?? null,
-    modelUrl: a && a.status === "loaded" ? a.modelUrl ?? null : null,
-  };
+	if (assetMode === "generated") {
+		if (
+			currentSlotId === null ||
+			currentModel === null ||
+			genVersion == null ||
+			!modelsById.has(node.id)
+		) {
+			return { imageUrl: null, modelUrl: null };
+		}
+		// Carry the version token so a regenerate (which bumps it) changes the urls
+		// → ensureDetailPreview rebuilds the image + mini-viewer with fresh bytes.
+		const v = genMeshVersions.get(node.id);
+		return {
+			imageUrl: generatedImageUrl(
+				currentSlotId,
+				currentModel,
+				currentRun,
+				genVersion,
+				node.id,
+				v,
+			),
+			modelUrl: generatedArtifactUrl(
+				currentSlotId,
+				currentModel,
+				currentRun,
+				genVersion,
+				node.id,
+				v,
+			),
+		};
+	}
+	const a = assets.get(node.id);
+	return {
+		imageUrl: a?.imageUrl ?? null,
+		modelUrl: a && a.status === "loaded" ? (a.modelUrl ?? null) : null,
+	};
 }
 
 // Builds (or returns the cached) preview container for `node`. Returns null
 // when nothing has been generated yet so the caller can skip the section.
 function ensureDetailPreview(node) {
-  const { imageUrl, modelUrl } = detailPreviewUrls(node);
-  const modelLoaded = !!modelUrl;
-  if (!imageUrl && !modelLoaded) {
-    destroyDetailPreview();
-    return null;
-  }
-  if (
-    detailPreviewState
-    && detailPreviewState.id === node.id
-    && detailPreviewState.imageUrl === imageUrl
-    && detailPreviewState.modelUrl === modelUrl
-  ) {
-    return detailPreviewState.container;
-  }
-  destroyDetailPreview();
+	const { imageUrl, modelUrl } = detailPreviewUrls(node);
+	const modelLoaded = !!modelUrl;
+	if (!imageUrl && !modelLoaded) {
+		destroyDetailPreview();
+		return null;
+	}
+	if (
+		detailPreviewState &&
+		detailPreviewState.id === node.id &&
+		detailPreviewState.imageUrl === imageUrl &&
+		detailPreviewState.modelUrl === modelUrl
+	) {
+		return detailPreviewState.container;
+	}
+	destroyDetailPreview();
 
-  const wrap = document.createElement("div");
-  wrap.className = "detail-section detail-preview";
-  const label = document.createElement("div");
-  label.className = "label";
-  label.textContent = "preview";
-  wrap.appendChild(label);
+	const wrap = document.createElement("div");
+	wrap.className = "detail-section detail-preview";
+	const label = document.createElement("div");
+	label.className = "label";
+	label.textContent = "preview";
+	wrap.appendChild(label);
 
-  if (imageUrl) {
-    const absImg = new URL(imageUrl, SERVER_URL).toString();
-    const link = document.createElement("a");
-    link.className = "detail-preview-image-link";
-    link.href = absImg;
-    link.target = "_blank";
-    link.rel = "noopener";
-    const img = document.createElement("img");
-    img.className = "detail-preview-image";
-    img.loading = "lazy";
-    img.alt = node.id;
-    img.src = absImg;
-    link.appendChild(img);
-    wrap.appendChild(link);
-  }
+	if (imageUrl) {
+		const absImg = new URL(imageUrl, SERVER_URL).toString();
+		const link = document.createElement("a");
+		link.className = "detail-preview-image-link";
+		link.href = absImg;
+		link.target = "_blank";
+		link.rel = "noopener";
+		const img = document.createElement("img");
+		img.className = "detail-preview-image";
+		img.loading = "lazy";
+		img.alt = node.id;
+		img.src = absImg;
+		link.appendChild(img);
+		wrap.appendChild(link);
+	}
 
-  let viewer = null;
-  if (modelLoaded) {
-    const viewerWrap = document.createElement("div");
-    viewerWrap.className = "detail-preview-viewer";
-    wrap.appendChild(viewerWrap);
-    viewer = mountMiniViewer(viewerWrap, modelUrl);
-  }
+	let viewer = null;
+	if (modelLoaded) {
+		const viewerWrap = document.createElement("div");
+		viewerWrap.className = "detail-preview-viewer";
+		wrap.appendChild(viewerWrap);
+		viewer = mountMiniViewer(viewerWrap, modelUrl);
+	}
 
-  detailPreviewState = { id: node.id, imageUrl, modelUrl, container: wrap, viewer };
-  return wrap;
+	detailPreviewState = {
+		id: node.id,
+		imageUrl,
+		modelUrl,
+		container: wrap,
+		viewer,
+	};
+	return wrap;
 }
 
 function renderTreeDetail() {
-  const id = selectedBboxId;
-  if (id === null) {
-    destroyDetailPreview();
-    treeEl.classList.remove("detail-open");
-    treeDetailEl.innerHTML = "";
-    return;
-  }
-  const node = treeNodes.get(id);
-  if (!node) {
-    destroyDetailPreview();
-    treeEl.classList.remove("detail-open");
-    treeDetailEl.innerHTML = "";
-    return;
-  }
-  treeEl.classList.add("detail-open");
-  // Detach the live preview before wiping the panel so its WebGL canvas and
-  // OrbitControls listeners survive the rebuild and we don't lose the user's
-  // camera position on every event tick.
-  if (detailPreviewState?.container?.parentNode === treeDetailEl) {
-    treeDetailEl.removeChild(detailPreviewState.container);
-  }
-  treeDetailEl.textContent = "";
+	const id = selectedBboxId;
+	if (id === null) {
+		destroyDetailPreview();
+		treeEl.classList.remove("detail-open");
+		treeDetailEl.innerHTML = "";
+		return;
+	}
+	const node = treeNodes.get(id);
+	if (!node) {
+		destroyDetailPreview();
+		treeEl.classList.remove("detail-open");
+		treeDetailEl.innerHTML = "";
+		return;
+	}
+	treeEl.classList.add("detail-open");
+	// Detach the live preview before wiping the panel so its WebGL canvas and
+	// OrbitControls listeners survive the rebuild and we don't lose the user's
+	// camera position on every event tick.
+	if (detailPreviewState?.container?.parentNode === treeDetailEl) {
+		treeDetailEl.removeChild(detailPreviewState.container);
+	}
+	treeDetailEl.textContent = "";
 
-  // Back-to-tree button — also clears the selection so the bbox highlight
-  // drops and the tree resumes its normal listing.
-  const back = document.createElement("button");
-  back.type = "button";
-  back.className = "detail-back";
-  back.textContent = "← back to tree";
-  back.addEventListener("click", () => selectTreeNode(id)); // toggle off
-  treeDetailEl.appendChild(back);
-  // Quick jump into the full-tree modal — keeps the user's current selection
-  // so they land on the same card in the larger view.
-  const openFull = document.createElement("button");
-  openFull.type = "button";
-  openFull.className = "detail-open-full";
-  openFull.textContent = "open full tree ⛶";
-  openFull.title = "Open every node's prompts, plans, and bboxes in a modal";
-  openFull.addEventListener("click", openTreeModal);
-  treeDetailEl.appendChild(openFull);
+	// Back-to-tree button — also clears the selection so the bbox highlight
+	// drops and the tree resumes its normal listing.
+	const back = document.createElement("button");
+	back.type = "button";
+	back.className = "detail-back";
+	back.textContent = "← back to tree";
+	back.addEventListener("click", () => selectTreeNode(id)); // toggle off
+	treeDetailEl.appendChild(back);
+	// Quick jump into the full-tree modal — keeps the user's current selection
+	// so they land on the same card in the larger view.
+	const openFull = document.createElement("button");
+	openFull.type = "button";
+	openFull.className = "detail-open-full";
+	openFull.textContent = "open full tree ⛶";
+	openFull.title = "Open every node's prompts, plans, and bboxes in a modal";
+	openFull.addEventListener("click", openTreeModal);
+	treeDetailEl.appendChild(openFull);
 
-  // Header row: kind tag + id.
-  const idRow = document.createElement("div");
-  idRow.className = "detail-id-row";
-  const kindTag = document.createElement("span");
-  kindTag.className = "detail-kind";
-  kindTag.textContent = `[${node.kind ?? "zone"}]`;
-  idRow.appendChild(kindTag);
-  const idEl = document.createElement("span");
-  idEl.className = `detail-id ${node.kind ?? "zone"}`;
-  idEl.textContent = node.id;
-  idRow.appendChild(idEl);
-  treeDetailEl.appendChild(idRow);
+	// Header row: kind tag + id.
+	const idRow = document.createElement("div");
+	idRow.className = "detail-id-row";
+	const kindTag = document.createElement("span");
+	kindTag.className = "detail-kind";
+	kindTag.textContent = `[${node.kind ?? "zone"}]`;
+	idRow.appendChild(kindTag);
+	const idEl = document.createElement("span");
+	idEl.className = `detail-id ${node.kind ?? "zone"}`;
+	idEl.textContent = node.id;
+	idRow.appendChild(idEl);
+	treeDetailEl.appendChild(idRow);
 
-  // Hierarchy — vertical, indented list of ancestors with the current node
-  // at the bottom. Each ancestor row is clickable to jump selection. Shows
-  // the [kind] tag and a short prompt preview so the user can see *what*
-  // each parent is, not just its id.
-  const chain = ancestorChain(id);
-  if (chain.length > 0) {
-    const hier = document.createElement("div");
-    hier.className = "detail-hierarchy";
-    function hierRow(n, depth, isCurrent) {
-      const row = document.createElement(isCurrent ? "div" : "a");
-      row.className = `detail-hier-row${isCurrent ? " current" : ""}`;
-      row.style.paddingLeft = `${depth * 12}px`;
-      if (!isCurrent) {
-        row.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          selectTreeNode(n.id);
-        });
-      }
-      if (depth > 0) {
-        const branch = document.createElement("span");
-        branch.className = "detail-hier-branch";
-        branch.textContent = "└";
-        row.appendChild(branch);
-      }
-      const kindEl = document.createElement("span");
-      kindEl.className = `detail-hier-kind ${n.kind ?? "zone"}`;
-      kindEl.textContent = `[${n.kind ?? "zone"}]`;
-      row.appendChild(kindEl);
-      const idEl2 = document.createElement("span");
-      idEl2.className = `detail-hier-id ${n.kind ?? "zone"}`;
-      idEl2.textContent = n.id;
-      row.appendChild(idEl2);
-      if (n.prompt) {
-        const promptEl2 = document.createElement("span");
-        promptEl2.className = "detail-hier-prompt";
-        promptEl2.textContent = truncate(n.prompt, 50);
-        promptEl2.title = n.prompt;
-        row.appendChild(promptEl2);
-      }
-      return row;
-    }
-    for (let i = 0; i < chain.length; i++) {
-      hier.appendChild(hierRow(chain[i], i, false));
-    }
-    hier.appendChild(hierRow(node, chain.length, true));
-    treeDetailEl.appendChild(hier);
-  }
+	// Hierarchy — vertical, indented list of ancestors with the current node
+	// at the bottom. Each ancestor row is clickable to jump selection. Shows
+	// the [kind] tag and a short prompt preview so the user can see *what*
+	// each parent is, not just its id.
+	const chain = ancestorChain(id);
+	if (chain.length > 0) {
+		const hier = document.createElement("div");
+		hier.className = "detail-hierarchy";
+		function hierRow(n, depth, isCurrent) {
+			const row = document.createElement(isCurrent ? "div" : "a");
+			row.className = `detail-hier-row${isCurrent ? " current" : ""}`;
+			row.style.paddingLeft = `${depth * 12}px`;
+			if (!isCurrent) {
+				row.addEventListener("click", (ev) => {
+					ev.stopPropagation();
+					selectTreeNode(n.id);
+				});
+			}
+			if (depth > 0) {
+				const branch = document.createElement("span");
+				branch.className = "detail-hier-branch";
+				branch.textContent = "└";
+				row.appendChild(branch);
+			}
+			const kindEl = document.createElement("span");
+			kindEl.className = `detail-hier-kind ${n.kind ?? "zone"}`;
+			kindEl.textContent = `[${n.kind ?? "zone"}]`;
+			row.appendChild(kindEl);
+			const idEl2 = document.createElement("span");
+			idEl2.className = `detail-hier-id ${n.kind ?? "zone"}`;
+			idEl2.textContent = n.id;
+			row.appendChild(idEl2);
+			if (n.prompt) {
+				const promptEl2 = document.createElement("span");
+				promptEl2.className = "detail-hier-prompt";
+				promptEl2.textContent = truncate(n.prompt, 50);
+				promptEl2.title = n.prompt;
+				row.appendChild(promptEl2);
+			}
+			return row;
+		}
+		for (let i = 0; i < chain.length; i++) {
+			hier.appendChild(hierRow(chain[i], i, false));
+		}
+		hier.appendChild(hierRow(node, chain.length, true));
+		treeDetailEl.appendChild(hier);
+	}
 
-  // Meta row: phase / bbox / proxy shape.
-  const meta = document.createElement("div");
-  meta.className = "detail-meta-row";
-  function metaEntry(label, value) {
-    const span = document.createElement("span");
-    const lbl = document.createElement("span");
-    lbl.textContent = `${label} `;
-    span.appendChild(lbl);
-    const b = document.createElement("b");
-    b.textContent = value;
-    span.appendChild(b);
-    return span;
-  }
-  meta.appendChild(metaEntry("phase:", treeDisplayPhase(node.id)));
-  if (Array.isArray(node.origin) && Array.isArray(node.dimensions)) {
-    meta.appendChild(metaEntry("origin:", `[${fmtMeters(node.origin)}]`));
-    meta.appendChild(metaEntry("size:", `[${fmtMeters(node.dimensions)}] m`));
-  }
-  if (node.proxyShape) {
-    meta.appendChild(metaEntry("proxy:", node.proxyShape));
-  }
-  treeDetailEl.appendChild(meta);
+	// Meta row: phase / bbox / proxy shape.
+	const meta = document.createElement("div");
+	meta.className = "detail-meta-row";
+	function metaEntry(label, value) {
+		const span = document.createElement("span");
+		const lbl = document.createElement("span");
+		lbl.textContent = `${label} `;
+		span.appendChild(lbl);
+		const b = document.createElement("b");
+		b.textContent = value;
+		span.appendChild(b);
+		return span;
+	}
+	meta.appendChild(metaEntry("phase:", treeDisplayPhase(node.id)));
+	if (Array.isArray(node.origin) && Array.isArray(node.dimensions)) {
+		meta.appendChild(metaEntry("origin:", `[${fmtMeters(node.origin)}]`));
+		meta.appendChild(
+			metaEntry("size:", `[${fmtMeters(node.dimensions)}] m`),
+		);
+	}
+	if (node.proxyShape) {
+		meta.appendChild(metaEntry("proxy:", node.proxyShape));
+	}
+	treeDetailEl.appendChild(meta);
 
-  // Prompt / plan / image-prompt sections — labelled so a reader can tell
-  // which pipeline step authored each piece of text.
-  function section(label, text) {
-    const wrap = document.createElement("div");
-    wrap.className = "detail-section";
-    const lab = document.createElement("div");
-    lab.className = "label";
-    lab.textContent = label;
-    wrap.appendChild(lab);
-    const body = document.createElement("div");
-    body.className = "body";
-    if (text) {
-      body.textContent = text;
-    } else {
-      body.classList.add("detail-empty");
-      body.textContent = "(not yet authored)";
-    }
-    wrap.appendChild(body);
-    treeDetailEl.appendChild(wrap);
-  }
+	// Prompt / plan / image-prompt sections — labelled so a reader can tell
+	// which pipeline step authored each piece of text.
+	function section(label, text) {
+		const wrap = document.createElement("div");
+		wrap.className = "detail-section";
+		const lab = document.createElement("div");
+		lab.className = "label";
+		lab.textContent = label;
+		wrap.appendChild(lab);
+		const body = document.createElement("div");
+		body.className = "body";
+		if (text) {
+			body.textContent = text;
+		} else {
+			body.classList.add("detail-empty");
+			body.textContent = "(not yet authored)";
+		}
+		wrap.appendChild(body);
+		treeDetailEl.appendChild(wrap);
+	}
 
-  section("seed prompt", node.prompt);
-  if (node.kind === "zone" || node.plan) {
-    section("zone plan", node.plan);
-  }
-  if (node.kind !== "zone") {
-    section("image prompt", node.imagePrompt);
-  }
+	section("seed prompt", node.prompt);
+	if (node.kind === "zone" || node.plan) {
+		section("zone plan", node.plan);
+	}
+	if (node.kind !== "zone") {
+		section("image prompt", node.imagePrompt);
+	}
 
-  // Retry control — only meaningful for non-zone meshes that errored (or are
-  // mid-retry from this client). Zones never produce meshes, so a retry would
-  // have nothing to regenerate.
-  if (node.kind !== "zone") {
-    const a = assets.get(id);
-    const status = a ? assetStatus(a) : "pending";
-    if (status === "error" || retryingIds.has(id)) {
-      const wrap = document.createElement("div");
-      wrap.className = "detail-section";
-      syncRetryButton(wrap, id, status, "detail-retry");
-      treeDetailEl.appendChild(wrap);
-    }
-  }
+	// Retry control — only meaningful for non-zone meshes that errored (or are
+	// mid-retry from this client). Zones never produce meshes, so a retry would
+	// have nothing to regenerate.
+	if (node.kind !== "zone") {
+		const a = assets.get(id);
+		const status = a ? assetStatus(a) : "pending";
+		if (status === "error" || retryingIds.has(id)) {
+			const wrap = document.createElement("div");
+			wrap.className = "detail-section";
+			syncRetryButton(wrap, id, status, "detail-retry");
+			treeDetailEl.appendChild(wrap);
+		}
+	}
 
-  // Regenerate control — generated mode only. Re-rolls this one generated asset
-  // from scratch (Nano-Banana + Trellis + optimize); the gate poll swaps the new
-  // mesh in once it lands. Available for any non-zone node, including ones whose
-  // generated asset failed or hasn't been built yet.
-  if (assetMode === "generated" && genVersion != null && node.kind !== "zone") {
-    const regenerating = regeneratingIds.has(id);
-    const wrap = document.createElement("div");
-    wrap.className = "detail-section";
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "detail-retry";
-    btn.classList.toggle("retrying", regenerating);
-    btn.disabled = regenerating;
-    btn.textContent = regenerating ? "regenerating…" : "regenerate asset";
-    btn.title = regenerating
-      ? "Re-running Nano-Banana + Trellis for this generated asset"
-      : "Re-run Nano-Banana + Trellis for this asset and re-derive every object sharing its prefab mesh";
-    btn.addEventListener("click", (ev) => {
-      ev.stopPropagation();
-      regenerateAsset(id);
-    });
-    wrap.appendChild(btn);
-    treeDetailEl.appendChild(wrap);
-  }
+	// Regenerate control — generated mode only. Re-rolls this one generated asset
+	// from scratch (Nano-Banana + Trellis + optimize); the gate poll swaps the new
+	// mesh in once it lands. Available for any non-zone node, including ones whose
+	// generated asset failed or hasn't been built yet.
+	if (
+		assetMode === "generated" &&
+		genVersion != null &&
+		node.kind !== "zone"
+	) {
+		const regenerating = regeneratingIds.has(id);
+		const unsymmetrizing = unsymmetrizingIds.has(id);
+		// Any in-flight rebuild op on this node disables all of its action buttons, so
+		// the user can't fire two at once; each button keeps its own in-flight label.
+		const busy = regenerating || unsymmetrizing;
+		// Current symmetry plane for this asset (from the gate poll). undefined =
+		// not reported yet (mesh not built); xy/xz = mirrored; none = full mesh.
+		const sym = genMeshSymmetry.get(id);
+		const mirrored = sym === "xy" || sym === "xz";
 
-  // Generated image + interactive mini 3D viewer when this node has assets.
-  // Built (or reused) by ensureDetailPreview so the WebGL context isn't torn
-  // down on incidental re-renders.
-  const preview = ensureDetailPreview(node);
-  if (preview) treeDetailEl.appendChild(preview);
+		// Per-asset optimize override (view-only) — shown once this asset has a
+		// mesh on screen to swap. Flips just this asset between its optimized twin
+		// and the raw, un-optimized Trellis mesh; the rest of the scene stays on
+		// the scene-wide `optimized` setting, and the override resets whenever the
+		// scene re-streams. Disabled while a swap or a rebuild of this node is in
+		// flight so the two reloads can't race.
+		if (modelsById.has(id)) {
+			const optimized = meshOptimizedFor(id);
+			const overridden = genMeshOptimized.has(id);
+			const swapping = _genLoading.has(id);
+			const optWrap = document.createElement("div");
+			optWrap.className = "detail-section";
+			const optBtn = document.createElement("button");
+			optBtn.type = "button";
+			optBtn.className = "detail-optimize" + (optimized ? "" : " raw");
+			optBtn.disabled = swapping || busy;
+			optBtn.textContent = swapping
+				? "swapping mesh…"
+				: `mesh: ${optimized ? "optimized" : "raw"}${overridden ? " · override" : ""}`;
+			optBtn.title = optimized
+				? "This asset is showing its optimized twin (decimated + KTX2 + Meshopt). Click to load just this asset's raw, un-optimized Trellis mesh (~100× heavier) — the rest of the scene stays on the scene-wide optimized setting."
+				: "This asset is showing its raw, un-optimized Trellis mesh (~100× heavier). Click to load just this asset's optimized twin instead.";
+			optBtn.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				toggleMeshOptimized(id);
+			});
+			optWrap.appendChild(optBtn);
+			treeDetailEl.appendChild(optWrap);
+		}
 
-  // Children list — for zones with sub-zones, lets the user drill into a
-  // child without leaving the detail view.
-  const childIds = treeChildren.get(id) ?? [];
-  if (childIds.length > 0) {
-    const wrap = document.createElement("div");
-    wrap.className = "detail-section";
-    const lab = document.createElement("div");
-    lab.className = "label";
-    lab.textContent = `children (${childIds.length})`;
-    wrap.appendChild(lab);
-    const list = document.createElement("div");
-    list.className = "detail-children";
-    for (const cid of childIds) {
-      const a = document.createElement("a");
-      const cn = treeNodes.get(cid);
-      a.textContent = cn ? `${cn.id} — ${truncate(cn.prompt ?? "", 60)}` : cid;
-      a.addEventListener("click", () => selectTreeNode(cid));
-      list.appendChild(a);
-    }
-    wrap.appendChild(list);
-    treeDetailEl.appendChild(wrap);
-  }
+		// Regenerate-source toggle: "from scratch" (new image + mesh) vs "from
+		// image" (reuse the existing image, rebuild only the mesh). Applies to all
+		// three backend regenerate buttons below; un-symmetrize is unaffected.
+		const srcWrap = document.createElement("div");
+		srcWrap.className = "detail-section";
+		const srcToggle = document.createElement("button");
+		srcToggle.type = "button";
+		srcToggle.className =
+			"detail-regen-source" + (regenReuseImage ? " from-image" : "");
+		srcToggle.textContent = regenReuseImage
+			? "regen source: from image"
+			: "regen source: from scratch";
+		srcToggle.title = regenReuseImage
+			? "Regenerate reuses this asset's existing image and rebuilds only the mesh (no new Nano-Banana). Click to switch to from-scratch."
+			: "Regenerate makes a new Nano-Banana image AND a new mesh. Click to reuse the existing image instead (rebuild the mesh only).";
+		srcToggle.addEventListener("click", (ev) => {
+			ev.stopPropagation();
+			regenReuseImage = !regenReuseImage;
+			try {
+				localStorage.setItem(
+					REGEN_SOURCE_STORAGE_KEY,
+					regenReuseImage ? "image" : "scratch",
+				);
+			} catch {}
+			renderTreeDetail();
+		});
+		srcWrap.appendChild(srcToggle);
+		treeDetailEl.appendChild(srcWrap);
 
-  treeDetailEl.scrollTop = 0;
+		const wrap = document.createElement("div");
+		wrap.className = "detail-section";
+		// One button per mesh backend (Trellis | Hunyuan Omni | Hunyuan 3.1), plus an
+		// un-symmetrize button. All share the per-id gate above.
+		const makeRegenButton = (label, backend, backendLabel) => {
+			const btn = document.createElement("button");
+			btn.type = "button";
+			btn.className = "detail-retry";
+			btn.classList.toggle("retrying", busy);
+			btn.disabled = busy;
+			btn.textContent = regenerating ? "regenerating…" : label;
+			btn.title = regenerating
+				? `Re-running Nano-Banana + ${backendLabel} for this generated asset`
+				: `Re-run Nano-Banana + ${backendLabel} for this asset and re-derive every object sharing its prefab mesh`;
+			btn.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				regenerateAsset(id, backend);
+			});
+			return btn;
+		};
+		wrap.appendChild(
+			makeRegenButton("regenerate (trellis)", "trellis", "Trellis"),
+		);
+		wrap.appendChild(
+			makeRegenButton("regenerate (hunyuan)", "hunyuan", "Hunyuan"),
+		);
+		// Hunyuan 3D 3.1 Rapid via Tencent's direct API — paced one-at-a-time
+		// server-side (Tencent's per-account concurrent-task limit is 1).
+		wrap.appendChild(
+			makeRegenButton(
+				"regenerate (hunyuan 3.1)",
+				"hunyuan-tencent",
+				"Hunyuan 3.1",
+			),
+		);
+		// Symmetry readout: whether this asset's served mesh is currently mirrored
+		// (and across which plane) or showing its full, un-mirrored geometry. Shown
+		// once the gate poll has reported this built asset's state.
+		if (sym !== undefined) {
+			const symWrap = document.createElement("div");
+			symWrap.className = "detail-section";
+			const symLab = document.createElement("div");
+			symLab.className = "label";
+			symLab.textContent = "symmetry";
+			const symBody = document.createElement("div");
+			symBody.className = "body";
+			symBody.textContent = mirrored
+				? `mirrored across ${sym.toUpperCase()} plane`
+				: "none (full mesh)";
+			symWrap.appendChild(symLab);
+			symWrap.appendChild(symBody);
+			treeDetailEl.appendChild(symWrap);
+		}
+		// Un-symmetrize: reprocess the EXISTING mesh with the mirror off (no AI),
+		// revealing the full model. Disabled once the asset is known un-mirrored
+		// (nothing to reveal); an as-yet-unreported state keeps it available.
+		const unBtn = document.createElement("button");
+		unBtn.type = "button";
+		unBtn.className = "detail-retry detail-unsymmetrize";
+		unBtn.classList.toggle("retrying", busy);
+		unBtn.disabled = busy || sym === "none";
+		unBtn.textContent = unsymmetrizing
+			? "un-symmetrizing…"
+			: mirrored
+				? `un-symmetrize (${sym})`
+				: sym === "none"
+					? "not symmetrized"
+					: "un-symmetrize";
+		unBtn.title = unsymmetrizing
+			? "Rebuilding this asset's mesh from its original un-mirrored model"
+			: mirrored
+				? `Currently mirrored across the ${sym.toUpperCase()} plane. Reveal the full, un-mirrored mesh (no AI calls). Propagates across the prefab group.`
+				: sym === "none"
+					? "This asset isn't mirrored — nothing to un-symmetrize."
+					: "Reveal the full, un-mirrored mesh: reprocess the existing model with symmetry off (no AI calls). Propagates across the prefab group.";
+		unBtn.addEventListener("click", (ev) => {
+			ev.stopPropagation();
+			unsymmetrizeAsset(id);
+		});
+		wrap.appendChild(unBtn);
+		treeDetailEl.appendChild(wrap);
+	}
+
+	// Generated image + interactive mini 3D viewer when this node has assets.
+	// Built (or reused) by ensureDetailPreview so the WebGL context isn't torn
+	// down on incidental re-renders.
+	const preview = ensureDetailPreview(node);
+	if (preview) treeDetailEl.appendChild(preview);
+
+	// Children list — for zones with sub-zones, lets the user drill into a
+	// child without leaving the detail view.
+	const childIds = treeChildren.get(id) ?? [];
+	if (childIds.length > 0) {
+		const wrap = document.createElement("div");
+		wrap.className = "detail-section";
+		const lab = document.createElement("div");
+		lab.className = "label";
+		lab.textContent = `children (${childIds.length})`;
+		wrap.appendChild(lab);
+		const list = document.createElement("div");
+		list.className = "detail-children";
+		for (const cid of childIds) {
+			const a = document.createElement("a");
+			const cn = treeNodes.get(cid);
+			a.textContent = cn
+				? `${cn.id} — ${truncate(cn.prompt ?? "", 60)}`
+				: cid;
+			a.addEventListener("click", () => selectTreeNode(cid));
+			list.appendChild(a);
+		}
+		wrap.appendChild(list);
+		treeDetailEl.appendChild(wrap);
+	}
+
+	treeDetailEl.scrollTop = 0;
 }
 
 // --- pipeline observability modal ------------------------------------------
@@ -2839,609 +3827,657 @@ let treeModalFocusId = null;
 const treeModalNodeOpen = new Map(); // id -> bool
 
 function modalFocusId() {
-  if (treeModalFocusId && treeNodes.has(treeModalFocusId)) {
-    return treeModalFocusId;
-  }
-  if (selectedBboxId && treeNodes.has(selectedBboxId)) {
-    return selectedBboxId;
-  }
-  return treeRootId;
+	if (treeModalFocusId && treeNodes.has(treeModalFocusId)) {
+		return treeModalFocusId;
+	}
+	if (selectedBboxId && treeNodes.has(selectedBboxId)) {
+		return selectedBboxId;
+	}
+	return treeRootId;
 }
 
 function openTreeModal() {
-  treeModalOpen = true;
-  // Snap focus to the current selection on open, so the modal opens on
-  // the node the user was looking at — not whatever they last pinned in
-  // a previous modal session.
-  treeModalFocusId = selectedBboxId ?? treeRootId;
-  treeModalNodeOpen.clear();
-  treeModalEl.classList.add("open");
-  renderTreeModal();
-  setTimeout(() => treeModalSearchEl?.focus(), 0);
+	treeModalOpen = true;
+	// Snap focus to the current selection on open, so the modal opens on
+	// the node the user was looking at — not whatever they last pinned in
+	// a previous modal session.
+	treeModalFocusId = selectedBboxId ?? treeRootId;
+	treeModalNodeOpen.clear();
+	treeModalEl.classList.add("open");
+	renderTreeModal();
+	setTimeout(() => treeModalSearchEl?.focus(), 0);
 }
 
 function closeTreeModal() {
-  treeModalOpen = false;
-  treeModalEl.classList.remove("open");
+	treeModalOpen = false;
+	treeModalEl.classList.remove("open");
 }
 
 function focusModalOn(id) {
-  if (!treeNodes.has(id)) return;
-  treeModalFocusId = id;
-  // Auto-open the new focus so the user immediately sees its calls.
-  treeModalNodeOpen.set(id, true);
-  if (selectedBboxId !== id) selectTreeNode(id);
-  renderTreeModal();
-  // Scroll the focused card into view so the layout shift doesn't strand
-  // the user at the top of the modal.
-  requestAnimationFrame(() => {
-    const target = treeModalBodyEl.querySelector(
-      `.tm-card[data-id="${CSS.escape(id)}"]`,
-    );
-    if (target) target.scrollIntoView({ block: "center" });
-  });
+	if (!treeNodes.has(id)) return;
+	treeModalFocusId = id;
+	// Auto-open the new focus so the user immediately sees its calls.
+	treeModalNodeOpen.set(id, true);
+	if (selectedBboxId !== id) selectTreeNode(id);
+	renderTreeModal();
+	// Scroll the focused card into view so the layout shift doesn't strand
+	// the user at the top of the modal.
+	requestAnimationFrame(() => {
+		const target = treeModalBodyEl.querySelector(
+			`.tm-card[data-id="${CSS.escape(id)}"]`,
+		);
+		if (target) target.scrollIntoView({ block: "center" });
+	});
 }
 
 function descendantsDFS(id) {
-  // (node, depth-from-focus) pairs, focus excluded. Used to render the
-  // descendant section below the focused card.
-  const out = [];
-  const start = treeChildren.get(id) ?? [];
-  const stack = start.map((cid) => [cid, 1]);
-  while (stack.length) {
-    const [cid, depth] = stack.shift();
-    const node = treeNodes.get(cid);
-    if (!node) continue;
-    out.push([node, depth]);
-    const kids = treeChildren.get(cid) ?? [];
-    for (const k of kids) stack.push([k, depth + 1]);
-  }
-  return out;
+	// (node, depth-from-focus) pairs, focus excluded. Used to render the
+	// descendant section below the focused card.
+	const out = [];
+	const start = treeChildren.get(id) ?? [];
+	const stack = start.map((cid) => [cid, 1]);
+	while (stack.length) {
+		const [cid, depth] = stack.shift();
+		const node = treeNodes.get(cid);
+		if (!node) continue;
+		out.push([node, depth]);
+		const kids = treeChildren.get(cid) ?? [];
+		for (const k of kids) stack.push([k, depth + 1]);
+	}
+	return out;
 }
 
 // `<pre>` block that holds an LLM prompt verbatim. Wrapped, scrollable when
 // large, capped in height so the modal layout doesn't get blown out by a
 // 4k-line user prompt — the user can scroll inside if they want more.
 function preBlock(text, { mono = true, cap = "320px" } = {}) {
-  const pre = document.createElement("pre");
-  pre.className = mono ? "tm-pre mono" : "tm-pre";
-  pre.style.maxHeight = cap;
-  pre.textContent = text ?? "";
-  return pre;
+	const pre = document.createElement("pre");
+	pre.className = mono ? "tm-pre mono" : "tm-pre";
+	pre.style.maxHeight = cap;
+	pre.textContent = text ?? "";
+	return pre;
 }
 
 function copyButton(text, label = "copy") {
-  const b = document.createElement("button");
-  b.type = "button";
-  b.className = "tm-copy";
-  b.textContent = label;
-  b.title = "copy to clipboard";
-  b.addEventListener("click", async (ev) => {
-    ev.stopPropagation();
-    try {
-      await navigator.clipboard.writeText(text ?? "");
-      b.textContent = "copied";
-      setTimeout(() => { b.textContent = label; }, 900);
-    } catch {
-      b.textContent = "copy failed";
-      setTimeout(() => { b.textContent = label; }, 1200);
-    }
-  });
-  return b;
+	const b = document.createElement("button");
+	b.type = "button";
+	b.className = "tm-copy";
+	b.textContent = label;
+	b.title = "copy to clipboard";
+	b.addEventListener("click", async (ev) => {
+		ev.stopPropagation();
+		try {
+			await navigator.clipboard.writeText(text ?? "");
+			b.textContent = "copied";
+			setTimeout(() => {
+				b.textContent = label;
+			}, 900);
+		} catch {
+			b.textContent = "copy failed";
+			setTimeout(() => {
+				b.textContent = label;
+			}, 1200);
+		}
+	});
+	return b;
 }
 
 function llmCallBlock(call, { defaultOpen }) {
-  const det = document.createElement("details");
-  det.className = "tm-llm-call";
-  if (call.cached) det.classList.add("cached");
-  det.open = defaultOpen;
+	const det = document.createElement("details");
+	det.className = "tm-llm-call";
+	if (call.cached) det.classList.add("cached");
+	det.open = defaultOpen;
 
-  const sum = document.createElement("summary");
-  sum.className = "tm-llm-summary";
-  const stepEl = document.createElement("span");
-  stepEl.className = "tm-llm-step";
-  stepEl.textContent = call.step;
-  sum.appendChild(stepEl);
-  if (call.model) {
-    const modelEl = document.createElement("span");
-    modelEl.className = "tm-llm-model";
-    modelEl.textContent = call.model;
-    sum.appendChild(modelEl);
-  }
-  if (call.cached) {
-    const tag = document.createElement("span");
-    tag.className = "tm-llm-tag cached";
-    tag.textContent = "cached";
-    tag.title = "Output reused from a previous identical (model, system, user) call in this run.";
-    sum.appendChild(tag);
-  }
-  det.appendChild(sum);
+	const sum = document.createElement("summary");
+	sum.className = "tm-llm-summary";
+	const stepEl = document.createElement("span");
+	stepEl.className = "tm-llm-step";
+	stepEl.textContent = call.step;
+	sum.appendChild(stepEl);
+	if (call.model) {
+		const modelEl = document.createElement("span");
+		modelEl.className = "tm-llm-model";
+		modelEl.textContent = call.model;
+		sum.appendChild(modelEl);
+	}
+	if (call.cached) {
+		const tag = document.createElement("span");
+		tag.className = "tm-llm-tag cached";
+		tag.textContent = "cached";
+		tag.title =
+			"Output reused from a previous identical (model, system, user) call in this run.";
+		sum.appendChild(tag);
+	}
+	det.appendChild(sum);
 
-  function section(label, body, extra) {
-    const wrap = document.createElement("div");
-    wrap.className = "tm-llm-section";
-    const head = document.createElement("div");
-    head.className = "tm-llm-section-head";
-    const lab = document.createElement("span");
-    lab.className = "tm-llm-section-label";
-    lab.textContent = label;
-    head.appendChild(lab);
-    if (extra) head.appendChild(extra);
-    wrap.appendChild(head);
-    wrap.appendChild(body);
-    return wrap;
-  }
+	function section(label, body, extra) {
+		const wrap = document.createElement("div");
+		wrap.className = "tm-llm-section";
+		const head = document.createElement("div");
+		head.className = "tm-llm-section-head";
+		const lab = document.createElement("span");
+		lab.className = "tm-llm-section-label";
+		lab.textContent = label;
+		head.appendChild(lab);
+		if (extra) head.appendChild(extra);
+		wrap.appendChild(head);
+		wrap.appendChild(body);
+		return wrap;
+	}
 
-  // System instruction — the prompt that defines the LLM's role for this
-  // step. Usually long-ish boilerplate; collapsed by default so the user
-  // sees the dynamic input + output first.
-  const sysWrap = document.createElement("details");
-  sysWrap.className = "tm-llm-subblock";
-  const sysSum = document.createElement("summary");
-  sysSum.textContent = `system instruction (${call.system.length.toLocaleString()} chars)`;
-  sysWrap.appendChild(sysSum);
-  sysWrap.appendChild(preBlock(call.system, { cap: "260px" }));
-  sysWrap.appendChild(copyButton(call.system, "copy system"));
-  det.appendChild(section("system", sysWrap));
+	// System instruction — the prompt that defines the LLM's role for this
+	// step. Usually long-ish boilerplate; collapsed by default so the user
+	// sees the dynamic input + output first.
+	const sysWrap = document.createElement("details");
+	sysWrap.className = "tm-llm-subblock";
+	const sysSum = document.createElement("summary");
+	sysSum.textContent = `system instruction (${call.system.length.toLocaleString()} chars)`;
+	sysWrap.appendChild(sysSum);
+	sysWrap.appendChild(preBlock(call.system, { cap: "260px" }));
+	sysWrap.appendChild(copyButton(call.system, "copy system"));
+	det.appendChild(section("system", sysWrap));
 
-  // User input — the actual rendered context for this call. This is the
-  // most-changing part call-to-call so it's open by default inside the
-  // already-open detail block.
-  const userWrap = document.createElement("div");
-  userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
-  userWrap.appendChild(copyButton(call.user, "copy input"));
-  det.appendChild(section(
-    `input (${call.user.length.toLocaleString()} chars)`,
-    userWrap,
-  ));
+	// User input — the actual rendered context for this call. This is the
+	// most-changing part call-to-call so it's open by default inside the
+	// already-open detail block.
+	const userWrap = document.createElement("div");
+	userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
+	userWrap.appendChild(copyButton(call.user, "copy input"));
+	det.appendChild(
+		section(`input (${call.user.length.toLocaleString()} chars)`, userWrap),
+	);
 
-  // Output — pretty-print JSON. We render with json formatting because the
-  // structured-output schema is what the rest of the pipeline consumes.
-  const outText = call.output === null
-    ? "(no output)"
-    : (() => { try { return JSON.stringify(call.output, null, 2); } catch { return String(call.output); } })();
-  const outWrap = document.createElement("div");
-  outWrap.appendChild(preBlock(outText, { cap: "360px" }));
-  outWrap.appendChild(copyButton(outText, "copy output"));
-  det.appendChild(section("output", outWrap));
+	// Output — pretty-print JSON. We render with json formatting because the
+	// structured-output schema is what the rest of the pipeline consumes.
+	const outText =
+		call.output === null
+			? "(no output)"
+			: (() => {
+					try {
+						return JSON.stringify(call.output, null, 2);
+					} catch {
+						return String(call.output);
+					}
+				})();
+	const outWrap = document.createElement("div");
+	outWrap.appendChild(preBlock(outText, { cap: "360px" }));
+	outWrap.appendChild(copyButton(outText, "copy output"));
+	det.appendChild(section("output", outWrap));
 
-  // Reasoning is optional (only present when the provider returns CoT).
-  // Collapsed by default — it's noisy.
-  if (call.reasoning) {
-    const reasWrap = document.createElement("details");
-    reasWrap.className = "tm-llm-subblock";
-    const reasSum = document.createElement("summary");
-    reasSum.textContent = `reasoning (${call.reasoning.length.toLocaleString()} chars)`;
-    reasWrap.appendChild(reasSum);
-    reasWrap.appendChild(preBlock(call.reasoning, { cap: "260px" }));
-    det.appendChild(section("reasoning", reasWrap));
-  }
+	// Reasoning is optional (only present when the provider returns CoT).
+	// Collapsed by default — it's noisy.
+	if (call.reasoning) {
+		const reasWrap = document.createElement("details");
+		reasWrap.className = "tm-llm-subblock";
+		const reasSum = document.createElement("summary");
+		reasSum.textContent = `reasoning (${call.reasoning.length.toLocaleString()} chars)`;
+		reasWrap.appendChild(reasSum);
+		reasWrap.appendChild(preBlock(call.reasoning, { cap: "260px" }));
+		det.appendChild(section("reasoning", reasWrap));
+	}
 
-  return det;
+	return det;
 }
 
 function renderObsCard(node, { role, depth }) {
-  // role: "ancestor" | "focus" | "descendant"
-  // depth is only used to indent descendants visually.
-  const card = document.createElement("div");
-  const kind = node.kind ?? "zone";
-  card.className = `tm-card tm-obs-card kind-${kind} role-${role}`;
-  card.dataset.id = node.id;
-  if (role === "focus") card.classList.add("selected");
-  if (role === "descendant" && depth > 0) {
-    card.style.marginLeft = `${Math.min(depth, 6) * 16}px`;
-  }
+	// role: "ancestor" | "focus" | "descendant"
+	// depth is only used to indent descendants visually.
+	const card = document.createElement("div");
+	const kind = node.kind ?? "zone";
+	card.className = `tm-card tm-obs-card kind-${kind} role-${role}`;
+	card.dataset.id = node.id;
+	if (role === "focus") card.classList.add("selected");
+	if (role === "descendant" && depth > 0) {
+		card.style.marginLeft = `${Math.min(depth, 6) * 16}px`;
+	}
 
-  // Decide default open/closed. The focused node opens by default; ancestors
-  // and descendants stay closed so the focus stays visually dominant.
-  // User-toggled state takes precedence.
-  const userPref = treeModalNodeOpen.get(node.id);
-  const detailsOpen = userPref !== undefined ? userPref : (role === "focus");
+	// Decide default open/closed. The focused node opens by default; ancestors
+	// and descendants stay closed so the focus stays visually dominant.
+	// User-toggled state takes precedence.
+	const userPref = treeModalNodeOpen.get(node.id);
+	const detailsOpen = userPref !== undefined ? userPref : role === "focus";
 
-  const det = document.createElement("details");
-  det.className = "tm-obs-details";
-  det.open = detailsOpen;
-  det.addEventListener("toggle", () => {
-    treeModalNodeOpen.set(node.id, det.open);
-  });
+	const det = document.createElement("details");
+	det.className = "tm-obs-details";
+	det.open = detailsOpen;
+	det.addEventListener("toggle", () => {
+		treeModalNodeOpen.set(node.id, det.open);
+	});
 
-  const sum = document.createElement("summary");
-  sum.className = "tm-obs-summary";
+	const sum = document.createElement("summary");
+	sum.className = "tm-obs-summary";
 
-  const roleEl = document.createElement("span");
-  roleEl.className = `tm-obs-role role-${role}`;
-  roleEl.textContent = role === "focus" ? "focus" :
-    role === "ancestor" ? "ancestor" : `child ·d${depth}`;
-  sum.appendChild(roleEl);
+	const roleEl = document.createElement("span");
+	roleEl.className = `tm-obs-role role-${role}`;
+	roleEl.textContent =
+		role === "focus"
+			? "focus"
+			: role === "ancestor"
+				? "ancestor"
+				: `child ·d${depth}`;
+	sum.appendChild(roleEl);
 
-  const kindEl = document.createElement("span");
-  kindEl.className = "tm-kind";
-  kindEl.textContent = `[${kind}]`;
-  sum.appendChild(kindEl);
+	const kindEl = document.createElement("span");
+	kindEl.className = "tm-kind";
+	kindEl.textContent = `[${kind}]`;
+	sum.appendChild(kindEl);
 
-  const idEl = document.createElement("span");
-  idEl.className = `tm-id ${kind}`;
-  idEl.textContent = node.id;
-  idEl.title = "Click to focus this node";
-  idEl.addEventListener("click", (ev) => {
-    ev.stopPropagation();
-    ev.preventDefault();
-    focusModalOn(node.id);
-  });
-  sum.appendChild(idEl);
+	const idEl = document.createElement("span");
+	idEl.className = `tm-id ${kind}`;
+	idEl.textContent = node.id;
+	idEl.title = "Click to focus this node";
+	idEl.addEventListener("click", (ev) => {
+		ev.stopPropagation();
+		ev.preventDefault();
+		focusModalOn(node.id);
+	});
+	sum.appendChild(idEl);
 
-  const phaseEl = document.createElement("span");
-  const displayPhase = treeDisplayPhase(node.id);
-  phaseEl.className = `tm-phase phase-${displayPhase}`;
-  phaseEl.textContent = displayPhase;
-  sum.appendChild(phaseEl);
+	const phaseEl = document.createElement("span");
+	const displayPhase = treeDisplayPhase(node.id);
+	phaseEl.className = `tm-phase phase-${displayPhase}`;
+	phaseEl.textContent = displayPhase;
+	sum.appendChild(phaseEl);
 
-  const calls = nodeLlmCalls.get(node.id) ?? [];
-  const callsTag = document.createElement("span");
-  callsTag.className = "tm-obs-callcount";
-  callsTag.textContent = calls.length === 1 ? "1 llm call" : `${calls.length} llm calls`;
-  sum.appendChild(callsTag);
+	const calls = nodeLlmCalls.get(node.id) ?? [];
+	const callsTag = document.createElement("span");
+	callsTag.className = "tm-obs-callcount";
+	callsTag.textContent =
+		calls.length === 1 ? "1 llm call" : `${calls.length} llm calls`;
+	sum.appendChild(callsTag);
 
-  // "via {step}" pill — surfaces which decomposition step admitted this
-  // node at a glance, so the user can immediately see anchor vs next_object
-  // vs encapsulating vs negative_space vs zone_decompose, without expanding.
-  // Pulled from the provenance trace (first emitted_by entry).
-  const provenance = nodeProvenance.get(node.id) ?? [];
-  const emittedBy = provenance.find((p) => p.relation === "emitted_by");
-  if (emittedBy) {
-    const via = document.createElement("span");
-    via.className = `tm-obs-via via-${emittedBy.call.step}`;
-    via.textContent = `via ${emittedBy.call.step}`;
-    via.title = `Emitted by ${emittedBy.call.step} call on ${emittedBy.call.parentNode || "?"}`;
-    sum.appendChild(via);
-  }
+	// "via {step}" pill — surfaces which decomposition step admitted this
+	// node at a glance, so the user can immediately see anchor vs next_object
+	// vs encapsulating vs negative_space vs zone_decompose, without expanding.
+	// Pulled from the provenance trace (first emitted_by entry).
+	const provenance = nodeProvenance.get(node.id) ?? [];
+	const emittedBy = provenance.find((p) => p.relation === "emitted_by");
+	if (emittedBy) {
+		const via = document.createElement("span");
+		via.className = `tm-obs-via via-${emittedBy.call.step}`;
+		via.textContent = `via ${emittedBy.call.step}`;
+		via.title = `Emitted by ${emittedBy.call.step} call on ${emittedBy.call.parentNode || "?"}`;
+		sum.appendChild(via);
+	}
 
-  if (node.prompt) {
-    const promptTeaser = document.createElement("span");
-    promptTeaser.className = "tm-obs-teaser";
-    promptTeaser.textContent = truncate(node.prompt, 80);
-    promptTeaser.title = node.prompt;
-    sum.appendChild(promptTeaser);
-  }
+	if (node.prompt) {
+		const promptTeaser = document.createElement("span");
+		promptTeaser.className = "tm-obs-teaser";
+		promptTeaser.textContent = truncate(node.prompt, 80);
+		promptTeaser.title = node.prompt;
+		sum.appendChild(promptTeaser);
+	}
 
-  det.appendChild(sum);
+	det.appendChild(sum);
 
-  // Body: the per-node prompts captured by the pipeline (seed/plan/image)
-  // plus every llm.call recorded against this node.
-  const body = document.createElement("div");
-  body.className = "tm-obs-body";
+	// Body: the per-node prompts captured by the pipeline (seed/plan/image)
+	// plus every llm.call recorded against this node.
+	const body = document.createElement("div");
+	body.className = "tm-obs-body";
 
-  function addTextSection(label, text) {
-    if (!text) return;
-    const wrap = document.createElement("div");
-    wrap.className = "tm-section";
-    const lab = document.createElement("div");
-    lab.className = "tm-section-label";
-    lab.textContent = label;
-    wrap.appendChild(lab);
-    const b = document.createElement("div");
-    b.className = "tm-section-body";
-    b.textContent = text;
-    wrap.appendChild(b);
-    body.appendChild(wrap);
-  }
+	function addTextSection(label, text) {
+		if (!text) return;
+		const wrap = document.createElement("div");
+		wrap.className = "tm-section";
+		const lab = document.createElement("div");
+		lab.className = "tm-section-label";
+		lab.textContent = label;
+		wrap.appendChild(lab);
+		const b = document.createElement("div");
+		b.className = "tm-section-body";
+		b.textContent = text;
+		wrap.appendChild(b);
+		body.appendChild(wrap);
+	}
 
-  addTextSection("seed prompt", node.prompt);
-  if (kind === "zone" && node.plan) addTextSection("zone plan", node.plan);
-  if (kind !== "zone" && node.imagePrompt) addTextSection("image prompt", node.imagePrompt);
+	addTextSection("seed prompt", node.prompt);
+	if (kind === "zone" && node.plan) addTextSection("zone plan", node.plan);
+	if (kind !== "zone" && node.imagePrompt)
+		addTextSection("image prompt", node.imagePrompt);
 
-  // Provenance — the LLM calls that *brought this node into existence*.
-  // Distinct from the calls section below (which is calls *issued from* this
-  // node). For an object, this is the only place to see the anchor_decompose
-  // / next_object / object_bbox_batch calls that named & placed it — those
-  // calls live on the parent zone's id. Surfaced as full collapsible call
-  // blocks so the user can read the exact system + user + output that drove
-  // the placement decision.
-  if (provenance.length > 0) {
-    const provWrap = document.createElement("div");
-    provWrap.className = "tm-obs-provenance";
-    const lab = document.createElement("div");
-    lab.className = "tm-section-label tm-obs-provenance-label";
-    lab.textContent = "provenance — calls that emitted & placed this node";
-    provWrap.appendChild(lab);
-    const callDefaultOpen = role === "focus";
-    for (const entry of provenance) {
-      const relLine = document.createElement("div");
-      relLine.className = "tm-obs-provenance-rel";
-      const rel = document.createElement("span");
-      rel.className = `tm-obs-provenance-tag rel-${entry.relation}`;
-      rel.textContent = entry.relation === "emitted_by" ? "emitted by" : "placed by";
-      relLine.appendChild(rel);
-      const onNode = document.createElement("a");
-      onNode.className = "tm-obs-provenance-on";
-      onNode.textContent = `${entry.call.step} on ${entry.call.parentNode || "?"}`;
-      if (entry.call.parentNode && treeNodes.has(entry.call.parentNode)) {
-        onNode.title = `Click to focus ${entry.call.parentNode}`;
-        onNode.addEventListener("click", (ev) => {
-          ev.stopPropagation();
-          focusModalOn(entry.call.parentNode);
-        });
-      } else {
-        onNode.classList.add("dead");
-      }
-      relLine.appendChild(onNode);
-      provWrap.appendChild(relLine);
-      provWrap.appendChild(llmCallBlock(entry.call, { defaultOpen: callDefaultOpen }));
-    }
-    body.appendChild(provWrap);
-  }
+	// Provenance — the LLM calls that *brought this node into existence*.
+	// Distinct from the calls section below (which is calls *issued from* this
+	// node). For an object, this is the only place to see the anchor_decompose
+	// / next_object / object_bbox_batch calls that named & placed it — those
+	// calls live on the parent zone's id. Surfaced as full collapsible call
+	// blocks so the user can read the exact system + user + output that drove
+	// the placement decision.
+	if (provenance.length > 0) {
+		const provWrap = document.createElement("div");
+		provWrap.className = "tm-obs-provenance";
+		const lab = document.createElement("div");
+		lab.className = "tm-section-label tm-obs-provenance-label";
+		lab.textContent = "provenance — calls that emitted & placed this node";
+		provWrap.appendChild(lab);
+		const callDefaultOpen = role === "focus";
+		for (const entry of provenance) {
+			const relLine = document.createElement("div");
+			relLine.className = "tm-obs-provenance-rel";
+			const rel = document.createElement("span");
+			rel.className = `tm-obs-provenance-tag rel-${entry.relation}`;
+			rel.textContent =
+				entry.relation === "emitted_by" ? "emitted by" : "placed by";
+			relLine.appendChild(rel);
+			const onNode = document.createElement("a");
+			onNode.className = "tm-obs-provenance-on";
+			onNode.textContent = `${entry.call.step} on ${entry.call.parentNode || "?"}`;
+			if (entry.call.parentNode && treeNodes.has(entry.call.parentNode)) {
+				onNode.title = `Click to focus ${entry.call.parentNode}`;
+				onNode.addEventListener("click", (ev) => {
+					ev.stopPropagation();
+					focusModalOn(entry.call.parentNode);
+				});
+			} else {
+				onNode.classList.add("dead");
+			}
+			relLine.appendChild(onNode);
+			provWrap.appendChild(relLine);
+			provWrap.appendChild(
+				llmCallBlock(entry.call, { defaultOpen: callDefaultOpen }),
+			);
+		}
+		body.appendChild(provWrap);
+	}
 
-  // LLM call traces — calls issued *from* this node (zone_plan,
-  // zone_decompose, anchor_decompose, image_prompt, etc).
-  const callsWrap = document.createElement("div");
-  callsWrap.className = "tm-llm-calls";
-  const callsHeader = document.createElement("div");
-  callsHeader.className = "tm-section-label tm-llm-calls-label";
-  callsHeader.textContent = "calls issued from this node";
-  callsWrap.appendChild(callsHeader);
-  if (calls.length === 0) {
-    const empty = document.createElement("div");
-    empty.className = "tm-llm-empty";
-    empty.textContent = "(no LLM calls issued from this node)";
-    callsWrap.appendChild(empty);
-  } else {
-    // Focus card opens every call; ancestors/descendants leave them collapsed.
-    const callDefaultOpen = role === "focus";
-    for (const call of calls) {
-      callsWrap.appendChild(llmCallBlock(call, { defaultOpen: callDefaultOpen }));
-    }
-  }
-  body.appendChild(callsWrap);
+	// LLM call traces — calls issued *from* this node (zone_plan,
+	// zone_decompose, anchor_decompose, image_prompt, etc).
+	const callsWrap = document.createElement("div");
+	callsWrap.className = "tm-llm-calls";
+	const callsHeader = document.createElement("div");
+	callsHeader.className = "tm-section-label tm-llm-calls-label";
+	callsHeader.textContent = "calls issued from this node";
+	callsWrap.appendChild(callsHeader);
+	if (calls.length === 0) {
+		const empty = document.createElement("div");
+		empty.className = "tm-llm-empty";
+		empty.textContent = "(no LLM calls issued from this node)";
+		callsWrap.appendChild(empty);
+	} else {
+		// Focus card opens every call; ancestors/descendants leave them collapsed.
+		const callDefaultOpen = role === "focus";
+		for (const call of calls) {
+			callsWrap.appendChild(
+				llmCallBlock(call, { defaultOpen: callDefaultOpen }),
+			);
+		}
+	}
+	body.appendChild(callsWrap);
 
-  det.appendChild(body);
-  card.appendChild(det);
-  return card;
+	det.appendChild(body);
+	card.appendChild(det);
+	return card;
 }
 
 function renderModalSectionHeading(label, count, hint) {
-  const h = document.createElement("div");
-  h.className = "tm-obs-heading";
-  const lab = document.createElement("span");
-  lab.className = "tm-obs-heading-label";
-  lab.textContent = label;
-  h.appendChild(lab);
-  const c = document.createElement("span");
-  c.className = "tm-obs-heading-count";
-  c.textContent = count === 1 ? "1 node" : `${count} nodes`;
-  h.appendChild(c);
-  if (hint) {
-    const hi = document.createElement("span");
-    hi.className = "tm-obs-heading-hint";
-    hi.textContent = hint;
-    h.appendChild(hi);
-  }
-  return h;
+	const h = document.createElement("div");
+	h.className = "tm-obs-heading";
+	const lab = document.createElement("span");
+	lab.className = "tm-obs-heading-label";
+	lab.textContent = label;
+	h.appendChild(lab);
+	const c = document.createElement("span");
+	c.className = "tm-obs-heading-count";
+	c.textContent = count === 1 ? "1 node" : `${count} nodes`;
+	h.appendChild(c);
+	if (hint) {
+		const hi = document.createElement("span");
+		hi.className = "tm-obs-heading-hint";
+		hi.textContent = hint;
+		h.appendChild(hi);
+	}
+	return h;
 }
 
 function callMatchesQuery(call, q) {
-  return call.step.toLowerCase().includes(q)
-    || call.system.toLowerCase().includes(q)
-    || call.user.toLowerCase().includes(q)
-    || (call.model || "").toLowerCase().includes(q)
-    || JSON.stringify(call.output ?? "").toLowerCase().includes(q);
+	return (
+		call.step.toLowerCase().includes(q) ||
+		call.system.toLowerCase().includes(q) ||
+		call.user.toLowerCase().includes(q) ||
+		(call.model || "").toLowerCase().includes(q) ||
+		JSON.stringify(call.output ?? "")
+			.toLowerCase()
+			.includes(q)
+	);
 }
 
 function nodeMatchesQuery(node, q) {
-  if (node.id.toLowerCase().includes(q)) return true;
-  if ((node.prompt ?? "").toLowerCase().includes(q)) return true;
-  if ((node.plan ?? "").toLowerCase().includes(q)) return true;
-  if ((node.imagePrompt ?? "").toLowerCase().includes(q)) return true;
-  const calls = nodeLlmCalls.get(node.id) ?? [];
-  if (calls.some((c) => callMatchesQuery(c, q))) return true;
-  // Also match provenance calls — searching for an emitting step name like
-  // "anchor_decompose" should surface every object that was emitted by one.
-  const prov = nodeProvenance.get(node.id) ?? [];
-  return prov.some((p) => callMatchesQuery(p.call, q));
+	if (node.id.toLowerCase().includes(q)) return true;
+	if ((node.prompt ?? "").toLowerCase().includes(q)) return true;
+	if ((node.plan ?? "").toLowerCase().includes(q)) return true;
+	if ((node.imagePrompt ?? "").toLowerCase().includes(q)) return true;
+	const calls = nodeLlmCalls.get(node.id) ?? [];
+	if (calls.some((c) => callMatchesQuery(c, q))) return true;
+	// Also match provenance calls — searching for an emitting step name like
+	// "anchor_decompose" should surface every object that was emitted by one.
+	const prov = nodeProvenance.get(node.id) ?? [];
+	return prov.some((p) => callMatchesQuery(p.call, q));
 }
 
 function renderTreeModal() {
-  if (!treeModalOpen) return;
-  // Re-renders happen on every streamed event while the modal is open. Plain
-  // `scrollTop` preservation isn't enough — when new LLM calls land on the
-  // focused card (or any card above the user's viewport), absolute pixel
-  // positions shift downward and the user ends up looking at a different
-  // card. Anchor the restore to whichever card is currently closest to the
-  // top of the viewport, then snap that same card back to the same offset
-  // after the rebuild.
-  const bodyRectTop = treeModalBodyEl.getBoundingClientRect().top;
-  let anchorId = null;
-  let anchorOffset = 0;
-  for (const card of treeModalBodyEl.querySelectorAll(".tm-card")) {
-    const r = card.getBoundingClientRect();
-    const offset = r.top - bodyRectTop;
-    // Pick the first card whose top is at or below the viewport top — that's
-    // the one the user is reading. Bail once we pass it; cards lower down
-    // can't be a better anchor.
-    if (offset >= -2) {
-      anchorId = card.dataset.id;
-      anchorOffset = offset;
-      break;
-    }
-  }
-  treeModalBodyEl.innerHTML = "";
+	if (!treeModalOpen) return;
+	// Re-renders happen on every streamed event while the modal is open. Plain
+	// `scrollTop` preservation isn't enough — when new LLM calls land on the
+	// focused card (or any card above the user's viewport), absolute pixel
+	// positions shift downward and the user ends up looking at a different
+	// card. Anchor the restore to whichever card is currently closest to the
+	// top of the viewport, then snap that same card back to the same offset
+	// after the rebuild.
+	const bodyRectTop = treeModalBodyEl.getBoundingClientRect().top;
+	let anchorId = null;
+	let anchorOffset = 0;
+	for (const card of treeModalBodyEl.querySelectorAll(".tm-card")) {
+		const r = card.getBoundingClientRect();
+		const offset = r.top - bodyRectTop;
+		// Pick the first card whose top is at or below the viewport top — that's
+		// the one the user is reading. Bail once we pass it; cards lower down
+		// can't be a better anchor.
+		if (offset >= -2) {
+			anchorId = card.dataset.id;
+			anchorOffset = offset;
+			break;
+		}
+	}
+	treeModalBodyEl.innerHTML = "";
 
-  if (treeNodes.size === 0) {
-    const empty = document.createElement("div");
-    empty.className = "tm-empty";
-    empty.textContent = "no nodes yet — start a run to populate observability";
-    treeModalBodyEl.appendChild(empty);
-    return;
-  }
+	if (treeNodes.size === 0) {
+		const empty = document.createElement("div");
+		empty.className = "tm-empty";
+		empty.textContent =
+			"no nodes yet — start a run to populate observability";
+		treeModalBodyEl.appendChild(empty);
+		return;
+	}
 
-  const focusId = modalFocusId();
-  if (!focusId) {
-    const empty = document.createElement("div");
-    empty.className = "tm-empty";
-    empty.textContent = "no focused node — click a node in the sidebar tree";
-    treeModalBodyEl.appendChild(empty);
-    return;
-  }
-  const focusNode = treeNodes.get(focusId);
-  if (!focusNode) return;
+	const focusId = modalFocusId();
+	if (!focusId) {
+		const empty = document.createElement("div");
+		empty.className = "tm-empty";
+		empty.textContent =
+			"no focused node — click a node in the sidebar tree";
+		treeModalBodyEl.appendChild(empty);
+		return;
+	}
+	const focusNode = treeNodes.get(focusId);
+	if (!focusNode) return;
 
-  const ancestors = ancestorChain(focusId); // root → ... → parent
-  const descendants = descendantsDFS(focusId); // [[node, depth], ...]
+	const ancestors = ancestorChain(focusId); // root → ... → parent
+	const descendants = descendantsDFS(focusId); // [[node, depth], ...]
 
-  const q = treeModalQuery.trim().toLowerCase();
+	const q = treeModalQuery.trim().toLowerCase();
 
-  // Header strip: shows the active focus path so the user has a breadcrumb
-  // back to the root even when the ancestors section is collapsed.
-  const breadcrumb = document.createElement("div");
-  breadcrumb.className = "tm-obs-breadcrumb";
-  const crumbLabel = document.createElement("span");
-  crumbLabel.className = "tm-obs-crumb-label";
-  crumbLabel.textContent = "path:";
-  breadcrumb.appendChild(crumbLabel);
-  const chain = [...ancestors, focusNode];
-  chain.forEach((n, i) => {
-    if (i > 0) {
-      const sep = document.createElement("span");
-      sep.className = "tm-obs-crumb-sep";
-      sep.textContent = "›";
-      breadcrumb.appendChild(sep);
-    }
-    const link = document.createElement("a");
-    link.className = `tm-obs-crumb ${n.kind ?? "zone"}${n.id === focusId ? " current" : ""}`;
-    link.textContent = n.id;
-    link.addEventListener("click", (ev) => {
-      ev.preventDefault();
-      focusModalOn(n.id);
-    });
-    breadcrumb.appendChild(link);
-  });
-  treeModalBodyEl.appendChild(breadcrumb);
+	// Header strip: shows the active focus path so the user has a breadcrumb
+	// back to the root even when the ancestors section is collapsed.
+	const breadcrumb = document.createElement("div");
+	breadcrumb.className = "tm-obs-breadcrumb";
+	const crumbLabel = document.createElement("span");
+	crumbLabel.className = "tm-obs-crumb-label";
+	crumbLabel.textContent = "path:";
+	breadcrumb.appendChild(crumbLabel);
+	const chain = [...ancestors, focusNode];
+	chain.forEach((n, i) => {
+		if (i > 0) {
+			const sep = document.createElement("span");
+			sep.className = "tm-obs-crumb-sep";
+			sep.textContent = "›";
+			breadcrumb.appendChild(sep);
+		}
+		const link = document.createElement("a");
+		link.className = `tm-obs-crumb ${n.kind ?? "zone"}${n.id === focusId ? " current" : ""}`;
+		link.textContent = n.id;
+		link.addEventListener("click", (ev) => {
+			ev.preventDefault();
+			focusModalOn(n.id);
+		});
+		breadcrumb.appendChild(link);
+	});
+	treeModalBodyEl.appendChild(breadcrumb);
 
-  // Ancestors block — collapsed by default per-card.
-  if (ancestors.length > 0) {
-    treeModalBodyEl.appendChild(renderModalSectionHeading(
-      "ancestors",
-      ancestors.length,
-      "every LLM call that shaped the chain from root → focus",
-    ));
-    for (const a of ancestors) {
-      if (q && !nodeMatchesQuery(a, q)) continue;
-      treeModalBodyEl.appendChild(renderObsCard(a, { role: "ancestor", depth: 0 }));
-    }
-  }
+	// Ancestors block — collapsed by default per-card.
+	if (ancestors.length > 0) {
+		treeModalBodyEl.appendChild(
+			renderModalSectionHeading(
+				"ancestors",
+				ancestors.length,
+				"every LLM call that shaped the chain from root → focus",
+			),
+		);
+		for (const a of ancestors) {
+			if (q && !nodeMatchesQuery(a, q)) continue;
+			treeModalBodyEl.appendChild(
+				renderObsCard(a, { role: "ancestor", depth: 0 }),
+			);
+		}
+	}
 
-  // Focus block.
-  treeModalBodyEl.appendChild(renderModalSectionHeading(
-    "focused node",
-    1,
-    "every LLM call captured for this node, expanded",
-  ));
-  treeModalBodyEl.appendChild(renderObsCard(focusNode, { role: "focus", depth: 0 }));
+	// Focus block.
+	treeModalBodyEl.appendChild(
+		renderModalSectionHeading(
+			"focused node",
+			1,
+			"every LLM call captured for this node, expanded",
+		),
+	);
+	treeModalBodyEl.appendChild(
+		renderObsCard(focusNode, { role: "focus", depth: 0 }),
+	);
 
-  // Descendants block.
-  if (descendants.length > 0) {
-    treeModalBodyEl.appendChild(renderModalSectionHeading(
-      "descendants",
-      descendants.length,
-      "indented by depth from focus",
-    ));
-    for (const [d, depth] of descendants) {
-      if (q && !nodeMatchesQuery(d, q)) continue;
-      treeModalBodyEl.appendChild(renderObsCard(d, { role: "descendant", depth }));
-    }
-  }
+	// Descendants block.
+	if (descendants.length > 0) {
+		treeModalBodyEl.appendChild(
+			renderModalSectionHeading(
+				"descendants",
+				descendants.length,
+				"indented by depth from focus",
+			),
+		);
+		for (const [d, depth] of descendants) {
+			if (q && !nodeMatchesQuery(d, q)) continue;
+			treeModalBodyEl.appendChild(
+				renderObsCard(d, { role: "descendant", depth }),
+			);
+		}
+	}
 
-  if (anchorId) {
-    const target = treeModalBodyEl.querySelector(
-      `.tm-card[data-id="${CSS.escape(anchorId)}"]`,
-    );
-    if (target) {
-      const newOffset = target.getBoundingClientRect().top
-        - treeModalBodyEl.getBoundingClientRect().top;
-      treeModalBodyEl.scrollTop += (newOffset - anchorOffset);
-    }
-  }
+	if (anchorId) {
+		const target = treeModalBodyEl.querySelector(
+			`.tm-card[data-id="${CSS.escape(anchorId)}"]`,
+		);
+		if (target) {
+			const newOffset =
+				target.getBoundingClientRect().top -
+				treeModalBodyEl.getBoundingClientRect().top;
+			treeModalBodyEl.scrollTop += newOffset - anchorOffset;
+		}
+	}
 }
 
 treeExpandEl?.addEventListener("click", (ev) => {
-  ev.stopPropagation(); // don't toggle the tree-header collapse
-  openTreeModal();
+	ev.stopPropagation(); // don't toggle the tree-header collapse
+	openTreeModal();
 });
 treeModalCloseEl?.addEventListener("click", closeTreeModal);
 treeModalEl?.addEventListener("click", (ev) => {
-  if (ev.target === treeModalEl) closeTreeModal();
+	if (ev.target === treeModalEl) closeTreeModal();
 });
 treeModalSearchEl?.addEventListener("input", () => {
-  treeModalQuery = treeModalSearchEl.value;
-  renderTreeModal();
+	treeModalQuery = treeModalSearchEl.value;
+	renderTreeModal();
 });
 window.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && treeModalOpen) {
-    if (document.activeElement === treeModalSearchEl && treeModalSearchEl.value) {
-      treeModalSearchEl.value = "";
-      treeModalQuery = "";
-      renderTreeModal();
-      return;
-    }
-    closeTreeModal();
-  }
+	if (ev.key === "Escape" && treeModalOpen) {
+		if (
+			document.activeElement === treeModalSearchEl &&
+			treeModalSearchEl.value
+		) {
+			treeModalSearchEl.value = "";
+			treeModalQuery = "";
+			renderTreeModal();
+			return;
+		}
+		closeTreeModal();
+	}
 });
 
 function positionTooltip(clientX, clientY, id) {
-  const node = treeNodes.get(id);
-  const kind = node?.kind ?? "zone";
-  const kindColor = TOOLTIP_KIND_COLOR[kind] ?? "#e6e6e6";
+	const node = treeNodes.get(id);
+	const kind = node?.kind ?? "zone";
+	const kindColor = TOOLTIP_KIND_COLOR[kind] ?? "#e6e6e6";
 
-  // Build with DOM nodes rather than innerHTML so the prompt (LLM-authored
-  // text) can't smuggle markup into the tooltip.
-  tooltip.textContent = "";
-  const head = document.createElement("div");
-  const kindEl = document.createElement("span");
-  kindEl.textContent = `[${kind}]`;
-  kindEl.style.color = kindColor;
-  head.appendChild(kindEl);
-  head.appendChild(document.createTextNode(` ${id}`));
-  tooltip.appendChild(head);
+	// Build with DOM nodes rather than innerHTML so the prompt (LLM-authored
+	// text) can't smuggle markup into the tooltip.
+	tooltip.textContent = "";
+	const head = document.createElement("div");
+	const kindEl = document.createElement("span");
+	kindEl.textContent = `[${kind}]`;
+	kindEl.style.color = kindColor;
+	head.appendChild(kindEl);
+	head.appendChild(document.createTextNode(` ${id}`));
+	tooltip.appendChild(head);
 
-  // Sections: each carries a small label so the user can tell which prompt
-  // came from which pipeline step. Order is "earliest in the pipeline first"
-  // so reading top-to-bottom matches the order of LLM rewrites.
-  //   seed  — zone_decompose / object_decomp output (what the LLM was given
-  //           as the brief for this node)
-  //   plan  — zone_plan output (zones only)
-  //   image — image-prompt noun phrase actually sent to Banana+Trellis
-  //           (objects/frames only, once generated)
-  const sections = [];
-  if (node?.prompt) sections.push(["seed", node.prompt]);
-  if (kind === "zone" && node?.plan) sections.push(["plan", node.plan]);
-  if (kind !== "zone" && node?.imagePrompt && node.imagePrompt !== node.prompt) {
-    sections.push(["image", node.imagePrompt]);
-  }
-  for (const [label, text] of sections) {
-    const row = document.createElement("div");
-    row.style.marginTop = "4px";
-    row.style.color = "#bdbdbd";
-    const lbl = document.createElement("span");
-    lbl.textContent = `${label}: `;
-    lbl.style.color = "#7a8190";
-    row.appendChild(lbl);
-    row.appendChild(document.createTextNode(text));
-    tooltip.appendChild(row);
-  }
+	// Sections: each carries a small label so the user can tell which prompt
+	// came from which pipeline step. Order is "earliest in the pipeline first"
+	// so reading top-to-bottom matches the order of LLM rewrites.
+	//   seed  — zone_decompose / object_decomp output (what the LLM was given
+	//           as the brief for this node)
+	//   plan  — zone_plan output (zones only)
+	//   image — image-prompt noun phrase actually sent to Banana+Trellis
+	//           (objects/frames only, once generated)
+	const sections = [];
+	if (node?.prompt) sections.push(["seed", node.prompt]);
+	if (kind === "zone" && node?.plan) sections.push(["plan", node.plan]);
+	if (
+		kind !== "zone" &&
+		node?.imagePrompt &&
+		node.imagePrompt !== node.prompt
+	) {
+		sections.push(["image", node.imagePrompt]);
+	}
+	for (const [label, text] of sections) {
+		const row = document.createElement("div");
+		row.style.marginTop = "4px";
+		row.style.color = "#bdbdbd";
+		const lbl = document.createElement("span");
+		lbl.textContent = `${label}: `;
+		lbl.style.color = "#7a8190";
+		row.appendChild(lbl);
+		row.appendChild(document.createTextNode(text));
+		tooltip.appendChild(row);
+	}
 
-  // Flip left/up when the tooltip would overflow the viewport so the cursor
-  // can keep approaching the hovered bbox from any direction.
-  tooltip.style.display = "block";
-  tooltip.style.left = "0px";
-  tooltip.style.top = "0px";
-  const w = tooltip.offsetWidth;
-  const h = tooltip.offsetHeight;
-  const pad = 12;
-  let x = clientX + pad;
-  let y = clientY + pad;
-  if (x + w > window.innerWidth) x = clientX - pad - w;
-  if (y + h > window.innerHeight) y = clientY - pad - h;
-  tooltip.style.left = `${Math.max(0, x)}px`;
-  tooltip.style.top = `${Math.max(0, y)}px`;
+	// Flip left/up when the tooltip would overflow the viewport so the cursor
+	// can keep approaching the hovered bbox from any direction.
+	tooltip.style.display = "block";
+	tooltip.style.left = "0px";
+	tooltip.style.top = "0px";
+	const w = tooltip.offsetWidth;
+	const h = tooltip.offsetHeight;
+	const pad = 12;
+	let x = clientX + pad;
+	let y = clientY + pad;
+	if (x + w > window.innerWidth) x = clientX - pad - w;
+	if (y + h > window.innerHeight) y = clientY - pad - h;
+	tooltip.style.left = `${Math.max(0, x)}px`;
+	tooltip.style.top = `${Math.max(0, y)}px`;
 }
 
 // Mesh-based picking: raycast against actual geometry the user sees —
@@ -3450,25 +4486,25 @@ function positionTooltip(clientX, clientY, id) {
 // be selected from the tree (or via zone-mode picking, below).
 const _pickRoots = [];
 function pickHoveredBboxId() {
-  if (selectMode === "zones") return pickHoveredZoneBboxId();
-  _pickRoots.length = 0;
-  for (const model of modelsById.values()) {
-    if (model.visible) _pickRoots.push(model);
-  }
-  for (const fill of solidFills.values()) {
-    if (fill.visible) _pickRoots.push(fill);
-  }
-  if (_pickRoots.length === 0) return null;
-  const hits = raycaster.intersectObjects(_pickRoots, true);
-  for (const hit of hits) {
-    let node = hit.object;
-    while (node) {
-      const pid = node.userData?.pickId;
-      if (pid != null && !effectivelyHidden(pid)) return pid;
-      node = node.parent;
-    }
-  }
-  return null;
+	if (selectMode === "zones") return pickHoveredZoneBboxId();
+	_pickRoots.length = 0;
+	for (const model of modelsById.values()) {
+		if (model.visible) _pickRoots.push(model);
+	}
+	for (const fill of solidFills.values()) {
+		if (fill.visible) _pickRoots.push(fill);
+	}
+	if (_pickRoots.length === 0) return null;
+	const hits = raycaster.intersectObjects(_pickRoots, true);
+	for (const hit of hits) {
+		let node = hit.object;
+		while (node) {
+			const pid = node.userData?.pickId;
+			if (pid != null && !effectivelyHidden(pid)) return pid;
+			node = node.parent;
+		}
+	}
+	return null;
 }
 
 // Zone-only picker. Zones nest (children fit inside their parent and
@@ -3478,20 +4514,20 @@ function pickHoveredBboxId() {
 const _zoneHit = new THREE.Vector3();
 const _zoneSize = new THREE.Vector3();
 function pickHoveredZoneBboxId() {
-  let bestId = null;
-  let bestVol = Infinity;
-  for (const [id, helper] of bboxes) {
-    if (helper.userData.nodeKind !== "zone") continue;
-    if (effectivelyHidden(id)) continue;
-    if (!raycaster.ray.intersectBox(helper.box, _zoneHit)) continue;
-    helper.box.getSize(_zoneSize);
-    const vol = _zoneSize.x * _zoneSize.y * _zoneSize.z;
-    if (vol < bestVol) {
-      bestVol = vol;
-      bestId = id;
-    }
-  }
-  return bestId;
+	let bestId = null;
+	let bestVol = Infinity;
+	for (const [id, helper] of bboxes) {
+		if (helper.userData.nodeKind !== "zone") continue;
+		if (effectivelyHidden(id)) continue;
+		if (!raycaster.ray.intersectBox(helper.box, _zoneHit)) continue;
+		helper.box.getSize(_zoneSize);
+		const vol = _zoneSize.x * _zoneSize.y * _zoneSize.z;
+		if (vol < bestVol) {
+			bestVol = vol;
+			bestId = id;
+		}
+	}
+	return bestId;
 }
 
 // Right-click picker. Tries the mesh picker first, then falls back to a
@@ -3501,38 +4537,40 @@ function pickHoveredZoneBboxId() {
 // be able to click on the bbox to un-hide.
 const _rightClickBoxHit = new THREE.Vector3();
 function pickRightClickId() {
-  const meshId = pickHoveredBboxId();
-  if (meshId !== null) return meshId;
-  let bestId = null;
-  let bestDist = Infinity;
-  for (const [id, helper] of bboxes) {
-    if (!helper.visible) continue;
-    // In zone-only mode the bbox fallback must also stay zone-restricted —
-    // otherwise right-clicking past a zone hit would hide a non-zone the
-    // user can't even select via left-click.
-    if (selectMode === "zones" && helper.userData.nodeKind !== "zone") continue;
-    if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit)) continue;
-    const dist = _rightClickBoxHit.distanceToSquared(camera.position);
-    if (dist < bestDist) {
-      bestDist = dist;
-      bestId = id;
-    }
-  }
-  return bestId;
+	const meshId = pickHoveredBboxId();
+	if (meshId !== null) return meshId;
+	let bestId = null;
+	let bestDist = Infinity;
+	for (const [id, helper] of bboxes) {
+		if (!helper.visible) continue;
+		// In zone-only mode the bbox fallback must also stay zone-restricted —
+		// otherwise right-clicking past a zone hit would hide a non-zone the
+		// user can't even select via left-click.
+		if (selectMode === "zones" && helper.userData.nodeKind !== "zone")
+			continue;
+		if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit))
+			continue;
+		const dist = _rightClickBoxHit.distanceToSquared(camera.position);
+		if (dist < bestDist) {
+			bestDist = dist;
+			bestId = id;
+		}
+	}
+	return bestId;
 }
 
 renderer.domElement.addEventListener("pointermove", (ev) => {
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-  lastPointerClientX = ev.clientX;
-  lastPointerClientY = ev.clientY;
-  pointerDirty = true;
+	const rect = renderer.domElement.getBoundingClientRect();
+	pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+	pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+	lastPointerClientX = ev.clientX;
+	lastPointerClientY = ev.clientY;
+	pointerDirty = true;
 });
 
 renderer.domElement.addEventListener("pointerleave", () => {
-  setHoveredBbox(null);
-  tooltip.style.display = "none";
+	setHoveredBbox(null);
+	tooltip.style.display = "none";
 });
 
 // Click-to-select on the canvas. OrbitControls also listens for pointerdown
@@ -3548,34 +4586,37 @@ let _downT = 0;
 let _downButton = -1;
 
 renderer.domElement.addEventListener("pointerdown", (ev) => {
-  _downX = ev.clientX;
-  _downY = ev.clientY;
-  _downT = performance.now();
-  _downButton = ev.button;
+	_downX = ev.clientX;
+	_downY = ev.clientY;
+	_downT = performance.now();
+	_downButton = ev.button;
 });
 
 renderer.domElement.addEventListener("pointerup", (ev) => {
-  if (_downButton !== 0 || ev.button !== 0) return; // left-click only
-  const dx = ev.clientX - _downX;
-  const dy = ev.clientY - _downY;
-  const dt = performance.now() - _downT;
-  if (Math.hypot(dx, dy) > CLICK_MAX_MOVE_PX || dt > CLICK_MAX_DURATION_MS) return;
+	if (_downButton !== 0 || ev.button !== 0) return; // left-click only
+	const dx = ev.clientX - _downX;
+	const dy = ev.clientY - _downY;
+	const dt = performance.now() - _downT;
+	if (Math.hypot(dx, dy) > CLICK_MAX_MOVE_PX || dt > CLICK_MAX_DURATION_MS)
+		return;
 
-  // Reuse the hover picker so selecting matches whatever the hover
-  // tooltip is showing.
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const id = pickHoveredBboxId();
-  if (id !== null) {
-    selectTreeNode(id);
-    // Scroll the corresponding tree row into view so the link between the
-    // 3D click and the (now-open) detail panel is obvious if the user closes
-    // the detail view.
-    const row = treeBodyEl.querySelector(`.tree-node[data-id="${CSS.escape(id)}"]`);
-    if (row) row.scrollIntoView({ block: "nearest" });
-  }
+	// Reuse the hover picker so selecting matches whatever the hover
+	// tooltip is showing.
+	const rect = renderer.domElement.getBoundingClientRect();
+	pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+	pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+	raycaster.setFromCamera(pointer, camera);
+	const id = pickHoveredBboxId();
+	if (id !== null) {
+		selectTreeNode(id);
+		// Scroll the corresponding tree row into view so the link between the
+		// 3D click and the (now-open) detail panel is obvious if the user closes
+		// the detail view.
+		const row = treeBodyEl.querySelector(
+			`.tree-node[data-id="${CSS.escape(id)}"]`,
+		);
+		if (row) row.scrollIntoView({ block: "nearest" });
+	}
 });
 
 // Right-click toggles per-node hide for the picked id — same Set as the
@@ -3583,13 +4624,13 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
 // disappears, the bbox stays as a volumetric reference and as the click
 // target for un-hiding. Suppresses the browser's default context menu.
 renderer.domElement.addEventListener("contextmenu", (ev) => {
-  ev.preventDefault();
-  const rect = renderer.domElement.getBoundingClientRect();
-  pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-  pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-  raycaster.setFromCamera(pointer, camera);
-  const id = pickRightClickId();
-  if (id !== null) toggleNodeHidden(id);
+	ev.preventDefault();
+	const rect = renderer.domElement.getBoundingClientRect();
+	pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
+	pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
+	raycaster.setFromCamera(pointer, camera);
+	const id = pickRightClickId();
+	if (id !== null) toggleNodeHidden(id);
 });
 
 // --- event dispatch ---------------------------------------------------------
@@ -3611,125 +4652,145 @@ let highestEventIndex = -1;
 const recordedEvents = [];
 
 function dispatch(event) {
-  if (typeof event.index === "number") {
-    if (event.index <= highestEventIndex) return;
-    highestEventIndex = event.index;
-  }
-  recordedEvents.push(event);
-  updateReplayButton();
-  appendEvent(event);
-  switch (event.kind) {
-    case "run.start":
-      setStatus(`run :: ${event.model}`);
-      break;
-    case "run.done":
-      runFinished = true;
-      if (meshErrors.size > 0) showRunCompleteWithErrors();
-      else setStatus("run complete");
-      if (currentSource) { currentSource.close(); currentSource = null; }
-      refreshSlots();
-      break;
-    case "run.error":
-      runFinished = true;
-      setStatus(`error: ${event.message}`, "err");
-      if (currentSource) { currentSource.close(); currentSource = null; }
-      refreshSlots();
-      break;
-    case "run.paused":
-      runFinished = true;
-      setStatus("paused");
-      if (currentSource) { currentSource.close(); currentSource = null; }
-      refreshSlots();
-      break;
-    case "mesh.error":
-      // Surface the failure: track for the run.done summary, paint the
-      // tree node + asset card as errored so users see it without grepping
-      // the log panel.
-      retryingIds.delete(event.id);
-      meshErrors.set(event.id, event.message ?? "unknown error");
-      treeSetPhase(event.id, "error");
-      upsertAsset(event.id, { status: "error", errorMessage: event.message });
-      refreshPostRunStatus();
-      break;
-    case "mesh.retry":
-      // Server-side retry kickoff. The user may have triggered it from
-      // *this* client (retryingIds already set) or another tab; either
-      // way, clear the prior error state so the asset/tree both flip back
-      // to in-flight and the retry button greys out.
-      retryingIds.add(event.id);
-      meshErrors.delete(event.id);
-      upsertAsset(event.id, { status: "pending", errorMessage: null });
-      if (treeNodes.has(event.id)) treeSetPhase(event.id, "generating_mesh");
-      refreshPostRunStatus();
-      break;
-    case "bbox":
-      loadBbox(event);
-      treeUpsert(event.id, {
-        parentId: event.parent_id ?? null,
-        prompt: event.prompt ?? null,
-        kind: event.node_kind ?? "zone",
-        origin: event.origin,
-        dimensions: event.dimensions,
-        proxyShape: event.proxy_shape ?? null,
-      });
-      scheduleRenderTree();
-      if (event.id === selectedBboxId) renderTreeDetail();
-      break;
-    case "divider.decompose":
-    case "divider.zone_decompose":
-      // Pre-declare children so the tree shows them (in pending state) before
-      // their bboxes resolve. Use the child's structural parent when present;
-      // sibling-parented zones should not be shown under the emitting node.
-      for (const c of event.children ?? []) {
-        treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
-      }
-      scheduleRenderTree();
-      break;
-    case "divider.zone_plan":
-      // Stash the authored zone plan on the node so the tooltip can surface
-      // it. The plan often arrives before the bbox is resolved, so upsert
-      // (which tolerates a half-formed node) rather than gating on existence.
-      if (event.node && typeof event.plan === "string") {
-        treeUpsert(event.node, { plan: event.plan });
-        if (event.node === selectedBboxId) renderTreeDetail();
-      }
-      break;
-    case "step":
-      treeSetPhase(event.node, event.phase);
-      break;
-    case "mesh.submit":
-      // Object mesh generation kicked off — show it on the tree.
-      treeSetPhase(event.id, "generating_mesh");
-      break;
-    case "image":
-      upsertAsset(event.id, { imageUrl: event.url, prompt: event.prompt });
-      // Image-prompt noun phrase (post-rewrite) — distinct from the seed
-      // prompt stored on the bbox event. Tooltip + detail panel show both.
-      if (typeof event.prompt === "string") {
-        treeUpsert(event.id, { imagePrompt: event.prompt });
-        if (event.id === selectedBboxId) renderTreeDetail();
-      }
-      break;
-    case "model":
-      loadModel(event);
-      treeSetPhase(event.id, "done");
-      retryingIds.delete(event.id);
-      // A `model` event for this id is proof the mesh exists now, so any
-      // prior `mesh.error` for the same id is stale. Without this clear,
-      // snapshot replay (where a past error then a later success both
-      // appear in the recorded log) leaves `meshErrors` permanently
-      // overcounted — the tree shows `done` but the run-complete summary
-      // still reads "N meshes failed". Equally applies to in-pipeline
-      // recoveries that ship a `model` without a preceding `mesh.retry`.
-      meshErrors.delete(event.id);
-      if (event.id === selectedBboxId) renderTreeDetail();
-      refreshPostRunStatus();
-      break;
-    case "cache.llm":
-      recordLlmCall(event);
-      break;
-    // Everything else is already shown as a log line above.
-  }
+	if (typeof event.index === "number") {
+		if (event.index <= highestEventIndex) return;
+		highestEventIndex = event.index;
+	}
+	recordedEvents.push(event);
+	updateReplayButton();
+	appendEvent(event);
+	switch (event.kind) {
+		case "run.start":
+			setStatus(`run :: ${event.model}`);
+			break;
+		case "run.done":
+			runFinished = true;
+			if (meshErrors.size > 0) showRunCompleteWithErrors();
+			else setStatus("run complete");
+			if (currentSource) {
+				currentSource.close();
+				currentSource = null;
+			}
+			refreshSlots();
+			break;
+		case "run.error":
+			runFinished = true;
+			setStatus(`error: ${event.message}`, "err");
+			if (currentSource) {
+				currentSource.close();
+				currentSource = null;
+			}
+			refreshSlots();
+			break;
+		case "run.paused":
+			runFinished = true;
+			setStatus("paused");
+			if (currentSource) {
+				currentSource.close();
+				currentSource = null;
+			}
+			refreshSlots();
+			break;
+		case "mesh.error":
+			// Surface the failure: track for the run.done summary, paint the
+			// tree node + asset card as errored so users see it without grepping
+			// the log panel.
+			retryingIds.delete(event.id);
+			meshErrors.set(event.id, event.message ?? "unknown error");
+			treeSetPhase(event.id, "error");
+			upsertAsset(event.id, {
+				status: "error",
+				errorMessage: event.message,
+			});
+			refreshPostRunStatus();
+			break;
+		case "mesh.retry":
+			// Server-side retry kickoff. The user may have triggered it from
+			// *this* client (retryingIds already set) or another tab; either
+			// way, clear the prior error state so the asset/tree both flip back
+			// to in-flight and the retry button greys out.
+			retryingIds.add(event.id);
+			meshErrors.delete(event.id);
+			upsertAsset(event.id, { status: "pending", errorMessage: null });
+			if (treeNodes.has(event.id))
+				treeSetPhase(event.id, "generating_mesh");
+			refreshPostRunStatus();
+			break;
+		case "bbox":
+			loadBbox(event);
+			treeUpsert(event.id, {
+				parentId: event.parent_id ?? null,
+				prompt: event.prompt ?? null,
+				kind: event.node_kind ?? "zone",
+				origin: event.origin,
+				dimensions: event.dimensions,
+				proxyShape: event.proxy_shape ?? null,
+			});
+			scheduleRenderTree();
+			if (event.id === selectedBboxId) renderTreeDetail();
+			break;
+		case "divider.decompose":
+		case "divider.zone_decompose":
+			// Pre-declare children so the tree shows them (in pending state) before
+			// their bboxes resolve. Use the child's structural parent when present;
+			// sibling-parented zones should not be shown under the emitting node.
+			for (const c of event.children ?? []) {
+				treeUpsert(c.id, {
+					parentId: c.parent ?? event.node,
+					prompt: c.prompt,
+					kind: "zone",
+				});
+			}
+			scheduleRenderTree();
+			break;
+		case "divider.zone_plan":
+			// Stash the authored zone plan on the node so the tooltip can surface
+			// it. The plan often arrives before the bbox is resolved, so upsert
+			// (which tolerates a half-formed node) rather than gating on existence.
+			if (event.node && typeof event.plan === "string") {
+				treeUpsert(event.node, { plan: event.plan });
+				if (event.node === selectedBboxId) renderTreeDetail();
+			}
+			break;
+		case "step":
+			treeSetPhase(event.node, event.phase);
+			break;
+		case "mesh.submit":
+			// Object mesh generation kicked off — show it on the tree.
+			treeSetPhase(event.id, "generating_mesh");
+			break;
+		case "image":
+			upsertAsset(event.id, {
+				imageUrl: event.url,
+				prompt: event.prompt,
+			});
+			// Image-prompt noun phrase (post-rewrite) — distinct from the seed
+			// prompt stored on the bbox event. Tooltip + detail panel show both.
+			if (typeof event.prompt === "string") {
+				treeUpsert(event.id, { imagePrompt: event.prompt });
+				if (event.id === selectedBboxId) renderTreeDetail();
+			}
+			break;
+		case "model":
+			loadModel(event);
+			treeSetPhase(event.id, "done");
+			retryingIds.delete(event.id);
+			// A `model` event for this id is proof the mesh exists now, so any
+			// prior `mesh.error` for the same id is stale. Without this clear,
+			// snapshot replay (where a past error then a later success both
+			// appear in the recorded log) leaves `meshErrors` permanently
+			// overcounted — the tree shows `done` but the run-complete summary
+			// still reads "N meshes failed". Equally applies to in-pipeline
+			// recoveries that ship a `model` without a preceding `mesh.retry`.
+			meshErrors.delete(event.id);
+			if (event.id === selectedBboxId) renderTreeDetail();
+			refreshPostRunStatus();
+			break;
+		case "cache.llm":
+			recordLlmCall(event);
+			break;
+		// Everything else is already shown as a log line above.
+	}
 }
 
 // --- slot picker + model picker + run lifecycle ------------------------------
@@ -3739,17 +4800,11 @@ function dispatch(event) {
 // dimension closes the active SSE, clears the scene, and reconnects to that
 // cell's stream. The Trellis queue is global, so other cells stay in-flight
 // on the same Modal pool while we're looking at one of them.
-
-let currentSource = null;
-let currentSlotId = null;
-let currentModel = null;
-let currentRun = null;
-let availableModels = [];
-let availableRuns = [];  // [{name, modified_at, has_prompt_snapshot}, ...]
-let availableVersions = [];  // [{id, run_name, label, status}, ...] from GET /versions
-let defaultModelAlias = null;
-let slotSummaries = [];  // latest /slots `slots` array, for tab rendering
-let slotNeedsResume = false;
+//
+// The state these functions read/mutate (currentRun / currentSlotId /
+// currentModel / availableModels / …) is declared near the top of the module so
+// init-time code — notably the queue panel's first render — can read it without
+// hitting the temporal dead zone.
 
 // --- run tabs (multiple open run-views) -------------------------------------
 //
@@ -3759,181 +4814,188 @@ let slotNeedsResume = false;
 // click away — the natural way to A/B-compare renditions across runs. The run
 // picker, version bar, slot bar, and model picker all edit the *active* tab
 // (via syncActiveTab in switchView); openTabs persists across reloads.
-const openTabs = [];   // [{ id, run, slot, model }]
+const openTabs = []; // [{ id, run, slot, model }]
 let activeTabId = null;
 
 function currentRunInfo() {
-  const slot = slotSummaries.find((s) => s.id === currentSlotId);
-  return slot?.runs?.[currentModel] ?? null;
+	const slot = slotSummaries.find((s) => s.id === currentSlotId);
+	return slot?.runs?.[currentModel] ?? null;
 }
 
 function renderSlotTabs() {
-  for (const child of Array.from(slotBarEl.querySelectorAll(".slot-tab"))) {
-    child.remove();
-  }
-  for (const s of slotSummaries) {
-    const tab = document.createElement("button");
-    tab.type = "button";
-    tab.className = "slot-tab" + (s.id === currentSlotId ? " active" : "");
-    tab.dataset.slotId = s.id;
-    tab.title = s.prompt ?? "";
+	for (const child of Array.from(slotBarEl.querySelectorAll(".slot-tab"))) {
+		child.remove();
+	}
+	for (const s of slotSummaries) {
+		const tab = document.createElement("button");
+		tab.type = "button";
+		tab.className = "slot-tab" + (s.id === currentSlotId ? " active" : "");
+		tab.dataset.slotId = s.id;
+		tab.title = s.prompt ?? "";
 
-    const status = s.runs?.[currentModel]?.status ?? "idle";
-    const dot = document.createElement("span");
-    dot.className = `slot-dot status-${status}`;
-    tab.appendChild(dot);
+		const status = s.runs?.[currentModel]?.status ?? "idle";
+		const dot = document.createElement("span");
+		dot.className = `slot-dot status-${status}`;
+		tab.appendChild(dot);
 
-    const label = document.createElement("span");
-    label.textContent = s.id;
-    tab.appendChild(label);
+		const label = document.createElement("span");
+		label.textContent = s.id;
+		tab.appendChild(label);
 
-    tab.addEventListener("click", () => switchSlot(s.id));
-    slotBarEl.insertBefore(tab, slotBarToggleEl);
-  }
+		tab.addEventListener("click", () => switchSlot(s.id));
+		slotBarEl.insertBefore(tab, slotBarToggleEl);
+	}
 }
 
 function populateModelPicker() {
-  modelPickerEl.innerHTML = "";
-  for (const alias of availableModels) {
-    const opt = document.createElement("option");
-    opt.value = alias;
-    opt.textContent = alias;
-    modelPickerEl.appendChild(opt);
-  }
-  if (currentModel) modelPickerEl.value = currentModel;
+	modelPickerEl.innerHTML = "";
+	for (const alias of availableModels) {
+		const opt = document.createElement("option");
+		opt.value = alias;
+		opt.textContent = alias;
+		modelPickerEl.appendChild(opt);
+	}
+	if (currentModel) modelPickerEl.value = currentModel;
 }
 
 function updateResumeButton() {
-  const status = currentRunInfo()?.status;
-  resumeEl.className = "";
-  resumeEl.style.display = "none";
-  if (status === "idle") {
-    resumeEl.style.display = "";
-    resumeEl.className = "paused";
-    resumeEl.textContent = "start";
-    resumeEl.title = "Start this run";
-  } else if (status === "paused") {
-    resumeEl.style.display = "";
-    resumeEl.className = "paused";
-    resumeEl.textContent = "resume";
-    resumeEl.title = "Resume the interrupted run";
-  } else if (status === "error") {
-    resumeEl.style.display = "";
-    resumeEl.className = "error";
-    resumeEl.textContent = "retry";
-    resumeEl.title = "Retry the failed run";
-  } else if (status === "running") {
-    resumeEl.style.display = "";
-    resumeEl.className = "running";
-    resumeEl.textContent = "pause";
-    resumeEl.title = "Pause this run";
-  } else if (slotNeedsResume && currentSlotId !== null && currentModel !== null) {
-    slotNeedsResume = false;
-    subscribe(slotEventsUrl(currentSlotId, currentModel));
-  }
+	const status = currentRunInfo()?.status;
+	resumeEl.className = "";
+	resumeEl.style.display = "none";
+	if (status === "idle") {
+		resumeEl.style.display = "";
+		resumeEl.className = "paused";
+		resumeEl.textContent = "start";
+		resumeEl.title = "Start this run";
+	} else if (status === "paused") {
+		resumeEl.style.display = "";
+		resumeEl.className = "paused";
+		resumeEl.textContent = "resume";
+		resumeEl.title = "Resume the interrupted run";
+	} else if (status === "error") {
+		resumeEl.style.display = "";
+		resumeEl.className = "error";
+		resumeEl.textContent = "retry";
+		resumeEl.title = "Retry the failed run";
+	} else if (status === "running") {
+		resumeEl.style.display = "";
+		resumeEl.className = "running";
+		resumeEl.textContent = "pause";
+		resumeEl.title = "Pause this run";
+	} else if (
+		slotNeedsResume &&
+		currentSlotId !== null &&
+		currentModel !== null
+	) {
+		slotNeedsResume = false;
+		subscribe(slotEventsUrl(currentSlotId, currentModel));
+	}
 }
 
 async function refreshSlots() {
-  try {
-    // Scope the status poll to OUR viewed run. Every cell request is
-    // run-scoped now, so we must ask for this version's statuses explicitly
-    // rather than whatever run happens to be the server's last-activated
-    // global — otherwise another tab/version flips our dots out from under us.
-    const url = new URL("/slots", SERVER_URL);
-    if (currentRun) url.searchParams.set("run", currentRun);
-    const res = await fetch(url);
-    if (!res.ok) return;
-    const payload = await res.json();
-    availableModels = payload.models ?? [];
-    defaultModelAlias = payload.default_model ?? availableModels[0] ?? null;
-    slotSummaries = payload.slots ?? [];
-    if (payload.run && !currentRun) {
-      // First load only: adopt the server's default run. We never *steal* a
-      // run another client activated — requests are run-scoped, so a global
-      // flip elsewhere no longer means our view should follow it.
-      currentRun = payload.run;
-      if (runPickerEl.value !== currentRun) runPickerEl.value = currentRun;
-    }
-    // Re-populate the picker if the model list changed (or this is the
-    // first refresh). Cheap to redo every tick — the <option>s are flat.
-    if (modelPickerEl.options.length !== availableModels.length) {
-      populateModelPicker();
-    }
-    renderSlotTabs();
-    updateResumeButton();
-  } catch {
-    // Transient; next tick will retry.
-  }
+	try {
+		// Scope the status poll to OUR viewed run. Every cell request is
+		// run-scoped now, so we must ask for this version's statuses explicitly
+		// rather than whatever run happens to be the server's last-activated
+		// global — otherwise another tab/version flips our dots out from under us.
+		const url = new URL("/slots", SERVER_URL);
+		if (currentRun) url.searchParams.set("run", currentRun);
+		const res = await fetch(url);
+		if (!res.ok) return;
+		const payload = await res.json();
+		availableModels = payload.models ?? [];
+		defaultModelAlias = payload.default_model ?? availableModels[0] ?? null;
+		slotSummaries = payload.slots ?? [];
+		if (payload.run && !currentRun) {
+			// First load only: adopt the server's default run. We never *steal* a
+			// run another client activated — requests are run-scoped, so a global
+			// flip elsewhere no longer means our view should follow it.
+			currentRun = payload.run;
+			if (runPickerEl.value !== currentRun)
+				runPickerEl.value = currentRun;
+		}
+		// Re-populate the picker if the model list changed (or this is the
+		// first refresh). Cheap to redo every tick — the <option>s are flat.
+		if (modelPickerEl.options.length !== availableModels.length) {
+			populateModelPicker();
+		}
+		renderSlotTabs();
+		updateResumeButton();
+	} catch {
+		// Transient; next tick will retry.
+	}
 }
 
 function populateRunPicker() {
-  runPickerEl.innerHTML = "";
-  for (const r of availableRuns) {
-    const opt = document.createElement("option");
-    opt.value = r.name;
-    opt.textContent = r.has_prompt_snapshot ? r.name : `${r.name} (no snapshot)`;
-    runPickerEl.appendChild(opt);
-  }
-  if (currentRun) runPickerEl.value = currentRun;
+	runPickerEl.innerHTML = "";
+	for (const r of availableRuns) {
+		const opt = document.createElement("option");
+		opt.value = r.name;
+		opt.textContent = r.has_prompt_snapshot
+			? r.name
+			: `${r.name} (no snapshot)`;
+		runPickerEl.appendChild(opt);
+	}
+	if (currentRun) runPickerEl.value = currentRun;
 }
 
 async function refreshRuns() {
-  try {
-    const res = await fetch(new URL("/runs", SERVER_URL));
-    if (!res.ok) return;
-    const payload = await res.json();
-    availableRuns = payload.runs ?? [];
-    if (!currentRun) currentRun = payload.current ?? null;
-    populateRunPicker();
-  } catch {
-    // Transient; next tick will retry.
-  }
+	try {
+		const res = await fetch(new URL("/runs", SERVER_URL));
+		if (!res.ok) return;
+		const payload = await res.json();
+		availableRuns = payload.runs ?? [];
+		if (!currentRun) currentRun = payload.current ?? null;
+		populateRunPicker();
+	} catch {
+		// Transient; next tick will retry.
+	}
 }
 
 function resetClientStateForRunSwitch() {
-  // Switching to a different run means every cached scene/log/asset/tree
-  // entry is stale — they belong to the prior run's (slot, model) cells.
-  // Tear down before we refetch slots and re-subscribe.
-  if (currentSource) {
-    currentSource.close();
-    currentSource = null;
-  }
-  clearScene();
-  clearLog();
-  clearAssets();
-  treeClear();
-  clearMeshErrors();
-  highestEventIndex = -1;
-  recordedEvents.length = 0;
-  updateReplayButton();
+	// Switching to a different run means every cached scene/log/asset/tree
+	// entry is stale — they belong to the prior run's (slot, model) cells.
+	// Tear down before we refetch slots and re-subscribe.
+	if (currentSource) {
+		currentSource.close();
+		currentSource = null;
+	}
+	clearScene();
+	clearLog();
+	clearAssets();
+	treeClear();
+	clearMeshErrors();
+	highestEventIndex = -1;
+	recordedEvents.length = 0;
+	updateReplayButton();
 }
 
 async function switchRun(name) {
-  if (!name || name === currentRun) return;
-  runPickerEl.disabled = true;
-  try {
-    const res = await fetch(
-      new URL(`/runs/${encodeURIComponent(name)}/activate`, SERVER_URL),
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      setStatus(`run switch failed: HTTP ${res.status}`, "err");
-      // Snap the picker back to whatever the server still thinks is active.
-      if (currentRun) runPickerEl.value = currentRun;
-      return;
-    }
-    currentRun = name;
-    setStatus(`run :: ${name}`);
-    resetClientStateForRunSwitch();
-    await refreshSlots();
-    if (currentSlotId && currentModel) {
-      // Re-render the same (slot, model) selection, now backed by the new
-      // run's events.jsonl + idle/paused/done state.
-      switchView(currentSlotId, currentModel);
-    }
-  } finally {
-    runPickerEl.disabled = false;
-  }
+	if (!name || name === currentRun) return;
+	runPickerEl.disabled = true;
+	try {
+		const res = await fetch(
+			new URL(`/runs/${encodeURIComponent(name)}/activate`, SERVER_URL),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			setStatus(`run switch failed: HTTP ${res.status}`, "err");
+			// Snap the picker back to whatever the server still thinks is active.
+			if (currentRun) runPickerEl.value = currentRun;
+			return;
+		}
+		currentRun = name;
+		setStatus(`run :: ${name}`);
+		resetClientStateForRunSwitch();
+		await refreshSlots();
+		if (currentSlotId && currentModel) {
+			// Re-render the same (slot, model) selection, now backed by the new
+			// run's events.jsonl + idle/paused/done state.
+			switchView(currentSlotId, currentModel);
+		}
+	} finally {
+		runPickerEl.disabled = false;
+	}
 }
 
 // --- pipeline versions (V1/V2/V3) -------------------------------------------
@@ -3946,228 +5008,238 @@ async function switchRun(name) {
 // version's cell status for the viewed (slot, model).
 
 function renderVersionBar() {
-  versionBarEl.innerHTML = "";
-  for (const v of availableVersions) {
-    const tab = document.createElement("button");
-    tab.type = "button";
-    tab.className = "version-tab" + (v.run_name === currentRun ? " active" : "");
-    tab.title = `${v.label} — run "${v.run_name}"`;
-    const dot = document.createElement("span");
-    dot.className = `slot-dot status-${v.status ?? "idle"}`;
-    tab.appendChild(dot);
-    const label = document.createElement("span");
-    label.textContent = v.label;
-    tab.appendChild(label);
-    tab.addEventListener("click", () => selectVersion(v.run_name));
-    versionBarEl.appendChild(tab);
-  }
+	versionBarEl.innerHTML = "";
+	for (const v of availableVersions) {
+		const tab = document.createElement("button");
+		tab.type = "button";
+		tab.className =
+			"version-tab" + (v.run_name === currentRun ? " active" : "");
+		tab.title = `${v.label} — run "${v.run_name}"`;
+		const dot = document.createElement("span");
+		dot.className = `slot-dot status-${v.status ?? "idle"}`;
+		tab.appendChild(dot);
+		const label = document.createElement("span");
+		label.textContent = v.label;
+		tab.appendChild(label);
+		tab.addEventListener("click", () => selectVersion(v.run_name));
+		versionBarEl.appendChild(tab);
+	}
 }
 
 async function refreshVersions() {
-  try {
-    const url = new URL("/versions", SERVER_URL);
-    if (currentSlotId) url.searchParams.set("slot", currentSlotId);
-    if (currentModel) url.searchParams.set("model", currentModel);
-    const res = await fetch(url);
-    if (!res.ok) return;
-    const payload = await res.json();
-    availableVersions = payload.versions ?? [];
-    renderVersionBar();
-  } catch {
-    // Transient; next tick will retry.
-  }
+	try {
+		const url = new URL("/versions", SERVER_URL);
+		if (currentSlotId) url.searchParams.set("slot", currentSlotId);
+		if (currentModel) url.searchParams.set("model", currentModel);
+		const res = await fetch(url);
+		if (!res.ok) return;
+		const payload = await res.json();
+		availableVersions = payload.versions ?? [];
+		renderVersionBar();
+	} catch {
+		// Transient; next tick will retry.
+	}
 }
 
 async function selectVersion(runName) {
-  // Persist the choice and swap which version the single canvas is viewing.
-  // switchRun handles activate + teardown + re-subscribe; the other versions'
-  // background tasks are untouched and keep generating.
-  try { localStorage.setItem(VERSION_STORAGE_KEY, runName); } catch {}
-  await switchRun(runName);
-  renderVersionBar();
+	// Persist the choice and swap which version the single canvas is viewing.
+	// switchRun handles activate + teardown + re-subscribe; the other versions'
+	// background tasks are untouched and keep generating.
+	try {
+		localStorage.setItem(VERSION_STORAGE_KEY, runName);
+	} catch {}
+	await switchRun(runName);
+	renderVersionBar();
 }
 
 async function launchAllVersions() {
-  // Start all three versions on the current (slot, model) cell so they run
-  // concurrently and isolated, then re-subscribe the viewed cell's stream.
-  if (currentSlotId === null || currentModel === null) {
-    setStatus("pick a slot + model before launching versions", "warn");
-    return;
-  }
-  versionLaunchAllEl.disabled = true;
-  try {
-    const res = await fetch(
-      new URL(
-        `/versions/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/launch`,
-        SERVER_URL,
-      ),
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      setStatus(`launch all failed: HTTP ${res.status}`, "err");
-      return;
-    }
-    const payload = await res.json();
-    const started = (payload.versions ?? []).filter((v) => v.started).length;
-    setStatus(
-      `launched ${started}/3 versions on ${currentSlotId} · ${currentModel} — streaming current…`,
-    );
-    // Mirror resumeSlot: tear the viewed cell down and re-subscribe so its
-    // freshly-started stream shows immediately. The other versions stream in
-    // the background; switch to them with the version buttons.
-    slotNeedsResume = false;
-    resetClientStateForRunSwitch();
-    subscribe(slotEventsUrl(currentSlotId, currentModel));
-    refreshSlots();
-    refreshVersions();
-  } catch (e) {
-    setStatus(`launch all failed: ${e.message}`, "err");
-  } finally {
-    versionLaunchAllEl.disabled = false;
-  }
+	// Start all three versions on the current (slot, model) cell so they run
+	// concurrently and isolated, then re-subscribe the viewed cell's stream.
+	if (currentSlotId === null || currentModel === null) {
+		setStatus("pick a slot + model before launching versions", "warn");
+		return;
+	}
+	versionLaunchAllEl.disabled = true;
+	try {
+		const res = await fetch(
+			new URL(
+				`/versions/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/launch`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			setStatus(`launch all failed: HTTP ${res.status}`, "err");
+			return;
+		}
+		const payload = await res.json();
+		const started = (payload.versions ?? []).filter(
+			(v) => v.started,
+		).length;
+		setStatus(
+			`launched ${started}/3 versions on ${currentSlotId} · ${currentModel} — streaming current…`,
+		);
+		// Mirror resumeSlot: tear the viewed cell down and re-subscribe so its
+		// freshly-started stream shows immediately. The other versions stream in
+		// the background; switch to them with the version buttons.
+		slotNeedsResume = false;
+		resetClientStateForRunSwitch();
+		subscribe(slotEventsUrl(currentSlotId, currentModel));
+		refreshSlots();
+		refreshVersions();
+	} catch (e) {
+		setStatus(`launch all failed: ${e.message}`, "err");
+	} finally {
+		versionLaunchAllEl.disabled = false;
+	}
 }
 
 versionLaunchAllEl.addEventListener("click", launchAllVersions);
 
 async function archiveAllVersions() {
-  // Copy every version run (V1/V2/V3) that has data into timestamped,
-  // loadable archive runs, so the live version cells can be reset and re-run
-  // for a fresh V1 vs V2 without losing the current rendition. Stays on the
-  // current version; archives appear in the run picker and stream meshes from
-  // their own dir, so each copy is self-contained.
-  versionArchiveAllEl.disabled = true;
-  const prevLabel = versionArchiveAllEl.textContent;
-  versionArchiveAllEl.textContent = "archiving…";
-  try {
-    const res = await fetch(new URL("/versions/snapshot", SERVER_URL), {
-      method: "POST",
-    });
-    if (!res.ok) {
-      const detail = await res.text();
-      setStatus(`archive failed: ${detail}`, "err");
-      return;
-    }
-    const payload = await res.json();
-    const names = (payload.snapshots ?? []).map((s) => s.snapshot);
-    setStatus(
-      names.length
-        ? `archived ${names.length} version run${names.length === 1 ? "" : "s"} → ${names.join(", ")} — load any of them from the run picker later`
-        : "nothing to archive yet",
-    );
-    await refreshRuns();
-  } catch (e) {
-    setStatus(`archive failed: ${e.message}`, "err");
-  } finally {
-    versionArchiveAllEl.disabled = false;
-    versionArchiveAllEl.textContent = prevLabel;
-  }
+	// Copy every version run (V1/V2/V3) that has data into timestamped,
+	// loadable archive runs, so the live version cells can be reset and re-run
+	// for a fresh V1 vs V2 without losing the current rendition. Stays on the
+	// current version; archives appear in the run picker and stream meshes from
+	// their own dir, so each copy is self-contained.
+	versionArchiveAllEl.disabled = true;
+	const prevLabel = versionArchiveAllEl.textContent;
+	versionArchiveAllEl.textContent = "archiving…";
+	try {
+		const res = await fetch(new URL("/versions/snapshot", SERVER_URL), {
+			method: "POST",
+		});
+		if (!res.ok) {
+			const detail = await res.text();
+			setStatus(`archive failed: ${detail}`, "err");
+			return;
+		}
+		const payload = await res.json();
+		const names = (payload.snapshots ?? []).map((s) => s.snapshot);
+		setStatus(
+			names.length
+				? `archived ${names.length} version run${names.length === 1 ? "" : "s"} → ${names.join(", ")} — load any of them from the run picker later`
+				: "nothing to archive yet",
+		);
+		await refreshRuns();
+	} catch (e) {
+		setStatus(`archive failed: ${e.message}`, "err");
+	} finally {
+		versionArchiveAllEl.disabled = false;
+		versionArchiveAllEl.textContent = prevLabel;
+	}
 }
 
 versionArchiveAllEl.addEventListener("click", archiveAllVersions);
 
 async function createRun() {
-  const name = window.prompt(
-    "New run name (e.g. iteration14, ab_test_v3):",
-    "",
-  );
-  if (!name) return;
-  runNewEl.disabled = true;
-  try {
-    const res = await fetch(new URL("/runs", SERVER_URL), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name: name.trim() }),
-    });
-    if (!res.ok) {
-      const detail = await res.text();
-      setStatus(`create run failed: ${detail}`, "err");
-      return;
-    }
-    const payload = await res.json();
-    currentRun = payload.current;
-    setStatus(`run created :: ${currentRun}`);
-    await refreshRuns();
-    resetClientStateForRunSwitch();
-    await refreshSlots();
-    if (currentSlotId && currentModel) {
-      switchView(currentSlotId, currentModel);
-    }
-  } finally {
-    runNewEl.disabled = false;
-  }
+	const name = window.prompt(
+		"New run name (e.g. iteration14, ab_test_v3):",
+		"",
+	);
+	if (!name) return;
+	runNewEl.disabled = true;
+	try {
+		const res = await fetch(new URL("/runs", SERVER_URL), {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name: name.trim() }),
+		});
+		if (!res.ok) {
+			const detail = await res.text();
+			setStatus(`create run failed: ${detail}`, "err");
+			return;
+		}
+		const payload = await res.json();
+		currentRun = payload.current;
+		setStatus(`run created :: ${currentRun}`);
+		await refreshRuns();
+		resetClientStateForRunSwitch();
+		await refreshSlots();
+		if (currentSlotId && currentModel) {
+			switchView(currentSlotId, currentModel);
+		}
+	} finally {
+		runNewEl.disabled = false;
+	}
 }
 
 function switchView(slotId, modelAlias) {
-  // Common path for both slot and model switches: tear down the current
-  // SSE + scene, persist the new selection, and load the cell (scene +
-  // log backfill) unless it's idle. Error/paused cells still load so the
-  // log panel shows what happened; slotNeedsResume drives retry/resume UI.
-  if (currentSource) {
-    currentSource.close();
-    currentSource = null;
-  }
-  clearScene();
-  clearLog();
-  clearAssets();
-  treeClear();
-  clearMeshErrors();
-  highestEventIndex = -1;
-  recordedEvents.length = 0;
-  updateReplayButton();
-  currentSlotId = slotId;
-  currentModel = modelAlias;
-  try { localStorage.setItem(SLOT_STORAGE_KEY, slotId); } catch {}
-  try { localStorage.setItem(MODEL_STORAGE_KEY, modelAlias); } catch {}
-  if (modelPickerEl.value !== modelAlias) modelPickerEl.value = modelAlias;
+	// Common path for both slot and model switches: tear down the current
+	// SSE + scene, persist the new selection, and load the cell (scene +
+	// log backfill) unless it's idle. Error/paused cells still load so the
+	// log panel shows what happened; slotNeedsResume drives retry/resume UI.
+	if (currentSource) {
+		currentSource.close();
+		currentSource = null;
+	}
+	clearScene();
+	clearLog();
+	clearAssets();
+	treeClear();
+	clearMeshErrors();
+	highestEventIndex = -1;
+	recordedEvents.length = 0;
+	updateReplayButton();
+	currentSlotId = slotId;
+	currentModel = modelAlias;
+	try {
+		localStorage.setItem(SLOT_STORAGE_KEY, slotId);
+	} catch {}
+	try {
+		localStorage.setItem(MODEL_STORAGE_KEY, modelAlias);
+	} catch {}
+	if (modelPickerEl.value !== modelAlias) modelPickerEl.value = modelAlias;
 
-  const status = currentRunInfo()?.status;
-  slotNeedsResume = status === "idle" || status === "paused" || status === "error";
-  renderSlotTabs();
-  updateResumeButton();
-  const cellLabel = `${slotId} · ${modelAlias}`;
-  if (status === "idle") {
-    setStatus(`slot :: ${cellLabel} — idle`);
-  } else {
-    if (slotNeedsResume) {
-      setStatus(`slot :: ${cellLabel} — ${status}`);
-    } else {
-      setStatus(`slot :: ${cellLabel}`);
-    }
-    // Error/paused cells still have an events.jsonl — load scene + backfill
-    // logs so switching to a failed run shows what went wrong.
-    loadCellScene(slotId, modelAlias);
-  }
-  syncActiveTab();
+	const status = currentRunInfo()?.status;
+	slotNeedsResume =
+		status === "idle" || status === "paused" || status === "error";
+	renderSlotTabs();
+	updateResumeButton();
+	const cellLabel = `${slotId} · ${modelAlias}`;
+	if (status === "idle") {
+		setStatus(`slot :: ${cellLabel} — idle`);
+	} else {
+		if (slotNeedsResume) {
+			setStatus(`slot :: ${cellLabel} — ${status}`);
+		} else {
+			setStatus(`slot :: ${cellLabel}`);
+		}
+		// Error/paused cells still have an events.jsonl — load scene + backfill
+		// logs so switching to a failed run shows what went wrong.
+		loadCellScene(slotId, modelAlias);
+	}
+	syncActiveTab();
 }
 
 function switchSlot(id) {
-  if (id === currentSlotId) return;
-  switchView(id, currentModel);
+	if (id === currentSlotId) return;
+	switchView(id, currentModel);
 }
 
 function switchModel(alias) {
-  if (alias === currentModel) return;
-  if (!availableModels.includes(alias)) return;
-  switchView(currentSlotId, alias);
+	if (alias === currentModel) return;
+	if (!availableModels.includes(alias)) return;
+	switchView(currentSlotId, alias);
 }
 
 // --- run tab bar -------------------------------------------------------------
 
 function nextTabId() {
-  return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+	return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
 }
 
 function runExists(run) {
-  return availableRuns.some((r) => r.name === run);
+	return availableRuns.some((r) => r.name === run);
 }
 
 function persistTabs() {
-  try {
-    localStorage.setItem(
-      TABS_STORAGE_KEY,
-      JSON.stringify({ tabs: openTabs, active: activeTabId }),
-    );
-  } catch {}
+	try {
+		localStorage.setItem(
+			TABS_STORAGE_KEY,
+			JSON.stringify({ tabs: openTabs, active: activeTabId }),
+		);
+	} catch {}
 }
 
 // Pull the loaded run/slot/model back onto the active tab so the pickers,
@@ -4175,62 +5247,62 @@ function persistTabs() {
 // Called at the tail of switchView (the single choke point for run/slot/model
 // changes), so every selection path keeps the tab + its label in sync.
 function syncActiveTab() {
-  const tab = openTabs.find((t) => t.id === activeTabId);
-  if (!tab) return;
-  tab.run = currentRun;
-  tab.slot = currentSlotId;
-  tab.model = currentModel;
-  persistTabs();
-  renderTabBar();
-  // Keep the run picker + version highlight reflecting the active tab's run
-  // immediately (otherwise they'd lag until the next refresh poll).
-  if (currentRun && runPickerEl.value !== currentRun) {
-    runPickerEl.value = currentRun;
-  }
-  renderVersionBar();
+	const tab = openTabs.find((t) => t.id === activeTabId);
+	if (!tab) return;
+	tab.run = currentRun;
+	tab.slot = currentSlotId;
+	tab.model = currentModel;
+	persistTabs();
+	renderTabBar();
+	// Keep the run picker + version highlight reflecting the active tab's run
+	// immediately (otherwise they'd lag until the next refresh poll).
+	if (currentRun && runPickerEl.value !== currentRun) {
+		runPickerEl.value = currentRun;
+	}
+	renderVersionBar();
 }
 
 function renderTabBar() {
-  if (!runTabsBarEl) return;
-  for (const el of Array.from(runTabsBarEl.querySelectorAll(".run-tab"))) {
-    el.remove();
-  }
-  for (const tab of openTabs) {
-    const btn = document.createElement("button");
-    btn.type = "button";
-    btn.className = "run-tab" + (tab.id === activeTabId ? " active" : "");
-    btn.title = `${tab.run} · ${tab.slot ?? "—"} · ${tab.model ?? "—"}`;
+	if (!runTabsBarEl) return;
+	for (const el of Array.from(runTabsBarEl.querySelectorAll(".run-tab"))) {
+		el.remove();
+	}
+	for (const tab of openTabs) {
+		const btn = document.createElement("button");
+		btn.type = "button";
+		btn.className = "run-tab" + (tab.id === activeTabId ? " active" : "");
+		btn.title = `${tab.run} · ${tab.slot ?? "—"} · ${tab.model ?? "—"}`;
 
-    const label = document.createElement("span");
-    label.className = "rt-label";
-    label.textContent = tab.run ?? "(run)";
-    btn.appendChild(label);
+		const label = document.createElement("span");
+		label.className = "rt-label";
+		label.textContent = tab.run ?? "(run)";
+		btn.appendChild(label);
 
-    const subText = [tab.slot, tab.model].filter(Boolean).join(" · ");
-    if (subText) {
-      const sub = document.createElement("span");
-      sub.className = "rt-sub";
-      sub.textContent = subText;
-      btn.appendChild(sub);
-    }
+		const subText = [tab.slot, tab.model].filter(Boolean).join(" · ");
+		if (subText) {
+			const sub = document.createElement("span");
+			sub.className = "rt-sub";
+			sub.textContent = subText;
+			btn.appendChild(sub);
+		}
 
-    btn.addEventListener("click", () => activateTab(tab.id));
+		btn.addEventListener("click", () => activateTab(tab.id));
 
-    // The last tab can't be closed — there's always one open view.
-    if (openTabs.length > 1) {
-      const close = document.createElement("span");
-      close.className = "run-tab-close";
-      close.textContent = "×";
-      close.title = "Close this tab";
-      close.addEventListener("click", (ev) => {
-        ev.stopPropagation();
-        closeTab(tab.id);
-      });
-      btn.appendChild(close);
-    }
+		// The last tab can't be closed — there's always one open view.
+		if (openTabs.length > 1) {
+			const close = document.createElement("span");
+			close.className = "run-tab-close";
+			close.textContent = "×";
+			close.title = "Close this tab";
+			close.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				closeTab(tab.id);
+			});
+			btn.appendChild(close);
+		}
 
-    runTabsBarEl.insertBefore(btn, runTabAddEl);
-  }
+		runTabsBarEl.insertBefore(btn, runTabAddEl);
+	}
 }
 
 // Make `id` the active tab and load its (run, slot, model) into the canvas.
@@ -4238,78 +5310,92 @@ function renderTabBar() {
 // (activate + teardown + reload); a same-run/different-cell tab swaps via
 // switchView; an identical view (e.g. a freshly duplicated tab) is a no-op.
 async function activateTab(id) {
-  const tab = openTabs.find((t) => t.id === id);
-  if (!tab) return;
-  activeTabId = id;
-  const wantSlot = tab.slot ?? currentSlotId ?? slotSummaries[0]?.id ?? null;
-  const wantModel =
-    tab.model ?? currentModel ?? defaultModelAlias ?? availableModels[0] ?? null;
-  renderTabBar();
+	const tab = openTabs.find((t) => t.id === id);
+	if (!tab) return;
+	activeTabId = id;
+	const wantSlot = tab.slot ?? currentSlotId ?? slotSummaries[0]?.id ?? null;
+	const wantModel =
+		tab.model ??
+		currentModel ??
+		defaultModelAlias ??
+		availableModels[0] ??
+		null;
+	renderTabBar();
 
-  if (tab.run === currentRun && wantSlot === currentSlotId && wantModel === currentModel) {
-    syncActiveTab();
-    return;
-  }
-  if (tab.run !== currentRun) {
-    // Pre-seed the cell so switchRun's trailing switchView targets it.
-    currentSlotId = wantSlot;
-    currentModel = wantModel;
-    await switchRun(tab.run);
-  } else {
-    switchView(wantSlot, wantModel);
-  }
+	if (
+		tab.run === currentRun &&
+		wantSlot === currentSlotId &&
+		wantModel === currentModel
+	) {
+		syncActiveTab();
+		return;
+	}
+	if (tab.run !== currentRun) {
+		// Pre-seed the cell so switchRun's trailing switchView targets it.
+		currentSlotId = wantSlot;
+		currentModel = wantModel;
+		await switchRun(tab.run);
+	} else {
+		switchView(wantSlot, wantModel);
+	}
 }
 
 // Open a new tab cloning the active view; the user then retargets its run via
 // the run picker / version bar to compare against the original.
 function addTab() {
-  const base = openTabs.find((t) => t.id === activeTabId);
-  const tab = {
-    id: nextTabId(),
-    run: base?.run ?? currentRun,
-    slot: base?.slot ?? currentSlotId,
-    model: base?.model ?? currentModel,
-  };
-  openTabs.push(tab);
-  activateTab(tab.id);
+	const base = openTabs.find((t) => t.id === activeTabId);
+	const tab = {
+		id: nextTabId(),
+		run: base?.run ?? currentRun,
+		slot: base?.slot ?? currentSlotId,
+		model: base?.model ?? currentModel,
+	};
+	openTabs.push(tab);
+	activateTab(tab.id);
 }
 
 function closeTab(id) {
-  if (openTabs.length <= 1) return;
-  const idx = openTabs.findIndex((t) => t.id === id);
-  if (idx === -1) return;
-  const wasActive = id === activeTabId;
-  openTabs.splice(idx, 1);
-  if (wasActive) {
-    const next = openTabs[Math.min(idx, openTabs.length - 1)];
-    activateTab(next.id);
-  } else {
-    persistTabs();
-    renderTabBar();
-  }
+	if (openTabs.length <= 1) return;
+	const idx = openTabs.findIndex((t) => t.id === id);
+	if (idx === -1) return;
+	const wasActive = id === activeTabId;
+	openTabs.splice(idx, 1);
+	if (wasActive) {
+		const next = openTabs[Math.min(idx, openTabs.length - 1)];
+		activateTab(next.id);
+	} else {
+		persistTabs();
+		renderTabBar();
+	}
 }
 
 // Restore persisted tabs on boot, dropping any whose run no longer exists.
 // Returns null when there's nothing valid to restore (first run, or all runs
 // deleted) so the caller seeds a fresh single tab.
 function loadSavedTabs() {
-  let raw = null;
-  try { raw = localStorage.getItem(TABS_STORAGE_KEY); } catch {}
-  if (!raw) return null;
-  let parsed;
-  try { parsed = JSON.parse(raw); } catch { return null; }
-  // Drop tabs whose run is gone; repair a slot/model the server no longer
-  // reports to null so the loader falls back to a valid default.
-  const tabs = (parsed?.tabs ?? [])
-    .filter((t) => t && typeof t.run === "string" && runExists(t.run))
-    .map((t) => ({
-      id: typeof t.id === "string" ? t.id : nextTabId(),
-      run: t.run,
-      slot: slotSummaries.some((s) => s.id === t.slot) ? t.slot : null,
-      model: availableModels.includes(t.model) ? t.model : null,
-    }));
-  if (tabs.length === 0) return null;
-  return { tabs, active: parsed.active };
+	let raw = null;
+	try {
+		raw = localStorage.getItem(TABS_STORAGE_KEY);
+	} catch {}
+	if (!raw) return null;
+	let parsed;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return null;
+	}
+	// Drop tabs whose run is gone; repair a slot/model the server no longer
+	// reports to null so the loader falls back to a valid default.
+	const tabs = (parsed?.tabs ?? [])
+		.filter((t) => t && typeof t.run === "string" && runExists(t.run))
+		.map((t) => ({
+			id: typeof t.id === "string" ? t.id : nextTabId(),
+			run: t.run,
+			slot: slotSummaries.some((s) => s.id === t.slot) ? t.slot : null,
+			model: availableModels.includes(t.model) ? t.model : null,
+		}));
+	if (tabs.length === 0) return null;
+	return { tabs, active: parsed.active };
 }
 
 runTabAddEl.addEventListener("click", addTab);
@@ -4319,32 +5405,37 @@ runTabAddEl.addEventListener("click", addTab);
 // server-side selector. `run` defaults to the viewed run; the start picker
 // passes other versions' run names to drive their cells in the background.
 function slotEventsUrl(slotId, model, run = currentRun) {
-  return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events?run=${encodeURIComponent(run)}`,
-    SERVER_URL,
-  ).toString();
+	return new URL(
+		`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events?run=${encodeURIComponent(run)}`,
+		SERVER_URL,
+	).toString();
 }
 
 function slotMeshesUrl(slotId, model, run = currentRun) {
-  // `mode` is the asset toggle — the only request it touches. "library" streams
-  // objects/; "generated" streams generated/<version>/objects-generated-optimized
-  // (the selected version, or the server's latest when `version` is omitted).
-  // Everything else (scene, events, history) stays pinned to the library build.
-  const u = new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}&mode=${encodeURIComponent(assetMode)}`,
-    SERVER_URL,
-  );
-  if (assetMode === "generated" && genVersion != null) {
-    u.searchParams.set("version", genVersion);
-  }
-  return u.toString();
+	// `mode` is the asset toggle — the only request it touches. "library" streams
+	// objects/; "generated" streams generated/<version>/objects-generated-optimized
+	// (the selected version, or the server's latest when `version` is omitted).
+	// Everything else (scene, events, history) stays pinned to the library build.
+	const u = new URL(
+		`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/meshes?run=${encodeURIComponent(run)}&mode=${encodeURIComponent(assetMode)}`,
+		SERVER_URL,
+	);
+	if (assetMode === "generated" && genVersion != null) {
+		u.searchParams.set("version", genVersion);
+	}
+	// `optimized=0` re-points the bundle at the raw objects-generated/ folder; the
+	// server defaults to the optimized twin, so only send it when raw is selected.
+	if (assetMode === "generated" && !genOptimized) {
+		u.searchParams.set("optimized", "0");
+	}
+	return u.toString();
 }
 
 function slotSceneUrl(slotId, model, run = currentRun) {
-  return new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene?run=${encodeURIComponent(run)}`,
-    SERVER_URL,
-  ).toString();
+	return new URL(
+		`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/scene?run=${encodeURIComponent(run)}`,
+		SERVER_URL,
+	).toString();
 }
 
 // The full event log on disk, served by the /artifacts static mount. Used to
@@ -4352,82 +5443,86 @@ function slotSceneUrl(slotId, model, run = currentRun) {
 // the scene is already painted from /scene — no SSE replay. Artifacts are
 // genuinely path-scoped by run, so this already isolates per version.
 function historyUrl(slotId, model, run = currentRun) {
-  return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events.jsonl`,
-    SERVER_URL,
-  ).toString();
+	return new URL(
+		`/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/events.jsonl`,
+		SERVER_URL,
+	).toString();
 }
 
 async function resetSlot(id, model, skipConfirm = false) {
-  if (!skipConfirm) {
-    const ok = window.confirm(
-      `Wipe runs/${id}/${model}/ and restart the pipeline for this cell?`,
-    );
-    if (!ok) return;
-  }
-  resetEl.disabled = true;
-  try {
-    const res = await fetch(
-      new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/reset?run=${encodeURIComponent(currentRun)}`,
-        SERVER_URL,
-      ),
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      setStatus(`reset failed: HTTP ${res.status}`, "err");
-      return;
-    }
-    if (currentSource) {
-      currentSource.close();
-      currentSource = null;
-    }
-    clearScene();
-    clearLog();
-    clearAssets();
-    treeClear();
-    clearMeshErrors();
-    highestEventIndex = -1;
-    recordedEvents.length = 0;
-    updateReplayButton();
-    slotNeedsResume = false;
-    setStatus(`slot ${id} · ${model} reset — streaming events…`);
-    loadCellScene(id, model, { forceLive: true });
-    refreshSlots();
-  } catch (e) {
-    setStatus(`reset failed: ${e.message}`, "err");
-  } finally {
-    resetEl.disabled = false;
-  }
+	if (!skipConfirm) {
+		const ok = window.confirm(
+			`Wipe runs/${id}/${model}/ and restart the pipeline for this cell?`,
+		);
+		if (!ok) return;
+	}
+	resetEl.disabled = true;
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/reset?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			setStatus(`reset failed: HTTP ${res.status}`, "err");
+			return;
+		}
+		if (currentSource) {
+			currentSource.close();
+			currentSource = null;
+		}
+		clearScene();
+		clearLog();
+		clearAssets();
+		treeClear();
+		clearMeshErrors();
+		highestEventIndex = -1;
+		recordedEvents.length = 0;
+		updateReplayButton();
+		slotNeedsResume = false;
+		setStatus(`slot ${id} · ${model} reset — streaming events…`);
+		loadCellScene(id, model, { forceLive: true });
+		refreshSlots();
+	} catch (e) {
+		setStatus(`reset failed: ${e.message}`, "err");
+	} finally {
+		resetEl.disabled = false;
+	}
 }
 
 function subscribe(url) {
-  // Fresh scene loads (highestEventIndex === -1) replay the whole snapshot, so
-  // prefetch the cell's GLBs in one request; loadModel consumes the bundle as
-  // `model` events arrive. Mid-run re-subscribes (mesh retry, post-replay
-  // reconnect) keep their already-loaded meshes — those events dedupe by index
-  // — so they skip the prefetch.
-  if (highestEventIndex === -1 && currentSlotId !== null && currentModel !== null) {
-    prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
-  }
-  const es = new EventSource(url);
-  currentSource = es;
-  es.onmessage = (ev) => {
-    let data;
-    try {
-      data = JSON.parse(ev.data);
-    } catch {
-      return;
-    }
-    dispatch(data);
-  };
-  es.onerror = () => {
-    // EventSource auto-reconnects on transient failures; only surface a hard close.
-    if (es.readyState === EventSource.CLOSED && currentSource === es) {
-      setStatus("stream closed", "err");
-      currentSource = null;
-    }
-  };
+	// Fresh scene loads (highestEventIndex === -1) replay the whole snapshot, so
+	// prefetch the cell's GLBs in one request; loadModel consumes the bundle as
+	// `model` events arrive. Mid-run re-subscribes (mesh retry, post-replay
+	// reconnect) keep their already-loaded meshes — those events dedupe by index
+	// — so they skip the prefetch.
+	if (
+		highestEventIndex === -1 &&
+		currentSlotId !== null &&
+		currentModel !== null
+	) {
+		prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
+	}
+	const es = new EventSource(url);
+	currentSource = es;
+	es.onmessage = (ev) => {
+		let data;
+		try {
+			data = JSON.parse(ev.data);
+		} catch {
+			return;
+		}
+		dispatch(data);
+	};
+	es.onerror = () => {
+		// EventSource auto-reconnects on transient failures; only surface a hard close.
+		if (es.readyState === EventSource.CLOSED && currentSource === es) {
+			setStatus("stream closed", "err");
+			currentSource = null;
+		}
+	};
 }
 
 // --- CQRS scene load (derive-on-read) --------------------------------------
@@ -4448,258 +5543,275 @@ function subscribe(url) {
 // Build scene + tree + asset panel directly from the /scene projection. Reuses
 // the live builders so there's a single source of truth for how a node renders.
 function applySceneProjection(nodes) {
-  for (const n of nodes) {
-    const patch = {
-      parentId: n.parent_id ?? null,
-      prompt: n.prompt ?? null,
-      kind: n.node_kind ?? "zone",
-    };
-    if (n.plan != null) patch.plan = n.plan;
-    if (n.image_prompt != null) patch.imagePrompt = n.image_prompt;
-    // Mirror the live `dispatch` "bbox" handler so renderTreeDetail's
-    // origin/size/proxy rows render the same whether the cell was opened
-    // from /scene or watched live over SSE.
-    if (n.origin != null) patch.origin = n.origin;
-    if (n.dimensions != null) patch.dimensions = n.dimensions;
-    if (n.proxy_shape != null) patch.proxyShape = n.proxy_shape;
-    treeUpsert(n.id, patch);
-    if (n.origin && n.dimensions) {
-      loadBbox({
-        id: n.id,
-        origin: n.origin,
-        dimensions: n.dimensions,
-        proxy_shape: n.proxy_shape,
-        node_kind: n.node_kind,
-        orientation: n.orientation,
-      });
-    }
-    if (n.image_url) {
-      upsertAsset(n.id, { imageUrl: n.image_url, prompt: n.image_prompt ?? n.prompt ?? null });
-    }
-    if (n.mesh_url) upsertAsset(n.id, { modelUrl: n.mesh_url });
-    if (n.error) {
-      meshErrors.set(n.id, n.error);
-      upsertAsset(n.id, { status: "error", errorMessage: n.error });
-    }
-    if (n.phase) {
-      // Set phase directly (not treeSetPhase) to skip its per-call render/focus
-      // churn across hundreds of nodes; the single scheduleRenderTree() below covers all.
-      const cur = treeNodes.get(n.id);
-      if (cur) cur.phase = n.phase;
-    }
-  }
-  scheduleRenderTree();
+	for (const n of nodes) {
+		const patch = {
+			parentId: n.parent_id ?? null,
+			prompt: n.prompt ?? null,
+			kind: n.node_kind ?? "zone",
+		};
+		if (n.plan != null) patch.plan = n.plan;
+		if (n.image_prompt != null) patch.imagePrompt = n.image_prompt;
+		// Mirror the live `dispatch` "bbox" handler so renderTreeDetail's
+		// origin/size/proxy rows render the same whether the cell was opened
+		// from /scene or watched live over SSE.
+		if (n.origin != null) patch.origin = n.origin;
+		if (n.dimensions != null) patch.dimensions = n.dimensions;
+		if (n.proxy_shape != null) patch.proxyShape = n.proxy_shape;
+		treeUpsert(n.id, patch);
+		if (n.origin && n.dimensions) {
+			loadBbox({
+				id: n.id,
+				origin: n.origin,
+				dimensions: n.dimensions,
+				proxy_shape: n.proxy_shape,
+				node_kind: n.node_kind,
+				orientation: n.orientation,
+			});
+		}
+		if (n.image_url) {
+			upsertAsset(n.id, {
+				imageUrl: n.image_url,
+				prompt: n.image_prompt ?? n.prompt ?? null,
+			});
+		}
+		if (n.mesh_url) upsertAsset(n.id, { modelUrl: n.mesh_url });
+		if (n.error) {
+			meshErrors.set(n.id, n.error);
+			upsertAsset(n.id, { status: "error", errorMessage: n.error });
+		}
+		if (n.phase) {
+			// Set phase directly (not treeSetPhase) to skip its per-call render/focus
+			// churn across hundreds of nodes; the single scheduleRenderTree() below covers all.
+			const cur = treeNodes.get(n.id);
+			if (cur) cur.phase = n.phase;
+		}
+	}
+	scheduleRenderTree();
 }
 
 // Panel-only consumer for the background history load: feeds the gif buffer,
 // log panel, and observability modal — never the scene (the projection owns it).
 function backfillPanels(event) {
-  recordedEvents.push(event);
-  appendEvent(event);
-  if (event.kind === "cache.llm") recordLlmCall(event);
+	recordedEvents.push(event);
+	appendEvent(event);
+	if (event.kind === "cache.llm") recordLlmCall(event);
 }
 
 // Stream the full event log into the side panels AFTER the meshes have loaded,
 // so the heavy parse never contends with GLB texture finalization. Chunked so
 // it yields to the main thread instead of freezing it.
 async function backfillHistoryInBackground(slotId, model, gen) {
-  try { await meshBundle.streamDone; } catch {}
-  if (gen !== sceneGen) return;
-  let text;
-  try {
-    const res = await fetch(historyUrl(slotId, model), { cache: "no-store" });
-    if (!res.ok) return;
-    text = await res.text();
-  } catch {
-    return;
-  }
-  if (gen !== sceneGen) return;
-  const lines = text.split("\n");
-  let i = 0;
-  const step = () => {
-    if (gen !== sceneGen) return;
-    const end = Math.min(i + 200, lines.length);
-    for (; i < end; i++) {
-      const line = lines[i].trim();
-      if (!line) continue;
-      let event;
-      try { event = JSON.parse(line); } catch { continue; }
-      backfillPanels(event);
-    }
-    if (i < lines.length) setTimeout(step, 0);
-    else updateReplayButton();
-  };
-  step();
+	try {
+		await meshBundle.streamDone;
+	} catch {}
+	if (gen !== sceneGen) return;
+	let text;
+	try {
+		const res = await fetch(historyUrl(slotId, model), {
+			cache: "no-store",
+		});
+		if (!res.ok) return;
+		text = await res.text();
+	} catch {
+		return;
+	}
+	if (gen !== sceneGen) return;
+	const lines = text.split("\n");
+	let i = 0;
+	const step = () => {
+		if (gen !== sceneGen) return;
+		const end = Math.min(i + 200, lines.length);
+		for (; i < end; i++) {
+			const line = lines[i].trim();
+			if (!line) continue;
+			let event;
+			try {
+				event = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			backfillPanels(event);
+		}
+		if (i < lines.length) setTimeout(step, 0);
+		else updateReplayButton();
+	};
+	step();
 }
 
 async function loadCellScene(slotId, model, { forceLive = false } = {}) {
-  const gen = sceneGen;
-  let payload;
-  try {
-    const res = await fetch(slotSceneUrl(slotId, model), { cache: "no-store" });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    payload = await res.json();
-  } catch (e) {
-    setStatus(`scene load failed: ${e.message}`, "err");
-    return;
-  }
-  // Bail if the user switched cells while /scene was in flight.
-  if (gen !== sceneGen || currentSlotId !== slotId || currentModel !== model) return;
+	const gen = sceneGen;
+	let payload;
+	try {
+		const res = await fetch(slotSceneUrl(slotId, model), {
+			cache: "no-store",
+		});
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		payload = await res.json();
+	} catch (e) {
+		setStatus(`scene load failed: ${e.message}`, "err");
+		return;
+	}
+	// Bail if the user switched cells while /scene was in flight.
+	if (gen !== sceneGen || currentSlotId !== slotId || currentModel !== model)
+		return;
 
-  applySceneProjection(payload.nodes ?? []);
-  highestEventIndex = typeof payload.last_index === "number" ? payload.last_index : -1;
-  prefetchMeshBundle(slotId, model, sceneGen);
-  // In generated mode, resolve this cell's versions + selected version now so the
-  // picker populates immediately instead of after the next poll tick.
-  if (assetMode === "generated") refreshGenerateGate();
+	applySceneProjection(payload.nodes ?? []);
+	highestEventIndex =
+		typeof payload.last_index === "number" ? payload.last_index : -1;
+	prefetchMeshBundle(slotId, model, sceneGen);
+	// In generated mode, resolve this cell's versions + selected version now so the
+	// picker populates immediately instead of after the next poll tick.
+	if (assetMode === "generated") refreshGenerateGate();
 
-  if (forceLive || currentRunInfo()?.status === "running") {
-    // Active run (or just reset/resumed): tail only the events past the
-    // projection cut. forceLive bypasses the status check, which is racy right
-    // after a POST flips the run to running.
-    subscribe(`${slotEventsUrl(slotId, model)}&since=${highestEventIndex}`);
-  } else {
-    // Finished cell: no live stream. Mark the run done so post-run mesh retries
-    // refresh the status line correctly. Error/paused keep the status line
-    // switchView already set — backfill will populate the log panel.
-    runFinished = true;
-    const status = currentRunInfo()?.status;
-    if (status !== "error" && status !== "paused") {
-      if (meshErrors.size > 0) showRunCompleteWithErrors();
-      else setStatus("run complete");
-    }
-  }
+	if (forceLive || currentRunInfo()?.status === "running") {
+		// Active run (or just reset/resumed): tail only the events past the
+		// projection cut. forceLive bypasses the status check, which is racy right
+		// after a POST flips the run to running.
+		subscribe(`${slotEventsUrl(slotId, model)}&since=${highestEventIndex}`);
+	} else {
+		// Finished cell: no live stream. Mark the run done so post-run mesh retries
+		// refresh the status line correctly. Error/paused keep the status line
+		// switchView already set — backfill will populate the log panel.
+		runFinished = true;
+		const status = currentRunInfo()?.status;
+		if (status !== "error" && status !== "paused") {
+			if (meshErrors.size > 0) showRunCompleteWithErrors();
+			else setStatus("run complete");
+		}
+	}
 
-  backfillHistoryInBackground(slotId, model, gen);
+	backfillHistoryInBackground(slotId, model, gen);
 }
 
 async function rewindTo(index) {
-  if (currentSlotId === null || currentModel === null) return;
-  if (currentSource) {
-    currentSource.close();
-    currentSource = null;
-  }
-  clearScene();
-  clearLog();
-  clearAssets();
-  treeClear();
-  clearMeshErrors();
-  highestEventIndex = -1;
-  recordedEvents.length = 0;
-  updateReplayButton();
-  setStatus(`POST /slots/${currentSlotId}/${currentModel}/rewind to ${index} …`);
+	if (currentSlotId === null || currentModel === null) return;
+	if (currentSource) {
+		currentSource.close();
+		currentSource = null;
+	}
+	clearScene();
+	clearLog();
+	clearAssets();
+	treeClear();
+	clearMeshErrors();
+	highestEventIndex = -1;
+	recordedEvents.length = 0;
+	updateReplayButton();
+	setStatus(
+		`POST /slots/${currentSlotId}/${currentModel}/rewind to ${index} …`,
+	);
 
-  let res;
-  try {
-    res = await fetch(
-      new URL(
-        `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind?run=${encodeURIComponent(currentRun)}`,
-        SERVER_URL,
-      ),
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ to_event_index: index }),
-      },
-    );
-  } catch (e) {
-    setStatus(`rewind failed: ${e.message}`, "err");
-    return;
-  }
-  if (!res.ok) {
-    setStatus(`HTTP ${res.status}: ${await res.text()}`, "err");
-    return;
-  }
-  slotNeedsResume = false;
-  setStatus(`rewound to ${index} — streaming events…`);
-  subscribe(slotEventsUrl(currentSlotId, currentModel));
-  refreshSlots();
+	let res;
+	try {
+		res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/rewind?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ to_event_index: index }),
+			},
+		);
+	} catch (e) {
+		setStatus(`rewind failed: ${e.message}`, "err");
+		return;
+	}
+	if (!res.ok) {
+		setStatus(`HTTP ${res.status}: ${await res.text()}`, "err");
+		return;
+	}
+	slotNeedsResume = false;
+	setStatus(`rewound to ${index} — streaming events…`);
+	subscribe(slotEventsUrl(currentSlotId, currentModel));
+	refreshSlots();
 }
 
 resetEl.addEventListener("click", () => {
-  if (currentSlotId !== null && currentModel !== null) {
-    resetSlot(currentSlotId, currentModel);
-  }
+	if (currentSlotId !== null && currentModel !== null) {
+		resetSlot(currentSlotId, currentModel);
+	}
 });
 
 async function resetAll() {
-  // Wipe every started cell on the current run back to IDLE — fanned out
-  // across all slots × all models — WITHOUT restarting anything. We only touch
-  // cells that have data (events_count > 0); never-run cells are already idle.
-  // Reset no longer implies "start": the user then opens "start cells…" and
-  // launches exactly the (version, slot, model) cells they want, so one click
-  // can't spawn dozens of pipelines.
-  const run = currentRun;
-  const cells = [];
-  for (const s of slotSummaries) {
-    for (const model of availableModels) {
-      if ((s.runs?.[model]?.events_count ?? 0) > 0) {
-        cells.push({ id: s.id, model });
-      }
-    }
-  }
-  if (cells.length === 0) {
-    setStatus(`no started cells to reset on run "${run}"`);
-    return;
-  }
-  const ok = window.confirm(
-    `Wipe ${cells.length} started cell(s) across all models on run "${run}" back to idle?\n\nThis permanently deletes their generated meshes + event logs. Nothing is restarted — use "start cells…" to launch the ones you want.`,
-  );
-  if (!ok) return;
-  resetAllEl.disabled = true;
-  try {
-    const viewedReset = cells.some(
-      (c) => c.id === currentSlotId && c.model === currentModel,
-    );
-    const results = await Promise.all(
-      cells.map((c) =>
-        fetch(
-          new URL(
-            `/slots/${encodeURIComponent(c.id)}/${encodeURIComponent(c.model)}/reset?run=${encodeURIComponent(run)}&start=false`,
-            SERVER_URL,
-          ),
-          { method: "POST" },
-        )
-          .then((r) => ({ cell: `${c.id}·${c.model}`, ok: r.ok }))
-          .catch(() => ({ cell: `${c.id}·${c.model}`, ok: false })),
-      ),
-    );
-    if (viewedReset) {
-      // The on-screen cell is now an empty idle cell — tear its scene down so
-      // it doesn't keep showing stale meshes from the wiped run.
-      if (currentSource) {
-        currentSource.close();
-        currentSource = null;
-      }
-      clearScene();
-      clearLog();
-      clearAssets();
-      treeClear();
-      clearMeshErrors();
-      highestEventIndex = -1;
-      recordedEvents.length = 0;
-      updateReplayButton();
-      slotNeedsResume = false;
-    }
-    const failures = results.filter((r) => r && r.ok === false);
-    if (failures.length > 0) {
-      const names = failures.map((f) => f.cell).join(", ");
-      setStatus(
-        `reset all on "${run}": ${cells.length - failures.length} ok, ${failures.length} failed (${names})`,
-        "err",
-      );
-    } else {
-      setStatus(
-        `reset ${cells.length} cell${cells.length === 1 ? "" : "s"} on "${run}" to idle — pick cells to start`,
-      );
-    }
-    await refreshSlots();
-    refreshVersions();
-  } catch (e) {
-    setStatus(`reset all failed: ${e.message}`, "err");
-  } finally {
-    resetAllEl.disabled = false;
-  }
+	// Wipe every started cell on the current run back to IDLE — fanned out
+	// across all slots × all models — WITHOUT restarting anything. We only touch
+	// cells that have data (events_count > 0); never-run cells are already idle.
+	// Reset no longer implies "start": the user then opens "start cells…" and
+	// launches exactly the (version, slot, model) cells they want, so one click
+	// can't spawn dozens of pipelines.
+	const run = currentRun;
+	const cells = [];
+	for (const s of slotSummaries) {
+		for (const model of availableModels) {
+			if ((s.runs?.[model]?.events_count ?? 0) > 0) {
+				cells.push({ id: s.id, model });
+			}
+		}
+	}
+	if (cells.length === 0) {
+		setStatus(`no started cells to reset on run "${run}"`);
+		return;
+	}
+	const ok = window.confirm(
+		`Wipe ${cells.length} started cell(s) across all models on run "${run}" back to idle?\n\nThis permanently deletes their generated meshes + event logs. Nothing is restarted — use "start cells…" to launch the ones you want.`,
+	);
+	if (!ok) return;
+	resetAllEl.disabled = true;
+	try {
+		const viewedReset = cells.some(
+			(c) => c.id === currentSlotId && c.model === currentModel,
+		);
+		const results = await Promise.all(
+			cells.map((c) =>
+				fetch(
+					new URL(
+						`/slots/${encodeURIComponent(c.id)}/${encodeURIComponent(c.model)}/reset?run=${encodeURIComponent(run)}&start=false`,
+						SERVER_URL,
+					),
+					{ method: "POST" },
+				)
+					.then((r) => ({ cell: `${c.id}·${c.model}`, ok: r.ok }))
+					.catch(() => ({ cell: `${c.id}·${c.model}`, ok: false })),
+			),
+		);
+		if (viewedReset) {
+			// The on-screen cell is now an empty idle cell — tear its scene down so
+			// it doesn't keep showing stale meshes from the wiped run.
+			if (currentSource) {
+				currentSource.close();
+				currentSource = null;
+			}
+			clearScene();
+			clearLog();
+			clearAssets();
+			treeClear();
+			clearMeshErrors();
+			highestEventIndex = -1;
+			recordedEvents.length = 0;
+			updateReplayButton();
+			slotNeedsResume = false;
+		}
+		const failures = results.filter((r) => r && r.ok === false);
+		if (failures.length > 0) {
+			const names = failures.map((f) => f.cell).join(", ");
+			setStatus(
+				`reset all on "${run}": ${cells.length - failures.length} ok, ${failures.length} failed (${names})`,
+				"err",
+			);
+		} else {
+			setStatus(
+				`reset ${cells.length} cell${cells.length === 1 ? "" : "s"} on "${run}" to idle — pick cells to start`,
+			);
+		}
+		await refreshSlots();
+		refreshVersions();
+	} catch (e) {
+		setStatus(`reset all failed: ${e.message}`, "err");
+	} finally {
+		resetAllEl.disabled = false;
+	}
 }
 
 resetAllEl.addEventListener("click", resetAll);
@@ -4713,498 +5825,526 @@ resetAllEl.addEventListener("click", resetAll);
 // over-selecting is harmless.
 
 function startCheckedValues(containerEl) {
-  return Array.from(
-    containerEl.querySelectorAll("input[type=checkbox]:checked"),
-  ).map((cb) => cb.value);
+	return Array.from(
+		containerEl.querySelectorAll("input[type=checkbox]:checked"),
+	).map((cb) => cb.value);
 }
 
 function updateStartCount() {
-  const v = startCheckedValues(startVersionsEl).length;
-  const m = startCheckedValues(startModelsEl).length;
-  const s = startCheckedValues(startSlotsEl).length;
-  const n = v * m * s;
-  startModalCountEl.textContent =
-    `${n} cell${n === 1 ? "" : "s"} — ${v} version${v === 1 ? "" : "s"} × ${m} model${m === 1 ? "" : "s"} × ${s} slot${s === 1 ? "" : "s"}`;
-  startModalGoEl.disabled = n === 0;
-  startModalGoEl.textContent = n === 0 ? "start selected" : `start ${n} cell${n === 1 ? "" : "s"}`;
+	const v = startCheckedValues(startVersionsEl).length;
+	const m = startCheckedValues(startModelsEl).length;
+	const s = startCheckedValues(startSlotsEl).length;
+	const n = v * m * s;
+	startModalCountEl.textContent = `${n} cell${n === 1 ? "" : "s"} — ${v} version${v === 1 ? "" : "s"} × ${m} model${m === 1 ? "" : "s"} × ${s} slot${s === 1 ? "" : "s"}`;
+	startModalGoEl.disabled = n === 0;
+	startModalGoEl.textContent =
+		n === 0 ? "start selected" : `start ${n} cell${n === 1 ? "" : "s"}`;
 }
 
 function buildStartOptions(containerEl, items) {
-  containerEl.innerHTML = "";
-  for (const it of items) {
-    const label = document.createElement("label");
-    label.className = "start-opt";
-    label.title = it.title ?? "";
-    const cb = document.createElement("input");
-    cb.type = "checkbox";
-    cb.value = it.value;
-    cb.checked = !!it.checked;
-    cb.addEventListener("change", updateStartCount);
-    const text = document.createElement("span");
-    text.textContent = it.label;
-    label.append(cb, text);
-    containerEl.appendChild(label);
-  }
+	containerEl.innerHTML = "";
+	for (const it of items) {
+		const label = document.createElement("label");
+		label.className = "start-opt";
+		label.title = it.title ?? "";
+		const cb = document.createElement("input");
+		cb.type = "checkbox";
+		cb.value = it.value;
+		cb.checked = !!it.checked;
+		cb.addEventListener("change", updateStartCount);
+		const text = document.createElement("span");
+		text.textContent = it.label;
+		label.append(cb, text);
+		containerEl.appendChild(label);
+	}
 }
 
 function openStartModal() {
-  if (
-    availableVersions.length === 0 ||
-    availableModels.length === 0 ||
-    slotSummaries.length === 0
-  ) {
-    setStatus("nothing to start yet — versions/models/slots not loaded", "warn");
-    return;
-  }
-  // Default to the version + model you're currently viewing, with no slots
-  // pre-checked so the count starts at 0 and you opt slots in deliberately.
-  buildStartOptions(
-    startVersionsEl,
-    availableVersions.map((ver) => ({
-      value: ver.run_name,
-      label: ver.label ?? ver.run_name,
-      checked: ver.run_name === currentRun,
-    })),
-  );
-  buildStartOptions(
-    startModelsEl,
-    availableModels.map((m) => ({ value: m, label: m, checked: m === currentModel })),
-  );
-  buildStartOptions(
-    startSlotsEl,
-    slotSummaries.map((s) => ({
-      value: s.id,
-      label: s.id,
-      title: s.prompt ?? "",
-      checked: false,
-    })),
-  );
-  updateStartCount();
-  startModalEl.classList.add("open");
+	if (
+		availableVersions.length === 0 ||
+		availableModels.length === 0 ||
+		slotSummaries.length === 0
+	) {
+		setStatus(
+			"nothing to start yet — versions/models/slots not loaded",
+			"warn",
+		);
+		return;
+	}
+	// Default to the version + model you're currently viewing, with no slots
+	// pre-checked so the count starts at 0 and you opt slots in deliberately.
+	buildStartOptions(
+		startVersionsEl,
+		availableVersions.map((ver) => ({
+			value: ver.run_name,
+			label: ver.label ?? ver.run_name,
+			checked: ver.run_name === currentRun,
+		})),
+	);
+	buildStartOptions(
+		startModelsEl,
+		availableModels.map((m) => ({
+			value: m,
+			label: m,
+			checked: m === currentModel,
+		})),
+	);
+	buildStartOptions(
+		startSlotsEl,
+		slotSummaries.map((s) => ({
+			value: s.id,
+			label: s.id,
+			title: s.prompt ?? "",
+			checked: false,
+		})),
+	);
+	updateStartCount();
+	startModalEl.classList.add("open");
 }
 
 function closeStartModal() {
-  startModalEl.classList.remove("open");
+	startModalEl.classList.remove("open");
 }
 
 async function startSelectedCells() {
-  const runs = startCheckedValues(startVersionsEl);
-  const models = startCheckedValues(startModelsEl);
-  const slots = startCheckedValues(startSlotsEl);
-  const cells = [];
-  for (const run of runs) {
-    for (const slot of slots) {
-      for (const model of models) cells.push({ run, slot, model });
-    }
-  }
-  if (cells.length === 0) return;
-  startModalGoEl.disabled = true;
-  try {
-    const results = await Promise.all(
-      cells.map((c) =>
-        fetch(
-          new URL(
-            `/slots/${encodeURIComponent(c.slot)}/${encodeURIComponent(c.model)}/resume?run=${encodeURIComponent(c.run)}`,
-            SERVER_URL,
-          ),
-          { method: "POST" },
-        )
-          .then((r) => ({ ...c, ok: r.ok }))
-          .catch(() => ({ ...c, ok: false })),
-      ),
-    );
-    const started = results.filter((r) => r.ok).length;
-    const skipped = results.length - started;
-    setStatus(
-      `started ${started}/${results.length} cell${results.length === 1 ? "" : "s"}` +
-        (skipped ? ` — ${skipped} skipped (already running/done)` : ""),
-    );
-    const viewedStarted = cells.some(
-      (c) =>
-        c.run === currentRun &&
-        c.slot === currentSlotId &&
-        c.model === currentModel,
-    );
-    closeStartModal();
-    if (viewedStarted) {
-      // The viewed cell just started — rewire its scene + SSE so it streams
-      // live instead of waiting for the next manual reselect.
-      if (currentSource) {
-        currentSource.close();
-        currentSource = null;
-      }
-      clearScene();
-      clearLog();
-      clearAssets();
-      treeClear();
-      clearMeshErrors();
-      highestEventIndex = -1;
-      recordedEvents.length = 0;
-      updateReplayButton();
-      slotNeedsResume = false;
-      loadCellScene(currentSlotId, currentModel, { forceLive: true });
-    }
-    await refreshSlots();
-    refreshVersions();
-  } finally {
-    startModalGoEl.disabled = false;
-    updateStartCount();
-  }
+	const runs = startCheckedValues(startVersionsEl);
+	const models = startCheckedValues(startModelsEl);
+	const slots = startCheckedValues(startSlotsEl);
+	const cells = [];
+	for (const run of runs) {
+		for (const slot of slots) {
+			for (const model of models) cells.push({ run, slot, model });
+		}
+	}
+	if (cells.length === 0) return;
+	startModalGoEl.disabled = true;
+	try {
+		const results = await Promise.all(
+			cells.map((c) =>
+				fetch(
+					new URL(
+						`/slots/${encodeURIComponent(c.slot)}/${encodeURIComponent(c.model)}/resume?run=${encodeURIComponent(c.run)}`,
+						SERVER_URL,
+					),
+					{ method: "POST" },
+				)
+					.then((r) => ({ ...c, ok: r.ok }))
+					.catch(() => ({ ...c, ok: false })),
+			),
+		);
+		const started = results.filter((r) => r.ok).length;
+		const skipped = results.length - started;
+		setStatus(
+			`started ${started}/${results.length} cell${results.length === 1 ? "" : "s"}` +
+				(skipped ? ` — ${skipped} skipped (already running/done)` : ""),
+		);
+		const viewedStarted = cells.some(
+			(c) =>
+				c.run === currentRun &&
+				c.slot === currentSlotId &&
+				c.model === currentModel,
+		);
+		closeStartModal();
+		if (viewedStarted) {
+			// The viewed cell just started — rewire its scene + SSE so it streams
+			// live instead of waiting for the next manual reselect.
+			if (currentSource) {
+				currentSource.close();
+				currentSource = null;
+			}
+			clearScene();
+			clearLog();
+			clearAssets();
+			treeClear();
+			clearMeshErrors();
+			highestEventIndex = -1;
+			recordedEvents.length = 0;
+			updateReplayButton();
+			slotNeedsResume = false;
+			loadCellScene(currentSlotId, currentModel, { forceLive: true });
+		}
+		await refreshSlots();
+		refreshVersions();
+	} finally {
+		startModalGoEl.disabled = false;
+		updateStartCount();
+	}
 }
 
 startCellsEl.addEventListener("click", openStartModal);
 startModalGoEl.addEventListener("click", startSelectedCells);
 startModalCloseEl.addEventListener("click", closeStartModal);
 startModalEl.addEventListener("click", (ev) => {
-  // Click on the dimmed backdrop (outside the panel) closes.
-  if (ev.target === startModalEl) closeStartModal();
-  // Select-all / -none chips in each column header.
-  const bulk = ev.target.closest("[data-start-bulk]");
-  if (bulk) {
-    const container = document.getElementById(bulk.dataset.startTarget);
-    if (container) {
-      const check = bulk.dataset.startBulk === "all";
-      for (const cb of container.querySelectorAll("input[type=checkbox]")) {
-        cb.checked = check;
-      }
-      updateStartCount();
-    }
-  }
+	// Click on the dimmed backdrop (outside the panel) closes.
+	if (ev.target === startModalEl) closeStartModal();
+	// Select-all / -none chips in each column header.
+	const bulk = ev.target.closest("[data-start-bulk]");
+	if (bulk) {
+		const container = document.getElementById(bulk.dataset.startTarget);
+		if (container) {
+			const check = bulk.dataset.startBulk === "all";
+			for (const cb of container.querySelectorAll(
+				"input[type=checkbox]",
+			)) {
+				cb.checked = check;
+			}
+			updateStartCount();
+		}
+	}
 });
 document.addEventListener("keydown", (ev) => {
-  if (ev.key === "Escape" && startModalEl.classList.contains("open")) {
-    closeStartModal();
-  }
+	if (ev.key === "Escape" && startModalEl.classList.contains("open")) {
+		closeStartModal();
+	}
 });
 
 modelPickerEl.addEventListener("change", () => {
-  switchModel(modelPickerEl.value);
+	switchModel(modelPickerEl.value);
 });
 
 runPickerEl.addEventListener("change", () => {
-  switchRun(runPickerEl.value);
+	switchRun(runPickerEl.value);
 });
 
 runNewEl.addEventListener("click", createRun);
 
 async function saveAllAndNew() {
-  const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-  const name = `save_${ts}`;
-  saveAllEl.disabled = true;
-  try {
-    const res = await fetch(new URL("/runs", SERVER_URL), {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
-    });
-    if (!res.ok) {
-      const detail = await res.text();
-      setStatus(`save all failed: ${detail}`, "err");
-      return;
-    }
-    const prevRun = currentRun;
-    const payload = await res.json();
-    currentRun = payload.current;
-    setStatus(`saved run "${prevRun}" — switched to fresh run "${currentRun}"`);
-    await refreshRuns();
-    resetClientStateForRunSwitch();
-    await refreshSlots();
-    if (currentSlotId && currentModel) {
-      switchView(currentSlotId, currentModel);
-    }
-  } finally {
-    saveAllEl.disabled = false;
-  }
+	const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+	const name = `save_${ts}`;
+	saveAllEl.disabled = true;
+	try {
+		const res = await fetch(new URL("/runs", SERVER_URL), {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ name }),
+		});
+		if (!res.ok) {
+			const detail = await res.text();
+			setStatus(`save all failed: ${detail}`, "err");
+			return;
+		}
+		const prevRun = currentRun;
+		const payload = await res.json();
+		currentRun = payload.current;
+		setStatus(
+			`saved run "${prevRun}" — switched to fresh run "${currentRun}"`,
+		);
+		await refreshRuns();
+		resetClientStateForRunSwitch();
+		await refreshSlots();
+		if (currentSlotId && currentModel) {
+			switchView(currentSlotId, currentModel);
+		}
+	} finally {
+		saveAllEl.disabled = false;
+	}
 }
 
 saveAllEl.addEventListener("click", saveAllAndNew);
 
 async function snapshotAll() {
-  snapshotAllEl.disabled = true;
-  try {
-    const res = await fetch(new URL("/runs/snapshot", SERVER_URL), {
-      method: "POST",
-    });
-    if (!res.ok) {
-      const detail = await res.text();
-      setStatus(`snapshot failed: ${detail}`, "err");
-      return;
-    }
-    const payload = await res.json();
-    setStatus(`snapshot saved as "${payload.snapshot}"`);
-    await refreshRuns();
-  } finally {
-    snapshotAllEl.disabled = false;
-  }
+	snapshotAllEl.disabled = true;
+	try {
+		const res = await fetch(new URL("/runs/snapshot", SERVER_URL), {
+			method: "POST",
+		});
+		if (!res.ok) {
+			const detail = await res.text();
+			setStatus(`snapshot failed: ${detail}`, "err");
+			return;
+		}
+		const payload = await res.json();
+		setStatus(`snapshot saved as "${payload.snapshot}"`);
+		await refreshRuns();
+	} finally {
+		snapshotAllEl.disabled = false;
+	}
 }
 
 snapshotAllEl.addEventListener("click", snapshotAll);
 
 async function resumeAll() {
-  // Fans out POST /slots/<slot>/<model>/resume for every cell on the active
-  // model whose status is startable (idle/paused/error). Running and done
-  // cells are skipped. If the viewed cell gets resumed, route it through
-  // resumeSlot() so the scene + SSE rewire — non-viewed cells just need
-  // the kick, their events will flow next time the user switches to them.
-  if (currentModel === null) return;
-  const model = currentModel;
-  const startable = slotSummaries.filter((s) =>
-    ["idle", "paused", "error"].includes(s.runs?.[model]?.status),
-  );
-  if (startable.length === 0) {
-    setStatus(`no startable cells on ${model}`);
-    return;
-  }
-  resumeAllEl.disabled = true;
-  try {
-    const tasks = startable.map((s) => {
-      if (s.id === currentSlotId) {
-        // Viewed cell — wire SSE + clear scene via the existing helper.
-        return resumeSlot(s.id, model);
-      }
-      return fetch(
-        new URL(
-          `/slots/${encodeURIComponent(s.id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
-          SERVER_URL,
-        ),
-        { method: "POST" },
-      ).then((r) => ({ slot: s.id, ok: r.ok, status: r.status }));
-    });
-    const results = await Promise.all(tasks);
-    const failures = results.filter((r) => r && r.ok === false);
-    if (failures.length > 0) {
-      const names = failures.map((f) => f.slot).join(", ");
-      setStatus(
-        `resume all on ${model}: ${startable.length - failures.length} ok, ${failures.length} failed (${names})`,
-        "err",
-      );
-    } else {
-      setStatus(
-        `resumed ${startable.length} cell${startable.length === 1 ? "" : "s"} on ${model}`,
-      );
-    }
-    refreshSlots();
-  } catch (e) {
-    setStatus(`resume all failed: ${e.message}`, "err");
-  } finally {
-    resumeAllEl.disabled = false;
-  }
+	// Fans out POST /slots/<slot>/<model>/resume for every cell on the active
+	// model whose status is startable (idle/paused/error). Running and done
+	// cells are skipped. If the viewed cell gets resumed, route it through
+	// resumeSlot() so the scene + SSE rewire — non-viewed cells just need
+	// the kick, their events will flow next time the user switches to them.
+	if (currentModel === null) return;
+	const model = currentModel;
+	const startable = slotSummaries.filter((s) =>
+		["idle", "paused", "error"].includes(s.runs?.[model]?.status),
+	);
+	if (startable.length === 0) {
+		setStatus(`no startable cells on ${model}`);
+		return;
+	}
+	resumeAllEl.disabled = true;
+	try {
+		const tasks = startable.map((s) => {
+			if (s.id === currentSlotId) {
+				// Viewed cell — wire SSE + clear scene via the existing helper.
+				return resumeSlot(s.id, model);
+			}
+			return fetch(
+				new URL(
+					`/slots/${encodeURIComponent(s.id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
+					SERVER_URL,
+				),
+				{ method: "POST" },
+			).then((r) => ({ slot: s.id, ok: r.ok, status: r.status }));
+		});
+		const results = await Promise.all(tasks);
+		const failures = results.filter((r) => r && r.ok === false);
+		if (failures.length > 0) {
+			const names = failures.map((f) => f.slot).join(", ");
+			setStatus(
+				`resume all on ${model}: ${startable.length - failures.length} ok, ${failures.length} failed (${names})`,
+				"err",
+			);
+		} else {
+			setStatus(
+				`resumed ${startable.length} cell${startable.length === 1 ? "" : "s"} on ${model}`,
+			);
+		}
+		refreshSlots();
+	} catch (e) {
+		setStatus(`resume all failed: ${e.message}`, "err");
+	} finally {
+		resumeAllEl.disabled = false;
+	}
 }
 
 resumeAllEl.addEventListener("click", resumeAll);
 
 async function stopAll() {
-  // Preemptive global kill switch: POST /generations/stop halts EVERY in-flight
-  // generation process-wide (all runs, all versions, all cells) — pipeline
-  // builds, from-scratch generates, and mesh retries — and leaves them
-  // resumable/retryable (running cells become paused). Nothing on disk is
-  // touched, so this is a safe interrupt, not a reset. The viewed cell's open
-  // SSE stream delivers its own run.paused; refreshSlots/refreshVersions repaint
-  // the rest of the dashboard's status dots.
-  const ok = window.confirm(
-    'Stop ALL in-flight generations across every run and version?\n\nRunning pipeline cells become paused and from-scratch builds halt. Nothing is deleted — resume a cell or re-press generate/retry to pick up where it left off.',
-  );
-  if (!ok) return;
-  stopAllEl.disabled = true;
-  try {
-    const res = await fetch(new URL("/generations/stop", SERVER_URL), {
-      method: "POST",
-    });
-    if (!res.ok) {
-      setStatus(`stop all failed: HTTP ${res.status}`, "err");
-      return;
-    }
-    const payload = await res.json();
-    const np = (payload.stopped_pipelines ?? []).length;
-    const ng = (payload.stopped_generates ?? []).length;
-    const nr = payload.stopped_retries ?? 0;
-    if (np + ng + nr === 0) {
-      setStatus("nothing in flight to stop");
-    } else {
-      setStatus(
-        `stopped ${np} pipeline${np === 1 ? "" : "s"}, ${ng} generate${ng === 1 ? "" : "s"}, ${nr} retr${nr === 1 ? "y" : "ies"} — all resumable`,
-      );
-    }
-    refreshSlots();
-    refreshVersions();
-  } catch (e) {
-    setStatus(`stop all failed: ${e.message}`, "err");
-  } finally {
-    stopAllEl.disabled = false;
-  }
+	// Preemptive global kill switch: POST /generations/stop halts EVERY in-flight
+	// generation process-wide (all runs, all versions, all cells) — pipeline
+	// builds, from-scratch generates, and mesh retries — and leaves them
+	// resumable/retryable (running cells become paused). Nothing on disk is
+	// touched, so this is a safe interrupt, not a reset. The viewed cell's open
+	// SSE stream delivers its own run.paused; refreshSlots/refreshVersions repaint
+	// the rest of the dashboard's status dots.
+	const ok = window.confirm(
+		"Stop ALL in-flight generations across every run and version?\n\nRunning pipeline cells become paused and from-scratch builds halt. Nothing is deleted — resume a cell or re-press generate/retry to pick up where it left off.",
+	);
+	if (!ok) return;
+	stopAllEl.disabled = true;
+	try {
+		const res = await fetch(new URL("/generations/stop", SERVER_URL), {
+			method: "POST",
+		});
+		if (!res.ok) {
+			setStatus(`stop all failed: HTTP ${res.status}`, "err");
+			return;
+		}
+		const payload = await res.json();
+		const np = (payload.stopped_pipelines ?? []).length;
+		const ng = (payload.stopped_generates ?? []).length;
+		const nr = payload.stopped_retries ?? 0;
+		if (np + ng + nr === 0) {
+			setStatus("nothing in flight to stop");
+		} else {
+			setStatus(
+				`stopped ${np} pipeline${np === 1 ? "" : "s"}, ${ng} generate${ng === 1 ? "" : "s"}, ${nr} retr${nr === 1 ? "y" : "ies"} — all resumable`,
+			);
+		}
+		refreshSlots();
+		refreshVersions();
+	} catch (e) {
+		setStatus(`stop all failed: ${e.message}`, "err");
+	} finally {
+		stopAllEl.disabled = false;
+	}
 }
 
 stopAllEl.addEventListener("click", stopAll);
 
 async function resumeSlot(id, model) {
-  resumeEl.disabled = true;
-  try {
-    const res = await fetch(
-      new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
-        SERVER_URL,
-      ),
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      setStatus(`resume failed: HTTP ${res.status}`, "err");
-      return;
-    }
-    slotNeedsResume = false;
-    if (currentSource) {
-      currentSource.close();
-      currentSource = null;
-    }
-    clearScene();
-    clearLog();
-    clearAssets();
-    treeClear();
-    clearMeshErrors();
-    highestEventIndex = -1;
-    recordedEvents.length = 0;
-    updateReplayButton();
-    setStatus(`resumed — streaming events…`);
-    subscribe(slotEventsUrl(id, model));
-    refreshSlots();
-  } catch (e) {
-    setStatus(`resume failed: ${e.message}`, "err");
-  } finally {
-    resumeEl.disabled = false;
-  }
+	resumeEl.disabled = true;
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			setStatus(`resume failed: HTTP ${res.status}`, "err");
+			return;
+		}
+		slotNeedsResume = false;
+		if (currentSource) {
+			currentSource.close();
+			currentSource = null;
+		}
+		clearScene();
+		clearLog();
+		clearAssets();
+		treeClear();
+		clearMeshErrors();
+		highestEventIndex = -1;
+		recordedEvents.length = 0;
+		updateReplayButton();
+		setStatus(`resumed — streaming events…`);
+		subscribe(slotEventsUrl(id, model));
+		refreshSlots();
+	} catch (e) {
+		setStatus(`resume failed: ${e.message}`, "err");
+	} finally {
+		resumeEl.disabled = false;
+	}
 }
 
 async function pauseSlot(id, model) {
-  resumeEl.disabled = true;
-  try {
-    const res = await fetch(
-      new URL(
-        `/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/pause?run=${encodeURIComponent(currentRun)}`,
-        SERVER_URL,
-      ),
-      { method: "POST" },
-    );
-    if (!res.ok) {
-      setStatus(`pause failed: HTTP ${res.status}`, "err");
-      return;
-    }
-    setStatus("paused");
-    refreshSlots();
-  } catch (e) {
-    setStatus(`pause failed: ${e.message}`, "err");
-  } finally {
-    resumeEl.disabled = false;
-  }
+	resumeEl.disabled = true;
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(id)}/${encodeURIComponent(model)}/pause?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			setStatus(`pause failed: HTTP ${res.status}`, "err");
+			return;
+		}
+		setStatus("paused");
+		refreshSlots();
+	} catch (e) {
+		setStatus(`pause failed: ${e.message}`, "err");
+	} finally {
+		resumeEl.disabled = false;
+	}
 }
 
 resumeEl.addEventListener("click", () => {
-  if (currentSlotId === null || currentModel === null) return;
-  const status = currentRunInfo()?.status;
-  if (status === "running") {
-    pauseSlot(currentSlotId, currentModel);
-  } else {
-    resumeSlot(currentSlotId, currentModel);
-  }
+	if (currentSlotId === null || currentModel === null) return;
+	const status = currentRunInfo()?.status;
+	if (status === "running") {
+		pauseSlot(currentSlotId, currentModel);
+	} else {
+		resumeSlot(currentSlotId, currentModel);
+	}
 });
 
 document.getElementById("zoom-in").addEventListener("click", () => _dolly(0.8));
-document.getElementById("zoom-out").addEventListener("click", () => _dolly(1.25));
+document
+	.getElementById("zoom-out")
+	.addEventListener("click", () => _dolly(1.25));
 
 // --- GLB export --------------------------------------------------------------
 
 exportGlbEl.addEventListener("click", async () => {
-  if (modelsById.size === 0) return;
-  exportGlbEl.disabled = true;
-  exportGlbEl.textContent = "exporting…";
-  try {
-    // Temporarily force all models visible so hidden frames are included.
-    const wasHidden = [];
-    sceneRoot.traverse((obj) => {
-      if (!obj.visible) {
-        wasHidden.push(obj);
-        obj.visible = true;
-      }
-    });
+	if (modelsById.size === 0) return;
+	exportGlbEl.disabled = true;
+	exportGlbEl.textContent = "exporting…";
+	try {
+		// Temporarily force all models visible so hidden frames are included.
+		const wasHidden = [];
+		sceneRoot.traverse((obj) => {
+			if (!obj.visible) {
+				wasHidden.push(obj);
+				obj.visible = true;
+			}
+		});
 
-    const exporter = new GLTFExporter();
-    const glb = await exporter.parseAsync(sceneRoot, { binary: true });
+		const exporter = new GLTFExporter();
+		const glb = await exporter.parseAsync(sceneRoot, { binary: true });
 
-    for (const obj of wasHidden) obj.visible = false;
+		for (const obj of wasHidden) obj.visible = false;
 
-    const blob = new Blob([glb], { type: "model/gltf-binary" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    const stem = currentSlotId && currentModel
-      ? `${currentSlotId}_${currentModel}`
-      : (currentSlotId ?? "scene");
-    a.download = `${stem}.glb`;
-    a.click();
-    URL.revokeObjectURL(url);
-  } catch (e) {
-    appendEvent({ kind: "run.error", message: `GLB export failed: ${e.message}` });
-  } finally {
-    exportGlbEl.disabled = false;
-    exportGlbEl.textContent = "export .glb";
-  }
+		const blob = new Blob([glb], { type: "model/gltf-binary" });
+		const url = URL.createObjectURL(blob);
+		const a = document.createElement("a");
+		a.href = url;
+		const stem =
+			currentSlotId && currentModel
+				? `${currentSlotId}_${currentModel}`
+				: (currentSlotId ?? "scene");
+		a.download = `${stem}.glb`;
+		a.click();
+		URL.revokeObjectURL(url);
+	} catch (e) {
+		appendEvent({
+			kind: "run.error",
+			message: `GLB export failed: ${e.message}`,
+		});
+	} finally {
+		exportGlbEl.disabled = false;
+		exportGlbEl.textContent = "export .glb";
+	}
 });
 
 // Boot: fetch active run first (so /slots reflects the right cell set),
 // then load slot + model lists, pick remembered (or defaults), subscribe.
 (async () => {
-  await refreshRuns();
-  await refreshSlots();
-  if (slotSummaries.length === 0) {
-    setStatus("no slots reported by server", "err");
-    return;
-  }
-  if (availableModels.length === 0) {
-    setStatus("no models reported by server", "err");
-    return;
-  }
-  let savedSlot = null;
-  let savedModel = null;
-  try { savedSlot = localStorage.getItem(SLOT_STORAGE_KEY); } catch {}
-  try { savedModel = localStorage.getItem(MODEL_STORAGE_KEY); } catch {}
-  const slotPick =
-    slotSummaries.find((s) => s.id === savedSlot)?.id ?? slotSummaries[0].id;
-  const modelPick =
-    availableModels.includes(savedModel)
-      ? savedModel
-      : (defaultModelAlias ?? availableModels[0]);
+	await refreshRuns();
+	await refreshSlots();
+	if (slotSummaries.length === 0) {
+		setStatus("no slots reported by server", "err");
+		return;
+	}
+	if (availableModels.length === 0) {
+		setStatus("no models reported by server", "err");
+		return;
+	}
+	let savedSlot = null;
+	let savedModel = null;
+	try {
+		savedSlot = localStorage.getItem(SLOT_STORAGE_KEY);
+	} catch {}
+	try {
+		savedModel = localStorage.getItem(MODEL_STORAGE_KEY);
+	} catch {}
+	const slotPick =
+		slotSummaries.find((s) => s.id === savedSlot)?.id ??
+		slotSummaries[0].id;
+	const modelPick = availableModels.includes(savedModel)
+		? savedModel
+		: (defaultModelAlias ?? availableModels[0]);
 
-  // Restore the open tabs (each pins a run + slot + model). First boot after
-  // this feature ships has none → seed a single tab, honoring the previously-
-  // remembered version run so existing users land where they left off.
-  const saved = loadSavedTabs();
-  if (saved) {
-    openTabs.push(...saved.tabs);
-    activeTabId = saved.tabs.some((t) => t.id === saved.active)
-      ? saved.active
-      : saved.tabs[0].id;
-  } else {
-    let savedVersion = null;
-    try { savedVersion = localStorage.getItem(VERSION_STORAGE_KEY); } catch {}
-    const initRun =
-      savedVersion && runExists(savedVersion) ? savedVersion : currentRun;
-    const tab = { id: nextTabId(), run: initRun, slot: slotPick, model: modelPick };
-    openTabs.push(tab);
-    activeTabId = tab.id;
-  }
-  renderTabBar();
+	// Restore the open tabs (each pins a run + slot + model). First boot after
+	// this feature ships has none → seed a single tab, honoring the previously-
+	// remembered version run so existing users land where they left off.
+	const saved = loadSavedTabs();
+	if (saved) {
+		openTabs.push(...saved.tabs);
+		activeTabId = saved.tabs.some((t) => t.id === saved.active)
+			? saved.active
+			: saved.tabs[0].id;
+	} else {
+		let savedVersion = null;
+		try {
+			savedVersion = localStorage.getItem(VERSION_STORAGE_KEY);
+		} catch {}
+		const initRun =
+			savedVersion && runExists(savedVersion) ? savedVersion : currentRun;
+		const tab = {
+			id: nextTabId(),
+			run: initRun,
+			slot: slotPick,
+			model: modelPick,
+		};
+		openTabs.push(tab);
+		activeTabId = tab.id;
+	}
+	renderTabBar();
 
-  // Drive the initial canvas from the active tab.
-  const active = openTabs.find((t) => t.id === activeTabId);
-  const bootSlot = active.slot ?? slotPick;
-  const bootModel = active.model ?? modelPick;
-  if (active.run && active.run !== currentRun) {
-    // Pre-seed the cell so switchRun's trailing switchView targets it.
-    currentSlotId = bootSlot;
-    currentModel = bootModel;
-    await switchRun(active.run);
-  } else {
-    switchView(bootSlot, bootModel);
-  }
-  await refreshVersions();
+	// Drive the initial canvas from the active tab.
+	const active = openTabs.find((t) => t.id === activeTabId);
+	const bootSlot = active.slot ?? slotPick;
+	const bootModel = active.model ?? modelPick;
+	if (active.run && active.run !== currentRun) {
+		// Pre-seed the cell so switchRun's trailing switchView targets it.
+		currentSlotId = bootSlot;
+		currentModel = bootModel;
+		await switchRun(active.run);
+	} else {
+		switchView(bootSlot, bootModel);
+	}
+	await refreshVersions();
 })();
 
 // Keep tab status dots + run list fresh — runs change less often, so a
@@ -5224,111 +6364,170 @@ setInterval(refreshVersions, 2000);
 // version, "+ new version" forks a fresh one), which runs Nano-Banana + Trellis
 // reusing the library layout — same bboxes, freshly generated meshes.
 
-function slotGenerateUrl(slotId, model, run = currentRun, version = genVersion) {
-  // Shared by the GET poll and the POST resume — both target one version
-  // (omitted ⇒ the server's latest, used before a version is resolved).
-  const u = new URL(
-    `/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generate?run=${encodeURIComponent(run)}`,
-    SERVER_URL,
-  );
-  if (version != null) u.searchParams.set("version", version);
-  return u.toString();
+function slotGenerateUrl(
+	slotId,
+	model,
+	run = currentRun,
+	version = genVersion,
+	optimized = true,
+) {
+	// Shared by the GET poll and the POST resume — both target one version
+	// (omitted ⇒ the server's latest, used before a version is resolved).
+	const u = new URL(
+		`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generate?run=${encodeURIComponent(run)}`,
+		SERVER_URL,
+	);
+	if (version != null) u.searchParams.set("version", version);
+	// The GET poll passes the toggle so it enumerates the same folder the bundle
+	// streams (raw ↔ optimized), keeping per-mesh version tokens consistent. POST
+	// callers leave it at the default — the resume/new build is folder-agnostic.
+	if (!optimized) u.searchParams.set("optimized", "0");
+	return u.toString();
 }
 
 function updateGenerateGate() {
-  const cellReady = currentSlotId !== null && currentModel !== null;
-  const show = assetMode === "generated";
-  if (generateGateEl) {
-    generateGateEl.style.display = show ? "" : "none";
-    generateGateEl.disabled = generating || !cellReady;
-    // No version yet → the first press creates version 1; otherwise it resumes
-    // the selected version.
-    generateGateEl.textContent = generating
-      ? "generating…"
-      : genVersion == null
-        ? "⚡ generate"
-        : `⚡ generate v${genVersion}`;
-  }
-  if (genVersionNewEl) {
-    // A new version is its own isolated build, so it stays available even while
-    // the currently-viewed version is mid-build (the server runs versions
-    // concurrently); only the ⚡ resume button is gated on `generating`.
-    genVersionNewEl.style.display = show ? "" : "none";
-    genVersionNewEl.disabled = !cellReady;
-  }
-  if (genVersionPickerEl) {
-    // Only meaningful once at least one version exists; hidden in library mode.
-    genVersionPickerEl.style.display = show && genVersions.length > 0 ? "" : "none";
-    genVersionPickerEl.disabled = !cellReady;
-  }
+	const cellReady = currentSlotId !== null && currentModel !== null;
+	const show = assetMode === "generated";
+	if (generateGateEl) {
+		generateGateEl.style.display = show ? "" : "none";
+		generateGateEl.disabled = generating || !cellReady;
+		// No version yet → the first press creates version 1; otherwise it resumes
+		// the selected version.
+		generateGateEl.textContent = generating
+			? "generating…"
+			: genVersion == null
+				? "⚡ generate"
+				: `⚡ generate v${genVersion}`;
+	}
+	if (genVersionNewEl) {
+		// A new version is its own isolated build, so it stays available even while
+		// the currently-viewed version is mid-build (the server runs versions
+		// concurrently); only the ⚡ resume button is gated on `generating`.
+		genVersionNewEl.style.display = show ? "" : "none";
+		genVersionNewEl.disabled = !cellReady;
+	}
+	if (genFromImagesEl) {
+		// Forks a fresh version that reuses the CURRENTLY-VIEWED version's images, so
+		// it only makes sense once a version is selected. Like "+ new version" it's a
+		// separate isolated build, so it's not gated on `generating`.
+		genFromImagesEl.style.display =
+			show && genVersion != null ? "" : "none";
+		genFromImagesEl.disabled = !cellReady;
+		genFromImagesEl.textContent = `⚡ rebuild from v${genVersion ?? ""} imgs`;
+	}
+	if (genVersionPickerEl) {
+		// Only meaningful once at least one version exists; hidden in library mode.
+		genVersionPickerEl.style.display =
+			show && genVersions.length > 0 ? "" : "none";
+		genVersionPickerEl.disabled = !cellReady;
+	}
+	if (genOptimizeToggleEl) {
+		// Same lifecycle as the version picker: only meaningful once a version's
+		// assets exist, hidden in library mode.
+		genOptimizeToggleEl.style.display =
+			show && genVersions.length > 0 ? "" : "none";
+		genOptimizeToggleEl.disabled = !cellReady;
+	}
 }
 
 // Repopulate the version dropdown from `genVersions`, keeping `genVersion`
 // selected. Cheap enough to call on every gate poll; rebuilds only on change.
 function renderGenVersionPicker() {
-  if (!genVersionPickerEl) return;
-  const want = genVersions.map((v) => `v${v}`).join("|") + `@${genVersion ?? ""}`;
-  if (genVersionPickerEl.dataset.sig === want) return;
-  genVersionPickerEl.dataset.sig = want;
-  genVersionPickerEl.innerHTML = "";
-  for (const v of genVersions) {
-    const opt = document.createElement("option");
-    opt.value = v;
-    opt.textContent = `v${v}`;
-    if (v === genVersion) opt.selected = true;
-    genVersionPickerEl.appendChild(opt);
-  }
+	if (!genVersionPickerEl) return;
+	const want =
+		genVersions.map((v) => `v${v}`).join("|") + `@${genVersion ?? ""}`;
+	if (genVersionPickerEl.dataset.sig === want) return;
+	genVersionPickerEl.dataset.sig = want;
+	genVersionPickerEl.innerHTML = "";
+	for (const v of genVersions) {
+		const opt = document.createElement("option");
+		opt.value = v;
+		opt.textContent = `v${v}`;
+		if (v === genVersion) opt.selected = true;
+		genVersionPickerEl.appendChild(opt);
+	}
 }
 
 function applyAssetModeUI() {
-  if (assetModeToggleEl) {
-    assetModeToggleEl.textContent = `assets: ${assetMode}`;
-    assetModeToggleEl.classList.toggle("generated", assetMode === "generated");
-  }
-  renderGenVersionPicker();
-  updateGenerateGate();
+	if (assetModeToggleEl) {
+		assetModeToggleEl.textContent = `assets: ${assetMode}`;
+		assetModeToggleEl.classList.toggle(
+			"generated",
+			assetMode === "generated",
+		);
+	}
+	if (genOptimizeToggleEl) {
+		genOptimizeToggleEl.textContent = `optimized: ${genOptimized ? "on" : "off"}`;
+		genOptimizeToggleEl.classList.toggle("off", !genOptimized);
+	}
+	renderGenVersionPicker();
+	updateGenerateGate();
 }
 
 // Swap the rendered meshes for the active asset mode WITHOUT disturbing the
 // tree/bboxes: drop the attached GLBs, bump sceneGen so any in-flight bundle is
 // ignored, then re-stream from the now-current mode's folder.
 function reloadMeshesForAssetMode() {
-  if (currentSlotId === null || currentModel === null) return;
-  for (const obj of modelsById.values()) {
-    sceneRoot.remove(obj);
-    disposeObject3D(obj);
-  }
-  modelsById.clear();
-  // Bundle reload re-attaches everything; drop version baselines so the next
-  // gate poll re-establishes them against the freshly streamed meshes.
-  genMeshVersions.clear();
-  resetModelQueue();
-  updateMissingMeshCount();
-  prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
+	if (currentSlotId === null || currentModel === null) return;
+	for (const obj of modelsById.values()) {
+		sceneRoot.remove(obj);
+		disposeObject3D(obj);
+	}
+	modelsById.clear();
+	// Bundle reload re-attaches everything; drop version baselines so the next
+	// gate poll re-establishes them against the freshly streamed meshes, and drop
+	// every per-asset optimize override so the reloaded scene starts uniform on
+	// the (possibly just-changed) scene-wide setting.
+	genMeshVersions.clear();
+	genMeshSymmetry.clear();
+	genMeshOptimized.clear();
+	resetModelQueue();
+	updateMissingMeshCount();
+	prefetchMeshBundle(currentSlotId, currentModel, sceneGen);
+}
+
+// Per-asset effective optimize state: the override the user pinned from the
+// detail panel, else the scene-wide default. The single place every per-mesh url
+// reads, so one toggled asset streams from the other folder while the rest of
+// the scene stays on the scene setting.
+function meshOptimizedFor(id) {
+	return genMeshOptimized.has(id) ? genMeshOptimized.get(id) : genOptimized;
+}
+
+// The generated subfolder a url points at: the served optimized twin (default)
+// or the raw, bbox-fitted Trellis mesh. `id` is optional — omitted (bundle /
+// global paths) it reads the scene-wide setting; given, it honors that asset's
+// per-asset override. Drives every per-mesh url (incremental load + detail
+// preview) so they track whichever folder the asset should show.
+function generatedSubdir(id) {
+	const optimized = id != null ? meshOptimizedFor(id) : genOptimized;
+	return optimized ? "objects-generated-optimized" : "objects-generated";
 }
 
 function generatedArtifactUrl(slotId, model, run, version, id, v) {
-  // Served from the selected version's optimized twin (decimated + KTX2 +
-  // Meshopt) — same as the /meshes?mode=generated bundle. `v` (the GLB's mtime)
-  // busts the loader + browser cache so a regenerated asset re-fetches instead
-  // of serving stale bytes keyed on the bare URL.
-  const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
-  return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generated/${encodeURIComponent(version)}/objects-generated-optimized/${encodeURIComponent(id)}.glb${bust}`,
-    SERVER_URL,
-  ).toString();
+	// Served from the selected version + this asset's effective optimize folder
+	// (its per-asset override, else the scene-wide toggle): the optimized twin
+	// (decimated + KTX2 + Meshopt) by default, or the raw objects-generated/ mesh
+	// when toggled off — the same folders the /meshes?mode=generated bundle uses.
+	// `v` (the GLB's mtime) busts the loader + browser cache so a regenerated
+	// asset re-fetches instead of serving stale bytes keyed on the bare URL.
+	const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
+	return new URL(
+		`/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generated/${encodeURIComponent(version)}/${generatedSubdir(id)}/${encodeURIComponent(id)}.glb${bust}`,
+		SERVER_URL,
+	).toString();
 }
 
 // The generated build's preview image: the Nano-Banana render copied beside each
-// optimized mesh (generated/<version>/objects-generated-optimized/<id>.png by
-// _optimize_asset), so the detail preview's image matches the mesh shown in
-// "generated" mode. `v` busts the cache on regenerate, same as the GLB.
+// mesh (<id>.png in both the raw and optimized folders), so the detail preview's
+// image matches the mesh shown in "generated" mode. Reads the same folder as the
+// toggle. `v` busts the cache on regenerate, same as the GLB.
 function generatedImageUrl(slotId, model, run, version, id, v) {
-  const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
-  return new URL(
-    `/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generated/${encodeURIComponent(version)}/objects-generated-optimized/${encodeURIComponent(id)}.png${bust}`,
-    SERVER_URL,
-  ).toString();
+	const bust = v != null ? `?v=${encodeURIComponent(v)}` : "";
+	return new URL(
+		`/artifacts/${encodeURIComponent(run)}/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generated/${encodeURIComponent(version)}/${generatedSubdir(id)}/${encodeURIComponent(id)}.png${bust}`,
+		SERVER_URL,
+	).toString();
 }
 
 // Attach one generated GLB by id. Mirrors attachBundleMesh's attach half. On a
@@ -5337,32 +6536,30 @@ function generatedImageUrl(slotId, model, run, version, id, v) {
 // export has finished — no permanent skip, no completion-time full reload.
 const _genLoading = new Set();
 async function loadGeneratedMesh(id, url, gen) {
-  if (gen !== sceneGen) return;
-  let gltf;
-  try {
-    gltf = await loader.loadAsync(url);
-  } catch {
-    return;
-  }
-  if (gen !== sceneGen) { disposeObject3D(gltf.scene); return; }
-  gltf.scene.traverse((child) => {
-    if (child.isMesh && child.material) {
-      const mats = Array.isArray(child.material) ? child.material : [child.material];
-      for (const m of mats) m.side = THREE.DoubleSide;
-    }
-  });
-  gltf.scene.name = `mesh:${id}`;
-  gltf.scene.userData.pickId = id;
-  const prev = modelsById.get(id);
-  if (prev) {
-    sceneRoot.remove(prev);
-    disposeObject3D(prev);
-  }
-  sceneRoot.add(gltf.scene);
-  modelsById.set(id, gltf.scene);
-  applyModelVisibility(id);
-  upsertAsset(id, { status: "loaded" });
-  scheduleFitToScene();
+	if (gen !== sceneGen) return;
+	let gltf;
+	try {
+		gltf = await loader.loadAsync(url);
+	} catch {
+		return;
+	}
+	if (gen !== sceneGen) {
+		disposeObject3D(gltf.scene);
+		return;
+	}
+	prepareLoadedScene(gltf.scene);
+	gltf.scene.name = `mesh:${id}`;
+	gltf.scene.userData.pickId = id;
+	const prev = modelsById.get(id);
+	if (prev) {
+		sceneRoot.remove(prev);
+		disposeObject3D(prev);
+	}
+	sceneRoot.add(gltf.scene);
+	modelsById.set(id, gltf.scene);
+	applyModelVisibility(id);
+	upsertAsset(id, { status: "loaded" });
+	scheduleFitToScene();
 }
 
 // Reconcile attached generated meshes against the gate's reported set. `meshes`
@@ -5373,190 +6570,342 @@ async function loadGeneratedMesh(id, url, gen) {
 //     cache-busted URL (loadGeneratedMesh disposes the old mesh and swaps the
 //     new one in), then clear the regenerating flag + refresh the open detail.
 function syncGeneratedMeshes(meshes, slotId, model, run, version) {
-  for (const { id, v } of meshes) {
-    if (_genLoading.has(id)) continue;
-    const attached = modelsById.has(id);
-    const known = genMeshVersions.get(id);
-    if (attached && known === undefined) {
-      genMeshVersions.set(id, v);   // bundle-loaded — baseline only, don't reload
-      continue;
-    }
-    if (attached && known === v) continue;   // unchanged
-    const isReload = attached;
-    genMeshVersions.set(id, v);
-    _genLoading.add(id);
-    const gen = sceneGen;
-    loadGeneratedMesh(id, generatedArtifactUrl(slotId, model, run, version, id, v), gen)
-      .finally(() => {
-        _genLoading.delete(id);
-        const wasRegenerating = regeneratingIds.delete(id);
-        if ((isReload || wasRegenerating) && id === selectedBboxId) renderTreeDetail();
-      });
-  }
+	for (const { id, v } of meshes) {
+		if (_genLoading.has(id)) continue;
+		const attached = modelsById.has(id);
+		const known = genMeshVersions.get(id);
+		if (attached && known === undefined) {
+			genMeshVersions.set(id, v); // bundle-loaded — baseline only, don't reload
+			continue;
+		}
+		if (attached && known === v) continue; // unchanged
+		// While the one-connection bundle for this scene is still streaming, let it
+		// deliver not-yet-attached ids instead of racing it with a per-mesh fetch —
+		// raw (un-optimized) meshes are ~100x heavier, so a duplicate pull is very
+		// costly. Once the bundle finishes (streaming=false) the poll tops up
+		// anything it didn't carry (parse miss, or a mesh built after the snapshot).
+		if (!attached && meshBundle.gen === sceneGen && meshBundle.streaming)
+			continue;
+		const isReload = attached;
+		genMeshVersions.set(id, v);
+		_genLoading.add(id);
+		const gen = sceneGen;
+		loadGeneratedMesh(
+			id,
+			generatedArtifactUrl(slotId, model, run, version, id, v),
+			gen,
+		).finally(() => {
+			_genLoading.delete(id);
+			const wasRegenerating = regeneratingIds.delete(id);
+			const wasUnsymmetrizing = unsymmetrizingIds.delete(id);
+			if (
+				(isReload || wasRegenerating || wasUnsymmetrizing) &&
+				id === selectedBboxId
+			) {
+				renderTreeDetail();
+			}
+		});
+	}
+}
+
+// Per-asset optimize override: flip ONE generated asset between its optimized
+// twin and its raw Trellis mesh, leaving every other asset on the scene-wide
+// `genOptimized` setting. Records an override (or drops it when the choice lands
+// back on the scene default), then reloads just this mesh — generatedSubdir(id)
+// already points its url at the now-effective folder. The override is view-only
+// and resets whenever the scene re-streams (cell switch, asset-mode /
+// scene-optimize / version change). Generated mode only.
+//
+// We deliberately don't touch genMeshVersions here: the gate poll keeps that
+// baselined to the scene-default folder's mtime, so its steady-state
+// `known === v` check still skips this id (no revert), while a regenerate that
+// bumps the mtime reloads it from the override folder via generatedSubdir(id).
+function toggleMeshOptimized(id) {
+	if (assetMode !== "generated" || genVersion == null) return;
+	if (currentSlotId === null || currentModel === null) return;
+	if (_genLoading.has(id)) return;
+	const next = !meshOptimizedFor(id);
+	if (next === genOptimized) genMeshOptimized.delete(id);
+	else genMeshOptimized.set(id, next);
+	const v = genMeshVersions.get(id);
+	const gen = sceneGen;
+	_genLoading.add(id);
+	loadGeneratedMesh(
+		id,
+		generatedArtifactUrl(
+			currentSlotId,
+			currentModel,
+			currentRun,
+			genVersion,
+			id,
+			v,
+		),
+		gen,
+	).finally(() => {
+		_genLoading.delete(id);
+		if (id === selectedBboxId) renderTreeDetail();
+	});
+	// Repaint the detail button (label + disabled) immediately, before the load.
+	if (id === selectedBboxId) renderTreeDetail();
 }
 
 // The gate: kick off a from-scratch build for the open cell. The button is
 // disabled while one is in flight (and re-enabled once the poll sees it done),
 // so a build can't be triggered on top of itself.
 async function startGenerate() {
-  if (generating || currentSlotId === null || currentModel === null) return;
-  const slotId = currentSlotId, model = currentModel, run = currentRun;
-  let body;
-  try {
-    const res = await fetch(slotGenerateUrl(slotId, model, run, genVersion), { method: "POST" });
-    body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setStatus(`generate failed: ${body.detail ?? `HTTP ${res.status}`}`, "err");
-      return;
-    }
-  } catch (e) {
-    setStatus(`generate failed: ${e.message}`, "err");
-    return;
-  }
-  // Adopt the version the server resolved (creates v1 when the cell had none),
-  // switching the view to it if it differs from what we were showing.
-  if (body.version != null && body.version !== genVersion) {
-    selectGenVersion(body.version);
-  }
-  generating = true;
-  _genWasRunning = true;
-  updateGenerateGate();
-  setStatus(`generating v${genVersion ?? body.version} assets — Nano-Banana + Trellis (this can take a while)…`);
+	if (generating || currentSlotId === null || currentModel === null) return;
+	const slotId = currentSlotId,
+		model = currentModel,
+		run = currentRun;
+	let body;
+	try {
+		const res = await fetch(
+			slotGenerateUrl(slotId, model, run, genVersion),
+			{ method: "POST" },
+		);
+		body = await res.json().catch(() => ({}));
+		if (!res.ok) {
+			setStatus(
+				`generate failed: ${body.detail ?? `HTTP ${res.status}`}`,
+				"err",
+			);
+			return;
+		}
+	} catch (e) {
+		setStatus(`generate failed: ${e.message}`, "err");
+		return;
+	}
+	// Adopt the version the server resolved (creates v1 when the cell had none),
+	// switching the view to it if it differs from what we were showing.
+	if (body.version != null && body.version !== genVersion) {
+		selectGenVersion(body.version);
+	}
+	generating = true;
+	_genWasRunning = true;
+	updateGenerateGate();
+	setStatus(
+		`generating v${genVersion ?? body.version} assets — Nano-Banana + Trellis (this can take a while)…`,
+	);
 }
 
 // Switch the viewed generated version: stream that version's finished meshes now;
 // the gate poll tops up the rest and records per-mesh version tokens.
 function selectGenVersion(v) {
-  if (v == null) return;
-  const next = String(v);
-  if (next === genVersion) return;
-  genVersion = next;
-  if (!genVersions.includes(next)) {
-    genVersions = [...genVersions, next].sort((a, b) => Number(a) - Number(b));
-  }
-  applyAssetModeUI();
-  reloadMeshesForAssetMode();
-  if (selectedBboxId !== null) renderTreeDetail();
+	if (v == null) return;
+	const next = String(v);
+	if (next === genVersion) return;
+	genVersion = next;
+	if (!genVersions.includes(next)) {
+		genVersions = [...genVersions, next].sort(
+			(a, b) => Number(a) - Number(b),
+		);
+	}
+	applyAssetModeUI();
+	reloadMeshesForAssetMode();
+	if (selectedBboxId !== null) renderTreeDetail();
 }
 
 // Create a fresh from-scratch version of this scene (its own generated/<v>/
 // folder) and start building into it. The new (empty) version is selected
 // immediately; assets pop in as the build produces them.
 async function newGenVersion() {
-  if (currentSlotId === null || currentModel === null) return;
-  const slotId = currentSlotId, model = currentModel, run = currentRun;
-  let body;
-  try {
-    const u = new URL(slotGenerateUrl(slotId, model, run, null));
-    u.searchParams.set("new", "true");
-    const res = await fetch(u.toString(), { method: "POST" });
-    body = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      setStatus(`new version failed: ${body.detail ?? `HTTP ${res.status}`}`, "err");
-      return;
-    }
-  } catch (e) {
-    setStatus(`new version failed: ${e.message}`, "err");
-    return;
-  }
-  if (body.version != null) selectGenVersion(body.version);
-  generating = true;
-  _genWasRunning = true;
-  updateGenerateGate();
-  setStatus(`generating new version v${body.version} — Nano-Banana + Trellis (this can take a while)…`);
+	if (currentSlotId === null || currentModel === null) return;
+	const slotId = currentSlotId,
+		model = currentModel,
+		run = currentRun;
+	let body;
+	try {
+		const u = new URL(slotGenerateUrl(slotId, model, run, null));
+		u.searchParams.set("new", "true");
+		const res = await fetch(u.toString(), { method: "POST" });
+		body = await res.json().catch(() => ({}));
+		if (!res.ok) {
+			setStatus(
+				`new version failed: ${body.detail ?? `HTTP ${res.status}`}`,
+				"err",
+			);
+			return;
+		}
+	} catch (e) {
+		setStatus(`new version failed: ${e.message}`, "err");
+		return;
+	}
+	if (body.version != null) selectGenVersion(body.version);
+	generating = true;
+	_genWasRunning = true;
+	updateGenerateGate();
+	setStatus(
+		`generating new version v${body.version} — Nano-Banana + Trellis (this can take a while)…`,
+	);
+}
+
+// Fork a new version that REUSES the currently-viewed version's Nano-Banana
+// images and rebuilds every mesh fresh with Trellis — no new image generation.
+// Use it to re-roll a bad mesh pass while keeping a good image pass: select the
+// version whose images you like, click this, get a new version built from them.
+async function regenerateSceneFromImages() {
+	if (currentSlotId === null || currentModel === null || genVersion == null)
+		return;
+	const slotId = currentSlotId,
+		model = currentModel,
+		run = currentRun;
+	const sourceVersion = genVersion;
+	let body;
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/generate-from-images/${encodeURIComponent(sourceVersion)}?run=${encodeURIComponent(run)}`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		body = await res.json().catch(() => ({}));
+		if (!res.ok) {
+			setStatus(
+				`rebuild from images failed: ${body.detail ?? `HTTP ${res.status}`}`,
+				"err",
+			);
+			return;
+		}
+	} catch (e) {
+		setStatus(`rebuild from images failed: ${e.message}`, "err");
+		return;
+	}
+	if (body.version != null) selectGenVersion(body.version);
+	generating = true;
+	_genWasRunning = true;
+	updateGenerateGate();
+	setStatus(
+		`generating v${body.version} from v${sourceVersion}'s ${body.seeded_images ?? ""} image(s) — Trellis only, no new Nano-Banana (this can take a while)…`,
+	);
 }
 
 // Poll the open cell's build state while the generated view is active: keep the
 // gate's disabled state in sync, and pull the freshly built meshes in the
 // moment a build we were watching finishes.
 async function refreshGenerateGate() {
-  const cellKey =
-    currentSlotId !== null && currentModel !== null
-      ? `${currentRun}/${currentSlotId}/${currentModel}/${genVersion ?? ""}`
-      : null;
-  if (cellKey !== _genCellKey) {
-    _genCellKey = cellKey;
-    _genWasRunning = false;
-  }
-  if (assetMode !== "generated" || currentSlotId === null || currentModel === null) {
-    _genWasRunning = false;
-    return;
-  }
-  const slotId = currentSlotId;
-  const model = currentModel;
-  const run = currentRun;
-  const reqVersion = genVersion;   // version this poll asked about (may be null)
-  let status;
-  try {
-    const res = await fetch(slotGenerateUrl(slotId, model, run, reqVersion), { cache: "no-store" });
-    if (!res.ok) return;
-    status = await res.json();
-  } catch {
-    return;
-  }
-  // Bail if the user switched cell/mode or picked a different version while the
-  // poll was in flight — a later poll handles the new selection.
-  if (
-    assetMode !== "generated" ||
-    currentSlotId !== slotId ||
-    currentModel !== model ||
-    currentRun !== run ||
-    genVersion !== reqVersion
-  ) {
-    return;
-  }
-  // Refresh the available versions + picker.
-  const nextVersions = status.versions ?? [];
-  const versionsChanged = nextVersions.join("|") !== genVersions.join("|");
-  genVersions = nextVersions;
-  // Adopt the server's resolved version when we hadn't picked one yet. The cell
-  // load already streamed the latest (version omitted), which equals this, so no
-  // reload — syncGeneratedMeshes below just records the per-mesh version tokens.
-  if (genVersion == null && status.version != null) {
-    genVersion = status.version;
-  }
-  if (versionsChanged || genVersionPickerEl?.value !== genVersion) renderGenVersionPicker();
-  generating = !!status.running;
-  updateGenerateGate();
-  // Reconcile attached meshes with the build's set for the version we're viewing:
-  // new ones pop in as the build produces them, and a regenerated asset (same id,
-  // bumped version) reloads in place. A node caught mid-write just isn't added
-  // this tick and is retried next (loadGeneratedMesh doesn't cache the failure).
-  if (status.version === genVersion && genVersion != null) {
-    const meshes = status.meshes ?? (status.ids ?? []).map((id) => ({ id, v: null }));
-    syncGeneratedMeshes(meshes, slotId, model, run, genVersion);
-  }
-  if (_genWasRunning && !status.running) {
-    setStatus(`generated ${status.count} asset(s) — showing v${genVersion}`);
-    // Build idle: anything still flagged regenerating either landed (cleared in
-    // syncGeneratedMeshes) or failed without changing — drop the stragglers so
-    // the detail button doesn't stick on "regenerating…".
-    if (regeneratingIds.size > 0) {
-      regeneratingIds.clear();
-      if (selectedBboxId !== null) renderTreeDetail();
-    }
-  }
-  _genWasRunning = !!status.running;
+	const cellKey =
+		currentSlotId !== null && currentModel !== null
+			? `${currentRun}/${currentSlotId}/${currentModel}/${genVersion ?? ""}`
+			: null;
+	if (cellKey !== _genCellKey) {
+		_genCellKey = cellKey;
+		_genWasRunning = false;
+	}
+	if (
+		assetMode !== "generated" ||
+		currentSlotId === null ||
+		currentModel === null
+	) {
+		_genWasRunning = false;
+		return;
+	}
+	const slotId = currentSlotId;
+	const model = currentModel;
+	const run = currentRun;
+	const reqVersion = genVersion; // version this poll asked about (may be null)
+	const reqOptimized = genOptimized; // folder this poll asked about (raw ↔ optimized)
+	let status;
+	try {
+		const res = await fetch(
+			slotGenerateUrl(slotId, model, run, reqVersion, reqOptimized),
+			{ cache: "no-store" },
+		);
+		if (!res.ok) return;
+		status = await res.json();
+	} catch {
+		return;
+	}
+	// Bail if the user switched cell/mode or picked a different version while the
+	// poll was in flight — a later poll handles the new selection.
+	if (
+		assetMode !== "generated" ||
+		currentSlotId !== slotId ||
+		currentModel !== model ||
+		currentRun !== run ||
+		genVersion !== reqVersion ||
+		genOptimized !== reqOptimized
+	) {
+		return;
+	}
+	// Refresh the available versions + picker.
+	const nextVersions = status.versions ?? [];
+	const versionsChanged = nextVersions.join("|") !== genVersions.join("|");
+	genVersions = nextVersions;
+	// Adopt the server's resolved version when we hadn't picked one yet. The cell
+	// load already streamed the latest (version omitted), which equals this, so no
+	// reload — syncGeneratedMeshes below just records the per-mesh version tokens.
+	if (genVersion == null && status.version != null) {
+		genVersion = status.version;
+	}
+	if (versionsChanged || genVersionPickerEl?.value !== genVersion)
+		renderGenVersionPicker();
+	generating = !!status.running;
+	updateGenerateGate();
+	// Reconcile attached meshes with the build's set for the version we're viewing:
+	// new ones pop in as the build produces them, and a regenerated asset (same id,
+	// bumped version) reloads in place. A node caught mid-write just isn't added
+	// this tick and is retried next (loadGeneratedMesh doesn't cache the failure).
+	if (status.version === genVersion && genVersion != null) {
+		const meshes =
+			status.meshes ?? (status.ids ?? []).map((id) => ({ id, v: null }));
+		for (const m of meshes) genMeshSymmetry.set(m.id, m.sym ?? "none");
+		syncGeneratedMeshes(meshes, slotId, model, run, genVersion);
+	}
+	if (_genWasRunning && !status.running) {
+		setStatus(
+			`generated ${status.count} asset(s) — showing v${genVersion}`,
+		);
+		// Build idle: anything still flagged regenerating/un-symmetrizing either
+		// landed (cleared in syncGeneratedMeshes) or failed without changing — drop
+		// the stragglers so the detail buttons don't stick on their in-flight label.
+		if (regeneratingIds.size > 0 || unsymmetrizingIds.size > 0) {
+			regeneratingIds.clear();
+			unsymmetrizingIds.clear();
+			if (selectedBboxId !== null) renderTreeDetail();
+		}
+	}
+	_genWasRunning = !!status.running;
 }
 
 assetModeToggleEl?.addEventListener("click", () => {
-  assetMode = assetMode === "library" ? "generated" : "library";
-  try { localStorage.setItem(ASSET_MODE_STORAGE_KEY, assetMode); } catch {}
-  applyAssetModeUI();
-  // Bulk-load the target build's meshes over one connection; the gate poll then
-  // tops up any that finish afterward and syncs the gate's enabled state.
-  reloadMeshesForAssetMode();
-  // Re-resolve the open detail preview for the new mode (its urls read
-  // assetMode); the generated mesh repaints once the bundle re-streams it.
-  if (selectedBboxId !== null) renderTreeDetail();
-  // Populate the version picker + resolve the selected version now rather than
-  // waiting up to a full poll tick.
-  if (assetMode === "generated") refreshGenerateGate();
+	assetMode = assetMode === "library" ? "generated" : "library";
+	try {
+		localStorage.setItem(ASSET_MODE_STORAGE_KEY, assetMode);
+	} catch {}
+	applyAssetModeUI();
+	// Bulk-load the target build's meshes over one connection; the gate poll then
+	// tops up any that finish afterward and syncs the gate's enabled state.
+	reloadMeshesForAssetMode();
+	// Re-resolve the open detail preview for the new mode (its urls read
+	// assetMode); the generated mesh repaints once the bundle re-streams it.
+	if (selectedBboxId !== null) renderTreeDetail();
+	// Populate the version picker + resolve the selected version now rather than
+	// waiting up to a full poll tick.
+	if (assetMode === "generated") refreshGenerateGate();
+});
+genOptimizeToggleEl?.addEventListener("click", () => {
+	genOptimized = !genOptimized;
+	try {
+		localStorage.setItem(
+			GEN_OPTIMIZED_STORAGE_KEY,
+			genOptimized ? "optimized" : "raw",
+		);
+	} catch {}
+	applyAssetModeUI();
+	// Re-stream the cell's meshes from the now-current folder (raw ↔ optimized);
+	// the gate poll then reconciles per-mesh version tokens against that folder.
+	reloadMeshesForAssetMode();
+	// The open detail preview reads the toggle for its image + mini-viewer urls.
+	if (selectedBboxId !== null) renderTreeDetail();
+	// Re-resolve the gate against the new folder now rather than waiting a tick.
+	refreshGenerateGate();
 });
 genVersionPickerEl?.addEventListener("change", () => {
-  selectGenVersion(genVersionPickerEl.value);
+	selectGenVersion(genVersionPickerEl.value);
 });
 genVersionNewEl?.addEventListener("click", newGenVersion);
+genFromImagesEl?.addEventListener("click", regenerateSceneFromImages);
 generateGateEl?.addEventListener("click", startGenerate);
 applyAssetModeUI();
 setInterval(refreshGenerateGate, 2000);
@@ -5565,122 +6914,144 @@ setInterval(refreshGenerateGate, 2000);
 //
 // User clicks "replay → gif" → a modal opens. The user can preview the
 // build (re-dispatches the entire `recordedEvents` log against the live
-// scene at controlled speed) and then export an animated GIF.
+// scene) and then export an animated GIF.
 //
-// Mechanism: we wipe the current scene, then walk the recorded log,
-// chunking events into per-frame batches. Each batch is dispatched, the
-// renderer draws once, and (in record mode) the canvas pixels are pushed
-// into a gif.js encoder. Mesh GLB loads remain async — they'll pop into
-// the gif whenever the loader resolves, which for cached artifacts is
-// usually within a frame or two.
+// Timing model: one frame per recorded event, each held for the chosen
+// `interval` (ms). That single knob is both the gif frame delay and the
+// preview step delay, so encoded duration is frames × interval + a short end
+// hold — no fps/speed coupling. We walk the log, dispatch each event, draw
+// once, and (in record mode) push the canvas pixels into a gif.js encoder.
+// Mesh GLB loads remain async — they'll pop into the gif whenever the loader
+// resolves, which for cached artifacts is usually within a frame or two.
 
 function updateReplayButton() {
-  if (!replayGifEl) return;
-  replayGifEl.disabled = recordedEvents.length === 0;
+	if (!replayGifEl) return;
+	replayGifEl.disabled = recordedEvents.length === 0;
 }
 updateReplayButton();
 
-let replayActive = false;       // true while preview or record is running
+let replayActive = false; // true while preview or record is running
 let replayCancelRequested = false;
-let replayInProgress = false;   // gates concurrent invocations of run()
+let replayInProgress = false; // gates concurrent invocations of run()
 
-// Max output width for the encoded gif. The renderer's backing buffer can be
-// 2-3× the CSS size on retina, which makes gifs enormous; we downscale every
-// captured frame through an offscreen canvas to this cap before encoding.
+// Default max output width for the encoded gif. The renderer's backing buffer
+// can be 2-3× the CSS size on retina, which makes gifs enormous; we downscale
+// every captured frame through an offscreen canvas to this cap before encoding.
+// The replay modal's resolution dropdown overrides this per-render (see
+// readReplayResolution); this is the fallback when the control is unparseable
+// and the value of its default-selected option.
 const GIF_MAX_WIDTH = 540;
 
 function setReplayStatus(text, cls = "") {
-  replayStatusEl.textContent = text;
-  replayStatusEl.className = cls;
+	replayStatusEl.textContent = text;
+	replayStatusEl.className = cls;
 }
 
 function setReplayProgress(frac) {
-  replayProgressBarEl.style.width = `${Math.max(0, Math.min(1, frac)) * 100}%`;
+	replayProgressBarEl.style.width = `${Math.max(0, Math.min(1, frac)) * 100}%`;
 }
 
-function readReplaySpeed() {
-  return parseFloat(replaySpeedEl.value) || 1;
+// ms each recorded event ("change") is held on screen. This is the single
+// timing knob: it's both the gif frame delay and the preview step delay, so
+// the encoded duration is simply frames × interval (+ end hold) with no
+// fps/speed coupling.
+function readReplayInterval() {
+	return parseInt(replayIntervalEl.value, 10) || 50;
 }
 
-function readReplayFps() {
-  return parseInt(replayFpsEl.value, 10) || 15;
+// Selected gif width cap from the resolution dropdown. The "native" option has
+// value 0 → no cap (Infinity), letting the downscale factor clamp to 1 so the
+// gif encodes at the renderer's full backing-buffer size.
+function readReplayResolution() {
+	const v = parseInt(replayResolutionEl.value, 10);
+	if (Number.isNaN(v)) return GIF_MAX_WIDTH;
+	return v <= 0 ? Infinity : v;
 }
 
-// Walk the buffered events and group them into per-frame batches so the
-// preview/recording can advance at a fixed framerate. `eventsPerFrame =
-// max(1, round(totalEvents / targetTotalFrames))`, where targetTotalFrames
-// derives from the chosen fps and a base "1 event = 1/speed seconds" pace.
-function planFrames(events, fps, speed) {
-  // Target a build that takes roughly events / speed seconds at 1× — so
-  // total frames at our fps is (events / speed) * fps. Cap at 600 frames
-  // so very long runs don't try to encode minute-long gifs.
-  const targetFrames = Math.min(
-    600,
-    Math.max(8, Math.round((events.length / Math.max(0.25, speed)) * (fps / 30))),
-  );
-  const perFrame = Math.max(1, Math.ceil(events.length / targetFrames));
-  const batches = [];
-  for (let i = 0; i < events.length; i += perFrame) {
-    batches.push(events.slice(i, i + perFrame));
-  }
-  return batches;
+// Show the resulting encoded dimensions for the current pick next to the
+// dropdown, using the same downscale math runReplay applies so the label
+// matches what actually gets encoded.
+function updateResolutionEstimate() {
+	const maxW = readReplayResolution();
+	const srcW = renderer.domElement.width;
+	const srcH = renderer.domElement.height;
+	const scale = Math.min(1, maxW / srcW);
+	const w = Math.max(2, Math.round(srcW * scale));
+	const h = Math.max(2, Math.round(srcH * scale));
+	replayResolutionValEl.textContent = `${w}×${h}`;
+}
+
+// One frame per recorded event — each "change" gets its own gif frame, held
+// for the chosen interval. Logs longer than REPLAY_MAX_FRAMES group events
+// evenly so file size / encode time stay bounded; the duration estimate reads
+// the real frame count so it always matches the encode.
+const REPLAY_MAX_FRAMES = 600;
+
+// Final still frame appended after the build completes so the finished scene
+// registers before the gif loops. Counted in the duration estimate.
+const REPLAY_HOLD_MS = 800;
+
+function planFrames(events) {
+	const perFrame = Math.max(1, Math.ceil(events.length / REPLAY_MAX_FRAMES));
+	const batches = [];
+	for (let i = 0; i < events.length; i += perFrame) {
+		batches.push(events.slice(i, i + perFrame));
+	}
+	return batches;
 }
 
 function updateDurationEstimate() {
-  const fps = readReplayFps();
-  const speed = readReplaySpeed();
-  const batches = planFrames(recordedEvents, fps, speed);
-  const seconds = batches.length / fps;
-  replayEventCountEl.textContent = String(recordedEvents.length);
-  replayDurationEstEl.textContent = batches.length === 0
-    ? "—"
-    : `${seconds.toFixed(1)}s · ${batches.length} frames`;
+	const interval = readReplayInterval();
+	const batches = planFrames(recordedEvents);
+	const seconds = (batches.length * interval + REPLAY_HOLD_MS) / 1000;
+	replayEventCountEl.textContent = String(recordedEvents.length);
+	replayDurationEstEl.textContent =
+		batches.length === 0
+			? "—"
+			: `${seconds.toFixed(1)}s · ${batches.length} frames`;
 }
 
-replaySpeedEl.addEventListener("input", () => {
-  replaySpeedValEl.textContent = `${parseFloat(replaySpeedEl.value).toFixed(2)}×`;
-  updateDurationEstimate();
+replayIntervalEl.addEventListener("input", () => {
+	replayIntervalValEl.textContent = `${replayIntervalEl.value} ms`;
+	updateDurationEstimate();
 });
-replayFpsEl.addEventListener("input", () => {
-  replayFpsValEl.textContent = `${replayFpsEl.value} fps`;
-  updateDurationEstimate();
-});
+replayResolutionEl.addEventListener("change", updateResolutionEstimate);
 
 function openReplayModal() {
-  if (recordedEvents.length === 0) return;
-  replayModalEl.classList.add("open");
-  replaySpeedValEl.textContent = `${parseFloat(replaySpeedEl.value).toFixed(2)}×`;
-  replayFpsValEl.textContent = `${replayFpsEl.value} fps`;
-  updateDurationEstimate();
-  setReplayStatus("idle");
-  setReplayProgress(0);
-  showReplayPlaceholder();
+	if (recordedEvents.length === 0) return;
+	replayModalEl.classList.add("open");
+	replayIntervalValEl.textContent = `${replayIntervalEl.value} ms`;
+	updateDurationEstimate();
+	updateResolutionEstimate();
+	setReplayStatus("idle");
+	setReplayProgress(0);
+	showReplayPlaceholder();
 }
 
 function closeReplayModal() {
-  // If a replay is mid-run, request cancellation; the run loop checks the
-  // flag between frames and bails out, then we close. If nothing is
-  // running, close immediately.
-  if (replayActive) {
-    replayCancelRequested = true;
-    return;
-  }
-  replayModalEl.classList.remove("open");
-  // Free the gif blob URL when the modal closes — keeping it alive across
-  // sessions would leak memory if the user repeatedly opens/saves.
-  if (lastGifUrl) {
-    URL.revokeObjectURL(lastGifUrl);
-    lastGifUrl = null;
-    lastGifBlob = null;
-    replayResultImgEl.removeAttribute("src");
-    replayDownloadEl.disabled = true;
-  }
+	// If a replay is mid-run, request cancellation; the run loop checks the
+	// flag between frames and bails out, then we close. If nothing is
+	// running, close immediately.
+	if (replayActive) {
+		replayCancelRequested = true;
+		return;
+	}
+	replayModalEl.classList.remove("open");
+	// Free the gif blob URL when the modal closes — keeping it alive across
+	// sessions would leak memory if the user repeatedly opens/saves.
+	if (lastGifUrl) {
+		URL.revokeObjectURL(lastGifUrl);
+		lastGifUrl = null;
+		lastGifBlob = null;
+		replayResultImgEl.removeAttribute("src");
+		replayDownloadEl.disabled = true;
+	}
 }
 
 replayGifEl.addEventListener("click", openReplayModal);
 replayCloseEl.addEventListener("click", closeReplayModal);
 replayModalEl.addEventListener("click", (ev) => {
-  if (ev.target === replayModalEl) closeReplayModal();
+	if (ev.target === replayModalEl) closeReplayModal();
 });
 
 // Walk the events for every `model` emission and fetch + parse each GLB in
@@ -5690,35 +7061,38 @@ replayModalEl.addEventListener("click", (ev) => {
 // the same id collapse to the latest url (mirrors the live last-write-wins
 // behavior).
 async function preloadReplayGlbs(events) {
-  const byId = new Map();
-  for (const e of events) {
-    if (e.kind === "model" && e.url) byId.set(e.id, e);
-  }
-  const total = byId.size;
-  const cache = new Map();
-  setReplayProgress(0);
-  if (total === 0) {
-    setReplayStatus("no meshes to preload");
-    return cache;
-  }
-  setReplayStatus(`preloading meshes… 0/${total}`, "recording");
-  let done = 0;
-  await Promise.all(
-    Array.from(byId.values()).map(async (e) => {
-      const absUrl = new URL(e.url, SERVER_URL).toString();
-      try {
-        const gltf = await loader.loadAsync(absUrl);
-        cache.set(e.id, { gltf });
-      } catch (err) {
-        cache.set(e.id, { error: err });
-      } finally {
-        done += 1;
-        setReplayStatus(`preloading meshes… ${done}/${total}`, "recording");
-        setReplayProgress(done / total);
-      }
-    }),
-  );
-  return cache;
+	const byId = new Map();
+	for (const e of events) {
+		if (e.kind === "model" && e.url) byId.set(e.id, e);
+	}
+	const total = byId.size;
+	const cache = new Map();
+	setReplayProgress(0);
+	if (total === 0) {
+		setReplayStatus("no meshes to preload");
+		return cache;
+	}
+	setReplayStatus(`preloading meshes… 0/${total}`, "recording");
+	let done = 0;
+	await Promise.all(
+		Array.from(byId.values()).map(async (e) => {
+			const absUrl = new URL(e.url, SERVER_URL).toString();
+			try {
+				const gltf = await loader.loadAsync(absUrl);
+				cache.set(e.id, { gltf });
+			} catch (err) {
+				cache.set(e.id, { error: err });
+			} finally {
+				done += 1;
+				setReplayStatus(
+					`preloading meshes… ${done}/${total}`,
+					"recording",
+				);
+				setReplayProgress(done / total);
+			}
+		}),
+	);
+	return cache;
 }
 
 // Snapshot the live scene + ephemeral UI state, wipe everything, replay the
@@ -5726,309 +7100,348 @@ async function preloadReplayGlbs(events) {
 // holding the final-state of the replay (which matches the live state).
 // Returns the encoded blob in record mode, or null in preview mode.
 async function runReplay({ record }) {
-  if (replayInProgress) return null;
-  replayInProgress = true;
-  replayActive = true;
-  replayCancelRequested = false;
-  setReplayProgress(0);
+	if (replayInProgress) return null;
+	replayInProgress = true;
+	replayActive = true;
+	replayCancelRequested = false;
+	setReplayProgress(0);
 
-  // Disconnect from the live SSE stream so server-pushed events don't race
-  // the replay. The user can reconnect via the resume / slot-switch paths
-  // afterwards; for a finished run nothing's incoming anyway.
-  const reconnectAfter = currentSource !== null;
-  const slotForReconnect = currentSlotId;
-  const modelForReconnect = currentModel;
-  if (currentSource) {
-    currentSource.close();
-    currentSource = null;
-  }
+	// Disconnect from the live SSE stream so server-pushed events don't race
+	// the replay. The user can reconnect via the resume / slot-switch paths
+	// afterwards; for a finished run nothing's incoming anyway.
+	const reconnectAfter = currentSource !== null;
+	const slotForReconnect = currentSlotId;
+	const modelForReconnect = currentModel;
+	if (currentSource) {
+		currentSource.close();
+		currentSource = null;
+	}
 
-  // Snapshot the recorded log + the current camera state so we restore them
-  // after the replay finishes (or the user cancels). The replay reuses the
-  // same dispatch path which resets `highestEventIndex` and clears state, so
-  // we have to take care to leave the user where they started.
-  const events = recordedEvents.slice();
-  const camSnapshot = {
-    pos: camera.position.clone(),
-    target: controls.target.clone(),
-    userMoved: cameraUserMoved,
-  };
+	// Snapshot the recorded log + the current camera state so we restore them
+	// after the replay finishes (or the user cancels). The replay reuses the
+	// same dispatch path which resets `highestEventIndex` and clears state, so
+	// we have to take care to leave the user where they started.
+	const events = recordedEvents.slice();
+	const camSnapshot = {
+		pos: camera.position.clone(),
+		target: controls.target.clone(),
+		userMoved: cameraUserMoved,
+	};
 
-  // Wipe everything that the replay will rebuild.
-  clearScene();
-  clearLog();
-  clearAssets();
-  treeClear();
-  clearMeshErrors();
-  highestEventIndex = -1;
-  recordedEvents.length = 0;
-  updateReplayButton();
+	// Wipe everything that the replay will rebuild.
+	clearScene();
+	clearLog();
+	clearAssets();
+	treeClear();
+	clearMeshErrors();
+	highestEventIndex = -1;
+	recordedEvents.length = 0;
+	updateReplayButton();
 
-  const fps = readReplayFps();
-  const speed = readReplaySpeed();
-  const batches = planFrames(events, fps, speed);
-  const frameIntervalMs = 1000 / fps;
+	const batches = planFrames(events);
+	const frameIntervalMs = readReplayInterval();
 
-  let gif = null;
-  let gifScaler = null;
-  let gifScalerCtx = null;
-  if (record) {
-    if (typeof window.GIF === "undefined") {
-      setReplayStatus("gif.js library failed to load", "err");
-      replayActive = false;
-      replayInProgress = false;
-      return null;
-    }
-    // The renderer's backing buffer is `cssSize * devicePixelRatio`, so on
-    // a retina display this is 2-3× the visible canvas. Feeding that
-    // straight into gif.js produces enormous (10-100MB) gifs. Downscale
-    // every frame through an offscreen canvas to a sane max width before
-    // adding it. 720px is a good balance of legibility and file size.
-    const srcW = renderer.domElement.width;
-    const srcH = renderer.domElement.height;
-    const scale = Math.min(1, GIF_MAX_WIDTH / srcW);
-    const gifW = Math.max(2, Math.round(srcW * scale));
-    const gifH = Math.max(2, Math.round(srcH * scale));
-    gifScaler = document.createElement("canvas");
-    gifScaler.width = gifW;
-    gifScaler.height = gifH;
-    gifScalerCtx = gifScaler.getContext("2d");
-    gif = new window.GIF({
-      workers: 2,
-      // gif.js's `quality` is inverted: HIGHER = coarser palette quantization
-      // = smaller files. 10 is the default; 30 trims size further with mild
-      // banding in mesh gradients (fine for benchmark gifs of mostly flat
-      // wireframes + a dark background).
-      quality: 30,
-      workerScript: "/vendor/gifjs/gif.worker.js",
-      width: gifW,
-      height: gifH,
-      background: "#101114",
-    });
-  }
+	let gif = null;
+	let gifScaler = null;
+	let gifScalerCtx = null;
+	if (record) {
+		if (typeof window.GIF === "undefined") {
+			setReplayStatus("gif.js library failed to load", "err");
+			replayActive = false;
+			replayInProgress = false;
+			return null;
+		}
+		// The renderer's backing buffer is `cssSize * devicePixelRatio`, so on
+		// a retina display this is 2-3× the visible canvas. Feeding that
+		// straight into gif.js produces enormous (10-100MB) gifs. Downscale
+		// every frame through an offscreen canvas to the width cap chosen in
+		// the resolution dropdown before adding it.
+		const maxWidth = readReplayResolution();
+		const srcW = renderer.domElement.width;
+		const srcH = renderer.domElement.height;
+		const scale = Math.min(1, maxWidth / srcW);
+		const gifW = Math.max(2, Math.round(srcW * scale));
+		const gifH = Math.max(2, Math.round(srcH * scale));
+		gifScaler = document.createElement("canvas");
+		gifScaler.width = gifW;
+		gifScaler.height = gifH;
+		gifScalerCtx = gifScaler.getContext("2d");
+		gif = new window.GIF({
+			workers: 2,
+			// gif.js's `quality` is inverted: HIGHER = coarser palette quantization
+			// = smaller files. 10 is the default; 30 trims size further with mild
+			// banding in mesh gradients (fine for benchmark gifs of mostly flat
+			// wireframes + a dark background).
+			quality: 30,
+			workerScript: "/vendor/gifjs/gif.worker.js",
+			width: gifW,
+			height: gifH,
+			background: "#101114",
+		});
+	}
 
-  // Lock the camera for the duration of the replay — otherwise fitToScene
-  // would refit on every mesh load and the gif would jitter. The user's
-  // current view persists through clearScene() (camera is in its own scene
-  // graph), so the gif captures whatever angle they're looking at right now;
-  // camSnapshot still restores the same view afterwards.
-  cameraUserMoved = true;
+	// Lock the camera for the duration of the replay — otherwise fitToScene
+	// would refit on every mesh load and the gif would jitter. The user's
+	// current view persists through clearScene() (camera is in its own scene
+	// graph), so the gif captures whatever angle they're looking at right now;
+	// camSnapshot still restores the same view afterwards.
+	cameraUserMoved = true;
 
-  // Start the preview stage with a blank frame so the user sees the modal
-  // switch out of the placeholder state immediately.
-  replayStageEl.classList.remove("show-result");
-  replayStageEl.classList.remove("empty");
+	// Start the preview stage with a blank frame so the user sees the modal
+	// switch out of the placeholder state immediately.
+	replayStageEl.classList.remove("show-result");
+	replayStageEl.classList.remove("empty");
 
-  // Preload every GLB referenced by the recorded events so the dispatch
-  // loop can attach meshes synchronously — otherwise mesh fetches lag the
-  // events that triggered them and the gif cuts off mid-load. If the user
-  // cancels during preload, fall through: the dispatch loop will see the
-  // cancel flag, skip itself, and let the normal cleanup tail run (which
-  // restores the camera + reconnects the SSE stream).
-  replayPreloadCache = await preloadReplayGlbs(events);
-  setReplayProgress(0);
-  if (!replayCancelRequested) {
-    setReplayStatus(record ? "recording…" : "previewing…", record ? "recording" : "");
-  }
+	// Preload every GLB referenced by the recorded events so the dispatch
+	// loop can attach meshes synchronously — otherwise mesh fetches lag the
+	// events that triggered them and the gif cuts off mid-load. If the user
+	// cancels during preload, fall through: the dispatch loop will see the
+	// cancel flag, skip itself, and let the normal cleanup tail run (which
+	// restores the camera + reconnects the SSE stream).
+	replayPreloadCache = await preloadReplayGlbs(events);
+	setReplayProgress(0);
+	if (!replayCancelRequested) {
+		setReplayStatus(
+			record ? "recording…" : "previewing…",
+			record ? "recording" : "",
+		);
+	}
 
-  for (let i = 0; i < batches.length; i++) {
-    if (replayCancelRequested) break;
-    const batch = batches[i];
-    for (const ev of batch) dispatchForReplay(ev);
-    // One render after each batch (renderer.render is also driven by the
-    // animate() loop, but doing it explicitly here guarantees a fresh frame
-    // before capture).
-    controls.update();
-    renderer.render(scene, camera);
-    if (gif) {
-      gifScalerCtx.drawImage(
-        renderer.domElement, 0, 0, gifScaler.width, gifScaler.height,
-      );
-      gif.addFrame(gifScaler, { copy: true, delay: frameIntervalMs });
-    }
-    // Mirror the freshly-rendered frame into the in-modal preview canvas
-    // so the user can watch the build play out without needing to look
-    // past the modal at the main viewport.
-    drawReplayFrame(renderer.domElement);
-    setReplayProgress(i / batches.length);
-    // Yield to the browser so it can paint the preview frame and the user
-    // can see progress in real time.
-    await sleep(frameIntervalMs);
-  }
+	for (let i = 0; i < batches.length; i++) {
+		if (replayCancelRequested) break;
+		const batch = batches[i];
+		for (const ev of batch) dispatchForReplay(ev);
+		// One render after each batch (renderer.render is also driven by the
+		// animate() loop, but doing it explicitly here guarantees a fresh frame
+		// before capture).
+		controls.update();
+		renderer.render(scene, camera);
+		if (gif) {
+			gifScalerCtx.drawImage(
+				renderer.domElement,
+				0,
+				0,
+				gifScaler.width,
+				gifScaler.height,
+			);
+			gif.addFrame(gifScaler, { copy: true, delay: frameIntervalMs });
+		}
+		// Mirror the freshly-rendered frame into the in-modal preview canvas
+		// so the user can watch the build play out without needing to look
+		// past the modal at the main viewport.
+		drawReplayFrame(renderer.domElement);
+		setReplayProgress(i / batches.length);
+		// Yield to the browser so it can paint the preview frame and the user
+		// can see progress in real time.
+		await sleep(frameIntervalMs);
+	}
 
-  // Final hold frame so viewers see the completed scene linger for a beat
-  // before the gif loops. 1500ms is long enough to register without making
-  // the loop feel stuck.
-  if (gif && !replayCancelRequested) {
-    controls.update();
-    renderer.render(scene, camera);
-    gifScalerCtx.drawImage(
-      renderer.domElement, 0, 0, gifScaler.width, gifScaler.height,
-    );
-    gif.addFrame(gifScaler, { copy: true, delay: 1500 });
-    drawReplayFrame(renderer.domElement);
-  }
-  setReplayProgress(1);
+	// Final hold frame so viewers see the completed scene linger for a beat
+	// before the gif loops. Kept short (REPLAY_HOLD_MS) and folded into the
+	// duration estimate so the gif never runs noticeably past the build.
+	if (gif && !replayCancelRequested) {
+		controls.update();
+		renderer.render(scene, camera);
+		gifScalerCtx.drawImage(
+			renderer.domElement,
+			0,
+			0,
+			gifScaler.width,
+			gifScaler.height,
+		);
+		gif.addFrame(gifScaler, { copy: true, delay: REPLAY_HOLD_MS });
+		drawReplayFrame(renderer.domElement);
+	}
+	setReplayProgress(1);
 
-  let blob = null;
-  if (gif && !replayCancelRequested) {
-    setReplayStatus("encoding gif…", "recording");
-    blob = await new Promise((resolve) => {
-      gif.on("finished", resolve);
-      gif.render();
-    });
-    setReplayStatus(`gif ready · ${(blob.size / 1024).toFixed(1)} KB`, "done");
-    // Swap the stage to an <img> of the encoded blob — animated gifs loop
-    // by default in the browser, so the user sees the final result play.
-    showReplayGifResult(blob);
-  } else if (replayCancelRequested) {
-    setReplayStatus("cancelled");
-  } else {
-    setReplayStatus("preview done", "done");
-  }
+	let blob = null;
+	if (gif && !replayCancelRequested) {
+		setReplayStatus("encoding gif…", "recording");
+		blob = await new Promise((resolve) => {
+			gif.on("finished", resolve);
+			gif.render();
+		});
+		setReplayStatus(
+			`gif ready · ${(blob.size / 1024).toFixed(1)} KB`,
+			"done",
+		);
+		// Swap the stage to an <img> of the encoded blob — animated gifs loop
+		// by default in the browser, so the user sees the final result play.
+		showReplayGifResult(blob);
+	} else if (replayCancelRequested) {
+		setReplayStatus("cancelled");
+	} else {
+		setReplayStatus("preview done", "done");
+	}
 
-  // Restore camera state.
-  camera.position.copy(camSnapshot.pos);
-  controls.target.copy(camSnapshot.target);
-  cameraUserMoved = camSnapshot.userMoved;
-  controls.update();
+	// Restore camera state.
+	camera.position.copy(camSnapshot.pos);
+	controls.target.copy(camSnapshot.target);
+	cameraUserMoved = camSnapshot.userMoved;
+	controls.update();
 
-  replayActive = false;
-  replayInProgress = false;
-  replayPreloadCache = null;
-  // recordedEvents has been refilled by dispatchForReplay during the loop;
-  // re-enable the button to reflect that.
-  updateReplayButton();
+	replayActive = false;
+	replayInProgress = false;
+	replayPreloadCache = null;
+	// recordedEvents has been refilled by dispatchForReplay during the loop;
+	// re-enable the button to reflect that.
+	updateReplayButton();
 
-  // Reconnect to the live stream so newly-arriving events flow back into
-  // the buffer. The server replays the snapshot from index 0 on reconnect,
-  // which re-populates `recordedEvents` for the next gif export.
-  if (reconnectAfter && slotForReconnect !== null && modelForReconnect !== null) {
-    subscribe(slotEventsUrl(slotForReconnect, modelForReconnect));
-  }
+	// Reconnect to the live stream so newly-arriving events flow back into
+	// the buffer. The server replays the snapshot from index 0 on reconnect,
+	// which re-populates `recordedEvents` for the next gif export.
+	if (
+		reconnectAfter &&
+		slotForReconnect !== null &&
+		modelForReconnect !== null
+	) {
+		subscribe(slotEventsUrl(slotForReconnect, modelForReconnect));
+	}
 
-  // If the user clicked the close button while a replay was running, honor
-  // that now that we've cleaned up.
-  if (replayCancelRequested) {
-    replayModalEl.classList.remove("open");
-  }
-  return blob;
+	// If the user clicked the close button while a replay was running, honor
+	// that now that we've cleaned up.
+	if (replayCancelRequested) {
+		replayModalEl.classList.remove("open");
+	}
+	return blob;
 }
 
 // Sibling of dispatch() used during replay. The buffer was wiped before
 // replay started; we refill it as we re-dispatch so the user can immediately
 // run another preview/export without waiting for an SSE reconnect.
 function dispatchForReplay(event) {
-  if (typeof event.index === "number") {
-    if (event.index <= highestEventIndex) return;
-    highestEventIndex = event.index;
-  }
-  recordedEvents.push(event);
-  appendEvent(event);
-  switch (event.kind) {
-    case "run.start": setStatus(`run :: ${event.model}`); break;
-    case "run.done":
-      if (meshErrors.size > 0) showRunCompleteWithErrors();
-      else setStatus("run complete");
-      break;
-    case "run.error": setStatus(`error: ${event.message}`, "err"); break;
-    case "run.paused": setStatus("paused"); break;
-    case "mesh.error":
-      meshErrors.set(event.id, event.message ?? "unknown error");
-      treeSetPhase(event.id, "error");
-      upsertAsset(event.id, { status: "error", errorMessage: event.message });
-      break;
-    case "mesh.retry":
-      meshErrors.delete(event.id);
-      upsertAsset(event.id, { status: "pending", errorMessage: null });
-      if (treeNodes.has(event.id)) treeSetPhase(event.id, "generating_mesh");
-      break;
-    case "bbox":
-      loadBbox(event);
-      treeUpsert(event.id, {
-        parentId: event.parent_id ?? null,
-        prompt: event.prompt ?? null,
-        kind: event.node_kind ?? "zone",
-        origin: event.origin,
-        dimensions: event.dimensions,
-        proxyShape: event.proxy_shape ?? null,
-      });
-      scheduleRenderTree();
-      break;
-    case "divider.decompose":
-    case "divider.zone_decompose":
-      for (const c of event.children ?? []) {
-        treeUpsert(c.id, { parentId: c.parent ?? event.node, prompt: c.prompt, kind: "zone" });
-      }
-      scheduleRenderTree();
-      break;
-    case "divider.zone_plan":
-      if (event.node && typeof event.plan === "string") {
-        treeUpsert(event.node, { plan: event.plan });
-      }
-      break;
-    case "step": treeSetPhase(event.node, event.phase); break;
-    case "mesh.submit": treeSetPhase(event.id, "generating_mesh"); break;
-    case "image":
-      upsertAsset(event.id, { imageUrl: event.url, prompt: event.prompt });
-      if (typeof event.prompt === "string") {
-        treeUpsert(event.id, { imagePrompt: event.prompt });
-      }
-      break;
-    case "model":
-      loadModel(event);
-      treeSetPhase(event.id, "done");
-      meshErrors.delete(event.id);
-      break;
-    case "cache.llm":
-      recordLlmCall(event);
-      break;
-  }
+	if (typeof event.index === "number") {
+		if (event.index <= highestEventIndex) return;
+		highestEventIndex = event.index;
+	}
+	recordedEvents.push(event);
+	appendEvent(event);
+	switch (event.kind) {
+		case "run.start":
+			setStatus(`run :: ${event.model}`);
+			break;
+		case "run.done":
+			if (meshErrors.size > 0) showRunCompleteWithErrors();
+			else setStatus("run complete");
+			break;
+		case "run.error":
+			setStatus(`error: ${event.message}`, "err");
+			break;
+		case "run.paused":
+			setStatus("paused");
+			break;
+		case "mesh.error":
+			meshErrors.set(event.id, event.message ?? "unknown error");
+			treeSetPhase(event.id, "error");
+			upsertAsset(event.id, {
+				status: "error",
+				errorMessage: event.message,
+			});
+			break;
+		case "mesh.retry":
+			meshErrors.delete(event.id);
+			upsertAsset(event.id, { status: "pending", errorMessage: null });
+			if (treeNodes.has(event.id))
+				treeSetPhase(event.id, "generating_mesh");
+			break;
+		case "bbox":
+			loadBbox(event);
+			treeUpsert(event.id, {
+				parentId: event.parent_id ?? null,
+				prompt: event.prompt ?? null,
+				kind: event.node_kind ?? "zone",
+				origin: event.origin,
+				dimensions: event.dimensions,
+				proxyShape: event.proxy_shape ?? null,
+			});
+			scheduleRenderTree();
+			break;
+		case "divider.decompose":
+		case "divider.zone_decompose":
+			for (const c of event.children ?? []) {
+				treeUpsert(c.id, {
+					parentId: c.parent ?? event.node,
+					prompt: c.prompt,
+					kind: "zone",
+				});
+			}
+			scheduleRenderTree();
+			break;
+		case "divider.zone_plan":
+			if (event.node && typeof event.plan === "string") {
+				treeUpsert(event.node, { plan: event.plan });
+			}
+			break;
+		case "step":
+			treeSetPhase(event.node, event.phase);
+			break;
+		case "mesh.submit":
+			treeSetPhase(event.id, "generating_mesh");
+			break;
+		case "image":
+			upsertAsset(event.id, {
+				imageUrl: event.url,
+				prompt: event.prompt,
+			});
+			if (typeof event.prompt === "string") {
+				treeUpsert(event.id, { imagePrompt: event.prompt });
+			}
+			break;
+		case "model":
+			loadModel(event);
+			treeSetPhase(event.id, "done");
+			meshErrors.delete(event.id);
+			break;
+		case "cache.llm":
+			recordLlmCall(event);
+			break;
+	}
 }
 
 function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+	return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function lockReplayButtons(locked) {
-  replayPreviewEl.disabled = locked;
-  replayRenderEl.disabled = locked;
-  // Download stays disabled until a successful render completes — flip it
-  // off here so an in-flight render can't be re-downloaded mid-encode, but
-  // don't blindly re-enable on unlock; showReplayGifResult will.
-  if (locked) replayDownloadEl.disabled = true;
+	replayPreviewEl.disabled = locked;
+	replayRenderEl.disabled = locked;
+	// Download stays disabled until a successful render completes — flip it
+	// off here so an in-flight render can't be re-downloaded mid-encode, but
+	// don't blindly re-enable on unlock; showReplayGifResult will.
+	if (locked) replayDownloadEl.disabled = true;
 }
 
 replayPreviewEl.addEventListener("click", async () => {
-  if (replayInProgress) return;
-  lockReplayButtons(true);
-  try {
-    await runReplay({ record: false });
-  } finally {
-    lockReplayButtons(false);
-    // Re-enable download only if we still have a previously-rendered gif.
-    replayDownloadEl.disabled = lastGifBlob === null;
-  }
+	if (replayInProgress) return;
+	lockReplayButtons(true);
+	try {
+		await runReplay({ record: false });
+	} finally {
+		lockReplayButtons(false);
+		// Re-enable download only if we still have a previously-rendered gif.
+		replayDownloadEl.disabled = lastGifBlob === null;
+	}
 });
 
 replayRenderEl.addEventListener("click", async () => {
-  if (replayInProgress) return;
-  lockReplayButtons(true);
-  try {
-    await runReplay({ record: true });
-  } finally {
-    lockReplayButtons(false);
-    replayDownloadEl.disabled = lastGifBlob === null;
-  }
+	if (replayInProgress) return;
+	lockReplayButtons(true);
+	try {
+		await runReplay({ record: true });
+	} finally {
+		lockReplayButtons(false);
+		replayDownloadEl.disabled = lastGifBlob === null;
+	}
 });
 
 replayDownloadEl.addEventListener("click", () => {
-  if (!lastGifBlob) return;
-  const a = document.createElement("a");
-  a.href = lastGifUrl;
-  const gifStem = currentSlotId && currentModel
-    ? `${currentSlotId}_${currentModel}`
-    : (currentSlotId ?? "replay");
-  a.download = `${gifStem}.gif`;
-  a.click();
+	if (!lastGifBlob) return;
+	const a = document.createElement("a");
+	a.href = lastGifUrl;
+	const gifStem =
+		currentSlotId && currentModel
+			? `${currentSlotId}_${currentModel}`
+			: (currentSlotId ?? "replay");
+	a.download = `${gifStem}.gif`;
+	a.click();
 });

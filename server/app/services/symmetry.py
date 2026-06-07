@@ -41,7 +41,7 @@ from app.core.slots import MODELS
 from app.core.types import BoundingBox, Orientation
 from app.services import llm
 from app.utils import logging
-from app.utils.geometry import rescale_mesh_to_bbox, symmetrize_mesh
+from app.utils.geometry import export_glb, rescale_mesh_to_bbox, symmetrize_mesh
 
 CutPlane = Literal["none", "xy", "xz"]
 
@@ -235,7 +235,7 @@ async def build_symmetric_glb(
         target = bbox if bbox is not None else _natural_bbox(symmetric)
         placed = rescale_mesh_to_bbox(symmetric, target, orientation=orientation)
         raw_out.parent.mkdir(parents=True, exist_ok=True)
-        placed.export(raw_out, file_type="glb")
+        export_glb(placed, raw_out)
         return {"triangles": int(len(placed.faces)), "raw_bytes": raw_out.stat().st_size}
 
     stats = await asyncio.to_thread(_process)

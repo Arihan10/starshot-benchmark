@@ -21,6 +21,7 @@ with per-axis scaling.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import numpy as np
 import trimesh
@@ -135,6 +136,13 @@ def symmetrize_mesh(
     if len(faces) == 0:
         raise ValueError("cut plane left an empty half; cannot symmetrize")
 
+    # A zero-area source triangle makes slice_faces_plane interpolate the new
+    # cut-vertex UV as 0/0 -> NaN; left in, trimesh writes a literal `NaN` into
+    # the exported GLB's accessor min/max (invalid JSON, crashes strict glTF
+    # readers like the optimizer's @gltf-transform). Clamp non-finite UVs to 0.
+    if uv is not None:
+        uv = np.nan_to_num(uv, nan=0.0, posinf=0.0, neginf=0.0)
+
     mirror = verts.copy()
     mirror[:, axis] = 2.0 * plane - mirror[:, axis]
     all_verts = np.vstack([verts, mirror])
@@ -150,3 +158,23 @@ def symmetrize_mesh(
     out = trimesh.Trimesh(vertices=all_verts, faces=all_faces, visual=visual, process=False)
     out.merge_vertices()
     return out
+
+
+def export_glb(mesh: trimesh.Trimesh | trimesh.Scene, path: Path) -> None:
+    """Export `mesh` to a GLB at `path`, clamping any non-finite UVs to 0 first.
+
+    trimesh writes each accessor's min/max straight from the array, so a single
+    NaN/inf UV (e.g. interpolated from a degenerate triangle during symmetrize)
+    emits a literal `NaN` token into the GLB's JSON chunk — invalid JSON that
+    crashes strict glTF readers (the optimizer's @gltf-transform NodeIO). This is
+    the last line of defence, independent of where a bad UV originated.
+    """
+    geoms = mesh.geometry.values() if isinstance(mesh, trimesh.Scene) else (mesh,)
+    for g in geoms:
+        uv = getattr(getattr(g, "visual", None), "uv", None)
+        if uv is None:
+            continue
+        uv = np.asarray(uv, dtype=np.float64)
+        if not np.isfinite(uv).all():
+            g.visual.uv = np.nan_to_num(uv, nan=0.0, posinf=0.0, neginf=0.0)
+    mesh.export(path, file_type="glb")

@@ -26,6 +26,7 @@ import json
 import os
 from pathlib import Path
 
+from app.core.types import BoundingBox
 from app.services import mesh_jobs
 
 HUNYUAN_MODEL = "hunyuan-omni"
@@ -42,8 +43,18 @@ HUNYUAN_BASE_URL = os.environ.get(
 # the playground / batch scripts can read or override them without round-
 # tripping through env; read at submit time (inside `_form_fields` /
 # `_hash_payload`), so an override before a call is honored.
-HUNYUAN_CONTROL_TYPE = "point"          # one of: point, voxel, bbox, pose
-HUNYUAN_CONTROL: dict[str, object] = {}  # control payload (authored client-side)
+# Control modality. Only "bbox" is wired up: the bounding box is the one control
+# signal we can derive from a node (its target box → aspect ratio). point/voxel/
+# pose need data we don't have here (a point cloud / voxel grid / skeleton). The
+# old empty "point" default crashed the worker (KeyError: 'grid') — that path has
+# no control data to read.
+HUNYUAN_CONTROL_TYPE = "bbox"            # one of: point, voxel, bbox, pose
+# Canonical half-extent for the bbox's longest axis. Hunyuan3D-Omni normalizes
+# meshes into a centered cube (its normalize_mesh scales the longest side into
+# [-0.9999, 0.9999]) and the bbox condition encodes the object's ASPECT RATIO in
+# that space — so we center the box at the origin and scale by the longest side
+# to match. It constrains proportions, not absolute size.
+HUNYUAN_BBOX_CANONICAL_HALF = 0.9999
 HUNYUAN_STEPS = 50                       # flow-matching steps
 HUNYUAN_OCTREE_RESOLUTION = 512          # marching-cubes grid: 256 / 384 / 512
 HUNYUAN_GUIDANCE_SCALE = 6.7             # CFG scale
@@ -59,14 +70,32 @@ def _bool(value: bool) -> str:
     return "true" if value else "false"
 
 
-def _form_fields(object_name: str) -> dict[str, str]:
-    """The non-image multipart fields for Hunyuan's `POST /generate`. Hunyuan
-    has no `object_name` field — the closest is `text_prompt`, a caption nudge,
-    not an id — so `object_name` is intentionally unused in the request body
-    (it still scopes the resumable cache via the core's `job_id`)."""
+def _bbox_control(bbox: BoundingBox | None) -> dict[str, list[float]]:
+    """Hunyuan-Omni's bbox control payload — a min/max box centered at the origin
+    in canonical space, encoding the target ASPECT RATIO (it constrains
+    proportions, not absolute size). Shape matches the model's `infer_bbox` JSON:
+    `{"bbox": [x_min, y_min, z_min, x_max, y_max, z_max]}`. The node's
+    (width, height, depth) map onto (x, y, z), scaled by the longest side so the
+    box lands in the model's [-1, 1] canonical cube. No bbox → a unit cube (no
+    stretch)."""
+    h = HUNYUAN_BBOX_CANONICAL_HALF
+    if bbox is None:
+        return {"bbox": [-h, -h, -h, h, h, h]}
+    w, height, depth = bbox.size
+    longest = max(w, height, depth) or 1.0
+    hx, hy, hz = w / longest * h, height / longest * h, depth / longest * h
+    return {"bbox": [-hx, -hy, -hz, hx, hy, hz]}
+
+
+def _form_fields(object_name: str, bbox: BoundingBox | None) -> dict[str, str]:
+    """The non-image multipart fields for Hunyuan's `POST /generate`. The control
+    payload is the node's bounding box as an aspect-ratio constraint. Hunyuan has
+    no `object_name` field — the closest is `text_prompt`, a caption nudge, not an
+    id — so `object_name` is unused in the request body (it still scopes the
+    resumable cache via the core's `job_id`)."""
     return {
         "control_type": HUNYUAN_CONTROL_TYPE,
-        "control": json.dumps(HUNYUAN_CONTROL),
+        "control": json.dumps(_bbox_control(bbox)),
         "steps": str(HUNYUAN_STEPS),
         "octree_resolution": str(HUNYUAN_OCTREE_RESOLUTION),
         "guidance_scale": str(HUNYUAN_GUIDANCE_SCALE),
@@ -78,14 +107,14 @@ def _form_fields(object_name: str) -> dict[str, str]:
     }
 
 
-def _hash_payload(object_name: str) -> dict[str, object]:
+def _hash_payload(object_name: str, bbox: BoundingBox | None) -> dict[str, object]:
     """Knobs that change the GLB — folded into the resumable input hash. Kept in
     sync with `_form_fields` (the core adds base_url + image sha256). `model`
     distinguishes Hunyuan submits from Trellis ones in the audit hash."""
     return {
         "model": HUNYUAN_MODEL,
         "control_type": HUNYUAN_CONTROL_TYPE,
-        "control": HUNYUAN_CONTROL,
+        "control": _bbox_control(bbox),
         "steps": HUNYUAN_STEPS,
         "octree_resolution": HUNYUAN_OCTREE_RESOLUTION,
         "guidance_scale": HUNYUAN_GUIDANCE_SCALE,
@@ -113,13 +142,17 @@ async def generate_mesh(
     output_path: Path,
     job_id: str,
     image_mime: str = "image/png",
+    bbox: BoundingBox | None = None,
 ) -> Path:
     """Run Hunyuan-Omni on `image` and save the textured GLB to `output_path`.
-    See `mesh_jobs.generate_mesh` for the resumable / retry semantics."""
+    `bbox` (the node's target box) drives Hunyuan's bbox control — the generated
+    mesh's aspect ratio is constrained to it. See `mesh_jobs.generate_mesh` for
+    the resumable / retry semantics."""
     return await mesh_jobs.generate_mesh(
         image,
         output_path=output_path,
         job_id=job_id,
         image_mime=image_mime,
         backend=_BACKEND,
+        bbox=bbox,
     )

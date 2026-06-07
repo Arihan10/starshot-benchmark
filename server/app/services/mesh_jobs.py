@@ -51,6 +51,7 @@ from typing import Any
 
 import httpx
 
+from app.core.types import BoundingBox
 from app.utils import logging, resumable
 
 
@@ -64,18 +65,20 @@ class MeshBackend:
       `.retry` / `.done`), distinct per backend so their logs and completion
       caches never collide (e.g. `trellis` vs `hunyuan`).
     * `base_url` — the router deployment.
-    * `form_fields(object_name)` — the non-image multipart fields for this
-      backend's `POST /generate` (the image part is added by the core).
-    * `hash_payload(object_name)` — the knobs that change the GLB, folded into
-      the resumable input hash alongside `base_url` + the image's sha256.
+    * `form_fields(object_name, bbox)` — the non-image multipart fields for this
+      backend's `POST /generate` (the image part is added by the core). `bbox`
+      is the job's target box, an optional per-request shape hint (Hunyuan turns
+      it into its bbox/aspect-ratio control; Trellis ignores it).
+    * `hash_payload(object_name, bbox)` — the knobs that change the GLB, folded
+      into the resumable input hash alongside `base_url` + the image's sha256.
     * `model_query` — value for the `?model=` selector, or None for the
       router's default model (Trellis).
     """
 
     scope: str
     base_url: str
-    form_fields: Callable[[str], dict[str, str]]
-    hash_payload: Callable[[str], dict[str, object]]
+    form_fields: Callable[[str, BoundingBox | None], dict[str, str]]
+    hash_payload: Callable[[str, BoundingBox | None], dict[str, object]]
     model_query: str | None = None
 
 
@@ -128,6 +131,50 @@ class JobLostError(Exception):
 GENERATE_CONCURRENCY = 100
 _inflight_sem = asyncio.Semaphore(GENERATE_CONCURRENCY)
 
+# Hunyuan 3.1 (Tencent's direct rapid API) is a SEPARATE concurrency pool from
+# the Modal container pool above. Tencent hard-caps an account to one in-flight
+# rapid job, and — by design — a Hunyuan 3.1 job must never consume one of
+# Modal's GENERATE_CONCURRENCY slots, so the two backends can't starve each
+# other. The semaphore that enforces this lives in app.services.hunyuan_tencent;
+# this constant is its size, kept here so the queue panel and that gate share a
+# single source of truth.
+HUNYUAN_TENCENT_CONCURRENCY = 1
+
+# Concurrency pools surfaced to the queue panel. A pool is an independent budget;
+# each backend scope maps to exactly one, and the panel renders one section per
+# pool with that pool's own cap — so Trellis/Modal work and Hunyuan 3.1 work are
+# counted and displayed separately rather than looking like one shared budget.
+# Hunyuan-Omni rides the Modal router, so it shares Modal's pool with Trellis.
+POOL_MODAL = "modal"
+POOL_HUNYUAN_TENCENT = "hunyuan-tencent"
+# Accepts both the service scopes ("hunyuan_tencent") and the API backend names
+# ("hunyuan-tencent"), so a row is grouped correctly no matter which tagged it.
+_SCOPE_POOL = {
+    "trellis": POOL_MODAL,
+    "hunyuan": POOL_MODAL,
+    "hunyuan-omni": POOL_MODAL,
+    "hunyuan_tencent": POOL_HUNYUAN_TENCENT,
+    "hunyuan-tencent": POOL_HUNYUAN_TENCENT,
+}
+
+
+def _pool_for(scope: str | None) -> str:
+    return _SCOPE_POOL.get(scope or "", POOL_MODAL)
+
+
+def queue_pools() -> list[dict[str, Any]]:
+    """Ordered pool sections for the queue panel — each its own independent cap.
+    Caps are read live so a script overriding GENERATE_CONCURRENCY is reflected."""
+    return [
+        {"id": POOL_MODAL, "label": "Trellis · Modal", "cap": GENERATE_CONCURRENCY},
+        {
+            "id": POOL_HUNYUAN_TENCENT,
+            "label": "Hunyuan 3.1 · Tencent",
+            "cap": HUNYUAN_TENCENT_CONCURRENCY,
+        },
+    ]
+
+
 # Minimum spacing between successive `POST /generate` submits, process-globally.
 # The in-flight cap governs how MANY jobs run at once; this governs how FAST we
 # hand them to Modal. Without it, a batch (the generate gate firing a whole
@@ -168,15 +215,21 @@ _QUEUE: dict[tuple[str, str], dict[str, Any]] = {}
 
 
 def queue_snapshot() -> list[dict[str, Any]]:
-    """Current in-flight + waiting jobs across all slots and backends."""
+    """Current in-flight + waiting jobs across all slots and backends. Each row
+    carries its `backend` scope and the concurrency `pool` it draws from, so the
+    panel can split Trellis/Modal rows from Hunyuan 3.1 rows into their own
+    sections."""
     out: list[dict[str, Any]] = []
     for (slot_id, job_id), entry in _QUEUE.items():
+        backend = entry.get("backend")
         out.append({
             "slot_id": slot_id,
             "job_id": job_id,
             "state": entry["state"],
             "since": entry["since"],
             "task_id": entry.get("task_id"),
+            "backend": backend,
+            "pool": _pool_for(backend),
         })
     return out
 
@@ -186,11 +239,15 @@ def _queue_set(slot_id: str | None, job_id: str, state: str, **extra: Any) -> No
         return
     key = (slot_id, job_id)
     cur = _QUEUE.get(key)
+    merged = {k: v for k, v in (cur or {}).items() if k not in {"state", "since"}}
+    # Overlay only explicitly-provided fields, so a state transition that omits
+    # `backend`/`task_id` keeps what an earlier call recorded (e.g. mark_queued
+    # tags the backend; the later mark_processing needn't repeat it).
+    merged.update({k: v for k, v in extra.items() if v is not None})
     _QUEUE[key] = {
         "state": state,
         "since": cur["since"] if cur and cur["state"] == state else time.time(),
-        **({k: v for k, v in (cur or {}).items() if k not in {"state", "since"}}),
-        **extra,
+        **merged,
     }
 
 
@@ -200,19 +257,31 @@ def _queue_drop(slot_id: str | None, job_id: str) -> None:
     _QUEUE.pop((slot_id, job_id), None)
 
 
-def mark_queued(slot_id: str | None, job_id: str) -> None:
+def mark_queued(slot_id: str | None, job_id: str, *, backend: str | None = None) -> None:
     """Register an externally-managed job (e.g. a regeneration awaiting its turn
     in a per-cell worker) as `waiting` in the shared queue snapshot, so it shows
-    in the same `/trellis/queue` panel as live mesh work. When the job actually
-    submits, `generate_mesh` takes over the (slot_id, job_id) entry; pair this
-    with `unmark_queued` at hand-off / cancellation so it can't leak."""
-    _queue_set(slot_id, job_id, "waiting")
+    in the same queue panel as live mesh work. `backend` tags the row so the
+    panel buckets it into the right pool section. When the job actually submits,
+    `generate_mesh` takes over the (slot_id, job_id) entry; pair this with
+    `unmark_queued` at hand-off / cancellation so it can't leak."""
+    _queue_set(slot_id, job_id, "waiting", backend=backend)
 
 
 def unmark_queued(slot_id: str | None, job_id: str) -> None:
     """Drop an entry registered via `mark_queued` — the job is starting (so
     `generate_mesh` will manage its own entry) or was cancelled before it ran."""
     _queue_drop(slot_id, job_id)
+
+
+def mark_processing(
+    slot_id: str | None, job_id: str, *, task_id: str | None = None, backend: str | None = None,
+) -> None:
+    """Promote a queue entry to `processing` for an externally-managed job that
+    runs its own submit/poll lifecycle outside `generate_mesh` — e.g. the direct
+    Tencent Hunyuan backend, which still belongs in the shared queue panel as the
+    live in-flight row. `backend` tags the row's pool section. Pair with
+    `mark_queued` (waiting) and `unmark_queued`."""
+    _queue_set(slot_id, job_id, "processing", task_id=task_id, backend=backend)
 
 
 def _retry_delay(attempt: int, err: BaseException) -> float:
@@ -269,10 +338,11 @@ async def _fetch_url(url: str) -> bytes:
 
 async def _post_generate(
     backend: MeshBackend, image_bytes: bytes, image_mime: str, object_name: str,
+    bbox: BoundingBox | None,
 ) -> str:
     http = await _get_http()
     files = {"image": ("image.png", image_bytes, image_mime)}
-    data = backend.form_fields(object_name)
+    data = backend.form_fields(object_name, bbox)
     params = {"model": backend.model_query} if backend.model_query else None
     resp = await http.post(
         f"{backend.base_url}/generate",
@@ -402,13 +472,16 @@ async def _download_result(backend: MeshBackend, server_job_id: str) -> bytes:
     raise AssertionError("unreachable")
 
 
-def _input_hash(backend: MeshBackend, image_bytes: bytes, object_name: str) -> str:
+def _input_hash(
+    backend: MeshBackend, image_bytes: bytes, object_name: str,
+    bbox: BoundingBox | None,
+) -> str:
     """Stable hash of every input that would change the GLB. Logged on
     `<scope>.submit` for audit so two submits with identical inputs are visibly
     equivalent. The backend supplies its own knobs; `base_url` and the image
     sha256 are common to every backend."""
     return resumable.hash_input({
-        **backend.hash_payload(object_name),
+        **backend.hash_payload(object_name, bbox),
         "base_url": backend.base_url,
         "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
     })
@@ -421,11 +494,14 @@ async def generate_mesh(
     output_path: Path,
     job_id: str,
     image_mime: str = "image/png",
+    bbox: BoundingBox | None = None,
 ) -> Path:
     """Run `backend` on `image` and save the textured GLB to `output_path`.
 
     `image` is either raw image bytes uploaded via multipart, or a remote URL
     which we fetch to bytes first (the API doesn't accept URLs server-side).
+    `bbox` is an optional per-request shape hint handed to the backend's
+    `form_fields` (Hunyuan uses it for bbox control; Trellis ignores it).
 
     Restart-resilient on completed work: if `<scope>.done` was previously logged
     for `job_id` and the file at the recorded path still exists, the call
@@ -441,12 +517,12 @@ async def generate_mesh(
             return cached
 
     image_bytes = await _fetch_url(image) if isinstance(image, str) else image
-    input_hash = _input_hash(backend, image_bytes, job_id)
+    input_hash = _input_hash(backend, image_bytes, job_id, bbox)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     slot_id = logging.current_slot_id()
-    _queue_set(slot_id, job_id, "waiting")
+    _queue_set(slot_id, job_id, "waiting", backend=backend.scope)
     try:
         async with _inflight_sem:
             # By default we hold `server_job_id` across outer retries — any
@@ -464,9 +540,9 @@ async def generate_mesh(
                         # Modal instead of bursting into a 429 storm.
                         await _pace_submit()
                         server_job_id = await _post_generate(
-                            backend, image_bytes, image_mime, job_id,
+                            backend, image_bytes, image_mime, job_id, bbox,
                         )
-                        _queue_set(slot_id, job_id, "processing", task_id=server_job_id)
+                        _queue_set(slot_id, job_id, "processing", task_id=server_job_id, backend=backend.scope)
                         logging.log(
                             f"{backend.scope}.submit",
                             job_id=job_id,
@@ -478,7 +554,12 @@ async def generate_mesh(
                         backend, server_job_id, timeout=POLL_TIMEOUT_SECONDS,
                     )
                     content = await _download_result(backend, server_job_id)
-                    output_path.write_bytes(content)
+                    # Atomic write: a concurrent reader (a prefab reuse rescaling
+                    # this raw mesh) must never see a half-written GLB. Write to a
+                    # temp in the same dir, then replace.
+                    tmp_path = output_path.with_name(f"{output_path.name}.part")
+                    tmp_path.write_bytes(content)
+                    tmp_path.replace(output_path)
                     resumable.log_done(
                         scope=backend.scope,
                         job_id=job_id,
