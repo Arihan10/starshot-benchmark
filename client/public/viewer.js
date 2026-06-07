@@ -102,9 +102,12 @@ let _genCellKey = null; // (cell, version) the gen-gate poll is tracking
 // id, new bytes) and reload just it with a cache-busted URL. Reset on cell
 // switch (clearScene) and asset-mode reload.
 const genMeshVersions = new Map();
-// id -> current symmetry plane ("none" | "xy" | "xz") for each generated mesh,
-// from GET /generate. Drives the detail panel's symmetry readout + the
-// un-symmetrize button's state. Same lifecycle as genMeshVersions (per version).
+// id -> { plane, was } for each generated mesh, from GET /generate. `plane` is
+// the current symmetry plane ("none" | "xy" | "xz"); `was` is the plane it used
+// to be mirrored across if it's since been un-symmetrized, else null — letting
+// the detail panel tell mirrored / un-symmetrized / never-symmetrized apart.
+// Drives the symmetry readout + the un-symmetrize button's state. Same lifecycle
+// as genMeshVersions (per version).
 const genMeshSymmetry = new Map();
 // id -> bool: a per-asset OVERRIDE of the scene-wide `genOptimized` setting,
 // set from the detail panel's per-asset toggle. Empty on every fresh scene load
@@ -121,6 +124,16 @@ const regeneratingIds = new Set();
 // yet. Same lifecycle as regeneratingIds; both gate the detail action buttons so
 // only one rebuild op runs per node at a time.
 const unsymmetrizingIds = new Set();
+// ids the user clicked "symmetrize" on (the inverse op) whose reprocessed mesh
+// hasn't landed yet. Parallel to unsymmetrizingIds with the same lifecycle — kept
+// separate so the in-flight button label is correct even though `symmetry.applied`
+// (and thus the polled `sym`) may update mid-op before the new mesh lands.
+const symmetrizingIds = new Set();
+// Sticky plane + kept-half for the symmetrize control, so the gate poll's
+// re-renders don't reset a mid-selection. plane: "xy" (front/back along Z) | "xz"
+// (top/bottom along Y); keepPositive: keep the +half (else the −half).
+let symmetrizePlane = "xy";
+let symmetrizeKeepPositive = true;
 // Regenerate image source (persisted). false = "from scratch" (new Nano-Banana
 // image + new mesh); true = "from image" (reuse the existing image, rebuild only
 // the mesh). Read by regenerateAsset; toggled from the object detail panel.
@@ -609,6 +622,56 @@ async function unsymmetrizeAsset(id) {
 	} catch (e) {
 		setStatus(`un-symmetrize failed: ${e.message}`, "err");
 		unsymmetrizingIds.delete(id);
+		if (id === selectedBboxId) renderTreeDetail();
+	}
+}
+
+// Mirror a GENERATED asset across `plane` ("xy"|"xz"), keeping `keepPositive`'s
+// half — the inverse of unsymmetrizeAsset. The plane + direction are passed
+// straight to the server, which reprocesses the existing raw mesh (no AI, no log
+// lookup, no symmetry LLM call) and propagates across the prefab group. The gate
+// poll detects the changed mesh by its bumped version token and swaps it in;
+// `symmetrizingIds` drives the button's in-flight label.
+async function symmetrizeAsset(id, plane, keepPositive) {
+	if (currentSlotId === null || currentModel === null || genVersion == null)
+		return;
+	if (
+		regeneratingIds.has(id) ||
+		unsymmetrizingIds.has(id) ||
+		symmetrizingIds.has(id)
+	)
+		return;
+	symmetrizingIds.add(id);
+	if (id === selectedBboxId) renderTreeDetail();
+	setStatus(
+		`symmetrizing ${id} + objects sharing its mesh in v${genVersion} across the ${plane.toUpperCase()} plane — reprocessing the existing mesh (no AI)…`,
+	);
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/symmetrize/${encodeURIComponent(id)}?run=${encodeURIComponent(currentRun)}&version=${encodeURIComponent(genVersion)}&plane=${encodeURIComponent(plane)}&keep_positive=${keepPositive}&propagate=true`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (!res.ok) {
+			const body = await res.json().catch(() => ({}));
+			setStatus(
+				`symmetrize failed: ${body.detail ?? `HTTP ${res.status}`}`,
+				"err",
+			);
+			symmetrizingIds.delete(id);
+			if (id === selectedBboxId) renderTreeDetail();
+			return;
+		}
+		// Reflect the in-flight reprocess immediately; the gate poll confirms + swaps
+		// the mirrored mesh in once its optimize pass lands.
+		generating = true;
+		_genWasRunning = true;
+		updateGenerateGate();
+	} catch (e) {
+		setStatus(`symmetrize failed: ${e.message}`, "err");
+		symmetrizingIds.delete(id);
 		if (id === selectedBboxId) renderTreeDetail();
 	}
 }
@@ -2312,6 +2375,7 @@ function clearScene() {
 	genMeshOptimized.clear();
 	regeneratingIds.clear();
 	unsymmetrizingIds.clear();
+	symmetrizingIds.clear();
 	// The next cell resolves its own generated versions; the gate poll re-adopts
 	// the latest and repopulates the picker.
 	genVersion = null;
@@ -3618,13 +3682,19 @@ function renderTreeDetail() {
 	) {
 		const regenerating = regeneratingIds.has(id);
 		const unsymmetrizing = unsymmetrizingIds.has(id);
+		const symmetrizing = symmetrizingIds.has(id);
 		// Any in-flight rebuild op on this node disables all of its action buttons, so
 		// the user can't fire two at once; each button keeps its own in-flight label.
-		const busy = regenerating || unsymmetrizing;
-		// Current symmetry plane for this asset (from the gate poll). undefined =
-		// not reported yet (mesh not built); xy/xz = mirrored; none = full mesh.
-		const sym = genMeshSymmetry.get(id);
+		const busy = regenerating || unsymmetrizing || symmetrizing;
+		// Symmetry state for this asset (from the gate poll). undefined = not
+		// reported yet (mesh not built). Otherwise { plane, was }: plane xy/xz =
+		// mirrored; plane none WITH a `was` = un-symmetrized (was mirrored across
+		// `was`); plane none with no `was` = never symmetrized.
+		const symInfo = genMeshSymmetry.get(id);
+		const sym = symInfo?.plane;
+		const symWas = symInfo?.was ?? null;
 		const mirrored = sym === "xy" || sym === "xz";
+		const unsymmetrized = sym === "none" && symWas != null;
 
 		// Per-asset optimize override (view-only) — shown once this asset has a
 		// mesh on screen to swap. Flips just this asset between its optimized twin
@@ -3687,8 +3757,8 @@ function renderTreeDetail() {
 
 		const wrap = document.createElement("div");
 		wrap.className = "detail-section";
-		// One button per mesh backend (Trellis | Hunyuan Omni | Hunyuan 3.1), plus an
-		// un-symmetrize button. All share the per-id gate above.
+		// One button per mesh backend (Trellis | Hunyuan Omni | Hunyuan 3.1). The
+		// symmetry actions live in their own section below; all share the per-id gate.
 		const makeRegenButton = (label, backend, backendLabel) => {
 			const btn = document.createElement("button");
 			btn.type = "button";
@@ -3720,6 +3790,7 @@ function renderTreeDetail() {
 				"Hunyuan 3.1",
 			),
 		);
+		treeDetailEl.appendChild(wrap);
 		// Symmetry readout: whether this asset's served mesh is currently mirrored
 		// (and across which plane) or showing its full, un-mirrored geometry. Shown
 		// once the gate poll has reported this built asset's state.
@@ -3733,39 +3804,100 @@ function renderTreeDetail() {
 			symBody.className = "body";
 			symBody.textContent = mirrored
 				? `mirrored across ${sym.toUpperCase()} plane`
-				: "none (full mesh)";
+				: unsymmetrized
+					? `un-symmetrized (was ${symWas.toUpperCase()} plane)`
+					: "none (never symmetrized)";
 			symWrap.appendChild(symLab);
 			symWrap.appendChild(symBody);
 			treeDetailEl.appendChild(symWrap);
 		}
-		// Un-symmetrize: reprocess the EXISTING mesh with the mirror off (no AI),
-		// revealing the full model. Disabled once the asset is known un-mirrored
-		// (nothing to reveal); an as-yet-unreported state keeps it available.
-		const unBtn = document.createElement("button");
-		unBtn.type = "button";
-		unBtn.className = "detail-retry detail-unsymmetrize";
-		unBtn.classList.toggle("retrying", busy);
-		unBtn.disabled = busy || sym === "none";
-		unBtn.textContent = unsymmetrizing
-			? "un-symmetrizing…"
-			: mirrored
-				? `un-symmetrize (${sym})`
-				: sym === "none"
-					? "not symmetrized"
-					: "un-symmetrize";
-		unBtn.title = unsymmetrizing
-			? "Rebuilding this asset's mesh from its original un-mirrored model"
-			: mirrored
-				? `Currently mirrored across the ${sym.toUpperCase()} plane. Reveal the full, un-mirrored mesh (no AI calls). Propagates across the prefab group.`
-				: sym === "none"
-					? "This asset isn't mirrored — nothing to un-symmetrize."
-					: "Reveal the full, un-mirrored mesh: reprocess the existing model with symmetry off (no AI calls). Propagates across the prefab group.";
-		unBtn.addEventListener("click", (ev) => {
-			ev.stopPropagation();
-			unsymmetrizeAsset(id);
-		});
-		wrap.appendChild(unBtn);
-		treeDetailEl.appendChild(wrap);
+		// Symmetry action — its own section, separate from the regenerate buttons.
+		// Mirrored → un-symmetrize (reveal the full un-mirrored mesh, no AI). Not
+		// mirrored (un-symmetrized or never) → a symmetrize control: pick a plane +
+		// kept half and mirror it (no AI, no symmetry LLM call). Both reprocess the
+		// existing raw mesh and propagate across the prefab group. While `sym` is
+		// unreported (mesh not built yet) we optimistically offer the symmetrize
+		// control; the server skips gracefully if no raw exists.
+		const symActWrap = document.createElement("div");
+		symActWrap.className = "detail-section";
+		if (mirrored) {
+			const unBtn = document.createElement("button");
+			unBtn.type = "button";
+			unBtn.className = "detail-retry detail-unsymmetrize";
+			unBtn.classList.toggle("retrying", busy);
+			unBtn.disabled = busy;
+			unBtn.textContent = unsymmetrizing
+				? "un-symmetrizing…"
+				: `un-symmetrize (${sym})`;
+			unBtn.title = unsymmetrizing
+				? "Rebuilding this asset's mesh from its original un-mirrored model"
+				: `Currently mirrored across the ${sym.toUpperCase()} plane. Reveal the full, un-mirrored mesh (no AI calls). Propagates across the prefab group.`;
+			unBtn.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				unsymmetrizeAsset(id);
+			});
+			symActWrap.appendChild(unBtn);
+		} else {
+			// Plane toggle (XY ↔ XZ) + kept-half toggle (+ ↔ −), both sticky across
+			// re-renders via the module vars, then the symmetrize action button.
+			const planeBtn = document.createElement("button");
+			planeBtn.type = "button";
+			planeBtn.className = "detail-regen-source";
+			planeBtn.disabled = busy;
+			planeBtn.textContent = `symmetrize plane: ${symmetrizePlane.toUpperCase()}`;
+			planeBtn.title =
+				symmetrizePlane === "xy"
+					? "Mirror across the XY plane (front/back along Z). Click to switch to XZ (top/bottom along Y)."
+					: "Mirror across the XZ plane (top/bottom along Y). Click to switch to XY (front/back along Z).";
+			planeBtn.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				symmetrizePlane = symmetrizePlane === "xy" ? "xz" : "xy";
+				renderTreeDetail();
+			});
+			symActWrap.appendChild(planeBtn);
+
+			const dirBtn = document.createElement("button");
+			dirBtn.type = "button";
+			dirBtn.className = "detail-regen-source";
+			dirBtn.disabled = busy;
+			const dirLabel =
+				symmetrizePlane === "xy"
+					? symmetrizeKeepPositive
+						? "keep front (+Z)"
+						: "keep back (−Z)"
+					: symmetrizeKeepPositive
+						? "keep top (+Y)"
+						: "keep bottom (−Y)";
+			dirBtn.textContent = `direction: ${dirLabel}`;
+			dirBtn.title =
+				"Which half of the mesh to keep and mirror onto the other side. Click to flip.";
+			dirBtn.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				symmetrizeKeepPositive = !symmetrizeKeepPositive;
+				renderTreeDetail();
+			});
+			symActWrap.appendChild(dirBtn);
+
+			const symBtn = document.createElement("button");
+			symBtn.type = "button";
+			symBtn.className = "detail-retry detail-symmetrize";
+			symBtn.classList.toggle("retrying", busy);
+			symBtn.disabled = busy;
+			symBtn.textContent = symmetrizing
+				? "symmetrizing…"
+				: `symmetrize (${symmetrizePlane.toUpperCase()})`;
+			symBtn.title = symmetrizing
+				? "Mirroring this asset's mesh across the chosen plane"
+				: `Mirror this asset across the ${symmetrizePlane.toUpperCase()} plane, ${
+						symmetrizeKeepPositive ? "keeping the +half" : "keeping the −half"
+					} (no AI calls). Propagates across the prefab group.`;
+			symBtn.addEventListener("click", (ev) => {
+				ev.stopPropagation();
+				symmetrizeAsset(id, symmetrizePlane, symmetrizeKeepPositive);
+			});
+			symActWrap.appendChild(symBtn);
+		}
+		treeDetailEl.appendChild(symActWrap);
 	}
 
 	// Generated image + interactive mini 3D viewer when this node has assets.
@@ -6598,8 +6730,12 @@ function syncGeneratedMeshes(meshes, slotId, model, run, version) {
 			_genLoading.delete(id);
 			const wasRegenerating = regeneratingIds.delete(id);
 			const wasUnsymmetrizing = unsymmetrizingIds.delete(id);
+			const wasSymmetrizing = symmetrizingIds.delete(id);
 			if (
-				(isReload || wasRegenerating || wasUnsymmetrizing) &&
+				(isReload ||
+					wasRegenerating ||
+					wasUnsymmetrizing ||
+					wasSymmetrizing) &&
 				id === selectedBboxId
 			) {
 				renderTreeDetail();
@@ -6849,7 +6985,8 @@ async function refreshGenerateGate() {
 	if (status.version === genVersion && genVersion != null) {
 		const meshes =
 			status.meshes ?? (status.ids ?? []).map((id) => ({ id, v: null }));
-		for (const m of meshes) genMeshSymmetry.set(m.id, m.sym ?? "none");
+		for (const m of meshes)
+			genMeshSymmetry.set(m.id, { plane: m.sym ?? "none", was: m.symWas ?? null });
 		syncGeneratedMeshes(meshes, slotId, model, run, genVersion);
 	}
 	if (_genWasRunning && !status.running) {
@@ -6859,9 +6996,14 @@ async function refreshGenerateGate() {
 		// Build idle: anything still flagged regenerating/un-symmetrizing either
 		// landed (cleared in syncGeneratedMeshes) or failed without changing — drop
 		// the stragglers so the detail buttons don't stick on their in-flight label.
-		if (regeneratingIds.size > 0 || unsymmetrizingIds.size > 0) {
+		if (
+			regeneratingIds.size > 0 ||
+			unsymmetrizingIds.size > 0 ||
+			symmetrizingIds.size > 0
+		) {
 			regeneratingIds.clear();
 			unsymmetrizingIds.clear();
+			symmetrizingIds.clear();
 			if (selectedBboxId !== null) renderTreeDetail();
 		}
 	}

@@ -176,15 +176,25 @@ def _write_gen_version(
 # Parsed symmetry state per generated-events log, cached on the file's
 # (mtime_ns, size) so the frequently-polled gate status re-reads it only when a
 # build / regen / un-symmetrize has appended to that version's log.
-_gen_symmetry_cache: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
+_gen_symmetry_cache: dict[
+    Path, tuple[tuple[int, int], dict[str, dict[str, str | None]]]
+] = {}
 
 
-def _generated_symmetry(events_path: Path) -> dict[str, str]:
-    """Map node id -> current symmetry plane ('none' | 'xy' | 'xz'), read from the
-    latest `symmetry.applied` event in a generated version's log. xy/xz means the
-    served mesh is mirrored across that plane; 'none' means it was un-mirrored
-    (e.g. via un-symmetrize). Ids with no applied event were never mirrored, so
-    callers default them to 'none'."""
+def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
+    """Map node id -> {'plane': current symmetry plane, 'was': prior mirror plane}.
+
+    'plane' is 'xy'/'xz' when the served mesh is mirrored across that plane, else
+    'none'. 'was' separates the two un-mirrored cases the client must tell apart:
+    a node un-symmetrized after being mirrored ('plane'='none', 'was'= its old
+    plane) vs one that was never symmetrized ('plane'='none', 'was'=None).
+
+    A node's symmetry follows its PREFAB CANONICAL: a reuse's mesh is always
+    re-derived from the canonical's raw at the canonical's current plane, and a
+    propagated un-symmetrize records `symmetry.applied`='none' only on the
+    canonical (the per-reuse re-derivation logs nothing), so the canonical's
+    applied history is the source of truth for the whole group. Ids absent here
+    resolve to a canonical that was never mirrored, so callers default to never."""
     try:
         st = events_path.stat()
     except OSError:
@@ -193,7 +203,10 @@ def _generated_symmetry(events_path: Path) -> dict[str, str]:
     cached = _gen_symmetry_cache.get(events_path)
     if cached is not None and cached[0] == sig:
         return cached[1]
-    state: dict[str, str] = {}
+    # Per-id applied history (latest plane + last mirrored plane) and the flat
+    # prefab star (id -> the canonical it reuses, latest match winning).
+    applied: dict[str, dict[str, str | None]] = {}
+    reuse_of: dict[str, str] = {}
     with events_path.open("r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -203,12 +216,31 @@ def _generated_symmetry(events_path: Path) -> dict[str, str]:
                 event = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if event.get("kind") != "symmetry.applied":
-                continue
-            cut_plane = event.get("cut_plane")
+            kind = event.get("kind")
             node_id = event.get("id")
-            if cut_plane in ("none", "xy", "xz") and isinstance(node_id, str):
-                state[node_id] = cut_plane
+            if not isinstance(node_id, str):
+                continue
+            if kind == "symmetry.applied":
+                cut_plane = event.get("cut_plane")
+                if cut_plane in ("none", "xy", "xz"):
+                    entry = applied.setdefault(node_id, {"plane": "none", "was": None})
+                    entry["plane"] = cut_plane
+                    if cut_plane in ("xy", "xz"):
+                        entry["was"] = cut_plane
+            elif kind == "prefab.match":
+                reuse_of[node_id] = str(event.get("reuse_id") or "")
+    # Resolve every node to its canonical's state (canonical = itself when it's
+    # not a reuse), so a reuse reports the canonical's current plane even though a
+    # propagated un-symmetrize wrote no per-reuse event.
+    state: dict[str, dict[str, str | None]] = {}
+    for node_id in set(applied) | set(reuse_of):
+        canonical = reuse_of.get(node_id) or node_id
+        info = applied.get(canonical)
+        state[node_id] = (
+            {"plane": info["plane"], "was": info["was"]}
+            if info
+            else {"plane": "none", "was": None}
+        )
     _gen_symmetry_cache[events_path] = (sig, state)
     return state
 
@@ -906,9 +938,11 @@ def create_app() -> FastAPI:
             # once its optimize pass finishes), or the raw objects-generated/
             # set when `optimized=0`. Each carries the GLB's mtime as a version
             # token so the client can detect a regenerated asset (same id, new
-            # bytes) and reload just it with a cache-busted URL, plus `sym` — the
-            # asset's current symmetry plane (none/xy/xz) so the detail panel shows
-            # whether it's mirrored. The `.raw.glb` intermediates are skipped below.
+            # bytes) and reload just it with a cache-busted URL, plus `sym`/`symWas`
+            # — the asset's current symmetry plane (none/xy/xz) and, if since
+            # un-symmetrized, the plane it used to be mirrored across — so the detail
+            # panel tells mirrored / un-symmetrized / never-symmetrized apart. The
+            # `.raw.glb` intermediates are skipped below.
             sym_map = _generated_symmetry(
                 generation.generated_events_path(RUNS_DIR, rid, resolved)
             )
@@ -922,9 +956,13 @@ def create_app() -> FastAPI:
                     except OSError:
                         continue
                     mesh_id = p.name[: -len(".glb")]
-                    meshes.append(
-                        {"id": mesh_id, "v": mtime, "sym": sym_map.get(mesh_id, "none")}
-                    )
+                    info = sym_map.get(mesh_id)
+                    meshes.append({
+                        "id": mesh_id,
+                        "v": mtime,
+                        "sym": info["plane"] if info else "none",
+                        "symWas": info["was"] if info else None,
+                    })
         ids = [m["id"] for m in meshes]
         return {
             "running": running,
@@ -987,7 +1025,7 @@ def create_app() -> FastAPI:
 
         gen_slot_id = _gen_slot_id(run, slot.id, model_alias, gen_version)
         queue = _regen_queues.setdefault(key, asyncio.Queue())
-        queue.put_nowait((node_id, propagate, backend, "regenerate", reuse_image))
+        queue.put_nowait((node_id, propagate, backend, "regenerate", reuse_image, None))
         # Surface the queued regen in the shared mesh queue panel until the
         # worker dequeues it (then generate_mesh manages its own entry). Tag the
         # backend so it lands in the right pool section (Trellis vs Hunyuan 3.1).
@@ -1044,7 +1082,7 @@ def create_app() -> FastAPI:
         # Not surfaced in the mesh queue panel — it's a local reprocess, not a
         # backend generation.
         queue = _regen_queues.setdefault(key, asyncio.Queue())
-        queue.put_nowait((node_id, propagate, generation.DEFAULT_MESH_BACKEND, "unsymmetrize", False))
+        queue.put_nowait((node_id, propagate, generation.DEFAULT_MESH_BACKEND, "unsymmetrize", False, None))
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
@@ -1058,6 +1096,68 @@ def create_app() -> FastAPI:
             "node_id": node_id,
             "propagate": propagate,
             "op": "unsymmetrize",
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/symmetrize/{node_id}")
+    async def slot_symmetrize(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+        version: str | None = None,
+        plane: str = "xy",
+        keep_positive: bool = True,
+        propagate: bool = True,
+    ) -> dict[str, object]:
+        """Mirror a GENERATED asset across `plane` ('xy' = front/back along Z, 'xz' =
+        top/bottom along Y), keeping the `keep_positive` half — the symmetrize
+        counterpart to /unsymmetrize. The plane + direction are supplied by the
+        caller, so NO symmetry LLM decision is made and NO symmetry log is consulted
+        to pick them. Reprocesses the existing raw mesh (no Nano-Banana, no mesh
+        backend) on the SAME per-version worker as regenerate/unsymmetrize, so it
+        enqueues, drains concurrently, and serializes per-node via
+        `generation.node_lock`. With `propagate=true` (the client default) the prefab
+        CANONICAL behind `node_id` is mirrored and every object reusing it is
+        re-derived to match. Pins the node's symmetry decision so later resumes /
+        regenerations keep the mirror."""
+        if plane not in ("xy", "xz"):
+            raise HTTPException(status_code=400, detail=f"plane must be 'xy' or 'xz', got: {plane}")
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        gen_version = _read_gen_version(run, slot_id, model_alias, version) or "1"
+        key: GenKey = (run, slot_id, model_alias, gen_version)
+        ver = versions.for_run(run)
+        prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        # Same worker + filler backend slot as un-symmetrize; the (plane, keep)
+        # ride the trailing `sym` field of the queue item. Not surfaced in the mesh
+        # queue panel — a local reprocess, not a backend generation.
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait(
+            (node_id, propagate, generation.DEFAULT_MESH_BACKEND, "symmetrize", False, (plane, keep_positive))
+        )
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias, gen_version)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "version": gen_version,
+            "node_id": node_id,
+            "propagate": propagate,
+            "op": "symmetrize",
+            "plane": plane,
+            "keep_positive": keep_positive,
             "queued": True,
             "depth": queue.qsize(),
         }
@@ -1594,7 +1694,14 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) 
     prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
     canon_locks: dict[str, asyncio.Lock] = {}
 
-    async def _process(node_id: str, propagate: bool, backend: str, op: str, reuse_image: bool) -> None:
+    async def _process(
+        node_id: str,
+        propagate: bool,
+        backend: str,
+        op: str,
+        reuse_image: bool,
+        sym: tuple[str, bool] | None,
+    ) -> None:
         if lib_log is None:
             return
         try:
@@ -1629,6 +1736,16 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) 
                     await generation.unsymmetrize_one(
                         node=build_node, runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
+                elif op == "symmetrize":
+                    # Mirror the existing mesh across the caller-supplied plane (no
+                    # AI). The canonical is mirrored here; propagate re-derives its
+                    # reuses below, which read the canonical's symmetry.applied
+                    # (plane + kept half) and mirror identically.
+                    cut_plane, keep_positive = sym  # type: ignore[misc]
+                    await generation.symmetrize_one(
+                        node=build_node, cut_plane=cut_plane, keep_positive=keep_positive,  # type: ignore[arg-type]
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
+                    )
                 else:
                     if reuse_image:
                         # From-image rebuild: ensure the node we're building has its
@@ -1649,10 +1766,11 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) 
                         canonical_id=canonical_id, reuses=reuses,
                         runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
-                elif canonical_id != node_id and op != "unsymmetrize":
+                elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize"):
                     # A reuse regenerated on its own now owns a fresh mesh + raw —
                     # record it as canonical so a later propagate of its old source
-                    # can't clobber it.
+                    # can't clobber it. (Symmetry ops write no new raw, so they never
+                    # promote — a reuse with no own raw is skipped instead.)
                     gen_log.log(
                         "prefab.match", id=node_id, reuse_id="", description=build_node.prompt,
                     )
@@ -1667,12 +1785,12 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) 
             # Spawn every currently-queued item; the semaphores bound the real work.
             while True:
                 try:
-                    node_id, propagate, backend, op, reuse_image = queue.get_nowait()
+                    node_id, propagate, backend, op, reuse_image, sym = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
                 # Worker owns the entry now; generate_mesh re-registers it on submit.
                 threed.unmark_queued(gen_slot_id, node_id)
-                inflight.add(asyncio.create_task(_process(node_id, propagate, backend, op, reuse_image)))
+                inflight.add(asyncio.create_task(_process(node_id, propagate, backend, op, reuse_image, sym)))
             if not inflight:
                 break
             # Wait for a build to finish OR a short tick to elapse, then loop back
@@ -1694,7 +1812,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) 
         # the shared queue panel so they don't linger as phantom waiting rows.
         while True:
             try:
-                pending_id, _, _, _, _ = queue.get_nowait()
+                pending_id, *_ = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
             threed.unmark_queued(gen_slot_id, pending_id)

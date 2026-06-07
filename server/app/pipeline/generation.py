@@ -965,15 +965,22 @@ async def _rescale_reuse_from_raw(
     try:
         rescaled = raw_dir / f"{node.id}.glb"
         cut_plane: Literal["none", "xy", "xz"] = "none"
+        keep_positive: bool | None = None
         applied = logging.find_event("symmetry.applied", id=source_id)
         if applied is not None:
             raw_cp = applied.get("cut_plane")
             if raw_cp in ("none", "xy", "xz"):
                 cut_plane = raw_cp  # type: ignore[assignment]
+            # Carry the canonical's kept-half so a non-default direction (set via
+            # the symmetrize control) mirrors the reuse identically. Absent on
+            # older logs -> None -> the plane's default half.
+            raw_keep = applied.get("keep_positive")
+            if isinstance(raw_keep, bool):
+                keep_positive = raw_keep
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, src_raw)
             scene = await symmetry.apply_symmetrize(
-                scene, cut_plane=cut_plane, node_id=node.id,
+                scene, cut_plane=cut_plane, node_id=node.id, keep_positive=keep_positive,
             )
             placed = await asyncio.to_thread(
                 rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
@@ -1394,6 +1401,57 @@ async def unsymmetrize_one(
             logging.log("symmetry.unsymmetrized", id=node.id)
         except Exception as e:  # noqa: BLE001
             logging.log("mesh.error", id=node.id, message=f"unsymmetrize: {type(e).__name__}: {e}")
+
+
+async def symmetrize_one(
+    *,
+    node: Node,
+    cut_plane: Literal["xy", "xz"],
+    keep_positive: bool,
+    runs_dir: Path,
+    run_id: str,
+    version: str,
+) -> None:
+    """Mirror a generated object's served mesh across `cut_plane`, keeping the
+    `keep_positive` half — the symmetrize counterpart to `unsymmetrize_one`. The
+    plane + direction come straight from the caller (the client control), so this
+    makes NO symmetry LLM decision and reads NO prior symmetry log to pick them. No
+    Nano-Banana and no mesh backend: reload the on-disk raw (always the pristine,
+    un-mirrored Trellis output, so re-mirroring is idempotent regardless of the
+    current served state), apply the mirror, rescale into the node's bbox, and
+    re-optimize the served twin. Pins the symmetry decision to `cut_plane` and lets
+    `apply_symmetrize` record `symmetry.applied` (carrying `keep_positive`) so a
+    resume / regeneration / prefab-reuse replays the same mirror and direction. A
+    missing raw (e.g. a prefab reuse with no own raw) is logged and skipped — the
+    caller symmetrizes the canonical and propagates. Runs under the node lock."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id, version)
+    src_raw = raw_dir / f"{node.id}.raw.glb"
+    async with node_lock(run_id, version, node.id):
+        if not src_raw.exists():
+            logging.log("symmetry.skip", id=node.id, reason="symmetrize: no raw mesh on disk")
+            return
+        logging.log("symmetry.decision", id=node.id, cut_plane=cut_plane, encapsulating=False)
+        rescaled = raw_dir / f"{node.id}.glb"
+        try:
+            async with _MESH_IO:
+                scene = await asyncio.to_thread(trimesh.load, src_raw)
+                scene = await symmetry.apply_symmetrize(
+                    scene, cut_plane=cut_plane, node_id=node.id, keep_positive=keep_positive,
+                )
+                placed = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
+                )
+                tmp = rescaled.with_name(f"{rescaled.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, placed, tmp)
+                    os.replace(tmp, rescaled)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                del scene, placed
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+            logging.log("symmetry.symmetrized", id=node.id, cut_plane=cut_plane, keep_positive=keep_positive)
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"symmetrize: {type(e).__name__}: {e}")
 
 
 async def await_pending(run_id: str) -> None:

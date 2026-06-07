@@ -126,20 +126,23 @@ def symmetrize_mesh(
     normal[axis] = 1.0 if keep_positive else -1.0
 
     src_uv = getattr(m.visual, "uv", None)
-    verts, faces, uv = slice_faces_plane(
-        np.asarray(m.vertices, dtype=np.float64),
-        np.asarray(m.faces),
-        normal,
-        plane_origin,
-        uv=None if src_uv is None else np.asarray(src_uv, dtype=np.float64),
-    )
+    # A zero-area source triangle straddling the cut makes slice_faces_plane's
+    # barycentric UV interpolation divide by zero — emitting numpy warnings and
+    # producing NaN/inf UVs at the new cut vertices. Silence the expected
+    # warnings here and clamp the result below: a non-finite UV left in is
+    # written verbatim into the exported GLB's accessor min/max as a literal
+    # `NaN` (invalid JSON that crashes strict glTF readers like the optimizer's
+    # @gltf-transform).
+    with np.errstate(divide="ignore", invalid="ignore"):
+        verts, faces, uv = slice_faces_plane(
+            np.asarray(m.vertices, dtype=np.float64),
+            np.asarray(m.faces),
+            normal,
+            plane_origin,
+            uv=None if src_uv is None else np.asarray(src_uv, dtype=np.float64),
+        )
     if len(faces) == 0:
         raise ValueError("cut plane left an empty half; cannot symmetrize")
-
-    # A zero-area source triangle makes slice_faces_plane interpolate the new
-    # cut-vertex UV as 0/0 -> NaN; left in, trimesh writes a literal `NaN` into
-    # the exported GLB's accessor min/max (invalid JSON, crashes strict glTF
-    # readers like the optimizer's @gltf-transform). Clamp non-finite UVs to 0.
     if uv is not None:
         uv = np.nan_to_num(uv, nan=0.0, posinf=0.0, neginf=0.0)
 

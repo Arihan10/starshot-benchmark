@@ -1723,6 +1723,21 @@
 				border-color: #6ab4d0;
 				color: #9ad4ec;
 			}
+			/* Symmetrize is the inverse non-AI reprocess — give it a green tint so
+			   it reads as a constructive "apply mirror" action, distinct from the
+			   teal un-symmetrize and red regenerate. Skipped while in flight so the
+			   shared `.retrying` style still shows. */
+			#tree-detail .detail-retry.detail-symmetrize:not(.retrying) {
+				border-color: #5a7a40;
+				background: #1a2415;
+				color: #9ad07a;
+			}
+			#tree-detail
+				.detail-retry.detail-symmetrize:not(.retrying):hover:not(:disabled) {
+				background: #20301a;
+				border-color: #9ad07a;
+				color: #c4ec9a;
+			}
 			/* Regenerate-source toggle: neutral when "from scratch" (default),
 			   tinted when "from image" (reuse the existing image). */
 			#tree-detail .detail-regen-source {

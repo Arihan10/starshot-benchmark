@@ -160,17 +160,24 @@ async def apply_symmetrize(
     *,
     cut_plane: CutPlane,
     node_id: str,
+    keep_positive: bool | None = None,
 ) -> trimesh.Trimesh | trimesh.Scene:
     """Mirror `mesh` per the already-resolved `cut_plane` (no LLM call). Returns
     the mesh unchanged for `none`; a mesh-level failure is logged and degrades
-    to the original so generation never aborts over symmetry."""
+    to the original so generation never aborts over symmetry.
+
+    `keep_positive` overrides which half is kept (None = the plane's default,
+    +Z/+Y). It's recorded in the `symmetry.applied` event so a prefab reuse
+    re-derived from this node's mesh mirrors the same half (see
+    `_rescale_reuse_from_raw`)."""
     params = _PLANE_PARAMS.get(cut_plane)
     if params is None:
         return mesh
-    axis, keep_positive = params
+    axis, default_keep = params
+    keep = default_keep if keep_positive is None else keep_positive
     try:
         out = await asyncio.to_thread(
-            symmetrize_mesh, mesh, axis=axis, keep_positive=keep_positive,
+            symmetrize_mesh, mesh, axis=axis, keep_positive=keep,
         )
     except Exception as e:  # noqa: BLE001
         logging.log(
@@ -180,7 +187,7 @@ async def apply_symmetrize(
             reason=f"mesh_failed: {type(e).__name__}: {str(e)[:200]}",
         )
         return mesh
-    logging.log("symmetry.applied", id=node_id, cut_plane=cut_plane, axis=axis)
+    logging.log("symmetry.applied", id=node_id, cut_plane=cut_plane, axis=axis, keep_positive=keep)
     return out
 
 
