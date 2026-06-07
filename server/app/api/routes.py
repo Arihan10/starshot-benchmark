@@ -194,7 +194,13 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
     propagated un-symmetrize records `symmetry.applied`='none' only on the
     canonical (the per-reuse re-derivation logs nothing), so the canonical's
     applied history is the source of truth for the whole group. Ids absent here
-    resolve to a canonical that was never mirrored, so callers default to never."""
+    resolve to a canonical that was never mirrored, so callers default to never.
+
+    Handles both event formats: the current `symmetry.applied` event AND the legacy
+    `symmetry.decision` that bundled `applied`+`axis` onto the decision itself
+    (older builds, before applied was split out). Both update the same per-id state
+    in log order, so a node recorded only the legacy way is still detected and a
+    later un-symmetrize still wins."""
     try:
         st = events_path.stat()
     except OSError:
@@ -203,12 +209,22 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
     cached = _gen_symmetry_cache.get(events_path)
     if cached is not None and cached[0] == sig:
         return cached[1]
-    # Per-id applied history (latest plane + last mirrored plane) and the flat
-    # prefab star (id -> the canonical it reuses, latest match winning).
+    # Per-id applied history (latest plane + last mirrored plane, with the log
+    # position of that latest update) and the flat prefab star (id -> the canonical
+    # it reuses, latest match winning).
     applied: dict[str, dict[str, str | None]] = {}
+    applied_idx: dict[str, int] = {}
     reuse_of: dict[str, str] = {}
+
+    def _set_plane(nid: str, cut_plane: str, idx: int) -> None:
+        entry = applied.setdefault(nid, {"plane": "none", "was": None})
+        entry["plane"] = cut_plane
+        if cut_plane in ("xy", "xz"):
+            entry["was"] = cut_plane
+        applied_idx[nid] = idx
+
     with events_path.open("r", encoding="utf-8") as f:
-        for line in f:
+        for idx, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
@@ -223,22 +239,37 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
             if kind == "symmetry.applied":
                 cut_plane = event.get("cut_plane")
                 if cut_plane in ("none", "xy", "xz"):
-                    entry = applied.setdefault(node_id, {"plane": "none", "was": None})
-                    entry["plane"] = cut_plane
-                    if cut_plane in ("xy", "xz"):
-                        entry["was"] = cut_plane
+                    _set_plane(node_id, cut_plane, idx)
+            elif kind == "symmetry.decision" and "applied" in event:
+                # Legacy combined event: older builds recorded the plane AND whether
+                # it was mirrored on the decision itself (current builds split that
+                # into a separate `symmetry.applied`). Mirrored iff `applied` is
+                # truthy and the plane is xy/xz; anything else (applied false, or
+                # plane none) means the served mesh is not mirrored.
+                cut_plane = event.get("cut_plane")
+                _set_plane(
+                    node_id,
+                    cut_plane if (event.get("applied") and cut_plane in ("xy", "xz")) else "none",
+                    idx,
+                )
             elif kind == "prefab.match":
                 reuse_of[node_id] = str(event.get("reuse_id") or "")
-    # Resolve every node to its canonical's state (canonical = itself when it's
-    # not a reuse), so a reuse reports the canonical's current plane even though a
-    # propagated un-symmetrize wrote no per-reuse event.
+    # Resolve each node to whichever of {its own, its canonical's} applied history
+    # is MORE RECENT in log order. The canonical matters because a propagated
+    # un-symmetrize records applied=none only on the canonical (the per-reuse
+    # re-derivation logs nothing), so its later 'none' must override a reuse's
+    # now-stale mirror. But a reuse (re)built more recently keeps its own state —
+    # including legacy logs, where each reuse carried its OWN symmetry event, and
+    # an independently regenerated reuse. Ids with neither default to never.
     state: dict[str, dict[str, str | None]] = {}
     for node_id in set(applied) | set(reuse_of):
         canonical = reuse_of.get(node_id) or node_id
-        info = applied.get(canonical)
+        own_idx = applied_idx.get(node_id, -1)
+        canon_idx = applied_idx.get(canonical, -1) if canonical != node_id else -1
+        info = applied.get(node_id if own_idx >= canon_idx else canonical)
         state[node_id] = (
             {"plane": info["plane"], "was": info["was"]}
-            if info
+            if info is not None
             else {"plane": "none", "was": None}
         )
     _gen_symmetry_cache[events_path] = (sig, state)
