@@ -22,13 +22,13 @@ from app.core.types import (
 # no drift — the bbox-resolution step needs the full formulas to place
 # ON-anchored children correctly, so they live here alongside the
 # vocabulary.
-PROXY_SHAPE_DOC = """A `proxy_shape` describes the silhouette of the node's mesh INSIDE its axis-aligned bbox. The proxy is always inscribed in the AABB; you do NOT emit radii or cap sizes — they derive from the bbox dimensions. Emit `proxy_shape` ONLY when the mesh is noticeably non-boxy; omit it (i.e. null / absent) when the bbox itself is a good collision proxy.
+PROXY_SHAPE_DOC = """A `proxy_shape` describes the silhouette of the node's mesh INSIDE its axis-aligned bbox. The proxy is always inscribed in the AABB; you do NOT emit radii or cap sizes — they derive from the bbox dimensions. Select `BOX` (the default) when the bbox itself is a good collision proxy; pick `SPHERE` / `CAPSULE` / `HEMISPHERE` ONLY when the mesh is noticeably non-boxy.
 
 NOTATION used below. For an AABB with min corner (x_min, y_min, z_min) and max corner (x_max, y_max, z_max): center (cx, cy, cz), half-extents (hx, hy, hz) = ((x_max-x_min)/2, (y_max-y_min)/2, (z_max-z_min)/2), full extents (sx, sy, sz) = (2·hx, 2·hy, 2·hz). Every proxy below defines a FOOTPRINT (the XZ region the shape covers) and a TOP-SURFACE FUNCTION Y_top(x, z) that returns the proxy's upper surface height at a given XZ inside that footprint. There is no automatic correction — when you anchor another node ON this one, YOU must compute Y_top at the anchor's XZ and place its bbox so its bottom face sits there.
 
 Valid values:
 
-  * null / omitted — BOX. The AABB is the proxy. Default.
+  * BOX (or null / omitted) — the AABB itself is the proxy (a rectangular prism). The default.
       WHEN TO USE: walls, floors, ceilings, furniture, crates, buildings, signs, rectangular terrain slabs — anything rectilinear.
       FOOTPRINT: the full AABB rectangle, x ∈ [x_min, x_max], z ∈ [z_min, z_max].
       Y_top(x, z) = y_max   (flat top face everywhere in the footprint).
@@ -152,7 +152,7 @@ def _root_scene_header(root: Node) -> str:
     return (
         f'Prompt: "{root.prompt}"\n'
         f'Plan: "{root.plan}"\n'
-        f"Overall scene (root) bounding box: {dx:.2f}m by {dy:.2f}m by {dz:.2f}m, with its origin corner at ({ox:.2f}, {oy:.2f}, {oz:.2f}) m (scene root)"
+        f"Overall scene (root) bounding box: {dx:.2f}m by {dy:.2f}m by {dz:.2f}m, with its origin corner at ({ox:.2f}, {oy:.2f}, {oz:.2f}) m (root)"
     )
 
 
@@ -484,7 +484,7 @@ in the interest of winning, always start by thinking of the overall narrative an
     zone_bbox = next((n.bbox for n in nodes if n.id == zone_id), root.bbox)
     context = render_embedded_block(nodes, node_id=zone_id, text="This is the region you are to plan and flesh out from.")
 
-    return f"""You are the step in the SpatialBench pipeline responsible for planning out a particular subregion within the larger overall scene. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. You author the plan for one such region, which further downstream steps then expand on, decompose, and populate. 
+    return f"""You are the step in the SpatialBench pipeline responsible for designing a particular subregion within the larger overall scene, expanding on the story that has already been established. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually, then subdivides them further. You author the design for one such region, which further downstream steps then expand on, decompose, and populate.
 
 Here is the overall scene that is being built by the pipeline:
 
@@ -503,24 +503,22 @@ Here's the scene's subregion tree, with the objects placed in each subregion lis
 
 {context}
 
-Your goal is to elaborate and add to the narrative painted by the ancestor plans through the plan for this region, but also leave sufficient room in your plan for further downstream steps to expand on more using their own agency. what constitutes "sufficient" depends on the specificity of the current region: larger, higher-level regions should have less specificity, while smaller, more constrained regions nearing the atomic level should have more specificity. your prompt will undergo further subregion divisions, expansion, and detail steps before reaching any generation steps, so structure your output as a base that downstream steps can build upon and do not enumerate objects unless this region cannot be subdivided much further.
+Your goal is to elaborate and add to the story started by the ancestor plans through the design for this region, but also leave sufficient room in your design for further downstream steps to expand more on it using their own ideas. what constitutes "sufficient room" depends on the specificity of the current region: larger, higher-level regions should have less specificity in their designs, while smaller, more constrained regions nearing the atomic level should have more specificity.
+<VERY IMPORTANT INSTRUCTIONS> think deeply about what this region is and how you can make it creatively compelling relative to the story that is being established for the scene. the story is what brings life to the scene and adds a plot on top of the concrete, structural qualities of the scene. every region of the scene contributes to the final build that judges evaluate, and the quality of your design here directly shapes how impressive this part of the scene will be.
 
-you should also calibrate your plan's specificity to the scope and nature of this region. a well-understood region type (a bedroom, a kitchen, a garden) needs less foundational planning because downstream steps share an understanding of what that space looks like and what belongs in it. a region with novel character or a creative premise that cannot be inferred from its prompt and ancestor context alone needs more explicit through-line — downstream steps that further decompose and populate this region will not reconstruct creative intent that isn't present in your plan. furthermore, a tightly-constrained region that cannot be broken down into further subregions would require more specificity in terms of object enumeration as you are the final planning step before the actual object list gets generated by a downstream step.
-
-<VERY IMPORTANT INSTRUCTIONS>
-think deeply about what this region is and how you can make it creatively compelling. every region of the scene contributes to the final build that judges evaluate, and the quality of your plan here directly shapes how impressive this part of the scene will be.
-
-write directly and consider every part carefully. you are the planning step for this region - your plan will go through further downstream steps where it is expanded on and transformed as the pipeline propagates further planning by depth. define this region's character, spatial shape, and what makes it distinctive enough that downstream steps have agency over the specifics while building coherently.
+write directly and consider every part carefully. you are the design step for this region - your design will go through further downstream steps where it is expanded on and transformed as the pipeline propagates further. Your design should define this region's character, spatial shape, and what makes it distinctive from a similar region with a different story.
 
 only the final output of the 3D geometry will be judged once the pipeline is finished; your prompt itself will NEVER be shown to the judges, it will only serve as a base to build upon for this region. thus, making the prompt dramatic and sound impressive will only have a contradictory effect, since it will confuse downstream steps when generation actually happens as they don't understand flowery language.
 
+DO NOT be overly specific - your prompt will undergo further subregion divisions, expansion, and detail steps before reaching any generation steps, so structure your output as a base that downstream steps can build upon. DO NOT enumerate specific objects (a table, a chair, a tree, a lamp) - object selection happens in a later generation step that needs its own agency over what to place.
+
+calibrate your design's specificity to the scope and nature of this region. a well-understood region type (a bedroom, a kitchen, a garden) needs less foundational planning because downstream steps share an understanding of what that space looks like and what belongs in it. a region with novel character or a creative premise that cannot be inferred from its prompt and ancestor context alone needs more explicit through-line — downstream steps that further decompose and populate this region will not reconstruct creative intent that isn't present in your design. furthermore, a tightly-constrained region that cannot be broken down into further subregions would require more specificity in terms of object enumeration as you are the final planning step before the actual object list gets generated by a downstream step.
+
 your prompt should focus on just the current region: it can reference other defined regions and objects as context, but do not overtly describe them apart from using them as an anchor for relative positioning.
 
-think from the perspective of a narrative through-line. ground the region in concrete use: what physically happens in this space, not in atmosphere or symbolism. you can and should use the plans of ancestor regions mentioned above to help you in coming up with this as they provide additional, already-established context of the scene.
+think from the perspective of a narrative through-line defined by upstream steps. ground the region in concrete use: what physically happens in this space, not in atmosphere or symbolism. you can and should use the plans of ancestor regions mentioned above to help you in coming up with this as they provide additional, already-established context of the scene.
 
-In the plan you write, do not use flowery language. do not describe any abstract quantities like mood, lighting, fog, etc unless they can be converted into concrete 3D geometry. do not reference meta-quantities like the pipeline itself or your role. focus on defining the region intrinsically. this is a 3D environment, not an image - do not define any specific perspective. do not mention meta pipeline-related terms, such as "already-placed" or "existing". the prompt should be direct, accurately describe the scene, and every word should be useful for downstream generation and further processing, grounded concretely in what the scene is and with no relation to the pipeline itself.
-
-define this region's shape, character, and rough spatial relationships between its major parts enough that downstream steps have agency over their individual sections while forming ideas of what to build, especially spatially.
+In the design, do not describe any abstract quantities like mood, lighting, fog, etc unless they can be converted into concrete 3D geometry. your design should not be self-aware, do not reference meta-quantities like the pipeline itself or your role. focus on defining the region intrinsically. this is a 3D environment, not an image - do not define any specific perspective. do not mention pipeline-related terms that have nothing to do with you, including numeric coordinates, dimensions, and downstream steps. the design you write should be direct and focus on accurately describing the region, including but not limited to its shape, character, and rough spatial relationships between the major parts within it.
 </VERY IMPORTANT INSTRUCTIONS>
 
 <region_decomposition>
@@ -528,17 +526,14 @@ you must also decide is_atomic — whether this region is a single cohesive spac
 
 default to is_atomic=true. set is_atomic=false ONLY when the region genuinely contains TWO OR MORE distinct regions, each deserving its own dedicated planning and generation pass:
 
-    good decomposition: mansion grounds → house, formal garden, stables (distinct functional regions)
-    good decomposition: hotel room → bedroom, bathroom (distinct rooms)
-    bad decomposition: island → north end, central mound, south end (arbitrary geography with no distinct identity)
-    bad decomposition: bedroom → bed area, dresser area, reading nook (over-fragmented; one cohesive space)
+good decomposition: mansion grounds → house, formal garden, stables (distinct functional regions)
+good decomposition: hotel room → bedroom, bathroom (distinct rooms)
+bad decomposition: island → north end, central mound, south end (arbitrary geography with no distinct identity)
+bad decomposition: bedroom → bed area, dresser area, reading nook (over-fragmented; one cohesive space)
 
 a region is a place large enough to contain multiple objects arranged inside it. a single landmark, monument, centerpiece, or hero prop — no matter how important — is an OBJECT inside a region, not a region of its own.
 </region_decomposition>
-
-<thinking>
-before ANY output, think HARD and DEEPLY and provide a detailed CoT. think through the creative direction for this region within the context of the larger scene. think through spatial layout and how everything fits together physically. think about the constructed narrative of the ancestor plans and how this particular region could add onto it as a detail. think about what would make this region genuinely impressive and memorable as part of a winning build.
-</thinking>
+<thinking> before ANY output, think HARD and DEEPLY and provide a detailed CoT. think through the creative direction for this region within the context of the larger scene. think through spatial layout and how everything fits together physically. think about the constructed story of the ancestor plans and how this particular region could add onto it as a detail. think about what would make this region genuinely impressive and memorable as part of a winning build. </thinking>
 {_deepseek_suffix()}"""
 
 
@@ -636,8 +631,11 @@ class ChildNodeSpec(BaseModel):
     @field_validator("proxy_shape", mode="before")
     @classmethod
     def _box_means_none(cls, v: object) -> object:
-        # The prompt describes BOX as "null/omitted" — no enum value — but
-        # some models emit the literal string "BOX" anyway. Treat it as None.
+        # BOX is offered as an explicit, selectable proxy_shape value (the
+        # rectilinear default), but the rest of the pipeline encodes "box" as
+        # None — the AABB is its own proxy. Canonicalize the literal "BOX" (and
+        # any null/omission) to None here so a realized Node only ever carries
+        # None / SPHERE / CAPSULE / HEMISPHERE.
         if isinstance(v, str) and v.upper() == "BOX":
             return None
         return v
@@ -668,7 +666,7 @@ Respond with a single JSON object containing:
   - `parent_relationship_kind` (string): how this child anchors to its `parent`. Exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here — they are peer hints, reserved for `relationships`.
   - `placement` (string): one string describing where this child sits within the scene relative to other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the subregion is located. Think very deeply about where each region should lie spatially and designing the placement string for it.
   - `relationships` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
-  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the region's silhouette is non-rectangular, otherwise null/omitted.
+  - `proxy_shape` (string): `BOX` when the region's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectangular.
 
 No additional prose, markdown, or code fences.
 </output>"""
@@ -835,16 +833,20 @@ class ObjectDecompOutput(BaseModel):
 
 # Shared output schema + additional_context for the three object
 # decomposition modes (anchor, encapsulating, negative-space). Each
-# mode-specific system prompt concatenates its own intro/role/input
-# with this tail.
-_OBJECT_DECOMP_TAIL = f"""<output>
+# mode-specific system prompt concatenates its own intro/role/input with
+# this tail. `extra_context` is appended to the additional_context block;
+# the encapsulating (frame) decomp passes ORIENTATION_DOC so the shell
+# author knows a node's box can't tilt, taper, or lean — only yaw.
+def _object_decomp_tail(extra_context: str = "") -> str:
+    extra = f"\n\n{extra_context}" if extra_context else ""
+    return f"""<output>
 Respond with a single JSON object containing:
 - `objects` (list): the new object specs this call adds to the scene. Each object spec:
   - `id` (string): unique within this call
   - `prompt` (string): detailed description; used verbatim as the text-to-3D generation prompt
   - `parent` (string): id of this object's structural parent (what it physically rests on, hangs from, leans against, or is contained by)
   - `parent_relationship_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent — wall/ceiling mounts, embedded fittings, shell-frame-to-region), or `IN` (contained inside the parent's volume / footprint with no specific contact face). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
-  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the object's silhouette is non-rectilinear, otherwise null/omitted.
+  - `proxy_shape` (string): `BOX` when the object's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectilinear.
   - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z (toward viewer), `90` = front faces +X (to the right), `180` = front faces -Z (away), `-90` = front faces -X (to the left); positive degrees swing the front toward +X (right), negative toward -X (left). Use 0 for symmetric objects.
   - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
   - `relationships` (list of {{target, kind}}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
@@ -858,7 +860,7 @@ No additional prose, markdown, or code fences.
 
 {NO_EPHEMERA_DOC}
 
-{SOLID_OCCUPANCY_DOC}
+{SOLID_OCCUPANCY_DOC}{extra}
 </additional_context>"""
 
 
@@ -874,7 +876,7 @@ You are enumerating the objects of an atomic leaf region — the objects that ma
 The user message contains this region's id, description, and plan, plus the scene context (every region and object already placed in the run, which you may reference by id).
 </input>
 
-{_OBJECT_DECOMP_TAIL}"""
+{_object_decomp_tail()}"""
 
 
 SYSTEM_ENCAPSULATING_DECOMP = f"""<intro>
@@ -891,7 +893,7 @@ If and ONLY if so, you are to output a list of objects that represent the perime
 The user message contains this region's id, description, and plan, plus the scene context (every region and object already placed in the run, which you may reference by id).
 </input>
 
-{_OBJECT_DECOMP_TAIL}"""
+{_object_decomp_tail(ORIENTATION_DOC)}"""
 
 
 SYSTEM_NEGATIVE_SPACE_DECOMP = f"""<intro>
@@ -906,7 +908,7 @@ You are filling the ambient, connective, interstitial space between the named re
 The user message contains this region's id, description, and plan, plus the scene context (every region and object already placed in the run, which you may reference by id).
 </input>
 
-{_OBJECT_DECOMP_TAIL}"""
+{_object_decomp_tail()}"""
 
 
 def _render_retry_block(
@@ -1163,7 +1165,7 @@ Here is the list of objects you must place:
 
 {_render_to_place_block(objects, by_id, parent_zone=zone_id)}
 
-Your job is to produce a bounding box for those objects. Each object's bbox must be relative to that object's parent's local frame — origin (0,0,0) is the parent's minimum corner. When determining the bounding boxes, you should remain loyal to each object's placement text, but also use your best judgment and think spatially about how the bounding boxes you come up with interact with the already present bounding boxes of other objects/regions inside the scene, as well as the bounding boxes of the other objects in your output list. You are not simply a translator that translates a placement text into coordinates - you should reason spatially to determine what bounding box coordinates make sense.
+Your job is to produce a bounding box for those objects. Each object's bbox must be relative to that object's parent's local frame — origin (0,0,0) is the parent's minimum corner. Note that this refers to the actual parent you choose to parent the object to, and could differ from the parent region (which is the region that actually is generating that object). When determining the bounding boxes, you should remain loyal to each object's placement text, but also use your best judgment and think spatially about how the bounding boxes you come up with interact with the already present bounding boxes of other objects/regions inside the scene, as well as the bounding boxes of the other objects in your output list. You are not simply a translator that translates a placement text into coordinates - you should reason spatially to determine what bounding box coordinates make sense.
 
 When determining the bounding box coordinates and dimensions of each object, you should also think about the object's orientation (shown in the list above in degrees of yaw about the vertical +Y axis). It turns the object's front against the one global frame — 0 faces +Z (toward the viewer), +90 faces +X (to the right), -90 faces -X (to the left), 180 faces -Z (away). The box you assign stays axis-aligned and is filled by the object after it is turned, so size it to the turned shape: a +/-90 yaw swaps the object's width and depth, so give the box the object's depth as its X extent and its width as its Z extent (a box whose proportions don't match the turned object will stretch it out of shape). And let facing drive placement — seat each object so its front, and the open space its front needs, point the way its orientation dictates.
 {_deepseek_suffix()}"""
@@ -1199,7 +1201,7 @@ Each object spec has the same fields as the bulk decomposition step:
   - `prompt` (string): detailed description; used verbatim for text-to-3D
   - `parent` (string): id of the structural anchor (what this object physically rests on, hangs from, leans against, or is contained by) — an existing node, or another object earlier in this same list
   - `parent_relationship_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
-  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the object's silhouette is non-rectilinear, otherwise null/omitted.
+  - `proxy_shape` (string): `BOX` when the object's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectilinear.
   - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z, `90` = front faces -X, `180` = front faces -Z, `-90` = front faces +X. Use 0 for symmetric objects.
   - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
   - `relationships` (list of {{target, kind}}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.

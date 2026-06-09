@@ -1835,10 +1835,37 @@ gridToggleEl.addEventListener("click", () => {
   applyGridToggle();
 });
 
+// The controls/topbar grows and reflows (tabs, slots, versions, row-wrapping,
+// collapse/expand), so its height isn't fixed. Pin the tree just below the
+// topbar's live bottom edge instead of a hard-coded top, so a tall controls
+// panel can never overlap the tree. The CSS top/max-height are only the
+// pre-JS fallback.
+const topbarEl = document.getElementById("topbar");
+const TREE_TOP_GAP = 12;
+let _treeLayoutPending = false;
+function layoutTree() {
+  const top = Math.round(topbarEl.getBoundingClientRect().bottom) + TREE_TOP_GAP;
+  treeEl.style.top = `${top}px`;
+  // Anchor the tree's bottom edge as before (20px margin + 30vh reserved for
+  // the lower-left panels); only its height flexes as the topbar grows.
+  treeEl.style.maxHeight = `calc(100vh - ${top + 20}px - 30vh)`;
+}
+function scheduleTreeLayout() {
+  if (_treeLayoutPending) return;
+  _treeLayoutPending = true;
+  requestAnimationFrame(() => {
+    _treeLayoutPending = false;
+    layoutTree();
+  });
+}
+new ResizeObserver(scheduleTreeLayout).observe(topbarEl);
+scheduleTreeLayout();
+
 window.addEventListener("resize", () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  scheduleTreeLayout();
 });
 
 // Coalescing flag for fitToScene (drained once per frame in animate, below):

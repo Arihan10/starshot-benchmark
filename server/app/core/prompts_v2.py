@@ -388,7 +388,7 @@ def render_root_objects(nodes: list[Node]) -> str:
     idx = util.index_children(nodes)
     root_objects, _ = util.split_region_members(root.id, idx)
     if not root_objects:
-        return "No objects are parented directly to the scene root yet."
+        return "No objects are parented directly to the scene's root yet."
     return (
         "Here's a list of objects parented directly to the root (parent_id = root):\n\n"
         + util.brace_group(

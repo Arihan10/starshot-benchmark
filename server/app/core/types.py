@@ -130,10 +130,16 @@ class BoundingBox(BaseModel):
 
 class ProxyShape(StrEnum):
     """Optional collision-proxy primitive describing the mesh's silhouette
-    inside its AABB. `None` on a Node means the AABB itself is the proxy
-    (a rectangular prism). The proxy is always inscribed axis-aligned in
-    the AABB; its parameters are derived from the AABB's dimensions."""
+    inside its AABB. `BOX` is the explicit, model-selectable spelling of the
+    rectangular-prism default and is canonicalized to `None` at decomposition
+    time (see `ChildNodeSpec._box_means_none`), so a realized Node only ever
+    carries `None`, `SPHERE`, `CAPSULE`, or `HEMISPHERE` — `None` and `BOX`
+    both mean "the AABB itself is the proxy". The proxy is always inscribed
+    axis-aligned in the AABB; its parameters are derived from the AABB's
+    dimensions. `BOX` is listed first so a model that defaults to the first
+    enum value lands on the rectilinear default rather than a curved proxy."""
 
+    BOX = "BOX"
     SPHERE = "SPHERE"
     CAPSULE = "CAPSULE"
     HEMISPHERE = "HEMISPHERE"

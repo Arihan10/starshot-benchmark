@@ -988,6 +988,10 @@
             }
             #tree {
                 position: fixed;
+                /* top + max-height are managed at runtime (see layoutTree in
+                   viewer.js): the tree is pinned just below the topbar's live
+                   bottom edge so the controls panel can never overlap it. These
+                   values are only the pre-JS fallback. */
                 top: 248px;
                 left: 12px;
                 width: 360px;
@@ -999,10 +1003,9 @@
                 backdrop-filter: blur(6px);
                 font-size: 11px;
                 line-height: 1.4;
-                /* Above #topbar (z-index 10): the controls bar grows tall enough
-                   to overhang the tree's top edge, and at z-index 5 it covered
-                   the tree header — burying the flow-graph + observability
-                   launch buttons. Sitting above the bar keeps them clickable. */
+                /* Defense-in-depth for the pre-layout frame and the flow canvas:
+                   keep the tree (z-index 20) above #topbar (z-index 10) so its
+                   flow-graph + observability launch buttons stay clickable. */
                 z-index: 20;
             }
             #tree.collapsed #tree-body {
