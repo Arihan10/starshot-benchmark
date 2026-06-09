@@ -33,7 +33,13 @@ SLOTS: list[Slot] = [
     Slot("campsites", "three family campsites in an open field"),
     Slot("outer space", "a planetary system"),
     Slot("suburban home", "a traditional two-story suburban house"),
+<<<<<<< HEAD
     Slot("toy room", "shrunk down in gigantic toy room")
+=======
+    Slot("modern-house-cliff", "a modern house built into a cliff"),
+    Slot("battle-arena-medieval", "a two-player battle arena in a medieval castle"),
+    Slot("A startup office", "a startup office")
+>>>>>>> testing/old-data-vs-new-data
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}

@@ -25,6 +25,10 @@ const GEN_OPTIMIZED_STORAGE_KEY = "starshot.genOptimized";
 const REGEN_SOURCE_STORAGE_KEY = "starshot.regenSource";
 
 const statusEl = document.getElementById("status");
+const costTrackerEl = document.getElementById("cost-tracker");
+const costPillEl = document.getElementById("cost-pill");
+const costPillSummaryEl = costPillEl.querySelector(".cost-pill-summary");
+const costDropdownEl = document.getElementById("cost-dropdown");
 const logEl = document.getElementById("log");
 const logBodyEl = document.getElementById("log-body");
 const logToggleEl = document.getElementById("log-toggle");
@@ -248,6 +252,79 @@ const treeModalEl = document.getElementById("tree-modal");
 const treeModalBodyEl = document.getElementById("tree-modal-body");
 const treeModalCloseEl = document.getElementById("tree-modal-close");
 const treeModalSearchEl = document.getElementById("tree-modal-search");
+const treeFlowEl = document.getElementById("tree-flow");
+const flowModalEl = document.getElementById("flow-modal");
+const flowViewportEl = document.getElementById("flow-viewport");
+const flowStageEl = document.getElementById("flow-stage");
+const flowEdgesEl = document.getElementById("flow-edges");
+const flowNodesEl = document.getElementById("flow-nodes");
+const flowEmptyEl = document.getElementById("flow-empty");
+const flowSearchEl = document.getElementById("flow-search");
+const flowFitEl = document.getElementById("flow-fit");
+const flowZoomInEl = document.getElementById("flow-zoom-in");
+const flowZoomOutEl = document.getElementById("flow-zoom-out");
+const flowCloseEl = document.getElementById("flow-close");
+const flowPauseEl = document.getElementById("flow-pause");
+const sandboxPanelEl = document.getElementById("sandbox-panel");
+const sandboxStepPillEl = document.getElementById("sandbox-step-pill");
+const sandboxStepMetaEl = document.getElementById("sandbox-step-meta");
+const sandboxPosEl = document.getElementById("sandbox-pos");
+const sandboxSystemEl = document.getElementById("sandbox-system");
+const sandboxUserEl = document.getElementById("sandbox-user");
+const sandboxSystemFieldEl = document.getElementById("sandbox-system-field");
+const sandboxUserFieldEl = document.getElementById("sandbox-user-field");
+const sandboxOutputWrapEl = document.getElementById("sandbox-output-wrap");
+const sandboxOutputEl = document.getElementById("sandbox-output");
+const sandboxRenderNoteEl = document.getElementById("sandbox-render-note");
+const sandboxReasoningEl = document.getElementById("sandbox-reasoning");
+const sandboxReasoningBodyEl = document.getElementById("sandbox-reasoning-body");
+const sandboxTestEl = document.getElementById("sandbox-test");
+const sandboxResetEl = document.getElementById("sandbox-reset");
+const sandboxPrevEl = document.getElementById("sandbox-prev");
+const sandboxNextEl = document.getElementById("sandbox-next");
+const sandboxSimulateEl = document.getElementById("sandbox-simulate");
+const sandboxRunStepEl = document.getElementById("sandbox-runstep");
+const sandboxRerunEl = document.getElementById("sandbox-rerun");
+const sandboxRunRestEl = document.getElementById("sandbox-runrest");
+const sandboxBackEl = document.getElementById("sandbox-back");
+const sandboxBreakoutEl = document.getElementById("sandbox-breakout");
+const sandboxCloseEl = document.getElementById("sandbox-close");
+const sandboxStatusEl = document.getElementById("sandbox-status");
+const sandboxExpandEl = document.getElementById("sandbox-expand");
+const sandboxCopyEl = document.getElementById("sandbox-copy");
+
+// Execution-flow graph layout constants + state. Declared up here (before
+// `animate()` first runs) because the render loop reads `flowModalOpen` /
+// `_flowRenderPending` / `_flowLastRender` every frame — leaving them in a
+// `let` further down would put them in the temporal dead zone on the first
+// synchronous `animate()` call. The graph's functions live lower in the file.
+const FLOW = {
+	INDENT: 32, // horizontal indent per depth level (outline)
+	ROW_H: 56, // vertical slot per node row
+	GUTTER: 14, // connector spine offset inside a node's left edge
+	NODE_W: 210,
+	NODE_H: 42, // nominal node height (edge anchors + bbox height)
+	PAD: 80, // breathing room around the whole graph
+	GRID: 24, // background dot pitch (matches the viewport CSS)
+};
+let flowModalOpen = false;
+let flowPanX = 0;
+let flowPanY = 0;
+let flowZoom = 1;
+let flowSearchQuery = "";
+let _flowRenderPending = false;
+let _flowLastRender = 0;
+let _flowLastWidth = 0;
+let _flowLastHeight = 0;
+let _flowPanning = false;
+let _flowStartX = 0;
+let _flowStartY = 0;
+let _flowStartPanX = 0;
+let _flowStartPanY = 0;
+// Last-rendered exec graph + node positions, cached so sidebar clicks and the
+// locate search can center the canvas without rebuilding the layout.
+let _flowGraph = null;
+let _flowPositions = new Map();
 
 // --- log panel --------------------------------------------------------------
 
@@ -287,6 +364,17 @@ function fmtValue(v) {
 		);
 	if (typeof v === "string") return v;
 	return String(v);
+}
+
+// The log panel is a glanceable activity feed, not a payload inspector — some
+// events (e.g. cache.llm) carry hundreds of KB of prompt/output text. Each
+// rendered field value is clipped to a short preview; the full value still
+// lives in events.jsonl and the observability modal.
+const MAX_LOG_VALUE_LEN = 40;
+function truncateLogValue(text) {
+	return text.length > MAX_LOG_VALUE_LEN
+		? text.slice(0, MAX_LOG_VALUE_LEN) + "…"
+		: text;
 }
 
 // Fields whose values are LLM thinking / chain-of-thought traces. Stripped at
@@ -343,7 +431,7 @@ function buildLogLine(event) {
 			label.className = "k";
 			label.textContent = ` ${k}=`;
 			kv.appendChild(label);
-			kv.appendChild(document.createTextNode(fmtValue(v)));
+			kv.appendChild(document.createTextNode(truncateLogValue(fmtValue(v))));
 			p.appendChild(kv);
 		}
 	}
@@ -1130,6 +1218,10 @@ const nodeLlmCalls = new Map(); // id -> [{step, system, user, output, reasoning
 // Same shape as `nodeLlmCalls` entries plus a `relation` tag and the parent
 // `node` id from the call (so the UI can label "via parent_zone.anchor_decompose").
 const nodeProvenance = new Map(); // id -> [{relation, call: {...}}]
+// Monotonic id stamped on every recorded LLM call so the execution-flow graph
+// can give each step node a stable key, and a step-node click can scroll the
+// observability modal to that exact call block (`data-call-key`).
+let _llmCallUid = 0;
 let treeRootId = null;
 let treeActiveId = null;
 let treeOrderCounter = 0;
@@ -1218,13 +1310,21 @@ function treeSetPhase(id, phase) {
 }
 
 function recordLlmCall(event) {
+	// Feed the per-run spend tracker (keyed by event index, so the backfill /
+	// live-tail overlap doesn't double-count).
+	trackLlmCost(event);
 	// Bucket the call under its `node` id. The server stamps that field on
 	// every `llm.call`; if it's missing (older log line, or a call site we
 	// haven't tagged) bucket it under "_unattributed" so the modal can still
 	// surface it under the root view rather than dropping it on the floor.
 	const id = event.node || "_unattributed";
 	const call = {
+		uid: _llmCallUid++,
 		step: event.step || "(unknown step)",
+		// Output-schema class name (e.g. "BboxBatchOutput"). The prompt-tuning
+		// sandbox sends this to POST /llm/test so the server can resolve the
+		// right schema to re-run this exact step under an edited prompt.
+		schema: event.schema ?? null,
 		system: event.system ?? "",
 		user: event.user ?? "",
 		output: event.output ?? null,
@@ -1240,6 +1340,10 @@ function recordLlmCall(event) {
 	const list = nodeLlmCalls.get(id) ?? [];
 	list.push(call);
 	nodeLlmCalls.set(id, list);
+	// A new call adds a step node (and maybe scene children) to the exec graph;
+	// flag a refresh so it appears live even when no tree mutation accompanies
+	// this cache.llm event. Drained, throttled, by the animate() loop.
+	if (flowModalOpen) _flowRenderPending = true;
 	// Now scan the output for ids this call brought into existence and back-
 	// fill provenance for each. The output shape is structured-output, so we
 	// know exactly which fields name child ids:
@@ -1301,7 +1405,211 @@ function treeClear() {
 	treeDetailEl.innerHTML = "";
 	treeEl.classList.remove("detail-open");
 	updateMissingMeshCount();
+	// The per-run spend tracker shares the tree's lifecycle: a view switch /
+	// reset / rewind wipes the LLM calls it aggregates.
+	clearCostTracker();
 }
+
+// --- per-run LLM spend tracker ----------------------------------------------
+//
+// Every billable LLM request lands as a `cache.llm` event. We bucket the run's
+// reasoning calls (the selected model) by pipeline step and pool the
+// gemini-flash-lite library-matching calls separately, then price each with
+// OpenRouter's published per-token rates. The map is keyed by the event's
+// `index` so the same call arriving via both the history backfill and the live
+// SSE tail (their ranges can overlap) is counted once.
+
+// USD per token (prompt / completion). Source: OpenRouter model catalog
+// (openrouter.ai/api/v1/models), captured 2026-06. Keyed by the OpenRouter
+// model id stamped on each cache.llm event. An id missing here contributes 0
+// cost but is still counted as a request, so a newly-added model degrades to a
+// request-only row until its price is filled in.
+const MODEL_PRICING = {
+	"google/gemini-3.5-flash":       { in: 0.0000015,    out: 0.000009 },
+	"google/gemini-3.1-flash-lite":  { in: 0.00000025,   out: 0.0000015 },
+	"google/gemini-3.1-pro-preview": { in: 0.000002,     out: 0.000012 },
+	"openai/gpt-5.5":                { in: 0.000005,      out: 0.00003 },
+	"anthropic/claude-opus-4.6":     { in: 0.000005,      out: 0.000025 },
+	"deepseek/deepseek-v4-pro":      { in: 0.000000435,   out: 0.00000087 },
+	"anthropic/claude-opus-4.8":     { in: 0.000005,      out: 0.000025 },
+};
+
+// eventIndex -> { step, model, tokensIn, tokensOut, isMatch, exact }
+const llmCostCalls = new Map();
+let _costFallbackKey = 0;
+let _costRenderPending = false;
+
+// Rough token count when the server didn't log usage (older runs). ~4 chars per
+// token is the usual English heuristic — fine for a spend *estimate*.
+function estTokens(s) {
+	return s ? Math.ceil(String(s).length / 4) : 0;
+}
+
+function trackLlmCost(event) {
+	const key = typeof event.index === "number" ? event.index : `u${_costFallbackKey++}`;
+	const haveUsage =
+		Number.isFinite(event.tokens_in) && Number.isFinite(event.tokens_out);
+	const tokensIn = Number.isFinite(event.tokens_in)
+		? event.tokens_in
+		: estTokens(event.system) + estTokens(event.user);
+	const out = event.output;
+	const outText = typeof out === "string" ? out : out == null ? "" : JSON.stringify(out);
+	const tokensOut = Number.isFinite(event.tokens_out)
+		? event.tokens_out
+		: estTokens(outText) + estTokens(event.reasoning);
+	// Library matching always runs on gemini-flash-lite. Identify it by its
+	// step (new logs) or output schema (every prior log) so the split survives
+	// even when the run's reasoning model is also flash-lite.
+	const isMatch =
+		event.step === "library_match" || event.schema === "LibraryMatchOutput";
+	llmCostCalls.set(key, {
+		step: event.step || "(unknown step)",
+		model: event.model || "",
+		tokensIn,
+		tokensOut,
+		isMatch,
+		exact: haveUsage,
+	});
+	scheduleCostRender();
+}
+
+function llmCallCost(c) {
+	const p = MODEL_PRICING[c.model];
+	if (!p) return 0;
+	return c.tokensIn * p.in + c.tokensOut * p.out;
+}
+
+function fmtCost(v) {
+	v = v || 0;
+	return v >= 1 ? "$" + v.toFixed(2) : "$" + v.toFixed(4);
+}
+
+function clearCostTracker() {
+	llmCostCalls.clear();
+	scheduleCostRender();
+}
+
+function scheduleCostRender() {
+	if (_costRenderPending) return;
+	_costRenderPending = true;
+	requestAnimationFrame(() => {
+		_costRenderPending = false;
+		renderCostTracker();
+	});
+}
+
+function costRow(label, count, cost, className) {
+	const row = document.createElement("div");
+	row.className = className;
+	const step = document.createElement("span");
+	step.className = "cost-step";
+	step.textContent = label;
+	const reqs = document.createElement("span");
+	reqs.className = "cost-count";
+	reqs.textContent = String(count);
+	const amt = document.createElement("span");
+	amt.className = "cost-amt";
+	amt.textContent = fmtCost(cost);
+	row.append(step, reqs, amt);
+	return row;
+}
+
+function costSectionHead(name, tag, count, cost) {
+	const head = document.createElement("div");
+	head.className = "cost-section-head";
+	const nameEl = document.createElement("span");
+	nameEl.className = "cost-sec-name";
+	nameEl.textContent = name;
+	const tagEl = document.createElement("span");
+	tagEl.className = "cost-sec-model";
+	tagEl.textContent = tag;
+	const sumEl = document.createElement("span");
+	sumEl.className = "cost-sec-sum";
+	sumEl.textContent = `${fmtCost(cost)} · ${count} req`;
+	head.append(nameEl, tagEl, sumEl);
+	return head;
+}
+
+function renderCostTracker() {
+	const byStep = new Map(); // step -> { count, cost }
+	let reasoningCount = 0;
+	let reasoningCost = 0;
+	let matchCount = 0;
+	let matchCost = 0;
+	let anyEstimated = false;
+	for (const c of llmCostCalls.values()) {
+		const cost = llmCallCost(c);
+		if (!c.exact) anyEstimated = true;
+		if (c.isMatch) {
+			matchCount += 1;
+			matchCost += cost;
+		} else {
+			reasoningCount += 1;
+			reasoningCost += cost;
+			const e = byStep.get(c.step) ?? { count: 0, cost: 0 };
+			e.count += 1;
+			e.cost += cost;
+			byStep.set(c.step, e);
+		}
+	}
+	const totalCount = reasoningCount + matchCount;
+	const totalCost = reasoningCost + matchCost;
+	costPillSummaryEl.textContent = `${fmtCost(totalCost)} · ${totalCount} req`;
+
+	costDropdownEl.innerHTML = "";
+	if (totalCount === 0) {
+		const empty = document.createElement("div");
+		empty.className = "cost-empty";
+		empty.textContent = "no LLM requests yet";
+		costDropdownEl.appendChild(empty);
+		return;
+	}
+
+	if (reasoningCount > 0) {
+		const section = document.createElement("div");
+		section.className = "cost-section";
+		section.appendChild(
+			costSectionHead(currentModel ?? "selected model", "reasoning", reasoningCount, reasoningCost),
+		);
+		const steps = [...byStep.entries()].sort((a, b) => b[1].cost - a[1].cost);
+		for (const [step, agg] of steps) {
+			section.appendChild(costRow(step.replace(/_/g, " "), agg.count, agg.cost, "cost-row"));
+		}
+		costDropdownEl.appendChild(section);
+	}
+
+	if (matchCount > 0) {
+		const div = document.createElement("div");
+		div.className = "cost-divider";
+		costDropdownEl.appendChild(div);
+		const section = document.createElement("div");
+		section.className = "cost-section";
+		section.appendChild(
+			costSectionHead("gemini-flash-lite", "matching", matchCount, matchCost),
+		);
+		costDropdownEl.appendChild(section);
+	}
+
+	const div = document.createElement("div");
+	div.className = "cost-divider";
+	costDropdownEl.appendChild(div);
+	costDropdownEl.appendChild(costRow("total", totalCount, totalCost, "cost-total"));
+
+	if (anyEstimated) {
+		const note = document.createElement("div");
+		note.className = "cost-est-note";
+		note.textContent = "≈ some calls estimated from text (no token log)";
+		costDropdownEl.appendChild(note);
+	}
+}
+
+costPillEl.addEventListener("click", () => {
+	costTrackerEl.classList.toggle("collapsed");
+});
+
+// Paint the empty state on boot. Deferred via rAF (scheduleCostRender), so it
+// runs after module init — `currentModel` is no longer in its TDZ by then.
+scheduleCostRender();
 
 // True if `id` itself is hidden, or any ZONE ancestor is hidden. The
 // zone-only ancestor rule is what makes hiding a zone hide everything
@@ -1406,6 +1714,12 @@ function renderTreeNode(id, ctx) {
 	row.addEventListener("click", (ev) => {
 		ev.stopPropagation();
 		selectTreeNode(id);
+		// When the execution-flow canvas is open, a sidebar click also zooms it
+		// onto the matching scene node so the two views stay coupled.
+		if (flowModalOpen) {
+			renderFlow();
+			flowCenterOnScene(id);
+		}
 	});
 
 	// Per-node visibility toggle. Reflects only the self-hidden state — a
@@ -1628,6 +1942,66 @@ scene.add(sceneRoot);
 // and so clearScene can nuke them independently.
 const bboxRoot = new THREE.Group();
 scene.add(bboxRoot);
+
+// --- prompt-tuning sandbox state --------------------------------------------
+//
+// The sandbox lets the user rewind the canvas to a single pipeline step and
+// re-run that step's LLM call under an edited prompt — non-destructively. The
+// real run is never mutated: we PAUSE it (server), detach the SSE, and
+// simulate the rewind purely by toggling the visibility of already-loaded
+// scene objects (every object remembers the event index that created it, and
+// while `rewindCutoffIndex` is set, anything created at/after the cursor is
+// hidden). A tested step's output is drawn into `sandboxOverlayRoot` on top of
+// that rewound state. Breaking out clears the cutoff + overlay, restoring the
+// exact scene, and resumes the run if we were the ones who paused it.
+const sandboxOverlayRoot = new THREE.Group();
+scene.add(sandboxOverlayRoot);
+let sandboxActive = false;
+// Ordered list of every recorded LLM-call step (across all nodes) by event
+// index — the spine the user walks with prev/next. Each entry is a
+// nodeLlmCalls `call` object.
+let sandboxSteps = [];
+let sandboxCursor = -1;
+// Whether THIS sandbox session paused the run (so break-out knows to resume).
+let sandboxPausedByUs = false;
+// While set, scene-object visibility is gated to "created before this event
+// index"; null = show everything (normal mode).
+let rewindCutoffIndex = null;
+// id -> event index at which its bbox / model first appeared. Built from
+// `recordedEvents` when a sandbox session starts.
+const bboxCreatedIndex = new Map();
+const modelCreatedIndex = new Map();
+// In-flight POST /llm/test guard so double-clicks can't stack calls.
+let sandboxTesting = false;
+// --- branch (downstream step-through) state ---
+// When `branchActive`, the cell has been forked at the tuned step (server-side,
+// under <cell>/_branch) and the deviated subtree is re-simulating one step at a
+// time: the pipeline PAUSES before each downstream LLM call so you can edit its
+// (pre-filled, re-rendered) prompt. We keep the original scene rewound to the
+// deviation point and render the branch's downstream nodes — bboxes AND real
+// meshes — into sandboxOverlayRoot as its events stream. Break-out deletes it.
+let branchActive = false;
+let branchSource = null;        // EventSource over /branch/events
+let branchDeviationIndex = -1;  // original event index the fork deviated at
+let branchGen = 0;              // bumped per session to bail stale async mesh loads
+let branchDone = false;
+// `branchSteps` is the ordered list of the branch's steps: the committed ones
+// (each carries the prompt that was actually committed to the branch log, plus
+// its output + reasoning) followed by the live frontier (the next, un-run step,
+// editable to run). `branchCursor` is the step being viewed; prev/next move it
+// NON-destructively (observability). Only an explicit re-run truncates +
+// invalidates downstream.
+let branchSteps = [];
+let branchCursor = -1;
+let branchStepBusy = false;      // a proceed / re-run is in flight
+let branchAuto = false;          // "run rest" is streaming autonomously (no pauses)
+let branchRebuilding = false;    // a re-run reopen's snapshot is replaying
+let branchReopenTarget = 0;      // cursor to settle on once a rebuild finishes
+// The in-progress prompt carried from EDIT mode into the branch's first step,
+// so entering simulation doesn't make you retype the edit. Consumed once.
+let branchFirstPrompt = null;
+const branchOverlayBboxIds = new Set(); // deviated ids already drawn as overlay wireframes
+const branchOverlayMeshes = new Map();  // id -> loaded GLB object3d in the overlay
 let bboxesShown = localStorage.getItem(BBOX_VISIBLE_STORAGE_KEY) !== "0";
 function applyBboxToggleLabel() {
 	bboxToggleEl.textContent = `bboxes: ${bboxesShown ? "on" : "off"}`;
@@ -1737,6 +2111,10 @@ let selectedBboxId = null;
 const raycaster = new THREE.Raycaster();
 const pointer = new THREE.Vector2();
 let pointerDirty = false;
+// Whether the cursor is currently over the WebGL canvas. Gates Shift-driven
+// hover refreshes so the zones-only override never paints a phantom highlight
+// when the pointer is off-canvas.
+let pointerInsideCanvas = false;
 let lastPointerClientX = 0;
 let lastPointerClientY = 0;
 let controlsInteracting = false;
@@ -1753,7 +2131,9 @@ tooltip.style.cssText = [
 	"font: 12px ui-monospace, SFMono-Regular, Menlo, monospace",
 	"pointer-events: none",
 	"display: none",
-	"z-index: 10",
+	// Above the chrome incl. the sandbox panel (z-index 60) so a hover label on a
+	// magenta overlay box near the panel edge isn't occluded; still below modals.
+	"z-index: 70",
 	"max-width: 360px",
 	"white-space: pre-wrap",
 	"line-height: 1.35",
@@ -1818,16 +2198,28 @@ window.addEventListener("keydown", (ev) => {
 		pressedKeys.add(k);
 		ev.preventDefault();
 	} else if (k === "shift") {
-		pressedKeys.add("shift");
+		// First Shift press also flips picking to zones-only; refresh hover so the
+		// highlight reflects the new pick set without needing a mouse jiggle.
+		if (!pressedKeys.has("shift")) {
+			pressedKeys.add("shift");
+			if (pointerInsideCanvas) pointerDirty = true;
+		}
 	}
 });
 
 window.addEventListener("keyup", (ev) => {
-	pressedKeys.delete(ev.key.toLowerCase());
+	const k = ev.key.toLowerCase();
+	pressedKeys.delete(k);
+	// Releasing Shift drops the zones-only override; refresh hover for the
+	// full pick set.
+	if (k === "shift" && pointerInsideCanvas) pointerDirty = true;
 });
 
 // Alt-tab / focus-loss: drop held keys so they don't stick on.
-window.addEventListener("blur", () => pressedKeys.clear());
+window.addEventListener("blur", () => {
+	pressedKeys.clear();
+	if (pointerInsideCanvas) pointerDirty = true;
+});
 
 const _fwd = new THREE.Vector3();
 const _right = new THREE.Vector3();
@@ -2342,10 +2734,37 @@ gridToggleEl.addEventListener("click", () => {
 	applyGridToggle();
 });
 
+// The controls/topbar grows and reflows (tabs, slots, versions, row-wrapping,
+// collapse/expand), so its height isn't fixed. Pin the tree just below the
+// topbar's live bottom edge instead of a hard-coded top, so a tall controls
+// panel can never overlap the tree. The CSS top/max-height are only the
+// pre-JS fallback.
+const topbarEl = document.getElementById("topbar");
+const TREE_TOP_GAP = 12;
+let _treeLayoutPending = false;
+function layoutTree() {
+	const top = Math.round(topbarEl.getBoundingClientRect().bottom) + TREE_TOP_GAP;
+	treeEl.style.top = `${top}px`;
+	// Anchor the tree's bottom edge as before (20px margin + 30vh reserved for
+	// the lower-left panels); only its height flexes as the topbar grows.
+	treeEl.style.maxHeight = `calc(100vh - ${top + 20}px - 30vh)`;
+}
+function scheduleTreeLayout() {
+	if (_treeLayoutPending) return;
+	_treeLayoutPending = true;
+	requestAnimationFrame(() => {
+		_treeLayoutPending = false;
+		layoutTree();
+	});
+}
+new ResizeObserver(scheduleTreeLayout).observe(topbarEl);
+scheduleTreeLayout();
+
 window.addEventListener("resize", () => {
 	camera.aspect = window.innerWidth / window.innerHeight;
 	camera.updateProjectionMatrix();
 	renderer.setSize(window.innerWidth, window.innerHeight);
+	scheduleTreeLayout();
 });
 
 // Coalescing flag for fitToScene (drained once per frame in animate, below):
@@ -2367,10 +2786,21 @@ function animate() {
 	// Drain coalesced UI work once per frame: collapse a burst of streamed tree
 	// mutations into one DOM rebuild, and a burst of mesh completions into one
 	// camera refit. Both run before render so the frame reflects them.
-	if (_treeRenderPending) renderTree();
+	if (_treeRenderPending) {
+		renderTree();
+		if (flowModalOpen) _flowRenderPending = true;
+	}
 	if (_fitScenePending) {
 		_fitScenePending = false;
 		fitToScene();
+	}
+	// Refresh the execution-flow graph from the same coalesced tree mutations,
+	// throttled so a burst of streamed nodes rebuilds the canvas at most a few
+	// times a second rather than every frame.
+	if (flowModalOpen && _flowRenderPending && now - _flowLastRender > 150) {
+		_flowRenderPending = false;
+		_flowLastRender = now;
+		renderFlow();
 	}
 
 	gridMat.uniforms.uCameraPos.value.copy(camera.position);
@@ -2381,12 +2811,32 @@ function animate() {
 	if (pointerDirty && !controlsInteracting) {
 		pointerDirty = false;
 		raycaster.setFromCamera(pointer, camera);
-		const hoveredId = pickHoveredBboxId();
-		setHoveredBbox(hoveredId);
-		if (hoveredId !== null) {
-			positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+		if (sandboxActive) {
+			// The magenta overlay boxes take priority; fall back to the still-visible
+			// frozen context (pre-rewind originals) so those keep their tooltip too.
+			const oid = pickHoveredOverlayId();
+			if (oid !== null) {
+				setHoveredOverlay(oid);
+				setHoveredBbox(null);
+				positionOverlayTooltip(lastPointerClientX, lastPointerClientY, oid);
+			} else {
+				setHoveredOverlay(null);
+				const hoveredId = pickHoveredBboxId();
+				setHoveredBbox(hoveredId);
+				if (hoveredId !== null) {
+					positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+				} else {
+					tooltip.style.display = "none";
+				}
+			}
 		} else {
-			tooltip.style.display = "none";
+			const hoveredId = pickHoveredBboxId();
+			setHoveredBbox(hoveredId);
+			if (hoveredId !== null) {
+				positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+			} else {
+				tooltip.style.display = "none";
+			}
 		}
 	}
 
@@ -2425,6 +2875,7 @@ function clearScene() {
 	// the latest and repopulates the picker.
 	genVersion = null;
 	genVersions = [];
+	clearSandboxOverlay();
 	hoveredBboxId = null;
 	selectedBboxId = null;
 	updateOrientationIndicator();
@@ -2463,14 +2914,23 @@ function fitToScene() {
 // GLTFLoader can't parse them. Wire the Basis transcoder (shipped with three,
 // served at /vendor/three/... by client/server.mjs) and the Meshopt decoder into
 // every loader. detectSupport(renderer) picks the GPU's transcode target.
+// Both geometry (Meshopt) and texture (KTX2) decode default to a single thread,
+// which serializes a scene's hundreds of meshes and is the main load-time
+// bottleneck. Give each a worker pool scaled to the machine so they decode in
+// parallel, off the main thread. One knob drives both.
+const DECODE_WORKERS = Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4));
+
 const ktx2Loader = new KTX2Loader()
 	.setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
-	// The default 4-worker transcode pool serializes a scene's hundreds of KTX2
-	// textures and is the main load-time bottleneck; scale it to the machine.
-	.setWorkerLimit(
-		Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4)),
-	)
+	.setWorkerLimit(DECODE_WORKERS)
 	.detectSupport(renderer);
+
+// EXT_meshopt_compression decode otherwise runs synchronously on the main
+// thread even though GLTFLoader awaits it (decodeGltfBufferAsync just wraps a
+// blocking WASM call); a worker pool routes it off-thread so vertex/index
+// decode parallelizes across the streamed bundle like KTX2 above. Called once
+// on the shared singleton — every GLTFLoader that uses it inherits the pool.
+MeshoptDecoder.useWorkers(DECODE_WORKERS);
 
 function configureGltfLoader(gltfLoader) {
 	return gltfLoader
@@ -2695,6 +3155,10 @@ function _byteStreamReader(reader) {
 	return { readExact };
 }
 
+// Diagnostic: log per-phase first-switch load timings to the console under a
+// `[load]` prefix. Flip off once the bottleneck is understood.
+const LOAD_TIMING = true;
+
 // Parse + attach up to this many meshes concurrently. Reading frames off the
 // stream stays sequential on the one connection; only the parse/decode fans
 // out, bounding peak memory to ~MAX_INFLIGHT in-flight GLBs.
@@ -2705,6 +3169,10 @@ async function consumeMeshBundleStream(reader, state) {
 	const dec = new TextDecoder();
 	const magic = await r.readExact(4);
 	if (!magic || dec.decode(magic) !== _MESH_BUNDLE_MAGIC) return;
+	const t0 = performance.now();
+	let count = 0;
+	let bytes = 0;
+	let firstMeshMs = 0;
 	const inflight = new Set();
 	while (true) {
 		if (state.gen !== sceneGen || state.abort.signal.aborted) break;
@@ -2719,15 +3187,23 @@ async function consumeMeshBundleStream(reader, state) {
 		const glbLen = new DataView(glbLenB.buffer).getUint32(0, true);
 		const glbB = await r.readExact(glbLen);
 		if (!glbB) break;
-		const p = attachBundleMesh(id, glbB.buffer, state.gen, state).finally(
-			() => inflight.delete(p),
-		);
+		count++;
+		bytes += glbLen;
+		const p = attachBundleMesh(id, glbB.buffer, state.gen, state)
+			.then(() => { if (firstMeshMs === 0) firstMeshMs = performance.now() - t0; })
+			.finally(() => inflight.delete(p));
 		inflight.add(p);
 		// Hold the read at MAX_INFLIGHT in-flight parses; resume once one drains.
 		if (inflight.size >= MESH_BUNDLE_MAX_INFLIGHT)
 			await Promise.race(inflight);
 	}
 	await Promise.allSettled(inflight);
+	if (LOAD_TIMING) {
+		console.info(
+			`[load] mesh bundle: ${count} meshes · ${(bytes / 1e6).toFixed(1)}MB · ` +
+				`first paint ${firstMeshMs | 0}ms · decode+attach ${(performance.now() - t0) | 0}ms`,
+		);
+	}
 	// One camera refit after the whole bundle lands — a per-mesh fitToScene()
 	// is an O(scene) Box3 traversal, i.e. quadratic across a large scene.
 	if (state.gen === sceneGen) fitToScene();
@@ -3082,12 +3558,25 @@ function rebuildAllSolidFills() {
 	}
 }
 
+// Rewind gate for the prompt-tuning sandbox: the scene is "rewound" to a step
+// by hiding every object created at/after the cursor's event index. Outside
+// the sandbox (`rewindCutoffIndex === null`) everything passes. An id with no
+// recorded creation index (log still backfilling) is treated as present so we
+// never spuriously blank a node we simply lack provenance for.
+function withinRewind(id, kind) {
+	if (rewindCutoffIndex === null) return true;
+	const map = kind === "model" ? modelCreatedIndex : bboxCreatedIndex;
+	const created = map.get(id);
+	if (created === undefined) return true;
+	return created < rewindCutoffIndex;
+}
+
 function applySolidFillVisibility(id) {
 	const mesh = solidFills.get(id);
 	if (!mesh) return;
 	const isFrame = treeNodes.get(id)?.kind === "frame";
 	const frameOk = isFrame ? framesShown : true;
-	mesh.visible = frameOk && !effectivelyHidden(id);
+	mesh.visible = frameOk && !effectivelyHidden(id) && withinRewind(id, "bbox");
 }
 
 function refreshAllSolidFillVisibility() {
@@ -3125,7 +3614,10 @@ function applyBboxVisibility(id) {
 	// spatial reference. Hover gets full opacity so the user can see what
 	// they're about to pick.
 	const visible =
-		id === selectedBboxId || id === hoveredBboxId || bboxesShown;
+		(id === selectedBboxId ||
+			id === hoveredBboxId ||
+			bboxesShown) &&
+		withinRewind(id, "bbox");
 	const dim =
 		selectedBboxId !== null &&
 		id !== selectedBboxId &&
@@ -3151,11 +3643,21 @@ function applyModelVisibility(id) {
 	if (!model) return;
 	const isFrame = treeNodes.get(id)?.kind === "frame";
 	const frameOk = isFrame ? framesShown : true;
-	model.visible = meshesShown && frameOk && !effectivelyHidden(id);
+	model.visible =
+		meshesShown && frameOk && !effectivelyHidden(id) && withinRewind(id, "model");
 }
 
 function refreshAllFrameModelVisibility() {
 	for (const id of modelsById.keys()) applyModelVisibility(id);
+}
+
+// Re-apply every visibility rule across bboxes, proxies, solid fills, and
+// meshes. The sandbox calls this whenever the rewind cutoff moves so the whole
+// scene snaps to the rewound state in one pass.
+function refreshAllVisibility() {
+	refreshAllBboxVisibility();
+	refreshAllSolidFillVisibility();
+	refreshAllFrameModelVisibility();
 }
 
 function setHoveredBbox(id) {
@@ -4102,11 +4604,29 @@ function copyButton(text, label = "copy") {
 	return b;
 }
 
-function llmCallBlock(call, { defaultOpen }) {
+function llmCallBlock(call, { defaultOpen, query = "" }) {
+	const filtering = query.length > 0;
+
+	// Output is pretty-printed JSON because the structured-output schema is what
+	// the rest of the pipeline consumes; match against the same text the user sees.
+	const outText = call.output === null
+		? "(no output)"
+		: (() => { try { return JSON.stringify(call.output, null, 2); } catch { return String(call.output); } })();
+
+	// When searching, only the boxes containing the term render. A call with no
+	// matching box is dropped entirely (return null) so "calls issued from this
+	// node" / provenance collapse to just the hits.
+	const sysHit = !!call.system && call.system.toLowerCase().includes(query);
+	const userHit = !!call.user && call.user.toLowerCase().includes(query);
+	const outHit = outText.toLowerCase().includes(query);
+	const reasHit = !!call.reasoning && call.reasoning.toLowerCase().includes(query);
+	if (filtering && !sysHit && !userHit && !outHit && !reasHit) return null;
+
 	const det = document.createElement("details");
 	det.className = "tm-llm-call";
 	if (call.cached) det.classList.add("cached");
-	det.open = defaultOpen;
+	if (call.uid != null) det.dataset.callKey = String(call.uid);
+	det.open = filtering ? true : defaultOpen;
 
 	const sum = document.createElement("summary");
 	sum.className = "tm-llm-summary";
@@ -4147,48 +4667,47 @@ function llmCallBlock(call, { defaultOpen }) {
 
 	// System instruction — the prompt that defines the LLM's role for this
 	// step. Usually long-ish boilerplate; collapsed by default so the user
-	// sees the dynamic input + output first.
-	const sysWrap = document.createElement("details");
-	sysWrap.className = "tm-llm-subblock";
-	const sysSum = document.createElement("summary");
-	sysSum.textContent = `system instruction (${call.system.length.toLocaleString()} chars)`;
-	sysWrap.appendChild(sysSum);
-	sysWrap.appendChild(preBlock(call.system, { cap: "260px" }));
-	sysWrap.appendChild(copyButton(call.system, "copy system"));
-	det.appendChild(section("system", sysWrap));
+	// sees the dynamic input + output first (opened when it's the search hit).
+	if (!filtering || sysHit) {
+		const sysWrap = document.createElement("details");
+		sysWrap.className = "tm-llm-subblock";
+		if (sysHit) sysWrap.open = true;
+		const sysSum = document.createElement("summary");
+		sysSum.textContent = `system instruction (${call.system.length.toLocaleString()} chars)`;
+		sysWrap.appendChild(sysSum);
+		sysWrap.appendChild(preBlock(call.system, { cap: "260px" }));
+		sysWrap.appendChild(copyButton(call.system, "copy system"));
+		det.appendChild(section("system", sysWrap));
+	}
 
 	// User input — the actual rendered context for this call. This is the
 	// most-changing part call-to-call so it's open by default inside the
 	// already-open detail block.
-	const userWrap = document.createElement("div");
-	userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
-	userWrap.appendChild(copyButton(call.user, "copy input"));
-	det.appendChild(
-		section(`input (${call.user.length.toLocaleString()} chars)`, userWrap),
-	);
+	if (!filtering || userHit) {
+		const userWrap = document.createElement("div");
+		userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
+		userWrap.appendChild(copyButton(call.user, "copy input"));
+		det.appendChild(section(
+			`input (${call.user.length.toLocaleString()} chars)`,
+			userWrap,
+		));
+	}
 
 	// Output — pretty-print JSON. We render with json formatting because the
 	// structured-output schema is what the rest of the pipeline consumes.
-	const outText =
-		call.output === null
-			? "(no output)"
-			: (() => {
-					try {
-						return JSON.stringify(call.output, null, 2);
-					} catch {
-						return String(call.output);
-					}
-				})();
-	const outWrap = document.createElement("div");
-	outWrap.appendChild(preBlock(outText, { cap: "360px" }));
-	outWrap.appendChild(copyButton(outText, "copy output"));
-	det.appendChild(section("output", outWrap));
+	if (!filtering || outHit) {
+		const outWrap = document.createElement("div");
+		outWrap.appendChild(preBlock(outText, { cap: "360px" }));
+		outWrap.appendChild(copyButton(outText, "copy output"));
+		det.appendChild(section("output", outWrap));
+	}
 
 	// Reasoning is optional (only present when the provider returns CoT).
-	// Collapsed by default — it's noisy.
-	if (call.reasoning) {
+	// Collapsed by default — it's noisy (opened when it's the search hit).
+	if (call.reasoning && (!filtering || reasHit)) {
 		const reasWrap = document.createElement("details");
 		reasWrap.className = "tm-llm-subblock";
+		if (reasHit) reasWrap.open = true;
 		const reasSum = document.createElement("summary");
 		reasSum.textContent = `reasoning (${call.reasoning.length.toLocaleString()} chars)`;
 		reasWrap.appendChild(reasSum);
@@ -4199,9 +4718,15 @@ function llmCallBlock(call, { defaultOpen }) {
 	return det;
 }
 
-function renderObsCard(node, { role, depth }) {
+function renderObsCard(node, { role, depth, query = "" }) {
 	// role: "ancestor" | "focus" | "descendant"
 	// depth is only used to indent descendants visually.
+	// When `query` is set the card is filtered down to the text boxes that
+	// contain the term; if nothing in it matches we bail and return null so the
+	// caller drops the card (and its section heading) entirely.
+	const filtering = query.length > 0;
+	if (filtering && !nodeMatchesQuery(node, query)) return null;
+
 	const card = document.createElement("div");
 	const kind = node.kind ?? "zone";
 	card.className = `tm-card tm-obs-card kind-${kind} role-${role}`;
@@ -4213,14 +4738,20 @@ function renderObsCard(node, { role, depth }) {
 
 	// Decide default open/closed. The focused node opens by default; ancestors
 	// and descendants stay closed so the focus stays visually dominant.
-	// User-toggled state takes precedence.
+	// User-toggled state takes precedence — but a live query forces open so the
+	// matching boxes are visible without extra clicks.
 	const userPref = treeModalNodeOpen.get(node.id);
-	const detailsOpen = userPref !== undefined ? userPref : role === "focus";
+	const detailsOpen = filtering
+		? true
+		: (userPref !== undefined ? userPref : (role === "focus"));
 
 	const det = document.createElement("details");
 	det.className = "tm-obs-details";
 	det.open = detailsOpen;
 	det.addEventListener("toggle", () => {
+		// Don't persist open/closed while a search is forcing matches open — that
+		// would clobber the user's pre-search expand state, which we restore on clear.
+		if (treeModalQuery.trim()) return;
 		treeModalNodeOpen.set(node.id, det.open);
 	});
 
@@ -4295,8 +4826,13 @@ function renderObsCard(node, { role, depth }) {
 	const body = document.createElement("div");
 	body.className = "tm-obs-body";
 
+	// Count every box left after filtering so the card can drop itself when a
+	// query matches nothing inside it (despite passing the cheap node-level bail).
+	let visibleBoxes = 0;
+
 	function addTextSection(label, text) {
 		if (!text) return;
+		if (filtering && !text.toLowerCase().includes(query)) return;
 		const wrap = document.createElement("div");
 		wrap.className = "tm-section";
 		const lab = document.createElement("div");
@@ -4308,6 +4844,7 @@ function renderObsCard(node, { role, depth }) {
 		b.textContent = text;
 		wrap.appendChild(b);
 		body.appendChild(wrap);
+		visibleBoxes++;
 	}
 
 	addTextSection("seed prompt", node.prompt);
@@ -4330,7 +4867,10 @@ function renderObsCard(node, { role, depth }) {
 		lab.textContent = "provenance — calls that emitted & placed this node";
 		provWrap.appendChild(lab);
 		const callDefaultOpen = role === "focus";
+		let shownProv = 0;
 		for (const entry of provenance) {
+			const block = llmCallBlock(entry.call, { defaultOpen: callDefaultOpen, query });
+			if (!block) continue; // filtered out — drop its relation line too
 			const relLine = document.createElement("div");
 			relLine.className = "tm-obs-provenance-rel";
 			const rel = document.createElement("span");
@@ -4352,11 +4892,13 @@ function renderObsCard(node, { role, depth }) {
 			}
 			relLine.appendChild(onNode);
 			provWrap.appendChild(relLine);
-			provWrap.appendChild(
-				llmCallBlock(entry.call, { defaultOpen: callDefaultOpen }),
-			);
+			provWrap.appendChild(block);
+			shownProv++;
 		}
-		body.appendChild(provWrap);
+		if (shownProv > 0) {
+			body.appendChild(provWrap);
+			visibleBoxes += shownProv;
+		}
 	}
 
 	// LLM call traces — calls issued *from* this node (zone_plan,
@@ -4367,24 +4909,40 @@ function renderObsCard(node, { role, depth }) {
 	callsHeader.className = "tm-section-label tm-llm-calls-label";
 	callsHeader.textContent = "calls issued from this node";
 	callsWrap.appendChild(callsHeader);
+	let shownCalls = 0;
 	if (calls.length === 0) {
-		const empty = document.createElement("div");
-		empty.className = "tm-llm-empty";
-		empty.textContent = "(no LLM calls issued from this node)";
-		callsWrap.appendChild(empty);
+		// No calls at all — keep the explanatory placeholder only when not
+		// filtering (a search shouldn't surface an empty section).
+		if (!filtering) {
+			const empty = document.createElement("div");
+			empty.className = "tm-llm-empty";
+			empty.textContent = "(no LLM calls issued from this node)";
+			callsWrap.appendChild(empty);
+		}
 	} else {
 		// Focus card opens every call; ancestors/descendants leave them collapsed.
 		const callDefaultOpen = role === "focus";
 		for (const call of calls) {
-			callsWrap.appendChild(
-				llmCallBlock(call, { defaultOpen: callDefaultOpen }),
-			);
+			const block = llmCallBlock(call, { defaultOpen: callDefaultOpen, query });
+			if (!block) continue;
+			callsWrap.appendChild(block);
+			shownCalls++;
 		}
 	}
-	body.appendChild(callsWrap);
+	// When filtering, only surface the calls section if it has a hit; otherwise
+	// keep it (it carries the always-on section / "(no LLM calls…)" placeholder).
+	if (!filtering || shownCalls > 0) {
+		body.appendChild(callsWrap);
+		visibleBoxes += shownCalls;
+	}
 
 	det.appendChild(body);
 	card.appendChild(det);
+
+	// A query that matched the node-level bail but no actual box (e.g. matched
+	// only output's compact JSON, not the pretty form shown) leaves nothing to
+	// read — drop the card so only boxes containing the term remain.
+	if (filtering && visibleBoxes === 0) return null;
 	return card;
 }
 
@@ -4408,27 +4966,26 @@ function renderModalSectionHeading(label, count, hint) {
 	return h;
 }
 
+// Box-level inclusion tests for the modal search. A search filters the modal
+// down to the text boxes that actually contain the term, so these only consider
+// box content — system / input / output / reasoning for calls, and the per-node
+// seed / plan / image prompts. id / step / model labels are deliberately
+// excluded, since they aren't text boxes. The authoritative per-box filtering
+// lives in llmCallBlock + renderObsCard; these just let a card bail before it
+// builds its DOM (and the final empty-card guard keeps the result exact).
 function callMatchesQuery(call, q) {
-	return (
-		call.step.toLowerCase().includes(q) ||
-		call.system.toLowerCase().includes(q) ||
-		call.user.toLowerCase().includes(q) ||
-		(call.model || "").toLowerCase().includes(q) ||
-		JSON.stringify(call.output ?? "")
-			.toLowerCase()
-			.includes(q)
-	);
+	return (!!call.system && call.system.toLowerCase().includes(q))
+		|| (!!call.user && call.user.toLowerCase().includes(q))
+		|| (!!call.reasoning && call.reasoning.toLowerCase().includes(q))
+		|| JSON.stringify(call.output ?? "").toLowerCase().includes(q);
 }
 
 function nodeMatchesQuery(node, q) {
-	if (node.id.toLowerCase().includes(q)) return true;
 	if ((node.prompt ?? "").toLowerCase().includes(q)) return true;
 	if ((node.plan ?? "").toLowerCase().includes(q)) return true;
 	if ((node.imagePrompt ?? "").toLowerCase().includes(q)) return true;
 	const calls = nodeLlmCalls.get(node.id) ?? [];
 	if (calls.some((c) => callMatchesQuery(c, q))) return true;
-	// Also match provenance calls — searching for an emitting step name like
-	// "anchor_decompose" should surface every object that was emitted by one.
 	const prov = nodeProvenance.get(node.id) ?? [];
 	return prov.some((p) => callMatchesQuery(p.call, q));
 }
@@ -4512,50 +5069,65 @@ function renderTreeModal() {
 	});
 	treeModalBodyEl.appendChild(breadcrumb);
 
+	// Each block builds its cards first so the section heading can report the
+	// post-filter count, and an entire section (heading included) drops out when
+	// a query filters it to nothing.
+	let visibleCards = 0;
+
 	// Ancestors block — collapsed by default per-card.
 	if (ancestors.length > 0) {
-		treeModalBodyEl.appendChild(
-			renderModalSectionHeading(
-				"ancestors",
-				ancestors.length,
-				"every LLM call that shaped the chain from root → focus",
-			),
-		);
+		const cards = [];
 		for (const a of ancestors) {
-			if (q && !nodeMatchesQuery(a, q)) continue;
-			treeModalBodyEl.appendChild(
-				renderObsCard(a, { role: "ancestor", depth: 0 }),
-			);
+			const card = renderObsCard(a, { role: "ancestor", depth: 0, query: q });
+			if (card) cards.push(card);
+		}
+		if (cards.length > 0) {
+			treeModalBodyEl.appendChild(renderModalSectionHeading(
+				"ancestors",
+				cards.length,
+				q ? "matching boxes only" : "every LLM call that shaped the chain from root → focus",
+			));
+			for (const card of cards) treeModalBodyEl.appendChild(card);
+			visibleCards += cards.length;
 		}
 	}
 
 	// Focus block.
-	treeModalBodyEl.appendChild(
-		renderModalSectionHeading(
+	const focusCard = renderObsCard(focusNode, { role: "focus", depth: 0, query: q });
+	if (focusCard) {
+		treeModalBodyEl.appendChild(renderModalSectionHeading(
 			"focused node",
 			1,
-			"every LLM call captured for this node, expanded",
-		),
-	);
-	treeModalBodyEl.appendChild(
-		renderObsCard(focusNode, { role: "focus", depth: 0 }),
-	);
+			q ? "matching boxes only" : "every LLM call captured for this node, expanded",
+		));
+		treeModalBodyEl.appendChild(focusCard);
+		visibleCards++;
+	}
 
 	// Descendants block.
 	if (descendants.length > 0) {
-		treeModalBodyEl.appendChild(
-			renderModalSectionHeading(
-				"descendants",
-				descendants.length,
-				"indented by depth from focus",
-			),
-		);
+		const cards = [];
 		for (const [d, depth] of descendants) {
-			if (q && !nodeMatchesQuery(d, q)) continue;
-			treeModalBodyEl.appendChild(
-				renderObsCard(d, { role: "descendant", depth }),
-			);
+			const card = renderObsCard(d, { role: "descendant", depth, query: q });
+			if (card) cards.push(card);
 		}
+		if (cards.length > 0) {
+			treeModalBodyEl.appendChild(renderModalSectionHeading(
+				"descendants",
+				cards.length,
+				q ? "matching boxes only" : "indented by depth from focus",
+			));
+			for (const card of cards) treeModalBodyEl.appendChild(card);
+			visibleCards += cards.length;
+		}
+	}
+
+	// A query that hit nothing anywhere — say so instead of a blank modal.
+	if (q && visibleCards === 0) {
+		const empty = document.createElement("div");
+		empty.className = "tm-empty";
+		empty.textContent = `no matches for “${treeModalQuery.trim()}”`;
+		treeModalBodyEl.appendChild(empty);
 	}
 
 	if (anchorId) {
@@ -4597,6 +5169,1553 @@ window.addEventListener("keydown", (ev) => {
 		closeTreeModal();
 	}
 });
+
+// ===========================================================================
+// Execution-flow graph — a pannable canvas of the ACTUAL run, not the semantic
+// scene tree. Two interleaved node kinds:
+//   * scene node `s:<id>`  — a zone/object/frame the run produced.
+//   * step node  `t:<uid>` — one LLM call (zone_plan, zone_decompose,
+//                            anchor_decompose, object_bbox_single, …).
+// Parenting reflects ONLY which step generated what: a scene node's children
+// are the steps issued from it (in execution order); a step node's children
+// are the scene nodes its output emitted — so a scene node's parent is the
+// step that created it. Clicking a scene node opens its observability; clicking
+// a step node opens that exact call's system / input / output / reasoning. The
+// graph reads the same `treeNodes`/`nodeLlmCalls` state the sidebar and the
+// observability modal maintain, so it stays in sync with the live SSE stream
+// and replay scrubbing for free (see the `animate()` refresh hook). State +
+// layout constants are declared near the top of the file (before the render
+// loop first runs); the functions and wiring live here.
+// ===========================================================================
+
+function flowSceneKindClass(kind) {
+	return kind === "object" ? "object" : kind === "frame" ? "frame" : "zone";
+}
+
+// The scene ids a step's output brought into existence. We read the emitting
+// fields only (children / objects / object) — NOT bbox `assignments` — so each
+// scene node has exactly one generating step and the graph stays a tree.
+function execEmittedIds(call) {
+	const out = call?.output;
+	if (!out || typeof out !== "object") return [];
+	const ids = [];
+	if (Array.isArray(out.children)) for (const c of out.children) if (c?.id) ids.push(c.id);
+	if (Array.isArray(out.objects)) for (const o of out.objects) if (o?.id) ids.push(o.id);
+	if (out.object && typeof out.object === "object" && out.object.id) ids.push(out.object.id);
+	return ids;
+}
+
+// Assemble the exec graph from the recorded LLM calls + scene nodes.
+function buildExecGraph() {
+	const nodes = new Map();
+	const childrenOf = new Map();
+	const addChild = (parentKey, childKey) => {
+		const arr = childrenOf.get(parentKey);
+		if (arr) arr.push(childKey);
+		else childrenOf.set(parentKey, [childKey]);
+	};
+
+	for (const [id, n] of treeNodes) {
+		nodes.set(`s:${id}`, {
+			key: `s:${id}`, type: "scene", id,
+			sceneKind: n.kind ?? "zone", prompt: n.prompt ?? null,
+			phase: n.phase ?? "pending", order: n.order ?? 0,
+		});
+	}
+
+	const hasParent = new Set();
+	// Each recorded call becomes a step node under the scene that issued it; its
+	// emitted ids become that step's scene children (first emitter wins).
+	for (const [ownerId, calls] of nodeLlmCalls) {
+		const ownerKey = `s:${ownerId}`;
+		if (!nodes.has(ownerKey)) {
+			// Call issued from an id with no scene node (e.g. "_unattributed").
+			nodes.set(ownerKey, {
+				key: ownerKey, type: "scene", id: ownerId,
+				sceneKind: "zone", prompt: null, phase: "pending", order: -1, synthetic: true,
+			});
+		}
+		const ordered = calls
+			.map((c, i) => ({ c, i }))
+			.sort((a, b) => (a.c.eventIndex ?? a.i) - (b.c.eventIndex ?? b.i));
+		for (const { c } of ordered) {
+			const stepKey = `t:${c.uid}`;
+			const emitted = [...new Set(execEmittedIds(c))];
+			nodes.set(stepKey, {
+				key: stepKey, type: "step", step: c.step || "(step)",
+				ownerId, call: c, eventIndex: c.eventIndex ?? null,
+				cached: !!c.cached, model: c.model || "", generated: emitted.length,
+			});
+			addChild(ownerKey, stepKey);
+			hasParent.add(stepKey);
+			for (const gid of emitted) {
+				const childKey = `s:${gid}`;
+				if (!nodes.has(childKey) || hasParent.has(childKey)) continue;
+				addChild(stepKey, childKey);
+				hasParent.add(childKey);
+			}
+		}
+	}
+
+	// Roots: the real scene root first, then anything still unparented (orphan
+	// scenes whose generating call we never saw, synthetic owners, etc.).
+	const roots = [];
+	if (treeRootId && nodes.has(`s:${treeRootId}`)) roots.push(`s:${treeRootId}`);
+	for (const [key] of nodes) {
+		if (key === `s:${treeRootId}`) continue;
+		if (!hasParent.has(key)) roots.push(key);
+	}
+	return { nodes, childrenOf, roots };
+}
+
+// Indented-outline layout: every node takes its own row (top-to-bottom in
+// execution / emission order) and is indented by depth. Width is bounded by the
+// tree's depth instead of its leaf count, so deep/bushy graphs grow downward
+// rather than sprawling sideways. Same-depth nodes do NOT share a row — that
+// rigid banding is what made the old layout spread too thin horizontally.
+function flowLayout(graph) {
+	const positions = new Map();
+	const visited = new Set();
+	let row = 0;
+	function place(key, depth) {
+		visited.add(key);
+		positions.set(key, { x: depth * FLOW.INDENT, y: row * FLOW.ROW_H, depth });
+		row += 1;
+		for (const k of graph.childrenOf.get(key) ?? []) {
+			if (graph.nodes.has(k) && !visited.has(k)) place(k, depth + 1);
+		}
+	}
+	for (const r of graph.roots) {
+		if (visited.has(r)) continue;
+		place(r, 0);
+		row += 1; // blank spacer row between separate root trees
+	}
+	for (const [key] of graph.nodes) if (!visited.has(key)) place(key, 0);
+	let maxX = 0;
+	let maxY = 0;
+	for (const p of positions.values()) {
+		if (p.x > maxX) maxX = p.x;
+		if (p.y > maxY) maxY = p.y;
+	}
+	return {
+		positions,
+		width: maxX + FLOW.NODE_W + FLOW.PAD * 2,
+		height: maxY + FLOW.NODE_H + FLOW.PAD * 2,
+	};
+}
+
+function flowSearchHit(text) {
+	const q = flowSearchQuery.trim().toLowerCase();
+	if (!q) return null;
+	return (text ?? "").toLowerCase().includes(q);
+}
+
+function buildSceneFlowNode(node, pos) {
+	const el = document.createElement("div");
+	el.className = `flow-node flow-scene ${flowSceneKindClass(node.sceneKind)}`;
+	el.dataset.key = node.key;
+	el.dataset.id = node.id;
+	el.style.left = `${pos.x + FLOW.PAD}px`;
+	el.style.top = `${pos.y + FLOW.PAD}px`;
+	el.style.width = `${FLOW.NODE_W}px`;
+	if (node.id === treeActiveId) el.classList.add("active");
+	if (node.id === selectedBboxId) el.classList.add("selected");
+	const hit = flowSearchHit(`${node.id} ${node.prompt ?? ""}`);
+	if (hit === true) el.classList.add("hit");
+	else if (hit === false) el.classList.add("dimmed");
+
+	const head = document.createElement("div");
+	head.className = "flow-node-head";
+	const dot = document.createElement("span");
+	dot.className = `flow-dot phase-${node.phase ?? "pending"}`;
+	head.appendChild(dot);
+	const idEl = document.createElement("span");
+	idEl.className = "flow-node-id";
+	idEl.textContent = node.id;
+	head.appendChild(idEl);
+	el.appendChild(head);
+
+	if (node.prompt) {
+		const p = document.createElement("div");
+		p.className = "flow-node-prompt";
+		p.textContent = truncate(node.prompt, 52);
+		el.appendChild(p);
+	}
+	el.title = `${node.sceneKind} ${node.id} — click for observability`;
+	el.addEventListener("click", (ev) => {
+		ev.stopPropagation();
+		openObsFor(node.id);
+	});
+	return el;
+}
+
+function buildStepFlowNode(node, pos) {
+	const el = document.createElement("div");
+	el.className = `flow-node flow-step s-${node.step}`;
+	el.dataset.key = node.key;
+	el.style.left = `${pos.x + FLOW.PAD}px`;
+	el.style.top = `${pos.y + FLOW.PAD}px`;
+	el.style.width = `${FLOW.NODE_W}px`;
+	if (node.cached) el.classList.add("cached");
+	const hit = flowSearchHit(`${node.step} ${node.ownerId}`);
+	if (hit === true) el.classList.add("hit");
+	else if (hit === false) el.classList.add("dimmed");
+
+	const head = document.createElement("div");
+	head.className = "flow-step-head";
+	const nameEl = document.createElement("span");
+	nameEl.className = "flow-step-name";
+	nameEl.textContent = node.step;
+	head.appendChild(nameEl);
+	if (node.generated > 0) {
+		const gen = document.createElement("span");
+		gen.className = "flow-step-gen";
+		gen.textContent = `→${node.generated}`;
+		gen.title = `emitted ${node.generated} node${node.generated === 1 ? "" : "s"}`;
+		head.appendChild(gen);
+	}
+	if (node.cached) {
+		const c = document.createElement("span");
+		c.className = "flow-step-cached";
+		c.textContent = "cached";
+		head.appendChild(c);
+	}
+	// "Rewind & tune here": exits the graph, rewinds the canvas to this step,
+	// and opens the prompt-tuning sandbox on it. Only meaningful for steps with
+	// a recorded event index (the position the rewind cuts at).
+	if (node.eventIndex != null) {
+		const tune = document.createElement("button");
+		tune.type = "button";
+		tune.className = "flow-step-tune";
+		tune.textContent = "⤺ tune";
+		tune.title =
+			"Rewind the canvas to this step and edit its prompt — re-runs only this step, non-destructively";
+		tune.addEventListener("click", (ev) => {
+			ev.stopPropagation();
+			enterSandboxAtStep(node.call);
+		});
+		head.appendChild(tune);
+	}
+	el.appendChild(head);
+	const sub = document.createElement("div");
+	sub.className = "flow-step-sub";
+	sub.textContent = node.model || `on ${node.ownerId}`;
+	el.appendChild(sub);
+
+	el.title = `${node.step} on ${node.ownerId} — click for input / output / reasoning · ⤺ tune to rewind & edit its prompt`;
+	el.addEventListener("click", (ev) => {
+		ev.stopPropagation();
+		openObsForStep(node.ownerId, node.call.uid);
+	});
+	return el;
+}
+
+function renderFlow() {
+	if (!flowModalOpen) return;
+	const graph = buildExecGraph();
+	const { positions, width, height } = flowLayout(graph);
+	_flowGraph = graph;
+	_flowPositions = positions;
+	_flowLastWidth = width;
+	_flowLastHeight = height;
+
+	flowEmptyEl.classList.toggle("show", positions.size === 0);
+	flowStageEl.style.width = `${width}px`;
+	flowStageEl.style.height = `${height}px`;
+
+	// Edges: an outline connector per parent — a spine dropping from the parent's
+	// gutter with a rounded tick into each child's left edge. Children of a given
+	// node share a type, so the overlapping spine stays one color. Tinted by child.
+	flowEdgesEl.setAttribute("width", String(width));
+	flowEdgesEl.setAttribute("height", String(height));
+	let edges = "";
+	const R = 6; // connector corner radius
+	for (const [key, p] of positions) {
+		const sx = p.x + FLOW.PAD + FLOW.GUTTER; // spine x, just inside the parent's left edge
+		const sy = p.y + FLOW.PAD + FLOW.NODE_H; // parent bottom
+		for (const ck of graph.childrenOf.get(key) ?? []) {
+			const cp = positions.get(ck);
+			if (!cp) continue;
+			const child = graph.nodes.get(ck);
+			const cy = cp.y + FLOW.PAD + FLOW.NODE_H / 2; // child vertical center
+			const cx = cp.x + FLOW.PAD; // child left edge
+			const cls = child.type === "step" ? "to-step" : `to-${child.sceneKind}`;
+			edges += `<path class="flow-edge ${cls}" d="M ${sx.toFixed(1)} ${sy.toFixed(1)} L ${sx.toFixed(1)} ${(cy - R).toFixed(1)} Q ${sx.toFixed(1)} ${cy.toFixed(1)} ${(sx + R).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${cy.toFixed(1)}" />`;
+		}
+	}
+	flowEdgesEl.innerHTML = edges;
+
+	const frag = document.createDocumentFragment();
+	for (const [key, p] of positions) {
+		const node = graph.nodes.get(key);
+		frag.appendChild(node.type === "step" ? buildStepFlowNode(node, p) : buildSceneFlowNode(node, p));
+	}
+	flowNodesEl.replaceChildren(frag);
+	applyFlowTransform();
+}
+
+function applyFlowTransform() {
+	flowStageEl.style.transform = `translate(${flowPanX}px, ${flowPanY}px) scale(${flowZoom})`;
+	// Pan/zoom the background dot-grid with the content for an infinite-canvas feel.
+	flowViewportEl.style.backgroundPosition = `${flowPanX}px ${flowPanY}px`;
+	flowViewportEl.style.backgroundSize = `${FLOW.GRID * flowZoom}px ${FLOW.GRID * flowZoom}px`;
+}
+
+function flowClampZoom(z) {
+	return Math.max(0.15, Math.min(2.5, z));
+}
+
+function flowZoomAt(cx, cy, factor) {
+	const next = flowClampZoom(flowZoom * factor);
+	const k = next / flowZoom;
+	flowPanX = cx - (cx - flowPanX) * k;
+	flowPanY = cy - (cy - flowPanY) * k;
+	flowZoom = next;
+	applyFlowTransform();
+}
+
+function fitFlow() {
+	const w = _flowLastWidth || 1;
+	const h = _flowLastHeight || 1;
+	const vw = flowViewportEl.clientWidth || 1;
+	const vh = flowViewportEl.clientHeight || 1;
+	// The outline is narrow and grows downward: fit its width at up to 1:1 so
+	// nodes stay readable, then anchor to the top and let the user scroll down —
+	// shrinking a tall tree to fit vertically would make everything tiny.
+	flowZoom = flowClampZoom(Math.min(vw / w, 1) * 0.94);
+	flowPanX = (vw - w * flowZoom) / 2;
+	flowPanY = h * flowZoom <= vh ? (vh - h * flowZoom) / 2 : 0;
+	applyFlowTransform();
+}
+
+function openObsFor(id) {
+	if (!treeNodes.has(id)) return;
+	if (!treeModalOpen) openTreeModal();
+	focusModalOn(id);
+}
+
+// Step-node click: open the observability modal on the step's owner node and
+// scroll its specific call block (system / input / output / reasoning) into
+// view — the exact panes the observability pipeline shows.
+function openObsForStep(ownerId, callUid) {
+	if (!treeModalOpen) openTreeModal();
+	if (treeNodes.has(ownerId)) focusModalOn(ownerId);
+	requestAnimationFrame(() => {
+		const focusCard = treeModalBodyEl.querySelector(".tm-obs-card.role-focus") || treeModalBodyEl;
+		const block = focusCard.querySelector(
+			`.tm-llm-call[data-call-key="${CSS.escape(String(callUid))}"]`,
+		);
+		if (!block) return;
+		block.open = true;
+		block.scrollIntoView({ block: "center" });
+		block.classList.add("tm-llm-flash");
+		setTimeout(() => block.classList.remove("tm-llm-flash"), 1400);
+	});
+}
+
+// Center the canvas on a scene node — used when a sidebar-tree row is clicked
+// while the flow canvas is open. Bumps zoom in if the user was zoomed far out.
+function flowCenterOnScene(id) {
+	const pos = _flowPositions.get(`s:${id}`);
+	if (!pos) return;
+	if (flowZoom < 0.75) flowZoom = 0.9;
+	const vw = flowViewportEl.clientWidth || 1;
+	const vh = flowViewportEl.clientHeight || 1;
+	const nx = pos.x + FLOW.PAD + FLOW.NODE_W / 2;
+	const ny = pos.y + FLOW.PAD + FLOW.NODE_H / 2;
+	flowPanX = vw / 2 - nx * flowZoom;
+	flowPanY = vh / 2 - ny * flowZoom;
+	applyFlowTransform();
+}
+
+function openFlowModal() {
+	flowModalOpen = true;
+	flowModalEl.classList.add("open");
+	// Float the sidebar tree above the canvas so it stays usable while the flow
+	// graph is open (CSS bumps #tree's z-index under body.flow-open).
+	document.body.classList.add("flow-open");
+	flowSearchEl.value = flowSearchQuery;
+	updateFlowPauseButton();
+	renderFlow();
+	// Defer fit until the viewport has its open dimensions.
+	requestAnimationFrame(() => {
+		renderFlow();
+		fitFlow();
+	});
+}
+
+function closeFlowModal() {
+	flowModalOpen = false;
+	flowModalEl.classList.remove("open");
+	document.body.classList.remove("flow-open");
+}
+
+function toggleFlowModal() {
+	if (flowModalOpen) closeFlowModal();
+	else openFlowModal();
+}
+
+// Center the view on the first node (scene or step) matching the query.
+function flowLocate(query) {
+	const q = query.trim().toLowerCase();
+	if (!q || !_flowGraph) return;
+	for (const [key, p] of _flowPositions) {
+		const node = _flowGraph.nodes.get(key);
+		if (!node) continue;
+		const hay = node.type === "step"
+			? `${node.step} ${node.ownerId}`
+			: `${node.id} ${node.prompt ?? ""}`;
+		if (hay.toLowerCase().includes(q)) {
+			const vw = flowViewportEl.clientWidth || 1;
+			const vh = flowViewportEl.clientHeight || 1;
+			const nx = p.x + FLOW.PAD + FLOW.NODE_W / 2;
+			const ny = p.y + FLOW.PAD + FLOW.NODE_H / 2;
+			flowPanX = vw / 2 - nx * flowZoom;
+			flowPanY = vh / 2 - ny * flowZoom;
+			applyFlowTransform();
+			return;
+		}
+	}
+}
+
+treeFlowEl?.addEventListener("click", (ev) => {
+	ev.stopPropagation(); // don't toggle the tree-header collapse
+	toggleFlowModal();
+});
+flowCloseEl?.addEventListener("click", closeFlowModal);
+flowFitEl?.addEventListener("click", fitFlow);
+flowZoomInEl?.addEventListener("click", () =>
+	flowZoomAt(flowViewportEl.clientWidth / 2, flowViewportEl.clientHeight / 2, 1.2),
+);
+flowZoomOutEl?.addEventListener("click", () =>
+	flowZoomAt(flowViewportEl.clientWidth / 2, flowViewportEl.clientHeight / 2, 1 / 1.2),
+);
+flowSearchEl?.addEventListener("input", () => {
+	flowSearchQuery = flowSearchEl.value;
+	renderFlow();
+	flowLocate(flowSearchQuery);
+});
+flowModalEl?.addEventListener("pointerdown", (ev) => {
+	// Backdrop (area outside the panel) closes the modal.
+	if (ev.target === flowModalEl) closeFlowModal();
+});
+flowViewportEl?.addEventListener("pointerdown", (ev) => {
+	if (ev.button !== 0) return;
+	if (ev.target.closest(".flow-node")) return; // let the node handle its click
+	_flowPanning = true;
+	_flowStartX = ev.clientX;
+	_flowStartY = ev.clientY;
+	_flowStartPanX = flowPanX;
+	_flowStartPanY = flowPanY;
+	flowViewportEl.classList.add("grabbing");
+	flowViewportEl.setPointerCapture?.(ev.pointerId);
+});
+flowViewportEl?.addEventListener("pointermove", (ev) => {
+	if (!_flowPanning) return;
+	const dx = ev.clientX - _flowStartX;
+	const dy = ev.clientY - _flowStartY;
+	flowPanX = _flowStartPanX + dx;
+	flowPanY = _flowStartPanY + dy;
+	applyFlowTransform();
+});
+function flowEndPan(ev) {
+	if (!_flowPanning) return;
+	_flowPanning = false;
+	flowViewportEl.classList.remove("grabbing");
+	flowViewportEl.releasePointerCapture?.(ev.pointerId);
+}
+flowViewportEl?.addEventListener("pointerup", flowEndPan);
+flowViewportEl?.addEventListener("pointercancel", flowEndPan);
+flowViewportEl?.addEventListener(
+	"wheel",
+	(ev) => {
+		ev.preventDefault();
+		const rect = flowViewportEl.getBoundingClientRect();
+		const factor = ev.deltaY < 0 ? 1.05 : 1 / 1.05;
+		flowZoomAt(ev.clientX - rect.left, ev.clientY - rect.top, factor);
+	},
+	{ passive: false },
+);
+// Capture-phase Escape so the observability modal (a bubble-phase handler that
+// sits on top, z-index 1100) closes first; only once it is gone does Escape
+// close the flow graph beneath it.
+window.addEventListener(
+	"keydown",
+	(ev) => {
+		if (ev.key !== "Escape") return;
+		if (!flowModalOpen || treeModalOpen) return;
+		if (document.activeElement === flowSearchEl && flowSearchEl.value) {
+			flowSearchEl.value = "";
+			flowSearchQuery = "";
+			renderFlow();
+			return;
+		}
+		ev.stopImmediatePropagation();
+		closeFlowModal();
+	},
+	true,
+);
+
+// ============================================================================
+// Prompt-tuning sandbox
+//
+// Rewind the canvas to a single pipeline step and re-run that step's LLM call
+// under an edited prompt, non-destructively. We never touch the recorded log:
+// the run is PAUSED (server) and the SSE detached so client state freezes, the
+// rewind is faked by hiding scene objects created at/after the step (see
+// `withinRewind`), and a tested step's output is drawn into
+// `sandboxOverlayRoot`. Break-out clears the cutoff + overlay (instant restore)
+// and resumes the run if we paused it.
+// ============================================================================
+
+const SANDBOX_OVERLAY_COLOR = 0xff4fdd; // vivid magenta — distinct from every bbox color
+// Every magenta box drawn into sandboxOverlayRoot is registered here with the
+// metadata needed to identify it (id, kind, prompt), so it hovers (tooltip +
+// highlight) and selects exactly like a normal-canvas bbox. Cleared with the
+// overlay. Hover/select reuse the canvas hover/selected colors for consistency.
+const sandboxOverlayBoxes = new Map(); // overlayId -> { helper, box, id, kind, prompt }
+let _overlayBoxSeq = 0;
+let hoveredOverlayId = null;
+let selectedOverlayId = null;
+// True when the viewed run was live (running) at sandbox entry, so break-out
+// reconnects the SSE to catch up on what the resumed pipeline emits.
+let sandboxWasLive = false;
+// Synchronous re-entrancy latch: enterSandboxAtStep awaits the pause POST, so a
+// fast second click would otherwise start a parallel entry and clobber
+// sandboxPausedByUs. Held from the first click until setup completes.
+let sandboxEntering = false;
+// Expanded (near-fullscreen) panel preference — persisted so it sticks across
+// sessions, like the other view toggles.
+const SANDBOX_EXPANDED_KEY = "starshot:sandbox-expanded";
+let sandboxExpanded = (() => {
+	try { return localStorage.getItem(SANDBOX_EXPANDED_KEY) === "1"; } catch { return false; }
+})();
+
+function applySandboxExpanded() {
+	sandboxPanelEl.classList.toggle("expanded", sandboxExpanded);
+	if (sandboxExpandEl) {
+		sandboxExpandEl.textContent = sandboxExpanded ? "⤡" : "⤢";
+		sandboxExpandEl.title = sandboxExpanded
+			? "Collapse the panel"
+			: "Expand the panel for easier reading of the system / input / output";
+	}
+}
+
+function clearSandboxOverlay() {
+	while (sandboxOverlayRoot.children.length > 0) {
+		const child = sandboxOverlayRoot.children[0];
+		sandboxOverlayRoot.remove(child);
+		// disposeObject3D walks meshes (branch GLB groups); the direct dispose
+		// covers Box3Helpers (LineSegments — not meshes, so the walk skips them).
+		disposeObject3D(child);
+		child.geometry?.dispose?.();
+		child.material?.dispose?.();
+	}
+	sandboxOverlayBoxes.clear();
+	hoveredOverlayId = null;
+	selectedOverlayId = null;
+	if (sandboxActive) tooltip.style.display = "none";
+}
+
+// Record the event index each node's bbox / mesh first appeared at, so the
+// rewind cutoff can hide everything created from a given step onward.
+function buildCreationIndexMaps() {
+	bboxCreatedIndex.clear();
+	modelCreatedIndex.clear();
+	for (const e of recordedEvents) {
+		if (typeof e.index !== "number" || typeof e.id !== "string") continue;
+		if (e.kind === "bbox") {
+			if (!bboxCreatedIndex.has(e.id)) bboxCreatedIndex.set(e.id, e.index);
+		} else if (e.kind === "model") {
+			if (!modelCreatedIndex.has(e.id)) modelCreatedIndex.set(e.id, e.index);
+		}
+	}
+}
+
+// Every recorded LLM-call step across all nodes, ordered by the event index it
+// was logged at — the execution-order spine prev/next walks. Steps without an
+// event index (legacy logs) can't be positioned, so they're skipped, and
+// duplicates are collapsed by event index: the live tail and the background
+// history backfill both feed recordLlmCall with no per-index dedup, so a cell
+// opened mid-run can hold two entries for one call. They carry identical
+// content, so keeping the first is exact.
+function collectSandboxSteps() {
+	const byIndex = new Map();
+	for (const [, calls] of nodeLlmCalls) {
+		for (const c of calls) {
+			if (typeof c.eventIndex === "number" && !byIndex.has(c.eventIndex)) {
+				byIndex.set(c.eventIndex, c);
+			}
+		}
+	}
+	return [...byIndex.values()].sort((a, b) => a.eventIndex - b.eventIndex);
+}
+
+function setSandboxStatus(msg, cls = "") {
+	if (!sandboxStatusEl) return;
+	sandboxStatusEl.textContent = msg || "";
+	sandboxStatusEl.className = cls; // "", "err", or "ok"
+}
+
+// Flag the system/user fields whose text diverges from the recorded prompt.
+function markSandboxEdited() {
+	// Baseline is the viewed branch step when stepping through a branch,
+	// otherwise the original recorded step being tuned.
+	const base = branchActive ? branchSteps[branchCursor] : sandboxSteps[sandboxCursor];
+	if (!base) return;
+	sandboxSystemFieldEl.classList.toggle("edited", sandboxSystemEl.value !== (base.system ?? ""));
+	sandboxUserFieldEl.classList.toggle("edited", sandboxUserEl.value !== (base.user ?? ""));
+}
+
+async function enterSandboxAtStep(call) {
+	if (call == null || typeof call.eventIndex !== "number") return;
+	if (sandboxActive) {
+		// Already tuning — just jump the cursor to the clicked step. Match by
+		// event index (stable) rather than uid, which differs across the
+		// dedup-collapsed duplicates.
+		const idx = sandboxSteps.findIndex((c) => c.eventIndex === call.eventIndex);
+		if (idx >= 0) gotoSandboxStep(idx);
+		return;
+	}
+	if (sandboxEntering) return; // a parallel entry is mid-flight (async pause)
+	sandboxEntering = true;
+	try {
+		// Freeze the run for the session: detach the SSE FIRST (so the run.paused
+		// sentinel never lands in our recorded log / bumps highestEventIndex), then
+		// pause it server-side if it was live.
+		const wasRunning = currentRunInfo()?.status === "running";
+		sandboxWasLive = wasRunning;
+		if (currentSource) { currentSource.close(); currentSource = null; }
+		sandboxPausedByUs = false;
+		if (wasRunning && currentSlotId && currentModel) {
+			try {
+				const res = await fetch(
+					new URL(
+						`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/pause?run=${encodeURIComponent(currentRun)}`,
+						SERVER_URL,
+					),
+					{ method: "POST" },
+				);
+				if (res.ok) sandboxPausedByUs = true;
+			} catch {}
+		}
+
+		sandboxActive = true;
+		buildCreationIndexMaps();
+		sandboxSteps = collectSandboxSteps();
+		const cursor = sandboxSteps.findIndex((c) => c.eventIndex === call.eventIndex);
+		// Clear any selection so the rewound scene isn't dimmed by it.
+		if (selectedBboxId !== null) {
+			const prev = selectedBboxId;
+			selectedBboxId = null;
+			applyBboxColor(prev);
+		}
+		closeFlowModal();
+		sandboxPanelEl.classList.add("open");
+		document.body.classList.add("sandbox-open");
+		applySandboxExpanded();
+		applySandboxMode(); // fresh session is always edit-mode (Phase A)
+		gotoSandboxStep(cursor >= 0 ? cursor : 0);
+		refreshSlots();
+	} finally {
+		sandboxEntering = false;
+	}
+}
+
+// Rewind to step `i`: hide everything from its event index onward, prefill the
+// editors with its recorded prompts, and reset the output area.
+function gotoSandboxStep(i) {
+	if (!sandboxActive || i < 0 || i >= sandboxSteps.length) return;
+	sandboxCursor = i;
+	const call = sandboxSteps[i];
+	clearSandboxOverlay();
+	rewindCutoffIndex = call.eventIndex;
+	refreshAllVisibility();
+
+	sandboxSystemEl.value = call.system ?? "";
+	sandboxUserEl.value = call.user ?? "";
+	markSandboxEdited();
+
+	sandboxStepPillEl.textContent = call.step ?? "(step)";
+	sandboxStepMetaEl.textContent = "";
+	const onEl = document.createElement("span");
+	onEl.textContent = "on ";
+	const ownerEl = document.createElement("b");
+	ownerEl.textContent = call.parentNode ?? "—";
+	sandboxStepMetaEl.append(onEl, ownerEl);
+	if (call.model) {
+		const modEl = document.createElement("span");
+		modEl.textContent = `   ·   ${call.model}`;
+		sandboxStepMetaEl.append(modEl);
+	}
+	sandboxPosEl.textContent = `step ${i + 1} / ${sandboxSteps.length}`;
+
+	sandboxOutputWrapEl.classList.remove("show");
+	sandboxOutputEl.textContent = "";
+	sandboxReasoningBodyEl.textContent = "";
+	updateSimulateButton();
+	sandboxPrevEl.disabled = i <= 0;
+	sandboxNextEl.disabled = i >= sandboxSteps.length - 1;
+	sandboxTestEl.disabled = !call.schema;
+	setSandboxStatus(
+		"rewound — optionally test, or 'simulate downstream' to step through from here",
+	);
+}
+
+async function testSandboxStep() {
+	if (!sandboxActive || branchActive || sandboxTesting) return;
+	const call = sandboxSteps[sandboxCursor];
+	if (!call || !call.schema) return;
+	sandboxTesting = true;
+	sandboxTestEl.classList.add("busy");
+	sandboxTestEl.disabled = true;
+	setSandboxStatus("re-running this step…");
+	try {
+		const res = await fetch(
+			new URL(`/llm/test?run=${encodeURIComponent(currentRun)}`, SERVER_URL),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({
+					system: sandboxSystemEl.value,
+					user: sandboxUserEl.value,
+					schema_name: call.schema,
+					model: call.model || "",
+				}),
+			},
+		);
+		if (!res.ok) {
+			setSandboxStatus(`test failed: HTTP ${res.status} — ${await res.text()}`, "err");
+			return;
+		}
+		showSandboxResult(call, await res.json());
+	} catch (e) {
+		setSandboxStatus(`test failed: ${e.message}`, "err");
+	} finally {
+		sandboxTesting = false;
+		sandboxTestEl.classList.remove("busy");
+		// Only re-own the button state if we're still on the step we tested —
+		// otherwise gotoSandboxStep already set it for the step the user moved to.
+		if (sandboxActive && sandboxSteps[sandboxCursor]?.uid === call.uid) {
+			sandboxTestEl.disabled = !call.schema;
+		}
+	}
+}
+
+function showSandboxResult(call, data) {
+	// Guard against a result landing after the user already broke out or stepped.
+	if (!sandboxActive || sandboxSteps[sandboxCursor]?.uid !== call.uid) return;
+	const output = data.output ?? null;
+	sandboxOutputWrapEl.classList.add("show");
+	sandboxOutputEl.textContent = JSON.stringify(output, null, 2);
+	const reasoning = (data.reasoning ?? "").trim();
+	sandboxReasoningEl.style.display = reasoning ? "" : "none";
+	sandboxReasoningBodyEl.textContent = reasoning;
+
+	const rendered = renderSandboxOverlay(call, output);
+	if (rendered > 0) {
+		sandboxRenderNoteEl.textContent = `▲ ${rendered} box${rendered === 1 ? "" : "es"} rendered on the canvas (magenta)`;
+		sandboxRenderNoteEl.classList.remove("nothing");
+	} else {
+		sandboxRenderNoteEl.textContent = "no spatial geometry in this step's output — shown as JSON below";
+		sandboxRenderNoteEl.classList.add("nothing");
+	}
+	const tok = data.tokens_in != null ? ` · ${data.tokens_in}+${data.tokens_out ?? 0} tok` : "";
+	setSandboxStatus(`done${tok}`, "ok");
+}
+
+// Min corner of an axis-aligned box given a (possibly signed-dimension) origin.
+function bboxMinCorner(origin, dims) {
+	return [
+		Math.min(origin[0], origin[0] + dims[0]),
+		Math.min(origin[1], origin[1] + dims[1]),
+		Math.min(origin[2], origin[2] + dims[2]),
+	];
+}
+
+// Draw the renderable part of a tested step's output as magenta overlay boxes
+// on top of the rewound scene. Returns how many boxes were drawn.
+//   * overall_bbox  → one world-frame box (the root canvas)
+//   * *_bbox_batch  → one box per assignment, converted from the owner
+//                     region's local frame back to world coordinates
+// Decompose / plan / next_object / image_prompt outputs carry no geometry → 0.
+function renderSandboxOverlay(call, output) {
+	clearSandboxOverlay();
+	if (!output || typeof output !== "object") return 0;
+	const boxes = [];
+	if (output.bbox && Array.isArray(output.bbox.origin) && Array.isArray(output.bbox.dimensions)) {
+		boxes.push({
+			origin: output.bbox.origin,
+			dimensions: output.bbox.dimensions,
+			meta: { id: call.parentNode ?? null, kind: treeNodes.get(call.parentNode)?.kind ?? null },
+		});
+	}
+	if (Array.isArray(output.assignments)) {
+		// Batch assignments are authored in the parent region's local frame; the
+		// owner (call.parentNode) was placed before this step so its world bbox is
+		// known. Sibling-anchored children (rare) are approximated against the
+		// region — fine for a preview.
+		const owner = treeNodes.get(call.parentNode);
+		const pmin =
+			owner && Array.isArray(owner.origin) && Array.isArray(owner.dimensions)
+				? bboxMinCorner(owner.origin, owner.dimensions)
+				: [0, 0, 0];
+		for (const a of output.assignments) {
+			const bb = a && a.bbox;
+			if (!bb || !Array.isArray(bb.origin) || !Array.isArray(bb.dimensions)) continue;
+			boxes.push({
+				origin: [bb.origin[0] + pmin[0], bb.origin[1] + pmin[1], bb.origin[2] + pmin[2]],
+				dimensions: bb.dimensions,
+				meta: { id: a.id ?? null, prompt: typeof a.prompt === "string" ? a.prompt : null },
+			});
+		}
+	}
+	for (const b of boxes) addSandboxOverlayBox(b.origin, b.dimensions, b.meta);
+	return boxes.length;
+}
+
+// Draw one magenta overlay box. `meta` ({id, kind, prompt}) is what the
+// hover tooltip / selection surface to say "what this box is"; anonymous boxes
+// (no id) still register so they can be hovered, just with a generic label.
+function addSandboxOverlayBox(origin, dimensions, meta = null) {
+	const ox = origin[0], oy = origin[1], oz = origin[2];
+	const fx = ox + dimensions[0], fy = oy + dimensions[1], fz = oz + dimensions[2];
+	const box3 = new THREE.Box3(
+		new THREE.Vector3(Math.min(ox, fx), Math.min(oy, fy), Math.min(oz, fz)),
+		new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
+	);
+	const helper = new THREE.Box3Helper(box3, SANDBOX_OVERLAY_COLOR);
+	// Draw on top of everything so the proposed box reads clearly against the
+	// rewound scene regardless of depth.
+	helper.material.depthTest = false;
+	helper.material.transparent = true;
+	helper.renderOrder = 999;
+	const overlayId = meta?.id ?? `__overlay_${_overlayBoxSeq++}`;
+	helper.userData.overlayId = overlayId;
+	sandboxOverlayRoot.add(helper);
+	sandboxOverlayBoxes.set(overlayId, {
+		helper,
+		box: box3,
+		id: meta?.id ?? null,
+		kind: meta?.kind ?? null,
+		prompt: meta?.prompt ?? null,
+	});
+	applyOverlayColor(overlayId);
+	return helper;
+}
+
+// Paint a single overlay box's color from its hover/selected state — selected
+// (cyan) beats hovered (yellow) beats the default magenta.
+function applyOverlayColor(oid) {
+	if (oid == null) return;
+	const entry = sandboxOverlayBoxes.get(oid);
+	if (!entry) return;
+	const color =
+		oid === selectedOverlayId ? BBOX_COLOR_SELECTED
+		: oid === hoveredOverlayId ? BBOX_COLOR_HOVER
+		: SANDBOX_OVERLAY_COLOR;
+	entry.helper.material.color.setHex(color);
+}
+
+function setHoveredOverlay(oid) {
+	if (oid === hoveredOverlayId) return;
+	const prev = hoveredOverlayId;
+	hoveredOverlayId = oid;
+	applyOverlayColor(prev);
+	applyOverlayColor(oid);
+}
+
+function selectOverlay(oid) {
+	const prev = selectedOverlayId;
+	selectedOverlayId = prev === oid ? null : oid; // re-click clears
+	applyOverlayColor(prev);
+	applyOverlayColor(selectedOverlayId);
+}
+
+// Smallest-volume overlay box the ray crosses — the deepest/most-specific box
+// under the cursor, matching the zone picker (boxes nest + overlap).
+const _overlayHit = new THREE.Vector3();
+const _overlaySize = new THREE.Vector3();
+function pickHoveredOverlayId() {
+	let bestId = null;
+	let bestVol = Infinity;
+	for (const [oid, entry] of sandboxOverlayBoxes) {
+		if (!entry.helper.visible) continue;
+		if (!raycaster.ray.intersectBox(entry.box, _overlayHit)) continue;
+		entry.box.getSize(_overlaySize);
+		const vol = _overlaySize.x * _overlaySize.y * _overlaySize.z;
+		if (vol < bestVol) {
+			bestVol = vol;
+			bestId = oid;
+		}
+	}
+	return bestId;
+}
+
+// ===========================================================================
+// Downstream simulation (branch)
+//
+// "Simulate downstream" commits the current step's tested output as a deviation
+// (POST /branch) and the server re-runs the whole pipeline from there in an
+// isolated `<cell>/_branch`. We keep the original scene rewound to the
+// deviation point and stream the branch's DOWNSTREAM nodes — bboxes + real
+// meshes — into the overlay as they're produced, so the change visibly
+// cascades. The panel flips to read-only and shows the branch's re-rendered
+// prompts. "Back to edit" drops the branch and returns to tuning; break-out
+// deletes it and restores the original run.
+// ===========================================================================
+
+function updateSimulateButton() {
+	if (!sandboxSimulateEl) return;
+	// Downstream simulation is just a mode — no test required. Enabled on any
+	// step (it forks before that step and steps through from there).
+	sandboxSimulateEl.disabled = !(sandboxActive && !branchActive && !!sandboxSteps[sandboxCursor]);
+}
+
+// Toggle the panel between EDIT (Phase A — tune the original) and BRANCH
+// (Phase B — step through the simulated downstream, editing each step's
+// re-rendered prompt before it runs).
+function applySandboxMode() {
+	const branch = branchActive;
+	sandboxPanelEl.classList.toggle("branch-mode", branch);
+	// Prompts stay editable in both modes (tune the original in EDIT; edit each
+	// step's prompt in BRANCH to run / re-run it).
+	sandboxSystemEl.readOnly = false;
+	sandboxUserEl.readOnly = false;
+	// EDIT-only buttons.
+	for (const el of [sandboxTestEl, sandboxResetEl, sandboxSimulateEl]) {
+		if (el) el.style.display = branch ? "none" : "";
+	}
+	// BRANCH-only buttons (runstep/rerun/runrest visibility within branch is
+	// refined per viewed step by updateBranchControls).
+	for (const el of [sandboxRunStepEl, sandboxRerunEl, sandboxRunRestEl, sandboxBackEl]) {
+		if (el) el.style.display = branch ? "" : "none";
+	}
+	// prev / next exist in both modes (navigate original steps in EDIT, branch
+	// steps in BRANCH).
+	for (const el of [sandboxPrevEl, sandboxNextEl]) {
+		if (el) el.style.display = "";
+	}
+	if (branch) updateBranchControls();
+	else updateSimulateButton();
+}
+
+async function simulateDownstream() {
+	if (!sandboxActive || branchActive) return;
+	const call = sandboxSteps[sandboxCursor];
+	if (!call) return;
+	sandboxSimulateEl.disabled = true;
+	setSandboxStatus("forking a branch & stepping through downstream…");
+	// Carry the in-progress edit into the first pause (this very step) so you
+	// don't retype it; consumed on the first branch.step.pending.
+	branchFirstPrompt = { system: sandboxSystemEl.value, user: sandboxUserEl.value };
+	let res;
+	try {
+		res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ deviation_index: call.eventIndex }),
+			},
+		);
+	} catch (e) {
+		setSandboxStatus(`branch failed: ${e.message}`, "err");
+		branchFirstPrompt = null;
+		updateSimulateButton();
+		return;
+	}
+	if (!res.ok) {
+		setSandboxStatus(`branch failed: HTTP ${res.status} — ${await res.text()}`, "err");
+		branchFirstPrompt = null;
+		updateSimulateButton();
+		return;
+	}
+	enterBranchView(call.eventIndex);
+}
+
+function enterBranchView(deviationIndex) {
+	branchActive = true;
+	branchDone = false;
+	branchSteps = [];
+	branchCursor = -1;
+	branchRebuilding = false;
+	branchStepBusy = false;
+	branchAuto = false;
+	branchDeviationIndex = deviationIndex;
+	branchGen += 1;
+	branchOverlayBboxIds.clear();
+	branchOverlayMeshes.clear();
+	// Keep the original scene rewound to the fork point; the branch's downstream
+	// renders on top (bboxes + meshes) as it streams.
+	clearSandboxOverlay();
+	rewindCutoffIndex = deviationIndex;
+	refreshAllVisibility();
+	applySandboxMode();
+	sandboxStepPillEl.textContent = "branch";
+	sandboxStepMetaEl.textContent = "simulating downstream…";
+	sandboxPosEl.textContent = "";
+	sandboxOutputWrapEl.classList.remove("show");
+	setSandboxStatus("forked — resolving the first downstream step…");
+	openBranchStream();
+}
+
+function openBranchStream() {
+	closeBranchStream();
+	const gen = branchGen;
+	const url = new URL(
+		`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch/events?run=${encodeURIComponent(currentRun)}`,
+		SERVER_URL,
+	);
+	const es = new EventSource(url);
+	branchSource = es;
+	es.onmessage = (ev) => {
+		if (gen !== branchGen) return;
+		let data;
+		try { data = JSON.parse(ev.data); } catch { return; }
+		dispatchBranchEvent(data);
+	};
+	es.onerror = () => {
+		if (es.readyState === EventSource.CLOSED && branchSource === es) branchSource = null;
+	};
+}
+
+function closeBranchStream() {
+	if (branchSource) {
+		branchSource.close();
+		branchSource = null;
+	}
+}
+
+function dispatchBranchEvent(e) {
+	const kind = e.kind;
+	const idx = typeof e.index === "number" ? e.index : -1;
+	if (kind === "branch.step.pending") {
+		// A new frontier pause (the next, un-run step). A pause means we're not
+		// running autonomously.
+		branchAuto = false;
+		branchSteps.push({
+			step: e.step || "(step)", owner: e.node || null, model: e.model || "",
+			system: e.system ?? "", user: e.user ?? "", output: null, reasoning: "",
+			ran: false, pauseIndex: idx, llmIndex: null,
+		});
+		branchStepBusy = false;
+		onBranchStepsGrew();
+		return;
+	}
+	if (kind === "cache.llm") {
+		if (idx <= branchDeviationIndex) return;
+		// A step ran → commit it. Normally it's the current frontier (last, un-run);
+		// under "run rest" (no pauses) there's no frontier, so append it.
+		const last = branchSteps[branchSteps.length - 1];
+		if (last && !last.ran) {
+			last.ran = true;
+			if (typeof e.system === "string") last.system = e.system;
+			if (typeof e.user === "string") last.user = e.user;
+			last.output = e.output ?? null;
+			last.reasoning = e.reasoning ?? "";
+			last.llmIndex = idx;
+		} else {
+			branchSteps.push({
+				step: e.step || "(step)", owner: e.node || null, model: e.model || "",
+				system: e.system ?? "", user: e.user ?? "", output: e.output ?? null,
+				reasoning: e.reasoning ?? "", ran: true, pauseIndex: null, llmIndex: idx,
+			});
+		}
+		// Stay busy while running autonomously so the controls don't flicker open
+		// mid-stream; "run.done" clears it.
+		if (!branchAuto) branchStepBusy = false;
+		onBranchStepsGrew();
+		return;
+	}
+	if (kind === "bbox" && typeof e.id === "string") {
+		if (idx > branchDeviationIndex) addBranchBbox(e);
+		return;
+	}
+	if (kind === "model" && typeof e.id === "string") {
+		if (idx > branchDeviationIndex) loadBranchMesh(e.id, e.url);
+		return;
+	}
+	if (kind === "run.done") {
+		branchDone = true;
+		branchAuto = false;
+		branchStepBusy = false;
+		if (branchRebuilding) { maybeSettleRebuild(); return; }
+		if (branchCursor >= 0) renderBranchStep(branchCursor);
+		else updateBranchControls();
+		return;
+	}
+	if (kind === "run.error") {
+		branchAuto = false;
+		branchStepBusy = false;
+		branchRebuilding = false; // don't leave the controls wedged if a rebuild errors
+		if (branchCursor < 0 && branchSteps.length) branchCursor = branchSteps.length - 1;
+		setSandboxStatus(`branch error: ${e.message ?? "unknown"}`, "err");
+		if (branchCursor >= 0) renderBranchStep(branchCursor);
+		else updateBranchControls();
+	}
+}
+
+// React to branchSteps changing. During a rebuild (after a re-run reopen), hold
+// until the re-run target step re-commits, then settle the cursor on it.
+// Otherwise focus the first step on the initial pause (carrying the EDIT-mode
+// edit) or refresh the currently-viewed step (its controls / result).
+function onBranchStepsGrew() {
+	if (branchRebuilding) { maybeSettleRebuild(); return; }
+	if (branchCursor === -1) {
+		const carried = branchFirstPrompt;
+		branchFirstPrompt = null;
+		renderBranchStep(0, carried);
+	} else {
+		renderBranchStep(branchCursor);
+	}
+}
+
+// A re-run reopen replays the (fast) committed prefix and then makes a REAL
+// (slow) LLM call for the re-run target itself. So we can't settle on a timer —
+// we settle once the target step has actually re-committed (or the branch ends),
+// landing the cursor on the target's fresh result.
+function maybeSettleRebuild() {
+	const t = branchReopenTarget;
+	const ready = branchDone || (t >= 0 && t < branchSteps.length && !!branchSteps[t] && branchSteps[t].ran);
+	if (!ready) {
+		setSandboxStatus("re-running this step (invalidating later steps)…");
+		return;
+	}
+	branchRebuilding = false;
+	branchStepBusy = false;
+	const target = branchSteps.length ? Math.max(0, Math.min(t, branchSteps.length - 1)) : -1;
+	if (target >= 0) renderBranchStep(target);
+	else updateBranchControls();
+}
+
+// Set the step header (pill + "<verb> <owner> · model").
+function setBranchHeader(verb, step, owner, model) {
+	sandboxStepPillEl.textContent = step ?? "(step)";
+	sandboxStepMetaEl.textContent = "";
+	const v = document.createElement("span");
+	v.textContent = `${verb} `;
+	const o = document.createElement("b");
+	o.textContent = owner ?? "—";
+	sandboxStepMetaEl.append(v, o);
+	if (model) {
+		const m = document.createElement("span");
+		m.textContent = `   ·   ${model}`;
+		sandboxStepMetaEl.append(m);
+	}
+	sandboxPosEl.textContent = "";
+}
+
+// Render the step at `i`. The frontier (un-run, last) shows its editable
+// re-rendered prompt to run. A committed step shows the prompt that was
+// actually committed to the branch log + its output + reasoning, editable so
+// it can be re-run. `override` seeds the textareas (the carried EDIT-mode edit
+// on the first step).
+function renderBranchStep(i, override) {
+	if (i < 0 || i >= branchSteps.length) { updateBranchControls(); return; }
+	branchCursor = i;
+	const s = branchSteps[i];
+	const isFrontier = !s.ran;
+	setBranchHeader(isFrontier ? "paused before" : "committed", s.step, s.owner, s.model);
+	sandboxPosEl.textContent = `step ${i + 1} / ${branchSteps.length}`;
+	sandboxSystemEl.readOnly = false;
+	sandboxUserEl.readOnly = false;
+	sandboxSystemEl.value = override ? (override.system ?? "") : (s.system ?? "");
+	sandboxUserEl.value = override ? (override.user ?? "") : (s.user ?? "");
+	markSandboxEdited();
+	if (s.ran && s.output != null) {
+		sandboxOutputWrapEl.classList.add("show");
+		sandboxOutputEl.textContent = JSON.stringify(s.output, null, 2);
+		sandboxRenderNoteEl.textContent = "output of this step";
+		sandboxRenderNoteEl.classList.remove("nothing");
+		const r = (s.reasoning ?? "").trim();
+		sandboxReasoningEl.style.display = r ? "" : "none";
+		sandboxReasoningBodyEl.textContent = r;
+	} else {
+		sandboxOutputWrapEl.classList.remove("show");
+		sandboxOutputEl.textContent = "";
+		sandboxReasoningEl.style.display = "none";
+		sandboxReasoningBodyEl.textContent = "";
+	}
+	if (isFrontier) {
+		setSandboxStatus("paused — edit this step's prompt, then run it (or run the rest)");
+	} else {
+		setSandboxStatus("committed step — edit + re-run to change it (invalidates later steps)");
+	}
+	updateBranchControls();
+}
+
+function updateBranchControls() {
+	if (!branchActive) return;
+	const s = branchSteps[branchCursor];
+	const onFrontier = !!s && !s.ran;
+	const onCommitted = !!s && s.ran;
+	const idle = !branchStepBusy && !branchRebuilding;
+	// prev / next: pure (non-destructive) observability navigation.
+	if (sandboxPrevEl) sandboxPrevEl.disabled = !(idle && branchCursor > 0);
+	if (sandboxNextEl) sandboxNextEl.disabled = !(idle && branchCursor < branchSteps.length - 1);
+	// Run (frontier) — run the next, un-run step.
+	if (sandboxRunStepEl) {
+		sandboxRunStepEl.style.display = onFrontier ? "" : "none";
+		sandboxRunStepEl.disabled = !(onFrontier && idle && !branchDone);
+	}
+	// Re-run (committed) — DESTRUCTIVE: invalidates everything after this step.
+	if (sandboxRerunEl) {
+		sandboxRerunEl.style.display = onCommitted ? "" : "none";
+		sandboxRerunEl.disabled = !(onCommitted && idle && s.llmIndex != null);
+	}
+	// Run rest — only from the frontier.
+	if (sandboxRunRestEl) {
+		sandboxRunRestEl.style.display = onFrontier ? "" : "none";
+		sandboxRunRestEl.disabled = !(onFrontier && idle && !branchDone);
+	}
+}
+
+// Low-level: tell the server to advance past the current pause. Returns true on
+// success. Does not manage busy — callers do.
+async function sendBranchProceed(body) {
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch/step?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+		);
+		if (!res.ok) {
+			setSandboxStatus(`step failed: HTTP ${res.status}`, "err");
+			return false;
+		}
+		return true;
+	} catch (err) {
+		setSandboxStatus(`step failed: ${err.message}`, "err");
+		return false;
+	}
+}
+
+async function sendBranchRerun(llmIndex, system, user) {
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch/rerun?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify({ llm_index: llmIndex, system, user }),
+			},
+		);
+		if (!res.ok) {
+			setSandboxStatus(`re-run failed: HTTP ${res.status}`, "err");
+			return false;
+		}
+		return true;
+	} catch (err) {
+		setSandboxStatus(`re-run failed: ${err.message}`, "err");
+		return false;
+	}
+}
+
+// Observability navigation — non-destructive (just moves the viewed step).
+function navBranch(delta) {
+	if (!branchActive || branchStepBusy || branchRebuilding) return;
+	const i = branchCursor + delta;
+	if (i < 0 || i >= branchSteps.length) return;
+	renderBranchStep(i);
+}
+
+// Run the frontier step with the edited prompt; the stream commits it + appends
+// the next frontier.
+async function runBranchStep() {
+	if (!branchActive || branchStepBusy || branchRebuilding) return;
+	const s = branchSteps[branchCursor];
+	if (!s || s.ran) return;
+	branchStepBusy = true;
+	updateBranchControls();
+	setSandboxStatus("running this step…");
+	const ok = await sendBranchProceed({ system: sandboxSystemEl.value, user: sandboxUserEl.value });
+	if (!ok) { branchStepBusy = false; updateBranchControls(); }
+}
+
+// Run the rest of the branch from the frontier with no further pauses.
+async function runBranchRest() {
+	if (!branchActive || branchStepBusy || branchRebuilding || branchDone) return;
+	const s = branchSteps[branchCursor];
+	if (!s || s.ran) return; // only from the frontier
+	branchStepBusy = true;
+	branchAuto = true;
+	updateBranchControls();
+	setSandboxStatus("running the rest of the branch…");
+	const ok = await sendBranchProceed({
+		system: sandboxSystemEl.value, user: sandboxUserEl.value, auto: true,
+	});
+	if (!ok) { branchStepBusy = false; branchAuto = false; updateBranchControls(); }
+}
+
+// Re-run a COMMITTED step with the edited prompt: invalidates everything after
+// it (server truncates + replays), then re-syncs from the rebuilt branch log,
+// landing back on this step's new result.
+async function reRunBranchStep() {
+	if (!branchActive || branchStepBusy || branchRebuilding) return;
+	const s = branchSteps[branchCursor];
+	if (!s || !s.ran || s.llmIndex == null) return;
+	const target = branchCursor;
+	branchStepBusy = true;
+	branchAuto = false; // re-run drops us back into interactive stepping
+	updateBranchControls();
+	setSandboxStatus("re-running this step (invalidating later steps)…");
+	const ok = await sendBranchRerun(s.llmIndex, sandboxSystemEl.value, sandboxUserEl.value);
+	if (!ok) { branchStepBusy = false; updateBranchControls(); return; }
+	// Rebuild from the truncated + re-run log; settle the cursor back on this step.
+	branchReopenTarget = target;
+	branchRebuilding = true;
+	branchSteps = [];
+	branchCursor = -1;
+	branchDone = false;
+	branchGen += 1; // invalidate stale mesh loads from the undone steps
+	branchOverlayBboxIds.clear();
+	branchOverlayMeshes.clear();
+	clearSandboxOverlay();
+	openBranchStream(); // fresh snapshot rebuilds the overlay + the step history
+}
+
+// Draw a deviated branch node's (world-frame) bbox into the overlay. The branch
+// emits world coordinates already, so no parent-frame conversion is needed.
+function addBranchBbox(e) {
+	if (branchOverlayBboxIds.has(e.id)) return;
+	if (!Array.isArray(e.origin) || !Array.isArray(e.dimensions)) return;
+	branchOverlayBboxIds.add(e.id);
+	addSandboxOverlayBox(e.origin, e.dimensions, {
+		id: e.id,
+		kind: e.node_kind ?? "object",
+		prompt: typeof e.prompt === "string" ? e.prompt : null,
+	});
+}
+
+async function loadBranchMesh(id, url) {
+	if (!url) return;
+	const gen = branchGen;
+	let gltf;
+	try {
+		gltf = await loader.loadAsync(new URL(url, SERVER_URL).toString());
+	} catch {
+		return;
+	}
+	if (gen !== branchGen || !branchActive) {
+		disposeObject3D(gltf.scene);
+		return;
+	}
+	gltf.scene.traverse((child) => {
+		if (child.isMesh && child.material) {
+			const mats = Array.isArray(child.material) ? child.material : [child.material];
+			for (const m of mats) m.side = THREE.DoubleSide;
+		}
+	});
+	const prev = branchOverlayMeshes.get(id);
+	if (prev) {
+		sandboxOverlayRoot.remove(prev);
+		disposeObject3D(prev);
+	}
+	sandboxOverlayRoot.add(gltf.scene);
+	branchOverlayMeshes.set(id, gltf.scene);
+}
+
+// Local-only branch teardown (no DELETE) — shared by discardBranch + the silent
+// cell-switch teardown.
+function clearBranchStateLocal() {
+	branchActive = false;
+	branchGen += 1; // invalidate any pending mesh loads
+	branchDone = false;
+	branchSteps = [];
+	branchCursor = -1;
+	branchRebuilding = false;
+	branchStepBusy = false;
+	branchAuto = false;
+	branchFirstPrompt = null;
+	closeBranchStream();
+	branchOverlayBboxIds.clear();
+	branchOverlayMeshes.clear();
+	clearSandboxOverlay();
+}
+
+async function discardBranch() {
+	if (!branchActive) return;
+	const slotId = currentSlotId, model = currentModel, run = currentRun;
+	clearBranchStateLocal();
+	try {
+		await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/branch?run=${encodeURIComponent(run)}`,
+				SERVER_URL,
+			),
+			{ method: "DELETE" },
+		);
+	} catch {}
+}
+
+// Phase B -> Phase A: drop the branch and return to tuning the step we forked.
+async function backToEdit() {
+	if (!branchActive) return;
+	const cursor = sandboxCursor;
+	await discardBranch();
+	applySandboxMode();
+	gotoSandboxStep(cursor);
+}
+
+// Break out: discard all tuning, restore the full scene instantly (the objects
+// were only hidden), resume the run if we paused it, and reconnect the SSE if
+// the run had been live.
+async function exitSandbox() {
+	if (!sandboxActive) return;
+	// Capture the cell we're restoring — clearing `sandbox-open` below re-enables
+	// the chrome, so the user could switch cells during the resume await; the
+	// resume must target the cell we paused, and the reconnect must bail if we've
+	// since navigated away.
+	const slotId = currentSlotId;
+	const model = currentModel;
+	const run = currentRun;
+	// Drop any active branch (cancels its server task + deletes the temp dir).
+	if (branchActive) await discardBranch();
+	sandboxActive = false;
+	rewindCutoffIndex = null;
+	clearSandboxOverlay();
+	refreshAllVisibility();
+	sandboxPanelEl.classList.remove("open");
+	document.body.classList.remove("sandbox-open");
+	sandboxSteps = [];
+	sandboxCursor = -1;
+	const resume = sandboxPausedByUs;
+	const reconnect = sandboxWasLive;
+	sandboxPausedByUs = false;
+	sandboxWasLive = false;
+	if (resume && slotId && model) {
+		try {
+			await fetch(
+				new URL(
+					`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/resume?run=${encodeURIComponent(run)}`,
+					SERVER_URL,
+				),
+				{ method: "POST" },
+			);
+		} catch {}
+	}
+	// Only reconnect if we're still viewing the same cell (a switch during the
+	// await already tore down + reloaded its own stream).
+	if (reconnect && currentSlotId === slotId && currentModel === model && !currentSource) {
+		setStatus("tuning discarded — original run restored, streaming events…");
+		subscribe(`${slotEventsUrl(slotId, model)}&since=${highestEventIndex}`);
+	} else if (currentSlotId === slotId && currentModel === model) {
+		setStatus("tuning discarded — original run restored");
+	}
+	refreshSlots();
+}
+
+// Hard teardown with no awaited server calls — used when the cell itself is
+// going away (slot/model/run switch, reset). The follow-up clearScene wipes the
+// overlay. Fires a best-effort branch DELETE for the cell we're leaving.
+function teardownSandboxSilently() {
+	if (!sandboxActive && !branchActive) return;
+	if (branchActive) {
+		const slotId = currentSlotId, model = currentModel, run = currentRun;
+		clearBranchStateLocal();
+		if (slotId && model && run) {
+			try {
+				fetch(
+					new URL(
+						`/slots/${encodeURIComponent(slotId)}/${encodeURIComponent(model)}/branch?run=${encodeURIComponent(run)}`,
+						SERVER_URL,
+					),
+					{ method: "DELETE", keepalive: true },
+				).catch(() => {});
+			} catch {}
+		}
+	}
+	sandboxActive = false;
+	rewindCutoffIndex = null;
+	clearSandboxOverlay();
+	sandboxPanelEl.classList.remove("open");
+	document.body.classList.remove("sandbox-open");
+	sandboxSteps = [];
+	sandboxCursor = -1;
+	sandboxPausedByUs = false;
+	sandboxWasLive = false;
+}
+
+function updateFlowPauseButton() {
+	if (!flowPauseEl) return;
+	const running = currentRunInfo()?.status === "running";
+	flowPauseEl.disabled = !running;
+	flowPauseEl.classList.toggle("is-running", running);
+}
+
+async function pauseCurrentCell() {
+	if (!currentSlotId || !currentModel) return;
+	if (currentRunInfo()?.status !== "running") return;
+	flowPauseEl.disabled = true;
+	try {
+		const res = await fetch(
+			new URL(
+				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/pause?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
+			{ method: "POST" },
+		);
+		if (res.ok) {
+			// slot_pause flips the cell to "paused" synchronously, so awaiting the
+			// status refresh before re-reading lets the button settle correctly
+			// (the run.paused SSE event also lands and closes the live stream).
+			setStatus("run paused — open a step and 'tune' to rewind & edit its prompt");
+			await refreshSlots();
+		} else {
+			setStatus(`pause failed: HTTP ${res.status}`, "err");
+		}
+	} catch (e) {
+		setStatus(`pause failed: ${e.message}`, "err");
+	}
+	updateFlowPauseButton();
+}
+
+sandboxTestEl?.addEventListener("click", testSandboxStep);
+sandboxResetEl?.addEventListener("click", () => {
+	const call = sandboxSteps[sandboxCursor];
+	if (!call) return;
+	sandboxSystemEl.value = call.system ?? "";
+	sandboxUserEl.value = call.user ?? "";
+	markSandboxEdited();
+	setSandboxStatus("prompts reset to the recorded values");
+});
+sandboxPrevEl?.addEventListener("click", () => (branchActive ? navBranch(-1) : gotoSandboxStep(sandboxCursor - 1)));
+sandboxNextEl?.addEventListener("click", () => (branchActive ? navBranch(1) : gotoSandboxStep(sandboxCursor + 1)));
+sandboxSimulateEl?.addEventListener("click", simulateDownstream);
+sandboxRunStepEl?.addEventListener("click", runBranchStep);
+sandboxRerunEl?.addEventListener("click", reRunBranchStep);
+sandboxRunRestEl?.addEventListener("click", runBranchRest);
+sandboxBackEl?.addEventListener("click", backToEdit);
+sandboxBreakoutEl?.addEventListener("click", () => exitSandbox());
+sandboxCloseEl?.addEventListener("click", () => exitSandbox());
+sandboxSystemEl?.addEventListener("input", markSandboxEdited);
+sandboxUserEl?.addEventListener("input", markSandboxEdited);
+sandboxExpandEl?.addEventListener("click", () => {
+	sandboxExpanded = !sandboxExpanded;
+	try { localStorage.setItem(SANDBOX_EXPANDED_KEY, sandboxExpanded ? "1" : "0"); } catch {}
+	applySandboxExpanded();
+});
+sandboxCopyEl?.addEventListener("click", async () => {
+	const text = sandboxOutputEl.textContent || "";
+	if (!text) return;
+	try {
+		await navigator.clipboard.writeText(text);
+		sandboxCopyEl.textContent = "✓ copied";
+		setTimeout(() => { sandboxCopyEl.textContent = "⧉ copy"; }, 1200);
+	} catch {
+		setSandboxStatus("copy failed — select the output text manually", "err");
+	}
+});
+flowPauseEl?.addEventListener("click", pauseCurrentCell);
 
 function positionTooltip(clientX, clientY, id) {
 	const node = treeNodes.get(id);
@@ -4644,8 +6763,13 @@ function positionTooltip(clientX, clientY, id) {
 		tooltip.appendChild(row);
 	}
 
-	// Flip left/up when the tooltip would overflow the viewport so the cursor
-	// can keep approaching the hovered bbox from any direction.
+	placeTooltip(clientX, clientY);
+}
+
+// Flip left/up when the tooltip would overflow the viewport so the cursor can
+// keep approaching the hovered box from any direction. Assumes tooltip content
+// is already set.
+function placeTooltip(clientX, clientY) {
 	tooltip.style.display = "block";
 	tooltip.style.left = "0px";
 	tooltip.style.top = "0px";
@@ -4660,13 +6784,51 @@ function positionTooltip(clientX, clientY, id) {
 	tooltip.style.top = `${Math.max(0, y)}px`;
 }
 
+// Tooltip for a magenta overlay box — same look as the canvas bbox tooltip,
+// built from the box's own metadata (the branch/tested node isn't in the tree).
+function positionOverlayTooltip(clientX, clientY, oid) {
+	const entry = sandboxOverlayBoxes.get(oid);
+	if (!entry) { tooltip.style.display = "none"; return; }
+	const kind = entry.kind;
+	tooltip.textContent = "";
+	const head = document.createElement("div");
+	if (kind) {
+		const kindEl = document.createElement("span");
+		kindEl.textContent = `[${kind}]`;
+		kindEl.style.color = TOOLTIP_KIND_COLOR[kind] ?? "#e6e6e6";
+		head.appendChild(kindEl);
+		head.appendChild(document.createTextNode(" "));
+	}
+	head.appendChild(document.createTextNode(entry.id ?? "(box)"));
+	tooltip.appendChild(head);
+	if (entry.prompt) {
+		const row = document.createElement("div");
+		row.style.marginTop = "4px";
+		row.style.color = "#bdbdbd";
+		const lbl = document.createElement("span");
+		lbl.textContent = "seed: ";
+		lbl.style.color = "#7a8190";
+		row.appendChild(lbl);
+		row.appendChild(document.createTextNode(entry.prompt));
+		tooltip.appendChild(row);
+	}
+	placeTooltip(clientX, clientY);
+}
+
+// Zones-only picking is active when the toggle is set to "zones" OR the user
+// is holding Shift — a momentary override to grab the containing zone without
+// flipping (and persisting) the saved mode.
+function zonesOnlyActive() {
+	return selectMode === "zones" || pressedKeys.has("shift");
+}
+
 // Mesh-based picking: raycast against actual geometry the user sees —
 // loaded GLB meshes first, then solid-fill proxies when the model hasn't
 // arrived. Zones never have meshes, so they're unreachable here and must
 // be selected from the tree (or via zone-mode picking, below).
 const _pickRoots = [];
 function pickHoveredBboxId() {
-	if (selectMode === "zones") return pickHoveredZoneBboxId();
+	if (zonesOnlyActive()) return pickHoveredZoneBboxId();
 	_pickRoots.length = 0;
 	for (const model of modelsById.values()) {
 		if (model.visible) _pickRoots.push(model);
@@ -4699,6 +6861,7 @@ function pickHoveredZoneBboxId() {
 	for (const [id, helper] of bboxes) {
 		if (helper.userData.nodeKind !== "zone") continue;
 		if (effectivelyHidden(id)) continue;
+		if (!withinRewind(id, "bbox")) continue; // don't grab a rewound-away zone
 		if (!raycaster.ray.intersectBox(helper.box, _zoneHit)) continue;
 		helper.box.getSize(_zoneSize);
 		const vol = _zoneSize.x * _zoneSize.y * _zoneSize.z;
@@ -4726,10 +6889,8 @@ function pickRightClickId() {
 		// In zone-only mode the bbox fallback must also stay zone-restricted —
 		// otherwise right-clicking past a zone hit would hide a non-zone the
 		// user can't even select via left-click.
-		if (selectMode === "zones" && helper.userData.nodeKind !== "zone")
-			continue;
-		if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit))
-			continue;
+		if (zonesOnlyActive() && helper.userData.nodeKind !== "zone") continue;
+		if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit)) continue;
 		const dist = _rightClickBoxHit.distanceToSquared(camera.position);
 		if (dist < bestDist) {
 			bestDist = dist;
@@ -4745,11 +6906,14 @@ renderer.domElement.addEventListener("pointermove", (ev) => {
 	pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
 	lastPointerClientX = ev.clientX;
 	lastPointerClientY = ev.clientY;
+	pointerInsideCanvas = true;
 	pointerDirty = true;
 });
 
 renderer.domElement.addEventListener("pointerleave", () => {
+	pointerInsideCanvas = false;
 	setHoveredBbox(null);
+	setHoveredOverlay(null);
 	tooltip.style.display = "none";
 });
 
@@ -4786,6 +6950,11 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
 	pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
 	pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
 	raycaster.setFromCamera(pointer, camera);
+	if (sandboxActive) {
+		// Select the magenta overlay box (highlight it); the tooltip already names it.
+		selectOverlay(pickHoveredOverlayId());
+		return;
+	}
 	const id = pickHoveredBboxId();
 	if (id !== null) {
 		selectTreeNode(id);
@@ -4832,6 +7001,11 @@ let highestEventIndex = -1;
 const recordedEvents = [];
 
 function dispatch(event) {
+	// While the prompt-tuning sandbox is open the live stream is detached and
+	// client state is frozen — ignore any stray event so recordedEvents / tree /
+	// scene stay exactly as they were. Break-out reconnects with ?since= to
+	// catch up, so nothing is lost.
+	if (sandboxActive) return;
 	if (typeof event.index === "number") {
 		if (event.index <= highestEventIndex) return;
 		highestEventIndex = event.index;
@@ -5101,6 +7275,9 @@ async function refreshSlots() {
 		}
 		renderSlotTabs();
 		updateResumeButton();
+		// Keep the flow-modal pause button in sync with the live run status
+		// (e.g. when a run finishes on its own while the graph is open).
+		updateFlowPauseButton();
 	} catch {
 		// Transient; next tick will retry.
 	}
@@ -5152,6 +7329,7 @@ function resetClientStateForRunSwitch() {
 
 async function switchRun(name) {
 	if (!name || name === currentRun) return;
+	teardownSandboxSilently();
 	runPickerEl.disabled = true;
 	try {
 		const res = await fetch(
@@ -5178,14 +7356,14 @@ async function switchRun(name) {
 	}
 }
 
-// --- pipeline versions (V1/V2/V3) -------------------------------------------
+// --- pipeline versions (V1/V2/V3/V4) ----------------------------------------
 //
 // Each version is a reserved run (v1-legacy-xml / v2-frame-first /
-// v3-decomp-first). The version bar is a specialized run-switcher: clicking a
-// button activates that run via switchRun() (single-canvas swap), and "launch
-// all 3" starts every version's cell on the current (slot, model) so they
-// generate concurrently and isolated. The dot on each button mirrors that
-// version's cell status for the viewed (slot, model).
+// v3-decomp-first / v4-decomp-first-all). The version bar is a specialized
+// run-switcher: clicking a button activates that run via switchRun()
+// (single-canvas swap), and "launch all" starts every version's cell on the
+// current (slot, model) so they generate concurrently and isolated. The dot on
+// each button mirrors that version's cell status for the viewed (slot, model).
 
 function renderVersionBar() {
 	versionBarEl.innerHTML = "";
@@ -5349,6 +7527,8 @@ function switchView(slotId, modelAlias) {
 	// SSE + scene, persist the new selection, and load the cell (scene +
 	// log backfill) unless it's idle. Error/paused cells still load so the
 	// log panel shows what happened; slotNeedsResume drives retry/resume UI.
+	// Abandon any open tuning session first — the cell it rewound is going away.
+	teardownSandboxSilently();
 	if (currentSource) {
 		currentSource.close();
 		currentSource = null;
@@ -5636,6 +7816,7 @@ async function resetSlot(id, model, skipConfirm = false) {
 		);
 		if (!ok) return;
 	}
+	teardownSandboxSilently();
 	resetEl.disabled = true;
 	try {
 		const res = await fetch(
@@ -5785,6 +7966,7 @@ async function backfillHistoryInBackground(slotId, model, gen) {
 		await meshBundle.streamDone;
 	} catch {}
 	if (gen !== sceneGen) return;
+	const t0 = performance.now();
 	let text;
 	try {
 		const res = await fetch(historyUrl(slotId, model), {
@@ -5796,8 +7978,10 @@ async function backfillHistoryInBackground(slotId, model, gen) {
 		return;
 	}
 	if (gen !== sceneGen) return;
+	const tFetched = performance.now();
 	const lines = text.split("\n");
 	let i = 0;
+	let count = 0;
 	const step = () => {
 		if (gen !== sceneGen) return;
 		const end = Math.min(i + 200, lines.length);
@@ -5811,15 +7995,25 @@ async function backfillHistoryInBackground(slotId, model, gen) {
 				continue;
 			}
 			backfillPanels(event);
+			count++;
 		}
 		if (i < lines.length) setTimeout(step, 0);
-		else updateReplayButton();
+		else {
+			updateReplayButton();
+			if (LOAD_TIMING) {
+				console.info(
+					`[load] backfill: ${count} events · ${(text.length / 1e6).toFixed(1)}MB · ` +
+						`fetch ${(tFetched - t0) | 0}ms · parse+render ${(performance.now() - tFetched) | 0}ms`,
+				);
+			}
+		}
 	};
 	step();
 }
 
 async function loadCellScene(slotId, model, { forceLive = false } = {}) {
 	const gen = sceneGen;
+	const t0 = performance.now();
 	let payload;
 	try {
 		const res = await fetch(slotSceneUrl(slotId, model), {
@@ -5835,9 +8029,15 @@ async function loadCellScene(slotId, model, { forceLive = false } = {}) {
 	if (gen !== sceneGen || currentSlotId !== slotId || currentModel !== model)
 		return;
 
+	const tFetch = performance.now();
 	applySceneProjection(payload.nodes ?? []);
-	highestEventIndex =
-		typeof payload.last_index === "number" ? payload.last_index : -1;
+	if (LOAD_TIMING) {
+		console.info(
+			`[load] /scene: ${payload.nodes?.length ?? 0} nodes · ` +
+				`fetch ${(tFetch - t0) | 0}ms · projection ${(performance.now() - tFetch) | 0}ms`,
+		);
+	}
+	highestEventIndex = typeof payload.last_index === "number" ? payload.last_index : -1;
 	prefetchMeshBundle(slotId, model, sceneGen);
 	// In generated mode, resolve this cell's versions + selected version now so the
 	// picker populates immediately instead of after the next poll tick.
@@ -5864,6 +8064,9 @@ async function loadCellScene(slotId, model, { forceLive = false } = {}) {
 }
 
 async function rewindTo(index) {
+	// The prompt-tuning sandbox owns the scene + freezes the log; a real
+	// (destructive) rewind here would truncate events.jsonl out from under it.
+	if (sandboxActive) return;
 	if (currentSlotId === null || currentModel === null) return;
 	if (currentSource) {
 		currentSource.close();
@@ -6244,23 +8447,25 @@ async function snapshotAll() {
 snapshotAllEl.addEventListener("click", snapshotAll);
 
 async function resumeAll() {
-	// Fans out POST /slots/<slot>/<model>/resume for every cell on the active
-	// model whose status is startable (idle/paused/error). Running and done
-	// cells are skipped. If the viewed cell gets resumed, route it through
-	// resumeSlot() so the scene + SSE rewire — non-viewed cells just need
-	// the kick, their events will flow next time the user switches to them.
+	// Fans out POST /slots/<slot>/<model>/resume for every PAUSED or ERRORED
+	// cell on the active model: paused cells continue, errored cells retry.
+	// Idle (never-started), running, and done cells are skipped — idle cells
+	// are launched from "start cells…", not here. If the viewed cell gets
+	// resumed, route it through resumeSlot() so the scene + SSE rewire —
+	// non-viewed cells just need the kick, their events will flow next time
+	// the user switches to them.
 	if (currentModel === null) return;
 	const model = currentModel;
-	const startable = slotSummaries.filter((s) =>
-		["idle", "paused", "error"].includes(s.runs?.[model]?.status),
+	const resumable = slotSummaries.filter((s) =>
+		["paused", "error"].includes(s.runs?.[model]?.status),
 	);
-	if (startable.length === 0) {
-		setStatus(`no startable cells on ${model}`);
+	if (resumable.length === 0) {
+		setStatus(`no paused or errored cells on ${model}`);
 		return;
 	}
 	resumeAllEl.disabled = true;
 	try {
-		const tasks = startable.map((s) => {
+		const tasks = resumable.map((s) => {
 			if (s.id === currentSlotId) {
 				// Viewed cell — wire SSE + clear scene via the existing helper.
 				return resumeSlot(s.id, model);
@@ -6278,12 +8483,12 @@ async function resumeAll() {
 		if (failures.length > 0) {
 			const names = failures.map((f) => f.slot).join(", ");
 			setStatus(
-				`resume all on ${model}: ${startable.length - failures.length} ok, ${failures.length} failed (${names})`,
+				`resume all on ${model}: ${resumable.length - failures.length} ok, ${failures.length} failed (${names})`,
 				"err",
 			);
 		} else {
 			setStatus(
-				`resumed ${startable.length} cell${startable.length === 1 ? "" : "s"} on ${model}`,
+				`resumed ${resumable.length} cell${resumable.length === 1 ? "" : "s"} on ${model}`,
 			);
 		}
 		refreshSlots();
@@ -7291,6 +9496,9 @@ async function preloadReplayGlbs(events) {
 // Returns the encoded blob in record mode, or null in preview mode.
 async function runReplay({ record }) {
 	if (replayInProgress) return null;
+	// Replay tears the scene down and re-dispatches the log; refuse while the
+	// prompt-tuning sandbox owns the canvas + frozen state.
+	if (sandboxActive) return null;
 	replayInProgress = true;
 	replayActive = true;
 	replayCancelRequested = false;

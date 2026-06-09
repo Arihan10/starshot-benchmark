@@ -8,7 +8,8 @@ Orientation contract:
   Trellis 2 returns a mesh whose intrinsic front face points along +Z
   in mesh frame. The Node's `orientation` is a yaw (integer degrees,
   right-handed about +Y) that rotates the mesh into world pose: 0 leaves
-  the front facing world +Z; 90 turns the front to world -X. The
+  the front facing world +Z; +90 turns the front to world +X (right),
+  -90 to world -X (left). The
   image-prompt step requests an orthographic head-on front view so
   Trellis's output frame is predictable, leaving this rotation as the
   only orientation knob.

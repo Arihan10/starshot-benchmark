@@ -283,6 +283,11 @@ async def _resolve_and_generate(
         output_schema=BboxBatchOutput,
         node_id=zone.id,
         step="object_bbox_batch",
+        validate=lambda o: llm.require_matching_ids(
+            produced=[a.id for a in o.assignments],
+            expected=[s.id for s in specs],
+            step="object_bbox_batch",
+        ),
     )
     # LLM emits each object's bbox in that object's parent's local
     # frame. Convert to world coordinates per-object. Handle
@@ -677,6 +682,12 @@ async def run(
     if scenario != "anchor":
         return
 
+    # Guard against the model getting stuck re-proposing an object that can
+    # never be admitted (e.g. admitted into `_admitted_ids` but dropped before
+    # placement by the bbox step): _resolve_and_generate dedups the repeat to
+    # nothing, spinning this loop forever. A repeat proposal means no progress
+    # is possible — stop the zone. (Mirrors the guard in generation.py.)
+    attempted: set[str] = set()
     while True:
         decision = await _next_object_validated(
             zone=zone, all_nodes=all_nodes, ancestors=ancestors,
@@ -684,7 +695,12 @@ async def run(
         if decision.done or decision.object is None:
             logging.log("generation.next.done", zone=zone.id)
             return
-        logging.log("generation.next", zone=zone.id, id=decision.object.id)
+        obj_id = decision.object.id
+        if obj_id in attempted:
+            logging.log("generation.next.stuck", zone=zone.id, id=obj_id)
+            return
+        attempted.add(obj_id)
+        logging.log("generation.next", zone=zone.id, id=obj_id)
         new_nodes = await _resolve_and_generate(
             specs=[decision.object], zone=zone, all_nodes=all_nodes,
             scenario="anchor",

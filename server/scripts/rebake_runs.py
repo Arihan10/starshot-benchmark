@@ -21,9 +21,13 @@ optimized GLBs are Meshopt/KTX2-compressed):
 
   * id -> library_id          from ``library.match`` events
   * id -> origin/dims/yaw      from ``bbox`` events
-  * for every object with a baked ``objects/<id>.glb``, write
-    ``objects-optimized/<id>.glb`` via app.utils.glb_place using the asset's
-    precomputed per-orientation bounds, and copy the optimized reference PNG.
+  * id rendered?              from ``model`` events
+  * for every rendered match, write ``objects-optimized/<id>.glb`` via
+    app.utils.glb_place using the asset's precomputed per-orientation bounds,
+    and copy the optimized reference PNG. The bake reads only the event log +
+    the library, so the original ``objects/`` need not be present — a bare
+    ``events.jsonl`` (shared without its meshes, or already pruned) re-bakes
+    exactly the set the run rendered.
 
 Usage (from server/):
   uv run python scripts/rebake_runs.py                          # every cell
@@ -61,10 +65,20 @@ def _dir_size_mb(path: Path, suffix: str = ".glb") -> float:
     return round(total / 1048576, 1)
 
 
-def _parse_cell(events_path: Path) -> tuple[dict[str, str], dict[str, tuple]]:
-    """Returns (library_id_by_node, (origin, dims, orientation)_by_node)."""
+def _parse_cell(
+    events_path: Path,
+) -> tuple[dict[str, str], dict[str, tuple], set[str]]:
+    """Returns (library_id_by_node, (origin, dims, orientation)_by_node,
+    rendered_node_ids).
+
+    `rendered_node_ids` are the nodes the run actually placed (emitted a
+    ``model`` event) — the log-only equivalent of the old "has a baked
+    objects/<id>.glb" check. Keying off the log instead of disk lets a cell
+    whose heavy objects/ dir is absent (a bare events.jsonl shared without its
+    meshes, or one already pruned) re-bake exactly the set the run rendered."""
     lib_by_id: dict[str, str] = {}
     bbox_by_id: dict[str, tuple] = {}
+    rendered_ids: set[str] = set()
     with events_path.open(encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -85,37 +99,35 @@ def _parse_cell(events_path: Path) -> tuple[dict[str, str], dict[str, tuple]]:
                 if node_id and origin and dims:
                     orientation = int(event.get("orientation", 0) or 0)
                     bbox_by_id[node_id] = (origin, dims, orientation)
-    return lib_by_id, bbox_by_id
+            elif kind == "model":
+                node_id = event.get("id")
+                if node_id:
+                    rendered_ids.add(node_id)
+    return lib_by_id, bbox_by_id, rendered_ids
 
 
 def rebake_cell(cell_dir: Path, *, force: bool, limit: int, prune: bool) -> dict | None:
     events_path = cell_dir / "events.jsonl"
     if not events_path.exists():
         return None
-    lib_by_id, bbox_by_id = _parse_cell(events_path)
+    lib_by_id, bbox_by_id, rendered_ids = _parse_cell(events_path)
     if not lib_by_id:
         return None  # not a library-mode cell — nothing to re-bake
 
     objects_dir = cell_dir / "objects"
     out_dir = cell_dir / OPTIMIZED_SUBDIR
 
-    # Convertible objects: a library match that actually produced a baked
-    # object (didn't error mid-run) and whose placement we can recover.
+    # Convertible objects: a library match the run actually rendered (emitted a
+    # ``model`` event) and whose placement we can recover from the log. Each
+    # twin is baked from the event log + the library asset alone, so the
+    # original objects/ dir need not exist — a bare events.jsonl is enough.
     targets = [
         node_id
         for node_id in lib_by_id
-        if bbox_by_id.get(node_id) is not None and (objects_dir / f"{node_id}.glb").exists()
+        if bbox_by_id.get(node_id) is not None and node_id in rendered_ids
     ]
 
-    if not objects_dir.exists():
-        # Already pruned by an earlier pass (or the cell never produced objects).
-        return {
-            "baked": 0, "already": 0, "unconvertible": 0, "pruned": False,
-            "orig_mb": 0.0, "opt_mb": _dir_size_mb(out_dir),
-            "status": "already_pruned" if out_dir.exists() else "no_objects",
-        }
-
-    out_dir.mkdir(exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     orig_mb = _dir_size_mb(objects_dir)
 
     def _have(node_id: str) -> bool:
@@ -157,7 +169,7 @@ def rebake_cell(cell_dir: Path, *, force: bool, limit: int, prune: bool) -> dict
     # twin — never when an asset was missing or a --limit left gaps.
     complete = bool(targets) and unconvertible == 0 and all(_have(nid) for nid in targets)
     pruned = False
-    if prune and complete:
+    if prune and complete and objects_dir.exists():
         shutil.rmtree(objects_dir)
         pruned = True
 

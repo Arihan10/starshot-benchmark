@@ -57,6 +57,36 @@ def split_region_members(
     return objects, subregions
 
 
+def index_objects_by_region(nodes: list[Node]) -> dict[str | None, list[Node]]:
+    """Group concrete (non-region) nodes by their `parent_region` field — the
+    region whose generation pass emitted each object — preserving insertion
+    order. V3/V4 object grouping reads this instead of walking `parent_id`, so a
+    frame anchored to a structural supporter in another region still renders
+    under the region that owns it. Zones carry no `parent_region` and are
+    excluded; they stay grouped by `parent_id`."""
+    out: dict[str | None, list[Node]] = {}
+    for n in nodes:
+        if is_region(n):
+            continue
+        out.setdefault(n.parent_region, []).append(n)
+    return out
+
+
+def split_region_members_owned(
+    region_id: str,
+    children_index: dict[str | None, list[Node]],
+    objects_by_region: dict[str | None, list[Node]],
+) -> tuple[list[Node], list[Node]]:
+    """V3/V4 variant of `split_region_members`. Subregions are resolved exactly
+    as before (region-nodes hanging under `region_id` by `parent_id`), but
+    objects come from the `parent_region` ownership index rather than the
+    object->object `parent_id` ancestor walk. V1/V2 keep calling
+    `split_region_members` unchanged."""
+    _, subregions = split_region_members(region_id, children_index)
+    objects = objects_by_region.get(region_id, [])
+    return objects, subregions
+
+
 # --- bounding-box prose ------------------------------------------------------
 
 

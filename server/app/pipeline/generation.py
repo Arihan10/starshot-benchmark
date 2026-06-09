@@ -16,12 +16,14 @@ Three scenarios:
 
 Per scenario: decompose objects (LLM) -> validate relationships and retry
 on failure (this is the only validating retry left in the pipeline) ->
-batch-resolve every object's bbox in a single LLM call (trusted, no
-retry) -> spawn background Trellis 2 jobs that fan out via SSE events
-as each mesh lands.
+resolve every object's bbox in a single batch LLM call (trusted, no
+retry) -> spawn background Trellis 2 jobs that fan out via SSE events as
+each mesh lands.
 
-The anchor-loop's "is another object needed?" step uses the same
-relationship validator on the single emitted spec.
+The anchor-loop's "are more objects needed?" step uses the same
+relationship validator on the emitted specs. V3/V4 let that step propose
+a LIST of objects per round (`batch_next_object`); V2 proposes one at a
+time. Bounding-box resolution is batch in every version.
 """
 
 from __future__ import annotations
@@ -341,6 +343,7 @@ async def _decompose_objects_validated(
             user = p.render_negative_space_decomp(
                 zone_id=zone.id,
                 zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
                 nodes=all_nodes,
                 prior_attempts=prior_attempts,
             )
@@ -360,8 +363,6 @@ async def _decompose_objects_validated(
             )
             return []
         specs = list(out.objects)
-        if scenario == "encapsulating":
-            specs = [s.model_copy(update={"parent": zone.id}) for s in specs]
         try:
             validate_referenced_ids(specs, parent_id=zone.id, existing_ids=existing_ids)
             return specs
@@ -447,6 +448,246 @@ async def _next_object_validated(
     return decision
 
 
+async def _next_object_batch_validated(
+    *,
+    zone: Node,
+    all_nodes: list[Node],
+) -> tuple[bool, list[Any]]:
+    """V3/V4 anchor-completion decision: the model proposes a LIST of objects
+    per round (or signals done). Runs the same relationship-validator retry as
+    the single-object path, applied to the whole proposed batch. Returns
+    `(done, objects)`; `objects` is empty when done."""
+    prior_attempts: list[tuple[list[Any], str]] = []
+    existing_ids = {n.id for n in all_nodes}
+    objects: list[Any] = []
+    for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
+        p = prompt_runtime.current()
+        decision = await llm.call_llm(
+            system=p.SYSTEM_NEXT_OBJECT,
+            user=p.render_next_object(
+                zone_id=zone.id,
+                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
+                nodes=all_nodes,
+                prior_attempts=prior_attempts,
+            ),
+            output_schema=p.NextObjectOutput,
+            node_id=zone.id,
+            step="next_object",
+        )
+        objects = list(decision.objects)
+        if decision.done or not objects:
+            return True, []
+        try:
+            validate_referenced_ids(objects, parent_id=zone.id, existing_ids=existing_ids)
+            return False, objects
+        except ValueError as e:
+            reason = str(e)
+            logging.log(
+                "generation.next.retry",
+                zone=zone.id,
+                attempt=attempt,
+                reason=reason,
+                emitted=[o.model_dump() for o in objects],
+            )
+            prior_attempts.append((objects, reason))
+    # Retries exhausted. Unresolvable parents are a hard fail; dangling
+    # secondary referenced_ids are accepted with a log.
+    validate_parents(objects, parent_id=zone.id, existing_ids=existing_ids)
+    logging.log_once(
+        "generation.next.accept_invalid",
+        match_fields=("zone",),
+        zone=zone.id,
+        reason=prior_attempts[-1][1] if prior_attempts else "",
+    )
+    return False, objects
+
+
+async def _resolve_object_bboxes_batch(
+    *,
+    specs: list[Any],
+    zone: Node,
+    all_nodes: list[Node],
+) -> dict[str, BoundingBox]:
+    """Place every object in `specs` in ONE batch LLM call (the V2 strategy).
+    Returns `{id: world-frame bbox}`. Objects already committed (resume) keep
+    their world position and the LLM is skipped entirely when all are."""
+    committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
+    if all(b is not None for b in committed_bboxes.values()):
+        return {sid: b for sid, b in committed_bboxes.items() if b is not None}
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
+    p = prompt_runtime.current()
+    out = await llm.call_llm(
+        system=p.SYSTEM_OBJECT_BBOX_BATCH,
+        user=p.render_object_bbox_batch(
+            zone_id=zone.id,
+            zone_prompt=zone.prompt,
+            zone_plan=zone.plan,
+            zone_bbox=zone.bbox,
+            objects=specs,
+            nodes=all_nodes,
+        ),
+        output_schema=p.BboxBatchOutput,
+        node_id=zone.id,
+        step="object_bbox_batch",
+        validate=lambda o: llm.require_matching_ids(
+            produced=[a.id for a in o.assignments],
+            expected=[s.id for s in specs],
+            step="object_bbox_batch",
+        ),
+    )
+    # LLM emits each object's bbox in that object's parent's local frame.
+    # Convert to world coordinates per-object. Handle intra-batch parents
+    # (spec B parents to spec A in same batch) via topological resolution.
+    spec_parent = {s.id: s.parent for s in specs}
+    assignments_by_id = {a.id: a.bbox for a in out.assignments}
+    bboxes: dict[str, BoundingBox] = {}
+    remaining = set(assignments_by_id.keys())
+    while remaining:
+        progress = False
+        for obj_id in list(remaining):
+            parent_id = spec_parent.get(obj_id, zone.id)
+            if parent_id in bboxes:
+                parent_bbox = bboxes[parent_id]
+            elif parent_id in bbox_by_id:
+                parent_bbox = bbox_by_id[parent_id]
+            elif parent_id in remaining:
+                continue
+            else:
+                parent_bbox = zone.bbox
+            bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
+            remaining.discard(obj_id)
+            progress = True
+        if not progress:
+            for obj_id in list(remaining):
+                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
+            remaining.clear()
+    for sid, b in committed_bboxes.items():
+        if b is not None:
+            bboxes[sid] = b
+    return bboxes
+
+
+async def _next_object_batch_validated(
+    *,
+    zone: Node,
+    all_nodes: list[Node],
+) -> tuple[bool, list[Any]]:
+    """V3/V4 anchor-completion decision: the model proposes a LIST of objects
+    per round (or signals done). Runs the same relationship-validator retry as
+    the single-object path, applied to the whole proposed batch. Returns
+    `(done, objects)`; `objects` is empty when done."""
+    prior_attempts: list[tuple[list[Any], str]] = []
+    existing_ids = {n.id for n in all_nodes}
+    objects: list[Any] = []
+    for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
+        p = prompt_runtime.current()
+        decision = await llm.call_llm(
+            system=p.SYSTEM_NEXT_OBJECT,
+            user=p.render_next_object(
+                zone_id=zone.id,
+                zone_prompt=zone.prompt,
+                zone_plan=zone.plan,
+                nodes=all_nodes,
+                prior_attempts=prior_attempts,
+            ),
+            output_schema=p.NextObjectOutput,
+            node_id=zone.id,
+            step="next_object",
+        )
+        objects = list(decision.objects)
+        if decision.done or not objects:
+            return True, []
+        try:
+            validate_referenced_ids(objects, parent_id=zone.id, existing_ids=existing_ids)
+            return False, objects
+        except ValueError as e:
+            reason = str(e)
+            logging.log(
+                "generation.next.retry",
+                zone=zone.id,
+                attempt=attempt,
+                reason=reason,
+                emitted=[o.model_dump() for o in objects],
+            )
+            prior_attempts.append((objects, reason))
+    # Retries exhausted. Unresolvable parents are a hard fail; dangling
+    # secondary referenced_ids are accepted with a log.
+    validate_parents(objects, parent_id=zone.id, existing_ids=existing_ids)
+    logging.log_once(
+        "generation.next.accept_invalid",
+        match_fields=("zone",),
+        zone=zone.id,
+        reason=prior_attempts[-1][1] if prior_attempts else "",
+    )
+    return False, objects
+
+
+async def _resolve_object_bboxes_batch(
+    *,
+    specs: list[Any],
+    zone: Node,
+    all_nodes: list[Node],
+) -> dict[str, BoundingBox]:
+    """Place every object in `specs` in ONE batch LLM call (the V2 strategy).
+    Returns `{id: world-frame bbox}`. Objects already committed (resume) keep
+    their world position and the LLM is skipped entirely when all are."""
+    committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
+    if all(b is not None for b in committed_bboxes.values()):
+        return {sid: b for sid, b in committed_bboxes.items() if b is not None}
+    bbox_by_id = {n.id: n.bbox for n in all_nodes}
+    p = prompt_runtime.current()
+    out = await llm.call_llm(
+        system=p.SYSTEM_OBJECT_BBOX_BATCH,
+        user=p.render_object_bbox_batch(
+            zone_id=zone.id,
+            zone_prompt=zone.prompt,
+            zone_plan=zone.plan,
+            zone_bbox=zone.bbox,
+            objects=specs,
+            nodes=all_nodes,
+        ),
+        output_schema=p.BboxBatchOutput,
+        node_id=zone.id,
+        step="object_bbox_batch",
+        validate=lambda o: llm.require_matching_ids(
+            produced=[a.id for a in o.assignments],
+            expected=[s.id for s in specs],
+            step="object_bbox_batch",
+        ),
+    )
+    # LLM emits each object's bbox in that object's parent's local frame.
+    # Convert to world coordinates per-object. Handle intra-batch parents
+    # (spec B parents to spec A in same batch) via topological resolution.
+    spec_parent = {s.id: s.parent for s in specs}
+    assignments_by_id = {a.id: a.bbox for a in out.assignments}
+    bboxes: dict[str, BoundingBox] = {}
+    remaining = set(assignments_by_id.keys())
+    while remaining:
+        progress = False
+        for obj_id in list(remaining):
+            parent_id = spec_parent.get(obj_id, zone.id)
+            if parent_id in bboxes:
+                parent_bbox = bboxes[parent_id]
+            elif parent_id in bbox_by_id:
+                parent_bbox = bbox_by_id[parent_id]
+            elif parent_id in remaining:
+                continue
+            else:
+                parent_bbox = zone.bbox
+            bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
+            remaining.discard(obj_id)
+            progress = True
+        if not progress:
+            for obj_id in list(remaining):
+                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
+            remaining.clear()
+    for sid, b in committed_bboxes.items():
+        if b is not None:
+            bboxes[sid] = b
+    return bboxes
+
+
 async def _resolve_and_generate(
     *,
     specs: list[Any],
@@ -456,9 +697,6 @@ async def _resolve_and_generate(
     runs_dir: Path,
     run_id: str,
 ) -> list[Node]:
-    if scenario == "encapsulating":
-        specs = [s.model_copy(update={"parent": zone.id}) for s in specs]
-
     # Run-wide dedup. The LLM occasionally emits the same id twice in one
     # decomposition (e.g. duplicate floor slabs in encapsulating mode), and
     # later recursion levels can re-surface an id already in flight. Drop
@@ -494,65 +732,32 @@ async def _resolve_and_generate(
     admitted.update(seen_in_call)
     specs = deduped
 
-    # Resume: objects already placed (a committed `bbox` event) keep their
-    # exact world position. Skip the LLM when every object is committed;
-    # otherwise resolve the batch and overwrite the committed ones so only
-    # never-placed objects take a fresh assignment.
-    committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
-    if all(b is not None for b in committed_bboxes.values()):
-        bboxes: dict[str, BoundingBox] = {
-            sid: b for sid, b in committed_bboxes.items() if b is not None
-        }
-    else:
-        bbox_by_id = {n.id: n.bbox for n in all_nodes}
-        p = prompt_runtime.current()
-        out = await llm.call_llm(
-            system=p.SYSTEM_OBJECT_BBOX_BATCH,
-            user=p.render_object_bbox_batch(
-                zone_id=zone.id,
-                zone_prompt=zone.prompt,
-                zone_plan=zone.plan,
-                zone_bbox=zone.bbox,
-                objects=specs,
-                nodes=all_nodes,
-            ),
-            output_schema=p.BboxBatchOutput,
-            node_id=zone.id,
-            step="object_bbox_batch",
+    # Resolve every object's world-frame bbox in one batch LLM call (honoring
+    # committed bboxes for resume). The anchor completion loop calls this with
+    # the objects it proposed that round — one for V2, a list for V3/V4.
+    bboxes = await _resolve_object_bboxes_batch(
+        specs=specs,
+        zone=zone,
+        all_nodes=all_nodes,
+    )
+
+    # Emit EVERY resolved bbox upfront — before the per-object image-prompt /
+    # library-match calls below — so the whole sibling set appears at once right
+    # after the batch step (matching how the divider emits child bboxes). Without
+    # this the boxes dribble out one at a time, paused behind each per-object
+    # call in the step-through. emit_bbox dedups, so the reuse paths below are
+    # unaffected.
+    _bbox_kind = "frame" if scenario == "encapsulating" else "object"
+    for spec in specs:
+        logging.emit_bbox(
+            spec.id,
+            bboxes[spec.id],
+            parent_id=spec.parent,
+            prompt=spec.prompt,
+            kind=_bbox_kind,
+            proxy_shape=spec.proxy_shape,
+            orientation=spec.orientation,
         )
-        # LLM emits each object's bbox in that object's parent's local
-        # frame. Convert to world coordinates per-object. Handle
-        # intra-batch parents (spec B parents to spec A in same batch) via
-        # topological resolution order.
-        spec_parent = {s.id: s.parent for s in specs}
-        assignments_by_id = {a.id: a.bbox for a in out.assignments}
-        bboxes = {}
-        # Resolve in passes: each pass converts objects whose parent bbox
-        # is already known. Terminates when all are resolved or no progress
-        # (cycle — fall back to zone frame).
-        remaining = set(assignments_by_id.keys())
-        while remaining:
-            progress = False
-            for obj_id in list(remaining):
-                parent_id = spec_parent.get(obj_id, zone.id)
-                if parent_id in bboxes:
-                    parent_bbox = bboxes[parent_id]
-                elif parent_id in bbox_by_id:
-                    parent_bbox = bbox_by_id[parent_id]
-                elif parent_id in remaining:
-                    continue
-                else:
-                    parent_bbox = zone.bbox
-                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
-                remaining.discard(obj_id)
-                progress = True
-            if not progress:
-                for obj_id in list(remaining):
-                    bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
-                remaining.clear()
-        for sid, b in committed_bboxes.items():
-            if b is not None:
-                bboxes[sid] = b
 
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(
@@ -561,6 +766,7 @@ async def _resolve_and_generate(
             scenario=scenario,
             runs_dir=runs_dir,
             run_id=run_id,
+            zone_id=zone.id,
         )
 
     # Every object (anchor, completion, encapsulating alike) goes through
@@ -577,14 +783,13 @@ async def _resolve_and_generate(
     for spec in specs:
         bbox = bboxes[spec.id]
         parent_id = spec.parent
-        logging.emit_bbox(
-            spec.id,
-            bbox,
-            parent_id=parent_id,
+        # bbox already emitted upfront above.
+        prior_subjects = committed_subjects + [r.prompt for r in resolved]
+        encapsulating = scenario == "encapsulating"
+        cut_plane = await symmetry.resolve_cut_plane(
             prompt=spec.prompt,
-            kind="frame" if scenario == "encapsulating" else "object",
-            proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
+            node_id=spec.id,
+            encapsulating=encapsulating,
         )
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
         encapsulating = scenario == "encapsulating"
@@ -617,6 +822,7 @@ async def _resolve_and_generate(
                 parent_id=parent_id,
                 parent_kind=spec.parent_kind,
                 symmetry_cut_plane=cut_plane,
+                parent_region=zone.id,
             )
         )
 
@@ -635,6 +841,7 @@ async def _match_library_assets(
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     runs_dir: Path,
     run_id: str,
+    zone_id: str,
 ) -> list[Node]:
     from app.services import library
 
@@ -659,21 +866,13 @@ async def _match_library_assets(
                     referenced_ids=list(spec.referenced_ids),
                     parent_id=spec.parent,
                     parent_kind=spec.parent_kind,
+                    parent_region=zone_id,
                     mesh_url=url,
                 )
             )
             continue
 
-        logging.emit_bbox(
-            spec.id,
-            bbox,
-            parent_id=spec.parent,
-            prompt=spec.prompt,
-            kind="frame" if scenario == "encapsulating" else "object",
-            proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
-        )
-
+        # bbox already emitted upfront in _resolve_and_generate.
         match = await library.match(spec.prompt)
         asset = library.asset_path(match.library_id)
 
@@ -742,6 +941,7 @@ async def _match_library_assets(
                 referenced_ids=list(spec.referenced_ids),
                 parent_id=spec.parent,
                 parent_kind=spec.parent_kind,
+                parent_region=zone_id,
                 mesh_url=url,
             )
         )
@@ -1479,6 +1679,7 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
+    batch_next_object: bool = False,
 ) -> None:
     specs = await _decompose_objects_validated(
         zone=zone,
@@ -1525,27 +1726,62 @@ async def run(
     if committed.next_done(zone.id):
         return
 
+    # The completion loop normally terminates on the model's `done`, but the
+    # model can also get stuck re-proposing objects that can never be admitted
+    # — e.g. one whose bbox the batch step omitted, so it was admitted into
+    # `_admitted_ids` but never placed into `all_nodes`, and so never shows up
+    # as already-present in the next_object context. _resolve_and_generate
+    # dedups that repeat to nothing (`generation.dedup_drop`), so without a
+    # progress guard the loop spins forever re-billing next_object. Track the
+    # ids attempted this loop; a round that proposes only already-attempted ids
+    # means no progress is possible — stop.
+    #
+    # V3/V4 propose a LIST of objects per round (`batch_next_object`); V2
+    # proposes one. Both feed the same frontier loop — V2 just yields a
+    # length-1 batch. Each accepted object is committed as its own
+    # `generation.next` event so resume replays them one at a time regardless
+    # of how they were proposed.
+    attempted: set[str] = set()
     while True:
-        decision = await _next_object_validated(
-            zone=zone,
-            all_nodes=all_nodes,
-        )
-        if decision.done or decision.object is None:
+        if batch_next_object:
+            done, objects = await _next_object_batch_validated(
+                zone=zone,
+                all_nodes=all_nodes,
+            )
+        else:
+            decision = await _next_object_validated(
+                zone=zone,
+                all_nodes=all_nodes,
+            )
+            done = decision.done or decision.object is None
+            objects = [] if done else [decision.object]
+        if done or not objects:
             logging.log_once(
                 "generation.next.done",
                 match_fields=("zone",),
                 zone=zone.id,
             )
             return
-        logging.log_once(
-            "generation.next",
-            match_fields=("zone", "id"),
-            zone=zone.id,
-            id=decision.object.id,
-            object=decision.object.model_dump(mode="json"),
-        )
+        fresh = [o for o in objects if o.id not in attempted]
+        if not fresh:
+            logging.log_once(
+                "generation.next.stuck",
+                match_fields=("zone",),
+                zone=zone.id,
+                id=objects[0].id,
+            )
+            return
+        for o in fresh:
+            attempted.add(o.id)
+            logging.log_once(
+                "generation.next",
+                match_fields=("zone", "id"),
+                zone=zone.id,
+                id=o.id,
+                object=o.model_dump(mode="json"),
+            )
         new_nodes = await _resolve_and_generate(
-            specs=[decision.object],
+            specs=fresh,
             zone=zone,
             all_nodes=all_nodes,
             scenario="anchor",

@@ -130,10 +130,16 @@ class BoundingBox(BaseModel):
 
 class ProxyShape(StrEnum):
     """Optional collision-proxy primitive describing the mesh's silhouette
-    inside its AABB. `None` on a Node means the AABB itself is the proxy
-    (a rectangular prism). The proxy is always inscribed axis-aligned in
-    the AABB; its parameters are derived from the AABB's dimensions."""
+    inside its AABB. `BOX` is the explicit, model-selectable spelling of the
+    rectangular-prism default and is canonicalized to `None` at decomposition
+    time (see `ChildNodeSpec._box_means_none`), so a realized Node only ever
+    carries `None`, `SPHERE`, `CAPSULE`, or `HEMISPHERE` — `None` and `BOX`
+    both mean "the AABB itself is the proxy". The proxy is always inscribed
+    axis-aligned in the AABB; its parameters are derived from the AABB's
+    dimensions. `BOX` is listed first so a model that defaults to the first
+    enum value lands on the rectilinear default rather than a curved proxy."""
 
+    BOX = "BOX"
     SPHERE = "SPHERE"
     CAPSULE = "CAPSULE"
     HEMISPHERE = "HEMISPHERE"
@@ -243,6 +249,15 @@ class Node(BaseModel):
     # mount), or IN (containment). None only for the root, which has no
     # parent.
     parent_kind: ParentRelationshipKind | None = None
+    # The region that owns this node for scene-context grouping: the zone whose
+    # generation pass emitted this object. Unlike `parent_id` (the structural
+    # anchor — what the node rests on / attaches to, which may sit in another
+    # region), this always names the region the object belongs to, so context
+    # renderers can group it under its zone instead of walking `parent_id` up to
+    # whatever it structurally rests on. Set on concrete objects/frames by V3/V4
+    # generation; None for zones (grouped by `parent_id`) and the root. V1/V2
+    # ignore it.
+    parent_region: str | None = None
     plan: str | None = None
     # True for subzone/region nodes, set at divider decomposition time; False
     # for concrete objects/frames. A zone is flagged the moment it is placed —

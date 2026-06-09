@@ -794,9 +794,132 @@
 				background: #2a2d35;
 				color: #5a5e68;
 			}
-			#status {
+			/* Per-run LLM spend tracker — collapsible pill in the top-right
+			   run-status column. The pill sits at top:12; #status is nudged
+			   down to 52 so the two stack without overlap. */
+			#cost-tracker {
+				position: fixed;
+				top: 12px;
+				right: 344px;
+				width: 320px;
+				max-width: calc(100vw - 356px);
+				box-sizing: border-box;
+				z-index: 8;
+				font-size: 11px;
+				line-height: 1.4;
+			}
+			#cost-pill {
+				display: flex;
+				align-items: center;
+				gap: 8px;
 				width: 100%;
-				max-width: 560px;
+				padding: 6px 10px;
+				border: 1px solid rgba(255, 255, 255, 0.06);
+				border-radius: 6px;
+				background: rgba(22, 24, 29, 0.82);
+				backdrop-filter: blur(6px);
+				color: #e6e6e6;
+				font: inherit;
+				cursor: pointer;
+				box-sizing: border-box;
+				text-align: left;
+			}
+			#cost-pill:hover { background: rgba(34, 37, 44, 0.92); }
+			#cost-pill .cost-caret { color: #7a8190; width: 9px; }
+			#cost-tracker.collapsed #cost-pill .cost-caret::before { content: "\25B8"; }
+			#cost-tracker:not(.collapsed) #cost-pill .cost-caret::before { content: "\25BE"; }
+			#cost-pill .cost-pill-label {
+				color: #7a8190;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				font-size: 10px;
+			}
+			#cost-pill .cost-pill-summary {
+				margin-left: auto;
+				color: #9ad4ff;
+				font-variant-numeric: tabular-nums;
+			}
+			#cost-dropdown {
+				margin-top: 6px;
+				padding: 8px 10px;
+				border-radius: 6px;
+				background: rgba(22, 24, 29, 0.94);
+				backdrop-filter: blur(6px);
+				max-height: 62vh;
+				overflow: auto;
+				box-sizing: border-box;
+			}
+			#cost-tracker.collapsed #cost-dropdown { display: none; }
+			.cost-section { margin-bottom: 8px; }
+			.cost-section:last-child { margin-bottom: 0; }
+			.cost-section-head {
+				display: flex;
+				align-items: baseline;
+				gap: 6px;
+				color: #cdd3dd;
+				margin-bottom: 3px;
+			}
+			.cost-section-head .cost-sec-name { font-weight: 600; }
+			.cost-section-head .cost-sec-model {
+				color: #7a8190;
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.03em;
+			}
+			.cost-section-head .cost-sec-sum {
+				margin-left: auto;
+				color: #9ad4ff;
+				font-variant-numeric: tabular-nums;
+			}
+			.cost-row {
+				display: flex;
+				align-items: baseline;
+				gap: 6px;
+				padding: 1px 0 1px 10px;
+			}
+			.cost-row .cost-step { color: #9aa3b2; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+			.cost-row .cost-count {
+				margin-left: auto;
+				color: #7a8190;
+				font-variant-numeric: tabular-nums;
+				min-width: 30px;
+				text-align: right;
+			}
+			.cost-row .cost-amt {
+				color: #cdd3dd;
+				font-variant-numeric: tabular-nums;
+				min-width: 66px;
+				text-align: right;
+			}
+			.cost-divider { height: 1px; background: rgba(255, 255, 255, 0.08); margin: 6px 0; }
+			.cost-total {
+				display: flex;
+				align-items: baseline;
+				gap: 6px;
+				color: #e6e6e6;
+				font-weight: 600;
+			}
+			.cost-total .cost-count {
+				margin-left: auto;
+				color: #b8c0cc;
+				font-variant-numeric: tabular-nums;
+				min-width: 30px;
+				text-align: right;
+			}
+			.cost-total .cost-amt {
+				color: #9ad4ff;
+				font-variant-numeric: tabular-nums;
+				min-width: 66px;
+				text-align: right;
+			}
+			.cost-est-note { color: #7a8190; font-size: 10px; margin-top: 6px; }
+			.cost-empty { color: #7a8190; padding: 2px 0; }
+			#status {
+				position: fixed;
+				top: 52px;
+				right: 344px;
+				width: 320px;
+				max-width: calc(100vw - 356px);
 				padding: 10px 12px;
 				border-radius: 6px;
 				background: rgba(22, 24, 29, 0.78);
@@ -805,6 +928,7 @@
 				line-height: 1.4;
 				pointer-events: none;
 				box-sizing: border-box;
+				z-index: 6;
 			}
 			#status .line {
 				margin: 0;
@@ -1110,6 +1234,10 @@
 			}
 			#tree {
 				position: fixed;
+				/* top + max-height are managed at runtime (see layoutTree in
+				   viewer.js): the tree is pinned just below the topbar's live
+				   bottom edge so the controls panel can never overlap it. These
+				   values are only the pre-JS fallback. */
 				top: 248px;
 				left: 12px;
 				width: 360px;
@@ -1121,7 +1249,10 @@
 				backdrop-filter: blur(6px);
 				font-size: 11px;
 				line-height: 1.4;
-				z-index: 5;
+				/* Defense-in-depth for the pre-layout frame and the flow canvas:
+				   keep the tree (z-index 20) above #topbar (z-index 10) so its
+				   flow-graph + observability launch buttons stay clickable. */
+				z-index: 20;
 			}
 			#tree.collapsed #tree-body {
 				display: none;
@@ -2780,6 +2911,659 @@
 				border-color: #4a8fd8;
 				color: #e6e6e6;
 			}
+			/* tree-header flow-graph launcher (mirrors #tree-expand) */
+			#tree-flow {
+				width: 22px;
+				height: 18px;
+				padding: 0;
+				margin: 0 0 0 4px;
+				border-radius: 3px;
+				border: 1px solid #2a2d35;
+				background: #16181d;
+				color: #9ad4ff;
+				font: inherit;
+				line-height: 1;
+				cursor: pointer;
+				display: inline-flex;
+				align-items: center;
+				justify-content: center;
+			}
+			#tree-flow:hover {
+				border-color: #4a8fd8;
+				color: #c8d8f0;
+			}
+			#tree.collapsed #tree-flow { display: none; }
+			/* --- execution-flow graph modal --- */
+			#flow-modal {
+				position: fixed;
+				inset: 0;
+				background: rgba(8, 9, 12, 0.9);
+				backdrop-filter: blur(6px);
+				z-index: 1090;
+				display: none;
+			}
+			#flow-modal.open { display: flex; }
+			#flow-panel {
+				margin: 2.5vh auto;
+				width: 96vw;
+				height: 95vh;
+				display: flex;
+				flex-direction: column;
+				background: #121419;
+				border: 1px solid #2a2d35;
+				border-radius: 8px;
+				overflow: hidden;
+				color: #e6e6e6;
+			}
+			#flow-panel > header {
+				display: flex;
+				align-items: center;
+				gap: 14px;
+				padding: 9px 14px;
+				background: #1c1e24;
+				border-bottom: 1px solid #2a2d35;
+				flex-shrink: 0;
+			}
+			#flow-panel > header h2 {
+				margin: 0;
+				font-size: 13px;
+				font-weight: 600;
+				color: #9ad4ff;
+				flex-shrink: 0;
+			}
+			#flow-legend {
+				display: flex;
+				gap: 12px;
+				font-size: 10px;
+				color: #8a8f99;
+			}
+			.flow-legend-item {
+				display: inline-flex;
+				align-items: center;
+				gap: 5px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+			}
+			.flow-sw {
+				width: 9px;
+				height: 9px;
+				border-radius: 2px;
+				display: inline-block;
+			}
+			.flow-sw.zone { background: #e0c271; }
+			.flow-sw.object { background: #c586d1; }
+			.flow-sw.frame { background: #7fb3d5; }
+			.flow-sw.step { background: #6a7080; }
+			#flow-controls {
+				margin-left: auto;
+				display: flex;
+				align-items: center;
+				gap: 6px;
+			}
+			#flow-search {
+				width: 220px;
+				padding: 4px 8px;
+				background: #0c0d10;
+				border: 1px solid #2a2d35;
+				border-radius: 3px;
+				color: #e6e6e6;
+				font: inherit;
+				font-size: 11px;
+			}
+			#flow-search:focus { outline: none; border-color: #4a8fd8; }
+			#flow-controls button {
+				min-width: 28px;
+				height: 26px;
+				padding: 0 8px;
+				border-radius: 4px;
+				border: 1px solid #2a2d35;
+				background: #16181d;
+				color: #b8bcc4;
+				font: inherit;
+				font-size: 13px;
+				line-height: 1;
+				cursor: pointer;
+			}
+			#flow-controls button:hover { border-color: #4a8fd8; color: #e6e6e6; }
+			#flow-close { font-size: 18px !important; }
+			#flow-viewport {
+				position: relative;
+				flex: 1;
+				overflow: hidden;
+				cursor: grab;
+				background-color: #0c0d10;
+				background-image: radial-gradient(circle, #20242c 1px, transparent 1px);
+				background-size: 24px 24px;
+				background-position: 0 0;
+			}
+			#flow-viewport.grabbing { cursor: grabbing; }
+			#flow-stage {
+				position: absolute;
+				top: 0;
+				left: 0;
+				transform-origin: 0 0;
+				will-change: transform;
+			}
+			#flow-edges {
+				position: absolute;
+				top: 0;
+				left: 0;
+				overflow: visible;
+				pointer-events: none;
+			}
+			.flow-edge {
+				fill: none;
+				stroke: #39404d;
+				stroke-width: 1.5;
+			}
+			.flow-edge.to-object { stroke: #5c4668; }
+			.flow-edge.to-frame { stroke: #2f4a5e; }
+			#flow-nodes { position: absolute; top: 0; left: 0; }
+			.flow-node {
+				position: absolute;
+				box-sizing: border-box;
+				background: #16181d;
+				border: 1px solid #2a2d35;
+				border-left-width: 3px;
+				border-radius: 5px;
+				padding: 5px 8px 6px;
+				cursor: pointer;
+				user-select: none;
+				overflow: hidden;
+			}
+			.flow-node:hover { border-color: #4a8fd8; }
+			.flow-node.zone { border-left-color: #e0c271; }
+			.flow-node.object { border-left-color: #c586d1; }
+			.flow-node.frame { border-left-color: #7fb3d5; }
+			.flow-node.active {
+				box-shadow: 0 0 0 1px #4a8fd8, 0 0 14px rgba(74, 143, 216, 0.4);
+				border-color: #4a8fd8;
+			}
+			.flow-node.selected {
+				box-shadow: 0 0 0 1px #4af0e0;
+				border-color: #4af0e0;
+			}
+			.flow-node.dimmed { opacity: 0.28; }
+			.flow-node.hit { box-shadow: 0 0 0 1px #e0c271; }
+			.flow-node-head {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+			}
+			.flow-dot {
+				width: 7px;
+				height: 7px;
+				border-radius: 50%;
+				flex-shrink: 0;
+				background: #5a5e68;
+			}
+			.flow-dot.phase-planning { background: #9ad4ff; }
+			.flow-dot.phase-decomposing { background: #e0c271; }
+			.flow-dot.phase-resolving_bbox,
+			.flow-dot.phase-resolving_bboxes { background: #f6a96a; }
+			.flow-dot.phase-building_children { background: #f6a96a; }
+			.flow-dot.phase-generating_frame { background: #c586d1; }
+			.flow-dot.phase-generating_anchor { background: #8bd17c; }
+			.flow-dot.phase-generating_mesh { background: #6ac2c2; }
+			.flow-dot.phase-generating_negative_space { background: #9ad4ff; }
+			.flow-dot.phase-done { background: #5a8a55; }
+			.flow-dot.phase-error { background: #ff8080; }
+			.flow-node-id {
+				font-weight: 600;
+				font-size: 11px;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				flex: 1;
+				min-width: 0;
+			}
+			.flow-node.zone .flow-node-id { color: #e0c271; }
+			.flow-node.object .flow-node-id { color: #c586d1; }
+			.flow-node.frame .flow-node-id { color: #7fb3d5; }
+			.flow-seq {
+				flex-shrink: 0;
+				font-size: 9px;
+				font-variant-numeric: tabular-nums;
+				color: #6a7080;
+				background: #0c0d10;
+				border: 1px solid #232631;
+				border-radius: 8px;
+				padding: 0 5px;
+				line-height: 14px;
+			}
+			.flow-node-prompt {
+				margin-top: 2px;
+				font-size: 10px;
+				color: #9aa0ab;
+				line-height: 1.3;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+			}
+			/* step nodes — one card per LLM call, visually distinct from scene cards */
+			.flow-node.flow-step {
+				background: #131519;
+				border-color: #242833;
+				padding: 5px 8px;
+			}
+			.flow-node.flow-step.cached { border-style: dashed; }
+			.flow-step-head {
+				display: flex;
+				align-items: baseline;
+				gap: 6px;
+			}
+			.flow-step-name {
+				font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+				font-size: 11px;
+				font-weight: 600;
+				color: #b8bcc4;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				flex: 1;
+				min-width: 0;
+			}
+			.flow-step-gen {
+				flex-shrink: 0;
+				font-size: 9px;
+				color: #8bd17c;
+				background: #14201a;
+				border: 1px solid #2a4a2a;
+				border-radius: 8px;
+				padding: 0 5px;
+				line-height: 14px;
+			}
+			.flow-step-cached {
+				flex-shrink: 0;
+				font-size: 8.5px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				color: #c0a070;
+				border: 1px solid #4a3a20;
+				background: #1f1a12;
+				border-radius: 2px;
+				padding: 0 4px;
+				line-height: 13px;
+			}
+			.flow-step-sub {
+				margin-top: 2px;
+				font-size: 9.5px;
+				color: #6a7080;
+				font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+			}
+			/* step-node left border + name tint per step (mirrors the obs "via" palette) */
+			.flow-step.s-zone_plan { border-left-color: #9ad4ff; }
+			.flow-step.s-zone_plan .flow-step-name { color: #9ad4ff; }
+			.flow-step.s-overall_bbox { border-left-color: #6ac2c2; }
+			.flow-step.s-overall_bbox .flow-step-name { color: #6ac2c2; }
+			.flow-step.s-zone_decompose { border-left-color: #e0c271; }
+			.flow-step.s-zone_decompose .flow-step-name { color: #e0c271; }
+			.flow-step.s-child_bbox_single,
+			.flow-step.s-child_bbox_batch { border-left-color: #f6a96a; }
+			.flow-step.s-child_bbox_single .flow-step-name,
+			.flow-step.s-child_bbox_batch .flow-step-name { color: #f6a96a; }
+			.flow-step.s-anchor_decompose { border-left-color: #8bd17c; }
+			.flow-step.s-anchor_decompose .flow-step-name { color: #8bd17c; }
+			.flow-step.s-encapsulating_decompose { border-left-color: #7fb3d5; }
+			.flow-step.s-encapsulating_decompose .flow-step-name { color: #7fb3d5; }
+			.flow-step.s-negative_space_decompose { border-left-color: #9ad4ff; }
+			.flow-step.s-negative_space_decompose .flow-step-name { color: #9ad4ff; }
+			.flow-step.s-object_bbox_single,
+			.flow-step.s-object_bbox_batch { border-left-color: #f6a96a; }
+			.flow-step.s-object_bbox_single .flow-step-name,
+			.flow-step.s-object_bbox_batch .flow-step-name { color: #f6a96a; }
+			.flow-step.s-next_object { border-left-color: #d1a386; }
+			.flow-step.s-next_object .flow-step-name { color: #d1a386; }
+			.flow-step.s-image_prompt { border-left-color: #c586d1; }
+			.flow-step.s-image_prompt .flow-step-name { color: #c586d1; }
+			.flow-edge.to-step { stroke: #313845; stroke-dasharray: 3 3; }
+			/* keep the sidebar tree usable, floating above the flow canvas */
+			body.flow-open #tree { z-index: 1095; }
+			/* brief flash when a step-node click lands on its call in the obs modal */
+			.tm-llm-call.tm-llm-flash {
+				outline: 1px solid #4a8fd8;
+				box-shadow: 0 0 0 2px rgba(74, 143, 216, 0.25);
+			}
+			#flow-empty {
+				position: absolute;
+				inset: 0;
+				display: none;
+				align-items: center;
+				justify-content: center;
+				color: #5a5e68;
+				font-style: italic;
+				font-size: 12px;
+				pointer-events: none;
+			}
+			#flow-empty.show { display: flex; }
+			#flow-hint {
+				position: absolute;
+				left: 12px;
+				bottom: 10px;
+				padding: 4px 9px;
+				border-radius: 5px;
+				background: rgba(12, 13, 16, 0.78);
+				border: 1px solid #232631;
+				color: #6a7080;
+				font-size: 10px;
+				pointer-events: none;
+			}
+			/* --- flow step-node "rewind & tune here" affordance --- */
+			.flow-step-tune {
+				margin-left: auto;
+				flex-shrink: 0;
+				padding: 1px 6px;
+				border-radius: 3px;
+				border: 1px solid #3a3f4b;
+				background: #1b1d23;
+				color: #cdb4e6;
+				font: inherit;
+				font-size: 9px;
+				line-height: 1.5;
+				cursor: pointer;
+				white-space: nowrap;
+			}
+			.flow-step-tune:hover { border-color: #b07fd8; color: #e9d8f7; }
+			/* flow-modal pause button turns amber while the viewed run is live */
+			#flow-pause.is-running { border-color: #e0a050; color: #f0c070; }
+			#flow-pause:disabled { opacity: 0.4; cursor: default; }
+			/* --- prompt-tuning sandbox panel --- */
+			#sandbox-panel {
+				position: fixed;
+				left: 50%;
+				bottom: 14px;
+				transform: translateX(-50%);
+				width: min(780px, calc(100vw - 24px));
+				max-height: 66vh;
+				display: none;
+				flex-direction: column;
+				background: rgba(18, 20, 25, 0.97);
+				border: 1px solid #4a3a5e;
+				border-radius: 8px;
+				box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+				color: #e6e6e6;
+				z-index: 60;
+				overflow: hidden;
+			}
+			#sandbox-panel.open { display: flex; }
+			#sandbox-head {
+				display: flex;
+				align-items: center;
+				gap: 10px;
+				padding: 8px 12px;
+				background: #1f1828;
+				border-bottom: 1px solid #4a3a5e;
+				flex-shrink: 0;
+			}
+			#sandbox-head h2 {
+				margin: 0;
+				font-size: 12px;
+				font-weight: 600;
+				color: #cdb4e6;
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+				flex-shrink: 0;
+			}
+			#sandbox-step-pill {
+				padding: 2px 8px;
+				border-radius: 10px;
+				background: #2a2233;
+				border: 1px solid #4a3a5e;
+				color: #d9c7ec;
+				font-size: 11px;
+				font-weight: 600;
+				white-space: nowrap;
+			}
+			#sandbox-step-meta {
+				color: #8a8f99;
+				font-size: 11px;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				flex: 1;
+			}
+			#sandbox-step-meta b { color: #b8bcc4; font-weight: 600; }
+			#sandbox-pos {
+				color: #7a8190;
+				font-size: 11px;
+				flex-shrink: 0;
+			}
+			#sandbox-expand {
+				background: none;
+				border: 1px solid #3a3f4b;
+				border-radius: 3px;
+				color: #9aa0aa;
+				font-size: 12px;
+				line-height: 1;
+				cursor: pointer;
+				padding: 3px 6px;
+				flex-shrink: 0;
+			}
+			#sandbox-expand:hover { color: #e6e6e6; border-color: #b07fd8; }
+			#sandbox-close {
+				background: none;
+				border: none;
+				color: #8a8f99;
+				font-size: 18px;
+				line-height: 1;
+				cursor: pointer;
+				padding: 0 2px;
+				flex-shrink: 0;
+			}
+			#sandbox-close:hover { color: #e6e6e6; }
+			#sandbox-body {
+				padding: 10px 12px;
+				overflow: auto;
+				display: flex;
+				flex-direction: column;
+				gap: 8px;
+			}
+			#sandbox-note {
+				color: #7a8190;
+				font-size: 10.5px;
+				line-height: 1.4;
+			}
+			#sandbox-note b { color: #cdb4e6; font-weight: 600; }
+			.sandbox-field { display: flex; flex-direction: column; gap: 3px; }
+			.sandbox-field > label {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				color: #7a8190;
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+			}
+			.sandbox-field .sandbox-edited {
+				color: #e0a050;
+				font-size: 9px;
+				text-transform: none;
+				letter-spacing: 0;
+				display: none;
+			}
+			.sandbox-field.edited .sandbox-edited { display: inline; }
+			.sandbox-field textarea {
+				width: 100%;
+				box-sizing: border-box;
+				background: #0c0d10;
+				border: 1px solid #2a2d35;
+				border-radius: 4px;
+				color: #d6dae2;
+				font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+				line-height: 1.45;
+				padding: 6px 8px;
+				resize: vertical;
+			}
+			.sandbox-field textarea:focus { outline: none; border-color: #b07fd8; }
+			#sandbox-system { height: 96px; min-height: 40px; }
+			#sandbox-user { height: 150px; min-height: 60px; }
+			#sandbox-output-wrap { display: none; flex-direction: column; gap: 3px; }
+			#sandbox-output-wrap.show { display: flex; }
+			#sandbox-output-label {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				color: #7a8190;
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+			}
+			#sandbox-render-note {
+				color: #8bd17c;
+				font-size: 9.5px;
+				text-transform: none;
+				letter-spacing: 0;
+			}
+			#sandbox-render-note.nothing { color: #7a8190; }
+			#sandbox-copy {
+				margin-left: auto;
+				flex-shrink: 0;
+				padding: 2px 8px;
+				border-radius: 3px;
+				border: 1px solid #2a2d35;
+				background: #16181d;
+				color: #b8bcc4;
+				font: inherit;
+				font-size: 10px;
+				text-transform: none;
+				letter-spacing: 0;
+				cursor: pointer;
+			}
+			#sandbox-copy:hover { border-color: #4a8fd8; color: #e6e6e6; }
+			#sandbox-output {
+				margin: 0;
+				background: #0c0d10;
+				border: 1px solid #2a2d35;
+				border-radius: 4px;
+				color: #c6d0c0;
+				font: 10.5px ui-monospace, SFMono-Regular, Menlo, monospace;
+				line-height: 1.45;
+				padding: 6px 8px;
+				max-height: 180px;
+				overflow: auto;
+				white-space: pre-wrap;
+				word-break: break-word;
+			}
+			#sandbox-reasoning { color: #8a8f99; font-size: 10.5px; }
+			#sandbox-reasoning summary { cursor: pointer; color: #7a8190; }
+			#sandbox-reasoning pre {
+				margin: 4px 0 0;
+				white-space: pre-wrap;
+				word-break: break-word;
+				color: #9aa0aa;
+				max-height: 160px;
+				overflow: auto;
+			}
+			#sandbox-foot {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 8px 12px;
+				background: #15171c;
+				border-top: 1px solid #2a2d35;
+				flex-shrink: 0;
+				flex-wrap: wrap;
+			}
+			#sandbox-foot button {
+				padding: 5px 11px;
+				border-radius: 4px;
+				border: 1px solid #2a2d35;
+				background: #16181d;
+				color: #b8bcc4;
+				font: inherit;
+				font-size: 11px;
+				cursor: pointer;
+				white-space: nowrap;
+			}
+			#sandbox-foot button:hover:not(:disabled) { border-color: #4a8fd8; color: #e6e6e6; }
+			#sandbox-foot button:disabled { opacity: 0.4; cursor: default; }
+			#sandbox-test {
+				background: #3a2a52;
+				border-color: #6a4a8e;
+				color: #ead9f7;
+				font-weight: 600;
+			}
+			#sandbox-test:hover:not(:disabled) { background: #4a3568; border-color: #b07fd8; }
+			#sandbox-test.busy { opacity: 0.7; cursor: wait; }
+			#sandbox-simulate, #sandbox-runstep {
+				background: #1f3a2a;
+				border-color: #3a6a4e !important;
+				color: #c0f0d0 !important;
+				font-weight: 600;
+			}
+			#sandbox-simulate:hover:not(:disabled),
+			#sandbox-runstep:hover:not(:disabled) { background: #2a5038; border-color: #5ac080 !important; color: #d6f7e0 !important; }
+			/* Re-run is destructive (invalidates every later step) — amber accent. */
+			#sandbox-rerun {
+				background: #3a2f1a;
+				border-color: #7a5a2e !important;
+				color: #f0d8a8 !important;
+				font-weight: 600;
+			}
+			#sandbox-rerun:hover:not(:disabled) { background: #50421f; border-color: #c0902e !important; color: #f7e6c0 !important; }
+			/* Branch (downstream step-through) mode: green accent; prompts stay
+			   editable so each downstream step's re-rendered prompt can be tuned. */
+			#sandbox-panel.branch-mode { border-color: #3a6a4e; }
+			#sandbox-panel.branch-mode #sandbox-head { background: #16281d; border-bottom-color: #3a6a4e; }
+			#sandbox-panel.branch-mode h2 { color: #8bd17c; }
+			#sandbox-panel.branch-mode #sandbox-step-pill { background: #1f3a2a; border-color: #3a6a4e; color: #c0f0d0; }
+			#sandbox-foot .sandbox-spacer { flex: 1; }
+			#sandbox-breakout {
+				border-color: #6a3a3a !important;
+				color: #e09a9a !important;
+			}
+			#sandbox-breakout:hover { background: #3a2020; border-color: #c05050 !important; color: #f0c0c0 !important; }
+			#sandbox-status {
+				color: #8a8f99;
+				font-size: 10.5px;
+				flex-basis: 100%;
+				min-height: 13px;
+			}
+			#sandbox-status.err { color: #ff8080; }
+			#sandbox-status.ok { color: #8bd17c; }
+			/* Expanded panel: grow to near-fullscreen and let the system / user /
+			   output sections each flex to fill the height (scrolling inside)
+			   so long prompts and outputs are readable at a glance. */
+			#sandbox-panel.expanded {
+				top: 2.5vh;
+				bottom: auto;
+				width: 92vw;
+				height: 95vh;
+				max-height: 95vh;
+			}
+			#sandbox-panel.expanded #sandbox-body { flex: 1 1 auto; min-height: 0; }
+			#sandbox-panel.expanded .sandbox-field { flex: 1 1 0; min-height: 90px; }
+			#sandbox-panel.expanded .sandbox-field textarea {
+				flex: 1 1 auto;
+				height: auto;
+				min-height: 0;
+			}
+			#sandbox-panel.expanded #sandbox-output-wrap.show { flex: 1 1 0; min-height: 90px; }
+			#sandbox-panel.expanded #sandbox-output {
+				flex: 1 1 auto;
+				max-height: none;
+				min-height: 0;
+			}
+			/* While tuning, the sandbox owns the session: dim + disable every
+			   other control surface so a stray click on log-rewind, replay,
+			   resume/retry, reset, or a run/slot/model switch can't fight the
+			   frozen state. The 3D canvas and the sandbox panel stay live. */
+			body.sandbox-open #run-tabs-bar,
+			body.sandbox-open #slot-bar,
+			body.sandbox-open #controls-bar,
+			body.sandbox-open #tree,
+			body.sandbox-open #log,
+			body.sandbox-open #assets,
+			body.sandbox-open #trellis-queue,
+			body.sandbox-open #cost-tracker,
+			body.sandbox-open #zoom-controls {
+				pointer-events: none;
+				opacity: 0.4;
+				filter: grayscale(0.4);
+			}
 		</style>
 		<script type="importmap">
 			{
@@ -2822,14 +3606,14 @@
 					<button
 						id="version-launch-all"
 						type="button"
-						title="Start all three pipeline versions (V1 legacy-XML, V2 new-context frame-first, V3 new-context decomp-first) on the current slot + model so they run concurrently. Switch which one you are viewing with the buttons; the others keep running in the background."
+						title="Start all four pipeline versions (V1 legacy-XML, V2 frame-first, V3 decomp-first root, V4 decomp-first all zones) on the current slot + model so they run concurrently. Switch which one you are viewing with the buttons; the others keep running in the background."
 					>
-						launch all 3
+						launch all 4
 					</button>
 					<button
 						id="version-archive-all"
 						type="button"
-						title="Archive every version run (V1/V2/V3) that has data into timestamped, loadable copies, so you can reset and re-run V1 vs V2 fresh without losing the current rendition. Originals stay active; each archive appears in the run picker for normal loading later."
+						title="Archive every version run (V1/V2/V3/V4) that has data into timestamped, loadable copies, so you can reset and re-run fresh without losing the current rendition. Originals stay active; each archive appears in the run picker for normal loading later."
 					>
 						archive all
 					</button>
@@ -2877,7 +3661,7 @@
 					<button
 						id="resume-all"
 						type="button"
-						title="Start/resume every slot's run on the currently-selected model. Skips cells that are already running or done."
+						title="Resume every paused run and retry every errored run on the currently-selected model. Skips idle (never-started), running, and done cells — use 'start cells…' to launch idle cells."
 					>
 						resume all
 					</button>
@@ -2936,7 +3720,7 @@
 					<button
 						id="select-mode-toggle"
 						type="button"
-						title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it"
+						title="Restrict selection to zones only — meshes and frames are unclickable, so you can pick a containing zone to inspect how its contents sit inside it. Hold Shift to do this momentarily without flipping the toggle."
 					>
 						select: all
 					</button>
@@ -3031,13 +3815,10 @@
 			<div id="tree-header">
 				<span>tree</span>
 				<span id="tree-active"></span>
-				<button
-					id="tree-expand"
-					type="button"
-					title="Open pipeline observability — every LLM call (system / input / output / reasoning) for the focused node, plus its ancestors and descendants"
-				>
-					⛶
+				<button id="tree-flow" type="button" title="Open the execution-flow graph — a pannable canvas of every pipeline node in execution order. Subregions branch into separate paths; anchor objects chain in the order they were placed. Click any node for its observability pipeline.">
+					<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.3" stroke-linecap="round"><circle cx="3" cy="8" r="1.7"/><circle cx="13" cy="3.6" r="1.7"/><circle cx="13" cy="12.4" r="1.7"/><path d="M4.7 8 L11.3 4.2"/><path d="M4.7 8 L11.3 11.8"/></svg>
 				</button>
+				<button id="tree-expand" type="button" title="Open pipeline observability — every LLM call (system / input / output / reasoning) for the focused node, plus its ancestors and descendants">⛶</button>
 				<span id="tree-toggle">▾</span>
 			</div>
 			<div id="tree-search-row">
@@ -3059,6 +3840,14 @@
 			</div>
 			<div id="tree-body"></div>
 			<div id="tree-detail"></div>
+		</div>
+		<div id="cost-tracker" class="collapsed">
+			<button id="cost-pill" type="button" title="Estimated OpenRouter spend for this run (selected model + gemini-flash-lite matching). Click to break down requests by pipeline step.">
+				<span class="cost-caret"></span>
+				<span class="cost-pill-label">spend</span>
+				<span class="cost-pill-summary">$0.00 · 0 req</span>
+			</button>
+			<div id="cost-dropdown"></div>
 		</div>
 		<div id="assets">
 			<div id="assets-header">
@@ -3347,6 +4136,82 @@
 					</div>
 				</header>
 				<div id="tree-modal-body"></div>
+			</div>
+		</div>
+		<div id="flow-modal">
+			<div id="flow-panel">
+				<header>
+					<h2>execution flow</h2>
+					<div id="flow-legend">
+						<span class="flow-legend-item"><i class="flow-sw zone"></i>zone</span>
+						<span class="flow-legend-item"><i class="flow-sw object"></i>object</span>
+						<span class="flow-legend-item"><i class="flow-sw frame"></i>frame</span>
+						<span class="flow-legend-item"><i class="flow-sw step"></i>step</span>
+					</div>
+					<div id="flow-controls">
+						<input id="flow-search" type="text" placeholder="locate id or prompt…" autocomplete="off" spellcheck="false" />
+						<button id="flow-pause" type="button" title="Pause this run so you can rewind into a step and tune its prompt without the pipeline moving on. Only active while the viewed cell is running.">⏸ pause</button>
+						<button id="flow-fit" type="button" title="Fit the whole graph to view">fit</button>
+						<button id="flow-zoom-out" type="button" title="Zoom out">−</button>
+						<button id="flow-zoom-in" type="button" title="Zoom in">+</button>
+						<button id="flow-close" type="button" title="Close (Esc)">×</button>
+					</div>
+				</header>
+				<div id="flow-viewport">
+					<div id="flow-stage">
+						<svg id="flow-edges" xmlns="http://www.w3.org/2000/svg"></svg>
+						<div id="flow-nodes"></div>
+					</div>
+					<div id="flow-empty">no pipeline nodes yet — start a run, then reopen this graph</div>
+					<div id="flow-hint">drag to pan · scroll to zoom · scene node → observability · step node → input/output/reasoning · <b>tune → rewind &amp; edit this step's prompt</b> · sidebar click centers here</div>
+				</div>
+			</div>
+		</div>
+		<div id="sandbox-panel">
+			<div id="sandbox-head">
+				<h2>tune</h2>
+				<span id="sandbox-step-pill">step</span>
+				<span id="sandbox-step-meta"></span>
+				<span id="sandbox-pos"></span>
+				<button id="sandbox-expand" type="button" title="Expand the panel for easier reading of the system / input / output">⤢</button>
+				<button id="sandbox-close" type="button" title="Break out — discard all tuning and restore the original run">×</button>
+			</div>
+			<div id="sandbox-body">
+				<div id="sandbox-note">The scene is <b>rewound</b> to just before this step. Editing re-runs <b>only this step</b> against the recorded scene state and renders its output here — <b>nothing is saved</b>. Break out to restore the original run.</div>
+				<div class="sandbox-field" id="sandbox-system-field">
+					<label>system prompt <span class="sandbox-edited">· edited</span></label>
+					<textarea id="sandbox-system" spellcheck="false" autocomplete="off"></textarea>
+				</div>
+				<div class="sandbox-field" id="sandbox-user-field">
+					<label>user prompt (rendered input) <span class="sandbox-edited">· edited</span></label>
+					<textarea id="sandbox-user" spellcheck="false" autocomplete="off"></textarea>
+				</div>
+				<div id="sandbox-output-wrap">
+					<div id="sandbox-output-label">
+						<span>output</span>
+						<span id="sandbox-render-note"></span>
+						<button id="sandbox-copy" type="button" title="Copy this output to the clipboard so you can paste it into the next step's input">⧉ copy</button>
+					</div>
+					<pre id="sandbox-output"></pre>
+					<details id="sandbox-reasoning">
+						<summary>reasoning</summary>
+						<pre id="sandbox-reasoning-body"></pre>
+					</details>
+				</div>
+			</div>
+			<div id="sandbox-foot">
+				<button id="sandbox-test" type="button" title="Re-run this step with the prompts above and render the result">⏵ test step</button>
+				<button id="sandbox-reset" type="button" title="Restore the original recorded prompts for this step">reset prompt</button>
+				<button id="sandbox-simulate" type="button" title="Fork the run from this step and step through the pipeline downstream — it pauses at each step so you can edit its (pre-filled, re-rendered) prompt and run it.">⑃ simulate downstream</button>
+				<span class="sandbox-spacer"></span>
+				<button id="sandbox-prev" type="button" title="View the previous step in the simulation (its committed prompt + output) — non-destructive">◀ prev</button>
+				<button id="sandbox-next" type="button" title="View the next step in the simulation — non-destructive">next ▶</button>
+				<button id="sandbox-runstep" type="button" title="Run this step with the prompt above, then pause at the next one">▶ run step</button>
+				<button id="sandbox-rerun" type="button" title="Re-run this committed step with the edited prompt — INVALIDATES every step after it">↻ re-run step</button>
+				<button id="sandbox-runrest" type="button" title="Run the rest of the branch without pausing">⏩ run rest</button>
+				<button id="sandbox-back" type="button" title="Discard the simulation and go back to editing the original step">← back to edit</button>
+				<button id="sandbox-breakout" type="button" title="Discard all tuning and restore the original run">break out</button>
+				<div id="sandbox-status"></div>
 			</div>
 		</div>
 		<!-- gif.js loaded as a global because the npm dist is UMD/CJS and

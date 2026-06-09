@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.core.types import (
     BoundingBox,
@@ -136,6 +136,10 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 <role>
 You are authoring the plan for ONE region within a larger scene, and deciding whether that region is a single cohesive area or should decompose further into distinct subzones.
 </role>
+
+<input>
+The user message contains this region's seed prompt, the scene context already in the run, and guidance on how to author the plan and how to decide `is_atomic`.
+</input>
 
 <output>
 Respond with a single JSON object containing:
@@ -318,7 +322,7 @@ class ChildNodeSpec(BaseModel):
         frame) this node physically rests on, or the containing zone
         when there's no physical supporter (floating objects, frames
         themselves, subzones inside a parent zone).
-      * `parent_kind` — how this node relates to its `parent`. MUST be
+      * `parent_relationship_kind` — how this node relates to its `parent`. MUST be
         one of ON / ATTACHED / IN:
           - ON: rests on parent's outward surface (most often top face).
           - ATTACHED: flush against any face of the parent (wall mount,
@@ -327,25 +331,35 @@ class ChildNodeSpec(BaseModel):
             (subzone inside a zone, fish inside a tank, cloud inside a
             sky zone, embedded particle).
         BESIDE / ABOVE / BELOW are reserved for sibling/peer hints in
-        `referenced_ids` and are NOT valid here.
+        `relationship_ids` and are NOT valid here.
       * `placement` — prose describing where this node sits, with
         precise positioning (centered, edge-aligned, two-thirds along,
         etc.). The bbox-resolution step uses this verbatim to choose
         coordinates.
-      * `referenced_ids` — optional list of *secondary* relationships
-        to other already-placed peers. Each entry is a Relationship
-        with `target` (the peer's id) and `kind` (ON, BESIDE, ABOVE,
-        BELOW, ATTACHED, IN) — categorical, no anchor point. Do NOT
-        repeat the parent here. Empty list is fine when the placement
-        only references the parent.
+      * `relationship_ids` — optional list of spatial relationships to
+        other already-placed nodes that assist the downstream spatial
+        resolver. Each entry is a Relationship with `target` (the peer's
+        id) and `kind` (ON, BESIDE, ABOVE, BELOW, ATTACHED, IN) —
+        categorical, no anchor point. Do NOT repeat the parent here.
+        Empty list is fine when the placement only references the parent.
     """
+
+    # Two LLM-facing field names are aliased so the schema/wire names match the
+    # prompt text, while the Python attributes stay the names the shared
+    # divider/generation/topology + Node use across every version:
+    # `relationship_ids` -> attr `referenced_ids`, `parent_relationship_kind`
+    # -> attr `parent_kind`. `populate_by_name` lets committed-event replay
+    # (which dumps by attribute name) round-trip back in.
+    model_config = ConfigDict(populate_by_name=True)
 
     id: str
     prompt: str
     parent: str
-    parent_kind: ParentRelationshipKind
+    parent_kind: ParentRelationshipKind = Field(alias="parent_relationship_kind")
     placement: str
-    referenced_ids: list[Relationship] = Field(default_factory=list)
+    referenced_ids: list[Relationship] = Field(
+        default_factory=list, alias="relationship_ids"
+    )
     proxy_shape: ProxyShape | None = None
     orientation: Orientation = 0
 
@@ -381,250 +395,13 @@ Respond with a single JSON object containing:
   - `id` (string): unique within the entire scene
   - `prompt` (string): a short seed describing what this child zone is
   - `parent` (string): the id of this child's structural parent. For a top-level subzone, this is the literal id of the zone being decomposed (the value labelled "Parent zone id" in the user message — e.g. if the user message says `Parent zone id: 'living_room'`, emit `"parent": "living_room"`, NOT the string "PARENT_ID" or any other placeholder). For a child anchored to an earlier sibling in this call, use that sibling's id verbatim.
-  - `parent_kind` (string): how this child anchors to its `parent`. Exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here — they are peer hints, reserved for `referenced_ids`.
-  - `placement` (string): prose describing WHERE this child sits within / against / relative to its parent and any referenced peers. The bbox-resolution step uses this verbatim.
-  - `referenced_ids` (list of {target, kind}): OPTIONAL secondary relationships to other already-placed nodes referenced in the placement text. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
+  - `parent_relationship_kind` (string): how this child anchors to its `parent`. Exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here — they are peer hints, reserved for `relationship_ids`.
+  - `placement` (string): one string describing where this child sits within the scene relative to other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the subregion is located. Think very deeply about where each zone should lie spatially and designing the placement string for it.
+  - `relationship_ids` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
   - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the zone's silhouette is non-rectangular, otherwise null/omitted.
 
 No additional prose, markdown, or code fences.
 </output>"""
-
-
-def _scene_context_zone_decompose_narrative(
-    *,
-    target_zone_id: str,
-    target_zone_prompt: str,
-    target_zone_bbox: BoundingBox,
-    target_zone_plan: str,
-    scene_prompt: str,
-    scene_plan: str,
-    ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    prior_zones: list[tuple[str, str, str | None, str, BoundingBox, str | None]],
-    objects: list[tuple[str, str, str | None, BoundingBox, str | None, str | None]],
-    bbox_by_id: dict[str, BoundingBox] | None = None,
-) -> str:
-    """TEMPORARY helper — render scene context for ZONE_DECOMPOSE as a
-    flowing narrative.
-
-    The output drills top-down from the root through the ancestor spine
-    into the target zone in prose: each zone gets a plan paragraph
-    (plan + "is framed by …" sentence) followed by a dims-and-transition
-    sentence ("The X is W by H by D and origins at (...). Inside, it
-    contains Y with the following plan:") that hands off to the next
-    zone in the path. Sibling subtrees off the path are enumerated
-    afterwards under "Other areas in <parent>:". Nesting inside those
-    sub-area lists uses `> ` as a depth delimiter (one `>` per level)
-    in place of visual indentation.
-    """
-    bag: dict[str, dict] = {}
-    for i, (aid, aprompt, aplan, abbox, aplacement) in enumerate(ancestors):
-        ap = None if i == 0 else ancestors[i - 1][0]
-        bag[aid] = dict(
-            prompt=aprompt,
-            bbox=abbox,
-            plan=aplan,
-            parent_id=ap,
-            placement=aplacement,
-            kind="zone",
-        )
-    target_parent = ancestors[-1][0] if ancestors else None
-    bag[target_zone_id] = dict(
-        prompt=target_zone_prompt,
-        bbox=target_zone_bbox,
-        plan=target_zone_plan,
-        parent_id=target_parent,
-        placement=None,
-        kind="zone",
-    )
-    for zid, zprompt, zplan, zparent, zbbox, zplacement in prior_zones:
-        if zid in bag:
-            continue
-        bag[zid] = dict(
-            prompt=zprompt,
-            bbox=zbbox,
-            plan=zplan,
-            parent_id=zparent,
-            placement=zplacement,
-            kind="zone",
-        )
-    for oid, oprompt, oparent, obbox, oplacement, oparent_kind in objects:
-        if oid in bag:
-            continue
-        bag[oid] = dict(
-            prompt=oprompt,
-            bbox=obbox,
-            plan=None,
-            parent_id=oparent,
-            placement=oplacement,
-            kind="object",
-            parent_kind=oparent_kind,
-        )
-
-    children: dict[str, list[str]] = {}
-    for nid, n in bag.items():
-        pid = n["parent_id"]
-        if pid is None or pid not in bag:
-            continue
-        children.setdefault(pid, []).append(nid)
-
-    spine = [a[0] for a in ancestors] + [target_zone_id]
-
-    def fmt_dims_sentence(nid: str) -> str:
-        n = bag[nid]
-        b: BoundingBox = n["bbox"]
-        pid = n["parent_id"]
-        w, h, d = b.size
-        if pid and pid in bag and bbox_by_id and pid in bbox_by_id:
-            parent_bbox = bbox_by_id[pid]
-            local = b.to_local_frame(parent_bbox)
-            ox, oy, oz = local.origin
-            pdims = parent_bbox.size
-            return f"{w:.2f}m by {h:.2f}m by {d:.2f}m, at ({ox:.2f}, {oy:.2f}, {oz:.2f}) relative to {pid} [{pdims[0]:.2f} x {pdims[1]:.2f} x {pdims[2]:.2f}]"
-        return f"{w:.2f}m by {h:.2f}m by {d:.2f}m (scene root)"
-
-    def fmt_dims_inline(nid: str) -> str:
-        n = bag[nid]
-        b: BoundingBox = n["bbox"]
-        pid = n["parent_id"]
-        w, h, d = b.size
-        if pid and pid in bag and bbox_by_id and pid in bbox_by_id:
-            parent_bbox = bbox_by_id[pid]
-            local = b.to_local_frame(parent_bbox)
-            ox, oy, oz = local.origin
-            pdims = parent_bbox.size
-            return f"{w:.2f}m by {h:.2f}m by {d:.2f}m, at ({ox:.2f}, {oy:.2f}, {oz:.2f}) rel. {pid} [{pdims[0]:.2f} x {pdims[1]:.2f} x {pdims[2]:.2f}]"
-        return f"{w:.2f}m by {h:.2f}m by {d:.2f}m (scene root)"
-
-    def fmt_plan(plan: str | None) -> str:
-        if plan is None:
-            return "(plan not yet authored — this zone has been declared and placed but not individually planned)"
-        text = plan.rstrip()
-        if not text.endswith("."):
-            text += "."
-        return text
-
-    def fmt_framed_by(zone_id: str) -> str:
-        """Return the trailing sentence describing the zone's concrete
-        children:
-          * frames + anchors → "The X is framed by F1, F2, and it contains O1 (P1), O2 (P2)."
-          * frames only      → "The X is framed by F1, F2."
-          * anchors only     → "The X contains O1 (P1), O2 (P2)."
-          * neither          → "" (empty string)
-        Frames are concrete children with parent_kind=ATTACHED (shell
-        elements); anchors are concrete children with parent_kind=ON
-        or IN. Concrete children with unknown parent_kind fall through
-        to the anchor list so they're still surfaced."""
-        concrete = [k for k in children.get(zone_id, []) if bag[k]["kind"] == "object"]
-        if not concrete:
-            return ""
-        frames = [k for k in concrete if bag[k].get("parent_kind") == "ATTACHED"]
-        anchors = [k for k in concrete if bag[k].get("parent_kind") in ("ON", "IN")]
-        leftovers = [k for k in concrete if k not in frames and k not in anchors]
-        anchors = anchors + leftovers
-
-        def fmt_anchor(cid: str) -> str:
-            placement = bag[cid]["placement"] or "no explicit placement recorded"
-            return f"{cid} ({placement})"
-
-        if frames and anchors:
-            return (
-                f" The {zone_id} is framed by "
-                + ", ".join(frames)
-                + ", and it contains "
-                + ", ".join(fmt_anchor(a) for a in anchors)
-                + "."
-            )
-        if frames:
-            return f" The {zone_id} is framed by " + ", ".join(frames) + "."
-        # anchors only
-        return f" The {zone_id} contains " + ", ".join(fmt_anchor(a) for a in anchors) + "."
-
-    out: list[str] = []
-    out.append(
-        f"Here is a list of zones that have already been declared and/or "
-        f"planned beforehand. You should use their plans and locations to aid "
-        f"you in deciding on the structural decomposition of {target_zone_id}. "
-        f"Starting with the root zone encapsulating the entire scene, here is its plan:"
-    )
-    out.append("")
-
-    for i, nid in enumerate(spine):
-        n = bag[nid]
-        is_target = nid == target_zone_id
-        out.append(fmt_plan(n["plan"]) + fmt_framed_by(nid))
-        out.append("")
-        if is_target:
-            out.append(
-                f"The {nid} is {fmt_dims_sentence(nid)}. "
-                f"You are to decide on the structural decomposition of this {nid}."
-            )
-        else:
-            nxt = spine[i + 1]
-            out.append(
-                f"The {nid} is {fmt_dims_sentence(nid)}. "
-                f"Inside, it contains {nxt} with the following plan:"
-            )
-        out.append("")
-
-    out.append(
-        f"To that end, here's some more context on the other areas inside the "
-        f"scene. You should reference this information to help you in deciding "
-        f"on the structural decomposition of {target_zone_id}."
-    )
-    out.append("")
-    out.append(
-        "Nested sub-area lists below use `> ` as a depth delimiter: every line "
-        "is prefixed with one `> ` per level of nesting below its enclosing "
-        '"Other areas in X" or "Areas in X" header (top-level entries have '
-        "no prefix; their sub-areas get one `> `; sub-sub-areas get `> > `; etc.)."
-    )
-    out.append("")
-
-    def render_subtree(zone_id: str, num: int, depth: int) -> list[str]:
-        n = bag[zone_id]
-        prefix = "> " * depth
-        sub_prefix = "> " * (depth + 1)
-        lines: list[str] = []
-        lines.append(f"{prefix}{num}. {zone_id} ({fmt_dims_inline(zone_id)})")
-        lines.append(prefix.rstrip() if prefix else "")
-        plan_para = fmt_plan(n["plan"]) + fmt_framed_by(zone_id)
-        for ln in plan_para.split("\n"):
-            lines.append(f"{prefix}{ln}")
-        zone_kids = [k for k in children.get(zone_id, []) if bag[k]["kind"] == "zone"]
-        if zone_kids:
-            lines.append(sub_prefix.rstrip() if sub_prefix else "")
-            lines.append(f"{sub_prefix}Areas in {zone_id}:")
-            lines.append(sub_prefix.rstrip() if sub_prefix else "")
-            for j, sub in enumerate(zone_kids, 1):
-                lines.extend(render_subtree(sub, j, depth + 1))
-                if j < len(zone_kids):
-                    lines.append(sub_prefix.rstrip() if sub_prefix else "")
-        return lines
-
-    any_siblings = False
-    for i in range(len(spine) - 1):
-        parent_id = spine[i]
-        path_child = spine[i + 1]
-        sibling_zone_ids = [
-            k for k in children.get(parent_id, []) if bag[k]["kind"] == "zone" and k != path_child
-        ]
-        if not sibling_zone_ids:
-            continue
-        any_siblings = True
-        is_target_parent = parent_id == target_parent
-        marker = f" <- the {target_zone_id} you are to decompose exists here" if is_target_parent else ""
-        out.append(f"Other areas in {parent_id}:{marker}")
-        out.append("")
-        for j, sib in enumerate(sibling_zone_ids, 1):
-            out.extend(render_subtree(sib, j, 0))
-            if j < len(sibling_zone_ids):
-                out.append("")
-        out.append("")
-    if not any_siblings:
-        out.append("(no other declared areas — the path above is the entire declared scene so far.)")
-        out.append("")
-
-    return "\n".join(out).rstrip() + "\n"
 
 
 def render_zone_decompose(
@@ -634,44 +411,18 @@ def render_zone_decompose(
     zone_bbox: BoundingBox,
     zone_plan: str,
     ancestors: list[tuple[str, str, str, BoundingBox, str | None]],
-    objects: list[tuple[str, str, str | None, BoundingBox, str | None, str | None]],
     scene: list[
         tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
     ],
-    scene_prompt: str,
-    scene_plan: str,
-    prior_zones: list[tuple[str, str, str | None, str, BoundingBox, str | None]],
     bbox_by_id: dict[str, BoundingBox] | None = None,
 ) -> str:
     """ancestors: (id, prompt, plan, bbox, placement) tuples from root →
     parent of this zone, excluding the zone itself. Empty for the root.
     `placement` is None for root only.
-    objects: (id, prompt, parent_id, bbox, placement, parent_kind) tuples
-    for every concrete (mesh-bearing) node placed anywhere in the run so
-    far. `parent_kind` is `'ATTACHED'` for shell frames and `'ON' / 'IN'`
-    for interior anchor objects.
     scene: the full run-wide node snapshot (same 11-tuple shape every
-    other step uses) — rendered into a full-detail <OBJECTS> block so the
-    decomposer sees the actual geometry of the concrete objects the
-    narrative only names by id (notably this zone's own shell/ground from
-    its encapsulating pass).
-    prior_zones: (id, prompt, plan_or_None, parent_id, bbox, placement)
-    for every non-root zone already declared in the run, in declaration
-    order. `plan` is None for zones that have been declared (bbox
-    resolved) but not yet recursed into for individual planning."""
-    narrative = _scene_context_zone_decompose_narrative(
-        target_zone_id=zone_id,
-        target_zone_prompt=zone_prompt,
-        target_zone_bbox=zone_bbox,
-        target_zone_plan=zone_plan,
-        scene_prompt=scene_prompt,
-        scene_plan=scene_plan,
-        ancestors=ancestors,
-        prior_zones=prior_zones,
-        objects=objects,
-        bbox_by_id=bbox_by_id,
-    )
-    objects_block = _render_objects_block(scene, bbox_by_id=bbox_by_id)
+    other step uses) — rendered as the flat <ANCESTOR_CHAIN> / <ZONES> /
+    <OBJECTS> node list every other step gets, so the decomposer sees
+    every region and concrete object already placed."""
     zone_parent_id = ancestors[-1][0] if ancestors else None
     if zone_parent_id and bbox_by_id and zone_parent_id in bbox_by_id:
         parent_bbox = bbox_by_id[zone_parent_id]
@@ -690,25 +441,24 @@ A subzone is an area of spatial interest whose bounding box sits within the pare
 Subzones can keep decomposing into more zones recursively in subsequent passes, or end there as atomic leaves if that is appropriate. so always decompose at the TOP MOST LEVEL of the current zone — e.g. for a house scene with backyard, driveway, and house, do not skip straight to backyard-pool zone, backyard-grass zone, house-basement, house-first-floor, etc.; decompose into "the house", "the backyard", "the driveway" as top-level children, and let the next recursion split the house into floors and the backyard into pool and grass. the same principle holds everywhere: emit only the zones that exist at THIS level of the hierarchy, and trust the recursive planning + decompose passes underneath each of them to handle the next layer down.
 </ZONE_SPLITTING_GUIDANCE>
 
-Think very intricately and spatially about how this zone splits. Your goal is to reason a subzone decomposition layout that fits the narrative presented by the scene plan given above as well as the additional plans of ancestor scenes in the scene context section given below, while paying attention to the semantic relationships between the subzones. The subzones presented should each flesh out the guiding narrative further in some way, carrying relevant ideas from previously defined plans (in the scene context below) while also introducing some new ones without being contradictory.
+Think very intricately and spatially about how this zone splits, being careful and wary about overlapping regions. Your goal is to reason a subzone decomposition layout that fits the narrative presented by the scene plan given above as well as the additional plans of ancestor scenes in the scene context section given below, while paying attention to the semantic relationships between the subzones. The subzones presented should each flesh out the guiding narrative further in some way, carrying relevant ideas from previously defined plans (in the scene context below) while also introducing some new ones without being contradictory.
 
 The seed prompt you output for each subzone should be a 1-2 sentences long description that explains the subzone's shape, character, and the new narrative ideas presented by this subzone, if any. Be concrete about its description while leaving room for this prompt to be a seed for a more detailed plan. The prompt should be succinct without mentioning going overly into detail on the subzone's contents.
 
 Keep the prompt tight: the goal is not to plan out the subzone's contents, but to establish its character as a piece of the larger scene as a whole.
 </IMPORTANT_INSTRUCTIONS>
 
-<SCENE_CONTEXT>
-{narrative}
-
-The following is a list of all the objects that the scene is composed of, and the zones they are parented to:
-
-{objects_block}
+<scene_context>
+{_SCENE_CONTEXT_INTRO}
 
 Parent zone id (use this id literally as `parent` for top-level subzones): {zone_id!r}
 Zone prompt: "{zone_prompt}"
 {zone_bbox_line}
 
-</SCENE_CONTEXT>
+{_render_ancestor_block(ancestors, bbox_by_id=bbox_by_id)}
+
+{_render_scene_lines(scene, bbox_by_id=bbox_by_id)}
+</scene_context>
 {_deepseek_suffix()}"""
 
 
@@ -729,11 +479,11 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are a constraint solver placing ALL sibling child zones inside a parent zone in one shot — deriving each child's axis-aligned bounding box from its placement prose, parent_kind, referenced_ids, and the parent's dimensions.
+You are a constraint solver placing ALL sibling child zones inside a parent zone in one shot — deriving each child's axis-aligned bounding box from its placement prose, parent_relationship_kind, relationship_ids, and the parent's dimensions.
 </role>
 
 <input>
-The user message contains the parent zone's id and dimensions, and a list of child specs to place. Each child has `id`, `prompt`, `proxy_shape`, `parent`, `parent_kind`, `parent_dimensions`, `placement`, and `referenced_ids`. A child's parent may be the zone being decomposed, an existing node, or another child in this same batch.
+The user message contains the parent zone's id and dimensions, and a list of child specs to place. Each child has `id`, `prompt`, `proxy_shape`, `parent`, `parent_relationship_kind`, `parent_dimensions`, `placement`, and `relationship_ids`. A child's parent may be the zone being decomposed, an existing node, or another child in this same batch.
 </input>
 
 <output>
@@ -782,12 +532,12 @@ def render_zone_bbox_batch(
     child_lines = "\n\n".join(
         f"""  - id={c.id!r}
     parent: {c.parent!r}
-    parent_kind: {c.parent_kind.value}
+    parent_relationship_kind: {c.parent_kind.value}
 {_child_parent_dims(c)}
     prompt: "{c.prompt}"
     proxy_shape: {_render_proxy_shape(c.proxy_shape)}
     placement: "{c.placement}"
-    referenced_ids: {_render_relationships(c.referenced_ids)}"""
+    relationship_ids: {_render_relationships(c.referenced_ids)}"""
         for c in children
     )
     return f"""Zone id: {parent_id!r}
@@ -815,7 +565,7 @@ class ObjectSpec(ChildNodeSpec):
     """A single object in a zone. Identical shape to ChildNodeSpec.
     The structural parent (`parent` field) may be the enclosing zone,
     a frame, an earlier-placed peer, or another object listed in the
-    same decomp call. Secondary relationships (`referenced_ids`)
+    same decomp call. Secondary relationships (`relationship_ids`)
     capture additional spatial connections — sibling alignment, the
     wall a painting hangs against, etc."""
 
@@ -861,11 +611,11 @@ Respond with a single JSON object containing:
   - `id` (string): unique within this call
   - `prompt` (string): detailed description; used verbatim as the text-to-3D generation prompt
   - `parent` (string): id of this object's structural parent (what it physically rests on, hangs from, leans against, or is contained by)
-  - `parent_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent — wall/ceiling mounts, embedded fittings, shell-frame-to-zone), or `IN` (contained inside the parent's volume / footprint with no specific contact face). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
+  - `parent_relationship_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent — wall/ceiling mounts, embedded fittings, shell-frame-to-zone), or `IN` (contained inside the parent's volume / footprint with no specific contact face). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
   - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the object's silhouette is non-rectilinear, otherwise null/omitted.
   - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z (toward viewer), `90` = front faces -X, `180` = front faces -Z, `-90` = front faces +X. Use 0 for symmetric objects.
-  - `placement` (string): prose describing WHERE this object sits — position within / on / against the parent, plus alignment to any referenced peers.
-  - `referenced_ids` (list of {{target, kind}}): OPTIONAL secondary relationships when placement text refers to nodes other than the parent. Each entry: `target` (peer's id) and `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine.
+  - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
+  - `relationship_ids` (list of {{target, kind}}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
 - `bound_existing` (list): used only by the encapsulating step (anchor and negative-space leave this empty). Each entry has `plan_element` (the plan's noun phrase verbatim) and `peer_id` (the id of an existing node that already satisfies it).
 - `bounding_required` (bool): used only by the encapsulating step (anchor and negative-space leave this as the default `true`). Set to `false` when the region needs no bounding perimeter at all — `objects` is then ignored downstream even if non-empty. Set to `true` when at least one bounding object is being emitted.
 
@@ -982,7 +732,7 @@ def _render_node_entry(
     if prompt is not None:
         lines.append(f'  prompt: "{prompt}"')
     if parent_kind is not None:
-        lines.append(f"  parent_kind: {parent_kind}")
+        lines.append(f"  parent_relationship_kind: {parent_kind}")
     if bbox is not None:
         if bbox_by_id and parent and parent in bbox_by_id:
             parent_bbox = bbox_by_id[parent]
@@ -1001,7 +751,7 @@ def _render_node_entry(
     elif placement_unset_label is not None:
         lines.append(f"  placement: {placement_unset_label}")
     if referenced_ids is not None:
-        lines.append(f"  referenced_ids: {_render_relationships(referenced_ids)}")
+        lines.append(f"  relationship_ids: {_render_relationships(referenced_ids)}")
     if plan is not None:
         lines.append(f'  plan: "{plan}"')
     elif plan_unset_label is not None:
@@ -1100,45 +850,10 @@ def _render_scene_lines(
     return f"{zones_block}\n\n{objects_block}"
 
 
-def _render_objects_block(
-    scene: list[
-        tuple[str, str, BoundingBox, str | None, ProxyShape | None, Orientation, str | None, str | None, str | None, list[Relationship], bool]
-    ],
-    bbox_by_id: dict[str, BoundingBox] | None = None,
-) -> str:
-    """Render every concrete (mesh-bearing) node in the scene as a full
-    <OBJECTS> block — the same per-node detail every other step gets via
-    `_render_scene_lines`. Zones are omitted: the zone-decompose narrative
-    already drills the region hierarchy, and the only thing it leaves as
-    bare ids are the concrete frames, ground, and anchors. Surfacing their
-    geometry here keeps the decomposer from being blind to the surfaces
-    its subzones must anchor against — most importantly the zone's own
-    shell/ground from its encapsulating pass, which (for the root) is the
-    only concrete geometry present at decompose time."""
-    object_entries = [
-        _render_node_entry(
-            nid=nid,
-            parent=pid,
-            prompt=prompt,
-            bbox=bbox,
-            bbox_by_id=bbox_by_id,
-            placement=placement,
-            placement_unset_label="(root — has no parent)",
-            proxy_shape=proxy,
-            orientation=orient,
-            parent_kind=parent_kind,
-            referenced_ids=refs,
-        )
-        for nid, prompt, bbox, pid, proxy, orient, placement, plan, parent_kind, refs, is_zone in scene
-        if not (is_zone or plan is not None)
-    ]
-    return _render_section("OBJECTS", object_entries, "none — no concrete meshes placed yet")
-
-
 # Shared one-paragraph header at the top of every <scene_context> block.
 # Gives the model a quick map of what tags it's about to see and what
 # they mean, so the structure isn't a surprise mid-prompt.
-_SCENE_CONTEXT_INTRO = "This is an overview of the current scene context — every entity already placed in the run that you can reference by id. <ANCESTOR_CHAIN> is the path from the root down to this zone's parent. <ZONES> are abstract regions (have a `plan`). <OBJECTS> are concrete frames, anchors, and prior negative-space pieces (have no plan; some have a mesh). Each `<node>` entry shows id, parent, prompt, bbox, placement, and any other applicable fields. Use these as concrete anchors when authoring placement prose and as valid `referenced_ids` targets."
+_SCENE_CONTEXT_INTRO = "This is an overview of the current scene context — every entity already placed in the run that you can reference by id. <ANCESTOR_CHAIN> is the path from the root down to this zone's parent. <ZONES> are abstract regions (have a `plan`). <OBJECTS> are concrete frames, anchors, and prior negative-space pieces (have no plan; some have a mesh). Each `<node>` entry shows id, parent, prompt, bbox, placement, and any other applicable fields. Use these as concrete anchors when authoring placement prose and as valid `relationship_ids` targets."
 
 
 def _render_retry_block(
@@ -1157,7 +872,7 @@ def _render_retry_block(
 PRIOR ATTEMPTS — every decomposition below was ALREADY rejected. Do NOT re-emit the same set of object specs, and do not repeat the same structural mistake. Treat every listed reason as a hard constraint you must satisfy this time:
 {attempt_lines}
 
-Produce a NEW decomposition that fixes every listed reason. In particular, ensure every object's `parent` field is set to a valid existing id (the supporter or containing zone that anchors it), and every `referenced_ids` entry has a `target` that exists in the scene context."""
+Produce a NEW decomposition that fixes every listed reason. In particular, ensure every object's `parent` field is set to a valid existing id (the supporter or containing zone that anchors it), and every `relationship_ids` entry has a `target` that exists in the scene context."""
 
 
 def render_anchor_decomp(
@@ -1200,7 +915,7 @@ ZONE_ID: {zone_id!r}
 <output_guidance>
 The concept of a parent should be grounded in a concrete, physical relationship, not a conceptual one. A cantilevered object would be parented to the surface or wall it's cantilevered to with relationship type 'ATTACHED', not parented to the floor below with relationship 'ON'. If no physical relationship is found with another object or frame, the relationship should be of type 'IN', and parented to the zone itself.
 
-Each anchor object in your resultant list has an id, prompt, parent (the structural anchor id — the zone, a ground/shell peer from the encapsulating pass, or another object in this list), parent_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: `ON` for resting on an outward surface, `ATTACHED` for wall/ceiling/face mounts, `IN` for free containment inside the parent's volume — BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for secondary relationships your placement text mentions; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: anchor onto any ground/shell peer already placed by the encapsulating pass, do not duplicate geometry another zone has already emitted. Anchor objects are expected to live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified — the object remains semantically part of this zone even though its geometry overhangs. Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry. In your final output, each object's placement text should be direct and parametric. Avoid flowery language that states the narrative purpose of the positioning. Do not state the abstract reason of the positioning, only details that ground the position concretely. The position description should be absolute and succinct, leaving no creative liberty for the downstream constraint solver.
+Each anchor object in your resultant list has an id, prompt, parent (the structural anchor id — the zone, a ground/shell peer from the encapsulating pass, or another object in this list), parent_relationship_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: `ON` for resting on an outward surface, `ATTACHED` for wall/ceiling/face mounts, `IN` for free containment inside the parent's volume — BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and relationship_ids (optional list of `{{target, kind}}` for spatial relationships to other nodes that assist the downstream solver; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: anchor onto any ground/shell peer already placed by the encapsulating pass, do not duplicate geometry another zone has already emitted. Anchor objects are expected to live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified — the object remains semantically part of this zone even though its geometry overhangs. Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry. In your final output, each object's placement text should be direct and parametric. Avoid flowery language that states the narrative purpose of the positioning. Do not state the abstract reason of the positioning, only details that ground the position concretely. The position description should be absolute and succinct, leaving no creative liberty for the downstream constraint solver.
 </output_guidance>
 
 {_render_retry_block(prior_attempts)}
@@ -1235,7 +950,7 @@ the list of objects you output, if any, should work together to form a cohesive 
 
 Object should be individualistic - composite objects should be broken down into individual or partial objects (abstract fragments that are meant to combine into a more complex object) and placed accordingly, allowing for more granular control of the region's boundary. Objects and partial objects can be stacked, strung, pieced to form larger, cohesive sections for the perimeter. there is no limit on the number of objects in your output list - always prefer individual objects placed close to each other over a single composite object with a prompt to generate them together at once. if the region calls for it, we can have as high fidelity of a perimeter as we want, the number of objects you can output is truly unbounded. if a dense perimeter makes sense for the given region, then make it dense - as many objects as you see fit, their bounding boxes right next to each other. You are in control - do not rely on downstream generation steps to output composite geometry: organize your list of objects so that you are in direct control of positioning to form that composite geometry yourself using the individual partial objects.
 
-When generating a list of objects, keep in mind connectives between this region and others, in all directions; using objects and partial objects to leave free space, embed semantically relevant transition objects, construct composite structures, etc. The space should be realistic and traversable.
+When generating a list of objects, keep in mind connectives between this region and others, in all directions; using objects and partial objects to leave free space, embed semantically relevant transition objects, construct composite structures, etc. The space should be realistic and traversable. Also keep in mind collisions and overlaps with existing objects and planned regions' bounding boxes.
 If you need to leave a hole/gap or embed other objects within a greater bounding section for any purpose, piece objects and partial objects together like a puzzle around the gap or embed. For example, a door or window embedded within a wall, a roofed forest underpass, an ice fishing hole, a concave crater in the ground, etc. 
 
 Pay special attention to the context provided in the plans of other regions in the scene, and use it to imagine realistically navigating the region as part of the larger scene. Use this thinking to guide you in the generation and placement of your list of objects.
@@ -1290,7 +1005,7 @@ ZONE_ID: {zone_id!r}
 {_render_scene_lines(scene, bbox_by_id=bbox_by_id)}
 </scene_context>
 
-Each negative space object in your resultant list has an id, prompt, parent (structural anchor — the zone, an earlier-placed peer, or another object in this list), parent_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: most negative-space pieces sit `ON` a ground/floor peer, `ATTACHED` for things mounted flush to a wall/ceiling, `IN` for free-floating pieces inside an enclosing volume; BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and referenced_ids (optional list of `{{target, kind}}` for secondary relationships your placement text mentions; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: do not duplicate geometry another zone has already emitted on a shared face. Negative-space pieces live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified (a vine draped over a wall, a banner hanging off an edge, drifting smoke crossing into an adjacent zone, a connective walkway or rope-bridge reaching toward a peer zone, a stabilizing strut or buttress extending below to ground against a peer). Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry.
+Each negative space object in your resultant list has an id, prompt, parent (structural anchor — the zone, an earlier-placed peer, or another object in this list), parent_relationship_kind (one of ON / ATTACHED / IN — how the object physically anchors to that parent: most negative-space pieces sit `ON` a ground/floor peer, `ATTACHED` for things mounted flush to a wall/ceiling, `IN` for free-floating pieces inside an enclosing volume; BESIDE/ABOVE/BELOW are NOT valid here), placement (prose), and relationship_ids (optional list of `{{target, kind}}` for spatial relationships to other nodes that assist the downstream solver; kind may use ON/BESIDE/ABOVE/BELOW/ATTACHED/IN). Respect the scene context: do not duplicate geometry another zone has already emitted on a shared face. Negative-space pieces live primarily inside this zone, but their bboxes MAY protrude modestly outside the zone bbox when narratively justified (a vine draped over a wall, a banner hanging off an edge, drifting smoke crossing into an adjacent zone, a connective walkway or rope-bridge reaching toward a peer zone, a stabilizing strut or buttress extending below to ground against a peer). Do not use this as license to claim airspace far from the zone or to volumetrically intersect another zone's load-bearing geometry.
 
 The primary purpose of these negative space objects is to make the scene feel coherent and cohesive, filling in the gaps between subzones or objects. As such, for each negative space to fill in, it is imperative to analyze the existing placed objects and zones surrounding it to create a smooth filling that does not look out of place.{_render_retry_block(prior_attempts)}
 {_deepseek_suffix()}"""
@@ -1304,11 +1019,11 @@ You are competing in SpatialBench, a competitive benchmark where LLMs create det
 </intro>
 
 <role>
-You are a constraint solver placing ALL objects for a scene zone in one shot — deriving each object's axis-aligned bounding box from its placement prose, parent_kind, referenced_ids, the parent's dimensions, and peer geometry.
+You are a constraint solver placing ALL objects for a scene zone in one shot — deriving each object's axis-aligned bounding box from its placement prose, parent_relationship_kind, relationship_ids, the parent's dimensions, and peer geometry.
 </role>
 
 <input>
-The user message contains the zone id/prompt/dimensions, a list of objects to place (each with `id`, `prompt`, `proxy_shape`, `orientation`, `parent`, `parent_kind`, `parent_dimensions`, `placement`, `referenced_ids`), and a list of peers already placed in the scene. Each peer's bbox is expressed relative to THAT PEER'S OWN parent's minimum corner (origin (0,0,0) = parent's min corner). Use siblings (peers sharing the same parent as the object you are placing) for direct spatial reasoning; peers under different parents provide broader scene context.
+The user message contains the zone id/prompt/dimensions, a list of objects to place (each with `id`, `prompt`, `proxy_shape`, `orientation`, `parent`, `parent_relationship_kind`, `parent_dimensions`, `placement`, `relationship_ids`), and a list of peers already placed in the scene. Each peer's bbox is expressed relative to THAT PEER'S OWN parent's minimum corner (origin (0,0,0) = parent's min corner). Use siblings (peers sharing the same parent as the object you are placing) for direct spatial reasoning; peers under different parents provide broader scene context.
 </input>
 
 <output>
@@ -1351,7 +1066,7 @@ def render_object_bbox_batch(
             local_bbox = pbbox
             parent_dims = None
         dims_str = f" parent_dimensions=[{parent_dims[0]:.2f}, {parent_dims[1]:.2f}, {parent_dims[2]:.2f}]" if parent_dims else ""
-        return f"  - {pid}: prompt={pprompt!r} bbox={local_bbox.model_dump_json()} parent={pparent!r} parent_kind={pkind_str}{dims_str} proxy_shape={_render_proxy_shape(pproxy)} orientation={porient}deg placement={pplacement!r} referenced_ids={_render_relationships(prefs)}"
+        return f"  - {pid}: prompt={pprompt!r} bbox={local_bbox.model_dump_json()} parent={pparent!r} parent_relationship_kind={pkind_str}{dims_str} proxy_shape={_render_proxy_shape(pproxy)} orientation={porient}deg placement={pplacement!r} relationship_ids={_render_relationships(prefs)}"
 
     peer_lines = (
         "\n".join(
@@ -1370,13 +1085,13 @@ def render_object_bbox_batch(
     object_lines = "\n\n".join(
         f"""  - id={o.id!r}
     parent: {o.parent!r}
-    parent_kind: {o.parent_kind.value}
+    parent_relationship_kind: {o.parent_kind.value}
 {_parent_dims_line(o)}
     prompt: "{o.prompt}"
     proxy_shape: {_render_proxy_shape(o.proxy_shape)}
     orientation: {o.orientation}deg
     placement: "{o.placement}"
-    referenced_ids: {_render_relationships(o.referenced_ids)}"""
+    relationship_ids: {_render_relationships(o.referenced_ids)}"""
         for o in objects
     )
     return f"""Zone id: {zone_id!r}
@@ -1422,11 +1137,11 @@ Each object spec has the same fields as the bulk decomposition step:
   - `id` (string): unique, not colliding with any existing node in the scene
   - `prompt` (string): detailed description; used verbatim for text-to-3D
   - `parent` (string): id of the structural anchor (what this object physically rests on, hangs from, leans against, or is contained by)
-  - `parent_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
+  - `parent_relationship_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
   - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the object's silhouette is non-rectilinear, otherwise null/omitted.
   - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z, `90` = front faces -X, `180` = front faces -Z, `-90` = front faces +X. Use 0 for symmetric objects.
-  - `placement` (string): prose describing WHERE this object sits within / on / against its parent, plus alignment to any referenced peers.
-  - `referenced_ids` (list of {{target, kind}}): OPTIONAL secondary relationships when the placement text refers to nodes other than the parent. Each entry: `target` (peer's id) and `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine.
+  - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
+  - `relationship_ids` (list of {{target, kind}}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
 
 No additional prose, markdown, or code fences.
 </output>
@@ -1594,7 +1309,7 @@ def render_next_object(
 PRIOR ATTEMPTS — every object spec below was ALREADY rejected. Do NOT re-emit the same spec, and do not repeat the same structural mistake. Treat every listed reason as a hard constraint you must satisfy this time:
 {attempt_lines}
 
-Either emit a NEW ObjectSpec that fixes every listed reason, or set done=true. If you emit an object, its `referenced_ids` list must be non-empty and its first entry must be the object's structural parent (the supporter or containing zone)."""
+Either emit a NEW ObjectSpec that fixes every listed reason, or set done=true. If you emit an object, its `relationship_ids` list must be non-empty and its first entry must be the object's structural parent (the supporter or containing zone)."""
     else:
         retry_block = ""
     return f"""<scene_context>

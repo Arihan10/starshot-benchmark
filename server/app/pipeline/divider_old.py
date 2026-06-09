@@ -66,32 +66,6 @@ async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
     return out.bbox
 
 
-def _prior_zones(
-    all_nodes: list[Node],
-) -> list[tuple[str, str, str | None, str, BoundingBox, str | None]]:
-    """Every non-root zone already declared. Used as lateral scene
-    context for the decomposition step so siblings/cousins can inform
-    a zone's structure and relationships.
-
-    We include zones whose plan hasn't been authored yet — depth-first
-    traversal plans-then-decomposes one branch at a time, so the rest
-    of the parent's siblings (declared in the same batch, recursed
-    into later) sit here as `plan=None`. Their bboxes and placement
-    text are the load-bearing pieces: a cousin zone the decomposer is
-    about to plan around needs to know where its already-placed
-    neighbors sit, even if those neighbors' detailed plans don't exist
-    yet. Tuple: (id, prompt, plan_or_None, parent_id, bbox, placement).
-    """
-    out: list[tuple[str, str, str | None, str, BoundingBox, str | None]] = []
-    for n in all_nodes:
-        if n.mesh_url is not None:
-            continue
-        if n.parent_id is None:
-            continue
-        out.append((n.id, n.prompt, n.plan, n.parent_id, n.bbox, n.placement))
-    return out
-
-
 def _ancestors(
     node: Node, all_nodes: list[Node],
 ) -> list[tuple[str, str, str, BoundingBox, str | None]]:
@@ -144,27 +118,6 @@ def _scene_view(
     ]
 
 
-def _generated_objects(
-    all_nodes: list[Node],
-) -> list[tuple[str, str, str | None, BoundingBox, str | None, str | None]]:
-    """Every concrete (mesh-bearing) node placed so far, in declaration
-    order, with its bbox, placement prose, and parent_kind. Used to
-    ground planning context in what the scene actually looks like, not
-    just what's been promised — and so these nodes are valid
-    `referenced_ids` targets in downstream placement text. Tuple: (id,
-    prompt, parent_id, bbox, placement, parent_kind). `parent_kind` lets
-    the zone-decompose narrative split shell frames (ATTACHED) from
-    interior anchor objects (ON / IN)."""
-    return [
-        (
-            n.id, n.prompt, n.parent_id, n.bbox, n.placement,
-            n.parent_kind.value if n.parent_kind is not None else None,
-        )
-        for n in all_nodes
-        if n.mesh_url is not None
-    ]
-
-
 async def _plan_zone(
     *,
     zone_id: str,
@@ -199,8 +152,6 @@ async def _decompose_zone(
     """Emit child zones for a non-atomic zone. Each child is fully
     structured (id, prompt, proxy_shape, relationships) in one call."""
     assert node.plan is not None, "zone must be planned before decomposition"
-    root = all_nodes[0]
-    assert root.plan is not None, "root.plan must be set before decomposition"
     bbox_by_id = {n.id: n.bbox for n in all_nodes}
     return await llm.call_llm(
         system=SYSTEM_ZONE_DECOMPOSE,
@@ -210,11 +161,7 @@ async def _decompose_zone(
             zone_bbox=node.bbox,
             zone_plan=node.plan,
             ancestors=_ancestors(node, all_nodes),
-            objects=_generated_objects(all_nodes),
             scene=_scene_view(all_nodes),
-            scene_prompt=root.prompt,
-            scene_plan=root.plan,
-            prior_zones=_prior_zones(all_nodes),
             bbox_by_id=bbox_by_id,
         ),
         output_schema=ZoneDecomposeOutput,
@@ -241,6 +188,11 @@ async def _resolve_child_bboxes_batch(
         output_schema=BboxBatchOutput,
         node_id=parent.id,
         step="child_bbox_batch",
+        validate=lambda o: llm.require_matching_ids(
+            produced=[a.id for a in o.assignments],
+            expected=[c.id for c in children],
+            step="child_bbox_batch",
+        ),
     )
     # LLM emits each child's bbox in that child's parent's local frame.
     # Convert to world coordinates per-child with topological ordering
