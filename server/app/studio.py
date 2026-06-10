@@ -33,12 +33,14 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -94,6 +96,13 @@ CATALOG_PATH = LIBRARY_DIR / "library.json"
 # install) instead of a CDN — fetching the 500KB transcoder wasm per worker over
 # unpkg is what made the symmetry view crawl, while the client loads it instantly.
 VENDOR_THREE_DIR = _REPO_ROOT / "client" / "node_modules" / "three"
+
+# The pipeline's runs tree — shared with the main API server, which WRITES the
+# persisted walkthrough tours under <run>/<slot>/<model>/tour/. Honor the same
+# STARSHOT_RUNS_DIR env var the API server uses (default: the repo's runs/), so
+# the /pano client can list (GET /tours) and load (served read-only at /runs)
+# every rendered tour same-origin — no cross-origin or main-server-URL guessing.
+RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", str(_REPO_ROOT / "runs"))).resolve()
 
 # Maps the UI's proxy-shape strings to the pipeline's ProxyShape enum.
 # `rectangular_prism` is the bare AABB (None), matching the rest of the
@@ -303,6 +312,14 @@ def create_app() -> FastAPI:
         StaticFiles(directory=str(VENDOR_THREE_DIR), check_dir=False),
         name="vendor-three",
     )
+    # The runs tree (read-only), so the /pano client can fetch persisted tour
+    # bundles (tour.json + panos + proxy.glb) same-origin. check_dir=False so the
+    # studio still boots when no runs exist yet.
+    app.mount(
+        "/runs",
+        StaticFiles(directory=str(RUNS_DIR), check_dir=False),
+        name="runs",
+    )
 
     @app.get("/")
     async def index() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
@@ -327,6 +344,36 @@ def create_app() -> FastAPI:
     @app.get("/pano.js")
     async def pano_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(STATIC_DIR / "pano.js", media_type="text/javascript")
+
+    @app.get("/tours")
+    async def tours() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Every persisted walkthrough tour (<run>/<slot>/<model>/tour/tour.json)
+        under the runs tree, newest first, each with a same-origin /runs/ URL the
+        /pano client loads directly."""
+        items: list[dict[str, Any]] = []
+        if RUNS_DIR.is_dir():
+            for manifest in RUNS_DIR.glob("*/*/*/tour/tour.json"):
+                try:
+                    parts = manifest.relative_to(RUNS_DIR).parts
+                    if len(parts) != 5:
+                        continue
+                    data = json.loads(manifest.read_text(encoding="utf-8"))
+                    panos = data.get("panos")
+                    items.append(
+                        {
+                            "run": parts[0],
+                            "slot": parts[1],
+                            "model": parts[2],
+                            "url": "/runs/" + "/".join(quote(p) for p in parts),
+                            "panos": len(panos) if isinstance(panos, list) else 0,
+                            "has_proxy": bool(data.get("proxy")),
+                            "mtime": manifest.stat().st_mtime,
+                        }
+                    )
+                except (OSError, ValueError):
+                    continue
+        items.sort(key=lambda x: x["mtime"], reverse=True)
+        return {"tours": items}
 
     @app.get("/phrases")
     async def phrases() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

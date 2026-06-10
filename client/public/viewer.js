@@ -277,7 +277,9 @@ const sandboxOutputWrapEl = document.getElementById("sandbox-output-wrap");
 const sandboxOutputEl = document.getElementById("sandbox-output");
 const sandboxRenderNoteEl = document.getElementById("sandbox-render-note");
 const sandboxReasoningEl = document.getElementById("sandbox-reasoning");
-const sandboxReasoningBodyEl = document.getElementById("sandbox-reasoning-body");
+const sandboxReasoningBodyEl = document.getElementById(
+	"sandbox-reasoning-body",
+);
 const sandboxTestEl = document.getElementById("sandbox-test");
 const sandboxResetEl = document.getElementById("sandbox-reset");
 const sandboxPrevEl = document.getElementById("sandbox-prev");
@@ -431,7 +433,9 @@ function buildLogLine(event) {
 			label.className = "k";
 			label.textContent = ` ${k}=`;
 			kv.appendChild(label);
-			kv.appendChild(document.createTextNode(truncateLogValue(fmtValue(v))));
+			kv.appendChild(
+				document.createTextNode(truncateLogValue(fmtValue(v))),
+			);
 			p.appendChild(kv);
 		}
 	}
@@ -1425,13 +1429,13 @@ function treeClear() {
 // cost but is still counted as a request, so a newly-added model degrades to a
 // request-only row until its price is filled in.
 const MODEL_PRICING = {
-	"google/gemini-3.5-flash":       { in: 0.0000015,    out: 0.000009 },
-	"google/gemini-3.1-flash-lite":  { in: 0.00000025,   out: 0.0000015 },
-	"google/gemini-3.1-pro-preview": { in: 0.000002,     out: 0.000012 },
-	"openai/gpt-5.5":                { in: 0.000005,      out: 0.00003 },
-	"anthropic/claude-opus-4.6":     { in: 0.000005,      out: 0.000025 },
-	"deepseek/deepseek-v4-pro":      { in: 0.000000435,   out: 0.00000087 },
-	"anthropic/claude-opus-4.8":     { in: 0.000005,      out: 0.000025 },
+	"google/gemini-3.5-flash": { in: 0.0000015, out: 0.000009 },
+	"google/gemini-3.1-flash-lite": { in: 0.00000025, out: 0.0000015 },
+	"google/gemini-3.1-pro-preview": { in: 0.000002, out: 0.000012 },
+	"openai/gpt-5.5": { in: 0.000005, out: 0.00003 },
+	"anthropic/claude-opus-4.6": { in: 0.000005, out: 0.000025 },
+	"deepseek/deepseek-v4-pro": { in: 0.000000435, out: 0.00000087 },
+	"anthropic/claude-opus-4.8": { in: 0.000005, out: 0.000025 },
 };
 
 // eventIndex -> { step, model, tokensIn, tokensOut, isMatch, exact }
@@ -1446,14 +1450,18 @@ function estTokens(s) {
 }
 
 function trackLlmCost(event) {
-	const key = typeof event.index === "number" ? event.index : `u${_costFallbackKey++}`;
+	const key =
+		typeof event.index === "number"
+			? event.index
+			: `u${_costFallbackKey++}`;
 	const haveUsage =
 		Number.isFinite(event.tokens_in) && Number.isFinite(event.tokens_out);
 	const tokensIn = Number.isFinite(event.tokens_in)
 		? event.tokens_in
 		: estTokens(event.system) + estTokens(event.user);
 	const out = event.output;
-	const outText = typeof out === "string" ? out : out == null ? "" : JSON.stringify(out);
+	const outText =
+		typeof out === "string" ? out : out == null ? "" : JSON.stringify(out);
 	const tokensOut = Number.isFinite(event.tokens_out)
 		? event.tokens_out
 		: estTokens(outText) + estTokens(event.reasoning);
@@ -1569,11 +1577,25 @@ function renderCostTracker() {
 		const section = document.createElement("div");
 		section.className = "cost-section";
 		section.appendChild(
-			costSectionHead(currentModel ?? "selected model", "reasoning", reasoningCount, reasoningCost),
+			costSectionHead(
+				currentModel ?? "selected model",
+				"reasoning",
+				reasoningCount,
+				reasoningCost,
+			),
 		);
-		const steps = [...byStep.entries()].sort((a, b) => b[1].cost - a[1].cost);
+		const steps = [...byStep.entries()].sort(
+			(a, b) => b[1].cost - a[1].cost,
+		);
 		for (const [step, agg] of steps) {
-			section.appendChild(costRow(step.replace(/_/g, " "), agg.count, agg.cost, "cost-row"));
+			section.appendChild(
+				costRow(
+					step.replace(/_/g, " "),
+					agg.count,
+					agg.cost,
+					"cost-row",
+				),
+			);
 		}
 		costDropdownEl.appendChild(section);
 	}
@@ -1585,7 +1607,12 @@ function renderCostTracker() {
 		const section = document.createElement("div");
 		section.className = "cost-section";
 		section.appendChild(
-			costSectionHead("gemini-flash-lite", "matching", matchCount, matchCost),
+			costSectionHead(
+				"gemini-flash-lite",
+				"matching",
+				matchCount,
+				matchCost,
+			),
 		);
 		costDropdownEl.appendChild(section);
 	}
@@ -1593,7 +1620,9 @@ function renderCostTracker() {
 	const div = document.createElement("div");
 	div.className = "cost-divider";
 	costDropdownEl.appendChild(div);
-	costDropdownEl.appendChild(costRow("total", totalCount, totalCost, "cost-total"));
+	costDropdownEl.appendChild(
+		costRow("total", totalCount, totalCost, "cost-total"),
+	);
 
 	if (anyEstimated) {
 		const note = document.createElement("div");
@@ -1981,9 +2010,9 @@ let sandboxTesting = false;
 // deviation point and render the branch's downstream nodes — bboxes AND real
 // meshes — into sandboxOverlayRoot as its events stream. Break-out deletes it.
 let branchActive = false;
-let branchSource = null;        // EventSource over /branch/events
-let branchDeviationIndex = -1;  // original event index the fork deviated at
-let branchGen = 0;              // bumped per session to bail stale async mesh loads
+let branchSource = null; // EventSource over /branch/events
+let branchDeviationIndex = -1; // original event index the fork deviated at
+let branchGen = 0; // bumped per session to bail stale async mesh loads
 let branchDone = false;
 // `branchSteps` is the ordered list of the branch's steps: the committed ones
 // (each carries the prompt that was actually committed to the branch log, plus
@@ -1993,15 +2022,15 @@ let branchDone = false;
 // invalidates downstream.
 let branchSteps = [];
 let branchCursor = -1;
-let branchStepBusy = false;      // a proceed / re-run is in flight
-let branchAuto = false;          // "run rest" is streaming autonomously (no pauses)
-let branchRebuilding = false;    // a re-run reopen's snapshot is replaying
-let branchReopenTarget = 0;      // cursor to settle on once a rebuild finishes
+let branchStepBusy = false; // a proceed / re-run is in flight
+let branchAuto = false; // "run rest" is streaming autonomously (no pauses)
+let branchRebuilding = false; // a re-run reopen's snapshot is replaying
+let branchReopenTarget = 0; // cursor to settle on once a rebuild finishes
 // The in-progress prompt carried from EDIT mode into the branch's first step,
 // so entering simulation doesn't make you retype the edit. Consumed once.
 let branchFirstPrompt = null;
 const branchOverlayBboxIds = new Set(); // deviated ids already drawn as overlay wireframes
-const branchOverlayMeshes = new Map();  // id -> loaded GLB object3d in the overlay
+const branchOverlayMeshes = new Map(); // id -> loaded GLB object3d in the overlay
 let bboxesShown = localStorage.getItem(BBOX_VISIBLE_STORAGE_KEY) !== "0";
 function applyBboxToggleLabel() {
 	bboxToggleEl.textContent = `bboxes: ${bboxesShown ? "on" : "off"}`;
@@ -2743,7 +2772,8 @@ const topbarEl = document.getElementById("topbar");
 const TREE_TOP_GAP = 12;
 let _treeLayoutPending = false;
 function layoutTree() {
-	const top = Math.round(topbarEl.getBoundingClientRect().bottom) + TREE_TOP_GAP;
+	const top =
+		Math.round(topbarEl.getBoundingClientRect().bottom) + TREE_TOP_GAP;
 	treeEl.style.top = `${top}px`;
 	// Anchor the tree's bottom edge as before (20px margin + 30vh reserved for
 	// the lower-left panels); only its height flexes as the topbar grows.
@@ -2818,13 +2848,21 @@ function animate() {
 			if (oid !== null) {
 				setHoveredOverlay(oid);
 				setHoveredBbox(null);
-				positionOverlayTooltip(lastPointerClientX, lastPointerClientY, oid);
+				positionOverlayTooltip(
+					lastPointerClientX,
+					lastPointerClientY,
+					oid,
+				);
 			} else {
 				setHoveredOverlay(null);
 				const hoveredId = pickHoveredBboxId();
 				setHoveredBbox(hoveredId);
 				if (hoveredId !== null) {
-					positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+					positionTooltip(
+						lastPointerClientX,
+						lastPointerClientY,
+						hoveredId,
+					);
 				} else {
 					tooltip.style.display = "none";
 				}
@@ -2833,7 +2871,11 @@ function animate() {
 			const hoveredId = pickHoveredBboxId();
 			setHoveredBbox(hoveredId);
 			if (hoveredId !== null) {
-				positionTooltip(lastPointerClientX, lastPointerClientY, hoveredId);
+				positionTooltip(
+					lastPointerClientX,
+					lastPointerClientY,
+					hoveredId,
+				);
 			} else {
 				tooltip.style.display = "none";
 			}
@@ -2918,7 +2960,10 @@ function fitToScene() {
 // which serializes a scene's hundreds of meshes and is the main load-time
 // bottleneck. Give each a worker pool scaled to the machine so they decode in
 // parallel, off the main thread. One knob drives both.
-const DECODE_WORKERS = Math.min(16, Math.max(4, navigator.hardwareConcurrency || 4));
+const DECODE_WORKERS = Math.min(
+	16,
+	Math.max(4, navigator.hardwareConcurrency || 4),
+);
 
 const ktx2Loader = new KTX2Loader()
 	.setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
@@ -3190,7 +3235,9 @@ async function consumeMeshBundleStream(reader, state) {
 		count++;
 		bytes += glbLen;
 		const p = attachBundleMesh(id, glbB.buffer, state.gen, state)
-			.then(() => { if (firstMeshMs === 0) firstMeshMs = performance.now() - t0; })
+			.then(() => {
+				if (firstMeshMs === 0) firstMeshMs = performance.now() - t0;
+			})
 			.finally(() => inflight.delete(p));
 		inflight.add(p);
 		// Hold the read at MAX_INFLIGHT in-flight parses; resume once one drains.
@@ -3576,7 +3623,8 @@ function applySolidFillVisibility(id) {
 	if (!mesh) return;
 	const isFrame = treeNodes.get(id)?.kind === "frame";
 	const frameOk = isFrame ? framesShown : true;
-	mesh.visible = frameOk && !effectivelyHidden(id) && withinRewind(id, "bbox");
+	mesh.visible =
+		frameOk && !effectivelyHidden(id) && withinRewind(id, "bbox");
 }
 
 function refreshAllSolidFillVisibility() {
@@ -3614,9 +3662,7 @@ function applyBboxVisibility(id) {
 	// spatial reference. Hover gets full opacity so the user can see what
 	// they're about to pick.
 	const visible =
-		(id === selectedBboxId ||
-			id === hoveredBboxId ||
-			bboxesShown) &&
+		(id === selectedBboxId || id === hoveredBboxId || bboxesShown) &&
 		withinRewind(id, "bbox");
 	const dim =
 		selectedBboxId !== null &&
@@ -3644,7 +3690,10 @@ function applyModelVisibility(id) {
 	const isFrame = treeNodes.get(id)?.kind === "frame";
 	const frameOk = isFrame ? framesShown : true;
 	model.visible =
-		meshesShown && frameOk && !effectivelyHidden(id) && withinRewind(id, "model");
+		meshesShown &&
+		frameOk &&
+		!effectivelyHidden(id) &&
+		withinRewind(id, "model");
 }
 
 function refreshAllFrameModelVisibility() {
@@ -4439,7 +4488,9 @@ function renderTreeDetail() {
 			symBtn.title = symmetrizing
 				? "Mirroring this asset's mesh across the chosen plane"
 				: `Mirror this asset across the ${symmetrizePlane.toUpperCase()} plane, ${
-						symmetrizeKeepPositive ? "keeping the +half" : "keeping the −half"
+						symmetrizeKeepPositive
+							? "keeping the +half"
+							: "keeping the −half"
 					} (no AI calls). Propagates across the prefab group.`;
 			symBtn.addEventListener("click", (ev) => {
 				ev.stopPropagation();
@@ -4609,9 +4660,16 @@ function llmCallBlock(call, { defaultOpen, query = "" }) {
 
 	// Output is pretty-printed JSON because the structured-output schema is what
 	// the rest of the pipeline consumes; match against the same text the user sees.
-	const outText = call.output === null
-		? "(no output)"
-		: (() => { try { return JSON.stringify(call.output, null, 2); } catch { return String(call.output); } })();
+	const outText =
+		call.output === null
+			? "(no output)"
+			: (() => {
+					try {
+						return JSON.stringify(call.output, null, 2);
+					} catch {
+						return String(call.output);
+					}
+				})();
 
 	// When searching, only the boxes containing the term render. A call with no
 	// matching box is dropped entirely (return null) so "calls issued from this
@@ -4619,7 +4677,8 @@ function llmCallBlock(call, { defaultOpen, query = "" }) {
 	const sysHit = !!call.system && call.system.toLowerCase().includes(query);
 	const userHit = !!call.user && call.user.toLowerCase().includes(query);
 	const outHit = outText.toLowerCase().includes(query);
-	const reasHit = !!call.reasoning && call.reasoning.toLowerCase().includes(query);
+	const reasHit =
+		!!call.reasoning && call.reasoning.toLowerCase().includes(query);
 	if (filtering && !sysHit && !userHit && !outHit && !reasHit) return null;
 
 	const det = document.createElement("details");
@@ -4687,10 +4746,12 @@ function llmCallBlock(call, { defaultOpen, query = "" }) {
 		const userWrap = document.createElement("div");
 		userWrap.appendChild(preBlock(call.user, { cap: "360px" }));
 		userWrap.appendChild(copyButton(call.user, "copy input"));
-		det.appendChild(section(
-			`input (${call.user.length.toLocaleString()} chars)`,
-			userWrap,
-		));
+		det.appendChild(
+			section(
+				`input (${call.user.length.toLocaleString()} chars)`,
+				userWrap,
+			),
+		);
 	}
 
 	// Output — pretty-print JSON. We render with json formatting because the
@@ -4743,7 +4804,9 @@ function renderObsCard(node, { role, depth, query = "" }) {
 	const userPref = treeModalNodeOpen.get(node.id);
 	const detailsOpen = filtering
 		? true
-		: (userPref !== undefined ? userPref : (role === "focus"));
+		: userPref !== undefined
+			? userPref
+			: role === "focus";
 
 	const det = document.createElement("details");
 	det.className = "tm-obs-details";
@@ -4869,7 +4932,10 @@ function renderObsCard(node, { role, depth, query = "" }) {
 		const callDefaultOpen = role === "focus";
 		let shownProv = 0;
 		for (const entry of provenance) {
-			const block = llmCallBlock(entry.call, { defaultOpen: callDefaultOpen, query });
+			const block = llmCallBlock(entry.call, {
+				defaultOpen: callDefaultOpen,
+				query,
+			});
 			if (!block) continue; // filtered out — drop its relation line too
 			const relLine = document.createElement("div");
 			relLine.className = "tm-obs-provenance-rel";
@@ -4923,7 +4989,10 @@ function renderObsCard(node, { role, depth, query = "" }) {
 		// Focus card opens every call; ancestors/descendants leave them collapsed.
 		const callDefaultOpen = role === "focus";
 		for (const call of calls) {
-			const block = llmCallBlock(call, { defaultOpen: callDefaultOpen, query });
+			const block = llmCallBlock(call, {
+				defaultOpen: callDefaultOpen,
+				query,
+			});
 			if (!block) continue;
 			callsWrap.appendChild(block);
 			shownCalls++;
@@ -4974,10 +5043,14 @@ function renderModalSectionHeading(label, count, hint) {
 // lives in llmCallBlock + renderObsCard; these just let a card bail before it
 // builds its DOM (and the final empty-card guard keeps the result exact).
 function callMatchesQuery(call, q) {
-	return (!!call.system && call.system.toLowerCase().includes(q))
-		|| (!!call.user && call.user.toLowerCase().includes(q))
-		|| (!!call.reasoning && call.reasoning.toLowerCase().includes(q))
-		|| JSON.stringify(call.output ?? "").toLowerCase().includes(q);
+	return (
+		(!!call.system && call.system.toLowerCase().includes(q)) ||
+		(!!call.user && call.user.toLowerCase().includes(q)) ||
+		(!!call.reasoning && call.reasoning.toLowerCase().includes(q)) ||
+		JSON.stringify(call.output ?? "")
+			.toLowerCase()
+			.includes(q)
+	);
 }
 
 function nodeMatchesQuery(node, q) {
@@ -5078,28 +5151,44 @@ function renderTreeModal() {
 	if (ancestors.length > 0) {
 		const cards = [];
 		for (const a of ancestors) {
-			const card = renderObsCard(a, { role: "ancestor", depth: 0, query: q });
+			const card = renderObsCard(a, {
+				role: "ancestor",
+				depth: 0,
+				query: q,
+			});
 			if (card) cards.push(card);
 		}
 		if (cards.length > 0) {
-			treeModalBodyEl.appendChild(renderModalSectionHeading(
-				"ancestors",
-				cards.length,
-				q ? "matching boxes only" : "every LLM call that shaped the chain from root → focus",
-			));
+			treeModalBodyEl.appendChild(
+				renderModalSectionHeading(
+					"ancestors",
+					cards.length,
+					q
+						? "matching boxes only"
+						: "every LLM call that shaped the chain from root → focus",
+				),
+			);
 			for (const card of cards) treeModalBodyEl.appendChild(card);
 			visibleCards += cards.length;
 		}
 	}
 
 	// Focus block.
-	const focusCard = renderObsCard(focusNode, { role: "focus", depth: 0, query: q });
+	const focusCard = renderObsCard(focusNode, {
+		role: "focus",
+		depth: 0,
+		query: q,
+	});
 	if (focusCard) {
-		treeModalBodyEl.appendChild(renderModalSectionHeading(
-			"focused node",
-			1,
-			q ? "matching boxes only" : "every LLM call captured for this node, expanded",
-		));
+		treeModalBodyEl.appendChild(
+			renderModalSectionHeading(
+				"focused node",
+				1,
+				q
+					? "matching boxes only"
+					: "every LLM call captured for this node, expanded",
+			),
+		);
 		treeModalBodyEl.appendChild(focusCard);
 		visibleCards++;
 	}
@@ -5108,15 +5197,21 @@ function renderTreeModal() {
 	if (descendants.length > 0) {
 		const cards = [];
 		for (const [d, depth] of descendants) {
-			const card = renderObsCard(d, { role: "descendant", depth, query: q });
+			const card = renderObsCard(d, {
+				role: "descendant",
+				depth,
+				query: q,
+			});
 			if (card) cards.push(card);
 		}
 		if (cards.length > 0) {
-			treeModalBodyEl.appendChild(renderModalSectionHeading(
-				"descendants",
-				cards.length,
-				q ? "matching boxes only" : "indented by depth from focus",
-			));
+			treeModalBodyEl.appendChild(
+				renderModalSectionHeading(
+					"descendants",
+					cards.length,
+					q ? "matching boxes only" : "indented by depth from focus",
+				),
+			);
 			for (const card of cards) treeModalBodyEl.appendChild(card);
 			visibleCards += cards.length;
 		}
@@ -5199,9 +5294,12 @@ function execEmittedIds(call) {
 	const out = call?.output;
 	if (!out || typeof out !== "object") return [];
 	const ids = [];
-	if (Array.isArray(out.children)) for (const c of out.children) if (c?.id) ids.push(c.id);
-	if (Array.isArray(out.objects)) for (const o of out.objects) if (o?.id) ids.push(o.id);
-	if (out.object && typeof out.object === "object" && out.object.id) ids.push(out.object.id);
+	if (Array.isArray(out.children))
+		for (const c of out.children) if (c?.id) ids.push(c.id);
+	if (Array.isArray(out.objects))
+		for (const o of out.objects) if (o?.id) ids.push(o.id);
+	if (out.object && typeof out.object === "object" && out.object.id)
+		ids.push(out.object.id);
 	return ids;
 }
 
@@ -5217,9 +5315,13 @@ function buildExecGraph() {
 
 	for (const [id, n] of treeNodes) {
 		nodes.set(`s:${id}`, {
-			key: `s:${id}`, type: "scene", id,
-			sceneKind: n.kind ?? "zone", prompt: n.prompt ?? null,
-			phase: n.phase ?? "pending", order: n.order ?? 0,
+			key: `s:${id}`,
+			type: "scene",
+			id,
+			sceneKind: n.kind ?? "zone",
+			prompt: n.prompt ?? null,
+			phase: n.phase ?? "pending",
+			order: n.order ?? 0,
 		});
 	}
 
@@ -5231,8 +5333,14 @@ function buildExecGraph() {
 		if (!nodes.has(ownerKey)) {
 			// Call issued from an id with no scene node (e.g. "_unattributed").
 			nodes.set(ownerKey, {
-				key: ownerKey, type: "scene", id: ownerId,
-				sceneKind: "zone", prompt: null, phase: "pending", order: -1, synthetic: true,
+				key: ownerKey,
+				type: "scene",
+				id: ownerId,
+				sceneKind: "zone",
+				prompt: null,
+				phase: "pending",
+				order: -1,
+				synthetic: true,
 			});
 		}
 		const ordered = calls
@@ -5242,9 +5350,15 @@ function buildExecGraph() {
 			const stepKey = `t:${c.uid}`;
 			const emitted = [...new Set(execEmittedIds(c))];
 			nodes.set(stepKey, {
-				key: stepKey, type: "step", step: c.step || "(step)",
-				ownerId, call: c, eventIndex: c.eventIndex ?? null,
-				cached: !!c.cached, model: c.model || "", generated: emitted.length,
+				key: stepKey,
+				type: "step",
+				step: c.step || "(step)",
+				ownerId,
+				call: c,
+				eventIndex: c.eventIndex ?? null,
+				cached: !!c.cached,
+				model: c.model || "",
+				generated: emitted.length,
 			});
 			addChild(ownerKey, stepKey);
 			hasParent.add(stepKey);
@@ -5260,7 +5374,8 @@ function buildExecGraph() {
 	// Roots: the real scene root first, then anything still unparented (orphan
 	// scenes whose generating call we never saw, synthetic owners, etc.).
 	const roots = [];
-	if (treeRootId && nodes.has(`s:${treeRootId}`)) roots.push(`s:${treeRootId}`);
+	if (treeRootId && nodes.has(`s:${treeRootId}`))
+		roots.push(`s:${treeRootId}`);
 	for (const [key] of nodes) {
 		if (key === `s:${treeRootId}`) continue;
 		if (!hasParent.has(key)) roots.push(key);
@@ -5279,7 +5394,11 @@ function flowLayout(graph) {
 	let row = 0;
 	function place(key, depth) {
 		visited.add(key);
-		positions.set(key, { x: depth * FLOW.INDENT, y: row * FLOW.ROW_H, depth });
+		positions.set(key, {
+			x: depth * FLOW.INDENT,
+			y: row * FLOW.ROW_H,
+			depth,
+		});
 		row += 1;
 		for (const k of graph.childrenOf.get(key) ?? []) {
 			if (graph.nodes.has(k) && !visited.has(k)) place(k, depth + 1);
@@ -5439,7 +5558,8 @@ function renderFlow() {
 			const child = graph.nodes.get(ck);
 			const cy = cp.y + FLOW.PAD + FLOW.NODE_H / 2; // child vertical center
 			const cx = cp.x + FLOW.PAD; // child left edge
-			const cls = child.type === "step" ? "to-step" : `to-${child.sceneKind}`;
+			const cls =
+				child.type === "step" ? "to-step" : `to-${child.sceneKind}`;
 			edges += `<path class="flow-edge ${cls}" d="M ${sx.toFixed(1)} ${sy.toFixed(1)} L ${sx.toFixed(1)} ${(cy - R).toFixed(1)} Q ${sx.toFixed(1)} ${cy.toFixed(1)} ${(sx + R).toFixed(1)} ${cy.toFixed(1)} L ${cx.toFixed(1)} ${cy.toFixed(1)}" />`;
 		}
 	}
@@ -5448,7 +5568,11 @@ function renderFlow() {
 	const frag = document.createDocumentFragment();
 	for (const [key, p] of positions) {
 		const node = graph.nodes.get(key);
-		frag.appendChild(node.type === "step" ? buildStepFlowNode(node, p) : buildSceneFlowNode(node, p));
+		frag.appendChild(
+			node.type === "step"
+				? buildStepFlowNode(node, p)
+				: buildSceneFlowNode(node, p),
+		);
 	}
 	flowNodesEl.replaceChildren(frag);
 	applyFlowTransform();
@@ -5501,7 +5625,9 @@ function openObsForStep(ownerId, callUid) {
 	if (!treeModalOpen) openTreeModal();
 	if (treeNodes.has(ownerId)) focusModalOn(ownerId);
 	requestAnimationFrame(() => {
-		const focusCard = treeModalBodyEl.querySelector(".tm-obs-card.role-focus") || treeModalBodyEl;
+		const focusCard =
+			treeModalBodyEl.querySelector(".tm-obs-card.role-focus") ||
+			treeModalBodyEl;
 		const block = focusCard.querySelector(
 			`.tm-llm-call[data-call-key="${CSS.escape(String(callUid))}"]`,
 		);
@@ -5562,9 +5688,10 @@ function flowLocate(query) {
 	for (const [key, p] of _flowPositions) {
 		const node = _flowGraph.nodes.get(key);
 		if (!node) continue;
-		const hay = node.type === "step"
-			? `${node.step} ${node.ownerId}`
-			: `${node.id} ${node.prompt ?? ""}`;
+		const hay =
+			node.type === "step"
+				? `${node.step} ${node.ownerId}`
+				: `${node.id} ${node.prompt ?? ""}`;
 		if (hay.toLowerCase().includes(q)) {
 			const vw = flowViewportEl.clientWidth || 1;
 			const vh = flowViewportEl.clientHeight || 1;
@@ -5585,10 +5712,18 @@ treeFlowEl?.addEventListener("click", (ev) => {
 flowCloseEl?.addEventListener("click", closeFlowModal);
 flowFitEl?.addEventListener("click", fitFlow);
 flowZoomInEl?.addEventListener("click", () =>
-	flowZoomAt(flowViewportEl.clientWidth / 2, flowViewportEl.clientHeight / 2, 1.2),
+	flowZoomAt(
+		flowViewportEl.clientWidth / 2,
+		flowViewportEl.clientHeight / 2,
+		1.2,
+	),
 );
 flowZoomOutEl?.addEventListener("click", () =>
-	flowZoomAt(flowViewportEl.clientWidth / 2, flowViewportEl.clientHeight / 2, 1 / 1.2),
+	flowZoomAt(
+		flowViewportEl.clientWidth / 2,
+		flowViewportEl.clientHeight / 2,
+		1 / 1.2,
+	),
 );
 flowSearchEl?.addEventListener("input", () => {
 	flowSearchQuery = flowSearchEl.value;
@@ -5688,7 +5823,11 @@ let sandboxEntering = false;
 // sessions, like the other view toggles.
 const SANDBOX_EXPANDED_KEY = "starshot:sandbox-expanded";
 let sandboxExpanded = (() => {
-	try { return localStorage.getItem(SANDBOX_EXPANDED_KEY) === "1"; } catch { return false; }
+	try {
+		return localStorage.getItem(SANDBOX_EXPANDED_KEY) === "1";
+	} catch {
+		return false;
+	}
 })();
 
 function applySandboxExpanded() {
@@ -5725,9 +5864,11 @@ function buildCreationIndexMaps() {
 	for (const e of recordedEvents) {
 		if (typeof e.index !== "number" || typeof e.id !== "string") continue;
 		if (e.kind === "bbox") {
-			if (!bboxCreatedIndex.has(e.id)) bboxCreatedIndex.set(e.id, e.index);
+			if (!bboxCreatedIndex.has(e.id))
+				bboxCreatedIndex.set(e.id, e.index);
 		} else if (e.kind === "model") {
-			if (!modelCreatedIndex.has(e.id)) modelCreatedIndex.set(e.id, e.index);
+			if (!modelCreatedIndex.has(e.id))
+				modelCreatedIndex.set(e.id, e.index);
 		}
 	}
 }
@@ -5743,7 +5884,10 @@ function collectSandboxSteps() {
 	const byIndex = new Map();
 	for (const [, calls] of nodeLlmCalls) {
 		for (const c of calls) {
-			if (typeof c.eventIndex === "number" && !byIndex.has(c.eventIndex)) {
+			if (
+				typeof c.eventIndex === "number" &&
+				!byIndex.has(c.eventIndex)
+			) {
 				byIndex.set(c.eventIndex, c);
 			}
 		}
@@ -5761,10 +5905,18 @@ function setSandboxStatus(msg, cls = "") {
 function markSandboxEdited() {
 	// Baseline is the viewed branch step when stepping through a branch,
 	// otherwise the original recorded step being tuned.
-	const base = branchActive ? branchSteps[branchCursor] : sandboxSteps[sandboxCursor];
+	const base = branchActive
+		? branchSteps[branchCursor]
+		: sandboxSteps[sandboxCursor];
 	if (!base) return;
-	sandboxSystemFieldEl.classList.toggle("edited", sandboxSystemEl.value !== (base.system ?? ""));
-	sandboxUserFieldEl.classList.toggle("edited", sandboxUserEl.value !== (base.user ?? ""));
+	sandboxSystemFieldEl.classList.toggle(
+		"edited",
+		sandboxSystemEl.value !== (base.system ?? ""),
+	);
+	sandboxUserFieldEl.classList.toggle(
+		"edited",
+		sandboxUserEl.value !== (base.user ?? ""),
+	);
 }
 
 async function enterSandboxAtStep(call) {
@@ -5773,7 +5925,9 @@ async function enterSandboxAtStep(call) {
 		// Already tuning — just jump the cursor to the clicked step. Match by
 		// event index (stable) rather than uid, which differs across the
 		// dedup-collapsed duplicates.
-		const idx = sandboxSteps.findIndex((c) => c.eventIndex === call.eventIndex);
+		const idx = sandboxSteps.findIndex(
+			(c) => c.eventIndex === call.eventIndex,
+		);
 		if (idx >= 0) gotoSandboxStep(idx);
 		return;
 	}
@@ -5785,7 +5939,10 @@ async function enterSandboxAtStep(call) {
 		// pause it server-side if it was live.
 		const wasRunning = currentRunInfo()?.status === "running";
 		sandboxWasLive = wasRunning;
-		if (currentSource) { currentSource.close(); currentSource = null; }
+		if (currentSource) {
+			currentSource.close();
+			currentSource = null;
+		}
 		sandboxPausedByUs = false;
 		if (wasRunning && currentSlotId && currentModel) {
 			try {
@@ -5803,7 +5960,9 @@ async function enterSandboxAtStep(call) {
 		sandboxActive = true;
 		buildCreationIndexMaps();
 		sandboxSteps = collectSandboxSteps();
-		const cursor = sandboxSteps.findIndex((c) => c.eventIndex === call.eventIndex);
+		const cursor = sandboxSteps.findIndex(
+			(c) => c.eventIndex === call.eventIndex,
+		);
 		// Clear any selection so the rewound scene isn't dimmed by it.
 		if (selectedBboxId !== null) {
 			const prev = selectedBboxId;
@@ -5872,7 +6031,10 @@ async function testSandboxStep() {
 	setSandboxStatus("re-running this step…");
 	try {
 		const res = await fetch(
-			new URL(`/llm/test?run=${encodeURIComponent(currentRun)}`, SERVER_URL),
+			new URL(
+				`/llm/test?run=${encodeURIComponent(currentRun)}`,
+				SERVER_URL,
+			),
 			{
 				method: "POST",
 				headers: { "Content-Type": "application/json" },
@@ -5885,7 +6047,10 @@ async function testSandboxStep() {
 			},
 		);
 		if (!res.ok) {
-			setSandboxStatus(`test failed: HTTP ${res.status} — ${await res.text()}`, "err");
+			setSandboxStatus(
+				`test failed: HTTP ${res.status} — ${await res.text()}`,
+				"err",
+			);
 			return;
 		}
 		showSandboxResult(call, await res.json());
@@ -5917,10 +6082,14 @@ function showSandboxResult(call, data) {
 		sandboxRenderNoteEl.textContent = `▲ ${rendered} box${rendered === 1 ? "" : "es"} rendered on the canvas (magenta)`;
 		sandboxRenderNoteEl.classList.remove("nothing");
 	} else {
-		sandboxRenderNoteEl.textContent = "no spatial geometry in this step's output — shown as JSON below";
+		sandboxRenderNoteEl.textContent =
+			"no spatial geometry in this step's output — shown as JSON below";
 		sandboxRenderNoteEl.classList.add("nothing");
 	}
-	const tok = data.tokens_in != null ? ` · ${data.tokens_in}+${data.tokens_out ?? 0} tok` : "";
+	const tok =
+		data.tokens_in != null
+			? ` · ${data.tokens_in}+${data.tokens_out ?? 0} tok`
+			: "";
 	setSandboxStatus(`done${tok}`, "ok");
 }
 
@@ -5943,11 +6112,18 @@ function renderSandboxOverlay(call, output) {
 	clearSandboxOverlay();
 	if (!output || typeof output !== "object") return 0;
 	const boxes = [];
-	if (output.bbox && Array.isArray(output.bbox.origin) && Array.isArray(output.bbox.dimensions)) {
+	if (
+		output.bbox &&
+		Array.isArray(output.bbox.origin) &&
+		Array.isArray(output.bbox.dimensions)
+	) {
 		boxes.push({
 			origin: output.bbox.origin,
 			dimensions: output.bbox.dimensions,
-			meta: { id: call.parentNode ?? null, kind: treeNodes.get(call.parentNode)?.kind ?? null },
+			meta: {
+				id: call.parentNode ?? null,
+				kind: treeNodes.get(call.parentNode)?.kind ?? null,
+			},
 		});
 	}
 	if (Array.isArray(output.assignments)) {
@@ -5957,16 +6133,30 @@ function renderSandboxOverlay(call, output) {
 		// region — fine for a preview.
 		const owner = treeNodes.get(call.parentNode);
 		const pmin =
-			owner && Array.isArray(owner.origin) && Array.isArray(owner.dimensions)
+			owner &&
+			Array.isArray(owner.origin) &&
+			Array.isArray(owner.dimensions)
 				? bboxMinCorner(owner.origin, owner.dimensions)
 				: [0, 0, 0];
 		for (const a of output.assignments) {
 			const bb = a && a.bbox;
-			if (!bb || !Array.isArray(bb.origin) || !Array.isArray(bb.dimensions)) continue;
+			if (
+				!bb ||
+				!Array.isArray(bb.origin) ||
+				!Array.isArray(bb.dimensions)
+			)
+				continue;
 			boxes.push({
-				origin: [bb.origin[0] + pmin[0], bb.origin[1] + pmin[1], bb.origin[2] + pmin[2]],
+				origin: [
+					bb.origin[0] + pmin[0],
+					bb.origin[1] + pmin[1],
+					bb.origin[2] + pmin[2],
+				],
 				dimensions: bb.dimensions,
-				meta: { id: a.id ?? null, prompt: typeof a.prompt === "string" ? a.prompt : null },
+				meta: {
+					id: a.id ?? null,
+					prompt: typeof a.prompt === "string" ? a.prompt : null,
+				},
 			});
 		}
 	}
@@ -5978,8 +6168,12 @@ function renderSandboxOverlay(call, output) {
 // hover tooltip / selection surface to say "what this box is"; anonymous boxes
 // (no id) still register so they can be hovered, just with a generic label.
 function addSandboxOverlayBox(origin, dimensions, meta = null) {
-	const ox = origin[0], oy = origin[1], oz = origin[2];
-	const fx = ox + dimensions[0], fy = oy + dimensions[1], fz = oz + dimensions[2];
+	const ox = origin[0],
+		oy = origin[1],
+		oz = origin[2];
+	const fx = ox + dimensions[0],
+		fy = oy + dimensions[1],
+		fz = oz + dimensions[2];
 	const box3 = new THREE.Box3(
 		new THREE.Vector3(Math.min(ox, fx), Math.min(oy, fy), Math.min(oz, fz)),
 		new THREE.Vector3(Math.max(ox, fx), Math.max(oy, fy), Math.max(oz, fz)),
@@ -6011,9 +6205,11 @@ function applyOverlayColor(oid) {
 	const entry = sandboxOverlayBoxes.get(oid);
 	if (!entry) return;
 	const color =
-		oid === selectedOverlayId ? BBOX_COLOR_SELECTED
-		: oid === hoveredOverlayId ? BBOX_COLOR_HOVER
-		: SANDBOX_OVERLAY_COLOR;
+		oid === selectedOverlayId
+			? BBOX_COLOR_SELECTED
+			: oid === hoveredOverlayId
+				? BBOX_COLOR_HOVER
+				: SANDBOX_OVERLAY_COLOR;
 	entry.helper.material.color.setHex(color);
 }
 
@@ -6069,7 +6265,11 @@ function updateSimulateButton() {
 	if (!sandboxSimulateEl) return;
 	// Downstream simulation is just a mode — no test required. Enabled on any
 	// step (it forks before that step and steps through from there).
-	sandboxSimulateEl.disabled = !(sandboxActive && !branchActive && !!sandboxSteps[sandboxCursor]);
+	sandboxSimulateEl.disabled = !(
+		sandboxActive &&
+		!branchActive &&
+		!!sandboxSteps[sandboxCursor]
+	);
 }
 
 // Toggle the panel between EDIT (Phase A — tune the original) and BRANCH
@@ -6088,7 +6288,12 @@ function applySandboxMode() {
 	}
 	// BRANCH-only buttons (runstep/rerun/runrest visibility within branch is
 	// refined per viewed step by updateBranchControls).
-	for (const el of [sandboxRunStepEl, sandboxRerunEl, sandboxRunRestEl, sandboxBackEl]) {
+	for (const el of [
+		sandboxRunStepEl,
+		sandboxRerunEl,
+		sandboxRunRestEl,
+		sandboxBackEl,
+	]) {
 		if (el) el.style.display = branch ? "" : "none";
 	}
 	// prev / next exist in both modes (navigate original steps in EDIT, branch
@@ -6108,7 +6313,10 @@ async function simulateDownstream() {
 	setSandboxStatus("forking a branch & stepping through downstream…");
 	// Carry the in-progress edit into the first pause (this very step) so you
 	// don't retype it; consumed on the first branch.step.pending.
-	branchFirstPrompt = { system: sandboxSystemEl.value, user: sandboxUserEl.value };
+	branchFirstPrompt = {
+		system: sandboxSystemEl.value,
+		user: sandboxUserEl.value,
+	};
 	let res;
 	try {
 		res = await fetch(
@@ -6129,7 +6337,10 @@ async function simulateDownstream() {
 		return;
 	}
 	if (!res.ok) {
-		setSandboxStatus(`branch failed: HTTP ${res.status} — ${await res.text()}`, "err");
+		setSandboxStatus(
+			`branch failed: HTTP ${res.status} — ${await res.text()}`,
+			"err",
+		);
 		branchFirstPrompt = null;
 		updateSimulateButton();
 		return;
@@ -6175,11 +6386,16 @@ function openBranchStream() {
 	es.onmessage = (ev) => {
 		if (gen !== branchGen) return;
 		let data;
-		try { data = JSON.parse(ev.data); } catch { return; }
+		try {
+			data = JSON.parse(ev.data);
+		} catch {
+			return;
+		}
 		dispatchBranchEvent(data);
 	};
 	es.onerror = () => {
-		if (es.readyState === EventSource.CLOSED && branchSource === es) branchSource = null;
+		if (es.readyState === EventSource.CLOSED && branchSource === es)
+			branchSource = null;
 	};
 }
 
@@ -6198,9 +6414,16 @@ function dispatchBranchEvent(e) {
 		// running autonomously.
 		branchAuto = false;
 		branchSteps.push({
-			step: e.step || "(step)", owner: e.node || null, model: e.model || "",
-			system: e.system ?? "", user: e.user ?? "", output: null, reasoning: "",
-			ran: false, pauseIndex: idx, llmIndex: null,
+			step: e.step || "(step)",
+			owner: e.node || null,
+			model: e.model || "",
+			system: e.system ?? "",
+			user: e.user ?? "",
+			output: null,
+			reasoning: "",
+			ran: false,
+			pauseIndex: idx,
+			llmIndex: null,
 		});
 		branchStepBusy = false;
 		onBranchStepsGrew();
@@ -6220,9 +6443,16 @@ function dispatchBranchEvent(e) {
 			last.llmIndex = idx;
 		} else {
 			branchSteps.push({
-				step: e.step || "(step)", owner: e.node || null, model: e.model || "",
-				system: e.system ?? "", user: e.user ?? "", output: e.output ?? null,
-				reasoning: e.reasoning ?? "", ran: true, pauseIndex: null, llmIndex: idx,
+				step: e.step || "(step)",
+				owner: e.node || null,
+				model: e.model || "",
+				system: e.system ?? "",
+				user: e.user ?? "",
+				output: e.output ?? null,
+				reasoning: e.reasoning ?? "",
+				ran: true,
+				pauseIndex: null,
+				llmIndex: idx,
 			});
 		}
 		// Stay busy while running autonomously so the controls don't flicker open
@@ -6243,7 +6473,10 @@ function dispatchBranchEvent(e) {
 		branchDone = true;
 		branchAuto = false;
 		branchStepBusy = false;
-		if (branchRebuilding) { maybeSettleRebuild(); return; }
+		if (branchRebuilding) {
+			maybeSettleRebuild();
+			return;
+		}
 		if (branchCursor >= 0) renderBranchStep(branchCursor);
 		else updateBranchControls();
 		return;
@@ -6252,7 +6485,8 @@ function dispatchBranchEvent(e) {
 		branchAuto = false;
 		branchStepBusy = false;
 		branchRebuilding = false; // don't leave the controls wedged if a rebuild errors
-		if (branchCursor < 0 && branchSteps.length) branchCursor = branchSteps.length - 1;
+		if (branchCursor < 0 && branchSteps.length)
+			branchCursor = branchSteps.length - 1;
 		setSandboxStatus(`branch error: ${e.message ?? "unknown"}`, "err");
 		if (branchCursor >= 0) renderBranchStep(branchCursor);
 		else updateBranchControls();
@@ -6264,7 +6498,10 @@ function dispatchBranchEvent(e) {
 // Otherwise focus the first step on the initial pause (carrying the EDIT-mode
 // edit) or refresh the currently-viewed step (its controls / result).
 function onBranchStepsGrew() {
-	if (branchRebuilding) { maybeSettleRebuild(); return; }
+	if (branchRebuilding) {
+		maybeSettleRebuild();
+		return;
+	}
 	if (branchCursor === -1) {
 		const carried = branchFirstPrompt;
 		branchFirstPrompt = null;
@@ -6280,14 +6517,21 @@ function onBranchStepsGrew() {
 // landing the cursor on the target's fresh result.
 function maybeSettleRebuild() {
 	const t = branchReopenTarget;
-	const ready = branchDone || (t >= 0 && t < branchSteps.length && !!branchSteps[t] && branchSteps[t].ran);
+	const ready =
+		branchDone ||
+		(t >= 0 &&
+			t < branchSteps.length &&
+			!!branchSteps[t] &&
+			branchSteps[t].ran);
 	if (!ready) {
 		setSandboxStatus("re-running this step (invalidating later steps)…");
 		return;
 	}
 	branchRebuilding = false;
 	branchStepBusy = false;
-	const target = branchSteps.length ? Math.max(0, Math.min(t, branchSteps.length - 1)) : -1;
+	const target = branchSteps.length
+		? Math.max(0, Math.min(t, branchSteps.length - 1))
+		: -1;
 	if (target >= 0) renderBranchStep(target);
 	else updateBranchControls();
 }
@@ -6315,15 +6559,25 @@ function setBranchHeader(verb, step, owner, model) {
 // it can be re-run. `override` seeds the textareas (the carried EDIT-mode edit
 // on the first step).
 function renderBranchStep(i, override) {
-	if (i < 0 || i >= branchSteps.length) { updateBranchControls(); return; }
+	if (i < 0 || i >= branchSteps.length) {
+		updateBranchControls();
+		return;
+	}
 	branchCursor = i;
 	const s = branchSteps[i];
 	const isFrontier = !s.ran;
-	setBranchHeader(isFrontier ? "paused before" : "committed", s.step, s.owner, s.model);
+	setBranchHeader(
+		isFrontier ? "paused before" : "committed",
+		s.step,
+		s.owner,
+		s.model,
+	);
 	sandboxPosEl.textContent = `step ${i + 1} / ${branchSteps.length}`;
 	sandboxSystemEl.readOnly = false;
 	sandboxUserEl.readOnly = false;
-	sandboxSystemEl.value = override ? (override.system ?? "") : (s.system ?? "");
+	sandboxSystemEl.value = override
+		? (override.system ?? "")
+		: (s.system ?? "");
 	sandboxUserEl.value = override ? (override.user ?? "") : (s.user ?? "");
 	markSandboxEdited();
 	if (s.ran && s.output != null) {
@@ -6341,9 +6595,13 @@ function renderBranchStep(i, override) {
 		sandboxReasoningBodyEl.textContent = "";
 	}
 	if (isFrontier) {
-		setSandboxStatus("paused — edit this step's prompt, then run it (or run the rest)");
+		setSandboxStatus(
+			"paused — edit this step's prompt, then run it (or run the rest)",
+		);
 	} else {
-		setSandboxStatus("committed step — edit + re-run to change it (invalidates later steps)");
+		setSandboxStatus(
+			"committed step — edit + re-run to change it (invalidates later steps)",
+		);
 	}
 	updateBranchControls();
 }
@@ -6356,7 +6614,10 @@ function updateBranchControls() {
 	const idle = !branchStepBusy && !branchRebuilding;
 	// prev / next: pure (non-destructive) observability navigation.
 	if (sandboxPrevEl) sandboxPrevEl.disabled = !(idle && branchCursor > 0);
-	if (sandboxNextEl) sandboxNextEl.disabled = !(idle && branchCursor < branchSteps.length - 1);
+	if (sandboxNextEl)
+		sandboxNextEl.disabled = !(
+			idle && branchCursor < branchSteps.length - 1
+		);
 	// Run (frontier) — run the next, un-run step.
 	if (sandboxRunStepEl) {
 		sandboxRunStepEl.style.display = onFrontier ? "" : "none";
@@ -6383,7 +6644,11 @@ async function sendBranchProceed(body) {
 				`/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}/branch/step?run=${encodeURIComponent(currentRun)}`,
 				SERVER_URL,
 			),
-			{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) },
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(body),
+			},
 		);
 		if (!res.ok) {
 			setSandboxStatus(`step failed: HTTP ${res.status}`, "err");
@@ -6437,13 +6702,20 @@ async function runBranchStep() {
 	branchStepBusy = true;
 	updateBranchControls();
 	setSandboxStatus("running this step…");
-	const ok = await sendBranchProceed({ system: sandboxSystemEl.value, user: sandboxUserEl.value });
-	if (!ok) { branchStepBusy = false; updateBranchControls(); }
+	const ok = await sendBranchProceed({
+		system: sandboxSystemEl.value,
+		user: sandboxUserEl.value,
+	});
+	if (!ok) {
+		branchStepBusy = false;
+		updateBranchControls();
+	}
 }
 
 // Run the rest of the branch from the frontier with no further pauses.
 async function runBranchRest() {
-	if (!branchActive || branchStepBusy || branchRebuilding || branchDone) return;
+	if (!branchActive || branchStepBusy || branchRebuilding || branchDone)
+		return;
 	const s = branchSteps[branchCursor];
 	if (!s || s.ran) return; // only from the frontier
 	branchStepBusy = true;
@@ -6451,9 +6723,15 @@ async function runBranchRest() {
 	updateBranchControls();
 	setSandboxStatus("running the rest of the branch…");
 	const ok = await sendBranchProceed({
-		system: sandboxSystemEl.value, user: sandboxUserEl.value, auto: true,
+		system: sandboxSystemEl.value,
+		user: sandboxUserEl.value,
+		auto: true,
 	});
-	if (!ok) { branchStepBusy = false; branchAuto = false; updateBranchControls(); }
+	if (!ok) {
+		branchStepBusy = false;
+		branchAuto = false;
+		updateBranchControls();
+	}
 }
 
 // Re-run a COMMITTED step with the edited prompt: invalidates everything after
@@ -6468,8 +6746,16 @@ async function reRunBranchStep() {
 	branchAuto = false; // re-run drops us back into interactive stepping
 	updateBranchControls();
 	setSandboxStatus("re-running this step (invalidating later steps)…");
-	const ok = await sendBranchRerun(s.llmIndex, sandboxSystemEl.value, sandboxUserEl.value);
-	if (!ok) { branchStepBusy = false; updateBranchControls(); return; }
+	const ok = await sendBranchRerun(
+		s.llmIndex,
+		sandboxSystemEl.value,
+		sandboxUserEl.value,
+	);
+	if (!ok) {
+		branchStepBusy = false;
+		updateBranchControls();
+		return;
+	}
 	// Rebuild from the truncated + re-run log; settle the cursor back on this step.
 	branchReopenTarget = target;
 	branchRebuilding = true;
@@ -6511,7 +6797,9 @@ async function loadBranchMesh(id, url) {
 	}
 	gltf.scene.traverse((child) => {
 		if (child.isMesh && child.material) {
-			const mats = Array.isArray(child.material) ? child.material : [child.material];
+			const mats = Array.isArray(child.material)
+				? child.material
+				: [child.material];
 			for (const m of mats) m.side = THREE.DoubleSide;
 		}
 	});
@@ -6544,7 +6832,9 @@ function clearBranchStateLocal() {
 
 async function discardBranch() {
 	if (!branchActive) return;
-	const slotId = currentSlotId, model = currentModel, run = currentRun;
+	const slotId = currentSlotId,
+		model = currentModel,
+		run = currentRun;
 	clearBranchStateLocal();
 	try {
 		await fetch(
@@ -6605,8 +6895,15 @@ async function exitSandbox() {
 	}
 	// Only reconnect if we're still viewing the same cell (a switch during the
 	// await already tore down + reloaded its own stream).
-	if (reconnect && currentSlotId === slotId && currentModel === model && !currentSource) {
-		setStatus("tuning discarded — original run restored, streaming events…");
+	if (
+		reconnect &&
+		currentSlotId === slotId &&
+		currentModel === model &&
+		!currentSource
+	) {
+		setStatus(
+			"tuning discarded — original run restored, streaming events…",
+		);
 		subscribe(`${slotEventsUrl(slotId, model)}&since=${highestEventIndex}`);
 	} else if (currentSlotId === slotId && currentModel === model) {
 		setStatus("tuning discarded — original run restored");
@@ -6620,7 +6917,9 @@ async function exitSandbox() {
 function teardownSandboxSilently() {
 	if (!sandboxActive && !branchActive) return;
 	if (branchActive) {
-		const slotId = currentSlotId, model = currentModel, run = currentRun;
+		const slotId = currentSlotId,
+			model = currentModel,
+			run = currentRun;
 		clearBranchStateLocal();
 		if (slotId && model && run) {
 			try {
@@ -6668,7 +6967,9 @@ async function pauseCurrentCell() {
 			// slot_pause flips the cell to "paused" synchronously, so awaiting the
 			// status refresh before re-reading lets the button settle correctly
 			// (the run.paused SSE event also lands and closes the live stream).
-			setStatus("run paused — open a step and 'tune' to rewind & edit its prompt");
+			setStatus(
+				"run paused — open a step and 'tune' to rewind & edit its prompt",
+			);
 			await refreshSlots();
 		} else {
 			setStatus(`pause failed: HTTP ${res.status}`, "err");
@@ -6688,8 +6989,12 @@ sandboxResetEl?.addEventListener("click", () => {
 	markSandboxEdited();
 	setSandboxStatus("prompts reset to the recorded values");
 });
-sandboxPrevEl?.addEventListener("click", () => (branchActive ? navBranch(-1) : gotoSandboxStep(sandboxCursor - 1)));
-sandboxNextEl?.addEventListener("click", () => (branchActive ? navBranch(1) : gotoSandboxStep(sandboxCursor + 1)));
+sandboxPrevEl?.addEventListener("click", () =>
+	branchActive ? navBranch(-1) : gotoSandboxStep(sandboxCursor - 1),
+);
+sandboxNextEl?.addEventListener("click", () =>
+	branchActive ? navBranch(1) : gotoSandboxStep(sandboxCursor + 1),
+);
 sandboxSimulateEl?.addEventListener("click", simulateDownstream);
 sandboxRunStepEl?.addEventListener("click", runBranchStep);
 sandboxRerunEl?.addEventListener("click", reRunBranchStep);
@@ -6701,7 +7006,9 @@ sandboxSystemEl?.addEventListener("input", markSandboxEdited);
 sandboxUserEl?.addEventListener("input", markSandboxEdited);
 sandboxExpandEl?.addEventListener("click", () => {
 	sandboxExpanded = !sandboxExpanded;
-	try { localStorage.setItem(SANDBOX_EXPANDED_KEY, sandboxExpanded ? "1" : "0"); } catch {}
+	try {
+		localStorage.setItem(SANDBOX_EXPANDED_KEY, sandboxExpanded ? "1" : "0");
+	} catch {}
 	applySandboxExpanded();
 });
 sandboxCopyEl?.addEventListener("click", async () => {
@@ -6710,9 +7017,14 @@ sandboxCopyEl?.addEventListener("click", async () => {
 	try {
 		await navigator.clipboard.writeText(text);
 		sandboxCopyEl.textContent = "✓ copied";
-		setTimeout(() => { sandboxCopyEl.textContent = "⧉ copy"; }, 1200);
+		setTimeout(() => {
+			sandboxCopyEl.textContent = "⧉ copy";
+		}, 1200);
 	} catch {
-		setSandboxStatus("copy failed — select the output text manually", "err");
+		setSandboxStatus(
+			"copy failed — select the output text manually",
+			"err",
+		);
 	}
 });
 flowPauseEl?.addEventListener("click", pauseCurrentCell);
@@ -6788,7 +7100,10 @@ function placeTooltip(clientX, clientY) {
 // built from the box's own metadata (the branch/tested node isn't in the tree).
 function positionOverlayTooltip(clientX, clientY, oid) {
 	const entry = sandboxOverlayBoxes.get(oid);
-	if (!entry) { tooltip.style.display = "none"; return; }
+	if (!entry) {
+		tooltip.style.display = "none";
+		return;
+	}
 	const kind = entry.kind;
 	tooltip.textContent = "";
 	const head = document.createElement("div");
@@ -6890,7 +7205,8 @@ function pickRightClickId() {
 		// otherwise right-clicking past a zone hit would hide a non-zone the
 		// user can't even select via left-click.
 		if (zonesOnlyActive() && helper.userData.nodeKind !== "zone") continue;
-		if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit)) continue;
+		if (!raycaster.ray.intersectBox(helper.box, _rightClickBoxHit))
+			continue;
 		const dist = _rightClickBoxHit.distanceToSquared(camera.position);
 		if (dist < bestDist) {
 			bestDist = dist;
@@ -8037,7 +8353,8 @@ async function loadCellScene(slotId, model, { forceLive = false } = {}) {
 				`fetch ${(tFetch - t0) | 0}ms · projection ${(performance.now() - tFetch) | 0}ms`,
 		);
 	}
-	highestEventIndex = typeof payload.last_index === "number" ? payload.last_index : -1;
+	highestEventIndex =
+		typeof payload.last_index === "number" ? payload.last_index : -1;
 	prefetchMeshBundle(slotId, model, sceneGen);
 	// In generated mode, resolve this cell's versions + selected version now so the
 	// picker populates immediately instead of after the next poll tick.
@@ -8832,9 +9149,15 @@ async function stitchPanoEquirect(faces, faceSize, onProgress) {
 
 			o[oi] = d[i00] * w00 + d[i10] * w10 + d[i01] * w01 + d[i11] * w11;
 			o[oi + 1] =
-				d[i00 + 1] * w00 + d[i10 + 1] * w10 + d[i01 + 1] * w01 + d[i11 + 1] * w11;
+				d[i00 + 1] * w00 +
+				d[i10 + 1] * w10 +
+				d[i01 + 1] * w01 +
+				d[i11 + 1] * w11;
 			o[oi + 2] =
-				d[i00 + 2] * w00 + d[i10 + 2] * w10 + d[i01 + 2] * w01 + d[i11 + 2] * w11;
+				d[i00 + 2] * w00 +
+				d[i10 + 2] * w10 +
+				d[i01 + 2] * w01 +
+				d[i11 + 2] * w11;
 			o[oi + 3] = 255;
 		}
 		if (row % 128 === 127) {
@@ -8919,7 +9242,10 @@ async function buildMergedSceneGlbBuffer() {
 	if (geoms.length === 0) return null;
 	try {
 		const exporter = new GLTFExporter();
-		return await exporter.parseAsync(group, { binary: true, onlyVisible: false });
+		return await exporter.parseAsync(group, {
+			binary: true,
+			onlyVisible: false,
+		});
 	} finally {
 		for (const g of geoms) g.dispose();
 		mat.dispose();
@@ -9053,8 +9379,15 @@ function cellQuery() {
 
 async function uploadPano(cell, panoId, blob) {
 	const res = await fetch(
-		new URL(`${cell.base}/tour/pano/${encodeURIComponent(panoId)}?${cell.run}`, SERVER_URL).toString(),
-		{ method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: blob },
+		new URL(
+			`${cell.base}/tour/pano/${encodeURIComponent(panoId)}?${cell.run}`,
+			SERVER_URL,
+		).toString(),
+		{
+			method: "PUT",
+			headers: { "Content-Type": "image/jpeg" },
+			body: blob,
+		},
 	);
 	if (!res.ok) throw new Error(`upload ${panoId} → ${res.status}`);
 }
@@ -9063,11 +9396,17 @@ panoAutoEl?.addEventListener("click", async () => {
 	if (panoBusy) return;
 	const cell = cellQuery();
 	if (!cell) {
-		appendEvent({ kind: "run.error", message: "auto-tour: no active run/slot/model" });
+		appendEvent({
+			kind: "run.error",
+			message: "auto-tour: no active run/slot/model",
+		});
 		return;
 	}
 	if (modelsById.size === 0) {
-		appendEvent({ kind: "run.error", message: "auto-tour: scene has no meshes loaded yet" });
+		appendEvent({
+			kind: "run.error",
+			message: "auto-tour: scene has no meshes loaded yet",
+		});
 		return;
 	}
 	panoBusy = true;
@@ -9090,24 +9429,38 @@ panoAutoEl?.addEventListener("click", async () => {
 		if (!planRes.ok) throw new Error(`/anchors → ${planRes.status}`);
 		const plan = await planRes.json();
 		const anchors = Array.isArray(plan.anchors) ? plan.anchors : [];
-		if (anchors.length === 0) throw new Error("planner returned no anchors");
+		if (anchors.length === 0)
+			throw new Error("planner returned no anchors");
 
-		await fetch(new URL(`${cell.base}/tour/reset?${cell.run}`, SERVER_URL).toString(), {
-			method: "POST",
-		});
+		await fetch(
+			new URL(
+				`${cell.base}/tour/reset?${cell.run}`,
+				SERVER_URL,
+			).toString(),
+			{
+				method: "POST",
+			},
+		);
 
 		const panoMeta = [];
 		for (let i = 0; i < anchors.length; i++) {
 			const a = anchors[i];
 			const pos = Array.isArray(a.position) ? a.position : [0, 0, 0];
 			const lookAt = Array.isArray(a.look_at) ? a.look_at : null;
-			const id = typeof a.id === "string" && a.id ? a.id : `anchor-${String(i).padStart(3, "0")}`;
+			const id =
+				typeof a.id === "string" && a.id
+					? a.id
+					: `anchor-${String(i).padStart(3, "0")}`;
 			camera.position.set(pos[0], pos[1], pos[2]);
 			// Forward = toward the look_at point (horizontal fallback otherwise);
 			// only seeds /pano's initial view — the capture itself is a full 360.
 			let forward = [0, 0, -1];
 			if (lookAt) {
-				_v.set(lookAt[0] - pos[0], lookAt[1] - pos[1], lookAt[2] - pos[2]);
+				_v.set(
+					lookAt[0] - pos[0],
+					lookAt[1] - pos[1],
+					lookAt[2] - pos[2],
+				);
 				if (_v.lengthSq() > 1e-9) forward = _v.normalize().toArray();
 			}
 			panoAutoEl.textContent = `capturing ${i + 1}/${anchors.length}…`;
@@ -9128,12 +9481,22 @@ panoAutoEl?.addEventListener("click", async () => {
 		const merged = await buildMergedSceneGlbBuffer();
 		if (merged) {
 			const proxyRes = await fetch(
-				new URL(`${cell.base}/tour/proxy?${cell.run}`, SERVER_URL).toString(),
-				{ method: "POST", headers: { "Content-Type": "model/gltf-binary" }, body: merged },
+				new URL(
+					`${cell.base}/tour/proxy?${cell.run}`,
+					SERVER_URL,
+				).toString(),
+				{
+					method: "POST",
+					headers: { "Content-Type": "model/gltf-binary" },
+					body: merged,
+				},
 			);
 			hasProxy = proxyRes.ok;
 			if (!proxyRes.ok) {
-				appendEvent({ kind: "run.error", message: `auto-tour proxy → ${proxyRes.status} (tour saved without it)` });
+				appendEvent({
+					kind: "run.error",
+					message: `auto-tour proxy → ${proxyRes.status} (tour saved without it)`,
+				});
 			}
 		}
 
@@ -9142,20 +9505,37 @@ panoAutoEl?.addEventListener("click", async () => {
 			version: 1,
 			proxy: hasProxy ? "proxy.glb" : null,
 			planner_model: typeof plan.model === "string" ? plan.model : null,
-			planner_reasoning: typeof plan.reasoning === "string" ? plan.reasoning : null,
+			planner_reasoning:
+				typeof plan.reasoning === "string" ? plan.reasoning : null,
 			panos: panoMeta,
 		};
 		const manRes = await fetch(
-			new URL(`${cell.base}/tour/manifest?${cell.run}`, SERVER_URL).toString(),
-			{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(manifest) },
+			new URL(
+				`${cell.base}/tour/manifest?${cell.run}`,
+				SERVER_URL,
+			).toString(),
+			{
+				method: "POST",
+				headers: { "Content-Type": "application/json" },
+				body: JSON.stringify(manifest),
+			},
 		);
 		if (!manRes.ok) throw new Error(`/tour/manifest → ${manRes.status}`);
 		const { tour_url } = await manRes.json();
 		const absUrl = new URL(tour_url, SERVER_URL).toString();
-		setStatus(`auto-tour ready · ${panoMeta.length} panos · open /pano?tour=${absUrl}`, "hdr");
-		appendEvent({ kind: "run.done", message: `auto-tour persisted: ${absUrl}` });
+		setStatus(
+			`auto-tour ready · ${panoMeta.length} panos · open /pano?tour=${absUrl}`,
+			"hdr",
+		);
+		appendEvent({
+			kind: "run.done",
+			message: `auto-tour persisted: ${absUrl}`,
+		});
 	} catch (e) {
-		appendEvent({ kind: "run.error", message: `auto-tour failed: ${e.message}` });
+		appendEvent({
+			kind: "run.error",
+			message: `auto-tour failed: ${e.message}`,
+		});
 	} finally {
 		camera.position.copy(camSnapshot.pos);
 		controls.target.copy(camSnapshot.target);
@@ -9744,7 +10124,10 @@ async function refreshGenerateGate() {
 		const meshes =
 			status.meshes ?? (status.ids ?? []).map((id) => ({ id, v: null }));
 		for (const m of meshes)
-			genMeshSymmetry.set(m.id, { plane: m.sym ?? "none", was: m.symWas ?? null });
+			genMeshSymmetry.set(m.id, {
+				plane: m.sym ?? "none",
+				was: m.symWas ?? null,
+			});
 		syncGeneratedMeshes(meshes, slotId, model, run, genVersion);
 	}
 	if (_genWasRunning && !status.running) {

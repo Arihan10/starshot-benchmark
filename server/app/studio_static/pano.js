@@ -824,11 +824,14 @@ function applyTour(entries, proxyRoot) {
 	activate(0);
 }
 
-// Load a persisted tour by URL (the server-side bundle under /artifacts/<cell>/
-// tour/). Pano + proxy files are resolved RELATIVE to the tour.json URL, so the
-// same manifest works wherever it's hosted (and cross-origin from the studio to
-// the main server, which serves them with permissive CORS). Driven by ?tour=.
+// Load a persisted tour by URL. Pano + proxy files are resolved RELATIVE to the
+// tour.json URL, so the same manifest works wherever it's hosted. `tourUrl` is
+// normalized against the page origin first, so both a same-origin path (the
+// /runs/<cell>/tour/tour.json the rendered-tour list hands us) and an absolute
+// cross-origin URL (the viewer's ?tour= hand-off) work. Driven by the saved-tour
+// list, the file drop's manifest, and ?tour=.
 async function loadFromTourUrl(tourUrl) {
+	tourUrl = new URL(tourUrl, location.href).toString();
 	setHud("loading tour…");
 	let manifest;
 	try {
@@ -863,6 +866,55 @@ async function loadFromTourUrl(tourUrl) {
 	}
 	applyTour(entries, proxyRoot);
 }
+
+// --- rendered-tour browser ---------------------------------------------------
+// Lists every tour persisted under the runs tree (GET /tours, served read-only
+// at /runs); click one to load it directly — no file handling.
+const toursListEl = document.getElementById("tours-list");
+const toursRefreshEl = document.getElementById("tours-refresh");
+let loadedTourUrl = null;
+let lastTours = [];
+
+function renderTours() {
+	toursListEl.innerHTML = "";
+	if (lastTours.length === 0) {
+		const empty = document.createElement("div");
+		empty.id = "tours-empty";
+		empty.textContent = "no rendered tours yet";
+		toursListEl.appendChild(empty);
+		return;
+	}
+	for (const t of lastTours) {
+		const item = document.createElement("div");
+		item.className = `tour-item${t.url === loadedTourUrl ? " active" : ""}`;
+		const proxy = t.has_proxy ? " · proxy" : "";
+		item.innerHTML =
+			`<span class="title">${t.slot} · ${t.model}</span>` +
+			`<span class="meta">${t.run} · ${t.panos} pano${t.panos === 1 ? "" : "s"}${proxy}</span>`;
+		item.addEventListener("click", () => loadSavedTour(t));
+		toursListEl.appendChild(item);
+	}
+}
+
+async function refreshTours() {
+	try {
+		const res = await fetch("/tours");
+		if (!res.ok) throw new Error(`HTTP ${res.status}`);
+		const data = await res.json();
+		lastTours = Array.isArray(data.tours) ? data.tours : [];
+	} catch {
+		lastTours = [];
+	}
+	renderTours();
+}
+
+async function loadSavedTour(t) {
+	loadedTourUrl = t.url;
+	renderTours();
+	await loadFromTourUrl(t.url);
+}
+
+toursRefreshEl?.addEventListener("click", refreshTours);
 
 dropEl.addEventListener("dragover", (ev) => {
 	ev.preventDefault();
@@ -924,7 +976,8 @@ renderer.setAnimationLoop((time) => {
 	renderer.render(scene, camera);
 });
 
-// Auto-load a server-persisted tour when opened as /pano?tour=<url to tour.json>
-// (how the auto-tour flow and the website hand off a finished tour).
+// Populate the rendered-tour list on boot, and auto-load a specific tour when
+// opened as /pano?tour=<url to tour.json> (the auto-tour / website hand-off).
+refreshTours();
 const _tourParam = new URLSearchParams(location.search).get("tour");
 if (_tourParam) loadFromTourUrl(_tourParam);

@@ -91,6 +91,60 @@
             .pano-item.active { border-color: var(--blue); color: var(--blue-ink); background: rgba(74, 143, 216, 0.10); }
             .pano-item .pos { margin-left: auto; color: var(--faint); font-size: 10px; }
 
+            #tours-section {
+                display: flex;
+                flex-direction: column;
+                min-height: 0;
+                border-bottom: 1px solid var(--line);
+            }
+            #tours-header {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 10px 12px 6px;
+                color: var(--muted);
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            #tours-header button {
+                margin-left: auto;
+                background: #0c0d10;
+                border: 1px solid var(--line);
+                color: var(--ink-dim);
+                border-radius: 4px;
+                cursor: pointer;
+                padding: 2px 8px;
+                font: inherit;
+                font-size: 12px;
+                line-height: 1;
+            }
+            #tours-header button:hover { border-color: var(--blue); color: var(--blue-ink); }
+            #tours-list {
+                max-height: 34vh;
+                overflow-y: auto;
+                padding: 0 12px 10px;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            .tour-item {
+                padding: 7px 10px;
+                border: 1px solid var(--line);
+                border-radius: 5px;
+                background: var(--panel-2);
+                cursor: pointer;
+                color: var(--ink-dim);
+                display: flex;
+                flex-direction: column;
+                gap: 2px;
+            }
+            .tour-item:hover { border-color: var(--blue); }
+            .tour-item.active { border-color: var(--blue); color: var(--blue-ink); background: rgba(74, 143, 216, 0.10); }
+            .tour-item .title { font-size: 12px; }
+            .tour-item .meta { color: var(--faint); font-size: 10px; }
+            #tours-empty { color: var(--faint); font-size: 11px; padding: 4px 2px 8px; }
+
             #help {
                 padding: 12px 14px;
                 border-top: 1px solid var(--line);
@@ -181,6 +235,13 @@
                     <br />— or click to pick files —
                     <input id="file-input" type="file" multiple accept=".json,.glb,model/gltf-binary,image/*" />
                 </label>
+                <div id="tours-section">
+                    <div id="tours-header">
+                        <span>rendered tours</span>
+                        <button id="tours-refresh" type="button" title="Reload the list of rendered tours">⟳</button>
+                    </div>
+                    <div id="tours-list"></div>
+                </div>
                 <div id="pano-list"></div>
                 <div id="help">
                     capturing a tour:
