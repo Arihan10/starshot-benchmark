@@ -1,0 +1,210 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>pano walkthrough — 360° tour viewer</title>
+        <style>
+            :root {
+                --bg: #0e0f12;
+                --panel: #16181d;
+                --panel-2: #1a1c22;
+                --line: #2a2d35;
+                --ink: #e6e6e6;
+                --ink-dim: #b8bcc4;
+                --muted: #8a8f99;
+                --faint: #5a5e68;
+                --blue: #4a8fd8;
+                --blue-ink: #9ad4ff;
+                --green: #8bd17c;
+                --amber: #e0c271;
+                --red: #ff8080;
+            }
+            * { box-sizing: border-box; }
+            html, body {
+                margin: 0;
+                height: 100%;
+                background: var(--bg);
+                color: var(--ink);
+                font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            }
+            #app { display: grid; grid-template-columns: 320px 1fr; height: 100%; min-height: 0; }
+
+            /* ---- sidebar ---- */
+            #sidebar {
+                display: flex;
+                flex-direction: column;
+                min-height: 0;
+                border-right: 1px solid var(--line);
+                background: var(--panel);
+            }
+            #brand {
+                padding: 12px 14px;
+                border-bottom: 1px solid var(--line);
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+            }
+            #brand h1 { margin: 0; font-size: 14px; font-weight: 600; color: var(--blue-ink); letter-spacing: 0.02em; }
+            #brand .sub { color: var(--faint); font-size: 10px; }
+            #brand a { margin-left: auto; color: var(--blue-ink); font-size: 10px; text-decoration: none; }
+
+            #drop {
+                margin: 12px;
+                padding: 22px 14px;
+                border: 1px dashed var(--line);
+                border-radius: 6px;
+                text-align: center;
+                color: var(--muted);
+                cursor: pointer;
+                transition: border-color 0.15s, background 0.15s;
+            }
+            #drop:hover, #drop.over {
+                border-color: var(--blue);
+                background: rgba(74, 143, 216, 0.06);
+                color: var(--ink-dim);
+            }
+            #drop b { color: var(--blue-ink); font-weight: 600; }
+            #drop input { display: none; }
+
+            #pano-list {
+                flex: 1;
+                overflow-y: auto;
+                min-height: 0;
+                padding: 0 12px 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            .pano-item {
+                padding: 7px 10px;
+                border: 1px solid var(--line);
+                border-radius: 5px;
+                background: var(--panel-2);
+                cursor: pointer;
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+                color: var(--ink-dim);
+            }
+            .pano-item:hover { border-color: var(--blue); }
+            .pano-item.active { border-color: var(--blue); color: var(--blue-ink); background: rgba(74, 143, 216, 0.10); }
+            .pano-item .pos { margin-left: auto; color: var(--faint); font-size: 10px; }
+
+            #help {
+                padding: 12px 14px;
+                border-top: 1px solid var(--line);
+                color: var(--muted);
+                font-size: 11px;
+            }
+            #help ol { margin: 6px 0 0; padding-left: 18px; }
+            #help li { margin: 3px 0; }
+            #help code { color: var(--blue-ink); }
+
+            /* ---- viewer ---- */
+            #stage { position: relative; min-width: 0; min-height: 0; }
+            #stage canvas { display: block; }
+            #stage.grabbing canvas { cursor: grabbing; }
+            #stage.hotspot canvas { cursor: pointer; }
+            #hud {
+                position: absolute;
+                left: 12px;
+                bottom: 12px;
+                padding: 6px 10px;
+                background: rgba(14, 15, 18, 0.75);
+                border: 1px solid var(--line);
+                border-radius: 5px;
+                color: var(--ink-dim);
+                font-size: 11px;
+                pointer-events: none;
+                z-index: 10;
+            }
+            /* Dips toward the background colour mid-move to mask interpolation
+               artifacts; sits above the canvas but below the HUD/controls. */
+            #travel-fade {
+                position: absolute;
+                inset: 0;
+                background: var(--bg);
+                opacity: 0;
+                pointer-events: none;
+                z-index: 5;
+            }
+            #hud b { color: var(--blue-ink); font-weight: 600; }
+            #empty {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                color: var(--faint);
+                pointer-events: none;
+            }
+            #view-toggle {
+                position: absolute;
+                top: 12px;
+                right: 12px;
+                padding: 7px 12px;
+                background: rgba(14, 15, 18, 0.8);
+                border: 1px solid var(--line);
+                border-radius: 6px;
+                color: var(--ink-dim);
+                font: inherit;
+                font-size: 12px;
+                cursor: pointer;
+                user-select: none;
+                z-index: 10;
+                transition: border-color 0.15s, color 0.15s, background 0.15s;
+            }
+            #view-toggle:hover { border-color: var(--blue); color: var(--blue-ink); }
+            #view-toggle.poly { border-color: var(--amber); color: var(--amber); }
+            #view-toggle[hidden] { display: none; }
+        </style>
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "/vendor/three/build/three.module.js",
+                    "three/addons/": "/vendor/three/examples/jsm/"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <div id="app">
+            <aside id="sidebar">
+                <div id="brand">
+                    <h1>pano walkthrough</h1>
+                    <span class="sub">360° tour viewer</span>
+                    <a href="/">← studio</a>
+                </div>
+                <label id="drop">
+                    drop <b>tour.json + JPEGs (+ proxy.glb)</b> here
+                    <br />— or click to pick files —
+                    <input id="file-input" type="file" multiple accept=".json,.glb,model/gltf-binary,image/*" />
+                </label>
+                <div id="pano-list"></div>
+                <div id="help">
+                    capturing a tour:
+                    <ol>
+                        <li>in the main viewer, place the camera and hit <code>📷 capture 360</code> (repeat from several spots)</li>
+                        <li><code>save tour</code> downloads <code>tour.json</code>, one JPEG per pano, and a low-poly <code>proxy.glb</code></li>
+                        <li>drop all of those files here</li>
+                    </ol>
+                    <br />
+                    <b>with proxy.glb</b> → walkthrough: the panos are projected onto
+                    the low-poly scene, so travelling between capture points
+                    interpolates with real parallax.
+                    <br /><b>without it</b> → 360 spheres you click between.
+                    <br /><br />
+                    drag to look · scroll to zoom · click a floor disc to travel
+                </div>
+            </aside>
+            <main id="stage">
+                <div id="empty">drop a captured tour to start</div>
+                <div id="travel-fade"></div>
+                <div id="hud" hidden></div>
+                <button id="view-toggle" type="button" hidden>◐ 360 view</button>
+            </main>
+        </div>
+        <script type="module" src="/pano.js"></script>
+    </body>
+</html>

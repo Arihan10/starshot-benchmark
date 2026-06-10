@@ -8662,6 +8662,511 @@ exportGlbEl.addEventListener("click", async () => {
 	}
 });
 
+// --- 360° panorama capture ----------------------------------------------------
+//
+// Captures an equirectangular 360° snapshot from the current camera position:
+// the live scene is rendered six times (cube faces, 90° fov) into a square
+// scissored viewport on the main canvas — full parity with what's on screen
+// (ACES tonemapping, sRGB, shadows, IBL, antialiasing; preserveDrawingBuffer is
+// already on for the gif exporter, so the canvas is readable after render) —
+// then CPU-stitched into a standard equirect panorama. The stitch uses the same
+// direction→uv convention as three's EquirectangularReflectionMapping
+// (u = atan2(z, x)/2π + 0.5, v = asin(y)/π + 0.5), so the JPEGs drop into any
+// three.js scene as a background. Captures accumulate into a "tour" (world
+// position + view direction per pano); "save tour" downloads tour.json + one
+// JPEG per pano for the studio's /pano matterport-style walkthrough page.
+
+const panoCaptureEl = document.getElementById("pano-capture");
+const panoSaveEl = document.getElementById("pano-save");
+const panoClearEl = document.getElementById("pano-clear");
+const panoAutoEl = document.getElementById("pano-auto");
+
+const panoTour = []; // { id, position: [x,y,z], forward: [x,y,z], blob }
+let panoBusy = false;
+
+const PANO_FACE_TARGET = 1280; // device px per cube face, capped by canvas size
+const PANO_WIDTH_CAP = 4096; // equirect output width cap (height = width / 2)
+
+// forward/up per face; right = cross(forward, up) — matches what lookAt builds,
+// so the analytic projection in the stitch agrees with the render exactly.
+// Order: +X, -X, +Y, -Y, +Z, -Z (indexed as axis*2 + (negative ? 1 : 0)).
+const PANO_FACES = [
+	{ f: [1, 0, 0], up: [0, 1, 0] },
+	{ f: [-1, 0, 0], up: [0, 1, 0] },
+	{ f: [0, 1, 0], up: [0, 0, 1] },
+	{ f: [0, -1, 0], up: [0, 0, -1] },
+	{ f: [0, 0, 1], up: [0, 1, 0] },
+	{ f: [0, 0, -1], up: [0, 1, 0] },
+];
+const PANO_FACE_BASIS = PANO_FACES.map(({ f, up }) => ({
+	f,
+	up,
+	right: [
+		f[1] * up[2] - f[2] * up[1],
+		f[2] * up[0] - f[0] * up[2],
+		f[0] * up[1] - f[1] * up[0],
+	],
+}));
+
+function updatePanoButtons() {
+	panoCaptureEl.disabled = panoBusy;
+	panoSaveEl.disabled = panoTour.length === 0 || panoBusy;
+	panoClearEl.disabled = panoTour.length === 0 || panoBusy;
+	if (panoAutoEl) panoAutoEl.disabled = panoBusy;
+	panoSaveEl.textContent = `save tour (${panoTour.length})`;
+}
+
+// Render the six cube faces through the main renderer and read each back as
+// ImageData. Synchronous; the animate loop repaints the viewport next frame.
+function renderPanoFaces() {
+	const canvas = renderer.domElement;
+	const dpr = renderer.getPixelRatio();
+	const prevSize = renderer.getSize(new THREE.Vector2());
+	const faceSize = Math.min(PANO_FACE_TARGET, canvas.width, canvas.height);
+	const faceCss = faceSize / dpr; // setViewport/Scissor multiply by dpr
+
+	const faceCam = new THREE.PerspectiveCamera(90, 1, camera.near, camera.far);
+	faceCam.position.copy(camera.position);
+
+	const crop = document.createElement("canvas");
+	crop.width = faceSize;
+	crop.height = faceSize;
+	const cropCtx = crop.getContext("2d", { willReadFrequently: true });
+
+	// Debug wireframes don't belong in a "realistic" pano.
+	const bboxWasVisible = bboxRoot.visible;
+	bboxRoot.visible = false;
+
+	const faces = [];
+	try {
+		renderer.setScissorTest(true);
+		for (const { f, up } of PANO_FACES) {
+			faceCam.up.set(up[0], up[1], up[2]);
+			faceCam.lookAt(
+				camera.position.x + f[0],
+				camera.position.y + f[1],
+				camera.position.z + f[2],
+			);
+			renderer.setViewport(0, 0, faceCss, faceCss);
+			renderer.setScissor(0, 0, faceCss, faceCss);
+			renderer.render(scene, faceCam);
+			// Viewport (0,0) is the canvas' bottom-left; drawImage's source rect
+			// is top-left-origin device pixels.
+			cropCtx.drawImage(
+				canvas,
+				0,
+				canvas.height - faceSize,
+				faceSize,
+				faceSize,
+				0,
+				0,
+				faceSize,
+				faceSize,
+			);
+			faces.push(cropCtx.getImageData(0, 0, faceSize, faceSize));
+		}
+	} finally {
+		renderer.setScissorTest(false);
+		renderer.setViewport(0, 0, prevSize.x, prevSize.y);
+		renderer.setScissor(0, 0, prevSize.x, prevSize.y);
+		bboxRoot.visible = bboxWasVisible;
+	}
+	return { faces, faceSize };
+}
+
+// Stitch six face ImageDatas into one equirect ImageData (bilinear sampling).
+// Chunked by rows so the tab stays responsive on 4096×2048 outputs.
+async function stitchPanoEquirect(faces, faceSize, onProgress) {
+	const W = Math.min(PANO_WIDTH_CAP, faceSize * 4);
+	const H = W / 2;
+	const out = new ImageData(W, H);
+	const o = out.data;
+	const S = faceSize;
+	const maxIdx = S - 1;
+
+	for (let row = 0; row < H; row++) {
+		const v = 1 - (row + 0.5) / H;
+		const phi = (v - 0.5) * Math.PI;
+		const dy = Math.sin(phi);
+		const cosPhi = Math.cos(phi);
+		let oi = row * W * 4;
+		for (let col = 0; col < W; col++, oi += 4) {
+			const az = ((col + 0.5) / W - 0.5) * 2 * Math.PI;
+			const dx = cosPhi * Math.cos(az);
+			const dz = cosPhi * Math.sin(az);
+
+			const ax = Math.abs(dx);
+			const ay = Math.abs(dy);
+			const az2 = Math.abs(dz);
+			let faceIdx;
+			if (ax >= ay && ax >= az2) faceIdx = dx > 0 ? 0 : 1;
+			else if (ay >= az2) faceIdx = dy > 0 ? 2 : 3;
+			else faceIdx = dz > 0 ? 4 : 5;
+
+			const { f, up, right } = PANO_FACE_BASIS[faceIdx];
+			const t = dx * f[0] + dy * f[1] + dz * f[2];
+			const u2 = (dx * right[0] + dy * right[1] + dz * right[2]) / t;
+			const v2 = (dx * up[0] + dy * up[1] + dz * up[2]) / t;
+
+			// Face pixel coords (image y down) + bilinear weights.
+			const px = (u2 * 0.5 + 0.5) * S - 0.5;
+			const py = (0.5 - v2 * 0.5) * S - 0.5;
+			let x0 = Math.floor(px);
+			let y0 = Math.floor(py);
+			const fx = px - x0;
+			const fy = py - y0;
+			x0 = x0 < 0 ? 0 : x0 > maxIdx ? maxIdx : x0;
+			y0 = y0 < 0 ? 0 : y0 > maxIdx ? maxIdx : y0;
+			const x1 = x0 < maxIdx ? x0 + 1 : maxIdx;
+			const y1 = y0 < maxIdx ? y0 + 1 : maxIdx;
+
+			const d = faces[faceIdx].data;
+			const i00 = (y0 * S + x0) * 4;
+			const i10 = (y0 * S + x1) * 4;
+			const i01 = (y1 * S + x0) * 4;
+			const i11 = (y1 * S + x1) * 4;
+			const w00 = (1 - fx) * (1 - fy);
+			const w10 = fx * (1 - fy);
+			const w01 = (1 - fx) * fy;
+			const w11 = fx * fy;
+
+			o[oi] = d[i00] * w00 + d[i10] * w10 + d[i01] * w01 + d[i11] * w11;
+			o[oi + 1] =
+				d[i00 + 1] * w00 + d[i10 + 1] * w10 + d[i01 + 1] * w01 + d[i11 + 1] * w11;
+			o[oi + 2] =
+				d[i00 + 2] * w00 + d[i10 + 2] * w10 + d[i01 + 2] * w01 + d[i11 + 2] * w11;
+			o[oi + 3] = 255;
+		}
+		if (row % 128 === 127) {
+			onProgress?.(row / H);
+			await sleep(0);
+		}
+	}
+
+	const outCanvas = document.createElement("canvas");
+	outCanvas.width = W;
+	outCanvas.height = H;
+	outCanvas.getContext("2d").putImageData(out, 0, 0);
+	return new Promise((resolve, reject) =>
+		outCanvas.toBlob(
+			(blob) =>
+				blob ? resolve(blob) : reject(new Error("JPEG encode failed")),
+			"image/jpeg",
+			0.92,
+		),
+	);
+}
+
+function downloadPanoBlob(blob, filename) {
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement("a");
+	a.href = url;
+	a.download = filename;
+	a.click();
+	URL.revokeObjectURL(url);
+}
+
+// Bake one placed mesh's geometry into world-space, float32, position-only
+// geometry. Reading every vertex through `fromBufferAttribute` DENORMALIZES
+// quantized attributes, and writing into a FRESH Float32 array sidesteps the
+// classic trap that broke the proxy: the placed library GLBs are Meshopt /
+// KHR_mesh_quantization, so three keeps their POSITION as an INTEGER buffer with
+// the dequantization folded into the node matrix. Calling
+// `geometry.clone().applyMatrix4(matrixWorld)` writes world-space floats back
+// into that integer buffer — truncating every vertex onto the integer grid (and,
+// for normalized attributes, collapsing the whole scene toward the origin),
+// which is exactly the snapped/sharded ~10%-size blob the proxy was showing.
+function bakeWorldGeometry(mesh) {
+	const src = mesh.geometry.getAttribute("position");
+	if (!src) return null;
+	const count = src.count;
+	const positions = new Float32Array(count * 3);
+	const v = new THREE.Vector3();
+	const m = mesh.matrixWorld;
+	for (let i = 0; i < count; i++) {
+		v.fromBufferAttribute(src, i).applyMatrix4(m);
+		positions[i * 3] = v.x;
+		positions[i * 3 + 1] = v.y;
+		positions[i * 3 + 2] = v.z;
+	}
+	const g = new THREE.BufferGeometry();
+	g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+	// Keep the topology (a copy, detached from the source buffer). Normals are
+	// dropped: the server strips them and /pano recomputes them on the proxy.
+	const idx = mesh.geometry.getIndex();
+	if (idx) g.setIndex(new THREE.BufferAttribute(idx.array.slice(), 1));
+	return g;
+}
+
+// Bake the live scene into one material-free, world-space GLB (geometry only:
+// each placed mesh baked into world space — the same frame the pano positions
+// were captured in). This is the merged stand-in the server's /proxy decimator
+// reduces to a few-thousand-triangle projection proxy. Returns the binary GLB
+// ArrayBuffer, or null when the scene has no meshes.
+async function buildMergedSceneGlbBuffer() {
+	if (modelsById.size === 0) return null;
+	const group = new THREE.Group();
+	const mat = new THREE.MeshStandardMaterial();
+	const geoms = [];
+	sceneRoot.updateWorldMatrix(true, true);
+	sceneRoot.traverse((o) => {
+		if (!o.isMesh || !o.geometry) return;
+		const g = bakeWorldGeometry(o);
+		if (!g) return;
+		group.add(new THREE.Mesh(g, mat));
+		geoms.push(g);
+	});
+	if (geoms.length === 0) return null;
+	try {
+		const exporter = new GLTFExporter();
+		return await exporter.parseAsync(group, { binary: true, onlyVisible: false });
+	} finally {
+		for (const g of geoms) g.dispose();
+		mat.dispose();
+	}
+}
+
+// Build the merged scene and hand it to /proxy, returning the decimated proxy
+// blob for the downloadable tour bundle (manual "save tour" flow).
+async function buildProxyGlbBlob() {
+	const glb = await buildMergedSceneGlbBuffer();
+	if (!glb) return null;
+	const res = await fetch(new URL("/proxy", SERVER_URL).toString(), {
+		method: "POST",
+		headers: { "Content-Type": "model/gltf-binary" },
+		body: glb,
+	});
+	if (!res.ok) throw new Error(`server /proxy → ${res.status}`);
+	return new Blob([await res.arrayBuffer()], { type: "model/gltf-binary" });
+}
+
+// Render + stitch one 360° equirectangular pano from the CURRENT camera position
+// (the capture is orientation-independent — renderPanoFaces builds its own
+// axis-aligned face cameras). Returns the JPEG blob.
+async function capturePanoBlob(onProgress) {
+	const { faces, faceSize } = renderPanoFaces();
+	return stitchPanoEquirect(faces, faceSize, onProgress);
+}
+
+panoCaptureEl.addEventListener("click", async () => {
+	if (panoBusy) return;
+	panoBusy = true;
+	panoCaptureEl.disabled = true;
+	updatePanoButtons();
+	try {
+		panoCaptureEl.textContent = "rendering…";
+		const blob = await capturePanoBlob((frac) => {
+			panoCaptureEl.textContent = `stitching ${Math.round(frac * 100)}%`;
+		});
+		const fwd = camera.getWorldDirection(new THREE.Vector3());
+		panoTour.push({
+			id: `pano-${String(panoTour.length).padStart(3, "0")}`,
+			position: camera.position.toArray(),
+			forward: fwd.toArray(),
+			blob,
+		});
+	} catch (e) {
+		appendEvent({
+			kind: "run.error",
+			message: `360 capture failed: ${e.message}`,
+		});
+	} finally {
+		panoCaptureEl.textContent = "📷 capture 360";
+		panoCaptureEl.disabled = false;
+		panoBusy = false;
+		updatePanoButtons();
+	}
+});
+
+panoSaveEl.addEventListener("click", async () => {
+	if (panoTour.length === 0 || panoBusy) return;
+	panoBusy = true;
+	updatePanoButtons();
+	// Decimate the live scene into a low-poly projection proxy first; the
+	// manifest only advertises proxy.glb if it actually built, so /pano falls
+	// back to its sphere mode when the proxy is missing.
+	let proxyBlob = null;
+	try {
+		panoSaveEl.textContent = "building proxy…";
+		proxyBlob = await buildProxyGlbBlob();
+	} catch (e) {
+		appendEvent({
+			kind: "run.error",
+			message: `proxy build failed (saving panos without it): ${e.message}`,
+		});
+	}
+	const manifest = {
+		version: 1,
+		proxy: proxyBlob ? "proxy.glb" : null,
+		panos: panoTour.map((p) => ({
+			id: p.id,
+			file: `${p.id}.jpg`,
+			position: p.position,
+			forward: p.forward,
+		})),
+	};
+	try {
+		panoSaveEl.textContent = "saving…";
+		downloadPanoBlob(
+			new Blob([JSON.stringify(manifest, null, 2)], {
+				type: "application/json",
+			}),
+			"tour.json",
+		);
+		// Space the downloads out so the browser doesn't coalesce/drop them.
+		if (proxyBlob) {
+			await sleep(250);
+			downloadPanoBlob(proxyBlob, "proxy.glb");
+		}
+		for (const p of panoTour) {
+			await sleep(250);
+			downloadPanoBlob(p.blob, `${p.id}.jpg`);
+		}
+	} finally {
+		panoBusy = false;
+		updatePanoButtons();
+	}
+});
+
+panoClearEl.addEventListener("click", () => {
+	if (panoBusy) return;
+	panoTour.length = 0;
+	updatePanoButtons();
+});
+
+// --- auto-tour: LLM-planned anchors → auto-capture → server-persisted tour ----
+//
+// The "other side of the coin". The server reads THIS cell's scene hierarchy,
+// has a lightweight model propose capture anchor points, and returns them. We
+// then drive the existing capture machinery over those anchors (set the camera,
+// render a 360, upload it), decimate + upload the proxy, and write the manifest —
+// so the whole tour persists under /artifacts/<cell>/tour/ for /pano to load by
+// URL. The manual capture/save flow is untouched.
+
+function cellQuery() {
+	if (!currentRun || !currentSlotId || !currentModel) return null;
+	return {
+		base: `/slots/${encodeURIComponent(currentSlotId)}/${encodeURIComponent(currentModel)}`,
+		run: `run=${encodeURIComponent(currentRun)}`,
+	};
+}
+
+async function uploadPano(cell, panoId, blob) {
+	const res = await fetch(
+		new URL(`${cell.base}/tour/pano/${encodeURIComponent(panoId)}?${cell.run}`, SERVER_URL).toString(),
+		{ method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: blob },
+	);
+	if (!res.ok) throw new Error(`upload ${panoId} → ${res.status}`);
+}
+
+panoAutoEl?.addEventListener("click", async () => {
+	if (panoBusy) return;
+	const cell = cellQuery();
+	if (!cell) {
+		appendEvent({ kind: "run.error", message: "auto-tour: no active run/slot/model" });
+		return;
+	}
+	if (modelsById.size === 0) {
+		appendEvent({ kind: "run.error", message: "auto-tour: scene has no meshes loaded yet" });
+		return;
+	}
+	panoBusy = true;
+	updatePanoButtons();
+	// Lock the camera so the animate loop's OrbitControls.update() doesn't fight
+	// the positions we set per anchor; restore the view afterwards.
+	const camSnapshot = {
+		pos: camera.position.clone(),
+		target: controls.target.clone(),
+		userMoved: cameraUserMoved,
+	};
+	cameraUserMoved = true;
+	const _v = new THREE.Vector3();
+	try {
+		panoAutoEl.textContent = "planning anchors…";
+		const planRes = await fetch(
+			new URL(`${cell.base}/anchors?${cell.run}`, SERVER_URL).toString(),
+			{ method: "POST" },
+		);
+		if (!planRes.ok) throw new Error(`/anchors → ${planRes.status}`);
+		const plan = await planRes.json();
+		const anchors = Array.isArray(plan.anchors) ? plan.anchors : [];
+		if (anchors.length === 0) throw new Error("planner returned no anchors");
+
+		await fetch(new URL(`${cell.base}/tour/reset?${cell.run}`, SERVER_URL).toString(), {
+			method: "POST",
+		});
+
+		const panoMeta = [];
+		for (let i = 0; i < anchors.length; i++) {
+			const a = anchors[i];
+			const pos = Array.isArray(a.position) ? a.position : [0, 0, 0];
+			const lookAt = Array.isArray(a.look_at) ? a.look_at : null;
+			const id = typeof a.id === "string" && a.id ? a.id : `anchor-${String(i).padStart(3, "0")}`;
+			camera.position.set(pos[0], pos[1], pos[2]);
+			// Forward = toward the look_at point (horizontal fallback otherwise);
+			// only seeds /pano's initial view — the capture itself is a full 360.
+			let forward = [0, 0, -1];
+			if (lookAt) {
+				_v.set(lookAt[0] - pos[0], lookAt[1] - pos[1], lookAt[2] - pos[2]);
+				if (_v.lengthSq() > 1e-9) forward = _v.normalize().toArray();
+			}
+			panoAutoEl.textContent = `capturing ${i + 1}/${anchors.length}…`;
+			const blob = await capturePanoBlob();
+			await uploadPano(cell, id, blob);
+			panoMeta.push({
+				id,
+				file: `${id}.jpg`,
+				position: pos,
+				forward,
+				reason: typeof a.reason === "string" ? a.reason : undefined,
+			});
+		}
+
+		// Decimate + persist the proxy from the merged scene.
+		let hasProxy = false;
+		panoAutoEl.textContent = "building proxy…";
+		const merged = await buildMergedSceneGlbBuffer();
+		if (merged) {
+			const proxyRes = await fetch(
+				new URL(`${cell.base}/tour/proxy?${cell.run}`, SERVER_URL).toString(),
+				{ method: "POST", headers: { "Content-Type": "model/gltf-binary" }, body: merged },
+			);
+			hasProxy = proxyRes.ok;
+			if (!proxyRes.ok) {
+				appendEvent({ kind: "run.error", message: `auto-tour proxy → ${proxyRes.status} (tour saved without it)` });
+			}
+		}
+
+		panoAutoEl.textContent = "writing manifest…";
+		const manifest = {
+			version: 1,
+			proxy: hasProxy ? "proxy.glb" : null,
+			planner_model: typeof plan.model === "string" ? plan.model : null,
+			planner_reasoning: typeof plan.reasoning === "string" ? plan.reasoning : null,
+			panos: panoMeta,
+		};
+		const manRes = await fetch(
+			new URL(`${cell.base}/tour/manifest?${cell.run}`, SERVER_URL).toString(),
+			{ method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(manifest) },
+		);
+		if (!manRes.ok) throw new Error(`/tour/manifest → ${manRes.status}`);
+		const { tour_url } = await manRes.json();
+		const absUrl = new URL(tour_url, SERVER_URL).toString();
+		setStatus(`auto-tour ready · ${panoMeta.length} panos · open /pano?tour=${absUrl}`, "hdr");
+		appendEvent({ kind: "run.done", message: `auto-tour persisted: ${absUrl}` });
+	} catch (e) {
+		appendEvent({ kind: "run.error", message: `auto-tour failed: ${e.message}` });
+	} finally {
+		camera.position.copy(camSnapshot.pos);
+		controls.target.copy(camSnapshot.target);
+		cameraUserMoved = camSnapshot.userMoved;
+		controls.update();
+		panoAutoEl.textContent = "⚡ auto-tour";
+		panoBusy = false;
+		updatePanoButtons();
+	}
+});
+
 // Boot: fetch active run first (so /slots reflects the right cell set),
 // then load slot + model lists, pick remembered (or defaults), subscribe.
 (async () => {

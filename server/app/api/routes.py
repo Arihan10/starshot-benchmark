@@ -27,15 +27,17 @@ import json
 import os
 import shutil
 import struct
+import tempfile
 from datetime import datetime
+from urllib.parse import quote
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.core import prompt_runtime
@@ -50,7 +52,8 @@ from app.core.slots import (
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import generation, versions
-from app.services import llm, prefabs, threed
+from app.services import anchors as anchors_svc
+from app.services import llm, prefabs, proxy as proxy_svc, threed
 from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
@@ -539,6 +542,25 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404)
         return FileResponse(target, media_type=_ARTIFACT_MEDIA_TYPES.get(target.suffix.lower()))
 
+    @app.post("/proxy")
+    async def build_scene_proxy(request: Request) -> Response:  # pyright: ignore[reportUnusedFunction]
+        # Decimate a merged, world-space scene GLB (the viewer bakes one from its
+        # placed meshes) into a geometry-only low-poly proxy for the /pano
+        # walkthrough's projection mode. Stateless: bytes in, smaller bytes out.
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty request body (expected a binary GLB)")
+        with tempfile.TemporaryDirectory(prefix="proxy-") as td:
+            src = Path(td) / "scene.glb"
+            dst = Path(td) / "proxy.glb"
+            src.write_bytes(body)
+            try:
+                await proxy_svc.build_proxy(src, dst)
+            except Exception as e:  # surface decimation failures to the client as 502
+                raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+            data = dst.read_bytes()
+        return Response(content=data, media_type="model/gltf-binary")
+
     @app.get("/runs")
     async def list_runs() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         items: list[dict[str, object]] = []
@@ -808,6 +830,96 @@ def create_app() -> FastAPI:
             media_type="application/octet-stream",
             headers={"Cache-Control": "no-store"},
         )
+
+    # --- capture-anchor planning + tour persistence --------------------------
+    #
+    # The "other side" of the pipeline: a lightweight model reads this cell's
+    # scene hierarchy and proposes where to stand for 360 captures; the client
+    # then renders a pano at each, builds the proxy, and uploads the whole tour
+    # back here so it persists under /artifacts/<cell>/tour/ for the walkthrough
+    # viewer (and the website) to load by URL — no manual file handling.
+
+    def _tour_dir(slot_log: SlotLog) -> Path:
+        return slot_log.events_path.parent / "tour"
+
+    @app.post("/slots/{slot_id}/{model_alias}/anchors")
+    async def slot_anchors(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # Plan 360 capture anchors for this cell's scene with the fixed planner
+        # model. Read-only analysis: reconstructs the Node tree from the event
+        # log and renders it in the pipeline's own scene-context format.
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        nodes = _nodes_from_events(list(slot_log.state["events"]))
+        if not nodes:
+            raise HTTPException(400, "scene has no placed nodes to plan anchors from")
+        try:
+            plan, reasoning = await anchors_svc.generate_anchors(nodes)
+        except Exception as e:  # surface provider failures as 502
+            raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+        return {
+            "anchors": [a.model_dump() for a in plan.anchors],
+            "reasoning": reasoning,
+            "model": anchors_svc.ANCHOR_PLANNER_MODEL,
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/tour/reset")
+    async def tour_reset(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        tour_dir = _tour_dir(slot_log)
+        shutil.rmtree(tour_dir, ignore_errors=True)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        return {"ok": True}
+
+    @app.put("/slots/{slot_id}/{model_alias}/tour/pano/{pano_id}")
+    async def tour_pano(slot_id: str, model_alias: str, pano_id: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty pano body")
+        tour_dir = _tour_dir(slot_log)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(pano_id).name  # defend against path traversal
+        (tour_dir / f"{stem}.jpg").write_bytes(body)
+        return {"ok": True}
+
+    @app.post("/slots/{slot_id}/{model_alias}/tour/proxy")
+    async def tour_proxy(slot_id: str, model_alias: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        # Body is the client's merged, world-space scene GLB; decimate it into the
+        # stored proxy.glb via the same pass the download flow uses.
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty scene body")
+        tour_dir = _tour_dir(slot_log)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="tourproxy-") as td:
+            src = Path(td) / "scene.glb"
+            src.write_bytes(body)
+            try:
+                await proxy_svc.build_proxy(src, tour_dir / "proxy.glb")
+            except Exception as e:
+                raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+        return {"ok": True}
+
+    @app.post("/slots/{slot_id}/{model_alias}/tour/manifest")
+    async def tour_manifest(slot_id: str, model_alias: str, request: Request, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        try:
+            json.loads(body)
+        except Exception as e:
+            raise HTTPException(400, f"manifest is not valid JSON: {e}")
+        tour_dir = _tour_dir(slot_log)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        (tour_dir / "tour.json").write_bytes(body)
+        tour_url = (
+            f"/artifacts/{quote(run)}/{quote(slot_id)}/{quote(model_alias)}/tour/tour.json"
+        )
+        return {"ok": True, "tour_url": tour_url}
 
     @app.post("/slots/{slot_id}/{model_alias}/rewind")
     async def slot_rewind(  # pyright: ignore[reportUnusedFunction]
@@ -2136,6 +2248,51 @@ def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
             n.pop("error", None)
 
     return {"nodes": list(nodes.values()), "last_index": last_index}
+
+
+_ALLOWED_ORIENTATIONS = frozenset({-180, -135, -90, -45, 0, 45, 90, 135, 180})
+
+
+def _nodes_from_events(events: list[dict[str, object]]) -> list[Node]:
+    """Reconstruct the scene's Node tree from a cell's event log — enough fields
+    for the canonical scene-context renderers (bbox, prompt, parent, plan,
+    zone/object kind, proxy shape, orientation). Built off `_scene_projection`'s
+    fold so the two stay in lockstep. Nodes without a resolved bbox are skipped."""
+    nodes: list[Node] = []
+    for n in _scene_projection(events)["nodes"]:
+        nid = n.get("id")
+        origin = n.get("origin")
+        dimensions = n.get("dimensions")
+        if not isinstance(nid, str):
+            continue
+        if not (isinstance(origin, (list, tuple)) and len(origin) == 3):
+            continue
+        if not (isinstance(dimensions, (list, tuple)) and len(dimensions) == 3):
+            continue
+        proxy_raw = n.get("proxy_shape")
+        try:
+            proxy = ProxyShape(proxy_raw) if proxy_raw else None
+        except ValueError:
+            proxy = None
+        try:
+            orientation = int(n.get("orientation", 0) or 0)
+        except (TypeError, ValueError):
+            orientation = 0
+        try:
+            node = Node(
+                id=nid,
+                prompt=str(n.get("prompt") or ""),
+                bbox=BoundingBox(origin=tuple(origin), dimensions=tuple(dimensions)),  # type: ignore[arg-type]
+                proxy_shape=proxy,
+                orientation=orientation if orientation in _ALLOWED_ORIENTATIONS else 0,
+                parent_id=n.get("parent_id") if isinstance(n.get("parent_id"), str) else None,
+                plan=n.get("plan") if isinstance(n.get("plan"), str) else None,
+                is_zone=(n.get("node_kind") == "zone"),
+            )
+        except Exception:  # noqa: BLE001 — a malformed node shouldn't sink the plan
+            continue
+        nodes.append(node)
+    return nodes
 
 
 async def _sse(

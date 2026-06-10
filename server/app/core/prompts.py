@@ -343,6 +343,21 @@ def render_root_objects(nodes: list[Node]) -> str:
     )
 
 
+def render_full_scene_context(nodes: list[Node]) -> str:
+    """The complete canonical scene-context block — root header + root-level
+    global geometry + the full embedded subregion/object tree — composed exactly
+    as the divider/generation steps assemble it. Lets an out-of-pipeline reader
+    (e.g. the capture-anchor planner) see a finished scene's hierarchy in the
+    identical format the pipeline's own LLM steps are handed."""
+    root = util.find_root(nodes)
+    parts: list[str] = []
+    if root is not None:
+        parts.append(_root_scene_header(root))
+    parts.append(render_root_objects(nodes))
+    parts.append(render_embedded_block(nodes))
+    return "\n\n".join(parts)
+
+
 def render_embedded_block(
     nodes: list[Node],
     *,

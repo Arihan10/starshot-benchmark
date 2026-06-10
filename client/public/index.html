@@ -3807,6 +3807,36 @@
 					>
 						replay → gif
 					</button>
+					<button
+						id="pano-auto"
+						type="button"
+						title="Auto-tour: a lightweight model reads this scene's hierarchy and proposes 360 capture anchor points, then the client captures a pano at each, builds the proxy, and persists the whole tour server-side under /artifacts/<cell>/tour/ — load it in the studio's /pano page via ?tour=<url>."
+					>
+						⚡ auto-tour
+					</button>
+					<button
+						id="pano-capture"
+						type="button"
+						title="Capture a 360° equirectangular panorama from the current camera position — the live scene is rendered as 6 cube faces and stitched into a JPEG. Captures accumulate into a tour for the studio's /pano walkthrough page."
+					>
+						📷 capture 360
+					</button>
+					<button
+						id="pano-save"
+						type="button"
+						disabled
+						title="Download the captured tour: tour.json (positions + view directions) plus one JPEG per panorama. Drop all of the files onto the studio's /pano page to walk through them."
+					>
+						save tour (0)
+					</button>
+					<button
+						id="pano-clear"
+						type="button"
+						disabled
+						title="Discard all captured panoramas"
+					>
+						×
+					</button>
 				</div>
 			</div>
 			<div id="status"><p class="line hdr">ready</p></div>

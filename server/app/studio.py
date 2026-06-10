@@ -320,6 +320,14 @@ def create_app() -> FastAPI:
     async def symmetry_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(STATIC_DIR / "symmetry.js", media_type="text/javascript")
 
+    @app.get("/pano")
+    async def pano_page() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC_DIR / "pano.html", media_type="text/html")
+
+    @app.get("/pano.js")
+    async def pano_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC_DIR / "pano.js", media_type="text/javascript")
+
     @app.get("/phrases")
     async def phrases() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         return _load_phrases()
