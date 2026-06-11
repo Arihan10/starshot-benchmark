@@ -30,13 +30,14 @@ async def build_proxy(
     src: Path,
     dst: Path,
     *,
-    target_tris: int = 8000,
-    error: float = 0.5,
+    target_tris: int = 40000,
+    error: float = 0.02,
 ) -> None:
     """Decimate `src` (a merged, world-space scene GLB) into a geometry-only
     proxy at `dst`. `target_tris` is the whole-scene budget that the meshoptimizer
-    simplifier targets; `error` is a loose ceiling so the budget is what binds
-    (proxy mode strips attribute seams, so the ratio actually reaches the target)."""
+    simplifier targets; `error` is a tight ceiling that protects surface fidelity.
+    Proxy mode locks open borders, so floor/wall perimeters and open-shell edges
+    stay intact instead of collapsing into gaps."""
     src, dst = src.resolve(), dst.resolve()
     dst.parent.mkdir(parents=True, exist_ok=True)
     proc = await asyncio.create_subprocess_exec(

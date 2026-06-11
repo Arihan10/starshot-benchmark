@@ -21,7 +21,7 @@ from app.core.slots import MODELS
 from app.core.types import Node, Vec3Tuple
 from app.services import llm
 
-ANCHOR_PLANNER_MODEL = MODELS["gemini-flash"]  # google/gemini-3.5-flash
+ANCHOR_PLANNER_MODEL = MODELS["opus-new"]  # google/gemini-3.5-flash
 
 
 SYSTEM_ANCHOR_PLANNER = """\

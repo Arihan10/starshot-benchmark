@@ -181,7 +181,9 @@ async function optimizeFile(io, inPath, outPath, opts) {
 
   const ratio = Math.min(1, opts.targetTris / Math.max(1, srcTris));
   const simplifyOpts = { simplifier: MeshoptSimplifier, ratio, error: opts.error };
-  if (opts.proxy) simplifyOpts.lockBorder = false;
+  // Proxy: keep open boundaries pinned so floor/wall perimeters and the open
+  // edges of non-watertight Trellis shells can't collapse inward into gaps.
+  if (opts.proxy) simplifyOpts.lockBorder = true;
 
   await document.transform(dedup(), weld(), simplify(simplifyOpts), prune());
 

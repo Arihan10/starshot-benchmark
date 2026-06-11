@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.12"
-# dependencies = []
+# dependencies = ["python-dotenv>=1.0"]
 # ///
 """Boot the API server in no-frames mode plus the three.js viewer.
 
@@ -24,9 +24,14 @@ import sys
 import time
 from pathlib import Path
 
+from dotenv import load_dotenv
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_DIR = REPO_ROOT / "server"
 CLIENT_DIR = REPO_ROOT / "client"
+
+# Resolve STARSHOT_RUNS_DIR from server/.env too (an explicit env var still wins).
+load_dotenv(SERVER_DIR / ".env")
 
 SERVER_HOST = "127.0.0.1"
 
@@ -97,8 +102,8 @@ def main() -> int:
         "--run",
         dest="run",
         default=None,
-        help="Subfolder name under <repo>/runs/ to write per-slot artifacts into. "
-             "Omit to use <repo>/runs/ directly.",
+        help="Subfolder name under the runs root (STARSHOT_RUNS_DIR, else <repo>/runs) "
+             "to write per-slot artifacts into. Omit to use the runs root directly.",
     )
     args = parser.parse_args()
 
@@ -109,7 +114,7 @@ def main() -> int:
         )
         return 1
 
-    runs_root = REPO_ROOT / "runs"
+    runs_root = Path(os.environ.get("STARSHOT_RUNS_DIR") or (REPO_ROOT / "runs"))
     runs_dir = (runs_root / args.run if args.run else runs_root).resolve()
     runs_dir.mkdir(parents=True, exist_ok=True)
 
