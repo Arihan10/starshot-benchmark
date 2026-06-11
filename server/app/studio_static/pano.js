@@ -206,41 +206,57 @@ let polyView = false; // false = projected 360s; true = bare proxy geometry
 const hotspotGroup = new THREE.Group();
 scene.add(hotspotGroup);
 
-const HOTSPOT_FLOOR_DROP = 1.3; // meters below eye level
+const HOTSPOT_FLOOR_DROP = 1.3; // meters below eye level (markers sit at the floor)
 const HOTSPOT_MAX_DIST = 18; // (sphere mode) clamp far panos inside the sphere
 const HOTSPOT_MIN_DIST = 1.2;
-// Only the nearest few anchors are shown as in-scene hotspots — a Matterport-
-// style "hop to a neighbour" model that declutters big scenes (jump anywhere is
-// still one click away in the sidebar list). Each is rescaled every frame to a
-// roughly constant ON-SCREEN size, so distant ones don't shrink into unclickable
-// specks regardless of how far apart the capture points are.
-const HOTSPOT_MAX_VISIBLE = 6;
-const HOTSPOT_TARGET_PX = 24; // target disc radius on screen, in CSS px
+// Which anchors become in-scene hotspots. Projection mode raycasts the proxy to
+// split nearby anchors into line-of-sight ones ("in this room", shown brightly)
+// and occluded ones ("behind a wall/floor", shown as dim ghosts) — both stay
+// clickable, so reach is broad while it's obvious what you're stepping through.
+// Counts are generous (vs. the old nearest-6) so you can cross a room in one hop
+// instead of beading along every capture point. Markers lie FLAT on the surface
+// (they read as spots on the floor) and rescale every frame to a constant
+// ON-SCREEN size; pressing them is made easy by auto-aim (screen-space pick
+// magnetism) instead of billboarding them upright into flat coins.
+const HOTSPOT_REACH = 30; // (projection) furthest an anchor can be and still show
+const HOTSPOT_MAX_VISIBLE = 10; // line-of-sight anchors shown
+const HOTSPOT_MAX_OCCLUDED = 6; // behind-wall anchors shown (as ghosts)
+const HOTSPOT_OCCLUDE_EPS = 0.2; // trim off each end so a hugged wall isn't a block
+const HOTSPOT_TARGET_PX = 24; // target marker radius on screen, in CSS px
+const AUTO_AIM_PX = 42; // click/hover snaps to the nearest marker within this radius
 const HOTSPOT_BASE_RADIUS = 0.16; // the disc geometry's world radius
+const HOTSPOT_VISIBLE_COLOR = 0xffffff;
+const HOTSPOT_RING_COLOR = 0x9ad4ff;
+const HOTSPOT_OCCLUDED_COLOR = 0xe0c271;
 let hoveredTargetIndex = -1;
 
 function makeHotspot(targetIndex) {
 	const group = new THREE.Group();
 	const disc = new THREE.Mesh(
-		new THREE.CircleGeometry(0.16, 40),
+		new THREE.CircleGeometry(HOTSPOT_BASE_RADIUS, 40),
 		new THREE.MeshBasicMaterial({
-			color: 0xffffff,
+			color: HOTSPOT_VISIBLE_COLOR,
 			transparent: true,
 			opacity: 0.55,
 			side: THREE.DoubleSide,
 			depthTest: false,
+			depthWrite: false,
 		}),
 	);
 	const ring = new THREE.Mesh(
-		new THREE.RingGeometry(0.22, 0.27, 48),
+		new THREE.RingGeometry(HOTSPOT_BASE_RADIUS * 1.38, HOTSPOT_BASE_RADIUS * 1.69, 48),
 		new THREE.MeshBasicMaterial({
-			color: 0x9ad4ff,
+			color: HOTSPOT_RING_COLOR,
 			transparent: true,
 			opacity: 0.9,
 			side: THREE.DoubleSide,
 			depthTest: false,
+			depthWrite: false,
 		}),
 	);
+	// Lie flat on the surface (normal up) so the markers read as spots ON the
+	// floor; auto-aim (see pickHotspot) handles the picking, so they don't need to
+	// billboard upright to stay clickable.
 	disc.rotation.x = -Math.PI / 2;
 	ring.rotation.x = -Math.PI / 2;
 	group.add(disc, ring);
@@ -251,33 +267,81 @@ function makeHotspot(targetIndex) {
 	return group;
 }
 
-// Indices of the HOTSPOT_MAX_VISIBLE panos nearest the current one (the ones a
-// viewer would step to next). Distance is measured in world space from the
-// current capture point.
-function nearestNeighborIndices() {
+// Neighbour anchors, nearest first. Projection mode drops anything past
+// HOTSPOT_REACH so huge scenes don't surface the whole map at once; sphere mode
+// keeps all (placement clamps them into the backdrop sphere instead).
+function neighborsByDistance() {
 	const cur = new THREE.Vector3().fromArray(panos[currentIndex].position);
 	const tmp = new THREE.Vector3();
-	const others = [];
+	const out = [];
 	for (let i = 0; i < panos.length; i++) {
 		if (i === currentIndex) continue;
-		others.push([i, cur.distanceToSquared(tmp.fromArray(panos[i].position))]);
+		const d2 = cur.distanceToSquared(tmp.fromArray(panos[i].position));
+		if (projectionMode && d2 > HOTSPOT_REACH * HOTSPOT_REACH) continue;
+		out.push([i, d2]);
 	}
-	others.sort((a, b) => a[1] - b[1]);
-	return others.slice(0, HOTSPOT_MAX_VISIBLE).map((o) => o[0]);
+	out.sort((a, b) => a[1] - b[1]);
+	return out.map((o) => o[0]);
+}
+
+// Is the straight line between two capture points blocked by the proxy? That's
+// our "behind a wall / floor" test. We trace eye-to-eye (capture height, not the
+// floor-dropped marker) and trim a little off both ends so a wall the anchor
+// stands against — or one we're standing against — doesn't read as occlusion.
+const _occluder = new THREE.Raycaster();
+const _occFrom = new THREE.Vector3();
+const _occTo = new THREE.Vector3();
+const _occDir = new THREE.Vector3();
+
+function anchorOccluded(fromPos, toPos) {
+	if (!proxyGroup) return false;
+	_occFrom.fromArray(fromPos);
+	_occTo.fromArray(toPos);
+	_occDir.subVectors(_occTo, _occFrom);
+	const dist = _occDir.length();
+	if (dist < 1e-3) return false;
+	_occDir.divideScalar(dist);
+	_occluder.set(_occFrom, _occDir);
+	_occluder.near = HOTSPOT_OCCLUDE_EPS;
+	_occluder.far = dist - HOTSPOT_OCCLUDE_EPS;
+	if (_occluder.far <= _occluder.near) return false;
+	return _occluder.intersectObject(proxyGroup, true).length > 0;
+}
+
+// Base palette for a marker; per-frame opacity/scale (incl. hover) is applied in
+// the render loop. Occluded markers go amber so "through a wall" reads at a glance.
+function styleHotspot(spot, occluded) {
+	const [disc, ring] = spot.children;
+	disc.material.color.setHex(occluded ? HOTSPOT_OCCLUDED_COLOR : HOTSPOT_VISIBLE_COLOR);
+	ring.material.color.setHex(occluded ? HOTSPOT_OCCLUDED_COLOR : HOTSPOT_RING_COLOR);
 }
 
 function rebuildHotspots() {
 	hotspotGroup.clear();
 	if (currentIndex < 0) return;
 	const cur = panos[currentIndex];
-	for (const i of nearestNeighborIndices()) {
+	let nVisible = 0;
+	let nOccluded = 0;
+	for (const i of neighborsByDistance()) {
+		const occluded = anchorOccluded(cur.position, panos[i].position);
+		// Keep the nearest few of each kind: broad enough to navigate freely, but
+		// capped so dense scenes don't drown in markers.
+		if (occluded) {
+			if (nOccluded >= HOTSPOT_MAX_OCCLUDED) continue;
+			nOccluded++;
+		} else {
+			if (nVisible >= HOTSPOT_MAX_VISIBLE) continue;
+			nVisible++;
+		}
 		const spot = makeHotspot(i);
+		spot.userData.occluded = occluded;
+		styleHotspot(spot, occluded);
 		if (projectionMode) {
-			// Discs sit at the panos' true world positions, dropped to floor height.
+			// Markers sit at the panos' true world positions, dropped to the floor.
 			spot.position.fromArray(panos[i].position);
 			spot.position.y -= HOTSPOT_FLOOR_DROP;
 		} else {
-			// Sphere mode: camera sits at the origin, so place discs RELATIVE to
+			// Sphere mode: camera sits at the origin, so place markers RELATIVE to
 			// the current pano and clamp them inside the backdrop sphere.
 			const rel = new THREE.Vector3()
 				.fromArray(panos[i].position)
@@ -289,6 +353,7 @@ function rebuildHotspots() {
 			spot.position.copy(rel);
 		}
 		hotspotGroup.add(spot);
+		if (nVisible >= HOTSPOT_MAX_VISIBLE && nOccluded >= HOTSPOT_MAX_OCCLUDED) break;
 	}
 }
 
@@ -413,23 +478,31 @@ renderer.domElement.addEventListener(
 	{ passive: false },
 );
 
-// --- hotspot picking ------------------------------------------------------------
-
-const raycaster = new THREE.Raycaster();
-const pointerNdc = new THREE.Vector2();
+// --- hotspot picking (screen-space auto-aim) --------------------------------
+// The markers lie flat on the surface, so their foreshortened discs are fiddly
+// to hit dead-on. Instead of raycasting the geometry we project each marker's
+// centre to the screen and lock onto the NEAREST one within AUTO_AIM_PX of the
+// cursor — forgiving targeting that keeps the discs glued to the floor.
+const _aimWorld = new THREE.Vector3();
 
 function pickHotspot(ev) {
 	const rect = renderer.domElement.getBoundingClientRect();
-	pointerNdc.set(
-		((ev.clientX - rect.left) / rect.width) * 2 - 1,
-		-((ev.clientY - rect.top) / rect.height) * 2 + 1,
-	);
-	raycaster.setFromCamera(pointerNdc, camera);
-	const hits = raycaster.intersectObjects(hotspotGroup.children, true);
-	if (hits.length === 0) return null;
-	let obj = hits[0].object;
-	while (obj && obj.userData.targetIndex === undefined) obj = obj.parent;
-	return obj;
+	const cx = ev.clientX - rect.left;
+	const cy = ev.clientY - rect.top;
+	let best = null;
+	let bestPx = AUTO_AIM_PX;
+	for (const spot of hotspotGroup.children) {
+		spot.getWorldPosition(_aimWorld).project(camera);
+		if (_aimWorld.z > 1) continue; // behind the camera
+		const sx = (_aimWorld.x * 0.5 + 0.5) * rect.width;
+		const sy = (-_aimWorld.y * 0.5 + 0.5) * rect.height;
+		const px = Math.hypot(sx - cx, sy - cy);
+		if (px < bestPx) {
+			bestPx = px;
+			best = spot;
+		}
+	}
+	return best;
 }
 
 function updateHover(ev) {
@@ -439,7 +512,8 @@ function updateHover(ev) {
 	stageEl.classList.toggle("hotspot", spot !== null);
 	if (spot) {
 		const target = panos[spot.userData.targetIndex];
-		setHud(`<b>${panos[currentIndex].id}</b> · go to <b>${target.id}</b>`);
+		const wall = spot.userData.occluded ? " · behind wall" : "";
+		setHud(`<b>${panos[currentIndex].id}</b> · go to <b>${target.id}</b>${wall}`);
 	} else {
 		const mode = projectionMode ? "walk" : "look";
 		setHud(
@@ -966,12 +1040,24 @@ renderer.setAnimationLoop((time) => {
 	const pulse = 1 + 0.07 * Math.sin(time * 0.004);
 	for (const spot of hotspotGroup.children) {
 		const hovered = spot.userData.targetIndex === hoveredTargetIndex;
+		const occluded = spot.userData.occluded;
 		const d = camera.position.distanceTo(spot.position);
-		spot.scale.setScalar(hotspotScaleForDistance(d) * (hovered ? 1.4 : 1));
+		// Constant on-screen size; ghosts ride a touch smaller so they recede
+		// behind the live anchors.
+		spot.scale.setScalar(
+			hotspotScaleForDistance(d) * (hovered ? 1.35 : 1) * (occluded ? 0.82 : 1),
+		);
 		const [disc, ring] = spot.children;
 		ring.scale.setScalar(pulse);
-		disc.material.opacity = hovered ? 0.85 : 0.5;
-		ring.material.opacity = hovered ? 1.0 : 0.82;
+		if (occluded) {
+			// Behind a wall/floor: a faint amber ghost, so it's clearly "through"
+			// something rather than a marker in the room with you.
+			disc.material.opacity = hovered ? 0.5 : 0.22;
+			ring.material.opacity = hovered ? 0.8 : 0.45;
+		} else {
+			disc.material.opacity = hovered ? 0.9 : 0.55;
+			ring.material.opacity = hovered ? 1.0 : 0.85;
+		}
 	}
 	renderer.render(scene, camera);
 });

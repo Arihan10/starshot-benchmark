@@ -1,473 +1,576 @@
 <!doctype html>
 <html lang="en">
-    <head>
-        <meta charset="utf-8" />
-        <meta name="viewport" content="width=device-width, initial-scale=1" />
-        <title>phrase studio — noun phrase → image → 3D</title>
-        <style>
-            :root {
-                --bg: #0e0f12;
-                --panel: #16181d;
-                --panel-2: #1a1c22;
-                --line: #2a2d35;
-                --line-2: #232631;
-                --ink: #e6e6e6;
-                --ink-dim: #b8bcc4;
-                --muted: #8a8f99;
-                --faint: #5a5e68;
-                --blue: #4a8fd8;
-                --blue-ink: #9ad4ff;
-                --purple: #c586d1;
-                --green: #8bd17c;
-                --amber: #e0c271;
-                --red: #ff8080;
-            }
-            * { box-sizing: border-box; }
-            html, body {
-                margin: 0;
-                height: 100%;
-                background: var(--bg);
-                color: var(--ink);
-                font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco,
-                    Consolas, monospace;
-            }
-            #app {
-                display: grid;
-                grid-template-columns: 360px 1fr;
-                height: 100%;
-                min-height: 0;
-            }
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>phrase studio — noun phrase → image → 3D</title>
+		<style>
+			:root {
+				--bg: #0e0f12;
+				--panel: #16181d;
+				--panel-2: #1a1c22;
+				--line: #2a2d35;
+				--line-2: #232631;
+				--ink: #e6e6e6;
+				--ink-dim: #b8bcc4;
+				--muted: #8a8f99;
+				--faint: #5a5e68;
+				--blue: #4a8fd8;
+				--blue-ink: #9ad4ff;
+				--purple: #c586d1;
+				--green: #8bd17c;
+				--amber: #e0c271;
+				--red: #ff8080;
+			}
+			* {
+				box-sizing: border-box;
+			}
+			html,
+			body {
+				margin: 0;
+				height: 100%;
+				background: var(--bg);
+				color: var(--ink);
+				font:
+					13px/1.45 ui-monospace,
+					SFMono-Regular,
+					Menlo,
+					Monaco,
+					Consolas,
+					monospace;
+			}
+			#app {
+				display: grid;
+				grid-template-columns: 360px 1fr;
+				height: 100%;
+				min-height: 0;
+			}
 
-            /* ---- sidebar (phrase picker) ---- */
-            #sidebar {
-                display: flex;
-                flex-direction: column;
-                min-height: 0;
-                border-right: 1px solid var(--line);
-                background: var(--panel);
-            }
-            #brand {
-                padding: 12px 14px;
-                border-bottom: 1px solid var(--line);
-                display: flex;
-                align-items: baseline;
-                gap: 8px;
-            }
-            #brand h1 {
-                margin: 0;
-                font-size: 14px;
-                font-weight: 600;
-                color: var(--blue-ink);
-                letter-spacing: 0.02em;
-            }
-            #brand .sub {
-                color: var(--faint);
-                font-size: 10px;
-            }
-            #filters {
-                display: flex;
-                flex-direction: column;
-                gap: 6px;
-                padding: 10px 12px;
-                border-bottom: 1px solid var(--line);
-            }
-            .filter-row {
-                display: flex;
-                gap: 6px;
-            }
-            select, input[type="text"], input[type="number"], textarea {
-                background: #0c0d10;
-                color: var(--ink);
-                border: 1px solid var(--line);
-                border-radius: 4px;
-                padding: 5px 7px;
-                font: inherit;
-            }
-            select:focus, input:focus, textarea:focus {
-                outline: none;
-                border-color: var(--blue);
-            }
-            #filter-scene, #filter-model { flex: 1; min-width: 0; }
-            #filter-search { width: 100%; }
-            #phrase-count {
-                color: var(--faint);
-                font-size: 10px;
-                padding: 2px 2px 0;
-            }
-            #phrase-list {
-                flex: 1;
-                overflow-y: auto;
-                padding: 6px;
-                display: flex;
-                flex-direction: column;
-                gap: 4px;
-            }
-            .phrase-card {
-                padding: 7px 8px;
-                border: 1px solid var(--line);
-                border-left: 2px solid transparent;
-                border-radius: 4px;
-                background: var(--panel-2);
-                cursor: pointer;
-            }
-            .phrase-card:hover { border-color: var(--blue); }
-            .phrase-card.active {
-                border-color: var(--blue);
-                border-left-color: var(--blue);
-                background: #1f2632;
-            }
-            .pc-head {
-                display: flex;
-                align-items: baseline;
-                gap: 6px;
-                margin-bottom: 2px;
-            }
-            .pc-name {
-                color: var(--purple);
-                font-weight: 600;
-                font-size: 11px;
-                word-break: break-all;
-            }
-            .pc-source {
-                margin-left: auto;
-                flex-shrink: 0;
-                font-size: 9px;
-                text-transform: uppercase;
-                letter-spacing: 0.04em;
-                color: var(--faint);
-                border: 1px solid var(--line);
-                border-radius: 2px;
-                padding: 0 4px;
-            }
-            .pc-phrase {
-                color: var(--ink-dim);
-                font-size: 11px;
-                display: -webkit-box;
-                -webkit-line-clamp: 2;
-                -webkit-box-orient: vertical;
-                overflow: hidden;
-            }
-            .pc-meta {
-                margin-top: 3px;
-                color: var(--faint);
-                font-size: 9px;
-            }
-            #phrase-empty {
-                color: var(--faint);
-                font-style: italic;
-                padding: 16px;
-                text-align: center;
-            }
+			/* ---- sidebar (phrase picker) ---- */
+			#sidebar {
+				display: flex;
+				flex-direction: column;
+				min-height: 0;
+				border-right: 1px solid var(--line);
+				background: var(--panel);
+			}
+			#brand {
+				padding: 12px 14px;
+				border-bottom: 1px solid var(--line);
+				display: flex;
+				align-items: baseline;
+				gap: 8px;
+			}
+			#brand h1 {
+				margin: 0;
+				font-size: 14px;
+				font-weight: 600;
+				color: var(--blue-ink);
+				letter-spacing: 0.02em;
+			}
+			#brand .sub {
+				color: var(--faint);
+				font-size: 10px;
+			}
+			#filters {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+				padding: 10px 12px;
+				border-bottom: 1px solid var(--line);
+			}
+			.filter-row {
+				display: flex;
+				gap: 6px;
+			}
+			select,
+			input[type="text"],
+			input[type="number"],
+			textarea {
+				background: #0c0d10;
+				color: var(--ink);
+				border: 1px solid var(--line);
+				border-radius: 4px;
+				padding: 5px 7px;
+				font: inherit;
+			}
+			select:focus,
+			input:focus,
+			textarea:focus {
+				outline: none;
+				border-color: var(--blue);
+			}
+			#filter-scene,
+			#filter-model {
+				flex: 1;
+				min-width: 0;
+			}
+			#filter-search {
+				width: 100%;
+			}
+			#phrase-count {
+				color: var(--faint);
+				font-size: 10px;
+				padding: 2px 2px 0;
+			}
+			#phrase-list {
+				flex: 1;
+				overflow-y: auto;
+				padding: 6px;
+				display: flex;
+				flex-direction: column;
+				gap: 4px;
+			}
+			.phrase-card {
+				padding: 7px 8px;
+				border: 1px solid var(--line);
+				border-left: 2px solid transparent;
+				border-radius: 4px;
+				background: var(--panel-2);
+				cursor: pointer;
+			}
+			.phrase-card:hover {
+				border-color: var(--blue);
+			}
+			.phrase-card.active {
+				border-color: var(--blue);
+				border-left-color: var(--blue);
+				background: #1f2632;
+			}
+			.pc-head {
+				display: flex;
+				align-items: baseline;
+				gap: 6px;
+				margin-bottom: 2px;
+			}
+			.pc-name {
+				color: var(--purple);
+				font-weight: 600;
+				font-size: 11px;
+				word-break: break-all;
+			}
+			.pc-source {
+				margin-left: auto;
+				flex-shrink: 0;
+				font-size: 9px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				color: var(--faint);
+				border: 1px solid var(--line);
+				border-radius: 2px;
+				padding: 0 4px;
+			}
+			.pc-phrase {
+				color: var(--ink-dim);
+				font-size: 11px;
+				display: -webkit-box;
+				-webkit-line-clamp: 2;
+				-webkit-box-orient: vertical;
+				overflow: hidden;
+			}
+			.pc-meta {
+				margin-top: 3px;
+				color: var(--faint);
+				font-size: 9px;
+			}
+			#phrase-empty {
+				color: var(--faint);
+				font-style: italic;
+				padding: 16px;
+				text-align: center;
+			}
 
-            /* ---- main ---- */
-            #main {
-                display: grid;
-                grid-template-rows: auto 1fr;
-                min-width: 0;
-                min-height: 0;
-            }
-            #toolbar {
-                padding: 12px 14px;
-                border-bottom: 1px solid var(--line);
-                display: flex;
-                flex-direction: column;
-                gap: 10px;
-                background: var(--panel);
-            }
-            .tb-label {
-                color: var(--muted);
-                font-size: 10px;
-                text-transform: uppercase;
-                letter-spacing: 0.06em;
-            }
-            #phrase-input {
-                width: 100%;
-                min-height: 56px;
-                resize: vertical;
-            }
-            .tb-controls {
-                display: flex;
-                flex-wrap: wrap;
-                gap: 10px;
-                align-items: flex-end;
-            }
-            .field {
-                display: flex;
-                flex-direction: column;
-                gap: 3px;
-            }
-            .field label {
-                color: var(--muted);
-                font-size: 10px;
-                text-transform: uppercase;
-                letter-spacing: 0.04em;
-            }
-            .field.dims input { width: 72px; }
-            .field.checkbox {
-                flex-direction: row;
-                align-items: center;
-                gap: 6px;
-                padding-bottom: 6px;
-            }
-            .field.checkbox input { accent-color: var(--blue); }
-            .field.checkbox label { text-transform: none; font-size: 11px; }
-            .spacer { flex: 1; }
-            button {
-                padding: 8px 14px;
-                border-radius: 4px;
-                border: 1px solid var(--line);
-                background: var(--panel-2);
-                color: var(--ink);
-                font: inherit;
-                cursor: pointer;
-                white-space: nowrap;
-            }
-            button:hover:not(:disabled) {
-                border-color: var(--blue);
-                color: #fff;
-            }
-            button:disabled { opacity: 0.45; cursor: default; }
-            #btn-banana {
-                background: #241a2c;
-                border-color: #6a4a7a;
-                color: #d8b8f0;
-            }
-            #btn-banana:hover:not(:disabled) {
-                background: #3a2747;
-                border-color: var(--purple);
-                color: #f0d8ff;
-            }
-            #btn-trellis {
-                background: #122a2a;
-                border-color: #2f6a6a;
-                color: #9fe6e6;
-            }
-            #btn-trellis:hover:not(:disabled) {
-                background: #173b3b;
-                border-color: #4fd0d0;
-                color: #c9ffff;
-            }
-            #status {
-                min-height: 1.3em;
-                color: var(--blue-ink);
-                white-space: pre-wrap;
-                word-break: break-word;
-                font-size: 12px;
-            }
-            #status.err { color: var(--red); }
-            #status.ok { color: var(--green); }
-            details.wrapped {
-                border: 1px solid var(--line);
-                border-radius: 4px;
-                background: #0c0d10;
-            }
-            details.wrapped > summary {
-                cursor: pointer;
-                color: var(--muted);
-                font-size: 10px;
-                text-transform: uppercase;
-                letter-spacing: 0.06em;
-                padding: 6px 8px;
-                list-style: none;
-            }
-            details.wrapped > summary::-webkit-details-marker { display: none; }
-            details.wrapped > summary::before { content: "▸ "; color: var(--faint); }
-            details.wrapped[open] > summary::before { content: "▾ "; }
-            #wrapped-preview {
-                margin: 0;
-                padding: 8px 10px;
-                border-top: 1px solid var(--line);
-                color: var(--ink-dim);
-                font-size: 11px;
-                white-space: pre-wrap;
-                word-break: break-word;
-                max-height: 140px;
-                overflow: auto;
-            }
+			/* ---- main ---- */
+			#main {
+				display: grid;
+				grid-template-rows: auto 1fr;
+				min-width: 0;
+				min-height: 0;
+			}
+			#toolbar {
+				padding: 12px 14px;
+				border-bottom: 1px solid var(--line);
+				display: flex;
+				flex-direction: column;
+				gap: 10px;
+				background: var(--panel);
+			}
+			.tb-label {
+				color: var(--muted);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.06em;
+			}
+			#phrase-input {
+				width: 100%;
+				min-height: 56px;
+				resize: vertical;
+			}
+			.tb-controls {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 10px;
+				align-items: flex-end;
+			}
+			.field {
+				display: flex;
+				flex-direction: column;
+				gap: 3px;
+			}
+			.field label {
+				color: var(--muted);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+			}
+			.field.dims input {
+				width: 72px;
+			}
+			.field.checkbox {
+				flex-direction: row;
+				align-items: center;
+				gap: 6px;
+				padding-bottom: 6px;
+			}
+			.field.checkbox input {
+				accent-color: var(--blue);
+			}
+			.field.checkbox label {
+				text-transform: none;
+				font-size: 11px;
+			}
+			.spacer {
+				flex: 1;
+			}
+			button {
+				padding: 8px 14px;
+				border-radius: 4px;
+				border: 1px solid var(--line);
+				background: var(--panel-2);
+				color: var(--ink);
+				font: inherit;
+				cursor: pointer;
+				white-space: nowrap;
+			}
+			button:hover:not(:disabled) {
+				border-color: var(--blue);
+				color: #fff;
+			}
+			button:disabled {
+				opacity: 0.45;
+				cursor: default;
+			}
+			#btn-banana {
+				background: #241a2c;
+				border-color: #6a4a7a;
+				color: #d8b8f0;
+			}
+			#btn-banana:hover:not(:disabled) {
+				background: #3a2747;
+				border-color: var(--purple);
+				color: #f0d8ff;
+			}
+			#btn-trellis {
+				background: #122a2a;
+				border-color: #2f6a6a;
+				color: #9fe6e6;
+			}
+			#btn-trellis:hover:not(:disabled) {
+				background: #173b3b;
+				border-color: #4fd0d0;
+				color: #c9ffff;
+			}
+			#status {
+				min-height: 1.3em;
+				color: var(--blue-ink);
+				white-space: pre-wrap;
+				word-break: break-word;
+				font-size: 12px;
+			}
+			#status.err {
+				color: var(--red);
+			}
+			#status.ok {
+				color: var(--green);
+			}
+			details.wrapped {
+				border: 1px solid var(--line);
+				border-radius: 4px;
+				background: #0c0d10;
+			}
+			details.wrapped > summary {
+				cursor: pointer;
+				color: var(--muted);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.06em;
+				padding: 6px 8px;
+				list-style: none;
+			}
+			details.wrapped > summary::-webkit-details-marker {
+				display: none;
+			}
+			details.wrapped > summary::before {
+				content: "▸ ";
+				color: var(--faint);
+			}
+			details.wrapped[open] > summary::before {
+				content: "▾ ";
+			}
+			#wrapped-preview {
+				margin: 0;
+				padding: 8px 10px;
+				border-top: 1px solid var(--line);
+				color: var(--ink-dim);
+				font-size: 11px;
+				white-space: pre-wrap;
+				word-break: break-word;
+				max-height: 140px;
+				overflow: auto;
+			}
 
-            /* ---- stage ---- */
-            #stage {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                min-width: 0;
-                min-height: 0;
-            }
-            .pane {
-                position: relative;
-                display: flex;
-                align-items: center;
-                justify-content: center;
-                background: #0c0d10;
-                min-width: 0;
-                min-height: 0;
-                overflow: hidden;
-            }
-            .pane + .pane { border-left: 1px solid var(--line); }
-            .pane-label {
-                position: absolute;
-                top: 8px;
-                left: 10px;
-                font-size: 10px;
-                color: var(--muted);
-                text-transform: uppercase;
-                letter-spacing: 0.06em;
-                pointer-events: none;
-                z-index: 2;
-            }
-            .pane-help {
-                position: absolute;
-                top: 8px;
-                right: 10px;
-                font-size: 10px;
-                color: var(--faint);
-                pointer-events: none;
-                z-index: 2;
-            }
-            .pane-status {
-                position: absolute;
-                bottom: 8px;
-                right: 10px;
-                font-size: 11px;
-                color: var(--muted);
-                z-index: 2;
-            }
-            .pane-status.err { color: var(--red); }
-            .pane-status.ok { color: var(--green); }
-            .pane .empty { color: var(--faint); font-size: 12px; }
-            #image-pane img {
-                max-width: 100%;
-                max-height: 100%;
-                object-fit: contain;
-                display: block;
-            }
-            #image-pane a.open {
-                position: absolute;
-                bottom: 8px;
-                left: 10px;
-                color: #6ac2c2;
-                font-size: 10px;
-                text-decoration: none;
-                z-index: 2;
-            }
-            #image-pane a.open:hover { text-decoration: underline; }
-            #model-pane canvas { display: block; }
-            .spinner {
-                width: 22px;
-                height: 22px;
-                border: 2px solid var(--line);
-                border-top-color: var(--blue);
-                border-radius: 50%;
-                animation: spin 0.8s linear infinite;
-            }
-            @keyframes spin { to { transform: rotate(360deg); } }
-        </style>
-        <script type="importmap">
-            {
-                "imports": {
-                    "three": "https://unpkg.com/three@0.171.0/build/three.module.js",
-                    "three/addons/": "https://unpkg.com/three@0.171.0/examples/jsm/"
-                }
-            }
-        </script>
-    </head>
-    <body>
-        <div id="app">
-            <aside id="sidebar">
-                <div id="brand">
-                    <h1>phrase studio</h1>
-                    <span class="sub">noun phrase → image → 3D</span>
-                    <a
-                        href="/symmetry"
-                        style="margin-left: auto; color: var(--blue-ink); font-size: 10px; text-decoration: none;"
-                        >symmetry ↗</a
-                    >
-                </div>
-                <div id="filters">
-                    <div class="filter-row">
-                        <select id="filter-scene"><option value="">all scenes</option></select>
-                        <select id="filter-model"><option value="">all models</option></select>
-                    </div>
-                    <input
-                        id="filter-search"
-                        type="text"
-                        placeholder="search name or phrase…"
-                        autocomplete="off"
-                        spellcheck="false"
-                    />
-                    <div id="phrase-count"></div>
-                </div>
-                <div id="phrase-list">
-                    <div id="phrase-empty">loading phrases…</div>
-                </div>
-            </aside>
+			/* ---- stage ---- */
+			#stage {
+				display: grid;
+				grid-template-columns: 1fr 1fr;
+				min-width: 0;
+				min-height: 0;
+			}
+			.pane {
+				position: relative;
+				display: flex;
+				align-items: center;
+				justify-content: center;
+				background: #0c0d10;
+				min-width: 0;
+				min-height: 0;
+				overflow: hidden;
+			}
+			.pane + .pane {
+				border-left: 1px solid var(--line);
+			}
+			.pane-label {
+				position: absolute;
+				top: 8px;
+				left: 10px;
+				font-size: 10px;
+				color: var(--muted);
+				text-transform: uppercase;
+				letter-spacing: 0.06em;
+				pointer-events: none;
+				z-index: 2;
+			}
+			.pane-help {
+				position: absolute;
+				top: 8px;
+				right: 10px;
+				font-size: 10px;
+				color: var(--faint);
+				pointer-events: none;
+				z-index: 2;
+			}
+			.pane-status {
+				position: absolute;
+				bottom: 8px;
+				right: 10px;
+				font-size: 11px;
+				color: var(--muted);
+				z-index: 2;
+			}
+			.pane-status.err {
+				color: var(--red);
+			}
+			.pane-status.ok {
+				color: var(--green);
+			}
+			.pane .empty {
+				color: var(--faint);
+				font-size: 12px;
+			}
+			#image-pane img {
+				max-width: 100%;
+				max-height: 100%;
+				object-fit: contain;
+				display: block;
+			}
+			#image-pane a.open {
+				position: absolute;
+				bottom: 8px;
+				left: 10px;
+				color: #6ac2c2;
+				font-size: 10px;
+				text-decoration: none;
+				z-index: 2;
+			}
+			#image-pane a.open:hover {
+				text-decoration: underline;
+			}
+			#model-pane canvas {
+				display: block;
+			}
+			.spinner {
+				width: 22px;
+				height: 22px;
+				border: 2px solid var(--line);
+				border-top-color: var(--blue);
+				border-radius: 50%;
+				animation: spin 0.8s linear infinite;
+			}
+			@keyframes spin {
+				to {
+					transform: rotate(360deg);
+				}
+			}
+		</style>
+		<script type="importmap">
+			{
+				"imports": {
+					"three": "https://unpkg.com/three@0.171.0/build/three.module.js",
+					"three/addons/": "https://unpkg.com/three@0.171.0/examples/jsm/"
+				}
+			}
+		</script>
+	</head>
+	<body>
+		<div id="app">
+			<aside id="sidebar">
+				<div id="brand">
+					<h1>phrase studio</h1>
+					<span class="sub">noun phrase → image → 3D</span>
+					<a
+						href="/symmetry"
+						style="
+							margin-left: auto;
+							color: var(--blue-ink);
+							font-size: 10px;
+							text-decoration: none;
+						"
+						>symmetry ↗</a
+					>
+				</div>
+				<div id="filters">
+					<div class="filter-row">
+						<select id="filter-scene">
+							<option value="">all scenes</option>
+						</select>
+						<select id="filter-model">
+							<option value="">all models</option>
+						</select>
+					</div>
+					<input
+						id="filter-search"
+						type="text"
+						placeholder="search name or phrase…"
+						autocomplete="off"
+						spellcheck="false"
+					/>
+					<div id="phrase-count"></div>
+				</div>
+				<div id="phrase-list">
+					<div id="phrase-empty">loading phrases…</div>
+				</div>
+			</aside>
 
-            <main id="main">
-                <div id="toolbar">
-                    <span class="tb-label">selected noun phrase (editable)</span>
-                    <textarea
-                        id="phrase-input"
-                        placeholder="pick a phrase on the left, or type your own…"
-                        spellcheck="false"
-                    ></textarea>
-                    <div class="tb-controls">
-                        <div class="field">
-                            <label for="proxy">proxy shape</label>
-                            <select id="proxy">
-                                <option value="rectangular_prism">rectangular_prism</option>
-                                <option value="sphere">sphere</option>
-                                <option value="capsule">capsule</option>
-                                <option value="hemisphere">hemisphere</option>
-                            </select>
-                        </div>
-                        <div class="field">
-                            <label for="view">view</label>
-                            <select id="view">
-                                <option value="front">front</option>
-                                <option value="side">side</option>
-                                <option value="top">top</option>
-                                <option value="three-quarter">three-quarter</option>
-                            </select>
-                        </div>
-                        <div class="field checkbox">
-                            <input id="use-dims" type="checkbox" />
-                            <label for="use-dims">append dimensions (m)</label>
-                        </div>
-                        <div class="field dims">
-                            <label for="dim-w">width</label>
-                            <input id="dim-w" type="number" step="0.01" min="0" disabled />
-                        </div>
-                        <div class="field dims">
-                            <label for="dim-h">height</label>
-                            <input id="dim-h" type="number" step="0.01" min="0" disabled />
-                        </div>
-                        <div class="field dims">
-                            <label for="dim-d">depth</label>
-                            <input id="dim-d" type="number" step="0.01" min="0" disabled />
-                        </div>
-                        <div class="spacer"></div>
-                        <button id="btn-banana" type="button">🍌 generate image</button>
-                        <button id="btn-trellis" type="button" disabled>◆ generate 3D</button>
-                    </div>
-                    <div id="status">pick a phrase to begin.</div>
-                    <details class="wrapped">
-                        <summary>wrapped image prompt (what Nano Banana sees)</summary>
-                        <pre id="wrapped-preview">—</pre>
-                    </details>
-                </div>
+			<main id="main">
+				<div id="toolbar">
+					<span class="tb-label"
+						>selected noun phrase (editable)</span
+					>
+					<textarea
+						id="phrase-input"
+						placeholder="pick a phrase on the left, or type your own…"
+						spellcheck="false"
+					></textarea>
+					<div class="tb-controls">
+						<div class="field">
+							<label for="proxy">proxy shape</label>
+							<select id="proxy">
+								<option value="rectangular_prism">
+									rectangular_prism
+								</option>
+								<option value="sphere">sphere</option>
+								<option value="capsule">capsule</option>
+								<option value="hemisphere">hemisphere</option>
+							</select>
+						</div>
+						<div class="field">
+							<label for="view">view</label>
+							<select id="view">
+								<option value="front">front</option>
+								<option value="side">side</option>
+								<option value="top">top</option>
+								<option value="three-quarter">
+									three-quarter
+								</option>
+							</select>
+						</div>
+						<div class="field checkbox">
+							<input id="use-dims" type="checkbox" />
+							<label for="use-dims">append dimensions (m)</label>
+						</div>
+						<div class="field dims">
+							<label for="dim-w">width</label>
+							<input
+								id="dim-w"
+								type="number"
+								step="0.01"
+								min="0"
+								disabled
+							/>
+						</div>
+						<div class="field dims">
+							<label for="dim-h">height</label>
+							<input
+								id="dim-h"
+								type="number"
+								step="0.01"
+								min="0"
+								disabled
+							/>
+						</div>
+						<div class="field dims">
+							<label for="dim-d">depth</label>
+							<input
+								id="dim-d"
+								type="number"
+								step="0.01"
+								min="0"
+								disabled
+							/>
+						</div>
+						<div class="spacer"></div>
+						<button id="btn-banana" type="button">
+							🍌 generate image
+						</button>
+						<button id="btn-trellis" type="button" disabled>
+							◆ generate 3D
+						</button>
+					</div>
+					<div id="status">pick a phrase to begin.</div>
+					<details class="wrapped">
+						<summary>
+							wrapped image prompt (what Nano Banana sees)
+						</summary>
+						<pre id="wrapped-preview">—</pre>
+					</details>
+				</div>
 
-                <div id="stage">
-                    <div class="pane" id="image-pane">
-                        <span class="pane-label">image · nano banana</span>
-                        <span class="empty">no image yet</span>
-                    </div>
-                    <div class="pane" id="model-pane">
-                        <span class="pane-label">3d · trellis</span>
-                        <span class="pane-help">L-drag orbit · R/M-drag pan · scroll zoom · F frame</span>
-                        <span class="empty">no model yet</span>
-                    </div>
-                </div>
-            </main>
-        </div>
-        <script type="module" src="/studio.js"></script>
-    </body>
+				<div id="stage">
+					<div class="pane" id="image-pane">
+						<span class="pane-label">image · nano banana</span>
+						<span class="empty">no image yet</span>
+					</div>
+					<div class="pane" id="model-pane">
+						<span class="pane-label">3d · trellis</span>
+						<span class="pane-help"
+							>L-drag orbit · R/M-drag pan · scroll zoom · F
+							frame</span
+						>
+						<span class="empty">no model yet</span>
+					</div>
+				</div>
+			</main>
+		</div>
+		<script type="module" src="/studio.js"></script>
+	</body>
 </html>

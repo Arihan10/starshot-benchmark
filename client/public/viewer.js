@@ -9419,7 +9419,6 @@ panoAutoEl?.addEventListener("click", async () => {
 		userMoved: cameraUserMoved,
 	};
 	cameraUserMoved = true;
-	const _v = new THREE.Vector3();
 	try {
 		panoAutoEl.textContent = "planning anchors…";
 		const planRes = await fetch(
@@ -9446,23 +9445,13 @@ panoAutoEl?.addEventListener("click", async () => {
 		for (let i = 0; i < anchors.length; i++) {
 			const a = anchors[i];
 			const pos = Array.isArray(a.position) ? a.position : [0, 0, 0];
-			const lookAt = Array.isArray(a.look_at) ? a.look_at : null;
 			const id =
 				typeof a.id === "string" && a.id
 					? a.id
 					: `anchor-${String(i).padStart(3, "0")}`;
 			camera.position.set(pos[0], pos[1], pos[2]);
-			// Forward = toward the look_at point (horizontal fallback otherwise);
-			// only seeds /pano's initial view — the capture itself is a full 360.
-			let forward = [0, 0, -1];
-			if (lookAt) {
-				_v.set(
-					lookAt[0] - pos[0],
-					lookAt[1] - pos[1],
-					lookAt[2] - pos[2],
-				);
-				if (_v.lengthSq() > 1e-9) forward = _v.normalize().toArray();
-			}
+			// Each capture is a full 360°; forward only seeds /pano's initial view.
+			const forward = [0, 0, -1];
 			panoAutoEl.textContent = `capturing ${i + 1}/${anchors.length}…`;
 			const blob = await capturePanoBlob();
 			await uploadPano(cell, id, blob);

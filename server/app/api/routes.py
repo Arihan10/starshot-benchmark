@@ -2292,6 +2292,21 @@ def _nodes_from_events(events: list[dict[str, object]]) -> list[Node]:
         except Exception:  # noqa: BLE001 — a malformed node shouldn't sink the plan
             continue
         nodes.append(node)
+
+    # `parent_region` isn't persisted in the bbox event, but the V3/V4 scene-
+    # context renderers group objects by it (the zone whose generation pass
+    # emitted them). Reconstruct it by walking each object's `parent_id` up past
+    # any peer-object anchors to the nearest enclosing zone; without this every
+    # object groups under None and renderers (e.g. the anchor planner) drop them,
+    # leaving only zones in the context.
+    by_id = {n.id: n for n in nodes}
+    for n in nodes:
+        if n.is_zone:
+            continue
+        cur = n.parent_id
+        while cur in by_id and not by_id[cur].is_zone:
+            cur = by_id[cur].parent_id
+        n.parent_region = cur if (cur in by_id and by_id[cur].is_zone) else None
     return nodes
 
 
