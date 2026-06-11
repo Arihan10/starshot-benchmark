@@ -2,16 +2,17 @@
 
 Generating every object independently means a scene with twenty near-identical
 "wall panel"s pays for twenty Nano-Banana + Trellis runs that also don't visually
-match each other. Before generating a new object, a lightweight LLM call checks
-whether it can REUSE an asset already built (or still in flight) in the SAME
-scene — for visual consistency AND to skip duplicate generation. A reuse rescales
-the matched asset's mesh into the new object's bbox instead of generating from
-scratch (see generation._reuse).
+match each other. Instead, objects are de-duplicated by a seed-and-sweep pass: the
+first undecided object is taken as a canonical "seed" and a lightweight LLM call
+names every other object that is the SAME object, so each of those REUSES the
+seed's mesh (rescaled into its bbox; see generation._reuse) instead of being
+generated. The next undecided object seeds the following group, and so on — so
+matching costs one call per distinct object TYPE, not one per object.
 
 The match always runs on gemini-flash-lite regardless of the run's configured
 model — it's a cheap retrieval, not part of the spatial-reasoning benchmark
-surface, mirroring library matching. The per-scene catalog + reuse bookkeeping
-live in the generation module that drives this.
+surface, mirroring library matching. The seed/reuse bookkeeping lives in the
+generation module that drives this.
 """
 
 from __future__ import annotations
@@ -26,30 +27,30 @@ from app.services import llm
 
 SYSTEM_PREFAB_MATCH = """\
 You are part of a 3D scene builder that generates assets from scratch. To keep \
-the scene visually consistent AND avoid regenerating duplicates, you decide \
-whether a NEW object can REUSE an asset that has already been built (or is being \
-built) elsewhere in the SAME scene.
+the scene visually consistent AND avoid regenerating duplicates, you find every \
+object that is a REPEAT of a given "seed" object, so each one can REUSE the \
+seed's mesh instead of being generated again.
 
-You receive the new object's id, description, and bounding-box size \
-(width×height×depth, in metres), plus a catalog of existing assets (each with the \
-same fields). Reuse an existing asset ONLY when it \
-is essentially the SAME object — a repeat or near-identical instance that would \
-look correct if the existing mesh were dropped into the new object's slot (it \
-will be rescaled to fit). Do not get caught up by flourishes in the mesh's \
-description, identify the exact type of object it is and match if a similar mesh exists. 
+You receive the seed object's id, description, and bounding-box size \
+(width×height×depth, in metres), plus a list of candidate objects (each with the \
+same fields). Return the ids of every candidate that is essentially the SAME \
+object as the seed — a repeat or near-identical instance that would look correct \
+if the seed's mesh were dropped into the candidate's slot (it will be rescaled to \
+fit). Ignore flourishes in the prompt but keep in mind ESSENTIAL descriptive features; only match objects that are near identical/will be used in the exact context. Your goal is not to minimize the number of assets, it is to make the scene MORE COHERENT.  
 
-A reused mesh is rescaled per-axis to exactly fill the new object's bounding box, \
+
+
+A reused mesh is rescaled per-axis to exactly fill the candidate's bounding box, \
 which does not preserve proportions.
 
-Respond with ONE JSON object: set reuse_id to the id of the asset to reuse, or \
-to an empty string "" to generate a fresh asset. No prose, no markdown, no code \
-fences.\
+Respond with ONE JSON object: set `matches` to the list of matching candidate ids \
+(an empty list if none match). No prose, no markdown, no code fences.\
 """
 
 
-class PrefabMatchOutput(BaseModel):
-    # The id of an existing asset to reuse, or "" to generate a fresh one.
-    reuse_id: str = ""
+class DuplicateMatchOutput(BaseModel):
+    # ids of the candidates that are the same object as the seed (they reuse it).
+    matches: list[str] = []
 
 
 def _fmt_size(bbox: BoundingBox) -> str:
@@ -57,41 +58,48 @@ def _fmt_size(bbox: BoundingBox) -> str:
     return f"{w:.2f}×{h:.2f}×{d:.2f}m"
 
 
-async def match(
+async def match_duplicates(
     *,
-    new_id: str,
-    new_description: str,
-    new_bbox: BoundingBox,
-    catalog: list[tuple[str, str, BoundingBox]],
-) -> str:
-    """Lightweight check: can the new object reuse one of `catalog` (each an
-    `(id, description, bbox)`)? Returns the chosen id, or "" to generate fresh.
-    Always runs on gemini-flash-lite. The caller is responsible for validating
-    the returned id against the catalog (guards a hallucinated id)."""
-    if not catalog:
-        return ""
+    seed_id: str,
+    seed_description: str,
+    seed_bbox: BoundingBox,
+    candidates: list[tuple[str, str, BoundingBox]],
+) -> list[str]:
+    """Name every candidate that is essentially the SAME object as the seed (and so
+    can reuse the seed's mesh). `candidates` is a list of `(id, description, bbox)`;
+    returns the matching ids, validated against the candidate set so a hallucinated
+    or duplicated id is dropped. Always runs on gemini-flash-lite."""
+    if not candidates:
+        return []
     listing = "\n".join(
-        f"  - id={cid!r} [{_fmt_size(bbox)}]: {desc}" for cid, desc, bbox in catalog
+        f"  - id={cid!r} [{_fmt_size(bbox)}]: {desc}" for cid, desc, bbox in candidates
     )
     user = (
-        f"New object:\n  id={new_id!r} [{_fmt_size(new_bbox)}]: {new_description}\n\n"
-        "Existing assets already in this scene "
+        f"Seed object:\n  id={seed_id!r} [{_fmt_size(seed_bbox)}]: {seed_description}\n\n"
+        "Candidate objects "
         "(id, [bounding-box size as width×height×depth in metres], description):\n"
         f"{listing}\n\n"
-        'Return the id of the asset to reuse, or "" to generate fresh.'
+        "Return the ids of every candidate that is the same object as the seed."
     )
     token = llm._current_model.set(MODELS["gemini-flash-lite"])
     try:
         out = await llm.call_llm(
             system=SYSTEM_PREFAB_MATCH,
             user=user,
-            output_schema=PrefabMatchOutput,
-            node_id=new_id,
+            output_schema=DuplicateMatchOutput,
+            node_id=seed_id,
             step="prefab_match",
         )
     finally:
         llm._current_model.reset(token)
-    return (out.reuse_id or "").strip()
+    valid = {cid for cid, _, _ in candidates}
+    seen: set[str] = set()
+    matches: list[str] = []
+    for mid in out.matches:
+        if mid in valid and mid not in seen:
+            seen.add(mid)
+            matches.append(mid)
+    return matches
 
 
 def resolve_group(events: list[dict[str, Any]], node_id: str) -> tuple[str, list[str]]:

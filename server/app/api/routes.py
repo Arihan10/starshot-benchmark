@@ -27,6 +27,7 @@ import json
 import os
 import shutil
 import struct
+import uuid
 from datetime import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -980,11 +981,18 @@ def create_app() -> FastAPI:
         gen_log.hydrate_from_disk()
 
         async def _do_generate() -> None:
-            rlog.bind(gen_log)
             prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+            # The prefab grouping is a per-SCENE artifact: compute it ONCE into the
+            # shared library log (bound here) before binding this version's log for
+            # the build, so every version reuses the same grouping instead of
+            # re-matching. Idempotent — a later version finds it already there.
+            rlog.bind(lib_log)
+            decisions = await generation.ensure_scene_prefab_groups(nodes=nodes, run_id=run_id)
+            rlog.bind(gen_log)
             try:
                 await generation.generate_assets(
-                    nodes=nodes, runs_dir=RUNS_DIR, run_id=run_id, version=gen_version,
+                    nodes=nodes, decisions=decisions, runs_dir=RUNS_DIR,
+                    run_id=run_id, version=gen_version,
                 )
             finally:
                 gen_log.close()
@@ -1062,8 +1070,12 @@ def create_app() -> FastAPI:
             rlog.bind(gen_log)
             prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
             try:
+                # The target log was seeded with the SOURCE version's prefab
+                # grouping (see seed_generated_version_from), so this fork reuses
+                # that grouping verbatim — pass no scene fallback.
                 await generation.generate_assets(
-                    nodes=nodes, runs_dir=RUNS_DIR, run_id=run_id, version=target_version,
+                    nodes=nodes, decisions={}, runs_dir=RUNS_DIR,
+                    run_id=run_id, version=target_version,
                 )
             finally:
                 gen_log.close()
@@ -1077,6 +1089,105 @@ def create_app() -> FastAPI:
             "source_version": src_version,
             "nodes": len(nodes),
             "seeded_images": seeded,
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/prefab-test")
+    async def slot_prefab_test(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """TEMP testing: re-run ONLY the prefab grouping over this scene's objects,
+        in ISOLATION — a throwaway log gives empty cache (a fresh match every call,
+        no replay) and leaves the real scene/version logs untouched — and return the
+        matched groups. Lets you iterate on the prefab-match prompt: edit it (run
+        uvicorn with --reload, or restart), hit this, and the client recolors each
+        matched group's bboxes. Remove with `generation.dry_run_prefab_groups` + the
+        client's Prefab Test button."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        ver = versions.for_run(run)
+        prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+        nodes = _scene_nodes_from_library(lib_log)
+        if not nodes:
+            raise HTTPException(status_code=400, detail="no scene to test; build the scene first")
+        # Isolated throwaway log: empty in-memory events → no LLM cache hit (fresh
+        # match every call) and nothing written to the real logs. UNIQUE per request
+        # so two overlapping prefab-test runs never share the file — on Windows that
+        # made one run's cleanup unlink the other's still-open handle (WinError 32,
+        # 500ing the request). Cleanup is best-effort so it can never crash the call.
+        tmp_path = (
+            RUNS_DIR / run / slot.id / model_alias / f".prefab-test-{uuid.uuid4().hex}.events.jsonl"
+        )
+        throwaway = SlotLog(_gen_slot_id(run, slot.id, model_alias, "prefab-test"), tmp_path)
+        rlog.bind(throwaway)
+        try:
+            decisions = await generation.dry_run_prefab_groups(nodes=nodes)
+        finally:
+            throwaway.close()
+            with contextlib.suppress(OSError):
+                tmp_path.unlink(missing_ok=True)
+        prompts = {n.id: n.prompt for n in nodes}
+        groups: dict[str, list[str]] = {}
+        for n in nodes:
+            canonical = decisions.get(n.id, "") or n.id
+            groups.setdefault(canonical, []).append(n.id)
+        matched = [
+            {"canonical_id": c, "prompt": prompts.get(c, ""), "member_ids": members}
+            for c, members in groups.items()
+            if len(members) > 1
+        ]
+        # Return each object's bbox geometry too, so the prefab view is
+        # self-sufficient (it draws these rather than relying on the main view).
+        objects = [
+            {"id": n.id, "origin": list(n.bbox.origin), "dimensions": list(n.bbox.dimensions)}
+            for n in nodes
+        ]
+        result = {
+            "total_objects": len(nodes),
+            "distinct_canonicals": len(groups),
+            "matched_groups": matched,
+        }
+        # Persist the matching so it survives a server reload: the view loads this
+        # (GET below) instead of re-matching on open; Re-run (POST) recomputes + saves.
+        save_path = RUNS_DIR / run / slot.id / model_alias / "prefab-test.json"
+        with contextlib.suppress(OSError):
+            save_path.write_text(json.dumps(result), encoding="utf-8")
+        return {**result, "objects": objects, "saved": True}
+
+    @app.get("/slots/{slot_id}/{model_alias}/prefab-test")
+    async def slot_prefab_test_saved(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """TEMP testing: return the SAVED prefab-test matching (persisted by the last
+        POST) plus the scene's current object bboxes, WITHOUT re-matching — so the
+        view shows the last result instantly on open and across server reloads."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        ver = versions.for_run(run)
+        prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+        nodes = _scene_nodes_from_library(lib_log)
+        objects = [
+            {"id": n.id, "origin": list(n.bbox.origin), "dimensions": list(n.bbox.dimensions)}
+            for n in nodes
+        ]
+        save_path = RUNS_DIR / run / slot.id / model_alias / "prefab-test.json"
+        saved: dict[str, object] = {}
+        if save_path.exists():
+            with contextlib.suppress(OSError, ValueError):
+                saved = json.loads(save_path.read_text(encoding="utf-8"))
+        return {
+            "total_objects": len(nodes),
+            "distinct_canonicals": saved.get("distinct_canonicals", len(nodes)),
+            "matched_groups": saved.get("matched_groups", []),
+            "objects": objects,
+            "saved": bool(saved),
         }
 
     @app.get("/slots/{slot_id}/{model_alias}/generate")

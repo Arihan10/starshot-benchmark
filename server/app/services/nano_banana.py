@@ -120,7 +120,7 @@ _RETRY_BACKOFF_BASE_S = 4.0
 # Cap on concurrent Google calls in flight. Pairs with the shared 429
 # backoff: the semaphore prevents bursts, the backoff handles quota
 # trips that still slip through.
-GENERATE_CONCURRENCY = 8
+GENERATE_CONCURRENCY = 25
 _generate_slot = asyncio.Semaphore(GENERATE_CONCURRENCY)
 
 
