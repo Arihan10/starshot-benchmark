@@ -51,7 +51,7 @@ from pydantic import BaseModel
 
 from app.core.prompts import wrap_image_prompt
 from app.core.types import BoundingBox, ProxyShape
-from app.services import nano_banana, symmetry, threed
+from app.services import nano_banana, scene_lite as scene_lite_svc, symmetry, threed
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
@@ -272,6 +272,46 @@ def _slug(text: str) -> str:
     return (s[:48] or "object").strip("-")
 
 
+# --- scene-lite (vertex-color web export) cell resolution -------------------
+#
+# A "cell" is one run/slot/model dir under the runs tree. The /lite page bakes a
+# cell's raw generated meshes into one small, textureless vertex-colored GLB.
+
+SCENE_LITE_NAME = "scene-lite.glb"
+
+
+def _scene_object_glbs(objects_dir: Path) -> list[Path]:
+    """The finished per-object GLBs in `objects_dir`, excluding the `.raw.glb`
+    Trellis intermediates."""
+    return [p for p in objects_dir.glob("*.glb") if not p.name.endswith(".raw.glb")]
+
+
+def _cell_raw_objects_dir(run: str, slot: str, model: str) -> Path | None:
+    """Newest generated version's RAW objects (PNG-textured, sharp-decodable) —
+    the source for the vertex-color bake. The optimized twins are KTX2/Basis,
+    which can't be decoded to sample colors. None when the cell has no raw
+    generated meshes (e.g. a library-only cell)."""
+    gen_root = RUNS_DIR / run / slot / model / "generated"
+    if not gen_root.is_dir():
+        return None
+    versions = sorted(
+        (p for p in gen_root.iterdir() if p.is_dir() and p.name.isdigit()),
+        key=lambda p: int(p.name),
+        reverse=True,
+    )
+    for v in versions:
+        raw = v / "objects-generated"
+        if raw.is_dir() and _scene_object_glbs(raw):
+            return raw
+    return None
+
+
+def _safe_cell_part(part: str) -> str:
+    if not part or "/" in part or "\\" in part or part.startswith("."):
+        raise HTTPException(400, f"invalid cell path component: {part!r}")
+    return part
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -344,6 +384,76 @@ def create_app() -> FastAPI:
     @app.get("/pano.js")
     async def pano_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(STATIC_DIR / "pano.js", media_type="text/javascript")
+
+    @app.get("/lite")
+    async def lite_page() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC_DIR / "lite.html", media_type="text/html")
+
+    @app.get("/lite.js")
+    async def lite_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC_DIR / "lite.js", media_type="text/javascript")
+
+    @app.get("/scenes")
+    async def scenes() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Every generated cell (run/slot/model) with raw meshes to bake, newest
+        first, flagged with whether its scene-lite.glb has been built."""
+        items: list[dict[str, Any]] = []
+        if RUNS_DIR.is_dir():
+            for cell in RUNS_DIR.glob("*/*/*"):
+                if not cell.is_dir():
+                    continue
+                run, slot, model = cell.relative_to(RUNS_DIR).parts
+                raw_dir = _cell_raw_objects_dir(run, slot, model)
+                if raw_dir is None:
+                    continue
+                lite = cell / SCENE_LITE_NAME
+                built = lite.is_file()
+                items.append(
+                    {
+                        "run": run,
+                        "slot": slot,
+                        "model": model,
+                        "objects": len(_scene_object_glbs(raw_dir)),
+                        "built": built,
+                        "url": "/runs/" + "/".join(quote(p) for p in (run, slot, model, SCENE_LITE_NAME))
+                        if built
+                        else None,
+                        "bytes": lite.stat().st_size if built else None,
+                        "mtime": cell.stat().st_mtime,
+                    }
+                )
+        items.sort(key=lambda x: x["mtime"], reverse=True)
+        return {"scenes": items}
+
+    @app.post("/scene-lite/{run}/{slot}/{model}")
+    async def scene_lite(run: str, slot: str, model: str, force: bool = False) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Bake a cell's raw generated meshes into one small, textureless
+        vertex-colored scene-lite.glb (cached under the cell) and return its
+        /runs URL + stats. Re-runs only when forced or a source GLB / the bake
+        script is newer than the cached build."""
+        run, slot, model = _safe_cell_part(run), _safe_cell_part(slot), _safe_cell_part(model)
+        raw_dir = _cell_raw_objects_dir(run, slot, model)
+        if raw_dir is None:
+            raise HTTPException(404, "no raw generated meshes to bake for this cell")
+        sources = _scene_object_glbs(raw_dir)
+        dst = RUNS_DIR / run / slot / model / SCENE_LITE_NAME
+        # Stale when a source GLB or the bake script is newer than the cached build.
+        floor_mtime = scene_lite_svc.BAKE_SCRIPT.stat().st_mtime if scene_lite_svc.BAKE_SCRIPT.is_file() else 0.0
+        for s in sources:
+            floor_mtime = max(floor_mtime, s.stat().st_mtime)
+        fresh = dst.is_file() and dst.stat().st_mtime >= floor_mtime
+        if force or not fresh:
+            try:
+                stats = await scene_lite_svc.build_scene_vcolor(raw_dir, dst)
+            except Exception as e:  # surface bake failures to the client as 502
+                raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+        else:
+            stats = {"objects": len(sources), "outBytes": dst.stat().st_size}
+        return {
+            "url": "/runs/" + "/".join(quote(p) for p in (run, slot, model, SCENE_LITE_NAME)),
+            "bytes": dst.stat().st_size,
+            **stats,
+        }
 
     @app.get("/tours")
     async def tours() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>scene lite — vertex-colored web export</title>
+        <style>
+            :root {
+                --bg: #0e0f12;
+                --panel: #16181d;
+                --panel-2: #1a1c22;
+                --line: #2a2d35;
+                --ink: #e6e6e6;
+                --ink-dim: #b8bcc4;
+                --muted: #8a8f99;
+                --faint: #5a5e68;
+                --blue: #4a8fd8;
+                --blue-ink: #9ad4ff;
+                --purple: #c586d1;
+                --green: #8bd17c;
+                --amber: #e0c271;
+                --red: #ff8080;
+            }
+            * { box-sizing: border-box; }
+            html, body {
+                margin: 0;
+                height: 100%;
+                background: var(--bg);
+                color: var(--ink);
+                font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            }
+            #app { display: grid; grid-template-columns: 340px 1fr; height: 100%; min-height: 0; }
+
+            /* ---- sidebar (cell picker) ---- */
+            #sidebar {
+                display: flex;
+                flex-direction: column;
+                min-height: 0;
+                border-right: 1px solid var(--line);
+                background: var(--panel);
+            }
+            #brand {
+                padding: 12px 14px;
+                border-bottom: 1px solid var(--line);
+                display: flex;
+                align-items: baseline;
+                gap: 8px;
+            }
+            #brand h1 { margin: 0; font-size: 14px; font-weight: 600; color: var(--blue-ink); letter-spacing: 0.02em; }
+            #brand .sub { color: var(--faint); font-size: 10px; }
+            #brand .nav { margin-left: auto; display: flex; gap: 8px; }
+            #brand a { color: var(--blue-ink); font-size: 10px; text-decoration: none; }
+            #brand a:hover { text-decoration: underline; }
+
+            #list-header {
+                display: flex;
+                align-items: center;
+                gap: 8px;
+                padding: 10px 12px 6px;
+                color: var(--muted);
+                font-size: 10px;
+                text-transform: uppercase;
+                letter-spacing: 0.04em;
+            }
+            #list-header button {
+                margin-left: auto;
+                background: #0c0d10;
+                border: 1px solid var(--line);
+                color: var(--ink-dim);
+                border-radius: 4px;
+                cursor: pointer;
+                padding: 2px 8px;
+                font: inherit;
+                font-size: 12px;
+                line-height: 1;
+            }
+            #list-header button:hover { border-color: var(--blue); color: var(--blue-ink); }
+            #scene-list {
+                flex: 1;
+                overflow-y: auto;
+                min-height: 0;
+                padding: 0 12px 12px;
+                display: flex;
+                flex-direction: column;
+                gap: 4px;
+            }
+            .scene-card {
+                padding: 7px 10px;
+                border: 1px solid var(--line);
+                border-left: 2px solid transparent;
+                border-radius: 5px;
+                background: var(--panel-2);
+                cursor: pointer;
+                color: var(--ink-dim);
+            }
+            .scene-card:hover { border-color: var(--blue); }
+            .scene-card.active { border-color: var(--blue); border-left-color: var(--blue); background: #1f2632; color: var(--blue-ink); }
+            .sc-head { display: flex; align-items: baseline; gap: 6px; }
+            .sc-title { font-weight: 600; font-size: 12px; color: var(--purple); word-break: break-word; }
+            .sc-badge { margin-left: auto; flex-shrink: 0; font-size: 9px; color: var(--faint); }
+            .sc-badge.built { color: var(--green); }
+            .sc-meta { margin-top: 3px; color: var(--faint); font-size: 10px; }
+            #scene-empty { color: var(--faint); font-style: italic; padding: 16px; text-align: center; }
+
+            #help {
+                padding: 12px 14px;
+                border-top: 1px solid var(--line);
+                color: var(--muted);
+                font-size: 11px;
+            }
+            #help b { color: var(--blue-ink); }
+
+            /* ---- main ---- */
+            #main { display: grid; grid-template-rows: auto 1fr; min-width: 0; min-height: 0; }
+            #toolbar {
+                padding: 12px 14px;
+                border-bottom: 1px solid var(--line);
+                display: flex;
+                flex-direction: column;
+                gap: 8px;
+                background: var(--panel);
+            }
+            .tb-controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+            .tb-title { font-size: 13px; color: var(--ink); font-weight: 600; }
+            .tb-sub { color: var(--faint); font-size: 11px; margin-left: 8px; }
+            .spacer { flex: 1; }
+            button, .btn-link {
+                padding: 8px 14px;
+                border-radius: 4px;
+                border: 1px solid var(--line);
+                background: var(--panel-2);
+                color: var(--ink);
+                font: inherit;
+                cursor: pointer;
+                white-space: nowrap;
+                text-decoration: none;
+            }
+            button:hover:not(:disabled), .btn-link:hover { border-color: var(--blue); color: #fff; }
+            button:disabled { opacity: 0.45; cursor: default; }
+            .btn-link[hidden] { display: none; }
+            #btn-rebuild {
+                background: #122a2a;
+                border-color: #2f6a6a;
+                color: #9fe6e6;
+            }
+            #btn-rebuild:hover:not(:disabled) { background: #173b3b; border-color: #4fd0d0; color: #c9ffff; }
+            #status { min-height: 1.3em; color: var(--blue-ink); white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+            #status.err { color: var(--red); }
+            #status.ok { color: var(--green); }
+            #stats { color: var(--faint); font-size: 11px; min-height: 1.1em; }
+
+            /* ---- stage ---- */
+            #stage { display: grid; grid-template-columns: 1fr; min-width: 0; min-height: 0; }
+            .pane {
+                position: relative;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: #0c0d10;
+                min-width: 0;
+                min-height: 0;
+                overflow: hidden;
+            }
+            .pane-label {
+                position: absolute;
+                top: 8px;
+                left: 10px;
+                font-size: 10px;
+                color: var(--muted);
+                text-transform: uppercase;
+                letter-spacing: 0.06em;
+                pointer-events: none;
+                z-index: 2;
+            }
+            .pane-help {
+                position: absolute;
+                top: 8px;
+                right: 10px;
+                font-size: 10px;
+                color: var(--faint);
+                pointer-events: none;
+                z-index: 2;
+            }
+            .pane .empty { color: var(--faint); font-size: 12px; }
+            .pane canvas { display: block; }
+            .pane-overlay {
+                position: absolute;
+                inset: 0;
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                justify-content: center;
+                background: rgba(12, 13, 16, 0.82);
+                z-index: 3;
+                pointer-events: none;
+            }
+            .spinner {
+                width: 22px;
+                height: 22px;
+                border: 2px solid var(--line);
+                border-top-color: var(--blue);
+                border-radius: 50%;
+                animation: spin 0.8s linear infinite;
+            }
+            @keyframes spin { to { transform: rotate(360deg); } }
+        </style>
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "/vendor/three/build/three.module.js",
+                    "three/addons/": "/vendor/three/examples/jsm/"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <div id="app">
+            <aside id="sidebar">
+                <div id="brand">
+                    <h1>scene lite</h1>
+                    <span class="sub">vertex-colored web export</span>
+                    <span class="nav">
+                        <a href="/pano">pano ↗</a>
+                        <a href="/">studio ↗</a>
+                    </span>
+                </div>
+                <div id="list-header">
+                    <span>benchmarked cells</span>
+                    <button id="refresh" type="button" title="Reload the list of cells">⟳</button>
+                </div>
+                <div id="scene-list">
+                    <div id="scene-empty">loading cells…</div>
+                </div>
+                <div id="help">
+                    each cell's scene is baked into <b>one</b> small,
+                    vertex-colored <b>.glb</b> — textures baked into per-vertex
+                    colors, geometry decimated, no texture maps. small enough to
+                    ship over the web. click a cell to build + preview it.
+                </div>
+            </aside>
+
+            <main id="main">
+                <div id="toolbar">
+                    <div class="tb-controls">
+                        <span class="tb-title" id="sel-title">no scene selected</span>
+                        <span class="tb-sub" id="sel-sub"></span>
+                        <span class="spacer"></span>
+                        <a id="download" class="btn-link" hidden download>⤓ download .glb</a>
+                        <button id="btn-rebuild" type="button" disabled>↻ rebuild</button>
+                    </div>
+                    <div id="status">pick a cell on the left to build its web-shippable scene.</div>
+                    <div id="stats"></div>
+                </div>
+
+                <div id="stage">
+                    <div class="pane" id="scene-pane">
+                        <span class="pane-label">scene lite · vertex-colored</span>
+                        <span class="pane-help">L-drag orbit · R/M-drag pan · scroll zoom · F frame</span>
+                        <span class="empty">no scene loaded</span>
+                    </div>
+                </div>
+            </main>
+        </div>
+        <script type="module" src="/lite.js"></script>
+    </body>
+</html>
