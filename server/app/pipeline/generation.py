@@ -1301,29 +1301,6 @@ async def ensure_scene_prefab_groups(*, nodes: list[Node], run_id: str) -> dict[
         return decisions
 
 
-# TEMP (prefab-match prompt iteration): fresh, isolated grouping driving the
-# `/prefab-test` route + the client's "Prefab Test" button. Remove all three together.
-async def dry_run_prefab_groups(*, nodes: list[Node]) -> dict[str, str]:
-    """Fresh prefab grouping that reads NO prior prefab.match and persists none —
-    the same seed-sweep as `ensure_scene_prefab_groups`, but for iterating on the
-    match prompt. The caller binds a throwaway log so each run re-calls the LLM
-    with the current prompt. Returns node_id -> reuse_id ("" = canonical)."""
-    decisions: dict[str, str] = {}
-    for node in nodes:
-        if node.id in decisions:
-            continue
-        decisions[node.id] = ""
-        candidates = [(n.id, n.prompt, n.bbox) for n in nodes if n.id not in decisions]
-        for dup_id in await prefabs.match_duplicates(
-            seed_id=node.id,
-            seed_description=node.prompt,
-            seed_bbox=node.bbox,
-            candidates=candidates,
-        ):
-            decisions[dup_id] = node.id
-    return decisions
-
-
 async def generate_assets(
     *,
     nodes: list[Node],

@@ -27,7 +27,7 @@ from app.services import llm
 
 SYSTEM_PREFAB_MATCH = """\
 You are part of a 3D scene builder that generates assets from scratch. To keep \
-the scene visually consistent AND avoid regenerating duplicates, you find every \
+the scene visually consistent, you find every \
 object that is a REPEAT of a given "seed" object, so each one can REUSE the \
 seed's mesh instead of being generated again.
 
@@ -36,7 +36,7 @@ You receive the seed object's id, description, and bounding-box size \
 same fields). Return the ids of every candidate that is essentially the SAME \
 object as the seed — a repeat or near-identical instance that would look correct \
 if the seed's mesh were dropped into the candidate's slot (it will be rescaled to \
-fit). Ignore flourishes in the prompt but keep in mind ESSENTIAL descriptive features; only match objects that are near identical/will be used in the exact context. Your goal is not to minimize the number of assets, it is to make the scene MORE COHERENT.  
+fit). Think about physical descriptive features that would make two objects visually distinct to the human eye; only match objects that are near identical/will be used in the exact context. Your goal is not to minimize the number of assets, it is to make the scene MORE COHERENT.  
 
 
 
