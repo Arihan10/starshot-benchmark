@@ -427,5 +427,12 @@ async def run(
         scenario="negative-space",
         all_nodes=all_nodes,
     )
+    # Library mode: the scene is fully decomposed + placed but not yet realized.
+    # Match + bake every object in ONE batch now, so a shared whole-scene prefab
+    # grouping dedups identical objects to a single library match. No-op for the
+    # fresh-mesh path (those meshes were spawned during the divider).
+    await generation.realize_library_scene(
+        nodes=all_nodes, runs_dir=runs_dir, run_id=run_id,
+    )
     logging.emit_step(root.id, "done")
     return root

@@ -111,6 +111,12 @@ _OPTIMIZE_SCRIPT = _OPTIMIZE_DIR / "optimize.mjs"
 _NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
 _OPTIMIZE_FANOUT = asyncio.Semaphore(4)
 
+# Cap on concurrent library-asset match calls (flash-lite) when realizing a whole
+# scene's assets in one batch. call_llm has no client-side rate limit, so this
+# bounds the fan-out under OpenRouter's ceiling while still matching in parallel.
+LIBRARY_MATCH_CONCURRENCY = 12
+_library_match_slot = asyncio.Semaphore(LIBRARY_MATCH_CONCURRENCY)
+
 # Versioned from-scratch generated builds. A cell can hold ANY number of
 # independent generated versions of the SAME scene — identical bboxes / event
 # log / structure, but freshly generated (or re-matched) assets per object —
@@ -760,14 +766,25 @@ async def _resolve_and_generate(
         )
 
     if _USE_ASSET_LIBRARY:
-        return await _match_library_assets(
-            specs=specs,
-            bboxes=bboxes,
-            scenario=scenario,
-            runs_dir=runs_dir,
-            run_id=run_id,
-            zone_id=zone.id,
-        )
+        # Library mode defers realization: place the nodes now (bboxes already
+        # emitted above) but match + bake them in ONE whole-scene pass after the
+        # divider finishes (`realize_library_scene`), so a shared prefab grouping
+        # can dedup identical objects down to a single library match.
+        return [
+            Node(
+                id=spec.id,
+                prompt=spec.prompt,
+                bbox=bboxes[spec.id],
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+                placement=spec.placement,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=spec.parent,
+                parent_kind=spec.parent_kind,
+                parent_region=zone.id,
+            )
+            for spec in specs
+        ]
 
     # Every object (anchor, completion, encapsulating alike) goes through
     # the image-prompt rewrite: Nano Banana needs an isolated studio
@@ -834,119 +851,118 @@ async def _resolve_and_generate(
     )
 
 
-async def _match_library_assets(
-    *,
-    specs: list[Any],
-    bboxes: dict[str, BoundingBox],
-    scenario: Literal["anchor", "encapsulating", "negative-space"],
-    runs_dir: Path,
-    run_id: str,
-    zone_id: str,
-) -> list[Node]:
+async def _bake_library_asset(
+    *, node: Node, library_id: str, objs_dir: Path, runs_dir: Path,
+) -> None:
+    """Bake one library asset into `node`'s slot: copy the reference image, place
+    the (Meshopt/KTX2) GLB into the node's bbox + orientation as a node-graph
+    transform, and emit the model event. Skips work when the placed GLB already
+    exists (resume). Every node in a prefab group bakes the SAME `library_id` —
+    the canonical and each reuse, each into its own slot."""
     from app.services import library
 
+    path = objs_dir / f"{node.id}.glb"
+    url = _artifact_url(runs_dir, path)
+    if path.exists():
+        logging.emit_model(node.id, artifact_kind="object", url=url)
+        return
+
+    asset = library.asset_path(library_id)
+    ref_image = asset.with_suffix(".png")
+    if ref_image.exists():
+        dest_image = objs_dir / f"{node.id}.png"
+        await asyncio.to_thread(shutil.copy2, ref_image, dest_image)
+        logging.log(
+            "image", id=node.id, url=_artifact_url(runs_dir, dest_image), prompt=node.prompt,
+        )
+
+    if not asset.exists():
+        logging.log("library.asset_missing", id=node.id, library_id=library_id)
+        return
+
+    # The optimized asset is Meshopt/KTX2-compressed, so bake the placement as a
+    # node-graph transform (preserving the compressed bytes) instead of decoding +
+    # re-exporting through trimesh.
+    bounds = library.asset_rotated_bounds(library_id, node.orientation)
+    if bounds is not None:
+        await asyncio.to_thread(
+            glb_place.place_glb,
+            src=asset, dst=path, bbox=node.bbox, orientation=node.orientation,
+            rotated_min=bounds[0], rotated_max=bounds[1],
+        )
+    else:
+        # Asset missing from the manifest: copy through unscaled so the placement
+        # still renders rather than vanishing.
+        await asyncio.to_thread(shutil.copyfile, asset, path)
+        logging.log("library.bounds_missing", id=node.id, library_id=library_id)
+    logging.emit_model(node.id, artifact_kind="object", url=url)
+
+
+async def realize_library_scene(
+    *, nodes: list[Node], runs_dir: Path, run_id: str,
+) -> None:
+    """Library-asset realization for a whole built scene (deferred batch). No-op
+    unless USE_ASSET_LIBRARY. Runs the SCENE prefab grouping once, matches every
+    prefab CANONICAL to a library asset CONCURRENTLY (one `library.match` per
+    distinct object, not per object, bounded by `_library_match_slot`), then bakes
+    that asset into the canonical's slot and every reuse's slot — reuses inherit
+    the canonical's library_id, rescaled into their own bbox. Must run with the
+    SCENE log bound; resumable (skips already-baked objects and replays logged
+    matches)."""
+    if not _USE_ASSET_LIBRARY:
+        return
+    from app.services import library
+
+    concrete = [n for n in nodes if not n.is_zone]
+    if not concrete:
+        return
+    decisions = await ensure_scene_prefab_groups(nodes=concrete, run_id=run_id)
+    by_id = {n.id: n for n in concrete}
     objs_dir = runs_dir / run_id / "objects"
     objs_dir.mkdir(parents=True, exist_ok=True)
 
-    resolved: list[Node] = []
-    for spec in specs:
-        bbox = bboxes[spec.id]
-        path = objs_dir / f"{spec.id}.glb"
-        url = _artifact_url(runs_dir, path)
+    # The distinct canonicals (reuses inherit their canonical's match), de-duped in
+    # node order so a canonical leads its reuses.
+    canonical_ids: list[str] = []
+    seen: set[str] = set()
+    for node in concrete:
+        cid = decisions.get(node.id, "") or node.id
+        if cid not in seen:
+            seen.add(cid)
+            canonical_ids.append(cid)
 
-        if path.exists():
-            resolved.append(
-                Node(
-                    id=spec.id,
-                    prompt=spec.prompt,
-                    bbox=bbox,
-                    proxy_shape=spec.proxy_shape,
-                    orientation=spec.orientation,
-                    placement=spec.placement,
-                    referenced_ids=list(spec.referenced_ids),
-                    parent_id=spec.parent,
-                    parent_kind=spec.parent_kind,
-                    parent_region=zone_id,
-                    mesh_url=url,
-                )
-            )
-            continue
+    # Match each canonical to a library asset. The matches are independent (each
+    # canonical vs the static catalog), so fire them CONCURRENTLY — bounded by
+    # `_library_match_slot`. Resume reuses any already-logged match.
+    async def _resolve_canonical(cid: str) -> tuple[str, str]:
+        decided = logging.find_event("library.match", id=cid)
+        if decided is not None:
+            return cid, str(decided.get("library_id") or "")
+        canonical_node = by_id.get(cid)
+        if canonical_node is None:
+            return cid, ""
+        async with _library_match_slot:
+            lib_id = (await library.match(canonical_node.prompt)).library_id
+        logging.log("library.match", id=cid, prompt=canonical_node.prompt, library_id=lib_id)
+        return cid, lib_id
 
-        # bbox already emitted upfront in _resolve_and_generate.
-        match = await library.match(spec.prompt)
-        asset = library.asset_path(match.library_id)
+    library_id_by_canonical = dict(
+        await asyncio.gather(*(_resolve_canonical(cid) for cid in canonical_ids))
+    )
 
-        logging.log(
-            "library.match",
-            id=spec.id,
-            prompt=spec.prompt,
-            library_id=match.library_id,
-        )
-
-        ref_image = asset.with_suffix(".png")
-        if ref_image.exists():
-            dest_image = objs_dir / f"{spec.id}.png"
-            await asyncio.to_thread(shutil.copy2, ref_image, dest_image)
+    # Bake every node into its slot; reuses inherit their canonical's library_id.
+    for node in concrete:
+        canonical_id = decisions.get(node.id, "") or node.id
+        lib_id = library_id_by_canonical.get(canonical_id, "")
+        if node.id != canonical_id and logging.find_event("library.match", id=node.id) is None:
+            # Record the reuse's inherited match so the scene log is complete.
             logging.log(
-                "image",
-                id=spec.id,
-                url=_artifact_url(runs_dir, dest_image),
-                prompt=spec.prompt,
+                "library.match", id=node.id, prompt=node.prompt,
+                library_id=lib_id, reuse_of=canonical_id,
             )
-
-        if asset.exists():
-            # The optimized asset is Meshopt/KTX2-compressed, so we bake the
-            # placement as a node-graph transform (preserving the compressed
-            # bytes) instead of decoding + re-exporting through trimesh.
-            bounds = library.asset_rotated_bounds(match.library_id, spec.orientation)
-            if bounds is not None:
-                await asyncio.to_thread(
-                    glb_place.place_glb,
-                    src=asset,
-                    dst=path,
-                    bbox=bbox,
-                    orientation=spec.orientation,
-                    rotated_min=bounds[0],
-                    rotated_max=bounds[1],
-                )
-            else:
-                # Asset missing from the manifest: copy through unscaled so the
-                # placement still renders rather than vanishing.
-                await asyncio.to_thread(shutil.copyfile, asset, path)
-                logging.log(
-                    "library.bounds_missing",
-                    id=spec.id,
-                    library_id=match.library_id,
-                )
-            logging.emit_model(
-                spec.id,
-                artifact_kind="object",
-                url=url,
-            )
-        else:
-            logging.log(
-                "library.asset_missing",
-                id=spec.id,
-                library_id=match.library_id,
-            )
-
-        resolved.append(
-            Node(
-                id=spec.id,
-                prompt=spec.prompt,
-                bbox=bbox,
-                proxy_shape=spec.proxy_shape,
-                orientation=spec.orientation,
-                placement=spec.placement,
-                referenced_ids=list(spec.referenced_ids),
-                parent_id=spec.parent,
-                parent_kind=spec.parent_kind,
-                parent_region=zone_id,
-                mesh_url=url,
-            )
+        await _bake_library_asset(
+            node=node, library_id=lib_id, objs_dir=objs_dir, runs_dir=runs_dir,
         )
-
-    return resolved
 
 
 async def _build_image_prompt(
@@ -1238,9 +1254,57 @@ async def _spawn_meshes(
     return out
 
 
+# One lock per scene (run_id) so concurrent version builds compute the shared
+# prefab grouping once instead of racing to re-sweep + double-log it.
+_scene_prefab_locks: dict[str, asyncio.Lock] = {}
+
+
+async def ensure_scene_prefab_groups(*, nodes: list[Node], run_id: str) -> dict[str, str]:
+    """Compute the scene-wide prefab grouping over `nodes` ONCE and persist it as
+    `prefab.match` events in the BOUND log — which must be the SCENE log
+    (`events.jsonl`), since the grouping is a per-scene artifact shared by every
+    generated version, the library build, and regen.
+
+    Seed-and-sweep: the first undecided node is a canonical "seed"; a flash-lite
+    call names every remaining node that is the SAME object (each reuses the
+    seed), then the next still-undecided node seeds the following group. Idempotent
+    — nodes already carrying a logged `prefab.match` are honored and never
+    re-swept, so a later version build, the library realize, or a resume is free.
+    Returns node_id -> reuse_id ("" = canonical)."""
+    lock = _scene_prefab_locks.setdefault(run_id, asyncio.Lock())
+    async with lock:
+        decisions: dict[str, str] = {}
+        for node in nodes:
+            decided = logging.find_event("prefab.match", id=node.id)
+            if decided is not None:
+                decisions[node.id] = str(decided.get("reuse_id") or "")
+        by_id = {n.id: n for n in nodes}
+        for node in nodes:
+            if node.id in decisions:
+                continue
+            decisions[node.id] = ""
+            logging.log("prefab.match", id=node.id, reuse_id="", description=node.prompt)
+            candidates = [
+                (n.id, n.prompt, n.bbox) for n in nodes if n.id not in decisions
+            ]
+            for dup_id in await prefabs.match_duplicates(
+                seed_id=node.id,
+                seed_description=node.prompt,
+                seed_bbox=node.bbox,
+                candidates=candidates,
+            ):
+                decisions[dup_id] = node.id
+                logging.log(
+                    "prefab.match", id=dup_id, reuse_id=node.id,
+                    description=by_id[dup_id].prompt,
+                )
+        return decisions
+
+
 async def generate_assets(
     *,
     nodes: list[Node],
+    decisions: dict[str, str],
     runs_dir: Path,
     run_id: str,
     version: str,
@@ -1266,20 +1330,21 @@ async def generate_assets(
     regenerates only the failed/interrupted assets and leaves finished ones
     untouched.
 
-    PREFAB REUSE: before generating an object fresh, a lightweight LLM
-    (`prefabs.match`) checks whether it is essentially the SAME object as one
-    already built (or in flight) earlier in this scene. On a hit the object skips
-    Nano-Banana + Trellis entirely — its mesh is the matched asset's raw Trellis
-    output rescaled into this object's bbox (identical geometry, fitted to the
-    slot) — for visual consistency and to avoid paying for duplicates. Decisions
-    are logged as `prefab.match` and replayed on resume so they stay stable.
+    PREFAB REUSE: `decisions` (node_id -> reuse_id, "" = canonical) is the
+    SCENE-level prefab grouping computed once by `ensure_scene_prefab_groups` and
+    shared across every generated version + the library build. This gate only
+    APPLIES it: a reuse skips Nano-Banana + Trellis entirely (its mesh is the
+    canonical's raw Trellis output rescaled into its slot). The grouping is seeded
+    into this version's log — honoring any per-version promotion already on disk (a
+    reuse rebuilt standalone logs its own `prefab.match`) and never flipping a
+    pre-built asset — so regen + the reuse-images fork keep resolving groups here.
 
     Every asset fans out at once into an uncapped queue; the Trellis in-flight cap
     (threed.GENERATE_CONCURRENCY — 100 live submits) plus threed's `_pace_submit`
     (~1s between Trellis `POST /generate`) govern how many actually reach Modal, so
     the batch ramps on instead of bursting into a 429 storm.
 
-    Requires a bound SlotLog: `_generate_one`, `prefabs.match`, and the
+    Requires a bound SlotLog: `_generate_one`, `prefabs.match_duplicates`, and the
     nano_banana / threed services record their bookkeeping there. The caller
     binds a dedicated log (events.generated.jsonl) so none of this lands in the
     library build's event stream."""
@@ -1289,16 +1354,20 @@ async def generate_assets(
     backend = _scene_backend()
     logging.log("generate.backend", backend=backend, version=version)
 
-    # Per-scene prefab state: an ordered catalog of canonical assets (the reuse
-    # candidates) and a "raw on disk" event per canonical so a reuse can wait for
-    # a source still in flight. Local to this call — the whole scene is processed
-    # in one pass, in node order, so a node only matches against earlier ones.
-    catalog: list[tuple[str, str, BoundingBox]] = []
+    # Per-scene prefab state: the canonical asset ids (reuse targets) and a "raw on
+    # disk" event per canonical so a reuse can wait for a source still in flight.
+    # Local to this call.
     canonical_ids: set[str] = set()
     raw_ready: dict[str, asyncio.Event] = {}
 
     def _has_raw(node_id: str) -> bool:
         return (raw_dir / f"{node_id}.raw.glb").exists()
+
+    def _built(node_id: str) -> bool:
+        # Already has a served twin or a raw mesh from a prior run: a resume keeps
+        # it canonical (never reclassifies a built asset as a reuse) and a seed
+        # never claims it as a duplicate.
+        return (opt_dir / f"{node_id}.glb").exists() or _has_raw(node_id)
 
     async def _fresh(node: Node) -> None:
         # Decide symmetry before the image is made (reconstructed nodes carry no
@@ -1358,29 +1427,23 @@ async def generate_assets(
                 source_id=source_id,
             )
 
+    # Apply the scene grouping. Seed this version's log with each decision so regen
+    # / resolve_group / the reuse-images fork read the grouping from here, while
+    # honoring a decision already on disk (a per-version promotion) and never
+    # flipping a pre-built asset into a reuse.
     tasks: list[asyncio.Task[None]] = []
     for node in nodes:
         done = (opt_dir / f"{node.id}.glb").exists()
         decided = logging.find_event("prefab.match", id=node.id)
         if decided is not None:
             reuse_id = str(decided.get("reuse_id") or "")
-        elif done or _has_raw(node.id):
-            # An original built before prefabs (or a prior resume) — keep it an
-            # original so resume never flips an already-built asset into a reuse.
-            reuse_id = ""
         else:
-            reuse_id = await prefabs.match(
-                new_id=node.id,
-                new_description=node.prompt,
-                new_bbox=node.bbox,
-                catalog=catalog,
-            )
+            reuse_id = "" if _built(node.id) else decisions.get(node.id, "")
             logging.log("prefab.match", id=node.id, reuse_id=reuse_id, description=node.prompt)
 
         is_reuse = bool(reuse_id) and reuse_id in canonical_ids
         if not is_reuse:
-            # Canonical: matchable by later objects; reuses rescale its raw mesh.
-            catalog.append((node.id, node.prompt, node.bbox))
+            # Canonical (a seed or a pre-built original); reuses rescale its raw mesh.
             canonical_ids.add(node.id)
             ev = raw_ready.setdefault(node.id, asyncio.Event())
             if done or _has_raw(node.id):
@@ -1388,10 +1451,9 @@ async def generate_assets(
 
         if done:
             continue
-        if is_reuse:
-            tasks.append(asyncio.create_task(_reuse(node, reuse_id)))
-        else:
-            tasks.append(asyncio.create_task(_fresh(node)))
+        tasks.append(
+            asyncio.create_task(_reuse(node, reuse_id) if is_reuse else _fresh(node))
+        )
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)

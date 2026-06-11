@@ -980,11 +980,18 @@ def create_app() -> FastAPI:
         gen_log.hydrate_from_disk()
 
         async def _do_generate() -> None:
-            rlog.bind(gen_log)
             prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+            # The prefab grouping is a per-SCENE artifact: compute it ONCE into the
+            # shared library log (bound here) before binding this version's log for
+            # the build, so every version reuses the same grouping instead of
+            # re-matching. Idempotent — a later version finds it already there.
+            rlog.bind(lib_log)
+            decisions = await generation.ensure_scene_prefab_groups(nodes=nodes, run_id=run_id)
+            rlog.bind(gen_log)
             try:
                 await generation.generate_assets(
-                    nodes=nodes, runs_dir=RUNS_DIR, run_id=run_id, version=gen_version,
+                    nodes=nodes, decisions=decisions, runs_dir=RUNS_DIR,
+                    run_id=run_id, version=gen_version,
                 )
             finally:
                 gen_log.close()
@@ -1062,8 +1069,12 @@ def create_app() -> FastAPI:
             rlog.bind(gen_log)
             prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
             try:
+                # The target log was seeded with the SOURCE version's prefab
+                # grouping (see seed_generated_version_from), so this fork reuses
+                # that grouping verbatim — pass no scene fallback.
                 await generation.generate_assets(
-                    nodes=nodes, runs_dir=RUNS_DIR, run_id=run_id, version=target_version,
+                    nodes=nodes, decisions={}, runs_dir=RUNS_DIR,
+                    run_id=run_id, version=target_version,
                 )
             finally:
                 gen_log.close()

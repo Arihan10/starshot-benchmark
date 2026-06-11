@@ -239,6 +239,17 @@ async def call_llm_once(
             message = response.choices[0].message
             content = message.content
             args = json.loads(content) if isinstance(content, str) else content
+            # A reasoning-heavy turn can finish with no answer body (`content`
+            # null, or the bare literal `null`) — resample it with a clear reason
+            # instead of letting `model_validate(None)` raise a cryptic
+            # `model_type` error. finish_reason/refusal pin down truncation vs.
+            # a content filter for the retry log.
+            if args is None:
+                refusal = message.refusal if isinstance(message.refusal, str) else None
+                raise ValueError(
+                    "model returned no content "
+                    f"(finish_reason={response.choices[0].finish_reason!r}, refusal={refusal!r})"
+                )
             validated = output_schema.model_validate(args)
             if validate is not None:
                 # Semantic check (e.g. batch id echo). Raised BEFORE the
