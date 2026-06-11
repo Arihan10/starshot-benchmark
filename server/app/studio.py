@@ -393,6 +393,14 @@ def create_app() -> FastAPI:
     async def lite_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(STATIC_DIR / "lite.js", media_type="text/javascript")
 
+    @app.get("/orbit")
+    async def orbit_page() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC_DIR / "orbit.html", media_type="text/html")
+
+    @app.get("/orbit.js")
+    async def orbit_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC_DIR / "orbit.js", media_type="text/javascript")
+
     @app.get("/scenes")
     async def scenes() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Every generated cell (run/slot/model) with raw meshes to bake, newest
