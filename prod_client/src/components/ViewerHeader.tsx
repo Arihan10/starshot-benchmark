@@ -20,6 +20,9 @@ export default function ViewerHeader() {
 				<NavLink href="/panorama" active={pathname === "/panorama"}>
 					Panoramas
 				</NavLink>
+				<NavLink href="/orbit" active={pathname === "/orbit"}>
+					Orbit
+				</NavLink>
 			</div>
 		</header>
 	);

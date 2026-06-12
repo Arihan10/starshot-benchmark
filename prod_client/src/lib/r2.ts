@@ -11,6 +11,13 @@ export const PANORAMA_COUNT = 22;
 
 export const SCENE_PREVIEW_KEY = "previews/scene-lite.glb";
 
+// The capture-tour manifest (pano world positions + optional proxy) for the
+// preview scene. Optional: when absent, orbit shows the dollhouse on its own.
+// The manifest names panos/proxy by bare filename; in R2 they live under their
+// own prefixes (tours/, panoramas/, proxies/), so resolve via panoFileUrls /
+// proxyFileUrl rather than relative to the manifest URL.
+export const TOUR_MANIFEST_KEY = "tours/tour.json";
+
 export const PANORAMA_KEYS = Array.from(
 	{ length: PANORAMA_COUNT },
 	(_, i) => `panoramas/anchor-${String(i).padStart(3, "0")}.jpg`,
@@ -22,6 +29,26 @@ export function assetUrl(key: string): string {
 
 export function scenePreviewUrl(): string {
 	return assetUrl(SCENE_PREVIEW_KEY);
+}
+
+export function tourManifestUrl(): string {
+	return assetUrl(TOUR_MANIFEST_KEY);
+}
+
+// Map a manifest's bare pano filename to its R2 URLs: the full image plus a
+// low-res blurred placeholder (Cloudflare Image Transform), so the viewer can
+// show the preview first and sharpen in place — same as the panorama page.
+export function panoFileUrls(file: string): { url: string; placeholderUrl: string } {
+	const key = `panoramas/${file.replace(/^.*\//, "")}`;
+	return {
+		url: assetUrl(key),
+		placeholderUrl: cfImageUrl(key, { width: 640, quality: 50, blur: 16 }),
+	};
+}
+
+// The proxy GLB sits under proxies/.
+export function proxyFileUrl(file: string): string {
+	return assetUrl(`proxies/${file.replace(/^.*\//, "")}`);
 }
 
 export function panoramaUrl(index: number): string {
