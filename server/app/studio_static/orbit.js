@@ -31,6 +31,8 @@ const els = {
 	btnEnter: $("#btn-enter"),
 	btnExit: $("#btn-exit"),
 	btnLocate: $("#btn-locate"),
+	btnProxy: $("#btn-proxy"),
+	objMenu: $("#obj-menu"),
 };
 
 // --- renderer / scene / camera ----------------------------------------------
@@ -472,6 +474,32 @@ let projectionMode = false;
 let liteRoot = null;
 let proxyGroup = null;
 let sharedOverview = false; // no lite export: the proxy doubles as the dollhouse
+let proxyView = false; // overview shows the proxy mesh instead of the lite dollhouse
+
+// --- per-object addressing (lite + proxy) -----------------------------------
+// The lite/proxy GLBs keep each placed object as its own sub-node, so we tag
+// them at load and let the user hover (outline) + right-click (hide / persist
+// outline) individual objects. Outlines are independent EdgesGeometry overlays
+// (a child LineSegments per mesh), so reskinProxy() — which rewrites every proxy
+// mesh's material on view changes — can't clobber them.
+const hiddenObjects = new Set(); // object nodes with .visible forced off
+const outlinedObjects = new Set(); // object nodes with a persistent (orange) outline
+let hoveredObj = null; // object node currently under the cursor
+
+const hoverLineMat = new THREE.LineBasicMaterial({
+	color: 0x66e0ff,
+	transparent: true,
+	opacity: 0.95,
+	depthTest: false,
+	depthWrite: false,
+});
+const selectLineMat = new THREE.LineBasicMaterial({
+	color: 0xffa23a,
+	transparent: true,
+	opacity: 1.0,
+	depthTest: false,
+	depthWrite: false,
+});
 
 let mode = "empty"; // empty | loading | overview | interior | peek | transition
 let sceneCenter = new THREE.Vector3();
@@ -488,9 +516,12 @@ function reskinProxy(mat) {
 }
 
 function setOverviewView() {
-	if (liteRoot) liteRoot.visible = true;
+	// The proxy stands in for the dollhouse when there's no lite export, or when
+	// the user flipped on "proxy view" to inspect/address the low-poly geometry.
+	const proxyAsDollhouse = sharedOverview || (proxyView && !!proxyGroup);
+	if (liteRoot) liteRoot.visible = !proxyAsDollhouse;
 	if (proxyGroup) {
-		if (sharedOverview) {
+		if (proxyAsDollhouse) {
 			reskinProxy(polyMaterial);
 			proxyGroup.visible = true;
 		} else {
@@ -507,7 +538,9 @@ function setOverviewView() {
 function setInteriorView() {
 	if (liteRoot) liteRoot.visible = false;
 	if (proxyGroup) {
-		if (sharedOverview) reskinProxy(projMaterial);
+		// Always restore the projection material here: "proxy view" / sharedOverview
+		// may have reskinned the proxy to the flat polyMaterial in the overview.
+		if (projectionMode) reskinProxy(projMaterial);
 		proxyGroup.visible = projectionMode;
 	}
 	sphereA.visible = true;
@@ -517,9 +550,10 @@ function setInteriorView() {
 }
 
 function setPeekView() {
-	if (liteRoot) liteRoot.visible = true;
+	const proxyAsDollhouse = sharedOverview || (proxyView && !!proxyGroup);
+	if (liteRoot) liteRoot.visible = !proxyAsDollhouse;
 	if (proxyGroup) {
-		if (sharedOverview) {
+		if (proxyAsDollhouse) {
 			reskinProxy(polyMaterial);
 			proxyGroup.visible = true;
 		} else {
@@ -531,6 +565,221 @@ function setPeekView() {
 	hotspotGroup.visible = false;
 	entryGroup.visible = false;
 	youMarker.visible = true;
+}
+
+// --- per-object addressing (pick / hide / outline) --------------------------
+
+// The addressable objects of a loaded root. The exporter/loader can wrap the
+// real objects under a single node, so unwrap single non-mesh wrappers, then
+// take that container's mesh-bearing children. Fall back to "every mesh" when
+// the structure is flat or collapses to one node.
+function collectObjects(root) {
+	let container = root;
+	while (
+		container.children.length === 1 &&
+		!container.children[0].isMesh &&
+		!container.children[0].name && // a named node is already an object, don't unwrap past it
+		container.children[0].children.length > 0
+	) {
+		container = container.children[0];
+	}
+	const hasMesh = (o) => {
+		let found = false;
+		o.traverse((c) => {
+			if (c.isMesh) found = true;
+		});
+		return found;
+	};
+	let objs = container.children.filter(hasMesh);
+	if (objs.length <= 1) {
+		objs = [];
+		root.traverse((o) => {
+			if (o.isMesh) objs.push(o);
+		});
+	}
+	return objs;
+}
+
+function registerObjects(root) {
+	const objs = collectObjects(root);
+	objs.forEach((o, i) => {
+		o.userData.objId = i;
+		o.userData.objLabel = o.name && o.name.trim() ? o.name.trim() : `object ${i + 1}`;
+	});
+	return objs;
+}
+
+// Lazily build a wireframe outline (one LineSegments per mesh) parented to each
+// mesh, so it tracks the object's transform and survives reskinProxy() (which
+// only rewrites mesh materials). Edges are cached per mesh.
+function getEdges(mesh) {
+	if (!mesh.userData.edges) mesh.userData.edges = new THREE.EdgesGeometry(mesh.geometry, 25);
+	return mesh.userData.edges;
+}
+
+function ensureOutlineLines(obj) {
+	if (obj.userData.outlineLines) return obj.userData.outlineLines;
+	const lines = [];
+	obj.traverse((m) => {
+		if (!m.isMesh || !m.geometry) return;
+		const ls = new THREE.LineSegments(getEdges(m), hoverLineMat);
+		ls.userData.isOutline = true;
+		ls.raycast = () => {}; // the outline itself is never a pick target
+		ls.renderOrder = 6;
+		ls.frustumCulled = false;
+		ls.visible = false;
+		m.add(ls);
+		lines.push(ls);
+	});
+	obj.userData.outlineLines = lines;
+	return lines;
+}
+
+// Selection (persistent, orange) beats hover (transient, cyan) beats none.
+function refreshOutline(obj) {
+	const kind = outlinedObjects.has(obj) ? "select" : obj === hoveredObj ? "hover" : "none";
+	if (kind === "none" && !obj.userData.outlineLines) return;
+	const mat = kind === "select" ? selectLineMat : hoverLineMat;
+	for (const ls of ensureOutlineLines(obj)) {
+		ls.visible = kind !== "none";
+		ls.material = mat;
+	}
+}
+
+function setObjectHover(obj) {
+	if (obj === hoveredObj) return;
+	const prev = hoveredObj;
+	hoveredObj = obj;
+	if (prev) refreshOutline(prev);
+	if (obj) refreshOutline(obj);
+}
+
+function setObjectHidden(obj, hidden) {
+	obj.visible = !hidden;
+	if (hidden) {
+		hiddenObjects.add(obj);
+		if (obj === hoveredObj) hoveredObj = null; // can't hover what's gone
+	} else {
+		hiddenObjects.delete(obj);
+	}
+}
+
+function showAllHidden() {
+	for (const o of hiddenObjects) o.visible = true;
+	hiddenObjects.clear();
+}
+
+function toggleObjectOutline(obj) {
+	if (outlinedObjects.has(obj)) outlinedObjects.delete(obj);
+	else outlinedObjects.add(obj);
+	refreshOutline(obj);
+}
+
+function clearOutlines() {
+	const all = [...outlinedObjects];
+	outlinedObjects.clear();
+	for (const o of all) refreshOutline(o);
+}
+
+// Which loaded root the cursor addresses right now: the dollhouse in overview
+// (lite, or the proxy when "proxy view" is on / there's no lite), the proxy in
+// the projected interior, nothing otherwise.
+function activeObjectRoot() {
+	if (mode === "overview" || mode === "peek") {
+		if (proxyView && proxyGroup) return proxyGroup;
+		return liteRoot ?? proxyGroup;
+	}
+	if (mode === "interior") return projectionMode && proxyGroup ? proxyGroup : null;
+	return null;
+}
+
+const picker = new THREE.Raycaster();
+const _ndc = new THREE.Vector2();
+
+function findObjectRoot(node, root) {
+	let cur = node;
+	while (cur && cur !== root) {
+		if (cur.userData.objId !== undefined) return cur;
+		cur = cur.parent;
+	}
+	return null;
+}
+
+function pickObjectAt(clientX, clientY) {
+	const root = activeObjectRoot();
+	if (!root || !root.visible) return null;
+	const rect = renderer.domElement.getBoundingClientRect();
+	_ndc.x = ((clientX - rect.left) / rect.width) * 2 - 1;
+	_ndc.y = -((clientY - rect.top) / rect.height) * 2 + 1;
+	picker.setFromCamera(_ndc, camera);
+	// Raycaster doesn't skip invisible objects, so skip hidden ones explicitly —
+	// otherwise a hidden object would still shadow the visible geometry behind it.
+	for (const h of picker.intersectObject(root, true)) {
+		if (h.object.userData.isOutline) continue;
+		const obj = findObjectRoot(h.object, root);
+		if (obj && obj.visible) return obj;
+	}
+	return null;
+}
+
+// --- right-click object menu ------------------------------------------------
+
+function closeObjMenu() {
+	els.objMenu.hidden = true;
+	els.objMenu.innerHTML = "";
+}
+
+function objMenuButton(label, onClick) {
+	const b = document.createElement("button");
+	b.type = "button";
+	b.textContent = label;
+	b.addEventListener("click", () => {
+		onClick();
+		closeObjMenu();
+	});
+	return b;
+}
+
+function openObjMenu(x, y, obj) {
+	const menu = els.objMenu;
+	menu.innerHTML = "";
+	if (obj) {
+		const title = document.createElement("div");
+		title.className = "om-title";
+		title.textContent = obj.userData.objLabel ?? "object";
+		menu.appendChild(title);
+		const hidden = hiddenObjects.has(obj);
+		menu.appendChild(
+			objMenuButton(hidden ? "show" : "hide", () => {
+				setObjectHidden(obj, !hidden);
+				els.stage.classList.remove("picking");
+			}),
+		);
+		const outlined = outlinedObjects.has(obj);
+		menu.appendChild(
+			objMenuButton(outlined ? "remove outline" : "highlight outline", () => toggleObjectOutline(obj)),
+		);
+	}
+	// Recovery actions, reachable even by right-clicking empty space (you can't
+	// re-pick an object once it's hidden).
+	const extras = [];
+	if (hiddenObjects.size) extras.push(objMenuButton(`show all (${hiddenObjects.size})`, showAllHidden));
+	if (outlinedObjects.size) extras.push(objMenuButton("clear outlines", clearOutlines));
+	if (extras.length) {
+		if (obj) {
+			const sep = document.createElement("div");
+			sep.className = "om-sep";
+			menu.appendChild(sep);
+		}
+		for (const b of extras) menu.appendChild(b);
+	}
+	if (!menu.children.length) {
+		closeObjMenu();
+		return;
+	}
+	menu.hidden = false;
+	menu.style.left = `${Math.min(x, window.innerWidth - menu.offsetWidth - 8)}px`;
+	menu.style.top = `${Math.min(y, window.innerHeight - menu.offsetHeight - 8)}px`;
 }
 
 // --- camera flight (mode changes: slerp orientation + lerp position) ---------
@@ -561,7 +810,9 @@ function startFly(toPos, lookTarget, dur, { onMid, onEnd } = {}) {
 	controls.autoRotate = false;
 	hoveredEntryIndex = -1;
 	hoveredTargetIndex = -1;
-	els.stage.classList.remove("hotspot", "grabbing");
+	setObjectHover(null);
+	closeObjMenu();
+	els.stage.classList.remove("hotspot", "grabbing", "picking");
 	updateModeUI();
 }
 
@@ -795,6 +1046,10 @@ function updateModeUI() {
 	els.btnLocate.hidden = !(mode === "interior" || mode === "peek");
 	els.btnEnter.disabled = panos.length === 0;
 	els.btnExit.disabled = interiorBusy;
+	// "proxy view" is a dollhouse toggle: only meaningful in overview when there
+	// IS a separate lite scene to swap the proxy in for.
+	els.btnProxy.hidden = !(mode === "overview" && liteRoot && proxyGroup);
+	els.btnProxy.classList.toggle("active", proxyView);
 	if (mode === "overview") {
 		els.modeLabel.innerHTML = "<b>dollhouse</b> · orbit";
 		setHud(OVERVIEW_HELP);
@@ -809,7 +1064,7 @@ function updateModeUI() {
 // --- input ------------------------------------------------------------------
 
 renderer.domElement.addEventListener("pointerdown", (ev) => {
-	if (mode !== "interior" || interiorBusy) return;
+	if (mode !== "interior" || interiorBusy || ev.button !== 0) return;
 	dragging = true;
 	dragMoved = 0;
 	downX = ev.clientX;
@@ -821,12 +1076,27 @@ renderer.domElement.addEventListener("pointerdown", (ev) => {
 });
 renderer.domElement.addEventListener("pointermove", (ev) => {
 	if (mode === "overview") {
-		// Highlight + hand cursor + label when hovering an entry disc (skip mid-orbit drag).
+		// Entry discs win the hover (they're the primary overview action); skip
+		// mid-orbit drag. Otherwise fall through to object hover (outline + label).
 		if (ev.buttons !== 0) return;
 		const spot = pickByScreen(ev, entryGroup, ENTRY_AIM_PX);
 		hoveredEntryIndex = spot ? spot.userData.targetIndex : -1;
-		els.stage.classList.toggle("hotspot", spot !== null);
-		setHud(spot ? `enter at <b>${panos[hoveredEntryIndex].id}</b>` : OVERVIEW_HELP);
+		if (spot) {
+			setObjectHover(null);
+			els.stage.classList.toggle("hotspot", true);
+			els.stage.classList.remove("picking");
+			setHud(`enter at <b>${panos[hoveredEntryIndex].id}</b>`);
+			return;
+		}
+		els.stage.classList.toggle("hotspot", false);
+		const obj = pickObjectAt(ev.clientX, ev.clientY);
+		setObjectHover(obj);
+		els.stage.classList.toggle("picking", !!obj);
+		setHud(
+			obj
+				? `object <b>${obj.userData.objLabel}</b> · right-click to hide / outline`
+				: OVERVIEW_HELP,
+		);
 		return;
 	}
 	if (mode !== "interior") return;
@@ -843,7 +1113,8 @@ renderer.domElement.addEventListener("pointerup", (ev) => {
 	if (mode !== "interior") return;
 	dragging = false;
 	els.stage.classList.remove("grabbing");
-	if (dragMoved < 5 && !interiorBusy) {
+	// Left-click only: a clean right-click is reserved for the object menu.
+	if (ev.button === 0 && dragMoved < 5 && !interiorBusy) {
 		const spot = pickByScreen(ev, hotspotGroup, AUTO_AIM_PX);
 		if (spot) travelTo(spot.userData.targetIndex);
 	}
@@ -865,17 +1136,73 @@ renderer.domElement.addEventListener("click", (ev) => {
 	if (spot) enter(spot.userData.targetIndex);
 });
 
+// Right-click an object → per-object menu (hide / outline). A right-DRAG still
+// pans (overview), so only a near-stationary right-click counts; the canvas
+// already has its own contextmenu preventDefault listener.
+let rcDownX = 0;
+let rcDownY = 0;
+renderer.domElement.addEventListener("pointerdown", (ev) => {
+	if (ev.button === 2) {
+		rcDownX = ev.clientX;
+		rcDownY = ev.clientY;
+	}
+});
+renderer.domElement.addEventListener("contextmenu", (ev) => {
+	if (mode === "transition" || mode === "loading" || mode === "empty") return;
+	if (Math.hypot(ev.clientX - rcDownX, ev.clientY - rcDownY) > 6) return; // a pan, not a click
+	const obj = pickObjectAt(ev.clientX, ev.clientY);
+	if (obj || hiddenObjects.size || outlinedObjects.size) {
+		openObjMenu(ev.clientX, ev.clientY, obj);
+	} else {
+		closeObjMenu();
+	}
+});
+// Dismiss the menu on any outside press (capture, so it runs before the canvas
+// handlers) or Escape.
+document.addEventListener(
+	"pointerdown",
+	(ev) => {
+		if (!els.objMenu.hidden && !els.objMenu.contains(ev.target)) closeObjMenu();
+	},
+	true,
+);
+window.addEventListener("keydown", (ev) => {
+	if (ev.key === "Escape") closeObjMenu();
+});
+
+els.btnProxy.addEventListener("click", () => {
+	if (!(liteRoot && proxyGroup)) return;
+	proxyView = !proxyView;
+	setObjectHover(null);
+	closeObjMenu();
+	els.stage.classList.remove("picking");
+	if (mode === "overview") setOverviewView();
+	else if (mode === "peek") setPeekView();
+	updateModeUI();
+});
+
 let hoveredTargetIndex = -1;
 let hoveredEntryIndex = -1;
 function updateHover(ev) {
 	if (currentIndex < 0) return;
 	const spot = pickByScreen(ev, hotspotGroup, AUTO_AIM_PX);
 	hoveredTargetIndex = spot ? spot.userData.targetIndex : -1;
-	els.stage.classList.toggle("hotspot", spot !== null);
 	if (spot) {
+		setObjectHover(null);
+		els.stage.classList.toggle("hotspot", true);
+		els.stage.classList.remove("picking");
 		const target = panos[spot.userData.targetIndex];
 		const wall = spot.userData.occluded ? " · behind wall" : "";
 		setHud(`<b>${panos[currentIndex].id}</b> · go to <b>${target.id}</b>${wall}`);
+		return;
+	}
+	els.stage.classList.toggle("hotspot", false);
+	// No hotspot under the cursor → offer the projected proxy object instead.
+	const obj = pickObjectAt(ev.clientX, ev.clientY);
+	setObjectHover(obj);
+	els.stage.classList.toggle("picking", !!obj);
+	if (obj) {
+		setHud(`object <b>${obj.userData.objLabel}</b> · right-click to hide / outline`);
 	} else {
 		setHud(`<b>${panos[currentIndex].id}</b> · ${currentIndex + 1}/${panos.length} · drag to look`);
 	}
@@ -927,7 +1254,16 @@ function disposeObject(obj) {
 			o.geometry?.dispose();
 			const mats = Array.isArray(o.material) ? o.material : [o.material];
 			for (const m of mats) {
-				if (m && m !== projMaterial && m !== polyMaterial) m.dispose?.();
+				// Shared singletons (projection/poly fills, outline line mats) outlive
+				// any one cell, so never dispose them here.
+				if (
+					m &&
+					m !== projMaterial &&
+					m !== polyMaterial &&
+					m !== hoverLineMat &&
+					m !== selectLineMat
+				)
+					m.dispose?.();
 			}
 		}
 	});
@@ -961,6 +1297,13 @@ function clearScene() {
 	savedInterior = null;
 	hoveredEntryIndex = -1;
 	hoveredTargetIndex = -1;
+	// Reset per-object addressing; the old nodes are disposed with the roots.
+	proxyView = false;
+	hiddenObjects.clear();
+	outlinedObjects.clear();
+	hoveredObj = null;
+	closeObjMenu();
+	els.stage.classList.remove("picking");
 	clearTravelMask();
 }
 
@@ -1045,6 +1388,12 @@ function applyCell(entries, proxyRoot, lite) {
 		proxyGroup = proxyRoot;
 		scene.add(proxyGroup);
 	}
+
+	// Tag each placed object in both roots so they can be hovered / hidden /
+	// outlined individually (independently per scene — lite and proxy nodes
+	// don't share identity).
+	if (liteRoot) registerObjects(liteRoot);
+	if (proxyGroup) registerObjects(proxyGroup);
 
 	// Frame from whichever geometry we have.
 	const framed = lite ?? proxyRoot;

@@ -280,6 +280,66 @@
 				border-color: var(--red);
 				color: #fff;
 			}
+			#btn-proxy.active {
+				background: #221f2c;
+				border-color: #7a6abf;
+				color: #d9c9ff;
+			}
+
+			/* cursor when hovering an addressable object (lite/proxy) */
+			#stage.picking canvas {
+				cursor: pointer;
+			}
+
+			/* right-click per-object actions */
+			#obj-menu {
+				position: fixed;
+				z-index: 50;
+				min-width: 170px;
+				padding: 4px;
+				background: rgba(20, 22, 27, 0.97);
+				border: 1px solid var(--line);
+				border-radius: 6px;
+				box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+				font-size: 12px;
+				user-select: none;
+			}
+			#obj-menu[hidden] {
+				display: none;
+			}
+			#obj-menu .om-title {
+				padding: 6px 8px 5px;
+				margin-bottom: 4px;
+				border-bottom: 1px solid var(--line);
+				color: var(--blue-ink);
+				font-weight: 600;
+				max-width: 240px;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+			}
+			#obj-menu button {
+				display: block;
+				width: 100%;
+				padding: 6px 8px;
+				border: 0;
+				border-radius: 4px;
+				background: transparent;
+				color: var(--ink);
+				font: inherit;
+				font-size: 12px;
+				text-align: left;
+				cursor: pointer;
+			}
+			#obj-menu button:hover {
+				background: #243042;
+				color: #fff;
+			}
+			#obj-menu .om-sep {
+				height: 1px;
+				margin: 4px 0;
+				background: var(--line);
+			}
 
 			#empty {
 				position: absolute;
@@ -362,6 +422,10 @@
 					<b>entry marker</b> (or <b>enter interior</b>) to step inside the
 					projected 360° walkthrough. inside, <b>hold locate</b> to pop out to
 					the dollhouse with a red marker on your spot.
+					<br /><br />
+					hover an object to outline it; <b>right-click</b> it to
+					<b>hide</b> or <b>highlight</b> it. toggle <b>proxy view</b> to
+					address the low-poly proxy objects instead of the lite ones.
 				</div>
 			</aside>
 
@@ -371,6 +435,14 @@
 				<div class="mode-label" id="mode-label"></div>
 				<div id="hud" hidden></div>
 				<div id="controls">
+					<button
+						id="btn-proxy"
+						type="button"
+						hidden
+						title="Toggle the overview between the lite dollhouse and the low-poly projection proxy"
+					>
+						proxy view
+					</button>
 					<button id="btn-enter" type="button" hidden>enter interior ▸</button>
 					<button id="btn-exit" type="button" hidden>◂ overview</button>
 					<button
@@ -382,6 +454,7 @@
 						⤢ hold to locate
 					</button>
 				</div>
+				<div id="obj-menu" hidden></div>
 				<div class="overlay" id="overlay" hidden>
 					<div class="spinner" id="overlay-spin"></div>
 					<div class="msg" id="overlay-msg"></div>

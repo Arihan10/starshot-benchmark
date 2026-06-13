@@ -9221,28 +9221,52 @@ function bakeWorldGeometry(mesh) {
 	return g;
 }
 
+// The owning object's id for a mesh: walk up to the node the loader tagged with
+// `pickId` (set on every placed `gltf.scene`). Carries object identity into the
+// baked proxy so the walkthrough can name / address individual objects.
+function pickIdOf(obj) {
+	for (let cur = obj; cur; cur = cur.parent) {
+		if (cur.userData?.pickId) return cur.userData.pickId;
+	}
+	return null;
+}
+
 // Bake the live scene into one material-free, world-space GLB (geometry only:
 // each placed mesh baked into world space — the same frame the pano positions
 // were captured in). This is the merged stand-in the server's /proxy decimator
 // reduces to a few-thousand-triangle projection proxy. Returns the binary GLB
 // ArrayBuffer, or null when the scene has no meshes.
+//
+// Each source object's baked meshes hang under their own node, named with the
+// object id, so the proxy keeps per-object identity through the decimation pass
+// (gltf-transform preserves node names) and the viewer can address objects.
 async function buildMergedSceneGlbBuffer() {
 	if (modelsById.size === 0) return null;
-	const group = new THREE.Group();
+	const root = new THREE.Group();
 	const mat = new THREE.MeshStandardMaterial();
 	const geoms = [];
+	const objNodes = new Map(); // object id (or null) -> its node under `root`
 	sceneRoot.updateWorldMatrix(true, true);
 	sceneRoot.traverse((o) => {
 		if (!o.isMesh || !o.geometry) return;
 		const g = bakeWorldGeometry(o);
 		if (!g) return;
-		group.add(new THREE.Mesh(g, mat));
+		const id = pickIdOf(o);
+		const key = id ?? "";
+		let node = objNodes.get(key);
+		if (!node) {
+			node = new THREE.Group();
+			if (id) node.name = id;
+			objNodes.set(key, node);
+			root.add(node);
+		}
+		node.add(new THREE.Mesh(g, mat));
 		geoms.push(g);
 	});
 	if (geoms.length === 0) return null;
 	try {
 		const exporter = new GLTFExporter();
-		return await exporter.parseAsync(group, {
+		return await exporter.parseAsync(root, {
 			binary: true,
 			onlyVisible: false,
 		});

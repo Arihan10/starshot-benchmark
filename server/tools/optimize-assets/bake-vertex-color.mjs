@@ -234,6 +234,25 @@ async function collectInputs(inputsDir) {
   return names.map((n) => path.join(inputsDir, n));
 }
 
+// Name each object's top-level node with its source id (the GLB's filename
+// stem) so the merged scene — and any client that loads it — can name / address
+// the individual objects. Multi-root sources collapse under one named wrapper.
+function labelObject(doc, id) {
+  for (const scene of doc.getRoot().listScenes()) {
+    const roots = scene.listChildren();
+    if (roots.length === 1) {
+      roots[0].setName(id);
+    } else if (roots.length > 1) {
+      const wrap = doc.createNode(id);
+      for (const child of roots) {
+        scene.removeChild(child);
+        wrap.addChild(child);
+      }
+      scene.addChild(wrap);
+    }
+  }
+}
+
 async function main() {
   const opts = parseArgs(process.argv);
   const files = await collectInputs(opts.inputsDir);
@@ -254,6 +273,7 @@ async function main() {
       srcTris += triangleCount(src);
       await bakeColors(src, SAMPLE_SIZE);
       decimateObject(src, cap);
+      labelObject(src, path.basename(file).replace(/\.glb$/i, ""));
       mergeDocuments(target, src);
     } catch (err) {
       // A single malformed object (e.g. a NaN-bounded Trellis mesh, whose JSON

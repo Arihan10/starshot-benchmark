@@ -836,7 +836,7 @@ export class OrbitEngine {
 			? this.camera.position.clone()
 			: v3(this.panos[this.currentIndex].position);
 	}
-
+	
 	enter(index: number | null = null) {
 		if (this.mode !== "overview" || this.panos.length === 0) return;
 		const idx = index ?? this.nearestPanoTo(this.controls.target);
