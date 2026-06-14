@@ -51,7 +51,9 @@ from pydantic import BaseModel
 
 from app.core.prompts import wrap_image_prompt
 from app.core.types import BoundingBox, ProxyShape
-from app.services import nano_banana, scene_lite as scene_lite_svc, symmetry, threed
+from app.services import nano_banana, symmetry, threed
+from app.services import publish as publish_svc
+from app.services import scene_lite as scene_lite_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
@@ -462,6 +464,23 @@ def create_app() -> FastAPI:
             "bytes": dst.stat().st_size,
             **stats,
         }
+
+    @app.post("/publish/{run}/{slot}/{model}")
+    async def publish(run: str, slot: str, model: str, version: str | None = None, dry_run: bool = False) -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
+        """Publish this cell's dollhouse preview + capture tour to the R2 bucket
+        under per-(run/slot/model/version) keys and upsert its D1 catalog row.
+        `version` defaults to the latest generated build with rendered meshes;
+        re-publishing the same version overwrites the objects in place. `dry_run`
+        returns the planned keys without baking, uploading, or writing D1."""
+        run, slot, model = _safe_cell_part(run), _safe_cell_part(slot), _safe_cell_part(model)
+        try:
+            return await publish_svc.publish_cell(RUNS_DIR, run, slot, model, version, dry_run=dry_run)
+        except FileNotFoundError as e:
+            raise HTTPException(404, str(e)) from e
+        except ValueError as e:
+            raise HTTPException(400, str(e)) from e
+        except Exception as e:  # R2/D1 failures (creds, network) surface as 502
+            raise HTTPException(502, f"{type(e).__name__}: {e}") from e
 
     @app.get("/tours")
     async def tours() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

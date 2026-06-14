@@ -9,7 +9,6 @@ import {
 	Texture,
 	TextureLoader,
 } from "three";
-import { panoramaPlaceholderUrl, panoramaUrl } from "@/lib/r2";
 
 function asEquirect(texture: Texture): Texture {
 	texture.mapping = EquirectangularReflectionMapping;
@@ -18,11 +17,13 @@ function asEquirect(texture: Texture): Texture {
 }
 
 function PanoramaScene({
-	index,
+	url,
+	placeholderUrl,
 	onFullLoaded,
 }: {
-	index: number;
-	onFullLoaded: (index: number) => void;
+	url: string;
+	placeholderUrl: string;
+	onFullLoaded: (url: string) => void;
 }) {
 	const scene = useThree((state) => state.scene);
 
@@ -33,7 +34,7 @@ function PanoramaScene({
 
 		// Assign the new background, then free the texture it replaced so VRAM
 		// doesn't grow as the user browses panoramas (placeholder -> full, and
-		// across index changes).
+		// across pano changes).
 		const apply = (texture: Texture) => {
 			const previous = scene.background;
 			scene.background = asEquirect(texture);
@@ -44,7 +45,7 @@ function PanoramaScene({
 
 		// Low-res placeholder shows first — it's a real equirect background, so
 		// it pans in 360 immediately while the full image streams in.
-		loader.load(panoramaPlaceholderUrl(index), (lqip) => {
+		loader.load(placeholderUrl, (lqip) => {
 			if (!active || fullLoaded) {
 				lqip.dispose();
 				return;
@@ -53,32 +54,38 @@ function PanoramaScene({
 		});
 
 		// Full resolution sharpens in place at the same orientation.
-		loader.load(panoramaUrl(index), (full) => {
+		loader.load(url, (full) => {
 			if (!active) {
 				full.dispose();
 				return;
 			}
 			fullLoaded = true;
 			apply(full);
-			onFullLoaded(index);
+			onFullLoaded(url);
 		});
 
 		return () => {
 			active = false;
 		};
-	}, [index, scene, onFullLoaded]);
+	}, [url, placeholderUrl, scene, onFullLoaded]);
 
 	return null;
 }
 
-export default function PanoramaImage({ index }: { index: number }) {
-	const [loadedIndex, setLoadedIndex] = useState<number | null>(null);
-	const sharp = loadedIndex === index;
+export default function PanoramaImage({
+	url,
+	placeholderUrl,
+}: {
+	url: string;
+	placeholderUrl: string;
+}) {
+	const [loadedUrl, setLoadedUrl] = useState<string | null>(null);
+	const sharp = loadedUrl === url;
 
 	return (
 		<div className="absolute inset-0">
 			<Canvas camera={{ position: [0, 0, 0.1], fov: 75, near: 0.01, far: 1000 }}>
-				<PanoramaScene index={index} onFullLoaded={setLoadedIndex} />
+				<PanoramaScene url={url} placeholderUrl={placeholderUrl} onFullLoaded={setLoadedUrl} />
 				<OrbitControls
 					makeDefault
 					enableZoom={false}

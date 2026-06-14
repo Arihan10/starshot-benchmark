@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import shutil
 import struct
@@ -53,7 +54,7 @@ from app.core.slots import (
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import generation, versions
 from app.services import anchors as anchors_svc
-from app.services import llm, prefabs, proxy as proxy_svc, threed
+from app.services import llm, prefabs, proxy as proxy_svc, publish as publish_svc, threed
 from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
@@ -67,6 +68,30 @@ RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
 # the re-baked optimized set (scripts/rebake_runs.py) instead. Falls back to
 # "objects" for any cell that hasn't been migrated.
 OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
+
+# Best-effort auto-publish: once a tour is finalized, push the cell's preview +
+# tour to R2 and upsert the D1 catalog in the background so the prod client sees
+# the new scene. Detached from the request, and failures (missing R2/D1 creds,
+# network) are only logged — they never block tour capture. A live task set
+# keeps references so the GC can't drop a publish mid-flight.
+_autopublish_log = logging.getLogger("starshot.autopublish")
+_autopublish_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _auto_publish_cell(run: str, slot: str, model: str) -> None:
+    try:
+        rec = await publish_svc.publish_cell(RUNS_DIR, run, slot, model)
+        _autopublish_log.info("published %s/%s/%s v%s", run, slot, model, rec["version"])
+    except Exception as e:
+        _autopublish_log.warning(
+            "publish failed for %s/%s/%s: %s: %s", run, slot, model, type(e).__name__, e
+        )
+
+
+def _schedule_auto_publish(run: str, slot: str, model: str) -> None:
+    task = asyncio.create_task(_auto_publish_cell(run, slot, model))
+    _autopublish_tasks.add(task)
+    task.add_done_callback(_autopublish_tasks.discard)
 
 # Python's mimetypes doesn't know glTF; without these the artifact route would
 # hand the loader its GLBs as text/plain.
@@ -916,6 +941,9 @@ def create_app() -> FastAPI:
         tour_dir = _tour_dir(slot_log)
         tour_dir.mkdir(parents=True, exist_ok=True)
         (tour_dir / "tour.json").write_bytes(body)
+        # A finalized tour = a publishable scene; push it to R2 + D1 in the
+        # background (best-effort) so the prod client's catalog picks it up.
+        _schedule_auto_publish(run, slot_id, model_alias)
         tour_url = (
             f"/artifacts/{quote(run)}/{quote(slot_id)}/{quote(model_alias)}/tour/tour.json"
         )

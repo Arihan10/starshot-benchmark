@@ -2,30 +2,47 @@
 
 import { useState, type ReactNode } from "react";
 import PanoramaImage from "@/components/PanoramaImage";
+import SceneGate from "@/components/SceneGate";
 import ViewerHeader from "@/components/ViewerHeader";
-import { PANORAMA_COUNT } from "@/lib/r2";
+import { panoFiles, panoPlaceholderUrl, panoUrl, sceneId, type Scene } from "@/lib/scenes";
 
 export default function PanoramaPage() {
-	const [pano, setPano] = useState(0);
-
 	return (
 		<main className="relative flex h-dvh flex-col overflow-hidden bg-neutral-950 text-neutral-100">
 			<ViewerHeader />
 
 			<div className="relative flex-1">
-				<PanoramaImage index={pano} />
-
-				<PanoramaSelector
-					index={pano}
-					count={PANORAMA_COUNT}
-					onSelect={setPano}
-				/>
-
-				<p className="pointer-events-none absolute left-4 top-4 text-xs text-neutral-500">
-					drag to look around
-				</p>
+				{/* Keyed by scene id so switching scenes resets to the first panorama. */}
+				<SceneGate>{(scene) => <PanoramaBrowser key={sceneId(scene)} scene={scene} />}</SceneGate>
 			</div>
 		</main>
+	);
+}
+
+function PanoramaBrowser({ scene }: { scene: Scene }) {
+	const files = panoFiles(scene);
+	const [index, setIndex] = useState(0);
+
+	if (files.length === 0) {
+		return (
+			<div className="absolute inset-0 flex items-center justify-center">
+				<span className="text-sm text-neutral-500">this scene has no panoramas</span>
+			</div>
+		);
+	}
+
+	const file = files[index];
+
+	return (
+		<>
+			<PanoramaImage url={panoUrl(scene, file)} placeholderUrl={panoPlaceholderUrl(scene, file)} />
+
+			<PanoramaSelector index={index} count={files.length} onSelect={setIndex} />
+
+			<p className="pointer-events-none absolute left-4 top-4 text-xs text-neutral-500">
+				drag to look around
+			</p>
+		</>
 	);
 }
 

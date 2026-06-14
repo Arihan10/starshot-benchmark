@@ -30,6 +30,18 @@ export type OrbitMode =
 	| "peek"
 	| "transition";
 
+// The right-click per-object menu, positioned in viewport coords. `label` is
+// null when opened over empty space (only the recovery actions show then).
+export type ObjectMenu = {
+	x: number;
+	y: number;
+	label: string | null;
+	hidden: boolean;
+	outlined: boolean;
+	hiddenCount: number;
+	outlinedCount: number;
+};
+
 // What the engine surfaces is fed straight into the on-screen chrome.
 export type OrbitState = {
 	mode: OrbitMode;
@@ -37,6 +49,10 @@ export type OrbitState = {
 	currentId: string | null;
 	currentIndex: number;
 	hover: { id: string; occluded: boolean } | null;
+	objectHover: string | null; // label of the object under the cursor (overview)
+	proxyView: boolean; // overview shows the low-poly proxy instead of the lite dollhouse
+	canProxyView: boolean; // the proxy/lite swap is available (overview + both loaded)
+	contextMenu: ObjectMenu | null;
 	busy: boolean;
 	overlay: { msg: string; spinner: boolean; err: boolean } | null;
 };
@@ -47,6 +63,10 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	currentId: null,
 	currentIndex: -1,
 	hover: null,
+	objectHover: null,
+	proxyView: false,
+	canProxyView: false,
+	contextMenu: null,
 	busy: false,
 	overlay: null,
 };

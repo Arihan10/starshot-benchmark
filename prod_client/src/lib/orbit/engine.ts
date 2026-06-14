@@ -2,9 +2,12 @@ import {
 	Box3,
 	Color,
 	DirectionalLight,
+	EdgesGeometry,
 	Group,
 	HemisphereLight,
 	type Intersection,
+	LineBasicMaterial,
+	LineSegments,
 	type Material,
 	MathUtils,
 	Matrix3,
@@ -145,6 +148,35 @@ export class OrbitEngine {
 	private liteRoot: Group | null = null;
 	private proxyGroup: Group | null = null;
 	private sharedOverview = false;
+	private proxyView = false; // overview shows the proxy mesh instead of the lite dollhouse
+
+	// Per-object addressing (lite + proxy). Each placed object is tagged at load
+	// so the user can hover (cyan outline) and right-click (hide / persist orange
+	// outline) it. Outlines are independent EdgesGeometry overlays parented to each
+	// mesh, so reskinProxy() — which rewrites proxy mesh materials on view changes —
+	// can't clobber them.
+	private readonly picker = new Raycaster();
+	private readonly hiddenObjects = new Set<Object3D>();
+	private readonly outlinedObjects = new Set<Object3D>();
+	private hoveredObj: Object3D | null = null;
+	private menuTarget: Object3D | null = null;
+	private contextMenu: OrbitState["contextMenu"] = null;
+	private rcDownX = 0;
+	private rcDownY = 0;
+	private readonly hoverLineMat = new LineBasicMaterial({
+		color: 0x66e0ff,
+		transparent: true,
+		opacity: 0.95,
+		depthTest: false,
+		depthWrite: false,
+	});
+	private readonly selectLineMat = new LineBasicMaterial({
+		color: 0xffa23a,
+		transparent: true,
+		opacity: 1.0,
+		depthTest: false,
+		depthWrite: false,
+	});
 
 	private mode: OrbitMode = "empty";
 	private readonly sceneCenter = new Vector3();
@@ -293,6 +325,8 @@ export class OrbitEngine {
 			m.geometry.dispose();
 			(m.material as Material).dispose();
 		});
+		this.hoverLineMat.dispose();
+		this.selectLineMat.dispose();
 		this.renderer.dispose();
 		this.canvas.remove();
 		this.travelFade.remove();
@@ -315,6 +349,10 @@ export class OrbitEngine {
 			currentId: cur ? cur.id : null,
 			currentIndex: this.currentIndex,
 			hover,
+			objectHover: this.hoveredObj ? (this.hoveredObj.userData.objLabel as string) : null,
+			proxyView: this.proxyView,
+			canProxyView: this.canToggleProxyView(),
+			contextMenu: this.contextMenu,
 			busy: this.interiorBusy,
 			overlay: this.overlay,
 		};
@@ -353,7 +391,16 @@ export class OrbitEngine {
 
 	// --- input handlers (bound fields so dispose can detach them) -------------
 
-	private onContextMenu = (e: Event) => e.preventDefault();
+	// Right-click an object → per-object menu (hide / outline). A right-DRAG still
+	// pans the overview (OrbitControls RIGHT = PAN), so only a near-stationary
+	// right-click counts. Addressing is an overview activity, so the menu is gated
+	// to it.
+	private onContextMenu = (ev: MouseEvent) => {
+		ev.preventDefault();
+		if (this.mode !== "overview") return;
+		if (Math.hypot(ev.clientX - this.rcDownX, ev.clientY - this.rcDownY) > 6) return;
+		this.openObjectMenu(ev.clientX, ev.clientY);
+	};
 
 	private onControlsStart = () => {
 		if (this.mode !== "overview") return;
@@ -369,6 +416,10 @@ export class OrbitEngine {
 	};
 
 	private onPointerDown = (ev: PointerEvent) => {
+		if (ev.button === 2) {
+			this.rcDownX = ev.clientX;
+			this.rcDownY = ev.clientY;
+		}
 		if (this.mode !== "interior" || this.interiorBusy) return;
 		this.dragging = true;
 		this.dragMoved = 0;
@@ -384,12 +435,15 @@ export class OrbitEngine {
 		if (this.mode === "overview") {
 			if (ev.buttons !== 0) return; // skip mid-orbit drag
 			const spot = pickByScreen(ev.clientX, ev.clientY, this.entryGroup, ENTRY_AIM_PX, this.camera, this.canvas);
-			const idx = spot ? (spot.userData.targetIndex as number) : -1;
-			this.canvas.style.cursor = spot ? "pointer" : "";
-			if (idx !== this.hoveredEntryIndex) {
-				this.hoveredEntryIndex = idx;
-				this.emit();
-			}
+			const entryIdx = spot ? (spot.userData.targetIndex as number) : -1;
+			// Entry discs are the primary overview action and win the hover; only
+			// when none is under the cursor do we offer the object beneath it.
+			const obj = entryIdx >= 0 ? null : this.pickObjectAt(ev.clientX, ev.clientY);
+			this.canvas.style.cursor = entryIdx >= 0 || obj ? "pointer" : "";
+			const hoverChanged = this.setObjectHover(obj);
+			const entryChanged = entryIdx !== this.hoveredEntryIndex;
+			this.hoveredEntryIndex = entryIdx;
+			if (entryChanged || hoverChanged) this.emit();
 			return;
 		}
 		if (this.mode !== "interior") return;
@@ -617,10 +671,17 @@ export class OrbitEngine {
 		});
 	}
 
+	// The proxy stands in for the dollhouse when there's no lite export, or when
+	// the user flipped on "proxy view" to inspect/address the low-poly geometry.
+	private proxyAsDollhouse(): boolean {
+		return this.sharedOverview || (this.proxyView && !!this.proxyGroup);
+	}
+
 	private setOverviewView() {
-		if (this.liteRoot) this.liteRoot.visible = true;
+		const proxyDoll = this.proxyAsDollhouse();
+		if (this.liteRoot) this.liteRoot.visible = !proxyDoll;
 		if (this.proxyGroup) {
-			if (this.sharedOverview) {
+			if (proxyDoll) {
 				this.reskinProxy(this.polyMaterial);
 				this.proxyGroup.visible = true;
 			} else {
@@ -634,22 +695,37 @@ export class OrbitEngine {
 		this.you.group.visible = false;
 	}
 
+	// Swap the interior proxy in place between the bare low-poly mesh (proxy view:
+	// flat matte, no pano) and the captured panos projected onto it. The backdrop
+	// sphere is the projected sky, so it's off in proxy view. Safe to call
+	// mid-walkthrough — it leaves the navigation markers alone.
+	private setInteriorProxyView() {
+		if (!this.proxyGroup || !this.projectionMode) return;
+		this.reskinProxy(this.proxyView ? this.polyMaterial : this.projMaterial);
+		this.sphereA.visible = !this.proxyView;
+		// Refresh the projection uniforms after a proxy-view spell (updateProjection
+		// is skipped while it's on) so the first textured frame isn't stale.
+		if (!this.proxyView) this.updateProjection();
+	}
+
 	private setInteriorView() {
 		if (this.liteRoot) this.liteRoot.visible = false;
-		if (this.proxyGroup) {
-			if (this.sharedOverview) this.reskinProxy(this.projMaterial);
-			this.proxyGroup.visible = this.projectionMode;
+		if (this.proxyGroup) this.proxyGroup.visible = this.projectionMode;
+		if (this.projectionMode) {
+			this.setInteriorProxyView();
+		} else {
+			this.sphereA.visible = true; // sphere-only tour: the pano sphere IS the view
 		}
-		this.sphereA.visible = true;
 		this.hotspotGroup.visible = true;
 		this.entryGroup.visible = false;
 		this.you.group.visible = false;
 	}
 
 	private setPeekView() {
-		if (this.liteRoot) this.liteRoot.visible = true;
+		const proxyDoll = this.proxyAsDollhouse();
+		if (this.liteRoot) this.liteRoot.visible = !proxyDoll;
 		if (this.proxyGroup) {
-			if (this.sharedOverview) {
+			if (proxyDoll) {
 				this.reskinProxy(this.polyMaterial);
 				this.proxyGroup.visible = true;
 			} else {
@@ -661,6 +737,233 @@ export class OrbitEngine {
 		this.hotspotGroup.visible = false;
 		this.entryGroup.visible = false;
 		this.you.group.visible = true;
+	}
+
+	// Where the bare-proxy / textured swap is offered: the overview needs a lite
+	// scene to swap the proxy in for (sharedOverview tours already show the proxy);
+	// the interior needs a proxy to project onto (i.e. projection mode).
+	private canToggleProxyView(): boolean {
+		if (this.mode === "overview") return !!this.liteRoot && !!this.proxyGroup;
+		if (this.mode === "interior") return this.projectionMode;
+		return false;
+	}
+
+	// Flip between the textured scene (lite dollhouse / projected panos) and the
+	// bare low-poly proxy — in the overview AND the first-person interior.
+	toggleProxyView() {
+		if (!this.canToggleProxyView()) return;
+		this.proxyView = !this.proxyView;
+		this.setObjectHover(null);
+		this.contextMenu = null;
+		this.menuTarget = null;
+		this.canvas.style.cursor = "";
+		if (this.mode === "overview") this.setOverviewView();
+		else if (this.mode === "interior") this.setInteriorProxyView();
+		this.emit();
+	}
+
+	// --- per-object addressing (pick / hide / outline) ------------------------
+
+	// The addressable objects of a loaded root. The exporter/loader can wrap the
+	// real objects under a single node, so unwrap single unnamed non-mesh wrappers,
+	// then take that container's mesh-bearing children. Fall back to "every mesh"
+	// when the structure is flat or collapses to one node.
+	private collectObjects(root: Object3D): Object3D[] {
+		let container = root;
+		while (
+			container.children.length === 1 &&
+			!(container.children[0] as Mesh).isMesh &&
+			!container.children[0].name &&
+			container.children[0].children.length > 0
+		) {
+			container = container.children[0];
+		}
+		const hasMesh = (o: Object3D) => {
+			let found = false;
+			o.traverse((c) => {
+				if ((c as Mesh).isMesh) found = true;
+			});
+			return found;
+		};
+		let objs = container.children.filter(hasMesh);
+		if (objs.length <= 1) {
+			objs = [];
+			root.traverse((o) => {
+				if ((o as Mesh).isMesh) objs.push(o);
+			});
+		}
+		return objs;
+	}
+
+	private registerObjects(root: Object3D) {
+		this.collectObjects(root).forEach((o, i) => {
+			o.userData.objId = i;
+			o.userData.objLabel = o.name && o.name.trim() ? o.name.trim() : `object ${i + 1}`;
+		});
+	}
+
+	// Lazily build a wireframe outline (one LineSegments per mesh) parented to each
+	// mesh, so it tracks the object's transform and survives reskinProxy() (which
+	// only rewrites mesh materials). Edges are cached per mesh.
+	private getEdges(mesh: Mesh): EdgesGeometry {
+		const ud = mesh.userData as { edges?: EdgesGeometry };
+		if (!ud.edges) ud.edges = new EdgesGeometry(mesh.geometry, 25);
+		return ud.edges;
+	}
+
+	private ensureOutlineLines(obj: Object3D): LineSegments[] {
+		const ud = obj.userData as { outlineLines?: LineSegments[] };
+		if (ud.outlineLines) return ud.outlineLines;
+		const lines: LineSegments[] = [];
+		obj.traverse((node) => {
+			const mesh = node as Mesh;
+			if (!mesh.isMesh || !mesh.geometry) return;
+			const ls = new LineSegments(this.getEdges(mesh), this.hoverLineMat);
+			ls.userData.isOutline = true;
+			ls.raycast = () => {}; // the outline itself is never a pick target
+			ls.renderOrder = 6;
+			ls.frustumCulled = false;
+			ls.visible = false;
+			mesh.add(ls);
+			lines.push(ls);
+		});
+		ud.outlineLines = lines;
+		return lines;
+	}
+
+	// Selection (persistent, orange) beats hover (transient, cyan) beats none.
+	private refreshOutline(obj: Object3D) {
+		const kind = this.outlinedObjects.has(obj)
+			? "select"
+			: obj === this.hoveredObj
+				? "hover"
+				: "none";
+		const ud = obj.userData as { outlineLines?: LineSegments[] };
+		if (kind === "none" && !ud.outlineLines) return;
+		const mat = kind === "select" ? this.selectLineMat : this.hoverLineMat;
+		for (const ls of this.ensureOutlineLines(obj)) {
+			ls.visible = kind !== "none";
+			ls.material = mat;
+		}
+	}
+
+	private setObjectHover(obj: Object3D | null): boolean {
+		if (obj === this.hoveredObj) return false;
+		const prev = this.hoveredObj;
+		this.hoveredObj = obj;
+		if (prev) this.refreshOutline(prev);
+		if (obj) this.refreshOutline(obj);
+		return true;
+	}
+
+	private setObjectHidden(obj: Object3D, hidden: boolean) {
+		obj.visible = !hidden;
+		if (hidden) {
+			this.hiddenObjects.add(obj);
+			if (obj === this.hoveredObj) this.hoveredObj = null; // can't hover what's gone
+		} else {
+			this.hiddenObjects.delete(obj);
+		}
+	}
+
+	private toggleObjectOutline(obj: Object3D) {
+		if (this.outlinedObjects.has(obj)) this.outlinedObjects.delete(obj);
+		else this.outlinedObjects.add(obj);
+		this.refreshOutline(obj);
+	}
+
+	// Which loaded root the cursor addresses right now: the dollhouse in overview /
+	// peek (lite, or the proxy when "proxy view" is on or there's no lite). The
+	// interior is a navigation walkthrough, so objects aren't addressed there.
+	private activeObjectRoot(): Object3D | null {
+		if (this.mode === "overview" || this.mode === "peek") {
+			if (this.proxyView && this.proxyGroup) return this.proxyGroup;
+			return this.liteRoot ?? this.proxyGroup;
+		}
+		return null;
+	}
+
+	private findObjectRoot(node: Object3D, root: Object3D): Object3D | null {
+		let cur: Object3D | null = node;
+		while (cur && cur !== root) {
+			if (cur.userData.objId !== undefined) return cur;
+			cur = cur.parent;
+		}
+		return null;
+	}
+
+	private pickObjectAt(clientX: number, clientY: number): Object3D | null {
+		const root = this.activeObjectRoot();
+		if (!root || !root.visible) return null;
+		const rect = this.canvas.getBoundingClientRect();
+		_ndc.set(
+			((clientX - rect.left) / rect.width) * 2 - 1,
+			-((clientY - rect.top) / rect.height) * 2 + 1,
+		);
+		this.picker.setFromCamera(_ndc, this.camera);
+		// Raycaster doesn't skip invisible objects, so skip hidden ones explicitly —
+		// otherwise a hidden object would still shadow the geometry behind it.
+		for (const h of this.picker.intersectObject(root, true)) {
+			if ((h.object.userData as { isOutline?: boolean }).isOutline) continue;
+			const obj = this.findObjectRoot(h.object, root);
+			if (obj && obj.visible) return obj;
+		}
+		return null;
+	}
+
+	// --- right-click object menu ----------------------------------------------
+
+	private openObjectMenu(clientX: number, clientY: number) {
+		const obj = this.pickObjectAt(clientX, clientY);
+		// Right-clicking empty space still surfaces the recovery actions (you can't
+		// re-pick an object once it's hidden), but only if there's something to recover.
+		if (!obj && this.hiddenObjects.size === 0 && this.outlinedObjects.size === 0) {
+			this.closeMenu();
+			return;
+		}
+		this.menuTarget = obj;
+		this.contextMenu = {
+			x: clientX,
+			y: clientY,
+			label: obj ? (obj.userData.objLabel as string) : null,
+			hidden: !!obj && this.hiddenObjects.has(obj),
+			outlined: !!obj && this.outlinedObjects.has(obj),
+			hiddenCount: this.hiddenObjects.size,
+			outlinedCount: this.outlinedObjects.size,
+		};
+		this.emit();
+	}
+
+	closeMenu() {
+		if (!this.contextMenu) return;
+		this.contextMenu = null;
+		this.menuTarget = null;
+		this.emit();
+	}
+
+	toggleMenuTargetHidden() {
+		const obj = this.menuTarget;
+		if (obj) this.setObjectHidden(obj, !this.hiddenObjects.has(obj));
+		this.closeMenu();
+	}
+
+	toggleMenuTargetOutline() {
+		const obj = this.menuTarget;
+		if (obj) this.toggleObjectOutline(obj);
+		this.closeMenu();
+	}
+
+	showAllHidden() {
+		for (const o of this.hiddenObjects) o.visible = true;
+		this.hiddenObjects.clear();
+		this.closeMenu();
+	}
+
+	clearOutlines() {
+		const all = [...this.outlinedObjects];
+		this.outlinedObjects.clear();
+		for (const o of all) this.refreshOutline(o);
+		this.closeMenu();
 	}
 
 	// --- markers --------------------------------------------------------------
@@ -858,6 +1161,9 @@ export class OrbitEngine {
 		this.controls.autoRotate = false;
 		this.hoveredEntryIndex = -1;
 		this.hoveredTargetIndex = -1;
+		this.setObjectHover(null);
+		this.contextMenu = null;
+		this.menuTarget = null;
 		this.canvas.style.cursor = "";
 		this.cursorGroup.visible = false;
 		this.emit(); // gated: holds the chrome while mode === "transition"
@@ -1184,7 +1490,16 @@ export class OrbitEngine {
 			m.geometry?.dispose();
 			const mats = Array.isArray(m.material) ? m.material : [m.material];
 			for (const mat of mats) {
-				if (mat && mat !== this.projMaterial && mat !== this.polyMaterial) mat.dispose();
+				// Shared singletons (projection/poly fills, outline line mats) outlive
+				// any one cell, so never dispose them here.
+				if (
+					mat &&
+					mat !== this.projMaterial &&
+					mat !== this.polyMaterial &&
+					mat !== this.hoverLineMat &&
+					mat !== this.selectLineMat
+				)
+					mat.dispose();
 			}
 		});
 	}
@@ -1222,6 +1537,14 @@ export class OrbitEngine {
 		this.savedInterior = null;
 		this.hoveredEntryIndex = -1;
 		this.hoveredTargetIndex = -1;
+		// Reset per-object addressing; the old nodes are disposed with the roots.
+		this.proxyView = false;
+		this.hiddenObjects.clear();
+		this.outlinedObjects.clear();
+		this.hoveredObj = null;
+		this.menuTarget = null;
+		this.contextMenu = null;
+		this.canvas.style.cursor = "";
 		this.clearTravelMask();
 	}
 
@@ -1312,6 +1635,12 @@ export class OrbitEngine {
 			this.scene.add(proxyRoot);
 		}
 
+		// Tag each placed object in both roots so they can be hovered / hidden /
+		// outlined individually (independently per scene — lite and proxy nodes
+		// don't share identity).
+		if (this.liteRoot) this.registerObjects(this.liteRoot);
+		if (this.proxyGroup) this.registerObjects(this.proxyGroup);
+
 		const framed = lite ?? proxyRoot!;
 		const box = new Box3().setFromObject(framed);
 		const size = box.getSize(new Vector3());
@@ -1360,7 +1689,7 @@ export class OrbitEngine {
 				tr.midDone = true;
 				tr.onMid?.();
 			}
-			if (this.proxyGroup && this.proxyGroup.visible && this.projectionMode) this.updateProjection();
+			if (this.proxyGroup?.visible && this.projectionMode && !this.proxyView) this.updateProjection();
 			if (t >= 1) {
 				this.clearTravelMask();
 				const cb = tr.onEnd;
@@ -1384,8 +1713,11 @@ export class OrbitEngine {
 					this.activate(idx);
 				}
 			}
-			if (this.projectionMode) this.updateProjection();
-			else this.sphereA.position.copy(this.camera.position);
+			if (this.projectionMode) {
+				if (!this.proxyView) this.updateProjection(); // proxy view shows bare geometry, no panos
+			} else {
+				this.sphereA.position.copy(this.camera.position);
+			}
 			this.applyLook();
 		} else if (this.mode === "peek") {
 			// Slowly orbit the dollhouse so locating gives a 360 view.
