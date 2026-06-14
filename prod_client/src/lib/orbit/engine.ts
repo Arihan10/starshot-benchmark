@@ -1,16 +1,15 @@
 import {
 	Box3,
+	Box3Helper,
 	Color,
 	DirectionalLight,
 	EdgesGeometry,
 	Group,
 	HemisphereLight,
-	type Intersection,
 	LineBasicMaterial,
 	LineSegments,
 	type Material,
 	MathUtils,
-	Matrix3,
 	Mesh,
 	type MeshBasicMaterial,
 	MOUSE,
@@ -43,7 +42,6 @@ import {
 import {
 	AUTO_AIM_PX,
 	CAPTURE_EYE_HEIGHT,
-	CLICK_CONE_HALF_ANGLE,
 	ENTRY_AIM_PX,
 	ENTRY_TARGET_PX,
 	HOTSPOT_FLOOR_DROP,
@@ -54,26 +52,16 @@ import {
 	HOTSPOT_TARGET_PX,
 	hotspotScaleForDistance,
 	makeDisc,
-	makeReticle,
 	makeYouMarker,
 	PEEK_ROTATE_SPEED,
 	pickByScreen,
-	RETICLE_TARGET_PX,
-	STEP_CONE_HALF_ANGLE,
 	type YouMarker,
 } from "./markers";
 import type { OrbitMode, OrbitState, TourManifest, TourSource } from "./types";
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 const easeInOut = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
-const UNIT_Z = new Vector3(0, 0, 1);
-const _coneDir = new Vector3();
 const _ndc = new Vector2();
-const _normalMat = new Matrix3();
-const _hitNormal = new Vector3();
-
-// A WASD step heading, relative to where you're currently looking.
-type StepKind = "forward" | "back" | "left" | "right";
 
 type Transition = {
 	fromPos: Vector3;
@@ -136,8 +124,6 @@ export class OrbitEngine {
 
 	private readonly hotspotGroup = new Group();
 	private readonly entryGroup = new Group();
-	private readonly cursorGroup = makeReticle();
-	private readonly cursorCaster = new Raycaster();
 	private readonly you: YouMarker;
 	private readonly occluder = new Raycaster();
 	private readonly dummyCam = new PerspectiveCamera();
@@ -147,6 +133,7 @@ export class OrbitEngine {
 	private projectionMode = false;
 	private liteRoot: Group | null = null;
 	private proxyGroup: Group | null = null;
+	private proxyBox: Box3Helper | null = null; // tight AABB wireframe around the proxy
 	private sharedOverview = false;
 	private proxyView = false; // overview shows the proxy mesh instead of the lite dollhouse
 
@@ -276,8 +263,6 @@ export class OrbitEngine {
 		this.scene.add(this.sphereA, this.sphereB);
 
 		this.scene.add(this.hotspotGroup, this.entryGroup);
-		this.cursorGroup.renderOrder = 6;
-		this.scene.add(this.cursorGroup);
 		this.you = makeYouMarker();
 		this.scene.add(this.you.group);
 
@@ -285,7 +270,6 @@ export class OrbitEngine {
 		this.canvas.addEventListener("pointerdown", this.onPointerDown);
 		this.canvas.addEventListener("pointermove", this.onPointerMove);
 		this.canvas.addEventListener("pointerup", this.onPointerUp);
-		this.canvas.addEventListener("pointerleave", this.onPointerLeave);
 		this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
 		this.canvas.addEventListener("click", this.onClick);
 		window.addEventListener("pointerup", this.onWindowPointerUp);
@@ -311,7 +295,6 @@ export class OrbitEngine {
 		this.canvas.removeEventListener("pointerdown", this.onPointerDown);
 		this.canvas.removeEventListener("pointermove", this.onPointerMove);
 		this.canvas.removeEventListener("pointerup", this.onPointerUp);
-		this.canvas.removeEventListener("pointerleave", this.onPointerLeave);
 		this.canvas.removeEventListener("wheel", this.onWheel);
 		this.canvas.removeEventListener("click", this.onClick);
 		window.removeEventListener("pointerup", this.onWindowPointerUp);
@@ -319,12 +302,6 @@ export class OrbitEngine {
 		window.removeEventListener("keyup", this.onKeyUp);
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
 		this.clearScene();
-		this.cursorGroup.traverse((o) => {
-			const m = o as Mesh;
-			if (!m.isMesh) return;
-			m.geometry.dispose();
-			(m.material as Material).dispose();
-		});
 		this.hoverLineMat.dispose();
 		this.selectLineMat.dispose();
 		this.renderer.dispose();
@@ -452,7 +429,6 @@ export class OrbitEngine {
 			this.lon = this.downLon + (this.downX - ev.clientX) * k;
 			this.lat = this.downLat + (ev.clientY - this.downY) * k;
 			this.dragMoved = Math.max(this.dragMoved, Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY));
-			this.cursorGroup.visible = false; // stash the reticle while looking around
 		} else if (!this.interiorBusy) {
 			this.updateHover(ev);
 		}
@@ -462,27 +438,9 @@ export class OrbitEngine {
 		if (this.mode !== "interior") return;
 		this.dragging = false;
 		this.canvas.style.cursor = "";
-		if (this.dragMoved >= 5 || this.interiorBusy) return;
-		if (this.proxyGroup) {
-			// Only a click that lands on the proxy counts — that's exactly when the
-			// reticle is showing. From there, travel to the nearest node in the click
-			// direction (straight through any wall); a click into the void does
-			// nothing.
-			if (!this.proxyHit(ev)) return;
-			this.travelTo(this.pickNodeByRay(ev));
-			return;
-		}
-		// No proxy (sphere-only tour): magnet-pick a hotspot disc.
-		const spot = pickByScreen(ev.clientX, ev.clientY, this.hotspotGroup, AUTO_AIM_PX, this.camera, this.canvas);
-		if (spot) this.travelTo(spot.userData.targetIndex as number);
-	};
-
-	private onPointerLeave = () => {
-		this.cursorGroup.visible = false;
-		if (this.mode === "interior" && this.hoveredTargetIndex !== -1) {
-			this.hoveredTargetIndex = -1;
-			this.hoveredOccluded = false;
-			this.emit();
+		if (this.dragMoved < 5 && !this.interiorBusy) {
+			const spot = pickByScreen(ev.clientX, ev.clientY, this.hotspotGroup, AUTO_AIM_PX, this.camera, this.canvas);
+			if (spot) this.travelTo(spot.userData.targetIndex as number);
 		}
 	};
 
@@ -504,15 +462,6 @@ export class OrbitEngine {
 		if (ev.code === "Space" && !ev.repeat) {
 			ev.preventDefault();
 			this.peekDown();
-			return;
-		}
-		// Hold-to-repeat is fine: travelTo no-ops while a step is in flight, so
-		// keeping a key down steps node-to-node at the travel cadence.
-		if (this.mode === "interior" && !this.interiorBusy) {
-			if (ev.code === "KeyW") this.stepInDirection("forward");
-			else if (ev.code === "KeyS") this.stepInDirection("back");
-			else if (ev.code === "KeyA") this.stepInDirection("left");
-			else if (ev.code === "KeyD") this.stepInDirection("right");
 		}
 	};
 	private onKeyUp = (ev: KeyboardEvent) => {
@@ -521,12 +470,6 @@ export class OrbitEngine {
 
 	private updateHover(ev: PointerEvent) {
 		if (this.currentIndex < 0) return;
-		if (this.proxyGroup) this.updateSurfaceHover(ev);
-		else this.updateHotspotHover(ev);
-	}
-
-	// Sphere-only tours (no proxy): the original magnet-pick over hotspot discs.
-	private updateHotspotHover(ev: PointerEvent) {
 		const spot = pickByScreen(ev.clientX, ev.clientY, this.hotspotGroup, AUTO_AIM_PX, this.camera, this.canvas);
 		const idx = spot ? (spot.userData.targetIndex as number) : -1;
 		const occ = spot ? !!spot.userData.occluded : false;
@@ -536,129 +479,6 @@ export class OrbitEngine {
 			this.hoveredOccluded = occ;
 			this.emit();
 		}
-	}
-
-	// Projection tours: glide the on-surface cursor over the proxy and preview the
-	// node a click would jump to (the nearest capture to the hit point).
-	private updateSurfaceHover(ev: PointerEvent) {
-		// Off the proxy there's no surface for the reticle and a click does nothing,
-		// so drop the reticle and the preview entirely.
-		const hit = this.proxyHit(ev);
-		if (!hit) {
-			this.cursorGroup.visible = false;
-			this.canvas.style.cursor = "";
-			if (this.hoveredTargetIndex !== -1) {
-				this.hoveredTargetIndex = -1;
-				this.hoveredOccluded = false;
-				this.emit();
-			}
-			return;
-		}
-		this.placeCursor(hit);
-		// Preview the exact node a click would jump to (same direction pick), so the
-		// highlight tracks through walls just like the click.
-		const target = this.pickNodeByRay(ev);
-		this.canvas.style.cursor = target >= 0 ? "pointer" : "";
-		const occ =
-			target >= 0 &&
-			this.anchorOccluded(this.panos[this.currentIndex].position, this.panos[target].position);
-		if (target !== this.hoveredTargetIndex || occ !== this.hoveredOccluded) {
-			this.hoveredTargetIndex = target;
-			this.hoveredOccluded = occ;
-			this.emit();
-		}
-	}
-
-	// Aim the shared cursor raycaster from a pointer event; returns its ray.
-	private rayFromEvent(ev: PointerEvent) {
-		const rect = this.canvas.getBoundingClientRect();
-		_ndc.set(
-			((ev.clientX - rect.left) / rect.width) * 2 - 1,
-			-((ev.clientY - rect.top) / rect.height) * 2 + 1,
-		);
-		this.cursorCaster.setFromCamera(_ndc, this.camera);
-		return this.cursorCaster.ray;
-	}
-
-	// Raycast the pointer against the proxy mesh; null when it misses (e.g. sky).
-	private proxyHit(ev: PointerEvent): Intersection | null {
-		const proxy = this.proxyGroup;
-		if (!proxy) return null;
-		this.rayFromEvent(ev);
-		const hits = this.cursorCaster.intersectObject(proxy, true);
-		return hits.length > 0 ? hits[0] : null;
-	}
-
-	// Lay the reticle flat on the hit facet (align +Z with the world-space face
-	// normal) at a constant on-screen size, so it reads as a cursor riding the
-	// proxy surface rather than a flat overlay on the image.
-	private placeCursor(hit: Intersection) {
-		const n = _hitNormal.set(0, 1, 0);
-		if (hit.face) {
-			n.copy(hit.face.normal)
-				.applyNormalMatrix(_normalMat.getNormalMatrix(hit.object.matrixWorld))
-				.normalize();
-		}
-		this.cursorGroup.position.copy(hit.point);
-		this.cursorGroup.quaternion.setFromUnitVectors(UNIT_Z, n);
-		const d = this.camera.position.distanceTo(hit.point);
-		this.cursorGroup.scale.setScalar(
-			hotspotScaleForDistance(d, RETICLE_TARGET_PX, this.camera.fov, this.host.clientHeight),
-		);
-		this.cursorGroup.visible = true;
-	}
-
-	// Which node a click points at: the nearest node inside a narrow cone around
-	// the click ray. Occlusion is ignored, so the pick reaches straight through a
-	// wall (clicking the wall lands you on the far side). Falls back to the node
-	// most in line with the click, then the absolute nearest, so a click is never
-	// left unanswered.
-	private pickNodeByRay(ev: PointerEvent): number {
-		const ray = this.rayFromEvent(ev);
-		const o = ray.origin;
-		const d = ray.direction;
-		const cosCone = Math.cos(CLICK_CONE_HALF_ANGLE);
-		let best = -1;
-		let bestDist = Infinity;
-		let aligned = -1;
-		let alignedCos = -1;
-		for (let i = 0; i < this.panos.length; i++) {
-			if (i === this.currentIndex) continue;
-			const p = this.panos[i].position;
-			const ex = p[0] - o.x;
-			const ey = p[1] - o.y;
-			const ez = p[2] - o.z;
-			const dist = Math.hypot(ex, ey, ez);
-			if (dist < 1e-3) continue;
-			const along = ex * d.x + ey * d.y + ez * d.z;
-			if (along <= 0) continue; // behind the click direction
-			const cos = along / dist;
-			if (cos >= cosCone && dist < bestDist) {
-				bestDist = dist;
-				best = i;
-			}
-			if (cos > alignedCos) {
-				alignedCos = cos;
-				aligned = i;
-			}
-		}
-		if (best >= 0) return best; // nearest node inside the click cone
-		if (aligned >= 0) return aligned; // else the node most in line with the click
-		return this.nearestExcludingCurrent(o); // last resort: nearest neighbour
-	}
-
-	private nearestExcludingCurrent(point: Vector3): number {
-		let best = -1;
-		let bestD = Infinity;
-		for (let i = 0; i < this.panos.length; i++) {
-			if (i === this.currentIndex) continue;
-			const dsq = point.distanceToSquared(v3(this.panos[i].position));
-			if (dsq < bestD) {
-				bestD = dsq;
-				best = i;
-			}
-		}
-		return best;
 	}
 
 	// --- view toggles (which geometry each mode shows) ------------------------
@@ -1114,6 +934,25 @@ export class OrbitEngine {
 		this.sphereAMat.depthTest = true; // let the opaque proxy occlude the backdrop
 	}
 
+	// Encase the proxy in a wireframe box sized to its exact world AABB (precise,
+	// per-vertex → no clearance). Drawn over everything (depthTest off) so the full
+	// 12-edge cage reads as a box around the proxy from any angle.
+	private buildProxyBox() {
+		if (!this.proxyGroup) return;
+		const box = new Box3().setFromObject(this.proxyGroup, true);
+		if (box.isEmpty()) return;
+		const helper = new Box3Helper(box, 0x9ad4ff);
+		const mat = helper.material as LineBasicMaterial;
+		mat.transparent = true;
+		mat.opacity = 0.5;
+		mat.depthTest = false;
+		mat.depthWrite = false;
+		helper.renderOrder = 5;
+		helper.frustumCulled = false;
+		this.scene.add(helper);
+		this.proxyBox = helper;
+	}
+
 	// --- look controls (interior: lon/lat drag) -------------------------------
 
 	private setLookFromForward(f: [number, number, number]) {
@@ -1165,7 +1004,6 @@ export class OrbitEngine {
 		this.contextMenu = null;
 		this.menuTarget = null;
 		this.canvas.style.cursor = "";
-		this.cursorGroup.visible = false;
 		this.emit(); // gated: holds the chrome while mode === "transition"
 	}
 
@@ -1176,7 +1014,6 @@ export class OrbitEngine {
 		this.hoveredTargetIndex = -1;
 		this.interiorBusy = true;
 		this.hotspotGroup.visible = false;
-		this.cursorGroup.visible = false;
 
 		if (this.projectionMode) {
 			// Glide through world space; the projection re-blends live (loading the
@@ -1435,52 +1272,6 @@ export class OrbitEngine {
 		if (this.mode === "peek") this.peekEnd();
 	}
 
-	// --- keyboard step navigation (WASD → nearest node within a cone) ----------
-
-	// Unit heading for a step key, relative to the current view. Forward/back use
-	// the full look direction (pitch included), so looking up at a node lets W
-	// reach it. Strafe stays horizontal — the camera has no roll, so A/D
-	// shouldn't dip into the floor/ceiling. Written into `out`.
-	private stepDir(kind: StepKind, out: Vector3): Vector3 {
-		const cl = Math.cos(this.lon);
-		const sl = Math.sin(this.lon);
-		const ca = Math.cos(this.lat);
-		const sa = Math.sin(this.lat);
-		if (kind === "forward") return out.set(ca * cl, sa, ca * sl);
-		if (kind === "back") return out.set(-ca * cl, -sa, -ca * sl);
-		if (kind === "left") return out.set(sl, 0, -cl);
-		return out.set(-sl, 0, cl); // right
-	}
-
-	// Cast a cone from the current viewpoint along the key's view-relative heading
-	// and travel to the nearest capture node inside it. The cone is angle-only
-	// (no max range): the nearest in-cone node always wins, so a sparse or badly
-	// placed scene can never strand you on a node. The angle test is fully 3D, so
-	// pitch is respected.
-	private stepInDirection(kind: StepKind) {
-		if (this.mode !== "interior" || this.interiorBusy || this.currentIndex < 0) return;
-		const dir = this.stepDir(kind, _coneDir);
-		const o = this.camera.position;
-		const cosHalf = Math.cos(STEP_CONE_HALF_ANGLE);
-		let best = -1;
-		let bestDist = Infinity;
-		for (let i = 0; i < this.panos.length; i++) {
-			if (i === this.currentIndex) continue;
-			const p = this.panos[i].position;
-			const ex = p[0] - o.x;
-			const ey = p[1] - o.y;
-			const ez = p[2] - o.z;
-			const dist = Math.hypot(ex, ey, ez);
-			if (dist < 1e-3) continue; // same point
-			if ((ex * dir.x + ey * dir.y + ez * dir.z) / dist < cosHalf) continue; // outside the cone
-			if (dist < bestDist) {
-				bestDist = dist;
-				best = i;
-			}
-		}
-		if (best >= 0) this.travelTo(best);
-	}
-
 	// --- cell loading ---------------------------------------------------------
 
 	private disposeObject(obj: Object3D) {
@@ -1516,6 +1307,11 @@ export class OrbitEngine {
 			this.disposeObject(this.proxyGroup);
 			this.proxyGroup = null;
 		}
+		if (this.proxyBox) {
+			this.scene.remove(this.proxyBox);
+			this.proxyBox.dispose();
+			this.proxyBox = null;
+		}
 		for (const p of this.panos) {
 			p.texture?.dispose();
 			if (p.placeholderTexture && p.placeholderTexture !== p.texture) p.placeholderTexture.dispose();
@@ -1527,7 +1323,6 @@ export class OrbitEngine {
 		this.hotspotGroup.clear();
 		this.entryGroup.clear();
 		this.you.group.visible = false;
-		this.cursorGroup.visible = false;
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
 		this.transition = null;
@@ -1640,6 +1435,9 @@ export class OrbitEngine {
 		// don't share identity).
 		if (this.liteRoot) this.registerObjects(this.liteRoot);
 		if (this.proxyGroup) this.registerObjects(this.proxyGroup);
+
+		// Encase the proxy in a tight bounding-box wireframe (its exact extents).
+		this.buildProxyBox();
 
 		const framed = lite ?? proxyRoot!;
 		const box = new Box3().setFromObject(framed);

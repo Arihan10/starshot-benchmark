@@ -21,15 +21,12 @@ export const HOTSPOT_MAX_VISIBLE = 10; // line-of-sight anchors shown
 export const HOTSPOT_MAX_OCCLUDED = 6; // behind-wall anchors shown (as ghosts)
 export const HOTSPOT_OCCLUDE_EPS = 0.2; // trim both ends so a hugged wall isn't a block
 export const HOTSPOT_TARGET_PX = 24; // interior hotspot radius on screen, in CSS px
-export const RETICLE_TARGET_PX = 30; // on-surface cursor radius on screen, in CSS px
 export const ENTRY_TARGET_PX = 12; // overview entry discs render smaller
 export const AUTO_AIM_PX = 42; // interior pick/hover magnetism radius
 export const ENTRY_AIM_PX = 26; // tighter pick radius for the smaller entry discs
 export const HOTSPOT_BASE_RADIUS = 0.16; // the disc geometry's world radius
 export const CAPTURE_EYE_HEIGHT = 1.6; // panos are shot at eye height; floor sits this far below
 export const PEEK_ROTATE_SPEED = 0.5; // rad/s the dollhouse spins while locating
-export const STEP_CONE_HALF_ANGLE = MathUtils.degToRad(40); // half-angle of each WASD pick cone
-export const CLICK_CONE_HALF_ANGLE = MathUtils.degToRad(18); // half-angle of the click direction pick
 
 // A flat floor disc + ring. Lies flat (normal up) so it reads as a spot on the
 // floor; screen-space auto-aim (see pickByScreen) handles forgiving picking.
@@ -98,42 +95,6 @@ export function makeYouMarker(): YouMarker {
 	for (const m of [sphere, ring, line]) m.renderOrder = 999;
 	group.add(sphere, ring, line);
 	return { group, sphere, ring, line };
-}
-
-// The on-surface cursor: a ring + center dot lying in the XY plane (normal +Z),
-// so the engine can lay it flat on whatever proxy face is under the pointer by
-// aligning +Z with the hit normal. Outer radius matches HOTSPOT_BASE_RADIUS so
-// hotspotScaleForDistance keeps it a constant pixel size. Drawn over everything
-// (depthTest off) so it reads as a crisp reticle gliding across the surface.
-export function makeReticle(): Group {
-	const group = new Group();
-	group.visible = false;
-	group.renderOrder = 6;
-	const ring = new Mesh(
-		new RingGeometry(HOTSPOT_BASE_RADIUS * 0.78, HOTSPOT_BASE_RADIUS, 48),
-		new MeshBasicMaterial({
-			color: 0x9ad4ff,
-			transparent: true,
-			opacity: 0.95,
-			side: DoubleSide,
-			depthTest: false,
-			depthWrite: false,
-		}),
-	);
-	const dot = new Mesh(
-		new CircleGeometry(HOTSPOT_BASE_RADIUS * 0.16, 24),
-		new MeshBasicMaterial({
-			color: 0x9ad4ff,
-			transparent: true,
-			opacity: 0.6,
-			side: DoubleSide,
-			depthTest: false,
-			depthWrite: false,
-		}),
-	);
-	for (const m of [ring, dot]) m.renderOrder = 6;
-	group.add(ring, dot);
-	return group;
 }
 
 // World scale that renders a disc at ~targetPx on screen at distance `d` —
