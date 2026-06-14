@@ -81,7 +81,7 @@ _autopublish_tasks: set[asyncio.Task[None]] = set()
 async def _auto_publish_cell(run: str, slot: str, model: str) -> None:
     try:
         rec = await publish_svc.publish_cell(RUNS_DIR, run, slot, model)
-        _autopublish_log.info("published %s/%s/%s v%s", run, slot, model, rec["version"])
+        _autopublish_log.info("published %s/%s/%s (%s panos)", run, slot, model, rec["pano_count"])
     except Exception as e:
         _autopublish_log.warning(
             "publish failed for %s/%s/%s: %s: %s", run, slot, model, type(e).__name__, e

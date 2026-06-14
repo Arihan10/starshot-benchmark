@@ -24,27 +24,28 @@ import httpx
 _API_BASE = "https://api.cloudflare.com/client/v4"
 _DEFAULT_DB_ID = "7437d4b3-a91c-4587-90cc-3a2ef269031d"  # database-prod
 
+# One row per (run, slot, model) — assets are NOT versioned. Re-publishing a
+# cell overwrites its row (and its R2 objects) in place.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenes (
   run          TEXT NOT NULL,
   slot         TEXT NOT NULL,
   model        TEXT NOT NULL,
-  version      TEXT NOT NULL,
   preview_key  TEXT NOT NULL,
   tour_key     TEXT,
   proxy_key    TEXT,
   pano_prefix  TEXT,
   pano_count   INTEGER NOT NULL DEFAULT 0,
   published_at TEXT NOT NULL,
-  PRIMARY KEY (run, slot, model, version)
+  PRIMARY KEY (run, slot, model)
 )
 """.strip()
 
 _UPSERT = """
 INSERT INTO scenes
-  (run, slot, model, version, preview_key, tour_key, proxy_key, pano_prefix, pano_count, published_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-ON CONFLICT(run, slot, model, version) DO UPDATE SET
+  (run, slot, model, preview_key, tour_key, proxy_key, pano_prefix, pano_count, published_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(run, slot, model) DO UPDATE SET
   preview_key  = excluded.preview_key,
   tour_key     = excluded.tour_key,
   proxy_key    = excluded.proxy_key,
@@ -106,7 +107,6 @@ async def upsert_scene(
     run: str,
     slot: str,
     model: str,
-    version: str,
     preview_key: str,
     tour_key: str | None,
     proxy_key: str | None,
@@ -114,7 +114,7 @@ async def upsert_scene(
     pano_count: int,
     published_at: str,
 ) -> None:
-    """Insert or overwrite the catalog row for one published (run/slot/model/version)."""
+    """Insert or overwrite the catalog row for one published (run/slot/model)."""
     await ensure_schema()
     await query(
         _UPSERT,
@@ -122,7 +122,6 @@ async def upsert_scene(
             run,
             slot,
             model,
-            version,
             preview_key,
             tour_key,
             proxy_key,

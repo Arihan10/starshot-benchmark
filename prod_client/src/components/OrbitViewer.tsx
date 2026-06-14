@@ -237,11 +237,13 @@ function MenuButton({ onClick, children }: { onClick: () => void; children: Reac
 	);
 }
 
-// Top-left bird's-eye minimap for the level the user is on: the captured slice
-// with every same-level anchor dotted onto it (current one lit). Clicking a dot
-// walks there; the header toggle expands it to a large readable view. The box
-// always keeps the slice's aspect (so the %-placed dots stay aligned) and is the
-// largest size that fits the caps on both axes — width = min(maxW, maxH * aspect).
+// Top-left bird's-eye minimap. Shows the captured slice for the floor you're
+// viewing, with that floor's anchors dotted on (the live one lit). The floor
+// switcher pages between captured levels WITHOUT moving the camera; it defaults
+// to — and follows — the floor the character is on. Clicking a dot walks there;
+// the header toggle expands it. The box always keeps the slice's aspect (so the
+// %-placed dots stay aligned), at the largest size that fits the caps on both
+// axes — width = min(maxW, maxH * aspect).
 const minimapWidth = (aspect: number, maxW: string, maxH: string) =>
 	`min(${maxW}, calc(${maxH} * ${aspect}))`;
 const MINIMAP_COMPACT = { w: "200px", h: "170px" };
@@ -255,16 +257,48 @@ function Minimap({
 	engine: RefObject<OrbitEngine | null>;
 }) {
 	const [expanded, setExpanded] = useState(false);
+	const { currentLevel, levels } = minimap;
+	const [viewedLevel, setViewedLevel] = useState(currentLevel);
+	// Default to / follow the character's floor; a manual pick sticks until they
+	// change floors. Adjusting state during render on a prop change (vs. an effect)
+	// is React's recommended pattern — no extra commit / cascading render.
+	const [prevLevel, setPrevLevel] = useState(currentLevel);
+	if (currentLevel !== prevLevel) {
+		setPrevLevel(currentLevel);
+		setViewedLevel(currentLevel);
+	}
+
+	const view = levels[viewedLevel] ?? levels[currentLevel];
+	if (!view) return null;
 	const caps = expanded ? MINIMAP_EXPANDED : MINIMAP_COMPACT;
+	const onCurrentFloor = view.level === currentLevel;
 	return (
 		<div className="rounded-md border border-white/10 bg-black/60 p-1.5 backdrop-blur">
 			<div className="mb-1 flex items-center justify-between gap-2 px-0.5 text-[9px] uppercase tracking-wider text-neutral-400">
 				<span>minimap</span>
-				<div className="flex items-center gap-1.5">
-					{minimap.levelCount > 1 && (
-						<span>
-							level {minimap.level + 1}/{minimap.levelCount}
-						</span>
+				<div className="flex items-center gap-1">
+					{levels.length > 1 && (
+						<div className="flex items-center gap-0.5" title="switch floor (doesn't move you)">
+							{levels.map((lv) => {
+								const isViewed = lv.level === viewedLevel;
+								const isCurrent = lv.level === currentLevel;
+								return (
+									<button
+										key={lv.level}
+										type="button"
+										title={`floor ${lv.level + 1}${isCurrent ? " · you are here" : ""}`}
+										onClick={() => setViewedLevel(lv.level)}
+										className={`rounded px-1 py-0.5 text-[9px] leading-none tabular-nums transition ${
+											isViewed
+												? "bg-cyan-500/30 text-cyan-100"
+												: "text-neutral-400 hover:bg-white/10 hover:text-white"
+										} ${isCurrent ? "ring-1 ring-inset ring-cyan-300/70" : ""}`}
+									>
+										{lv.level + 1}
+									</button>
+								);
+							})}
+						</div>
 					)}
 					<button
 						type="button"
@@ -279,16 +313,16 @@ function Minimap({
 			</div>
 			<div
 				className="relative overflow-hidden rounded"
-				style={{ width: minimapWidth(minimap.aspect, caps.w, caps.h), aspectRatio: minimap.aspect }}
+				style={{ width: minimapWidth(view.aspect, caps.w, caps.h), aspectRatio: view.aspect }}
 			>
 				{/* eslint-disable-next-line @next/next/no-img-element -- runtime R2 slice (proxied via /r2), not a static asset; next/image adds no value here */}
 				<img
-					src={minimap.url}
+					src={view.url}
 					alt="scene from above"
 					draggable={false}
 					className="absolute inset-0 h-full w-full object-fill"
 				/>
-				{minimap.points.map((pt) => (
+				{view.points.map((pt) => (
 					<button
 						key={pt.index}
 						type="button"
@@ -302,6 +336,11 @@ function Minimap({
 						}`}
 					/>
 				))}
+				{!onCurrentFloor && (
+					<div className="pointer-events-none absolute bottom-1 left-1 rounded bg-black/65 px-1 py-0.5 text-[8px] uppercase tracking-wider text-cyan-200">
+						floor {view.level + 1} · you are on {currentLevel + 1}
+					</div>
+				)}
 			</div>
 		</div>
 	);

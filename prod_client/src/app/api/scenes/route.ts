@@ -15,7 +15,7 @@ const nullable = (v: unknown): string | null => (v == null ? null : String(v));
 export async function GET() {
 	try {
 		const rows = await d1Query(
-			`SELECT run, slot, model, version, preview_key, tour_key, proxy_key,
+			`SELECT run, slot, model, preview_key, tour_key, proxy_key,
 			        pano_prefix, pano_count, published_at
 			   FROM scenes
 			  ORDER BY published_at DESC`,
@@ -24,7 +24,6 @@ export async function GET() {
 			run: str(r.run),
 			slot: str(r.slot),
 			model: str(r.model),
-			version: str(r.version),
 			previewKey: str(r.preview_key),
 			tourKey: nullable(r.tour_key),
 			proxyKey: nullable(r.proxy_key),

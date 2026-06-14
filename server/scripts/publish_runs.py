@@ -66,7 +66,7 @@ async def _run(args: argparse.Namespace) -> int:
             )
             tag = "[plan]" if args.dry_run else "[publish]"
             print(
-                f"{tag} {run}/{slot}/{model} v{rec['version']}: "
+                f"{tag} {run}/{slot}/{model}: "
                 f"{rec['pano_count']} panos, proxy={'y' if rec['proxy_key'] else 'n'} "
                 f"-> {rec['preview_key']}"
             )
@@ -81,7 +81,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Publish generated cells to R2 + D1.")
     ap.add_argument("--cell", help="run/slot/model to publish")
     ap.add_argument("--all", action="store_true", help="publish every cell with generated meshes")
-    ap.add_argument("--version", default=None, help="generated version (default: latest with meshes)")
+    ap.add_argument(
+        "--version",
+        default=None,
+        help="generated build to bake the dollhouse from (default: the tour's build, else latest)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="print planned keys; no upload / D1 write")
     raise SystemExit(asyncio.run(_run(ap.parse_args())))
 

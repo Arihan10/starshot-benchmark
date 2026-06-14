@@ -1,8 +1,8 @@
 // The scene catalog: the client's view of the D1 `scenes` table. Each row is one
-// published (run / slot / model / version) take, carrying the R2 keys of its
-// assets. The client fetches the catalog from `/api/scenes` (a Route Handler
-// that holds the D1 credentials server-side) and resolves asset URLs straight
-// from the stored keys — it never reconstructs the bucket layout itself.
+// published (run / slot / model) cell — unversioned — carrying the R2 keys of its
+// assets. The client fetches the catalog from `/api/scenes` (a Route Handler that
+// holds the D1 credentials server-side) and resolves asset URLs straight from the
+// stored keys — it never reconstructs the bucket layout itself.
 import type { TourSource } from "./orbit/types";
 import { assetUrl, cfImageUrl } from "./r2";
 
@@ -10,7 +10,6 @@ export type Scene = {
 	run: string;
 	slot: string;
 	model: string;
-	version: string;
 	previewKey: string; // previews/.../scene-lite.glb (the dollhouse, always present)
 	tourKey: string | null; // tours/.../tour.json (the walkthrough plan; null = no tour)
 	proxyKey: string | null; // proxies/.../proxy.glb (projection proxy; null = none)
@@ -19,11 +18,11 @@ export type Scene = {
 	publishedAt: string;
 };
 
-/** Stable unique id + directory for a scene, e.g. "run/slot/model/2". */
-export const sceneId = (s: Scene): string => `${s.run}/${s.slot}/${s.model}/${s.version}`;
+/** Stable unique id for a scene, e.g. "run/slot/model". */
+export const sceneId = (s: Scene): string => `${s.run}/${s.slot}/${s.model}`;
 
-/** Human label for the picker, e.g. "modern-house · opus-new · v2". */
-export const sceneLabel = (s: Scene): string => `${s.slot} · ${s.model} · v${s.version}`;
+/** Human label for the picker, e.g. "modern-house · opus-new". */
+export const sceneLabel = (s: Scene): string => `${s.slot} · ${s.model}`;
 
 /** Fetch the catalog (newest first) from the same-origin Route Handler. */
 export async function fetchScenes(): Promise<Scene[]> {

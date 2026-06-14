@@ -1,17 +1,17 @@
 """Publish one cell's preview + tour to R2 and record it in the D1 catalog.
 
 The prod client reads four top-level folders in the bucket (panoramas/, previews/,
-proxies/, tours/). Until now those held a single flat test set; this keys every
-asset beneath them by run/slot/model/version:
+proxies/, tours/). Assets are keyed per cell — run/slot/model, NOT versioned:
 
-  previews/<run>/<slot>/<model>/<version>/scene-lite.glb
-  tours/<run>/<slot>/<model>/<version>/tour.json
-  proxies/<run>/<slot>/<model>/<version>/proxy.glb
-  panoramas/<run>/<slot>/<model>/<version>/<anchor>.jpg
+  previews/<run>/<slot>/<model>/scene-lite.glb
+  tours/<run>/<slot>/<model>/tour.json
+  proxies/<run>/<slot>/<model>/proxy.glb
+  panoramas/<run>/<slot>/<model>/<anchor>.jpg
 
-so each generated take is distinct, and re-publishing the same version overwrites
-in place (deterministic keys + a D1 upsert). `version` is the generated build the
-dollhouse preview is baked from — the latest with rendered meshes, by default.
+so re-publishing a cell overwrites its objects (and its D1 row) in place. The
+dollhouse is still baked from a specific generated build — the one the tour was
+captured against (else the latest with rendered meshes) — but that build number
+is an internal bake detail, never part of the published keys or catalog.
 """
 
 from __future__ import annotations
@@ -130,9 +130,10 @@ async def _ensure_preview(cell: Path, version: str) -> Path:
     return out
 
 
-def scene_keys(run: str, slot: str, model: str, version: str) -> dict[str, str]:
-    """The R2 key (and pano prefix) layout for one published scene."""
-    prefix = f"{run}/{slot}/{model}/{version}"
+def scene_keys(run: str, slot: str, model: str) -> dict[str, str]:
+    """The R2 key (and pano prefix) layout for one published cell — unversioned,
+    so re-publishing overwrites in place."""
+    prefix = f"{run}/{slot}/{model}"
     return {
         "preview_key": f"previews/{prefix}/scene-lite.glb",
         "tour_key": f"tours/{prefix}/tour.json",
@@ -184,7 +185,7 @@ async def publish_cell(
     # prefix, so the manifest's `minimaps[].file` resolves like a pano filename.
     minimaps = sorted(tour_dir.glob("minimap-*.png")) if tour_dir.is_dir() else []
 
-    keys = scene_keys(run, slot, model, version)
+    keys = scene_keys(run, slot, model)
     preview_key = keys["preview_key"]
     tour_key = keys["tour_key"] if tour_json.is_file() else None
     proxy_key = keys["proxy_key"] if proxy_glb.is_file() else None
@@ -195,7 +196,6 @@ async def publish_cell(
             "run": run,
             "slot": slot,
             "model": model,
-            "version": version,
             "preview_key": preview_key,
             "tour_key": tour_key,
             "proxy_key": proxy_key,
@@ -225,7 +225,6 @@ async def publish_cell(
         run=run,
         slot=slot,
         model=model,
-        version=version,
         preview_key=preview_key,
         tour_key=tour_key,
         proxy_key=proxy_key,
@@ -238,7 +237,6 @@ async def publish_cell(
         "run": run,
         "slot": slot,
         "model": model,
-        "version": version,
         "preview_key": preview_key,
         "tour_key": tour_key,
         "proxy_key": proxy_key,

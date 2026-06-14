@@ -71,15 +71,19 @@ export type OrbitState = {
 	contextMenu: ObjectMenu | null;
 	busy: boolean;
 	overlay: { msg: string; spinner: boolean; err: boolean } | null;
-	// The bird's-eye minimap for the level the user is currently on (interior /
-	// peek only). `points` are the level's capture anchors placed onto the slice
-	// as 0–100% offsets; `aspect` is the slice's width/height for sizing the box.
+	// The bird's-eye minimap (interior / peek only). Every captured floor level is
+	// surfaced so the chrome can page between floors without moving the camera;
+	// `currentLevel` is the level the character is actually on. Per level, `points`
+	// are that floor's capture anchors placed onto the slice as 0–100% offsets,
+	// and `aspect` is the slice's width/height for sizing the box.
 	minimap: {
-		url: string;
-		aspect: number;
-		level: number;
-		levelCount: number;
-		points: Array<{ index: number; id: string; leftPct: number; topPct: number; current: boolean }>;
+		currentLevel: number;
+		levels: Array<{
+			level: number;
+			url: string;
+			aspect: number;
+			points: Array<{ index: number; id: string; leftPct: number; topPct: number; current: boolean }>;
+		}>;
 	} | null;
 };
 

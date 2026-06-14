@@ -4,8 +4,8 @@ import { useScene } from "@/components/SceneProvider";
 import { sceneId, type Scene } from "@/lib/scenes";
 
 // Scene selector for the header. Scenes are grouped by run (a benchmark run
-// holds many slot/model/version takes), so the dropdown scales as more runs and
-// versions are published.
+// holds many slot/model cells), so the dropdown scales as more runs and cells
+// are published.
 export default function ScenePicker() {
 	const { scenes, selected, status, select } = useScene();
 
@@ -29,7 +29,7 @@ export default function ScenePicker() {
 				<optgroup key={run} label={run} className="bg-neutral-900">
 					{runScenes.map((s) => (
 						<option key={sceneId(s)} value={sceneId(s)}>
-							{s.slot} · {s.model} · v{s.version}
+							{s.slot} · {s.model}
 						</option>
 					))}
 				</optgroup>

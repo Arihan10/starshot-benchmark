@@ -133,6 +133,10 @@ export class OrbitEngine {
 	// (its nearest minimap by capture height). Empty when the tour has no slices.
 	private minimaps: Array<MinimapLevel & { url: string }> = [];
 	private panoLevel: number[] = [];
+	// Held image prefetchers for the slices, so every floor is cached up front and
+	// the floor switcher is instant. Kept referenced so the in-flight loads aren't
+	// GC'd; dropped on the next clearScene.
+	private minimapPrefetch: HTMLImageElement[] = [];
 	private liteRoot: Group | null = null;
 	private proxyGroup: Group | null = null;
 	private proxyBase: Mesh | null = null; // floor slab under the proxy (mirrors proxy material)
@@ -141,10 +145,13 @@ export class OrbitEngine {
 
 	// Per-object addressing (lite + proxy). Each placed object is tagged at load so
 	// the user can hover (cyan) and right-click (hide / persist orange) it. The
-	// highlight is a translucent fill overlay — a copy of the mesh drawn on top
-	// (depth-test off) — parented to each mesh, so reskinProxy() (which rewrites
-	// proxy mesh materials on view changes) can't clobber it and it reads as the
-	// object lifted straight out of the 360 image.
+	// highlight is a translucent fill overlay — a copy of the mesh — parented to
+	// each mesh, so reskinProxy() (which rewrites proxy mesh materials on view
+	// changes) can't clobber it. It's depth-tested (with a slight negative polygon
+	// offset so it doesn't z-fight the coincident source surface), so nearer
+	// geometry occludes the tint — the object reads as highlighted in place, not
+	// floated on top. depthTest rejects the back faces, so the DoubleSide fill is
+	// single-coverage; opacity is set accordingly.
 	private readonly picker = new Raycaster();
 	private readonly hiddenObjects = new Set<Object3D>();
 	private readonly outlinedObjects = new Set<Object3D>();
@@ -156,18 +163,24 @@ export class OrbitEngine {
 	private readonly hoverFillMat = new MeshBasicMaterial({
 		color: 0x66e0ff,
 		transparent: true,
-		opacity: 0.25,
+		opacity: 0.42,
 		side: DoubleSide,
-		depthTest: false,
+		depthTest: true,
 		depthWrite: false,
+		polygonOffset: true,
+		polygonOffsetFactor: -1,
+		polygonOffsetUnits: -1,
 	});
 	private readonly selectFillMat = new MeshBasicMaterial({
 		color: 0xffa23a,
 		transparent: true,
-		opacity: 0.38,
+		opacity: 0.6,
 		side: DoubleSide,
-		depthTest: false,
+		depthTest: true,
 		depthWrite: false,
+		polygonOffset: true,
+		polygonOffsetFactor: -1,
+		polygonOffsetUnits: -1,
 	});
 
 	private mode: OrbitMode = "empty";
@@ -379,31 +392,29 @@ export class OrbitEngine {
 	private buildMinimapState(): OrbitState["minimap"] {
 		if (this.minimaps.length === 0 || this.currentIndex < 0) return null;
 		if (this.mode !== "interior" && this.mode !== "peek") return null;
-		const level = this.panoLevel[this.currentIndex];
-		const mm = level >= 0 ? this.minimaps[level] : undefined;
-		if (!mm) return null;
-		const w = mm.bounds.maxX - mm.bounds.minX;
-		const d = mm.bounds.maxZ - mm.bounds.minZ;
+		const currentLevel = this.panoLevel[this.currentIndex];
+		if (currentLevel < 0) return null;
 		const pct = (n: number) => Math.max(0, Math.min(100, n * 100));
-		const points: NonNullable<OrbitState["minimap"]>["points"] = [];
-		for (let i = 0; i < this.panos.length; i++) {
-			if (this.panoLevel[i] !== level) continue;
-			const p = this.panos[i].position;
-			points.push({
-				index: i,
-				id: this.panos[i].id,
-				leftPct: w > 0 ? pct((p[0] - mm.bounds.minX) / w) : 50,
-				topPct: d > 0 ? pct((p[2] - mm.bounds.minZ) / d) : 50,
-				current: i === this.currentIndex,
-			});
-		}
-		return {
-			url: mm.url,
-			aspect: d > 0 ? w / d : 1,
-			level,
-			levelCount: this.minimaps.length,
-			points,
-		};
+		// Surface every floor's slice + its anchors so the chrome can browse other
+		// levels without moving the camera; the live capture lights up on its level.
+		const levels = this.minimaps.map((mm, idx) => {
+			const w = mm.bounds.maxX - mm.bounds.minX;
+			const d = mm.bounds.maxZ - mm.bounds.minZ;
+			const points: { index: number; id: string; leftPct: number; topPct: number; current: boolean }[] = [];
+			for (let i = 0; i < this.panos.length; i++) {
+				if (this.panoLevel[i] !== idx) continue;
+				const p = this.panos[i].position;
+				points.push({
+					index: i,
+					id: this.panos[i].id,
+					leftPct: w > 0 ? pct((p[0] - mm.bounds.minX) / w) : 50,
+					topPct: d > 0 ? pct((p[2] - mm.bounds.minZ) / d) : 50,
+					current: i === this.currentIndex,
+				});
+			}
+			return { level: idx, url: mm.url, aspect: d > 0 ? w / d : 1, points };
+		});
+		return { currentLevel, levels };
 	}
 
 	// --- travel mask: blur the canvas + dip to bg, peaking mid-move -----------
@@ -709,9 +720,9 @@ export class OrbitEngine {
 	// Lazily build the highlight overlay: a translucent copy of each sub-mesh
 	// (sharing the source geometry) parented to it, so it tracks the object's
 	// transform and survives reskinProxy() (which only rewrites the base mesh
-	// materials). Drawn with depth-test off + a high render order, so it tints the
-	// object on top of the projected pano. Collect first, then attach — adding
-	// children mid-traverse would otherwise re-visit (and re-overlay) the overlays.
+	// materials). The fill material is depth-tested, so nearer geometry occludes the
+	// tint. Collect first, then attach — adding children mid-traverse would
+	// otherwise re-visit (and re-overlay) the overlays.
 	private ensureFillOverlay(obj: Object3D): Mesh[] {
 		const ud = obj.userData as { fillOverlay?: Mesh[] };
 		if (ud.fillOverlay) return ud.fillOverlay;
@@ -1420,6 +1431,7 @@ export class OrbitEngine {
 		this.panos = [];
 		this.minimaps = [];
 		this.panoLevel = [];
+		this.minimapPrefetch = [];
 		this.sphereAMat.uniforms.map.value = DUMMY_TEX;
 		this.sphereBMat.uniforms.map.value = DUMMY_TEX;
 		this.currentIndex = -1;
@@ -1467,10 +1479,16 @@ export class OrbitEngine {
 			}
 			if (token !== this.loadToken || this.disposed) return;
 
-			// Bird's-eye slices: resolve their URLs up front (small, eager <img>
-			// loads in the chrome — not part of the WebGL pipeline).
+			// Bird's-eye slices: resolve their URLs and prefetch EVERY floor now
+			// (parallel with the GLB loads below), so paging floors on the minimap
+			// is instant instead of fetching each slice on first view.
 			const mmList = manifest && Array.isArray(manifest.minimaps) ? manifest.minimaps : [];
 			this.minimaps = mmList.map((m) => ({ ...m, url: source.resolveMinimap(m.file) }));
+			this.minimapPrefetch = this.minimaps.map((m) => {
+				const img = new Image();
+				img.src = m.url;
+				return img;
+			});
 
 			const list = manifest && Array.isArray(manifest.panos) ? manifest.panos : [];
 			// Panos load lazily (on enter / on movement); just resolve URLs now.
