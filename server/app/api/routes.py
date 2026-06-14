@@ -878,13 +878,19 @@ def create_app() -> FastAPI:
         if not nodes:
             raise HTTPException(400, "scene has no placed nodes to plan anchors from")
         try:
-            plan, reasoning = await anchors_svc.generate_anchors(nodes)
+            plan, reasoning, names = await anchors_svc.generate_anchors(nodes)
         except Exception as e:  # surface provider failures as 502
             raise HTTPException(502, f"{type(e).__name__}: {e}") from e
         return {
-            "anchors": [a.model_dump() for a in plan.anchors],
+            # `id` is the anchor's list index — the join key the namer echoed
+            # back; `name` is None for any anchor the namer skipped.
+            "anchors": [
+                {"id": i, "name": names.get(i), **a.model_dump()}
+                for i, a in enumerate(plan.anchors)
+            ],
             "reasoning": reasoning,
             "model": anchors_svc.ANCHOR_PLANNER_MODEL,
+            "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/tour/reset")
@@ -907,6 +913,22 @@ def create_app() -> FastAPI:
         tour_dir.mkdir(parents=True, exist_ok=True)
         stem = Path(pano_id).name  # defend against path traversal
         (tour_dir / f"{stem}.jpg").write_bytes(body)
+        return {"ok": True}
+
+    @app.put("/slots/{slot_id}/{model_alias}/tour/minimap/{minimap_id}")
+    async def tour_minimap(slot_id: str, model_alias: str, minimap_id: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        # One top-down bird's-eye slice per Y level, rendered client-side and
+        # stored beside the panos as a PNG (transparency-friendly, distinct from
+        # the `*.jpg` pano glob the publisher reads).
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty minimap body")
+        tour_dir = _tour_dir(slot_log)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(minimap_id).name  # defend against path traversal
+        (tour_dir / f"{stem}.png").write_bytes(body)
         return {"ok": True}
 
     @app.post("/slots/{slot_id}/{model_alias}/tour/proxy")
@@ -935,11 +957,19 @@ def create_app() -> FastAPI:
         slot_log = _require_slot_log(run, slot_id, model_alias)
         body = await request.body()
         try:
-            json.loads(body)
+            data = json.loads(body)
         except Exception as e:
             raise HTTPException(400, f"manifest is not valid JSON: {e}")
         tour_dir = _tour_dir(slot_log)
         tour_dir.mkdir(parents=True, exist_ok=True)
+        # Stamp the generation this tour was captured against so publish always
+        # pairs THIS walkthrough (proxy + panos) with the matching dollhouse bake;
+        # a later regenerate then can't silently publish a new dollhouse over it.
+        if isinstance(data, dict):
+            captured = publish_svc.latest_rendered_version(tour_dir.parent)
+            if captured is not None:
+                data["generated_version"] = captured
+                body = json.dumps(data).encode("utf-8")
         (tour_dir / "tour.json").write_bytes(body)
         # A finalized tour = a publishable scene; push it to R2 + D1 in the
         # background (best-effort) so the prod client's catalog picks it up.

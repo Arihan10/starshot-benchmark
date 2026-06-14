@@ -59,5 +59,7 @@ export function tourSource(s: Scene): TourSource {
 		manifestUrl: s.tourKey ? assetUrl(s.tourKey) : null,
 		resolvePano: (file) => ({ url: panoUrl(s, file), placeholderUrl: panoPlaceholderUrl(s, file) }),
 		resolveProxy: () => assetUrl(s.proxyKey ?? ""),
+		// Minimap slices are published under the same prefix as the panos.
+		resolveMinimap: (file) => panoUrl(s, file),
 	};
 }

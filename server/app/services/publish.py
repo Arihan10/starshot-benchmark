@@ -17,6 +17,7 @@ dollhouse preview is baked from — the latest with rendered meshes, by default.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -39,6 +40,7 @@ _CONTENT_TYPES = {
     ".json": "application/json",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    ".png": "image/png",
 }
 
 
@@ -80,6 +82,30 @@ def _resolve_version(cell: Path, version: str | None) -> str:
         if _scene_glbs(cell / _GENERATED_DIR / v / _RAW_SUBDIR):
             return v
     raise FileNotFoundError("cell has no generated meshes to publish")
+
+
+def latest_rendered_version(cell: Path) -> str | None:
+    """The newest generated version with rendered meshes, or None — the version a
+    fresh capture corresponds to. Used to stamp the tour at capture time."""
+    try:
+        return _resolve_version(cell, None)
+    except FileNotFoundError:
+        return None
+
+
+def recorded_tour_version(cell: Path) -> str | None:
+    """The generation a cell's tour was captured against, stamped into the tour
+    manifest by the /tour/manifest route. None for tours written before this was
+    recorded (callers then fall back to the latest rendered version)."""
+    tour_json = cell / "tour" / "tour.json"
+    if not tour_json.is_file():
+        return None
+    try:
+        data = json.loads(tour_json.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    v = data.get("generated_version") if isinstance(data, dict) else None
+    return str(v) if isinstance(v, (str, int)) and str(v).isdigit() else None
 
 
 def _stale(dst: Path, *sources: Path) -> bool:
@@ -132,12 +158,31 @@ async def publish_cell(
     cell = runs_dir / run / slot / model
     if not cell.is_dir():
         raise FileNotFoundError(f"no such cell: {run}/{slot}/{model}")
-    version = _resolve_version(cell, version)
+    # Pair the dollhouse (baked per generated version) with the SAME generation
+    # the tour (proxy + panos, captured once into the unversioned tour/ dir) was
+    # shot against — otherwise a later regenerate publishes a fresh dollhouse over
+    # a stale walkthrough, so the overview and the interior show different scenes.
+    # An explicit request wins; a tour with no recorded version falls back to the
+    # latest (legacy tours, and the dollhouse-only case).
+    if version is None:
+        recorded = recorded_tour_version(cell)
+        if recorded is not None:
+            try:
+                version = _resolve_version(cell, recorded)
+            except (FileNotFoundError, ValueError):
+                version = _resolve_version(cell, None)
+        else:
+            version = _resolve_version(cell, None)
+    else:
+        version = _resolve_version(cell, version)
 
     tour_dir = cell / "tour"
     tour_json = tour_dir / "tour.json"
     proxy_glb = tour_dir / "proxy.glb"
     panos = sorted(tour_dir.glob("*.jpg")) if tour_dir.is_dir() else []
+    # Bird's-eye minimap slices (one PNG per Y level) ride under the same pano
+    # prefix, so the manifest's `minimaps[].file` resolves like a pano filename.
+    minimaps = sorted(tour_dir.glob("minimap-*.png")) if tour_dir.is_dir() else []
 
     keys = scene_keys(run, slot, model, version)
     preview_key = keys["preview_key"]
@@ -156,6 +201,7 @@ async def publish_cell(
             "proxy_key": proxy_key,
             "pano_prefix": pano_prefix,
             "pano_count": len(panos),
+            "minimap_count": len(minimaps),
             "base_url": _PUBLIC_BASE,
             "dry_run": True,
         }
@@ -169,6 +215,9 @@ async def publish_cell(
         uploads.append(r2.put_file(proxy_key, proxy_glb, _content_type(proxy_glb)))
     for p in panos:
         uploads.append(r2.put_file(f"{pano_prefix}{p.name}", p, _content_type(p)))
+    if pano_prefix:
+        for p in minimaps:
+            uploads.append(r2.put_file(f"{pano_prefix}{p.name}", p, _content_type(p)))
     await asyncio.gather(*uploads)
 
     published_at = datetime.now(UTC).isoformat()
@@ -195,6 +244,7 @@ async def publish_cell(
         "proxy_key": proxy_key,
         "pano_prefix": pano_prefix,
         "pano_count": len(panos),
+        "minimap_count": len(minimaps),
         "published_at": published_at,
         "base_url": _PUBLIC_BASE,
     }

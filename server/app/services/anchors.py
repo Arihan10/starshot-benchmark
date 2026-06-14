@@ -11,8 +11,14 @@ reasoning — decide where a person would stand to photograph the space with goo
 coverage and overlap — so it doubles as a spatial-reasoning benchmark for the
 planner model.
 
-The model is FIXED to gemini-3.1-flash-lite. Anchors are trusted as-is (no
-collision / floor post-processing); the capturing client renders a 360 at each.
+The planner model is FIXED. Anchors are trusted as-is (no collision / floor
+post-processing); the capturing client renders a 360 at each.
+
+A second, separate pass NAMES the planned anchors: a fixed gemini-3.1-flash-lite
+call reads the SAME scene context plus the planned coordinates and labels each
+point of interest from the zone it sits in and the objects around it. Naming is
+split from planning on purpose — the planner emits raw coordinates only, so it's
+never biased toward producing fewer points just to label them.
 """
 
 from __future__ import annotations
@@ -24,7 +30,8 @@ from app.core.slots import MODELS
 from app.core.types import Node, ProxyShape, Vec3Tuple
 from app.services import llm
 
-ANCHOR_PLANNER_MODEL = MODELS["opus-new"]  # google/gemini-3.5-flash
+ANCHOR_PLANNER_MODEL = MODELS["gemini-flash"]  # google/gemini-3.5-flash
+ANCHOR_NAMER_MODEL = MODELS["gemini-flash-lite"]  # google/gemini-3.1-flash-lite
 
 
 SYSTEM_ANCHOR_PLANNER = """\
@@ -39,12 +46,27 @@ Produce as THOROUGH of a set as possible, inside and out, optimize for FULL scen
 Output ONLY the JSON object matching the schema: each anchor is just its `position`, [x, y, z] world-space meters. Do NOT name, label, classify, or annotate the anchors — emit raw coordinates only."""
 
 
+SYSTEM_ANCHOR_NAMER = """\
+You are the point of interest namer for a text-to-3D scene pipeline. A scene tree has already been fully built from a text prompt (made up of zones and objects) and a planner has picked a list of coordinates for certain points of interest within this scene. Your job is to injest the tree context, understand where the points of interest have been placed; Based on the zone it is in, the objects surrounding it and the overall scene context, provide a name for each point of interest
+
+Output ONLY the JSON object matching the schema: each point of interest is its numeric `id` and string `name`."""
+
+
 class Anchor(BaseModel):
     position: Vec3Tuple
 
 
 class AnchorPlan(BaseModel):
     anchors: list[Anchor]
+
+
+class PointName(BaseModel):
+    id: int
+    name: str
+
+
+class PointNames(BaseModel):
+    points: list[PointName]
 
 
 def _scene_aabb(nodes: list[Node]) -> tuple[Vec3Tuple, Vec3Tuple]:
@@ -163,9 +185,54 @@ def build_user_prompt(nodes: list[Node]) -> str:
     )
 
 
-async def generate_anchors(nodes: list[Node]) -> tuple[AnchorPlan, str]:
-    """Plan capture anchors for `nodes` with the fixed planner model. Standalone:
-    no SlotLog binding, no cache, retries unlogged. Returns (plan, reasoning)."""
+def build_namer_prompt(nodes: list[Node], anchors: list[Anchor]) -> str:
+    """The planner's scene context (verbatim) plus the planned coordinates,
+    each tagged with the numeric id the namer echoes back. The namer reasons
+    from the same world geometry to decide what each point overlooks."""
+    context = _render_scene_context(nodes)
+    points = "\n".join(
+        f"id {i}: position "
+        f"({a.position[0]:.2f}, {a.position[1]:.2f}, {a.position[2]:.2f}) m"
+        for i, a in enumerate(anchors)
+    )
+    return (
+        "Name the points of interest the planner placed in the scene below. "
+        "Each is a 360° camera capture coordinate; decide what it overlooks "
+        "from its position within the hierarchy.\n\n"
+        "=== SCENE HIERARCHY ===\n"
+        f"{context}\n"
+        "=== END SCENE HIERARCHY ===\n\n"
+        "=== POINTS OF INTEREST ===\n"
+        f"{points}\n"
+        "=== END POINTS OF INTEREST ===\n\n"
+        "Now name every point of interest by its id."
+    )
+
+
+async def name_anchors(nodes: list[Node], anchors: list[Anchor]) -> dict[int, str]:
+    """Name each planned anchor with the fixed namer model — a separate call so
+    naming never biases the planner toward fewer points. Returns {anchor index:
+    name}; ids the model omits are simply absent. Standalone: no SlotLog
+    binding, no cache, retries unlogged."""
+    if not anchors:
+        return {}
+    llm.set_model(ANCHOR_NAMER_MODEL)
+    result, _reasoning, _usage, _raw = await llm.call_llm_once(
+        system=SYSTEM_ANCHOR_NAMER,
+        user=build_namer_prompt(nodes, anchors),
+        output_schema=PointNames,
+        model=ANCHOR_NAMER_MODEL,
+        step="anchor_name",
+        log_retries=False,
+    )
+    return {p.id: p.name for p in result.points}
+
+
+async def generate_anchors(nodes: list[Node]) -> tuple[AnchorPlan, str, dict[int, str]]:
+    """Plan capture anchors with the fixed planner model, then name them with
+    the fixed namer model. Standalone: no SlotLog binding, no cache, retries
+    unlogged. Returns (plan, reasoning, names) where `names` maps each anchor's
+    list index to its point-of-interest name."""
     # Set the model context too, so llm._normalize_schema applies any
     # provider-specific schema tweaks for the planner provider.
     llm.set_model(ANCHOR_PLANNER_MODEL)
@@ -177,4 +244,5 @@ async def generate_anchors(nodes: list[Node]) -> tuple[AnchorPlan, str]:
         step="anchor_plan",
         log_retries=False,
     )
-    return plan, reasoning
+    names = await name_anchors(nodes, plan.anchors)
+    return plan, reasoning, names

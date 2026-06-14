@@ -9298,6 +9298,183 @@ async function capturePanoBlob(onProgress) {
 	return stitchPanoEquirect(faces, faceSize, onProgress);
 }
 
+// --- bird's-eye minimap slices (one per Y level) ------------------------------
+//
+// The companion to the 360 captures: group the anchors into Y "levels" (storeys
+// — anchors within MINIMAP_LEVEL_EPS metres of each other) and render one
+// top-down orthographic slice of the scene per level, cut at that level's camera
+// height (a world clip plane drops everything above the cut, so the slice shows
+// the floor plan + furniture rather than the roof). The prod client shows the
+// matching slice as a minimap and dots the level's anchors onto it, mapping each
+// anchor's world XZ through the stored `bounds`.
+
+const MINIMAP_LEVEL_EPS = 1.5; // metres; anchors within this Y gap share a level
+const MINIMAP_RES = 1024; // longest output side in device px (capped by the canvas)
+const MINIMAP_PAD_FRAC = 0.04; // breathing room around the scene footprint
+
+// Cluster anchor Ys into levels by gap; returns [{ y, indices }] low→high, where
+// y is the level's median camera height (its slice-cut height + client match key).
+function groupAnchorLevels(positions) {
+	const order = positions
+		.map((_, i) => i)
+		.sort((a, b) => positions[a][1] - positions[b][1]);
+	const groups = [];
+	let cur = null;
+	for (const i of order) {
+		const y = positions[i][1];
+		if (!cur || y - cur.lastY > MINIMAP_LEVEL_EPS) {
+			cur = { indices: [], ys: [], lastY: y };
+			groups.push(cur);
+		}
+		cur.indices.push(i);
+		cur.ys.push(y);
+		cur.lastY = y;
+	}
+	return groups.map((g) => {
+		const ys = g.ys.slice().sort((a, b) => a - b);
+		return { y: ys[(ys.length - 1) >> 1], indices: g.indices };
+	});
+}
+
+// Render one top-down slice of the live scene into a PNG blob. Reuses the main
+// renderer/canvas (so tonemapping + sRGB match the panos), scissored to a
+// footprint-aspect viewport then read back — the pano-face pattern. The ortho
+// camera looks straight down with -Z "up" in the image, so the stored `bounds`
+// map world (x,z) → image (left,top) as ((x-minX)/W, (z-minZ)/D).
+async function captureMinimapBlob(bounds, cutY, yTop, yBot) {
+	const canvas = renderer.domElement;
+	const dpr = renderer.getPixelRatio();
+	const prevSize = renderer.getSize(new THREE.Vector2());
+
+	const W = bounds.maxX - bounds.minX;
+	const D = bounds.maxZ - bounds.minZ;
+	const cx = (bounds.minX + bounds.maxX) / 2;
+	const cz = (bounds.minZ + bounds.maxZ) / 2;
+
+	// Output pixels preserve the footprint aspect, capped by MINIMAP_RES and the
+	// drawing buffer (we read back from the canvas, so we can't exceed it).
+	const cap = Math.min(MINIMAP_RES, canvas.width, canvas.height);
+	let pw;
+	let ph;
+	if (W >= D) {
+		pw = cap;
+		ph = Math.max(1, Math.round((cap * D) / W));
+	} else {
+		ph = cap;
+		pw = Math.max(1, Math.round((cap * W) / D));
+	}
+
+	const cam = new THREE.OrthographicCamera(
+		-W / 2,
+		W / 2,
+		D / 2,
+		-D / 2,
+		0.1,
+		yTop - yBot + 4,
+	);
+	cam.position.set(cx, yTop + 2, cz);
+	cam.up.set(0, 0, -1);
+	cam.lookAt(cx, yBot, cz);
+	cam.updateProjectionMatrix();
+
+	// World clip plane keeping y <= cutY (everything above the camera level is
+	// dropped, opening the roof so the slice reads as a floor plan).
+	const plane = new THREE.Plane(new THREE.Vector3(0, -1, 0), cutY);
+	const prevClip = renderer.clippingPlanes;
+	const prevBg = scene.background;
+	const prevClear = renderer.getClearColor(new THREE.Color());
+	const prevAlpha = renderer.getClearAlpha();
+	const prevShadow = renderer.shadowMap.enabled;
+	const bboxWasVisible = bboxRoot.visible;
+
+	const crop = document.createElement("canvas");
+	crop.width = pw;
+	crop.height = ph;
+
+	try {
+		bboxRoot.visible = false; // debug wireframes don't belong on the map
+		// Flat, evenly-lit floor plan reads clearer than a top-down cast-shadow
+		// render; the clipping-plane swap below forces a program refresh, so this
+		// toggle takes effect for the slice pass.
+		renderer.shadowMap.enabled = false;
+		renderer.clippingPlanes = [plane];
+		scene.background = null;
+		renderer.setClearColor(0x0c0d10, 1);
+		renderer.setScissorTest(true);
+		renderer.setViewport(0, 0, pw / dpr, ph / dpr);
+		renderer.setScissor(0, 0, pw / dpr, ph / dpr);
+		renderer.render(scene, cam);
+		// Viewport (0,0) is the canvas' bottom-left; drawImage's source rect is
+		// top-left-origin device pixels.
+		crop
+			.getContext("2d")
+			.drawImage(canvas, 0, canvas.height - ph, pw, ph, 0, 0, pw, ph);
+	} finally {
+		renderer.setScissorTest(false);
+		renderer.setViewport(0, 0, prevSize.x, prevSize.y);
+		renderer.setScissor(0, 0, prevSize.x, prevSize.y);
+		renderer.clippingPlanes = prevClip;
+		renderer.shadowMap.enabled = prevShadow;
+		scene.background = prevBg;
+		renderer.setClearColor(prevClear, prevAlpha);
+		bboxRoot.visible = bboxWasVisible;
+	}
+	return new Promise((resolve, reject) =>
+		crop.toBlob(
+			(blob) => (blob ? resolve(blob) : reject(new Error("minimap encode failed"))),
+			"image/png",
+		),
+	);
+}
+
+async function uploadMinimap(cell, minimapId, blob) {
+	const res = await fetch(
+		new URL(
+			`${cell.base}/tour/minimap/${encodeURIComponent(minimapId)}?${cell.run}`,
+			SERVER_URL,
+		).toString(),
+		{
+			method: "PUT",
+			headers: { "Content-Type": "image/png" },
+			body: blob,
+		},
+	);
+	if (!res.ok) throw new Error(`upload ${minimapId} → ${res.status}`);
+}
+
+// Group the captured anchors by level, render + persist one bird's-eye slice
+// per level, and return the manifest `minimaps` array (empty on any failure —
+// the tour stays valid without them).
+async function buildMinimaps(cell, panoMeta, onLevel) {
+	const positions = panoMeta.map((p) => p.position);
+	if (positions.length === 0) return [];
+	const box = new THREE.Box3().setFromObject(sceneRoot);
+	if (box.isEmpty()) return [];
+	const pad =
+		MINIMAP_PAD_FRAC * Math.max(box.max.x - box.min.x, box.max.z - box.min.z, 1);
+	const bounds = {
+		minX: box.min.x - pad,
+		maxX: box.max.x + pad,
+		minZ: box.min.z - pad,
+		maxZ: box.max.z + pad,
+	};
+	const levels = groupAnchorLevels(positions);
+	const minimaps = [];
+	for (let li = 0; li < levels.length; li++) {
+		onLevel?.(li, levels.length);
+		const file = `minimap-${li}.png`;
+		const blob = await captureMinimapBlob(
+			bounds,
+			levels[li].y,
+			box.max.y,
+			box.min.y,
+		);
+		await uploadMinimap(cell, `minimap-${li}`, blob);
+		minimaps.push({ level: li, y: levels[li].y, file, bounds });
+	}
+	return minimaps;
+}
+
 panoCaptureEl.addEventListener("click", async () => {
 	if (panoBusy) return;
 	panoBusy = true;
@@ -9485,6 +9662,7 @@ panoAutoEl?.addEventListener("click", async () => {
 				position: pos,
 				forward,
 				reason: typeof a.reason === "string" ? a.reason : undefined,
+				name: typeof a.name === "string" ? a.name : undefined,
 			});
 		}
 
@@ -9513,14 +9691,32 @@ panoAutoEl?.addEventListener("click", async () => {
 			}
 		}
 
+		// Bird's-eye minimap slices, grouped by Y level. Best-effort: a failure
+		// here leaves the tour fully usable, just without the minimap overlay.
+		let minimaps = [];
+		try {
+			minimaps = await buildMinimaps(cell, panoMeta, (li, n) => {
+				panoAutoEl.textContent = `rendering minimap ${li + 1}/${n}…`;
+			});
+		} catch (e) {
+			minimaps = [];
+			appendEvent({
+				kind: "run.error",
+				message: `auto-tour minimaps failed (tour saved without them): ${e.message}`,
+			});
+		}
+
 		panoAutoEl.textContent = "writing manifest…";
 		const manifest = {
 			version: 1,
 			proxy: hasProxy ? "proxy.glb" : null,
 			planner_model: typeof plan.model === "string" ? plan.model : null,
+			namer_model:
+				typeof plan.namer_model === "string" ? plan.namer_model : null,
 			planner_reasoning:
 				typeof plan.reasoning === "string" ? plan.reasoning : null,
 			panos: panoMeta,
+			minimaps,
 		};
 		const manRes = await fetch(
 			new URL(

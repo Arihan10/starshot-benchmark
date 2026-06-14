@@ -8,6 +8,19 @@ export type TourSource = {
 	manifestUrl: string | null;
 	resolvePano: (file: string) => { url: string; placeholderUrl: string };
 	resolveProxy: (file: string) => string;
+	resolveMinimap: (file: string) => string;
+};
+
+// One bird's-eye slice: the scene rendered top-down, cut at a Y "level" (storey)
+// the panos were captured on. `bounds` is the world-space XZ rectangle the image
+// spans, so a pano at world (x,z) maps to image fractions ((x-minX)/W, (z-minZ)/D)
+// — image +x is world +X, image +y (downward) is world +Z.
+export type MinimapBounds = { minX: number; maxX: number; minZ: number; maxZ: number };
+export type MinimapLevel = {
+	level: number;
+	y: number; // the level's representative camera height (its match key)
+	file: string;
+	bounds: MinimapBounds;
 };
 
 // tour.json: capture points (panos) in the shared world frame, plus an optional
@@ -20,6 +33,7 @@ export type TourManifest = {
 		file: string;
 	}>;
 	proxy?: string;
+	minimaps?: MinimapLevel[];
 };
 
 export type OrbitMode =
@@ -52,9 +66,21 @@ export type OrbitState = {
 	objectHover: string | null; // label of the object under the cursor (overview)
 	proxyView: boolean; // overview shows the low-poly proxy instead of the lite dollhouse
 	canProxyView: boolean; // the proxy/lite swap is available (overview + both loaded)
+	highlightEnabled: boolean; // hover-highlight the object under the cursor (toggleable)
+	canHighlight: boolean; // hover-highlight applies in this mode (overview / interior w/ objects)
 	contextMenu: ObjectMenu | null;
 	busy: boolean;
 	overlay: { msg: string; spinner: boolean; err: boolean } | null;
+	// The bird's-eye minimap for the level the user is currently on (interior /
+	// peek only). `points` are the level's capture anchors placed onto the slice
+	// as 0–100% offsets; `aspect` is the slice's width/height for sizing the box.
+	minimap: {
+		url: string;
+		aspect: number;
+		level: number;
+		levelCount: number;
+		points: Array<{ index: number; id: string; leftPct: number; topPct: number; current: boolean }>;
+	} | null;
 };
 
 export const INITIAL_ORBIT_STATE: OrbitState = {
@@ -66,7 +92,10 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	objectHover: null,
 	proxyView: false,
 	canProxyView: false,
+	highlightEnabled: true,
+	canHighlight: false,
 	contextMenu: null,
 	busy: false,
 	overlay: null,
+	minimap: null,
 };

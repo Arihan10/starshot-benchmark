@@ -53,7 +53,7 @@ export default function OrbitViewer() {
 		};
 	}, [state.contextMenu]);
 
-	const { mode, overlay } = state;
+	const { mode, overlay, minimap } = state;
 	const hud = hudContent(state);
 	const catalogMessage =
 		status === "loading"
@@ -77,8 +77,11 @@ export default function OrbitViewer() {
 			)}
 
 			{mode !== "empty" && mode !== "loading" && (
-				<div className="pointer-events-none absolute left-4 top-4 z-10 text-[10px] uppercase tracking-wider text-neutral-400 [&_strong]:font-semibold [&_strong]:text-cyan-200">
-					{modeLabel(state)}
+				<div className="absolute left-4 top-4 z-10 flex flex-col gap-2">
+					{minimap && <Minimap minimap={minimap} engine={engineRef} />}
+					<div className="pointer-events-none text-[10px] uppercase tracking-wider text-neutral-400 [&_strong]:font-semibold [&_strong]:text-cyan-200">
+						{modeLabel(state)}
+					</div>
 				</div>
 			)}
 
@@ -95,6 +98,20 @@ export default function OrbitViewer() {
 						}`}
 					>
 						proxy view
+					</button>
+				)}
+				{state.canHighlight && (
+					<button
+						type="button"
+						title="Highlight the object under the cursor on hover"
+						onClick={() => engineRef.current?.toggleHighlight()}
+						className={`rounded-md border px-3 py-2 text-xs backdrop-blur transition ${
+							state.highlightEnabled
+								? "border-cyan-400/70 bg-cyan-500/20 text-cyan-100"
+								: "border-white/15 bg-black/50 text-neutral-300 hover:border-white/30 hover:text-white"
+						}`}
+					>
+						hover highlight
 					</button>
 				)}
 				{mode === "overview" && (
@@ -220,6 +237,76 @@ function MenuButton({ onClick, children }: { onClick: () => void; children: Reac
 	);
 }
 
+// Top-left bird's-eye minimap for the level the user is on: the captured slice
+// with every same-level anchor dotted onto it (current one lit). Clicking a dot
+// walks there; the header toggle expands it to a large readable view. The box
+// always keeps the slice's aspect (so the %-placed dots stay aligned) and is the
+// largest size that fits the caps on both axes — width = min(maxW, maxH * aspect).
+const minimapWidth = (aspect: number, maxW: string, maxH: string) =>
+	`min(${maxW}, calc(${maxH} * ${aspect}))`;
+const MINIMAP_COMPACT = { w: "200px", h: "170px" };
+const MINIMAP_EXPANDED = { w: "min(48vw, 640px)", h: "min(66vh, 640px)" };
+
+function Minimap({
+	minimap,
+	engine,
+}: {
+	minimap: NonNullable<OrbitState["minimap"]>;
+	engine: RefObject<OrbitEngine | null>;
+}) {
+	const [expanded, setExpanded] = useState(false);
+	const caps = expanded ? MINIMAP_EXPANDED : MINIMAP_COMPACT;
+	return (
+		<div className="rounded-md border border-white/10 bg-black/60 p-1.5 backdrop-blur">
+			<div className="mb-1 flex items-center justify-between gap-2 px-0.5 text-[9px] uppercase tracking-wider text-neutral-400">
+				<span>minimap</span>
+				<div className="flex items-center gap-1.5">
+					{minimap.levelCount > 1 && (
+						<span>
+							level {minimap.level + 1}/{minimap.levelCount}
+						</span>
+					)}
+					<button
+						type="button"
+						onClick={() => setExpanded((v) => !v)}
+						title={expanded ? "collapse minimap" : "expand minimap"}
+						aria-label={expanded ? "collapse minimap" : "expand minimap"}
+						className="rounded px-1 text-[11px] leading-none text-neutral-300 transition hover:bg-white/10 hover:text-white"
+					>
+						{expanded ? "✕" : "⤢"}
+					</button>
+				</div>
+			</div>
+			<div
+				className="relative overflow-hidden rounded"
+				style={{ width: minimapWidth(minimap.aspect, caps.w, caps.h), aspectRatio: minimap.aspect }}
+			>
+				{/* eslint-disable-next-line @next/next/no-img-element -- runtime R2 slice (proxied via /r2), not a static asset; next/image adds no value here */}
+				<img
+					src={minimap.url}
+					alt="scene from above"
+					draggable={false}
+					className="absolute inset-0 h-full w-full object-fill"
+				/>
+				{minimap.points.map((pt) => (
+					<button
+						key={pt.index}
+						type="button"
+						title={pt.id}
+						onClick={() => engine.current?.travelToIndex(pt.index)}
+						style={{ left: `${pt.leftPct}%`, top: `${pt.topPct}%` }}
+						className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full border transition ${
+							pt.current
+								? `${expanded ? "h-3.5 w-3.5" : "h-2.5 w-2.5"} border-white bg-cyan-400 shadow-[0_0_6px_2px_rgba(34,211,238,0.7)]`
+								: `${expanded ? "h-3 w-3" : "h-2 w-2"} border-white/70 bg-cyan-300/40 hover:scale-125 hover:bg-cyan-300/90`
+						}`}
+					/>
+				))}
+			</div>
+		</div>
+	);
+}
+
 function modeLabel({ mode, proxyView }: OrbitState): ReactNode {
 	if (mode === "overview") {
 		return proxyView ? <><strong>proxy</strong> · orbit</> : <><strong>dollhouse</strong> · orbit</>;
@@ -251,6 +338,13 @@ function hudContent(state: OrbitState): ReactNode {
 		);
 	}
 	if (mode === "interior") {
+		if (objectHover) {
+			return (
+				<>
+					object <strong>{objectHover}</strong>
+				</>
+			);
+		}
 		if (hover) {
 			return (
 				<>

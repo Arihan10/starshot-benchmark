@@ -1,21 +1,19 @@
 import {
 	Box3,
-	Box3Helper,
 	Color,
 	DirectionalLight,
-	EdgesGeometry,
+	DoubleSide,
 	Group,
 	HemisphereLight,
-	LineBasicMaterial,
-	LineSegments,
 	type Material,
 	MathUtils,
 	Mesh,
-	type MeshBasicMaterial,
+	MeshBasicMaterial,
 	MOUSE,
 	type Object3D,
 	NoToneMapping,
 	PerspectiveCamera,
+	PlaneGeometry,
 	type Quaternion,
 	Raycaster,
 	RingGeometry,
@@ -57,7 +55,7 @@ import {
 	pickByScreen,
 	type YouMarker,
 } from "./markers";
-import type { OrbitMode, OrbitState, TourManifest, TourSource } from "./types";
+import type { MinimapLevel, OrbitMode, OrbitState, TourManifest, TourSource } from "./types";
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 const easeInOut = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
@@ -131,17 +129,22 @@ export class OrbitEngine {
 	private panos: PanoEntry[] = [];
 	private currentIndex = -1;
 	private projectionMode = false;
+	// Bird's-eye minimap slices (one per Y level) + the level each pano sits on
+	// (its nearest minimap by capture height). Empty when the tour has no slices.
+	private minimaps: Array<MinimapLevel & { url: string }> = [];
+	private panoLevel: number[] = [];
 	private liteRoot: Group | null = null;
 	private proxyGroup: Group | null = null;
-	private proxyBox: Box3Helper | null = null; // tight AABB wireframe around the proxy
+	private proxyBase: Mesh | null = null; // floor slab under the proxy (mirrors proxy material)
 	private sharedOverview = false;
 	private proxyView = false; // overview shows the proxy mesh instead of the lite dollhouse
 
-	// Per-object addressing (lite + proxy). Each placed object is tagged at load
-	// so the user can hover (cyan outline) and right-click (hide / persist orange
-	// outline) it. Outlines are independent EdgesGeometry overlays parented to each
-	// mesh, so reskinProxy() — which rewrites proxy mesh materials on view changes —
-	// can't clobber them.
+	// Per-object addressing (lite + proxy). Each placed object is tagged at load so
+	// the user can hover (cyan) and right-click (hide / persist orange) it. The
+	// highlight is a translucent fill overlay — a copy of the mesh drawn on top
+	// (depth-test off) — parented to each mesh, so reskinProxy() (which rewrites
+	// proxy mesh materials on view changes) can't clobber it and it reads as the
+	// object lifted straight out of the 360 image.
 	private readonly picker = new Raycaster();
 	private readonly hiddenObjects = new Set<Object3D>();
 	private readonly outlinedObjects = new Set<Object3D>();
@@ -150,17 +153,19 @@ export class OrbitEngine {
 	private contextMenu: OrbitState["contextMenu"] = null;
 	private rcDownX = 0;
 	private rcDownY = 0;
-	private readonly hoverLineMat = new LineBasicMaterial({
+	private readonly hoverFillMat = new MeshBasicMaterial({
 		color: 0x66e0ff,
 		transparent: true,
-		opacity: 0.95,
+		opacity: 0.25,
+		side: DoubleSide,
 		depthTest: false,
 		depthWrite: false,
 	});
-	private readonly selectLineMat = new LineBasicMaterial({
+	private readonly selectFillMat = new MeshBasicMaterial({
 		color: 0xffa23a,
 		transparent: true,
-		opacity: 1.0,
+		opacity: 0.38,
+		side: DoubleSide,
 		depthTest: false,
 		depthWrite: false,
 	});
@@ -181,6 +186,9 @@ export class OrbitEngine {
 	private downY = 0;
 	private downLon = 0;
 	private downLat = 0;
+	// Hover-highlight (cyan fill on the object under the cursor) is on by default;
+	// the toolbar toggle flips this. Persistent right-click selections ignore it.
+	private highlightEnabled = true;
 
 	private interiorBusy = false;
 	private savedInterior: SavedInterior | null = null;
@@ -302,8 +310,8 @@ export class OrbitEngine {
 		window.removeEventListener("keyup", this.onKeyUp);
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
 		this.clearScene();
-		this.hoverLineMat.dispose();
-		this.selectLineMat.dispose();
+		this.hoverFillMat.dispose();
+		this.selectFillMat.dispose();
 		this.renderer.dispose();
 		this.canvas.remove();
 		this.travelFade.remove();
@@ -329,9 +337,12 @@ export class OrbitEngine {
 			objectHover: this.hoveredObj ? (this.hoveredObj.userData.objLabel as string) : null,
 			proxyView: this.proxyView,
 			canProxyView: this.canToggleProxyView(),
+			highlightEnabled: this.highlightEnabled,
+			canHighlight: (this.mode === "overview" || this.mode === "interior") && !!this.activeObjectRoot(),
 			contextMenu: this.contextMenu,
 			busy: this.interiorBusy,
 			overlay: this.overlay,
+			minimap: this.buildMinimapState(),
 		};
 		this.onState(state);
 	}
@@ -343,6 +354,56 @@ export class OrbitEngine {
 	private hideOverlay() {
 		this.overlay = null;
 		this.emit();
+	}
+
+	// --- minimap (bird's-eye slice for the current level) ---------------------
+
+	// Nearest slice to a capture height. Levels are Y-separated, so argmin-|Δy|
+	// reproduces the grouping the capturer used.
+	private levelForY(y: number): number {
+		let best = -1;
+		let bestD = Infinity;
+		for (let i = 0; i < this.minimaps.length; i++) {
+			const d = Math.abs(this.minimaps[i].y - y);
+			if (d < bestD) {
+				bestD = d;
+				best = i;
+			}
+		}
+		return best;
+	}
+
+	// The minimap for whatever level the user is on right now — the matching
+	// slice plus every same-level anchor placed onto it. Only while walking the
+	// interior (or peeking); the overview already shows the whole dollhouse.
+	private buildMinimapState(): OrbitState["minimap"] {
+		if (this.minimaps.length === 0 || this.currentIndex < 0) return null;
+		if (this.mode !== "interior" && this.mode !== "peek") return null;
+		const level = this.panoLevel[this.currentIndex];
+		const mm = level >= 0 ? this.minimaps[level] : undefined;
+		if (!mm) return null;
+		const w = mm.bounds.maxX - mm.bounds.minX;
+		const d = mm.bounds.maxZ - mm.bounds.minZ;
+		const pct = (n: number) => Math.max(0, Math.min(100, n * 100));
+		const points: NonNullable<OrbitState["minimap"]>["points"] = [];
+		for (let i = 0; i < this.panos.length; i++) {
+			if (this.panoLevel[i] !== level) continue;
+			const p = this.panos[i].position;
+			points.push({
+				index: i,
+				id: this.panos[i].id,
+				leftPct: w > 0 ? pct((p[0] - mm.bounds.minX) / w) : 50,
+				topPct: d > 0 ? pct((p[2] - mm.bounds.minZ) / d) : 50,
+				current: i === this.currentIndex,
+			});
+		}
+		return {
+			url: mm.url,
+			aspect: d > 0 ? w / d : 1,
+			level,
+			levelCount: this.minimaps.length,
+			points,
+		};
 	}
 
 	// --- travel mask: blur the canvas + dip to bg, peaking mid-move -----------
@@ -414,8 +475,9 @@ export class OrbitEngine {
 			const spot = pickByScreen(ev.clientX, ev.clientY, this.entryGroup, ENTRY_AIM_PX, this.camera, this.canvas);
 			const entryIdx = spot ? (spot.userData.targetIndex as number) : -1;
 			// Entry discs are the primary overview action and win the hover; only
-			// when none is under the cursor do we offer the object beneath it.
-			const obj = entryIdx >= 0 ? null : this.pickObjectAt(ev.clientX, ev.clientY);
+			// when none is under the cursor (and highlighting is on) do we offer the
+			// object beneath it.
+			const obj = entryIdx >= 0 || !this.highlightEnabled ? null : this.pickObjectAt(ev.clientX, ev.clientY);
 			this.canvas.style.cursor = entryIdx >= 0 || obj ? "pointer" : "";
 			const hoverChanged = this.setObjectHover(obj);
 			const entryChanged = entryIdx !== this.hoveredEntryIndex;
@@ -468,17 +530,22 @@ export class OrbitEngine {
 		if (ev.code === "Space") this.peekUp();
 	};
 
+	// Interior hover: navigation discs are the primary action and win the hover; the
+	// proxy object beneath is highlighted only when no disc is under the cursor and
+	// the hover-highlight toggle is on. The fill overlay is depth-test-off, so it
+	// tints the object on top of the projected pano — it reads as picking the object
+	// straight out of the 360 image.
 	private updateHover(ev: PointerEvent) {
 		if (this.currentIndex < 0) return;
 		const spot = pickByScreen(ev.clientX, ev.clientY, this.hotspotGroup, AUTO_AIM_PX, this.camera, this.canvas);
 		const idx = spot ? (spot.userData.targetIndex as number) : -1;
 		const occ = spot ? !!spot.userData.occluded : false;
-		this.canvas.style.cursor = spot ? "pointer" : "";
-		if (idx !== this.hoveredTargetIndex || occ !== this.hoveredOccluded) {
-			this.hoveredTargetIndex = idx;
-			this.hoveredOccluded = occ;
-			this.emit();
-		}
+		const obj = idx >= 0 || !this.highlightEnabled ? null : this.pickObjectAt(ev.clientX, ev.clientY);
+		this.canvas.style.cursor = idx >= 0 || obj ? "pointer" : "";
+		const hotspotChanged = idx !== this.hoveredTargetIndex || occ !== this.hoveredOccluded;
+		this.hoveredTargetIndex = idx;
+		this.hoveredOccluded = occ;
+		if (this.setObjectHover(obj) || hotspotChanged) this.emit();
 	}
 
 	// --- view toggles (which geometry each mode shows) ------------------------
@@ -489,6 +556,10 @@ export class OrbitEngine {
 			const m = o as Mesh;
 			if (m.isMesh) m.material = mat;
 		});
+		// The base mirrors the proxy: panos project onto it in the walkthrough (so
+		// it blends into the floor instead of showing through as a flat fill), and
+		// it goes matte in proxy view.
+		if (this.proxyBase) this.proxyBase.material = mat;
 	}
 
 	// The proxy stands in for the dollhouse when there's no lite export, or when
@@ -513,6 +584,7 @@ export class OrbitEngine {
 		this.hotspotGroup.visible = false;
 		this.entryGroup.visible = true;
 		this.you.group.visible = false;
+		this.syncProxyBase();
 	}
 
 	// Swap the interior proxy in place between the bare low-poly mesh (proxy view:
@@ -539,6 +611,7 @@ export class OrbitEngine {
 		this.hotspotGroup.visible = true;
 		this.entryGroup.visible = false;
 		this.you.group.visible = false;
+		this.syncProxyBase();
 	}
 
 	private setPeekView() {
@@ -557,6 +630,7 @@ export class OrbitEngine {
 		this.hotspotGroup.visible = false;
 		this.entryGroup.visible = false;
 		this.you.group.visible = true;
+		this.syncProxyBase();
 	}
 
 	// Where the bare-proxy / textured swap is offered: the overview needs a lite
@@ -579,6 +653,16 @@ export class OrbitEngine {
 		this.canvas.style.cursor = "";
 		if (this.mode === "overview") this.setOverviewView();
 		else if (this.mode === "interior") this.setInteriorProxyView();
+		this.emit();
+	}
+
+	// Turn the on-hover object highlight on/off (persistent right-click selections
+	// are unaffected). Clearing the live hover on the way off; the next pointer move
+	// re-picks when turned back on.
+	toggleHighlight() {
+		this.highlightEnabled = !this.highlightEnabled;
+		if (!this.highlightEnabled) this.setObjectHover(null);
+		this.canvas.style.cursor = "";
 		this.emit();
 	}
 
@@ -622,33 +706,31 @@ export class OrbitEngine {
 		});
 	}
 
-	// Lazily build a wireframe outline (one LineSegments per mesh) parented to each
-	// mesh, so it tracks the object's transform and survives reskinProxy() (which
-	// only rewrites mesh materials). Edges are cached per mesh.
-	private getEdges(mesh: Mesh): EdgesGeometry {
-		const ud = mesh.userData as { edges?: EdgesGeometry };
-		if (!ud.edges) ud.edges = new EdgesGeometry(mesh.geometry, 25);
-		return ud.edges;
-	}
-
-	private ensureOutlineLines(obj: Object3D): LineSegments[] {
-		const ud = obj.userData as { outlineLines?: LineSegments[] };
-		if (ud.outlineLines) return ud.outlineLines;
-		const lines: LineSegments[] = [];
+	// Lazily build the highlight overlay: a translucent copy of each sub-mesh
+	// (sharing the source geometry) parented to it, so it tracks the object's
+	// transform and survives reskinProxy() (which only rewrites the base mesh
+	// materials). Drawn with depth-test off + a high render order, so it tints the
+	// object on top of the projected pano. Collect first, then attach — adding
+	// children mid-traverse would otherwise re-visit (and re-overlay) the overlays.
+	private ensureFillOverlay(obj: Object3D): Mesh[] {
+		const ud = obj.userData as { fillOverlay?: Mesh[] };
+		if (ud.fillOverlay) return ud.fillOverlay;
+		const meshes: Mesh[] = [];
 		obj.traverse((node) => {
 			const mesh = node as Mesh;
-			if (!mesh.isMesh || !mesh.geometry) return;
-			const ls = new LineSegments(this.getEdges(mesh), this.hoverLineMat);
-			ls.userData.isOutline = true;
-			ls.raycast = () => {}; // the outline itself is never a pick target
-			ls.renderOrder = 6;
-			ls.frustumCulled = false;
-			ls.visible = false;
-			mesh.add(ls);
-			lines.push(ls);
+			if (mesh.isMesh && mesh.geometry && !mesh.userData.isOutline) meshes.push(mesh);
 		});
-		ud.outlineLines = lines;
-		return lines;
+		ud.fillOverlay = meshes.map((mesh) => {
+			const fill = new Mesh(mesh.geometry, this.hoverFillMat);
+			fill.userData.isOutline = true; // never a pick target / never itself overlaid
+			fill.raycast = () => {};
+			fill.renderOrder = 6;
+			fill.frustumCulled = false;
+			fill.visible = false;
+			mesh.add(fill);
+			return fill;
+		});
+		return ud.fillOverlay;
 	}
 
 	// Selection (persistent, orange) beats hover (transient, cyan) beats none.
@@ -658,12 +740,12 @@ export class OrbitEngine {
 			: obj === this.hoveredObj
 				? "hover"
 				: "none";
-		const ud = obj.userData as { outlineLines?: LineSegments[] };
-		if (kind === "none" && !ud.outlineLines) return;
-		const mat = kind === "select" ? this.selectLineMat : this.hoverLineMat;
-		for (const ls of this.ensureOutlineLines(obj)) {
-			ls.visible = kind !== "none";
-			ls.material = mat;
+		const ud = obj.userData as { fillOverlay?: Mesh[] };
+		if (kind === "none" && !ud.fillOverlay) return;
+		const mat = kind === "select" ? this.selectFillMat : this.hoverFillMat;
+		for (const fill of this.ensureFillOverlay(obj)) {
+			fill.visible = kind !== "none";
+			fill.material = mat;
 		}
 	}
 
@@ -693,13 +775,14 @@ export class OrbitEngine {
 	}
 
 	// Which loaded root the cursor addresses right now: the dollhouse in overview /
-	// peek (lite, or the proxy when "proxy view" is on or there's no lite). The
-	// interior is a navigation walkthrough, so objects aren't addressed there.
+	// peek (lite, or the proxy when "proxy view" is on or there's no lite), and the
+	// projected proxy in the interior (hover-highlight — see updateHover).
 	private activeObjectRoot(): Object3D | null {
 		if (this.mode === "overview" || this.mode === "peek") {
 			if (this.proxyView && this.proxyGroup) return this.proxyGroup;
 			return this.liteRoot ?? this.proxyGroup;
 		}
+		if (this.mode === "interior") return this.proxyGroup;
 		return null;
 	}
 
@@ -934,23 +1017,32 @@ export class OrbitEngine {
 		this.sphereAMat.depthTest = true; // let the opaque proxy occlude the backdrop
 	}
 
-	// Encase the proxy in a wireframe box sized to its exact world AABB (precise,
-	// per-vertex → no clearance). Drawn over everything (depthTest off) so the full
-	// 12-edge cage reads as a box around the proxy from any angle.
-	private buildProxyBox() {
+	// A floor slab spanning the proxy's footprint, sat just under its lowest point,
+	// backing "proxy leaks" (gaps in the proxy floor). It shares the proxy's
+	// material (see reskinProxy), so the panos project onto it just like the floor:
+	// at a capture point the projection equals the backdrop image, so the slab is
+	// invisible, and it picks up the live projected floor as you move — rather than
+	// showing through holes as a flat fill. Kept out of proxyGroup so it isn't
+	// registered/picked as an addressable object; visibility is synced to the proxy.
+	private buildProxyBase() {
 		if (!this.proxyGroup) return;
 		const box = new Box3().setFromObject(this.proxyGroup, true);
 		if (box.isEmpty()) return;
-		const helper = new Box3Helper(box, 0x9ad4ff);
-		const mat = helper.material as LineBasicMaterial;
-		mat.transparent = true;
-		mat.opacity = 0.5;
-		mat.depthTest = false;
-		mat.depthWrite = false;
-		helper.renderOrder = 5;
-		helper.frustumCulled = false;
-		this.scene.add(helper);
-		this.proxyBox = helper;
+		const size = box.getSize(new Vector3());
+		const center = box.getCenter(new Vector3());
+		const base = new Mesh(new PlaneGeometry(size.x, size.z), this.projMaterial);
+		base.rotation.x = -Math.PI / 2; // lie flat, normal up
+		// A hair below the lowest vertex so it never z-fights a coincident floor.
+		base.position.set(center.x, box.min.y - Math.max(0.01, size.y * 0.002), center.z);
+		base.frustumCulled = false;
+		base.visible = false;
+		this.scene.add(base);
+		this.proxyBase = base;
+	}
+
+	// The base belongs to the proxy, so it shows exactly when the proxy does.
+	private syncProxyBase() {
+		if (this.proxyBase) this.proxyBase.visible = !!this.proxyGroup?.visible;
 	}
 
 	// --- look controls (interior: lon/lat drag) -------------------------------
@@ -1208,6 +1300,12 @@ export class OrbitEngine {
 		});
 	}
 
+	// Walk to a capture from the minimap (interior only; overview uses enter()).
+	travelToIndex(index: number) {
+		if (this.mode !== "interior" || this.interiorBusy) return;
+		this.travelTo(index);
+	}
+
 	private peekStart() {
 		if (this.mode !== "interior" || this.interiorBusy) return;
 		this.savedInterior = {
@@ -1276,19 +1374,22 @@ export class OrbitEngine {
 
 	private disposeObject(obj: Object3D) {
 		obj.traverse((o) => {
+			// Highlight overlays share their parent's geometry + a singleton material;
+			// the parent disposes the geometry, so skip them here.
+			if ((o.userData as { isOutline?: boolean }).isOutline) return;
 			const m = o as Mesh;
 			if (!m.isMesh && !(o as { isLine?: boolean }).isLine) return;
 			m.geometry?.dispose();
 			const mats = Array.isArray(m.material) ? m.material : [m.material];
 			for (const mat of mats) {
-				// Shared singletons (projection/poly fills, outline line mats) outlive
+				// Shared singletons (projection/poly fills, highlight fill mats) outlive
 				// any one cell, so never dispose them here.
 				if (
 					mat &&
 					mat !== this.projMaterial &&
 					mat !== this.polyMaterial &&
-					mat !== this.hoverLineMat &&
-					mat !== this.selectLineMat
+					mat !== this.hoverFillMat &&
+					mat !== this.selectFillMat
 				)
 					mat.dispose();
 			}
@@ -1307,16 +1408,18 @@ export class OrbitEngine {
 			this.disposeObject(this.proxyGroup);
 			this.proxyGroup = null;
 		}
-		if (this.proxyBox) {
-			this.scene.remove(this.proxyBox);
-			this.proxyBox.dispose();
-			this.proxyBox = null;
+		if (this.proxyBase) {
+			this.scene.remove(this.proxyBase);
+			this.proxyBase.geometry.dispose(); // shares the proj/poly singletons — don't dispose them
+			this.proxyBase = null;
 		}
 		for (const p of this.panos) {
 			p.texture?.dispose();
 			if (p.placeholderTexture && p.placeholderTexture !== p.texture) p.placeholderTexture.dispose();
 		}
 		this.panos = [];
+		this.minimaps = [];
+		this.panoLevel = [];
 		this.sphereAMat.uniforms.map.value = DUMMY_TEX;
 		this.sphereBMat.uniforms.map.value = DUMMY_TEX;
 		this.currentIndex = -1;
@@ -1363,6 +1466,11 @@ export class OrbitEngine {
 				if (res.ok) manifest = (await res.json()) as TourManifest;
 			}
 			if (token !== this.loadToken || this.disposed) return;
+
+			// Bird's-eye slices: resolve their URLs up front (small, eager <img>
+			// loads in the chrome — not part of the WebGL pipeline).
+			const mmList = manifest && Array.isArray(manifest.minimaps) ? manifest.minimaps : [];
+			this.minimaps = mmList.map((m) => ({ ...m, url: source.resolveMinimap(m.file) }));
 
 			const list = manifest && Array.isArray(manifest.panos) ? manifest.panos : [];
 			// Panos load lazily (on enter / on movement); just resolve URLs now.
@@ -1411,6 +1519,7 @@ export class OrbitEngine {
 
 	private applyScene(entries: PanoEntry[], proxyRoot: Group | null, lite: Group | null) {
 		this.panos = entries;
+		this.panoLevel = entries.map((p) => this.levelForY(p.position[1]));
 		this.projectionMode = !!proxyRoot;
 		this.sharedOverview = !lite && !!proxyRoot; // no lite: the proxy doubles as the dollhouse
 
@@ -1436,8 +1545,8 @@ export class OrbitEngine {
 		if (this.liteRoot) this.registerObjects(this.liteRoot);
 		if (this.proxyGroup) this.registerObjects(this.proxyGroup);
 
-		// Encase the proxy in a tight bounding-box wireframe (its exact extents).
-		this.buildProxyBox();
+		// Give proxy floor leaks an opaque backing (a base under its footprint).
+		this.buildProxyBase();
 
 		const framed = lite ?? proxyRoot!;
 		const box = new Box3().setFromObject(framed);
