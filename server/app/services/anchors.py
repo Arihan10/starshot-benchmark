@@ -41,7 +41,9 @@ Coordinate convention (identical to the scene's): right-handed, Y-up, meters.
   +X = right, +Y = up, +Z = toward the viewer (front), -Z = away (back).
 A bounding box is given as its world-space dimensions (W by H by D) and a global origin corner; the box spans from that corner along +X/+Y/+Z by the dimensions.
 
-Produce as THOROUGH of a set as possible, inside and out, optimize for FULL scene coverage on all sides and angles in terms of line of sight. Try to anchor the camera to certain object top faces. Be certain not to place the anchor point within any bounding boxes of objects. Try to place the anchor points at a realistic viewing height above a surface, do not place the anchor point randomly in the air.
+Produce as THOROUGH of a set as possible, inside and out, optimize for FULL scene coverage on all sides and angles. Imagine you are a human walking physically through the scene at discrete points, where do these discrete points need to be in order to experience the scene fully without the discrete jumps being jarring. Transitionatory points are just as important as key highlight points: walking from key location A -> key location B involves one or more important intermediate points even if the image is less interesting at those intermediate points. 
+
+Try to anchor the camera to object top faces. DO NOT place the anchor point inside object bounding boxes. Try to place the anchor points at a realistic viewing height above a surface.
 
 Output ONLY the JSON object matching the schema: each anchor is just its `position`, [x, y, z] world-space meters. Do NOT name, label, classify, or annotate the anchors — emit raw coordinates only."""
 

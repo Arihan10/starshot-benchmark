@@ -17,20 +17,35 @@ import {
 
 export const HOTSPOT_FLOOR_DROP = 1.3; // meters below eye level (markers sit on the floor)
 export const HOTSPOT_REACH = 30; // furthest an interior anchor can be and still show
-export const HOTSPOT_MAX_VISIBLE = 10; // line-of-sight anchors shown
-export const HOTSPOT_MAX_OCCLUDED = 6; // behind-wall anchors shown (as ghosts)
+export const HOTSPOT_MAX_OCCLUDED = 6; // X closest behind-wall anchors kept as yellow ghosts
 export const HOTSPOT_OCCLUDE_EPS = 0.2; // trim both ends so a hugged wall isn't a block
-export const HOTSPOT_TARGET_PX = 24; // interior hotspot radius on screen, in CSS px
 export const ENTRY_TARGET_PX = 12; // overview entry discs render smaller
 export const AUTO_AIM_PX = 42; // interior pick/hover magnetism radius
 export const ENTRY_AIM_PX = 26; // tighter pick radius for the smaller entry discs
 export const HOTSPOT_BASE_RADIUS = 0.16; // the disc geometry's world radius
+// Every anchor shows a small white ring laid flat on the floor: world-fixed size
+// (scales with distance like a real object) and depth-tested (scene geometry hides it).
+export const ANCHOR_RING_INNER = 0.14; // world-space inner radius of the anchor ring
+export const ANCHOR_RING_OUTER = 0.2; // world-space outer radius of the anchor ring
+export const ANCHOR_RING_OPACITY = 0.4; // anchor rings are faint / transparent
+// The X closest behind-wall anchors reuse the anchor-ring look in a warm gold:
+// brighter, larger, and drawn over everything so they read as reachable through walls.
+export const ANCHOR_RING_OCCLUDED_COLOR = 0xffce73; // warm gold
+export const ANCHOR_RING_OCCLUDED_OPACITY = 0.92; // bolder than the faint white rings
+export const ANCHOR_RING_OCCLUDED_SCALE = 1.5; // larger than the white rings, for visibility
 export const CAPTURE_EYE_HEIGHT = 1.6; // panos are shot at eye height; floor sits this far below
 export const PEEK_ROTATE_SPEED = 0.5; // rad/s the dollhouse spins while locating
+export const WASD_MAX_Y_STEP = 2.0; // m: max |Δy| a WASD step will cross (blocks floor hops)
+export const WASD_MAX_STEP = 24.0; // m: furthest a single WASD step will travel (XZ distance)
+export const WASD_DIR_COS = Math.SQRT1_2; // cos(45°): WASD takes the nearest anchor in a quadrant-wide cone
 
 // A flat floor disc + ring. Lies flat (normal up) so it reads as a spot on the
 // floor; screen-space auto-aim (see pickByScreen) handles forgiving picking.
-export function makeDisc(targetIndex: number, color: number, ringColor: number): Group {
+export function makeDisc(
+	targetIndex: number,
+	color: number,
+	ringColor: number,
+): Group {
 	const group = new Group();
 	const disc = new Mesh(
 		new CircleGeometry(HOTSPOT_BASE_RADIUS, 40),
@@ -44,7 +59,11 @@ export function makeDisc(targetIndex: number, color: number, ringColor: number):
 		}),
 	);
 	const ring = new Mesh(
-		new RingGeometry(HOTSPOT_BASE_RADIUS * 1.38, HOTSPOT_BASE_RADIUS * 1.69, 48),
+		new RingGeometry(
+			HOTSPOT_BASE_RADIUS * 1.38,
+			HOTSPOT_BASE_RADIUS * 1.69,
+			48,
+		),
 		new MeshBasicMaterial({
 			color: ringColor,
 			transparent: true,
@@ -74,7 +93,11 @@ export function makeYouMarker(): YouMarker {
 	group.renderOrder = 999;
 	const sphere = new Mesh(
 		new SphereGeometry(1, 24, 16),
-		new MeshBasicMaterial({ color: 0xff3030, depthTest: false, depthWrite: false }),
+		new MeshBasicMaterial({
+			color: 0xff3030,
+			depthTest: false,
+			depthWrite: false,
+		}),
 	);
 	const ring = new Mesh(
 		new RingGeometry(1.4, 1.9, 40),
@@ -90,7 +113,12 @@ export function makeYouMarker(): YouMarker {
 	ring.rotation.x = -Math.PI / 2;
 	const line = new Line(
 		new BufferGeometry().setFromPoints([new Vector3(), new Vector3()]),
-		new LineBasicMaterial({ color: 0xff3030, transparent: true, opacity: 0.8, depthTest: false }),
+		new LineBasicMaterial({
+			color: 0xff3030,
+			transparent: true,
+			opacity: 0.8,
+			depthTest: false,
+		}),
 	);
 	for (const m of [sphere, ring, line]) m.renderOrder = 999;
 	group.add(sphere, ring, line);
@@ -107,7 +135,8 @@ export function hotspotScaleForDistance(
 	stageHeight: number,
 ): number {
 	const h = stageHeight || 1;
-	const worldRadius = (targetPx * 2 * d * Math.tan((fov * Math.PI) / 360)) / h;
+	const worldRadius =
+		(targetPx * 2 * d * Math.tan((fov * Math.PI) / 360)) / h;
 	return MathUtils.clamp(worldRadius / HOTSPOT_BASE_RADIUS, 0.15, 14);
 }
 

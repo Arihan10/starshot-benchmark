@@ -395,7 +395,8 @@ function hudContent(state: OrbitState): ReactNode {
 		if (currentId) {
 			return (
 				<>
-					<strong>{currentId}</strong> · {currentIndex + 1}/{panoCount} · drag to look
+					<strong>{currentId}</strong> · {currentIndex + 1}/{panoCount} · drag to look ·{" "}
+					<strong>WASD</strong> to move
 				</>
 			);
 		}

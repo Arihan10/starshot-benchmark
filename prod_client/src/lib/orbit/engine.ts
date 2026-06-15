@@ -5,8 +5,10 @@ import {
 	DoubleSide,
 	Group,
 	HemisphereLight,
+	type Intersection,
 	type Material,
 	MathUtils,
+	Matrix3,
 	Mesh,
 	MeshBasicMaterial,
 	MOUSE,
@@ -38,28 +40,51 @@ import {
 	SPHERE_RADIUS,
 } from "./materials";
 import {
+	ANCHOR_RING_INNER,
+	ANCHOR_RING_OCCLUDED_COLOR,
+	ANCHOR_RING_OCCLUDED_OPACITY,
+	ANCHOR_RING_OCCLUDED_SCALE,
+	ANCHOR_RING_OPACITY,
+	ANCHOR_RING_OUTER,
 	AUTO_AIM_PX,
 	CAPTURE_EYE_HEIGHT,
 	ENTRY_AIM_PX,
 	ENTRY_TARGET_PX,
 	HOTSPOT_FLOOR_DROP,
 	HOTSPOT_MAX_OCCLUDED,
-	HOTSPOT_MAX_VISIBLE,
 	HOTSPOT_OCCLUDE_EPS,
 	HOTSPOT_REACH,
-	HOTSPOT_TARGET_PX,
 	hotspotScaleForDistance,
 	makeDisc,
 	makeYouMarker,
 	PEEK_ROTATE_SPEED,
 	pickByScreen,
+	WASD_DIR_COS,
+	WASD_MAX_STEP,
+	WASD_MAX_Y_STEP,
 	type YouMarker,
 } from "./markers";
-import type { MinimapLevel, OrbitMode, OrbitState, TourManifest, TourSource } from "./types";
+import type {
+	MinimapLevel,
+	OrbitMode,
+	OrbitState,
+	TourManifest,
+	TourSource,
+} from "./types";
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
-const easeInOut = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2);
+const easeInOut = (t: number) =>
+	t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
 const _ndc = new Vector2();
+// Scratch for the surface-riding ring cursor (interior). RingGeometry lies in the
+// XY plane facing +Z, so orienting +Z onto a hit normal lays the ring flat on
+// that surface. RING_OUTER_PX keeps the ring a constant on-screen radius.
+const _cursorNdc = new Vector2();
+const _cursorNormal = new Vector3();
+const _cursorNormalMat = new Matrix3();
+const _cursorToCam = new Vector3();
+const Z_AXIS = new Vector3(0, 0, 1);
+const RING_OUTER_PX = 18;
 
 type Transition = {
 	fromPos: Vector3;
@@ -72,8 +97,20 @@ type Transition = {
 	onEnd?: () => void;
 	midDone: boolean;
 };
-type Glide = { fromPos: Vector3; toPos: Vector3; start: number; dur: number; index: number };
-type SavedInterior = { pos: Vector3; lon: number; lat: number; index: number; fov: number };
+type Glide = {
+	fromPos: Vector3;
+	toPos: Vector3;
+	start: number;
+	dur: number;
+	index: number;
+};
+type SavedInterior = {
+	pos: Vector3;
+	lon: number;
+	lat: number;
+	index: number;
+	fov: number;
+};
 
 // A capture point. Textures are loaded lazily (on enter / on movement): a low-res
 // blurred placeholder shows first, then the full image swaps in. `texture` is the
@@ -122,9 +159,46 @@ export class OrbitEngine {
 
 	private readonly hotspotGroup = new Group();
 	private readonly entryGroup = new Group();
+	// Every anchor as a small white ring laid flat on the floor. Depth-tested
+	// (depthTest defaults on) so scene geometry obstructs it, and never
+	// screen-scaled in tick() so it keeps a world-fixed size — smaller far, larger
+	// near, like a real object. One shared geometry + material across all anchors.
+	private readonly anchorRingGroup = new Group();
+	private readonly anchorRingGeo = new RingGeometry(
+		ANCHOR_RING_INNER,
+		ANCHOR_RING_OUTER,
+		40,
+	);
+	private readonly anchorRingMat = new MeshBasicMaterial({
+		color: 0xffffff,
+		transparent: true,
+		opacity: ANCHOR_RING_OPACITY,
+		side: DoubleSide,
+		depthWrite: false,
+	});
+	// The X closest obstructed anchors reuse the ring geometry in warm gold, drawn
+	// over everything (depthTest off) so they show through walls as reachable.
+	private readonly anchorRingOccludedMat = new MeshBasicMaterial({
+		color: ANCHOR_RING_OCCLUDED_COLOR,
+		transparent: true,
+		opacity: ANCHOR_RING_OCCLUDED_OPACITY,
+		side: DoubleSide,
+		depthWrite: false,
+		depthTest: false,
+	});
 	private readonly you: YouMarker;
 	private readonly occluder = new Raycaster();
 	private readonly dummyCam = new PerspectiveCamera();
+
+	// Surface-adhering ring cursor (interior only): a flat ring laid on the world
+	// point under the native cursor, oriented to the hit surface's normal so it
+	// sits flush on floors / walls / objects. The OS cursor is never hidden — this
+	// rides on top of it.
+	private readonly cursorRing: Mesh;
+	private readonly cursorRay = new Raycaster();
+	private pointerClientX = 0;
+	private pointerClientY = 0;
+	private pointerInside = false;
 
 	private panos: PanoEntry[] = [];
 	private currentIndex = -1;
@@ -219,7 +293,11 @@ export class OrbitEngine {
 	private loadToken = 0;
 	private disposed = false;
 
-	constructor(host: HTMLElement, onState: (s: OrbitState) => void, onHold?: (held: boolean) => void) {
+	constructor(
+		host: HTMLElement,
+		onState: (s: OrbitState) => void,
+		onHold?: (held: boolean) => void,
+	) {
 		this.host = host;
 		this.onState = onState;
 		this.onHold = onHold;
@@ -231,7 +309,11 @@ export class OrbitEngine {
 		this.canvas = this.renderer.domElement;
 		// CSS-size the canvas to fill the host (buffer stays at w*dpr for crisp
 		// HiDPI); setSize(w,h,false) below avoids overriding these styles.
-		Object.assign(this.canvas.style, { display: "block", width: "100%", height: "100%" });
+		Object.assign(this.canvas.style, {
+			display: "block",
+			width: "100%",
+			height: "100%",
+		});
 		host.appendChild(this.canvas);
 
 		this.travelFade = document.createElement("div");
@@ -264,7 +346,11 @@ export class OrbitEngine {
 		this.controls.zoomToCursor = true;
 		this.controls.autoRotate = true;
 		this.controls.autoRotateSpeed = 0.6;
-		this.controls.mouseButtons = { LEFT: MOUSE.ROTATE, MIDDLE: MOUSE.PAN, RIGHT: MOUSE.PAN };
+		this.controls.mouseButtons = {
+			LEFT: MOUSE.ROTATE,
+			MIDDLE: MOUSE.PAN,
+			RIGHT: MOUSE.PAN,
+		};
 		this.controls.enabled = false;
 		this.controls.addEventListener("start", this.onControlsStart);
 		this.controls.addEventListener("end", this.onControlsEnd);
@@ -275,7 +361,10 @@ export class OrbitEngine {
 		// Valid sampler before any pano texture loads (panos load lazily now).
 		this.sphereAMat.uniforms.map.value = DUMMY_TEX;
 		this.sphereBMat.uniforms.map.value = DUMMY_TEX;
-		this.sphereA = new Mesh(new SphereGeometry(SPHERE_RADIUS, 64, 32), this.sphereAMat);
+		this.sphereA = new Mesh(
+			new SphereGeometry(SPHERE_RADIUS, 64, 32),
+			this.sphereAMat,
+		);
 		this.sphereB = new Mesh(this.sphereA.geometry, this.sphereBMat);
 		this.sphereA.renderOrder = 0;
 		this.sphereB.renderOrder = 1;
@@ -283,13 +372,32 @@ export class OrbitEngine {
 		this.sphereB.visible = false;
 		this.scene.add(this.sphereA, this.sphereB);
 
-		this.scene.add(this.hotspotGroup, this.entryGroup);
+		this.scene.add(this.hotspotGroup, this.entryGroup, this.anchorRingGroup);
 		this.you = makeYouMarker();
 		this.scene.add(this.you.group);
+
+		// Base outer radius 1; scaled per-frame to a constant pixel size. Drawn over
+		// everything (depthTest off), like the other markers, so it stays visible.
+		this.cursorRing = new Mesh(
+			new RingGeometry(0.72, 1, 48),
+			new MeshBasicMaterial({
+				color: 0x7fe9ff,
+				transparent: true,
+				opacity: 0.9,
+				side: DoubleSide,
+				depthTest: false,
+				depthWrite: false,
+			}),
+		);
+		this.cursorRing.renderOrder = 1000;
+		this.cursorRing.frustumCulled = false;
+		this.cursorRing.visible = false;
+		this.scene.add(this.cursorRing);
 
 		this.canvas.addEventListener("contextmenu", this.onContextMenu);
 		this.canvas.addEventListener("pointerdown", this.onPointerDown);
 		this.canvas.addEventListener("pointermove", this.onPointerMove);
+		this.canvas.addEventListener("pointerleave", this.onPointerLeave);
 		this.canvas.addEventListener("pointerup", this.onPointerUp);
 		this.canvas.addEventListener("wheel", this.onWheel, { passive: false });
 		this.canvas.addEventListener("click", this.onClick);
@@ -315,6 +423,7 @@ export class OrbitEngine {
 		this.canvas.removeEventListener("contextmenu", this.onContextMenu);
 		this.canvas.removeEventListener("pointerdown", this.onPointerDown);
 		this.canvas.removeEventListener("pointermove", this.onPointerMove);
+		this.canvas.removeEventListener("pointerleave", this.onPointerLeave);
 		this.canvas.removeEventListener("pointerup", this.onPointerUp);
 		this.canvas.removeEventListener("wheel", this.onWheel);
 		this.canvas.removeEventListener("click", this.onClick);
@@ -323,6 +432,13 @@ export class OrbitEngine {
 		window.removeEventListener("keyup", this.onKeyUp);
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
 		this.clearScene();
+		this.scene.remove(this.cursorRing);
+		this.cursorRing.geometry.dispose();
+		(this.cursorRing.material as Material).dispose();
+		this.scene.remove(this.anchorRingGroup);
+		this.anchorRingGeo.dispose();
+		this.anchorRingMat.dispose();
+		this.anchorRingOccludedMat.dispose();
 		this.hoverFillMat.dispose();
 		this.selectFillMat.dispose();
 		this.renderer.dispose();
@@ -334,12 +450,19 @@ export class OrbitEngine {
 
 	private emit() {
 		if (this.mode === "transition") return;
-		const cur = this.currentIndex >= 0 ? this.panos[this.currentIndex] : null;
+		const cur =
+			this.currentIndex >= 0 ? this.panos[this.currentIndex] : null;
 		let hover: OrbitState["hover"] = null;
 		if (this.mode === "overview" && this.hoveredEntryIndex >= 0) {
-			hover = { id: this.panos[this.hoveredEntryIndex].id, occluded: false };
+			hover = {
+				id: this.panos[this.hoveredEntryIndex].id,
+				occluded: false,
+			};
 		} else if (this.mode === "interior" && this.hoveredTargetIndex >= 0) {
-			hover = { id: this.panos[this.hoveredTargetIndex].id, occluded: this.hoveredOccluded };
+			hover = {
+				id: this.panos[this.hoveredTargetIndex].id,
+				occluded: this.hoveredOccluded,
+			};
 		}
 		const state: OrbitState = {
 			mode: this.mode,
@@ -347,11 +470,15 @@ export class OrbitEngine {
 			currentId: cur ? cur.id : null,
 			currentIndex: this.currentIndex,
 			hover,
-			objectHover: this.hoveredObj ? (this.hoveredObj.userData.objLabel as string) : null,
+			objectHover: this.hoveredObj
+				? (this.hoveredObj.userData.objLabel as string)
+				: null,
 			proxyView: this.proxyView,
 			canProxyView: this.canToggleProxyView(),
 			highlightEnabled: this.highlightEnabled,
-			canHighlight: (this.mode === "overview" || this.mode === "interior") && !!this.activeObjectRoot(),
+			canHighlight:
+				(this.mode === "overview" || this.mode === "interior") &&
+				!!this.activeObjectRoot(),
 			contextMenu: this.contextMenu,
 			busy: this.interiorBusy,
 			overlay: this.overlay,
@@ -400,7 +527,13 @@ export class OrbitEngine {
 		const levels = this.minimaps.map((mm, idx) => {
 			const w = mm.bounds.maxX - mm.bounds.minX;
 			const d = mm.bounds.maxZ - mm.bounds.minZ;
-			const points: { index: number; id: string; leftPct: number; topPct: number; current: boolean }[] = [];
+			const points: {
+				index: number;
+				id: string;
+				leftPct: number;
+				topPct: number;
+				current: boolean;
+			}[] = [];
 			for (let i = 0; i < this.panos.length; i++) {
 				if (this.panoLevel[i] !== idx) continue;
 				const p = this.panos[i].position;
@@ -412,7 +545,12 @@ export class OrbitEngine {
 					current: i === this.currentIndex,
 				});
 			}
-			return { level: idx, url: mm.url, aspect: d > 0 ? w / d : 1, points };
+			return {
+				level: idx,
+				url: mm.url,
+				aspect: d > 0 ? w / d : 1,
+				points,
+			};
 		});
 		return { currentLevel, levels };
 	}
@@ -421,7 +559,8 @@ export class OrbitEngine {
 
 	private setTravelMask(t: number) {
 		const m = Math.sin(Math.PI * MathUtils.clamp(t, 0, 1));
-		this.canvas.style.filter = m > 0.002 ? `blur(${(m * 7).toFixed(2)}px)` : "none";
+		this.canvas.style.filter =
+			m > 0.002 ? `blur(${(m * 7).toFixed(2)}px)` : "none";
 		this.travelFade.style.opacity = (m * 0.5).toFixed(3);
 	}
 	private clearTravelMask() {
@@ -447,7 +586,10 @@ export class OrbitEngine {
 	private onContextMenu = (ev: MouseEvent) => {
 		ev.preventDefault();
 		if (this.mode !== "overview") return;
-		if (Math.hypot(ev.clientX - this.rcDownX, ev.clientY - this.rcDownY) > 6) return;
+		if (
+			Math.hypot(ev.clientX - this.rcDownX, ev.clientY - this.rcDownY) > 6
+		)
+			return;
 		this.openObjectMenu(ev.clientX, ev.clientY);
 	};
 
@@ -481,14 +623,29 @@ export class OrbitEngine {
 	};
 
 	private onPointerMove = (ev: PointerEvent) => {
+		// Keep the last cursor position for the ring (updated every frame in tick so
+		// it tracks look-drag rotation too, not just raw movement).
+		this.pointerClientX = ev.clientX;
+		this.pointerClientY = ev.clientY;
+		this.pointerInside = true;
 		if (this.mode === "overview") {
 			if (ev.buttons !== 0) return; // skip mid-orbit drag
-			const spot = pickByScreen(ev.clientX, ev.clientY, this.entryGroup, ENTRY_AIM_PX, this.camera, this.canvas);
+			const spot = pickByScreen(
+				ev.clientX,
+				ev.clientY,
+				this.entryGroup,
+				ENTRY_AIM_PX,
+				this.camera,
+				this.canvas,
+			);
 			const entryIdx = spot ? (spot.userData.targetIndex as number) : -1;
 			// Entry discs are the primary overview action and win the hover; only
 			// when none is under the cursor (and highlighting is on) do we offer the
 			// object beneath it.
-			const obj = entryIdx >= 0 || !this.highlightEnabled ? null : this.pickObjectAt(ev.clientX, ev.clientY);
+			const obj =
+				entryIdx >= 0 || !this.highlightEnabled
+					? null
+					: this.pickObjectAt(ev.clientX, ev.clientY);
 			this.canvas.style.cursor = entryIdx >= 0 || obj ? "pointer" : "";
 			const hoverChanged = this.setObjectHover(obj);
 			const entryChanged = entryIdx !== this.hoveredEntryIndex;
@@ -501,7 +658,10 @@ export class OrbitEngine {
 			const k = (0.0032 * this.camera.fov) / 75;
 			this.lon = this.downLon + (this.downX - ev.clientX) * k;
 			this.lat = this.downLat + (ev.clientY - this.downY) * k;
-			this.dragMoved = Math.max(this.dragMoved, Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY));
+			this.dragMoved = Math.max(
+				this.dragMoved,
+				Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY),
+			);
 		} else if (!this.interiorBusy) {
 			this.updateHover(ev);
 		}
@@ -511,30 +671,75 @@ export class OrbitEngine {
 		if (this.mode !== "interior") return;
 		this.dragging = false;
 		this.canvas.style.cursor = "";
-		if (this.dragMoved < 5 && !this.interiorBusy) {
-			const spot = pickByScreen(ev.clientX, ev.clientY, this.hotspotGroup, AUTO_AIM_PX, this.camera, this.canvas);
-			if (spot) this.travelTo(spot.userData.targetIndex as number);
-		}
+		if (this.dragMoved >= 5 || this.interiorBusy) return;
+		// Click a ring to go straight there: a gold behind-wall marker, or a visible
+		// white ring (both draw over / sit in the scene, so a screen-space pick is
+		// what matches what you see). Off the rings, fall back to auto-aim's
+		// nearest-anchor-to-the-clicked-surface pick.
+		const spot = this.pickAnchorMarker(ev.clientX, ev.clientY);
+		if (spot) this.travelTo(spot.userData.targetIndex as number);
+		else this.autoAimTravel(ev.clientX, ev.clientY);
 	};
 
 	private onWheel = (ev: WheelEvent) => {
 		if (this.mode !== "interior") return;
 		ev.preventDefault();
-		this.camera.fov = MathUtils.clamp(this.camera.fov + ev.deltaY * 0.05, 25, 100);
+		this.camera.fov = MathUtils.clamp(
+			this.camera.fov + ev.deltaY * 0.05,
+			25,
+			100,
+		);
 		this.camera.updateProjectionMatrix();
 	};
 
 	private onClick = (ev: MouseEvent) => {
 		if (this.mode !== "overview") return;
-		const spot = pickByScreen(ev.clientX, ev.clientY, this.entryGroup, ENTRY_AIM_PX, this.camera, this.canvas);
+		const spot = pickByScreen(
+			ev.clientX,
+			ev.clientY,
+			this.entryGroup,
+			ENTRY_AIM_PX,
+			this.camera,
+			this.canvas,
+		);
 		if (spot) this.enter(spot.userData.targetIndex as number);
 	};
 
+	private onPointerLeave = () => {
+		this.pointerInside = false;
+		this.cursorRing.visible = false;
+	};
 	private onWindowPointerUp = () => this.peekUp();
 	private onKeyDown = (ev: KeyboardEvent) => {
 		if (ev.code === "Space" && !ev.repeat) {
 			ev.preventDefault();
 			this.peekDown();
+			return;
+		}
+		// WASD walks the interior: forward is where you're looking (XZ of the look
+		// azimuth), right is 90° off it. One step per press (auto-repeat ignored).
+		if (this.mode !== "interior" || this.interiorBusy || ev.repeat) return;
+		const fx = Math.cos(this.lon);
+		const fz = Math.sin(this.lon);
+		const rx = -Math.sin(this.lon);
+		const rz = Math.cos(this.lon);
+		switch (ev.code) {
+			case "KeyW":
+				ev.preventDefault();
+				this.stepToward(fx, fz);
+				break;
+			case "KeyS":
+				ev.preventDefault();
+				this.stepToward(-fx, -fz);
+				break;
+			case "KeyD":
+				ev.preventDefault();
+				this.stepToward(rx, rz);
+				break;
+			case "KeyA":
+				ev.preventDefault();
+				this.stepToward(-rx, -rz);
+				break;
 		}
 	};
 	private onKeyUp = (ev: KeyboardEvent) => {
@@ -548,15 +753,139 @@ export class OrbitEngine {
 	// straight out of the 360 image.
 	private updateHover(ev: PointerEvent) {
 		if (this.currentIndex < 0) return;
-		const spot = pickByScreen(ev.clientX, ev.clientY, this.hotspotGroup, AUTO_AIM_PX, this.camera, this.canvas);
+		const spot = this.pickAnchorMarker(ev.clientX, ev.clientY);
 		const idx = spot ? (spot.userData.targetIndex as number) : -1;
 		const occ = spot ? !!spot.userData.occluded : false;
-		const obj = idx >= 0 || !this.highlightEnabled ? null : this.pickObjectAt(ev.clientX, ev.clientY);
+		const obj =
+			idx >= 0 || !this.highlightEnabled
+				? null
+				: this.pickObjectAt(ev.clientX, ev.clientY);
 		this.canvas.style.cursor = idx >= 0 || obj ? "pointer" : "";
-		const hotspotChanged = idx !== this.hoveredTargetIndex || occ !== this.hoveredOccluded;
+		const hotspotChanged =
+			idx !== this.hoveredTargetIndex || occ !== this.hoveredOccluded;
 		this.hoveredTargetIndex = idx;
 		this.hoveredOccluded = occ;
 		if (this.setObjectHover(obj) || hotspotChanged) this.emit();
+	}
+
+	// Nearest clickable anchor marker under the cursor (screen-space magnetism): a
+	// gold obstructed marker (drawn over everything, always reachable), else a white
+	// ring that scene geometry isn't hiding — an occluded white ring is invisible,
+	// so clicking the wall in front of it must NOT teleport through. Returns the
+	// marker (read userData.targetIndex / .occluded) or null. Shared by hover +
+	// click, so what lights up is exactly what a click travels to.
+	private pickAnchorMarker(clientX: number, clientY: number): Object3D | null {
+		const occluded = pickByScreen(
+			clientX,
+			clientY,
+			this.hotspotGroup,
+			AUTO_AIM_PX,
+			this.camera,
+			this.canvas,
+		);
+		if (occluded) return occluded;
+		const ring = pickByScreen(
+			clientX,
+			clientY,
+			this.anchorRingGroup,
+			AUTO_AIM_PX,
+			this.camera,
+			this.canvas,
+		);
+		if (!ring) return null;
+		const i = ring.userData.targetIndex as number;
+		if (i === this.currentIndex) return null;
+		const cur = this.panos[this.currentIndex].position;
+		return this.anchorOccluded(cur, this.panos[i].position) ? null : ring;
+	}
+
+	// Interior geometry under a screen point: the projection proxy plus its floor
+	// base, or the pano sphere when there's no proxy. Returns the nearest visible
+	// hit (raycasting doesn't skip hidden objects, so walk the parent chain), or
+	// null. Shared by the surface cursor ring and click auto-aim.
+	private raycastInterior(
+		clientX: number,
+		clientY: number,
+	): Intersection | null {
+		const targets: Object3D[] = [];
+		if (this.projectionMode) {
+			if (this.proxyGroup) targets.push(this.proxyGroup);
+			if (this.proxyBase) targets.push(this.proxyBase);
+		} else {
+			this.sphereA.updateMatrixWorld();
+			targets.push(this.sphereA);
+		}
+		if (targets.length === 0) return null;
+		const rect = this.canvas.getBoundingClientRect();
+		_cursorNdc.set(
+			((clientX - rect.left) / rect.width) * 2 - 1,
+			-((clientY - rect.top) / rect.height) * 2 + 1,
+		);
+		this.camera.updateMatrixWorld();
+		this.cursorRay.setFromCamera(_cursorNdc, this.camera);
+		return (
+			this.cursorRay.intersectObjects(targets, true).find((h) => {
+				for (let o: Object3D | null = h.object; o; o = o.parent)
+					if (!o.visible) return false;
+				return true;
+			}) ?? null
+		);
+	}
+
+	// Auto-aim travel: world-raycast the click into the interior geometry and walk
+	// to the anchor closest (in world space) to where it lands. Clicking any
+	// surface snaps to the nearest capture point — no need to hit a marker.
+	private autoAimTravel(clientX: number, clientY: number) {
+		const hit = this.raycastInterior(clientX, clientY);
+		if (hit) this.travelTo(this.nearestPanoTo(hit.point));
+	}
+
+	// The surface-riding ring cursor. Lays a flat ring on the first interior surface
+	// under the native cursor, oriented to that surface's normal so it foreshortens
+	// with floors / walls. Kept a constant on-screen size and drawn over everything
+	// (depthTest off), like the other markers. Runs every frame so it follows both
+	// cursor motion and look-drag rotation. The OS cursor is never touched.
+	private updateCursorRing() {
+		if (
+			this.mode !== "interior" ||
+			this.interiorBusy ||
+			!this.pointerInside
+		) {
+			this.cursorRing.visible = false;
+			return;
+		}
+		const hit = this.raycastInterior(
+			this.pointerClientX,
+			this.pointerClientY,
+		);
+		if (!hit) {
+			this.cursorRing.visible = false;
+			return;
+		}
+		// Local→world surface normal (fall back to facing the camera if the hit
+		// carried none), flipped camera-ward so the ring's plane hugs the surface and
+		// a hair of offset keeps it off the skin.
+		if (hit.face) {
+			_cursorNormalMat.getNormalMatrix(hit.object.matrixWorld);
+			_cursorNormal
+				.copy(hit.face.normal)
+				.applyMatrix3(_cursorNormalMat)
+				.normalize();
+		} else {
+			_cursorNormal.copy(this.camera.position).sub(hit.point).normalize();
+		}
+		_cursorToCam.copy(this.camera.position).sub(hit.point);
+		if (_cursorNormal.dot(_cursorToCam) < 0) _cursorNormal.negate();
+		this.cursorRing.position
+			.copy(hit.point)
+			.addScaledVector(_cursorNormal, hit.distance * 0.01);
+		this.cursorRing.quaternion.setFromUnitVectors(Z_AXIS, _cursorNormal);
+		const tan = Math.tan((this.camera.fov * Math.PI) / 360);
+		this.cursorRing.scale.setScalar(
+			(RING_OUTER_PX * 2 * hit.distance * tan) /
+				(this.host.clientHeight || 1),
+		);
+		this.cursorRing.visible = true;
 	}
 
 	// --- view toggles (which geometry each mode shows) ------------------------
@@ -594,6 +923,7 @@ export class OrbitEngine {
 		this.sphereB.visible = false;
 		this.hotspotGroup.visible = false;
 		this.entryGroup.visible = true;
+		this.anchorRingGroup.visible = false;
 		this.you.group.visible = false;
 		this.syncProxyBase();
 	}
@@ -604,7 +934,9 @@ export class OrbitEngine {
 	// mid-walkthrough — it leaves the navigation markers alone.
 	private setInteriorProxyView() {
 		if (!this.proxyGroup || !this.projectionMode) return;
-		this.reskinProxy(this.proxyView ? this.polyMaterial : this.projMaterial);
+		this.reskinProxy(
+			this.proxyView ? this.polyMaterial : this.projMaterial,
+		);
 		this.sphereA.visible = !this.proxyView;
 		// Refresh the projection uniforms after a proxy-view spell (updateProjection
 		// is skipped while it's on) so the first textured frame isn't stale.
@@ -621,6 +953,7 @@ export class OrbitEngine {
 		}
 		this.hotspotGroup.visible = true;
 		this.entryGroup.visible = false;
+		this.anchorRingGroup.visible = true;
 		this.you.group.visible = false;
 		this.syncProxyBase();
 	}
@@ -640,6 +973,7 @@ export class OrbitEngine {
 		this.sphereB.visible = false;
 		this.hotspotGroup.visible = false;
 		this.entryGroup.visible = false;
+		this.anchorRingGroup.visible = false;
 		this.you.group.visible = true;
 		this.syncProxyBase();
 	}
@@ -648,7 +982,8 @@ export class OrbitEngine {
 	// scene to swap the proxy in for (sharedOverview tours already show the proxy);
 	// the interior needs a proxy to project onto (i.e. projection mode).
 	private canToggleProxyView(): boolean {
-		if (this.mode === "overview") return !!this.liteRoot && !!this.proxyGroup;
+		if (this.mode === "overview")
+			return !!this.liteRoot && !!this.proxyGroup;
 		if (this.mode === "interior") return this.projectionMode;
 		return false;
 	}
@@ -713,7 +1048,8 @@ export class OrbitEngine {
 	private registerObjects(root: Object3D) {
 		this.collectObjects(root).forEach((o, i) => {
 			o.userData.objId = i;
-			o.userData.objLabel = o.name && o.name.trim() ? o.name.trim() : `object ${i + 1}`;
+			o.userData.objLabel =
+				o.name && o.name.trim() ? o.name.trim() : `object ${i + 1}`;
 		});
 	}
 
@@ -729,7 +1065,8 @@ export class OrbitEngine {
 		const meshes: Mesh[] = [];
 		obj.traverse((node) => {
 			const mesh = node as Mesh;
-			if (mesh.isMesh && mesh.geometry && !mesh.userData.isOutline) meshes.push(mesh);
+			if (mesh.isMesh && mesh.geometry && !mesh.userData.isOutline)
+				meshes.push(mesh);
 		});
 		ud.fillOverlay = meshes.map((mesh) => {
 			const fill = new Mesh(mesh.geometry, this.hoverFillMat);
@@ -818,7 +1155,8 @@ export class OrbitEngine {
 		// Raycaster doesn't skip invisible objects, so skip hidden ones explicitly —
 		// otherwise a hidden object would still shadow the geometry behind it.
 		for (const h of this.picker.intersectObject(root, true)) {
-			if ((h.object.userData as { isOutline?: boolean }).isOutline) continue;
+			if ((h.object.userData as { isOutline?: boolean }).isOutline)
+				continue;
 			const obj = this.findObjectRoot(h.object, root);
 			if (obj && obj.visible) return obj;
 		}
@@ -831,7 +1169,11 @@ export class OrbitEngine {
 		const obj = this.pickObjectAt(clientX, clientY);
 		// Right-clicking empty space still surfaces the recovery actions (you can't
 		// re-pick an object once it's hidden), but only if there's something to recover.
-		if (!obj && this.hiddenObjects.size === 0 && this.outlinedObjects.size === 0) {
+		if (
+			!obj &&
+			this.hiddenObjects.size === 0 &&
+			this.outlinedObjects.size === 0
+		) {
 			this.closeMenu();
 			return;
 		}
@@ -885,7 +1227,10 @@ export class OrbitEngine {
 	// Is the straight line between two capture points blocked by the proxy? Our
 	// "behind a wall/floor" test, trimmed at both ends so a hugged wall doesn't read
 	// as occlusion.
-	private anchorOccluded(fromPos: [number, number, number], toPos: [number, number, number]): boolean {
+	private anchorOccluded(
+		fromPos: [number, number, number],
+		toPos: [number, number, number],
+	): boolean {
 		if (!this.proxyGroup) return false;
 		const from = v3(fromPos);
 		const d = v3(toPos).sub(from);
@@ -905,34 +1250,54 @@ export class OrbitEngine {
 		for (let i = 0; i < this.panos.length; i++) {
 			if (i === this.currentIndex) continue;
 			const d2 = cur.distanceToSquared(v3(this.panos[i].position));
-			if (this.projectionMode && d2 > HOTSPOT_REACH * HOTSPOT_REACH) continue;
+			if (this.projectionMode && d2 > HOTSPOT_REACH * HOTSPOT_REACH)
+				continue;
 			out.push([i, d2]);
 		}
 		out.sort((a, b) => a[1] - b[1]);
 		return out.map((o) => o[0]);
 	}
 
+	// The X closest obstructed (behind-wall) anchors. Same ring as the white anchor
+	// rings but warm gold, larger, and drawn over everything (depthTest off via
+	// anchorRingOccludedMat) so they read as reachable through walls. Every anchor
+	// also has a depth-tested white ring (buildAnchorRings); this layers the
+	// see-through gold ring onto the nearest few that geometry hides. Rebuilt on
+	// travel (occlusion is per position).
 	private rebuildHotspots() {
 		this.hotspotGroup.clear();
 		if (this.currentIndex < 0) return;
 		const cur = this.panos[this.currentIndex];
-		let nVisible = 0;
 		let nOccluded = 0;
 		for (const i of this.neighborsByDistance()) {
-			const occluded = this.anchorOccluded(cur.position, this.panos[i].position);
-			if (occluded) {
-				if (nOccluded >= HOTSPOT_MAX_OCCLUDED) continue;
-				nOccluded++;
-			} else {
-				if (nVisible >= HOTSPOT_MAX_VISIBLE) continue;
-				nVisible++;
-			}
-			const spot = makeDisc(i, occluded ? 0xe0c271 : 0xffffff, occluded ? 0xe0c271 : 0x9ad4ff);
-			spot.userData.occluded = occluded;
-			spot.position.fromArray(this.panos[i].position);
-			spot.position.y -= HOTSPOT_FLOOR_DROP;
-			this.hotspotGroup.add(spot);
-			if (nVisible >= HOTSPOT_MAX_VISIBLE && nOccluded >= HOTSPOT_MAX_OCCLUDED) break;
+			if (!this.anchorOccluded(cur.position, this.panos[i].position))
+				continue;
+			const ring = new Mesh(this.anchorRingGeo, this.anchorRingOccludedMat);
+			ring.rotation.x = -Math.PI / 2;
+			ring.scale.setScalar(ANCHOR_RING_OCCLUDED_SCALE);
+			ring.position.fromArray(this.panos[i].position);
+			ring.position.y -= HOTSPOT_FLOOR_DROP;
+			ring.userData.targetIndex = i;
+			ring.userData.occluded = true;
+			this.hotspotGroup.add(ring);
+			if (++nOccluded >= HOTSPOT_MAX_OCCLUDED) break;
+		}
+	}
+
+	// One white ring per anchor, laid flat on the floor — built once per scene
+	// (every anchor, always present). Shares anchorRingGeo/anchorRingMat so it's
+	// depth-tested (geometry obstructs it) and world-fixed-size; never touched by
+	// tick()'s screen-scaling, so it shrinks far / grows near like a real object.
+	private buildAnchorRings() {
+		this.anchorRingGroup.clear();
+		for (let i = 0; i < this.panos.length; i++) {
+			const ring = new Mesh(this.anchorRingGeo, this.anchorRingMat);
+			ring.rotation.x = -Math.PI / 2;
+			ring.position.fromArray(this.panos[i].position);
+			ring.position.y -= HOTSPOT_FLOOR_DROP;
+			ring.userData.targetIndex = i;
+			ring.userData.occluded = false;
+			this.anchorRingGroup.add(ring);
 		}
 	}
 
@@ -960,7 +1325,10 @@ export class OrbitEngine {
 		const floorY = p.y - CAPTURE_EYE_HEIGHT;
 		this.you.sphere.position.copy(p);
 		this.you.ring.position.set(p.x, floorY, p.z);
-		this.you.line.geometry.setFromPoints([new Vector3(p.x, floorY, p.z), p.clone()]);
+		this.you.line.geometry.setFromPoints([
+			new Vector3(p.x, floorY, p.z),
+			p.clone(),
+		]);
 	}
 
 	// --- projection (view-dependent texture mapping, per frame) ---------------
@@ -977,7 +1345,9 @@ export class OrbitEngine {
 			const dz = cam.z - p[2];
 			this.camDist2[i] = dx * dx + dy * dy + dz * dz;
 		}
-		const order = this.panos.map((_, i) => i).sort((a, b) => this.camDist2[a] - this.camDist2[b]);
+		const order = this.panos
+			.map((_, i) => i)
+			.sort((a, b) => this.camDist2[a] - this.camDist2[b]);
 		const K = Math.min(PROJ_K, this.panos.length);
 		// Load on movement: kick off the K nearest captures, but project only the
 		// ones already loaded (blurred placeholder counts) so we never block.
@@ -997,7 +1367,9 @@ export class OrbitEngine {
 			if (k < ready.length) {
 				const idx = ready[k];
 				u.uTex.value[k] = this.panos[idx].texture;
-				(u.uCenter.value[k] as Vector3).fromArray(this.panos[idx].position);
+				(u.uCenter.value[k] as Vector3).fromArray(
+					this.panos[idx].position,
+				);
 				u.uWeight.value[k] = w[k] / wsum;
 			} else {
 				u.uTex.value[k] = DUMMY_TEX;
@@ -1005,7 +1377,9 @@ export class OrbitEngine {
 			}
 		}
 		u.uCount.value = ready.length;
-		this.sphereAMat.uniforms.map.value = ready.length ? this.panos[ready[0]].texture : DUMMY_TEX;
+		this.sphereAMat.uniforms.map.value = ready.length
+			? this.panos[ready[0]].texture
+			: DUMMY_TEX;
 		this.sphereA.position.copy(cam);
 	}
 
@@ -1041,10 +1415,17 @@ export class OrbitEngine {
 		if (box.isEmpty()) return;
 		const size = box.getSize(new Vector3());
 		const center = box.getCenter(new Vector3());
-		const base = new Mesh(new PlaneGeometry(size.x, size.z), this.projMaterial);
+		const base = new Mesh(
+			new PlaneGeometry(size.x, size.z),
+			this.projMaterial,
+		);
 		base.rotation.x = -Math.PI / 2; // lie flat, normal up
 		// A hair below the lowest vertex so it never z-fights a coincident floor.
-		base.position.set(center.x, box.min.y - Math.max(0.01, size.y * 0.002), center.z);
+		base.position.set(
+			center.x,
+			box.min.y - Math.max(0.01, size.y * 0.002),
+			center.z,
+		);
 		base.frustumCulled = false;
 		base.visible = false;
 		this.scene.add(base);
@@ -1066,11 +1447,19 @@ export class OrbitEngine {
 	private lookTargetFrom(pos: Vector3, lo: number, la: number): Vector3 {
 		return pos
 			.clone()
-			.add(new Vector3(Math.cos(la) * Math.cos(lo), Math.sin(la), Math.cos(la) * Math.sin(lo)));
+			.add(
+				new Vector3(
+					Math.cos(la) * Math.cos(lo),
+					Math.sin(la),
+					Math.cos(la) * Math.sin(lo),
+				),
+			);
 	}
 	private applyLook() {
 		this.lat = MathUtils.clamp(this.lat, -1.55, 1.55);
-		this.camera.lookAt(this.lookTargetFrom(this.camera.position, this.lon, this.lat));
+		this.camera.lookAt(
+			this.lookTargetFrom(this.camera.position, this.lon, this.lat),
+		);
 	}
 
 	// --- camera flight (mode changes: slerp orientation + lerp position) ------
@@ -1113,7 +1502,12 @@ export class OrbitEngine {
 	// --- travel between anchors (interior) ------------------------------------
 
 	private travelTo(index: number) {
-		if (this.interiorBusy || index === this.currentIndex || !this.panos[index]) return;
+		if (
+			this.interiorBusy ||
+			index === this.currentIndex ||
+			!this.panos[index]
+		)
+			return;
 		this.hoveredTargetIndex = -1;
 		this.interiorBusy = true;
 		this.hotspotGroup.visible = false;
@@ -1156,7 +1550,8 @@ export class OrbitEngine {
 					requestAnimationFrame(step);
 					return;
 				}
-				this.sphereAMat.uniforms.map.value = target.texture ?? DUMMY_TEX;
+				this.sphereAMat.uniforms.map.value =
+					target.texture ?? DUMMY_TEX;
 				this.sphereAMat.uniforms.opacity.value = 1;
 				this.sphereB.visible = false;
 				this.clearTravelMask();
@@ -1172,7 +1567,8 @@ export class OrbitEngine {
 		this.currentIndex = index;
 		this.requestPano(index);
 		if (!this.projectionMode) {
-			this.sphereAMat.uniforms.map.value = this.panos[index].texture ?? DUMMY_TEX;
+			this.sphereAMat.uniforms.map.value =
+				this.panos[index].texture ?? DUMMY_TEX;
 			this.sphereAMat.uniforms.opacity.value = 1;
 		}
 		this.rebuildHotspots();
@@ -1268,13 +1664,14 @@ export class OrbitEngine {
 			? this.camera.position.clone()
 			: v3(this.panos[this.currentIndex].position);
 	}
-	
+
 	enter(index: number | null = null) {
 		if (this.mode !== "overview" || this.panos.length === 0) return;
 		const idx = index ?? this.nearestPanoTo(this.controls.target);
 		this.requestPano(idx); // head start so the texture is ready by the fly-in's end
 		const p = this.panos[idx];
-		const fwd: [number, number, number] = p.forward && p.forward.length ? p.forward : [0, 0, 1];
+		const fwd: [number, number, number] =
+			p.forward && p.forward.length ? p.forward : [0, 0, 1];
 		const toPos = v3(p.position);
 		this.startFly(toPos, toPos.clone().add(v3(fwd)), 1100, {
 			onMid: () => {
@@ -1317,6 +1714,38 @@ export class OrbitEngine {
 		this.travelTo(index);
 	}
 
+	// WASD: step to the nearest anchor along a horizontal direction. "Nearest" is
+	// XZ-only (Y ignored); a |Δy| gate keeps the step on the current floor and a
+	// reach cap bounds how far one press travels. Only anchors inside a 45° cone of
+	// the direction qualify, so the four keys tile the plane into quadrants.
+	private stepToward(dirX: number, dirZ: number) {
+		if (
+			this.mode !== "interior" ||
+			this.interiorBusy ||
+			this.currentIndex < 0
+		)
+			return;
+		const cur = this.panos[this.currentIndex].position;
+		let best = -1;
+		let bestDist2 = Infinity;
+		for (let i = 0; i < this.panos.length; i++) {
+			if (i === this.currentIndex) continue;
+			const p = this.panos[i].position;
+			if (Math.abs(p[1] - cur[1]) > WASD_MAX_Y_STEP) continue;
+			const dx = p[0] - cur[0];
+			const dz = p[2] - cur[2];
+			const dist2 = dx * dx + dz * dz;
+			if (dist2 < 1e-6 || dist2 > WASD_MAX_STEP * WASD_MAX_STEP) continue;
+			if ((dx * dirX + dz * dirZ) / Math.sqrt(dist2) < WASD_DIR_COS)
+				continue;
+			if (dist2 < bestDist2) {
+				bestDist2 = dist2;
+				best = i;
+			}
+		}
+		if (best >= 0) this.travelTo(best);
+	}
+
 	private peekStart() {
 		if (this.mode !== "interior" || this.interiorBusy) return;
 		this.savedInterior = {
@@ -1332,7 +1761,9 @@ export class OrbitEngine {
 		flat.y = 0;
 		if (flat.lengthSq() < 1e-6) flat.set(0, 0, 1);
 		flat.normalize();
-		const toPos = this.sceneCenter.clone().addScaledVector(flat, this.sceneMaxDim * 1.5);
+		const toPos = this.sceneCenter
+			.clone()
+			.addScaledVector(flat, this.sceneMaxDim * 1.5);
 		toPos.y += this.sceneMaxDim * 0.6;
 		this.startFly(toPos, this.sceneCenter.clone(), 850, {
 			onMid: () => {
@@ -1351,21 +1782,26 @@ export class OrbitEngine {
 	private peekEnd() {
 		if (this.mode !== "peek" || !this.savedInterior) return;
 		const s = this.savedInterior;
-		this.startFly(s.pos.clone(), this.lookTargetFrom(s.pos, s.lon, s.lat), 800, {
-			onMid: () => {
-				this.setInteriorView();
-				this.camera.fov = s.fov;
-				this.camera.updateProjectionMatrix();
+		this.startFly(
+			s.pos.clone(),
+			this.lookTargetFrom(s.pos, s.lon, s.lat),
+			800,
+			{
+				onMid: () => {
+					this.setInteriorView();
+					this.camera.fov = s.fov;
+					this.camera.updateProjectionMatrix();
+				},
+				onEnd: () => {
+					this.mode = "interior";
+					this.lon = s.lon;
+					this.lat = s.lat;
+					this.currentIndex = s.index;
+					this.activate(s.index);
+					this.emit();
+				},
 			},
-			onEnd: () => {
-				this.mode = "interior";
-				this.lon = s.lon;
-				this.lat = s.lat;
-				this.currentIndex = s.index;
-				this.activate(s.index);
-				this.emit();
-			},
-		});
+		);
 	}
 
 	peekDown() {
@@ -1426,7 +1862,8 @@ export class OrbitEngine {
 		}
 		for (const p of this.panos) {
 			p.texture?.dispose();
-			if (p.placeholderTexture && p.placeholderTexture !== p.texture) p.placeholderTexture.dispose();
+			if (p.placeholderTexture && p.placeholderTexture !== p.texture)
+				p.placeholderTexture.dispose();
 		}
 		this.panos = [];
 		this.minimaps = [];
@@ -1437,6 +1874,7 @@ export class OrbitEngine {
 		this.currentIndex = -1;
 		this.hotspotGroup.clear();
 		this.entryGroup.clear();
+		this.anchorRingGroup.clear();
 		this.you.group.visible = false;
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
@@ -1482,15 +1920,22 @@ export class OrbitEngine {
 			// Bird's-eye slices: resolve their URLs and prefetch EVERY floor now
 			// (parallel with the GLB loads below), so paging floors on the minimap
 			// is instant instead of fetching each slice on first view.
-			const mmList = manifest && Array.isArray(manifest.minimaps) ? manifest.minimaps : [];
-			this.minimaps = mmList.map((m) => ({ ...m, url: source.resolveMinimap(m.file) }));
+			const mmList =
+				manifest && Array.isArray(manifest.minimaps)
+					? manifest.minimaps
+					: [];
+			this.minimaps = mmList.map((m) => ({
+				...m,
+				url: source.resolveMinimap(m.file),
+			}));
 			this.minimapPrefetch = this.minimaps.map((m) => {
 				const img = new Image();
 				img.src = m.url;
 				return img;
 			});
 
-			const list = manifest && Array.isArray(manifest.panos) ? manifest.panos : [];
+			const list =
+				manifest && Array.isArray(manifest.panos) ? manifest.panos : [];
 			// Panos load lazily (on enter / on movement); just resolve URLs now.
 			const entries: PanoEntry[] = list.map((p) => {
 				const { url, placeholderUrl } = source.resolvePano(p.file);
@@ -1510,7 +1955,9 @@ export class OrbitEngine {
 			let proxyRoot: Group | null = null;
 			if (manifest?.proxy) {
 				try {
-					proxyRoot = await loadGLB(source.resolveProxy(manifest.proxy));
+					proxyRoot = await loadGLB(
+						source.resolveProxy(manifest.proxy),
+					);
 				} catch {
 					proxyRoot = null;
 				}
@@ -1528,14 +1975,21 @@ export class OrbitEngine {
 		} catch (e) {
 			if (token !== this.loadToken || this.disposed) return;
 			this.mode = "empty";
-			this.showOverlay(`failed to load scene: ${e instanceof Error ? e.message : String(e)}`, {
-				spinner: false,
-				err: true,
-			});
+			this.showOverlay(
+				`failed to load scene: ${e instanceof Error ? e.message : String(e)}`,
+				{
+					spinner: false,
+					err: true,
+				},
+			);
 		}
 	}
 
-	private applyScene(entries: PanoEntry[], proxyRoot: Group | null, lite: Group | null) {
+	private applyScene(
+		entries: PanoEntry[],
+		proxyRoot: Group | null,
+		lite: Group | null,
+	) {
 		this.panos = entries;
 		this.panoLevel = entries.map((p) => this.levelForY(p.position[1]));
 		this.projectionMode = !!proxyRoot;
@@ -1543,7 +1997,10 @@ export class OrbitEngine {
 
 		if (!lite && !proxyRoot) {
 			this.mode = "empty";
-			this.showOverlay("nothing to show for this scene", { spinner: false, err: true });
+			this.showOverlay("nothing to show for this scene", {
+				spinner: false,
+				err: true,
+			});
 			return;
 		}
 
@@ -1577,10 +2034,13 @@ export class OrbitEngine {
 
 		this.sizeYouMarker();
 		this.buildEntryMarkers();
+		this.buildAnchorRings();
 		this.rebuildHotspots();
 
 		const dist = this.sceneMaxDim * 1.6;
-		this.browsePos.copy(this.sceneCenter).add(new Vector3(dist * 0.7, dist * 0.5, dist * 0.9));
+		this.browsePos
+			.copy(this.sceneCenter)
+			.add(new Vector3(dist * 0.7, dist * 0.5, dist * 0.9));
 		this.camera.position.copy(this.browsePos);
 		this.camera.fov = 55;
 		this.camera.lookAt(this.sceneCenter);
@@ -1599,7 +2059,9 @@ export class OrbitEngine {
 
 	private tick = (time: number) => {
 		const now = performance.now();
-		const dt = this.lastFrame ? Math.min(0.05, (time - this.lastFrame) / 1000) : 0;
+		const dt = this.lastFrame
+			? Math.min(0.05, (time - this.lastFrame) / 1000)
+			: 0;
 		this.lastFrame = time;
 
 		if (this.transition) {
@@ -1614,7 +2076,12 @@ export class OrbitEngine {
 				tr.midDone = true;
 				tr.onMid?.();
 			}
-			if (this.proxyGroup?.visible && this.projectionMode && !this.proxyView) this.updateProjection();
+			if (
+				this.proxyGroup?.visible &&
+				this.projectionMode &&
+				!this.proxyView
+			)
+				this.updateProjection();
 			if (t >= 1) {
 				this.clearTravelMask();
 				const cb = tr.onEnd;
@@ -1627,7 +2094,11 @@ export class OrbitEngine {
 			if (this.glide) {
 				const g = this.glide;
 				const t = Math.min(1, (now - g.start) / g.dur);
-				this.camera.position.lerpVectors(g.fromPos, g.toPos, easeInOut(t));
+				this.camera.position.lerpVectors(
+					g.fromPos,
+					g.toPos,
+					easeInOut(t),
+				);
 				this.setTravelMask(t);
 				if (t >= 1) {
 					this.clearTravelMask();
@@ -1655,33 +2126,29 @@ export class OrbitEngine {
 			this.camera.lookAt(this.sceneCenter);
 		}
 
-		// Constant on-screen sizing + pulse for whichever marker group is showing.
-		const pulse = 1 + 0.07 * Math.sin(time * 0.004);
-		for (const group of [this.hotspotGroup, this.entryGroup]) {
-			if (!group.visible) continue;
-			const targetPx = group === this.entryGroup ? ENTRY_TARGET_PX : HOTSPOT_TARGET_PX;
-			const hoverIdx = group === this.entryGroup ? this.hoveredEntryIndex : this.hoveredTargetIndex;
-			for (const spot of group.children) {
-				const occluded = !!spot.userData.occluded;
-				const hovered = spot.userData.targetIndex === hoverIdx;
+		this.updateCursorRing();
+
+		// Overview entry discs render at a constant on-screen size + pulse; the
+		// interior anchor rings (white + gold) are world-fixed, so they're left be.
+		if (this.entryGroup.visible) {
+			const pulse = 1 + 0.07 * Math.sin(time * 0.004);
+			for (const spot of this.entryGroup.children) {
+				const hovered =
+					spot.userData.targetIndex === this.hoveredEntryIndex;
 				const d = this.camera.position.distanceTo(spot.position);
 				spot.scale.setScalar(
-					hotspotScaleForDistance(d, targetPx, this.camera.fov, this.host.clientHeight) *
-						(hovered ? 1.35 : 1) *
-						(occluded ? 0.82 : 1),
+					hotspotScaleForDistance(
+						d,
+						ENTRY_TARGET_PX,
+						this.camera.fov,
+						this.host.clientHeight,
+					) * (hovered ? 1.35 : 1),
 				);
 				const disc = spot.children[0] as Mesh;
 				const ring = spot.children[1] as Mesh;
 				ring.scale.setScalar(pulse);
-				const discMat = disc.material as MeshBasicMaterial;
-				const ringMat = ring.material as MeshBasicMaterial;
-				if (occluded) {
-					discMat.opacity = hovered ? 0.5 : 0.22;
-					ringMat.opacity = hovered ? 0.8 : 0.45;
-				} else {
-					discMat.opacity = hovered ? 0.9 : 0.55;
-					ringMat.opacity = hovered ? 1.0 : 0.85;
-				}
+				(disc.material as MeshBasicMaterial).opacity = hovered ? 0.9 : 0.55;
+				(ring.material as MeshBasicMaterial).opacity = hovered ? 1.0 : 0.85;
 			}
 		}
 

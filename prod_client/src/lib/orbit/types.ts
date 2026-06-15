@@ -31,6 +31,7 @@ export type TourManifest = {
 		position: [number, number, number];
 		forward?: [number, number, number];
 		file: string;
+		name?: string; // POI label from the anchor namer; absent for unnamed anchors
 	}>;
 	proxy?: string;
 	minimaps?: MinimapLevel[];
@@ -62,7 +63,7 @@ export type OrbitState = {
 	panoCount: number;
 	currentId: string | null;
 	currentIndex: number;
-	hover: { id: string; occluded: boolean } | null;
+	hover: { id: string; name?: string; occluded: boolean } | null;
 	objectHover: string | null; // label of the object under the cursor (overview)
 	proxyView: boolean; // overview shows the low-poly proxy instead of the lite dollhouse
 	canProxyView: boolean; // the proxy/lite swap is available (overview + both loaded)
