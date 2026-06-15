@@ -127,6 +127,28 @@ class BoundingBox(BaseModel):
             dimensions=self.dimensions,
         )
 
+    def canonical(self) -> BoundingBox:
+        """Same AABB re-expressed with `origin` at the minimum corner and
+        all-non-negative `dimensions`.
+
+        Signed dimensions let the identical box be written from any of its 8
+        corners, so a node's stated `origin` can land on a corner other than
+        its true minimum. The bbox-resolution local frame is defined as
+        "origin (0,0,0) = the parent's minimum corner", so a parent whose
+        authored origin is NOT its min corner makes that frame self-
+        contradictory — children get placed against the wrong corner and fall
+        outside. Canonicalizing every model-emitted box removes that ambiguity;
+        it is lossless (same point set) and facing is carried separately by
+        `orientation` (yaw), so collapsing the sign here drops no information."""
+        return BoundingBox(
+            origin=_round_vec(self.min_corner),
+            dimensions=(
+                abs(self.dimensions[0]),
+                abs(self.dimensions[1]),
+                abs(self.dimensions[2]),
+            ),
+        )
+
 
 class ProxyShape(StrEnum):
     """Optional collision-proxy primitive describing the mesh's silhouette

@@ -10,7 +10,7 @@ the spec graph here. We do NOT check that the chosen parent is the
 
 from __future__ import annotations
 
-from app.core.prompts import ChildNodeSpec
+from app.core.schemas import ChildNodeSpec, SubregionSpec
 
 
 def validate_parents(
@@ -114,5 +114,45 @@ def validate_referenced_ids(
             if rel.target not in known:
                 raise ValueError(
                     f"spec {s.id!r} has a relationship with unknown "
+                    f"target {rel.target!r}"
+                )
+
+
+def validate_subregions(
+    specs: list[SubregionSpec],
+    *,
+    parent_id: str,
+    existing_ids: set[str],
+) -> None:
+    """Raise ValueError if a batch of subregion specs is malformed.
+
+    Subregions carry no structural `parent` — they are always contained in the
+    zone being decomposed (`parent_id`), so there is no orphan / parent-chain
+    failure mode to guard (the whole reason `validate_parents` is a hard gate).
+    What remains is purely advisory, mirroring the non-parent checks of
+    `validate_referenced_ids`:
+      1. ids unique within `specs` and disjoint from `existing_ids`.
+      2. every `relationships[i].target` resolves to the zone, another spec,
+         or an existing node, and is not the spec itself.
+    """
+    spec_ids = [s.id for s in specs]
+    if len(spec_ids) != len(set(spec_ids)):
+        raise ValueError(f"duplicate ids among subregions: {spec_ids}")
+    collisions = set(spec_ids) & existing_ids
+    if collisions:
+        raise ValueError(
+            f"subregion ids collide with existing nodes: {sorted(collisions)}"
+        )
+
+    known = {parent_id} | existing_ids | set(spec_ids)
+    for s in specs:
+        for rel in s.referenced_ids:
+            if rel.target == s.id:
+                raise ValueError(
+                    f"subregion {s.id!r} has a relationship targeting itself"
+                )
+            if rel.target not in known:
+                raise ValueError(
+                    f"subregion {s.id!r} has a relationship with unknown "
                     f"target {rel.target!r}"
                 )

@@ -42,7 +42,7 @@ from runware import (
     Runware,
 )
 
-from app.core.prompts import wrap_image_prompt
+from app.core.scene_context import wrap_image_prompt
 from app.core.types import ProxyShape
 
 load_dotenv()

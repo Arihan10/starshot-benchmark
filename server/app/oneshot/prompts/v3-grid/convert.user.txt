@@ -1,0 +1,9 @@
+generate the list of objects present in `{SCENE_PROMPT}`, given the following floorplan for it:
+
+`{GRID_PLAN}`
+
+where every number is a cell that represents the object present in one foot of the scene. a cell with '0' represents empty space on the floor.
+
+output a CSV-style list where each line represents an object in the scene. on each line, write down the object's name, a tuple of 3 numbers representing its bounding box's minimum corner, a tuple of 3 positive numbers representing the bounding boxes dimensions, and 
+
+chair,

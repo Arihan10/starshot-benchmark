@@ -46,6 +46,47 @@ def _quat_y(deg: float) -> list[float]:
     return [0.0, math.sin(half), 0.0, math.cos(half)]
 
 
+def quat_x(deg: float) -> list[float]:
+    """glTF quaternion [x, y, z, w] for a rotation about +X. `quat_x(-90)` maps
+    the asset's +Z to +Y — the fixed reorientation v5 bakes so upright assets
+    stand along the side-view's vertical (world z) instead of lying flat."""
+    half = math.radians(deg) / 2.0
+    return [math.sin(half), 0.0, 0.0, math.cos(half)]
+
+
+def _rotate_vec(q: list[float], v: tuple[float, float, float]) -> list[float]:
+    """Rotate a 3-vector by glTF quaternion q = [x, y, z, w]."""
+    x, y, z, w = q
+    vx, vy, vz = v
+    tx = 2.0 * (y * vz - z * vy)
+    ty = 2.0 * (z * vx - x * vz)
+    tz = 2.0 * (x * vy - y * vx)
+    return [
+        vx + w * tx + (y * tz - z * ty),
+        vy + w * ty + (z * tx - x * tz),
+        vz + w * tz + (x * ty - y * tx),
+    ]
+
+
+def rotate_aabb(
+    rmin: list[float], rmax: list[float], quat: list[float]
+) -> tuple[list[float], list[float]]:
+    """The axis-aligned bounds of the box [rmin, rmax] after rotation by `quat`.
+    Exact for the 90° rotations v5 uses (they permute axes), so the fill scale
+    in place_glb stays correct when an extra `model_rotation` is baked in."""
+    corners = [
+        (rmin[0] if i & 1 else rmax[0],
+         rmin[1] if i & 2 else rmax[1],
+         rmin[2] if i & 4 else rmax[2])
+        for i in range(8)
+    ]
+    rotated = [_rotate_vec(quat, c) for c in corners]
+    return (
+        [min(p[a] for p in rotated) for a in range(3)],
+        [max(p[a] for p in rotated) for a in range(3)],
+    )
+
+
 def _parse_glb(data: bytes) -> tuple[dict, bytes | None]:
     """Split a GLB into (json_dict, bin_chunk_data). bin is None if absent."""
     magic, _version, length = struct.unpack_from("<III", data, 0)
@@ -90,12 +131,18 @@ def place_glb(
     orientation: int,
     rotated_min: list[float],
     rotated_max: list[float],
+    model_rotation: list[float] | None = None,
 ) -> None:
     """Bake `bbox` + `orientation` placement into `src` → `dst`.
 
-    `rotated_min`/`rotated_max` are the asset's world-space AABB *after* the
-    yaw rotation (precomputed in optimize_manifest.json), which is what the
-    per-axis fill scale needs.
+    `rotated_min`/`rotated_max` are the asset's world-space AABB *after* every
+    baked rotation (the yaw from optimize_manifest.json and, when given,
+    `model_rotation`), which is what the per-axis fill scale needs — pass
+    bounds already run through `rotate_aabb(..., model_rotation)`.
+
+    `model_rotation` is an optional fixed glTF quaternion applied INNERMOST
+    (in asset-local space, before yaw): v5 bakes `quat_x(-90)` so library
+    assets stand upright along the side-view's vertical axis.
     """
     target_extents = bbox.size
     target_center = bbox.center
@@ -115,9 +162,18 @@ def place_glb(
     scene = gltf.get("scenes", [{}])[gltf.get("scene", 0)]
     old_roots = list(scene.get("nodes", []))
 
+    # Optional fixed reorientation, applied innermost (asset-local, before yaw).
+    yaw_children = old_roots
+    if model_rotation is not None:
+        model_node: dict = {"rotation": model_rotation}
+        if old_roots:
+            model_node["children"] = old_roots
+        nodes.append(model_node)
+        yaw_children = [len(nodes) - 1]
+
     inner: dict = {"rotation": _quat_y(orientation)}
-    if old_roots:
-        inner["children"] = old_roots
+    if yaw_children:
+        inner["children"] = yaw_children
     nodes.append(inner)
     inner_idx = len(nodes) - 1
 

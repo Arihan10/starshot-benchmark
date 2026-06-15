@@ -44,13 +44,37 @@ def set_model(model: str) -> None:
     _current_model.set(model)
 
 
+# Model-specific runtime injections — quirks of particular providers, NOT
+# prompt content, so they never appear in templates. Applied to the user
+# message at the call boundary, BEFORE cache hashing and logging, so the
+# cache key and the logged ground-truth bytes both reflect exactly what was
+# sent. (Appending at the end matches where the old template token rendered,
+# keeping cache keys byte-identical across the cutover.)
+DEEPSEEK_INJECTION = """
+<IMPORTANT_THINKING>
+Be very opinionated in your thinking - do not go around in circles. Once a conclusion is reached, stick to it. Aim to end reasoning as soon as a concrete plan has been formed.
+</IMPORTANT_THINKING>
+"""
+
+
+def apply_model_quirks(user: str, model: str) -> str:
+    """The user message as it must actually leave for `model` — DeepSeek's
+    reasoning tends to spiral, so it gets the opinionated-thinking pin.
+    Idempotent: prompts rendered from pre-cutover snapshots/events may carry
+    the injection already (it used to be a template variable)."""
+    if model and "deepseek" in model.lower():
+        if DEEPSEEK_INJECTION.strip() not in user:
+            return user + DEEPSEEK_INJECTION
+    return user
+
+
 # Optional per-task breakpoint. When set, `call_llm` awaits it right before
-# issuing a REAL (cache-miss) call, handing over the rendered call context and
-# receiving back the (possibly hand-edited) `(system, user)` to actually send.
-# The prompt-tuning branch binds one in its task so it can PAUSE at every
-# downstream step for editing; every other task leaves it None (the default),
-# so the normal pipeline never blocks.
-StepGate = Callable[..., Awaitable[tuple[str, str]]]
+# issuing a REAL (cache-miss) call. Downstream-simulation branch tasks bind
+# one so the user advances them one step at a time; every other task leaves
+# it None (the default), so the normal pipeline never blocks. Replayed
+# prefix steps and seeded results cache-hit BEFORE the gate, so only the
+# genuinely-new frontier pauses.
+StepGate = Callable[..., Awaitable[None]]
 _step_gate: ContextVar[StepGate | None] = ContextVar("_step_gate", default=None)
 
 
@@ -95,11 +119,21 @@ async def call_llm(
     output_schema: type[T],
     node_id: str | None = None,
     step: str | None = None,
+    template: str | None = None,
+    variables: dict[str, str] | None = None,
     validate: Callable[[T], None] | None = None,
 ) -> T:
+    """`system`/`user` are the EXACT bytes sent to the provider; they are
+    logged verbatim so the event log stays ground truth for what the model
+    saw. `template` is the prompt-template name that produced them (root and
+    nested variants of a step differ here, while `step` stays the event-log
+    step id) and `variables` the resolved values that were substituted —
+    logged so the prompt lab can re-render a historical call against an
+    edited template."""
     model = _current_model.get()
     if model is None:
         raise RuntimeError("llm.set_model() must be called before call_llm()")
+    user = apply_model_quirks(user, model)
     schema_name = output_schema.__name__
     key = cache.hash_llm_call(
         model=model,
@@ -118,23 +152,19 @@ async def call_llm(
             validate(cached)
         return cached
 
-    # Breakpoint: a bound step gate (the prompt-tuning branch) pauses here —
-    # AFTER the cache check, so committed/cached steps replay untouched and only
-    # genuinely-new frontier steps stop — to let the user edit this step's
-    # re-rendered prompt before it runs. The (possibly edited) prompt then
-    # drives the call and is what gets cached/logged.
+    # Step gate: a bound gate (downstream-simulation branches) pauses here —
+    # AFTER the cache check, so committed/cached/seeded steps replay untouched
+    # and only genuinely-new frontier steps stop for the user's go-ahead.
     gate = _step_gate.get()
     if gate is not None:
-        system, user = await gate(
+        await gate(
             node_id=node_id,
             step=step,
+            template=template,
             system=system,
             user=user,
             schema_name=schema_name,
             model=model,
-        )
-        key = cache.hash_llm_call(
-            model=model, system=system, user=user, schema_name=schema_name,
         )
 
     validated, reasoning, usage, raw = await call_llm_once(
@@ -145,20 +175,22 @@ async def call_llm(
         validate=validate,
         step=step,
     )
-    # cache.llm carries everything needed for both the LLM-call cache
-    # (key + output) and the observability view (node + step + model
-    # + system + user + reasoning). Older log lines that lacked the
-    # new fields still replay correctly — the client treats them as
-    # unattributed.
+    # cache.llm carries everything needed for the LLM-call cache (key +
+    # output), the observability view (node + step + model + system + user +
+    # reasoning), and the prompt lab (template + variables). Older log lines
+    # that lack the newer fields still replay correctly — the client treats
+    # them as unattributed / not re-renderable.
     logging.log(
         "cache.llm",
         key=key,
         node=node_id,
         step=step,
+        template=template,
         model=model,
         schema=schema_name,
         system=system,
         user=user,
+        variables=variables,
         output=raw,
         reasoning=reasoning,
         tokens_in=getattr(usage, "prompt_tokens", None),

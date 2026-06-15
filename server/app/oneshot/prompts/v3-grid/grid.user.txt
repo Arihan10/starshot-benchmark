@@ -1,0 +1,31 @@
+generate the top-down floorplan of a `{SCENE_PROMPT}`. 
+
+start by outputting a full list of the objects you will include in the scene. this list should be structured in the following manner:
+1. 'object name'
+2. 'object name'
+...and so on, enumerated to contain every object in the scene. the order of the objects does not matter.
+
+then, output a 16x16 canvas representation of the floorplan that looks like the following:
+
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]
+
+where every number is a cell that represents the object present in one unit of the scene. a cell with '0' represents empty space on the floor; any non-zero number represents an object on the floor defined with the corresponding number.
+
+make sure the layout of the scene and the spatial placement of all the objects within it makes sense. be very careful with object placement. 
+
+output ONLY the floorplan and nothing else.

@@ -1,0 +1,325 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="server-url" content="http://127.0.0.1:8765" />
+        <title>starshot · one-shot bench</title>
+        <style>
+            * { box-sizing: border-box; }
+            html, body {
+                margin: 0;
+                height: 100%;
+                background: #101114;
+                color: #e6e6e6;
+                font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+                overflow: hidden;
+            }
+            body { display: flex; flex-direction: column; }
+            /* One shared WebGL canvas behind everything; each tile's viewport
+               is scissor-rendered onto it. */
+            #canvas-host { position: fixed; inset: 0; z-index: 0; }
+            #canvas-host canvas { display: block; }
+
+            #topbar {
+                position: relative;
+                z-index: 20;
+                display: flex;
+                flex-direction: column;
+                gap: 6px;
+                padding: 8px 10px;
+                background: linear-gradient(rgba(12, 13, 16, 0.96), rgba(12, 13, 16, 0.88));
+                border-bottom: 1px solid #1d2027;
+                flex: none;
+            }
+            .bar { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+            .bar-label {
+                color: #7a808c;
+                text-transform: uppercase;
+                font-size: 10px;
+                letter-spacing: 0.05em;
+                margin-right: 2px;
+            }
+            #page-title { color: #9ad4ff; font-weight: 600; }
+            #page-sub { color: #7a808c; font-size: 11px; }
+            #back-link {
+                margin-left: auto;
+                color: #8a8f99;
+                text-decoration: none;
+                font-size: 11px;
+                border: 1px solid #2a2d35;
+                border-radius: 4px;
+                padding: 3px 8px;
+                background: #16181d;
+            }
+            #back-link:hover { border-color: #4a8fd8; color: #c8d8f0; }
+
+            .slot-tab {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px 9px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            .slot-tab:hover { border-color: #4a8fd8; }
+            .slot-tab.active { background: #2a4a78; border-color: #4a8fd8; color: #e6e6e6; }
+            .slot-dot {
+                width: 8px; height: 8px; border-radius: 50%;
+                flex-shrink: 0; background: #5a5e68;
+            }
+            .slot-dot.status-running { background: #e0c271; }
+            .slot-dot.status-done    { background: #8bd17c; }
+            .slot-dot.status-error   { background: #ff8080; }
+            .slot-dot.status-paused  { background: #e09050; }
+            .slot-dot.status-idle    { background: #5a5e68; }
+
+            select, .btn {
+                background: #16181d;
+                border: 1px solid #2a2d35;
+                border-radius: 4px;
+                color: #b8bcc4;
+                font: inherit;
+                font-size: 11px;
+                padding: 4px 9px;
+                cursor: pointer;
+            }
+            select:focus { outline: none; border-color: #4a8fd8; }
+            .btn:hover:not(:disabled) { border-color: #4a8fd8; color: #c8d8f0; }
+            .btn:disabled { opacity: 0.45; cursor: default; }
+            .btn.off { opacity: 0.55; }
+            .ctrl-sep { width: 1px; align-self: stretch; background: #23262e; margin: 0 4px; }
+
+            .model-check {
+                display: flex;
+                align-items: center;
+                gap: 6px;
+                padding: 4px 9px;
+                border-radius: 4px;
+                border: 1px solid #2a2d35;
+                background: #16181d;
+                color: #d2d6de;
+                font-size: 11px;
+                cursor: pointer;
+                user-select: none;
+                white-space: nowrap;
+            }
+            .model-check:hover { border-color: #4a8fd8; }
+            .model-check input { accent-color: #4a8fd8; margin: 0; }
+            #launch {
+                padding: 4px 14px;
+                border-radius: 4px;
+                border: 1px solid #3f7a52;
+                background: #1d2c22;
+                color: #c9f0d6;
+                font: inherit;
+                font-size: 11px;
+                cursor: pointer;
+            }
+            #launch:hover:not(:disabled) { background: #244e34; border-color: #4faf6e; }
+            #launch:disabled { opacity: 0.45; cursor: default; }
+
+            #tiles {
+                position: relative;
+                z-index: 5;
+                flex: 1;
+                min-height: 0;
+                display: grid;
+                gap: 8px;
+                padding: 8px;
+            }
+            .tile {
+                position: relative;
+                display: flex;
+                flex-direction: column;
+                min-height: 0;
+                min-width: 0;
+                border: 1px solid #23262e;
+                border-radius: 6px;
+                overflow: hidden;
+                background: transparent;
+            }
+            .tile.err { border-color: #6a3030; }
+            .tile-head {
+                position: relative;
+                z-index: 2;
+                display: flex;
+                align-items: center;
+                gap: 7px;
+                padding: 4px 8px;
+                background: rgba(22, 24, 29, 0.94);
+                border-bottom: 1px solid #23262e;
+                font-size: 11px;
+                flex: none;
+            }
+            .tile-head .alias { font-weight: 600; color: #e6e6e6; }
+            .tile-head .meta {
+                color: #7a808c;
+                margin-right: auto;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+            }
+            .tile-btn {
+                background: #0c0d10;
+                border: 1px solid #2a2d35;
+                border-radius: 3px;
+                color: #8a8f99;
+                font: inherit;
+                font-size: 10px;
+                padding: 2px 7px;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            .tile-btn:hover:not(:disabled) { border-color: #4a8fd8; color: #c8d8f0; }
+            .tile-btn:disabled { opacity: 0.45; cursor: default; }
+            .tile-btn.paused { border-color: #7a5a2e; color: #e0c271; }
+            .tile-btn.error { border-color: #7a3a3a; color: #ff9d9d; }
+            .tile-btn.running { border-color: #2a4a78; color: #9ad4ff; }
+            .tile-btn.danger { color: #d99; }
+            .tile-btn.active { border-color: #4a8fd8; color: #c8d8f0; background: #1c2a36; }
+            .tile-body { display: flex; flex: 1; min-height: 0; }
+            .tile-viewport {
+                flex: 1;
+                min-width: 0;
+                min-height: 0;
+                touch-action: none;
+            }
+            /* v3 floor-plan companion: shown only once a grid plan event lands. */
+            .tile-plan {
+                display: none;
+                flex: none;
+                width: clamp(120px, 34%, 176px);
+                flex-direction: column;
+                gap: 6px;
+                padding: 6px 8px;
+                border-left: 1px solid #23262e;
+                background: rgba(12, 13, 16, 0.6);
+                position: relative;
+                z-index: 2;
+                overflow: hidden;
+            }
+            .tile-plan.on { display: flex; }
+            .tile-plan canvas {
+                flex: none;
+                width: 100%;
+                height: auto;
+                border: 1px solid #23262e;
+                border-radius: 3px;
+            }
+            .plan-note { color: #7a808c; font-size: 10px; white-space: nowrap; }
+            .plan-legend {
+                flex: 1;
+                min-height: 0;
+                overflow-y: auto;
+                font-size: 10px;
+                line-height: 1.55;
+            }
+            .plan-legend .pl-row {
+                display: flex;
+                align-items: center;
+                gap: 5px;
+                white-space: nowrap;
+                color: #b8bcc4;
+            }
+            .plan-legend .pl-row .pl-name { overflow: hidden; text-overflow: ellipsis; }
+            .pl-swatch { width: 8px; height: 8px; border-radius: 2px; flex: none; }
+            .tile-overlay {
+                position: absolute;
+                top: 27px;
+                left: 0;
+                right: 0;
+                bottom: 0;
+                z-index: 3;
+                display: none;
+                overflow-y: auto;
+                padding: 8px 10px;
+                background: rgba(12, 13, 16, 0.94);
+                color: #a8adb8;
+                font-size: 11px;
+                white-space: pre-wrap;
+            }
+            .tile-overlay.open { display: block; }
+            .tile-overlay .ov-err { color: #ff9d9d; margin-bottom: 8px; }
+            .tile-overlay .ov-warn { color: #e0c271; margin-bottom: 8px; white-space: pre-wrap; }
+            .tile-overlay .ov-meta { color: #7a808c; margin-bottom: 8px; }
+            .tile-overlay .ov-step { color: #e0c271; font-weight: 600; margin: 10px 0 4px; }
+            .tile-overlay .ov-step:first-child { margin-top: 0; }
+            .tile-overlay details { margin: 0 0 4px; }
+            .tile-overlay summary { cursor: pointer; color: #8fb8e8; user-select: none; }
+            .tile-overlay summary:hover { color: #c8d8f0; }
+            .tile-overlay .ov-body { color: #a8adb8; padding: 4px 0 2px 13px; }
+            #tiles-empty {
+                color: #7a808c;
+                align-self: center;
+                justify-self: center;
+                text-align: center;
+                line-height: 1.8;
+            }
+
+            #status {
+                position: fixed;
+                left: 10px;
+                bottom: 10px;
+                max-width: 56vw;
+                padding: 6px 10px;
+                background: rgba(16, 17, 20, 0.88);
+                border: 1px solid #1d2027;
+                border-radius: 5px;
+                color: #b8bcc4;
+                font-size: 11px;
+                z-index: 30;
+                white-space: pre-wrap;
+            }
+            #status.err { color: #ff9d9d; border-color: #5a2a2a; }
+            #status.warn { color: #e0c271; }
+        </style>
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "/vendor/three/build/three.module.js",
+                    "three/addons/": "/vendor/three/examples/jsm/"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <div id="canvas-host"></div>
+        <div id="topbar">
+            <div class="bar">
+                <span id="page-title">one-shot bench</span>
+                <span id="page-sub">single LLM call → whole scene · all models side by side · prompts: server/app/oneshot/prompts/&lt;version&gt;/*.txt</span>
+                <a id="back-link" href="/">← pipeline dashboard</a>
+            </div>
+            <div class="bar">
+                <span class="bar-label">run</span>
+                <select id="run-picker" title="Named one-shot runs (oneshot-runs/<run>/). Each keeps its own slot × model matrix and pins a pipeline version — create one run per version (or per prompt edit) and compare."></select>
+                <select id="run-version" title="Pipeline version pinned by the NEXT new run: v1-bbox = original world-bbox schema · v2-spatial = name/position/dimensions/orientation · v3-room = interior design as top-view center + (width, length, height) boxes inside a harness room shell (canvas scales with the slot) · v4-grid-only = name-celled 16×16 floor plan, then a conversion call to the same center+size boxes · v5-sidescroller = 32×8 side-view level plan (2 ft cells, 64×16 ft), then a deterministic solver builds the level on a harness background wall — unit items (bricks/blocks/coins) one object per cell, structures (pipes/ground/platforms) merged per straight run."></select>
+                <button id="run-new" class="btn" title="Create a new named run — a fresh cell matrix pinned to the selected version, using that version's current prompt files.">+ new run</button>
+            </div>
+            <div class="bar" id="slot-bar">
+                <span class="bar-label">slots</span>
+            </div>
+            <div class="bar" id="model-bar">
+                <span class="bar-label">models</span>
+                <!-- checkboxes injected here -->
+                <button id="launch" title="Launch the current scene on every checked model in parallel (fresh run per cell — cells with data are reset).">launch scene</button>
+                <div class="ctrl-sep"></div>
+                <span class="bar-label">view</span>
+                <button id="bbox-toggle" class="btn">bboxes: on</button>
+                <button id="mesh-toggle" class="btn">meshes: on</button>
+                <button id="solid-toggle" class="btn" title="Render each object as a solid filled box matching its bounding box">solids: off</button>
+                <button id="fit" class="btn" title="Re-frame every tile's camera on its scene">fit all</button>
+            </div>
+        </div>
+        <div id="tiles"></div>
+        <div id="status">ready</div>
+        <script type="module" src="/oneshot/oneshot.js"></script>
+    </body>
+</html>

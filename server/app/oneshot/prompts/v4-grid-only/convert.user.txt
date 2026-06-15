@@ -1,0 +1,15 @@
+given a very rough representation of the floor plan for a `{CANVAS_FT}` ft by `{CANVAS_FT}` ft `{SCENE_PROMPT}` centered at (0, 0), design the list of objects present in the scene along with their precise positions and sizes.
+
+the following is the very rough top-view floor plan for the scene, centered around the origin (0,0):
+
+`{GRID_PLAN}`
+
+use this as a reference for roughly where the objects in the scene should be placed and how the objects in the scene are laid out relative to each other. with the floor plan as a semantic guide, determine the exact position and size of each object in the scene. be very careful and detailed with the placement of each object, and make sure each object's position and size makes sense with respect to the other objects in the scene. make sure the spatial layout of the scene as a whole is coherent.
+
+output a CSV-style list (ignoring the header row) of objects with each row representing an object in the scene. each row contains the object's name, its base's center's precise (x, y) coordinates given a a tuple, and its size in feet given as a tuple of positive integers (width, length, height). for example:
+
+chair, position: (5, 2), size: (2,2,4)
+table, position: (7, 3), dimensions: (8,7,4)
+
+output only the CSV-style list and nothing else.
+

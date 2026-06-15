@@ -1,0 +1,29 @@
+generate the top-down floorplan of a `{SCENE_PROMPT}`. 
+
+output a 16 by 16 matrix representation of the floorplan, covering the full `{CANVAS_FT}` ft by `{CANVAS_FT}` ft scene (each cell spans `{CELL_FT}` ft), that looks like the following:
+
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+
+where every number is a cell that represents the object present in `{CELL_FT}` ft of the scene. a cell with '0' represents empty space on the floor; any part of the floor with an object on it should contain the name of the object. keep in mind that objects can span multiple cells, e.g:
+
+...0,side desk,table,table,table,0...
+...0,0,0,chair,0,0...
+
+make sure the layout of the scene and the spatial placement of all the objects within it makes sense. be very careful with object placement and size. 
+
+output ONLY the floorplan and nothing else. make sure each row in the floorplan canvas has exactly 16 entries, and only include tangible, visible objects with hard surfaces.

@@ -21,9 +21,11 @@ retry) -> spawn background Trellis 2 jobs that fan out via SSE events as
 each mesh lands.
 
 The anchor-loop's "are more objects needed?" step uses the same
-relationship validator on the emitted specs. V3/V4 let that step propose
-a LIST of objects per round (`batch_next_object`); V2 proposes one at a
-time. Bounding-box resolution is batch in every version.
+relationship validator on the emitted specs and proposes a LIST of
+objects per round. Bounding-box resolution is a single batch call.
+
+Prompt text comes from the run's prompt snapshot (`prompt_store.current()`);
+this module only decides which step fires when and with which scene state.
 """
 
 from __future__ import annotations
@@ -36,7 +38,7 @@ from typing import Any, Literal
 
 import trimesh
 
-from app.core import prompt_runtime
+from app.core import prompt_store, scene_context, schemas
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
 from app.services import llm, nano_banana, threed
@@ -59,6 +61,22 @@ def _artifact_url(runs_dir: Path, path: Path) -> str:
 
 RELATIONSHIP_RETRY_ATTEMPTS = 3
 
+# scenario -> (template/event step name, {SCENE_CONTEXT} target marker text)
+_DECOMP_STEPS: dict[str, tuple[str, str]] = {
+    "anchor": (
+        "anchor_decompose",
+        "This is the subregion you are to generate a list of anchor objects for.",
+    ),
+    "encapsulating": (
+        "encapsulating_decompose",
+        "This is the region you are to decide whether a boundary is needed for, and if so, what objects form that boundary",
+    ),
+    "negative-space": (
+        "negative_space_decompose",
+        "This is the region whose interstitial negative space you are filling.",
+    ),
+}
+
 
 async def _decompose_objects_validated(
     *,
@@ -75,41 +93,25 @@ async def _decompose_objects_validated(
     prior_attempts: list[tuple[list[Any], str]] = []
     existing_ids = {n.id for n in all_nodes}
     specs: list[Any] = []
+    step, target_text = _DECOMP_STEPS[scenario]
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
-        p = prompt_runtime.current()
-        if scenario == "anchor":
-            system = p.SYSTEM_ANCHOR_DECOMP
-            user = p.render_anchor_decomp(
-                zone_id=zone.id,
-                zone_prompt=zone.prompt,
-                zone_plan=zone.plan,
-                nodes=all_nodes,
-                prior_attempts=prior_attempts,
-            )
-        elif scenario == "encapsulating":
-            system = p.SYSTEM_ENCAPSULATING_DECOMP
-            user = p.render_encapsulating_decomp(
-                zone_id=zone.id,
-                zone_prompt=zone.prompt,
-                zone_plan=zone.plan,
-                nodes=all_nodes,
-                prior_attempts=prior_attempts,
-            )
-        else:
-            system = p.SYSTEM_NEGATIVE_SPACE_DECOMP
-            user = p.render_negative_space_decomp(
-                zone_id=zone.id,
-                zone_prompt=zone.prompt,
-                zone_plan=zone.plan,
-                nodes=all_nodes,
-                prior_attempts=prior_attempts,
-            )
+        ps = prompt_store.current()
+        variables = scene_context.zone_vars(
+            zone_id=zone.id,
+            zone_prompt=zone.prompt,
+            zone_plan=zone.plan,
+            nodes=all_nodes,
+            target_text=target_text,
+        )
+        variables["RETRY_BLOCK"] = scene_context.render_retry_block(prior_attempts)
         out = await llm.call_llm(
-            system=system,
-            user=user,
-            output_schema=p.ObjectDecompOutput,
+            system=ps.system(step, variables),
+            user=ps.user(step, variables),
+            output_schema=schemas.ObjectDecompOutput,
             node_id=zone.id,
-            step=f"{scenario.replace('-', '_')}_decompose",
+            step=step,
+            template=step,
+            variables=variables,
         )
         if scenario == "encapsulating" and not out.bounding_required:
             logging.log_once(
@@ -150,87 +152,36 @@ async def _decompose_objects_validated(
     return specs
 
 
-async def _next_object_validated(
-    *,
-    zone: Node,
-    all_nodes: list[Node],
-) -> Any:
-    prior_attempts: list[tuple[Any, str]] = []
-    existing_ids = {n.id for n in all_nodes}
-    decision: Any | None = None
-    for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
-        p = prompt_runtime.current()
-        decision = await llm.call_llm(
-            system=p.SYSTEM_NEXT_OBJECT,
-            user=p.render_next_object(
-                zone_id=zone.id,
-                zone_prompt=zone.prompt,
-                nodes=all_nodes,
-                prior_attempts=prior_attempts,
-            ),
-            output_schema=p.NextObjectOutput,
-            node_id=zone.id,
-            step="next_object",
-        )
-        if decision.done or decision.object is None:
-            return decision
-        try:
-            validate_referenced_ids(
-                [decision.object],
-                parent_id=zone.id,
-                existing_ids=existing_ids,
-            )
-            return decision
-        except ValueError as e:
-            reason = str(e)
-            logging.log(
-                "generation.next.retry",
-                zone=zone.id,
-                attempt=attempt,
-                reason=reason,
-                emitted=decision.object.model_dump(),
-            )
-            prior_attempts.append((decision.object, reason))
-    assert decision is not None
-    # Retries exhausted. An unresolvable parent on the emitted object is a
-    # hard fail; a dangling secondary referenced_id is accepted with a log.
-    if decision.object is not None:
-        validate_parents([decision.object], parent_id=zone.id, existing_ids=existing_ids)
-    logging.log_once(
-        "generation.next.accept_invalid",
-        match_fields=("zone",),
-        zone=zone.id,
-        reason=prior_attempts[-1][1] if prior_attempts else "",
-    )
-    return decision
-
-
 async def _next_object_batch_validated(
     *,
     zone: Node,
     all_nodes: list[Node],
 ) -> tuple[bool, list[Any]]:
-    """V3/V4 anchor-completion decision: the model proposes a LIST of objects
-    per round (or signals done). Runs the same relationship-validator retry as
-    the single-object path, applied to the whole proposed batch. Returns
-    `(done, objects)`; `objects` is empty when done."""
+    """Anchor-completion decision: the model proposes a LIST of objects per
+    round (or signals done), with the relationship-validator retry applied to
+    the whole proposed batch. Returns `(done, objects)`; `objects` is empty
+    when done."""
     prior_attempts: list[tuple[list[Any], str]] = []
     existing_ids = {n.id for n in all_nodes}
     objects: list[Any] = []
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
-        p = prompt_runtime.current()
+        ps = prompt_store.current()
+        variables = scene_context.zone_vars(
+            zone_id=zone.id,
+            zone_prompt=zone.prompt,
+            zone_plan=zone.plan,
+            nodes=all_nodes,
+            target_text="This is the subregion you are deciding whether to add more objects to.",
+        )
+        variables["RETRY_BLOCK"] = scene_context.render_next_object_retry_block(prior_attempts)
         decision = await llm.call_llm(
-            system=p.SYSTEM_NEXT_OBJECT,
-            user=p.render_next_object(
-                zone_id=zone.id,
-                zone_prompt=zone.prompt,
-                zone_plan=zone.plan,
-                nodes=all_nodes,
-                prior_attempts=prior_attempts,
-            ),
-            output_schema=p.NextObjectOutput,
+            system=ps.system("next_object", variables),
+            user=ps.user("next_object", variables),
+            output_schema=schemas.NextObjectOutput,
             node_id=zone.id,
             step="next_object",
+            template="next_object",
+            variables=variables,
         )
         objects = list(decision.objects)
         if decision.done or not objects:
@@ -266,27 +217,33 @@ async def _resolve_object_bboxes_batch(
     zone: Node,
     all_nodes: list[Node],
 ) -> dict[str, BoundingBox]:
-    """Place every object in `specs` in ONE batch LLM call (the V2 strategy).
+    """Place every object in `specs` in ONE batch LLM call.
     Returns `{id: world-frame bbox}`. Objects already committed (resume) keep
     their world position and the LLM is skipped entirely when all are."""
     committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
     if all(b is not None for b in committed_bboxes.values()):
         return {sid: b for sid, b in committed_bboxes.items() if b is not None}
     bbox_by_id = {n.id: n.bbox for n in all_nodes}
-    p = prompt_runtime.current()
+    by_id = {n.id: n for n in all_nodes}
+    ps = prompt_store.current()
+    variables = scene_context.zone_vars(
+        zone_id=zone.id,
+        zone_prompt=zone.prompt,
+        zone_plan=zone.plan,
+        nodes=all_nodes,
+        target_text="This is the subregion whose objects you are to place.",
+    )
+    variables["TO_PLACE"] = scene_context.render_to_place_block(
+        specs, by_id, parent_zone=zone.id,
+    )
     out = await llm.call_llm(
-        system=p.SYSTEM_OBJECT_BBOX_BATCH,
-        user=p.render_object_bbox_batch(
-            zone_id=zone.id,
-            zone_prompt=zone.prompt,
-            zone_plan=zone.plan,
-            zone_bbox=zone.bbox,
-            objects=specs,
-            nodes=all_nodes,
-        ),
-        output_schema=p.BboxBatchOutput,
+        system=ps.system("object_bbox_batch", variables),
+        user=ps.user("object_bbox_batch", variables),
+        output_schema=schemas.BboxBatchOutput,
         node_id=zone.id,
         step="object_bbox_batch",
+        template="object_bbox_batch",
+        variables=variables,
         validate=lambda o: llm.require_matching_ids(
             produced=[a.id for a in o.assignments],
             expected=[s.id for s in specs],
@@ -371,7 +328,7 @@ async def _resolve_and_generate(
 
     # Resolve every object's world-frame bbox in one batch LLM call (honoring
     # committed bboxes for resume). The anchor completion loop calls this with
-    # the objects it proposed that round — one for V2, a list for V3/V4.
+    # the objects it proposed that round.
     bboxes = await _resolve_object_bboxes_batch(
         specs=specs,
         zone=zone,
@@ -430,6 +387,8 @@ async def _resolve_and_generate(
             proxy_shape=spec.proxy_shape,
             prior_prompts=prior_subjects,
             view=view,
+            zone=zone,
+            nodes=all_nodes,
         )
         resolved.append(
             Node(
@@ -469,29 +428,25 @@ async def _match_library_assets(
     objs_dir = runs_dir / run_id / "objects"
     objs_dir.mkdir(parents=True, exist_ok=True)
 
-    resolved: list[Node] = []
-    for spec in specs:
+    async def _one(spec: Any) -> Node:
         bbox = bboxes[spec.id]
         path = objs_dir / f"{spec.id}.glb"
         url = _artifact_url(runs_dir, path)
 
         if path.exists():
-            resolved.append(
-                Node(
-                    id=spec.id,
-                    prompt=spec.prompt,
-                    bbox=bbox,
-                    proxy_shape=spec.proxy_shape,
-                    orientation=spec.orientation,
-                    placement=spec.placement,
-                    referenced_ids=list(spec.referenced_ids),
-                    parent_id=spec.parent,
-                    parent_kind=spec.parent_kind,
-                    parent_region=zone_id,
-                    mesh_url=url,
-                )
+            return Node(
+                id=spec.id,
+                prompt=spec.prompt,
+                bbox=bbox,
+                proxy_shape=spec.proxy_shape,
+                orientation=spec.orientation,
+                placement=spec.placement,
+                referenced_ids=list(spec.referenced_ids),
+                parent_id=spec.parent,
+                parent_kind=spec.parent_kind,
+                parent_region=zone_id,
+                mesh_url=url,
             )
-            continue
 
         # bbox already emitted upfront in _resolve_and_generate.
         match = await library.match(spec.prompt)
@@ -551,23 +506,26 @@ async def _match_library_assets(
                 library_id=match.library_id,
             )
 
-        resolved.append(
-            Node(
-                id=spec.id,
-                prompt=spec.prompt,
-                bbox=bbox,
-                proxy_shape=spec.proxy_shape,
-                orientation=spec.orientation,
-                placement=spec.placement,
-                referenced_ids=list(spec.referenced_ids),
-                parent_id=spec.parent,
-                parent_kind=spec.parent_kind,
-                parent_region=zone_id,
-                mesh_url=url,
-            )
+        return Node(
+            id=spec.id,
+            prompt=spec.prompt,
+            bbox=bbox,
+            proxy_shape=spec.proxy_shape,
+            orientation=spec.orientation,
+            placement=spec.placement,
+            referenced_ids=list(spec.referenced_ids),
+            parent_id=spec.parent,
+            parent_kind=spec.parent_kind,
+            parent_region=zone_id,
+            mesh_url=url,
         )
 
-    return resolved
+    # Fan the matches out in parallel: each spec's match -> ref-image ->
+    # placement pipeline is independent (its LLM prompt depends only on the
+    # spec's own text), so only event arrival order changes. gather keeps
+    # spec order for the returned nodes; the first exception aborts the
+    # call, same as the sequential loop.
+    return list(await asyncio.gather(*(_one(s) for s in specs)))
 
 
 async def _build_image_prompt(
@@ -579,6 +537,8 @@ async def _build_image_prompt(
     prior_prompts: list[str],
     view: str = "front",
     include_dimensions: bool = True,
+    zone: Node | None = None,
+    nodes: list[Node] | None = None,
 ) -> tuple[str, str]:
     """Returns (subject_phrase, wrapped_image_prompt). The subject phrase is
     the LLM's bare noun phrase — what gets stored on Node.prompt and shown
@@ -588,26 +548,31 @@ async def _build_image_prompt(
     Set include_dimensions=False for library generation where objects have
     no meaningful bbox — omits the dimension constraint from the image
     prompt so the model renders natural proportions."""
-    p = prompt_runtime.current()
     dims = bbox.size if include_dimensions else None
     # Resume: reuse the committed subject phrase so a replayed object keeps
     # the exact prompt the rest of the scene already references downstream.
     subject = committed.image_subject(spec_id)
     if subject is not None:
-        return subject, p.wrap_image_prompt(subject, proxy_shape, dims, view=view)
+        return subject, scene_context.wrap_image_prompt(subject, proxy_shape, dims, view=view)
+    ps = prompt_store.current()
+    variables = scene_context.image_prompt_vars(
+        prompt=prompt,
+        bbox=bbox,
+        proxy_shape=proxy_shape,
+        prior_prompts=prior_prompts,
+        zone=zone,
+        nodes=nodes,
+    )
     out = await llm.call_llm(
-        system=p.SYSTEM_IMAGE_PROMPT,
-        user=p.render_image_prompt(
-            prompt=prompt,
-            bbox=bbox,
-            proxy_shape=proxy_shape,
-            prior_prompts=prior_prompts,
-        ),
-        output_schema=p.ImagePromptOutput,
+        system=ps.system("image_prompt", variables),
+        user=ps.user("image_prompt", variables),
+        output_schema=schemas.ImagePromptOutput,
         node_id=spec_id,
         step="image_prompt",
+        template="image_prompt",
+        variables=variables,
     )
-    return out.prompt, p.wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
+    return out.prompt, scene_context.wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
 
 
 _pending: dict[str, list[asyncio.Task[None]]] = {}
@@ -772,7 +737,6 @@ async def run(
     run_id: str,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
-    batch_next_object: bool = False,
 ) -> None:
     specs = await _decompose_objects_validated(
         zone=zone,
@@ -829,25 +793,15 @@ async def run(
     # ids attempted this loop; a round that proposes only already-attempted ids
     # means no progress is possible — stop.
     #
-    # V3/V4 propose a LIST of objects per round (`batch_next_object`); V2
-    # proposes one. Both feed the same frontier loop — V2 just yields a
-    # length-1 batch. Each accepted object is committed as its own
-    # `generation.next` event so resume replays them one at a time regardless
-    # of how they were proposed.
+    # The model proposes a LIST of objects per round. Each accepted object is
+    # committed as its own `generation.next` event so resume replays them one
+    # at a time regardless of how they were proposed.
     attempted: set[str] = set()
     while True:
-        if batch_next_object:
-            done, objects = await _next_object_batch_validated(
-                zone=zone,
-                all_nodes=all_nodes,
-            )
-        else:
-            decision = await _next_object_validated(
-                zone=zone,
-                all_nodes=all_nodes,
-            )
-            done = decision.done or decision.object is None
-            objects = [] if done else [decision.object]
+        done, objects = await _next_object_batch_validated(
+            zone=zone,
+            all_nodes=all_nodes,
+        )
         if done or not objects:
             logging.log_once(
                 "generation.next.done",

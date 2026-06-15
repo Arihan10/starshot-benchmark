@@ -13,17 +13,17 @@ fork a brand-new tree: committed work is replayed verbatim from the log,
 and only the genuinely-uncommitted *frontier* falls through to a fresh
 LLM call (which is correct — that work never happened).
 
-Every getter returns the prompt module's own schema object (resolved via
-`prompt_runtime.current()`), so a reconstructed value is a drop-in for
-what the corresponding LLM call would have returned. A `None` return
-means "not committed" — the caller should do the real work. An empty
-list is distinct from `None`: it means "committed, but produced nothing"
-(e.g. an encapsulating pass that decided no bounding geometry was needed).
+Every getter returns the shared `schemas` object, so a reconstructed value
+is a drop-in for what the corresponding LLM call would have returned. A
+`None` return means "not committed" — the caller should do the real work.
+An empty list is distinct from `None`: it means "committed, but produced
+nothing" (e.g. an encapsulating pass that decided no bounding geometry was
+needed).
 
 The committed events this reads:
   * `divider.zone_plan`     — `node`, `plan`, `is_atomic`
   * `bbox`                  — `id`, world-frame `origin`/`dimensions`, ...
-  * `divider.zone_decompose`— `node`, `children` (full ChildNodeSpec dumps)
+  * `divider.zone_decompose`— `node`, `children` (full SubregionSpec dumps)
   * `generation.decompose`  — `zone`, `scenario`, `objects` (full ObjectSpec dumps)
   * `generation.next`       — `zone`, `id`, `object` (full ObjectSpec dump)
   * `generation.next.done`  — `zone`
@@ -40,7 +40,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from app.core import prompt_runtime
+from app.core import schemas
 from app.core.types import BoundingBox
 from app.utils import logging
 
@@ -50,8 +50,7 @@ def zone_plan(node_id: str) -> Any | None:
     e = logging.find_event("divider.zone_plan", node=node_id)
     if e is None:
         return None
-    p = prompt_runtime.current()
-    return p.ZonePlanOutput(
+    return schemas.ZonePlanOutput(
         plan=str(e.get("plan", "")),
         is_atomic=bool(e.get("is_atomic", False)),
     )
@@ -81,12 +80,13 @@ def zone_decompose(node_id: str) -> Any | None:
     children = e.get("children")
     if not isinstance(children, list):
         return None
-    p = prompt_runtime.current()
     try:
-        specs = [p.ChildNodeSpec.model_validate(c) for c in children]
+        # Old logs carry per-child `parent`/`parent_relationship_kind`; those
+        # extra keys are simply ignored when validated into a SubregionSpec.
+        specs = [schemas.SubregionSpec.model_validate(c) for c in children]
     except Exception:
         return None
-    return p.ZoneDecomposeOutput(children=specs)
+    return schemas.ZoneDecomposeOutput(subregions=specs)
 
 
 def object_specs(zone_id: str, scenario: str) -> list[Any] | None:
@@ -102,10 +102,9 @@ def object_specs(zone_id: str, scenario: str) -> list[Any] | None:
         return None
     if not objects:
         return []
-    p = prompt_runtime.current()
     if all(isinstance(o, dict) for o in objects):
         try:
-            return [p.ObjectSpec.model_validate(o) for o in objects]
+            return [schemas.ObjectSpec.model_validate(o) for o in objects]
         except Exception:
             pass
     # Legacy ids-only event: rebuild each object from its bbox event.
@@ -124,7 +123,6 @@ def object_specs(zone_id: str, scenario: str) -> list[Any] | None:
 def next_object_specs(zone_id: str) -> list[Any]:
     """Ordered committed next-object specs from a zone's anchor completion
     loop — one per accepted `generation.next`, in emission order."""
-    p = prompt_runtime.current()
     out: list[Any] = []
     for e in logging.current_events():
         if e.get("kind") != "generation.next" or e.get("zone") != zone_id:
@@ -132,7 +130,7 @@ def next_object_specs(zone_id: str) -> list[Any]:
         obj = e.get("object")
         if isinstance(obj, dict):
             try:
-                out.append(p.ObjectSpec.model_validate(obj))
+                out.append(schemas.ObjectSpec.model_validate(obj))
                 continue
             except Exception:
                 pass
@@ -169,9 +167,8 @@ def _spec_from_bbox(node_id: str) -> Any | None:
     e = logging.find_event("bbox", id=node_id)
     if e is None:
         return None
-    p = prompt_runtime.current()
     try:
-        return p.ObjectSpec(
+        return schemas.ObjectSpec(
             id=node_id,
             prompt=str(e.get("prompt", "")),
             parent=str(e.get("parent_id") or ""),

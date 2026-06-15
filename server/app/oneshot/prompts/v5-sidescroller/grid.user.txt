@@ -1,0 +1,21 @@
+generate the side-view layout of a 2D, side-scrolling platformer-style level: `{SCENE_PROMPT}`.
+
+output a 32-wide by 8-tall matrix representation of the level viewed from the side (each cell spans `{CELL_FT}` ft; row 1 is the TOP of the level, row 8 is the BOTTOM, where the ground usually runs), that looks like the following:
+
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0
+
+where every entry is a cell that represents the object present in `{CELL_FT}` ft of the level. a cell with '0' represents empty air; any part of the level with an object in it should contain the name of the object, including terrain, platforms, ladders, obstacles, decorations, etc. keep in mind that objects can span multiple cells, e.g:
+
+...0,platform,platform,platform,0...
+...0,0,ladder,0,0...
+
+make sure the layout plays like a coherent side-scroller level: walkable ground, reachable platforms, sensible vertical spacing. be very careful with object placement and size, and make sure the placement of each object relative to the others makes sense.
+
+output ONLY the level matrix and nothing else. make sure each row in the matrix has exactly 32 entries, and only include tangible, non-ephemeral objects.

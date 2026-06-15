@@ -1,0 +1,14 @@
+given a very rough representation of the side-view layout of a 2D, side-scrolling level in the style of `{SCENE_PROMPT}`, design the list of objects present in the level along with their precise positions and sizes.
+
+the following is the very rough side-view layout for the level, centered around the origin (0,0):
+
+`{GRID_PLAN}`
+
+use this as a reference for roughly where the objects in the level should be placed and how they are laid out relative to each other. with the layout as a semantic guide, determine the exact position and size of each object in the level. be very careful and detailed with the placement of each object, and make sure each object's position and size makes sense with respect to the other objects in the level. make sure the level as a whole plays coherently.
+
+output a CSV-style list (ignoring the header row) of objects with each row representing an object in the level. each row contains the object's name, its center's precise (x, y) coordinates given as a tuple, and its size in feet given as a tuple of positive integers (width, height). for example:
+
+platform, position: (5, 2), size: (8,2)
+crate, position: (7, 3), dimensions: (2,2)
+
+output only the CSV-style list and nothing else.

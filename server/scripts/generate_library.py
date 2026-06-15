@@ -37,7 +37,7 @@ from dotenv import load_dotenv  # noqa: E402
 load_dotenv()
 load_dotenv(dotenv_path=_SERVER_DIR.parent / ".env")
 
-from app.core.prompts import ImageView  # noqa: E402
+from app.core.scene_context import ImageView  # noqa: E402
 from app.core.types import BoundingBox  # noqa: E402
 from app.pipeline.generation import _build_image_prompt  # noqa: E402
 

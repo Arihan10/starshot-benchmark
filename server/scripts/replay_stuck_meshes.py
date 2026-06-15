@@ -40,7 +40,7 @@ from dotenv import find_dotenv, load_dotenv
 # (DEFAULT_RUNS_DIR below).
 load_dotenv(find_dotenv(usecwd=True))
 
-from app.core.prompts import wrap_image_prompt
+from app.core.scene_context import wrap_image_prompt
 from app.core.types import BoundingBox, ProxyShape
 from app.services import nano_banana, threed
 from app.utils import logging as rlog, resumable

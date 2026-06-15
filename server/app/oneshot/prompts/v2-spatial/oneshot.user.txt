@@ -1,0 +1,11 @@
+You are participating in SpatialBench, a pipeline that pits LLMs against each other to evaluate their 3D scene generation capabilities. Participants generate a 3D scene imagined from the same text prompt, and human judges evaluate the final results to see which LLM did it best. Make a 3D scene based on the following prompt:
+
+"`{SCENE_PROMPT}`"
+
+To build the 3D scene, output a CSV-style list of objects where each row represents an object you want to place into the scene. Each row consists of four comma-separated values: a unique snake_case name for that object, a bounding box origin [x_min, y_min, z_min] (the box's minimum corner), bounding box dimensions [w, h, d] extending along +X/+Y/+Z and sized to the turned object, and an orientation yaw in degrees with respect to the world frame where +Z is the canonical front. The canvas will parse your list, generate a 3D model for each object from its name, turn it to its orientation, and stretch it to exactly fill its box. Once all objects have been placed, judges will evaluate the final scene as a whole.
+
+Make the scene spatially coherent and detailed - the placement and design of each and every object matters. Ensure the spatial relationships between the objects you output makes sense. Judges will immediately be able to discern a spatially coherent layout from one that is all over the place. Be very detailed and compose the entire scene in one shot. Build spatially and be intentional with every object.
+
+The dimensions you output for each object should be real world scale, given in feet.
+
+The canvas is a fixed `{CANVAS_FT}` ft by `{CANVAS_FT}` ft footprint centered on the world origin and starts with nothing - in your list, provide all objects present in the scene you imagine, placed inside it.

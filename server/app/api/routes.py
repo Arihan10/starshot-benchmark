@@ -1,16 +1,15 @@
 """HTTP API — endpoints scoped to a (run, slot, model) cell.
 
-`RUNS_DIR` is now a parent directory holding many named *runs*; each run
-is a versioned set of (slot, model) cells with its own prompt snapshot,
-events.jsonl, mesh artifacts, and SSE streams. The viewer picks the
-active run at runtime via `GET /runs` / `POST /runs/{name}/activate` —
-no more relaunching the server with a different `STARSHOT_RUNS_DIR`.
+`RUNS_DIR` is a parent directory holding many named *runs*; each run is a
+set of (slot, model) cells with its own prompt snapshot (`prompts/`, copied
+from a `versions/` prompt version at creation), events.jsonl, mesh
+artifacts, and SSE streams. The viewer picks the active run at runtime via
+`GET /runs` / `POST /runs/{name}/activate`.
 
 For each (run, slot, model) cell: fresh ones sit idle, interrupted ones
 come back as paused, completed ones stay done. Nothing auto-launches;
 the viewer drives start/resume/reset per cell. Runs are hydrated lazily
-on activation; the initial active run is the newest subdir of RUNS_DIR
-(or `default` if RUNS_DIR is empty).
+on activation; the initial active run is the newest subdir of RUNS_DIR.
 
 Every asyncio task is bound to its SlotLog via a ContextVar so
 concurrent pipeline work routes events to the right cell without
@@ -23,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
 import json
 import os
+import re
 import shutil
 import struct
 from datetime import datetime
@@ -37,7 +38,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from app.core import prompt_runtime
+from app.core import prompt_store, scene_context, schemas
+from app.utils import cache
+from app.oneshot import routes as oneshot
 from app.core.slots import (
     DEFAULT_MODEL_ALIAS,
     MODEL_ALIASES,
@@ -47,14 +50,17 @@ from app.core.slots import (
     Slot,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
-from app.pipeline import versions
+from app.pipeline import divider, generation
 from app.services import llm, threed
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
 # Parent directory holding many named runs. Each immediate subdirectory
-# is one run; cells live at RUNS_DIR/<run>/<slot>/<model>.
-RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", "./runs"))
+# is one run; cells live at RUNS_DIR/<run>/<slot>/<model>. Anchored to the
+# repo root (this file is server/app/api/routes.py) rather than the launch
+# CWD, mirroring prompt_store.VERSIONS_DIR.
+_REPO_ROOT = Path(__file__).resolve().parents[3]
+RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", _REPO_ROOT / "runs"))
 
 # Which per-cell mesh directory the scene bundle streams from. Defaults to the
 # originals ("objects"); set STARSHOT_OBJECTS_SUBDIR=objects-optimized to serve
@@ -66,10 +72,8 @@ OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
 # hand the loader its GLBs as text/plain.
 _ARTIFACT_MEDIA_TYPES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json"}
 
-# Source file we snapshot into each newly-created run so prompt-versioned
-# AB tests are reproducible after the source has moved on.
-PROMPTS_SOURCE = Path(__file__).resolve().parent.parent / "core" / "prompts.py"
-PROMPT_SNAPSHOT_NAME = "prompts_snapshot.py"
+# Per-run metadata written at creation (chosen prompt version, created_at).
+RUN_META_NAME = "run.json"
 
 # Keyed by (run_name, slot_id, model_alias). Each cell is an independent
 # pipeline. Lazy-populated: only runs the user has activated are loaded.
@@ -80,32 +84,137 @@ _retry_tasks: set[asyncio.Task[None]] = set()
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
 
-# Prompt-tuning BRANCHES. A branch is an ephemeral "what-if" fork of one cell:
-# the original events up to a tuned step, with that step's output swapped for a
-# hand-tested one, then the pipeline resumed so every downstream step re-runs
-# against the changed state. Each branch is fully isolated from its source —
-# its own SlotLog + events.jsonl + objects dir under `<cell>/_branch/`, and its
-# own composite run_id (`run/slot/model/_branch`) so the LLM cache, the
-# `committed.*` resume reader, `generation._pending`, and the Trellis queue all
-# key off the branch, never the source.
+# Downstream-simulation BRANCHES. A branch is an ephemeral "what-if" fork of
+# one cell: the original events up to (excluding) an edited step's call, then
+# the pipeline re-run with the run's prompt snapshot PLUS the edited step
+# templates, so that step — and every later firing of it — renders from the
+# edit while everything else replays via `committed.*`. Each branch is fully
+# isolated from its source — its own SlotLog + events.jsonl + objects dir
+# under `<cell>/_branch/`, and its own composite run_id
+# (`run/slot/model/_branch`) so the LLM cache, the `committed.*` resume
+# reader, `generation._pending`, and the Trellis queue all key off the
+# branch, never the source.
 #
-# At most ONE branch per run (the sandbox is a single modal; there is no
-# recursive "branch a branch"): a branch always forks the original cell, and
-# creating one discards any prior branch in that run. So these map RUN ->
-# branch; the branch's own composite run_id (stored as the SlotLog's slot_id)
-# remembers which cell it forked. Wiped on break-out (DELETE) and on any
-# source-cell mutation (reset/rewind).
+# One branch per CELL; branches across cells run in parallel (the prompt
+# lab's horizontal simulation), each individually pausable/resumable/
+# discardable. Wiped on break-out (DELETE) and on any source-cell mutation
+# (reset/rewind). In-memory only: a server restart orphans branch dirs until
+# the next branch/reset on that cell replaces them.
 BRANCH_SUBDIR = "_branch"
-_branch_logs: dict[str, SlotLog] = {}
-_branch_tasks: dict[str, asyncio.Task[None]] = {}
-# Per-run step controller driving the branch's interactive step-through: it
-# pauses the pipeline before each downstream LLM call (via `llm`'s step gate)
-# and the `/branch/step` endpoint resolves each pause with the edited prompt.
-_branch_controllers: dict[str, "BranchStepController"] = {}
-# A one-shot prompt to auto-run the FIRST paused step with (no pause), set by
-# `/branch/rerun` so re-running a committed step replays it with the edited
-# prompt instead of stopping on it again.
-_branch_reseed: dict[str, dict[str, object]] = {}
+_branch_logs: dict[RunKey, SlotLog] = {}
+_branch_tasks: dict[RunKey, asyncio.Task[None]] = {}
+# The prompt-template overrides each live branch simulates with — bound (on
+# top of the run snapshot) every time its task (re)launches.
+_branch_overrides: dict[RunKey, dict[str, dict[str, str]]] = {}
+# Step gates: gated pipelines advance ONE LLM call at a time, pausing before
+# each frontier call until a step endpoint releases it (or flips the task to
+# auto). Branches are ALWAYS gated; source cells are gated when launched in
+# stepped mode (the per-step prompt-iteration workflow).
+_branch_gates: dict[RunKey, "CellGate"] = {}
+_cell_gates: dict[RunKey, "CellGate"] = {}
+# Source cells currently in stepped mode (one LLM call per "step"). Mirrored
+# on disk by a `.stepped` marker in each cell dir so the mode SURVIVES a
+# server restart — otherwise a stepped run would come back as a plain paused
+# cell with no way to advance it.
+_stepped_cells: set[RunKey] = set()
+# The intent applied to the NEXT gate a cell's `_run` task creates:
+#   {"budget": N} — pass N frontier calls without pausing, then pause (a
+#     "step" launches a paused cell with budget 1; rerun-step uses it to
+#     auto-execute the edited step before pausing on the one after).
+#   {"auto": True} — never pause (a stepped cell told to "run rest").
+_gate_intents: dict[RunKey, dict[str, object]] = {}
+
+
+def _stepped_marker(key: RunKey) -> Path:
+    return _slot_dir(*key) / ".stepped"
+
+
+def _set_stepped(key: RunKey, on: bool) -> None:
+    """Toggle a cell's stepped mode in memory AND on disk so it persists
+    across restarts."""
+    marker = _stepped_marker(key)
+    if on:
+        _stepped_cells.add(key)
+        with contextlib.suppress(OSError):
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("")
+    else:
+        _stepped_cells.discard(key)
+        marker.unlink(missing_ok=True)
+
+
+class CellGate:
+    """Pauses a gated pipeline before each real (cache-miss) LLM call until
+    the user advances it. `budget` pre-grants pause-free calls (rerun-step
+    uses it to auto-execute the edited step). Single-event-loop, so the
+    cross-coroutine `Future.set_result` from the endpoint safely wakes the
+    paused task."""
+
+    def __init__(self, slot_log: SlotLog, *, budget: int = 0) -> None:
+        self.slot_log = slot_log
+        # `budget` is the count of QUEUED steps: each lets the cell pass one
+        # gate without pausing. "Step all" grants one to every stepped cell —
+        # including ones still mid-call — so a slower model doesn't miss the
+        # step and need an individual catch-up later; it consumes the credit
+        # when it reaches its next gate, keeping the whole run in lockstep.
+        self.budget = budget
+        self._fut: asyncio.Future[dict[str, object]] | None = None
+        self.auto = False  # once set, the rest of the run proceeds without pausing
+        # Fast-forward target: pass every call until one with this TEMPLATE comes
+        # up, then pause right before it ("run to breakpoint at step X").
+        self.until_step: str | None = None
+        self.pending: dict[str, object] | None = None
+
+    async def wait(
+        self, *, node_id: str | None, step: str | None, template: str | None = None,
+        system: str, user: str, schema_name: str, model: str,
+    ) -> None:
+        # Library matching is a mechanical per-object service step, not a
+        # pipeline step worth click-through (and its parallel fan-out would
+        # clobber the single pause future).
+        if self.auto or step == "library_match":
+            return
+        # Seeking a target step: blow past everything else, then stop AT it.
+        # `until_step` is a template id (the lab's granular step name), so match
+        # on `template` (root/nested variants differ there, not in `step`).
+        if self.until_step is not None:
+            if (template or step) == self.until_step:
+                self.until_step = None  # arrived — fall through and pause here
+            else:
+                return
+        elif self.budget > 0:
+            self.budget -= 1
+            return
+        loop = asyncio.get_running_loop()
+        fut: asyncio.Future[dict[str, object]] = loop.create_future()
+        self._fut = fut
+        self.pending = {"node": node_id, "step": step, "template": template, "schema": schema_name, "model": model}
+        # Surface the pending call (including the exact prompt about to be
+        # sent) on the stream so the UI can preview it.
+        self.slot_log.log(
+            "branch.step.pending",
+            node=node_id,
+            step=step,
+            template=template,
+            schema=schema_name,
+            model=model,
+            system=system,
+            user=user,
+        )
+        try:
+            result = await fut
+        finally:
+            self._fut = None
+            self.pending = None
+        if result.get("auto"):
+            self.auto = True
+
+    def proceed(self, *, auto: bool = False) -> bool:
+        """Release the current pause. Returns False if nothing is pending."""
+        if self._fut is None or self._fut.done():
+            return False
+        self._fut.set_result({"auto": auto})
+        return True
 
 
 class RewindRequest(BaseModel):
@@ -114,52 +223,116 @@ class RewindRequest(BaseModel):
 
 class CreateRunRequest(BaseModel):
     name: str
+    # Name of a source prompt version (a subfolder of `versions/`). Copied
+    # into the run as its immutable prompt snapshot at creation.
+    prompt_version: str
 
 
-class StepTestRequest(BaseModel):
-    """One-off "what if I edited this prompt" replay of a single pipeline
-    step. `system`/`user` are the (possibly hand-edited) messages;
-    `schema_name` is the output-schema class name recorded on the original
-    `cache.llm` event (resolved against the run's bound prompt module);
-    `model` is the OpenRouter id to run it on. Deliberately carries no slot
-    id — the call never reads or writes any cell's event log."""
+class PromptTestRequest(BaseModel):
+    """One-shot re-run of a HISTORICAL step call with edited templates: the
+    target `cache.llm` event's logged `variables` are substituted into
+    `system_template`/`user_template` and the call re-issued on the event's
+    own model. Nothing is logged or cached — the result is display-only."""
+
+    run: str
+    slot: str
+    model: str
+    event_index: int
+    step: str
+    system_template: str
+    user_template: str
+
+
+class BranchSeed(BaseModel):
+    """A prompt-test result to pre-commit into a fresh branch's log, so
+    "simulate downstream" continues from EXACTLY the output the user vetted
+    (instead of re-rolling the edited step). `system`/`user` are the rendered
+    bytes the test actually sent."""
 
     system: str
     user: str
-    schema_name: str
-    model: str
+    output: dict[str, object]
+    reasoning: str = ""
+    tokens_in: int | None = None
+    tokens_out: int | None = None
 
 
 class BranchRequest(BaseModel):
-    """Fork the cell so it re-simulates from `deviation_index` onward —
-    which MUST point at a `cache.llm` event. The branch keeps the events
-    BEFORE that step and resumes, so the step-through pauses on that step
-    first (its re-rendered prompt is editable) and then every step after it.
-    Always forks the original cell; creating a branch replaces any prior
-    branch in the run."""
+    """Fork the cell so it re-simulates from `event_index` onward — which
+    MUST point at a `cache.llm` event of template `step` carrying logged
+    `variables`. The branch keeps the events BEFORE that call and re-runs the
+    pipeline with the run snapshot + `overrides` — the prompt lab's FULL edit
+    set (`{step: {"system": text, "user": text}}`), so a session editing
+    several steps simulates exactly what "save to new run" would persist.
+    Replaces any prior branch on this cell."""
 
-    deviation_index: int
+    event_index: int
+    step: str
+    overrides: dict[str, dict[str, str]]
+    seed: BranchSeed | None = None
 
 
 class BranchStepRequest(BaseModel):
-    """Advance the branch past the step it's paused on. `system`/`user` are the
-    (possibly hand-edited) prompts to actually run; `auto` lets the rest of the
-    branch run without further pauses."""
+    """Advance a gated cell/branch. `auto=True` runs the rest to completion;
+    `until` (a template id) fast-forwards a source cell to the next call of
+    that step and pauses there. `until` is ignored by branch stepping."""
 
-    system: str | None = None
-    user: str | None = None
     auto: bool = False
+    until: str | None = None
 
 
-class BranchRerunRequest(BaseModel):
-    """Re-run an already-committed branch step (identified by its `cache.llm`
-    event index) with the given prompt, INVALIDATING every step after it. The
-    step replays with the edit (no pause), then the branch pauses on the next
-    step."""
+class ForkVersionRequest(BaseModel):
+    """Copy an existing source version to a new name — the "start a fresh
+    version to iterate on" entry point used by run creation."""
 
-    llm_index: int
-    system: str | None = None
-    user: str | None = None
+    name: str
+    base: str
+
+
+class UpdateRunPromptsRequest(BaseModel):
+    """Write the prompt lab's edits INTO the run's snapshot (the in-place
+    iteration loop). Running cells keep the templates they launched with;
+    every relaunch/rerun/resume renders the new bytes. With `update_version`
+    the run's source version folder is kept in sync too."""
+
+    overrides: dict[str, dict[str, str]]
+    update_version: bool = False
+
+
+class RerunStepRequest(BaseModel):
+    """Rewind cells to just BEFORE their EARLIEST first call of any template
+    in `steps` and relaunch — the committed prefix replays, the edited steps
+    re-run under the run's (freshly edited) snapshot, and everything
+    downstream regenerates. Omitted `cells` means every cell that has logged
+    a call of one of those steps."""
+
+    steps: list[str]
+    cells: list[dict[str, str]] | None = None
+
+
+class SaveVersionRequest(BaseModel):
+    """Persist `base_run`'s prompt snapshot + the prompt lab's edited step
+    templates as a brand-new source version folder under `versions/`."""
+
+    name: str
+    base_run: str
+    overrides: dict[str, dict[str, str]]
+
+
+class SaveRunRequest(BaseModel):
+    """Materialize the prompt lab's simulation as a NEW run: prompts/ =
+    `base_run`'s snapshot + `overrides`, and each listed cell's BRANCH state
+    (events + meshes) copied in as that cell's history — paused mid-pipeline
+    states stay resumable because the new snapshot matches the prompts the
+    branch actually ran with."""
+
+    name: str
+    base_run: str
+    overrides: dict[str, dict[str, str]]
+    cells: list[dict[str, str]]
+    # Display label for run.json; pass the freshly-saved version name when
+    # "save to new version" ran first.
+    version_label: str | None = None
 
 
 def _run_id(run: str, slot_id: str, model_alias: str) -> str:
@@ -190,46 +363,381 @@ def _branch_run_id(run: str, slot_id: str, model_alias: str) -> str:
 
 
 def _resolve_run(run: str | None) -> str:
-    """Every cell endpoint names its target run/version explicitly so the
-    concurrently-running versions never route through a shared global.
-    The client always sends `?run=`; `_current_run` is only the fallback for a
-    client that hasn't picked one yet (boot, or a legacy caller)."""
+    """Every cell endpoint names its target run explicitly so concurrently-
+    running runs never route through a shared global. The client always sends
+    `?run=`; `_current_run` is only the fallback for a client that hasn't
+    picked one yet (boot, or a legacy caller)."""
     return run or _current_run
 
 
-def _run_has_data(run: str) -> bool:
-    """True when any (slot, model) cell under this run has a non-empty
-    events.jsonl — i.e. there is a rendition worth archiving. Lets the
-    version snapshot skip versions the user never launched."""
+def _run_meta(run: str) -> dict[str, object]:
+    """The run's `run.json` (prompt version name, created_at), or {} for runs
+    that predate the file-based prompt versioning."""
+    path = _run_dir(run) / RUN_META_NAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _require_run_prompts(run: str) -> prompt_store.PromptSet:
+    """The run's prompt snapshot, required for anything that (re)starts
+    pipeline work. Runs created before the file-based prompt versioning have
+    no snapshot — they stay loadable (scene/meshes/events) but can't run."""
     run_dir = _run_dir(run)
+    if not prompt_store.has_run_prompts(run_dir):
+        raise HTTPException(
+            status_code=409,
+            detail=f"run {run!r} has no prompt snapshot (legacy run) — create a new run to launch pipelines",
+        )
+    try:
+        return prompt_store.load_run_prompts(run_dir)
+    except prompt_store.PromptTemplateError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+
+
+def _require_step_event(
+    run: str, slot_id: str, model_alias: str, event_index: int, step: str,
+) -> tuple[SlotLog, dict[str, object]]:
+    """The cell's `cache.llm` event at `event_index`, validated as a
+    re-renderable call of template `step` (the prompt lab's eligibility rule:
+    same template, already ran, variables logged)."""
+    if step not in prompt_store.STEPS:
+        raise HTTPException(status_code=404, detail=f"unknown step: {step}")
+    slot_log = _require_slot_log(run, slot_id, model_alias)
+    events = slot_log.state["events"]
+    if not (0 <= event_index < len(events)):
+        raise HTTPException(status_code=400, detail="event_index out of range")
+    event = events[event_index]
+    if event.get("kind") != "cache.llm":
+        raise HTTPException(status_code=400, detail="event is not an LLM call")
+    if event.get("template") != step:
+        raise HTTPException(
+            status_code=400,
+            detail=f"event is a {event.get('template') or event.get('step')!r} call, not {step!r}",
+        )
+    if not isinstance(event.get("variables"), dict):
+        raise HTTPException(
+            status_code=409,
+            detail="event predates variable logging — re-run the cell to make it testable",
+        )
+    return slot_log, event
+
+
+# --- prompt inspector -------------------------------------------------------
+#
+# Reconstructs the prompts a run actually used straight from its event logs.
+# (Runs launched after the snapshot-first change pin + bind their effective
+# prompt module at first launch, so their snapshots ARE authoritative — but
+# legacy runs either lack snapshots or were never bound to them, so every
+# `cache.llm` event carrying the exact `system` + `user` text per `step`
+# remains the universal ground truth.)
+
+# Canonical pipeline-step display order; unlisted steps sort after these.
+_PROMPT_STEP_ORDER = [
+    "zone_plan",
+    "overall_bbox",
+    "zone_decompose",
+    "child_bbox_batch",
+    "encapsulating_decompose",
+    "anchor_decompose",
+    "object_bbox_batch",
+    "next_object",
+    "negative_space_decompose",
+    "image_prompt",
+    "library_match",
+]
+
+# Per-cell extraction cache: events.jsonl path -> (mtime, {step: {...}}). A
+# single cell log can be 100MB+, so we scan it at most once per modification.
+_CELL_PROMPT_CACHE: dict[Path, tuple[float, dict[str, dict]]] = {}
+
+_PROMPT_TOKEN_RE = re.compile(r"\s+|\S+")
+# The top-level `"step"` key is logged BEFORE the megabyte system/user/output
+# fields, so the first match in a line's head is always the real step. Lets us
+# decide whether to skip a line without a full json.loads of its giant payload.
+_STEP_PEEK_RE = re.compile(r'"step":\s*"([a-z_]+)"')
+# Fully parse only the first few calls of each step per cell. The system prompt
+# is a module constant (identical across a step's calls; the sole exception is
+# zone_plan's root-vs-non-root pair, both seen within the first 2 calls), and
+# the representative user is the FIRST call — so calls beyond this add nothing
+# but parse cost. Hundreds of repeated object_bbox_batch/image_prompt/
+# library_match payloads are skipped after the cap.
+_STEP_PARSE_CAP = 4
+
+
+def _extract_cell_prompts(events_path: Path) -> dict[str, dict]:
+    """Reconstruct one cell's prompts from its `cache.llm` events.
+
+    Returns `{step: {"systems": {system_text: call_count}, "first_user": str,
+    "first_node": str | None, "first_index": int}}`. The `first_*` fields are
+    the EARLIEST call of that step (lowest event index) — a deterministic
+    representative for the (context-bearing) user prompt. Cached by mtime."""
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {}
+    cached = _CELL_PROMPT_CACHE.get(events_path)
+    if cached is not None and cached[0] == st.st_mtime:
+        return cached[1]
+    out: dict[str, dict] = {}
+    parsed_per_step: dict[str, int] = {}
+    try:
+        with events_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                # cache.llm lines are the only ones carrying prompts; the
+                # substring pre-filter skips the cheap (bbox/image/model/...)
+                # lines outright. Correctness is still gated on the parsed
+                # `kind` below, so a false-positive is harmless.
+                if '"kind": "cache.llm"' not in line:
+                    continue
+                # Peek at the step near the line head; once we've parsed the
+                # cap for that step, skip the (huge) payload without decoding.
+                peek = _STEP_PEEK_RE.search(line, 0, 400)
+                if peek is not None and parsed_per_step.get(peek.group(1), 0) >= _STEP_PARSE_CAP:
+                    continue
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("kind") != "cache.llm":
+                    continue
+                step = e.get("step")
+                if not isinstance(step, str):
+                    continue
+                parsed_per_step[step] = parsed_per_step.get(step, 0) + 1
+                system = e.get("system") if isinstance(e.get("system"), str) else ""
+                user = e.get("user") if isinstance(e.get("user"), str) else ""
+                idx = e.get("index")
+                idx = idx if isinstance(idx, int) else (1 << 62)
+                slot = out.setdefault(
+                    step,
+                    {"systems": {}, "first_user": "", "first_node": None, "first_index": 1 << 62},
+                )
+                slot["systems"][system] = slot["systems"].get(system, 0) + 1
+                if idx < slot["first_index"]:
+                    slot["first_index"] = idx
+                    slot["first_user"] = user
+                    slot["first_node"] = e.get("node")
+    except OSError:
+        return {}
+    _CELL_PROMPT_CACHE[events_path] = (st.st_mtime, out)
+    return out
+
+
+def _run_cells_with_data(run: str) -> list[tuple[str, Path, float]]:
+    """`(cell_key, events_path, created)` for every cell under this run whose
+    log is non-empty. `cell_key` is `"<slot>/<model>"` — stable across runs so
+    the diff can pick a reference cell present in both runs. `created` is the
+    events.jsonl CREATION time (st_birthtime; falls back to mtime on the rare
+    platform without it) — i.e. when that cell was first launched."""
+    run_dir = _run_dir(run)
+    cells: list[tuple[str, Path, float]] = []
     if not run_dir.is_dir():
-        return False
-    for events_path in run_dir.glob("*/*/events.jsonl"):
+        return cells
+    for ev in sorted(run_dir.glob("*/*/events.jsonl")):
         try:
-            if events_path.stat().st_size > 0:
-                return True
+            st = ev.stat()
         except OSError:
             continue
-    return False
+        if st.st_size <= 0:
+            continue
+        rel = ev.relative_to(run_dir).parts  # (slot, model, "events.jsonl")
+        if len(rel) >= 2:
+            created = getattr(st, "st_birthtime", st.st_mtime)
+            cells.append((f"{rel[0]}/{rel[1]}", ev, created))
+    return cells
 
 
-def _ensure_prompt_snapshot(run: str) -> None:
-    """Copy the live prompts.py into RUNS_DIR/<run>/ if not already there.
-    Called only when a brand-new run is created via POST /runs; legacy
-    runs that pre-date this feature keep whatever (or nothing) they had,
-    so we never overwrite the historical record."""
-    target = _run_dir(run) / PROMPT_SNAPSHOT_NAME
-    if target.exists():
-        return
-    if PROMPTS_SOURCE.exists():
-        target.write_text(PROMPTS_SOURCE.read_text())
+def _run_first_launch(run: str) -> float | None:
+    """Canonical chronological date for a run: its OLDEST SLOT's first-launch.
+
+    Keyed on each cell's CREATION time (st_birthtime), NOT mtime. A cell's
+    events.jsonl is created the moment that cell is first launched, and
+    creation time never moves afterward — so it is immune to the later writes
+    (re-runs, resumes, rebakes, manual log edits, folder copies/renames) that
+    make mtime and folder timestamps drift. A slot (scene) is first launched at
+    its earliest cell creation; the run's date is the oldest such slot. None
+    when the run has no rendition yet."""
+    slot_dates: dict[str, float] = {}
+    for cell_key, _ev, created in _run_cells_with_data(run):
+        slot = cell_key.split("/", 1)[0]
+        slot_dates[slot] = min(slot_dates.get(slot, created), created)
+    return min(slot_dates.values()) if slot_dates else None
 
 
-def _prompt_module_for_run(run: str):
-    snapshot = _run_dir(run) / PROMPT_SNAPSHOT_NAME
-    if snapshot.exists():
-        return prompt_runtime.load_snapshot(snapshot)
-    return None
+def _extract_run_prompts(run: str, ref_cell_key: str | None = None) -> dict[str, dict]:
+    """Union the per-cell extractions for a run into
+    `{step: {"systems": {text: count}, "by_cell": {cell_key: {"user", "node"}}}}`.
+
+    Cells are scanned with the reference cell (for diffable user prompts) FIRST,
+    then smallest-first; scanning stops once the structural pipeline is covered
+    (`zone_decompose` seen) and the reference cell has been read. Since a step's
+    system prompt is identical across cells, this avoids reading every cell's
+    multi-hundred-MB log just to re-collect the same per-step systems."""
+    def _size(p: Path) -> int:
+        try:
+            return p.stat().st_size
+        except OSError:
+            return 0
+
+    cells = _run_cells_with_data(run)
+    # Reference cell first (so its user prompts are always captured for the
+    # diff), then ascending size so the cheapest cell completes coverage.
+    cells.sort(key=lambda c: (c[0] != ref_cell_key, _size(c[1])))
+
+    merged: dict[str, dict] = {}
+    seen_steps: set[str] = set()
+    ref_scanned = ref_cell_key is None
+    for cell_key, ev, _m in cells:
+        for step, info in _extract_cell_prompts(ev).items():
+            m = merged.setdefault(step, {"systems": {}, "by_cell": {}})
+            for sys_text, cnt in info["systems"].items():
+                m["systems"][sys_text] = m["systems"].get(sys_text, 0) + cnt
+            m["by_cell"][cell_key] = {"user": info["first_user"], "node": info["first_node"]}
+            seen_steps.add(step)
+        if cell_key == ref_cell_key:
+            ref_scanned = True
+        # A cell that ran `zone_decompose` exercised the full divider+generation
+        # pipeline, so every step's system is already captured. Stop there
+        # (once the reference cell is in) instead of scanning the rest.
+        if ref_scanned and "zone_decompose" in seen_steps:
+            break
+    return merged
+
+
+def _dominant_system(systems: dict[str, int]) -> str:
+    """The system prompt used by the most calls — a stable, meaningful diff
+    target when a step has >1 variant (only `zone_plan`, root vs non-root)."""
+    if not systems:
+        return ""
+    return max(systems.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
+# Cost guards: word-level diff is O(n·m), so a fully-rewritten 100KB user
+# prompt (full scene context) would hang the request. We diff at LINE level
+# first (few hundred entries) and refine only the small changed hunks to word
+# level; anything past these caps degrades to a whole-block replace.
+_DIFF_WORD_CAP = 2500
+_DIFF_LINE_CAP = 8000
+
+
+def _word_segments(old: str, new: str) -> list[dict[str, str]]:
+    a = _PROMPT_TOKEN_RE.findall(old)
+    b = _PROMPT_TOKEN_RE.findall(new)
+    if len(a) > _DIFF_WORD_CAP or len(b) > _DIFF_WORD_CAP:
+        out: list[dict[str, str]] = []
+        if old:
+            out.append({"op": "delete", "text": old})
+        if new:
+            out.append({"op": "insert", "text": new})
+        return out
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    out = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            out.append({"op": "equal", "text": "".join(a[i1:i2])})
+        elif tag == "delete":
+            out.append({"op": "delete", "text": "".join(a[i1:i2])})
+        elif tag == "insert":
+            out.append({"op": "insert", "text": "".join(b[j1:j2])})
+        else:  # replace
+            out.append({"op": "delete", "text": "".join(a[i1:i2])})
+            out.append({"op": "insert", "text": "".join(b[j1:j2])})
+    return out
+
+
+def _prompt_diff_segments(old: str, new: str) -> list[dict[str, str]]:
+    """Diff two prompts into ordered `{op, text}` segments (op ∈
+    equal/insert/delete). Line-level structure with word-level refinement of
+    changed hunks: precise highlighting of the exact words that changed inside a
+    long prose block, while staying linear in the common (mostly-equal) case."""
+    a = (old or "").splitlines(keepends=True)
+    b = (new or "").splitlines(keepends=True)
+    if len(a) > _DIFF_LINE_CAP or len(b) > _DIFF_LINE_CAP:
+        return _word_segments(old or "", new or "")
+    sm = difflib.SequenceMatcher(a=a, b=b, autojunk=False)
+    segs: list[dict[str, str]] = []
+    for tag, i1, i2, j1, j2 in sm.get_opcodes():
+        if tag == "equal":
+            segs.append({"op": "equal", "text": "".join(a[i1:i2])})
+        elif tag == "delete":
+            segs.append({"op": "delete", "text": "".join(a[i1:i2])})
+        elif tag == "insert":
+            segs.append({"op": "insert", "text": "".join(b[j1:j2])})
+        else:  # replace — refine the (usually small) changed block to words
+            segs.extend(_word_segments("".join(a[i1:i2]), "".join(b[j1:j2])))
+    return segs
+
+
+def _pick_ref_cell(cur_cells: dict, prev_cells: dict) -> tuple[str | None, bool]:
+    """Choose the reference cell for a step's representative user prompt:
+    the lexicographically-first cell present in BOTH runs (so the user diff
+    compares the same scene+model+call), else the first current-run cell
+    (display only, no diff)."""
+    shared = sorted(set(cur_cells) & set(prev_cells))
+    if shared:
+        return shared[0], True
+    cur_only = sorted(cur_cells)
+    return (cur_only[0], False) if cur_only else (None, False)
+
+
+def _build_run_prompts(run: str, compare: str | None) -> dict[str, object]:
+    """Assemble the prompt-inspector payload for `run`, diffed against
+    `compare` (the chronologically-previous run) when given."""
+    # Pick the shared reference cell up front (from directory listing alone, no
+    # scanning) so both runs extract the SAME cell's user prompts — keeping the
+    # representative user diff apples-to-apples.
+    cur_keys = {k for k, _ev, _m in _run_cells_with_data(run)}
+    prev_keys = {k for k, _ev, _m in _run_cells_with_data(compare)} if compare else set()
+    shared = sorted(cur_keys & prev_keys)
+    ref_cell = shared[0] if shared else None
+
+    cur = _extract_run_prompts(run, ref_cell)
+    prev = _extract_run_prompts(compare, ref_cell) if compare else {}
+    steps_out: list[dict[str, object]] = []
+    order = {s: i for i, s in enumerate(_PROMPT_STEP_ORDER)}
+    for step in sorted(cur, key=lambda s: (order.get(s, len(order)), s)):
+        cur_info = cur[step]
+        prev_info = prev.get(step)
+        cur_sys = _dominant_system(cur_info["systems"])
+        prev_sys = _dominant_system(prev_info["systems"]) if prev_info else None
+        sys_changed = prev_sys is not None and prev_sys != cur_sys
+        system_block: dict[str, object] = {
+            "text": cur_sys,
+            "variant_count": len(cur_info["systems"]),
+            "changed": sys_changed,
+            "diff": _prompt_diff_segments(prev_sys or "", cur_sys) if sys_changed else None,
+        }
+        user_block: dict[str, object] | None = None
+        ref_cell, shared = _pick_ref_cell(
+            cur_info["by_cell"], prev_info["by_cell"] if prev_info else {}
+        )
+        if ref_cell is not None:
+            cu = cur_info["by_cell"][ref_cell]
+            node = cu["node"]
+            cur_user = cu["user"]
+            user_changed = False
+            diff = None
+            if shared and prev_info is not None:
+                pu = prev_info["by_cell"][ref_cell]["user"]
+                if pu != cur_user:
+                    user_changed = True
+                    diff = _prompt_diff_segments(pu, cur_user)
+            user_block = {
+                "text": cur_user,
+                "ref": ref_cell + (f"  ·  node={node}" if node else ""),
+                # The first call of a root-anchored step is node="root", whose
+                # user prompt has no upstream context — so its diff is template-
+                # only. Leaf steps carry scene context, so flag the diff as mixed.
+                "root_anchored": node == "root",
+                "diffable": shared,
+                "changed": user_changed,
+                "diff": diff,
+            }
+        steps_out.append({"step": step, "system": system_block, "user": user_block})
+    return {"run": run, "compare": compare, "steps": steps_out}
 
 
 def _hydrate_run(run: str) -> None:
@@ -248,6 +756,10 @@ def _hydrate_run(run: str) -> None:
             slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
             slot_log.hydrate_from_disk()
             _slot_logs[(run, slot.id, alias)] = slot_log
+            # Restore stepped mode from its on-disk marker so a stepped run
+            # comes back steppable after a restart instead of a dead paused cell.
+            if (slot_dir / ".stepped").exists():
+                _stepped_cells.add((run, slot.id, alias))
             _maybe_launch(slot, alias, slot_log)
     _hydrated_runs.add(run)
 
@@ -257,11 +769,17 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         global _current_run
-        # Seed the reserved version runs so their cells exist and can
-        # stream status from boot; the viewer opens on v3 (today's behavior).
-        for ver in versions.VERSIONS:
-            _hydrate_run(ver.run_name)
-        _current_run = versions.DEFAULT_VERSION.run_name
+        # Open on the most recently touched run (if any); other runs hydrate
+        # lazily on activation. Nothing is seeded — runs only exist when the
+        # user creates them.
+        run_dirs = sorted(
+            (p for p in RUNS_DIR.iterdir() if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        if run_dirs:
+            _current_run = run_dirs[0].name
+            _hydrate_run(_current_run)
         try:
             yield
         finally:
@@ -269,9 +787,7 @@ def create_app() -> FastAPI:
             for slot_log in _slot_logs.values():
                 slot_log.close()
             for run_name, slot_id, model_alias in list(_slot_logs.keys()):
-                versions.for_run(run_name).generation.cancel_pending(
-                    _run_id(run_name, slot_id, model_alias),
-                )
+                generation.cancel_pending(_run_id(run_name, slot_id, model_alias))
             for task in _tasks.values():
                 task.cancel()
             for task in _retry_tasks:
@@ -289,6 +805,7 @@ def create_app() -> FastAPI:
                     await task
             for branch_log in _branch_logs.values():
                 branch_log.close()
+            await oneshot.shutdown()
             await threed.disconnect_http()
 
     app = FastAPI(
@@ -303,6 +820,9 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    # The experimental one-shot track (single-call scene design, own slots/
+    # models/prompt) — fully isolated under /oneshot; see app/oneshot/.
+    app.include_router(oneshot.router)
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
     @app.get("/artifacts/{artifact_path:path}")
@@ -335,11 +855,14 @@ def create_app() -> FastAPI:
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             ):
+                meta = _run_meta(p.name)
+                pv = meta.get("prompt_version")
                 items.append(
                     {
                         "name": p.name,
                         "modified_at": p.stat().st_mtime,
-                        "has_prompt_snapshot": (p / PROMPT_SNAPSHOT_NAME).exists(),
+                        # null for legacy runs (loadable, not resumable).
+                        "prompt_version": pv if isinstance(pv, str) else None,
                     }
                 )
         return {"runs": items, "current": _current_run}
@@ -349,11 +872,29 @@ def create_app() -> FastAPI:
         name = req.name.strip()
         if not name or "/" in name or "\\" in name or name.startswith("."):
             raise HTTPException(status_code=400, detail="invalid run name")
+        version = req.prompt_version.strip()
+        if not prompt_store.version_exists(version):
+            raise HTTPException(status_code=404, detail=f"unknown prompt version: {version}")
+        try:
+            # Fail before any directory exists if the source set is incomplete.
+            prompt_store.validate_version(version)
+        except prompt_store.PromptTemplateError as e:
+            raise HTTPException(status_code=409, detail=str(e))
         run_dir = _run_dir(name)
         if run_dir.exists():
             raise HTTPException(status_code=409, detail=f"run already exists: {name}")
         run_dir.mkdir(parents=True)
-        _ensure_prompt_snapshot(name)
+        prompt_store.snapshot_into_run(version, run_dir)
+        (run_dir / RUN_META_NAME).write_text(
+            json.dumps(
+                {
+                    "prompt_version": version,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         _hydrate_run(name)
         global _current_run
         _current_run = name
@@ -369,6 +910,8 @@ def create_app() -> FastAPI:
         dst = _run_dir(name)
         if dst.exists():
             raise HTTPException(status_code=409, detail=f"snapshot already exists: {name}")
+        # The copy carries the run's prompts/ snapshot + run.json, so the
+        # archive replays and resumes with the source's exact prompts.
         shutil.copytree(src, dst)
         return {"snapshot": name}
 
@@ -382,49 +925,215 @@ def create_app() -> FastAPI:
         _current_run = name
         return {"current": name}
 
-    @app.post("/llm/test")
-    async def llm_test(  # pyright: ignore[reportUnusedFunction]
-        req: StepTestRequest,
-        run: str | None = None,
+    @app.get("/prompt-runs")
+    async def prompt_runs() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Runs that have a rendition, ordered chronologically by when each was
+        first launched (the OLDEST events.jsonl mtime among its cells). The
+        prompt inspector diffs each run against its immediate predecessor here."""
+        def _collect() -> list[dict[str, object]]:
+            items: list[dict[str, object]] = []
+            if RUNS_DIR.exists():
+                for p in RUNS_DIR.iterdir():
+                    if not p.is_dir():
+                        continue
+                    cells = _run_cells_with_data(p.name)
+                    if not cells:
+                        continue  # never launched — nothing to inspect
+                    slots = {k.split("/", 1)[0] for k, _ev, _m in cells}
+                    items.append(
+                        {
+                            "name": p.name,
+                            "launched_at": _run_first_launch(p.name),
+                            "n_slots": len(slots),
+                            "n_cells": len(cells),
+                        }
+                    )
+            items.sort(key=lambda d: (d["launched_at"], d["name"]))
+            return items
+
+        runs = await asyncio.to_thread(_collect)
+        return {"runs": runs, "current": _current_run}
+
+    @app.get("/runs/{run}/prompts")
+    async def run_prompts(  # pyright: ignore[reportUnusedFunction]
+        run: str, compare: str | None = None
     ) -> dict[str, object]:
-        """Re-run ONE pipeline step's LLM call with (optionally edited)
-        system/user prompts and hand back the parsed output — the engine
-        behind the prompt-tuning sandbox. Resolves the output schema against
-        the run's prompt module (so v1/v2 snapshots and live v3/v4 all work),
-        then calls `llm.call_llm_once`, which neither reads the LLM cache nor
-        writes a `cache.llm` event. The result is rendered transiently in the
-        client and discarded; nothing about any run is mutated."""
-        run = _resolve_run(run)
-        ver = versions.for_run(run)
-        module = ver.prompt_module or _prompt_module_for_run(run)
-        prompt_runtime.bind(module)
-        schema_cls = getattr(prompt_runtime.current(), req.schema_name, None)
+        """Per-step prompts a run actually used, reconstructed from its event
+        logs, with a word-level diff against `compare` when supplied."""
+        if not _run_dir(run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown run: {run}")
+        return await asyncio.to_thread(_build_run_prompts, run, compare)
+
+    @app.post("/prompt-test")
+    async def prompt_test(  # pyright: ignore[reportUnusedFunction]
+        req: PromptTestRequest,
+    ) -> dict[str, object]:
+        """Re-run ONE historical step call with edited templates — the engine
+        behind the prompt lab's "test on selected events". The target event's
+        logged `variables` are substituted into the edited templates and the
+        call re-issued on the event's own model via `llm.call_llm_once`, which
+        neither reads the LLM cache nor writes a `cache.llm` event. The result
+        is rendered transiently in the client and discarded; nothing about any
+        run is mutated."""
+        slot_log, event = _require_step_event(
+            req.run, req.slot, req.model, req.event_index, req.step,
+        )
+        variables = event["variables"]
+        model_id = str(event.get("model") or slot_log.state.get("model") or "")
+        schema_cls = getattr(schemas, str(event.get("schema")), None)
         if not (isinstance(schema_cls, type) and issubclass(schema_cls, BaseModel)):
             raise HTTPException(
-                status_code=404,
-                detail=f"unknown output schema: {req.schema_name}",
+                status_code=409,
+                detail=f"event's output schema is unknown: {event.get('schema')!r}",
             )
-        if not req.model:
-            raise HTTPException(status_code=400, detail="model is required")
-        llm.set_model(req.model)
+        try:
+            system = prompt_store.resolve(
+                req.system_template, variables, where=f"{req.step}.system (edited)")
+            user = prompt_store.resolve(
+                req.user_template, variables, where=f"{req.step}.user (edited)")
+        except prompt_store.PromptTemplateError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        user = llm.apply_model_quirks(user, model_id)
+        llm.set_model(model_id)
         try:
             _validated, reasoning, usage, raw = await llm.call_llm_once(
-                system=req.system,
-                user=req.user,
+                system=system,
+                user=user,
                 output_schema=schema_cls,
-                model=req.model,
+                model=model_id,
                 log_retries=False,
             )
         except Exception as e:
-            # Surface provider/parse failures as a clean 502 the sandbox can
-            # show inline, rather than a 500 with a stack trace.
+            # Surface provider/parse failures as a clean 502 the lab can show
+            # inline, rather than a 500 with a stack trace.
             raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
         return {
+            # The exact bytes sent — what a branch seed must carry.
+            "system": system,
+            "user": user,
             "output": raw,
             "reasoning": reasoning,
-            "schema": req.schema_name,
+            "schema": event.get("schema"),
+            "model": model_id,
+            "node": event.get("node"),
+            "original_output": event.get("output"),
             "tokens_in": getattr(usage, "prompt_tokens", None),
             "tokens_out": getattr(usage, "completion_tokens", None),
+        }
+
+    @app.get("/runs/{run}/prompt-templates")
+    async def run_prompt_templates(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The run's prompt snapshot as editable templates, with each step's
+        available variables — the prompt lab's editing source."""
+        ps = _require_run_prompts(run)
+        return {
+            "run": run,
+            "steps": [
+                {
+                    "step": step,
+                    "system": ps.template(step, "system"),
+                    "user": ps.template(step, "user"),
+                    # Every variable is injectable into every template; the
+                    # `native` subset is what this step backs with real values
+                    # (the rest render empty/placeholder here).
+                    "variables": prompt_store.ALL_VARIABLES,
+                    "native": prompt_store.STEP_VARIABLES[step],
+                }
+                for step in prompt_store.STEPS
+            ],
+        }
+
+    @app.get("/runs/{run}/step-events")
+    async def run_step_events(run: str, step: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Every logged call of template `step` across the run's cells that is
+        re-renderable (carries logged `variables`) — the prompt lab's
+        candidate list for testing an edit."""
+        if step not in prompt_store.STEPS:
+            raise HTTPException(status_code=404, detail=f"unknown step: {step}")
+        if not _run_dir(run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown run: {run}")
+        _hydrate_run(run)
+        items: list[dict[str, object]] = []
+        for (r, slot_id, alias), slot_log in _slot_logs.items():
+            if r != run:
+                continue
+            for e in slot_log.state["events"]:
+                if e.get("kind") != "cache.llm" or e.get("template") != step:
+                    continue
+                if not isinstance(e.get("variables"), dict):
+                    continue
+                output = json.dumps(e.get("output"), ensure_ascii=False)
+                items.append(
+                    {
+                        "slot": slot_id,
+                        "model": alias,
+                        "index": e.get("index"),
+                        "node": e.get("node"),
+                        "model_id": e.get("model"),
+                        "tokens_out": e.get("tokens_out"),
+                        "output_preview": output[:240] + ("…" if len(output) > 240 else ""),
+                        "branch_live": (run, slot_id, alias) in _branch_logs,
+                    }
+                )
+        items.sort(key=lambda d: (str(d["slot"]), str(d["model"]), int(d["index"] or 0)))
+        return {"run": run, "step": step, "events": items}
+
+    @app.get("/runs/{run}/step-event")
+    async def run_step_event(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, index: int, step: str,
+    ) -> dict[str, object]:
+        """One logged call's FULL bytes (exact system/user sent, output +
+        reasoning received) — fetched on demand so the prompt lab's review
+        canvas can show every event's input/output without bloating the
+        candidate-list poll."""
+        _, event = _require_step_event(run, slot, model, index, step)
+        return {
+            "slot": slot,
+            "model": model,
+            "index": index,
+            "step": step,
+            "node": event.get("node"),
+            "model_id": event.get("model"),
+            "system": event.get("system"),
+            "user": event.get("user"),
+            "output": event.get("output"),
+            "reasoning": event.get("reasoning"),
+            "tokens_in": event.get("tokens_in"),
+            "tokens_out": event.get("tokens_out"),
+        }
+
+    @app.get("/runs/{run}/branch-step-event")
+    async def run_branch_step_event(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, step: str, node: str | None = None,
+    ) -> dict[str, object]:
+        """The matching call's FULL bytes from the cell's simulation branch —
+        the same template (and node, when given), so the lab can diff the live
+        run's input/output against the simulated-edit branch. 404 when the cell
+        has no live branch or no such call in it yet."""
+        if step not in prompt_store.STEPS:
+            raise HTTPException(status_code=404, detail=f"unknown step: {step}")
+        blog = _branch_logs.get((run, slot, model))
+        if blog is None:
+            raise HTTPException(status_code=404, detail="no simulation branch for this cell")
+        events = blog.state["events"]
+        cands = [e for e in events if e.get("kind") == "cache.llm" and e.get("template") == step]
+        match = next((e for e in cands if e.get("node") == node), None) if node else None
+        match = match or (cands[0] if cands else None)
+        if match is None:
+            raise HTTPException(status_code=404, detail=f"no {step} call in the branch yet")
+        return {
+            "slot": slot,
+            "model": model,
+            "step": step,
+            "index": match.get("index"),
+            "node": match.get("node"),
+            "model_id": match.get("model"),
+            "system": match.get("system"),
+            "user": match.get("user"),
+            "output": match.get("output"),
+            "reasoning": match.get("reasoning"),
+            "tokens_in": match.get("tokens_in"),
+            "tokens_out": match.get("tokens_out"),
         }
 
     @app.get("/slots")
@@ -493,14 +1202,7 @@ def create_app() -> FastAPI:
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         cell_dir = slot_log.events_path.parent
-        objects_dir = cell_dir / OBJECTS_SUBDIR
-        if not objects_dir.is_dir():
-            # Migrated cells keep only objects-optimized (rebake_runs.py
-            # --prune-originals); pre-migration cells keep only objects.
-            objects_dir = next(
-                (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
-                objects_dir,
-            )
+        objects_dir = _objects_dir(cell_dir)
         return StreamingResponse(
             _mesh_bundle(objects_dir),
             media_type="application/octet-stream",
@@ -523,19 +1225,44 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail="slot has no run to rewind",
             )
-        # A rewind rewrites the source log; the run's branch is now stale.
-        await _discard_branch(run)
+        _require_run_prompts(run)
+        # Reverting rewrites the source log; this cell's branch is now stale and
+        # any in-flight task must stop before we rewrite under it.
+        await _discard_branch((run, slot_id, model_alias))
         await _cancel_task(run, slot_id, model_alias)
-        new_len = slot_log.truncate_events_to(req.to_event_index)
-        _tasks[(run, slot.id, model_alias)] = asyncio.create_task(_run(run, slot.id, model_alias))
-        return {"run": run, "slot_id": slot.id, "model": model_alias, "events": new_len}
+        events = slot_log.state["events"]
+        cut = max(0, min(req.to_event_index, len(events)))
+        # Drop the meshes of every node generated at/after the cut so a later
+        # re-run regenerates cleanly instead of silently reusing a stale glb.
+        objs = slot_log.events_path.parent / "objects"
+        for e in events[cut:]:
+            oid = e.get("id")
+            if isinstance(oid, str):
+                for suffix in (".glb", ".raw.glb", ".png"):
+                    with contextlib.suppress(OSError):
+                        (objs / f"{oid}{suffix}").unlink()
+        slot_log.truncate_events_to(cut)
+        # Land paused AT the cut — the user decides what runs next (resume /
+        # step / re-run with edited prompts), no surprise LLM spend.
+        slot_log.state["status"] = "paused"
+        slot_log.log("run.paused")
+        return {"run": run, "slot_id": slot.id, "model": model_alias, "events": len(slot_log.state["events"])}
 
     @app.post("/slots/{slot_id}/{model_alias}/resume")
-    async def slot_resume(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+    async def slot_resume(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+        stepped: bool | None = None,
+    ) -> dict[str, str]:
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
+        # `stepped` opts the cell in/out of one-call-at-a-time execution
+        # (persisted on disk); omitted = keep the cell's current mode.
+        if stepped is not None:
+            _set_stepped((run, slot_id, model_alias), stepped)
         # A completed run is terminal: resuming it would re-enter the pipeline
         # and generate a second run into the same cell. `run.done` is sticky
         # in the status derivation so the guard below normally catches this;
@@ -586,8 +1313,6 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
-        ver = versions.for_run(run)
-        prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
         node = _reconstruct_node(slot_log, node_id)
         if node is None:
             raise HTTPException(
@@ -598,8 +1323,7 @@ def create_app() -> FastAPI:
         async def _do_retry() -> None:
             rlog.bind(slot_log)
             llm.set_model(MODELS[model_alias])
-            prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
-            await ver.generation.retry_node(
+            await generation.retry_node(
                 node=node,
                 runs_dir=RUNS_DIR,
                 run_id=_run_id(run, slot.id, model_alias),
@@ -625,15 +1349,20 @@ def create_app() -> FastAPI:
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        ver = versions.for_run(run)
-        # Reset wipes the whole cell dir (including any `_branch/`), so tear the
-        # run's branch down first to avoid it writing into a dir being deleted.
-        await _discard_branch(run)
+        if start:
+            _require_run_prompts(run)
+        # Reset wipes the whole cell dir (including any `_branch/`), so tear
+        # this cell's branch down first to avoid it writing into a dir being
+        # deleted.
+        await _discard_branch((run, slot.id, model_alias))
         await _cancel_task(run, slot_id, model_alias)
-        # Cancel any standalone retries (registered on this version's
-        # generation._pending but with no owning _run task to drive cleanup)
-        # that the running task wouldn't have touched.
-        ver.generation.cancel_pending(_run_id(run, slot.id, model_alias))
+        # Cancel any standalone retries (registered on generation._pending but
+        # with no owning _run task to drive cleanup) that the running task
+        # wouldn't have touched.
+        generation.cancel_pending(_run_id(run, slot.id, model_alias))
+        # A reset wipes the cell, including its stepped marker + intent.
+        _set_stepped((run, slot.id, model_alias), False)
+        _gate_intents.pop((run, slot.id, model_alias), None)
         slot_dir = _slot_dir(run, slot.id, model_alias)
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
@@ -650,7 +1379,7 @@ def create_app() -> FastAPI:
             # later /resume can start_run without the client resending them) but
             # no pipeline task launched. Lets "reset all" clear an A/B matrix
             # without spawning dozens of runs; the user then starts exactly the
-            # (version, slot, model) cells they pick.
+            # (slot, model) cells they pick.
             slot_log.state["prompt"] = slot.prompt
             slot_log.state["model"] = MODELS[model_alias]
             slot_log.state["status"] = "idle"
@@ -663,24 +1392,27 @@ def create_app() -> FastAPI:
         req: BranchRequest,
         run: str | None = None,
     ) -> dict[str, object]:
-        """Fork the original cell so it re-simulates from `deviation_index`
-        onward, pausing on each step for prompt editing. Replaces any prior
-        branch in this run. Isolated: writes only under `<cell>/_branch/`."""
+        """Fork the cell so it re-simulates from `event_index` onward with the
+        edited step templates overriding the run snapshot. Replaces any prior
+        branch on this cell. Isolated: writes only under `<cell>/_branch/`."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
-        src_log = _require_slot_log(run, slot.id, model_alias)
+        _require_run_prompts(run)
+        for ostep, roles in req.overrides.items():
+            if ostep not in prompt_store.STEPS:
+                raise HTTPException(status_code=400, detail=f"unknown override step: {ostep}")
+            for role in roles:
+                if role not in ("system", "user"):
+                    raise HTTPException(status_code=400, detail=f"unknown template role: {role}")
+        src_log, event = _require_step_event(
+            run, slot.id, model_alias, req.event_index, req.step,
+        )
         src_events = list(src_log.state["events"])
-        n = req.deviation_index
-        if not (0 <= n < len(src_events)) or src_events[n].get("kind") != "cache.llm":
-            raise HTTPException(
-                status_code=400,
-                detail="deviation_index must point at a cache.llm event",
-            )
+        key: RunKey = (run, slot.id, model_alias)
 
-        # One branch per run: drop any existing branch (whatever cell it forked)
-        # before forking this one.
-        await _discard_branch(run)
+        # One branch per cell: replace any prior fork of this cell.
+        await _discard_branch(key)
         bdir = _branch_dir(run, slot.id, model_alias)
         shutil.rmtree(bdir, ignore_errors=True)
         bdir.mkdir(parents=True, exist_ok=True)
@@ -696,11 +1428,10 @@ def create_app() -> FastAPI:
             )
         await asyncio.to_thread(_hardlink_tree, src_objects, bdir / "objects")
 
-        # Prefix = source events BEFORE the chosen step's cache.llm. Dropping
-        # that step (and everything after) means `committed.*` re-runs it, the
-        # step gate pauses on it for editing, and the step-through proceeds from
-        # there. No output is injected — each step's prompt is edited live.
-        branch_events = [dict(e) for e in src_events[:n]]
+        # Prefix = source events BEFORE the edited step's call. Dropping that
+        # call (and everything after) means `committed.*` replays the prefix
+        # and the pipeline re-reaches the call with the edited templates bound.
+        branch_events = [dict(e) for e in src_events[: req.event_index]]
         bevents = bdir / "events.jsonl"
         with bevents.open("w", encoding="utf-8") as f:
             for e in branch_events:
@@ -713,14 +1444,38 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail="source has no run.start to branch from",
             )
-        _branch_logs[run] = blog
-        _branch_tasks[run] = asyncio.create_task(_run_branch(run))
+        if req.seed is not None:
+            # Pre-commit the vetted prompt-test result so the re-reached call
+            # cache-hits it and the simulation continues from EXACTLY the
+            # output the user approved. If the replayed render drifts from the
+            # tested bytes the key simply misses and the call re-runs fresh.
+            blog.log(
+                "cache.llm",
+                key=cache_hash_for_seed(event, req.seed),
+                node=event.get("node"),
+                step=event.get("step"),
+                template=req.step,
+                model=event.get("model"),
+                schema=event.get("schema"),
+                system=req.seed.system,
+                user=req.seed.user,
+                variables=event.get("variables"),
+                output=req.seed.output,
+                reasoning=req.seed.reasoning,
+                tokens_in=req.seed.tokens_in,
+                tokens_out=req.seed.tokens_out,
+                seeded=True,
+            )
+        _branch_logs[key] = blog
+        _branch_overrides[key] = {s: dict(r) for s, r in req.overrides.items()}
+        _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot.id, model_alias))
         return {
             "run": run,
             "slot_id": slot.id,
             "model": model_alias,
-            "deviation_index": n,
-            "events": len(branch_events),
+            "event_index": req.event_index,
+            "events": len(blog.state["events"]),
+            "seeded": req.seed is not None,
         }
 
     @app.get("/slots/{slot_id}/{model_alias}/branch/scene")
@@ -753,6 +1508,44 @@ def create_app() -> FastAPI:
             headers={"Cache-Control": "no-store"},
         )
 
+    @app.post("/slots/{slot_id}/{model_alias}/step")
+    async def cell_step(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        req: BranchStepRequest,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Advance a stepped source cell by one LLM call — releasing a live
+        gate OR relaunching a paused cell with a 1-call budget, so it works
+        even after a restart. `auto` runs the cell to completion. 409 only
+        when there's genuinely nothing to advance (done / mid-call / no cell)."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        if req.until is not None and req.until not in prompt_store.STEPS:
+            raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
+        result = await _advance_cell(run, slot_id, model_alias, auto=req.auto, until=req.until)
+        if result in ("missing", "done", "not_runnable", "in_flight"):
+            raise HTTPException(status_code=409, detail=f"cannot step: {result}")
+        return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto, "result": result}
+
+    @app.post("/runs/{run}/step-all")
+    async def run_step_all(run: str, auto: bool = False, until: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Advance EVERY stepped cell in the run — regardless of whether it's
+        paused at a live gate, mid-call, or sitting paused with no task (the
+        "move the whole experiment forward" action). Each gets ONE queued step
+        (so none is skipped for being mid-call), keeping the run in lockstep.
+        `auto=true` runs them all to completion; `until=<step>` fast-forwards
+        them all to the next call of that step."""
+        if until is not None and until not in prompt_store.STEPS:
+            raise HTTPException(status_code=400, detail=f"unknown step: {until}")
+        results: dict[str, list[str]] = {}
+        for r, slot_id, alias in [k for k in _stepped_cells if k[0] == run]:
+            res = await _advance_cell(r, slot_id, alias, auto=auto, until=until)
+            results.setdefault(res, []).append(f"{slot_id}/{alias}")
+        advanced = results.get("stepped", []) + results.get("launched", []) + results.get("queued", []) + results.get("seeking", [])
+        return {"run": run, "advanced": advanced, "auto": auto, "until": until, "by_result": results}
+
     @app.post("/slots/{slot_id}/{model_alias}/branch/step")
     async def branch_step(  # pyright: ignore[reportUnusedFunction]
         slot_id: str,
@@ -760,161 +1553,267 @@ def create_app() -> FastAPI:
         req: BranchStepRequest,
         run: str | None = None,
     ) -> dict[str, object]:
-        """Advance the branch past the step it's paused on, running the step
-        with the (possibly hand-edited) prompt. `auto` lets the rest run without
-        further pauses. 409 if nothing is currently paused."""
+        """Run the branch's next pending LLM call (simulation is one-step-at-
+        a-time). 409 when nothing is pending — the step in flight hasn't
+        finished, or the branch is paused/done."""
         run = _resolve_run(run)
         _require_branch_log(run, slot_id, model_alias)
-        controller = _branch_controllers.get(run)
-        if controller is None or not controller.proceed(
-            system=req.system, user=req.user, auto=req.auto,
-        ):
-            raise HTTPException(status_code=409, detail="no paused step to advance")
-        return {"ok": True, "auto": req.auto}
+        gate = _branch_gates.get((run, slot_id, model_alias))
+        if gate is None or not gate.proceed(auto=req.auto):
+            raise HTTPException(status_code=409, detail="no pending step to run")
+        return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto}
 
-    @app.post("/slots/{slot_id}/{model_alias}/branch/rerun")
-    async def branch_rerun(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str,
-        model_alias: str,
-        req: BranchRerunRequest,
-        run: str | None = None,
-    ) -> dict[str, object]:
-        """Re-run an already-committed step (by its `cache.llm` event index)
-        with an edited prompt, INVALIDATING everything after it: truncate the
-        log to before that step, discard the undone steps' mesh artifacts, seed
-        the step's prompt, and relaunch so it replays (no pause) and then pauses
-        on the next step. Navigation (prev/next) is client-side and never hits
-        this — only an explicit re-run is destructive."""
+    @app.post("/slots/{slot_id}/{model_alias}/branch/pause")
+    async def branch_pause(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
         blog = _require_branch_log(run, slot_id, model_alias)
+        key: RunKey = (run, slot_id, model_alias)
+        if blog.state.get("status") != "running":
+            raise HTTPException(
+                status_code=400,
+                detail=f"branch is {blog.state.get('status')}, not pausable",
+            )
+        await _cancel_branch_task(key)
+        blog.state["status"] = "paused"
+        blog.log("run.paused")
+        return {"run": run, "slot_id": slot_id, "model": model_alias}
+
+    @app.post("/slots/{slot_id}/{model_alias}/branch/resume")
+    async def branch_resume(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        blog = _require_branch_log(run, slot_id, model_alias)
+        key: RunKey = (run, slot_id, model_alias)
+        if key not in _branch_overrides:
+            raise HTTPException(
+                status_code=409,
+                detail="branch overrides are gone (server restarted) — re-create the branch",
+            )
+        status = blog.state.get("status")
+        if status not in ("paused", "error"):
+            raise HTTPException(status_code=400, detail=f"branch is {status}, not resumable")
         events = blog.state["events"]
-        p = req.llm_index
-        if not any(
-            e.get("index") == p and e.get("kind") == "cache.llm" for e in events
-        ):
-            raise HTTPException(status_code=400, detail="llm_index must point at a committed step")
-        # Drop the artifacts of every node placed at/after the re-run point, so
-        # they regenerate (otherwise `path.exists()` reuses a stale placement).
-        objs = blog.events_path.parent / "objects"
-        for e in events:
-            idx = e.get("index")
-            oid = e.get("id")
-            if isinstance(idx, int) and idx >= p and isinstance(oid, str):
-                for suffix in (".glb", ".raw.glb", ".png"):
-                    with contextlib.suppress(OSError):
-                        (objs / f"{oid}{suffix}").unlink()
-        await _cancel_branch_task(run)
-        blog.truncate_events_to(p)
-        _branch_reseed[run] = {"system": req.system, "user": req.user}
-        _branch_tasks[run] = asyncio.create_task(_run_branch(run))
-        return {"ok": True, "events": p}
+        if events and events[-1].get("kind") in ("run.error", "run.paused"):
+            blog.truncate_events_to(len(events) - 1)
+        blog.state["status"] = "running"
+        _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot_id, model_alias))
+        return {"run": run, "slot_id": slot_id, "model": model_alias}
 
     @app.delete("/slots/{slot_id}/{model_alias}/branch")
     async def discard_branch(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
         _require_slot(slot_id)
         _require_model(model_alias)
-        # Only the cell that owns the run's branch may discard it (idempotent —
-        # a missing/mismatched branch is a no-op).
-        blog = _branch_logs.get(run)
-        if blog is not None and blog.slot_id == _branch_run_id(run, slot_id, model_alias):
-            await _discard_branch(run)
+        # Idempotent — a missing branch is a no-op.
+        await _discard_branch((run, slot_id, model_alias))
         return {"run": run, "slot_id": slot_id, "model": model_alias}
 
-    @app.get("/versions")
-    async def list_versions(  # pyright: ignore[reportUnusedFunction]
-        slot: str | None = None,
-        model: str | None = None,
+    @app.post("/versions/fork")
+    async def fork_version(req: ForkVersionRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        name = req.name.strip()
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid version name")
+        if prompt_store.version_exists(name):
+            raise HTTPException(status_code=409, detail=f"version already exists: {name}")
+        if not prompt_store.version_exists(req.base):
+            raise HTTPException(status_code=404, detail=f"unknown base version: {req.base}")
+        try:
+            prompt_store.fork_version(name, base=req.base)
+        except prompt_store.PromptTemplateError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return {"name": name, "base": req.base}
+
+    @app.put("/runs/{run}/prompt-templates")
+    async def update_run_prompts(  # pyright: ignore[reportUnusedFunction]
+        run: str, req: UpdateRunPromptsRequest,
     ) -> dict[str, object]:
-        """The pipeline versions for the version bar. When `slot` and
-        `model` are given, each entry carries that cell's status (for the
-        per-version status dots); the runs are seeded at boot so their cells
-        always exist."""
-        items: list[dict[str, object]] = []
-        for ver in versions.VERSIONS:
-            slot_log = None
-            if slot is not None and model is not None:
-                slot_log = _slot_logs.get((ver.run_name, slot, model))
-            status = slot_log.state.get("status") if slot_log is not None else None
-            items.append(
+        """Apply the prompt lab's edits to the run's snapshot in place — the
+        fast iteration loop (edit → re-run step → compare) for a run that IS
+        the working copy of a version being authored."""
+        _require_run_prompts(run)
+        if not req.overrides:
+            raise HTTPException(status_code=400, detail="no template edits to apply")
+        try:
+            prompt_store.write_overrides(
+                _run_dir(run) / prompt_store.RUN_PROMPTS_SUBDIR, req.overrides,
+            )
+        except prompt_store.PromptTemplateError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        version_synced: str | None = None
+        if req.update_version:
+            meta = _run_meta(run)
+            version = meta.get("prompt_version")
+            if isinstance(version, str) and prompt_store.version_exists(version):
+                prompt_store.write_overrides(
+                    prompt_store.VERSIONS_DIR / version, req.overrides,
+                )
+                version_synced = version
+        return {
+            "run": run,
+            "applied": sorted(req.overrides),
+            "version_synced": version_synced,
+        }
+
+    @app.post("/runs/{run}/rerun-step")
+    async def rerun_step(  # pyright: ignore[reportUnusedFunction]
+        run: str, req: RerunStepRequest,
+    ) -> dict[str, object]:
+        """Rewind every targeted cell to just before its EARLIEST first call
+        of any template in `steps` and relaunch: the committed prefix replays
+        from the log, the edited steps re-run under the snapshot's current
+        templates, and the whole downstream cascade regenerates. The per-step
+        iteration loop — works no matter how deep the run got before the
+        problem was noticed."""
+        if not req.steps:
+            raise HTTPException(status_code=400, detail="no steps given")
+        for s in req.steps:
+            if s not in prompt_store.STEPS:
+                raise HTTPException(status_code=404, detail=f"unknown step: {s}")
+        if not _run_dir(run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown run: {run}")
+        _require_run_prompts(run)
+        _hydrate_run(run)
+        wanted: set[tuple[str, str]] | None = None
+        if req.cells is not None:
+            wanted = {(str(c.get("slot", "")), str(c.get("model", ""))) for c in req.cells}
+        steps = set(req.steps)
+        rerun: list[str] = []
+        skipped: list[str] = []
+        for (r, slot_id, alias), slot_log in list(_slot_logs.items()):
+            if r != run:
+                continue
+            if wanted is not None and (slot_id, alias) not in wanted:
+                continue
+            events = slot_log.state["events"]
+            cut = next(
+                (e.get("index") for e in events
+                 if e.get("kind") == "cache.llm" and e.get("template") in steps),
+                None,
+            )
+            if not isinstance(cut, int):
+                skipped.append(f"{slot_id}/{alias}")
+                continue
+            key: RunKey = (run, slot_id, alias)
+            # The rewind rewrites this cell's log: its branch is stale, and
+            # the artifacts of every dropped node must go so the regenerated
+            # tree can't silently reuse a stale mesh under a re-used id.
+            await _discard_branch(key)
+            await _cancel_task(run, slot_id, alias)
+            objs = slot_log.events_path.parent / "objects"
+            for e in events[cut:]:
+                oid = e.get("id")
+                if isinstance(oid, str):
+                    for suffix in (".glb", ".raw.glb", ".png"):
+                        with contextlib.suppress(OSError):
+                            (objs / f"{oid}{suffix}").unlink()
+            slot_log.truncate_events_to(cut)
+            # Stepped cells get one free pass so the edited step itself
+            # re-executes immediately, then the gate pauses before the call
+            # AFTER it — no per-cell clicking just to see the new output.
+            if key in _stepped_cells:
+                _gate_intents[key] = {"budget": 1}
+            _tasks[key] = asyncio.create_task(_run(run, slot_id, alias))
+            rerun.append(f"{slot_id}/{alias}")
+        return {"run": run, "steps": sorted(steps), "rerun": rerun, "skipped": skipped}
+
+    @app.post("/versions/save")
+    async def save_version(req: SaveVersionRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        """Persist the prompt lab's edit as a new source version: the base
+        run's snapshot plus the edited step templates."""
+        name = req.name.strip()
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid version name")
+        if prompt_store.version_exists(name):
+            raise HTTPException(status_code=409, detail=f"version already exists: {name}")
+        _require_run_prompts(req.base_run)
+        try:
+            prompt_store.save_version(
+                name,
+                base_dir=_run_dir(req.base_run) / prompt_store.RUN_PROMPTS_SUBDIR,
+                overrides=req.overrides,
+            )
+        except prompt_store.PromptTemplateError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"name": name}
+
+    @app.post("/runs/from-branches")
+    async def save_run_from_branches(req: SaveRunRequest) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Materialize the prompt lab's simulation as a NEW run: snapshot =
+        base run's prompts + overrides, and each listed cell's branch state
+        copied in as that cell's history (paused/finished alike — the new
+        snapshot matches the prompts the branches actually ran with, so they
+        resume cleanly)."""
+        name = req.name.strip()
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid run name")
+        run_dir = _run_dir(name)
+        if run_dir.exists():
+            raise HTTPException(status_code=409, detail=f"run already exists: {name}")
+        _require_run_prompts(req.base_run)
+
+        copied: list[str] = []
+        skipped: list[str] = []
+        run_dir.mkdir(parents=True)
+        try:
+            prompt_store.save_snapshot_with_overrides(
+                base_dir=_run_dir(req.base_run) / prompt_store.RUN_PROMPTS_SUBDIR,
+                dest=run_dir / prompt_store.RUN_PROMPTS_SUBDIR,
+                overrides=req.overrides,
+            )
+        except prompt_store.PromptTemplateError as e:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise HTTPException(status_code=400, detail=str(e))
+        base_meta = _run_meta(req.base_run)
+        label = req.version_label or f"{base_meta.get('prompt_version') or req.base_run}+edit"
+        (run_dir / RUN_META_NAME).write_text(
+            json.dumps(
                 {
-                    "id": ver.id,
-                    "run_name": ver.run_name,
-                    "label": ver.label,
-                    "status": status,
+                    "prompt_version": label,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "branched_from": req.base_run,
                 }
             )
-        return {"versions": items, "current": _current_run}
-
-    @app.post("/versions/{slot_id}/{model_alias}/launch")
-    async def launch_versions(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str,
-        model_alias: str,
-    ) -> dict[str, object]:
-        """Start every pipeline version on one (slot, model) cell so they
-        run concurrently and fully isolated. Independent of `_current_run`;
-        each version is its own reserved run and keeps running regardless of
-        which one the viewer is currently showing. A version whose cell is
-        already complete is left untouched."""
-        _require_slot(slot_id)
-        _require_model(model_alias)
-        results: list[dict[str, object]] = []
-        for ver in versions.VERSIONS:
-            run = ver.run_name
-            try:
-                _hydrate_run(run)
-                slot_log = _require_slot_log(run, slot_id, model_alias)
-                if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
-                    results.append(
-                        {"id": ver.id, "run_name": run, "status": "done", "started": False}
-                    )
-                    continue
-                await _start_cell(run, slot_id, model_alias)
-                results.append(
-                    {"id": ver.id, "run_name": run, "status": "running", "started": True}
-                )
-            except Exception as e:
-                results.append(
-                    {
-                        "id": ver.id,
-                        "run_name": run,
-                        "status": "error",
-                        "started": False,
-                        "error": str(e),
-                    }
-                )
-        return {"slot_id": slot_id, "model": model_alias, "versions": results}
-
-    @app.post("/versions/snapshot")
-    async def snapshot_versions() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Archive every reserved version run (V1/V2/V3/V4) that has data into a
-        timestamped, loadable copy, so the live version cells can be reset and
-        re-run fresh without losing the current rendition. The
-        originals are untouched and stay active; each archive shows up in the
-        run picker like any other run and is self-contained (meshes stream
-        from its own dir). Versions the user never launched are skipped. A
-        shared timestamp keeps the batch grouped in the picker."""
-        ts = datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-        snapshots: list[dict[str, str]] = []
-        skipped: list[str] = []
-        for ver in versions.VERSIONS:
-            if not _run_has_data(ver.run_name):
-                skipped.append(ver.run_name)
+            + "\n",
+            encoding="utf-8",
+        )
+        for cell in req.cells:
+            slot_id = str(cell.get("slot", ""))
+            alias = str(cell.get("model", ""))
+            key: RunKey = (req.base_run, slot_id, alias)
+            bdir = _branch_dir(req.base_run, slot_id, alias)
+            if not (bdir / "events.jsonl").is_file():
+                skipped.append(f"{slot_id}/{alias}")
                 continue
-            name = f"{ver.run_name}@{ts}"
-            dst = _run_dir(name)
-            if dst.exists():
-                skipped.append(ver.run_name)
-                continue
-            # copytree of a cell's objects/ can be hundreds of MB — run it off
-            # the event loop so SSE streams and status polls don't stall.
-            await asyncio.to_thread(shutil.copytree, _run_dir(ver.run_name), dst)
-            snapshots.append({"run_name": ver.run_name, "snapshot": name})
-        if not snapshots:
-            raise HTTPException(status_code=404, detail="no version data to archive yet")
-        return {"snapshots": snapshots, "skipped": skipped}
+            # Stop the live task first so the copied log is quiescent. The
+            # branch itself stays on the source cell, untouched.
+            await _cancel_branch_task(key)
+            dest = run_dir / slot_id / alias
+            dest.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(
+                shutil.copyfile, bdir / "events.jsonl", dest / "events.jsonl",
+            )
+            await asyncio.to_thread(_hardlink_tree, bdir / "objects", dest / "objects")
+            copied.append(f"{slot_id}/{alias}")
+        _hydrate_run(name)
+        global _current_run
+        _current_run = name
+        return {"current": name, "copied": copied, "skipped": skipped}
+
+    @app.get("/versions")
+    async def list_versions() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The source prompt versions (subfolders of `versions/`) a new run
+        can be created from."""
+        return {"versions": [{"name": n} for n in prompt_store.list_versions()]}
 
     return app
+
+
+def _last_step(events: list[dict[str, object]]) -> dict[str, object] | None:
+    """The most recent pipeline-location marker — what the board cards show
+    as "where is this cell right now"."""
+    for e in reversed(events):
+        if e.get("kind") == "step":
+            return {"node": e.get("node"), "phase": e.get("phase")}
+    return None
 
 
 def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
@@ -923,10 +1822,29 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
         slot_log = _slot_logs.get((run, slot.id, alias))
         state = slot_log.state if slot_log is not None else {"status": "idle", "events": []}
         events = state.get("events", [])
+        blog = _branch_logs.get((run, slot.id, alias))
+        branch: dict[str, object] | None = None
+        if blog is not None:
+            bevents = blog.state.get("events", [])
+            bgate = _branch_gates.get((run, slot.id, alias))
+            branch = {
+                "status": blog.state.get("status", "idle"),
+                "events_count": len(bevents),
+                "last_step": _last_step(bevents),
+                # The LLM call waiting for the user's go-ahead, when gated.
+                "pending": bgate.pending if bgate is not None else None,
+                "auto": bgate.auto if bgate is not None else False,
+            }
+        cgate = _cell_gates.get((run, slot.id, alias))
         runs[alias] = {
             "status": state.get("status", "idle"),
             "events_count": len(events),
             "last_kind": events[-1]["kind"] if events else None,
+            "last_step": _last_step(events),
+            "stepped": (run, slot.id, alias) in _stepped_cells,
+            "pending": cgate.pending if cgate is not None else None,
+            "auto": cgate.auto if cgate is not None else False,
+            "branch": branch,
         }
     return {
         "id": slot.id,
@@ -1020,8 +1938,7 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
         subject_str = raw_str
     else:
         subject_str = raw_str
-        p = prompt_runtime.current()
-        image_prompt = p.wrap_image_prompt(subject_str, proxy_shape, bbox.size)
+        image_prompt = scene_context.wrap_image_prompt(subject_str, proxy_shape, bbox.size)
     parent_id = bbox_event.get("parent_id")
     return Node(
         id=node_id,
@@ -1059,12 +1976,75 @@ def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
 
 
 async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
+    _cell_gates.pop((run, slot_id, model_alias), None)
     task = _tasks.pop((run, slot_id, model_alias), None)
     if task is None or task.done():
         return
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await task
+
+
+def _objects_dir(cell_dir: Path) -> Path:
+    """The cell's mesh dir — `objects/`, or the migrated `objects-optimized/`."""
+    primary = cell_dir / OBJECTS_SUBDIR
+    if primary.is_dir():
+        return primary
+    return next(
+        (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
+        primary,
+    )
+
+
+async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None) -> str:
+    """Advance a stepped source cell. Three modes:
+      * `auto`   — run it to completion, ungated.
+      * `until`  — fast-forward to the next call of template `until`, pause there.
+      * default  — advance by exactly one LLM call.
+
+    Works from EITHER state, which is what keeps a multi-model run in sync:
+      * live gate (task running, paused OR mid-call): release a current pause,
+        else QUEUE a credit (budget++) the cell spends at its next gate — so a
+        model still mid-call doesn't miss a "step (all)".
+      * paused/idle/error with no task → relaunch the pipeline carrying the
+        intent so it replays the committed prefix then stops appropriately.
+    Returns a status string for the caller to report/aggregate."""
+    key: RunKey = (run, slot_id, model_alias)
+    gate = _cell_gates.get(key)
+    if gate is not None:
+        if auto:
+            gate.auto = True
+            gate.proceed(auto=True)  # release a current pause if any
+            _set_stepped(key, False)  # "run rest" exits step mode
+            return "stepped"
+        if until is not None:
+            if gate.pending and gate.pending.get("template") == until:
+                return "at_target"  # already paused right at it
+            gate.until_step = until
+            gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
+            return "seeking"
+        if gate.proceed():
+            return "stepped"  # was paused → released one call
+        gate.budget += 1  # mid-call → queue the step for its next gate
+        return "queued"
+    # No live gate. (A non-stepped task could still be running; guard.)
+    task = _tasks.get(key)
+    if task is not None and not task.done():
+        return "in_flight"
+    slot_log = _slot_logs.get(key)
+    if slot_log is None:
+        return "missing"
+    if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
+        return "done"
+    if slot_log.state.get("status") not in ("idle", "paused", "error"):
+        return "not_runnable"
+    if auto:
+        _set_stepped(key, False)  # finish normally, ungated
+    else:
+        _set_stepped(key, True)
+        _gate_intents[key] = {"until": until} if until is not None else {"budget": 1}
+    await _start_cell(run, slot_id, model_alias)
+    return "launched"
 
 
 def _hardlink_tree(src: Path, dst: Path) -> None:
@@ -1091,150 +2071,93 @@ def _hardlink_tree(src: Path, dst: Path) -> None:
 
 
 def _require_branch_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
-    """The run's branch, but only when it was forked from THIS cell (its
-    composite run_id, stored as the SlotLog's slot_id, encodes the source
-    cell). 404 otherwise — so a cell only ever sees its own branch."""
+    """The cell's live branch. 404 when this cell has none."""
     _require_slot(slot_id)
     _require_model(model_alias)
-    blog = _branch_logs.get(run)
-    if blog is None or blog.slot_id != _branch_run_id(run, slot_id, model_alias):
+    blog = _branch_logs.get((run, slot_id, model_alias))
+    if blog is None:
         raise HTTPException(status_code=404, detail="no active branch for this cell")
     return blog
 
 
-class BranchStepController:
-    """Pauses the branch pipeline before each real (cache-miss) LLM call so the
-    user can edit the step's re-rendered prompt, then resumes it. Bound as the
-    `llm` step gate inside the branch task; `/branch/step` resolves each pause.
-
-    Single-event-loop, so the cross-coroutine `Future.set_result` from the
-    endpoint safely wakes the branch task awaiting the gate."""
-
-    def __init__(self, slot_log: SlotLog) -> None:
-        self.slot_log = slot_log
-        self._gate: asyncio.Future[dict[str, object]] | None = None
-        self.auto = False  # once set, the rest of the branch runs without pausing
-        # One-shot {system, user} to run the FIRST step with, no pause (a
-        # re-run replays its target step with the edited prompt).
-        self.seed: dict[str, object] | None = None
-
-    async def gate(
-        self, *, node_id: str | None, step: str | None,
-        system: str, user: str, schema_name: str, model: str,
-    ) -> tuple[str, str]:
-        if self.auto:
-            return system, user
-        if self.seed is not None:
-            seed = self.seed
-            self.seed = None
-            s, u = seed.get("system"), seed.get("user")
-            return (s if isinstance(s, str) else system, u if isinstance(u, str) else user)
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[dict[str, object]] = loop.create_future()
-        self._gate = fut
-        # Surface the pending step (its freshly re-rendered prompt) to the client.
-        self.slot_log.log(
-            "branch.step.pending",
-            node=node_id,
-            step=step,
-            system=system,
-            user=user,
-            schema=schema_name,
-            model=model,
-        )
-        try:
-            result = await fut
-        finally:
-            self._gate = None
-        if result.get("auto"):
-            self.auto = True
-        new_system = result.get("system")
-        new_user = result.get("user")
-        return (
-            new_system if isinstance(new_system, str) else system,
-            new_user if isinstance(new_user, str) else user,
-        )
-
-    def proceed(self, *, system: str | None = None, user: str | None = None, auto: bool = False) -> bool:
-        """Resolve the current pause. Returns False if nothing is paused."""
-        if self._gate is None or self._gate.done():
-            return False
-        self._gate.set_result({"system": system, "user": user, "auto": auto})
-        return True
+def cache_hash_for_seed(event: dict[str, object], seed: BranchSeed) -> str:
+    """Cache key for a seeded prompt-test result: identical inputs to what the
+    branch's re-reached call will hash, so the pipeline cache-hits the vetted
+    output instead of re-rolling the edited step."""
+    return cache.hash_llm_call(
+        model=str(event.get("model") or ""),
+        system=seed.system,
+        user=seed.user,
+        schema_name=str(event.get("schema") or ""),
+    )
 
 
-async def _cancel_branch_task(run: str) -> None:
-    """Cancel the run's branch task + in-flight branch meshes + stale step
-    controller, but KEEP its SlotLog and dir — so a back-step can truncate the
-    log and relaunch on the same branch."""
-    task = _branch_tasks.pop(run, None)
+async def _cancel_branch_task(key: RunKey) -> None:
+    """Cancel the cell branch's task + in-flight branch meshes + step gate,
+    but KEEP its SlotLog, overrides, and dir — pause/resume relaunch on the
+    same branch (a relaunch binds a fresh gate, back in stepping mode)."""
+    task = _branch_tasks.pop(key, None)
     if task is not None and not task.done():
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
-    _branch_controllers.pop(run, None)
-    _branch_reseed.pop(run, None)
-    log = _branch_logs.get(run)
+    _branch_gates.pop(key, None)
+    log = _branch_logs.get(key)
     if log is not None:
-        versions.for_run(run).generation.cancel_pending(log.slot_id)
+        generation.cancel_pending(log.slot_id)
 
 
-async def _cancel_branch(run: str) -> None:
-    """Tear down the run's live branch task + in-flight branch meshes (but
-    leave the on-disk `_branch/` dir for the caller to keep or delete)."""
-    await _cancel_branch_task(run)
-    log = _branch_logs.pop(run, None)
+async def _discard_branch(key: RunKey) -> None:
+    """Full break-out: cancel the cell's branch and delete its directory."""
+    await _cancel_branch_task(key)
+    _branch_overrides.pop(key, None)
+    log = _branch_logs.pop(key, None)
     if log is not None:
         log.close()
+        shutil.rmtree(log.events_path.parent, ignore_errors=True)
 
 
-async def _discard_branch(run: str) -> None:
-    """Full break-out: cancel the run's branch and delete its directory."""
-    log = _branch_logs.get(run)
-    branch_dir = log.events_path.parent if log is not None else None
-    await _cancel_branch(run)
-    if branch_dir is not None:
-        shutil.rmtree(branch_dir, ignore_errors=True)
-
-
-async def _run_branch(run: str) -> None:
-    """Drive the run's branch pipeline. A mirror of `_run` bound to the branch's
-    SlotLog + branch run_id: it resumes (the prefix replays via `committed.*`,
-    the tuned step cache-hits the swapped output, and the frontier re-runs),
-    streaming into the branch log only."""
-    blog = _branch_logs[run]
+async def _run_branch(run: str, slot_id: str, model_alias: str) -> None:
+    """Drive one cell branch. A mirror of `_run` bound to the branch's SlotLog
+    + branch run_id + the run snapshot WITH the lab's template overrides: the
+    prefix replays via `committed.*`, the edited step's seeded result (if any)
+    cache-hits, and the frontier re-runs under the edited templates."""
+    key: RunKey = (run, slot_id, model_alias)
+    blog = _branch_logs[key]
     rlog.bind(blog)
-    # Bind the step gate IN this task's context so only the branch pauses; the
-    # main pipeline tasks leave the gate None and never block.
-    controller = BranchStepController(blog)
-    controller.seed = _branch_reseed.pop(run, None)  # set by /branch/rerun
-    _branch_controllers[run] = controller
-    llm.set_step_gate(controller.gate)
-    ver = versions.for_run(run)
-    prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+    # One LLM call at a time: bind the step gate IN this task's context so
+    # only the branch pauses; the main pipeline tasks never block.
+    gate = CellGate(blog)
+    _branch_gates[key] = gate
+    llm.set_step_gate(gate.wait)
     prompt = blog.state["prompt"]
     model = blog.state["model"]
     brun_id = blog.slot_id  # composite branch run_id (run/slot/model/_branch)
     try:
-        await ver.run(run_id=brun_id, prompt=prompt, model=model, runs_dir=RUNS_DIR)
+        base = prompt_store.load_run_prompts(_run_dir(run))
+        prompt_store.bind(base.with_overrides(_branch_overrides.get(key, {})))
+        await divider.run(run_id=brun_id, prompt=prompt, model=model, runs_dir=RUNS_DIR)
     except asyncio.CancelledError:
-        ver.generation.cancel_pending(brun_id)
+        generation.cancel_pending(brun_id)
         raise
     except Exception as e:
-        ver.generation.cancel_pending(brun_id)
+        generation.cancel_pending(brun_id)
         blog.log("run.error", message=f"{type(e).__name__}: {e}")
         return
-    await ver.generation.await_pending(brun_id)
+    await generation.await_pending(brun_id)
     blog.finish_run()
 
 
 async def _start_cell(run: str, slot_id: str, model_alias: str) -> None:
     """Cancel any in-flight task for this cell, then (re)start its pipeline.
     A fresh cell emits run.start; a paused/errored cell drops its terminal
-    sentinel and resumes. Shared by slot_resume and the version launcher —
-    callers own any precondition guards (e.g. blocking a completed run)."""
+    sentinel and resumes. Callers own any other precondition guards (e.g.
+    blocking a completed run)."""
     slot = _require_slot(slot_id)
     slot_log = _require_slot_log(run, slot_id, model_alias)
+    # The run's prompt snapshot is the only prompt source — without one
+    # (legacy run) nothing can launch.
+    _require_run_prompts(run)
     status = slot_log.state.get("status")
     await _cancel_task(run, slot_id, model_alias)
     events = slot_log.state["events"]
@@ -1385,25 +2308,38 @@ async def _sse(
 
 
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
-    slot_log = _slot_logs[(run, slot_id, model_alias)]
+    key: RunKey = (run, slot_id, model_alias)
+    slot_log = _slot_logs[key]
     rlog.bind(slot_log)
-    ver = versions.for_run(run)
-    prompt_runtime.bind(ver.prompt_module or _prompt_module_for_run(run))
+    # Stepped mode: gate this cell so it pauses before every frontier LLM
+    # call (the per-step prompt-iteration workflow). The next-gate intent
+    # (set by "step" / "run rest" / rerun-step) tunes the first launch.
+    if key in _stepped_cells:
+        intent = _gate_intents.pop(key, {})
+        gate = CellGate(slot_log, budget=int(intent.get("budget", 0) or 0))
+        gate.auto = bool(intent.get("auto", False))
+        _until = intent.get("until")
+        gate.until_step = str(_until) if _until else None
+        _cell_gates[key] = gate
+        llm.set_step_gate(gate.wait)
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]
     run_id = _run_id(run, slot_id, model_alias)
     try:
-        await ver.run(
+        # Bind the run's prompt snapshot inside the try so a broken/missing
+        # snapshot surfaces as a clean run.error instead of a dead task.
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        await divider.run(
             run_id=run_id,
             prompt=prompt,
             model=model,
             runs_dir=RUNS_DIR,
         )
     except asyncio.CancelledError:
-        ver.generation.cancel_pending(run_id)
+        generation.cancel_pending(run_id)
         raise
     except Exception as e:
-        ver.generation.cancel_pending(run_id)
+        generation.cancel_pending(run_id)
         # OpenRouter SDK errors only stringify to the top-level "Provider
         # returned error" message; the actually useful detail (upstream
         # provider's complaint, the request body that tripped it) lives on
@@ -1424,7 +2360,12 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         suffix = (" | " + " | ".join(details)) if details else ""
         slot_log.log("run.error", message=f"{type(e).__name__}: {e}{suffix}")
         return
+    finally:
+        # A gate only lives for the duration of its task — drop it so a paused
+        # or finished cell reports no `pending`. (A live pause is still
+        # awaiting inside divider.run, so this runs only once the task ends.)
+        _cell_gates.pop(key, None)
     # Pipeline tree is fully resolved; meshes may still be in flight.
     # Hold the run open until they all land so `run.done` truly means done.
-    await ver.generation.await_pending(run_id)
+    await generation.await_pending(run_id)
     slot_log.finish_run()

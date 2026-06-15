@@ -1,0 +1,10 @@
+design the interior of a `{CANVAS_FT}` ft by `{CANVAS_FT}` ft `{SCENE_PROMPT}` centered at (0, 0), by outputting a list of objects that are present within it.
+
+make your scene very detailed and comprehensive. for each object, determine its precise spatial position and size within the scene. make sure to be VERY careful with the placement of each object, and make sure each object's position and size makes sense with respect to the other objects in the scene. make sure the spatial layout of the scene as a whole is coherent. 
+
+output a CSV-style list (ignoring the header row) of objects with each row representing an object in the scene. each row contains the object's name, its base's center's precise (x, y) coordinates given a a tuple, and its size in feet given as a tuple of positive integers (width, length, height). for example:
+
+chair, position: (5, 2), size: (2,2,4)
+table, position: (7, 3), dimensions: (8,7,4)
+
+output only the CSV-style list and nothing else.
