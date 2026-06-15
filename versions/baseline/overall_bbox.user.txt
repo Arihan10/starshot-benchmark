@@ -1,0 +1,6 @@
+User prompt for the scene: '`{ROOT_PROMPT}`'
+
+SCENE PLAN (authored upstream — size the canvas to match its implied silhouette):
+`{ROOT_PLAN}`
+
+Produce the overall bounding box for the whole scene.

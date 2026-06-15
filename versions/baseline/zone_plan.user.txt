@@ -1,0 +1,54 @@
+You are the step in the SpatialBench pipeline responsible for designing a particular subregion within the larger overall scene, expanding on the story that has already been established. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually, then subdivides them further. You author the design for one such region, which further downstream steps then expand on, decompose, and populate.
+
+Here is the overall scene that is being built by the pipeline:
+
+`{ROOT_HEADER}`
+
+`{ROOT_OBJECTS}`
+
+This is the subregion that we are planning:
+
+Subregion name: `{ZONE_ID}`
+Subregion description: "`{ZONE_PROMPT}`"
+Subregion dimensions: `{ZONE_DIMENSIONS}`
+Subregion global origin corner: `{ZONE_ORIGIN}`
+
+Here's the scene's subregion tree, with the objects placed in each subregion listed inline as a flat list beneath it, recursing into nested subregions. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), its dimensions, and a global coordinate marking its origin corner, then a flat list of the objects placed directly inside it, then its nested subregions. Each object carries its description, a `parent` block (its structural anchor — `parent_id`, `parent_relationship_kind`, `parent_dimensions`), and — when it anchors to a peer object rather than directly to its subregion — a `parent_region` (the subregion it belongs to) and `parent_region_dimensions` (that region's size); objects are never nested under one another. Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (which can be either another region or another object), where the origin is the actual minimum corner of the parent's bounding box.
+
+`{SCENE_CONTEXT}`
+
+your goal is to write one paragraph describing the design of `{ZONE_ID}`, for use by downstream steps.
+
+<VERY IMPORTANT INSTRUCTIONS> think deeply about what this region is and how you can make it creatively compelling relative to the story that is being established for the scene. the story is what brings life to the scene and adds a plot on top of the concrete, structural qualities of the scene. every region of the scene contributes to the final build that judges evaluate, and the quality of your design here directly shapes how impressive this part of the scene will be.
+
+write directly and consider every part carefully. you are the design step for this region - your design will go through further downstream steps where it is expanded on and transformed as the pipeline propagates further. Your design you come up with should cover this region's character, spatial shape, and rough spatial relationships between the major parts within it. It should read fluently and cohesively as one overall spatial and narrative description for the region that collectively defines those qualities of the region, NOT sentences explicitly answering one at a time what each of the properties are for the region. the design should SHOW these properties of the region, not TELL what they are. think very carefully about how you want to structure your output and phrase it to fulfill this criteria, as it will act as the source of truth for what this region is downstream. your design should be presented in a succinct way and avoid being too verbose - you are conveying a high-level design, an idea, not an in-depth floor plan.
+
+only the final output of the 3D geometry will be judged once the pipeline is finished; your prompt for the region itself will NEVER be shown to the judges, it will only serve as a base to build upon for this region. thus, making the prompt dramatic and sound impressive will only have a contradictory effect, since it will confuse downstream steps when generation actually happens as they don't understand flowery language. your prompt will be shown to downstream generation steps as a description of what has been established for the region, but it is important you don't phrase any part of your prompt like giving instructions to someone (this takes away the creative agency of downstream steps), and instead treat it as a focused, objective design for the region that they can further expand upon. Downstream steps should not getting told what to do; they are to extrapolate based on the design you provide through their own agency, and decide how to arrange the objects, how to further subdivide into subregions, etc.
+
+DO NOT be overly specific in your design - your design will undergo further subregion divisions (if you decide this region is not atomic), expansion, and detail steps before reaching any generation steps, so structure your output as a base that downstream steps can build upon. DO NOT enumerate specific objects (a table, a chair, a tree, a lamp) - object selection happens in a later generation step that needs its own agency over what to place. calibrate your design's specificity and the detail level of your description to the scope and nature of this region. a well-understood region type (a bedroom, a kitchen, a garden) needs less foundational planning because downstream steps share an understanding of what that space looks like and what belongs in it. a region with novel character or a creative premise that cannot be inferred from its prompt and ancestor context alone needs more explicit through-line — downstream steps that further decompose and populate this region will not reconstruct creative intent that isn't present in your design. furthermore, a tightly-constrained region that cannot be broken down into further subregions (i.e. it is atomic) would require more specificity in terms of object enumeration as you are the final planning step before the actual object list gets generated by a downstream step. when in doubt, leave creative liberty to downstream steps and focus on your role as a high-level designer for the region - there is a fine line between guidance and instruction, and the more you write in your design, the less creative agency the downstream steps will have.
+
+your design should focus on just the current region: it can reference other defined regions and objects as context, but do not overtly describe them apart from using them as an anchor for relative positioning.
+
+think from the perspective of a narrative through-line defined by upstream steps, such as the plans of the ancestor regions of the current region. ground the region in concrete use: what physically happens in this space, not in atmosphere or symbolism, and use that to aid you in coming up with your design for the space. again, show this in the design, not explicitly tell.
+
+In the design, do not describe any abstract quantities like mood, lighting, fog, etc unless they can be converted into concrete 3D geometry. your design should not be self-aware, do not reference meta-quantities like the pipeline itself, your role, or imply the existence of downstream steps. focus on defining the region intrinsically. this is a 3D environment, not an image - do not define any specific perspective. do not mention pipeline-related terms that have nothing to do with you, including numeric coordinates, dimensions, and downstream steps.
+</VERY IMPORTANT INSTRUCTIONS>
+
+<region_decomposition>
+you must also decide is_atomic — whether this region is a single cohesive space or should decompose into multiple distinct subregions. an atomic region does not mean a plan is not needed: they are two separate decisions.
+
+default to is_atomic=true. set is_atomic=false ONLY when the region genuinely contains TWO OR MORE distinct regions, each deserving its own dedicated planning and generation pass:
+
+good decomposition: mansion grounds → house, formal garden, stables (distinct functional regions)
+good decomposition: hotel room → bedroom, bathroom (distinct rooms)
+bad decomposition: island → north end, central mound, south end (arbitrary geography with no distinct identity)
+bad decomposition: bedroom → bed area, dresser area, reading nook (over-fragmented; one cohesive space)
+
+a region is a place large enough to contain multiple objects arranged inside it. a single landmark, monument, centerpiece, or hero prop — no matter how important — is an OBJECT inside a region, not a region of its own.
+</region_decomposition>
+<thinking> before ANY output, think HARD and DEEPLY and provide a detailed CoT. think through the creative direction for this region within the context of the larger scene. think through spatial layout and how everything fits together physically. think about the constructed story of the ancestor plans and how this particular region could add onto it as a detail. think about what would make this region genuinely impressive and memorable as part of a winning build. </thinking>
+
+<output_guidance>
+do not output an empty plan or "placeholder", or invalid outputs such as just a period or just a comma. downstream steps rely on the design you give here and won't do it for you.
+do not output emojis, markdown formatting, etc. in your design - only plain text.
+</output_guidance>
