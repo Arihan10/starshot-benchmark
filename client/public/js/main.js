@@ -9,6 +9,7 @@ import { renderBoard } from "./board.js";
 import { initOverlay, closeOverlay } from "./overlay.js";
 import { initLab } from "./promptlab.js";
 import { initCompare } from "./compare.js";
+import { initCost } from "./cost.js";
 
 const LAST_RUN_KEY = "starshot.lastRun";
 const runPickerEl = document.getElementById("run-picker");
@@ -35,6 +36,25 @@ async function refreshRuns() {
   return payload;
 }
 
+// Clear the prompt-lab session (drafts, selected step, loaded templates, sims).
+// Lab state is per-run, so EVERY run change must wipe it — otherwise a draft
+// left over from the previous run is compared against the new run's snapshot
+// and shows as a phantom "unsaved change" (most visibly on the default-selected
+// root zone-plan step). Used by both switchRun and createRun.
+function resetLabSession() {
+  document.getElementById("lab").classList.remove("open");
+  state.lab.open = false;
+  state.lab.step = null;
+  state.lab.templates = new Map();
+  state.lab.drafts = new Map();
+  state.lab.events = [];
+  state.lab.selection = new Map();
+  state.lab.tests = new Map();
+  state.lab.sims = new Map();
+  state.lab.simStep = null;
+  state.lab.simEditedSteps = [];
+}
+
 async function switchRun(name) {
   if (!name || name === state.run) return;
   try {
@@ -49,18 +69,7 @@ async function switchRun(name) {
   closeOverlay();
   // Lab state belongs to the previous run; sims (if any) keep running
   // server-side on that run and stay reachable by switching back.
-  document.getElementById("lab").classList.remove("open");
-  document.getElementById("review").classList.remove("open");
-  state.lab.open = false;
-  state.lab.step = null;
-  state.lab.templates = new Map();
-  state.lab.drafts = new Map();
-  state.lab.events = [];
-  state.lab.selected = new Set();
-  state.lab.tests = new Map();
-  state.lab.sims = new Map();
-  state.lab.simStep = null;
-  state.lab.simEditedSteps = [];
+  resetLabSession();
   renderRunPicker();
   await refreshSlots();
   toast(`run :: ${name}`);
@@ -256,8 +265,11 @@ async function newRunModal() {
           close();
           toast(`run created :: ${payload.current} (prompts: ${version})`, "ok");
           await refreshRuns();
-          state.run = null; // force switch wiring (activate already done server-side)
           state.run = payload.current;
+          // A brand-new run starts with a clean prompt lab — reset the session
+          // so a draft left over from the previously-active run isn't compared
+          // against the new run's snapshot and flagged as a phantom edit.
+          resetLabSession();
           try { localStorage.setItem(LAST_RUN_KEY, payload.current); } catch { /* ignore */ }
           renderRunPicker();
           await refreshSlots();
@@ -362,6 +374,7 @@ document.getElementById("btn-reset-all").addEventListener("click", resetAllModal
   initOverlay(viewer);
   initLab();
   initCompare();
+  initCost();
 
   try {
     const payload = await refreshRuns();

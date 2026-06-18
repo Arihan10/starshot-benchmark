@@ -13,12 +13,28 @@ import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 
 const BBOX_COLOR_DEFAULT = 0xff3b3b;  // zones
-const BBOX_COLOR_OBJECT = 0x6bd96e;
+// Objects are colored by the decomposition step that emitted them, so the
+// benchmark reader can see at a glance which pass produced each object:
+// anchor_decompose (the defining objects) keeps the canonical object green,
+// next_object (the completion-loop additions) is purple, and
+// negative_space_decompose (interstitial fill) is light brown. An object whose
+// origin step is unknown (no provenance folded yet) falls back to the green.
+const BBOX_COLOR_OBJECT = 0x6bd96e;          // anchor_decompose + default object
+const BBOX_COLOR_NEXT_OBJECT = 0xb46aff;     // next_object (purple)
+const BBOX_COLOR_NEGATIVE_SPACE = 0xc8a06a;  // negative_space_decompose (light brown)
 const BBOX_COLOR_FRAME = 0x7fb3d5;
-const BBOX_COLOR_PROXY = 0xb46aff;
 const BBOX_COLOR_HOVER = 0xffe14a;
 const BBOX_COLOR_SELECTED = 0x4af0e0;
 const BBOX_COLOR_OVERLAY = 0xff3df5;   // prompt-lab "after" (proposed) boxes
+
+// Object bbox (and its proxy wireframe) color keyed by the decomposition step
+// recorded as the node's `emitted_by` provenance. The overlay feeds the step
+// via `setOriginOf`; viewers without that wiring fall back to the object green.
+const OBJECT_COLOR_BY_STEP = {
+  anchor_decompose: BBOX_COLOR_OBJECT,
+  next_object: BBOX_COLOR_NEXT_OBJECT,
+  negative_space_decompose: BBOX_COLOR_NEGATIVE_SPACE,
+};
 const BBOX_DIM_OPACITY = 0.35;
 const PROXY_BASE_OPACITY = 0.55;
 const PROXY_DIM_OPACITY = 0.2;
@@ -135,7 +151,13 @@ export function createViewer(host, { keyboard = true } = {}) {
   const proxies = new Map();  // id -> wireframe proxy mesh
   const models = new Map();   // id -> gltf scene
   const kinds = new Map();    // id -> node_kind ("zone"/"object"/"frame")
-  const show = { bboxes: true, meshes: true, frames: true, grid: true };
+  // Visibility layers. objects/frames/zones are per-CATEGORY (node kind)
+  // toggles — switching one off removes that kind entirely, mesh AND bbox.
+  // meshes/bboxes are cross-cutting: meshes off mutes every mesh but keeps the
+  // bboxes; bboxes off mutes every wireframe box but keeps the meshes. proxies
+  // is the collision-proxy wireframe layer — an opt-in debug overlay, hidden by
+  // default. grid is the floor.
+  const show = { objects: true, frames: true, zones: true, meshes: true, bboxes: true, proxies: false, grid: true };
   let gen = 0;
   let fitPending = false;
   let bundleAbort = null;
@@ -162,6 +184,10 @@ export function createViewer(host, { keyboard = true } = {}) {
   let nodeInfo = () => null;
   let onSelectCb = () => {};
   let onHiddenChangeCb = () => {};
+  // Overlay-provided: the decomposition step that emitted a node (its
+  // `emitted_by` provenance), used to color objects by origin. Returns null
+  // when unknown — the obs model isn't wired, or provenance hasn't folded yet.
+  let originOf = () => null;
 
   // Per-node hiding (right-click, shared with the tree's eye buttons). A
   // hidden node hides its MESH only — the wireframe bbox stays visible as a
@@ -230,38 +256,56 @@ export function createViewer(host, { keyboard = true } = {}) {
 
   // --- colors / visibility (select + hover + dim semantics, ported) -------------
 
+  // Base (unselected, unhovered) bbox color. Objects key off the decomposition
+  // step that emitted them (`originOf`); frames and zones key off node kind.
+  function baseBboxColor(id, nodeKind) {
+    if (nodeKind === "object") return OBJECT_COLOR_BY_STEP[originOf(id)] ?? BBOX_COLOR_OBJECT;
+    if (nodeKind === "frame") return BBOX_COLOR_FRAME;
+    return BBOX_COLOR_DEFAULT;
+  }
+
   function applyBboxColor(id) {
     const helper = id !== null ? bboxes.get(id) : null;
     if (!helper) return;
-    const base =
-      helper.userData.proxyShape ? BBOX_COLOR_PROXY
-      : helper.userData.nodeKind === "object" ? BBOX_COLOR_OBJECT
-      : helper.userData.nodeKind === "frame" ? BBOX_COLOR_FRAME
-      : BBOX_COLOR_DEFAULT;
     const color =
       id === selectedId ? BBOX_COLOR_SELECTED
       : id === hoveredId ? BBOX_COLOR_HOVER
-      : base;
+      : baseBboxColor(id, helper.userData.nodeKind);
     helper.material.color.setHex(color);
+    // The proxy wireframe always tracks its object's bbox color.
     const proxy = proxies.get(id);
     if (proxy) proxy.material.color.setHex(color);
+  }
+
+  // Whether a node's whole CATEGORY layer is on (objects / frames / zones).
+  function categoryOn(kind) {
+    if (kind === "frame") return show.frames;
+    if (kind === "object") return show.objects;
+    return show.zones; // "zone" (and any unknown default)
   }
 
   function applyBboxVisibility(id) {
     // When something is selected, every OTHER bbox is dimmed (not hidden) so
     // the selected one stands out without losing the rest of the scene as
     // spatial reference. Hover gets full opacity so the user can see what
-    // they're about to pick.
-    const visible = id === selectedId || id === hoveredId || show.bboxes;
-    const dim = selectedId !== null && id !== selectedId && id !== hoveredId;
+    // they're about to pick. A node's CATEGORY toggle (objects/frames/zones)
+    // off removes the whole node, so its box goes too; the bboxes toggle only
+    // mutes the wireframe layer — selection/hover still reveal a box so it
+    // stays pickable while the layer is off.
     const helper = bboxes.get(id);
+    const proxy = proxies.get(id);
+    const kind = helper?.userData?.nodeKind ?? kinds.get(id) ?? "zone";
+    const visible = categoryOn(kind) && (id === selectedId || id === hoveredId || show.bboxes);
+    const dim = selectedId !== null && id !== selectedId && id !== hoveredId;
     if (helper) {
       helper.visible = visible;
       helper.material.opacity = dim ? BBOX_DIM_OPACITY : 1;
     }
-    const proxy = proxies.get(id);
     if (proxy) {
-      proxy.visible = visible;
+      // Proxies are an opt-in debug layer (hidden by default): shown only when
+      // their category is on AND the proxies toggle is on, independent of the
+      // bbox layer. Selection still dims the non-selected ones.
+      proxy.visible = categoryOn(kind) && show.proxies;
       proxy.material.opacity = dim ? PROXY_DIM_OPACITY : PROXY_BASE_OPACITY;
     }
   }
@@ -269,14 +313,22 @@ export function createViewer(host, { keyboard = true } = {}) {
   function applyModelVisibility(id) {
     const model = models.get(id);
     if (!model) return;
-    const isFrame = (kinds.get(id) ?? "zone") === "frame";
-    model.visible = show.meshes && (isFrame ? show.frames : true) && !effectivelyHidden(id);
+    // Category off hides this kind's mesh; the meshes layer mutes ALL meshes
+    // (bboxes stay); per-node hide (right-click / eye) is independent.
+    model.visible = categoryOn(kinds.get(id) ?? "zone") && show.meshes && !effectivelyHidden(id);
   }
 
   function refreshAllVisibility() {
     for (const id of bboxes.keys()) applyBboxVisibility(id);
     for (const id of models.keys()) applyModelVisibility(id);
     grid.visible = show.grid;
+  }
+
+  // Re-derive every bbox's base color — called after the obs model's provenance
+  // folds in (the overlay wires `originOf` to it), since objects painted before
+  // their decomposition step was known defaulted to the object green.
+  function recolorAll() {
+    for (const id of bboxes.keys()) applyBboxColor(id);
   }
 
   function setHovered(id) {
@@ -647,14 +699,15 @@ export function createViewer(host, { keyboard = true } = {}) {
       return null;
     }
     const mat = new THREE.MeshBasicMaterial({
-      color: PROXY_COLOR_FOR(proxyShape), wireframe: true, transparent: true, opacity: PROXY_BASE_OPACITY,
+      // Placeholder color — applyBboxColor recolors it to match the object's
+      // bbox as soon as the proxy is registered (loadBbox, right after this).
+      color: BBOX_COLOR_OBJECT, wireframe: true, transparent: true, opacity: PROXY_BASE_OPACITY,
     });
     const mesh = new THREE.Mesh(geom, mat);
     mesh.position.set(cx, anchorY, cz);
     mesh.renderOrder = 1;
     return mesh;
   }
-  const PROXY_COLOR_FOR = () => BBOX_COLOR_PROXY;
 
   function loadBbox(event) {
     const { id, origin, dimensions } = event;
@@ -686,7 +739,6 @@ export function createViewer(host, { keyboard = true } = {}) {
     helper.material.transparent = true;
     helper.material.opacity = 1;
     helper.userData.nodeKind = kind;
-    helper.userData.proxyShape = event.proxy_shape ?? null;
     bboxRoot.add(helper);
     bboxes.set(id, helper);
     const proxy = buildProxyWireframe(event.proxy_shape, origin, dimensions);
@@ -870,6 +922,40 @@ export function createViewer(host, { keyboard = true } = {}) {
     cameraUserMoved = false;
   }
 
+  // Reconcile the scene DOWN to an exact id set: drop every bbox/proxy/mesh no
+  // longer present. Painting a /scene projection was purely additive, so moving
+  // the cut BACKWARD (scrubbing the compare's original to an earlier step, or
+  // reverting a branch) left stale geometry behind. `applySceneProjection` calls
+  // this so a projection paint means "show EXACTLY this", in both directions.
+  function pruneTo({ bboxIds, meshIds }) {
+    for (const id of [...bboxes.keys()]) {
+      if (bboxIds.has(id)) continue;
+      const helper = bboxes.get(id);
+      bboxRoot.remove(helper);
+      helper.geometry?.dispose?.();
+      helper.material?.dispose?.();
+      bboxes.delete(id);
+      if (hoveredId === id) hoveredId = null;
+      if (selectedId === id) selectedId = null;
+    }
+    for (const id of [...proxies.keys()]) {
+      if (bboxIds.has(id)) continue;
+      const proxy = proxies.get(id);
+      bboxRoot.remove(proxy);
+      proxy.geometry?.dispose?.();
+      proxy.material?.dispose?.();
+      proxies.delete(id);
+    }
+    for (const id of [...models.keys()]) {
+      if (meshIds.has(id)) continue;
+      const m = models.get(id);
+      sceneRoot.remove(m);
+      disposeObject3D(m);
+      models.delete(id);
+    }
+    scheduleFit();
+  }
+
   function scheduleFit() { fitPending = true; }
 
   function resize() {
@@ -923,6 +1009,7 @@ export function createViewer(host, { keyboard = true } = {}) {
     setOverlayVisible: (v) => { overlayRoot.visible = v; },
     setBboxesVisible: (v) => { show.bboxes = v; refreshAllVisibility(); },
     clear,
+    pruneTo,
     hasModel: (id) => models.has(id),
     hasBbox: (id) => bboxes.has(id),
     setKind: (id, kind) => { if (kind) kinds.set(id, kind); },
@@ -935,6 +1022,8 @@ export function createViewer(host, { keyboard = true } = {}) {
     toggleHidden,
     isHidden: (id) => hiddenIds.has(id),
     setNodeInfo: (fn) => { nodeInfo = fn; },
+    setOriginOf: (fn) => { originOf = fn; },
+    recolorAll,
     onSelect: (fn) => { onSelectCb = fn; },
     onHiddenChange: (fn) => { onHiddenChangeCb = fn; },
     setActive: (v) => {

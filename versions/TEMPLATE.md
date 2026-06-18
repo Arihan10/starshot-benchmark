@@ -114,6 +114,7 @@ its prompt (and plan, for `overall_bbox`) known. For `child_bbox_batch` the
 | `` `{ZONE_PLACEMENT}` `` | target region placement — the semantic spatial description of where it sits within its parent (empty for the root, or until authored) |
 | `` `{ZONE_DIMENSIONS}` `` | target region bbox dimensions, `(x, y, z) m` |
 | `` `{ZONE_ORIGIN}` `` | target region bbox world origin corner, `(x, y, z) m` |
+| `` `{ZONE_OBJECTS}` `` | flat list of the objects placed DIRECTLY inside the target region (its current contents) — e.g. to remind `next_object` what's already in the zone before it decides what to add. Placeholder line until the zone holds objects. |
 | `` `{PARENT_ZONE_ID}` `` | the target region's ENCLOSING parent region id — the zone one level up the tree, distinct from `` `{ZONE_ID}` `` (the region in focus). Empty for the root, which has no parent. |
 | `` `{PARENT_ZONE_PLAN}` `` | the enclosing parent region's plan (empty for the root, or until the parent is authored) |
 | `` `{PARENT_ZONE_ORIGIN}` `` | the enclosing parent region's bbox world origin corner, `(x, y, z) m` (empty for the root) |
@@ -124,6 +125,7 @@ its prompt (and plan, for `overall_bbox`) known. For `child_bbox_batch` the
 | --- | --- | --- |
 | `` `{TO_PLACE}` `` | `child_bbox_batch`, `object_bbox_batch` | pseudo-JSON block of the specs whose bboxes the solver must emit (id, parent, relationship kind, parent dims/origin, proxy shape, orientation for objects, prompt, placement, relationships) |
 | `` `{RETRY_BLOCK}` `` | `anchor_decompose`, `encapsulating_decompose`, `negative_space_decompose`, `next_object` | empty on the first attempt; after a rejected attempt, the prior emissions + rejection reasons with instructions to fix them |
+| `` `{ADJACENT_ZONES}` `` | `encapsulating_decompose` | the regions adjacent to the target zone — the nearest region in each direction, found by casting a sphere of rays from the zone's centre (occlusion-aware, distance uncapped) — rendered in the same embedded form as `` `{SCENE_CONTEXT}` `` (plan, bbox, inline objects, nested subregions) but trimmed to just those neighbours; empty when the zone has no neighbours |
 | `` `{OBJECT_PROMPT}` `` | `image_prompt` | the object's original prompt text |
 | `` `{OBJECT_DIMENSIONS}` `` | `image_prompt` | `width=W.WWm, height=H.HHm, depth=D.DDm` |
 | `` `{PROXY_SHAPE}` `` | `image_prompt` | `BOX` / `SPHERE` / `CAPSULE` / `HEMISPHERE` |

@@ -153,7 +153,7 @@ async def _resolve_child_bboxes_batch(
         target_text="This is the region whose subregions you are to place.",
     )
     variables["TO_PLACE"] = scene_context.render_to_place_block(
-        children, by_id, parent_zone=parent.id, show_orientation=False,
+        children, by_id, parent_zone=parent.id,
     )
     out = await llm.call_llm(
         system=ps.system("child_bbox_batch", variables),

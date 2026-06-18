@@ -94,6 +94,14 @@ async def _decompose_objects_validated(
     existing_ids = {n.id for n in all_nodes}
     specs: list[Any] = []
     step, target_text = _DECOMP_STEPS[scenario]
+    # Only the encapsulating pass emits the `bounding_required` perimeter gate;
+    # anchor + negative-space use the bare object-list schema, so they can't (and
+    # don't) emit that field.
+    decomp_schema = (
+        schemas.EncapsulatingDecompOutput
+        if scenario == "encapsulating"
+        else schemas.ObjectDecompOutput
+    )
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
         ps = prompt_store.current()
         variables = scene_context.zone_vars(
@@ -107,13 +115,13 @@ async def _decompose_objects_validated(
         out = await llm.call_llm(
             system=ps.system(step, variables),
             user=ps.user(step, variables),
-            output_schema=schemas.ObjectDecompOutput,
+            output_schema=decomp_schema,
             node_id=zone.id,
             step=step,
             template=step,
             variables=variables,
         )
-        if scenario == "encapsulating" and not out.bounding_required:
+        if isinstance(out, schemas.EncapsulatingDecompOutput) and not out.bounding_required:
             logging.log_once(
                 "generation.decompose.no_bounding",
                 match_fields=("zone",),
@@ -216,13 +224,18 @@ async def _resolve_object_bboxes_batch(
     specs: list[Any],
     zone: Node,
     all_nodes: list[Node],
-) -> dict[str, BoundingBox]:
-    """Place every object in `specs` in ONE batch LLM call.
-    Returns `{id: world-frame bbox}`. Objects already committed (resume) keep
-    their world position and the LLM is skipped entirely when all are."""
+) -> tuple[dict[str, BoundingBox], dict[str, int]]:
+    """Place every object in `specs` in ONE batch LLM call, which also SOLVES
+    each object's discrete yaw from its semantic `orientation` text. Returns `({id: world-frame bbox},
+    {id: orientation})`. Objects already committed (resume) keep their world
+    position + solved yaw and the LLM is skipped entirely when all are."""
     committed_bboxes = {s.id: committed.bbox(s.id) for s in specs}
+    committed_orient = {s.id: committed.orientation(s.id) for s in specs}
     if all(b is not None for b in committed_bboxes.values()):
-        return {sid: b for sid, b in committed_bboxes.items() if b is not None}
+        return (
+            {sid: b for sid, b in committed_bboxes.items() if b is not None},
+            {sid: (committed_orient[sid] or 0) for sid in committed_bboxes},
+        )
     bbox_by_id = {n.id: n.bbox for n in all_nodes}
     by_id = {n.id: n for n in all_nodes}
     ps = prompt_store.current()
@@ -239,7 +252,7 @@ async def _resolve_object_bboxes_batch(
     out = await llm.call_llm(
         system=ps.system("object_bbox_batch", variables),
         user=ps.user("object_bbox_batch", variables),
-        output_schema=schemas.BboxBatchOutput,
+        output_schema=schemas.ObjectBboxBatchOutput,
         node_id=zone.id,
         step="object_bbox_batch",
         template="object_bbox_batch",
@@ -255,6 +268,7 @@ async def _resolve_object_bboxes_batch(
     # (spec B parents to spec A in same batch) via topological resolution.
     spec_parent = {s.id: s.parent for s in specs}
     assignments_by_id = {a.id: a.bbox for a in out.assignments}
+    orientations = {a.id: a.orientation for a in out.assignments}
     bboxes: dict[str, BoundingBox] = {}
     remaining = set(assignments_by_id.keys())
     while remaining:
@@ -279,7 +293,9 @@ async def _resolve_object_bboxes_batch(
     for sid, b in committed_bboxes.items():
         if b is not None:
             bboxes[sid] = b
-    return bboxes
+            if committed_orient[sid] is not None:
+                orientations[sid] = committed_orient[sid]
+    return bboxes, orientations
 
 
 async def _resolve_and_generate(
@@ -329,7 +345,7 @@ async def _resolve_and_generate(
     # Resolve every object's world-frame bbox in one batch LLM call (honoring
     # committed bboxes for resume). The anchor completion loop calls this with
     # the objects it proposed that round.
-    bboxes = await _resolve_object_bboxes_batch(
+    bboxes, orientations = await _resolve_object_bboxes_batch(
         specs=specs,
         zone=zone,
         all_nodes=all_nodes,
@@ -350,13 +366,14 @@ async def _resolve_and_generate(
             prompt=spec.prompt,
             kind=_bbox_kind,
             proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
+            orientation=orientations[spec.id],
         )
 
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(
             specs=specs,
             bboxes=bboxes,
+            orientations=orientations,
             scenario=scenario,
             runs_dir=runs_dir,
             run_id=run_id,
@@ -397,7 +414,7 @@ async def _resolve_and_generate(
                 image_prompt=image_prompt,
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
-                orientation=spec.orientation,
+                orientation=orientations[spec.id],
                 placement=spec.placement,
                 referenced_ids=list(spec.referenced_ids),
                 parent_id=parent_id,
@@ -418,6 +435,7 @@ async def _match_library_assets(
     *,
     specs: list[Any],
     bboxes: dict[str, BoundingBox],
+    orientations: dict[str, int],
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     runs_dir: Path,
     run_id: str,
@@ -430,16 +448,28 @@ async def _match_library_assets(
 
     async def _one(spec: Any) -> Node:
         bbox = bboxes[spec.id]
+        orientation = orientations[spec.id]
         path = objs_dir / f"{spec.id}.glb"
         url = _artifact_url(runs_dir, path)
 
-        if path.exists():
+        # Reuse an on-disk mesh ONLY when THIS log already committed its `model`
+        # event — a resume, or a sim branch's replayed prefix — where the file was
+        # baked for the committed bbox + orientation, so it's correct to keep (and
+        # re-asserting the event is a dedup no-op). A file that exists *only*
+        # because the branch hardlinked the source objects/ dir, with NO committed
+        # model here, is the SOURCE's mesh: baked to fill the SOURCE's bbox at the
+        # SOURCE's yaw. The re-run can resolve a different bbox/orientation — the
+        # fill scale AND the yaw are baked per orientation (see glb_place.place_glb),
+        # so a changed yaw mis-fits the box — and an edited prompt can match a
+        # different asset, so fall through and re-match + re-place it freshly.
+        if path.exists() and logging.find_event("model", id=spec.id, artifact_kind="object") is not None:
+            logging.emit_model(spec.id, artifact_kind="object", url=url)
             return Node(
                 id=spec.id,
                 prompt=spec.prompt,
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
-                orientation=spec.orientation,
+                orientation=orientation,
                 placement=spec.placement,
                 referenced_ids=list(spec.referenced_ids),
                 parent_id=spec.parent,
@@ -462,6 +492,9 @@ async def _match_library_assets(
         ref_image = asset.with_suffix(".png")
         if ref_image.exists():
             dest_image = objs_dir / f"{spec.id}.png"
+            # Break a hardlink to the source's image before overwriting, so a
+            # branch re-match can't mutate the source cell's shared inode.
+            dest_image.unlink(missing_ok=True)
             await asyncio.to_thread(shutil.copy2, ref_image, dest_image)
             logging.log(
                 "image",
@@ -474,14 +507,17 @@ async def _match_library_assets(
             # The optimized asset is Meshopt/KTX2-compressed, so we bake the
             # placement as a node-graph transform (preserving the compressed
             # bytes) instead of decoding + re-exporting through trimesh.
-            bounds = library.asset_rotated_bounds(match.library_id, spec.orientation)
+            bounds = library.asset_rotated_bounds(match.library_id, orientation)
+            # Break any hardlink to the source mesh before (re)baking — writing in
+            # place would corrupt the source cell's shared inode.
+            path.unlink(missing_ok=True)
             if bounds is not None:
                 await asyncio.to_thread(
                     glb_place.place_glb,
                     src=asset,
                     dst=path,
                     bbox=bbox,
-                    orientation=spec.orientation,
+                    orientation=orientation,
                     rotated_min=bounds[0],
                     rotated_max=bounds[1],
                 )
@@ -511,7 +547,7 @@ async def _match_library_assets(
             prompt=spec.prompt,
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
-            orientation=spec.orientation,
+            orientation=orientation,
             placement=spec.placement,
             referenced_ids=list(spec.referenced_ids),
             parent_id=spec.parent,

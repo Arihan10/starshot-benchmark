@@ -68,6 +68,11 @@ function stepLine(summary) {
   if (summary?.pending) {
     return `⏸ awaiting step: ${summary.pending.step} @ ${summary.pending.node ?? "?"}`;
   }
+  // While a call is in flight, show THAT call, not the stale last phase.
+  const cur = summary?.current;
+  if (summary?.status === "running" && cur) {
+    return `▶ running: ${cur.template ?? cur.step} @ ${cur.node ?? "?"}`;
+  }
   const ls = summary?.last_step;
   if (!ls || !ls.node) return summary?.status === "idle" ? "not started" : "—";
   return `${ls.node} · ${ls.phase ?? "?"}`;
@@ -229,7 +234,8 @@ function openObsDrawer(slot, model) {
 }
 
 // Revert the drawer's cell to just before `call` — confirm, truncate the log,
-// then reload the tile's scene + obs at the cut.
+// then re-run the pipeline from the cut. The tile's scene + obs reload at the
+// cut and the polling loop refreshes them as the re-run progresses.
 function revertDrawerCall(call) {
   const slot = drawer.slot;
   const model = drawer.model;
@@ -238,12 +244,12 @@ function revertDrawerCall(call) {
   openModal(`revert ${slot} · ${model}?`, (close, setError) => ({
     body: [
       el("div", { class: "m-hint", text:
-        `Truncates this slot's log to just before its ${step} call (#${call.index}) and ` +
-        "drops every later step and its meshes. The slot lands paused there." }),
+        `Truncates this slot's log to just before its ${step} call (#${call.index}), ` +
+        "drops every later step and its meshes, then re-runs the pipeline from there." }),
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
-      el("button", { class: "danger", text: "revert", onclick: async () => {
+      el("button", { class: "danger", text: "revert & re-run", onclick: async () => {
         try { await api.rewind(state.run, slot, model, call.index); }
         catch (e) { setError(e.message); return; }
         close();

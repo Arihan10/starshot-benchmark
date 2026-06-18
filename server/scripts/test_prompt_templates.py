@@ -237,7 +237,7 @@ def object_specs() -> list[ObjectSpec]:
         ObjectSpec(
             id="armchair", prompt="a worn tan leather armchair",
             parent="living_room", parent_kind=ParentRelationshipKind.ON,
-            orientation=45,
+            orientation="angled to face the sofa",
             placement="angled toward the sofa across the rug",
             referenced_ids=[Relationship(target="sofa", kind=RelationshipKind.BESIDE)],
         ),
@@ -386,7 +386,7 @@ def render_all_steps() -> dict[str, str]:
 
     v = zv(nodes, house, "child_bbox_batch")
     v["TO_PLACE"] = scene_context.render_to_place_block(
-        child_specs(), by_id, parent_zone=house.id, show_orientation=False)
+        child_specs(), by_id, parent_zone=house.id)
     out["child_bbox_batch"] = ps.system("child_bbox_batch", v) + "\n###\n" + ps.user("child_bbox_batch", v)
 
     for step, zone in (("anchor_decompose", living),
@@ -459,7 +459,7 @@ def test_information_routing() -> None:
     # child_bbox_batch: zone fields + TO_PLACE block specifics
     v = zv(nodes, house, "child_bbox_batch")
     v["TO_PLACE"] = scene_context.render_to_place_block(
-        child_specs(), by_id, parent_zone=house.id, show_orientation=False)
+        child_specs(), by_id, parent_zone=house.id)
     u = ps.user("child_bbox_batch", v)
     expect("Parent region name: 'house_zone'" in u, "parent zone id not routed")
     to_place = u.split("Here is the list of subregions you must place:")[1]
@@ -476,7 +476,7 @@ def test_information_routing() -> None:
     v = zv(nodes, living, "object_bbox_batch")
     v["TO_PLACE"] = scene_context.render_to_place_block(object_specs(), by_id, parent_zone=living.id)
     to_place = ps.user("object_bbox_batch", v).split("Here is the list of objects you must place:")[1]
-    expect("orientation: 45deg" in to_place, "object orientation missing from TO_PLACE")
+    expect('orientation: "angled to face the sofa"' in to_place, "object orientation text missing from TO_PLACE")
     expect(f"parent_dimensions: {util.format_dimensions(by_id['side_table'].bbox)}" in to_place,
            "object spec peer-parent dims wrong")
 

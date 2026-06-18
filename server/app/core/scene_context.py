@@ -20,11 +20,19 @@ produced here:
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Literal
 
 from app.core import prompt_store, util
 from app.core.schemas import ObjectSpec, SubregionSpec
-from app.core.types import BoundingBox, Node, ProxyShape
+from app.core.types import (
+    BoundingBox,
+    Node,
+    ParentRelationshipKind,
+    ProxyShape,
+    Relationship,
+    RelationshipKind,
+)
 
 _NO_NODES_MESSAGE = "(no regions or objects have been placed yet — this is the very start of the run)"
 _NO_SUBREGIONS_MESSAGE = "{(none - no other subregions have been planned yet)}"
@@ -186,6 +194,26 @@ def render_root_objects(nodes: list[Node]) -> str:
     )
 
 
+def render_zone_objects(zone_id: str, nodes: list[Node]) -> str:
+    """Flat list of the objects placed DIRECTLY inside `zone_id` (those whose
+    `parent_region` is this zone) — the zone's CURRENT contents, pulled out as a
+    standalone block so a step like `next_object` can call attention to what's
+    already in the zone before deciding what to add next. Mirrors
+    `render_root_objects` but for an arbitrary zone; the same objects also appear
+    inline beneath this zone in `{SCENE_CONTEXT}`. Returns a short placeholder
+    when the zone holds no objects yet."""
+    objects = util.index_objects_by_region(nodes).get(zone_id, [])
+    if not objects:
+        return "No objects have been placed directly in this zone yet."
+    by_id = {n.id: n for n in nodes}
+    return (
+        f'Here\'s a list of objects already placed directly within "{zone_id}":\n\n'
+        + util.brace_group(
+            [_object_entry(o, by_id, parent_zone=zone_id) for o in objects]
+        )
+    )
+
+
 def render_embedded_block(
     nodes: list[Node],
     *,
@@ -213,7 +241,6 @@ def render_to_place_block(
     to_place: list[SubregionSpec] | list[ObjectSpec] | None,
     by_id: dict[str, Node],
     parent_zone: str | None = None,
-    show_orientation: bool = True,
 ) -> str:
     """Pseudo-JSON block of the children/objects whose bboxes a bbox-batch step must determine — the template writes the introducing sentence. Empty string when there is nothing to place.
 
@@ -223,7 +250,7 @@ def render_to_place_block(
 
     * OBJECTS (`ObjectSpec`, structural `parent`) keep the full anchor block — `parent`, `parent_relationship_kind`, and the parent's dimensions / global origin (the frame the object's bbox is authored in). When the structural parent is a peer rather than `parent_zone`, `parent_region` + `parent_region_dimensions` also name the region the object belongs to, mirroring `_object_entry`.
 
-    `show_orientation` stays True for objects (which carry a real yaw) but is False for subregions, since zones are never yawed."""
+    Objects also carry their `orientation` text — the semantic heading the decompose step authored (free text, not a yaw) — which the object_bbox_batch solver resolves to a discrete yaw; subregions have none."""
     if not to_place:
         return ""
     to_place_ids = {c.id for c in to_place}
@@ -262,8 +289,8 @@ def render_to_place_block(
                         f"parent_region_dimensions: {util.format_dimensions(by_id[parent_zone].bbox)}"
                     )
         lines.append(f"proxy_shape: {_render_proxy_shape(c.proxy_shape)}")
-        if show_orientation:
-            lines.append(f"orientation: {getattr(c, 'orientation', 0)}deg")
+        if spec_parent is not None:
+            lines.append(f'orientation: "{getattr(c, "orientation", "")}"')
         lines.append(f'prompt: "{c.prompt}"')
         lines.append(f'placement: "{c.placement}"')
         if c.referenced_ids:
@@ -273,6 +300,40 @@ def render_to_place_block(
             lines.append("relationships: []")
         entries.append(util.braces("\n".join(lines)))
     return util.brace_group(entries)
+
+
+def render_adjacent_zones_block(target_id: str, nodes: list[Node]) -> str:
+    """The zones ADJACENT to `target_id` — the nearest region in each direction
+    from the target's centre, found by ray-casting (see `util.adjacent_zones`) —
+    rendered in the SAME embedded form as `{SCENE_CONTEXT}` (each zone with its
+    plan, bbox, inline objects, and nested subregions), but TRIMMED to just the
+    neighbours. A neighbour that has already been developed shows its full
+    subtree; one only just placed shows its seed prompt + bbox (no plan yet).
+    Empty string when the target has no neighbours, so a template can gate on it.
+
+    When one neighbour is nested inside another (both border the target), only
+    the outermost is a top-level entry — the inner one appears nested within it
+    via the recursive entry, so every neighbour is shown exactly once."""
+    adjacent = util.adjacent_zones(target_id, nodes)
+    if not adjacent:
+        return ""
+    by_id = {n.id: n for n in nodes}
+    idx = util.index_children(nodes)
+    oidx = util.index_objects_by_region(nodes)
+    adjacent_ids = {z.id for z in adjacent}
+
+    def _nested_under_neighbour(z: Node) -> bool:
+        ancestor = z.parent_id
+        while ancestor is not None and ancestor in by_id:
+            if ancestor in adjacent_ids:
+                return True
+            ancestor = by_id[ancestor].parent_id
+        return False
+
+    tops = [z for z in adjacent if not _nested_under_neighbour(z)]
+    return util.brace_group(
+        [_region_embedded_entry(z, idx, oidx, by_id) for z in tops]
+    )
 
 
 # --- validation-retry feedback ({RETRY_BLOCK}) -------------------------------
@@ -443,12 +504,14 @@ def zone_vars(
         "ROOT_HEADER": _root_scene_header(root),
         "ROOT_OBJECTS": render_root_objects(nodes),
         "SCENE_CONTEXT": render_embedded_block(nodes, node_id=zone_id, text=target_text),
+        "ADJACENT_ZONES": render_adjacent_zones_block(zone_id, nodes),
         "ZONE_ID": zone_id,
         "ZONE_PROMPT": zone_prompt,
         "ZONE_PLAN": str(zone_plan or ""),
         "ZONE_PLACEMENT": str(focus.placement or "") if focus is not None else "",
         "ZONE_DIMENSIONS": util.format_dimensions(zone_bbox),
         "ZONE_ORIGIN": util.format_global_origin(zone_bbox),
+        "ZONE_OBJECTS": render_zone_objects(zone_id, nodes),
         "PARENT_ZONE_ID": parent_zone_id,
         "PARENT_ZONE_PLAN": str(parent.plan or "") if parent is not None else "",
         "PARENT_ZONE_ORIGIN": util.format_global_origin(parent.bbox) if parent is not None else "",
@@ -525,3 +588,150 @@ def image_prompt_vars(
         "PRIOR_SUBJECTS": prior_block,
     })
     return out
+
+
+# --- sample variable rendering (prompt-lab hover preview) ---------------------
+
+
+@lru_cache(maxsize=1)
+def sample_variables() -> dict[str, str]:
+    """Render EVERY `{VARIABLE}` against a fixed, representative sample scene
+    using the SAME builders the live pipeline injects with — so the prompt lab
+    can show each variable's real shape on hover, surfacing missing context or a
+    rendering bug without having to run a scene. Nothing here is hard-coded text:
+    every value comes out of `zone_vars` / `render_to_place_block` /
+    `render_retry_block` / `image_prompt_vars`, exactly as the pipeline calls
+    them. Cached — the sample scene is static.
+
+    The scene is a two-room cottage that exercises the real structure: a root
+    shell with a floor slab (root-anchored object), a living room holding a sofa
+    + coffee table + a lamp anchored ON that table (object-on-peer), a reading
+    nook nested INSIDE the living room (zone-in-zone), and a bedroom. The reading
+    nook is the focus zone, so ZONE_* gets a real region and PARENT_ZONE_* gets a
+    real non-root parent."""
+
+    def _box(origin: tuple[float, float, float], dims: tuple[float, float, float]) -> BoundingBox:
+        return BoundingBox(origin=origin, dimensions=dims)
+
+    root = Node(
+        id="root", prompt="A cozy two-room timber cottage",
+        bbox=_box((0.0, 0.0, 0.0), (8.0, 3.0, 6.0)), parent_id=None, is_zone=True,
+        plan="A warm, lived-in cottage split into a sunlit living room and a snug bedroom, finished in rustic timber and soft textiles.",
+    )
+    floor = Node(
+        id="floor_slab", prompt="a wide oak-plank floor slab",
+        bbox=_box((0.0, 0.0, 0.0), (8.0, 0.1, 6.0)),
+        parent_id="root", parent_kind=ParentRelationshipKind.IN, parent_region="root",
+        placement="covering the whole footprint at floor level", mesh_url="sample://floor_slab",
+    )
+    living = Node(
+        id="living_room", prompt="the cottage's living room",
+        bbox=_box((0.0, 0.0, 0.0), (5.0, 3.0, 6.0)),
+        parent_id="root", parent_kind=ParentRelationshipKind.IN, is_zone=True,
+        plan="A sunlit lounge centered on a low conversation set, warm and inviting.",
+        placement="the western two-thirds of the cottage",
+    )
+    bedroom = Node(
+        id="bedroom", prompt="the cottage's bedroom",
+        bbox=_box((5.0, 0.0, 0.0), (3.0, 3.0, 6.0)),
+        parent_id="root", parent_kind=ParentRelationshipKind.IN, is_zone=True,
+        plan="A snug sleeping nook with a single bed against the back wall.",
+        placement="the eastern third of the cottage",
+    )
+    sofa = Node(
+        id="linen_sofa", prompt="a tufted two-seater linen sofa",
+        bbox=_box((0.5, 0.1, 3.5), (2.0, 0.9, 0.9)),
+        parent_id="living_room", parent_kind=ParentRelationshipKind.IN, parent_region="living_room",
+        placement="against the west wall, facing the coffee table",
+        referenced_ids=[Relationship(target="coffee_table", kind=RelationshipKind.BESIDE)],
+        mesh_url="sample://linen_sofa",
+    )
+    table = Node(
+        id="coffee_table", prompt="a round walnut coffee table",
+        bbox=_box((1.0, 0.1, 2.0), (1.2, 0.45, 0.7)),
+        parent_id="living_room", parent_kind=ParentRelationshipKind.IN, parent_region="living_room",
+        placement="centered in front of the sofa", mesh_url="sample://coffee_table",
+    )
+    lamp = Node(
+        id="table_lamp", prompt="a brass table lamp with a linen shade",
+        bbox=_box((1.4, 0.55, 2.2), (0.3, 0.6, 0.3)),
+        parent_id="coffee_table", parent_kind=ParentRelationshipKind.ON, parent_region="living_room",
+        placement="centered on the coffee table", mesh_url="sample://table_lamp",
+    )
+    nook = Node(
+        id="reading_nook", prompt="a quiet reading nook",
+        bbox=_box((3.0, 0.0, 4.5), (2.0, 3.0, 1.5)),
+        parent_id="living_room", parent_kind=ParentRelationshipKind.IN, is_zone=True,
+        plan="A calm corner for reading by the window, anchored by a single armchair.",
+        placement="the southeast corner of the living room",
+    )
+    armchair = Node(
+        id="leather_armchair", prompt="a worn leather wingback armchair",
+        bbox=_box((3.3, 0.1, 4.7), (0.9, 1.0, 0.9)),
+        parent_id="reading_nook", parent_kind=ParentRelationshipKind.IN, parent_region="reading_nook",
+        orientation=45, placement="angled toward the window in the corner of the nook",
+        mesh_url="sample://leather_armchair",
+    )
+    bed = Node(
+        id="platform_bed", prompt="a low platform single bed with a quilt",
+        bbox=_box((5.5, 0.1, 0.5), (1.4, 0.6, 2.0)),
+        parent_id="bedroom", parent_kind=ParentRelationshipKind.IN, parent_region="bedroom",
+        placement="against the back (north) wall", mesh_url="sample://platform_bed",
+    )
+    nodes = [root, floor, living, bedroom, sofa, table, lamp, nook, armchair, bed]
+    by_id = {n.id: n for n in nodes}
+
+    # Scene-wide + target-zone set (focus = the nested reading nook).
+    out = zone_vars(
+        zone_id="reading_nook", zone_prompt=nook.prompt, zone_plan=nook.plan,
+        nodes=nodes, target_text="the region this step is acting on",
+    )
+
+    # TO_PLACE: a batch about to be placed in the nook — one anchored to the zone
+    # itself, one with a sibling hint, and one anchored ON a peer object (the
+    # armchair), so both the zone-parent and peer-parent branches render.
+    to_place = [
+        ObjectSpec(
+            id="oak_bookshelf", prompt="a narrow oak bookshelf", parent="reading_nook",
+            parent_kind=ParentRelationshipKind.IN,
+            placement="flush against the east wall of the nook", orientation="facing into the nook",
+        ),
+        ObjectSpec(
+            id="arc_floor_lamp", prompt="a slim arc floor lamp", parent="reading_nook",
+            parent_kind=ParentRelationshipKind.IN, placement="beside the armchair, arcing over it",
+            referenced_ids=[Relationship(target="leather_armchair", kind=RelationshipKind.BESIDE)],
+        ),
+        ObjectSpec(
+            id="folded_reading_glasses", prompt="a folded pair of reading glasses",
+            parent="leather_armchair", parent_kind=ParentRelationshipKind.ON,
+            placement="resting on the armchair's near arm",
+        ),
+    ]
+    out["TO_PLACE"] = render_to_place_block(to_place, by_id, parent_zone="reading_nook")
+
+    # RETRY_BLOCK: one rejected prior attempt, in the bulk-decompose feedback shape.
+    rejected = [
+        ObjectSpec(
+            id="arc_floor_lamp", prompt="a slim arc floor lamp", parent="reading_nook",
+            parent_kind=ParentRelationshipKind.IN, placement="beside the armchair",
+            referenced_ids=[Relationship(target="window", kind=RelationshipKind.BESIDE)],
+        ),
+    ]
+    out["RETRY_BLOCK"] = render_retry_block(
+        [(rejected, "relationships target 'window' does not exist in the scene context")]
+    )
+
+    # OBJECT_* / PROXY_SHAPE / IMAGE_TEMPLATE_* / PRIOR_SUBJECTS: the image-prompt
+    # step's set, sampled for the sofa. (image_prompt_vars rebuilds the zone set
+    # for the sofa's zone, so only the image-specific keys are taken from it.)
+    img = image_prompt_vars(
+        prompt=sofa.prompt, bbox=sofa.bbox, proxy_shape=sofa.proxy_shape,
+        prior_prompts=[floor.prompt, table.prompt, lamp.prompt], zone=living, nodes=nodes,
+    )
+    for k in (
+        "OBJECT_PROMPT", "OBJECT_DIMENSIONS", "PROXY_SHAPE",
+        "IMAGE_TEMPLATE_FRONT", "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP", "PRIOR_SUBJECTS",
+    ):
+        out[k] = img[k]
+
+    return {name: out.get(name, "") for name in prompt_store.ALL_VARIABLES}

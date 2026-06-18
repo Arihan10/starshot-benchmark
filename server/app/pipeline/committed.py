@@ -71,6 +71,16 @@ def bbox(node_id: str) -> BoundingBox | None:
     )
 
 
+def orientation(node_id: str) -> int | None:
+    """Committed yaw for a node, read from its `bbox` event (object_bbox_batch
+    solves it now and emit_bbox logs it). None when absent."""
+    e = logging.find_event("bbox", id=node_id)
+    if e is None:
+        return None
+    o = e.get("orientation")
+    return int(o) if isinstance(o, (int, float)) else None
+
+
 def zone_decompose(node_id: str) -> Any | None:
     """Committed `ZoneDecomposeOutput` (child specs) for a non-atomic zone,
     or None if this zone was never decomposed."""
@@ -175,7 +185,6 @@ def _spec_from_bbox(node_id: str) -> Any | None:
             parent_kind="IN",
             placement="",
             proxy_shape=e.get("proxy_shape"),
-            orientation=int(e.get("orientation", 0) or 0),
         )
     except Exception:
         return None

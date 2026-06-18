@@ -4,8 +4,9 @@
 import { api } from "./api.js";
 import { state, emit, on, cellSummary } from "./state.js";
 import { el, toast, stepUntilSelect, openModal } from "./ui.js";
-import { openStream, dispatchSceneEvent, applySceneProjection, createObsModel } from "./events.js";
+import { openStream, dispatchSceneEvent, applySceneProjection, createObsModel, emittedStep } from "./events.js";
 import * as obstree from "./obstree.js";
+import * as inquiry from "./inquiry.js";
 
 const overlayEl = document.getElementById("overlay");
 const titleEl = document.getElementById("overlay-title");
@@ -29,6 +30,11 @@ export function initOverlay(sceneViewer) {
   // without toggling it off. 3D-side picks highlight + reveal the tree row,
   // and the hover tooltip reads seed/plan/image text from the obs model.
   viewer.setNodeInfo((id) => obs.model.nodes.get(id) ?? null);
+  // Color objects in 3D by the decomposition step that emitted them (next_object
+  // purple, anchor green, negative_space brown) — read from the same provenance
+  // the tree shows as "via {step}". `recolorAll` (below) repaints once a load's
+  // history has folded, since the scene projection paints bboxes first.
+  viewer.setOriginOf((id) => emittedStep(obs.model, id));
   viewer.onSelect((id) => obstree.markSelected(id, { scroll: true }));
   obstree.setOnNodeClick((id, { ensureSelected = false } = {}) => {
     if (!viewer.hasBbox(id)) return;
@@ -41,11 +47,24 @@ export function initOverlay(sceneViewer) {
   obstree.setHiddenApi({ isHidden: viewer.isHidden, toggle: viewer.toggleHidden });
   viewer.onHiddenChange(() => obstree.renderTree(obs.model));
 
+  // "why?" on any call row → the decision-inquiry chat for that step. Read-only,
+  // so it's wired once (source AND branch views) and reads the live view at
+  // click time for the cell/run/branch context.
+  obstree.setOnInquire((call) => {
+    if (!state.view) return;
+    const { slot, model, branch } = state.view;
+    inquiry.openInquiry(call, { run: state.run, slot, model, branch });
+  });
+
   document.getElementById("overlay-close").addEventListener("click", closeOverlay);
   document.addEventListener("keydown", (ev) => {
     if (ev.key === "Escape" && overlayEl.classList.contains("open")
         && !document.getElementById("modal-root").firstChild) {
       closeOverlay();
+      // When the full scene was opened from the compare view (stacked beneath),
+      // don't let the SAME Escape also close compare — return to it instead.
+      // The overlay's keydown is registered before compare's (see main init).
+      ev.stopImmediatePropagation();
     }
   });
   for (const btn of document.querySelectorAll("#viewer-toggles [data-toggle]")) {
@@ -111,17 +130,20 @@ function scheduleTreeRender() {
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
-    obstree.renderTree(obs.model);
+    obstree.renderTree(obs.model, { streamed: true });
     if (state.view?.branch && state.lab.simStep) obstree.renderPinned(obs.model);
   });
 }
 
-export async function openCell({ slot, model, branch = false }) {
+export async function openCell({ slot, model, branch = false, forceLive = false }) {
   const seq = ++openSeq;
   const run = state.run;
   stream?.close();
   stream = null;
   state.view = { slot, model, branch };
+  // Close any inquiry chat that belongs to a different cell/mode (same-cell
+  // re-subscribes from resume/step keep it open).
+  inquiry.notifyView({ run, slot, model, branch });
   overlayEl.classList.add("open");
   viewer.setActive(true);
   viewer.clear();
@@ -130,6 +152,9 @@ export async function openCell({ slot, model, branch = false }) {
   obstree.setPinStep(branch ? state.lab.simStep : null);
   // Revert is a source-cell action (branches are discarded, not rewound).
   obstree.setOnRevert(branch ? null : revertToCall);
+  // "+ sim" on a zone row drops it into the prompt lab's simulation slots. A
+  // source-cell action — you fork a NEW branch from the source, not from one.
+  obstree.setOnAddSim(branch ? null : (node) => emit("add-sim-target", { slot, model, node }));
   renderHeader();
 
   let projection = { nodes: [], last_index: -1 };
@@ -148,12 +173,19 @@ export async function openCell({ slot, model, branch = false }) {
   } catch { /* never-started cell */ }
   if (seq !== openSeq) return;
   for (const event of history) obs.feed(event);
+  // The scene projection painted bboxes before this history folded, so objects
+  // were colored the default green; repaint now that each node's emitting step
+  // is known. (Streamed bboxes color correctly on paint — their decompose call
+  // always precedes the bbox event.)
+  viewer.recolorAll();
   obstree.renderTree(obs.model);
   if (branch && state.lab.simStep) obstree.renderPinned(obs.model);
   renderHeader(); // error message comes from the just-loaded log
 
+  // `forceLive` subscribes without waiting for the next poll — used right
+  // after a revert relaunches the cell, so the polled summary is still stale.
   const summary = currentSummary();
-  const live = (branch ? summary?.branch?.status : summary?.status) === "running";
+  const live = forceLive || (branch ? summary?.branch?.status : summary?.status) === "running";
   if (live) {
     const since = Math.max(obs.model.maxIndex, projection.last_index ?? -1);
     subscribe(seq, since);
@@ -181,6 +213,19 @@ function buildUrl(since) {
   return api.eventsUrl(state.run, slot, model, { branch, since });
 }
 
+// Re-attach the SSE tail to the CURRENT cell without reloading it — used on
+// resume/start in place of a full `openCell`, so the scene + observability dock
+// stay exactly as they are and only new events fold in. Rolls back any folded
+// terminal sentinel first (resume truncates it server-side and reuses its
+// index), then tails from where we left off.
+function relinkStream() {
+  stream?.close();
+  stream = null;
+  obs.rewindTerminal();
+  subscribe(openSeq, obs.model.maxIndex);
+  renderHeader();
+}
+
 function currentSummary() {
   if (!state.view) return null;
   return cellSummary(state.view.slot, state.view.model);
@@ -195,11 +240,24 @@ function renderHeader() {
   crumbsEl.textContent = `${state.run}${branch ? " · simulation branch" : ""}`;
   const status = branch ? (branchInfo?.status ?? "?") : (summary?.status ?? "?");
   dotEl.className = `dot ${status}`;
-  const pending = branch ? branchInfo?.pending : summary?.pending;
-  let statusText = branch
-    ? `branch ${status} · ${branchInfo?.events_count ?? 0} events`
-    : `${status}${summary?.stepped ? " · stepped" : ""} · ${summary?.events_count ?? 0} events`;
-  if (pending) statusText += ` · awaiting step: ${pending.step} @ ${pending.node ?? "?"}`;
+  const cellInfo = branch ? branchInfo : summary;
+  const pending = cellInfo?.pending;
+  const cur = cellInfo?.current;
+  // Show the EXACT step the cell is on: the gated step it's awaiting, the call
+  // in flight while running, else the last phase marker — not a stale phase.
+  const ls = cellInfo?.last_step;
+  const stepDesc = pending
+    ? `awaiting ${pending.step} @ ${pending.node ?? "?"}`
+    : status === "running" && cur
+    ? `running ${cur.template ?? cur.step} @ ${cur.node ?? "?"}`
+    : ls && ls.node
+    ? `${ls.node} · ${ls.phase ?? "?"}`
+    : status === "idle"
+    ? "not started"
+    : null;
+  let statusText = branch ? `branch ${status}` : `${status}${summary?.stepped ? " · stepped" : ""}`;
+  if (stepDesc) statusText += ` · ${stepDesc}`;
+  statusText += ` · ${cellInfo?.events_count ?? 0} events`;
   if (status === "error") {
     // Put the failure reason where the eye lands first; the log strip below
     // has the full trail.
@@ -282,7 +340,8 @@ function renderHeader() {
 }
 
 // Revert the open source cell to just before `call` — confirms first (it
-// drops every later step + its meshes), then reloads the overlay at the cut.
+// drops every later step + its meshes), then re-runs the pipeline from the cut
+// and reloads the overlay streaming the re-run live.
 function revertToCall(call) {
   const { slot, model, branch } = state.view ?? {};
   if (!slot || branch) return;
@@ -290,18 +349,19 @@ function revertToCall(call) {
   openModal(`revert ${slot} · ${model}?`, (close, setError) => ({
     body: [
       el("div", { class: "m-hint", text:
-        `Truncates this slot's log to just before its ${step} call (#${call.index}) and ` +
-        "drops every later step and its meshes. The slot lands paused there — resume, step, " +
-        "or re-run (with edited prompts) to continue." }),
+        `Truncates this slot's log to just before its ${step} call (#${call.index}), ` +
+        "drops every later step and its meshes, then re-runs the pipeline from there." }),
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
-      el("button", { class: "danger", text: "revert", onclick: async () => {
+      el("button", { class: "danger", text: "revert & re-run", onclick: async () => {
         try { await api.rewind(state.run, slot, model, call.index); }
         catch (e) { setError(e.message); return; }
         close();
         toast(`reverted ${slot} · ${model} to #${call.index}`, "ok");
-        openCell({ slot, model, branch: false }); // reload scene + tree at the cut
+        // The cell is already relaunching server-side; reload at the cut and
+        // stream the re-run (forceLive — the polled summary is still stale).
+        openCell({ slot, model, branch: false, forceLive: true });
         emit("poll-now");
       } }),
     ],
@@ -337,17 +397,24 @@ async function onAction() {
   if (!slot) return;
   const summary = currentSummary();
   const status = branch ? summary?.branch?.status : summary?.status;
+  const pausing = status === "running";
   try {
     if (branch) {
-      if (status === "running") await api.branchPause(state.run, slot, model);
+      if (pausing) await api.branchPause(state.run, slot, model);
       else await api.branchResume(state.run, slot, model);
     } else {
-      if (status === "running") await api.pause(state.run, slot, model);
+      if (pausing) await api.pause(state.run, slot, model);
       else await api.resume(state.run, slot, model);
     }
     emit("poll-now");
-    // Re-open to (re)wire SSE against the new lifecycle state.
-    setTimeout(() => { if (state.view?.slot === slot) openCell({ slot, model, branch }); }, 350);
+    // Bail if the view moved while the request was in flight.
+    if (!state.view || state.view.slot !== slot || state.view.model !== model || state.view.branch !== branch) return;
+    // Re-wire the live stream IN PLACE rather than reloading the cell — no
+    // viewer.clear / dock reset, so the scene + observability stay put.
+    // Pausing lets the open stream wind down on its run.paused; resuming/
+    // starting re-tails so new events fold into the existing view.
+    if (pausing) renderHeader();
+    else relinkStream();
   } catch (e) {
     toast(e.message, "err");
   }
@@ -374,4 +441,5 @@ export function closeOverlay() {
   overlayEl.classList.remove("open");
   viewer.setActive(false);
   obstree.setPinStep(null);
+  inquiry.closeInquiry();
 }

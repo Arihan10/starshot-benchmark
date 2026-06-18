@@ -17,6 +17,10 @@ const GIFJS_DIR = resolve(__dirname, "node_modules", "gif.js", "dist");
 
 const PORT = Number(process.env.PORT ?? 8766);
 const SERVER_URL = process.env.SERVER_URL ?? "http://127.0.0.1:8765";
+// "bfs" | "dfs" — flips the dashboard's main-screen backdrop (light vs dark)
+// so a BFS run is instantly distinguishable from a DFS one. Set by the launch
+// script (scripts/run_bfs.py); defaults to dfs (dark) for every other entry.
+const PIPELINE_MODE = process.env.PIPELINE_MODE ?? "dfs";
 // Which page to open on boot: "/" (pipeline dashboard) or "/oneshot"
 // (the one-shot bench, used by scripts/run_oneshot.py).
 const VIEWER_PATH = process.env.VIEWER_PATH ?? "/";
@@ -64,6 +68,11 @@ async function serveIndex(res, relHtmlPath = "index.html") {
         html = html.replace(
             /<meta name="server-url"[^>]*>/,
             `<meta name="server-url" content="${SERVER_URL}">`,
+        );
+        // Flip the BFS/DFS backdrop by stamping the active pipeline onto <html>.
+        html = html.replace(
+            /(<html\b[^>]*\bdata-pipeline=")[^"]*(")/,
+            `$1${PIPELINE_MODE}$2`,
         );
         res.writeHead(200, {
             "Content-Type": MIME[".html"],

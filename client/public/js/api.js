@@ -67,12 +67,15 @@ export const api = {
 
   // --- cell data ---
   //   branch:true → the cell's simulation fork.
-  scene: (run, slot, model, { branch = false } = {}) =>
-    request(cellPath(slot, model, branch ? "/branch/scene" : "/scene"), { params: { run } }),
+  //   untilIndex → project/bundle only the source prefix BEFORE that event
+  //     (the compare view's "previous" pane: the original's state at the fork
+  //     step). Source-only; ignored for branch reads.
+  scene: (run, slot, model, { branch = false, untilIndex } = {}) =>
+    request(cellPath(slot, model, branch ? "/branch/scene" : "/scene"), { params: { run, until_index: untilIndex } }),
   eventsUrl: (run, slot, model, { branch = false, since } = {}) =>
     u(cellPath(slot, model, branch ? "/branch/events" : "/events"), { run, since }).toString(),
-  meshesUrl: (run, slot, model, { branch = false } = {}) =>
-    u(cellPath(slot, model, branch ? "/branch/meshes" : "/meshes"), { run }).toString(),
+  meshesUrl: (run, slot, model, { branch = false, untilIndex } = {}) =>
+    u(cellPath(slot, model, branch ? "/branch/meshes" : "/meshes"), { run, until_index: untilIndex }).toString(),
   // Full history backfill (cache.llm payloads included) straight from disk.
   async eventsHistory(run, slot, model, { branch = false } = {}) {
     const sub = branch ? "_branch/" : "";
@@ -92,6 +95,9 @@ export const api = {
 
   // --- prompt lab ---
   promptTemplates: (run) => request(`/runs/${encodeURIComponent(run)}/prompt-templates`),
+  // Every `{VARIABLE}` rendered against a fixed sample scene by the real
+  // server-side injection functions — the lab's hover preview. Run-independent.
+  variableSamples: () => request("/variable-samples"),
   stepEvents: (run, step) => request(`/runs/${encodeURIComponent(run)}/step-events`, { params: { step } }),
   stepEvent: (run, slot, model, index, step) =>
     request(`/runs/${encodeURIComponent(run)}/step-event`, { params: { run, slot, model, index, step } }),
@@ -100,8 +106,22 @@ export const api = {
   promptTest: (body) => request("/prompt-test", { method: "POST", body }),
   createBranch: (run, slot, model, body) =>
     request(cellPath(slot, model, "/branch"), { method: "POST", params: { run }, body }),
-  branchStep: (run, slot, model, auto = false) =>
-    request(cellPath(slot, model, "/branch/step"), { method: "POST", params: { run }, body: { auto } }),
+  // `auto` runs the branch to completion; `until` (a template id) fast-forwards
+  // it to the next call of that step. A plain step queues if the branch is
+  // mid-call (so a batch "step sims" never errors on a not-yet-gated branch).
+  // `modelOverride` (a model alias) re-aims the next gated call at a chosen LLM
+  // (compare's per-step A/B); null keeps the branch's current model.
+  branchStep: (run, slot, model, auto = false, until = null, modelOverride = null) =>
+    request(cellPath(slot, model, "/branch/step"), { method: "POST", params: { run }, body: { auto, until, model: modelOverride } }),
+  // Revert a simulation branch to before `toEventIndex` and pause there; a
+  // following branchStep re-runs from the cut under the current snapshot +
+  // `overrides` (the lab's live edit set). `overrides=null` keeps the branch's
+  // existing edits.
+  branchRewind: (run, slot, model, toEventIndex, overrides = null) =>
+    request(cellPath(slot, model, "/branch/rewind"), { method: "POST", params: { run }, body: { to_event_index: toEventIndex, overrides } }),
+  // Promote a cell's simulation branch to BE the source cell (replace + discard).
+  commitBranch: (run, slot, model) =>
+    request(cellPath(slot, model, "/branch/commit"), { method: "POST", params: { run } }),
   branchPause: (run, slot, model) =>
     request(cellPath(slot, model, "/branch/pause"), { method: "POST", params: { run } }),
   branchResume: (run, slot, model) =>
@@ -116,6 +136,16 @@ export const api = {
       method: "PUT",
       body: { overrides, update_version: updateVersion },
     }),
-  rerunStep: (run, steps, cells = null) =>
-    request(`/runs/${encodeURIComponent(run)}/rerun-step`, { method: "POST", body: { steps, cells } }),
+  // Fork a simulation branch in each cell at its earliest call of any of
+  // `steps` (non-destructive — source untouched). Replaces the old destructive
+  // rerun-step.
+  simulateStep: (run, steps, cells = null) =>
+    request(`/runs/${encodeURIComponent(run)}/simulate-step`, { method: "POST", body: { steps, cells } }),
+
+  // --- decision inquiry ---
+  // Ask the reviewer (Claude Opus 4.8, xhigh) why a step's subject model
+  // decided what it did. `body` carries the step grounding (step/model/system/
+  // user/output/reasoning) plus the running `messages` thread; returns
+  // {answer, reasoning, model}.
+  inquire: (body) => request("/inquire", { method: "POST", body }),
 };

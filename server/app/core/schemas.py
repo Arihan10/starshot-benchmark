@@ -94,7 +94,10 @@ class ChildNodeSpec(BaseModel):
         default_factory=list, alias="relationships"
     )
     proxy_shape: ProxyShape | None = None
-    orientation: Orientation = 0
+    # Semantic orientation the decompose steps author (e.g. "facing the
+    # conversation pit") as free text, NOT a yaw angle — object_bbox_batch
+    # resolves it to the discrete yaw from this plus the surrounding layout.
+    orientation: str = ""
 
     @field_validator("proxy_shape", mode="before")
     @classmethod
@@ -170,6 +173,18 @@ class BboxBatchOutput(BaseModel):
     assignments: list[BboxAssignment] = Field(default_factory=list)
 
 
+class ObjectBboxAssignment(BboxAssignment):
+    # object_bbox_batch RESOLVES the object's discrete yaw from its semantic
+    # `orientation` text (carried on the spec) plus the surrounding layout, so
+    # its assignment carries the numeric `orientation` on top of the bbox.
+    # Subregion placement (child_bbox_batch) stays bbox-only.
+    orientation: Orientation = 0
+
+
+class ObjectBboxBatchOutput(BaseModel):
+    assignments: list[ObjectBboxAssignment] = Field(default_factory=list)
+
+
 class ObjectSpec(ChildNodeSpec):
     """A single object in a region. Identical shape to ChildNodeSpec.
     The structural parent (`parent` field) may be the enclosing region,
@@ -180,11 +195,16 @@ class ObjectSpec(ChildNodeSpec):
 
 
 class ObjectDecompOutput(BaseModel):
-    # NEWLY EMITTED shell/object specs. These become Nodes downstream.
+    # NEWLY EMITTED object specs — the anchor + negative-space passes. These
+    # become Nodes downstream. No `bounding_required`: only the encapsulating
+    # pass gates on a perimeter, so only its schema (below) carries that field.
     objects: list[ObjectSpec] = Field(default_factory=list)
-    # Encapsulating-only gate: when the model sets this False the region needs no
-    # bounding perimeter and `objects` is ignored even if non-empty. Anchor and
-    # negative-space decompositions leave it at the default True.
+
+
+class EncapsulatingDecompOutput(ObjectDecompOutput):
+    # The encapsulating pass adds a perimeter gate on top of the object list:
+    # when the model sets this False the region needs no bounding perimeter and
+    # `objects` is ignored even if non-empty.
     bounding_required: bool = True
 
 

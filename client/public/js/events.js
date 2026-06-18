@@ -59,7 +59,19 @@ export function dispatchSceneEvent(viewer, event) {
 // Paint the server's CQRS /scene projection (fast first paint; meshes follow
 // via the bundle stream + live model events).
 export function applySceneProjection(viewer, projection) {
-  for (const n of projection.nodes ?? []) {
+  const nodes = projection.nodes ?? [];
+  // A projection is a COMPLETE snapshot of the scene at its cut, so first prune
+  // anything the viewer holds that isn't in it (handles the cut moving backward
+  // — scrub/revert — which the old additive paint left stale). `mesh_url` marks
+  // the nodes whose mesh is committed by this cut.
+  const bboxIds = new Set();
+  const meshIds = new Set();
+  for (const n of nodes) {
+    if (Array.isArray(n.origin) && Array.isArray(n.dimensions)) bboxIds.add(n.id);
+    if (n.mesh_url) meshIds.add(n.id);
+  }
+  viewer.pruneTo({ bboxIds, meshIds });
+  for (const n of nodes) {
     if (n.node_kind) viewer.setKind(n.id, n.node_kind);
     if (Array.isArray(n.origin) && Array.isArray(n.dimensions)) {
       viewer.loadBbox({
@@ -147,6 +159,14 @@ export function createObsModel() {
     order: [],         // node ids in first-seen order
     calls: [],         // every cache.llm event, log order
     log: [],           // filtered lifecycle/error/warning entries, log order
+    // id -> [{relation, call}] — the calls that brought this node into
+    // existence: "emitted_by" (a decompose step that NAMED it) and "placed_by"
+    // (a bbox-batch step that gave it its box). Those calls run on the node's
+    // REGION (event.node), so they're bucketed on a different id in `nodes` —
+    // this is the only place an object can learn the step + region that made
+    // it, which matters most for negative-space objects whose region isn't
+    // their structural parent.
+    provenance: new Map(),
     errorCount: 0,
     maxIndex: -1,
   };
@@ -164,6 +184,38 @@ export function createObsModel() {
     return n;
   }
 
+  // Scan a finished LLM call's structured output for the ids it brought into
+  // existence and record provenance for each. `event.node` is the call site —
+  // for a decompose / bbox-batch step that's the REGION the step ran on, which
+  // is what we surface as "<step> on <region>". Only the id-bearing output
+  // shapes matter: `children`/`objects` + single `object` (decompose, named →
+  // emitted_by) and `assignments` (bbox batch, positioned → placed_by); every
+  // other step (zone_plan, image_prompt, overall_bbox) names no ids.
+  function recordProvenance(event) {
+    const out = event.output;
+    if (!out || typeof out !== "object") return;
+    const relation =
+      event.step === "child_bbox_batch" || event.step === "object_bbox_batch"
+        ? "placed_by"
+        : "emitted_by";
+    const tag = (cid) => {
+      if (typeof cid !== "string" || cid === event.node) return;
+      const arr = model.provenance.get(cid) ?? [];
+      // One entry per (relation, event index): an SSE reconnect replays the
+      // same call, and a malformed output could name the same id twice.
+      if (arr.some((e) => e.relation === relation && e.call.index === event.index)) return;
+      arr.push({ relation, call: event });
+      model.provenance.set(cid, arr);
+    };
+    const tagList = (list) => {
+      if (Array.isArray(list)) for (const x of list) tag(x?.id);
+    };
+    tagList(out.children);
+    tagList(out.objects);
+    tagList(out.assignments);
+    if (out.object && typeof out.object === "object") tag(out.object.id);
+  }
+
   function feed(event) {
     const idx = typeof event.index === "number" ? event.index : null;
     if (idx !== null) {
@@ -179,6 +231,7 @@ export function createObsModel() {
       case "cache.llm": {
         model.calls.push(event);
         node(event.node ?? "(unattributed)").calls.push(event);
+        recordProvenance(event);
         return true;
       }
       case "bbox": {
@@ -235,8 +288,24 @@ export function createObsModel() {
     model.order.length = 0;
     model.calls.length = 0;
     model.log.length = 0;
+    model.provenance.clear();
     model.errorCount = 0;
     model.maxIndex = -1;
+  }
+
+  // Resume/retry truncates the cell's trailing run.paused / run.error sentinel
+  // server-side and reuses its log index for the first new event. We already
+  // folded that sentinel, so undo it before re-tailing the stream — otherwise
+  // the dedup floor (`idx <= maxIndex`) swallows the first resumed event. The
+  // sentinel is always the last event folded (the stream closed on it), so
+  // dropping its log row and stepping maxIndex back one is exact.
+  function rewindTerminal() {
+    const last = model.log[model.log.length - 1];
+    if (last && (last.kind === "run.paused" || last.kind === "run.error")) {
+      model.log.pop();
+      if (last.severity === "error") model.errorCount = Math.max(0, model.errorCount - 1);
+      model.maxIndex -= 1;
+    }
   }
 
   function lastError() {
@@ -256,5 +325,15 @@ export function createObsModel() {
     return null;
   }
 
-  return { model, feed, reset, lastCallOf, lastError };
+  return { model, feed, reset, rewindTerminal, lastCallOf, lastError };
+}
+
+// The decomposition step recorded as a node's `emitted_by` provenance — the
+// pass that NAMED it (anchor_decompose / next_object / negative_space_decompose
+// / encapsulating_decompose). The 3D viewer keys object colors off this; the
+// obs tree shows the same value as the node row's "via {step}" pill. Null when
+// nothing has named the node yet (provenance not folded, or a plain zone).
+export function emittedStep(model, id) {
+  const e = (model.provenance?.get(id) ?? []).find((p) => p.relation === "emitted_by");
+  return e ? (e.call.template ?? e.call.step ?? null) : null;
 }

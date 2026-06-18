@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Zone adjacency raycast — visualizer</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #0a0e14; color: #cdd6e4; }
+  #view { position: fixed; inset: 0; }
+  #panel {
+    position: fixed; top: 12px; left: 12px; width: 340px; max-height: calc(100% - 24px);
+    overflow: auto; background: rgba(14,19,28,0.92); border: 1px solid #243044;
+    border-radius: 10px; padding: 14px 16px; backdrop-filter: blur(4px); z-index: 10;
+  }
+  h1 { font-size: 14px; margin: 0 0 10px; color: #eaf0f8; }
+  label.row { display: block; margin: 8px 0 4px; font-size: 12px; color: #9fb0c6; }
+  select { width: 100%; padding: 6px 8px; background: #0f1622; color: #dfe7f0;
+    border: 1px solid #2a3a52; border-radius: 6px; font-family: inherit; font-size: 13px; }
+  .nums { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+  .nums label { flex: 1; min-width: 92px; display: flex; flex-direction: column; gap: 3px; font-size: 11px; color: #9fb0c6; }
+  .nums input { width: 100%; padding: 5px 6px; background: #0f1622; color: #dfe7f0;
+    border: 1px solid #2a3a52; border-radius: 6px; font-family: inherit; font-size: 12px; }
+  .stats { font-size: 11px; color: #7d8ca6; margin-top: 8px; }
+  .checks { margin: 12px 0; display: flex; flex-direction: column; gap: 6px; font-size: 12px; }
+  .checks label { display: flex; gap: 8px; align-items: center; cursor: pointer; color: #cdd6e4; }
+  .legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 10px 0; font-size: 11px; }
+  .legend span { display: inline-flex; align-items: center; gap: 5px; }
+  .sw { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .note { font-size: 12px; line-height: 1.45; color: #aebbcd; background: #0f1622;
+    border: 1px solid #223049; border-radius: 6px; padding: 8px 10px; margin-top: 8px; }
+  .ids { font-size: 12px; line-height: 1.5; margin-top: 8px; }
+  .ids b { color: #eaf0f8; }
+  .pill { display: inline-block; padding: 1px 6px; border-radius: 999px; margin: 2px 3px 0 0; font-size: 11px; }
+  .pill.adj { background: rgba(53,208,127,0.18); color: #6ee7a6; border: 1px solid #2f7a52; }
+  .pill.no  { background: rgba(138,160,184,0.12); color: #9fb0c6; border: 1px solid #34465f; }
+  .hint { font-size: 11px; color: #708099; margin-top: 10px; line-height: 1.4; }
+  code { color: #d6b36b; }
+</style>
+<script type="importmap">
+{ "imports": {
+  "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+  "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+}}
+</script>
+</head>
+<body>
+<div id="panel">
+  <h1>Zone adjacency — raycast visualizer</h1>
+  <label class="row" for="sceneSel">Sample scene</label>
+  <select id="sceneSel"></select>
+  <label class="row" for="targetSel">Target zone (or click a box)</label>
+  <select id="targetSel"></select>
+  <label class="row" for="methodSel">Adjacency method</label>
+  <select id="methodSel">
+    <option value="visibility" selected>pairwise visibility (segments)</option>
+    <option value="raycast">raycast (sphere)</option>
+  </select>
+  <label class="row" for="originSel">Ray origins (raycast)</label>
+  <select id="originSel">
+    <option value="surface" selected>box surface (multi-origin)</option>
+    <option value="center">single center point</option>
+  </select>
+  <div class="nums">
+    <label>origins (K)<input type="number" id="kIn" value="128" min="1" max="600" step="1" /></label>
+    <label>dirs / origin (M)<input type="number" id="mIn" value="192" min="8" max="4000" step="8" /></label>
+    <label>vis spacing (m)<input type="number" id="spacingIn" value="1.5" min="0.25" max="20" step="0.25" /></label>
+  </div>
+  <div class="checks">
+    <label><input type="checkbox" id="cRays" checked /> show rays / clear connections</label>
+    <label><input type="checkbox" id="cEsc" /> show escaped rays / blocked connections</label>
+    <label><input type="checkbox" id="cOrigins" checked /> show origins / surface samples</label>
+    <label><input type="checkbox" id="cLabels" checked /> show labels</label>
+    <label><input type="checkbox" id="cOthers" checked /> show non-adjacent zones</label>
+  </div>
+  <div class="legend">
+    <span><i class="sw" style="background:#ffa033"></i>target</span>
+    <span><i class="sw" style="background:#35d07f"></i>adjacent</span>
+    <span><i class="sw" style="background:#8aa0b8"></i>other</span>
+    <span><i class="sw" style="background:#39d0c8"></i>ray / clear conn</span>
+    <span><i class="sw" style="background:#ff5566"></i>blocked conn</span>
+    <span><i class="sw" style="background:#ffffff"></i>origin / sample</span>
+  </div>
+  <div class="stats" id="stats"></div>
+  <div class="note" id="note"></div>
+  <div class="ids" id="ids"></div>
+  <div class="hint">Axes: <b>+X</b> right, <b>+Y</b> up, <b>+Z</b> toward you. Drag to orbit, scroll to zoom.
+    <b>Pairwise visibility</b> connects surface points of each zone pair and keeps the pair if any segment is unobstructed (catches far / small zones the raycast misses; toggle "show blocked connections" to see why a zone is dropped). <b>Raycast</b> shoots a sphere of rays from the box surface (K origins × M dirs) and keeps each ray's first hit.</div>
+</div>
+<div id="view"></div>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+/* ============================================================================
+ * Adjacency algorithm — a faithful port of server/app/core/util.adjacent_zones.
+ * Zones here are {id, parent, min:[x,y,z], max:[x,y,z]}. All are "regions".
+ * ==========================================================================*/
+const RAY_EPS = 1e-9;
+
+function fibDirections(n) {
+  const golden = Math.PI * (3 - Math.sqrt(5));
+  const out = [];
+  for (let k = 0; k < n; k++) {
+    const i = k + 0.5;
+    const y = 1 - 2 * i / n;
+    const r = Math.sqrt(Math.max(0, 1 - y * y));
+    const t = golden * i;
+    out.push([r * Math.cos(t), y, r * Math.sin(t)]);
+  }
+  return out;
+}
+
+const center = (z) => [(z.min[0] + z.max[0]) / 2, (z.min[1] + z.max[1]) / 2, (z.min[2] + z.max[2]) / 2];
+const size = (z) => [z.max[0] - z.min[0], z.max[1] - z.min[1], z.max[2] - z.min[2]];
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const norm = (v) => { const l = Math.hypot(v[0], v[1], v[2]) || 1; return [v[0] / l, v[1] / l, v[2] / l]; };
+const clampDir = (d) => d.map((v) => (Math.abs(v) < RAY_EPS ? (v < 0 ? -RAY_EPS : RAY_EPS) : v));
+
+function interpenetrates(a, b) {
+  for (let i = 0; i < 3; i++)
+    if (Math.min(a.max[i], b.max[i]) - Math.max(a.min[i], b.min[i]) <= RAY_EPS) return false;
+  return true;
+}
+function buildIndex(zones) {
+  const byId = {}, childrenOf = {};
+  for (const z of zones) { byId[z.id] = z; (childrenOf[z.parent] ||= []).push(z); }
+  return { byId, childrenOf };
+}
+function isAncestorOf(anc, nodeId, byId) {
+  let p = byId[nodeId].parent;
+  while (p != null && byId[p]) { if (p === anc) return true; p = byId[p].parent; }
+  return false;
+}
+function deepestOfTie(ids, byId) {
+  const set = new Set(ids);
+  return ids.filter((id) => {
+    for (const other of set) if (other !== id && isAncestorOf(id, other, byId)) return false;
+    return true;
+  });
+}
+
+// Distance at which ray (o, d) exits box b.
+function exitT(o, d, b) {
+  let tExit = Infinity;
+  for (let i = 0; i < 3; i++) {
+    const di = Math.abs(d[i]) < RAY_EPS ? (d[i] < 0 ? -RAY_EPS : RAY_EPS) : d[i];
+    tExit = Math.min(tExit, Math.max((b.min[i] - o[i]) / di, (b.max[i] - o[i]) / di));
+  }
+  return tExit;
+}
+// K origins spread over the target's surface (fib directions projected onto the
+// box), nudged 0.1% inside so a flush neighbour still has a positive entry.
+function surfaceOrigins(target, k) {
+  const c = center(target);
+  return fibDirections(k).map((d) => {
+    const t = exitT(c, d, target) * (1 - 1e-3);
+    return [c[0] + d[0] * t, c[1] + d[1] * t, c[2] + d[2] * t];
+  });
+}
+// First region entered by ray (o, d0): nearest entry (occlusion), ties resolved
+// to the deepest region. Returns { t, ids } or null if the ray hits nothing.
+function firstHit(o, d0, candidates, byId) {
+  const d = clampDir(d0);
+  const entered = [];
+  for (const c of candidates) {
+    let tEnter = -Infinity, tExit = Infinity;
+    for (let i = 0; i < 3; i++) {
+      const t1 = (c.min[i] - o[i]) / d[i], t2 = (c.max[i] - o[i]) / d[i];
+      const lo = Math.min(t1, t2), hi = Math.max(t1, t2);
+      if (lo > tEnter) tEnter = lo;
+      if (hi < tExit) tExit = hi;
+    }
+    if (tEnter <= tExit && tExit >= 0 && tEnter > RAY_EPS) entered.push({ id: c.id, t: tEnter });
+  }
+  if (!entered.length) return null;
+  let min = Infinity;
+  for (const e of entered) if (e.t < min) min = e.t;
+  const tied = entered.filter((e) => e.t <= min + RAY_EPS).map((e) => e.id);
+  return { t: min, ids: tied.length > 1 ? deepestOfTie(tied, byId) : tied };
+}
+
+// Returns { hits:Set<id>, rays:[{o:[3], dir:[3], t:number|null}], origins:[[3]] }.
+// originMode: 'surface' (K origins over the box surface, each casting M outward
+// rays) or 'center' (one origin at the centre, M rays over the full sphere).
+function adjacentZones(zones, targetId, opts = {}) {
+  const { originMode = 'surface', K = 128, M = 192 } = opts;
+  const { byId, childrenOf } = buildIndex(zones);
+  const target = byId[targetId];
+  if (!target) return { hits: new Set(), rays: [], origins: [] };
+
+  const excluded = new Set([targetId]);
+  let anc = target.parent;
+  while (anc != null && byId[anc] && !excluded.has(anc)) { excluded.add(anc); anc = byId[anc].parent; }
+  const stack = [targetId];
+  while (stack.length) {
+    const cur = stack.pop();
+    for (const ch of (childrenOf[cur] || [])) if (!excluded.has(ch.id)) { excluded.add(ch.id); stack.push(ch.id); }
+  }
+
+  const candidates = zones.filter((z) => !excluded.has(z.id));
+  const hits = new Set();
+  for (const c of candidates) if (interpenetrates(target, c)) hits.add(c.id);
+
+  const c0 = center(target);
+  const origins = originMode === 'surface' ? surfaceOrigins(target, K) : [c0];
+  const dirs = fibDirections(M);
+  const rays = [];
+  for (const o of origins) {
+    const isCenter = o[0] === c0[0] && o[1] === c0[1] && o[2] === c0[2];
+    const outward = isCenter ? null : norm(sub(o, c0)); // surface origins only fire outward
+    for (const d0 of dirs) {
+      if (outward && dot(d0, outward) < 0) continue;
+      const hit = firstHit(o, d0, candidates, byId);
+      if (!hit) { rays.push({ o, dir: d0, t: null }); continue; }
+      for (const id of hit.ids) hits.add(id);
+      rays.push({ o, dir: d0, t: hit.t });
+    }
+  }
+  return { hits, rays, origins };
+}
+
+/* ============================================================================
+ * Adjacency method 2 — pairwise mutual VISIBILITY between AABBs.
+ * T and C are adjacent iff some segment from T's surface to C's surface is
+ * unobstructed by a third zone. This enumerates zone PAIRS (not directions), so
+ * far / small zones are never "between rays". Occluders for the T<->C test are
+ * every zone EXCEPT T, C, T's ancestors (we sit inside them), and T's & C's
+ * descendants (inside the endpoints). C's own ancestors STAY opaque — a region
+ * between T and C should block — which keeps zones nested inside a neighbour
+ * from being "seen" through their parent.
+ * ==========================================================================*/
+function ancestorsOf(id, byId) {
+  const s = new Set(); let p = byId[id].parent;
+  while (p != null && byId[p] && !s.has(p)) { s.add(p); p = byId[p].parent; }
+  return s;
+}
+function descendantsOf(id, childrenOf) {
+  const s = new Set(); const st = [id];
+  while (st.length) { const c = st.pop(); for (const k of (childrenOf[c] || [])) if (!s.has(k.id)) { s.add(k.id); st.push(k.id); } }
+  return s;
+}
+const unionBox = (a, b) => ({
+  min: [Math.min(a.min[0], b.min[0]), Math.min(a.min[1], b.min[1]), Math.min(a.min[2], b.min[2])],
+  max: [Math.max(a.max[0], b.max[0]), Math.max(a.max[1], b.max[1]), Math.max(a.max[2], b.max[2])],
+});
+const boxesOverlap = (a, b) =>
+  a.min[0] <= b.max[0] && b.min[0] <= a.max[0] &&
+  a.min[1] <= b.max[1] && b.min[1] <= a.max[1] &&
+  a.min[2] <= b.max[2] && b.min[2] <= a.max[2];
+const dist3 = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+
+// Closest pair of points between two AABBs (per-axis clamp; coincident on any
+// overlapping axis).
+function closestSegment(a, b) {
+  const pa = [0, 0, 0], pb = [0, 0, 0];
+  for (let i = 0; i < 3; i++) {
+    if (a.max[i] < b.min[i]) { pa[i] = a.max[i]; pb[i] = b.min[i]; }
+    else if (b.max[i] < a.min[i]) { pa[i] = a.min[i]; pb[i] = b.max[i]; }
+    else { const m = (Math.max(a.min[i], b.min[i]) + Math.min(a.max[i], b.max[i])) / 2; pa[i] = m; pb[i] = m; }
+  }
+  return [pa, pb];
+}
+// Points on every face of `box`, spaced ~`spacing` m apart along each edge — so
+// the count SCALES with the zone's size (a big face gets many points, a small
+// one just its corners). Corners are always included; per-axis count is capped
+// to bound cost. Deduped across shared edges/corners.
+const _AXIS_POINT_CAP = 16;
+function axisCoords(lo, hi, spacing) {
+  const n = Math.min(_AXIS_POINT_CAP, Math.max(1, Math.ceil((hi - lo) / spacing)));
+  const out = [];
+  for (let k = 0; k <= n; k++) out.push(lo + (hi - lo) * (k / n));
+  return out;
+}
+function boxSurfacePoints(box, spacing) {
+  const coords = [0, 1, 2].map((i) => axisCoords(box.min[i], box.max[i], spacing));
+  const pts = [], seen = new Set();
+  const add = (p) => { const k = p.map((v) => v.toFixed(3)).join(','); if (!seen.has(k)) { seen.add(k); pts.push(p); } };
+  for (let axis = 0; axis < 3; axis++) {
+    const u = (axis + 1) % 3, v = (axis + 2) % 3;
+    for (const face of [box.min[axis], box.max[axis]]) {
+      for (const cu of coords[u]) for (const cv of coords[v]) {
+        const p = [0, 0, 0]; p[axis] = face; p[u] = cu; p[v] = cv; add(p);
+      }
+    }
+  }
+  return pts;
+}
+// Does the (slightly shrunk) segment p->q pass through `box`? Shrinking off both
+// endpoints keeps contact at the T / C surfaces themselves from counting.
+function segHitsBox(p, q, box) {
+  const s = 1e-4;
+  const A = [p[0] + (q[0] - p[0]) * s, p[1] + (q[1] - p[1]) * s, p[2] + (q[2] - p[2]) * s];
+  const B = [q[0] - (q[0] - p[0]) * s, q[1] - (q[1] - p[1]) * s, q[2] - (q[2] - p[2]) * s];
+  const D = [B[0] - A[0], B[1] - A[1], B[2] - A[2]];
+  let tmin = 0, tmax = 1;
+  for (let i = 0; i < 3; i++) {
+    if (Math.abs(D[i]) < RAY_EPS) { if (A[i] < box.min[i] || A[i] > box.max[i]) return false; continue; }
+    let t1 = (box.min[i] - A[i]) / D[i], t2 = (box.max[i] - A[i]) / D[i];
+    if (t1 > t2) { const t = t1; t1 = t2; t2 = t; }
+    if (t1 > tmin) tmin = t1;
+    if (t2 < tmax) tmax = t2;
+    if (tmin > tmax) return false;
+  }
+  return true;
+}
+const clearOfAll = (p, q, occ) => { for (const o of occ) if (segHitsBox(p, q, o)) return false; return true; };
+
+// Returns { hits:Set<id>, segments:[{a:[3], b:[3], clear:bool, cid}] }.
+function adjacentZonesVisibility(zones, targetId, opts = {}) {
+  const { spacing = 1.5 } = opts;
+  const { byId, childrenOf } = buildIndex(zones);
+  const target = byId[targetId];
+  if (!target) return { hits: new Set(), segments: [] };
+
+  const ancT = ancestorsOf(targetId, byId);
+  const descT = descendantsOf(targetId, childrenOf);
+  const excl = new Set([targetId, ...ancT, ...descT]);
+  const candidates = zones.filter((z) => z.parent != null && !excl.has(z.id));
+
+  const hits = new Set();
+  const segments = [];
+  const ptsT = boxSurfacePoints(target, spacing);
+
+  for (const C of candidates) {
+    const descC = descendantsOf(C.id, childrenOf);
+    const exclOcc = new Set([targetId, C.id, ...ancT, ...descT, ...descC]);
+    const span = unionBox(target, C);
+    const occ = zones.filter((z) => !exclOcc.has(z.id) && boxesOverlap(z, span));
+
+    // 1) closest segment first (touching / overlapping is trivially clear)
+    const [a, b] = closestSegment(target, C);
+    if (dist3(a, b) < 1e-6 || clearOfAll(a, b, occ)) {
+      hits.add(C.id); segments.push({ a, b, clear: true, cid: C.id }); continue;
+    }
+    // 2) surface point pairs (size-scaled), early-exit on first clear
+    const ptsC = boxSurfacePoints(C, spacing);
+    let found = null;
+    outer: for (const pa of ptsT) for (const pb of ptsC) {
+      if (clearOfAll(pa, pb, occ)) { found = [pa, pb]; break outer; }
+    }
+    if (found) { hits.add(C.id); segments.push({ a: found[0], b: found[1], clear: true, cid: C.id }); }
+    else segments.push({ a, b, clear: false, cid: C.id }); // representative blocked = closest
+  }
+  return { hits, segments };
+}
+
+/* ============================================================================
+ * Sample scenes (each box is a zone; `root` is the scene container, not drawn).
+ * ==========================================================================*/
+function gridScene() {
+  const zones = [{ id: 'root', parent: null, min: [-50, 0, -50], max: [50, 50, 50] }];
+  for (const cx of [-3, 0, 3]) for (const cz of [-3, 0, 3])
+    zones.push({ id: `x${cx}_z${cz}`, parent: 'root', min: [cx - 1, 0, cz - 1], max: [cx + 1, 2, cz + 1] });
+  return {
+    name: 'Grid of rooms (gaps + diagonals)', target: 'x0_z0',
+    note: 'Center room. All 8 surrounding rooms come back adjacent — rays bridge the 1 m wall-gaps, and the 4 diagonal/corner rooms (which share NO face) are caught by diagonal rays.',
+    zones,
+  };
+}
+const SCENES = [
+  gridScene(),
+  {
+    name: 'Occlusion', target: 'core',
+    note: '`near` (east) and `north` are adjacent. `far` sits directly behind `near` in the same direction, so it is occluded — NOT adjacent. Occlusion is intentional.',
+    zones: [
+      { id: 'root', parent: null, min: [-50, 0, -50], max: [50, 50, 50] },
+      { id: 'core', parent: 'root', min: [-1, 0, -1], max: [1, 2, 1] },
+      { id: 'near', parent: 'root', min: [2, 0, -1], max: [4, 2, 1] },
+      { id: 'far', parent: 'root', min: [5, 0, -1], max: [7, 2, 1] },
+      { id: 'north', parent: 'root', min: [-1, 0, 2], max: [1, 2, 4] },
+    ],
+  },
+  {
+    name: 'Diagonal staircase (corner-only)', target: 'lower',
+    note: '`upper` meets `lower` only at a single corner and is raised in Y — there is NO shared face, yet a diagonal ray hits it, so it is adjacent. `east` is a normal gapped side neighbor. This is the case a face-aligned method would miss.',
+    zones: [
+      { id: 'root', parent: null, min: [-50, -10, -50], max: [50, 50, 50] },
+      { id: 'lower', parent: 'root', min: [0, 0, 0], max: [3, 1, 3] },
+      { id: 'upper', parent: 'root', min: [3, 1, 3], max: [6, 2, 6] },
+      { id: 'east', parent: 'root', min: [3.5, 0, 0], max: [6, 1, 3] },
+    ],
+  },
+  {
+    name: 'Multi-storey (vertical)', target: 'floor1',
+    note: '`floor2` (above) and `basement` (below) are adjacent — the spherical ray set covers ±Y, which a horizontal-only fan would miss. `wing` is a normal side neighbor.',
+    zones: [
+      { id: 'root', parent: null, min: [-50, -30, -50], max: [50, 50, 50] },
+      { id: 'floor1', parent: 'root', min: [0, 0, 0], max: [4, 3, 4] },
+      { id: 'floor2', parent: 'root', min: [0, 3.2, 0], max: [4, 6, 4] },
+      { id: 'basement', parent: 'root', min: [0, -3, 0], max: [4, -0.2, 4] },
+      { id: 'wing', parent: 'root', min: [4.2, 0, 0], max: [8, 3, 4] },
+    ],
+  },
+  {
+    name: 'Parent / child (flush vs inset)', target: 'core',
+    note: 'NORTH: child `front_nook` is FLUSH on parent `north_wing`\u2019s near face and fully covers it — the child wins the per-ray tie, so the parent is dropped. EAST: child `back_alcove` is INSET inside parent `east_wing`, so the parent is hit first and the inset child is occluded — parent shown, child not.',
+    zones: [
+      { id: 'root', parent: null, min: [-50, 0, -50], max: [50, 50, 50] },
+      { id: 'core', parent: 'root', min: [-1, 0, -1], max: [1, 2, 1] },
+      { id: 'north_wing', parent: 'root', min: [-1, 0, 2], max: [1, 2, 5] },
+      { id: 'front_nook', parent: 'north_wing', min: [-1, 0, 2], max: [1, 2, 3.5] },
+      { id: 'east_wing', parent: 'root', min: [2, 0, -1], max: [5, 2, 1] },
+      { id: 'back_alcove', parent: 'east_wing', min: [3, 0, -1], max: [5, 2, 1] },
+    ],
+  },
+  {
+    name: 'Far + small (where the methods diverge)', target: 'core',
+    note: '`near` and `far_big` are adjacent in both methods. `far_small` is far (~20 m) and small — the case they diverge on. In PAIRWISE VISIBILITY (default) it is CAUGHT, because a segment is aimed straight at it instead of hoping a ray lands in its ~1° sliver. Switch the method to RAYCAST and it is MISSED at the default M until you raise `dirs / origin (M)` to ~384+ (denser rays finally resolve the cone). That divergence is the whole reason for the visibility method.',
+    zones: [
+      { id: 'root', parent: null, min: [-60, -10, -60], max: [60, 50, 60] },
+      { id: 'core', parent: 'root', min: [-1, 0, -1], max: [1, 2, 1] },
+      { id: 'near', parent: 'root', min: [2, 0, -1], max: [4, 2, 1] },
+      { id: 'far_big', parent: 'root', min: [-4, -1, 8], max: [4, 4, 13] },
+      { id: 'far_small', parent: 'root', min: [-0.75, 0.25, -21], max: [0.75, 1.75, -19.5] },
+    ],
+  },
+  {
+    name: 'Around a blocker (surface beats center)', target: 'hall',
+    note: 'THE key case for surface emission. `blocker` covers every sightline from the hall\u2019s CENTER to `behind`, so in CENTER mode `behind` is occluded and dropped. Switch Ray origins to BOX SURFACE: origins on the hall\u2019s east end have a clear line around the blocker\u2019s east edge, so `behind` flips to adjacent. `blocker` and `south` are adjacent either way. (Density does not fix this — it is an occlusion blind spot of the single center point.)',
+    zones: [
+      { id: 'root', parent: null, min: [-50, -10, -50], max: [50, 50, 50] },
+      { id: 'hall', parent: 'root', min: [-8, 0, -1], max: [8, 2.5, 1] },
+      { id: 'blocker', parent: 'root', min: [-2, 0, 1.3], max: [7, 3, 2] },
+      { id: 'behind', parent: 'root', min: [7, 0, 2.2], max: [11, 2.5, 4.5] },
+      { id: 'south', parent: 'root', min: [-2, 0, -3], max: [2, 2.5, -1.3] },
+    ],
+  },
+  {
+    name: 'Long hall + tiny end rooms (proximity)', target: 'hall',
+    note: 'A 36 m hall with small rooms at the far ends (~16 m from the center). In CENTER mode the ends subtend a sliver and the discrete rays land in them only by luck — you will usually see one or both ends gray (raise M and they reappear). In SURFACE mode, origins sit ~1 m from each end and catch both reliably. `mid` (close) is caught either way. Surface\u2019s proximity makes end coverage robust.',
+    zones: [
+      { id: 'root', parent: null, min: [-40, 0, -40], max: [40, 50, 40] },
+      { id: 'hall', parent: 'root', min: [-18, 0, -1], max: [18, 2, 1] },
+      { id: 'end_E', parent: 'root', min: [15.5, 0, 1.3], max: [17, 1.5, 2.8] },
+      { id: 'end_W', parent: 'root', min: [-17, 0, 1.3], max: [-15.5, 1.5, 2.8] },
+      { id: 'mid', parent: 'root', min: [-1.25, 0, 1.3], max: [1.25, 2, 3.3] },
+    ],
+  },
+  {
+    name: 'Big hall + rim rooms (large target)', target: 'hall',
+    note: 'A large 14\u00d714 m hall ringed by small rooms (one tiny). From the CENTER the rim sits ~7\u20139 m away, so the small/tiny rooms subtend small angles and some are missed at low M. SURFACE origins sit on the rim right next to each room and catch them. Toggle center vs surface, and raise K / M, to compare.',
+    zones: [
+      { id: 'root', parent: null, min: [-40, -5, -40], max: [40, 50, 40] },
+      { id: 'hall', parent: 'root', min: [-7, 0, -7], max: [7, 3, 7] },
+      { id: 'rim_N', parent: 'root', min: [-2, 0, 7.3], max: [2, 3, 9.5] },
+      { id: 'rim_NE', parent: 'root', min: [5.3, 0, 5.3], max: [8, 3, 8] },
+      { id: 'rim_E', parent: 'root', min: [7.3, 0, -2], max: [9.5, 3, 2] },
+      { id: 'rim_S', parent: 'root', min: [-5, 0, -9.5], max: [-2, 3, -7.3] },
+      { id: 'rim_W', parent: 'root', min: [-9.5, 0, 3], max: [-7.3, 3, 6] },
+      { id: 'rim_tiny', parent: 'root', min: [-0.7, 0, 7.3], max: [0.3, 1, 8] },
+    ],
+  },
+];
+
+/* ============================================================================
+ * Three.js scene
+ * ==========================================================================*/
+const COL = { target: 0xffa033, adj: 0x35d07f, other: 0x8aa0b8, rayHit: 0x39d0c8, rayEsc: 0x3a4a60, conn: 0x39d0c8, blocked: 0xff5566 };
+
+const view = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(view.clientWidth, view.clientHeight);
+view.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0a0e14);
+const camera = new THREE.PerspectiveCamera(50, view.clientWidth / view.clientHeight, 0.05, 5000);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+const dir = new THREE.DirectionalLight(0xffffff, 0.9);
+dir.position.set(8, 14, 10);
+scene.add(dir);
+const grid = new THREE.GridHelper(120, 60, 0x223049, 0x162234);
+scene.add(grid);
+scene.add(new THREE.AxesHelper(4));
+
+const boxGroup = new THREE.Group();
+const rayGroup = new THREE.Group();
+const labelGroup = new THREE.Group();
+scene.add(boxGroup, rayGroup, labelGroup);
+
+let pickables = [];          // meshes carrying userData.zoneId
+let currentZones = [];
+let sceneRadius = 10;
+
+function clear(group) {
+  for (const o of group.children) {
+    o.geometry?.dispose?.();
+    if (o.material) (Array.isArray(o.material) ? o.material : [o.material]).forEach((m) => { m.map?.dispose?.(); m.dispose(); });
+  }
+  group.clear();
+}
+
+function makeLabel(text, pos) {
+  const cv = document.createElement('canvas');
+  cv.width = 256; cv.height = 64;
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = 'rgba(10,14,20,0.78)';
+  roundRect(ctx, 2, 2, 252, 60, 10); ctx.fill();
+  ctx.font = 'bold 30px ui-monospace, monospace';
+  ctx.fillStyle = '#e7eef8'; ctx.textBaseline = 'middle';
+  ctx.fillText(text, 14, 34);
+  const tex = new THREE.CanvasTexture(cv);
+  tex.anisotropy = 4;
+  const sp = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, transparent: true }));
+  const s = sceneRadius * 0.13;
+  sp.scale.set(s * 4, s, 1);
+  sp.position.set(pos[0], pos[1], pos[2]);
+  return sp;
+}
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r); ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+}
+
+function addBox(zone, role) {
+  const sz = size(zone), c = center(zone);
+  const color = COL[role];
+  const opacity = role === 'target' ? 0.5 : role === 'adj' ? 0.38 : 0.12;
+  const geom = new THREE.BoxGeometry(sz[0], sz[1], sz[2]);
+  const mesh = new THREE.Mesh(geom, new THREE.MeshStandardMaterial({
+    color, transparent: true, opacity, depthWrite: false, roughness: 0.7, metalness: 0,
+  }));
+  mesh.position.set(c[0], c[1], c[2]);
+  mesh.userData.zoneId = zone.id;
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(geom),
+    new THREE.LineBasicMaterial({ color, transparent: true, opacity: role === 'other' ? 0.4 : 0.95 }),
+  );
+  mesh.add(edges);
+  boxGroup.add(mesh);
+  pickables.push(mesh);
+  if (document.getElementById('cLabels').checked)
+    labelGroup.add(makeLabel(zone.id, [c[0], zone.max[1] + sceneRadius * 0.08, c[2]]));
+}
+
+function buildRays(rays, origins) {
+  const stub = sceneRadius * 0.5;
+  const MAX_DRAW = 2500; // cap drawn line count so dense modes stay responsive
+  const draw = (list, color, opacity, lenOf) => {
+    if (!list.length) return;
+    const stride = Math.max(1, Math.ceil(list.length / MAX_DRAW));
+    const pos = [];
+    for (let i = 0; i < list.length; i += stride) {
+      const r = list[i], o = r.o, L = lenOf(r);
+      pos.push(o[0], o[1], o[2], o[0] + r.dir[0] * L, o[1] + r.dir[1] * L, o[2] + r.dir[2] * L);
+    }
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    rayGroup.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity })));
+  };
+  if (document.getElementById('cRays').checked) draw(rays.filter((r) => r.t != null), COL.rayHit, 0.4, (r) => r.t);
+  if (document.getElementById('cEsc').checked) draw(rays.filter((r) => r.t == null), COL.rayEsc, 0.2, () => stub);
+  if (document.getElementById('cOrigins').checked) {
+    const geo = new THREE.SphereGeometry(sceneRadius * 0.018, 8, 8);
+    const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    for (const o of origins) {
+      const d = new THREE.Mesh(geo, mat);
+      d.position.set(o[0], o[1], o[2]);
+      rayGroup.add(d);
+    }
+  }
+}
+
+function buildSegments(res, target, spacing) {
+  const mk = (list, color, opacity) => {
+    if (!list.length) return;
+    const pos = [];
+    for (const s of list) pos.push(s.a[0], s.a[1], s.a[2], s.b[0], s.b[1], s.b[2]);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    rayGroup.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color, transparent: true, opacity })));
+  };
+  if (document.getElementById('cRays').checked) mk(res.segments.filter((s) => s.clear), COL.conn, 0.85);
+  if (document.getElementById('cEsc').checked) mk(res.segments.filter((s) => !s.clear), COL.blocked, 0.5);
+  if (document.getElementById('cOrigins').checked && target) {
+    const geo = new THREE.SphereGeometry(sceneRadius * 0.014, 8, 8);
+    const mat = new THREE.MeshBasicMaterial({ color: 0xffffff });
+    for (const p of boxSurfacePoints(target, spacing)) {
+      const d = new THREE.Mesh(geo, mat); d.position.set(p[0], p[1], p[2]); rayGroup.add(d);
+    }
+  }
+}
+
+function boundsOf(zones) {
+  const box = new THREE.Box3();
+  for (const z of zones) {
+    if (z.parent == null) continue; // skip the (huge) root container
+    box.expandByPoint(new THREE.Vector3(...z.min));
+    box.expandByPoint(new THREE.Vector3(...z.max));
+  }
+  const c = box.getCenter(new THREE.Vector3());
+  const r = Math.max(box.getSize(new THREE.Vector3()).length() / 2, 1);
+  return { center: c, radius: r };
+}
+
+function clampInt(v, lo, hi) { v = parseInt(v, 10); if (!Number.isFinite(v)) v = lo; return Math.max(lo, Math.min(hi, v)); }
+function clampFloat(v, lo, hi) { v = parseFloat(v); if (!Number.isFinite(v)) v = lo; return Math.max(lo, Math.min(hi, v)); }
+
+function refresh() {
+  const targetId = document.getElementById('targetSel').value;
+  const method = document.getElementById('methodSel').value;
+  const target = currentZones.find((z) => z.id === targetId);
+
+  let hits, drawFn, stat;
+  const t0 = performance.now();
+  if (method === 'visibility') {
+    const spacing = clampFloat(document.getElementById('spacingIn').value, 0.25, 20);
+    const res = adjacentZonesVisibility(currentZones, targetId, { spacing });
+    hits = res.hits;
+    drawFn = () => buildSegments(res, target, spacing);
+    stat = (dt) => `visibility \u00b7 ${spacing} m spacing \u00b7 ${res.segments.length} pairs \u00b7 ${dt} ms`;
+  } else {
+    const originMode = document.getElementById('originSel').value;
+    const K = clampInt(document.getElementById('kIn').value, 1, 600);
+    const M = clampInt(document.getElementById('mIn').value, 8, 4000);
+    const res = adjacentZones(currentZones, targetId, { originMode, K, M });
+    hits = res.hits;
+    drawFn = () => buildRays(res.rays, res.origins);
+    stat = (dt) => `${originMode === 'surface' ? res.origins.length + ' origins' : 'center'} \u00b7 ${res.rays.length.toLocaleString()} rays \u00b7 ${dt} ms`;
+  }
+  const dt = (performance.now() - t0).toFixed(1);
+
+  clear(boxGroup); clear(rayGroup); clear(labelGroup); pickables = [];
+  const showOthers = document.getElementById('cOthers').checked;
+
+  for (const z of currentZones) {
+    if (z.parent == null) continue;          // root container is not drawn
+    const role = z.id === targetId ? 'target' : hits.has(z.id) ? 'adj' : 'other';
+    if (role === 'other' && !showOthers) continue;
+    addBox(z, role);
+  }
+  drawFn();
+
+  // info panel
+  document.getElementById('stats').textContent = stat(dt);
+  document.getElementById('note').textContent = SCENES[+document.getElementById('sceneSel').value].note;
+  const drawn = currentZones.filter((z) => z.parent != null && z.id !== targetId);
+  const adj = drawn.filter((z) => hits.has(z.id)).map((z) => z.id);
+  const non = drawn.filter((z) => !hits.has(z.id)).map((z) => z.id);
+  document.getElementById('ids').innerHTML =
+    `<b>target:</b> ${targetId}<br/>` +
+    `<b>adjacent (${adj.length}):</b><br/>${adj.map((i) => `<span class="pill adj">${i}</span>`).join('') || '<span class="pill no">none</span>'}` +
+    `<br/><b>not adjacent (${non.length}):</b><br/>${non.map((i) => `<span class="pill no">${i}</span>`).join('') || '<span class="pill no">none</span>'}`;
+}
+
+function loadScene(idx) {
+  const s = SCENES[idx];
+  currentZones = s.zones;
+  sceneRadius = boundsOf(currentZones).radius;
+  const tsel = document.getElementById('targetSel');
+  tsel.innerHTML = '';
+  for (const z of currentZones) {
+    if (z.parent == null) continue;
+    const opt = document.createElement('option');
+    opt.value = z.id; opt.textContent = z.id;
+    if (z.id === s.target) opt.selected = true;
+    tsel.appendChild(opt);
+  }
+  refresh();
+  fitCamera();
+}
+
+function fitCamera() {
+  const { center: c, radius } = boundsOf(currentZones);
+  controls.target.copy(c);
+  const off = new THREE.Vector3(1, 0.85, 1).normalize().multiplyScalar(radius * 2.6);
+  camera.position.copy(c.clone().add(off));
+  camera.near = radius / 100; camera.far = radius * 100;
+  camera.updateProjectionMatrix();
+  controls.update();
+}
+
+/* ---- UI wiring ---- */
+const sceneSel = document.getElementById('sceneSel');
+SCENES.forEach((s, i) => {
+  const o = document.createElement('option'); o.value = i; o.textContent = s.name; sceneSel.appendChild(o);
+});
+sceneSel.addEventListener('change', () => loadScene(+sceneSel.value));
+for (const id of ['targetSel', 'methodSel', 'originSel', 'kIn', 'mIn', 'spacingIn'])
+  document.getElementById(id).addEventListener('change', refresh);
+for (const id of ['cRays', 'cEsc', 'cOrigins', 'cLabels', 'cOthers'])
+  document.getElementById(id).addEventListener('change', refresh);
+
+// click a box to make it the target
+const ray = new THREE.Raycaster();
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  const r = renderer.domElement.getBoundingClientRect();
+  const m = new THREE.Vector2(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(m, camera);
+  const hit = ray.intersectObjects(pickables, false)[0];
+  if (hit) { document.getElementById('targetSel').value = hit.object.userData.zoneId; refresh(); }
+});
+
+addEventListener('resize', () => {
+  renderer.setSize(view.clientWidth, view.clientHeight);
+  camera.aspect = view.clientWidth / view.clientHeight;
+  camera.updateProjectionMatrix();
+});
+
+loadScene(0);
+(function animate() { requestAnimationFrame(animate); controls.update(); renderer.render(scene, camera); })();
+</script>
+</body>
+</html>

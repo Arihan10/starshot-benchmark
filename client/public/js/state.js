@@ -21,7 +21,14 @@ export const state = {
     templates: new Map(),  // step -> {system, user, variables}
     drafts: new Map(),     // step -> {system, user} (edited copies)
     events: [],            // step-events payload for `step`
-    selected: new Set(),   // "slot|model|index" keys
+    // The debug-grid selection, scoped PER cell so you can pick different zones
+    // from different slots (no forced cross-product). A cell present in the map
+    // is selected; its Set lists the node ids (zones) to show — an EMPTY set
+    // means "every zone of this cell". Cell + node identities are
+    // step-independent, so the choice survives a step switch: the grid just
+    // re-materializes whichever of the new step's calls fall in each cell's
+    // chosen zones.
+    selection: new Map(),  // cellKey -> Set<node id>  (empty set ⇒ all zones)
     tests: new Map(),      // "slot|model|index" -> {status, result?, error?}
     sims: new Map(),       // "slot|model" -> {slot, model, eventIndex}
     simStep: null,         // step the simulation branched at (pins obs panel)

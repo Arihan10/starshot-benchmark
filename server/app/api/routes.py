@@ -111,6 +111,10 @@ _branch_overrides: dict[RunKey, dict[str, dict[str, str]]] = {}
 # auto). Branches are ALWAYS gated; source cells are gated when launched in
 # stepped mode (the per-step prompt-iteration workflow).
 _branch_gates: dict[RunKey, "CellGate"] = {}
+# Next-launch gate intent for a PAUSED branch (budget / auto / until) — the
+# branch mirror of `_gate_intents`, consumed by `_run_branch` when a step
+# advance relaunches a paused branch.
+_branch_gate_intents: dict[RunKey, dict[str, object]] = {}
 _cell_gates: dict[RunKey, "CellGate"] = {}
 # Source cells currently in stepped mode (one LLM call per "step"). Mirrored
 # on disk by a `.stepped` marker in each cell dir so the mode SURVIVES a
@@ -150,7 +154,7 @@ class CellGate:
     cross-coroutine `Future.set_result` from the endpoint safely wakes the
     paused task."""
 
-    def __init__(self, slot_log: SlotLog, *, budget: int = 0) -> None:
+    def __init__(self, slot_log: SlotLog, *, budget: int = 0, model_override: str | None = None) -> None:
         self.slot_log = slot_log
         # `budget` is the count of QUEUED steps: each lets the cell pass one
         # gate without pausing. "Step all" grants one to every stepped cell —
@@ -164,16 +168,29 @@ class CellGate:
         # up, then pause right before it ("run to breakpoint at step X").
         self.until_step: str | None = None
         self.pending: dict[str, object] | None = None
+        # The call CURRENTLY in flight — released from a pause, or run on a
+        # budget credit / in auto. Lets the UI show "running X" instead of the
+        # stale last phase once a gated step is released. None until one runs.
+        self.current: dict[str, object] | None = None
+        # Per-step LLM override (compare's "run this step on model X"): the
+        # OpenRouter model id `wait` hands back so `call_llm` re-aims the gated
+        # call at it. Sticky until changed — "run rest" + later steps follow the
+        # choice — so the same scene context can be A/B'd across models.
+        self.model_override: str | None = model_override
 
     async def wait(
         self, *, node_id: str | None, step: str | None, template: str | None = None,
         system: str, user: str, schema_name: str, model: str,
-    ) -> None:
-        # Library matching is a mechanical per-object service step, not a
-        # pipeline step worth click-through (and its parallel fan-out would
-        # clobber the single pause future).
-        if self.auto or step == "library_match":
-            return
+    ) -> str | None:
+        # Library matching is a mechanical per-object service step (always on its
+        # own gemini model), not a pipeline step worth click-through — never gate
+        # it and never let a model override re-aim it.
+        if step == "library_match":
+            return None
+        call = {"node": node_id, "step": step, "template": template, "schema": schema_name, "model": model}
+        if self.auto:
+            self.current = call
+            return self.model_override
         # Seeking a target step: blow past everything else, then stop AT it.
         # `until_step` is a template id (the lab's granular step name), so match
         # on `template` (root/nested variants differ there, not in `step`).
@@ -181,14 +198,16 @@ class CellGate:
             if (template or step) == self.until_step:
                 self.until_step = None  # arrived — fall through and pause here
             else:
-                return
+                self.current = call
+                return self.model_override
         elif self.budget > 0:
             self.budget -= 1
-            return
+            self.current = call
+            return self.model_override
         loop = asyncio.get_running_loop()
         fut: asyncio.Future[dict[str, object]] = loop.create_future()
         self._fut = fut
-        self.pending = {"node": node_id, "step": step, "template": template, "schema": schema_name, "model": model}
+        self.pending = call
         # Surface the pending call (including the exact prompt about to be
         # sent) on the stream so the UI can preview it.
         self.slot_log.log(
@@ -206,8 +225,10 @@ class CellGate:
         finally:
             self._fut = None
             self.pending = None
+            self.current = call  # released — this call is now the one in flight
         if result.get("auto"):
             self.auto = True
+        return self.model_override
 
     def proceed(self, *, auto: bool = False) -> bool:
         """Release the current pause. Returns False if nothing is pending."""
@@ -243,6 +264,24 @@ class PromptTestRequest(BaseModel):
     user_template: str
 
 
+class InquiryMessage(BaseModel):
+    role: str  # "user" | "assistant"
+    content: str
+
+
+class InquiryRequest(BaseModel):
+    """One turn in a persistent "why did the model do this?" conversation about
+    a pipeline step. The client assembles and OWNS the reviewer's full system
+    prompt — the analyst framing plus that step's exact system / input / output
+    / reasoning — and sends it verbatim as `system`, so what the panel shows
+    (prefilled and editable) is byte-for-byte what is sent. `messages` is the
+    running thread and MUST end with the new user turn. Stateless: the endpoint
+    reads no cell state, so it serves source and simulation-branch calls alike."""
+
+    system: str = ""
+    messages: list[InquiryMessage]
+
+
 class BranchSeed(BaseModel):
     """A prompt-test result to pre-commit into a fresh branch's log, so
     "simulate downstream" continues from EXACTLY the output the user vetted
@@ -275,10 +314,27 @@ class BranchRequest(BaseModel):
 class BranchStepRequest(BaseModel):
     """Advance a gated cell/branch. `auto=True` runs the rest to completion;
     `until` (a template id) fast-forwards a source cell to the next call of
-    that step and pauses there. `until` is ignored by branch stepping."""
+    that step and pauses there. `model` (a model ALIAS) re-aims a branch's next
+    gated call at a chosen LLM — compare's per-step model A/B — independent of
+    the model that produced the pre-branch scene; None keeps the branch's
+    current model."""
 
     auto: bool = False
     until: str | None = None
+    model: str | None = None
+
+
+class BranchRewindRequest(BaseModel):
+    """Revert a simulation branch to before `to_event_index` (a re-renderable
+    branch `cache.llm` call): drop that call and everything after it, delete the
+    meshes generated at/after the cut, and pause there. `overrides` (the lab's
+    CURRENT edit set) refreshes the branch's templates so the subsequent step
+    re-runs under the current snapshot + edits — the sim's source of truth;
+    `None` keeps the branch's existing edit set. The source cell and the
+    branch's replayed prefix meshes are untouched."""
+
+    to_event_index: int
+    overrides: dict[str, dict[str, str]] | None = None
 
 
 class ForkVersionRequest(BaseModel):
@@ -299,12 +355,12 @@ class UpdateRunPromptsRequest(BaseModel):
     update_version: bool = False
 
 
-class RerunStepRequest(BaseModel):
-    """Rewind cells to just BEFORE their EARLIEST first call of any template
-    in `steps` and relaunch — the committed prefix replays, the edited steps
-    re-run under the run's (freshly edited) snapshot, and everything
-    downstream regenerates. Omitted `cells` means every cell that has logged
-    a call of one of those steps."""
+class SimulateStepRequest(BaseModel):
+    """Fork a SIMULATION branch in each cell at its EARLIEST call of any
+    template in `steps`, running from there under the run's (freshly edited)
+    snapshot — the non-destructive iteration loop. Source cells are untouched;
+    a branch is promoted to source on demand (/branch/commit). Omitted `cells`
+    means every cell that has logged a call of one of those steps."""
 
     steps: list[str]
     cells: list[dict[str, str]] | None = None
@@ -423,6 +479,18 @@ def _require_step_event(
             detail="event predates variable logging — re-run the cell to make it testable",
         )
     return slot_log, event
+
+
+# --- decision inquiry -------------------------------------------------------
+#
+# "Why did the model do this?" — a persistent conversation answered by a fixed
+# strong reviewer so analysis quality is constant across whatever subject model
+# is being benchmarked. The reviewer's full prompt (analyst framing + the step's
+# exact system / input / output / reasoning) is assembled and shown CLIENT-SIDE
+# in an editable, prefilled box, so the user sees byte-for-byte what gets sent;
+# this endpoint just pins the reviewer model and forwards. The reviewer is
+# Claude Opus 4.8 at xhigh reasoning regardless of which model ran the step.
+INQUIRY_MODEL = "anthropic/claude-opus-4.8"
 
 
 # --- prompt inspector -------------------------------------------------------
@@ -1021,6 +1089,27 @@ def create_app() -> FastAPI:
             "tokens_out": getattr(usage, "completion_tokens", None),
         }
 
+    @app.post("/inquire")
+    async def inquire(req: InquiryRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        """Ask the reviewer (Claude Opus 4.8, xhigh reasoning) the latest
+        question in an inquiry thread, and keep asking — the client carries the
+        conversation forward in `messages`, so the thread is persistent. `system`
+        is the exact, client-assembled prompt (analyst framing + the step's
+        grounding — shown and editable in the panel). Stateless: nothing about
+        any run is read or mutated."""
+        if not req.messages or req.messages[-1].role != "user":
+            raise HTTPException(
+                status_code=400,
+                detail="messages must be non-empty and end with a user turn",
+            )
+        convo = [{"role": m.role, "content": m.content} for m in req.messages]
+        try:
+            answer, reasoning = await llm.chat(model=INQUIRY_MODEL, system=req.system, messages=convo)
+        except Exception as e:
+            # Provider/transport failure → clean 502 the panel shows inline.
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+        return {"answer": answer, "reasoning": reasoning, "model": INQUIRY_MODEL}
+
     @app.get("/runs/{run}/prompt-templates")
     async def run_prompt_templates(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """The run's prompt snapshot as editable templates, with each step's
@@ -1042,6 +1131,15 @@ def create_app() -> FastAPI:
                 for step in prompt_store.STEPS
             ],
         }
+
+    @app.get("/variable-samples")
+    async def variable_samples() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        """Every prompt `{VARIABLE}` rendered against a fixed sample scene via
+        the real `scene_context` injection functions — the prompt lab's hover
+        preview, so each variable's actual injected shape (and any missing
+        context / rendering bug) is visible without running a scene. Run-
+        independent: the sample scene is static."""
+        return scene_context.sample_variables()
 
     @app.get("/runs/{run}/step-events")
     async def run_step_events(run: str, step: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -1117,10 +1215,28 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="no simulation branch for this cell")
         events = blog.state["events"]
         cands = [e for e in events if e.get("kind") == "cache.llm" and e.get("template") == step]
-        match = next((e for e in cands if e.get("node") == node), None) if node else None
-        match = match or (cands[0] if cands else None)
+        # Match the SPECIFIC node when one is given — never fall back to another
+        # node's call (e.g. a copied-prefix `root` decompose), which would diff a
+        # stale prompt/output for the wrong region.
+        if node is not None:
+            cands = [e for e in cands if e.get("node") == node]
+        # Surface the branch's ACTUAL output, not the pre-committed prompt-test
+        # SEED. The seed is only a cache prime: when it hits, the branch runs
+        # past this step using it (so it IS the output → show it); when it
+        # misses, the branch pauses right before re-running this step (so the
+        # seed is stale → report "not re-run yet" until the real call lands).
+        # Real (non-seeded) calls always win, and the LATEST one is the final
+        # validated attempt the pipeline actually used.
+        real = [e for e in cands if not e.get("seeded")]
+        if real:
+            match = real[-1]
+        elif cands and not _branch_awaiting(run, slot, model, step, node):
+            match = cands[-1]  # seed cache-hit and consumed — it is the output
+        else:
+            match = None
         if match is None:
-            raise HTTPException(status_code=404, detail=f"no {step} call in the branch yet")
+            where = f"{step} @ {node}" if node else step
+            raise HTTPException(status_code=404, detail=f"the branch has not re-run {where} yet")
         return {
             "slot": slot,
             "model": model,
@@ -1182,29 +1298,45 @@ def create_app() -> FastAPI:
         )
 
     @app.get("/slots/{slot_id}/{model_alias}/scene")
-    async def slot_scene(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def slot_scene(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         # CQRS read model: fold the event log into the minimal renderable scene
         # state so the client paints directly instead of replaying ~2k events.
         # Returns `last_index` (the fold's cut) so the client can pick up the
         # live tail at `?since=last_index` with no gap or overlap.
+        #
+        # `until_index` projects only the prefix BEFORE that event — the compare
+        # view's "previous" pane uses it to show the original run's state at the
+        # branch's fork step (the shared baseline), not its full final scene.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
-        return _scene_projection(list(slot_log.state["events"]))
+        events = list(slot_log.state["events"])
+        if until_index is not None:
+            events = events[:until_index]
+        return _scene_projection(events)
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
         # cap those at ~6 per origin, and they'd contend with the SSE stream
         # and polls on this same origin). The client keys each blob to its
         # `model` event by file stem; see `_mesh_bundle`.
+        #
+        # Always filtered to ids with a committed `model` event (so a cell that
+        # was promoted from a branch, whose objects/ retains stale hardlinks,
+        # never serves ghosts); `until_index` further restricts to meshes
+        # committed BEFORE that event — paired with /scene?until_index for the
+        # compare view's "previous" pane (the original's meshes at the fork).
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         cell_dir = slot_log.events_path.parent
         objects_dir = _objects_dir(cell_dir)
+        events = list(slot_log.state["events"])
+        if until_index is not None:
+            events = events[:until_index]
         return StreamingResponse(
-            _mesh_bundle(objects_dir),
+            _mesh_bundle(objects_dir, _committed_mesh_ids(events)),
             media_type="application/octet-stream",
             headers={"Cache-Control": "no-store"},
         )
@@ -1242,10 +1374,15 @@ def create_app() -> FastAPI:
                     with contextlib.suppress(OSError):
                         (objs / f"{oid}{suffix}").unlink()
         slot_log.truncate_events_to(cut)
-        # Land paused AT the cut — the user decides what runs next (resume /
-        # step / re-run with edited prompts), no surprise LLM spend.
-        slot_log.state["status"] = "paused"
-        slot_log.log("run.paused")
+        # Auto-resume from the cut instead of landing paused: a revert means
+        # "re-run from here", so the reverted call (and everything downstream)
+        # regenerates with no manual resume. Stepped cells get one free pass so
+        # the reverted call itself re-executes before the gate pauses again
+        # (mirrors rerun-step).
+        key: RunKey = (run, slot_id, model_alias)
+        if key in _stepped_cells:
+            _gate_intents[key] = {"budget": 1}
+        await _start_cell(run, slot_id, model_alias)
         return {"run": run, "slot_id": slot.id, "model": model_alias, "events": len(slot_log.state["events"])}
 
     @app.post("/slots/{slot_id}/{model_alias}/resume")
@@ -1405,76 +1542,17 @@ def create_app() -> FastAPI:
             for role in roles:
                 if role not in ("system", "user"):
                     raise HTTPException(status_code=400, detail=f"unknown template role: {role}")
-        src_log, event = _require_step_event(
-            run, slot.id, model_alias, req.event_index, req.step,
+        events = await _fork_branch(
+            run, slot.id, model_alias,
+            event_index=req.event_index, step=req.step,
+            overrides=req.overrides, seed=req.seed,
         )
-        src_events = list(src_log.state["events"])
-        key: RunKey = (run, slot.id, model_alias)
-
-        # One branch per cell: replace any prior fork of this cell.
-        await _discard_branch(key)
-        bdir = _branch_dir(run, slot.id, model_alias)
-        shutil.rmtree(bdir, ignore_errors=True)
-        bdir.mkdir(parents=True, exist_ok=True)
-
-        # Hardlink the source's finished meshes so the replayed prefix doesn't
-        # regenerate them — only the deviated subtree re-bills Trellis.
-        cell_dir = src_log.events_path.parent
-        src_objects = cell_dir / OBJECTS_SUBDIR
-        if not src_objects.is_dir():
-            src_objects = next(
-                (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
-                cell_dir / "objects",
-            )
-        await asyncio.to_thread(_hardlink_tree, src_objects, bdir / "objects")
-
-        # Prefix = source events BEFORE the edited step's call. Dropping that
-        # call (and everything after) means `committed.*` replays the prefix
-        # and the pipeline re-reaches the call with the edited templates bound.
-        branch_events = [dict(e) for e in src_events[: req.event_index]]
-        bevents = bdir / "events.jsonl"
-        with bevents.open("w", encoding="utf-8") as f:
-            for e in branch_events:
-                f.write(json.dumps(e) + "\n")
-
-        blog = SlotLog(_branch_run_id(run, slot.id, model_alias), bevents)
-        blog.hydrate_from_disk()
-        if blog.state.get("prompt") is None or blog.state.get("model") is None:
-            raise HTTPException(
-                status_code=400,
-                detail="source has no run.start to branch from",
-            )
-        if req.seed is not None:
-            # Pre-commit the vetted prompt-test result so the re-reached call
-            # cache-hits it and the simulation continues from EXACTLY the
-            # output the user approved. If the replayed render drifts from the
-            # tested bytes the key simply misses and the call re-runs fresh.
-            blog.log(
-                "cache.llm",
-                key=cache_hash_for_seed(event, req.seed),
-                node=event.get("node"),
-                step=event.get("step"),
-                template=req.step,
-                model=event.get("model"),
-                schema=event.get("schema"),
-                system=req.seed.system,
-                user=req.seed.user,
-                variables=event.get("variables"),
-                output=req.seed.output,
-                reasoning=req.seed.reasoning,
-                tokens_in=req.seed.tokens_in,
-                tokens_out=req.seed.tokens_out,
-                seeded=True,
-            )
-        _branch_logs[key] = blog
-        _branch_overrides[key] = {s: dict(r) for s, r in req.overrides.items()}
-        _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot.id, model_alias))
         return {
             "run": run,
             "slot_id": slot.id,
             "model": model_alias,
             "event_index": req.event_index,
-            "events": len(blog.state["events"]),
+            "events": events,
             "seeded": req.seed is not None,
         }
 
@@ -1502,11 +1580,62 @@ def create_app() -> FastAPI:
         run = _resolve_run(run)
         blog = _require_branch_log(run, slot_id, model_alias)
         objects_dir = blog.events_path.parent / "objects"
+        # Branch hardlinks the whole source objects/ dir, so serve only the
+        # meshes the branch actually committed — never the dropped prefix ones.
         return StreamingResponse(
-            _mesh_bundle(objects_dir),
+            _mesh_bundle(objects_dir, _committed_mesh_ids(list(blog.state["events"]))),
             media_type="application/octet-stream",
             headers={"Cache-Control": "no-store"},
         )
+
+    @app.post("/slots/{slot_id}/{model_alias}/branch/rewind")
+    async def branch_rewind(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        req: BranchRewindRequest,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Revert a simulation branch to before `to_event_index` and pause there
+        — the branch mirror of the source `/rewind`. Re-running forward (a plain
+        `/branch/step`) then regenerates the reverted call under the CURRENT run
+        snapshot + refreshed edits. Scoped to the branch log: the source cell and
+        the branch's hardlinked prefix meshes are untouched."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        _require_run_prompts(run)
+        key: RunKey = (run, slot_id, model_alias)
+        blog = _require_branch_log(run, slot_id, model_alias)
+        if req.overrides is not None:
+            for ostep, roles in req.overrides.items():
+                if ostep not in prompt_store.STEPS:
+                    raise HTTPException(status_code=400, detail=f"unknown override step: {ostep}")
+                for role in roles:
+                    if role not in ("system", "user"):
+                        raise HTTPException(status_code=400, detail=f"unknown template role: {role}")
+        # Stop the in-flight branch task but KEEP its log / overrides / dir, then
+        # rewrite the log under it (mirrors source rewind's discard-then-truncate).
+        await _cancel_branch_task(key)
+        events = blog.state["events"]
+        cut = max(0, min(req.to_event_index, len(events)))
+        # Drop the meshes of every node generated at/after the cut so a re-run
+        # regenerates cleanly. Prefix meshes (before the cut, hardlinked from the
+        # source) stay; unlinking a post-cut hardlink only drops the branch's
+        # name, never the source's inode.
+        objs = blog.events_path.parent / "objects"
+        for e in events[cut:]:
+            oid = e.get("id")
+            if isinstance(oid, str):
+                for suffix in (".glb", ".raw.glb", ".png"):
+                    with contextlib.suppress(OSError):
+                        (objs / f"{oid}{suffix}").unlink()
+        blog.truncate_events_to(cut)
+        blog.state["status"] = "paused"
+        # Refresh the edit set so the next step re-runs under the lab's CURRENT
+        # edits (the sim's source of truth); None keeps the existing set.
+        if req.overrides is not None:
+            _branch_overrides[key] = {s: dict(r) for s, r in req.overrides.items()}
+        return {"run": run, "slot_id": slot_id, "model": model_alias, "events": len(blog.state["events"])}
 
     @app.post("/slots/{slot_id}/{model_alias}/step")
     async def cell_step(  # pyright: ignore[reportUnusedFunction]
@@ -1553,15 +1682,25 @@ def create_app() -> FastAPI:
         req: BranchStepRequest,
         run: str | None = None,
     ) -> dict[str, object]:
-        """Run the branch's next pending LLM call (simulation is one-step-at-
-        a-time). 409 when nothing is pending — the step in flight hasn't
-        finished, or the branch is paused/done."""
+        """Advance a simulation branch by one LLM call. Like the source
+        "step", this QUEUES a credit when the branch is mid-call (so a batch
+        "step sims" never errors on a branch that isn't sitting at a gate),
+        runs it to completion with `auto`, or fast-forwards to the next call of
+        `until` and pauses there. 409 only when there's genuinely nothing to
+        advance (done / no branch / overrides lost)."""
         run = _resolve_run(run)
         _require_branch_log(run, slot_id, model_alias)
-        gate = _branch_gates.get((run, slot_id, model_alias))
-        if gate is None or not gate.proceed(auto=req.auto):
-            raise HTTPException(status_code=409, detail="no pending step to run")
-        return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto}
+        if req.until is not None and req.until not in prompt_store.STEPS:
+            raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
+        # `req.model` is a model ALIAS chosen in the compare UI; map to its
+        # OpenRouter id so the next gated call re-aims at it (None = unchanged).
+        if req.model is not None and req.model not in MODELS:
+            raise HTTPException(status_code=400, detail=f"unknown model: {req.model}")
+        model_id = MODELS[req.model] if req.model is not None else None
+        result = await _advance_branch(run, slot_id, model_alias, auto=req.auto, until=req.until, model=model_id)
+        if result in ("missing", "done", "not_runnable"):
+            raise HTTPException(status_code=409, detail=f"cannot step: {result}")
+        return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto, "until": req.until, "result": result, "ran_model": req.model}
 
     @app.post("/slots/{slot_id}/{model_alias}/branch/pause")
     async def branch_pause(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -1630,22 +1769,25 @@ def create_app() -> FastAPI:
         fast iteration loop (edit → re-run step → compare) for a run that IS
         the working copy of a version being authored."""
         _require_run_prompts(run)
-        if not req.overrides:
+        # Allow a no-edit call when it's only syncing the version (push the run's
+        # accumulated prompts back onto the source version without a fresh edit).
+        if not req.overrides and not req.update_version:
             raise HTTPException(status_code=400, detail="no template edits to apply")
-        try:
-            prompt_store.write_overrides(
-                _run_dir(run) / prompt_store.RUN_PROMPTS_SUBDIR, req.overrides,
-            )
-        except prompt_store.PromptTemplateError as e:
-            raise HTTPException(status_code=400, detail=str(e))
+        run_snapshot = _run_dir(run) / prompt_store.RUN_PROMPTS_SUBDIR
+        if req.overrides:
+            try:
+                prompt_store.write_overrides(run_snapshot, req.overrides)
+            except prompt_store.PromptTemplateError as e:
+                raise HTTPException(status_code=400, detail=str(e))
         version_synced: str | None = None
         if req.update_version:
             meta = _run_meta(run)
             version = meta.get("prompt_version")
             if isinstance(version, str) and prompt_store.version_exists(version):
-                prompt_store.write_overrides(
-                    prompt_store.VERSIONS_DIR / version, req.overrides,
-                )
+                # HARD replacement: copy the run's FULL snapshot (every step) onto
+                # the source version, so edits applied to the run earlier without
+                # syncing land too — not just this call's overrides.
+                prompt_store.sync_templates(prompt_store.VERSIONS_DIR / version, run_snapshot)
                 version_synced = version
         return {
             "run": run,
@@ -1653,16 +1795,17 @@ def create_app() -> FastAPI:
             "version_synced": version_synced,
         }
 
-    @app.post("/runs/{run}/rerun-step")
-    async def rerun_step(  # pyright: ignore[reportUnusedFunction]
-        run: str, req: RerunStepRequest,
+    @app.post("/runs/{run}/simulate-step")
+    async def simulate_step(  # pyright: ignore[reportUnusedFunction]
+        run: str, req: SimulateStepRequest,
     ) -> dict[str, object]:
-        """Rewind every targeted cell to just before its EARLIEST first call
-        of any template in `steps` and relaunch: the committed prefix replays
-        from the log, the edited steps re-run under the snapshot's current
-        templates, and the whole downstream cascade regenerates. The per-step
-        iteration loop — works no matter how deep the run got before the
-        problem was noticed."""
+        """Fork a SIMULATION branch in every targeted cell at its EARLIEST
+        call of any template in `steps`, running the pipeline from there under
+        the run's (freshly edited) snapshot. Non-destructive: the source cells
+        are untouched, so the original output stays for comparison — promote a
+        branch with /branch/commit to replace its source when you're happy.
+        Omitted `cells` means every cell that logged a re-renderable call of
+        one of those steps."""
         if not req.steps:
             raise HTTPException(status_code=400, detail="no steps given")
         for s in req.steps:
@@ -1676,7 +1819,7 @@ def create_app() -> FastAPI:
         if req.cells is not None:
             wanted = {(str(c.get("slot", "")), str(c.get("model", ""))) for c in req.cells}
         steps = set(req.steps)
-        rerun: list[str] = []
+        simulated: list[str] = []
         skipped: list[str] = []
         for (r, slot_id, alias), slot_log in list(_slot_logs.items()):
             if r != run:
@@ -1684,36 +1827,71 @@ def create_app() -> FastAPI:
             if wanted is not None and (slot_id, alias) not in wanted:
                 continue
             events = slot_log.state["events"]
-            cut = next(
-                (e.get("index") for e in events
-                 if e.get("kind") == "cache.llm" and e.get("template") in steps),
-                None,
-            )
-            if not isinstance(cut, int):
+            # Earliest re-renderable call of any target step — its ARRAY index
+            # is the fork point (matches _fork_branch / _require_step_event).
+            cut: int | None = None
+            cut_step: str | None = None
+            for i, e in enumerate(events):
+                if (e.get("kind") == "cache.llm" and e.get("template") in steps
+                        and isinstance(e.get("variables"), dict)):
+                    cut = i
+                    cut_step = str(e.get("template"))
+                    break
+            if cut is None or cut_step is None:
                 skipped.append(f"{slot_id}/{alias}")
                 continue
-            key: RunKey = (run, slot_id, alias)
-            # The rewind rewrites this cell's log: its branch is stale, and
-            # the artifacts of every dropped node must go so the regenerated
-            # tree can't silently reuse a stale mesh under a re-used id.
-            await _discard_branch(key)
-            await _cancel_task(run, slot_id, alias)
-            objs = slot_log.events_path.parent / "objects"
-            for e in events[cut:]:
-                oid = e.get("id")
-                if isinstance(oid, str):
-                    for suffix in (".glb", ".raw.glb", ".png"):
-                        with contextlib.suppress(OSError):
-                            (objs / f"{oid}{suffix}").unlink()
-            slot_log.truncate_events_to(cut)
-            # Stepped cells get one free pass so the edited step itself
-            # re-executes immediately, then the gate pauses before the call
-            # AFTER it — no per-cell clicking just to see the new output.
-            if key in _stepped_cells:
-                _gate_intents[key] = {"budget": 1}
-            _tasks[key] = asyncio.create_task(_run(run, slot_id, alias))
-            rerun.append(f"{slot_id}/{alias}")
-        return {"run": run, "steps": sorted(steps), "rerun": rerun, "skipped": skipped}
+            # The run snapshot already carries the lab's edits (the apply step
+            # writes them first), so the branch needs no per-call overrides.
+            try:
+                await _fork_branch(run, slot_id, alias, event_index=cut, step=cut_step, overrides={})
+            except HTTPException:
+                skipped.append(f"{slot_id}/{alias}")
+                continue
+            simulated.append(f"{slot_id}/{alias}")
+        return {"run": run, "steps": sorted(steps), "simulated": simulated, "skipped": skipped}
+
+    @app.post("/slots/{slot_id}/{model_alias}/branch/commit")
+    async def commit_branch(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Promote a cell's simulation branch to BE the source cell: the
+        branch's events + meshes replace the cell's own, and the branch is
+        discarded. The deliberate, on-demand "replace source with the
+        simulation" action — the inverse of the non-destructive fork. The
+        prior source state is overwritten (gone)."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        key: RunKey = (run, slot_id, model_alias)
+        blog = _branch_logs.get(key)
+        if blog is None:
+            raise HTTPException(status_code=404, detail="no active branch for this cell")
+        src_log = _slot_logs.get(key)
+        if src_log is None:
+            raise HTTPException(status_code=404, detail="no source cell to replace")
+        # Stop both pipelines, then swap the branch's log + meshes into source.
+        await _cancel_task(run, slot_id, model_alias)
+        await _cancel_branch_task(key)  # keeps blog + dir for the copy below
+        bdir = blog.events_path.parent
+        cell_dir = src_log.events_path.parent
+        src_objects = _objects_dir(cell_dir)
+        src_log.close()
+        await asyncio.to_thread(shutil.copyfile, bdir / "events.jsonl", src_log.events_path)
+        # Move the branch's objects over the source's. The branch's prefix
+        # files are hardlinks to the source inodes, so dropping the source dir
+        # first is safe; slot_meshes filters to committed ids, so any stale
+        # hardlinked-but-dropped files in the moved dir aren't served.
+        branch_objects = bdir / "objects"
+
+        def _swap_objects() -> None:
+            shutil.rmtree(src_objects, ignore_errors=True)
+            if branch_objects.is_dir():
+                shutil.move(str(branch_objects), str(src_objects))
+            else:
+                src_objects.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_swap_objects)
+        src_log.hydrate_from_disk()  # reload source state from the promoted log
+        await _discard_branch(key)   # remove the now-consumed branch dir + state
+        emit_index = len(src_log.state["events"])
+        return {"run": run, "slot_id": slot_id, "model": model_alias, "events": emit_index}
 
     @app.post("/versions/save")
     async def save_version(req: SaveVersionRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -1816,6 +1994,25 @@ def _last_step(events: list[dict[str, object]]) -> dict[str, object] | None:
     return None
 
 
+def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, int]]:
+    """Per-model token + request totals from a cell's `cache.llm` events, so the
+    UI cost tracker can price the run (it applies the per-model USD rates client
+    side). Returns `{ model_id: {"in": tokens_in, "out": tokens_out, "req": n} }`
+    — a model with no logged usage still counts requests (cost shows as 0 for it
+    until a rate exists), matching the old tracker's request-only degradation."""
+    usage: dict[str, dict[str, int]] = {}
+    for e in events:
+        if e.get("kind") != "cache.llm":
+            continue
+        model = str(e.get("model") or "?")
+        u = usage.setdefault(model, {"in": 0, "out": 0, "req": 0})
+        ti, to = e.get("tokens_in"), e.get("tokens_out")
+        u["in"] += int(ti) if isinstance(ti, (int, float)) else 0
+        u["out"] += int(to) if isinstance(to, (int, float)) else 0
+        u["req"] += 1
+    return usage
+
+
 def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
@@ -1833,6 +2030,9 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
                 "last_step": _last_step(bevents),
                 # The LLM call waiting for the user's go-ahead, when gated.
                 "pending": bgate.pending if bgate is not None else None,
+                # The call currently in flight (released/running), so the UI
+                # shows it instead of the stale last phase while it runs.
+                "current": bgate.current if bgate is not None else None,
                 "auto": bgate.auto if bgate is not None else False,
             }
         cgate = _cell_gates.get((run, slot.id, alias))
@@ -1843,8 +2043,12 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             "last_step": _last_step(events),
             "stepped": (run, slot.id, alias) in _stepped_cells,
             "pending": cgate.pending if cgate is not None else None,
+            "current": cgate.current if cgate is not None else None,
             "auto": cgate.auto if cgate is not None else False,
             "branch": branch,
+            # Per-model token/request totals for the cost tracker (the run's
+            # actual spend = source cells; branch simulations aren't counted).
+            "usage": _usage_summary(events),
         }
     return {
         "id": slot.id,
@@ -2047,18 +2251,82 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
     return "launched"
 
 
-def _hardlink_tree(src: Path, dst: Path) -> None:
+async def _advance_branch(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None, model: str | None = None) -> str:
+    """Advance a simulation branch — the branch mirror of `_advance_cell`, so
+    "step sims" behaves like "step all": it queues rather than erroring when a
+    branch isn't sitting at a live gate.
+      * live gate: release a current pause, else QUEUE a credit (budget++) the
+        branch spends at its next gate — so a branch mid-call isn't skipped.
+      * `auto` runs it to completion; `until` fast-forwards to the next call of
+        that template and pauses there.
+      * `model` (an OpenRouter id) re-aims the next gated call at a chosen LLM
+        (compare's per-step model A/B) — sticky on the gate until changed, so
+        the same scene context can be tested against different models.
+      * paused/error with no task → relaunch carrying the intent.
+    Returns a status string for the caller to report/aggregate."""
+    key: RunKey = (run, slot_id, model_alias)
+    blog = _branch_logs.get(key)
+    if blog is None:
+        return "missing"
+    gate = _branch_gates.get(key)
+    task = _branch_tasks.get(key)
+    if gate is not None and task is not None and not task.done():
+        if model is not None:
+            gate.model_override = model  # applies from the next gated call onward
+        if auto:
+            gate.auto = True
+            gate.proceed(auto=True)
+            return "stepped"
+        if until is not None:
+            if gate.pending and gate.pending.get("template") == until:
+                return "at_target"
+            gate.until_step = until
+            gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
+            return "seeking"
+        if gate.proceed():
+            return "stepped"
+        gate.budget += 1  # mid-call → queue the step for its next gate
+        return "queued"
+    # No live gate. (A finished task leaves no gate; a paused branch was cancelled.)
+    if any(e.get("kind") == "run.done" for e in blog.state["events"]):
+        return "done"
+    if key not in _branch_overrides:
+        return "not_runnable"  # overrides gone (server restart) — re-create it
+    if blog.state.get("status") not in ("paused", "error"):
+        return "not_runnable"
+    events = blog.state["events"]
+    if events and events[-1].get("kind") in ("run.error", "run.paused"):
+        blog.truncate_events_to(len(events) - 1)
+    if auto:
+        intent: dict[str, object] = {"auto": True}
+    else:
+        intent = {"until": until} if until is not None else {"budget": 1}
+    if model is not None:
+        intent["model"] = model  # seed the relaunched gate's override
+    _branch_gate_intents[key] = intent
+    blog.state["status"] = "running"
+    _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot_id, model_alias))
+    return "launched"
+
+
+def _hardlink_tree(src: Path, dst: Path, ids: set[str] | None = None) -> None:
     """Mirror the flat `objects/` dir (`<id>.glb`, `<id>.raw.glb`, `<id>.png`)
     from `src` into `dst` via hardlinks — instant and zero extra disk, so the
     branch's `_spawn_meshes` sees committed prefix meshes as already present
-    (`path.exists()`) and skips re-billing them. Prefix meshes are read-only in
-    the branch (only NEW ids generate), so sharing inodes is safe. Falls back
-    to a copy where hardlinks aren't supported."""
+    (`path.exists()`) and skips re-billing them. When `ids` is given, ONLY files
+    for those node ids are linked (the branch passes its PREFIX's committed mesh
+    ids) — post-deviation objects are deliberately absent so the pipeline
+    regenerates them fresh and the branch shares nothing with the source past
+    the fork. Falls back to a copy where hardlinks aren't supported."""
     if not src.is_dir():
         return
     dst.mkdir(parents=True, exist_ok=True)
     for p in src.iterdir():
         if not p.is_file():
+            continue
+        # File names are `<id>.glb` / `<id>.raw.glb` / `<id>.png`; the id is the
+        # part before the first dot (node ids carry no dots).
+        if ids is not None and p.name.split(".", 1)[0] not in ids:
             continue
         target = dst / p.name
         if target.exists():
@@ -2080,6 +2348,17 @@ def _require_branch_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
     return blog
 
 
+def _branch_awaiting(run: str, slot_id: str, model_alias: str, step: str, node: str | None) -> bool:
+    """True when the branch is paused at its gate right before a (step[, node])
+    call — i.e. a prompt-test seed for that call MISSED the cache and the real
+    re-run hasn't happened yet, so the seed is stale, not the branch's output."""
+    gate = _branch_gates.get((run, slot_id, model_alias))
+    pending = gate.pending if gate is not None else None
+    if not pending or pending.get("template") != step:
+        return False
+    return node is None or pending.get("node") == node
+
+
 def cache_hash_for_seed(event: dict[str, object], seed: BranchSeed) -> str:
     """Cache key for a seeded prompt-test result: identical inputs to what the
     branch's re-reached call will hash, so the pipeline cache-hits the vetted
@@ -2092,6 +2371,94 @@ def cache_hash_for_seed(event: dict[str, object], seed: BranchSeed) -> str:
     )
 
 
+async def _fork_branch(
+    run: str,
+    slot_id: str,
+    model_alias: str,
+    *,
+    event_index: int,
+    step: str,
+    overrides: dict[str, dict[str, str]],
+    seed: BranchSeed | None = None,
+) -> int:
+    """Fork a cell into a simulation branch at `event_index` (a re-renderable
+    cache.llm call of template `step`): keep the prefix, hardlink the source's
+    finished meshes, and run the pipeline from there under the run snapshot +
+    `overrides`. Replaces any prior branch. Returns the branch's starting event
+    count. Shared by the lab's "simulate downstream" (create_branch) and
+    apply-to-run's "simulate from step" (simulate_step) — both are NON-
+    destructive: the source cell is never touched."""
+    src_log, event = _require_step_event(run, slot_id, model_alias, event_index, step)
+    src_events = list(src_log.state["events"])
+    key: RunKey = (run, slot_id, model_alias)
+
+    # One branch per cell: replace any prior fork of this cell.
+    await _discard_branch(key)
+    bdir = _branch_dir(run, slot_id, model_alias)
+    shutil.rmtree(bdir, ignore_errors=True)
+    bdir.mkdir(parents=True, exist_ok=True)
+
+    # Hardlink ONLY the prefix's finished meshes (objects committed BEFORE the
+    # fork) so the replayed prefix renders without regenerating. Nothing after
+    # the deviation is linked: post-fork objects have no file here, so the
+    # pipeline generates each one FRESH (library re-match + re-place, or a fresh
+    # Trellis run), keeping the branch fully independent of the source past the
+    # branch-off point.
+    cell_dir = src_log.events_path.parent
+    src_objects = cell_dir / OBJECTS_SUBDIR
+    if not src_objects.is_dir():
+        src_objects = next(
+            (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
+            cell_dir / "objects",
+        )
+    prefix_ids = _committed_mesh_ids(src_events[:event_index])
+    await asyncio.to_thread(_hardlink_tree, src_objects, bdir / "objects", prefix_ids)
+
+    # Prefix = source events BEFORE the edited step's call. Dropping that call
+    # (and everything after) means `committed.*` replays the prefix and the
+    # pipeline re-reaches the call with the (snapshot + overrides) templates.
+    branch_events = [dict(e) for e in src_events[:event_index]]
+    bevents = bdir / "events.jsonl"
+    with bevents.open("w", encoding="utf-8") as f:
+        for e in branch_events:
+            f.write(json.dumps(e) + "\n")
+
+    blog = SlotLog(_branch_run_id(run, slot_id, model_alias), bevents)
+    blog.hydrate_from_disk()
+    if blog.state.get("prompt") is None or blog.state.get("model") is None:
+        raise HTTPException(status_code=400, detail="source has no run.start to branch from")
+    if seed is not None:
+        # Pre-commit the vetted prompt-test result so the re-reached call
+        # cache-hits it and the simulation continues from EXACTLY the output
+        # the user approved (a drifted render simply misses and re-runs fresh).
+        blog.log(
+            "cache.llm",
+            key=cache_hash_for_seed(event, seed),
+            node=event.get("node"),
+            step=event.get("step"),
+            template=step,
+            model=event.get("model"),
+            schema=event.get("schema"),
+            system=seed.system,
+            user=seed.user,
+            variables=event.get("variables"),
+            output=seed.output,
+            reasoning=seed.reasoning,
+            tokens_in=seed.tokens_in,
+            tokens_out=seed.tokens_out,
+            seeded=True,
+        )
+    _branch_logs[key] = blog
+    _branch_overrides[key] = {s: dict(r) for s, r in overrides.items()}
+    # Run the forked step IMMEDIATELY (one gate credit) so "simulate downstream"
+    # shows the edited step's result on fork, with no manual first step. A seed
+    # already pre-commits that result, so leave it paused right after it.
+    if seed is None:
+        _branch_gate_intents[key] = {"budget": 1}
+    _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot_id, model_alias))
+    return len(blog.state["events"])
+
+
 async def _cancel_branch_task(key: RunKey) -> None:
     """Cancel the cell branch's task + in-flight branch meshes + step gate,
     but KEEP its SlotLog, overrides, and dir — pause/resume relaunch on the
@@ -2102,6 +2469,7 @@ async def _cancel_branch_task(key: RunKey) -> None:
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
     _branch_gates.pop(key, None)
+    _branch_gate_intents.pop(key, None)
     log = _branch_logs.get(key)
     if log is not None:
         generation.cancel_pending(log.slot_id)
@@ -2126,8 +2494,14 @@ async def _run_branch(run: str, slot_id: str, model_alias: str) -> None:
     blog = _branch_logs[key]
     rlog.bind(blog)
     # One LLM call at a time: bind the step gate IN this task's context so
-    # only the branch pauses; the main pipeline tasks never block.
-    gate = CellGate(blog)
+    # only the branch pauses; the main pipeline tasks never block. A relaunch
+    # (step / step-until / run-rest of a paused branch) carries its intent here.
+    intent = _branch_gate_intents.pop(key, {})
+    _b_model = intent.get("model")
+    gate = CellGate(blog, budget=int(intent.get("budget", 0) or 0), model_override=str(_b_model) if _b_model else None)
+    gate.auto = bool(intent.get("auto", False))
+    _b_until = intent.get("until")
+    gate.until_step = str(_b_until) if _b_until else None
     _branch_gates[key] = gate
     llm.set_step_gate(gate.wait)
     prompt = blog.state["prompt"]
@@ -2175,7 +2549,21 @@ async def _start_cell(run: str, slot_id: str, model_alias: str) -> None:
 _MESH_BUNDLE_MAGIC = b"SMB1"
 
 
-async def _mesh_bundle(objects_dir: Path) -> AsyncIterator[bytes]:
+def _committed_mesh_ids(events: list[dict[str, object]]) -> set[str]:
+    """Node ids with a committed `model` event — the meshes that are actually
+    part of the scene. A branch hardlinks the WHOLE source `objects/` dir up
+    front (so the replayed prefix doesn't re-bill Trellis), so its bundle must
+    exclude files for nodes the re-run dropped (no `model` event in the branch
+    log) — otherwise those obsoleted source meshes render as ghosts the branch's
+    bboxes/scene-projection don't include."""
+    return {
+        e["id"]  # type: ignore[misc]
+        for e in events
+        if e.get("kind") == "model" and isinstance(e.get("id"), str)
+    }
+
+
+async def _mesh_bundle(objects_dir: Path, ids: set[str] | None = None) -> AsyncIterator[bytes]:
     """Stream every finished GLB under `objects_dir` as one length-prefixed
     binary bundle, so a client can fetch an entire scene in a single request
     instead of one HTTP round-trip per mesh. Framing (little-endian):
@@ -2184,7 +2572,9 @@ async def _mesh_bundle(objects_dir: Path) -> AsyncIterator[bytes]:
         repeat: <uint32 id_len><id utf-8><uint32 glb_len><glb bytes>
 
     The id is the file stem, which matches the `model` event's `id`. Files are
-    read off the event loop via a thread so a large scene doesn't stall it.
+    read off the event loop via a thread so a large scene doesn't stall it. When
+    `ids` is given, only those stems are streamed — the branch passes the set of
+    its committed `model` ids so stale hardlinked prefix meshes aren't served.
     """
     yield _MESH_BUNDLE_MAGIC
     if not objects_dir.is_dir():
@@ -2195,6 +2585,8 @@ async def _mesh_bundle(objects_dir: Path) -> AsyncIterator[bytes]:
         if path.name.endswith(".raw.glb"):
             continue
         node_id = path.name[: -len(".glb")]
+        if ids is not None and node_id not in ids:
+            continue  # not part of this scene (e.g. a branch's obsoleted object)
         data = await asyncio.to_thread(path.read_bytes)
         id_bytes = node_id.encode("utf-8")
         yield struct.pack("<I", len(id_bytes)) + id_bytes

@@ -15,22 +15,23 @@ const stepsEl = document.getElementById("lab-steps");
 const varsEl = document.getElementById("lab-vars");
 const sysEl = document.getElementById("lab-sys");
 const usrEl = document.getElementById("lab-usr");
-const eventsEl = document.getElementById("lab-events");
-const evCountEl = document.getElementById("lab-ev-count");
+const selectBtn = document.getElementById("lab-select");
+const selSummaryEl = document.getElementById("lab-sel-summary");
 const selCountEl = document.getElementById("lab-sel-count");
 const testBtn = document.getElementById("lab-test");
 const simBtn = document.getElementById("lab-simulate");
-const reviewEl = document.getElementById("review");
-const reviewGridEl = document.getElementById("review-grid");
-const reviewStepEl = document.getElementById("review-step");
-const reviewCountEl = document.getElementById("review-count");
-const reviewSectionsEl = document.getElementById("review-sections");
-const reviewColsEl = document.getElementById("review-cols");
-const reviewTestAllEl = document.getElementById("review-test-all");
-const reviewTestSummaryEl = document.getElementById("review-test-summary");
+// The debug grid lives in the lab's right pane (#lab-right) — the review
+// canvas, relocated. It's live whenever the lab is open, scoped to the
+// selected slots/zones, and toggles between 3D scenes and text output diffs.
+// The `review*` identifiers below name the card-rendering machinery it reuses
+// verbatim; there is no longer a separate review screen.
+const reviewGridEl = document.getElementById("lab-grid");
+const reviewStepEl = document.getElementById("lab-grid-step");
+const reviewCountEl = document.getElementById("lab-grid-count");
+const reviewSectionsEl = document.getElementById("lab-sections");
+const reviewColsEl = document.getElementById("lab-cols");
+const reviewTestSummaryEl = document.getElementById("lab-test-summary");
 const labStepAllEl = document.getElementById("lab-step-all");
-const reviewStepAllEl = document.getElementById("review-step-all");
-const eventStepBtns = []; // current event-panel step buttons, refreshed each poll
 
 // Which text sections the review cards show, and how many cards per row —
 // the comparison view's "fill the space with what I care about" controls.
@@ -40,17 +41,12 @@ const REVIEW_3D_KEY = "starshot.review3d";
 const REVIEW_SECTIONS = ["input", "output", "system", "reasoning"];
 const reviewShow = loadReviewShow();
 let reviewCols = loadReviewCols();
-// "Convert to 3D": each card shows its slot's CURRENT scene (one live viewer
-// per card) instead of text, so a new prompt's effect can be eyeballed across
-// every slot side by side. Distinct from the per-card "compare 3D" (live run
-// vs simulated-edit branch of one slot).
-let review3d = (() => { try { return localStorage.getItem(REVIEW_3D_KEY) === "1"; } catch { return false; } })();
-// 3D before/after layers, toggled independently so each reads on its own:
-// "original" = the recorded boxes, "proposed" = the tested-edit overlay.
-const REVIEW_ORIGINAL_KEY = "starshot.reviewShowOriginal";
-const REVIEW_PROPOSED_KEY = "starshot.reviewShowProposed";
-let reviewShowOriginal = (() => { try { return localStorage.getItem(REVIEW_ORIGINAL_KEY) !== "0"; } catch { return true; } })();
-let reviewShowProposed = (() => { try { return localStorage.getItem(REVIEW_PROPOSED_KEY) !== "0"; } catch { return true; } })();
+// "Convert to 3D": each card shows its cell's scene (one live viewer per card)
+// instead of text — the source, or its simulation branch when one is live, so
+// a prompt's effect can be eyeballed across every slot side by side. Before/
+// after comparison lives on the dedicated compare screen (per-card "compare
+// 3D ⇄"), not as an overlay on this canvas.
+let review3d = (() => { try { return localStorage.getItem(REVIEW_3D_KEY) !== "0"; } catch { return true; } })();
 
 // Progress of the in-flight test batch(es), so the summary reads honestly
 // ("testing 3/9…") instead of the live-concurrency count, which looked like
@@ -58,6 +54,10 @@ let reviewShowProposed = (() => { try { return localStorage.getItem(REVIEW_PROPO
 // (a per-card "test" fired mid-"test all") via the ref count.
 let testBatch = null; // { total, done } | null when idle
 let testBatchRefs = 0;
+// Bumped on every step (re)selection. An in-flight batch captures it and bails
+// the moment it changes, so tests from the old step can't re-populate lab.tests
+// or skew the new step's progress count.
+let testSeq = 0;
 
 function loadReviewShow() {
   try {
@@ -73,10 +73,16 @@ function loadReviewCols() {
 
 let lastSavedVersion = null;
 
+// The debug-grid selection is per-run; `selInitialized` lets us seed it once
+// (to every started cell) on first open of a run, then leave the user's
+// choices alone — including a deliberate "select nothing".
+let selRun = null;
+let selInitialized = false;
+
 export function initLab() {
   document.getElementById("btn-lab").addEventListener("click", openLab);
   document.getElementById("lab-close").addEventListener("click", () => {
-    closeReview();
+    teardownGrid();
     labEl.classList.remove("open");
   });
   // Template editors expand to fit their full text (and keep tracking it
@@ -84,44 +90,46 @@ export function initLab() {
   document.getElementById("lab-sys-label").appendChild(fitToggle(sysEl));
   document.getElementById("lab-usr-label").appendChild(fitToggle(usrEl));
   document.getElementById("lab-ev-refresh").addEventListener("click", () => loadEvents());
-  document.getElementById("lab-ev-review").addEventListener("click", openReview);
-  document.getElementById("review-close").addEventListener("click", closeReview);
+  selectBtn.addEventListener("click", openSelectionDialog);
   reviewColsEl.value = String(reviewCols);
   reviewColsEl.addEventListener("change", () => {
     reviewCols = Number(reviewColsEl.value) || 2;
     try { localStorage.setItem(REVIEW_COLS_KEY, String(reviewCols)); } catch { /* private mode */ }
     applyReviewCols();
   });
-  reviewTestAllEl.addEventListener("click", () => testEvents(state.lab.events));
   labStepAllEl.addEventListener("click", stepAllCells);
-  reviewStepAllEl.addEventListener("click", stepAllCells);
   labStepAllEl.after(labUntilEl);
-  reviewStepAllEl.after(reviewUntilEl);
   labUntilEl.after(labExitEl);
-  reviewUntilEl.after(reviewExitEl);
-  document.addEventListener("keydown", (ev) => {
-    // Escape closes the review canvas only when the scene overlay (which sits
-    // above it and owns its own Escape) and modals aren't open.
-    if (ev.key === "Escape" && reviewEl.classList.contains("open")
-        && !document.getElementById("overlay").classList.contains("open")
-        && !document.getElementById("modal-root").firstChild) {
-      closeReview();
-    }
-  });
   document.getElementById("lab-apply").addEventListener("click", applyToRunModal);
   document.getElementById("lab-save-version").addEventListener("click", saveVersionModal);
   document.getElementById("lab-save-run").addEventListener("click", saveRunModal);
-  testBtn.addEventListener("click", runTests);
-  simBtn.addEventListener("click", simulateDownstream);
+  // The two action-bar buttons are contextual: test/simulate when the selection
+  // is idle, step-sims/break-out once it's simulating (see updateActionBar).
+  // The "step sims until…" select sits between them, shown only in branch mode.
+  testBtn.addEventListener("click", () => {
+    if (selectedBranchedCells().length > 0) stepSelectedBranches();
+    else testEvents(selectedEvents());
+  });
+  testBtn.after(simUntilEl);
+  simBtn.addEventListener("click", () => {
+    if (selectedBranchedCells().length > 0) breakOutSelected();
+    else simulateDownstream();
+  });
   sysEl.addEventListener("input", onEdit);
   usrEl.addEventListener("input", onEdit);
+  initLabResizer();
   on("slots", () => {
     if (!labEl.classList.contains("open")) return;
+    pruneStaleSims(); // forget branches the server dropped (source rewound/reset elsewhere)
     renderSims();
     updateStepAllButtons();
-    refreshEventStepBtns(); // keep per-cell step buttons live between event reloads
-    pollEvents(); // auto-pick up newly-completed events (incl. in the review canvas)
+    refreshCardStepBtns(); // keep card step buttons live between event reloads
+    refreshCardScenes(); // swap a card to its branch scene + follow it as it runs
+    pollEvents(); // auto-pick up newly-completed events in the grid
   });
+  // The overlay's "+ sim" zone button feeds targets here, so you can pick a zone
+  // off the 3D scene instead of hunting for it in the step's call list.
+  on("add-sim-target", addSimTarget);
 }
 
 export async function openLab() {
@@ -134,12 +142,25 @@ export async function openLab() {
     toast(`prompt lab unavailable: ${e.message}`, "err");
     return;
   }
+  // Variable hover samples are run-independent (a fixed sample scene rendered by
+  // the real injection functions) — fetch once, lazily, non-fatally.
+  if (varSamples === null) {
+    try { varSamples = await api.variableSamples(); }
+    catch { varSamples = {}; }
+  }
+  // The slot/zone selection belongs to a run; on a run switch re-seed it from
+  // that run's events on the next load (the session reset already cleared it).
+  if (selRun !== state.run) { selRun = state.run; selInitialized = false; }
   lab.open = true;
   labEl.classList.add("open");
+  renderReviewControls();
+  applyReviewCols();
   renderSteps();
+  updateSelectionSummary();
   if (!lab.step) selectStep(lab.templates.keys().next().value);
   else selectStep(lab.step, { keepSelection: true });
   updateStepAllButtons();
+  renderSims();
 }
 
 function draftFor(step) {
@@ -157,7 +178,7 @@ function isEdited(step) {
   return !!t && !!d && (d.system !== t.system || d.user !== t.user);
 }
 
-function overridesPayload() {
+export function overridesPayload() {
   const out = {};
   for (const step of state.lab.templates.keys()) {
     if (isEdited(step)) {
@@ -183,13 +204,75 @@ function renderSteps() {
   }
 }
 
+// --- variable hover preview ---------------------------------------------------
+//
+// Hovering a variable chip shows what that token actually expands to: a sample
+// rendered SERVER-SIDE by the same scene_context injection functions the live
+// pipeline uses (fetched once into `varSamples`), so a missing-context or
+// rendering bug surfaces here without running a scene. The popover bridges hover
+// to itself so big samples (SCENE_CONTEXT, TO_PLACE) can be scrolled.
+
+let varSamples = null;
+let varPreviewEl = null;
+let varPreviewHideTimer = null;
+
+function ensureVarPreview() {
+  if (varPreviewEl) return varPreviewEl;
+  varPreviewEl = el("div", { class: "var-preview" });
+  varPreviewEl.addEventListener("mouseenter", () => clearTimeout(varPreviewHideTimer));
+  varPreviewEl.addEventListener("mouseleave", scheduleHideVarPreview);
+  document.body.appendChild(varPreviewEl);
+  return varPreviewEl;
+}
+
+function scheduleHideVarPreview() {
+  clearTimeout(varPreviewHideTimer);
+  varPreviewHideTimer = setTimeout(() => varPreviewEl?.classList.remove("open"), 160);
+}
+
+function hideVarPreview() {
+  clearTimeout(varPreviewHideTimer);
+  varPreviewEl?.classList.remove("open");
+}
+
+function showVarPreview(chip, name, isNative) {
+  const pop = ensureVarPreview();
+  clearTimeout(varPreviewHideTimer);
+  const sample = varSamples?.[name];
+  pop.textContent = "";
+  pop.appendChild(el("div", { class: "var-preview-head" },
+    el("span", { class: "var-preview-name", text: `\`{${name}}\`` }),
+    el("span", { class: "var-preview-note", text: isNative ? "sample render" : "sample render · not populated for this step" }),
+  ));
+  pop.appendChild(el("pre", {
+    class: "var-preview-body",
+    text: sample && sample.trim()
+      ? sample
+      : (varSamples ? "(renders empty for the sample scene)" : "(sample unavailable)"),
+  }));
+  pop.appendChild(el("div", { class: "var-preview-foot", text: "click the chip to insert it at the user-template cursor" }));
+  pop.classList.add("open");
+  // Position under the chip, clamped to the viewport; flip above if it'd overflow.
+  const r = chip.getBoundingClientRect();
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 12));
+  let top = r.bottom + 6;
+  if (top + pop.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - 6 - pop.offsetHeight);
+  pop.style.left = `${Math.round(left)}px`;
+  pop.style.top = `${Math.round(top)}px`;
+}
+
 function selectStep(step, { keepSelection = false } = {}) {
   const lab = state.lab;
   lab.step = step;
-  if (!keepSelection) {
-    lab.selected.clear();
-    lab.tests.clear();
-  }
+  // A real step change abandons the previous step's in-flight card fetches and
+  // its per-event test results (the events differ). The slot/zone selection is
+  // step-independent, so it persists across the switch.
+  reviewSeq += 1;
+  // Invalidate any running test batch — its events belong to the old step — and
+  // drop its progress so the new step doesn't show a phantom "testing N/M…".
+  testSeq += 1;
+  testBatch = null;
+  if (!keepSelection) lab.tests.clear();
   const t = lab.templates.get(step);
   const d = draftFor(step);
   sysEl.value = d.system;
@@ -199,26 +282,24 @@ function selectStep(step, { keepSelection = false } = {}) {
   sysEl.dispatchEvent(new Event("input"));
   usrEl.dispatchEvent(new Event("input"));
   varsEl.textContent = "";
+  hideVarPreview();
   // The full vocabulary is injectable everywhere; chips outside this step's
   // native set are dimmed — they resolve to empty/placeholder at call time.
+  // Hovering a chip previews its real rendered sample (see showVarPreview).
   const native = new Set(t.native ?? t.variables);
   for (const v of t.variables) {
     const isNative = native.has(v);
-    varsEl.appendChild(
-      el("span", {
-        class: `var-chip${isNative ? "" : " dim"}`,
-        text: `\`{${v}}\``,
-        title: isNative
-          ? "click to insert at the user-template cursor"
-          : "click to insert — not natively populated for this step, renders empty/placeholder here",
-        onclick: () => insertAtCursor(usrEl, `\`{${v}}\``),
-      }),
-    );
+    const chip = el("span", {
+      class: `var-chip${isNative ? "" : " dim"}`,
+      text: `\`{${v}}\``,
+      onclick: () => insertAtCursor(usrEl, `\`{${v}}\``),
+    });
+    chip.addEventListener("mouseenter", () => showVarPreview(chip, v, isNative));
+    chip.addEventListener("mouseleave", scheduleHideVarPreview);
+    varsEl.appendChild(chip);
   }
   renderSteps();
-  // When stepping drives the lab while the review canvas is open, keep its
-  // header in sync — loadEvents() repaints the grid for the new step.
-  if (reviewEl.classList.contains("open")) reviewStepEl.textContent = step;
+  reviewStepEl.textContent = step; // grid header tracks the open step
   loadEvents();
 }
 
@@ -238,10 +319,245 @@ function onEdit() {
   renderSteps();
 }
 
-// --- event candidates -----------------------------------------------------------
+// --- selection: which slots (cells) and zones the debug grid shows ---------------
+//
+// Selection is scoped PER cell: `lab.selection` maps a cellKey to the set of
+// node ids (zones) chosen for it — an EMPTY set means "every zone of this
+// cell". This is per-slot, so zone A of one slot and zone B of another can be
+// picked independently (no forced cross-product). Cell + node identities are
+// step-independent, so a choice survives a step switch — the grid just
+// re-materializes whichever of the new step's calls fall in each cell's chosen
+// zones. `selectedEvents()` is the live materialization for the open step;
+// every surface (grid, test, simulate, counts) reads from it.
 
 let eventsSig = null;
 let eventPollInFlight = false;
+
+function selectedEvents() {
+  const sel = state.lab.selection;
+  return state.lab.events.filter((e) => {
+    const zones = sel.get(cellKey(e.slot, e.model));
+    if (!zones) return false;                     // cell not selected
+    return zones.size === 0 || zones.has(e.node); // empty set ⇒ all zones
+  });
+}
+
+// The distinct cells in the current selection, and which of them are live
+// simulation branches — once any selected cell is simulating, the action bar
+// swaps from test/simulate to branch controls (step the sims / break out).
+function selectedCellList() {
+  const seen = new Set();
+  const out = [];
+  for (const ev of selectedEvents()) {
+    const ck = cellKey(ev.slot, ev.model);
+    if (seen.has(ck)) continue;
+    seen.add(ck);
+    out.push({ slot: ev.slot, model: ev.model });
+  }
+  return out;
+}
+function selectedBranchedCells() {
+  return selectedCellList().filter((c) => cellHasLiveBranch(c.slot, c.model));
+}
+
+// On first open of a run, seed the selection to every started cell (so the
+// grid isn't empty); afterwards respect the user's choice (including "none").
+// Cells are step-independent, so this is sourced from the run's slots rather
+// than the current step's events.
+function ensureDefaultSelection() {
+  const lab = state.lab;
+  if (selInitialized) return;
+  const started = [];
+  for (const s of state.slots) {
+    for (const m of state.models) {
+      const c = s.runs?.[m];
+      if (c && ((c.events_count ?? 0) > 0 || c.branch)) started.push(cellKey(s.id, m));
+    }
+  }
+  if (!started.length) return; // nothing started yet — seed on a later render
+  selInitialized = true;
+  if (lab.selection.size === 0) for (const k of started) lab.selection.set(k, new Set()); // all started cells, all zones
+}
+
+function updateSelectionSummary() {
+  const sel = state.lab.selection;
+  const nc = sel.size;
+  if (!nc) { selSummaryEl.textContent = "no slots selected"; return; }
+  let scoped = 0; // slots narrowed to specific zones
+  for (const zones of sel.values()) if (zones.size) scoped += 1;
+  selSummaryEl.textContent = `${nc} slot${nc === 1 ? "" : "s"} · ${scoped ? `${scoped} zone-filtered` : "all zones"}`;
+}
+
+// Add a zone picked off the 3D scene (overlay "+ sim") to the simulation slots.
+// Narrows that cell to the chosen zone(s): an unselected or all-zones cell
+// becomes "just this zone", an already-zone-filtered cell accumulates it — you
+// build up a precise target list straight from the scene.
+function addSimTarget({ slot, model, node }) {
+  if (!slot || !model || !node) return;
+  const lab = state.lab;
+  // Claim this run's selection so opening the lab later doesn't reseed over it.
+  selRun = state.run;
+  selInitialized = true;
+  const ck = cellKey(slot, model);
+  let zones = lab.selection.get(ck);
+  if (!zones || zones.size === 0) { zones = new Set(); lab.selection.set(ck, zones); }
+  zones.add(node);
+  updateSelectionSummary();
+  if (labEl.classList.contains("open")) renderGrid();
+  toast(`added ${node} (${slot} · ${model}) to simulation slots`, "ok");
+}
+
+// The top-bar picker: a per-slot tree. Each started cell is a row you select;
+// expanding it narrows that slot to specific zones of the current step
+// (default: all zones). Because narrowing is per slot, zone A of one slot and
+// zone B of another are independently pickable. Edits stage in a working copy
+// (cellKey -> Set<node id>) and commit on "apply".
+function openSelectionDialog() {
+  const lab = state.lab;
+  const cells = [];
+  for (const s of state.slots) {
+    for (const m of state.models) {
+      const c = s.runs?.[m];
+      if (c && ((c.events_count ?? 0) > 0 || c.branch)) {
+        cells.push({ slot: s.id, model: m, status: c.status ?? "idle", events: c.events_count ?? 0 });
+      }
+    }
+  }
+  // This step's distinct zones (node ids) per cell — the calls a slot can be
+  // narrowed to right now.
+  const stepZonesByCell = new Map();
+  for (const e of lab.events) {
+    if (!e.node) continue;
+    const ck = cellKey(e.slot, e.model);
+    if (!stepZonesByCell.has(ck)) stepZonesByCell.set(ck, new Set());
+    stepZonesByCell.get(ck).add(e.node);
+  }
+  // Staging copy of the selection, plus which slot blocks are expanded. Open
+  // any slot that already carries a specific zone filter so it's visible.
+  const pick = new Map();
+  for (const [ck, zones] of lab.selection) pick.set(ck, new Set(zones));
+  const expanded = new Set();
+  for (const [ck, zones] of pick) if (zones.size) expanded.add(ck);
+
+  const slotFilter = el("input", { type: "text", placeholder: "filter slots by name…", style: "flex:1;min-width:80px" });
+  const modelSel = el("select", { style: "max-width:130px" },
+    el("option", { value: "", text: "all models" }),
+    [...new Set(cells.map((c) => c.model))].sort().map((m) => el("option", { value: m, text: m })));
+  // Filter the per-slot zone lists by name — typing auto-expands the slots that
+  // have a matching zone, so a named zone is reachable without expanding each.
+  const zoneFilter = el("input", { type: "text", placeholder: "filter zones by name…", style: "width:100%" });
+  const list = el("div", { class: "sel-tree" });
+
+  const visibleCells = () => cells.filter((c) =>
+    (!modelSel.value || c.model === modelSel.value) &&
+    (!slotFilter.value.trim() || c.slot.toLowerCase().includes(slotFilter.value.trim().toLowerCase())));
+
+  function render() {
+    const top = list.scrollTop;
+    list.textContent = "";
+    const vis = visibleCells();
+    if (!vis.length) { list.appendChild(el("div", { class: "muted", text: "no started slots match." })); return; }
+    for (const c of vis) list.appendChild(renderBlock(c));
+    list.scrollTop = top;
+  }
+
+  function renderBlock(c) {
+    const ck = cellKey(c.slot, c.model);
+    const sel = pick.get(ck);                 // undefined ⇒ not selected
+    const selected = sel !== undefined;
+    const specific = selected && sel.size > 0; // narrowed to a zone subset
+    // Show every zone this step calls PLUS any already-picked zone (so a filter
+    // set at another step is still visible and removable here).
+    const stepZones = stepZonesByCell.get(ck) ?? new Set();
+    const allZones = [...new Set([...stepZones, ...(sel ?? [])])].sort();
+    const zq = zoneFilter.value.trim().toLowerCase();
+    const zonesShown = zq ? allZones.filter((z) => z.toLowerCase().includes(zq)) : allZones;
+    // A zone-name query force-opens the slots that have a match.
+    const open = expanded.has(ck) || (zq !== "" && zonesShown.length > 0);
+
+    const slotCb = el("input", { type: "checkbox", ...(selected ? { checked: "" } : {}) });
+    slotCb.addEventListener("change", () => {
+      if (slotCb.checked) pick.set(ck, new Set());
+      else pick.delete(ck);
+      render();
+    });
+    const summary = specific ? `${sel.size} zone${sel.size === 1 ? "" : "s"}` : (selected ? "all zones" : "off");
+    const caret = el("button", {
+      class: "fit-btn",
+      text: `${open ? "▾" : "▸"} ${summary}`,
+      title: "expand to narrow this slot to specific zones of this step",
+      onclick: () => { if (open) expanded.delete(ck); else expanded.add(ck); render(); },
+    });
+    const header = el("div", { class: "sel-slot" },
+      slotCb,
+      el("span", { class: `dot ${c.status}` }),
+      el("span", { text: `${c.slot} · ${c.model}` }),
+      el("span", { class: "muted", style: "margin-left:auto", text: `${c.events} ev` }),
+      caret);
+    const block = el("div", { class: `sel-block${selected ? " on" : ""}` }, header);
+
+    if (open) {
+      const sub = el("div", { class: "sel-zones" });
+      if (!allZones.length) {
+        sub.appendChild(el("div", { class: "muted", text: "no per-zone calls of this step for this slot." }));
+      } else if (!zonesShown.length) {
+        sub.appendChild(el("div", { class: "muted", text: `no zones match “${zoneFilter.value.trim()}”.` }));
+      } else {
+        if (!zq) { // "all zones" reset is moot while filtering by name
+          const allCb = el("input", { type: "checkbox", ...(selected && !specific ? { checked: "" } : {}) });
+          allCb.addEventListener("change", () => { pick.set(ck, new Set()); render(); }); // back to all zones
+          sub.appendChild(el("label", { class: "sel-all" }, allCb, el("span", { text: "all zones" })));
+        }
+        for (const z of zonesShown) {
+          const on = specific && sel.has(z);
+          const zb = el("input", { type: "checkbox", ...(on ? { checked: "" } : {}) });
+          zb.addEventListener("change", () => {
+            let set = pick.get(ck);
+            if (!set) { set = new Set(); pick.set(ck, set); } // checking a zone selects the slot
+            if (zb.checked) set.add(z); else set.delete(z);
+            render();
+          });
+          sub.appendChild(el("label", {}, zb, el("span", { text: z }),
+            stepZones.has(z) ? null
+              : el("span", { class: "muted", style: "margin-left:auto;font-size:10px", text: "no call this step" })));
+        }
+      }
+      block.appendChild(sub);
+    }
+    return block;
+  }
+
+  slotFilter.addEventListener("input", render);
+  modelSel.addEventListener("change", render);
+  zoneFilter.addEventListener("input", render);
+  const selectAll = () => { for (const c of visibleCells()) { const ck = cellKey(c.slot, c.model); if (!pick.has(ck)) pick.set(ck, new Set()); } render(); };
+  const selectNone = () => { for (const c of visibleCells()) pick.delete(cellKey(c.slot, c.model)); render(); };
+
+  openModal("select slots / zones to iterate on", (close) => {
+    render();
+    return {
+      body: [
+        el("div", { class: "m-hint", text: "Pick slots to iterate on; expand a slot to narrow it to specific zones of this step (default: all zones). Or add zones straight off the 3D scene with “+ sim”. The choice persists as you switch steps and shows as live canvases on the right." }),
+        el("div", { class: "m-field sel-field" },
+          el("div", { style: "display:flex;gap:6px;align-items:center" }, slotFilter, modelSel,
+            el("button", { class: "fit-btn", text: "all", onclick: selectAll }),
+            el("button", { class: "fit-btn", text: "none", onclick: selectNone })),
+          zoneFilter,
+          list),
+      ],
+      actions: [
+        el("button", { text: "cancel", onclick: close }),
+        el("button", { class: "primary", text: "apply", onclick: () => {
+          lab.selection = pick;
+          selInitialized = true;
+          close();
+          updateSelectionSummary();
+          renderGrid();
+        } }),
+      ],
+    };
+  });
+}
 
 function eventsSignature(events) {
   return events
@@ -251,33 +567,29 @@ function eventsSignature(events) {
 
 // `silent` = the auto-refresh path: never shows a loading state, and only
 // touches the DOM when the event set actually changed (so it won't reset
-// scroll or selection on every poll).
+// scroll or test state on every poll).
 async function loadEvents({ silent = false } = {}) {
   const lab = state.lab;
   if (!lab.step) return;
-  if (!silent) { eventsEl.textContent = ""; evCountEl.textContent = "…"; }
+  if (!silent) reviewCountEl.textContent = "…";
   let payload;
   try {
     payload = await api.stepEvents(state.run, lab.step);
   } catch (e) {
-    if (!silent) {
-      evCountEl.textContent = "";
-      eventsEl.appendChild(el("div", { class: "muted", style: "padding:8px", text: e.message }));
-    }
+    if (!silent) { teardownGrid(); reviewCountEl.textContent = ""; gridMessage(`failed to load events: ${e.message}`); }
     return;
   }
   // The lab may have moved on while the request was in flight (step switch,
   // run switch, closed) — discard a stale response.
   if (!labEl.classList.contains("open") || lab.step !== payload.step) return;
   lab.events = payload.events;
-  // Drop selections that no longer exist (run reset, step switch, etc.).
+  // Drop tests whose event no longer exists (run reset, step switch, etc.).
   const valid = new Set(lab.events.map((e) => targetKey(e.slot, e.model, e.index)));
-  for (const k of [...lab.selected]) if (!valid.has(k)) lab.selected.delete(k);
+  for (const k of [...lab.tests.keys()]) if (!valid.has(k)) lab.tests.delete(k);
   const sig = eventsSignature(lab.events);
-  if (silent && sig === eventsSig) return; // unchanged — leave the DOM (and scroll) alone
+  if (silent && sig === eventsSig) return; // unchanged — leave the grid alone
   eventsSig = sig;
-  renderEvents();
-  if (reviewEl.classList.contains("open")) reconcileReview();
+  renderGrid();
 }
 
 async function pollEvents() {
@@ -287,91 +599,12 @@ async function pollEvents() {
   try { await loadEvents({ silent: true }); } finally { eventPollInFlight = false; }
 }
 
-function renderEvents() {
-  const lab = state.lab;
-  evCountEl.textContent = `${lab.events.length} eligible`;
-  eventsEl.textContent = "";
-  eventStepBtns.length = 0; // rebuilt below alongside the cell groups
-  renderSims();
-  if (lab.events.length === 0) {
-    eventsEl.appendChild(el("div", {
-      class: "muted", style: "padding:8px",
-      text: "no logged calls of this step in this run yet — run cells first (only calls made after the versioning cutover carry re-renderable variables)",
-    }));
-    updateActionBar();
-    return;
-  }
-  const groups = new Map();
-  for (const ev of lab.events) {
-    const k = cellKey(ev.slot, ev.model);
-    if (!groups.has(k)) groups.set(k, []);
-    groups.get(k).push(ev);
-  }
-  for (const [k, evs] of groups) {
-    const [slot, model] = k.split("|");
-    const live = cellHasLiveBranch(slot, model) || evs.some((e) => e.branch_live);
-    const stepBtn = makeStepBtn(slot, model);
-    if (!live) stepBtn.style.marginLeft = "auto"; // else the sim-live tag holds the auto-margin
-    eventStepBtns.push({ btn: stepBtn, slot, model });
-    const group = el("div", { class: "ev-cell-group" },
-      el("div", { class: "g-head" },
-        el("span", { text: `${slot} · ${model}` }),
-        el("span", { class: "muted", text: `${evs.length} call${evs.length === 1 ? "" : "s"}` }),
-        live ? el("span", {
-          class: "sim-live-tag",
-          text: "sim live",
-          title: "this slot already has a simulation branch — simulating it again asks before replacing it",
-        }) : null,
-        stepBtn,
-      ),
-    );
-    for (const ev of evs) group.appendChild(eventRow(ev));
-    eventsEl.appendChild(group);
-    refreshStepBtn(stepBtn, slot, model);
-  }
-  updateActionBar();
-}
-
-function eventRow(ev) {
-  const lab = state.lab;
-  const key = targetKey(ev.slot, ev.model, ev.index);
-  const row = el("div", { class: `ev-row${lab.selected.has(key) ? " selected" : ""}` });
-  // The pick area toggles test/simulate selection; the scene button jumps to
-  // the actual 3D run for this slot (selection no longer the only action).
-  const pick = el("div", { class: "pick", onclick: () => {
-    if (lab.selected.has(key)) lab.selected.delete(key);
-    else lab.selected.add(key);
-    row.classList.toggle("selected", lab.selected.has(key));
-    updateActionBar();
-  } },
-    el("input", { type: "checkbox", ...(lab.selected.has(key) ? { checked: "" } : {}), onclick: (e) => e.preventDefault() }),
-    el("span", { class: "node-tag", text: ev.node ?? "?" }),
-    el("span", { class: "muted", text: ev.model_id ?? "" }),
-    el("span", { class: "idx", text: `#${ev.index}` }),
-  );
-  row.appendChild(
-    el("div", { class: "r1" },
-      pick,
-      el("button", {
-        class: "ev-scene-btn",
-        text: "scene →",
-        title: "open this slot's 3D scene",
-        onclick: () => emit("open-cell", { slot: ev.slot, model: ev.model, branch: false }),
-      }),
-    ),
-  );
-  row.appendChild(el("div", { class: "preview", text: ev.output_preview ?? "", title: ev.output_preview ?? "" }));
-  const test = lab.tests.get(key);
-  if (test) row.appendChild(testBlock(ev, test));
-  return row;
-}
-
 // --- stepping source cells (drive the live run from the lab) --------------------
 //
 // "step" / "step all" advance the actual run cells in step mode (api.cellStep /
-// api.stepAll), then jump the lab — and the review canvas, if open — to the
-// prompt of the step that just ran, so you can walk the pipeline one LLM call
-// at a time and inspect each prompt as it fires.
+// api.stepAll), then jump the lab (and its debug grid) to the prompt of the
+// step that just ran, so you can walk the pipeline one LLM call at a time and
+// inspect each prompt as it fires.
 
 function canStepCell(c) {
   return !!c && c.status !== "done" && (!!c.pending || ["idle", "paused", "error"].includes(c.status));
@@ -387,8 +620,8 @@ function steppedCellCount() {
 }
 
 // "step all until <step>" — fast-forward every stepped cell to the next run
-// of a target step, pause them all there, and jump the lab/review to it. The
-// option list is filled lazily once `state.steps` loads.
+// of a target step, pause them all there, and jump the lab to it. The option
+// list is filled lazily once `state.steps` loads.
 function makeUntilSelect() {
   const sel = el("select", { class: "step-until", style: "display:none",
     title: "fast-forward every stepped cell to the next run of a step" },
@@ -397,7 +630,6 @@ function makeUntilSelect() {
   return sel;
 }
 const labUntilEl = makeUntilSelect();
-const reviewUntilEl = makeUntilSelect();
 
 function makeExitBtn() {
   const b = el("button", { class: "ev-scene-btn", style: "display:none", text: "exit stepping",
@@ -406,7 +638,19 @@ function makeExitBtn() {
   return b;
 }
 const labExitEl = makeExitBtn();
-const reviewExitEl = makeExitBtn();
+
+// "step sims until <step>" — fast-forward every selected simulation branch to
+// the next call of a target step, pausing each there (the branch mirror of
+// "step all until"). Shown in the action bar only while the selection is
+// simulating; option list filled lazily in updateActionBar.
+function makeSimUntilSelect() {
+  const sel = el("select", { class: "step-until", style: "display:none",
+    title: "fast-forward every selected simulation branch to the next call of a step" },
+    el("option", { value: "", text: "step until…" }));
+  sel.addEventListener("change", () => { const v = sel.value; sel.value = ""; if (v) stepSelectedBranches(v); });
+  return sel;
+}
+const simUntilEl = makeSimUntilSelect();
 
 async function stepAllUntil(until) {
   let r;
@@ -430,15 +674,13 @@ async function exitStepping() {
 
 function updateStepAllButtons() {
   const n = steppedCellCount();
-  for (const [btn, sel, exit] of [[labStepAllEl, labUntilEl, labExitEl], [reviewStepAllEl, reviewUntilEl, reviewExitEl]]) {
-    btn.style.display = n ? "" : "none";
-    btn.textContent = `step all (${n})`;
-    if (state.steps.length && sel.options.length <= 1) {
-      for (const s of state.steps) sel.appendChild(el("option", { value: s, text: `▸ ${s}` }));
-    }
-    sel.style.display = (n && state.steps.length) ? "" : "none";
-    exit.style.display = n ? "" : "none";
+  labStepAllEl.style.display = n ? "" : "none";
+  labStepAllEl.textContent = `step all (${n})`;
+  if (state.steps.length && labUntilEl.options.length <= 1) {
+    for (const s of state.steps) labUntilEl.appendChild(el("option", { value: s, text: `▸ ${s}` }));
   }
+  labUntilEl.style.display = (n && state.steps.length) ? "" : "none";
+  labExitEl.style.display = n ? "" : "none";
 }
 
 function makeStepBtn(slot, model) {
@@ -460,11 +702,11 @@ function refreshStepBtn(btn, slot, model) {
     : "advance this cell one LLM call, then show that step's prompt";
 }
 
-function refreshEventStepBtns() {
-  for (const { btn, slot, model } of eventStepBtns) refreshStepBtn(btn, slot, model);
+function refreshCardStepBtns() {
+  for (const ref of reviewCards.values()) refreshStepBtn(ref.stepBtn, ref.ev.slot, ref.ev.model);
 }
 
-// Jump the lab (and review canvas, if open) to a step's prompt.
+// Jump the lab (and its debug grid) to a step's prompt.
 function navigateToStep(step) {
   if (state.lab.templates.has(step)) selectStep(step, { keepSelection: true });
 }
@@ -493,33 +735,42 @@ async function stepAllCells() {
   } catch (e) { toast(e.message, "err"); return; }
   toast(`advanced ${r.advanced.length} stepped cell${r.advanced.length === 1 ? "" : "s"} one step`,
     r.advanced.length ? "ok" : "err");
+  // Advance the active simulation branches in lockstep with the source cells, so
+  // one "step all" moves BOTH sides of the 3D compare forward together instead
+  // of leaving the original behind. Best-effort per branch — one that's done or
+  // mid-call simply isn't advanced.
+  const sims = [...state.lab.sims.values()];
+  if (sims.length) {
+    await Promise.allSettled(sims.map((s) => api.branchStep(state.run, s.slot, s.model)));
+  }
   if (pendings.size === 1) navigateToStep([...pendings][0]);
   emit("poll-now");
 }
 
-// --- review canvas: every event's input + output, side by side ------------------
+// --- debug grid: the selected slots' scenes / output diffs, side by side --------
 //
-// Reconciles against `lab.events`: newly-completed events get cards (full
-// bytes fetched per-card), re-run events refetch, vanished events drop —
-// without tearing down the grid, so per-card show/hide/expand state and the
-// scroll position survive the silent auto-refresh.
+// Reconciles against selectedEvents(): newly-completed events get cards (full
+// bytes fetched per-card), re-run events refetch, vanished/deselected events
+// drop — without tearing down the grid, so per-card show/hide/expand state and
+// the scroll position survive the silent auto-refresh.
 
 let reviewSeq = 0;
 const reviewCards = new Map(); // key -> { card, body, ev, full, preview }
 
-function openReview() {
-  const lab = state.lab;
-  if (!lab.step) return;
-  if (!lab.events.length) { toast("no events to review for this step yet", "err"); return; }
+// Tear the grid down completely (lab close / load error): abandon in-flight
+// fills and release every card's WebGL context.
+function teardownGrid() {
   reviewSeq += 1;
+  for (const ref of reviewCards.values()) teardownCard3d(ref);
   reviewCards.clear();
   reviewGridEl.textContent = "";
-  reviewStepEl.textContent = lab.step;
-  renderReviewControls();
-  applyReviewCols();
-  reviewEl.classList.add("open");
-  updateStepAllButtons();
-  reconcileReview();
+}
+
+// A single full-width message in the empty grid (no selection / no events).
+function gridMessage(text) {
+  let m = reviewGridEl.querySelector(".grid-empty");
+  if (!m) { m = el("div", { class: "grid-empty" }); reviewGridEl.appendChild(m); }
+  m.textContent = text;
 }
 
 function applyReviewCols() {
@@ -545,80 +796,85 @@ function renderReviewControls() {
   reviewSectionsEl.appendChild(el("span", {
     class: `rc-pill rc-3d${review3d ? " on" : ""}`,
     text: "3D ▦",
-    title: "convert every card to its slot's current 3D scene — compare scenes across slots side by side",
+    title: "convert every card to its cell's 3D scene (source, or its simulation branch) — compare across slots side by side",
     onclick: () => setReview3d(!review3d),
   }));
-  // In 3D mode, let the before/after layers be isolated: hide the recorded
-  // boxes to read the proposal alone, or hide the proposal to see the scene.
-  if (review3d) {
-    reviewSectionsEl.appendChild(vizPill("original", reviewShowOriginal, () => {
-      reviewShowOriginal = !reviewShowOriginal; afterVizToggle();
-    }));
-    reviewSectionsEl.appendChild(vizPill("proposed", reviewShowProposed, () => {
-      reviewShowProposed = !reviewShowProposed; afterVizToggle();
-    }));
-  }
-}
-
-function vizPill(label, on, onClick) {
-  return el("span", {
-    class: `rc-pill${on ? " on" : ""}`,
-    text: label,
-    title: `show/hide the ${label} boxes in the 3D before/after`,
-    onclick: onClick,
-  });
-}
-
-function afterVizToggle() {
-  try {
-    localStorage.setItem(REVIEW_ORIGINAL_KEY, reviewShowOriginal ? "1" : "0");
-    localStorage.setItem(REVIEW_PROPOSED_KEY, reviewShowProposed ? "1" : "0");
-  } catch { /* private mode */ }
-  renderReviewControls();
-  for (const ref of reviewCards.values()) applyCardViz(ref);
 }
 
 function setReview3d(on) {
   review3d = on;
   try { localStorage.setItem(REVIEW_3D_KEY, on ? "1" : "0"); } catch { /* private mode */ }
   renderReviewControls();
-  for (const ref of reviewCards.values()) renderCardBody(ref);
+  // The card set + granularity differ by mode (3D = one canvas per cell, text =
+  // one card per zone-event), so rebuild rather than re-skin the existing cards.
+  teardownGrid();
+  renderGrid();
 }
 
-function reconcileReview() {
+function renderGrid() {
+  ensureDefaultSelection();
   const lab = state.lab;
   const seq = reviewSeq;
-  const wanted = new Set(lab.events.map((e) => targetKey(e.slot, e.model, e.index)));
+  const all = selectedEvents();
+  // 3D shows ONE canvas per cell — the scene is per slot×model, not per zone —
+  // so dedup to the first event of each cell. Otherwise a multi-zone cell spins
+  // up N identical viewers (redundant, and enough of them exhaust the browser's
+  // WebGL contexts). Text mode keeps one card per zone-event (distinct diffs).
+  const zonesPerCell = new Map();
+  for (const ev of all) {
+    const ck = cellKey(ev.slot, ev.model);
+    zonesPerCell.set(ck, (zonesPerCell.get(ck) ?? 0) + 1);
+  }
+  let events = all;
+  if (review3d) {
+    const byCell = new Map();
+    for (const ev of all) {
+      const ck = cellKey(ev.slot, ev.model);
+      if (!byCell.has(ck)) byCell.set(ck, ev);
+    }
+    events = [...byCell.values()];
+  }
+  const wanted = new Set(events.map((e) => targetKey(e.slot, e.model, e.index)));
   for (const [key, ref] of [...reviewCards]) {
     if (!wanted.has(key)) { teardownCard3d(ref); ref.card.remove(); reviewCards.delete(key); }
   }
-  for (const ev of lab.events) {
-    const key = targetKey(ev.slot, ev.model, ev.index);
-    let ref = reviewCards.get(key);
-    if (!ref) {
-      ref = reviewCard(ev);
-      reviewCards.set(key, ref);
-      // In 3D mode mount the canvas immediately — it needs the slot's scene,
-      // not the step-event text, so don't wait on the fetch.
-      if (review3d) renderCardBody(ref);
-      fetchReviewCard(ev, ref, seq);
-    } else if (ref.preview !== ev.output_preview) {
-      // Same call slot re-ran (e.g. a re-run-step) — its logged output changed.
-      ref.preview = ev.output_preview;
-      ref.ev = ev;
-      fetchReviewCard(ev, ref, seq);
-      if (review3d) reloadCard3d(ref); // the slot's scene changed too
+  if (events.length === 0) {
+    gridMessage(lab.selection.size === 0
+      ? "no slots selected — use “select slots / zones…” in the top bar to choose which to iterate on."
+      : "the selected slots have no calls of this step in their chosen zones.");
+  } else {
+    reviewGridEl.querySelector(".grid-empty")?.remove();
+    for (const ev of events) {
+      const key = targetKey(ev.slot, ev.model, ev.index);
+      const zoneCount = review3d ? (zonesPerCell.get(cellKey(ev.slot, ev.model)) ?? 1) : 1;
+      let ref = reviewCards.get(key);
+      if (!ref) {
+        ref = reviewCard(ev, zoneCount);
+        reviewCards.set(key, ref);
+        // In 3D mode mount the canvas immediately — it needs the slot's scene,
+        // not the step-event text, so don't wait on the fetch.
+        if (review3d) renderCardBody(ref);
+        fetchReviewCard(ev, ref, seq);
+      } else if (ref.preview !== ev.output_preview) {
+        // Same call slot re-ran (e.g. a re-run-step) — its logged output changed.
+        ref.preview = ev.output_preview;
+        ref.ev = ev;
+        fetchReviewCard(ev, ref, seq);
+        if (review3d) reloadCard3d(ref); // the slot's scene changed too
+      }
+      // appendChild moves an existing node, preserving its state — keeps the
+      // grid in server (slot/model/index) order as new cards arrive.
+      reviewGridEl.appendChild(ref.card);
+      // The "compare 3D" button is live whenever this slot has a simulation
+      // branch, the "step" button whenever it can advance — refresh both each
+      // poll so they track the cell the moment it changes.
+      updateCmpBtn(ref);
+      refreshStepBtn(ref.stepBtn, ev.slot, ev.model);
     }
-    // appendChild moves an existing node, preserving its state — keeps the
-    // grid in server (slot/model/index) order as new cards arrive.
-    reviewGridEl.appendChild(ref.card);
-    // The "compare 3D" button is live whenever this slot has a simulation
-    // branch, the "step" button whenever it can advance — refresh both each
-    // poll so they track the cell the moment it changes.
-    updateCmpBtn(ref);
-    refreshStepBtn(ref.stepBtn, ev.slot, ev.model);
   }
-  reviewCountEl.textContent = `${lab.events.length} event${lab.events.length === 1 ? "" : "s"}`;
+  reviewCountEl.textContent = `${events.length} card${events.length === 1 ? "" : "s"}`;
+  updateSelectionSummary();
+  updateActionBar();
   updateReviewTestSummary();
 }
 
@@ -638,14 +894,7 @@ async function fetchReviewCard(ev, ref, seq) {
   }
 }
 
-function closeReview() {
-  reviewSeq += 1; // abandon any in-flight fills
-  for (const ref of reviewCards.values()) teardownCard3d(ref); // release WebGL contexts
-  reviewCards.clear();
-  reviewEl.classList.remove("open");
-}
-
-function reviewCard(ev) {
+function reviewCard(ev, zoneCount = 1) {
   const body = el("div", { class: "rv-body" }, el("div", { class: "rv-loading", text: "loading…" }));
   const cmpBtn = el("button", {
     class: "ev-scene-btn",
@@ -661,7 +910,9 @@ function reviewCard(ev) {
     el("div", { class: "rv-head" },
       el("span", { class: "rv-slot", text: ev.slot }),
       el("span", { class: "rv-meta", text: ev.model }),
-      el("span", { class: "rv-meta", text: `${ev.node ?? "?"} · #${ev.index}` }),
+      // 3D card stands for the whole cell (one scene); show its zone count.
+      // Text card is per zone-event; show that zone + log index.
+      el("span", { class: "rv-meta", text: zoneCount > 1 ? `${zoneCount} zones` : `${ev.node ?? "?"} · #${ev.index}` }),
       el("button", {
         class: "ev-scene-btn",
         style: "margin-left:auto",
@@ -734,93 +985,39 @@ function renderCardBody(ref) {
 
 // --- 3D grid mode -----------------------------------------------------------------
 //
-// One live viewer per card showing that slot's CURRENT scene. Viewers are
-// created lazily when a card scrolls into view (and paused when it leaves) so
-// a big review doesn't open dozens of WebGL contexts at once; keyboard nav is
-// off so a keypress can't drive every canvas. `dispose()` reclaims the context
-// when the card leaves 3D mode / is removed / the review closes.
+// One live viewer per card showing that cell's scene — its simulation BRANCH
+// when one is live (so a downstream simulation's result shows here, evolving as
+// the branch runs), otherwise the source cell. Viewers are created lazily when
+// a card scrolls into view (and paused when it leaves) so a big grid doesn't
+// open dozens of WebGL contexts at once; keyboard nav is off so a keypress
+// can't drive every canvas. `dispose()` reclaims the context when the card
+// leaves 3D mode / is removed / the grid is torn down.
 //
-// 3D "after" for "test edit on all": for the bbox steps, the tested output is
-// overlaid as proposed (magenta) boxes on the card's live scene (the
-// "before") — modeled on the old tune sandbox's renderSandboxOverlay.
+// "test edits on selected" is a cheap single-call preview surfaced as the text
+// output diff; "simulate downstream" forks a branch and runs it, and the card
+// switches to that branch's scene (the real, full result). Before/after 3D
+// comparison is the dedicated compare screen's job — not an overlay here.
 
-// The only steps whose output is directly spatial; everything else has no 3D
-// "after" without a full downstream re-run (simulation).
-const BBOX_OVERLAY_STEPS = new Set(["overall_bbox", "child_bbox_batch", "object_bbox_batch"]);
-
-function minCorner(origin, dims) {
-  return [
-    Math.min(origin[0], origin[0] + dims[0]),
-    Math.min(origin[1], origin[1] + dims[1]),
-    Math.min(origin[2], origin[2] + dims[2]),
-  ];
+// A card renders its cell's simulation BRANCH scene when one is live (just
+// forked via lab.sims, or reported by the slots poll), else the source cell.
+function cardBranched(slot, model) {
+  return cellHasLiveBranch(slot, model);
 }
 
-// A tested step's proposed boxes in WORLD frame: overall_bbox is already world;
-// *_bbox_batch assignments are authored in the owner region's local frame, so
-// shift each by that region's min corner (read from the current scene).
-function proposedBoxes(step, output, ownerId, sceneNodes) {
-  if (!output || typeof output !== "object") return [];
-  if (step === "overall_bbox") {
-    const bb = output.bbox;
-    return bb && Array.isArray(bb.origin) && Array.isArray(bb.dimensions)
-      ? [{ origin: bb.origin, dimensions: bb.dimensions }] : [];
-  }
-  if (!Array.isArray(output.assignments)) return [];
-  const owner = sceneNodes?.get(ownerId);
-  const pmin = owner && Array.isArray(owner.origin) && Array.isArray(owner.dimensions)
-    ? minCorner(owner.origin, owner.dimensions) : [0, 0, 0];
-  const out = [];
-  for (const a of output.assignments) {
-    const bb = a && a.bbox;
-    if (!bb || !Array.isArray(bb.origin) || !Array.isArray(bb.dimensions)) continue;
-    out.push({
-      origin: [bb.origin[0] + pmin[0], bb.origin[1] + pmin[1], bb.origin[2] + pmin[2]],
-      dimensions: bb.dimensions,
-    });
-  }
-  return out;
-}
-
-// Draw (or clear) the card's proposed-placement overlay from its current draft
-// test. Only the bbox steps have a spatial "after"; everything else clears it.
-function applyCardOverlay(ref) {
-  const v = ref.viewer3d;
-  if (!v) return;
-  const step = state.lab.step;
-  const test = state.lab.tests.get(targetKey(ref.ev.slot, ref.ev.model, ref.ev.index));
-  const boxes = (review3d && ref.sceneNodes && BBOX_OVERLAY_STEPS.has(step) && test?.status === "done")
-    ? proposedBoxes(step, test.result.output, ref.ev.node, ref.sceneNodes)
-    : [];
-  ref.overlayCount = boxes.length;
-  v.setOverlayBoxes(boxes);
-  applyCardViz(ref);
-}
-
-// Apply the global original/proposed visibility toggles to one card's viewer
-// (the recorded boxes and the proposed overlay are independent layers).
-function applyCardViz(ref) {
-  const v = ref.viewer3d;
-  if (!v) return;
-  v.setBboxesVisible(reviewShowOriginal);
-  v.setOverlayVisible(reviewShowProposed);
-  cardOverlayLegend(ref, reviewShowProposed ? (ref.overlayCount ?? 0) : 0);
-}
-
-// A small magenta caption so the overlay reads as the tested proposal, not
-// part of the recorded scene.
-function cardOverlayLegend(ref, n) {
+// A corner caption so a card reads clearly as the simulation branch (the
+// downstream-simulated result) rather than the source scene.
+function cardSceneBadge(ref, branched) {
   if (!ref.host3d) return;
-  let lg = ref.host3d.querySelector(".rv-3d-legend");
-  if (n > 0) {
-    if (!lg) {
-      lg = el("div", { class: "rv-3d-legend",
-        style: "position:absolute;top:4px;left:6px;font-size:10px;color:#ff3df5;pointer-events:none;text-shadow:0 0 3px #000;z-index:1" });
-      ref.host3d.appendChild(lg);
+  let b = ref.host3d.querySelector(".rv-3d-branch");
+  if (branched) {
+    if (!b) {
+      b = el("div", { class: "rv-3d-branch",
+        style: "position:absolute;top:4px;right:6px;font-size:10px;color:var(--purple);pointer-events:none;text-shadow:0 0 3px #000;z-index:1" });
+      ref.host3d.appendChild(b);
     }
-    lg.textContent = `▢ proposed (test) · ${n} box${n === 1 ? "" : "es"}`;
-  } else if (lg) {
-    lg.remove();
+    b.textContent = "▸ sim branch";
+  } else if (b) {
+    b.remove();
   }
 }
 
@@ -829,7 +1026,6 @@ function renderCard3d(ref) {
   refreshStepBtn(ref.stepBtn, ref.ev.slot, ref.ev.model);
   if (!ref.host3d) ref.host3d = el("div", { class: "rv-3d", style: "position:relative" });
   if (ref.body.firstChild !== ref.host3d) ref.body.replaceChildren(ref.host3d);
-  applyCardOverlay(ref); // refresh the proposed-placement overlay (e.g. after a test lands)
   if (ref.io3d || ref.viewer3d) return; // already wired
   ref.io3d = new IntersectionObserver((entries) => {
     for (const entry of entries) {
@@ -847,25 +1043,65 @@ function renderCard3d(ref) {
   ref.io3d.observe(ref.host3d);
 }
 
+// What a card's scene should currently show: branch vs source, and how far
+// that side has progressed — so a poll reloads the canvas as the branch runs
+// (or is discarded), not only when the source event's output changes.
+function cardSceneState(slot, model) {
+  const c = cellSummary(slot, model);
+  if (cardBranched(slot, model)) {
+    const b = c?.branch;
+    return { side: "branch", count: b?.events_count ?? 0, status: b?.status ?? "starting" };
+  }
+  return { side: "source", count: c?.events_count ?? 0, status: c?.status ?? "idle" };
+}
+
 async function loadCard3d(ref) {
   const viewer = ref.viewer3d;
   if (!viewer) return;
   const { slot, model } = ref.ev;
+  // Pull the branch's scene + meshes when one is live, so "simulate downstream"
+  // shows the branched result here. Stamp the side/progress we're loading so
+  // refreshCardScenes can tell when a reload is due.
+  const st = cardSceneState(slot, model);
+  const branched = st.side === "branch";
+  const opts = branched ? { branch: true } : {};
+  ref.sceneState = st;
+  ref.lastSceneLoad = performance.now();
   try {
-    const proj = await api.scene(state.run, slot, model, {});
+    const proj = await api.scene(state.run, slot, model, opts);
     if (ref.viewer3d !== viewer) return; // disposed / reloaded while in flight
     viewer.clear();
     applySceneProjection(viewer, proj);
-    viewer.prefetchBundle(api.meshesUrl(state.run, slot, model, {}));
-    // World boxes of every placed node — lets the overlay convert a tested
-    // batch step's parent-local boxes back to world.
-    ref.sceneNodes = new Map((proj.nodes ?? []).map((n) => [n.id, n]));
-    applyCardOverlay(ref);
+    viewer.prefetchBundle(api.meshesUrl(state.run, slot, model, opts));
+    cardSceneBadge(ref, branched);
   } catch { /* leave the grid cell empty — non-fatal */ }
 }
 
 function reloadCard3d(ref) {
   if (ref.viewer3d) loadCard3d(ref);
+}
+
+// Per-poll: reload a mounted card's scene when its branch appears/ends (side
+// flip — reload now, it's the moment the user simulated) or its current side
+// progresses (throttled, so a running branch doesn't re-pull every poll).
+const CARD_SCENE_RELOAD_MS = 6000;
+function refreshCardScenes() {
+  if (!review3d) return;
+  const now = performance.now();
+  for (const ref of reviewCards.values()) {
+    if (!ref.viewer3d) continue; // not mounted (off-screen) — loads on mount
+    const st = cardSceneState(ref.ev.slot, ref.ev.model);
+    const prev = ref.sceneState;
+    const sideFlipped = !prev || prev.side !== st.side;
+    const statusChanged = prev && prev.status !== st.status;
+    const progressed = prev && prev.count !== st.count;
+    if (!sideFlipped && !statusChanged && !progressed) continue;
+    // Side flip (just simulated / broke out) and status change (branch settled
+    // to done/paused) reload now; mere mid-run progress is throttled so a
+    // running branch doesn't re-pull its whole mesh bundle every poll.
+    if (!sideFlipped && !statusChanged && now - (ref.lastSceneLoad ?? 0) < CARD_SCENE_RELOAD_MS) continue;
+    loadCard3d(ref);
+  }
 }
 
 function teardownCard3d(ref) {
@@ -914,7 +1150,7 @@ function updateReviewTestSummary() {
   }
   let tested = 0;
   let changed = 0;
-  for (const ev of state.lab.events) {
+  for (const ev of selectedEvents()) {
     const t = state.lab.tests.get(targetKey(ev.slot, ev.model, ev.index));
     if (t && t.status === "done") { tested += 1; if (isChanged(t.result)) changed += 1; }
   }
@@ -929,70 +1165,51 @@ function reviewSection(label, text) {
   );
 }
 
-function testBlock(ev, test) {
-  const wrap = el("div", { class: "ev-test" });
-  if (test.status === "queued") {
-    wrap.appendChild(el("div", { class: "t-status", text: "queued for test…" }));
-  } else if (test.status === "running") {
-    wrap.appendChild(el("div", { class: "t-status", text: "testing… (live LLM call)" }));
-  } else if (test.status === "error") {
-    wrap.appendChild(el("div", { class: "t-status err", text: `test failed: ${test.error}` }));
-  } else {
-    const r = test.result;
-    wrap.appendChild(el("div", { class: "t-status ok", text: `tested · ${r.tokens_out ?? "?"} tok out` }));
-    const origPre = el("pre", { text: fmtJson(r.original_output) });
-    const editedPre = el("pre", { text: fmtJson(r.output) });
-    wrap.appendChild(
-      el("div", { class: "cmp" },
-        el("div", {},
-          el("div", { class: "lab" }, el("span", { text: "previous output" }), fitToggle(origPre)),
-          origPre),
-        el("div", {},
-          el("div", { class: "lab" }, el("span", { text: "current output" }), fitToggle(editedPre)),
-          editedPre),
-      ),
-    );
-    const details = el("pre", { text: `SYSTEM SENT\n${r.system}\n\nUSER SENT\n${r.user}\n\nREASONING\n${r.reasoning || "(none)"}`, style: "display:none" });
-    wrap.appendChild(
-      el("div", { style: "display:flex;gap:6px;margin-top:4px;align-items:center" },
-        el("button", {
-          style: "font-size:10px;padding:1px 7px",
-          text: "sent bytes + reasoning",
-          onclick: () => { details.style.display = details.style.display === "none" ? "" : "none"; },
-        }),
-        fitToggle(details),
-      ),
-    );
-    wrap.appendChild(details);
-  }
-  return wrap;
-}
-
 function updateActionBar() {
   const lab = state.lab;
-  const n = lab.selected.size;
-  selCountEl.textContent = `${n} selected${lab.sims.size ? ` · ${lab.sims.size} simulating` : ""}`;
-  testBtn.disabled = n === 0;
-  simBtn.disabled = n === 0;
+  const n = selectedEvents().length;
+  const branched = selectedBranchedCells();
+  selCountEl.textContent = `${n} event${n === 1 ? "" : "s"} selected${lab.sims.size ? ` · ${lab.sims.size} simulating` : ""}`;
+  if (branched.length > 0) {
+    // The selection is already simulating: re-testing or re-simulating makes no
+    // sense, so the bar drives the branches instead — step them all one call,
+    // or break them all out (which returns the bar to test/simulate).
+    const steppable = branched.filter((c) => cellSummary(c.slot, c.model)?.branch?.status !== "done");
+    testBtn.textContent = `step sims (${steppable.length})`;
+    testBtn.title = "advance every selected simulation branch one LLM call";
+    testBtn.disabled = steppable.length === 0;
+    if (state.steps.length && simUntilEl.options.length <= 1) {
+      for (const s of state.steps) simUntilEl.appendChild(el("option", { value: s, text: `▸ ${s}` }));
+    }
+    simUntilEl.style.display = state.steps.length ? "" : "none";
+    simBtn.textContent = `break out (${branched.length})`;
+    simBtn.title = "discard the simulation branch on every selected slot (its downstream events + meshes)";
+    simBtn.classList.add("danger");
+    simBtn.disabled = false;
+  } else {
+    testBtn.textContent = "test edits on selected";
+    testBtn.title = "Run the current prompt edit on every selected slot/zone and highlight the difference";
+    testBtn.disabled = n === 0;
+    simUntilEl.style.display = "none";
+    simBtn.textContent = "simulate downstream";
+    simBtn.title = "";
+    simBtn.classList.remove("danger");
+    simBtn.disabled = n === 0;
+  }
 }
 
 // --- testing ---------------------------------------------------------------------
 
-// Push a test-state change to whichever surface is showing this event: the
-// review canvas updates just the one card (no list churn); otherwise the
-// events panel row re-renders.
+// Push a test-state change to this event's card in the grid + refresh the
+// "changed by edit" summary.
 function reflectTest(key) {
-  if (reviewEl.classList.contains("open")) {
-    const ref = reviewCards.get(key);
-    if (ref) renderCardBody(ref);
-    updateReviewTestSummary();
-  } else {
-    renderEvents();
-  }
+  const ref = reviewCards.get(key);
+  if (ref) renderCardBody(ref);
+  updateReviewTestSummary();
 }
 
 // Run the current draft against one event, storing the A/B result in the
-// shared `lab.tests` (so the events panel and review canvas agree).
+// shared `lab.tests` (so the card body + summary agree).
 async function testEvent(ev) {
   const lab = state.lab;
   const d = draftFor(lab.step);
@@ -1016,17 +1233,18 @@ async function testEvent(ev) {
   reflectTest(key);
 }
 
-// Bounded-concurrency batch tester — drives "test on selected", per-card
-// "test", and "test edit on all" so a whole run's worth of slots can be
-// A/B'd in one click without flooding the provider.
+// Bounded-concurrency batch tester — drives "test edits on selected" and the
+// per-card "test" so a whole run's worth of slots can be A/B'd in one click
+// without flooding the provider.
 const TEST_CONCURRENCY = 5;
 async function testEvents(events) {
   if (!events.length) return;
   const lab = state.lab;
   const queue = [...events];
+  const mySeq = testSeq; // this batch belongs to the current step; bail if it changes
   // Mark every target "queued" up front so all of them show activity now, not
-  // just the first TEST_CONCURRENCY a worker grabs — and so a 9-card "test
-  // all" doesn't look like it launched only 5.
+  // just the first TEST_CONCURRENCY a worker grabs — and so a 9-card batch
+  // doesn't look like it launched only 5.
   for (const ev of events) {
     const key = targetKey(ev.slot, ev.model, ev.index);
     const cur = lab.tests.get(key);
@@ -1038,25 +1256,21 @@ async function testEvents(events) {
     ? { total: testBatch.total + events.length, done: testBatch.done }
     : { total: events.length, done: 0 };
   testBatchRefs += 1;
-  reviewTestAllEl.disabled = true;
   testBtn.disabled = true;
-  if (reviewEl.classList.contains("open")) {
-    for (const ev of events) {
-      const ref = reviewCards.get(targetKey(ev.slot, ev.model, ev.index));
-      if (ref) renderCardBody(ref);
-    }
-    updateReviewTestSummary();
-  } else {
-    renderEvents();
+  for (const ev of events) {
+    const ref = reviewCards.get(targetKey(ev.slot, ev.model, ev.index));
+    if (ref) renderCardBody(ref);
   }
+  updateReviewTestSummary();
   try {
     const workers = Array.from(
       { length: Math.min(TEST_CONCURRENCY, queue.length) },
       async () => {
         while (queue.length) {
+          if (mySeq !== testSeq) break; // step switched mid-batch — stop, don't taint the new step
           await testEvent(queue.shift());
-          if (testBatch) testBatch.done += 1;
-          if (reviewEl.classList.contains("open")) updateReviewTestSummary();
+          if (testBatch && mySeq === testSeq) testBatch.done += 1;
+          updateReviewTestSummary();
         }
       },
     );
@@ -1064,17 +1278,9 @@ async function testEvents(events) {
   } finally {
     testBatchRefs -= 1;
     if (testBatchRefs === 0) testBatch = null;
-    reviewTestAllEl.disabled = testBatchRefs > 0;
     updateActionBar();
-    if (reviewEl.classList.contains("open")) updateReviewTestSummary();
-    else renderEvents();
+    updateReviewTestSummary();
   }
-}
-
-async function runTests() {
-  const lab = state.lab;
-  const targets = lab.events.filter((ev) => lab.selected.has(targetKey(ev.slot, ev.model, ev.index)));
-  await testEvents(targets);
 }
 
 // --- downstream simulation ---------------------------------------------------------
@@ -1087,53 +1293,75 @@ function cellHasLiveBranch(slot, model) {
     || state.lab.sims.has(cellKey(slot, model));
 }
 
-async function simulateDownstream() {
+// The server is the source of truth for live branches; lab.sims is a session
+// cache that must self-heal. Drop entries the slots poll no longer reports a
+// branch for — e.g. the source cell was rewound/reset from the board/overlay,
+// which discards its branch server-side. Without this the grid stays stuck
+// "branched" and the step / break-out / replace-source buttons 404. Keep
+// just-forked entries until the poll has had a chance to see them (createBranch
+// is awaited before poll-now, so a single grace window covers the race).
+const SIM_PRUNE_GRACE_MS = 4000;
+function pruneStaleSims() {
   const lab = state.lab;
+  const now = performance.now();
+  for (const [ck, sim] of [...lab.sims]) {
+    if (cellSummary(sim.slot, sim.model)?.branch) continue; // still live server-side
+    if (now - (sim.createdAt ?? 0) < SIM_PRUNE_GRACE_MS) continue; // just forked — let the poll catch up
+    lab.sims.delete(ck);
+  }
+  if (lab.sims.size === 0) lab.simStep = null;
+}
+
+async function simulateDownstream() {
   // Branches carry the lab's FULL edit set (every drafted step), so the
   // simulation matches exactly what "save to new run" would persist.
   const overrides = overridesPayload();
-  // One branch per cell, forked at the EARLIEST selected event of that cell —
-  // the edited templates then apply to every later firing of those steps too.
-  const perCell = new Map();
-  for (const ev of lab.events) {
-    const key = targetKey(ev.slot, ev.model, ev.index);
-    if (!lab.selected.has(key)) continue;
-    const ck = cellKey(ev.slot, ev.model);
-    const cur = perCell.get(ck);
-    if (!cur || ev.index < cur.index) perCell.set(ck, ev);
-  }
-  if (perCell.size === 0) return;
 
-  // Re-simulating a cell DISCARDS its live branch (events + branch meshes,
-  // source cell untouched) and re-forks at the new branch point — never do
-  // that silently.
-  const conflicts = [...perCell.values()]
-    .filter((ev) => cellHasLiveBranch(ev.slot, ev.model) || ev.branch_live);
-  if (conflicts.length > 0) {
-    openModal("replace live simulations?", (close) => ({
-      body: [
-        el("div", { class: "m-hint", text:
-          `${conflicts.length} of the selected slot${conflicts.length === 1 ? " has" : "s have"} a live simulation branch. ` +
-          "Simulating again discards that branch — its downstream events and generated meshes — " +
-          "and re-forks at the new branch point with the current edits. Source cells are untouched." }),
-        el("div", { class: "check-grid" },
-          conflicts.map((ev) => el("label", {},
-            el("span", { class: `dot ${cellSummary(ev.slot, ev.model)?.branch?.status ?? "running"}` }),
-            `${ev.slot} · ${ev.model}`,
-          )),
-        ),
-      ],
-      actions: [
-        el("button", { text: "cancel", onclick: close }),
-        el("button", { class: "danger", text: "replace & simulate", onclick: () => {
-          close();
-          launchBranches(perCell, overrides);
-        } }),
-      ],
-    }));
+  // Group the selection by cell. The server holds exactly ONE branch per slot,
+  // and a branch forks at a SINGLE event — so multiple selected events on the
+  // same slot (e.g. two zone_decompose calls) is ambiguous: which one is the
+  // fork point? Silently collapsing them branches at the wrong step. Refuse
+  // outright and make the user narrow to one event per slot (pick one zone).
+  const byCell = new Map();
+  for (const ev of selectedEvents()) {
+    const ck = cellKey(ev.slot, ev.model);
+    if (!byCell.has(ck)) byCell.set(ck, []);
+    byCell.get(ck).push(ev);
+  }
+  if (byCell.size === 0) return;
+
+  const multi = [...byCell.values()].filter((evs) => evs.length > 1);
+  if (multi.length > 0) {
+    const names = multi
+      .map((evs) => `${evs[0].slot} · ${evs[0].model} (${evs.length} events)`)
+      .join(", ");
+    toast(
+      `can't simulate ${names}: multiple events selected on one slot, but there's only ` +
+      "one branch per slot. Narrow to a single event (pick one zone) and try again.",
+      "err",
+    );
     return;
   }
-  await launchBranches(perCell, overrides);
+
+  // Exactly one event per cell now. A live branch is only ever dropped by an
+  // explicit "break out", so never silently replace one: skip cells already
+  // simulating (warn to break out first) and simulate the rest.
+  const fresh = new Map();
+  const busy = [];
+  for (const [ck, evs] of byCell) {
+    const ev = evs[0];
+    if (cellHasLiveBranch(ev.slot, ev.model) || ev.branch_live) busy.push(ev);
+    else fresh.set(ck, ev);
+  }
+  if (busy.length > 0) {
+    const names = busy.map((ev) => `${ev.slot} · ${ev.model}`).join(", ");
+    toast(
+      `already simulating: ${names} — break out first to re-simulate (one branch per slot)`,
+      "err",
+    );
+  }
+  if (fresh.size === 0) return;
+  await launchBranches(fresh, overrides);
 }
 
 async function launchBranches(perCell, overrides) {
@@ -1160,7 +1388,7 @@ async function launchBranches(perCell, overrides) {
         overrides,
         seed,
       });
-      lab.sims.set(ck, { slot: ev.slot, model: ev.model, eventIndex: ev.index });
+      lab.sims.set(ck, { slot: ev.slot, model: ev.model, eventIndex: ev.index, createdAt: performance.now() });
       started += 1;
     } catch (e) {
       toast(`${ev.slot}·${ev.model}: ${e.message}`, "err");
@@ -1173,6 +1401,7 @@ async function launchBranches(perCell, overrides) {
     toast(`simulating downstream on ${started} cell${started === 1 ? "" : "s"}`, "ok");
     emit("poll-now");
     renderSims();
+    refreshCardScenes(); // flip the just-branched cards to their branch scene now
   }
 }
 
@@ -1187,7 +1416,7 @@ function renderSims() {
   if (lab.sims.size === 0) { host?.remove(); updateActionBar(); return; }
   if (!host) {
     host = el("div", { id: "lab-sims", style: "padding:0 0 8px 0" });
-    eventsEl.before(host);
+    reviewGridEl.before(host);
   }
   host.textContent = "";
   const edited = lab.simEditedSteps?.length ? lab.simEditedSteps.join(", ") : lab.simStep;
@@ -1209,7 +1438,9 @@ function renderSims() {
         class: "step-line",
         text: pending
           ? `awaiting step: ${pending.step} @ ${pending.node ?? "?"}`
-          : ls ? `${ls.node} · ${ls.phase}` : status,
+          : (status === "running" && b?.current)
+            ? `running: ${b.current.template ?? b.current.step} @ ${b.current.node ?? "?"}`
+            : ls ? `${ls.node} · ${ls.phase}` : status,
       }),
     );
     if (pending) {
@@ -1226,6 +1457,9 @@ function renderSims() {
     } else if (status === "paused" || status === "error") {
       row.appendChild(el("button", { text: "resume", onclick: () => simAction(sim, "resume", row) }));
     }
+    row.appendChild(el("button", { text: "replace source",
+      title: "promote this simulation to be the slot's source run (overwrites the original)",
+      onclick: () => replaceSourceWithSim(sim) }));
     row.appendChild(el("button", { class: "danger", text: "break out", onclick: () => simAction(sim, "discard", row) }));
     body.appendChild(row);
   }
@@ -1247,79 +1481,166 @@ async function simAction(sim, action, row) {
     }
     emit("poll-now");
     renderSims();
+    refreshCardScenes(); // follow the branch (or revert to source on break-out)
   } catch (e) {
     toast(e.message, "err");
     renderSims();
   }
 }
 
+// Promote a single simulation branch to BE its source cell (overwrites the
+// original run's events + meshes, then consumes the branch). The deliberate,
+// per-slot "replace source with the simulation" — confirmed because it's
+// destructive to the source.
+function replaceSourceWithSim(sim) {
+  openModal(`replace ${sim.slot} · ${sim.model} with its simulation?`, (close, setError) => ({
+    body: [
+      el("div", { class: "m-hint", text:
+        "The simulation branch becomes this slot's source run — its events and meshes replace the original's, " +
+        "and the branch is consumed. The previous source state is discarded." }),
+    ],
+    actions: [
+      el("button", { text: "cancel", onclick: close }),
+      el("button", { class: "danger", text: "replace source", onclick: async () => {
+        try { await api.commitBranch(state.run, sim.slot, sim.model); }
+        catch (e) { setError(e.message); return; }
+        close();
+        state.lab.sims.delete(cellKey(sim.slot, sim.model));
+        if (state.lab.sims.size === 0) state.lab.simStep = null;
+        toast(`replaced ${sim.slot} · ${sim.model} with its simulation`, "ok");
+        emit("poll-now");
+        renderSims();
+        refreshCardScenes();
+      } }),
+    ],
+  }));
+}
+
+// Action-bar batch controls when the selection is simulating: step every
+// selected branch one call (or fast-forward to `until`), or break them all
+// out. Like "step all", each branch QUEUES rather than erroring when it isn't
+// sitting at a gate. Per-cell errors toast but don't abort the rest.
+async function stepSelectedBranches(until = null) {
+  const cells = selectedBranchedCells()
+    .filter((c) => cellSummary(c.slot, c.model)?.branch?.status !== "done");
+  if (!cells.length) return;
+  testBtn.disabled = true;
+  await Promise.all(cells.map(async (c) => {
+    try { await api.branchStep(state.run, c.slot, c.model, false, until); }
+    catch (e) { toast(`${c.slot}·${c.model}: ${e.message}`, "err"); }
+  }));
+  emit("poll-now");
+  renderSims();
+  refreshCardScenes();
+}
+
+async function breakOutSelected() {
+  const cells = selectedBranchedCells();
+  if (!cells.length) return;
+  simBtn.disabled = true;
+  await Promise.all(cells.map(async (c) => {
+    try {
+      await api.branchDiscard(state.run, c.slot, c.model);
+      state.lab.sims.delete(cellKey(c.slot, c.model));
+    } catch (e) { toast(`${c.slot}·${c.model}: ${e.message}`, "err"); }
+  }));
+  if (state.lab.sims.size === 0) state.lab.simStep = null;
+  toast(`broke out of ${cells.length} simulation${cells.length === 1 ? "" : "s"}`, "ok");
+  emit("poll-now");
+  renderSims();
+  refreshCardScenes();
+  updateActionBar();
+}
+
 // --- persistence -----------------------------------------------------------------
 
-// The in-place iteration loop: write the lab's edits into THIS run's
-// snapshot (optionally syncing the run's source version folder), then rewind
-// every slot to the edited step's first call and relaunch — so each
-// edit→rerun→compare round runs across all slots in two clicks.
+// The in-place iteration loop: write the lab's edits into THIS run's snapshot
+// (optionally syncing the run's source version folder), then SIMULATE from a
+// step — forking a NON-destructive branch in every slot that ran it, under the
+// freshly-edited snapshot. The source run is untouched, so the original output
+// stays for comparison; promote a branch to source later from the simulations
+// list ("replace source") when you're happy.
 function applyToRunModal() {
   const lab = state.lab;
   const overrides = overridesPayload();
   const editedSteps = Object.keys(overrides);
   const hasEdits = editedSteps.length > 0;
-  // Always openable: with edits it applies + (optionally) re-runs; with no
-  // edits it's just the re-run-from-a-step control, so you can rewind a slot
-  // to any earlier step without first having to make a throwaway change.
+  // Always openable: with edits it applies + (optionally) simulates; with no
+  // edits it's just the simulate-from-a-step control.
   const allSteps = [...lab.templates.keys()];
   const versionLabel = state.runs.find((r) => r.name === state.run)?.prompt_version;
-  const syncCheck = el("input", { type: "checkbox", checked: "" });
-  const rerunSel = el("select", {},
-    el("option", { value: "", text: "don't re-run anything yet" }),
-    hasEdits ? el("option", { value: "*", text: "re-run from earliest edited step (recommended)" }) : null,
-    allSteps.map((s) => el("option", { value: s, text: `re-run from first ${s} call` })),
+  // ON by default when applying edits (keep the version in step); OFF when there
+  // are none, where ticking it is an explicit "overwrite the source version with
+  // this run's full prompts" — a hard replacement of ALL steps.
+  const syncCheck = el("input", { type: "checkbox", ...(hasEdits ? { checked: "" } : {}) });
+  const simSel = el("select", {},
+    el("option", { value: "", text: "don't simulate yet" }),
+    hasEdits ? el("option", { value: "*", text: "simulate from earliest edited step (recommended)" }) : null,
+    allSteps.map((s) => el("option", { value: s, text: `simulate from first ${s} call` })),
   );
   // With edits, default to the earliest affected step; with none, default to
   // the step currently open in the lab (the one you're likely iterating on).
-  rerunSel.value = hasEdits ? "*" : (lab.step && allSteps.includes(lab.step) ? lab.step : "");
+  simSel.value = hasEdits ? "*" : (lab.step && allSteps.includes(lab.step) ? lab.step : "");
 
-  openModal(hasEdits ? `apply edits to ${state.run}` : `re-run a step in ${state.run}`, (close, setError) => ({
+  openModal(hasEdits ? `apply edits to ${state.run}` : `update ${state.run}`, (close, setError) => ({
     body: [
       hasEdits
         ? el("div", { class: "m-hint", text: `writes into this run's snapshot: ${editedSteps.join(", ")}` })
-        : el("div", { class: "m-hint", text: "no pending edits — this just rewinds and re-runs the chosen step against the run's current prompts." }),
-      hasEdits
+        : el("div", { class: "m-hint", text: "no pending edits — sync the source version to this run's prompts and/or simulate a step." }),
+      versionLabel
         ? el("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text-dim)" },
-            syncCheck, `also update the source version (${versionLabel ?? "unknown"})`)
+            syncCheck, `save this run's full prompts to source version "${versionLabel}" — overwrites ALL its steps (so edits applied earlier without syncing land too)`)
         : null,
-      field(hasEdits ? "then" : "re-run from", rerunSel),
+      field(hasEdits ? "then" : "simulate from", simSel),
       el("div", { class: "m-hint", text:
-        "re-running rewinds each slot to just before its first call of that step and relaunches: " +
-        "everything earlier replays from the log, the step re-runs, and the downstream cascade " +
-        "regenerates. Slots that never ran the step are skipped." }),
+        "simulating forks a branch in each slot at its first call of that step and runs it downstream under " +
+        "the run's (edited) snapshot — the source run is untouched, so you can compare and then promote a " +
+        "branch to source from the simulations list. Slots that never ran the step are skipped." }),
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
-      el("button", { class: "primary", text: hasEdits ? "apply" : "re-run", onclick: async () => {
-        if (!hasEdits && !rerunSel.value) { setError("pick a step to re-run"); return; }
+      el("button", { class: "primary", text: hasEdits ? "apply" : "update", onclick: async () => {
+        const wantWrite = hasEdits || syncCheck.checked;
+        if (!wantWrite && !simSel.value) {
+          setError("nothing to do — edit a prompt, pick a step to simulate, or check “save to source version”");
+          return;
+        }
         try {
-          if (hasEdits) {
+          if (wantWrite) {
             const applied = await api.updateRunPrompts(state.run, overrides, syncCheck.checked);
-            let msg = `snapshot updated (${applied.applied.join(", ")})`;
+            const parts = [];
+            if (editedSteps.length) parts.push(`snapshot updated (${applied.applied.join(", ")})`);
             if (syncCheck.checked) {
-              msg += applied.version_synced
-                ? ` · version "${applied.version_synced}" synced`
-                : " · source version not found, not synced";
+              parts.push(applied.version_synced
+                ? `version "${applied.version_synced}" overwritten with this run's prompts`
+                : "source version not found, not synced");
             }
-            toast(msg, "ok");
+            if (parts.length) toast(parts.join(" · "), "ok");
           }
-          if (rerunSel.value) {
-            const steps = rerunSel.value === "*" ? editedSteps : [rerunSel.value];
-            const r = await api.rerunStep(state.run, steps);
-            toast(`re-running from ${steps.join("/")} on ${r.rerun.length} slot${r.rerun.length === 1 ? "" : "s"}` +
-              (r.skipped.length ? ` (${r.skipped.length} skipped — never ran it)` : ""), "ok");
+          if (simSel.value) {
+            const steps = simSel.value === "*" ? editedSteps : [simSel.value];
+            const r = await api.simulateStep(state.run, steps);
+            for (const c of r.simulated) {
+              const i = c.lastIndexOf("/");
+              const slot = c.slice(0, i);
+              const model = c.slice(i + 1);
+              lab.sims.set(cellKey(slot, model), { slot, model, eventIndex: -1, createdAt: performance.now() });
+            }
+            lab.simStep = steps[0];
+            lab.simEditedSteps = editedSteps.length ? editedSteps : steps;
+            toast(`simulating from ${steps.join("/")} on ${r.simulated.length} slot${r.simulated.length === 1 ? "" : "s"}` +
+              (r.skipped.length ? ` (${r.skipped.length} skipped — never ran it)` : ""), r.simulated.length ? "ok" : "err");
           }
           close();
-          // Applied edits become the snapshot's canonical templates — reload
-          // so the edited flags clear and the event list refreshes.
+          // The applied edits are now the snapshot's canonical templates: drop
+          // every draft + test (stale against the new snapshot) and reload, so
+          // no pre-save prompt can linger in the lab.
+          lab.drafts = new Map();
+          lab.tests = new Map();
           await openLab();
           emit("poll-now");
+          renderSims();
+          refreshCardScenes();
         } catch (e) { setError(e.message); }
       } }),
     ],
@@ -1328,15 +1649,16 @@ function applyToRunModal() {
 
 function saveVersionModal() {
   const overrides = overridesPayload();
-  if (Object.keys(overrides).length === 0) {
-    toast("no template edits to save", "err");
-    return;
-  }
+  const edited = Object.keys(overrides);
+  // No gate on pending drafts: the run's snapshot already holds every edit
+  // applied to it, so a new version is its FULL snapshot (+ any unsaved drafts).
   const input = el("input", { type: "text", placeholder: "e.g. baseline-tighter-bboxes" });
   openModal("save to new version", (close, setError) => ({
     body: [
       field("version name", input),
-      el("div", { class: "m-hint", text: `versions/<name>/ = this run's snapshot + your edits to: ${Object.keys(overrides).join(", ")}` }),
+      el("div", { class: "m-hint", text: edited.length
+        ? `versions/<name>/ = this run's full prompt snapshot + your unsaved edits to: ${edited.join(", ")}`
+        : "versions/<name>/ = this run's full prompt snapshot — all steps, including everything already applied to the run" }),
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
@@ -1391,6 +1713,7 @@ function saveRunModal() {
           });
           toast(`run "${payload.current}" created (${payload.copied.length} cells)`, "ok");
           close();
+          teardownGrid();
           labEl.classList.remove("open");
           lab.sims.clear();
           lab.simStep = null;
@@ -1399,4 +1722,44 @@ function saveRunModal() {
       } }),
     ],
   }));
+}
+
+// Drag the divider between the template editor and the debug grid to set the
+// grid's width; the editor reflows to fill the rest. Persisted so the chosen
+// split survives reloads. Mirrors the overlay's observability-dock resizer.
+const LAB_DEBUG_WIDTH_KEY = "starshot.labDebugWidth";
+const LAB_DEBUG_MIN = 360;
+const LAB_EDITOR_MIN = 420; // step list + editor keep at least this much
+
+function initLabResizer() {
+  const resizer = document.getElementById("lab-resizer");
+  const pane = document.getElementById("lab-right");
+  const body = document.getElementById("lab-body");
+  let saved = NaN;
+  try { saved = Number(localStorage.getItem(LAB_DEBUG_WIDTH_KEY)); } catch { /* private mode */ }
+  if (saved >= LAB_DEBUG_MIN) pane.style.width = `${saved}px`;
+
+  let dragging = false;
+  resizer.addEventListener("pointerdown", (ev) => {
+    dragging = true;
+    resizer.classList.add("dragging");
+    resizer.setPointerCapture(ev.pointerId);
+    ev.preventDefault();
+  });
+  resizer.addEventListener("pointermove", (ev) => {
+    if (!dragging) return;
+    const rect = body.getBoundingClientRect();
+    const max = Math.max(LAB_DEBUG_MIN, rect.width - LAB_EDITOR_MIN);
+    const width = Math.max(LAB_DEBUG_MIN, Math.min(rect.right - ev.clientX, max));
+    pane.style.width = `${Math.round(width)}px`;
+  });
+  const end = (ev) => {
+    if (!dragging) return;
+    dragging = false;
+    resizer.classList.remove("dragging");
+    try { resizer.releasePointerCapture(ev.pointerId); } catch { /* already released */ }
+    try { localStorage.setItem(LAB_DEBUG_WIDTH_KEY, String(parseInt(pane.style.width, 10) || LAB_DEBUG_MIN)); } catch { /* private mode */ }
+  };
+  resizer.addEventListener("pointerup", end);
+  resizer.addEventListener("pointercancel", end);
 }

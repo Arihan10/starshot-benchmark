@@ -8,6 +8,10 @@ These are intentionally type-light and free of any LLM / spec dependencies so `p
 
 from __future__ import annotations
 
+import math
+
+import numpy as np
+
 from app.core.types import BoundingBox, Node
 
 # --- node classification + tree walking --------------------------------------
@@ -85,6 +89,134 @@ def split_region_members_owned(
     _, subregions = split_region_members(region_id, children_index)
     objects = objects_by_region.get(region_id, [])
     return objects, subregions
+
+
+# --- zone adjacency ----------------------------------------------------------
+
+# Adjacency is computed by ray-casting: from the target zone's centre we shoot a
+# near-uniform sphere of rays and keep, per ray, the FIRST region entered.
+# Occlusion is intentional (a zone hidden behind a nearer one in some direction
+# is not a neighbour), distance is uncapped (the nearest zone in a direction
+# counts however far it sits), and the union of every ray's first hit is the
+# neighbour set. 256 directions ~ 32 angular cones x ~8 sub-rays each: enough
+# resolution that side-by-side neighbours land on different rays and a thin
+# neighbour is unlikely to slip between them.
+_ADJACENCY_RAYS = 256
+_RAY_EPS = 1e-9
+
+
+def _fibonacci_directions(n: int) -> np.ndarray:
+    """`n` near-uniform unit vectors on the sphere via the golden-spiral
+    construction — deterministic, so adjacency is reproducible. Returns an
+    `(n, 3)` array of directions in the canonical (X, Y, Z) world frame."""
+    i = np.arange(n) + 0.5
+    y = 1.0 - 2.0 * i / n  # equal-area latitude bands
+    r = np.sqrt(np.clip(1.0 - y * y, 0.0, 1.0))
+    theta = math.pi * (3.0 - math.sqrt(5.0)) * i  # golden angle
+    return np.column_stack((r * np.cos(theta), y, r * np.sin(theta)))
+
+
+def _aabb_interpenetrates(a: BoundingBox, b: BoundingBox) -> bool:
+    """True when the two world boxes overlap in volume (interiors meet on all
+    three axes). Such a neighbour engulfs part of the target — possibly its
+    centre, where every ray starts — so it has no clean entry point for a ray
+    to detect, and is added to the neighbour set directly instead."""
+    amin, amax = a.min_corner, a.max_corner
+    bmin, bmax = b.min_corner, b.max_corner
+    return all(min(amax[i], bmax[i]) - max(amin[i], bmin[i]) > _RAY_EPS for i in range(3))
+
+
+def _deepest_of_tie(ids: list[str], by_id: dict[str, Node]) -> list[str]:
+    """For the zones a single ray entered at the same distance — which happens
+    when a child sits flush against its parent's crossed face — drop any that is
+    an ancestor of another in the set, keeping the deepest (the child). An
+    unrelated coincidence (degenerate overlapping placements) keeps every member."""
+    id_set = set(ids)
+
+    def is_ancestor_of_another(cid: str) -> bool:
+        for other in id_set:
+            if other == cid:
+                continue
+            anc = by_id[other].parent_id
+            while anc is not None and anc in by_id:
+                if anc == cid:
+                    return True
+                anc = by_id[anc].parent_id
+        return False
+
+    return [cid for cid in ids if not is_ancestor_of_another(cid)]
+
+
+def adjacent_zones(target_id: str, nodes: list[Node]) -> list[Node]:
+    """Every region adjacent to `target_id`, found by casting a sphere of rays
+    from the target's centre and unioning the first region each ray enters.
+
+    Occlusion is a feature (a zone behind a nearer one in a direction is not a
+    neighbour) and distance is uncapped (the nearest zone in any direction
+    counts, however far). A neighbour that interpenetrates the target — and so
+    has no clean entry point, since rays start inside it — is added directly.
+    When one ray enters a flush parent and child at the same distance, the
+    deeper region (the child) is taken and its ancestor ignored.
+
+    Containment is not adjacency, so the target's ancestor chain (it sits inside
+    them) and its whole subtree (they sit inside it) are excluded as candidates.
+    Only zones (regions) are returned, in `nodes` order."""
+    by_id = {n.id: n for n in nodes}
+    target = by_id.get(target_id)
+    if target is None:
+        return []
+
+    excluded = {target_id}
+    ancestor = target.parent_id
+    while ancestor is not None and ancestor in by_id and ancestor not in excluded:
+        excluded.add(ancestor)
+        ancestor = by_id[ancestor].parent_id
+    children = index_children(nodes)
+    stack = [target_id]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child.id not in excluded:
+                excluded.add(child.id)
+                stack.append(child.id)
+
+    candidates = [n for n in nodes if n.id not in excluded and is_region(n)]
+    if not candidates:
+        return []
+
+    # A neighbour overlapping the ray origin is invisible to the rays, so seed
+    # the hit set with any candidate that interpenetrates the target.
+    hit_ids: set[str] = {
+        c.id for c in candidates if _aabb_interpenetrates(target.bbox, c.bbox)
+    }
+
+    origin = np.asarray(target.bbox.center, dtype=float)
+    mins = np.array([c.bbox.min_corner for c in candidates], dtype=float)  # (C, 3)
+    maxs = np.array([c.bbox.max_corner for c in candidates], dtype=float)  # (C, 3)
+    dirs = _fibonacci_directions(_ADJACENCY_RAYS)                          # (N, 3)
+    dirs = np.where(np.abs(dirs) < _RAY_EPS, np.copysign(_RAY_EPS, dirs), dirs)
+
+    # Ray-AABB (slab method), vectorised over candidates for every ray at once.
+    # `t_enter` / `t_exit` are entry / exit distances along each ray; a ray
+    # enters a box in front of the origin when t_enter <= t_exit and t_exit >= 0.
+    t1 = (mins[None, :, :] - origin) / dirs[:, None, :]  # (N, C, 3)
+    t2 = (maxs[None, :, :] - origin) / dirs[:, None, :]
+    t_enter = np.minimum(t1, t2).max(axis=2)             # (N, C)
+    t_exit = np.maximum(t1, t2).min(axis=2)              # (N, C)
+    entered = (t_enter <= t_exit) & (t_exit >= 0.0) & (t_enter > _RAY_EPS)
+    t_enter = np.where(entered, t_enter, np.inf)
+
+    cand_ids = [c.id for c in candidates]
+    for row in t_enter:  # one ray's entry distance to every candidate
+        nearest = float(row.min())
+        if not np.isfinite(nearest):
+            continue  # this ray escaped into open space
+        tied = np.flatnonzero(row <= nearest + _RAY_EPS)
+        if tied.size == 1:
+            hit_ids.add(cand_ids[int(tied[0])])
+        else:
+            hit_ids.update(_deepest_of_tie([cand_ids[int(j)] for j in tied], by_id))
+
+    return [n for n in nodes if n.id in hit_ids]
 
 
 # --- bounding-box prose ------------------------------------------------------

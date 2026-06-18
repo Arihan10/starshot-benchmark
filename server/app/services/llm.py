@@ -68,6 +68,13 @@ def apply_model_quirks(user: str, model: str) -> str:
     return user
 
 
+def _reasoning_effort(model: str) -> str:
+    """The reasoning effort to request for `model`. OpenAI/GPT models are pinned
+    to "minimal" for now — xhigh makes them slow + costly and we're not
+    measuring their reasoning depth here; every other provider stays at "xhigh"."""
+    return "minimal" if (model or "").startswith("openai/") else "xhigh"
+
+
 # Optional per-task breakpoint. When set, `call_llm` awaits it right before
 # issuing a REAL (cache-miss) call. Downstream-simulation branch tasks bind
 # one so the user advances them one step at a time; every other task leaves
@@ -133,7 +140,8 @@ async def call_llm(
     model = _current_model.get()
     if model is None:
         raise RuntimeError("llm.set_model() must be called before call_llm()")
-    user = apply_model_quirks(user, model)
+    user_raw = user  # pre-quirk source; re-quirked if the gate re-aims this call
+    user = apply_model_quirks(user_raw, model)
     schema_name = output_schema.__name__
     key = cache.hash_llm_call(
         model=model,
@@ -154,10 +162,15 @@ async def call_llm(
 
     # Step gate: a bound gate (downstream-simulation branches) pauses here —
     # AFTER the cache check, so committed/cached/seeded steps replay untouched
-    # and only genuinely-new frontier steps stop for the user's go-ahead.
+    # and only genuinely-new frontier steps stop for the user's go-ahead. The
+    # gate may also RE-AIM this call at a different model (compare's per-step
+    # "run this step on model X"): re-quirk for it, switch the task model (so
+    # schema normalization + any later calls follow it), re-hash, and re-check
+    # the cache under the new key — a revert cleared any prior output, so this
+    # normally misses and the step runs fresh on the chosen model.
     gate = _step_gate.get()
     if gate is not None:
-        await gate(
+        chosen = await gate(
             node_id=node_id,
             step=step,
             template=template,
@@ -166,6 +179,22 @@ async def call_llm(
             schema_name=schema_name,
             model=model,
         )
+        if chosen and chosen != model:
+            model = chosen
+            _current_model.set(model)
+            user = apply_model_quirks(user_raw, model)
+            key = cache.hash_llm_call(
+                model=model,
+                system=system,
+                user=user,
+                schema_name=schema_name,
+            )
+            hit = cache.find_llm_cache_hit(logging.current_events(), key)
+            if hit is not None:
+                cached = output_schema.model_validate(hit)
+                if validate is not None:
+                    validate(cached)
+                return cached
 
     validated, reasoning, usage, raw = await call_llm_once(
         system=system,
@@ -266,7 +295,7 @@ async def call_llm_once(
                             "schema_": _normalize_schema(output_schema.model_json_schema()),
                         },
                     },
-                    reasoning={"effort": "xhigh"},
+                    reasoning={"effort": _reasoning_effort(model)},
                 )
             message = response.choices[0].message
             content = message.content
@@ -335,6 +364,58 @@ async def call_llm_once(
                 raise
             _retry_log("llm.retry", reason=f"{type(e).__name__}: {str(e)[:160]}")
             parse_attempt += 1
+
+
+async def chat(
+    *,
+    model: str,
+    system: str,
+    messages: list[dict[str, str]],
+    reasoning_effort: str = "xhigh",
+) -> tuple[str, str]:
+    """A free-form, multi-turn completion with NO structured-output schema —
+    the engine behind the decision-inquiry endpoint. `system` is prepended as
+    the system message; `messages` is the running conversation (alternating
+    user/assistant turns). Returns `(text, reasoning)`.
+
+    Unlike `call_llm`/`call_llm_once` this neither forces `response_format`
+    nor reads/writes any cache or event log, and `model` is passed explicitly
+    rather than via the `_current_model` ContextVar — it runs outside any
+    cell's pipeline. It keeps only the transport-retry budget (provider flaps
+    like Anthropic 503s); there is no JSON to parse, so no parse/validation
+    resampling."""
+    transport_attempt = 0
+    TRANSPORT_MAX = 8
+    TRANSPORT_BACKOFF = [2, 4, 8, 16, 30, 30, 30, 30]
+    wire: list[dict[str, str]] = [{"role": "system", "content": system}, *messages]
+    while True:
+        try:
+            async with OpenRouter(
+                api_key=os.environ["OPENROUTER_API_KEY"],
+                timeout_ms=180_000,
+            ) as client:
+                response = await client.chat.send_async(
+                    model=model,
+                    # The SDK types messages as a TypedDict list; our runtime-built
+                    # role/content dicts are structurally identical (same friction
+                    # the structured path hits on response_format).
+                    messages=wire,  # pyright: ignore[reportArgumentType]
+                    reasoning={"effort": reasoning_effort},
+                )
+            message = response.choices[0].message
+            content = message.content
+            text = content if isinstance(content, str) else str(content or "")
+            reasoning = getattr(message, "reasoning", None) or ""
+            return text, reasoning
+        except (OpenRouterError, httpx.HTTPError):
+            # Provider flap (Anthropic 503, dropped connection) — the model
+            # never saw the request, so back off and resend, same budget as
+            # call_llm_once's transport retries.
+            if transport_attempt >= TRANSPORT_MAX - 1:
+                raise
+            backoff = TRANSPORT_BACKOFF[min(transport_attempt, len(TRANSPORT_BACKOFF) - 1)]
+            await asyncio.sleep(backoff)
+            transport_attempt += 1
 
 
 def _normalize_schema(schema: object) -> object:

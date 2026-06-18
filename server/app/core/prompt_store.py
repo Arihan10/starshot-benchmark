@@ -65,8 +65,8 @@ ALL_VARIABLES: list[str] = [
     "ROOT_PROMPT", "ROOT_PLAN", "ROOT_DIMENSIONS", "ROOT_ORIGIN", "ROOT_HEADER",
     "ROOT_OBJECTS", "SCENE_CONTEXT",
     "ZONE_ID", "ZONE_PROMPT", "ZONE_PLAN", "ZONE_PLACEMENT", "ZONE_DIMENSIONS",
-    "ZONE_ORIGIN", "PARENT_ZONE_ID", "PARENT_ZONE_PLAN", "PARENT_ZONE_ORIGIN",
-    "TO_PLACE", "RETRY_BLOCK",
+    "ZONE_ORIGIN", "ZONE_OBJECTS", "PARENT_ZONE_ID", "PARENT_ZONE_PLAN", "PARENT_ZONE_ORIGIN",
+    "TO_PLACE", "RETRY_BLOCK", "ADJACENT_ZONES",
     "OBJECT_PROMPT", "OBJECT_DIMENSIONS", "PROXY_SHAPE", "IMAGE_TEMPLATE_FRONT",
     "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP", "PRIOR_SUBJECTS",
 ]
@@ -84,7 +84,7 @@ LEGACY_VARIABLES: list[str] = ["DEEPSEEK_SUFFIX"]
 _ZONE_VARIABLES = [
     "ROOT_PROMPT", "ROOT_PLAN", "ROOT_DIMENSIONS", "ROOT_ORIGIN", "ROOT_HEADER",
     "ROOT_OBJECTS", "SCENE_CONTEXT", "ZONE_ID", "ZONE_PROMPT", "ZONE_PLAN",
-    "ZONE_PLACEMENT", "ZONE_DIMENSIONS", "ZONE_ORIGIN", "PARENT_ZONE_ID",
+    "ZONE_PLACEMENT", "ZONE_DIMENSIONS", "ZONE_ORIGIN", "ZONE_OBJECTS", "PARENT_ZONE_ID",
     "PARENT_ZONE_PLAN", "PARENT_ZONE_ORIGIN",
 ]
 STEP_VARIABLES: dict[str, list[str]] = {
@@ -94,7 +94,7 @@ STEP_VARIABLES: dict[str, list[str]] = {
     "zone_decompose_root": _ZONE_VARIABLES,
     "zone_decompose": _ZONE_VARIABLES,
     "child_bbox_batch": _ZONE_VARIABLES + ["TO_PLACE"],
-    "encapsulating_decompose": _ZONE_VARIABLES + ["RETRY_BLOCK"],
+    "encapsulating_decompose": _ZONE_VARIABLES + ["RETRY_BLOCK", "ADJACENT_ZONES"],
     "anchor_decompose": _ZONE_VARIABLES + ["RETRY_BLOCK"],
     "negative_space_decompose": _ZONE_VARIABLES + ["RETRY_BLOCK"],
     "object_bbox_batch": _ZONE_VARIABLES + ["TO_PLACE"],
@@ -260,6 +260,20 @@ def write_overrides(target_dir: Path, overrides: dict[str, dict[str, str]]) -> N
             (target_dir / f"{step}.{role}.txt").write_text(text, encoding="utf-8")
     _load_dir(target_dir, target_dir.name)
     _snapshot_cache.pop(target_dir.resolve(), None)
+
+
+def sync_templates(dest_dir: Path, src_dir: Path) -> None:
+    """Hard-replace EVERY step template in `dest_dir` with `src_dir`'s — used to
+    push a run's FULL prompt snapshot back onto its source version. Unlike
+    `write_overrides` (which only touches the steps you just edited), this copies
+    all steps, so edits applied to the run EARLIER without syncing still land,
+    not just the latest override. Validates both sides and drops the cached
+    load of the destination."""
+    src = _load_dir(src_dir, src_dir.name)  # validates src is a complete set
+    for (step, role), text in src.templates.items():
+        (dest_dir / f"{step}.{role}.txt").write_text(text, encoding="utf-8")
+    _load_dir(dest_dir, dest_dir.name)  # validate the result
+    _snapshot_cache.pop(dest_dir.resolve(), None)
 
 
 # --- run snapshots --------------------------------------------------------------
