@@ -19,19 +19,19 @@ export const HOTSPOT_FLOOR_DROP = 1.3; // meters below eye level (markers sit on
 export const HOTSPOT_REACH = 30; // furthest an interior anchor can be and still show
 export const HOTSPOT_MAX_OCCLUDED = 6; // X closest behind-wall anchors kept as yellow ghosts
 export const HOTSPOT_OCCLUDE_EPS = 0.2; // trim both ends so a hugged wall isn't a block
-export const ENTRY_TARGET_PX = 12; // overview entry discs render smaller
+export const ENTRY_TARGET_PX = 5; // overview entry discs render as small dots
 export const AUTO_AIM_PX = 42; // interior pick/hover magnetism radius
 export const ENTRY_AIM_PX = 26; // tighter pick radius for the smaller entry discs
 export const HOTSPOT_BASE_RADIUS = 0.16; // the disc geometry's world radius
-// Every anchor shows a small white ring laid flat on the floor: world-fixed size
+// Every anchor shows a white ring laid flat on the floor: world-fixed size
 // (scales with distance like a real object) and depth-tested (scene geometry hides it).
-export const ANCHOR_RING_INNER = 0.14; // world-space inner radius of the anchor ring
-export const ANCHOR_RING_OUTER = 0.2; // world-space outer radius of the anchor ring
+export const ANCHOR_RING_INNER = 0.2; // world-space inner radius of the anchor ring
+export const ANCHOR_RING_OUTER = 0.3; // world-space outer radius of the anchor ring
 export const ANCHOR_RING_OPACITY = 0.4; // anchor rings are faint / transparent
 // The X closest behind-wall anchors reuse the anchor-ring look in a warm gold:
 // brighter, larger, and drawn over everything so they read as reachable through walls.
 export const ANCHOR_RING_OCCLUDED_COLOR = 0xffce73; // warm gold
-export const ANCHOR_RING_OCCLUDED_OPACITY = 0.92; // bolder than the faint white rings
+export const ANCHOR_RING_OCCLUDED_OPACITY = 0.6; // translucent so the hover-to-opaque pop reads clearly (still bolder than white)
 export const ANCHOR_RING_OCCLUDED_SCALE = 1.5; // larger than the white rings, for visibility
 export const CAPTURE_EYE_HEIGHT = 1.6; // panos are shot at eye height; floor sits this far below
 export const PEEK_ROTATE_SPEED = 0.5; // rad/s the dollhouse spins while locating

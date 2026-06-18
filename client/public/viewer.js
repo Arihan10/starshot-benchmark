@@ -9302,18 +9302,21 @@ async function capturePanoBlob(onProgress) {
 //
 // The companion to the 360 captures: group the anchors into Y "levels" (storeys
 // — anchors within MINIMAP_LEVEL_EPS metres of each other) and render one
-// top-down orthographic slice of the scene per level, cut at that level's camera
-// height (a world clip plane drops everything above the cut, so the slice shows
-// the floor plan + furniture rather than the roof). The prod client shows the
-// matching slice as a minimap and dots the level's anchors onto it, mapping each
-// anchor's world XZ through the stored `bounds`.
+// top-down orthographic slice of the scene per level. The slice is a horizontal
+// SLAB at camera level: cut above the head (drops the roof, so we see in) AND a
+// bit below the lowest camera in the group (drops the floor-and-below, so an
+// upper storey's slice can't show the floor beneath it). The prod client shows
+// the matching slice as a minimap and dots the level's anchors onto it, mapping
+// each anchor's world XZ through the stored `bounds`.
 
 const MINIMAP_LEVEL_EPS = 1.5; // metres; anchors within this Y gap share a level
 const MINIMAP_RES = 1024; // longest output side in device px (capped by the canvas)
 const MINIMAP_PAD_FRAC = 0.04; // breathing room around the scene footprint
+const MINIMAP_SLICE_BELOW = 2; // metres below the level's lowest anchor for the floor cut
 
-// Cluster anchor Ys into levels by gap; returns [{ y, indices }] low→high, where
-// y is the level's median camera height (its slice-cut height + client match key).
+// Cluster anchor Ys into levels by gap; returns [{ y, minY, indices }] low→high,
+// where y is the level's median camera height (its top slice-cut + client match
+// key) and minY is its lowest camera (the bottom slice-cut rides just under it).
 function groupAnchorLevels(positions) {
 	const order = positions
 		.map((_, i) => i)
@@ -9332,7 +9335,7 @@ function groupAnchorLevels(positions) {
 	}
 	return groups.map((g) => {
 		const ys = g.ys.slice().sort((a, b) => a - b);
-		return { y: ys[(ys.length - 1) >> 1], indices: g.indices };
+		return { y: ys[(ys.length - 1) >> 1], minY: ys[0], indices: g.indices };
 	});
 }
 
@@ -9341,7 +9344,7 @@ function groupAnchorLevels(positions) {
 // footprint-aspect viewport then read back — the pano-face pattern. The ortho
 // camera looks straight down with -Z "up" in the image, so the stored `bounds`
 // map world (x,z) → image (left,top) as ((x-minX)/W, (z-minZ)/D).
-async function captureMinimapBlob(bounds, cutY, yTop, yBot) {
+async function captureMinimapBlob(bounds, cutTop, cutBottom, yTop, yBot) {
 	const canvas = renderer.domElement;
 	const dpr = renderer.getPixelRatio();
 	const prevSize = renderer.getSize(new THREE.Vector2());
@@ -9377,9 +9380,13 @@ async function captureMinimapBlob(bounds, cutY, yTop, yBot) {
 	cam.lookAt(cx, yBot, cz);
 	cam.updateProjectionMatrix();
 
-	// World clip plane keeping y <= cutY (everything above the camera level is
-	// dropped, opening the roof so the slice reads as a floor plan).
-	const plane = new THREE.Plane(new THREE.Vector3(0, -1, 0), cutY);
+	// World clip planes bounding a horizontal SLAB: keep cutBottom <= y <= cutTop.
+	// The top cut opens the roof (drops everything above the head); the bottom cut
+	// drops the floor-and-below — including lower storeys, so an upper level's slice
+	// can't show the floor beneath it. Global clipping planes intersect (a fragment
+	// outside EITHER is dropped).
+	const planeTop = new THREE.Plane(new THREE.Vector3(0, -1, 0), cutTop);
+	const planeBottom = new THREE.Plane(new THREE.Vector3(0, 1, 0), -cutBottom);
 	const prevClip = renderer.clippingPlanes;
 	const prevBg = scene.background;
 	const prevClear = renderer.getClearColor(new THREE.Color());
@@ -9397,7 +9404,7 @@ async function captureMinimapBlob(bounds, cutY, yTop, yBot) {
 		// render; the clipping-plane swap below forces a program refresh, so this
 		// toggle takes effect for the slice pass.
 		renderer.shadowMap.enabled = false;
-		renderer.clippingPlanes = [plane];
+		renderer.clippingPlanes = [planeTop, planeBottom];
 		scene.background = null;
 		renderer.setClearColor(0x0c0d10, 1);
 		renderer.setScissorTest(true);
@@ -9406,9 +9413,17 @@ async function captureMinimapBlob(bounds, cutY, yTop, yBot) {
 		renderer.render(scene, cam);
 		// Viewport (0,0) is the canvas' bottom-left; drawImage's source rect is
 		// top-left-origin device pixels.
-		crop
-			.getContext("2d")
-			.drawImage(canvas, 0, canvas.height - ph, pw, ph, 0, 0, pw, ph);
+		crop.getContext("2d").drawImage(
+			canvas,
+			0,
+			canvas.height - ph,
+			pw,
+			ph,
+			0,
+			0,
+			pw,
+			ph,
+		);
 	} finally {
 		renderer.setScissorTest(false);
 		renderer.setViewport(0, 0, prevSize.x, prevSize.y);
@@ -9421,7 +9436,10 @@ async function captureMinimapBlob(bounds, cutY, yTop, yBot) {
 	}
 	return new Promise((resolve, reject) =>
 		crop.toBlob(
-			(blob) => (blob ? resolve(blob) : reject(new Error("minimap encode failed"))),
+			(blob) =>
+				blob
+					? resolve(blob)
+					: reject(new Error("minimap encode failed")),
 			"image/png",
 		),
 	);
@@ -9451,7 +9469,8 @@ async function buildMinimaps(cell, panoMeta, onLevel) {
 	const box = new THREE.Box3().setFromObject(sceneRoot);
 	if (box.isEmpty()) return [];
 	const pad =
-		MINIMAP_PAD_FRAC * Math.max(box.max.x - box.min.x, box.max.z - box.min.z, 1);
+		MINIMAP_PAD_FRAC *
+		Math.max(box.max.x - box.min.x, box.max.z - box.min.z, 1);
 	const bounds = {
 		minX: box.min.x - pad,
 		maxX: box.max.x + pad,
@@ -9463,9 +9482,12 @@ async function buildMinimaps(cell, panoMeta, onLevel) {
 	for (let li = 0; li < levels.length; li++) {
 		onLevel?.(li, levels.length);
 		const file = `minimap-${li}.png`;
+		// Top cut above the head (median camera height); bottom cut a bit below the
+		// level's lowest camera — a slab at camera level, isolated from other storeys.
 		const blob = await captureMinimapBlob(
 			bounds,
 			levels[li].y,
+			levels[li].minY - MINIMAP_SLICE_BELOW,
 			box.max.y,
 			box.min.y,
 		);

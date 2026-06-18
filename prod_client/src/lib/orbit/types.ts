@@ -15,7 +15,12 @@ export type TourSource = {
 // the panos were captured on. `bounds` is the world-space XZ rectangle the image
 // spans, so a pano at world (x,z) maps to image fractions ((x-minX)/W, (z-minZ)/D)
 // — image +x is world +X, image +y (downward) is world +Z.
-export type MinimapBounds = { minX: number; maxX: number; minZ: number; maxZ: number };
+export type MinimapBounds = {
+	minX: number;
+	maxX: number;
+	minZ: number;
+	maxZ: number;
+};
 export type MinimapLevel = {
 	level: number;
 	y: number; // the level's representative camera height (its match key)
@@ -62,6 +67,7 @@ export type OrbitState = {
 	mode: OrbitMode;
 	panoCount: number;
 	currentId: string | null;
+	currentName: string | null; // POI name of the current pano; null falls back to the id
 	currentIndex: number;
 	hover: { id: string; name?: string; occluded: boolean } | null;
 	objectHover: string | null; // label of the object under the cursor (overview)
@@ -83,7 +89,14 @@ export type OrbitState = {
 			level: number;
 			url: string;
 			aspect: number;
-			points: Array<{ index: number; id: string; leftPct: number; topPct: number; current: boolean }>;
+			points: Array<{
+				index: number;
+				id: string;
+				name?: string;
+				leftPct: number;
+				topPct: number;
+				current: boolean;
+			}>;
 		}>;
 	} | null;
 };
@@ -92,6 +105,7 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	mode: "empty",
 	panoCount: 0,
 	currentId: null,
+	currentName: null,
 	currentIndex: -1,
 	hover: null,
 	objectHover: null,
