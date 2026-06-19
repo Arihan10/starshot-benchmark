@@ -52,13 +52,15 @@ In the scene context, you are provided two sets of coordinates for every object/
 </input>
 
 <output>
-Respond with a single JSON object matching the schema: one `assignment` per object (id, bounding box, orientation). 
+Respond with a single JSON object containing one field:
+- `assignments` (list): exactly one entry per object you were asked to place — no extras, no omissions. Each entry has:
+  - `id` (string): the id of the object this box is for, copied verbatim from the request.
+  - `bbox` (object): that object's axis-aligned bounding box, declared relative to the parent declared for it in the input — the local frame where the origin (0,0,0) is the parent's bounding box's minimum corner. It has exactly two fields:
+    - `origin` (array of 3 numbers `[x, y, z]`): the box's own minimum corner.
+    - `dimensions` (array of 3 numbers `[dx, dy, dz]`): the box's extent from `origin` along +X (right), +Y (up), +Z (front). The box is formed by taking the minimum corner and extending along each axis by these dimensions. Must always be non-negative.
+  - `orientation` (integer): the object's facing as a yaw about the vertical +Y axis (no rotation in the X or Z axes) — exactly one of these 9 values: -180, -135, -90, -45, 0, 45, 90, 135, 180 (180 and -180 represent the same direction). 0 means the object is facing +Z (towards the viewer); 90 means the object is facing +X (to the right).
 
-Each object's bounding box (bbox) must be declared relative to the parent that has been declared for it in the input — the local coordinates, where the origin (0,0,0) is the parent's bounding box's minimum corner. Each bounding box you output is defined by its own minimum corner and its dimensions. The bounding box is formed by taking the minimum corner and extending along each axes according to the dimensions you give. The `dimensions` vector must always be non-negative.
-
-Axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The working unit is ALWAYS meters: every coordinate and dimension you emit or are given is in meters. You can use decimals up to centimeter precision (multiples of 0.01 m). Emit exactly one assignment per requested object — no extras, no omissions.
-
-Orientation is defined as a yaw relative to the positive Y axis - no rotations in the X or Z axes. Choose from 9 literal values: -180, -135, -90, -45, 0, 45, 90, 135, 180 (where 180 and -180 represent the same direction). 0 means the object is facing the +Z axes (towards the viewer), while 90 means the object is facing the +X axis (to the right).
+Axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The working unit is ALWAYS meters: every coordinate and dimension you emit or are given is in meters. You can use decimals up to centimeter precision (multiples of 0.01 m).
 
 No prose, no markdown, no code fences.
 </output>

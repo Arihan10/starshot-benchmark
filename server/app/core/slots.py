@@ -54,7 +54,10 @@ MODELS: dict[str, str] = {
     "opus-new": "anthropic/claude-opus-4.8",
     "opus-fable": "anthropic/claude-fable-latest",
     "glm": "z-ai/glm-5.2",
-    "qwen": "qwen/qwen3.7-max"
+    "qwen": "qwen/qwen3.7-max",
+    "kimi": "moonshotai/kimi-k2-thinking",
+    "sonnet": "anthropic/claude-sonnet-4.6",
+    "minimax": "minimax/minimax-m3"
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())
