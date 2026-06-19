@@ -2,28 +2,22 @@ import {
 	Box3,
 	Color,
 	DirectionalLight,
-	DoubleSide,
 	Group,
 	HemisphereLight,
 	type Intersection,
 	type Material,
 	MathUtils,
 	Mesh,
-	MeshBasicMaterial,
 	MOUSE,
 	type Object3D,
 	NoToneMapping,
 	PerspectiveCamera,
-	PlaneGeometry,
 	type Quaternion,
 	Raycaster,
-	RingGeometry,
 	Scene,
 	type ShaderMaterial,
-	Sphere,
 	SphereGeometry,
 	SRGBColorSpace,
-	type Texture,
 	Vector2,
 	Vector3,
 	WebGLRenderer,
@@ -31,57 +25,42 @@ import {
 } from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { EffectComposer } from "three/examples/jsm/postprocessing/EffectComposer.js";
-import { OutlinePass } from "three/examples/jsm/postprocessing/OutlinePass.js";
 import { RenderPass } from "three/examples/jsm/postprocessing/RenderPass.js";
 import { ShaderPass } from "three/examples/jsm/postprocessing/ShaderPass.js";
 import { CopyShader } from "three/examples/jsm/shaders/CopyShader.js";
-import { loadGLB, loadPanoTexture } from "./loaders";
+import { loadGLB } from "./loaders";
 import {
 	DUMMY_TEX,
 	makePanoMaterial,
 	makePolyMaterial,
-	makeProjectionMaterial,
-	PROJ_K,
 	SPHERE_RADIUS,
 } from "./materials";
 import {
-	ANCHOR_RING_INNER,
-	ANCHOR_RING_OCCLUDED_COLOR,
-	ANCHOR_RING_OCCLUDED_OPACITY,
-	ANCHOR_RING_OCCLUDED_SCALE,
-	ANCHOR_RING_OPACITY,
-	ANCHOR_RING_OUTER,
-	AUTO_AIM_PX,
-	CAPTURE_EYE_HEIGHT,
 	ENTRY_AIM_PX,
-	ENTRY_TARGET_PX,
-	HOTSPOT_FLOOR_DROP,
-	HOTSPOT_MAX_OCCLUDED,
-	HOTSPOT_OCCLUDE_EPS,
-	HOTSPOT_REACH,
-	hotspotScaleForDistance,
-	makeDisc,
-	makeYouMarker,
 	PEEK_ROTATE_SPEED,
 	pickByScreen,
 	WASD_DIR_COS,
 	WASD_MAX_STEP,
 	WASD_MAX_Y_STEP,
-	type YouMarker,
 } from "./markers";
 import { SurfaceCursor } from "./cursor";
-import type {
-	MinimapLevel,
-	OrbitMode,
-	OrbitState,
-	TourManifest,
-	TourSource,
-} from "./types";
+import { MarkerLayer } from "./markerLayer";
+import { collectObjects, ObjectAddressing } from "./objectAddressing";
+import { type PanoEntry, PanoStreamer } from "./panoTextures";
+import { Projection } from "./projection";
+import { buildMinimapState, levelForY, type MinimapSlice } from "./minimap";
+import {
+	applyLook,
+	cursorRayDir,
+	forwardToLonLat,
+	lookTargetFrom,
+	pinLook,
+} from "./look";
+import type { OrbitMode, OrbitState, TourManifest, TourSource } from "./types";
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 const easeInOut = (t: number) =>
 	t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
-const _ndc = new Vector2();
 const _cursorNdc = new Vector2(); // scratch: native cursor in NDC for raycastInterior
 const _labelPos = new Vector3(); // scratch: project a hovered ring's anchor to screen
 
@@ -111,25 +90,6 @@ type SavedInterior = {
 	fov: number;
 };
 
-// A capture point. Textures are loaded lazily (on enter / on movement): a low-res
-// blurred placeholder shows first, then the full image swaps in. `texture` is the
-// current best (placeholder or full); `placeholderTexture` is kept only so it can
-// be disposed at teardown without racing a bound shader uniform.
-type PanoEntry = {
-	id: string;
-	name?: string;
-	position: [number, number, number];
-	forward?: [number, number, number];
-	url: string;
-	placeholderUrl: string;
-	texture: Texture | null;
-	placeholderTexture: Texture | null;
-	hasFull: boolean;
-	requested: boolean;
-	ready?: Promise<void>;
-	resolveReady?: () => void;
-};
-
 // A combined dollhouse + interior walkthrough. OVERVIEW orbits the cell's
 // vertex-colored lite scene with a free-pan camera; stepping INSIDE drops into
 // the pano projection walkthrough. Both live in the SAME world frame, so a "you
@@ -150,72 +110,26 @@ export class OrbitEngine {
 	private readonly controls: OrbitControls;
 	private readonly ro: ResizeObserver;
 
-	// Post-processing: the beauty pass plus two OutlinePasses that draw a
-	// screen-space silhouette around the selected (orange) / hovered (cyan)
-	// objects. selectedObjects on each is refreshed every frame from the
-	// hover / selection sets (updateOutlineSelection).
+	// Post-processing: the beauty pass plus two OutlinePasses (owned by
+	// ObjectAddressing) that silhouette the selected (orange) / hovered (cyan)
+	// objects, then a copy to screen.
 	private readonly composer: EffectComposer;
-	private readonly outlineSelect: OutlinePass;
-	private readonly outlineHover: OutlinePass;
 
 	private readonly sphereA: Mesh;
 	private readonly sphereAMat: ShaderMaterial;
 	private readonly sphereB: Mesh;
 	private readonly sphereBMat: ShaderMaterial;
-	private readonly projMaterial: ShaderMaterial;
 	private readonly polyMaterial = makePolyMaterial();
-	private backdropRadius = SPHERE_RADIUS;
 
-	private readonly hotspotGroup = new Group();
-	private readonly entryGroup = new Group();
-	// Every anchor as a small white ring laid flat on the floor. Depth-tested
-	// (depthTest defaults on) so scene geometry obstructs it, and never
-	// screen-scaled in tick() so it keeps a world-fixed size — smaller far, larger
-	// near, like a real object. One shared geometry + material across all anchors.
-	private readonly anchorRingGroup = new Group();
-	private readonly anchorRingGeo = new RingGeometry(
-		ANCHOR_RING_INNER,
-		ANCHOR_RING_OUTER,
-		40,
-	);
-	private readonly anchorRingMat = new MeshBasicMaterial({
-		color: 0xffffff,
-		transparent: true,
-		opacity: ANCHOR_RING_OPACITY,
-		side: DoubleSide,
-		depthWrite: false,
-	});
-	// The X closest obstructed anchors reuse the ring geometry in warm gold, drawn
-	// over everything (depthTest off) so they show through walls as reachable.
-	private readonly anchorRingOccludedMat = new MeshBasicMaterial({
-		color: ANCHOR_RING_OCCLUDED_COLOR,
-		transparent: true,
-		opacity: ANCHOR_RING_OCCLUDED_OPACITY,
-		side: DoubleSide,
-		depthWrite: false,
-		depthTest: false,
-	});
-	// Full-opacity twins of the two ring materials, swapped onto the single ring the
-	// cursor is over (setRingHover). Rings share the faint base materials, so this
-	// lights just the hovered one — matching its color + depthTest, only at opacity 1.
-	private readonly anchorRingHoverMat = new MeshBasicMaterial({
-		color: 0xffffff,
-		transparent: true,
-		opacity: 1,
-		side: DoubleSide,
-		depthWrite: false,
-	});
-	private readonly anchorRingOccludedHoverMat = new MeshBasicMaterial({
-		color: ANCHOR_RING_OCCLUDED_COLOR,
-		transparent: true,
-		opacity: 1,
-		side: DoubleSide,
-		depthWrite: false,
-		depthTest: false,
-	});
-	private hoveredRing: Mesh | null = null;
-	private readonly you: YouMarker;
-	private readonly occluder = new Raycaster();
+	// Subsystems: pano texture streaming, the projection backdrop, the navigation
+	// marker layer, and per-object addressing. The engine wires them, routes
+	// input, and runs the camera / render loop.
+	private readonly streamer: PanoStreamer;
+	private readonly projection = new Projection();
+	private readonly markers: MarkerLayer;
+	private readonly addressing: ObjectAddressing;
+	private readonly requestPano = (i: number) => this.streamer.request(i);
+
 	private readonly dummyCam = new PerspectiveCamera();
 
 	// Surface-adhering ring cursor (interior only); see SurfaceCursor. The raycast
@@ -227,12 +141,11 @@ export class OrbitEngine {
 	private pointerClientY = 0;
 	private pointerInside = false;
 
-	private panos: PanoEntry[] = [];
 	private currentIndex = -1;
 	private projectionMode = false;
 	// Bird's-eye minimap slices (one per Y level) + the level each pano sits on
 	// (its nearest minimap by capture height). Empty when the tour has no slices.
-	private minimaps: Array<MinimapLevel & { url: string }> = [];
+	private minimaps: MinimapSlice[] = [];
 	private panoLevel: number[] = [];
 	// Held image prefetchers for the slices, so every floor is cached up front and
 	// the floor switcher is instant. Kept referenced so the in-flight loads aren't
@@ -240,24 +153,11 @@ export class OrbitEngine {
 	private minimapPrefetch: HTMLImageElement[] = [];
 	private liteRoot: Group | null = null;
 	private proxyGroup: Group | null = null;
-	private proxyBase: Mesh | null = null; // floor slab under the proxy (mirrors proxy material)
 	private sharedOverview = false;
 	private proxyView = false; // overview shows the proxy mesh instead of the lite dollhouse
 	// One matte material per proxy object so the bare proxy reads as distinct
 	// parts; reskinProxy's matte path swaps these in, clearScene disposes them.
 	private proxyColorMats: Material[] = [];
-
-	// Per-object addressing (lite + proxy). Each placed object is tagged at load so
-	// the user can hover (cyan) and right-click (hide / persist orange) it. The
-	// highlight is a screen-space outline drawn by OutlinePass (see the composer
-	// setup): hover / selection are just object sets here, fed to the two passes
-	// each frame by updateOutlineSelection — no per-mesh overlay geometry to keep.
-	private readonly picker = new Raycaster();
-	private readonly hiddenObjects = new Set<Object3D>();
-	private readonly outlinedObjects = new Set<Object3D>();
-	private hoveredObj: Object3D | null = null;
-	private menuTarget: Object3D | null = null;
-	private contextMenu: OrbitState["contextMenu"] = null;
 	private rcDownX = 0;
 	private rcDownY = 0;
 
@@ -293,7 +193,6 @@ export class OrbitEngine {
 	private autoRotateTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastFrame = 0;
 	private overlay: OrbitState["overlay"] = null;
-	private readonly camDist2: number[] = [];
 
 	private loadToken = 0;
 	private disposed = false;
@@ -381,7 +280,6 @@ export class OrbitEngine {
 		this.controls.addEventListener("start", this.onControlsStart);
 		this.controls.addEventListener("end", this.onControlsEnd);
 
-		this.projMaterial = makeProjectionMaterial();
 		this.sphereAMat = makePanoMaterial();
 		this.sphereBMat = makePanoMaterial();
 		// Valid sampler before any pano texture loads (panos load lazily now).
@@ -398,15 +296,17 @@ export class OrbitEngine {
 		this.sphereB.visible = false;
 		this.scene.add(this.sphereA, this.sphereB);
 
-		this.scene.add(
-			this.hotspotGroup,
-			this.entryGroup,
-			this.anchorRingGroup,
-		);
-		this.you = makeYouMarker();
-		this.scene.add(this.you.group);
-
+		this.markers = new MarkerLayer(this.scene);
 		this.cursor = new SurfaceCursor(this.scene);
+		this.streamer = new PanoStreamer(
+			() => this.loadToken,
+			(i) => this.onPanoReady(i),
+		);
+		this.addressing = new ObjectAddressing(
+			this.scene,
+			this.camera,
+			this.canvas,
+		);
 
 		// Outline pipeline. The working buffer is sRGB + multisampled so the
 		// composite matches the direct-render look: the pano / projection shaders
@@ -418,10 +318,8 @@ export class OrbitEngine {
 		this.composer = new EffectComposer(this.renderer, composerRT);
 		this.composer.setPixelRatio(this.renderer.getPixelRatio());
 		this.composer.addPass(new RenderPass(this.scene, this.camera));
-		this.outlineSelect = this.makeOutlinePass(0xffa23a, 4, 2);
-		this.outlineHover = this.makeOutlinePass(0x66e0ff, 3, 1.5);
-		this.composer.addPass(this.outlineSelect);
-		this.composer.addPass(this.outlineHover);
+		this.composer.addPass(this.addressing.selectPass);
+		this.composer.addPass(this.addressing.hoverPass);
 		this.composer.addPass(new ShaderPass(CopyShader));
 
 		this.canvas.addEventListener("contextmenu", this.onContextMenu);
@@ -463,18 +361,19 @@ export class OrbitEngine {
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
 		this.clearScene();
 		this.cursor.dispose();
-		this.scene.remove(this.anchorRingGroup);
-		this.anchorRingGeo.dispose();
-		this.anchorRingMat.dispose();
-		this.anchorRingOccludedMat.dispose();
-		this.anchorRingHoverMat.dispose();
-		this.anchorRingOccludedHoverMat.dispose();
+		this.markers.dispose();
 		for (const pass of this.composer.passes) pass.dispose();
 		this.composer.dispose();
 		this.renderer.dispose();
 		this.canvas.remove();
 		this.travelFade.remove();
 		this.destLabel.remove();
+	}
+
+	// The pano list is owned by the streamer; the engine reads positions / ids /
+	// textures straight off it.
+	private get panos(): PanoEntry[] {
+		return this.streamer.list;
 	}
 
 	// --- state emission (gated so chrome holds through camera flights) --------
@@ -498,19 +397,23 @@ export class OrbitEngine {
 			currentName: cur ? (cur.name ?? null) : null,
 			currentIndex: this.currentIndex,
 			hover,
-			objectHover: this.hoveredObj
-				? (this.hoveredObj.userData.objLabel as string)
-				: null,
+			objectHover: this.addressing.hoverLabel,
 			proxyView: this.proxyView,
 			canProxyView: this.canToggleProxyView(),
 			highlightEnabled: this.highlightEnabled,
 			canHighlight:
 				(this.mode === "overview" || this.mode === "interior") &&
 				!!this.activeObjectRoot(),
-			contextMenu: this.contextMenu,
+			contextMenu: this.addressing.menu,
 			busy: this.interiorBusy,
 			overlay: this.overlay,
-			minimap: this.buildMinimapState(),
+			minimap: buildMinimapState({
+				minimaps: this.minimaps,
+				panos: this.panos,
+				panoLevel: this.panoLevel,
+				currentIndex: this.currentIndex,
+				mode: this.mode,
+			}),
 		};
 		this.onState(state);
 	}
@@ -522,67 +425,6 @@ export class OrbitEngine {
 	private hideOverlay() {
 		this.overlay = null;
 		this.emit();
-	}
-
-	// --- minimap (bird's-eye slice for the current level) ---------------------
-
-	// Nearest slice to a capture height. Levels are Y-separated, so argmin-|Δy|
-	// reproduces the grouping the capturer used.
-	private levelForY(y: number): number {
-		let best = -1;
-		let bestD = Infinity;
-		for (let i = 0; i < this.minimaps.length; i++) {
-			const d = Math.abs(this.minimaps[i].y - y);
-			if (d < bestD) {
-				bestD = d;
-				best = i;
-			}
-		}
-		return best;
-	}
-
-	// The minimap for whatever level the user is on right now — the matching
-	// slice plus every same-level anchor placed onto it. Only while walking the
-	// interior (or peeking); the overview already shows the whole dollhouse.
-	private buildMinimapState(): OrbitState["minimap"] {
-		if (this.minimaps.length === 0 || this.currentIndex < 0) return null;
-		if (this.mode !== "interior" && this.mode !== "peek") return null;
-		const currentLevel = this.panoLevel[this.currentIndex];
-		if (currentLevel < 0) return null;
-		const pct = (n: number) => Math.max(0, Math.min(100, n * 100));
-		// Surface every floor's slice + its anchors so the chrome can browse other
-		// levels without moving the camera; the live capture lights up on its level.
-		const levels = this.minimaps.map((mm, idx) => {
-			const w = mm.bounds.maxX - mm.bounds.minX;
-			const d = mm.bounds.maxZ - mm.bounds.minZ;
-			const points: {
-				index: number;
-				id: string;
-				name?: string;
-				leftPct: number;
-				topPct: number;
-				current: boolean;
-			}[] = [];
-			for (let i = 0; i < this.panos.length; i++) {
-				if (this.panoLevel[i] !== idx) continue;
-				const p = this.panos[i].position;
-				points.push({
-					index: i,
-					id: this.panos[i].id,
-					name: this.panos[i].name,
-					leftPct: w > 0 ? pct((p[0] - mm.bounds.minX) / w) : 50,
-					topPct: d > 0 ? pct((p[2] - mm.bounds.minZ) / d) : 50,
-					current: i === this.currentIndex,
-				});
-			}
-			return {
-				level: idx,
-				url: mm.url,
-				aspect: d > 0 ? w / d : 1,
-				points,
-			};
-		});
-		return { currentLevel, levels };
 	}
 
 	// --- travel mask: blur the canvas + dip to bg, peaking mid-move -----------
@@ -621,7 +463,12 @@ export class OrbitEngine {
 			Math.hypot(ev.clientX - this.rcDownX, ev.clientY - this.rcDownY) > 6
 		)
 			return;
-		this.openObjectMenu(ev.clientX, ev.clientY);
+		this.addressing.openMenu(
+			ev.clientX,
+			ev.clientY,
+			this.activeObjectRoot(),
+		);
+		this.emit();
 	};
 
 	private onControlsStart = () => {
@@ -647,7 +494,15 @@ export class OrbitEngine {
 		this.dragMoved = 0;
 		this.downX = ev.clientX;
 		this.downY = ev.clientY;
-		this.grabDir.copy(this.cursorRayDir(ev.clientX, ev.clientY));
+		this.grabDir.copy(
+			cursorRayDir(
+				this.camera,
+				this.canvas,
+				this.cursorRay,
+				ev.clientX,
+				ev.clientY,
+			),
+		);
 		this.canvas.style.cursor = "grabbing";
 		this.canvas.setPointerCapture(ev.pointerId);
 	};
@@ -663,7 +518,7 @@ export class OrbitEngine {
 			const spot = pickByScreen(
 				ev.clientX,
 				ev.clientY,
-				this.entryGroup,
+				this.markers.entryGroup,
 				ENTRY_AIM_PX,
 				this.camera,
 				this.canvas,
@@ -673,10 +528,14 @@ export class OrbitEngine {
 			// cursor no longer suppresses it, so the object beneath still highlights
 			// (when the toggle is on).
 			const obj = this.highlightEnabled
-				? this.pickObjectAt(ev.clientX, ev.clientY)
+				? this.addressing.pickAt(
+						ev.clientX,
+						ev.clientY,
+						this.activeObjectRoot(),
+					)
 				: null;
 			this.canvas.style.cursor = entryIdx >= 0 || obj ? "pointer" : "";
-			const hoverChanged = this.setObjectHover(obj);
+			const hoverChanged = this.addressing.setHover(obj);
 			const entryChanged = entryIdx !== this.hoveredEntryIndex;
 			this.hoveredEntryIndex = entryIdx;
 			if (entryChanged || hoverChanged) this.emit();
@@ -684,7 +543,15 @@ export class OrbitEngine {
 		}
 		if (this.mode !== "interior") return;
 		if (this.dragging) {
-			this.pinLook(ev.clientX, ev.clientY);
+			const look = pinLook(
+				this.camera,
+				this.canvas,
+				ev.clientX,
+				ev.clientY,
+				this.grabDir,
+			);
+			this.lon = look.lon;
+			this.lat = look.lat;
 			this.dragMoved = Math.max(
 				this.dragMoved,
 				Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY),
@@ -703,7 +570,15 @@ export class OrbitEngine {
 		// white ring (both draw over / sit in the scene, so a screen-space pick is
 		// what matches what you see). Off the rings, fall back to auto-aim's
 		// nearest-anchor-to-the-clicked-surface pick.
-		const spot = this.pickAnchorMarker(ev.clientX, ev.clientY);
+		const spot = this.markers.pickAnchorMarker(
+			ev.clientX,
+			ev.clientY,
+			this.camera,
+			this.canvas,
+			this.panos,
+			this.currentIndex,
+			this.proxyGroup,
+		);
 		if (spot) this.travelTo(spot.userData.targetIndex as number);
 		else this.autoAimTravel(ev.clientX, ev.clientY);
 	};
@@ -724,7 +599,7 @@ export class OrbitEngine {
 		const spot = pickByScreen(
 			ev.clientX,
 			ev.clientY,
-			this.entryGroup,
+			this.markers.entryGroup,
 			ENTRY_AIM_PX,
 			this.camera,
 			this.canvas,
@@ -779,71 +654,31 @@ export class OrbitEngine {
 	// so it reads as picking the object straight out of the projected 360 image.
 	private updateHover(ev: PointerEvent) {
 		if (this.currentIndex < 0) return;
-		const spot = this.pickAnchorMarker(ev.clientX, ev.clientY);
-		this.setRingHover(spot as Mesh | null);
+		const spot = this.markers.pickAnchorMarker(
+			ev.clientX,
+			ev.clientY,
+			this.camera,
+			this.canvas,
+			this.panos,
+			this.currentIndex,
+			this.proxyGroup,
+		);
+		this.markers.setRingHover(spot as Mesh | null);
 		const idx = spot ? (spot.userData.targetIndex as number) : -1;
 		const occ = spot ? !!spot.userData.occluded : false;
 		const obj = this.highlightEnabled
-			? this.pickObjectAt(ev.clientX, ev.clientY)
+			? this.addressing.pickAt(
+					ev.clientX,
+					ev.clientY,
+					this.activeObjectRoot(),
+				)
 			: null;
 		this.canvas.style.cursor = idx >= 0 || obj ? "pointer" : "";
 		const hotspotChanged =
 			idx !== this.hoveredTargetIndex || occ !== this.hoveredOccluded;
 		this.hoveredTargetIndex = idx;
 		this.hoveredOccluded = occ;
-		if (this.setObjectHover(obj) || hotspotChanged) this.emit();
-	}
-
-	// Nearest clickable anchor marker under the cursor (screen-space magnetism): a
-	// gold obstructed marker (drawn over everything, always reachable), else a white
-	// ring that scene geometry isn't hiding — an occluded white ring is invisible,
-	// so clicking the wall in front of it must NOT teleport through. Returns the
-	// marker (read userData.targetIndex / .occluded) or null. Shared by hover +
-	// click, so what lights up is exactly what a click travels to.
-	private pickAnchorMarker(
-		clientX: number,
-		clientY: number,
-	): Object3D | null {
-		const occluded = pickByScreen(
-			clientX,
-			clientY,
-			this.hotspotGroup,
-			AUTO_AIM_PX,
-			this.camera,
-			this.canvas,
-		);
-		if (occluded) return occluded;
-		const ring = pickByScreen(
-			clientX,
-			clientY,
-			this.anchorRingGroup,
-			AUTO_AIM_PX,
-			this.camera,
-			this.canvas,
-		);
-		if (!ring) return null;
-		const i = ring.userData.targetIndex as number;
-		if (i === this.currentIndex) return null;
-		const cur = this.panos[this.currentIndex].position;
-		return this.anchorOccluded(cur, this.panos[i].position) ? null : ring;
-	}
-
-	// Light the one ring the cursor is over to full opacity, reverting the one it
-	// left. Rings share faint base materials, so we swap just this mesh's material
-	// to its bolder twin (same color + depthTest, opacity 1).
-	private setRingHover(mesh: Mesh | null) {
-		if (mesh === this.hoveredRing) return;
-		if (this.hoveredRing) {
-			this.hoveredRing.material = this.hoveredRing.userData.occluded
-				? this.anchorRingOccludedMat
-				: this.anchorRingMat;
-		}
-		this.hoveredRing = mesh;
-		if (mesh) {
-			mesh.material = mesh.userData.occluded
-				? this.anchorRingOccludedHoverMat
-				: this.anchorRingHoverMat;
-		}
+		if (this.addressing.setHover(obj) || hotspotChanged) this.emit();
 	}
 
 	// Interior geometry under a screen point: the projection proxy plus its floor
@@ -857,7 +692,8 @@ export class OrbitEngine {
 		const targets: Object3D[] = [];
 		if (this.projectionMode) {
 			if (this.proxyGroup) targets.push(this.proxyGroup);
-			if (this.proxyBase) targets.push(this.proxyBase);
+			if (this.projection.proxyBase)
+				targets.push(this.projection.proxyBase);
 		} else {
 			this.sphereA.updateMatrixWorld();
 			targets.push(this.sphereA);
@@ -897,7 +733,7 @@ export class OrbitEngine {
 			this.mode === "interior" &&
 			!this.interiorBusy &&
 			this.pointerInside &&
-			!this.hoveredRing;
+			!this.markers.hoveredRing;
 		const hit = active
 			? this.raycastInterior(this.pointerClientX, this.pointerClientY)
 			: null;
@@ -909,7 +745,7 @@ export class OrbitEngine {
 	// the tag there. Only gold rings get it — the room they lead to is hidden, so
 	// naming it helps. Hidden otherwise.
 	private positionDestLabel() {
-		const ring = this.hoveredRing;
+		const ring = this.markers.hoveredRing;
 		if (this.mode !== "interior" || !ring || !ring.userData.occluded) {
 			this.destLabel.style.display = "none";
 			return;
@@ -949,7 +785,7 @@ export class OrbitEngine {
 		// it blends into the floor instead of showing through as a flat fill), and
 		// it goes matte in proxy view. It's a neutral backing slab (not an
 		// addressable object), so it keeps the shared material, not a per-object color.
-		if (this.proxyBase) this.proxyBase.material = mat;
+		this.projection.setBaseMaterial(mat);
 	}
 
 	// Give each proxy object its own matte color so the bare proxy reads as
@@ -959,7 +795,7 @@ export class OrbitEngine {
 	// disposes the clones.
 	private colorProxyObjects() {
 		if (!this.proxyGroup) return;
-		this.collectObjects(this.proxyGroup).forEach((obj, i) => {
+		collectObjects(this.proxyGroup).forEach((obj, i) => {
 			const mat = this.polyMaterial.clone();
 			mat.color.setHSL((i * 0.6180339887) % 1, 0.6, 0.55, SRGBColorSpace);
 			this.proxyColorMats.push(mat);
@@ -988,11 +824,11 @@ export class OrbitEngine {
 		}
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
-		this.hotspotGroup.visible = false;
-		this.entryGroup.visible = true;
-		this.anchorRingGroup.visible = false;
-		this.you.group.visible = false;
-		this.syncProxyBase();
+		this.markers.hotspotGroup.visible = false;
+		this.markers.entryGroup.visible = true;
+		this.markers.anchorRingGroup.visible = false;
+		this.markers.you.group.visible = false;
+		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
 
 	// Swap the interior proxy in place between the bare low-poly mesh (proxy view:
@@ -1002,7 +838,7 @@ export class OrbitEngine {
 	private setInteriorProxyView() {
 		if (!this.proxyGroup || !this.projectionMode) return;
 		this.reskinProxy(
-			this.proxyView ? this.polyMaterial : this.projMaterial,
+			this.proxyView ? this.polyMaterial : this.projection.material,
 		);
 		this.sphereA.visible = !this.proxyView;
 		// Refresh the projection uniforms after a proxy-view spell (updateProjection
@@ -1018,11 +854,11 @@ export class OrbitEngine {
 		} else {
 			this.sphereA.visible = true; // sphere-only tour: the pano sphere IS the view
 		}
-		this.hotspotGroup.visible = true;
-		this.entryGroup.visible = false;
-		this.anchorRingGroup.visible = true;
-		this.you.group.visible = false;
-		this.syncProxyBase();
+		this.markers.hotspotGroup.visible = true;
+		this.markers.entryGroup.visible = false;
+		this.markers.anchorRingGroup.visible = true;
+		this.markers.you.group.visible = false;
+		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
 
 	private setPeekView() {
@@ -1038,11 +874,11 @@ export class OrbitEngine {
 		}
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
-		this.hotspotGroup.visible = false;
-		this.entryGroup.visible = false;
-		this.anchorRingGroup.visible = false;
-		this.you.group.visible = true;
-		this.syncProxyBase();
+		this.markers.hotspotGroup.visible = false;
+		this.markers.entryGroup.visible = false;
+		this.markers.anchorRingGroup.visible = false;
+		this.markers.you.group.visible = true;
+		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
 
 	// Where the bare-proxy / textured swap is offered: the overview needs a lite
@@ -1060,9 +896,8 @@ export class OrbitEngine {
 	toggleProxyView() {
 		if (!this.canToggleProxyView()) return;
 		this.proxyView = !this.proxyView;
-		this.setObjectHover(null);
-		this.contextMenu = null;
-		this.menuTarget = null;
+		this.addressing.setHover(null);
+		this.addressing.closeMenu();
 		this.canvas.style.cursor = "";
 		if (this.mode === "overview") this.setOverviewView();
 		else if (this.mode === "interior") this.setInteriorProxyView();
@@ -1074,109 +909,17 @@ export class OrbitEngine {
 	// re-picks when turned back on.
 	toggleHighlight() {
 		this.highlightEnabled = !this.highlightEnabled;
-		if (!this.highlightEnabled) this.setObjectHover(null);
+		if (!this.highlightEnabled) this.addressing.setHover(null);
 		this.canvas.style.cursor = "";
 		this.emit();
 	}
 
 	// --- per-object addressing (pick / hide / outline) ------------------------
 
-	// The addressable objects of a loaded root. The exporter/loader can wrap the
-	// real objects under a single node, so unwrap single unnamed non-mesh wrappers,
-	// then take that container's mesh-bearing children. Fall back to "every mesh"
-	// when the structure is flat or collapses to one node.
-	private collectObjects(root: Object3D): Object3D[] {
-		let container = root;
-		while (
-			container.children.length === 1 &&
-			!(container.children[0] as Mesh).isMesh &&
-			!container.children[0].name &&
-			container.children[0].children.length > 0
-		) {
-			container = container.children[0];
-		}
-		const hasMesh = (o: Object3D) => {
-			let found = false;
-			o.traverse((c) => {
-				if ((c as Mesh).isMesh) found = true;
-			});
-			return found;
-		};
-		let objs = container.children.filter(hasMesh);
-		if (objs.length <= 1) {
-			objs = [];
-			root.traverse((o) => {
-				if ((o as Mesh).isMesh) objs.push(o);
-			});
-		}
-		return objs;
-	}
-
-	private registerObjects(root: Object3D) {
-		this.collectObjects(root).forEach((o, i) => {
-			o.userData.objId = i;
-			o.userData.objLabel =
-				o.name && o.name.trim() ? o.name.trim() : `object ${i + 1}`;
-		});
-	}
-
-	// Build an OutlinePass tuned to a colour. hiddenEdgeColor is black so the
-	// occluded part of a silhouette adds nothing (the overlay blends additively) —
-	// the outline shows only where the object is actually visible, reading as an
-	// in-place highlight rather than an x-ray.
-	private makeOutlinePass(
-		color: number,
-		edgeStrength: number,
-		edgeThickness: number,
-	): OutlinePass {
-		const pass = new OutlinePass(
-			new Vector2(1, 1),
-			this.scene,
-			this.camera,
-		);
-		pass.visibleEdgeColor.set(color);
-		pass.hiddenEdgeColor.set(0x000000);
-		pass.edgeStrength = edgeStrength;
-		pass.edgeThickness = edgeThickness;
-		return pass;
-	}
-
-	// Feed the live hover / selection sets to the two outline passes (run every
-	// frame from tick). Selection (orange) wins over hover (cyan) for an object
-	// that's both, and hidden objects are dropped; an empty list is a no-op pass.
-	private updateOutlineSelection() {
-		const selected: Object3D[] = [];
-		for (const o of this.outlinedObjects) if (o.visible) selected.push(o);
-		this.outlineSelect.selectedObjects = selected;
-		const h = this.hoveredObj;
-		this.outlineHover.selectedObjects =
-			h && h.visible && !this.outlinedObjects.has(h) ? [h] : [];
-	}
-
-	private setObjectHover(obj: Object3D | null): boolean {
-		if (obj === this.hoveredObj) return false;
-		this.hoveredObj = obj;
-		return true;
-	}
-
-	private setObjectHidden(obj: Object3D, hidden: boolean) {
-		obj.visible = !hidden;
-		if (hidden) {
-			this.hiddenObjects.add(obj);
-			if (obj === this.hoveredObj) this.hoveredObj = null; // can't hover what's gone
-		} else {
-			this.hiddenObjects.delete(obj);
-		}
-	}
-
-	private toggleObjectOutline(obj: Object3D) {
-		if (this.outlinedObjects.has(obj)) this.outlinedObjects.delete(obj);
-		else this.outlinedObjects.add(obj);
-	}
-
 	// Which loaded root the cursor addresses right now: the dollhouse in overview /
 	// peek (lite, or the proxy when "proxy view" is on or there's no lite), and the
-	// projected proxy in the interior (hover-highlight — see updateHover).
+	// projected proxy in the interior (hover-highlight — see updateHover). The
+	// hover / hide / outline mechanics live in ObjectAddressing.
 	private activeObjectRoot(): Object3D | null {
 		if (this.mode === "overview" || this.mode === "peek") {
 			if (this.proxyView && this.proxyGroup) return this.proxyGroup;
@@ -1186,372 +929,46 @@ export class OrbitEngine {
 		return null;
 	}
 
-	private findObjectRoot(node: Object3D, root: Object3D): Object3D | null {
-		let cur: Object3D | null = node;
-		while (cur && cur !== root) {
-			if (cur.userData.objId !== undefined) return cur;
-			cur = cur.parent;
-		}
-		return null;
-	}
-
-	private pickObjectAt(clientX: number, clientY: number): Object3D | null {
-		const root = this.activeObjectRoot();
-		if (!root || !root.visible) return null;
-		const rect = this.canvas.getBoundingClientRect();
-		_ndc.set(
-			((clientX - rect.left) / rect.width) * 2 - 1,
-			-((clientY - rect.top) / rect.height) * 2 + 1,
-		);
-		this.picker.setFromCamera(_ndc, this.camera);
-		// Raycaster doesn't skip invisible objects, so skip hidden ones explicitly —
-		// otherwise a hidden object would still shadow the geometry behind it.
-		for (const h of this.picker.intersectObject(root, true)) {
-			const obj = this.findObjectRoot(h.object, root);
-			if (obj && obj.visible) return obj;
-		}
-		return null;
-	}
-
-	// --- right-click object menu ----------------------------------------------
-
-	private openObjectMenu(clientX: number, clientY: number) {
-		const obj = this.pickObjectAt(clientX, clientY);
-		// Right-clicking empty space still surfaces the recovery actions (you can't
-		// re-pick an object once it's hidden), but only if there's something to recover.
-		if (
-			!obj &&
-			this.hiddenObjects.size === 0 &&
-			this.outlinedObjects.size === 0
-		) {
-			this.closeMenu();
-			return;
-		}
-		this.menuTarget = obj;
-		this.contextMenu = {
-			x: clientX,
-			y: clientY,
-			label: obj ? (obj.userData.objLabel as string) : null,
-			hidden: !!obj && this.hiddenObjects.has(obj),
-			outlined: !!obj && this.outlinedObjects.has(obj),
-			hiddenCount: this.hiddenObjects.size,
-			outlinedCount: this.outlinedObjects.size,
-		};
-		this.emit();
-	}
+	// --- right-click object menu (delegated to ObjectAddressing) --------------
 
 	closeMenu() {
-		if (!this.contextMenu) return;
-		this.contextMenu = null;
-		this.menuTarget = null;
+		if (!this.addressing.hasMenu) return;
+		this.addressing.closeMenu();
 		this.emit();
 	}
 
 	toggleMenuTargetHidden() {
-		const obj = this.menuTarget;
-		if (obj) this.setObjectHidden(obj, !this.hiddenObjects.has(obj));
-		this.closeMenu();
+		this.addressing.toggleMenuTargetHidden();
+		this.emit();
 	}
 
 	toggleMenuTargetOutline() {
-		const obj = this.menuTarget;
-		if (obj) this.toggleObjectOutline(obj);
-		this.closeMenu();
+		this.addressing.toggleMenuTargetOutline();
+		this.emit();
 	}
 
 	showAllHidden() {
-		for (const o of this.hiddenObjects) o.visible = true;
-		this.hiddenObjects.clear();
-		this.closeMenu();
+		this.addressing.showAllHidden();
+		this.emit();
 	}
 
 	clearOutlines() {
-		this.outlinedObjects.clear();
-		this.closeMenu();
+		this.addressing.clearOutlines();
+		this.emit();
 	}
 
-	// --- markers --------------------------------------------------------------
+	// --- projection (view-dependent texture mapping) -------------------------
 
-	// Is the straight line between two capture points blocked by the proxy? Our
-	// "behind a wall/floor" test, trimmed at both ends so a hugged wall doesn't read
-	// as occlusion.
-	private anchorOccluded(
-		fromPos: [number, number, number],
-		toPos: [number, number, number],
-	): boolean {
-		if (!this.proxyGroup) return false;
-		const from = v3(fromPos);
-		const d = v3(toPos).sub(from);
-		const dist = d.length();
-		if (dist < 1e-3) return false;
-		d.divideScalar(dist);
-		this.occluder.set(from, d);
-		this.occluder.near = HOTSPOT_OCCLUDE_EPS;
-		this.occluder.far = dist - HOTSPOT_OCCLUDE_EPS;
-		if (this.occluder.far <= this.occluder.near) return false;
-		return this.occluder.intersectObject(this.proxyGroup, true).length > 0;
-	}
-
-	private neighborsByDistance(): number[] {
-		const cur = v3(this.panos[this.currentIndex].position);
-		const out: Array<[number, number]> = [];
-		for (let i = 0; i < this.panos.length; i++) {
-			if (i === this.currentIndex) continue;
-			const d2 = cur.distanceToSquared(v3(this.panos[i].position));
-			if (this.projectionMode && d2 > HOTSPOT_REACH * HOTSPOT_REACH)
-				continue;
-			out.push([i, d2]);
-		}
-		out.sort((a, b) => a[1] - b[1]);
-		return out.map((o) => o[0]);
-	}
-
-	// The X closest obstructed (behind-wall) anchors. Same ring as the white anchor
-	// rings but warm gold, larger, and drawn over everything (depthTest off via
-	// anchorRingOccludedMat) so they read as reachable through walls. Every anchor
-	// also has a depth-tested white ring (buildAnchorRings); this layers the
-	// see-through gold ring onto the nearest few that geometry hides. Rebuilt on
-	// travel (occlusion is per position).
-	private rebuildHotspots() {
-		this.hotspotGroup.clear();
-		if (this.currentIndex < 0) return;
-		const cur = this.panos[this.currentIndex];
-		let nOccluded = 0;
-		for (const i of this.neighborsByDistance()) {
-			if (!this.anchorOccluded(cur.position, this.panos[i].position))
-				continue;
-			const ring = new Mesh(
-				this.anchorRingGeo,
-				this.anchorRingOccludedMat,
-			);
-			ring.rotation.x = -Math.PI / 2;
-			ring.scale.setScalar(ANCHOR_RING_OCCLUDED_SCALE);
-			ring.position.fromArray(this.panos[i].position);
-			ring.position.y -= HOTSPOT_FLOOR_DROP;
-			ring.userData.targetIndex = i;
-			ring.userData.occluded = true;
-			this.hotspotGroup.add(ring);
-			if (++nOccluded >= HOTSPOT_MAX_OCCLUDED) break;
-		}
-	}
-
-	// One white ring per anchor, laid flat on the floor — built once per scene
-	// (every anchor, always present). Shares anchorRingGeo/anchorRingMat so it's
-	// depth-tested (geometry obstructs it) and world-fixed-size; never touched by
-	// tick()'s screen-scaling, so it shrinks far / grows near like a real object.
-	private buildAnchorRings() {
-		this.anchorRingGroup.clear();
-		for (let i = 0; i < this.panos.length; i++) {
-			const ring = new Mesh(this.anchorRingGeo, this.anchorRingMat);
-			ring.rotation.x = -Math.PI / 2;
-			ring.position.fromArray(this.panos[i].position);
-			ring.position.y -= HOTSPOT_FLOOR_DROP;
-			ring.userData.targetIndex = i;
-			ring.userData.occluded = false;
-			this.anchorRingGroup.add(ring);
-		}
-	}
-
-	private buildEntryMarkers() {
-		this.entryGroup.clear();
-		for (let i = 0; i < this.panos.length; i++) {
-			const spot = makeDisc(i, 0x9ad4ff, 0x4a8fd8);
-			spot.position.fromArray(this.panos[i].position);
-			spot.position.y -= HOTSPOT_FLOOR_DROP;
-			this.entryGroup.add(spot);
-		}
-	}
-
-	private sizeYouMarker() {
-		const r = Math.max(0.05, this.sceneMaxDim * 0.014);
-		this.you.sphere.geometry.dispose();
-		this.you.sphere.geometry = new SphereGeometry(r, 24, 16);
-		this.you.ring.geometry.dispose();
-		this.you.ring.geometry = new RingGeometry(r * 1.6, r * 2.2, 40);
-	}
-
-	// Floor directly beneath the user (panos sit at eye height), not the global
-	// scene minimum — so the base lands on the level you're standing on.
-	private positionYouMarker(p: Vector3) {
-		const floorY = p.y - CAPTURE_EYE_HEIGHT;
-		this.you.sphere.position.copy(p);
-		this.you.ring.position.set(p.x, floorY, p.z);
-		this.you.line.geometry.setFromPoints([
-			new Vector3(p.x, floorY, p.z),
-			p.clone(),
-		]);
-	}
-
-	// --- projection (view-dependent texture mapping, per frame) ---------------
-
+	// Per-frame VDTM blend, delegated to Projection (which owns the shader and the
+	// backdrop sphere sizing). Skipped while proxy view shows the bare geometry.
 	private updateProjection() {
-		if (this.panos.length === 0) return;
-		const u = this.projMaterial.uniforms;
-		const cam = this.camera.position;
-		this.camDist2.length = this.panos.length;
-		for (let i = 0; i < this.panos.length; i++) {
-			const p = this.panos[i].position;
-			const dx = cam.x - p[0];
-			const dy = cam.y - p[1];
-			const dz = cam.z - p[2];
-			this.camDist2[i] = dx * dx + dy * dy + dz * dz;
-		}
-		const order = this.panos
-			.map((_, i) => i)
-			.sort((a, b) => this.camDist2[a] - this.camDist2[b]);
-		const K = Math.min(PROJ_K, this.panos.length);
-		// Load on movement: kick off the K nearest captures, but project only the
-		// ones already loaded (blurred placeholder counts) so we never block.
-		const ready: number[] = [];
-		for (let k = 0; k < K; k++) {
-			this.requestPano(order[k]);
-			if (this.panos[order[k]].texture) ready.push(order[k]);
-		}
-		let wsum = 0;
-		const w: number[] = [];
-		for (let k = 0; k < ready.length; k++) {
-			const ww = 1 / (this.camDist2[ready[k]] + 0.25);
-			w.push(ww);
-			wsum += ww;
-		}
-		for (let k = 0; k < PROJ_K; k++) {
-			if (k < ready.length) {
-				const idx = ready[k];
-				u.uTex.value[k] = this.panos[idx].texture;
-				(u.uCenter.value[k] as Vector3).fromArray(
-					this.panos[idx].position,
-				);
-				u.uWeight.value[k] = w[k] / wsum;
-			} else {
-				u.uTex.value[k] = DUMMY_TEX;
-				u.uWeight.value[k] = 0;
-			}
-		}
-		u.uCount.value = ready.length;
-		this.sphereAMat.uniforms.map.value = ready.length
-			? this.panos[ready[0]].texture
-			: DUMMY_TEX;
-		this.sphereA.position.copy(cam);
-	}
-
-	// Re-skin proxy meshes with the projection shader, recompute normals (the
-	// decimation dropped usable ones), and size the backdrop to the scene extent.
-	private setupProjection(root: Group) {
-		root.traverse((o) => {
-			const m = o as Mesh;
-			if (!m.isMesh || !m.geometry) return;
-			m.geometry.computeVertexNormals();
-			m.material = this.projMaterial;
-			m.frustumCulled = false;
-		});
-		const box = new Box3().setFromObject(root);
-		const sph = box.getBoundingSphere(new Sphere());
-		this.backdropRadius = Math.max(80, sph.radius * 4);
-		this.sphereA.scale.setScalar(this.backdropRadius / SPHERE_RADIUS);
-		this.sphereA.renderOrder = -1;
-		this.sphereAMat.uniforms.opacity.value = 1;
-		this.sphereAMat.depthTest = true; // let the opaque proxy occlude the backdrop
-	}
-
-	// A floor slab spanning the proxy's footprint, sat just under its lowest point,
-	// backing "proxy leaks" (gaps in the proxy floor). It shares the proxy's
-	// material (see reskinProxy), so the panos project onto it just like the floor:
-	// at a capture point the projection equals the backdrop image, so the slab is
-	// invisible, and it picks up the live projected floor as you move — rather than
-	// showing through holes as a flat fill. Kept out of proxyGroup so it isn't
-	// registered/picked as an addressable object; visibility is synced to the proxy.
-	private buildProxyBase() {
-		if (!this.proxyGroup) return;
-		const box = new Box3().setFromObject(this.proxyGroup, true);
-		if (box.isEmpty()) return;
-		const size = box.getSize(new Vector3());
-		const center = box.getCenter(new Vector3());
-		const base = new Mesh(
-			new PlaneGeometry(size.x, size.z),
-			this.projMaterial,
+		this.projection.update(
+			this.camera,
+			this.panos,
+			this.requestPano,
+			this.sphereA,
+			this.sphereAMat,
 		);
-		base.rotation.x = -Math.PI / 2; // lie flat, normal up
-		// A hair below the lowest vertex so it never z-fights a coincident floor.
-		base.position.set(
-			center.x,
-			box.min.y - Math.max(0.01, size.y * 0.002),
-			center.z,
-		);
-		base.frustumCulled = false;
-		base.visible = false;
-		this.scene.add(base);
-		this.proxyBase = base;
-	}
-
-	// The base belongs to the proxy, so it shows exactly when the proxy does.
-	private syncProxyBase() {
-		if (this.proxyBase) this.proxyBase.visible = !!this.proxyGroup?.visible;
-	}
-
-	// --- look controls (interior: lon/lat drag) -------------------------------
-
-	private setLookFromForward(f: [number, number, number]) {
-		const v = v3(f).normalize();
-		this.lon = Math.atan2(v.z, v.x);
-		this.lat = Math.asin(MathUtils.clamp(v.y, -1, 1));
-	}
-	private lookTargetFrom(pos: Vector3, lo: number, la: number): Vector3 {
-		return pos
-			.clone()
-			.add(
-				new Vector3(
-					Math.cos(la) * Math.cos(lo),
-					Math.sin(la),
-					Math.cos(la) * Math.sin(lo),
-				),
-			);
-	}
-	private applyLook() {
-		this.lat = MathUtils.clamp(this.lat, -1.55, 1.55);
-		this.camera.lookAt(
-			this.lookTargetFrom(this.camera.position, this.lon, this.lat),
-		);
-	}
-
-	// World-space ray direction through a screen pixel (normalized).
-	private cursorRayDir(clientX: number, clientY: number): Vector3 {
-		const rect = this.canvas.getBoundingClientRect();
-		_ndc.set(
-			((clientX - rect.left) / rect.width) * 2 - 1,
-			-((clientY - rect.top) / rect.height) * 2 + 1,
-		);
-		this.camera.updateMatrixWorld();
-		this.cursorRay.setFromCamera(_ndc, this.camera);
-		return this.cursorRay.ray.direction;
-	}
-
-	// Turn the look so the grabbed world direction reprojects onto the current
-	// cursor pixel — the point stays welded under the cursor as you drag. The eye
-	// is fixed during a look-drag, so this is the exact inverse of the perspective
-	// projection for the yaw/pitch rig: the pixel becomes a camera-space unit ray
-	// (cX right, cY up, cF forward), then lon/lat are the angles that map grabDir
-	// onto it. {forward, right, up} is orthonormal, so cF = 1/‖ray‖ falls straight
-	// out; lon comes from grabDir's azimuth offset by the ray's horizontal angle,
-	// and lat rotates grabDir's (horizontal, vertical) parts onto (cF, cY). The old
-	// mapping turned a constant radians-per-pixel — blind to viewport height and the
-	// projection's curvature — so the grab drifted off the cursor.
-	private pinLook(clientX: number, clientY: number) {
-		const rect = this.canvas.getBoundingClientRect();
-		const nx = ((clientX - rect.left) / rect.width) * 2 - 1;
-		const ny = -((clientY - rect.top) / rect.height) * 2 + 1;
-		const t = Math.tan((this.camera.fov * Math.PI) / 360);
-		const gx = nx * this.camera.aspect * t;
-		const gy = ny * t;
-		const invL = 1 / Math.hypot(gx, gy, 1);
-		const cX = gx * invL;
-		const cY = gy * invL;
-		const cF = invL;
-		const d = this.grabDir;
-		const rh = Math.hypot(d.x, d.z);
-		this.lon =
-			Math.atan2(d.z, d.x) - Math.asin(MathUtils.clamp(cX / rh, -1, 1));
-		const h = Math.sqrt(Math.max(0, rh * rh - cX * cX));
-		this.lat = Math.atan2(cF * d.y - h * cY, cF * h + d.y * cY);
 	}
 
 	// --- camera flight (mode changes: slerp orientation + lerp position) ------
@@ -1584,10 +1001,9 @@ export class OrbitEngine {
 		this.controls.autoRotate = false;
 		this.hoveredEntryIndex = -1;
 		this.hoveredTargetIndex = -1;
-		this.setRingHover(null);
-		this.setObjectHover(null);
-		this.contextMenu = null;
-		this.menuTarget = null;
+		this.markers.setRingHover(null);
+		this.addressing.setHover(null);
+		this.addressing.closeMenu();
 		this.canvas.style.cursor = "";
 		this.emit(); // gated: holds the chrome while mode === "transition"
 	}
@@ -1602,9 +1018,9 @@ export class OrbitEngine {
 		)
 			return;
 		this.hoveredTargetIndex = -1;
-		this.setRingHover(null);
+		this.markers.setRingHover(null);
 		this.interiorBusy = true;
-		this.hotspotGroup.visible = false;
+		this.markers.hotspotGroup.visible = false;
 
 		if (this.projectionMode) {
 			// Glide through world space; the projection re-blends live (loading the
@@ -1623,7 +1039,7 @@ export class OrbitEngine {
 		// Sphere mode: wait for the target's texture (a placeholder is enough), then
 		// crossfade the backdrop to it while drifting the camera onto its position.
 		const token = this.loadToken;
-		void this.ensurePano(index).then(() => {
+		void this.streamer.ensure(index).then(() => {
 			if (this.disposed || token !== this.loadToken) return;
 			const target = this.panos[index];
 			this.sphereBMat.uniforms.map.value = target.texture ?? DUMMY_TEX;
@@ -1650,7 +1066,7 @@ export class OrbitEngine {
 				this.sphereB.visible = false;
 				this.clearTravelMask();
 				this.interiorBusy = false;
-				this.hotspotGroup.visible = true;
+				this.markers.hotspotGroup.visible = true;
 				this.activate(index);
 			};
 			requestAnimationFrame(step);
@@ -1665,75 +1081,22 @@ export class OrbitEngine {
 				this.panos[index].texture ?? DUMMY_TEX;
 			this.sphereAMat.uniforms.opacity.value = 1;
 		}
-		this.rebuildHotspots();
+		this.markers.rebuildHotspots(
+			this.panos,
+			this.currentIndex,
+			this.proxyGroup,
+			this.projectionMode,
+		);
 		this.emit();
 	}
 
-	// --- lazy pano textures (load on enter / on movement) ---------------------
-
-	// Fire-and-forget trigger (per-frame safe): start loading pano `i` if needed.
-	private requestPano(i: number) {
-		const p = this.panos[i];
-		if (!p || p.texture || p.requested) return;
-		this.startPanoLoad(i);
-	}
-
-	// Resolves once a texture (placeholder or full) is set — for paths that need
-	// something to show before animating (sphere-mode travel).
-	private ensurePano(i: number): Promise<void> {
-		const p = this.panos[i];
-		if (!p || p.texture) return Promise.resolve();
-		if (!p.ready) {
-			p.ready = new Promise<void>((res) => {
-				p.resolveReady = res;
-			});
-		}
-		const ready = p.ready;
-		this.requestPano(i);
-		return ready;
-	}
-
-	private startPanoLoad(i: number) {
-		const p = this.panos[i];
-		if (p.requested) return;
-		p.requested = true;
-		const token = this.loadToken;
-		// Low-res blurred preview first (streams in fast), then the full image
-		// sharpens in place — the panorama page's LQIP→full swap.
-		loadPanoTexture(p.placeholderUrl)
-			.then((tex) => {
-				if (this.disposed || token !== this.loadToken || p.hasFull) {
-					tex.dispose();
-					return;
-				}
-				p.placeholderTexture = tex;
-				if (!p.texture) {
-					p.texture = tex;
-					this.onPanoReady(i);
-				}
-			})
-			.catch(() => {});
-		loadPanoTexture(p.url)
-			.then((tex) => {
-				if (this.disposed || token !== this.loadToken) {
-					tex.dispose();
-					return;
-				}
-				p.hasFull = true;
-				p.texture = tex;
-				this.onPanoReady(i);
-			})
-			.catch(() => {});
-	}
-
+	// The streamer owns lazy LQIP→full loading; this fires when the current
+	// capture's texture lands so sphere mode can refresh its backdrop (projection
+	// mode re-reads textures every frame).
 	private onPanoReady(i: number) {
-		const p = this.panos[i];
-		p.resolveReady?.();
-		p.resolveReady = undefined;
-		// Sphere mode shows one pano on the backdrop; refresh it if this is the
-		// current capture. Projection mode re-reads textures every frame.
 		if (!this.projectionMode && i === this.currentIndex) {
-			this.sphereAMat.uniforms.map.value = p.texture ?? DUMMY_TEX;
+			this.sphereAMat.uniforms.map.value =
+				this.panos[i].texture ?? DUMMY_TEX;
 			this.sphereAMat.uniforms.opacity.value = 1;
 		}
 	}
@@ -1775,7 +1138,9 @@ export class OrbitEngine {
 			},
 			onEnd: () => {
 				this.mode = "interior";
-				this.setLookFromForward(fwd);
+				const look = forwardToLonLat(fwd);
+				this.lon = look.lon;
+				this.lat = look.lat;
 				this.activate(idx);
 				this.emit();
 			},
@@ -1850,7 +1215,7 @@ export class OrbitEngine {
 			fov: this.camera.fov,
 		};
 		const userPos = this.currentUserWorldPos();
-		this.positionYouMarker(userPos);
+		this.markers.positionYouMarker(userPos);
 		const flat = userPos.clone().sub(this.sceneCenter);
 		flat.y = 0;
 		if (flat.lengthSq() < 1e-6) flat.set(0, 0, 1);
@@ -1878,7 +1243,7 @@ export class OrbitEngine {
 		const s = this.savedInterior;
 		this.startFly(
 			s.pos.clone(),
-			this.lookTargetFrom(s.pos, s.lon, s.lat),
+			lookTargetFrom(s.pos, s.lon, s.lat),
 			800,
 			{
 				onMid: () => {
@@ -1924,7 +1289,7 @@ export class OrbitEngine {
 				// never dispose them here.
 				if (
 					mat &&
-					mat !== this.projMaterial &&
+					mat !== this.projection.material &&
 					mat !== this.polyMaterial
 				)
 					mat.dispose();
@@ -1948,27 +1313,15 @@ export class OrbitEngine {
 		// can't reach them), so drop them explicitly.
 		for (const m of this.proxyColorMats) m.dispose();
 		this.proxyColorMats = [];
-		if (this.proxyBase) {
-			this.scene.remove(this.proxyBase);
-			this.proxyBase.geometry.dispose(); // shares the proj/poly singletons — don't dispose them
-			this.proxyBase = null;
-		}
-		for (const p of this.panos) {
-			p.texture?.dispose();
-			if (p.placeholderTexture && p.placeholderTexture !== p.texture)
-				p.placeholderTexture.dispose();
-		}
-		this.panos = [];
+		this.projection.clearBase(this.scene);
+		this.streamer.reset();
 		this.minimaps = [];
 		this.panoLevel = [];
 		this.minimapPrefetch = [];
 		this.sphereAMat.uniforms.map.value = DUMMY_TEX;
 		this.sphereBMat.uniforms.map.value = DUMMY_TEX;
 		this.currentIndex = -1;
-		this.hotspotGroup.clear();
-		this.entryGroup.clear();
-		this.anchorRingGroup.clear();
-		this.you.group.visible = false;
+		this.markers.clear();
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
 		this.transition = null;
@@ -1978,14 +1331,9 @@ export class OrbitEngine {
 		this.savedInterior = null;
 		this.hoveredEntryIndex = -1;
 		this.hoveredTargetIndex = -1;
-		this.hoveredRing = null;
 		// Reset per-object addressing; the old nodes are disposed with the roots.
 		this.proxyView = false;
-		this.hiddenObjects.clear();
-		this.outlinedObjects.clear();
-		this.hoveredObj = null;
-		this.menuTarget = null;
-		this.contextMenu = null;
+		this.addressing.reset();
 		this.canvas.style.cursor = "";
 		this.clearTravelMask();
 	}
@@ -2085,8 +1433,10 @@ export class OrbitEngine {
 		proxyRoot: Group | null,
 		lite: Group | null,
 	) {
-		this.panos = entries;
-		this.panoLevel = entries.map((p) => this.levelForY(p.position[1]));
+		this.streamer.reset(entries);
+		this.panoLevel = entries.map((p) =>
+			levelForY(this.minimaps, p.position[1]),
+		);
 		this.projectionMode = !!proxyRoot;
 		this.sharedOverview = !lite && !!proxyRoot; // no lite: the proxy doubles as the dollhouse
 
@@ -2104,7 +1454,7 @@ export class OrbitEngine {
 			this.scene.add(lite);
 		}
 		if (proxyRoot) {
-			this.setupProjection(proxyRoot);
+			this.projection.setup(proxyRoot, this.sphereA, this.sphereAMat);
 			this.proxyGroup = proxyRoot;
 			this.scene.add(proxyRoot);
 		}
@@ -2112,14 +1462,13 @@ export class OrbitEngine {
 		// Tag each placed object in both roots so they can be hovered / hidden /
 		// outlined individually (independently per scene — lite and proxy nodes
 		// don't share identity).
-		if (this.liteRoot) this.registerObjects(this.liteRoot);
+		if (this.liteRoot) this.addressing.register(this.liteRoot);
 		if (this.proxyGroup) {
-			this.registerObjects(this.proxyGroup);
+			this.addressing.register(this.proxyGroup);
 			this.colorProxyObjects();
+			// Give proxy floor leaks an opaque backing (a base under its footprint).
+			this.projection.buildBase(this.proxyGroup, this.scene);
 		}
-
-		// Give proxy floor leaks an opaque backing (a base under its footprint).
-		this.buildProxyBase();
 
 		const framed = lite ?? proxyRoot!;
 		const box = new Box3().setFromObject(framed);
@@ -2130,10 +1479,13 @@ export class OrbitEngine {
 		this.camera.near = Math.max(0.02, this.sceneMaxDim * 0.002);
 		this.camera.far = Math.max(500, this.sceneMaxDim * 60);
 
-		this.sizeYouMarker();
-		this.buildEntryMarkers();
-		this.buildAnchorRings();
-		this.rebuildHotspots();
+		this.markers.build(this.panos, this.sceneMaxDim);
+		this.markers.rebuildHotspots(
+			this.panos,
+			this.currentIndex,
+			this.proxyGroup,
+			this.projectionMode,
+		);
 
 		const dist = this.sceneMaxDim * 1.6;
 		this.browsePos
@@ -2203,7 +1555,7 @@ export class OrbitEngine {
 					const idx = g.index;
 					this.glide = null;
 					this.interiorBusy = false;
-					this.hotspotGroup.visible = true;
+					this.markers.hotspotGroup.visible = true;
 					this.activate(idx);
 				}
 			}
@@ -2212,7 +1564,7 @@ export class OrbitEngine {
 			} else {
 				this.sphereA.position.copy(this.camera.position);
 			}
-			this.applyLook();
+			this.lat = applyLook(this.camera, this.lon, this.lat);
 		} else if (this.mode === "peek") {
 			// Slowly orbit the dollhouse so locating gives a 360 view.
 			const off = this.camera.position.clone().sub(this.sceneCenter);
@@ -2226,36 +1578,13 @@ export class OrbitEngine {
 
 		this.updateCursorRing();
 		this.positionDestLabel();
-
-		// Overview entry discs render at a constant on-screen size + pulse; the
-		// interior anchor rings (white + gold) are world-fixed, so they're left be.
-		if (this.entryGroup.visible) {
-			const pulse = 1 + 0.07 * Math.sin(time * 0.004);
-			for (const spot of this.entryGroup.children) {
-				const hovered =
-					spot.userData.targetIndex === this.hoveredEntryIndex;
-				const d = this.camera.position.distanceTo(spot.position);
-				spot.scale.setScalar(
-					hotspotScaleForDistance(
-						d,
-						ENTRY_TARGET_PX,
-						this.camera.fov,
-						this.host.clientHeight,
-					) * (hovered ? 1.35 : 1),
-				);
-				const disc = spot.children[0] as Mesh;
-				const ring = spot.children[1] as Mesh;
-				ring.scale.setScalar(pulse);
-				(disc.material as MeshBasicMaterial).opacity = hovered
-					? 0.9
-					: 0.55;
-				(ring.material as MeshBasicMaterial).opacity = hovered
-					? 1.0
-					: 0.85;
-			}
-		}
-
-		this.updateOutlineSelection();
+		this.markers.updateEntryDiscs(
+			this.camera,
+			this.host.clientHeight,
+			this.hoveredEntryIndex,
+			time,
+		);
+		this.addressing.updateOutlines();
 		this.composer.render();
 	};
 }
