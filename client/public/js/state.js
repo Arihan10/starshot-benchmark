@@ -11,6 +11,12 @@ export const state = {
   slots: [],            // /slots payload: [{id, prompt, runs: {alias: cellSummary}}]
   steps: [],            // pipeline step/template ids (for "step until X"); fetched once
 
+  // Board multi-select: an arbitrary set of (slot × model) cells to drive
+  // resume/reset/step/pause on together — vs. acting on a single cell or all.
+  // Per-run (cell keys repeat across runs), so a run switch clears it.
+  selectMode: false,
+  selection: new Set(), // cellKey ("slot|model") of every selected cell
+
   // What the single 3D viewer is showing. null = board.
   view: null,           // {slot, model, branch: branchId|null}
 

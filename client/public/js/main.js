@@ -67,6 +67,11 @@ async function switchRun(name) {
   state.run = name;
   try { localStorage.setItem(LAST_RUN_KEY, name); } catch { /* private mode */ }
   closeOverlay();
+  // Board selection is per-run (cell keys repeat across runs) — drop it so a
+  // bulk action never lands on the previous run's cells.
+  state.selection.clear();
+  state.selectMode = false;
+  emit("selection");
   // Lab state belongs to the previous run; sims (if any) keep running
   // server-side on that run and stay reachable by switching back.
   resetLabSession();
@@ -270,6 +275,9 @@ async function newRunModal() {
           // so a draft left over from the previously-active run isn't compared
           // against the new run's snapshot and flagged as a phantom edit.
           resetLabSession();
+          state.selection.clear();
+          state.selectMode = false;
+          emit("selection");
           try { localStorage.setItem(LAST_RUN_KEY, payload.current); } catch { /* ignore */ }
           renderRunPicker();
           await refreshSlots();

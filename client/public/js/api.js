@@ -155,6 +155,10 @@ export const api = {
       method: "PUT",
       body: { overrides, update_version: updateVersion },
     }),
+  // Reset the run's snapshot back to its base source version (the inverse of
+  // updateRunPrompts' version-sync) — discards the lab's in-place prompt edits.
+  restoreRunPrompts: (run) =>
+    request(`/runs/${encodeURIComponent(run)}/prompt-templates/restore`, { method: "POST" }),
   // Fork a simulation branch in each cell at its earliest call of any of
   // `steps` (non-destructive — source untouched). Replaces the old destructive
   // rerun-step.

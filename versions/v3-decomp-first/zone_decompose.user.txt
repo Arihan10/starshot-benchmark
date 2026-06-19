@@ -11,7 +11,6 @@ Subregion description: "`{ZONE_PROMPT}`"
 Subregion plan: "`{ZONE_PLAN}`"
 Subregion dimensions: `{ZONE_DIMENSIONS}`
 Subregion global origin corner: `{ZONE_ORIGIN}`
-Parent region id: '`{ZONE_ID}`'
 
 
 Here is the list of other subregions that have been planned for this scene so far. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), its dimensions, and a global coordinate marking its origin corner, with the objects placed inside it listed inline beneath it. Additionally, each subregion mentioned will also have a set of local coordinates that define its position relative to its parent region, where the origin is the actual minimum corner of the parent's bounding box.

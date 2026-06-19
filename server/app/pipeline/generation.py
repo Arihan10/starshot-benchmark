@@ -65,7 +65,7 @@ RELATIONSHIP_RETRY_ATTEMPTS = 3
 _DECOMP_STEPS: dict[str, tuple[str, str]] = {
     "anchor": (
         "anchor_decompose",
-        "This is the subregion you are to generate a list of anchor objects for.",
+        "This is the subregion you are to generate a list of objects for.",
     ),
     "encapsulating": (
         "encapsulating_decompose",
@@ -415,6 +415,7 @@ async def _resolve_and_generate(
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
                 orientation=orientations[spec.id],
+                orientation_description=spec.orientation,
                 placement=spec.placement,
                 referenced_ids=list(spec.referenced_ids),
                 parent_id=parent_id,
@@ -470,6 +471,7 @@ async def _match_library_assets(
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
                 orientation=orientation,
+                orientation_description=spec.orientation,
                 placement=spec.placement,
                 referenced_ids=list(spec.referenced_ids),
                 parent_id=spec.parent,
@@ -548,6 +550,7 @@ async def _match_library_assets(
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
             orientation=orientation,
+            orientation_description=spec.orientation,
             placement=spec.placement,
             referenced_ids=list(spec.referenced_ids),
             parent_id=spec.parent,

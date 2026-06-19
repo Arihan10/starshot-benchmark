@@ -263,12 +263,14 @@ def write_overrides(target_dir: Path, overrides: dict[str, dict[str, str]]) -> N
 
 
 def sync_templates(dest_dir: Path, src_dir: Path) -> None:
-    """Hard-replace EVERY step template in `dest_dir` with `src_dir`'s — used to
-    push a run's FULL prompt snapshot back onto its source version. Unlike
-    `write_overrides` (which only touches the steps you just edited), this copies
-    all steps, so edits applied to the run EARLIER without syncing still land,
-    not just the latest override. Validates both sides and drops the cached
-    load of the destination."""
+    """Hard-replace EVERY step template in `dest_dir` with `src_dir`'s. Used in
+    both directions: to push a run's FULL prompt snapshot back onto its source
+    version (`dest_dir` = the version), and to RESTORE a run's snapshot from its
+    base version (`dest_dir` = the run snapshot). Unlike `write_overrides` (which
+    only touches the steps you just edited), this copies all steps, so edits
+    applied to the run EARLIER without syncing still land, not just the latest
+    override. Validates both sides and drops the cached load of the
+    destination."""
     src = _load_dir(src_dir, src_dir.name)  # validates src is a complete set
     for (step, role), text in src.templates.items():
         (dest_dir / f"{step}.{role}.txt").write_text(text, encoding="utf-8")

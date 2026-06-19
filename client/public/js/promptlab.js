@@ -1668,6 +1668,9 @@ function applyToRunModal() {
         ? el("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text-dim)" },
             syncCheck, `save this run's full prompts to source version "${versionLabel}" — overwrites ALL its steps (so edits applied earlier without syncing land too)`)
         : null,
+      versionLabel
+        ? el("div", { class: "m-hint", text: `the “restore from "${versionLabel}"” button below does the inverse — it overwrites this run's snapshot with that source version, discarding every prompt edit applied to this run (and any unsaved drafts).` })
+        : null,
       field(hasEdits ? "then" : "simulate from", simSel),
       el("div", { class: "m-hint", text:
         "simulating forks a branch in each slot at its first call of that step and runs it downstream under " +
@@ -1676,6 +1679,21 @@ function applyToRunModal() {
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
+      ...(versionLabel ? [el("button", { class: "danger", text: `restore from "${versionLabel}"`, onclick: async () => {
+        try {
+          const r = await api.restoreRunPrompts(state.run);
+          toast(`restored this run's prompts from version "${r.restored_from}"`, "ok");
+          close();
+          // The snapshot is the version's templates now: drop drafts + tests
+          // (stale against it) and reload so nothing pre-restore lingers.
+          lab.drafts = new Map();
+          lab.tests = new Map();
+          await openLab();
+          emit("poll-now");
+          renderSims();
+          refreshCardScenes();
+        } catch (e) { setError(e.message); }
+      } })] : []),
       el("button", { class: "primary", text: hasEdits ? "apply" : "update", onclick: async () => {
         const wantWrite = hasEdits || syncCheck.checked;
         if (!wantWrite && !simSel.value) {

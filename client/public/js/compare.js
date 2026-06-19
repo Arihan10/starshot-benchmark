@@ -353,7 +353,9 @@ async function viewLineage(llm) {
   renderLineageBar();
   await loadBranchSteps(seq);
   if (seq !== openSeq) return;
-  await paintCur(lin.branch, seq, true);
+  // Keep the camera put — swapping which lineage is viewed shouldn't move the
+  // user's vantage on the (comparable) scene.
+  await paintCur(lin.branch, seq, true, true);
   if (seq !== openSeq) return;
   const last = branchSteps[branchSteps.length - 1] ?? null;
   if (last) { viewStep = last.template ?? last.step; viewNode = last.node ?? null; }
@@ -367,12 +369,12 @@ async function viewLineage(llm) {
 // (used on view-switch / revert) so a same-id node from another lineage can't
 // linger; otherwise it streams the bundle only when the cut references meshes
 // the viewer lacks (cheap live progress repaint).
-async function paintCur(branch, seq, clear = false) {
+async function paintCur(branch, seq, clear = false, keepCamera = false) {
   if (!curViewer || !branch) return;
   try {
     const proj = await api.branchScene(branch);
     if (seq !== openSeq) return;
-    if (clear) curViewer.clear();
+    if (clear) curViewer.clear({ keepCamera });
     applySceneProjection(curViewer, proj);
     const needBundle = clear || (proj.nodes ?? []).some((n) => n.mesh_url && !curViewer.hasModel(n.id));
     if (needBundle) curViewer.prefetchBundle(api.branchMeshesUrl(branch));
@@ -416,7 +418,7 @@ async function rewindBranchTo(call) {
     if (seq !== openSeq) return;
     await loadBranchSteps(seq);
     if (seq !== openSeq) return;
-    await paintCur(lin.branch, seq, true);
+    await paintCur(lin.branch, seq, true, true); // keep the camera across the revert
     if (seq !== openSeq) return;
     await loadTextForView(seq);
     if (seq !== openSeq) return;

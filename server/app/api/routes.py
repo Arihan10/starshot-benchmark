@@ -2089,6 +2089,33 @@ def create_app() -> FastAPI:
             "version_synced": version_synced,
         }
 
+    @app.post("/runs/{run}/prompt-templates/restore")
+    async def restore_run_prompts(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Reset the run's prompt snapshot back to its base version — the
+        inverse of the `update_version` sync (which pushes the run's snapshot
+        ONTO the version). Hard-replaces every step template in the run's
+        snapshot with the source version's, discarding the prompt lab's in-place
+        edits. Running cells keep the templates they launched with; every later
+        relaunch/rerun/resume renders the restored bytes."""
+        _require_run_prompts(run)
+        version = _run_meta(run).get("prompt_version")
+        if not isinstance(version, str) or not prompt_store.version_exists(version):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"run {run!r} has no existing base version to restore from"
+                    + (f" — {version!r} no longer exists" if isinstance(version, str) and version else "")
+                ),
+            )
+        run_snapshot = _run_dir(run) / prompt_store.RUN_PROMPTS_SUBDIR
+        try:
+            # dest = the run snapshot, src = the base version: the exact reverse
+            # of the `update_version` sync above.
+            prompt_store.sync_templates(run_snapshot, prompt_store.VERSIONS_DIR / version)
+        except prompt_store.PromptTemplateError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"run": run, "restored_from": version}
+
     @app.post("/runs/{run}/simulate-step")
     async def simulate_step(  # pyright: ignore[reportUnusedFunction]
         run: str, req: SimulateStepRequest,

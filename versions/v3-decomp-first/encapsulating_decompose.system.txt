@@ -19,23 +19,23 @@ Respond with a single JSON object containing:
   - `prompt` (string): detailed description; used verbatim as the text-to-3D generation prompt
   - `parent` (string): id of this object's structural parent (what it physically rests on, hangs from, leans against, or is contained by)
   - `parent_relationship_kind` (string): exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent — wall/ceiling mounts, embedded fittings, shell-frame-to-region), or `IN` (contained inside the parent's volume / footprint with no specific contact face). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here.
-  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the object's silhouette is non-rectilinear, otherwise null/omitted.
-  - `orientation` (int): world-frame yaw about +Y in degrees. Exactly one of -180, -135, -90, -45, 0, 45, 90, 135, 180. `0` = front faces +Z (toward viewer), `90` = front faces +X (to the right), `180` = front faces -Z (away), `-90` = front faces -X (to the left); positive degrees swing the front toward +X (right), negative toward -X (left). Use 0 for symmetric objects.
+  - `proxy_shape` (string): `BOX` when the object's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectilinear.
+  - `orientation` (string): one string describing what other object(s) this object is facing - helps the downstream step actually place the object into the scene.
   - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
   - `relationships` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
-- `bounding_required` (bool): used only by the encapsulating step (anchor and negative-space leave this as the default `true`). Set to `false` when the region needs no bounding perimeter at all — `objects` is then ignored downstream even if non-empty. Set to `true` when at least one bounding object is being emitted.
+- `bounding_required` (bool): set to `false` when this region needs no bounding perimeter at all — `objects` is then ignored even if non-empty. Set to `true` when at least one bounding object is being emitted.
 
 No additional prose, markdown, or code fences.
 </output>
 
 <additional_context>
-A `proxy_shape` describes the silhouette of the node's mesh INSIDE its axis-aligned bbox. The proxy is always inscribed in the AABB; you do NOT emit radii or cap sizes — they derive from the bbox dimensions. Emit `proxy_shape` ONLY when the mesh is noticeably non-boxy; omit it (i.e. null / absent) when the bbox itself is a good collision proxy.
+A `proxy_shape` describes the silhouette of the node's mesh INSIDE its axis-aligned bbox. The proxy is always inscribed in the AABB; you do NOT emit radii or cap sizes — they derive from the bbox dimensions. Use `SPHERE` / `CAPSULE` / `HEMISPHERE` ONLY when the mesh is noticeably non-boxy; use `BOX` (the default) when the bbox itself is a good collision proxy.
 
 NOTATION used below. For an AABB with min corner (x_min, y_min, z_min) and max corner (x_max, y_max, z_max): center (cx, cy, cz), half-extents (hx, hy, hz) = ((x_max-x_min)/2, (y_max-y_min)/2, (z_max-z_min)/2), full extents (sx, sy, sz) = (2·hx, 2·hy, 2·hz). Every proxy below defines a FOOTPRINT (the XZ region the shape covers) and a TOP-SURFACE FUNCTION Y_top(x, z) that returns the proxy's upper surface height at a given XZ inside that footprint. There is no automatic correction — when you anchor another node ON this one, YOU must compute Y_top at the anchor's XZ and place its bbox so its bottom face sits there.
 
 Valid values:
 
-  * null / omitted — BOX. The AABB is the proxy. Default.
+  * `BOX` — the AABB is the proxy. Default.
       WHEN TO USE: walls, floors, ceilings, furniture, crates, buildings, signs, rectangular terrain slabs — anything rectilinear.
       FOOTPRINT: the full AABB rectangle, x ∈ [x_min, x_max], z ∈ [z_min, z_max].
       Y_top(x, z) = y_max   (flat top face everywhere in the footprint).

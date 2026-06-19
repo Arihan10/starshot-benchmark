@@ -16,14 +16,6 @@ state (stepped-mode gate, simulation branches, current pipeline phase) are
 intentionally kept out: they have different lifetimes and are served
 separately. This object is DERIVED — rebuilt by folding a cell's event log and
 updated incrementally as new events land — so it is never authoritative.
-
-Taxonomy note: there is no `kind` field. Zones vs concrete leaves is the
-bucket split (`Scene.zones` vs `Scene.objects`); within leaves, the
-decomposition pass (`SceneObject.emitted_by`) is the sole classifier and color
-key — a "frame" is simply the `ENCAPSULATING` pass's output, not a distinct
-kind.
-
-First module of the new `app.types` package.
 """
 
 from __future__ import annotations

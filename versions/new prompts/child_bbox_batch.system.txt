@@ -51,14 +51,9 @@ The user message contains the parent region's id, plan, and dimensions; the scen
 </input>
 
 <output>
-Respond with a single JSON object containing one field:
-- `assignments` (list): exactly one entry per subregion you were asked to place — no extras, no omissions. Each entry has:
-  - `id` (string): the id of the subregion this box is for, copied verbatim from the request.
-  - `bbox` (object): that subregion's axis-aligned bounding box, declared relative to the parent region you're working in — the origin (0,0,0) is the parent region's minimum corner. It has exactly two fields:
-    - `origin` (array of 3 numbers `[x, y, z]`): the box's own minimum corner.
-    - `dimensions` (array of 3 numbers `[dx, dy, dz]`): the box's extent from `origin` along +X (right), +Y (up), +Z (front). The box is formed by taking the minimum corner and extending along each axis by these dimensions. Must always be non-negative.
+Respond with a single JSON object matching the schema: one `assignment` per subregion (id + bounding box). Each subregion's bounding box (bbox) must be declared relative to the parent region you're working in — the origin (0,0,0) is the parent region's minimum corner. Each bounding box you output is defined by its own minimum corner and its dimensions. The bounding box is formed by taking the minimum corner and extending along each axes according to the dimensions you give. The `dimensions` vector must always be non-negative.
 
-Axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The working unit is ALWAYS meters: every coordinate and dimension you emit or are given is in meters. You can use decimals up to centimeter precision (multiples of 0.01 m).
+Axes follow the canonical front view (+X right, +Y up, +Z front, -Z back). The working unit is ALWAYS meters: every coordinate and dimension you emit or are given is in meters. You can use decimals up to centimeter precision (multiples of 0.01 m). Emit exactly one assignment per requested subregion — no extras, no omissions.
 
 No prose, no markdown, no code fences.
 </output>

@@ -257,6 +257,12 @@ class Node(BaseModel):
     bbox: BoundingBox
     proxy_shape: ProxyShape | None = None
     orientation: Orientation = 0
+    # Semantic facing prose the object decompose step authors (e.g. "facing the
+    # conversation pit"), carried verbatim from the spec — the free-text
+    # counterpart to the numeric `orientation` yaw, so scene context can show the
+    # authored facing intent next to the resolved angle. "" for zones and for
+    # objects whose pass authored no facing.
+    orientation_description: str = ""
     placement: str | None = None
     referenced_ids: list[Relationship] = Field(default_factory=list)
     mesh_url: str | None = None

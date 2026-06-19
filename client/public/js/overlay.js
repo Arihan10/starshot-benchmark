@@ -139,6 +139,13 @@ function scheduleTreeRender() {
 export async function openCell({ slot, model, branch = false, forceLive = false }) {
   const seq = ++openSeq;
   const run = state.run;
+  // Keep the camera when this re-renders the SAME cell while the overlay is
+  // already open — the branch selector swapping between the source run and its
+  // per-LLM simulation lineages, or a revert/step reload. Swapping like that
+  // shouldn't pull the user off the part of the scene they're inspecting. A
+  // fresh open (overlay closed) or a different cell still frames the scene anew.
+  const keepCamera = overlayEl.classList.contains("open")
+    && !!state.view && state.view.slot === slot && state.view.model === model;
   stream?.close();
   stream = null;
   state.view = { slot, model, branch };
@@ -147,7 +154,7 @@ export async function openCell({ slot, model, branch = false, forceLive = false 
   inquiry.notifyView({ run, slot, model, branch });
   overlayEl.classList.add("open");
   viewer.setActive(true);
-  viewer.clear();
+  viewer.clear({ keepCamera });
   obs = createObsModel();
   obstree.resetDock();
   obstree.setPinStep(branch ? state.lab.simStep : null);

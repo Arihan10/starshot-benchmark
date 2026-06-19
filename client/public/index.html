@@ -431,6 +431,55 @@
             }
             select.step-until:hover { border-color: var(--accent-line); }
 
+            /* ---------- board multi-select ---------- */
+            /* A contextual action bar pinned under the topbar; the board slides
+               down to make room while select mode is on. */
+            #btn-select.on { border-color: var(--accent-line); color: var(--accent); background: #16222e; }
+            body.select-mode #board,
+            body.select-mode #board-scenes { top: 88px; }
+            #bulk-bar {
+                position: fixed;
+                top: 46px; left: 0; right: 0;
+                height: 42px;
+                display: none;
+                align-items: center;
+                gap: 8px;
+                padding: 0 12px;
+                background: var(--panel);
+                border-bottom: 1px solid var(--line);
+                z-index: 39; /* under the topbar (40), over the board */
+            }
+            #bulk-bar.open { display: flex; }
+            #bulk-bar .bulk-check { color: var(--accent); }
+            #bulk-bar .bulk-count {
+                color: var(--text-dim);
+                font-variant-numeric: tabular-nums;
+                min-width: 76px;
+            }
+            #bulk-bar .bulk-mini { font-size: 11px; padding: 3px 8px; }
+            #bulk-bar .bulk-sep { width: 1px; height: 22px; background: var(--line); margin: 0 2px; }
+            #bulk-bar button { font-size: 11px; }
+            #bulk-bar .bulk-stepped {
+                display: flex; align-items: center; gap: 5px;
+                color: var(--text-dim); font-size: 11px; cursor: pointer; white-space: nowrap;
+            }
+            #bulk-bar .bulk-done { margin-left: 0; }
+            .cell-card.selectable { cursor: pointer; }
+            .cell-card.selected {
+                border-color: var(--accent-line);
+                background: #16222e;
+                box-shadow: inset 0 0 0 1px var(--accent-line);
+            }
+            .cell-card .sel-box {
+                width: 14px; height: 14px; flex-shrink: 0;
+                border: 1px solid var(--line); border-radius: 3px;
+                display: inline-flex; align-items: center; justify-content: center;
+                font-size: 10px; line-height: 1; color: var(--accent); background: #0c0d10;
+            }
+            .cell-card .sel-box.on { border-color: var(--accent-line); background: #1d3343; }
+            body.select-mode .grid-head { cursor: pointer; }
+            body.select-mode .grid-head:hover { color: var(--accent); }
+
             /* ---------- overlay (cell view) ---------- */
             #overlay {
                 position: fixed;
@@ -1359,6 +1408,7 @@
             <button id="btn-new-run" title="Create a new run from a prompt version">+ new run</button>
             <button id="btn-start-cells" title="Start model × slot cells on this run">start cells…</button>
             <button id="btn-reset-all" class="danger" title="Wipe every started cell on this run back to idle (deletes their events + meshes). Nothing is restarted.">reset all</button>
+            <button id="btn-select" title="Select multiple cells, then resume / reset / step / pause them all at once">select</button>
             <span class="sep"></span>
             <button id="btn-lab" class="primary" title="Edit a prompt template, test it against logged events, and simulate downstream">modify prompts</button>
             <button id="btn-step-all" style="display:none" title="Advance every waiting slot by exactly one step">step all</button>

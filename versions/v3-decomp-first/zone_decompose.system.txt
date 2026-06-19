@@ -12,14 +12,12 @@ The user message contains this region's id, prompt, bbox, and plan, plus the sce
 
 <output>
 Respond with a single JSON object containing:
-- `children` (list): the subregions this region decomposes into. Each child has:
+- `subregions` (list): the subregions this region decomposes into. Each child has:
   - `id` (string): unique within the entire scene
   - `prompt` (string): a short seed describing what this child region is
-  - `parent` (string): the id of this child's structural parent. For a top-level subregion, this is the literal id of the region being decomposed (the value labelled "Parent region id" in the user message — e.g. if the user message says `Parent region id: 'living_room'`, emit `"parent": "living_room"`, NOT the string "PARENT_ID" or any other placeholder). For a child anchored to an earlier sibling in this call, use that sibling's id verbatim.
-  - `parent_relationship_kind` (string): how this child anchors to its `parent`. Exactly one of `ON` (rests on parent's outward surface), `ATTACHED` (flush against any face of the parent), or `IN` (contained inside the parent's volume / footprint). `BESIDE` / `ABOVE` / `BELOW` are NOT valid here — they are peer hints, reserved for `relationships`.
   - `placement` (string): one string describing where this child sits within the scene relative to other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the subregion is located. Think very deeply about where each region should lie spatially and designing the placement string for it.
   - `relationships` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
-  - `proxy_shape` (string | null): BOX / SPHERE / CAPSULE / HEMISPHERE if the region's silhouette is non-rectangular, otherwise null/omitted.
+  - `proxy_shape` (string): `BOX` when the region's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectangular.
 
 No additional prose, markdown, or code fences.
 </output>

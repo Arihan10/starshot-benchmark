@@ -101,7 +101,8 @@ def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str) -> str:
     else:
         lines.append("relationships: []")
     lines.append(f"proxy_shape: {_render_proxy_shape(obj.proxy_shape)}")
-    lines.append(f"orientation: {obj.orientation}deg")
+    lines.append(f'orientation: "{obj.orientation_description}"')
+    lines.append(f"global yaw: {obj.orientation}deg")
     lines.append(f"Dimensions: {util.format_dimensions(obj.bbox)}")
     lines.append(f"Global origin corner: {util.format_global_origin(obj.bbox)}")
     local = _local_coords_line(obj, by_id)
@@ -622,6 +623,7 @@ def sample_variables() -> dict[str, str]:
         id="floor_slab", prompt="a wide oak-plank floor slab",
         bbox=_box((0.0, 0.0, 0.0), (8.0, 0.1, 6.0)),
         parent_id="root", parent_kind=ParentRelationshipKind.IN, parent_region="root",
+        orientation_description="lies flat; no inherent facing",
         placement="covering the whole footprint at floor level", mesh_url="sample://floor_slab",
     )
     living = Node(
@@ -642,6 +644,7 @@ def sample_variables() -> dict[str, str]:
         id="linen_sofa", prompt="a tufted two-seater linen sofa",
         bbox=_box((0.5, 0.1, 3.5), (2.0, 0.9, 0.9)),
         parent_id="living_room", parent_kind=ParentRelationshipKind.IN, parent_region="living_room",
+        orientation=90, orientation_description="facing east toward the coffee table",
         placement="against the west wall, facing the coffee table",
         referenced_ids=[Relationship(target="coffee_table", kind=RelationshipKind.BESIDE)],
         mesh_url="sample://linen_sofa",
@@ -650,12 +653,14 @@ def sample_variables() -> dict[str, str]:
         id="coffee_table", prompt="a round walnut coffee table",
         bbox=_box((1.0, 0.1, 2.0), (1.2, 0.45, 0.7)),
         parent_id="living_room", parent_kind=ParentRelationshipKind.IN, parent_region="living_room",
+        orientation_description="round; no inherent facing",
         placement="centered in front of the sofa", mesh_url="sample://coffee_table",
     )
     lamp = Node(
         id="table_lamp", prompt="a brass table lamp with a linen shade",
         bbox=_box((1.4, 0.55, 2.2), (0.3, 0.6, 0.3)),
         parent_id="coffee_table", parent_kind=ParentRelationshipKind.ON, parent_region="living_room",
+        orientation_description="symmetric shade; no inherent facing",
         placement="centered on the coffee table", mesh_url="sample://table_lamp",
     )
     nook = Node(
@@ -669,13 +674,15 @@ def sample_variables() -> dict[str, str]:
         id="leather_armchair", prompt="a worn leather wingback armchair",
         bbox=_box((3.3, 0.1, 4.7), (0.9, 1.0, 0.9)),
         parent_id="reading_nook", parent_kind=ParentRelationshipKind.IN, parent_region="reading_nook",
-        orientation=45, placement="angled toward the window in the corner of the nook",
+        orientation=45, orientation_description="angled toward the bay window in the corner",
+        placement="angled toward the window in the corner of the nook",
         mesh_url="sample://leather_armchair",
     )
     bed = Node(
         id="platform_bed", prompt="a low platform single bed with a quilt",
         bbox=_box((5.5, 0.1, 0.5), (1.4, 0.6, 2.0)),
         parent_id="bedroom", parent_kind=ParentRelationshipKind.IN, parent_region="bedroom",
+        orientation_description="headboard to the back wall, foot facing into the room",
         placement="against the back (north) wall", mesh_url="sample://platform_bed",
     )
     nodes = [root, floor, living, bedroom, sofa, table, lamp, nook, armchair, bed]

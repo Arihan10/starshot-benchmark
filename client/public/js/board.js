@@ -8,6 +8,7 @@ import { createViewer } from "./scene3d.js";
 import { applySceneProjection, createObsModel } from "./events.js";
 import { renderObsTree, renderObsTrace } from "./obsmini.js";
 import { statusView } from "./status.js";
+import { closeOverlay } from "./overlay.js";
 
 const boardEl = document.getElementById("board");
 const planeEl = document.getElementById("board-plane");
@@ -26,7 +27,8 @@ function applyTransform() {
 let panning = null;
 boardEl.addEventListener("pointerdown", (ev) => {
   if (ev.button !== 0) return;
-  if (ev.target.closest(".cell-card")) return; // card clicks open the overlay
+  if (ev.target.closest(".cell-card")) return; // card clicks open the overlay (or toggle selection)
+  if (state.selectMode && ev.target.closest(".grid-head")) return; // header clicks select a row/column
   panning = { x: ev.clientX, y: ev.clientY };
   boardEl.classList.add("panning");
   boardEl.setPointerCapture(ev.pointerId);
@@ -69,16 +71,23 @@ function cellCard(slot, model) {
   const summary = slot.runs?.[model] ?? { status: "idle", events_count: 0 };
   const branches = summary.branches ?? [];
   const view = statusView(summary);
+  const selecting = state.selectMode;
+  const selected = state.selection.has(cellKey(slot.id, model));
   const card = el(
     "div",
     {
-      class: `cell-card${summary.events_count === 0 && !branches.length ? " empty" : ""}`,
+      class: `cell-card${summary.events_count === 0 && !branches.length ? " empty" : ""}` +
+        `${selecting ? " selectable" : ""}${selected ? " selected" : ""}`,
       title: slot.prompt ?? "",
-      // The card opens the SOURCE scene; a cell can carry several sim branches
-      // now, so they're opened/managed from the prompt lab's simulations list.
-      onclick: () => emit("open-cell", { slot: slot.id, model, branch: null }),
+      // In select mode the card toggles its selection; otherwise it opens the
+      // SOURCE scene (a cell's sim branches are reached from the prompt lab).
+      onclick: () => {
+        if (state.selectMode) toggleSel(slot.id, model);
+        else emit("open-cell", { slot: slot.id, model, branch: null });
+      },
     },
     el("div", { class: "head" },
+      selecting ? el("span", { class: `sel-box${selected ? " on" : ""}`, text: selected ? "✓" : "" }) : null,
       el("span", { class: `dot ${view.dot}` }),
       el("span", { class: "slot-name", text: slot.id }),
       summary.stepped ? el("span", { class: "step-mode-tag", text: "step mode", title: "one LLM call per step — advance from the cell view or “step all”" }) : null,
@@ -91,9 +100,14 @@ function cellCard(slot, model) {
     const bview = statusView(first);
     // Clickable: jump straight into a downstream simulation (the overlay's
     // branch selector then reaches the others) — reachable even on a done cell.
+    // In select mode it folds into the card's selection toggle instead.
     card.appendChild(
       el("div", { class: "branch-chip", title: "open this cell's downstream simulation",
-        onclick: (ev) => { ev.stopPropagation(); emit("open-cell", { slot: slot.id, model, branch: first.id }); } },
+        onclick: (ev) => {
+          ev.stopPropagation();
+          if (state.selectMode) { toggleSel(slot.id, model); return; }
+          emit("open-cell", { slot: slot.id, model, branch: first.id });
+        } },
         el("span", { class: `dot ${bview.dot}` }),
         el("span", { text: branches.length === 1
           ? `sim · ${bview.label}`
@@ -109,12 +123,163 @@ export function renderBoard() {
   gridEl.style.gridTemplateColumns = `130px repeat(${models.length}, 230px)`;
   gridEl.textContent = "";
   gridEl.appendChild(el("div", { class: "grid-head" }));
-  for (const m of models) gridEl.appendChild(el("div", { class: "grid-head col", text: m }));
+  for (const m of models) {
+    gridEl.appendChild(el("div", {
+      class: "grid-head col", text: m,
+      title: state.selectMode ? "select / clear this model's whole column" : "",
+      onclick: state.selectMode ? () => toggleColumn(m) : null,
+    }));
+  }
   for (const slot of state.slots) {
-    gridEl.appendChild(el("div", { class: "grid-head", text: slot.id, title: slot.prompt ?? "" }));
+    gridEl.appendChild(el("div", {
+      class: "grid-head", text: slot.id,
+      title: state.selectMode ? "select / clear this slot's whole row" : (slot.prompt ?? ""),
+      onclick: state.selectMode ? () => toggleRow(slot.id) : null,
+    }));
     for (const m of models) gridEl.appendChild(cellCard(slot, m));
   }
   applyTransform();
+}
+
+// --- multi-select: pick an arbitrary set of (slot × model) cells and run
+//     resume / reset / step / pause on all of them at once (vs. one-or-all). ---
+
+const selectBtn = document.getElementById("btn-select");
+
+function toggleSel(slotId, model) {
+  const k = cellKey(slotId, model);
+  if (state.selection.has(k)) state.selection.delete(k);
+  else state.selection.add(k);
+  emit("selection");
+}
+
+function selectedCells() {
+  const out = [];
+  for (const k of state.selection) {
+    const i = k.lastIndexOf("|"); // slot ids may contain spaces but never "|"
+    out.push({ slot: k.slice(0, i), model: k.slice(i + 1) });
+  }
+  return out;
+}
+
+// Toggle a set of keys as a group: if every one is already selected, clear
+// them; otherwise add them all. Drives the row/column header shortcuts.
+function toggleKeys(keys) {
+  const allOn = keys.length > 0 && keys.every((k) => state.selection.has(k));
+  for (const k of keys) { if (allOn) state.selection.delete(k); else state.selection.add(k); }
+  emit("selection");
+}
+function toggleRow(slotId) { toggleKeys(state.models.map((m) => cellKey(slotId, m))); }
+function toggleColumn(model) { toggleKeys(state.slots.map((s) => cellKey(s.id, model))); }
+function selectAllCells() {
+  for (const s of state.slots) for (const m of state.models) state.selection.add(cellKey(s.id, m));
+  emit("selection");
+}
+
+function setSelectMode(on) {
+  state.selectMode = on;
+  if (on && boardMode === "scenes") setBoardMode("cards"); // cards view shows the per-cell checkboxes
+  if (!on) state.selection.clear();
+  emit("selection");
+}
+
+if (selectBtn) selectBtn.addEventListener("click", () => setSelectMode(!state.selectMode));
+
+// Run a per-cell endpoint across the whole selection in parallel; individual
+// failures (resuming a done cell, stepping a non-stepped one, …) are counted as
+// skipped rather than aborting the batch — mirroring "start cells" / "reset all".
+async function runBulk(verb, perCell) {
+  const cells = selectedCells();
+  if (!cells.length) return;
+  const results = await Promise.all(cells.map(async (c) => {
+    try { await perCell(c); return true; } catch { return false; }
+  }));
+  const ok = results.filter(Boolean).length;
+  toast(
+    `${verb}: ${ok}/${results.length} cell${results.length === 1 ? "" : "s"}` +
+      (ok < results.length ? " — rest skipped/failed" : ""),
+    ok ? "ok" : "err",
+  );
+  emit("poll-now");
+}
+
+function bulkResume() {
+  const stepped = steppedCheck.checked ? true : null; // null ⇒ keep each cell's current mode
+  runBulk("resumed/started", (c) => api.resume(state.run, c.slot, c.model, stepped));
+}
+function bulkPause() { runBulk("paused", (c) => api.pause(state.run, c.slot, c.model)); }
+function bulkStep(until) {
+  runBulk(until ? `stepping → ${until}` : "stepped",
+    (c) => api.cellStep(state.run, c.slot, c.model, { until: until || null }));
+}
+function bulkReset(start) {
+  const cells = selectedCells();
+  if (!cells.length) return;
+  const n = cells.length;
+  openModal(`reset ${n} cell${n === 1 ? "" : "s"}${start ? " & start" : ""}?`, (close) => ({
+    body: [
+      el("div", { class: "m-hint", text:
+        `Permanently deletes the events, generated meshes, and simulation branches of ${n} selected cell${n === 1 ? "" : "s"}` +
+        (start ? ", then starts each one fresh." : " and leaves them idle.") }),
+    ],
+    actions: [
+      el("button", { text: "cancel", onclick: close }),
+      el("button", { class: "danger", text: `reset${start ? " & start" : ""} ${n}`, onclick: () => {
+        close();
+        closeOverlay(); // a viewed cell may be among those wiped
+        runBulk(start ? "reset & started" : "reset to idle", (c) => api.reset(state.run, c.slot, c.model, start));
+      } }),
+    ],
+  }));
+}
+
+// The contextual action bar, built once (so the "stepped" toggle + "until"
+// picker keep their state across board re-renders) and shown only in select mode.
+const steppedCheck = el("input", { type: "checkbox" });
+const bulkCount = el("span", { class: "bulk-count" });
+const untilSel = el("select", { class: "step-until",
+  title: "fast-forward every selected cell to the next run of a step, then pause there" },
+  el("option", { value: "", text: "step until…" }));
+untilSel.addEventListener("change", () => { const v = untilSel.value; untilSel.value = ""; if (v) bulkStep(v); });
+const bulkActionEls = [
+  el("button", { class: "primary", title: "start idle / resume paused selected cells", onclick: bulkResume }, "resume / start"),
+  el("label", { class: "bulk-stepped", title: "resume/start in step mode (pause before each LLM call)" }, steppedCheck, "stepped"),
+  el("button", { title: "pause selected running cells", onclick: bulkPause }, "pause"),
+  el("button", { title: "advance each selected cell by one LLM call", onclick: () => bulkStep(null) }, "step"),
+  untilSel,
+  el("button", { class: "danger", title: "wipe selected cells back to idle", onclick: () => bulkReset(false) }, "reset → idle"),
+  el("button", { class: "danger", title: "wipe selected cells and start them fresh", onclick: () => bulkReset(true) }, "reset & start"),
+];
+const bulkBar = el("div", { id: "bulk-bar" },
+  el("span", { class: "bulk-check", text: "☑" }),
+  bulkCount,
+  el("button", { class: "bulk-mini", title: "select every cell on this run", onclick: selectAllCells }, "all"),
+  el("button", { class: "bulk-mini", title: "clear the selection", onclick: () => { state.selection.clear(); emit("selection"); } }, "none"),
+  el("span", { class: "bulk-sep" }),
+  ...bulkActionEls,
+  el("span", { style: "margin-left:auto" }),
+  el("button", { class: "bulk-done", title: "leave select mode", onclick: () => setSelectMode(false) }, "done"),
+);
+document.body.appendChild(bulkBar);
+// The controls that act on the selection — disabled while nothing is selected.
+const bulkNeedsSelection = bulkActionEls.filter((n) => n.tagName === "BUTTON" || n.tagName === "SELECT");
+
+function renderSelectionUI() {
+  document.body.classList.toggle("select-mode", state.selectMode);
+  if (selectBtn) {
+    selectBtn.classList.toggle("on", state.selectMode);
+    selectBtn.textContent = state.selectMode ? "exit select" : "select";
+  }
+  bulkBar.classList.toggle("open", state.selectMode);
+  const n = state.selection.size;
+  bulkCount.textContent = `${n} selected`;
+  for (const node of bulkNeedsSelection) node.disabled = n === 0;
+  steppedCheck.disabled = n === 0;
+  // The "step until…" options come from the run's step list (fetched after the
+  // first slots poll) — populate them once they're available.
+  if (state.steps.length && untilSel.options.length <= 1) {
+    for (const s of state.steps) untilSel.appendChild(el("option", { value: s, text: `▸ ${s}` }));
+  }
 }
 
 // --- scenes view: a grid of live 3D canvases, one per active run -----------------
@@ -512,6 +677,8 @@ function setBoardMode(mode) {
 
 viewBtn.addEventListener("click", () => setBoardMode(boardMode === "scenes" ? "cards" : "scenes"));
 
-on("slots", () => { if (boardMode === "scenes") reconcileScenes(); else renderBoard(); });
+on("slots", () => { if (boardMode === "scenes") reconcileScenes(); else renderBoard(); renderSelectionUI(); });
+on("selection", () => { if (boardMode !== "scenes") renderBoard(); renderSelectionUI(); });
 applyTransform();
 applyBoardMode();
+renderSelectionUI();

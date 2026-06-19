@@ -49,12 +49,7 @@ The user message contains the user prompt and the scene plan authored upstream.
 </input>
 
 <output>
-Respond with a single JSON object containing one field:
-- `bbox` (object): the scene's axis-aligned bounding box in meters, under the canonical front view (+X right, +Y up, +Z front, -Z back). It has exactly two fields:
-  - `origin` (array of 3 numbers `[x, y, z]`): the box's MINIMUM corner.
-  - `dimensions` (array of 3 numbers `[dx, dy, dz]`): the box's extent from `origin` along +X (right), +Y (up), and +Z (front). Must be non-negative — do NOT use negative dimensions.
-
-Coordinates to centimeter precision (multiples of 0.01).
+Respond with a single JSON object matching the schema: an axis-aligned bounding box in meters, under the canonical front view (+X right, +Y up, +Z front, -Z back). Defined by an `origin` vertex — the box's MINIMUM corner — and a non-negative `dimensions` vector `(dx, dy, dz)` measuring its extent from that corner along +X (right), +Y (up), and +Z (front). Do NOT use negative dimensions. Coordinates to centimeter precision (multiples of 0.01).
 
 No prose, no markdown, no code fences.
 </output>

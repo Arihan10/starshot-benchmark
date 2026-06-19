@@ -926,7 +926,7 @@ export function createViewer(host, { keyboard = true } = {}) {
     } catch { /* malformed bytes — leave what loaded */ }
   }
 
-  function clear() {
+  function clear({ keepCamera = false } = {}) {
     gen += 1;
     bundleAbort?.abort?.();
     while (sceneRoot.children.length > 0) {
@@ -954,7 +954,12 @@ export function createViewer(host, { keyboard = true } = {}) {
     hoveredId = null;
     selectedId = null;
     tooltip.style.display = "none";
-    cameraUserMoved = false;
+    // keepCamera leaves the camera exactly where it is and marks it
+    // user-controlled, which suppresses the incoming scene's auto-fit — so
+    // swapping the scene in place (a different LLM/branch of the same view)
+    // doesn't yank the user's vantage. A plain clear re-arms the auto-fit so a
+    // freshly-opened scene frames itself.
+    cameraUserMoved = keepCamera;
   }
 
   // Reconcile the scene DOWN to an exact id set: drop every bbox/proxy/mesh no

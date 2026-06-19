@@ -12,7 +12,7 @@ The user message contains this region's seed prompt, the scene context already i
 
 <output>
 Respond with a single JSON object containing:
-- `plan` (string): your region planning paragraph
+- `design` (string): your region planning paragraph
 - `is_atomic` (boolean): whether this region is a single cohesive space or should decompose into distinct subregions
 
 No additional prose, markdown, or code fences.
