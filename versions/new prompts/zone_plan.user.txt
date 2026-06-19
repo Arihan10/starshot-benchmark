@@ -20,21 +20,14 @@ Here's the list of other subregions that have been planned for this scene so far
 <VERY_IMPORTANT_INSTRUCTIONS>
 using the scene context provided above and the description given for `{ZONE_ID}`, write one paragraph describing the design of `{ZONE_ID}`.
 
-You are to design the subregion in a single paragraph at a high level and expand the throughline provided by upstream steps narratively. Your job is to think about the scene from a storytelling perspective rather than a spatial one. focus on what happens in the space and let downstream steps decide what this means physically for the region. your design should also mention any narrative or structural quirks that cannot be inferred or reconstructed by downstream steps since it was an idea generated within your internal reasoning.
+You are to design the subregion in a single paragraph at a high level and expand the throughline provided by upstream steps narratively. Your job is to think about the region from a storytelling perspective. focus on what happens in the space and let downstream steps decide what this means physically for the region. your design should also mention any narrative or structural quirks that cannot be inferred or reconstructed by downstream steps since it was an idea generated within your internal reasoning.
+
+
 
 DO NOT use flowery language or be overly detailed.
 
 <region_decomposition>
-you must also decide is_atomic — whether this region is a single cohesive space or should decompose into multiple distinct subregions. an atomic region does not mean a plan is not needed: they are two separate decisions.
-
-default to is_atomic=true. set is_atomic=false ONLY when the region genuinely contains TWO OR MORE distinct regions, each deserving its own dedicated planning and generation pass:
-
-good decomposition: mansion grounds → house, formal garden, stables (distinct functional regions)
-good decomposition: hotel room → bedroom, bathroom (distinct rooms)
-bad decomposition: island → north end, central mound, south end (arbitrary geography with no distinct identity)
-bad decomposition: bedroom → bed area, dresser area, reading nook (over-fragmented; one cohesive space)
-
-a region is a place large enough to contain multiple objects arranged inside it. a single landmark, monument, centerpiece, or hero prop — no matter how important — is an OBJECT inside a region, not a region of its own.
+you must also decide is_atomic — whether it makes sense to leave the region as is and start populating it with objects, or if it makes sense to break it down further into smaller subregions.
 </region_decomposition>
 
 <thinking> 

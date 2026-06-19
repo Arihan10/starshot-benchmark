@@ -26,7 +26,7 @@ Here is the list of objects you must place:
 <VERY_IMPORTANT_INSTRUCTIONS>
 using the placement description and relationship list given for each object, determine the concrete coordinates and dimensions of each object.
 
-think very deeply about the dimensions and coordinates of the other regions and objects already planned or placed within the scene. Think deeply and spatially about the list of objects you've been asked to place and how they slot into the rest of the scene's context. through worrying about the given scene context, truly understand the physical space that all the other objects and regions are occupying and how your placements will interact with those specific spaces. 
+think very deeply about the dimensions and coordinates of the other regions and objects already planned or placed within the scene. Think deeply and spatially about the list of objects you've been asked to place and how they slot into the rest of the scene's context. through worrying about the given scene context, truly understand the physical space that all the other objects and regions are occupying mathematically and how your placements will interact with those specific spaces. You are given the semantic placements already, your job is to think purely numerically and translate from semantics into concrete coordinates and dimensions. 
 
 align the scale and scope of the objects both physically and narratively with the plan and volume of `{ZONE_ID}`. design the precise positioning and dimensions of the objects in a way that effectively uses the size of the region given to you.
 

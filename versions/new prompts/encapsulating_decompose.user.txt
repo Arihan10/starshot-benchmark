@@ -1,4 +1,4 @@
-You are the step in the SpatialBench pipeline responsible for determining whether a boundary or partial boundary is needed for the given region, and if so, what that boundary/partial boundary is made up of. a boundary of a region is what controls how the region connects to and interacts with the regions around it. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual subregions to allow downstream steps to recurse into them and focus on each one individually.
+You are the step in the SpatialBench pipeline responsible for determining whether a boundary or partial boundary is needed for the given region, and if so, what that boundary/partial boundary is made up of. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual subregions to allow downstream steps to recurse into them and focus on each one individually.
 
 Here is the overall scene that is being built by the pipeline:
 
@@ -20,15 +20,21 @@ Here's the list of other subregions that have been planned for this scene so far
 `{SCENE_CONTEXT}`
 
 <VERY_IMPORTANT_INSTRUCTIONS>
+not every region requires a boundary.
+
 if a boundary is not required, simply output bounding_required = false and an empty list of objects. 
 
-if a boundary is required, your role is to piece together the boundary of `{ZONE_ID}` with a variety of objects. this boundary is what frames the region and can act as a perimeter for the region as well as support for this or other regions in the scene.
+if a boundary is required, your role is to piece together the boundary of `{ZONE_ID}` with a variety of objects. this boundary is what frames the region and can act as an abstract shell for the region as well as support for this or other regions in the scene.
 
-think about whether this region needs to access other neighboring regions, or whether the plan established in the scene so far leads to objects being slotted into this boundary, now or in downstream steps.
+think about whether this region needs to access other neighboring regions, or whether the plan established in the scene so far leads to objects being slotted into this boundary, now or in downstream steps. the boundary of a region is what defines its connections and interactions with other regions.
 
-think about how this region might connect to others around it, whether that be through the practical traversability of the scene or connectives that tie regions together semantically. think about what ties the scene together to make it cohesive, a scene is not just individual regions and objects but how those regions use objects (or gaps) to link together in a realistic way.
+think about how this region might connect to others around it, whether that be through the practical traversability of the scene, connectives that tie regions together semantically or support for other objects and regions in the scene. think about what ties the scene together to make it cohesive, a scene is not just individual regions and objects but how those regions use objects (or gaps) to link together in a realistic way.
 
-once you have a rough idea of the objects you'll need to form this boundary, think about when the objects you've made must be broken down into several subatomic objects that leave room for gaps or other objects placed within the boundary, rather than overlapping them. "looking correct" is not the only requirement for the boundary - it must also be functional.
+once you have a rough idea of the objects you'll need to form this boundary, think about when the objects you've made must be broken down into several subatomic objects that leave room for gaps or other objects/regions placed within the boundary, rather than overlapping them. "looking correct" is not the only requirement for the boundary - it must also be functional, in the sense that two regions that are meant to be connected semantically must actually be physically traversable from one to the other.
 
-do not rely on downstream 3D generation steps to leave intentional gaps in objects, embed other objects within, or generate coherent collections of objects - split surfaces or groups of objects into different sections yourself and place them intricately to make room for these gaps or objects.
+do not rely on downstream 3D generation steps to leave intentional gaps in objects or embed other objects within split surfaces into different sections yourself and place them intricately to make room for these gaps or objects.
+
+furthermore, when considering how to compose the object list, be aware that a downstream step is responsible for outputting an AABB for each object you output, and another downstream step is responsible for generating the actual 3D meshes based on each object's prompt. the 3d mesh generator excels at generating individual, tangible, and structurally well-defined objects - it is NOT reliable when it comes to intangible ephemera (e.g. gasses, nebula clouds, etc.) or collections of objects placed in a certain shape or manner and will often have devastating results on the entire scene, especially since the output mesh gets stretched and scaled to the bounding box given for it. as such, ignore intangible objects like gasses, and ALWAYS split groups of objects into individual ones, then use the placement text and relationships list to convey the meaning of how they should be placed in the scene so each individual object in the collection gets its own mesh and bounding box.
+
+for each object you output, carefully consider how you want to convey their spatial placement in the scene to the downstream step that converts your purely semantic descriptions into actual numeric coordinates and orientation. each object's placement string should be used to semantically describe where and how the object is sitting in the scene, while each object's orientation semantically describes what other objects or regions it is facing. each object's relationships array describes its relative positioning to other objects where the placement text might not capture. all three of these fields come together to help the coordinate solver precisely calculate the spatial positioning of each object, so use them effectively to convey how exactly you want the objects to be laid out.
 </VERY_IMPORTANT_INSTRUCTIONS>

@@ -18,9 +18,11 @@ Here's the list of other subregions that have been planned for this scene so far
 `{SCENE_CONTEXT}`
 
 <IMPORTANT_INSTRUCTIONS>
-Think deeply and spatially about how `{ZONE_ID}` splits into its top-level subregions. for each subregion, the placement text represents a semantic spatial description of where the region sits. your output for the placement text and the relationships array will be used as a guide to a downstream step that will compute the exact bounding boxes of each subregion. the downstream step uses the relationships array to analyze the region's position relative to already placed regions or objects in the scene that are directly relevant to this region (or other regions you're outputting in this list).
+Think deeply and spatially about how `{ZONE_ID}` splits into its top-level subregions, based on its plan and size.
 
-reason spatially, at a high-level, the placements and relationships you output for each one, and ensure they don't contradict each other since it will be spatially impossible to resolve by the downstream step.
+for each subregion, the placement text represents a semantic spatial description of where the region sits. your output for the placement text and the relationships array will be used as a guide to a downstream step that will compute the exact bounding boxes of each subregion. the downstream step uses the relationships array to analyze the region's position relative to already placed regions or objects in the scene that are directly relavent to this region (or other regions you're outputting in this list).
+
+once you've decided the list of subregions, reason spatially about the role and meaning of each one and how that affects their placement in the larger region and spatial relationships with each other or existing objects/regions in the scene. the placement and size of each subregion should be realistic relative to the purpose it serves in the scene.
 
 start by thinking of the high level way of how these subregions should be laid out relative to each other, with respect to the scene's narrative. then, think spatially about if this is possible or practical given the physical structure of the scene thus far, and prioritize spatial coherence over narrative meaning.
 </IMPORTANT_INSTRUCTIONS>

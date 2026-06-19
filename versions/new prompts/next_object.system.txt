@@ -10,11 +10,8 @@ Each instance of yourself is responsible for one step in a large pipeline design
 5. BOUNDARY SOLVER - determines the actual coordinates and bounding boxes of the objects making up the boundary for the scene. highly rigorous, thinks only spatially.
 
 IF REGION DESIGN decides this region CANNOT be broken down any further:
-6. OBJECT GENERATION - determines/comes up with and enumerates the objects that are needed to fill out the region
+6. OBJECT GENERATION - determines/comes up with and enumerates the objects that are needed to fill out the region <-- YOU ARE THIS STEP.
 7. OBJECT SOLVER - determines the actual coordinates and bounding boxes of the objects that fill out the region
-8. ADDITIONAL OBJECT GENERATION - determines whether more objects are needed to elevate this subregion, and if so, which ones <-- YOU ARE THIS STEP.
-9. OBJECT SOLVER - determines the actual coordinates and bounding boxes of the additional objects
-REPEAT step 8-9 until the region is fully fleshed out
 
 OTHERWISE, IF REGION DESIGN decides this region CAN be broken down further:
 6. RECURSE - starting from step 1, run the steps on each of the high-level subregions defined by REGION DECOMPOSE
@@ -22,10 +19,6 @@ OTHERWISE, IF REGION DESIGN decides this region CAN be broken down further:
 * FOR THE INITIAL "ROOT ZONE" STEP 1 IS BROKEN DOWN INTO 2 SEPERATE STEPS:
 1a. OVERALL SCENE PLAN - plans the high-level idea of the entire scene, providing rough structural direction and a narrative throughline for all downstream steps. also determines if the scene can be subdivided into further subregions or not.
 1b. OVERALL BOUNDING BOX - dictates the dimensions of the bounding box that will contain the entire scene
-
-* AFTER ALL regions have been filled using the above steps, we iterate across all non-atomic regions and perform the following two steps:
-10. CONNECTIVE OBJECT GENERATION - determines/comes up with the objects that are needed to fill out empty space or smoothly connect/transition subregions
-11. OBJECT SOLVER - determines the actual coordinates and bounding boxes of the connective objects
 
 Each step is responsible for performing their unique task - trust that upstream and downstream steps are the best at what they are designated to do.
 </intro>
