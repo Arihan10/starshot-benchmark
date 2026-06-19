@@ -122,14 +122,11 @@ def _hydrate_run(run: str) -> None:
             cell.mkdir(parents=True, exist_ok=True)
             log = SlotLog(_run_id(run, slot.id, alias), cell / "events.jsonl")
             log.hydrate_from_disk()
+            # Status is derived live (no fix-up here): a cell killed mid-run has
+            # no live task, so it reads as paused; done/error come from the log.
             if not log.state["events"]:
                 log.state["prompt"] = slot.prompt
-                log.state["model"] = MODELS[alias].model
-                log.state["status"] = "idle"
-            else:
-                log.state["model"] = MODELS[alias].model
-                if log.state["status"] == "running":
-                    log.state["status"] = "paused"
+            log.state["model"] = MODELS[alias].model
             _logs[(run, slot.id, alias)] = log
     _hydrated_runs.add(run)
 
@@ -170,9 +167,15 @@ def _require_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
         if not log.state["events"]:
             log.state["prompt"] = SLOTS_BY_ID[slot_id].prompt
             log.state["model"] = MODELS[model_alias].model
-            log.state["status"] = "idle"
         _logs[(run, slot_id, model_alias)] = log
     return log
+
+
+def _live(task: "asyncio.Task[None] | None") -> bool:
+    """True while a pipeline task is executing this cell — the running-vs-
+    resumable discriminator the status resolver keys on (oneshot has no step
+    gates, so liveness is the only runtime input)."""
+    return task is not None and not task.done()
 
 
 async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
@@ -244,13 +247,12 @@ def _start_cell(run: str, slot_id: str, model_alias: str) -> None:
     slot = _require_slot(slot_id)
     log = _logs[(run, slot_id, model_alias)]
     events = log.state["events"]
-    if log.state.get("status") == "idle" and not events:
+    if not events:
         log.start_run(slot.prompt, MODELS[model_alias].model)
     else:
-        if events and events[-1].get("kind") in ("run.error", "run.paused"):
+        if events[-1].get("kind") in ("run.error", "run.paused"):
             log.truncate_events_to(len(events) - 1)
         log.state["model"] = MODELS[model_alias].model
-        log.state["status"] = "running"
     _tasks[(run, slot_id, model_alias)] = asyncio.create_task(
         _run_cell(run, slot_id, model_alias, version),
     )
@@ -306,10 +308,12 @@ async def list_slots(run: str | None = None) -> dict[str, object]:
         runs: dict[str, dict[str, object]] = {}
         for alias in MODEL_ALIASES:
             log = _logs.get((run, slot.id, alias)) if run else None
-            state = log.state if log is not None else {"status": "idle", "events": []}
-            events = state.get("events", [])
+            events = log.state["events"] if log is not None else []
             runs[alias] = {
-                "status": state.get("status", "idle"),
+                "status": (
+                    rlog.derive_status(events, live=_live(_tasks.get((run, slot.id, alias))))
+                    if log is not None else "idle"
+                ),
                 "events_count": len(events),
                 "last_kind": events[-1]["kind"] if events else None,
             }
@@ -330,9 +334,8 @@ async def slot_resume(slot_id: str, model_alias: str, run: str | None = None) ->
     log = _require_log(run, slot_id, model_alias)
     if any(e.get("kind") == "run.done" for e in log.state["events"]):
         raise HTTPException(status_code=409, detail="run is complete; reset to start a new run")
-    status = log.state.get("status")
-    if status not in ("idle", "paused", "error"):
-        raise HTTPException(status_code=400, detail=f"cell is {status}, not startable")
+    if _live(_tasks.get((run, slot_id, model_alias))):
+        raise HTTPException(status_code=400, detail="cell is already running")
     _require_model_key(model_alias)
     await _cancel_task(run, slot_id, model_alias)
     _start_cell(run, slot_id, model_alias)
@@ -343,10 +346,9 @@ async def slot_resume(slot_id: str, model_alias: str, run: str | None = None) ->
 async def slot_pause(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:
     run = _require_run(run)
     log = _require_log(run, slot_id, model_alias)
-    if log.state.get("status") != "running":
-        raise HTTPException(status_code=400, detail=f"cell is {log.state.get('status')}, not pausable")
+    if not _live(_tasks.get((run, slot_id, model_alias))):
+        raise HTTPException(status_code=400, detail="cell is not running")
     await _cancel_task(run, slot_id, model_alias)
-    log.state["status"] = "paused"
     log.log("run.paused")
     return {"run": run, "slot_id": slot_id, "model": model_alias}
 

@@ -21,6 +21,7 @@ import { createViewer } from "./scene3d.js";
 import { applySceneProjection, createObsModel, emittedStep } from "./events.js";
 import { renderObsTree } from "./obsmini.js";
 import { overridesPayload } from "./promptlab.js";
+import { statusView } from "./status.js";
 
 const root = document.getElementById("compare");
 const titleEl = document.getElementById("compare-title");
@@ -472,13 +473,8 @@ function updateStepLabels() {
     const b = lin ? branchSummaryById(lin.branch) : null;
     if (!lin) {
       curLabel.textContent = lineages.size ? "pick a lineage to view" : "no lineages — pick LLM(s) + “step ▶”";
-    } else if (b?.pending) {
-      curLabel.textContent = `${viewLLM} · awaiting ${stepDesc(b.pending)}`;
-    } else if (b?.status === "running") {
-      curLabel.textContent = `${viewLLM} · running ${b.current ? stepDesc(b.current) : "…"}`;
     } else {
-      const last = branchSteps[branchSteps.length - 1];
-      curLabel.textContent = `${viewLLM} · ${b?.status ?? "…"}${last ? " · " + stepDesc(last) : ""}`;
+      curLabel.textContent = `${viewLLM} · ${statusView(b).label}`;
     }
   }
   updateSimControls();
@@ -577,7 +573,7 @@ function renderLineageBar() {
   lineageBarEl.appendChild(el("span", { class: "cmp-pick-lab", text: "view" }));
   for (const lin of lineages.values()) {
     const b = branchSummaryById(lin.branch);
-    const status = b?.pending ? "paused" : (b?.status ?? "idle");
+    const status = statusView(b).dot;
     const sel = lin.llm === viewLLM;
     lineageBarEl.appendChild(el("button", {
       class: `cmp-cand${sel ? " on" : ""}${b?.status === "error" ? " err" : ""}`,
@@ -653,14 +649,12 @@ async function paint(viewer, slot, model, opts, seq) {
 }
 
 // Plain-language status of a lineage + whether it's waiting on the user.
+// The label comes from the shared renderer; `wait` (paused ⇒ needs a "step ▶")
+// drives the per-lineage prompt.
 function branchStatusText(b) {
   if (!b) return { dot: "idle", text: "no lineage", wait: false };
-  if (b.pending) return { dot: "paused", text: `paused — press “step ▶” to run ${stepDesc(b.pending)}`, wait: true };
-  if (b.status === "running") return { dot: "running", text: `running ${b.current ? stepDesc(b.current) : "a call"}…`, wait: false };
-  if (b.status === "error") return { dot: "error", text: "error — check the lineage log", wait: false };
-  if (b.status === "done") return { dot: "done", text: "done — lineage complete", wait: false };
-  if (b.status === "paused") return { dot: "paused", text: "paused — press “step ▶” to advance", wait: true };
-  return { dot: b.status ?? "idle", text: b.status ?? "starting…", wait: false };
+  const v = statusView(b);
+  return { dot: v.dot, text: v.label, wait: v.state === "paused" };
 }
 
 // Load + render the input/output diff for the CURRENT view step (viewStep /

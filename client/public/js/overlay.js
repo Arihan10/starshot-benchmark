@@ -5,6 +5,7 @@ import { api } from "./api.js";
 import { state, emit, on, cellSummary, cellBranches, branchSummaryById } from "./state.js";
 import { el, toast, stepUntilSelect, openModal } from "./ui.js";
 import { openStream, dispatchSceneEvent, applySceneProjection, createObsModel, emittedStep } from "./events.js";
+import { statusView } from "./status.js";
 import * as obstree from "./obstree.js";
 import * as inquiry from "./inquiry.js";
 
@@ -186,8 +187,11 @@ export async function openCell({ slot, model, branch = false, forceLive = false 
 
   // `forceLive` subscribes without waiting for the next poll — used right
   // after a revert relaunches the cell, so the polled summary is still stale.
+  // A cell parked at a step gate (status paused WITH a pending call) still has
+  // a live task, so subscribe — the next "step" streams its events.
   const summary = currentSummary();
-  const live = forceLive || (branch ? branchSummaryById(branch)?.status : summary?.status) === "running";
+  const info = branch ? branchSummaryById(branch) : summary;
+  const live = forceLive || info?.status === "running" || !!info?.pending;
   if (live) {
     const since = Math.max(obs.model.maxIndex, projection.last_index ?? -1);
     subscribe(seq, since);
@@ -245,25 +249,15 @@ function renderHeader() {
   const pin = branchInfo?.pin && branchInfo.pin !== model ? branchInfo.pin : null;
   titleEl.textContent = `${slot} · ${model}${pin ? " → " + pin : ""}`;
   crumbsEl.textContent = `${state.run}${branch ? (pin ? ` · sim on ${pin}` : " · simulation branch") : ""}`;
-  const status = branch ? (branchInfo?.status ?? "?") : (summary?.status ?? "?");
-  dotEl.className = `dot ${status}`;
   const cellInfo = branch ? branchInfo : summary;
+  const view = statusView(cellInfo);
+  const status = view.state;
   const pending = cellInfo?.pending;
-  const cur = cellInfo?.current;
-  // Show the EXACT step the cell is on: the gated step it's awaiting, the call
-  // in flight while running, else the last phase marker — not a stale phase.
-  const ls = cellInfo?.last_step;
-  const stepDesc = pending
-    ? `awaiting ${pending.step} @ ${pending.node ?? "?"}`
-    : status === "running" && cur
-    ? `running ${cur.template ?? cur.step} @ ${cur.node ?? "?"}`
-    : ls && ls.node
-    ? `${ls.node} · ${ls.phase ?? "?"}`
-    : status === "idle"
-    ? "not started"
-    : null;
-  let statusText = branch ? `branch ${status}` : `${status}${summary?.stepped ? " · stepped" : ""}`;
-  if (stepDesc) statusText += ` · ${stepDesc}`;
+  dotEl.className = `dot ${view.dot}`;
+  // One canonical status message (status.js), plus the overlay-only extras:
+  // the stepped-mode tag, the event count, and the error reason.
+  let statusText = view.label;
+  if (!branch && summary?.stepped) statusText += " · stepped";
   statusText += ` · ${cellInfo?.events_count ?? 0} events`;
   if (status === "error") {
     // Put the failure reason where the eye lands first; the log strip below
@@ -276,12 +270,15 @@ function renderHeader() {
   statusEl.classList.toggle("is-error", status === "error");
 
   // Action button: source cells start/resume/pause; branches pause/resume.
+  // "Live" = a running task OR one parked at a step gate (pending) — both are
+  // pausable; only a cell with no live task resumes/starts.
+  const live = status === "running" || !!pending;
   let label = null;
   if (branch) {
-    if (status === "running") label = "pause sim";
+    if (live) label = "pause sim";
     else if (status === "paused" || status === "error") label = "resume sim";
   } else {
-    if (status === "running") label = "pause";
+    if (live) label = "pause";
     else if (status === "idle") label = "start";
     else if (status === "paused") label = "resume";
     else if (status === "error") label = "retry";
@@ -341,7 +338,7 @@ function renderHeader() {
   let branchSel = document.getElementById("overlay-branch-sel");
   const cellBs = cellBranches(slot, model);
   if (branch || cellBs.length) {
-    const sig = `${branch ?? ""}|${cellBs.map((b) => `${b.id}:${b.pending ? "paused" : b.status ?? ""}`).join(",")}`;
+    const sig = `${branch ?? ""}|${cellBs.map((b) => `${b.id}:${statusView(b).state}`).join(",")}`;
     // Don't rebuild the <select> while the user has it open (a poll would close
     // the dropdown); refresh only when the option set / statuses actually change.
     if (!branchSel || (branchSel.dataset.sig !== sig && document.activeElement !== branchSel)) {
@@ -367,7 +364,7 @@ function renderHeader() {
         ...cellBs.map((b) => {
           const lab = b.pin ?? b.model ?? model;
           const node = b.last_step?.node;
-          const st = b.pending ? "paused" : (b.status ?? "?");
+          const st = statusView(b).state;
           return el("option", { value: b.id, text: `⑂ sim · ${lab}${node ? " @ " + node : ""} · ${st}` });
         }),
       );
@@ -470,8 +467,11 @@ async function onAction() {
   const { slot, model, branch } = state.view ?? {};
   if (!slot) return;
   const summary = currentSummary();
-  const status = branch ? branchSummaryById(branch)?.status : summary?.status;
-  const pausing = status === "running";
+  const info = branch ? branchSummaryById(branch) : summary;
+  const status = info?.status;
+  // Parked-at-gate (pending) counts as live, so the button pauses (breaks out
+  // of stepping) rather than mis-firing a resume on a cell that's still gated.
+  const pausing = status === "running" || !!info?.pending;
   try {
     if (branch) {
       if (pausing) await api.branchPause(branch);

@@ -233,8 +233,6 @@ async def main() -> None:
     slot_log.hydrate_from_disk()
     if not slot_log.state["events"]:
         slot_log.start_run("library generation", MODEL)
-    else:
-        slot_log.state["status"] = "running"
     rlog.bind(slot_log)
     llm.set_model(MODEL)
 

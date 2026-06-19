@@ -8,6 +8,7 @@ import { state, emit, on, cellKey, targetKey, cellSummary, cellBranches, branchS
 import { el, fitToggle, toast, openModal, field, fmtJson, diffPre } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { applySceneProjection } from "./events.js";
+import { statusView } from "./status.js";
 
 const labEl = document.getElementById("lab");
 const runEl = document.getElementById("lab-run");
@@ -1490,26 +1491,19 @@ function simGroups() {
 // rows show the full cell.
 function simRow(sim, grouped) {
   const b = branchSummaryById(sim.id);
+  const view = statusView(b);
   const status = b?.status ?? "starting";
   const pending = b?.pending ?? null;
-  const ls = b?.last_step;
   const pin = b?.pin && b.pin !== sim.model ? b.pin : null;
   const forkLabel = sim.node ? ` ⑂ ${sim.node}` : "";
   const name = grouped
     ? (pin ?? sim.model)
     : `${sim.slot} · ${sim.model}${pin ? " → " + pin : ""}${forkLabel}`;
   const row = el("div", { class: "sim-row" },
-    el("span", { class: `dot ${pending ? "paused" : status}` }),
+    el("span", { class: `dot ${view.dot}` }),
     el("span", { class: "cell-name", text: name, title: "open this lineage's branch view",
       onclick: () => emit("open-cell", { slot: sim.slot, model: sim.model, branch: sim.id }) }),
-    el("span", {
-      class: "step-line",
-      text: pending
-        ? `awaiting: ${pending.step} @ ${pending.node ?? "?"}`
-        : (status === "running" && b?.current)
-          ? `running: ${b.current.template ?? b.current.step} @ ${b.current.node ?? "?"}`
-          : ls ? `${ls.node} · ${ls.phase}` : status,
-    }),
+    el("span", { class: "step-line", text: view.label }),
   );
   if (!grouped) {
     row.appendChild(el("button", { text: "compare", title: "live run vs this simulation, side by side in 3D",
@@ -1524,7 +1518,9 @@ function simRow(sim, grouped) {
     // Between gates: a call is in flight; the next gate appears when it lands.
     row.appendChild(el("span", { class: "muted", text: "step running…" }));
   }
-  if (status === "running") {
+  // Parked at a gate (pending) is still a live task → pause breaks out of it;
+  // only a branch with no live task (hard-paused / errored) resumes.
+  if (status === "running" || pending) {
     row.appendChild(el("button", { text: "pause", onclick: () => simAction(sim, "pause", row) }));
   } else if (status === "paused" || status === "error") {
     row.appendChild(el("button", { text: "resume", onclick: () => simAction(sim, "resume", row) }));

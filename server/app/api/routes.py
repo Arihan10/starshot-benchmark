@@ -267,6 +267,40 @@ class CellGate:
         return True
 
 
+def _live(task: "asyncio.Task[None] | None") -> bool:
+    """True while a pipeline task is executing this slot — the running-vs-
+    resumable discriminator the status resolver keys on. A finished/cancelled
+    task (still parked in the registry) reads False, so status falls back to
+    the log."""
+    return task is not None and not task.done()
+
+
+def _gate_awaiting(gate: "CellGate | None") -> bool:
+    """True when a step gate is parked before its next call — surfaced as
+    paused/awaiting (the awaited step is the gate's `pending`)."""
+    return gate is not None and gate.pending is not None
+
+
+def _cell_status(key: RunKey, slot_log: SlotLog) -> str:
+    """Live status of a source cell — its event log refined by its live
+    gate (awaiting) and task (running)."""
+    return rlog.derive_status(
+        slot_log.state["events"],
+        awaiting=_gate_awaiting(_cell_gates.get(key)),
+        live=_live(_tasks.get(key)),
+    )
+
+
+def _branch_status(br: "Branch") -> str:
+    """Live status of a simulation branch — same resolver, branch-scoped
+    gate/task."""
+    return rlog.derive_status(
+        br.log.state["events"],
+        awaiting=_gate_awaiting(br.gate),
+        live=_live(br.task),
+    )
+
+
 class RewindRequest(BaseModel):
     to_event_index: int
 
@@ -520,7 +554,7 @@ def _branch_summary(br: Branch) -> dict[str, object]:
         # The alias this branch's steps are pinned to (compare's per-LLM
         # lineage), or None when it runs on the cell's base model.
         "pin": next((a for a, m in MODELS.items() if m == br.model_pin), None),
-        "status": br.log.state.get("status", "idle"),
+        "status": _branch_status(br),
         "events_count": len(bevents),
         "last_step": _last_step(bevents),
         # The LLM call waiting for the user's go-ahead, when gated.
@@ -1002,8 +1036,8 @@ def _hydrate_branches(run: str) -> None:
             continue
         blog = SlotLog(_branch_run_id(run, bdir.name), events_path)
         blog.hydrate_from_disk()
-        if blog.state.get("status") == "running":
-            blog.state["status"] = "paused"  # crashed mid-run → resumable
+        # No status fix-up: with no live task/gate, derive_status reports a
+        # non-terminal branch log as paused (resumable) automatically.
         _branches[bdir.name] = Branch(
             id=bdir.name, run=run,
             slot=str(data.get("slot", "")),
@@ -1610,12 +1644,10 @@ def create_app() -> FastAPI:
                 status_code=409,
                 detail="run is complete; reset to start a new run",
             )
-        status = slot_log.state.get("status")
-        if status not in ("idle", "paused", "error"):
-            raise HTTPException(
-                status_code=400,
-                detail=f"slot is {status}, not startable",
-            )
+        # Startable iff nothing is already driving it (running OR parked at a
+        # gate both hold a live task — those advance via /step, not /resume).
+        if _live(_tasks.get((run, slot_id, model_alias))):
+            raise HTTPException(status_code=400, detail="slot is already running")
         await _start_cell(run, slot_id, model_alias)
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
@@ -1625,17 +1657,16 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
-        status = slot_log.state.get("status")
-        if status != "running":
-            raise HTTPException(
-                status_code=400,
-                detail=f"slot is {status}, not pausable",
-            )
+        # Pausable iff a live task exists to cancel — running OR parked at a
+        # step gate (cancelling the gate breaks out of stepping into a hard
+        # pause). A cell with no live task has nothing to pause.
+        if not _live(_tasks.get((run, slot_id, model_alias))):
+            raise HTTPException(status_code=400, detail="slot is not running")
         await _cancel_task(run, slot_id, model_alias)
         # _cancel_task awaits the cancellation, so the pipeline task has
         # already torn down (including generation.cancel_pending via _run's
-        # CancelledError branch) by the time we emit the sentinel.
-        slot_log.state["status"] = "paused"
+        # CancelledError branch) by the time we emit the sentinel. The
+        # run.paused event is what derive_status reads back as paused.
         slot_log.log("run.paused")
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
@@ -1718,7 +1749,6 @@ def create_app() -> FastAPI:
             # (slot, model) cells they pick.
             slot_log.state["prompt"] = slot.prompt
             slot_log.state["model"] = MODELS[model_alias]
-            slot_log.state["status"] = "idle"
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
     @app.post("/slots/{slot_id}/{model_alias}/branch")
@@ -1855,7 +1885,8 @@ def create_app() -> FastAPI:
                     with contextlib.suppress(OSError):
                         (objs / f"{oid}{suffix}").unlink()
         blog.truncate_events_to(cut)
-        blog.state["status"] = "paused"
+        # The task was cancelled above and the log no longer ends in a terminal
+        # marker, so derive_status reports this truncated branch as paused.
         # Refresh the edit set so the next step re-runs under the lab's CURRENT
         # edits (the sim's source of truth); None keeps the existing set.
         if req.overrides is not None:
@@ -1926,26 +1957,23 @@ def create_app() -> FastAPI:
     @app.post("/branches/{branch_id}/pause")
     async def branch_pause(branch_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         br = _require_branch(branch_id)
-        if br.log.state.get("status") != "running":
-            raise HTTPException(
-                status_code=400,
-                detail=f"branch is {br.log.state.get('status')}, not pausable",
-            )
+        # Pausable iff a live task exists to cancel (running or parked at a gate).
+        if not _live(br.task):
+            raise HTTPException(status_code=400, detail="branch is not running")
         await _cancel_branch_task(br)
-        br.log.state["status"] = "paused"
         br.log.log("run.paused")
         return {"branch": branch_id}
 
     @app.post("/branches/{branch_id}/resume")
     async def branch_resume(branch_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         br = _require_branch(branch_id)
-        status = br.log.state.get("status")
-        if status not in ("paused", "error"):
-            raise HTTPException(status_code=400, detail=f"branch is {status}, not resumable")
+        if any(e.get("kind") == "run.done" for e in br.log.state["events"]):
+            raise HTTPException(status_code=409, detail="branch is complete")
+        if _live(br.task):
+            raise HTTPException(status_code=400, detail="branch is already running")
         events = br.log.state["events"]
         if events and events[-1].get("kind") in ("run.error", "run.paused"):
             br.log.truncate_events_to(len(events) - 1)
-        br.log.state["status"] = "running"
         br.task = asyncio.create_task(_run_branch(branch_id))
         return {"branch": branch_id}
 
@@ -2259,8 +2287,9 @@ def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, int]]
 def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
-        slot_log = _slot_logs.get((run, slot.id, alias))
-        state = slot_log.state if slot_log is not None else {"status": "idle", "events": []}
+        key: RunKey = (run, slot.id, alias)
+        slot_log = _slot_logs.get(key)
+        state = slot_log.state if slot_log is not None else {"events": []}
         events = state.get("events", [])
         # Every TOP-LEVEL simulation forked from this cell (fan-out children are
         # excluded — they live transiently inside the compare view). A cell can
@@ -2269,9 +2298,9 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             _branch_summary(b) for b in _branches.values()
             if b.parent is None and b.run == run and b.slot == slot.id and b.model == alias
         ]
-        cgate = _cell_gates.get((run, slot.id, alias))
+        cgate = _cell_gates.get(key)
         runs[alias] = {
-            "status": state.get("status", "idle"),
+            "status": _cell_status(key, slot_log) if slot_log is not None else "idle",
             "events_count": len(events),
             "last_kind": events[-1]["kind"] if events else None,
             "last_step": _last_step(events),
@@ -2292,31 +2321,16 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
 
 
 def _maybe_launch(slot: Slot, model_alias: str, slot_log: SlotLog) -> None:
-    """Prepare each (slot, model) cell for manual start. Nothing auto-runs
-    at boot — the user clicks start/resume/retry per cell from the viewer.
-    Fresh cells sit idle with their seed prompt prefilled; previously-
-    running cells come back as paused (resumable); errored cells come
-    back as error (retry-able); completed cells stay done."""
-    model_id = MODELS[model_alias]
-    events = slot_log.state["events"]
-    if not events:
-        # Pre-seed the prompt + model so slot_resume can start_run() without
-        # the client having to send them. status="idle" tells the viewer to
-        # render a "start" button.
+    """Pre-seed each (slot, model) cell for manual start; nothing auto-runs at
+    boot — the user clicks start/resume/retry per cell. A fresh cell gets its
+    seed prompt + model prefilled (so a later /resume can start_run without the
+    client resending them). Status is no longer stamped here: it's derived live
+    by `derive_status`, so a cell killed mid-run reads as paused (no live task)
+    and a completed/errored cell reads done/error straight from its log — no
+    boot-time fix-up."""
+    if not slot_log.state["events"]:
         slot_log.state["prompt"] = slot.prompt
-        slot_log.state["model"] = model_id
-        slot_log.state["status"] = "idle"
-        return
-    slot_log.state["model"] = model_id
-    # hydrate_from_disk already derived the status from the full event log
-    # (done/error/paused are sticky terminal states; a log with no terminal
-    # marker reads as "running"). The only boot-time adjustment is that a
-    # process killed mid-run leaves a "running" log with no sentinel —
-    # surface that as paused so the user can resume it. A completed run stays
-    # "done" (resume blocked, reset only) even when a post-run mesh retry
-    # appended events after run.done; an errored run stays "error" (retry).
-    if slot_log.state["status"] == "running":
-        slot_log.state["status"] = "paused"
+    slot_log.state["model"] = MODELS[model_alias]
 
 
 _WRAPPED_PROMPT_PREFIX = "Generate a direct,"
@@ -2474,8 +2488,7 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
         return "missing"
     if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
         return "done"
-    if slot_log.state.get("status") not in ("idle", "paused", "error"):
-        return "not_runnable"
+    # No live task and not done → idle / paused / error / crashed: all runnable.
     if auto:
         _set_stepped(key, False)  # finish normally, ungated
     else:
@@ -2522,11 +2535,10 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
             return "stepped"
         gate.budget += 1  # mid-call → queue the step for its next gate
         return "queued"
-    # No live gate. (A finished task leaves no gate; a paused branch was cancelled.)
+    # No live gate (a branch always gates while live, so the task has ended).
     if any(e.get("kind") == "run.done" for e in blog.state["events"]):
         return "done"
-    if blog.state.get("status") not in ("paused", "error"):
-        return "not_runnable"
+    # Not done and no live task → paused / error / crashed: all relaunchable.
     events = blog.state["events"]
     if events and events[-1].get("kind") in ("run.error", "run.paused"):
         blog.truncate_events_to(len(events) - 1)
@@ -2537,7 +2549,6 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
     if model is not None:
         intent["model"] = model  # seed the relaunched gate's override
     br.gate_intent = intent
-    blog.state["status"] = "running"
     br.task = asyncio.create_task(_run_branch(branch_id))
     return "launched"
 
@@ -2806,17 +2817,15 @@ async def _start_cell(run: str, slot_id: str, model_alias: str) -> None:
     # The run's prompt snapshot is the only prompt source — without one
     # (legacy run) nothing can launch.
     _require_run_prompts(run)
-    status = slot_log.state.get("status")
     await _cancel_task(run, slot_id, model_alias)
     events = slot_log.state["events"]
     model_id = MODELS[model_alias]
-    if status == "idle" and not events:
+    if not events:
         slot_log.start_run(slot.prompt, model_id)
     else:
-        if events and events[-1].get("kind") in ("run.error", "run.paused"):
+        if events[-1].get("kind") in ("run.error", "run.paused"):
             slot_log.truncate_events_to(len(events) - 1)
         slot_log.state["model"] = model_id
-        slot_log.state["status"] = "running"
     _tasks[(run, slot_id, model_alias)] = asyncio.create_task(_run(run, slot_id, model_alias))
 
 

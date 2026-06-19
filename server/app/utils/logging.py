@@ -29,50 +29,56 @@ from rich.markup import escape
 
 from app.core.types import BoundingBox, Orientation, ProxyShape
 
-# Uvicorn and subprocess wrappers can leave stdout block-buffered even in a
-# TTY, so Rich batches huge cache.llm blocks until flush — Ctrl-C then dumps
-# the backlog for a long time. Line-buffer + explicit flush keeps the terminal
-# live; verbose kinds still omit megabyte fields from the console (jsonl/SSE
-# keep the full payload).
+# Fixes flushing issue
 try:
-    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    sys.stdout.reconfigure(line_buffering=True)
 except (AttributeError, OSError, ValueError):
     pass
 
 _console = Console()
 _console_suppressed = False
 
-# Full prompts/reasoning live in events.jsonl; printing them here fills the
-# stdout buffer and makes shutdown look like an endless flush.
 _CONSOLE_OMIT_FIELDS = frozenset({"system", "user", "output", "reasoning", "content"})
 _CONSOLE_COMPACT_KINDS = frozenset({"cache.llm"})
 _CONSOLE_STR_MAX = 240
 
 
-def _derive_status(events: list[dict[str, Any]]) -> str:
-    """Map an event log to a slot status.
+def derive_status(
+    events: list[dict[str, Any]], *, awaiting: bool = False, live: bool = False,
+) -> str:
+    """The single, live source of truth for a slot's status.
 
-    `run.done` is STICKY: once a run has completed it stays "done" no matter
-    what lands afterward. A standalone post-run mesh retry (`/retry-mesh`)
-    appends mesh.retry/image/model events *after* run.done; keying status off
-    only the final event would mis-read those as an interrupted run, letting
-    the cell be resumed and re-enter the entire pipeline on top of a finished
-    run. A completed run is terminal — the only way back to a runnable state
-    is reset.
+    Status is NOT purely a function of the event log — distinguishing
+    "running" from "paused at a step gate" from "crashed/idle" needs runtime
+    that the log can't carry, so callers pass it in:
 
-    error/paused are recognized only as the latest event (a resume strips
-    that sentinel before re-running). A non-empty log with no terminal marker
-    is a process that died mid-run ("running"); an empty log is "idle"."""
+      * `awaiting` — a live gate is parked before its next call (the stepped
+        cell's auto-pause). Surfaced as `paused`; the awaited step lives in the
+        gate's `pending` / the trailing `branch.step.pending` event.
+      * `live` — a pipeline task is currently executing this slot.
+
+    Resolution order (terminal markers win; then the runtime refinement; then
+    the started-but-not-live fallback):
+
+      * `done`    — any `run.done` (STICKY: a post-run mesh retry appends events
+        after it, but a completed run is terminal — reset is the only way back).
+      * `error`   — the latest event is `run.error` (a resume strips it first).
+      * `paused`  — a gate is parked (`awaiting`).
+      * `running` — a task is `live` (executing, between gates).
+      * `paused`  — started (non-empty log) but no live task: a clean hard
+        pause (`run.paused`), or a process that died / a cell rehydrated at
+        boot. All resolve to a resumable `paused` without any boot fix-up.
+      * `idle`    — empty log: a fresh, never-started cell.
+    """
     if any(e.get("kind") == "run.done" for e in events):
         return "done"
-    last_kind = events[-1]["kind"] if events else None
-    if last_kind == "run.error":
+    if events and events[-1].get("kind") == "run.error":
         return "error"
-    if last_kind == "run.paused":
+    if awaiting:
         return "paused"
-    if events:
+    if live:
         return "running"
-    return "idle"
+    return "paused" if events else "idle"
 
 
 class SlotLog:
@@ -81,8 +87,10 @@ class SlotLog:
     def __init__(self, slot_id: str, events_path: Path) -> None:
         self.slot_id = slot_id
         self.events_path = events_path
+        # Status is NOT stored here — it's derived live via `derive_status`
+        # (which needs the gate/task runtime the SlotLog can't see). `state`
+        # holds only the durable, log-derived data.
         self.state: dict[str, Any] = {
-            "status": "idle",
             "prompt": None,
             "model": None,
             "events": [],
@@ -119,7 +127,6 @@ class SlotLog:
         self.state["prompt"] = None
         self.state["model"] = None
         if not self.events_path.exists():
-            self.state["status"] = "idle"
             return
         with self.events_path.open("r") as f:
             for line in f:
@@ -137,7 +144,6 @@ class SlotLog:
                 if event.get("kind") == "run.start" and self.state["prompt"] is None:
                     self.state["prompt"] = event.get("prompt")
                     self.state["model"] = event.get("model")
-        self.state["status"] = _derive_status(self.state["events"])
 
     def truncate_events_to(self, n: int) -> int:
         """Keep only the first `n` events on disk and in memory. Returns
@@ -151,14 +157,10 @@ class SlotLog:
             with self.events_path.open("w", encoding="utf-8") as f:
                 for event in self.state["events"]:
                     f.write(json.dumps(event) + "\n")
-        # Status may have changed (e.g. error cleared, or now mid-run).
-        # Completion stays sticky — see _derive_status.
-        self.state["status"] = _derive_status(self.state["events"])
         return n
 
     def start_run(self, prompt: str, model: str) -> None:
         self._close_events_file()
-        self.state["status"] = "running"
         self.state["prompt"] = prompt
         self.state["model"] = model
         self.state["events"] = []
@@ -167,7 +169,6 @@ class SlotLog:
         self.log("run.start", prompt=prompt, model=model)
 
     def finish_run(self) -> None:
-        self.state["status"] = "done"
         self.log("run.done")
 
     def log(self, kind: str, **data: Any) -> None:
@@ -177,8 +178,6 @@ class SlotLog:
             **data,
         }
         self.state["events"].append(event)
-        if kind == "run.error":
-            self.state["status"] = "error"
         f = self._ensure_events_append()
         f.write(json.dumps(event) + "\n")
         f.flush()

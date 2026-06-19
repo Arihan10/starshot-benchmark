@@ -7,6 +7,7 @@ import { api } from "./api.js";
 import { createViewer } from "./scene3d.js";
 import { applySceneProjection, createObsModel } from "./events.js";
 import { renderObsTree, renderObsTrace } from "./obsmini.js";
+import { statusView } from "./status.js";
 
 const boardEl = document.getElementById("board");
 const planeEl = document.getElementById("board-plane");
@@ -64,23 +65,10 @@ boardEl.addEventListener("wheel", (ev) => {
 
 // --- cards ----------------------------------------------------------------------
 
-function stepLine(summary) {
-  if (summary?.pending) {
-    return `⏸ awaiting step: ${summary.pending.step} @ ${summary.pending.node ?? "?"}`;
-  }
-  // While a call is in flight, show THAT call, not the stale last phase.
-  const cur = summary?.current;
-  if (summary?.status === "running" && cur) {
-    return `▶ running: ${cur.template ?? cur.step} @ ${cur.node ?? "?"}`;
-  }
-  const ls = summary?.last_step;
-  if (!ls || !ls.node) return summary?.status === "idle" ? "not started" : "—";
-  return `${ls.node} · ${ls.phase ?? "?"}`;
-}
-
 function cellCard(slot, model) {
   const summary = slot.runs?.[model] ?? { status: "idle", events_count: 0 };
   const branches = summary.branches ?? [];
+  const view = statusView(summary);
   const card = el(
     "div",
     {
@@ -91,24 +79,25 @@ function cellCard(slot, model) {
       onclick: () => emit("open-cell", { slot: slot.id, model, branch: null }),
     },
     el("div", { class: "head" },
-      el("span", { class: `dot ${summary.status}` }),
+      el("span", { class: `dot ${view.dot}` }),
       el("span", { class: "slot-name", text: slot.id }),
       summary.stepped ? el("span", { class: "step-mode-tag", text: "step mode", title: "one LLM call per step — advance from the cell view or “step all”" }) : null,
     ),
-    el("div", { class: "step-line", text: stepLine(summary) }),
-    el("div", { class: "meta-line", text: `${model} · ${summary.events_count} events · ${summary.status}` }),
+    el("div", { class: "step-line", text: view.label }),
+    el("div", { class: "meta-line", text: `${model} · ${summary.events_count} events · ${view.state}` }),
   );
   if (branches.length) {
     const first = branches[0];
+    const bview = statusView(first);
     // Clickable: jump straight into a downstream simulation (the overlay's
     // branch selector then reaches the others) — reachable even on a done cell.
     card.appendChild(
       el("div", { class: "branch-chip", title: "open this cell's downstream simulation",
         onclick: (ev) => { ev.stopPropagation(); emit("open-cell", { slot: slot.id, model, branch: first.id }); } },
-        el("span", { class: `dot ${first.status}` }),
+        el("span", { class: `dot ${bview.dot}` }),
         el("span", { text: branches.length === 1
-          ? `sim · ${first.status} · ${stepLine(first)}`
-          : `${branches.length} sims · ${first.status}…` }),
+          ? `sim · ${bview.label}`
+          : `${branches.length} sims · ${bview.state}…` }),
       ),
     );
   }
@@ -428,7 +417,7 @@ function makeSceneTile(slot, model) {
   const ref = {
     tile, host, viewer: null, io: null, loadedCount: -1, lastLoad: 0,
     obsBody, obsModel: null,
-    setStatus: (s) => { dot.className = `dot ${s.status}`; status.textContent = stepLine(s); },
+    setStatus: (s) => { const v = statusView(s); dot.className = `dot ${v.dot}`; status.textContent = v.label; },
   };
   ref.io = new IntersectionObserver((entries) => {
     for (const e of entries) {
