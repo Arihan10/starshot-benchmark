@@ -26,8 +26,10 @@ import difflib
 import json
 import os
 import re
+import secrets
 import shutil
 import struct
+from dataclasses import dataclass, field
 from datetime import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -84,37 +86,64 @@ _retry_tasks: set[asyncio.Task[None]] = set()
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
 
-# Downstream-simulation BRANCHES. A branch is an ephemeral "what-if" fork of
-# one cell: the original events up to (excluding) an edited step's call, then
-# the pipeline re-run with the run's prompt snapshot PLUS the edited step
-# templates, so that step — and every later firing of it — renders from the
-# edit while everything else replays via `committed.*`. Each branch is fully
-# isolated from its source — its own SlotLog + events.jsonl + objects dir
-# under `<cell>/_branch/`, and its own composite run_id
-# (`run/slot/model/_branch`) so the LLM cache, the `committed.*` resume
-# reader, `generation._pending`, and the Trellis queue all key off the
-# branch, never the source.
+# Downstream-simulation BRANCHES. A branch is a "what-if" fork: the prefix of
+# some source log (a cell, or another branch) up to a chosen event, then the
+# pipeline re-run from there under the run's prompt snapshot PLUS the lab's
+# edited step templates — so the forked step (and every later firing of it)
+# renders from the edit while everything else replays via `committed.*`.
 #
-# One branch per CELL; branches across cells run in parallel (the prompt
-# lab's horizontal simulation), each individually pausable/resumable/
-# discardable. Wiped on break-out (DELETE) and on any source-cell mutation
-# (reset/rewind). In-memory only: a server restart orphans branch dirs until
-# the next branch/reset on that cell replaces them.
-BRANCH_SUBDIR = "_branch"
-_branch_logs: dict[RunKey, SlotLog] = {}
-_branch_tasks: dict[RunKey, asyncio.Task[None]] = {}
-# The prompt-template overrides each live branch simulates with — bound (on
-# top of the run snapshot) every time its task (re)launches.
-_branch_overrides: dict[RunKey, dict[str, dict[str, str]]] = {}
-# Step gates: gated pipelines advance ONE LLM call at a time, pausing before
-# each frontier call until a step endpoint releases it (or flips the task to
-# auto). Branches are ALWAYS gated; source cells are gated when launched in
-# stepped mode (the per-step prompt-iteration workflow).
-_branch_gates: dict[RunKey, "CellGate"] = {}
-# Next-launch gate intent for a PAUSED branch (budget / auto / until) — the
-# branch mirror of `_gate_intents`, consumed by `_run_branch` when a step
-# advance relaunches a paused branch.
-_branch_gate_intents: dict[RunKey, dict[str, object]] = {}
+# Every branch is a FIRST-CLASS entity keyed by its own `branch_id`, stored
+# flat in ONE per-run temp folder: `<run>/_branches/<branch_id>/` with its own
+# events.jsonl + objects/ + branch.json manifest, and its own composite run_id
+# (`<run>/_branches/<branch_id>`) so the LLM cache, the `committed.*` resume
+# reader, `generation._pending`, and the Trellis queue all key off the branch,
+# never the source. This single flat namespace is the whole branching surface:
+#
+#   * MANY branches per cell — fork a cell at different zones (different event
+#     indices) to run several independent downstream sims of one slot at once.
+#   * PARALLEL LLM on one sim — "run the next step on N models" forks N CHILD
+#     branches (`parent` set) of the active sim at its frontier, each pinned to
+#     a model and gated to run exactly that step, all CONCURRENTLY. The user
+#     views each child's scene/output, then KEEPS one (it becomes the sim; the
+#     parent + losing siblings are dropped). Children reuse the identical
+#     branch machinery — no separate "candidate" path.
+#
+# A top-level sim has `parent=None`; a parallel-LLM preview has `parent=<sim
+# id>`. The manifest makes the temp folder self-describing, so branches are
+# enumerable and survive a restart (rehydrated paused/resumable on activation).
+BRANCHES_SUBDIR = "_branches"
+BRANCH_MANIFEST = "branch.json"
+
+
+@dataclass
+class Branch:
+    """One live simulation fork. `slot`/`model` name the ORIGIN cell (the
+    source of the prompt + the promote target); `parent` is the branch this
+    forked from (None ⇒ forked straight from the origin cell). `model_pin` is
+    an OpenRouter id the gate re-aims this branch's frontier call at — set on
+    parallel-LLM children so each runs the same step on a different model;
+    None ⇒ the cell's base model."""
+
+    id: str
+    run: str
+    slot: str
+    model: str
+    parent: str | None
+    fork_index: int
+    overrides: dict[str, dict[str, str]]
+    log: SlotLog
+    model_pin: str | None = None
+    task: asyncio.Task[None] | None = None
+    gate: "CellGate | None" = None
+    # Next-launch gate intent for a PAUSED branch (budget / auto / until /
+    # model) — consumed by `_run_branch` when a step advance relaunches it.
+    gate_intent: dict[str, object] = field(default_factory=dict)
+
+
+# branch_id -> Branch. Process-global: ids are unique across runs, and each
+# Branch carries its own run, so the bid-keyed endpoints need no run param.
+_branches: dict[str, Branch] = {}
+
 _cell_gates: dict[RunKey, "CellGate"] = {}
 # Source cells currently in stepped mode (one LLM call per "step"). Mirrored
 # on disk by a `.stepped` marker in each cell dir so the mode SURVIVES a
@@ -270,14 +299,16 @@ class InquiryMessage(BaseModel):
 
 
 class InquiryRequest(BaseModel):
-    """One turn in a persistent "why did the model do this?" conversation about
-    a pipeline step. The client assembles and OWNS the reviewer's full system
-    prompt — the analyst framing plus that step's exact system / input / output
-    / reasoning — and sends it verbatim as `system`, so what the panel shows
-    (prefilled and editable) is byte-for-byte what is sent. `messages` is the
-    running thread and MUST end with the new user turn. Stateless: the endpoint
-    reads no cell state, so it serves source and simulation-branch calls alike."""
+    """One turn in a persistent "continue this step's conversation" thread. The
+    client seeds the thread with the step's OWN call — its exact system prompt,
+    the user message it received, and the output it produced — then carries the
+    running conversation forward in `messages` (which MUST end with the new user
+    turn). `model` is the step's own model, so the reply comes from the very LLM
+    that made the decision, picking up where it left off — no analyst persona,
+    no appended grounding. Stateless: the endpoint reads no cell state, so it
+    serves source and simulation-branch calls alike."""
 
+    model: str
     system: str = ""
     messages: list[InquiryMessage]
 
@@ -297,18 +328,23 @@ class BranchSeed(BaseModel):
 
 
 class BranchRequest(BaseModel):
-    """Fork the cell so it re-simulates from `event_index` onward — which
-    MUST point at a `cache.llm` event of template `step` carrying logged
+    """Fork the cell into a NEW simulation branch from `event_index` onward —
+    which MUST point at a `cache.llm` event of template `step` carrying logged
     `variables`. The branch keeps the events BEFORE that call and re-runs the
     pipeline with the run snapshot + `overrides` — the prompt lab's FULL edit
-    set (`{step: {"system": text, "user": text}}`), so a session editing
-    several steps simulates exactly what "save to new run" would persist.
-    Replaces any prior branch on this cell."""
+    set (`{step: {"system": text, "user": text}}`).
+
+    `model` (an alias) PINS the fork to a chosen LLM and runs exactly one step
+    on it, then parks — the compare view's per-LLM lineage fork (its prefix is
+    the source's committed events, so the pinned step runs against the original
+    run's prior output as context). Omit it for the prompt lab's "simulate
+    downstream", which pauses at the forked step on the cell's base model."""
 
     event_index: int
     step: str
     overrides: dict[str, dict[str, str]]
     seed: BranchSeed | None = None
+    model: str | None = None
 
 
 class BranchStepRequest(BaseModel):
@@ -377,15 +413,16 @@ class SaveVersionRequest(BaseModel):
 
 class SaveRunRequest(BaseModel):
     """Materialize the prompt lab's simulation as a NEW run: prompts/ =
-    `base_run`'s snapshot + `overrides`, and each listed cell's BRANCH state
-    (events + meshes) copied in as that cell's history — paused mid-pipeline
+    `base_run`'s snapshot + `overrides`, and each listed BRANCH's state (events
+    + meshes) copied in as its origin cell's history — paused mid-pipeline
     states stay resumable because the new snapshot matches the prompts the
-    branch actually ran with."""
+    branch actually ran with. `branches` is a list of branch ids; when two name
+    the same origin cell the later one wins."""
 
     name: str
     base_run: str
     overrides: dict[str, dict[str, str]]
-    cells: list[dict[str, str]]
+    branches: list[str]
     # Display label for run.json; pass the freshly-saved version name when
     # "save to new version" ran first.
     version_label: str | None = None
@@ -406,16 +443,103 @@ def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
     return RUNS_DIR / run / slot_id / model_alias
 
 
-def _branch_dir(run: str, slot_id: str, model_alias: str) -> Path:
-    return _slot_dir(run, slot_id, model_alias) / BRANCH_SUBDIR
+def _branches_root(run: str) -> Path:
+    """The single temp folder holding every active branch of a run."""
+    return _run_dir(run) / BRANCHES_SUBDIR
 
 
-def _branch_run_id(run: str, slot_id: str, model_alias: str) -> str:
-    """Composite run_id for a branch — the source cell's run_id plus the
-    `_branch` segment, so meshes land in `<cell>/_branch/objects/` and every
-    run_id-keyed table (`generation._pending`, the Trellis queue) is isolated
-    from the source."""
-    return f"{_run_id(run, slot_id, model_alias)}/{BRANCH_SUBDIR}"
+def _branch_dir(run: str, branch_id: str) -> Path:
+    return _branches_root(run) / branch_id
+
+
+def _branch_run_id(run: str, branch_id: str) -> str:
+    """Composite run_id for a branch — `<run>/_branches/<branch_id>`, so meshes
+    land in `<run>/_branches/<branch_id>/objects/` and every run_id-keyed table
+    (`generation._pending`, the Trellis queue) is isolated from every other
+    branch and from the source cells."""
+    return f"{run}/{BRANCHES_SUBDIR}/{branch_id}"
+
+
+def _slug(text: str) -> str:
+    """A filesystem/URL-safe lowercase slug — branch ids embed the origin
+    slot + model so the temp folder reads at a glance."""
+    s = re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+    return s or "x"
+
+
+def _new_branch_id(slot_id: str, model_alias: str) -> str:
+    """A unique, readable branch id: `<slot>-<model>-<token>`. The random
+    token keeps several forks of one cell (different zones, or A/B children)
+    collision-free; the slug prefix makes the temp folder self-explaining."""
+    while True:
+        bid = f"{_slug(slot_id)}-{_slug(model_alias)}-{secrets.token_hex(3)}"
+        if bid not in _branches:
+            return bid
+
+
+def _require_branch(branch_id: str) -> Branch:
+    br = _branches.get(branch_id)
+    if br is None:
+        raise HTTPException(status_code=404, detail=f"no such branch: {branch_id}")
+    return br
+
+
+def _branch_manifest(br: Branch) -> dict[str, object]:
+    return {
+        "id": br.id,
+        "slot": br.slot,
+        "model": br.model,
+        "parent": br.parent,
+        "fork_index": br.fork_index,
+        "overrides": br.overrides,
+        "model_pin": br.model_pin,
+    }
+
+
+def _write_branch_manifest(br: Branch) -> None:
+    """Persist the branch's identity to `branch.json` so the temp folder is
+    self-describing — enumerable + rehydratable after a restart."""
+    path = _branch_dir(br.run, br.id) / BRANCH_MANIFEST
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(_branch_manifest(br)) + "\n", encoding="utf-8")
+
+
+def _branch_summary(br: Branch) -> dict[str, object]:
+    """The branch state the client polls: its identity (id / origin cell /
+    parent / fork index) plus where it is and what it's awaiting at its gate."""
+    bevents = br.log.state.get("events", [])
+    gate = br.gate
+    return {
+        "id": br.id,
+        "run": br.run,
+        "slot": br.slot,
+        "model": br.model,
+        "parent": br.parent,
+        "fork_index": br.fork_index,
+        # The alias this branch's steps are pinned to (compare's per-LLM
+        # lineage), or None when it runs on the cell's base model.
+        "pin": next((a for a, m in MODELS.items() if m == br.model_pin), None),
+        "status": br.log.state.get("status", "idle"),
+        "events_count": len(bevents),
+        "last_step": _last_step(bevents),
+        # The LLM call waiting for the user's go-ahead, when gated.
+        "pending": gate.pending if gate is not None else None,
+        # The call currently in flight (released/running), so the UI shows it
+        # instead of the stale last phase while it runs.
+        "current": gate.current if gate is not None else None,
+        "auto": gate.auto if gate is not None else False,
+    }
+
+
+def _validate_overrides(overrides: dict[str, dict[str, str]]) -> None:
+    """Reject an override set naming an unknown step or template role."""
+    for ostep, roles in overrides.items():
+        if ostep not in prompt_store.STEPS:
+            raise HTTPException(status_code=400, detail=f"unknown override step: {ostep}")
+        for role in roles:
+            if role not in ("system", "user"):
+                raise HTTPException(status_code=400, detail=f"unknown template role: {role}")
 
 
 def _resolve_run(run: str | None) -> str:
@@ -483,14 +607,30 @@ def _require_step_event(
 
 # --- decision inquiry -------------------------------------------------------
 #
-# "Why did the model do this?" — a persistent conversation answered by a fixed
-# strong reviewer so analysis quality is constant across whatever subject model
-# is being benchmarked. The reviewer's full prompt (analyst framing + the step's
-# exact system / input / output / reasoning) is assembled and shown CLIENT-SIDE
-# in an editable, prefilled box, so the user sees byte-for-byte what gets sent;
-# this endpoint just pins the reviewer model and forwards. The reviewer is
-# Claude Opus 4.8 at xhigh reasoning regardless of which model ran the step.
-INQUIRY_MODEL = "anthropic/claude-opus-4.8"
+# "Why did the model do this?" — a persistent, free-form chat that CONTINUES the
+# step's own LLM call. The client seeds the thread with that call's exact system
+# prompt, input, and output, then forwards each new turn here; the reply comes
+# from the very model that ran the step (req.model), picking up the conversation
+# where it left off. No analyst persona, no re-grounding: the conversation
+# history is sent unchanged.
+#
+# The one thing appended is FREEFORM_CONTINUATION — and only to the system
+# message. The pipeline's system prompts mandate a strict JSON-only answer
+# ("respond with a single JSON object… no prose"), and the seeded assistant turn
+# IS that JSON, so without releasing that constraint the model just keeps
+# emitting the step's output schema (useless for a conversation). This frees the
+# remaining turns to be plain prose while the message history stays untouched.
+# Stateless: no run state is read or mutated, so it serves source and
+# simulation-branch calls alike.
+FREEFORM_CONTINUATION = (
+    "\n\n---\n"
+    "The structured-output task above is COMPLETE. Everything below is a free-form "
+    "conversation with a developer reviewing the decision you just made. For the rest "
+    "of this conversation, DISREGARD any instruction above to answer only in JSON, to "
+    "conform to a fixed schema, or to avoid prose — those governed the task output "
+    "above, not this discussion. Reply in plain, conversational prose (no JSON, no code "
+    "fences) and answer the developer's questions directly, explaining your earlier work."
+)
 
 
 # --- prompt inspector -------------------------------------------------------
@@ -612,7 +752,10 @@ def _run_cells_with_data(run: str) -> list[tuple[str, Path, float]]:
         if st.st_size <= 0:
             continue
         rel = ev.relative_to(run_dir).parts  # (slot, model, "events.jsonl")
-        if len(rel) >= 2:
+        # The `_branches/<id>/events.jsonl` temp logs also match `*/*/…`; only
+        # real slot cells count, so the prompt inspector / run-date scan never
+        # mistakes a live branch for a phantom cell.
+        if len(rel) >= 2 and rel[0] in SLOTS_BY_ID:
             created = getattr(st, "st_birthtime", st.st_mtime)
             cells.append((f"{rel[0]}/{rel[1]}", ev, created))
     return cells
@@ -829,7 +972,48 @@ def _hydrate_run(run: str) -> None:
             if (slot_dir / ".stepped").exists():
                 _stepped_cells.add((run, slot.id, alias))
             _maybe_launch(slot, alias, slot_log)
+    _hydrate_branches(run)
     _hydrated_runs.add(run)
+
+
+def _hydrate_branches(run: str) -> None:
+    """Rebuild the in-memory branch registry from the run's self-describing
+    `_branches/<id>/branch.json` manifests, so the temp folder's TOP-LEVEL sims
+    survive a server restart — coming back paused/resumable (no live task/gate)
+    exactly like source cells. Transient fan-out children (a `parent` set) are
+    stale on restart, so their dirs are swept instead of revived."""
+    root = _branches_root(run)
+    if not root.is_dir():
+        return
+    for bdir in sorted(root.iterdir()):
+        if not bdir.is_dir() or bdir.name in _branches:
+            continue
+        manifest = bdir / BRANCH_MANIFEST
+        events_path = bdir / "events.jsonl"
+        if not manifest.is_file() or not events_path.is_file():
+            shutil.rmtree(bdir, ignore_errors=True)
+            continue
+        try:
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            data = None
+        if not isinstance(data, dict) or data.get("parent"):
+            shutil.rmtree(bdir, ignore_errors=True)
+            continue
+        blog = SlotLog(_branch_run_id(run, bdir.name), events_path)
+        blog.hydrate_from_disk()
+        if blog.state.get("status") == "running":
+            blog.state["status"] = "paused"  # crashed mid-run → resumable
+        _branches[bdir.name] = Branch(
+            id=bdir.name, run=run,
+            slot=str(data.get("slot", "")),
+            model=str(data.get("model", "")),
+            parent=None,
+            fork_index=int(data.get("fork_index", 0) or 0),
+            overrides=data["overrides"] if isinstance(data.get("overrides"), dict) else {},
+            log=blog,
+            model_pin=data.get("model_pin") if isinstance(data.get("model_pin"), str) else None,
+        )
 
 
 def create_app() -> FastAPI:
@@ -860,19 +1044,21 @@ def create_app() -> FastAPI:
                 task.cancel()
             for task in _retry_tasks:
                 task.cancel()
-            for task in _branch_tasks.values():
-                task.cancel()
+            for br in _branches.values():
+                if br.task is not None:
+                    br.task.cancel()
             for task in list(_tasks.values()):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
             for task in list(_retry_tasks):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
-            for task in list(_branch_tasks.values()):
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-            for branch_log in _branch_logs.values():
-                branch_log.close()
+            for br in list(_branches.values()):
+                if br.task is not None:
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await br.task
+            for br in _branches.values():
+                br.log.close()
             await oneshot.shutdown()
             await threed.disconnect_http()
 
@@ -1091,24 +1277,36 @@ def create_app() -> FastAPI:
 
     @app.post("/inquire")
     async def inquire(req: InquiryRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        """Ask the reviewer (Claude Opus 4.8, xhigh reasoning) the latest
-        question in an inquiry thread, and keep asking — the client carries the
-        conversation forward in `messages`, so the thread is persistent. `system`
-        is the exact, client-assembled prompt (analyst framing + the step's
-        grounding — shown and editable in the panel). Stateless: nothing about
-        any run is read or mutated."""
+        """Continue a step's own conversation: seeded client-side with that
+        call's system / input / output, `messages` carries the running thread
+        and MUST end with the new user turn, and the reply comes from `model` —
+        the very LLM that made the step. The step's system prompt is sent with
+        FREEFORM_CONTINUATION appended so the model answers in prose instead of
+        the step's JSON schema; the message history is sent unchanged. Stateless:
+        no run state is touched."""
+        if not req.model:
+            raise HTTPException(status_code=400, detail="no model to continue the step's call with")
         if not req.messages or req.messages[-1].role != "user":
             raise HTTPException(
                 status_code=400,
                 detail="messages must be non-empty and end with a user turn",
             )
         convo = [{"role": m.role, "content": m.content} for m in req.messages]
+        # Continue at the effort the step's model runs at in the pipeline (mirrors
+        # llm._reasoning_effort): GPT stays at medium (xhigh is slow + costly
+        # there), every other provider at xhigh.
+        effort = "medium" if req.model.startswith("openai/") else "xhigh"
         try:
-            answer, reasoning = await llm.chat(model=INQUIRY_MODEL, system=req.system, messages=convo)
+            answer, reasoning = await llm.chat(
+                model=req.model,
+                system=req.system + FREEFORM_CONTINUATION,
+                messages=convo,
+                reasoning_effort=effort,
+            )
         except Exception as e:
             # Provider/transport failure → clean 502 the panel shows inline.
             raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
-        return {"answer": answer, "reasoning": reasoning, "model": INQUIRY_MODEL}
+        return {"answer": answer, "reasoning": reasoning, "model": req.model}
 
     @app.get("/runs/{run}/prompt-templates")
     async def run_prompt_templates(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -1170,7 +1368,10 @@ def create_app() -> FastAPI:
                         "model_id": e.get("model"),
                         "tokens_out": e.get("tokens_out"),
                         "output_preview": output[:240] + ("…" if len(output) > 240 else ""),
-                        "branch_live": (run, slot_id, alias) in _branch_logs,
+                        "branch_live": any(
+                            b.parent is None and b.run == run and b.slot == slot_id and b.model == alias
+                            for b in _branches.values()
+                        ),
                     }
                 )
         items.sort(key=lambda d: (str(d["slot"]), str(d["model"]), int(d["index"] or 0)))
@@ -1200,20 +1401,18 @@ def create_app() -> FastAPI:
             "tokens_out": event.get("tokens_out"),
         }
 
-    @app.get("/runs/{run}/branch-step-event")
-    async def run_branch_step_event(  # pyright: ignore[reportUnusedFunction]
-        run: str, slot: str, model: str, step: str, node: str | None = None,
+    @app.get("/branches/{branch_id}/step-event")
+    async def branch_step_event(  # pyright: ignore[reportUnusedFunction]
+        branch_id: str, step: str, node: str | None = None,
     ) -> dict[str, object]:
-        """The matching call's FULL bytes from the cell's simulation branch —
-        the same template (and node, when given), so the lab can diff the live
-        run's input/output against the simulated-edit branch. 404 when the cell
-        has no live branch or no such call in it yet."""
+        """The matching call's FULL bytes from a simulation branch — the same
+        template (and node, when given), so the lab can diff the live run's
+        input/output against the simulated-edit branch. 404 when the branch has
+        no such call in it yet."""
         if step not in prompt_store.STEPS:
             raise HTTPException(status_code=404, detail=f"unknown step: {step}")
-        blog = _branch_logs.get((run, slot, model))
-        if blog is None:
-            raise HTTPException(status_code=404, detail="no simulation branch for this cell")
-        events = blog.state["events"]
+        br = _require_branch(branch_id)
+        events = br.log.state["events"]
         cands = [e for e in events if e.get("kind") == "cache.llm" and e.get("template") == step]
         # Match the SPECIFIC node when one is given — never fall back to another
         # node's call (e.g. a copied-prefix `root` decompose), which would diff a
@@ -1230,7 +1429,7 @@ def create_app() -> FastAPI:
         real = [e for e in cands if not e.get("seeded")]
         if real:
             match = real[-1]
-        elif cands and not _branch_awaiting(run, slot, model, step, node):
+        elif cands and not _branch_awaiting(br, step, node):
             match = cands[-1]  # seed cache-hit and consumed — it is the output
         else:
             match = None
@@ -1238,8 +1437,9 @@ def create_app() -> FastAPI:
             where = f"{step} @ {node}" if node else step
             raise HTTPException(status_code=404, detail=f"the branch has not re-run {where} yet")
         return {
-            "slot": slot,
-            "model": model,
+            "branch": branch_id,
+            "slot": br.slot,
+            "model": br.model,
             "step": step,
             "index": match.get("index"),
             "node": match.get("node"),
@@ -1358,9 +1558,9 @@ def create_app() -> FastAPI:
                 detail="slot has no run to rewind",
             )
         _require_run_prompts(run)
-        # Reverting rewrites the source log; this cell's branch is now stale and
-        # any in-flight task must stop before we rewrite under it.
-        await _discard_branch((run, slot_id, model_alias))
+        # Reverting rewrites the source log; this cell's branches are now stale
+        # and any in-flight task must stop before we rewrite under it.
+        await _discard_branches_of_cell(run, slot_id, model_alias)
         await _cancel_task(run, slot_id, model_alias)
         events = slot_log.state["events"]
         cut = max(0, min(req.to_event_index, len(events)))
@@ -1488,10 +1688,9 @@ def create_app() -> FastAPI:
         _require_model(model_alias)
         if start:
             _require_run_prompts(run)
-        # Reset wipes the whole cell dir (including any `_branch/`), so tear
-        # this cell's branch down first to avoid it writing into a dir being
-        # deleted.
-        await _discard_branch((run, slot.id, model_alias))
+        # Reset wipes the whole cell dir, so tear this cell's branches down
+        # first to avoid one writing into a dir being deleted.
+        await _discard_branches_of_cell(run, slot.id, model_alias)
         await _cancel_task(run, slot_id, model_alias)
         # Cancel any standalone retries (registered on generation._pending but
         # with no owning _run task to drive cleanup) that the running task
@@ -1529,43 +1728,68 @@ def create_app() -> FastAPI:
         req: BranchRequest,
         run: str | None = None,
     ) -> dict[str, object]:
-        """Fork the cell so it re-simulates from `event_index` onward with the
-        edited step templates overriding the run snapshot. Replaces any prior
-        branch on this cell. Isolated: writes only under `<cell>/_branch/`."""
+        """Fork the cell into a NEW simulation branch at `event_index` (a
+        re-renderable cache.llm call of template `step`) under the run snapshot +
+        the lab's edited templates. MANY branches per cell coexist — fork
+        different zones (or LLMs) to run several independent downstream sims of
+        one slot at once. Returns the new branch id; all later control is keyed
+        by it under `/branches/{id}/…`. Isolated: writes only under
+        `<run>/_branches/<id>/`, never the source cell.
+
+        With `model` (an alias) the fork is PINNED to that LLM and runs exactly
+        one step before parking — the compare view's per-LLM lineage. Without it
+        the branch pauses at the forked step on the cell's base model."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         _require_run_prompts(run)
-        for ostep, roles in req.overrides.items():
-            if ostep not in prompt_store.STEPS:
-                raise HTTPException(status_code=400, detail=f"unknown override step: {ostep}")
-            for role in roles:
-                if role not in ("system", "user"):
-                    raise HTTPException(status_code=400, detail=f"unknown template role: {role}")
-        events = await _fork_branch(
+        _validate_overrides(req.overrides)
+        if req.model is not None and req.model not in MODELS:
+            raise HTTPException(status_code=400, detail=f"unknown model: {req.model}")
+        # A pinned LLM lineage runs its forked step immediately (gate budget 1)
+        # then parks; an unpinned branch pauses AT the forked step for a manual
+        # step on the base model.
+        pin = MODELS[req.model] if req.model is not None else None
+        br = await _fork_branch(
             run, slot.id, model_alias,
             event_index=req.event_index, step=req.step,
             overrides=req.overrides, seed=req.seed,
+            model_pin=pin, gate_budget=1 if pin else 0,
         )
         return {
+            "branch": _branch_summary(br),
             "run": run,
             "slot_id": slot.id,
             "model": model_alias,
-            "event_index": req.event_index,
-            "events": events,
             "seeded": req.seed is not None,
         }
 
-    @app.get("/slots/{slot_id}/{model_alias}/branch/scene")
-    async def branch_scene(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    @app.get("/runs/{run}/branches")
+    async def list_branches(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Every TOP-LEVEL simulation branch of a run (parallel-LLM fan-out
+        children excluded) — the prompt lab's sims list. Rehydrated branches
+        come back paused/resumable."""
         run = _resolve_run(run)
-        blog = _require_branch_log(run, slot_id, model_alias)
-        return _scene_projection(list(blog.state["events"]))
+        _hydrate_run(run)
+        return {
+            "run": run,
+            "branches": [
+                _branch_summary(b) for b in _branches.values()
+                if b.run == run and b.parent is None
+            ],
+        }
 
-    @app.get("/slots/{slot_id}/{model_alias}/branch/events")
-    async def branch_events(slot_id: str, model_alias: str, since: int = -1, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
-        run = _resolve_run(run)
-        blog = _require_branch_log(run, slot_id, model_alias)
+    @app.get("/branches/{branch_id}")
+    async def branch_status(branch_id: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        return _branch_summary(_require_branch(branch_id))
+
+    @app.get("/branches/{branch_id}/scene")
+    async def branch_scene(branch_id: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        return _scene_projection(list(_require_branch(branch_id).log.state["events"]))
+
+    @app.get("/branches/{branch_id}/events")
+    async def branch_events(branch_id: str, since: int = -1) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        blog = _require_branch(branch_id).log
         q = blog.subscribe()
         snapshot = list(blog.state["events"])
         if since >= 0:
@@ -1575,47 +1799,48 @@ def create_app() -> FastAPI:
             ]
         return StreamingResponse(_sse(blog, q, snapshot), media_type="text/event-stream")
 
-    @app.get("/slots/{slot_id}/{model_alias}/branch/meshes")
-    async def branch_meshes(slot_id: str, model_alias: str, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
-        run = _resolve_run(run)
-        blog = _require_branch_log(run, slot_id, model_alias)
+    @app.get("/branches/{branch_id}/meshes")
+    async def branch_meshes(branch_id: str, since_index: int | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        """The branch's committed meshes. A branch hardlinks the prefix's source
+        meshes, so serve only the ids it actually committed (never the dropped
+        prefix ones). `since_index` restricts to meshes placed at/after that
+        event — compare attaches just the NEW meshes a fan-out child placed over
+        the shared prefix already on screen."""
+        blog = _require_branch(branch_id).log
+        evs = list(blog.state["events"])
+        if since_index is not None:
+            ids = {
+                str(e["id"]) for e in evs
+                if e.get("kind") == "model" and isinstance(e.get("index"), int)
+                and int(e["index"]) >= since_index and isinstance(e.get("id"), str)  # type: ignore[arg-type]
+            }
+        else:
+            ids = _committed_mesh_ids(evs)
         objects_dir = blog.events_path.parent / "objects"
-        # Branch hardlinks the whole source objects/ dir, so serve only the
-        # meshes the branch actually committed — never the dropped prefix ones.
         return StreamingResponse(
-            _mesh_bundle(objects_dir, _committed_mesh_ids(list(blog.state["events"]))),
+            _mesh_bundle(objects_dir, ids),
             media_type="application/octet-stream",
             headers={"Cache-Control": "no-store"},
         )
 
-    @app.post("/slots/{slot_id}/{model_alias}/branch/rewind")
+    @app.post("/branches/{branch_id}/rewind")
     async def branch_rewind(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str,
-        model_alias: str,
+        branch_id: str,
         req: BranchRewindRequest,
-        run: str | None = None,
     ) -> dict[str, object]:
         """Revert a simulation branch to before `to_event_index` and pause there
         — the branch mirror of the source `/rewind`. Re-running forward (a plain
-        `/branch/step`) then regenerates the reverted call under the CURRENT run
-        snapshot + refreshed edits. Scoped to the branch log: the source cell and
-        the branch's hardlinked prefix meshes are untouched."""
-        run = _resolve_run(run)
-        _require_slot(slot_id)
-        _require_model(model_alias)
-        _require_run_prompts(run)
-        key: RunKey = (run, slot_id, model_alias)
-        blog = _require_branch_log(run, slot_id, model_alias)
+        `/branches/{id}/step`) then regenerates the reverted call under the
+        CURRENT run snapshot + refreshed edits. Scoped to the branch log: the
+        source cell and the branch's hardlinked prefix meshes are untouched."""
+        br = _require_branch(branch_id)
+        _require_run_prompts(br.run)
         if req.overrides is not None:
-            for ostep, roles in req.overrides.items():
-                if ostep not in prompt_store.STEPS:
-                    raise HTTPException(status_code=400, detail=f"unknown override step: {ostep}")
-                for role in roles:
-                    if role not in ("system", "user"):
-                        raise HTTPException(status_code=400, detail=f"unknown template role: {role}")
+            _validate_overrides(req.overrides)
         # Stop the in-flight branch task but KEEP its log / overrides / dir, then
         # rewrite the log under it (mirrors source rewind's discard-then-truncate).
-        await _cancel_branch_task(key)
+        await _cancel_branch_task(br)
+        blog = br.log
         events = blog.state["events"]
         cut = max(0, min(req.to_event_index, len(events)))
         # Drop the meshes of every node generated at/after the cut so a re-run
@@ -1634,8 +1859,9 @@ def create_app() -> FastAPI:
         # Refresh the edit set so the next step re-runs under the lab's CURRENT
         # edits (the sim's source of truth); None keeps the existing set.
         if req.overrides is not None:
-            _branch_overrides[key] = {s: dict(r) for s, r in req.overrides.items()}
-        return {"run": run, "slot_id": slot_id, "model": model_alias, "events": len(blog.state["events"])}
+            br.overrides = {s: dict(r) for s, r in req.overrides.items()}
+            _write_branch_manifest(br)
+        return {"branch": branch_id, "events": len(blog.state["events"])}
 
     @app.post("/slots/{slot_id}/{model_alias}/step")
     async def cell_step(  # pyright: ignore[reportUnusedFunction]
@@ -1675,76 +1901,116 @@ def create_app() -> FastAPI:
         advanced = results.get("stepped", []) + results.get("launched", []) + results.get("queued", []) + results.get("seeking", [])
         return {"run": run, "advanced": advanced, "auto": auto, "until": until, "by_result": results}
 
-    @app.post("/slots/{slot_id}/{model_alias}/branch/step")
+    @app.post("/branches/{branch_id}/step")
     async def branch_step(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str,
-        model_alias: str,
+        branch_id: str,
         req: BranchStepRequest,
-        run: str | None = None,
     ) -> dict[str, object]:
         """Advance a simulation branch by one LLM call. Like the source
         "step", this QUEUES a credit when the branch is mid-call (so a batch
         "step sims" never errors on a branch that isn't sitting at a gate),
         runs it to completion with `auto`, or fast-forwards to the next call of
-        `until` and pauses there. 409 only when there's genuinely nothing to
-        advance (done / no branch / overrides lost)."""
-        run = _resolve_run(run)
-        _require_branch_log(run, slot_id, model_alias)
+        `until` and pauses there. `model` (an alias) re-aims the next gated call
+        at a chosen LLM. 409 only when there's genuinely nothing to advance."""
+        _require_branch(branch_id)
         if req.until is not None and req.until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
-        # `req.model` is a model ALIAS chosen in the compare UI; map to its
-        # OpenRouter id so the next gated call re-aims at it (None = unchanged).
         if req.model is not None and req.model not in MODELS:
             raise HTTPException(status_code=400, detail=f"unknown model: {req.model}")
         model_id = MODELS[req.model] if req.model is not None else None
-        result = await _advance_branch(run, slot_id, model_alias, auto=req.auto, until=req.until, model=model_id)
+        result = await _advance_branch(branch_id, auto=req.auto, until=req.until, model=model_id)
         if result in ("missing", "done", "not_runnable"):
             raise HTTPException(status_code=409, detail=f"cannot step: {result}")
-        return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto, "until": req.until, "result": result, "ran_model": req.model}
+        return {"branch": branch_id, "auto": req.auto, "until": req.until, "result": result, "ran_model": req.model}
 
-    @app.post("/slots/{slot_id}/{model_alias}/branch/pause")
-    async def branch_pause(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        run = _resolve_run(run)
-        blog = _require_branch_log(run, slot_id, model_alias)
-        key: RunKey = (run, slot_id, model_alias)
-        if blog.state.get("status") != "running":
+    @app.post("/branches/{branch_id}/pause")
+    async def branch_pause(branch_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        br = _require_branch(branch_id)
+        if br.log.state.get("status") != "running":
             raise HTTPException(
                 status_code=400,
-                detail=f"branch is {blog.state.get('status')}, not pausable",
+                detail=f"branch is {br.log.state.get('status')}, not pausable",
             )
-        await _cancel_branch_task(key)
-        blog.state["status"] = "paused"
-        blog.log("run.paused")
-        return {"run": run, "slot_id": slot_id, "model": model_alias}
+        await _cancel_branch_task(br)
+        br.log.state["status"] = "paused"
+        br.log.log("run.paused")
+        return {"branch": branch_id}
 
-    @app.post("/slots/{slot_id}/{model_alias}/branch/resume")
-    async def branch_resume(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        run = _resolve_run(run)
-        blog = _require_branch_log(run, slot_id, model_alias)
-        key: RunKey = (run, slot_id, model_alias)
-        if key not in _branch_overrides:
-            raise HTTPException(
-                status_code=409,
-                detail="branch overrides are gone (server restarted) — re-create the branch",
-            )
-        status = blog.state.get("status")
+    @app.post("/branches/{branch_id}/resume")
+    async def branch_resume(branch_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        br = _require_branch(branch_id)
+        status = br.log.state.get("status")
         if status not in ("paused", "error"):
             raise HTTPException(status_code=400, detail=f"branch is {status}, not resumable")
-        events = blog.state["events"]
+        events = br.log.state["events"]
         if events and events[-1].get("kind") in ("run.error", "run.paused"):
-            blog.truncate_events_to(len(events) - 1)
-        blog.state["status"] = "running"
-        _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot_id, model_alias))
-        return {"run": run, "slot_id": slot_id, "model": model_alias}
+            br.log.truncate_events_to(len(events) - 1)
+        br.log.state["status"] = "running"
+        br.task = asyncio.create_task(_run_branch(branch_id))
+        return {"branch": branch_id}
 
-    @app.delete("/slots/{slot_id}/{model_alias}/branch")
-    async def discard_branch(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        run = _resolve_run(run)
-        _require_slot(slot_id)
-        _require_model(model_alias)
+    @app.delete("/branches/{branch_id}")
+    async def discard_branch(branch_id: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         # Idempotent — a missing branch is a no-op.
-        await _discard_branch((run, slot_id, model_alias))
-        return {"run": run, "slot_id": slot_id, "model": model_alias}
+        await _discard_branch(branch_id)
+        return {"branch": branch_id}
+
+    @app.post("/branches/{branch_id}/commit")
+    async def commit_branch(branch_id: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Promote a branch to BE its origin source cell: the branch's events +
+        meshes replace the cell's own, and the branch (with its children) is
+        discarded. The deliberate, on-demand "replace source with the
+        simulation" action — the prior source state is overwritten. Sibling
+        branches of the same cell are left alone (their prefixes are independent
+        copies)."""
+        br = _require_branch(branch_id)
+        run, slot_id, model_alias = br.run, br.slot, br.model
+        src_log = _slot_logs.get((run, slot_id, model_alias))
+        if src_log is None:
+            raise HTTPException(status_code=404, detail="no source cell to replace")
+        # Stop the source pipeline + this branch (keeping its log + dir for the copy).
+        await _cancel_task(run, slot_id, model_alias)
+        await _cancel_branch_task(br)
+        bdir = br.log.events_path.parent
+        cell_dir = src_log.events_path.parent
+        src_objects = _objects_dir(cell_dir)
+        # The branch's `model`/`image` events point at its own
+        # `_branches/<id>/objects/` dir, which is moved + deleted below — rewrite
+        # those URLs to the source cell's `objects/` so the promoted scene's
+        # mesh/image URLs stay valid (the artifact route maps objects ↔
+        # objects-optimized, so the bare `/objects/` segment is correct either way).
+        seg = f"/{BRANCHES_SUBDIR}/{branch_id}/objects/"
+        dest_seg = f"/{slot_id}/{model_alias}/objects/"
+        branch_events = list(br.log.state["events"])
+        src_log.close()
+
+        def _write_promoted() -> None:
+            with src_log.events_path.open("w", encoding="utf-8") as f:
+                for e in branch_events:
+                    url = e.get("url")
+                    if isinstance(url, str) and seg in url:
+                        e = {**e, "url": url.replace(seg, dest_seg)}
+                    f.write(json.dumps(e) + "\n")
+        await asyncio.to_thread(_write_promoted)
+        # Move the branch's objects over the source's. The branch's prefix files
+        # are hardlinks to the source inodes, so dropping the source dir first is
+        # safe; slot_meshes filters to committed ids, so any stale
+        # hardlinked-but-dropped files in the moved dir aren't served.
+        branch_objects = bdir / "objects"
+
+        def _swap_objects() -> None:
+            shutil.rmtree(src_objects, ignore_errors=True)
+            if branch_objects.is_dir():
+                shutil.move(str(branch_objects), str(src_objects))
+            else:
+                src_objects.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(_swap_objects)
+        src_log.hydrate_from_disk()  # reload source state from the promoted log
+        await _discard_branch(branch_id)  # remove the now-consumed branch dir + state
+        return {
+            "branch": branch_id, "run": run, "slot_id": slot_id, "model": model_alias,
+            "events": len(src_log.state["events"]),
+        }
 
     @app.post("/versions/fork")
     async def fork_version(req: ForkVersionRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -1850,49 +2116,6 @@ def create_app() -> FastAPI:
             simulated.append(f"{slot_id}/{alias}")
         return {"run": run, "steps": sorted(steps), "simulated": simulated, "skipped": skipped}
 
-    @app.post("/slots/{slot_id}/{model_alias}/branch/commit")
-    async def commit_branch(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Promote a cell's simulation branch to BE the source cell: the
-        branch's events + meshes replace the cell's own, and the branch is
-        discarded. The deliberate, on-demand "replace source with the
-        simulation" action — the inverse of the non-destructive fork. The
-        prior source state is overwritten (gone)."""
-        run = _resolve_run(run)
-        _require_slot(slot_id)
-        _require_model(model_alias)
-        key: RunKey = (run, slot_id, model_alias)
-        blog = _branch_logs.get(key)
-        if blog is None:
-            raise HTTPException(status_code=404, detail="no active branch for this cell")
-        src_log = _slot_logs.get(key)
-        if src_log is None:
-            raise HTTPException(status_code=404, detail="no source cell to replace")
-        # Stop both pipelines, then swap the branch's log + meshes into source.
-        await _cancel_task(run, slot_id, model_alias)
-        await _cancel_branch_task(key)  # keeps blog + dir for the copy below
-        bdir = blog.events_path.parent
-        cell_dir = src_log.events_path.parent
-        src_objects = _objects_dir(cell_dir)
-        src_log.close()
-        await asyncio.to_thread(shutil.copyfile, bdir / "events.jsonl", src_log.events_path)
-        # Move the branch's objects over the source's. The branch's prefix
-        # files are hardlinks to the source inodes, so dropping the source dir
-        # first is safe; slot_meshes filters to committed ids, so any stale
-        # hardlinked-but-dropped files in the moved dir aren't served.
-        branch_objects = bdir / "objects"
-
-        def _swap_objects() -> None:
-            shutil.rmtree(src_objects, ignore_errors=True)
-            if branch_objects.is_dir():
-                shutil.move(str(branch_objects), str(src_objects))
-            else:
-                src_objects.mkdir(parents=True, exist_ok=True)
-        await asyncio.to_thread(_swap_objects)
-        src_log.hydrate_from_disk()  # reload source state from the promoted log
-        await _discard_branch(key)   # remove the now-consumed branch dir + state
-        emit_index = len(src_log.state["events"])
-        return {"run": run, "slot_id": slot_id, "model": model_alias, "events": emit_index}
-
     @app.post("/versions/save")
     async def save_version(req: SaveVersionRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         """Persist the prompt lab's edit as a new source version: the base
@@ -1953,24 +2176,44 @@ def create_app() -> FastAPI:
             + "\n",
             encoding="utf-8",
         )
-        for cell in req.cells:
-            slot_id = str(cell.get("slot", ""))
-            alias = str(cell.get("model", ""))
-            key: RunKey = (req.base_run, slot_id, alias)
-            bdir = _branch_dir(req.base_run, slot_id, alias)
-            if not (bdir / "events.jsonl").is_file():
-                skipped.append(f"{slot_id}/{alias}")
+        seen_cells: set[tuple[str, str]] = set()
+        for branch_id in req.branches:
+            br = _branches.get(branch_id)
+            if br is None or br.run != req.base_run:
+                skipped.append(branch_id)
                 continue
-            # Stop the live task first so the copied log is quiescent. The
-            # branch itself stays on the source cell, untouched.
-            await _cancel_branch_task(key)
-            dest = run_dir / slot_id / alias
+            cell = (br.slot, br.model)
+            if cell in seen_cells:  # two kept branches on one cell — later wins
+                skipped.append(branch_id)
+                continue
+            bdir = _branch_dir(br.run, branch_id)
+            if not (bdir / "events.jsonl").is_file():
+                skipped.append(branch_id)
+                continue
+            seen_cells.add(cell)
+            # Stop the live task first so the copied log is quiescent. The branch
+            # itself stays in the base run's temp folder, untouched.
+            await _cancel_branch_task(br)
+            dest = run_dir / br.slot / br.model
             dest.mkdir(parents=True, exist_ok=True)
-            await asyncio.to_thread(
-                shutil.copyfile, bdir / "events.jsonl", dest / "events.jsonl",
-            )
+            # Rewrite the branch-dir object URLs to the NEW run's cell location, so
+            # the copied log's mesh/image URLs resolve there. (GLBs load via the
+            # id-keyed bundle regardless; this keeps image-hover URLs valid too.)
+            seg = f"/{req.base_run}/{BRANCHES_SUBDIR}/{branch_id}/objects/"
+            dest_seg = f"/{name}/{br.slot}/{br.model}/objects/"
+            branch_events = list(br.log.state["events"])
+            dest_events = dest / "events.jsonl"
+
+            def _write_cell(evs=branch_events, path=dest_events, _seg=seg, _dest=dest_seg) -> None:
+                with path.open("w", encoding="utf-8") as f:
+                    for e in evs:
+                        url = e.get("url")
+                        if isinstance(url, str) and _seg in url:
+                            e = {**e, "url": url.replace(_seg, _dest)}
+                        f.write(json.dumps(e) + "\n")
+            await asyncio.to_thread(_write_cell)
             await asyncio.to_thread(_hardlink_tree, bdir / "objects", dest / "objects")
-            copied.append(f"{slot_id}/{alias}")
+            copied.append(f"{br.slot}/{br.model}")
         _hydrate_run(name)
         global _current_run
         _current_run = name
@@ -2019,22 +2262,13 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
         slot_log = _slot_logs.get((run, slot.id, alias))
         state = slot_log.state if slot_log is not None else {"status": "idle", "events": []}
         events = state.get("events", [])
-        blog = _branch_logs.get((run, slot.id, alias))
-        branch: dict[str, object] | None = None
-        if blog is not None:
-            bevents = blog.state.get("events", [])
-            bgate = _branch_gates.get((run, slot.id, alias))
-            branch = {
-                "status": blog.state.get("status", "idle"),
-                "events_count": len(bevents),
-                "last_step": _last_step(bevents),
-                # The LLM call waiting for the user's go-ahead, when gated.
-                "pending": bgate.pending if bgate is not None else None,
-                # The call currently in flight (released/running), so the UI
-                # shows it instead of the stale last phase while it runs.
-                "current": bgate.current if bgate is not None else None,
-                "auto": bgate.auto if bgate is not None else False,
-            }
+        # Every TOP-LEVEL simulation forked from this cell (fan-out children are
+        # excluded — they live transiently inside the compare view). A cell can
+        # now carry several at once (different zones / parallel sims).
+        branches = [
+            _branch_summary(b) for b in _branches.values()
+            if b.parent is None and b.run == run and b.slot == slot.id and b.model == alias
+        ]
         cgate = _cell_gates.get((run, slot.id, alias))
         runs[alias] = {
             "status": state.get("status", "idle"),
@@ -2045,7 +2279,7 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             "pending": cgate.pending if cgate is not None else None,
             "current": cgate.current if cgate is not None else None,
             "auto": cgate.auto if cgate is not None else False,
-            "branch": branch,
+            "branches": branches,
             # Per-model token/request totals for the cost tracker (the run's
             # actual spend = source cells; branch simulations aren't counted).
             "usage": _usage_summary(events),
@@ -2251,7 +2485,7 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
     return "launched"
 
 
-async def _advance_branch(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None, model: str | None = None) -> str:
+async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = None, model: str | None = None) -> str:
     """Advance a simulation branch — the branch mirror of `_advance_cell`, so
     "step sims" behaves like "step all": it queues rather than erroring when a
     branch isn't sitting at a live gate.
@@ -2259,17 +2493,18 @@ async def _advance_branch(run: str, slot_id: str, model_alias: str, *, auto: boo
         branch spends at its next gate — so a branch mid-call isn't skipped.
       * `auto` runs it to completion; `until` fast-forwards to the next call of
         that template and pauses there.
-      * `model` (an OpenRouter id) re-aims the next gated call at a chosen LLM
-        (compare's per-step model A/B) — sticky on the gate until changed, so
-        the same scene context can be tested against different models.
-      * paused/error with no task → relaunch carrying the intent.
+      * `model` (an OpenRouter id) re-aims the next gated call at a chosen LLM —
+        sticky on the gate until changed, so the same scene context can be
+        tested against different models.
+      * paused/error with no task → relaunch carrying the intent (overrides live
+        on the Branch + its manifest, so this works after a restart too).
     Returns a status string for the caller to report/aggregate."""
-    key: RunKey = (run, slot_id, model_alias)
-    blog = _branch_logs.get(key)
-    if blog is None:
+    br = _branches.get(branch_id)
+    if br is None:
         return "missing"
-    gate = _branch_gates.get(key)
-    task = _branch_tasks.get(key)
+    blog = br.log
+    gate = br.gate
+    task = br.task
     if gate is not None and task is not None and not task.done():
         if model is not None:
             gate.model_override = model  # applies from the next gated call onward
@@ -2290,8 +2525,6 @@ async def _advance_branch(run: str, slot_id: str, model_alias: str, *, auto: boo
     # No live gate. (A finished task leaves no gate; a paused branch was cancelled.)
     if any(e.get("kind") == "run.done" for e in blog.state["events"]):
         return "done"
-    if key not in _branch_overrides:
-        return "not_runnable"  # overrides gone (server restart) — re-create it
     if blog.state.get("status") not in ("paused", "error"):
         return "not_runnable"
     events = blog.state["events"]
@@ -2303,9 +2536,9 @@ async def _advance_branch(run: str, slot_id: str, model_alias: str, *, auto: boo
         intent = {"until": until} if until is not None else {"budget": 1}
     if model is not None:
         intent["model"] = model  # seed the relaunched gate's override
-    _branch_gate_intents[key] = intent
+    br.gate_intent = intent
     blog.state["status"] = "running"
-    _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot_id, model_alias))
+    br.task = asyncio.create_task(_run_branch(branch_id))
     return "launched"
 
 
@@ -2338,22 +2571,11 @@ def _hardlink_tree(src: Path, dst: Path, ids: set[str] | None = None) -> None:
                 shutil.copy2(p, target)
 
 
-def _require_branch_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
-    """The cell's live branch. 404 when this cell has none."""
-    _require_slot(slot_id)
-    _require_model(model_alias)
-    blog = _branch_logs.get((run, slot_id, model_alias))
-    if blog is None:
-        raise HTTPException(status_code=404, detail="no active branch for this cell")
-    return blog
-
-
-def _branch_awaiting(run: str, slot_id: str, model_alias: str, step: str, node: str | None) -> bool:
+def _branch_awaiting(br: Branch, step: str, node: str | None) -> bool:
     """True when the branch is paused at its gate right before a (step[, node])
     call — i.e. a prompt-test seed for that call MISSED the cache and the real
     re-run hasn't happened yet, so the seed is stale, not the branch's output."""
-    gate = _branch_gates.get((run, slot_id, model_alias))
-    pending = gate.pending if gate is not None else None
+    pending = br.gate.pending if br.gate is not None else None
     if not pending or pending.get("template") != step:
         return False
     return node is None or pending.get("node") == node
@@ -2377,60 +2599,86 @@ async def _fork_branch(
     model_alias: str,
     *,
     event_index: int,
-    step: str,
+    step: str | None,
     overrides: dict[str, dict[str, str]],
     seed: BranchSeed | None = None,
-) -> int:
-    """Fork a cell into a simulation branch at `event_index` (a re-renderable
-    cache.llm call of template `step`): keep the prefix, hardlink the source's
-    finished meshes, and run the pipeline from there under the run snapshot +
-    `overrides`. Replaces any prior branch. Returns the branch's starting event
-    count. Shared by the lab's "simulate downstream" (create_branch) and
-    apply-to-run's "simulate from step" (simulate_step) — both are NON-
-    destructive: the source cell is never touched."""
-    src_log, event = _require_step_event(run, slot_id, model_alias, event_index, step)
-    src_events = list(src_log.state["events"])
-    key: RunKey = (run, slot_id, model_alias)
+    parent: str | None = None,
+    model_pin: str | None = None,
+    gate_budget: int = 0,
+) -> Branch:
+    """Fork a new simulation branch (allocating a fresh id) and start it gated.
+    Many forks of one cell coexist — nothing prior is discarded.
 
-    # One branch per cell: replace any prior fork of this cell.
-    await _discard_branch(key)
-    bdir = _branch_dir(run, slot_id, model_alias)
+    `parent=None` forks the ORIGIN cell at `event_index` (a re-renderable
+    cache.llm call of template `step`): keep the prefix, hardlink the cell's
+    committed prefix meshes, and re-run from there under the run snapshot +
+    `overrides`. With no gate budget the branch replays the prefix and pauses at
+    the first cache-miss — exactly the forked step — awaiting a manual step (a
+    `seed` pre-commits a vetted prompt-test result for that step, so it
+    cache-hits past it and pauses at the next one).
+
+    `parent=<bid>` forks that BRANCH at its current frontier — the parallel-LLM
+    child: copy the parent's whole log + committed meshes, `model_pin` the
+    frontier call to a chosen model, and `gate_budget=1` so it runs exactly that
+    one step then parks for the user to view + keep."""
+    if parent is not None:
+        psrc = _require_branch(parent)
+        src_log = psrc.log
+        src_objects = src_log.events_path.parent / "objects"
+        event: dict[str, object] | None = None  # children carry no seed
+    else:
+        src_log, event = _require_step_event(run, slot_id, model_alias, event_index, step or "")
+        cell_dir = src_log.events_path.parent
+        src_objects = cell_dir / OBJECTS_SUBDIR
+        if not src_objects.is_dir():
+            src_objects = next(
+                (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
+                cell_dir / "objects",
+            )
+    src_events = list(src_log.state["events"])
+    event_index = max(0, min(event_index, len(src_events)))
+
+    bid = _new_branch_id(slot_id, model_alias)
+    bdir = _branch_dir(run, bid)
     shutil.rmtree(bdir, ignore_errors=True)
     bdir.mkdir(parents=True, exist_ok=True)
 
-    # Hardlink ONLY the prefix's finished meshes (objects committed BEFORE the
-    # fork) so the replayed prefix renders without regenerating. Nothing after
-    # the deviation is linked: post-fork objects have no file here, so the
-    # pipeline generates each one FRESH (library re-match + re-place, or a fresh
-    # Trellis run), keeping the branch fully independent of the source past the
-    # branch-off point.
-    cell_dir = src_log.events_path.parent
-    src_objects = cell_dir / OBJECTS_SUBDIR
-    if not src_objects.is_dir():
-        src_objects = next(
-            (cell_dir / d for d in ("objects-optimized", "objects") if (cell_dir / d).is_dir()),
-            cell_dir / "objects",
-        )
+    # Hardlink ONLY the prefix's committed meshes (objects committed BEFORE the
+    # fork) so the replayed prefix renders without regenerating. Nothing past
+    # the fork is linked: those objects have no file here, so the pipeline makes
+    # each one FRESH (library re-match + re-place, or a fresh Trellis run),
+    # keeping the branch independent of the source past the branch-off point.
     prefix_ids = _committed_mesh_ids(src_events[:event_index])
     await asyncio.to_thread(_hardlink_tree, src_objects, bdir / "objects", prefix_ids)
 
-    # Prefix = source events BEFORE the edited step's call. Dropping that call
-    # (and everything after) means `committed.*` replays the prefix and the
-    # pipeline re-reaches the call with the (snapshot + overrides) templates.
+    # Prefix = source events BEFORE the fork. Dropping that call (and everything
+    # after) means `committed.*` replays the prefix and the pipeline re-reaches
+    # it with the (snapshot + overrides) templates.
     branch_events = [dict(e) for e in src_events[:event_index]]
+    # A CHILD fork copies the PARENT branch's log; repoint the parent's object
+    # URLs at the child's own dir (the parent's committed meshes are hardlinked
+    # into it just above), so the child — and any sim KEPT from it — stays
+    # self-referential after the parent is discarded. Inductively, a child only
+    # ever carries its-own-dir + source-cell URLs (source points at the live
+    # cell and needs no rewrite), so a later commit/save needs just one rewrite.
+    if parent is not None:
+        seg = f"/{BRANCHES_SUBDIR}/{parent}/objects/"
+        dest_seg = f"/{BRANCHES_SUBDIR}/{bid}/objects/"
+        for e in branch_events:
+            url = e.get("url")
+            if isinstance(url, str) and seg in url:
+                e["url"] = url.replace(seg, dest_seg)
     bevents = bdir / "events.jsonl"
     with bevents.open("w", encoding="utf-8") as f:
         for e in branch_events:
             f.write(json.dumps(e) + "\n")
 
-    blog = SlotLog(_branch_run_id(run, slot_id, model_alias), bevents)
+    blog = SlotLog(_branch_run_id(run, bid), bevents)
     blog.hydrate_from_disk()
     if blog.state.get("prompt") is None or blog.state.get("model") is None:
+        shutil.rmtree(bdir, ignore_errors=True)
         raise HTTPException(status_code=400, detail="source has no run.start to branch from")
-    if seed is not None:
-        # Pre-commit the vetted prompt-test result so the re-reached call
-        # cache-hits it and the simulation continues from EXACTLY the output
-        # the user approved (a drifted render simply misses and re-runs fresh).
+    if seed is not None and event is not None:
         blog.log(
             "cache.llm",
             key=cache_hash_for_seed(event, seed),
@@ -2448,68 +2696,89 @@ async def _fork_branch(
             tokens_out=seed.tokens_out,
             seeded=True,
         )
-    _branch_logs[key] = blog
-    _branch_overrides[key] = {s: dict(r) for s, r in overrides.items()}
-    # Run the forked step IMMEDIATELY (one gate credit) so "simulate downstream"
-    # shows the edited step's result on fork, with no manual first step. A seed
-    # already pre-commits that result, so leave it paused right after it.
-    if seed is None:
-        _branch_gate_intents[key] = {"budget": 1}
-    _branch_tasks[key] = asyncio.create_task(_run_branch(run, slot_id, model_alias))
-    return len(blog.state["events"])
+    br = Branch(
+        id=bid, run=run, slot=slot_id, model=model_alias,
+        parent=parent, fork_index=event_index,
+        overrides={s: dict(r) for s, r in overrides.items()},
+        log=blog, model_pin=model_pin,
+        gate_intent={"budget": gate_budget} if gate_budget else {},
+    )
+    _branches[bid] = br
+    _write_branch_manifest(br)
+    br.task = asyncio.create_task(_run_branch(bid))
+    return br
 
 
-async def _cancel_branch_task(key: RunKey) -> None:
-    """Cancel the cell branch's task + in-flight branch meshes + step gate,
-    but KEEP its SlotLog, overrides, and dir — pause/resume relaunch on the
-    same branch (a relaunch binds a fresh gate, back in stepping mode)."""
-    task = _branch_tasks.pop(key, None)
+def _children_of(branch_id: str) -> list[str]:
+    """Live child (parallel-LLM preview) branch ids forked from `branch_id`."""
+    return [b.id for b in _branches.values() if b.parent == branch_id]
+
+
+async def _cancel_branch_task(br: Branch) -> None:
+    """Cancel the branch's task + in-flight meshes + step gate, but KEEP its
+    SlotLog, overrides, manifest, and dir — pause/resume relaunch on the same
+    branch (a relaunch binds a fresh gate, back in stepping mode)."""
+    task = br.task
+    br.task = None
     if task is not None and not task.done():
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
-    _branch_gates.pop(key, None)
-    _branch_gate_intents.pop(key, None)
-    log = _branch_logs.get(key)
-    if log is not None:
-        generation.cancel_pending(log.slot_id)
+    br.gate = None
+    br.gate_intent = {}
+    generation.cancel_pending(br.log.slot_id)
 
 
-async def _discard_branch(key: RunKey) -> None:
-    """Full break-out: cancel the cell's branch and delete its directory."""
-    await _cancel_branch_task(key)
-    _branch_overrides.pop(key, None)
-    log = _branch_logs.pop(key, None)
-    if log is not None:
-        log.close()
-        shutil.rmtree(log.events_path.parent, ignore_errors=True)
+async def _discard_branch(branch_id: str) -> None:
+    """Full break-out: discard this branch AND every child forked from it, then
+    delete its directory. Idempotent."""
+    br = _branches.get(branch_id)
+    if br is None:
+        return
+    for child in _children_of(branch_id):
+        await _discard_branch(child)
+    await _cancel_branch_task(br)
+    _branches.pop(branch_id, None)
+    br.log.close()
+    shutil.rmtree(_branch_dir(br.run, branch_id), ignore_errors=True)
 
 
-async def _run_branch(run: str, slot_id: str, model_alias: str) -> None:
-    """Drive one cell branch. A mirror of `_run` bound to the branch's SlotLog
-    + branch run_id + the run snapshot WITH the lab's template overrides: the
-    prefix replays via `committed.*`, the edited step's seeded result (if any)
-    cache-hits, and the frontier re-runs under the edited templates."""
-    key: RunKey = (run, slot_id, model_alias)
-    blog = _branch_logs[key]
+async def _discard_branches_of_cell(run: str, slot_id: str, model_alias: str) -> None:
+    """Discard every branch (and child) whose ORIGIN is this cell — used when
+    the source cell is reset/rewound/promoted-onto, which invalidates its forks."""
+    for bid in [
+        b.id for b in _branches.values()
+        if b.run == run and b.slot == slot_id and b.model == model_alias
+    ]:
+        await _discard_branch(bid)
+
+
+async def _run_branch(branch_id: str) -> None:
+    """Drive one branch — top-level sim OR parallel-LLM child alike. A mirror of
+    `_run` bound to the branch's SlotLog + branch run_id + the run snapshot WITH
+    the lab's overrides: the prefix replays via `committed.*`, a seeded step
+    cache-hits, and the frontier re-runs under the edited templates. The step
+    gate (bound in THIS task's context, so only this branch pauses) advances it
+    one call at a time; the branch's `model_pin` (a child's chosen model) or a
+    per-launch `model` intent re-aims the frontier call."""
+    br = _branches[branch_id]
+    blog = br.log
     rlog.bind(blog)
-    # One LLM call at a time: bind the step gate IN this task's context so
-    # only the branch pauses; the main pipeline tasks never block. A relaunch
-    # (step / step-until / run-rest of a paused branch) carries its intent here.
-    intent = _branch_gate_intents.pop(key, {})
-    _b_model = intent.get("model")
-    gate = CellGate(blog, budget=int(intent.get("budget", 0) or 0), model_override=str(_b_model) if _b_model else None)
+    intent = br.gate_intent or {}
+    br.gate_intent = {}
+    pin = intent.get("model") or br.model_pin
+    gate = CellGate(blog, budget=int(intent.get("budget", 0) or 0), model_override=str(pin) if pin else None)
     gate.auto = bool(intent.get("auto", False))
     _b_until = intent.get("until")
     gate.until_step = str(_b_until) if _b_until else None
-    _branch_gates[key] = gate
+    br.gate = gate
     llm.set_step_gate(gate.wait)
     prompt = blog.state["prompt"]
     model = blog.state["model"]
-    brun_id = blog.slot_id  # composite branch run_id (run/slot/model/_branch)
+    brun_id = blog.slot_id  # composite branch run_id (<run>/_branches/<bid>)
     try:
-        base = prompt_store.load_run_prompts(_run_dir(run))
-        prompt_store.bind(base.with_overrides(_branch_overrides.get(key, {})))
+        base = prompt_store.load_run_prompts(_run_dir(br.run))
+        prompt_store.bind(base.with_overrides(br.overrides))
         await divider.run(run_id=brun_id, prompt=prompt, model=model, runs_dir=RUNS_DIR)
     except asyncio.CancelledError:
         generation.cancel_pending(brun_id)
@@ -2518,6 +2787,11 @@ async def _run_branch(run: str, slot_id: str, model_alias: str) -> None:
         generation.cancel_pending(brun_id)
         blog.log("run.error", message=f"{type(e).__name__}: {e}")
         return
+    finally:
+        # The gate lives only for the task's duration — drop it so a finished
+        # branch reports no stale `pending`/`current`. (A live pause is still
+        # awaiting inside divider.run, so this runs only once the task ends.)
+        br.gate = None
     await generation.await_pending(brun_id)
     blog.finish_run()
 

@@ -4,7 +4,7 @@
 // result as a new version and/or a new run.
 
 import { api } from "./api.js";
-import { state, emit, on, cellKey, targetKey, cellSummary } from "./state.js";
+import { state, emit, on, cellKey, targetKey, cellSummary, cellBranches, branchSummaryById } from "./state.js";
 import { el, fitToggle, toast, openModal, field, fmtJson, diffPre } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { applySceneProjection } from "./events.js";
@@ -107,12 +107,12 @@ export function initLab() {
   // is idle, step-sims/break-out once it's simulating (see updateActionBar).
   // The "step sims until…" select sits between them, shown only in branch mode.
   testBtn.addEventListener("click", () => {
-    if (selectedBranchedCells().length > 0) stepSelectedBranches();
+    if (selectedBranches().length > 0) stepSelectedBranches();
     else testEvents(selectedEvents());
   });
   testBtn.after(simUntilEl);
   simBtn.addEventListener("click", () => {
-    if (selectedBranchedCells().length > 0) breakOutSelected();
+    if (selectedBranches().length > 0) breakOutSelected();
     else simulateDownstream();
   });
   sysEl.addEventListener("input", onEdit);
@@ -124,6 +124,7 @@ export function initLab() {
     renderSims();
     updateStepAllButtons();
     refreshCardStepBtns(); // keep card step buttons live between event reloads
+    refreshCardBranchBtns(); // keep per-card simulate/compare buttons tracking each cell's branch
     refreshCardScenes(); // swap a card to its branch scene + follow it as it runs
     pollEvents(); // auto-pick up newly-completed events in the grid
   });
@@ -342,9 +343,9 @@ function selectedEvents() {
   });
 }
 
-// The distinct cells in the current selection, and which of them are live
-// simulation branches — once any selected cell is simulating, the action bar
-// swaps from test/simulate to branch controls (step the sims / break out).
+// The distinct cells in the current selection. Once any selected cell has a
+// live simulation branch, the action bar swaps from test/simulate to branch
+// controls (step the sims / break out).
 function selectedCellList() {
   const seen = new Set();
   const out = [];
@@ -356,8 +357,12 @@ function selectedCellList() {
   }
   return out;
 }
-function selectedBranchedCells() {
-  return selectedCellList().filter((c) => cellHasLiveBranch(c.slot, c.model));
+// Every TOP-LEVEL simulation branch of the selected cells (a cell can carry
+// several — different zones / parallel sims), as server-truth summaries.
+function selectedBranches() {
+  const out = [];
+  for (const c of selectedCellList()) out.push(...cellBranches(c.slot, c.model));
+  return out;
 }
 
 // On first open of a run, seed the selection to every started cell (so the
@@ -371,7 +376,7 @@ function ensureDefaultSelection() {
   for (const s of state.slots) {
     for (const m of state.models) {
       const c = s.runs?.[m];
-      if (c && ((c.events_count ?? 0) > 0 || c.branch)) started.push(cellKey(s.id, m));
+      if (c && ((c.events_count ?? 0) > 0 || c.branches?.length)) started.push(cellKey(s.id, m));
     }
   }
   if (!started.length) return; // nothing started yet — seed on a later render
@@ -418,7 +423,7 @@ function openSelectionDialog() {
   for (const s of state.slots) {
     for (const m of state.models) {
       const c = s.runs?.[m];
-      if (c && ((c.events_count ?? 0) > 0 || c.branch)) {
+      if (c && ((c.events_count ?? 0) > 0 || c.branches?.length)) {
         cells.push({ slot: s.id, model: m, status: c.status ?? "idle", events: c.events_count ?? 0 });
       }
     }
@@ -741,7 +746,7 @@ async function stepAllCells() {
   // mid-call simply isn't advanced.
   const sims = [...state.lab.sims.values()];
   if (sims.length) {
-    await Promise.allSettled(sims.map((s) => api.branchStep(state.run, s.slot, s.model)));
+    await Promise.allSettled(sims.map((s) => api.branchStep(s.id)));
   }
   if (pendings.size === 1) navigateToStep([...pendings][0]);
   emit("poll-now");
@@ -868,7 +873,7 @@ function renderGrid() {
       // The "compare 3D" button is live whenever this slot has a simulation
       // branch, the "step" button whenever it can advance — refresh both each
       // poll so they track the cell the moment it changes.
-      updateCmpBtn(ref);
+      refreshBranchBtns(ref);
       refreshStepBtn(ref.stepBtn, ev.slot, ev.model);
     }
   }
@@ -901,9 +906,24 @@ function reviewCard(ev, zoneCount = 1) {
     style: "display:none",
     text: "compare 3D ⇄",
     title: "live run vs simulated-edit branch, side by side in 3D",
-    onclick: () => emit("open-compare", {
-      slot: ev.slot, model: ev.model, step: state.lab.step, node: ev.node, index: ev.index,
-    }),
+    onclick: () => {
+      const b = cardBranch(ev.slot, ev.model, ev.index);
+      emit("open-compare", {
+        slot: ev.slot, model: ev.model, step: state.lab.step, node: ev.node, index: ev.index,
+        branch: b?.id ?? null,
+      });
+    },
+  });
+  // "simulate" — fork a downstream branch from THIS call alone, so a single
+  // slot can be simulated on its own (and added to a set that's already
+  // running), not only via the action-bar batch. Hidden once the cell is
+  // branched (refreshBranchBtns), where "compare 3D" + the sims list take over.
+  const simCellBtn = el("button", {
+    class: "ev-scene-btn",
+    style: "display:none",
+    text: "simulate",
+    title: "fork a downstream simulation branch from this call — starts on its own, even while other slots are simulating",
+    onclick: (e) => simulateCell(ev, e.currentTarget),
   });
   const stepBtn = makeStepBtn(ev.slot, ev.model);
   const card = el("div", { class: "rv-card" },
@@ -920,6 +940,7 @@ function reviewCard(ev, zoneCount = 1) {
         title: "run the current prompt edit on this event",
         onclick: () => testEvents([ev]),
       }),
+      simCellBtn,
       stepBtn,
       cmpBtn,
       el("button", {
@@ -932,16 +953,37 @@ function reviewCard(ev, zoneCount = 1) {
     body,
   );
   return {
-    card, body, cmpBtn, stepBtn, ev, full: null, preview: ev.output_preview,
+    card, body, cmpBtn, simCellBtn, stepBtn, ev, full: null, preview: ev.output_preview,
     // 3D-grid mode: lazily-created per-card viewer + its viewport observer.
     host3d: null, viewer3d: null, io3d: null,
   };
 }
 
-// Shows the per-card "compare 3D" button only when this slot has a live
-// simulation branch — the source of the "current" 3D scene.
-function updateCmpBtn(ref) {
-  ref.cmpBtn.style.display = cellHasLiveBranch(ref.ev.slot, ref.ev.model) ? "" : "none";
+// A card's two branch-dependent buttons are complements: "compare 3D" needs a
+// live branch (it's the "current" side), while "simulate" only makes sense when
+// there ISN'T one yet — one branch per slot, so you break out to re-simulate.
+// Toggling both here keeps the per-card "start a sim on its own" affordance in
+// lockstep with the cell's live-branch state, in every place a card re-renders.
+// The TOP-LEVEL simulation branch forked from THIS card's call (its origin cell
+// + fork event match) — a card maps to its own-zone sim. The most recent wins
+// if the same event was simulated more than once. `null` when this call hasn't
+// been simulated.
+function cardBranch(slot, model, eventIndex) {
+  const list = cellBranches(slot, model).filter((b) => b.fork_index === eventIndex);
+  return list.length ? list[list.length - 1] : null;
+}
+
+function refreshBranchBtns(ref) {
+  const b = cardBranch(ref.ev.slot, ref.ev.model, ref.ev.index);
+  ref.branchId = b?.id ?? null;
+  // "compare 3D" needs this card's branch; "simulate" is always available now
+  // (fork another sim of this call any time).
+  ref.cmpBtn.style.display = b ? "" : "none";
+  ref.simCellBtn.style.display = "";
+}
+
+function refreshCardBranchBtns() {
+  for (const ref of reviewCards.values()) refreshBranchBtns(ref);
 }
 
 // Rebuilds a card's body from the current section toggles + any test result —
@@ -958,7 +1000,7 @@ function renderCardBody(ref) {
     return;
   }
   const full = ref.full;
-  updateCmpBtn(ref);
+  refreshBranchBtns(ref);
   refreshStepBtn(ref.stepBtn, ref.ev.slot, ref.ev.model);
   const test = state.lab.tests.get(targetKey(ref.ev.slot, ref.ev.model, ref.ev.index));
   const tested = test && test.status === "done";
@@ -998,12 +1040,6 @@ function renderCardBody(ref) {
 // switches to that branch's scene (the real, full result). Before/after 3D
 // comparison is the dedicated compare screen's job — not an overlay here.
 
-// A card renders its cell's simulation BRANCH scene when one is live (just
-// forked via lab.sims, or reported by the slots poll), else the source cell.
-function cardBranched(slot, model) {
-  return cellHasLiveBranch(slot, model);
-}
-
 // A corner caption so a card reads clearly as the simulation branch (the
 // downstream-simulated result) rather than the source scene.
 function cardSceneBadge(ref, branched) {
@@ -1022,7 +1058,7 @@ function cardSceneBadge(ref, branched) {
 }
 
 function renderCard3d(ref) {
-  updateCmpBtn(ref);
+  refreshBranchBtns(ref);
   refreshStepBtn(ref.stepBtn, ref.ev.slot, ref.ev.model);
   if (!ref.host3d) ref.host3d = el("div", { class: "rv-3d", style: "position:relative" });
   if (ref.body.firstChild !== ref.host3d) ref.body.replaceChildren(ref.host3d);
@@ -1043,36 +1079,37 @@ function renderCard3d(ref) {
   ref.io3d.observe(ref.host3d);
 }
 
-// What a card's scene should currently show: branch vs source, and how far
-// that side has progressed — so a poll reloads the canvas as the branch runs
-// (or is discarded), not only when the source event's output changes.
-function cardSceneState(slot, model) {
+// What a card's scene should currently show: its own simulation branch (when
+// this call has been simulated) vs the source cell, and how far that side has
+// progressed — so a poll reloads the canvas as the branch runs (or is
+// discarded), not only when the source event's output changes.
+function cardSceneState(ref) {
+  const { slot, model, index } = ref.ev;
+  const b = cardBranch(slot, model, index);
+  if (b) return { side: "branch", id: b.id, count: b.events_count ?? 0, status: b.status ?? "starting" };
   const c = cellSummary(slot, model);
-  if (cardBranched(slot, model)) {
-    const b = c?.branch;
-    return { side: "branch", count: b?.events_count ?? 0, status: b?.status ?? "starting" };
-  }
-  return { side: "source", count: c?.events_count ?? 0, status: c?.status ?? "idle" };
+  return { side: "source", id: null, count: c?.events_count ?? 0, status: c?.status ?? "idle" };
 }
 
 async function loadCard3d(ref) {
   const viewer = ref.viewer3d;
   if (!viewer) return;
   const { slot, model } = ref.ev;
-  // Pull the branch's scene + meshes when one is live, so "simulate downstream"
+  // Pull this card's branch scene + meshes when it has one, so "simulate"
   // shows the branched result here. Stamp the side/progress we're loading so
   // refreshCardScenes can tell when a reload is due.
-  const st = cardSceneState(slot, model);
+  const st = cardSceneState(ref);
   const branched = st.side === "branch";
-  const opts = branched ? { branch: true } : {};
   ref.sceneState = st;
   ref.lastSceneLoad = performance.now();
   try {
-    const proj = await api.scene(state.run, slot, model, opts);
+    const proj = branched
+      ? await api.branchScene(st.id)
+      : await api.scene(state.run, slot, model, {});
     if (ref.viewer3d !== viewer) return; // disposed / reloaded while in flight
     viewer.clear();
     applySceneProjection(viewer, proj);
-    viewer.prefetchBundle(api.meshesUrl(state.run, slot, model, opts));
+    viewer.prefetchBundle(branched ? api.branchMeshesUrl(st.id) : api.meshesUrl(state.run, slot, model, {}));
     cardSceneBadge(ref, branched);
   } catch { /* leave the grid cell empty — non-fatal */ }
 }
@@ -1090,9 +1127,9 @@ function refreshCardScenes() {
   const now = performance.now();
   for (const ref of reviewCards.values()) {
     if (!ref.viewer3d) continue; // not mounted (off-screen) — loads on mount
-    const st = cardSceneState(ref.ev.slot, ref.ev.model);
+    const st = cardSceneState(ref);
     const prev = ref.sceneState;
-    const sideFlipped = !prev || prev.side !== st.side;
+    const sideFlipped = !prev || prev.side !== st.side || prev.id !== st.id;
     const statusChanged = prev && prev.status !== st.status;
     const progressed = prev && prev.count !== st.count;
     if (!sideFlipped && !statusChanged && !progressed) continue;
@@ -1168,13 +1205,13 @@ function reviewSection(label, text) {
 function updateActionBar() {
   const lab = state.lab;
   const n = selectedEvents().length;
-  const branched = selectedBranchedCells();
+  const branched = selectedBranches();
   selCountEl.textContent = `${n} event${n === 1 ? "" : "s"} selected${lab.sims.size ? ` · ${lab.sims.size} simulating` : ""}`;
   if (branched.length > 0) {
     // The selection is already simulating: re-testing or re-simulating makes no
     // sense, so the bar drives the branches instead — step them all one call,
     // or break them all out (which returns the bar to test/simulate).
-    const steppable = branched.filter((c) => cellSummary(c.slot, c.model)?.branch?.status !== "done");
+    const steppable = branched.filter((b) => b.status !== "done");
     testBtn.textContent = `step sims (${steppable.length})`;
     testBtn.title = "advance every selected simulation branch one LLM call";
     testBtn.disabled = steppable.length === 0;
@@ -1183,7 +1220,7 @@ function updateActionBar() {
     }
     simUntilEl.style.display = state.steps.length ? "" : "none";
     simBtn.textContent = `break out (${branched.length})`;
-    simBtn.title = "discard the simulation branch on every selected slot (its downstream events + meshes)";
+    simBtn.title = "discard every selected simulation branch (its downstream events + meshes)";
     simBtn.classList.add("danger");
     simBtn.disabled = false;
   } else {
@@ -1288,87 +1325,52 @@ async function testEvents(events) {
 // A cell already simulating: the freshest signal is the slots poll, with the
 // lab's own session record and the event payload's load-time flag as
 // fallbacks (a branch may have been forked in an earlier session).
-function cellHasLiveBranch(slot, model) {
-  return Boolean(cellSummary(slot, model)?.branch)
-    || state.lab.sims.has(cellKey(slot, model));
-}
-
-// The server is the source of truth for live branches; lab.sims is a session
-// cache that must self-heal. Drop entries the slots poll no longer reports a
-// branch for — e.g. the source cell was rewound/reset from the board/overlay,
-// which discards its branch server-side. Without this the grid stays stuck
-// "branched" and the step / break-out / replace-source buttons 404. Keep
-// just-forked entries until the poll has had a chance to see them (createBranch
-// is awaited before poll-now, so a single grace window covers the race).
+// The server's flat `_branches/` folder is the source of truth; lab.sims is a
+// session view keyed by branch id that self-heals against each /slots poll:
+// drop entries the poll no longer reports (broken out, or the source cell was
+// rewound/reset), and ADOPT any top-level branch the server reports that we
+// aren't tracking yet (forked via apply-to-run, or rehydrated after a restart).
+// Just-forked entries get a grace window before pruning so the race with the
+// poll doesn't flicker them away.
 const SIM_PRUNE_GRACE_MS = 4000;
 function pruneStaleSims() {
   const lab = state.lab;
   const now = performance.now();
-  for (const [ck, sim] of [...lab.sims]) {
-    if (cellSummary(sim.slot, sim.model)?.branch) continue; // still live server-side
+  const live = new Map(); // branchId -> summary
+  for (const s of state.slots) {
+    for (const alias of Object.keys(s.runs ?? {})) {
+      for (const b of (s.runs[alias].branches ?? [])) live.set(b.id, b);
+    }
+  }
+  for (const [bid, sim] of [...lab.sims]) {
+    if (live.has(bid)) continue;
     if (now - (sim.createdAt ?? 0) < SIM_PRUNE_GRACE_MS) continue; // just forked — let the poll catch up
-    lab.sims.delete(ck);
+    lab.sims.delete(bid);
+  }
+  for (const [bid, b] of live) {
+    if (!lab.sims.has(bid)) {
+      lab.sims.set(bid, { id: bid, slot: b.slot, model: b.model, eventIndex: b.fork_index, step: lab.simStep, node: null, createdAt: 0 });
+    }
   }
   if (lab.sims.size === 0) lab.simStep = null;
 }
 
 async function simulateDownstream() {
   // Branches carry the lab's FULL edit set (every drafted step), so the
-  // simulation matches exactly what "save to new run" would persist.
+  // simulation matches exactly what "save to new run" would persist. Each
+  // selected event forks its OWN branch — multiple zones of one slot now run as
+  // several independent sims, and re-simulating an event just adds another.
   const overrides = overridesPayload();
-
-  // Group the selection by cell. The server holds exactly ONE branch per slot,
-  // and a branch forks at a SINGLE event — so multiple selected events on the
-  // same slot (e.g. two zone_decompose calls) is ambiguous: which one is the
-  // fork point? Silently collapsing them branches at the wrong step. Refuse
-  // outright and make the user narrow to one event per slot (pick one zone).
-  const byCell = new Map();
-  for (const ev of selectedEvents()) {
-    const ck = cellKey(ev.slot, ev.model);
-    if (!byCell.has(ck)) byCell.set(ck, []);
-    byCell.get(ck).push(ev);
-  }
-  if (byCell.size === 0) return;
-
-  const multi = [...byCell.values()].filter((evs) => evs.length > 1);
-  if (multi.length > 0) {
-    const names = multi
-      .map((evs) => `${evs[0].slot} · ${evs[0].model} (${evs.length} events)`)
-      .join(", ");
-    toast(
-      `can't simulate ${names}: multiple events selected on one slot, but there's only ` +
-      "one branch per slot. Narrow to a single event (pick one zone) and try again.",
-      "err",
-    );
-    return;
-  }
-
-  // Exactly one event per cell now. A live branch is only ever dropped by an
-  // explicit "break out", so never silently replace one: skip cells already
-  // simulating (warn to break out first) and simulate the rest.
-  const fresh = new Map();
-  const busy = [];
-  for (const [ck, evs] of byCell) {
-    const ev = evs[0];
-    if (cellHasLiveBranch(ev.slot, ev.model) || ev.branch_live) busy.push(ev);
-    else fresh.set(ck, ev);
-  }
-  if (busy.length > 0) {
-    const names = busy.map((ev) => `${ev.slot} · ${ev.model}`).join(", ");
-    toast(
-      `already simulating: ${names} — break out first to re-simulate (one branch per slot)`,
-      "err",
-    );
-  }
-  if (fresh.size === 0) return;
-  await launchBranches(fresh, overrides);
+  const events = selectedEvents();
+  if (!events.length) return;
+  await launchBranches(events, overrides);
 }
 
-async function launchBranches(perCell, overrides) {
+async function launchBranches(events, overrides) {
   const lab = state.lab;
   simBtn.disabled = true;
   let started = 0;
-  for (const [ck, ev] of perCell) {
+  for (const ev of events) {
     const tkey = targetKey(ev.slot, ev.model, ev.index);
     const test = lab.tests.get(tkey);
     const seed = test?.status === "done"
@@ -1382,13 +1384,19 @@ async function launchBranches(perCell, overrides) {
         }
       : null;
     try {
-      await api.createBranch(state.run, ev.slot, ev.model, {
+      const resp = await api.createBranch(state.run, ev.slot, ev.model, {
         event_index: ev.index,
         step: lab.step,
         overrides,
         seed,
       });
-      lab.sims.set(ck, { slot: ev.slot, model: ev.model, eventIndex: ev.index, createdAt: performance.now() });
+      const bid = resp.branch?.id;
+      if (bid) {
+        lab.sims.set(bid, {
+          id: bid, slot: ev.slot, model: ev.model,
+          eventIndex: ev.index, step: lab.step, node: ev.node, createdAt: performance.now(),
+        });
+      }
       started += 1;
     } catch (e) {
       toast(`${ev.slot}·${ev.model}: ${e.message}`, "err");
@@ -1398,16 +1406,25 @@ async function launchBranches(perCell, overrides) {
   lab.simEditedSteps = Object.keys(overrides);
   simBtn.disabled = false;
   if (started > 0) {
-    toast(`simulating downstream on ${started} cell${started === 1 ? "" : "s"}`, "ok");
+    toast(`simulating downstream on ${started} branch${started === 1 ? "" : "es"}`, "ok");
     emit("poll-now");
     renderSims();
+    refreshCardBranchBtns(); // reveal "compare 3D" on the just-branched cards at once
     refreshCardScenes(); // flip the just-branched cards to their branch scene now
   }
 }
 
-function simStatus(slot, model) {
-  const s = state.slots.find((x) => x.id === slot);
-  return s?.runs?.[model]?.branch ?? null;
+// Simulate a SINGLE call on its own — the per-card mirror of the action-bar
+// "simulate downstream". Forks a NEW branch at exactly this card's event,
+// carrying the lab's full edit set + any vetted test seed, and runs it
+// independently of whatever else is simulating (many branches per cell now).
+async function simulateCell(ev, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    await launchBranches([ev], overridesPayload());
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 function renderSims() {
@@ -1424,59 +1441,124 @@ function renderSims() {
     el("span", { text: `simulations · edits: ${edited}`, title: `branched at ${lab.simStep} events` }),
   ));
   const body = el("div", { style: "padding:4px 8px" });
-  for (const sim of lab.sims.values()) {
-    const b = simStatus(sim.slot, sim.model);
-    const status = b?.status ?? "starting";
-    const pending = b?.pending ?? null;
-    const ls = b?.last_step;
-    const row = el("div", { class: "sim-row" },
-      el("span", { class: `dot ${pending ? "paused" : status}` }),
-      el("span", { class: "cell-name", text: `${sim.slot} · ${sim.model}`,
-        title: "open the branch view",
-        onclick: () => emit("open-cell", { slot: sim.slot, model: sim.model, branch: true }) }),
-      el("span", {
-        class: "step-line",
-        text: pending
-          ? `awaiting step: ${pending.step} @ ${pending.node ?? "?"}`
-          : (status === "running" && b?.current)
-            ? `running: ${b.current.template ?? b.current.step} @ ${b.current.node ?? "?"}`
-            : ls ? `${ls.node} · ${ls.phase}` : status,
-      }),
-    );
-    if (pending) {
-      // One LLM call at a time: each press runs exactly the pending call.
-      row.appendChild(el("button", { class: "primary", text: "step", onclick: () => simAction(sim, "step", row) }));
-      row.appendChild(el("button", { text: "run rest", title: "finish this branch without further pauses", onclick: () => simAction(sim, "auto", row) }));
-    }
-    if (status === "running" && !b?.auto && !pending) {
-      // Between gates: a call is in flight; the next gate appears when it lands.
-      row.appendChild(el("span", { class: "muted", text: "step running…" }));
-    }
-    if (status === "running") {
-      row.appendChild(el("button", { text: "pause", onclick: () => simAction(sim, "pause", row) }));
-    } else if (status === "paused" || status === "error") {
-      row.appendChild(el("button", { text: "resume", onclick: () => simAction(sim, "resume", row) }));
-    }
-    row.appendChild(el("button", { text: "replace source",
-      title: "promote this simulation to be the slot's source run (overwrites the original)",
-      onclick: () => replaceSourceWithSim(sim) }));
-    row.appendChild(el("button", { class: "danger", text: "break out", onclick: () => simAction(sim, "discard", row) }));
-    body.appendChild(row);
+  // Collapse the per-LLM lineages of one downstream exploration (same slot +
+  // model + fork event) into a single group, so the list stays readable across
+  // many LLMs. A lone sim renders as a plain row.
+  for (const g of simGroups()) {
+    if (g.sims.length === 1) { body.appendChild(simRow(g.sims[0], false)); continue; }
+    const grp = el("div", { class: "sim-group", style: "border-left:2px solid var(--line); margin:6px 0 6px 2px; padding-left:6px" });
+    const forkLabel = g.node ? ` ⑂ ${g.node}` : "";
+    grp.appendChild(el("div", { class: "sim-group-head", style: "display:flex; gap:8px; align-items:center; padding:2px 0" },
+      el("span", { class: "cell-name", text: `${g.slot} · ${g.model}${forkLabel}`,
+        title: "open the original cell's scene",
+        onclick: () => emit("open-cell", { slot: g.slot, model: g.model, branch: null }) }),
+      el("span", { class: "muted", text: `${g.sims.length} LLMs` }),
+      el("button", { text: "compare", title: "compare all these LLM lineages side by side in 3D",
+        onclick: () => emit("open-compare", { slot: g.slot, model: g.model, step: g.step, node: g.node, index: g.eventIndex, branch: g.sims[0].id }) }),
+      el("button", { class: "danger", text: "break out all", title: "discard every LLM lineage in this group",
+        onclick: () => breakOutGroup(g) }),
+    ));
+    for (const sim of g.sims) grp.appendChild(simRow(sim, true));
+    body.appendChild(grp);
   }
   host.appendChild(body);
   updateActionBar();
 }
 
+// Group live sims by (slot, model, fork event) — the per-LLM lineages of one
+// downstream exploration share a key, so they collapse into one entry.
+function simGroups() {
+  const groups = new Map();
+  for (const sim of state.lab.sims.values()) {
+    const key = `${sim.slot}|${sim.model}|${sim.eventIndex}`;
+    let g = groups.get(key);
+    if (!g) {
+      g = { key, slot: sim.slot, model: sim.model, eventIndex: sim.eventIndex, node: null, step: null, sims: [] };
+      groups.set(key, g);
+    }
+    // First sim that knows the zone/step labels the whole group (compare-forked
+    // lineages adopted from the poll carry no node).
+    if (g.node == null) g.node = sim.node ?? null;
+    if (g.step == null) g.step = sim.step ?? null;
+    g.sims.push(sim);
+  }
+  return [...groups.values()];
+}
+
+// One sim's row + its controls. `grouped` rows sit under a group header and
+// label by the lineage's LLM (the header carries slot·model + zone); standalone
+// rows show the full cell.
+function simRow(sim, grouped) {
+  const b = branchSummaryById(sim.id);
+  const status = b?.status ?? "starting";
+  const pending = b?.pending ?? null;
+  const ls = b?.last_step;
+  const pin = b?.pin && b.pin !== sim.model ? b.pin : null;
+  const forkLabel = sim.node ? ` ⑂ ${sim.node}` : "";
+  const name = grouped
+    ? (pin ?? sim.model)
+    : `${sim.slot} · ${sim.model}${pin ? " → " + pin : ""}${forkLabel}`;
+  const row = el("div", { class: "sim-row" },
+    el("span", { class: `dot ${pending ? "paused" : status}` }),
+    el("span", { class: "cell-name", text: name, title: "open this lineage's branch view",
+      onclick: () => emit("open-cell", { slot: sim.slot, model: sim.model, branch: sim.id }) }),
+    el("span", {
+      class: "step-line",
+      text: pending
+        ? `awaiting: ${pending.step} @ ${pending.node ?? "?"}`
+        : (status === "running" && b?.current)
+          ? `running: ${b.current.template ?? b.current.step} @ ${b.current.node ?? "?"}`
+          : ls ? `${ls.node} · ${ls.phase}` : status,
+    }),
+  );
+  if (!grouped) {
+    row.appendChild(el("button", { text: "compare", title: "live run vs this simulation, side by side in 3D",
+      onclick: () => emit("open-compare", { slot: sim.slot, model: sim.model, step: sim.step, node: sim.node, index: sim.eventIndex, branch: sim.id }) }));
+  }
+  if (pending) {
+    // One LLM call at a time: each press runs exactly the pending call.
+    row.appendChild(el("button", { class: "primary", text: "step", onclick: () => simAction(sim, "step", row) }));
+    row.appendChild(el("button", { text: "run rest", title: "finish this lineage without further pauses", onclick: () => simAction(sim, "auto", row) }));
+  }
+  if (status === "running" && !b?.auto && !pending) {
+    // Between gates: a call is in flight; the next gate appears when it lands.
+    row.appendChild(el("span", { class: "muted", text: "step running…" }));
+  }
+  if (status === "running") {
+    row.appendChild(el("button", { text: "pause", onclick: () => simAction(sim, "pause", row) }));
+  } else if (status === "paused" || status === "error") {
+    row.appendChild(el("button", { text: "resume", onclick: () => simAction(sim, "resume", row) }));
+  }
+  row.appendChild(el("button", { text: "replace source",
+    title: "promote this lineage to be the slot's source run (overwrites the original)",
+    onclick: () => replaceSourceWithSim(sim) }));
+  row.appendChild(el("button", { class: "danger", text: "break out", onclick: () => simAction(sim, "discard", row) }));
+  return row;
+}
+
+// Break out of every lineage in a group at once.
+async function breakOutGroup(g) {
+  for (const sim of [...g.sims]) {
+    try { await api.branchDiscard(sim.id); state.lab.sims.delete(sim.id); }
+    catch (e) { toast(`${sim.slot}·${sim.model}: ${e.message}`, "err"); }
+  }
+  if (state.lab.sims.size === 0) state.lab.simStep = null;
+  toast("broke out of the group's lineages", "ok");
+  emit("poll-now");
+  renderSims();
+  refreshCardScenes();
+}
+
 async function simAction(sim, action, row) {
   for (const b of row.querySelectorAll("button")) b.disabled = true;
   try {
-    if (action === "step") await api.branchStep(state.run, sim.slot, sim.model);
-    else if (action === "auto") await api.branchStep(state.run, sim.slot, sim.model, true);
-    else if (action === "pause") await api.branchPause(state.run, sim.slot, sim.model);
-    else if (action === "resume") await api.branchResume(state.run, sim.slot, sim.model);
+    if (action === "step") await api.branchStep(sim.id);
+    else if (action === "auto") await api.branchStep(sim.id, { auto: true });
+    else if (action === "pause") await api.branchPause(sim.id);
+    else if (action === "resume") await api.branchResume(sim.id);
     else {
-      await api.branchDiscard(state.run, sim.slot, sim.model);
-      state.lab.sims.delete(cellKey(sim.slot, sim.model));
+      await api.branchDiscard(sim.id);
+      state.lab.sims.delete(sim.id);
       if (state.lab.sims.size === 0) state.lab.simStep = null;
     }
     emit("poll-now");
@@ -1502,10 +1584,10 @@ function replaceSourceWithSim(sim) {
     actions: [
       el("button", { text: "cancel", onclick: close }),
       el("button", { class: "danger", text: "replace source", onclick: async () => {
-        try { await api.commitBranch(state.run, sim.slot, sim.model); }
+        try { await api.branchCommit(sim.id); }
         catch (e) { setError(e.message); return; }
         close();
-        state.lab.sims.delete(cellKey(sim.slot, sim.model));
+        state.lab.sims.delete(sim.id);
         if (state.lab.sims.size === 0) state.lab.simStep = null;
         toast(`replaced ${sim.slot} · ${sim.model} with its simulation`, "ok");
         emit("poll-now");
@@ -1519,15 +1601,14 @@ function replaceSourceWithSim(sim) {
 // Action-bar batch controls when the selection is simulating: step every
 // selected branch one call (or fast-forward to `until`), or break them all
 // out. Like "step all", each branch QUEUES rather than erroring when it isn't
-// sitting at a gate. Per-cell errors toast but don't abort the rest.
+// sitting at a gate. Per-branch errors toast but don't abort the rest.
 async function stepSelectedBranches(until = null) {
-  const cells = selectedBranchedCells()
-    .filter((c) => cellSummary(c.slot, c.model)?.branch?.status !== "done");
-  if (!cells.length) return;
+  const branches = selectedBranches().filter((b) => b.status !== "done");
+  if (!branches.length) return;
   testBtn.disabled = true;
-  await Promise.all(cells.map(async (c) => {
-    try { await api.branchStep(state.run, c.slot, c.model, false, until); }
-    catch (e) { toast(`${c.slot}·${c.model}: ${e.message}`, "err"); }
+  await Promise.all(branches.map(async (b) => {
+    try { await api.branchStep(b.id, { until }); }
+    catch (e) { toast(`${b.slot}·${b.model}: ${e.message}`, "err"); }
   }));
   emit("poll-now");
   renderSims();
@@ -1535,17 +1616,17 @@ async function stepSelectedBranches(until = null) {
 }
 
 async function breakOutSelected() {
-  const cells = selectedBranchedCells();
-  if (!cells.length) return;
+  const branches = selectedBranches();
+  if (!branches.length) return;
   simBtn.disabled = true;
-  await Promise.all(cells.map(async (c) => {
+  await Promise.all(branches.map(async (b) => {
     try {
-      await api.branchDiscard(state.run, c.slot, c.model);
-      state.lab.sims.delete(cellKey(c.slot, c.model));
-    } catch (e) { toast(`${c.slot}·${c.model}: ${e.message}`, "err"); }
+      await api.branchDiscard(b.id);
+      state.lab.sims.delete(b.id);
+    } catch (e) { toast(`${b.slot}·${b.model}: ${e.message}`, "err"); }
   }));
   if (state.lab.sims.size === 0) state.lab.simStep = null;
-  toast(`broke out of ${cells.length} simulation${cells.length === 1 ? "" : "s"}`, "ok");
+  toast(`broke out of ${branches.length} simulation${branches.length === 1 ? "" : "s"}`, "ok");
   emit("poll-now");
   renderSims();
   refreshCardScenes();
@@ -1620,12 +1701,8 @@ function applyToRunModal() {
           if (simSel.value) {
             const steps = simSel.value === "*" ? editedSteps : [simSel.value];
             const r = await api.simulateStep(state.run, steps);
-            for (const c of r.simulated) {
-              const i = c.lastIndexOf("/");
-              const slot = c.slice(0, i);
-              const model = c.slice(i + 1);
-              lab.sims.set(cellKey(slot, model), { slot, model, eventIndex: -1, createdAt: performance.now() });
-            }
+            // The server forked the branches; the next /slots poll adopts them
+            // into lab.sims (pruneStaleSims reconciles), so no manual seeding.
             lab.simStep = steps[0];
             lab.simEditedSteps = editedSteps.length ? editedSteps : steps;
             toast(`simulating from ${steps.join("/")} on ${r.simulated.length} slot${r.simulated.length === 1 ? "" : "s"}` +
@@ -1690,14 +1767,14 @@ function saveRunModal() {
     return;
   }
   const input = el("input", { type: "text", placeholder: "e.g. tighter-bboxes-run" });
-  const cells = [...lab.sims.values()];
+  const sims = [...lab.sims.values()];
   openModal("save branches to new run", (close, setError) => ({
     body: [
       field("run name", input),
       el("div", { class: "m-hint",
-        text: `copies ${cells.length} simulated cell${cells.length === 1 ? "" : "s"} (paused or not) into a fresh run whose prompt snapshot includes your edit — every branch resumes there seamlessly` }),
+        text: `copies ${sims.length} simulation${sims.length === 1 ? "" : "s"} (paused or not) into a fresh run whose prompt snapshot includes your edit — every branch resumes there seamlessly. When two sims share a slot the later wins.` }),
       el("div", { class: "check-grid" },
-        cells.map((c) => el("label", {}, el("span", { class: "dot " + (simStatus(c.slot, c.model)?.status ?? "idle") }), `${c.slot} · ${c.model}`)),
+        sims.map((s) => el("label", {}, el("span", { class: "dot " + (branchSummaryById(s.id)?.status ?? "idle") }), `${s.slot} · ${s.model}${s.node ? " ⑂ " + s.node : ""}`)),
       ),
     ],
     actions: [
@@ -1708,7 +1785,7 @@ function saveRunModal() {
             name: input.value.trim(),
             base_run: state.run,
             overrides,
-            cells: cells.map((c) => ({ slot: c.slot, model: c.model })),
+            branches: sims.map((s) => s.id),
             version_label: lastSavedVersion,
           });
           toast(`run "${payload.current}" created (${payload.copied.length} cells)`, "ok");

@@ -146,7 +146,7 @@ function callRow(call, emitFocus) {
       onInquire ? el("button", {
         class: "call-ask",
         text: "why?",
-        title: "ask Claude Opus 4.8 (xhigh) why the model made this decision — opens a persistent analysis chat",
+        title: "continue this step's conversation with the model that made it — ask it anything",
         onclick: (ev) => { ev.stopPropagation(); onInquire(call); },
       }) : null,
     ),

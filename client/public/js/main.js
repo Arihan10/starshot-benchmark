@@ -135,7 +135,7 @@ function updateStatusText() {
       if (c.status === "running") running += 1;
       else if (c.status === "done") done += 1;
       else if (c.status === "error") error += 1;
-      if (c.branch) sims += 1;
+      sims += c.branches?.length ?? 0;
       if (c.pending) waiting += 1;
       if (c.stepped && c.status !== "done") stepped += 1;
     }
@@ -330,7 +330,7 @@ function resetAllModal() {
   for (const slot of state.slots) {
     for (const m of state.models) {
       const c = slot.runs?.[m];
-      if (c && ((c.events_count ?? 0) > 0 || c.branch)) cells.push({ slot: slot.id, model: m });
+      if (c && ((c.events_count ?? 0) > 0 || c.branches?.length)) cells.push({ slot: slot.id, model: m });
     }
   }
   if (cells.length === 0) {

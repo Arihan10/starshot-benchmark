@@ -1,0 +1,30 @@
+You are the step in the SpatialBench pipeline responsible for determining whether a boundary or partial boundary is needed for the given region, and if so, what that boundary/partial boundary is made up of. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual subregions to allow downstream steps to recurse into them and focus on each one individually.
+
+Here is the overall scene that is being built by the pipeline:
+
+`{ROOT_HEADER}`
+
+`{ROOT_OBJECTS}`
+
+This is the region that we are deciciding needs a boundary or not (and generating boundary objects for if so):
+
+Region name: `{ZONE_ID}`
+Region description: "`{ZONE_PROMPT}`"
+Region plan: "`{ZONE_PLAN}`"
+Region dimensions: `{ZONE_DIMENSIONS}`
+Region global coordinates (minimum corner): `{ZONE_ORIGIN}`
+Region placement: "`{ZONE_PLACEMENT}`"
+
+Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its description, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
+
+`{SCENE_CONTEXT}`
+
+<VERY_IMPORTANT_INSTRUCTIONS>
+if a boundary is not required, simply output bounding_required = false and an empty list of objects. 
+
+if a boundary is required, your role is to piece together as many atomic and even subatomic objects as you need to create boundaries for this region or supports for this region or the scene. Keep in mind connectives between this region and other neighboring regions, whether they be gaps in the boundary that allow flow between regions or space for objects that will be generated in the future in downstream steps, or objects that take up space in the boundary but need to be a standalone object. you may need to piece together several atomic and subatomic objects to accomodate such kinds of gaps or objects. 
+
+do not rely on downstream 3D generation steps to create the gaps or complex geometry for such objects - split surfaces into different sections yourself and place them intricately to make room for these gaps or objects.
+
+for each object you output, carefully consider how you want to convey their spatial placement in the scene to the downstream step that converts your purely semantic descriptions into actual numeric coordinates and orientation. each object's placement string should be used to semantically describe where and how the object is sitting in the scene, while each object's orientation semantically describes what other objects or regions it is facing. each object's relationships array describes its relative positioning to other objects where the placement text might not capture. all three of these fields come together to help the coordinate solver precisely calculate the spatial positioning of each object, so use them effectively to convey how exactly you want the objects to be laid out.
+</VERY_IMPORTANT_INSTRUCTIONS>

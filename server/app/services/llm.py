@@ -72,7 +72,7 @@ def _reasoning_effort(model: str) -> str:
     """The reasoning effort to request for `model`. OpenAI/GPT models are pinned
     to "minimal" for now — xhigh makes them slow + costly and we're not
     measuring their reasoning depth here; every other provider stays at "xhigh"."""
-    return "minimal" if (model or "").startswith("openai/") else "xhigh"
+    return "medium" if (model or "").startswith("openai/") else "xhigh"
 
 
 # Optional per-task breakpoint. When set, `call_llm` awaits it right before
@@ -170,6 +170,19 @@ async def call_llm(
     # normally misses and the step runs fresh on the chosen model.
     gate = _step_gate.get()
     if gate is not None:
+        # Gated (branch) replay: a step committed earlier in THIS log on a
+        # different model (a per-step A/B pick, now replaying as a prefix) won't
+        # match the model-bound key above, but its output is committed truth —
+        # return it without re-running. Only the frontier (whose cache.llm was
+        # truncated by the revert) finds nothing and falls through to the gate.
+        replay = cache.find_llm_replay(
+            logging.current_events(), system=system, user=user, schema_name=schema_name,
+        )
+        if replay is not None:
+            cached = output_schema.model_validate(replay)
+            if validate is not None:
+                validate(cached)
+            return cached
         chosen = await gate(
             node_id=node_id,
             step=step,
@@ -296,6 +309,16 @@ async def call_llm_once(
                         },
                     },
                     reasoning={"effort": _reasoning_effort(model)},
+                    # Force routing to a provider that actually honors the
+                    # parameters we send. Omitted, OpenRouter silently strips
+                    # any param the chosen provider lacks — so a model whose
+                    # provider can't do `response_format: json_schema` (GLM)
+                    # falls back to a free-form completion and emits fenced /
+                    # prose / null content instead of schema-conformant JSON.
+                    provider={
+                        "require_parameters": True,
+                        "sort": "latency"
+                    },
                 )
             message = response.choices[0].message
             content = message.content

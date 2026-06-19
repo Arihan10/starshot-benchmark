@@ -12,7 +12,7 @@ export const state = {
   steps: [],            // pipeline step/template ids (for "step until X"); fetched once
 
   // What the single 3D viewer is showing. null = board.
-  view: null,           // {slot, model, branch: bool}
+  view: null,           // {slot, model, branch: branchId|null}
 
   // Prompt lab session (survives navigating to overlays and back).
   lab: {
@@ -30,7 +30,9 @@ export const state = {
     // chosen zones.
     selection: new Map(),  // cellKey -> Set<node id>  (empty set ⇒ all zones)
     tests: new Map(),      // "slot|model|index" -> {status, result?, error?}
-    sims: new Map(),       // "slot|model" -> {slot, model, eventIndex}
+    // Live simulation branches keyed by their server branch id (NOT the cell),
+    // so one cell can carry several at once (different zones / parallel sims).
+    sims: new Map(),       // branchId -> {id, slot, model, eventIndex, createdAt}
     simStep: null,         // step the simulation branched at (pins obs panel)
     simEditedSteps: [],    // every step whose edit the live branches carry
   },
@@ -56,4 +58,22 @@ export function emit(topic, payload) {
 export function cellSummary(slot, model) {
   const s = state.slots.find((x) => x.id === slot);
   return s?.runs?.[model] ?? null;
+}
+
+// The cell's TOP-LEVEL simulation branches (the /slots poll embeds them per
+// cell; fan-out children are not listed here). Always an array.
+export function cellBranches(slot, model) {
+  return cellSummary(slot, model)?.branches ?? [];
+}
+
+// Find a branch summary anywhere in the current /slots snapshot by its id.
+export function branchSummaryById(bid) {
+  if (!bid) return null;
+  for (const s of state.slots) {
+    for (const alias of Object.keys(s.runs ?? {})) {
+      const b = (s.runs[alias].branches ?? []).find((x) => x.id === bid);
+      if (b) return b;
+    }
+  }
+  return null;
 }

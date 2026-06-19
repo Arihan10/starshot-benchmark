@@ -2,7 +2,7 @@
 // simulation branch) with the observability dock on the right.
 
 import { api } from "./api.js";
-import { state, emit, on, cellSummary } from "./state.js";
+import { state, emit, on, cellSummary, cellBranches, branchSummaryById } from "./state.js";
 import { el, toast, stepUntilSelect, openModal } from "./ui.js";
 import { openStream, dispatchSceneEvent, applySceneProjection, createObsModel, emittedStep } from "./events.js";
 import * as obstree from "./obstree.js";
@@ -159,17 +159,17 @@ export async function openCell({ slot, model, branch = false, forceLive = false 
 
   let projection = { nodes: [], last_index: -1 };
   try {
-    projection = await api.scene(run, slot, model, { branch });
+    projection = branch ? await api.branchScene(branch) : await api.scene(run, slot, model, {});
   } catch (e) {
     toast(`scene load failed: ${e.message}`, "err");
   }
   if (seq !== openSeq) return;
   applySceneProjection(viewer, projection);
-  viewer.prefetchBundle(api.meshesUrl(run, slot, model, { branch }));
+  viewer.prefetchBundle(branch ? api.branchMeshesUrl(branch) : api.meshesUrl(run, slot, model, {}));
 
   let history = [];
   try {
-    history = await api.eventsHistory(run, slot, model, { branch });
+    history = branch ? await api.branchEventsHistory(run, branch) : await api.eventsHistory(run, slot, model);
   } catch { /* never-started cell */ }
   if (seq !== openSeq) return;
   for (const event of history) obs.feed(event);
@@ -185,7 +185,7 @@ export async function openCell({ slot, model, branch = false, forceLive = false 
   // `forceLive` subscribes without waiting for the next poll — used right
   // after a revert relaunches the cell, so the polled summary is still stale.
   const summary = currentSummary();
-  const live = forceLive || (branch ? summary?.branch?.status : summary?.status) === "running";
+  const live = forceLive || (branch ? branchSummaryById(branch)?.status : summary?.status) === "running";
   if (live) {
     const since = Math.max(obs.model.maxIndex, projection.last_index ?? -1);
     subscribe(seq, since);
@@ -210,7 +210,9 @@ function subscribe(seq, since) {
 
 function buildUrl(since) {
   const { slot, model, branch } = state.view;
-  return api.eventsUrl(state.run, slot, model, { branch, since });
+  return branch
+    ? api.branchEventsUrl(branch, { since })
+    : api.eventsUrl(state.run, slot, model, { since });
 }
 
 // Re-attach the SSE tail to the CURRENT cell without reloading it — used on
@@ -235,7 +237,7 @@ function renderHeader() {
   if (!state.view) return;
   const { slot, model, branch } = state.view;
   const summary = currentSummary();
-  const branchInfo = summary?.branch ?? null;
+  const branchInfo = branch ? branchSummaryById(branch) : null;
   titleEl.textContent = `${slot} · ${model}`;
   crumbsEl.textContent = `${state.run}${branch ? " · simulation branch" : ""}`;
   const status = branch ? (branchInfo?.status ?? "?") : (summary?.status ?? "?");
@@ -325,17 +327,43 @@ function renderHeader() {
     document.getElementById("overlay-step-until")?.remove();
   }
 
-  // Source/branch flip when both exist.
-  let flip = document.getElementById("overlay-flip");
-  if (branchInfo || branch) {
-    if (!flip) {
-      flip = el("button", { id: "overlay-flip" });
-      actionBtn.before(flip);
+  // Branch access: a selector to jump between the source run and EACH of the
+  // cell's downstream simulations (lineages). Available even on a DONE cell —
+  // whose only source action is reset — so sims that branched off earlier (and
+  // may still be running / paused) are always reachable here. Picking one loads
+  // it; from a branch its own step/pause/resume controls take over.
+  document.getElementById("overlay-flip")?.remove(); // legacy single-branch flip
+  let branchSel = document.getElementById("overlay-branch-sel");
+  const cellBs = cellBranches(slot, model);
+  if (branch || cellBs.length) {
+    const sig = `${branch ?? ""}|${cellBs.map((b) => `${b.id}:${b.pending ? "paused" : b.status ?? ""}`).join(",")}`;
+    // Don't rebuild the <select> while the user has it open (a poll would close
+    // the dropdown); refresh only when the option set / statuses actually change.
+    if (!branchSel || (branchSel.dataset.sig !== sig && document.activeElement !== branchSel)) {
+      if (!branchSel) {
+        branchSel = el("select", {
+          id: "overlay-branch-sel",
+          title: "view the source run or one of its downstream simulations",
+        });
+        branchSel.addEventListener("change", () => {
+          openCell({ slot, model, branch: branchSel.value || null });
+        });
+        actionBtn.before(branchSel);
+      }
+      branchSel.dataset.sig = sig;
+      branchSel.replaceChildren(
+        el("option", { value: "", text: "view: source run" }),
+        ...cellBs.map((b) => {
+          const lab = b.pin ?? b.model ?? model;
+          const node = b.last_step?.node;
+          const st = b.pending ? "paused" : (b.status ?? "?");
+          return el("option", { value: b.id, text: `⑂ sim · ${lab}${node ? " @ " + node : ""} · ${st}` });
+        }),
+      );
+      branchSel.value = branch ?? "";
     }
-    flip.textContent = branch ? "view source" : "view sim branch";
-    flip.onclick = () => openCell({ slot, model, branch: !branch });
-  } else if (flip) {
-    flip.remove();
+  } else if (branchSel) {
+    branchSel.remove();
   }
 }
 
@@ -373,7 +401,7 @@ async function stepCurrent(auto, until = null) {
   if (!slot) return;
   try {
     if (branch) {
-      await api.branchStep(state.run, slot, model, auto);
+      await api.branchStep(branch, { auto });
     } else {
       const r = await api.cellStep(state.run, slot, model, { auto, until });
       // A paused cell that was just relaunched (vs. a live gate released over
@@ -396,12 +424,12 @@ async function onAction() {
   const { slot, model, branch } = state.view ?? {};
   if (!slot) return;
   const summary = currentSummary();
-  const status = branch ? summary?.branch?.status : summary?.status;
+  const status = branch ? branchSummaryById(branch)?.status : summary?.status;
   const pausing = status === "running";
   try {
     if (branch) {
-      if (pausing) await api.branchPause(state.run, slot, model);
-      else await api.branchResume(state.run, slot, model);
+      if (pausing) await api.branchPause(branch);
+      else await api.branchResume(branch);
     } else {
       if (pausing) await api.pause(state.run, slot, model);
       else await api.resume(state.run, slot, model);

@@ -29,3 +29,27 @@ def find_llm_cache_hit(
             output = event.get("output")
             return output if isinstance(output, dict) else None
     return None
+
+
+def find_llm_replay(
+    events: list[dict[str, Any]], *, system: str, user: str, schema_name: str,
+) -> dict[str, Any] | None:
+    """A committed `cache.llm` whose inputs match IGNORING the model. The normal
+    cache key binds the model (so a fresh call on a different model re-runs),
+    but a step COMMITTED earlier on one model and then REPLAYED while the task
+    runs a different model (e.g. a simulation branch whose per-step A/B picked a
+    non-default model, now being replayed as a prefix) must still hit its
+    committed output instead of re-running. The cut is exact: a reverted step's
+    `cache.llm` is truncated away, so only genuinely-committed prefix steps match
+    — the frontier the user is re-running finds nothing here and proceeds to the
+    live call. Used ONLY on the gated (branch) path, never the main pipeline."""
+    for event in reversed(events):
+        if (
+            event.get("kind") == "cache.llm"
+            and event.get("schema") == schema_name
+            and event.get("system") == system
+            and event.get("user") == user
+        ):
+            output = event.get("output")
+            return output if isinstance(output, dict) else None
+    return None

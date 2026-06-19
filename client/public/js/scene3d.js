@@ -851,6 +851,49 @@ export function createViewer(host, { keyboard = true } = {}) {
     return new Promise((resolve, reject) => loader.parse(arrayBuffer, "", resolve, reject));
   }
 
+  // Wrap an already-in-memory byte array as a one-shot stream reader, so the
+  // SMB1 parse loop can run over fetched-and-held bytes (the compare view's
+  // captured candidate bundles) the same way it does over a live response body.
+  function singleChunkReader(uint8) {
+    let sent = false;
+    return { read: async () => (sent ? { done: true, value: undefined } : ((sent = true), { done: false, value: uint8 })) };
+  }
+
+  // Parse the SMB1 framing off `r` and attach each GLB, bounded-concurrency.
+  // `only` (a Set of node ids) restricts which meshes are attached — the compare
+  // view passes a candidate's NEW mesh ids so the shared prefix isn't re-parsed
+  // on every candidate switch (no flicker). Aborts when a newer load supersedes
+  // it or the viewer's generation advances.
+  async function drainBundle(r, myGen, abort, only) {
+    const dec = new TextDecoder();
+    const magic = await r.readExact(4);
+    if (!magic || dec.decode(magic) !== MESH_BUNDLE_MAGIC) return;
+    const inflight = new Set();
+    while (true) {
+      if (myGen !== gen || abort.signal.aborted) break;
+      const idLenB = await r.readExact(4);
+      if (!idLenB) break;
+      const idB = await r.readExact(new DataView(idLenB.buffer).getUint32(0, true));
+      if (!idB) break;
+      const id = dec.decode(idB);
+      const glbLenB = await r.readExact(4);
+      if (!glbLenB) break;
+      const glbB = await r.readExact(new DataView(glbLenB.buffer).getUint32(0, true));
+      if (!glbB) break;
+      if (only && !only.has(id)) continue; // a prefix mesh we already hold — skip
+      const p = (async () => {
+        try {
+          const gltf = await parseGlb(glbB.buffer);
+          if (myGen !== gen || abort.signal.aborted) { disposeObject3D(gltf.scene); return; }
+          attachGltf(id, gltf.scene, kinds.get(id));
+        } catch { /* model-event fallback will fetch it individually */ }
+      })().finally(() => inflight.delete(p));
+      inflight.add(p);
+      if (inflight.size >= MAX_INFLIGHT) await Promise.race(inflight);
+    }
+    await Promise.allSettled(inflight);
+  }
+
   // Pull the whole cell's GLBs over ONE connection and attach progressively.
   async function prefetchBundle(meshesUrl) {
     bundleAbort?.abort?.();
@@ -860,35 +903,27 @@ export function createViewer(host, { keyboard = true } = {}) {
     try {
       const res = await fetch(meshesUrl, { cache: "no-store", signal: abort.signal });
       if (!res.ok || !res.body) return;
-      const r = byteStreamReader(res.body.getReader());
-      const dec = new TextDecoder();
-      const magic = await r.readExact(4);
-      if (!magic || dec.decode(magic) !== MESH_BUNDLE_MAGIC) return;
-      const inflight = new Set();
-      while (true) {
-        if (myGen !== gen || abort.signal.aborted) break;
-        const idLenB = await r.readExact(4);
-        if (!idLenB) break;
-        const idB = await r.readExact(new DataView(idLenB.buffer).getUint32(0, true));
-        if (!idB) break;
-        const id = dec.decode(idB);
-        const glbLenB = await r.readExact(4);
-        if (!glbLenB) break;
-        const glbB = await r.readExact(new DataView(glbLenB.buffer).getUint32(0, true));
-        if (!glbB) break;
-        const p = (async () => {
-          try {
-            const gltf = await parseGlb(glbB.buffer);
-            if (myGen !== gen) { disposeObject3D(gltf.scene); return; }
-            attachGltf(id, gltf.scene, kinds.get(id));
-          } catch { /* model-event fallback will fetch it individually */ }
-        })().finally(() => inflight.delete(p));
-        inflight.add(p);
-        if (inflight.size >= MAX_INFLIGHT) await Promise.race(inflight);
-      }
-      await Promise.allSettled(inflight);
+      await drainBundle(byteStreamReader(res.body.getReader()), myGen, abort, null);
     } catch { /* aborted / network — fallbacks cover it */ }
     if (myGen === gen) fitToScene();
+  }
+
+  // Attach meshes from an SMB1 bundle whose bytes are ALREADY in hand (no fetch).
+  // The compare view snapshots each candidate model's bundle when it runs — the
+  // branch's objects dir only ever holds the latest model's meshes, so replaying
+  // captured bytes is the only way to show an earlier candidate's meshes. Forces
+  // a re-attach (attachGltf replaces by id) so a candidate's geometry/placement
+  // actually swaps in even though the id is unchanged.
+  async function loadBundleBuffer(arrayBuffer, onlyIds = null) {
+    if (!arrayBuffer || arrayBuffer.byteLength === 0) return;
+    bundleAbort?.abort?.();
+    const abort = new AbortController();
+    bundleAbort = abort;
+    const myGen = gen;
+    const only = onlyIds ? new Set(onlyIds) : null;
+    try {
+      await drainBundle(byteStreamReader(singleChunkReader(new Uint8Array(arrayBuffer))), myGen, abort, only);
+    } catch { /* malformed bytes — leave what loaded */ }
   }
 
   function clear() {
@@ -1004,6 +1039,7 @@ export function createViewer(host, { keyboard = true } = {}) {
     loadBbox,
     loadModel,
     prefetchBundle,
+    loadBundleBuffer,
     setOverlayBoxes,
     clearOverlayBoxes,
     setOverlayVisible: (v) => { overlayRoot.visible = v; },

@@ -34,6 +34,20 @@ async function request(path, { method = "GET", body, params } = {}) {
 const cellPath = (slot, model, tail = "") =>
   `/slots/${encodeURIComponent(slot)}/${encodeURIComponent(model)}${tail}`;
 
+// Read a JSONL event log straight from the artifact server (full history,
+// cache.llm payloads included). Tolerates a torn final line written mid-flush.
+async function readEventsJsonl(rel) {
+  const res = await fetch(u(`/artifacts/${rel}`), { cache: "no-store" });
+  if (!res.ok) return [];
+  const text = await res.text();
+  const out = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try { out.push(JSON.parse(line)); } catch { /* torn tail line mid-write */ }
+  }
+  return out;
+}
+
 export const api = {
   // --- runs + versions ---
   runs: () => request("/runs"),
@@ -65,33 +79,37 @@ export const api = {
   retryMesh: (run, slot, model, nodeId) =>
     request(cellPath(slot, model, `/retry-mesh/${encodeURIComponent(nodeId)}`), { method: "POST", params: { run } }),
 
-  // --- cell data ---
-  //   branch:true → the cell's simulation fork.
-  //   untilIndex → project/bundle only the source prefix BEFORE that event
-  //     (the compare view's "previous" pane: the original's state at the fork
-  //     step). Source-only; ignored for branch reads.
-  scene: (run, slot, model, { branch = false, untilIndex } = {}) =>
-    request(cellPath(slot, model, branch ? "/branch/scene" : "/scene"), { params: { run, until_index: untilIndex } }),
-  eventsUrl: (run, slot, model, { branch = false, since } = {}) =>
-    u(cellPath(slot, model, branch ? "/branch/events" : "/events"), { run, since }).toString(),
-  meshesUrl: (run, slot, model, { branch = false, untilIndex } = {}) =>
-    u(cellPath(slot, model, branch ? "/branch/meshes" : "/meshes"), { run, until_index: untilIndex }).toString(),
-  // Full history backfill (cache.llm payloads included) straight from disk.
-  async eventsHistory(run, slot, model, { branch = false } = {}) {
-    const sub = branch ? "_branch/" : "";
-    const rel = `${run}/${slot}/${model}/${sub}events.jsonl`;
-    const res = await fetch(u(`/artifacts/${rel}`), { cache: "no-store" });
-    if (!res.ok) return [];
-    const text = await res.text();
-    const out = [];
-    for (const line of text.split("\n")) {
-      if (!line.trim()) continue;
-      try { out.push(JSON.parse(line)); } catch { /* torn tail line mid-write */ }
-    }
-    return out;
+  // --- source cell data ---
+  //   untilIndex → project/bundle only the prefix BEFORE that event (the
+  //     compare view's "previous" pane: the original's state at the fork step).
+  scene: (run, slot, model, { untilIndex } = {}) =>
+    request(cellPath(slot, model, "/scene"), { params: { run, until_index: untilIndex } }),
+  eventsUrl: (run, slot, model, { since } = {}) =>
+    u(cellPath(slot, model, "/events"), { run, since }).toString(),
+  meshesUrl: (run, slot, model, { untilIndex } = {}) =>
+    u(cellPath(slot, model, "/meshes"), { run, until_index: untilIndex }).toString(),
+  // Full source-cell history backfill (cache.llm payloads included) from disk.
+  async eventsHistory(run, slot, model) {
+    return readEventsJsonl(`${run}/${slot}/${model}/events.jsonl`);
   },
   artifactUrl: (path) => u(`/artifacts/${path}`).toString(),
   absUrl: (path) => new URL(path, SERVER_URL).toString(),
+
+  // --- simulation branches (keyed by branch id) ---
+  // A branch is a first-class fork living in the run's flat `_branches/<id>/`
+  // temp folder. Many per cell coexist; parallel-LLM previews are child
+  // branches. All control is keyed by the opaque branch id.
+  branchScene: (bid) => request(`/branches/${encodeURIComponent(bid)}/scene`),
+  branchStatus: (bid) => request(`/branches/${encodeURIComponent(bid)}`),
+  branchEventsUrl: (bid, { since } = {}) =>
+    u(`/branches/${encodeURIComponent(bid)}/events`, { since }).toString(),
+  //   sinceIndex → only the meshes placed at/after that event (a fan-out child's
+  //     NEW meshes over the shared prefix already on screen).
+  branchMeshesUrl: (bid, { sinceIndex } = {}) =>
+    u(`/branches/${encodeURIComponent(bid)}/meshes`, { since_index: sinceIndex }).toString(),
+  async branchEventsHistory(run, bid) {
+    return readEventsJsonl(`${run}/_branches/${bid}/events.jsonl`);
+  },
 
   // --- prompt lab ---
   promptTemplates: (run) => request(`/runs/${encodeURIComponent(run)}/prompt-templates`),
@@ -101,33 +119,34 @@ export const api = {
   stepEvents: (run, step) => request(`/runs/${encodeURIComponent(run)}/step-events`, { params: { step } }),
   stepEvent: (run, slot, model, index, step) =>
     request(`/runs/${encodeURIComponent(run)}/step-event`, { params: { run, slot, model, index, step } }),
-  branchStepEvent: (run, slot, model, step, node) =>
-    request(`/runs/${encodeURIComponent(run)}/branch-step-event`, { params: { run, slot, model, step, node } }),
+  branchStepEvent: (bid, step, node) =>
+    request(`/branches/${encodeURIComponent(bid)}/step-event`, { params: { step, node } }),
   promptTest: (body) => request("/prompt-test", { method: "POST", body }),
+  // Fork a NEW simulation branch from a cell. `body` is {event_index, step,
+  // overrides, seed?, model?}; returns {branch:{id, …}}. Many branches per cell
+  // coexist (fork different zones — or LLMs — for parallel sims). `body.model`
+  // (an alias) PINS the fork to that LLM and runs one step (compare's per-LLM
+  // lineage); omit it to pause at the forked step on the cell's base model.
   createBranch: (run, slot, model, body) =>
     request(cellPath(slot, model, "/branch"), { method: "POST", params: { run }, body }),
+  // Every TOP-LEVEL sim branch of a run (children/fan-out previews excluded).
+  listBranches: (run) => request(`/runs/${encodeURIComponent(run)}/branches`, { params: { run } }),
   // `auto` runs the branch to completion; `until` (a template id) fast-forwards
   // it to the next call of that step. A plain step queues if the branch is
   // mid-call (so a batch "step sims" never errors on a not-yet-gated branch).
-  // `modelOverride` (a model alias) re-aims the next gated call at a chosen LLM
-  // (compare's per-step A/B); null keeps the branch's current model.
-  branchStep: (run, slot, model, auto = false, until = null, modelOverride = null) =>
-    request(cellPath(slot, model, "/branch/step"), { method: "POST", params: { run }, body: { auto, until, model: modelOverride } }),
-  // Revert a simulation branch to before `toEventIndex` and pause there; a
-  // following branchStep re-runs from the cut under the current snapshot +
-  // `overrides` (the lab's live edit set). `overrides=null` keeps the branch's
-  // existing edits.
-  branchRewind: (run, slot, model, toEventIndex, overrides = null) =>
-    request(cellPath(slot, model, "/branch/rewind"), { method: "POST", params: { run }, body: { to_event_index: toEventIndex, overrides } }),
-  // Promote a cell's simulation branch to BE the source cell (replace + discard).
-  commitBranch: (run, slot, model) =>
-    request(cellPath(slot, model, "/branch/commit"), { method: "POST", params: { run } }),
-  branchPause: (run, slot, model) =>
-    request(cellPath(slot, model, "/branch/pause"), { method: "POST", params: { run } }),
-  branchResume: (run, slot, model) =>
-    request(cellPath(slot, model, "/branch/resume"), { method: "POST", params: { run } }),
-  branchDiscard: (run, slot, model) =>
-    request(cellPath(slot, model, "/branch"), { method: "DELETE", params: { run } }),
+  // `modelOverride` (a model alias) re-aims the next gated call at a chosen LLM.
+  branchStep: (bid, { auto = false, until = null, model = null } = {}) =>
+    request(`/branches/${encodeURIComponent(bid)}/step`, { method: "POST", body: { auto, until, model } }),
+  // Revert a branch to before `toEventIndex` and pause there; a following
+  // branchStep re-runs from the cut under the current snapshot + `overrides`
+  // (the lab's live edit set). `overrides=null` keeps the branch's edits.
+  branchRewind: (bid, toEventIndex, overrides = null) =>
+    request(`/branches/${encodeURIComponent(bid)}/rewind`, { method: "POST", body: { to_event_index: toEventIndex, overrides } }),
+  // Promote a branch to BE its origin source cell (replace + discard).
+  branchCommit: (bid) => request(`/branches/${encodeURIComponent(bid)}/commit`, { method: "POST" }),
+  branchPause: (bid) => request(`/branches/${encodeURIComponent(bid)}/pause`, { method: "POST" }),
+  branchResume: (bid) => request(`/branches/${encodeURIComponent(bid)}/resume`, { method: "POST" }),
+  branchDiscard: (bid) => request(`/branches/${encodeURIComponent(bid)}`, { method: "DELETE" }),
   saveVersion: (body) => request("/versions/save", { method: "POST", body }),
   saveRunFromBranches: (body) => request("/runs/from-branches", { method: "POST", body }),
   forkVersion: (name, base) => request("/versions/fork", { method: "POST", body: { name, base } }),
@@ -143,9 +162,9 @@ export const api = {
     request(`/runs/${encodeURIComponent(run)}/simulate-step`, { method: "POST", body: { steps, cells } }),
 
   // --- decision inquiry ---
-  // Ask the reviewer (Claude Opus 4.8, xhigh) why a step's subject model
-  // decided what it did. `body` carries the step grounding (step/model/system/
-  // user/output/reasoning) plus the running `messages` thread; returns
+  // Continue a step's own LLM conversation. `body` carries the step's `model`,
+  // its system prompt, and the running `messages` thread (seeded with the
+  // call's input + output); the reply comes from that same model. Returns
   // {answer, reasoning, model}.
   inquire: (body) => request("/inquire", { method: "POST", body }),
 };

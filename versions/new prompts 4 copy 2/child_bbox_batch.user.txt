@@ -1,0 +1,35 @@
+You are the step in the SpatialBench pipeline responsible for resolving the bounding boxes of a region's subregions. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into different subregions to allow downstream steps to recurse into them and focus on each one individually. An upstream step has already chosen this region's subregions, and for each one, written a semantic placement description as a list of spatial relationships the subregion has with existing regions or objects in the scene. Your goal is to use the information provided and your own spatial awareness to determine the concrete coordinates and dimensions of each subregion relative to their larger parent region to deterministically place each one in the scene.
+
+Here is the overall scene that is being built by the pipeline:
+
+`{ROOT_HEADER}`
+
+`{ROOT_OBJECTS}`
+
+This is the parent region whose subregions you are placing:
+
+Parent region name: '`{ZONE_ID}`'
+Parent prompt: "`{ZONE_PROMPT}`"
+Parent region plan: "`{ZONE_PLAN}`"
+Parent region dimensions: `{ZONE_DIMENSIONS}`
+Parent region global origin corner: `{ZONE_ORIGIN}`
+
+Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its description, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
+
+`{SCENE_CONTEXT}`
+
+Here is the list of subregions you must place inside `{ZONE_ID}`. Each entry has a sentence describing the subregion's placement and a list of relationships that subregion has with other entities in the scene to better help you understand the way the subregions are intended to be laid out.
+
+`{TO_PLACE}`
+
+<VERY_IMPORTANT_INSTRUCTIONS>
+using the placement description and relationship list given for each subregion, determine the concrete coordinates and dimensions of each subregion.
+
+Think very deeply and spatially about the list of subregions you've been asked to place. think about the plan for the region and the overall scene as a whole, and how the placement of each subregion contributes to that. the bounding box you output for a subregion concretely determines that region's allocated space inside the scene, directly deciding the space that downstream steps have to populate that particular subregion. also think about the current state of the scene from the scene context - the objects/regions that have already been placed/planned. try to visualize what this physically looks like, and where the subregions you place fall into that image. think about how to place the subregions in such a way that their placement makes sense relative to each other and the scene overall remains spatially coherent. think about the other bounding boxes that have been declared in the scene, belonging to other objects or regions, and how the bounding boxes you output would interact with them.
+
+right after this step, a step for generating the objects that form the boundary of `{ZONE_ID}` will run. reason spatially about whether you need to leave any space for any boundary objects that might get generated when coming up with the bounding boxes for these subregions. think about this deeply relative to the context of already-placed regions/objects (if any) that shouldn't be intruded on, as well as the overall bounding box for the scene which must fully contain everything.
+
+once you output this list, the bounding boxes for each of the aforementioned subregions is locked in for the scene - no downstream step can change it. be very careful and detailed in your reasoning.
+
+the bounding boxes you give should be defined via its minimum corner and a list of dimensions. The minimum corner of each subregion's bounding box should be given relative to the bounding box of the parent region, treating the minimum corner of `{ZONE_ID}` as the origin (0, 0, 0).
+</VERY_IMPORTANT_INSTRUCTIONS>

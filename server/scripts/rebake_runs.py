@@ -183,7 +183,12 @@ def rebake_cell(cell_dir: Path, *, force: bool, limit: int, prune: bool) -> dict
 def _discover_cells(runs_dir: Path, cell: str | None) -> list[Path]:
     if cell:
         return [runs_dir / cell]
-    return sorted({p.parent for p in runs_dir.rglob("events.jsonl")})
+    # Skip each run's `_branches/` temp folder — those are ephemeral simulation
+    # forks (and their fan-out children), not source cells to optimize.
+    return sorted({
+        p.parent for p in runs_dir.rglob("events.jsonl")
+        if "_branches" not in p.parts
+    })
 
 
 def main() -> None:

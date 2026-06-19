@@ -850,6 +850,10 @@
             .inq-msg.user .inq-bubble { background: #16222e; border: 1px solid var(--accent-line); color: #d8ecff; }
             .inq-msg.assistant .inq-bubble { background: var(--panel-2); border: 1px solid var(--line); color: var(--text); }
             .inq-msg.assistant.error .inq-bubble { border-color: #7a3f3f; background: #2c1d1d; color: #f0c9c9; }
+            /* Seed turns = the step's own input/output the chat continues from:
+               dimmed + height-capped so a big input or output stays compact. */
+            .inq-msg.seed { opacity: 0.78; }
+            .inq-msg.seed .inq-bubble { max-height: 220px; overflow: auto; }
             .inq-think-toggle {
                 align-self: flex-start; margin-top: 3px;
                 font-size: 10px; padding: 1px 7px;
@@ -1092,8 +1096,22 @@
             .cmp-head-text { flex: 0 0 auto; white-space: nowrap; }
             .cmp-step-ctl { margin-left: auto; display: flex; align-items: center; gap: 4px; min-width: 0; }
             .cmp-step-btn { font-size: 10px; padding: 1px 7px; letter-spacing: 0; }
-            .cmp-step-model { font-size: 10px; padding: 1px 4px; max-width: 130px; }
             .cmp-step-label { font-size: 10px; color: var(--text-faint); letter-spacing: 0; max-width: 230px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            /* Per-step multi-LLM A/B: the "run next step on" model picker and the
+               resulting per-model outcome chips, above the simulation canvas. */
+            .cmp-sim-bar { display: flex; flex-direction: column; gap: 5px; padding: 5px 12px; background: #101218; border-bottom: 1px solid var(--line-2); }
+            .cmp-pick-row { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; min-height: 20px; }
+            .cmp-pick-lab { font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--text-faint); margin-right: 2px; }
+            .cmp-model-chip { font-size: 10px; padding: 1px 8px; border-radius: 10px; opacity: 0.45; }
+            .cmp-model-chip.on { opacity: 1; border-color: var(--accent); color: var(--accent); }
+            .cmp-cand { font-size: 10px; padding: 1px 8px; display: inline-flex; align-items: center; gap: 5px; }
+            .cmp-cand.on { border-color: var(--accent); color: var(--text); background: rgba(154, 212, 255, 0.12); }
+            .cmp-cand.err { opacity: 0.65; }
+            .cmp-cand-tok { color: var(--text-faint); }
+            .cmp-cand-chg { color: var(--accent); }
+            .cmp-cand-same { color: var(--text-faint); }
+            .cmp-cand-err { color: #ff8a8a; }
+            .cmp-cand-head { color: var(--purple); font-size: 9px; }
             .cmp-host { flex: 1; position: relative; min-height: 0; }
             /* Per-side debug toggles overlaid on each compare canvas. */
             .cmp-toggles {

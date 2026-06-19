@@ -80,13 +80,15 @@ function stepLine(summary) {
 
 function cellCard(slot, model) {
   const summary = slot.runs?.[model] ?? { status: "idle", events_count: 0 };
-  const branch = summary.branch;
+  const branches = summary.branches ?? [];
   const card = el(
     "div",
     {
-      class: `cell-card${summary.events_count === 0 && !branch ? " empty" : ""}`,
+      class: `cell-card${summary.events_count === 0 && !branches.length ? " empty" : ""}`,
       title: slot.prompt ?? "",
-      onclick: () => emit("open-cell", { slot: slot.id, model, branch: !!branch }),
+      // The card opens the SOURCE scene; a cell can carry several sim branches
+      // now, so they're opened/managed from the prompt lab's simulations list.
+      onclick: () => emit("open-cell", { slot: slot.id, model, branch: null }),
     },
     el("div", { class: "head" },
       el("span", { class: `dot ${summary.status}` }),
@@ -96,11 +98,17 @@ function cellCard(slot, model) {
     el("div", { class: "step-line", text: stepLine(summary) }),
     el("div", { class: "meta-line", text: `${model} · ${summary.events_count} events · ${summary.status}` }),
   );
-  if (branch) {
+  if (branches.length) {
+    const first = branches[0];
+    // Clickable: jump straight into a downstream simulation (the overlay's
+    // branch selector then reaches the others) — reachable even on a done cell.
     card.appendChild(
-      el("div", { class: "branch-chip" },
-        el("span", { class: `dot ${branch.status}` }),
-        el("span", { text: `sim · ${branch.status} · ${stepLine(branch)}` }),
+      el("div", { class: "branch-chip", title: "open this cell's downstream simulation",
+        onclick: (ev) => { ev.stopPropagation(); emit("open-cell", { slot: slot.id, model, branch: first.id }); } },
+        el("span", { class: `dot ${first.status}` }),
+        el("span", { text: branches.length === 1
+          ? `sim · ${first.status} · ${stepLine(first)}`
+          : `${branches.length} sims · ${first.status}…` }),
       ),
     );
   }

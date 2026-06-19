@@ -709,6 +709,8 @@ def iter_logged_calls(runs_root: Path, wanted: set[str]):
         run_dirs = [runs_root / forced]
     for run_dir in run_dirs[:_MAX_RUNS]:
         for ev_path in sorted(run_dir.glob("*/*/events.jsonl")):
+            if "_branches" in ev_path.parts:
+                continue  # ephemeral simulation forks, not source cells
             seen: dict[str, int] = {}
             try:
                 with ev_path.open("r", encoding="utf-8") as f:
