@@ -150,8 +150,10 @@ export async function openCell({ slot, model, branch = false, forceLive = false 
   obs = createObsModel();
   obstree.resetDock();
   obstree.setPinStep(branch ? state.lab.simStep : null);
-  // Revert is a source-cell action (branches are discarded, not rewound).
-  obstree.setOnRevert(branch ? null : revertToCall);
+  // Per-call revert (the ⏪ on each call row): a source cell rewinds + re-runs
+  // from the cut; a branch rewinds ITS OWN log to before the step and pauses
+  // there (source untouched), ready to step forward again.
+  obstree.setOnRevert(branch ? revertBranchToCall : revertToCall);
   // "+ sim" on a zone row drops it into the prompt lab's simulation slots. A
   // source-cell action — you fork a NEW branch from the source, not from one.
   obstree.setOnAddSim(branch ? null : (node) => emit("add-sim-target", { slot, model, node }));
@@ -238,8 +240,11 @@ function renderHeader() {
   const { slot, model, branch } = state.view;
   const summary = currentSummary();
   const branchInfo = branch ? branchSummaryById(branch) : null;
-  titleEl.textContent = `${slot} · ${model}`;
-  crumbsEl.textContent = `${state.run}${branch ? " · simulation branch" : ""}`;
+  // A per-LLM lineage is pinned to a model; surface it so the cell's many
+  // lineages aren't all indistinguishably labeled with the cell's base model.
+  const pin = branchInfo?.pin && branchInfo.pin !== model ? branchInfo.pin : null;
+  titleEl.textContent = `${slot} · ${model}${pin ? " → " + pin : ""}`;
+  crumbsEl.textContent = `${state.run}${branch ? (pin ? ` · sim on ${pin}` : " · simulation branch") : ""}`;
   const status = branch ? (branchInfo?.status ?? "?") : (summary?.status ?? "?");
   dotEl.className = `dot ${status}`;
   const cellInfo = branch ? branchInfo : summary;
@@ -345,8 +350,14 @@ function renderHeader() {
           id: "overlay-branch-sel",
           title: "view the source run or one of its downstream simulations",
         });
+        // Read the CURRENT view at change time — this <select> element persists
+        // across renders/cells (only its options are rebuilt), so capturing the
+        // creating render's slot/model would go stale: switching while viewing a
+        // DIFFERENT cell's branch would re-open under the wrong cell, whose
+        // options exclude the viewed branch → the dropdown blanks out.
         branchSel.addEventListener("change", () => {
-          openCell({ slot, model, branch: branchSel.value || null });
+          const v = state.view;
+          if (v) openCell({ slot: v.slot, model: v.model, branch: branchSel.value || null });
         });
         actionBtn.before(branchSel);
       }
@@ -390,6 +401,41 @@ function revertToCall(call) {
         // The cell is already relaunching server-side; reload at the cut and
         // stream the re-run (forceLive — the polled summary is still stale).
         openCell({ slot, model, branch: false, forceLive: true });
+        emit("poll-now");
+      } }),
+    ],
+  }));
+}
+
+// Revert the open simulation BRANCH to just before `call` — confirms first (it
+// drops every later step + its meshes on this branch), then truncates the
+// branch's log and PAUSES there. The source run is untouched; stepping forward
+// re-runs from the cut under the branch's edits. The branch mirror of
+// `revertToCall`, but non-destructive to the source (and it pauses rather than
+// auto-re-running, since a branch advances one manual step at a time).
+function revertBranchToCall(call) {
+  const { slot, model, branch } = state.view ?? {};
+  if (!slot || !branch) return;
+  const step = call.template ?? call.step ?? "this step";
+  openModal(`revert this simulation?`, (close, setError) => ({
+    body: [
+      el("div", { class: "m-hint", text:
+        `Truncates this simulation branch to just before its ${step} call (#${call.index}), ` +
+        "drops every later step and its meshes, and pauses there — “step” then re-runs from the cut. " +
+        "The source run is untouched." }),
+    ],
+    actions: [
+      el("button", { text: "cancel", onclick: close }),
+      el("button", { class: "danger", text: "revert & pause", onclick: async () => {
+        // overrides=null keeps the branch's own edit set (the overlay isn't the
+        // prompt lab, so it doesn't re-apply the lab's live drafts).
+        try { await api.branchRewind(branch, call.index); }
+        catch (e) { setError(e.message); return; }
+        close();
+        toast(`reverted simulation to #${call.index}`, "ok");
+        // Reload the (now-paused, truncated) branch at the cut; emit a poll so
+        // the header status catches up from the still-stale summary.
+        openCell({ slot, model, branch });
         emit("poll-now");
       } }),
     ],
