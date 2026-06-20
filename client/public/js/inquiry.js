@@ -108,12 +108,20 @@ function ensurePanel() {
   input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); sendTurn(); }
   });
+  // Always-visible "drop the step's own reasoning into the box" button. The
+  // step always emits a reasoning trace, so it sits right by the input ready to
+  // paste it in to quote or edit — it never sends on its own.
+  const reasonBtn = el("button", {
+    class: "inq-reason", type: "button", text: "↩ reasoning",
+    title: "paste this step's reasoning trace into the message box to quote or edit — doesn't send",
+    onclick: () => injectReasoning(current?.call?.reasoning),
+  });
   const sendBtn = el("button", { class: "primary inq-send", text: "ask", onclick: () => sendTurn() });
-  const foot = el("div", { class: "inq-foot" }, input, sendBtn);
+  const foot = el("div", { class: "inq-foot" }, input, reasonBtn, sendBtn);
 
   panel = el("div", { id: "inquiry-panel" }, head, prompt, body, foot);
   document.body.appendChild(panel);
-  refs = { title, sub, prompt, body, input, sendBtn };
+  refs = { title, sub, prompt, body, input, reasonBtn, sendBtn };
 
   // Esc closes the chat first (capture phase + stopPropagation keeps the
   // overlay/drawer Esc handlers from also firing), unless a modal owns Esc.
@@ -212,7 +220,17 @@ function bubble(turn) {
         tog.textContent = shown ? "▸ thinking" : "▾ thinking";
       },
     });
-    wrap.appendChild(tog);
+    const actions = el("div", { class: "inq-think-actions" }, tog);
+    // The seed turn IS this step — its reasoning has the always-visible footer
+    // "↩ reasoning" button, so per-bubble inject is only for follow-up replies.
+    if (!turn.seed) {
+      actions.appendChild(el("button", {
+        class: "inq-think-inject", text: "→ message",
+        title: "drop this reply's reasoning into the message box to quote, edit, or ask about it",
+        onclick: () => injectReasoning(turn.reasoning),
+      }));
+    }
+    wrap.appendChild(actions);
     wrap.appendChild(pre);
   }
   return wrap;
@@ -232,12 +250,32 @@ function syncBusyControls() {
   refs.sendBtn.disabled = busy;
   refs.sendBtn.textContent = busy ? "thinking…" : "ask";
   refs.input.disabled = busy;
+  refs.reasonBtn.disabled = busy || !current?.call?.reasoning;
 }
 
 function setBusy(on, id) {
   busy = on;
   busyId = on ? id : null;
   syncBusyControls();
+}
+
+// Drop a reasoning trace into the message box so it can be quoted, edited, or
+// asked about before sending. Splices at the caret when the box is focused,
+// else appends; pads with newlines so the block keeps its own lines.
+function injectReasoning(text) {
+  if (!refs || !text) return;
+  const input = refs.input;
+  const focused = document.activeElement === input;
+  const start = focused ? input.selectionStart : input.value.length;
+  const end = focused ? input.selectionEnd : input.value.length;
+  const before = input.value.slice(0, start);
+  const after = input.value.slice(end);
+  const lead = before && !before.endsWith("\n") ? "\n" : "";
+  const tail = after && !after.startsWith("\n") ? "\n" : "";
+  input.value = before + lead + text + tail + after;
+  const caret = before.length + lead.length + text.length;
+  input.focus();
+  input.setSelectionRange(caret, caret);
 }
 
 async function sendTurn(preset) {

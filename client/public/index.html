@@ -903,12 +903,12 @@
                dimmed + height-capped so a big input or output stays compact. */
             .inq-msg.seed { opacity: 0.78; }
             .inq-msg.seed .inq-bubble { max-height: 220px; overflow: auto; }
-            .inq-think-toggle {
-                align-self: flex-start; margin-top: 3px;
+            .inq-think-actions { display: flex; gap: 6px; align-self: flex-start; margin-top: 3px; }
+            .inq-think-toggle, .inq-think-inject {
                 font-size: 10px; padding: 1px 7px;
                 color: var(--text-faint); background: transparent; border: 1px solid var(--line-2); border-radius: 4px;
             }
-            .inq-think-toggle:hover { color: var(--purple); border-color: #5a4a8a; }
+            .inq-think-toggle:hover, .inq-think-inject:hover { color: var(--purple); border-color: #5a4a8a; }
             .inq-reasoning {
                 margin-top: 4px; max-width: 100%;
                 background: #0c0d10; border: 1px solid var(--line-2); border-radius: 5px;
@@ -926,6 +926,9 @@
             }
             .inq-input { flex: 1; resize: vertical; min-height: 38px; max-height: 160px; font-size: 12px; line-height: 1.45; }
             .inq-send { flex-shrink: 0; }
+            .inq-reason { flex-shrink: 0; font-size: 11px; }
+            .inq-reason:hover:not(:disabled) { color: var(--purple); border-color: #5a4a8a; }
+            .inq-reason:disabled { opacity: 0.45; cursor: default; }
 
             /* ---------- prompt lab ---------- */
             #lab {
