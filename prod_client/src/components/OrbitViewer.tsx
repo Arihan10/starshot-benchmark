@@ -7,18 +7,22 @@ import {
 	type ReactNode,
 	type RefObject,
 } from "react";
-import { useScene } from "@/components/SceneProvider";
 import { OrbitEngine } from "@/lib/orbit/engine";
 import { INITIAL_ORBIT_STATE, type OrbitState } from "@/lib/orbit/types";
-import { tourSource } from "@/lib/scenes";
+import { tourSource, type Scene } from "@/lib/scenes";
 
-export default function OrbitViewer() {
+export default function OrbitViewer({
+	scene,
+	onFocusedChange,
+}: {
+	scene: Scene | null;
+	onFocusedChange?: (focused: boolean) => void;
+}) {
 	const hostRef = useRef<HTMLDivElement>(null);
 	const engineRef = useRef<OrbitEngine | null>(null);
 	const menuRef = useRef<HTMLDivElement>(null);
 	const [state, setState] = useState<OrbitState>(INITIAL_ORBIT_STATE);
 	const [holding, setHolding] = useState(false);
-	const { selected, status, error } = useScene();
 
 	// Mount the imperative engine once; dispose fully on unmount so React
 	// StrictMode's double-invoke leaves nothing leaked.
@@ -33,12 +37,23 @@ export default function OrbitViewer() {
 		};
 	}, []);
 
-	// Load (or reload) the selected scene's assets from R2 whenever it changes:
+	// Load (or reload) this panel's scene assets from R2 whenever it changes:
 	// the dollhouse GLB plus the optional capture-tour manifest (positions +
 	// proxy). The engine fetches the manifest and streams panos lazily.
 	useEffect(() => {
-		if (selected) void engineRef.current?.loadTour(tourSource(selected));
-	}, [selected]);
+		if (scene) void engineRef.current?.loadTour(tourSource(scene));
+	}, [scene]);
+
+	// A panel is "focused" once its camera leaves the shared dollhouse orbit
+	// (entering / inside / locating). The workspace expands it to full screen and
+	// collapses its sibling while this holds.
+	const focused =
+		state.mode === "interior" ||
+		state.mode === "transition" ||
+		state.mode === "peek";
+	useEffect(() => {
+		onFocusedChange?.(focused);
+	}, [focused, onFocusedChange]);
 
 	// Dismiss the object menu on any outside press (capture, so it beats the canvas
 	// handlers) or Escape. The contextMenu reference is stable while open, so this
@@ -62,28 +77,10 @@ export default function OrbitViewer() {
 
 	const { mode, overlay, minimap } = state;
 	const hud = hudContent(state);
-	const catalogMessage =
-		status === "loading"
-			? "loading scenes…"
-			: status === "error"
-				? `failed to load scenes: ${error}`
-				: !selected
-					? "no scenes published yet"
-					: null;
 
 	return (
-		<div className='relative flex-1'>
+		<div className='relative h-full w-full'>
 			<div ref={hostRef} className='absolute inset-0 bg-[#0c0d10]' />
-
-			{catalogMessage && (
-				<div className='absolute inset-0 z-20 flex items-center justify-center bg-[#0c0d10]/80'>
-					<span
-						className={`text-sm ${status === "error" ? "text-red-400" : "text-neutral-400"}`}
-					>
-						{catalogMessage}
-					</span>
-				</div>
-			)}
 
 			{mode !== "empty" && mode !== "loading" && (
 				<div className='absolute left-4 top-4 z-10 flex flex-col gap-2'>

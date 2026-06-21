@@ -1241,26 +1241,21 @@ export class OrbitEngine {
 	private peekEnd() {
 		if (this.mode !== "peek" || !this.savedInterior) return;
 		const s = this.savedInterior;
-		this.startFly(
-			s.pos.clone(),
-			lookTargetFrom(s.pos, s.lon, s.lat),
-			800,
-			{
-				onMid: () => {
-					this.setInteriorView();
-					this.camera.fov = s.fov;
-					this.camera.updateProjectionMatrix();
-				},
-				onEnd: () => {
-					this.mode = "interior";
-					this.lon = s.lon;
-					this.lat = s.lat;
-					this.currentIndex = s.index;
-					this.activate(s.index);
-					this.emit();
-				},
+		this.startFly(s.pos.clone(), lookTargetFrom(s.pos, s.lon, s.lat), 800, {
+			onMid: () => {
+				this.setInteriorView();
+				this.camera.fov = s.fov;
+				this.camera.updateProjectionMatrix();
 			},
-		);
+			onEnd: () => {
+				this.mode = "interior";
+				this.lon = s.lon;
+				this.lat = s.lat;
+				this.currentIndex = s.index;
+				this.activate(s.index);
+				this.emit();
+			},
+		});
 	}
 
 	peekDown() {

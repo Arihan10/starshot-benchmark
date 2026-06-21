@@ -15,7 +15,12 @@ export const PROJ_K = 4;
 
 // 1×1 black stand-in so the sampler array is always fully bound; unused slots
 // carry weight 0 and never contribute.
-export const DUMMY_TEX = new DataTexture(new Uint8Array([0, 0, 0, 255]), 1, 1, RGBAFormat);
+export const DUMMY_TEX = new DataTexture(
+	new Uint8Array([0, 0, 0, 255]),
+	1,
+	1,
+	RGBAFormat,
+);
 DUMMY_TEX.needsUpdate = true;
 
 // Equirect backdrop / sphere-mode pano. Same direction→uv convention as the
@@ -59,7 +64,9 @@ export function makeProjectionMaterial(): ShaderMaterial {
 	return new ShaderMaterial({
 		uniforms: {
 			uTex: { value: Array.from({ length: PROJ_K }, () => DUMMY_TEX) },
-			uCenter: { value: Array.from({ length: PROJ_K }, () => new Vector3()) },
+			uCenter: {
+				value: Array.from({ length: PROJ_K }, () => new Vector3()),
+			},
 			uWeight: { value: new Float32Array(PROJ_K) },
 			uCount: { value: 0 },
 		},
