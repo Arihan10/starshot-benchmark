@@ -11,6 +11,10 @@ import type { OrbitState } from "./types";
 
 const _ndc = new Vector2();
 
+// Proxy parts whose name calls out a door or a stair are pinned to the orange
+// outline as a permanent wayfinding cue (see ObjectAddressing.pinOutlinesByName).
+const PINNED_OUTLINE_RE = /door|stair/i;
+
 // The addressable objects of a loaded root. The exporter/loader can wrap the
 // real objects under a single node, so unwrap single unnamed non-mesh wrappers,
 // then take that container's mesh-bearing children. Fall back to "every mesh"
@@ -50,6 +54,9 @@ export class ObjectAddressing {
 	private readonly picker = new Raycaster();
 	private readonly hiddenObjects = new Set<Object3D>();
 	private readonly outlinedObjects = new Set<Object3D>();
+	// Objects pinned to the orange outline regardless of hover / right-click —
+	// populated by pinOutlinesByName, dropped only by reset().
+	private readonly pinnedOutlines = new Set<Object3D>();
 	private hoveredObj: Object3D | null = null;
 	private menuTarget: Object3D | null = null;
 	private contextMenu: OrbitState["contextMenu"] = null;
@@ -71,6 +78,17 @@ export class ObjectAddressing {
 			o.userData.objId = i;
 			o.userData.objLabel =
 				o.name && o.name.trim() ? o.name.trim() : `object ${i + 1}`;
+		});
+	}
+
+	// Permanently orange-outline every object in `root` whose label names a door
+	// or a stair. These outlines ignore the hover toggle and survive
+	// clearOutlines / the right-click menu — only reset() drops them. Call after
+	// register() so objLabel is populated.
+	pinOutlinesByName(root: Object3D) {
+		collectObjects(root).forEach((o) => {
+			if (PINNED_OUTLINE_RE.test((o.userData.objLabel as string) ?? ""))
+				this.pinnedOutlines.add(o);
 		});
 	}
 
@@ -122,11 +140,18 @@ export class ObjectAddressing {
 	// that's both, and hidden objects are dropped; an empty list is a no-op pass.
 	updateOutlines() {
 		const selected: Object3D[] = [];
-		for (const o of this.outlinedObjects) if (o.visible) selected.push(o);
+		for (const o of this.pinnedOutlines) if (o.visible) selected.push(o);
+		for (const o of this.outlinedObjects)
+			if (o.visible && !this.pinnedOutlines.has(o)) selected.push(o);
 		this.selectPass.selectedObjects = selected;
 		const h = this.hoveredObj;
 		this.hoverPass.selectedObjects =
-			h && h.visible && !this.outlinedObjects.has(h) ? [h] : [];
+			h &&
+			h.visible &&
+			!this.outlinedObjects.has(h) &&
+			!this.pinnedOutlines.has(h)
+				? [h]
+				: [];
 	}
 
 	// Right-click an object → per-object menu (hide / outline). Right-clicking
@@ -191,6 +216,7 @@ export class ObjectAddressing {
 	reset() {
 		this.hiddenObjects.clear();
 		this.outlinedObjects.clear();
+		this.pinnedOutlines.clear();
 		this.hoveredObj = null;
 		this.menuTarget = null;
 		this.contextMenu = null;

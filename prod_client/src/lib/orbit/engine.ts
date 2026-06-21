@@ -589,7 +589,7 @@ export class OrbitEngine {
 		this.camera.fov = MathUtils.clamp(
 			this.camera.fov + ev.deltaY * 0.05,
 			25,
-			100,
+			120,
 		);
 		this.camera.updateProjectionMatrix();
 	};
@@ -1460,6 +1460,8 @@ export class OrbitEngine {
 		if (this.liteRoot) this.addressing.register(this.liteRoot);
 		if (this.proxyGroup) {
 			this.addressing.register(this.proxyGroup);
+			// Doors / stairs in the proxy stay permanently orange-outlined.
+			this.addressing.pinOutlinesByName(this.proxyGroup);
 			this.colorProxyObjects();
 			// Give proxy floor leaks an opaque backing (a base under its footprint).
 			this.projection.buildBase(this.proxyGroup, this.scene);
