@@ -22,7 +22,7 @@ using the scene context provided above and the description given for `{ZONE_ID}`
 
 You are to design the subregion in a single paragraph at a high level and expand the throughline provided by upstream steps narratively. Your job is to think about the region from a storytelling perspective. focus on what happens in the space and let downstream steps decide what this means physically for the region. your design should also mention any narrative or structural quirks that cannot be inferred or reconstructed by downstream steps since it was an idea generated within your internal reasoning.
 
-
+when designing `{ZONE_ID}`, consider all attributes of the region including its volume and position in the scene. the same region given different attributes might require a different design. 
 
 DO NOT use flowery language or be overly detailed.
 

@@ -1,4 +1,4 @@
-You are the step in the SpatialBench pipeline responsible for determining whether a boundary or partial boundary is needed for the given region, and if so, what that boundary/partial boundary is made up of. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual subregions to allow downstream steps to recurse into them and focus on each one individually.
+You are the step in the SpatialBench pipeline responsible for determining the list of objects that define how this region interacts with the regions around it. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual subregions to allow downstream steps to recurse into them and focus on each one individually.
 
 Here is the overall scene that is being built by the pipeline:
 
@@ -6,7 +6,7 @@ Here is the overall scene that is being built by the pipeline:
 
 `{ROOT_OBJECTS}`
 
-This is the region that we are deciciding needs a boundary or not (and generating boundary objects for if so):
+This is the region that you are focusing on:
 
 Region name: `{ZONE_ID}`
 Region description: "`{ZONE_PROMPT}`"
@@ -15,26 +15,20 @@ Region dimensions: `{ZONE_DIMENSIONS}`
 Region global coordinates (minimum corner): `{ZONE_ORIGIN}`
 Region placement: "`{ZONE_PLACEMENT}`"
 
-Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its description, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
+Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its description, a parent block (the object or region in the scene that the current object is structurally anchored to), a parent_region, and parent_region_dimensions (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box. Treat the bounding boxes for other subregions as space that has been reserved already for that subregion - something you should not intrude on unless there's a good spatial or narrative reason.
 
 `{SCENE_CONTEXT}`
 
 <VERY_IMPORTANT_INSTRUCTIONS>
-not every region requires a boundary.
+analyze the role of `{ZONE_ID}` in the scene, its plan, and its position in the scene to understand which other regions in the scene it interacts with, as well as the kind of interaction that `{ZONE_ID}` should have with each.
 
-if a boundary is not required, simply output bounding_required = false and an empty list of objects. 
+each of these interactions should be thought through carefully - some interactions are meant to be free and don't need any objects, while other kinds of interactions should be controlled by specific, intentionally placed geometry that limits the interaction in a well-structured way.
 
-if a boundary is required, your role is to piece together the boundary of `{ZONE_ID}` with a variety of objects. this boundary is what frames the region and can act as an abstract shell for the region as well as support for this or other regions in the scene.
+your goal is to assemble the list of objects that form the shell around `{ZONE_ID}` that supports each of these interactions it is meant to have with its neighboring regions. treat this abstract shell as a whole instead of individual objects: one object in the list can support multiple interactions with different regions, while one interaction may also need multiple objects to piece together. think cohesively and spatially about how to piece this shell together - the placement of each object, if any, should be intentional.
 
-think about whether this region needs to access other neighboring regions, or whether the plan established in the scene so far leads to objects being slotted into this boundary, now or in downstream steps. the boundary of a region is what defines its connections and interactions with other regions.
+when considering your list of objects, take ownership over the geometry. assume that the downstream 3D generation step is incapable of generating embedded objects, precisely shaped objects, or precisely positioned cutouts. if you need to do this when constructing the shell, split surfaces into different sections yourself and place them intricately to construct the geometry you're looking for. there are no exceptions to this rule. moreover, do not rely on a downstream step to generate anything for the shell of this region - you are the step to decide this, and no downstream step will do it for you. there is no limit on the number of objects you generate - trust downstream steps to resolve their concrete coordinates well regardless of how many pieces you output as a result of splitting.
 
-think about how this region might connect to others around it, whether that be through the practical traversability of the scene, connectives that tie regions together semantically or support for other objects and regions in the scene. think about what ties the scene together to make it cohesive, a scene is not just individual regions and objects but how those regions use objects (or gaps) to link together in a realistic way.
-
-once you have a rough idea of the objects you'll need to form this boundary, think about when the objects you've made must be broken down into several subatomic objects that leave room for gaps or other objects/regions placed within the boundary, rather than overlapping them. "looking correct" is not the only requirement for the boundary - it must also be functional, in the sense that two regions that are meant to be connected semantically must actually be physically traversable from one to the other.
-
-do not rely on downstream 3D generation steps to leave intentional gaps in objects or embed other objects within split surfaces into different sections yourself and place them intricately to make room for these gaps or objects.
-
-furthermore, when considering how to compose the object list, be aware that a downstream step is responsible for outputting an AABB for each object you output, and another downstream step is responsible for generating the actual 3D meshes based on each object's prompt. the 3d mesh generator excels at generating individual, tangible, and structurally well-defined objects - it is NOT reliable when it comes to intangible ephemera (e.g. gasses, nebula clouds, etc.) or collections of objects placed in a certain shape or manner and will often have devastating results on the entire scene, especially since the output mesh gets stretched and scaled to the bounding box given for it. as such, ignore intangible objects like gasses, and ALWAYS split groups of objects into individual ones, then use the placement text and relationships list to convey the meaning of how they should be placed in the scene so each individual object in the collection gets its own mesh and bounding box.
+do NOT generate intangible ephemera (e.g. gasses, nebula clouds, etc.). moreover, when considering collections of objects placed in a certain shape or manner, always split it into its individual component objects, and use their placement texts and relationship arrays to manually construct the intended shape you have in mind.
 
 for each object you output, carefully consider how you want to convey their spatial placement in the scene to the downstream step that converts your purely semantic descriptions into actual numeric coordinates and orientation. each object's placement string should be used to semantically describe where and how the object is sitting in the scene, while each object's orientation semantically describes what other objects or regions it is facing. each object's relationships array describes its relative positioning to other objects where the placement text might not capture. all three of these fields come together to help the coordinate solver precisely calculate the spatial positioning of each object, so use them effectively to convey how exactly you want the objects to be laid out.
 </VERY_IMPORTANT_INSTRUCTIONS>
