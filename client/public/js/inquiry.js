@@ -45,7 +45,11 @@ const SUGGESTIONS = [
 ];
 
 function convId(ctx, call) {
-  return `${ctx.run}|${ctx.slot}|${ctx.model}|${ctx.branch ? "branch" : "src"}|${call.index}`;
+  // The branch id (not a mere has-branch flag) is part of the key: a cell's
+  // sibling sims share run|slot|model AND the same call.index for a co-forked
+  // step, so only the branch id tells their threads apart. `|| "src"` folds the
+  // no-branch sentinels (false/null) to one stable source token.
+  return `${ctx.run}|${ctx.slot}|${ctx.model}|${ctx.branch || "src"}|${call.index}`;
 }
 
 export function openInquiry(call, ctx) {
@@ -64,16 +68,18 @@ export function closeInquiry() {
   panel?.classList.remove("open");
 }
 
-// Close the panel when the viewed cell (or its source/branch mode) changes, so
-// a chat about one step never lingers over a different one. Same-cell reopens
-// (resume / step re-subscribes openCell with the same view) keep it.
+// Close the panel when the viewed cell changes — including a switch between two
+// sibling sims of the SAME cell (same run/slot/model), so a chat about one
+// branch's step never lingers over another's. Same-view reopens (resume / step
+// re-subscribe openCell with the identical view) keep it. Falsy branch sentinels
+// (false/null) both mean "source", so normalize before the identity compare.
 export function notifyView(view) {
   if (!panel?.classList.contains("open") || !current) return;
   const c = current.ctx;
   if (
     !view ||
     c.run !== view.run || c.slot !== view.slot ||
-    c.model !== view.model || !!c.branch !== !!view.branch
+    c.model !== view.model || (c.branch || null) !== (view.branch || null)
   ) {
     closeInquiry();
   }
