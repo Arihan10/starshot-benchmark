@@ -23,10 +23,6 @@ OTHERWISE, IF REGION DESIGN decides this region CAN be broken down further:
 1a. OVERALL SCENE PLAN - plans the high-level idea of the entire scene, providing rough structural direction and a narrative throughline for all downstream steps. also determines if the scene can be subdivided into further subregions or not.
 1b. OVERALL BOUNDING BOX - dictates the dimensions of the bounding box that will contain the entire scene <-- YOU ARE THIS STEP.
 
-* AFTER ALL regions have been filled using the above steps, we iterate across all non-atomic regions and perform the following two steps:
-10. CONNECTIVE OBJECT GENERATION - determines/comes up with the objects that are needed to fill out empty space or smoothly connect/transition subregions
-11. OBJECT SOLVER - determines the actual coordinates and bounding boxes of the connective objects
-
 Each step is responsible for performing their unique task - trust that upstream and downstream steps are the best at what they are designated to do.
 </intro>
 
