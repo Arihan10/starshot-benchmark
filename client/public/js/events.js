@@ -126,8 +126,8 @@ const LOG_BUILDERS = {
     ["warn", `${e.zone}: completion loop stuck re-proposing ${e.id ?? "?"} — stopped`],
   "generation.dedup_drop": (e) =>
     ["warn", `${e.zone}: dropped duplicate ${e.id} (${e.reason ?? ""})`],
-  "generation.decompose.no_bounding": (e) =>
-    ["info", `${e.zone}: no bounding geometry needed`],
+  "generation.decompose.no_objects": (e) =>
+    ["info", `${e.zone}: no objects needed`],
   "divider.validate.referenced_ids.accept_invalid": (e) =>
     ["warn", `${e.node}: accepted children with dangling refs: ${e.reason ?? ""}`],
   "library.asset_missing": (e) => ["warn", `${e.id}: library asset missing (${e.library_id})`],

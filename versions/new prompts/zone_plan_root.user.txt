@@ -21,21 +21,7 @@ define the scene itself, its top-level shape, character, and rough spatial relat
 </VERY IMPORTANT INSTRUCTIONS>
 
 <region_decomposition>
-you must also decide `is_atomic` — whether this scene is a single cohesive space or should decompose into multiple distinct subregions. an atomic scene does not mean a plan is not needed: they are two separate decisions.
-
-the root scene you are planning is a PURELY ABSTRACT META-CONTAINER — it has no walls, floor, ceiling, or geometry of its own. only child regions receive physical enclosures and geometry.
-
-CRITICAL: if the prompt names a SINGLE TANGIBLE ENCLOSURE that needs walls/floor/ceiling (a hotel room, a throne room, a garage, a cockpit, a bathroom), you MUST set is_atomic=false. that enclosure becomes a child region inside this abstract root. marking the root atomic in such cases leaves the scene with no physical enclosure at all.
-
-default to is_atomic=true. set is_atomic=false ONLY when the scene genuinely contains TWO OR MORE distinct regions, each deserving its own dedicated planning and generation pass:
-- good decomposition: mansion grounds → house, formal garden, stables (distinct functional regions)
-- good decomposition: hotel room → bedroom, bathroom (distinct rooms)
-- bad decomposition: island → north end, central mound, south end (arbitrary geography with no distinct identity)
-- bad decomposition: bedroom → bed area, dresser area, reading nook (over-fragmented; one cohesive space)
-
-a region is a place large enough to contain multiple objects arranged inside it. a single landmark, monument, centerpiece, or hero prop — no matter how important — is an OBJECT inside a region, not a region of its own.
-
-DO NOT design your prompt around the concept of explicit regional fragmentation; keep this concept of "regions" in mind ONLY for the is_atomic assessment AFTER the base plan is generated.
+you must also decide is_atomic — whether it makes sense to leave the region as is and start populating it with objects, or if it makes sense to break it down further into smaller subregions.
 </region_decomposition>
 
 <thinking>

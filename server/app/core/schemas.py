@@ -20,13 +20,13 @@ from app.core.types import (
 
 class ZonePlanOutput(BaseModel):
     # The LLM-facing field is aliased so the schema/wire name matches the
-    # prompt text (`design`), while the Python attribute stays `plan` — the
+    # prompt text (`description`), while the Python attribute stays `plan` — the
     # name the shared divider/committed code and the `divider.zone_plan`
     # event use. `populate_by_name` keeps attribute-name construction
     # (committed-event replay) working.
     model_config = ConfigDict(populate_by_name=True)
 
-    plan: str = Field(alias="design")
+    plan: str = Field(alias="description")
     is_atomic: bool
 
 
@@ -195,22 +195,21 @@ class ObjectSpec(ChildNodeSpec):
 
 
 class ObjectDecompOutput(BaseModel):
-    # NEWLY EMITTED object specs — the anchor + negative-space passes. These
-    # become Nodes downstream. No `bounding_required`: only the encapsulating
-    # pass gates on a perimeter, so only its schema (below) carries that field.
+    # NEWLY EMITTED object specs that become Nodes downstream. The anchor pass
+    # uses this bare shape: it always produces the region's defining objects, so
+    # it carries no gate. Every pass that can instead decide a region needs no
+    # objects at all subclasses this and adds the `objects_required` gate below.
     objects: list[ObjectSpec] = Field(default_factory=list)
 
 
-class EncapsulatingDecompOutput(ObjectDecompOutput):
-    # The encapsulating pass adds a perimeter gate on top of the object list:
-    # when the model sets this False the region needs no bounding perimeter and
-    # `objects` is ignored even if non-empty.
-    bounding_required: bool = True
-
-
-class NextObjectOutput(BaseModel):
-    done: bool
-    objects: list[ObjectSpec] = Field(default_factory=list)
+class GatedObjectDecompOutput(ObjectDecompOutput):
+    # Shared by every pass that may decide a region needs no objects at all: the
+    # encapsulating shell, the negative-space fill, and the anchor completion
+    # loop (`next_object`). When the model sets this False the region needs
+    # nothing from this pass and `objects` is ignored even if non-empty — for the
+    # completion loop that False is also how it signals "done" (no more objects),
+    # so it needs no separate `done` field.
+    objects_required: bool = True
 
 
 class ImagePromptOutput(BaseModel):

@@ -52,8 +52,8 @@ def _root_scene_header(root: Node) -> str:
     dx, dy, dz = root.bbox.dimensions
     ox, oy, oz = root.bbox.origin
     return (
-        f'Prompt: "{root.prompt}"\n'
-        f'Plan: "{root.plan}"\n'
+        f'prompt: "{root.prompt}"\n'
+        f'description: "{root.plan}"\n'
         f"Overall scene (root) bounding box: {dx:.2f}m by {dy:.2f}m by {dz:.2f}m, with its origin corner at ({ox:.2f}, {oy:.2f}, {oz:.2f}) m"
     )
 
@@ -72,7 +72,7 @@ def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str) -> str:
     `parent` is the object's structural-anchor block — `parent_id` (the peer object or region this object physically rests on / attaches to / sits inside), `parent_relationship_kind` (ON / ATTACHED / IN), `parent_dimensions` (that parent's size), and `parent_global_origin_corner` (its world position). `parent_region` is the id of the subregion this object belongs to and `parent_region_dimensions` is that region's size; both are omitted when `parent_region` would equal `parent_id` (the object anchors directly to its region — the `parent` block already states them), and they are shown only when the object anchors to a peer object (e.g. a lamp ON a nightstand has parent_id=nightstand, parent_region=<the subregion the nightstand is in>)."""
     lines = [
         f"Name: {obj.id}",
-        f'Description: "{obj.prompt}"',
+        f'prompt: "{obj.prompt}"',
     ]
     if obj.parent_id is not None:
         kind_str = obj.parent_kind.value if obj.parent_kind is not None else "(unknown)"
@@ -126,10 +126,10 @@ def _region_embedded_entry(
         name_line += f"   {_TARGET_MARKER} {target_text}".rstrip()
     lines = [
         name_line,
-        f'Description: "{region.prompt}"',
+        f'prompt: "{region.prompt}"',
     ]
     if region.plan is not None:
-        lines.append(f'Plan for this region: "{region.plan}"')
+        lines.append(f'description: "{region.plan}"')
     if region.placement is not None:
         lines.append(f'placement: "{region.placement}"')
     if region.referenced_ids:
@@ -376,7 +376,7 @@ def render_next_object_retry_block(
 PRIOR ATTEMPTS — every object batch below was ALREADY rejected. Do NOT re-emit the same specs, and do not repeat the same structural mistake. Treat every listed reason as a hard constraint you must satisfy this time:
 {_attempt_lines(prior_attempts)}
 
-Either emit a NEW list of ObjectSpecs that fixes every listed reason, or set done=true. Every object's `parent` must be a valid existing id (the supporter or containing region that anchors it), and every `relationships` entry's `target` must exist in the scene context."""
+Either emit a NEW list of ObjectSpecs that fixes every listed reason, or set objects_required=false. Every object's `parent` must be a valid existing id (the supporter or containing region that anchors it), and every `relationships` entry's `target` must exist in the scene context."""
 
 
 # --- Nano-Banana image wrapper ------------------------------------------------

@@ -3,7 +3,7 @@ You are the step in the SpatialBench pipeline responsible for breaking down a gi
 `{ROOT_HEADER}`
 
 <IMPORTANT_INSTRUCTIONS>
-You are subdividing the scene itself (id: root) into its first set of top-level subregions based on its overall plan.
+You are subdividing the scene itself (id: root) into its first set of top-level subregions based on its overall description.
 
 you are the first subdivision step in the entire pipeline, so the way you choose to split the scene here has a massive effect on how the final scene will look, as well as the steps later on in the pipeline. for example, a downstream step after you is responsible for determining the bounding objects of the scene, and will work around the regions you choose to define here.
 </IMPORTANT_INSTRUCTIONS>

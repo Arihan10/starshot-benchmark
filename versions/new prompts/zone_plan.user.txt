@@ -1,4 +1,4 @@
-You are the step in the SpatialBench pipeline responsible for designing a particular subregion within the larger overall scene, expanding on the story that has already been established. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually, then subdivides them further. You author the design for one such region, which further downstream steps then expand on, decompose, and populate.
+You are the step in the SpatialBench pipeline responsible for describing a particular subregion within the larger overall scene, expanding on the story that has already been established. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually, then subdivides them further. You author the description for one such region, which further downstream steps then expand on, decompose, and populate.
 
 Here is the overall scene that is being built by the pipeline:
 
@@ -9,22 +9,25 @@ Here is the overall scene that is being built by the pipeline:
 This is the subregion that we are planning:
 
 Subregion name: `{ZONE_ID}`
-Subregion description: "`{ZONE_PROMPT}`"
+Subregion prompt: "`{ZONE_PROMPT}`"
 Subregion dimensions: `{ZONE_DIMENSIONS}`
 Subregion global origin corner: `{ZONE_ORIGIN}`
+Subregion placement: "`{ZONE_PLACEMENT}`"
 
-Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a plan for how it should be built (or a description of what it is if a plan hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its description, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
+Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a description for how it should be built (or just its prompt for what it is if a description hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its prompt, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
 
 `{SCENE_CONTEXT}`
 
 <VERY_IMPORTANT_INSTRUCTIONS>
-using the scene context provided above and the description given for `{ZONE_ID}`, write one paragraph describing the design of `{ZONE_ID}`.
+using the scene context provided above and the prompt given for `{ZONE_ID}`, write one paragraph describing the rough layout and story of `{ZONE_ID}`.
 
-You are to design the subregion in a single paragraph at a high level and expand the throughline provided by upstream steps narratively. Your job is to think about the region from a storytelling perspective. focus on what happens in the space and let downstream steps decide what this means physically for the region. your design should also mention any narrative or structural quirks that cannot be inferred or reconstructed by downstream steps since it was an idea generated within your internal reasoning.
+You are to describing the subregion in a single paragraph at a high level and expand the throughline provided by upstream steps narratively. Your job is to think about the region from a storytelling perspective. focus on what happens in the space, what story unfolds, and let downstream steps decide what this means physically for the region. Allow the narrative of the region to imply concrete geometry for downstream steps, rather than listing objects that imply the narrative. your role is that of high-level guidance - downstream steps rely heavily on your description of the region to build the region out with concrete 3D geometry, but how they do that is up to them.
 
-when designing `{ZONE_ID}`, consider all attributes of the region including its volume and position in the scene. the same region given different attributes might require a different design. 
+when describing `{ZONE_ID}`, consider all attributes of the region including its shape and size. the same region given a different shape or size for example might need a fundamentally different design. think not just about how the space should be laid out from a narrative standpoint, but also how it should be laid out to effectively make use of the space and dimensions that has been given to it by an usptream REGION DECOMPOSE step.
 
-DO NOT use flowery language or be overly detailed.
+your description of the region should read as one smooth, fluid paragraph instead of following a rigid, sequential structure. each narrative point should be interwoven with and backed up by a spatial, structural one. think about both narrative and spatial cohesion together - not first planning the story then formulating the spatial attributes of the region to build around that story. calibrate the specificity of your description to the scope and intent of the region - downstream steps for a well-understood, low-level atomic region would require less fundamental guidance from you than something more high-level.
+
+DO NOT use flowery language or be overly detailed. Be direct and avoid repeating information that has already been given about the subregion. your description should not reference pipeline-level meta qualities such as coordinates or axes - fully immerse yourself into the scene, not the pipeline.
 
 <region_decomposition>
 you must also decide is_atomic — whether it makes sense to leave the region as is and start populating it with objects, or if it makes sense to break it down further into smaller subregions.

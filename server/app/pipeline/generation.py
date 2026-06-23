@@ -94,12 +94,13 @@ async def _decompose_objects_validated(
     existing_ids = {n.id for n in all_nodes}
     specs: list[Any] = []
     step, target_text = _DECOMP_STEPS[scenario]
-    # Only the encapsulating pass emits the `bounding_required` perimeter gate;
-    # anchor + negative-space use the bare object-list schema, so they can't (and
-    # don't) emit that field.
+    # The encapsulating + negative-space passes may decide a region needs no
+    # objects at all, so they emit the `objects_required` gate; the anchor pass
+    # always produces its region's defining objects and uses the bare object-list
+    # schema (no gate).
     decomp_schema = (
-        schemas.EncapsulatingDecompOutput
-        if scenario == "encapsulating"
+        schemas.GatedObjectDecompOutput
+        if scenario in ("encapsulating", "negative-space")
         else schemas.ObjectDecompOutput
     )
     for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
@@ -121,11 +122,12 @@ async def _decompose_objects_validated(
             template=step,
             variables=variables,
         )
-        if isinstance(out, schemas.EncapsulatingDecompOutput) and not out.bounding_required:
+        if isinstance(out, schemas.GatedObjectDecompOutput) and not out.objects_required:
             logging.log_once(
-                "generation.decompose.no_bounding",
-                match_fields=("zone",),
+                "generation.decompose.no_objects",
+                match_fields=("zone", "scenario"),
                 zone=zone.id,
+                scenario=scenario,
                 emitted=[s.model_dump() for s in out.objects],
             )
             return []
@@ -166,9 +168,9 @@ async def _next_object_batch_validated(
     all_nodes: list[Node],
 ) -> tuple[bool, list[Any]]:
     """Anchor-completion decision: the model proposes a LIST of objects per
-    round (or signals done), with the relationship-validator retry applied to
-    the whole proposed batch. Returns `(done, objects)`; `objects` is empty
-    when done."""
+    round (or sets objects_required=false to finish), with the
+    relationship-validator retry applied to the whole proposed batch. Returns
+    `(done, objects)`; `objects` is empty when done."""
     prior_attempts: list[tuple[list[Any], str]] = []
     existing_ids = {n.id for n in all_nodes}
     objects: list[Any] = []
@@ -185,14 +187,14 @@ async def _next_object_batch_validated(
         decision = await llm.call_llm(
             system=ps.system("next_object", variables),
             user=ps.user("next_object", variables),
-            output_schema=schemas.NextObjectOutput,
+            output_schema=schemas.GatedObjectDecompOutput,
             node_id=zone.id,
             step="next_object",
             template="next_object",
             variables=variables,
         )
         objects = list(decision.objects)
-        if decision.done or not objects:
+        if not decision.objects_required or not objects:
             return True, []
         try:
             validate_referenced_ids(objects, parent_id=zone.id, existing_ids=existing_ids)

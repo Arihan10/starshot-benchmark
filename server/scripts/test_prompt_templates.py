@@ -437,9 +437,9 @@ def test_information_routing() -> None:
     expect("ground_slab" not in ctx, "root-anchored object leaked into the embedded tree")
     expect(f"Subregion name: living_room   <-- TARGET: {MARKERS['anchor_decompose']}" in ctx,
            "target marker not on the targeted zone line")
-    expect("Subregion name: kitchen" in ctx and "Plan for this region" not in
+    expect("Subregion name: kitchen" in ctx and 'description: "' not in
            ctx.split("Subregion name: kitchen")[1].split("Subregion name:")[0],
-           "unplanned zone should render without a plan line")
+           "unplanned zone should render without a description line")
     # peer-anchored object carries its region; direct-anchored object doesn't
     lamp_entry = ctx.split("Name: lamp")[1].split("Name: ")[0]
     expect("parent_id: side_table" in lamp_entry and "parent_region: living_room" in lamp_entry
@@ -490,7 +490,7 @@ def test_information_routing() -> None:
     expect('"parent_kind"' not in retry and '"referenced_ids"' not in retry,
            "retry dump leaked python attribute names")
     nretry = scene_context.render_next_object_retry_block([(rejected, "reason-x")])
-    expect("or set done=true" in nretry, "next_object retry flavor wrong")
+    expect("or set objects_required=false" in nretry, "next_object retry flavor wrong")
     v = zv(nodes, living, "anchor_decompose")
     v["RETRY_BLOCK"] = retry
     expect("PRIOR ATTEMPTS" in ps.user("anchor_decompose", v), "retry block not injected")

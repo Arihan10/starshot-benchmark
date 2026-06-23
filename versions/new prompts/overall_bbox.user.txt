@@ -2,7 +2,7 @@ You are the step in the SpatialBench pipeline responsible for creating the overa
 
 '`{ROOT_PROMPT}`'
 
-An upstream step has already fleshed this out in more detail and devised a high-level plan for this generation:
+An upstream step has already fleshed this out in more detail and devised a high-level description for this generation:
 
 `{ROOT_PLAN}`
 
