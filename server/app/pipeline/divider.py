@@ -79,6 +79,9 @@ async def _plan_zone(
     if not nodes:
         step = "zone_plan_root"
         variables = scene_context.root_seed_vars(prompt=zone_prompt)
+        # The root step ("OVERALL SCENE PLAN") emits `plan`; nested regions
+        # ("REGION DESCRIPTION") emit `description`. Same shape, different field.
+        output_schema = schemas.RootZonePlanOutput
     else:
         step = "zone_plan"
         variables = scene_context.zone_vars(
@@ -88,10 +91,11 @@ async def _plan_zone(
             nodes=nodes,
             target_text="This is the region you are to plan and flesh out from.",
         )
+        output_schema = schemas.ZonePlanOutput
     return await llm.call_llm(
         system=ps.system(step, variables),
         user=ps.user(step, variables),
-        output_schema=schemas.ZonePlanOutput,
+        output_schema=output_schema,
         node_id=zone_id,
         step="zone_plan",
         template=step,

@@ -18,12 +18,22 @@ from app.core.types import (
 )
 
 
+class RootZonePlanOutput(BaseModel):
+    # The root planning step ("OVERALL SCENE PLAN") keeps `plan` as its wire
+    # field — the scene-level plan, distinct from a nested region's
+    # `description`. Same shape as ZonePlanOutput, but no alias: the wire name
+    # equals the `plan` attribute the shared divider/committed code reads.
+    plan: str
+    is_atomic: bool
+
+
 class ZonePlanOutput(BaseModel):
-    # The LLM-facing field is aliased so the schema/wire name matches the
-    # prompt text (`description`), while the Python attribute stays `plan` — the
-    # name the shared divider/committed code and the `divider.zone_plan`
-    # event use. `populate_by_name` keeps attribute-name construction
-    # (committed-event replay) working.
+    # The non-root region step ("REGION DESCRIPTION"). The LLM-facing field is
+    # aliased so the schema/wire name matches the prompt text (`description`),
+    # while the Python attribute stays `plan` — the name the shared
+    # divider/committed code and the `divider.zone_plan` event use.
+    # `populate_by_name` keeps attribute-name construction (committed-event
+    # replay) working.
     model_config = ConfigDict(populate_by_name=True)
 
     plan: str = Field(alias="description")

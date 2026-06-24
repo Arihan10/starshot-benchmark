@@ -20,7 +20,7 @@ The user message contains the user prompt for the scene, plus guidance on how to
 
 <output>
 Respond with a single JSON object containing:
-- `description` (string): your scene planning paragraph
+- `plan` (string): your scene planning paragraph
 - `is_atomic` (boolean): whether this scene is a single cohesive space or should decompose into distinct subregions
 
 No additional prose, markdown, or code fences.

@@ -21,7 +21,7 @@ define the scene itself, its top-level shape, character, and rough spatial relat
 </VERY IMPORTANT INSTRUCTIONS>
 
 <region_decomposition>
-you must also decide is_atomic — whether it makes sense to leave the region as is and start populating it with objects, or if it makes sense to break it down further into smaller subregions.
+you must also decide is_atomic — whether it makes sense to leave the region as is and start populating it with objects, or if it makes sense to break it down further into smaller subregions first.
 </region_decomposition>
 
 <thinking>
