@@ -24,5 +24,7 @@ for each subregion, the placement text represents a semantic spatial description
 
 once you've decided the list of subregions, reason spatially about the role and meaning of each one and how that affects their placement in the larger region and spatial relationships with each other or existing objects/regions in the scene. the placement and size of each subregion should be realistic relative to the purpose it serves in the scene.
 
-start by thinking of the high level way of how these subregions should be laid out relative to each other, with respect to the scene's narrative. then, think spatially about if this is possible or practical given the physical structure of the scene thus far, and prioritize spatial coherence over narrative meaning.
+reason carefully about the role in the scene that each subregion should have, and how that translates to how large they should be. in particular, consider the relative sizing of each subregion you output and the most narratively sensible way to distribute the space of the parent region. When coming up with the placement of each, reason about the spatial layout of the subregions as a whole and think about how they interact with each other rather than focusing on one at a time.
+
+note that although the subregions are contained by the parent region, they aren't always strictly partitioning it - sometimes, a parent region is intended to be fully partitioned into individual subregions, while at other times, a parent region acts as more of an abstract container, and the subregions are simply contained within with negative space remaining.
 </IMPORTANT_INSTRUCTIONS>

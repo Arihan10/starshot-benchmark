@@ -6,4 +6,8 @@ You are the step in the SpatialBench pipeline responsible for breaking down a gi
 You are subdividing the scene itself (id: root) into its first set of top-level subregions based on its overall description.
 
 you are the first subdivision step in the entire pipeline, so the way you choose to split the scene here has a massive effect on how the final scene will look, as well as the steps later on in the pipeline. for example, a downstream step after you is responsible for determining the bounding objects of the scene, and will work around the regions you choose to define here.
+
+reason carefully about the role in the scene that each subregion should have, and how that translates to how large they should be. in particular, consider the relative sizing of each subregion you output and the most narratively sensible way to distribute the space of the parent region. When coming up with the placement of each, reason about the spatial layout of the subregions as a whole and think about how they interact with each other rather than focusing on one at a time.
+
+note that although the subregions are contained by the parent region, they aren't always strictly partitioning it - sometimes, a parent region is intended to be fully partitioned into individual subregions, while at other times, a parent region acts as more of an abstract container, and the subregions are simply contained within with negative space remaining.
 </IMPORTANT_INSTRUCTIONS>
