@@ -6,7 +6,7 @@ import { state, emit, on, cellSummary, cellBranches, branchSummaryById } from ".
 import { el, toast, stepUntilSelect, openModal } from "./ui.js";
 import { openStream, dispatchSceneEvent, applySceneProjection, createObsModel, emittedStep } from "./events.js";
 import { statusView } from "./status.js";
-import * as obstree from "./obstree.js";
+import { createObsDock } from "./obstree.js";
 import * as inquiry from "./inquiry.js";
 
 const overlayEl = document.getElementById("overlay");
@@ -18,6 +18,7 @@ const actionBtn = document.getElementById("overlay-action");
 const resetBtn = document.getElementById("overlay-reset");
 
 let viewer = null;
+let dock = null;
 let stream = null;
 let obs = createObsModel();
 let renderQueued = false;
@@ -25,6 +26,7 @@ let openSeq = 0; // monotonically increasing guard for async open races
 
 export function initOverlay(sceneViewer) {
   viewer = sceneViewer;
+  dock = createObsDock(document.getElementById("obsdock"));
 
   // Tree ↔ 3D linking. A node-row click toggles selection and frames the
   // bbox (dimming the rest); a call click guarantees its node is focused
@@ -36,8 +38,8 @@ export function initOverlay(sceneViewer) {
   // the tree shows as "via {step}". `recolorAll` (below) repaints once a load's
   // history has folded, since the scene projection paints bboxes first.
   viewer.setOriginOf((id) => emittedStep(obs.model, id));
-  viewer.onSelect((id) => obstree.markSelected(id, { scroll: true }));
-  obstree.setOnNodeClick((id, { ensureSelected = false } = {}) => {
+  viewer.onSelect((id) => dock.markSelected(id, { scroll: true }));
+  dock.setOnNodeClick((id, { ensureSelected = false } = {}) => {
     if (!viewer.hasBbox(id)) return;
     if (ensureSelected && viewer.getSelected() === id) return;
     viewer.select(id, { frame: true });
@@ -45,13 +47,13 @@ export function initOverlay(sceneViewer) {
   // Per-node hiding: the tree's eye buttons and the canvas right-click share
   // the viewer's hidden set; any change re-renders the tree so eye states
   // and row dimming follow.
-  obstree.setHiddenApi({ isHidden: viewer.isHidden, toggle: viewer.toggleHidden });
-  viewer.onHiddenChange(() => obstree.renderTree(obs.model));
+  dock.setHiddenApi({ isHidden: viewer.isHidden, toggle: viewer.toggleHidden });
+  viewer.onHiddenChange(() => dock.renderTree(obs.model));
 
   // "why?" on any call row → the decision-inquiry chat for that step. Read-only,
   // so it's wired once (source AND branch views) and reads the live view at
   // click time for the cell/run/branch context.
-  obstree.setOnInquire((call) => {
+  dock.setOnInquire((call) => {
     if (!state.view) return;
     const { slot, model, branch } = state.view;
     inquiry.openInquiry(call, { run: state.run, slot, model, branch });
@@ -131,8 +133,8 @@ function scheduleTreeRender() {
   renderQueued = true;
   requestAnimationFrame(() => {
     renderQueued = false;
-    obstree.renderTree(obs.model, { streamed: true });
-    if (state.view?.branch && state.lab.simStep) obstree.renderPinned(obs.model);
+    dock.renderTree(obs.model, { streamed: true });
+    if (state.view?.branch && state.lab.simStep) dock.renderPinned(obs.model);
   });
 }
 
@@ -156,15 +158,15 @@ export async function openCell({ slot, model, branch = false, forceLive = false 
   viewer.setActive(true);
   viewer.clear({ keepCamera });
   obs = createObsModel();
-  obstree.resetDock();
-  obstree.setPinStep(branch ? state.lab.simStep : null);
+  dock.resetDock();
+  dock.setPinStep(branch ? state.lab.simStep : null);
   // Per-call revert (the ⏪ on each call row): a source cell rewinds + re-runs
   // from the cut; a branch rewinds ITS OWN log to before the step and pauses
   // there (source untouched), ready to step forward again.
-  obstree.setOnRevert(branch ? revertBranchToCall : revertToCall);
+  dock.setOnRevert(branch ? revertBranchToCall : revertToCall);
   // "+ sim" on a zone row drops it into the prompt lab's simulation slots. A
   // source-cell action — you fork a NEW branch from the source, not from one.
-  obstree.setOnAddSim(branch ? null : (node) => emit("add-sim-target", { slot, model, node }));
+  dock.setOnAddSim(branch ? null : (node) => emit("add-sim-target", { slot, model, node }));
   renderHeader();
 
   let projection = { nodes: [], last_index: -1 };
@@ -188,8 +190,8 @@ export async function openCell({ slot, model, branch = false, forceLive = false 
   // is known. (Streamed bboxes color correctly on paint — their decompose call
   // always precedes the bbox event.)
   viewer.recolorAll();
-  obstree.renderTree(obs.model);
-  if (branch && state.lab.simStep) obstree.renderPinned(obs.model);
+  dock.renderTree(obs.model);
+  if (branch && state.lab.simStep) dock.renderPinned(obs.model);
   renderHeader(); // error message comes from the just-loaded log
 
   // `forceLive` subscribes without waiting for the next poll — used right
@@ -521,6 +523,6 @@ export function closeOverlay() {
   state.view = null;
   overlayEl.classList.remove("open");
   viewer.setActive(false);
-  obstree.setPinStep(null);
+  dock.setPinStep(null);
   inquiry.closeInquiry();
 }

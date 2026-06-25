@@ -55,6 +55,10 @@ export const api = {
   createRun: (name, promptVersion) =>
     request("/runs", { method: "POST", body: { name, prompt_version: promptVersion } }),
   activateRun: (name) => request(`/runs/${encodeURIComponent(name)}/activate`, { method: "POST" }),
+  // Load a run's cells into memory WITHOUT activating it, so its /scene +
+  // /meshes are readable next to the active run (the run-compare view). No-op
+  // if already loaded; launches nothing.
+  hydrateRun: (name) => request(`/runs/${encodeURIComponent(name)}/hydrate`, { method: "POST" }),
   slots: (run) => request("/slots", { params: { run } }),
 
   // --- cell lifecycle ---

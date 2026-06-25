@@ -549,15 +549,16 @@
                 width: 3px;
                 background: var(--accent-line);
             }
+            /* Shared dock layout — every createObsDock() host (the overlay's
+               #obsdock AND each run-compare pane's .rc-obs) is a flex column
+               whose body scrolls between a fixed head/pinned and the log. */
+            .obsdock { display: flex; flex-direction: column; min-height: 0; }
             #obsdock {
                 width: 480px;
                 flex-shrink: 0;
                 background: var(--panel);
-                display: flex;
-                flex-direction: column;
-                min-height: 0;
             }
-            #obsdock-head {
+            .obsdock-head {
                 padding: 8px 12px;
                 border-bottom: 1px solid var(--line-2);
                 display: flex;
@@ -566,7 +567,7 @@
                 color: var(--text-dim);
                 flex-shrink: 0;
             }
-            #obs-pinned {
+            .obs-pinned {
                 border-bottom: 1px solid var(--line);
                 background: #191527;
                 padding: 9px 12px;
@@ -575,8 +576,8 @@
                 overflow: auto;
                 display: none;
             }
-            #obs-pinned.visible { display: block; }
-            #obs-pinned .pin-label {
+            .obs-pinned.visible { display: block; }
+            .obs-pinned .pin-label {
                 color: var(--purple);
                 font-size: 10px;
                 text-transform: uppercase;
@@ -586,8 +587,8 @@
                 gap: 8px;
                 align-items: center;
             }
-            #obs-pinned .pin-section { margin: 6px 0; }
-            #obs-pinned .pin-section > .lab {
+            .obs-pinned .pin-section { margin: 6px 0; }
+            .obs-pinned .pin-section > .lab {
                 color: var(--text-faint);
                 font-size: 10px;
                 margin-bottom: 2px;
@@ -595,10 +596,10 @@
                 align-items: center;
                 gap: 6px;
             }
-            #obs-pinned pre { max-height: 110px; overflow: auto; background: #0c0d10; padding: 6px; border-radius: 4px; }
-            #obs-body { flex: 1; overflow: auto; padding: 8px 0; }
+            .obs-pinned pre { max-height: 110px; overflow: auto; background: #0c0d10; padding: 6px; border-radius: 4px; }
+            .obs-body { flex: 1; overflow: auto; padding: 8px 0; }
 
-            #obs-log {
+            .obs-log {
                 flex-shrink: 0;
                 border-top: 1px solid var(--line);
                 background: #14151a;
@@ -606,7 +607,7 @@
                 flex-direction: column;
                 min-height: 0;
             }
-            #obs-log-head {
+            .obs-log-head {
                 display: flex;
                 align-items: center;
                 gap: 8px;
@@ -616,17 +617,17 @@
                 user-select: none;
                 flex-shrink: 0;
             }
-            #obs-log-head:hover { color: var(--text); }
-            #obs-log-head .caret { color: var(--text-faint); width: 10px; }
-            #obs-log.open #obs-log-head .caret { transform: rotate(90deg); }
-            #obs-log-counts.has-errors { color: var(--red); }
-            #obs-log-body {
+            .obs-log-head:hover { color: var(--text); }
+            .obs-log-head .caret { color: var(--text-faint); width: 10px; }
+            .obs-log.open .obs-log-head .caret { transform: rotate(90deg); }
+            .obs-log-counts.has-errors { color: var(--red); }
+            .obs-log-body {
                 display: none;
                 overflow: auto;
                 max-height: 30vh;
                 padding: 2px 0 8px 0;
             }
-            #obs-log.open #obs-log-body { display: block; }
+            .obs-log.open .obs-log-body { display: block; }
             .log-row {
                 display: flex;
                 gap: 8px;
@@ -1202,6 +1203,59 @@
             #compare-text .ct-sec { margin-bottom: 10px; }
             #compare-text .ct-h { color: var(--text-faint); font-size: 10px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 3px; }
             #compare-text .ct-status { display: flex; align-items: center; gap: 6px; font-size: 11px; margin-bottom: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--line); }
+
+            /* ---------- run-compare (same cell across two runs) ---------- */
+            /* Two independent inspector panes, A = active run, B = compareRunB.
+               Read-only; each owns a viewer + a full observability dock. Sits
+               below the overlay so a pane can still be opened full there. */
+            #runcompare {
+                position: fixed;
+                inset: 0;
+                background: var(--bg);
+                z-index: 96; /* above compare (95), below overlay (100) */
+                display: none;
+                flex-direction: column;
+            }
+            #runcompare.open { display: flex; }
+            #runcompare-head {
+                height: 46px;
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 0 12px;
+                background: var(--panel-2);
+                border-bottom: 1px solid var(--line);
+                flex-shrink: 0;
+            }
+            #runcompare-head .title { color: var(--purple); font-weight: 600; }
+            #runcompare-body { flex: 1; display: flex; min-height: 0; }
+            .rc-col { flex: 1; min-width: 0; display: flex; flex-direction: column; border-right: 1px solid var(--line); }
+            .rc-col:last-child { border-right: 0; }
+            .rc-col-head {
+                display: flex; align-items: center; gap: 8px;
+                padding: 5px 12px; background: #14151a;
+                border-bottom: 1px solid var(--line-2); font-size: 11px; flex-shrink: 0;
+            }
+            .rc-run-badge {
+                font-weight: 600; padding: 1px 8px; border-radius: 4px;
+                max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+                border: 1px solid var(--line);
+            }
+            .rc-run-badge.a { color: var(--accent); border-color: var(--accent-line); }
+            .rc-run-badge.b { color: var(--green); border-color: var(--green-line); }
+            .rc-status { color: var(--text-faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+            .rc-obs-toggle { letter-spacing: 0; }
+            /* Each pane's full observability dock, docked below its canvas. */
+            .rc-obs {
+                height: 46%;
+                flex-shrink: 0;
+                border-top: 1px solid var(--line);
+                background: var(--panel);
+            }
+            .rc-obs:not(.open) { display: none; }
+            #compare-run-b { max-width: 190px; display: none; }
+            #compare-run-b.on { display: inline-block; }
+            #btn-compare-runs.on { border-color: var(--purple); color: var(--purple); background: #221a2e; }
             .rc-pill {
                 font-size: 10px;
                 padding: 2px 9px;
@@ -1412,6 +1466,8 @@
             <button id="btn-start-cells" title="Start model × slot cells on this run">start cells…</button>
             <button id="btn-reset-all" class="danger" title="Wipe every started cell on this run back to idle (deletes their events + meshes). Nothing is restarted.">reset all</button>
             <button id="btn-select" title="Select multiple cells, then resume / reset / step / pause them all at once">select</button>
+            <button id="btn-compare-runs" title="Compare a cell across two runs side by side">compare runs</button>
+            <select id="compare-run-b" title="The run to compare the active run against"></select>
             <span class="sep"></span>
             <button id="btn-lab" class="primary" title="Edit a prompt template, test it against logged events, and simulate downstream">modify prompts</button>
             <button id="btn-step-all" style="display:none" title="Advance every waiting slot by exactly one step">step all</button>
@@ -1463,22 +1519,8 @@
                     </div>
                 </div>
                 <div id="obsdock-resizer" title="drag to resize the observability panel"></div>
-                <div id="obsdock" style="position:relative">
-                    <div id="obsdock-head">
-                        <span>observability</span>
-                        <span id="obs-count" class="muted"></span>
-                    </div>
-                    <div id="obs-pinned"></div>
-                    <div id="obs-body"></div>
-                    <div id="obs-log">
-                        <div id="obs-log-head">
-                            <span class="caret">▸</span>
-                            <span>log</span>
-                            <span id="obs-log-counts" class="muted"></span>
-                        </div>
-                        <div id="obs-log-body"></div>
-                    </div>
-                </div>
+                <!-- createObsDock() (obstree.js) builds the head / pinned / body / log into this host. -->
+                <div id="obsdock" style="position:relative"></div>
             </div>
         </div>
         <div id="lab">
@@ -1554,6 +1596,40 @@
                 </div>
             </div>
             <div id="compare-text"></div>
+        </div>
+        <div id="runcompare">
+            <div id="runcompare-head">
+                <button id="runcompare-close" title="Back to the board (Esc)">← board</button>
+                <span class="title">compare runs · <span id="runcompare-title"></span></span>
+                <span class="muted" id="runcompare-sub"></span>
+                <span style="margin-left:auto"></span>
+                <button id="runcompare-sync" title="Align both views to the left (A) camera">sync views ⟳</button>
+                <label class="cmp-link" title="Move both cameras together"><input id="runcompare-link" type="checkbox" checked /> link cameras</label>
+            </div>
+            <div id="runcompare-body">
+                <div class="rc-col">
+                    <div class="rc-col-head">
+                        <span class="rc-run-badge a" id="rc-a-run"></span>
+                        <span class="dot idle" id="rc-a-dot"></span>
+                        <span class="rc-status" id="rc-a-status"></span>
+                        <span style="margin-left:auto"></span>
+                        <button class="cmp-step-btn rc-obs-toggle" id="rc-a-obs-toggle" title="show/hide this side's observability dock">obs ▴</button>
+                    </div>
+                    <div id="rc-a-host" class="cmp-host"></div>
+                    <div id="rc-a-obs" class="rc-obs open"></div>
+                </div>
+                <div class="rc-col">
+                    <div class="rc-col-head">
+                        <span class="rc-run-badge b" id="rc-b-run"></span>
+                        <span class="dot idle" id="rc-b-dot"></span>
+                        <span class="rc-status" id="rc-b-status"></span>
+                        <span style="margin-left:auto"></span>
+                        <button class="cmp-step-btn rc-obs-toggle" id="rc-b-obs-toggle" title="show/hide this side's observability dock">obs ▴</button>
+                    </div>
+                    <div id="rc-b-host" class="cmp-host"></div>
+                    <div id="rc-b-obs" class="rc-obs open"></div>
+                </div>
+            </div>
         </div>
         <div id="modal-root"></div>
         <div id="toast-root"></div>

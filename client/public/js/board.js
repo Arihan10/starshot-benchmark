@@ -79,10 +79,12 @@ function cellCard(slot, model) {
       class: `cell-card${summary.events_count === 0 && !branches.length ? " empty" : ""}` +
         `${selecting ? " selectable" : ""}${selected ? " selected" : ""}`,
       title: slot.prompt ?? "",
-      // In select mode the card toggles its selection; otherwise it opens the
-      // SOURCE scene (a cell's sim branches are reached from the prompt lab).
+      // Select mode → toggle selection; compare-runs mode → open this cell in
+      // both runs side by side; otherwise open the SOURCE scene (a cell's sim
+      // branches are reached from the prompt lab).
       onclick: () => {
         if (state.selectMode) toggleSel(slot.id, model);
+        else if (state.compareMode) emit("open-runcompare", { slot: slot.id, model });
         else emit("open-cell", { slot: slot.id, model, branch: null });
       },
     },
@@ -106,6 +108,7 @@ function cellCard(slot, model) {
         onclick: (ev) => {
           ev.stopPropagation();
           if (state.selectMode) { toggleSel(slot.id, model); return; }
+          if (state.compareMode) { emit("open-runcompare", { slot: slot.id, model }); return; }
           emit("open-cell", { slot: slot.id, model, branch: first.id });
         } },
         el("span", { class: `dot ${bview.dot}` }),
@@ -178,12 +181,53 @@ function selectAllCells() {
 
 function setSelectMode(on) {
   state.selectMode = on;
-  if (on && boardMode === "scenes") setBoardMode("cards"); // cards view shows the per-cell checkboxes
+  if (on) {
+    if (state.compareMode) setCompareMode(false); // the two board modes are exclusive
+    if (boardMode === "scenes") setBoardMode("cards"); // cards view shows the per-cell checkboxes
+  }
   if (!on) state.selection.clear();
   emit("selection");
 }
 
 if (selectBtn) selectBtn.addEventListener("click", () => setSelectMode(!state.selectMode));
+
+// --- run-compare mode: clicking a cell opens it across two runs side by side. ---
+
+const compareBtn = document.getElementById("btn-compare-runs");
+const compareRunBSel = document.getElementById("compare-run-b");
+
+function setCompareMode(on) {
+  state.compareMode = on;
+  if (on) {
+    if (state.selectMode) setSelectMode(false); // the two board modes are exclusive
+    if (boardMode === "scenes") setBoardMode("cards"); // compare opens from the cards board
+  }
+  renderCompareUI();
+}
+
+// Reflect the mode on the toggle + show/populate the run-B picker (every run
+// but the active A). Cheap and idempotent, so it's safe to call on every poll.
+function renderCompareUI() {
+  if (!compareBtn) return;
+  compareBtn.classList.toggle("on", state.compareMode);
+  compareRunBSel.classList.toggle("on", state.compareMode);
+  const others = state.runs.map((r) => r.name).filter((n) => n !== state.run);
+  const sig = others.join("|");
+  if (compareRunBSel.dataset.sig !== sig) {
+    compareRunBSel.dataset.sig = sig;
+    compareRunBSel.replaceChildren(...others.map((n) => el("option", { value: n, text: n })));
+  }
+  // Keep the chosen B valid as run A / the run set changes.
+  if (state.compareRunB && others.includes(state.compareRunB)) {
+    compareRunBSel.value = state.compareRunB;
+  } else {
+    state.compareRunB = others[0] ?? null;
+    if (state.compareRunB) compareRunBSel.value = state.compareRunB;
+  }
+}
+
+if (compareBtn) compareBtn.addEventListener("click", () => setCompareMode(!state.compareMode));
+if (compareRunBSel) compareRunBSel.addEventListener("change", () => { state.compareRunB = compareRunBSel.value || null; });
 
 // Run a per-cell endpoint across the whole selection in parallel; individual
 // failures (resuming a done cell, stepping a non-stepped one, …) are counted as
@@ -677,8 +721,9 @@ function setBoardMode(mode) {
 
 viewBtn.addEventListener("click", () => setBoardMode(boardMode === "scenes" ? "cards" : "scenes"));
 
-on("slots", () => { if (boardMode === "scenes") reconcileScenes(); else renderBoard(); renderSelectionUI(); });
+on("slots", () => { if (boardMode === "scenes") reconcileScenes(); else renderBoard(); renderSelectionUI(); renderCompareUI(); });
 on("selection", () => { if (boardMode !== "scenes") renderBoard(); renderSelectionUI(); });
 applyTransform();
 applyBoardMode();
 renderSelectionUI();
+renderCompareUI();

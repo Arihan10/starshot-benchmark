@@ -17,6 +17,12 @@ export const state = {
   selectMode: false,
   selection: new Set(), // cellKey ("slot|model") of every selected cell
 
+  // Run-compare mode: clicking a board cell opens that (slot × model) from the
+  // active run (A) and `compareRunB` (B) side by side, read-only. The slot/model
+  // grid is run-independent, so the cell exists in both runs (B may be empty).
+  compareMode: false,
+  compareRunB: null,    // the run to compare the active run against
+
   // What the single 3D viewer is showing. null = board.
   view: null,           // {slot, model, branch: branchId|null}
 

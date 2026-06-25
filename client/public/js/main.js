@@ -9,6 +9,7 @@ import { renderBoard } from "./board.js";
 import { initOverlay, closeOverlay } from "./overlay.js";
 import { initLab } from "./promptlab.js";
 import { initCompare } from "./compare.js";
+import { initRunCompare } from "./runcompare.js";
 import { initCost } from "./cost.js";
 
 const LAST_RUN_KEY = "starshot.lastRun";
@@ -382,6 +383,7 @@ document.getElementById("btn-reset-all").addEventListener("click", resetAllModal
   initOverlay(viewer);
   initLab();
   initCompare();
+  initRunCompare();
   initCost();
 
   try {

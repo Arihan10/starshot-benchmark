@@ -1213,6 +1213,18 @@ def create_app() -> FastAPI:
         _current_run = name
         return {"current": name}
 
+    @app.post("/runs/{name}/hydrate")
+    async def hydrate_run(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        """Load a run's SlotLogs into memory WITHOUT activating it, so its
+        cells' /scene + /meshes become readable alongside the active run — the
+        run-compare view reads a SECOND run next to run A. Idempotent and
+        launches nothing (see _maybe_launch), so it never disturbs the active
+        run's board, cost, or pipelines."""
+        if not _run_dir(name).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown run: {name}")
+        _hydrate_run(name)
+        return {"run": name}
+
     @app.get("/prompt-runs")
     async def prompt_runs() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Runs that have a rendition, ordered chronologically by when each was
