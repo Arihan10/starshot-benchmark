@@ -317,7 +317,8 @@ async def call_llm_once(
                     # prose / null content instead of schema-conformant JSON.
                     provider={
                         "require_parameters": True,
-                        "sort": "latency"
+                        "sort": "latency",
+                        "ignore": ["decart"]
                     },
                 )
             message = response.choices[0].message

@@ -19,7 +19,7 @@ import {
 	emittedStep,
 } from "./events.js";
 import { statusView } from "./status.js";
-import { createObsDock } from "./dock.js";
+import { createObsDock } from "./obstree.js";
 import * as inquiry from "./inquiry.js";
 
 const overlayEl = document.getElementById("overlay");
