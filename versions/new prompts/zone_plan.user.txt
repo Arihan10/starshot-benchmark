@@ -6,28 +6,28 @@ Here is the overall scene that is being built by the pipeline:
 
 `{ROOT_OBJECTS}`
 
-This is the subregion that we are planning:
+This is the region that we are planning:
 
-Subregion name: `{ZONE_ID}`
-Subregion prompt: "`{ZONE_PROMPT}`"
-Subregion dimensions: `{ZONE_DIMENSIONS}`
-Subregion global origin corner: `{ZONE_ORIGIN}`
-Subregion placement: "`{ZONE_PLACEMENT}`"
+region name: `{ZONE_ID}`
+region prompt: "`{ZONE_PROMPT}`"
+region dimensions: `{ZONE_DIMENSIONS}`
+region global origin corner: `{ZONE_ORIGIN}`
+region placement: "`{ZONE_PLACEMENT}`"
 
-Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a description for how it should be built (or just its prompt for what it is if a description hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its prompt, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
+Here's the list of other regions that have been planned for this scene so far, with the objects placed inside each region listed inline beneath it. Each region has a description for how it should be built (or just its prompt for what it is if a description hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its prompt, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each region and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
 
 `{SCENE_CONTEXT}`
 
 <VERY_IMPORTANT_INSTRUCTIONS>
-using the scene context provided above and the prompt given for `{ZONE_ID}`, write one paragraph describing the rough layout and story of `{ZONE_ID}`.
+using the scene context provided above and the prompt given for `{ZONE_ID}`, write one paragraph describing `{ZONE_ID}`.
 
-You are to describing the subregion in a single paragraph at a high level and expand the throughline provided by upstream steps narratively. Your job is to think about the region from a storytelling perspective. focus on what happens in the space, what story unfolds, and let downstream steps decide what this means physically for the region. Allow the narrative of the region to imply concrete geometry for downstream steps, rather than listing objects that imply the narrative. your role is that of high-level guidance - downstream steps rely heavily on your description of the region to build the region out with concrete 3D geometry, but how they do that is up to them.
+You are to describe the region in a single paragraph at a high level and expand the throughline provided by the region's prompt. Your job is to think about the region from both a storytelling perspective and a spatial one. using the prompt as a starting point, your description should cover the spatial shape of what the region looks like on the outside, as well as the layout of the interior. at the same time, think deeply about how you can use this region to creatively and narratively expand on the already-established story for the scene, and how that translates into geometry or quirks that should be present in this region. think about how to make this region interesting and stand out - in terms of both outer footprint and inner layout.
 
-when describing `{ZONE_ID}`, consider all attributes of the region including its shape and size. the same region given a different shape or size for example might need a fundamentally different design. think not just about how the space should be laid out from a narrative standpoint, but also how it should be laid out to effectively make use of the space and dimensions that has been given to it by an usptream REGION DECOMPOSE step.
+When reasoning about these things, you should consider all attributes of the region including its shape and size. the same region prompt given a different shape or size for example might need a fundamentally different design. your description for the region should allow downstream steps responsible for filling the region in to effectively make use of the space and dimensions of this region.
 
 your description of the region should read as one smooth, fluid paragraph instead of following a rigid, sequential structure. each narrative point should be interwoven with and backed up by a spatial, structural one. think about both narrative and spatial cohesion together - not first planning the story then formulating the spatial attributes of the region to build around that story. calibrate the specificity of your description to the scope and intent of the region - downstream steps for a well-understood, low-level atomic region would require less fundamental guidance from you than something more high-level.
 
-DO NOT use flowery language or be overly detailed. Be direct and avoid repeating information that has already been given about the subregion. your description should not reference pipeline-level meta qualities such as coordinates or axes - fully immerse yourself into the scene, not the pipeline.
+DO NOT use flowery language or be overly detailed. Be direct and avoid repeating information that has already been given about the region. your description should not reference pipeline-level meta qualities such as coordinates or axes - fully immerse yourself into the scene, not the pipeline.
 
 <region_decomposition>
 you must also decide is_atomic — whether it makes sense to leave the region as is and start populating it with objects, or if it makes sense to break it down further into smaller subregions.
