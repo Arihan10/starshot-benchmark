@@ -22,6 +22,14 @@ import { api } from "./api.js";
 const AXES_KEY = "starshot.traceAxes";   // mini-canvas axes toggle preference
 const TRACE_W_KEY = "starshot.traceWidth"; // resizable sidebar width
 
+// A node's OWN characterization steps — ones that ran ON the node itself rather
+// than emitting/placing it from its parent: a zone's plan (zone_plan, root or
+// nested) and the root's overall bbox. Shown in the trace alongside the
+// provenance (emitted_by / placed_by). A zone's decompose / bbox-batch steps are
+// deliberately NOT here — those generate its CHILDREN, so they live in the
+// children's traces, not the zone's.
+const OWN_STEPS = new Set(["zone_plan", "overall_bbox"]);
+
 function statusDot(n) {
   if (!n) return "idle";
   if (n.error) return "error";
@@ -32,7 +40,7 @@ function statusDot(n) {
 const fmtVec = (a) => `(${a.map((x) => (+x).toFixed(2)).join(", ")})`;
 const fmtDims = (a) => a.map((x) => (+x).toFixed(2)).join(" × ");
 
-export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () => {} } = {}) {
+export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () => {}, onInquire = null } = {}) {
   const nodeLabelEl = el("span", { class: "tp-node" });
 
   // Mini preview + its overlaid canonical-axes toggle. The axes are world-
@@ -268,22 +276,27 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
 
   // ── emittance trace body (rebuilt on node/call toggle + streamed updates) ──
 
-  // The calls that GENERATED a node: its provenance — emitted_by (the decompose
-  // that named it) + placed_by (the bbox step that placed it). Same set for the
-  // focused node and every ancestor. The root has no provenance, so it falls
-  // back to the calls that ran on it — never empty. Ordered by execution.
+  // The calls that GENERATED + characterized a node: its provenance — emitted_by
+  // (the decompose that named it) + placed_by (the bbox step that placed it) —
+  // PLUS its own steps (a zone's plan; the root's overall bbox), which run on the
+  // node itself so they're attributed, not provenance. Same shape for the focused
+  // node and every ancestor zone. Falls back to anything attributed if a node has
+  // none of the above, so a row is never bare. Ordered by execution.
   function nodeCalls(id) {
-    const prov = (model.provenance?.get(id) ?? []).filter((p) => p.call?.index != null);
-    if (prov.length) {
-      return prov
-        .slice()
-        .sort((a, b) => (a.call.index ?? 0) - (b.call.index ?? 0))
-        .map((p) => ({ call: p.call, relation: p.relation }));
+    const byIndex = new Map();
+    for (const p of model.provenance?.get(id) ?? []) {
+      if (p.call?.index != null) byIndex.set(p.call.index, { call: p.call, relation: p.relation });
     }
-    return (model.nodes.get(id)?.calls ?? [])
-      .slice()
-      .sort((a, b) => (a.index ?? 0) - (b.index ?? 0))
-      .map((call) => ({ call, relation: null }));
+    for (const c of model.nodes.get(id)?.calls ?? []) {
+      if (c.index != null && OWN_STEPS.has(c.step) && !byIndex.has(c.index)) {
+        byIndex.set(c.index, { call: c, relation: null });
+      }
+    }
+    let entries = [...byIndex.values()];
+    if (!entries.length) {
+      entries = (model.nodes.get(id)?.calls ?? []).map((c) => ({ call: c, relation: null }));
+    }
+    return entries.sort((a, b) => (a.call.index ?? 0) - (b.call.index ?? 0));
   }
 
   function collapsedSection(label, text, { variables = null } = {}) {
@@ -381,6 +394,13 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
       relation === "emitted_by" ? el("span", { class: "emit-badge", text: "emitted here" }) : null,
       relation === "placed_by" ? el("span", { class: "tp-place-badge", text: "placed here" }) : null,
       el("span", { class: "muted", text: `#${call.index ?? "?"} · ${call.tokens_out ?? "?"} tok` }),
+      onInquire ? el("button", {
+        class: "call-ask",
+        text: "why?",
+        style: "margin-left:auto",
+        title: "continue this step's conversation with the model that made it — ask it anything",
+        onclick: (ev) => { ev.stopPropagation(); onInquire(call); },
+      }) : null,
     );
     wrap.appendChild(row);
     if (expandedCalls.has(call.index)) {

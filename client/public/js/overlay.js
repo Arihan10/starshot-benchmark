@@ -53,6 +53,7 @@ export function initOverlay(sceneViewer) {
 	tracePanel = createTracePanel(document.getElementById("trace-panel"), {
 		onNavigate: focusNode,
 		onClose: () => viewer.clearSelection(),
+		onInquire: openInquiryForCall,
 	});
 
 	// Tree ↔ 3D linking. A node-row click toggles selection and frames the
@@ -88,14 +89,10 @@ export function initOverlay(sceneViewer) {
 	});
 	viewer.onHiddenChange(() => dock.renderTree(obs.model));
 
-	// "why?" on any call row → the decision-inquiry chat for that step. Read-only,
-	// so it's wired once (source AND branch views) and reads the live view at
-	// click time for the cell/run/branch context.
-	dock.setOnInquire((call) => {
-		if (!state.view) return;
-		const { slot, model, branch } = state.view;
-		inquiry.openInquiry(call, { run: state.run, slot, model, branch });
-	});
+	// "why?" on any call row (dock OR the left emittance-trace panel) → the
+	// decision-inquiry chat for that step. Read-only, so it's shared across
+	// source AND branch views and reads the live view at click time.
+	dock.setOnInquire(openInquiryForCall);
 
 	document
 		.getElementById("overlay-close")
@@ -269,6 +266,15 @@ function focusNode(id) {
 		dock.markSelected(id, { scroll: true });
 		tracePanel.show(obs.model, id);
 	}
+}
+
+// Open the decision-inquiry chat grounded in a call — shared by the dock and the
+// left trace panel's "why?" buttons. Reads the live view so it carries the
+// current cell/run/branch context.
+function openInquiryForCall(call) {
+	if (!state.view) return;
+	const { slot, model, branch } = state.view;
+	inquiry.openInquiry(call, { run: state.run, slot, model, branch });
 }
 
 function scheduleTreeRender() {

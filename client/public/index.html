@@ -1055,11 +1055,23 @@
 				display: flex;
 				flex-direction: row; /* [ inner column | drag handle ] */
 				min-height: 0;
+				/* Hide via visibility, not transform alone: the panel lives inside
+				   the overlay, which itself slides off-screen (translateX(100%)) when
+				   closed — so the panel's own translateX(-100%) cancels against it and
+				   would leave an empty strip pinned to the right edge. visibility
+				   guarantees it's gone whenever it isn't .open. It flips instantly
+				   (no delay) so closing the scene never flashes the panel; the slide
+				   is kept only on open. */
+				visibility: hidden;
 				transform: translateX(-100%);
-				transition: transform 0.2s ease;
+				transition:
+					transform 0.2s ease,
+					visibility 0s;
 			}
 			#trace-panel.open {
+				visibility: visible;
 				transform: translateX(0);
+				transition: transform 0.2s ease;
 			}
 			#trace-panel-inner {
 				flex: 1;
