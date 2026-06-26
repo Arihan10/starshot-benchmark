@@ -38,6 +38,11 @@ const OBJECT_COLOR_BY_STEP = {
 const BBOX_DIM_OPACITY = 0.35;
 const PROXY_BASE_OPACITY = 0.55;
 const PROXY_DIM_OPACITY = 0.2;
+// Zone-layers view: a faint translucent fill on each zone box so overlapping
+// subregions read as a denser patch (two fills stack). Kept low so a lone zone
+// is barely tinted; isolate a single depth layer to see sibling overlaps clean.
+const ZONE_FILL_OPACITY = 0.08;
+const ZONE_FILL_DIM_OPACITY = 0.03;
 const TOOLTIP_KIND_COLOR = {
 	zone: "#9ad4ff",
 	object: "#8bd17c",
@@ -167,6 +172,7 @@ export function createViewer(host, { keyboard = true } = {}) {
 
 	const bboxes = new Map(); // id -> Box3Helper
 	const proxies = new Map(); // id -> wireframe proxy mesh
+	const fills = new Map(); // id -> translucent zone fill mesh (zone-layers view)
 	const models = new Map(); // id -> gltf scene
 	const kinds = new Map(); // id -> node_kind ("zone"/"object"/"frame")
 	// Visibility layers. objects/frames/zones are per-CATEGORY (node kind)
@@ -339,6 +345,9 @@ export function createViewer(host, { keyboard = true } = {}) {
 		// The proxy wireframe always tracks its object's bbox color.
 		const proxy = proxies.get(id);
 		if (proxy) proxy.material.color.setHex(color);
+		// The zone fill tracks the same color (incl. the select/hover highlight).
+		const fill = fills.get(id);
+		if (fill) fill.material.color.setHex(color);
 	}
 
 	// Whether a node's whole CATEGORY layer is on (objects / frames / zones).
@@ -358,10 +367,11 @@ export function createViewer(host, { keyboard = true } = {}) {
 		// stays pickable while the layer is off.
 		const helper = bboxes.get(id);
 		const proxy = proxies.get(id);
+		const fill = fills.get(id);
 		const kind = helper?.userData?.nodeKind ?? kinds.get(id) ?? "zone";
-		// Zone-layers view: only zone wireframes draw — isolated to one nesting
-		// depth when a layer is picked — so the bare decomposition structure
-		// reads on its own. Objects/frames and every proxy are dropped.
+		// Zone-layers view: only zone wireframes + their fills draw — isolated to
+		// one nesting depth when a layer is picked — so the bare decomposition
+		// structure reads on its own. Objects/frames and every proxy are dropped.
 		if (zoneLayersMode) {
 			const inLayer =
 				kind === "zone" &&
@@ -376,6 +386,15 @@ export function createViewer(host, { keyboard = true } = {}) {
 				helper.material.opacity = dim ? BBOX_DIM_OPACITY : 1;
 			}
 			if (proxy) proxy.visible = false;
+			// The fill rides with the layer (independent of the wireframe toggle,
+			// so `bboxes` off gives a clean fills-only overlap view), dimming
+			// alongside the box when another zone is selected.
+			if (fill) {
+				fill.visible = inLayer;
+				fill.material.opacity = dim
+					? ZONE_FILL_DIM_OPACITY
+					: ZONE_FILL_OPACITY;
+			}
 			return;
 		}
 		const visible =
@@ -396,6 +415,9 @@ export function createViewer(host, { keyboard = true } = {}) {
 				? PROXY_DIM_OPACITY
 				: PROXY_BASE_OPACITY;
 		}
+		// Zone fills are a zone-layers-only overlay — never shown in the normal
+		// view, where they'd just tint the meshes.
+		if (fill) fill.visible = false;
 	}
 
 	function applyModelVisibility(id) {
@@ -893,6 +915,13 @@ export function createViewer(host, { keyboard = true } = {}) {
 			prevProxy.material?.dispose?.();
 			proxies.delete(id);
 		}
+		const prevFill = fills.get(id);
+		if (prevFill) {
+			bboxRoot.remove(prevFill);
+			prevFill.geometry?.dispose?.();
+			prevFill.material?.dispose?.();
+			fills.delete(id);
+		}
 		const kind = event.node_kind ?? "zone";
 		kinds.set(id, kind);
 		const fx = origin[0] + dimensions[0];
@@ -924,6 +953,27 @@ export function createViewer(host, { keyboard = true } = {}) {
 		if (proxy) {
 			bboxRoot.add(proxy);
 			proxies.set(id, proxy);
+		}
+		// Zones get a faint solid fill (in addition to the wireframe) so
+		// overlapping subregions show up as a denser patch in the zone-layers
+		// view. A unit box scaled to the bbox; depthWrite off + double-sided so
+		// it reads from any camera position and STACKS with other fills instead
+		// of occluding them. Visibility/color are applied below like the box.
+		if (kind === "zone") {
+			const fill = new THREE.Mesh(
+				new THREE.BoxGeometry(1, 1, 1),
+				new THREE.MeshBasicMaterial({
+					color: BBOX_COLOR_DEFAULT,
+					transparent: true,
+					opacity: ZONE_FILL_OPACITY,
+					depthWrite: false,
+					side: THREE.DoubleSide,
+				}),
+			);
+			fill.position.copy(box3.getCenter(new THREE.Vector3()));
+			fill.scale.copy(box3.getSize(new THREE.Vector3()));
+			bboxRoot.add(fill);
+			fills.set(id, fill);
 		}
 		applyBboxColor(id);
 		applyBboxVisibility(id);
@@ -1180,9 +1230,15 @@ export function createViewer(host, { keyboard = true } = {}) {
 			proxy.geometry?.dispose?.();
 			proxy.material?.dispose?.();
 		}
+		for (const fill of fills.values()) {
+			bboxRoot.remove(fill);
+			fill.geometry?.dispose?.();
+			fill.material?.dispose?.();
+		}
 		clearOverlayBoxes();
 		bboxes.clear();
 		proxies.clear();
+		fills.clear();
 		models.clear();
 		kinds.clear();
 		failedUrls.clear();
@@ -1225,6 +1281,14 @@ export function createViewer(host, { keyboard = true } = {}) {
 			proxy.geometry?.dispose?.();
 			proxy.material?.dispose?.();
 			proxies.delete(id);
+		}
+		for (const id of [...fills.keys()]) {
+			if (bboxIds.has(id)) continue;
+			const fill = fills.get(id);
+			bboxRoot.remove(fill);
+			fill.geometry?.dispose?.();
+			fill.material?.dispose?.();
+			fills.delete(id);
 		}
 		for (const id of [...models.keys()]) {
 			if (meshIds.has(id)) continue;
