@@ -188,9 +188,12 @@ export function createObsModel() {
   // existence and record provenance for each. `event.node` is the call site —
   // for a decompose / bbox-batch step that's the REGION the step ran on, which
   // is what we surface as "<step> on <region>". Only the id-bearing output
-  // shapes matter: `children`/`objects` + single `object` (decompose, named →
-  // emitted_by) and `assignments` (bbox batch, positioned → placed_by); every
-  // other step (zone_plan, image_prompt, overall_bbox) names no ids.
+  // shapes matter: `subregions`/`objects`/`children` + single `object`
+  // (decompose, named → emitted_by) and `assignments` (bbox batch, positioned →
+  // placed_by); every other step (zone_plan, image_prompt, overall_bbox) names
+  // no ids. `subregions` is what zone_decompose emits — tagging it is what gives
+  // zones (not just objects) an emitted_by, so the emittance lineage can climb
+  // region→region all the way to the root.
   function recordProvenance(event) {
     const out = event.output;
     if (!out || typeof out !== "object") return;
@@ -210,6 +213,7 @@ export function createObsModel() {
     const tagList = (list) => {
       if (Array.isArray(list)) for (const x of list) tag(x?.id);
     };
+    tagList(out.subregions);
     tagList(out.children);
     tagList(out.objects);
     tagList(out.assignments);
@@ -336,4 +340,59 @@ export function createObsModel() {
 export function emittedStep(model, id) {
   const e = (model.provenance?.get(id) ?? []).find((p) => p.relation === "emitted_by");
   return e ? (e.call.template ?? e.call.step ?? null) : null;
+}
+
+// The REGION a node was actually generated in — the call site of the decompose
+// step that named it (`emitted_by`), NOT its structural parent. A couch emitted
+// by next_object on `living_room` but anchored ON the floor has emitting region
+// `living_room` and structural parent `floor`; the emittance trace follows the
+// former. Falls back to the structural parent only when no emitted_by was
+// recorded (legacy logs, or a node whose decompose output didn't name it).
+export function emittingRegion(model, id) {
+  const e = (model.provenance?.get(id) ?? []).find((p) => p.relation === "emitted_by");
+  if (e && typeof e.call.node === "string") return e.call.node;
+  return model.nodes.get(id)?.parentId ?? null;
+}
+
+// The emittance lineage of a node: root → … → node, climbing emitting region to
+// emitting region (see `emittingRegion`). Stops at the root (no emitting region)
+// or a missing/cyclic link. This is the chain the trace panel walks — every hop
+// is "the region that generated the one below it", which is what we care about,
+// not the structural parent chain.
+export function emittanceLineage(model, focusId) {
+  const chain = [focusId];
+  const seen = new Set([focusId]);
+  let cur = focusId;
+  while (cur) {
+    const region = emittingRegion(model, cur);
+    if (!region || seen.has(region) || !model.nodes.has(region)) break;
+    chain.unshift(region);
+    seen.add(region);
+    cur = region;
+  }
+  return chain;
+}
+
+// Slice a finished LLM call's structured output down to just the part that
+// concerns `nodeId`: the emitted item (objects / subregions / children) or the
+// placed item (assignments) whose id matches. Returns `{ value, truncated }` —
+// `truncated` is true when a strict subset was found, false when the whole
+// output is already node-specific (zone_plan, image_prompt, overall_bbox) or
+// `nodeId` isn't an addressable item in it (a region's own decompose output,
+// where the node is the call site, not an emitted id).
+export function extractRelevantOutput(output, nodeId) {
+  if (!output || typeof output !== "object" || !nodeId) {
+    return { value: output, truncated: false };
+  }
+  for (const key of ["objects", "subregions", "children", "assignments"]) {
+    const list = output[key];
+    if (Array.isArray(list)) {
+      const item = list.find((x) => x && x.id === nodeId);
+      if (item) return { value: item, truncated: true };
+    }
+  }
+  if (output.object && typeof output.object === "object" && output.object.id === nodeId) {
+    return { value: output.object, truncated: true };
+  }
+  return { value: output, truncated: false };
 }

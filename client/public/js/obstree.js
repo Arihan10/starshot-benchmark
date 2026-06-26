@@ -11,7 +11,11 @@
 import { el, fitToggle, fmtJson, shortBytes, foldedPre } from "./ui.js";
 import { callEmits } from "./obsmini.js";
 
-export function createObsDock(hostEl) {
+// `trace:false` keeps the dock a pure node tree + log — clicking a node row
+// just frames + selects its 3D box (no in-dock lineage view). The single-cell
+// overlay passes this because its left emittance-trace panel owns the lineage;
+// run-compare panes keep the default (their own dock is the only trace surface).
+export function createObsDock(hostEl, { trace = true } = {}) {
   hostEl.classList.add("obsdock");
   // The dock's own DOM, built once into the host (no shared ids — every
   // instance is independent).
@@ -200,9 +204,12 @@ export function createObsDock(hostEl) {
     return detail;
   }
 
-  // Clicking a node focuses its bbox in 3D AND shows its emit trace in the dock.
+  // Clicking a node focuses its bbox in 3D. With trace enabled it also flips
+  // the dock to that node's emit lineage; with trace disabled the framing is
+  // all it does (the overlay's left panel shows the lineage instead).
   function selectNode(id) {
     onNodeClick(id, { toggle: true });
+    if (!trace) return;
     focusId = id;
     if (currentModel) renderTree(currentModel);
   }

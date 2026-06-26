@@ -20,6 +20,7 @@ import {
 } from "./events.js";
 import { statusView } from "./status.js";
 import { createObsDock } from "./obstree.js";
+import { createTracePanel } from "./tracepanel.js";
 import * as inquiry from "./inquiry.js";
 
 const overlayEl = document.getElementById("overlay");
@@ -34,6 +35,7 @@ const zoneLayersLegendEl = document.getElementById("zone-layers-legend");
 
 let viewer = null;
 let dock = null;
+let tracePanel = null;
 let stream = null;
 let obs = createObsModel();
 let renderQueued = false;
@@ -42,7 +44,16 @@ let lastLayersSig = null; // skips rebuilding the layer legend when unchanged
 
 export function initOverlay(sceneViewer) {
 	viewer = sceneViewer;
-	dock = createObsDock(document.getElementById("obsdock"));
+	// The right dock stays a pure node tree + log here — the left panel owns the
+	// per-node emit lineage, so the dock doesn't also flip into trace mode.
+	dock = createObsDock(document.getElementById("obsdock"), { trace: false });
+	// The left emittance-trace inspector: opened by 3D selection, it shows the
+	// picked node's root→node LLM-call lineage. Breadcrumb clicks re-aim the
+	// selection (and camera); close clears the selection (which hides it).
+	tracePanel = createTracePanel(document.getElementById("trace-panel"), {
+		onNavigate: focusNode,
+		onClose: () => viewer.clearSelection(),
+	});
 
 	// Tree ↔ 3D linking. A node-row click toggles selection and frames the
 	// bbox (dimming the rest); a call click guarantees its node is focused
@@ -54,7 +65,15 @@ export function initOverlay(sceneViewer) {
 	// the tree shows as "via {step}". `recolorAll` (below) repaints once a load's
 	// history has folded, since the scene projection paints bboxes first.
 	viewer.setOriginOf((id) => emittedStep(obs.model, id));
-	viewer.onSelect((id) => dock.markSelected(id, { scroll: true }));
+	// A 3D pick (or any selection) reveals the dock row AND drives the left
+	// emittance-trace panel; deselecting hides it. The panel only opens while a
+	// scene is actually up (state.view set) — never on a stray selection event
+	// with no cell loaded.
+	viewer.onSelect((id) => {
+		dock.markSelected(id, { scroll: true });
+		if (id && state.view) tracePanel.show(obs.model, id);
+		else tracePanel.hide();
+	});
 	dock.setOnNodeClick((id, { ensureSelected = false } = {}) => {
 		if (!viewer.hasBbox(id)) return;
 		if (ensureSelected && viewer.getSelected() === id) return;
@@ -87,7 +106,13 @@ export function initOverlay(sceneViewer) {
 			overlayEl.classList.contains("open") &&
 			!document.getElementById("modal-root").firstChild
 		) {
-			closeOverlay();
+			// Progressive close: an open emittance-trace panel takes the first
+			// Escape (deselect → panel hides); a second one leaves the scene.
+			if (tracePanel.isOpen()) {
+				viewer.clearSelection();
+			} else {
+				closeOverlay();
+			}
 			// When the full scene was opened from the compare view (stacked beneath),
 			// don't let the SAME Escape also close compare — return to it instead.
 			// The overlay's keydown is registered before compare's (see main init).
@@ -233,12 +258,28 @@ function initObsResizer() {
 	resizer.addEventListener("pointercancel", end);
 }
 
+// Re-aim the selection at a lineage node (a breadcrumb click in the trace
+// panel). A node with a 3D box is selected + framed — that drives the panel via
+// onSelect; a box-less ancestor (e.g. the root before its box paints) just
+// updates the dock row + panel directly.
+function focusNode(id) {
+	if (viewer.hasBbox(id)) {
+		viewer.select(id, { frame: true });
+	} else {
+		dock.markSelected(id, { scroll: true });
+		tracePanel.show(obs.model, id);
+	}
+}
+
 function scheduleTreeRender() {
 	if (renderQueued) return;
 	renderQueued = true;
 	requestAnimationFrame(() => {
 		renderQueued = false;
 		dock.renderTree(obs.model, { streamed: true });
+		// Fold any newly-streamed calls into the open emit trace too (no-ops
+		// when nothing the panel shows changed, or while the user is reading it).
+		tracePanel.refresh(obs.model, { streamed: true });
 		if (state.view?.branch && state.lab.simStep)
 			dock.renderPinned(obs.model);
 		// New zones may have streamed in — refresh the legend so a new depth's
@@ -276,6 +317,9 @@ export async function openCell({
 	viewer.clear({ keepCamera });
 	obs = createObsModel();
 	dock.resetDock();
+	// Selection is per-cell (viewer.clear drops it without notifying), so the
+	// left trace panel can't carry a stale focus into the incoming scene.
+	tracePanel.reset();
 	dock.setPinStep(branch ? state.lab.simStep : null);
 	// Per-call revert (the ⏪ on each call row): a source cell rewinds + re-runs
 	// from the cut; a branch rewinds ITS OWN log to before the step and pauses
@@ -716,5 +760,6 @@ export function closeOverlay() {
 	overlayEl.classList.remove("open");
 	viewer.setActive(false);
 	dock.setPinStep(null);
+	tracePanel.reset();
 	inquiry.closeInquiry();
 }

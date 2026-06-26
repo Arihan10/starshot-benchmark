@@ -23,6 +23,7 @@
 				--amber: #e0c271;
 				--orange: #e09050;
 				--purple: #c9a6ff;
+				--trace-w: 400px; /* left emittance-trace panel width */
 			}
 			/* BFS runs flip the main-screen backdrop to light, DFS stays dark,
                so the two pipelines are instantly distinguishable. Only the
@@ -1002,6 +1003,7 @@
 				display: flex;
 				gap: 6px;
 				z-index: 5;
+				transition: left 0.2s ease;
 			}
 			#viewer-toggles button {
 				font-size: 10px;
@@ -1023,6 +1025,127 @@
 				gap: 6px;
 				max-width: calc(100% - 20px);
 				z-index: 5;
+				transition: left 0.2s ease;
+			}
+			/* While the emittance-trace panel is open, slide the canvas overlays
+			   clear of it so the toggles + zone legend stay usable. */
+			#canvas-host:has(#trace-panel.open) #viewer-toggles,
+			#canvas-host:has(#trace-panel.open) #zone-layers-legend {
+				left: calc(var(--trace-w) + 16px);
+			}
+			#canvas-host:has(#trace-panel.open) #zone-layers-legend {
+				max-width: calc(100% - var(--trace-w) - 36px);
+			}
+
+			/* ---------- emittance-trace panel (left, selection-driven) ----------
+			   Floats over the left of the scene canvas; slides in when an object
+			   or zone is picked in 3D and shows that node's full LLM-call lineage
+			   (reuses the .obsm-* trace styles from the scenes drawer). */
+			#trace-panel {
+				position: absolute;
+				left: 0;
+				top: 0;
+				bottom: 0;
+				width: var(--trace-w);
+				max-width: 86%;
+				background: var(--panel);
+				border-right: 1px solid var(--line);
+				box-shadow: 8px 0 24px rgba(0, 0, 0, 0.4);
+				z-index: 7; /* over the canvas + toggles (5), under the tooltip (110) */
+				display: flex;
+				flex-direction: column;
+				min-height: 0;
+				transform: translateX(-100%);
+				transition: transform 0.2s ease;
+			}
+			#trace-panel.open {
+				transform: translateX(0);
+			}
+			#trace-panel-head {
+				padding: 8px 12px;
+				background: var(--panel-2);
+				border-bottom: 1px solid var(--line);
+				flex-shrink: 0;
+			}
+			#trace-panel-head .tp-head-top {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+			}
+			#trace-panel-head .title {
+				color: var(--purple);
+				font-weight: 600;
+			}
+			#trace-panel-head .tp-close {
+				margin-left: auto;
+				font-size: 11px;
+				padding: 3px 9px;
+			}
+			#trace-panel-head .tp-node {
+				display: block;
+				margin-top: 4px;
+				color: var(--text-dim);
+				font-size: 11px;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			#trace-panel-body {
+				flex: 1;
+				overflow: auto;
+				padding: 10px 12px;
+				font-size: 12px;
+			}
+			/* lineage node rows (collapsible) + per-node call count */
+			#trace-panel .tp-node-row {
+				cursor: pointer;
+			}
+			#trace-panel .tp-node-row .caret {
+				width: 9px;
+				flex-shrink: 0;
+				color: var(--text-faint);
+			}
+			#trace-panel .tp-kind {
+				color: var(--text-faint);
+				font-size: 10px;
+			}
+			#trace-panel .tp-count {
+				margin-left: auto;
+				flex-shrink: 0;
+				color: var(--text-faint);
+				font-size: 10px;
+			}
+			#trace-panel .tp-place-badge {
+				color: var(--accent);
+				font-size: 9px;
+				padding: 0 5px;
+				border: 1px solid #3a5a55;
+				border-radius: 3px;
+				white-space: nowrap;
+			}
+			/* per-call detail: each section (output / input / system / reasoning)
+			   has its own expand toggle; output starts on its relevant slice, the
+			   rest start collapsed. */
+			#trace-panel .tp-sec-head {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				margin-bottom: 3px;
+			}
+			#trace-panel .tp-sec-lab {
+				color: var(--text-faint);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			#trace-panel .tp-toggle {
+				margin-left: auto;
+				font-size: 10px;
+				padding: 1px 7px;
+				flex-shrink: 0;
 			}
 			.zl-title {
 				color: var(--text-faint);
@@ -2916,6 +3039,9 @@
 						<button id="btn-refit">refit</button>
 					</div>
 					<div id="zone-layers-legend" style="display: none"></div>
+					<!-- Selection-driven emittance-trace inspector; filled +
+					     slid in by tracepanel.js when a node is picked in 3D. -->
+					<div id="trace-panel"></div>
 				</div>
 				<div
 					id="obsdock-resizer"
