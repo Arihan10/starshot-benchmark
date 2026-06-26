@@ -204,6 +204,10 @@ export function createViewer(host, { keyboard = true } = {}) {
 	// The overlay slides off-screen with translateX, which keeps layout size —
 	// so visibility is an explicit flag, gating draws AND keyboard capture.
 	let active = false;
+	// Optional canonical-axes gizmo (X=red, Y=green, Z=blue, drawn on top) placed
+	// at a node's center — the trace panel's mini preview toggles it on to make
+	// the baked orientation legible. Added to `scene`, so clear() leaves it be.
+	let axesGroup = null;
 
 	// --- interaction state -----------------------------------------------------
 
@@ -471,6 +475,31 @@ export function createViewer(host, { keyboard = true } = {}) {
 	function clearZoneLayers() {
 		activeZoneLayers.clear();
 		refreshAllVisibility();
+	}
+
+	// Canonical-axes gizmo. `setAxes(true, {center, size})` draws the world X/Y/Z
+	// axes (Three's default red/green/blue) from `center`, sized to `size`,
+	// depth-test off so they read through any mesh; `setAxes(false)` removes it.
+	// The axes are world-aligned (there is one global canonical front view), so
+	// they're placed AT the inspected node to show how its geometry sits in it.
+	function setAxes(on, { center = [0, 0, 0], size = 1 } = {}) {
+		if (axesGroup) {
+			scene.remove(axesGroup);
+			axesGroup.traverse((o) => {
+				o.geometry?.dispose?.();
+				o.material?.dispose?.();
+			});
+			axesGroup = null;
+		}
+		if (!on) return;
+		const helper = new THREE.AxesHelper(Math.max(size, 0.1));
+		helper.material.depthTest = false;
+		helper.material.transparent = true;
+		helper.renderOrder = 998;
+		axesGroup = new THREE.Group();
+		axesGroup.add(helper);
+		axesGroup.position.set(center[0] ?? 0, center[1] ?? 0, center[2] ?? 0);
+		scene.add(axesGroup);
 	}
 
 	// The depths currently present among zone bboxes + each one's runtime color,
@@ -1393,6 +1422,7 @@ export function createViewer(host, { keyboard = true } = {}) {
 		toggleZoneLayer,
 		clearZoneLayers,
 		getZoneLayers,
+		setAxes,
 		onSelect: (fn) => {
 			onSelectCb = fn;
 		},

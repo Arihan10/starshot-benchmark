@@ -1,21 +1,26 @@
 // The emittance-trace inspector: a left panel in the single-cell overlay that
-// appears when an object/zone is picked in 3D and shows how it was generated —
-// the chain of REGIONS that emitted it (root → … → node, climbing each node's
-// emitting region, NOT its structural parent) with the LLM calls that brought
-// each into existence.
+// appears when an object/zone is picked in 3D. Two stacked parts:
 //
-// Layout per node: a collapsible row (the focused node open, its ancestors
-// collapsed) whose body is the calls that generated that node — its emitted_by /
-// placed_by calls plus any step that ran on it — each call expandable to its
-// bytes. In a call, the OUTPUT is truncated to just the section about that node
-// (expand for the full output); input / system / reasoning start collapsed.
+//   1. an INFO block for the focused node — a live mini 3D preview (its mesh +
+//      bbox, with the real baked orientation) plus its debug fields: prompt,
+//      orientation (semantic text + resolved degrees), dimensions, world origin,
+//      proxy shape, structural parent, placement prose, and relationships.
+//   2. the EMITTANCE trace below it — the chain of REGIONS that generated the
+//      node (root → … → node, climbing each node's emitting region, NOT its
+//      structural parent), each with the LLM calls that brought it into being,
+//      each call's output truncated to just that node's slice.
 //
-// It reads the folded obs model + provenance (events.js); it owns only its
-// open + expanded state and a live-refresh guard so a streamed event never tears
-// down something the user is reading. The overlay drives it off 3D selection.
+// It reads the folded obs model + provenance (events.js). The info block is
+// rebuilt only when the focus changes (or its data streams in), so the mini
+// viewer's WebGL context survives the body's frequent rebuilds.
 
 import { el, foldedPre, fmtJson, shortBytes } from "./ui.js";
 import { emittanceLineage, extractRelevantOutput } from "./events.js";
+import { createViewer } from "./scene3d.js";
+import { api } from "./api.js";
+
+const AXES_KEY = "starshot.traceAxes";   // mini-canvas axes toggle preference
+const TRACE_W_KEY = "starshot.traceWidth"; // resizable sidebar width
 
 function statusDot(n) {
   if (!n) return "idle";
@@ -24,37 +29,249 @@ function statusDot(n) {
   return n.calls.length ? "running" : "idle";
 }
 
+const fmtVec = (a) => `(${a.map((x) => (+x).toFixed(2)).join(", ")})`;
+const fmtDims = (a) => a.map((x) => (+x).toFixed(2)).join(" × ");
+
 export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () => {} } = {}) {
   const nodeLabelEl = el("span", { class: "tp-node" });
-  const bodyEl = el("div", { id: "trace-panel-body" });
-  hostEl.replaceChildren(
-    el("div", { id: "trace-panel-head" },
-      el("div", { class: "tp-head-top" },
-        el("span", { class: "title", text: "emittance trace" }),
-        el("button", {
-          class: "tp-close",
-          text: "close ✕",
-          title: "close the trace (Esc / click empty space)",
-          onclick: () => onClose(),
-        }),
-      ),
-      nodeLabelEl,
-    ),
-    bodyEl,
+
+  // Mini preview + its overlaid canonical-axes toggle. The axes are world-
+  // aligned (one global front view), so the gizmo is drawn AT the focused node
+  // to show how its baked orientation sits against +X/+Y/+Z. Toggle persists.
+  const previewHost = el("div", { class: "tp-preview" });
+  let axesOn = false;
+  try { axesOn = localStorage.getItem(AXES_KEY) === "1"; } catch { /* private mode */ }
+  let lastGeom = null; // {center, size} of the focused node, for the axes gizmo
+  const axesBtn = el("button", {
+    class: `tp-axes-btn${axesOn ? " on" : ""}`,
+    text: "axes",
+    title: "show the canonical X/Y/Z axes at this node (X red · Y green · Z blue)",
+    onclick: () => {
+      axesOn = !axesOn;
+      try { localStorage.setItem(AXES_KEY, axesOn ? "1" : "0"); } catch { /* private mode */ }
+      applyAxes();
+    },
+  });
+  const axesLegend = el("div", { class: "tp-axes-legend", style: axesOn ? "" : "display:none" },
+    el("span", { class: "ax ax-x", text: "X" }),
+    el("span", { class: "ax ax-y", text: "Y" }),
+    el("span", { class: "ax ax-z", text: "Z" }),
   );
+  previewHost.append(axesBtn, axesLegend);
+
+  const fieldsEl = el("div", { class: "tp-fields" });
+  const infoEl = el("div", { class: "tp-info" }, previewHost, fieldsEl);
+  const bodyEl = el("div", { class: "tp-body" });
+  const scrollEl = el("div", { id: "trace-panel-scroll" }, infoEl, bodyEl);
+  const resizer = el("div", { id: "trace-panel-resizer", title: "drag to resize the panel" });
+  hostEl.replaceChildren(
+    el("div", { id: "trace-panel-inner" },
+      el("div", { id: "trace-panel-head" },
+        el("div", { class: "tp-head-top" },
+          el("span", { class: "title", text: "emittance trace" }),
+          el("button", {
+            class: "tp-close",
+            text: "close ✕",
+            title: "close the trace (Esc / click empty space)",
+            onclick: () => onClose(),
+          }),
+        ),
+        nodeLabelEl,
+      ),
+      scrollEl,
+    ),
+    resizer,
+  );
+  initResizer(resizer);
+
+  // Sync the axes gizmo to the toggle + the focused node's geometry. Safe before
+  // the mini viewer exists (created lazily) — renderInfo re-applies once it does.
+  function applyAxes() {
+    axesBtn.classList.toggle("on", axesOn);
+    axesLegend.style.display = axesOn ? "" : "none";
+    miniViewer?.setAxes(axesOn && !!lastGeom, lastGeom ?? {});
+  }
+
+  // Drag the right edge to resize the sidebar. Width lives in the `--trace-w`
+  // CSS var so the panel AND the canvas-overlay shift (the :has() rule) track
+  // together; clamped to the scene canvas and persisted across reloads.
+  function initResizer(handle) {
+    try {
+      const saved = Number(localStorage.getItem(TRACE_W_KEY));
+      if (saved >= 300) {
+        // Cap a width saved on a wider screen so it can't swallow a narrow one.
+        const w = Math.min(saved, Math.max(300, window.innerWidth - 200));
+        document.documentElement.style.setProperty("--trace-w", `${w}px`);
+      }
+    } catch { /* private mode */ }
+    let dragging = false;
+    handle.addEventListener("pointerdown", (ev) => {
+      dragging = true;
+      handle.setPointerCapture(ev.pointerId);
+      document.body.classList.add("trace-resizing");
+      ev.preventDefault();
+    });
+    handle.addEventListener("pointermove", (ev) => {
+      if (!dragging) return;
+      const host = hostEl.parentElement; // #canvas-host
+      const left = hostEl.getBoundingClientRect().left;
+      const max = Math.max(360, (host?.clientWidth ?? 1200) - 120);
+      const w = Math.max(300, Math.min(ev.clientX - left, max));
+      document.documentElement.style.setProperty("--trace-w", `${Math.round(w)}px`);
+    });
+    const end = (ev) => {
+      if (!dragging) return;
+      dragging = false;
+      document.body.classList.remove("trace-resizing");
+      try { handle.releasePointerCapture(ev.pointerId); } catch { /* already released */ }
+      try {
+        const w = parseInt(getComputedStyle(document.documentElement).getPropertyValue("--trace-w"), 10);
+        if (w) localStorage.setItem(TRACE_W_KEY, String(w));
+      } catch { /* private mode */ }
+    };
+    handle.addEventListener("pointerup", end);
+    handle.addEventListener("pointercancel", end);
+  }
 
   let model = null;
   let focusId = null;
   const expandedNodes = new Set(); // lineage node ids whose call list is open
   const expandedCalls = new Set(); // call indices whose detail is open
   let lastSig = null;
+  let lastInfoSig = null;
+  // One reusable mini viewer for the whole panel lifetime (1 WebGL context);
+  // created lazily, never disposed — just cleared + reloaded per focus, and
+  // paused (setActive false) whenever the panel is hidden.
+  let miniViewer = null;
+  function ensureMini() {
+    if (!miniViewer) miniViewer = createViewer(previewHost, { keyboard: false });
+    return miniViewer;
+  }
+
+  // ── focused-node info (rebuilt only on focus change / live data fill-in) ──
+
+  // The object/subregion spec the emitting decompose call named this node with —
+  // the source of its semantic orientation text, placement prose, structural
+  // parent, and relationships (none of which live on the obs node itself).
+  function focusedSpec(id) {
+    const emitted = (model.provenance?.get(id) ?? []).find((p) => p.relation === "emitted_by");
+    if (!emitted) return null;
+    const { value, truncated } = extractRelevantOutput(emitted.call.output, id);
+    return truncated && value && typeof value === "object" ? value : null;
+  }
+
+  function fieldGroup(label, valueNode) {
+    return el("div", { class: "tp-field-group" },
+      el("div", { class: "tp-field-lab", text: label }),
+      typeof valueNode === "string" ? el("div", { class: "tp-field-val", text: valueNode }) : valueNode,
+    );
+  }
+
+  function prop(label, value) {
+    return el("div", { class: "tp-prop" },
+      el("span", { class: "tp-prop-lab", text: label }),
+      typeof value === "string" ? el("span", { class: "tp-prop-val", text: value }) : value,
+    );
+  }
+
+  function infoSig(id) {
+    const n = model.nodes.get(id);
+    if (!n) return null;
+    const emitted = (model.provenance?.get(id) ?? []).find((p) => p.relation === "emitted_by");
+    return [
+      id, n.prompt, n.kind, n.phase, n.meshUrl, n.proxyShape, n.orientation,
+      Array.isArray(n.origin) ? n.origin.join(",") : "",
+      Array.isArray(n.dimensions) ? n.dimensions.join(",") : "",
+      emitted?.call?.index ?? "",
+    ].join("|");
+  }
+
+  function renderInfo(id) {
+    fieldsEl.textContent = "";
+    const n = model.nodes.get(id);
+    if (!n) { previewHost.style.display = "none"; miniViewer?.setActive(false); lastInfoSig = null; return; }
+    const spec = focusedSpec(id);
+    const isObject = n.kind === "object" || n.kind === "frame";
+    const hasGeom = Array.isArray(n.origin) && Array.isArray(n.dimensions);
+
+    // Mini 3D preview: the node's bbox (always, when known) + its mesh (when one
+    // exists), with the orientation baked into the served GLB. Zones show just
+    // their bbox volume; objects show the oriented mesh inside its box.
+    // The axes gizmo sits at the node's bbox center, sized to its largest span.
+    lastGeom = hasGeom
+      ? {
+          center: [
+            n.origin[0] + n.dimensions[0] / 2,
+            n.origin[1] + n.dimensions[1] / 2,
+            n.origin[2] + n.dimensions[2] / 2,
+          ],
+          size: Math.max(Math.abs(n.dimensions[0]), Math.abs(n.dimensions[1]), Math.abs(n.dimensions[2])) * 0.75 || 1,
+        }
+      : null;
+    if (n.meshUrl || hasGeom) {
+      previewHost.style.display = "";
+      const mv = ensureMini();
+      mv.clear();
+      if (hasGeom) {
+        mv.loadBbox({ id, origin: n.origin, dimensions: n.dimensions, node_kind: n.kind, proxy_shape: n.proxyShape ?? null });
+      }
+      if (n.meshUrl) mv.loadModel({ id, url: n.meshUrl }, api.absUrl(n.meshUrl));
+      mv.setActive(true);
+      applyAxes();
+    } else {
+      previewHost.style.display = "none";
+      miniViewer?.setActive(false);
+    }
+
+    if (n.prompt) fieldsEl.appendChild(fieldGroup("prompt", n.prompt));
+
+    const props = el("div", { class: "tp-props" });
+    const addProp = (label, value) => { if (value !== null && value !== undefined && value !== "") props.appendChild(prop(label, value)); };
+    addProp("kind", n.kind + (n.phase ? ` · ${n.phase}` : ""));
+    if (isObject) {
+      const text = typeof spec?.orientation === "string" ? spec.orientation : null;
+      const deg = typeof n.orientation === "number" ? `${n.orientation}°` : null;
+      const parts = [text ? `“${text}”` : null, deg].filter(Boolean);
+      if (parts.length) addProp("orientation", parts.join(" · "));
+    }
+    if (Array.isArray(n.dimensions)) addProp("dimensions", fmtDims(n.dimensions));
+    if (Array.isArray(n.origin)) addProp("origin (world)", fmtVec(n.origin));
+    if (n.proxyShape) addProp("proxy", n.proxyShape);
+    if (spec?.parent) addProp("structural parent", `${spec.parent}${spec.parent_relationship_kind ? ` · ${spec.parent_relationship_kind}` : ""}`);
+    if (props.childElementCount) fieldsEl.appendChild(props);
+
+    if (spec?.placement) fieldsEl.appendChild(fieldGroup("placement", spec.placement));
+
+    const rels = Array.isArray(spec?.relationships) ? spec.relationships : [];
+    if (rels.length) {
+      const list = el("div", { class: "tp-rels" }, rels.map((r) => {
+        const linked = typeof r.target === "string" && model.nodes.has(r.target);
+        return el("div", { class: "tp-rel" },
+          el("span", { class: "tp-rel-kind", text: r.kind ?? "?" }),
+          el("span", { class: "tp-rel-arrow", text: "→" }),
+          el("span", {
+            class: `tp-rel-target${linked ? " link" : ""}`,
+            text: r.target ?? "?",
+            onclick: linked ? () => onNavigate(r.target) : null,
+          }),
+        );
+      }));
+      fieldsEl.appendChild(fieldGroup(`relationships (${rels.length})`, list));
+    }
+
+    if (n.meshUrl) {
+      fieldsEl.appendChild(prop("mesh", el("a", { class: "tp-link", href: api.absUrl(n.meshUrl), target: "_blank", text: "open .glb ↗" })));
+    }
+
+    lastInfoSig = infoSig(id);
+  }
+
+  // ── emittance trace body (rebuilt on node/call toggle + streamed updates) ──
 
   // The calls that GENERATED a node: its provenance — emitted_by (the decompose
-  // that named it) + placed_by (the bbox step that placed it), both run on the
-  // emitting region. This is the same set for the focused node and every
-  // ancestor, so each reads the same way. The root has no provenance, so it
-  // falls back to the calls that ran on it (overall_bbox / root plan+decompose)
-  // — never empty. Ordered by execution; each entry keeps its relation to badge.
+  // that named it) + placed_by (the bbox step that placed it). Same set for the
+  // focused node and every ancestor. The root has no provenance, so it falls
+  // back to the calls that ran on it — never empty. Ordered by execution.
   function nodeCalls(id) {
     const prov = (model.provenance?.get(id) ?? []).filter((p) => p.call?.index != null);
     if (prov.length) {
@@ -69,8 +286,6 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
       .map((call) => ({ call, relation: null }));
   }
 
-  // A text section that starts collapsed (just its header); the toggle reveals
-  // the full bytes. Scene-context blocks fold behind their own expanders.
   function collapsedSection(label, text, { variables = null } = {}) {
     const body = variables ? foldedPre(text, variables) : el("pre", { text });
     body.style.display = "none";
@@ -93,9 +308,6 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     );
   }
 
-  // The output section: shows only the slice about this node by default, with a
-  // toggle to the full output. When nothing could be sliced out (the node is the
-  // call's region, or a node-specific step) the full output already shows.
   function outputSection(call, nodeId) {
     const { value, truncated } = extractRelevantOutput(call.output, nodeId);
     const relText = fmtJson(value);
@@ -116,10 +328,7 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
       : null;
     return el("div", { class: "obsm-sec" },
       el("div", { class: "tp-sec-head" },
-        el("span", {
-          class: "tp-sec-lab",
-          text: `output${truncated ? ` · ${nodeId}` : ""} · ${shortBytes(fullText)}`,
-        }),
+        el("span", { class: "tp-sec-lab", text: `output${truncated ? ` · ${nodeId}` : ""} · ${shortBytes(fullText)}` }),
         toggle,
       ),
       body,
@@ -143,8 +352,6 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     return detail;
   }
 
-  // One call row, expandable IN PLACE (no full repaint, so other open calls /
-  // toggled sections stay put). `relation` badges how it relates to the node.
   function callRow({ call, relation }, nodeId) {
     const wrap = el("div", { class: "tp-call-wrap" });
     const caret = el("span", { class: "caret" });
@@ -217,13 +424,7 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
   }
 
   function paint() {
-    const n = model?.nodes.get(focusId);
-    nodeLabelEl.textContent = n ? `${focusId} · ${n.kind}` : (focusId ?? "");
-    nodeLabelEl.title = n?.prompt ?? "";
-    // Hold the scroll across a rebuild (a node-collapse/expand or a streamed
-    // update) so the view doesn't jump to the top; show() zeroes it first for a
-    // fresh node.
-    const prevScroll = bodyEl.scrollTop;
+    const prevScroll = scrollEl.scrollTop;
     bodyEl.textContent = "";
     const chain = emittanceLineage(model, focusId);
     const crumbs = el("div", { class: "obsm-crumbs" });
@@ -235,14 +436,15 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
         onclick: id === focusId ? null : () => onNavigate(id),
       }));
     });
-    bodyEl.appendChild(el("div", { class: "obsm-trace-head" }, crumbs));
+    bodyEl.appendChild(el("div", { class: "obsm-trace-head" },
+      el("div", { class: "tp-trace-title", text: "generated by" }),
+      crumbs,
+    ));
     for (const id of chain) bodyEl.appendChild(nodeBlock(id, id === focusId));
-    bodyEl.scrollTop = prevScroll;
+    scrollEl.scrollTop = prevScroll;
     lastSig = signature(chain);
   }
 
-  // A fingerprint of everything the trace currently DRAWS, so a streamed
-  // re-render no-ops when nothing visible changed.
   function signature(chain) {
     if (!model || focusId === null || !model.nodes.has(focusId)) return null;
     const nodeSig = (id) => {
@@ -254,49 +456,54 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     return `${focusId}|exp:${exp}|${chain.map(nodeSig).join(";")}`;
   }
 
-  // Open (or re-target) the panel on a node. A different node starts fresh: only
-  // it expanded, its ancestors collapsed, no calls open, scrolled to the top.
+  // ── lifecycle ──
+
   function show(m, id) {
     model = m;
     if (!m || !m.nodes.has(id)) { hide(); return; }
-    if (id !== focusId) {
+    const newFocus = id !== focusId;
+    if (newFocus) {
       focusId = id;
       expandedNodes.clear();
       expandedNodes.add(id);
       expandedCalls.clear();
-      bodyEl.scrollTop = 0;
     }
     hostEl.classList.add("open");
+    if (newFocus) renderInfo(id);
     lastSig = null;
     paint();
+    if (newFocus) scrollEl.scrollTop = 0;
   }
 
-  // Fold newly-streamed calls into the open trace, but never while the user is
-  // engaged (a call expanded, or scrolled in) — that would collapse what they're
-  // reading. User-driven renders (show / navigate / node toggle) always paint.
   function refresh(m, { streamed = false } = {}) {
     model = m;
     if (focusId === null || !hostEl.classList.contains("open")) return;
     if (!m || !m.nodes.has(focusId)) { hide(); return; }
-    const engaged = expandedCalls.size > 0 || bodyEl.scrollTop > 0;
+    const engaged = expandedCalls.size > 0 || scrollEl.scrollTop > 0;
     if (streamed && engaged) return;
-    if (signature(emittanceLineage(m, focusId)) === lastSig) return;
-    paint();
+    if (infoSig(focusId) !== lastInfoSig) renderInfo(focusId);
+    if (signature(emittanceLineage(m, focusId)) !== lastSig) paint();
   }
 
   function hide() {
     hostEl.classList.remove("open");
+    miniViewer?.setActive(false);
   }
 
-  // Full teardown on cell open/close — selection is per-cell, so the panel must
-  // not carry a stale focus or expansions into the next scene.
   function reset() {
     focusId = null;
     expandedNodes.clear();
     expandedCalls.clear();
     model = null;
     lastSig = null;
+    lastInfoSig = null;
+    fieldsEl.textContent = "";
     bodyEl.textContent = "";
+    previewHost.style.display = "none";
+    lastGeom = null;
+    miniViewer?.setActive(false);
+    miniViewer?.setAxes(false);
+    miniViewer?.clear();
     hide();
   }
 

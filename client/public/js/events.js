@@ -177,6 +177,9 @@ export function createObsModel() {
       n = {
         id, parentId: null, prompt: null, plan: null, imagePrompt: null,
         kind: "zone", phase: null, calls: [], meshUrl: null, error: null,
+        // World-space placement, carried on the `bbox` event (origin/dimensions
+        // are global; orientation is the resolved yaw in degrees, 0 for zones).
+        origin: null, dimensions: null, proxyShape: null, orientation: null,
       };
       model.nodes.set(id, n);
       model.order.push(id);
@@ -243,6 +246,10 @@ export function createObsModel() {
         n.parentId = event.parent_id ?? n.parentId;
         n.prompt = event.prompt ?? n.prompt;
         n.kind = event.node_kind ?? n.kind;
+        if (Array.isArray(event.origin)) n.origin = event.origin;
+        if (Array.isArray(event.dimensions)) n.dimensions = event.dimensions;
+        if (event.proxy_shape !== undefined) n.proxyShape = event.proxy_shape;
+        if (typeof event.orientation === "number") n.orientation = event.orientation;
         return true;
       }
       case "divider.zone_decompose":
