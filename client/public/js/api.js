@@ -60,6 +60,10 @@ export const api = {
   // if already loaded; launches nothing.
   hydrateRun: (name) => request(`/runs/${encodeURIComponent(name)}/hydrate`, { method: "POST" }),
   slots: (run) => request("/slots", { params: { run } }),
+  // Live snapshot of the process-global mesh queue — every in-flight + waiting
+  // generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
+  // pool. { pools: [{id,label,cap}], entries: [{slot_id,job_id,state,backend,pool,…}] }.
+  trellisQueue: () => request("/trellis/queue"),
 
   // --- cell lifecycle ---
   // `stepped` opts the cell in/out of one-call-at-a-time execution
@@ -83,6 +87,34 @@ export const api = {
   retryMesh: (run, slot, model, nodeId) =>
     request(cellPath(slot, model, `/retry-mesh/${encodeURIComponent(nodeId)}`), { method: "POST", params: { run } }),
 
+  // --- from-scratch generated assets (Nano-Banana + a mesh backend) ---
+  // The single generated build of a cell, built/regenerated alongside the
+  // library build and viewed by flipping `meshesUrl(..., { mode: "generated" })`.
+  // generate(): build/resume the whole scene's generated assets (409 if a build
+  // is already in flight). generateStatus(): whether a build/regen is running +
+  // the finished ids (each with its symmetry plane). regenerate/symmetrize/
+  // unsymmetrize act on ONE object's generated mesh; with propagate they apply to
+  // its whole prefab group. backend ∈ {trellis, hunyuan, hunyuan-tencent}.
+  generate: (run, slot, model) =>
+    request(cellPath(slot, model, "/generate"), { method: "POST", params: { run } }),
+  generateStatus: (run, slot, model, { optimized = true } = {}) =>
+    request(cellPath(slot, model, "/generate"), { params: { run, optimized: optimized ? 1 : 0 } }),
+  regenerate: (run, slot, model, nodeId, { backend = "trellis", propagate = true, reuseImage = false } = {}) =>
+    request(cellPath(slot, model, `/regenerate/${encodeURIComponent(nodeId)}`), {
+      method: "POST",
+      params: { run, backend, propagate, reuse_image: reuseImage },
+    }),
+  symmetrize: (run, slot, model, nodeId, { plane = "xy", keepPositive = true, propagate = true } = {}) =>
+    request(cellPath(slot, model, `/symmetrize/${encodeURIComponent(nodeId)}`), {
+      method: "POST",
+      params: { run, plane, keep_positive: keepPositive, propagate },
+    }),
+  unsymmetrize: (run, slot, model, nodeId, { propagate = true } = {}) =>
+    request(cellPath(slot, model, `/unsymmetrize/${encodeURIComponent(nodeId)}`), {
+      method: "POST",
+      params: { run, propagate },
+    }),
+
   // --- source cell data ---
   //   untilIndex → project/bundle only the prefix BEFORE that event (the
   //     compare view's "previous" pane: the original's state at the fork step).
@@ -90,8 +122,16 @@ export const api = {
     request(cellPath(slot, model, "/scene"), { params: { run, until_index: untilIndex } }),
   eventsUrl: (run, slot, model, { since } = {}) =>
     u(cellPath(slot, model, "/events"), { run, since }).toString(),
-  meshesUrl: (run, slot, model, { untilIndex } = {}) =>
-    u(cellPath(slot, model, "/meshes"), { run, until_index: untilIndex }).toString(),
+  //   mode="generated" streams the cell's from-scratch generated build instead
+  //     of the library objects/; optimized=false streams the raw bbox-fitted
+  //     Trellis mesh instead of the served KTX2/Meshopt twin.
+  meshesUrl: (run, slot, model, { untilIndex, mode, optimized } = {}) =>
+    u(cellPath(slot, model, "/meshes"), {
+      run,
+      until_index: untilIndex,
+      mode,
+      optimized: optimized === false ? 0 : undefined,
+    }).toString(),
   // Full source-cell history backfill (cache.llm payloads included) from disk.
   async eventsHistory(run, slot, model) {
     return readEventsJsonl(`${run}/${slot}/${model}/events.jsonl`);

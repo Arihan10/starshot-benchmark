@@ -11,6 +11,8 @@ import { initLab } from "./promptlab.js";
 import { initCompare } from "./compare.js";
 import { initRunCompare } from "./runcompare.js";
 import { initCost } from "./cost.js";
+import { initQueuePanel } from "./queue.js";
+import { initLighting } from "./lighting.js";
 
 const LAST_RUN_KEY = "starshot.lastRun";
 const runPickerEl = document.getElementById("run-picker");
@@ -379,12 +381,14 @@ document.getElementById("btn-reset-all").addEventListener("click", resetAllModal
 // --- boot ------------------------------------------------------------------------
 
 (async () => {
-  const viewer = createViewer(document.getElementById("canvas-host"));
+  const viewer = createViewer(document.getElementById("canvas-host"), { lighting: true });
   initOverlay(viewer);
+  initLighting(viewer);
   initLab();
   initCompare();
   initRunCompare();
   initCost();
+  initQueuePanel();
 
   try {
     const payload = await refreshRuns();

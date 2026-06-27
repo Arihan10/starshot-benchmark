@@ -72,6 +72,8 @@ function parseArgs(argv) {
   const opts = {
     input: DEFAULT_INPUT,
     output: DEFAULT_OUTPUT,
+    file: null,
+    outFile: null,
     targetTris: 15000,
     error: 0.01,
     textureSize: 256,
@@ -88,6 +90,8 @@ function parseArgs(argv) {
     switch (arg) {
       case "--input": opts.input = path.resolve(next()); break;
       case "--output": opts.output = path.resolve(next()); break;
+      case "--file": opts.file = path.resolve(next()); break;
+      case "--out-file": opts.outFile = path.resolve(next()); break;
       case "--target-tris": opts.targetTris = Number(next()); break;
       case "--error": opts.error = Number(next()); break;
       case "--texture-size": opts.textureSize = Number(next()); break;
@@ -145,26 +149,10 @@ function sceneBounds(document) {
   return { min, max };
 }
 
-async function optimizeOne(io, fileName, opts) {
-  const inPath = path.join(opts.input, fileName);
-  const outPath = path.join(opts.output, fileName);
-  const id = fileName.replace(/\.glb$/i, "");
-  const inBytes = (await stat(inPath)).size;
-
-  if (!opts.force && existsSync(outPath)) {
-    // Re-read the (small) optimized file so the manifest stays authoritative
-    // on resume — bounds especially, which the bake step depends on.
-    const doc = await io.read(outPath);
-    return {
-      id,
-      status: "skipped",
-      inBytes,
-      outBytes: (await stat(outPath)).size,
-      outTris: triangleCount(doc),
-      bounds: sceneBounds(doc),
-    };
-  }
-
+// The actual optimization pass for one GLB (read -> weld/decimate/prune ->
+// resize + KTX2 -> meshopt -> write). Shared by the batch library pass and the
+// per-asset generate-gate pass so both go through the identical pipeline.
+async function optimizeFile(io, inPath, outPath, opts) {
   const document = await io.read(inPath);
   document.setLogger(QUIET_LOGGER);
   const srcTris = triangleCount(document);
@@ -201,6 +189,31 @@ async function optimizeOne(io, fileName, opts) {
   await document.transform(meshopt({ encoder: MeshoptEncoder, level: "high" }));
   await io.write(outPath, document);
 
+  return { srcTris, outTris, bounds };
+}
+
+async function optimizeOne(io, fileName, opts) {
+  const inPath = path.join(opts.input, fileName);
+  const outPath = path.join(opts.output, fileName);
+  const id = fileName.replace(/\.glb$/i, "");
+  const inBytes = (await stat(inPath)).size;
+
+  if (!opts.force && existsSync(outPath)) {
+    // Re-read the (small) optimized file so the manifest stays authoritative
+    // on resume — bounds especially, which the bake step depends on.
+    const doc = await io.read(outPath);
+    return {
+      id,
+      status: "skipped",
+      inBytes,
+      outBytes: (await stat(outPath)).size,
+      outTris: triangleCount(doc),
+      bounds: sceneBounds(doc),
+    };
+  }
+
+  const { srcTris, outTris, bounds } = await optimizeFile(io, inPath, outPath, opts);
+
   return {
     id,
     status: "done",
@@ -234,21 +247,39 @@ async function runPool(items, concurrency, worker) {
   return results;
 }
 
-async function main() {
-  const opts = parseArgs(process.argv);
-
-  if (!existsSync(opts.input)) {
-    throw new Error(`input dir not found: ${opts.input}`);
-  }
-  await mkdir(opts.output, { recursive: true });
+async function makeIO() {
   await Promise.all([MeshoptDecoder.ready, MeshoptEncoder.ready, MeshoptSimplifier.ready]);
-
-  const io = new NodeIO()
+  return new NodeIO()
     .registerExtensions(ALL_EXTENSIONS)
     .registerDependencies({
       "meshopt.encoder": MeshoptEncoder,
       "meshopt.decoder": MeshoptDecoder,
     });
+}
+
+async function main() {
+  const opts = parseArgs(process.argv);
+
+  // Single-file mode: optimize one GLB to --out-file. The generate gate calls
+  // this per freshly generated asset so it gets the same decimate + KTX2 +
+  // Meshopt pass as the library. No manifest is written — generated meshes are
+  // already placed in world space, so the bake step (which needs the manifest's
+  // per-orientation bounds) doesn't apply.
+  if (opts.file) {
+    if (!existsSync(opts.file)) throw new Error(`input file not found: ${opts.file}`);
+    if (!opts.outFile) throw new Error("--file requires --out-file");
+    await mkdir(path.dirname(opts.outFile), { recursive: true });
+    const io = await makeIO();
+    const r = await optimizeFile(io, opts.file, opts.outFile, opts);
+    console.log(`[opt] ${path.basename(opts.file)}: ${kT(r.srcTris)} -> ${kT(r.outTris)} tris`);
+    return;
+  }
+
+  if (!existsSync(opts.input)) {
+    throw new Error(`input dir not found: ${opts.input}`);
+  }
+  await mkdir(opts.output, { recursive: true });
+  const io = await makeIO();
 
   let files = (await readdir(opts.input)).filter((f) => /\.glb$/i.test(f)).sort();
   if (Number.isFinite(opts.limit)) files = files.slice(0, opts.limit);

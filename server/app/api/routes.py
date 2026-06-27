@@ -34,6 +34,7 @@ from datetime import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -53,7 +54,8 @@ from app.core.slots import (
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import divider, generation
-from app.services import llm, threed
+from app.services import llm, prefabs, threed
+from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
@@ -80,9 +82,28 @@ RUN_META_NAME = "run.json"
 # Keyed by (run_name, slot_id, model_alias). Each cell is an independent
 # pipeline. Lazy-populated: only runs the user has activated are loaded.
 RunKey = tuple[str, str, str]
+# The from-scratch generated build of a cell keys its task tables on
+# (run, slot, model) — one build per cell, separate from the library build.
+GenKey = tuple[str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
 _retry_tasks: set[asyncio.Task[None]] = set()
+# In-flight "generate from-scratch assets" task per (cell, version). Drives the
+# client's generate gate (a version can't re-trigger until its current build
+# finishes) and lets shutdown / reset cancel a build cleanly.
+_generate_tasks: dict[GenKey, asyncio.Task[None]] = {}
+# Per-(cell, version) regeneration worker + its FIFO of
+# (node_id, propagate, backend, op, reuse_image) requests, where op is
+# "regenerate" (fresh mesh — and, unless reuse_image, a fresh Nano-Banana image
+# too) or "unsymmetrize" (reprocess the existing raw mesh with the symmetry
+# mirror off — no AI; reuse_image is ignored). `_regen_tasks` holds the single worker
+# task per version; `_regen_queues` is the work it drains concurrently (parallel
+# across prefab groups, serialized within one), sharing that version's
+# generated-events log. Requests enqueue rather than 409 between each other, and
+# run concurrently with a whole-scene generate of the same version: they serialize
+# per-node with it via generation.node_lock, so neither writes the same asset twice.
+_regen_tasks: dict[GenKey, asyncio.Task[None]] = {}
+_regen_queues: dict[GenKey, asyncio.Queue[tuple[str, bool, str, str, bool]]] = {}
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
 
@@ -519,6 +540,133 @@ def _branch_run_id(run: str, branch_id: str) -> str:
     return f"{run}/{BRANCHES_SUBDIR}/{branch_id}"
 
 
+def _gen_slot_id(run: str, slot_id: str, model_alias: str) -> str:
+    """SlotLog id for a cell's generated build — used as the bound log's slot_id
+    and the Trellis queue key, so the generated build never collides with the
+    library build on either."""
+    return f"{_run_id(run, slot_id, model_alias)}::generated"
+
+
+# Parsed symmetry state per generated-events log, cached on the file's
+# (mtime_ns, size) so the frequently-polled gate status re-reads it only when a
+# build / regen / un-symmetrize has appended to the build's log.
+_gen_symmetry_cache: dict[
+    Path, tuple[tuple[int, int], dict[str, dict[str, str | None]]]
+] = {}
+
+
+def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
+    """Map node id -> {'plane': current symmetry plane, 'was': prior mirror plane}.
+
+    'plane' is 'xy'/'xz' when the served mesh is mirrored across that plane, else
+    'none'. 'was' separates the two un-mirrored cases the client must tell apart:
+    a node un-symmetrized after being mirrored ('plane'='none', 'was'= its old
+    plane) vs one that was never symmetrized ('plane'='none', 'was'=None).
+
+    A node's symmetry follows its PREFAB CANONICAL: a reuse's mesh is always
+    re-derived from the canonical's raw at the canonical's current plane, and a
+    propagated un-symmetrize records `symmetry.applied`='none' only on the
+    canonical (the per-reuse re-derivation logs nothing), so the canonical's
+    applied history is the source of truth for the whole group. Ids absent here
+    resolve to a canonical that was never mirrored, so callers default to never.
+
+    Handles both event formats: the current `symmetry.applied` event AND the legacy
+    `symmetry.decision` that bundled `applied`+`axis` onto the decision itself
+    (older builds, before applied was split out). Both update the same per-id state
+    in log order, so a node recorded only the legacy way is still detected and a
+    later un-symmetrize still wins."""
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _gen_symmetry_cache.get(events_path)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    # Per-id applied history (latest plane + last mirrored plane, with the log
+    # position of that latest update) and the flat prefab star (id -> the canonical
+    # it reuses, latest match winning).
+    applied: dict[str, dict[str, str | None]] = {}
+    applied_idx: dict[str, int] = {}
+    reuse_of: dict[str, str] = {}
+
+    def _set_plane(nid: str, cut_plane: str, idx: int) -> None:
+        entry = applied.setdefault(nid, {"plane": "none", "was": None})
+        entry["plane"] = cut_plane
+        if cut_plane in ("xy", "xz"):
+            entry["was"] = cut_plane
+        applied_idx[nid] = idx
+
+    with events_path.open("r", encoding="utf-8") as f:
+        for idx, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = event.get("kind")
+            node_id = event.get("id")
+            if not isinstance(node_id, str):
+                continue
+            if kind == "symmetry.applied":
+                cut_plane = event.get("cut_plane")
+                if cut_plane in ("none", "xy", "xz"):
+                    _set_plane(node_id, cut_plane, idx)
+            elif kind == "symmetry.decision" and "applied" in event:
+                # Legacy combined event: older builds recorded the plane AND whether
+                # it was mirrored on the decision itself (current builds split that
+                # into a separate `symmetry.applied`). Mirrored iff `applied` is
+                # truthy and the plane is xy/xz; anything else (applied false, or
+                # plane none) means the served mesh is not mirrored.
+                cut_plane = event.get("cut_plane")
+                _set_plane(
+                    node_id,
+                    cut_plane if (event.get("applied") and cut_plane in ("xy", "xz")) else "none",
+                    idx,
+                )
+            elif kind == "prefab.match":
+                reuse_of[node_id] = str(event.get("reuse_id") or "")
+    # Resolve each node to whichever of {its own, its canonical's} applied history
+    # is MORE RECENT in log order. The canonical matters because a propagated
+    # un-symmetrize records applied=none only on the canonical (the per-reuse
+    # re-derivation logs nothing), so its later 'none' must override a reuse's
+    # now-stale mirror. But a reuse (re)built more recently keeps its own state —
+    # including legacy logs, where each reuse carried its OWN symmetry event, and
+    # an independently regenerated reuse. Ids with neither default to never.
+    state: dict[str, dict[str, str | None]] = {}
+    for node_id in set(applied) | set(reuse_of):
+        canonical = reuse_of.get(node_id) or node_id
+        own_idx = applied_idx.get(node_id, -1)
+        canon_idx = applied_idx.get(canonical, -1) if canonical != node_id else -1
+        info = applied.get(node_id if own_idx >= canon_idx else canonical)
+        state[node_id] = (
+            {"plane": info["plane"], "was": info["was"]}
+            if info is not None
+            else {"plane": "none", "was": None}
+        )
+    _gen_symmetry_cache[events_path] = (sig, state)
+    return state
+
+
+def _ensure_run_hydrated(run: str) -> None:
+    """Lazily hydrate a run that exists on disk but isn't in memory yet.
+
+    Only the three reserved version runs hydrate at boot; saved/named runs
+    hydrate on explicit activation. But the client also reaches a run directly
+    via `?run=` — a persisted tab, an archived run in the picker, or any cell
+    after a server restart — without re-activating it. Without this, every cell
+    endpoint for such a run 404s (`_require_slot_log`) and `/slots` reports its
+    cells as empty/idle, so the client's gate poll silently bails and a finished
+    regen/build never swaps in. Hydrating on first touch makes cell access
+    self-healing; it's idempotent and cheap once done (guarded by
+    `_hydrated_runs`), and a genuinely unknown run (no dir) is left alone so the
+    downstream 404 still fires."""
+    if run and run not in _hydrated_runs and _run_dir(run).is_dir():
+        _hydrate_run(run)
+
+
 def _slug(text: str) -> str:
     """A filesystem/URL-safe lowercase slug — branch ids embed the origin
     slot + model so the temp folder reads at a glance."""
@@ -604,9 +752,13 @@ def _validate_overrides(overrides: dict[str, dict[str, str]]) -> None:
 def _resolve_run(run: str | None) -> str:
     """Every cell endpoint names its target run explicitly so concurrently-
     running runs never route through a shared global. The client always sends
-    `?run=`; `_current_run` is only the fallback for a client that hasn't
-    picked one yet (boot, or a legacy caller)."""
-    return run or _current_run
+    `?run=`; `_current_run` is only the fallback for a client that hasn't picked
+    one yet (boot, or a legacy caller). Resolving also lazily hydrates the target
+    run if it exists on disk but isn't yet in memory, so a cell is never
+    spuriously 404/idle just because its run wasn't the one explicitly activated."""
+    resolved = run or _current_run
+    _ensure_run_hydrated(resolved)
+    return resolved
 
 
 def _run_meta(run: str) -> dict[str, object]:
@@ -1113,6 +1265,10 @@ def create_app() -> FastAPI:
             for br in _branches.values():
                 if br.task is not None:
                     br.task.cancel()
+            for task in _generate_tasks.values():
+                task.cancel()
+            for task in _regen_tasks.values():
+                task.cancel()
             for task in list(_tasks.values()):
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await task
@@ -1125,6 +1281,12 @@ def create_app() -> FastAPI:
                         await br.task
             for br in _branches.values():
                 br.log.close()
+            for task in list(_generate_tasks.values()):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+            for task in list(_regen_tasks.values()):
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
             await oneshot.shutdown()
             await threed.disconnect_http()
 
@@ -1544,13 +1706,76 @@ def create_app() -> FastAPI:
 
     @app.get("/trellis/queue")
     async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Live snapshot of the process-global Trellis in-flight queue.
-        The client polls this instead of inferring queue state from the
-        replayed event log (historical submits without matching .done
-        events leak as stale "processing" rows otherwise)."""
+        """Live snapshot of the in-flight mesh queue, split into independent
+        concurrency pools (Trellis/Modal vs Hunyuan 3.1/Tencent). The client
+        polls this instead of inferring queue state from the replayed event log
+        (historical submits without matching .done events leak as stale
+        "processing" rows otherwise). Each entry is tagged with its `backend` +
+        `pool`; `pools` carries each section's label and its own cap."""
         return {
-            "cap": threed.GENERATE_CONCURRENCY,
+            "pools": threed.queue_pools(),
             "entries": threed.queue_snapshot(),
+        }
+
+    @app.post("/generations/stop")
+    async def stop_all_generations() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Preemptively terminate every in-flight generation — process-wide,
+        across all runs, versions, and (slot, model) cells — without wiping any
+        state, so each can be resumed/retried afterward:
+
+          * Pipeline builds (`_tasks`) are cancelled, then their cell is flipped
+            to `paused` + `run.paused` (identical to a per-cell pause), so the
+            dashboard shows it as resumable and `/resume` re-enters the pipeline,
+            short-circuiting everything already on disk.
+          * From-scratch builds (`_generate_tasks`) are cancelled; re-pressing
+            generate resumes them (finished optimized twins are skipped).
+          * Standalone mesh retries (`_retry_tasks`) are cancelled.
+
+        Underlying Trellis/Banana mesh tasks live on each version's
+        `generation._pending`; a cancelled retry's wrapper has already returned
+        and no longer owns its mesh, so we drain `_pending` for every hydrated
+        cell to be sure none leak. On-disk artifacts + event logs are untouched
+        — only in-memory tasks die, which is what makes this resumable rather
+        than destructive."""
+        pipeline_keys = [k for k, t in _tasks.items() if not t.done()]
+        generate_keys = [k for k, t in _generate_tasks.items() if not t.done()]
+        regen_keys = [k for k, t in _regen_tasks.items() if not t.done()]
+        retry_tasks = [t for t in _retry_tasks if not t.done()]
+
+        # Fire every cancellation before awaiting any, so in-flight network
+        # awaits unwind concurrently instead of one cancellation at a time.
+        pipeline_tasks = [_tasks.pop(k) for k in pipeline_keys]
+        generate_tasks = [_generate_tasks.pop(k) for k in generate_keys]
+        regen_tasks = [_regen_tasks.pop(k) for k in regen_keys]
+        for task in (*pipeline_tasks, *generate_tasks, *regen_tasks, *retry_tasks):
+            task.cancel()
+
+        # Drain the per-run mesh-task tables on every hydrated cell.
+        for run_name, slot_id, model_alias in list(_slot_logs.keys()):
+            generation.cancel_pending(_run_id(run_name, slot_id, model_alias))
+
+        for task in (*pipeline_tasks, *generate_tasks, *regen_tasks, *retry_tasks):
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+
+        # Flip each stopped pipeline cell to paused (resumable) + sentinel —
+        # only while still "running", so a status the task wrote just before
+        # cancellation landed (run.done / run.error) is never clobbered.
+        paused: list[str] = []
+        for key in pipeline_keys:
+            slot_log = _slot_logs.get(key)
+            if slot_log is None or slot_log.state.get("status") != "running":
+                continue
+            slot_log.state["status"] = "paused"
+            slot_log.log("run.paused")
+            paused.append(_run_id(*key))
+
+        return {
+            "stopped_pipelines": [_run_id(*k) for k in pipeline_keys],
+            "stopped_generates": [_gen_slot_id(*k) for k in generate_keys],
+            "stopped_regens": [_gen_slot_id(*k) for k in regen_keys],
+            "stopped_retries": len(retry_tasks),
+            "paused": paused,
         }
 
     @app.get("/slots/{slot_id}/{model_alias}/events")
@@ -1595,7 +1820,7 @@ def create_app() -> FastAPI:
         return _scene_projection(events)
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
@@ -1608,13 +1833,23 @@ def create_app() -> FastAPI:
         # never serves ghosts); `until_index` further restricts to meshes
         # committed BEFORE that event — paired with /scene?until_index for the
         # compare view's "previous" pane (the original's meshes at the fork).
+        #
+        # `mode=generated` streams the cell's from-scratch generated build instead
+        # of the library `objects/` — the OPTIMIZED twin (decimated + KTX2 +
+        # Meshopt) by default, the raw bbox-fitted Trellis mesh when `optimized=0`
+        # (the client's side-by-side comparison). _mesh_bundle skips the
+        # `<id>.raw.glb` intermediates, so either dir streams the finished set.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         cell_dir = slot_log.events_path.parent
-        objects_dir = _objects_dir(cell_dir)
         events = list(slot_log.state["events"])
         if until_index is not None:
             events = events[:until_index]
+        if mode == "generated":
+            rid = _run_id(run, slot_id, model_alias)
+            objects_dir = generation.latest_generated_dirs(RUNS_DIR, rid)[1 if optimized else 0]
+        else:
+            objects_dir = _objects_dir(cell_dir)
         return StreamingResponse(
             _mesh_bundle(objects_dir, _committed_mesh_ids(events)),
             media_type="application/octet-stream",
@@ -1753,6 +1988,311 @@ def create_app() -> FastAPI:
             "node_id": node_id,
         }
 
+    @app.post("/slots/{slot_id}/{model_alias}/generate")
+    async def slot_generate(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """The generate gate: build from-scratch (Nano-Banana + a mesh backend)
+        assets for this cell's single generated build (`objects-generated/`),
+        reusing the library build's layout — every object's existing
+        bbox/orientation — so the client's "generated" view is an apples-to-apples
+        swap of matched assets for freshly generated ones.
+
+        Resumes in place: meshes already on disk are skipped and bookkeeping lands
+        in events.generated.jsonl. Only one build per cell at a time; re-pressing
+        while it's in flight returns 409 (the gate). The library build (objects/ +
+        events.jsonl) is never touched."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        run_id = _run_id(run, slot.id, model_alias)
+        generation.generated_dirs(RUNS_DIR, run_id)[0].mkdir(parents=True, exist_ok=True)
+        key: GenKey = (run, slot_id, model_alias)
+        in_flight = _generate_tasks.get(key)
+        if in_flight is not None and not in_flight.done():
+            raise HTTPException(status_code=409, detail="generation already running")
+        # Per-asset regenerations of this version may be in flight — that's allowed.
+        # The scene build and regens serialize per-node via generation.node_lock, so
+        # they never write the same asset at once.
+
+        # Reconstruct every concrete (object/frame) node from the library log so
+        # generation reuses the exact layout instead of re-running the divider.
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        nodes = _scene_nodes_from_library(lib_log)
+        if not nodes:
+            raise HTTPException(
+                status_code=400,
+                detail="no scene to generate from; build the library scene first",
+            )
+
+        # Dedicated generated-build log for resumable bookkeeping (nano_banana /
+        # threed require a bound SlotLog). Kept apart from the library log so the
+        # asset toggle stays a pure folder switch and the library stream is untouched.
+        gen_log = SlotLog(
+            _gen_slot_id(run, slot.id, model_alias),
+            generation.generated_events_path(RUNS_DIR, run_id),
+        )
+        gen_log.hydrate_from_disk()
+
+        async def _do_generate() -> None:
+            prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+            rlog.bind(gen_log)
+            try:
+                # Prefab grouping lives in the generated build's log; the library
+                # build never groups (it matches an asset per object as built).
+                decisions = await generation.ensure_scene_prefab_groups(nodes=nodes, run_id=run_id)
+                await generation.generate_assets(
+                    nodes=nodes, decisions=decisions, runs_dir=RUNS_DIR, run_id=run_id,
+                )
+            finally:
+                gen_log.close()
+
+        _generate_tasks[key] = asyncio.create_task(_do_generate())
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "nodes": len(nodes),
+        }
+
+    @app.get("/slots/{slot_id}/{model_alias}/generate")
+    async def slot_generate_status(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        run: str | None = None,
+        optimized: bool = True,
+    ) -> dict[str, object]:
+        """Gate state for the client: whether a build/regen is in flight for this
+        cell's generated build and the ids of its finished GLBs. Polled while the
+        "generated" view is active so the client can enable/disable the gate and
+        attach freshly-built meshes one by one as they land."""
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        rid = _run_id(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        gen_task = _generate_tasks.get(key)
+        regen_task = _regen_tasks.get(key)
+        regen_queue = _regen_queues.get(key)
+        running = (
+            (gen_task is not None and not gen_task.done())
+            or (regen_task is not None and not regen_task.done())
+            or (regen_queue is not None and not regen_queue.empty())
+        )
+        # Report the folder the client's optimized toggle is viewing — the OPTIMIZED
+        # twins by default (what's served), or the raw objects-generated/ set when
+        # `optimized=0`. Each carries the GLB's mtime as a token so the client can
+        # detect a regenerated asset (same id, new bytes) and reload just it, plus
+        # `sym`/`symWas` — the asset's current symmetry plane (none/xy/xz) and, if
+        # since un-symmetrized, the plane it used to be mirrored across — so the
+        # detail panel tells mirrored / un-symmetrized / never-symmetrized apart.
+        sym_map = _generated_symmetry(generation.latest_generated_events_path(RUNS_DIR, rid))
+        gen_dir = generation.latest_generated_dirs(RUNS_DIR, rid)[1 if optimized else 0]
+        meshes: list[dict[str, object]] = []
+        if gen_dir.is_dir():
+            for p in sorted(gen_dir.glob("*.glb")):
+                if p.name.endswith(".raw.glb"):
+                    continue
+                try:
+                    mtime = p.stat().st_mtime_ns
+                except OSError:
+                    continue
+                mesh_id = p.name[: -len(".glb")]
+                info = sym_map.get(mesh_id)
+                meshes.append({
+                    "id": mesh_id,
+                    "v": mtime,
+                    "url": f"/artifacts/{p.relative_to(RUNS_DIR).as_posix()}",
+                    "sym": info["plane"] if info else "none",
+                    "symWas": info["was"] if info else None,
+                })
+        ids = [m["id"] for m in meshes]
+        return {
+            "running": running,
+            "count": len(ids),
+            "ids": ids,
+            "meshes": meshes,
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/regenerate/{node_id}")
+    async def slot_regenerate(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+        propagate: bool = False,
+        backend: str = "trellis",
+        reuse_image: bool = False,
+    ) -> dict[str, object]:
+        """Enqueue a from-scratch regeneration of a GENERATED asset (in the
+        targeted `version`, else the latest) onto that version's regen worker. With
+        `propagate=true` (the client default) the worker rebuilds the prefab
+        CANONICAL behind `node_id` and re-derives every object that reuses it, so a
+        shared prefab updates everywhere within the version at once.
+
+        Requests ENQUEUE rather than 409 against each other: a single per-version
+        worker (`_regen_worker`) drains the queue concurrently — in parallel across
+        prefab groups, serialized within one — sharing that version's generated-events
+        log and resolving each item's prefab group at execution time (so a regen
+        enqueued later sees a reuse→canonical promotion an earlier one made). This
+        also runs CONCURRENTLY with a whole-scene generate of the same version: the
+        scene build and regens serialize per-node via `generation.node_lock` (plus
+        atomic GLB writes), so they never write the same asset at once — regenerating
+        an already-built asset proceeds while the scene build resumes the missing
+        ones. Queued items show as `waiting` rows in the shared /trellis/queue panel
+        until the worker picks them up."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        if backend not in generation.MESH_BACKENDS:
+            raise HTTPException(status_code=400, detail=f"unknown backend: {backend}")
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        # A whole-scene generate of this version may be in flight — that's allowed
+        # now. The regen and the scene build serialize per-node via
+        # generation.node_lock (see _regen_worker), so they never write the same
+        # asset's files at once.
+
+        # Validate the node exists in the library layout up front (fast 404); the
+        # worker reconstructs it + resolves the prefab group again at execution.
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+
+        gen_slot_id = _gen_slot_id(run, slot.id, model_alias)
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait((node_id, propagate, backend, "regenerate", reuse_image, None))
+        # Surface the queued regen in the shared mesh queue panel until the
+        # worker dequeues it (then generate_mesh manages its own entry). Tag the
+        # backend so it lands in the right pool section (Trellis vs Hunyuan 3.1).
+        threed.mark_queued(gen_slot_id, node_id, backend=backend)
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "propagate": propagate,
+            "backend": backend,
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/unsymmetrize/{node_id}")
+    async def slot_unsymmetrize(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+        propagate: bool = True,
+    ) -> dict[str, object]:
+        """Reveal a GENERATED asset's full, un-mirrored mesh: reprocess its existing
+        raw mesh with symmetry turned OFF — no Nano-Banana, no mesh backend, so it's
+        effectively instant. With `propagate=true` (the client default) the prefab
+        CANONICAL behind `node_id` is un-mirrored and every object reusing it is
+        re-derived to match, so a shared prefab stays consistent. Runs on the SAME
+        per-version worker as regeneration (`_regen_worker`), so it enqueues, drains
+        concurrently, and serializes per-node with builds + regens via
+        `generation.node_lock`. Pins the node's symmetry decision to `none` so later
+        resumes / regenerations keep it un-mirrored."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        # Reuses the regen worker's queue; the backend slot is unused for an
+        # un-symmetrize (it does no API calls) so it carries the default as filler.
+        # Not surfaced in the mesh queue panel — it's a local reprocess, not a
+        # backend generation.
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait((node_id, propagate, generation.DEFAULT_MESH_BACKEND, "unsymmetrize", False, None))
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "propagate": propagate,
+            "op": "unsymmetrize",
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/symmetrize/{node_id}")
+    async def slot_symmetrize(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+        plane: str = "xy",
+        keep_positive: bool = True,
+        propagate: bool = True,
+    ) -> dict[str, object]:
+        """Mirror a GENERATED asset across `plane` ('xy' = front/back along Z, 'xz' =
+        top/bottom along Y), keeping the `keep_positive` half — the symmetrize
+        counterpart to /unsymmetrize. The plane + direction are supplied by the
+        caller, so NO symmetry LLM decision is made and NO symmetry log is consulted
+        to pick them. Reprocesses the existing raw mesh (no Nano-Banana, no mesh
+        backend) on the SAME per-version worker as regenerate/unsymmetrize, so it
+        enqueues, drains concurrently, and serializes per-node via
+        `generation.node_lock`. With `propagate=true` (the client default) the prefab
+        CANONICAL behind `node_id` is mirrored and every object reusing it is
+        re-derived to match. Pins the node's symmetry decision so later resumes /
+        regenerations keep the mirror."""
+        if plane not in ("xy", "xz"):
+            raise HTTPException(status_code=400, detail=f"plane must be 'xy' or 'xz', got: {plane}")
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        # Same worker + filler backend slot as un-symmetrize; the (plane, keep)
+        # ride the trailing `sym` field of the queue item. Not surfaced in the mesh
+        # queue panel — a local reprocess, not a backend generation.
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait(
+            (node_id, propagate, generation.DEFAULT_MESH_BACKEND, "symmetrize", False, (plane, keep_positive))
+        )
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "propagate": propagate,
+            "op": "symmetrize",
+            "plane": plane,
+            "keep_positive": keep_positive,
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
     @app.post("/slots/{slot_id}/{model_alias}/reset")
     async def slot_reset(  # pyright: ignore[reportUnusedFunction]
         slot_id: str,
@@ -1769,6 +2309,26 @@ def create_app() -> FastAPI:
         # first to avoid one writing into a dir being deleted.
         await _discard_branches_of_cell(run, slot.id, model_alias)
         await _cancel_task(run, slot_id, model_alias)
+        # Tear down this cell's in-flight from-scratch build + regen worker so
+        # their meshes aren't written into the dir we're about to wipe.
+        cell = (run, slot_id, model_alias)
+        for gkey in [k for k in _generate_tasks if k[:3] == cell]:
+            gen_task = _generate_tasks.pop(gkey, None)
+            if gen_task is not None and not gen_task.done():
+                gen_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await gen_task
+        for gkey in [k for k in _regen_tasks if k[:3] == cell]:
+            regen_task = _regen_tasks.pop(gkey, None)
+            if regen_task is not None and not regen_task.done():
+                regen_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await regen_task
+        for gkey in [k for k in _regen_queues if k[:3] == cell]:
+            _regen_queues.pop(gkey, None)
+        # Drop this cell's per-node build locks now that no generate/regen task is
+        # left to hold them; the dir is about to be wiped.
+        generation.clear_node_locks(_run_id(run, slot.id, model_alias))
         # Cancel any standalone retries (registered on generation._pending but
         # with no owning _run task to drive cleanup) that the running task
         # wouldn't have touched.
@@ -2482,12 +3042,23 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
     orientation: Orientation = int(orientation_raw) if isinstance(orientation_raw, (int, float, str)) else 0  # type: ignore[assignment]
     raw_prompt = image_event.get("prompt") if image_event is not None else bbox_event.get("prompt")
     raw_str = str(raw_prompt) if raw_prompt is not None else ""
+    cut_plane: Literal["none", "xy", "xz"] = "none"
+    for event in events:
+        if event.get("id") == node_id and event.get("kind") == "symmetry.decision":
+            raw_cp = event.get("cut_plane")
+            if raw_cp in ("none", "xy", "xz"):
+                cut_plane = raw_cp  # type: ignore[assignment]
+            break
+    encapsulating = bbox_event.get("node_kind") == "frame"
     if raw_str.lstrip().startswith(_WRAPPED_PROMPT_PREFIX):
         image_prompt = raw_str
         subject_str = raw_str
     else:
         subject_str = raw_str
-        image_prompt = scene_context.wrap_image_prompt(subject_str, proxy_shape, bbox.size)
+        view = sym_svc.image_view_for(
+            cut_plane=cut_plane, encapsulating=bool(encapsulating),
+        )
+        image_prompt = scene_context.wrap_image_prompt(subject_str, proxy_shape, bbox.size, view=view)
     parent_id = bbox_event.get("parent_id")
     return Node(
         id=node_id,
@@ -2496,8 +3067,29 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
         proxy_shape=proxy_shape,
         orientation=orientation,
         image_prompt=image_prompt,
+        symmetry_cut_plane=cut_plane,
         parent_id=str(parent_id) if isinstance(parent_id, str) else None,
     )
+
+
+def _scene_nodes_from_library(slot_log: SlotLog) -> list[Node]:
+    """Every concrete (object/frame) node reconstructed from a cell's library log,
+    in first-seen order — the exact layout a from-scratch generated build reuses
+    (same bboxes/orientations), instead of re-running the divider. Shared by the
+    generate gate and the reuse-images fork."""
+    seen: set[str] = set()
+    nodes: list[Node] = []
+    for event in slot_log.state["events"]:
+        if event.get("kind") != "bbox" or event.get("node_kind") == "zone":
+            continue
+        node_id = event.get("id")
+        if not isinstance(node_id, str) or node_id in seen:
+            continue
+        seen.add(node_id)
+        node = _reconstruct_node(slot_log, node_id)
+        if node is not None:
+            nodes.append(node)
+    return nodes
 
 
 def _require_slot(slot_id: str) -> Slot:
@@ -3009,6 +3601,7 @@ def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
             n["origin"] = e.get("origin")
             n["dimensions"] = e.get("dimensions")
             n["proxy_shape"] = e.get("proxy_shape")
+            n["orientation"] = e.get("orientation", 0)
         elif kind in ("divider.decompose", "divider.zone_decompose"):
             children = e.get("children")
             if isinstance(children, list):
@@ -3077,6 +3670,166 @@ async def _sse(
                 return
     finally:
         slot_log.unsubscribe(q)
+
+
+# How long the regen worker blocks on in-flight builds before looping back to
+# re-drain its queue. Bounds how long a regen enqueued mid-batch waits before it
+# starts (it shouldn't wait for a prior build to finish); the worker only spins
+# this while it has builds in flight, and exits outright once idle.
+_REGEN_POLL_INTERVAL_S = 0.25
+
+
+async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
+    """Drain the cell's generated-build regeneration queue CONCURRENTLY. The worker
+    owns the generated-events log for the whole drain; `SlotLog.log()` is
+    synchronous, so concurrent items append through it atomically (unique indices,
+    no torn lines). Items run in parallel ACROSS prefab groups but are serialized
+    WITHIN a group by a per-canonical lock — so two regens that resolve to the same
+    canonical (a stray double-enqueue, or a reuse plus its canonical) can't race the
+    same files, and the second re-resolves under the lock to see the first's
+    promotion. Spawns are unbounded; the heavy work is throttled by the process-
+    global Banana / Trellis / mesh-IO / optimize semaphores. Exits when the queue is
+    empty and nothing is in flight; the next enqueue restarts it. Cancellation
+    (reset / stop / teardown) cancels in-flight builds and clears any still-queued
+    rows from the shared Trellis queue panel."""
+    key: GenKey = (run, slot_id, model_alias)
+    queue = _regen_queues.get(key)
+    if queue is None:
+        return
+    lib_log = _slot_logs.get((run, slot_id, model_alias))
+    run_id = _run_id(run, slot_id, model_alias)
+    gen_slot_id = _gen_slot_id(run, slot_id, model_alias)
+    raw_subdir = generation.GENERATED_RAW_SUBDIR
+    gen_log = SlotLog(gen_slot_id, generation.generated_events_path(RUNS_DIR, run_id))
+    gen_log.hydrate_from_disk()
+    rlog.bind(gen_log)
+    llm.set_model(MODELS[model_alias])
+    prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+    canon_locks: dict[str, asyncio.Lock] = {}
+
+    async def _process(
+        node_id: str,
+        propagate: bool,
+        backend: str,
+        op: str,
+        reuse_image: bool,
+        sym: tuple[str, bool] | None,
+    ) -> None:
+        if lib_log is None:
+            return
+        try:
+            # Pick the per-canonical lock by this node's current group, then do the
+            # real resolution + build UNDER the lock so same-group items serialize
+            # and a later one observes an earlier item's promotion.
+            canonical0, _ = prefabs.resolve_group(gen_log.state["events"], node_id)
+            async with canon_locks.setdefault(canonical0, asyncio.Lock()):
+                target = _reconstruct_node(lib_log, node_id)
+                if target is None:
+                    gen_log.log("mesh.error", id=node_id, message=f"{op}: no bbox event for node")
+                    return
+                canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
+                if propagate:
+                    build_node = _reconstruct_node(lib_log, canonical_id)
+                    if build_node is None:
+                        gen_log.log(
+                            "mesh.error", id=node_id,
+                            message=f"{op}: no bbox event for canonical {canonical_id}",
+                        )
+                        return
+                    reuses = [
+                        n for cid in reuse_ids if (n := _reconstruct_node(lib_log, cid)) is not None
+                    ]
+                else:
+                    build_node = target
+                    reuses = []
+                if op == "unsymmetrize":
+                    # Strip the symmetry mirror off the existing mesh (no AI). The
+                    # canonical is un-mirrored here; propagate re-derives its reuses
+                    # below, which read the canonical's now-`none` symmetry.applied.
+                    await generation.unsymmetrize_one(
+                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                    )
+                elif op == "symmetrize":
+                    # Mirror the existing mesh across the caller-supplied plane (no
+                    # AI). The canonical is mirrored here; propagate re-derives its
+                    # reuses below, which read the canonical's symmetry.applied
+                    # (plane + kept half) and mirror identically.
+                    cut_plane, keep_positive = sym  # type: ignore[misc]
+                    await generation.symmetrize_one(
+                        node=build_node, cut_plane=cut_plane, keep_positive=keep_positive,  # type: ignore[arg-type]
+                        runs_dir=RUNS_DIR, run_id=run_id,
+                    )
+                else:
+                    if reuse_image:
+                        # From-image rebuild: ensure the node we're building has its
+                        # raw-dir reference image. If that copy is missing (e.g. the
+                        # raw image was removed but the optimized twin survived, or a
+                        # prefab sibling still has it), restore it so we reuse the
+                        # image instead of re-generating it via the API.
+                        generation.recover_group_image(
+                            RUNS_DIR, run_id, build_node.id, [canonical_id, *reuse_ids],
+                        )
+                    await generation.regenerate_one(
+                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                        subdir=raw_subdir, optimize=True, backend=backend, generated=True,
+                        reuse_image=reuse_image,
+                    )
+                if propagate:
+                    await generation.propagate_reuses(
+                        canonical_id=canonical_id, reuses=reuses,
+                        runs_dir=RUNS_DIR, run_id=run_id,
+                    )
+                elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize"):
+                    # A reuse regenerated on its own now owns a fresh mesh + raw —
+                    # record it as canonical so a later propagate of its old source
+                    # can't clobber it. (Symmetry ops write no new raw, so they never
+                    # promote — a reuse with no own raw is skipped instead.)
+                    gen_log.log(
+                        "prefab.match", id=node_id, reuse_id="", description=build_node.prompt,
+                    )
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            gen_log.log("mesh.error", id=node_id, message=f"{type(e).__name__}: {e}")
+
+    inflight: set[asyncio.Task[None]] = set()
+    try:
+        while True:
+            # Spawn every currently-queued item; the semaphores bound the real work.
+            while True:
+                try:
+                    node_id, propagate, backend, op, reuse_image, sym = queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                # Worker owns the entry now; generate_mesh re-registers it on submit.
+                threed.unmark_queued(gen_slot_id, node_id)
+                inflight.add(asyncio.create_task(_process(node_id, propagate, backend, op, reuse_image, sym)))
+            if not inflight:
+                break
+            # Wait for a build to finish OR a short tick to elapse, then loop back
+            # to the drain — so a regen enqueued WHILE these run starts promptly
+            # (concurrently) instead of only after a prior build completes.
+            inflight = (
+                await asyncio.wait(
+                    inflight,
+                    timeout=_REGEN_POLL_INTERVAL_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+            )[1]
+    finally:
+        for t in inflight:
+            t.cancel()
+        if inflight:
+            await asyncio.gather(*inflight, return_exceptions=True)
+        # Clear any items still queued (e.g. drained early by cancellation) from
+        # the shared queue panel so they don't linger as phantom waiting rows.
+        while True:
+            try:
+                pending_id, *_ = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            threed.unmark_queued(gen_slot_id, pending_id)
+        gen_log.close()
 
 
 async def _run(run: str, slot_id: str, model_alias: str) -> None:
