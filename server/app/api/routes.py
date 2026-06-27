@@ -144,6 +144,31 @@ class Branch:
 # Branch carries its own run, so the bid-keyed endpoints need no run param.
 _branches: dict[str, Branch] = {}
 
+# --- LLM cost backfill --------------------------------------------------------
+# Pricing a call against OpenRouter's settled cost is deferred off the pipeline:
+# the /generation stats lag the completion, and a live lookup dies with a
+# restart. This sweep prices any `cache.llm` still missing its `llm.cost`, purely
+# from the durable log — so a run's spend converges to OpenRouter's actual
+# billing, restart or not, and the per-cell `pending` count it drives to zero is
+# the "all costs resolved, safe to shut down" signal.
+_COST_BACKFILL_INTERVAL_S = 20
+
+
+def _all_cost_logs() -> list[SlotLog]:
+    """Snapshot of every in-memory cell + branch log to sweep (the sweep awaits,
+    and these registries can change under it)."""
+    return [*_slot_logs.values(), *(b.log for b in _branches.values())]
+
+
+async def _cost_backfill_loop() -> None:
+    while True:
+        try:
+            await llm.backfill_costs(_all_cost_logs())
+        except Exception:
+            pass  # best-effort observability — never let the sweep die
+        await asyncio.sleep(_COST_BACKFILL_INTERVAL_S)
+
+
 _cell_gates: dict[RunKey, "CellGate"] = {}
 # Source cells currently in stepped mode (one LLM call per "step"). Mirrored
 # on disk by a `.stepped` marker in each cell dir so the mode SURVIVES a
@@ -1066,10 +1091,17 @@ def create_app() -> FastAPI:
         if run_dirs:
             _current_run = run_dirs[0].name
             _hydrate_run(_current_run)
+        # Resolve LLM costs off the pipeline, forever — including a backlog left
+        # unpriced by a prior process that exited mid-lookup (the resumed run's
+        # cells hydrate above, so this sweep recovers them).
+        cost_task = asyncio.create_task(_cost_backfill_loop())
         try:
             yield
         finally:
             rlog.suppress_console()
+            cost_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cost_task
             for slot_log in _slot_logs.values():
                 slot_log.close()
             for run_name, slot_id, model_alias in list(_slot_logs.keys()):
@@ -1296,7 +1328,9 @@ def create_app() -> FastAPI:
         user = llm.apply_model_quirks(user, model_id)
         llm.set_model(model_id)
         try:
-            _validated, reasoning, usage, raw = await llm.call_llm_once(
+            # Display-only preview: it never logs a cache.llm event, so the
+            # billed generation ids go unused (no cost is attributed to a run).
+            _validated, reasoning, usage, raw, _gen_ids = await llm.call_llm_once(
                 system=system,
                 user=user,
                 output_schema=schema_cls,
@@ -2304,22 +2338,46 @@ def _last_step(events: list[dict[str, object]]) -> dict[str, object] | None:
     return None
 
 
-def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, int]]:
-    """Per-model token + request totals from a cell's `cache.llm` events, so the
-    UI cost tracker can price the run (it applies the per-model USD rates client
-    side). Returns `{ model_id: {"in": tokens_in, "out": tokens_out, "req": n} }`
-    — a model with no logged usage still counts requests (cost shows as 0 for it
-    until a rate exists), matching the old tracker's request-only degradation."""
-    usage: dict[str, dict[str, int]] = {}
+def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, float]]:
+    """Per-model token, request, USD-cost, and unresolved-lookup totals from a
+    cell's `cache.llm` events, so the UI cost tracker can show the run's
+    authoritative spend and how much of it is still settling. Returns
+    `{ model_id: {"in": tokens_in, "out": tokens_out, "req": n, "cost": usd,
+    "pending": n} }`.
+
+    `cost` is OpenRouter's own settled `total_cost`, which lands a beat after the
+    call (its /generation stats lag the completion) as a separate `llm.cost`
+    event keyed by `generation_id` — written by the backfill sweep. We index
+    those, then attribute each to its `cache.llm` call's model — so the cost
+    lands on the right model, and a cost whose call was since dropped (a rewind
+    that raced the lookup) is ignored. `pending` counts calls carrying a
+    `generation_id` that the sweep hasn't priced yet; it drains to 0 once every
+    call is resolved (the run's spend has caught up). A call with no
+    `generation_id` (a legacy log) is neither priced nor pending — it just
+    counts as a request, matching the tracker's old request-only degradation."""
+    cost_by_gen: dict[str, float] = {}
+    for e in events:
+        if e.get("kind") != "llm.cost":
+            continue
+        gid, c = e.get("generation_id"), e.get("cost")
+        if isinstance(gid, str) and isinstance(c, (int, float)):
+            cost_by_gen[gid] = float(c)
+    usage: dict[str, dict[str, float]] = {}
     for e in events:
         if e.get("kind") != "cache.llm":
             continue
         model = str(e.get("model") or "?")
-        u = usage.setdefault(model, {"in": 0, "out": 0, "req": 0})
+        u = usage.setdefault(model, {"in": 0, "out": 0, "req": 0, "cost": 0.0, "pending": 0})
         ti, to = e.get("tokens_in"), e.get("tokens_out")
         u["in"] += int(ti) if isinstance(ti, (int, float)) else 0
         u["out"] += int(to) if isinstance(to, (int, float)) else 0
         u["req"] += 1
+        gid = e.get("generation_id")
+        if isinstance(gid, str):
+            if gid in cost_by_gen:
+                u["cost"] += cost_by_gen[gid]
+            else:
+                u["pending"] += 1
     return usage
 
 

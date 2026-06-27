@@ -209,7 +209,7 @@ async def call_llm(
                     validate(cached)
                 return cached
 
-    validated, reasoning, usage, raw = await call_llm_once(
+    validated, reasoning, usage, raw, generation_ids = await call_llm_once(
         system=system,
         user=user,
         output_schema=output_schema,
@@ -222,6 +222,12 @@ async def call_llm(
     # reasoning), and the prompt lab (template + variables). Older log lines
     # that lack the newer fields still replay correctly — the client treats
     # them as unattributed / not re-renderable.
+    #
+    # `generation_id` ties this call to OpenRouter's billing record. Its settled
+    # USD cost lags the completion (and a live lookup would die with a restart),
+    # so we DON'T resolve it here: the backfill sweep (`backfill_costs`) prices
+    # it off the log and appends a separate `llm.cost` event, which
+    # `_usage_summary` joins back by id.
     logging.log(
         "cache.llm",
         key=key,
@@ -237,6 +243,7 @@ async def call_llm(
         reasoning=reasoning,
         tokens_in=getattr(usage, "prompt_tokens", None),
         tokens_out=getattr(usage, "completion_tokens", None),
+        generation_id=generation_ids[-1] if generation_ids else None,
     )
     return validated
 
@@ -250,10 +257,12 @@ async def call_llm_once(
     validate: Callable[[T], None] | None = None,
     step: str | None = None,
     log_retries: bool = True,
-) -> tuple[T, str, object, object]:
+) -> tuple[T, str, object, object, list[str]]:
     """One structured-output call with the full resample/backoff budget,
     WITHOUT the content-addressed cache lookup or the `cache.llm` log write
-    that `call_llm` wraps around it. Returns `(validated, reasoning, usage)`.
+    that `call_llm` wraps around it. Returns
+    `(validated, reasoning, usage, raw, generation_ids)`, where
+    `generation_ids` lists every billed attempt (a resample bills each try).
 
     The prompt-tuning sandbox (`POST /llm/test`) calls this directly so a
     throwaway "what if I edited this prompt" test re-runs the exact step's
@@ -287,6 +296,11 @@ async def call_llm_once(
     # retry re-runs it too).
     ID_VALIDATION_MAX = 5
     TRANSPORT_BACKOFF = [2, 4, 8, 16, 30, 30, 30, 30]
+    # Every billed generation for this logical call, in order. A resample bills
+    # each attempt, so we collect the id of every response we received (even
+    # ones we later reject) — `call_llm` sums their costs so the run total
+    # matches what OpenRouter actually charged.
+    generation_ids: list[str] = []
     while True:
         content: object = None
         try:
@@ -321,6 +335,10 @@ async def call_llm_once(
                         "ignore": ["decart"]
                     },
                 )
+            # Recorded before parsing: this generation was billed regardless of
+            # whether its output survives validation below.
+            if getattr(response, "id", None):
+                generation_ids.append(response.id)
             message = response.choices[0].message
             content = message.content
             args = json.loads(content) if isinstance(content, str) else content
@@ -331,17 +349,18 @@ async def call_llm_once(
                 # and each resample re-runs the call fresh.
                 validate(validated)
             reasoning = getattr(message, "reasoning", None) or ""
-            # Token counts for the client's per-run spend tracker. `usage` is
-            # absent on the rare provider that omits it; cost falls back to a
-            # char-length estimate client-side. completion_tokens already
-            # includes reasoning tokens (OpenRouter bills them at the
-            # completion rate), so no separate reasoning field is needed.
+            # Token counts feed the per-call trace panels only — the run's spend
+            # is the authoritative `total_cost` `call_llm` pulls from the
+            # /generation endpoint, not derived from these. `usage` is absent on
+            # the rare provider that omits it; completion_tokens already includes
+            # reasoning tokens, so no separate reasoning field is needed.
             usage = getattr(response, "usage", None)
             # Return the raw parsed response (`args`) alongside the validated
             # model so callers can log EXACTLY what the model emitted — the wire
             # field names and values — rather than a re-serialized, attribute-
-            # named `model_dump`.
-            return validated, reasoning, usage, args
+            # named `model_dump` — plus every billed generation id so the caller
+            # can price the call against OpenRouter's settled cost.
+            return validated, reasoning, usage, args, generation_ids
         except OutputValidationError as e:
             if id_validation_attempt >= ID_VALIDATION_MAX - 1:
                 raise
@@ -388,6 +407,76 @@ async def call_llm_once(
                 raise
             _retry_log("llm.retry", reason=f"{type(e).__name__}: {str(e)[:160]}")
             parse_attempt += 1
+
+
+# Cost resolution runs OFF the pipeline: every `cache.llm` event carries its
+# `generation_id`, and a backfill sweep (driven on a timer by the API layer)
+# prices any that still lack an `llm.cost`. This survives restarts and the
+# /generation stats lagging the completion — the sweep cadence IS the retry, so
+# each lookup is a single best-effort attempt.
+_COST_FETCH_CONCURRENCY = 6
+
+
+async def fetch_generation_costs(generation_ids: Iterable[str]) -> dict[str, float]:
+    """Best-effort `GET /generation` lookup of OpenRouter's settled `total_cost`
+    for each (deduped) id, over one shared client with bounded concurrency.
+    Returns only the ids that resolved; a 404 (stats not ready yet) or transient
+    error simply omits that id, for the caller to retry on its next sweep. The
+    SDK's own retry is disabled — its default budget is an hour."""
+    ids = list(dict.fromkeys(generation_ids))
+    if not ids:
+        return {}
+    out: dict[str, float] = {}
+    sem = asyncio.Semaphore(_COST_FETCH_CONCURRENCY)
+
+    async def _one(client: OpenRouter, gid: str) -> None:
+        async with sem:
+            try:
+                res = await client.generations.get_generation_async(
+                    id=gid, retries=None, timeout_ms=30_000,
+                )
+            except (OpenRouterError, httpx.HTTPError):
+                return  # not settled yet / transient — next sweep retries
+            out[gid] = res.data.total_cost
+
+    async with OpenRouter(
+        api_key=os.environ["OPENROUTER_API_KEY"], timeout_ms=30_000,
+    ) as client:
+        await asyncio.gather(*(_one(client, gid) for gid in ids))
+    return out
+
+
+async def backfill_costs(slot_logs: Iterable[logging.SlotLog]) -> int:
+    """Price every logged-but-unpriced LLM call across the given cells: find each
+    `cache.llm` carrying a `generation_id` with no matching `llm.cost`, fetch the
+    settled cost, and append an `llm.cost` event. Idempotent and restart-proof —
+    it reads only the durable log, so a call left unpriced by a slow stat or a
+    live lookup killed mid-flight is recovered on a later pass. Returns the count
+    priced this pass."""
+    # Resolve the pending set up front: the fetch awaits, and the pipeline keeps
+    # appending to these same logs meanwhile — anything new is caught next pass.
+    pending: list[tuple[logging.SlotLog, str]] = []
+    for sl in slot_logs:
+        events = sl.state["events"]
+        resolved = {
+            e.get("generation_id") for e in events if e.get("kind") == "llm.cost"
+        }
+        for e in events:
+            if e.get("kind") != "cache.llm":
+                continue
+            gid = e.get("generation_id")
+            if isinstance(gid, str) and gid not in resolved:
+                pending.append((sl, gid))
+    if not pending:
+        return 0
+    costs = await fetch_generation_costs(gid for _, gid in pending)
+    priced = 0
+    for sl, gid in pending:
+        cost = costs.get(gid)
+        if cost is not None:
+            sl.log("llm.cost", generation_id=gid, cost=cost)
+            priced += 1
+    return priced
 
 
 async def chat(

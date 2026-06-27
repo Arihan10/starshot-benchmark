@@ -1,26 +1,14 @@
-// Per-run LLM spend tracker. Every billable call is a `cache.llm` event; the
-// server sums each cell's tokens per model into the slots payload (`usage`), and
-// we price them here with OpenRouter's published per-token rates — surfacing
-// each slot's cost AND the run's accumulative total in a collapsible top-bar
-// pill. Live: it re-renders on every slots poll.
+// Per-run LLM spend tracker. Every billable call logs a `cache.llm` event with
+// its OpenRouter `generation_id`; a server-side backfill sweep prices each
+// against OpenRouter's settled `total_cost` (caching discounts and all) and the
+// per-model sums land in the slots payload (`usage.cost`) — so this pill matches
+// OpenRouter's activity log. Cost settles a beat after each call, so the pill
+// also shows how many are still `resolving`; when that hits 0 the run's spend has
+// fully caught up (and it's safe to shut the server down without losing any).
+// Collapsible top-bar pill, re-rendered on every slots poll.
 
 import { state, on } from "./state.js";
 import { el } from "./ui.js";
-
-// USD per token (prompt / completion), keyed by the OpenRouter model id stamped
-// on each cache.llm event. Source: OpenRouter model catalog. A model missing
-// here costs 0 but still counts requests, so a newly-added model degrades to a
-// request-only row until its rate is filled in.
-const MODEL_PRICING = {
-  "google/gemini-3.5-flash":       { in: 0.0000015,  out: 0.000009 },
-  "google/gemini-3.1-flash-lite":  { in: 0.00000025, out: 0.0000015 },
-  "google/gemini-3.1-pro-preview": { in: 0.000002,   out: 0.000012 },
-  "openai/gpt-5.5":                { in: 0.000005,    out: 0.00003 },
-  "anthropic/claude-opus-4.6":     { in: 0.000005,    out: 0.000025 },
-  "anthropic/claude-opus-4.8":     { in: 0.000005,    out: 0.000025 },
-  "anthropic/claude-fable-latest": { in: 0.000005,    out: 0.000025 }, // claude-family estimate
-  "deepseek/deepseek-v4-pro":      { in: 0.000000435, out: 0.00000087 },
-};
 
 let trackerEl = null;
 let pillSummaryEl = null;
@@ -31,16 +19,20 @@ const fmtCost = (v) => {
   return v >= 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(4)}`;
 };
 
-// Cost + request count for one cell's per-model usage map ({model: {in,out,req}}).
+// Authoritative cost + request + unresolved-lookup counts for one cell's
+// per-model usage map ({model: {in, out, req, cost, pending}}). `cost` is
+// OpenRouter's settled USD already summed server-side; `pending` is how many of
+// this cell's calls the backfill hasn't priced yet. We just total across models.
 function cellCost(usage) {
   let cost = 0;
   let req = 0;
-  for (const [model, u] of Object.entries(usage || {})) {
-    const p = MODEL_PRICING[model];
-    if (p) cost += (u.in || 0) * p.in + (u.out || 0) * p.out;
+  let pending = 0;
+  for (const u of Object.values(usage || {})) {
+    cost += u.cost || 0;
     req += u.req || 0;
+    pending += u.pending || 0;
   }
-  return { cost, req };
+  return { cost, req, pending };
 }
 
 function costRow(label, count, cost, cls) {
@@ -66,9 +58,10 @@ function renderCost() {
   const bySlot = new Map(); // slotId -> { rows: [{model, cost, req}], cost, req }
   let totalCost = 0;
   let totalReq = 0;
+  let totalPending = 0;
   for (const s of state.slots) {
     for (const [model, c] of Object.entries(s.runs || {})) {
-      const { cost, req } = cellCost(c?.usage);
+      const { cost, req, pending } = cellCost(c?.usage);
       if (req === 0) continue;
       let g = bySlot.get(s.id);
       if (!g) { g = { rows: [], cost: 0, req: 0 }; bySlot.set(s.id, g); }
@@ -77,9 +70,13 @@ function renderCost() {
       g.req += req;
       totalCost += cost;
       totalReq += req;
+      totalPending += pending;
     }
   }
-  pillSummaryEl.textContent = `${fmtCost(totalCost)} · ${totalReq} req`;
+  // `resolving` = calls OpenRouter hasn't settled the cost of yet; 0 ⇒ the run's
+  // spend has fully caught up (the shutdown-safe signal).
+  pillSummaryEl.textContent =
+    `${fmtCost(totalCost)} · ${totalReq} req` + (totalPending ? ` · ${totalPending} resolving` : "");
   dropdownEl.textContent = "";
   if (bySlot.size === 0) {
     dropdownEl.appendChild(el("div", { class: "cost-empty", text: "no LLM requests yet on this run" }));
@@ -95,6 +92,10 @@ function renderCost() {
   }
   dropdownEl.appendChild(el("div", { class: "cost-divider" }));
   dropdownEl.appendChild(costRow("run total", totalReq, totalCost, "cost-total"));
+  if (totalPending) {
+    dropdownEl.appendChild(el("div", { class: "cost-empty", text:
+      `${totalPending} call${totalPending === 1 ? "" : "s"} still resolving — total rises as OpenRouter settles them` }));
+  }
 }
 
 export function initCost() {
