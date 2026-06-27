@@ -765,6 +765,7 @@ export function createTourCapture(deps) {
 					forward,
 					reason: typeof a.reason === "string" ? a.reason : undefined,
 					name: typeof a.name === "string" ? a.name : undefined,
+					zone: typeof a.zone === "string" ? a.zone : undefined,
 				});
 			}
 
@@ -816,6 +817,9 @@ export function createTourCapture(deps) {
 					typeof plan.reasoning === "string" ? plan.reasoning : null,
 				panos: panoMeta,
 				minimaps,
+				// Pass the planner's cross-zone connectors through verbatim so they
+				// persist in tour.json (the prod client accepts them, unused for now).
+				connectors: Array.isArray(plan.connectors) ? plan.connectors : [],
 			};
 			const manRes = await fetch(
 				new URL(`${cell.base}/tour/manifest?${cell.run}`, serverUrl).toString(),

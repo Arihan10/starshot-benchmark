@@ -8,6 +8,7 @@ import { loadPanoTexture } from "./loaders";
 export type PanoEntry = {
 	id: string;
 	name?: string;
+	zone?: string; // which manifest zone this capture sits in (connector travel)
 	position: [number, number, number];
 	forward?: [number, number, number];
 	url: string;

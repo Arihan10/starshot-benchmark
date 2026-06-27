@@ -35,6 +35,7 @@ import json
 import mimetypes
 import os
 import re
+import shutil
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -403,6 +404,10 @@ def create_app() -> FastAPI:
     async def orbit_js() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
         return FileResponse(STATIC_DIR / "orbit.js", media_type="text/javascript")
 
+    @app.get("/tours-manage")
+    async def tours_manage_page() -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+        return FileResponse(STATIC_DIR / "tours.html", media_type="text/html")
+
     @app.get("/scenes")
     async def scenes() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]
         """Every generated cell (run/slot/model) with raw meshes to bake, newest
@@ -511,6 +516,18 @@ def create_app() -> FastAPI:
                     continue
         items.sort(key=lambda x: x["mtime"], reverse=True)
         return {"tours": items}
+
+    @app.delete("/tours/{run}/{slot}/{model}")
+    async def delete_tour(run: str, slot: str, model: str) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        """Delete one cell's LOCAL tour/ directory (tour.json + panos + proxy +
+        minimaps). Leaves the rest of the cell (generated meshes, events) intact,
+        and never touches an already-published R2/D1 copy."""
+        run, slot, model = _safe_cell_part(run), _safe_cell_part(slot), _safe_cell_part(model)
+        tour_dir = RUNS_DIR / run / slot / model / "tour"
+        if not tour_dir.is_dir():
+            raise HTTPException(404, "no local tour for this cell")
+        shutil.rmtree(tour_dir, ignore_errors=True)
+        return {"ok": True}
 
     @app.get("/phrases")
     async def phrases() -> dict[str, Any]:  # pyright: ignore[reportUnusedFunction]

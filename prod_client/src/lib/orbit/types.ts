@@ -28,6 +28,14 @@ export type MinimapLevel = {
 	bounds: MinimapBounds;
 };
 
+// A cross-zone connector (door / stair / ...). `id` matches a proxy object's
+// name; clicking that object traverses between `starting_zone` and `target_zone`.
+export type Connector = {
+	id: string;
+	target_zone: string;
+	starting_zone: string;
+};
+
 // tour.json: capture points (panos) in the shared world frame, plus an optional
 // low-poly proxy GLB the panos project onto. Paths are relative to tour.json.
 export type TourManifest = {
@@ -37,9 +45,14 @@ export type TourManifest = {
 		forward?: [number, number, number];
 		file: string;
 		name?: string; // POI label from the anchor namer; absent for unnamed anchors
+		zone?: string; // the zone this capture point belongs to (assigned server-side)
 	}>;
 	proxy?: string;
 	minimaps?: MinimapLevel[];
+	// Cross-zone connectors from the anchor planner (doors, stairs, ...): each
+	// names an object `id`, the `starting_zone` it sits in, and the `target_zone`
+	// it leads into. The matching proxy object is highlighted + click-to-traverse.
+	connectors?: Connector[];
 };
 
 export type OrbitMode =

@@ -11,10 +11,6 @@ import type { OrbitState } from "./types";
 
 const _ndc = new Vector2();
 
-// Proxy parts whose name calls out a door or a stair are pinned to the orange
-// outline as a permanent wayfinding cue (see ObjectAddressing.pinOutlinesByName).
-const PINNED_OUTLINE_RE = /door|stair/i;
-
 // The addressable objects of a loaded root. The exporter/loader can wrap the
 // real objects under a single node, so unwrap single unnamed non-mesh wrappers,
 // then take that container's mesh-bearing children. Fall back to "every mesh"
@@ -46,16 +42,18 @@ export function collectObjects(root: Object3D): Object3D[] {
 	return objs;
 }
 
-// Per-object addressing for a loaded root (lite + proxy): hover (cyan), hide,
-// and persistent outline (orange), plus the right-click menu state. The two
-// OutlinePasses live here and are handed to the engine's composer; the engine
-// owns emit() and decides which root is addressable (passed into pick/open).
+// Per-object addressing for a loaded root (lite + proxy): hover (cyan outline),
+// hide, right-click outline (orange), and pinned connectors (orange outline +
+// translucent fill), plus the right-click menu state. The three OutlinePasses
+// live here and are handed to the engine's composer; the engine owns emit() and
+// decides which root is addressable (passed into pick/open).
 export class ObjectAddressing {
 	private readonly picker = new Raycaster();
 	private readonly hiddenObjects = new Set<Object3D>();
 	private readonly outlinedObjects = new Set<Object3D>();
 	// Objects pinned to the orange outline regardless of hover / right-click —
-	// populated by pinOutlinesByName, dropped only by reset().
+	// populated by pinConnectors, dropped only by reset(). These (cross-zone
+	// connectors) are the only highlight that also gets a translucent fill (fillPass).
 	private readonly pinnedOutlines = new Set<Object3D>();
 	private hoveredObj: Object3D | null = null;
 	private menuTarget: Object3D | null = null;
@@ -63,14 +61,17 @@ export class ObjectAddressing {
 
 	readonly selectPass: OutlinePass;
 	readonly hoverPass: OutlinePass;
+	// Pinned connectors: the same orange outline as selectPass, plus an interior fill.
+	readonly fillPass: OutlinePass;
 
 	constructor(
 		scene: Scene,
 		private readonly camera: PerspectiveCamera,
 		private readonly canvas: HTMLCanvasElement,
 	) {
-		this.selectPass = makeOutlinePass(scene, camera, 0xffa23a, 4, 2);
-		this.hoverPass = makeOutlinePass(scene, camera, 0x66e0ff, 3, 1.5);
+		this.selectPass = makeOutlinePass(scene, camera, 0xffa23a, 4, 2, 0);
+		this.hoverPass = makeOutlinePass(scene, camera, 0x66e0ff, 3, 1.5, 0);
+		this.fillPass = makeOutlinePass(scene, camera, 0xffa23a, 4, 2, 0.6);
 	}
 
 	register(root: Object3D) {
@@ -81,14 +82,19 @@ export class ObjectAddressing {
 		});
 	}
 
-	// Permanently orange-outline every object in `root` whose label names a door
-	// or a stair. These outlines ignore the hover toggle and survive
+	// Permanently orange-outline + fill the proxy objects named by `ids` (the
+	// manifest's cross-zone connectors), matched case-insensitively against each
+	// object's label. These highlights ignore the hover toggle and survive
 	// clearOutlines / the right-click menu — only reset() drops them. Call after
 	// register() so objLabel is populated.
-	pinOutlinesByName(root: Object3D) {
+	pinConnectors(root: Object3D, ids: string[]) {
+		const want = new Set(ids.map((s) => s.trim().toLowerCase()));
+		if (want.size === 0) return;
 		collectObjects(root).forEach((o) => {
-			if (PINNED_OUTLINE_RE.test((o.userData.objLabel as string) ?? ""))
-				this.pinnedOutlines.add(o);
+			const label = ((o.userData.objLabel as string) ?? "")
+				.trim()
+				.toLowerCase();
+			if (want.has(label)) this.pinnedOutlines.add(o);
 		});
 	}
 
@@ -135,12 +141,16 @@ export class ObjectAddressing {
 		return null;
 	}
 
-	// Feed the live hover / selection sets to the two outline passes (run every
-	// frame from tick). Selection (orange) wins over hover (cyan) for an object
-	// that's both, and hidden objects are dropped; an empty list is a no-op pass.
+	// Feed the live hover / selection sets to the three outline passes (run every
+	// frame from tick). Pinned connectors go to the orange fill pass; other
+	// right-click outlines to the plain orange pass; the hovered object to the cyan
+	// pass. A pinned/outlined object never also hover-outlines, and hidden objects
+	// are dropped; an empty list is a no-op pass.
 	updateOutlines() {
+		const filled: Object3D[] = [];
+		for (const o of this.pinnedOutlines) if (o.visible) filled.push(o);
+		this.fillPass.selectedObjects = filled;
 		const selected: Object3D[] = [];
-		for (const o of this.pinnedOutlines) if (o.visible) selected.push(o);
 		for (const o of this.outlinedObjects)
 			if (o.visible && !this.pinnedOutlines.has(o)) selected.push(o);
 		this.selectPass.selectedObjects = selected;
@@ -157,11 +167,7 @@ export class ObjectAddressing {
 	// Right-click an object → per-object menu (hide / outline). Right-clicking
 	// empty space still surfaces the recovery actions (you can't re-pick a hidden
 	// object), but only if there's something to recover.
-	openMenu(
-		clientX: number,
-		clientY: number,
-		root: Object3D | null,
-	) {
+	openMenu(clientX: number, clientY: number, root: Object3D | null) {
 		const obj = this.pickAt(clientX, clientY, root);
 		if (
 			!obj &&
@@ -257,11 +263,34 @@ function makeOutlinePass(
 	color: number,
 	edgeStrength: number,
 	edgeThickness: number,
+	fillStrength: number,
 ): OutlinePass {
 	const pass = new OutlinePass(new Vector2(1, 1), scene, camera);
 	pass.visibleEdgeColor.set(color);
 	pass.hiddenEdgeColor.set(0x000000);
 	pass.edgeStrength = edgeStrength;
 	pass.edgeThickness = edgeThickness;
+	// Patch the stock overlay shader (no vendoring) to also tint the visible
+	// silhouette: in the mask r=0 inside the object and g=0 where it's unoccluded,
+	// so (1-r)(1-g) is the visible interior, scaled by fillStrength (0 = no fill,
+	// leaving a plain outline pass byte-for-byte unchanged).
+	const overlay = pass.overlayMaterial;
+	overlay.uniforms.fillColor = { value: pass.visibleEdgeColor };
+	overlay.uniforms.fillStrength = { value: fillStrength };
+	overlay.fragmentShader = overlay.fragmentShader
+		.replace(
+			"uniform bool usePatternTexture;",
+			`uniform bool usePatternTexture;
+			uniform vec3 fillColor;
+			uniform float fillStrength;`,
+		)
+		.replace(
+			"gl_FragColor = finalColor;",
+			`float fillInside = fillStrength * (1.0 - maskColor.r) * (1.0 - maskColor.g);
+			finalColor.rgb += fillColor * fillInside;
+			finalColor.a += fillInside;
+			gl_FragColor = finalColor;`,
+		);
+	overlay.needsUpdate = true;
 	return pass;
 }

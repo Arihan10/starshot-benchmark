@@ -35,6 +35,7 @@ export const ANCHOR_RING_OCCLUDED_OPACITY = 0.6; // translucent so the hover-to-
 export const ANCHOR_RING_OCCLUDED_SCALE = 1.5; // larger than the white rings, for visibility
 export const CAPTURE_EYE_HEIGHT = 1.6; // panos are shot at eye height; floor sits this far below
 export const PEEK_ROTATE_SPEED = 0.5; // rad/s the dollhouse spins while locating
+export const LOCATE_SLICE_ABOVE_EYE = 0.3; // m above the camera/eye height where hold-to-locate slices the scene — just over your head, dropping the ceiling/roof to open the room
 export const WASD_MAX_Y_STEP = 2.0; // m: max |Δy| a WASD step will cross (blocks floor hops)
 export const WASD_MAX_STEP = 24.0; // m: furthest a single WASD step will travel (XZ distance)
 export const WASD_DIR_COS = Math.SQRT1_2; // cos(45°): WASD takes the nearest anchor in a quadrant-wide cone

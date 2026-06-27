@@ -12,6 +12,7 @@ import {
 	type Object3D,
 	NoToneMapping,
 	PerspectiveCamera,
+	Plane,
 	type Quaternion,
 	Raycaster,
 	Scene,
@@ -37,6 +38,7 @@ import {
 } from "./materials";
 import {
 	ENTRY_AIM_PX,
+	LOCATE_SLICE_ABOVE_EYE,
 	PEEK_ROTATE_SPEED,
 	pickByScreen,
 	WASD_DIR_COS,
@@ -56,7 +58,13 @@ import {
 	lookTargetFrom,
 	pinLook,
 } from "./look";
-import type { OrbitMode, OrbitState, TourManifest, TourSource } from "./types";
+import type {
+	Connector,
+	OrbitMode,
+	OrbitState,
+	TourManifest,
+	TourSource,
+} from "./types";
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 const easeInOut = (t: number) =>
@@ -110,9 +118,9 @@ export class OrbitEngine {
 	private readonly controls: OrbitControls;
 	private readonly ro: ResizeObserver;
 
-	// Post-processing: the beauty pass plus two OutlinePasses (owned by
-	// ObjectAddressing) that silhouette the selected (orange) / hovered (cyan)
-	// objects, then a copy to screen.
+	// Post-processing: the beauty pass plus three OutlinePasses (owned by
+	// ObjectAddressing) that silhouette the pinned connectors (orange + fill) /
+	// right-click selected (orange) / hovered (cyan) objects, then a copy to screen.
 	private readonly composer: EffectComposer;
 
 	private readonly sphereA: Mesh;
@@ -158,6 +166,10 @@ export class OrbitEngine {
 	// One matte material per proxy object so the bare proxy reads as distinct
 	// parts; reskinProxy's matte path swaps these in, clearScene disposes them.
 	private proxyColorMats: Material[] = [];
+	// Cross-zone connectors from the manifest; their proxy objects are highlighted
+	// and click-to-traverse between zones (see travelThroughConnector). Empty when
+	// the scene has none.
+	private connectors: Connector[] = [];
 	private rcDownX = 0;
 	private rcDownY = 0;
 
@@ -185,6 +197,11 @@ export class OrbitEngine {
 	private interiorBusy = false;
 	private savedInterior: SavedInterior | null = null;
 	private peekHeld = false;
+	// Hold-to-locate slice: a world-space horizontal plane (normal pointing down)
+	// installed globally on the renderer while peeking, so everything above the
+	// cut height is removed — the roof / any floor overhead drops away and you see
+	// into the room you're standing in. Cleared on the way back / on scene swaps.
+	private readonly locateClip = new Plane(new Vector3(0, -1, 0), 0);
 
 	private hoveredTargetIndex = -1;
 	private hoveredEntryIndex = -1;
@@ -312,12 +329,13 @@ export class OrbitEngine {
 		// composite matches the direct-render look: the pano / projection shaders
 		// aren't colour-managed, so a linear buffer + OutputPass would re-encode
 		// (shift) their colours — an sRGB buffer copied verbatim avoids that while
-		// keeping MSAA. RenderPass → select outline → hover outline → copy to screen.
+		// keeping MSAA. RenderPass → fill → select outline → hover outline → copy.
 		const composerRT = new WebGLRenderTarget(1, 1, { samples: 4 });
 		composerRT.texture.colorSpace = SRGBColorSpace;
 		this.composer = new EffectComposer(this.renderer, composerRT);
 		this.composer.setPixelRatio(this.renderer.getPixelRatio());
 		this.composer.addPass(new RenderPass(this.scene, this.camera));
+		this.composer.addPass(this.addressing.fillPass);
 		this.composer.addPass(this.addressing.selectPass);
 		this.composer.addPass(this.addressing.hoverPass);
 		this.composer.addPass(new ShaderPass(CopyShader));
@@ -566,6 +584,18 @@ export class OrbitEngine {
 		this.dragging = false;
 		this.canvas.style.cursor = "";
 		if (this.dragMoved >= 5 || this.interiorBusy) return;
+		// A click on a highlighted connector object walks through it to the adjacent
+		// zone (target ↔ starting), taking priority over the usual anchor pick.
+		const hit = this.proxyGroup
+			? this.addressing.pickAt(ev.clientX, ev.clientY, this.proxyGroup)
+			: null;
+		if (hit) {
+			const connector = this.connectorFor(hit);
+			if (connector) {
+				this.travelThroughConnector(connector, hit);
+				return;
+			}
+		}
 		// Click a ring to go straight there: a gold behind-wall marker, or a visible
 		// white ring (both draw over / sit in the scene, so a screen-space pick is
 		// what matches what you see). Off the rings, fall back to auto-aim's
@@ -721,6 +751,43 @@ export class OrbitEngine {
 	private autoAimTravel(clientX: number, clientY: number) {
 		const hit = this.raycastInterior(clientX, clientY);
 		if (hit) this.travelTo(this.nearestPanoTo(hit.point));
+	}
+
+	// The connector whose `id` names the clicked proxy object (matched against its
+	// addressing label, case-insensitively), or null if it isn't a connector.
+	private connectorFor(obj: Object3D): Connector | null {
+		const label = ((obj.userData.objLabel as string) ?? "")
+			.trim()
+			.toLowerCase();
+		return (
+			this.connectors.find((c) => c.id.trim().toLowerCase() === label) ??
+			null
+		);
+	}
+
+	// Walk through a connector: if we're not already in its target_zone, go to the
+	// closest capture in target_zone to the connector; otherwise back to the
+	// closest one in starting_zone. "Closest" is world distance to the object's
+	// bbox center. A no-op if that zone has no captures.
+	private travelThroughConnector(connector: Connector, obj: Object3D) {
+		if (this.interiorBusy || this.currentIndex < 0) return;
+		const here = this.panos[this.currentIndex].zone;
+		const destZone =
+			here === connector.target_zone
+				? connector.starting_zone
+				: connector.target_zone;
+		const at = new Box3().setFromObject(obj).getCenter(new Vector3());
+		let best = -1;
+		let bestD = Infinity;
+		for (let i = 0; i < this.panos.length; i++) {
+			if (this.panos[i].zone !== destZone) continue;
+			const d = at.distanceToSquared(v3(this.panos[i].position));
+			if (d < bestD) {
+				bestD = d;
+				best = i;
+			}
+		}
+		if (best >= 0) this.travelTo(best);
 	}
 
 	// Place the surface cursor each frame (runs in tick, so it follows both pointer
@@ -1216,6 +1283,12 @@ export class OrbitEngine {
 		};
 		const userPos = this.currentUserWorldPos();
 		this.markers.positionYouMarker(userPos);
+		// Slice the scene flat just above the camera/eye height (userPos is the eye),
+		// dropping the ceiling / roof and anything overhead so the room you're in is
+		// open from above. The plane is world-space, so it stays a clean horizontal
+		// cut as the dollhouse camera orbits.
+		this.locateClip.constant = userPos.y + LOCATE_SLICE_ABOVE_EYE;
+		this.renderer.clippingPlanes = [this.locateClip];
 		const flat = userPos.clone().sub(this.sceneCenter);
 		flat.y = 0;
 		if (flat.lengthSq() < 1e-6) flat.set(0, 0, 1);
@@ -1223,7 +1296,9 @@ export class OrbitEngine {
 		const toPos = this.sceneCenter
 			.clone()
 			.addScaledVector(flat, this.sceneMaxDim * 1.5);
-		toPos.y += this.sceneMaxDim * 0.6;
+		// Raised vantage (was 0.6) so the camera looks down through the cut into the
+		// opened room rather than side-on across the rooftops.
+		toPos.y += this.sceneMaxDim * 1.2;
 		this.startFly(toPos, this.sceneCenter.clone(), 850, {
 			onMid: () => {
 				this.setPeekView();
@@ -1240,6 +1315,8 @@ export class OrbitEngine {
 
 	private peekEnd() {
 		if (this.mode !== "peek" || !this.savedInterior) return;
+		// Seal the scene back up as we drop in — the slice is locate-only.
+		this.renderer.clippingPlanes = [];
 		const s = this.savedInterior;
 		this.startFly(s.pos.clone(), lookTargetFrom(s.pos, s.lon, s.lat), 800, {
 			onMid: () => {
@@ -1310,6 +1387,7 @@ export class OrbitEngine {
 		this.proxyColorMats = [];
 		this.projection.clearBase(this.scene);
 		this.streamer.reset();
+		this.connectors = [];
 		this.minimaps = [];
 		this.panoLevel = [];
 		this.minimapPrefetch = [];
@@ -1324,6 +1402,7 @@ export class OrbitEngine {
 		this.interiorBusy = false;
 		this.peekHeld = false;
 		this.savedInterior = null;
+		this.renderer.clippingPlanes = []; // drop any active locate slice
 		this.hoveredEntryIndex = -1;
 		this.hoveredTargetIndex = -1;
 		// Reset per-object addressing; the old nodes are disposed with the roots.
@@ -1379,6 +1458,7 @@ export class OrbitEngine {
 				return {
 					id: p.id,
 					name: p.name,
+					zone: p.zone,
 					position: p.position,
 					forward: p.forward,
 					url,
@@ -1389,6 +1469,11 @@ export class OrbitEngine {
 					requested: false,
 				};
 			});
+
+			const connectors =
+				manifest && Array.isArray(manifest.connectors)
+					? manifest.connectors
+					: [];
 
 			let proxyRoot: Group | null = null;
 			if (manifest?.proxy) {
@@ -1409,7 +1494,7 @@ export class OrbitEngine {
 				}
 			}
 			if (token !== this.loadToken || this.disposed) return;
-			this.applyScene(entries, proxyRoot, lite);
+			this.applyScene(entries, proxyRoot, lite, connectors);
 		} catch (e) {
 			if (token !== this.loadToken || this.disposed) return;
 			this.mode = "empty";
@@ -1427,7 +1512,9 @@ export class OrbitEngine {
 		entries: PanoEntry[],
 		proxyRoot: Group | null,
 		lite: Group | null,
+		connectors: Connector[],
 	) {
+		this.connectors = connectors;
 		this.streamer.reset(entries);
 		this.panoLevel = entries.map((p) =>
 			levelForY(this.minimaps, p.position[1]),
@@ -1460,8 +1547,12 @@ export class OrbitEngine {
 		if (this.liteRoot) this.addressing.register(this.liteRoot);
 		if (this.proxyGroup) {
 			this.addressing.register(this.proxyGroup);
-			// Doors / stairs in the proxy stay permanently orange-outlined.
-			this.addressing.pinOutlinesByName(this.proxyGroup);
+			// Connector objects (doors, stairs, ...) named by the manifest get the
+			// permanent orange outline + fill, and become click-to-traverse.
+			this.addressing.pinConnectors(
+				this.proxyGroup,
+				this.connectors.map((c) => c.id),
+			);
 			this.colorProxyObjects();
 			// Give proxy floor leaks an opaque backing (a base under its footprint).
 			this.projection.buildBase(this.proxyGroup, this.scene);

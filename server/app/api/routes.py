@@ -878,16 +878,19 @@ def create_app() -> FastAPI:
         if not nodes:
             raise HTTPException(400, "scene has no placed nodes to plan anchors from")
         try:
-            plan, reasoning, names = await anchors_svc.generate_anchors(nodes)
+            anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
         except Exception as e:  # surface provider failures as 502
             raise HTTPException(502, f"{type(e).__name__}: {e}") from e
         return {
-            # `id` is the anchor's list index — the join key the namer echoed
-            # back; `name` is None for any anchor the namer skipped.
+            # `id` is the anchor's aggregate list index — the join key the namer
+            # echoed back; `name` is None for any anchor the namer skipped.
             "anchors": [
                 {"id": i, "name": names.get(i), **a.model_dump()}
-                for i, a in enumerate(plan.anchors)
+                for i, a in enumerate(anchors)
             ],
+            # Objects that transition out of their zone, each naming the zone it
+            # leads into (doors, stairs + their handrails/supports, …).
+            "connectors": [c.model_dump() for c in connectors],
             "reasoning": reasoning,
             "model": anchors_svc.ANCHOR_PLANNER_MODEL,
             "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,

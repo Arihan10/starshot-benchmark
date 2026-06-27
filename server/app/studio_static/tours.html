@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>tour manager</title>
+		<style>
+			:root { color-scheme: dark; }
+			* { box-sizing: border-box; }
+			body {
+				margin: 0;
+				padding: 24px;
+				font: 14px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+				background: #0c0d10;
+				color: #d7dae0;
+			}
+			h1 { font-size: 16px; font-weight: 600; margin: 0 0 4px; }
+			.sub { color: #7f8794; font-size: 12px; margin: 0 0 20px; }
+			#status { min-height: 18px; margin-bottom: 12px; color: #8a93a0; }
+			table { width: 100%; border-collapse: collapse; }
+			th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid #1c1e24; vertical-align: middle; }
+			th { color: #7f8794; font-weight: 500; font-size: 12px; }
+			td.id { color: #eaecf0; }
+			.muted { color: #7f8794; }
+			.badge { font-size: 11px; padding: 1px 6px; border-radius: 4px; background: #1c1e24; color: #9aa7b4; }
+			.badge.ok { background: #143018; color: #69db7c; }
+			button {
+				font: inherit;
+				font-size: 12px;
+				cursor: pointer;
+				border: 1px solid #2a2d35;
+				background: #16181d;
+				color: #d7dae0;
+				border-radius: 5px;
+				padding: 4px 10px;
+			}
+			button:hover:not(:disabled) { border-color: #3a3f49; }
+			button:disabled { opacity: 0.5; cursor: default; }
+			button.danger:hover:not(:disabled) { border-color: #e03131; color: #ff8787; }
+			a { color: #74b9ff; text-decoration: none; }
+			a:hover { text-decoration: underline; }
+			.msg { font-size: 11px; margin-left: 8px; }
+			.msg.ok { color: #69db7c; }
+			.msg.err { color: #ff8787; }
+			.empty { color: #7f8794; padding: 24px 0; }
+		</style>
+	</head>
+	<body>
+		<h1>tour manager</h1>
+		<p class="sub">
+			tours found under <code>STARSHOT_RUNS_DIR</code> — upload one to Cloudflare
+			(R2 + D1) or delete its local copy.
+		</p>
+		<div id="status">loading…</div>
+		<table id="tbl" hidden>
+			<thead>
+				<tr>
+					<th>run / slot / model</th>
+					<th>panos</th>
+					<th>proxy</th>
+					<th>updated</th>
+					<th></th>
+				</tr>
+			</thead>
+			<tbody id="rows"></tbody>
+		</table>
+		<div id="empty" class="empty" hidden>no tours found.</div>
+
+		<script>
+			const statusEl = document.getElementById("status");
+			const tbl = document.getElementById("tbl");
+			const rowsEl = document.getElementById("rows");
+			const emptyEl = document.getElementById("empty");
+
+			const cell = (t) =>
+				`${encodeURIComponent(t.run)}/${encodeURIComponent(t.slot)}/${encodeURIComponent(t.model)}`;
+			const fmtTime = (s) => new Date(s * 1000).toLocaleString();
+
+			async function load() {
+				statusEl.textContent = "loading…";
+				let tours = [];
+				try {
+					const res = await fetch("/tours");
+					if (!res.ok) throw new Error(`/tours → ${res.status}`);
+					tours = (await res.json()).tours ?? [];
+				} catch (e) {
+					statusEl.textContent = `failed to load: ${e.message}`;
+					return;
+				}
+				rowsEl.replaceChildren();
+				for (const t of tours) rowsEl.appendChild(renderRow(t));
+				statusEl.textContent = `${tours.length} tour${tours.length === 1 ? "" : "s"}`;
+				tbl.hidden = tours.length === 0;
+				emptyEl.hidden = tours.length !== 0;
+			}
+
+			function renderRow(t) {
+				const tr = document.createElement("tr");
+
+				const id = document.createElement("td");
+				id.className = "id";
+				const link = document.createElement("a");
+				link.href = `/pano?tour=${encodeURIComponent(t.url)}`;
+				link.target = "_blank";
+				link.rel = "noopener";
+				link.textContent = `${t.run} / ${t.slot} / ${t.model}`;
+				id.appendChild(link);
+
+				const panos = document.createElement("td");
+				panos.className = "muted";
+				panos.textContent = t.panos;
+
+				const proxy = document.createElement("td");
+				const badge = document.createElement("span");
+				badge.className = t.has_proxy ? "badge ok" : "badge";
+				badge.textContent = t.has_proxy ? "yes" : "no";
+				proxy.appendChild(badge);
+
+				const updated = document.createElement("td");
+				updated.className = "muted";
+				updated.textContent = fmtTime(t.mtime);
+
+				const actions = document.createElement("td");
+				const upBtn = document.createElement("button");
+				upBtn.textContent = "⬆ upload to cloudflare";
+				const delBtn = document.createElement("button");
+				delBtn.className = "danger";
+				delBtn.textContent = "🗑 delete local";
+				const msg = document.createElement("span");
+				msg.className = "msg";
+				actions.append(upBtn, " ", delBtn, msg);
+
+				upBtn.addEventListener("click", () => upload(t, [upBtn, delBtn], msg));
+				delBtn.addEventListener("click", () => remove(t, [upBtn, delBtn], msg, tr));
+
+				tr.append(id, panos, proxy, updated, actions);
+				return tr;
+			}
+
+			async function upload(t, btns, msg) {
+				btns.forEach((b) => (b.disabled = true));
+				msg.className = "msg muted";
+				msg.textContent = "uploading…";
+				try {
+					const res = await fetch(`/publish/${cell(t)}`, { method: "POST" });
+					const data = await res.json().catch(() => ({}));
+					if (!res.ok) throw new Error(data.detail ?? `publish → ${res.status}`);
+					msg.className = "msg ok";
+					msg.textContent = `✓ uploaded (${data.pano_count ?? t.panos} panos)`;
+				} catch (e) {
+					msg.className = "msg err";
+					msg.textContent = `✗ ${e.message}`;
+				} finally {
+					btns.forEach((b) => (b.disabled = false));
+				}
+			}
+
+			async function remove(t, btns, msg, tr) {
+				if (
+					!confirm(
+						`Delete the LOCAL tour for ${t.run}/${t.slot}/${t.model}?\n` +
+							"Any copy already on Cloudflare is left untouched.",
+					)
+				)
+					return;
+				btns.forEach((b) => (b.disabled = true));
+				msg.className = "msg muted";
+				msg.textContent = "deleting…";
+				try {
+					const res = await fetch(`/tours/${cell(t)}`, { method: "DELETE" });
+					const data = await res.json().catch(() => ({}));
+					if (!res.ok) throw new Error(data.detail ?? `delete → ${res.status}`);
+					tr.remove();
+					const n = rowsEl.children.length;
+					statusEl.textContent = `${n} tour${n === 1 ? "" : "s"}`;
+					tbl.hidden = n === 0;
+					emptyEl.hidden = n !== 0;
+				} catch (e) {
+					msg.className = "msg err";
+					msg.textContent = `✗ ${e.message}`;
+					btns.forEach((b) => (b.disabled = false));
+				}
+			}
+
+			load();
+		</script>
+	</body>
+</html>
