@@ -120,7 +120,7 @@ _RETRY_BACKOFF_BASE_S = 4.0
 # Cap on concurrent Google calls in flight. Pairs with the shared 429
 # backoff: the semaphore prevents bursts, the backoff handles quota
 # trips that still slip through.
-GENERATE_CONCURRENCY = 8
+GENERATE_CONCURRENCY = 25
 _generate_slot = asyncio.Semaphore(GENERATE_CONCURRENCY)
 
 
@@ -358,6 +358,7 @@ async def generate_resumable(
     *,
     job_id: str,
     save_to: Path,
+    force: bool = False,
 ) -> NanoBananaResult:
     """Resumable text-to-image. Requires a bound SlotLog.
 
@@ -367,19 +368,26 @@ async def generate_resumable(
     the bytes to `save_to`, and logs `google.banana.done` so the next
     run short-circuits.
 
+    `force=True` bypasses that completion-cache short-circuit so the image
+    is always re-generated (used by a from-scratch regenerate). It stays
+    NON-destructive: the bytes are written to `save_to` only after the API
+    call succeeds, so a failed call (e.g. invalid/down key) leaves any
+    existing image on disk untouched — never deletes it.
+
     Google's GenAI API has no in-flight reattach (text-to-image is a
     single HTTP roundtrip with no resumption token), so a process kill
     MID-call will re-bill on the next attempt — only completed-and-
     saved calls are cheap to resume.
     """
-    done = resumable.find_done(scope=_RESUMABLE_SCOPE, job_id=job_id)
-    if done is not None:
-        saved = Path(str(done.get("saved", "")))
-        if saved.exists():
-            return NanoBananaResult(
-                image_bytes=saved.read_bytes(),
-                mime_type=str(done.get("mime_type", "image/png")),
-            )
+    if not force:
+        done = resumable.find_done(scope=_RESUMABLE_SCOPE, job_id=job_id)
+        if done is not None:
+            saved = Path(str(done.get("saved", "")))
+            if saved.exists():
+                return NanoBananaResult(
+                    image_bytes=saved.read_bytes(),
+                    mime_type=str(done.get("mime_type", "image/png")),
+                )
 
     input_hash = resumable.hash_input({
         "model": MODEL,

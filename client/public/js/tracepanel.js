@@ -40,7 +40,7 @@ function statusDot(n) {
 const fmtVec = (a) => `(${a.map((x) => (+x).toFixed(2)).join(", ")})`;
 const fmtDims = (a) => a.map((x) => (+x).toFixed(2)).join(" × ");
 
-export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () => {}, onInquire = null } = {}) {
+export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () => {}, onInquire = null, actions = null, meshUrlFor = (_id, node) => node.meshUrl ?? null } = {}) {
   const nodeLabelEl = el("span", { class: "tp-node" });
 
   // Mini preview + its overlaid canonical-axes toggle. The axes are world-
@@ -67,8 +67,18 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
   );
   previewHost.append(axesBtn, axesLegend);
 
+  // Reference image (the Nano-Banana / library photo the mesh was generated
+  // from), shown beneath the 3D preview. Hidden when absent or it fails to load.
+  const previewImg = el("img", { class: "tp-preview-img", alt: "reference image" });
+  const imgWrap = el("div", { class: "tp-img-wrap" },
+    el("div", { class: "tp-field-lab", text: "reference image" }),
+    previewImg,
+  );
+  imgWrap.style.display = "none";
+  previewImg.onerror = () => { imgWrap.style.display = "none"; };
+
   const fieldsEl = el("div", { class: "tp-fields" });
-  const infoEl = el("div", { class: "tp-info" }, previewHost, fieldsEl);
+  const infoEl = el("div", { class: "tp-info" }, previewHost, imgWrap, fieldsEl);
   const bodyEl = el("div", { class: "tp-body" });
   const scrollEl = el("div", { id: "trace-panel-scroll" }, infoEl, bodyEl);
   const resizer = el("div", { id: "trace-panel-resizer", title: "drag to resize the panel" });
@@ -182,6 +192,78 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     );
   }
 
+  // Per-object generated-asset controls — shown in the info block only while the
+  // overlay is viewing the from-scratch generated build (actions.available()).
+  // regenerate rebuilds the mesh fresh on the chosen backend (Trellis / Hunyuan
+  // on Modal / Hunyuan 3.1 on Tencent); symmetrize / unsymmetrize mirror or
+  // reveal the raw mesh with no backend call. All propagate across the prefab group.
+  function buildActions(id) {
+    const backendSel = el("select", { class: "tp-act-sel", title: "mesh backend for regenerate" },
+      ...["trellis", "hunyuan", "hunyuan-tencent"].map((b) => el("option", { value: b, text: b })));
+    const reuse = el("input", { type: "checkbox" });
+    const sym = actions.symmetryOf?.(id);
+    const mirrored = !!sym && (sym.plane === "xy" || sym.plane === "xz");
+
+    // Symmetry is one toggle: a mirrored asset shows ONLY un-symmetrize, an
+    // un-mirrored one shows ONLY symmetrize (+ the plane to mirror across).
+    let symRow;
+    if (mirrored) {
+      symRow = el("div", { class: "tp-act-row" },
+        el("button", {
+          class: "tp-act-btn", text: "unsymmetrize",
+          title: `reveal the full, un-mirrored mesh (currently mirrored across ${sym.plane})`,
+          onclick: () => actions.onUnsymmetrize(id),
+        }),
+      );
+    } else {
+      const planeSel = el("select", { class: "tp-act-sel", title: "mirror plane" },
+        el("option", { value: "xy", text: "xy · front/back" }),
+        el("option", { value: "xz", text: "xz · top/bottom" }),
+      );
+      // Which half to keep, mirrored onto the other. Labels follow the plane
+      // (xy: front/back along Z, xz: top/bottom along Y); value = keep_positive.
+      const keepSel = el("select", { class: "tp-act-sel", title: "which half to keep, then mirror onto the other" });
+      const KEEP = {
+        xy: [["true", "keep front"], ["false", "keep back"]],
+        xz: [["true", "keep top"], ["false", "keep bottom"]],
+      };
+      const syncKeep = () => keepSel.replaceChildren(
+        ...KEEP[planeSel.value].map(([v, t]) => el("option", { value: v, text: t })),
+      );
+      syncKeep();
+      planeSel.addEventListener("change", syncKeep);
+      symRow = el("div", { class: "tp-act-row" },
+        el("button", {
+          class: "tp-act-btn", text: "symmetrize",
+          title: "mirror this asset across the chosen plane, keeping the chosen half",
+          onclick: () => actions.onSymmetrize(id, {
+            plane: planeSel.value,
+            keepPositive: keepSel.value === "true",
+          }),
+        }),
+        planeSel,
+        keepSel,
+      );
+    }
+    const symText = mirrored
+      ? `mirrored · ${sym.plane}`
+      : sym && sym.was ? `un-symmetrized (was ${sym.was})` : "";
+    return el("div", { class: "tp-actions" },
+      el("div", { class: "tp-field-lab", text: "generated asset" }),
+      el("div", { class: "tp-act-row" },
+        el("button", {
+          class: "tp-act-btn", text: "regenerate",
+          title: "rebuild this asset's mesh fresh on the chosen backend (propagates to its prefab group)",
+          onclick: () => actions.onRegenerate(id, { backend: backendSel.value, reuseImage: reuse.checked }),
+        }),
+        backendSel,
+        el("label", { class: "tp-act-check", title: "reuse the existing reference image (skip Nano-Banana)" }, reuse, "reuse image"),
+      ),
+      symRow,
+      symText ? el("div", { class: "tp-act-sym", text: symText }) : null,
+    );
+  }
+
   function infoSig(id) {
     const n = model.nodes.get(id);
     if (!n) return null;
@@ -216,14 +298,24 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
           size: Math.max(Math.abs(n.dimensions[0]), Math.abs(n.dimensions[1]), Math.abs(n.dimensions[2])) * 0.75 || 1,
         }
       : null;
-    if (n.meshUrl || hasGeom) {
+    const meshUrl = meshUrlFor(id, n);
+    // The reference image sits next to the mesh on disk as `<id>.png` (library
+    // and generated alike), so it follows whichever mesh the mode resolved to.
+    const imageUrl = meshUrl ? meshUrl.replace(/\.glb(\?|$)/, ".png$1") : null;
+    if (imageUrl) {
+      previewImg.src = api.absUrl(imageUrl);
+      imgWrap.style.display = "";
+    } else {
+      imgWrap.style.display = "none";
+    }
+    if (meshUrl || hasGeom) {
       previewHost.style.display = "";
       const mv = ensureMini();
       mv.clear();
       if (hasGeom) {
         mv.loadBbox({ id, origin: n.origin, dimensions: n.dimensions, node_kind: n.kind, proxy_shape: n.proxyShape ?? null });
       }
-      if (n.meshUrl) mv.loadModel({ id, url: n.meshUrl }, api.absUrl(n.meshUrl));
+      if (meshUrl) mv.loadModel({ id, url: meshUrl }, api.absUrl(meshUrl));
       mv.setActive(true);
       applyAxes();
     } else {
@@ -267,8 +359,12 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
       fieldsEl.appendChild(fieldGroup(`relationships (${rels.length})`, list));
     }
 
-    if (n.meshUrl) {
-      fieldsEl.appendChild(prop("mesh", el("a", { class: "tp-link", href: api.absUrl(n.meshUrl), target: "_blank", text: "open .glb ↗" })));
+    if (meshUrl) {
+      fieldsEl.appendChild(prop("mesh", el("a", { class: "tp-link", href: api.absUrl(meshUrl), target: "_blank", text: "open .glb ↗" })));
+    }
+
+    if (actions && actions.available() && isObject) {
+      fieldsEl.appendChild(buildActions(id));
     }
 
     lastInfoSig = infoSig(id);
@@ -527,11 +623,18 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     hide();
   }
 
+  // Re-render the focused node's info block (e.g. when the asset mode toggles,
+  // so the generated-asset actions appear/disappear without a focus change).
+  function rerenderInfo() {
+    if (focusId !== null && model && model.nodes.has(focusId)) renderInfo(focusId);
+  }
+
   return {
     show,
     refresh,
     hide,
     reset,
+    rerenderInfo,
     isOpen: () => hostEl.classList.contains("open"),
     focusId: () => focusId,
   };

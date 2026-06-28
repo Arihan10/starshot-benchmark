@@ -11,6 +11,7 @@ import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 const BBOX_COLOR_DEFAULT = 0xff3b3b; // zones
 // Objects are colored by the decomposition step that emitted them, so the
@@ -64,10 +65,34 @@ const MAX_INFLIGHT = 20;
 const CLICK_MAX_MOVE_PX = 4;
 const CLICK_MAX_DURATION_MS = 400;
 
-export function createViewer(host, { keyboard = true } = {}) {
+// Defaults for the main viewer's lighting engine (exposed so the lighting panel
+// can reset to them). Tuned so the directional KEY light shapes the scene while
+// the IBL environment + hemisphere are fill/reflections rather than washing it
+// flat. azimuth 0°=+Z (front), 90°=+X (right); elevation in degrees.
+const LIGHTING_DEFAULTS = {
+	exposure: 1.0,
+	key: 3.5,
+	fill: 0.2,
+	env: 0.35,
+	shadow: 0.4,
+	azimuth: 34,
+	elevation: 48,
+	shadows: true,
+};
+
+export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const renderer = new THREE.WebGLRenderer({ antialias: true });
 	renderer.setPixelRatio(window.devicePixelRatio);
 	renderer.setClearColor(0x101114);
+	// Physically-based tone mapping + shadows for the MAIN viewer only; the mini /
+	// compare viewers keep flat linear shading (lighting=false), so the engine
+	// here never regresses them or pays for shadow maps they don't display.
+	if (lighting) {
+		renderer.toneMapping = THREE.ACESFilmicToneMapping;
+		renderer.toneMappingExposure = 1.0;
+		renderer.shadowMap.enabled = true;
+		renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+	}
 	host.prepend(renderer.domElement);
 
 	const scene = new THREE.Scene();
@@ -99,10 +124,17 @@ export function createViewer(host, { keyboard = true } = {}) {
 		pointerDirty = true;
 	});
 
-	scene.add(new THREE.HemisphereLight(0xffffff, 0x202028, 0.9));
-	const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
-	dirLight.position.set(20, 30, 14);
-	scene.add(dirLight);
+	// Shared shadow-reception gate (see prepareLoadedScene) — defined even for the
+	// simple-lit viewers, where the injected uniform is just unused.
+	const _forceReceiveShadow = { value: true };
+	const lightingRig = lighting ? setupLightingRig() : null;
+	if (!lighting) {
+		// Flat fill lighting for the mini / compare viewers.
+		scene.add(new THREE.HemisphereLight(0xffffff, 0x202028, 0.9));
+		const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
+		dirLight.position.set(20, 30, 14);
+		scene.add(dirLight);
+	}
 
 	// Distance-faded shader grid on the ground plane (ported verbatim; fade
 	// window tracks camera distance so detail scales as the user zooms).
@@ -1050,15 +1082,170 @@ export function createViewer(host, { keyboard = true } = {}) {
 		}
 	}
 
-	function attachGltf(id, gltfScene, kind) {
-		gltfScene.traverse((child) => {
-			if (child.isMesh && child.material) {
-				const mats = Array.isArray(child.material)
-					? child.material
-					: [child.material];
-				for (const m of mats) m.side = THREE.DoubleSide;
+	// --- lighting engine (main viewer only) ----------------------------------
+	// Image-based lighting (a prefiltered RoomEnvironment) + one shadow-casting
+	// key light + a hemisphere fill, with a transparent ground shadow catcher.
+	// The shadow frustum refits to the scene bounds on geometry change so contact
+	// shadows stay crisp at any scale. Returns the handle the viewer exposes to
+	// the lighting panel; only ever called when `lighting` is on.
+	function setupLightingRig() {
+		{
+			const pmrem = new THREE.PMREMGenerator(renderer);
+			const envScene = new RoomEnvironment(renderer);
+			scene.environment = pmrem.fromScene(envScene, 0.04).texture;
+			envScene.dispose();
+			pmrem.dispose();
+		}
+		const hemi = new THREE.HemisphereLight(0xffffff, 0x202028, LIGHTING_DEFAULTS.fill);
+		scene.add(hemi);
+		const SHADOW_MAP_SIZE = 4096;
+		const key = new THREE.DirectionalLight(0xffffff, LIGHTING_DEFAULTS.key);
+		key.castShadow = true;
+		key.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+		key.shadow.bias = -0.0001;
+		scene.add(key, key.target);
+		const catcher = new THREE.Mesh(
+			new THREE.PlaneGeometry(1, 1),
+			new THREE.ShadowMaterial({ opacity: LIGHTING_DEFAULTS.shadow, depthWrite: false }),
+		);
+		catcher.rotation.x = -Math.PI / 2;
+		catcher.receiveShadow = true;
+		catcher.renderOrder = -1;
+		scene.add(catcher);
+
+		const lightDir = new THREE.Vector3(4, 8, 6).normalize();
+		const center = new THREE.Vector3();
+		const dim = new THREE.Vector3();
+		let lastBox = null;
+		const state = { ...LIGHTING_DEFAULTS };
+
+		function fitShadow(box) {
+			const hasGeom = !!box && !box.isEmpty();
+			lastBox = hasGeom ? box : null;
+			if (hasGeom) {
+				box.getCenter(center);
+				box.getSize(dim);
+			} else {
+				center.set(0, 0, 0);
+				dim.set(20, 20, 20);
+			}
+			// Bounding-sphere radius (half the diagonal) so the ortho frustum
+			// encloses the whole scene, depth precision spent tightly on it.
+			const radius = Math.max(0.5, 0.5 * Math.hypot(dim.x, dim.y, dim.z));
+			const minY = hasGeom ? box.min.y : 0;
+			const dist = radius * 3;
+			key.position.copy(center).addScaledVector(lightDir, dist);
+			key.target.position.copy(center);
+			key.target.updateMatrixWorld();
+			const cam = key.shadow.camera;
+			const extent = radius * 1.05;
+			cam.left = -extent;
+			cam.right = extent;
+			cam.top = extent;
+			cam.bottom = -extent;
+			cam.near = Math.max(0.01, dist - radius * 1.1);
+			cam.far = dist + radius * 1.1;
+			cam.updateProjectionMatrix();
+			// Normal-offset bias scaled to the shadow texel's world size — the main
+			// defense against self-shadow acne, kept consistent across scene scales.
+			key.shadow.normalBias = ((2 * extent) / SHADOW_MAP_SIZE) * 2.0;
+			catcher.position.set(center.x, minY + radius * 0.003, center.z);
+			catcher.scale.set(radius * 6, radius * 6, 1);
+		}
+
+		function applyAngles() {
+			const az = THREE.MathUtils.degToRad(state.azimuth);
+			const el = THREE.MathUtils.degToRad(state.elevation);
+			const cosEl = Math.cos(el);
+			lightDir
+				.set(Math.sin(az) * cosEl, Math.sin(el), Math.cos(az) * cosEl)
+				.normalize();
+			fitShadow(lastBox);
+		}
+
+		function applyScalars() {
+			renderer.toneMappingExposure = state.exposure;
+			key.intensity = state.key;
+			hemi.intensity = state.fill;
+			scene.environmentIntensity = state.env;
+			catcher.material.opacity = state.shadow;
+			// Caster stays on; reception is gated through the shared uniform so
+			// toggling needs no shader recompile.
+			_forceReceiveShadow.value = state.shadows;
+			catcher.visible = state.shadows;
+		}
+
+		applyScalars();
+		fitShadow(null);
+
+		return {
+			refit() {
+				const box = new THREE.Box3();
+				if (sceneRoot.children.length > 0) box.setFromObject(sceneRoot);
+				if (box.isEmpty())
+					for (const helper of bboxes.values()) box.union(helper.box);
+				fitShadow(box.isEmpty() ? null : box);
+			},
+			setLighting(partial) {
+				Object.assign(state, partial);
+				applyScalars();
+				applyAngles();
+			},
+			getLighting: () => ({ ...state }),
+		};
+	}
+
+	// Re-gate a streamed PBR material's shadow term on our shared
+	// `_forceReceiveShadow` uniform instead of three's per-object `receiveShadow`
+	// (which doesn't reach these materials). Inert where there's no shadow map.
+	function patchMaterialReceiveShadow(m) {
+		if (!m || m.userData.__recvPatched) return;
+		m.userData.__recvPatched = true;
+		const prev = m.onBeforeCompile;
+		m.onBeforeCompile = (shader, rndr) => {
+			if (prev) prev(shader, rndr);
+			shader.uniforms.uForceReceiveShadow = _forceReceiveShadow;
+			shader.fragmentShader = shader.fragmentShader
+				.replace(
+					"#include <common>",
+					"#include <common>\nuniform bool uForceReceiveShadow;",
+				)
+				.replace(
+					"#include <lights_fragment_begin>",
+					THREE.ShaderChunk.lights_fragment_begin.replace(
+						/\(\s*directLight\.visible\s*&&\s*receiveShadow\s*\)/g,
+						"( directLight.visible && uForceReceiveShadow )",
+					),
+				);
+		};
+		const prevKey = m.customProgramCacheKey?.bind(m);
+		m.customProgramCacheKey = () => "recvForce1|" + (prevKey ? prevKey() : "");
+		m.needsUpdate = true;
+	}
+
+	// Every loaded GLB: double-sided (Trellis shells are often single-sided),
+	// shadow cast + receive, smooth normals computed when absent (generated meshes
+	// ship without them, which otherwise breaks shadow reception), and the
+	// receive-shadow re-gate. All shadow bits are no-ops in the flat mini viewers.
+	function prepareLoadedScene(root) {
+		root.traverse((child) => {
+			if (!child.isMesh) return;
+			child.castShadow = true;
+			child.receiveShadow = true;
+			if (child.geometry && !child.geometry.getAttribute("normal")) {
+				child.geometry.computeVertexNormals();
+			}
+			if (!child.material) return;
+			const mats = Array.isArray(child.material) ? child.material : [child.material];
+			for (const m of mats) {
+				m.side = THREE.DoubleSide;
+				m.shadowSide = THREE.BackSide;
 			}
 		});
+	}
+
+	function attachGltf(id, gltfScene, kind) {
+		prepareLoadedScene(gltfScene);
 		gltfScene.name = `mesh:${id}`;
 		gltfScene.userData.pickId = id;
 		const prev = models.get(id);
@@ -1074,10 +1261,12 @@ export function createViewer(host, { keyboard = true } = {}) {
 	}
 
 	const failedUrls = new Set(); // `${gen}|${url}` — don't re-parse known-bad GLBs
-	async function loadModel(event, absUrl) {
+	async function loadModel(event, absUrl, { replace = false } = {}) {
 		const myGen = gen;
 		const k = `${myGen}|${absUrl}`;
-		if (failedUrls.has(k) || models.has(event.id)) return;
+		// `replace` lets a changed mesh (same id, new bytes) re-attach over the old
+		// one; without it a loaded id is left untouched (attachGltf replaces by id).
+		if (failedUrls.has(k) || (!replace && models.has(event.id))) return;
 		try {
 			const gltf = await loader.loadAsync(absUrl);
 			if (myGen !== gen) {
@@ -1287,6 +1476,23 @@ export function createViewer(host, { keyboard = true } = {}) {
 		cameraUserMoved = keepCamera;
 	}
 
+	// Drop every loaded GLB mesh while KEEPING the bbox/proxy structure (and the
+	// camera + selection). Used when the overlay swaps which build's meshes it
+	// shows (asset library ↔ generated, or optimized ↔ raw) so the incoming set
+	// replaces the old rather than layering over it. Bumping `gen` aborts any
+	// in-flight mesh load so a stale one can't re-attach after the swap.
+	function clearMeshes() {
+		gen += 1;
+		bundleAbort?.abort?.();
+		while (sceneRoot.children.length > 0) {
+			const child = sceneRoot.children[0];
+			sceneRoot.remove(child);
+			disposeObject3D(child);
+		}
+		models.clear();
+		failedUrls.clear();
+	}
+
 	// Reconcile the scene DOWN to an exact id set: drop every bbox/proxy/mesh no
 	// longer present. Painting a /scene projection was purely additive, so moving
 	// the cut BACKWARD (scrubbing the compare's original to an earlier step, or
@@ -1378,6 +1584,7 @@ export function createViewer(host, { keyboard = true } = {}) {
 		if (fitPending) {
 			fitPending = false;
 			fitToScene();
+			lightingRig?.refit();
 		}
 		renderer.render(scene, camera);
 	})();
@@ -1397,7 +1604,13 @@ export function createViewer(host, { keyboard = true } = {}) {
 			refreshAllVisibility();
 		},
 		clear,
+		clearMeshes,
 		pruneTo,
+		// Lighting engine (main viewer only; no-ops + null elsewhere). The panel
+		// (lighting.js) drives setLighting; lightingDefaults seeds its reset.
+		setLighting: (partial) => lightingRig?.setLighting(partial),
+		getLighting: () => lightingRig?.getLighting() ?? null,
+		lightingDefaults: lightingRig ? LIGHTING_DEFAULTS : null,
 		hasModel: (id) => models.has(id),
 		hasBbox: (id) => bboxes.has(id),
 		setKind: (id, kind) => {

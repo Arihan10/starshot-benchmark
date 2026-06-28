@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import os
 import shutil
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import Any, Literal
 
@@ -41,18 +42,188 @@ import trimesh
 from app.core import prompt_store, scene_context, schemas
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
-from app.services import llm, nano_banana, threed
+from app.services import hunyuan, hunyuan_tencent, llm, nano_banana, prefabs, symmetry, threed
 from app.utils import glb_place, logging
-from app.utils.geometry import rescale_mesh_to_bbox
+from app.utils.geometry import export_glb, rescale_mesh_to_bbox
 from app.utils.topology import validate_parents, validate_referenced_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
+
+# Mesh backends a build can route to. Keys are the values the API accepts; each
+# exposes an identical `generate_mesh(...)`, so picking one is a dict lookup. The
+# divider, the generate gate, and library retries all use the default; only
+# per-asset regeneration overrides it (the regenerate buttons). `trellis` and
+# `hunyuan` (Omni) ride the shared Modal spawn-and-poll core (app.services.mesh_jobs,
+# ~100 concurrent); `hunyuan-tencent` calls Tencent Cloud's Hunyuan 3D 3.1 Rapid API
+# directly and self-serializes to one task at a time (its own account-level limit).
+DEFAULT_MESH_BACKEND = "trellis"
+MESH_BACKENDS: dict[str, Callable[..., Awaitable[Path]]] = {
+    "trellis": threed.generate_mesh,
+    "hunyuan": hunyuan.generate_mesh,
+    "hunyuan-tencent": hunyuan_tencent.generate_mesh,
+}
+
+
+def _scene_backend() -> str:
+    """The mesh backend the from-scratch *scene* generate gate (`generate_assets`)
+    routes every object to. Defaults to Trellis; set
+    `GENERATE_SCENE_BACKEND=hunyuan-tencent` to build whole scenes on Tencent's
+    Hunyuan 3D 3.1 Rapid — which paces itself to one job at a time via that
+    backend's own gate, so the gate's fan-out still serializes onto Tencent. Read
+    at submit time so flipping the env var takes effect on the next generate
+    without a restart; an unknown value falls back to the default with an audit
+    log."""
+    backend = os.environ.get("GENERATE_SCENE_BACKEND", DEFAULT_MESH_BACKEND).strip()
+    if backend not in MESH_BACKENDS:
+        logging.log(
+            "generate.backend_invalid",
+            backend=backend,
+            fallback=DEFAULT_MESH_BACKEND,
+            valid=sorted(MESH_BACKENDS),
+        )
+        return DEFAULT_MESH_BACKEND
+    return backend
 
 # Guards the trimesh load -> rescale -> export block. API calls and GLB
 # downloads stay fully parallel across slots; only the RAM-heavy mesh
 # decode is serialized so concurrent slots don't stack Pillow-decoded
 # texture buffers and trip the OOM killer.
 _MESH_IO = asyncio.Semaphore(1)
+
+# The generate gate fans out EVERY asset at once; the queue is intentionally
+# uncapped. Live concurrency is bounded only by the downstream per-stage gates
+# each pipeline passes through: Nano-Banana image gen
+# (nano_banana.GENERATE_CONCURRENCY), the Trellis in-flight cap
+# (threed.GENERATE_CONCURRENCY — the "100 live requests"), the serialized mesh
+# decode (`_MESH_IO`), and the optimizer pool (`_OPTIMIZE_FANOUT`). A process-
+# global fanout cap here previously double-capped the gate at the Trellis limit,
+# so a scene could never queue past 100 — overflow blocked before it registered
+# in threed's queue snapshot. Trellis submits are still spaced by `_pace_submit`.
+
+# The asset-library optimizer (tools/optimize-assets/optimize.mjs) — the same
+# weld/decimate/prune + KTX2 + Meshopt pass every library asset goes through.
+# Raw Trellis output is ~500k tris / ~10-20MB each; this brings every generated
+# asset down to the library's ~15-20k-tri, GPU-compressed footprint so the
+# generated view streams and renders like the library one. CPU/RAM-heavy (sharp
+# decode + Basis encode), so cap concurrent node subprocesses well below the
+# number of assets that may be in flight.
+_OPTIMIZE_DIR = Path(__file__).resolve().parents[2] / "tools" / "optimize-assets"
+_OPTIMIZE_SCRIPT = _OPTIMIZE_DIR / "optimize.mjs"
+_NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
+_OPTIMIZE_FANOUT = asyncio.Semaphore(4)
+
+# Cap on concurrent library-asset match calls (flash-lite) when realizing a whole
+# scene's assets in one batch. call_llm has no client-side rate limit, so this
+# bounds the fan-out under OpenRouter's ceiling while still matching in parallel.
+LIBRARY_MATCH_CONCURRENCY = 12
+_library_match_slot = asyncio.Semaphore(LIBRARY_MATCH_CONCURRENCY)
+
+# From-scratch generated build (Nano-Banana + a mesh backend), one per cell, laid
+# out beside the asset-library build under the cell dir:
+#   objects-generated/            raw meshes (intermediate)
+#   objects-generated-optimized/  served twin (KTX2/Meshopt)
+#   events.generated.jsonl        resumable log
+# The asset-library build (objects/ + events.jsonl) is separate and unaffected.
+GENERATED_RAW_SUBDIR = "objects-generated"
+GENERATED_OPT_SUBDIR = "objects-generated-optimized"
+GENERATED_EVENTS_NAME = "events.generated.jsonl"
+
+# Older builds nested each build under generated/<n>/. We no longer create those;
+# the helpers below only READ the latest one for backwards-compatible display.
+_LEGACY_GENERATED_DIR = "generated"
+
+
+def generated_dirs(runs_dir: Path, run_id: str) -> tuple[Path, Path]:
+    """(raw_dir, opt_dir) for a cell's single generated build."""
+    base = runs_dir / run_id
+    return base / GENERATED_RAW_SUBDIR, base / GENERATED_OPT_SUBDIR
+
+
+def generated_events_path(runs_dir: Path, run_id: str) -> Path:
+    """The cell's generated build resumable log (events.generated.jsonl)."""
+    return runs_dir / run_id / GENERATED_EVENTS_NAME
+
+
+def _latest_legacy_version(runs_dir: Path, run_id: str) -> str | None:
+    """Highest numeric generated/<n>/ build on disk, or None — backwards
+    compatibility for cells built under the old per-version layout."""
+    root = runs_dir / run_id / _LEGACY_GENERATED_DIR
+    if not root.is_dir():
+        return None
+    versions = sorted(
+        (p.name for p in root.iterdir() if p.is_dir() and p.name.isdigit()), key=int,
+    )
+    return versions[-1] if versions else None
+
+
+def latest_generated_dirs(runs_dir: Path, run_id: str) -> tuple[Path, Path]:
+    """(raw_dir, opt_dir) to READ for display: the single build when present, else
+    the newest legacy generated/<n>/ build."""
+    raw, opt = generated_dirs(runs_dir, run_id)
+    if raw.is_dir() or opt.is_dir():
+        return raw, opt
+    version = _latest_legacy_version(runs_dir, run_id)
+    if version is not None:
+        base = runs_dir / run_id / _LEGACY_GENERATED_DIR / version
+        return base / GENERATED_RAW_SUBDIR, base / GENERATED_OPT_SUBDIR
+    return raw, opt
+
+
+def latest_generated_events_path(runs_dir: Path, run_id: str) -> Path:
+    """The events.generated.jsonl to READ for display: the single build's when
+    present, else the newest legacy generated/<n>/ build's."""
+    path = generated_events_path(runs_dir, run_id)
+    if path.exists():
+        return path
+    version = _latest_legacy_version(runs_dir, run_id)
+    if version is not None:
+        return runs_dir / run_id / _LEGACY_GENERATED_DIR / version / GENERATED_EVENTS_NAME
+    return path
+
+
+async def _optimize_asset(src: Path, dst: Path) -> bool:
+    """Run one freshly generated GLB through the library optimizer into `dst`.
+    Atomic via a temp file (in src's dir, which isn't served) so a crash can't
+    leave a half-written optimized asset that resume would treat as finished.
+    On any failure `dst` is left absent, so a re-run retries it — cheaply, since
+    the raw mesh and Trellis cache are reused."""
+    # Absolute paths: the subprocess runs with cwd=_OPTIMIZE_DIR, and RUNS_DIR
+    # may be relative to the server's cwd, so relative paths would resolve wrong.
+    src = src.resolve()
+    dst = dst.resolve()
+    async with _OPTIMIZE_FANOUT:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        tmp = src.with_name(f"{src.stem}.opt-tmp.glb")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                _NODE_BIN, str(_OPTIMIZE_SCRIPT),
+                "--file", str(src), "--out-file", str(tmp),
+                cwd=str(_OPTIMIZE_DIR),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except Exception as e:
+            logging.log("generate.optimize_error", id=src.stem, message=f"{type(e).__name__}: {e}")
+            return False
+        try:
+            _, stderr = await proc.communicate()
+        except asyncio.CancelledError:
+            proc.kill()
+            tmp.unlink(missing_ok=True)
+            raise
+        if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(tmp, dst)
+            png = src.with_suffix(".png")
+            if png.exists():
+                await asyncio.to_thread(shutil.copyfile, png, dst.with_suffix(".png"))
+            return True
+        tmp.unlink(missing_ok=True)
+        logging.log(
+            "generate.optimize_error",
+            id=src.stem,
+            message=(stderr.decode(errors="replace")[:500] if stderr else f"node exit {proc.returncode}"),
+        )
+        return False
 
 
 def _artifact_url(runs_dir: Path, path: Path) -> str:
@@ -398,7 +569,15 @@ async def _resolve_and_generate(
         parent_id = spec.parent
         # bbox already emitted upfront above.
         prior_subjects = committed_subjects + [r.prompt for r in resolved]
-        view = "three-quarter" if scenario == "encapsulating" else "front"
+        encapsulating = scenario == "encapsulating"
+        cut_plane = await symmetry.resolve_cut_plane(
+            prompt=spec.prompt,
+            node_id=spec.id,
+            encapsulating=encapsulating,
+        )
+        view = symmetry.image_view_for(
+            cut_plane=cut_plane, encapsulating=encapsulating,
+        )
         subject_prompt, image_prompt = await _build_image_prompt(
             spec_id=spec.id,
             prompt=spec.prompt,
@@ -422,6 +601,7 @@ async def _resolve_and_generate(
                 referenced_ids=list(spec.referenced_ids),
                 parent_id=parent_id,
                 parent_kind=spec.parent_kind,
+                symmetry_cut_plane=cut_plane,
                 parent_region=zone.id,
             )
         )
@@ -568,7 +748,6 @@ async def _match_library_assets(
     # call, same as the sequential loop.
     return list(await asyncio.gather(*(_one(s) for s in specs)))
 
-
 async def _build_image_prompt(
     *,
     spec_id: str,
@@ -616,6 +795,31 @@ async def _build_image_prompt(
     return out.prompt, scene_context.wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
 
 
+async def _refresh_node_image_prompt(node: Node) -> Node:
+    """Re-resolve symmetry + wrap after a mesh retry deleted the reference image.
+    Replays `symmetry.decision` from the log when present."""
+    cut_plane = await symmetry.resolve_cut_plane(
+        prompt=node.prompt, node_id=node.id,
+    )
+    view = symmetry.image_view_for(cut_plane=cut_plane)
+    subject = committed.image_subject(node.id) or node.prompt
+    _, image_prompt = await _build_image_prompt(
+        spec_id=node.id,
+        prompt=subject,
+        bbox=node.bbox,
+        proxy_shape=node.proxy_shape,
+        prior_prompts=[],
+        view=view,
+    )
+    return node.model_copy(
+        update={
+            "prompt": subject,
+            "image_prompt": image_prompt,
+            "symmetry_cut_plane": cut_plane,
+        },
+    )
+
+
 _pending: dict[str, list[asyncio.Task[None]]] = {}
 
 # Run-scoped set of every id that has been admitted into _resolve_and_generate
@@ -627,6 +831,34 @@ _pending: dict[str, list[asyncio.Task[None]]] = {}
 # double-bill — this guard closes that window.
 _admitted_ids: dict[str, set[str]] = {}
 
+# Per-cell map of per-node asyncio.Locks. The from-scratch whole-scene generate
+# (`generate_assets`) and standalone per-asset regeneration (`regenerate_one` /
+# `propagate_reuses`) may run CONCURRENTLY on the same cell; this serializes them
+# whenever they would write the SAME node's files (raw / rescaled / optimized GLB
+# + reference image), so a node is never built by two writers at once. Distinct
+# nodes never contend, so the common case — regenerating already-built assets
+# while the scene build resumes the missing ones — stays fully parallel. A reuse's
+# read of its canonical's raw is lock-free and kept safe instead by atomic
+# (temp + replace) writes.
+_node_locks: dict[str, dict[str, asyncio.Lock]] = {}
+
+
+def node_lock(run_id: str, node_id: str) -> asyncio.Lock:
+    """The build lock for one (cell, node), created on first use. Shared by the
+    whole-scene generate and per-asset regeneration so the two serialize only when
+    they target the same node."""
+    per_cell = _node_locks.setdefault(run_id, {})
+    lock = per_cell.get(node_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        per_cell[node_id] = lock
+    return lock
+
+
+def clear_node_locks(run_id: str) -> None:
+    """Drop a cell's node locks (called on reset / teardown)."""
+    _node_locks.pop(run_id, None)
+
 
 async def _generate_one(
     node: Node,
@@ -635,6 +867,9 @@ async def _generate_one(
     path: Path,
     image_stem: Path,
     runs_dir: Path,
+    backend: str = DEFAULT_MESH_BACKEND,
+    reuse_image: bool = False,
+    force_image: bool = False,
 ) -> None:
     try:
         # Nano Banana sees the wrapped studio-shot directive; node.prompt
@@ -642,11 +877,32 @@ async def _generate_one(
         banana_prompt = node.image_prompt or node.prompt
         image_path = image_stem.parent / f"{image_stem.name}.png"
         had_image = image_path.exists() and logging.find_event("image", id=node.id) is not None
-        image = await nano_banana.generate_resumable(
-            banana_prompt,
-            job_id=node.id,
-            save_to=image_path,
-        )
+        if reuse_image:
+            # "Regenerate from image": reuse the reference image already on disk
+            # and NEVER call Nano-Banana. The on-disk image is always PNG
+            # (nano_banana normalizes; seeded/recovered copies are PNG). If it's
+            # genuinely gone (and couldn't be recovered from a prefab sibling
+            # upstream), fail clearly rather than silently re-generating it.
+            if not image_path.exists():
+                logging.log(
+                    "mesh.error", id=node.id,
+                    message="regenerate from image: no reference image to reuse",
+                )
+                return
+            image = nano_banana.NanoBananaResult(
+                image_bytes=image_path.read_bytes(), mime_type="image/png",
+            )
+        else:
+            # Fresh image. `force_image` bypasses the resumable completion cache so
+            # a regenerate actually re-rolls (instead of reusing the cached image)
+            # while still writing only on success — a failed call leaves any
+            # existing image intact instead of wiping it.
+            image = await nano_banana.generate_resumable(
+                banana_prompt,
+                job_id=node.id,
+                save_to=image_path,
+                force=force_image,
+            )
         if not had_image:
             logging.log(
                 "image",
@@ -654,21 +910,37 @@ async def _generate_one(
                 url=_artifact_url(runs_dir, image_path),
                 prompt=node.prompt,
             )
-        await threed.generate_mesh(
+        # generate_mesh writes `raw` on a fresh run but returns a *cached* path
+        # on a resumable hit (which may not be `raw` when the bound log was
+        # hydrated from another build). Load whatever it actually produced.
+        produced = await MESH_BACKENDS[backend](
             image.image_bytes,
             output_path=raw,
             job_id=node.id,
             image_mime=image.mime_type,
+            bbox=node.bbox,
         )
         async with _MESH_IO:
-            scene = await asyncio.to_thread(trimesh.load, raw)
+            scene = await asyncio.to_thread(trimesh.load, produced)
+            scene = await symmetry.apply_symmetrize(
+                scene,
+                cut_plane=node.symmetry_cut_plane,
+                node_id=node.id,
+            )
             rescaled = await asyncio.to_thread(
                 rescale_mesh_to_bbox,
                 scene,
                 node.bbox,
                 orientation=node.orientation,
             )
-            await asyncio.to_thread(rescaled.export, path, file_type="glb")
+            # Atomic write: export to a temp then replace, so a concurrent reader
+            # (the client streaming raw meshes, or a reuse) never sees a torn GLB.
+            tmp_path = path.with_name(f"{path.name}.part")
+            try:
+                await asyncio.to_thread(export_glb, rescaled, tmp_path)
+                os.replace(tmp_path, path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
             del scene, rescaled
         logging.emit_model(
             node.id,
@@ -676,6 +948,61 @@ async def _generate_one(
             url=_artifact_url(runs_dir, path),
         )
     except Exception as e:
+        logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
+
+
+async def _rescale_reuse_from_raw(
+    node: Node,
+    *,
+    src_raw: Path,
+    raw_dir: Path,
+    opt_dir: Path,
+    source_id: str,
+) -> None:
+    """Rescale a canonical's raw Trellis mesh into `node`'s bbox + orientation
+    (the prefab-reuse path — no Nano-Banana, no Trellis), carry over the
+    canonical's reference image, then optimize into the served twin. Shared by
+    the generate gate's in-scene reuse and standalone prefab propagation. A
+    missing source raw is logged and skipped rather than raising."""
+    if not src_raw.exists():
+        logging.log("prefab.reuse_missing", id=node.id, source=source_id)
+        return
+    try:
+        rescaled = raw_dir / f"{node.id}.glb"
+        cut_plane: Literal["none", "xy", "xz"] = "none"
+        keep_positive: bool | None = None
+        applied = logging.find_event("symmetry.applied", id=source_id)
+        if applied is not None:
+            raw_cp = applied.get("cut_plane")
+            if raw_cp in ("none", "xy", "xz"):
+                cut_plane = raw_cp  # type: ignore[assignment]
+            # Carry the canonical's kept-half so a non-default direction (set via
+            # the symmetrize control) mirrors the reuse identically. Absent on
+            # older logs -> None -> the plane's default half.
+            raw_keep = applied.get("keep_positive")
+            if isinstance(raw_keep, bool):
+                keep_positive = raw_keep
+        async with _MESH_IO:
+            scene = await asyncio.to_thread(trimesh.load, src_raw)
+            scene = await symmetry.apply_symmetrize(
+                scene, cut_plane=cut_plane, node_id=node.id, keep_positive=keep_positive,
+            )
+            placed = await asyncio.to_thread(
+                rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
+            )
+            # Atomic write (see _generate_one) so a concurrent reader never tears.
+            tmp_rescaled = rescaled.with_name(f"{rescaled.name}.part")
+            try:
+                await asyncio.to_thread(export_glb, placed, tmp_rescaled)
+                os.replace(tmp_rescaled, rescaled)
+            finally:
+                tmp_rescaled.unlink(missing_ok=True)
+            del scene, placed
+        src_png = raw_dir / f"{source_id}.png"
+        if src_png.exists():
+            await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{node.id}.png")
+        await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+    except Exception as e:  # noqa: BLE001
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
 
 
@@ -716,41 +1043,460 @@ async def _spawn_meshes(
     return out
 
 
+# One lock per cell (run_id) so the generate gate and a concurrent regen compute
+# the shared prefab grouping once instead of racing to re-sweep + double-log it.
+_scene_prefab_locks: dict[str, asyncio.Lock] = {}
+
+
+async def ensure_scene_prefab_groups(*, nodes: list[Node], run_id: str) -> dict[str, str]:
+    """Compute the scene-wide prefab grouping over `nodes` ONCE and persist it as
+    `prefab.match` events in the BOUND (generated build) log, shared by the
+    whole-scene generate and standalone regen of generated assets. Prefab matching
+    is for the from-scratch generated build only — the asset library picks an asset
+    per object as it is generated and never groups.
+
+    Seed-and-sweep: the first undecided node is a canonical "seed"; a flash-lite
+    call names every remaining node that is the SAME object (each reuses the
+    seed), then the next still-undecided node seeds the following group. Idempotent
+    — nodes already carrying a logged `prefab.match` are honored and never
+    re-swept, so a later regen or a resume is free.
+    Returns node_id -> reuse_id ("" = canonical)."""
+    lock = _scene_prefab_locks.setdefault(run_id, asyncio.Lock())
+    async with lock:
+        decisions: dict[str, str] = {}
+        for node in nodes:
+            decided = logging.find_event("prefab.match", id=node.id)
+            if decided is not None:
+                decisions[node.id] = str(decided.get("reuse_id") or "")
+        by_id = {n.id: n for n in nodes}
+        for node in nodes:
+            if node.id in decisions:
+                continue
+            decisions[node.id] = ""
+            logging.log("prefab.match", id=node.id, reuse_id="", description=node.prompt)
+            candidates = [
+                (n.id, n.prompt, n.bbox) for n in nodes if n.id not in decisions
+            ]
+            for dup_id in await prefabs.match_duplicates(
+                seed_id=node.id,
+                seed_description=node.prompt,
+                seed_bbox=node.bbox,
+                candidates=candidates,
+            ):
+                decisions[dup_id] = node.id
+                logging.log(
+                    "prefab.match", id=dup_id, reuse_id=node.id,
+                    description=by_id[dup_id].prompt,
+                )
+        return decisions
+
+
+async def generate_assets(
+    *,
+    nodes: list[Node],
+    decisions: dict[str, str],
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """From-scratch (Nano-Banana + a mesh backend) build of `nodes` for the
+    client's "generate" gate, independent of `_USE_ASSET_LIBRARY` and the library
+    build's `objects/`. The mesh backend is `GENERATE_SCENE_BACKEND` (default
+    Trellis; `hunyuan-tencent` routes the whole scene through Tencent's Hunyuan 3D
+    3.1, one job at a time). Writes the cell's single generated build into two dirs
+    beside the library build:
+
+      * `objects-generated/`            raw Trellis meshes (intermediate)
+      * `objects-generated-optimized/`  the served set — each raw mesh run
+        through the SAME optimizer the asset library uses (decimate + prune +
+        KTX2 textures + Meshopt), so a generated asset is never streamed
+        un-optimized (raw Trellis output is ~500k tris / tens of MB each).
+
+    Each node carries the bbox / orientation / image_prompt reconstructed from
+    the library build's log, so every generated mesh is rescaled into the exact
+    same bounding box the library asset occupied. Nodes that already have an
+    OPTIMIZED twin are skipped, so re-running this is how the gate "resumes": it
+    regenerates only the failed/interrupted assets and leaves finished ones
+    untouched.
+
+    PREFAB REUSE: `decisions` (node_id -> reuse_id, "" = canonical) is the
+    SCENE-level prefab grouping computed once by `ensure_scene_prefab_groups` and
+    shared across every generated version + the library build. This gate only
+    APPLIES it: a reuse skips Nano-Banana + Trellis entirely (its mesh is the
+    canonical's raw Trellis output rescaled into its slot). The grouping is seeded
+    into this version's log — honoring any per-version promotion already on disk (a
+    reuse rebuilt standalone logs its own `prefab.match`) and never flipping a
+    pre-built asset — so regen + the reuse-images fork keep resolving groups here.
+
+    Every asset fans out at once into an uncapped queue; the Trellis in-flight cap
+    (threed.GENERATE_CONCURRENCY — 100 live submits) plus threed's `_pace_submit`
+    (~1s between Trellis `POST /generate`) govern how many actually reach Modal, so
+    the batch ramps on instead of bursting into a 429 storm.
+
+    Requires a bound SlotLog: `_generate_one`, `prefabs.match_duplicates`, and the
+    nano_banana / threed services record their bookkeeping there. The caller
+    binds a dedicated log (events.generated.jsonl) so none of this lands in the
+    library build's event stream."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    opt_dir.mkdir(parents=True, exist_ok=True)
+    backend = _scene_backend()
+    logging.log("generate.backend", backend=backend)
+
+    # Per-scene prefab state: the canonical asset ids (reuse targets) and a "raw on
+    # disk" event per canonical so a reuse can wait for a source still in flight.
+    # Local to this call.
+    canonical_ids: set[str] = set()
+    raw_ready: dict[str, asyncio.Event] = {}
+
+    def _has_raw(node_id: str) -> bool:
+        return (raw_dir / f"{node_id}.raw.glb").exists()
+
+    def _built(node_id: str) -> bool:
+        # Already has a served twin or a raw mesh from a prior run: a resume keeps
+        # it canonical (never reclassifies a built asset as a reuse) and a seed
+        # never claims it as a duplicate.
+        return (opt_dir / f"{node_id}.glb").exists() or _has_raw(node_id)
+
+    async def _fresh(node: Node) -> None:
+        # Decide symmetry before the image is made (reconstructed nodes carry no
+        # decision, so otherwise the gate leaves every generated mesh un-symmetrized).
+        # Symmetric panels switch to a 3/4 view; the plane drives apply_symmetrize,
+        # and reuse twins inherit it from this canonical's logged symmetry.applied.
+        cut_plane = await symmetry.resolve_cut_plane(prompt=node.prompt, node_id=node.id)
+        if cut_plane != node.symmetry_cut_plane:
+            view = symmetry.image_view_for(cut_plane=cut_plane)
+            image_prompt = node.image_prompt
+            if image_prompt and node.prompt != image_prompt:
+                image_prompt = scene_context.wrap_image_prompt(
+                    node.prompt, node.proxy_shape, node.bbox.size, view=view,
+                )
+            node = node.model_copy(
+                update={"symmetry_cut_plane": cut_plane, "image_prompt": image_prompt},
+            )
+        rescaled = raw_dir / f"{node.id}.glb"
+        # Serialize against a concurrent per-asset regeneration of this same node
+        # (both write its files); distinct nodes never contend.
+        async with node_lock(run_id, node.id):
+            # A regeneration may have (re)built this node while we waited for the
+            # lock — don't redo it, but still unblock any reuse of this canonical.
+            if (opt_dir / f"{node.id}.glb").exists():
+                raw_ready[node.id].set()
+                return
+            try:
+                await _generate_one(
+                    node,
+                    raw=raw_dir / f"{node.id}.raw.glb",
+                    path=rescaled,
+                    image_stem=raw_dir / node.id,
+                    runs_dir=runs_dir,
+                    backend=backend,
+                )
+            finally:
+                # Raw is on disk now (or generation failed) — unblock any reuse
+                # waiting on this asset; it re-checks the file and bails if none.
+                raw_ready[node.id].set()
+            if rescaled.exists():
+                await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+
+    async def _reuse(node: Node, source_id: str) -> None:
+        # Wait for the source's mesh to land, then rescale ITS raw Trellis output
+        # into this node's slot — exactly as a fresh build would, so the reuse
+        # lands identically posed. No Nano-Banana, no Trellis.
+        await raw_ready[source_id].wait()
+        async with node_lock(run_id, node.id):
+            if (opt_dir / f"{node.id}.glb").exists():
+                return
+            await _rescale_reuse_from_raw(
+                node,
+                src_raw=raw_dir / f"{source_id}.raw.glb",
+                raw_dir=raw_dir,
+                opt_dir=opt_dir,
+                source_id=source_id,
+            )
+
+    # Apply the scene grouping. Seed this version's log with each decision so regen
+    # / resolve_group / the reuse-images fork read the grouping from here, while
+    # honoring a decision already on disk (a per-version promotion) and never
+    # flipping a pre-built asset into a reuse.
+    tasks: list[asyncio.Task[None]] = []
+    for node in nodes:
+        done = (opt_dir / f"{node.id}.glb").exists()
+        decided = logging.find_event("prefab.match", id=node.id)
+        if decided is not None:
+            reuse_id = str(decided.get("reuse_id") or "")
+        else:
+            reuse_id = "" if _built(node.id) else decisions.get(node.id, "")
+            logging.log("prefab.match", id=node.id, reuse_id=reuse_id, description=node.prompt)
+
+        is_reuse = bool(reuse_id) and reuse_id in canonical_ids
+        if not is_reuse:
+            # Canonical (a seed or a pre-built original); reuses rescale its raw mesh.
+            canonical_ids.add(node.id)
+            ev = raw_ready.setdefault(node.id, asyncio.Event())
+            if done or _has_raw(node.id):
+                ev.set()
+
+        if done:
+            continue
+        tasks.append(
+            asyncio.create_task(_reuse(node, reuse_id) if is_reuse else _fresh(node))
+        )
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def regenerate_one(
+    *,
+    node: Node,
+    runs_dir: Path,
+    run_id: str,
+    subdir: str = "objects",
+    optimize: bool = False,
+    backend: str = DEFAULT_MESH_BACKEND,
+    generated: bool = False,
+    reuse_image: bool = False,
+) -> None:
+    """Rebuild a single mesh FRESH on `backend` (one of `MESH_BACKENDS`): unlink
+    every prior on-disk artifact for this node under `subdir` so the cache-aware
+    checks inside `nano_banana.generate_resumable` and the chosen backend's
+    `generate_mesh` miss and issue new API calls, then re-run Nano-Banana + that
+    backend + rescale. With
+    `optimize=True` the freshly built mesh is run through the library optimizer
+    into the sibling `objects-generated-optimized/` served twin (the from-scratch
+    generated pipeline — `subdir` is then `objects-generated`);
+    the library path leaves it off.
+
+    `reuse_image=True` keeps the node's existing reference image and rebuilds ONLY
+    the mesh ("regenerate from image"): the image isn't unlinked and `_generate_one`
+    reuses it instead of calling Nano-Banana. Default False regenerates the image
+    too ("regenerate from scratch").
+
+    With `generated=True` the rebuild runs under the (cell, node)'s build lock, so
+    a concurrent whole-scene generate can never write this node's files at the same
+    time. The library retry path passes generated=False (no concurrent gate).
+
+    Awaitable core shared by the library single-mesh retry (`retry_node`, a
+    detached + `_pending`-tracked wrapper) and standalone generated-asset
+    regeneration (awaited directly under its own cell task)."""
+    if not generated:
+        await _rebuild_one(
+            node=node, runs_dir=runs_dir, run_id=run_id,
+            subdir=subdir, optimize=optimize, backend=backend, reuse_image=reuse_image,
+        )
+        return
+    async with node_lock(run_id, node.id):
+        await _rebuild_one(
+            node=node, runs_dir=runs_dir, run_id=run_id,
+            subdir=subdir, optimize=optimize, backend=backend, reuse_image=reuse_image,
+        )
+
+
+async def _rebuild_one(
+    *,
+    node: Node,
+    runs_dir: Path,
+    run_id: str,
+    subdir: str,
+    optimize: bool,
+    backend: str,
+    reuse_image: bool = False,
+) -> None:
+    objs_dir = runs_dir / run_id / subdir
+    objs_dir.mkdir(parents=True, exist_ok=True)
+    raw = objs_dir / f"{node.id}.raw.glb"
+    path = objs_dir / f"{node.id}.glb"
+    image_stem = objs_dir / node.id
+    # Drop only the prior MESH so the backend rebuilds it fresh. The reference
+    # image is NEVER deleted here: a from-scratch rebuild re-rolls it via
+    # `force_image` (which writes only on success, so a failed image call — e.g.
+    # the API key being down — leaves the existing image intact instead of wiping
+    # it and breaking a later from-image regen), and a from-image rebuild reuses it.
+    for artifact in (raw, path):
+        artifact.unlink(missing_ok=True)
+    logging.log("mesh.retry", id=node.id, prompt=node.prompt, backend=backend)
+    node = await _refresh_node_image_prompt(node)
+    await _generate_one(
+        node, raw=raw, path=path, image_stem=image_stem, runs_dir=runs_dir,
+        backend=backend, reuse_image=reuse_image, force_image=not reuse_image,
+    )
+    if optimize and path.exists():
+        # Served twin sits beside the raw dir, so the same version subdir
+        # (generated/<v>/objects-generated → .../objects-generated-optimized).
+        await _optimize_asset(
+            path, objs_dir.parent / GENERATED_OPT_SUBDIR / f"{node.id}.glb",
+        )
+
+
 async def retry_node(
     *,
     node: Node,
     runs_dir: Path,
     run_id: str,
 ) -> asyncio.Task[None]:
-    """Standalone re-generation of a single failed mesh — always FRESH:
-    every prior on-disk artifact for this node is unlinked so the
-    cache-aware checks inside `nano_banana.generate_resumable` and
-    `threed.generate_mesh` miss and issue new API calls. The user is
-    asking for "give this object another shot," not "reuse what we had,"
-    so a stale banana image (e.g. one that produced a broken Trellis run)
-    doesn't get recycled. Registered on `_pending` so `cancel_pending`
-    (slot reset / teardown) can tear it down alongside in-flight
-    pipeline meshes."""
-    objs_dir = runs_dir / run_id / "objects"
-    objs_dir.mkdir(parents=True, exist_ok=True)
-    raw = objs_dir / f"{node.id}.raw.glb"
-    path = objs_dir / f"{node.id}.glb"
-    image_stem = objs_dir / node.id
-    image_path = image_stem.parent / f"{image_stem.name}.png"
-    for artifact in (image_path, raw, path):
-        artifact.unlink(missing_ok=True)
-    logging.log("mesh.retry", id=node.id, prompt=node.prompt)
+    """Standalone re-generation of a single failed mesh in the LIBRARY pipeline
+    (`objects/`). Fire-and-forget: the fresh build (`regenerate_one`) runs as a
+    detached task registered on `_pending` so `cancel_pending` (slot reset /
+    teardown) can tear it down alongside in-flight pipeline meshes."""
     task = asyncio.create_task(
-        _generate_one(
-            node,
-            raw=raw,
-            path=path,
-            image_stem=image_stem,
-            runs_dir=runs_dir,
-        ),
+        regenerate_one(node=node, runs_dir=runs_dir, run_id=run_id),
     )
     _pending.setdefault(run_id, []).append(task)
     return task
+
+
+async def propagate_reuses(
+    *,
+    canonical_id: str,
+    reuses: list[Node],
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Re-derive every `reuses` node from `canonical_id`'s raw Trellis mesh —
+    rescaling it into each reuse's own bbox/orientation and optimizing into the
+    served twin. Pairs with a prior FRESH build of the canonical
+    (`regenerate_one` with optimize=True) to push a regenerated prefab out to
+    every object that shares it within this generated `version`. Awaited under
+    the caller's cell task, so a cancellation there tears the fan-out down via
+    the gather."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{canonical_id}.raw.glb"
+
+    async def _one(node: Node) -> None:
+        # Lock per reuse so a concurrent whole-scene generate (or another regen)
+        # of the same node can't write its files at the same time.
+        async with node_lock(run_id, node.id):
+            await _rescale_reuse_from_raw(
+                node, src_raw=src_raw, raw_dir=raw_dir, opt_dir=opt_dir, source_id=canonical_id,
+            )
+
+    coros = [_one(node) for node in reuses]
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
+
+
+def recover_group_image(
+    runs_dir: Path, run_id: str, target_id: str, group_ids: list[str],
+) -> bool:
+    """Best-effort restore of a node's reference image (the raw-dir `<id>.png` a
+    from-image rebuild reads) when that copy is missing but the same image still
+    exists elsewhere. The same picture is duplicated in a few places:
+      * the OPTIMIZED twin (`objects-generated-optimized/<id>.png`) — copied there
+        by the optimize pass; survives even when the raw-dir copy was removed;
+      * every prefab group member (`group_ids`) holds a copy in either dir (a reuse
+        copies its canonical's image).
+    So if `<id>.png` is gone we restore it from the first of those that exists,
+    letting a from-image rebuild proceed without re-generating. Returns True if the
+    raw-dir image is present afterward (already there, or recovered), else False."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    target_png = raw_dir / f"{target_id}.png"
+    if target_png.exists():
+        return True
+    candidates = [opt_dir / f"{target_id}.png"]
+    for gid in group_ids:
+        candidates.append(raw_dir / f"{gid}.png")
+        candidates.append(opt_dir / f"{gid}.png")
+    for src in candidates:
+        if src.exists():
+            shutil.copyfile(src, target_png)
+            logging.log("image.recovered", id=target_id, source=f"{src.parent.name}/{src.stem}")
+            return True
+    return False
+
+
+async def unsymmetrize_one(
+    *,
+    node: Node,
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Rebuild a generated object's served mesh from its OWN raw mesh with NO
+    symmetry mirror — i.e. reveal the full, un-mirrored model the mirror was
+    hiding. No Nano-Banana and no mesh backend: just reload the on-disk raw,
+    rescale it into the node's bbox, and re-optimize the served twin, so it's
+    effectively instant and free. Pins the node's symmetry decision/applied to
+    `none` so a later resume, regeneration, or prefab-reuse keeps it un-mirrored.
+    A missing raw (e.g. a prefab reuse with no own raw) is logged and skipped —
+    the caller un-symmetrizes the canonical and propagates instead. Runs under the
+    node lock so it can't race a concurrent scene build or regen of the same node."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{node.id}.raw.glb"
+    async with node_lock(run_id, node.id):
+        if not src_raw.exists():
+            logging.log("symmetry.skip", id=node.id, reason="unsymmetrize: no raw mesh on disk")
+            return
+        # Pin the decision so the resolver, the reuse-from-raw path, and any future
+        # regeneration all stop re-mirroring this node.
+        logging.log("symmetry.decision", id=node.id, cut_plane="none", encapsulating=False)
+        logging.log("symmetry.applied", id=node.id, cut_plane="none")
+        rescaled = raw_dir / f"{node.id}.glb"
+        try:
+            async with _MESH_IO:
+                scene = await asyncio.to_thread(trimesh.load, src_raw)
+                placed = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
+                )
+                tmp = rescaled.with_name(f"{rescaled.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, placed, tmp)
+                    os.replace(tmp, rescaled)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                del scene, placed
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+            logging.log("symmetry.unsymmetrized", id=node.id)
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"unsymmetrize: {type(e).__name__}: {e}")
+
+
+async def symmetrize_one(
+    *,
+    node: Node,
+    cut_plane: Literal["xy", "xz"],
+    keep_positive: bool,
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Mirror a generated object's served mesh across `cut_plane`, keeping the
+    `keep_positive` half — the symmetrize counterpart to `unsymmetrize_one`. The
+    plane + direction come straight from the caller (the client control), so this
+    makes NO symmetry LLM decision and reads NO prior symmetry log to pick them. No
+    Nano-Banana and no mesh backend: reload the on-disk raw (always the pristine,
+    un-mirrored Trellis output, so re-mirroring is idempotent regardless of the
+    current served state), apply the mirror, rescale into the node's bbox, and
+    re-optimize the served twin. Pins the symmetry decision to `cut_plane` and lets
+    `apply_symmetrize` record `symmetry.applied` (carrying `keep_positive`) so a
+    resume / regeneration / prefab-reuse replays the same mirror and direction. A
+    missing raw (e.g. a prefab reuse with no own raw) is logged and skipped — the
+    caller symmetrizes the canonical and propagates. Runs under the node lock."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{node.id}.raw.glb"
+    async with node_lock(run_id, node.id):
+        if not src_raw.exists():
+            logging.log("symmetry.skip", id=node.id, reason="symmetrize: no raw mesh on disk")
+            return
+        logging.log("symmetry.decision", id=node.id, cut_plane=cut_plane, encapsulating=False)
+        rescaled = raw_dir / f"{node.id}.glb"
+        try:
+            async with _MESH_IO:
+                scene = await asyncio.to_thread(trimesh.load, src_raw)
+                scene = await symmetry.apply_symmetrize(
+                    scene, cut_plane=cut_plane, node_id=node.id, keep_positive=keep_positive,
+                )
+                placed = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
+                )
+                tmp = rescaled.with_name(f"{rescaled.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, placed, tmp)
+                    os.replace(tmp, rescaled)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                del scene, placed
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+            logging.log("symmetry.symmetrized", id=node.id, cut_plane=cut_plane, keep_positive=keep_positive)
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"symmetrize: {type(e).__name__}: {e}")
 
 
 async def await_pending(run_id: str) -> None:

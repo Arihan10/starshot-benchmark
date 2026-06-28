@@ -347,7 +347,7 @@ def create_app() -> FastAPI:
                 model=TRELLIS_MODEL,
                 inputs=I3dInputs(image=req.image_url),
                 settings=ISettings(
-                    remesh=False, resolution=512, textureSize=1024,
+                    remesh=False, resolution=1024, textureSize=2048,
                 ),
                 outputFormat="GLB",
                 outputType="URL",
@@ -506,7 +506,7 @@ _PAGE = """<!doctype html>
       Production settings (locked, identical to <code>app.services.threed</code>):<br>
       • <b>nano-banana-2</b> (<code>google:4@3</code>): 512×512, thinking=MINIMAL<br>
       • <b>nano-banana-pro</b> (<code>google:4@2</code>): 1024×1024<br>
-      • <b>trellis</b>: remesh=off, resolution=512, textureSize=1024
+      • <b>trellis</b>: remesh=off, resolution=1024, textureSize=2048
     </div>
 
     <div id="status"></div>
@@ -581,8 +581,8 @@ const wrappedNewEl = $("#wrapped-new");
 // Production trellis settings — locked to match server/app/services/threed.py
 const TRELLIS_PROD_SETTINGS = {
   remesh: false,
-  resolution: 512,
-  texture_size: 1024,
+  resolution: 1024,
+  texture_size: 2048,
 };
 
 const PROMPT_KEY = "playground.prompt";

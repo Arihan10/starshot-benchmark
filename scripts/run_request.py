@@ -62,6 +62,23 @@ def _signal_group(pgid: int, sig: int) -> None:
 def _shutdown(proc: subprocess.Popen[bytes]) -> None:
     if proc.poll() is not None:
         return
+    if os.name == "nt":
+        # Windows has no POSIX process groups / SIGINT-to-tree, and `uv run` spawns
+        # uvicorn (or node) as a child — so force-kill the whole tree by PID.
+        # Without this, os.getpgid/os.killpg below raise AttributeError on Windows,
+        # the shutdown fails, and the server is orphaned: it keeps draining any
+        # in-flight request (e.g. a slow prefab-test matching) until it finishes.
+        subprocess.run(
+            ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        return
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:

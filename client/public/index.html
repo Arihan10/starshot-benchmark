@@ -3093,6 +3093,255 @@
 			.rc-obs:not(.open) {
 				display: none;
 			}
+			/* Generated-asset view controls (overlay toolbar) + per-object
+			   regenerate / symmetry actions (trace panel) — from the hunyuan
+			   generation + symmetry features. */
+			#btn-asset-mode.on,
+			#btn-asset-optimized.on {
+				border-color: var(--accent);
+				color: var(--accent);
+			}
+			#btn-generate {
+				font-weight: 600;
+			}
+			.gen-status {
+				font-size: 10px;
+				color: var(--text-faint);
+				align-self: center;
+			}
+			.tp-actions {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+				margin-top: 4px;
+				padding-top: 8px;
+				border-top: 1px solid var(--line);
+			}
+			.tp-act-row {
+				display: flex;
+				flex-wrap: wrap;
+				align-items: center;
+				gap: 6px;
+			}
+			.tp-act-btn {
+				font-size: 11px;
+				padding: 3px 9px;
+			}
+			.tp-act-sel {
+				font-size: 11px;
+				padding: 2px 4px;
+			}
+			.tp-act-check {
+				display: inline-flex;
+				align-items: center;
+				gap: 4px;
+				font-size: 10px;
+				color: var(--text-dim);
+			}
+			.tp-act-sym {
+				font-size: 10px;
+				color: var(--text-faint);
+			}
+			/* Global mesh-generation queue panel (bottom-right): every in-flight +
+			   waiting generation across the concurrency pools, from /trellis/queue. */
+			#queue-panel {
+				position: fixed;
+				right: 12px;
+				bottom: 12px;
+				width: 270px;
+				max-height: 50vh;
+				display: flex;
+				flex-direction: column;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-radius: 8px;
+				z-index: 105; /* above the overlay (100), below inquiry (110) + modals (120) */
+				font-size: 12px;
+				box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+				overflow: hidden;
+			}
+			#queue-head {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				padding: 7px 10px;
+				cursor: pointer;
+				user-select: none;
+				flex-shrink: 0;
+			}
+			#queue-head .q-title {
+				color: var(--text-dim);
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+				font-size: 10px;
+			}
+			#queue-head .q-caret {
+				color: var(--text-faint);
+				font-size: 10px;
+			}
+			#queue-panel .q-count {
+				margin-left: auto;
+				min-width: 18px;
+				text-align: center;
+				color: var(--bg);
+				background: var(--text-faint);
+				border-radius: 999px;
+				padding: 0 6px;
+				font-variant-numeric: tabular-nums;
+			}
+			#queue-panel.busy .q-count {
+				background: var(--accent);
+			}
+			#queue-body {
+				display: none;
+				overflow-y: auto;
+				padding: 0 8px 8px;
+			}
+			#queue-panel.open #queue-body {
+				display: block;
+			}
+			.q-empty {
+				color: var(--text-faint);
+				padding: 4px 2px 2px;
+			}
+			.q-section {
+				margin-top: 6px;
+			}
+			.q-sec-head {
+				display: flex;
+				justify-content: space-between;
+				color: var(--text-faint);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				padding: 2px 0;
+				border-bottom: 1px solid var(--line);
+			}
+			.q-row {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				padding: 3px 0;
+			}
+			.q-dot {
+				width: 7px;
+				height: 7px;
+				border-radius: 50%;
+				flex-shrink: 0;
+				background: var(--text-faint);
+			}
+			.q-dot.processing {
+				background: var(--accent);
+				animation: q-pulse 1.2s ease-in-out infinite;
+			}
+			.q-dot.waiting {
+				background: var(--amber);
+			}
+			@keyframes q-pulse {
+				0%,
+				100% {
+					opacity: 1;
+				}
+				50% {
+					opacity: 0.35;
+				}
+			}
+			.q-job {
+				flex: 1;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				color: var(--text);
+			}
+			.q-backend {
+				color: var(--text-faint);
+				font-size: 10px;
+			}
+			.q-state {
+				color: var(--text-dim);
+				font-size: 10px;
+			}
+			/* Reference image in the object viewer, beneath the 3D mini preview. */
+			.tp-img-wrap {
+				display: flex;
+				flex-direction: column;
+				gap: 2px;
+			}
+			.tp-preview-img {
+				width: 100%;
+				max-height: 220px;
+				object-fit: contain;
+				border: 1px solid var(--line);
+				border-radius: 6px;
+				background: #0c0d10;
+			}
+			/* Lighting panel — opened from the ☀ light toggle in #viewer-toggles;
+			   floats bottom-left over the canvas, shifting clear of the trace panel. */
+			#lighting-panel {
+				position: absolute;
+				left: 10px;
+				bottom: 46px;
+				width: 230px;
+				display: none;
+				flex-direction: column;
+				gap: 6px;
+				padding: 10px;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-radius: 8px;
+				z-index: 8;
+				transition: left 0.2s ease;
+			}
+			#lighting-panel.open {
+				display: flex;
+			}
+			#canvas-host:has(#trace-panel.open) #lighting-panel {
+				left: calc(var(--trace-w) + 16px);
+			}
+			#lighting-panel .lp-head {
+				display: flex;
+				justify-content: space-between;
+				align-items: center;
+			}
+			#lighting-panel .lp-title {
+				color: var(--text-dim);
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+				font-size: 10px;
+			}
+			#lighting-panel .lp-reset {
+				font-size: 10px;
+				padding: 2px 7px;
+			}
+			.lp-row {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				font-size: 11px;
+			}
+			.lp-row .lp-lab {
+				flex: 0 0 78px;
+				color: var(--text-faint);
+			}
+			.lp-row .lp-slider {
+				flex: 1;
+				min-width: 0;
+			}
+			.lp-row .lp-val {
+				flex: 0 0 38px;
+				text-align: right;
+				color: var(--text-dim);
+				font-variant-numeric: tabular-nums;
+			}
+			.lp-row.lp-check {
+				gap: 8px;
+				color: var(--text-dim);
+				margin-top: 2px;
+			}
+			#btn-lighting.on {
+				border-color: var(--accent);
+				color: var(--accent);
+			}
 		</style>
 		<script type="importmap">
 			{

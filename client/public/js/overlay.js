@@ -41,6 +41,21 @@ let obs = createObsModel();
 let renderQueued = false;
 let openSeq = 0; // monotonically increasing guard for async open races
 let lastLayersSig = null; // skips rebuilding the layer legend when unchanged
+// Asset view: which mesh build the 3D view shows + the generate gate's polling.
+let assetMode = "library"; // "library" | "generated"
+let optimizedView = true; // generated meshes: optimized KTX2/Meshopt twin vs raw
+let genPollTimer = null;
+let genMeshSig = null; // last generate-status mesh signature, to skip redundant work
+let lastGenMesh = new Map(); // node id -> { url, v, plane, was } from the last poll
+let loadedGen = new Map(); // node id -> mtime currently loaded in the main viewer
+let assetBtn = null;
+let genBtn = null;
+let optBtn = null;
+let genStatusEl = null;
+
+// Cache-bust a generated mesh URL by its mtime token, so a regenerated asset
+// (same id + path, new bytes) reloads instead of serving a stale cached GLB.
+const withV = (url, v) => url + (url.includes("?") ? "&" : "?") + "v=" + v;
 
 export function initOverlay(sceneViewer) {
 	viewer = sceneViewer;
@@ -54,6 +69,28 @@ export function initOverlay(sceneViewer) {
 		onNavigate: focusNode,
 		onClose: () => viewer.clearSelection(),
 		onInquire: openInquiryForCall,
+		// Per-object generated-asset controls, live only while viewing a source
+		// cell's generated build: regenerate on a chosen backend + symmetry ops.
+		actions: {
+			available: () =>
+				!!state.view && !state.view.branch && assetMode === "generated",
+			symmetryOf: (id) => {
+				const m = lastGenMesh.get(id);
+				return m ? { plane: m.plane, was: m.was } : null;
+			},
+			onRegenerate: regenerateNode,
+			onSymmetrize: symmetrizeNode,
+			onUnsymmetrize: unsymmetrizeNode,
+		},
+		// Mini-preview mesh source: the generated mesh while in the generated view
+		// (null — bbox only — when this node has none yet), the library asset otherwise.
+		meshUrlFor: (id, node) => {
+			if (state.view && !state.view.branch && assetMode === "generated") {
+				const m = lastGenMesh.get(id);
+				return m && m.url ? withV(m.url, m.v) : null;
+			}
+			return node.meshUrl ?? null;
+		},
 	});
 
 	// Tree ↔ 3D linking. A node-row click toggles selection and frames the
@@ -137,6 +174,7 @@ export function initOverlay(sceneViewer) {
 	document
 		.getElementById("btn-refit")
 		.addEventListener("click", () => viewer.fit());
+	setupAssetControls();
 	actionBtn.addEventListener("click", onAction);
 	resetBtn.addEventListener("click", onReset);
 	on("slots", () => {
@@ -194,6 +232,219 @@ function refreshZoneLayers() {
 				`L${layer.depth}`,
 			),
 		);
+	}
+}
+
+// ── from-scratch generated assets: view toggle + generate gate + per-object ──
+// regenerate / symmetry. The generated build reuses the library scene's layout
+// (same node ids + bboxes), so switching modes just re-attaches the OTHER mesh
+// set onto the same boxes; the per-object actions live in the trace panel.
+
+function setupAssetControls() {
+	const refit = document.getElementById("btn-refit");
+	if (!refit || assetBtn) return;
+	assetBtn = el("button", {
+		id: "btn-asset-mode",
+		title: "toggle between the asset-library meshes and the from-scratch generated build",
+		text: "generated",
+		onclick: () =>
+			setAssetMode(assetMode === "generated" ? "library" : "generated"),
+	});
+	genBtn = el("button", {
+		id: "btn-generate",
+		title: "build (or resume) this scene's from-scratch generated assets",
+		text: "⚡ generate",
+		onclick: onGenerate,
+	});
+	optBtn = el("button", {
+		id: "btn-asset-optimized",
+		title: "generated view: optimized (KTX2/Meshopt) served meshes vs the raw Trellis output",
+		text: "optimized",
+		onclick: toggleOptimized,
+	});
+	genStatusEl = el("span", { id: "gen-status", class: "gen-status" });
+	refit.after(assetBtn, genBtn, optBtn, genStatusEl);
+	syncAssetControls();
+}
+
+// The toggle shows only on source cells (branches always render library meshes);
+// the generate button + status appear only while the generated view is active.
+function syncAssetControls() {
+	if (!assetBtn) return;
+	const show = !!state.view && !state.view.branch;
+	assetBtn.style.display = show ? "" : "none";
+	const gen = show && assetMode === "generated";
+	genBtn.style.display = gen ? "" : "none";
+	optBtn.style.display = gen ? "" : "none";
+	genStatusEl.style.display = gen ? "" : "none";
+	assetBtn.classList.toggle("on", assetMode === "generated");
+	assetBtn.textContent = assetMode === "generated" ? "generated ✓" : "generated";
+	optBtn.classList.toggle("on", optimizedView);
+	optBtn.textContent = optimizedView ? "optimized ✓" : "raw";
+}
+
+function setAssetMode(mode) {
+	if (!state.view || state.view.branch || mode === assetMode) return;
+	assetMode = mode;
+	stopGenPoll();
+	clearGeneratedState();
+	// Drop the current build's meshes so the incoming view shows ONLY its own —
+	// generated mode never layers over leftover library meshes (and vice versa).
+	viewer.clearMeshes();
+	syncAssetControls();
+	tracePanel.rerenderInfo();
+	if (assetMode === "generated") {
+		pollGenerated(); // loads each built generated mesh incrementally
+	} else {
+		loadLibraryMeshes();
+	}
+}
+
+function toggleOptimized() {
+	if (!state.view || state.view.branch || assetMode !== "generated") return;
+	optimizedView = !optimizedView;
+	syncAssetControls();
+	// Re-pull from the other source (optimized twin vs raw): drop what's loaded
+	// and let the poll re-attach from the freshly-chosen dir.
+	stopGenPoll();
+	loadedGen = new Map();
+	genMeshSig = null;
+	viewer.clearMeshes();
+	tracePanel.rerenderInfo();
+	pollGenerated();
+}
+
+// Forget the generated-view bookkeeping (on cell open, mode switch, or toggle).
+function clearGeneratedState() {
+	lastGenMesh = new Map();
+	loadedGen = new Map();
+	genMeshSig = null;
+	if (genStatusEl) genStatusEl.textContent = "";
+}
+
+// Library meshes load as one bundle (small, complete) onto the current scene.
+function loadLibraryMeshes() {
+	if (!state.view) return;
+	const { slot, model, branch } = state.view;
+	viewer.prefetchBundle(
+		branch ? api.branchMeshesUrl(branch) : api.meshesUrl(state.run, slot, model, {}),
+	);
+}
+
+async function onGenerate() {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.generate(state.run, slot, model);
+		toast(`generating ${slot} · ${model}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+function stopGenPoll() {
+	if (genPollTimer) {
+		clearTimeout(genPollTimer);
+		genPollTimer = null;
+	}
+}
+
+// Total objects/frames in the loaded scene — the denominator for the generate
+// gate's X/Y progress (every concrete node gets one generated mesh).
+function concreteNodeCount() {
+	let n = 0;
+	for (const node of obs.model.nodes.values()) {
+		if (node.kind === "object" || node.kind === "frame") n += 1;
+	}
+	return n;
+}
+
+// Poll the generate gate while a build/regen is in flight: refresh the symmetry
+// map (the trace-panel hint), re-attach meshes when the finished-id set grows,
+// and keep a small status label. Self-stops once nothing is running.
+async function pollGenerated() {
+	stopGenPoll();
+	if (!state.view || state.view.branch || assetMode !== "generated") return;
+	const { slot, model } = state.view;
+	const run = state.run;
+	let status = null;
+	try {
+		status = await api.generateStatus(run, slot, model, {});
+	} catch {
+		/* transient — the next poll (if still in generated mode) retries */
+	}
+	if (
+		!state.view ||
+		state.view.slot !== slot ||
+		state.view.model !== model ||
+		state.view.branch ||
+		assetMode !== "generated"
+	)
+		return;
+	if (!status) return;
+	const meshes = status.meshes ?? [];
+	lastGenMesh = new Map(
+		meshes.map((m) => [m.id, { url: m.url, v: m.v, plane: m.sym, was: m.symWas }]),
+	);
+	// Attach only newly-built / regenerated meshes (keyed by mtime), replacing a
+	// prior version in place — cheap during a live build, and a raw mesh that's
+	// already current is never re-downloaded.
+	for (const m of meshes) {
+		if (!m.url || loadedGen.get(m.id) === m.v) continue;
+		const had = loadedGen.has(m.id);
+		loadedGen.set(m.id, m.v);
+		const url = withV(m.url, m.v);
+		viewer.loadModel({ id: m.id, url }, api.absUrl(url), { replace: had });
+	}
+	const sig = meshes.map((m) => `${m.id}:${m.v}:${m.sym}`).join("|");
+	if (sig !== genMeshSig) {
+		genMeshSig = sig;
+		tracePanel.rerenderInfo();
+	}
+	const total = concreteNodeCount();
+	const done = status.count ?? 0;
+	const frac = total ? `${done}/${total}` : `${done}`;
+	genStatusEl.textContent = status.running ? `building… ${frac}` : `${frac} generated`;
+	if (status.running) genPollTimer = setTimeout(pollGenerated, 1500);
+}
+
+// Per-object actions from the trace panel (generated build only). Each enqueues
+// server-side work + propagates across the object's prefab group, then polls so
+// the new mesh swaps in when it lands.
+async function regenerateNode(id, opts) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.regenerate(state.run, slot, model, id, { ...opts, propagate: true });
+		toast(`regenerating ${id} · ${opts.backend}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+async function symmetrizeNode(id, opts) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.symmetrize(state.run, slot, model, id, { ...opts, propagate: true });
+		toast(`symmetrizing ${id}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+async function unsymmetrizeNode(id) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.unsymmetrize(state.run, slot, model, id, { propagate: true });
+		toast(`un-symmetrizing ${id}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
 	}
 }
 
@@ -314,6 +565,11 @@ export async function openCell({
 		state.view.model === model;
 	stream?.close();
 	stream = null;
+	// A fresh cell open always starts on the library build; the generated view
+	// is opt-in per open via the asset toggle.
+	assetMode = "library";
+	stopGenPoll();
+	clearGeneratedState();
 	state.view = { slot, model, branch };
 	// Close any inquiry chat that belongs to a different cell/mode (same-cell
 	// re-subscribes from resume/step keep it open).
@@ -584,6 +840,7 @@ function renderHeader() {
 	} else if (branchSel) {
 		branchSel.remove();
 	}
+	syncAssetControls();
 }
 
 // Revert the open source cell to just before `call` — confirms first (it
@@ -762,6 +1019,8 @@ export function closeOverlay() {
 	openSeq += 1;
 	stream?.close();
 	stream = null;
+	stopGenPoll();
+	assetMode = "library";
 	state.view = null;
 	overlayEl.classList.remove("open");
 	viewer.setActive(false);

@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>prefab studio — inspect prefab matching</title>
+        <style>
+            :root {
+                --bg: #0e1014;
+                --panel: #15171c;
+                --line: #2a2d34;
+                --ink: #e6e6e6;
+                --muted: #9aa0aa;
+                --faint: #5a5e68;
+                --blue-ink: #9ad4ff;
+                --purple: #8a5cc0;
+                --red: #ff8080;
+            }
+            * { box-sizing: border-box; }
+            html, body {
+                margin: 0;
+                height: 100%;
+                background: var(--bg);
+                color: var(--ink);
+                font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+            }
+            #app { display: grid; grid-template-rows: auto 1fr; height: 100%; min-height: 0; }
+            #bar {
+                display: flex;
+                align-items: center;
+                gap: 10px;
+                padding: 8px 12px;
+                border-bottom: 1px solid var(--line);
+                background: var(--panel);
+                flex-wrap: wrap;
+            }
+            #bar h1 { margin: 0; font-size: 14px; font-weight: 600; color: var(--blue-ink); }
+            #bar .sub { color: var(--faint); font-size: 10px; }
+            #bar a.back { color: var(--blue-ink); font-size: 10px; text-decoration: none; }
+            .spacer { flex: 1; }
+            select {
+                background: #0c0d10;
+                color: var(--ink);
+                border: 1px solid var(--line);
+                border-radius: 4px;
+                padding: 5px 8px;
+                font: inherit;
+                cursor: pointer;
+                max-width: 420px;
+            }
+            select:focus { outline: none; border-color: var(--blue-ink); }
+            button {
+                padding: 6px 12px;
+                border-radius: 4px;
+                border: 1px solid var(--purple);
+                background: #2a2030;
+                color: #d9b8ff;
+                font: inherit;
+                cursor: pointer;
+                white-space: nowrap;
+            }
+            button:hover:not(:disabled) { border-color: #b88ce0; color: #fff; }
+            button:disabled { opacity: 0.45; cursor: default; }
+            #status { color: var(--muted); font-size: 12px; min-width: 8em; }
+            #status.err { color: var(--red); }
+            #stage { position: relative; min-width: 0; min-height: 0; }
+            #stage canvas { display: block; }
+            #tip {
+                position: absolute;
+                pointer-events: none;
+                display: none;
+                max-width: 360px;
+                background: rgba(8, 10, 14, 0.96);
+                color: #e8e8e8;
+                border: 1px solid var(--line);
+                border-radius: 6px;
+                padding: 6px 9px;
+                font: 12px sans-serif;
+                z-index: 5;
+            }
+            #tip .name { font-weight: 600; color: #fff; word-break: break-all; }
+            #tip .desc { margin-top: 3px; color: #aab0ba; line-height: 1.35; }
+        </style>
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "/vendor/three/build/three.module.js",
+                    "three/addons/": "/vendor/three/examples/jsm/"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <div id="app">
+            <div id="bar">
+                <h1>prefab studio</h1>
+                <span class="sub">scene → seed-and-sweep matching → bboxes-only inspect</span>
+                <select id="scene" title="Pick a built scene (run / slot / model)">
+                    <option value="">loading scenes…</option>
+                </select>
+                <select id="version" title="Switch between saved matching versions" style="display: none"></select>
+                <button id="rerun" type="button" disabled>Re-run (new version)</button>
+                <span id="status">pick a scene to begin.</span>
+                <span class="spacer"></span>
+                <a class="back" href="/">← phrases</a>
+            </div>
+            <div id="stage">
+                <div id="tip"><div class="name"></div><div class="desc"></div></div>
+            </div>
+        </div>
+        <script type="module" src="/prefab.js"></script>
+    </body>
+</html>

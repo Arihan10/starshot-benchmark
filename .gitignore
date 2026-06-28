@@ -8,6 +8,7 @@ server/app/assets_library/assets-optimized-test/
 server/app/assets_library/assets-uastc-test/
 server/tools/optimize-assets/node_modules/
 server/dry_runs/
+server/studio-artifacts/
 previous_runs/
 .ruff_cache/
 **/__pycache__/
@@ -19,3 +20,4 @@ __pycache__/
 *.pyo
 *.pyd
 oneshot-runs/
+asset_viewer
