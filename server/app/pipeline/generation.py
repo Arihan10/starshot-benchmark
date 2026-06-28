@@ -44,7 +44,7 @@ from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
 from app.services import hunyuan, hunyuan_tencent, llm, nano_banana, prefabs, symmetry, threed
 from app.utils import glb_place, logging
-from app.utils.geometry import export_glb, rescale_mesh_to_bbox
+from app.utils.geometry import export_glb, rescale_mesh_to_bbox, rotate_mesh
 from app.utils.topology import validate_parents, validate_referenced_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
@@ -1375,6 +1375,34 @@ async def propagate_reuses(
         await asyncio.gather(*coros, return_exceptions=True)
 
 
+async def clone_canonical_raw(
+    *,
+    runs_dir: Path,
+    run_id: str,
+    source_id: str,
+    dest_id: str,
+) -> bool:
+    """Copy `source_id`'s raw Trellis mesh (and its reference image) onto
+    `dest_id` so `dest_id` becomes a self-sufficient prefab canonical holding the
+    SAME shared geometry. Used when a group's canonical is unlinked: the group is
+    handed off to one of its reuses, which inherits the canonical's raw here so the
+    remaining members keep their shared look (and stay re-derivable) once the old
+    canonical regenerates fresh. Runs under `dest_id`'s node lock so it can't race
+    a concurrent build/regen of that node. Returns whether the raw was copied (a
+    missing source raw is logged and skipped)."""
+    raw_dir, _opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{source_id}.raw.glb"
+    async with node_lock(run_id, dest_id):
+        if not src_raw.exists():
+            logging.log("prefab.reuse_missing", id=dest_id, source=source_id)
+            return False
+        await asyncio.to_thread(shutil.copyfile, src_raw, raw_dir / f"{dest_id}.raw.glb")
+        src_png = raw_dir / f"{source_id}.png"
+        if src_png.exists():
+            await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{dest_id}.png")
+        return True
+
+
 def recover_group_image(
     runs_dir: Path, run_id: str, target_id: str, group_ids: list[str],
 ) -> bool:
@@ -1497,6 +1525,83 @@ async def symmetrize_one(
             logging.log("symmetry.symmetrized", id=node.id, cut_plane=cut_plane, keep_positive=keep_positive)
         except Exception as e:  # noqa: BLE001
             logging.log("mesh.error", id=node.id, message=f"symmetrize: {type(e).__name__}: {e}")
+
+
+async def reorient_one(
+    *,
+    node: Node,
+    axis: Literal["x", "y", "z"],
+    degrees: int,
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Change a generated object's "front view" — which face points along +Z in
+    the raw, pre-transform mesh — by rotating its RAW mesh 90° (a `degrees`
+    multiple of 90) about `axis`, then re-deriving its served + optimized twin.
+
+    The raw is the pristine source every prefab reuse + every re-derivation reads,
+    so the rotation is BAKED into it: reload the on-disk raw, rotate, write it back
+    (atomically), then re-apply the object's current symmetry and rescale into its
+    bbox + yaw. The caller (`_regen_worker`) then `propagate_reuses`, which re-
+    derives every reuse from this same re-fronted raw — so the new front view lands
+    identically across the whole prefab group, in both the optimized and unoptimized
+    builds. No Nano-Banana, no mesh backend, so it's effectively instant. Runs under
+    the node lock so it can't race a scene build / regen of the same node. A missing
+    raw is logged and skipped (the caller passes the prefab CANONICAL, which always
+    owns the group's raw; a reuse has none of its own)."""
+    if degrees % 90 != 0:
+        logging.log("mesh.error", id=node.id, message=f"reorient: degrees must be a multiple of 90, got {degrees}")
+        return
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{node.id}.raw.glb"
+    rescaled = raw_dir / f"{node.id}.glb"
+    async with node_lock(run_id, node.id):
+        if not src_raw.exists():
+            logging.log("mesh.reorient_skip", id=node.id, reason="no raw mesh on disk")
+            return
+        # Re-apply the object's CURRENT symmetry when re-deriving, so re-fronting
+        # composes with an existing mirror (read from the canonical's log, like
+        # `_rescale_reuse_from_raw`) instead of silently dropping it.
+        cut_plane: Literal["none", "xy", "xz"] = "none"
+        keep_positive: bool | None = None
+        applied = logging.find_event("symmetry.applied", id=node.id)
+        if applied is not None:
+            raw_cp = applied.get("cut_plane")
+            if raw_cp in ("none", "xy", "xz"):
+                cut_plane = raw_cp  # type: ignore[assignment]
+            raw_keep = applied.get("keep_positive")
+            if isinstance(raw_keep, bool):
+                keep_positive = raw_keep
+        try:
+            async with _MESH_IO:
+                raw_scene = await asyncio.to_thread(trimesh.load, src_raw)
+                rotated = await asyncio.to_thread(rotate_mesh, raw_scene, axis=axis, degrees=degrees)
+                # Persist the re-fronted raw FIRST (atomic) — it is the new source
+                # of truth for this object AND every reuse derived from it.
+                tmp_raw = src_raw.with_name(f"{src_raw.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, rotated, tmp_raw)
+                    os.replace(tmp_raw, src_raw)
+                finally:
+                    tmp_raw.unlink(missing_ok=True)
+                # Re-derive the served mesh from the re-fronted raw.
+                placed = await symmetry.apply_symmetrize(
+                    rotated, cut_plane=cut_plane, node_id=node.id, keep_positive=keep_positive,
+                )
+                placed = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, placed, node.bbox, orientation=node.orientation,
+                )
+                tmp_rescaled = rescaled.with_name(f"{rescaled.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, placed, tmp_rescaled)
+                    os.replace(tmp_rescaled, rescaled)
+                finally:
+                    tmp_rescaled.unlink(missing_ok=True)
+                del raw_scene, rotated, placed
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+            logging.log("mesh.reorient", id=node.id, axis=axis, degrees=degrees)
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"reorient: {type(e).__name__}: {e}")
 
 
 async def await_pending(run_id: str) -> None:

@@ -11,6 +11,8 @@ export function el(tag, attrs = {}, ...children) {
       node.addEventListener(k.slice(2), v);
     } else if (k === "dataset") {
       for (const [dk, dv] of Object.entries(v)) node.dataset[dk] = dv;
+    } else if (typeof v === "boolean") {
+      if (v) node.setAttribute(k, "");
     } else {
       node.setAttribute(k, v);
     }

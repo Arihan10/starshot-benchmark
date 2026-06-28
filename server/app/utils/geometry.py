@@ -92,6 +92,29 @@ def rescale_mesh_to_bbox(
     return out
 
 
+def rotate_mesh(
+    mesh: trimesh.Trimesh | trimesh.Scene,
+    *,
+    axis: str,
+    degrees: float,
+) -> trimesh.Trimesh | trimesh.Scene:
+    """Rotate `mesh` by `degrees` about a world axis ('x'/'y'/'z'), returning a
+    rotated copy (the input is left untouched).
+
+    Used to re-front a raw mesh — change which face points along +Z, the intrinsic
+    "front" Trellis bakes in — before it is symmetrized + rescaled into its bbox.
+    The rotation is about the mesh-frame origin; the downstream rescale re-derives
+    the rotated AABB and re-centers it into the target box, so the pivot is moot
+    for placement (and the per-object raw preview just fits to whatever it loads)."""
+    vecs = {"x": [1.0, 0.0, 0.0], "y": [0.0, 1.0, 0.0], "z": [0.0, 0.0, 1.0]}
+    vec = vecs.get(axis.lower())
+    if vec is None:
+        raise ValueError(f"axis must be 'x', 'y', or 'z'; got {axis!r}")
+    out = mesh.copy()
+    out.apply_transform(trimesh.transformations.rotation_matrix(math.radians(degrees), vec))
+    return out
+
+
 def symmetrize_mesh(
     mesh: trimesh.Trimesh | trimesh.Scene,
     *,

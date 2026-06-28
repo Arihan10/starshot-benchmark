@@ -27,6 +27,9 @@ const BBOX_COLOR_FRAME = 0x7fb3d5;
 const BBOX_COLOR_HOVER = 0xffe14a;
 const BBOX_COLOR_SELECTED = 0x4af0e0;
 const BBOX_COLOR_OVERLAY = 0xff3df5; // prompt-lab "after" (proposed) boxes
+// Facing arrow drawn at the selected object/frame, pointing the way its
+// `orientation` yaw faces. Warm so it reads against the cyan selected bbox.
+const ORIENTATION_ARROW_COLOR = 0xffa033;
 
 // Object bbox (and its proxy wireframe) color keyed by the decomposition step
 // recorded as the node's `emitted_by` provenance. The overlay feeds the step
@@ -240,6 +243,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// at a node's center — the trace panel's mini preview toggles it on to make
 	// the baked orientation legible. Added to `scene`, so clear() leaves it be.
 	let axesGroup = null;
+	// Facing arrow for the selected object (see applyOrientationArrow). Added to
+	// `scene` like the axes gizmo, so select()/clear() manage it directly.
+	let orientationArrow = null;
 
 	// --- interaction state -----------------------------------------------------
 
@@ -534,6 +540,53 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		scene.add(axesGroup);
 	}
 
+	function clearOrientationArrow() {
+		if (!orientationArrow) return;
+		scene.remove(orientationArrow);
+		orientationArrow.line?.geometry?.dispose?.();
+		orientationArrow.line?.material?.dispose?.();
+		orientationArrow.cone?.geometry?.dispose?.();
+		orientationArrow.cone?.material?.dispose?.();
+		orientationArrow = null;
+	}
+
+	// Facing arrow: from the selected node's bbox center, pointing the way its
+	// `orientation` yaw faces. Trellis bakes each mesh's front along +Z and the
+	// node's orientation yaws that front about +Y (matching rescale_mesh_to_bbox),
+	// so the world facing is (sin θ, 0, cos θ). Drawn on top (depth-test off) like
+	// the axes gizmo. Only for concrete nodes — zones have no meaningful facing.
+	function applyOrientationArrow(id) {
+		clearOrientationArrow();
+		if (id === null) return;
+		const helper = bboxes.get(id);
+		const kind = kinds.get(id) ?? helper?.userData?.nodeKind ?? "zone";
+		if (!helper || kind === "zone") return;
+		// Needs the resolved yaw — absent (no nodeInfo wired, e.g. the mini /
+		// compare viewers, or a zone) means no meaningful facing, so no arrow.
+		const deg = nodeInfo(id)?.orientation;
+		if (typeof deg !== "number") return;
+		const theta = (deg * Math.PI) / 180;
+		const dir = new THREE.Vector3(Math.sin(theta), 0, Math.cos(theta));
+		const center = helper.box.getCenter(new THREE.Vector3());
+		const size = helper.box.getSize(new THREE.Vector3());
+		const length = Math.max(Math.max(size.x, size.y, size.z) * 0.6, 0.4);
+		const arrow = new THREE.ArrowHelper(
+			dir,
+			center,
+			length,
+			ORIENTATION_ARROW_COLOR,
+			length * 0.3,
+			length * 0.16,
+		);
+		for (const part of [arrow.line, arrow.cone]) {
+			part.material.depthTest = false;
+			part.material.transparent = true;
+			part.renderOrder = 997;
+		}
+		scene.add(arrow);
+		orientationArrow = arrow;
+	}
+
 	// The depths currently present among zone bboxes + each one's runtime color,
 	// for the overlay's layer legend. Layers are empty unless the mode is on.
 	function getZoneLayers() {
@@ -716,6 +769,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		if (prev !== null) applyBboxColor(prev);
 		if (selectedId !== null) applyBboxColor(selectedId);
 		for (const bid of bboxes.keys()) applyBboxVisibility(bid);
+		applyOrientationArrow(selectedId);
 		if (selectedId !== null && frame) {
 			const helper = bboxes.get(selectedId);
 			if (helper) {
@@ -733,6 +787,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		selectedId = null;
 		applyBboxColor(prev);
 		for (const bid of bboxes.keys()) applyBboxVisibility(bid);
+		clearOrientationArrow();
 		if (notify) onSelectCb(null);
 	}
 
@@ -1240,6 +1295,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			for (const m of mats) {
 				m.side = THREE.DoubleSide;
 				m.shadowSide = THREE.BackSide;
+				patchMaterialReceiveShadow(m);
 			}
 		});
 	}
@@ -1261,7 +1317,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	}
 
 	const failedUrls = new Set(); // `${gen}|${url}` — don't re-parse known-bad GLBs
-	async function loadModel(event, absUrl, { replace = false } = {}) {
+	async function loadModel(
+		event,
+		absUrl,
+		{ replace = false, onLoaded = null, onError = null } = {},
+	) {
 		const myGen = gen;
 		const k = `${myGen}|${absUrl}`;
 		// `replace` lets a changed mesh (same id, new bytes) re-attach over the old
@@ -1274,8 +1334,31 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				return;
 			}
 			attachGltf(event.id, gltf.scene, kinds.get(event.id));
+			// Hand the parsed scene (+ its world bounds) back so a caller can read
+			// the loaded geometry — the per-object trace preview frames the raw mesh
+			// on its own bounds and reads its PBR textures for the per-map view.
+			if (onLoaded) {
+				const box = new THREE.Box3().setFromObject(gltf.scene);
+				let bounds = null;
+				if (!box.isEmpty()) {
+					const c = box.getCenter(new THREE.Vector3());
+					const s = box.getSize(new THREE.Vector3());
+					bounds = {
+						center: [c.x, c.y, c.z],
+						size: Math.max(s.x, s.y, s.z),
+					};
+				}
+				onLoaded(gltf.scene, bounds);
+			}
 		} catch (e) {
 			failedUrls.add(k);
+			// A superseded load (the scene was cleared / focus moved on) must not
+			// fire callbacks — its fallback would attach the wrong node's mesh.
+			if (myGen !== gen) return;
+			if (onError) {
+				onError(e);
+				return;
+			}
 			console.warn(
 				`[scene3d] mesh load failed for ${event.id}:`,
 				e.message,
@@ -1454,6 +1537,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			fill.material?.dispose?.();
 		}
 		clearOverlayBoxes();
+		clearOrientationArrow();
 		bboxes.clear();
 		proxies.clear();
 		fills.clear();
@@ -1623,6 +1707,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		clearSelection,
 		getSelected: () => selectedId,
 		toggleHidden,
+		unhideAll: () => {
+			if (!hiddenIds.size) return;
+			hiddenIds.clear();
+			refreshAllVisibility();
+			onHiddenChangeCb();
+		},
 		isHidden: (id) => hiddenIds.has(id),
 		setNodeInfo: (fn) => {
 			nodeInfo = fn;

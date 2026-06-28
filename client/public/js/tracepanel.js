@@ -40,7 +40,7 @@ function statusDot(n) {
 const fmtVec = (a) => `(${a.map((x) => (+x).toFixed(2)).join(", ")})`;
 const fmtDims = (a) => a.map((x) => (+x).toFixed(2)).join(" × ");
 
-export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () => {}, onInquire = null, actions = null, meshUrlFor = (_id, node) => node.meshUrl ?? null } = {}) {
+export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () => {}, onInquire = null, actions = null, meshUrlFor = (_id, node) => node.meshUrl ?? null, rawMeshUrlFor = (_id, node) => (node.meshUrl ? node.meshUrl.replace(/\.glb(\?|$)/, ".raw.glb$1") : null) } = {}) {
   const nodeLabelEl = el("span", { class: "tp-node" });
 
   // Mini preview + its overlaid canonical-axes toggle. The axes are world-
@@ -77,8 +77,19 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
   imgWrap.style.display = "none";
   previewImg.onerror = () => { imgWrap.style.display = "none"; };
 
+  // Per-object texture maps: the raw mesh's PBR maps (base color, roughness,
+  // metallic, occlusion, normal, emissive), each rendered to its own thumbnail
+  // so every map can be inspected separately. Filled by `renderMaps` once the
+  // raw GLB loads; hidden when the focused node exposes no readable maps.
+  const mapsGrid = el("div", { class: "tp-maps-grid" });
+  const mapsWrap = el("div", { class: "tp-maps" },
+    el("div", { class: "tp-field-lab", text: "texture maps" }),
+    mapsGrid,
+  );
+  mapsWrap.style.display = "none";
+
   const fieldsEl = el("div", { class: "tp-fields" });
-  const infoEl = el("div", { class: "tp-info" }, previewHost, imgWrap, fieldsEl);
+  const infoEl = el("div", { class: "tp-info" }, previewHost, mapsWrap, imgWrap, fieldsEl);
   const bodyEl = el("div", { class: "tp-body" });
   const scrollEl = el("div", { id: "trace-panel-scroll" }, infoEl, bodyEl);
   const resizer = el("div", { id: "trace-panel-resizer", title: "drag to resize the panel" });
@@ -157,6 +168,7 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
   const expandedCalls = new Set(); // call indices whose detail is open
   let lastSig = null;
   let lastInfoSig = null;
+  let lastPreviewKey = null; // focused mesh currently in the mini viewer — skips needless reloads
   // One reusable mini viewer for the whole panel lifetime (1 WebGL context);
   // created lazily, never disposed — just cleared + reloaded per focus, and
   // paused (setActive false) whenever the panel is hidden.
@@ -196,33 +208,33 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
   // overlay is viewing the from-scratch generated build (actions.available()).
   // regenerate rebuilds the mesh fresh on the chosen backend (Trellis / Hunyuan
   // on Modal / Hunyuan 3.1 on Tencent); symmetrize / unsymmetrize mirror or
-  // reveal the raw mesh with no backend call. All propagate across the prefab group.
+  // reveal the raw mesh with no backend call. A plain regenerate propagates across
+  // the prefab group; the prefab section below adds unlink (diverge this object
+  // alone) and link (join another group).
   function buildActions(id) {
-    const backendSel = el("select", { class: "tp-act-sel", title: "mesh backend for regenerate" },
+    const busy = !!actions.isBusy?.(id);
+    const backendSel = el("select", { class: "tp-act-sel", title: "mesh backend for regenerate", disabled: busy },
       ...["trellis", "hunyuan", "hunyuan-tencent"].map((b) => el("option", { value: b, text: b })));
-    const reuse = el("input", { type: "checkbox" });
+    const reuse = el("input", { type: "checkbox", disabled: busy });
     const sym = actions.symmetryOf?.(id);
     const mirrored = !!sym && (sym.plane === "xy" || sym.plane === "xz");
 
-    // Symmetry is one toggle: a mirrored asset shows ONLY un-symmetrize, an
-    // un-mirrored one shows ONLY symmetrize (+ the plane to mirror across).
     let symRow;
     if (mirrored) {
       symRow = el("div", { class: "tp-act-row" },
         el("button", {
           class: "tp-act-btn", text: "unsymmetrize",
-          title: `reveal the full, un-mirrored mesh (currently mirrored across ${sym.plane})`,
+          disabled: busy,
+          title: busy ? "this asset is currently generating" : `reveal the full, un-mirrored mesh (currently mirrored across ${sym.plane})`,
           onclick: () => actions.onUnsymmetrize(id),
         }),
       );
     } else {
-      const planeSel = el("select", { class: "tp-act-sel", title: "mirror plane" },
+      const planeSel = el("select", { class: "tp-act-sel", title: "mirror plane", disabled: busy },
         el("option", { value: "xy", text: "xy · front/back" }),
         el("option", { value: "xz", text: "xz · top/bottom" }),
       );
-      // Which half to keep, mirrored onto the other. Labels follow the plane
-      // (xy: front/back along Z, xz: top/bottom along Y); value = keep_positive.
-      const keepSel = el("select", { class: "tp-act-sel", title: "which half to keep, then mirror onto the other" });
+      const keepSel = el("select", { class: "tp-act-sel", title: "which half to keep, then mirror onto the other", disabled: busy });
       const KEEP = {
         xy: [["true", "keep front"], ["false", "keep back"]],
         xz: [["true", "keep top"], ["false", "keep bottom"]],
@@ -235,7 +247,8 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
       symRow = el("div", { class: "tp-act-row" },
         el("button", {
           class: "tp-act-btn", text: "symmetrize",
-          title: "mirror this asset across the chosen plane, keeping the chosen half",
+          disabled: busy,
+          title: busy ? "this asset is currently generating" : "mirror this asset across the chosen plane, keeping the chosen half",
           onclick: () => actions.onSymmetrize(id, {
             plane: planeSel.value,
             keepPositive: keepSel.value === "true",
@@ -248,20 +261,124 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     const symText = mirrored
       ? `mirrored · ${sym.plane}`
       : sym && sym.was ? `un-symmetrized (was ${sym.was})` : "";
+    const imgPrompt = actions.imagePromptOf?.(id) ?? null;
     return el("div", { class: "tp-actions" },
-      el("div", { class: "tp-field-lab", text: "generated asset" }),
+      el("div", { class: "tp-field-lab", text: busy ? "generated asset · generating…" : "generated asset" }),
+      imgPrompt ? el("div", { class: "tp-field-group" },
+        el("div", { class: "tp-field-lab", text: "image prompt" }),
+        el("div", { class: "tp-field-val tp-img-prompt", text: imgPrompt }),
+      ) : null,
       el("div", { class: "tp-act-row" },
         el("button", {
           class: "tp-act-btn", text: "regenerate",
-          title: "rebuild this asset's mesh fresh on the chosen backend (propagates to its prefab group)",
+          disabled: busy,
+          title: busy ? "this asset is currently generating" : "rebuild this asset's mesh fresh on the chosen backend (propagates to its prefab group)",
           onclick: () => actions.onRegenerate(id, { backend: backendSel.value, reuseImage: reuse.checked }),
         }),
         backendSel,
         el("label", { class: "tp-act-check", title: "reuse the existing reference image (skip Nano-Banana)" }, reuse, "reuse image"),
       ),
+      buildRenderToggle(id),
       symRow,
       symText ? el("div", { class: "tp-act-sym", text: symText }) : null,
+      buildFrontView(id, busy),
+      buildPrefabSection(id, backendSel, reuse, busy),
     );
+  }
+
+  // Per-object render toggle: flip THIS object between its optimized (KTX2 /
+  // Meshopt) and unoptimized ("raw") mesh in the main scene — a pure view swap
+  // (both already on disk), no rebuild. Hidden unless both variants exist
+  // (actions.optimizedOf returns the effective mode, or null).
+  function buildRenderToggle(id) {
+    const mode = actions.optimizedOf?.(id);
+    if (!mode || !actions.onSetOptimized) return null;
+    return el("div", { class: "tp-act-row" },
+      el("span", { class: "tp-act-sym", text: "render" }),
+      el("button", {
+        class: "tp-act-btn",
+        text: mode === "optimized" ? "optimized ✓" : "raw",
+        title: "swap this object between the optimized (KTX2/Meshopt) and unoptimized raw mesh in the scene — no rebuild",
+        onclick: () => actions.onSetOptimized(id, mode === "optimized" ? "raw" : "optimized"),
+      }),
+    );
+  }
+
+  // Front-view controls: rotate the object's RAW mesh 90° about an axis so a
+  // different face becomes the front (the +Z-facing side of the raw, pre-transform
+  // mesh). Each rotation re-fronts the WHOLE prefab group — the server bakes it
+  // into the canonical's raw and re-derives every reuse + the optimized twin.
+  function buildFrontView(id, busy) {
+    if (!actions.onReorient) return null;
+    const rot = (label, axis, degrees, tip) => el("button", {
+      class: "tp-act-btn",
+      text: label,
+      disabled: busy,
+      title: busy ? "this asset is currently generating" : tip,
+      onclick: () => actions.onReorient(id, { axis, degrees }),
+    });
+    return el("div", { class: "tp-frontview" },
+      el("div", { class: "tp-field-lab", text: "front view" }),
+      el("div", { class: "tp-act-row" },
+        rot("pitch ↓", "x", 90, "tip the raw mesh 90° about X — brings the +Y face to the +Z front (re-fronts the whole prefab group)"),
+        rot("pitch ↑", "x", -90, "tip the raw mesh -90° about X — brings the -Y face to the +Z front (re-fronts the whole prefab group)"),
+        rot("yaw →", "y", 90, "turn the raw mesh 90° about Y — brings the -X face to the +Z front (re-fronts the whole prefab group)"),
+        rot("yaw ←", "y", -90, "turn the raw mesh -90° about Y — brings the +X face to the +Z front (re-fronts the whole prefab group)"),
+        rot("roll ↺", "z", 90, "roll the raw mesh 90° about Z — rotates the front face in-plane (re-fronts the whole prefab group)"),
+        rot("roll ↻", "z", -90, "roll the raw mesh -90° about Z — rotates the front face in-plane (re-fronts the whole prefab group)"),
+      ),
+    );
+  }
+
+  // The prefab-group controls within the generated-asset block: a status line
+  // (canonical / reuse / standalone + group size), an "unlink + regenerate" that
+  // pulls this object out of its group so it diverges alone (reusing the backend +
+  // reuse-image controls above), and a "link" that joins it into another group so
+  // it shares that group's mesh. Hidden until the object has a generated mesh.
+  function buildPrefabSection(id, backendSel, reuse, busy) {
+    const prefab = actions.prefabOf?.(id) ?? null;
+    if (!prefab) return null;
+    const targets = actions.linkTargets?.(id) ?? [];
+    const rows = [el("div", { class: "tp-field-lab", text: "prefab group" })];
+
+    const status = prefab.isReuse
+      ? `reuse of ${prefab.canonical} · ${prefab.groupSize} in group`
+      : prefab.groupSize > 1
+        ? `canonical · ${prefab.groupSize} in group`
+        : "standalone";
+    rows.push(el("div", { class: "tp-act-sym", text: status }));
+
+    if (prefab.groupSize > 1) {
+      rows.push(el("div", { class: "tp-act-row" },
+        el("button", {
+          class: "tp-act-btn", text: "unlink + regenerate",
+          disabled: busy,
+          title: busy ? "this asset is currently generating" : "pull this object out of its prefab group and rebuild it alone, so it diverges from the rest (uses the backend + reuse-image above)",
+          onclick: () => actions.onRegenerate(id, { backend: backendSel.value, reuseImage: reuse.checked, unlink: true }),
+        }),
+      ));
+    }
+
+    if (targets.length && actions.onLink) {
+      const linkSel = el("select", { class: "tp-act-sel", title: "prefab group to link this object into", disabled: busy },
+        ...targets.map((t) => el("option", { value: t.canonical, text: `${t.label} (${t.size})` })));
+      const linkGroup = el("input", { type: "checkbox", disabled: busy });
+      const showGroupOpt = prefab.groupSize > 1;
+      rows.push(el("div", { class: "tp-act-row" },
+        el("button", {
+          class: "tp-act-btn", text: "link →",
+          disabled: busy,
+          title: busy ? "this asset is currently generating" : "link this object into the chosen prefab group, so it shares that group's mesh",
+          onclick: () => actions.onLink(id, linkSel.value, { group: showGroupOpt && linkGroup.checked }),
+        }),
+        linkSel,
+        showGroupOpt
+          ? el("label", { class: "tp-act-check", title: "move the entire current prefab group into the destination (canonical + every sibling)" }, linkGroup, "entire group")
+          : null,
+      ));
+    }
+
+    return el("div", { class: "tp-prefab" }, ...rows);
   }
 
   function infoSig(id) {
@@ -276,6 +393,127 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     ].join("|");
   }
 
+  // ── per-object texture maps (read off the loaded raw GLB) ──
+
+  const MAP_CANVAS_CAP = 512; // downscale big (2k) textures for cheap channel splits
+
+  // A drawable bitmap for a THREE.Texture, or null. Compressed (KTX2) textures
+  // carry no readable image, so the optimized twin yields nothing here — which is
+  // exactly why the per-object view loads the raw (uncompressed) mesh.
+  function texImage(tex) {
+    const img = tex && tex.image;
+    if (!img) return null;
+    const w = img.width || img.videoWidth || 0;
+    const h = img.height || img.videoHeight || 0;
+    return w && h ? { img, w, h } : null;
+  }
+
+  // Render one texture (optionally a single channel, splatted to grayscale) to a
+  // capped 2D canvas. channel ∈ {null, "r", "g", "b"} — glTF packs occlusion in
+  // R, roughness in G, and metalness in B of the metallic-roughness texture.
+  function drawMapCanvas(src, channel) {
+    const scale = Math.min(1, MAP_CANVAS_CAP / Math.max(src.w, src.h));
+    const cw = Math.max(1, Math.round(src.w * scale));
+    const ch = Math.max(1, Math.round(src.h * scale));
+    const canvas = el("canvas", { class: "tp-map-canvas" });
+    canvas.width = cw;
+    canvas.height = ch;
+    const ctx = canvas.getContext("2d");
+    try {
+      ctx.drawImage(src.img, 0, 0, cw, ch);
+    } catch { return null; }
+    if (channel) {
+      let data;
+      try { data = ctx.getImageData(0, 0, cw, ch); } catch { return null; }
+      const px = data.data;
+      const off = channel === "r" ? 0 : channel === "g" ? 1 : 2;
+      for (let i = 0; i < px.length; i += 4) {
+        const v = px[i + off];
+        px[i] = px[i + 1] = px[i + 2] = v;
+        px[i + 3] = 255;
+      }
+      ctx.putImageData(data, 0, 0);
+    }
+    return canvas;
+  }
+
+  function mapTile(label, src, channel) {
+    const canvas = drawMapCanvas(src, channel);
+    if (!canvas) return null;
+    const tile = el("div", {
+      class: "tp-map",
+      title: "click to enlarge",
+      onclick: () => tile.classList.toggle("big"),
+    },
+      canvas,
+      el("div", { class: "tp-map-lab", text: `${label} · ${src.w}×${src.h}` }),
+    );
+    return tile;
+  }
+
+  function clearMaps() {
+    mapsGrid.replaceChildren();
+    mapsWrap.style.display = "none";
+  }
+
+  // Pull the standard PBR maps off the loaded GLB's materials and render each
+  // (and each packed channel) to its own thumbnail. Raw GLBs carry uncompressed
+  // textures, so their pixels are readable here.
+  function renderMaps(sceneObj) {
+    clearMaps();
+    if (!sceneObj) return;
+    const found = {};
+    sceneObj.traverse((o) => {
+      if (!o.isMesh || !o.material) return;
+      const mats = Array.isArray(o.material) ? o.material : [o.material];
+      for (const m of mats) {
+        if (!found.base && m.map) found.base = m.map;
+        if (!found.mr && (m.roughnessMap || m.metalnessMap)) found.mr = m.roughnessMap || m.metalnessMap;
+        if (!found.normal && m.normalMap) found.normal = m.normalMap;
+        if (!found.ao && m.aoMap) found.ao = m.aoMap;
+        if (!found.emissive && m.emissiveMap) found.emissive = m.emissiveMap;
+      }
+    });
+    const tiles = [];
+    const add = (tex, channel, label) => {
+      const src = texImage(tex);
+      if (!src) return;
+      const tile = mapTile(label, src, channel);
+      if (tile) tiles.push(tile);
+    };
+    add(found.base, null, "base color");
+    add(found.mr, "g", "roughness");
+    add(found.mr, "b", "metallic");
+    add(found.ao, "r", "occlusion");
+    add(found.normal, null, "normal");
+    add(found.emissive, null, "emissive");
+    if (!tiles.length) return;
+    mapsGrid.replaceChildren(...tiles);
+    mapsWrap.style.display = "";
+  }
+
+  // Load an object's RAW mesh into the mini viewer, framed on its own bounds (it
+  // isn't placed in the world bbox — that context lives in the main scene view).
+  // Reads its texture maps on load; falls back to the transformed mesh if the
+  // raw one is absent (e.g. an optimized-library cell keeps no raw).
+  function loadObjectPreview(mv, id, rawUrl, fallbackUrl) {
+    const onLoaded = (sceneObj, bounds) => {
+      lastGeom = bounds ? { center: bounds.center, size: bounds.size * 0.75 || 1 } : null;
+      applyAxes();
+      renderMaps(sceneObj);
+    };
+    const primary = rawUrl ?? fallbackUrl;
+    if (!primary) return;
+    mv.loadModel({ id, url: primary }, api.absUrl(primary), {
+      onLoaded,
+      onError: () => {
+        if (rawUrl && fallbackUrl && fallbackUrl !== rawUrl) {
+          mv.loadModel({ id, url: fallbackUrl }, api.absUrl(fallbackUrl), { onLoaded });
+        }
+      },
+    });
+  }
+
   function renderInfo(id) {
     fieldsEl.textContent = "";
     const n = model.nodes.get(id);
@@ -284,11 +522,11 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     const isObject = n.kind === "object" || n.kind === "frame";
     const hasGeom = Array.isArray(n.origin) && Array.isArray(n.dimensions);
 
-    // Mini 3D preview: the node's bbox (always, when known) + its mesh (when one
-    // exists), with the orientation baked into the served GLB. Zones show just
-    // their bbox volume; objects show the oriented mesh inside its box.
-    // The axes gizmo sits at the node's bbox center, sized to its largest span.
-    lastGeom = hasGeom
+    // Mini 3D preview. Objects/frames show the RAW generation-API mesh on its own
+    // (its native, un-placed frame), with the canonical axes at the mesh center.
+    // Zones (and not-yet-meshed objects) show their bbox volume instead, with the
+    // axes at the bbox center sized to its largest span.
+    const bboxGeom = hasGeom
       ? {
           center: [
             n.origin[0] + n.dimensions[0] / 2,
@@ -298,9 +536,12 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
           size: Math.max(Math.abs(n.dimensions[0]), Math.abs(n.dimensions[1]), Math.abs(n.dimensions[2])) * 0.75 || 1,
         }
       : null;
+    // The transformed/optimized mesh resolves the reference image + download
+    // link; the per-object 3D view itself shows the RAW generation-API output.
     const meshUrl = meshUrlFor(id, n);
-    // The reference image sits next to the mesh on disk as `<id>.png` (library
-    // and generated alike), so it follows whichever mesh the mode resolved to.
+    const rawUrl = rawMeshUrlFor(id, n);
+    // The reference image sits next to the transformed mesh on disk as `<id>.png`
+    // (library and generated alike), so it follows the transformed url.
     const imageUrl = meshUrl ? meshUrl.replace(/\.glb(\?|$)/, ".png$1") : null;
     if (imageUrl) {
       previewImg.src = api.absUrl(imageUrl);
@@ -308,19 +549,40 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     } else {
       imgWrap.style.display = "none";
     }
-    if (meshUrl || hasGeom) {
-      previewHost.style.display = "";
-      const mv = ensureMini();
-      mv.clear();
-      if (hasGeom) {
-        mv.loadBbox({ id, origin: n.origin, dimensions: n.dimensions, node_kind: n.kind, proxy_shape: n.proxyShape ?? null });
+    // Preview + maps (re)load only when the focused mesh actually changes. A
+    // streamed re-render of the SAME node — a generate-status poll, an infoSig
+    // tick — leaves the loaded raw mesh + its map thumbnails in place; reloading
+    // a large raw GLB on every tick would jank the panel.
+    const previewUrl = isObject ? (rawUrl ?? meshUrl) : null;
+    const previewKey = previewUrl
+      ? `mesh|${id}|${previewUrl}`
+      : hasGeom
+        ? `bbox|${id}`
+        : "";
+    if (previewKey !== lastPreviewKey) {
+      lastPreviewKey = previewKey;
+      clearMaps();
+      if (previewUrl || hasGeom) {
+        previewHost.style.display = "";
+        const mv = ensureMini();
+        mv.clear();
+        if (previewUrl) {
+          // Object/frame: the raw mesh on its own (no world bbox — the raw output
+          // isn't placed in it). lastGeom/axes + the per-map thumbnails are set
+          // from the loaded geometry in loadObjectPreview's onLoaded.
+          lastGeom = null;
+          loadObjectPreview(mv, id, rawUrl, meshUrl);
+        } else {
+          // Zones (and objects with no mesh yet): the bbox volume.
+          mv.loadBbox({ id, origin: n.origin, dimensions: n.dimensions, node_kind: n.kind, proxy_shape: n.proxyShape ?? null });
+          lastGeom = bboxGeom;
+        }
+        mv.setActive(true);
+        applyAxes();
+      } else {
+        previewHost.style.display = "none";
+        miniViewer?.setActive(false);
       }
-      if (meshUrl) mv.loadModel({ id, url: meshUrl }, api.absUrl(meshUrl));
-      mv.setActive(true);
-      applyAxes();
-    } else {
-      previewHost.style.display = "none";
-      miniViewer?.setActive(false);
     }
 
     if (n.prompt) fieldsEl.appendChild(fieldGroup("prompt", n.prompt));
@@ -359,8 +621,12 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
       fieldsEl.appendChild(fieldGroup(`relationships (${rels.length})`, list));
     }
 
-    if (meshUrl) {
-      fieldsEl.appendChild(prop("mesh", el("a", { class: "tp-link", href: api.absUrl(meshUrl), target: "_blank", text: "open .glb ↗" })));
+    if (rawUrl || meshUrl) {
+      const links = el("span", {});
+      if (rawUrl) links.append(el("a", { class: "tp-link", href: api.absUrl(rawUrl), target: "_blank", text: "raw ↗" }));
+      if (rawUrl && meshUrl) links.append(document.createTextNode(" · "));
+      if (meshUrl) links.append(el("a", { class: "tp-link", href: api.absUrl(meshUrl), target: "_blank", text: "transformed ↗" }));
+      fieldsEl.appendChild(prop("mesh", links));
     }
 
     if (actions && actions.available() && isObject) {
@@ -613,8 +879,10 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     model = null;
     lastSig = null;
     lastInfoSig = null;
+    lastPreviewKey = null;
     fieldsEl.textContent = "";
     bodyEl.textContent = "";
+    clearMaps();
     previewHost.style.display = "none";
     lastGeom = null;
     miniViewer?.setActive(false);

@@ -92,17 +92,30 @@ export const api = {
   // library build and viewed by flipping `meshesUrl(..., { mode: "generated" })`.
   // generate(): build/resume the whole scene's generated assets (409 if a build
   // is already in flight). generateStatus(): whether a build/regen is running +
-  // the finished ids (each with its symmetry plane). regenerate/symmetrize/
-  // unsymmetrize act on ONE object's generated mesh; with propagate they apply to
-  // its whole prefab group. backend ∈ {trellis, hunyuan, hunyuan-tencent}.
+  // the finished ids (each with its symmetry plane, served `url`, and the raw
+  // generation-API `raw` mesh url for the per-object view; plus each mesh's
+  // prefab `canonical`). regenerate/symmetrize/unsymmetrize act on ONE object's
+  // generated mesh; with propagate they apply to its whole prefab group.
+  // regenerate with `unlink` instead pulls the object out of its group and
+  // rebuilds it alone; `link` moves it into another object's group. backend ∈
+  // {trellis, hunyuan, hunyuan-tencent}.
   generate: (run, slot, model) =>
     request(cellPath(slot, model, "/generate"), { method: "POST", params: { run } }),
   generateStatus: (run, slot, model, { optimized = true } = {}) =>
     request(cellPath(slot, model, "/generate"), { params: { run, optimized: optimized ? 1 : 0 } }),
-  regenerate: (run, slot, model, nodeId, { backend = "trellis", propagate = true, reuseImage = false } = {}) =>
+  regenerate: (run, slot, model, nodeId, { backend = "trellis", propagate = true, reuseImage = false, unlink = false } = {}) =>
     request(cellPath(slot, model, `/regenerate/${encodeURIComponent(nodeId)}`), {
       method: "POST",
-      params: { run, backend, propagate, reuse_image: reuseImage },
+      params: { run, backend, propagate, reuse_image: reuseImage, unlink },
+    }),
+  // Link a generated object INTO another object's prefab group (target = any
+  // member of that group) so it shares the group's mesh — the inverse of
+  // regenerate's `unlink`. Re-derives the object's mesh from the group canonical;
+  // no backend call.
+  link: (run, slot, model, nodeId, target, { group = false } = {}) =>
+    request(cellPath(slot, model, `/link/${encodeURIComponent(nodeId)}`), {
+      method: "POST",
+      params: { run, target, group },
     }),
   symmetrize: (run, slot, model, nodeId, { plane = "xy", keepPositive = true, propagate = true } = {}) =>
     request(cellPath(slot, model, `/symmetrize/${encodeURIComponent(nodeId)}`), {
@@ -113,6 +126,14 @@ export const api = {
     request(cellPath(slot, model, `/unsymmetrize/${encodeURIComponent(nodeId)}`), {
       method: "POST",
       params: { run, propagate },
+    }),
+  // Change an object's "front view" (which face points +Z in its raw mesh) by
+  // rotating the raw 90° about `axis` ('x' pitch, 'y' yaw, 'z' roll). Bakes into
+  // the prefab canonical's raw + propagates to every reuse.
+  reorient: (run, slot, model, nodeId, { axis = "y", degrees = 90, propagate = true } = {}) =>
+    request(cellPath(slot, model, `/reorient/${encodeURIComponent(nodeId)}`), {
+      method: "POST",
+      params: { run, axis, degrees, propagate },
     }),
 
   // --- source cell data ---

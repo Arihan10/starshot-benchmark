@@ -92,20 +92,52 @@ _retry_tasks: set[asyncio.Task[None]] = set()
 # client's generate gate (a version can't re-trigger until its current build
 # finishes) and lets shutdown / reset cancel a build cleanly.
 _generate_tasks: dict[GenKey, asyncio.Task[None]] = {}
-# Per-(cell, version) regeneration worker + its FIFO of
-# (node_id, propagate, backend, op, reuse_image) requests, where op is
-# "regenerate" (fresh mesh — and, unless reuse_image, a fresh Nano-Banana image
-# too) or "unsymmetrize" (reprocess the existing raw mesh with the symmetry
-# mirror off — no AI; reuse_image is ignored). `_regen_tasks` holds the single worker
-# task per version; `_regen_queues` is the work it drains concurrently (parallel
-# across prefab groups, serialized within one), sharing that version's
-# generated-events log. Requests enqueue rather than 409 between each other, and
-# run concurrently with a whole-scene generate of the same version: they serialize
-# per-node with it via generation.node_lock, so neither writes the same asset twice.
+# Per-(cell, version) regeneration worker + its FIFO of `RegenJob`s, where `op`
+# is "regenerate" (fresh mesh — and, unless reuse_image, a fresh Nano-Banana
+# image too; `unlink` first pulls the object out of its prefab group so it
+# diverges alone), "unsymmetrize" / "symmetrize" (reprocess the existing raw mesh
+# with the symmetry mirror off/on — no AI; reuse_image is ignored), or "link"
+# (join the object into another prefab group, re-deriving its mesh from that
+# group's canonical — no AI). `_regen_tasks` holds the single worker task per
+# version; `_regen_queues` is the work it drains concurrently (parallel across
+# prefab groups, serialized within one), sharing that version's generated-events
+# log. Requests enqueue rather than 409 between each other, and run concurrently
+# with a whole-scene generate of the same version: they serialize per-node with it
+# via generation.node_lock, so neither writes the same asset twice.
 _regen_tasks: dict[GenKey, asyncio.Task[None]] = {}
-_regen_queues: dict[GenKey, asyncio.Queue[tuple[str, bool, str, str, bool]]] = {}
+_regen_queues: dict[GenKey, asyncio.Queue["RegenJob"]] = {}
 _hydrated_runs: set[str] = set()
 _current_run: str = ""
+
+
+@dataclass(frozen=True)
+class RegenJob:
+    """One item the per-version regen worker drains. `op` selects the action:
+
+      * "regenerate"  — rebuild the mesh fresh on `backend` (and the image too
+        unless `reuse_image`). `propagate` re-derives the whole prefab group from
+        the rebuilt canonical; `unlink` instead pulls THIS object out of its group
+        first so it diverges with its own fresh mesh (forces propagate off).
+      * "unsymmetrize" / "symmetrize" — reprocess the existing raw mesh with the
+        mirror off / on (`sym` carries (plane, keep_positive)); no backend call.
+      * "reorient" — change the "front view" by rotating the raw mesh 90° about an
+        axis (`reorient` carries (axis, degrees)); no backend call.
+      * "link" — join this object into the prefab group of `link_to` (any member
+        of the destination group), re-deriving its mesh from that group's
+        canonical; no backend call.
+    """
+
+    node_id: str
+    op: str
+    propagate: bool = True
+    backend: str = generation.DEFAULT_MESH_BACKEND
+    reuse_image: bool = False
+    sym: tuple[str, bool] | None = None
+    reorient: tuple[str, int] | None = None
+    unlink: bool = False
+    link_to: str | None = None
+    link_group: bool = False
+
 
 # Downstream-simulation BRANCHES. A branch is a "what-if" fork: the prefix of
 # some source log (a cell, or another branch) up to a chosen event, then the
@@ -648,6 +680,83 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
         )
     _gen_symmetry_cache[events_path] = (sig, state)
     return state
+
+
+# Parsed prefab star per generated-events log, cached on the file's (mtime_ns,
+# size) like the symmetry map, so the frequently-polled gate status re-folds it
+# only when a build / regen / link / unlink has appended to the log.
+_gen_prefab_cache: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
+
+
+def _generated_prefab(events_path: Path) -> dict[str, str]:
+    """Map node id -> its prefab CANONICAL id, folded from the generated log's
+    `prefab.match` events (latest per id wins, mirroring `prefabs.resolve_group`).
+    A canonical maps to itself; a reuse maps to the canonical whose mesh it shares.
+    Ids with no `prefab.match` are absent (callers treat them as their own
+    canonical). Lets the gate status tag each mesh with its group so the client can
+    show membership and offer link / unlink without re-reading the log per node."""
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _gen_prefab_cache.get(events_path)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    reuse_of: dict[str, str] = {}
+    with events_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("kind") != "prefab.match":
+                continue
+            node_id = event.get("id")
+            if isinstance(node_id, str):
+                reuse_of[node_id] = str(event.get("reuse_id") or "")
+    canonical_of = {nid: (reuse_of.get(nid) or nid) for nid in reuse_of}
+    _gen_prefab_cache[events_path] = (sig, canonical_of)
+    return canonical_of
+
+
+_gen_image_prompt_cache: dict[Path, tuple[tuple[int, int], dict[str, str]]] = {}
+
+
+def _generated_image_prompts(events_path: Path) -> dict[str, str]:
+    """Map node id -> the subject phrase used for its reference-image generation,
+    folded from the generated log's `image` events (latest per id wins). Only
+    canonicals have their own `image` event; callers resolve reuses to their
+    canonical. Cached on the file's (mtime_ns, size)."""
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _gen_image_prompt_cache.get(events_path)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    prompts: dict[str, str] = {}
+    with events_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if event.get("kind") != "image":
+                continue
+            node_id = event.get("id")
+            prompt = event.get("prompt")
+            if isinstance(node_id, str) and isinstance(prompt, str):
+                prompts[node_id] = prompt
+    _gen_image_prompt_cache[events_path] = (sig, prompts)
+    return prompts
 
 
 def _ensure_run_hydrated(run: str) -> None:
@@ -2088,8 +2197,23 @@ def create_app() -> FastAPI:
         # `sym`/`symWas` — the asset's current symmetry plane (none/xy/xz) and, if
         # since un-symmetrized, the plane it used to be mirrored across — so the
         # detail panel tells mirrored / un-symmetrized / never-symmetrized apart.
-        sym_map = _generated_symmetry(generation.latest_generated_events_path(RUNS_DIR, rid))
-        gen_dir = generation.latest_generated_dirs(RUNS_DIR, rid)[1 if optimized else 0]
+        gen_events_path = generation.latest_generated_events_path(RUNS_DIR, rid)
+        sym_map = _generated_symmetry(gen_events_path)
+        # node id -> its prefab canonical, so each mesh carries its group. The
+        # client buckets meshes by `canonical` to show group membership and offer
+        # link / unlink on a single object.
+        canonical_of = _generated_prefab(gen_events_path)
+        image_prompts = _generated_image_prompts(gen_events_path)
+        raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
+        gen_dir = opt_dir if optimized else raw_dir
+
+        def _variant(path: Path) -> tuple[str, int] | None:
+            """(url, mtime) for a generated GLB, or None when it isn't on disk."""
+            try:
+                return f"/artifacts/{path.relative_to(RUNS_DIR).as_posix()}", path.stat().st_mtime_ns
+            except OSError:
+                return None
+
         meshes: list[dict[str, object]] = []
         if gen_dir.is_dir():
             for p in sorted(gen_dir.glob("*.glb")):
@@ -2101,19 +2225,53 @@ def create_app() -> FastAPI:
                     continue
                 mesh_id = p.name[: -len(".glb")]
                 info = sym_map.get(mesh_id)
+                canonical_id = canonical_of.get(mesh_id, mesh_id)
+                # The pristine Trellis/Hunyuan output (pre rescale-to-bbox, pre
+                # symmetry) lives in the raw dir as `<id>.raw.glb`, which the
+                # per-object viewer renders (reading its uncompressed PBR maps). A
+                # prefab REUSE writes no raw of its own — its mesh is re-derived
+                # from the canonical's raw — so resolve the raw against the
+                # CANONICAL so a reuse shows the source mesh, not its rescaled twin.
+                raw_p = raw_dir / f"{canonical_id}.raw.glb"
+                img_prompt = image_prompts.get(mesh_id) or image_prompts.get(canonical_id)
+                # Both rescaled variants of THIS object — the optimized (KTX2 /
+                # Meshopt) twin and the unoptimized ("raw") mesh — so the client can
+                # flip a single object between them independently of the scene-wide
+                # toggle. Either can be absent mid-build (the unoptimized lands
+                # first, the optimized twin after); the client falls back.
+                opt_v = _variant(opt_dir / f"{mesh_id}.glb")
+                unopt_v = _variant(raw_dir / f"{mesh_id}.glb")
                 meshes.append({
                     "id": mesh_id,
                     "v": mtime,
                     "url": f"/artifacts/{p.relative_to(RUNS_DIR).as_posix()}",
+                    "optUrl": opt_v[0] if opt_v else None,
+                    "optV": opt_v[1] if opt_v else None,
+                    "unoptUrl": unopt_v[0] if unopt_v else None,
+                    "unoptV": unopt_v[1] if unopt_v else None,
+                    "raw": f"/artifacts/{raw_p.relative_to(RUNS_DIR).as_posix()}" if raw_p.exists() else None,
                     "sym": info["plane"] if info else "none",
                     "symWas": info["was"] if info else None,
+                    "canonical": canonical_id,
+                    "imagePrompt": img_prompt,
                 })
         ids = [m["id"] for m in meshes]
+        # Node ids whose meshes are currently being built or are queued to build —
+        # either sitting in the mesh-jobs global queue (waiting/processing on a
+        # backend) or still queued in this cell's regen worker (not yet dequeued).
+        # The client disables per-object actions on these ids so the user can't
+        # double-enqueue a node that's already in flight.
+        gen_slot_id = _gen_slot_id(run, slot_id, model_alias)
+        busy: set[str] = threed.inflight_ids(gen_slot_id)
+        if regen_queue is not None:
+            for job in list(regen_queue._queue):  # type: ignore[attr-defined]
+                busy.add(job.node_id)
         return {
             "running": running,
             "count": len(ids),
             "ids": ids,
             "meshes": meshes,
+            "busy": sorted(busy),
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/regenerate/{node_id}")
@@ -2125,12 +2283,20 @@ def create_app() -> FastAPI:
         propagate: bool = False,
         backend: str = "trellis",
         reuse_image: bool = False,
+        unlink: bool = False,
     ) -> dict[str, object]:
         """Enqueue a from-scratch regeneration of a GENERATED asset (in the
         targeted `version`, else the latest) onto that version's regen worker. With
         `propagate=true` (the client default) the worker rebuilds the prefab
         CANONICAL behind `node_id` and re-derives every object that reuses it, so a
         shared prefab updates everywhere within the version at once.
+
+        With `unlink=true` the worker instead bypasses the prefab finder: it pulls
+        `node_id` OUT of its prefab group first (a reuse simply leaves; a canonical
+        with reuses hands the shared mesh off to one of them so the rest of the
+        group is preserved), then rebuilds ONLY `node_id` fresh as its own
+        standalone asset — so it diverges from the group it was matched into.
+        `unlink` forces `propagate` off.
 
         Requests ENQUEUE rather than 409 against each other: a single per-version
         worker (`_regen_worker`) drains the queue concurrently — in parallel across
@@ -2163,9 +2329,15 @@ def create_app() -> FastAPI:
                 status_code=404, detail=f"no bbox event found for node: {node_id}",
             )
 
+        # Unlinking diverges this object alone — never fan the rebuild across the
+        # group it's leaving.
+        propagate = propagate and not unlink
         gen_slot_id = _gen_slot_id(run, slot.id, model_alias)
         queue = _regen_queues.setdefault(key, asyncio.Queue())
-        queue.put_nowait((node_id, propagate, backend, "regenerate", reuse_image, None))
+        queue.put_nowait(RegenJob(
+            node_id=node_id, op="regenerate", propagate=propagate,
+            backend=backend, reuse_image=reuse_image, unlink=unlink,
+        ))
         # Surface the queued regen in the shared mesh queue panel until the
         # worker dequeues it (then generate_mesh manages its own entry). Tag the
         # backend so it lands in the right pool section (Trellis vs Hunyuan 3.1).
@@ -2181,6 +2353,7 @@ def create_app() -> FastAPI:
             "model": model_alias,
             "node_id": node_id,
             "propagate": propagate,
+            "unlink": unlink,
             "backend": backend,
             "queued": True,
             "depth": queue.qsize(),
@@ -2218,7 +2391,7 @@ def create_app() -> FastAPI:
         # Not surfaced in the mesh queue panel — it's a local reprocess, not a
         # backend generation.
         queue = _regen_queues.setdefault(key, asyncio.Queue())
-        queue.put_nowait((node_id, propagate, generation.DEFAULT_MESH_BACKEND, "unsymmetrize", False, None))
+        queue.put_nowait(RegenJob(node_id=node_id, op="unsymmetrize", propagate=propagate))
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
@@ -2268,13 +2441,14 @@ def create_app() -> FastAPI:
             raise HTTPException(
                 status_code=404, detail=f"no bbox event found for node: {node_id}",
             )
-        # Same worker + filler backend slot as un-symmetrize; the (plane, keep)
-        # ride the trailing `sym` field of the queue item. Not surfaced in the mesh
-        # queue panel — a local reprocess, not a backend generation.
+        # Same worker as un-symmetrize; the (plane, keep) ride the `sym` field of
+        # the job. Not surfaced in the mesh queue panel — a local reprocess, not a
+        # backend generation.
         queue = _regen_queues.setdefault(key, asyncio.Queue())
-        queue.put_nowait(
-            (node_id, propagate, generation.DEFAULT_MESH_BACKEND, "symmetrize", False, (plane, keep_positive))
-        )
+        queue.put_nowait(RegenJob(
+            node_id=node_id, op="symmetrize", propagate=propagate,
+            sym=(plane, keep_positive),
+        ))
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
@@ -2289,6 +2463,121 @@ def create_app() -> FastAPI:
             "op": "symmetrize",
             "plane": plane,
             "keep_positive": keep_positive,
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/reorient/{node_id}")
+    async def slot_reorient(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+        axis: str = "y",
+        degrees: int = 90,
+        propagate: bool = True,
+    ) -> dict[str, object]:
+        """Change a GENERATED object's "front view" — which face points along +Z in
+        its raw, pre-transform mesh — by rotating that raw mesh 90° (`degrees`, a
+        multiple of 90) about `axis` ('x' pitch, 'y' yaw, 'z' roll), then re-deriving
+        its served + optimized twin. The rotation is baked into the raw, the pristine
+        source every prefab reuse derives from, so with `propagate=true` (the client
+        default) the prefab CANONICAL behind `node_id` is re-fronted and every object
+        reusing it is re-derived to match — keeping the whole group consistent across
+        the optimized and unoptimized builds. No Nano-Banana, no mesh backend.
+        Reprocesses on the SAME per-version worker as regenerate/symmetrize, so it
+        enqueues, drains concurrently, and serializes per-node via
+        `generation.node_lock`."""
+        if axis not in ("x", "y", "z"):
+            raise HTTPException(status_code=400, detail=f"axis must be 'x', 'y', or 'z', got: {axis}")
+        if degrees % 90 != 0:
+            raise HTTPException(status_code=400, detail=f"degrees must be a multiple of 90, got: {degrees}")
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        # Same worker as symmetrize; (axis, degrees) ride the `reorient` field. Not
+        # surfaced in the mesh queue panel — a local reprocess, not a backend gen.
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait(RegenJob(
+            node_id=node_id, op="reorient", propagate=propagate,
+            reorient=(axis, degrees),
+        ))
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "propagate": propagate,
+            "op": "reorient",
+            "axis": axis,
+            "degrees": degrees,
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/link/{node_id}")
+    async def slot_link(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        target: str,
+        run: str | None = None,
+        group: bool = False,
+    ) -> dict[str, object]:
+        """Link a GENERATED asset INTO another object's prefab group, so it shares
+        that group's mesh — the inverse of `unlink`. `target` is ANY member of the
+        destination group (we resolve it to that group's canonical); `node_id`
+        becomes a reuse of it and its mesh is re-derived from the canonical's raw
+        (rescaled into `node_id`'s own bbox/orientation) — no Nano-Banana, no mesh
+        backend, so it's effectively instant. If `node_id` was itself a prefab
+        canonical with reuses, those reuses move into the destination group too, so
+        the flat prefab star is preserved. With `group=true` the ENTIRE source group
+        (canonical + every reuse) moves into the destination, even when `node_id` is
+        a reuse — its old canonical and siblings come along. Runs on the SAME
+        per-version worker as regenerate/symmetrize, serialized per group via the
+        worker's per-canonical lock + `generation.node_lock`. Not surfaced in the
+        mesh queue panel — a local re-derivation, not a backend generation."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        if _reconstruct_node(lib_log, target) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for link target: {target}",
+            )
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait(RegenJob(node_id=node_id, op="link", link_to=target, link_group=group))
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "op": "link",
+            "target": target,
+            "group": group,
             "queued": True,
             "depth": queue.qsize(),
         }
@@ -3707,17 +3996,97 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
     prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
     canon_locks: dict[str, asyncio.Lock] = {}
 
-    async def _process(
-        node_id: str,
-        propagate: bool,
-        backend: str,
-        op: str,
-        reuse_image: bool,
-        sym: tuple[str, bool] | None,
-    ) -> None:
+    async def _detach_from_group(node_id: str, node: Node) -> None:
+        """Pull `node_id` out of its prefab group while preserving the rest of it,
+        so the caller can rebuild `node_id` alone. A reuse simply leaves (it's
+        re-logged as its own canonical). A canonical WITH reuses hands the group
+        off to one of those reuses — that reuse inherits `node_id`'s current raw
+        mesh (via `clone_canonical_raw`) so the group keeps its shared look and
+        stays re-derivable — and the remaining reuses are repointed to it; `node_id`
+        is left a now-empty-group canonical. A lone canonical needs no detaching."""
+        assert lib_log is not None
+        canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
+        if canonical_id != node_id:
+            gen_log.log("prefab.match", id=node_id, reuse_id="", description=node.prompt)
+            return
+        if not reuse_ids:
+            return
+        new_canon = reuse_ids[0]
+        await generation.clone_canonical_raw(
+            runs_dir=RUNS_DIR, run_id=run_id, source_id=node_id, dest_id=new_canon,
+        )
+        # Carry the old canonical's symmetry onto the new one so the handed-off
+        # group keeps its mirror — a reuse logs no symmetry of its own, so without
+        # this the new canonical would resolve (and re-derive) as un-mirrored.
+        for e in reversed(gen_log.state["events"]):
+            if e.get("kind") == "symmetry.applied" and e.get("id") == node_id:
+                cp = e.get("cut_plane")
+                if cp in ("none", "xy", "xz"):
+                    extra = (
+                        {"keep_positive": e["keep_positive"]}
+                        if isinstance(e.get("keep_positive"), bool) else {}
+                    )
+                    gen_log.log("symmetry.applied", id=new_canon, cut_plane=cp, **extra)
+                break
+        new_node = _reconstruct_node(lib_log, new_canon)
+        gen_log.log(
+            "prefab.match", id=new_canon, reuse_id="",
+            description=new_node.prompt if new_node else "",
+        )
+        for rid in reuse_ids[1:]:
+            rnode = _reconstruct_node(lib_log, rid)
+            gen_log.log(
+                "prefab.match", id=rid, reuse_id=new_canon,
+                description=rnode.prompt if rnode else "",
+            )
+
+    async def _do_link(node_id: str, target_id: str, *, link_group: bool = False) -> None:
+        """Link `node_id` INTO the prefab group of `target_id` (any group member;
+        resolved to that group's canonical), re-deriving its mesh from the
+        canonical's raw. If `node_id` was itself a canonical with reuses, those
+        reuses come along so the flat prefab star is preserved. With
+        `link_group=True` the entire SOURCE group (canonical + every reuse) moves
+        into the destination — even when `node_id` is a reuse, its old canonical
+        and siblings come along too."""
+        assert lib_log is not None
+        dest_canonical, _ = prefabs.resolve_group(gen_log.state["events"], target_id)
+        async with canon_locks.setdefault(dest_canonical, asyncio.Lock()):
+            if _reconstruct_node(lib_log, dest_canonical) is None:
+                gen_log.log(
+                    "mesh.error", id=node_id,
+                    message=f"link: no bbox event for target canonical {dest_canonical}",
+                )
+                return
+            own_canonical, own_reuses = prefabs.resolve_group(gen_log.state["events"], node_id)
+            if own_canonical == dest_canonical:
+                gen_log.log("prefab.link_noop", id=node_id, reuse_id=dest_canonical)
+                return
+            if link_group:
+                mover_ids = [own_canonical, *own_reuses]
+            elif own_canonical == node_id:
+                mover_ids = [node_id, *own_reuses]
+            else:
+                mover_ids = [node_id]
+            movers = [
+                n for mid in mover_ids if (n := _reconstruct_node(lib_log, mid)) is not None
+            ]
+            for m in movers:
+                gen_log.log(
+                    "prefab.match", id=m.id, reuse_id=dest_canonical, description=m.prompt,
+                )
+            await generation.propagate_reuses(
+                canonical_id=dest_canonical, reuses=movers,
+                runs_dir=RUNS_DIR, run_id=run_id,
+            )
+
+    async def _process(job: RegenJob) -> None:
+        node_id, op = job.node_id, job.op
         if lib_log is None:
             return
         try:
+            if op == "link":
+                await _do_link(node_id, job.link_to or "", link_group=job.link_group)
+                return
             # Pick the per-canonical lock by this node's current group, then do the
             # real resolution + build UNDER the lock so same-group items serialize
             # and a later one observes an earlier item's promotion.
@@ -3727,6 +4096,12 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                 if target is None:
                     gen_log.log("mesh.error", id=node_id, message=f"{op}: no bbox event for node")
                     return
+                propagate = job.propagate
+                if op == "regenerate" and job.unlink:
+                    # Bypass the prefab finder: pull this object out of its group so
+                    # it diverges with its own fresh mesh, then build it alone.
+                    await _detach_from_group(node_id, target)
+                    propagate = False
                 canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
                 if propagate:
                     build_node = _reconstruct_node(lib_log, canonical_id)
@@ -3754,13 +4129,22 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # AI). The canonical is mirrored here; propagate re-derives its
                     # reuses below, which read the canonical's symmetry.applied
                     # (plane + kept half) and mirror identically.
-                    cut_plane, keep_positive = sym  # type: ignore[misc]
+                    cut_plane, keep_positive = job.sym  # type: ignore[misc]
                     await generation.symmetrize_one(
                         node=build_node, cut_plane=cut_plane, keep_positive=keep_positive,  # type: ignore[arg-type]
                         runs_dir=RUNS_DIR, run_id=run_id,
                     )
+                elif op == "reorient":
+                    # Re-front the canonical's raw mesh (rotate which face is +Z);
+                    # propagate re-derives its reuses below from the re-fronted raw,
+                    # so the whole prefab group shares the new front view.
+                    rax, rdeg = job.reorient  # type: ignore[misc]
+                    await generation.reorient_one(
+                        node=build_node, axis=rax, degrees=rdeg,  # type: ignore[arg-type]
+                        runs_dir=RUNS_DIR, run_id=run_id,
+                    )
                 else:
-                    if reuse_image:
+                    if job.reuse_image:
                         # From-image rebuild: ensure the node we're building has its
                         # raw-dir reference image. If that copy is missing (e.g. the
                         # raw image was removed but the optimized twin survived, or a
@@ -3771,19 +4155,19 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                         )
                     await generation.regenerate_one(
                         node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
-                        subdir=raw_subdir, optimize=True, backend=backend, generated=True,
-                        reuse_image=reuse_image,
+                        subdir=raw_subdir, optimize=True, backend=job.backend, generated=True,
+                        reuse_image=job.reuse_image,
                     )
                 if propagate:
                     await generation.propagate_reuses(
                         canonical_id=canonical_id, reuses=reuses,
                         runs_dir=RUNS_DIR, run_id=run_id,
                     )
-                elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize"):
+                elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize", "reorient"):
                     # A reuse regenerated on its own now owns a fresh mesh + raw —
                     # record it as canonical so a later propagate of its old source
-                    # can't clobber it. (Symmetry ops write no new raw, so they never
-                    # promote — a reuse with no own raw is skipped instead.)
+                    # can't clobber it. (Symmetry / reorient ops write no new raw for
+                    # a reuse — they target the canonical — so they never promote.)
                     gen_log.log(
                         "prefab.match", id=node_id, reuse_id="", description=build_node.prompt,
                     )
@@ -3791,6 +4175,13 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
             raise
         except Exception as e:  # noqa: BLE001
             gen_log.log("mesh.error", id=node_id, message=f"{type(e).__name__}: {e}")
+        finally:
+            # Drop the pre-enqueue queue-panel entry (if any). For a regenerate
+            # that reached generate_mesh, the mesh-jobs lifecycle already removed
+            # it; this catches early failures (bad node, missing image) and
+            # non-regenerate ops that were never marked. The pop is a no-op when
+            # the entry is already gone.
+            threed.unmark_queued(gen_slot_id, node_id)
 
     inflight: set[asyncio.Task[None]] = set()
     try:
@@ -3798,12 +4189,10 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
             # Spawn every currently-queued item; the semaphores bound the real work.
             while True:
                 try:
-                    node_id, propagate, backend, op, reuse_image, sym = queue.get_nowait()
+                    job = queue.get_nowait()
                 except asyncio.QueueEmpty:
                     break
-                # Worker owns the entry now; generate_mesh re-registers it on submit.
-                threed.unmark_queued(gen_slot_id, node_id)
-                inflight.add(asyncio.create_task(_process(node_id, propagate, backend, op, reuse_image, sym)))
+                inflight.add(asyncio.create_task(_process(job)))
             if not inflight:
                 break
             # Wait for a build to finish OR a short tick to elapse, then loop back
@@ -3825,10 +4214,10 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
         # the shared queue panel so they don't linger as phantom waiting rows.
         while True:
             try:
-                pending_id, *_ = queue.get_nowait()
+                pending = queue.get_nowait()
             except asyncio.QueueEmpty:
                 break
-            threed.unmark_queued(gen_slot_id, pending_id)
+            threed.unmark_queued(gen_slot_id, pending.node_id)
         gen_log.close()
 
 
