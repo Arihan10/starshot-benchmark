@@ -128,6 +128,16 @@ export const api = {
 			cellPath(slot, model, `/retry-mesh/${encodeURIComponent(nodeId)}`),
 			{ method: "POST", params: { run } },
 		),
+	// Permanently wipe ONE object from the cell: every reference in both event
+	// logs (library + generated), its mesh/image files in every build dir, all
+	// reindexed. Orphaned children re-anchor to the object's region; a wiped
+	// prefab canonical hands its role (and raw mesh) to a reuse. Irreversible;
+	// tears down branches + in-flight tasks first and does not auto-resume.
+	deleteObject: (run, slot, model, nodeId) =>
+		request(
+			cellPath(slot, model, `/delete-object/${encodeURIComponent(nodeId)}`),
+			{ method: "POST", params: { run } },
+		),
 
 	// --- from-scratch generated assets (Nano-Banana + a mesh backend) ---
 	// The single generated build of a cell, built/regenerated alongside the

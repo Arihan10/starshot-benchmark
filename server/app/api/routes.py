@@ -53,7 +53,7 @@ from app.core.slots import (
     Slot,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
-from app.pipeline import divider, generation
+from app.pipeline import divider, generation, object_wipe
 from app.services import llm, prefabs, threed
 from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
@@ -2712,28 +2712,7 @@ def create_app() -> FastAPI:
         await _cancel_task(run, slot_id, model_alias)
         # Tear down this cell's in-flight from-scratch build + regen worker so
         # their meshes aren't written into the dir we're about to wipe.
-        cell = (run, slot_id, model_alias)
-        for gkey in [k for k in _generate_tasks if k[:3] == cell]:
-            gen_task = _generate_tasks.pop(gkey, None)
-            if gen_task is not None and not gen_task.done():
-                gen_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await gen_task
-        for gkey in [k for k in _regen_tasks if k[:3] == cell]:
-            regen_task = _regen_tasks.pop(gkey, None)
-            if regen_task is not None and not regen_task.done():
-                regen_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await regen_task
-        for gkey in [k for k in _regen_queues if k[:3] == cell]:
-            _regen_queues.pop(gkey, None)
-        # Drop this cell's per-node build locks now that no generate/regen task is
-        # left to hold them; the dir is about to be wiped.
-        generation.clear_node_locks(_run_id(run, slot.id, model_alias))
-        # Cancel any standalone retries (registered on generation._pending but
-        # with no owning _run task to drive cleanup) that the running task
-        # wouldn't have touched.
-        generation.cancel_pending(_run_id(run, slot.id, model_alias))
+        await _cancel_cell_generation(run, slot.id, model_alias)
         # A reset wipes the cell, including its stepped marker + intent.
         _set_stepped((run, slot.id, model_alias), False)
         _gate_intents.pop((run, slot.id, model_alias), None)
@@ -2757,6 +2736,60 @@ def create_app() -> FastAPI:
             slot_log.state["prompt"] = slot.prompt
             slot_log.state["model"] = MODELS[model_alias]
         return {"run": run, "slot_id": slot.id, "model": model_alias}
+
+    @app.post("/slots/{slot_id}/{model_alias}/delete-object/{node_id}")
+    async def slot_delete_object(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Permanently wipe ONE object from the cell — every reference to it in
+        both event logs (library + generated), its mesh/image artifacts in every
+        build dir, all reindexed so the logs stay replay-clean. Orphaned children
+        are re-anchored onto the object's owning region; if it was a prefab
+        canonical, the role is handed to one of its reuses (which inherits the
+        shared raw mesh). Irreversible — there is no undo short of re-running.
+
+        Tears the cell's branches + pipeline/generate/regen tasks down first
+        (a reindex invalidates absolute branch fork indices and any in-flight
+        writer would race the rewrite), exactly like reset/rewind. Leaves the
+        cell otherwise intact and does NOT auto-resume."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        bbox_ev = next(
+            (e for e in reversed(slot_log.state["events"])
+             if e.get("kind") == "bbox" and e.get("id") == node_id),
+            None,
+        )
+        if bbox_ev is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        # Object-scoped tool: a zone owns a whole subtree (its objects re-anchor
+        # to it on wipe), so deleting one would orphan its contents into nothing.
+        # Frames (encapsulating shells) are concrete meshes and ARE wipeable.
+        if bbox_ev.get("node_kind") == "zone":
+            raise HTTPException(
+                status_code=400,
+                detail=f"{node_id} is a zone/region, not an object — cannot wipe",
+            )
+        await _discard_branches_of_cell(run, slot.id, model_alias)
+        await _cancel_task(run, slot_id, model_alias)
+        await _cancel_cell_generation(run, slot.id, model_alias)
+        summary = object_wipe.wipe_object(
+            node_id=node_id,
+            library_log=slot_log,
+            runs_dir=RUNS_DIR,
+            run_id=_run_id(run, slot.id, model_alias),
+        )
+        if summary is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        return {"run": run, "slot_id": slot.id, "model": model_alias, **summary}
 
     @app.post("/slots/{slot_id}/{model_alias}/branch")
     async def create_branch(  # pyright: ignore[reportUnusedFunction]
@@ -3676,6 +3709,33 @@ async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
     task.cancel()
     with contextlib.suppress(asyncio.CancelledError, Exception):
         await task
+
+
+async def _cancel_cell_generation(run: str, slot_id: str, model_alias: str) -> None:
+    """Tear down the cell's from-scratch generated build: its in-flight whole-scene
+    generate, its regen worker, and its queued regen jobs, then drop the per-node
+    build locks and cancel any detached mesh retries. Leaves the generated log /
+    dirs on disk — only the live tasks are stopped, so nothing keeps writing into
+    files a reset or object-wipe is about to remove. Shared by `reset` and
+    `delete-object`."""
+    cell = (run, slot_id, model_alias)
+    for gkey in [k for k in _generate_tasks if k[:3] == cell]:
+        gen_task = _generate_tasks.pop(gkey, None)
+        if gen_task is not None and not gen_task.done():
+            gen_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await gen_task
+    for gkey in [k for k in _regen_tasks if k[:3] == cell]:
+        regen_task = _regen_tasks.pop(gkey, None)
+        if regen_task is not None and not regen_task.done():
+            regen_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await regen_task
+    for gkey in [k for k in _regen_queues if k[:3] == cell]:
+        _regen_queues.pop(gkey, None)
+    run_id = _run_id(run, slot_id, model_alias)
+    generation.clear_node_locks(run_id)
+    generation.cancel_pending(run_id)
 
 
 def _objects_dir(cell_dir: Path) -> Path:

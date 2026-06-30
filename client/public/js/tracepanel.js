@@ -463,6 +463,34 @@ export function createTracePanel(
 		);
 	}
 
+	// Permanent deletion of the focused object. Unlike the generated-only actions
+	// above it wipes BOTH builds' logs + every build's files, so it's gated on
+	// `actions.deletable()` (any source cell, either asset view) rather than
+	// `actions.available()` (generated view only). The confirm prompt + API call
+	// live in the overlay; this only surfaces the button (disabled while the
+	// asset is mid-build, to match the other controls).
+	function buildDangerZone(id) {
+		const busy = !!actions.isBusy?.(id);
+		return el(
+			"div",
+			{ class: "tp-actions" },
+			el("div", { class: "tp-field-lab", text: "danger zone" }),
+			el(
+				"div",
+				{ class: "tp-act-row" },
+				el("button", {
+					class: "tp-act-btn danger",
+					text: "delete object",
+					disabled: busy,
+					title: busy
+						? "this asset is currently generating"
+						: "permanently remove this object from the cell — both event logs + every build's mesh & image files (irreversible)",
+					onclick: () => actions.onDelete(id),
+				}),
+			),
+		);
+	}
+
 	// Per-object render toggle: flip THIS object between its optimized (KTX2 /
 	// Meshopt) and unoptimized ("raw") mesh in the main scene — a pure view swap
 	// (both already on disk), no rebuild. Hidden unless both variants exist
@@ -1024,6 +1052,11 @@ export function createTracePanel(
 
 		if (actions && actions.available() && isObject) {
 			fieldsEl.appendChild(buildActions(id));
+		}
+		// Delete sits below the generated actions (or directly below the fields in
+		// the library view) — shown for any object/frame on a source cell.
+		if (actions && actions.onDelete && isObject && actions.deletable?.()) {
+			fieldsEl.appendChild(buildDangerZone(id));
 		}
 
 		lastInfoSig = infoSig(id);

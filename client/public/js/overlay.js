@@ -142,6 +142,12 @@ export function initOverlay(sceneViewer) {
 			onGlassify: glassifyNode,
 			onReset: resetNode,
 			onSetOptimized: setObjectOptimized,
+			// Delete is build-agnostic — it wipes the object from BOTH event logs
+			// and every build's files — so unlike the generated-only actions above
+			// it's offered on any SOURCE cell in either asset view, gated by
+			// `deletable` rather than `available`.
+			deletable: () => !!state.view && !state.view.branch,
+			onDelete: deleteNode,
 		},
 		// Mini-preview mesh source: the generated mesh while in the generated view
 		// (null — bbox only — when this node has none yet), the library asset otherwise.
@@ -682,6 +688,63 @@ function setObjectOptimized(id, mode) {
 	objOptMode.set(id, mode);
 	attachGeneratedMeshes([{ id, ...m }]);
 	tracePanel.rerenderInfo();
+}
+
+// Permanently wipe an object from the open SOURCE cell — every reference in BOTH
+// event logs (library + generated) and its mesh + image files in every build.
+// Guarded by an explicit danger confirm so it can't be a stray click; the wipe
+// is IRREVERSIBLE. On success the cell reloads so the scene + observability drop
+// the node (orphaned children re-anchor to its region and a prefab canonical
+// hands off, server-side). Works in either asset view; never on a branch.
+function deleteNode(id) {
+	const { slot, model, branch } = state.view ?? {};
+	if (!slot || branch) return;
+	const node = obs.model.nodes.get(id);
+	const kind = node?.kind ?? "object";
+	const desc = node?.prompt ? ` — “${node.prompt}”` : "";
+	const wasGenerated = assetMode === "generated";
+	openModal(`delete ${kind} ${id}?`, (close, setError) => ({
+		body: [
+			el("div", {
+				class: "m-hint",
+				text:
+					`Permanently removes ${id}${desc} from ${slot} · ${model}: every reference in BOTH event logs ` +
+					"(library + generated) and its mesh + image files across every build. Any object anchored to it " +
+					"is re-parented to its region; if it is a prefab canonical, the shared mesh passes to one of its " +
+					"reuses. This cannot be undone.",
+			}),
+		],
+		actions: [
+			el("button", { text: "cancel", onclick: close }),
+			el("button", {
+				class: "danger",
+				text: "delete permanently",
+				onclick: async () => {
+					try {
+						await api.deleteObject(state.run, slot, model, id);
+					} catch (e) {
+						setError(e.message);
+						return;
+					}
+					close();
+					toast(`deleted ${id}`, "ok");
+					// Reload so the scene + obs reflect the wipe (openCell resets to
+					// the library view); restore the generated view if that's where
+					// the delete fired AND we're still on the same cell.
+					await openCell({ slot, model, branch: false });
+					if (
+						wasGenerated &&
+						state.view &&
+						state.view.slot === slot &&
+						state.view.model === model &&
+						!state.view.branch
+					)
+						setAssetMode("generated");
+					emit("poll-now");
+				},
+			}),
+		],
+	}));
 }
 
 // Drag the divider between the canvas and the observability dock to set the
