@@ -133,9 +133,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const lightingRig = lighting ? setupLightingRig() : null;
 	if (!lighting) {
 		// Flat fill lighting for the mini / compare viewers.
-		scene.add(new THREE.HemisphereLight(0xffffff, 0x202028, 0.9));
+		const hemi = new THREE.HemisphereLight(0xffffff, 0x202028, 0.9);
+		hemi.layers.enableAll(); // also light the OIT layer
+		scene.add(hemi);
 		const dirLight = new THREE.DirectionalLight(0xffffff, 0.9);
 		dirLight.position.set(20, 30, 14);
+		dirLight.layers.enableAll();
 		scene.add(dirLight);
 	}
 
@@ -252,6 +255,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	let hoveredId = null;
 	let selectedId = null;
 	const raycaster = new THREE.Raycaster();
+	raycaster.layers.enableAll(); // OIT meshes live on a non-default layer
 	const pointer = new THREE.Vector2();
 	let pointerDirty = false;
 	let pointerInsideCanvas = false;
@@ -1151,17 +1155,26 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			envScene.dispose();
 			pmrem.dispose();
 		}
-		const hemi = new THREE.HemisphereLight(0xffffff, 0x202028, LIGHTING_DEFAULTS.fill);
+		const hemi = new THREE.HemisphereLight(
+			0xffffff,
+			0x202028,
+			LIGHTING_DEFAULTS.fill,
+		);
+		hemi.layers.enableAll(); // also light the OIT layer
 		scene.add(hemi);
 		const SHADOW_MAP_SIZE = 4096;
 		const key = new THREE.DirectionalLight(0xffffff, LIGHTING_DEFAULTS.key);
 		key.castShadow = true;
+		key.layers.enableAll();
 		key.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
 		key.shadow.bias = -0.0001;
 		scene.add(key, key.target);
 		const catcher = new THREE.Mesh(
 			new THREE.PlaneGeometry(1, 1),
-			new THREE.ShadowMaterial({ opacity: LIGHTING_DEFAULTS.shadow, depthWrite: false }),
+			new THREE.ShadowMaterial({
+				opacity: LIGHTING_DEFAULTS.shadow,
+				depthWrite: false,
+			}),
 		);
 		catcher.rotation.x = -Math.PI / 2;
 		catcher.receiveShadow = true;
@@ -1274,14 +1287,17 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				);
 		};
 		const prevKey = m.customProgramCacheKey?.bind(m);
-		m.customProgramCacheKey = () => "recvForce1|" + (prevKey ? prevKey() : "");
+		m.customProgramCacheKey = () =>
+			"recvForce1|" + (prevKey ? prevKey() : "");
 		m.needsUpdate = true;
 	}
 
 	// Every loaded GLB: double-sided (Trellis shells are often single-sided),
 	// shadow cast + receive, smooth normals computed when absent (generated meshes
 	// ship without them, which otherwise breaks shadow reception), and the
-	// receive-shadow re-gate. All shadow bits are no-ops in the flat mini viewers.
+	// receive-shadow re-gate. Transparent meshes are routed to the weighted-blended
+	// OIT layer so double-sided alpha composites correctly on concave geometry. All
+	// shadow bits are no-ops in the flat mini viewers.
 	function prepareLoadedScene(root) {
 		root.traverse((child) => {
 			if (!child.isMesh) return;
@@ -1291,11 +1307,20 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				child.geometry.computeVertexNormals();
 			}
 			if (!child.material) return;
-			const mats = Array.isArray(child.material) ? child.material : [child.material];
+			const mats = Array.isArray(child.material)
+				? child.material
+				: [child.material];
+			let oit = false;
 			for (const m of mats) {
 				m.side = THREE.DoubleSide;
 				m.shadowSide = THREE.BackSide;
 				patchMaterialReceiveShadow(m);
+				if (m.transparent) oit = true;
+			}
+			if (oit) {
+				for (const m of mats) patchMaterialOIT(m);
+				child.layers.set(OIT_LAYER);
+				child.userData.__oit = true;
 			}
 		});
 	}
@@ -1634,6 +1659,225 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	resizeObserver.observe(host);
 	resize();
 
+	// --- weighted-blended OIT (transparent meshes) -------------------------------
+	// Transparent GLBs render order-independently: an accumulation pass (additive
+	// premultiplied colour x weight) and a revealage pass (product of 1-alpha),
+	// both depth-tested against the opaque depth with no depth writes, composited
+	// over the opaque image. Keeps double-sided alpha correct on concave meshes
+	// (windows, pools, the mostly-opaque car) with no per-triangle sorting. Only
+	// engaged while transparent meshes are loaded; otherwise the plain path runs.
+	const OIT_LAYER = 1;
+	// Depth pre-pass cutoff: fragments at/above this occlude (write depth) so solid
+	// surfaces and window frames don't bleed the background; genuine glass below it
+	// blends. Sits just above typical window alpha (~0.6-0.78) and below the
+	// frame/edge transition (~0.8-1.0) so windows see through but their rims stay solid.
+	const OIT_OPAQUE = 0.8;
+	const oitPass = { value: 0 };
+	const _oitSize = new THREE.Vector2();
+	const _oitColor = new THREE.Color();
+	let opaqueTarget = null;
+	let accumTarget = null;
+	let revealTarget = null;
+
+	function patchMaterialOIT(m) {
+		if (m.userData.__oitPatched) return;
+		m.userData.__oitPatched = true;
+		m.transparent = true;
+		m.depthWrite = false;
+		m.depthTest = true;
+		m.blending = THREE.CustomBlending;
+		m.blendEquation = THREE.AddEquation;
+		m.blendEquationAlpha = THREE.AddEquation;
+		const prev = m.onBeforeCompile;
+		m.onBeforeCompile = (shader, rndr) => {
+			if (prev) prev(shader, rndr);
+			shader.uniforms.uOITPass = oitPass;
+			shader.fragmentShader = shader.fragmentShader
+				.replace(
+					"#include <common>",
+					"#include <common>\nuniform float uOITPass;",
+				)
+				.replace(
+					"#include <dithering_fragment>",
+					`#include <dithering_fragment>
+					float _a = gl_FragColor.a;
+					if (uOITPass > 1.5) { if (_a < ${OIT_OPAQUE}) discard; }
+					else {
+						// occluders cover fully so frames/rims stay solid (no partial-
+						// alpha bleed of the background); genuine glass keeps its alpha.
+						float _ac = _a >= ${OIT_OPAQUE} ? 1.0 : _a;
+						if (uOITPass < 0.5) {
+							float _w = clamp(pow(min(1.0, _ac * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - gl_FragCoord.z * 0.9, 3.0), 1e-2, 3e3);
+							gl_FragColor = vec4(gl_FragColor.rgb * _ac * _w, _ac * _w);
+						} else {
+							gl_FragColor = vec4(_ac);
+						}
+					}`,
+				);
+		};
+		const prevKey = m.customProgramCacheKey?.bind(m);
+		m.customProgramCacheKey = () => "oit1|" + (prevKey ? prevKey() : "");
+		m.needsUpdate = true;
+	}
+
+	// accum: additive (ONE, ONE); revealage: dst *= (1 - srcAlpha).
+	function setOITBlend(m, accum) {
+		m.blendSrc = accum ? THREE.OneFactor : THREE.ZeroFactor;
+		m.blendDst = accum ? THREE.OneFactor : THREE.OneMinusSrcAlphaFactor;
+		m.blendSrcAlpha = m.blendSrc;
+		m.blendDstAlpha = m.blendDst;
+	}
+
+	// Render-target passes are linear + un-tone-mapped (three only tone-maps to the
+	// canvas), so the composite resolves OIT over opaque in linear, then applies
+	// the viewer's tone mapping (ACES when lit) + sRGB — matching the plain path.
+	const oitCompose = new THREE.ShaderMaterial({
+		uniforms: {
+			uOpaque: { value: null },
+			uAccum: { value: null },
+			uReveal: { value: null },
+			uExposure: { value: 1 },
+			uToneMap: { value: lighting ? 1 : 0 },
+		},
+		vertexShader:
+			"varying vec2 vUv; void main(){ vUv = uv; gl_Position = vec4(position.xy, 0.0, 1.0); }",
+		fragmentShader: `
+			uniform sampler2D uOpaque;
+			uniform sampler2D uAccum;
+			uniform sampler2D uReveal;
+			uniform float uExposure;
+			uniform float uToneMap;
+			varying vec2 vUv;
+			vec3 RRTAndODTFit(vec3 v){ vec3 a = v * (v + 0.0245786) - 0.000090537; vec3 b = v * (0.983729 * v + 0.4329510) + 0.238081; return a / b; }
+			vec3 aces(vec3 color){
+				const mat3 IN = mat3(0.59719, 0.07600, 0.02840, 0.35458, 0.90834, 0.13383, 0.04823, 0.01566, 0.83777);
+				const mat3 OUT = mat3(1.60475, -0.10208, -0.00327, -0.53108, 1.10813, -0.07276, -0.07367, -0.00605, 1.07602);
+				color *= uExposure / 0.6;
+				color = OUT * RRTAndODTFit(IN * color);
+				return clamp(color, 0.0, 1.0);
+			}
+			vec3 enc(vec3 c){ c = clamp(c, 0.0, 1.0); return mix(1.055 * pow(c, vec3(0.4166667)) - 0.055, c * 12.92, step(c, vec3(0.0031308))); }
+			void main(){
+				vec4 accum = texture2D(uAccum, vUv);
+				float reveal = texture2D(uReveal, vUv).r;
+				vec3 oit = accum.rgb / max(accum.a, 1e-5);
+				vec3 lin = mix(oit, texture2D(uOpaque, vUv).rgb, reveal);
+				gl_FragColor = vec4(enc(uToneMap > 0.5 ? aces(lin) : lin), 1.0);
+			}
+		`,
+		depthTest: false,
+		depthWrite: false,
+		toneMapped: false,
+	});
+	const oitQuad = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), oitCompose);
+	oitQuad.frustumCulled = false;
+	const oitQuadScene = new THREE.Scene();
+	oitQuadScene.add(oitQuad);
+	const oitQuadCamera = new THREE.Camera();
+
+	function ensureOITTargets() {
+		renderer.getDrawingBufferSize(_oitSize);
+		const w = Math.max(1, _oitSize.x);
+		const h = Math.max(1, _oitSize.y);
+		if (opaqueTarget && opaqueTarget.width === w && opaqueTarget.height === h)
+			return;
+		disposeOITTargets();
+		// accum + reveal share the opaque depth (depth-test only, no writes).
+		const depthTexture = new THREE.DepthTexture(w, h);
+		const opts = {
+			type: THREE.HalfFloatType,
+			minFilter: THREE.NearestFilter,
+			magFilter: THREE.NearestFilter,
+			depthTexture,
+		};
+		opaqueTarget = new THREE.WebGLRenderTarget(w, h, opts);
+		accumTarget = new THREE.WebGLRenderTarget(w, h, opts);
+		revealTarget = new THREE.WebGLRenderTarget(w, h, opts);
+		oitCompose.uniforms.uOpaque.value = opaqueTarget.texture;
+		oitCompose.uniforms.uAccum.value = accumTarget.texture;
+		oitCompose.uniforms.uReveal.value = revealTarget.texture;
+	}
+
+	function disposeOITTargets() {
+		if (!opaqueTarget) return;
+		const depth = opaqueTarget.depthTexture; // shared across the three targets
+		opaqueTarget.dispose();
+		accumTarget.dispose();
+		revealTarget.dispose();
+		depth?.dispose();
+		opaqueTarget = accumTarget = revealTarget = null;
+	}
+
+	const _oitMats = [];
+	function renderFrame() {
+		_oitMats.length = 0;
+		sceneRoot.traverse((o) => {
+			if (!o.userData.__oit || !o.material) return;
+			if (Array.isArray(o.material)) _oitMats.push(...o.material);
+			else _oitMats.push(o.material);
+		});
+		if (_oitMats.length === 0) {
+			renderer.setRenderTarget(null);
+			renderer.render(scene, camera);
+			return;
+		}
+		ensureOITTargets();
+		renderer.getClearColor(_oitColor);
+		const prevAlpha = renderer.getClearAlpha();
+		const prevShadowAuto = renderer.shadowMap.autoUpdate;
+
+		// opaque (layer 0) -> opaqueTarget, full clear + shadow map.
+		camera.layers.set(0);
+		renderer.autoClear = true;
+		renderer.setRenderTarget(opaqueTarget);
+		renderer.setClearColor(_oitColor, 1);
+		renderer.render(scene, camera);
+
+		// transparent (layer 1) -> two OIT passes reusing the opaque depth + shadows.
+		renderer.autoClear = false;
+		renderer.shadowMap.autoUpdate = false;
+		camera.layers.set(OIT_LAYER);
+
+		// depth pre-pass: opaque-ish pixels (alpha >= 0.5) write the nearest depth
+		// into the shared buffer so accumulation only sees the front layer.
+		// Without it WBOIT averages every layer of a solid mesh into an x-ray wash;
+		// genuinely transparent pixels (alpha < 0.5) skip it and still blend.
+		oitPass.value = 2;
+		for (const m of _oitMats) {
+			m.depthWrite = true;
+			m.colorWrite = false;
+		}
+		renderer.setRenderTarget(accumTarget);
+		renderer.render(scene, camera);
+
+		oitPass.value = 0;
+		for (const m of _oitMats) {
+			m.depthWrite = false;
+			m.colorWrite = true;
+			setOITBlend(m, true);
+		}
+		renderer.setRenderTarget(accumTarget);
+		renderer.setClearColor(0x000000, 0);
+		renderer.clear(true, false, false);
+		renderer.render(scene, camera);
+
+		oitPass.value = 1;
+		for (const m of _oitMats) setOITBlend(m, false);
+		renderer.setRenderTarget(revealTarget);
+		renderer.setClearColor(0xffffff, 1);
+		renderer.clear(true, false, false);
+		renderer.render(scene, camera);
+
+		// composite to screen (tone-map + sRGB happen here, see oitCompose).
+		camera.layers.set(0);
+		renderer.shadowMap.autoUpdate = prevShadowAuto;
+		renderer.setClearColor(_oitColor, prevAlpha);
+		renderer.autoClear = true;
+		renderer.setRenderTarget(null);
+		oitCompose.uniforms.uExposure.value = renderer.toneMappingExposure;
+		renderer.render(oitQuadScene, oitQuadCamera);
+	}
+
 	let disposed = false;
 	(function animate() {
 		if (disposed) return; // viewer torn down — stop the rAF loop entirely
@@ -1670,7 +1914,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			fitToScene();
 			lightingRig?.refit();
 		}
-		renderer.render(scene, camera);
+		renderFrame();
 	})();
 
 	return {
@@ -1773,6 +2017,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			}
 			resizeObserver.disconnect();
 			clear();
+			disposeOITTargets();
+			oitCompose.dispose();
+			oitQuad.geometry.dispose();
 			controls.dispose();
 			tooltip.remove();
 			renderer.dispose();

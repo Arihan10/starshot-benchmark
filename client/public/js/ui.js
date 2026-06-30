@@ -97,7 +97,10 @@ export function fmtJson(value) {
 // The big dynamic scene-state blocks injected into prompts. In the obs prompt
 // view we fold these behind expandable placeholders by default so the prompt's
 // own wording is readable without the scene dump.
-const CONTEXT_VARS = ["SCENE_CONTEXT", "ROOT_OBJECTS", "TO_PLACE", "RETRY_BLOCK"];
+const CONTEXT_VARS = [
+  "SCENE_CONTEXT", "ROOT_OBJECTS", "TO_PLACE", "RETRY_BLOCK",
+  "SIBLING_OBJECTS", "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF",
+];
 const CONTEXT_MIN = 80; // leave small/empty placeholders inline
 
 function foldWidget(name, val) {

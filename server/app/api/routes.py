@@ -34,7 +34,7 @@ from datetime import datetime
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -122,6 +122,13 @@ class RegenJob:
         mirror off / on (`sym` carries (plane, keep_positive)); no backend call.
       * "reorient" — change the "front view" by rotating the raw mesh 90° about an
         axis (`reorient` carries (axis, degrees)); no backend call.
+      * "glassify" — force the window/glass transparency transform (white texels ->
+        near-clear) onto the object's served mesh, bypassing the pipeline's keyword
+        + symmetry gates. Applies to the WHOLE prefab group (each member's served
+        mesh directly, since glass isn't raw-derivable); no backend call.
+      * "reset" — rebuild the object's served mesh from its pristine raw, dropping
+        any in-place served edit (e.g. a forced glassify) while keeping its current
+        symmetry; propagates across the prefab group; no backend call.
       * "link" — join this object into the prefab group of `link_to` (any member
         of the destination group), re-deriving its mesh from that group's
         canonical; no backend call.
@@ -132,6 +139,11 @@ class RegenJob:
     propagate: bool = True
     backend: str = generation.DEFAULT_MESH_BACKEND
     reuse_image: bool = False
+    # Regenerate the object's noun phrase (re-distill from its authored seed) as
+    # part of a "regenerate" op, then re-log the `image` event with it so later
+    # regenerations read the new phrase. Forces `reuse_image` off (a new phrase
+    # needs a new image).
+    regen_noun_phrase: bool = False
     sym: tuple[str, bool] | None = None
     reorient: tuple[str, int] | None = None
     unlink: bool = False
@@ -2283,6 +2295,7 @@ def create_app() -> FastAPI:
         propagate: bool = False,
         backend: str = "trellis",
         reuse_image: bool = False,
+        regen_noun_phrase: bool = False,
         unlink: bool = False,
     ) -> dict[str, object]:
         """Enqueue a from-scratch regeneration of a GENERATED asset (in the
@@ -2332,11 +2345,15 @@ def create_app() -> FastAPI:
         # Unlinking diverges this object alone — never fan the rebuild across the
         # group it's leaving.
         propagate = propagate and not unlink
+        # Regenerating the noun phrase means a fresh image distilled from it, so a
+        # reuse-image request can't also apply — the new phrase needs a new image.
+        reuse_image = reuse_image and not regen_noun_phrase
         gen_slot_id = _gen_slot_id(run, slot.id, model_alias)
         queue = _regen_queues.setdefault(key, asyncio.Queue())
         queue.put_nowait(RegenJob(
             node_id=node_id, op="regenerate", propagate=propagate,
-            backend=backend, reuse_image=reuse_image, unlink=unlink,
+            backend=backend, reuse_image=reuse_image,
+            regen_noun_phrase=regen_noun_phrase, unlink=unlink,
         ))
         # Surface the queued regen in the shared mesh queue panel until the
         # worker dequeues it (then generate_mesh manages its own entry). Tag the
@@ -2523,6 +2540,101 @@ def create_app() -> FastAPI:
             "op": "reorient",
             "axis": axis,
             "degrees": degrees,
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/glassify/{node_id}")
+    async def slot_glassify(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Force the window/glass transparency transform onto a generated object,
+        bypassing the pipeline's keyword + symmetry gates. Bakes per-texel
+        transparency into the served mesh (white / near-white texels -> near-clear)
+        and re-optimizes the served twin — no Nano-Banana, no mesh backend, so it's
+        effectively instant. Applies to the WHOLE prefab group behind `node_id`
+        (each member's served mesh directly, since glass isn't re-derivable from the
+        shared raw). Operating on the served mesh, it is not raw-derivable, so a
+        later regenerate / symmetrize / reorient / reset rebuilds from raw and drops
+        the transparency. Reprocesses on the SAME per-version worker as
+        regenerate/symmetrize, so it enqueues, drains concurrently, and serializes
+        per-node via `generation.node_lock`."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        # Same worker as symmetrize/reorient. propagate=True: glass is applied to
+        # every member of the object's prefab group. Not surfaced in the mesh queue
+        # panel — a local reprocess, not a backend gen.
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait(RegenJob(node_id=node_id, op="glassify", propagate=True))
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "op": "glassify",
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/reset-mesh/{node_id}")
+    async def slot_reset_mesh(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Rebuild a GENERATED object's served mesh from its pristine raw Trellis
+        output, dropping any in-place served edit (notably a forced glassify) while
+        KEEPING its current symmetry/orientation. No Nano-Banana, no mesh backend,
+        so it's effectively instant. Applies to the WHOLE prefab group behind
+        `node_id`: the canonical is re-derived from its raw and every reuse is
+        re-derived from that same clean raw (`propagate_reuses`), so the group
+        reverts together. Reprocesses on the SAME per-version worker as
+        regenerate/symmetrize, so it enqueues, drains concurrently, and serializes
+        per-node via `generation.node_lock`. (To remove the symmetry mirror too, use
+        /unsymmetrize.)"""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        # Same worker as symmetrize/reorient. propagate=True: the whole prefab group
+        # reverts to its clean raw-derived mesh. Not surfaced in the mesh queue
+        # panel — a local reprocess, not a backend gen.
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait(RegenJob(node_id=node_id, op="reset", propagate=True))
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "op": "reset",
             "queued": True,
             "depth": queue.qsize(),
         }
@@ -3361,6 +3473,20 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
     )
 
 
+def _node_seed_prompt(slot_log: SlotLog, node_id: str) -> str | None:
+    """The object's AUTHORED seed prompt — the `bbox` event's `prompt`, which is
+    always the decompose seed (`spec.prompt`), never the distilled noun phrase
+    (the `image` event holds that). Used by the regenerate-noun-phrase path to
+    re-distill a fresh phrase from the original description. Latest bbox wins."""
+    seed: str | None = None
+    for event in slot_log.state["events"]:
+        if event.get("kind") == "bbox" and event.get("id") == node_id:
+            p = event.get("prompt")
+            if isinstance(p, str):
+                seed = p
+    return seed
+
+
 def _scene_nodes_from_library(slot_log: SlotLog) -> list[Node]:
     """Every concrete (object/frame) node reconstructed from a cell's library log,
     in first-seen order — the exact layout a from-scratch generated build reuses
@@ -3378,6 +3504,143 @@ def _scene_nodes_from_library(slot_log: SlotLog) -> list[Node]:
         node = _reconstruct_node(slot_log, node_id)
         if node is not None:
             nodes.append(node)
+    return nodes
+
+
+def _scene_nodes_full(slot_log: SlotLog, *, image_log: SlotLog | None = None) -> list[Node]:
+    """Reconstruct the COMPLETE scene tree (zones + objects/frames) as `Node`s from
+    a cell's library log — enough for the scene-context renderers
+    (`scene_context.zone_vars` / `render_embedded_block`): each node carries its
+    bbox, seed `prompt`, distilled `noun_phrase`, `plan` (zones), `placement` /
+    `parent_kind` / `referenced_ids` / orientation text, `parent_region` (objects),
+    and `is_zone`.
+
+    Unlike `_scene_nodes_from_library` (objects only, minimal fields for re-mesh),
+    this rebuilds the FULL tree so a regenerate-noun-phrase pass can show the same
+    scene context the original `image_prompt` step saw. It reads events directly
+    (not the bound-log `committed.*`), so it works against any cell's log.
+    Best-effort: malformed / legacy events are skipped rather than raising.
+
+    `noun_phrase` is the distilled subject phrase from each node's `image` event,
+    taken to be distinct from the seed. The phrase is sourced from `slot_log`, but
+    when `image_log` is given (the GENERATED build's log) its `image` events take
+    precedence — that's where a generated/regenerated object's freshly-distilled
+    phrase lands, while the library log often only stores the verbose seed. Without
+    this overlay a regenerated object's noun phrase would never surface in the
+    scene context (the library `image` event still equals its seed)."""
+    events = slot_log.state["events"]
+
+    # bbox per id (latest wins), tracking first-seen order so the rendered tree is
+    # deterministic and roughly matches creation order.
+    bbox_ev: dict[str, dict[str, object]] = {}
+    order: list[str] = []
+    for e in events:
+        if e.get("kind") != "bbox":
+            continue
+        nid = e.get("id")
+        if not isinstance(nid, str):
+            continue
+        if nid not in bbox_ev:
+            order.append(nid)
+        bbox_ev[nid] = e
+
+    zone_plans: dict[str, str] = {}
+    subregion_specs: dict[str, Any] = {}
+    obj_specs: dict[str, Any] = {}
+    obj_region: dict[str, str] = {}
+    image_subj: dict[str, str] = {}
+    for e in events:
+        kind = e.get("kind")
+        if kind == "divider.zone_plan":
+            nid, plan = e.get("node"), e.get("plan")
+            if isinstance(nid, str) and isinstance(plan, str):
+                zone_plans[nid] = plan
+        elif kind == "divider.zone_decompose":
+            for c in e.get("children") or []:
+                if isinstance(c, dict) and isinstance(c.get("id"), str):
+                    try:
+                        subregion_specs[c["id"]] = schemas.SubregionSpec.model_validate(c)
+                    except Exception:
+                        pass
+        elif kind == "generation.decompose":
+            zone = e.get("zone")
+            for o in e.get("objects") or []:
+                if isinstance(o, dict) and isinstance(o.get("id"), str):
+                    try:
+                        obj_specs[o["id"]] = schemas.ObjectSpec.model_validate(o)
+                        if isinstance(zone, str):
+                            obj_region[o["id"]] = zone
+                    except Exception:
+                        pass
+        elif kind == "generation.next":
+            zone, o = e.get("zone"), e.get("object")
+            if isinstance(o, dict) and isinstance(o.get("id"), str):
+                try:
+                    obj_specs[o["id"]] = schemas.ObjectSpec.model_validate(o)
+                    if isinstance(zone, str):
+                        obj_region[o["id"]] = zone
+                except Exception:
+                    pass
+        elif kind == "image":
+            nid, p = e.get("id"), e.get("prompt")
+            if isinstance(nid, str) and isinstance(p, str):
+                image_subj[nid] = p
+    # The generated build's `image` events carry the distilled noun phrases for
+    # objects built/regenerated there; let them win over the library log's (which
+    # frequently just re-store the seed), so a generated noun phrase shows up.
+    if image_log is not None:
+        for e in image_log.state["events"]:
+            if e.get("kind") == "image":
+                nid, p = e.get("id"), e.get("prompt")
+                if isinstance(nid, str) and isinstance(p, str):
+                    image_subj[nid] = p
+
+    nodes: list[Node] = []
+    for nid in order:
+        be = bbox_ev[nid]
+        origin, dims = be.get("origin"), be.get("dimensions")
+        if not isinstance(origin, list) or not isinstance(dims, list):
+            continue
+        try:
+            box = BoundingBox(
+                origin=(float(origin[0]), float(origin[1]), float(origin[2])),
+                dimensions=(float(dims[0]), float(dims[1]), float(dims[2])),
+            )
+        except Exception:
+            continue
+        is_zone = be.get("node_kind") == "zone"
+        proxy_raw = be.get("proxy_shape")
+        proxy_shape = ProxyShape(proxy_raw) if isinstance(proxy_raw, str) else None
+        o_raw = be.get("orientation", 0)
+        node_orientation: Orientation = int(o_raw) if isinstance(o_raw, (int, float, str)) else 0  # type: ignore[assignment]
+        seed = be.get("prompt")
+        seed = seed if isinstance(seed, str) else ""
+        parent_id = be.get("parent_id")
+        parent_id = parent_id if isinstance(parent_id, str) else None
+        # The `image` event's prompt is the distilled noun phrase on current runs
+        # (== the seed on legacy ones); only surface it when it actually differs,
+        # so a legacy object doesn't show a redundant noun_phrase line.
+        img = image_subj.get(nid)
+        noun_phrase = img if (img and img != seed) else None
+        spec = subregion_specs.get(nid) if is_zone else obj_specs.get(nid)
+        nodes.append(Node(
+            id=nid,
+            prompt=seed,
+            noun_phrase=noun_phrase,
+            bbox=box,
+            proxy_shape=proxy_shape,
+            orientation=node_orientation,
+            orientation_description=("" if is_zone else str(getattr(spec, "orientation", "") or "")),
+            placement=getattr(spec, "placement", None) if spec is not None else None,
+            referenced_ids=list(getattr(spec, "referenced_ids", []) or []) if spec is not None else [],
+            parent_id=parent_id,
+            # parent_kind is rendered only for objects (from the spec); zones don't
+            # surface it, so leaving it None there is harmless.
+            parent_kind=(None if is_zone else getattr(spec, "parent_kind", None)),
+            parent_region=(None if is_zone else obj_region.get(nid)),
+            plan=(zone_plans.get(nid) if is_zone else None),
+            is_zone=is_zone,
+        ))
     return nodes
 
 
@@ -4143,6 +4406,22 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                         node=build_node, axis=rax, degrees=rdeg,  # type: ignore[arg-type]
                         runs_dir=RUNS_DIR, run_id=run_id,
                     )
+                elif op == "reset":
+                    # Rebuild the canonical's served mesh from its pristine raw
+                    # (drop forced glass, keep symmetry); propagate re-derives its
+                    # reuses below from that same clean raw, so the whole group
+                    # reverts together.
+                    await generation.reset_from_raw_one(
+                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                    )
+                elif op == "glassify":
+                    # Force the glass-transparency transform onto the WHOLE prefab
+                    # group (no AI). Glass is a per-mesh texture edit, not derivable
+                    # from the shared raw, so apply it to the canonical AND every
+                    # reuse directly here and SKIP the raw-replay propagate below.
+                    await generation.glassify_group(
+                        nodes=[build_node, *reuses], runs_dir=RUNS_DIR, run_id=run_id,
+                    )
                 else:
                     if job.reuse_image:
                         # From-image rebuild: ensure the node we're building has its
@@ -4153,21 +4432,46 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                         generation.recover_group_image(
                             RUNS_DIR, run_id, build_node.id, [canonical_id, *reuse_ids],
                         )
+                    # Regenerate-noun-phrase: re-distill from the build node's
+                    # AUTHORED seed (the library log's bbox prompt), not its current
+                    # distilled phrase — so the new phrase derives from the original
+                    # description even when the object has no noun phrase yet. Also
+                    # reconstruct the full scene tree + the node's owning zone, so the
+                    # re-distillation runs with the SAME scene context (root header,
+                    # zone, sibling objects) the original image_prompt step saw rather
+                    # than an empty one.
+                    seed_prompt: str | None = None
+                    scene_zone: Node | None = None
+                    scene_nodes: list[Node] | None = None
+                    if job.regen_noun_phrase and lib_log is not None:
+                        seed_prompt = _node_seed_prompt(lib_log, build_node.id)
+                        scene_nodes = _scene_nodes_full(lib_log, image_log=gen_log)
+                        target = next((n for n in scene_nodes if n.id == build_node.id), None)
+                        zone_id = target.parent_region if target is not None else None
+                        scene_zone = (
+                            next((n for n in scene_nodes if n.id == zone_id), None)
+                            if zone_id else None
+                        )
                     await generation.regenerate_one(
                         node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
                         subdir=raw_subdir, optimize=True, backend=job.backend, generated=True,
                         reuse_image=job.reuse_image,
+                        regen_noun_phrase=job.regen_noun_phrase, seed_prompt=seed_prompt,
+                        scene_zone=scene_zone, scene_nodes=scene_nodes,
                     )
-                if propagate:
+                if propagate and op != "glassify":
+                    # glassify already transformed every member itself (above) —
+                    # its texture edit isn't re-derivable from the raw that
+                    # propagate_reuses replays, so it must not run here.
                     await generation.propagate_reuses(
                         canonical_id=canonical_id, reuses=reuses,
                         runs_dir=RUNS_DIR, run_id=run_id,
                     )
-                elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize", "reorient"):
+                elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize", "reorient", "glassify", "reset"):
                     # A reuse regenerated on its own now owns a fresh mesh + raw —
                     # record it as canonical so a later propagate of its old source
-                    # can't clobber it. (Symmetry / reorient ops write no new raw for
-                    # a reuse — they target the canonical — so they never promote.)
+                    # can't clobber it. (Symmetry / reorient / glassify / reset ops
+                    # write no new raw for a reuse — so they never promote.)
                     gen_log.log(
                         "prefab.match", id=node_id, reuse_id="", description=build_node.prompt,
                     )

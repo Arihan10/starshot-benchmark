@@ -231,12 +231,17 @@ class Node(BaseModel):
     registry, but the pipeline emits state to clients incrementally via
     SSE events rather than by traversing the Node graph.
 
-    `prompt` is always the bare subject phrase — what the node *is* in plain
-    language. `image_prompt` is the Nano-Banana–specific directive (the
-    studio-shot wrapper around the subject phrase) used only at the
-    image-generation boundary. Keeping them separate prevents the wrapper
-    boilerplate from leaking into LLM context lookups like "objects placed
-    so far" / "prior subject phrases in this scene".
+    `prompt` is the node's authored prompt — the decomposition seed describing
+    what the node *is* (for objects, often with its role / scene context).
+    `noun_phrase` is the concise, isolated visual subject phrase distilled from
+    that prompt by the `image_prompt` step during the object's asset-generation
+    pass — the bare "what it physically is", stripped of placement/context. It is
+    `None` until generated, and `None` for zones (which carry only `prompt`/`plan`).
+    `image_prompt` is the Nano-Banana–specific directive (the studio-shot wrapper
+    around the noun phrase) used only at the image-generation boundary. Keeping
+    them separate lets scene context surface both the authored prompt and the
+    generated noun phrase, and keeps the wrapper boilerplate out of LLM context
+    lookups like "objects placed so far" / "prior subject phrases in this scene".
 
     `placement` is the prose description of where this node sits in the
     scene, authored at the decomposition step and resolved by the
@@ -254,6 +259,13 @@ class Node(BaseModel):
 
     id: str
     prompt: str
+    # The concise visual subject phrase distilled from `prompt` by the
+    # `image_prompt` step during this object's asset-generation pass — what it
+    # physically IS, stripped of placement/scene context. Drives library
+    # matching, the symmetry cut plane, prefab grouping, and the wrapped
+    # Nano-Banana directive, and is surfaced in scene context beneath `prompt`.
+    # None until generated, and None for zones.
+    noun_phrase: str | None = None
     bbox: BoundingBox
     proxy_shape: ProxyShape | None = None
     orientation: Orientation = 0

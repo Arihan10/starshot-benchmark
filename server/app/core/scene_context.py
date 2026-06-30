@@ -66,30 +66,39 @@ def _local_coords_line(node: Node, by_id: dict[str, Node]) -> str | None:
     return None
 
 
-def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str) -> str:
+def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str, *, compact: bool = False) -> str:
     """Full-detail entry for one concrete object (no plan), rendered as a member of the scene's flat object list.
 
-    `parent` is the object's structural-anchor block — `parent_id` (the peer object or region this object physically rests on / attaches to / sits inside), `parent_relationship_kind` (ON / ATTACHED / IN), `parent_dimensions` (that parent's size), and `parent_global_origin_corner` (its world position). `parent_region` is the id of the subregion this object belongs to and `parent_region_dimensions` is that region's size; both are omitted when `parent_region` would equal `parent_id` (the object anchors directly to its region — the `parent` block already states them), and they are shown only when the object anchors to a peer object (e.g. a lamp ON a nightstand has parent_id=nightstand, parent_region=<the subregion the nightstand is in>)."""
+    `parent` is the object's structural-anchor block — `parent_id` (the peer object or region this object physically rests on / attaches to / sits inside), `parent_relationship_kind` (ON / ATTACHED / IN), `parent_dimensions` (that parent's size), and `parent_global_origin_corner` (its world position). `parent_region` is the id of the subregion this object belongs to and `parent_region_dimensions` is that region's size; both are omitted when `parent_region` would equal `parent_id` (the object anchors directly to its region — the `parent` block already states them), and they are shown only when the object anchors to a peer object (e.g. a lamp ON a nightstand has parent_id=nightstand, parent_region=<the subregion the nightstand is in>).
+
+    `noun_phrase` (the concise visual subject distilled during the object's asset-generation pass) is shown right under `prompt` whenever the object has one — i.e. its image was already generated; objects not yet generated (and zones) omit the line.
+
+    With `compact=True` (the `{SCENE_CONTEXT_COMPACT}` variant) only the SEMANTIC fields are emitted — id, prompt, `noun_phrase` (when generated), semantic parent (`parent: <id> (<kind>)`), `parent_region` id, placement, relationships, the orientation phrase, and the object's own bbox dimensions. Every world/parent coordinate (global + local origin corners, parent + region dimensions/origins), the numeric yaw, and the proxy shape are dropped."""
     lines = [
         f"Name: {obj.id}",
         f'prompt: "{obj.prompt}"',
     ]
+    if obj.noun_phrase:
+        lines.append(f'noun_phrase/description: "{obj.noun_phrase}"')
     if obj.parent_id is not None:
         kind_str = obj.parent_kind.value if obj.parent_kind is not None else "(unknown)"
-        parent_lines = [
-            f"parent_id: {obj.parent_id}",
-            f"parent_relationship_kind: {kind_str}",
-        ]
-        if obj.parent_id in by_id:
-            parent_bbox = by_id[obj.parent_id].bbox
-            parent_lines.append(f"parent_dimensions: {util.format_dimensions(parent_bbox)}")
-            parent_lines.append(
-                f"parent_global_origin_corner: {util.format_global_origin(parent_bbox)}"
-            )
-        lines.append("parent: " + util.braces("\n".join(parent_lines)))
+        if compact:
+            lines.append(f"parent: {obj.parent_id} ({kind_str})")
+        else:
+            parent_lines = [
+                f"parent_id: {obj.parent_id}",
+                f"parent_relationship_kind: {kind_str}",
+            ]
+            if obj.parent_id in by_id:
+                parent_bbox = by_id[obj.parent_id].bbox
+                parent_lines.append(f"parent_dimensions: {util.format_dimensions(parent_bbox)}")
+                parent_lines.append(
+                    f"parent_global_origin_corner: {util.format_global_origin(parent_bbox)}"
+                )
+            lines.append("parent: " + util.braces("\n".join(parent_lines)))
     if parent_zone != obj.parent_id:
         lines.append(f"parent_region: {parent_zone}")
-        if parent_zone in by_id:
+        if not compact and parent_zone in by_id:
             lines.append(
                 f"parent_region_dimensions: {util.format_dimensions(by_id[parent_zone].bbox)}"
             )
@@ -100,14 +109,17 @@ def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str) -> str:
         lines.append(f"relationships: [{refs}]")
     else:
         lines.append("relationships: []")
-    lines.append(f"proxy_shape: {_render_proxy_shape(obj.proxy_shape)}")
+    if not compact:
+        lines.append(f"proxy_shape: {_render_proxy_shape(obj.proxy_shape)}")
     lines.append(f'orientation: "{obj.orientation_description}"')
-    lines.append(f"global yaw: {obj.orientation}deg")
+    if not compact:
+        lines.append(f"global yaw: {obj.orientation}deg")
     lines.append(f"Dimensions: {util.format_dimensions(obj.bbox)}")
-    lines.append(f"Global origin corner: {util.format_global_origin(obj.bbox)}")
-    local = _local_coords_line(obj, by_id)
-    if local is not None:
-        lines.append(local)
+    if not compact:
+        lines.append(f"Global origin corner: {util.format_global_origin(obj.bbox)}")
+        local = _local_coords_line(obj, by_id)
+        if local is not None:
+            lines.append(local)
     return util.braces("\n".join(lines))
 
 
@@ -118,8 +130,12 @@ def _region_embedded_entry(
     by_id: dict[str, Node],
     target_id: str | None = None,
     target_text: str = "",
+    *,
+    compact: bool = False,
 ) -> str:
-    """Subregion tree (embedded form): a subregion's fields, then a FLAT list of the objects placed directly inside it, then (recursively) its nested subregions. Objects are never nested under one another — a peer-anchored object names its anchor in its own `parent` block rather than nesting beneath it. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one region."""
+    """Subregion tree (embedded form): a subregion's fields, then a FLAT list of the objects placed directly inside it, then (recursively) its nested subregions. Objects are never nested under one another — a peer-anchored object names its anchor in its own `parent` block rather than nesting beneath it. When `target_id` matches this region (at any depth), an inline marker carrying `target_text` is appended to its name line so a prompt can point the LLM at this one region.
+
+    With `compact=True` (the `{SCENE_CONTEXT_COMPACT}` variant) a subregion shows only its name, prompt, description, and placement — its relationships, proxy, dimensions, world/local origin corners, and parent block are dropped. Its inline objects and nested subregions recurse in the same compact form."""
     objects, subregions = util.split_region_members_owned(region.id, idx, obj_idx)
     name_line = f"Subregion name: {region.id}"
     if target_id is not None and region.id == target_id:
@@ -132,33 +148,34 @@ def _region_embedded_entry(
         lines.append(f'description: "{region.plan}"')
     if region.placement is not None:
         lines.append(f'placement: "{region.placement}"')
-    if region.referenced_ids:
-        refs = ", ".join(f"{r.target}: {r.kind.value}" for r in region.referenced_ids)
-        lines.append(f"relationships: [{refs}]")
-    else:
-        lines.append("relationships: []")
-    lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
-    lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
-    lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
-    local = _local_coords_line(region, by_id)
-    if local is not None:
-        lines.append(local)
-    if region.parent_id is not None and region.parent_id in by_id:
-        parent = by_id[region.parent_id]
-        parent_placement = f'"{parent.placement}"' if parent.placement is not None else "(none)"
-        parent_lines = [
-            f"parent_name: {parent.id}",
-            f"parent_placement: {parent_placement}",
-            f"parent_dimensions: {util.format_dimensions(parent.bbox)}",
-            f"parent_global_origin_corner: {util.format_global_origin(parent.bbox)}",
-        ]
-        lines.append("parent_region: " + util.braces("\n".join(parent_lines)))
+    if not compact:
+        if region.referenced_ids:
+            refs = ", ".join(f"{r.target}: {r.kind.value}" for r in region.referenced_ids)
+            lines.append(f"relationships: [{refs}]")
+        else:
+            lines.append("relationships: []")
+        lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
+        lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
+        lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
+        local = _local_coords_line(region, by_id)
+        if local is not None:
+            lines.append(local)
+        if region.parent_id is not None and region.parent_id in by_id:
+            parent = by_id[region.parent_id]
+            parent_placement = f'"{parent.placement}"' if parent.placement is not None else "(none)"
+            parent_lines = [
+                f"parent_name: {parent.id}",
+                f"parent_placement: {parent_placement}",
+                f"parent_dimensions: {util.format_dimensions(parent.bbox)}",
+                f"parent_global_origin_corner: {util.format_global_origin(parent.bbox)}",
+            ]
+            lines.append("parent_region: " + util.braces("\n".join(parent_lines)))
     if objects:
         lines += [
             "",
             f'Objects placed directly within "{region.id}" (a flat list — an object anchored to a peer object names that peer in its `parent` block rather than nesting beneath it):',
             "",
-            util.brace_group([_object_entry(o, by_id, parent_zone=region.id) for o in objects]),
+            util.brace_group([_object_entry(o, by_id, parent_zone=region.id, compact=compact) for o in objects]),
         ]
     if subregions:
         lines += [
@@ -166,7 +183,7 @@ def _region_embedded_entry(
             f'Here\'s the list of subregions that are present within "{region.id}".',
             "",
             util.brace_group(
-                [_region_embedded_entry(s, idx, obj_idx, by_id, target_id, target_text) for s in subregions]
+                [_region_embedded_entry(s, idx, obj_idx, by_id, target_id, target_text, compact=compact) for s in subregions]
             ),
         ]
     return util.braces("\n".join(lines))
@@ -215,11 +232,100 @@ def render_zone_objects(zone_id: str, nodes: list[Node]) -> str:
     )
 
 
+# --- image-prompt scene context (reduced) ------------------------------------
+#
+# The image_prompt step only distills a noun phrase, so it needs just enough
+# context to keep an object's LOOK coherent with its neighbours — not the full
+# geometric placement tree. It gets a GRADUATED, far-trimmed view: the subject's
+# OWN region + sibling objects in semantic detail (`_object_local`), and
+# everything beyond (root + other subregions) as bare id / prompt / noun phrase
+# (`_object_brief`). World/local coordinates, yaw, proxy, and parent-frame dumps
+# are all dropped here.
+
+
+def _object_brief(obj: Node) -> str:
+    """Barest object entry — id, seed prompt, and the distilled noun phrase when
+    it exists. The FAR-context form (root + other subregions): only a neighbour's
+    identity and look matter for aesthetic coherence."""
+    lines = [f"Name: {obj.id}", f'prompt: "{obj.prompt}"']
+    if obj.noun_phrase:
+        lines.append(f'noun_phrase: "{obj.noun_phrase}"')
+    return util.braces("\n".join(lines))
+
+
+def _object_local(obj: Node) -> str:
+    """Sibling-object entry for the subject's OWN region: the semantic fields that
+    pin down the local arrangement — noun phrase, structural anchor
+    (`parent: <id> (<kind>)`), placement, relationships, and size — without the
+    world/local coordinate dump the placement steps consume."""
+    lines = [f"Name: {obj.id}", f'prompt: "{obj.prompt}"']
+    if obj.noun_phrase:
+        lines.append(f'noun_phrase: "{obj.noun_phrase}"')
+    if obj.parent_id is not None:
+        kind_str = obj.parent_kind.value if obj.parent_kind is not None else "(unknown)"
+        lines.append(f"parent: {obj.parent_id} ({kind_str})")
+    if obj.placement is not None:
+        lines.append(f'placement: "{obj.placement}"')
+    refs = ", ".join(f"{r.target}: {r.kind.value}" for r in obj.referenced_ids)
+    lines.append(f"relationships: [{refs}]")
+    lines.append(f"Dimensions: {util.format_dimensions(obj.bbox)}")
+    return util.braces("\n".join(lines))
+
+
+def render_image_sibling_objects(zone_id: str, nodes: list[Node]) -> str:
+    """`{SIBLING_OBJECTS}` — the objects already placed directly within the
+    subject's own region (`_object_local` detail): the immediate company the
+    distilled object shares space with. Placeholder when it is the first."""
+    objects = util.index_objects_by_region(nodes).get(zone_id, [])
+    if not objects:
+        return "No other objects have been placed directly in this region yet."
+    return util.brace_group([_object_local(o) for o in objects])
+
+
+def render_image_root_objects(nodes: list[Node]) -> str:
+    """`{ROOT_OBJECTS_BRIEF}` — the root-region objects (shells / ground / ambient
+    fill) in bare `_object_brief` form. Placeholder when the root holds none."""
+    root = util.find_root(nodes)
+    if root is None:
+        return _NO_NODES_MESSAGE
+    objects = util.index_objects_by_region(nodes).get(root.id, [])
+    if not objects:
+        return "No objects belong to the root region yet."
+    return util.brace_group([_object_brief(o) for o in objects])
+
+
+def render_image_other_subregions(focus_zone_id: str, nodes: list[Node]) -> str:
+    """`{OTHER_SUBREGIONS_BRIEF}` — every region EXCEPT the root and the subject's
+    own region, as a FLAT list (no hierarchy), each its name + prompt with a bare
+    `_object_brief` list of the objects inside it. The far aesthetic backdrop for
+    the image step; placeholder when there are none."""
+    root = util.find_root(nodes)
+    oidx = util.index_objects_by_region(nodes)
+    entries: list[str] = []
+    for n in nodes:
+        if not util.is_region(n) or n.id == focus_zone_id or (root is not None and n.id == root.id):
+            continue
+        lines = [f"Subregion name: {n.id}", f'prompt: "{n.prompt}"']
+        objs = oidx.get(n.id, [])
+        if objs:
+            lines += [
+                "",
+                f'Objects placed directly within "{n.id}":',
+                "",
+                util.brace_group([_object_brief(o) for o in objs]),
+            ]
+        entries.append(util.braces("\n".join(lines)))
+    if not entries:
+        return _NO_SUBREGIONS_MESSAGE
+    return util.brace_group(entries)
+
+
 def render_embedded_block(
     nodes: list[Node],
     *,
     node_id: str | None = None,
     text: str = "",
+    compact: bool = False,
 ) -> str:
     """Scene context in EMBEDDED form: the subregion tree where each subregion lists the objects placed directly inside it inline as a FLAT list — objects are never nested under one another, a peer-anchored object just names its anchor in its own `parent` block — and then recurses into its nested subregions. Objects anchored directly to the scene root (the shell/ground meshes from the root's encapsulating pass) are NOT included here — they are global geometry, rendered separately by `render_root_objects`. Renders the single-region placeholder when the scene has no subregions yet.
 
@@ -234,7 +340,7 @@ def render_embedded_block(
     if not subregions:
         return _NO_SUBREGIONS_MESSAGE
     return util.brace_group(
-        [_region_embedded_entry(s, idx, oidx, by_id, node_id, text) for s in subregions]
+        [_region_embedded_entry(s, idx, oidx, by_id, node_id, text, compact=compact) for s in subregions]
     )
 
 
@@ -505,6 +611,7 @@ def zone_vars(
         "ROOT_HEADER": _root_scene_header(root),
         "ROOT_OBJECTS": render_root_objects(nodes),
         "SCENE_CONTEXT": render_embedded_block(nodes, node_id=zone_id, text=target_text),
+        "SCENE_CONTEXT_COMPACT": render_embedded_block(nodes, node_id=zone_id, text=target_text, compact=True),
         "ADJACENT_ZONES": render_adjacent_zones_block(zone_id, nodes),
         "ZONE_ID": zone_id,
         "ZONE_PROMPT": zone_prompt,
@@ -531,6 +638,7 @@ def root_seed_vars(*, prompt: str) -> dict[str, str]:
         "ZONE_PROMPT": prompt,
         "ROOT_OBJECTS": render_root_objects([]),
         "SCENE_CONTEXT": render_embedded_block([]),
+        "SCENE_CONTEXT_COMPACT": render_embedded_block([], compact=True),
     })
     return out
 
@@ -547,6 +655,7 @@ def overall_bbox_vars(*, prompt: str, scene_plan: str) -> dict[str, str]:
         "ZONE_PLAN": scene_plan,
         "ROOT_OBJECTS": render_root_objects([]),
         "SCENE_CONTEXT": render_embedded_block([]),
+        "SCENE_CONTEXT_COMPACT": render_embedded_block([], compact=True),
     })
     return out
 
@@ -560,25 +669,37 @@ def image_prompt_vars(
     zone: Node | None = None,
     nodes: list[Node] | None = None,
 ) -> dict[str, str]:
-    """The variable set for the `image_prompt` step. When the owning zone +
-    scene snapshot are supplied, the scene-wide/zone variables are populated
-    too, so image-prompt templates can pull scene context if they want it."""
+    """The variable set for the `image_prompt` step (noun-phrase distillation).
+
+    The step only needs enough context to keep an object's LOOK coherent with its
+    neighbours, so it gets a GRADUATED, far-trimmed view rather than the full
+    placement tree: the subject's OWN region in semantic detail (`ZONE_*` +
+    `{SIBLING_OBJECTS}`), and everything beyond — the root region
+    (`ROOT_PROMPT` / `ROOT_PLAN` + `{ROOT_OBJECTS_BRIEF}`) and every other
+    subregion (`{OTHER_SUBREGIONS_BRIEF}`) — as bare id / prompt / noun phrase.
+    The heavy `{SCENE_CONTEXT}` / `{ROOT_HEADER}` / `{ZONE_OBJECTS}` blocks are
+    intentionally NOT built here. `zone`/`nodes` are optional; without them only
+    the object's own fields populate and the scene vars stay empty."""
     w, h, d = bbox.size
     if prior_prompts:
         prior_lines = "\n".join(f"  {i + 1}. {p}" for i, p in enumerate(prior_prompts))
         prior_block = f"Prior subject phrases in this scene ({len(prior_prompts)} total):\n{prior_lines}"
     else:
         prior_block = "Prior subject phrases in this scene: (none — this is the first object; you are setting the aesthetic baseline)."
+    out = base_vars()
     if zone is not None and nodes:
-        out = zone_vars(
-            zone_id=zone.id,
-            zone_prompt=zone.prompt,
-            zone_plan=zone.plan,
-            nodes=nodes,
-            target_text="This is the subregion the object being described belongs to.",
-        )
-    else:
-        out = base_vars()
+        root = util.find_root(nodes)
+        out.update({
+            "ROOT_PROMPT": root.prompt if root is not None else "",
+            "ROOT_PLAN": str(root.plan or "") if root is not None else "",
+            "ROOT_OBJECTS_BRIEF": render_image_root_objects(nodes),
+            "ZONE_ID": zone.id,
+            "ZONE_PROMPT": zone.prompt,
+            "ZONE_PLAN": str(zone.plan or ""),
+            "ZONE_PLACEMENT": str(zone.placement or ""),
+            "SIBLING_OBJECTS": render_image_sibling_objects(zone.id, nodes),
+            "OTHER_SUBREGIONS_BRIEF": render_image_other_subregions(zone.id, nodes),
+        })
     out.update({
         "OBJECT_PROMPT": prompt,
         "OBJECT_DIMENSIONS": f"width={w:.2f}m, height={h:.2f}m, depth={d:.2f}m",
@@ -621,6 +742,7 @@ def sample_variables() -> dict[str, str]:
     )
     floor = Node(
         id="floor_slab", prompt="a wide oak-plank floor slab",
+        noun_phrase="a wide oak-plank floor slab in warm honey tones",
         bbox=_box((0.0, 0.0, 0.0), (8.0, 0.1, 6.0)),
         parent_id="root", parent_kind=ParentRelationshipKind.IN, parent_region="root",
         orientation_description="lies flat; no inherent facing",
@@ -642,6 +764,7 @@ def sample_variables() -> dict[str, str]:
     )
     sofa = Node(
         id="linen_sofa", prompt="a tufted two-seater linen sofa",
+        noun_phrase="a tufted two-seater sofa in oatmeal linen",
         bbox=_box((0.5, 0.1, 3.5), (2.0, 0.9, 0.9)),
         parent_id="living_room", parent_kind=ParentRelationshipKind.IN, parent_region="living_room",
         orientation=90, orientation_description="facing east toward the coffee table",
@@ -651,6 +774,7 @@ def sample_variables() -> dict[str, str]:
     )
     table = Node(
         id="coffee_table", prompt="a round walnut coffee table",
+        noun_phrase="a round walnut coffee table with tapered legs",
         bbox=_box((1.0, 0.1, 2.0), (1.2, 0.45, 0.7)),
         parent_id="living_room", parent_kind=ParentRelationshipKind.IN, parent_region="living_room",
         orientation_description="round; no inherent facing",
@@ -658,6 +782,7 @@ def sample_variables() -> dict[str, str]:
     )
     lamp = Node(
         id="table_lamp", prompt="a brass table lamp with a linen shade",
+        noun_phrase="a brass table lamp with a cream linen drum shade",
         bbox=_box((1.4, 0.55, 2.2), (0.3, 0.6, 0.3)),
         parent_id="coffee_table", parent_kind=ParentRelationshipKind.ON, parent_region="living_room",
         orientation_description="symmetric shade; no inherent facing",
@@ -672,6 +797,7 @@ def sample_variables() -> dict[str, str]:
     )
     armchair = Node(
         id="leather_armchair", prompt="a worn leather wingback armchair",
+        noun_phrase="a worn cognac leather wingback armchair",
         bbox=_box((3.3, 0.1, 4.7), (0.9, 1.0, 0.9)),
         parent_id="reading_nook", parent_kind=ParentRelationshipKind.IN, parent_region="reading_nook",
         orientation=45, orientation_description="angled toward the bay window in the corner",
@@ -680,6 +806,7 @@ def sample_variables() -> dict[str, str]:
     )
     bed = Node(
         id="platform_bed", prompt="a low platform single bed with a quilt",
+        noun_phrase="a low oak platform bed with a sage-green quilt",
         bbox=_box((5.5, 0.1, 0.5), (1.4, 0.6, 2.0)),
         parent_id="bedroom", parent_kind=ParentRelationshipKind.IN, parent_region="bedroom",
         orientation_description="headboard to the back wall, foot facing into the room",
@@ -738,6 +865,7 @@ def sample_variables() -> dict[str, str]:
     for k in (
         "OBJECT_PROMPT", "OBJECT_DIMENSIONS", "PROXY_SHAPE",
         "IMAGE_TEMPLATE_FRONT", "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP", "PRIOR_SUBJECTS",
+        "SIBLING_OBJECTS", "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF",
     ):
         out[k] = img[k]
 

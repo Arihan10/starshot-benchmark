@@ -93,7 +93,11 @@ export function initOverlay(sceneViewer) {
 				let groupSize = 0;
 				for (const v of lastGenMesh.values())
 					if (v.canonical === m.canonical) groupSize += 1;
-				return { canonical: m.canonical, isReuse: m.canonical !== id, groupSize };
+				return {
+					canonical: m.canonical,
+					isReuse: m.canonical !== id,
+					groupSize,
+				};
 			},
 			// Other prefab groups this object could be linked into — one entry per
 			// distinct canonical (excluding the node's own group), labeled by the
@@ -110,7 +114,11 @@ export function initOverlay(sceneViewer) {
 				for (const [canon, size] of counts) {
 					if (canon === myCanon) continue;
 					const node = obs.model.nodes.get(canon);
-					out.push({ canonical: canon, label: node?.prompt || canon, size });
+					out.push({
+						canonical: canon,
+						label: node?.prompt || canon,
+						size,
+					});
 				}
 				out.sort((a, b) => a.label.localeCompare(b.label));
 				return out;
@@ -122,13 +130,17 @@ export function initOverlay(sceneViewer) {
 			optimizedOf: (id) => {
 				const m = lastGenMesh.get(id);
 				if (!m || !m.optUrl || !m.unoptUrl) return null;
-				return objOptMode.get(id) ?? (optimizedView ? "optimized" : "raw");
+				return (
+					objOptMode.get(id) ?? (optimizedView ? "optimized" : "raw")
+				);
 			},
 			onRegenerate: regenerateNode,
 			onSymmetrize: symmetrizeNode,
 			onUnsymmetrize: unsymmetrizeNode,
 			onLink: linkNode,
 			onReorient: reorientNode,
+			onGlassify: glassifyNode,
+			onReset: resetNode,
 			onSetOptimized: setObjectOptimized,
 		},
 		// Mini-preview mesh source: the generated mesh while in the generated view
@@ -345,7 +357,8 @@ function syncAssetControls() {
 	optBtn.style.display = gen ? "" : "none";
 	genStatusEl.style.display = gen ? "" : "none";
 	assetBtn.classList.toggle("on", assetMode === "generated");
-	assetBtn.textContent = assetMode === "generated" ? "generated ✓" : "generated";
+	assetBtn.textContent =
+		assetMode === "generated" ? "generated ✓" : "generated";
 	optBtn.classList.toggle("on", optimizedView);
 	optBtn.textContent = optimizedView ? "optimized ✓" : "raw";
 }
@@ -399,7 +412,9 @@ function loadLibraryMeshes() {
 	if (!state.view) return;
 	const { slot, model, branch } = state.view;
 	viewer.prefetchBundle(
-		branch ? api.branchMeshesUrl(branch) : api.meshesUrl(state.run, slot, model, {}),
+		branch
+			? api.branchMeshesUrl(branch)
+			: api.meshesUrl(state.run, slot, model, {}),
 	);
 }
 
@@ -455,7 +470,9 @@ function attachGeneratedMeshes(meshes) {
 		if (loadedGen.get(m.id) === tagged) continue;
 		const had = loadedGen.has(m.id);
 		loadedGen.set(m.id, tagged);
-		viewer.loadModel({ id: m.id, url: tagged }, api.absUrl(tagged), { replace: had });
+		viewer.loadModel({ id: m.id, url: tagged }, api.absUrl(tagged), {
+			replace: had,
+		});
 	}
 }
 
@@ -469,7 +486,9 @@ async function pollGenerated() {
 	const run = state.run;
 	let status = null;
 	try {
-		status = await api.generateStatus(run, slot, model, { optimized: optimizedView });
+		status = await api.generateStatus(run, slot, model, {
+			optimized: optimizedView,
+		});
 	} catch {
 		/* transient — the next poll (if still in generated mode) retries */
 	}
@@ -484,11 +503,22 @@ async function pollGenerated() {
 	if (!status) return;
 	const meshes = status.meshes ?? [];
 	lastGenMesh = new Map(
-		meshes.map((m) => [m.id, {
-			url: m.url, raw: m.raw, v: m.v, plane: m.sym, was: m.symWas,
-			canonical: m.canonical ?? m.id, imagePrompt: m.imagePrompt ?? null,
-			optUrl: m.optUrl, optV: m.optV, unoptUrl: m.unoptUrl, unoptV: m.unoptV,
-		}]),
+		meshes.map((m) => [
+			m.id,
+			{
+				url: m.url,
+				raw: m.raw,
+				v: m.v,
+				plane: m.sym,
+				was: m.symWas,
+				canonical: m.canonical ?? m.id,
+				imagePrompt: m.imagePrompt ?? null,
+				optUrl: m.optUrl,
+				optV: m.optV,
+				unoptUrl: m.unoptUrl,
+				unoptV: m.unoptV,
+			},
+		]),
 	);
 	// Expand the server's busy set (directly queued/processing node ids) to
 	// include every prefab group member whose canonical is busy — a regeneration
@@ -503,7 +533,10 @@ async function pollGenerated() {
 	// bumping mtime) re-attaches and an already-current one is never re-downloaded.
 	attachGeneratedMeshes(meshes);
 	const busySig = [...busyNodes].sort().join(",");
-	const sig = meshes.map((m) => `${m.id}:${m.v}:${m.sym}:${m.canonical}`).join("|") + "|busy:" + busySig;
+	const sig =
+		meshes.map((m) => `${m.id}:${m.v}:${m.sym}:${m.canonical}`).join("|") +
+		"|busy:" +
+		busySig;
 	if (sig !== genMeshSig) {
 		genMeshSig = sig;
 		tracePanel.rerenderInfo();
@@ -511,7 +544,9 @@ async function pollGenerated() {
 	const total = concreteNodeCount();
 	const done = status.count ?? 0;
 	const frac = total ? `${done}/${total}` : `${done}`;
-	genStatusEl.textContent = status.running ? `building… ${frac}` : `${frac} generated`;
+	genStatusEl.textContent = status.running
+		? `building… ${frac}`
+		: `${frac} generated`;
 	if (status.running) genPollTimer = setTimeout(pollGenerated, 1500);
 }
 
@@ -524,11 +559,26 @@ async function regenerateNode(id, opts) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	const unlink = !!opts.unlink;
+	// Disable the asset's controls immediately — before the enqueue round-trip and
+	// the (possibly slow) noun-phrase LLM step — so the button can't be re-fired.
+	// The next /generate-status poll keeps it busy server-side (the node is marked
+	// queued at enqueue); a failed enqueue re-enables it below.
+	busyNodes.add(id);
+	tracePanel.rerenderInfo();
 	try {
-		await api.regenerate(state.run, slot, model, id, { ...opts, unlink, propagate: !unlink });
-		toast(`${unlink ? "unlinking + regenerating" : "regenerating"} ${id} · ${opts.backend}…`, "ok");
+		await api.regenerate(state.run, slot, model, id, {
+			...opts,
+			unlink,
+			propagate: !unlink,
+		});
+		toast(
+			`${unlink ? "unlinking + regenerating" : "regenerating"} ${id}${opts.regenNounPhrase ? " (+ new noun phrase)" : ""} · ${opts.backend}…`,
+			"ok",
+		);
 		pollGenerated();
 	} catch (e) {
+		busyNodes.delete(id);
+		tracePanel.rerenderInfo();
 		toast(e.message, "err");
 	}
 }
@@ -549,7 +599,10 @@ async function symmetrizeNode(id, opts) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.symmetrize(state.run, slot, model, id, { ...opts, propagate: true });
+		await api.symmetrize(state.run, slot, model, id, {
+			...opts,
+			propagate: true,
+		});
 		toast(`symmetrizing ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -576,8 +629,42 @@ async function reorientNode(id, opts) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.reorient(state.run, slot, model, id, { ...opts, propagate: true });
+		await api.reorient(state.run, slot, model, id, {
+			...opts,
+			propagate: true,
+		});
 		toast(`re-fronting ${id}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Force the window/glass transparency transform onto this object (and its whole
+// prefab group) regardless of the pipeline's keyword + symmetry gates: the server
+// bakes white texels to near-clear and re-optimizes each member's served mesh.
+// Fast local reprocess, so it mirrors the symmetry handlers (no busy lock).
+async function glassifyNode(id) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.glassify(state.run, slot, model, id);
+		toast(`applying glass transparency to ${id} + prefab group…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Rebuild this object (and its prefab group) from the pristine raw mesh, dropping
+// any in-place served edit (e.g. a forced glassify) while keeping its current
+// symmetry. Fast local reprocess; mirrors the symmetry handlers (no busy lock).
+async function resetNode(id) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.reset(state.run, slot, model, id);
+		toast(`resetting ${id} + prefab group from raw…`, "ok");
 		pollGenerated();
 	} catch (e) {
 		toast(e.message, "err");
