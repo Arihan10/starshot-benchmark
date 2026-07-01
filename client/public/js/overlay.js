@@ -703,7 +703,7 @@ async function resetNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.reset(state.run, slot, model, id);
+		await api.resetMesh(state.run, slot, model, id);
 		toast(`resetting ${id} + prefab group from raw…`, "ok");
 		pollGenerated();
 	} catch (e) {
