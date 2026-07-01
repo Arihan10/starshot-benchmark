@@ -148,8 +148,8 @@ export const api = {
 	// generation-API `raw` mesh url for the per-object view; plus each mesh's
 	// prefab `canonical`). regenerate/symmetrize/unsymmetrize act on ONE object's
 	// generated mesh; with propagate they apply to its whole prefab group.
-	// regenerate with `unlink` instead pulls the object out of its group and
-	// rebuilds it alone; `link` moves it into another object's group. backend ∈
+	// `unlink` splits the object out of its group into a standalone asset (its own
+	// raw, no rebuild); `link` moves it into another object's group. backend ∈
 	// {trellis, hunyuan, hunyuan-tencent}.
 	generate: (run, slot, model) =>
 		request(cellPath(slot, model, "/generate"), {
@@ -170,7 +170,6 @@ export const api = {
 			propagate = true,
 			reuseImage = false,
 			regenNounPhrase = false,
-			unlink = false,
 		} = {},
 	) =>
 		request(
@@ -183,18 +182,26 @@ export const api = {
 					propagate,
 					reuse_image: reuseImage,
 					regen_noun_phrase: regenNounPhrase,
-					unlink,
 				},
 			},
 		),
 	// Link a generated object INTO another object's prefab group (target = any
 	// member of that group) so it shares the group's mesh — the inverse of
-	// regenerate's `unlink`. Re-derives the object's mesh from the group canonical;
-	// no backend call.
+	// `unlink`. Re-derives the object's mesh from the group canonical; no backend
+	// call.
 	link: (run, slot, model, nodeId, target, { group = false } = {}) =>
 		request(cellPath(slot, model, `/link/${encodeURIComponent(nodeId)}`), {
 			method: "POST",
 			params: { run, target, group },
+		}),
+	// Split a generated object OUT of its prefab group into a standalone asset with
+	// its own copy of the shared raw mesh (the inverse of `link`), so it stops
+	// sharing and can then be regenerated alone. No backend call — a fast local
+	// re-derivation on the regen worker.
+	unlink: (run, slot, model, nodeId) =>
+		request(cellPath(slot, model, `/unlink/${encodeURIComponent(nodeId)}`), {
+			method: "POST",
+			params: { run },
 		}),
 	symmetrize: (
 		run,

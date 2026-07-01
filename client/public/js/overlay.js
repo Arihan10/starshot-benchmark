@@ -148,6 +148,7 @@ export function initOverlay(sceneViewer) {
 			onSymmetrize: symmetrizeNode,
 			onUnsymmetrize: unsymmetrizeNode,
 			onLink: linkNode,
+			onUnlink: unlinkNode,
 			onReorient: reorientNode,
 			onGlassify: glassifyNode,
 			onReset: resetNode,
@@ -579,13 +580,13 @@ async function pollGenerated() {
 
 // Per-object actions from the trace panel (generated build only). Each enqueues
 // server-side work + polls so the new mesh swaps in when it lands. A plain
-// regenerate propagates across the object's prefab group; an `unlink` regenerate
-// first pulls the object out of its group so it diverges alone; `link` moves it
-// into another object's group (re-deriving its mesh, no backend call).
+// regenerate propagates across the object's prefab group; `unlink` splits the
+// object out of its group into a standalone asset with its own raw mesh (no
+// backend call); `link` moves it into another object's group (re-deriving its
+// mesh, no backend call).
 async function regenerateNode(id, opts) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
-	const unlink = !!opts.unlink;
 	// Disable the asset's controls immediately — before the enqueue round-trip and
 	// the (possibly slow) noun-phrase LLM step — so the button can't be re-fired.
 	// The next /generate-status poll keeps it busy server-side (the node is marked
@@ -593,13 +594,9 @@ async function regenerateNode(id, opts) {
 	busyNodes.add(id);
 	tracePanel.rerenderInfo();
 	try {
-		await api.regenerate(state.run, slot, model, id, {
-			...opts,
-			unlink,
-			propagate: !unlink,
-		});
+		await api.regenerate(state.run, slot, model, id, opts);
 		toast(
-			`${unlink ? "unlinking + regenerating" : "regenerating"} ${id}${opts.regenNounPhrase ? " (+ new noun phrase)" : ""} · ${opts.backend}…`,
+			`regenerating ${id}${opts.regenNounPhrase ? " (+ new noun phrase)" : ""} · ${opts.backend}…`,
 			"ok",
 		);
 		pollGenerated();
@@ -616,6 +613,22 @@ async function linkNode(id, target, { group = false } = {}) {
 	try {
 		await api.link(state.run, slot, model, id, target, { group });
 		toast(`linking ${group ? "group" : id} → ${target}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Split an object out of its prefab group into a standalone asset with its own
+// raw mesh (the server clones the shared geometry) so it no longer tracks the
+// group; the user can then regenerate it on its own. Fast local re-derivation,
+// no backend call — mirrors linkNode (no busy lock).
+async function unlinkNode(id) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.unlink(state.run, slot, model, id);
+		toast(`unlinking ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
 		toast(e.message, "err");

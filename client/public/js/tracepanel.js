@@ -293,8 +293,8 @@ export function createTracePanel(
 	// regenerate rebuilds the mesh fresh on the chosen backend (Trellis / Hunyuan
 	// on Modal / Hunyuan 3.1 on Tencent); symmetrize / unsymmetrize mirror or
 	// reveal the raw mesh with no backend call. A plain regenerate propagates across
-	// the prefab group; the prefab section below adds unlink (diverge this object
-	// alone) and link (join another group).
+	// the prefab group; the prefab section below adds unlink (split this object
+	// into a standalone asset) and link (join another group).
 	function buildActions(id) {
 		const busy = !!actions.isBusy?.(id);
 		const backendSel = el(
@@ -470,7 +470,7 @@ export function createTracePanel(
 			symText ? el("div", { class: "tp-act-sym", text: symText }) : null,
 			buildFrontView(id, busy),
 			buildGlassify(id, busy),
-			buildPrefabSection(id, backendSel, reuse, nounChk, busy),
+			buildPrefabSection(id, busy),
 		);
 	}
 
@@ -630,11 +630,12 @@ export function createTracePanel(
 	}
 
 	// The prefab-group controls within the generated-asset block: a status line
-	// (canonical / reuse / standalone + group size), an "unlink + regenerate" that
-	// pulls this object out of its group so it diverges alone (reusing the backend +
-	// reuse-image controls above), and a "link" that joins it into another group so
-	// it shares that group's mesh. Hidden until the object has a generated mesh.
-	function buildPrefabSection(id, backendSel, reuse, nounChk, busy) {
+	// (canonical / reuse / standalone + group size), an "unlink" that splits this
+	// object out of its group into a standalone asset with its own copy of the
+	// shared mesh (so it stops sharing and can then be regenerated alone), and a
+	// "link" that joins it into another group so it shares that group's mesh. Hidden
+	// until the object has a generated mesh.
+	function buildPrefabSection(id, busy) {
 		const prefab = actions.prefabOf?.(id) ?? null;
 		if (!prefab) return null;
 		const targets = actions.linkTargets?.(id) ?? [];
@@ -656,18 +657,12 @@ export function createTracePanel(
 					{ class: "tp-act-row" },
 					el("button", {
 						class: "tp-act-btn",
-						text: "unlink + regenerate",
+						text: "unlink",
 						disabled: busy,
 						title: busy
 							? "this asset is currently generating"
-							: "pull this object out of its prefab group and rebuild it alone, so it diverges from the rest (uses the backend + reuse-image + new-noun-phrase toggles above)",
-						onclick: () =>
-							actions.onRegenerate(id, {
-								backend: backendSel.value,
-								reuseImage: reuse.checked,
-								regenNounPhrase: nounChk.checked,
-								unlink: true,
-							}),
+							: "split this object out of its prefab group into a standalone asset with its own copy of the shared mesh — it stops sharing, so you can then regenerate it on its own",
+						onclick: () => actions.onUnlink(id),
 					}),
 				),
 			);

@@ -94,11 +94,12 @@ _retry_tasks: set[asyncio.Task[None]] = set()
 _generate_tasks: dict[GenKey, asyncio.Task[None]] = {}
 # Per-(cell, version) regeneration worker + its FIFO of `RegenJob`s, where `op`
 # is "regenerate" (fresh mesh — and, unless reuse_image, a fresh Nano-Banana
-# image too; `unlink` first pulls the object out of its prefab group so it
-# diverges alone), "unsymmetrize" / "symmetrize" (reprocess the existing raw mesh
-# with the symmetry mirror off/on — no AI; reuse_image is ignored), or "link"
+# image too), "unsymmetrize" / "symmetrize" (reprocess the existing raw mesh
+# with the symmetry mirror off/on — no AI; reuse_image is ignored), "link"
 # (join the object into another prefab group, re-deriving its mesh from that
-# group's canonical — no AI). `_regen_tasks` holds the single worker task per
+# group's canonical — no AI), or "unlink" (split the object out of its group into
+# a standalone asset with its own raw mesh — no AI). `_regen_tasks` holds the
+# single worker task per
 # version; `_regen_queues` is the work it drains concurrently (parallel across
 # prefab groups, serialized within one), sharing that version's generated-events
 # log. Requests enqueue rather than 409 between each other, and run concurrently
@@ -116,8 +117,7 @@ class RegenJob:
 
       * "regenerate"  — rebuild the mesh fresh on `backend` (and the image too
         unless `reuse_image`). `propagate` re-derives the whole prefab group from
-        the rebuilt canonical; `unlink` instead pulls THIS object out of its group
-        first so it diverges with its own fresh mesh (forces propagate off).
+        the rebuilt canonical.
       * "unsymmetrize" / "symmetrize" — reprocess the existing raw mesh with the
         mirror off / on (`sym` carries (plane, keep_positive)); no backend call.
       * "reorient" — change the "front view" by rotating the raw mesh 90° about an
@@ -132,6 +132,10 @@ class RegenJob:
       * "link" — join this object into the prefab group of `link_to` (any member
         of the destination group), re-deriving its mesh from that group's
         canonical; no backend call.
+      * "unlink" — split this object OUT of its prefab group into a standalone
+        asset with its own raw mesh (a reuse clones its canonical's geometry; a
+        canonical with reuses hands the group off to one of them), without
+        rebuilding it; no backend call.
     """
 
     node_id: str
@@ -146,7 +150,6 @@ class RegenJob:
     regen_noun_phrase: bool = False
     sym: tuple[str, bool] | None = None
     reorient: tuple[str, int] | None = None
-    unlink: bool = False
     link_to: str | None = None
     link_group: bool = False
 
@@ -2306,20 +2309,12 @@ def create_app() -> FastAPI:
         backend: str = "trellis",
         reuse_image: bool = False,
         regen_noun_phrase: bool = False,
-        unlink: bool = False,
     ) -> dict[str, object]:
         """Enqueue a from-scratch regeneration of a GENERATED asset (in the
         targeted `version`, else the latest) onto that version's regen worker. With
         `propagate=true` (the client default) the worker rebuilds the prefab
         CANONICAL behind `node_id` and re-derives every object that reuses it, so a
         shared prefab updates everywhere within the version at once.
-
-        With `unlink=true` the worker instead bypasses the prefab finder: it pulls
-        `node_id` OUT of its prefab group first (a reuse simply leaves; a canonical
-        with reuses hands the shared mesh off to one of them so the rest of the
-        group is preserved), then rebuilds ONLY `node_id` fresh as its own
-        standalone asset — so it diverges from the group it was matched into.
-        `unlink` forces `propagate` off.
 
         Requests ENQUEUE rather than 409 against each other: a single per-version
         worker (`_regen_worker`) drains the queue concurrently — in parallel across
@@ -2352,9 +2347,6 @@ def create_app() -> FastAPI:
                 status_code=404, detail=f"no bbox event found for node: {node_id}",
             )
 
-        # Unlinking diverges this object alone — never fan the rebuild across the
-        # group it's leaving.
-        propagate = propagate and not unlink
         # Regenerating the noun phrase means a fresh image distilled from it, so a
         # reuse-image request can't also apply — the new phrase needs a new image.
         reuse_image = reuse_image and not regen_noun_phrase
@@ -2363,7 +2355,7 @@ def create_app() -> FastAPI:
         queue.put_nowait(RegenJob(
             node_id=node_id, op="regenerate", propagate=propagate,
             backend=backend, reuse_image=reuse_image,
-            regen_noun_phrase=regen_noun_phrase, unlink=unlink,
+            regen_noun_phrase=regen_noun_phrase,
         ))
         # Surface the queued regen in the shared mesh queue panel until the
         # worker dequeues it (then generate_mesh manages its own entry). Tag the
@@ -2380,7 +2372,6 @@ def create_app() -> FastAPI:
             "model": model_alias,
             "node_id": node_id,
             "propagate": propagate,
-            "unlink": unlink,
             "backend": backend,
             "queued": True,
             "depth": queue.qsize(),
@@ -2700,6 +2691,50 @@ def create_app() -> FastAPI:
             "op": "link",
             "target": target,
             "group": group,
+            "queued": True,
+            "depth": queue.qsize(),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/unlink/{node_id}")
+    async def slot_unlink(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        node_id: str,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Split a GENERATED asset OUT of its prefab group into a STANDALONE asset
+        with its OWN raw mesh — the inverse of `link` — WITHOUT rebuilding it. A
+        reuse clones its canonical's raw (inheriting its geometry + symmetry) and
+        becomes its own canonical; a canonical with reuses hands the group off to
+        one of them (which inherits the shared raw) and stays standalone; a lone
+        canonical is already independent. No Nano-Banana, no mesh backend, so it's
+        effectively instant — the object then diverges only once the user
+        regenerates it. Runs on the SAME per-version worker as regenerate/link,
+        serialized per group via the worker's per-canonical lock. Not surfaced in
+        the mesh queue panel — a local re-derivation, not a backend generation."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        lib_log = _require_slot_log(run, slot_id, model_alias)
+        key: GenKey = (run, slot_id, model_alias)
+        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        if _reconstruct_node(lib_log, node_id) is None:
+            raise HTTPException(
+                status_code=404, detail=f"no bbox event found for node: {node_id}",
+            )
+        queue = _regen_queues.setdefault(key, asyncio.Queue())
+        queue.put_nowait(RegenJob(node_id=node_id, op="unlink"))
+        worker = _regen_tasks.get(key)
+        if worker is None or worker.done():
+            _regen_tasks[key] = asyncio.create_task(
+                _regen_worker(run, slot.id, model_alias)
+            )
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "node_id": node_id,
+            "op": "unlink",
             "queued": True,
             "depth": queue.qsize(),
         }
@@ -4329,17 +4364,39 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
     prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
     canon_locks: dict[str, asyncio.Lock] = {}
 
-    async def _detach_from_group(node_id: str, node: Node) -> None:
-        """Pull `node_id` out of its prefab group while preserving the rest of it,
-        so the caller can rebuild `node_id` alone. A reuse simply leaves (it's
-        re-logged as its own canonical). A canonical WITH reuses hands the group
-        off to one of those reuses — that reuse inherits `node_id`'s current raw
-        mesh (via `clone_canonical_raw`) so the group keeps its shared look and
-        stays re-derivable — and the remaining reuses are repointed to it; `node_id`
-        is left a now-empty-group canonical. A lone canonical needs no detaching."""
+    def _carry_symmetry(src_id: str, dst_id: str) -> None:
+        """Copy src's latest applied symmetry (plane + kept half) onto dst, so a
+        later re-derive of dst from its raw mirrors identically — a promoted /
+        handed-off node logs no symmetry of its own, so without this it would
+        resolve (and re-derive) as un-mirrored."""
+        for e in reversed(gen_log.state["events"]):
+            if e.get("kind") == "symmetry.applied" and e.get("id") == src_id:
+                cp = e.get("cut_plane")
+                if cp in ("none", "xy", "xz"):
+                    extra = (
+                        {"keep_positive": e["keep_positive"]}
+                        if isinstance(e.get("keep_positive"), bool) else {}
+                    )
+                    gen_log.log("symmetry.applied", id=dst_id, cut_plane=cp, **extra)
+                break
+
+    async def _do_unlink(node_id: str, node: Node) -> None:
+        """Pull `node_id` out of its prefab group into a STANDALONE asset with its
+        OWN raw mesh, WITHOUT rebuilding it — so it stops sharing and the user can
+        then regenerate it alone. A reuse clones its canonical's raw (inheriting its
+        geometry + symmetry) and is promoted to its own canonical; its served mesh,
+        already derived from that same raw, stays valid. A canonical WITH reuses
+        hands the group off to one of those reuses — that reuse inherits `node_id`'s
+        raw (via `clone_canonical_raw`) + symmetry and the rest are repointed to it,
+        while `node_id` stays standalone with its own raw. A lone canonical is
+        already independent."""
         assert lib_log is not None
         canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
         if canonical_id != node_id:
+            await generation.clone_canonical_raw(
+                runs_dir=RUNS_DIR, run_id=run_id, source_id=canonical_id, dest_id=node_id,
+            )
+            _carry_symmetry(canonical_id, node_id)
             gen_log.log("prefab.match", id=node_id, reuse_id="", description=node.prompt)
             return
         if not reuse_ids:
@@ -4348,19 +4405,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
         await generation.clone_canonical_raw(
             runs_dir=RUNS_DIR, run_id=run_id, source_id=node_id, dest_id=new_canon,
         )
-        # Carry the old canonical's symmetry onto the new one so the handed-off
-        # group keeps its mirror — a reuse logs no symmetry of its own, so without
-        # this the new canonical would resolve (and re-derive) as un-mirrored.
-        for e in reversed(gen_log.state["events"]):
-            if e.get("kind") == "symmetry.applied" and e.get("id") == node_id:
-                cp = e.get("cut_plane")
-                if cp in ("none", "xy", "xz"):
-                    extra = (
-                        {"keep_positive": e["keep_positive"]}
-                        if isinstance(e.get("keep_positive"), bool) else {}
-                    )
-                    gen_log.log("symmetry.applied", id=new_canon, cut_plane=cp, **extra)
-                break
+        _carry_symmetry(node_id, new_canon)
         new_node = _reconstruct_node(lib_log, new_canon)
         gen_log.log(
             "prefab.match", id=new_canon, reuse_id="",
@@ -4429,12 +4474,12 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                 if target is None:
                     gen_log.log("mesh.error", id=node_id, message=f"{op}: no bbox event for node")
                     return
+                if op == "unlink":
+                    # Split this object into a standalone asset with its own raw —
+                    # no rebuild; the user regenerates it separately.
+                    await _do_unlink(node_id, target)
+                    return
                 propagate = job.propagate
-                if op == "regenerate" and job.unlink:
-                    # Bypass the prefab finder: pull this object out of its group so
-                    # it diverges with its own fresh mesh, then build it alone.
-                    await _detach_from_group(node_id, target)
-                    propagate = False
                 canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
                 if propagate:
                     build_node = _reconstruct_node(lib_log, canonical_id)
