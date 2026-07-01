@@ -3209,6 +3209,10 @@
 				font-size: 11px;
 				padding: 3px 9px;
 			}
+			.tp-act-btn:disabled, .tp-act-sel:disabled {
+				opacity: 0.35;
+				cursor: not-allowed;
+			}
 			.tp-act-sel {
 				font-size: 11px;
 				padding: 2px 4px;
@@ -3223,6 +3227,35 @@
 			.tp-act-sym {
 				font-size: 10px;
 				color: var(--text-faint);
+			}
+			.tp-img-prompt {
+				font-size: 11px;
+				line-height: 1.4;
+				color: var(--text-dim);
+				background: var(--bg-inset, rgba(0,0,0,0.15));
+				border-radius: 4px;
+				padding: 4px 6px;
+				user-select: text;
+			}
+			/* Prefab group controls (link / unlink) — set off from the regenerate +
+			   symmetry rows within the same generated-asset block. */
+			.tp-prefab {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+				margin-top: 2px;
+				padding-top: 8px;
+				border-top: 1px dashed var(--line);
+			}
+			/* Front-view (raw-mesh re-orientation) controls — set off like the prefab
+			   block within the same generated-asset section. */
+			.tp-frontview {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+				margin-top: 2px;
+				padding-top: 8px;
+				border-top: 1px dashed var(--line);
 			}
 			/* Global mesh-generation queue panel (bottom-right): every in-flight +
 			   waiting generation across the concurrency pools, from /trellis/queue. */
@@ -3356,6 +3389,42 @@
 				border: 1px solid var(--line);
 				border-radius: 6px;
 				background: #0c0d10;
+			}
+			/* Per-object PBR texture maps (base color / roughness / metallic /
+			   occlusion / normal / emissive), one thumbnail each, under the 3D
+			   preview. Click a tile to span it full-width for a closer look. */
+			.tp-maps {
+				display: flex;
+				flex-direction: column;
+				gap: 4px;
+			}
+			.tp-maps-grid {
+				display: grid;
+				grid-template-columns: repeat(2, 1fr);
+				gap: 6px;
+			}
+			.tp-map {
+				display: flex;
+				flex-direction: column;
+				gap: 2px;
+				cursor: pointer;
+			}
+			.tp-map.big {
+				grid-column: 1 / -1;
+			}
+			.tp-map-canvas {
+				width: 100%;
+				aspect-ratio: 1 / 1;
+				object-fit: contain;
+				border: 1px solid var(--line);
+				border-radius: 4px;
+				background: #0c0d10;
+			}
+			.tp-map-lab {
+				color: var(--text-faint);
+				font-size: 9px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
 			}
 			/* Lighting panel — opened from the ☀ light toggle in #viewer-toggles;
 			   floats bottom-left over the canvas, shifting clear of the trace panel. */
@@ -3561,6 +3630,7 @@
 						>
 							zone layers
 						</button>
+						<button id="btn-unhide-all" title="un-hide every manually hidden object / zone">unhide all</button>
 						<button id="btn-refit">refit</button>
 					</div>
 					<div id="zone-layers-legend" style="display: none"></div>

@@ -131,3 +131,12 @@ its prompt (and plan, for `overall_bbox`) known. For `child_bbox_batch` the
 | `` `{PROXY_SHAPE}` `` | `image_prompt` | `BOX` / `SPHERE` / `CAPSULE` / `HEMISPHERE` |
 | `` `{IMAGE_TEMPLATE_FRONT}` `` / `` `{IMAGE_TEMPLATE_SIDE}` `` / `` `{IMAGE_TEMPLATE_TOP}` `` | `image_prompt` | the fixed image-generation wrapper for each view with `<<<SUBJECT>>>` marking where the model's phrase is slotted |
 | `` `{PRIOR_SUBJECTS}` `` | `image_prompt` | numbered list of subject phrases already submitted in this scene (or a first-object placeholder) |
+| `` `{SIBLING_OBJECTS}` `` | `image_prompt` | the objects already placed directly within the subject's OWN region (its siblings), each with id, prompt, noun phrase, structural parent (`<id> (<kind>)`), placement, relationships, and dimensions — no world coordinates |
+| `` `{ROOT_OBJECTS_BRIEF}` `` | `image_prompt` | the root-region objects (shared shells / ground / fill) in bare form — id, prompt, and noun phrase only |
+| `` `{OTHER_SUBREGIONS_BRIEF}` `` | `image_prompt` | every region EXCEPT the root and the subject's own region, as a flat list — each its name + prompt with a bare id/prompt/noun-phrase list of the objects inside it |
+
+> `image_prompt` deliberately runs on a REDUCED, graduated scene context: its own
+> region in semantic detail (`` `{ZONE_ID}` ``/`` `{ZONE_PROMPT}` ``/`` `{ZONE_PLAN}` ``/`` `{ZONE_PLACEMENT}` `` + `` `{SIBLING_OBJECTS}` ``) and
+> everything beyond as bare id/prompt/noun-phrase (`` `{ROOT_PROMPT}` ``/`` `{ROOT_PLAN}` `` +
+> `` `{ROOT_OBJECTS_BRIEF}` ``, `` `{OTHER_SUBREGIONS_BRIEF}` ``). It does NOT populate the heavy
+> `` `{SCENE_CONTEXT}` `` / `` `{ROOT_HEADER}` `` / `` `{ROOT_OBJECTS}` `` / `` `{ZONE_OBJECTS}` `` blocks.

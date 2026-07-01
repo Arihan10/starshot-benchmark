@@ -62,7 +62,9 @@ MODELS: dict[str, str] = {
     "qwen": "qwen/qwen3.7-max",
     "kimi": "moonshotai/kimi-k2-thinking",
     "sonnet": "anthropic/claude-sonnet-4.6",
-    "minimax": "minimax/minimax-m3"
+    "sonnet-new": "anthropic/claude-sonnet-5",
+    "minimax": "minimax/minimax-m3",
+    "gemma": "google/gemma-4-31b-it"
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())

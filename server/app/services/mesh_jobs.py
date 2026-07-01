@@ -257,6 +257,11 @@ def _queue_drop(slot_id: str | None, job_id: str) -> None:
     _QUEUE.pop((slot_id, job_id), None)
 
 
+def inflight_ids(slot_id: str) -> set[str]:
+    """Job ids currently waiting or processing for `slot_id` in the global queue."""
+    return {jid for (sid, jid) in _QUEUE if sid == slot_id}
+
+
 def mark_queued(slot_id: str | None, job_id: str, *, backend: str | None = None) -> None:
     """Register an externally-managed job (e.g. a regeneration awaiting its turn
     in a per-cell worker) as `waiting` in the shared queue snapshot, so it shows

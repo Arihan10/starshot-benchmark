@@ -44,10 +44,15 @@ let lastLayersSig = null; // skips rebuilding the layer legend when unchanged
 // Asset view: which mesh build the 3D view shows + the generate gate's polling.
 let assetMode = "library"; // "library" | "generated"
 let optimizedView = true; // generated meshes: optimized KTX2/Meshopt twin vs raw
+// Per-object override of the scene-wide optimized/raw toggle: node id ->
+// "optimized" | "raw". Absent = follow `optimizedView`. Reset whenever the
+// scene-wide toggle flips (it sets a fresh baseline for every object).
+let objOptMode = new Map();
 let genPollTimer = null;
 let genMeshSig = null; // last generate-status mesh signature, to skip redundant work
-let lastGenMesh = new Map(); // node id -> { url, v, plane, was } from the last poll
-let loadedGen = new Map(); // node id -> mtime currently loaded in the main viewer
+let lastGenMesh = new Map(); // node id -> { url, v, optUrl, optV, unoptUrl, unoptV, ... } from the last poll
+let loadedGen = new Map(); // node id -> the variant url currently loaded in the main viewer
+let busyNodes = new Set(); // node ids currently queued/processing on a mesh backend
 let assetBtn = null;
 let genBtn = null;
 let optBtn = null;
@@ -70,7 +75,8 @@ export function initOverlay(sceneViewer) {
 		onClose: () => viewer.clearSelection(),
 		onInquire: openInquiryForCall,
 		// Per-object generated-asset controls, live only while viewing a source
-		// cell's generated build: regenerate on a chosen backend + symmetry ops.
+		// cell's generated build: regenerate on a chosen backend + symmetry ops +
+		// prefab link/unlink.
 		actions: {
 			available: () =>
 				!!state.view && !state.view.branch && assetMode === "generated",
@@ -78,18 +84,105 @@ export function initOverlay(sceneViewer) {
 				const m = lastGenMesh.get(id);
 				return m ? { plane: m.plane, was: m.was } : null;
 			},
+			// The focused node's prefab group: its canonical, whether it's a reuse
+			// (vs the group's source), and how many objects share the group. null
+			// until the node has a generated mesh.
+			prefabOf: (id) => {
+				const m = lastGenMesh.get(id);
+				if (!m || !m.canonical) return null;
+				let groupSize = 0;
+				for (const v of lastGenMesh.values())
+					if (v.canonical === m.canonical) groupSize += 1;
+				return {
+					canonical: m.canonical,
+					isReuse: m.canonical !== id,
+					groupSize,
+				};
+			},
+			// Every OTHER object this asset can be linked to — one entry per
+			// object (canonical OR reuse), excluding the focused node itself and
+			// the rest of its own group (linking within a group is a no-op). The
+			// server resolves the chosen object to its prefab group's canonical,
+			// so ANY member is a valid target. Each entry carries the object's id
+			// (the visible label), its prompt (a hover tooltip), and the size of
+			// the group it would join.
+			linkTargets: (id) => {
+				const me = lastGenMesh.get(id);
+				const myCanon = me ? me.canonical : null;
+				const groupSize = new Map();
+				for (const v of lastGenMesh.values())
+					groupSize.set(
+						v.canonical,
+						(groupSize.get(v.canonical) || 0) + 1,
+					);
+				const out = [];
+				for (const [nid, m] of lastGenMesh) {
+					if (nid === id || m.canonical === myCanon) continue;
+					const node = obs.model.nodes.get(nid);
+					out.push({
+						id: nid,
+						prompt: node?.prompt || "",
+						size: groupSize.get(m.canonical) || 1,
+					});
+				}
+				out.sort((a, b) => a.id.localeCompare(b.id));
+				return out;
+			},
+			isBusy: (id) => busyNodes.has(id),
+			imagePromptOf: (id) => lastGenMesh.get(id)?.imagePrompt ?? null,
+			// True when this object renders (stale optimized twin) but its raw /
+			// unoptimized mesh is missing — a regenerate that died midway. The
+			// panel badges it so the "ghost" isn't silent and the user knows to
+			// regenerate to rebuild it.
+			incompleteOf: (id) => lastGenMesh.get(id)?.incomplete ?? false,
+			// This object's effective render variant ("optimized" | "raw"), or null
+			// when it can't be toggled (only one variant on disk, e.g. mid-build).
+			optimizedOf: (id) => {
+				const m = lastGenMesh.get(id);
+				if (!m || !m.optUrl || !m.unoptUrl) return null;
+				return (
+					objOptMode.get(id) ?? (optimizedView ? "optimized" : "raw")
+				);
+			},
 			onRegenerate: regenerateNode,
 			onSymmetrize: symmetrizeNode,
 			onUnsymmetrize: unsymmetrizeNode,
+			onLink: linkNode,
+			onUnlink: unlinkNode,
+			onReorient: reorientNode,
+			onGlassify: glassifyNode,
+			onReset: resetNode,
+			onSetOptimized: setObjectOptimized,
+			// Delete is build-agnostic — it wipes the object from BOTH event logs
+			// and every build's files — so unlike the generated-only actions above
+			// it's offered on any SOURCE cell in either asset view, gated by
+			// `deletable` rather than `available`.
+			deletable: () => !!state.view && !state.view.branch,
+			onDelete: deleteNode,
 		},
 		// Mini-preview mesh source: the generated mesh while in the generated view
 		// (null — bbox only — when this node has none yet), the library asset otherwise.
+		// This is the TRANSFORMED/optimized twin — used for the reference image and
+		// the download link; the 3D preview itself shows the raw mesh below.
 		meshUrlFor: (id, node) => {
 			if (state.view && !state.view.branch && assetMode === "generated") {
 				const m = lastGenMesh.get(id);
 				return m && m.url ? withV(m.url, m.v) : null;
 			}
 			return node.meshUrl ?? null;
+		},
+		// The per-object 3D view shows the RAW mesh straight from the generation
+		// API (Trellis/Hunyuan) rather than the transformed/optimized object: in
+		// the generated view it's the raw-dir `<id>.raw.glb` (carried as `m.raw`);
+		// in the library view it sits beside the placed mesh as `<id>.raw.glb`.
+		rawMeshUrlFor: (id, node) => {
+			if (state.view && !state.view.branch && assetMode === "generated") {
+				const m = lastGenMesh.get(id);
+				return m && m.raw ? withV(m.raw, m.v) : null;
+			}
+			return node.meshUrl
+				? node.meshUrl.replace(/\.glb(\?|$)/, ".raw.glb$1")
+				: null;
 		},
 	});
 
@@ -174,6 +267,9 @@ export function initOverlay(sceneViewer) {
 	document
 		.getElementById("btn-refit")
 		.addEventListener("click", () => viewer.fit());
+	document
+		.getElementById("btn-unhide-all")
+		.addEventListener("click", () => viewer.unhideAll());
 	setupAssetControls();
 	actionBtn.addEventListener("click", onAction);
 	resetBtn.addEventListener("click", onReset);
@@ -278,7 +374,8 @@ function syncAssetControls() {
 	optBtn.style.display = gen ? "" : "none";
 	genStatusEl.style.display = gen ? "" : "none";
 	assetBtn.classList.toggle("on", assetMode === "generated");
-	assetBtn.textContent = assetMode === "generated" ? "generated ✓" : "generated";
+	assetBtn.textContent =
+		assetMode === "generated" ? "generated ✓" : "generated";
 	optBtn.classList.toggle("on", optimizedView);
 	optBtn.textContent = optimizedView ? "optimized ✓" : "raw";
 }
@@ -303,6 +400,9 @@ function setAssetMode(mode) {
 function toggleOptimized() {
 	if (!state.view || state.view.branch || assetMode !== "generated") return;
 	optimizedView = !optimizedView;
+	// The scene-wide flip is a fresh baseline — drop per-object overrides so every
+	// object follows the new global mode.
+	objOptMode = new Map();
 	syncAssetControls();
 	// Re-pull from the other source (optimized twin vs raw): drop what's loaded
 	// and let the poll re-attach from the freshly-chosen dir.
@@ -318,6 +418,8 @@ function toggleOptimized() {
 function clearGeneratedState() {
 	lastGenMesh = new Map();
 	loadedGen = new Map();
+	busyNodes = new Set();
+	objOptMode = new Map();
 	genMeshSig = null;
 	if (genStatusEl) genStatusEl.textContent = "";
 }
@@ -327,7 +429,9 @@ function loadLibraryMeshes() {
 	if (!state.view) return;
 	const { slot, model, branch } = state.view;
 	viewer.prefetchBundle(
-		branch ? api.branchMeshesUrl(branch) : api.meshesUrl(state.run, slot, model, {}),
+		branch
+			? api.branchMeshesUrl(branch)
+			: api.meshesUrl(state.run, slot, model, {}),
 	);
 }
 
@@ -360,6 +464,35 @@ function concreteNodeCount() {
 	return n;
 }
 
+// The mesh variant to show for one object: its per-object override if set, else
+// the scene-wide `optimizedView`. Falls back to whichever variant exists (then
+// the status' global url) so a half-built object still renders.
+function variantFor(m) {
+	const mode = objOptMode.get(m.id) ?? (optimizedView ? "optimized" : "raw");
+	if (mode === "optimized" && m.optUrl) return { url: m.optUrl, v: m.optV };
+	if (mode === "raw" && m.unoptUrl) return { url: m.unoptUrl, v: m.unoptV };
+	if (m.optUrl) return { url: m.optUrl, v: m.optV };
+	if (m.unoptUrl) return { url: m.unoptUrl, v: m.unoptV };
+	return { url: m.url, v: m.v };
+}
+
+// Attach each object's chosen variant to the main viewer, replacing in place when
+// its loaded variant url changed (a regen, or a per-object/global raw↔optimized
+// flip). `meshes` are status entries (or reconstructed `{ id, ...lastGenMesh }`).
+function attachGeneratedMeshes(meshes) {
+	for (const m of meshes) {
+		const { url, v } = variantFor(m);
+		if (!url) continue;
+		const tagged = withV(url, v);
+		if (loadedGen.get(m.id) === tagged) continue;
+		const had = loadedGen.has(m.id);
+		loadedGen.set(m.id, tagged);
+		viewer.loadModel({ id: m.id, url: tagged }, api.absUrl(tagged), {
+			replace: had,
+		});
+	}
+}
+
 // Poll the generate gate while a build/regen is in flight: refresh the symmetry
 // map (the trace-panel hint), re-attach meshes when the finished-id set grows,
 // and keep a small status label. Self-stops once nothing is running.
@@ -370,7 +503,9 @@ async function pollGenerated() {
 	const run = state.run;
 	let status = null;
 	try {
-		status = await api.generateStatus(run, slot, model, {});
+		status = await api.generateStatus(run, slot, model, {
+			optimized: optimizedView,
+		});
 	} catch {
 		/* transient — the next poll (if still in generated mode) retries */
 	}
@@ -385,19 +520,43 @@ async function pollGenerated() {
 	if (!status) return;
 	const meshes = status.meshes ?? [];
 	lastGenMesh = new Map(
-		meshes.map((m) => [m.id, { url: m.url, v: m.v, plane: m.sym, was: m.symWas }]),
+		meshes.map((m) => [
+			m.id,
+			{
+				url: m.url,
+				raw: m.raw,
+				v: m.v,
+				plane: m.sym,
+				was: m.symWas,
+				canonical: m.canonical ?? m.id,
+				imagePrompt: m.imagePrompt ?? null,
+				optUrl: m.optUrl,
+				optV: m.optV,
+				unoptUrl: m.unoptUrl,
+				unoptV: m.unoptV,
+				// Renders (stale optimized twin) but its raw/unoptimized backing is
+				// missing — a regen that died midway. Surfaced so it isn't silent.
+				incomplete: !!m.incomplete,
+			},
+		]),
 	);
-	// Attach only newly-built / regenerated meshes (keyed by mtime), replacing a
-	// prior version in place — cheap during a live build, and a raw mesh that's
-	// already current is never re-downloaded.
-	for (const m of meshes) {
-		if (!m.url || loadedGen.get(m.id) === m.v) continue;
-		const had = loadedGen.has(m.id);
-		loadedGen.set(m.id, m.v);
-		const url = withV(m.url, m.v);
-		viewer.loadModel({ id: m.id, url }, api.absUrl(url), { replace: had });
+	// Expand the server's busy set (directly queued/processing node ids) to
+	// include every prefab group member whose canonical is busy — a regeneration
+	// propagates to the whole group, so all members should be locked out.
+	const rawBusy = new Set(status.busy ?? []);
+	busyNodes = new Set(rawBusy);
+	for (const [id, m] of lastGenMesh) {
+		if (rawBusy.has(m.canonical)) busyNodes.add(id);
 	}
-	const sig = meshes.map((m) => `${m.id}:${m.v}:${m.sym}`).join("|");
+	// Attach newly-built / regenerated / mode-changed meshes; loadedGen is keyed
+	// by the loaded variant url, so a swap (per-object raw↔optimized, or a regen
+	// bumping mtime) re-attaches and an already-current one is never re-downloaded.
+	attachGeneratedMeshes(meshes);
+	const busySig = [...busyNodes].sort().join(",");
+	const sig =
+		meshes.map((m) => `${m.id}:${m.v}:${m.sym}:${m.canonical}`).join("|") +
+		"|busy:" +
+		busySig;
 	if (sig !== genMeshSig) {
 		genMeshSig = sig;
 		tracePanel.rerenderInfo();
@@ -405,19 +564,71 @@ async function pollGenerated() {
 	const total = concreteNodeCount();
 	const done = status.count ?? 0;
 	const frac = total ? `${done}/${total}` : `${done}`;
-	genStatusEl.textContent = status.running ? `building… ${frac}` : `${frac} generated`;
+	// Torn "ghost" assets: a served twin whose raw/unoptimized backing is missing
+	// (a regen that didn't finish). Exclude any currently rebuilding (busy). Flag
+	// them so the loss isn't silent — regenerating each rebuilds its raw.
+	const ghosts = meshes.filter(
+		(m) => m.incomplete && !busyNodes.has(m.id),
+	).length;
+	const base = status.running ? `building… ${frac}` : `${frac} generated`;
+	genStatusEl.textContent = base + (ghosts ? ` · ⚠ ${ghosts} incomplete` : "");
+	genStatusEl.title = ghosts
+		? `${ghosts} object${ghosts === 1 ? "" : "s"} render from a stale optimized mesh but are missing their raw/unoptimized files (an unfinished regenerate). Regenerate each to rebuild it.`
+		: "";
 	if (status.running) genPollTimer = setTimeout(pollGenerated, 1500);
 }
 
 // Per-object actions from the trace panel (generated build only). Each enqueues
-// server-side work + propagates across the object's prefab group, then polls so
-// the new mesh swaps in when it lands.
+// server-side work + polls so the new mesh swaps in when it lands. A plain
+// regenerate propagates across the object's prefab group; `unlink` splits the
+// object out of its group into a standalone asset with its own raw mesh (no
+// backend call); `link` moves it into another object's group (re-deriving its
+// mesh, no backend call).
 async function regenerateNode(id, opts) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
+	// Disable the asset's controls immediately — before the enqueue round-trip and
+	// the (possibly slow) noun-phrase LLM step — so the button can't be re-fired.
+	// The next /generate-status poll keeps it busy server-side (the node is marked
+	// queued at enqueue); a failed enqueue re-enables it below.
+	busyNodes.add(id);
+	tracePanel.rerenderInfo();
 	try {
-		await api.regenerate(state.run, slot, model, id, { ...opts, propagate: true });
-		toast(`regenerating ${id} · ${opts.backend}…`, "ok");
+		await api.regenerate(state.run, slot, model, id, opts);
+		toast(
+			`regenerating ${id}${opts.regenNounPhrase ? " (+ new noun phrase)" : ""} · ${opts.backend}…`,
+			"ok",
+		);
+		pollGenerated();
+	} catch (e) {
+		busyNodes.delete(id);
+		tracePanel.rerenderInfo();
+		toast(e.message, "err");
+	}
+}
+
+async function linkNode(id, target, { group = false } = {}) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.link(state.run, slot, model, id, target, { group });
+		toast(`linking ${group ? "group" : id} → ${target}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Split an object out of its prefab group into a standalone asset with its own
+// raw mesh (the server clones the shared geometry) so it no longer tracks the
+// group; the user can then regenerate it on its own. Fast local re-derivation,
+// no backend call — mirrors linkNode (no busy lock).
+async function unlinkNode(id) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.unlink(state.run, slot, model, id);
+		toast(`unlinking ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
 		toast(e.message, "err");
@@ -428,7 +639,10 @@ async function symmetrizeNode(id, opts) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.symmetrize(state.run, slot, model, id, { ...opts, propagate: true });
+		await api.symmetrize(state.run, slot, model, id, {
+			...opts,
+			propagate: true,
+		});
 		toast(`symmetrizing ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -446,6 +660,125 @@ async function unsymmetrizeNode(id) {
 	} catch (e) {
 		toast(e.message, "err");
 	}
+}
+
+// Change the object's "front view" — rotate its raw mesh 90° about an axis so a
+// different face points +Z. Propagates across the prefab group (server bakes it
+// into the canonical's raw + re-derives every reuse).
+async function reorientNode(id, opts) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.reorient(state.run, slot, model, id, {
+			...opts,
+			propagate: true,
+		});
+		toast(`re-fronting ${id}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Force the window/glass transparency transform onto this object (and its whole
+// prefab group) regardless of the pipeline's keyword + symmetry gates: the server
+// bakes white texels to near-clear and re-optimizes each member's served mesh.
+// Fast local reprocess, so it mirrors the symmetry handlers (no busy lock).
+async function glassifyNode(id) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.glassify(state.run, slot, model, id);
+		toast(`applying glass transparency to ${id} + prefab group…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Rebuild this object (and its prefab group) from the pristine raw mesh, dropping
+// any in-place served edit (e.g. a forced glassify) while keeping its current
+// symmetry. Fast local reprocess; mirrors the symmetry handlers (no busy lock).
+async function resetNode(id) {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.reset(state.run, slot, model, id);
+		toast(`resetting ${id} + prefab group from raw…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Flip ONE object between its optimized (KTX2/Meshopt) and unoptimized ("raw")
+// rescaled mesh in the main scene — a pure view swap (both variants already
+// exist on disk), no rebuild and no server call. Overrides the scene-wide toggle
+// for this object until the global toggle is flipped (which resets overrides).
+function setObjectOptimized(id, mode) {
+	if (!state.view || state.view.branch || assetMode !== "generated") return;
+	const m = lastGenMesh.get(id);
+	if (!m) return;
+	objOptMode.set(id, mode);
+	attachGeneratedMeshes([{ id, ...m }]);
+	tracePanel.rerenderInfo();
+}
+
+// Permanently wipe an object from the open SOURCE cell — every reference in BOTH
+// event logs (library + generated) and its mesh + image files in every build.
+// Guarded by an explicit danger confirm so it can't be a stray click; the wipe
+// is IRREVERSIBLE. On success the cell reloads so the scene + observability drop
+// the node (orphaned children re-anchor to its region and a prefab canonical
+// hands off, server-side). Works in either asset view; never on a branch.
+function deleteNode(id) {
+	const { slot, model, branch } = state.view ?? {};
+	if (!slot || branch) return;
+	const node = obs.model.nodes.get(id);
+	const kind = node?.kind ?? "object";
+	const desc = node?.prompt ? ` — “${node.prompt}”` : "";
+	const wasGenerated = assetMode === "generated";
+	openModal(`delete ${kind} ${id}?`, (close, setError) => ({
+		body: [
+			el("div", {
+				class: "m-hint",
+				text:
+					`Permanently removes ${id}${desc} from ${slot} · ${model}: every reference in BOTH event logs ` +
+					"(library + generated) and its mesh + image files across every build. Any object anchored to it " +
+					"is re-parented to its region; if it is a prefab canonical, the shared mesh passes to one of its " +
+					"reuses. This cannot be undone.",
+			}),
+		],
+		actions: [
+			el("button", { text: "cancel", onclick: close }),
+			el("button", {
+				class: "danger",
+				text: "delete permanently",
+				onclick: async () => {
+					try {
+						await api.deleteObject(state.run, slot, model, id);
+					} catch (e) {
+						setError(e.message);
+						return;
+					}
+					close();
+					toast(`deleted ${id}`, "ok");
+					// Reload so the scene + obs reflect the wipe (openCell resets to
+					// the library view); restore the generated view if that's where
+					// the delete fired AND we're still on the same cell.
+					await openCell({ slot, model, branch: false });
+					if (
+						wasGenerated &&
+						state.view &&
+						state.view.slot === slot &&
+						state.view.model === model &&
+						!state.view.branch
+					)
+						setAssetMode("generated");
+					emit("poll-now");
+				},
+			}),
+		],
+	}));
 }
 
 // Drag the divider between the canvas and the observability dock to set the

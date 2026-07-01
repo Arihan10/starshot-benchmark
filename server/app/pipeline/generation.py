@@ -43,8 +43,8 @@ from app.core import prompt_store, scene_context, schemas
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
 from app.services import hunyuan, hunyuan_tencent, llm, nano_banana, prefabs, symmetry, threed
-from app.utils import glb_place, logging
-from app.utils.geometry import export_glb, rescale_mesh_to_bbox
+from app.utils import glass, glb_place, logging
+from app.utils.geometry import export_glb, rescale_mesh_to_bbox, rotate_mesh
 from app.utils.topology import validate_parents, validate_referenced_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
@@ -179,6 +179,28 @@ def latest_generated_events_path(runs_dir: Path, run_id: str) -> Path:
     if version is not None:
         return runs_dir / run_id / _LEGACY_GENERATED_DIR / version / GENERATED_EVENTS_NAME
     return path
+
+
+def artifacts_complete(
+    raw_dir: Path, opt_dir: Path, node_id: str, *, is_reuse: bool,
+) -> bool:
+    """Whether a generated object's WHOLE on-disk artifact set is present, not
+    just the served twin: the optimized GLB, its unoptimized source, and — for a
+    canonical — the pristine raw Trellis mesh it (and its reuses) re-derive from.
+    A reuse owns no raw (it rescales its canonical's), so it needs only the two
+    served twins.
+
+    The resume gate keys on THIS rather than the optimized twin alone, because a
+    regen deletes the raw + unoptimized up front: a build that fails midway then
+    leaves only the stale optimized GLB, which still renders and so masks the loss
+    as a silent "ghost". Treating that torn set as un-built makes a resume rebuild
+    it — cheaply re-deriving from the raw when it survives, re-generating when it
+    doesn't — instead of skipping it, and lets the status surface it."""
+    served = (opt_dir / f"{node_id}.glb").exists()
+    unoptimized = (raw_dir / f"{node_id}.glb").exists()
+    # A reuse re-derives from its canonical's raw, so it owns none of its own.
+    raw = is_reuse or (raw_dir / f"{node_id}.raw.glb").exists()
+    return served and unoptimized and raw
 
 
 async def _optimize_asset(src: Path, dst: Path) -> bool:
@@ -542,56 +564,67 @@ async def _resolve_and_generate(
             orientation=orientations[spec.id],
         )
 
+    # Distill each object's verbose seed into its concise visual subject phrase
+    # (the `image_prompt` LLM step), for BOTH the library and from-scratch flows.
+    # The distilled phrase is the object's canonical "what it is" description and
+    # drives every downstream decision that wants a direct physical description
+    # rather than the placement-laden seed: library matching, the symmetry cut
+    # plane, prefab grouping, and the Nano-Banana image. The prior-subjects
+    # context fed to each call is the bare distilled phrases of already-placed
+    # nodes (Node.noun_phrase), never the wrapped Nano-Banana directives — leaking
+    # the wrapper boilerplate would just teach the model to echo it back.
+    committed_subjects = [n.noun_phrase or n.prompt for n in all_nodes if n.mesh_url is not None]
+    subjects: dict[str, str] = {}
+    prior_subjects = list[str](committed_subjects)
+    for spec in specs:
+        subject = await _distill_subject(
+            spec_id=spec.id,
+            prompt=spec.prompt,
+            bbox=bboxes[spec.id],
+            proxy_shape=spec.proxy_shape,
+            prior_prompts=prior_subjects,
+            zone=zone,
+            nodes=all_nodes,
+        )
+        subjects[spec.id] = subject
+        prior_subjects.append(subject)
+
     if _USE_ASSET_LIBRARY:
         return await _match_library_assets(
             specs=specs,
             bboxes=bboxes,
             orientations=orientations,
+            subjects=subjects,
             scenario=scenario,
             runs_dir=runs_dir,
             run_id=run_id,
             zone_id=zone.id,
         )
 
-    # Every object (anchor, completion, encapsulating alike) goes through
-    # the image-prompt rewrite: Nano Banana needs an isolated studio
-    # reference shot — any environmental context bleeds into the mesh.
-    #
-    # The "prior subjects" context fed to the LLM is the bare subject
-    # phrases of already-placed nodes (Node.prompt), NOT their full
-    # Nano-Banana directives (Node.image_prompt). Leaking the wrapper
-    # boilerplate would just teach the LLM to echo "Generate a direct,
-    # perfect orthographic..." back into every new phrase.
-    committed_subjects = [n.prompt for n in all_nodes if n.mesh_url is not None]
+    # From-scratch: resolve the symmetry cut plane FROM the distilled subject
+    # (not the verbose seed), then wrap that subject into the Nano-Banana
+    # studio-shot directive for the resolved view.
     resolved: list[Node] = []
     for spec in specs:
         bbox = bboxes[spec.id]
-        parent_id = spec.parent
-        # bbox already emitted upfront above.
-        prior_subjects = committed_subjects + [r.prompt for r in resolved]
+        subject_prompt = subjects[spec.id]
         encapsulating = scenario == "encapsulating"
         cut_plane = await symmetry.resolve_cut_plane(
-            prompt=spec.prompt,
+            prompt=subject_prompt,
             node_id=spec.id,
             encapsulating=encapsulating,
         )
         view = symmetry.image_view_for(
             cut_plane=cut_plane, encapsulating=encapsulating,
         )
-        subject_prompt, image_prompt = await _build_image_prompt(
-            spec_id=spec.id,
-            prompt=spec.prompt,
-            bbox=bbox,
-            proxy_shape=spec.proxy_shape,
-            prior_prompts=prior_subjects,
-            view=view,
-            zone=zone,
-            nodes=all_nodes,
+        image_prompt = scene_context.wrap_image_prompt(
+            subject_prompt, spec.proxy_shape, bbox.size, view=view,
         )
         resolved.append(
             Node(
                 id=spec.id,
-                prompt=subject_prompt,
+                prompt=spec.prompt,
+                noun_phrase=subject_prompt,
                 image_prompt=image_prompt,
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
@@ -599,7 +632,7 @@ async def _resolve_and_generate(
                 orientation_description=spec.orientation,
                 placement=spec.placement,
                 referenced_ids=list(spec.referenced_ids),
-                parent_id=parent_id,
+                parent_id=spec.parent,
                 parent_kind=spec.parent_kind,
                 symmetry_cut_plane=cut_plane,
                 parent_region=zone.id,
@@ -619,6 +652,7 @@ async def _match_library_assets(
     specs: list[Any],
     bboxes: dict[str, BoundingBox],
     orientations: dict[str, int],
+    subjects: dict[str, str],
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     runs_dir: Path,
     run_id: str,
@@ -650,6 +684,7 @@ async def _match_library_assets(
             return Node(
                 id=spec.id,
                 prompt=spec.prompt,
+                noun_phrase=subjects[spec.id],
                 bbox=bbox,
                 proxy_shape=spec.proxy_shape,
                 orientation=orientation,
@@ -662,14 +697,21 @@ async def _match_library_assets(
                 mesh_url=url,
             )
 
-        # bbox already emitted upfront in _resolve_and_generate.
-        match = await library.match(spec.prompt)
+        # bbox already emitted upfront in _resolve_and_generate. Match on the
+        # distilled visual subject (not the placement-laden seed) so the library
+        # pick keys off a clean physical description. The same phrase is recorded
+        # as the `image` event's prompt, which is what the from-scratch generate
+        # gate reconstructs each node's prompt from (see routes._reconstruct_node),
+        # so the distilled subject carries through to that gate's cut-plane /
+        # prefab / Nano-Banana decisions.
+        subject = subjects[spec.id]
+        match = await library.match(subject)
         asset = library.asset_path(match.library_id)
 
         logging.log(
             "library.match",
             id=spec.id,
-            prompt=spec.prompt,
+            prompt=subject,
             library_id=match.library_id,
         )
 
@@ -684,7 +726,7 @@ async def _match_library_assets(
                 "image",
                 id=spec.id,
                 url=_artifact_url(runs_dir, dest_image),
-                prompt=spec.prompt,
+                prompt=subject,
             )
 
         if asset.exists():
@@ -729,6 +771,7 @@ async def _match_library_assets(
         return Node(
             id=spec.id,
             prompt=spec.prompt,
+            noun_phrase=subjects[spec.id],
             bbox=bbox,
             proxy_shape=spec.proxy_shape,
             orientation=orientation,
@@ -748,6 +791,70 @@ async def _match_library_assets(
     # call, same as the sequential loop.
     return list(await asyncio.gather(*(_one(s) for s in specs)))
 
+async def _distill_subject(
+    *,
+    spec_id: str,
+    prompt: str,
+    bbox: BoundingBox,
+    proxy_shape: ProxyShape | None,
+    prior_prompts: list[str],
+    zone: Node | None = None,
+    nodes: list[Node] | None = None,
+    force: bool = False,
+) -> str:
+    """Run the `image_prompt` LLM step: distill the verbose seed `prompt` into a
+    concise visual noun phrase — what the object physically IS, stripped of the
+    placement / scene-context language the decompose step authors. This distilled
+    phrase is the object's canonical subject: stored as Node.prompt and used for
+    library matching, the symmetry cut plane, prefab grouping, and (wrapped)
+    Nano-Banana — every step that wants a direct physical description.
+
+    Resumes from the committed `image` event when present, so a replayed object
+    keeps the exact phrase the rest of the scene already references downstream.
+
+    `force=True` (the regenerate-noun-phrase path) skips BOTH the committed-`image`
+    short-circuit and the content-addressed LLM cache (via `call_llm_once`), so the
+    phrase is re-distilled fresh every call — a repeated regenerate actually
+    re-rolls instead of replaying the cached phrase, and an object that has no
+    noun phrase yet still gets one."""
+    if not force:
+        subject = committed.image_subject(spec_id)
+        if subject is not None:
+            return subject
+    ps = prompt_store.current()
+    variables = scene_context.image_prompt_vars(
+        prompt=prompt,
+        bbox=bbox,
+        proxy_shape=proxy_shape,
+        prior_prompts=prior_prompts,
+        zone=zone,
+        nodes=nodes,
+    )
+    if force:
+        # Uncached, unlogged-as-cache.llm one-shot: no cache read (so it re-rolls)
+        # and no cache.llm write (so the NEXT forced re-roll also misses). The new
+        # phrase becomes the source of truth via a fresh `image` event the caller
+        # logs, not via this call.
+        validated, *_ = await llm.call_llm_once(
+            system=ps.system("image_prompt", variables),
+            user=ps.user("image_prompt", variables),
+            output_schema=schemas.ImagePromptOutput,
+            model=llm.current_model(),
+            step="image_prompt",
+        )
+        return validated.prompt
+    out = await llm.call_llm(
+        system=ps.system("image_prompt", variables),
+        user=ps.user("image_prompt", variables),
+        output_schema=schemas.ImagePromptOutput,
+        node_id=spec_id,
+        step="image_prompt",
+        template="image_prompt",
+        variables=variables,
+    )
+    return out.prompt
+
+
 async def _build_image_prompt(
     *,
     spec_id: str,
@@ -760,22 +867,18 @@ async def _build_image_prompt(
     zone: Node | None = None,
     nodes: list[Node] | None = None,
 ) -> tuple[str, str]:
-    """Returns (subject_phrase, wrapped_image_prompt). The subject phrase is
-    the LLM's bare noun phrase — what gets stored on Node.prompt and shown
-    in context. The wrapped prompt is the full Nano-Banana studio-shot
-    directive — used only at the image-generation boundary.
+    """Returns (subject_phrase, wrapped_image_prompt): the distilled subject
+    (see `_distill_subject`) plus the full Nano-Banana studio-shot directive for
+    `view`. Used where both are wanted in one shot — the mesh-retry refresh and
+    the standalone library-asset builder. The main generate path distills and
+    wraps separately, since the symmetry view must be resolved (from the distilled
+    subject) before the wrap.
 
-    Set include_dimensions=False for library generation where objects have
-    no meaningful bbox — omits the dimension constraint from the image
-    prompt so the model renders natural proportions."""
-    dims = bbox.size if include_dimensions else None
-    # Resume: reuse the committed subject phrase so a replayed object keeps
-    # the exact prompt the rest of the scene already references downstream.
-    subject = committed.image_subject(spec_id)
-    if subject is not None:
-        return subject, scene_context.wrap_image_prompt(subject, proxy_shape, dims, view=view)
-    ps = prompt_store.current()
-    variables = scene_context.image_prompt_vars(
+    Set include_dimensions=False for library generation where objects have no
+    meaningful bbox — omits the dimension constraint so the model renders natural
+    proportions."""
+    subject = await _distill_subject(
+        spec_id=spec_id,
         prompt=prompt,
         bbox=bbox,
         proxy_shape=proxy_shape,
@@ -783,34 +886,66 @@ async def _build_image_prompt(
         zone=zone,
         nodes=nodes,
     )
-    out = await llm.call_llm(
-        system=ps.system("image_prompt", variables),
-        user=ps.user("image_prompt", variables),
-        output_schema=schemas.ImagePromptOutput,
-        node_id=spec_id,
-        step="image_prompt",
-        template="image_prompt",
-        variables=variables,
-    )
-    return out.prompt, scene_context.wrap_image_prompt(out.prompt, proxy_shape, dims, view=view)
+    dims = bbox.size if include_dimensions else None
+    return subject, scene_context.wrap_image_prompt(subject, proxy_shape, dims, view=view)
 
 
-async def _refresh_node_image_prompt(node: Node) -> Node:
+async def _refresh_node_image_prompt(
+    node: Node,
+    *,
+    regen_noun_phrase: bool = False,
+    seed_prompt: str | None = None,
+    zone: Node | None = None,
+    nodes: list[Node] | None = None,
+) -> Node:
     """Re-resolve symmetry + wrap after a mesh retry deleted the reference image.
-    Replays `symmetry.decision` from the log when present."""
+    Replays `symmetry.decision` from the log when present.
+
+    With `regen_noun_phrase=True`, re-distill a FRESH noun phrase from the
+    object's authored seed (`seed_prompt`, falling back to the node's current
+    prompt) via a forced `image_prompt` call — so a regenerate can re-roll the
+    noun phrase, even for an object that has none yet. The fresh phrase becomes
+    the node's prompt + wrapped Nano-Banana directive; the caller re-logs the
+    `image` event with it (see `_generate_one(relog_image=...)`) so later
+    regenerations, which read the `image` log, pick up the new phrase."""
     cut_plane = await symmetry.resolve_cut_plane(
         prompt=node.prompt, node_id=node.id,
     )
     view = symmetry.image_view_for(cut_plane=cut_plane)
-    subject = committed.image_subject(node.id) or node.prompt
-    _, image_prompt = await _build_image_prompt(
-        spec_id=node.id,
-        prompt=subject,
-        bbox=node.bbox,
-        proxy_shape=node.proxy_shape,
-        prior_prompts=[],
-        view=view,
-    )
+    if regen_noun_phrase:
+        # Re-distill against the SAME scene context the original image_prompt step
+        # saw (`{ROOT_HEADER}`, `{ZONE_*}`, `{SCENE_CONTEXT}`, prior phrases),
+        # reconstructed by the caller — not an empty render. The node being
+        # described is dropped from that context: the live first pass distills
+        # before appending the node to `all_nodes`, and excluding it stops a re-roll
+        # from simply echoing the object's own existing phrase back. `zone`/`nodes`
+        # are None when the caller couldn't rebuild the tree, in which case the
+        # step still runs, just context-free.
+        scene = [n for n in nodes if n.id != node.id] if nodes else nodes
+        priors = [n.noun_phrase for n in (scene or []) if n.noun_phrase is not None]
+        subject = await _distill_subject(
+            spec_id=node.id,
+            prompt=seed_prompt or node.prompt,
+            bbox=node.bbox,
+            proxy_shape=node.proxy_shape,
+            prior_prompts=priors,
+            zone=zone,
+            nodes=scene,
+            force=True,
+        )
+        image_prompt = scene_context.wrap_image_prompt(
+            subject, node.proxy_shape, node.bbox.size, view=view,
+        )
+    else:
+        subject = committed.image_subject(node.id) or node.prompt
+        _, image_prompt = await _build_image_prompt(
+            spec_id=node.id,
+            prompt=subject,
+            bbox=node.bbox,
+            proxy_shape=node.proxy_shape,
+            prior_prompts=[],
+            view=view,
+        )
     return node.model_copy(
         update={
             "prompt": subject,
@@ -870,11 +1005,12 @@ async def _generate_one(
     backend: str = DEFAULT_MESH_BACKEND,
     reuse_image: bool = False,
     force_image: bool = False,
+    relog_image: bool = False,
 ) -> None:
     try:
         # Nano Banana sees the wrapped studio-shot directive; node.prompt
         # stays the bare subject phrase for everything else.
-        banana_prompt = node.image_prompt or node.prompt
+        banana_prompt = node.image_prompt or node.noun_phrase or node.prompt
         image_path = image_stem.parent / f"{image_stem.name}.png"
         had_image = image_path.exists() and logging.find_event("image", id=node.id) is not None
         if reuse_image:
@@ -903,12 +1039,16 @@ async def _generate_one(
                 save_to=image_path,
                 force=force_image,
             )
-        if not had_image:
+        if not had_image or relog_image:
+            # `relog_image` (the regenerate-noun-phrase path) appends a NEW `image`
+            # event so the freshly-distilled phrase becomes the latest one — which
+            # is what `committed.image_subject` / the displayed image prompt / a
+            # later regenerate all read.
             logging.log(
                 "image",
                 id=node.id,
                 url=_artifact_url(runs_dir, image_path),
-                prompt=node.prompt,
+                prompt=node.noun_phrase or node.prompt,
             )
         # generate_mesh writes `raw` on a fresh run but returns a *cached* path
         # on a resumable hit (which may not be `raw` when the bound log was
@@ -933,6 +1073,21 @@ async def _generate_one(
                 node.bbox,
                 orientation=node.orientation,
             )
+            # Window/glass objects: bake per-texel transparency into the base
+            # color (white texels -> near-clear) before export. Gated on the object
+            # reading as glass AND having been decided to be symmetrized (a flat
+            # glazed panel). Modular + removable — drop this block and the `glass`
+            # import to disable. Logged here, in the async context, since the slot
+            # log isn't thread-safe.
+            glass_stats = await asyncio.to_thread(
+                glass.apply_window_glass_transparency,
+                rescaled,
+                noun_phrase=node.noun_phrase,
+                prompt=node.prompt,
+                symmetrized=node.symmetry_cut_plane != "none",
+            )
+            if glass_stats is not None:
+                logging.log("mesh.glass", id=node.id, **glass_stats)
             # Atomic write: export to a temp then replace, so a concurrent reader
             # (the client streaming raw meshes, or a reuse) never sees a torn GLB.
             tmp_path = path.with_name(f"{path.name}.part")
@@ -1179,7 +1334,10 @@ async def generate_assets(
         async with node_lock(run_id, node.id):
             # A regeneration may have (re)built this node while we waited for the
             # lock — don't redo it, but still unblock any reuse of this canonical.
-            if (opt_dir / f"{node.id}.glb").exists():
+            # Gate on the FULL artifact set, not the optimized twin alone, so a
+            # torn "ghost" (stale optimized, raw/unoptimized deleted by a failed
+            # regen) is rebuilt here instead of skipped.
+            if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=False):
                 raw_ready[node.id].set()
                 return
             try:
@@ -1204,7 +1362,9 @@ async def generate_assets(
         # lands identically posed. No Nano-Banana, no Trellis.
         await raw_ready[source_id].wait()
         async with node_lock(run_id, node.id):
-            if (opt_dir / f"{node.id}.glb").exists():
+            # Full-set gate (see `_fresh`): a reuse with a stale optimized twin but
+            # a missing unoptimized served mesh is re-derived, not skipped.
+            if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=True):
                 return
             await _rescale_reuse_from_raw(
                 node,
@@ -1220,7 +1380,6 @@ async def generate_assets(
     # flipping a pre-built asset into a reuse.
     tasks: list[asyncio.Task[None]] = []
     for node in nodes:
-        done = (opt_dir / f"{node.id}.glb").exists()
         decided = logging.find_event("prefab.match", id=node.id)
         if decided is not None:
             reuse_id = str(decided.get("reuse_id") or "")
@@ -1229,11 +1388,21 @@ async def generate_assets(
             logging.log("prefab.match", id=node.id, reuse_id=reuse_id, description=node.prompt)
 
         is_reuse = bool(reuse_id) and reuse_id in canonical_ids
+        # "Done" requires the WHOLE artifact set on disk (role-aware), NOT just the
+        # served optimized twin: a regen deletes the raw + unoptimized up front, so
+        # a build that died midway leaves only the stale optimized — which still
+        # renders, hiding the loss. Gating on the full set rebuilds that torn state
+        # here instead of skipping it (a re-run keeps retrying until consistent).
+        done = artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=is_reuse)
         if not is_reuse:
             # Canonical (a seed or a pre-built original); reuses rescale its raw mesh.
             canonical_ids.add(node.id)
             ev = raw_ready.setdefault(node.id, asyncio.Event())
-            if done or _has_raw(node.id):
+            # Signal readiness only when the raw is genuinely on disk — a reuse
+            # re-derives from it, so a canonical whose raw was deleted (a ghost)
+            # must not report ready off its stale optimized twin; `_fresh` sets the
+            # event once it has rebuilt the raw.
+            if _has_raw(node.id):
                 ev.set()
 
         if done:
@@ -1256,6 +1425,10 @@ async def regenerate_one(
     backend: str = DEFAULT_MESH_BACKEND,
     generated: bool = False,
     reuse_image: bool = False,
+    regen_noun_phrase: bool = False,
+    seed_prompt: str | None = None,
+    scene_zone: Node | None = None,
+    scene_nodes: list[Node] | None = None,
 ) -> None:
     """Rebuild a single mesh FRESH on `backend` (one of `MESH_BACKENDS`): unlink
     every prior on-disk artifact for this node under `subdir` so the cache-aware
@@ -1283,12 +1456,16 @@ async def regenerate_one(
         await _rebuild_one(
             node=node, runs_dir=runs_dir, run_id=run_id,
             subdir=subdir, optimize=optimize, backend=backend, reuse_image=reuse_image,
+            regen_noun_phrase=regen_noun_phrase, seed_prompt=seed_prompt,
+            scene_zone=scene_zone, scene_nodes=scene_nodes,
         )
         return
     async with node_lock(run_id, node.id):
         await _rebuild_one(
             node=node, runs_dir=runs_dir, run_id=run_id,
             subdir=subdir, optimize=optimize, backend=backend, reuse_image=reuse_image,
+            regen_noun_phrase=regen_noun_phrase, seed_prompt=seed_prompt,
+            scene_zone=scene_zone, scene_nodes=scene_nodes,
         )
 
 
@@ -1301,6 +1478,10 @@ async def _rebuild_one(
     optimize: bool,
     backend: str,
     reuse_image: bool = False,
+    regen_noun_phrase: bool = False,
+    seed_prompt: str | None = None,
+    scene_zone: Node | None = None,
+    scene_nodes: list[Node] | None = None,
 ) -> None:
     objs_dir = runs_dir / run_id / subdir
     objs_dir.mkdir(parents=True, exist_ok=True)
@@ -1314,11 +1495,21 @@ async def _rebuild_one(
     # it and breaking a later from-image regen), and a from-image rebuild reuses it.
     for artifact in (raw, path):
         artifact.unlink(missing_ok=True)
+    # Refresh BEFORE logging: _refresh_node_image_prompt re-rolls the noun phrase
+    # (regen_noun_phrase) — or re-reads the committed subject — and rewrites
+    # node.prompt, so logging mesh.retry after it records the phrase actually being
+    # built. Logging before would capture the stale pre-distillation seed (the
+    # reconstructed node still carries the authored prompt), which is why a retry
+    # showed the old prompt even though the regenerated `image` event held the new.
+    node = await _refresh_node_image_prompt(
+        node, regen_noun_phrase=regen_noun_phrase, seed_prompt=seed_prompt,
+        zone=scene_zone, nodes=scene_nodes,
+    )
     logging.log("mesh.retry", id=node.id, prompt=node.prompt, backend=backend)
-    node = await _refresh_node_image_prompt(node)
     await _generate_one(
         node, raw=raw, path=path, image_stem=image_stem, runs_dir=runs_dir,
         backend=backend, reuse_image=reuse_image, force_image=not reuse_image,
+        relog_image=regen_noun_phrase,
     )
     if optimize and path.exists():
         # Served twin sits beside the raw dir, so the same version subdir
@@ -1373,6 +1564,34 @@ async def propagate_reuses(
     coros = [_one(node) for node in reuses]
     if coros:
         await asyncio.gather(*coros, return_exceptions=True)
+
+
+async def clone_canonical_raw(
+    *,
+    runs_dir: Path,
+    run_id: str,
+    source_id: str,
+    dest_id: str,
+) -> bool:
+    """Copy `source_id`'s raw Trellis mesh (and its reference image) onto
+    `dest_id` so `dest_id` becomes a self-sufficient prefab canonical holding the
+    SAME shared geometry. Used when a group's canonical is unlinked: the group is
+    handed off to one of its reuses, which inherits the canonical's raw here so the
+    remaining members keep their shared look (and stay re-derivable) once the old
+    canonical regenerates fresh. Runs under `dest_id`'s node lock so it can't race
+    a concurrent build/regen of that node. Returns whether the raw was copied (a
+    missing source raw is logged and skipped)."""
+    raw_dir, _opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{source_id}.raw.glb"
+    async with node_lock(run_id, dest_id):
+        if not src_raw.exists():
+            logging.log("prefab.reuse_missing", id=dest_id, source=source_id)
+            return False
+        await asyncio.to_thread(shutil.copyfile, src_raw, raw_dir / f"{dest_id}.raw.glb")
+        src_png = raw_dir / f"{source_id}.png"
+        if src_png.exists():
+            await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{dest_id}.png")
+        return True
 
 
 def recover_group_image(
@@ -1497,6 +1716,217 @@ async def symmetrize_one(
             logging.log("symmetry.symmetrized", id=node.id, cut_plane=cut_plane, keep_positive=keep_positive)
         except Exception as e:  # noqa: BLE001
             logging.log("mesh.error", id=node.id, message=f"symmetrize: {type(e).__name__}: {e}")
+
+
+async def reorient_one(
+    *,
+    node: Node,
+    axis: Literal["x", "y", "z"],
+    degrees: int,
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Change a generated object's "front view" — which face points along +Z in
+    the raw, pre-transform mesh — by rotating its RAW mesh 90° (a `degrees`
+    multiple of 90) about `axis`, then re-deriving its served + optimized twin.
+
+    The raw is the pristine source every prefab reuse + every re-derivation reads,
+    so the rotation is BAKED into it: reload the on-disk raw, rotate, write it back
+    (atomically), then re-apply the object's current symmetry and rescale into its
+    bbox + yaw. The caller (`_regen_worker`) then `propagate_reuses`, which re-
+    derives every reuse from this same re-fronted raw — so the new front view lands
+    identically across the whole prefab group, in both the optimized and unoptimized
+    builds. No Nano-Banana, no mesh backend, so it's effectively instant. Runs under
+    the node lock so it can't race a scene build / regen of the same node. A missing
+    raw is logged and skipped (the caller passes the prefab CANONICAL, which always
+    owns the group's raw; a reuse has none of its own)."""
+    if degrees % 90 != 0:
+        logging.log("mesh.error", id=node.id, message=f"reorient: degrees must be a multiple of 90, got {degrees}")
+        return
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{node.id}.raw.glb"
+    rescaled = raw_dir / f"{node.id}.glb"
+    async with node_lock(run_id, node.id):
+        if not src_raw.exists():
+            logging.log("mesh.reorient_skip", id=node.id, reason="no raw mesh on disk")
+            return
+        # Re-apply the object's CURRENT symmetry when re-deriving, so re-fronting
+        # composes with an existing mirror (read from the canonical's log, like
+        # `_rescale_reuse_from_raw`) instead of silently dropping it.
+        cut_plane: Literal["none", "xy", "xz"] = "none"
+        keep_positive: bool | None = None
+        applied = logging.find_event("symmetry.applied", id=node.id)
+        if applied is not None:
+            raw_cp = applied.get("cut_plane")
+            if raw_cp in ("none", "xy", "xz"):
+                cut_plane = raw_cp  # type: ignore[assignment]
+            raw_keep = applied.get("keep_positive")
+            if isinstance(raw_keep, bool):
+                keep_positive = raw_keep
+        try:
+            async with _MESH_IO:
+                raw_scene = await asyncio.to_thread(trimesh.load, src_raw)
+                rotated = await asyncio.to_thread(rotate_mesh, raw_scene, axis=axis, degrees=degrees)
+                # Persist the re-fronted raw FIRST (atomic) — it is the new source
+                # of truth for this object AND every reuse derived from it.
+                tmp_raw = src_raw.with_name(f"{src_raw.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, rotated, tmp_raw)
+                    os.replace(tmp_raw, src_raw)
+                finally:
+                    tmp_raw.unlink(missing_ok=True)
+                # Re-derive the served mesh from the re-fronted raw.
+                placed = await symmetry.apply_symmetrize(
+                    rotated, cut_plane=cut_plane, node_id=node.id, keep_positive=keep_positive,
+                )
+                placed = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, placed, node.bbox, orientation=node.orientation,
+                )
+                tmp_rescaled = rescaled.with_name(f"{rescaled.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, placed, tmp_rescaled)
+                    os.replace(tmp_rescaled, rescaled)
+                finally:
+                    tmp_rescaled.unlink(missing_ok=True)
+                del raw_scene, rotated, placed
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+            logging.log("mesh.reorient", id=node.id, axis=axis, degrees=degrees)
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"reorient: {type(e).__name__}: {e}")
+
+
+async def glassify_one(
+    *,
+    node: Node,
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Force the window/glass transparency transform onto ONE generated object's
+    served mesh, bypassing the pipeline's keyword + symmetry gates. The per-node
+    primitive behind the frontend "make glass transparent" control; `glassify_group`
+    fans it across a prefab group.
+
+    Unlike unsymmetrize/symmetrize/reorient (which re-derive from the pristine
+    raw), this edits the object's already-rescaled served mesh
+    (`objects-generated/<id>.glb`) IN PLACE: reload it, bake per-texel
+    transparency into its base-color texture(s) (white -> near-clear via
+    `glass.apply_alpha_from_white`), re-export, and re-optimize the served twin.
+    Operating on the served mesh means it applies uniformly to a prefab CANONICAL
+    and a REUSE alike (a reuse owns a served `<id>.glb` but no raw), needs no
+    bbox/symmetry replay, and is idempotent (re-running re-finds the same white
+    texels). It is NOT re-derivable from the raw, so it can't ride the generic
+    `propagate_reuses` raw-replay (which would drop it) — `glassify_group` instead
+    applies it to each member directly. A later regenerate / symmetrize / reorient
+    / reset rebuilds from raw and drops the transparency. Runs under the node lock
+    so it can't race a scene build / regen of the same node. A missing served mesh,
+    or one with no white texels / no base-color texture, is logged and skipped."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    rescaled = raw_dir / f"{node.id}.glb"
+    async with node_lock(run_id, node.id):
+        if not rescaled.exists():
+            logging.log("mesh.glass_skip", id=node.id, reason="no served mesh on disk")
+            return
+        try:
+            async with _MESH_IO:
+                scene = await asyncio.to_thread(trimesh.load, rescaled)
+                stats = await asyncio.to_thread(glass.apply_alpha_from_white, scene)
+                if stats is None:
+                    logging.log(
+                        "mesh.glass_skip", id=node.id,
+                        reason="no white texels or no base-color texture",
+                    )
+                    del scene
+                    return
+                tmp = rescaled.with_name(f"{rescaled.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, scene, tmp)
+                    os.replace(tmp, rescaled)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                del scene
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+            logging.log("mesh.glass", id=node.id, forced=True, **stats)
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"glassify: {type(e).__name__}: {e}")
+
+
+async def glassify_group(
+    *,
+    nodes: list[Node],
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Force the glass-transparency transform onto every node in a prefab group
+    (the canonical + its reuses), each on its OWN served mesh via `glassify_one`.
+
+    Glass is a per-mesh texture edit, not re-derivable from the shared raw, so the
+    group can't be propagated through `propagate_reuses`' raw replay (it would drop
+    the transparency). Instead each member is transformed directly — they share the
+    canonical's geometry + texture, so the same white texels are cut on each. Runs
+    members concurrently; each `glassify_one` takes its own node lock."""
+    coros = [glassify_one(node=n, runs_dir=runs_dir, run_id=run_id) for n in nodes]
+    if coros:
+        await asyncio.gather(*coros, return_exceptions=True)
+
+
+async def reset_from_raw_one(
+    *,
+    node: Node,
+    runs_dir: Path,
+    run_id: str,
+) -> None:
+    """Rebuild a generated object's served mesh from its pristine raw Trellis
+    output, discarding any in-place served-mesh edit (notably a forced glass
+    transparency): reload the raw, re-apply the object's CURRENT symmetry decision,
+    rescale into its bbox + orientation, and re-optimize the served twin. No
+    Nano-Banana, no mesh backend — effectively instant.
+
+    Unlike `unsymmetrize_one` (which forces symmetry OFF and pins it), this
+    PRESERVES the existing symmetry/orientation — it reverts only texture/served-
+    level changes, restoring the mesh exactly as the pipeline produced it before
+    the edit. A missing raw (e.g. a prefab reuse, which owns no raw) is logged and
+    skipped — the caller resets the canonical and re-derives reuses via
+    `propagate_reuses`. Runs under the node lock."""
+    raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
+    src_raw = raw_dir / f"{node.id}.raw.glb"
+    rescaled = raw_dir / f"{node.id}.glb"
+    async with node_lock(run_id, node.id):
+        if not src_raw.exists():
+            logging.log("mesh.reset_skip", id=node.id, reason="no raw mesh on disk")
+            return
+        # Re-apply the object's CURRENT symmetry when re-deriving (read from the
+        # log, like reorient/_rescale_reuse_from_raw), so reset keeps the mirror
+        # instead of silently dropping it.
+        cut_plane: Literal["none", "xy", "xz"] = "none"
+        keep_positive: bool | None = None
+        applied = logging.find_event("symmetry.applied", id=node.id)
+        if applied is not None:
+            raw_cp = applied.get("cut_plane")
+            if raw_cp in ("none", "xy", "xz"):
+                cut_plane = raw_cp  # type: ignore[assignment]
+            raw_keep = applied.get("keep_positive")
+            if isinstance(raw_keep, bool):
+                keep_positive = raw_keep
+        try:
+            async with _MESH_IO:
+                scene = await asyncio.to_thread(trimesh.load, src_raw)
+                scene = await symmetry.apply_symmetrize(
+                    scene, cut_plane=cut_plane, node_id=node.id, keep_positive=keep_positive,
+                )
+                placed = await asyncio.to_thread(
+                    rescale_mesh_to_bbox, scene, node.bbox, orientation=node.orientation,
+                )
+                tmp = rescaled.with_name(f"{rescaled.name}.part")
+                try:
+                    await asyncio.to_thread(export_glb, placed, tmp)
+                    os.replace(tmp, rescaled)
+                finally:
+                    tmp.unlink(missing_ok=True)
+                del scene, placed
+            await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+            logging.log("mesh.reset", id=node.id)
+        except Exception as e:  # noqa: BLE001
+            logging.log("mesh.error", id=node.id, message=f"reset: {type(e).__name__}: {e}")
 
 
 async def await_pending(run_id: str) -> None:

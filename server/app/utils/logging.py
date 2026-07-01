@@ -159,6 +159,26 @@ class SlotLog:
                     f.write(json.dumps(event) + "\n")
         return n
 
+    def replace_events(self, events: list[dict[str, Any]]) -> None:
+        """Overwrite the log with `events` (already in final order), rewriting
+        every `index` to its new position so `index == line == list position`
+        holds again, and resyncing the in-memory buffer + append handle.
+
+        Truncation only ever drops the tail, so it leaves indices intact; a
+        SURGICAL edit (deleting/rewriting lines mid-log, e.g. wiping one object)
+        breaks the position==index invariant and must reindex, or the next
+        `log()` (a later resume) would mint an index that collides with a
+        surviving line — which the client's `idx <= maxIndex` dedup then drops.
+        """
+        self._close_events_file()
+        for i, event in enumerate(events):
+            event["index"] = i
+        self.state["events"] = events
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        with self.events_path.open("w", encoding="utf-8") as f:
+            for event in events:
+                f.write(json.dumps(event) + "\n")
+
     def start_run(self, prompt: str, model: str) -> None:
         self._close_events_file()
         self.state["prompt"] = prompt

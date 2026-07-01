@@ -44,6 +44,16 @@ def set_model(model: str) -> None:
     _current_model.set(model)
 
 
+def current_model() -> str:
+    """The model bound to the current task. Raises if `set_model` hasn't run —
+    same contract as `call_llm`. Lets callers that use `call_llm_once` directly
+    (which takes `model` explicitly) reuse the task-bound model."""
+    model = _current_model.get()
+    if model is None:
+        raise RuntimeError("llm.set_model() must be called before current_model()")
+    return model
+
+
 # Model-specific runtime injections — quirks of particular providers, NOT
 # prompt content, so they never appear in templates. Applied to the user
 # message at the call boundary, BEFORE cache hashing and logging, so the
