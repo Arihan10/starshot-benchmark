@@ -99,32 +99,42 @@ export function initOverlay(sceneViewer) {
 					groupSize,
 				};
 			},
-			// Other prefab groups this object could be linked into — one entry per
-			// distinct canonical (excluding the node's own group), labeled by the
-			// canonical's prompt and sized by membership.
+			// Every OTHER object this asset can be linked to — one entry per
+			// object (canonical OR reuse), excluding the focused node itself and
+			// the rest of its own group (linking within a group is a no-op). The
+			// server resolves the chosen object to its prefab group's canonical,
+			// so ANY member is a valid target. Each entry carries the object's id
+			// (the visible label), its prompt (a hover tooltip), and the size of
+			// the group it would join.
 			linkTargets: (id) => {
 				const me = lastGenMesh.get(id);
 				const myCanon = me ? me.canonical : null;
-				const counts = new Map();
-				for (const v of lastGenMesh.values()) {
-					if (!v.canonical) continue;
-					counts.set(v.canonical, (counts.get(v.canonical) || 0) + 1);
-				}
+				const groupSize = new Map();
+				for (const v of lastGenMesh.values())
+					groupSize.set(
+						v.canonical,
+						(groupSize.get(v.canonical) || 0) + 1,
+					);
 				const out = [];
-				for (const [canon, size] of counts) {
-					if (canon === myCanon) continue;
-					const node = obs.model.nodes.get(canon);
+				for (const [nid, m] of lastGenMesh) {
+					if (nid === id || m.canonical === myCanon) continue;
+					const node = obs.model.nodes.get(nid);
 					out.push({
-						canonical: canon,
-						label: node?.prompt || canon,
-						size,
+						id: nid,
+						prompt: node?.prompt || "",
+						size: groupSize.get(m.canonical) || 1,
 					});
 				}
-				out.sort((a, b) => a.label.localeCompare(b.label));
+				out.sort((a, b) => a.id.localeCompare(b.id));
 				return out;
 			},
 			isBusy: (id) => busyNodes.has(id),
 			imagePromptOf: (id) => lastGenMesh.get(id)?.imagePrompt ?? null,
+			// True when this object renders (stale optimized twin) but its raw /
+			// unoptimized mesh is missing — a regenerate that died midway. The
+			// panel badges it so the "ghost" isn't silent and the user knows to
+			// regenerate to rebuild it.
+			incompleteOf: (id) => lastGenMesh.get(id)?.incomplete ?? false,
 			// This object's effective render variant ("optimized" | "raw"), or null
 			// when it can't be toggled (only one variant on disk, e.g. mid-build).
 			optimizedOf: (id) => {
@@ -523,6 +533,9 @@ async function pollGenerated() {
 				optV: m.optV,
 				unoptUrl: m.unoptUrl,
 				unoptV: m.unoptV,
+				// Renders (stale optimized twin) but its raw/unoptimized backing is
+				// missing — a regen that died midway. Surfaced so it isn't silent.
+				incomplete: !!m.incomplete,
 			},
 		]),
 	);
@@ -550,9 +563,17 @@ async function pollGenerated() {
 	const total = concreteNodeCount();
 	const done = status.count ?? 0;
 	const frac = total ? `${done}/${total}` : `${done}`;
-	genStatusEl.textContent = status.running
-		? `building… ${frac}`
-		: `${frac} generated`;
+	// Torn "ghost" assets: a served twin whose raw/unoptimized backing is missing
+	// (a regen that didn't finish). Exclude any currently rebuilding (busy). Flag
+	// them so the loss isn't silent — regenerating each rebuilds its raw.
+	const ghosts = meshes.filter(
+		(m) => m.incomplete && !busyNodes.has(m.id),
+	).length;
+	const base = status.running ? `building… ${frac}` : `${frac} generated`;
+	genStatusEl.textContent = base + (ghosts ? ` · ⚠ ${ghosts} incomplete` : "");
+	genStatusEl.title = ghosts
+		? `${ghosts} object${ghosts === 1 ? "" : "s"} render from a stale optimized mesh but are missing their raw/unoptimized files (an unfinished regenerate). Regenerate each to rebuild it.`
+		: "";
 	if (status.running) genPollTimer = setTimeout(pollGenerated, 1500);
 }
 

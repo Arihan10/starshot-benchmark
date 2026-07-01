@@ -3,18 +3,24 @@
 Writes a per-placement world transform into a COPY of a pre-optimized
 (Meshopt + KTX2) library GLB *without* decoding geometry or textures, so the
 compression survives all the way to the client. The transform reproduces the
-`rescale_mesh_to_bbox` contract — yaw, then per-axis stretch to fill the
+`rescale_mesh_to_bbox` contract — yaw, then a scale that fits the
 world-axis-aligned bbox — expressed as a 2-node nest the client applies
 natively when it loads the GLB:
 
-    outer node: translation + non-uniform scale (world axes)
+    outer node: translation + scale (world axes)
       inner node: yaw rotation
         └─ the GLB's original scene roots
 
-Scale and rotation are split across two nodes on purpose: a single matrix of
-`scale · rotate` carries shear for a non-uniform scale, which GLTFLoader would
-mangle when it decomposes the node into TRS. Keeping each node shear-free
-(outer = translate + scale, inner = pure rotation) decomposes cleanly.
+The scale is per-axis (fills the bbox exactly) for an axis-aligned yaw. For an
+oblique yaw (±45/±135) the X and Z axes share one scale (the tighter fill) so
+the asset isn't sheared, while Y still fills on its own — the asset keeps full
+height, and since an oblique yaw makes the footprint square, a square bbox still
+fills exactly (see `rescale_mesh_to_bbox` for the full rationale).
+
+Scale and rotation are split across two nodes so each node stays a clean TRS:
+a single matrix of `scale · rotate` would carry shear for a non-uniform scale,
+which GLTFLoader mangles when it decomposes the node into TRS (outer =
+translate + scale, inner = pure rotation).
 
 The edit is done as raw GLB chunk surgery: only the JSON chunk is rewritten
 (two nodes appended, the scene re-rooted), and the binary chunk — holding the
@@ -137,8 +143,8 @@ def place_glb(
 
     `rotated_min`/`rotated_max` are the asset's world-space AABB *after* every
     baked rotation (the yaw from optimize_manifest.json and, when given,
-    `model_rotation`), which is what the per-axis fill scale needs — pass
-    bounds already run through `rotate_aabb(..., model_rotation)`.
+    `model_rotation`), which is what the fill scale needs — pass bounds already
+    run through `rotate_aabb(..., model_rotation)`.
 
     `model_rotation` is an optional fixed glTF quaternion applied INNERMOST
     (in asset-local space, before yaw): v5 bakes `quat_x(-90)` so library
@@ -146,16 +152,28 @@ def place_glb(
     """
     target_extents = bbox.size
     target_center = bbox.center
-    scale: list[float] = []
-    translate: list[float] = []
-    for i in range(3):
-        extent = rotated_max[i] - rotated_min[i]
-        center = (rotated_max[i] + rotated_min[i]) / 2.0
-        # Flat assets (walls/floors) have a zero extent on one axis; leave it
-        # at scale 1 instead of dividing by zero.
-        s = target_extents[i] / extent if abs(extent) > 1e-9 else 1.0
-        scale.append(s)
-        translate.append(target_center[i] - s * center)
+    extents = [rotated_max[i] - rotated_min[i] for i in range(3)]
+    centers = [(rotated_max[i] + rotated_min[i]) / 2.0 for i in range(3)]
+    # Per-axis fill. Flat assets (walls/floors) have a zero extent on one axis;
+    # leave it at scale 1 instead of dividing by zero.
+    scale: list[float] = [
+        target_extents[i] / extents[i] if abs(extents[i]) > 1e-9 else 1.0
+        for i in range(3)
+    ]
+    if orientation % 90 != 0:
+        # Oblique yaw (about +Y) rotates X and Z off the world axes, so scaling
+        # them by DIFFERENT amounts shears the asset; they share the tighter fill
+        # instead (inscribing the footprint — a ±45/±135 yaw makes it square, so a
+        # square bbox still fills exactly). Y is the yaw axis, so it keeps its own
+        # fill and the asset keeps full height; an in-plane-uniform X/Z scale
+        # commutes with the yaw, so the scale + rotation nodes stay shear-free.
+        # (model_rotation, when set, is an axis-aligned 90°, so the yaw alone
+        # decides obliqueness.)
+        h = min(scale[0], scale[2])
+        scale = [h, scale[1], h]
+    translate: list[float] = [
+        target_center[i] - scale[i] * centers[i] for i in range(3)
+    ]
 
     gltf, bin_data = _parse_glb(src.read_bytes())
     nodes: list[dict] = gltf.setdefault("nodes", [])

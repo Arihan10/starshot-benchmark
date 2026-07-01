@@ -1,8 +1,18 @@
 """Mesh post-processing: yaw rotation + rescaling into a target bbox.
 
-Per-axis scaling: each axis is scaled independently so the mesh exactly
-fills the bbox on every axis. Proportions are not preserved — the
-guarantee is that the mesh is fully contained in the bbox.
+Scaling policy depends on the yaw:
+  * Axis-aligned yaw (a multiple of 90°): each axis is scaled independently so
+    the mesh exactly fills the bbox on every axis. The yaw only permutes axes,
+    so a per-axis world-space scale stays shear-free. Proportions are not
+    preserved — the guarantee is an exact fill.
+  * Oblique yaw (±45, ±135): the yaw is about +Y, so it rotates only the X and Z
+    axes off the world axes. Scaling X and Z by DIFFERENT amounts then shears the
+    mesh, so they instead SHARE one scale — the tighter of the two fills, which
+    inscribes the footprint and keeps the in-plane proportions (a ±45/±135 yaw
+    makes the footprint square, so a square bbox still fills exactly). Y is the
+    yaw axis, untouched by the rotation, so it keeps its own per-axis fill — the
+    object keeps its full height. Only a non-square footprint under-fills, which
+    is the unavoidable cost of staying shear-free.
 
 Orientation contract:
   Trellis 2 returns a mesh whose intrinsic front face points along +Z
@@ -14,9 +24,10 @@ Orientation contract:
   Trellis's output frame is predictable, leaving this rotation as the
   only orientation knob.
 
-Order of operations: translate to origin → yaw → scale → translate to
-bbox center. Yaw is applied to the unscaled mesh so it composes cleanly
-with per-axis scaling.
+Order of operations: yaw → scale → translate to bbox center. Yaw is applied to
+the unscaled mesh; an axis-aligned yaw composes cleanly with the per-axis scale,
+and an oblique yaw's shared X/Z scale is in-plane uniform (a similarity), so
+neither path shears.
 """
 
 from __future__ import annotations
@@ -29,6 +40,23 @@ import trimesh
 from trimesh.intersections import slice_faces_plane
 
 from app.core.types import BoundingBox, Orientation
+
+
+def _fill_scale(
+    target_extents: np.ndarray, source_extents: np.ndarray, orientation: int
+) -> np.ndarray:
+    """Per-axis fill ratios (`target / source`), made shear-free for `orientation`.
+
+    An axis-aligned yaw only permutes axes, so each axis fills independently. An
+    oblique yaw (±45/±135) rotates X and Z off the world axes, so they must share
+    ONE scale — the tighter of the two fills — or the mesh shears; Y (the yaw
+    axis) still fills on its own, so height is unaffected.
+    """
+    ratios = target_extents / source_extents
+    if orientation % 90 != 0:
+        h = float(min(ratios[0], ratios[2]))
+        ratios = np.array([h, ratios[1], h])
+    return ratios
 
 
 def rescale_mesh_to_bbox(
@@ -55,36 +83,36 @@ def rescale_mesh_to_bbox(
     rotated_center = (rotated_min + rotated_max) / 2.0
     target_extents = np.asarray(bbox.size, dtype=float)
     target_center = np.asarray(bbox.center, dtype=float)
-    scale_vec = target_extents / rotated_extents
 
-    # Compose the recenter + per-axis scale + final translate into ONE
-    # matrix. Applying these as three separate `apply_transform` calls is
-    # mathematically equivalent but harder to reason about for a Scene
-    # (each call mutates every per-geometry transform in the graph), and
-    # any drift between intermediate `bounds` reads compounds. A single
-    # composed matrix collapses the whole sequence to one mutation.
+    # Per-axis fill, made shear-free for an oblique yaw (X and Z share the tighter
+    # fill; Y fills on its own — see `_fill_scale`). `expected_extents` is what we
+    # actually aim to occupy: the full bbox when axis-aligned or when an oblique
+    # footprint is square, the inscribed extents otherwise.
+    scale_vec = _fill_scale(target_extents, rotated_extents, orientation)
+    expected_extents = scale_vec * rotated_extents
+
+    # Collapse recenter + scale + final translate into ONE matrix (one mutation,
+    # so no drift compounds across intermediate `bounds` reads on a Scene):
     #     M @ p = S @ (p - rotated_center) + target_center
     M = np.eye(4)
     M[:3, :3] = np.diag(scale_vec)
     M[:3, 3] = target_center - np.diag(scale_vec) @ rotated_center
     out.apply_transform(M)
 
-    # Belt-and-suspenders: re-read the actual world AABB after all
-    # transforms. If the final bounds drift from the requested bbox by
-    # more than centimetre tolerance (multi-geometry scene graphs,
-    # nested per-geom transforms, float precision), apply a corrective
-    # translate+scale that forces a fit. This guarantees the mesh is
-    # inside the bbox regardless of any upstream transform pathology.
+    # Belt-and-suspenders: re-read the world AABB and correct any drift from what
+    # we aimed to occupy (`expected_extents`, NOT the raw bbox — an oblique,
+    # non-square footprint deliberately under-fills). The correction follows the
+    # same policy (`_fill_scale`) so it can never re-introduce shear.
     final_min, final_max = out.bounds
     final_extents = final_max - final_min
     final_center = (final_min + final_max) / 2.0
     if (
-        not np.allclose(final_extents, target_extents, atol=1e-3)
+        not np.allclose(final_extents, expected_extents, atol=1e-3)
         or not np.allclose(final_center, target_center, atol=1e-3)
     ):
         if np.any(final_extents <= 0):
             return out
-        correction_scale = target_extents / final_extents
+        correction_scale = _fill_scale(expected_extents, final_extents, orientation)
         C = np.eye(4)
         C[:3, :3] = np.diag(correction_scale)
         C[:3, 3] = target_center - np.diag(correction_scale) @ final_center

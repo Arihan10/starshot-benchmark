@@ -181,6 +181,28 @@ def latest_generated_events_path(runs_dir: Path, run_id: str) -> Path:
     return path
 
 
+def artifacts_complete(
+    raw_dir: Path, opt_dir: Path, node_id: str, *, is_reuse: bool,
+) -> bool:
+    """Whether a generated object's WHOLE on-disk artifact set is present, not
+    just the served twin: the optimized GLB, its unoptimized source, and — for a
+    canonical — the pristine raw Trellis mesh it (and its reuses) re-derive from.
+    A reuse owns no raw (it rescales its canonical's), so it needs only the two
+    served twins.
+
+    The resume gate keys on THIS rather than the optimized twin alone, because a
+    regen deletes the raw + unoptimized up front: a build that fails midway then
+    leaves only the stale optimized GLB, which still renders and so masks the loss
+    as a silent "ghost". Treating that torn set as un-built makes a resume rebuild
+    it — cheaply re-deriving from the raw when it survives, re-generating when it
+    doesn't — instead of skipping it, and lets the status surface it."""
+    served = (opt_dir / f"{node_id}.glb").exists()
+    unoptimized = (raw_dir / f"{node_id}.glb").exists()
+    # A reuse re-derives from its canonical's raw, so it owns none of its own.
+    raw = is_reuse or (raw_dir / f"{node_id}.raw.glb").exists()
+    return served and unoptimized and raw
+
+
 async def _optimize_asset(src: Path, dst: Path) -> bool:
     """Run one freshly generated GLB through the library optimizer into `dst`.
     Atomic via a temp file (in src's dir, which isn't served) so a crash can't
@@ -1312,7 +1334,10 @@ async def generate_assets(
         async with node_lock(run_id, node.id):
             # A regeneration may have (re)built this node while we waited for the
             # lock — don't redo it, but still unblock any reuse of this canonical.
-            if (opt_dir / f"{node.id}.glb").exists():
+            # Gate on the FULL artifact set, not the optimized twin alone, so a
+            # torn "ghost" (stale optimized, raw/unoptimized deleted by a failed
+            # regen) is rebuilt here instead of skipped.
+            if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=False):
                 raw_ready[node.id].set()
                 return
             try:
@@ -1337,7 +1362,9 @@ async def generate_assets(
         # lands identically posed. No Nano-Banana, no Trellis.
         await raw_ready[source_id].wait()
         async with node_lock(run_id, node.id):
-            if (opt_dir / f"{node.id}.glb").exists():
+            # Full-set gate (see `_fresh`): a reuse with a stale optimized twin but
+            # a missing unoptimized served mesh is re-derived, not skipped.
+            if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=True):
                 return
             await _rescale_reuse_from_raw(
                 node,
@@ -1353,7 +1380,6 @@ async def generate_assets(
     # flipping a pre-built asset into a reuse.
     tasks: list[asyncio.Task[None]] = []
     for node in nodes:
-        done = (opt_dir / f"{node.id}.glb").exists()
         decided = logging.find_event("prefab.match", id=node.id)
         if decided is not None:
             reuse_id = str(decided.get("reuse_id") or "")
@@ -1362,11 +1388,21 @@ async def generate_assets(
             logging.log("prefab.match", id=node.id, reuse_id=reuse_id, description=node.prompt)
 
         is_reuse = bool(reuse_id) and reuse_id in canonical_ids
+        # "Done" requires the WHOLE artifact set on disk (role-aware), NOT just the
+        # served optimized twin: a regen deletes the raw + unoptimized up front, so
+        # a build that died midway leaves only the stale optimized — which still
+        # renders, hiding the loss. Gating on the full set rebuilds that torn state
+        # here instead of skipping it (a re-run keeps retrying until consistent).
+        done = artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=is_reuse)
         if not is_reuse:
             # Canonical (a seed or a pre-built original); reuses rescale its raw mesh.
             canonical_ids.add(node.id)
             ev = raw_ready.setdefault(node.id, asyncio.Event())
-            if done or _has_raw(node.id):
+            # Signal readiness only when the raw is genuinely on disk — a reuse
+            # re-derives from it, so a canonical whose raw was deleted (a ghost)
+            # must not report ready off its stale optimized twin; `_fresh` sets the
+            # event once it has rebuilt the raw.
+            if _has_raw(node.id):
                 ev.set()
 
         if done:

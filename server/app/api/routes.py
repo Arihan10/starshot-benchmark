@@ -2253,6 +2253,15 @@ def create_app() -> FastAPI:
                 # first, the optimized twin after); the client falls back.
                 opt_v = _variant(opt_dir / f"{mesh_id}.glb")
                 unopt_v = _variant(raw_dir / f"{mesh_id}.glb")
+                # A served twin whose raw/unoptimized backing is missing is a torn
+                # "ghost" (a regen that died midway): it still renders but can't be
+                # re-derived (reorient/symmetrize/reuse) or shown in the per-object
+                # raw view. Surface it so it isn't silent — and so the user knows a
+                # regenerate is needed to rebuild it. (Reuses own no raw; they only
+                # need their served twins.)
+                incomplete = not generation.artifacts_complete(
+                    raw_dir, opt_dir, mesh_id, is_reuse=canonical_id != mesh_id,
+                )
                 meshes.append({
                     "id": mesh_id,
                     "v": mtime,
@@ -2266,6 +2275,7 @@ def create_app() -> FastAPI:
                     "symWas": info["was"] if info else None,
                     "canonical": canonical_id,
                     "imagePrompt": img_prompt,
+                    "incomplete": incomplete,
                 })
         ids = [m["id"] for m in meshes]
         # Node ids whose meshes are currently being built or are queued to build —

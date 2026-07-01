@@ -394,6 +394,10 @@ export function createTracePanel(
 				? `un-symmetrized (was ${sym.was})`
 				: "";
 		const imgPrompt = actions.imagePromptOf?.(id) ?? null;
+		// Torn "ghost": renders from a stale optimized twin but its raw/unoptimized
+		// mesh is gone (a regen that didn't finish), so it can't be re-derived or
+		// shown in the raw view. Don't warn while it's actively rebuilding (busy).
+		const incomplete = !!actions.incompleteOf?.(id) && !busy;
 		return el(
 			"div",
 			{ class: "tp-actions" },
@@ -403,6 +407,13 @@ export function createTracePanel(
 					? "generated asset · generating…"
 					: "generated asset",
 			}),
+			incomplete
+				? el("div", {
+						class: "tp-act-sym",
+						style: "color:#f0c9c9",
+						text: "⚠ raw mesh missing — renders from a stale optimized twin; regenerate to rebuild it",
+					})
+				: null,
 			imgPrompt
 				? el(
 						"div",
@@ -667,13 +678,14 @@ export function createTracePanel(
 				"select",
 				{
 					class: "tp-act-sel",
-					title: "prefab group to link this object into",
+					title: "the object to link this asset to — it joins that object's prefab group and shares its mesh",
 					disabled: busy,
 				},
 				...targets.map((t) =>
 					el("option", {
-						value: t.canonical,
-						text: `${t.label} (${t.size})`,
+						value: t.id,
+						text: t.size > 1 ? `${t.id} · ${t.size} in group` : t.id,
+						title: t.prompt || t.id,
 					}),
 				),
 			);
@@ -689,7 +701,7 @@ export function createTracePanel(
 						disabled: busy,
 						title: busy
 							? "this asset is currently generating"
-							: "link this object into the chosen prefab group, so it shares that group's mesh",
+							: "link this object to the chosen object, so it shares that object's prefab group + mesh",
 						onclick: () =>
 							actions.onLink(id, linkSel.value, {
 								group: showGroupOpt && linkGroup.checked,
