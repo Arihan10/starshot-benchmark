@@ -178,7 +178,7 @@ document.getElementById("btn-step-all").addEventListener("click", async () => {
 // the same step for side-by-side comparison.
 const stepAllUntilEl = el("select", {
   id: "step-all-until", class: "step-until", style: "display:none",
-  title: "fast-forward every stepped slot to the next run of a step",
+  title: "run every stepped slot through the next call of a step, then pause before the following one",
 }, el("option", { value: "", text: "all until…" }));
 document.getElementById("btn-step-all").after(stepAllUntilEl);
 stepAllUntilEl.addEventListener("change", async () => {

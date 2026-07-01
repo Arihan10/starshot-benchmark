@@ -75,7 +75,7 @@ export function field(labelText, control) {
 export function stepUntilSelect(steps, onPick, { label = "until…", title } = {}) {
   const sel = el("select", {
     class: "step-until",
-    title: title ?? "fast-forward to the next run of a step, then pause there",
+    title: title ?? "run through the next call of a step, then pause before the following one",
   },
     el("option", { value: "", text: label }),
     (steps || []).map((s) => el("option", { value: s, text: `▸ ${s}` })),

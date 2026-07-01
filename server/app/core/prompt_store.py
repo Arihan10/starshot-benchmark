@@ -278,6 +278,23 @@ def sync_templates(dest_dir: Path, src_dir: Path) -> None:
     _snapshot_cache.pop(dest_dir.resolve(), None)
 
 
+def restore_step(dest_dir: Path, src_dir: Path, step: str) -> None:
+    """Hard-replace ONE step's `system` + `user` templates in `dest_dir` with
+    `src_dir`'s — the per-step form of `sync_templates`, used to revert a single
+    prompt in a run's snapshot back to its base version without touching the
+    others. Validates the step, the source files, and that the result stays a
+    complete set, then drops the cached load of the destination."""
+    if step not in STEPS:
+        raise PromptTemplateError(f"unknown step: {step}")
+    for role in _ROLES:
+        src = src_dir / f"{step}.{role}.txt"
+        if not src.is_file():
+            raise PromptTemplateError(f"prompt set at {src_dir} is missing: {src.name}")
+        (dest_dir / f"{step}.{role}.txt").write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
+    _load_dir(dest_dir, dest_dir.name)  # validate the result stays complete
+    _snapshot_cache.pop(dest_dir.resolve(), None)
+
+
 # --- run snapshots --------------------------------------------------------------
 
 _snapshot_cache: dict[Path, PromptSet] = {}

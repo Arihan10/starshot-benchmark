@@ -2201,6 +2201,24 @@
 				margin-left: auto;
 				color: var(--amber);
 			}
+			.lab-step-row .lab-step-revert {
+				margin-left: auto;
+				padding: 0 4px;
+				border: none;
+				background: none;
+				color: var(--text-faint);
+				cursor: pointer;
+				font-size: 12px;
+				line-height: 1;
+			}
+			/* An edited row already pushes its flag to the right; keep the revert
+			   button snug beside it rather than taking the auto-margin itself. */
+			.lab-step-row .edited-flag + .lab-step-revert {
+				margin-left: 0;
+			}
+			.lab-step-row .lab-step-revert:hover {
+				color: var(--amber);
+			}
 			#lab-editor {
 				flex: 1;
 				display: flex;
@@ -2657,6 +2675,16 @@
 				padding-bottom: 8px;
 				border-bottom: 1px solid var(--line);
 			}
+			/* The collapsed-by-default input/system diff expander: a toggle that
+               reveals the diffs below the two outputs. */
+			#compare-text .ct-expand {
+				margin: 4px 0 0;
+			}
+			#compare-text .ct-diffs {
+				margin-top: 8px;
+				padding-top: 8px;
+				border-top: 1px dashed var(--line);
+			}
 			.rc-pill {
 				font-size: 10px;
 				padding: 2px 9px;
@@ -2723,10 +2751,64 @@
 			.rv-card .rv-head {
 				display: flex;
 				align-items: center;
-				gap: 8px;
+				flex-wrap: wrap;
+				gap: 8px 6px;
 				padding: 8px 10px;
 				background: var(--panel-2);
 				border-bottom: 1px solid var(--line-2);
+			}
+			/* The per-event "simulate on" LLM picker — tinted so it reads as a
+               distinct config affordance next to the plain action buttons. */
+			.sim-llm-btn {
+				color: var(--purple);
+				border-color: rgba(168, 148, 255, 0.4);
+			}
+			/* Floating model-checkbox popover for the per-event LLM picker. */
+			.model-pop {
+				position: fixed;
+				z-index: 200;
+				background: var(--panel-2);
+				border: 1px solid var(--line-2);
+				border-radius: 6px;
+				padding: 6px;
+				min-width: 150px;
+				max-height: 320px;
+				overflow: auto;
+				box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+			}
+			.model-pop-head {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				color: var(--text-faint);
+				margin-bottom: 5px;
+			}
+			.model-pop-head .fit-btn {
+				margin-left: 0;
+			}
+			.model-pop-rows {
+				display: flex;
+				flex-direction: column;
+				gap: 1px;
+			}
+			.model-pop-row {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				font-size: 11px;
+				padding: 2px 3px;
+				border-radius: 4px;
+				cursor: pointer;
+			}
+			.model-pop-row:hover {
+				background: rgba(255, 255, 255, 0.04);
+			}
+			.model-pop-row .muted {
+				margin-left: auto;
+				font-size: 9px;
 			}
 			.rv-card .rv-slot {
 				font-weight: 600;
@@ -3628,7 +3710,7 @@
 				>
 				<button
 					id="compare-text-toggle"
-					title="Show input diff + outputs"
+					title="Show the two outputs (input / system diff on expand)"
 				>
 					text ▾
 				</button>

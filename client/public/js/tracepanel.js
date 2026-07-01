@@ -2,9 +2,9 @@
 // appears when an object/zone is picked in 3D. Two stacked parts:
 //
 //   1. an INFO block for the focused node — a live mini 3D preview (its mesh +
-//      bbox, with the real baked orientation) plus its debug fields: prompt,
-//      orientation (semantic text + resolved degrees), dimensions, world origin,
-//      proxy shape, structural parent, placement prose, and relationships.
+//      bbox, with the real baked orientation) plus its debug fields: prompt, a
+//      zone's plan, orientation (semantic text + resolved degrees), dimensions,
+//      world origin, proxy shape, structural parent, placement prose, and relationships.
 //   2. the EMITTANCE trace below it — the chain of REGIONS that generated the
 //      node (root → … → node, climbing each node's emitting region, NOT its
 //      structural parent), each with the LLM calls that brought it into being,
@@ -269,7 +269,7 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     if (!n) return null;
     const emitted = (model.provenance?.get(id) ?? []).find((p) => p.relation === "emitted_by");
     return [
-      id, n.prompt, n.kind, n.phase, n.meshUrl, n.proxyShape, n.orientation,
+      id, n.prompt, n.plan, n.kind, n.phase, n.meshUrl, n.proxyShape, n.orientation,
       Array.isArray(n.origin) ? n.origin.join(",") : "",
       Array.isArray(n.dimensions) ? n.dimensions.join(",") : "",
       emitted?.call?.index ?? "",
@@ -324,6 +324,10 @@ export function createTracePanel(hostEl, { onNavigate = () => {}, onClose = () =
     }
 
     if (n.prompt) fieldsEl.appendChild(fieldGroup("prompt", n.prompt));
+    // A zone's plan (from zone_plan) characterizes the zone itself, so surface it
+    // right under the prompt — a selected zone reads as prompt → plan, not just
+    // its prompt. Only zones carry a plan.
+    if (n.kind === "zone" && n.plan) fieldsEl.appendChild(fieldGroup("plan", n.plan));
 
     const props = el("div", { class: "tp-props" });
     const addProp = (label, value) => { if (value !== null && value !== undefined && value !== "") props.appendChild(prop(label, value)); };

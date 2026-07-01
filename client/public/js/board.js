@@ -282,7 +282,7 @@ function bulkReset(start) {
 const steppedCheck = el("input", { type: "checkbox" });
 const bulkCount = el("span", { class: "bulk-count" });
 const untilSel = el("select", { class: "step-until",
-  title: "fast-forward every selected cell to the next run of a step, then pause there" },
+  title: "run every selected cell through the next call of a step, then pause before the following one" },
   el("option", { value: "", text: "step until…" }));
 untilSel.addEventListener("change", () => { const v = untilSel.value; untilSel.value = ""; if (v) bulkStep(v); });
 const bulkActionEls = [

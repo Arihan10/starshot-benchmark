@@ -1,36 +1,63 @@
-// The decision-inquiry panel: a persistent, per-call chat that CONTINUES the
-// LLM call a pipeline step made. Opened from the "why?" button on a call row in
-// the obs dock.
+// The decision-inquiry panel: a persistent, per-call chat that asks Claude
+// Opus 4.8 (xhigh reasoning) WHY the subject model decided what it did in one
+// pipeline step. Opened from the "why?" button on a call row in the obs dock.
 //
-// The thread is seeded with that call's real conversation — its exact system
-// prompt, the user message it received, and the output it produced — and every
-// new turn is sent back to the SAME model, so it answers as itself, picking up
-// where it left off. No analyst persona, no appended grounding: you're just
-// talking to the model that made the decision, and can type anything. Threads
+// The reviewer's FULL system prompt — the analyst framing plus the step's exact
+// system / input / output / reasoning — is assembled HERE and shown in an
+// editable, prefilled box, so what you see is byte-for-byte what gets sent (and
+// you can tweak it before asking). The server is a thin pass-through. Threads
 // live in-memory keyed by run|slot|model|branch|callIndex, so reopening a
-// step's panel restores its conversation, and the dock's streaming re-renders
-// never disturb it (the panel is mounted on <body>).
+// step's panel restores both its prompt and its conversation, and the dock's
+// streaming re-renders never disturb it (the panel is mounted on <body>).
 
 import { el, shortBytes, fmtJson } from "./ui.js";
 import { api } from "./api.js";
 
-// Seed the chat with the step's real conversation: the user message it received
-// and the output it produced (its reasoning kept for display, not replayed as
-// content). The system prompt lives separately on the conversation (editable in
-// the panel) and is sent as the system message. Together these ARE the call —
-// continuing the thread sends them straight back to the model, no framing added.
-function seedTurns(call) {
+// The analyst framing prepended to every inquiry. The step's grounding (built
+// per call below) is appended to form the exact system prompt sent — and both
+// are surfaced verbatim in the panel's editable prompt box.
+const INQUIRY_SYSTEM = `You are a senior analyst performing a forensic post-mortem of a SINGLE decision made by another language model (the "subject model"). The subject model is one step of an automated pipeline that turns a text prompt into a 3D scene by recursively decomposing it into zones and objects, each with an axis-aligned bounding box and spatial relationships. The canonical world frame is right-handed, Y-up, meters: +X is right, +Y is up, +Z is toward the viewer (front), -Z is away (back).
+
+You are given the EXACT material that defined and resulted from the subject model's call for this one step:
+  - SYSTEM PROMPT: the instructions the subject model operated under.
+  - INPUT: the exact user message it received (it already contains any injected scene context).
+  - OUTPUT: the structured result it produced.
+  - REASONING: the subject model's own private chain-of-thought, if it exposed one.
+
+A developer benchmarking the pipeline will ask you why the subject model did particular things — why it placed an object at certain coordinates, why it decomposed a zone the way it did, why some downstream consequence followed, and so on.
+
+Rules:
+  - Ground every claim in the provided SYSTEM / INPUT / OUTPUT / REASONING. Quote the relevant lines or fields.
+  - The REASONING is the strongest evidence of intent: when it explains a decision, cite it directly. When it is absent or silent on the asked-about point, say so plainly and separate what the subject model actually reasoned from what you are inferring purely from its prompt and output.
+  - Never invent motives the evidence does not support. "The reasoning does not address this" and "this looks like an unexplained or arbitrary choice" are valid, valuable answers.
+  - Be concrete: reference specific ids, coordinates, dimensions, and prompt clauses. Keep answers tight and skimmable; lead with the direct answer, then the evidence.`;
+
+// The step's grounding block, mirroring exactly what the server used to append:
+// verbatim system / input / output / reasoning straight off the obs-model call.
+function groundingFor(call) {
   return [
-    { role: "user", content: call.user || "(empty)", seed: true },
-    { role: "assistant", content: fmtJson(call.output), reasoning: call.reasoning || "", seed: true },
-  ];
+    `=== SUBJECT MODEL: ${call.model || "unknown"} ===`,
+    `=== PIPELINE STEP: ${call.template ?? call.step ?? "unknown"} ===`,
+    "",
+    "--- SYSTEM PROMPT the subject model operated under ---",
+    call.system || "(empty)",
+    "",
+    "--- INPUT (user message) the subject model received ---",
+    call.user || "(empty)",
+    "",
+    "--- OUTPUT the subject model produced ---",
+    fmtJson(call.output),
+    "",
+    "--- The subject model's PRIVATE REASONING ---",
+    call.reasoning || "(the subject model exposed no separate reasoning trace)",
+  ].join("\n");
 }
 
-function seedConversation(call) {
-  return { model: call.model || "", system: call.system || "", turns: seedTurns(call) };
+function defaultPrompt(call) {
+  return `${INQUIRY_SYSTEM}\n\n${groundingFor(call)}`;
 }
 
-const conversations = new Map(); // convId -> { model, system, turns: [{role, content, reasoning?, seed?, error?}] }
+const conversations = new Map(); // convId -> { system, turns: [{role, content, reasoning?, error?}] }
 
 let panel = null;
 let refs = null; // { title, sub, prompt, body, input, sendBtn }
@@ -39,9 +66,9 @@ let busy = false;
 let busyId = null; // the conversation awaiting a reply (drives the pending bubble)
 
 const SUGGESTIONS = [
-  "Why did you choose these dimensions and this position?",
-  "Why did you decompose it the way you did?",
-  "What in the input drove this output?",
+  "Why did it choose these dimensions and position?",
+  "Why did it decompose things the way it did?",
+  "What in the input or its reasoning drove this output?",
 ];
 
 function convId(ctx, call) {
@@ -56,7 +83,7 @@ export function openInquiry(call, ctx) {
   ensurePanel();
   current = { id: convId(ctx, call), call, ctx };
   if (!conversations.has(current.id)) {
-    conversations.set(current.id, seedConversation(call));
+    conversations.set(current.id, { system: defaultPrompt(call), turns: [] });
   }
   renderShell();
   renderTranscript();
@@ -90,10 +117,10 @@ function ensurePanel() {
   const title = el("span", { class: "inq-title" });
   const sub = el("span", { class: "inq-sub muted" });
   const clearBtn = el("button", {
-    class: "inq-clear", text: "clear chat", title: "drop your follow-ups — back to the step's original call",
+    class: "inq-clear", text: "clear chat", title: "clear this step's conversation (keeps the prompt)",
     onclick: () => {
       if (!current) return;
-      conversations.get(current.id).turns = seedTurns(current.call);
+      conversations.get(current.id).turns = [];
       renderTranscript();
       refs.input.focus();
     },
@@ -114,20 +141,12 @@ function ensurePanel() {
   input.addEventListener("keydown", (ev) => {
     if (ev.key === "Enter" && !ev.shiftKey) { ev.preventDefault(); sendTurn(); }
   });
-  // Always-visible "drop the step's own reasoning into the box" button. The
-  // step always emits a reasoning trace, so it sits right by the input ready to
-  // paste it in to quote or edit — it never sends on its own.
-  const reasonBtn = el("button", {
-    class: "inq-reason", type: "button", text: "↩ reasoning",
-    title: "paste this step's reasoning trace into the message box to quote or edit — doesn't send",
-    onclick: () => injectReasoning(current?.call?.reasoning),
-  });
   const sendBtn = el("button", { class: "primary inq-send", text: "ask", onclick: () => sendTurn() });
-  const foot = el("div", { class: "inq-foot" }, input, reasonBtn, sendBtn);
+  const foot = el("div", { class: "inq-foot" }, input, sendBtn);
 
   panel = el("div", { id: "inquiry-panel" }, head, prompt, body, foot);
   document.body.appendChild(panel);
-  refs = { title, sub, prompt, body, input, reasonBtn, sendBtn };
+  refs = { title, sub, prompt, body, input, sendBtn };
 
   // Esc closes the chat first (capture phase + stopPropagation keeps the
   // overlay/drawer Esc handlers from also firing), unless a modal owns Esc.
@@ -143,18 +162,18 @@ function renderShell() {
   const { call } = current;
   const step = call.template ?? call.step ?? "step";
   refs.title.textContent = `why? · ${step}`;
-  refs.sub.textContent = `continuing this call · ${call.model ?? "?"}`;
+  refs.sub.textContent = `subject: ${call.model ?? "?"}  ·  reviewer: claude-opus-4.8 · xhigh`;
   renderPrompt();
   syncBusyControls();
 }
 
-// The system prompt the step's model ran under — sent verbatim as the system
-// message of the continued conversation, editable, and collapsed by default so
-// the conversation itself stays the focus.
+// The exact prompt sent to the reviewer — prefilled with the analyst framing +
+// this step's grounding, editable, and the source of truth for what gets sent.
 function renderPrompt() {
   const { call } = current;
   const conv = conversations.get(current.id);
   refs.prompt.textContent = "";
+  refs.prompt.classList.add("open"); // visible by default so the prompt is right there
 
   const size = el("span", { class: "muted size", text: shortBytes(conv.system) });
   const ta = el("textarea", { class: "inq-prompt-text", spellcheck: "false" });
@@ -166,21 +185,21 @@ function renderPrompt() {
 
   const reset = el("button", {
     class: "inq-prompt-reset", text: "reset",
-    title: "restore this step's original system prompt (discards edits)",
+    title: "restore the prefilled prompt for this step (discards edits)",
     onclick: (ev) => {
       ev.stopPropagation();
-      conv.system = call.system || "";
+      conv.system = defaultPrompt(call);
       ta.value = conv.system;
       size.textContent = shortBytes(conv.system);
     },
   });
   const headRow = el("div", {
     class: "inq-prompt-head",
-    title: "the system prompt this step's model ran under — sent as the system message (plus a short directive to reply in prose, not the step's JSON); edit it freely",
+    title: "the exact system prompt sent to the reviewer — edit it freely",
     onclick: (ev) => { if (!ev.target.closest(".inq-prompt-reset")) refs.prompt.classList.toggle("open"); },
   },
     el("span", { class: "caret", text: "▸" }),
-    el("span", { text: "system prompt the model ran under" }),
+    el("span", { text: "exact prompt sent to the reviewer" }),
     size, reset,
   );
 
@@ -193,28 +212,24 @@ function renderTranscript() {
   const turns = conversations.get(current.id).turns;
   const showingPending = busy && busyId === current.id;
   refs.body.textContent = "";
-  for (const turn of turns) refs.body.appendChild(bubble(turn));
-  // Until the first follow-up, invite one below the seeded call — the seed
-  // turns above are the step's own input/output, so the model picks up there.
-  const hasFollowup = turns.some((t) => !t.seed);
-  if (!hasFollowup && !showingPending) {
+  if (!turns.length && !showingPending) {
     refs.body.appendChild(el("div", { class: "inq-hint" },
       el("div", { text:
-        "Continue the conversation with the model that ran this step — it picks up right where it left off and replies in plain prose (not the step's JSON). Ask it anything." }),
+        "Ask why the subject model made a choice in this step. Expand the prompt above to see (and edit) the exact bytes the reviewer receives." }),
       el("div", { class: "inq-suggest" }, SUGGESTIONS.map((s) =>
         el("button", { class: "inq-chip", text: s, onclick: () => sendTurn(s) }))),
     ));
   }
+  for (const turn of turns) refs.body.appendChild(bubble(turn));
   if (showingPending) refs.body.appendChild(pendingBubble());
   refs.body.scrollTop = refs.body.scrollHeight;
 }
 
 function bubble(turn) {
-  const seed = turn.seed ? " seed" : "";
   if (turn.role === "user") {
-    return el("div", { class: `inq-msg user${seed}` }, el("div", { class: "inq-bubble", text: turn.content }));
+    return el("div", { class: "inq-msg user" }, el("div", { class: "inq-bubble", text: turn.content }));
   }
-  const wrap = el("div", { class: `inq-msg assistant${seed}${turn.error ? " error" : ""}` });
+  const wrap = el("div", { class: `inq-msg assistant${turn.error ? " error" : ""}` });
   wrap.appendChild(el("div", { class: "inq-bubble", text: turn.content }));
   if (turn.reasoning) {
     const pre = el("pre", { class: "inq-reasoning", text: turn.reasoning, style: "display:none" });
@@ -226,17 +241,7 @@ function bubble(turn) {
         tog.textContent = shown ? "▸ thinking" : "▾ thinking";
       },
     });
-    const actions = el("div", { class: "inq-think-actions" }, tog);
-    // The seed turn IS this step — its reasoning has the always-visible footer
-    // "↩ reasoning" button, so per-bubble inject is only for follow-up replies.
-    if (!turn.seed) {
-      actions.appendChild(el("button", {
-        class: "inq-think-inject", text: "→ message",
-        title: "drop this reply's reasoning into the message box to quote, edit, or ask about it",
-        onclick: () => injectReasoning(turn.reasoning),
-      }));
-    }
-    wrap.appendChild(actions);
+    wrap.appendChild(tog);
     wrap.appendChild(pre);
   }
   return wrap;
@@ -246,7 +251,7 @@ function pendingBubble() {
   return el("div", { class: "inq-msg assistant pending" },
     el("div", { class: "inq-bubble" },
       el("span", { class: "inq-dots" }, el("i"), el("i"), el("i")),
-      el("span", { text: "thinking…" }),
+      el("span", { text: "analyzing the step…" }),
     ),
   );
 }
@@ -256,32 +261,12 @@ function syncBusyControls() {
   refs.sendBtn.disabled = busy;
   refs.sendBtn.textContent = busy ? "thinking…" : "ask";
   refs.input.disabled = busy;
-  refs.reasonBtn.disabled = busy || !current?.call?.reasoning;
 }
 
 function setBusy(on, id) {
   busy = on;
   busyId = on ? id : null;
   syncBusyControls();
-}
-
-// Drop a reasoning trace into the message box so it can be quoted, edited, or
-// asked about before sending. Splices at the caret when the box is focused,
-// else appends; pads with newlines so the block keeps its own lines.
-function injectReasoning(text) {
-  if (!refs || !text) return;
-  const input = refs.input;
-  const focused = document.activeElement === input;
-  const start = focused ? input.selectionStart : input.value.length;
-  const end = focused ? input.selectionEnd : input.value.length;
-  const before = input.value.slice(0, start);
-  const after = input.value.slice(end);
-  const lead = before && !before.endsWith("\n") ? "\n" : "";
-  const tail = after && !after.startsWith("\n") ? "\n" : "";
-  input.value = before + lead + text + tail + after;
-  const caret = before.length + lead.length + text.length;
-  input.focus();
-  input.setSelectionRange(caret, caret);
 }
 
 async function sendTurn(preset) {
@@ -298,9 +283,7 @@ async function sendTurn(preset) {
   let error = null;
   try {
     result = await api.inquire({
-      model: conv.model,
-      // The step's own system prompt (editable in the panel) + its full
-      // conversation so far — sent verbatim, continued by the step's own model.
+      // The exact, possibly-edited prompt shown in the panel — verbatim.
       system: conv.system,
       messages: conv.turns.map((t) => ({ role: t.role, content: t.content })),
     });

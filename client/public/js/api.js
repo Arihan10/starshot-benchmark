@@ -70,9 +70,10 @@ export const api = {
   // (null/undefined keeps its current mode).
   resume: (run, slot, model, stepped = null) =>
     request(cellPath(slot, model, "/resume"), { method: "POST", params: { run, stepped } }),
-  // `auto` runs the cell to completion; `until` fast-forwards to the next run
-  // of that step and pauses there. A plain step (neither) advances one call —
-  // queued if the cell is mid-call, so a "step all" never skips a slow model.
+  // `auto` runs the cell to completion; `until` runs THROUGH the next call of
+  // that step (it executes), pausing before the following one. A plain step
+  // (neither) advances one call — queued if the cell is mid-call, so a "step
+  // all" never skips a slow model.
   cellStep: (run, slot, model, { auto = false, until = null } = {}) =>
     request(cellPath(slot, model, "/step"), { method: "POST", params: { run }, body: { auto, until } }),
   stepAll: (run, { auto = false, until = null } = {}) =>
@@ -175,9 +176,10 @@ export const api = {
     request(cellPath(slot, model, "/branch"), { method: "POST", params: { run }, body }),
   // Every TOP-LEVEL sim branch of a run (children/fan-out previews excluded).
   listBranches: (run) => request(`/runs/${encodeURIComponent(run)}/branches`, { params: { run } }),
-  // `auto` runs the branch to completion; `until` (a template id) fast-forwards
-  // it to the next call of that step. A plain step queues if the branch is
-  // mid-call (so a batch "step sims" never errors on a not-yet-gated branch).
+  // `auto` runs the branch to completion; `until` (a template id) runs it
+  // THROUGH the next call of that step (it executes), pausing before the
+  // following one. A plain step queues if the branch is mid-call (so a batch
+  // "step sims" never errors on a not-yet-gated branch).
   // `modelOverride` (a model alias) re-aims the next gated call at a chosen LLM.
   branchStep: (bid, { auto = false, until = null, model = null } = {}) =>
     request(`/branches/${encodeURIComponent(bid)}/step`, { method: "POST", body: { auto, until, model } }),
@@ -201,8 +203,10 @@ export const api = {
     }),
   // Reset the run's snapshot back to its base source version (the inverse of
   // updateRunPrompts' version-sync) — discards the lab's in-place prompt edits.
-  restoreRunPrompts: (run) =>
-    request(`/runs/${encodeURIComponent(run)}/prompt-templates/restore`, { method: "POST" }),
+  //   step → revert ONLY that step's prompt (the per-prompt revert); omit to
+  //     restore every step from the base version.
+  restoreRunPrompts: (run, step = null) =>
+    request(`/runs/${encodeURIComponent(run)}/prompt-templates/restore`, { method: "POST", params: { step } }),
   // Fork a simulation branch in each cell at its earliest call of any of
   // `steps` (non-destructive — source untouched). Replaces the old destructive
   // rerun-step.
@@ -210,9 +214,9 @@ export const api = {
     request(`/runs/${encodeURIComponent(run)}/simulate-step`, { method: "POST", body: { steps, cells } }),
 
   // --- decision inquiry ---
-  // Continue a step's own LLM conversation. `body` carries the step's `model`,
-  // its system prompt, and the running `messages` thread (seeded with the
-  // call's input + output); the reply comes from that same model. Returns
-  // {answer, reasoning, model}.
+  // Ask the reviewer (Claude Opus 4.8, xhigh) why a step's subject model
+  // decided what it did. `body` carries the client-assembled reviewer `system`
+  // (analyst framing + the step's system/input/output/reasoning grounding) plus
+  // the running `messages` thread; returns {answer, reasoning, model}.
   inquire: (body) => request("/inquire", { method: "POST", body }),
 };

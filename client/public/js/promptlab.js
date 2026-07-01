@@ -5,7 +5,7 @@
 
 import { api } from "./api.js";
 import { state, emit, on, cellKey, targetKey, cellSummary, cellBranches, branchSummaryById } from "./state.js";
-import { el, fitToggle, toast, openModal, field, fmtJson, diffPre } from "./ui.js";
+import { el, fitToggle, toast, openModal, field, fmtJson, diffPre, stepUntilSelect } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { applySceneProjection } from "./events.js";
 import { statusView } from "./status.js";
@@ -193,6 +193,9 @@ export function overridesPayload() {
 
 function renderSteps() {
   stepsEl.textContent = "";
+  // The per-step "revert to base" needs a source version to revert from; legacy
+  // runs without one only get the flag (their base can't be resolved).
+  const hasBaseVersion = !!state.runs.find((r) => r.name === state.run)?.prompt_version;
   for (const step of state.lab.templates.keys()) {
     stepsEl.appendChild(
       el("div", {
@@ -201,9 +204,48 @@ function renderSteps() {
       },
       el("span", { text: step }),
       isEdited(step) ? el("span", { class: "edited-flag", text: "●", title: "edited" }) : null,
+      hasBaseVersion ? el("button", {
+        class: "lab-step-revert",
+        text: "↩",
+        title: `revert this prompt to the run's base version — discards edits (applied or unsaved) to ${step}`,
+        onclick: (ev) => { ev.stopPropagation(); revertStepToBase(step); },
+      }) : null,
       ),
     );
   }
+}
+
+// Revert ONE step's prompt in the run's snapshot back to its base version — the
+// per-prompt form of applyToRunModal's "restore from version" (which does every
+// step at once). Discards this step's edits, applied or unsaved; other steps are
+// untouched.
+function revertStepToBase(step) {
+  const versionLabel = state.runs.find((r) => r.name === state.run)?.prompt_version;
+  openModal(`revert ${step} to base version?`, (close, setError) => ({
+    body: [
+      el("div", { class: "m-hint", text:
+        `Overwrites this run's ${step} prompt (system + user) with source version "${versionLabel}", discarding any edits — applied or unsaved — to this step. Other steps are untouched.` }),
+    ],
+    actions: [
+      el("button", { text: "cancel", onclick: close }),
+      el("button", { class: "danger", text: "revert to base", onclick: async () => {
+        try {
+          const r = await api.restoreRunPrompts(state.run, step);
+          close();
+          // The snapshot's step is the base version's template now — drop this
+          // step's draft so the editor reloads from it, then refresh templates.
+          state.lab.drafts.delete(step);
+          const payload = await api.promptTemplates(state.run);
+          state.lab.templates = new Map(payload.steps.map((s) => [s.step, s]));
+          // Reloading the open step reloads its editor from the restored base
+          // (and clears its now-stale tests); any other step just loses its flag.
+          if (state.lab.step === step) selectStep(step);
+          else renderSteps();
+          toast(`reverted ${step} to base version "${r.restored_from}"`, "ok");
+        } catch (e) { setError(e.message); }
+      } }),
+    ],
+  }));
 }
 
 // --- variable hover preview ---------------------------------------------------
@@ -274,7 +316,7 @@ function selectStep(step, { keepSelection = false } = {}) {
   // drop its progress so the new step doesn't show a phantom "testing N/M…".
   testSeq += 1;
   testBatch = null;
-  if (!keepSelection) lab.tests.clear();
+  if (!keepSelection) { lab.tests.clear(); lab.simModels.clear(); }
   const t = lab.templates.get(step);
   const d = draftFor(step);
   sysEl.value = d.system;
@@ -589,9 +631,11 @@ async function loadEvents({ silent = false } = {}) {
   // run switch, closed) — discard a stale response.
   if (!labEl.classList.contains("open") || lab.step !== payload.step) return;
   lab.events = payload.events;
-  // Drop tests whose event no longer exists (run reset, step switch, etc.).
+  // Drop tests + per-event LLM picks whose event no longer exists (run reset,
+  // step switch, etc.).
   const valid = new Set(lab.events.map((e) => targetKey(e.slot, e.model, e.index)));
   for (const k of [...lab.tests.keys()]) if (!valid.has(k)) lab.tests.delete(k);
+  for (const k of [...lab.simModels.keys()]) if (!valid.has(k)) lab.simModels.delete(k);
   const sig = eventsSignature(lab.events);
   if (silent && sig === eventsSig) return; // unchanged — leave the grid alone
   eventsSig = sig;
@@ -630,7 +674,7 @@ function steppedCellCount() {
 // list is filled lazily once `state.steps` loads.
 function makeUntilSelect() {
   const sel = el("select", { class: "step-until", style: "display:none",
-    title: "fast-forward every stepped cell to the next run of a step" },
+    title: "run every stepped cell through the next call of a step, then pause before the following one" },
     el("option", { value: "", text: "all until…" }));
   sel.addEventListener("change", () => { const v = sel.value; sel.value = ""; if (v) stepAllUntil(v); });
   return sel;
@@ -651,7 +695,7 @@ const labExitEl = makeExitBtn();
 // simulating; option list filled lazily in updateActionBar.
 function makeSimUntilSelect() {
   const sel = el("select", { class: "step-until", style: "display:none",
-    title: "fast-forward every selected simulation branch to the next call of a step" },
+    title: "run every selected simulation branch through the next call of a step, then pause before the following one" },
     el("option", { value: "", text: "step until…" }));
   sel.addEventListener("change", () => { const v = sel.value; sel.value = ""; if (v) stepSelectedBranches(v); });
   return sel;
@@ -767,6 +811,7 @@ const reviewCards = new Map(); // key -> { card, body, ev, full, preview }
 // fills and release every card's WebGL context.
 function teardownGrid() {
   reviewSeq += 1;
+  closeSimModelPopover(); // drop any floating LLM picker tied to a card
   for (const ref of reviewCards.values()) teardownCard3d(ref);
   reviewCards.clear();
   reviewGridEl.textContent = "";
@@ -923,10 +968,12 @@ function reviewCard(ev, zoneCount = 1) {
     class: "ev-scene-btn",
     style: "display:none",
     text: "simulate",
-    title: "fork a downstream simulation branch from this call — starts on its own, even while other slots are simulating",
+    title: "fork a downstream simulation from this call on each LLM picked at left (▷) — starts on its own, even while other slots are simulating",
     onclick: (e) => simulateCell(ev, e.currentTarget),
   });
   const stepBtn = makeStepBtn(ev.slot, ev.model);
+  // The LLM picker for this event's downstream sim — paired with "simulate".
+  const simModelBtn = makeSimModelBtn(ev);
   const card = el("div", { class: "rv-card" },
     el("div", { class: "rv-head" },
       el("span", { class: "rv-slot", text: ev.slot }),
@@ -941,6 +988,7 @@ function reviewCard(ev, zoneCount = 1) {
         title: "run the current prompt edit on this event",
         onclick: () => testEvents([ev]),
       }),
+      simModelBtn,
       simCellBtn,
       stepBtn,
       cmpBtn,
@@ -1205,7 +1253,8 @@ function reviewSection(label, text) {
 
 function updateActionBar() {
   const lab = state.lab;
-  const n = selectedEvents().length;
+  const events = selectedEvents();
+  const n = events.length;
   const branched = selectedBranches();
   selCountEl.textContent = `${n} event${n === 1 ? "" : "s"} selected${lab.sims.size ? ` · ${lab.sims.size} simulating` : ""}`;
   if (branched.length > 0) {
@@ -1229,8 +1278,13 @@ function updateActionBar() {
     testBtn.title = "Run the current prompt edit on every selected slot/zone and highlight the difference";
     testBtn.disabled = n === 0;
     simUntilEl.style.display = "none";
-    simBtn.textContent = "simulate downstream";
-    simBtn.title = "";
+    // One click can fan out across each event's chosen LLMs — surface the total
+    // branch count when it exceeds the event count so it's clear it's a batch.
+    const branchTotal = events.reduce((acc, ev) => acc + simModelsFor(ev).size, 0);
+    simBtn.textContent = branchTotal > n ? `simulate downstream (${branchTotal})` : "simulate downstream";
+    simBtn.title = branchTotal > n
+      ? `forks ${branchTotal} lineages across the selected events' chosen LLMs`
+      : "fork a downstream simulation from every selected event";
     simBtn.classList.remove("danger");
     simBtn.disabled = n === 0;
   }
@@ -1321,6 +1375,96 @@ async function testEvents(events) {
   }
 }
 
+// --- per-event simulation LLM selection ---------------------------------------------
+//
+// Each selected event carries its OWN set of LLMs to run downstream — picked
+// from a per-card dropdown — so one "simulate" forks a pinned lineage per model
+// and A/Bs the step across them without the detour through the compare screen.
+// Absent / empty ⇒ just the cell's base model (one branch, today's behavior).
+
+function simModelsFor(ev) {
+  const set = state.lab.simModels.get(targetKey(ev.slot, ev.model, ev.index));
+  return set && set.size ? set : new Set([ev.model]);
+}
+
+function simModelSummary(ev) {
+  const set = simModelsFor(ev);
+  return set.size === 1 ? [...set][0] : `${set.size} LLMs`;
+}
+
+// The card's "which LLMs to simulate this event on" control. A compact button
+// (the current set's summary) that opens the checkbox popover below.
+function makeSimModelBtn(ev) {
+  const btn = el("button", {
+    class: "ev-scene-btn sim-llm-btn",
+    title: "pick which LLM(s) this event's downstream simulation runs on",
+  });
+  const sync = () => { btn.textContent = `▷ ${simModelSummary(ev)} ▾`; };
+  sync();
+  btn.addEventListener("click", (e) => { e.stopPropagation(); openSimModelPopover(btn, ev, sync); });
+  return btn;
+}
+
+// A single floating model-checkbox popover (only one open at a time), anchored
+// under the clicked card button. Toggling a box rewrites the event's set live;
+// it never empties (a cleared set falls back to the cell's base model).
+let simPopEl = null;
+let simPopCleanup = null;
+
+function closeSimModelPopover() {
+  simPopCleanup?.();
+  simPopEl?.remove();
+  simPopEl = null;
+  simPopCleanup = null;
+}
+
+function openSimModelPopover(anchor, ev, onChange) {
+  if (simPopEl) { closeSimModelPopover(); return; } // same button ⇒ toggle shut
+  const k = targetKey(ev.slot, ev.model, ev.index);
+  const cur = new Set(simModelsFor(ev));
+  const commit = () => {
+    state.lab.simModels.set(k, cur.size ? new Set(cur) : new Set([ev.model]));
+    onChange();
+    updateActionBar(); // keep the action-bar "simulate (N)" count in step
+  };
+  const rowsHost = el("div", { class: "model-pop-rows" });
+  const renderRows = () => {
+    rowsHost.textContent = "";
+    for (const m of state.models) {
+      const cb = el("input", { type: "checkbox", ...(cur.has(m) ? { checked: "" } : {}) });
+      cb.addEventListener("change", () => { if (cb.checked) cur.add(m); else cur.delete(m); commit(); });
+      rowsHost.appendChild(el("label", { class: "model-pop-row" },
+        cb, el("span", { text: m }),
+        m === ev.model ? el("span", { class: "muted", text: "base" }) : null));
+    }
+  };
+  const pop = el("div", { class: "model-pop" },
+    el("div", { class: "model-pop-head" },
+      el("span", { text: "simulate on" }),
+      el("button", { class: "fit-btn", text: "base", title: "just this cell's base model",
+        onclick: () => { cur.clear(); cur.add(ev.model); commit(); renderRows(); } }),
+      el("button", { class: "fit-btn", text: "all",
+        onclick: () => { for (const m of state.models) cur.add(m); commit(); renderRows(); } })),
+    rowsHost);
+  renderRows();
+  simPopEl = pop;
+  document.body.appendChild(pop);
+  const r = anchor.getBoundingClientRect();
+  const left = Math.max(8, Math.min(r.left, window.innerWidth - pop.offsetWidth - 12));
+  let top = r.bottom + 4;
+  if (top + pop.offsetHeight > window.innerHeight - 8) top = Math.max(8, r.top - 4 - pop.offsetHeight);
+  pop.style.left = `${Math.round(left)}px`;
+  pop.style.top = `${Math.round(top)}px`;
+  const onDoc = (e) => { if (!pop.contains(e.target) && e.target !== anchor) closeSimModelPopover(); };
+  const onKey = (e) => { if (e.key === "Escape") closeSimModelPopover(); };
+  setTimeout(() => document.addEventListener("mousedown", onDoc), 0);
+  document.addEventListener("keydown", onKey);
+  simPopCleanup = () => {
+    document.removeEventListener("mousedown", onDoc);
+    document.removeEventListener("keydown", onKey);
+  };
+}
+
 // --- downstream simulation ---------------------------------------------------------
 
 // A cell already simulating: the freshest signal is the slots poll, with the
@@ -1367,40 +1511,67 @@ async function simulateDownstream() {
   await launchBranches(events, overrides);
 }
 
+// The vetted prompt-test result for an event (so a downstream sim continues
+// from EXACTLY the output the user already saw instead of re-rolling the edited
+// step). Only the base-model lineage uses it — a pinned LLM must run the step
+// itself, or the comparison wouldn't be that LLM's output.
+function seedFor(ev) {
+  const test = state.lab.tests.get(targetKey(ev.slot, ev.model, ev.index));
+  if (test?.status !== "done") return null;
+  return {
+    system: test.result.system,
+    user: test.result.user,
+    output: test.result.output,
+    reasoning: test.result.reasoning ?? "",
+    tokens_in: test.result.tokens_in,
+    tokens_out: test.result.tokens_out,
+  };
+}
+
+// Fork ONE branch of an event. `model` (an alias) pins the lineage to that LLM
+// and runs the forked step on it (the compare per-LLM lineage); omit it for the
+// base-model branch, which pauses at the forked step (and cache-hits a `seed`).
+// Tracks the branch in lab.sims; per-fork errors toast but don't abort siblings.
+async function forkOne(ev, overrides, { model = null, seed = null } = {}) {
+  try {
+    const resp = await api.createBranch(state.run, ev.slot, ev.model, {
+      event_index: ev.index,
+      step: state.lab.step,
+      overrides,
+      seed,
+      model,
+    });
+    const bid = resp.branch?.id;
+    if (bid) {
+      state.lab.sims.set(bid, {
+        id: bid, slot: ev.slot, model: ev.model,
+        eventIndex: ev.index, step: state.lab.step, node: ev.node, createdAt: performance.now(),
+      });
+      return true;
+    }
+  } catch (e) {
+    const label = model ? `${ev.slot}·${ev.model}→${model}` : `${ev.slot}·${ev.model}`;
+    toast(`${label}: ${e.message}`, "err");
+  }
+  return false;
+}
+
 async function launchBranches(events, overrides) {
   const lab = state.lab;
   simBtn.disabled = true;
   let started = 0;
   for (const ev of events) {
-    const tkey = targetKey(ev.slot, ev.model, ev.index);
-    const test = lab.tests.get(tkey);
-    const seed = test?.status === "done"
-      ? {
-          system: test.result.system,
-          user: test.result.user,
-          output: test.result.output,
-          reasoning: test.result.reasoning ?? "",
-          tokens_in: test.result.tokens_in,
-          tokens_out: test.result.tokens_out,
-        }
-      : null;
-    try {
-      const resp = await api.createBranch(state.run, ev.slot, ev.model, {
-        event_index: ev.index,
-        step: lab.step,
-        overrides,
-        seed,
-      });
-      const bid = resp.branch?.id;
-      if (bid) {
-        lab.sims.set(bid, {
-          id: bid, slot: ev.slot, model: ev.model,
-          eventIndex: ev.index, step: lab.step, node: ev.node, createdAt: performance.now(),
-        });
+    const aliases = [...simModelsFor(ev)];
+    // Just the cell's base model ⇒ today's path: one unpinned branch that
+    // pauses at the forked step and cache-hits the vetted test seed. Any other
+    // selection ⇒ a pinned lineage per LLM (each runs the forked step on its
+    // own model), so one "simulate" A/Bs the step across models.
+    if (aliases.length === 1 && aliases[0] === ev.model) {
+      if (await forkOne(ev, overrides, { seed: seedFor(ev) })) started += 1;
+    } else {
+      for (const alias of aliases) {
+        if (await forkOne(ev, overrides, { model: alias })) started += 1;
       }
-      started += 1;
-    } catch (e) {
-      toast(`${ev.slot}·${ev.model}: ${e.message}`, "err");
     }
   }
   lab.simStep = lab.step;
@@ -1456,6 +1627,7 @@ function renderSims() {
       el("span", { class: "muted", text: `${g.sims.length} LLMs` }),
       el("button", { text: "compare", title: "compare all these LLM lineages side by side in 3D",
         onclick: () => emit("open-compare", { slot: g.slot, model: g.model, step: g.step, node: g.node, index: g.eventIndex, branch: g.sims[0].id }) }),
+      simUntilSelectFor(g.sims),
       el("button", { class: "danger", text: "break out all", title: "discard every LLM lineage in this group",
         onclick: () => breakOutGroup(g) }),
     ));
@@ -1508,6 +1680,8 @@ function simRow(sim, grouped) {
   if (!grouped) {
     row.appendChild(el("button", { text: "compare", title: "live run vs this simulation, side by side in 3D",
       onclick: () => emit("open-compare", { slot: sim.slot, model: sim.model, step: sim.step, node: sim.node, index: sim.eventIndex, branch: sim.id }) }));
+    const until = simUntilSelectFor([sim]);
+    if (until) row.appendChild(until);
   }
   if (pending) {
     // One LLM call at a time: each press runs exactly the pending call.
@@ -1530,6 +1704,35 @@ function simRow(sim, grouped) {
     onclick: () => replaceSourceWithSim(sim) }));
   row.appendChild(el("button", { class: "danger", text: "break out", onclick: () => simAction(sim, "discard", row) }));
   return row;
+}
+
+// Fast-forward a SPECIFIC set of simulation branches — one zone-on-slot group,
+// or a single lineage — THROUGH the next call of `until` (it executes), pausing
+// each before the following step. The per-target mirror of stepSelectedBranches,
+// wired to the "step until…" picker beside a group's / row's compare + break-out.
+async function stepBranchesUntil(sims, until) {
+  const live = sims.filter((s) => branchSummaryById(s.id)?.status !== "done");
+  if (!live.length) return;
+  await Promise.all(live.map(async (s) => {
+    try { await api.branchStep(s.id, { until }); }
+    catch (e) { toast(`${s.slot}·${s.model}: ${e.message}`, "err"); }
+  }));
+  toast(`running ${live.length} lineage${live.length === 1 ? "" : "s"} through ${until}`, "ok");
+  emit("poll-now");
+  renderSims();
+  refreshCardScenes();
+}
+
+// A "step until…" picker scoped to `sims` (a group's lineages, or one). Null when
+// the steps aren't loaded yet or nothing in the set can still advance, so it only
+// renders where it can act.
+function simUntilSelectFor(sims) {
+  if (!state.steps.length) return null;
+  if (!sims.some((s) => branchSummaryById(s.id)?.status !== "done")) return null;
+  return stepUntilSelect(state.steps, (until) => stepBranchesUntil(sims, until), {
+    label: "step until…",
+    title: "run this zone's lineage(s) through the next call of a step, then pause before the following one",
+  });
 }
 
 // Break out of every lineage in a group at once.

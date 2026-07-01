@@ -688,6 +688,11 @@ async function loadTextForView(seq) {
   renderText(prev, cur, step, node);
 }
 
+// Whether the input/system diffs are expanded. Off by default (the panel shows
+// just the two outputs); persisted across re-renders + model switches so a poll
+// or a VIEW change doesn't re-collapse a diff the user opened.
+let textDiffsOpen = false;
+
 function renderText(prev, cur, step, node) {
   const frag = document.createDocumentFragment();
   const status = branchStatusText(curLineage() ? branchSummaryById(curLineage().branch) : null);
@@ -696,29 +701,11 @@ function renderText(prev, cur, step, node) {
     el("span", { text: `${viewLLM ?? "simulation"}: ${status.text}` }),
   ]));
 
-  if (!cur) {
-    frag.appendChild(el("div", { class: "m-hint", text:
-      `No simulation output for ${step}${node ? " @ " + node : ""} on ${viewLLM ?? "this lineage"} yet — pick LLM(s) and press “step ▶” to run it.` }));
-    if (prev) {
-      frag.appendChild(el("div", { class: "ct-sec" }, [
-        el("div", { class: "ct-h", text: "original input · this step" }),
-        el("pre", { class: "fit-full", text: prev.user || "" }),
-      ]));
-    }
-    textEl.replaceChildren(frag);
-    return;
-  }
-
-  if ((prev && prev.system) !== cur.system) {
-    frag.appendChild(el("div", { class: "ct-sec" }, [
-      el("div", { class: "ct-h", text: "system · diff (original → simulation)" }),
-      diffPre((prev && prev.system) || "", cur.system || ""),
-    ]));
-  }
-  frag.appendChild(el("div", { class: "ct-sec" }, [
-    el("div", { class: "ct-h", text: "input · diff (original → simulation)" }),
-    diffPre((prev && prev.user) || "", cur.user || ""),
-  ]));
+  // Default view: the two outputs side by side. The lineage picked on the right
+  // (VIEW) drives the "simulation" column, so switching models swaps it.
+  const simText = cur
+    ? fmtJson(cur.output)
+    : `not run on ${viewLLM ?? "this lineage"} yet — pick LLM(s) + “step ▶”.`;
   frag.appendChild(el("div", { class: "ct-grid" }, [
     el("div", { class: "ct-sec" }, [
       el("div", { class: "ct-h", text: "original output" }),
@@ -726,9 +713,44 @@ function renderText(prev, cur, step, node) {
     ]),
     el("div", { class: "ct-sec" }, [
       el("div", { class: "ct-h", text: `simulation output${viewLLM ? " · " + viewLLM : ""}` }),
-      el("pre", { class: "fit-full", text: fmtJson(cur.output) }),
+      el("pre", { class: "fit-full", text: simText }),
     ]),
   ]));
+
+  // The input / system diffs are tucked behind an expander — collapsed by
+  // default, only built when there's something to show.
+  const diffs = el("div", { class: "ct-diffs", style: textDiffsOpen ? "" : "display:none" });
+  if (cur) {
+    if (((prev && prev.system) || "") !== (cur.system || "")) {
+      diffs.appendChild(el("div", { class: "ct-sec" }, [
+        el("div", { class: "ct-h", text: "system · diff (original → simulation)" }),
+        diffPre((prev && prev.system) || "", cur.system || ""),
+      ]));
+    }
+    diffs.appendChild(el("div", { class: "ct-sec" }, [
+      el("div", { class: "ct-h", text: "input · diff (original → simulation)" }),
+      diffPre((prev && prev.user) || "", cur.user || ""),
+    ]));
+  } else if (prev) {
+    diffs.appendChild(el("div", { class: "ct-sec" }, [
+      el("div", { class: "ct-h", text: "original input · this step" }),
+      el("pre", { class: "fit-full", text: prev.user || "" }),
+    ]));
+  }
+  if (diffs.childNodes.length) {
+    const label = (open) => (open ? "hide input / system diff ▴" : "show input / system diff ▾");
+    const toggle = el("button", {
+      class: "cmp-step-btn ct-expand",
+      text: label(textDiffsOpen),
+      onclick: () => {
+        textDiffsOpen = !textDiffsOpen;
+        diffs.style.display = textDiffsOpen ? "" : "none";
+        toggle.textContent = label(textDiffsOpen);
+      },
+    });
+    frag.appendChild(toggle);
+    frag.appendChild(diffs);
+  }
   textEl.replaceChildren(frag);
 }
 

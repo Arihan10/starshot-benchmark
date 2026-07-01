@@ -239,8 +239,8 @@ class CellGate:
         self.budget = budget
         self._fut: asyncio.Future[dict[str, object]] | None = None
         self.auto = False  # once set, the rest of the run proceeds without pausing
-        # Fast-forward target: pass every call until one with this TEMPLATE comes
-        # up, then pause right before it ("run to breakpoint at step X").
+        # Fast-forward target: pass every call up to AND INCLUDING one with this
+        # TEMPLATE, then pause before the NEXT call ("run THROUGH step X").
         self.until_step: str | None = None
         self.pending: dict[str, object] | None = None
         # The call CURRENTLY in flight — released from a pause, or run on a
@@ -266,16 +266,21 @@ class CellGate:
         if self.auto:
             self.current = call
             return self.model_override
-        # Seeking a target step: blow past everything else, then stop AT it.
-        # `until_step` is a template id (the lab's granular step name), so match
-        # on `template` (root/nested variants differ there, not in `step`).
+        # Seeking a target step: blow past every call up to AND INCLUDING the
+        # target, then pause at the NEXT one — "step until X" runs THROUGH X (X
+        # finishes executing) and stops before whatever follows it. `until_step`
+        # is a template id (the lab's granular step name), so match on `template`
+        # (root/nested variants differ there, not in `step`).
         if self.until_step is not None:
             if (template or step) == self.until_step:
-                self.until_step = None  # arrived — fall through and pause here
-            else:
-                self.current = call
-                return self.model_override
-        elif self.budget > 0:
+                # Reached the target: run it now (don't pause before it), then
+                # disarm so the NEXT call hits the pause below. Drop any queued
+                # step credits too, so the breakpoint can't be skipped past.
+                self.until_step = None
+                self.budget = 0
+            self.current = call
+            return self.model_override
+        if self.budget > 0:
             self.budget -= 1
             self.current = call
             return self.model_override
@@ -379,16 +384,14 @@ class InquiryMessage(BaseModel):
 
 
 class InquiryRequest(BaseModel):
-    """One turn in a persistent "continue this step's conversation" thread. The
-    client seeds the thread with the step's OWN call — its exact system prompt,
-    the user message it received, and the output it produced — then carries the
-    running conversation forward in `messages` (which MUST end with the new user
-    turn). `model` is the step's own model, so the reply comes from the very LLM
-    that made the decision, picking up where it left off — no analyst persona,
-    no appended grounding. Stateless: the endpoint reads no cell state, so it
-    serves source and simulation-branch calls alike."""
+    """One turn in a persistent "why did the model do this?" conversation about
+    a pipeline step. The client assembles and OWNS the reviewer's full system
+    prompt — the analyst framing plus that step's exact system / input / output
+    / reasoning — and sends it verbatim as `system`, so what the panel shows
+    (prefilled and editable) is byte-for-byte what is sent. `messages` is the
+    running thread and MUST end with the new user turn. Stateless: the endpoint
+    reads no cell state, so it serves source and simulation-branch calls alike."""
 
-    model: str
     system: str = ""
     messages: list[InquiryMessage]
 
@@ -429,8 +432,8 @@ class BranchRequest(BaseModel):
 
 class BranchStepRequest(BaseModel):
     """Advance a gated cell/branch. `auto=True` runs the rest to completion;
-    `until` (a template id) fast-forwards a source cell to the next call of
-    that step and pauses there. `model` (a model ALIAS) re-aims a branch's next
+    `until` (a template id) fast-forwards THROUGH the next call of that step
+    (it executes) and pauses before the following one. `model` (a model ALIAS) re-aims a branch's next
     gated call at a chosen LLM — compare's per-step model A/B — independent of
     the model that produced the pre-branch scene; None keeps the branch's
     current model."""
@@ -818,30 +821,14 @@ def _require_step_event(
 
 # --- decision inquiry -------------------------------------------------------
 #
-# "Why did the model do this?" — a persistent, free-form chat that CONTINUES the
-# step's own LLM call. The client seeds the thread with that call's exact system
-# prompt, input, and output, then forwards each new turn here; the reply comes
-# from the very model that ran the step (req.model), picking up the conversation
-# where it left off. No analyst persona, no re-grounding: the conversation
-# history is sent unchanged.
-#
-# The one thing appended is FREEFORM_CONTINUATION — and only to the system
-# message. The pipeline's system prompts mandate a strict JSON-only answer
-# ("respond with a single JSON object… no prose"), and the seeded assistant turn
-# IS that JSON, so without releasing that constraint the model just keeps
-# emitting the step's output schema (useless for a conversation). This frees the
-# remaining turns to be plain prose while the message history stays untouched.
-# Stateless: no run state is read or mutated, so it serves source and
-# simulation-branch calls alike.
-FREEFORM_CONTINUATION = (
-    "\n\n---\n"
-    "The structured-output task above is COMPLETE. Everything below is a free-form "
-    "conversation with a developer reviewing the decision you just made. For the rest "
-    "of this conversation, DISREGARD any instruction above to answer only in JSON, to "
-    "conform to a fixed schema, or to avoid prose — those governed the task output "
-    "above, not this discussion. Reply in plain, conversational prose (no JSON, no code "
-    "fences) and answer the developer's questions directly, explaining your earlier work."
-)
+# "Why did the model do this?" — a persistent conversation answered by a fixed
+# strong reviewer so analysis quality is constant across whatever subject model
+# is being benchmarked. The reviewer's full prompt (analyst framing + the step's
+# exact system / input / output / reasoning) is assembled and shown CLIENT-SIDE
+# in an editable, prefilled box, so the user sees byte-for-byte what gets sent;
+# this endpoint just pins the reviewer model and forwards. The reviewer is
+# Claude Opus 4.8 at xhigh reasoning regardless of which model ran the step.
+INQUIRY_MODEL = "anthropic/claude-opus-4.8"
 
 
 # --- prompt inspector -------------------------------------------------------
@@ -1519,36 +1506,24 @@ def create_app() -> FastAPI:
 
     @app.post("/inquire")
     async def inquire(req: InquiryRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        """Continue a step's own conversation: seeded client-side with that
-        call's system / input / output, `messages` carries the running thread
-        and MUST end with the new user turn, and the reply comes from `model` —
-        the very LLM that made the step. The step's system prompt is sent with
-        FREEFORM_CONTINUATION appended so the model answers in prose instead of
-        the step's JSON schema; the message history is sent unchanged. Stateless:
-        no run state is touched."""
-        if not req.model:
-            raise HTTPException(status_code=400, detail="no model to continue the step's call with")
+        """Ask the reviewer (Claude Opus 4.8, xhigh reasoning) the latest
+        question in an inquiry thread, and keep asking — the client carries the
+        conversation forward in `messages`, so the thread is persistent. `system`
+        is the exact, client-assembled prompt (analyst framing + the step's
+        grounding — shown and editable in the panel). Stateless: nothing about
+        any run is read or mutated."""
         if not req.messages or req.messages[-1].role != "user":
             raise HTTPException(
                 status_code=400,
                 detail="messages must be non-empty and end with a user turn",
             )
         convo = [{"role": m.role, "content": m.content} for m in req.messages]
-        # Continue at the effort the step's model runs at in the pipeline (mirrors
-        # llm._reasoning_effort): GPT stays at medium (xhigh is slow + costly
-        # there), every other provider at xhigh.
-        effort = "medium" if req.model.startswith("openai/") else "xhigh"
         try:
-            answer, reasoning = await llm.chat(
-                model=req.model,
-                system=req.system + FREEFORM_CONTINUATION,
-                messages=convo,
-                reasoning_effort=effort,
-            )
+            answer, reasoning = await llm.chat(model=INQUIRY_MODEL, system=req.system, messages=convo)
         except Exception as e:
             # Provider/transport failure → clean 502 the panel shows inline.
             raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
-        return {"answer": answer, "reasoning": reasoning, "model": req.model}
+        return {"answer": answer, "reasoning": reasoning, "model": INQUIRY_MODEL}
 
     @app.get("/runs/{run}/prompt-templates")
     async def run_prompt_templates(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -2527,8 +2502,8 @@ def create_app() -> FastAPI:
         paused at a live gate, mid-call, or sitting paused with no task (the
         "move the whole experiment forward" action). Each gets ONE queued step
         (so none is skipped for being mid-call), keeping the run in lockstep.
-        `auto=true` runs them all to completion; `until=<step>` fast-forwards
-        them all to the next call of that step."""
+        `auto=true` runs them all to completion; `until=<step>` runs them all
+        THROUGH the next call of that step, pausing before the following one."""
         if until is not None and until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {until}")
         results: dict[str, list[str]] = {}
@@ -2546,9 +2521,10 @@ def create_app() -> FastAPI:
         """Advance a simulation branch by one LLM call. Like the source
         "step", this QUEUES a credit when the branch is mid-call (so a batch
         "step sims" never errors on a branch that isn't sitting at a gate),
-        runs it to completion with `auto`, or fast-forwards to the next call of
-        `until` and pauses there. `model` (an alias) re-aims the next gated call
-        at a chosen LLM. 409 only when there's genuinely nothing to advance."""
+        runs it to completion with `auto`, or fast-forwards THROUGH the next
+        call of `until` (it executes) and pauses before the following one.
+        `model` (an alias) re-aims the next gated call at a chosen LLM. 409 only
+        when there's genuinely nothing to advance."""
         _require_branch(branch_id)
         if req.until is not None and req.until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
@@ -2696,12 +2672,13 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/runs/{run}/prompt-templates/restore")
-    async def restore_run_prompts(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def restore_run_prompts(run: str, step: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Reset the run's prompt snapshot back to its base version — the
         inverse of the `update_version` sync (which pushes the run's snapshot
-        ONTO the version). Hard-replaces every step template in the run's
-        snapshot with the source version's, discarding the prompt lab's in-place
-        edits. Running cells keep the templates they launched with; every later
+        ONTO the version). With `step`, revert ONLY that step's templates (the
+        per-prompt revert); without it, hard-replace every step. Either way this
+        discards the prompt lab's in-place edits to the reverted step(s).
+        Running cells keep the templates they launched with; every later
         relaunch/rerun/resume renders the restored bytes."""
         _require_run_prompts(run)
         version = _run_meta(run).get("prompt_version")
@@ -2713,14 +2690,20 @@ def create_app() -> FastAPI:
                     + (f" — {version!r} no longer exists" if isinstance(version, str) and version else "")
                 ),
             )
+        if step is not None and step not in prompt_store.STEPS:
+            raise HTTPException(status_code=404, detail=f"unknown step: {step}")
         run_snapshot = _run_dir(run) / prompt_store.RUN_PROMPTS_SUBDIR
+        version_dir = prompt_store.VERSIONS_DIR / version
         try:
             # dest = the run snapshot, src = the base version: the exact reverse
-            # of the `update_version` sync above.
-            prompt_store.sync_templates(run_snapshot, prompt_store.VERSIONS_DIR / version)
+            # of the `update_version` sync above — one step, or all of them.
+            if step is None:
+                prompt_store.sync_templates(run_snapshot, version_dir)
+            else:
+                prompt_store.restore_step(run_snapshot, version_dir, step)
         except prompt_store.PromptTemplateError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        return {"run": run, "restored_from": version}
+        return {"run": run, "restored_from": version, "step": step}
 
     @app.post("/runs/{run}/simulate-step")
     async def simulate_step(  # pyright: ignore[reportUnusedFunction]
@@ -3140,7 +3123,8 @@ def _objects_dir(cell_dir: Path) -> Path:
 async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None) -> str:
     """Advance a stepped source cell. Three modes:
       * `auto`   — run it to completion, ungated.
-      * `until`  — fast-forward to the next call of template `until`, pause there.
+      * `until`  — run THROUGH the next call of template `until` (it executes),
+                   pausing before the call after it.
       * default  — advance by exactly one LLM call.
 
     Works from EITHER state, which is what keeps a multi-model run in sync:
@@ -3160,7 +3144,11 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
             return "stepped"
         if until is not None:
             if gate.pending and gate.pending.get("template") == until:
-                return "at_target"  # already paused right at it
+                # Paused right BEFORE the target. "Through X" means run exactly
+                # this call, then pause at the next — a single step from here.
+                # (Re-seeking would skip past it to the NEXT occurrence of X.)
+                gate.proceed()
+                return "stepped"
             gate.until_step = until
             gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
             return "seeking"
@@ -3193,8 +3181,8 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
     branch isn't sitting at a live gate.
       * live gate: release a current pause, else QUEUE a credit (budget++) the
         branch spends at its next gate — so a branch mid-call isn't skipped.
-      * `auto` runs it to completion; `until` fast-forwards to the next call of
-        that template and pauses there.
+      * `auto` runs it to completion; `until` runs THROUGH the next call of that
+        template (it executes) and pauses before the call after it.
       * `model` (an OpenRouter id) re-aims the next gated call at a chosen LLM —
         sticky on the gate until changed, so the same scene context can be
         tested against different models.
@@ -3216,7 +3204,10 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
             return "stepped"
         if until is not None:
             if gate.pending and gate.pending.get("template") == until:
-                return "at_target"
+                # Paused right BEFORE the target — "through X" is a single step
+                # from here (re-seeking would skip to the NEXT occurrence of X).
+                gate.proceed()
+                return "stepped"
             gate.until_step = until
             gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
             return "seeking"
