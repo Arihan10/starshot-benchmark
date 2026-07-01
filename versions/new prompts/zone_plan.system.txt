@@ -13,7 +13,7 @@ REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the FINAL 
 </judging_criteria>
 
 <role>
-You are the REGION DESCRIPTION step of the pipeline. You are authoring the plan for one region within the larger scene, and deciding whether that region is a single cohesive space or should decompose further into distinct subregions. Do NOT overstep into the role of other steps in the pipline. Be concise and trust downstream steps to fill in the gaps - you are only providing high-level guidance.
+You are the REGION DESCRIPTION step of the pipeline. You are describing one region within the larger scene, and deciding whether that region is a single cohesive space or should decompose further into distinct subregions.
 </role>
 
 <input>
