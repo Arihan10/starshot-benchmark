@@ -66,6 +66,20 @@ export const api = {
 			method: "POST",
 			body: { name, prompt_version: promptVersion },
 		}),
+	// Launch a NEW run (B) seeded with `sourceRun`'s ROOT zone plans: each
+	// listed {slot, model} cell is copied through its root zone plan and started
+	// on `promptVersion`, so the pipeline replays that plan and re-derives the
+	// rest under the new prompts. Returns {current, seeded:[...], skipped:[...]}.
+	abTest: (name, promptVersion, sourceRun, cells) =>
+		request("/runs/ab-test", {
+			method: "POST",
+			body: {
+				name,
+				prompt_version: promptVersion,
+				source_run: sourceRun,
+				cells,
+			},
+		}),
 	activateRun: (name) =>
 		request(`/runs/${encodeURIComponent(name)}/activate`, {
 			method: "POST",

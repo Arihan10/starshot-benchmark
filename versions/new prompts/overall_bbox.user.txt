@@ -6,4 +6,4 @@ An upstream step has already fleshed this out in more detail and devised a high-
 
 `{ROOT_PLAN}`
 
-Produce the overall bounding box for the whole scene.
+Based on what the scene is and how you think downstream steps might populate it, produce a realistically sized and shaped overall bounding box for the whole scene.

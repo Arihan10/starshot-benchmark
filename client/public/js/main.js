@@ -333,6 +333,114 @@ function startCellsModal() {
   }));
 }
 
+// Launch a new run (B) that reuses this run's ROOT zone plans: pick the cells
+// to carry over + a prompt version, and each cell is re-run from just after its
+// root zone plan under the new version (the plan is held fixed, everything
+// below it regenerates). Server seeds only cells with a committed plan.
+async function abTestModal() {
+  if (!state.run) return;
+  const sourceRun = state.run;
+  const candidates = [];
+  for (const slot of state.slots) {
+    for (const m of state.models) {
+      const c = slot.runs?.[m];
+      if (c && (c.events_count ?? 0) > 0) {
+        candidates.push({ slot: slot.id, model: m, status: c.status ?? "idle", events: c.events_count ?? 0 });
+      }
+    }
+  }
+  if (!candidates.length) {
+    toast(`no started cells in "${sourceRun}" to A/B from`, "err");
+    return;
+  }
+  let versions = [];
+  try {
+    versions = (await api.versions()).versions.map((v) => v.name);
+  } catch (e) {
+    toast(`failed to load prompt versions: ${e.message}`, "err");
+    return;
+  }
+  const nameInput = el("input", { type: "text", placeholder: "e.g. ab-newplan" });
+  const versionSel = el("select", {}, versions.map((v) => el("option", { value: v, text: v })));
+  const activeVersion = state.runs.find((r) => r.name === sourceRun)?.prompt_version;
+  if (activeVersion && versions.includes(activeVersion)) versionSel.value = activeVersion;
+
+  // Same fork-a-fresh-version affordance as "new run", so the A/B can be run on
+  // a brand-new version copied from the base (then iterated in the prompt lab).
+  const forkCheck = el("input", { type: "checkbox" });
+  const forkName = el("input", { type: "text", placeholder: "e.g. root-plan-rewrite" });
+  const forkRow = el("div", { class: "m-field", style: "display:none" },
+    el("span", { text: "new version name (forked from the selection above)" }),
+    forkName,
+  );
+  forkCheck.addEventListener("change", () => { forkRow.style.display = forkCheck.checked ? "" : "none"; });
+
+  const cellChecks = candidates.map((c) =>
+    el("label", {},
+      el("input", { type: "checkbox", value: `${c.slot}|${c.model}`, checked: "" }),
+      el("span", { class: `dot ${c.status}` }),
+      el("span", { text: `${c.slot} · ${c.model}` }),
+      el("span", { class: "muted", style: "margin-left:auto", text: `${c.events} ev` }),
+    ));
+
+  openModal("launch A/B test", (close, setError) => ({
+    body: [
+      field("run name (B)", nameInput),
+      field("prompt version (or fork base)", versionSel),
+      el("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text-dim)" },
+        forkCheck, "create a NEW version from it for this run (iterate it in the prompt lab)"),
+      forkRow,
+      el("div", { class: "m-field" },
+        el("span", { text: `cells to A/B from “${sourceRun}” (keeps each cell's root zone plan)` }),
+        el("div", { class: "check-grid" }, cellChecks)),
+      el("div", { class: "m-hint", text: "Run B copies each selected cell's log up to its root zone plan, then re-runs from there on the chosen version — the plan is held fixed, everything below it regenerates. Cells without a committed plan are skipped." }),
+    ],
+    actions: [
+      el("button", { text: "cancel", onclick: close }),
+      el("button", { class: "primary", text: "create & launch", onclick: async () => {
+        const name = nameInput.value.trim();
+        if (!name) { setError("name the new run"); return; }
+        const cells = cellChecks
+          .filter((l) => l.firstChild.checked)
+          .map((l) => {
+            const v = l.firstChild.value;
+            const i = v.lastIndexOf("|"); // slot ids may contain spaces but never "|"
+            return { slot: v.slice(0, i), model: v.slice(i + 1) };
+          });
+        if (!cells.length) { setError("pick at least one cell"); return; }
+        try {
+          let version = versionSel.value;
+          if (forkCheck.checked) {
+            const newName = forkName.value.trim();
+            if (!newName) { setError("name the new version (or untick the fork option)"); return; }
+            await api.forkVersion(newName, versionSel.value);
+            version = newName;
+          }
+          const payload = await api.abTest(name, version, sourceRun, cells);
+          close();
+          const nSeeded = payload.seeded?.length ?? 0;
+          const nSkipped = payload.skipped?.length ?? 0;
+          toast(
+            `A/B run :: ${payload.current} — launched ${nSeeded} cell${nSeeded === 1 ? "" : "s"}` +
+              (nSkipped ? ` (skipped ${nSkipped} without a plan)` : ""),
+            "ok",
+          );
+          await refreshRuns();
+          state.run = payload.current;
+          // Brand-new run → clean prompt lab + no stale board selection.
+          resetLabSession();
+          state.selection.clear();
+          state.selectMode = false;
+          emit("selection");
+          try { localStorage.setItem(LAST_RUN_KEY, payload.current); } catch { /* ignore */ }
+          renderRunPicker();
+          await refreshSlots();
+        } catch (e) { setError(e.message); }
+      } }),
+    ],
+  }));
+}
+
 function resetAllModal() {
   if (!state.run) return;
   // Every started cell on this run (anything with logged events, or a live
@@ -377,6 +485,7 @@ function resetAllModal() {
 document.getElementById("btn-new-run").addEventListener("click", newRunModal);
 document.getElementById("btn-start-cells").addEventListener("click", startCellsModal);
 document.getElementById("btn-reset-all").addEventListener("click", resetAllModal);
+document.getElementById("btn-ab-test").addEventListener("click", abTestModal);
 
 // --- boot ------------------------------------------------------------------------
 

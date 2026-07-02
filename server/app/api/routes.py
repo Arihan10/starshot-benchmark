@@ -558,6 +558,37 @@ class SaveRunRequest(BaseModel):
     version_label: str | None = None
 
 
+class AbTestCell(BaseModel):
+    slot: str
+    model: str
+
+
+class AbTestRequest(BaseModel):
+    """Launch a NEW run seeded with `source_run`'s ROOT zone plans. Each
+    listed (slot, model) cell's log is copied through its root
+    `divider.zone_plan` and no further; the cell is then started on
+    `prompt_version`, so the resumable divider replays that one committed
+    plan verbatim (committed.zone_plan) and re-derives everything below it
+    under the new prompts — a prompt A/B that holds the top-level plan fixed
+    and varies the whole scene beneath it."""
+
+    name: str
+    prompt_version: str
+    source_run: str
+    cells: list[AbTestCell]
+
+
+def _root_plan_cut(events: list[dict[str, object]]) -> int | None:
+    """Leading-event count to keep so a copy holds through the ROOT zone plan
+    and nothing after — the position of the root `divider.zone_plan` event + 1,
+    or None if this cell never planned its root. A true prefix, so the copied
+    events keep `index == line` and a resumed `log()` continues cleanly."""
+    for i, e in enumerate(events):
+        if e.get("kind") == "divider.zone_plan" and e.get("node") == "root":
+            return i + 1
+    return None
+
+
 def _run_id(run: str, slot_id: str, model_alias: str) -> str:
     """Composite id used as `run_id` in pipeline code (divider, generation,
     threed queue, SlotLog.slot_id). The slashes make it work as a filesystem
@@ -3341,6 +3372,94 @@ def create_app() -> FastAPI:
         global _current_run
         _current_run = name
         return {"current": name, "copied": copied, "skipped": skipped}
+
+    @app.post("/runs/ab-test")
+    async def ab_test_run(req: AbTestRequest) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Launch a NEW run (B) seeded with a source run's ROOT zone plans.
+        Each selected (slot, model) cell's log is copied through its root
+        `divider.zone_plan` and nothing else, then the cell is started on the
+        chosen prompt version. The resumable divider replays that one committed
+        plan verbatim and re-derives the whole scene below it under B's
+        prompts — an A/B that holds the top-level plan fixed and varies
+        everything downstream. Non-destructive to the source run (read-only)."""
+        name = req.name.strip()
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid run name")
+        version = req.prompt_version.strip()
+        if not prompt_store.version_exists(version):
+            raise HTTPException(status_code=404, detail=f"unknown prompt version: {version}")
+        try:
+            prompt_store.validate_version(version)
+        except prompt_store.PromptTemplateError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        if not _run_dir(req.source_run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown source run: {req.source_run}")
+        run_dir = _run_dir(name)
+        if run_dir.exists():
+            raise HTTPException(status_code=409, detail=f"run already exists: {name}")
+        # Read source cells from memory (idempotent hydrate) so a still-running
+        # source run's live log can't hand us a torn final line.
+        _hydrate_run(req.source_run)
+
+        run_dir.mkdir(parents=True)
+        try:
+            prompt_store.snapshot_into_run(version, run_dir)
+        except Exception:
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise
+        (run_dir / RUN_META_NAME).write_text(
+            json.dumps(
+                {
+                    "prompt_version": version,
+                    "created_at": datetime.now().isoformat(timespec="seconds"),
+                    "ab_from": req.source_run,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        seeded: list[tuple[str, str]] = []
+        skipped: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for cell in req.cells:
+            key = (cell.slot, cell.model)
+            if key in seen:
+                continue
+            seen.add(key)
+            if cell.slot not in SLOTS_BY_ID or cell.model not in MODELS:
+                skipped.append(f"{cell.slot}/{cell.model}")
+                continue
+            src = _slot_logs.get((req.source_run, cell.slot, cell.model))
+            events = src.state["events"] if src is not None else []
+            cut = _root_plan_cut(events)
+            if cut is None:
+                skipped.append(f"{cell.slot}/{cell.model}")
+                continue
+            dest = _slot_dir(name, cell.slot, cell.model)
+            dest.mkdir(parents=True, exist_ok=True)
+            with (dest / "events.jsonl").open("w", encoding="utf-8") as f:
+                for e in events[:cut]:
+                    f.write(json.dumps(e) + "\n")
+            seeded.append(key)
+        if not seeded:
+            # Nothing to launch — don't leave an empty A/B run behind.
+            shutil.rmtree(run_dir, ignore_errors=True)
+            raise HTTPException(
+                status_code=400,
+                detail="no selected cell had a committed root zone plan to seed from",
+            )
+        # Hydrate B (picks up the seeded prefixes) then start each seeded cell:
+        # the divider replays the copied root plan and runs the rest fresh.
+        _hydrate_run(name)
+        for slot_id, model_alias in seeded:
+            await _start_cell(name, slot_id, model_alias)
+        global _current_run
+        _current_run = name
+        return {
+            "current": name,
+            "seeded": [f"{s}/{m}" for s, m in seeded],
+            "skipped": skipped,
+        }
 
     @app.get("/versions")
     async def list_versions() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
