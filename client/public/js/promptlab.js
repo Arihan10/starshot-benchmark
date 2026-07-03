@@ -316,7 +316,7 @@ function selectStep(step, { keepSelection = false } = {}) {
   // drop its progress so the new step doesn't show a phantom "testing N/M…".
   testSeq += 1;
   testBatch = null;
-  if (!keepSelection) { lab.tests.clear(); lab.simModels.clear(); }
+  if (!keepSelection) lab.tests.clear();
   const t = lab.templates.get(step);
   const d = draftFor(step);
   sysEl.value = d.system;
@@ -631,11 +631,11 @@ async function loadEvents({ silent = false } = {}) {
   // run switch, closed) — discard a stale response.
   if (!labEl.classList.contains("open") || lab.step !== payload.step) return;
   lab.events = payload.events;
-  // Drop tests + per-event LLM picks whose event no longer exists (run reset,
-  // step switch, etc.).
+  // Drop tests whose event no longer exists (run reset, step switch, etc.). The
+  // per-cell LLM picks (simModels) are step-independent like the selection, so
+  // they persist across step switches and reset only on a run switch.
   const valid = new Set(lab.events.map((e) => targetKey(e.slot, e.model, e.index)));
   for (const k of [...lab.tests.keys()]) if (!valid.has(k)) lab.tests.delete(k);
-  for (const k of [...lab.simModels.keys()]) if (!valid.has(k)) lab.simModels.delete(k);
   const sig = eventsSignature(lab.events);
   if (silent && sig === eventsSig) return; // unchanged — leave the grid alone
   eventsSig = sig;
@@ -1002,7 +1002,7 @@ function reviewCard(ev, zoneCount = 1) {
     body,
   );
   return {
-    card, body, cmpBtn, simCellBtn, stepBtn, ev, full: null, preview: ev.output_preview,
+    card, body, cmpBtn, simCellBtn, stepBtn, simModelBtn, ev, full: null, preview: ev.output_preview,
     // 3D-grid mode: lazily-created per-card viewer + its viewport observer.
     host3d: null, viewer3d: null, io3d: null,
   };
@@ -1375,15 +1375,18 @@ async function testEvents(events) {
   }
 }
 
-// --- per-event simulation LLM selection ---------------------------------------------
+// --- per-cell simulation LLM selection ----------------------------------------------
 //
-// Each selected event carries its OWN set of LLMs to run downstream — picked
-// from a per-card dropdown — so one "simulate" forks a pinned lineage per model
-// and A/Bs the step across them without the detour through the compare screen.
-// Absent / empty ⇒ just the cell's base model (one branch, today's behavior).
+// Each selected CELL carries its own set of LLMs to run downstream — picked from
+// a per-card dropdown — so one "simulate" forks a pinned lineage per model and
+// A/Bs the step across them without the detour through the compare screen. Keyed
+// per cell (slot|model), NOT per event: every selected zone of a slot forks on
+// the SAME LLMs (in 3D the grid shows one card per cell; in text, the per-zone
+// cards of a slot share the set + label). Absent / empty ⇒ just the cell's base
+// model (one branch, today's behavior).
 
 function simModelsFor(ev) {
-  const set = state.lab.simModels.get(targetKey(ev.slot, ev.model, ev.index));
+  const set = state.lab.simModels.get(cellKey(ev.slot, ev.model));
   return set && set.size ? set : new Set([ev.model]);
 }
 
@@ -1392,16 +1395,28 @@ function simModelSummary(ev) {
   return set.size === 1 ? [...set][0] : `${set.size} LLMs`;
 }
 
-// The card's "which LLMs to simulate this event on" control. A compact button
+const simModelLabel = (ev) => `▷ ${simModelSummary(ev)} ▾`;
+
+// Re-sync the picker button label on EVERY card of this cell — the set is per
+// cell, so a text-mode slot's several zone cards must all track an edit made
+// from any one of them (in 3D there's a single card per cell).
+function syncSimModelBtns(slot, model) {
+  for (const ref of reviewCards.values()) {
+    if (ref.simModelBtn && ref.ev.slot === slot && ref.ev.model === model) {
+      ref.simModelBtn.textContent = simModelLabel(ref.ev);
+    }
+  }
+}
+
+// The card's "which LLMs to simulate this cell on" control. A compact button
 // (the current set's summary) that opens the checkbox popover below.
 function makeSimModelBtn(ev) {
   const btn = el("button", {
     class: "ev-scene-btn sim-llm-btn",
-    title: "pick which LLM(s) this event's downstream simulation runs on",
+    text: simModelLabel(ev),
+    title: "pick which LLM(s) this slot's downstream simulations run on — shared across the slot's selected zones",
   });
-  const sync = () => { btn.textContent = `▷ ${simModelSummary(ev)} ▾`; };
-  sync();
-  btn.addEventListener("click", (e) => { e.stopPropagation(); openSimModelPopover(btn, ev, sync); });
+  btn.addEventListener("click", (e) => { e.stopPropagation(); openSimModelPopover(btn, ev); });
   return btn;
 }
 
@@ -1418,13 +1433,13 @@ function closeSimModelPopover() {
   simPopCleanup = null;
 }
 
-function openSimModelPopover(anchor, ev, onChange) {
+function openSimModelPopover(anchor, ev) {
   if (simPopEl) { closeSimModelPopover(); return; } // same button ⇒ toggle shut
-  const k = targetKey(ev.slot, ev.model, ev.index);
+  const k = cellKey(ev.slot, ev.model);
   const cur = new Set(simModelsFor(ev));
   const commit = () => {
     state.lab.simModels.set(k, cur.size ? new Set(cur) : new Set([ev.model]));
-    onChange();
+    syncSimModelBtns(ev.slot, ev.model); // every card of this cell shares the set
     updateActionBar(); // keep the action-bar "simulate (N)" count in step
   };
   const rowsHost = el("div", { class: "model-pop-rows" });

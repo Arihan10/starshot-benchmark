@@ -16,7 +16,7 @@
 
 import { api } from "./api.js";
 import { state, on, emit, cellSummary, cellBranches, branchSummaryById } from "./state.js";
-import { el, toast, diffPre, fmtJson } from "./ui.js";
+import { el, toast, diffPre, fmtJson, buildObjectsMenu } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { applySceneProjection, createObsModel, emittedStep } from "./events.js";
 import { renderObsTree } from "./obsmini.js";
@@ -590,10 +590,10 @@ function renderLineageBar() {
   }
 }
 
-// Per-side visibility layers, overlaid on each canvas.
+// Per-side visibility layers, overlaid on each canvas. Objects (anchors / next /
+// negative space / frames) are the multiselect dropdown prepended below; these
+// are the remaining plain on/off layers.
 const CMP_TOGGLES = [
-  ["objects", "objects"],
-  ["frames", "frames"],
   ["zones", "zones"],
   ["meshes", "meshes"],
   ["grid", "grid"],
@@ -603,6 +603,7 @@ const CMP_TOGGLES = [
 
 function buildToggleBar(host, viewer) {
   const bar = el("div", { class: "cmp-toggles" });
+  bar.appendChild(buildObjectsMenu(viewer));
   for (const [key, label] of CMP_TOGGLES) {
     const btn = el("button", {
       class: viewer.toggles[key] ? "" : "off",

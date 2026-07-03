@@ -90,6 +90,74 @@ export function stepUntilSelect(steps, onPick, { label = "until…", title } = {
   return sel;
 }
 
+// Objects multiselect dropdown for a 3D viewer — the replacement for the old
+// single "objects" toggle. It filters objects by the decomposition step that
+// emitted each (anchors / next / negative space) plus frames, all bound to
+// `viewer.toggles.{anchors,next,negativeSpace,frames}`. Ticking "none" masks
+// every category off and disables the rest until it's unticked — the individual
+// picks are remembered (masked, not cleared), so unticking restores them.
+// Shared by every viewer with a toggle row (main overlay + both compare panes).
+const OBJECT_MENU_CATEGORIES = [
+  ["anchors", "anchors"],
+  ["next", "next"],
+  ["negativeSpace", "negative space"],
+  ["frames", "frames"],
+];
+
+// One document-level closer for every objects menu (registered lazily, once):
+// a click that isn't kept inside an open menu collapses them all.
+let objMenuCloserAdded = false;
+function ensureObjMenuCloser() {
+  if (objMenuCloserAdded) return;
+  objMenuCloserAdded = true;
+  document.addEventListener("click", () => {
+    for (const m of document.querySelectorAll(".vt-menu.open")) m.classList.remove("open");
+  });
+}
+
+export function buildObjectsMenu(viewer) {
+  ensureObjMenuCloser();
+  const noneCb = el("input", { type: "checkbox" });
+  const catCbs = OBJECT_MENU_CATEGORIES.map(([key]) =>
+    el("input", { type: "checkbox", checked: !!viewer.toggles[key] }));
+  const btn = el("button", {
+    class: "vt-menu-btn",
+    title: "choose which object categories (by emitting step) and frames to show",
+    text: "objects ▾",
+  });
+  const pop = el("div", { class: "vt-menu-pop" },
+    el("label", { class: "vt-menu-item vt-menu-none" }, noneCb, "none"),
+    el("div", { class: "vt-menu-sep" }),
+    ...OBJECT_MENU_CATEGORIES.map(([, label], i) =>
+      el("label", { class: "vt-menu-item" }, catCbs[i], label)),
+  );
+  const menu = el("div", { class: "vt-menu" }, btn, pop);
+
+  const apply = () => {
+    const none = noneCb.checked;
+    OBJECT_MENU_CATEGORIES.forEach(([key], i) => {
+      catCbs[i].disabled = none;
+      // NONE masks every category off WITHOUT clearing the checkboxes, so
+      // unticking it restores exactly what was showing before.
+      viewer.toggles[key] = none ? false : catCbs[i].checked;
+    });
+    btn.classList.toggle("off", none || !catCbs.some((cb) => cb.checked));
+    viewer.refreshVisibility();
+  };
+  noneCb.addEventListener("change", apply);
+  for (const cb of catCbs) cb.addEventListener("change", apply);
+  // Toggle this popup (closing any other open one first); keep clicks inside the
+  // menu from reaching the document closer so ticking a box doesn't collapse it.
+  btn.addEventListener("click", () => {
+    const wasOpen = menu.classList.contains("open");
+    for (const m of document.querySelectorAll(".vt-menu.open")) m.classList.remove("open");
+    if (!wasOpen) menu.classList.add("open");
+  });
+  menu.addEventListener("click", (ev) => ev.stopPropagation());
+  apply(); // push the initial checkbox state onto the viewer
+  return menu;
+}
+
 export function fmtJson(value) {
   try { return JSON.stringify(value, null, 2); } catch { return String(value); }
 }

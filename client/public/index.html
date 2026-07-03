@@ -1137,6 +1137,65 @@
 			#viewer-toggles button.off {
 				opacity: 0.5;
 			}
+			/* Objects multiselect dropdown (buildObjectsMenu) — lives inline in a
+			   viewer's toggle row; the trigger button inherits the row's button
+			   style, so only the popup + items need styling here. */
+			.vt-menu {
+				position: relative;
+				display: inline-flex;
+			}
+			.vt-menu-pop {
+				position: absolute;
+				bottom: 100%; /* #viewer-toggles is bottom-left, so open upward */
+				left: 0;
+				margin-bottom: 4px;
+				display: none;
+				flex-direction: column;
+				gap: 1px;
+				min-width: 132px;
+				padding: 5px;
+				background: var(--panel-2);
+				border: 1px solid var(--line-2);
+				border-radius: 6px;
+				box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+				z-index: 10;
+			}
+			.cmp-toggles .vt-menu-pop {
+				/* compare panes carry the toggle row at the TOP, so drop it downward */
+				top: 100%;
+				bottom: auto;
+				margin-top: 4px;
+				margin-bottom: 0;
+			}
+			.vt-menu.open .vt-menu-pop {
+				display: flex;
+			}
+			.vt-menu-item {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				padding: 2px 4px;
+				font-size: 11px;
+				color: var(--text-dim);
+				cursor: pointer;
+				white-space: nowrap;
+			}
+			.vt-menu-item input {
+				cursor: pointer;
+			}
+			.vt-menu-item:has(input:disabled) {
+				/* the categories greyed out while NONE masks them */
+				opacity: 0.4;
+				cursor: default;
+			}
+			.vt-menu-none {
+				color: var(--text);
+			}
+			.vt-menu-sep {
+				height: 1px;
+				background: var(--line);
+				margin: 3px 0;
+			}
 			/* Zone-layers legend: a colour swatch per nesting depth present in the
                scene, shown only while the zone-layers view is on. Top-left so it
                never collides with the bottom-left toggle row when it wraps. */
@@ -3392,7 +3451,10 @@
 				bottom: 12px;
 				width: 270px;
 				max-height: 50vh;
-				display: flex;
+				/* Hidden by default — the queue only floats over the main scene
+				   canvas (the cell overlay), never on the board or in the prompt
+				   lab, where it's just noise. Shown by the :has() rule below. */
+				display: none;
 				flex-direction: column;
 				background: var(--panel);
 				border: 1px solid var(--line);
@@ -3401,6 +3463,11 @@
 				font-size: 12px;
 				box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
 				overflow: hidden;
+			}
+			/* Reveal it only while the main canvas (cell overlay) is up. Mirrors
+			   the app's other context-scoped overlays (e.g. #canvas-host:has(...)). */
+			body:has(#overlay.open) #queue-panel {
+				display: flex;
 			}
 			#queue-head {
 				display: flex;
@@ -3745,8 +3812,8 @@
 			<div id="overlay-body">
 				<div id="canvas-host">
 					<div id="viewer-toggles">
-						<button data-toggle="objects">objects</button>
-						<button data-toggle="frames">frames</button>
+						<!-- objects multiselect (anchors/next/negative space/frames) is
+						     inserted here by overlay.js via buildObjectsMenu() -->
 						<button data-toggle="zones">zones</button>
 						<button data-toggle="meshes">meshes</button>
 						<button data-toggle="grid">grid</button>

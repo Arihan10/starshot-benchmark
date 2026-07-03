@@ -213,14 +213,20 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const fills = new Map(); // id -> translucent zone fill mesh (zone-layers view)
 	const models = new Map(); // id -> gltf scene
 	const kinds = new Map(); // id -> node_kind ("zone"/"object"/"frame")
-	// Visibility layers. objects/frames/zones are per-CATEGORY (node kind)
-	// toggles — switching one off removes that kind entirely, mesh AND bbox.
-	// meshes/bboxes are cross-cutting: meshes off mutes every mesh but keeps the
-	// bboxes; bboxes off mutes every wireframe box but keeps the meshes. proxies
-	// is the collision-proxy wireframe layer — an opt-in debug overlay, hidden by
+	// Visibility layers. The object/frame/zone layers are per-CATEGORY toggles —
+	// switching one off removes that kind entirely, mesh AND bbox. Objects are
+	// split by the decomposition step that emitted them (anchor_decompose →
+	// anchors, next_object → next, negative_space_decompose → negativeSpace) so
+	// the objects dropdown can filter by origin; an object of unknown origin
+	// buckets with anchors. `frames` is the encapsulating-shell kind. meshes/
+	// bboxes are cross-cutting: meshes off mutes every mesh but keeps the bboxes;
+	// bboxes off mutes every wireframe box but keeps the meshes. proxies is the
+	// collision-proxy wireframe layer — an opt-in debug overlay, hidden by
 	// default. grid is the floor.
 	const show = {
-		objects: true,
+		anchors: true,
+		next: true,
+		negativeSpace: true,
 		frames: true,
 		zones: true,
 		meshes: true,
@@ -396,10 +402,18 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		if (fill) fill.material.color.setHex(color);
 	}
 
-	// Whether a node's whole CATEGORY layer is on (objects / frames / zones).
-	function categoryOn(kind) {
+	// Whether a node's CATEGORY layer is on. Objects are split by the step that
+	// emitted them (`originOf`) so the dropdown filters anchors / next /
+	// negative-space independently; an object of unknown origin buckets with
+	// anchors (matching its default green). Frames + zones key off node kind.
+	function categoryOn(kind, id) {
 		if (kind === "frame") return show.frames;
-		if (kind === "object") return show.objects;
+		if (kind === "object") {
+			const step = originOf(id);
+			if (step === "next_object") return show.next;
+			if (step === "negative_space_decompose") return show.negativeSpace;
+			return show.anchors; // anchor_decompose + unknown-origin objects
+		}
 		return show.zones; // "zone" (and any unknown default)
 	}
 
@@ -444,7 +458,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			return;
 		}
 		const visible =
-			categoryOn(kind) &&
+			categoryOn(kind, id) &&
 			(id === selectedId || id === hoveredId || show.bboxes);
 		const dim =
 			selectedId !== null && id !== selectedId && id !== hoveredId;
@@ -456,7 +470,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			// Proxies are an opt-in debug layer (hidden by default): shown only when
 			// their category is on AND the proxies toggle is on, independent of the
 			// bbox layer. Selection still dims the non-selected ones.
-			proxy.visible = categoryOn(kind) && show.proxies;
+			proxy.visible = categoryOn(kind, id) && show.proxies;
 			proxy.material.opacity = dim
 				? PROXY_DIM_OPACITY
 				: PROXY_BASE_OPACITY;
@@ -477,7 +491,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		// Category off hides this kind's mesh; the meshes layer mutes ALL meshes
 		// (bboxes stay); per-node hide (right-click / eye) is independent.
 		model.visible =
-			categoryOn(kinds.get(id) ?? "zone") &&
+			categoryOn(kinds.get(id) ?? "zone", id) &&
 			show.meshes &&
 			!effectivelyHidden(id);
 	}

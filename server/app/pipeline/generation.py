@@ -262,7 +262,7 @@ _DECOMP_STEPS: dict[str, tuple[str, str]] = {
     ),
     "encapsulating": (
         "encapsulating_decompose",
-        "This is the region you are to decide whether a boundary is needed for, and if so, what objects form that boundary",
+        "This is the region you are to decide whether it has shared geometry with surrounding areas for, and if so, what objects in that set have yet to be generated",
     ),
     "negative-space": (
         "negative_space_decompose",

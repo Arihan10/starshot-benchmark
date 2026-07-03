@@ -42,11 +42,13 @@ export const state = {
     // chosen zones.
     selection: new Map(),  // cellKey -> Set<node id>  (empty set ⇒ all zones)
     tests: new Map(),      // "slot|model|index" -> {status, result?, error?}
-    // Which LLM(s) each selected event's downstream simulation runs on, keyed
-    // by "slot|model|index". Absent ⇒ just the cell's base model (one branch,
-    // today's behavior); a multi-alias set forks one pinned lineage per LLM so
-    // a single "simulate" A/Bs the step across models without the compare hop.
-    simModels: new Map(),  // "slot|model|index" -> Set<model alias>
+    // Which LLM(s) a selected cell's downstream simulations run on, keyed by
+    // cellKey "slot|model" so every selected zone of a slot forks on the SAME
+    // LLMs (NOT per event — the grid dedups to one card per cell in 3D). Absent ⇒
+    // just the cell's base model (one branch, today's behavior); a multi-alias
+    // set forks one pinned lineage per LLM so a single "simulate" A/Bs the step
+    // across models. Step-independent like `selection`; reset on a run switch.
+    simModels: new Map(),  // cellKey "slot|model" -> Set<model alias>
     // Live simulation branches keyed by their server branch id (NOT the cell),
     // so one cell can carry several at once (different zones / parallel sims).
     sims: new Map(),       // branchId -> {id, slot, model, eventIndex, createdAt}

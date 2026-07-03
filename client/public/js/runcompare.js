@@ -12,7 +12,7 @@
 
 import { api } from "./api.js";
 import { state, on } from "./state.js";
-import { el, toast } from "./ui.js";
+import { el, toast, buildObjectsMenu } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { createObsDock } from "./obstree.js";
 import { applySceneProjection, createObsModel, emittedStep } from "./events.js";
@@ -33,9 +33,9 @@ let linked = true;
 let syncing = false;   // re-entrancy guard for the A<->B camera copy
 
 // Per-side visibility layers, overlaid on each canvas (mirrors the compare view).
+// Objects (anchors / next / negative space / frames) are the multiselect
+// dropdown prepended below; these are the remaining plain on/off layers.
 const RC_TOGGLES = [
-  ["objects", "objects"],
-  ["frames", "frames"],
   ["zones", "zones"],
   ["meshes", "meshes"],
   ["grid", "grid"],
@@ -45,6 +45,7 @@ const RC_TOGGLES = [
 
 function buildToggleBar(host, viewer) {
   const bar = el("div", { class: "cmp-toggles" });
+  bar.appendChild(buildObjectsMenu(viewer));
   for (const [key, label] of RC_TOGGLES) {
     const btn = el("button", {
       class: viewer.toggles[key] ? "" : "off",

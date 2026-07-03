@@ -10,7 +10,7 @@ import {
 	cellBranches,
 	branchSummaryById,
 } from "./state.js";
-import { el, toast, stepUntilSelect, openModal } from "./ui.js";
+import { el, toast, stepUntilSelect, openModal, buildObjectsMenu } from "./ui.js";
 import {
 	openStream,
 	dispatchSceneEvent,
@@ -246,6 +246,11 @@ export function initOverlay(sceneViewer) {
 			ev.stopImmediatePropagation();
 		}
 	});
+	// The objects layer is a multiselect (anchors / next / negative space /
+	// frames, filtered by emitting step) rather than a single toggle — insert it
+	// at the head of the row. The remaining layers stay plain on/off buttons.
+	const togglesRow = document.getElementById("viewer-toggles");
+	togglesRow.prepend(buildObjectsMenu(viewer));
 	for (const btn of document.querySelectorAll(
 		"#viewer-toggles [data-toggle]",
 	)) {

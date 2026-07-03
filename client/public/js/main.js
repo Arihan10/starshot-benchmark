@@ -55,6 +55,7 @@ function resetLabSession() {
   state.lab.drafts = new Map();
   state.lab.events = [];
   state.lab.selection = new Map();
+  state.lab.simModels = new Map();
   state.lab.tests = new Map();
   state.lab.sims = new Map();
   state.lab.simStep = null;

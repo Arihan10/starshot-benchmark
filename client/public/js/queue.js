@@ -1,9 +1,14 @@
 // Global mesh-generation queue panel — a live view of every in-flight + waiting
 // generation across the concurrency pools (Trellis + Hunyuan on Modal, and
 // Hunyuan 3.1 on Tencent), polled from /trellis/queue. The queue is
-// process-global (it spans every cell + branch), so this floats in the corner
-// rather than living in one cell's overlay: a from-scratch generate fans a whole
-// scene onto it, and per-asset regenerations surface as waiting → processing rows.
+// process-global (it spans every cell + branch), not one cell's data: a
+// from-scratch generate fans a whole scene onto it, and per-asset regenerations
+// surface as waiting → processing rows.
+//
+// It floats in the corner ONLY while the main scene canvas (the cell overlay) is
+// up; the board and the prompt lab hide it (CSS, keyed off `#overlay.open`),
+// where a mesh queue is just noise. It keeps polling while hidden, so the count
+// is already current the moment the overlay opens.
 
 import { api } from "./api.js";
 import { el } from "./ui.js";
