@@ -14,15 +14,17 @@ Three scenarios:
                        drifting content that fills the interstitial
                        space between zones. No completion loop.
 
-Per scenario: decompose objects (LLM) -> validate relationships and retry
-on failure (this is the only validating retry left in the pipeline) ->
-resolve every object's bbox in a single batch LLM call (trusted, no
-retry) -> spawn background Trellis 2 jobs that fan out via SSE events as
-each mesh lands.
+Per scenario: decompose objects (LLM, a single call) -> resolve every
+object's bbox in a single batch LLM call (trusted, no retry) -> spawn
+background Trellis 2 jobs that fan out via SSE events as each mesh lands.
+There is NO validate-and-retry step: a decomposition whose ids collide with
+already-placed nodes is accepted as-is (the retry could never resolve a
+genuine boundary/anchor overlap and just re-billed the call), and the
+run-wide dedup in `_resolve_and_generate` silently drops the colliding specs.
 
-The anchor-loop's "are more objects needed?" step uses the same
-relationship validator on the emitted specs and proposes a LIST of
-objects per round. Bounding-box resolution is a single batch call.
+The anchor-loop's "are more objects needed?" step proposes a LIST of objects
+per round (same single-call, dedup-not-retry handling). Bounding-box
+resolution is a single batch call.
 
 Prompt text comes from the run's prompt snapshot (`prompt_store.current()`);
 this module only decides which step fires when and with which scene state.
@@ -45,7 +47,6 @@ from app.pipeline import committed
 from app.services import hunyuan, hunyuan_tencent, llm, nano_banana, prefabs, symmetry, threed
 from app.utils import glass, glb_place, logging
 from app.utils.geometry import export_glb, rescale_mesh_to_bbox, rotate_mesh
-from app.utils.topology import validate_parents, validate_referenced_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
 
@@ -252,8 +253,6 @@ def _artifact_url(runs_dir: Path, path: Path) -> str:
     return f"/artifacts/{path.relative_to(runs_dir).as_posix()}"
 
 
-RELATIONSHIP_RETRY_ATTEMPTS = 3
-
 # scenario -> (template/event step name, {SCENE_CONTEXT} target marker text)
 _DECOMP_STEPS: dict[str, tuple[str, str]] = {
     "anchor": (
@@ -271,21 +270,25 @@ _DECOMP_STEPS: dict[str, tuple[str, str]] = {
 }
 
 
-async def _decompose_objects_validated(
+async def _decompose_objects(
     *,
     zone: Node,
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
 ) -> list[Any]:
+    """Decompose a zone into object specs in ONE LLM call.
+
+    There is no validate-and-retry: a decomposition whose ids collide with
+    already-placed nodes (a boundary/anchor overlap the model can't resolve) is
+    no longer re-rolled — the retry only re-billed the call to re-emit the same
+    set. The run-wide dedup in `_resolve_and_generate` silently drops any
+    colliding spec instead."""
     # Resume: if this (zone, scenario) pass already committed its object set
     # to the log, replay those specs verbatim (ids fixed) instead of asking
     # the LLM to re-decompose — which is exactly where new ids leak in.
     committed_specs = committed.object_specs(zone.id, scenario)
     if committed_specs is not None:
         return committed_specs
-    prior_attempts: list[tuple[list[Any], str]] = []
-    existing_ids = {n.id for n in all_nodes}
-    specs: list[Any] = []
     step, target_text = _DECOMP_STEPS[scenario]
     # The encapsulating + negative-space passes may decide a region needs no
     # objects at all, so they emit the `objects_required` gate; the anchor pass
@@ -296,121 +299,68 @@ async def _decompose_objects_validated(
         if scenario in ("encapsulating", "negative-space")
         else schemas.ObjectDecompOutput
     )
-    for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
-        ps = prompt_store.current()
-        variables = scene_context.zone_vars(
-            zone_id=zone.id,
-            zone_prompt=zone.prompt,
-            zone_plan=zone.plan,
-            nodes=all_nodes,
-            target_text=target_text,
-        )
-        variables["RETRY_BLOCK"] = scene_context.render_retry_block(prior_attempts)
-        out = await llm.call_llm(
-            system=ps.system(step, variables),
-            user=ps.user(step, variables),
-            output_schema=decomp_schema,
-            node_id=zone.id,
-            step=step,
-            template=step,
-            variables=variables,
-        )
-        if isinstance(out, schemas.GatedObjectDecompOutput) and not out.objects_required:
-            logging.log_once(
-                "generation.decompose.no_objects",
-                match_fields=("zone", "scenario"),
-                zone=zone.id,
-                scenario=scenario,
-                emitted=[s.model_dump() for s in out.objects],
-            )
-            return []
-        specs = list(out.objects)
-        try:
-            validate_referenced_ids(specs, parent_id=zone.id, existing_ids=existing_ids)
-            return specs
-        except ValueError as e:
-            reason = str(e)
-            logging.log(
-                "generation.decompose.retry",
-                zone=zone.id,
-                attempt=attempt,
-                reason=reason,
-                emitted=[s.model_dump() for s in specs],
-            )
-            # Feed this failure back into the next prompt so the LLM has
-            # something to react to instead of re-emitting the same invalid
-            # set. After exhausting attempts we fall through to the
-            # accept_invalid branch below.
-            prior_attempts.append((specs, reason))
-    # Retries exhausted. Unresolvable parents are a hard fail (orphaned
-    # objects would ship a mesh yet be invisible to every later step);
-    # secondary referenced_ids stay advisory and are accepted with a log.
-    validate_parents(specs, parent_id=zone.id, existing_ids=existing_ids)
-    logging.log_once(
-        "generation.decompose.accept_invalid",
-        match_fields=("zone",),
-        zone=zone.id,
-        reason=prior_attempts[-1][1] if prior_attempts else "",
+    ps = prompt_store.current()
+    variables = scene_context.zone_vars(
+        zone_id=zone.id,
+        zone_prompt=zone.prompt,
+        zone_plan=zone.plan,
+        nodes=all_nodes,
+        target_text=target_text,
     )
-    return specs
+    out = await llm.call_llm(
+        system=ps.system(step, variables),
+        user=ps.user(step, variables),
+        output_schema=decomp_schema,
+        node_id=zone.id,
+        step=step,
+        template=step,
+        variables=variables,
+    )
+    if isinstance(out, schemas.GatedObjectDecompOutput) and not out.objects_required:
+        logging.log_once(
+            "generation.decompose.no_objects",
+            match_fields=("zone", "scenario"),
+            zone=zone.id,
+            scenario=scenario,
+            emitted=[s.model_dump() for s in out.objects],
+        )
+        return []
+    return list(out.objects)
 
 
-async def _next_object_batch_validated(
+async def _next_object_batch(
     *,
     zone: Node,
     all_nodes: list[Node],
 ) -> tuple[bool, list[Any]]:
-    """Anchor-completion decision: the model proposes a LIST of objects per
-    round (or sets objects_required=false to finish), with the
-    relationship-validator retry applied to the whole proposed batch. Returns
-    `(done, objects)`; `objects` is empty when done."""
-    prior_attempts: list[tuple[list[Any], str]] = []
-    existing_ids = {n.id for n in all_nodes}
-    objects: list[Any] = []
-    for attempt in range(RELATIONSHIP_RETRY_ATTEMPTS):
-        ps = prompt_store.current()
-        variables = scene_context.zone_vars(
-            zone_id=zone.id,
-            zone_prompt=zone.prompt,
-            zone_plan=zone.plan,
-            nodes=all_nodes,
-            target_text="This is the subregion you are deciding whether to add more objects to.",
-        )
-        variables["RETRY_BLOCK"] = scene_context.render_next_object_retry_block(prior_attempts)
-        decision = await llm.call_llm(
-            system=ps.system("next_object", variables),
-            user=ps.user("next_object", variables),
-            output_schema=schemas.GatedObjectDecompOutput,
-            node_id=zone.id,
-            step="next_object",
-            template="next_object",
-            variables=variables,
-        )
-        objects = list(decision.objects)
-        if not decision.objects_required or not objects:
-            return True, []
-        try:
-            validate_referenced_ids(objects, parent_id=zone.id, existing_ids=existing_ids)
-            return False, objects
-        except ValueError as e:
-            reason = str(e)
-            logging.log(
-                "generation.next.retry",
-                zone=zone.id,
-                attempt=attempt,
-                reason=reason,
-                emitted=[o.model_dump() for o in objects],
-            )
-            prior_attempts.append((objects, reason))
-    # Retries exhausted. Unresolvable parents are a hard fail; dangling
-    # secondary referenced_ids are accepted with a log.
-    validate_parents(objects, parent_id=zone.id, existing_ids=existing_ids)
-    logging.log_once(
-        "generation.next.accept_invalid",
-        match_fields=("zone",),
-        zone=zone.id,
-        reason=prior_attempts[-1][1] if prior_attempts else "",
+    """Anchor-completion decision in ONE LLM call: the model proposes a LIST of
+    objects per round (or sets objects_required=false to finish). Returns
+    `(done, objects)`; `objects` is empty when done.
+
+    No validate-and-retry (see `_decompose_objects`): colliding ids are dropped
+    silently downstream by the run-wide dedup in `_resolve_and_generate`, and the
+    completion loop's own progress guard (`attempted`) stops a model that keeps
+    re-proposing already-placed objects."""
+    ps = prompt_store.current()
+    variables = scene_context.zone_vars(
+        zone_id=zone.id,
+        zone_prompt=zone.prompt,
+        zone_plan=zone.plan,
+        nodes=all_nodes,
+        target_text="This is the subregion you are deciding whether to add more objects to.",
     )
+    decision = await llm.call_llm(
+        system=ps.system("next_object", variables),
+        user=ps.user("next_object", variables),
+        output_schema=schemas.GatedObjectDecompOutput,
+        node_id=zone.id,
+        step="next_object",
+        template="next_object",
+        variables=variables,
+    )
+    objects = list(decision.objects)
+    if not decision.objects_required or not objects:
+        return True, []
     return False, objects
 
 
@@ -515,20 +465,11 @@ async def _resolve_and_generate(
     deduped: list[Any] = []
     seen_in_call: set[str] = set()
     for s in specs:
+        # Silently drop any spec whose id collides with an earlier spec in this
+        # call, an already-admitted (in-flight) id, or an already-placed node.
+        # Not logged: the decompose retry that used to surface these overlaps was
+        # removed, so a benign boundary/anchor overlap is just quietly deduped.
         if s.id in seen_in_call or s.id in admitted or s.id in placed_ids:
-            logging.log(
-                "generation.dedup_drop",
-                zone=zone.id,
-                scenario=scenario,
-                id=s.id,
-                reason=(
-                    "duplicate_in_call"
-                    if s.id in seen_in_call
-                    else "already_placed"
-                    if s.id in placed_ids
-                    else "already_in_flight"
-                ),
-            )
             continue
         seen_in_call.add(s.id)
         deduped.append(s)
@@ -1974,7 +1915,7 @@ async def run(
     scenario: Literal["anchor", "encapsulating", "negative-space"],
     all_nodes: list[Node],
 ) -> None:
-    specs = await _decompose_objects_validated(
+    specs = await _decompose_objects(
         zone=zone,
         scenario=scenario,
         all_nodes=all_nodes,
@@ -2024,17 +1965,17 @@ async def run(
     # — e.g. one whose bbox the batch step omitted, so it was admitted into
     # `_admitted_ids` but never placed into `all_nodes`, and so never shows up
     # as already-present in the next_object context. _resolve_and_generate
-    # dedups that repeat to nothing (`generation.dedup_drop`), so without a
-    # progress guard the loop spins forever re-billing next_object. Track the
-    # ids attempted this loop; a round that proposes only already-attempted ids
-    # means no progress is possible — stop.
+    # silently dedups that repeat to nothing, so without a progress guard the
+    # loop spins forever re-billing next_object. Track the ids attempted this
+    # loop; a round that proposes only already-attempted ids means no progress
+    # is possible — stop.
     #
     # The model proposes a LIST of objects per round. Each accepted object is
     # committed as its own `generation.next` event so resume replays them one
     # at a time regardless of how they were proposed.
     attempted: set[str] = set()
     while True:
-        done, objects = await _next_object_batch_validated(
+        done, objects = await _next_object_batch(
             zone=zone,
             all_nodes=all_nodes,
         )
