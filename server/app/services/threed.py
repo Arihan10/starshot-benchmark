@@ -105,11 +105,12 @@ async def generate_mesh(
     job_id: str,
     image_mime: str = "image/png",
     bbox: BoundingBox | None = None,
+    force: bool = False,
 ) -> Path:
     """Run Trellis 2 on `image` and save the textured GLB to `output_path`.
     `bbox` is accepted for a uniform backend signature but unused (Trellis has no
-    aspect-ratio control). See `mesh_jobs.generate_mesh` for the resumable /
-    retry semantics."""
+    aspect-ratio control). `force=True` regenerates even if a completed job is
+    cached (see `mesh_jobs.generate_mesh` for the resumable / retry semantics)."""
     return await mesh_jobs.generate_mesh(
         image,
         output_path=output_path,
@@ -117,4 +118,5 @@ async def generate_mesh(
         image_mime=image_mime,
         backend=_BACKEND,
         bbox=bbox,
+        force=force,
     )

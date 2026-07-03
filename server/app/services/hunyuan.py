@@ -143,11 +143,13 @@ async def generate_mesh(
     job_id: str,
     image_mime: str = "image/png",
     bbox: BoundingBox | None = None,
+    force: bool = False,
 ) -> Path:
     """Run Hunyuan-Omni on `image` and save the textured GLB to `output_path`.
     `bbox` (the node's target box) drives Hunyuan's bbox control — the generated
-    mesh's aspect ratio is constrained to it. See `mesh_jobs.generate_mesh` for
-    the resumable / retry semantics."""
+    mesh's aspect ratio is constrained to it. `force=True` regenerates even if a
+    completed job is cached (see `mesh_jobs.generate_mesh` for the resumable /
+    retry semantics)."""
     return await mesh_jobs.generate_mesh(
         image,
         output_path=output_path,
@@ -155,4 +157,5 @@ async def generate_mesh(
         image_mime=image_mime,
         backend=_BACKEND,
         bbox=bbox,
+        force=force,
     )

@@ -500,6 +500,7 @@ async def generate_mesh(
     job_id: str,
     image_mime: str = "image/png",
     bbox: BoundingBox | None = None,
+    force: bool = False,
 ) -> Path:
     """Run `backend` on `image` and save the textured GLB to `output_path`.
 
@@ -514,12 +515,20 @@ async def generate_mesh(
     probe prior Modal task_ids because Modal GCs them on its own schedule, and
     the in-flight semaphore (`_inflight_sem`) gates submits at Modal's container
     count so Modal never queues on its side.
+
+    `force=True` skips that completion-cache short-circuit and always regenerates,
+    even when a prior `<scope>.done` + on-disk GLB exist. This is how a regenerate
+    forces a fresh mesh WITHOUT first deleting the old one: the new GLB is written
+    atomically (temp + replace) at the end, so `output_path` is only ever REPLACED
+    on success — a regen that fails leaves the prior mesh intact instead of a
+    headless node.
     """
-    done = resumable.find_done(scope=backend.scope, job_id=job_id)
-    if done is not None:
-        cached = Path(str(done["saved"]))
-        if cached.exists():
-            return cached
+    if not force:
+        done = resumable.find_done(scope=backend.scope, job_id=job_id)
+        if done is not None:
+            cached = Path(str(done["saved"]))
+            if cached.exists():
+                return cached
 
     image_bytes = await _fetch_url(image) if isinstance(image, str) else image
     input_hash = _input_hash(backend, image_bytes, job_id, bbox)

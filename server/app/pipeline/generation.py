@@ -1005,8 +1005,17 @@ async def _generate_one(
     backend: str = DEFAULT_MESH_BACKEND,
     reuse_image: bool = False,
     force_image: bool = False,
+    force_mesh: bool = False,
     relog_image: bool = False,
-) -> None:
+) -> bool:
+    """Build the node's image + raw mesh + rescaled served GLB, emitting its
+    `model` event on success. Returns whether it succeeded. Non-destructive: the
+    image (Nano-Banana), the raw (the mesh backend), and the rescaled served GLB
+    are each written only on success (atomically for the meshes), so a failure at
+    any step leaves the node's prior artifacts intact — never a headless node.
+
+    `force_mesh=True` forces a fresh mesh from the backend even when a completed
+    one is cached, so a regenerate rebuilds WITHOUT first deleting the old raw."""
     try:
         # Nano Banana sees the wrapped studio-shot directive; node.prompt
         # stays the bare subject phrase for everything else.
@@ -1024,7 +1033,7 @@ async def _generate_one(
                     "mesh.error", id=node.id,
                     message="regenerate from image: no reference image to reuse",
                 )
-                return
+                return False
             image = nano_banana.NanoBananaResult(
                 image_bytes=image_path.read_bytes(), mime_type="image/png",
             )
@@ -1052,13 +1061,16 @@ async def _generate_one(
             )
         # generate_mesh writes `raw` on a fresh run but returns a *cached* path
         # on a resumable hit (which may not be `raw` when the bound log was
-        # hydrated from another build). Load whatever it actually produced.
+        # hydrated from another build). Load whatever it actually produced. It
+        # writes `raw` atomically and (with force_mesh) never reads a pre-deleted
+        # file to force a rebuild — so `raw` is only ever replaced on success.
         produced = await MESH_BACKENDS[backend](
             image.image_bytes,
             output_path=raw,
             job_id=node.id,
             image_mime=image.mime_type,
             bbox=node.bbox,
+            force=force_mesh,
         )
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, produced)
@@ -1102,8 +1114,10 @@ async def _generate_one(
             artifact_kind="object",
             url=_artifact_url(runs_dir, path),
         )
+        return True
     except Exception as e:
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
+        return False
 
 
 async def _rescale_reuse_from_raw(
@@ -1488,13 +1502,15 @@ async def _rebuild_one(
     raw = objs_dir / f"{node.id}.raw.glb"
     path = objs_dir / f"{node.id}.glb"
     image_stem = objs_dir / node.id
-    # Drop only the prior MESH so the backend rebuilds it fresh. The reference
-    # image is NEVER deleted here: a from-scratch rebuild re-rolls it via
-    # `force_image` (which writes only on success, so a failed image call — e.g.
-    # the API key being down — leaves the existing image intact instead of wiping
-    # it and breaking a later from-image regen), and a from-image rebuild reuses it.
-    for artifact in (raw, path):
-        artifact.unlink(missing_ok=True)
+    # NON-DESTRUCTIVE regen. Nothing is deleted up front: the backend is forced to
+    # rebuild via `force_mesh`/`force_image` (not by deleting the file to trigger a
+    # cache miss, which is what used to leave a headless node when a rebuild then
+    # failed), and `_generate_one` writes the image, raw, and served GLB only on
+    # success (atomically for the meshes). So `<id>.raw.glb` — and the served twin
+    # — are only ever REPLACED once the new one is in hand; a failed regen leaves
+    # the prior, working asset fully intact instead of a node with no raw to
+    # restore or reference.
+    #
     # Refresh BEFORE logging: _refresh_node_image_prompt re-rolls the noun phrase
     # (regen_noun_phrase) — or re-reads the committed subject — and rewrites
     # node.prompt, so logging mesh.retry after it records the phrase actually being
@@ -1506,12 +1522,15 @@ async def _rebuild_one(
         zone=scene_zone, nodes=scene_nodes,
     )
     logging.log("mesh.retry", id=node.id, prompt=node.prompt, backend=backend)
-    await _generate_one(
+    rebuilt = await _generate_one(
         node, raw=raw, path=path, image_stem=image_stem, runs_dir=runs_dir,
         backend=backend, reuse_image=reuse_image, force_image=not reuse_image,
-        relog_image=regen_noun_phrase,
+        force_mesh=True, relog_image=regen_noun_phrase,
     )
-    if optimize and path.exists():
+    # Only re-optimize when the rebuild actually produced a fresh served mesh; on
+    # failure `path` still holds the PRIOR served GLB, so re-optimizing it would
+    # just churn identical bytes (and the old optimized twin already matches it).
+    if optimize and rebuilt and path.exists():
         # Served twin sits beside the raw dir, so the same version subdir
         # (generated/<v>/objects-generated → .../objects-generated-optimized).
         await _optimize_asset(

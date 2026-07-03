@@ -59,7 +59,7 @@ _DEFAULT_REGION = "ap-singapore"
 # one place; read at submit time. EnableGeometry yields a texture-free white model
 # (and forbids OBJ); EnablePBR adds PBR material textures.
 RESULT_FORMAT = "GLB"
-ENABLE_PBR = False
+ENABLE_PBR = True
 ENABLE_GEOMETRY = False
 
 # Submit-then-poll cadence. Rapid jobs finish in ~50-120s; poll every 2s and cap a
@@ -241,14 +241,17 @@ async def generate_mesh(
     job_id: str,
     image_mime: str = "image/png",
     bbox: BoundingBox | None = None,
+    force: bool = False,
 ) -> Path:
     """Run Hunyuan 3D 3.1 Rapid on `image` and save the GLB to `output_path`.
 
     `image` is raw image bytes or a URL (fetched first). `image_mime`/`bbox` are
     accepted for backend-signature uniformity but unused (Tencent infers the format
-    from the bytes and has no aspect-ratio control). Serialized process-globally via
-    `_GATE` so only one Tencent task is ever in flight, and registered in the shared
-    mesh queue snapshot so it shows in the dashboard's queue panel.
+    from the bytes and has no aspect-ratio control). `force` is likewise accepted
+    for signature uniformity but has no effect: this backend keeps no completion
+    cache, so it ALWAYS regenerates. Serialized process-globally via `_GATE` so
+    only one Tencent task is ever in flight, and registered in the shared mesh
+    queue snapshot so it shows in the dashboard's queue panel.
     """
     creds = _creds()
     region = _region()
@@ -277,7 +280,12 @@ async def generate_mesh(
             files = await _poll(http, creds, region, tencent_job_id)
             resp = await http.get(_pick_url(files), timeout=_DOWNLOAD_TIMEOUT_S)
             resp.raise_for_status()
-            output_path.write_bytes(resp.content)
+            # Atomic write (temp + replace): `output_path` is only ever REPLACED
+            # on a completed download, so an interrupted regen leaves the prior
+            # mesh intact rather than a torn/headless file.
+            tmp_path = output_path.with_name(f"{output_path.name}.part")
+            tmp_path.write_bytes(resp.content)
+            tmp_path.replace(output_path)
             logging.log(f"{SCOPE}.done", job_id=job_id, task_id=tencent_job_id, saved=str(output_path))
             return output_path
     finally:
