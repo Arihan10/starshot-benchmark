@@ -13,6 +13,7 @@ import { initRunCompare } from "./runcompare.js";
 import { initCost } from "./cost.js";
 import { initQueuePanel } from "./queue.js";
 import { initLighting } from "./lighting.js";
+import { createRunCombo } from "./runcombo.js";
 
 const LAST_RUN_KEY = "starshot.lastRun";
 const runPickerEl = document.getElementById("run-picker");
@@ -20,15 +21,17 @@ const statusTextEl = document.getElementById("status-text");
 
 // --- runs ------------------------------------------------------------------------
 
+// The active-run selector is a searchable combobox (see runcombo.js) — the
+// replacement for the native <select> whose order couldn't be sorted. Built once
+// at boot; `renderRunPicker` just refreshes its label + open list.
+let runCombo = null;
+
+function runLabel(r) {
+  return r.prompt_version ? `${r.name} · ${r.prompt_version}` : `${r.name} (legacy)`;
+}
+
 function renderRunPicker() {
-  runPickerEl.textContent = "";
-  for (const r of state.runs) {
-    runPickerEl.appendChild(el("option", {
-      value: r.name,
-      text: r.prompt_version ? `${r.name} · ${r.prompt_version}` : `${r.name} (legacy)`,
-    }));
-  }
-  if (state.run) runPickerEl.value = state.run;
+  runCombo?.render();
 }
 
 async function refreshRuns() {
@@ -83,7 +86,13 @@ async function switchRun(name) {
   toast(`run :: ${name}`);
 }
 
-runPickerEl.addEventListener("change", () => switchRun(runPickerEl.value));
+runCombo = createRunCombo(runPickerEl, {
+  getRuns: () => state.runs,
+  getSelected: () => state.run,
+  onPick: switchRun,
+  buttonLabel: runLabel,
+  placeholder: "select a run",
+});
 on("switch-run", async (name) => {
   await refreshRuns();
   await switchRun(name);
@@ -110,7 +119,9 @@ async function refreshSlots() {
     if (!state.steps.length) {
       try {
         const t = await api.promptTemplates(state.run);
-        state.steps = t.steps.map((s) => s.step);
+        // image_prompt auto-plays when stepping (it's not a gated step), so it's
+        // not a valid "step until" target — drop it from the steppable list.
+        state.steps = t.steps.map((s) => s.step).filter((s) => s !== "image_prompt");
       } catch { /* old runs without a snapshot — step-until stays unavailable */ }
     }
     emit("slots");
@@ -324,7 +335,7 @@ function startCellsModal() {
         const ok = results.filter(Boolean).length;
         toast(
           `started ${ok}/${results.length} cells${stepped ? " (stepped)" : ""}` +
-            (ok < results.length ? " — rest skipped: running/done/legacy" : ""),
+            (ok < results.length ? " — rest skipped: running/done/capped/legacy" : ""),
           ok ? "ok" : "err",
         );
         refreshSlots();

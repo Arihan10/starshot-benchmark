@@ -176,9 +176,11 @@ async function refreshCurLive(seq) {
 // --- per-side step controls (built once, into the column headers) ------------
 
 // The committed pipeline steps the user scrubs/reverts by — gated cache.llm
-// calls only. Excludes `library_match` (a mechanical per-object service call).
+// calls only. Excludes `library_match` + `image_prompt` (mechanical per-object
+// service calls that auto-play through when stepping, so they aren't steps).
 const isStepEvent = (e) =>
-  e.kind === "cache.llm" && typeof e.index === "number" && e.step !== "library_match";
+  e.kind === "cache.llm" && typeof e.index === "number" &&
+  e.step !== "library_match" && e.step !== "image_prompt";
 
 async function loadOrigSteps(seq) {
   if (!openTarget) return;

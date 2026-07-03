@@ -125,6 +125,14 @@ export const api = {
 			method: "POST",
 			params: { run },
 		}),
+	// Override a tripped spend cap: raises this cell's ceiling by one band
+	// (spend is preserved, so the next stop lands one band higher) and resumes
+	// the run. 409 unless the cell is actually at its cap. Returns {cap, resumed}.
+	capOverride: (run, slot, model) =>
+		request(cellPath(slot, model, "/cap-override"), {
+			method: "POST",
+			params: { run },
+		}),
 	reset: (run, slot, model, start = false) =>
 		request(cellPath(slot, model, "/reset"), {
 			method: "POST",

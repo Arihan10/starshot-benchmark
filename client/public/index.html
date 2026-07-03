@@ -165,6 +165,9 @@
 			.dot.paused {
 				background: var(--orange);
 			}
+			.dot.capped {
+				background: var(--purple);
+			}
 			.dot.idle {
 				background: #5a5e68;
 			}
@@ -200,8 +203,90 @@
 				overflow: hidden;
 				text-overflow: ellipsis;
 			}
-			#run-picker {
+			/* ---------- run pickers (searchable combobox: topbar + compare B) ---------- */
+			.run-combo {
+				position: relative;
+				flex-shrink: 0;
+			}
+			.run-combo-btn {
+				display: flex;
+				align-items: center;
+				gap: 8px;
 				max-width: 320px;
+			}
+			.run-combo-btn .run-combo-lab {
+				min-width: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.run-combo-btn .run-combo-caret {
+				margin-left: auto;
+				color: var(--text-faint);
+				font-size: 10px;
+			}
+			.run-combo.open .run-combo-btn {
+				border-color: var(--accent-line);
+				color: #c8d8f0;
+			}
+			.run-combo-pop {
+				position: absolute;
+				top: calc(100% + 6px);
+				left: 0;
+				display: none;
+				flex-direction: column;
+				width: 340px;
+				max-width: 92vw;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-radius: 6px;
+				box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+				overflow: hidden;
+				z-index: 50;
+			}
+			.run-combo.open .run-combo-pop {
+				display: flex;
+			}
+			.run-combo-search {
+				margin: 8px;
+				align-self: stretch;
+			}
+			.run-combo-list {
+				max-height: 60vh;
+				overflow: auto;
+				padding: 0 4px 6px;
+			}
+			.run-combo-item {
+				display: flex;
+				align-items: baseline;
+				gap: 8px;
+				padding: 6px 8px;
+				border-radius: 4px;
+				cursor: pointer;
+				color: var(--text-dim);
+			}
+			.run-combo-item:hover,
+			.run-combo-item.active {
+				background: #1d2027;
+			}
+			.run-combo-item.current {
+				color: var(--accent);
+			}
+			.run-combo-item .run-combo-item-name {
+				min-width: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.run-combo-item .run-combo-item-ver {
+				margin-left: auto;
+				flex-shrink: 0;
+				color: var(--text-faint);
+				font-size: 10px;
+			}
+			.run-combo-empty {
+				padding: 8px;
+				color: var(--text-faint);
 			}
 
 			/* ---------- per-run LLM spend tracker (top-bar pill + dropdown) ---------- */
@@ -343,6 +428,46 @@
 			.cost-empty {
 				color: var(--text-faint);
 				padding: 2px 0;
+			}
+			/* Capped cells: flag the collapsed pill purple so a spend-cap trip is
+			   noticeable without expanding, then show each cell's override inline. */
+			#cost-tracker.has-capped #cost-pill {
+				border-color: var(--purple);
+			}
+			#cost-tracker.has-capped #cost-pill .cost-pill-summary {
+				color: var(--purple);
+			}
+			.cost-cap-row {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				padding: 2px 0 3px 10px;
+			}
+			.cost-cap-row .cost-cap-msg {
+				color: var(--purple);
+				font-size: 10px;
+				font-variant-numeric: tabular-nums;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.cost-cap-row .cost-cap-override {
+				margin-left: auto;
+				flex-shrink: 0;
+				padding: 1px 8px;
+				font-size: 10px;
+				color: var(--purple);
+				background: transparent;
+				border: 1px solid var(--purple);
+				border-radius: 4px;
+				cursor: pointer;
+			}
+			.cost-cap-row .cost-cap-override:hover {
+				background: rgba(201, 166, 255, 0.14);
+			}
+			.cost-cap-row .cost-cap-override:disabled {
+				opacity: 0.5;
+				cursor: default;
 			}
 
 			/* ---------- board ---------- */
@@ -3083,11 +3208,13 @@
 				background: #221a2e;
 			}
 			#compare-run-b {
-				max-width: 190px;
 				display: none;
 			}
 			#compare-run-b.on {
-				display: inline-block;
+				display: block;
+			}
+			#compare-run-b .run-combo-btn {
+				max-width: 220px;
 			}
 			#runcompare {
 				position: fixed;
@@ -3506,7 +3633,7 @@
 	<body>
 		<div id="topbar">
 			<span class="brand">starshot</span>
-			<select id="run-picker" title="Switch the active run"></select>
+			<div id="run-picker" class="run-combo"></div>
 			<button
 				id="btn-new-run"
 				title="Create a new run from a prompt version"
@@ -3559,10 +3686,11 @@
 			>
 				compare runs
 			</button>
-			<select
+			<div
 				id="compare-run-b"
+				class="run-combo"
 				title="The run to compare the active run against"
-			></select>
+			></div>
 			<button
 				id="btn-ab-test"
 				title="Launch a new run (Run B) seeded with this run's zone plans, re-running from the zone plan onwards on a chosen prompt version"

@@ -1071,12 +1071,32 @@ function renderHeader() {
 	actionBtn.textContent = label ?? "";
 	resetBtn.style.display = branch ? "none" : "";
 
+	// Spend-cap override: a capped source cell shows a single "override cap &
+	// continue" that raises its ceiling one band and resumes it — the only way
+	// past the cap (a plain resume/retry is refused server-side while capped, so
+	// the normal action button stays hidden here).
+	let capBtn = document.getElementById("overlay-cap-override");
+	if (!branch && status === "capped") {
+		if (!capBtn) {
+			capBtn = el("button", { id: "overlay-cap-override", class: "primary" });
+			actionBtn.before(capBtn);
+		}
+		capBtn.textContent = "override cap & continue";
+		capBtn.title =
+			"raise this cell's spend cap by one band (spend kept) and resume the run";
+		capBtn.onclick = onCapOverride;
+	} else {
+		capBtn?.remove();
+	}
+
 	// One-call-at-a-time stepping controls. Shown whenever the cell is gated:
 	// a live branch always is; a source cell whenever it's in step mode (so
 	// the button is there even when paused with no live gate — incl. after a
 	// restart). `done` cells have nothing left to step.
+	// A capped cell can't step either (stepping is refused until the cap is
+	// overridden), so only its override button shows — not a dead-end "step".
 	const stepped = branch || !!summary?.stepped;
-	const canStep = stepped && status !== "done";
+	const canStep = stepped && status !== "done" && status !== "capped";
 	let stepBtn = document.getElementById("overlay-step");
 	let autoBtn = document.getElementById("overlay-auto");
 	if (canStep) {
@@ -1343,6 +1363,28 @@ async function onReset() {
 		await api.reset(state.run, slot, model, true);
 		emit("poll-now");
 		openCell({ slot, model, branch: false });
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Override a tripped spend cap: raise this cell's ceiling one band (spend is
+// kept) and resume — the only way past the cap, since a plain resume is refused
+// server-side while capped. Reload streaming the resumed run (forceLive — the
+// polled summary still says capped until the next poll lands).
+async function onCapOverride() {
+	const { slot, model, branch } = state.view ?? {};
+	if (!slot || branch) return;
+	try {
+		await api.capOverride(state.run, slot, model);
+		emit("poll-now");
+		if (
+			state.view &&
+			state.view.slot === slot &&
+			state.view.model === model &&
+			!state.view.branch
+		)
+			openCell({ slot, model, branch: false, forceLive: true });
 	} catch (e) {
 		toast(e.message, "err");
 	}

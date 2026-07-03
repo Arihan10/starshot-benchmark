@@ -438,12 +438,22 @@ async def call_llm_once(
 _COST_FETCH_CONCURRENCY = 6
 
 
-async def fetch_generation_costs(generation_ids: Iterable[str]) -> dict[str, float]:
+async def fetch_generation_costs(
+    generation_ids: Iterable[str],
+    on_cost: Callable[[str, float], Awaitable[None]] | None = None,
+) -> dict[str, float]:
     """Best-effort `GET /generation` lookup of OpenRouter's settled `total_cost`
     for each (deduped) id, over one shared client with bounded concurrency.
     Returns only the ids that resolved; a 404 (stats not ready yet) or transient
     error simply omits that id, for the caller to retry on its next sweep. The
-    SDK's own retry is disabled — its default budget is an hour."""
+    SDK's own retry is disabled — its default budget is an hour.
+
+    `on_cost`, when given, is awaited with `(gid, total_cost)` the MOMENT each
+    lookup returns — after its fetch slot is released, so the callback (which may
+    itself await) doesn't stall the other lookups. This lets a caller act on each
+    settled cost as it lands (e.g. a spend-cap check) instead of waiting on the
+    batch's slowest fetch. A callback fault is isolated so it can't abort the
+    rest of the batch."""
     ids = list(dict.fromkeys(generation_ids))
     if not ids:
         return {}
@@ -458,7 +468,13 @@ async def fetch_generation_costs(generation_ids: Iterable[str]) -> dict[str, flo
                 )
             except (OpenRouterError, httpx.HTTPError):
                 return  # not settled yet / transient — next sweep retries
-            out[gid] = res.data.total_cost
+        cost = res.data.total_cost
+        out[gid] = cost
+        if on_cost is not None:
+            try:
+                await on_cost(gid, cost)
+            except Exception:
+                pass  # a per-cost callback fault must not abort the batch
 
     async with OpenRouter(
         api_key=os.environ["OPENROUTER_API_KEY"], timeout_ms=30_000,
@@ -467,17 +483,34 @@ async def fetch_generation_costs(generation_ids: Iterable[str]) -> dict[str, flo
     return out
 
 
-async def backfill_costs(slot_logs: Iterable[logging.SlotLog]) -> int:
-    """Price every logged-but-unpriced LLM call across the given cells: find each
-    `cache.llm` carrying a `generation_id` with no matching `llm.cost`, fetch the
-    settled cost, and append an `llm.cost` event. Idempotent and restart-proof —
-    it reads only the durable log, so a call left unpriced by a slow stat or a
-    live lookup killed mid-flight is recovered on a later pass. Returns the count
-    priced this pass."""
+async def backfill_costs(
+    get_logs: Callable[[], Iterable[logging.SlotLog]],
+    on_priced: Callable[[logging.SlotLog], Awaitable[None]] | None = None,
+) -> int:
+    """Price every logged-but-unpriced LLM call across the current cells: find
+    each `cache.llm` carrying a `generation_id` with no matching `llm.cost`,
+    fetch the settled cost, and append an `llm.cost` event. Idempotent and
+    restart-proof — it reads only the durable log, so a call left unpriced by a
+    slow stat or a live lookup killed mid-flight is recovered on a later pass.
+    Returns the count priced this pass.
+
+    Each cost is appended AS IT RETURNS (via `fetch_generation_costs`'s per-cost
+    hook), and `on_priced(slot_log)` is awaited right after — so a caller's
+    spend-cap check fires the instant the tipping cost lands, not gated behind
+    the sweep's slowest unrelated lookup.
+
+    A cell reset / (re)started / A/B-launched mid-sweep swaps in a FRESH SlotLog;
+    appending through the stale object would stamp the event with its frozen
+    `index` (its old length), colliding with the live writer and breaking the
+    log's index↔position invariant that the prompt lab, rewind, and branch
+    forking all rely on. So liveness is re-checked against `get_logs()`
+    immediately before each append (which has no `await`, so it can't go stale
+    between the check and the write)."""
     # Resolve the pending set up front: the fetch awaits, and the pipeline keeps
     # appending to these same logs meanwhile — anything new is caught next pass.
     pending: list[tuple[logging.SlotLog, str]] = []
-    for sl in slot_logs:
+    seen: set[str] = set()
+    for sl in get_logs():
         events = sl.state["events"]
         resolved = {
             e.get("generation_id") for e in events if e.get("kind") == "llm.cost"
@@ -486,17 +519,29 @@ async def backfill_costs(slot_logs: Iterable[logging.SlotLog]) -> int:
             if e.get("kind") != "cache.llm":
                 continue
             gid = e.get("generation_id")
-            if isinstance(gid, str) and gid not in resolved:
+            if isinstance(gid, str) and gid not in resolved and gid not in seen:
+                seen.add(gid)  # generation ids are unique; guard against dupes
                 pending.append((sl, gid))
     if not pending:
         return 0
-    costs = await fetch_generation_costs(gid for _, gid in pending)
+    by_gid = {gid: sl for sl, gid in pending}
     priced = 0
-    for sl, gid in pending:
-        cost = costs.get(gid)
-        if cost is not None:
-            sl.log("llm.cost", generation_id=gid, cost=cost)
-            priced += 1
+
+    async def _apply(gid: str, cost: float) -> None:
+        nonlocal priced
+        sl = by_gid.get(gid)
+        # Skip a SlotLog swapped out during the fetch (reset/restart/A/B): writing
+        # through it would break its index invariant. Re-checked here, right
+        # before the await-free append, so a swap during a prior cost's
+        # `on_priced` await can't slip a stale write through.
+        if sl is None or sl not in get_logs():
+            return
+        sl.log("llm.cost", generation_id=gid, cost=cost)
+        priced += 1
+        if on_priced is not None:
+            await on_priced(sl)
+
+    await fetch_generation_costs((gid for _, gid in pending), on_cost=_apply)
     return priced
 
 

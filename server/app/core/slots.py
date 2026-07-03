@@ -41,7 +41,8 @@ SLOTS: list[Slot] = [
     Slot("interesting modern house", "A luxurious, elegantly designed and architecturally creative modern house built on flat ground"),
     Slot("more interesting modern house", "A compact, artistic, elegantly designed modern house built on flat ground"),
     Slot("specific house", "modern house constructed of several independent volumes stacked/offset together"),
-    Slot("factory", "a factory assembly line")
+    Slot("factory", "a factory assembly line"),
+    Slot("CS Dust2", "Dust II from Counter-Strike")
 ]
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}

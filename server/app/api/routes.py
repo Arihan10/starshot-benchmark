@@ -72,6 +72,16 @@ RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", _REPO_ROOT / "runs"))
 # "objects" for any cell that hasn't been migrated.
 OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
 
+# Per-cell (run × slot × model) LLM spend cap, in USD. When a cell's settled
+# OpenRouter spend crosses its effective cap, the backfill sweep auto-pauses it
+# ("spend cap reached") and it stays that way until manually overridden. Each
+# override raises the effective cap by exactly one SPEND_CAP_USD band WITHOUT
+# resetting spend, so the next stop lands at 2×, then 3×, … — a moving tripwire
+# entirely derived from the durable log (`llm.cost` + `run.cap_override`
+# events), so it's restart- and rewind-proof. Set to 0 (or negative) to disable
+# the cap entirely.
+SPEND_CAP_USD = float(os.environ.get("STARSHOT_SPEND_CAP_USD", "200"))
+
 # Python's mimetypes doesn't know glTF; without these the artifact route would
 # hand the loader its GLBs as text/plain.
 _ARTIFACT_MEDIA_TYPES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json"}
@@ -231,10 +241,44 @@ def _all_cost_logs() -> list[SlotLog]:
 async def _cost_backfill_loop() -> None:
     while True:
         try:
-            await llm.backfill_costs(_all_cost_logs())
+            # Enforce the spend cap PER cost, the instant each one settles (via
+            # the per-cost hook), not once at the end of the sweep — so a breaching
+            # cell pauses the moment its tipping cost returns rather than waiting
+            # on the batch's slowest unrelated lookup.
+            await llm.backfill_costs(_all_cost_logs, on_priced=_enforce_cap_for_log)
         except Exception:
             pass  # best-effort observability — never let the sweep die
         await asyncio.sleep(_COST_BACKFILL_INTERVAL_S)
+
+
+async def _enforce_cap_for_log(slot_log: SlotLog) -> None:
+    """Cap enforcement for ONE cell, fired by the backfill the instant a new cost
+    lands on it. If the freshly-updated settled spend has crossed the cell's cap
+    and its pipeline is still live, cancel it and stamp a `run.cap_reached`
+    notice. The cap is inherently a SOFT tripwire — cost is only known once
+    OpenRouter settles it, so a cell can drift a little past its cap before the
+    tipping cost returns.
+
+    Idempotent under the backfill's concurrent per-cost callbacks: `_cancel_task`
+    pops the task before its first await and there's no await here before it, so
+    once the first callback has cancelled, a racing second one sees no live task
+    and no-ops — exactly one notice is ever logged. A completed cell (`run.done`,
+    hence not live) is never paused. Branch logs aren't in `_slot_logs`, so they
+    never cap — matching the run-spend accounting, which excludes simulations."""
+    if SPEND_CAP_USD <= 0:
+        return
+    events = slot_log.state["events"]
+    if not _cap_reached(events):
+        return
+    key = next((k for k, v in _slot_logs.items() if v is slot_log), None)
+    if key is None or not _live(_tasks.get(key)):
+        return
+    await _cancel_task(*key)
+    slot_log.log(
+        "run.cap_reached",
+        spend=_cell_spend(events),
+        cap=_effective_cap(events),
+    )
 
 
 _cell_gates: dict[RunKey, "CellGate"] = {}
@@ -304,10 +348,14 @@ class CellGate:
         self, *, node_id: str | None, step: str | None, template: str | None = None,
         system: str, user: str, schema_name: str, model: str,
     ) -> str | None:
-        # Library matching is a mechanical per-object service step (always on its
-        # own gemini model), not a pipeline step worth click-through — never gate
-        # it and never let a model override re-aim it.
-        if step == "library_match":
+        # Mechanical per-object service steps — NOT pipeline reasoning worth a
+        # click-through — never gate: they auto-play without pausing or spending a
+        # step budget, and aren't re-aimed by a model override. library_match runs
+        # on its own gemini model; image_prompt distills a noun phrase for asset
+        # generation. So "step" / "step until" / "step sims" run straight through
+        # them (a pinned lineage still runs them on its model, already switched to
+        # by an earlier gated call).
+        if step in ("library_match", "image_prompt"):
             return None
         call = {"node": node_id, "step": step, "template": template, "schema": schema_name, "model": model}
         if self.auto:
@@ -381,11 +429,12 @@ def _gate_awaiting(gate: "CellGate | None") -> bool:
 
 def _cell_status(key: RunKey, slot_log: SlotLog) -> str:
     """Live status of a source cell — its event log refined by its live
-    gate (awaiting) and task (running)."""
+    gate (awaiting), task (running), and settled spend vs. its cap (capped)."""
     return rlog.derive_status(
         slot_log.state["events"],
         awaiting=_gate_awaiting(_cell_gates.get(key)),
         live=_live(_tasks.get(key)),
+        capped=_cap_reached(slot_log.state["events"]),
     )
 
 
@@ -2055,6 +2104,14 @@ def create_app() -> FastAPI:
                 status_code=409,
                 detail="run is complete; reset to start a new run",
             )
+        # Over the spend cap: a plain resume would just keep spending toward a
+        # limit already hit. The cap holds until explicitly overridden (which
+        # raises the ceiling and resumes) — so refuse here and point at that.
+        if _cap_reached(slot_log.state["events"]):
+            raise HTTPException(
+                status_code=409,
+                detail="spend cap reached — override the cap to continue",
+            )
         # Startable iff nothing is already driving it (running OR parked at a
         # gate both hold a live task — those advance via /step, not /resume).
         if _live(_tasks.get((run, slot_id, model_alias))):
@@ -2080,6 +2137,50 @@ def create_app() -> FastAPI:
         # run.paused event is what derive_status reads back as paused.
         slot_log.log("run.paused")
         return {"run": run, "slot_id": slot.id, "model": model_alias}
+
+    @app.post("/slots/{slot_id}/{model_alias}/cap-override")
+    async def slot_cap_override(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, run: str | None = None,
+    ) -> dict[str, object]:
+        """Override a tripped spend cap. Raises the cell's ceiling by exactly one
+        SPEND_CAP_USD band (settled spend is untouched, so the NEXT stop lands one
+        band higher — hit at 1×, override, next at 2×, …) by appending a
+        `run.cap_override` marker the cap math counts, then RESUMES the run — the
+        cap is the only thing holding it, and a plain /resume stays refused until
+        this runs. 409 unless the cell is actually at its cap (so the ceiling
+        can't be inflated on a healthy or completed cell)."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        if SPEND_CAP_USD <= 0:
+            raise HTTPException(status_code=400, detail="spend cap is disabled")
+        events = slot_log.state["events"]
+        done = any(e.get("kind") == "run.done" for e in events)
+        # Align with the `capped` STATUS (done wins over capped), so the override
+        # is only ever accepted for a cell the UI actually shows as capped.
+        if done or not _cap_reached(events):
+            raise HTTPException(status_code=409, detail="cell is not at its spend cap")
+        # One more override on record ⇒ ceiling rises to base × (overrides + 1);
+        # `_cap_overrides` still reads the pre-append count here, hence +2.
+        new_cap = SPEND_CAP_USD * (_cap_overrides(events) + 2)
+        slot_log.log("run.cap_override", cap=new_cap, spend=_cell_spend(events))
+        # Resume the now-un-capped cell. A stepped cell gets a one-call budget so
+        # it advances exactly like a /step relaunch rather than running free.
+        key: RunKey = (run, slot_id, model_alias)
+        resumed = False
+        if not _live(_tasks.get(key)):
+            if key in _stepped_cells:
+                _gate_intents[key] = {"budget": 1}
+            await _start_cell(run, slot_id, model_alias)
+            resumed = True
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "cap": new_cap,
+            "resumed": resumed,
+        }
 
     @app.post("/slots/{slot_id}/{model_alias}/retry-mesh/{node_id}")
     async def slot_retry_mesh(  # pyright: ignore[reportUnusedFunction]
@@ -3002,6 +3103,11 @@ def create_app() -> FastAPI:
         if req.until is not None and req.until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
         result = await _advance_cell(run, slot_id, model_alias, auto=req.auto, until=req.until)
+        if result == "capped":
+            raise HTTPException(
+                status_code=409,
+                detail="spend cap reached — override the cap to continue",
+            )
         if result in ("missing", "done", "not_runnable", "in_flight"):
             raise HTTPException(status_code=409, detail=f"cannot step: {result}")
         return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto, "result": result}
@@ -3522,6 +3628,70 @@ def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, float
     return usage
 
 
+# --- per-cell spend cap -------------------------------------------------------
+# A cell's authoritative spend is the sum of its settled `llm.cost` events (the
+# backfill prices each `cache.llm` against OpenRouter's own total). The cap is a
+# moving tripwire: `SPEND_CAP_USD × (overrides + 1)`, where each `run.cap_override`
+# event raises the ceiling one band WITHOUT touching spend — so the first stop
+# lands at 1×, the next (after one override) at 2×, and so on. Everything is
+# derived from the durable log, so it survives restarts and recomputes correctly
+# after a rewind drops cost / override events past the cut.
+
+
+def _cell_spend(events: list[dict[str, object]]) -> float:
+    total = 0.0
+    for e in events:
+        if e.get("kind") == "llm.cost":
+            c = e.get("cost")
+            if isinstance(c, (int, float)):
+                total += float(c)
+    return total
+
+
+def _cap_overrides(events: list[dict[str, object]]) -> int:
+    return sum(1 for e in events if e.get("kind") == "run.cap_override")
+
+
+def _effective_cap(events: list[dict[str, object]]) -> float:
+    """The cell's current cap ceiling — the base band times one plus the number
+    of overrides granted so far."""
+    return SPEND_CAP_USD * (_cap_overrides(events) + 1)
+
+
+def _cap_reached(events: list[dict[str, object]]) -> bool:
+    """True when the cap is active and settled spend has hit the ceiling. This is
+    THE source of truth for the `capped` status — the `run.cap_reached` event is
+    only a durable marker/notice, never the condition itself, so a later override
+    (raising the ceiling) un-caps the cell without any log surgery."""
+    return SPEND_CAP_USD > 0 and _cell_spend(events) >= _effective_cap(events)
+
+
+def _cap_summary(events: list[dict[str, object]]) -> dict[str, object] | None:
+    """The cost tracker's per-cell cap panel: settled `spend`, the current
+    `limit` (ceiling), whether it's `reached`, how many `overrides` were granted,
+    and the `base` band. None when the cap is disabled (SPEND_CAP_USD ≤ 0)."""
+    if SPEND_CAP_USD <= 0:
+        return None
+    spend = 0.0
+    overrides = 0
+    for e in events:
+        kind = e.get("kind")
+        if kind == "llm.cost":
+            c = e.get("cost")
+            if isinstance(c, (int, float)):
+                spend += float(c)
+        elif kind == "run.cap_override":
+            overrides += 1
+    limit = SPEND_CAP_USD * (overrides + 1)
+    return {
+        "spend": spend,
+        "limit": limit,
+        "reached": spend >= limit,
+        "overrides": overrides,
+        "base": SPEND_CAP_USD,
+    }
+
+
 def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
@@ -3550,6 +3720,9 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             # Per-model token/request totals for the cost tracker (the run's
             # actual spend = source cells; branch simulations aren't counted).
             "usage": _usage_summary(events),
+            # Per-cell spend cap panel: settled spend, current ceiling, whether
+            # it's tripped, and the override count. None when the cap is off.
+            "cap": _cap_summary(events),
         }
     return {
         "id": slot.id,
@@ -3941,6 +4114,11 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
         return "missing"
     if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
         return "done"
+    # Over the spend cap — can't relaunch to advance it (a capped cell has no
+    # live gate to release either; the cap enforcement cancelled its task). The
+    # override is the only way forward. "step all" folds this into by_result.
+    if _cap_reached(slot_log.state["events"]):
+        return "capped"
     # No live task and not done → idle / paused / error / crashed: all runnable.
     if auto:
         _set_stepped(key, False)  # finish normally, ungated
@@ -4433,7 +4611,7 @@ async def _sse(
         while True:
             event = await q.get()
             yield f"data: {json.dumps(event)}\n\n"
-            if event["kind"] in {"run.done", "run.error", "run.paused"}:
+            if event["kind"] in {"run.done", "run.error", "run.paused", "run.cap_reached"}:
                 return
     finally:
         slot_log.unsubscribe(q)

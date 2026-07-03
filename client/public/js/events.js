@@ -23,7 +23,11 @@ export function openStream(url, { onEvent, onTerminal } = {}) {
             return;
         }
         onEvent?.(event);
-        if (["run.done", "run.error", "run.paused"].includes(event.kind)) {
+        if (
+            ["run.done", "run.error", "run.paused", "run.cap_reached"].includes(
+                event.kind,
+            )
+        ) {
             close();
             onTerminal?.(event);
         }
@@ -110,6 +114,11 @@ const LOG_BUILDERS = {
     "run.done": () => ["info", "run done"],
     "run.paused": () => ["info", "run paused"],
     "run.error": (e) => ["error", e.message ?? "run error"],
+    "run.cap_reached": (e) => [
+        "warn",
+        `spend cap reached — $${(e.spend ?? 0).toFixed(2)} of $${(e.cap ?? 0).toFixed(2)}`,
+    ],
+    "run.cap_override": (e) => ["info", `spend cap raised to $${(e.cap ?? 0).toFixed(2)}`],
     "mesh.error": (e) => ["error", `${e.id}: ${e.message ?? "mesh error"}`],
     "mesh.retry": (e) => ["warn", `${e.id}: mesh retried`],
     "mesh.submit": null,

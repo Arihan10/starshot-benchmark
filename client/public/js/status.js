@@ -3,14 +3,15 @@
 // through here, so the status shown never drifts between views.
 //
 // The server already resolves `status` into one of idle | running | paused |
-// error | done (folding a cell parked at a step gate into `paused`), so the dot
-// is just that value. This module only adds the matching human label and the
-// relevant step:
+// error | done | capped (folding a cell parked at a step gate into `paused`), so
+// the dot is just that value. This module only adds the matching human label and
+// the relevant step:
 //
 //   paused  → "awaiting <next step>"   (the gated call that runs on the next step)
 //   running → "running <current step>" (the call in flight)
 //   done    → "done"
 //   error   → "error"
+//   capped  → "spend cap reached"      (auto-paused at its cap; override to continue)
 //   idle    → "not started"
 //
 // Cells and branches share the summary shape, so one function serves both.
@@ -45,6 +46,8 @@ export function statusView(summary) {
     }
     case "done": label = "done"; break;
     case "error": label = "error"; break;
+    // Auto-paused at its spend cap; stays here until the cap is overridden.
+    case "capped": label = "spend cap reached"; break;
     case "idle": label = "not started"; break;
     default: label = state;
   }

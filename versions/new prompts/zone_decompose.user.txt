@@ -20,9 +20,13 @@ Here's the list of other subregions that have been planned for this scene so far
 <IMPORTANT_INSTRUCTIONS>
 Think deeply and spatially about how `{ZONE_ID}` splits into its top-level subregions, based on its description and size. 
 
+consider the volume of `{ZONE_ID}` and and how the subregions will occupy it; by extension, ground the volume and shape of each subregion within it based on the specific function of the subregion in the region and the larger overall scene.
+
+for each subregion you plan on splitting `{ZONE_ID}` into, think about what the subregion inherently is and what shape and volume makes sense for the subregion relative to `{ZONE_ID}`. 
+
 when determining the list of subregions you want to place in this scene, carefully consider if their role can be already fulfilled by a standalone object generation pass. the landscape that carries the entire scene, for example, does not have its own distinct footprint/identity and wouldn't be a subregion - its space is intruded on by its sibling subregions, and its purpose can be fulfilled via the boundary generation step that runs on the entire scene. in contrast, a bridge spanning two sky islands would be a subregion, since it has a very distinct footprint as a connector between its sibling subregions.
 
-Decompose only into major spatial/programmatic zones that a person, vehicle, or scene activity would meaningfully occupy or move through. Do not create subregions for boundary treatments, landscape buffers, screening wraps, decorative edges, utility details, object clusters, or perimeter conditions unless they form a distinct occupiable area with its own internal layout. If a feature merely frames, screens, services, decorates, or edges another zone, leave it for boundary generation or object generation.
+Decompose only into major spatial/programmatic zones that a person, vehicle, or scene activity would meaningfully occupy or move through. Do not create subregions for boundary treatments, landscape buffers, screening wraps, decorative edges, utility details, object clusters, or perimeter conditions unless they form a distinct occupiable area with its own internal layout. If a feature merely frames, screens, services, decorates, or edges another region, leave it for boundary generation or object generation.
 
 for each subregion you have chosen to output, the placement text represents a semantic spatial description of where the region sits. your output for the placement text and the relationships array will be used as a guide to a downstream step that will compute the exact bounding boxes of each subregion. the downstream step uses the relationships array to analyze the region's position relative to already placed regions or objects in the scene that are directly relevant to this region (or other regions you're outputting in this list).
 

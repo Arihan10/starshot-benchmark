@@ -2,13 +2,14 @@
 // the active run, each card showing live status + the step it is on.
 
 import { el, openModal, toast } from "./ui.js";
-import { state, emit, on, cellKey } from "./state.js";
+import { state, emit, on, cellKey, cellSummary } from "./state.js";
 import { api } from "./api.js";
 import { createViewer } from "./scene3d.js";
 import { applySceneProjection, createObsModel } from "./events.js";
 import { renderObsTree, renderObsTrace } from "./obsmini.js";
 import { statusView } from "./status.js";
 import { closeOverlay } from "./overlay.js";
+import { createRunCombo } from "./runcombo.js";
 
 const boardEl = document.getElementById("board");
 const planeEl = document.getElementById("board-plane");
@@ -196,6 +197,18 @@ if (selectBtn) selectBtn.addEventListener("click", () => setSelectMode(!state.se
 const compareBtn = document.getElementById("btn-compare-runs");
 const compareRunBSel = document.getElementById("compare-run-b");
 
+// Run B is picked with the same searchable combobox as the topbar's active-run
+// picker (runcombo.js), scoped to every run BUT the active A. Picking sets
+// state.compareRunB — it does NOT switch the active run.
+const compareCombo = compareRunBSel
+  ? createRunCombo(compareRunBSel, {
+      getRuns: () => state.runs.filter((r) => r.name !== state.run),
+      getSelected: () => state.compareRunB,
+      onPick: (name) => { state.compareRunB = name; renderCompareUI(); },
+      placeholder: "pick run B",
+    })
+  : null;
+
 function setCompareMode(on) {
   state.compareMode = on;
   if (on) {
@@ -205,35 +218,26 @@ function setCompareMode(on) {
   renderCompareUI();
 }
 
-// Reflect the mode on the toggle + show/populate the run-B picker (every run
-// but the active A). Cheap and idempotent, so it's safe to call on every poll.
+// Reflect the mode on the toggle + show the run-B picker (every run but the
+// active A). Cheap and idempotent, so it's safe to call on every poll.
 function renderCompareUI() {
   if (!compareBtn) return;
   compareBtn.classList.toggle("on", state.compareMode);
   compareRunBSel.classList.toggle("on", state.compareMode);
-  const others = state.runs.map((r) => r.name).filter((n) => n !== state.run);
-  const sig = others.join("|");
-  if (compareRunBSel.dataset.sig !== sig) {
-    compareRunBSel.dataset.sig = sig;
-    compareRunBSel.replaceChildren(...others.map((n) => el("option", { value: n, text: n })));
-  }
   // Keep the chosen B valid as run A / the run set changes.
-  if (state.compareRunB && others.includes(state.compareRunB)) {
-    compareRunBSel.value = state.compareRunB;
-  } else {
+  const others = state.runs.map((r) => r.name).filter((n) => n !== state.run);
+  if (!state.compareRunB || !others.includes(state.compareRunB)) {
     state.compareRunB = others[0] ?? null;
-    if (state.compareRunB) compareRunBSel.value = state.compareRunB;
   }
+  compareCombo?.render();
 }
 
 if (compareBtn) compareBtn.addEventListener("click", () => setCompareMode(!state.compareMode));
-if (compareRunBSel) compareRunBSel.addEventListener("change", () => { state.compareRunB = compareRunBSel.value || null; });
 
 // Run a per-cell endpoint across the whole selection in parallel; individual
 // failures (resuming a done cell, stepping a non-stepped one, …) are counted as
 // skipped rather than aborting the batch — mirroring "start cells" / "reset all".
-async function runBulk(verb, perCell) {
-  const cells = selectedCells();
+async function runBulk(verb, perCell, cells = selectedCells()) {
   if (!cells.length) return;
   const results = await Promise.all(cells.map(async (c) => {
     try { await perCell(c); return true; } catch { return false; }
@@ -252,6 +256,13 @@ function bulkResume() {
   runBulk("resumed/started", (c) => api.resume(state.run, c.slot, c.model, stepped));
 }
 function bulkPause() { runBulk("paused", (c) => api.pause(state.run, c.slot, c.model)); }
+// Override the spend cap on just the capped cells in the selection (each raises
+// one band + resumes). Filtered client-side so healthy cells aren't touched.
+function bulkOverride() {
+  const capped = selectedCells().filter((c) => cellSummary(c.slot, c.model)?.status === "capped");
+  if (!capped.length) { toast("no capped cells in the selection", "err"); return; }
+  runBulk("caps overridden", (c) => api.capOverride(state.run, c.slot, c.model), capped);
+}
 function bulkStep(until) {
   runBulk(until ? `stepping → ${until}` : "stepped",
     (c) => api.cellStep(state.run, c.slot, c.model, { until: until || null }));
@@ -291,6 +302,7 @@ const bulkActionEls = [
   el("button", { title: "pause selected running cells", onclick: bulkPause }, "pause"),
   el("button", { title: "advance each selected cell by one LLM call", onclick: () => bulkStep(null) }, "step"),
   untilSel,
+  el("button", { title: "override the spend cap on selected capped cells & resume them", onclick: bulkOverride }, "override caps"),
   el("button", { class: "danger", title: "wipe selected cells back to idle", onclick: () => bulkReset(false) }, "reset → idle"),
   el("button", { class: "danger", title: "wipe selected cells and start them fresh", onclick: () => bulkReset(true) }, "reset & start"),
 ];

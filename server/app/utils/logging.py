@@ -45,6 +45,7 @@ _CONSOLE_STR_MAX = 240
 
 def derive_status(
     events: list[dict[str, Any]], *, awaiting: bool = False, live: bool = False,
+    capped: bool = False,
 ) -> str:
     """The single, live source of truth for a slot's status.
 
@@ -56,12 +57,18 @@ def derive_status(
         cell's auto-pause). Surfaced as `paused`; the awaited step lives in the
         gate's `pending` / the trailing `branch.step.pending` event.
       * `live` — a pipeline task is currently executing this slot.
+      * `capped` — settled spend has hit the cell's spend cap (a derived,
+        log-only fact the API layer computes). A hard stop until the cap is
+        manually overridden; see `_cap_reached` in the API layer.
 
     Resolution order (terminal markers win; then the runtime refinement; then
     the started-but-not-live fallback):
 
       * `done`    — any `run.done` (STICKY: a post-run mesh retry appends events
         after it, but a completed run is terminal — reset is the only way back).
+      * `capped`  — over the spend cap. Beats `error` deliberately: the override
+        is the ONLY way forward (a plain resume/retry is refused while capped),
+        so the UI must surface the override path, not a dead-end "retry".
       * `error`   — the latest event is `run.error` (a resume strips it first).
       * `paused`  — a gate is parked (`awaiting`).
       * `running` — a task is `live` (executing, between gates).
@@ -72,6 +79,8 @@ def derive_status(
     """
     if any(e.get("kind") == "run.done" for e in events):
         return "done"
+    if capped:
+        return "capped"
     if events and events[-1].get("kind") == "run.error":
         return "error"
     if awaiting:

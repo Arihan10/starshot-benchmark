@@ -6,4 +6,4 @@ An upstream step has already fleshed this out in more detail and devised a high-
 
 `{ROOT_PLAN}`
 
-Based on what the scene is and how you think downstream steps might populate it, produce a realistically sized and shaped overall bounding box for the whole scene.
+Based on what the scene is and how you think downstream steps might populate it, produce a realistically sized and shaped overall bounding box for the whole scene. In your reasoning trace, justify the size and shape of the scene. A bounding box that is too large for the scene's intention will result in sparse, empty layout whereas a bounding box that is too small will result in cluttered incoherent scenes. Think deeply about how the downstream REGION DECOMPOSE steps will break apart the bounding box you produce. Use all of this to produce the perfect bounding box for the scene.

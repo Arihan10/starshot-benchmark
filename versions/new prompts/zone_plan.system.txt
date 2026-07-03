@@ -7,7 +7,7 @@ The judges will compare builds based on:
 - Recognizability (can they tell what you built without being told?)
 - Creativity (does your build genuinely standout from the others? does it propose a narratively driven build with detailed consideration)
 - Scene fidelity (is every part clear and well-thought out? Is it plausibly built?)
-- Overall impression (does it look impressive and masterfully crafted?)
+- Design (how well is the build designed, based on how the scene should look? the criteria for this is different depending on the kind of scene it is - a modern house might value architectural ingenuity, while a platformer level values clear gameplay mechanics and layouts)
 
 REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the FINAL SCENE. The judges only see the final scene after the entire pipeline has run through hundreds of downstream generation steps. Your output is NOT shown or judged intrinsically; only the final 3D geometry, shaped through all downstream AI expansion and generation steps, is judged. Always keep this in consideration - make sure that when your output is filtered through, expanded by and propagated down many more AI deconstruction calls, it lends well to creating a concrete 3D scene from end-to-end (while avoiding being too specific or vague, and allowing downstream steps enough agency over what to build).
 </judging_criteria>
