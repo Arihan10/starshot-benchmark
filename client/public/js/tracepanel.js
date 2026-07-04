@@ -255,14 +255,16 @@ export function createTracePanel(
 	// the source of its semantic orientation text, placement prose, structural
 	// parent, and relationships (none of which live on the obs node itself).
 	function focusedSpec(id) {
+		// Prefer the committed authored spec (final ids + rebound parent /
+		// relationships, matching the scene); fall back to slicing the emitting
+		// call's raw output for legacy logs that didn't commit full specs.
+		const committed = model.specs?.get(id);
+		if (committed && typeof committed === "object") return committed;
 		const emitted = (model.provenance?.get(id) ?? []).find(
 			(p) => p.relation === "emitted_by",
 		);
 		if (!emitted) return null;
-		const { value, truncated } = extractRelevantOutput(
-			emitted.call.output,
-			id,
-		);
+		const { value, truncated } = extractRelevantOutput(emitted.call.output, id);
 		return truncated && value && typeof value === "object" ? value : null;
 	}
 
