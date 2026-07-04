@@ -19,6 +19,7 @@
 import { el, openModal, fmtJson, shortBytes } from "./ui.js";
 import { api } from "./api.js";
 import { on } from "./state.js";
+import { emittingRegion } from "./events.js";
 import { renderMarkdown } from "./markdown.js";
 
 // ── static grounding: the framing, pipeline explainer, and variable glossary ──
@@ -31,8 +32,9 @@ You are given, below, everything needed to reason about WHY the scene turned out
   - PROMPT TEMPLATES — the exact instructions (with variable tokens) each step operates under.
   - CURRENT SCENE — the full, final scene: the root, its global objects, and the subregion tree with every region's plan, bbox, and inline objects.
   - EXECUTION TIMELINE — every LLM step that actually ran, in order: which template on which node, its structured OUTPUT, its private REASONING, and its step-specific variable VALUES.
+  - FOCUS — when the developer pins specific steps (or a scene object/zone) as most relevant to the question, those steps are pulled OUT of the timeline and shown in full here: their exact system/input bytes, with heavy scene-wide variables left as tokens. A step is never in both the timeline and FOCUS.
 
-You are NOT given each step's fully-rendered system/user message. Reconstruct what a given step saw by combining its TEMPLATE with the scene state at that point (replay the timeline) and its logged variable VALUES. When you need a step's exact bytes, the developer can ATTACH it (its full system/input/output/reasoning is then appended under "ATTACHED STEPS").
+You are NOT given each step's fully-rendered system/user message, except the FOCUS ones. Reconstruct what a non-focus step saw by combining its TEMPLATE with the scene state at that point (replay the timeline) and its logged variable VALUES. When you need a step's exact bytes, the developer attaches it — it then moves from the timeline into FOCUS.
 
 A developer benchmarking the pipeline's spatial reasoning will ask you holistic questions about the scene — why an object sits where it does, whether a placement blocks traversal or overlaps badly, whether a decomposition was sensible, what the intent behind the layout was, where the reasoning went wrong.
 
@@ -119,6 +121,18 @@ function convId(c) {
   return c ? `${c.run}|${c.slot}|${c.model}|${c.branch || "src"}` : null;
 }
 
+// The zone_plan / zone_plan_root call bucketed on a zone — the "plan of that
+// zone" step, or null if it hasn't run.
+function zonePlanCallIndex(model, zoneId) {
+  const node = model?.nodes.get(zoneId);
+  if (!node) return null;
+  const c = node.calls.find((call) => {
+    const step = call.template ?? call.step;
+    return step === "zone_plan" || step === "zone_plan_root";
+  });
+  return c ? c.index : null;
+}
+
 function templatesBlock(templates) {
   // image_prompt (the per-object noun-phrase distiller) is left out of the base
   // context — its template + image wrappers bloat it and are rarely relevant to
@@ -163,6 +177,35 @@ function timelineBlock(steps) {
       `reasoning: ${s.reasoning ? s.reasoning : "(none exposed)"}`,
     ].join("\n");
   }).join("\n\n");
+}
+
+// Scene-wide variables whose rendered values would blow up context if repeated
+// in every attached step. In an attached step's exact bytes they're collapsed
+// back to their `{TOKEN}`; their values are defined ONCE (the scene in CURRENT
+// SCENE, the fixed image wrappers in the glossary), and the reviewer
+// reconstructs a mid-run step's scene from the timeline. Step-specific values
+// (ZONE_*, TO_PLACE, RETRY_BLOCK, OBJECT_*) stay inline — they're the per-step
+// delta and aren't duplicated across steps. Mirrors the server's timeline strip.
+const HEAVY_VARS = [
+  "SCENE_CONTEXT", "SCENE_CONTEXT_COMPACT", "ROOT_OBJECTS", "ROOT_HEADER",
+  "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF", "ADJACENT_ZONES",
+  "SIBLING_OBJECTS", "ZONE_OBJECTS",
+  "IMAGE_TEMPLATE_FRONT", "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP",
+];
+
+// Replace each heavy variable's rendered value in `text` with its `{TOKEN}`, so
+// the exact prompt is shown without inlining (and duplicating) the big blocks.
+// Longest values first, so a value nested inside a bigger one can't half-match.
+function collapseHeavyVars(text, variables) {
+  if (!text) return "";
+  if (!variables || typeof variables !== "object") return text;
+  const present = HEAVY_VARS
+    .map((name) => ({ name, val: variables[name] }))
+    .filter((v) => typeof v.val === "string" && v.val.length >= 40 && text.includes(v.val))
+    .sort((a, b) => b.val.length - a.val.length);
+  let out = text;
+  for (const { name, val } of present) out = out.split(val).join(`\`{${name}}\``);
+  return out;
 }
 
 // ── the shared chat component ────────────────────────────────────────────────
@@ -224,21 +267,19 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
 
   function attachmentBlock(idx) {
     const c = callByIndex(idx);
-    if (!c) return `### Attached step #${idx}\n(this step is no longer in the loaded event log)`;
-    const vars = c.variables && typeof c.variables === "object" && Object.keys(c.variables).length
-      ? Object.entries(c.variables).map(([k, v]) => `\`{${k}}\`:\n${v}`).join("\n\n")
-      : "(no variables logged)";
+    if (!c) return `### Focus step #${idx}\n(this step is no longer in the loaded event log)`;
+    // Show the EXACT bytes, but with the heavy scene-wide variables collapsed
+    // back to their `{TOKEN}` — their values live once in CURRENT SCENE, so
+    // attaching many steps never re-dumps the scene context. Step-specific values
+    // (zone fields, TO_PLACE, RETRY_BLOCK, …) stay inline as rendered.
     return [
-      `### Attached step #${c.index} — ${c.template ?? c.step} on ${c.node ?? "?"} (subject model: ${c.model ?? "?"})`,
+      `### Focus step #${c.index} — ${c.template ?? c.step} on ${c.node ?? "?"} (subject model: ${c.model ?? "?"})`,
       "",
-      "SYSTEM PROMPT (exact bytes the subject model operated under):",
-      c.system || "(empty)",
+      "SYSTEM (exact bytes — heavy scene-wide variables shown as their `{TOKEN}`):",
+      collapseHeavyVars(c.system, c.variables) || "(empty)",
       "",
-      "INPUT / user message (exact bytes it received):",
-      c.user || "(empty)",
-      "",
-      "RESOLVED VARIABLE VALUES:",
-      vars,
+      "INPUT / user message (exact bytes — heavy variables shown as their `{TOKEN}`):",
+      collapseHeavyVars(c.user, c.variables) || "(empty)",
       "",
       "OUTPUT:",
       fmtJson(c.output),
@@ -250,17 +291,26 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
 
   function composeSystem(t) {
     const mode = document.documentElement.dataset.pipeline || "dfs";
+    const attached = t.attached;
+    // Focus (attached) steps are PULLED OUT of the timeline and shown in full
+    // below — never in both places, so attaching a step never duplicates it.
+    const timelineSteps = attached.size
+      ? t.base.bundle.steps.filter((s) => !attached.has(s.index))
+      : t.base.bundle.steps;
     const parts = [
       INVESTIGATOR_FRAMING,
       pipelineDoc(mode),
       `# PROMPT TEMPLATES (every pipeline step except image_prompt — raw, with \`{VARIABLE}\` tokens; attach an image_prompt step to see its template)\n\n${templatesBlock(t.base.templates)}`,
       `# CURRENT SCENE\n\n${sceneBlock(t.base.bundle)}`,
-      `# EXECUTION TIMELINE (every step that ran, in order, EXCEPT the per-object image_prompt calls — its output, reasoning, and step-specific variable values)\n\n${timelineBlock(t.base.bundle.steps)}`,
+      `# EXECUTION TIMELINE (every step that ran, in order, EXCEPT the per-object image_prompt calls and the FOCUS steps below — its output, reasoning, and step-specific variable values)\n\n${timelineBlock(timelineSteps)}`,
     ];
-    if (t.attached.size) {
+    if (attached.size) {
+      // Execution order, so a mentioned object's steps read as its history:
+      // zone_plan → emitted → placed.
+      const ordered = [...attached].sort((a, b) => a - b);
       parts.push(
-        `# ATTACHED STEPS (the developer pinned these — full detail, including the exact rendered bytes)\n\n` +
-        [...t.attached].map(attachmentBlock).join("\n\n---\n\n"),
+        "# FOCUS — the step requests directly relevant to the question (pulled OUT of the timeline above and shown in full: exact system + input bytes, with the heavy scene-wide variables (`{SCENE_CONTEXT}`, `{ROOT_OBJECTS}`, `{ROOT_HEADER}`, …) collapsed to their tokens — defined once in CURRENT SCENE; reconstruct a mid-run step's scene from the timeline)\n\n" +
+        ordered.map(attachmentBlock).join("\n\n---\n\n"),
       );
     }
     return parts.join("\n\n");
@@ -287,7 +337,7 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     else if (t.baseError) base = `context failed: ${t.baseError} — click ↻`;
     else if (t.base) base = `${t.base.bundle.steps.length} steps · ${nodes} nodes`;
     else base = "context not loaded";
-    refs.status.textContent = base + (attached ? ` · ${attached} attached` : "");
+    refs.status.textContent = base + (attached ? ` · ${attached} in focus` : "");
   }
 
   function renderShellBusy() {
@@ -309,7 +359,7 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     refs.attach.replaceChildren();
     if (!t || !t.attached.size) { refs.attach.style.display = "none"; return; }
     refs.attach.style.display = "";
-    refs.attach.appendChild(el("span", { class: "ivg-attach-lab", text: "context steps:" }));
+    refs.attach.appendChild(el("span", { class: "ivg-attach-lab", text: "focus:" }));
     for (const idx of t.attached) {
       const c = callByIndex(idx);
       const label = c ? `${c.template ?? c.step} · ${c.node ?? "?"} · #${idx}` : `#${idx} (gone)`;
@@ -335,7 +385,7 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     if (!t.turns.length && !showPending) {
       refs.body.appendChild(el("div", { class: "ivg-hint" },
         el("div", { text: "Ask holistic questions about this scene — the reviewer has the full scene, every prompt template, and each step's output + reasoning. Type " }),
-        el("div", { class: "ivg-hint-emph", text: "@ to attach a specific step's exact bytes as deeper context (the “why?” buttons do this for you)." }),
+        el("div", { class: "ivg-hint-emph", text: "@ an object to attach its history (its zone's plan → emitted → placed), a zone to attach its plan + emitted + placed, or @ a step directly (the “why?” buttons attach a step for you)." }),
         el("div", { class: "ivg-suggest" }, SUGGESTIONS.map((s) =>
           el("button", { class: "ivg-chip", text: s, onclick: () => sendTurn(s) }))),
       ));
@@ -383,23 +433,45 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     );
   }
 
-  // ── @-mention step attachment ──────────────────────────────────────────────
+  // ── @-mention: attach a scene object (its emitted/placed steps) or a step ────
 
-  function stepCandidates(query) {
-    const calls = obsModel?.model.calls ?? [];
+  // Mentionable items — objects/zones first, then raw steps. Mentioning a node
+  // attaches its history in one go: its provenance calls (the decompose that
+  // EMITTED it + the bbox that PLACED it) PLUS the relevant zone_plan — a zone
+  // attaches its OWN plan; an object attaches its emitting zone's plan, i.e. the
+  // start of that object's history (plan → emitted → placed). A STEP attaches
+  // just that call.
+  function mentionCandidates(query) {
+    const model = obsModel?.model;
     const q = query.trim().toLowerCase();
-    const items = [];
-    for (const c of calls) {
-      const label = `${c.template ?? c.step ?? "?"} · ${c.node ?? "?"} · #${c.index}`;
-      if (q && !label.toLowerCase().includes(q)) continue;
-      items.push({ index: c.index, label, call: c });
+    const objects = [];
+    const steps = [];
+    if (model) {
+      for (const id of model.order) {
+        const node = model.nodes.get(id);
+        const nodeKind = node?.kind ?? "node";
+        const idxSet = new Set(
+          (model.provenance?.get(id) ?? []).map((p) => p.call?.index).filter((i) => i != null),
+        );
+        const planZone = nodeKind === "zone" ? id : emittingRegion(model, id);
+        const planIdx = planZone ? zonePlanCallIndex(model, planZone) : null;
+        if (planIdx != null) idxSet.add(planIdx);
+        const indices = [...idxSet];
+        if (!indices.length) continue; // e.g. the root before anything named / planned it
+        if (q && !`${id} ${node?.prompt ?? ""}`.toLowerCase().includes(q)) continue;
+        objects.push({ kind: "object", id, nodeKind, indices });
+      }
+      for (const c of model.calls) {
+        const label = `${c.template ?? c.step ?? "?"} · ${c.node ?? "?"} · #${c.index}`;
+        if (q && !label.toLowerCase().includes(q)) continue;
+        steps.push({ kind: "step", index: c.index, call: c });
+      }
     }
-    return items.slice(0, 60);
+    return [...objects.slice(0, 40), ...steps.slice(0, 40)];
   }
 
   function openMention(query) {
-    const items = stepCandidates(query);
-    mention = { start: mention?.start ?? refs.input.selectionStart, items, active: 0 };
+    mention = { start: mention?.start ?? refs.input.selectionStart, items: mentionCandidates(query), active: 0 };
     renderMention();
   }
 
@@ -409,8 +481,35 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     const before = input.value.slice(0, pos);
     const m = before.match(/(?:^|\s)@([\w./#-]*)$/);
     if (!m) { closeMention(); return; }
-    mention = { start: pos - m[1].length - 1, items: stepCandidates(m[1]), active: 0 };
+    mention = { start: pos - m[1].length - 1, items: mentionCandidates(m[1]), active: 0 };
     renderMention();
+  }
+
+  // mousedown (not click) so it fires before the textarea blur closes the popup.
+  function mentionRow(it, i) {
+    const t = thread();
+    const active = i === mention.active;
+    const handlers = {
+      onmousedown: (ev) => { ev.preventDefault(); selectMention(it); },
+      onmouseenter: () => { mention.active = i; syncMentionActive(); },
+    };
+    if (it.kind === "object") {
+      const allAttached = t && it.indices.every((idx) => t.attached.has(idx));
+      return el("div", { class: `ivg-mention-row${active ? " active" : ""}${allAttached ? " on" : ""}`, ...handlers },
+        el("span", { class: "ivg-mention-kind", text: it.nodeKind === "zone" ? "zone" : "obj" }),
+        el("span", { class: "ivg-mention-node", text: it.id }),
+        el("span", { class: "ivg-mention-idx", text: `${it.indices.length} step${it.indices.length === 1 ? "" : "s"}` }),
+        allAttached ? el("span", { class: "ivg-mention-tick", text: "✓" }) : null,
+      );
+    }
+    const c = it.call;
+    const attached = t?.attached.has(it.index);
+    return el("div", { class: `ivg-mention-row${active ? " active" : ""}${attached ? " on" : ""}`, ...handlers },
+      el("span", { class: "ivg-mention-step", text: c.template ?? c.step ?? "?" }),
+      el("span", { class: "ivg-mention-node", text: c.node ?? "?" }),
+      el("span", { class: "ivg-mention-idx", text: `#${it.index}` }),
+      attached ? el("span", { class: "ivg-mention-tick", text: "✓" }) : null,
+    );
   }
 
   function renderMention() {
@@ -418,24 +517,17 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     pop.replaceChildren();
     if (!mention) { pop.style.display = "none"; return; }
     if (!mention.items.length) {
-      pop.appendChild(el("div", { class: "ivg-mention-empty", text: (obsModel?.model.calls.length ? "no matching steps" : "no steps have run yet") }));
+      pop.appendChild(el("div", { class: "ivg-mention-empty", text: (obsModel?.model.calls.length ? "no matching objects or steps" : "nothing to mention yet") }));
       pop.style.display = "block";
       return;
     }
+    let lastKind = null;
     mention.items.forEach((it, i) => {
-      const c = it.call;
-      const attached = thread()?.attached.has(it.index);
-      pop.appendChild(el("div", {
-        class: `ivg-mention-row${i === mention.active ? " active" : ""}${attached ? " on" : ""}`,
-        // mousedown (not click) so it fires before the textarea blur closes the popup
-        onmousedown: (ev) => { ev.preventDefault(); selectMention(it); },
-        onmouseenter: () => { mention.active = i; syncMentionActive(); },
-      },
-        el("span", { class: "ivg-mention-step", text: c.template ?? c.step ?? "?" }),
-        el("span", { class: "ivg-mention-node", text: c.node ?? "?" }),
-        el("span", { class: "ivg-mention-idx", text: `#${it.index}` }),
-        attached ? el("span", { class: "ivg-mention-tick", text: "✓" }) : null,
-      ));
+      if (it.kind !== lastKind) {
+        lastKind = it.kind;
+        pop.appendChild(el("div", { class: "ivg-mention-head", text: it.kind === "object" ? "objects & zones" : "steps" }));
+      }
+      pop.appendChild(mentionRow(it, i));
     });
     pop.style.display = "block";
   }
@@ -447,16 +539,34 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
 
   function selectMention(it) {
     const t = thread();
-    if (t) { t.attached.add(it.index); renderAttach(); updateStatus(); }
-    // Strip the "@query" the user typed (if any) out of the textarea.
-    if (mention && typeof mention.start === "number") {
-      const input = refs.input;
-      const pos = input.selectionStart;
-      if (input.value[mention.start] === "@" && pos >= mention.start) {
-        input.value = input.value.slice(0, mention.start) + input.value.slice(pos);
-        input.selectionStart = input.selectionEnd = mention.start;
-      }
+    if (t) {
+      // An object folds in its emitted + placed steps; a step is just itself.
+      if (it.kind === "object") for (const idx of it.indices) t.attached.add(idx);
+      else t.attached.add(it.index);
+      renderAttach();
+      updateStatus();
     }
+    // Keep the mention IN the message text — replace any partial "@query" the
+    // user typed with the canonical token (or insert it at the caret when opened
+    // via the button). It's sent verbatim, so the question reads "…@sofa…"
+    // alongside the context the mention pulled in.
+    const input = refs.input;
+    const token = it.kind === "object"
+      ? `@${it.id}`
+      : `@${it.call.template ?? it.call.step ?? "step"}#${it.index}`;
+    const caret = input.selectionStart;
+    const hasQuery = mention && typeof mention.start === "number"
+      && input.value[mention.start] === "@" && caret >= mention.start;
+    const from = hasQuery ? mention.start : caret;
+    const before = input.value.slice(0, from);
+    const after = input.value.slice(caret);
+    // Space it off from surrounding words: a leading space when inserting the
+    // token (via the button) right after non-space text, and a trailing one
+    // unless the next char already is one.
+    const lead = !hasQuery && before && !/\s$/.test(before) ? " " : "";
+    const insert = lead + token + (after.startsWith(" ") ? "" : " ");
+    input.value = before + insert + after;
+    input.selectionStart = input.selectionEnd = before.length + insert.length;
     closeMention();
     refs.input.focus();
   }
@@ -576,18 +686,18 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
 
   const input = el("textarea", {
     class: "ivg-input", rows: "3", spellcheck: "false",
-    placeholder: "Ask about the whole scene…  (@ to attach a step · Enter to send · Shift+Enter for a newline)",
+    placeholder: "Ask about the whole scene…  (@ to attach an object or step · Enter to send · Shift+Enter for a newline)",
   });
   input.addEventListener("input", refreshMention);
   input.addEventListener("keydown", onInputKeydown);
   // Close the mention popup on blur, but let a refocus (e.g. clicking the
-  // "@ step" button, which briefly blurs the input then refocuses it) cancel
+  // "@ add" button, which briefly blurs the input then refocuses it) cancel
   // that close so the popup it just opened doesn't flash shut.
   input.addEventListener("blur", () => { blurTimer = setTimeout(closeMention, 150); });
   input.addEventListener("focus", () => { if (blurTimer) { clearTimeout(blurTimer); blurTimer = null; } });
   const addStepBtn = el("button", {
-    class: "ivg-add", text: "@ step",
-    title: "attach a specific pipeline step's full detail as context",
+    class: "ivg-add", text: "@ add",
+    title: "mention an object (attaches its history: zone plan → emitted → placed), a zone (its plan + emitted + placed), or a specific pipeline step",
     onclick: () => { openMention(""); input.focus(); },
   });
   const sendBtn = el("button", { class: "primary ivg-send", text: "ask", onclick: () => sendTurn() });
