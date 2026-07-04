@@ -10,6 +10,9 @@ the spec graph here. We do NOT check that the chosen parent is the
 
 from __future__ import annotations
 
+import re
+from collections.abc import Sequence
+
 from app.core.schemas import ChildNodeSpec, SubregionSpec
 
 
@@ -156,3 +159,55 @@ def validate_subregions(
                     f"subregion {s.id!r} has a relationship with unknown "
                     f"target {rel.target!r}"
                 )
+
+
+_TRAILING_INDEX = re.compile(r"^(?P<stem>.+?)_(?P<n>\d+)$")
+
+
+def _next_free_id(desired: str, taken: set[str]) -> str:
+    """`desired` if free, else the next free `{stem}_{k}`, reading a trailing
+    `_<n>` as the index (bare name = 0): `chair`->`chair_1`, `tree_2`->`tree_3`."""
+    if desired not in taken:
+        return desired
+    m = _TRAILING_INDEX.match(desired)
+    stem, n = (m.group("stem"), int(m.group("n"))) if m else (desired, 0)
+    k = n + 1
+    while f"{stem}_{k}" in taken:
+        k += 1
+    return f"{stem}_{k}"
+
+
+def uniquify_ids(
+    specs: Sequence[ChildNodeSpec | SubregionSpec],
+    *,
+    existing_ids: set[str],
+) -> list[tuple[str, str]]:
+    """Rename colliding spec ids in place — unique against `existing_ids` and
+    within the batch — so a reused id keeps its node instead of being dropped.
+    In-batch `parent`/`referenced_ids` targets pointing at a renamed
+    existing-node collision are rewritten to follow it. Returns `(old, new)`s."""
+    taken = set(existing_ids)
+    renames: list[tuple[str, str]] = []
+    rebind: dict[str, str] = {}
+    for s in specs:
+        old = s.id
+        new = _next_free_id(old, taken)
+        taken.add(new)
+        if new != old:
+            s.id = new
+            renames.append((old, new))
+            # Rebind refs only when an existing node owns `old` (a batch dup keeps it).
+            if old in existing_ids:
+                rebind[old] = new
+    if rebind:
+        for s in specs:
+            if isinstance(s, ChildNodeSpec) and s.parent in rebind:
+                s.parent = rebind[s.parent]
+            if any(r.target in rebind for r in s.referenced_ids):
+                s.referenced_ids = [
+                    r.model_copy(update={"target": rebind[r.target]})
+                    if r.target in rebind
+                    else r
+                    for r in s.referenced_ids
+                ]
+    return renames
