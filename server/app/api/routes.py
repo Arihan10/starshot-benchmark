@@ -330,9 +330,12 @@ class CellGate:
         self.budget = budget
         self._fut: asyncio.Future[dict[str, object]] | None = None
         self.auto = False  # once set, the rest of the run proceeds without pausing
-        # Fast-forward target: pass every call up to AND INCLUDING one with this
-        # TEMPLATE, then pause before the NEXT call ("run THROUGH step X").
+        # Fast-forward target: pass every call up to one with this TEMPLATE.
+        # `until_before` picks where to stop relative to that call: False (the
+        # default) runs THROUGH it and pauses before the NEXT call ("after X");
+        # True pauses in front of it, so X itself doesn't execute ("before X").
         self.until_step: str | None = None
+        self.until_before: bool = False
         self.pending: dict[str, object] | None = None
         # The call CURRENTLY in flight — released from a pause, or run on a
         # budget credit / in auto. Lets the UI show "running X" instead of the
@@ -361,20 +364,26 @@ class CellGate:
         if self.auto:
             self.current = call
             return self.model_override
-        # Seeking a target step: blow past every call up to AND INCLUDING the
-        # target, then pause at the NEXT one — "step until X" runs THROUGH X (X
-        # finishes executing) and stops before whatever follows it. `until_step`
-        # is a template id (the lab's granular step name), so match on `template`
-        # (root/nested variants differ there, not in `step`).
+        # Seeking a target step: blow past every call until one whose TEMPLATE
+        # matches (root/nested variants differ in `template`, not `step`). Where
+        # we stop depends on `until_before`:
+        #   * after  (False): run THROUGH the target, then pause at the NEXT call.
+        #   * before (True):  pause in front of the target — it does NOT execute.
         if self.until_step is not None:
-            if (template or step) == self.until_step:
-                # Reached the target: run it now (don't pause before it), then
-                # disarm so the NEXT call hits the pause below. Drop any queued
-                # step credits too, so the breakpoint can't be skipped past.
-                self.until_step = None
-                self.budget = 0
-            self.current = call
-            return self.model_override
+            if (template or step) != self.until_step:
+                self.current = call
+                return self.model_override  # not the target yet — pass
+            # Reached the target: disarm the seek + drop any queued step credits
+            # so the breakpoint can't be skipped past.
+            self.until_step = None
+            self.budget = 0
+            if not self.until_before:
+                # "after X": run X now (don't pause before it); the NEXT call
+                # hits the pause below.
+                self.current = call
+                return self.model_override
+            # "before X": fall through to the pause branch so we stop in front
+            # of this call — X only runs on the next explicit step.
         if self.budget > 0:
             self.budget -= 1
             self.current = call
@@ -528,14 +537,16 @@ class BranchRequest(BaseModel):
 
 class BranchStepRequest(BaseModel):
     """Advance a gated cell/branch. `auto=True` runs the rest to completion;
-    `until` (a template id) fast-forwards THROUGH the next call of that step
-    (it executes) and pauses before the following one. `model` (a model ALIAS) re-aims a branch's next
-    gated call at a chosen LLM — compare's per-step model A/B — independent of
-    the model that produced the pre-branch scene; None keeps the branch's
-    current model."""
+    `until` (a template id) fast-forwards to the next call of that step —
+    pausing AFTER it (through the call, the default) or BEFORE it when
+    `until_before=True` (the call doesn't execute). `model` (a model ALIAS)
+    re-aims a branch's next gated call at a chosen LLM — compare's per-step
+    model A/B — independent of the model that produced the pre-branch scene;
+    None keeps the branch's current model."""
 
     auto: bool = False
     until: str | None = None
+    until_before: bool = False
     model: str | None = None
 
 
@@ -3118,7 +3129,7 @@ def create_app() -> FastAPI:
         _require_model(model_alias)
         if req.until is not None and req.until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
-        result = await _advance_cell(run, slot_id, model_alias, auto=req.auto, until=req.until)
+        result = await _advance_cell(run, slot_id, model_alias, auto=req.auto, until=req.until, until_before=req.until_before)
         if result == "capped":
             raise HTTPException(
                 status_code=409,
@@ -3129,18 +3140,19 @@ def create_app() -> FastAPI:
         return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto, "result": result}
 
     @app.post("/runs/{run}/step-all")
-    async def run_step_all(run: str, auto: bool = False, until: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def run_step_all(run: str, auto: bool = False, until: str | None = None, until_before: bool = False) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Advance EVERY stepped cell in the run — regardless of whether it's
         paused at a live gate, mid-call, or sitting paused with no task (the
         "move the whole experiment forward" action). Each gets ONE queued step
         (so none is skipped for being mid-call), keeping the run in lockstep.
-        `auto=true` runs them all to completion; `until=<step>` runs them all
-        THROUGH the next call of that step, pausing before the following one."""
+        `auto=true` runs them all to completion; `until=<step>` runs them all to
+        the next call of that step — pausing AFTER it, or BEFORE it (it doesn't
+        execute) when `until_before=true`."""
         if until is not None and until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {until}")
         results: dict[str, list[str]] = {}
         for r, slot_id, alias in [k for k in _stepped_cells if k[0] == run]:
-            res = await _advance_cell(r, slot_id, alias, auto=auto, until=until)
+            res = await _advance_cell(r, slot_id, alias, auto=auto, until=until, until_before=until_before)
             results.setdefault(res, []).append(f"{slot_id}/{alias}")
         advanced = results.get("stepped", []) + results.get("launched", []) + results.get("queued", []) + results.get("seeking", [])
         return {"run": run, "advanced": advanced, "auto": auto, "until": until, "by_result": results}
@@ -3163,7 +3175,7 @@ def create_app() -> FastAPI:
         if req.model is not None and req.model not in MODELS:
             raise HTTPException(status_code=400, detail=f"unknown model: {req.model}")
         model_id = MODELS[req.model] if req.model is not None else None
-        result = await _advance_branch(branch_id, auto=req.auto, until=req.until, model=model_id)
+        result = await _advance_branch(branch_id, auto=req.auto, until=req.until, until_before=req.until_before, model=model_id)
         if result in ("missing", "done", "not_runnable"):
             raise HTTPException(status_code=409, detail=f"cannot step: {result}")
         return {"branch": branch_id, "auto": req.auto, "until": req.until, "result": result, "ran_model": req.model}
@@ -4148,11 +4160,12 @@ def _objects_dir(cell_dir: Path) -> Path:
     )
 
 
-async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None) -> str:
+async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None, until_before: bool = False) -> str:
     """Advance a stepped source cell. Three modes:
       * `auto`   — run it to completion, ungated.
-      * `until`  — run THROUGH the next call of template `until` (it executes),
-                   pausing before the call after it.
+      * `until`  — fast-forward to the next call of template `until`, pausing
+                   AFTER it (through the call) or, when `until_before`, BEFORE
+                   it (the call doesn't execute).
       * default  — advance by exactly one LLM call.
 
     Works from EITHER state, which is what keeps a multi-model run in sync:
@@ -4172,12 +4185,16 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
             return "stepped"
         if until is not None:
             if gate.pending and gate.pending.get("template") == until:
-                # Paused right BEFORE the target. "Through X" means run exactly
-                # this call, then pause at the next — a single step from here.
-                # (Re-seeking would skip past it to the NEXT occurrence of X.)
+                # Already paused right before a call of the target step.
+                if until_before:
+                    return "stepped"  # that IS the "before X" breakpoint — no-op
+                # "after X": run exactly this call, then pause at the next — a
+                # single step from here. (Re-seeking would skip past it to the
+                # NEXT occurrence of X.)
                 gate.proceed()
                 return "stepped"
             gate.until_step = until
+            gate.until_before = until_before
             gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
             return "seeking"
         if gate.proceed():
@@ -4203,19 +4220,21 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
         _set_stepped(key, False)  # finish normally, ungated
     else:
         _set_stepped(key, True)
-        _gate_intents[key] = {"until": until} if until is not None else {"budget": 1}
+        _gate_intents[key] = (
+            {"until": until, "until_before": until_before} if until is not None else {"budget": 1}
+        )
     await _start_cell(run, slot_id, model_alias)
     return "launched"
 
 
-async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = None, model: str | None = None) -> str:
+async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = None, until_before: bool = False, model: str | None = None) -> str:
     """Advance a simulation branch — the branch mirror of `_advance_cell`, so
     "step sims" behaves like "step all": it queues rather than erroring when a
     branch isn't sitting at a live gate.
       * live gate: release a current pause, else QUEUE a credit (budget++) the
         branch spends at its next gate — so a branch mid-call isn't skipped.
-      * `auto` runs it to completion; `until` runs THROUGH the next call of that
-        template (it executes) and pauses before the call after it.
+      * `auto` runs it to completion; `until` fast-forwards to the next call of
+        that template, pausing AFTER it or (when `until_before`) BEFORE it.
       * `model` (an OpenRouter id) re-aims the next gated call at a chosen LLM —
         sticky on the gate until changed, so the same scene context can be
         tested against different models.
@@ -4237,11 +4256,15 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
             return "stepped"
         if until is not None:
             if gate.pending and gate.pending.get("template") == until:
-                # Paused right BEFORE the target — "through X" is a single step
-                # from here (re-seeking would skip to the NEXT occurrence of X).
+                # Already paused right before a call of the target step.
+                if until_before:
+                    return "stepped"  # that IS the "before X" breakpoint — no-op
+                # "after X": run exactly this call, then pause at the next
+                # (re-seeking would skip to the NEXT occurrence of X).
                 gate.proceed()
                 return "stepped"
             gate.until_step = until
+            gate.until_before = until_before
             gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
             return "seeking"
         if gate.proceed():
@@ -4257,8 +4280,10 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
         blog.truncate_events_to(len(events) - 1)
     if auto:
         intent: dict[str, object] = {"auto": True}
+    elif until is not None:
+        intent = {"until": until, "until_before": until_before}
     else:
-        intent = {"until": until} if until is not None else {"budget": 1}
+        intent = {"budget": 1}
     if model is not None:
         intent["model"] = model  # seed the relaunched gate's override
     br.gate_intent = intent
@@ -4495,6 +4520,7 @@ async def _run_branch(branch_id: str) -> None:
     gate.auto = bool(intent.get("auto", False))
     _b_until = intent.get("until")
     gate.until_step = str(_b_until) if _b_until else None
+    gate.until_before = bool(intent.get("until_before", False))
     br.gate = gate
     llm.set_step_gate(gate.wait)
     prompt = blog.state["prompt"]
@@ -5020,6 +5046,7 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         gate.auto = bool(intent.get("auto", False))
         _until = intent.get("until")
         gate.until_step = str(_until) if _until else None
+        gate.until_before = bool(intent.get("until_before", False))
         _cell_gates[key] = gate
         llm.set_step_gate(gate.wait)
     prompt = slot_log.state["prompt"]

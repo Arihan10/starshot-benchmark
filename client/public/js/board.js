@@ -1,7 +1,7 @@
 // The run board: a pannable/zoomable plane of every (slot × model) cell in
 // the active run, each card showing live status + the step it is on.
 
-import { el, openModal, toast } from "./ui.js";
+import { el, openModal, toast, stepUntilSelect } from "./ui.js";
 import { state, emit, on, cellKey, cellSummary } from "./state.js";
 import { api } from "./api.js";
 import { createViewer } from "./scene3d.js";
@@ -263,9 +263,9 @@ function bulkOverride() {
   if (!capped.length) { toast("no capped cells in the selection", "err"); return; }
   runBulk("caps overridden", (c) => api.capOverride(state.run, c.slot, c.model), capped);
 }
-function bulkStep(until) {
-  runBulk(until ? `stepping → ${until}` : "stepped",
-    (c) => api.cellStep(state.run, c.slot, c.model, { until: until || null }));
+function bulkStep(until, before = false) {
+  runBulk(until ? `stepping → ${before ? "before " : ""}${until}` : "stepped",
+    (c) => api.cellStep(state.run, c.slot, c.model, { until: until || null, untilBefore: before }));
 }
 function bulkReset(start) {
   const cells = selectedCells();
@@ -292,10 +292,11 @@ function bulkReset(start) {
 // picker keep their state across board re-renders) and shown only in select mode.
 const steppedCheck = el("input", { type: "checkbox" });
 const bulkCount = el("span", { class: "bulk-count" });
-const untilSel = el("select", { class: "step-until",
-  title: "run every selected cell through the next call of a step, then pause before the following one" },
-  el("option", { value: "", text: "step until…" }));
-untilSel.addEventListener("change", () => { const v = untilSel.value; untilSel.value = ""; if (v) bulkStep(v); });
+const untilSel = stepUntilSelect(
+  () => state.steps,
+  (until, before) => bulkStep(until, before),
+  { label: "step until…", title: "run every selected cell up to the next call of a step — pause before or after it" },
+);
 const bulkActionEls = [
   el("button", { class: "primary", title: "start idle / resume paused selected cells", onclick: bulkResume }, "resume / start"),
   el("label", { class: "bulk-stepped", title: "resume/start in step mode (pause before each LLM call)" }, steppedCheck, "stepped"),
@@ -331,11 +332,6 @@ function renderSelectionUI() {
   bulkCount.textContent = `${n} selected`;
   for (const node of bulkNeedsSelection) node.disabled = n === 0;
   steppedCheck.disabled = n === 0;
-  // The "step until…" options come from the run's step list (fetched after the
-  // first slots poll) — populate them once they're available.
-  if (state.steps.length && untilSel.options.length <= 1) {
-    for (const s of state.steps) untilSel.appendChild(el("option", { value: s, text: `▸ ${s}` }));
-  }
 }
 
 // --- scenes view: a grid of live 3D canvases, one per active run -----------------

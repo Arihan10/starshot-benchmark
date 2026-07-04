@@ -1217,8 +1217,8 @@ function renderHeader() {
 		if (!branch && state.steps.length) {
 			if (!untilSel) {
 				untilSel = stepUntilSelect(
-					state.steps,
-					(until) => stepCurrent(false, until),
+					() => state.steps,
+					(until, before) => stepCurrent(false, until, before),
 					{ label: "until…" },
 				);
 				untilSel.id = "overlay-step-until";
@@ -1381,7 +1381,7 @@ function revertBranchToCall(call) {
 	}));
 }
 
-async function stepCurrent(auto, until = null) {
+async function stepCurrent(auto, until = null, before = false) {
 	const { slot, model, branch } = state.view ?? {};
 	if (!slot) return;
 	try {
@@ -1391,6 +1391,7 @@ async function stepCurrent(auto, until = null) {
 			const r = await api.cellStep(state.run, slot, model, {
 				auto,
 				until,
+				untilBefore: before,
 			});
 			// A paused cell that was just relaunched (vs. a live gate released over
 			// the existing stream) needs a fresh subscription to watch the call land.

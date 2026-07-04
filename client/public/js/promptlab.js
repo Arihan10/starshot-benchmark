@@ -242,6 +242,7 @@ function revertStepToBase(step) {
           if (state.lab.step === step) selectStep(step);
           else renderSteps();
           toast(`reverted ${step} to base version "${r.restored_from}"`, "ok");
+          emit("prompts-applied", state.run);
         } catch (e) { setError(e.message); }
       } }),
     ],
@@ -673,10 +674,12 @@ function steppedCellCount() {
 // of a target step, pause them all there, and jump the lab to it. The option
 // list is filled lazily once `state.steps` loads.
 function makeUntilSelect() {
-  const sel = el("select", { class: "step-until", style: "display:none",
-    title: "run every stepped cell through the next call of a step, then pause before the following one" },
-    el("option", { value: "", text: "all until…" }));
-  sel.addEventListener("change", () => { const v = sel.value; sel.value = ""; if (v) stepAllUntil(v); });
+  const sel = stepUntilSelect(
+    () => state.steps,
+    (until, before) => stepAllUntil(until, before),
+    { label: "all until…", title: "run every stepped cell up to the next call of a step — pause before or after it" },
+  );
+  sel.style.display = "none";
   return sel;
 }
 const labUntilEl = makeUntilSelect();
@@ -694,19 +697,21 @@ const labExitEl = makeExitBtn();
 // "step all until"). Shown in the action bar only while the selection is
 // simulating; option list filled lazily in updateActionBar.
 function makeSimUntilSelect() {
-  const sel = el("select", { class: "step-until", style: "display:none",
-    title: "run every selected simulation branch through the next call of a step, then pause before the following one" },
-    el("option", { value: "", text: "step until…" }));
-  sel.addEventListener("change", () => { const v = sel.value; sel.value = ""; if (v) stepSelectedBranches(v); });
+  const sel = stepUntilSelect(
+    () => state.steps,
+    (until, before) => stepSelectedBranches(until, before),
+    { label: "step until…", title: "run every selected simulation branch up to the next call of a step — pause before or after it" },
+  );
+  sel.style.display = "none";
   return sel;
 }
 const simUntilEl = makeSimUntilSelect();
 
-async function stepAllUntil(until) {
+async function stepAllUntil(until, before = false) {
   let r;
-  try { r = await api.stepAll(state.run, { until }); }
+  try { r = await api.stepAll(state.run, { until, untilBefore: before }); }
   catch (e) { toast(e.message, "err"); return; }
-  toast(`fast-forwarding ${r.advanced.length} cell${r.advanced.length === 1 ? "" : "s"} to ${until}`,
+  toast(`fast-forwarding ${r.advanced.length} cell${r.advanced.length === 1 ? "" : "s"} to ${before ? "before " : ""}${until}`,
     r.advanced.length ? "ok" : "err");
   navigateToStep(until);
   emit("poll-now");
@@ -726,9 +731,6 @@ function updateStepAllButtons() {
   const n = steppedCellCount();
   labStepAllEl.style.display = n ? "" : "none";
   labStepAllEl.textContent = `step all (${n})`;
-  if (state.steps.length && labUntilEl.options.length <= 1) {
-    for (const s of state.steps) labUntilEl.appendChild(el("option", { value: s, text: `▸ ${s}` }));
-  }
   labUntilEl.style.display = (n && state.steps.length) ? "" : "none";
   labExitEl.style.display = n ? "" : "none";
 }
@@ -1265,9 +1267,6 @@ function updateActionBar() {
     testBtn.textContent = `step sims (${steppable.length})`;
     testBtn.title = "advance every selected simulation branch one LLM call";
     testBtn.disabled = steppable.length === 0;
-    if (state.steps.length && simUntilEl.options.length <= 1) {
-      for (const s of state.steps) simUntilEl.appendChild(el("option", { value: s, text: `▸ ${s}` }));
-    }
     simUntilEl.style.display = state.steps.length ? "" : "none";
     simBtn.textContent = `break out (${branched.length})`;
     simBtn.title = "discard every selected simulation branch (its downstream events + meshes)";
@@ -1725,14 +1724,14 @@ function simRow(sim, grouped) {
 // or a single lineage — THROUGH the next call of `until` (it executes), pausing
 // each before the following step. The per-target mirror of stepSelectedBranches,
 // wired to the "step until…" picker beside a group's / row's compare + break-out.
-async function stepBranchesUntil(sims, until) {
+async function stepBranchesUntil(sims, until, before = false) {
   const live = sims.filter((s) => branchSummaryById(s.id)?.status !== "done");
   if (!live.length) return;
   await Promise.all(live.map(async (s) => {
-    try { await api.branchStep(s.id, { until }); }
+    try { await api.branchStep(s.id, { until, untilBefore: before }); }
     catch (e) { toast(`${s.slot}·${s.model}: ${e.message}`, "err"); }
   }));
-  toast(`running ${live.length} lineage${live.length === 1 ? "" : "s"} through ${until}`, "ok");
+  toast(`running ${live.length} lineage${live.length === 1 ? "" : "s"} ${before ? "up to before" : "through"} ${until}`, "ok");
   emit("poll-now");
   renderSims();
   refreshCardScenes();
@@ -1744,9 +1743,9 @@ async function stepBranchesUntil(sims, until) {
 function simUntilSelectFor(sims) {
   if (!state.steps.length) return null;
   if (!sims.some((s) => branchSummaryById(s.id)?.status !== "done")) return null;
-  return stepUntilSelect(state.steps, (until) => stepBranchesUntil(sims, until), {
+  return stepUntilSelect(() => state.steps, (until, before) => stepBranchesUntil(sims, until, before), {
     label: "step until…",
-    title: "run this zone's lineage(s) through the next call of a step, then pause before the following one",
+    title: "run this zone's lineage(s) up to the next call of a step — pause before or after it",
   });
 }
 
@@ -1816,12 +1815,12 @@ function replaceSourceWithSim(sim) {
 // selected branch one call (or fast-forward to `until`), or break them all
 // out. Like "step all", each branch QUEUES rather than erroring when it isn't
 // sitting at a gate. Per-branch errors toast but don't abort the rest.
-async function stepSelectedBranches(until = null) {
+async function stepSelectedBranches(until = null, before = false) {
   const branches = selectedBranches().filter((b) => b.status !== "done");
   if (!branches.length) return;
   testBtn.disabled = true;
   await Promise.all(branches.map(async (b) => {
-    try { await api.branchStep(b.id, { until }); }
+    try { await api.branchStep(b.id, { until, untilBefore: before }); }
     catch (e) { toast(`${b.slot}·${b.model}: ${e.message}`, "err"); }
   }));
   emit("poll-now");
@@ -1908,6 +1907,7 @@ function applyToRunModal() {
           lab.tests = new Map();
           await openLab();
           emit("poll-now");
+          emit("prompts-applied", state.run);
           renderSims();
           refreshCardScenes();
         } catch (e) { setError(e.message); }
@@ -1929,6 +1929,9 @@ function applyToRunModal() {
                 : "source version not found, not synced");
             }
             if (parts.length) toast(parts.join(" · "), "ok");
+            // The run's snapshot changed in place — let the investigator drop any
+            // cached context for this run so it re-reads the new templates.
+            emit("prompts-applied", state.run);
           }
           if (simSel.value) {
             const steps = simSel.value === "*" ? editedSteps : [simSel.value];
