@@ -210,6 +210,11 @@ export function createObsModel() {
         // it, which matters most for negative-space objects whose region isn't
         // their structural parent.
         provenance: new Map(),
+        // id -> the committed authored spec (ObjectSpec / SubregionSpec dump) from
+        // `generation.decompose` / `generation.next` / `divider.zone_decompose` —
+        // final ids with rebound parent / relationships, so the info panel's
+        // authored fields match the scene (vs the raw call output, pre-rename).
+        specs: new Map(),
         errorCount: 0,
         maxIndex: -1,
     };
@@ -284,6 +289,32 @@ export function createObsModel() {
         if (out.object && typeof out.object === "object") tag(out.object.id);
     }
 
+    // A committed `*.id_collision` re-keys an `emitted_by` entry from the raw id
+    // the model proposed to the final id `uniquify_ids` assigned, so provenance
+    // keys on the same ids as the scene (bbox / committed emissions). The
+    // colliding call is the most-recent `emitted_by` on `old` before the event;
+    // the pre-existing node that legitimately holds `old` keeps its own entry.
+    function relocateEmitted(event) {
+        const { old: from, new: to } = event;
+        if (typeof from !== "string" || typeof to !== "string") return;
+        const arr = model.provenance.get(from);
+        if (!arr) return;
+        let pick = null;
+        for (const e of arr) {
+            if (e.relation !== "emitted_by") continue;
+            if (typeof event.index === "number" && e.call.index >= event.index)
+                continue;
+            if (!pick || (e.call.index ?? -1) > (pick.call.index ?? -1)) pick = e;
+        }
+        if (!pick) return;
+        const rest = arr.filter((e) => e !== pick);
+        if (rest.length) model.provenance.set(from, rest);
+        else model.provenance.delete(from);
+        const dst = model.provenance.get(to) ?? [];
+        dst.push({ relation: "emitted_by", call: pick.call });
+        model.provenance.set(to, dst);
+    }
+
     function feed(event) {
         const idx = typeof event.index === "number" ? event.index : null;
         if (idx !== null) {
@@ -324,6 +355,7 @@ export function createObsModel() {
                     n.parentId = n.parentId ?? (c.parent || event.node);
                     n.prompt = n.prompt ?? c.prompt;
                     n.kind = "zone";
+                    model.specs.set(c.id, c);
                 }
                 return true;
             }
@@ -360,6 +392,22 @@ export function createObsModel() {
                 node(event.id).error = event.message ?? "mesh error";
                 return true;
             }
+            case "generation.decompose": {
+                for (const o of event.objects ?? [])
+                    if (o && typeof o === "object" && o.id)
+                        model.specs.set(o.id, o);
+                return true;
+            }
+            case "generation.next": {
+                if (event.object && typeof event.object === "object" && event.id)
+                    model.specs.set(event.id, event.object);
+                return true;
+            }
+            case "generation.id_collision":
+            case "divider.id_collision": {
+                relocateEmitted(event);
+                return true;
+            }
             default:
                 return entry !== null || idx !== null;
         }
@@ -371,6 +419,7 @@ export function createObsModel() {
         model.calls.length = 0;
         model.log.length = 0;
         model.provenance.clear();
+        model.specs.clear();
         model.errorCount = 0;
         model.maxIndex = -1;
     }

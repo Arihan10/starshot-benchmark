@@ -42,13 +42,20 @@ from typing import Any, Literal
 import trimesh
 
 from app.core import prompt_store, scene_context, schemas
+from app.core.slots import MODELS
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
 from app.services import hunyuan, hunyuan_tencent, llm, nano_banana, prefabs, symmetry, threed
 from app.utils import glass, glb_place, logging
 from app.utils.geometry import export_glb, rescale_mesh_to_bbox, rotate_mesh
+from app.utils.topology import uniquify_ids
 
 _USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
+
+# When true, the `image_prompt` noun-phrase step (see `_distill_subject`) runs on
+# gemini-flash-lite instead of the run's configured model — a cheap distill, like
+# library-match / symmetry, kept off the benchmark model surface.
+_DOWNGRADE_NOUN_PHRASE = os.environ.get("DOWNGRADE_NOUN_PHRASE", "false").lower() == "true"
 
 # Mesh backends a build can route to. Keys are the values the API accepts; each
 # exposes an identical `generate_mesh(...)`, so picking one is a dict lookup. The
@@ -325,7 +332,18 @@ async def _decompose_objects(
             emitted=[s.model_dump() for s in out.objects],
         )
         return []
-    return list(out.objects)
+    specs = list(out.objects)
+    # Rename any id colliding with an existing node with an incrementing index
+    existing_ids = {n.id for n in all_nodes}
+    for old, new in uniquify_ids(specs, existing_ids=existing_ids):
+        logging.log(
+            "generation.id_collision",
+            zone=zone.id,
+            scenario=scenario,
+            old=old,
+            new=new,
+        )
+    return specs
 
 
 async def _next_object_batch(
@@ -361,6 +379,16 @@ async def _next_object_batch(
     objects = list(decision.objects)
     if not decision.objects_required or not objects:
         return True, []
+    # Rename any id colliding with an existing node with an incrementing index
+    existing_ids = {n.id for n in all_nodes}
+    for old, new in uniquify_ids(objects, existing_ids=existing_ids):
+        logging.log(
+            "generation.id_collision",
+            zone=zone.id,
+            scenario="anchor",
+            old=old,
+            new=new,
+        )
     return False, objects
 
 
@@ -753,6 +781,10 @@ async def _distill_subject(
     Resumes from the committed `image` event when present, so a replayed object
     keeps the exact phrase the rest of the scene already references downstream.
 
+    When `DOWNGRADE_NOUN_PHRASE` is set, this step runs on gemini-flash-lite
+    instead of the run's configured model — both the automatic and `force` paths —
+    distilling the phrase cheaply, off the benchmark model surface.
+
     `force=True` (the regenerate-noun-phrase path) skips BOTH the committed-`image`
     short-circuit and the content-addressed LLM cache (via `call_llm_once`), so the
     phrase is re-distilled fresh every call — a repeated regenerate actually
@@ -771,29 +803,42 @@ async def _distill_subject(
         zone=zone,
         nodes=nodes,
     )
-    if force:
-        # Uncached, unlogged-as-cache.llm one-shot: no cache read (so it re-rolls)
-        # and no cache.llm write (so the NEXT forced re-roll also misses). The new
-        # phrase becomes the source of truth via a fresh `image` event the caller
-        # logs, not via this call.
-        validated, *_ = await llm.call_llm_once(
+    # DOWNGRADE_NOUN_PHRASE: force this step onto gemini-flash-lite regardless of
+    # the run's configured model (the same override library-match / symmetry use).
+    # Set the model ContextVar once so both call paths inherit it; the finally-reset
+    # restores the run model even if call_llm re-aims it internally.
+    token = (
+        llm._current_model.set(MODELS["gemini-flash-lite"])
+        if _DOWNGRADE_NOUN_PHRASE
+        else None
+    )
+    try:
+        if force:
+            # Uncached, unlogged-as-cache.llm one-shot: no cache read (so it re-rolls)
+            # and no cache.llm write (so the NEXT forced re-roll also misses). The new
+            # phrase becomes the source of truth via a fresh `image` event the caller
+            # logs, not via this call.
+            validated, *_ = await llm.call_llm_once(
+                system=ps.system("image_prompt", variables),
+                user=ps.user("image_prompt", variables),
+                output_schema=schemas.ImagePromptOutput,
+                model=llm.current_model(),
+                step="image_prompt",
+            )
+            return validated.prompt
+        out = await llm.call_llm(
             system=ps.system("image_prompt", variables),
             user=ps.user("image_prompt", variables),
             output_schema=schemas.ImagePromptOutput,
-            model=llm.current_model(),
+            node_id=spec_id,
             step="image_prompt",
+            template="image_prompt",
+            variables=variables,
         )
-        return validated.prompt
-    out = await llm.call_llm(
-        system=ps.system("image_prompt", variables),
-        user=ps.user("image_prompt", variables),
-        output_schema=schemas.ImagePromptOutput,
-        node_id=spec_id,
-        step="image_prompt",
-        template="image_prompt",
-        variables=variables,
-    )
-    return out.prompt
+        return out.prompt
+    finally:
+        if token is not None:
+            llm._current_model.reset(token)
 
 
 async def _build_image_prompt(

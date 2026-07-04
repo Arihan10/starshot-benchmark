@@ -43,7 +43,7 @@ from app.core.types import BoundingBox, Node, ParentRelationshipKind
 from app.pipeline import committed, generation
 from app.services import llm
 from app.utils import logging
-from app.utils.topology import validate_subregions
+from app.utils.topology import uniquify_ids, validate_subregions
 
 
 async def _pick_overall_bbox(prompt: str, scene_plan: str) -> BoundingBox:
@@ -220,6 +220,10 @@ async def _build(
     if not is_atomic:
         logging.emit_step(node.id, "decomposing")
         decomp = await _decompose_zone(node=node, all_nodes=all_nodes)
+        existing_ids = {n.id for n in all_nodes}
+        # Rename any id colliding with an existing node with an incrementing index
+        for old, new in uniquify_ids(decomp.subregions, existing_ids=existing_ids):
+            logging.log("divider.id_collision", node=node.id, old=old, new=new)
         logging.log_once(
             "divider.zone_decompose",
             match_fields=("node",),
@@ -227,7 +231,6 @@ async def _build(
             children=[c.model_dump() for c in decomp.subregions],
         )
 
-        existing_ids = {n.id for n in all_nodes}
         # Subregions always parent to THIS zone (deterministic containment), so
         # there's no orphan / parent-chain failure mode to hard-gate. What's
         # left is advisory — unique ids and resolvable peer-relationship hints;
