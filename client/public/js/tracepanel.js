@@ -1257,7 +1257,7 @@ export function createTracePanel(
 						class: "call-ask",
 						text: "why?",
 						style: "margin-left:auto",
-						title: "continue this step's conversation with the model that made it — ask it anything",
+						title: "open the scene investigator with this step attached — ask about it in the context of the whole scene",
 						onclick: (ev) => {
 							ev.stopPropagation();
 							onInquire(call);

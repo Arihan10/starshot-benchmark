@@ -21,7 +21,7 @@ import {
 import { statusView } from "./status.js";
 import { createObsDock } from "./obstree.js";
 import { createTracePanel } from "./tracepanel.js";
-import * as inquiry from "./inquiry.js";
+import { createInvestigator } from "./investigator.js";
 
 const overlayEl = document.getElementById("overlay");
 const titleEl = document.getElementById("overlay-title");
@@ -73,7 +73,7 @@ export function initOverlay(sceneViewer) {
 	tracePanel = createTracePanel(document.getElementById("trace-panel"), {
 		onNavigate: focusNode,
 		onClose: () => viewer.clearSelection(),
-		onInquire: openInquiryForCall,
+		onInquire: investigateCall,
 		// Per-object generated-asset controls, live only while viewing a source
 		// cell's generated build: regenerate on a chosen backend + symmetry ops +
 		// prefab link/unlink.
@@ -219,10 +219,10 @@ export function initOverlay(sceneViewer) {
 	});
 	viewer.onHiddenChange(() => dock.renderTree(obs.model));
 
-	// "why?" on any call row (dock OR the left emittance-trace panel) → the
-	// decision-inquiry chat for that step. Read-only, so it's shared across
-	// source AND branch views and reads the live view at click time.
-	dock.setOnInquire(openInquiryForCall);
+	// "why?" on any call row (dock OR the left emittance-trace panel) → open the
+	// investigator with that step attached. Reads the live view at click time, so
+	// it's shared across source AND branch views.
+	dock.setOnInquire(investigateCall);
 
 	document
 		.getElementById("overlay-close")
@@ -283,6 +283,7 @@ export function initOverlay(sceneViewer) {
 	});
 	on("open-cell", openCell);
 	initObsResizer();
+	setupInvestigator();
 	refreshZoneLayers();
 }
 
@@ -792,6 +793,10 @@ function deleteNode(id) {
 const OBSDOCK_WIDTH_KEY = "starshot.obsdockWidth";
 const OBSDOCK_MIN = 320;
 const CANVAS_MIN = 360;
+const INVESTIGATOR_WIDTH_KEY = "starshot.investigatorWidth";
+const INVESTIGATOR_MIN = 340;
+let investigatorOpen = false;
+let inv = null; // the shared investigator chat instance (see investigator.js)
 
 function initObsResizer() {
 	const resizer = document.getElementById("obsdock-resizer");
@@ -806,20 +811,25 @@ function initObsResizer() {
 	if (saved >= OBSDOCK_MIN) dock.style.width = `${saved}px`;
 
 	let dragging = false;
+	let dockRight = 0;
+	let bodyLeft = 0;
 	resizer.addEventListener("pointerdown", (ev) => {
 		dragging = true;
 		resizer.classList.add("dragging");
 		resizer.setPointerCapture(ev.pointerId);
 		ev.preventDefault();
+		// The dock's right edge is pinned during the drag (its right neighbour —
+		// the investigator column when open, else the body edge — is fixed-width),
+		// so capture it once and size the dock from it. This keeps the resizer
+		// correct whether or not the investigator column sits to the dock's right,
+		// where the body's right edge is no longer the dock's.
+		dockRight = dock.getBoundingClientRect().right;
+		bodyLeft = body.getBoundingClientRect().left;
 	});
 	resizer.addEventListener("pointermove", (ev) => {
 		if (!dragging) return;
-		const rect = body.getBoundingClientRect();
-		const max = Math.max(OBSDOCK_MIN, rect.width - CANVAS_MIN);
-		const width = Math.max(
-			OBSDOCK_MIN,
-			Math.min(rect.right - ev.clientX, max),
-		);
+		const max = Math.max(OBSDOCK_MIN, dockRight - bodyLeft - CANVAS_MIN);
+		const width = Math.max(OBSDOCK_MIN, Math.min(dockRight - ev.clientX, max));
 		dock.style.width = `${Math.round(width)}px`;
 	});
 	const end = (ev) => {
@@ -844,6 +854,85 @@ function initObsResizer() {
 	resizer.addEventListener("pointercancel", end);
 }
 
+// The per-slot investigator: a docked, toggleable chat column at the right edge
+// of the overlay (right of the observability dock). The header button flips it;
+// investigator.js renders the chat + owns its per-cell threads, and openCell
+// (re)binds it to the viewed cell.
+function setupInvestigator() {
+	inv = createInvestigator(document.getElementById("investigator"), {
+		onClose: () => setInvestigator(false),
+	});
+	document
+		.getElementById("overlay-investigate")
+		.addEventListener("click", () => setInvestigator(!investigatorOpen));
+	initInvestigatorResizer();
+}
+
+function setInvestigator(open) {
+	investigatorOpen = open;
+	document.getElementById("investigator").classList.toggle("open", open);
+	document.getElementById("investigator-resizer").style.display = open ? "" : "none";
+	document.getElementById("overlay-investigate").classList.toggle("on", open);
+	if (open) inv.onShown();
+}
+
+// Drag the divider left of the investigator column to set its width; the canvas
+// (flex) absorbs the change. Clamped so the obs dock + a minimum canvas survive,
+// and persisted like the obs dock's width.
+function initInvestigatorResizer() {
+	const resizer = document.getElementById("investigator-resizer");
+	const inv = document.getElementById("investigator");
+	const dock = document.getElementById("obsdock");
+	const body = document.getElementById("overlay-body");
+	let saved = NaN;
+	try {
+		saved = Number(localStorage.getItem(INVESTIGATOR_WIDTH_KEY));
+	} catch {
+		/* private mode */
+	}
+	if (saved >= INVESTIGATOR_MIN) inv.style.width = `${saved}px`;
+
+	let dragging = false;
+	let invRight = 0;
+	let bodyLeft = 0;
+	let reserved = 0; // obs dock + the two resizers — kept clear for the canvas min
+	resizer.addEventListener("pointerdown", (ev) => {
+		dragging = true;
+		resizer.classList.add("dragging");
+		resizer.setPointerCapture(ev.pointerId);
+		ev.preventDefault();
+		invRight = inv.getBoundingClientRect().right; // pinned to the body's right edge
+		bodyLeft = body.getBoundingClientRect().left;
+		reserved = dock.getBoundingClientRect().width + 14;
+	});
+	resizer.addEventListener("pointermove", (ev) => {
+		if (!dragging) return;
+		const max = Math.max(INVESTIGATOR_MIN, invRight - bodyLeft - reserved - CANVAS_MIN);
+		const width = Math.max(INVESTIGATOR_MIN, Math.min(invRight - ev.clientX, max));
+		inv.style.width = `${Math.round(width)}px`;
+	});
+	const end = (ev) => {
+		if (!dragging) return;
+		dragging = false;
+		resizer.classList.remove("dragging");
+		try {
+			resizer.releasePointerCapture(ev.pointerId);
+		} catch {
+			/* already released */
+		}
+		try {
+			localStorage.setItem(
+				INVESTIGATOR_WIDTH_KEY,
+				String(parseInt(inv.style.width, 10) || INVESTIGATOR_MIN),
+			);
+		} catch {
+			/* private mode */
+		}
+	};
+	resizer.addEventListener("pointerup", end);
+	resizer.addEventListener("pointercancel", end);
+}
+
 // Re-aim the selection at a lineage node (a breadcrumb click in the trace
 // panel). A node with a 3D box is selected + framed — that drives the panel via
 // onSelect; a box-less ancestor (e.g. the root before its box paints) just
@@ -857,13 +946,15 @@ function focusNode(id) {
 	}
 }
 
-// Open the decision-inquiry chat grounded in a call — shared by the dock and the
-// left trace panel's "why?" buttons. Reads the live view so it carries the
-// current cell/run/branch context.
-function openInquiryForCall(call) {
-	if (!state.view) return;
-	const { slot, model, branch } = state.view;
-	inquiry.openInquiry(call, { run: state.run, slot, model, branch });
+// "why?" on a call row (dock OR the left trace panel) → open the investigator
+// with that step attached as deep context. The per-step chat is now just the
+// shared investigator focused on one call; it reads the live view (which the
+// investigator is already bound to via openCell), so it works for source AND
+// branch cells alike.
+function investigateCall(call) {
+	if (!state.view || call?.index == null) return;
+	setInvestigator(true);
+	inv.attachStep(call.index);
 }
 
 function scheduleTreeRender() {
@@ -909,13 +1000,13 @@ export async function openCell({
 	stopGenPoll();
 	clearGeneratedState();
 	state.view = { slot, model, branch };
-	// Close any inquiry chat that belongs to a different cell/mode (same-cell
-	// re-subscribes from resume/step keep it open).
-	inquiry.notifyView({ run, slot, model, branch });
 	overlayEl.classList.add("open");
 	viewer.setActive(true);
 	viewer.clear({ keepCamera });
 	obs = createObsModel();
+	// (Re)bind the investigator to this cell + its fresh obs model; preload its
+	// base grounding when the panel is already open (no focus steal on reloads).
+	inv.setContext({ run, slot, model, branch }, obs, { fetch: investigatorOpen });
 	dock.resetDock();
 	// Selection is per-cell (viewer.clear drops it without notifying), so the
 	// left trace panel can't carry a stale focus into the incoming scene.
@@ -1406,5 +1497,6 @@ export function closeOverlay() {
 	viewer.setActive(false);
 	dock.setPinStep(null);
 	tracePanel.reset();
-	inquiry.closeInquiry();
+	setInvestigator(false);
+	inv.reset();
 }

@@ -427,10 +427,21 @@ export const api = {
 			body: { steps, cells },
 		}),
 
-	// --- decision inquiry ---
-	// Ask the reviewer (Claude Opus 4.8, xhigh) why a step's subject model
-	// decided what it did. `body` carries the client-assembled reviewer `system`
-	// (analyst framing + the step's system/input/output/reasoning grounding) plus
-	// the running `messages` thread; returns {answer, reasoning, model}.
+	// --- reviewer chat ---
+	// The stateless reviewer (Claude Opus 4.8, xhigh) behind the scene
+	// investigator. `body` carries the client-assembled `system` (analyst framing
+	// + scene grounding + step timeline + any attached steps) plus the running
+	// `messages` thread; returns {answer, reasoning, model}.
 	inquire: (body) => request("/inquire", { method: "POST", body }),
+
+	// --- per-slot investigator ---
+	// The faithful base grounding for the whole-scene investigator chat: the
+	// canonically-rendered final scene context + a timeline of every executed
+	// step's output / reasoning / step-specific variable values. The client pairs
+	// this with the run's prompt templates and forwards the composed prompt
+	// through `/inquire`. Read-only.
+	investigator: (run, slot, model) =>
+		request(cellPath(slot, model, "/investigator"), { params: { run } }),
+	branchInvestigator: (bid) =>
+		request(`/branches/${encodeURIComponent(bid)}/investigator`),
 };

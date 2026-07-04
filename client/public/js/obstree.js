@@ -58,8 +58,8 @@ export function createObsDock(hostEl, { trace = true } = {}) {
   // then re-run from there). null hides the per-call revert affordance (e.g.
   // when viewing a branch, or in the read-only run-compare panes).
   let onRevert = null;
-  // Overlay-provided: "ask why the model did this" — opens the decision-inquiry
-  // chat grounded in this call. Read-only, so it's offered on branch calls too.
+  // Overlay-provided: "ask why the model did this" — opens the investigator with
+  // this call attached as context. Read-only, so it's offered on branch calls too.
   let onInquire = null;
   // Overlay-provided: "add this zone to the prompt lab's downstream-simulation
   // slots". null hides the affordance (e.g. on a branch view — you simulate from
@@ -155,7 +155,7 @@ export function createObsDock(hostEl, { trace = true } = {}) {
         onInquire ? el("button", {
           class: "call-ask",
           text: "why?",
-          title: "continue this step's conversation with the model that made it — ask it anything",
+          title: "open the scene investigator with this step attached — ask about it in the context of the whole scene",
           onclick: (ev) => { ev.stopPropagation(); onInquire(call); },
         }) : null,
       ),
