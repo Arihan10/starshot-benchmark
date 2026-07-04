@@ -71,23 +71,129 @@ export function field(labelText, control) {
   return el("label", { class: "m-field" }, el("span", { text: labelText }), control);
 }
 
-// Compact "fast-forward to a step" picker: choosing a step fires onPick(step)
-// then resets to the placeholder. Used to step (one cell or all) until the
-// next run of a target step.
+// --- step-until picker -------------------------------------------------------
+// A custom popover (NOT a native <select>) that picks a target step AND where to
+// stop relative to it: pause BEFORE the step's next call (it doesn't run) or
+// AFTER it (run through it, pause at the following call). The before/after
+// choice is a single shared mode, persisted so it's consistent across every
+// step-until control in the app. `onPick(step, before)` fires on a step click.
+
+const STEP_UNTIL_DIR_KEY = "starshot.stepUntilBefore";
+let stepUntilBefore = false;
+try {
+  stepUntilBefore = localStorage.getItem(STEP_UNTIL_DIR_KEY) === "1";
+} catch {
+  /* private mode */
+}
+
+let openStepPop = null; // { pop, trigger, cleanup } — only one open at a time
+
+function closeStepUntilPop() {
+  if (!openStepPop) return;
+  openStepPop.cleanup();
+  openStepPop.pop.remove();
+  openStepPop = null;
+}
+
+// Anchor the popover under the trigger (flipping above / shifting left near the
+// viewport edges). Fixed-positioned in viewport coords, so it re-anchors on
+// scroll/resize rather than being clipped by an overflow container.
+function positionStepPop(pop, trigger) {
+  const r = trigger.getBoundingClientRect();
+  pop.style.visibility = "hidden";
+  pop.style.top = "0px";
+  pop.style.left = "0px";
+  const pw = pop.offsetWidth;
+  const ph = pop.offsetHeight;
+  let top = r.bottom + 4;
+  if (top + ph > window.innerHeight - 8) top = Math.max(8, r.top - 4 - ph);
+  let left = r.left;
+  if (left + pw > window.innerWidth - 8) left = Math.max(8, window.innerWidth - 8 - pw);
+  pop.style.top = `${Math.round(top)}px`;
+  pop.style.left = `${Math.round(left)}px`;
+  pop.style.visibility = "";
+}
+
+// `steps` may be an array or a getter — evaluated when the popover OPENS, so a
+// control built before the step list loads still shows the current steps.
 export function stepUntilSelect(steps, onPick, { label = "until…", title } = {}) {
-  const sel = el("select", {
+  const trigger = el("button", {
     class: "step-until",
-    title: title ?? "run through the next call of a step, then pause before the following one",
-  },
-    el("option", { value: "", text: label }),
-    (steps || []).map((s) => el("option", { value: s, text: `▸ ${s}` })),
-  );
-  sel.addEventListener("change", () => {
-    const v = sel.value;
-    sel.value = "";
-    if (v) onPick(v);
+    text: label,
+    title: title ?? "run up to the next call of a step — pause before it or after it",
   });
-  return sel;
+  trigger.addEventListener("click", (ev) => {
+    ev.stopPropagation();
+    if (openStepPop && openStepPop.trigger === trigger) { closeStepUntilPop(); return; }
+    closeStepUntilPop();
+    openStepUntilPop(trigger, steps, onPick);
+  });
+  return trigger;
+}
+
+function openStepUntilPop(trigger, steps, onPick) {
+  const stepList = typeof steps === "function" ? (steps() || []) : (steps || []);
+  const pop = el("div", { class: "step-until-pop" });
+
+  // before/after toggle (shared, persisted mode) at the top.
+  const beforeBtn = el("button", { class: "su-seg-btn", text: "before", title: "pause in front of the step — it does NOT run" });
+  const afterBtn = el("button", { class: "su-seg-btn", text: "after", title: "run through the step, then pause at the next call" });
+  const syncSeg = () => {
+    beforeBtn.classList.toggle("on", stepUntilBefore);
+    afterBtn.classList.toggle("on", !stepUntilBefore);
+  };
+  const setDir = (b) => {
+    stepUntilBefore = b;
+    try { localStorage.setItem(STEP_UNTIL_DIR_KEY, b ? "1" : "0"); } catch { /* private mode */ }
+    syncSeg();
+  };
+  beforeBtn.addEventListener("click", (e) => { e.stopPropagation(); setDir(true); });
+  afterBtn.addEventListener("click", (e) => { e.stopPropagation(); setDir(false); });
+  syncSeg();
+  pop.appendChild(el("div", { class: "su-seg-row" },
+    el("span", { class: "su-seg-lab", text: "pause" }),
+    el("div", { class: "su-seg" }, beforeBtn, afterBtn),
+  ));
+
+  if (!stepList.length) {
+    pop.appendChild(el("div", { class: "su-empty", text: "no steps loaded yet" }));
+  } else {
+    const list = el("div", { class: "su-list" });
+    for (const s of stepList) {
+      list.appendChild(el("button", {
+        class: "su-step", text: s,
+        onclick: (e) => {
+          e.stopPropagation();
+          const before = stepUntilBefore;
+          closeStepUntilPop();
+          onPick(s, before);
+        },
+      }));
+    }
+    pop.appendChild(list);
+  }
+
+  document.body.appendChild(pop);
+  positionStepPop(pop, trigger);
+
+  const onDocClick = (e) => { if (!pop.contains(e.target) && e.target !== trigger) closeStepUntilPop(); };
+  // Capture Escape so it closes only the popover (not the overlay/modal behind it).
+  const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); closeStepUntilPop(); } };
+  const onReflow = () => positionStepPop(pop, trigger);
+  setTimeout(() => document.addEventListener("click", onDocClick), 0); // skip the opening click
+  document.addEventListener("keydown", onKey, true);
+  window.addEventListener("resize", onReflow);
+  window.addEventListener("scroll", onReflow, true);
+  openStepPop = {
+    pop,
+    trigger,
+    cleanup: () => {
+      document.removeEventListener("click", onDocClick);
+      document.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("resize", onReflow);
+      window.removeEventListener("scroll", onReflow, true);
+    },
+  };
 }
 
 // Objects multiselect dropdown for a 3D viewer — the replacement for the old

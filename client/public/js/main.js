@@ -3,7 +3,7 @@
 
 import { api } from "./api.js";
 import { state, emit, on } from "./state.js";
-import { el, toast, openModal, field } from "./ui.js";
+import { el, toast, openModal, field, stepUntilSelect } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { renderBoard } from "./board.js";
 import { initOverlay, closeOverlay } from "./overlay.js";
@@ -168,9 +168,6 @@ function updateStatusText() {
   // of whether it's paused at a live gate, mid-call, or paused with no task.
   stepAllBtn.style.display = stepped > 0 ? "" : "none";
   stepAllBtn.textContent = `step all (${stepped})`;
-  if (state.steps.length && stepAllUntilEl.options.length <= 1) {
-    for (const s of state.steps) stepAllUntilEl.appendChild(el("option", { value: s, text: `▸ ${s}` }));
-  }
   stepAllUntilEl.style.display = (stepped > 0 && state.steps.length) ? "" : "none";
   exitSteppingEl.style.display = stepped > 0 ? "" : "none";
 }
@@ -188,23 +185,21 @@ document.getElementById("btn-step-all").addEventListener("click", async () => {
 // "step all until <step>": fast-forward every stepped slot to the next run of
 // the chosen step and pause them all there — gets the whole experiment onto
 // the same step for side-by-side comparison.
-const stepAllUntilEl = el("select", {
-  id: "step-all-until", class: "step-until", style: "display:none",
-  title: "run every stepped slot through the next call of a step, then pause before the following one",
-}, el("option", { value: "", text: "all until…" }));
+const stepAllUntilEl = stepUntilSelect(
+  () => state.steps,
+  async (until, before) => {
+    try {
+      const r = await api.stepAll(state.run, { until, untilBefore: before });
+      toast(`fast-forwarding ${r.advanced.length} slot${r.advanced.length === 1 ? "" : "s"} to ${before ? "before " : ""}${until}`, "ok");
+      refreshSlots();
+    } catch (e) {
+      toast(e.message, "err");
+    }
+  },
+  { label: "all until…", title: "run every stepped slot up to the next call of a step — pause before or after it" },
+);
+stepAllUntilEl.style.display = "none";
 document.getElementById("btn-step-all").after(stepAllUntilEl);
-stepAllUntilEl.addEventListener("change", async () => {
-  const until = stepAllUntilEl.value;
-  stepAllUntilEl.value = "";
-  if (!until) return;
-  try {
-    const r = await api.stepAll(state.run, { until });
-    toast(`fast-forwarding ${r.advanced.length} slot${r.advanced.length === 1 ? "" : "s"} to ${until}`, "ok");
-    refreshSlots();
-  } catch (e) {
-    toast(e.message, "err");
-  }
-});
 
 // "exit stepping": let every stepped slot run to completion and leave step mode.
 const exitSteppingEl = el("button", {

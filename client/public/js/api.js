@@ -109,16 +109,16 @@ export const api = {
 	// that step (it executes), pausing before the following one. A plain step
 	// (neither) advances one call — queued if the cell is mid-call, so a "step
 	// all" never skips a slow model.
-	cellStep: (run, slot, model, { auto = false, until = null } = {}) =>
+	cellStep: (run, slot, model, { auto = false, until = null, untilBefore = false } = {}) =>
 		request(cellPath(slot, model, "/step"), {
 			method: "POST",
 			params: { run },
-			body: { auto, until },
+			body: { auto, until, until_before: untilBefore },
 		}),
-	stepAll: (run, { auto = false, until = null } = {}) =>
+	stepAll: (run, { auto = false, until = null, untilBefore = false } = {}) =>
 		request(`/runs/${encodeURIComponent(run)}/step-all`, {
 			method: "POST",
-			params: { auto, until },
+			params: { auto, until, until_before: untilBefore },
 		}),
 	pause: (run, slot, model) =>
 		request(cellPath(slot, model, "/pause"), {
@@ -371,10 +371,10 @@ export const api = {
 	// following one. A plain step queues if the branch is mid-call (so a batch
 	// "step sims" never errors on a not-yet-gated branch).
 	// `modelOverride` (a model alias) re-aims the next gated call at a chosen LLM.
-	branchStep: (bid, { auto = false, until = null, model = null } = {}) =>
+	branchStep: (bid, { auto = false, until = null, untilBefore = false, model = null } = {}) =>
 		request(`/branches/${encodeURIComponent(bid)}/step`, {
 			method: "POST",
-			body: { auto, until, model },
+			body: { auto, until, until_before: untilBefore, model },
 		}),
 	// Revert a branch to before `toEventIndex` and pause there; a following
 	// branchStep re-runs from the cut under the current snapshot + `overrides`

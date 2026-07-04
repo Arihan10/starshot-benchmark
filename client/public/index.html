@@ -959,18 +959,97 @@
 				white-space: nowrap;
 			}
 			/* "step (all) until <step>" picker — sits next to step / step-all. */
-			select.step-until {
+			/* ---------- step-until picker (custom popover) ---------- */
+			/* Trigger button (replaces the old native <select>); the popover it
+			   opens carries the before/after toggle + the step list. */
+			.step-until {
 				font-size: 11px;
-				padding: 3px 6px;
+				padding: 3px 8px;
 				max-width: 160px;
 				background: var(--panel-2);
 				color: var(--text-dim);
 				border: 1px solid var(--line);
 				border-radius: 5px;
 				cursor: pointer;
+				white-space: nowrap;
 			}
-			select.step-until:hover {
+			.step-until:hover {
 				border-color: var(--accent-line);
+			}
+			.step-until-pop {
+				position: fixed;
+				z-index: 130; /* transient, above the overlay (100) + modals (120) */
+				min-width: 180px;
+				max-height: 60vh;
+				display: flex;
+				flex-direction: column;
+				gap: 4px;
+				padding: 6px;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-radius: 8px;
+				box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+			}
+			.su-seg-row {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 2px 4px 6px;
+				border-bottom: 1px solid var(--line);
+			}
+			.su-seg-lab {
+				color: var(--text-faint);
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+				font-size: 10px;
+			}
+			.su-seg {
+				display: flex;
+				margin-left: auto;
+				border: 1px solid var(--line);
+				border-radius: 6px;
+				overflow: hidden;
+			}
+			.su-seg-btn {
+				font-size: 11px;
+				padding: 3px 10px;
+				background: var(--panel-2);
+				color: var(--text-dim);
+				border: none;
+				cursor: pointer;
+			}
+			.su-seg-btn + .su-seg-btn {
+				border-left: 1px solid var(--line);
+			}
+			.su-seg-btn.on {
+				background: var(--accent);
+				color: var(--bg);
+			}
+			.su-list {
+				display: flex;
+				flex-direction: column;
+				gap: 1px;
+				overflow: auto;
+			}
+			.su-step {
+				text-align: left;
+				font-size: 12px;
+				padding: 5px 8px;
+				background: transparent;
+				color: var(--text);
+				border: none;
+				border-radius: 5px;
+				cursor: pointer;
+				white-space: nowrap;
+			}
+			.su-step:hover {
+				background: var(--panel-2);
+				color: var(--accent);
+			}
+			.su-empty {
+				color: var(--text-faint);
+				font-size: 11px;
+				padding: 6px 8px;
 			}
 
 			/* ---------- board multi-select ---------- */

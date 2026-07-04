@@ -18,11 +18,12 @@
 
 import { el, openModal, fmtJson, shortBytes } from "./ui.js";
 import { api } from "./api.js";
+import { on } from "./state.js";
 import { renderMarkdown } from "./markdown.js";
 
 // ── static grounding: the framing, pipeline explainer, and variable glossary ──
 
-const INVESTIGATOR_FRAMING = `You are a senior spatial-reasoning analyst investigating a COMPLETE 3D scene that an automated pipeline built from a single text prompt. The pipeline uses language models at every reasoning step: it recursively decomposes the prompt into a tree of regions (zones) and objects, each with an axis-aligned bounding box, an orientation, and spatial relationships, then generates a mesh for every leaf object and composes them into one scene.
+const INVESTIGATOR_FRAMING = `You are a senior spatial-reasoning analyst investigating a complete or mid-construction 3D scene that an automated pipeline built from a single text prompt. The pipeline uses language models at every reasoning step: it recursively decomposes the prompt into a tree of regions (zones) and objects, each with an axis-aligned bounding box, an orientation, and spatial relationships, then generates a mesh for every leaf object and composes them into one scene. The pipeline should be built to handle any kind of scene - modern houses, platformer levels, shooter maps, etc. - your job is to answer any questions that the user may have about the scene, by concretely analyzing the evidence and data provided.
 
 You are given, below, everything needed to reason about WHY the scene turned out the way it did:
   - PIPELINE — how the pipeline works, its steps, and the world frame.
@@ -39,7 +40,10 @@ Rules:
   - Ground every claim in the provided material. Cite specific ids, coordinates, dimensions, steps (by template + node), and template clauses. A model's own REASONING is the strongest evidence of intent — quote it when it explains a decision.
   - Separate what a step actually reasoned from what you are inferring from its output + the scene. When the evidence is silent, say so plainly: "the reasoning doesn't address this" and "this looks like an unexplained / arbitrary choice" are valid, valuable answers. Never invent motives.
   - Reason spatially and quantitatively: the world frame is right-handed, Y-up, metres — +X is right, +Y is up, +Z is toward the viewer (front), -Z is away (back). A bounding box is an origin (min corner) + dimensions. Geometry is additive, so well-formed scenes keep boxes flush rather than overlapping.
-  - Answer in GitHub-flavoured Markdown: lead with the direct answer, then the evidence. Use headings, bullet lists, tables, and \`inline code\` for ids/coords. Keep it tight and skimmable.`;
+  - Answer in GitHub-flavoured Markdown: lead with the direct answer, then the evidence. Use headings, bullet lists, tables, and \`inline code\` for ids/coords. Keep it tight and skimmable.
+  - Do not use dense jargon and goofy structured documents, output cleanly using flowing paragraphs with no massive assumed priors and dense jargon.
+  - Base all advice regarding the pipeline's prompts on the principle of generalizability - avoid simply saying "give negative examples" or "explicit rule" unless as a last resort. The prompts should convey the character and role to the LLM, not explicitly say what to do unless absolutely necessary.
+  `;
 
 const PIPELINE_STEPS = [
   ["zone_plan_root", "once per run — plan the overall scene from the user prompt and decide whether it is atomic (a leaf) or should be subdivided."],
@@ -99,14 +103,15 @@ const SUGGESTIONS = [
   "What was the intent behind the overall layout — does it match the prompt?",
 ];
 
-// ── module-level (shared across instances): pure helpers + a run→templates cache ──
+// ── module-level (shared across instances): pure helpers ──
 
-const templatesCache = new Map(); // run -> steps[] (run-level, safe to share)
-
+// The run's CURRENT prompt snapshot, fetched fresh on each base build — NOT
+// cached client-side. The prompt lab's "apply to run" / "revert to base" edit the
+// snapshot in place, so a per-run cache would serve stale templates after an
+// edit. The payload is small and the server caches it, so re-fetching per base
+// build (open / ↻ refresh) is cheap and always reflects the active snapshot.
 async function loadTemplates(run) {
-  if (templatesCache.has(run)) return templatesCache.get(run);
   const payload = await api.promptTemplates(run);
-  templatesCache.set(run, payload.steps);
   return payload.steps;
 }
 
@@ -596,6 +601,21 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
   refs = { title, sub, status, body, attach, input, sendBtn, mention: mentionPop };
   renderTranscript();
   updateStatus();
+
+  // A prompt-lab edit to a run's snapshot (apply-to-run / revert-to-base)
+  // invalidates every built base for that run's cells, so the next use re-fetches
+  // the CURRENT templates + scene. The bound thread refreshes live; the rest
+  // rebuild lazily on their next open / ↻ / send.
+  on("prompts-applied", (run) => {
+    let currentTouched = false;
+    for (const [id, t] of threads) {
+      if (!id.startsWith(`${run}|`)) continue;
+      t.base = null;
+      t.baseError = null;
+      if (id === currentId) currentTouched = true;
+    }
+    if (currentTouched) { updateStatus(); ensureBase(); }
+  });
 
   // ── public instance API ──────────────────────────────────────────────────
 
