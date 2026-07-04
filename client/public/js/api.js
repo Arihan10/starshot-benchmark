@@ -80,6 +80,14 @@ export const api = {
 				cells,
 			},
 		}),
+	// Copy an entire slot folder (every model cell + its meshes) from
+	// `sourceRun` into `destRun`, OVERWRITING destRun's slot. Returns
+	// {run, source_run, slot, copied:[...], replaced:[...]}.
+	copySlot: (destRun, sourceRun, slot) =>
+		request(`/runs/${encodeURIComponent(destRun)}/copy-slot`, {
+			method: "POST",
+			body: { source_run: sourceRun, slot },
+		}),
 	activateRun: (name) =>
 		request(`/runs/${encodeURIComponent(name)}/activate`, {
 			method: "POST",
@@ -412,11 +420,13 @@ export const api = {
 	// Reset the run's snapshot back to its base source version (the inverse of
 	// updateRunPrompts' version-sync) — discards the lab's in-place prompt edits.
 	//   step → revert ONLY that step's prompt (the per-prompt revert); omit to
-	//     restore every step from the base version.
-	restoreRunPrompts: (run, step = null) =>
+	//     restore every step.
+	//   version → restore from THAT source version instead of the run's base
+	//     (omit for the base). Content-only: the run's base is left unchanged.
+	restoreRunPrompts: (run, step = null, version = null) =>
 		request(`/runs/${encodeURIComponent(run)}/prompt-templates/restore`, {
 			method: "POST",
-			params: { step },
+			params: { step, version },
 		}),
 	// Fork a simulation branch in each cell at its earliest call of any of
 	// `steps` (non-destructive — source untouched). Replaces the old destructive

@@ -207,41 +207,59 @@ function renderSteps() {
       hasBaseVersion ? el("button", {
         class: "lab-step-revert",
         text: "↩",
-        title: `revert this prompt to the run's base version — discards edits (applied or unsaved) to ${step}`,
-        onclick: (ev) => { ev.stopPropagation(); revertStepToBase(step); },
+        title: `revert this prompt to a chosen prompt version (default: the run's base) — discards edits (applied or unsaved) to ${step}`,
+        onclick: (ev) => { ev.stopPropagation(); revertStepFromVersion(step); },
       }) : null,
       ),
     );
   }
 }
 
-// Revert ONE step's prompt in the run's snapshot back to its base version — the
-// per-prompt form of applyToRunModal's "restore from version" (which does every
-// step at once). Discards this step's edits, applied or unsaved; other steps are
-// untouched.
-function revertStepToBase(step) {
-  const versionLabel = state.runs.find((r) => r.name === state.run)?.prompt_version;
-  openModal(`revert ${step} to base version?`, (close, setError) => ({
+// A <select> of every prompt version, defaulting to this run's base, for the
+// restore-from-version modals. Fetched fresh so a just-forked version is
+// pickable; the base is folded in (labelled) even if the list can't be loaded,
+// so restore-to-base always works.
+async function versionSelectForRestore() {
+  const base = state.runs.find((r) => r.name === state.run)?.prompt_version || null;
+  let versions = [];
+  try { versions = (await api.versions()).versions.map((v) => v.name); }
+  catch { /* fall back to the base alone below */ }
+  if (base && !versions.includes(base)) versions = [base, ...versions];
+  const sel = el("select", {},
+    versions.map((v) => el("option", { value: v, text: v === base ? `${v} (base)` : v })));
+  if (base && versions.includes(base)) sel.value = base;
+  return { sel, versions, base };
+}
+
+// Revert ONE step's prompt in the run's snapshot to a chosen source version
+// (defaults to the run's base) — the per-prompt form of restoreFromVersionModal
+// (which does every step at once). Discards this step's edits, applied or
+// unsaved; other steps are untouched.
+async function revertStepFromVersion(step) {
+  const { sel, versions } = await versionSelectForRestore();
+  if (!versions.length) { toast("no prompt versions to restore from", "err"); return; }
+  openModal(`revert ${step} to a version?`, (close, setError) => ({
     body: [
+      field("restore from version", sel),
       el("div", { class: "m-hint", text:
-        `Overwrites this run's ${step} prompt (system + user) with source version "${versionLabel}", discarding any edits — applied or unsaved — to this step. Other steps are untouched.` }),
+        `Overwrites this run's ${step} prompt (system + user) with the selected source version, discarding any edits — applied or unsaved — to this step. Other steps are untouched.` }),
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
-      el("button", { class: "danger", text: "revert to base", onclick: async () => {
+      el("button", { class: "danger", text: "revert step", onclick: async () => {
         try {
-          const r = await api.restoreRunPrompts(state.run, step);
+          const r = await api.restoreRunPrompts(state.run, step, sel.value);
           close();
-          // The snapshot's step is the base version's template now — drop this
+          // The snapshot's step is the chosen version's template now — drop this
           // step's draft so the editor reloads from it, then refresh templates.
           state.lab.drafts.delete(step);
           const payload = await api.promptTemplates(state.run);
           state.lab.templates = new Map(payload.steps.map((s) => [s.step, s]));
-          // Reloading the open step reloads its editor from the restored base
+          // Reloading the open step reloads its editor from the restored version
           // (and clears its now-stale tests); any other step just loses its flag.
           if (state.lab.step === step) selectStep(step);
           else renderSteps();
-          toast(`reverted ${step} to base version "${r.restored_from}"`, "ok");
+          toast(`reverted ${step} to version "${r.restored_from}"`, "ok");
           emit("prompts-applied", state.run);
         } catch (e) { setError(e.message); }
       } }),
@@ -1852,6 +1870,41 @@ async function breakOutSelected() {
 // (optionally syncing the run's source version folder), then SIMULATE from a
 // step — forking a NON-destructive branch in every slot that ran it, under the
 // freshly-edited snapshot. The source run is untouched, so the original output
+// Overwrite this run's ENTIRE prompt snapshot from a chosen source version
+// (defaults to the base) — the all-steps form of the per-step ↩ revert.
+// Discards every applied edit + unsaved draft; the run's base is unchanged.
+async function restoreFromVersionModal() {
+  const { sel, versions } = await versionSelectForRestore();
+  if (!versions.length) { toast("no prompt versions to restore from", "err"); return; }
+  const lab = state.lab;
+  openModal("restore run prompts from a version", (close, setError) => ({
+    body: [
+      field("restore from version", sel),
+      el("div", { class: "m-hint", text:
+        "Overwrites this run's ENTIRE prompt snapshot (all steps) with the selected source version, discarding every prompt edit applied to this run and any unsaved drafts. The run's base version is left unchanged." }),
+    ],
+    actions: [
+      el("button", { text: "cancel", onclick: close }),
+      el("button", { class: "danger", text: "restore all steps", onclick: async () => {
+        try {
+          const r = await api.restoreRunPrompts(state.run, null, sel.value);
+          toast(`restored this run's prompts from version "${r.restored_from}"`, "ok");
+          close();
+          // The snapshot is the chosen version's templates now: drop drafts +
+          // tests (stale against it) and reload so nothing pre-restore lingers.
+          lab.drafts = new Map();
+          lab.tests = new Map();
+          await openLab();
+          emit("poll-now");
+          emit("prompts-applied", state.run);
+          renderSims();
+          refreshCardScenes();
+        } catch (e) { setError(e.message); }
+      } }),
+    ],
+  }));
+}
+
 // stays for comparison; promote a branch to source later from the simulations
 // list ("replace source") when you're happy.
 function applyToRunModal() {
@@ -1885,9 +1938,7 @@ function applyToRunModal() {
         ? el("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text-dim)" },
             syncCheck, `save this run's full prompts to source version "${versionLabel}" — overwrites ALL its steps (so edits applied earlier without syncing land too)`)
         : null,
-      versionLabel
-        ? el("div", { class: "m-hint", text: `the “restore from "${versionLabel}"” button below does the inverse — it overwrites this run's snapshot with that source version, discarding every prompt edit applied to this run (and any unsaved drafts).` })
-        : null,
+      el("div", { class: "m-hint", text: `“restore from a version…” below does the inverse of a sync — it overwrites this run's snapshot (all steps) with a chosen source version (default: base${versionLabel ? ` "${versionLabel}"` : ""}), discarding every prompt edit applied to this run (and any unsaved drafts).` }),
       field(hasEdits ? "then" : "simulate from", simSel),
       el("div", { class: "m-hint", text:
         "simulating forks a branch in each slot at its first call of that step and runs it downstream under " +
@@ -1896,22 +1947,7 @@ function applyToRunModal() {
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
-      ...(versionLabel ? [el("button", { class: "danger", text: `restore from "${versionLabel}"`, onclick: async () => {
-        try {
-          const r = await api.restoreRunPrompts(state.run);
-          toast(`restored this run's prompts from version "${r.restored_from}"`, "ok");
-          close();
-          // The snapshot is the version's templates now: drop drafts + tests
-          // (stale against it) and reload so nothing pre-restore lingers.
-          lab.drafts = new Map();
-          lab.tests = new Map();
-          await openLab();
-          emit("poll-now");
-          emit("prompts-applied", state.run);
-          renderSims();
-          refreshCardScenes();
-        } catch (e) { setError(e.message); }
-      } })] : []),
+      el("button", { class: "danger", text: "restore from a version…", title: "overwrite this run's snapshot (all steps) with any prompt version — defaults to the base", onclick: () => { close(); restoreFromVersionModal(); } }),
       el("button", { class: "primary", text: hasEdits ? "apply" : "update", onclick: async () => {
         const wantWrite = hasEdits || syncCheck.checked;
         if (!wantWrite && !simSel.value) {

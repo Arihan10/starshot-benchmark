@@ -638,6 +638,15 @@ class AbTestRequest(BaseModel):
     cells: list[AbTestCell]
 
 
+class CopySlotRequest(BaseModel):
+    """Copy an entire slot folder (all its model cells + meshes) from
+    `source_run` into the destination run (the path `run`), OVERWRITING the
+    destination's slot dir. The source run is left untouched."""
+
+    source_run: str
+    slot: str
+
+
 def _root_plan_cut(events: list[dict[str, object]]) -> int | None:
     """Leading-event count to keep so a copy holds through the ROOT zone plan
     and nothing after — the position of the root `divider.zone_plan` event + 1,
@@ -3316,38 +3325,44 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/runs/{run}/prompt-templates/restore")
-    async def restore_run_prompts(run: str, step: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Reset the run's prompt snapshot back to its base version — the
-        inverse of the `update_version` sync (which pushes the run's snapshot
-        ONTO the version). With `step`, revert ONLY that step's templates (the
-        per-prompt revert); without it, hard-replace every step. Either way this
-        discards the prompt lab's in-place edits to the reverted step(s).
-        Running cells keep the templates they launched with; every later
-        relaunch/rerun/resume renders the restored bytes."""
+    async def restore_run_prompts(run: str, step: str | None = None, version: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Overwrite the run's prompt snapshot from a source version. Defaults
+        to the run's BASE version (the inverse of the `update_version` sync,
+        which pushes the run's snapshot ONTO the version); pass `version` to
+        restore from ANY existing prompt version instead. With `step`, revert
+        ONLY that step's templates (the per-prompt revert); without it,
+        hard-replace every step. Either way this discards the prompt lab's
+        in-place edits to the reverted step(s). The run's base
+        (`run.json.prompt_version`) is left unchanged — this pulls content, it
+        does not re-base the run. Running cells keep the templates they launched
+        with; every later relaunch/rerun/resume renders the restored bytes."""
         _require_run_prompts(run)
-        version = _run_meta(run).get("prompt_version")
-        if not isinstance(version, str) or not prompt_store.version_exists(version):
+        base = _run_meta(run).get("prompt_version")
+        source = version if version is not None else base
+        if not isinstance(source, str) or not source or not prompt_store.version_exists(source):
+            if version is not None:
+                raise HTTPException(status_code=404, detail=f"unknown prompt version: {version!r}")
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"run {run!r} has no existing base version to restore from"
-                    + (f" — {version!r} no longer exists" if isinstance(version, str) and version else "")
+                    + (f" — {base!r} no longer exists" if isinstance(base, str) and base else "")
                 ),
             )
         if step is not None and step not in prompt_store.STEPS:
             raise HTTPException(status_code=404, detail=f"unknown step: {step}")
         run_snapshot = _run_dir(run) / prompt_store.RUN_PROMPTS_SUBDIR
-        version_dir = prompt_store.VERSIONS_DIR / version
+        version_dir = prompt_store.VERSIONS_DIR / source
         try:
-            # dest = the run snapshot, src = the base version: the exact reverse
-            # of the `update_version` sync above — one step, or all of them.
+            # dest = the run snapshot, src = the chosen source version — one
+            # step, or all of them.
             if step is None:
                 prompt_store.sync_templates(run_snapshot, version_dir)
             else:
                 prompt_store.restore_step(run_snapshot, version_dir, step)
         except prompt_store.PromptTemplateError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        return {"run": run, "restored_from": version, "step": step}
+        return {"run": run, "restored_from": source, "step": step}
 
     @app.post("/runs/{run}/simulate-step")
     async def simulate_step(  # pyright: ignore[reportUnusedFunction]
@@ -3593,6 +3608,91 @@ def create_app() -> FastAPI:
             "current": name,
             "seeded": [f"{s}/{m}" for s, m in seeded],
             "skipped": skipped,
+        }
+
+    @app.post("/runs/{run}/copy-slot")
+    async def copy_slot(run: str, req: CopySlotRequest) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Copy an entire slot folder (all its model cells + meshes) from
+        `source_run` into this run, OVERWRITING this run's slot dir. Every live
+        task / generate-regen worker / sim branch on the destination's cells for
+        this slot is torn down first (as reset does), then the source slot is
+        copied over and object URLs in the copied logs are rewritten to this run
+        so meshes/images resolve here. The source run is untouched."""
+        dest_run = run
+        source_run = req.source_run
+        slot = _require_slot(req.slot)
+        if source_run == dest_run:
+            raise HTTPException(status_code=400, detail="source and destination runs are the same")
+        if not _run_dir(source_run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown source run: {source_run}")
+        if not _run_dir(dest_run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown run: {dest_run}")
+        src_slot_dir = _run_dir(source_run) / slot.id
+        if not src_slot_dir.is_dir() or not any(
+            (src_slot_dir / alias / "events.jsonl").is_file() for alias in MODEL_ALIASES
+        ):
+            raise HTTPException(status_code=400, detail=f"slot {slot.id!r} has no data in run {source_run!r}")
+        _hydrate_run(source_run)
+        _hydrate_run(dest_run)
+        # Tear down every destination cell under this slot so nothing writes into
+        # the dir we're about to replace (same teardown reset does, applied to the
+        # whole slot row), and note which had data — the "replaced" report.
+        replaced: list[str] = []
+        for alias in MODEL_ALIASES:
+            key: RunKey = (dest_run, slot.id, alias)
+            dest_log = _slot_logs.get(key)
+            if dest_log is not None and dest_log.state["events"]:
+                replaced.append(f"{slot.id}/{alias}")
+            await _discard_branches_of_cell(dest_run, slot.id, alias)
+            await _cancel_task(dest_run, slot.id, alias)
+            await _cancel_cell_generation(dest_run, slot.id, alias)
+            _set_stepped(key, False)
+            _gate_intents.pop(key, None)
+            if dest_log is not None:
+                dest_log.close()
+                _slot_logs.pop(key, None)
+        dest_slot_dir = _run_dir(dest_run) / slot.id
+
+        def _copy() -> None:
+            shutil.rmtree(dest_slot_dir, ignore_errors=True)
+            shutil.copytree(src_slot_dir, dest_slot_dir)
+            # Repoint object/image URLs from the source cell path to this run's,
+            # per model cell (GLBs load by id regardless; this keeps image-hover
+            # URLs valid and self-contained even if the source run is deleted).
+            for alias in MODEL_ALIASES:
+                events_path = dest_slot_dir / alias / "events.jsonl"
+                if not events_path.is_file():
+                    continue
+                src_seg = f"/{source_run}/{slot.id}/{alias}/objects/"
+                dst_seg = f"/{dest_run}/{slot.id}/{alias}/objects/"
+                text = events_path.read_text(encoding="utf-8")
+                if src_seg in text:
+                    events_path.write_text(text.replace(src_seg, dst_seg), encoding="utf-8")
+
+        await asyncio.to_thread(_copy)
+        # Rebuild the destination slot's SlotLogs from the copied logs (mirrors
+        # _hydrate_run for this slot), restoring any stepped markers the copy
+        # brought over. Nothing is auto-launched — the cells come in whatever
+        # state their copied log implies.
+        copied: list[str] = []
+        for alias in MODEL_ALIASES:
+            cell_dir = dest_slot_dir / alias
+            cell_dir.mkdir(parents=True, exist_ok=True)
+            key = (dest_run, slot.id, alias)
+            new_log = SlotLog(_run_id(dest_run, slot.id, alias), cell_dir / "events.jsonl")
+            new_log.hydrate_from_disk()
+            _slot_logs[key] = new_log
+            _maybe_launch(slot, alias, new_log)
+            if (cell_dir / ".stepped").exists():
+                _stepped_cells.add(key)
+            if new_log.state["events"]:
+                copied.append(f"{slot.id}/{alias}")
+        return {
+            "run": dest_run,
+            "source_run": source_run,
+            "slot": slot.id,
+            "copied": copied,
+            "replaced": replaced,
         }
 
     @app.get("/versions")

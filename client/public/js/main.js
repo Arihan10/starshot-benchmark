@@ -448,6 +448,76 @@ async function abTestModal() {
   }));
 }
 
+// Copy a whole slot folder (every model cell + its meshes) from THIS run into
+// another run, overwriting that run's slot. Warns first about any populated
+// cells in the destination slot that the copy would delete/replace.
+async function copySlotModal() {
+  if (!state.run) return;
+  const sourceRun = state.run;
+  const populated = state.slots.filter((s) => state.models.some((m) => (s.runs?.[m]?.events_count ?? 0) > 0));
+  if (!populated.length) { toast(`no slots with data in "${sourceRun}" to copy`, "err"); return; }
+  const others = state.runs.map((r) => r.name).filter((n) => n !== sourceRun);
+  if (!others.length) { toast("no other run to copy into — create one first", "err"); return; }
+
+  const slotSel = el("select", {}, populated.map((s) => el("option", { value: s.id, text: s.id })));
+  const destSel = el("select", {}, others.map((n) => el("option", { value: n, text: n })));
+  const warnEl = el("div", { class: "m-hint" });
+
+  // Preflight the destination: list any of its cells under the chosen slot that
+  // already have data (they'd be deleted/replaced by the overwrite).
+  async function refreshWarn() {
+    const destRun = destSel.value;
+    const slotId = slotSel.value;
+    warnEl.className = "m-hint";
+    warnEl.textContent = "checking destination…";
+    let cells = null;
+    try {
+      const payload = await api.slots(destRun);
+      const s = payload.slots.find((x) => x.id === slotId);
+      cells = s ? Object.entries(s.runs || {}).filter(([, c]) => (c?.events_count ?? 0) > 0).map(([m]) => m) : [];
+    } catch { cells = null; }
+    if (destSel.value !== destRun || slotSel.value !== slotId) return; // a later change superseded this
+    if (cells === null) { warnEl.textContent = "couldn't read the destination run's contents."; return; }
+    if (cells.length) {
+      warnEl.className = "m-error";
+      warnEl.textContent = `⚠ Deletes & replaces ${cells.length} existing cell${cells.length === 1 ? "" : "s"} in "${destRun}/${slotId}": ${cells.join(", ")}.`;
+    } else {
+      warnEl.textContent = `"${destRun}/${slotId}" is empty — nothing will be overwritten.`;
+    }
+  }
+  slotSel.addEventListener("change", refreshWarn);
+  destSel.addEventListener("change", refreshWarn);
+
+  openModal(`copy a slot from "${sourceRun}"`, (close, setError) => {
+    refreshWarn();
+    return {
+      body: [
+        field("slot", slotSel),
+        field("copy into run", destSel),
+        el("div", { class: "m-hint", text:
+          `Copies the entire "${sourceRun}/<slot>" folder (every model cell + its meshes) into the chosen run, overwriting that run's slot. The source run is untouched.` }),
+        warnEl,
+      ],
+      actions: [
+        el("button", { text: "cancel", onclick: close }),
+        el("button", { class: "danger", text: "copy slot", onclick: async () => {
+          const slotId = slotSel.value;
+          const destRun = destSel.value;
+          try {
+            const r = await api.copySlot(destRun, sourceRun, slotId);
+            close();
+            const nCopied = r.copied?.length ?? 0;
+            const nReplaced = r.replaced?.length ?? 0;
+            toast(`copied "${slotId}" → "${destRun}" — ${nCopied} cell${nCopied === 1 ? "" : "s"}${nReplaced ? `, replaced ${nReplaced}` : ""}`, "ok");
+            await refreshRuns();
+            if (destRun === state.run) await refreshSlots();
+          } catch (e) { setError(e.message); }
+        } }),
+      ],
+    };
+  });
+}
+
 function resetAllModal() {
   if (!state.run) return;
   // Every started cell on this run (anything with logged events, or a live
@@ -493,6 +563,7 @@ document.getElementById("btn-new-run").addEventListener("click", newRunModal);
 document.getElementById("btn-start-cells").addEventListener("click", startCellsModal);
 document.getElementById("btn-reset-all").addEventListener("click", resetAllModal);
 document.getElementById("btn-ab-test").addEventListener("click", abTestModal);
+document.getElementById("btn-copy-slot").addEventListener("click", copySlotModal);
 
 // --- boot ------------------------------------------------------------------------
 
