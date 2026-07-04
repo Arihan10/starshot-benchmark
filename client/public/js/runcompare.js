@@ -17,7 +17,7 @@ import { createViewer } from "./scene3d.js";
 import { createObsDock } from "./obstree.js";
 import { applySceneProjection, createObsModel, emittedStep } from "./events.js";
 import { statusView } from "./status.js";
-import * as inquiry from "./inquiry.js";
+import { createInvestigator } from "./investigator.js";
 
 let root = null;
 let titleEl = null;
@@ -31,6 +31,10 @@ let openTarget = null; // {slot, model} currently shown
 let ready = false;     // suppress camera sync until both scenes have settled
 let linked = true;
 let syncing = false;   // re-entrancy guard for the A<->B camera copy
+// The shared investigator chat for this view — one instance, rebound to
+// whichever pane's cell you asked "why?" about (or toggled onto pane A).
+let rcInv = null;
+let rcInvOpen = false;
 
 // Per-side visibility layers, overlaid on each canvas (mirrors the compare view).
 // Objects (anchors / next / negative space / frames) are the multiselect
@@ -97,11 +101,13 @@ function buildPane(prefix) {
   });
   dock.setHiddenApi({ isHidden: viewer.isHidden, toggle: viewer.toggleHidden });
   viewer.onHiddenChange(() => dock.renderTree(pane.obs.model));
-  // "why?" opens the decision-inquiry chat grounded in THIS pane's run/cell
-  // (read-only — it just continues the step's own conversation).
+  // "why?" opens the shared investigator bound to THIS pane's run/cell, with the
+  // step attached as deep context (read-only — pure visualization of that run).
   dock.setOnInquire((call) => {
-    if (!openTarget) return;
-    inquiry.openInquiry(call, { run: pane.run, slot: openTarget.slot, model: openTarget.model, branch: null });
+    if (!openTarget || call?.index == null) return;
+    bindRc(pane);
+    setRcInvestigator(true);
+    rcInv.attachStep(call.index);
   });
   dock.setOnRevert(null);
   dock.setOnAddSim(null);
@@ -130,6 +136,33 @@ function ensure() {
     });
   link(paneA, paneB);
   link(paneB, paneA);
+  // The shared investigator chat for this view. The header toggle opens it onto
+  // run A's cell by default; a pane's "why?" rebinds it to that pane.
+  rcInv = createInvestigator(document.getElementById("rc-investigator"), {
+    onClose: () => setRcInvestigator(false),
+  });
+  document.getElementById("rc-investigate").addEventListener("click", () => {
+    if (rcInvOpen) { setRcInvestigator(false); return; }
+    bindRc(paneA);
+    setRcInvestigator(true);
+  });
+}
+
+// Bind the shared investigator to one pane's (run, cell, obs model). The pane's
+// run + obs are set on load and swapped per open, so read them at call time.
+function bindRc(pane) {
+  if (!openTarget || !pane || !rcInv) return;
+  rcInv.setContext(
+    { run: pane.run, slot: openTarget.slot, model: openTarget.model, branch: null },
+    pane.obs,
+  );
+}
+
+function setRcInvestigator(open) {
+  rcInvOpen = open;
+  document.getElementById("rc-investigator").classList.toggle("open", open);
+  document.getElementById("rc-investigate").classList.toggle("on", open);
+  if (open && rcInv) rcInv.onShown();
 }
 
 function renderPaneHeader(pane, run, history) {
@@ -212,7 +245,8 @@ async function openRunCompare({ slot, model }) {
   const seq = ++openSeq;
   openTarget = { slot, model };
   ready = false;
-  inquiry.closeInquiry();
+  setRcInvestigator(false);
+  rcInv?.reset();
   titleEl.textContent = `${slot} · ${model}`;
   subEl.textContent = `${runA}  ↔  ${runB}`;
   root.classList.add("open");
@@ -257,7 +291,8 @@ function closeRunCompare() {
   paneB?.viewer.setActive(false);
   paneA?.viewer.clear();
   paneB?.viewer.clear();
-  inquiry.closeInquiry();
+  setRcInvestigator(false);
+  rcInv?.reset();
 }
 
 export function initRunCompare() {

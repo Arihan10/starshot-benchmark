@@ -1023,15 +1023,14 @@ def _require_step_event(
     return slot_log, event
 
 
-# --- decision inquiry -------------------------------------------------------
+# --- reviewer chat ----------------------------------------------------------
 #
-# "Why did the model do this?" — a persistent conversation answered by a fixed
-# strong reviewer so analysis quality is constant across whatever subject model
-# is being benchmarked. The reviewer's full prompt (analyst framing + the step's
-# exact system / input / output / reasoning) is assembled and shown CLIENT-SIDE
-# in an editable, prefilled box, so the user sees byte-for-byte what gets sent;
-# this endpoint just pins the reviewer model and forwards. The reviewer is
-# Claude Opus 4.8 at xhigh reasoning regardless of which model ran the step.
+# The stateless reviewer behind the scene investigator: a fixed strong model so
+# analysis quality is constant across whatever subject model is being
+# benchmarked. The full system prompt (analyst framing + scene grounding + step
+# timeline + any attached steps) is assembled CLIENT-SIDE and passed in `system`;
+# this endpoint just pins the reviewer model and forwards the conversation. The
+# reviewer is Claude Opus 4.8 at xhigh reasoning regardless of the subject model.
 INQUIRY_MODEL = "anthropic/claude-opus-4.8"
 
 
@@ -1711,11 +1710,11 @@ def create_app() -> FastAPI:
     @app.post("/inquire")
     async def inquire(req: InquiryRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         """Ask the reviewer (Claude Opus 4.8, xhigh reasoning) the latest
-        question in an inquiry thread, and keep asking — the client carries the
-        conversation forward in `messages`, so the thread is persistent. `system`
-        is the exact, client-assembled prompt (analyst framing + the step's
-        grounding — shown and editable in the panel). Stateless: nothing about
-        any run is read or mutated."""
+        question in a conversation, and keep asking — the client carries the
+        thread forward in `messages`, so it is persistent. `system` is the exact,
+        client-assembled prompt (the investigator's analyst framing + scene
+        grounding + any attached steps). Stateless: nothing about any run is read
+        or mutated."""
         if not req.messages or req.messages[-1].role != "user":
             raise HTTPException(
                 status_code=400,
@@ -1728,6 +1727,23 @@ def create_app() -> FastAPI:
             # Provider/transport failure → clean 502 the panel shows inline.
             raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
         return {"answer": answer, "reasoning": reasoning, "model": INQUIRY_MODEL}
+
+    # --- per-slot investigator context --------------------------------------
+    #
+    # The holistic "why is the WHOLE scene like this?" chat (vs. the per-step
+    # `/inquire` above) needs the cell's faithful base grounding: the full final
+    # scene context + a timeline of every executed step's output/reasoning/vars.
+    # The client fetches this once per open (and on refresh), pairs it with the
+    # run's prompt templates + a static pipeline explainer, and forwards the
+    # composed system prompt through the SAME `/inquire` reviewer. Read-only.
+    @app.get("/slots/{slot_id}/{model_alias}/investigator")
+    async def slot_investigator(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        return _investigator_bundle(_require_slot_log(run, slot_id, model_alias))
+
+    @app.get("/branches/{branch_id}/investigator")
+    async def branch_investigator(branch_id: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        return _investigator_bundle(_require_branch(branch_id).log)
 
     @app.get("/runs/{run}/prompt-templates")
     async def run_prompt_templates(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -3995,6 +4011,69 @@ def _scene_nodes_full(slot_log: SlotLog, *, image_log: SlotLog | None = None) ->
             is_zone=is_zone,
         ))
     return nodes
+
+
+# Per-step variables the investigator's step TIMELINE omits: the scene-wide
+# dumps (the full scene is given ONCE, faithfully rendered, below) and the
+# global root fields (also given once). What remains per step is the compact,
+# step-distinguishing set — zone id/plan/placement/dims, the to-place batch, the
+# retry feedback, the object/image fields — so the timeline stays legible and the
+# reviewer reconstructs what each step saw from (template + these + the scene).
+_INVESTIGATOR_SKIP_VARS = {
+    "SCENE_CONTEXT", "SCENE_CONTEXT_COMPACT", "ROOT_OBJECTS", "ROOT_HEADER",
+    "ADJACENT_ZONES", "SIBLING_OBJECTS", "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF",
+    "ZONE_OBJECTS", "IMAGE_TEMPLATE_FRONT", "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP",
+    "ROOT_PROMPT", "ROOT_PLAN", "ROOT_DIMENSIONS", "ROOT_ORIGIN",
+}
+
+
+def _investigator_bundle(slot_log: SlotLog) -> dict[str, object]:
+    """The per-slot investigator's faithful base grounding for one cell (source
+    or branch): the FULL final scene rendered by the same `scene_context`
+    builders the pipeline injects with (so it's byte-faithful to `{SCENE_CONTEXT}`),
+    plus a chronological timeline of every executed LLM step — its template, the
+    node it ran on, its structured output, its reasoning, and its compact
+    step-specific variable VALUES (heavy scene-wide dumps stripped; the scene is
+    given once, above). The client composes this into the reviewer's system
+    prompt alongside the (separately fetched) prompt templates + the static
+    pipeline explainer; attaching a specific step then adds that call's exact
+    rendered bytes on top."""
+    nodes = _scene_nodes_full(slot_log)
+    root = next((n for n in nodes if n.parent_id is None), None)
+    steps: list[dict[str, object]] = []
+    for e in slot_log.state["events"]:
+        if e.get("kind") != "cache.llm":
+            continue
+        template = e.get("template") or e.get("step")
+        # image_prompt runs once PER OBJECT (the most numerous step); its
+        # noun-phrase output + reasoning bloat the timeline enormously for little
+        # spatial insight, so it's omitted from the base context. Attaching a
+        # specific image_prompt step still folds its full detail in on demand.
+        if template == "image_prompt":
+            continue
+        raw_vars = e.get("variables") if isinstance(e.get("variables"), dict) else {}
+        native = prompt_store.STEP_VARIABLES.get(template, []) if isinstance(template, str) else []
+        vars_out = {
+            k: raw_vars[k]
+            for k in native
+            if k not in _INVESTIGATOR_SKIP_VARS and isinstance(raw_vars.get(k), str) and raw_vars.get(k)
+        }
+        steps.append({
+            "index": e.get("index"),
+            "step": e.get("step"),
+            "template": template,
+            "node": e.get("node"),
+            "output": e.get("output"),
+            "reasoning": e.get("reasoning") or "",
+            "variables": vars_out,
+        })
+    return {
+        "prompt": root.prompt if root is not None else "",
+        "scene_context": scene_context.render_embedded_block(nodes),
+        "root_header": scene_context._root_scene_header(root) if root is not None else "",
+        "root_objects": scene_context.render_root_objects(nodes),
+        "steps": steps,
+    }
 
 
 def _require_slot(slot_id: str) -> Slot:
