@@ -1,9 +1,15 @@
-"""Single-shot structured call to OpenRouter via `response_format: json_schema`.
+"""Single-shot structured LLM call via `response_format: json_schema`.
+
+Most models route through OpenRouter; ids registered in
+`slots.OPENAI_COMPAT_MODELS` (e.g. LongCat) are sent straight to their own
+OpenAI-compatible `/chat/completions` endpoint instead. Only the transport
+differs — cache, resample/transport retries, reasoning + token capture, and
+the compare gate are shared by both.
 
 The model is task-local: each `_run` task calls `set_model()` once with
-the OpenRouter id for its alias, and every `call_llm()` on that task
-inherits via a ContextVar. Concurrent runs against the same slot with
-different models therefore don't race on a module global.
+the model id for its alias, and every `call_llm()` on that task inherits via
+a ContextVar. Concurrent runs against the same slot with different models
+therefore don't race on a module global.
 
 Up to 4 resamples on parse / validation failures.
 """
@@ -16,7 +22,8 @@ import os
 import sys
 from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
-from pathlib import Path
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TypeVar
 
 import httpx
@@ -24,6 +31,7 @@ from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError
 from pydantic import BaseModel, ValidationError
 
+from app.core.slots import OPENAI_COMPAT_MODELS, OpenAICompatModel
 from app.utils import cache, logging
 
 T = TypeVar("T", bound=BaseModel)
@@ -258,6 +266,165 @@ async def call_llm(
     return validated
 
 
+# --- transport dispatch -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Completion:
+    """One structured response, normalized across transports so
+    `call_llm_once`'s parse/validate/resample loop is backend-agnostic.
+    `generation_id` is OpenRouter's billed id (summed into the run's settled USD
+    cost); it is None for third-party OpenAI-compatible backends, which have no
+    `/generation` record — those calls still log token counts, but carry no cost
+    and never show as "resolving"."""
+
+    content: object
+    reasoning: str
+    usage: object
+    generation_id: str | None
+    finish_reason: object = None
+    refusal: str | None = None
+
+
+# A thinking-enabled structured call over a large token cap forms its whole
+# (non-streamed) body before responding, so the read budget is generous.
+_OPENAI_COMPAT_TIMEOUT = httpx.Timeout(connect=30.0, read=300.0, write=60.0, pool=60.0)
+
+
+async def _send_openai_compatible(
+    cfg: OpenAICompatModel,
+    *,
+    system: str,
+    user: str,
+    schema_name: str,
+    wire_schema: object,
+) -> _Completion:
+    """One non-streamed `POST {base_url}/chat/completions` to a third-party
+    OpenAI-compatible endpoint, returning the same normalized shape as the
+    OpenRouter path. `response_format: json_schema` is sent because the
+    pipeline's prompts carry no free-form JSON instructions — the schema param
+    IS the structure contract. Sampling knobs + `extra` (e.g. `thinking`) come
+    from the model config; a non-2xx raises `httpx.HTTPStatusError`, which
+    `call_llm_once` folds into its transport-retry budget alongside the SDK's
+    provider flaps."""
+    body: dict[str, object] = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "strict": True, "schema": wire_schema},
+        },
+        "stream": False,
+    }
+    if cfg.max_tokens is not None:
+        body["max_tokens"] = cfg.max_tokens
+    if cfg.temperature is not None:
+        body["temperature"] = cfg.temperature
+    if cfg.top_p is not None:
+        body["top_p"] = cfg.top_p
+    body.update(cfg.extra)
+    headers = {"Content-Type": "application/json"}
+    if cfg.api_key_env is not None:
+        api_key = os.environ.get(cfg.api_key_env)
+        if not api_key:
+            raise RuntimeError(
+                f"{cfg.api_key_env} is not set — required for {cfg.model} at {cfg.base_url}"
+            )
+        headers["Authorization"] = f"Bearer {api_key}"
+    async with httpx.AsyncClient(timeout=_OPENAI_COMPAT_TIMEOUT) as client:
+        res = await client.post(
+            f"{cfg.base_url}/chat/completions", headers=headers, json=body,
+        )
+    res.raise_for_status()
+    data = res.json()
+    choice = (data.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    usage_raw = data.get("usage") or {}
+    # Attribute access so `call_llm` reads it exactly like the SDK's typed usage.
+    usage = SimpleNamespace(
+        prompt_tokens=usage_raw.get("prompt_tokens"),
+        completion_tokens=usage_raw.get("completion_tokens"),
+    )
+    # Answer channel is `content`; the thinking trace is `reasoning_content`
+    # (LongCat) or `reasoning`. But LongCat returns the schema-conformant JSON
+    # ON `reasoning_content` and leaves `content` empty whenever a
+    # `response_format` is set (verified live, thinking on OR off) — so when
+    # `content` is blank, take the reasoning text AS the answer (it IS the
+    # answer, not a separate trace, hence no reasoning is reported then).
+    content = message.get("content")
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    if not isinstance(reasoning, str):
+        reasoning = ""
+    if (content is None or (isinstance(content, str) and not content.strip())) and reasoning:
+        content, reasoning = reasoning, ""
+    return _Completion(
+        content=content,
+        reasoning=reasoning,
+        usage=usage,
+        generation_id=None,
+        finish_reason=choice.get("finish_reason"),
+    )
+
+
+async def _send_structured(
+    *, model: str, system: str, user: str, output_schema: type[BaseModel],
+) -> _Completion:
+    """Issue ONE structured request for `model`, dispatching by transport: an id
+    registered in `OPENAI_COMPAT_MODELS` goes straight to its OpenAI-compatible
+    `base_url`; every other id routes through the OpenRouter SDK (unchanged).
+    Both return a normalized `_Completion`."""
+    schema_name = output_schema.__name__
+    wire_schema = _normalize_schema(output_schema.model_json_schema())
+    cfg = OPENAI_COMPAT_MODELS.get(model)
+    if cfg is not None:
+        return await _send_openai_compatible(
+            cfg, system=system, user=user, schema_name=schema_name, wire_schema=wire_schema,
+        )
+    async with OpenRouter(
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        timeout_ms=180_000,
+    ) as client:
+        response = await client.chat.send_async(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={  # pyright: ignore[reportArgumentType]
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema_": wire_schema,
+                },
+            },
+            reasoning={"effort": _reasoning_effort(model)},
+            # Force routing to a provider that actually honors the parameters we
+            # send. Omitted, OpenRouter silently strips any param the chosen
+            # provider lacks — so a model whose provider can't do
+            # `response_format: json_schema` (GLM) falls back to a free-form
+            # completion and emits fenced / prose / null content instead of
+            # schema-conformant JSON.
+            provider={
+                "require_parameters": True,
+                "sort": "latency",
+                "ignore": ["decart"],
+            },
+        )
+    message = response.choices[0].message
+    return _Completion(
+        content=message.content,
+        reasoning=getattr(message, "reasoning", None) or "",
+        usage=getattr(response, "usage", None),
+        generation_id=getattr(response, "id", None),
+        finish_reason=response.choices[0].finish_reason,
+        refusal=message.refusal if isinstance(message.refusal, str) else None,
+    )
+
+
 async def call_llm_once(
     *,
     system: str,
@@ -314,43 +481,16 @@ async def call_llm_once(
     while True:
         content: object = None
         try:
-            async with OpenRouter(
-                api_key=os.environ["OPENROUTER_API_KEY"],
-                timeout_ms=180_000,
-            ) as client:
-                response = await client.chat.send_async(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": output_schema.__name__,
-                            "strict": True,
-                            "schema_": _normalize_schema(output_schema.model_json_schema()),
-                        },
-                    },
-                    reasoning={"effort": _reasoning_effort(model)},
-                    # Force routing to a provider that actually honors the
-                    # parameters we send. Omitted, OpenRouter silently strips
-                    # any param the chosen provider lacks — so a model whose
-                    # provider can't do `response_format: json_schema` (GLM)
-                    # falls back to a free-form completion and emits fenced /
-                    # prose / null content instead of schema-conformant JSON.
-                    provider={
-                        "require_parameters": True,
-                        "sort": "latency",
-                        "ignore": ["decart"]
-                    },
-                )
-            # Recorded before parsing: this generation was billed regardless of
-            # whether its output survives validation below.
-            if getattr(response, "id", None):
-                generation_ids.append(response.id)
-            message = response.choices[0].message
-            content = message.content
+            comp = await _send_structured(
+                model=model, system=system, user=user, output_schema=output_schema,
+            )
+            # Recorded before parsing: an OpenRouter generation was billed
+            # regardless of whether its output survives validation below.
+            # Third-party OpenAI-compatible backends carry no billed id, so
+            # nothing is appended and those calls never show as cost-pending.
+            if comp.generation_id:
+                generation_ids.append(comp.generation_id)
+            content = comp.content
             args = json.loads(content) if isinstance(content, str) else content
             # A reasoning-heavy turn can finish with no answer body (`content`
             # null, or the bare literal `null`) — resample it with a clear reason
@@ -358,10 +498,9 @@ async def call_llm_once(
             # `model_type` error. finish_reason/refusal pin down truncation vs.
             # a content filter for the retry log.
             if args is None:
-                refusal = message.refusal if isinstance(message.refusal, str) else None
                 raise ValueError(
                     "model returned no content "
-                    f"(finish_reason={response.choices[0].finish_reason!r}, refusal={refusal!r})"
+                    f"(finish_reason={comp.finish_reason!r}, refusal={comp.refusal!r})"
                 )
             validated = output_schema.model_validate(args)
             if validate is not None:
@@ -369,19 +508,15 @@ async def call_llm_once(
                 # caller's cache.llm log, so a failing output is never cached
                 # and each resample re-runs the call fresh.
                 validate(validated)
-            reasoning = getattr(message, "reasoning", None) or ""
-            # Token counts feed the per-call trace panels only — the run's spend
-            # is the authoritative `total_cost` `call_llm` pulls from the
-            # /generation endpoint, not derived from these. `usage` is absent on
-            # the rare provider that omits it; completion_tokens already includes
-            # reasoning tokens, so no separate reasoning field is needed.
-            usage = getattr(response, "usage", None)
             # Return the raw parsed response (`args`) alongside the validated
             # model so callers can log EXACTLY what the model emitted — the wire
             # field names and values — rather than a re-serialized, attribute-
-            # named `model_dump` — plus every billed generation id so the caller
-            # can price the call against OpenRouter's settled cost.
-            return validated, reasoning, usage, args, generation_ids
+            # named `model_dump`. `comp.usage` feeds the per-call trace panels;
+            # `generation_ids` lets `call_llm` price the call against OpenRouter's
+            # settled cost (empty for third-party backends, which have no
+            # /generation record — completion_tokens already includes reasoning
+            # tokens, so no separate reasoning field is needed).
+            return validated, comp.reasoning, comp.usage, args, generation_ids
         except OutputValidationError as e:
             if id_validation_attempt >= ID_VALIDATION_MAX - 1:
                 raise

@@ -8,8 +8,7 @@ llm service feeds straight into chat.send_async.
 
 from __future__ import annotations
 
-import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(frozen=True)
@@ -48,6 +47,30 @@ SLOTS: list[Slot] = [
 
 SLOTS_BY_ID: dict[str, Slot] = {s.id: s for s in SLOTS}
 
+
+@dataclass(frozen=True)
+class OpenAICompatModel:
+    """A third-party OpenAI-compatible /chat/completions backend, slotted in
+    beside the OpenRouter-routed models. The pipeline still drives it through the
+    same `llm.call_llm` path (cache, resample/transport retries, reasoning +
+    token capture, the compare gate) — only the transport differs."""
+
+    # Provider-side model id sent in the request body.
+    model: str
+    # OpenAI-compatible API root, no trailing slash; the call posts to
+    # `{base_url}/chat/completions`.
+    base_url: str
+    # Env var holding the bearer key; None for auth-less endpoints.
+    api_key_env: str | None = None
+    # Sampling / length knobs, each sent only when set (None defers to the
+    # provider's own default).
+    max_tokens: int | None = None
+    temperature: float | None = None
+    top_p: float | None = None
+    # Extra request-body fields merged verbatim (e.g. LongCat's `thinking`).
+    extra: dict[str, object] = field(default_factory=dict)
+
+
 # Short alias -> OpenRouter model id. Aliases are the stable identifiers
 # the client + storage layout key on; the OpenRouter id is what llm.py
 # passes into the SDK call. Order is the order the dashboard renders.
@@ -66,7 +89,36 @@ MODELS: dict[str, str] = {
     "sonnet": "anthropic/claude-sonnet-4.6",
     "sonnet-new": "anthropic/claude-sonnet-5",
     "minimax": "minimax/minimax-m3",
-    "gemma": "google/gemma-4-31b-it"
+    "gemma": "google/gemma-4-31b-it",
+    "longcat": "longcat/LongCat-2.0",
+    "longcat-sf": "siliconflow/LongCat-2.0",
+}
+
+# Model ids from MODELS that are actually served by a third-party
+# OpenAI-compatible /chat/completions endpoint. Keyed by the SAME id string
+# MODELS maps to, so that id stays the cache key, the log/dashboard identity,
+# and the compare pin — llm.py swaps only the transport (direct httpx to
+# `base_url` instead of the OpenRouter SDK). Any id absent here routes through
+# OpenRouter exactly as before.
+OPENAI_COMPAT_MODELS: dict[str, OpenAICompatModel] = {
+    "longcat/LongCat-2.0": OpenAICompatModel(
+        model="LongCat-2.0",
+        base_url="https://api.longcat.chat/openai/v1",
+        api_key_env="LONGCAT_API_KEY",
+        stream=False,
+        max_tokens=131072,
+        # Thinking on; the trace comes back on `reasoning_content`.
+        extra={"thinking": {"type": "enabled"}},
+    ),
+    # Same LongCat-2.0 weights, served by SiliconFlow instead of Meituan's own
+    # gateway. SiliconFlow's thinking toggle is `enable_thinking` (not LongCat's
+    # native `thinking` object); the answer/trace come back the same way.
+    "siliconflow/LongCat-2.0": OpenAICompatModel(
+        model="meituan-longcat/LongCat-2.0",
+        base_url="https://api.siliconflow.com/v1",
+        api_key_env="SILICONFLOW_API_KEY",
+        extra={"enable_thinking": True},
+    ),
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())
