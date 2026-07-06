@@ -118,7 +118,10 @@ const LOG_BUILDERS = {
         "warn",
         `spend cap reached — $${(e.spend ?? 0).toFixed(2)} of $${(e.cap ?? 0).toFixed(2)}`,
     ],
-    "run.cap_override": (e) => ["info", `spend cap raised to $${(e.cap ?? 0).toFixed(2)}`],
+    "run.cap_override": (e) => [
+        "info",
+        (e.cap ?? 0) > 0 ? `spend cap set to $${e.cap.toFixed(2)}` : "spend cap removed",
+    ],
     "mesh.error": (e) => ["error", `${e.id}: ${e.message ?? "mesh error"}`],
     "mesh.retry": (e) => ["warn", `${e.id}: mesh retried`],
     "mesh.submit": null,

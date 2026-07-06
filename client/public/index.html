@@ -430,7 +430,8 @@
 				padding: 2px 0;
 			}
 			/* Capped cells: flag the collapsed pill purple so a spend-cap trip is
-			   noticeable without expanding, then show each cell's override inline. */
+			   noticeable without expanding. Every cell shows its cap inline (faint
+			   by default, purple once tripped). */
 			#cost-tracker.has-capped #cost-pill {
 				border-color: var(--purple);
 			}
@@ -441,33 +442,40 @@
 				display: flex;
 				align-items: center;
 				gap: 6px;
-				padding: 2px 0 3px 10px;
+				padding: 1px 0 2px 10px;
 			}
 			.cost-cap-row .cost-cap-msg {
-				color: var(--purple);
+				color: var(--text-faint);
 				font-size: 10px;
 				font-variant-numeric: tabular-nums;
 				overflow: hidden;
 				text-overflow: ellipsis;
 				white-space: nowrap;
 			}
-			.cost-cap-row .cost-cap-override {
+			.cost-cap-row.reached .cost-cap-msg {
+				color: var(--purple);
+			}
+			.cost-cap-row .cost-cap-set {
 				margin-left: auto;
 				flex-shrink: 0;
 				padding: 1px 8px;
 				font-size: 10px;
-				color: var(--purple);
+				color: var(--text-dim);
 				background: transparent;
-				border: 1px solid var(--purple);
+				border: 1px solid var(--line);
 				border-radius: 4px;
 				cursor: pointer;
 			}
-			.cost-cap-row .cost-cap-override:hover {
-				background: rgba(201, 166, 255, 0.14);
+			.cost-cap-row .cost-cap-set:hover {
+				border-color: var(--text-dim);
+				color: var(--text);
 			}
-			.cost-cap-row .cost-cap-override:disabled {
-				opacity: 0.5;
-				cursor: default;
+			.cost-cap-row.reached .cost-cap-set {
+				color: var(--purple);
+				border-color: var(--purple);
+			}
+			.cost-cap-row.reached .cost-cap-set:hover {
+				background: rgba(201, 166, 255, 0.14);
 			}
 
 			/* ---------- board ---------- */

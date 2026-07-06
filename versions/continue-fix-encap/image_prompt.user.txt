@@ -1,0 +1,12 @@
+Original object prompt: '`{OBJECT_PROMPT}`'
+Bounding box dimensions: `{OBJECT_DIMENSIONS}`
+Proxy shape: `{PROXY_SHAPE}`
+
+Image-prompt templates your phrase will be slotted into (`<<<SUBJECT>>>` is your output — same phrase, three views):
+  FRONT: `{IMAGE_TEMPLATE_FRONT}`
+  SIDE:  `{IMAGE_TEMPLATE_SIDE}`
+  TOP:   `{IMAGE_TEMPLATE_TOP}`
+
+`{PRIOR_SUBJECTS}`
+
+Produce ONE short noun phrase naming the subject.

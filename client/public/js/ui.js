@@ -71,6 +71,36 @@ export function field(labelText, control) {
   return el("label", { class: "m-field" }, el("span", { text: labelText }), control);
 }
 
+// Ask for a spend-cap ceiling (USD; 0 = no cap) in a modal, then hand the
+// entered value to `onSubmit`. Errors thrown by `onSubmit` surface inline; a
+// clean resolve closes the modal. Shared by the cost tracker, cell overlay, and
+// the board's bulk action.
+export function promptCapValue(title, { current = 0, submitLabel = "set cap" } = {}, onSubmit) {
+  const input = el("input", {
+    type: "number", min: "0", step: "1",
+    value: current > 0 ? String(current) : "",
+  });
+  openModal(title, (close, setError) => ({
+    body: [
+      field("spend cap · USD", input),
+      el("div", { class: "m-hint", text:
+        "the cell auto-pauses once settled spend reaches this. Enter 0 for no cap." }),
+    ],
+    actions: [
+      el("button", { text: "cancel", onclick: close }),
+      el("button", { class: "primary", text: submitLabel, onclick: async () => {
+        const v = Number(input.value);
+        if (input.value.trim() === "" || !Number.isFinite(v) || v < 0) {
+          setError("enter a cap of 0 or more (0 = no cap)");
+          return;
+        }
+        try { await onSubmit(v); close(); }
+        catch (e) { setError(e.message); }
+      } }),
+    ],
+  }));
+}
+
 // --- step-until picker -------------------------------------------------------
 // A custom popover (NOT a native <select>) that picks a target step AND where to
 // stop relative to it: pause BEFORE the step's next call (it doesn't run) or

@@ -7,14 +7,14 @@
 // fully caught up (and it's safe to shut the server down without losing any).
 // Collapsible top-bar pill, re-rendered on every slots poll.
 //
-// Each cell also carries a per-cell spend CAP (`cap` in the slots payload):
-// when settled spend crosses `SPEND_CAP_USD × (overrides + 1)` the server
+// Each cell also carries a per-cell spend CAP (`cap` in the slots payload:
+// {spend, limit}, 0 = uncapped): when settled spend reaches `limit` the server
 // auto-pauses the cell ("spend cap reached"). The pill flags how many cells are
-// capped; expanding it shows each capped cell's spend/limit and an "override"
-// that raises the ceiling one band (spend preserved) and resumes the cell.
+// capped; expanding it shows every cell's cap inline — editable to any value, so
+// a capped cell resumes the moment its ceiling clears its spend.
 
 import { state, on, emit } from "./state.js";
-import { el, toast } from "./ui.js";
+import { el, toast, promptCapValue } from "./ui.js";
 import { api } from "./api.js";
 
 let trackerEl = null;
@@ -58,33 +58,28 @@ function costSectionHead(name, tag, count, cost) {
   );
 }
 
-// Raise a capped cell's ceiling by one band and resume it. The server preserves
-// spend, so the next stop lands one band higher; a slots poll then re-renders
-// this cell without its cap notice.
-async function overrideCap(slotId, model, btn) {
-  btn.disabled = true;
-  btn.textContent = "…";
-  try {
-    const r = await api.capOverride(state.run, slotId, model);
-    toast(`spend cap → ${fmtCost(r.cap)} · ${slotId} · ${model}`, "ok");
+// Set a cell's spend cap to any value. Raising a capped cell's ceiling above its
+// spend resumes it; a slots poll then re-renders the cell without its cap flag.
+function editCap(slotId, model, cap) {
+  promptCapValue(`spend cap · ${slotId} · ${model}`, { current: cap.limit }, async (v) => {
+    const r = await api.capOverride(state.run, slotId, model, v);
+    toast(`spend cap → ${r.cap > 0 ? fmtCost(r.cap) : "no cap"} · ${slotId} · ${model}`, "ok");
     emit("poll-now");
-  } catch (e) {
-    toast(e.message, "err");
-    btn.disabled = false;
-    btn.textContent = "override";
-  }
+  });
 }
 
-// The under-a-row cap notice: how far spend ran past the ceiling, plus the
-// one-click override that raises the ceiling one band and resumes the cell.
-function capNotice(slotId, model, cap) {
-  return el("div", { class: "cost-cap-row" },
-    el("span", { class: "cost-cap-msg",
-      text: `spend cap reached · ${fmtCost(cap.spend)} / ${fmtCost(cap.limit)}` }),
-    el("button", { class: "cost-cap-override",
-      title: `raise the cap to ${fmtCost(cap.limit + cap.base)} and resume this cell`,
-      onclick: (ev) => { ev.stopPropagation(); overrideCap(slotId, model, ev.currentTarget); },
-      text: "override" }),
+// The under-a-row cap line: the cell's current ceiling (or how far spend ran
+// past it once tripped), plus a click to set a new one.
+function capRow(slotId, model, cap, capped) {
+  const limitTxt = cap.limit > 0 ? fmtCost(cap.limit) : "no cap";
+  return el("div", { class: "cost-cap-row" + (capped ? " reached" : "") },
+    el("span", { class: "cost-cap-msg", text: capped
+      ? `spend cap reached · ${fmtCost(cap.spend)} / ${limitTxt}`
+      : `cap ${limitTxt}` }),
+    el("button", { class: "cost-cap-set",
+      title: capped ? "set a new spend cap and resume this cell" : "set this cell's spend cap",
+      onclick: (ev) => { ev.stopPropagation(); editCap(slotId, model, cap); },
+      text: capped ? "set cap" : "edit" }),
   );
 }
 
@@ -92,8 +87,8 @@ function renderCost() {
   if (!trackerEl) return;
   // Group cells by slot: each slot is a section (its own total), each model a
   // row beneath it — so you read both the per-slot cost and the run total. Each
-  // row also carries its cell's cap panel so a tripped cap shows its override.
-  const bySlot = new Map(); // slotId -> { rows: [{model, cost, req, cap}], cost, req }
+  // row also carries its cell's editable cap (flagged when tripped).
+  const bySlot = new Map(); // slotId -> { rows: [{model, cost, req, cap, status, capped}], cost, req }
   let totalCost = 0;
   let totalReq = 0;
   let totalPending = 0;
@@ -102,13 +97,13 @@ function renderCost() {
     for (const [model, c] of Object.entries(s.runs || {})) {
       const { cost, req, pending } = cellCost(c?.usage);
       if (req === 0) continue;
-      // Key the override UI off the resolved status, not raw cap.reached: a cell
-      // that FINISHED over budget reads `done` (done wins) and can't be overridden.
+      // Key the capped flag off the resolved status, not raw spend vs limit: a
+      // cell that FINISHED over budget reads `done` (done wins) and isn't capped.
       const capped = c?.status === "capped";
       if (capped) cappedCount += 1;
       let g = bySlot.get(s.id);
       if (!g) { g = { rows: [], cost: 0, req: 0 }; bySlot.set(s.id, g); }
-      g.rows.push({ model, cost, req, cap: capped ? c.cap : null });
+      g.rows.push({ model, cost, req, cap: c?.cap ?? null, status: c?.status, capped });
       g.cost += cost;
       g.req += req;
       totalCost += cost;
@@ -118,7 +113,7 @@ function renderCost() {
   }
   // `resolving` = calls OpenRouter hasn't settled the cost of yet; 0 ⇒ the run's
   // spend has fully caught up (the shutdown-safe signal). A capped count flags
-  // cells auto-paused at their spend cap (expand to override them).
+  // cells auto-paused at their spend cap (expand to raise them).
   pillSummaryEl.textContent =
     `${fmtCost(totalCost)} · ${totalReq} req` +
     (totalPending ? ` · ${totalPending} resolving` : "") +
@@ -134,7 +129,8 @@ function renderCost() {
       costSectionHead(slotId, `${g.rows.length} model${g.rows.length === 1 ? "" : "s"}`, g.req, g.cost));
     for (const r of g.rows.sort((a, b) => b.cost - a.cost)) {
       section.appendChild(costRow(r.model, r.req, r.cost, "cost-row"));
-      if (r.cap) section.appendChild(capNotice(slotId, r.model, r.cap));
+      // Every live cell shows its editable cap; a done cell's is settled history.
+      if (r.cap && r.status !== "done") section.appendChild(capRow(slotId, r.model, r.cap, r.capped));
     }
     dropdownEl.appendChild(section);
   }

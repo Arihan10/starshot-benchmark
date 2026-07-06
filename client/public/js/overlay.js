@@ -10,7 +10,7 @@ import {
 	cellBranches,
 	branchSummaryById,
 } from "./state.js";
-import { el, toast, stepUntilSelect, openModal, buildObjectsMenu } from "./ui.js";
+import { el, toast, stepUntilSelect, openModal, buildObjectsMenu, promptCapValue } from "./ui.js";
 import {
 	openStream,
 	dispatchSceneEvent,
@@ -1167,19 +1167,23 @@ function renderHeader() {
 	actionBtn.textContent = label ?? "";
 	resetBtn.style.display = branch ? "none" : "";
 
-	// Spend-cap override: a capped source cell shows a single "override cap &
-	// continue" that raises its ceiling one band and resumes it — the only way
-	// past the cap (a plain resume/retry is refused server-side while capped, so
-	// the normal action button stays hidden here).
+	// Spend-cap override: offered on any started source cell (not only capped
+	// ones) so the ceiling can be changed anytime. A capped cell shows it as the
+	// primary "set cap & continue" — the only way past the cap, since a plain
+	// resume/retry is refused server-side while capped (so the action button is
+	// hidden then); otherwise it's a secondary "set cap" beside that action.
 	let capBtn = document.getElementById("overlay-cap-override");
-	if (!branch && status === "capped") {
+	if (!branch && summary?.cap && status !== "idle" && status !== "done") {
 		if (!capBtn) {
-			capBtn = el("button", { id: "overlay-cap-override", class: "primary" });
+			capBtn = el("button", { id: "overlay-cap-override" });
 			actionBtn.before(capBtn);
 		}
-		capBtn.textContent = "override cap & continue";
-		capBtn.title =
-			"raise this cell's spend cap by one band (spend kept) and resume the run";
+		const atCap = status === "capped";
+		capBtn.classList.toggle("primary", atCap);
+		capBtn.textContent = atCap ? "set cap & continue" : "set cap";
+		capBtn.title = atCap
+			? "set this cell's spend cap above its spend (0 = no cap) and resume the run"
+			: "set this cell's spend cap (0 = no cap)";
 		capBtn.onclick = onCapOverride;
 	} else {
 		capBtn?.remove();
@@ -1465,26 +1469,26 @@ async function onReset() {
 	}
 }
 
-// Override a tripped spend cap: raise this cell's ceiling one band (spend is
-// kept) and resume — the only way past the cap, since a plain resume is refused
-// server-side while capped. Reload streaming the resumed run (forceLive — the
-// polled summary still says capped until the next poll lands).
-async function onCapOverride() {
+// Set a cell's spend cap to any value — available anytime, not just when capped.
+// When the new ceiling clears a capped cell's spend the server resumes it, and
+// only then do we reopen streaming the live run (forceLive — the polled summary
+// still says capped until the next poll lands).
+function onCapOverride() {
 	const { slot, model, branch } = state.view ?? {};
 	if (!slot || branch) return;
-	try {
-		await api.capOverride(state.run, slot, model);
+	const cap = currentSummary()?.cap;
+	promptCapValue(`spend cap · ${slot} · ${model}`, { current: cap?.limit ?? 0 }, async (v) => {
+		const r = await api.capOverride(state.run, slot, model, v);
 		emit("poll-now");
 		if (
+			r.resumed &&
 			state.view &&
 			state.view.slot === slot &&
 			state.view.model === model &&
 			!state.view.branch
 		)
 			openCell({ slot, model, branch: false, forceLive: true });
-	} catch (e) {
-		toast(e.message, "err");
-	}
+	});
 }
 
 export function closeOverlay() {
