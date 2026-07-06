@@ -215,12 +215,12 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
   let ctx = null; // { run, slot, model, branch }
   let currentId = null;
   let obsModel = null; // the live obs-model wrapper (obsModel.model.calls / .nodes)
-  let busy = false;
-  let busyId = null;
   let blurTimer = null;
   let mention = null; // { start, items:[{index,label,call}], active } | null
   // convId -> { turns:[{role,content,reasoning?,error?}], attached:Set<callIndex>,
-  //            base:{ bundle, templates }|null, baseFetching, baseError }
+  //            base:{ bundle, templates }|null, baseFetching, baseError, busy }.
+  // `busy` is PER THREAD (per cell/branch), so an in-flight request on one never
+  // blocks sending on another — each conversation runs independently.
   const threads = new Map();
 
   function thread() {
@@ -340,17 +340,14 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     refs.status.textContent = base + (attached ? ` · ${attached} in focus` : "");
   }
 
-  function renderShellBusy() {
+  // The send controls reflect the CURRENTLY-VIEWED thread's own in-flight state,
+  // so a request on one cell/branch never disables another's input/button.
+  function syncSendControls() {
     if (!refs) return;
-    refs.sendBtn.disabled = busy;
-    refs.sendBtn.textContent = busy ? "thinking…" : "ask";
-    refs.input.disabled = busy;
-  }
-
-  function setBusy(on, id) {
-    busy = on;
-    busyId = on ? id : null;
-    renderShellBusy();
+    const b = !!thread()?.busy;
+    refs.sendBtn.disabled = b;
+    refs.sendBtn.textContent = b ? "thinking…" : "ask";
+    refs.input.disabled = b;
   }
 
   function renderAttach() {
@@ -381,7 +378,7 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
       refs.body.appendChild(el("div", { class: "ivg-hint" }, el("div", { text: "Open a cell to investigate its scene." })));
       return;
     }
-    const showPending = busy && busyId === currentId;
+    const showPending = !!t.busy;
     if (!t.turns.length && !showPending) {
       refs.body.appendChild(el("div", { class: "ivg-hint" },
         el("div", { text: "Ask holistic questions about this scene — the reviewer has the full scene, every prompt template, and each step's output + reasoning. Type " }),
@@ -599,36 +596,41 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
   // ── send ─────────────────────────────────────────────────────────────────
 
   async function sendTurn(preset) {
-    if (busy || !currentId) return;
+    const id = currentId;
+    const t = id ? threads.get(id) : null;
+    // Gate only on THIS thread's in-flight state — a request on another cell /
+    // branch must not block this one. (The thread object is stable, so it stays
+    // valid while the user views / sends on other threads meanwhile.)
+    if (!t || t.busy) return;
     const text = (preset ?? refs.input.value).trim();
     if (!text) return;
-    const id = currentId;
-    const t = threads.get(id);
     t.turns.push({ role: "user", content: text });
     refs.input.value = "";
     closeMention();
-    setBusy(true, id);
+    t.busy = true;
+    syncSendControls();
     renderTranscript();
     await ensureBase();
-    const cur = threads.get(id);
     let result = null;
     let error = null;
-    if (!cur.base) {
-      error = new Error(cur.baseError || "couldn't load the scene context for this cell");
+    if (!t.base) {
+      error = new Error(t.baseError || "couldn't load the scene context for this cell");
     } else {
       try {
         result = await api.inquire({
-          system: composeSystem(cur),
-          messages: cur.turns.map((m) => ({ role: m.role, content: m.content })),
+          system: composeSystem(t),
+          messages: t.turns.map((m) => ({ role: m.role, content: m.content })),
         });
       } catch (e) {
         error = e;
       }
     }
-    if (error) cur.turns.push({ role: "assistant", content: error.message, error: true });
-    else cur.turns.push({ role: "assistant", content: result.answer || "(empty response)", reasoning: result.reasoning || "" });
-    setBusy(false, null);
-    if (currentId === id) { renderTranscript(); refs.input.focus(); }
+    if (error) t.turns.push({ role: "assistant", content: error.message, error: true });
+    else t.turns.push({ role: "assistant", content: result.answer || "(empty response)", reasoning: result.reasoning || "" });
+    t.busy = false;
+    // Only touch the UI if this thread is still on screen — otherwise the answer
+    // is stored on its (background) thread and shown when it's next viewed.
+    if (currentId === id) { syncSendControls(); renderTranscript(); refs.input.focus(); }
   }
 
   // ── context transparency modal ─────────────────────────────────────────────
@@ -738,12 +740,13 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
       ctx = next ?? null;
       currentId = convId(ctx);
       if (currentId && !threads.has(currentId)) {
-        threads.set(currentId, { turns: [], attached: new Set(), base: null, baseFetching: false, baseError: null });
+        threads.set(currentId, { turns: [], attached: new Set(), base: null, baseFetching: false, baseError: null, busy: false });
       }
       closeMention();
       renderShell();
       renderAttach();
       renderTranscript();
+      syncSendControls(); // reflect the newly-viewed thread's own in-flight state
       updateStatus();
       if (fetch) ensureBase();
     },
@@ -775,6 +778,7 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
       renderShell();
       renderAttach();
       renderTranscript();
+      syncSendControls();
       updateStatus();
     },
   };
