@@ -1,7 +1,7 @@
 // The run board: a pannable/zoomable plane of every (slot × model) cell in
 // the active run, each card showing live status + the step it is on.
 
-import { el, openModal, toast, stepUntilSelect } from "./ui.js";
+import { el, openModal, toast, stepUntilSelect, promptCapValue } from "./ui.js";
 import { state, emit, on, cellKey, cellSummary } from "./state.js";
 import { api } from "./api.js";
 import { createViewer } from "./scene3d.js";
@@ -256,12 +256,18 @@ function bulkResume() {
   runBulk("resumed/started", (c) => api.resume(state.run, c.slot, c.model, stepped));
 }
 function bulkPause() { runBulk("paused", (c) => api.pause(state.run, c.slot, c.model)); }
-// Override the spend cap on just the capped cells in the selection (each raises
-// one band + resumes). Filtered client-side so healthy cells aren't touched.
+// Set one new spend cap on every started (non-done) cell in the selection —
+// raising the ceiling past a capped cell's spend also resumes it. Idle/done
+// cells have no run to cap, so they're filtered out client-side.
 function bulkOverride() {
-  const capped = selectedCells().filter((c) => cellSummary(c.slot, c.model)?.status === "capped");
-  if (!capped.length) { toast("no capped cells in the selection", "err"); return; }
-  runBulk("caps overridden", (c) => api.capOverride(state.run, c.slot, c.model), capped);
+  const cells = selectedCells().filter((c) => {
+    const s = cellSummary(c.slot, c.model);
+    return s?.cap && s.status !== "idle" && s.status !== "done";
+  });
+  if (!cells.length) { toast("no cap-settable cells in the selection", "err"); return; }
+  promptCapValue(`spend cap · ${cells.length} cell${cells.length === 1 ? "" : "s"}`,
+    { submitLabel: "set caps" },
+    (v) => runBulk("caps set", (c) => api.capOverride(state.run, c.slot, c.model, v), cells));
 }
 function bulkStep(until, before = false) {
   runBulk(until ? `stepping → ${before ? "before " : ""}${until}` : "stepped",
@@ -303,7 +309,7 @@ const bulkActionEls = [
   el("button", { title: "pause selected running cells", onclick: bulkPause }, "pause"),
   el("button", { title: "advance each selected cell by one LLM call", onclick: () => bulkStep(null) }, "step"),
   untilSel,
-  el("button", { title: "override the spend cap on selected capped cells & resume them", onclick: bulkOverride }, "override caps"),
+  el("button", { title: "set the spend cap on selected cells (raising past spend resumes capped ones)", onclick: bulkOverride }, "set caps"),
   el("button", { class: "danger", title: "wipe selected cells back to idle", onclick: () => bulkReset(false) }, "reset → idle"),
   el("button", { class: "danger", title: "wipe selected cells and start them fresh", onclick: () => bulkReset(true) }, "reset & start"),
 ];
