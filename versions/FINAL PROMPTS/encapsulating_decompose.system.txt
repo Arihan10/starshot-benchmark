@@ -13,7 +13,7 @@ REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the FINAL 
 </judging_criteria>
 
 <role>
-You are generating the list of objects that make up the negative space that isn't owned by any particular atomic (contains no further subregions) region in the larger overall scene.
+You are determinating the shared boundary that a given region in the scene has with its neighbors, and what objects make up said shared boundary.
 </role>
 
 <input>
@@ -31,6 +31,7 @@ Respond with a single JSON object containing:
   - `orientation` (string): one string describing what other object(s) this object is facing - helps the downstream step actually place the object into the scene.
   - `placement` (string): one string describing where this object sits within the scene relative to its parent and the other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the object is located. Think very deeply about where each object should lie spatially and designing the placement string for it.
   - `relationships` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here. Empty list is fine when the placement only references the parent.
-- `objects_required` (bool): set to `false` when this region's negative space needs no objects at all — `objects` is then ignored even if non-empty. Set to `true` when at least one object is being emitted.
+- `objects_required` (bool): set to `false` when this region needs no bounding perimeter at all — `objects` is then ignored even if non-empty. Set to `true` when at least one bounding object is being emitted.
+
 No additional prose, markdown, or code fences.
 </output>
