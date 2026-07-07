@@ -50,12 +50,12 @@ from app.utils import glass, glb_place, logging
 from app.utils.geometry import export_glb, rescale_mesh_to_bbox, rotate_mesh
 from app.utils.topology import uniquify_ids
 
-_USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "false").lower() == "true"
+_USE_ASSET_LIBRARY = os.environ.get("USE_ASSET_LIBRARY", "true").lower() == "true"
 
 # When true, the `image_prompt` noun-phrase step (see `_distill_subject`) runs on
 # gemini-flash-lite instead of the run's configured model — a cheap distill, like
 # library-match / symmetry, kept off the benchmark model surface.
-_DOWNGRADE_NOUN_PHRASE = os.environ.get("DOWNGRADE_NOUN_PHRASE", "false").lower() == "true"
+_DOWNGRADE_NOUN_PHRASE = os.environ.get("DOWNGRADE_NOUN_PHRASE", "true").lower() == "true"
 
 # Mesh backends a build can route to. Keys are the values the API accepts; each
 # exposes an identical `generate_mesh(...)`, so picking one is a dict lookup. The
