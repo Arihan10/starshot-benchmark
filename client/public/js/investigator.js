@@ -459,6 +459,8 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
         objects.push({ kind: "object", id, nodeKind, indices });
       }
       for (const c of model.calls) {
+        // library_match is a mechanical asset-match service step — never context.
+        if ((c.template ?? c.step) === "library_match") continue;
         const label = `${c.template ?? c.step ?? "?"} · ${c.node ?? "?"} · #${c.index}`;
         if (q && !label.toLowerCase().includes(q)) continue;
         steps.push({ kind: "step", index: c.index, call: c });
@@ -755,6 +757,9 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     attachStep(index) {
       const t = thread();
       if (!t || index == null) return;
+      // library_match is a mechanical service step — never folded into context,
+      // even via a "why?" click on its call row.
+      if (callByIndex(index)?.template === "library_match") return;
       t.attached.add(index);
       renderAttach();
       updateStatus();
