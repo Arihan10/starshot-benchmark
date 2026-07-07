@@ -484,6 +484,12 @@
 			.rep-main > .exp-block, .rep-side > .exp-block, .graph-card > .exp-block { margin-bottom: 8px; }
 			.rep-main > .exp-block:last-child, .rep-side > .exp-block:last-child, .graph-card > .exp-block:last-child { margin-bottom: 0; }
 			.graph-card > .matrix-wrap, .graph-card > .attr-radial-wrap, .graph-card > .graph-grid { overflow-x: auto; }
+			/* ablation research-question sections: stack their cards with breathing room
+			   and let titles/subs WRAP (show all text) instead of truncating. */
+			.abl-q-cards { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+			.abl-q-cards .graph-card-head { flex-wrap: wrap; align-items: baseline; }
+			.abl-q-cards .graph-card-title, .abl-q-cards .graph-card-sub { white-space: normal; overflow: visible; text-overflow: clip; }
+			.abl-q-cards .graph-card-sub { margin-left: 0; }
 			.rep-side { height: 100%; max-height: 100%; overflow: hidden; display: flex; flex-direction: column; gap: 8px; overscroll-behavior: contain; box-sizing: border-box; }
 			.sel-drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
 			.sel-drawer-title { font-size: 11px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--text-faint); }

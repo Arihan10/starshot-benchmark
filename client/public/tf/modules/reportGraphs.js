@@ -153,6 +153,68 @@ function comparePeerHeads(ctx, title = "selected head/layer attention") {
 	return reportCard(title, `${ctx.peers.length} selected ${ctx.level}s`, peerMatrix(profiles, keys, max, ctx.level));
 }
 
+// ---- ablation research-question graphs ------------------------------------
+
+// "XML existence": for each step KIND in the selection, the attention split
+// across ATTRIBUTES with prompt XML kept (✓) vs stripped (✗) — two overlaid
+// profiles per kind (spider = normalized shape, matrix = raw mean ± sd), reusing
+// the attribute-compare machinery. `treatByKey`: peer key → { method, xml, kind }.
+function ablationXmlSplit(cmp, treatByKey) {
+	const { overviewAggregate, reportCard, reportEmpty, el, showErr } = d();
+	const errOn = !showErr || showErr();
+	const profileFrom = (rows, label, color) => {
+		const totals = overviewAggregate(rows).componentTotals;
+		return {
+			label, color, n: rows.length,
+			map: new Map(totals.map((c) => [c.component, c.score])),
+			err: new Map(totals.map((c) => [c.component, c.sd || 0])),
+		};
+	};
+	const byKind = new Map();
+	for (const p of cmp.peers) {
+		const t = treatByKey.get(String(p.key));
+		if (!t) continue; // the base run carries no treatment — skip it here
+		const kind = t.kind || (p.rows[0] && p.rows[0].template) || "?";
+		if (!byKind.has(kind)) byKind.set(kind, { on: [], off: [] });
+		const b = byKind.get(kind);
+		for (const r of p.rows) (t.xml ? b.on : b.off).push(r);
+	}
+	if (!byKind.size) return reportCard("XML existence", "no treatments on the selected variants", reportEmpty("select variants (xml on / off) for a step kind on the left"));
+	const cards = [...byKind.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([kind, { on, off }]) => {
+		const profiles = [];
+		if (on.length) profiles.push(profileFrom(on, "xml \u2713", "#6bd96e"));
+		if (off.length) profiles.push(profileFrom(off, "xml \u2717", "#ff6b9d"));
+		if (!profiles.length) return null;
+		const comps = pickAxes(profiles.flatMap((pr) => [...pr.map.entries()]));
+		const max = axisMax(profiles.flatMap((pr) => comps.map((c) => ({ v: pr.map.get(c) || 0, e: pr.err.get(c) || 0 }))), (x) => x.v, (x) => x.e, errOn);
+		const sub = `${on.length} step${on.length === 1 ? "" : "s"} xml\u2713 · ${off.length} xml\u2717 · attention split across attributes`;
+		return reportCard(`${kind} \u2014 attribute split by XML`, sub, spiderChart(profiles), comps.length ? peerMatrix(profiles, comps, max, "xml") : null);
+	}).filter(Boolean);
+	return el("div", { class: "abl-q-cards" }, ...cards);
+}
+
+// "Scene ordering" scatter: x = an object's position in the (shuffled) scene
+// context (0 = first … 1 = last), y = attention to that object (graph 1) or to
+// one of its attributes (graph 2). Points colored by shuffle method; the pale
+// overlay is the per-position-bin mean (the aggregate trend). The corner shows
+// Spearman ρ + p of attention-vs-position — the "does order matter?" readout.
+// `rawPoints`: [{ x, y, color, label }]; `meanPoints`: [{ x, y }].
+function ablationOrderCard(title, sub, rawPoints, meanPoints, opts = {}) {
+	const { reportCard, reportEmpty, el } = d();
+	if (!rawPoints.length) return reportCard(title, sub, reportEmpty(opts.empty || "no positioned objects in the selection yet"));
+	const pts = rawPoints.map((p) => ({ x: p.x, y: p.y, color: p.color, r: 2.6, label: p.label }));
+	for (const m of meanPoints) pts.push({ x: m.x, y: m.y, color: "#e8fcff", r: 4.6, label: `bin mean ${m.y.toFixed(4)}` });
+	const tr = spearmanTrend(rawPoints.map((p) => p.x), rawPoints.map((p) => p.y));
+	const arrow = tr.rho > 0.05 ? "\u2197" : tr.rho < -0.05 ? "\u2198" : "\u2192";
+	const corr = rawPoints.length >= 3 ? `\u03c1=${tr.rho.toFixed(2)} ${arrow} p=${tr.p < 0.001 ? "<0.001" : tr.p.toFixed(3)}` : null;
+	const chart = scatterChart(pts, {
+		xLabel: "position in context  (0 = first \u2192 1 = last)",
+		yFmt: opts.yFmt || ((v) => (Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(3))),
+		xMax: 1, corrLabel: corr, legend: opts.legend, height: 150,
+	});
+	return reportCard(title, sub, chart);
+}
+
 function peerMatrix(profiles, columns, max, corner = "") {
 	const { el, heatColor } = d();
 	const cols = `grid-template-columns:200px repeat(${columns.length},minmax(96px,1fr))`;
@@ -2215,4 +2277,6 @@ export {
 	attributeProfileGraph,
 	compareAttributesGraph,
 	placementObjectsGraph,
+	ablationXmlSplit,
+	ablationOrderCard,
 };

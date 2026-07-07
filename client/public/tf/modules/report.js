@@ -4,7 +4,7 @@ import { oneWayAnova, mean } from "./ablationstats.js";
 // state.js is the shared leaf every module imports directly; focusedKind reads
 // the same singleton `state` that initReport receives via deps, so the scope
 // focus stays consistent whether it's set here or read there.
-import { focusedKind } from "./state.js";
+import { focusedKind, entityKindLabel } from "./state.js";
 
 // Modular analysis workspace for /tf.
 // Owns report state, selection drawer, comparison policies, and graph board rendering.
@@ -22,6 +22,11 @@ const REPORT_ALIASES = { summary: "step", overview: "scene", cell: "scene", plac
 const REPORT_STATE_VERSION = 1;
 const autoSelectSuppressed = { steps: new Set(), kinds: new Set(), scenes: new Set() };
 let sceneAttrKind = null;
+// Ablation "scene ordering" controls (module-scoped; a full re-render reads them).
+let ablOrderAttr = null;      // graph-2 attribute selector
+let ablOrderKind = "all";     // context-step filter: all | zone | anchor | encap
+const orderCache = new Map(); // `${run}\0${slot}\0${model}\0${ev}` -> Map(id->normPos) | "loading"
+const ORDER_METHOD_COLORS = { order: "#7aa2f7", random: "#e0a94a", distance: "#6bd96e", raytrace: "#b46aff", attend: "#ff6b9d" };
 // The kind highlighted as "focused" in the selector, healed against the kinds
 // actually present so it matches the kind the hero renders. Set in
 // selectionDrawer (kind scope) just before the rows are built.
@@ -918,12 +923,12 @@ function ablationSelectionDrawer() {
 		el("div", { class: "muted", style: "font-size:11px;line-height:1.5;margin-top:8px", text: "check the base + a family (or single variants) to overlay them in the same graphs · monitor + launch on the ⚗ board" }));
 }
 
-// name -> { method, xml } from the fetched ablation variants' treatments.
+// name -> { method, xml, kind } from the fetched ablation variants' treatments.
 function ablTreatmentByName() {
 	const m = new Map();
 	for (const it of ablationRunItems) {
 		const a = it.ablation;
-		if (a && a.treatment) m.set(it.name, { method: a.treatment.shuffle_method || "order", xml: a.treatment.xml_tags !== false });
+		if (a && a.treatment) m.set(it.name, { method: a.treatment.shuffle_method || "order", xml: a.treatment.xml_tags !== false, kind: a.target_step_kind || "" });
 	}
 	return m;
 }
@@ -983,10 +988,128 @@ function renderAblationStats(cmp) {
 		summary, table);
 }
 
+// ---- scene-ordering analysis ----------------------------------------------
+
+const ABL_ORDER_KINDS = ["all", "zone", "anchor", "encap"];
+function ablKindMatch(tpl) {
+	if (ablOrderKind === "zone") return tpl.startsWith("zone_decompose");
+	if (ablOrderKind === "anchor") return tpl.startsWith("anchor_decompose");
+	if (ablOrderKind === "encap") return tpl.startsWith("encapsulating_decompose");
+	return /^(zone_decompose|anchor_decompose|encapsulating_decompose)/.test(tpl);
+}
+
+// tf-export scene_map → { entityId: normalized position } (0 = first … 1 = last),
+// cached per (run, cell, event). Positions come from the PROMPT STRUCTURE, so
+// they exist for any variant regardless of attention compute; a miss kicks a
+// lazy fetch that re-renders on arrival.
+function ensureOrder(run, ev) {
+	const key = `${run}\u0000${state.slot}\u0000${state.model}\u0000${ev}`;
+	const cached = orderCache.get(key);
+	if (cached) return cached === "loading" ? null : cached;
+	orderCache.set(key, "loading");
+	Promise.resolve(api.tfExport(run, state.slot, state.model, ev)).then((exp) => {
+		const sm = (exp && exp.scene_map) || [];
+		const denom = Math.max(1, sm.length - 1);
+		orderCache.set(key, new Map(sm.map((e, i) => [e.id, i / denom])));
+		if (state.reportView === "ablation") renderReportWorkspace({ scrollSelection: false });
+	}).catch(() => { orderCache.set(key, new Map()); });
+	return null;
+}
+
+// (position, attention) points across the selected variants' treated steps.
+// attr=null → attention to the object; attr set → attention to that ATTRIBUTE of
+// the object (needs the per-object component split the server now stores).
+// Colored by shuffle method. The base run rides along as the canonical order.
+function ablOrderPoints(cmp, treat, attr) {
+	const raw = [];
+	let loading = false;
+	for (const p of cmp.peers) {
+		const t = treat.get(String(p.key));
+		const method = t ? t.method : "order";
+		const color = ORDER_METHOD_COLORS[method] || "#7aa2f7";
+		for (const r of p.rows) {
+			if (!ablKindMatch(r.template)) continue;
+			const omap = ensureOrder(String(p.key), r.step.event_index);
+			if (!omap) { loading = true; continue; }
+			for (const e of r.agg.entityTotals) {
+				if (entityKindLabel(e.kind, e.id) !== "object") continue;
+				const pos = omap.get(e.id);
+				if (pos == null) continue;
+				let y;
+				if (attr) { const c = (e.components || []).find((x) => x.component === attr); if (!c) continue; y = c.score; }
+				else y = e.score;
+				raw.push({ x: pos, y, color, method, label: `${e.id} · ${method} @${pos.toFixed(2)}` });
+			}
+		}
+	}
+	return { raw, loading };
+}
+function ablBinMean(raw, nb = 10) {
+	const bins = Array.from({ length: nb }, () => []);
+	for (const p of raw) bins[Math.min(nb - 1, Math.max(0, Math.floor(p.x * nb)))].push(p.y);
+	const out = [];
+	bins.forEach((vals, i) => { if (vals.length) out.push({ x: (i + 0.5) / nb, y: vals.reduce((a, b) => a + b, 0) / vals.length }); });
+	return out;
+}
+function ablOrderLegend(raw) {
+	const methods = [...new Set(raw.map((p) => p.method))];
+	return methods.map((m) => ({ label: m, color: ORDER_METHOD_COLORS[m] || "#7aa2f7" })).concat([{ label: "bin mean", color: "#e8fcff" }]);
+}
+function ablOrderAttributes(cmp) {
+	const freq = new Map();
+	for (const p of cmp.peers) for (const r of p.rows) {
+		if (!ablKindMatch(r.template)) continue;
+		for (const e of r.agg.entityTotals) for (const c of (e.components || [])) freq.set(c.component, (freq.get(c.component) || 0) + 1);
+	}
+	return [...freq.entries()].sort((a, b) => b[1] - a[1]).map(([k]) => k);
+}
+
+// Two xy-scatters answering "does the ordering of the scene context change how
+// the model attends?": (1) attention to the object vs its position, (2) attention
+// to a chosen ATTRIBUTE of the object vs its position. A step-kind filter
+// (zone/anchor/encap) + an attribute dropdown keep it uncrowded.
+function renderAblationOrdering(cmp, treat) {
+	const kindTabs = el("div", { class: "graph-toolbar" },
+		el("span", { class: "muted", style: "font-size:11px;align-self:center;margin-right:2px", text: "context steps:" }),
+		...ABL_ORDER_KINDS.map((k) => el("button", {
+			text: k, class: ablOrderKind === k ? "on" : "",
+			title: k === "all" ? "zone + anchor + encapsulating decompose" : `${k} decompose steps only`,
+			onclick: () => { ablOrderKind = k; renderReportWorkspace({ scrollSelection: false }); },
+		})));
+
+	const g1 = ablOrderPoints(cmp, treat, null);
+	const card1 = graphs.ablationOrderCard("attention to the object vs its position",
+		g1.loading ? "loading context positions…" : `${g1.raw.length} object·steps · y = attention to the object`,
+		g1.raw, ablBinMean(g1.raw), { legend: ablOrderLegend(g1.raw) });
+
+	const attrs = ablOrderAttributes(cmp);
+	if (ablOrderAttr && !attrs.includes(ablOrderAttr)) ablOrderAttr = null;
+	if (!ablOrderAttr && attrs.length) ablOrderAttr = attrs[0];
+	const attrSel = el("select", { style: "font-size:11px;padding:2px 6px;min-width:130px",
+		title: "which attribute of the object to measure attention to",
+		onchange: (e) => { ablOrderAttr = e.target.value; renderReportWorkspace({ scrollSelection: false }); } },
+		...attrs.map((a) => el("option", { value: a, text: a, ...(a === ablOrderAttr ? { selected: "" } : {}) })));
+	const attrRow = el("div", { class: "graph-toolbar" },
+		el("span", { class: "muted", style: "font-size:11px;align-self:center", text: "attribute:" }),
+		attrs.length ? attrSel : el("span", { class: "muted", style: "font-size:11px", text: "— none available —" }));
+	let card2;
+	if (!attrs.length) {
+		card2 = reportCard("attention to an attribute vs object position", "no per-object attribute breakdown in the selection",
+			reportEmpty("recompute the selected variants' attention — the server now stores each object's per-attribute split (older results predate it)"));
+	} else {
+		const g2 = ablOrderPoints(cmp, treat, ablOrderAttr);
+		card2 = graphs.ablationOrderCard(`attention to \u201c${ablOrderAttr}\u201d vs object position`,
+			g2.loading ? "loading context positions…" : `${g2.raw.length} object·steps · y = attention to the object's \u201c${ablOrderAttr}\u201d`,
+			g2.raw, ablBinMean(g2.raw), { legend: ablOrderLegend(g2.raw) });
+	}
+	return el("div", { class: "abl-q-cards" }, kindTabs, card1, attrRow, card2);
+}
+
 // Ablation scope: reuses the peer-comparison graphs, with the peers being the
 // selected variant RUNS. Same graphs as scene/kind/step compare, different axis.
 function renderAblationWorkspace() {
 	const choices = [
+		{ id: "xml", label: "xml existence" }, { id: "ordering", label: "scene ordering" },
 		{ id: "attributes", label: "attributes" }, { id: "stats", label: "ANOVA" },
 		{ id: "entities", label: "entities" }, { id: "heads", label: "heads" },
 	];
@@ -998,6 +1121,17 @@ function renderAblationWorkspace() {
 		return workspaceShell("ablation", choices,
 			reportHero("Ablation comparison", `${cmp.peers.length}/2 runs selected${cmp.loading ? " · loading…" : ""}`,
 				reportEmpty("check at least two variant runs on the left to overlay their attention in the same graphs")),
+			side, []);
+	}
+	const treat = ablTreatmentByName();
+	if (cat === "xml") {
+		return workspaceShell("ablation", choices,
+			reportHero("XML existence", `${cmp.peers.length} runs${cmp.loading ? " · loading…" : ""} · attribute split · XML on vs off, per step kind`, graphs.ablationXmlSplit(cmp, treat)),
+			side, []);
+	}
+	if (cat === "ordering") {
+		return workspaceShell("ablation", choices,
+			reportHero("Scene ordering", `${cmp.peers.length} runs${cmp.loading ? " · loading…" : ""} · does context order change what it attends to?`, renderAblationOrdering(cmp, treat)),
 			side, []);
 	}
 	if (cat === "stats") {
