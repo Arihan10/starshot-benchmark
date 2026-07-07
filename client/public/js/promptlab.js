@@ -649,7 +649,7 @@ async function loadEvents({ silent = false } = {}) {
   // The lab may have moved on while the request was in flight (step switch,
   // run switch, closed) — discard a stale response.
   if (!labEl.classList.contains("open") || lab.step !== payload.step) return;
-  lab.events = payload.events;
+  lab.events = collapseLoopedEvents(lab.step, payload.events);
   // Drop tests whose event no longer exists (run reset, step switch, etc.). The
   // per-cell LLM picks (simModels) are step-independent like the selection, so
   // they persist across step switches and reset only on a run switch.
@@ -659,6 +659,29 @@ async function loadEvents({ silent = false } = {}) {
   if (silent && sig === eventsSig) return; // unchanged — leave the grid alone
   eventsSig = sig;
   renderGrid();
+}
+
+// Steps that run repeatedly on the SAME zone as a completion loop (next_object
+// keeps proposing objects for a zone until it's satisfied), so a single zone
+// logs several calls of them in the source run.
+const LOOPED_STEPS = new Set(["next_object"]);
+
+// Collapse a looped step's per-zone calls down to the FIRST (earliest) call per
+// (slot, model, zone). The lab only ever tests/simulates that first call — a
+// simulation forks at the earliest call and re-runs the whole loop downstream —
+// so surfacing every iteration would make the grid + "simulate (N)" counts
+// reflect how many times the loop ran in the original run, not the single call
+// actually tested. Events arrive sorted by index, so the first seen per zone is
+// the earliest. Non-looped steps pass through unchanged.
+function collapseLoopedEvents(step, events) {
+  if (!LOOPED_STEPS.has(step)) return events;
+  const seen = new Set();
+  return events.filter((e) => {
+    const k = `${e.slot}|${e.model}|${e.node}`;
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
 }
 
 async function pollEvents() {

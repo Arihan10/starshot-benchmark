@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 You are the step in the SpatialBench pipeline responsible for determining if it makes sense to place more objects in a given region to complete its look. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. Once the pipeline reaches a subregion that it determines to not need any more further subdivisions, it begins to generate a list of concrete objects that make up the region. you are part of this process - the core objects have already been defined for the region; you are the detail pass that goes through and determines if any more objects should be added to complete the look or make the region more realistic.
     
 Here is the overall scene that is being built by the pipeline:
@@ -32,4 +33,40 @@ when coming up with the list of objects, be aware that a downstream step is resp
 
 for each object you output, carefully consider how you want to convey their spatial placement in the scene to the downstream step that converts your purely semantic descriptions into actual numeric coordinates and orientation. each object's placement string should be used to semantically describe where and how the object is sitting in the scene, while each object's orientation semantically describes what other objects or regions it is facing. each object's relationships array describes its relative positioning to other objects where the placement text might not capture. all three of these fields come together to help the coordinate solver precisely calculate the spatial positioning of each object, so use them effectively to convey how exactly you want the objects to be laid out.
 
+=======
+You are the step in the SpatialBench pipeline responsible for determining if it makes sense to place more objects in a given region to complete its look. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually. Once the pipeline reaches a subregion that it determines to not need any more further subdivisions, it begins to generate a list of concrete objects that make up the region. you are part of this process - the core objects have already been defined for the region; you are the detail pass that goes through and determines if any more objects should be added to complete the look or make the region more realistic.
+    
+Here is the overall scene that is being built by the pipeline:
+
+`{ROOT_HEADER}`
+
+`{ROOT_OBJECTS}`
+
+You are deciding whether the following region needs more objects to further flesh out its intention and role as part of the larger overall scene:
+
+Region name: `{ZONE_ID}`
+Region prompt: "`{ZONE_PROMPT}`"
+Region description: "`{ZONE_PLAN}`"
+Region dimensions: `{ZONE_DIMENSIONS}`
+Region global origin corner: `{ZONE_ORIGIN}`
+
+Here's the list of other subregions that have been planned for this scene so far, with the objects placed inside each subregion listed inline beneath it. Each subregion has a description for how it should be built (or just its prompt for what it is if a description hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its prompt, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each subregion and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
+
+`{SCENE_CONTEXT}`
+
+<VERY_IMPORTANT_INSTRUCTIONS>
+
+`{ZONE_OBJECTS}`
+
+using the provided scene context and the current state of `{ZONE_ID}`, determine if any more detail objects are necessary to be placed as part of `{ZONE_ID}`.
+
+think about the description for the region and the objects that have already been determined for it so far. all of the core use cases of the region have already been covered - your goal is to add detail to the region and make it seem more realistic. think from the perspective of someone actually in the scene and what kind of details they would notice that the current object list doesn't cover. what objects count as detail depends on the context of the region and the larger scene as a whole - a coin on a table in a modern house, for instance, would be a lofty detail that serves to add some realism and decoration to the scene, while a coin in a super mario brothers platformer level is a fundamental game mechanic that shouldn't be dictated by this step. sometimes, the layout is already sufficient and clear, and adding any more objects/detail will only introduce noise. importantly, the objects you generate should not alter or violate the existing intention of the region formed by the objects before you.
+
+at the same time, consider the specific placement of the objects already present in the region and if there is a physical AND semantic need for more objects. each object, should you choose to place any at all, should be fully intentional and justified in the space. when the region is sufficiently laid out relative to the amount of physical space it has left and it's description, output objects_required: false along with an empty list of items.
+
+when coming up with the list of objects, be aware that a downstream step is responsible for outputting an AABB for each object you output, and another downstream step is responsible for generating the actual 3D meshes based on each object's prompt. the 3d mesh generator excels at generating individual, atomic objects - it is NOT reliable when it comes to collections of objects placed in a certain shape or manner and will often have devastating results on the entire scene, especially since the output mesh gets stretched and scaled to the bounding box given for it. as such, ignore intangible objects like gasses, and ALWAYS split groups of objects into individual ones, then use the placement text and relationships list to convey the meaning of how they should be placed in the scene so each individual object in the collection gets its own mesh and bounding box.
+
+for each object you output, carefully consider how you want to convey their spatial placement in the scene to the downstream step that converts your purely semantic descriptions into actual numeric coordinates and orientation. each object's placement string should be used to semantically describe where and how the object is sitting in the scene, while each object's orientation semantically describes what other objects or regions it is facing. each object's relationships array describes its relative positioning to other objects where the placement text might not capture. all three of these fields come together to help the coordinate solver precisely calculate the spatial positioning of each object, so use them effectively to convey how exactly you want the objects to be laid out.
+
+>>>>>>> d263451bda856e598575245a2fd91222df577617
 </VERY_IMPORTANT_INSTRUCTIONS>

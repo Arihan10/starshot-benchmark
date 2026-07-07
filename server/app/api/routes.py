@@ -663,6 +663,29 @@ def _root_plan_cut(events: list[dict[str, object]]) -> int | None:
     return None
 
 
+def _llm_error_message(e: Exception) -> str:
+    """Full detail for an LLM/provider error. OpenRouter SDK errors only
+    stringify to the generic top-level message (e.g. "Provider returned
+    error"); the actually useful cause — the upstream provider's complaint and
+    the request body that tripped it — lives on `e.data.error.metadata` and
+    `e.body` (the response body the SDK already read; `raw_response.text` would
+    re-trigger a read on a closed streaming response). Fold both into one string
+    so every caller (pipeline run.error, the investigator's /inquire) surfaces
+    what actually went wrong instead of the opaque top-level message."""
+    details: list[str] = []
+    data = getattr(e, "data", None)
+    err = getattr(data, "error", None) if data is not None else None
+    if err is not None:
+        metadata = getattr(err, "metadata", None)
+        if metadata:
+            details.append(f"metadata={metadata}")
+    body = getattr(e, "body", None)
+    if body:
+        details.append(f"body={str(body)[:2000]}")
+    suffix = (" | " + " | ".join(details)) if details else ""
+    return f"{type(e).__name__}: {e}{suffix}"
+
+
 def _run_id(run: str, slot_id: str, model_alias: str) -> str:
     """Composite id used as `run_id` in pipeline code (divider, generation,
     threed queue, SlotLog.slot_id). The slashes make it work as a filesystem
@@ -1749,8 +1772,10 @@ def create_app() -> FastAPI:
         try:
             answer, reasoning = await llm.chat(model=INQUIRY_MODEL, system=req.system, messages=convo)
         except Exception as e:
-            # Provider/transport failure → clean 502 the panel shows inline.
-            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+            # Provider/transport failure → clean 502 the panel shows inline, with
+            # the provider's ACTUAL complaint (metadata/body), not just the SDK's
+            # opaque "Provider returned error".
+            raise HTTPException(status_code=502, detail=_llm_error_message(e))
         return {"answer": answer, "reasoning": reasoning, "model": INQUIRY_MODEL}
 
     # --- per-slot investigator context --------------------------------------
@@ -4128,6 +4153,12 @@ def _scene_nodes_full(slot_log: SlotLog, *, image_log: SlotLog | None = None) ->
     return nodes
 
 
+# Mechanical per-object service steps (asset matching + noun-phrase distillation)
+# — NOT spatial reasoning, and by far the most numerous LLM calls. Omitted from
+# the investigator context entirely (the step gate flags them the same way).
+_INVESTIGATOR_SKIP_STEPS = {"image_prompt", "library_match"}
+
+
 # Per-step variables the investigator's step TIMELINE omits: the scene-wide
 # dumps (the full scene is given ONCE, faithfully rendered, below) and the
 # global root fields (also given once). What remains per step is the compact,
@@ -4160,11 +4191,12 @@ def _investigator_bundle(slot_log: SlotLog) -> dict[str, object]:
         if e.get("kind") != "cache.llm":
             continue
         template = e.get("template") or e.get("step")
-        # image_prompt runs once PER OBJECT (the most numerous step); its
-        # noun-phrase output + reasoning bloat the timeline enormously for little
-        # spatial insight, so it's omitted from the base context. Attaching a
-        # specific image_prompt step still folds its full detail in on demand.
-        if template == "image_prompt":
+        # image_prompt / library_match are mechanical per-object service steps
+        # (the most numerous LLM calls); their output + reasoning bloat the
+        # timeline for zero spatial insight, so they're left out of the base
+        # context. An image_prompt step is still @-attachable on demand;
+        # library_match is kept out of the investigator entirely.
+        if template in _INVESTIGATOR_SKIP_STEPS:
             continue
         raw_vars = e.get("variables") if isinstance(e.get("variables"), dict) else {}
         native = prompt_store.STEP_VARIABLES.get(template, []) if isinstance(template, str) else []
@@ -4638,7 +4670,7 @@ async def _run_branch(branch_id: str) -> None:
         raise
     except Exception as e:
         generation.cancel_pending(brun_id)
-        blog.log("run.error", message=f"{type(e).__name__}: {e}")
+        blog.log("run.error", message=_llm_error_message(e))
         return
     finally:
         # The gate lives only for the task's duration — drop it so a finished
@@ -5170,25 +5202,9 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         raise
     except Exception as e:
         generation.cancel_pending(run_id)
-        # OpenRouter SDK errors only stringify to the top-level "Provider
-        # returned error" message; the actually useful detail (upstream
-        # provider's complaint, the request body that tripped it) lives on
-        # `data.error.metadata` and on `e.body` (the response body the SDK
-        # already read; `raw_response.text` would re-trigger a read on a
-        # closed streaming response). Pull both into the logged message so
-        # the run.error event tells us what went wrong.
-        details = []
-        data = getattr(e, "data", None)
-        err = getattr(data, "error", None) if data is not None else None
-        if err is not None:
-            metadata = getattr(err, "metadata", None)
-            if metadata:
-                details.append(f"metadata={metadata}")
-        body = getattr(e, "body", None)
-        if body:
-            details.append(f"body={body[:2000]}")
-        suffix = (" | " + " | ".join(details)) if details else ""
-        slot_log.log("run.error", message=f"{type(e).__name__}: {e}{suffix}")
+        # Log the full provider detail (metadata/body), not the SDK's opaque
+        # top-level "Provider returned error", so the run.error event is useful.
+        slot_log.log("run.error", message=_llm_error_message(e))
         return
     finally:
         # A gate only lives for the duration of its task — drop it so a paused
