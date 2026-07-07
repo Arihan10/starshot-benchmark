@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import unicodedata
 from pathlib import Path
 
 from pydantic import BaseModel
@@ -46,6 +47,37 @@ def _load_catalog() -> list[LibraryItem]:
             raw = json.load(f)
         _catalog = [LibraryItem(**item) for item in raw]
     return _catalog
+
+
+def _fold_library_id(library_id: str) -> str:
+    """Normalization key for tolerant catalog-id matching: unicode-NFC, trimmed,
+    and casefolded. Lets an id that differs from the catalog's only in letter
+    case or unicode form (e.g. "L-shaped-staircase" for "l-shaped-staircase")
+    resolve to the real asset."""
+    return unicodedata.normalize("NFC", library_id).strip().casefold()
+
+
+_canonical_by_fold: dict[str, str] | None = None
+
+
+def resolve_library_id(library_id: str) -> str | None:
+    """Snap an LLM-returned library id onto the exact catalog id it names,
+    tolerating case / unicode-form / surrounding-whitespace variance. Returns
+    None when it matches no catalog entry (a genuine hallucination), so callers
+    can fall back to the raw id and route to the asset-missing path.
+
+    The match step runs on a small model that regularly returns a near-miss of
+    the catalog id — most often a capitalized first letter. Both `asset_path` (a
+    case-sensitive filesystem) and `asset_rotated_bounds` (a case-sensitive dict
+    lookup) miss on such an id; the bounds miss is the damaging one, since
+    `_match_library_assets` then copies the asset through UNPLACED — the mesh
+    renders stuck at the world origin while its bbox sits correctly placed."""
+    global _canonical_by_fold
+    if _canonical_by_fold is None:
+        _canonical_by_fold = {}
+        for item in _load_catalog():
+            _canonical_by_fold.setdefault(_fold_library_id(item.id), item.id)
+    return _canonical_by_fold.get(_fold_library_id(library_id))
 
 
 SYSTEM_LIBRARY_MATCH = """\
@@ -86,7 +118,7 @@ async def match(prompt: str) -> LibraryMatchOutput:
     # spatial-reasoning benchmark surface.
     token = llm._current_model.set(MODELS["gemini-flash-lite"])
     try:
-        return await llm.call_llm(
+        result = await llm.call_llm(
             system=SYSTEM_LIBRARY_MATCH,
             user=user,
             output_schema=LibraryMatchOutput,
@@ -94,20 +126,33 @@ async def match(prompt: str) -> LibraryMatchOutput:
         )
     finally:
         llm._current_model.reset(token)
+    # Snap the model's id onto the exact catalog id — it commonly returns a
+    # case/unicode near-miss (e.g. "L-shaped-staircase" for "l-shaped-staircase")
+    # that would otherwise miss the placement-bounds lookup and copy the mesh
+    # through unplaced. An unresolvable id is left as-is for the asset-missing path.
+    canonical = resolve_library_id(result.library_id)
+    if canonical is not None:
+        result.library_id = canonical
+    return result
 
 
 def asset_path(library_id: str) -> Path:
-    return ASSETS_DIR / f"{library_id}.glb"
+    # Resolve to the canonical catalog id so a case/unicode near-miss still finds
+    # the real file on a case-sensitive filesystem; an unresolved id falls through
+    # unchanged, so a genuine miss still routes to the asset-missing path.
+    return ASSETS_DIR / f"{resolve_library_id(library_id) or library_id}.glb"
 
 
 _bounds_by_id: dict[str, dict[str, dict[str, list[float]]]] | None = None
 
 
 def _load_bounds() -> dict[str, dict[str, dict[str, list[float]]]]:
-    """Per-asset, per-orientation world-space AABBs from optimize_manifest.json.
-    The placement bake needs the rotated extents to fill a target bbox, but the
-    optimized GLBs are Meshopt/KTX2-compressed and can't be measured server-side,
-    so the bounds are precomputed (see tools/optimize-assets/augment-bounds.mjs)."""
+    """Per-asset, per-orientation world-space AABBs from optimize_manifest.json,
+    keyed by the folded asset id (case/unicode-insensitive) so the lookup can't
+    miss on a near-miss id. The placement bake needs the rotated extents to fill a
+    target bbox, but the optimized GLBs are Meshopt/KTX2-compressed and can't be
+    measured server-side, so the bounds are precomputed (see
+    tools/optimize-assets/augment-bounds.mjs)."""
     global _bounds_by_id
     if _bounds_by_id is None:
         _bounds_by_id = {}
@@ -116,7 +161,7 @@ def _load_bounds() -> dict[str, dict[str, dict[str, list[float]]]]:
             for entry in data.get("assets", []):
                 bbo = entry.get("bounds_by_orientation")
                 if bbo:
-                    _bounds_by_id[entry["id"]] = bbo
+                    _bounds_by_id[_fold_library_id(entry["id"])] = bbo
     return _bounds_by_id
 
 
@@ -125,7 +170,10 @@ def asset_rotated_bounds(
 ) -> tuple[list[float], list[float]] | None:
     """(min, max) world-space AABB of `library_id` after the given yaw, or None
     when the asset is absent from the manifest or lacks augmented bounds."""
-    bbo = _load_bounds().get(library_id)
+    # Fold the id to match the manifest's folded keys (case-insensitive on both
+    # ends), so a case/unicode near-miss from the match step still hits — a miss
+    # here is what makes _match_library_assets copy the mesh through unplaced.
+    bbo = _load_bounds().get(_fold_library_id(library_id))
     if not bbo:
         return None
     entry = bbo.get(str(int(orientation)))
