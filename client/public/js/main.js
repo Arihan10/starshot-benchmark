@@ -343,7 +343,9 @@ function startCellsModal() {
 // Launch a new run (B) that reuses this run's ROOT zone plans: pick the cells
 // to carry over + a prompt version, and each cell is re-run from just after its
 // root zone plan under the new version (the plan is held fixed, everything
-// below it regenerates). Server seeds only cells with a committed plan.
+// below it regenerates). Ticking "hold the overall bounding box" also carries
+// each cell's root bbox, so the scene canvas is identical in both runs. Server
+// seeds only cells with the copied step(s) committed.
 async function abTestModal() {
   if (!state.run) return;
   const sourceRun = state.run;
@@ -382,6 +384,10 @@ async function abTestModal() {
   );
   forkCheck.addEventListener("change", () => { forkRow.style.display = forkCheck.checked ? "" : "none"; });
 
+  // Also carry each cell's root overall bounding box (not just its zone plan),
+  // so both runs share the same scene canvas and only the fill varies.
+  const bboxCheck = el("input", { type: "checkbox" });
+
   const cellChecks = candidates.map((c) =>
     el("label", {},
       el("input", { type: "checkbox", value: `${c.slot}|${c.model}`, checked: "" }),
@@ -400,7 +406,9 @@ async function abTestModal() {
       el("div", { class: "m-field" },
         el("span", { text: `cells to A/B from “${sourceRun}” (keeps each cell's root zone plan)` }),
         el("div", { class: "check-grid" }, cellChecks)),
-      el("div", { class: "m-hint", text: "Run B copies each selected cell's log up to its root zone plan, then re-runs from there on the chosen version — the plan is held fixed, everything below it regenerates. Cells without a committed plan are skipped." }),
+      el("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text-dim)" },
+        bboxCheck, "also hold the overall bounding box fixed (copy each cell's root bbox call too)"),
+      el("div", { class: "m-hint", text: "Run B copies each selected cell's log up to its root zone plan, then re-runs from there on the chosen version — the plan is held fixed, everything below it (the overall bounding box included) regenerates. Tick the box above to also copy the root overall bounding box so the scene canvas is identical in both runs. Cells missing the copied step are skipped." }),
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
@@ -423,13 +431,14 @@ async function abTestModal() {
             await api.forkVersion(newName, versionSel.value);
             version = newName;
           }
-          const payload = await api.abTest(name, version, sourceRun, cells);
+          const payload = await api.abTest(name, version, sourceRun, cells, bboxCheck.checked);
           close();
           const nSeeded = payload.seeded?.length ?? 0;
           const nSkipped = payload.skipped?.length ?? 0;
+          const skipWhat = bboxCheck.checked ? "without a plan or overall bbox" : "without a plan";
           toast(
             `A/B run :: ${payload.current} — launched ${nSeeded} cell${nSeeded === 1 ? "" : "s"}` +
-              (nSkipped ? ` (skipped ${nSkipped} without a plan)` : ""),
+              (nSkipped ? ` (skipped ${nSkipped} ${skipWhat})` : ""),
             "ok",
           );
           await refreshRuns();

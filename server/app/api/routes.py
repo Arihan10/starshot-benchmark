@@ -635,12 +635,18 @@ class AbTestRequest(BaseModel):
     `prompt_version`, so the resumable divider replays that one committed
     plan verbatim (committed.zone_plan) and re-derives everything below it
     under the new prompts — a prompt A/B that holds the top-level plan fixed
-    and varies the whole scene beneath it."""
+    and varies the whole scene beneath it.
+
+    `include_overall_bbox` extends each cell's copied prefix through the root's
+    overall bounding box too, so B holds BOTH the root zone plan AND the scene
+    canvas fixed (committed.bbox("root") hits on resume) and varies only what is
+    generated inside that fixed box."""
 
     name: str
     prompt_version: str
     source_run: str
     cells: list[AbTestCell]
+    include_overall_bbox: bool = False
 
 
 class CopySlotRequest(BaseModel):
@@ -652,14 +658,35 @@ class CopySlotRequest(BaseModel):
     slot: str
 
 
-def _root_plan_cut(events: list[dict[str, object]]) -> int | None:
-    """Leading-event count to keep so a copy holds through the ROOT zone plan
-    and nothing after — the position of the root `divider.zone_plan` event + 1,
-    or None if this cell never planned its root. A true prefix, so the copied
-    events keep `index == line` and a resumed `log()` continues cleanly."""
+def _root_plan_cut(
+    events: list[dict[str, object]], *, through_overall_bbox: bool = False
+) -> int | None:
+    """Leading-event count to keep so an A/B copy holds a source cell's ROOT
+    reasoning fixed and drops everything after — a true prefix, so the copied
+    events keep `index == line` and a resumed `log()` continues cleanly.
+
+    Ends at the root `divider.zone_plan` event (+1) by default, so B replays
+    that one plan verbatim and re-derives everything below it — including a
+    fresh overall bounding box — under its own prompts. With
+    `through_overall_bbox` the prefix extends to the root `bbox` event (the
+    overall bounding box, which the divider emits right after the root plan) so
+    `committed.bbox("root")` hits on resume and B reuses the exact same canvas.
+
+    None when the required event was never committed: no root plan, or — with
+    `through_overall_bbox` — a root plan that never reached its bbox."""
+    plan_cut: int | None = None
     for i, e in enumerate(events):
         if e.get("kind") == "divider.zone_plan" and e.get("node") == "root":
-            return i + 1
+            plan_cut = i + 1
+            break
+    if plan_cut is None or not through_overall_bbox:
+        return plan_cut
+    # The overall bbox is only ever emitted after the root plan, so scanning
+    # from the plan cut keeps the kept slice a contiguous prefix.
+    for j in range(plan_cut, len(events)):
+        e = events[j]
+        if e.get("kind") == "bbox" and e.get("id") == "root":
+            return j + 1
     return None
 
 
@@ -3565,7 +3592,10 @@ def create_app() -> FastAPI:
         chosen prompt version. The resumable divider replays that one committed
         plan verbatim and re-derives the whole scene below it under B's
         prompts — an A/B that holds the top-level plan fixed and varies
-        everything downstream. Non-destructive to the source run (read-only)."""
+        everything downstream. With `include_overall_bbox` the copied prefix
+        extends through the root's overall bounding box as well, so B also holds
+        the scene canvas fixed and varies only what fills it. Non-destructive to
+        the source run (read-only)."""
         name = req.name.strip()
         if not name or "/" in name or "\\" in name or name.startswith("."):
             raise HTTPException(status_code=400, detail="invalid run name")
@@ -3597,6 +3627,7 @@ def create_app() -> FastAPI:
                     "prompt_version": version,
                     "created_at": datetime.now().isoformat(timespec="seconds"),
                     "ab_from": req.source_run,
+                    "ab_include_overall_bbox": req.include_overall_bbox,
                 }
             )
             + "\n",
@@ -3615,7 +3646,7 @@ def create_app() -> FastAPI:
                 continue
             src = _slot_logs.get((req.source_run, cell.slot, cell.model))
             events = src.state["events"] if src is not None else []
-            cut = _root_plan_cut(events)
+            cut = _root_plan_cut(events, through_overall_bbox=req.include_overall_bbox)
             if cut is None:
                 skipped.append(f"{cell.slot}/{cell.model}")
                 continue
@@ -3628,9 +3659,14 @@ def create_app() -> FastAPI:
         if not seeded:
             # Nothing to launch — don't leave an empty A/B run behind.
             shutil.rmtree(run_dir, ignore_errors=True)
+            need = (
+                "root zone plan and overall bounding box"
+                if req.include_overall_bbox
+                else "root zone plan"
+            )
             raise HTTPException(
                 status_code=400,
-                detail="no selected cell had a committed root zone plan to seed from",
+                detail=f"no selected cell had a committed {need} to seed from",
             )
         # Hydrate B (picks up the seeded prefixes) then start each seeded cell:
         # the divider replays the copied root plan and runs the rest fresh.

@@ -69,8 +69,10 @@ export const api = {
 	// Launch a NEW run (B) seeded with `sourceRun`'s ROOT zone plans: each
 	// listed {slot, model} cell is copied through its root zone plan and started
 	// on `promptVersion`, so the pipeline replays that plan and re-derives the
-	// rest under the new prompts. Returns {current, seeded:[...], skipped:[...]}.
-	abTest: (name, promptVersion, sourceRun, cells) =>
+	// rest under the new prompts. With `includeOverallBbox` the copy carries each
+	// cell's root overall bounding box too, so B holds the scene canvas fixed and
+	// varies only what fills it. Returns {current, seeded:[...], skipped:[...]}.
+	abTest: (name, promptVersion, sourceRun, cells, includeOverallBbox = false) =>
 		request("/runs/ab-test", {
 			method: "POST",
 			body: {
@@ -78,6 +80,7 @@ export const api = {
 				prompt_version: promptVersion,
 				source_run: sourceRun,
 				cells,
+				include_overall_bbox: includeOverallBbox,
 			},
 		}),
 	// Copy an entire slot folder (every model cell + its meshes) from
