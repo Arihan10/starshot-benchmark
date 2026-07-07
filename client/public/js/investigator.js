@@ -31,10 +31,10 @@ You are given, below, everything needed to reason about WHY the scene turned out
   - VARIABLES — what each \`{VARIABLE}\` token in the templates means.
   - PROMPT TEMPLATES — the exact instructions (with variable tokens) each step operates under.
   - CURRENT SCENE — the full, final scene: the root, its global objects, and the subregion tree with every region's plan, bbox, and inline objects.
-  - EXECUTION TIMELINE — every LLM step that actually ran, in order: which template on which node, its structured OUTPUT, its private REASONING, and its step-specific variable VALUES.
-  - FOCUS — when the developer pins specific steps (or a scene object/zone) as most relevant to the question, those steps are pulled OUT of the timeline and shown in full here: their exact system/input bytes, with heavy scene-wide variables left as tokens. A step is never in both the timeline and FOCUS.
+  - EXECUTION TIMELINE — an OUTLINE of every step that ran, in order: which template ran on which node (with its call index). This is the sequence of WHAT happened; it does NOT include any step's output, reasoning, or rendered prompt.
+  - FOCUS — the steps the developer pinned as most relevant to the question (by attaching a step, or @-mentioning a scene object/zone). ONLY these show their full detail: their exact system/input bytes (heavy scene-wide variables left as tokens) plus their structured OUTPUT and private REASONING.
 
-You are NOT given each step's fully-rendered system/user message, except the FOCUS ones. Reconstruct what a non-focus step saw by combining its TEMPLATE with the scene state at that point (replay the timeline) and its logged variable VALUES. When you need a step's exact bytes, the developer attaches it — it then moves from the timeline into FOCUS.
+For a non-focus step you have only its template + node from the outline — NOT its output, reasoning, or rendered prompt. Reason from CURRENT SCENE (the result) and the PROMPT TEMPLATES (what each step was instructed to do), correlating the outline to the scene. When a question genuinely needs a specific step's output or reasoning, say so and tell the developer to attach that step (or @-mention the object/zone) — it then appears in FOCUS.
 
 A developer benchmarking the pipeline's spatial reasoning will ask you holistic questions about the scene — why an object sits where it does, whether a placement blocks traversal or overlaps badly, whether a decomposition was sensible, what the intent behind the layout was, where the reasoning went wrong.
 
@@ -160,23 +160,12 @@ function sceneBlock(bundle) {
   ].join("\n");
 }
 
+// The timeline is just an OUTLINE — which template ran on which node, in order.
+// Outputs/reasoning aren't here (they're the bulk of the context); the scene
+// shows the RESULT, and FOCUS steps carry the full output + reasoning.
 function timelineBlock(steps) {
   if (!steps?.length) return "(no LLM steps have executed in this cell yet)";
-  return steps.map((s) => {
-    const vars = s.variables && Object.keys(s.variables).length
-      ? Object.entries(s.variables).map(([k, v]) =>
-          String(v).includes("\n") ? `\`{${k}}\`:\n${v}` : `\`{${k}}\` = ${v}`).join("\n")
-      : "(no step-specific variables logged)";
-    return [
-      `### #${s.index} · ${s.template ?? s.step} · on ${s.node ?? "?"}`,
-      "variables:",
-      vars,
-      "",
-      `output: ${fmtJson(s.output)}`,
-      "",
-      `reasoning: ${s.reasoning ? s.reasoning : "(none exposed)"}`,
-    ].join("\n");
-  }).join("\n\n");
+  return steps.map((s) => `#${s.index} · ${s.template ?? s.step} · on ${s.node ?? "?"}`).join("\n");
 }
 
 // Scene-wide variables whose rendered values would blow up context if repeated
@@ -302,7 +291,7 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
       pipelineDoc(mode),
       `# PROMPT TEMPLATES (every pipeline step except image_prompt — raw, with \`{VARIABLE}\` tokens; attach an image_prompt step to see its template)\n\n${templatesBlock(t.base.templates)}`,
       `# CURRENT SCENE\n\n${sceneBlock(t.base.bundle)}`,
-      `# EXECUTION TIMELINE (every step that ran, in order, EXCEPT the per-object image_prompt calls and the FOCUS steps below — its output, reasoning, and step-specific variable values)\n\n${timelineBlock(timelineSteps)}`,
+      `# EXECUTION TIMELINE — outline of every divider step that ran, in order (template · node · #index), EXCEPT the FOCUS steps below. No outputs/reasoning here: correlate a step to the scene it produced in CURRENT SCENE, and put a step in FOCUS to see its full output + reasoning.\n\n${timelineBlock(timelineSteps)}`,
     ];
     if (attached.size) {
       // Execution order, so a mentioned object's steps read as its history:
