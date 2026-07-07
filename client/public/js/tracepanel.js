@@ -46,6 +46,10 @@ export function createTracePanel(
 		onNavigate = () => {},
 		onClose = () => {},
 		onInquire = null,
+		// Project a map onto the focused object's mesh (null desc clears); returns
+		// whether it took. `mapProjectionOf` reads the viewer's live projection back.
+		onProjectMap = () => {},
+		mapProjectionOf = () => null,
 		actions = null,
 		meshUrlFor = (_id, node) => node.meshUrl ?? null,
 		rawMeshUrlFor = (_id, node) =>
@@ -239,6 +243,9 @@ export function createTracePanel(
 	let lastSig = null;
 	let lastInfoSig = null;
 	let lastPreviewKey = null; // focused mesh currently in the mini viewer — skips needless reloads
+	// "on mesh" buttons keyed by map type, re-synced from the viewer (source of
+	// truth) without rebuilding the map grid.
+	const mapProjBtns = new Map();
 	// One reusable mini viewer for the whole panel lifetime (1 WebGL context);
 	// created lazily, never disposed — just cleared + reloaded per focus, and
 	// paused (setActive false) whenever the panel is hidden.
@@ -794,9 +801,39 @@ export function createTracePanel(
 		return canvas;
 	}
 
-	function mapTile(label, src, channel) {
+	// Re-sync every "on mesh" button to the viewer's live projection.
+	function updateProjButtons() {
+		const active = mapProjectionOf(focusId);
+		for (const [mapType, btn] of mapProjBtns) {
+			const on = active === mapType;
+			btn.classList.toggle("on", on);
+			btn.textContent = on ? "on mesh ✓" : "on mesh";
+		}
+	}
+
+	// Toggle a map's projection onto the focused object's mesh (re-picking clears);
+	// the viewer is the source of truth, so apply then re-read into the buttons.
+	function toggleProjection(mapType) {
+		if (!focusId) return;
+		if (mapProjectionOf(focusId) === mapType) onProjectMap(focusId, null);
+		else onProjectMap(focusId, { mapType });
+		updateProjButtons();
+	}
+
+	function mapTile(label, src, channel, mapType) {
 		const canvas = drawMapCanvas(src, channel);
 		if (!canvas) return null;
+		const on = mapProjectionOf(focusId) === mapType;
+		const projBtn = el("button", {
+			class: `tp-map-proj${on ? " on" : ""}`,
+			text: on ? "on mesh ✓" : "on mesh",
+			title: "project this map onto the selected object's mesh in the 3D scene (dims the rest)",
+			onclick: (ev) => {
+				ev.stopPropagation(); // don't also toggle the tile's enlarge
+				toggleProjection(mapType);
+			},
+		});
+		mapProjBtns.set(mapType, projBtn);
 		const tile = el(
 			"div",
 			{
@@ -809,6 +846,7 @@ export function createTracePanel(
 				class: "tp-map-lab",
 				text: `${label} · ${src.w}×${src.h}`,
 			}),
+			projBtn,
 		);
 		return tile;
 	}
@@ -816,6 +854,7 @@ export function createTracePanel(
 	function clearMaps() {
 		mapsGrid.replaceChildren();
 		mapsWrap.style.display = "none";
+		mapProjBtns.clear(); // refilled by renderMaps
 	}
 
 	// Pull the standard PBR maps off the loaded GLB's materials and render each
@@ -839,18 +878,18 @@ export function createTracePanel(
 			}
 		});
 		const tiles = [];
-		const add = (tex, channel, label) => {
+		const add = (tex, channel, label, mapType) => {
 			const src = texImage(tex);
 			if (!src) return;
-			const tile = mapTile(label, src, channel);
+			const tile = mapTile(label, src, channel, mapType);
 			if (tile) tiles.push(tile);
 		};
-		add(found.base, null, "base color");
-		add(found.mr, "g", "roughness");
-		add(found.mr, "b", "metallic");
-		add(found.ao, "r", "occlusion");
-		add(found.normal, null, "normal");
-		add(found.emissive, null, "emissive");
+		add(found.base, null, "base color", "base");
+		add(found.mr, "g", "roughness", "roughness");
+		add(found.mr, "b", "metallic", "metallic");
+		add(found.ao, "r", "occlusion", "occlusion");
+		add(found.normal, null, "normal", "normal");
+		add(found.emissive, null, "emissive", "emissive");
 		if (!tiles.length) return;
 		mapsGrid.replaceChildren(...tiles);
 		mapsWrap.style.display = "";
@@ -1419,6 +1458,12 @@ export function createTracePanel(
 	function hide() {
 		hostEl.classList.remove("open");
 		miniViewer?.setActive(false);
+		// Also drop any projection (covers the node-vanished refresh path the
+		// viewer's own select/clear can miss).
+		if (mapProjectionOf(focusId)) {
+			onProjectMap(focusId, null);
+			updateProjButtons();
+		}
 	}
 
 	function reset() {
@@ -1453,6 +1498,9 @@ export function createTracePanel(
 		hide,
 		reset,
 		rerenderInfo,
+		// Repaint the buttons after the caller cleared the projection viewer-side
+		// (e.g. an asset-mode / optimized swap wiped the meshes).
+		clearProjection: () => updateProjButtons(),
 		isOpen: () => hostEl.classList.contains("open"),
 		focusId: () => focusId,
 	};

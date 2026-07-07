@@ -3912,6 +3912,23 @@
 				text-transform: uppercase;
 				letter-spacing: 0.04em;
 			}
+			/* "on mesh" toggle: projects the map onto the object's mesh; active = accent. */
+			.tp-map-proj {
+				margin-top: 2px;
+				width: 100%;
+				font-size: 9px;
+				padding: 2px 4px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+			}
+			.tp-map-proj.on {
+				background: var(--accent);
+				border-color: var(--accent);
+				color: #06121c;
+			}
+			.tp-map-proj.on:hover:not(:disabled) {
+				color: #06121c;
+			}
 			/* Lighting panel — opened from the ☀ light toggle in #viewer-toggles;
 			   floats bottom-left over the canvas, shifting clear of the trace panel. */
 			#lighting-panel {
