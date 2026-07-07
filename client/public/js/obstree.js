@@ -68,6 +68,11 @@ export function createObsDock(hostEl, { trace = true } = {}) {
   // Overlay-provided hidden-node API — the SAME set the canvas right-click
   // toggles, so the eye buttons and right-click stay in sync.
   let hiddenApi = { isHidden: () => false, toggle: () => {} };
+  // Overlay-provided: resolve a call's captured top-token logprobs (fetches the
+  // per-call sidecar). null hides the logprobs affordance (branches / panes that
+  // don't wire it). Only calls whose `cache.llm` event carries `logprobs:true`
+  // offer it.
+  let onLogprobs = null;
 
   function setPinStep(step) {
     pinStep = step;
@@ -79,6 +84,7 @@ export function createObsDock(hostEl, { trace = true } = {}) {
   function setOnInquire(fn) { onInquire = fn; }
   function setOnAddSim(fn) { onAddSim = fn; }
   function setHiddenApi(api) { hiddenApi = api; }
+  function setLogprobsResolver(fn) { onLogprobs = fn; }
 
   // Selection sync FROM the 3D viewer: highlight the row and reveal it.
   function markSelected(id, { scroll = true } = {}) {
@@ -180,6 +186,10 @@ export function createObsDock(hostEl, { trace = true } = {}) {
     detail.appendChild(section("system — exact bytes sent", call.system ?? "", { variables: call.variables }));
     detail.appendChild(section("user — exact bytes sent", call.user ?? "", { variables: call.variables }));
     detail.appendChild(section("output — exact bytes received", fmtJson(call.output)));
+    // Only present when this cell captured logprobs AND a resolver is wired
+    // (source cells in the overlay). The token stream aligns to the raw output
+    // above — concatenating the tokens reproduces it byte-for-byte.
+    if (call.logprobs === true && onLogprobs) detail.appendChild(logprobsSection(call));
     if (call.reasoning) detail.appendChild(section("reasoning", call.reasoning, { open: false }));
     if (call.variables && typeof call.variables === "object") {
       const wrap = el("div", { class: "detail-section" },
@@ -202,6 +212,108 @@ export function createObsDock(hostEl, { trace = true } = {}) {
     }
     detail.addEventListener("click", (ev) => ev.stopPropagation());
     return detail;
+  }
+
+  // Lazily-loaded top-token logprobs for one call. The sidecar can be large, so
+  // it's fetched on first expand (then cached on the call) and rendered as the
+  // response text with every token tinted by its probability + clickable for the
+  // top alternatives the model weighed at that position.
+  function logprobsSection(call) {
+    const body = el("div", { class: "logprobs-body", style: "display:none" });
+    let phase = "idle"; // idle → loaded | empty
+    const toggle = el("button", { style: "font-size:10px;padding:1px 7px", text: "show" });
+    toggle.onclick = async () => {
+      if (phase === "idle") {
+        toggle.textContent = "…";
+        const data =
+          call._logprobsData !== undefined
+            ? call._logprobsData
+            : (call._logprobsData = await onLogprobs(call));
+        if (data && Array.isArray(data.tokens) && data.tokens.length) {
+          renderLogprobsInto(body, data);
+          phase = "loaded";
+        } else {
+          body.appendChild(el("div", { class: "muted", text: "no logprobs captured for this call (provider may not serve them)" }));
+          phase = "empty";
+        }
+        body.style.display = "";
+        toggle.textContent = "hide";
+        return;
+      }
+      const shown = body.style.display !== "none";
+      body.style.display = shown ? "none" : "";
+      toggle.textContent = shown ? "show" : "hide";
+    };
+    return el("div", { class: "detail-section" },
+      el("div", { class: "lab" },
+        el("span", { text: "top-token logprobs — click any token for its top 20 alternatives" }),
+        toggle,
+      ),
+      body,
+    );
+  }
+
+  function renderLogprobsInto(container, data) {
+    container.textContent = "";
+    const tokens = Array.isArray(data.tokens) ? data.tokens : [];
+    container.appendChild(el("div", {
+      class: "muted",
+      style: "margin-bottom:4px",
+      text: `${tokens.length} tokens · top-${data.top_n ?? "?"}${data.model ? ` · ${data.model}` : ""}`,
+    }));
+    const detail = el("div", { class: "logprob-detail muted", text: "click a token to see the alternatives the model weighed there" });
+    const flow = el("div", { class: "logprob-flow" });
+    tokens.forEach((tk, i) => {
+      const p = typeof tk.logprob === "number" ? Math.exp(tk.logprob) : null;
+      const span = el("span", {
+        class: "logprob-tok",
+        // Show whitespace/newlines as themselves (the flow is pre-wrapped) but
+        // keep zero-width tokens clickable with a thin placeholder.
+        text: tk.token === "" ? "∅" : tk.token,
+        title: p !== null ? `p=${(p * 100).toFixed(2)}% · logprob ${tk.logprob.toFixed(3)}` : "",
+      });
+      if (p !== null) {
+        const hue = Math.round(120 * Math.max(0, Math.min(1, p)));
+        span.style.backgroundColor = `hsla(${hue}, 85%, 45%, 0.30)`;
+      }
+      span.onclick = (ev) => {
+        ev.stopPropagation();
+        for (const s of flow.querySelectorAll(".logprob-tok.sel")) s.classList.remove("sel");
+        span.classList.add("sel");
+        renderTokenAlternatives(detail, tk, i);
+      };
+      flow.appendChild(span);
+    });
+    container.appendChild(flow);
+    container.appendChild(detail);
+  }
+
+  function renderTokenAlternatives(detail, tk, i) {
+    detail.classList.remove("muted");
+    detail.textContent = "";
+    detail.appendChild(el("div", {
+      class: "logprob-detail-head",
+      text: `token #${i}: ${JSON.stringify(tk.token)}`,
+    }));
+    const alts = (Array.isArray(tk.top) ? tk.top.slice() : [])
+      .sort((a, b) => (b.logprob ?? -Infinity) - (a.logprob ?? -Infinity));
+    if (!alts.length) {
+      detail.appendChild(el("div", { class: "muted", text: "no alternatives recorded at this position" }));
+      return;
+    }
+    const table = el("div", { class: "logprob-alts" });
+    for (const alt of alts) {
+      const p = typeof alt.logprob === "number" ? Math.exp(alt.logprob) : 0;
+      const chosen = alt.token === tk.token;
+      const bar = el("div", { class: "logprob-bar" });
+      bar.style.width = `${Math.max(1, Math.round(p * 100))}%`;
+      table.appendChild(el("div", { class: `logprob-alt${chosen ? " chosen" : ""}` },
+        el("span", { class: "logprob-alt-tok", text: JSON.stringify(alt.token) }),
+        el("span", { class: "logprob-alt-p", text: `${(p * 100).toFixed(2)}%` }),
+        bar,
+      ));
+    }
+    detail.appendChild(table);
   }
 
   // Clicking a node focuses its bbox in 3D. With trace enabled it also flips
@@ -536,6 +648,7 @@ export function createObsDock(hostEl, { trace = true } = {}) {
     setOnInquire,
     setOnAddSim,
     setHiddenApi,
+    setLogprobsResolver,
     markSelected,
     expandCall,
     renderTree,

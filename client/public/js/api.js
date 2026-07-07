@@ -92,6 +92,10 @@ export const api = {
 		request(`/runs/${encodeURIComponent(name)}/activate`, {
 			method: "POST",
 		}),
+	// Delete a run and its on-disk artifacts (stops any live cells first).
+	// Refuses the active run. Used by the ablation board's reset.
+	deleteRun: (name) =>
+		request(`/runs/${encodeURIComponent(name)}`, { method: "DELETE" }),
 	// Load a run's cells into memory WITHOUT activating it, so its /scene +
 	// /meshes are readable next to the active run (the run-compare view). No-op
 	// if already loaded; launches nothing.
@@ -104,14 +108,19 @@ export const api = {
 	// generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
 	// pool. { pools: [{id,label,cap}], entries: [{slot_id,job_id,state,backend,pool,…}] }.
 	trellisQueue: () => request("/trellis/queue"),
+	// Hard-stop every in-flight generation process-wide (all runs/cells/meshes).
+	stopAllGenerations: () => request("/generations/stop", { method: "POST" }),
+	// Process-wide snapshot of what's running now (for the task monitor).
+	activeGenerations: () => request("/generations/active"),
 
 	// --- cell lifecycle ---
-	// `stepped` opts the cell in/out of one-call-at-a-time execution
-	// (null/undefined keeps its current mode).
-	resume: (run, slot, model, stepped = null) =>
+	// `stepped` opts the cell in/out of one-call-at-a-time execution;
+	// `logprobs` opts it in/out of top-20 token-logprob capture. Either
+	// null/undefined keeps the cell's current mode for that flag.
+	resume: (run, slot, model, stepped = null, logprobs = null) =>
 		request(cellPath(slot, model, "/resume"), {
 			method: "POST",
-			params: { run, stepped },
+			params: { run, stepped, logprobs },
 		}),
 	// `auto` runs the cell to completion; `until` runs THROUGH the next call of
 	// that step (it executes), pausing before the following one. A plain step
@@ -322,6 +331,71 @@ export const api = {
 	},
 	artifactUrl: (path) => u(`/artifacts/${path}`).toString(),
 	absUrl: (path) => new URL(path, SERVER_URL).toString(),
+	// The captured top-token logprobs for one LLM call — present only when the
+	// cell was started with capture on AND the provider served them. Keyed by
+	// the call's content hash (the `cache.llm` event's `key`); resolves to the
+	// parsed sidecar { text, tokens:[{start,end,token,logprob,top:[…]}], … } or
+	// null when absent. The token stream concatenates back to `text`, which is
+	// the exact response the model emitted — so tokens map 1:1 onto the output.
+	async logprobs(run, slot, model, key) {
+		if (!key) return null;
+		const res = await fetch(
+			u(`/artifacts/${run}/${slot}/${model}/logprobs/${key}.json`),
+			{ cache: "no-store" },
+		);
+		if (!res.ok) return null;
+		try {
+			return await res.json();
+		} catch {
+			return null;
+		}
+	},
+
+	// --- teacher-forcing export (Gemma-faithful reconstruction) ---
+	// `tfSteps` is the cell's linear step timeline (every LLM call in order, each
+	// with `render_until` = the log index to render the 3D scene up to).
+	// `tfExport` reconstructs one step's full input+reasoning+output sequence
+	// with id→char-span maps (scene zones/objects, to-place, output, variables).
+	tfSteps: (run, slot, model) =>
+		request(cellPath(slot, model, "/tf-steps"), { params: { run } }),
+	tfExport: (run, slot, model, eventIndex) =>
+		request(cellPath(slot, model, `/tf-export/${eventIndex}`), {
+			params: { run },
+		}),
+
+	// --- attention analysis (teacher-forced, real Modal GPU compute) ---
+	// The browser NEVER blocks on a compute. `attentionEnqueue` schedules one or
+	// many steps on the server and returns immediately; `attentionList` is the
+	// status poll — the server-owned queue: `{ computed, running, queued, errors }`
+	// per step; `attentionGet` fetches one stored result (404 until computed).
+	// max_query_tokens: 0 (default) scores EVERY completion token — the full output
+	// trajectory. A positive value bounds only the long reasoning region (every
+	// OUTPUT token is always kept), trading reasoning detail for smaller files.
+	attentionEnqueue: (run, slot, model, { eventIndices, force = false, maxQueryTokens = 0, maxHeads = 32, topK = 12 } = {}) =>
+		request(cellPath(slot, model, "/attention"), {
+			method: "POST",
+			params: { run },
+			body: { event_indices: eventIndices, force, max_heads: maxHeads, top_k: topK, max_query_tokens: maxQueryTokens },
+		}),
+	// Reset a cell's PENDING compute (clears the model's stale queue partition +
+	// this cell's queued/running) so a fresh compute-all never inherits a prior
+	// run's phantom jobs. Committed results are preserved. Reuses the enqueue
+	// route with an empty item list + `reset` flag (fires even with nothing to send).
+	attentionReset: (run, slot, model) =>
+		request(cellPath(slot, model, "/attention"), {
+			method: "POST",
+			params: { run },
+			body: { event_indices: [], reset: true },
+		}),
+	attentionList: (run, slot, model, { maxHeads = 0 } = {}) =>
+		request(cellPath(slot, model, "/attention"), { params: { run, max_heads: maxHeads || undefined } }),
+	// Projected views of one step's stored analysis so the browser never pulls the
+	// (potentially hundreds-of-MB) full result. `compact` (default) = scalars +
+	// head grid + entity maps + precomputed aggregates; `token` = one token's full
+	// per-head detail (lazy scrub); `present` = per-token head-summed detail;
+	// `full` = the whole thing (debug/back-compat).
+	attentionGet: (run, slot, model, eventIndex, { view = "compact", i } = {}) =>
+		request(cellPath(slot, model, `/attention/${eventIndex}`), { params: { run, view, i } }),
 
 	// --- simulation branches (keyed by branch id) ---
 	// A branch is a first-class fork living in the run's flat `_branches/<id>/`

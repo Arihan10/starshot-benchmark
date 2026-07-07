@@ -6,6 +6,8 @@ flipping the active model. Aliases map to the OpenRouter model IDs the
 llm service feeds straight into chat.send_async.
 """
 
+# CHANGING THE SLUGS AND NAMES WOULD MESS UP THE ATTENTION RESULTS AND THE DASHBOARD. THIS IS BECAUSE THE IDENTIFIERS ARE USED TO KEY THE ATTENTION RESULTS AND THE DASHBOARD USES THE IDENTIFIERS TO DISPLAY THE RESULTS.
+
 from __future__ import annotations
 
 import os
@@ -62,6 +64,9 @@ MODELS: dict[str, str] = {
     "opus-fable": "anthropic/claude-fable-latest",
     "glm": "z-ai/glm-5.2",
     "qwen": "qwen/qwen3.7-max",
+    # Open-weight Qwen (Apache-2.0) — the attention analysis can load its HF
+    # weights (Qwen/Qwen3.5-122B-A10B) and replay it; see app.attention.models.
+    "qwen-122b": "qwen/qwen3.5-122b-a10b",
     "kimi": "moonshotai/kimi-k2-thinking",
     "sonnet": "anthropic/claude-sonnet-4.6",
     "sonnet-new": "anthropic/claude-sonnet-5",

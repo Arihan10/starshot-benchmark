@@ -224,6 +224,15 @@ export function initOverlay(sceneViewer) {
 	// it's shared across source AND branch views.
 	dock.setOnInquire(investigateCall);
 
+	// Top-token logprobs for a call: fetch its per-call sidecar for the CURRENT
+	// source cell. Only offered on calls flagged `logprobs:true`; branches don't
+	// capture, so return null there (hides the affordance).
+	dock.setLogprobsResolver((call) => {
+		if (!state.view || state.view.branch) return null;
+		const { slot, model } = state.view;
+		return api.logprobs(state.run, slot, model, call.key);
+	});
+
 	document
 		.getElementById("overlay-close")
 		.addEventListener("click", closeOverlay);

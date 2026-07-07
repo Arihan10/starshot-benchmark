@@ -1,0 +1,36 @@
+This is the object you are describing:
+
+Original object prompt: '`{OBJECT_PROMPT}`'
+Bounding box dimensions: `{OBJECT_DIMENSIONS}`
+Proxy shape: `{PROXY_SHAPE}`
+
+This is the region that this object lives within, its direct parent:
+
+region name: "`{ZONE_ID}`"
+region prompt: "`{ZONE_PROMPT}`"
+description: "`{ZONE_PLAN}`"
+region placement: "`{ZONE_PLACEMENT}`"
+
+Here's a list of objects already placed directly within "`{ZONE_ID}`" (a flat list — an object anchored to a peer object names that peer in its `parent` block rather than nesting beneath it):
+
+`{SIBLING_OBJECTS}`
+
+Here is the overall scene context that is the main stylistic guide to all zones and objects:
+
+prompt: "`{ROOT_PROMPT}`"
+description: "`{ROOT_PLAN}`"
+
+Here's a list of objects that belong to the root region:
+
+`{ROOT_OBJECTS_BRIEF}`
+
+Here's the list of other subregions that have been planned for this scene so far. Each lists the subregion's prompt, then the objects placed inside it — each with its prompt and its noun-phrase (if it's already been generated):
+
+`{OTHER_SUBREGIONS_BRIEF}`
+
+<IMPORTANT_INSTRUCTIONS>
+Your role is to describe the object to an image generator such that it generates an item that fits the overall scene. The description must be in absolute isolation, DO NOT mention meta qualities about the object or it's interactions with things around it. Ex. X submerged in water, Y placed on top of Z, etc.
+
+The phrase is dropped verbatim into a fixed image-prompt template that generates an image of the object for a downstream image-to-3D re-constructor. Your description should be specific enough for downstream steps to recreate the geometry 1-to-1.
+
+Produce ONE noun phrase naming the subject.

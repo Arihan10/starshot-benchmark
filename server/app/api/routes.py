@@ -23,12 +23,15 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import difflib
+import gzip
 import json
 import os
 import re
 import secrets
 import shutil
 import struct
+import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections.abc import AsyncIterator
@@ -41,6 +44,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
+from app.ablation import config as ablation_cfg, context as ablation_ctx
 from app.core import prompt_store, scene_context, schemas
 from app.utils import cache
 from app.oneshot import routes as oneshot
@@ -54,7 +58,13 @@ from app.core.slots import (
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import divider, generation, object_wipe
-from app.services import llm, prefabs, threed
+from app.attention import derive as attn_derive
+from app.attention import dispatch as attn_dispatch
+from app.attention import identity as attn_identity
+from app.attention import models as attn_models
+from app.attention import schema as attn_schema
+from app.attention import store as attn_store
+from app.services import llm, prefabs, teacher_forcing, threed
 from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
@@ -311,6 +321,39 @@ def _set_stepped(key: RunKey, on: bool) -> None:
     else:
         _stepped_cells.discard(key)
         marker.unlink(missing_ok=True)
+
+
+# Cells started with the "capture logprobs" toggle: every real LLM call in the
+# cell requests OpenRouter's top-20 token logprobs and persists them to a
+# per-call sidecar (see llm._write_logprobs_sidecar). Mirrored on disk by a
+# `.logprobs` marker so the mode SURVIVES a restart — the flag has to be known
+# at resume time, before the pipeline re-enters divider.run.
+_logprobs_cells: set[RunKey] = set()
+
+
+def _logprobs_marker(key: RunKey) -> Path:
+    return _slot_dir(*key) / ".logprobs"
+
+
+def _set_logprobs(key: RunKey, on: bool) -> None:
+    """Toggle a cell's logprob-capture mode in memory AND on disk."""
+    marker = _logprobs_marker(key)
+    if on:
+        _logprobs_cells.add(key)
+        with contextlib.suppress(OSError):
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text("")
+    else:
+        _logprobs_cells.discard(key)
+        marker.unlink(missing_ok=True)
+
+
+# Attention: the durable job queue + all queued/running/errors state lives on
+# Modal, keyed by a cell HASH of (run, slot, full-model, prompt_version). The
+# server builds exports, streams them under that hash, and pulls finished results
+# — each HMAC-stamped so the server can verify a result matches the CURRENT prompt
+# version + step content before persisting. Nothing queue-related is kept in this
+# process, so a reload/restart recovers the full state with one pull.
 
 
 class CellGate:
@@ -621,6 +664,10 @@ class SaveRunRequest(BaseModel):
     # Display label for run.json; pass the freshly-saved version name when
     # "save to new version" ran first.
     version_label: str | None = None
+    # Optional ablation treatment persisted into the new run's run.json so the
+    # pipeline binds it task-locally and the scene renderer applies it (shuffle /
+    # distractor) to the re-inferred steps. Absent on normal saves.
+    ablation: dict[str, object] | None = None
 
 
 class AbTestCell(BaseModel):
@@ -1420,6 +1467,10 @@ def _hydrate_run(run: str) -> None:
             # comes back steppable after a restart instead of a dead paused cell.
             if (slot_dir / ".stepped").exists():
                 _stepped_cells.add((run, slot.id, alias))
+            # Restore logprob-capture mode likewise so a resumed cell keeps
+            # capturing top-token logprobs on its remaining frontier calls.
+            if (slot_dir / ".logprobs").exists():
+                _logprobs_cells.add((run, slot.id, alias))
             _maybe_launch(slot, alias, slot_log)
     _hydrate_branches(run)
     _hydrated_runs.add(run)
@@ -1577,12 +1628,17 @@ def create_app() -> FastAPI:
             ):
                 meta = _run_meta(p.name)
                 pv = meta.get("prompt_version")
+                abl = meta.get("ablation")
                 items.append(
                     {
                         "name": p.name,
                         "modified_at": p.stat().st_mtime,
                         # null for legacy runs (loadable, not resumable).
                         "prompt_version": pv if isinstance(pv, str) else None,
+                        # present only on ablation variants → lets the dashboard
+                        # board + /tf group them into base+label families without
+                        # a per-run metadata fetch.
+                        "ablation": abl if isinstance(abl, dict) else None,
                     }
                 )
         return {"runs": items, "current": _current_run}
@@ -1619,6 +1675,34 @@ def create_app() -> FastAPI:
         global _current_run
         _current_run = name
         return {"current": name}
+
+    @app.delete("/runs/{name}")
+    async def delete_run(name: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Delete a run and everything on disk for it, after stopping any live
+        cells so nothing keeps writing into files being removed. Refuses to
+        delete the active run (switch away first). Backs the ablation board's
+        reset — ablation variants are disposable forks, so this is their cleanup.
+        """
+        name = name.strip()
+        if not name or "/" in name or "\\" in name or name.startswith("."):
+            raise HTTPException(status_code=400, detail="invalid run name")
+        run_dir = _run_dir(name)
+        if not run_dir.is_dir():
+            raise HTTPException(status_code=404, detail=f"no such run: {name}")
+        if name == _current_run:
+            raise HTTPException(status_code=409, detail="can't delete the active run — switch runs first")
+        # Stop + drop every in-memory cell of this run before touching disk.
+        for key in [k for k in list(_slot_logs.keys()) if k[0] == name]:
+            await _cancel_task(*key)
+            await _cancel_cell_generation(*key)
+            _slot_logs.pop(key, None)
+        # Discard any branches anchored on this run.
+        for bid in [b for b, br in list(_branches.items()) if br.run == name]:
+            br = _branches.pop(bid, None)
+            if br is not None:
+                await _cancel_branch_task(br)
+        shutil.rmtree(run_dir, ignore_errors=True)
+        return {"deleted": name}
 
     @app.post("/runs/snapshot")
     async def snapshot_run() -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
@@ -1730,7 +1814,7 @@ def create_app() -> FastAPI:
         try:
             # Display-only preview: it never logs a cache.llm event, so the
             # billed generation ids go unused (no cost is attributed to a run).
-            _validated, reasoning, usage, raw, _gen_ids = await llm.call_llm_once(
+            _validated, reasoning, usage, raw, _gen_ids, _logprobs = await llm.call_llm_once(
                 system=system,
                 user=user,
                 output_schema=schema_cls,
@@ -2023,6 +2107,37 @@ def create_app() -> FastAPI:
             "paused": paused,
         }
 
+    @app.get("/generations/active")
+    async def active_generations() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Process-wide snapshot of what's in flight RIGHT NOW — every running
+        pipeline (across all runs, so ablation variants show too), from-scratch
+        build, regen, mesh retry, plus the mesh-queue depth. Cheap: iterates the
+        in-memory task tables (no hydration), so a task monitor can poll it."""
+        def _gate_step(g: object) -> str | None:
+            if g is None:
+                return None
+            for attr in ("current", "pending"):
+                v = getattr(g, attr, None)
+                if isinstance(v, dict):
+                    name = v.get("template") or v.get("step")
+                    if name:
+                        return f"{name} @ {v['node']}" if v.get("node") else str(name)
+            return None
+        pipelines = [
+            {"run": run, "slot": slot_id, "model": alias, "step": _gate_step(_cell_gates.get((run, slot_id, alias)))}
+            for (run, slot_id, alias), t in _tasks.items() if not t.done()
+        ]
+        generates = [_gen_slot_id(*k) for k, t in _generate_tasks.items() if not t.done()]
+        regens = [_gen_slot_id(*k) for k, t in _regen_tasks.items() if not t.done()]
+        retries = sum(1 for t in _retry_tasks if not t.done())
+        return {
+            "pipelines": pipelines,
+            "generates": generates,
+            "regens": regens,
+            "retries": retries,
+            "mesh_queue": len(threed.queue_snapshot()),
+        }
+
     @app.get("/slots/{slot_id}/{model_alias}/events")
     async def slot_events(slot_id: str, model_alias: str, since: int = -1, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
@@ -2101,6 +2216,625 @@ def create_app() -> FastAPI:
             headers={"Cache-Control": "no-store"},
         )
 
+    # --- teacher-forcing export (Gemma-faithful reconstruction) ----------------
+    # The linear step timeline for a cell: every logged LLM call in order, each
+    # with the log index to render the 3D scene up to (`render_until` = the next
+    # step's index, exclusive; null = render the whole scene at the last step).
+    @app.get("/slots/{slot_id}/{model_alias}/tf-steps")
+    async def tf_steps(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        # Drop mechanical per-object service calls that aren't spatial-reasoning
+        # steps worth teacher-forcing and just flood the timeline:
+        #   * library_match  — asset retrieval (always gemini-flash-lite, never gated)
+        #   * image_prompt    — noun-phrase distillation for the image gen
+        # `render_until` is computed from the FILTERED list, so a shown step still
+        # renders the scene through any skipped calls in between.
+        _SKIP_STEPS = {"library_match", "image_prompt"}
+        calls = [
+            e for e in slot_log.state["events"]
+            if e.get("kind") == "cache.llm" and e.get("step") not in _SKIP_STEPS
+        ]
+        steps: list[dict[str, object]] = []
+        for i, e in enumerate(calls):
+            steps.append({
+                "event_index": e.get("index"),
+                "step": e.get("step"),
+                "template": e.get("template"),
+                "node": e.get("node"),
+                "schema": e.get("schema"),
+                "model": e.get("model"),
+                "tokens_in": e.get("tokens_in"),
+                "tokens_out": e.get("tokens_out"),
+                "has_logprobs": e.get("logprobs") is True,
+                # Whether the step's prompt has scene entities to attend to. The UI
+                # skips scene-less steps (root plans / overall bbox) when computing
+                # attention — there'd be no scene-attending heads anyway.
+                "has_scene": teacher_forcing.has_scene_context(e),
+                # Render the scene up to (but not including) the NEXT step, so the
+                # bbox/model events this step produced are on screen.
+                "render_until": calls[i + 1].get("index") if i + 1 < len(calls) else None,
+            })
+        # Whether attention analysis is available for this cell's model: it needs
+        # OPEN HF weights, so closed/API models (gpt/claude/gemini/...) are gated
+        # off. Surfaced so the UI can disable compute + show the HF link.
+        spec = attn_models.resolve_open_model(MODELS.get(model_alias))
+        attention = {
+            "open": spec is not None,
+            "hf_path": spec.hf_path if spec else None,
+            "hf_url": spec.hf_url if spec else None,
+            "gpu": spec.gpu if spec else None,
+            "model_id": MODELS.get(model_alias),
+        }
+        return {"run": run, "slot": slot_id, "model": model_alias, "steps": steps, "attention": attention}
+
+    def _load_logprobs_sidecar(cell_dir: Path, event: dict[str, object]) -> dict[str, object] | None:
+        if event.get("logprobs") is not True:
+            return None
+        key = event.get("key")
+        if not isinstance(key, str):
+            return None
+        path = cell_dir / "logprobs" / f"{key}.json"
+        if not path.is_file():
+            return None
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _find_llm_event(slot_log: SlotLog, event_index: int) -> dict[str, object]:
+        for e in slot_log.state["events"]:
+            if e.get("index") == event_index and e.get("kind") == "cache.llm":
+                return e
+        raise HTTPException(status_code=404, detail=f"no cache.llm event at index {event_index}")
+
+    # The faithful (mock) teacher-forcing export for ONE step: the reconstructed
+    # Gemma input + reasoning + output as a single sequence, plus id -> char-span
+    # maps for scene-context zones/objects, the to-place batch, output
+    # assignments, and every rendered variable. See services/teacher_forcing.py.
+    @app.get("/slots/{slot_id}/{model_alias}/tf-export/{event_index}")
+    async def tf_export(slot_id: str, model_alias: str, event_index: int, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        event = _find_llm_event(slot_log, event_index)
+        logprobs = _load_logprobs_sidecar(slot_log.events_path.parent, event)
+        return teacher_forcing.build_export(
+            event, run=run, slot=slot_id, model_alias=model_alias,
+            model_id=MODELS[model_alias], logprobs=logprobs,
+        )
+
+    # --- attention analysis (teacher-forced attention instrumentation) ---------
+    # A CELL is (run, slot, full-model, prompt_version); its HASH (see identity.py)
+    # keys the durable Modal queue, so a prompt-version bump can never collide with
+    # an older version's state. The server builds exports, streams them to Modal
+    # under that hash, and pulls finished results — each carrying an HMAC STAMP the
+    # server RE-VERIFIES against the current prompt version + current step content
+    # before persisting, so a displayed map is always cryptographically up-to-date.
+
+    def _cell_identity(run: str, slot_id: str, model_alias: str) -> tuple[str, str, dict[str, Any]]:
+        """(cell_hash, prompt_version, ident) for the durable queue."""
+        pv = _run_meta(run).get("prompt_version")
+        pv = pv if isinstance(pv, str) else ""
+        model_full = MODELS[model_alias]
+        h = attn_identity.cell_hash(run, slot_id, model_full, pv)
+        ident = {
+            "run": run, "slot": slot_id, "model_alias": model_alias,
+            "model_id": model_full, "prompt_version": pv,
+        }
+        return h, pv, ident
+
+    # Cap the result blobs transferred per poll so a finished backlog drains over a
+    # few ticks instead of loading one giant response (the status metadata is always
+    # returned immediately regardless).
+    _ATTN_FETCH_CAP = 6
+
+    def _pull_remote_attention(
+        run: str, slot_id: str, model_alias: str, cell_dir: Path, *, max_heads: int = 0,
+    ) -> dict[str, Any]:
+        """FAST metadata poll (queued / running / errors / done) by cell_hash, then a
+        BOUNDED fetch of ONLY the finished blobs we DON'T already hold on disk. There
+        are no server->Modal acks anymore, so Modal's `done` list never shrinks — we
+        dedup against our OWN disk (same step content + at least the requested head
+        count) so the capped window keeps advancing instead of re-pulling the same few
+        steps forever. Persists ONLY results whose HMAC stamp re-verifies against the
+        current prompt version + current step content (an edited step / superseded
+        prompt fails and is dropped)."""
+        if not attn_dispatch.modal_available():
+            return {"queued": [], "running": [], "errors": {}, "done": []}
+        h, pv, _ = _cell_identity(run, slot_id, model_alias)
+        remote = attn_dispatch.pull_remote_queue(cell_hash=h)  # metadata only — cheap
+        raw_errors = remote.get("errors") or {}
+        done = [int(x) for x in (remote.get("done") or [])]
+        if not raw_errors and not done:
+            return remote  # nothing to reconcile — keep the idle poll cheap
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        # One pass over the log: current content key per cache.llm step (reused for BOTH
+        # the error-staleness check and the done-needs-pull check, so we scan once).
+        key_by_ev = {
+            int(e["index"]): e.get("key")
+            for e in slot_log.state["events"]
+            if e.get("kind") == "cache.llm" and e.get("index") is not None
+        }
+        # Normalize the worker's structured errors (`{input_key, msg}`) to `{ev: msg}`
+        # for the client, DROPPING any whose step content changed since the failure: an
+        # edited step's old failure is irrelevant (it re-reads as not-computed and is
+        # re-runnable), so a stale OOM can't keep reading back as "failed" for content
+        # that no longer exists. (A same-content redeploy is cleared worker-side at web
+        # startup; here we cover edits without needing a deploy.)
+        clean_errors: dict[str, str] = {}
+        for k, v in raw_errors.items():
+            try:
+                ev = int(k)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(v, dict):
+                ek, msg = v.get("input_key"), (v.get("msg") or "")
+                if ek is not None and ev in key_by_ev and key_by_ev[ev] != ek:
+                    continue  # content changed since the failure → hide the stale error
+                clean_errors[str(ev)] = msg
+            else:
+                clean_errors[str(ev)] = v  # legacy plain-string error (pre-upgrade)
+        remote["errors"] = clean_errors
+        if not done:
+            return remote
+        # Need = done steps whose on-disk analysis is missing/stale for the CURRENT
+        # key + head budget. Skipping the already-fresh ones is what lets the capped
+        # fetch make forward progress without acks.
+        need = [
+            ev for ev in done
+            if ev in key_by_ev
+            and not attn_store.is_fresh(attn_store.load(cell_dir, ev), key_by_ev[ev], min_heads=max_heads)
+        ]
+        if not need:
+            return remote
+        fetched = attn_dispatch.fetch_results(cell_hash=h, event_indices=need[:_ATTN_FETCH_CAP])
+        for item in fetched.get("results") or []:
+            ev = int(item["event_index"])
+            cur_key = key_by_ev.get(ev)
+            if not attn_identity.verify(
+                item.get("stamp"), cell_hash=h, event_index=ev,
+                input_key=cur_key, prompt_version=pv,
+            ):
+                continue  # stale / unverifiable — never trust it onto disk
+            data = item["result"]  # the SMALL compact view (heatmap + aggregates)
+            data.setdefault("meta", {})["input_key"] = item.get("input_key")
+            data["meta"]["cached"] = False
+            attn_store.save_dict(cell_dir, ev, data)  # -> {ev}.json (compact, served directly)
+        return remote
+
+    # The big per-token/per-head result is pulled ON DEMAND (streamed) only when a
+    # step's token/present detail is opened — never on the frequent poll. Serialize
+    # per-file so concurrent token/present requests for the SAME step pull it once.
+    _full_pull_locks: dict[str, threading.Lock] = {}
+    _full_pull_registry = threading.Lock()
+    # A single gate for the (heavy) legacy-blob heal below: parsing a few-hundred-MB
+    # result must happen ONE at a time, or the overview's parallel compact fetches
+    # would trigger several such parses at once and blow up the web container's RAM.
+    _heal_lock = threading.Lock()
+
+    def _full_pull_lock(path: str) -> threading.Lock:
+        with _full_pull_registry:
+            lk = _full_pull_locks.get(path)
+            if lk is None:
+                lk = _full_pull_locks[path] = threading.Lock()
+            return lk
+
+    def _gzip_file(src: Path, dst_gz: Path) -> None:
+        """Stream-compress `src` -> `dst_gz` (chunked; never holds the blob in RAM),
+        atomically renaming into place so readers see all-or-nothing."""
+        tmp = dst_gz.with_name(f".{dst_gz.name}.{os.getpid()}.tmp")
+        try:
+            with src.open("rb") as fin, gzip.open(tmp, "wb", compresslevel=6) as fout:
+                shutil.copyfileobj(fin, fout, length=1 << 20)
+            os.replace(tmp, dst_gz)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _atomic_write_gz(dst_gz: Path, text: str) -> None:
+        """Gzip `text` to `dst_gz` atomically."""
+        tmp = dst_gz.with_name(f".{dst_gz.name}.{os.getpid()}.tmp")
+        try:
+            with gzip.open(tmp, "wt", encoding="utf-8", compresslevel=6) as f:
+                f.write(text)
+            os.replace(tmp, dst_gz)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def _read_json_file(path: Path) -> dict[str, Any] | None:
+        """Parse a plain-JSON file (the legacy inline `{ev}.json` heal path)."""
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _load_full_blob(cell_dir: Path, event_index: int) -> dict[str, Any] | None:
+        # Heavy source is stored gzip-compressed at rest (`{ev}.full.json.gz`); the
+        # plain `.full.json` is still read for back-compat. attn_derive owns the format.
+        return attn_derive.read_full(cell_dir, event_index)
+
+    def _ensure_full_blob(
+        run: str, slot_id: str, model_alias: str, cell_dir: Path, event_index: int,
+    ) -> bool:
+        """Make the step's heavy source (`{ev}.full.json.gz`) present and CURRENT,
+        streaming it from the worker if missing/stale. It's 'current' when it's at
+        least as new as the small `{ev}.json` compact (a recompute rewrites the
+        compact newer, so an old full is re-pulled). One transfer per step under a
+        per-file lock; falls back to whatever is on disk if Modal is unreachable.
+        The pull lands plain, then we gzip it at rest (~10x) and drop the plain copy."""
+        gz_path, plain_path = attn_derive.source_paths(cell_dir, event_index)
+        compact_path = attn_store.analysis_path(cell_dir, event_index)
+
+        def _current() -> bool:
+            try:
+                cm = compact_path.stat().st_mtime
+            except OSError:
+                return False
+            for p in (gz_path, plain_path):
+                try:
+                    if p.stat().st_mtime >= cm:
+                        return True
+                except OSError:
+                    continue
+            return False
+
+        if _current():
+            return True
+        if not attn_dispatch.modal_available():
+            return gz_path.is_file() or plain_path.is_file()  # best effort: any copy
+        with _full_pull_lock(str(gz_path)):
+            if _current():  # another request pulled it while we waited on the lock
+                return True
+            h, _, _ = _cell_identity(run, slot_id, model_alias)
+            try:
+                gz_path.parent.mkdir(parents=True, exist_ok=True)
+                ok = attn_dispatch.fetch_full_to_file(
+                    cell_hash=h, event_index=int(event_index), dest_path=str(plain_path),
+                )
+                if ok:  # compress at rest, then drop the plain pull
+                    _gzip_file(plain_path, gz_path)
+                    plain_path.unlink(missing_ok=True)
+                return ok
+            except Exception:  # noqa: BLE001 — Modal hiccup; fall back to any local copy
+                return gz_path.is_file() or plain_path.is_file()
+
+    def _load_compact_healed(cell_dir: Path, event_index: int) -> dict[str, Any] | None:
+        """Serve a step's SMALL compact, HEALING a legacy full `{ev}.json` on first
+        access. Pre-split results stored the whole per-token/per-head blob inline
+        (up to ~700MB); the overview pulls EVERY computed step's compact, so serving
+        those raw would ship gigabytes to the browser and hang it. On a legacy hit we
+        preserve the heavy source GZIPPED as `{ev}.full.json.gz` (~10x smaller),
+        down-project to the compact, and rewrite `{ev}.json` as that compact — so it's
+        paid ONCE per step and every later read (compact here, token/present/full from
+        the sidecar) is cheap. New results already land as compact and take the fast path."""
+        path = attn_store.analysis_path(cell_dir, event_index)          # {ev}.json
+        gz_path, plain_path = attn_derive.source_paths(cell_dir, event_index)
+
+        def _peek_compact(p: Path) -> bool:
+            # The compact doc leads with `{"compact": true, ...}`, so the marker is in
+            # the first bytes — detect it WITHOUT parsing a possibly-huge legacy file.
+            try:
+                with p.open("r", encoding="utf-8") as f:
+                    return re.search(r'"compact"\s*:\s*true', f.read(4096)) is not None
+            except OSError:
+                return False
+
+        if path.is_file() and _peek_compact(path):
+            return attn_store.load(cell_dir, event_index)              # already small
+        if not path.is_file() and attn_derive.source_path(cell_dir, event_index) is None:
+            return None                                                # nothing stored
+
+        with _heal_lock:
+            if path.is_file() and _peek_compact(path):                 # healed while we waited
+                return attn_store.load(cell_dir, event_index)
+            # Heavy source of truth: the sidecar full (gz/plain) if present (e.g. an
+            # interrupted prior heal), else the legacy full still inline at `{ev}.json`.
+            existing_src = attn_derive.source_path(cell_dir, event_index)
+            full = attn_derive.read_full(cell_dir, event_index) if existing_src else _read_json_file(path)
+            if full is None:
+                return attn_store.load(cell_dir, event_index)
+            if isinstance(full, dict) and full.get("compact"):
+                return full
+            try:
+                compact = attn_derive.build_compact(full)
+            except Exception:  # noqa: BLE001 — a malformed legacy file must not wedge the view
+                return full if isinstance(full, dict) else None
+            try:
+                # Preserve the heavy source compressed at rest (~10x) so token/present
+                # views still work without a re-pull (Modal has no blob for legacy
+                # steps), then replace the giant inline `{ev}.json` with the compact.
+                if existing_src is None:
+                    _atomic_write_gz(gz_path, json.dumps(full))
+                attn_store.save_dict(cell_dir, event_index, compact)   # {ev}.json -> compact
+                # Keep the source at least as new as the compact so `_ensure_full_blob`
+                # sees it as current and never tries to re-pull these legacy steps.
+                (existing_src or gz_path).touch()
+            except OSError:
+                pass  # heal write failed (disk) — still serve the compact we built
+            del full
+            return compact
+
+    def _schedule_attention_jobs(
+        run: str, slot_id: str, model_alias: str, event_indices: list[int], *,
+        force: bool, max_heads: int, top_k: int, max_query_tokens: int, reset: bool = False,
+    ) -> tuple[list[int], list[int], list[int]]:
+        """Build exports for the misses and stream them to the durable Modal queue
+        (keyed by cell_hash). Returns (queued, skipped_fresh, already_active).
+
+        `reset` (set by a fresh compute-all): FIRST drop any prior run's phantom
+        pending compute for this model — the GPU queue is shared per model, so a
+        stale ref from an earlier run/scene otherwise sits ahead of this scene's
+        jobs. Committed results are preserved."""
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        cell_dir = slot_log.events_path.parent
+        h, pv, ident = _cell_identity(run, slot_id, model_alias)
+        if reset and attn_dispatch.modal_available():
+            try:
+                attn_dispatch.reset_modal(cell_hash=h, model_id=MODELS[model_alias])
+            except Exception:  # noqa: BLE001 — best-effort cleanup; never block scheduling
+                import logging
+                logging.getLogger("attention").warning("pending-reset failed", exc_info=True)
+        items: list[dict[str, Any]] = []
+        skipped_fresh: list[int] = []
+        # A force recompute must ALWAYS re-run, even when the content/params are
+        # unchanged (the worker dedups on the request token, so force needs a fresh
+        # nonce to differ). One nonce per call → the whole force batch recomputes,
+        # and two separate forces of the same step each recompute.
+        force_nonce = f"{time.time_ns():x}" if force else None
+
+        for event_index in event_indices:
+            event = _find_llm_event(slot_log, event_index)
+            logprobs = _load_logprobs_sidecar(cell_dir, event)
+            export = teacher_forcing.build_export(
+                event, run=run, slot=slot_id, model_alias=model_alias,
+                model_id=MODELS[model_alias], logprobs=logprobs,
+            )
+            input_key = export["meta"].get("key")
+            if not force:
+                cached = attn_store.load(cell_dir, event_index)
+                if attn_store.is_fresh(cached, input_key, min_heads=max_heads):
+                    skipped_fresh.append(event_index)
+                    continue
+            else:
+                attn_store.delete(cell_dir, event_index)
+            # Opaque per-request identity the GPU worker dedups on: content key +
+            # compute params + analysis/to-place versions (+ force nonce). is_fresh
+            # (above) decides what to SEND; `req` decides whether the worker actually
+            # (re)computes vs. adopts an already-computed result — so a duplicate /
+            # in-flight re-send is never computed twice, while a real change is.
+            req = attn_identity.req_token(
+                input_key=input_key, max_heads=max_heads, top_k=top_k,
+                max_query_tokens=max_query_tokens,
+                analysis_version=attn_schema.ANALYSIS_VERSION,
+                to_place_version=attn_schema.TO_PLACE_VERSION,
+                agg_version=attn_schema.AGG_VERSION,
+                force_nonce=force_nonce,
+            )
+            items.append({
+                "event_index": event_index,
+                "input_key": input_key,
+                "req": req,
+                "max_heads": max_heads,
+                "top_k": top_k,
+                "max_query_tokens": max_query_tokens,
+                # The full export travels with the job so the GPU worker needs no
+                # callback to us (localhost-safe — no public tunnel required).
+                "compute_item": {
+                    "export": export,
+                    "remote_logprobs": logprobs,
+                    "max_heads": max_heads,
+                    "top_k": top_k,
+                    "max_query_tokens": max_query_tokens,
+                },
+            })
+
+        if not items:
+            return [], skipped_fresh, []
+        if not attn_dispatch.modal_available():
+            raise RuntimeError("modal backend not configured (set ATTENTION_MODAL_URL)")
+        resp = attn_dispatch.enqueue_modal(
+            cell_hash=h, ident=ident, prompt_version=pv, items=items,
+            model_id=MODELS[model_alias], force=force,
+        )
+        # `accepted` = newly streamed to the GPU queue. (`cached` is retained in the
+        # response for shape compatibility but is always empty now that cross-cell
+        # dedup is dropped.) The next status poll pulls finished steps like any other.
+        queued = [int(x) for x in (resp.get("accepted") or [])]
+        queued += [int(x) for x in (resp.get("cached") or [])]
+        already_active = [int(x) for x in (resp.get("already_active") or [])]
+        return queued, skipped_fresh, already_active
+
+    @app.post("/slots/{slot_id}/{model_alias}/attention")
+    async def attention_enqueue(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, payload: dict[str, Any], run: str | None = None,
+    ) -> dict[str, object]:
+        """Enqueue one or many steps for background compute and return
+        IMMEDIATELY (`{queued: [...]}`). The client polls `GET .../attention` for
+        progress — no long-held HTTP connection. Body:
+        `{event_indices: [int], force?: bool, max_heads?, top_k?, max_query_tokens?}`."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        _require_slot_log(run, slot_id, model_alias)  # validate before scheduling
+        _require_open_model(model_alias)  # attention needs open HF weights
+        force = bool(payload.get("force", False))
+        reset = bool(payload.get("reset", False))  # fresh compute-all → clear stale pending first
+        mh = int(payload.get("max_heads", 4))
+        tk = int(payload.get("top_k", 12))
+        mq = int(payload.get("max_query_tokens", attn_schema.DEFAULT_MAX_QUERY_TOKENS))
+        evs = [int(e) for e in (payload.get("event_indices") or [])]
+        try:
+            # Build exports + the blocking httpx enqueue run in a worker thread so a
+            # single enqueue can't stall the event loop (and with it every concurrent
+            # status poll / scene fetch) while it talks to Modal.
+            queued, skipped_fresh, already_active = await asyncio.to_thread(
+                _schedule_attention_jobs, run, slot_id, model_alias, evs,
+                force=force, max_heads=mh, top_k=tk, max_query_tokens=mq, reset=reset,
+            )
+        except RuntimeError as e:
+            raise HTTPException(status_code=503, detail=str(e)) from e
+        return {
+            "queued": queued,
+            "skipped_fresh": skipped_fresh,
+            "already_active": already_active,
+            "requested": len(evs),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/attention/{event_index}")
+    async def attention_analyze(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, event_index: int, run: str | None = None,
+        max_heads: int = 4, top_k: int = 12,
+        max_query_tokens: int = attn_schema.DEFAULT_MAX_QUERY_TOKENS, force: bool = False,
+    ) -> dict[str, object]:
+        """Compute (or reuse) a step's REAL (Modal GPU) attention map. CACHING: a
+        stored result is REUSED as-is when it's real and its `input_key` still
+        matches the step's content — so "compute all" is additive. It's RECOMPUTED
+        when `force=true`, when the content changed (diff on the cache.llm key),
+        or when the stored result is a stale MOCK (mock is never reused/kept)."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        _require_open_model(model_alias)  # attention needs open HF weights
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        event = _find_llm_event(slot_log, event_index)
+        cell_dir = slot_log.events_path.parent
+        # `input_key` = the step's content hash (the cache.llm key). Reuse only a
+        # REAL, content-matching stored result (mock is treated as not-computed).
+        input_key = event.get("key")
+        cached = attn_store.load(cell_dir, event_index)
+        fresh = attn_store.is_fresh(cached, input_key, min_heads=max_heads)
+        if not force and fresh:
+            cached.setdefault("meta", {})["cached"] = True
+            return cached
+
+        if not attn_dispatch.modal_available():
+            raise HTTPException(status_code=503, detail="modal backend not configured (set ATTENTION_MODAL_URL)")
+        try:
+            # Stream this one step through the durable queue (builds + sends the
+            # export, drops any stale on-disk copy), then poll until it lands.
+            _schedule_attention_jobs(
+                run, slot_id, model_alias, [event_index],
+                force=force, max_heads=max_heads, top_k=top_k, max_query_tokens=max_query_tokens,
+            )
+            deadline = time.monotonic() + 1800.0
+            while time.monotonic() < deadline:
+                remote = await asyncio.to_thread(
+                    _pull_remote_attention, run, slot_id, model_alias, cell_dir,
+                )
+                err = (remote.get("errors") or {}).get(str(event_index))
+                if err:
+                    raise HTTPException(status_code=502, detail=f"modal analyze failed: {err}")
+                loaded = attn_store.load(cell_dir, event_index)
+                if loaded is not None and attn_store.is_fresh(loaded, input_key, min_heads=max_heads):
+                    loaded.setdefault("meta", {})["cached"] = False
+                    return loaded
+                busy = int(event_index) in (remote.get("queued") or []) or int(event_index) in (remote.get("running") or [])
+                if not busy:
+                    break
+                await asyncio.sleep(2.0)
+            loaded = attn_store.load(cell_dir, event_index)
+            if loaded is not None:
+                return loaded
+            raise HTTPException(status_code=504, detail="modal attention did not finish in time")
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"modal analyze failed: {type(e).__name__}: {e}") from e
+
+    @app.get("/slots/{slot_id}/{model_alias}/attention")
+    async def attention_list(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, run: str | None = None, max_heads: int = 0,
+    ) -> dict[str, object]:
+        """Per-step attention state for the cell. Queue state comes from Modal;
+        computed/stale from on-disk analyses. Pulls finished results each poll."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        cell_dir = slot_log.events_path.parent
+        try:
+            remote = await asyncio.to_thread(
+                _pull_remote_attention, run, slot_id, model_alias, cell_dir, max_heads=max_heads,
+            )
+        except Exception:  # noqa: BLE001 — still return disk state if Modal is unreachable
+            remote = {"queued": [], "running": [], "errors": {}}
+        running = [int(x) for x in (remote.get("running") or [])]
+        queued = [int(x) for x in (remote.get("queued") or [])]
+        errors = {str(k): v for k, v in (remote.get("errors") or {}).items()}
+        status = attn_store.list_status(cell_dir, min_heads=max_heads)
+        return {
+            "computed": status["fresh"],
+            "stale": status["stale"],
+            "running": running,
+            "queued": queued,
+            "computing": sorted(set(running) | set(queued)),
+            "errors": errors,
+        }
+
+    @app.get("/slots/{slot_id}/{model_alias}/attention/{event_index}")
+    async def attention_get(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, event_index: int, run: str | None = None,
+        view: str = "compact", i: int = 0,
+    ) -> dict[str, object]:
+        """One step's stored analysis. The small `compact` view is what the frequent
+        poll already wrote to disk, so it's served WITHOUT touching the heavy result;
+        the big per-token detail is pulled from the worker ON DEMAND (streamed) only
+        for the views that need it:
+
+          * `view=compact`  (default) -- scalars + head grid + entity maps +
+            precomputed aggregates; powers the heatmap, summary, overview and
+            placement tabs. Served straight from `{ev}.json` (already local).
+          * `view=token&i=` -- one generated token's full per-head detail, seeked out
+            of the on-demand full result (pulled once per step, then cached).
+          * `view=present`  -- per-token head-summed detail for present mode.
+          * `view=full`     -- the whole result (back-compat / debugging).
+
+        token/present/full ensure `{ev}.full.json` is present+current (one streamed
+        pull per step), then derive/serve from it; present/token sidecars are cached
+        on disk so the big result is parsed at most once."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        cell_dir = slot_log.events_path.parent
+
+        if view == "compact":
+            # Heals a legacy full `{ev}.json` down to the small compact on first hit
+            # (see `_load_compact_healed`) so neither this endpoint nor the overview
+            # ever ships a few-hundred-MB blob to the browser.
+            data = await asyncio.to_thread(_load_compact_healed, cell_dir, event_index)
+            if data is None:
+                raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
+            return data
+
+        if view not in ("token", "present", "full"):
+            raise HTTPException(status_code=422, detail=f"unknown view '{view}' (expected compact | token | present | full)")
+
+        # These need the big result — make sure it's on disk (streamed pull if needed).
+        ok = await asyncio.to_thread(
+            _ensure_full_blob, run, slot_id, model_alias, cell_dir, event_index,
+        )
+        if not ok:
+            raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
+
+        if view == "full":
+            full = await asyncio.to_thread(_load_full_blob, cell_dir, event_index)
+            if full is None:
+                raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
+            return full
+        if view == "token":
+            tok = await asyncio.to_thread(attn_derive.get_token, cell_dir, event_index, i)
+            if tok is None:
+                raise HTTPException(status_code=404, detail="no attention analysis stored for this step (or token out of range)")
+            return tok
+        data = await asyncio.to_thread(attn_derive.get_present, cell_dir, event_index)
+        if data is None:
+            raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
+        return data
+
     @app.post("/slots/{slot_id}/{model_alias}/rewind")
     async def slot_rewind(  # pyright: ignore[reportUnusedFunction]
         slot_id: str,
@@ -2151,6 +2885,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         run: str | None = None,
         stepped: bool | None = None,
+        logprobs: bool | None = None,
     ) -> dict[str, str]:
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
@@ -2160,6 +2895,12 @@ def create_app() -> FastAPI:
         # (persisted on disk); omitted = keep the cell's current mode.
         if stepped is not None:
             _set_stepped((run, slot_id, model_alias), stepped)
+        # `logprobs` opts the cell in/out of top-20 token-logprob capture
+        # (persisted on disk); omitted = keep the cell's current mode. Only
+        # NEW (cache-miss) calls capture — steps already cached from a prior
+        # run replay without a fresh call, so enable it on a fresh cell.
+        if logprobs is not None:
+            _set_logprobs((run, slot_id, model_alias), logprobs)
         # A completed run is terminal: resuming it would re-enter the pipeline
         # and generate a second run into the same cell. `run.done` is sticky
         # in the status derivation so the guard below normally catches this;
@@ -2938,10 +3679,18 @@ def create_app() -> FastAPI:
         await _cancel_cell_generation(run, slot.id, model_alias)
         # A reset wipes the cell, including its stepped marker + intent.
         _set_stepped((run, slot.id, model_alias), False)
+        # Leave the logprob-capture preference alone: a reset means "re-run this
+        # cell from scratch", and a fresh run is exactly when capture is useful,
+        # so the toggle persists across the wipe. The stale sidecars are cleared
+        # with the rest of the cell below.
         _gate_intents.pop((run, slot.id, model_alias), None)
         slot_dir = _slot_dir(run, slot.id, model_alias)
         shutil.rmtree(slot_dir, ignore_errors=True)
         slot_dir.mkdir(parents=True, exist_ok=True)
+        # rmtree also removed the `.logprobs` marker; we keep capture on across a
+        # reset, so re-write it to match the (retained) in-memory preference.
+        if (run, slot.id, model_alias) in _logprobs_cells:
+            _set_logprobs((run, slot.id, model_alias), True)
         old_log = _slot_logs.get((run, slot.id, model_alias))
         if old_log is not None:
             old_log.close()
@@ -3503,17 +4252,14 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(e))
         base_meta = _run_meta(req.base_run)
         label = req.version_label or f"{base_meta.get('prompt_version') or req.base_run}+edit"
-        (run_dir / RUN_META_NAME).write_text(
-            json.dumps(
-                {
-                    "prompt_version": label,
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "branched_from": req.base_run,
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        meta = {
+            "prompt_version": label,
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "branched_from": req.base_run,
+        }
+        if req.ablation:
+            meta["ablation"] = req.ablation
+        (run_dir / RUN_META_NAME).write_text(json.dumps(meta) + "\n", encoding="utf-8")
         seen_cells: set[tuple[str, str]] = set()
         for branch_id in req.branches:
             br = _branches.get(branch_id)
@@ -3869,6 +4615,7 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             "last_kind": events[-1]["kind"] if events else None,
             "last_step": _last_step(events),
             "stepped": (run, slot.id, alias) in _stepped_cells,
+            "logprobs": (run, slot.id, alias) in _logprobs_cells,
             "pending": cgate.pending if cgate is not None else None,
             "current": cgate.current if cgate is not None else None,
             "auto": cgate.auto if cgate is not None else False,
@@ -4233,6 +4980,17 @@ def _require_slot(slot_id: str) -> Slot:
 def _require_model(model_alias: str) -> None:
     if model_alias not in MODELS:
         raise HTTPException(status_code=404, detail=f"unknown model: {model_alias}")
+
+
+def _require_open_model(model_alias: str) -> None:
+    """Attention analysis loads real HF weights, so it only works for open-weight
+    models (see app.attention.models). Closed/API models are rejected up front."""
+    if attn_models.resolve_open_model(MODELS.get(model_alias)) is None:
+        raise HTTPException(
+            status_code=422,
+            detail=(f"attention analysis needs open HF weights; '{model_alias}' "
+                    f"({MODELS.get(model_alias)}) is not a supported open model"),
+        )
 
 
 def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
@@ -5184,6 +5942,11 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         gate.until_before = bool(intent.get("until_before", False))
         _cell_gates[key] = gate
         llm.set_step_gate(gate.wait)
+    # Task-local logprob capture: every real call this cell makes will request
+    # OpenRouter's top-20 token logprobs and sidecar them. Bound here (like the
+    # model) so it rides the ContextVar into divider.run and every call_llm.
+    if key in _logprobs_cells:
+        llm.set_capture_logprobs(True)
     prompt = slot_log.state["prompt"]
     model = slot_log.state["model"]
     run_id = _run_id(run, slot_id, model_alias)
@@ -5191,6 +5954,15 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         # Bind the run's prompt snapshot inside the try so a broken/missing
         # snapshot surfaces as a clean run.error instead of a dead task.
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        # Ablation variant runs carry a treatment in run.json; bind it task-locally
+        # so the scene renderer applies the shuffle / distractor to the re-inferred
+        # steps. A no-op for normal runs (no `ablation` key).
+        _abl_meta = (_run_meta(run) or {}).get("ablation")
+        if _abl_meta:
+            ablation_ctx.set_runtime(ablation_cfg.AblationRuntime(
+                target_step_kind=str(_abl_meta.get("target_step_kind") or ""),
+                treatment=ablation_cfg.treatment_from_meta(_abl_meta),
+            ))
         await divider.run(
             run_id=run_id,
             prompt=prompt,
@@ -5200,6 +5972,12 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
     except asyncio.CancelledError:
         generation.cancel_pending(run_id)
         raise
+    except ablation_ctx.AblationComplete:
+        # An ablation variant re-inferred its treated step and stopped — skip all
+        # downstream work. Cancel anything spawned, then fall through to finish
+        # the cell as done (its treated step is committed for attention capture).
+        generation.cancel_pending(run_id)
+        slot_log.log("ablation.complete", step=str((_abl_meta or {}).get("target_step_kind") or ""))
     except Exception as e:
         generation.cancel_pending(run_id)
         # Log the full provider detail (metadata/body), not the SDK's opaque
@@ -5211,6 +5989,7 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         # or finished cell reports no `pending`. (A live pause is still
         # awaiting inside divider.run, so this runs only once the task ends.)
         _cell_gates.pop(key, None)
+        ablation_ctx.clear()
     # Pipeline tree is fully resolved; meshes may still be in flight.
     # Hold the run open until they all land so `run.done` truly means done.
     await generation.await_pending(run_id)

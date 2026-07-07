@@ -320,6 +320,38 @@ def render_image_other_subregions(focus_zone_id: str, nodes: list[Node]) -> str:
     return util.brace_group(entries)
 
 
+def _ablation_reorder(items):
+    """When the run carries an ablation treatment (bound task-locally at pipeline
+    entry), reorder the scene items the model sees per the shuffle method — the
+    scene-context shuffling ablation. A no-op on normal runs. Base methods:
+    `order` (identity, the baseline) and `random` (seeded). `distance` sorts by
+    distance to the scene centroid when bbox centers are available; `raytrace`
+    falls back to `order` for now (a later refinement reuses util.adjacent_zones)."""
+    try:
+        from app.ablation import context as ablation
+        rt = ablation.current()
+    except Exception:
+        return items
+    if rt is None or len(items) < 2:
+        return items
+    method = getattr(rt.treatment, "shuffle_method", "order")
+    if method == "random":
+        import random
+        out = list(items)
+        random.Random(getattr(rt.treatment, "seed", 0)).shuffle(out)
+        return out
+    if method == "distance":
+        try:
+            centers = [tuple(n.bbox.center) for n in items]
+            cx = sum(c[0] for c in centers) / len(centers)
+            cy = sum(c[1] for c in centers) / len(centers)
+            cz = sum(c[2] for c in centers) / len(centers)
+            return sorted(items, key=lambda n: sum((a - b) ** 2 for a, b in zip(tuple(n.bbox.center), (cx, cy, cz))))
+        except Exception:
+            return items
+    return items  # order (baseline) + raytrace (base fallback) keep insertion order
+
+
 def render_embedded_block(
     nodes: list[Node],
     *,
@@ -339,6 +371,7 @@ def render_embedded_block(
     _, subregions = util.split_region_members(root.id, idx)
     if not subregions:
         return _NO_SUBREGIONS_MESSAGE
+    subregions = _ablation_reorder(subregions)
     return util.brace_group(
         [_region_embedded_entry(s, idx, oidx, by_id, node_id, text, compact=compact) for s in subregions]
     )

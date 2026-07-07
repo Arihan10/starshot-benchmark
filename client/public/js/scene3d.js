@@ -84,7 +84,20 @@ const LIGHTING_DEFAULTS = {
 };
 
 export function createViewer(host, { keyboard = true, lighting = false } = {}) {
-	const renderer = new THREE.WebGLRenderer({ antialias: true });
+	// Context creation can fail ("Error creating WebGL context") when the browser is
+	// at its live-context limit (many tabs / rapid reloads) — Chrome frees old ones
+	// only asynchronously. Retry once with a cheaper (no-antialias) context, which
+	// needs fewer GPU resources, before letting the error propagate to the caller
+	// (boot handles the final failure with a retry + message instead of crashing).
+	let renderer;
+	try {
+		renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+	} catch {
+		renderer = new THREE.WebGLRenderer({ antialias: false, failIfMajorPerformanceCaveat: false });
+	}
+	// Don't let a lost GPU context bubble up as an uncaught error; three.js can keep
+	// the canvas alive and the next interaction / reload re-establishes it.
+	renderer.domElement.addEventListener("webglcontextlost", (e) => e.preventDefault(), false);
 	renderer.setPixelRatio(window.devicePixelRatio);
 	renderer.setClearColor(0x101114);
 	// Physically-based tone mapping + shadows for the MAIN viewer only; the mini /
@@ -104,7 +117,17 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// Proposed-placement overlay (the prompt-lab's "after" boxes): magenta
 	// wireframes drawn on top of the current scene, excluded from fit.
 	const overlayRoot = new THREE.Group();
-	scene.add(sceneRoot, bboxRoot, overlayRoot);
+	// Attention cross-highlight: translucent, weight-colored boxes over the
+	// scene entities a token/head attends to (driven by the /tf attention view).
+	const attnRoot = new THREE.Group();
+	// Present-mode "neural activation": persistent, per-frame-animated glow over
+	// attended entities (bloom + afterglow + breath). Separate from attnRoot so
+	// the static cross-highlight and the animated one never fight.
+	const neuralRoot = new THREE.Group();
+	// Present-mode "resolving" boxes: an object's box grows from its origin corner
+	// to full size as the tokens describing it stream in.
+	const resolvingRoot = new THREE.Group();
+	scene.add(sceneRoot, bboxRoot, overlayRoot, attnRoot, neuralRoot, resolvingRoot);
 
 	const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 5000);
 	camera.position.set(14, 10, 14);
@@ -248,6 +271,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// The overlay slides off-screen with translateX, which keeps layout size —
 	// so visibility is an explicit flag, gating draws AND keyboard capture.
 	let active = false;
+	// Present-mode cinematic focus: when set, the orbit target eases toward this
+	// point each frame (the camera drifts to follow the scene being built).
+	let orbitFocus = null;
 	// Optional canonical-axes gizmo (X=red, Y=green, Z=blue, drawn on top) placed
 	// at a node's center — the trace panel's mini preview toggles it on to make
 	// the baked orientation legible. Added to `scene`, so clear() leaves it be.
@@ -286,6 +312,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// volumetric reference and as the right-click handle for un-hiding. Hiding
 	// a ZONE hides every descendant's mesh; hiding an object hides just it.
 	const hiddenIds = new Set();
+	// Present mode: fully hide these nodes (BOTH bbox and mesh) until the
+	// animation "places" them — so an emitted object (e.g. an encapsulating
+	// frame) that's already in the context scene doesn't show before it resolves.
+	const presentHidden = new Set();
 
 	function effectivelyHidden(id) {
 		let cur = nodeInfo(id);
@@ -428,6 +458,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const helper = bboxes.get(id);
 		const proxy = proxies.get(id);
 		const fill = fills.get(id);
+		if (presentHidden.has(id)) { // present mode: not placed yet — hide entirely
+			if (helper) helper.visible = false;
+			if (proxy) proxy.visible = false;
+			if (fill) fill.visible = false;
+			return;
+		}
 		const kind = helper?.userData?.nodeKind ?? kinds.get(id) ?? "zone";
 		// Zone-layers view: only zone wireframes + their fills draw — isolated to
 		// one nesting depth when a layer is picked — so the bare decomposition
@@ -483,6 +519,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	function applyModelVisibility(id) {
 		const model = models.get(id);
 		if (!model) return;
+		if (presentHidden.has(id)) { model.visible = false; return; } // present mode: hide until placed
 		// The zone-layers view is a pure wireframe structure view — no meshes.
 		if (zoneLayersMode) {
 			model.visible = false;
@@ -1126,6 +1163,346 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		}
 	}
 
+	// --- attention cross-highlight -------------------------------------------
+	// Emphasize the scene entities a token/head attends to: a translucent fill
+	// + bright edge per entity, colored/opacity-scaled by attention weight
+	// (0..1). Reuses the entities' existing bboxes, so it just needs ids+weights.
+	function clearAttnHighlight() {
+		while (attnRoot.children.length > 0) {
+			const child = attnRoot.children[0];
+			attnRoot.remove(child);
+			child.geometry?.dispose?.();
+			child.material?.dispose?.();
+		}
+	}
+
+	// items: [{ id, weight (0..1) }]. opts tune the mapping from weight→appearance:
+	//   gamma     > 1 sharpens contrast (weak attention pushed down, strong pops)
+	//   minWeight  drops any entity below this fraction entirely (no box at all),
+	//              then rescales the survivors to [0..1] so they use the full ramp
+	//   contrast   widens the color/opacity range (dim+cool low → bright+hot high)
+	// Defaults reproduce the original flat mapping (used by the /tf cross-highlight).
+	function setAttnHighlight(items, opts = {}) {
+		clearAttnHighlight();
+		const { gamma = 1, minWeight = 0, contrast = false } = opts;
+		for (const it of items ?? []) {
+			const helper = bboxes.get(it.id);
+			if (!helper) continue;
+			let w = Math.max(0, Math.min(1, it.weight ?? 1));
+			if (w < minWeight) continue; // faint → not highlighted at all
+			if (minWeight > 0 && minWeight < 1) w = (w - minWeight) / (1 - minWeight);
+			w = Math.pow(Math.max(0, Math.min(1, w)), gamma);
+			const size = helper.box.getSize(new THREE.Vector3());
+			const center = helper.box.getCenter(new THREE.Vector3());
+			// weight ramp: cool (low) -> hot yellow (high). With `contrast`, also ramp
+			// lightness so strong attention reads bright and weak stays muted.
+			const light = contrast ? 0.30 + 0.42 * w : 0.55;
+			const fillOp = contrast ? 0.05 + 0.55 * w : 0.1 + 0.35 * w;
+			const edgeOp = contrast ? 0.25 + 0.75 * w : 0.45 + 0.55 * w;
+			const color = new THREE.Color().setHSL(0.16 + (1 - w) * 0.42, 0.95, light);
+			const fill = new THREE.Mesh(
+				new THREE.BoxGeometry(Math.max(size.x, 1e-3), Math.max(size.y, 1e-3), Math.max(size.z, 1e-3)),
+				new THREE.MeshBasicMaterial({ color, transparent: true, opacity: fillOp, depthTest: false, depthWrite: false }),
+			);
+			fill.position.copy(center);
+			fill.renderOrder = 998;
+			fill.layers.enableAll();
+			attnRoot.add(fill);
+			const edge = new THREE.Box3Helper(helper.box.clone(), color);
+			edge.material.depthTest = false;
+			edge.material.transparent = true;
+			edge.material.opacity = edgeOp;
+			edge.renderOrder = 999;
+			edge.layers.enableAll();
+			attnRoot.add(edge);
+		}
+	}
+
+	// --- present-mode neural activation --------------------------------------
+	// A persistent glow (fill + edge) per entity that has fired, animated every
+	// frame: setNeuralActivation RAISES targets which then decay each frame, so
+	// entities bloom and afterglow-fade like firing neurons. Colored by the
+	// caller (entity-kind color) with a gentle sinusoidal breath. Reuses the
+	// entities' existing bboxes; nothing is allocated per frame.
+	const neuralGlow = new Map(); // id -> { fill, edge, cur, target, phase, color }
+	let neuralOn = false;
+	let savedExposure = null;
+
+	function _neuralEntry(id, color) {
+		let g = neuralGlow.get(id);
+		if (g) { if (color != null) g.color.set(color); g.fill.material.color.copy(g.color); g.edge.material.color.copy(g.color); return g; }
+		const helper = bboxes.get(id);
+		if (!helper) return null;
+		const size = helper.box.getSize(new THREE.Vector3());
+		const center = helper.box.getCenter(new THREE.Vector3());
+		const col = new THREE.Color(color ?? 0x7aa2f7);
+		const fill = new THREE.Mesh(
+			new THREE.BoxGeometry(Math.max(size.x, 1e-3), Math.max(size.y, 1e-3), Math.max(size.z, 1e-3)),
+			new THREE.MeshBasicMaterial({ color: col.clone(), transparent: true, opacity: 0, depthTest: false, depthWrite: false, toneMapped: false }),
+		);
+		fill.position.copy(center);
+		fill.renderOrder = 998;
+		fill.layers.enableAll();
+		const edge = new THREE.Box3Helper(helper.box.clone(), col.clone());
+		edge.material.depthTest = false;
+		edge.material.transparent = true;
+		edge.material.opacity = 0;
+		edge.material.toneMapped = false;
+		edge.renderOrder = 999;
+		edge.layers.enableAll();
+		neuralRoot.add(fill, edge);
+		g = { fill, edge, cur: 0, target: 0, phase: Math.random() * Math.PI * 2, color: col };
+		neuralGlow.set(id, g);
+		return g;
+	}
+
+	// items: [{ id, weight (0..1), color? }]. RAISES each entity's target; decay
+	// (in the animate loop) does the afterglow, so callers just fire per token.
+	function setNeuralActivation(items) {
+		neuralOn = true;
+		for (const it of items ?? []) {
+			const g = _neuralEntry(it.id, it.color);
+			if (g) g.target = Math.max(g.target, Math.max(0, Math.min(1, it.weight ?? 1)));
+		}
+	}
+
+	function clearNeuralActivation() {
+		neuralOn = false;
+		for (const g of neuralGlow.values()) {
+			neuralRoot.remove(g.fill, g.edge);
+			g.fill.geometry?.dispose?.();
+			g.fill.material?.dispose?.();
+			g.edge.geometry?.dispose?.();
+			g.edge.material?.dispose?.();
+		}
+		neuralGlow.clear();
+	}
+
+	// Per-frame glow update (bloom -> afterglow decay + breath); called from the
+	// animate loop with the frame dt (s) and absolute time t (s).
+	function _tickNeural(dt, t) {
+		if (!neuralOn || neuralGlow.size === 0) return;
+		const decay = Math.exp(-dt / 0.45);     // shorter afterglow → fewer lit at once (less strobe)
+		const rise = 1 - Math.exp(-dt / 0.05);  // fast bloom toward target
+		for (const g of neuralGlow.values()) {
+			g.target *= decay;
+			g.cur += (g.target - g.cur) * rise;
+			const a = Math.max(0, Math.min(1, g.cur));
+			const v = a * (0.85 + 0.15 * Math.sin(t * Math.PI + g.phase));
+			const vis = v > 0.01;
+			g.fill.visible = g.edge.visible = vis;
+			if (!vis) continue;
+			// Kept deliberately subtle — this is ambient "what it's glancing at",
+			// secondary to the pronounced gold objects being placed.
+			g.fill.material.opacity = 0.05 + 0.22 * v;
+			g.edge.material.opacity = 0.14 + 0.46 * v;
+			g.fill.scale.setScalar(1 + 0.04 * v);
+		}
+	}
+
+	// Remove one node's bbox/proxy/fill (+ any neural glow) — used by present
+	// mode to progressively place/unplace objects as the tokens emit them.
+	function removeBbox(id) {
+		for (const map of [bboxes, proxies, fills]) {
+			const o = map.get(id);
+			if (o) { bboxRoot.remove(o); o.geometry?.dispose?.(); o.material?.dispose?.(); map.delete(id); }
+		}
+		const gl = neuralGlow.get(id);
+		if (gl) {
+			neuralRoot.remove(gl.fill, gl.edge);
+			gl.fill.geometry?.dispose?.(); gl.fill.material?.dispose?.();
+			gl.edge.geometry?.dispose?.(); gl.edge.material?.dispose?.();
+			neuralGlow.delete(id);
+		}
+		kinds.delete(id);
+	}
+
+	// --- present-mode "resolving" boxes --------------------------------------
+	// Grow a wireframe+fill box from its ORIGIN corner (min corner) to full size,
+	// driven by `progress` (0..1), so an object appears to resolve into place as
+	// the tokens describing it stream in. Shared unit geometry ([0,1]^3), scaled
+	// per object — no per-frame geometry churn.
+	const resolving = new Map(); // id -> { wire, solid }
+	let _unitBox = null, _unitEdges = null;
+	function _unitGeoms() {
+		if (!_unitBox) {
+			_unitBox = new THREE.BoxGeometry(1, 1, 1); // centered at origin ([-0.5,0.5]^3) so it scales + spins about its center
+			_unitEdges = new THREE.EdgesGeometry(_unitBox);
+		}
+		return { box: _unitBox, edges: _unitEdges };
+	}
+	function setResolving(items) {
+		const now = performance.now() / 1000;
+		const c1 = 1.70158, c3 = c1 + 1; // ease-out-back constants (a slight "pop")
+		const seen = new Set();
+		for (const it of items ?? []) {
+			if (!Array.isArray(it.origin) || !Array.isArray(it.dimensions)) continue;
+			seen.add(it.id);
+			let r = resolving.get(it.id);
+			if (!r) {
+				const { box, edges } = _unitGeoms();
+				const col = new THREE.Color(it.color ?? 0xffd166);
+				const wire = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: col.clone(), transparent: true, depthTest: false, toneMapped: false }));
+				const solid = new THREE.Mesh(box, new THREE.MeshBasicMaterial({ color: col.clone(), transparent: true, opacity: 0.12, depthTest: false, depthWrite: false, toneMapped: false, blending: THREE.AdditiveBlending }));
+				wire.renderOrder = 997; solid.renderOrder = 996;
+				wire.layers.enableAll(); solid.layers.enableAll();
+				// A pivot at the object's CENTER so it can spin about itself; the
+				// centered unit meshes scale symmetrically inside it.
+				const group = new THREE.Group();
+				group.add(solid, wire);
+				resolvingRoot.add(group);
+				r = {
+					group, wire, solid, phase: Math.random() * Math.PI * 2,
+					// random initial orientation → resolves to upright + axis-aligned
+					rx: (Math.random() - 0.5) * 1.1, ry: (Math.random() - 0.5) * Math.PI * 2, rz: (Math.random() - 0.5) * 1.1,
+				};
+				resolving.set(it.id, r);
+			}
+			if (it.color != null) { r.wire.material.color.set(it.color); r.solid.material.color.set(it.color); }
+			const p = Math.max(0, Math.min(1, it.progress ?? 0));
+			const settled = p >= 0.999;
+			if (settled) { if (!r.settledT) r.settledT = now; } else { r.settledT = 0; }
+			// brief bright burst + scale pop the moment it locks in, so the placed
+			// object clearly announces itself over the ambient attention glow.
+			const flash = r.settledT ? Math.max(0, 1 - (now - r.settledT) / 0.6) : 0;
+			// ease-out-back growth (overshoots then settles); rotation eases from
+			// its random start to correct; once settled it gently breathes.
+			const e = Math.max(0.05, 1 + c3 * (p - 1) ** 3 + c1 * (p - 1) ** 2) * (1 + 0.12 * flash);
+			const breath = settled ? 0.9 + 0.1 * Math.sin(now * 2.2 + r.phase) : 1;
+			const rp = 1 - Math.pow(1 - p, 3); // easeOutCubic
+			const [ox, oy, oz] = it.origin, [dx, dy, dz] = it.dimensions;
+			r.group.position.set(ox + dx / 2, oy + dy / 2, oz + dz / 2);
+			r.group.scale.set(Math.max(1e-3, dx * e), Math.max(1e-3, dy * e), Math.max(1e-3, dz * e));
+			r.group.rotation.set(r.rx * (1 - rp), r.ry * (1 - rp), r.rz * (1 - rp));
+			r.wire.material.opacity = Math.min(1, (0.7 + 0.3 * p) * breath + 0.6 * flash);
+			r.solid.material.opacity = Math.min(0.9, (0.14 + 0.3 * p) * breath + 0.5 * flash);
+		}
+		for (const [id, r] of resolving) {
+			if (seen.has(id)) continue;
+			resolvingRoot.remove(r.group);
+			r.wire.material.dispose(); r.solid.material.dispose();
+			resolving.delete(id);
+		}
+	}
+	function clearResolving() {
+		for (const r of resolving.values()) {
+			resolvingRoot.remove(r.group);
+			r.wire.material.dispose(); r.solid.material.dispose();
+		}
+		resolving.clear();
+	}
+
+	// --- present-mode asset thumbnails (offscreen render of the ACTUAL GLB) ---
+	// Renders each emitted object's real mesh into a card <canvas> so the present
+	// inventory shows the would-be asset itself (turntable), not a flat preview.
+	// One dedicated offscreen scene + render target driven by the SHARED renderer
+	// (no extra WebGL context): render → readback → blit, restoring renderer state
+	// so the live 3D view is untouched. Assets are loaded once and cached.
+	let thumbScene = null, thumbCam = null, thumbRT = null, thumbBuf = null;
+	const _thumbCol = new THREE.Color();
+	const thumbModels = new Map(); // id -> { pivot, radius }
+	function _ensureThumb() {
+		if (thumbScene) return;
+		thumbScene = new THREE.Scene();
+		thumbScene.environment = scene.environment ?? null; // reuse IBL for PBR reflections
+		const hemi = new THREE.HemisphereLight(0xffffff, 0x2a2d38, 1.15);
+		const key = new THREE.DirectionalLight(0xffffff, 2.1);
+		key.position.set(2.5, 4, 3);
+		const rim = new THREE.DirectionalLight(0x9fbcff, 0.9);
+		rim.position.set(-3, 1.5, -2);
+		thumbScene.add(hemi, key, rim);
+		thumbCam = new THREE.PerspectiveCamera(32, 1, 0.01, 200);
+	}
+	// Minimal prep (double-sided + normals). Deliberately NOT prepareLoadedScene:
+	// that routes transparent meshes to the OIT layer, which the thumb camera
+	// doesn't render — they'd vanish. Here everything stays on the default layer.
+	function _prepThumb(root) {
+		root.traverse((c) => {
+			if (!c.isMesh) return;
+			if (c.geometry && !c.geometry.getAttribute("normal")) c.geometry.computeVertexNormals();
+			for (const m of (Array.isArray(c.material) ? c.material : [c.material])) if (m) m.side = THREE.DoubleSide;
+		});
+	}
+	// Load one object's GLB (tries urls in order — raw asset form first, then the
+	// optimized twin) into the offscreen cache. Recentred so it spins about itself.
+	async function loadThumbAsset(id, urls) {
+		_ensureThumb();
+		if (thumbModels.has(id)) return true;
+		for (const url of (Array.isArray(urls) ? urls : [urls])) {
+			if (!url) continue;
+			try {
+				const gltf = await loader.loadAsync(url);
+				const box = new THREE.Box3().setFromObject(gltf.scene);
+				if (box.isEmpty()) { disposeObject3D(gltf.scene); continue; }
+				_prepThumb(gltf.scene);
+				const center = box.getCenter(new THREE.Vector3());
+				const size = box.getSize(new THREE.Vector3());
+				gltf.scene.position.sub(center); // recentre at origin
+				const pivot = new THREE.Group();
+				pivot.add(gltf.scene);
+				// Fit radius for a Y-turntable: the worst-case half-extent as it spins
+				// is the horizontal diagonal (√(x²+z²)) or the height — NOT the single
+				// largest axis. Framing to this keeps the whole object in view at every
+				// angle (no clipping mid-spin) while still filling the card.
+				const radius = Math.max(0.5 * Math.hypot(size.x, size.z), 0.5 * size.y) || 1;
+				thumbModels.set(id, { pivot, radius });
+				return true;
+			} catch { /* try the next url */ }
+		}
+		return false;
+	}
+	function hasThumbAsset(id) { return thumbModels.has(id); }
+	// Render `id`'s mesh at `yaw` (radians) into a square 2D `canvas`. Cheap enough
+	// to drive a slow turntable when called round-robin across cards.
+	function renderThumb(id, canvas, yaw) {
+		const t = thumbModels.get(id);
+		if (!t || !canvas || !canvas.width) return false;
+		_ensureThumb();
+		const px = canvas.width;
+		if (!thumbRT || thumbRT.width !== px) {
+			thumbRT?.dispose();
+			thumbRT = new THREE.WebGLRenderTarget(px, px);
+			thumbRT.texture.colorSpace = THREE.SRGBColorSpace; // match the on-canvas look
+			thumbBuf = new Uint8Array(px * px * 4);
+		}
+		const prevRT = renderer.getRenderTarget();
+		const prevAlpha = renderer.getClearAlpha();
+		const prevExposure = renderer.toneMappingExposure;
+		renderer.getClearColor(_thumbCol);
+		// Present mode dims the live scene's exposure; render the asset at full so
+		// the tray thumbnails stay bright and legible.
+		renderer.toneMappingExposure = 1.0;
+		t.pivot.rotation.set(0.26, yaw, 0); // gentle top tilt + spin → a natural 3/4 turntable
+		thumbScene.add(t.pivot);
+		const r = t.radius;
+		// Frame the fit-sphere to the vertical FOV with a little air (1.1). Because
+		// `r` is rotation-safe, the object stays fully in view for every yaw.
+		const dist = (r / Math.sin((thumbCam.fov * Math.PI) / 360)) * 1.1;
+		thumbCam.position.set(dist * 0.12, r * 0.2, dist);
+		thumbCam.lookAt(0, 0, 0);
+		thumbCam.updateProjectionMatrix();
+		renderer.setRenderTarget(thumbRT);
+		renderer.setClearColor(0x000000, 0);
+		renderer.clear();
+		renderer.render(thumbScene, thumbCam);
+		renderer.readRenderTargetPixels(thumbRT, 0, 0, px, px, thumbBuf);
+		renderer.setRenderTarget(prevRT);
+		renderer.setClearColor(_thumbCol, prevAlpha);
+		renderer.toneMappingExposure = prevExposure;
+		thumbScene.remove(t.pivot);
+		const ctx = canvas.getContext("2d");
+		const img = ctx.createImageData(px, px);
+		const row = px * 4;
+		for (let y = 0; y < px; y++) img.data.set(thumbBuf.subarray((px - 1 - y) * row, (px - y) * row), y * row); // flip Y (GL is bottom-up)
+		ctx.putImageData(img, 0, 0);
+		return true;
+	}
+	function clearThumbAssets() {
+		for (const t of thumbModels.values()) disposeObject3D(t.pivot);
+		thumbModels.clear();
+		thumbRT?.dispose(); thumbRT = null; thumbBuf = null;
+	}
+
 	function setOverlayBoxes(boxes) {
 		clearOverlayBoxes();
 		for (const b of boxes ?? []) {
@@ -1576,6 +1953,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			fill.material?.dispose?.();
 		}
 		clearOverlayBoxes();
+		clearAttnHighlight();
+		clearNeuralActivation();
+		clearResolving();
 		clearOrientationArrow();
 		bboxes.clear();
 		proxies.clear();
@@ -1901,7 +2281,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const dt = Math.min(0.1, (now - lastMoveT) / 1000);
 		lastMoveT = now;
 		applyKeyboardMove(dt);
+		if (orbitFocus) controls.target.lerp(orbitFocus, 1 - Math.exp(-dt / 1.6)); // gentle cinematic drift
 		controls.update();
+		_tickNeural(dt, now / 1000);
 
 		gridMat.uniforms.uCameraPos.value.copy(camera.position);
 		const camDist = Math.max(
@@ -1938,6 +2320,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		loadBundleBuffer,
 		setOverlayBoxes,
 		clearOverlayBoxes,
+		setAttnHighlight,
+		clearAttnHighlight,
 		setOverlayVisible: (v) => {
 			overlayRoot.visible = v;
 		},
@@ -1945,6 +2329,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			show.bboxes = v;
 			refreshAllVisibility();
 		},
+		setMeshesVisible: (v) => {
+			show.meshes = v;
+			refreshAllVisibility();
+		},
+		getVisibility: () => ({ meshes: show.meshes, bboxes: show.bboxes }),
 		clear,
 		clearMeshes,
 		pruneTo,
@@ -2015,6 +2404,63 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			cameraUserMoved = true;
 		},
 		onCameraChange: (cb) => controls.addEventListener("change", cb),
+		// Present-mode ("brain activation") controls.
+		setNeuralActivation,
+		clearNeuralActivation,
+		setResolving,
+		clearResolving,
+		removeBbox,
+		// Present-mode asset thumbnails: load an object's actual GLB (raw form
+		// preferred) then render it (turntable) into a card <canvas>.
+		loadThumbAsset,
+		hasThumbAsset,
+		renderThumb,
+		clearThumbAssets,
+		// Dim the whole scene (moody backdrop) so the neural glow pops; restores
+		// the prior exposure when turned off.
+		setSceneDim: (on) => {
+			if (on && savedExposure == null) {
+				savedExposure = renderer.toneMappingExposure;
+				renderer.toneMappingExposure = savedExposure * 0.5;
+			} else if (!on && savedExposure != null) {
+				renderer.toneMappingExposure = savedExposure;
+				savedExposure = null;
+			}
+		},
+		// Gentle cinematic orbit (uses OrbitControls' built-in autoRotate, which
+		// advances on each controls.update() in the animate loop).
+		setAutoOrbit: (on, speed) => {
+			controls.autoRotate = !!on;
+			if (typeof speed === "number") controls.autoRotateSpeed = speed;
+		},
+		// Ease the orbit target toward `point` ([x,y,z]) each frame; null stops it.
+		setFocus: (point) => {
+			orbitFocus = point ? new THREE.Vector3(point[0], point[1], point[2]) : null;
+		},
+		// Project a world point ([x,y,z]) to VIEWPORT pixels (getBoundingClientRect
+		// space) so an HTML overlay can fly toward where an object sits in the 3D
+		// scene. `behind` flags points behind the camera (clamp/skip those).
+		project: (point) => {
+			const rect = renderer.domElement.getBoundingClientRect();
+			const v = new THREE.Vector3(point[0], point[1], point[2]).project(camera);
+			return {
+				x: rect.left + (v.x * 0.5 + 0.5) * rect.width,
+				y: rect.top + (0.5 - v.y * 0.5) * rect.height,
+				behind: v.z > 1,
+			};
+		},
+		// Fully hide these node ids (bbox + mesh) until present mode "places" them;
+		// clearPresentHidden restores normal visibility.
+		setPresentHidden: (ids) => {
+			presentHidden.clear();
+			for (const id of ids ?? []) presentHidden.add(id);
+			refreshAllVisibility();
+		},
+		clearPresentHidden: () => {
+			if (!presentHidden.size) return;
+			presentHidden.clear();
+			refreshAllVisibility();
+		},
 		// Tear the viewer down completely — stop the loop, detach observers /
 		// global listeners, free the GLB scene, and release the WebGL context.
 		// Needed because the review grid creates one viewer per slot card and
@@ -2031,6 +2477,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			}
 			resizeObserver.disconnect();
 			clear();
+			clearThumbAssets();
 			disposeOITTargets();
 			oitCompose.dispose();
 			oitQuad.geometry.dispose();

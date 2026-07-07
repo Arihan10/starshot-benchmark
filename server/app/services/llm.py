@@ -99,6 +99,128 @@ def set_step_gate(gate: StepGate | None) -> None:
     _step_gate.set(gate)
 
 
+# How many alternative tokens to request per position when logprob capture is
+# on. OpenRouter caps `top_logprobs` at 20; we request the max so the saved
+# distribution is as complete as the provider will return.
+TOP_LOGPROBS = 20
+
+# Task-local logprob capture, bound once by `_run` for cells started with the
+# "capture logprobs" toggle (mirrors `set_model`). When on, every real
+# (cache-miss) `call_llm` asks OpenRouter for the top-`TOP_LOGPROBS` tokens at
+# each output position and persists them next to the cell's events (see
+# `_write_logprobs_sidecar`). Off by default so normal runs are byte-identical.
+_capture_logprobs: ContextVar[bool] = ContextVar("_capture_logprobs", default=False)
+# Set within a task once we learn its model has no provider that serves
+# logprobs alongside our other required params (`require_parameters` filters
+# them out → 404). Latches capture off for the rest of the run so we stop
+# paying the failed first round-trip on every subsequent call.
+_logprobs_unsupported: ContextVar[bool] = ContextVar("_logprobs_unsupported", default=False)
+
+
+def set_capture_logprobs(on: bool) -> None:
+    _capture_logprobs.set(on)
+
+
+def _looks_like_logprobs_unsupported(e: Exception) -> bool:
+    """Whether a provider error on a logprobs-enabled call is the routing/param
+    rejection we should degrade past (retry without logprobs) rather than a real
+    transport flap. With `provider.require_parameters` on, a model whose
+    providers don't serve logprobs yields a 404 "no endpoints found that support
+    your parameters"; some providers instead 400/422 with a logprobs complaint."""
+    status = getattr(getattr(e, "raw_response", None), "status_code", None)
+    if status == 404:
+        return True
+    body = getattr(e, "body", None)
+    msg = f"{e} {body or ''}".lower()
+    return any(
+        kw in msg
+        for kw in ("logprob", "no endpoints", "no allowed providers", "does not support")
+    )
+
+
+def _serialize_logprobs(choice: object) -> dict[str, object] | None:
+    """Fold one choice's `logprobs.content` into a compact, self-describing map
+    that stays aligned to the original response text.
+
+    OpenRouter returns the output token stream in order, and concatenating the
+    tokens reproduces the exact `message.content` bytes the model emitted (the
+    same string we parse into structured output). We keep that ordering and
+    additionally record each token's `[start, end)` character span into the
+    reconstructed `text`, so a consumer can map any position in the original
+    response to its chosen token and the alternatives considered there. Returns
+    None when the provider sent no usable logprobs (best-effort capture)."""
+    lp = getattr(choice, "logprobs", None)
+    content = getattr(lp, "content", None)
+    if not isinstance(content, list) or not content:
+        return None
+    tokens: list[dict[str, object]] = []
+    parts: list[str] = []
+    offset = 0
+    for tok in content:
+        token = getattr(tok, "token", None)
+        if not isinstance(token, str):
+            continue
+        start = offset
+        offset += len(token)
+        parts.append(token)
+        top: list[dict[str, object]] = []
+        for alt in getattr(tok, "top_logprobs", None) or []:
+            alt_token = getattr(alt, "token", None)
+            alt_logprob = getattr(alt, "logprob", None)
+            if isinstance(alt_token, str) and isinstance(alt_logprob, (int, float)):
+                top.append({"token": alt_token, "logprob": float(alt_logprob)})
+        logprob = getattr(tok, "logprob", None)
+        tokens.append(
+            {
+                "start": start,
+                "end": offset,
+                "token": token,
+                "logprob": float(logprob) if isinstance(logprob, (int, float)) else None,
+                "top": top,
+            }
+        )
+    if not tokens:
+        return None
+    return {"text": "".join(parts), "tokens": tokens}
+
+
+def _write_logprobs_sidecar(
+    key: str,
+    logprobs_map: dict[str, object],
+    *,
+    model: str,
+    step: str | None,
+    node: str | None,
+    schema_name: str,
+    generation_id: str | None,
+) -> bool:
+    """Persist a call's captured logprobs beside the cell's events, keyed by the
+    same content hash as its `cache.llm` event (so a cache hit reuses the same
+    file and a rewind that rewinds the cache also orphans the right sidecar).
+    The `cache.llm` event stays small — it only gets a `logprobs: true` flag —
+    while the (potentially large) per-token distribution lives in
+    `logprobs/<key>.json`, served through the normal `/artifacts` route.
+    Best-effort: a write failure just means the flag isn't set."""
+    try:
+        directory = logging.slot_dir() / "logprobs"
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "key": key,
+            "generation_id": generation_id,
+            "model": model,
+            "step": step,
+            "node": node,
+            "schema": schema_name,
+            "top_n": TOP_LOGPROBS,
+            "text": logprobs_map.get("text"),
+            "tokens": logprobs_map.get("tokens"),
+        }
+        (directory / f"{key}.json").write_text(json.dumps(payload), encoding="utf-8")
+        return True
+    except (OSError, LookupError, KeyError, RuntimeError, TypeError):
+        return False
+
+
 class OutputValidationError(Exception):
     """A structured output parsed cleanly but failed a caller-supplied semantic
     check — e.g. a batch step echoing back ids that don't match the ones it was
@@ -219,7 +341,7 @@ async def call_llm(
                     validate(cached)
                 return cached
 
-    validated, reasoning, usage, raw, generation_ids = await call_llm_once(
+    validated, reasoning, usage, raw, generation_ids, logprobs_map = await call_llm_once(
         system=system,
         user=user,
         output_schema=output_schema,
@@ -227,6 +349,22 @@ async def call_llm(
         validate=validate,
         step=step,
     )
+    # When logprob capture is on and the provider returned them, spill the
+    # (potentially large) per-token distribution to a content-addressed sidecar
+    # and flag the event — kept OUT of the log line so events.jsonl stays lean
+    # and cheap to fold. `logprobs=True` tells the client a sidecar exists at
+    # `logprobs/<key>.json`.
+    logprobs_extra: dict[str, object] = {}
+    if logprobs_map is not None and _write_logprobs_sidecar(
+        key,
+        logprobs_map,
+        model=model,
+        step=step,
+        node=node_id,
+        schema_name=schema_name,
+        generation_id=generation_ids[-1] if generation_ids else None,
+    ):
+        logprobs_extra["logprobs"] = True
     # cache.llm carries everything needed for the LLM-call cache (key +
     # output), the observability view (node + step + model + system + user +
     # reasoning), and the prompt lab (template + variables). Older log lines
@@ -254,7 +392,15 @@ async def call_llm(
         tokens_in=getattr(usage, "prompt_tokens", None),
         tokens_out=getattr(usage, "completion_tokens", None),
         generation_id=generation_ids[-1] if generation_ids else None,
+        **logprobs_extra,
     )
+    # Ablation runs stop the moment their treated step is committed — no
+    # downstream (image prompts, flash-lite library/prefab matching, meshes).
+    # The ablation targets the TEMPLATE name (e.g. object_bbox_batch,
+    # zone_decompose) — root/nested variants differ in `template` while sharing a
+    # `step` id — so match on template (falling back to step).
+    from app.ablation import context as _abl_ctx
+    _abl_ctx.stop_if_treated_step(template if template is not None else step)
     return validated
 
 
@@ -267,12 +413,14 @@ async def call_llm_once(
     validate: Callable[[T], None] | None = None,
     step: str | None = None,
     log_retries: bool = True,
-) -> tuple[T, str, object, object, list[str]]:
+) -> tuple[T, str, object, object, list[str], dict[str, object] | None]:
     """One structured-output call with the full resample/backoff budget,
     WITHOUT the content-addressed cache lookup or the `cache.llm` log write
     that `call_llm` wraps around it. Returns
-    `(validated, reasoning, usage, raw, generation_ids)`, where
-    `generation_ids` lists every billed attempt (a resample bills each try).
+    `(validated, reasoning, usage, raw, generation_ids, logprobs)`, where
+    `generation_ids` lists every billed attempt (a resample bills each try) and
+    `logprobs` is the ordered top-token map (aligned to the response text) when
+    capture is on and the provider served it, else None.
 
     The prompt-tuning sandbox (`POST /llm/test`) calls this directly so a
     throwaway "what if I edited this prompt" test re-runs the exact step's
@@ -313,6 +461,13 @@ async def call_llm_once(
     generation_ids: list[str] = []
     while True:
         content: object = None
+        # Recomputed each attempt: a prior attempt may have latched capture off
+        # for this model (its providers don't serve logprobs under
+        # `require_parameters`), in which case we retry clean.
+        want_logprobs = _capture_logprobs.get() and not _logprobs_unsupported.get()
+        logprobs_kwargs: dict[str, object] = (
+            {"logprobs": True, "top_logprobs": TOP_LOGPROBS} if want_logprobs else {}
+        )
         try:
             async with OpenRouter(
                 api_key=os.environ["OPENROUTER_API_KEY"],
@@ -339,11 +494,14 @@ async def call_llm_once(
                     # provider can't do `response_format: json_schema` (GLM)
                     # falls back to a free-form completion and emits fenced /
                     # prose / null content instead of schema-conformant JSON.
+                    # NOTE: this also gates `logprobs` — a model with no
+                    # logprob-serving provider 404s, which we degrade past below.
                     provider={
                         "require_parameters": True,
                         "sort": "latency",
                         "ignore": ["decart"]
                     },
+                    **logprobs_kwargs,
                 )
             # Recorded before parsing: this generation was billed regardless of
             # whether its output survives validation below.
@@ -376,12 +534,16 @@ async def call_llm_once(
             # the rare provider that omits it; completion_tokens already includes
             # reasoning tokens, so no separate reasoning field is needed.
             usage = getattr(response, "usage", None)
+            # Ordered top-token map aligned to the response text (None unless
+            # capture is on and the provider served logprobs). Serialized here,
+            # inside the client context, before the response is discarded.
+            logprobs_map = _serialize_logprobs(response.choices[0]) if want_logprobs else None
             # Return the raw parsed response (`args`) alongside the validated
             # model so callers can log EXACTLY what the model emitted — the wire
             # field names and values — rather than a re-serialized, attribute-
             # named `model_dump` — plus every billed generation id so the caller
             # can price the call against OpenRouter's settled cost.
-            return validated, reasoning, usage, args, generation_ids
+            return validated, reasoning, usage, args, generation_ids, logprobs_map
         except OutputValidationError as e:
             if id_validation_attempt >= ID_VALIDATION_MAX - 1:
                 raise
@@ -405,6 +567,19 @@ async def call_llm_once(
                 raise
             parse_attempt += 1
         except (OpenRouterError, httpx.HTTPError) as e:
+            # Logprobs degrade: if THIS attempt asked for logprobs and the error
+            # is the "no provider serves logprobs under our required params"
+            # rejection, latch capture off for the run and retry immediately
+            # (clean, no logprobs) — don't spend a transport attempt on it.
+            if want_logprobs and _looks_like_logprobs_unsupported(e):
+                _logprobs_unsupported.set(True)
+                _retry_log(
+                    "llm.logprobs_unsupported",
+                    step=step,
+                    model=model,
+                    reason=str(e)[:200],
+                )
+                continue
             # httpx.RemoteProtocolError ("incomplete chunked read") and kin
             # surface when OpenRouter or an upstream provider drops the HTTP
             # connection mid-response. The SDK does not always wrap these as

@@ -87,25 +87,36 @@ async function serveIndex(res, relHtmlPath = "index.html") {
 
 const server = createServer(async (req, res) => {
     const url = req.url ?? "/";
-    if (url === "/" || url === "/index.html") {
+    // Match routes on the pathname only — query strings (e.g. the /tf ablation
+    // deep link `/tf?run=…&view=ablation&pins=…`) must not defeat the exact-match
+    // page routes, or the request falls through to the static handler and tries
+    // to read the `tf/` directory as a file (EISDIR).
+    const path = url.split("?")[0];
+    if (path === "/" || path === "/index.html") {
         return serveIndex(res);
     }
     // The experimental one-shot benchmark page (own slots/models, single-call
     // scene design). Same meta-injection so it knows the API origin.
     if (
-        url === "/oneshot" ||
-        url === "/oneshot/" ||
-        url === "/oneshot/index.html"
+        path === "/oneshot" ||
+        path === "/oneshot/" ||
+        path === "/oneshot/index.html"
     ) {
         return serveIndex(res, join("oneshot", "index.html"));
     }
-    if (url.startsWith("/vendor/three/")) {
-        const sub = url.slice("/vendor/three/".length);
+    // The teacher-forcing export inspector (step-by-step reconstruction of what
+    // gets fed to Gemma, with the 3D scene + observability tree per step). Same
+    // meta-injection so it knows the API origin.
+    if (path === "/tf" || path === "/tf/" || path === "/tf/index.html") {
+        return serveIndex(res, join("tf", "index.html"));
+    }
+    if (path.startsWith("/vendor/three/")) {
+        const sub = path.slice("/vendor/three/".length);
         const abs = resolveUnder(THREE_DIR, sub);
         if (abs) return serveFile(res, abs);
     }
-    if (url.startsWith("/vendor/gifjs/")) {
-        const sub = url.slice("/vendor/gifjs/".length);
+    if (path.startsWith("/vendor/gifjs/")) {
+        const sub = path.slice("/vendor/gifjs/".length);
         const abs = resolveUnder(GIFJS_DIR, sub);
         if (abs) return serveFile(res, abs);
     }

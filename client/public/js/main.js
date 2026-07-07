@@ -13,6 +13,8 @@ import { initRunCompare } from "./runcompare.js";
 import { initCost } from "./cost.js";
 import { initQueuePanel } from "./queue.js";
 import { initLighting } from "./lighting.js";
+import { openAblationWizard } from "./ablation.js";
+import { initAblationBoard } from "./ablationboard.js";
 import { createRunCombo } from "./runcombo.js";
 
 const LAST_RUN_KEY = "starshot.lastRun";
@@ -31,7 +33,14 @@ function runLabel(r) {
 }
 
 function renderRunPicker() {
-  runCombo?.render();
+  runPickerEl.textContent = "";
+  for (const r of state.runs) {
+    runPickerEl.appendChild(el("option", {
+      value: r.name,
+      text: r.prompt_version ? `${r.name} · ${r.prompt_version}` : `${r.name} (legacy)`,
+    }));
+  }
+  if (state.run) runPickerEl.value = state.run;
 }
 
 async function refreshRuns() {
@@ -304,6 +313,7 @@ function startCellsModal() {
   const slotChecks = state.slots.map((s) =>
     el("label", {}, el("input", { type: "checkbox", value: s.id }), s.id));
   const steppedCheck = el("input", { type: "checkbox", checked: "" });
+  const logprobsCheck = el("input", { type: "checkbox" });
   openModal(`start cells on ${state.run}`, (close, setError) => ({
     body: [
       el("div", { class: "m-field" }, el("span", { text: "models" }), el("div", { class: "check-grid" }, modelChecks)),
@@ -311,7 +321,10 @@ function startCellsModal() {
       el("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text-dim)" },
         steppedCheck,
         "run one step at a time (each slot pauses before every LLM call — the prompt-iteration mode)"),
-      el("div", { class: "m-hint", text: "launches the cross product; running/done cells are skipped automatically. Untick stepping for a full benchmark run." }),
+      el("label", { style: "display:flex;gap:8px;align-items:center;color:var(--text-dim)" },
+        logprobsCheck,
+        "capture top-20 token logprobs from OpenRouter for every LLM call (viewable per call in the observability panel)"),
+      el("div", { class: "m-hint", text: "launches the cross product; running/done cells are skipped automatically. Untick stepping for a full benchmark run. Logprob capture only applies to fresh calls, and models with no logprob-serving provider fall back silently." }),
     ],
     actions: [
       el("button", { text: "cancel", onclick: close }),
@@ -324,13 +337,14 @@ function startCellsModal() {
         }
         close();
         const stepped = steppedCheck.checked;
+        const logprobs = logprobsCheck.checked;
         const results = await Promise.all(slots.flatMap((s) => models.map(async (m) => {
-          try { await api.resume(state.run, s, m, stepped); return true; }
+          try { await api.resume(state.run, s, m, stepped, logprobs); return true; }
           catch { return false; }
         })));
         const ok = results.filter(Boolean).length;
         toast(
-          `started ${ok}/${results.length} cells${stepped ? " (stepped)" : ""}` +
+         `started ${ok}/${results.length} cells${stepped ? " (stepped)" : ""}${logprobs ? " (logprobs)" : ""}` +
             (ok < results.length ? " — rest skipped: running/done/capped/legacy" : ""),
           ok ? "ok" : "err",
         );
@@ -561,6 +575,7 @@ function resetAllModal() {
 
 document.getElementById("btn-new-run").addEventListener("click", newRunModal);
 document.getElementById("btn-start-cells").addEventListener("click", startCellsModal);
+document.getElementById("btn-ablation").addEventListener("click", openAblationWizard);
 document.getElementById("btn-reset-all").addEventListener("click", resetAllModal);
 document.getElementById("btn-ab-test").addEventListener("click", abTestModal);
 document.getElementById("btn-copy-slot").addEventListener("click", copySlotModal);
@@ -576,6 +591,7 @@ document.getElementById("btn-copy-slot").addEventListener("click", copySlotModal
   initRunCompare();
   initCost();
   initQueuePanel();
+  initAblationBoard();
 
   try {
     const payload = await refreshRuns();
