@@ -83,6 +83,82 @@ const LIGHTING_DEFAULTS = {
 	shadows: true,
 };
 
+// Selected-map projection ("on mesh" control): each map's material slot + the
+// packed channel to isolate (glTF packs occlusion=R, roughness=G, metalness=B);
+// channel -1 shows the whole RGB map (base/normal/emissive).
+const MAP_PROJECTION_SPEC = {
+	base: { slot: "map", channel: -1 },
+	roughness: { slot: "roughnessMap", alt: "metalnessMap", channel: 1 },
+	metallic: { slot: "metalnessMap", alt: "roughnessMap", channel: 2 },
+	occlusion: { slot: "aoMap", channel: 0 },
+	normal: { slot: "normalMap", channel: -1 },
+	emissive: { slot: "emissiveMap", channel: -1 },
+};
+// How far the rest of the scene desaturates toward dark grey while a map is
+// projected (0 = off, 1 = full), via the shared `_inspectDim` uniform.
+const INSPECT_DIM_STRENGTH = 0.82;
+// Inspector shader helpers: turbo false-colour ramp for scalar channels + an
+// sRGB→linear decode (turbo is authored in sRGB; the material outputs linear so
+// three's own tone-map/colour-space path finishes it).
+const MAP_PROJECTION_GLSL = `
+vec3 _proj_turbo( float t ) {
+	t = clamp( t, 0.0, 1.0 );
+	const vec3 c0 = vec3( 0.11408901, 0.06288341, 0.22483372 );
+	const vec3 c1 = vec3( 6.71641950, 3.18228675, 7.57158159 );
+	const vec3 c2 = vec3( -66.09402360, -4.92798270, -10.09439368 );
+	const vec3 c3 = vec3( 228.76607915, 25.04986700, -91.54105330 );
+	const vec3 c4 = vec3( -334.83515658, -69.31749713, 288.58588506 );
+	const vec3 c5 = vec3( 218.76372184, 67.52150568, -305.20457722 );
+	const vec3 c6 = vec3( -52.88903478, -21.54527365, 110.51746477 );
+	return clamp( c0 + t * ( c1 + t * ( c2 + t * ( c3 + t * ( c4 + t * ( c5 + t * c6 ) ) ) ) ), 0.0, 1.0 );
+}
+vec3 _proj_srgb2lin( vec3 c ) {
+	return mix( pow( ( c + 0.055 ) / 1.055, vec3( 2.4 ) ), c / 12.92, step( c, vec3( 0.04045 ) ) );
+}
+`;
+
+// The texture backing a map (metallic-roughness lives on either slot), or null.
+function mapProjectionTexture(mat, spec) {
+	if (!mat) return null;
+	return mat[spec.slot] ?? (spec.alt ? mat[spec.alt] : null) ?? null;
+}
+
+// Unlit inspector material for one source material. MeshBasicMaterial (not a raw
+// ShaderMaterial) so it rides three's tone-map/colour-space/OIT-composite path and
+// reuses `.map`'s UV transform + sRGB decode. Colour maps show as-is; scalar
+// channels are turbo false-coloured. Null when the material lacks the map.
+function buildInspectorMaterial(sourceMat, spec) {
+	const tex = mapProjectionTexture(sourceMat, spec);
+	if (!tex) return null;
+	const channel = spec.channel;
+	const mat = new THREE.MeshBasicMaterial({
+		map: tex,
+		color: 0xffffff,
+		side: THREE.DoubleSide,
+	});
+	mat.onBeforeCompile = (shader) => {
+		shader.uniforms.uProjChannel = { value: channel };
+		shader.fragmentShader = shader.fragmentShader
+			.replace(
+				"#include <common>",
+				"#include <common>\nuniform int uProjChannel;\n" +
+					MAP_PROJECTION_GLSL,
+			)
+			// outgoingLight = the sampled map colour (unlit). False-colour the scalar
+			// channels; leave colour maps for three to tone-map + encode.
+			.replace(
+				"#include <opaque_fragment>",
+				`if ( uProjChannel >= 0 ) {
+					float _v = uProjChannel == 0 ? outgoingLight.r : ( uProjChannel == 1 ? outgoingLight.g : outgoingLight.b );
+					outgoingLight = _proj_srgb2lin( _proj_turbo( _v ) );
+				}
+				#include <opaque_fragment>`,
+			);
+	};
+	mat.customProgramCacheKey = () => "mapproj1|" + channel;
+	return mat;
+}
+
 export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const renderer = new THREE.WebGLRenderer({ antialias: true });
 	renderer.setPixelRatio(window.devicePixelRatio);
@@ -130,6 +206,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// Shared shadow-reception gate (see prepareLoadedScene) — defined even for the
 	// simple-lit viewers, where the injected uniform is just unused.
 	const _forceReceiveShadow = { value: true };
+	// Shared scene-dim gate for the map projection: every streamed material reads it,
+	// so raising it dims everything but the inspector material (which lacks it). 0 = off.
+	const _inspectDim = { value: 0 };
 	const lightingRig = lighting ? setupLightingRig() : null;
 	if (!lighting) {
 		// Flat fill lighting for the mini / compare viewers.
@@ -782,6 +861,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// Toggle selection (re-selecting clears, like the old tree click). Framing
 	// marks the camera user-moved so auto-fit stops fighting the user.
 	function select(id, { frame = true, notify = true } = {}) {
+		clearMapProjection(); // projection is tied to the focused object
 		const prev = selectedId;
 		selectedId = prev === id ? null : id;
 		if (prev !== null) applyBboxColor(prev);
@@ -800,6 +880,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	}
 
 	function clearSelection({ notify = true } = {}) {
+		clearMapProjection();
 		if (selectedId === null) return;
 		const prev = selectedId;
 		selectedId = null;
@@ -1277,9 +1358,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		};
 	}
 
-	// Re-gate a streamed PBR material's shadow term on our shared
-	// `_forceReceiveShadow` uniform instead of three's per-object `receiveShadow`
-	// (which doesn't reach these materials). Inert where there's no shadow map.
+	// Two inert-by-default overlays every streamed material gets: (1) re-gate the
+	// shadow term on the shared `_forceReceiveShadow` uniform (three's per-object
+	// `receiveShadow` doesn't reach these materials); (2) an `_inspectDim` gate that
+	// dims the material for the map-projection view.
 	function patchMaterialReceiveShadow(m) {
 		if (!m || m.userData.__recvPatched) return;
 		m.userData.__recvPatched = true;
@@ -1287,10 +1369,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		m.onBeforeCompile = (shader, rndr) => {
 			if (prev) prev(shader, rndr);
 			shader.uniforms.uForceReceiveShadow = _forceReceiveShadow;
+			shader.uniforms.uInspectDim = _inspectDim;
 			shader.fragmentShader = shader.fragmentShader
 				.replace(
 					"#include <common>",
-					"#include <common>\nuniform bool uForceReceiveShadow;",
+					"#include <common>\nuniform bool uForceReceiveShadow;\nuniform float uInspectDim;",
 				)
 				.replace(
 					"#include <lights_fragment_begin>",
@@ -1298,11 +1381,15 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 						/\(\s*directLight\.visible\s*&&\s*receiveShadow\s*\)/g,
 						"( directLight.visible && uForceReceiveShadow )",
 					),
+				)
+				.replace(
+					"#include <opaque_fragment>",
+					"if ( uInspectDim > 0.0 ) { float _lum = dot( outgoingLight, vec3( 0.2126, 0.7152, 0.0722 ) ); outgoingLight = mix( outgoingLight, vec3( _lum ) * 0.25, uInspectDim ); }\n#include <opaque_fragment>",
 				);
 		};
 		const prevKey = m.customProgramCacheKey?.bind(m);
 		m.customProgramCacheKey = () =>
-			"recvForce1|" + (prevKey ? prevKey() : "");
+			"recvForce2|" + (prevKey ? prevKey() : "");
 		m.needsUpdate = true;
 	}
 
@@ -1339,12 +1426,92 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		});
 	}
 
+	// --- selected-map projection (unlit inspector) ---------------------------------
+	// One at a time, tied to the selected object: swap its mesh materials for the
+	// inspector (originals kept in userData) and dim the rest via `_inspectDim`.
+	let projectedId = null;
+	let projectedMapType = null;
+
+	function applyProjection(model, spec) {
+		// Bail if no material carries this map (an optimized twin may have pruned it),
+		// so the panel can revert its toggle.
+		let hasAny = false;
+		model.traverse((o) => {
+			if (!o.isMesh || !o.material) return;
+			const mats = Array.isArray(o.material) ? o.material : [o.material];
+			for (const m of mats) if (mapProjectionTexture(m, spec)) hasAny = true;
+		});
+		if (!hasAny) return false;
+		model.traverse((o) => {
+			if (!o.isMesh || !o.material || o.userData.__projOrigMat) return;
+			const orig = o.material;
+			o.userData.__projOrigMat = orig;
+			o.userData.__projLayerMask = o.layers.mask;
+			o.userData.__projOit = o.userData.__oit === true;
+			// Sub-materials lacking the map get flat grey ("no data here").
+			const swap = (m) =>
+				buildInspectorMaterial(m, spec) ??
+				new THREE.MeshBasicMaterial({
+					color: 0x555555,
+					side: THREE.DoubleSide,
+				});
+			o.material = Array.isArray(orig) ? orig.map(swap) : swap(orig);
+			// Opaque inspector: pull the mesh off the OIT layer so it renders solid.
+			o.userData.__oit = false;
+			o.layers.set(0);
+		});
+		return true;
+	}
+
+	function restoreProjection(model) {
+		model.traverse((o) => {
+			if (o.userData.__projOrigMat === undefined) return;
+			const cur = o.material;
+			// Dispose only the inspector material(s); their source textures belong to
+			// the restored original (freed later by disposeObject3D).
+			for (const m of Array.isArray(cur) ? cur : [cur]) m.dispose?.();
+			o.material = o.userData.__projOrigMat;
+			o.layers.mask = o.userData.__projLayerMask;
+			o.userData.__oit = o.userData.__projOit;
+			delete o.userData.__projOrigMat;
+			delete o.userData.__projLayerMask;
+			delete o.userData.__projOit;
+		});
+	}
+
+	// Project `desc.mapType` of object `id`; false when the mesh isn't loaded or
+	// lacks the map.
+	function setMapProjection(id, desc) {
+		clearMapProjection();
+		const spec = desc && MAP_PROJECTION_SPEC[desc.mapType];
+		if (!spec) return false;
+		const model = models.get(id);
+		if (!model || !applyProjection(model, spec)) return false;
+		projectedId = id;
+		projectedMapType = desc.mapType;
+		_inspectDim.value = INSPECT_DIM_STRENGTH;
+		return true;
+	}
+
+	function clearMapProjection() {
+		if (projectedId === null) return;
+		const model = models.get(projectedId);
+		if (model) restoreProjection(model);
+		projectedId = null;
+		projectedMapType = null;
+		_inspectDim.value = 0;
+	}
+
 	function attachGltf(id, gltfScene, kind) {
 		prepareLoadedScene(gltfScene);
 		gltfScene.name = `mesh:${id}`;
 		gltfScene.userData.pickId = id;
+		// Replacing the projected mesh: restore first (so its textures dispose
+		// cleanly), then re-project onto the incoming mesh so inspection stays put.
+		const reproject = projectedId === id ? projectedMapType : null;
 		const prev = models.get(id);
 		if (prev) {
+			if (reproject) clearMapProjection();
 			sceneRoot.remove(prev);
 			disposeObject3D(prev);
 		}
@@ -1352,6 +1519,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		models.set(id, gltfScene);
 		if (kind) kinds.set(id, kind);
 		applyModelVisibility(id);
+		if (reproject) setMapProjection(id, { mapType: reproject });
 		scheduleFit();
 	}
 
@@ -1555,6 +1723,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	function clear({ keepCamera = false } = {}) {
 		gen += 1;
 		bundleAbort?.abort?.();
+		clearMapProjection(); // restore swapped materials before disposal (no leak)
 		while (sceneRoot.children.length > 0) {
 			const child = sceneRoot.children[0];
 			sceneRoot.remove(child);
@@ -1607,6 +1776,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	function clearMeshes() {
 		gen += 1;
 		bundleAbort?.abort?.();
+		clearMapProjection();
 		while (sceneRoot.children.length > 0) {
 			const child = sceneRoot.children[0];
 			sceneRoot.remove(child);
@@ -1622,6 +1792,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// reverting a branch) left stale geometry behind. `applySceneProjection` calls
 	// this so a projection paint means "show EXACTLY this", in both directions.
 	function pruneTo({ bboxIds, meshIds }) {
+		// Restore before dispose if the projected object is being pruned.
+		if (projectedId !== null && !meshIds.has(projectedId)) clearMapProjection();
 		for (const id of [...bboxes.keys()]) {
 			if (bboxIds.has(id)) continue;
 			const helper = bboxes.get(id);
@@ -1948,6 +2120,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		clear,
 		clearMeshes,
 		pruneTo,
+		// Selected-map projection (unlit inspector). The panel reads getMapProjection
+		// back as the source of truth for its per-map button state.
+		setMapProjection,
+		clearMapProjection,
+		getMapProjection: (id) => (projectedId === id ? projectedMapType : null),
 		// Lighting engine (main viewer only; no-ops + null elsewhere). The panel
 		// (lighting.js) drives setLighting; lightingDefaults seeds its reset.
 		setLighting: (partial) => lightingRig?.setLighting(partial),

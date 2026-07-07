@@ -74,6 +74,11 @@ export function initOverlay(sceneViewer) {
 		onNavigate: focusNode,
 		onClose: () => viewer.clearSelection(),
 		onInquire: investigateCall,
+		// Project (or clear) a focused-object map onto its mesh; returns whether it
+		// took. `mapProjectionOf` reads the viewer's live state back for the panel.
+		onProjectMap: (id, desc) =>
+			desc ? viewer.setMapProjection(id, desc) : viewer.clearMapProjection(),
+		mapProjectionOf: (id) => viewer.getMapProjection(id),
 		// Per-object generated-asset controls, live only while viewing a source
 		// cell's generated build: regenerate on a chosen backend + symmetry ops +
 		// prefab link/unlink.
@@ -394,6 +399,7 @@ function setAssetMode(mode) {
 	// Drop the current build's meshes so the incoming view shows ONLY its own —
 	// generated mode never layers over leftover library meshes (and vice versa).
 	viewer.clearMeshes();
+	tracePanel.clearProjection(); // clearMeshes ended it viewer-side
 	syncAssetControls();
 	tracePanel.rerenderInfo();
 	if (assetMode === "generated") {
@@ -416,6 +422,7 @@ function toggleOptimized() {
 	loadedGen = new Map();
 	genMeshSig = null;
 	viewer.clearMeshes();
+	tracePanel.clearProjection(); // clearMeshes ended it viewer-side
 	tracePanel.rerenderInfo();
 	pollGenerated();
 }
@@ -941,6 +948,8 @@ function focusNode(id) {
 	if (viewer.hasBbox(id)) {
 		viewer.select(id, { frame: true });
 	} else {
+		// Box-less ancestor: viewer.select isn't called, so end any projection here.
+		viewer.clearMapProjection();
 		dock.markSelected(id, { scroll: true });
 		tracePanel.show(obs.model, id);
 	}

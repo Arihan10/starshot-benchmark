@@ -45,7 +45,7 @@ _GLASS_KEYWORDS = ("window", "glass")
 # fraction of full white. Keying off the min channel couples brightness with
 # desaturation, so a bright-but-tinted reflection (high in one channel, low in
 # another) stays opaque while true white/grey glass is caught.
-WHITE_THRESHOLD = 0.8
+WHITE_THRESHOLD = 0.3
 
 # Opacity given to the white texels (0 = invisible, 1 = opaque).
 GLASS_ALPHA = 0.065
