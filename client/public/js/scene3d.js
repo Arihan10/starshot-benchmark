@@ -8,6 +8,7 @@
 
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
+import { PointerLockControls } from "three/addons/controls/PointerLockControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
@@ -202,6 +203,63 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		controlsInteracting = false;
 		pointerDirty = true;
 	});
+
+	// First-person camera (main viewer only; the mini/compare viewers are
+	// keyboard:false). Orbit stays the default. In FP, PointerLockControls owns
+	// the camera's orientation from mouse-look while the shared key set drives
+	// movement — so the render loop must NOT call controls.update() (it re-aims
+	// the camera at controls.target every frame, which would fight the look).
+	const fp = keyboard
+		? new PointerLockControls(camera, renderer.domElement)
+		: null;
+	let cameraMode = "orbit"; // "orbit" | "fp"
+	const orbitFov = camera.fov; // restored on FP exit
+	const FP_FOV_SCALE = 1.5; // FP widens the view +50% for a natural walk-through
+	let fpSpeedScale = 10; // scene-scaled walk speed + target-ahead distance
+	let onCameraModeCb = () => {};
+	const _fpDir = new THREE.Vector3();
+
+	// Park OrbitControls' pivot a fixed distance ahead of the FP camera: keeps
+	// the ground grid's distance-fade stable and lets orbit resume from the FP
+	// pose without snapping (orbit re-derives its angle from position→target).
+	function syncTargetAhead() {
+		fp.getDirection(_fpDir);
+		controls.target
+			.copy(camera.position)
+			.addScaledVector(_fpDir, Math.max(2, fpSpeedScale * 0.5));
+	}
+
+	function setCameraMode(mode) {
+		if (!fp) return;
+		if (mode === "fp") fp.lock(); // requestPointerLock — needs the click gesture
+		else fp.unlock();
+	}
+
+	if (fp) {
+		// The lock/unlock events are the single source of truth for the mode, so
+		// Esc (browser-native exit) and a refused lock are both handled cleanly.
+		fp.addEventListener("lock", () => {
+			cameraMode = "fp";
+			fpSpeedScale = sceneRadius();
+			camera.fov = orbitFov * FP_FOV_SCALE;
+			camera.updateProjectionMatrix();
+			controls.enabled = false; // stop orbit input; the loop skips its update()
+			setHovered(null);
+			tooltip.style.display = "none";
+			onCameraModeCb("fp");
+		});
+		fp.addEventListener("unlock", () => {
+			cameraMode = "orbit";
+			camera.fov = orbitFov; // restore the orbit view
+			camera.updateProjectionMatrix();
+			syncTargetAhead(); // hand the FP pose to orbit before it takes back over
+			controls.enabled = true;
+			controls.update();
+			setHovered(null);
+			tooltip.style.display = "none";
+			onCameraModeCb("orbit");
+		});
+	}
 
 	// Shared shadow-reception gate (see prepareLoadedScene) — defined even for the
 	// simple-lit viewers, where the injected uniform is just unused.
@@ -922,6 +980,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		_downButton = ev.button;
 	});
 	renderer.domElement.addEventListener("pointerup", (ev) => {
+		if (cameraMode !== "orbit") return; // FP: the pointer is captured for look
 		if (_downButton !== 0 || ev.button !== 0) return;
 		const dx = ev.clientX - _downX;
 		const dy = ev.clientY - _downY;
@@ -970,9 +1029,15 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			pressedKeys.add(k);
 			ev.preventDefault();
 		} else if (k === "shift" && !pressedKeys.has("shift")) {
-			// Shift flips picking to zones-only; refresh hover without a mouse move.
+			// Shift flips picking to zones-only (orbit) / descends (FP); refresh
+			// hover without a mouse move.
 			pressedKeys.add("shift");
 			if (pointerInsideCanvas) pointerDirty = true;
+		} else if (cameraMode === "fp" && (k === " " || k === "capslock")) {
+			// FP only: Space rises, Caps Lock sprints (Shift descends). Captured
+			// so Space can't scroll the page or trigger a focused control.
+			pressedKeys.add(k);
+			ev.preventDefault();
 		}
 	};
 	const onKeyUp = (ev) => {
@@ -998,7 +1063,25 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const _worldUp = new THREE.Vector3(0, 1, 0);
 	const _move = new THREE.Vector3();
 
+	// First-person movement: WASD walks on the ground plane along the look yaw,
+	// Space/Shift rise/fall, Caps Lock sprints. Mouse-look is applied by fp on mousemove.
+	function applyFpMove(dt) {
+		if (pressedKeys.size === 0) return;
+		const speed =
+			Math.max(2, fpSpeedScale * 0.5) *
+			(pressedKeys.has("capslock") ? 3 : 1) *
+			dt;
+		if (pressedKeys.has("w")) fp.moveForward(speed);
+		if (pressedKeys.has("s")) fp.moveForward(-speed);
+		if (pressedKeys.has("d")) fp.moveRight(speed);
+		if (pressedKeys.has("a")) fp.moveRight(-speed);
+		if (pressedKeys.has(" ")) camera.position.y += speed; // Space rises
+		if (pressedKeys.has("shift")) camera.position.y -= speed; // Shift descends
+		cameraUserMoved = true;
+	}
+
 	function applyKeyboardMove(dt) {
+		if (cameraMode === "fp") return applyFpMove(dt);
 		if (pressedKeys.size === 0) return;
 		const shifted = pressedKeys.has("shift");
 		const camDist = Math.max(
@@ -1062,6 +1145,19 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		camera.far = Math.max(100, radius * 100);
 		camera.updateProjectionMatrix();
 		controls.update();
+	}
+
+	// Half the scene's largest dimension (meshes, else bboxes) — scales the FP
+	// walk speed + target-ahead distance so movement matches the scene size.
+	function sceneRadius() {
+		const box = new THREE.Box3();
+		if (sceneRoot.children.length > 0) box.setFromObject(sceneRoot);
+		if (box.isEmpty())
+			for (const helper of bboxes.values()) box.union(helper.box);
+		if (box.isEmpty()) return 10;
+		const size = box.getSize(new THREE.Vector3());
+		const r = 0.5 * Math.max(size.x, size.y, size.z);
+		return isFinite(r) && r > 0 ? r : 10;
 	}
 
 	function buildProxyWireframe(proxyShape, origin, dimensions) {
@@ -2073,7 +2169,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const dt = Math.min(0.1, (now - lastMoveT) / 1000);
 		lastMoveT = now;
 		applyKeyboardMove(dt);
-		controls.update();
+		if (cameraMode === "fp") syncTargetAhead();
+		else controls.update();
 
 		gridMat.uniforms.uCameraPos.value.copy(camera.position);
 		const camDist = Math.max(
@@ -2083,7 +2180,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		gridMat.uniforms.uFadeStart.value = camDist * 0.5;
 		gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
 
-		if (pointerDirty && !controlsInteracting) {
+		if (cameraMode === "orbit" && pointerDirty && !controlsInteracting) {
 			pointerDirty = false;
 			if (pointerInsideCanvas) {
 				raycaster.setFromCamera(pointer, camera);
@@ -2170,6 +2267,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		setActive: (v) => {
 			active = v;
 			if (!v) {
+				if (fp && fp.isLocked) fp.unlock();
 				pressedKeys.clear();
 				setHovered(null);
 				tooltip.style.display = "none";
@@ -2192,6 +2290,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			cameraUserMoved = true;
 		},
 		onCameraChange: (cb) => controls.addEventListener("change", cb),
+		// First-person camera mode (main viewer only; a no-op where fp is null).
+		setCameraMode,
+		getCameraMode: () => cameraMode,
+		onCameraModeChange: (cb) => {
+			onCameraModeCb = cb;
+		},
 		// Tear the viewer down completely — stop the loop, detach observers /
 		// global listeners, free the GLB scene, and release the WebGL context.
 		// Needed because the review grid creates one viewer per slot card and
@@ -2205,6 +2309,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				window.removeEventListener("keydown", onKeyDown);
 				window.removeEventListener("keyup", onKeyUp);
 				window.removeEventListener("blur", onBlur);
+			}
+			if (fp) {
+				if (fp.isLocked) fp.unlock();
+				fp.dispose();
 			}
 			resizeObserver.disconnect();
 			clear();

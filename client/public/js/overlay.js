@@ -280,6 +280,17 @@ export function initOverlay(sceneViewer) {
 	document
 		.getElementById("btn-unhide-all")
 		.addEventListener("click", () => viewer.unhideAll());
+	// First-person camera toggle: the button enters FP (pointer lock); the viewer
+	// flips back to orbit on Esc, so mirror its state via onCameraModeChange.
+	const btnCameraMode = document.getElementById("btn-camera-mode");
+	btnCameraMode.addEventListener("click", () =>
+		viewer.setCameraMode(viewer.getCameraMode() === "fp" ? "orbit" : "fp"),
+	);
+	viewer.onCameraModeChange((mode) => {
+		btnCameraMode.classList.toggle("on", mode === "fp");
+		btnCameraMode.textContent =
+			mode === "fp" ? "first-person ✓" : "first-person";
+	});
 	setupAssetControls();
 	actionBtn.addEventListener("click", onAction);
 	resetBtn.addEventListener("click", onReset);
