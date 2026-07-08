@@ -35,6 +35,11 @@ class OpenModelSpec:
     openrouter_id: str | None = None # generation id in core.slots.MODELS, for matching
     memory_mb: int = 131072          # container RAM (CPU-side headroom)
     scaledown_window: int = 360      # idle-kill seconds for this model's worker
+    # Approx bf16 weight size (GiB). When set on a multi-GPU tier, the loader caps
+    # each GPU's weight budget at ~weights/nGPU so device_map splits EVENLY (leaving
+    # runtime headroom) instead of packing GPU 0 — tier-independent, unlike a fixed
+    # per-GPU reserve. 0 = unknown → fall back to the fixed reserve.
+    approx_weights_gib: int = 0
     notes: str = ""
 
 
@@ -54,13 +59,20 @@ OPEN_MODELS: tuple[OpenModelSpec, ...] = (
         alias="qwen-122b",
         hf_path="Qwen/Qwen3.5-122B-A10B",
         hf_url="https://huggingface.co/Qwen/Qwen3.5-122B-A10B",
-        gpu="B200:2",
+        # B200:3 (~534 GB): the 122B forward over the largest end-steps (~200k+
+        # tokens) peaks near the 178 GB/card ceiling on 2×B200 and OOMs; a 3rd card
+        # spreads weights to ~83 GB/GPU (even split) leaving ~95 GB/card for the
+        # forward. B300:2 is cheaper (2 fast cards) but its Blackwell-Ultra kernels
+        # threw `CUDA unspecified launch failure` on the current cu128 image — flip
+        # gpu back to "B300:2" to retry once the image's flash/cuDNN supports B300.
+        gpu="B300:2",
         thinking_open="<think>",
         thinking_close="</think>",
         loader="image_text_to_text",   # arch Qwen3_5MoeForConditionalGeneration (VL wrapper)
         openrouter_id="qwen/qwen3.5-122b-a10b",
         memory_mb=262144,
         scaledown_window=600,
+        approx_weights_gib=250,        # measured on B200:2 (154+96) → even split cap
         notes="Qwen3.5-122B-A10B (Apache-2.0, Feb 2026). Hybrid MoE, 48 decoder layers "
               "laid out 12 x (3 x linear_attention[Gated-DeltaNet] -> 1 x full_attention"
               "[Gated-Attention]); ~122B total / 10B active over 256 experts (8+1). Only "
@@ -71,8 +83,8 @@ OPEN_MODELS: tuple[OpenModelSpec, ...] = (
               "RoPE (0.25); the sigmoid output gate is applied AFTER attention so the "
               "captured post-RoPE/QK-norm Q/K are the true softmax inputs. mRoPE reduces "
               "to standard RoPE for our text-only teacher-forced forward. ~250 GB bf16 -> "
-              "B200:2 (~360 GB) with device_map=auto pipeline-shard. Needs the cu128/"
-              "transformers>=5.2 image (see modal_app.big_image).",
+              "B200:3 (~534 GB) with device_map=auto pipeline-shard (even split, ~83 GB/GPU). Needs "
+              "the cu128/transformers>=5.2 image (see modal_app.big_image).",
     ),
 )
 

@@ -51,10 +51,6 @@ Accuracy
   for the offset map; per-token logprobs are recomputed and compared to the
   remote trace (diagnostic only — surfaced, never blocking).
 
-NOTE: deploy with Python >= 3.10. The `X | Y` type unions are evaluated at import,
-and `from __future__ import annotations` is NOT usable here — it turns the
-`modal.parameter` field annotations into strings and breaks Modal's class-parameter
-type validation (`'str' object has no attribute '__name__'`).
 """
 
 import json
@@ -117,6 +113,21 @@ LOGPROB_CHUNK = 512
 # tensor to a few GiB regardless of prompt length. Attention capture is unaffected
 # (it reads per-layer Q/K during the forward, not the final logits).
 LOGITS_KEEP_MAX = 8192
+# On a HUGE trace the model FORWARD itself (MoE expert activations over the full
+# sequence — not chunkable like the scoring) peaks near the tier ceiling, and the
+# [LOGITS_KEEP_MAX, vocab] fp32 logits window (~2.5–5 GB on ONE shard) is the one
+# reducible piece: the logprob round-trip it feeds is DIAGNOSTIC, so above this
+# token count we keep a much smaller tail to hand those GB back to the forward.
+_BIG_TRACE_TOKENS = 120_000
+_BIG_TRACE_LOGITS_KEEP = 512
+# head_token_stats scores every completion query against the full key sequence;
+# the transient [Nq, seq]/[Nq, S] score tensors are ~Nq*seq*2B each and several
+# coexist per head. Queries are INDEPENDENT, so we CHUNK the query axis so peak
+# VRAM is capped at ~(q_chunk * seq) regardless of how many tokens are scored or
+# how long the trace is (a short trace stays one chunk). ~4e8 ≈ 0.8 GB per bf16
+# [q_chunk, seq] tensor.
+_SCORE_QCHUNK_ELEMS = 400_000_000
+_SCORE_QCHUNK_MIN = 256
 
 # device_map="auto" fills GPUs greedily and PACKS GPU 0 with weights (~95% of the
 # card), leaving little for the forward's transient activations, the lm-head window,
@@ -699,27 +710,66 @@ class HFAttentionProvider:
             name: {"scale": [None] * G, "ratio": [None] * G, "ent": [None] * G, "comp": [None] * G}
             for name in group_plans
         }
+        # Size the query chunk so (q_chunk * seq) stays under the VRAM budget; a
+        # short trace collapses to a single chunk (original behavior). Only the tiny
+        # reduced per-head results are retained (transferred to host in one pass);
+        # the big [q_chunk, seq]/[q_chunk, S] transients are reclaimed per chunk on
+        # the chunked path so peak stays flat regardless of trace size.
+        seq_len = int(self._k[self._global[0]].shape[-2]) if self._global else 0
+        q_chunk = Nq if seq_len <= 0 else max(_SCORE_QCHUNK_MIN, min(Nq, _SCORE_QCHUNK_ELEMS // seq_len))
+        chunked = q_chunk < Nq
+
+        def _cat0(parts: list[Any]) -> Any:
+            parts = [p for p in parts if p is not None]
+            if not parts:
+                return None
+            return parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+
         with torch.inference_mode():
             for g, h in enumerate(selected):
                 layer, head = int(h["layer"]), int(h["head"])
                 q_layer = self._q[layer]
                 qi, qi_row, grp, whole_t = _idx_for(q_layer.device)
-                qm = q_layer[head].index_select(0, qi_row)             # [Nq, d] (bf16)
+                q_head = q_layer[head]                                  # [n_rows, d] (bf16)
                 kf = self._k[layer][head // self._n_rep]               # [seq, d] (bf16)
-                logZ, h_full, row = self._full_row_norm(qm, kf, qi, want_row=bool(whole_t))
-                if row is not None:
-                    for gname, segs_t in whole_t.items():              # whole-row group masses
-                        red = self._row_reduce(row, segs_t)
-                        if red is not None:
-                            whole_g[gname][g] = red
-                for name, (cols_t, ent_t, comp_t, agg) in grp.items():
-                    if cols_t.numel() == 0:
-                        continue
-                    c, dist, ratio = self._col_stats(qm, kf, logZ, h_full, qi, cols_t)
-                    grp_g[name]["scale"][g] = c
-                    grp_g[name]["ratio"][g] = ratio
-                    grp_g[name]["ent"][g] = _seg_reduce(dist, ent_t, agg)
-                    grp_g[name]["comp"][g] = _seg_reduce(dist, comp_t, agg)
+                whole_parts: dict[str, list[Any]] = {gname: [] for gname in whole_t}
+                grp_parts: dict[str, dict[str, list[Any]]] = {
+                    name: {"scale": [], "ratio": [], "ent": [], "comp": []} for name in grp
+                }
+                for c0 in range(0, Nq, q_chunk):
+                    c1 = min(Nq, c0 + q_chunk)
+                    qi_c = qi[c0:c1]                                    # absolute positions (causal mask)
+                    qm = q_head.index_select(0, qi_row[c0:c1])         # [qc, d]
+                    logZ, h_full, row = self._full_row_norm(qm, kf, qi_c, want_row=bool(whole_t))
+                    if row is not None:
+                        for gname, segs_t in whole_t.items():          # whole-row group masses
+                            red = self._row_reduce(row, segs_t)
+                            if red is not None:
+                                whole_parts[gname].append(red)
+                    for name, (cols_t, ent_t, comp_t, agg) in grp.items():
+                        if cols_t.numel() == 0:
+                            continue
+                        c, dist, ratio = self._col_stats(qm, kf, logZ, h_full, qi_c, cols_t)
+                        grp_parts[name]["scale"].append(c)
+                        grp_parts[name]["ratio"].append(ratio)
+                        grp_parts[name]["ent"].append(_seg_reduce(dist, ent_t, agg))
+                        grp_parts[name]["comp"].append(_seg_reduce(dist, comp_t, agg))
+                    if chunked:
+                        # Reclaim this chunk's big transients before the next chunk
+                        # allocates (caps peak at ~one chunk).
+                        del row, logZ, h_full
+                        self._torch.cuda.synchronize(q_layer.device)
+                # Concatenate each head's per-chunk results along the query axis
+                # (all small: [Nq], [Nq,E], [Nq,C], [Nq,segs]).
+                for gname, parts in whole_parts.items():
+                    red = _cat0(parts)
+                    if red is not None:
+                        whole_g[gname][g] = red
+                for name, cols in grp_parts.items():
+                    grp_g[name]["scale"][g] = _cat0(cols["scale"])
+                    grp_g[name]["ratio"][g] = _cat0(cols["ratio"])
+                    grp_g[name]["ent"][g] = _cat0(cols["ent"])
+                    grp_g[name]["comp"][g] = _cat0(cols["comp"])
         # One host transfer pass (the first .cpu() syncs once; the rest are ready).
         for gname, per_head in whole_g.items():
             for g, t in enumerate(per_head):
@@ -811,9 +861,13 @@ class HFAttentionProvider:
         kw: dict[str, Any] = {"input_ids": input_ids, "use_cache": False}
         base = 0
         keep_name = self._logits_keep_kwarg()
-        if keep_name and seq > LOGITS_KEEP_MAX:
-            kw[keep_name] = LOGITS_KEEP_MAX
-            base = seq - LOGITS_KEEP_MAX
+        # Shrink the (diagnostic) logits window on a huge trace so the fp32
+        # [keep, vocab] tensor stops eating the forward's headroom near the tier
+        # ceiling — attention capture is unaffected (it reads per-layer Q/K).
+        keep_max = _BIG_TRACE_LOGITS_KEEP if seq > _BIG_TRACE_TOKENS else LOGITS_KEEP_MAX
+        if keep_name and seq > keep_max:
+            kw[keep_name] = keep_max
+            base = seq - keep_max
         # `rows`/`_rows_dev`: the capture op slices Q to these scored rows and caches
         # the per-device index tensor (device_map shards layers across GPUs).
         cap: dict[str, Any] = {
@@ -941,7 +995,7 @@ if _HAS_MODAL:
     #
     #   attn_state[cell:{hash}]   -> {queued:[ev], running:[ev], done:[ev],
     #                                 errors:{ev:msg}, ident:{run,slot,model_alias,model_id}}
-    #   attn_lease[consumer:{model_id}] -> heartbeat ts  (is a GPU consumer alive?)
+    #   attn_lease[consumer:{model_id}:{slot}] -> heartbeat ts  (one per live consumer slot)
     #
     # ONE Dict op per Modal round-trip is a ~0.3s RPC (and spikes under load), so the
     # design is deliberately COARSE: exactly ONE compact status doc per cell holds the
@@ -981,13 +1035,68 @@ if _HAS_MODAL:
     # A single forward (cold model load + a long trace) can run for minutes with the
     # main thread blocked in CUDA — longer than a between-jobs beat can cover. So a
     # background thread beats the lease on this interval for the consumer's whole life,
-    # guaranteeing the lease never lapses mid-forward and the reaper can't spawn a
-    # SECOND consumer (which — even serialized by max_containers=1 — would redo work).
+    # guaranteeing the lease never lapses mid-forward and the reaper can't mistake a
+    # busy slot for dead and re-spawn onto it (which would redo work).
     _LEASE_BEAT_INTERVAL_S = 60.0
+
+    # --- dynamic consumer fan-out (throughput scales with queue depth) ----------
+    # Several GPU consumers can drain one model's queue partition IN PARALLEL — each
+    # is its own container, and `modal.Queue.get` is concurrency-safe (each get pops a
+    # distinct ref), so N consumers split the FIFO ~N ways. Each holds its own slot
+    # lease `consumer:{model_id}:{slot}`. The pool size tracks queue DEPTH — one
+    # consumer per `_STEPS_PER_CONSUMER_BY_GPU[tier]` queued steps — capped per tier by
+    # `_MAX_CONSUMERS_BY_GPU` (which is ALSO each tier's `max_containers`). Extra
+    # consumers idle-exit on their own (`_CONSUMER_IDLE_S`), so the pool scales DOWN
+    # for free with no proactive teardown. The big-MoE tier fans out too: each B200:2
+    # consumer is a whole 2×B200 box, so a cap of 4 means up to 8×B200 total under a
+    # deep queue (matched by `max_containers=4` on WorkerB200x2).
+    _MAX_CONSUMERS_BY_GPU: dict[str, int] = {"H200": 4, "B200:2": 4, "B200:3": 4, "B300:2": 4}
+
+    # Queue depth that justifies each ADDITIONAL consumer, PER TIER — the cost/efficiency
+    # knob the router sizes the pool with. A new consumer costs one COLD LOAD (idle
+    # GPU-minutes) and, on B200, TWO pricey GPUs; it only pays off if it will process
+    # enough queued steps to amortize that warmup. So the cheap, fast-loading H200 fans
+    # out eagerly (a consumer per ~3 queued steps), while the 2×B200 122B tier (a
+    # multi-minute, ~250 GB cold load) fans out only on a genuinely DEEP queue (per ~4
+    # steps) — reaching the full 8×B200 pool near a saturated window, never on a small
+    # burst. Router estimate (consumers @ queued depth):
+    #   H200   (/3, cap 4):  1-3→1, 4-6→2, 7-9→3, 10+→4       (max 4×H200)
+    #   B200:2 (/4, cap 4):  1-4→1, 5-8→2, 9-12→3, 13+→4       (max 4 boxes = 8×B200)
+    _STEPS_PER_CONSUMER_BY_GPU: dict[str, int] = {"H200": 3, "B200:2": 4, "B200:3": 4, "B300:2": 4}
+    _STEPS_PER_CONSUMER_DEFAULT = 3
+
+    def _consumer_cap(model_id: str) -> int:
+        spec = reg.resolve_open_model(model_id)
+        return _MAX_CONSUMERS_BY_GPU.get(spec.gpu, 1) if spec else 1
+
+    def _desired_consumers(model_id: str, depth: int) -> int:
+        """Estimate how many consumers this queue depth warrants, balancing throughput
+        against the tier's warmup cost. 0 when the queue is empty; else
+        ceil(depth / steps_per_consumer[tier]) clamped to [1, tier cap]. Called by the
+        router (web endpoint) on every enqueue/poll to size the pool to live demand."""
+        if depth <= 0:
+            return 0
+        spec = reg.resolve_open_model(model_id)
+        gpu = spec.gpu if spec else None
+        cap = _MAX_CONSUMERS_BY_GPU.get(gpu, 1)
+        per = _STEPS_PER_CONSUMER_BY_GPU.get(gpu, _STEPS_PER_CONSUMER_DEFAULT)
+        return max(1, min(cap, -(-int(depth) // per)))
 
     def _part(model_id: str) -> str:
         """modal.Queue partition key: one FIFO stream per model (sanitized)."""
         return (re.sub(r"[^A-Za-z0-9_.-]", "-", model_id or "")[:60]) or "default"
+
+    def _partition_depth(model_id: str) -> int:
+        """Total queued jobs in this MODEL's shared queue partition — the AGGREGATE
+        backlog across EVERY cell. This is what the consumer pool must scale to:
+        'run all' enqueues many cells that each carry only a few treated steps, so
+        sizing the pool off a SINGLE cell's queued count never fans out past 1 even
+        with hundreds of jobs waiting. Best-effort — callers max() it with the
+        per-cell depth, so a length hiccup just falls back to the old behavior."""
+        try:
+            return int(job_queue.len(partition=_part(model_id)))
+        except Exception:  # noqa: BLE001 — length is only a pool-sizing hint
+            return 0
 
     def _jk(h: str, ev: int) -> str:
         return f"{h}:{int(ev)}"
@@ -1057,6 +1166,38 @@ if _HAS_MODAL:
         except OSError:
             pass
 
+    def _listdir_evs(rel_dir: str, suffix: str) -> set[int]:
+        """Event indices under a Volume dir, parsed from `{ev}{suffix}` filenames via a
+        BACKEND listing (fresh + mount-lag-free, like `read_file`), NOT the stale web
+        mount. Best-effort: an absent dir / backend blip / API mismatch yields an empty
+        set so callers degrade to a no-op rather than raising on the hot path."""
+        out: set[int] = set()
+        lister = getattr(attn_vol, "listdir", None) or getattr(attn_vol, "iterdir", None)
+        if lister is None:
+            return out
+        try:
+            for entry in lister(rel_dir):
+                name = str(getattr(entry, "path", entry) or "").rsplit("/", 1)[-1]
+                if name.endswith(suffix):
+                    stem = name[: -len(suffix)]
+                    if stem.isdigit():
+                        out.add(int(stem))
+        except Exception:  # noqa: BLE001 — dir absent / listing unavailable → nothing there
+            pass
+        return out
+
+    def _committed_result_evs(h: str) -> set[int]:
+        """Steps with a COMMITTED result (`.meta.json` on the Volume) — the durable
+        'this step is done' truth, independent of the racily-RMW'd status doc."""
+        return _listdir_evs(f"cell/{h}", ".meta.json")
+
+    def _pending_job_evs(h: str) -> set[int]:
+        """Steps whose compute payload is still live (`jobs/{h}/{ev}.json`). `_publish_batch`
+        unlinks the payload on done, so a step WITH a committed result but WITHOUT a pending
+        payload is definitively published — even if a lost status-doc RMW clobbered its
+        `done` marker. A step being RE-computed still has a payload, so it's excluded."""
+        return _listdir_evs(f"jobs/{h}", ".json")
+
     def _vol_commit() -> None:
         attn_vol.commit()  # make writes visible to the other container
 
@@ -1117,27 +1258,54 @@ if _HAS_MODAL:
         except Exception:  # noqa: BLE001
             return None
 
-    def _lease_beat(model_id: str) -> None:
-        attn_lease[f"consumer:{model_id}"] = time.time()
+    def _lease_key(model_id: str, slot: int) -> str:
+        return f"consumer:{model_id}:{int(slot)}"
 
-    def _lease_alive(model_id: str) -> bool:
-        return (time.time() - float(attn_lease.get(f"consumer:{model_id}", 0.0))) < _LEASE_TTL_S
+    def _slot_beat(model_id: str, slot: int) -> None:
+        attn_lease[_lease_key(model_id, slot)] = time.time()
 
-    def _lease_clear(model_id: str) -> None:
-        """Relinquish the lease on consumer exit so the next enqueue/poll re-spawns
-        one right away (rather than waiting out the crash-fallback TTL)."""
-        attn_lease.pop(f"consumer:{model_id}", None)
+    def _slot_alive(model_id: str, slot: int) -> bool:
+        return (time.time() - float(attn_lease.get(_lease_key(model_id, slot), 0.0))) < _LEASE_TTL_S
 
-    def _ensure_consumer(model_id: str) -> None:
-        """Spawn a GPU consumer for this model if none is heartbeating."""
-        if _lease_alive(model_id):
+    def _slot_clear(model_id: str, slot: int) -> None:
+        """Relinquish a consumer's slot on exit so the next enqueue/poll can re-spawn
+        onto it right away (rather than waiting out the crash-fallback TTL)."""
+        attn_lease.pop(_lease_key(model_id, slot), None)
+
+    def _alive_slots(model_id: str, cap: int) -> list[int]:
+        return [i for i in range(max(1, cap)) if _slot_alive(model_id, i)]
+
+    def _any_consumer_alive(model_id: str) -> bool:
+        """Is ANY consumer slot heartbeating for this model? (reaper gate)."""
+        return bool(_alive_slots(model_id, _consumer_cap(model_id)))
+
+    def _ensure_consumers(model_id: str, desired: int) -> None:
+        """Spawn GPU consumers until `desired` (clamped to the tier cap) slots are
+        heartbeating. Each consumer is its own container draining the shared per-model
+        queue partition in parallel. Free slots are claimed low-index-first; the
+        optimistic pre-beat plus a fresh per-slot re-check collapse a burst of concurrent
+        enqueues/polls to one spawn per slot — important on B200, where a double-spawned
+        slot would waste a whole 2×B200 multi-minute cold load before it idle-exits."""
+        if desired <= 0:
             return
         spec = reg.resolve_open_model(model_id)
         Worker = _WORKER_BY_GPU.get(spec.gpu) if spec else None
         if Worker is None:
             return
-        _lease_beat(model_id)  # optimistic — collapses a burst of enqueues to one spawn
-        Worker(model_id=spec.hf_path).consume.spawn(model_id)
+        cap = _MAX_CONSUMERS_BY_GPU.get(spec.gpu, 1)
+        desired = max(1, min(cap, desired))
+        alive = set(_alive_slots(model_id, cap))
+        for slot in range(cap):
+            if len(alive) >= desired:
+                break
+            if slot in alive:
+                continue
+            if _slot_alive(model_id, slot):  # re-check fresh: a concurrent caller may have just claimed it
+                alive.add(slot)
+                continue
+            _slot_beat(model_id, slot)  # optimistic claim so a concurrent enqueue won't double-spawn this slot
+            Worker(model_id=spec.hf_path).consume.spawn(model_id, slot)
+            alive.add(slot)
 
     def _mark_running(h: str, ev: int) -> None:
         """Flip a step queued -> running (one status-doc RMW). Re-reads the doc fresh
@@ -1224,6 +1392,35 @@ if _HAS_MODAL:
         _list_add(st, "done", ev)
         _cell_save(h, st)
 
+    def _reconcile_done(st: dict[str, Any], h: str) -> None:
+        """Converge the status doc's `done` set from DURABLE Volume truth. With several
+        consumers fanned out over one cell, the coarse single-doc RMW (no CAS on
+        `modal.Dict`) can drop a `done` write — leaving a finished step stuck in
+        queued/running until the crash reaper eventually re-streams it. Here we self-heal
+        proactively on every poll: a step is authoritatively DONE when its result meta is
+        committed AND its compute payload is gone (exactly the post-`_publish_batch`
+        state), so we move any such OUTSTANDING step to done. An in-flight recompute still
+        has a live payload, so it's left running (no false positive); errored steps have
+        no meta, so they're untouched. Bounded to the outstanding set and skipped when
+        nothing is outstanding (idle poll stays a single Dict.get). Two backend listings,
+        best-effort; mutates + saves `st` in place only when it actually heals a clobber."""
+        outstanding = set(st.get("queued", [])) | set(st.get("running", []))
+        if not outstanding:
+            return
+        committed = _committed_result_evs(h)
+        healed = outstanding & committed
+        if not healed:
+            return
+        healed -= _pending_job_evs(h)  # a re-queued/recomputing step keeps its payload → not done yet
+        if not healed:
+            return
+        for ev in healed:
+            _list_remove(st, "queued", ev)
+            _list_remove(st, "running", ev)
+            st.get("errors", {}).pop(str(ev), None)
+            _list_add(st, "done", ev)
+        _cell_save(h, st)
+
     def _reap_stale(st: dict[str, Any], h: str) -> None:
         """Recover from a dead consumer (crash / redeploy): if the lease has expired
         while steps are still outstanding, re-stream them and re-spawn a consumer.
@@ -1235,23 +1432,29 @@ if _HAS_MODAL:
         always harmless (at worst one duplicate forward)."""
         outstanding = list(st.get("queued", [])) + list(st.get("running", []))
         model_id = (st.get("ident") or {}).get("model_id")
-        if not outstanding or not model_id or _lease_alive(model_id):
+        if not outstanding or not model_id or _any_consumer_alive(model_id):
             return
         for ev in outstanding:
             job_queue.put({"cell_hash": h, "event_index": int(ev), "model_id": model_id},
                           partition=_part(model_id))
-        _ensure_consumer(model_id)
+        _ensure_consumers(model_id, _desired_consumers(model_id, max(_partition_depth(model_id), len(outstanding))))
 
     _COMMIT_EVERY = 4          # commit at most this many computes between Volume syncs
     _COMMIT_INTERVAL_S = 1.5   # …or this long, so results stay fresh during slow bursts
     _JOB_READ_RETRIES = 6      # payload targeted-read attempts before giving up (backend lag)
     _JOB_READ_BACKOFF_S = 0.5  # …spaced this far apart (~3s total) — enqueue commits before streaming
 
-    def _worker_consume(self, model_id: str) -> str:
+    def _worker_consume(self, model_id: str, slot: int = 0) -> str:
         """Long-running GPU consumer: stream jobs off the durable queue and compute
         each (the model stays warm). It's a TRACKED Modal input (not a background
         task), so Modal won't recycle it out from under an in-flight forward — the
         bug behind the old cancellation storm.
+
+        `slot` is this consumer's index in the model's pool (0…cap−1); it holds the
+        `consumer:{model_id}:{slot}` lease for its whole life. Several slots drain the
+        SAME partition concurrently (each `job_queue.get` pops a distinct ref), so the
+        FIFO splits across the pool. The per-step dedup (`seen` + result-blob adoption)
+        is idempotent, so overlapping consumers never double-compute a request.
 
         Keeping the GPU FED is the priority here: a Volume `reload`/`commit` costs
         100s of ms–seconds, so doing one per job (as before) left the GPU idling in
@@ -1273,15 +1476,15 @@ if _HAS_MODAL:
         # Background lease heartbeat: beat immediately, then every interval for the
         # consumer's WHOLE life. A single forward (cold load + long trace) blocks the
         # main thread for minutes, but CUDA releases the GIL, so this thread keeps the
-        # lease alive — the reaper never mistakes a busy consumer for dead and can't
-        # spawn a second one. Runs strictly one forward at a time (single container).
+        # slot lease alive — the reaper never mistakes a busy slot for dead and can't
+        # re-spawn onto it. Each container runs strictly one forward at a time.
         _stop = threading.Event()
 
         def _beat_loop() -> None:
-            _lease_beat(model_id)
+            _slot_beat(model_id, slot)
             while not _stop.wait(_LEASE_BEAT_INTERVAL_S):
                 try:
-                    _lease_beat(model_id)
+                    _slot_beat(model_id, slot)
                 except Exception:  # noqa: BLE001 — a missed beat is recovered on the next tick
                     pass
 
@@ -1345,7 +1548,7 @@ if _HAS_MODAL:
                 return None
 
         _beater.start()  # keep the lease warm for the whole drain (esp. long forwards)
-        _log("consumer start", model=model_id, part=part)
+        _log("consumer start", model=model_id, part=part, slot=slot)
         try:
             while True:
                 # Drain everything immediately available back-to-back; only when the
@@ -1408,16 +1611,16 @@ if _HAS_MODAL:
                     _flush()
         finally:
             # Stop the heartbeat, publish anything still staged, then ALWAYS relinquish
-            # the lease — clean idle-exit OR crash — so the next enqueue/poll re-spawns
-            # a consumer instead of jobs sitting queued until the TTL fallback expires.
+            # this slot's lease — clean idle-exit OR crash — so the next enqueue/poll can
+            # re-spawn onto it instead of jobs sitting queued until the TTL fallback.
             _stop.set()
             _beater.join(timeout=2.0)
             try:
                 _flush()
             finally:
                 _gpu_cleanup(self._torch)  # leave the GPU clean for the next consume/model
-                _lease_clear(model_id)
-        _log("consumer exit", model=model_id, processed=processed)
+                _slot_clear(model_id, slot)
+        _log("consumer exit", model=model_id, processed=processed, slot=slot)
         return f"drained {processed}"
 
     # A second image tier for the big models: Blackwell-capable torch (B200) +
@@ -1436,6 +1639,30 @@ if _HAS_MODAL:
     big_image = (
         modal.Image.debian_slim(python_version="3.12")
         .pip_install("torch>=2.7.0", index_url="https://download.pytorch.org/whl/cu128")
+        .pip_install(
+            "transformers>=5.2.0", "accelerate>=1.2",
+            "numpy>=2.0", "hf_transfer>=0.1.8", "fastapi[standard]",
+        )
+        .env({
+            "HF_HOME": HF_CACHE,
+            "HF_HUB_ENABLE_HF_TRANSFER": "1",
+            "PYTHONPATH": "/root:/root/app/attention",
+            "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
+        })
+        .add_local_dir(_attn_dir.as_posix(), "/root/app/attention", ignore=["**/__pycache__/**", "**/*.pyc"])
+    )
+
+    # B300 (Blackwell Ultra) is compute capability sm_103, which nvcc 12.8 CAN'T
+    # emit — so the cu128 `big_image` above has no B300 kernels and every op there
+    # dies with "unspecified launch failure". This TWIN builds torch from the CUDA
+    # 12.9 index (sm_103 via the sm_10x family target + cuDNN 9.11+ Blackwell SDPA).
+    # ONLY WorkerB300x2 uses it, so the proven cu128 B200 tiers are untouched. We run
+    # an EAGER transformers forward + F.scaled_dot_product_attention (no torch.compile
+    # / Inductor), so we sidestep the known stable-torch Triton/ptxas `sm_103` gap; if
+    # a Triton path ever sneaks in, bump this to a torch nightly (>= 2.11.dev).
+    big_image_b300 = (
+        modal.Image.debian_slim(python_version="3.12")
+        .pip_install("torch>=2.9.0", index_url="https://download.pytorch.org/whl/cu129")
         .pip_install(
             "transformers>=5.2.0", "accelerate>=1.2",
             "numpy>=2.0", "hf_transfer>=0.1.8", "fastapi[standard]",
@@ -1485,17 +1712,26 @@ if _HAS_MODAL:
         # 1 GPU -> everything on cuda; multi-GPU tier -> pipeline-shard (device_map=auto).
         device_map = "auto" if (spec and reg.n_gpus(spec.gpu) > 1) else "cuda"
         kw = dict(dtype=torch.bfloat16, attn_implementation=SCENE_ATTN_IMPL, device_map=device_map, token=token)
-        # Cap the per-GPU WEIGHT budget so a fixed headroom stays free on every
-        # device for the forward's activations + lm-head window + captured Q (see
-        # _WEIGHT_HEADROOM_GIB) — otherwise auto packs GPU 0 and a long trace OOMs it.
+        # Cap the per-GPU WEIGHT budget so device_map splits the model EVENLY,
+        # leaving each GPU headroom for the forward's activations + lm-head window +
+        # captured Q. With a KNOWN weight size (spec.approx_weights_gib) cap each GPU
+        # at ~weights/nGPU — this forces auto to spill onto the next GPU instead of
+        # packing GPU 0, and is TIER-INDEPENDENT (the same ~125 GB cap balances a
+        # 178 GB B200 or a 288 GB B300; a fixed `total - reserve` cap on a big card
+        # is so high it packs GPU 0 and OOMs the forward). Else fall back to the
+        # fixed reserve.
         if device_map == "auto" and torch.cuda.is_available():
             gib = float(2**30)
+            ngpu = max(1, torch.cuda.device_count())
+            approx = float(getattr(spec, "approx_weights_gib", 0) or 0) if spec else 0.0
             budget = {}
-            for i in range(torch.cuda.device_count()):
+            for i in range(ngpu):
                 _, total = torch.cuda.mem_get_info(i)
-                budget[i] = f"{max(total / gib - _WEIGHT_HEADROOM_GIB, 8.0):.0f}GiB"
+                cap = (approx / ngpu) * 1.05 if approx > 0 else (total / gib - _WEIGHT_HEADROOM_GIB)
+                budget[i] = f"{max(cap, 8.0):.0f}GiB"
             kw["max_memory"] = budget
-            _log("device_map=auto weight budget", reserve_gib=_WEIGHT_HEADROOM_GIB, budget=budget)
+            _log("device_map weight budget", approx_weights_gib=approx,
+                 reserve_gib=_WEIGHT_HEADROOM_GIB, budget=budget)
         _log("loading model", model=model_id, loader=(spec.loader if spec else "causal_lm"),
              device_map=device_map, glayers=len(glayers))
         # VL checkpoints (Qwen3_5MoeForConditionalGeneration, multimodal Gemma) may
@@ -1635,9 +1871,11 @@ if _HAS_MODAL:
     def _worker_ping(self) -> str:
         return "ok"
 
-    # Shared @app.cls kwargs. SINGLE container per tier (no `@modal.concurrent` on
-    # the class) -> Modal runs spawned `analyze` calls FIFO, never two forwards at
-    # once (VRAM-safe). include_source=False: the image already ships app/attention.
+    # Shared @app.cls kwargs. NO `@modal.concurrent` on the class -> each container
+    # runs spawned calls FIFO, never two forwards at once (VRAM-safe); throughput
+    # instead comes from running SEVERAL containers (one per consumer slot), capped
+    # per tier by `max_containers` = `_MAX_CONSUMERS_BY_GPU[tier]` (set per class
+    # below). include_source=False: the image already ships app/attention.
     # cpu: give the post-processing real cores. Between forwards the GPU idles while
     # the CPU takes the top-k, builds per-token records, and JSON-serializes the
     # result; the default fractional CPU reservation makes that tail dominate — and
@@ -1648,12 +1886,14 @@ if _HAS_MODAL:
     # device->host transfer (one sync/step) so the CPU isn't also blocked on the GPU.
     _WORKER_KW: dict[str, Any] = dict(
         volumes={HF_CACHE: hf_cache, ATTN_BLOBS: attn_vol}, secrets=[hf_secret], timeout=3600,
-        max_containers=1, include_source=False, cpu=16.0,
+        include_source=False, cpu=16.0,
     )
 
-    @app.cls(gpu="H200", image=image, scaledown_window=360, memory=131072, **_WORKER_KW)
+    @app.cls(gpu="H200", image=image, scaledown_window=360, memory=131072,
+             max_containers=_MAX_CONSUMERS_BY_GPU["H200"], **_WORKER_KW)
     class WorkerH200:
-        """Single-H200 tier: Gemma-31b and similar (<=~70 GB bf16). Idle-killed at 6 min."""
+        """Single-H200 tier: Gemma-31b and similar (<=~70 GB bf16). Idle-killed at 6 min.
+        Fans out to up to `_MAX_CONSUMERS_BY_GPU["H200"]` containers under load."""
         model_id: str = modal.parameter(default=DEFAULT_MODEL_ID)
 
         @modal.enter()
@@ -1669,17 +1909,20 @@ if _HAS_MODAL:
             return _worker_analyze_many(self, items)
 
         @modal.method()
-        def consume(self, model_id: str) -> str:
-            return _worker_consume(self, model_id)
+        def consume(self, model_id: str, slot: int = 0) -> str:
+            return _worker_consume(self, model_id, slot)
 
         @modal.method()
         def ping(self) -> str:
             return _worker_ping(self)
 
-    @app.cls(gpu="B200:2", image=big_image, scaledown_window=600, memory=262144, **_WORKER_KW)
+    @app.cls(gpu="B200:2", image=big_image, scaledown_window=600, memory=262144,
+             max_containers=_MAX_CONSUMERS_BY_GPU["B200:2"], **_WORKER_KW)
     class WorkerB200x2:
         """Two-B200 tier (device_map=auto) for ~100-130B MoE models like
-        Qwen3.5-122B-A10B (~244 GB bf16). Longer idle window (pricier cold load)."""
+        Qwen3.5-122B-A10B (~244 GB bf16). Longer idle window (pricier cold load). Fans
+        out to up to `_MAX_CONSUMERS_BY_GPU["B200:2"]` containers — each a whole 2×B200
+        box, so the cap of 4 tops out at 8×B200 total under a deep queue."""
         model_id: str = modal.parameter(default="Qwen/Qwen3.5-122B-A10B")
 
         @modal.enter()
@@ -1695,8 +1938,65 @@ if _HAS_MODAL:
             return _worker_analyze_many(self, items)
 
         @modal.method()
-        def consume(self, model_id: str) -> str:
-            return _worker_consume(self, model_id)
+        def consume(self, model_id: str, slot: int = 0) -> str:
+            return _worker_consume(self, model_id, slot)
+
+        @modal.method()
+        def ping(self) -> str:
+            return _worker_ping(self)
+
+    @app.cls(gpu="B200:3", image=big_image, scaledown_window=600, memory=262144,
+             max_containers=_MAX_CONSUMERS_BY_GPU["B200:3"], **_WORKER_KW)
+    class WorkerB200x3:
+        """Three-B200 (~534 GB) tier for the big MoE — the proven Blackwell kernels
+        of B200:2 with a 3rd card so the largest end-steps (~200k+ tokens) fit: the
+        even-split weight budget puts ~83 GB/GPU, leaving ~95 GB/card for the
+        forward. Same big_image (cu128) as B200:2."""
+        model_id: str = modal.parameter(default="Qwen/Qwen3.5-122B-A10B")
+
+        @modal.enter()
+        def load(self) -> None:
+            _worker_load(self)
+
+        @modal.method()
+        def analyze(self, item: dict[str, Any]) -> dict[str, Any]:
+            return _worker_analyze(self, item)
+
+        @modal.method()
+        def analyze_many(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return _worker_analyze_many(self, items)
+
+        @modal.method()
+        def consume(self, model_id: str, slot: int = 0) -> str:
+            return _worker_consume(self, model_id, slot)
+
+        @modal.method()
+        def ping(self) -> str:
+            return _worker_ping(self)
+
+    @app.cls(gpu="B300:2", image=big_image_b300, scaledown_window=600, memory=262144,
+             max_containers=_MAX_CONSUMERS_BY_GPU["B300:2"], **_WORKER_KW)
+    class WorkerB300x2:
+        """Two-B300 (Blackwell Ultra, ~288 GB/GPU → ~576 GB) tier. Uses
+        `big_image_b300` (cu129) — B300 is sm_103, which the cu128 image can't
+        target. Experimental until validated on B300; qwen stays on B200:3 until then."""
+        model_id: str = modal.parameter(default="Qwen/Qwen3.5-122B-A10B")
+
+        @modal.enter()
+        def load(self) -> None:
+            _worker_load(self)
+
+        @modal.method()
+        def analyze(self, item: dict[str, Any]) -> dict[str, Any]:
+            return _worker_analyze(self, item)
+
+        @modal.method()
+        def analyze_many(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return _worker_analyze_many(self, items)
+
+        @modal.method()
+        def consume(self, model_id: str, slot: int = 0) -> str:
+            return _worker_consume(self, model_id, slot)
 
         @modal.method()
         def ping(self) -> str:
@@ -1704,7 +2004,10 @@ if _HAS_MODAL:
 
     # GPU tier -> worker class. The web endpoint routes each model to its tier
     # (from the model's OpenModelSpec.gpu). Add a tier here to support a new GPU size.
-    _WORKER_BY_GPU: dict[str, Any] = {"H200": WorkerH200, "B200:2": WorkerB200x2}
+    _WORKER_BY_GPU: dict[str, Any] = {
+        "H200": WorkerH200, "B200:2": WorkerB200x2, "B200:3": WorkerB200x3,
+        "B300:2": WorkerB300x2,
+    }
 
     @app.function(image=image, volumes={HF_CACHE: hf_cache}, secrets=[hf_secret], timeout=3600, include_source=False)
     def prefetch(model_id: str = DEFAULT_MODEL_ID) -> str:
@@ -1786,10 +2089,11 @@ if _HAS_MODAL:
         web_app = fastapi.FastAPI(title="starshot-attention", docs_url="/docs")
 
         # A fresh web container == a fresh deployment (any consumer container from a
-        # previous deploy is already gone), so drop stale consumer leases now. Without
-        # this, a lease no live consumer still holds could suppress `_ensure_consumer`
-        # until its TTL expires — leaving jobs queued-but-never-dispatched right after
-        # a redeploy. Live consumers simply re-beat within one loop iteration.
+        # previous deploy is already gone), so drop ALL stale slot leases now. Without
+        # this, a slot lease no live consumer still holds could suppress
+        # `_ensure_consumers` until its TTL expires — leaving jobs queued-but-never-
+        # dispatched right after a redeploy. Live consumers simply re-beat within one
+        # loop iteration (`clear()` wipes every `consumer:{model}:{slot}` entry).
         try:
             attn_lease.clear()
         except Exception:  # noqa: BLE001 — best-effort; TTL fallback still recovers
@@ -1861,6 +2165,7 @@ if _HAS_MODAL:
             ident = {**ident_in, "model_id": model_id, "prompt_version": prompt_version}
 
             st = _cell_state(h)
+            _reconcile_done(st, h)  # heal any clobbered 'done' before we treat evs as in-flight
             _reap_stale(st, h)  # recover a dead consumer using the doc we already fetched
             active = set(st.get("queued", [])) | set(st.get("running", []))
 
@@ -1910,7 +2215,11 @@ if _HAS_MODAL:
             for ev, req in to_stream:
                 job_queue.put({"cell_hash": h, "event_index": ev, "model_id": model_id, "req": req},
                               partition=_part(model_id))
-            _ensure_consumer(model_id)
+            # Fan out consumers to the current queue depth (up to the tier cap).
+            # Fan out to the WHOLE partition's backlog (all cells), not just this
+            # cell's steps — otherwise 'run all' never scales past one container.
+            depth = max(_partition_depth(model_id), len(st.get("queued", [])))
+            _ensure_consumers(model_id, _desired_consumers(model_id, depth))
             return {"accepted": sorted(ev for ev, _ in to_stream), "cached": [],
                     "already_active": sorted(already_active)}
 
@@ -1947,6 +2256,7 @@ if _HAS_MODAL:
         @web_app.get("/queue")
         def queue_status(cell_hash: str) -> dict[str, Any]:
             st = _cell_state(cell_hash)
+            _reconcile_done(st, cell_hash)
             _reap_stale(st, cell_hash)
             return {
                 "queued": st.get("queued", []),
@@ -1959,17 +2269,22 @@ if _HAS_MODAL:
         @web_app.post("/pull")
         def pull(payload: dict[str, Any]) -> dict[str, Any]:
             """FAST status poll — the whole cell's queue metadata in ONE `Dict.get`.
-            NO Volume reload, NO blob reads: finished steps are just listed in `done`,
-            and the caller fetches their (large) result blobs separately via `/results`,
-            so the frequent poll stays cheap and never blocks on IO."""
+            NO Volume reload and NO big-blob reads: finished steps are just listed in
+            `done`, and the caller fetches their (large) result blobs separately via
+            `/results`, so the frequent poll stays cheap. When steps ARE outstanding it
+            also does a bounded `_reconcile_done` (two cheap backend LISTINGS, no content
+            reads) to heal any `done` marker a fan-out RMW race clobbered; an idle poll
+            (nothing outstanding) skips even that and stays a single `Dict.get`."""
             h = str(payload["cell_hash"])
             st = _cell_state(h)
+            _reconcile_done(st, h)  # converge 'done' from durable Volume truth (fan-out self-heal)
             _reap_stale(st, h)
-            # Keep the GPU consumer alive if there's still queued work to stream.
+            # Keep the consumer pool sized to the queue while there's work to stream.
             if st.get("queued"):
                 mid = (st.get("ident") or {}).get("model_id")
                 if mid:
-                    _ensure_consumer(mid)
+                    depth = max(_partition_depth(mid), len(st.get("queued", [])))
+                    _ensure_consumers(mid, _desired_consumers(mid, depth))
             return {
                 "queued": st.get("queued", []),
                 "running": st.get("running", []),

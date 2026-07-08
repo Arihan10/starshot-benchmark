@@ -41,7 +41,14 @@ from typing import Any
 #   6: generation-progression bucket resolution raised (48 → 128) — the buckets are
 #      part of the stored analysis, so bump the freshness gate (is_reusable only
 #      checks ANALYSIS_VERSION) to recompute; powers the "per feature" region view.
-ANALYSIS_VERSION = 6
+#   7: per-OBJECT attribute split retained on `scene.entityTotals` (each entity now
+#      carries its own `components: [{component, score}]`, not just the marginal
+#      `componentTotals`). Powers the ablation "scene ordering" graph 2 (attention to
+#      a SPECIFIC attribute of an object vs its position). This is the ablation
+#      system's version gate: older results predate the per-object split, so they go
+#      stale and a recompute resolves them (the version is also part of the GPU
+#      dedup `req_token`, so recompute actually re-derives instead of reusing).
+ANALYSIS_VERSION = 7
 
 # Version of the region/type/progression aggregate view (`AnalysisResult.buckets`).
 # Recorded in `meta.agg_version` and folded into the compute-request identity
