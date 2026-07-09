@@ -211,6 +211,13 @@ def validate_version(name: str) -> None:
     _load_dir(VERSIONS_DIR / name, name)
 
 
+def load_version(name: str) -> PromptSet:
+    """The source version `name` as a PromptSet — what a simulation branch binds
+    (instead of the run snapshot) when it carries a `version`, so a prompt-set
+    A/B can run one lineage under the run's prompts and another under `name`."""
+    return _load_dir(VERSIONS_DIR / name, name)
+
+
 def snapshot_into_run(version: str, run_dir: Path) -> None:
     """Copy the source version folder into the run as its immutable snapshot."""
     shutil.copytree(VERSIONS_DIR / version, run_dir / RUN_PROMPTS_SUBDIR)

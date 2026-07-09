@@ -60,17 +60,19 @@ MODELS: dict[str, str] = {
     "deepseek": "deepseek/deepseek-v4-pro",
     "opus-new": "anthropic/claude-opus-4.8",
     "opus-fable": "anthropic/claude-fable-latest",
+    "grokky": "x-ai/grok-4.5",
     "glm": "z-ai/glm-5.2",
     "qwen": "qwen/qwen3.7-max",
     "kimi": "moonshotai/kimi-k2-thinking",
     "sonnet": "anthropic/claude-sonnet-4.6",
     "sonnet-new": "anthropic/claude-sonnet-5",
     "minimax": "minimax/minimax-m3",
-    "gemma": "google/gemma-4-31b-it"
+    "gemma": "google/gemma-4-31b-it",
+    "hy3": "tencent/hy3"
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())
 
-DEFAULT_MODEL_ALIAS = "gemini-flash"
+DEFAULT_MODEL_ALIAS = "gemini-flash-lite"
 
 DEFAULT_MODEL = MODELS[DEFAULT_MODEL_ALIAS]

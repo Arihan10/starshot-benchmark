@@ -211,6 +211,9 @@ class Branch:
     overrides: dict[str, dict[str, str]]
     log: SlotLog
     model_pin: str | None = None
+    # A source version this branch runs under instead of the run snapshot — the
+    # prompt-set A/B lineage (None ⇒ the run's current prompts).
+    version: str | None = None
     task: asyncio.Task[None] | None = None
     gate: "CellGate | None" = None
     # Next-launch gate intent for a PAUSED branch (budget / auto / until /
@@ -538,6 +541,9 @@ class BranchRequest(BaseModel):
     overrides: dict[str, dict[str, str]]
     seed: BranchSeed | None = None
     model: str | None = None
+    # Run this branch under a source version instead of the run snapshot — the
+    # prompt-set A/B lineage (the current-version lineage omits it).
+    version: str | None = None
 
 
 class BranchStepRequest(BaseModel):
@@ -656,6 +662,22 @@ class CopySlotRequest(BaseModel):
 
     source_run: str
     slot: str
+
+
+class CopyCellRequest(BaseModel):
+    """Copy ONE (slot, model) cell — its whole event log + meshes/images — from
+    `(source_run, slot, source_model)` into `(run, slot, dest_model)`,
+    OVERWRITING the destination cell. The slot is shared (a cell's content is
+    scene-specific), but the run and/or model may differ, so this covers cross-
+    model within a run, cross-run, or both. The source cell is untouched, and
+    the copy keeps the source model on its run.start/cache.llm events so
+    cost/usage stay attributed to the model that did the work — only object/
+    image URLs are repointed at the destination path."""
+
+    source_run: str
+    slot: str
+    source_model: str
+    dest_model: str
 
 
 def _root_plan_cut(
@@ -982,6 +1004,7 @@ def _branch_manifest(br: Branch) -> dict[str, object]:
         "fork_index": br.fork_index,
         "overrides": br.overrides,
         "model_pin": br.model_pin,
+        "version": br.version,
     }
 
 
@@ -1009,6 +1032,9 @@ def _branch_summary(br: Branch) -> dict[str, object]:
         # The alias this branch's steps are pinned to (compare's per-LLM
         # lineage), or None when it runs on the cell's base model.
         "pin": next((a for a, m in MODELS.items() if m == br.model_pin), None),
+        # The source version this lineage runs under (the prompt-set A/B), or
+        # None for the run's current prompts.
+        "version": br.version,
         "status": _branch_status(br),
         "events_count": len(bevents),
         "last_step": _last_step(bevents),
@@ -1489,6 +1515,7 @@ def _hydrate_branches(run: str) -> None:
             overrides=data["overrides"] if isinstance(data.get("overrides"), dict) else {},
             log=blog,
             model_pin=data.get("model_pin") if isinstance(data.get("model_pin"), str) else None,
+            version=data.get("version") if isinstance(data.get("version"), str) else None,
         )
 
 
@@ -3066,6 +3093,8 @@ def create_app() -> FastAPI:
         _validate_overrides(req.overrides)
         if req.model is not None and req.model not in MODELS:
             raise HTTPException(status_code=400, detail=f"unknown model: {req.model}")
+        if req.version is not None and not prompt_store.version_exists(req.version):
+            raise HTTPException(status_code=404, detail=f"unknown prompt version: {req.version}")
         # A pinned LLM lineage runs its forked step immediately (gate budget 1)
         # then parks; an unpinned branch pauses AT the forked step for a manual
         # step on the base model.
@@ -3075,6 +3104,7 @@ def create_app() -> FastAPI:
             event_index=req.event_index, step=req.step,
             overrides=req.overrides, seed=req.seed,
             model_pin=pin, gate_budget=1 if pin else 0,
+            version=req.version,
         )
         return {
             "branch": _branch_summary(br),
@@ -3763,6 +3793,83 @@ def create_app() -> FastAPI:
             "source_run": source_run,
             "slot": slot.id,
             "copied": copied,
+            "replaced": replaced,
+        }
+
+    @app.post("/runs/{run}/copy-cell")
+    async def copy_cell(run: str, req: CopyCellRequest) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Copy one (slot, model) cell into `(run, slot, dest_model)`, overwriting
+        it. Source and destination may differ in run and/or model; the slot is
+        shared. The destination cell's live task / generation / branches are torn
+        down first (as reset does), then the source cell dir is copied over and its
+        object/image URLs are repointed to the destination path so meshes/images
+        resolve here. The source is untouched; model fields are left as the
+        source's, so cost/usage stay attributed to the model that produced them
+        (a later resume runs the destination model — it's alias-derived)."""
+        dest_run = run
+        slot = _require_slot(req.slot)
+        _require_model(req.source_model)
+        _require_model(req.dest_model)
+        source_run = req.source_run
+        if source_run == dest_run and req.source_model == req.dest_model:
+            raise HTTPException(status_code=400, detail="source and destination are the same cell")
+        if not _run_dir(source_run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown source run: {source_run}")
+        if not _run_dir(dest_run).is_dir():
+            raise HTTPException(status_code=404, detail=f"unknown run: {dest_run}")
+        src_cell_dir = _slot_dir(source_run, slot.id, req.source_model)
+        if not (src_cell_dir / "events.jsonl").is_file():
+            raise HTTPException(
+                status_code=400,
+                detail=f"cell {slot.id}/{req.source_model} has no data in run {source_run!r}",
+            )
+        _hydrate_run(source_run)
+        _hydrate_run(dest_run)
+        # Tear down the destination cell so nothing writes into the dir we're about
+        # to replace (the same teardown reset does), noting whether it held data.
+        dest_key: RunKey = (dest_run, slot.id, req.dest_model)
+        dest_log = _slot_logs.get(dest_key)
+        replaced = bool(dest_log is not None and dest_log.state["events"])
+        await _discard_branches_of_cell(dest_run, slot.id, req.dest_model)
+        await _cancel_task(dest_run, slot.id, req.dest_model)
+        await _cancel_cell_generation(dest_run, slot.id, req.dest_model)
+        _set_stepped(dest_key, False)
+        _gate_intents.pop(dest_key, None)
+        if dest_log is not None:
+            dest_log.close()
+            _slot_logs.pop(dest_key, None)
+        dest_cell_dir = _slot_dir(dest_run, slot.id, req.dest_model)
+
+        def _copy() -> None:
+            shutil.rmtree(dest_cell_dir, ignore_errors=True)
+            shutil.copytree(src_cell_dir, dest_cell_dir)
+            # Repoint object/image URLs from the source cell path to the dest's —
+            # both the run and the model segment change (GLBs load by id from the
+            # bundle regardless; this keeps image-hover URLs valid + self-contained).
+            events_path = dest_cell_dir / "events.jsonl"
+            src_seg = f"/{source_run}/{slot.id}/{req.source_model}/objects/"
+            dst_seg = f"/{dest_run}/{slot.id}/{req.dest_model}/objects/"
+            text = events_path.read_text(encoding="utf-8")
+            if src_seg in text:
+                events_path.write_text(text.replace(src_seg, dst_seg), encoding="utf-8")
+
+        await asyncio.to_thread(_copy)
+        # Rebuild the destination cell's SlotLog from the copied log (mirrors
+        # _hydrate_run for one cell), restoring any stepped marker the copy brought
+        # over. Nothing auto-launches — it comes in whatever state its log implies.
+        new_log = SlotLog(_run_id(dest_run, slot.id, req.dest_model), dest_cell_dir / "events.jsonl")
+        new_log.hydrate_from_disk()
+        _slot_logs[dest_key] = new_log
+        _maybe_launch(slot, req.dest_model, new_log)
+        if (dest_cell_dir / ".stepped").exists():
+            _stepped_cells.add(dest_key)
+        return {
+            "run": dest_run,
+            "source_run": source_run,
+            "slot": slot.id,
+            "source_model": req.source_model,
+            "dest_model": req.dest_model,
+            "events": len(new_log.state["events"]),
             "replaced": replaced,
         }
 
@@ -4496,6 +4603,7 @@ async def _fork_branch(
     parent: str | None = None,
     model_pin: str | None = None,
     gate_budget: int = 0,
+    version: str | None = None,
 ) -> Branch:
     """Fork a new simulation branch (allocating a fresh id) and start it gated.
     Many forks of one cell coexist — nothing prior is discarded.
@@ -4591,7 +4699,7 @@ async def _fork_branch(
         id=bid, run=run, slot=slot_id, model=model_alias,
         parent=parent, fork_index=event_index,
         overrides={s: dict(r) for s, r in overrides.items()},
-        log=blog, model_pin=model_pin,
+        log=blog, model_pin=model_pin, version=version,
         gate_intent={"budget": gate_budget} if gate_budget else {},
     )
     _branches[bid] = br
@@ -4669,7 +4777,10 @@ async def _run_branch(branch_id: str) -> None:
     model = blog.state["model"]
     brun_id = blog.slot_id  # composite branch run_id (<run>/_branches/<bid>)
     try:
-        base = prompt_store.load_run_prompts(_run_dir(br.run))
+        # A branch runs under its `version` (the prompt-set A/B lineage) when set,
+        # else the run's own snapshot — with the lab's overrides layered on either.
+        base = (prompt_store.load_version(br.version) if br.version
+                else prompt_store.load_run_prompts(_run_dir(br.run)))
         prompt_store.bind(base.with_overrides(br.overrides))
         await divider.run(run_id=brun_id, prompt=prompt, model=model, runs_dir=RUNS_DIR)
     except asyncio.CancelledError:
