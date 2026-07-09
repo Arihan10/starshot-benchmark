@@ -1678,6 +1678,74 @@
 				color: var(--text-dim);
 				flex-shrink: 0;
 			}
+			/* Jump-to-node search: an input + a floating matches dropdown that
+			   overlays the tree below it (absolute, so it never reflows the dock). */
+			.obs-search {
+				position: relative;
+				padding: 6px 10px;
+				border-bottom: 1px solid var(--line-2);
+				flex-shrink: 0;
+			}
+			.obs-search-input {
+				width: 100%;
+				box-sizing: border-box;
+				background: #0c0d10;
+				border: 1px solid var(--line-2);
+				border-radius: 4px;
+				color: var(--text);
+				font: 11px ui-monospace, SFMono-Regular, Menlo, monospace;
+				padding: 4px 8px;
+				outline: none;
+			}
+			.obs-search-input:focus {
+				border-color: var(--accent-line);
+			}
+			.obs-search-input::placeholder {
+				color: var(--text-faint);
+			}
+			.obs-search-results {
+				display: none;
+				position: absolute;
+				left: 10px;
+				right: 10px;
+				top: 100%;
+				margin-top: 2px;
+				z-index: 30;
+				background: #16181d;
+				border: 1px solid var(--line-2);
+				border-radius: 4px;
+				max-height: 40vh;
+				overflow: auto;
+				box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+			}
+			.obs-search-results.open {
+				display: block;
+			}
+			.obs-search-hit {
+				display: flex;
+				align-items: center;
+				gap: 7px;
+				padding: 4px 8px;
+				cursor: pointer;
+				color: var(--text-dim);
+			}
+			.obs-search-hit:hover,
+			.obs-search-hit.active {
+				background: #1d2027;
+			}
+			.obs-search-hit .node-id {
+				font-weight: 600;
+			}
+			.obs-search-hit .node-kind {
+				color: var(--text-faint);
+				font-size: 10px;
+				margin-left: auto;
+			}
+			.obs-search-empty {
+				padding: 6px 8px;
+				color: var(--text-faint);
+				font-size: 11px;
+			}
 			.obs-pinned {
 				border-bottom: 1px solid var(--line);
 				background: #191527;
@@ -2908,6 +2976,16 @@
 				flex-shrink: 0;
 				flex-wrap: wrap;
 			}
+			.lab-cmp-ver {
+				display: inline-flex;
+				align-items: center;
+				gap: 4px;
+				font-size: 11px;
+				color: var(--text-dim);
+			}
+			.lab-cmp-ver select {
+				font-size: 11px;
+			}
 			#lab-actions .count {
 				color: var(--text-faint);
 				margin-right: auto;
@@ -3290,6 +3368,10 @@
 			.rv-card .rv-meta {
 				color: var(--text-faint);
 				font-size: 10px;
+			}
+			.rv-card .rv-version {
+				color: var(--accent);
+				font-weight: 600;
 			}
 			/* Sections stack vertically so each (input / output / system /
                reasoning) spans the card's full width — the visible set is
@@ -4083,6 +4165,12 @@
 			>
 				copy slot…
 			</button>
+			<button
+				id="btn-copy-cell"
+				title="Copy one slot's cell from one model (or run) into another model (or run), overwriting the destination cell"
+			>
+				copy cell…
+			</button>
 			<span id="status-text"></span>
 			<div id="cost-tracker" class="collapsed">
 				<button
@@ -4158,7 +4246,7 @@
 							zone layers
 						</button>
 						<button id="btn-unhide-all" title="un-hide every manually hidden object / zone">unhide all</button>
-						<button id="btn-camera-mode" title="First-person camera (mouse-look). Click to enter · WASD move · Space/Shift up·down · Caps Lock sprint · Esc to exit">first-person</button>
+						<button id="btn-camera-mode" title="First-person camera (mouse-look). Click to enter · WASD move (W follows look) · Q/E down·up · Shift sprint · Esc to exit">first-person</button>
 						<button id="btn-refit">refit</button>
 					</div>
 					<div id="zone-layers-legend" style="display: none"></div>
@@ -4284,6 +4372,15 @@
 					<div id="lab-actions">
 						<span class="count" id="lab-sel-count">0 selected</span>
 						<span class="muted" id="lab-test-summary"></span>
+						<label
+							class="lab-cmp-ver"
+							title="Also run each simulation under a second prompt version, side by side with the current one — pick a version from versions/"
+						>
+							vs version
+							<select id="lab-compare-version">
+								<option value="">none</option>
+							</select>
+						</label>
 						<button
 							id="lab-test"
 							class="primary"

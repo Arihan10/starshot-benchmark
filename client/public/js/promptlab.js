@@ -33,6 +33,7 @@ const reviewSectionsEl = document.getElementById("lab-sections");
 const reviewColsEl = document.getElementById("lab-cols");
 const reviewTestSummaryEl = document.getElementById("lab-test-summary");
 const labStepAllEl = document.getElementById("lab-step-all");
+const compareVerSel = document.getElementById("lab-compare-version");
 
 // Which text sections the review cards show, and how many cards per row —
 // the comparison view's "fill the space with what I care about" controls.
@@ -101,6 +102,13 @@ export function initLab() {
   labStepAllEl.addEventListener("click", stepAllCells);
   labStepAllEl.after(labUntilEl);
   labUntilEl.after(labExitEl);
+  // The "vs version" A/B picker: simulate forks an extra lineage per target
+  // under this version, side by side with the run's current prompts.
+  compareVerSel.addEventListener("change", () => {
+    state.lab.compareVersion = compareVerSel.value || null;
+    renderGrid();
+    updateActionBar();
+  });
   document.getElementById("lab-apply").addEventListener("click", applyToRunModal);
   document.getElementById("lab-save-version").addEventListener("click", saveVersionModal);
   document.getElementById("lab-save-run").addEventListener("click", saveRunModal);
@@ -157,12 +165,28 @@ export async function openLab() {
   labEl.classList.add("open");
   renderReviewControls();
   applyReviewCols();
+  await populateCompareVersions();
   renderSteps();
   updateSelectionSummary();
   if (!lab.step) selectStep(lab.templates.keys().next().value);
   else selectStep(lab.step, { keepSelection: true });
   updateStepAllButtons();
   renderSims();
+}
+
+// Fill the "vs version" picker from versions/, keeping the current pick if it
+// still exists. The chosen version is the prompt set each simulation A/Bs the
+// run's current prompts against (null ⇒ single-version simulate).
+async function populateCompareVersions() {
+  let versions = [];
+  try { versions = (await api.versions()).versions.map((v) => v.name); }
+  catch { versions = []; }
+  const cur = state.lab.compareVersion;
+  compareVerSel.textContent = "";
+  compareVerSel.appendChild(el("option", { value: "", text: "none" }));
+  for (const v of versions) compareVerSel.appendChild(el("option", { value: v, text: v }));
+  compareVerSel.value = cur && versions.includes(cur) ? cur : "";
+  state.lab.compareVersion = compareVerSel.value || null;
 }
 
 function draftFor(step) {
@@ -905,6 +929,47 @@ function setReview3d(on) {
   renderGrid();
 }
 
+// This cell's version-A/B lineages forked at `ev` — the "current" (run
+// snapshot) branch and the `compareVersion` branch — from the live sims, so the
+// grid can show them as a side-by-side pair. Empty until they're forked.
+function versionLineagesFor(ev) {
+  const cv = state.lab.compareVersion;
+  if (!cv) return [];
+  const verOf = (s) => branchSummaryById(s.id)?.version ?? s.version ?? null;
+  const mine = [...state.lab.sims.values()].filter(
+    (s) => s.slot === ev.slot && s.model === ev.model && s.eventIndex === ev.index,
+  );
+  const cur = mine.find((s) => !verOf(s));
+  const alt = mine.find((s) => verOf(s) === cv);
+  const out = [];
+  if (cur) out.push({ branch: cur.id, label: "current" });
+  if (alt) out.push({ branch: alt.id, label: cv });
+  return out;
+}
+
+// The cards to render for the selection: one per zone-event in text mode; one
+// per cell in 3D — or, in a version A/B with lineages forked, one per
+// (cell, lineage) so "current" and the compared version sit side by side.
+function buildPanels(all) {
+  const cardKey = (ev, tag) =>
+    tag ? `${targetKey(ev.slot, ev.model, ev.index)}#${tag}` : targetKey(ev.slot, ev.model, ev.index);
+  if (!review3d) return all.map((ev) => ({ ev, key: cardKey(ev), branch: null, label: null }));
+  const panels = [];
+  const seen = new Set();
+  for (const ev of all) {
+    const ck = cellKey(ev.slot, ev.model);
+    if (seen.has(ck)) continue;
+    seen.add(ck);
+    const lineages = versionLineagesFor(ev);
+    if (lineages.length) {
+      for (const lin of lineages) panels.push({ ev, key: cardKey(ev, lin.label), branch: lin.branch, label: lin.label });
+    } else {
+      panels.push({ ev, key: cardKey(ev), branch: null, label: null });
+    }
+  }
+  return panels;
+}
+
 function renderGrid() {
   ensureDefaultSelection();
   const lab = state.lab;
@@ -919,32 +984,26 @@ function renderGrid() {
     const ck = cellKey(ev.slot, ev.model);
     zonesPerCell.set(ck, (zonesPerCell.get(ck) ?? 0) + 1);
   }
-  let events = all;
-  if (review3d) {
-    const byCell = new Map();
-    for (const ev of all) {
-      const ck = cellKey(ev.slot, ev.model);
-      if (!byCell.has(ck)) byCell.set(ck, ev);
-    }
-    events = [...byCell.values()];
-  }
-  const wanted = new Set(events.map((e) => targetKey(e.slot, e.model, e.index)));
+  const panels = buildPanels(all);
+  const wanted = new Set(panels.map((p) => p.key));
   for (const [key, ref] of [...reviewCards]) {
     if (!wanted.has(key)) { teardownCard3d(ref); ref.card.remove(); reviewCards.delete(key); }
   }
-  if (events.length === 0) {
+  if (panels.length === 0) {
     gridMessage(lab.selection.size === 0
       ? "no slots selected — use “select slots / zones…” in the top bar to choose which to iterate on."
       : "the selected slots have no calls of this step in their chosen zones.");
   } else {
     reviewGridEl.querySelector(".grid-empty")?.remove();
-    for (const ev of events) {
-      const key = targetKey(ev.slot, ev.model, ev.index);
-      const zoneCount = review3d ? (zonesPerCell.get(cellKey(ev.slot, ev.model)) ?? 1) : 1;
-      let ref = reviewCards.get(key);
+    for (const panel of panels) {
+      const ev = panel.ev;
+      // A version-A/B card is bound to ONE lineage (so it shows only its own
+      // scene); otherwise a 3D card stands for the whole cell (its zone count).
+      const zoneCount = review3d && !panel.label ? (zonesPerCell.get(cellKey(ev.slot, ev.model)) ?? 1) : 1;
+      let ref = reviewCards.get(panel.key);
       if (!ref) {
-        ref = reviewCard(ev, zoneCount);
-        reviewCards.set(key, ref);
+        ref = reviewCard(ev, zoneCount, { branch: panel.branch, label: panel.label });
+        reviewCards.set(panel.key, ref);
         // In 3D mode mount the canvas immediately — it needs the slot's scene,
         // not the step-event text, so don't wait on the fetch.
         if (review3d) renderCardBody(ref);
@@ -966,7 +1025,7 @@ function renderGrid() {
       refreshStepBtn(ref.stepBtn, ev.slot, ev.model);
     }
   }
-  reviewCountEl.textContent = `${events.length} card${events.length === 1 ? "" : "s"}`;
+  reviewCountEl.textContent = `${panels.length} card${panels.length === 1 ? "" : "s"}`;
   updateSelectionSummary();
   updateActionBar();
   updateReviewTestSummary();
@@ -988,7 +1047,7 @@ async function fetchReviewCard(ev, ref, seq) {
   }
 }
 
-function reviewCard(ev, zoneCount = 1) {
+function reviewCard(ev, zoneCount = 1, { branch = null, label = null } = {}) {
   const body = el("div", { class: "rv-body" }, el("div", { class: "rv-loading", text: "loading…" }));
   const cmpBtn = el("button", {
     class: "ev-scene-btn",
@@ -1021,9 +1080,12 @@ function reviewCard(ev, zoneCount = 1) {
     el("div", { class: "rv-head" },
       el("span", { class: "rv-slot", text: ev.slot }),
       el("span", { class: "rv-meta", text: ev.model }),
-      // 3D card stands for the whole cell (one scene); show its zone count.
-      // Text card is per zone-event; show that zone + log index.
-      el("span", { class: "rv-meta", text: zoneCount > 1 ? `${zoneCount} zones` : `${ev.node ?? "?"} · #${ev.index}` }),
+      // A version-A/B card is one lineage of the cell — label it by version
+      // ("current" vs the compared version). Otherwise a 3D card stands for the
+      // whole cell (its zone count); a text card is one zone-event (zone + idx).
+      label
+        ? el("span", { class: "rv-meta rv-version", text: label, title: `simulation under "${label}" prompts` })
+        : el("span", { class: "rv-meta", text: zoneCount > 1 ? `${zoneCount} zones` : `${ev.node ?? "?"} · #${ev.index}` }),
       el("button", {
         class: "ev-scene-btn",
         style: "margin-left:auto",
@@ -1046,6 +1108,9 @@ function reviewCard(ev, zoneCount = 1) {
   );
   return {
     card, body, cmpBtn, simCellBtn, stepBtn, simModelBtn, ev, full: null, preview: ev.output_preview,
+    // A version-A/B card is pinned to ONE lineage (`forceBranch`), labeled by
+    // its version; a plain card follows the cell's latest branch / its source.
+    forceBranch: branch, versionLabel: label,
     // 3D-grid mode: lazily-created per-card viewer + its viewport observer.
     host3d: null, viewer3d: null, io3d: null,
   };
@@ -1177,6 +1242,14 @@ function renderCard3d(ref) {
 // discarded), not only when the source event's output changes.
 function cardSceneState(ref) {
   const { slot, model, index } = ref.ev;
+  // A version-A/B card shows ONLY its bound lineage — its own branch once the
+  // summary is live, else the source (never another lineage) until it appears.
+  if (ref.forceBranch) {
+    const fb = branchSummaryById(ref.forceBranch);
+    if (fb) return { side: "branch", id: fb.id, count: fb.events_count ?? 0, status: fb.status ?? "starting" };
+    const c = cellSummary(slot, model);
+    return { side: "source", id: null, count: c?.events_count ?? 0, status: c?.status ?? "idle" };
+  }
   const b = cardBranch(slot, model, index);
   if (b) return { side: "branch", id: b.id, count: b.events_count ?? 0, status: b.status ?? "starting" };
   const c = cellSummary(slot, model);
@@ -1318,12 +1391,14 @@ function updateActionBar() {
     testBtn.title = "Run the current prompt edit on every selected slot/zone and highlight the difference";
     testBtn.disabled = n === 0;
     simUntilEl.style.display = "none";
-    // One click can fan out across each event's chosen LLMs — surface the total
-    // branch count when it exceeds the event count so it's clear it's a batch.
-    const branchTotal = events.reduce((acc, ev) => acc + simModelsFor(ev).size, 0);
+    // One click can fan out across each event's chosen LLMs — and, with a
+    // compare-version picked, doubles to a current + version lineage per LLM.
+    // Surface the total when it exceeds the event count so it's clear it's a batch.
+    const perEvent = lab.compareVersion ? 2 : 1;
+    const branchTotal = events.reduce((acc, ev) => acc + simModelsFor(ev).size * perEvent, 0);
     simBtn.textContent = branchTotal > n ? `simulate downstream (${branchTotal})` : "simulate downstream";
     simBtn.title = branchTotal > n
-      ? `forks ${branchTotal} lineages across the selected events' chosen LLMs`
+      ? `forks ${branchTotal} lineages across the selected events' chosen LLMs${lab.compareVersion ? ` — current vs "${lab.compareVersion}"` : ""}`
       : "fork a downstream simulation from every selected event";
     simBtn.classList.remove("danger");
     simBtn.disabled = n === 0;
@@ -1549,7 +1624,7 @@ function pruneStaleSims() {
   }
   for (const [bid, b] of live) {
     if (!lab.sims.has(bid)) {
-      lab.sims.set(bid, { id: bid, slot: b.slot, model: b.model, eventIndex: b.fork_index, step: lab.simStep, node: null, createdAt: 0 });
+      lab.sims.set(bid, { id: bid, slot: b.slot, model: b.model, eventIndex: b.fork_index, step: lab.simStep, node: null, version: b.version ?? null, createdAt: 0 });
     }
   }
   if (lab.sims.size === 0) lab.simStep = null;
@@ -1587,7 +1662,7 @@ function seedFor(ev) {
 // and runs the forked step on it (the compare per-LLM lineage); omit it for the
 // base-model branch, which pauses at the forked step (and cache-hits a `seed`).
 // Tracks the branch in lab.sims; per-fork errors toast but don't abort siblings.
-async function forkOne(ev, overrides, { model = null, seed = null } = {}) {
+async function forkOne(ev, overrides, { model = null, seed = null, version = null } = {}) {
   try {
     const resp = await api.createBranch(state.run, ev.slot, ev.model, {
       event_index: ev.index,
@@ -1595,35 +1670,59 @@ async function forkOne(ev, overrides, { model = null, seed = null } = {}) {
       overrides,
       seed,
       model,
+      version,
     });
     const bid = resp.branch?.id;
     if (bid) {
       state.lab.sims.set(bid, {
         id: bid, slot: ev.slot, model: ev.model,
-        eventIndex: ev.index, step: state.lab.step, node: ev.node, createdAt: performance.now(),
+        eventIndex: ev.index, step: state.lab.step, node: ev.node,
+        version, createdAt: performance.now(),
       });
       return true;
     }
   } catch (e) {
     const label = model ? `${ev.slot}·${ev.model}→${model}` : `${ev.slot}·${ev.model}`;
-    toast(`${label}: ${e.message}`, "err");
+    toast(`${label}${version ? " @" + version : ""}: ${e.message}`, "err");
   }
   return false;
 }
 
 async function launchBranches(events, overrides) {
   const lab = state.lab;
+  const cv = lab.compareVersion;
   simBtn.disabled = true;
   let started = 0;
-  for (const ev of events) {
+  // A version A/B is per cell (the grid pairs current | version per cell), so
+  // fold a multi-zone selection to one event per cell before forking the pair.
+  let targets = events;
+  if (cv) {
+    const seen = new Set();
+    targets = events.filter((ev) => {
+      const ck = cellKey(ev.slot, ev.model);
+      if (seen.has(ck)) return false;
+      seen.add(ck);
+      return true;
+    });
+  }
+  for (const ev of targets) {
     const aliases = [...simModelsFor(ev)];
-    // Just the cell's base model ⇒ today's path: one unpinned branch that
-    // pauses at the forked step and cache-hits the vetted test seed. Any other
-    // selection ⇒ a pinned lineage per LLM (each runs the forked step on its
-    // own model), so one "simulate" A/Bs the step across models.
-    if (aliases.length === 1 && aliases[0] === ev.model) {
+    if (cv) {
+      // Prompt-set A/B: for each selected LLM, fork one lineage under the run's
+      // CURRENT prompts and one under version `cv`, both pinned so each runs the
+      // forked step and can be compared side by side (same scene + step + model,
+      // only the prompt set differs).
+      for (const alias of aliases) {
+        if (await forkOne(ev, overrides, { model: alias })) started += 1;
+        if (await forkOne(ev, overrides, { model: alias, version: cv })) started += 1;
+      }
+    } else if (aliases.length === 1 && aliases[0] === ev.model) {
+      // Just the cell's base model ⇒ today's path: one unpinned branch that
+      // pauses at the forked step and cache-hits the vetted test seed.
       if (await forkOne(ev, overrides, { seed: seedFor(ev) })) started += 1;
     } else {
+      // A pinned lineage per LLM (each runs the forked step on its own model),
+      // so one "simulate" A/Bs the step across models.
       for (const alias of aliases) {
         if (await forkOne(ev, overrides, { model: alias })) started += 1;
       }
@@ -1633,10 +1732,13 @@ async function launchBranches(events, overrides) {
   lab.simEditedSteps = Object.keys(overrides);
   simBtn.disabled = false;
   if (started > 0) {
-    toast(`simulating downstream on ${started} branch${started === 1 ? "" : "es"}`, "ok");
+    toast(cv
+      ? `simulating ${started} lineage${started === 1 ? "" : "s"} — current vs "${cv}"`
+      : `simulating downstream on ${started} branch${started === 1 ? "" : "es"}`, "ok");
     emit("poll-now");
     renderSims();
     refreshCardBranchBtns(); // reveal "compare 3D" on the just-branched cards at once
+    renderGrid(); // rebuild the grid into current | version cards for the A/B
     refreshCardScenes(); // flip the just-branched cards to their branch scene now
   }
 }
@@ -1673,20 +1775,23 @@ function renderSims() {
   // many LLMs. A lone sim renders as a plain row.
   for (const g of simGroups()) {
     if (g.sims.length === 1) { body.appendChild(simRow(g.sims[0], false)); continue; }
+    // A group mixes LLM lineages and/or version lineages (current vs a compared
+    // version); label each row by whichever axis varies.
+    const groupHasVersion = g.sims.some((s) => branchSummaryById(s.id)?.version || s.version);
     const grp = el("div", { class: "sim-group", style: "border-left:2px solid var(--line); margin:6px 0 6px 2px; padding-left:6px" });
     const forkLabel = g.node ? ` ⑂ ${g.node}` : "";
     grp.appendChild(el("div", { class: "sim-group-head", style: "display:flex; gap:8px; align-items:center; padding:2px 0" },
       el("span", { class: "cell-name", text: `${g.slot} · ${g.model}${forkLabel}`,
         title: "open the original cell's scene",
         onclick: () => emit("open-cell", { slot: g.slot, model: g.model, branch: null }) }),
-      el("span", { class: "muted", text: `${g.sims.length} LLMs` }),
-      el("button", { text: "compare", title: "compare all these LLM lineages side by side in 3D",
+      el("span", { class: "muted", text: `${g.sims.length} ${groupHasVersion ? "lineages" : "LLMs"}` }),
+      el("button", { text: "compare", title: "compare these lineages side by side in 3D",
         onclick: () => emit("open-compare", { slot: g.slot, model: g.model, step: g.step, node: g.node, index: g.eventIndex, branch: g.sims[0].id }) }),
       simUntilSelectFor(g.sims),
-      el("button", { class: "danger", text: "break out all", title: "discard every LLM lineage in this group",
+      el("button", { class: "danger", text: "break out all", title: "discard every lineage in this group",
         onclick: () => breakOutGroup(g) }),
     ));
-    for (const sim of g.sims) grp.appendChild(simRow(sim, true));
+    for (const sim of g.sims) grp.appendChild(simRow(sim, true, groupHasVersion));
     body.appendChild(grp);
   }
   host.appendChild(body);
@@ -1716,16 +1821,19 @@ function simGroups() {
 // One sim's row + its controls. `grouped` rows sit under a group header and
 // label by the lineage's LLM (the header carries slot·model + zone); standalone
 // rows show the full cell.
-function simRow(sim, grouped) {
+function simRow(sim, grouped, groupHasVersion = false) {
   const b = branchSummaryById(sim.id);
   const view = statusView(b);
   const status = b?.status ?? "starting";
   const pending = b?.pending ?? null;
   const pin = b?.pin && b.pin !== sim.model ? b.pin : null;
+  // The prompt set this lineage ran under — the version A/B label ("current" is
+  // the run's own prompts). Appended to the pin so a group can mix both axes.
+  const version = b?.version ?? sim.version ?? null;
   const forkLabel = sim.node ? ` ⑂ ${sim.node}` : "";
   const name = grouped
-    ? (pin ?? sim.model)
-    : `${sim.slot} · ${sim.model}${pin ? " → " + pin : ""}${forkLabel}`;
+    ? (groupHasVersion ? [version || "current", pin].filter(Boolean).join(" · ") : (pin ?? sim.model))
+    : `${sim.slot} · ${sim.model}${pin ? " → " + pin : ""}${version ? " · " + version : ""}${forkLabel}`;
   const row = el("div", { class: "sim-row" },
     el("span", { class: `dot ${view.dot}` }),
     el("span", { class: "cell-name", text: name, title: "open this lineage's branch view",
