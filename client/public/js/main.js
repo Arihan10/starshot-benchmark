@@ -527,6 +527,97 @@ async function copySlotModal() {
   });
 }
 
+// Copy a single cell (one slot's log + meshes for one model) into another model
+// and/or run — the cross-model / cross-run transplant. The source is a cell on
+// THIS run; the destination is any run's cell for the SAME slot (content is
+// scene-specific). The destination cell is overwritten; the source is untouched.
+async function copyCellModal() {
+  if (!state.run) return;
+  const sourceRun = state.run;
+  const dataSlots = state.slots.filter((s) => state.models.some((m) => (s.runs?.[m]?.events_count ?? 0) > 0));
+  if (!dataSlots.length) { toast(`no started cells in "${sourceRun}" to copy`, "err"); return; }
+
+  const slotSel = el("select", {}, dataSlots.map((s) => el("option", { value: s.id, text: s.id })));
+  const fromSel = el("select");
+  const toRunSel = el("select", {}, state.runs.map((r) => el("option", { value: r.name, text: r.name })));
+  toRunSel.value = sourceRun;
+  const toSel = el("select", {}, state.models.map((m) => el("option", { value: m, text: m })));
+  const warnEl = el("div", { class: "m-hint" });
+
+  // The chosen source slot's models that actually have data — the copy sources.
+  function refreshFromModels() {
+    const s = dataSlots.find((x) => x.id === slotSel.value);
+    fromSel.textContent = "";
+    for (const m of state.models) {
+      const n = s?.runs?.[m]?.events_count ?? 0;
+      if (n > 0) fromSel.appendChild(el("option", { value: m, text: `${m} · ${n} ev` }));
+    }
+  }
+
+  // Flag when the destination cell already holds data (it'll be replaced) or is
+  // the source itself. Reads the active run live, any other run on demand.
+  async function refreshWarn() {
+    const destRun = toRunSel.value, slotId = slotSel.value, srcModel = fromSel.value, destModel = toSel.value;
+    if (destRun === sourceRun && destModel === srcModel) {
+      warnEl.className = "m-error";
+      warnEl.textContent = "source and destination are the same cell — pick a different model or run.";
+      return;
+    }
+    warnEl.className = "m-hint";
+    warnEl.textContent = "checking destination…";
+    let count = null;
+    try {
+      const slots = destRun === sourceRun ? state.slots : (await api.slots(destRun)).slots;
+      count = slots.find((x) => x.id === slotId)?.runs?.[destModel]?.events_count ?? 0;
+    } catch { count = null; }
+    if (toRunSel.value !== destRun || slotSel.value !== slotId || toSel.value !== destModel || fromSel.value !== srcModel) return;
+    if (count === null) { warnEl.textContent = "couldn't read the destination run."; return; }
+    warnEl.className = count > 0 ? "m-error" : "m-hint";
+    warnEl.textContent = count > 0
+      ? `⚠ "${destRun} / ${slotId} / ${destModel}" has ${count} event${count === 1 ? "" : "s"} — deleted & replaced.`
+      : `"${destRun} / ${slotId} / ${destModel}" is empty — nothing overwritten.`;
+  }
+
+  slotSel.addEventListener("change", () => { refreshFromModels(); refreshWarn(); });
+  fromSel.addEventListener("change", refreshWarn);
+  toRunSel.addEventListener("change", refreshWarn);
+  toSel.addEventListener("change", refreshWarn);
+  refreshFromModels();
+  // Pre-pick a destination model different from the source, so the common
+  // within-run cross-model copy is valid without extra clicks.
+  const alt = state.models.find((m) => m !== fromSel.value);
+  if (alt) toSel.value = alt;
+
+  openModal(`copy a cell from "${sourceRun}"`, (close, setError) => {
+    refreshWarn();
+    return {
+      body: [
+        field("slot (shared by both cells)", slotSel),
+        field("from model", fromSel),
+        field("to run", toRunSel),
+        field("to model", toSel),
+        el("div", { class: "m-hint", text:
+          "Copies one model's cell — its whole log + meshes — into another model and/or run for the same slot, overwriting the destination. Cost/usage stay attributed to the source model; the source cell is untouched." }),
+        warnEl,
+      ],
+      actions: [
+        el("button", { text: "cancel", onclick: close }),
+        el("button", { class: "danger", text: "copy cell", onclick: async () => {
+          const destRun = toRunSel.value, slotId = slotSel.value, srcModel = fromSel.value, destModel = toSel.value;
+          if (destRun === sourceRun && destModel === srcModel) { setError("pick a different destination cell"); return; }
+          try {
+            const r = await api.copyCell(destRun, sourceRun, slotId, srcModel, destModel);
+            close();
+            toast(`copied "${slotId}" · ${srcModel} → ${destRun} / ${destModel} — ${r.events} event${r.events === 1 ? "" : "s"}${r.replaced ? " (replaced)" : ""}`, "ok");
+            await refreshRuns();
+            if (destRun === state.run) await refreshSlots();
+          } catch (e) { setError(e.message); }
+        } }),
+      ],
+    };
+  });
+}
+
 function resetAllModal() {
   if (!state.run) return;
   // Every started cell on this run (anything with logged events, or a live
@@ -573,6 +664,7 @@ document.getElementById("btn-start-cells").addEventListener("click", startCellsM
 document.getElementById("btn-reset-all").addEventListener("click", resetAllModal);
 document.getElementById("btn-ab-test").addEventListener("click", abTestModal);
 document.getElementById("btn-copy-slot").addEventListener("click", copySlotModal);
+document.getElementById("btn-copy-cell").addEventListener("click", copyCellModal);
 
 // --- boot ------------------------------------------------------------------------
 

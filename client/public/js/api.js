@@ -91,6 +91,21 @@ export const api = {
 			method: "POST",
 			body: { source_run: sourceRun, slot },
 		}),
+	// Copy ONE cell (log + meshes) for a shared `slot` from
+	// (`sourceRun`, `sourceModel`) into (`destRun`, `destModel`), OVERWRITING the
+	// destination cell. Run and/or model may differ (cross-model, cross-run, or
+	// both). Returns {run, source_run, slot, source_model, dest_model, events,
+	// replaced}.
+	copyCell: (destRun, sourceRun, slot, sourceModel, destModel) =>
+		request(`/runs/${encodeURIComponent(destRun)}/copy-cell`, {
+			method: "POST",
+			body: {
+				source_run: sourceRun,
+				slot,
+				source_model: sourceModel,
+				dest_model: destModel,
+			},
+		}),
 	activateRun: (name) =>
 		request(`/runs/${encodeURIComponent(name)}/activate`, {
 			method: "POST",

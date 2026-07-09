@@ -30,8 +30,20 @@ export function createObsDock(hostEl, { trace = true } = {}) {
     logCountsEl,
   );
   const logEl = el("div", { class: "obs-log" }, logHeadEl, logBodyEl);
+  // Jump-to-node search (see runSearch / pickSearch): a dropdown of id matches.
+  const searchInput = el("input", {
+    class: "obs-search-input",
+    type: "text",
+    placeholder: "find id…",
+    title: "jump to an object or zone by id",
+    spellcheck: "false",
+    autocomplete: "off",
+  });
+  const searchResultsEl = el("div", { class: "obs-search-results" });
+  const searchEl = el("div", { class: "obs-search" }, searchInput, searchResultsEl);
   hostEl.replaceChildren(
     el("div", { class: "obsdock-head" }, el("span", { text: "observability" }), countEl),
+    searchEl,
     pinnedEl,
     bodyEl,
     logEl,
@@ -93,6 +105,113 @@ export function createObsDock(hostEl, { trace = true } = {}) {
       if (scroll) row.scrollIntoView({ block: "nearest" });
     }
   }
+
+  // --- search: jump to a node by id ------------------------------------------
+  // A dropdown of id-substring matches; picking one selects + frames the node
+  // (via onNodeClick) and reveals its tree row. It reads the model directly and
+  // paints its own list, so it's independent of renderTree's streamed-repaint
+  // gating (the body can stay held while search still works).
+  let searchHits = []; // ids currently listed, best-first
+  let searchActive = 0; // highlighted result index
+
+  function closeSearch() {
+    searchResultsEl.classList.remove("open");
+    searchResultsEl.textContent = "";
+    searchHits = [];
+    searchActive = 0;
+  }
+
+  function paintSearchActive() {
+    const rows = searchResultsEl.children;
+    for (let i = 0; i < rows.length; i++) {
+      rows[i].classList.toggle("active", i === searchActive);
+    }
+    rows[searchActive]?.scrollIntoView({ block: "nearest" });
+  }
+
+  function pickSearch(id) {
+    // A trace view (compare panes) shows only one lineage — drop back to the
+    // full tree so the row exists to reveal, then select + frame + scroll to it.
+    if (focusId !== null && focusId !== id) {
+      focusId = null;
+      if (currentModel) renderTree(currentModel);
+    }
+    onNodeClick(id, { ensureSelected: true });
+    markSelected(id, { scroll: true });
+    closeSearch();
+  }
+
+  function runSearch() {
+    const q = searchInput.value.trim().toLowerCase();
+    searchResultsEl.textContent = "";
+    searchActive = 0;
+    if (!q || !currentModel) {
+      searchHits = [];
+      searchResultsEl.classList.remove("open");
+      return;
+    }
+    const hits = [];
+    for (const [id, n] of currentModel.nodes) {
+      const at = id.toLowerCase().indexOf(q);
+      if (at !== -1) hits.push({ id, kind: n.kind, at, n });
+    }
+    // Exact match first, then earliest match position, then alphabetical.
+    hits.sort(
+      (a, b) =>
+        (a.id.length === q.length ? 0 : 1) - (b.id.length === q.length ? 0 : 1) ||
+        a.at - b.at ||
+        a.id.localeCompare(b.id),
+    );
+    const shown = hits.slice(0, 50);
+    searchHits = shown.map((h) => h.id);
+    if (!shown.length) {
+      searchResultsEl.appendChild(el("div", { class: "obs-search-empty", text: "no match" }));
+    } else {
+      shown.forEach((h, i) => {
+        const dot = h.n.error ? "error" : h.n.phase === "done" ? "done" : h.n.calls.length ? "running" : "idle";
+        searchResultsEl.appendChild(
+          el("div", {
+            class: `obs-search-hit${i === 0 ? " active" : ""}`,
+            // mousedown, not click, so the input's blur-to-close can't beat it.
+            onmousedown: (ev) => { ev.preventDefault(); pickSearch(h.id); },
+          },
+            el("span", { class: `dot ${dot}` }),
+            el("span", { class: "node-id", text: h.id }),
+            el("span", { class: "node-kind", text: h.kind }),
+          ),
+        );
+      });
+    }
+    searchResultsEl.classList.add("open");
+  }
+
+  searchInput.addEventListener("input", runSearch);
+  searchInput.addEventListener("focus", () => { if (searchInput.value.trim()) runSearch(); });
+  searchInput.addEventListener("blur", closeSearch);
+  searchInput.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown") {
+      ev.preventDefault();
+      if (searchHits.length) { searchActive = Math.min(searchActive + 1, searchHits.length - 1); paintSearchActive(); }
+    } else if (ev.key === "ArrowUp") {
+      ev.preventDefault();
+      if (searchHits.length) { searchActive = Math.max(searchActive - 1, 0); paintSearchActive(); }
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      if (searchHits.length) pickSearch(searchHits[searchActive]);
+    } else if (ev.key === "Escape") {
+      // Swallow Escape only while the search is doing something, so it doesn't
+      // also reach the overlay's Escape (which would close the whole scene).
+      if (searchResultsEl.classList.contains("open")) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        closeSearch();
+      } else if (searchInput.value) {
+        ev.preventDefault();
+        ev.stopPropagation();
+        searchInput.value = "";
+      }
+    }
+  });
 
   // Calls expanded in place, keyed by event index so the accordion state
   // survives the full re-renders that streamed events trigger.
@@ -511,6 +630,8 @@ export function createObsDock(hostEl, { trace = true } = {}) {
   }
 
   function resetDock() {
+    searchInput.value = "";
+    closeSearch();
     bodyEl.textContent = "";
     pinnedEl.textContent = "";
     lastPinnedCall = null;

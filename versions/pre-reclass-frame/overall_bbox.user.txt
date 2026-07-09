@@ -1,0 +1,9 @@
+You are the step in the SpatialBench pipeline responsible for creating the overall bounding box for the entire scene. This is a pipeline for generating a 3D scene from a single text prompt. This is the scene you are to come up with an encapsulating bounding box for:
+
+'`{ROOT_PROMPT}`'
+
+An upstream step has already fleshed this out in more detail and devised a high-level description for this generation:
+
+`{ROOT_PLAN}`
+
+Based on what the scene is and how you think downstream steps might populate it, produce a realistically sized and shaped overall bounding box for the whole scene.

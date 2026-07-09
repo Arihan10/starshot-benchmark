@@ -1029,15 +1029,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			pressedKeys.add(k);
 			ev.preventDefault();
 		} else if (k === "shift" && !pressedKeys.has("shift")) {
-			// Shift flips picking to zones-only (orbit) / descends (FP); refresh
+			// Shift flips picking to zones-only (orbit) / sprints (FP); refresh
 			// hover without a mouse move.
 			pressedKeys.add("shift");
 			if (pointerInsideCanvas) pointerDirty = true;
-		} else if (cameraMode === "fp" && (k === " " || k === "capslock")) {
-			// FP only: Space rises, Caps Lock sprints (Shift descends). Captured
-			// so Space can't scroll the page or trigger a focused control.
-			pressedKeys.add(k);
-			ev.preventDefault();
 		}
 	};
 	const onKeyUp = (ev) => {
@@ -1063,20 +1058,24 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const _worldUp = new THREE.Vector3(0, 1, 0);
 	const _move = new THREE.Vector3();
 
-	// First-person movement: WASD walks on the ground plane along the look yaw,
-	// Space/Shift rise/fall, Caps Lock sprints. Mouse-look is applied by fp on mousemove.
+	// First-person flycam: W/S fly along the look direction (pitch included, so
+	// looking up climbs and down dives); A/D strafe level; Q/E lower/raise on
+	// world Y; Shift sprints. Mouse-look is applied by fp on mousemove.
 	function applyFpMove(dt) {
 		if (pressedKeys.size === 0) return;
 		const speed =
 			Math.max(2, fpSpeedScale * 0.5) *
-			(pressedKeys.has("capslock") ? 3 : 1) *
+			(pressedKeys.has("shift") ? 3 : 1) *
 			dt;
-		if (pressedKeys.has("w")) fp.moveForward(speed);
-		if (pressedKeys.has("s")) fp.moveForward(-speed);
+		if (pressedKeys.has("w") || pressedKeys.has("s")) {
+			fp.getDirection(_fpDir); // full look dir, including pitch
+			if (pressedKeys.has("w")) camera.position.addScaledVector(_fpDir, speed);
+			if (pressedKeys.has("s")) camera.position.addScaledVector(_fpDir, -speed);
+		}
 		if (pressedKeys.has("d")) fp.moveRight(speed);
 		if (pressedKeys.has("a")) fp.moveRight(-speed);
-		if (pressedKeys.has(" ")) camera.position.y += speed; // Space rises
-		if (pressedKeys.has("shift")) camera.position.y -= speed; // Shift descends
+		if (pressedKeys.has("e")) camera.position.y += speed;
+		if (pressedKeys.has("q")) camera.position.y -= speed;
 		cameraUserMoved = true;
 	}
 

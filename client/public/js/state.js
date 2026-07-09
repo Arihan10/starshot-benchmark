@@ -54,6 +54,10 @@ export const state = {
     sims: new Map(),       // branchId -> {id, slot, model, eventIndex, createdAt}
     simStep: null,         // step the simulation branched at (pins obs panel)
     simEditedSteps: [],    // every step whose edit the live branches carry
+    // A second prompt version to A/B against: when set, "simulate downstream"
+    // forks an extra lineage per target under this version, side by side with
+    // one under the run's current prompts. null ⇒ single-version simulate.
+    compareVersion: null,
   },
 };
 
