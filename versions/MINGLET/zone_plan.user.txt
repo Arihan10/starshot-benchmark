@@ -53,6 +53,8 @@ the description you write for the region shouldn't explicitly mention anything a
 
 <thinking> 
 before ANY output, think HARD and DEEPLY and provide a detailed CoT. think through the creative direction for this region within the context of the larger scene. think through spatial layout and how everything fits together physically. think about the constructed story of the ancestor plans and how this particular region could add onto it as a detail. think about what would make this region genuinely impressive and memorable as part of a winning build. 
+
+think hard about the following, "is this idea and description effectively using the space its been given?" - effectively refers not to density but follow through of intention. If not, consider adding more ideas to make the space more interesting, or removing certain aspects to make the space to make it more well spaced and intentionally designed. reason deeply about the kinds of objects you're outputting, anchoring centerpieces have a lot more draw within a scene than several detail elemenets put together. a large area may need several anchoring objects and a more intricate area might need more detail objects. think about a combination of centerpiece and detail objects to align yourself with the scene intention. Repeat this process of creating and revising over and over, keeping in mind the size and intention of the sceen at every step until the region description is perfect. 
 </thinking>
 
 </VERY_IMPORTANT_INSTRUCTIONS>

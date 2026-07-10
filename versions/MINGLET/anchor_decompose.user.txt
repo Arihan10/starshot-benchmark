@@ -47,3 +47,7 @@ for each object you output, carefully consider how you want to convey their spat
 output a JSON object containing the list of objects that make up `{ZONE_ID}`.
 
 </VERY_IMPORTANT_INSTRUCTIONS>
+
+<thinking> 
+think hard about the following, "are my objects effectively using the space its been given?" - effectively refers not to density but follow through of intention. If not, consider adding more ideas to make the space more interesting, or removing certain aspects to make the space to make it more well spaced and intentionally designed. reason deeply about the kinds of objects you're outputting, anchoring centerpieces have a lot more draw within a scene than several detail elemenets put together. think about a combination of centerpiece and detail objects to align yourself with the scene intention. Repeat this process of creating and revising over and over until the region description is perfect. 
+</thinking>
