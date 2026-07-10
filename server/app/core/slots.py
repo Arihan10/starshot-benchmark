@@ -91,6 +91,7 @@ MODELS: dict[str, str] = {
     "sonnet-new": "anthropic/claude-sonnet-5",
     "minimax": "minimax/minimax-m3",
     "gemma": "google/gemma-4-31b-it",
+    "luna-pro": "openai/gpt-5.6-luna-pro",
     "hy3": "tencent/hy3",
     "longcat": "longcat/LongCat-2.0",
     "longcat-sf": "siliconflow/LongCat-2.0",
@@ -129,3 +130,9 @@ MODEL_ALIASES: list[str] = list(MODELS.keys())
 DEFAULT_MODEL_ALIAS = "gemini-flash-lite"
 
 DEFAULT_MODEL = MODELS[DEFAULT_MODEL_ALIAS]
+
+DEFAULT_REASONING = "xhigh"
+
+REASONING_DOWNGRADE_LIST = [
+    "openai/gpt-5.5"
+]
