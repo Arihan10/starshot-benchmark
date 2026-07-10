@@ -26,6 +26,8 @@ from pydantic import BaseModel, ValidationError
 
 from app.utils import cache, logging
 
+from app.core.slots import DEFAULT_REASONING, REASONING_DOWNGRADE_LIST
+
 T = TypeVar("T", bound=BaseModel)
 
 # Lift Python 3.11+'s 4300-digit ceiling on int<->str conversion.
@@ -82,7 +84,8 @@ def _reasoning_effort(model: str) -> str:
     """The reasoning effort to request for `model`. OpenAI/GPT models are pinned
     to "minimal" for now — xhigh makes them slow + costly and we're not
     measuring their reasoning depth here; every other provider stays at "xhigh"."""
-    return "medium" if (model or "").startswith("openai/") else "xhigh"
+    
+    return "medium" if (model or "") in REASONING_DOWNGRADE_LIST else DEFAULT_REASONING
 
 
 # Optional per-task breakpoint. When set, `call_llm` awaits it right before
