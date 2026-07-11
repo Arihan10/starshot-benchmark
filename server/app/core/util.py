@@ -219,6 +219,50 @@ def adjacent_zones(target_id: str, nodes: list[Node]) -> list[Node]:
     return [n for n in nodes if n.id in hit_ids]
 
 
+def object_spatial_ranks(target_id: str, nodes: list[Node]) -> dict[str, dict[str, float]]:
+    """Per-OBJECT spatial relevance to `target_id`, for the ablation "does it
+    attend to what's close / visible?" graph: the Euclidean distance from the
+    target's centre to each object's centre, and a ray-trace VISIBILITY score —
+    how many of a Fibonacci sphere of rays cast from the target hit that object
+    FIRST (occlusion-aware, reusing the same slab ray-AABB machinery as
+    `adjacent_zones`). OBJECTS only (zones excluded); the target itself excluded.
+    Returns `{ id: {"distance": float, "ray_hits": int} }` — the caller ranks
+    (nearest / most-visible = rank 1)."""
+    by_id = {n.id: n for n in nodes}
+    target = by_id.get(target_id)
+    if target is None:
+        return {}
+    origin = np.asarray(target.bbox.center, dtype=float)
+    objs = [n for n in nodes if not is_region(n) and n.id != target_id]
+    if not objs:
+        return {}
+    out: dict[str, dict[str, float]] = {
+        n.id: {
+            "distance": float(np.linalg.norm(np.asarray(n.bbox.center, dtype=float) - origin)),
+            "ray_hits": 0,
+        }
+        for n in objs
+    }
+    mins = np.array([n.bbox.min_corner for n in objs], dtype=float)  # (C, 3)
+    maxs = np.array([n.bbox.max_corner for n in objs], dtype=float)
+    dirs = _fibonacci_directions(_ADJACENCY_RAYS)                    # (N, 3)
+    dirs = np.where(np.abs(dirs) < _RAY_EPS, np.copysign(_RAY_EPS, dirs), dirs)
+    t1 = (mins[None, :, :] - origin) / dirs[:, None, :]              # (N, C, 3)
+    t2 = (maxs[None, :, :] - origin) / dirs[:, None, :]
+    t_enter = np.minimum(t1, t2).max(axis=2)                         # (N, C)
+    t_exit = np.maximum(t1, t2).min(axis=2)
+    entered = (t_enter <= t_exit) & (t_exit >= 0.0) & (t_enter > _RAY_EPS)
+    t_enter = np.where(entered, t_enter, np.inf)
+    ids = [n.id for n in objs]
+    for row in t_enter:  # each ray: the object(s) it enters first are "visible"
+        nearest = float(row.min())
+        if not np.isfinite(nearest):
+            continue
+        for j in np.flatnonzero(row <= nearest + _RAY_EPS):
+            out[ids[int(j)]]["ray_hits"] += 1
+    return out
+
+
 # --- bounding-box prose ------------------------------------------------------
 
 

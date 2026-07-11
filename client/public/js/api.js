@@ -13,10 +13,14 @@ function u(path, params = {}) {
 	return url;
 }
 
-async function request(path, { method = "GET", body, params } = {}) {
+async function request(path, { method = "GET", body, params, cache = "no-store" } = {}) {
 	const res = await fetch(u(path, params), {
 		method,
-		cache: "no-store",
+		// Most calls bypass the HTTP cache (no-store). Immutable-ish GETs pass
+		// cache: "no-cache" so the browser STORES the response + its ETag and
+		// revalidates with If-None-Match — the server 304s unchanged content, so
+		// the (0.8-5 MB) body isn't re-transferred while staleness is impossible.
+		cache,
 		headers:
 			body !== undefined
 				? { "Content-Type": "application/json" }
@@ -38,6 +42,12 @@ async function request(path, { method = "GET", body, params } = {}) {
 
 const cellPath = (slot, model, tail = "") =>
 	`/slots/${encodeURIComponent(slot)}/${encodeURIComponent(model)}${tail}`;
+
+// A run id can now be a nested PATH (ablation variants fold under their base as
+// `<base>/ablations/<experiment>/<variant>`). When a run goes in the URL PATH
+// (not a query param), encode each segment but keep the `/` separators so the
+// server's `:path` routes match. Query-param uses (`?run=`) need no special care.
+const encPath = (s) => String(s).split("/").map(encodeURIComponent).join("/");
 
 // Read a JSONL event log straight from the artifact server (full history,
 // cache.llm payloads included). Tolerates a torn final line written mid-flush.
@@ -66,28 +76,6 @@ export const api = {
 			method: "POST",
 			body: { name, prompt_version: promptVersion },
 		}),
-	// Launch a NEW run (B) seeded with `sourceRun`'s ROOT zone plans: each
-	// listed {slot, model} cell is copied through its root zone plan and started
-	// on `promptVersion`, so the pipeline replays that plan and re-derives the
-	// rest under the new prompts. Returns {current, seeded:[...], skipped:[...]}.
-	abTest: (name, promptVersion, sourceRun, cells) =>
-		request("/runs/ab-test", {
-			method: "POST",
-			body: {
-				name,
-				prompt_version: promptVersion,
-				source_run: sourceRun,
-				cells,
-			},
-		}),
-	// Copy an entire slot folder (every model cell + its meshes) from
-	// `sourceRun` into `destRun`, OVERWRITING destRun's slot. Returns
-	// {run, source_run, slot, copied:[...], replaced:[...]}.
-	copySlot: (destRun, sourceRun, slot) =>
-		request(`/runs/${encodeURIComponent(destRun)}/copy-slot`, {
-			method: "POST",
-			body: { source_run: sourceRun, slot },
-		}),
 	activateRun: (name) =>
 		request(`/runs/${encodeURIComponent(name)}/activate`, {
 			method: "POST",
@@ -95,7 +83,7 @@ export const api = {
 	// Delete a run and its on-disk artifacts (stops any live cells first).
 	// Refuses the active run. Used by the ablation board's reset.
 	deleteRun: (name) =>
-		request(`/runs/${encodeURIComponent(name)}`, { method: "DELETE" }),
+		request(`/runs/${encPath(name)}`, { method: "DELETE" }),
 	// Load a run's cells into memory WITHOUT activating it, so its /scene +
 	// /meshes are readable next to the active run (the run-compare view). No-op
 	// if already loaded; launches nothing.
@@ -104,6 +92,16 @@ export const api = {
 			method: "POST",
 		}),
 	slots: (run) => request("/slots", { params: { run } }),
+	// Every ablation variant of a base run in ONE read (nested manifest + legacy
+	// flat, merged server-side). Replaces filtering /runs by ablation.base_run +
+	// the __abl- name prefix. Each variant carries { run_id, experiment, slot,
+	// model, target_step_kind, cut, replicate, treatment, legacy_flat? }.
+	ablations: (baseRun) => request(`/runs/${encodeURIComponent(baseRun)}/ablations`),
+	// Coarse cell lifecycle status (done/error/paused/running/idle) via a cheap
+	// server-side tail scan — NO full events.jsonl pull, NO hydration. Backs the
+	// ablation board's per-variant status poll.
+	runStatus: (run, slot, model) =>
+		request(`/run-status/${encPath(run)}/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`),
 	// Live snapshot of the process-global mesh queue — every in-flight + waiting
 	// generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
 	// pool. { pools: [{id,label,cap}], entries: [{slot_id,job_id,state,backend,pool,…}] }.
@@ -122,35 +120,24 @@ export const api = {
 			method: "POST",
 			params: { run, stepped, logprobs },
 		}),
-	// `auto` runs the cell to completion; `until` runs THROUGH the next call of
-	// that step (it executes), pausing before the following one. A plain step
-	// (neither) advances one call — queued if the cell is mid-call, so a "step
-	// all" never skips a slow model.
-	cellStep: (run, slot, model, { auto = false, until = null, untilBefore = false } = {}) =>
+	// `auto` runs the cell to completion; `until` fast-forwards to the next run
+	// of that step and pauses there. A plain step (neither) advances one call —
+	// queued if the cell is mid-call, so a "step all" never skips a slow model.
+	cellStep: (run, slot, model, { auto = false, until = null } = {}) =>
 		request(cellPath(slot, model, "/step"), {
 			method: "POST",
 			params: { run },
-			body: { auto, until, until_before: untilBefore },
+			body: { auto, until },
 		}),
-	stepAll: (run, { auto = false, until = null, untilBefore = false } = {}) =>
+	stepAll: (run, { auto = false, until = null } = {}) =>
 		request(`/runs/${encodeURIComponent(run)}/step-all`, {
 			method: "POST",
-			params: { auto, until, until_before: untilBefore },
+			params: { auto, until },
 		}),
 	pause: (run, slot, model) =>
 		request(cellPath(slot, model, "/pause"), {
 			method: "POST",
 			params: { run },
-		}),
-	// Set this cell's spend cap to an explicit ceiling (`cap` USD; 0 = no cap).
-	// If the cell was parked at its cap and the new ceiling clears its spend the
-	// server resumes it. 400 when the cap system is off, 409 on a done cell.
-	// Returns {cap, resumed}.
-	capOverride: (run, slot, model, cap) =>
-		request(cellPath(slot, model, "/cap-override"), {
-			method: "POST",
-			params: { run },
-			body: { cap },
 		}),
 	reset: (run, slot, model, start = false) =>
 		request(cellPath(slot, model, "/reset"), {
@@ -298,9 +285,8 @@ export const api = {
 		),
 	// Rebuild an object's served mesh from its pristine raw, dropping any in-place
 	// served edit (e.g. a forced glassify) while keeping its current symmetry.
-	// Applies to the whole prefab group. (Named `resetMesh` so it doesn't collide
-	// with the cell-level `reset` above — they're distinct operations.)
-	resetMesh: (run, slot, model, nodeId) =>
+	// Applies to the whole prefab group.
+	reset: (run, slot, model, nodeId) =>
 		request(
 			cellPath(slot, model, `/reset-mesh/${encodeURIComponent(nodeId)}`),
 			{ method: "POST", params: { run } },
@@ -358,9 +344,16 @@ export const api = {
 	// with id→char-span maps (scene zones/objects, to-place, output, variables).
 	tfSteps: (run, slot, model) =>
 		request(cellPath(slot, model, "/tf-steps"), { params: { run } }),
+	// The compact scene-tree + emitting provenance for a cell (server projection):
+	// `{ order:[id…], nodes:{ id: { kind, parent_id, region?, emitted_by?, call_index? } } }`.
+	// Replaces downloading + folding the full events.jsonl client-side just to
+	// recover the id→kind/parent/emitting-region lookup the /tf drawer + tree need.
+	tfTree: (run, slot, model) =>
+		request(cellPath(slot, model, "/tf-tree"), { params: { run } }),
 	tfExport: (run, slot, model, eventIndex) =>
 		request(cellPath(slot, model, `/tf-export/${eventIndex}`), {
 			params: { run },
+			cache: "no-cache", // ETag-revalidated: 304s the reconstruction on repeat step nav
 		}),
 
 	// --- attention analysis (teacher-forced, real Modal GPU compute) ---
@@ -389,13 +382,24 @@ export const api = {
 		}),
 	attentionList: (run, slot, model, { maxHeads = 0 } = {}) =>
 		request(cellPath(slot, model, "/attention"), { params: { run, max_heads: maxHeads || undefined } }),
+	// CHEAP, version-aware "what attention is already computed for this cell?" — a
+	// pure disk scan (no run hydration, no Modal poll) returning { fresh, stale }
+	// event indices. The ablation drawer lists this FIRST, then pulls only what's
+	// missing/stale, instead of 404-probing each guessed index.
+	attentionIndex: (run, slot, model, { maxHeads = 0 } = {}) =>
+		request(`/attention-index/${encPath(run)}/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`, { params: { max_heads: maxHeads || undefined } }),
+	// Per-object spatial relevance to a step's target node: distance + ray-trace
+	// visibility, from scene geometry (no GPU). Powers the ablation "does it attend
+	// to what's close / visible?" graph. `ev` = the step's cache.llm event index.
+	spatialRanks: (run, slot, model, ev) =>
+		request(cellPath(slot, model, "/spatial-ranks"), { params: { run, ev } }),
 	// Projected views of one step's stored analysis so the browser never pulls the
 	// (potentially hundreds-of-MB) full result. `compact` (default) = scalars +
 	// head grid + entity maps + precomputed aggregates; `token` = one token's full
 	// per-head detail (lazy scrub); `present` = per-token head-summed detail;
 	// `full` = the whole thing (debug/back-compat).
 	attentionGet: (run, slot, model, eventIndex, { view = "compact", i } = {}) =>
-		request(cellPath(slot, model, `/attention/${eventIndex}`), { params: { run, view, i } }),
+		request(cellPath(slot, model, `/attention/${eventIndex}`), { params: { run, view, i }, cache: "no-cache" }),
 
 	// --- simulation branches (keyed by branch id) ---
 	// A branch is a first-class fork living in the run's flat `_branches/<id>/`
@@ -450,15 +454,14 @@ export const api = {
 		request(`/runs/${encodeURIComponent(run)}/branches`, {
 			params: { run },
 		}),
-	// `auto` runs the branch to completion; `until` (a template id) runs it
-	// THROUGH the next call of that step (it executes), pausing before the
-	// following one. A plain step queues if the branch is mid-call (so a batch
-	// "step sims" never errors on a not-yet-gated branch).
+	// `auto` runs the branch to completion; `until` (a template id) fast-forwards
+	// it to the next call of that step. A plain step queues if the branch is
+	// mid-call (so a batch "step sims" never errors on a not-yet-gated branch).
 	// `modelOverride` (a model alias) re-aims the next gated call at a chosen LLM.
-	branchStep: (bid, { auto = false, until = null, untilBefore = false, model = null } = {}) =>
+	branchStep: (bid, { auto = false, until = null, model = null } = {}) =>
 		request(`/branches/${encodeURIComponent(bid)}/step`, {
 			method: "POST",
-			body: { auto, until, until_before: untilBefore, model },
+			body: { auto, until, model },
 		}),
 	// Revert a branch to before `toEventIndex` and pause there; a following
 	// branchStep re-runs from the cut under the current snapshot + `overrides`
@@ -495,14 +498,9 @@ export const api = {
 		}),
 	// Reset the run's snapshot back to its base source version (the inverse of
 	// updateRunPrompts' version-sync) — discards the lab's in-place prompt edits.
-	//   step → revert ONLY that step's prompt (the per-prompt revert); omit to
-	//     restore every step.
-	//   version → restore from THAT source version instead of the run's base
-	//     (omit for the base). Content-only: the run's base is left unchanged.
-	restoreRunPrompts: (run, step = null, version = null) =>
+	restoreRunPrompts: (run) =>
 		request(`/runs/${encodeURIComponent(run)}/prompt-templates/restore`, {
 			method: "POST",
-			params: { step, version },
 		}),
 	// Fork a simulation branch in each cell at its earliest call of any of
 	// `steps` (non-destructive — source untouched). Replaces the old destructive
@@ -513,21 +511,10 @@ export const api = {
 			body: { steps, cells },
 		}),
 
-	// --- reviewer chat ---
-	// The stateless reviewer (Claude Opus 4.8, xhigh) behind the scene
-	// investigator. `body` carries the client-assembled `system` (analyst framing
-	// + scene grounding + step timeline + any attached steps) plus the running
-	// `messages` thread; returns {answer, reasoning, model}.
+	// --- decision inquiry ---
+	// Continue a step's own LLM conversation. `body` carries the step's `model`,
+	// its system prompt, and the running `messages` thread (seeded with the
+	// call's input + output); the reply comes from that same model. Returns
+	// {answer, reasoning, model}.
 	inquire: (body) => request("/inquire", { method: "POST", body }),
-
-	// --- per-slot investigator ---
-	// The faithful base grounding for the whole-scene investigator chat: the
-	// canonically-rendered final scene context + a timeline of every executed
-	// step's output / reasoning / step-specific variable values. The client pairs
-	// this with the run's prompt templates and forwards the composed prompt
-	// through `/inquire`. Read-only.
-	investigator: (run, slot, model) =>
-		request(cellPath(slot, model, "/investigator"), { params: { run } }),
-	branchInvestigator: (bid) =>
-		request(`/branches/${encodeURIComponent(bid)}/investigator`),
 };

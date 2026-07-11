@@ -6,9 +6,17 @@
 import { $, state, PLACEMENT_STEPS, SEQ_SPEED, isFrameEntity, entityHex, entityKindLabel, compHex, COLORS } from "./state.js";
 import { api } from "../../js/api.js";
 import { applySceneProjection } from "../../js/events.js";
-import { openPresent, closePresent, advancePresent } from "./present.js";
 import { renderAttention } from "./attnPanel.js";
 import { renderScene } from "./render.js";
+
+// present.js (the ~77 KB overlay: 3D playback, EEG, per-object thumbnails) is
+// loaded ON DEMAND the first time present mode opens, so /tf's initial bundle
+// stays lean. Cached after the first import.
+let _presentMod = null;
+async function loadPresent() {
+	_presentMod ??= await import("./present.js");
+	return _presentMod;
+}
 
 // Build the present-mode context for ONE step: its present-view analysis, the
 // clean reasoning/output text, and per-object assets + zone-badge data. Shared by
@@ -154,7 +162,7 @@ async function presentCurrentStep() {
 		return;
 	}
 	ctx.onClose = () => renderAttention(); // restore the /tf 3D cross-highlight
-	openPresent(ctx);
+	(await loadPresent()).openPresent(ctx);
 }
 
 // The longest CONTIGUOUS run of computed (ready/stale) steps — what end-to-end
@@ -201,6 +209,7 @@ async function presentSequence({ outputOnly }) {
 	if (!indices.length) { $("tf-attn-progress").textContent = "present: no computed steps to stitch"; return; }
 	const token = state.viewToken;
 	const seq = ++state.presentSeqId; // supersedes any prior run
+	const present = await loadPresent(); // lazy overlay module (see loadPresent)
 	setLoading(true); // /tf buffering bar (indeterminate) until the first clip plays
 	let fullProj = null;
 	try { fullProj = await api.scene(state.run, state.slot, state.model, {}); } catch { /* assets optional */ }
@@ -276,7 +285,7 @@ async function presentSequence({ outputOnly }) {
 	const playAt = async (k, seekFrac = 0) => {
 		const g = ++gen;
 		if (seq !== state.presentSeqId) return;              // superseded / cancelled
-		if (k >= total) { closePresent(); return; }          // run complete → onClose restores /tf
+		if (k >= total) { present.closePresent(); return; }  // run complete → onClose restores /tf
 		const ctx = await build(k);
 		if (seq !== state.presentSeqId || g !== gen) return; // cancelled or superseded mid-fetch
 		if (!ctx || (!ctx.buildOnly && !(ctx.analysis?.tokens || []).length)) { playAt(k + 1); return; } // skip only broken steps
@@ -299,7 +308,7 @@ async function presentSequence({ outputOnly }) {
 			renderAttention();
 		};
 		// A bad clip must not stop the run — if opening it throws, skip to the next.
-		try { advancePresent(ctx); } // opens on the first clip, then swaps in place → seamless
+		try { present.advancePresent(ctx); } // opens on the first clip, then swaps in place → seamless
 		catch (err) { console.error("[present] clip failed:", err); playAt(k + 1); }
 	};
 	playAt(0);

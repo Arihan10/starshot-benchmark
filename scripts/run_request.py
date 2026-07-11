@@ -238,6 +238,16 @@ def main() -> int:
         env={**env, "SERVER_URL": server_url, "PORT": str(client_port)},
         process_group=0,
     )
+    # The children run in their OWN process groups so `_shutdown` can kill each
+    # whole `uv run uvicorn` / `node` TREE without killing this launcher. The
+    # flip side: they no longer receive the terminal's SIGHUP (window close) or a
+    # `kill` SIGTERM, so closing the terminal used to ORPHAN a uvicorn holding
+    # gigabytes of RAM. Route those signals through the same KeyboardInterrupt
+    # path as Ctrl-C so the `finally` below always tears the children down.
+    def _relay_shutdown(_signum: int, _frame: object) -> None:
+        raise KeyboardInterrupt
+    for _sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(_sig, _relay_shutdown)
     try:
         while True:
             if server.poll() is not None:

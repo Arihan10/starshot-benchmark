@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import difflib
 import gzip
+import hashlib
 import json
 import os
 import re
@@ -39,13 +40,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from app.ablation import config as ablation_cfg, context as ablation_ctx
-from app.core import prompt_store, scene_context, schemas
+from app.ablation import config as ablation_cfg, context as ablation_ctx, coord as ablation_coord, manifest as ablation_manifest
+from app.core import prompt_store, scene_context, schemas, util
 from app.utils import cache
 from app.oneshot import routes as oneshot
 from app.core.slots import (
@@ -81,16 +82,6 @@ RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", _REPO_ROOT / "runs"))
 # the re-baked optimized set (scripts/rebake_runs.py) instead. Falls back to
 # "objects" for any cell that hasn't been migrated.
 OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
-
-# Per-cell (run × slot × model) LLM spend cap, in USD — the DEFAULT ceiling a
-# cell starts with. When a cell's settled OpenRouter spend crosses its effective
-# cap the backfill sweep auto-pauses it ("spend cap reached"); it stays there
-# until the cap is raised past the spend (see /cap-override). The effective cap
-# is the ceiling carried by the cell's latest `run.cap_override` event, or this
-# default if it has none — so it's entirely derived from the durable log
-# (`llm.cost` + `run.cap_override`), hence restart- and rewind-proof. Set to 0
-# (or negative) to disable the cap entirely.
-SPEND_CAP_USD = float(os.environ.get("STARSHOT_SPEND_CAP_USD", "200"))
 
 # Python's mimetypes doesn't know glTF; without these the artifact route would
 # hand the loader its GLBs as text/plain.
@@ -251,44 +242,10 @@ def _all_cost_logs() -> list[SlotLog]:
 async def _cost_backfill_loop() -> None:
     while True:
         try:
-            # Enforce the spend cap PER cost, the instant each one settles (via
-            # the per-cost hook), not once at the end of the sweep — so a breaching
-            # cell pauses the moment its tipping cost returns rather than waiting
-            # on the batch's slowest unrelated lookup.
-            await llm.backfill_costs(_all_cost_logs, on_priced=_enforce_cap_for_log)
+            await llm.backfill_costs(_all_cost_logs())
         except Exception:
             pass  # best-effort observability — never let the sweep die
         await asyncio.sleep(_COST_BACKFILL_INTERVAL_S)
-
-
-async def _enforce_cap_for_log(slot_log: SlotLog) -> None:
-    """Cap enforcement for ONE cell, fired by the backfill the instant a new cost
-    lands on it. If the freshly-updated settled spend has crossed the cell's cap
-    and its pipeline is still live, cancel it and stamp a `run.cap_reached`
-    notice. The cap is inherently a SOFT tripwire — cost is only known once
-    OpenRouter settles it, so a cell can drift a little past its cap before the
-    tipping cost returns.
-
-    Idempotent under the backfill's concurrent per-cost callbacks: `_cancel_task`
-    pops the task before its first await and there's no await here before it, so
-    once the first callback has cancelled, a racing second one sees no live task
-    and no-ops — exactly one notice is ever logged. A completed cell (`run.done`,
-    hence not live) is never paused. Branch logs aren't in `_slot_logs`, so they
-    never cap — matching the run-spend accounting, which excludes simulations."""
-    if SPEND_CAP_USD <= 0:
-        return
-    events = slot_log.state["events"]
-    if not _cap_reached(events):
-        return
-    key = next((k for k, v in _slot_logs.items() if v is slot_log), None)
-    if key is None or not _live(_tasks.get(key)):
-        return
-    await _cancel_task(*key)
-    slot_log.log(
-        "run.cap_reached",
-        spend=_cell_spend(events),
-        cap=_effective_cap(events),
-    )
 
 
 _cell_gates: dict[RunKey, "CellGate"] = {}
@@ -373,12 +330,9 @@ class CellGate:
         self.budget = budget
         self._fut: asyncio.Future[dict[str, object]] | None = None
         self.auto = False  # once set, the rest of the run proceeds without pausing
-        # Fast-forward target: pass every call up to one with this TEMPLATE.
-        # `until_before` picks where to stop relative to that call: False (the
-        # default) runs THROUGH it and pauses before the NEXT call ("after X");
-        # True pauses in front of it, so X itself doesn't execute ("before X").
+        # Fast-forward target: pass every call until one with this TEMPLATE comes
+        # up, then pause right before it ("run to breakpoint at step X").
         self.until_step: str | None = None
-        self.until_before: bool = False
         self.pending: dict[str, object] | None = None
         # The call CURRENTLY in flight — released from a pause, or run on a
         # budget credit / in auto. Lets the UI show "running X" instead of the
@@ -394,40 +348,25 @@ class CellGate:
         self, *, node_id: str | None, step: str | None, template: str | None = None,
         system: str, user: str, schema_name: str, model: str,
     ) -> str | None:
-        # Mechanical per-object service steps — NOT pipeline reasoning worth a
-        # click-through — never gate: they auto-play without pausing or spending a
-        # step budget, and aren't re-aimed by a model override. library_match runs
-        # on its own gemini model; image_prompt distills a noun phrase for asset
-        # generation. So "step" / "step until" / "step sims" run straight through
-        # them (a pinned lineage still runs them on its model, already switched to
-        # by an earlier gated call).
-        if step in ("library_match", "image_prompt"):
+        # Library matching is a mechanical per-object service step (always on its
+        # own gemini model), not a pipeline step worth click-through — never gate
+        # it and never let a model override re-aim it.
+        if step == "library_match":
             return None
         call = {"node": node_id, "step": step, "template": template, "schema": schema_name, "model": model}
         if self.auto:
             self.current = call
             return self.model_override
-        # Seeking a target step: blow past every call until one whose TEMPLATE
-        # matches (root/nested variants differ in `template`, not `step`). Where
-        # we stop depends on `until_before`:
-        #   * after  (False): run THROUGH the target, then pause at the NEXT call.
-        #   * before (True):  pause in front of the target — it does NOT execute.
+        # Seeking a target step: blow past everything else, then stop AT it.
+        # `until_step` is a template id (the lab's granular step name), so match
+        # on `template` (root/nested variants differ there, not in `step`).
         if self.until_step is not None:
-            if (template or step) != self.until_step:
-                self.current = call
-                return self.model_override  # not the target yet — pass
-            # Reached the target: disarm the seek + drop any queued step credits
-            # so the breakpoint can't be skipped past.
-            self.until_step = None
-            self.budget = 0
-            if not self.until_before:
-                # "after X": run X now (don't pause before it); the NEXT call
-                # hits the pause below.
+            if (template or step) == self.until_step:
+                self.until_step = None  # arrived — fall through and pause here
+            else:
                 self.current = call
                 return self.model_override
-            # "before X": fall through to the pause branch so we stop in front
-            # of this call — X only runs on the next explicit step.
-        if self.budget > 0:
+        elif self.budget > 0:
             self.budget -= 1
             self.current = call
             return self.model_override
@@ -481,12 +420,11 @@ def _gate_awaiting(gate: "CellGate | None") -> bool:
 
 def _cell_status(key: RunKey, slot_log: SlotLog) -> str:
     """Live status of a source cell — its event log refined by its live
-    gate (awaiting), task (running), and settled spend vs. its cap (capped)."""
+    gate (awaiting) and task (running)."""
     return rlog.derive_status(
         slot_log.state["events"],
         awaiting=_gate_awaiting(_cell_gates.get(key)),
         live=_live(_tasks.get(key)),
-        capped=_cap_reached(slot_log.state["events"]),
     )
 
 
@@ -502,11 +440,6 @@ def _branch_status(br: "Branch") -> str:
 
 class RewindRequest(BaseModel):
     to_event_index: int
-
-
-class CapOverrideRequest(BaseModel):
-    # New spend-cap ceiling in USD; 0 (or less) uncaps the cell.
-    cap: float
 
 
 class CreateRunRequest(BaseModel):
@@ -537,14 +470,16 @@ class InquiryMessage(BaseModel):
 
 
 class InquiryRequest(BaseModel):
-    """One turn in a persistent "why did the model do this?" conversation about
-    a pipeline step. The client assembles and OWNS the reviewer's full system
-    prompt — the analyst framing plus that step's exact system / input / output
-    / reasoning — and sends it verbatim as `system`, so what the panel shows
-    (prefilled and editable) is byte-for-byte what is sent. `messages` is the
-    running thread and MUST end with the new user turn. Stateless: the endpoint
-    reads no cell state, so it serves source and simulation-branch calls alike."""
+    """One turn in a persistent "continue this step's conversation" thread. The
+    client seeds the thread with the step's OWN call — its exact system prompt,
+    the user message it received, and the output it produced — then carries the
+    running conversation forward in `messages` (which MUST end with the new user
+    turn). `model` is the step's own model, so the reply comes from the very LLM
+    that made the decision, picking up where it left off — no analyst persona,
+    no appended grounding. Stateless: the endpoint reads no cell state, so it
+    serves source and simulation-branch calls alike."""
 
+    model: str
     system: str = ""
     messages: list[InquiryMessage]
 
@@ -585,16 +520,14 @@ class BranchRequest(BaseModel):
 
 class BranchStepRequest(BaseModel):
     """Advance a gated cell/branch. `auto=True` runs the rest to completion;
-    `until` (a template id) fast-forwards to the next call of that step —
-    pausing AFTER it (through the call, the default) or BEFORE it when
-    `until_before=True` (the call doesn't execute). `model` (a model ALIAS)
-    re-aims a branch's next gated call at a chosen LLM — compare's per-step
-    model A/B — independent of the model that produced the pre-branch scene;
-    None keeps the branch's current model."""
+    `until` (a template id) fast-forwards a source cell to the next call of
+    that step and pauses there. `model` (a model ALIAS) re-aims a branch's next
+    gated call at a chosen LLM — compare's per-step model A/B — independent of
+    the model that produced the pre-branch scene; None keeps the branch's
+    current model."""
 
     auto: bool = False
     until: str | None = None
-    until_before: bool = False
     model: str | None = None
 
 
@@ -670,69 +603,6 @@ class SaveRunRequest(BaseModel):
     ablation: dict[str, object] | None = None
 
 
-class AbTestCell(BaseModel):
-    slot: str
-    model: str
-
-
-class AbTestRequest(BaseModel):
-    """Launch a NEW run seeded with `source_run`'s ROOT zone plans. Each
-    listed (slot, model) cell's log is copied through its root
-    `divider.zone_plan` and no further; the cell is then started on
-    `prompt_version`, so the resumable divider replays that one committed
-    plan verbatim (committed.zone_plan) and re-derives everything below it
-    under the new prompts — a prompt A/B that holds the top-level plan fixed
-    and varies the whole scene beneath it."""
-
-    name: str
-    prompt_version: str
-    source_run: str
-    cells: list[AbTestCell]
-
-
-class CopySlotRequest(BaseModel):
-    """Copy an entire slot folder (all its model cells + meshes) from
-    `source_run` into the destination run (the path `run`), OVERWRITING the
-    destination's slot dir. The source run is left untouched."""
-
-    source_run: str
-    slot: str
-
-
-def _root_plan_cut(events: list[dict[str, object]]) -> int | None:
-    """Leading-event count to keep so a copy holds through the ROOT zone plan
-    and nothing after — the position of the root `divider.zone_plan` event + 1,
-    or None if this cell never planned its root. A true prefix, so the copied
-    events keep `index == line` and a resumed `log()` continues cleanly."""
-    for i, e in enumerate(events):
-        if e.get("kind") == "divider.zone_plan" and e.get("node") == "root":
-            return i + 1
-    return None
-
-
-def _llm_error_message(e: Exception) -> str:
-    """Full detail for an LLM/provider error. OpenRouter SDK errors only
-    stringify to the generic top-level message (e.g. "Provider returned
-    error"); the actually useful cause — the upstream provider's complaint and
-    the request body that tripped it — lives on `e.data.error.metadata` and
-    `e.body` (the response body the SDK already read; `raw_response.text` would
-    re-trigger a read on a closed streaming response). Fold both into one string
-    so every caller (pipeline run.error, the investigator's /inquire) surfaces
-    what actually went wrong instead of the opaque top-level message."""
-    details: list[str] = []
-    data = getattr(e, "data", None)
-    err = getattr(data, "error", None) if data is not None else None
-    if err is not None:
-        metadata = getattr(err, "metadata", None)
-        if metadata:
-            details.append(f"metadata={metadata}")
-    body = getattr(e, "body", None)
-    if body:
-        details.append(f"body={str(body)[:2000]}")
-    suffix = (" | " + " | ".join(details)) if details else ""
-    return f"{type(e).__name__}: {e}{suffix}"
-
-
 def _run_id(run: str, slot_id: str, model_alias: str) -> str:
     """Composite id used as `run_id` in pipeline code (divider, generation,
     threed queue, SlotLog.slot_id). The slashes make it work as a filesystem
@@ -742,6 +612,26 @@ def _run_id(run: str, slot_id: str, model_alias: str) -> str:
 
 def _run_dir(run: str) -> Path:
     return RUNS_DIR / run
+
+
+def _valid_run_name(name: str, *, allow_ablation_subtree: bool = False) -> bool:
+    """A run id is normally ONE flat segment (no path separators). The sole
+    exception is an ablation variant, which nests as
+    ``<base>/ablations/<experiment>/<variant>`` (see app.ablation.config) — so a
+    variant's logical id is a path. Validate every segment either way (no ``..``,
+    no leading dot, no backslash)."""
+    name = (name or "").strip()
+    if not name or "\\" in name or name.startswith("."):
+        return False
+    if "/" not in name:
+        return True
+    if not allow_ablation_subtree:
+        return False
+    segs = name.split("/")
+    # <base>/ablations/<experiment>/<variant>[/...]
+    if len(segs) < 4 or segs[1] != ablation_cfg.ABLATIONS_SUBDIR:
+        return False
+    return all(s and s != ".." and not s.startswith(".") for s in segs)
 
 
 def _slot_dir(run: str, slot_id: str, model_alias: str) -> Path:
@@ -1063,6 +953,79 @@ def _resolve_run(run: str | None) -> str:
     return resolved
 
 
+def _cell_dir_nohydrate(
+    run: str | None, slot_id: str, model_alias: str,
+) -> tuple[str, Path]:
+    """Resolve (run, cell_dir) for a poll/read that touches ONLY on-disk
+    artifacts (attention analyses, sidecars) — WITHOUT hydrating the run's event
+    logs into memory. The attention drawer/board poll status for every ablation
+    variant; hydrating each variant's (up to ~450MB) log just to read a path is
+    exactly what ballooned RAM into tens of GB. Attention state is a pure disk
+    scan, so the path is all these endpoints need."""
+    resolved = run or _current_run
+    _require_slot(slot_id)
+    _require_model(model_alias)
+    return resolved, _slot_dir(resolved, slot_id, model_alias)
+
+
+_STATUS_KIND_RE = re.compile(rb'"kind"\s*:\s*"([^"]+)"')
+_RUN_STATUS_TAIL_BYTES = 262144  # last 256KB comfortably holds the terminal markers
+# events.jsonl path -> (mtime, size, status). Terminal/steady status is cached so
+# repeat polls of an unchanged log are O(1); a growing log re-scans its tail.
+_run_status_cache: dict[str, tuple[float, int, str]] = {}
+
+
+def _scan_run_status(events_path: Path) -> dict[str, str]:
+    """Coarse status from the events.jsonl TAIL. Mirrors the client's old
+    `statusFromEvents`: a completion (run.done / ablation.complete) wins over an
+    inherited base error; an error counts only if it's the latest marker. Reads
+    at most the trailing 256KB and never JSON-parses the huge payload lines."""
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {"status": "idle"}
+    if st.st_size == 0:
+        return {"status": "idle"}
+    key = str(events_path)
+    cached = _run_status_cache.get(key)
+    if cached is not None and cached[0] == st.st_mtime and cached[1] == st.st_size:
+        return {"status": cached[2]}
+    try:
+        with events_path.open("rb") as f:
+            if st.st_size > _RUN_STATUS_TAIL_BYTES:
+                f.seek(st.st_size - _RUN_STATUS_TAIL_BYTES)
+                f.readline()  # drop the partial first line after the seek
+            data = f.read()
+    except OSError:
+        return {"status": "idle"}
+    done_at = error_at = paused_at = active_at = -1
+    i = 0
+    for raw in data.split(b"\n"):
+        if not raw.strip():
+            continue
+        i += 1
+        m = _STATUS_KIND_RE.search(raw, 0, 200)
+        kind = m.group(1).decode("ascii", "replace") if m else ""
+        if kind in ("run.done", "ablation.complete"):
+            done_at = i
+        elif kind == "run.error":
+            error_at = i
+        elif kind == "run.paused":
+            paused_at = i
+        else:  # run.start / run.resume / any real work
+            active_at = i
+    if done_at >= 0:
+        status = "done"
+    elif paused_at > error_at and paused_at >= active_at:
+        status = "paused"
+    elif error_at >= 0 and error_at >= active_at and error_at >= paused_at:
+        status = "error"
+    else:
+        status = "running"
+    _run_status_cache[key] = (st.st_mtime, st.st_size, status)
+    return {"status": status}
+
+
 def _run_meta(run: str) -> dict[str, object]:
     """The run's `run.json` (prompt version name, created_at), or {} for runs
     that predate the file-based prompt versioning."""
@@ -1072,6 +1035,34 @@ def _run_meta(run: str) -> dict[str, object]:
         return data if isinstance(data, dict) else {}
     except (OSError, json.JSONDecodeError):
         return {}
+
+
+def _all_ablation_variants() -> list[tuple[str, dict[str, object]]]:
+    """(run_id, ablation_meta) for EVERY variant across all bases — the single
+    discovery source. Nested variants come from each base's `ablations/manifest.json`
+    (folded layout); legacy flat `<base>__abl-…` top-level runs (pre-migration) are
+    included too. `run_id` is the API key: the nested `<base>/ablations/<exp>/<variant>`
+    path, or the flat name."""
+    out: list[tuple[str, dict[str, object]]] = []
+    if not RUNS_DIR.exists():
+        return out
+    for p in sorted(pp for pp in RUNS_DIR.iterdir() if pp.is_dir()):
+        abl = _run_meta(p.name).get("ablation")
+        if isinstance(abl, dict) and abl.get("base_run"):
+            out.append((p.name, abl))  # legacy flat variant
+            continue
+        if (p / ablation_cfg.ABLATIONS_SUBDIR).is_dir():
+            for v in ablation_manifest.read(p, rebuild_on_miss=False).get("variants", []):
+                rid = str(v.get("run_id") or "")
+                if not rid:
+                    continue
+                out.append((rid, {
+                    "base_run": p.name, "slot": v.get("slot"), "model": v.get("model"),
+                    "target_step_kind": v.get("target_step_kind"), "cut": v.get("cut"),
+                    "last_n": v.get("last_n"), "replicate": v.get("replicate", 1),
+                    "label": v.get("label"), "treatment": v.get("treatment") or {},
+                }))
+    return out
 
 
 def _require_run_prompts(run: str) -> prompt_store.PromptSet:
@@ -1090,6 +1081,25 @@ def _require_run_prompts(run: str) -> prompt_store.PromptSet:
         raise HTTPException(status_code=409, detail=str(e))
 
 
+def _event_pos_by_index(events: list, event_index: int) -> int | None:
+    """List POSITION of the event whose canonical ``index`` FIELD == event_index.
+
+    Normally ``index == position`` (log() stamps index = len at write, hydrate
+    appends 1:1). But a base whose log was rewound+resumed, or reloaded after a
+    crash that left stale duplicate lines on disk, can carry ``index != position``
+    for a stretch. The client's cut is the ``index`` FIELD (that's what tf-steps
+    returns and what attention/{idx}.json is keyed on), so it MUST be resolved by
+    field — resolving by position lands on the wrong event (→ 400 "event is not an
+    LLM call"). Prefers the LAST match (the live / re-run copy). Fast-paths the
+    common undrifted case."""
+    if 0 <= event_index < len(events) and events[event_index].get("index") == event_index:
+        return event_index
+    for i in range(len(events) - 1, -1, -1):
+        if events[i].get("index") == event_index:
+            return i
+    return None
+
+
 def _require_step_event(
     run: str, slot_id: str, model_alias: str, event_index: int, step: str,
 ) -> tuple[SlotLog, dict[str, object]]:
@@ -1100,9 +1110,10 @@ def _require_step_event(
         raise HTTPException(status_code=404, detail=f"unknown step: {step}")
     slot_log = _require_slot_log(run, slot_id, model_alias)
     events = slot_log.state["events"]
-    if not (0 <= event_index < len(events)):
+    pos = _event_pos_by_index(events, event_index)
+    if pos is None:
         raise HTTPException(status_code=400, detail="event_index out of range")
-    event = events[event_index]
+    event = events[pos]
     if event.get("kind") != "cache.llm":
         raise HTTPException(status_code=400, detail="event is not an LLM call")
     if event.get("template") != step:
@@ -1110,23 +1121,45 @@ def _require_step_event(
             status_code=400,
             detail=f"event is a {event.get('template') or event.get('step')!r} call, not {step!r}",
         )
-    if not isinstance(event.get("variables"), dict):
+    # `has_variables` is the slim marker for "logged its render variables" (the
+    # raw `variables` dict itself lives on disk).
+    if not event.get("has_variables"):
         raise HTTPException(
             status_code=409,
             detail="event predates variable logging — re-run the cell to make it testable",
         )
-    return slot_log, event
+    full = slot_log.full_event(event_index)
+    if full is None:
+        raise HTTPException(status_code=404, detail="event body missing on disk")
+    return slot_log, full
 
 
-# --- reviewer chat ----------------------------------------------------------
+# --- decision inquiry -------------------------------------------------------
 #
-# The stateless reviewer behind the scene investigator: a fixed strong model so
-# analysis quality is constant across whatever subject model is being
-# benchmarked. The full system prompt (analyst framing + scene grounding + step
-# timeline + any attached steps) is assembled CLIENT-SIDE and passed in `system`;
-# this endpoint just pins the reviewer model and forwards the conversation. The
-# reviewer is Claude Opus 4.8 at xhigh reasoning regardless of the subject model.
-INQUIRY_MODEL = "anthropic/claude-opus-4.8"
+# "Why did the model do this?" — a persistent, free-form chat that CONTINUES the
+# step's own LLM call. The client seeds the thread with that call's exact system
+# prompt, input, and output, then forwards each new turn here; the reply comes
+# from the very model that ran the step (req.model), picking up the conversation
+# where it left off. No analyst persona, no re-grounding: the conversation
+# history is sent unchanged.
+#
+# The one thing appended is FREEFORM_CONTINUATION — and only to the system
+# message. The pipeline's system prompts mandate a strict JSON-only answer
+# ("respond with a single JSON object… no prose"), and the seeded assistant turn
+# IS that JSON, so without releasing that constraint the model just keeps
+# emitting the step's output schema (useless for a conversation). This frees the
+# remaining turns to be plain prose while the message history stays untouched.
+# Stateless: no run state is read or mutated, so it serves source and
+# simulation-branch calls alike.
+FREEFORM_CONTINUATION = (
+    "\n\n---\n"
+    "The structured-output task above is COMPLETE. Everything below is a free-form "
+    "conversation with a developer reviewing the decision you just made. For the rest "
+    "of this conversation, DISREGARD any instruction above to answer only in JSON, to "
+    "conform to a fixed schema, or to avoid prose — those governed the task output "
+    "above, not this discussion. Reply in plain, conversational prose (no JSON, no code "
+    "fences) and answer the developer's questions directly, explaining your earlier work."
+)
 
 
 # --- prompt inspector -------------------------------------------------------
@@ -1597,7 +1630,7 @@ def create_app() -> FastAPI:
     RUNS_DIR.mkdir(parents=True, exist_ok=True)
 
     @app.get("/artifacts/{artifact_path:path}")
-    async def artifact(artifact_path: str) -> FileResponse:  # pyright: ignore[reportUnusedFunction]
+    async def artifact(artifact_path: str) -> Response:  # pyright: ignore[reportUnusedFunction]
         # Per-cell artifacts (events.jsonl, reference PNGs, GLBs). The URLs are
         # baked into the event log as `<cell>/objects/<id>.<ext>`. Cells migrated
         # onto the optimized library (rebake_runs.py --prune-originals) hold those
@@ -1613,13 +1646,83 @@ def create_app() -> FastAPI:
             alt = (base / alt_rel).resolve()
             if alt.is_relative_to(base) and alt.is_file():
                 target = alt
+        # A terminal .jsonl may be stored gzipped (events.jsonl.gz) with no plain
+        # twin (a finished ablation variant, compacted for disk). Serve the
+        # requested .jsonl by decompressing on the fly — same in-RAM snapshot
+        # semantics as a plain log, so the client sees identical ndjson.
+        if not target.is_file() and target.suffix == ".jsonl":
+            gz = target.with_name(target.name + ".gz")
+            if gz.resolve().is_relative_to(base) and gz.is_file():
+                try:
+                    data = gzip.decompress(gz.read_bytes())
+                except OSError as e:
+                    raise HTTPException(status_code=404) from e
+                return Response(content=data, media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
         if not target.is_file():
             raise HTTPException(status_code=404)
+        # events.jsonl is APPEND-ONLY: a run keeps writing to it while the board /
+        # tf drawer poll it. FileResponse stamps Content-Length from an initial
+        # stat() then streams to EOF, so if the file grows in between it sends more
+        # bytes than the header promised and uvicorn aborts the response with
+        # "Response content longer than Content-Length". Serve growing .jsonl logs
+        # from an in-memory SNAPSHOT instead — Content-Length then always matches
+        # the bytes returned (a consistent point-in-time view of the log).
+        if target.suffix == ".jsonl":
+            try:
+                data = target.read_bytes()
+            except OSError as e:
+                raise HTTPException(status_code=404) from e
+            return Response(content=data, media_type="application/x-ndjson", headers={"Cache-Control": "no-store"})
         return FileResponse(target, media_type=_ARTIFACT_MEDIA_TYPES.get(target.suffix.lower()))
+
+    @app.get("/attention-index/{cell:path}")
+    async def attention_index(cell: str, max_heads: int = 0) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Version-aware computed/stale attention indices for a cell, where `cell` is
+        `<run>/<slot>/<model>`. A pure DISK SCAN of `<cell>/attention/*.json` (with
+        mtime-cached meta reads) — NO run hydration and NO Modal poll — so the
+        ablation drawer can ask "what's already computed here?" cheaply and in bulk
+        BEFORE pulling anything, instead of 404-probing each guessed event index.
+        `stale` = present but from an older analysis version (needs a recompute)."""
+        base = RUNS_DIR.resolve()
+        cell_dir = (base / cell).resolve()
+        if not cell_dir.is_relative_to(base) or not cell_dir.is_dir():
+            return {"fresh": [], "stale": []}
+        status = attn_store.list_status(cell_dir, min_heads=max_heads)
+        return {"fresh": status["fresh"], "stale": status["stale"]}
+
+    @app.get("/run-status/{cell:path}")
+    async def run_status(cell: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Coarse lifecycle status (done / error / paused / running / idle) for a
+        cell (`<run>/<slot>/<model>`), computed from a cheap TAIL scan of its
+        events.jsonl — NO whole-file read, NO JSON parse of the huge payload
+        lines, NO run hydration. The ablation board polls this per variant;
+        previously it pulled the ENTIRE (up to ~450MB) log over the wire per
+        variant just to read the last few lifecycle markers."""
+        base = RUNS_DIR.resolve()
+        cell_dir = (base / cell).resolve()
+        if not cell_dir.is_relative_to(base):
+            return {"status": "idle"}
+        ev = cell_dir / "events.jsonl"
+        if not ev.is_file():
+            # A gzipped log has no plain twin: it's a compacted TERMINAL cell (only
+            # run.done / ablation.complete logs are gzipped), so its status is
+            # "done" — O(1), no decompress. Without this a folded ablation variant
+            # reads as "idle" and the board shows finished runs as never-started.
+            if (cell_dir / "events.jsonl.gz").is_file():
+                return {"status": "done"}
+            return {"status": "idle"}
+        return await asyncio.to_thread(_scan_run_status, ev)
 
     @app.get("/runs")
     async def list_runs() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # Ablation variants are NO LONGER listed here — they're folded under their
+        # base run and discovered via GET /runs/<base>/ablations. This keeps the
+        # top-level list to real runs instead of the hundreds of disposable forks.
+        # Legacy flat `<base>__abl-…` variants (pre-migration) are likewise excluded
+        # and counted toward their base's `ablation_count`.
         items: list[dict[str, object]] = []
+        flat_abl_by_base: dict[str, int] = {}
+        base_dirs: list[tuple[Path, dict[str, object]]] = []
         if RUNS_DIR.exists():
             for p in sorted(
                 (p for p in RUNS_DIR.iterdir() if p.is_dir()),
@@ -1627,26 +1730,63 @@ def create_app() -> FastAPI:
                 reverse=True,
             ):
                 meta = _run_meta(p.name)
-                pv = meta.get("prompt_version")
                 abl = meta.get("ablation")
+                if isinstance(abl, dict) and abl.get("base_run"):
+                    b = str(abl["base_run"])  # a not-yet-migrated flat variant
+                    flat_abl_by_base[b] = flat_abl_by_base.get(b, 0) + 1
+                    continue
+                base_dirs.append((p, meta))
+            for p, meta in base_dirs:
+                pv = meta.get("prompt_version")
+                nested = 0
+                if (p / ablation_cfg.ABLATIONS_SUBDIR).is_dir():
+                    nested = len(ablation_manifest.read(p, rebuild_on_miss=False).get("variants", []))
                 items.append(
                     {
                         "name": p.name,
                         "modified_at": p.stat().st_mtime,
                         # null for legacy runs (loadable, not resumable).
                         "prompt_version": pv if isinstance(pv, str) else None,
-                        # present only on ablation variants → lets the dashboard
-                        # board + /tf group them into base+label families without
-                        # a per-run metadata fetch.
-                        "ablation": abl if isinstance(abl, dict) else None,
+                        "ablation": None,  # base runs carry no ablation block
+                        # how many ablation variants this run has (nested + legacy flat)
+                        "ablation_count": nested + flat_abl_by_base.get(p.name, 0),
                     }
                 )
         return {"runs": items, "current": _current_run}
 
+    @app.get("/runs/{base_run}/ablations")
+    async def list_ablations(base_run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Every ablation variant of a base run, in ONE read — so the board / tf
+        drawer no longer scan the whole top-level run list and filter by name.
+
+        Merges two sources during the flat→nested transition:
+          * NESTED (new layout) — the base's `ablations/manifest.json` (rebuilt on
+            miss), i.e. runs folded under `runs/<base>/ablations/<experiment>/<variant>`;
+          * LEGACY FLAT — top-level `<base>__abl-…` runs not yet migrated, discovered
+            by their `run.json` ablation meta (never by name-parsing).
+        Each variant carries `run_id` (the API key: nested path or flat name),
+        `experiment`, `slot`, `model`, `target_step_kind`, `cut`, `replicate`,
+        `treatment`, and `legacy_flat` when it still lives at the top level."""
+        # Compat shape: mirror a `/runs` item (`{name, ablation}`) + `run_id`,
+        # `experiment`, `legacy_flat`, so callers migrate off the /runs filter with
+        # a near drop-in swap (they already read `it.name` + `it.ablation.*`).
+        variants = [
+            {
+                "name": run_id,
+                "run_id": run_id,
+                "experiment": ablation_cfg.experiment_id(abl),
+                "legacy_flat": "/" not in run_id,  # a flat top-level id is not yet migrated
+                "ablation": abl,
+            }
+            for run_id, abl in _all_ablation_variants()
+            if str(abl.get("base_run") or "") == base_run
+        ]
+        return {"base_run": base_run, "variants": variants}
+
     @app.post("/runs")
     async def create_run(req: CreateRunRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         name = req.name.strip()
-        if not name or "/" in name or "\\" in name or name.startswith("."):
+        if not _valid_run_name(name):
             raise HTTPException(status_code=400, detail="invalid run name")
         version = req.prompt_version.strip()
         if not prompt_store.version_exists(version):
@@ -1676,17 +1816,20 @@ def create_app() -> FastAPI:
         _current_run = name
         return {"current": name}
 
-    @app.delete("/runs/{name}")
+    @app.delete("/runs/{name:path}")
     async def delete_run(name: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Delete a run and everything on disk for it, after stopping any live
         cells so nothing keeps writing into files being removed. Refuses to
         delete the active run (switch away first). Backs the ablation board's
         reset — ablation variants are disposable forks, so this is their cleanup.
-        """
+        `{name:path}` so a nested ablation variant id
+        (`<base>/ablations/<exp>/<variant>`) is deletable too."""
         name = name.strip()
-        if not name or "/" in name or "\\" in name or name.startswith("."):
+        if not _valid_run_name(name, allow_ablation_subtree=True):
             raise HTTPException(status_code=400, detail="invalid run name")
         run_dir = _run_dir(name)
+        if not run_dir.resolve().is_relative_to(RUNS_DIR.resolve()):
+            raise HTTPException(status_code=400, detail="invalid run name")
         if not run_dir.is_dir():
             raise HTTPException(status_code=404, detail=f"no such run: {name}")
         if name == _current_run:
@@ -1702,6 +1845,14 @@ def create_app() -> FastAPI:
             if br is not None:
                 await _cancel_branch_task(br)
         shutil.rmtree(run_dir, ignore_errors=True)
+        # A folded variant left its base run's manifest stale — rebuild it.
+        if f"/{ablation_cfg.ABLATIONS_SUBDIR}/" in name:
+            base = name.split(f"/{ablation_cfg.ABLATIONS_SUBDIR}/", 1)[0]
+            if base and _run_dir(base).is_dir():
+                try:
+                    ablation_manifest.refresh(_run_dir(base))
+                except OSError:
+                    pass
         return {"deleted": name}
 
     @app.post("/runs/snapshot")
@@ -1841,43 +1992,36 @@ def create_app() -> FastAPI:
 
     @app.post("/inquire")
     async def inquire(req: InquiryRequest) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        """Ask the reviewer (Claude Opus 4.8, xhigh reasoning) the latest
-        question in a conversation, and keep asking — the client carries the
-        thread forward in `messages`, so it is persistent. `system` is the exact,
-        client-assembled prompt (the investigator's analyst framing + scene
-        grounding + any attached steps). Stateless: nothing about any run is read
-        or mutated."""
+        """Continue a step's own conversation: seeded client-side with that
+        call's system / input / output, `messages` carries the running thread
+        and MUST end with the new user turn, and the reply comes from `model` —
+        the very LLM that made the step. The step's system prompt is sent with
+        FREEFORM_CONTINUATION appended so the model answers in prose instead of
+        the step's JSON schema; the message history is sent unchanged. Stateless:
+        no run state is touched."""
+        if not req.model:
+            raise HTTPException(status_code=400, detail="no model to continue the step's call with")
         if not req.messages or req.messages[-1].role != "user":
             raise HTTPException(
                 status_code=400,
                 detail="messages must be non-empty and end with a user turn",
             )
         convo = [{"role": m.role, "content": m.content} for m in req.messages]
+        # Continue at the effort the step's model runs at in the pipeline (mirrors
+        # llm._reasoning_effort): GPT stays at medium (xhigh is slow + costly
+        # there), every other provider at xhigh.
+        effort = "medium" if req.model.startswith("openai/") else "xhigh"
         try:
-            answer, reasoning = await llm.chat(model=INQUIRY_MODEL, system=req.system, messages=convo)
+            answer, reasoning = await llm.chat(
+                model=req.model,
+                system=req.system + FREEFORM_CONTINUATION,
+                messages=convo,
+                reasoning_effort=effort,
+            )
         except Exception as e:
-            # Provider/transport failure → clean 502 the panel shows inline, with
-            # the provider's ACTUAL complaint (metadata/body), not just the SDK's
-            # opaque "Provider returned error".
-            raise HTTPException(status_code=502, detail=_llm_error_message(e))
-        return {"answer": answer, "reasoning": reasoning, "model": INQUIRY_MODEL}
-
-    # --- per-slot investigator context --------------------------------------
-    #
-    # The holistic "why is the WHOLE scene like this?" chat (vs. the per-step
-    # `/inquire` above) needs the cell's faithful base grounding: the full final
-    # scene context + a timeline of every executed step's output/reasoning/vars.
-    # The client fetches this once per open (and on refresh), pairs it with the
-    # run's prompt templates + a static pipeline explainer, and forwards the
-    # composed system prompt through the SAME `/inquire` reviewer. Read-only.
-    @app.get("/slots/{slot_id}/{model_alias}/investigator")
-    async def slot_investigator(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        run = _resolve_run(run)
-        return _investigator_bundle(_require_slot_log(run, slot_id, model_alias))
-
-    @app.get("/branches/{branch_id}/investigator")
-    async def branch_investigator(branch_id: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        return _investigator_bundle(_require_branch(branch_id).log)
+            # Provider/transport failure → clean 502 the panel shows inline.
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+        return {"answer": answer, "reasoning": reasoning, "model": req.model}
 
     @app.get("/runs/{run}/prompt-templates")
     async def run_prompt_templates(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -1927,9 +2071,10 @@ def create_app() -> FastAPI:
             for e in slot_log.state["events"]:
                 if e.get("kind") != "cache.llm" or e.get("template") != step:
                     continue
-                if not isinstance(e.get("variables"), dict):
+                if not e.get("has_variables"):
                     continue
-                output = json.dumps(e.get("output"), ensure_ascii=False)
+                full = slot_log.full_event(e.get("index")) or {}
+                output = json.dumps(full.get("output"), ensure_ascii=False)
                 items.append(
                     {
                         "slot": slot_id,
@@ -2007,6 +2152,11 @@ def create_app() -> FastAPI:
         if match is None:
             where = f"{step} @ {node}" if node else step
             raise HTTPException(status_code=404, detail=f"the branch has not re-run {where} yet")
+        # Heavy fields (system/user/output/reasoning) live on disk — load the
+        # matched event in full for the diff view.
+        idx = match.get("index")
+        full = br.log.full_event(idx) if isinstance(idx, int) else None
+        full = full if isinstance(full, dict) else match
         return {
             "branch": branch_id,
             "slot": br.slot,
@@ -2015,10 +2165,10 @@ def create_app() -> FastAPI:
             "index": match.get("index"),
             "node": match.get("node"),
             "model_id": match.get("model"),
-            "system": match.get("system"),
-            "user": match.get("user"),
-            "output": match.get("output"),
-            "reasoning": match.get("reasoning"),
+            "system": full.get("system"),
+            "user": full.get("user"),
+            "output": full.get("output"),
+            "reasoning": full.get("reasoning"),
             "tokens_in": match.get("tokens_in"),
             "tokens_out": match.get("tokens_out"),
         }
@@ -2179,6 +2329,30 @@ def create_app() -> FastAPI:
             events = events[:until_index]
         return _scene_projection(events)
 
+    @app.get("/slots/{slot_id}/{model_alias}/spatial-ranks")
+    async def spatial_ranks(slot_id: str, model_alias: str, run: str | None = None, ev: int = -1) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Per-object spatial relevance to a step's TARGET node (the zone/object it
+        decomposes or places): distance from the target + a ray-trace visibility
+        score, from the (variant-independent) scene geometry. Powers the ablation
+        "does it attend to what's close / visible?" graph. Pure geometry, NO GPU —
+        the cheap 'compute' the client kicks per firing. `ev` = the step's event
+        index (its cache.llm `index`)."""
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        target_id = None
+        for e in slot_log.state["events"]:
+            if e.get("kind") == "cache.llm" and e.get("index") == ev:
+                target_id = e.get("node")
+                break
+        if not target_id:
+            return {"target": None, "objects": []}
+        nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
+        ranks = await asyncio.to_thread(util.object_spatial_ranks, str(target_id), nodes)
+        objs = [{"id": k, "distance": v["distance"], "ray_hits": v["ray_hits"]} for k, v in ranks.items()]
+        return {"target": target_id, "objects": objs}
+
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
     async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
@@ -2251,8 +2425,9 @@ def create_app() -> FastAPI:
                 "has_logprobs": e.get("logprobs") is True,
                 # Whether the step's prompt has scene entities to attend to. The UI
                 # skips scene-less steps (root plans / overall bbox) when computing
-                # attention — there'd be no scene-attending heads anyway.
-                "has_scene": teacher_forcing.has_scene_context(e),
+                # attention — there'd be no scene-attending heads anyway. Precomputed
+                # slim marker (the raw `variables` it derives from live on disk).
+                "has_scene": bool(e.get("has_scene")),
                 # Render the scene up to (but not including) the NEXT step, so the
                 # bbox/model events this step produced are on screen.
                 "render_until": calls[i + 1].get("index") if i + 1 < len(calls) else None,
@@ -2270,6 +2445,18 @@ def create_app() -> FastAPI:
         }
         return {"run": run, "slot": slot_id, "model": model_alias, "steps": steps, "attention": attention}
 
+    @app.get("/slots/{slot_id}/{model_alias}/tf-tree")
+    async def tf_tree(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # The compact scene-tree + emitting provenance the /tf inspector reads
+        # instead of downloading + folding the whole (hundreds-of-MB) events.jsonl
+        # client-side. Built from the SLIM in-memory buffer (no cache.llm bodies,
+        # no full-log read) — see _obs_tree.
+        run = _resolve_run(run)
+        _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        return {"run": run, "slot": slot_id, "model": model_alias, **_obs_tree(slot_log.state["events"])}
+
     def _load_logprobs_sidecar(cell_dir: Path, event: dict[str, object]) -> dict[str, object] | None:
         if event.get("logprobs") is not True:
             return None
@@ -2285,23 +2472,45 @@ def create_app() -> FastAPI:
             return None
 
     def _find_llm_event(slot_log: SlotLog, event_index: int) -> dict[str, object]:
+        # Locate via the slim buffer, then return the FULL event off disk —
+        # build_export needs the raw system/user/output/variables the buffer drops.
         for e in slot_log.state["events"]:
             if e.get("index") == event_index and e.get("kind") == "cache.llm":
-                return e
+                full = slot_log.full_event(event_index)
+                if full is None:
+                    raise HTTPException(status_code=404, detail=f"cache.llm event body missing at index {event_index}")
+                return full
         raise HTTPException(status_code=404, detail=f"no cache.llm event at index {event_index}")
 
     # The faithful (mock) teacher-forcing export for ONE step: the reconstructed
     # Gemma input + reasoning + output as a single sequence, plus id -> char-span
     # maps for scene-context zones/objects, the to-place batch, output
     # assignments, and every rendered variable. See services/teacher_forcing.py.
-    @app.get("/slots/{slot_id}/{model_alias}/tf-export/{event_index}")
-    async def tf_export(slot_id: str, model_alias: str, event_index: int, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    @app.get("/slots/{slot_id}/{model_alias}/tf-export/{event_index}", response_model=None)
+    async def tf_export(slot_id: str, model_alias: str, event_index: int, request: Request, response: Response, run: str | None = None) -> dict[str, object] | Response:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
         _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
+        # Cheap revalidation before the (heavy) reconstruction: the step's content
+        # `key` + its logprobs-sidecar mtime + model uniquely determine the export,
+        # so a repeat request 304s without _find_llm_event's disk read or build_export.
+        slim = next((e for e in slot_log.state["events"] if e.get("index") == event_index and e.get("kind") == "cache.llm"), None)
+        if slim is None:
+            raise HTTPException(status_code=404, detail=f"no cache.llm event at index {event_index}")
+        cell_dir = slot_log.events_path.parent
+        key = slim.get("key")
+        lp_mtime = ""
+        if slim.get("logprobs") is True and isinstance(key, str):
+            try:
+                lp_mtime = (cell_dir / "logprobs" / f"{key}.json").stat().st_mtime
+            except OSError:
+                lp_mtime = ""
+        nm = _revalidate(request, response, _make_etag("tf-export", _TF_EXPORT_ETAG_VERSION, MODELS[model_alias], key, lp_mtime))
+        if nm is not None:
+            return nm
         event = _find_llm_event(slot_log, event_index)
-        logprobs = _load_logprobs_sidecar(slot_log.events_path.parent, event)
+        logprobs = _load_logprobs_sidecar(cell_dir, event)
         return teacher_forcing.build_export(
             event, run=run, slot=slot_id, model_alias=model_alias,
             model_id=MODELS[model_alias], logprobs=logprobs,
@@ -2331,6 +2540,15 @@ def create_app() -> FastAPI:
     # few ticks instead of loading one giant response (the status metadata is always
     # returned immediately regardless).
     _ATTN_FETCH_CAP = 6
+    # Per-cell set of event indices whose CURRENT committed result we've already
+    # pulled locally. It makes the bounded fetch window MONOTONIC: each done step is
+    # fetched at most once per commit — never re-pulled just because it still reads
+    # `stale` under the current version — so the whole `done` backlog drains instead
+    # of the cap re-pulling the same head of a never-shrinking stale list forever. A
+    # (re)computing step is dropped from the set so its NEW commit is re-fetched.
+    _attn_pulled: dict[str, set[int]] = {}
+    # Warn once per distinct worker analysis_version skew (avoid per-poll spam).
+    _attn_worker_ver_warned: set[int] = set()
 
     def _pull_remote_attention(
         run: str, slot_id: str, model_alias: str, cell_dir: Path, *, max_heads: int = 0,
@@ -2381,19 +2599,28 @@ def create_app() -> FastAPI:
         remote["errors"] = clean_errors
         if not done:
             return remote
-        # Need = done steps whose on-disk analysis is missing/stale for the CURRENT
-        # key + head budget. Skipping the already-fresh ones is what lets the capped
-        # fetch make forward progress without acks.
+        # PULL-ONCE backlog: done steps whose committed result we haven't fetched yet
+        # this session AND whose on-disk copy is missing/stale. A (re)computing step
+        # is dropped from `pulled` first, so its NEW commit is re-fetched; everything
+        # else is fetched at most once per commit. `draining` is the remaining backlog
+        # — the client keeps polling until it hits 0 (see hasPending), so a finished
+        # batch fully lands (including steps far down the list) without manual re-syncs
+        # and WITHOUT the cap re-pulling the same never-fresh steps every tick.
+        pulled = _attn_pulled.setdefault(h, set())
+        for ev in [int(x) for x in (remote.get("running") or [])]:
+            pulled.discard(ev)  # (re)computing → a new commit is coming → allow a re-fetch
         need = [
             ev for ev in done
-            if ev in key_by_ev
+            if ev in key_by_ev and ev not in pulled
             and not attn_store.is_fresh(attn_store.load(cell_dir, ev), key_by_ev[ev], min_heads=max_heads)
         ]
+        remote["draining"] = len(need)
         if not need:
             return remote
         fetched = attn_dispatch.fetch_results(cell_hash=h, event_indices=need[:_ATTN_FETCH_CAP])
         for item in fetched.get("results") or []:
             ev = int(item["event_index"])
+            pulled.add(ev)  # committed + fetched — don't re-pull until it recomputes
             cur_key = key_by_ev.get(ev)
             if not attn_identity.verify(
                 item.get("stamp"), cell_hash=h, event_index=ev,
@@ -2404,6 +2631,7 @@ def create_app() -> FastAPI:
             data.setdefault("meta", {})["input_key"] = item.get("input_key")
             data["meta"]["cached"] = False
             attn_store.save_dict(cell_dir, ev, data)  # -> {ev}.json (compact, served directly)
+        remote["draining"] = len([ev for ev in need if ev not in pulled])  # what's still left
         return remote
 
     # The big per-token/per-head result is pulled ON DEMAND (streamed) only when a
@@ -2749,12 +2977,13 @@ def create_app() -> FastAPI:
         slot_id: str, model_alias: str, run: str | None = None, max_heads: int = 0,
     ) -> dict[str, object]:
         """Per-step attention state for the cell. Queue state comes from Modal;
-        computed/stale from on-disk analyses. Pulls finished results each poll."""
-        run = _resolve_run(run)
-        _require_slot(slot_id)
-        _require_model(model_alias)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
-        cell_dir = slot_log.events_path.parent
+        computed/stale from on-disk analyses. Pulls finished results each poll.
+        A poll-only path: resolves the cell dir WITHOUT hydrating the run's event
+        logs (attention state is a disk scan), so polling every ablation variant
+        no longer loads hundreds of MB of events per cell into RAM."""
+        run, cell_dir = _cell_dir_nohydrate(run, slot_id, model_alias)
+        if not cell_dir.is_dir():
+            return {"computed": [], "stale": [], "running": [], "queued": [], "computing": [], "errors": {}}
         try:
             remote = await asyncio.to_thread(
                 _pull_remote_attention, run, slot_id, model_alias, cell_dir, max_heads=max_heads,
@@ -2764,6 +2993,18 @@ def create_app() -> FastAPI:
         running = [int(x) for x in (remote.get("running") or [])]
         queued = [int(x) for x in (remote.get("queued") or [])]
         errors = {str(k): v for k, v in (remote.get("errors") or {}).items()}
+        # Surface the DEPLOYED worker's analysis_version so a worker/server skew is
+        # visible (recomputes read stale until the worker is redeployed). Warn once
+        # per distinct mismatched version so the log isn't spammed each poll.
+        worker_av = remote.get("worker_av")
+        if isinstance(worker_av, int) and worker_av != attn_schema.ANALYSIS_VERSION and worker_av not in _attn_worker_ver_warned:
+            _attn_worker_ver_warned.add(worker_av)
+            print(
+                f"[attn] WORKER/SERVER VERSION SKEW: modal worker analysis_version={worker_av} != "
+                f"server={attn_schema.ANALYSIS_VERSION} — recomputes will read STALE until the worker is "
+                f"redeployed (cd server && modal deploy -m app.attention.modal_app)",
+                flush=True,
+            )
         status = attn_store.list_status(cell_dir, min_heads=max_heads)
         return {
             "computed": status["fresh"],
@@ -2772,13 +3013,154 @@ def create_app() -> FastAPI:
             "queued": queued,
             "computing": sorted(set(running) | set(queued)),
             "errors": errors,
+            "worker_version": worker_av,
+            "server_version": attn_schema.ANALYSIS_VERSION,
+            # done-but-not-yet-pulled backlog — the client keeps polling until 0 so a
+            # finished batch fully lands locally without manual re-syncs.
+            "draining": int(remote.get("draining") or 0),
         }
 
-    @app.get("/slots/{slot_id}/{model_alias}/attention/{event_index}")
-    async def attention_get(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str, model_alias: str, event_index: int, run: str | None = None,
-        view: str = "compact", i: int = 0,
+    def _abl_projection(data: dict[str, Any]) -> dict[str, Any]:
+        """Ultra-light `abl` view of a compact: per-entity + per-attribute scene
+        rollups + each object's FIRST token + the per-segment bucket totals the
+        ablation graphs read. ~50 KB vs ~4 MB, so batching every variant stays cheap.
+        Shared by `attention_get?view=abl` and the batched aggregate endpoints."""
+        agg_in = data.get("agg") or {}
+        scene_in = agg_in.get("scene") or {}
+        ents = [
+            {"id": e.get("id"), "kind": e.get("kind"), "score": e.get("score")}
+            for e in (scene_in.get("entityTotals") or [])
+        ]
+        slim_se = [
+            {
+                "id": e.get("id"), "kind": e.get("kind"),
+                "parent": e.get("parent"), "region": e.get("region"),
+                "token_span": (e.get("token_span") or [])[:1],
+            }
+            for e in (data.get("scene_entities") or [])
+        ]
+        b = data.get("buckets") or {}
+
+        def _bucket_totals(names_key: str, grid_key: str, tok_key: str) -> list[dict[str, Any]]:
+            names = b.get(names_key) or []
+            grid = b.get(grid_key) or []
+            toks = b.get(tok_key) or []
+            tot = [0.0] * len(names)
+            for row in grid:
+                for i, v in enumerate(row):
+                    if i < len(tot):
+                        tot[i] += float(v or 0.0)
+            return [
+                {"name": names[i], "mass": tot[i], "tokens": int(toks[i]) if i < len(toks) else 0}
+                for i in range(len(names))
+            ]
+
+        return {
+            "compact": True, "abl": True,
+            "meta": data.get("meta") or {},
+            "agg": {"scene": {"entityTotals": ents, "componentTotals": scene_in.get("componentTotals") or []}},
+            "scene_entities": slim_se,
+            "token_types": _bucket_totals("type_names", "type", "type_tokens"),
+            "attr_roles": _bucket_totals("attr_role_names", "attr_role", "attr_role_tokens"),
+            # XML-gravity per-quarter attention (positions ride in `meta.gravity`).
+            "gravity": _bucket_totals("gravity_names", "gravity", "gravity_tokens"),
+            "n_tokens": data.get("n_tokens"),
+            "out_start": data.get("out_start"),
+        }
+
+    @app.get("/slots/{slot_id}/{model_alias}/attention/cell-aggregate", response_model=None)
+    async def attention_cell_aggregate(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, run: str | None = None, view: str = "agg", evs: str | None = None,
     ) -> dict[str, object]:
+        """Batch a cell's stored per-step attention projections into ONE response
+        (kills the client's per-step attentionGet N+1) plus a server-computed
+        cell-wide rollup (mean±sd entity/component totals + scene mass). `view` = agg
+        (compact minus the per-token array) | abl (ultra-light). `evs` = an explicit
+        comma list, else every fresh computed step. Read-only (no log hydration).
+        Declared BEFORE /attention/{event_index} so the literal path wins over the
+        int-typed param route."""
+        run, cell_dir = _cell_dir_nohydrate(run, slot_id, model_alias)
+        if not cell_dir.is_dir():
+            return {"run": run, "slot": slot_id, "model": model_alias, "view": view, "steps": [], "rollup": _cell_rollup([])}
+        if evs:
+            wanted = [int(x) for x in str(evs).split(",") if x.strip().lstrip("-").isdigit()]
+        else:
+            wanted = attn_store.list_computed(cell_dir)
+        steps: list[dict[str, object]] = []
+        compacts: list[dict[str, Any]] = []
+        for ev in sorted(set(wanted)):
+            data = await asyncio.to_thread(_load_compact_healed, cell_dir, ev)
+            if data is None:
+                continue
+            compacts.append(data)
+            if view == "abl":
+                a: dict[str, Any] = _abl_projection(data)
+            elif view == "compact":
+                a = data
+            elif view == "buckets":
+                # Just the region/type/attr-role bucket grids (the VII report reads
+                # ONLY `a.buckets`), so the whole-cell VII batch stays small.
+                a = {"compact": True, "meta": data.get("meta"), "buckets": data.get("buckets"),
+                     "n_tokens": data.get("n_tokens"), "out_start": data.get("out_start")}
+            else:
+                # Lean `agg`: the rollups + scene entities + region/type buckets the
+                # cards pool, dropping the per-token array + the head/entity matrices
+                # (`head_grid`, `agg.head_entity`, `agg.entity_token`, `to_place_entities`,
+                # `selected_heads`, `logprob_check`) the workspace never reads — so
+                # batching every computed step stays small.
+                agg_full = data.get("agg") or {}
+                a = {
+                    "compact": True,
+                    "meta": data.get("meta"),
+                    "agg": {k: v for k, v in agg_full.items() if k not in ("head_entity", "entity_token")},
+                    "scene_entities": data.get("scene_entities"),
+                    "buckets": data.get("buckets"),
+                    "n_tokens": data.get("n_tokens"),
+                    "out_start": data.get("out_start"),
+                }
+            steps.append({"event_index": ev, "a": a})
+        return {"run": run, "slot": slot_id, "model": model_alias, "view": view, "steps": steps, "rollup": _cell_rollup(compacts)}
+
+    @app.get("/slots/{slot_id}/{model_alias}/ablation-compare", response_model=None)
+    async def ablation_compare(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, run: str | None = None, kind: str | None = None,
+    ) -> dict[str, object]:
+        """Discover a base cell's ablation variants server-side + batch each one's
+        treated-step `abl` projection into ONE response — collapsing the client's
+        `/runs` filter + per-variant index probe + per-variant fetch (the ablation
+        N+1). `run` = the BASE run; `kind` optionally filters by target step kind.
+        Each variant: {name, ablation(meta), ev(treated step, latest computed), a(abl|null)}."""
+        base_run = _resolve_run(run)
+        variants: list[dict[str, object]] = []
+        combos: dict[str, int] = {}  # base·slot·model -> variant count (empty-state hint)
+        for name, abl in _all_ablation_variants():
+            if abl.get("cut") is None:
+                continue
+            combos[f"{abl.get('base_run')} · {abl.get('slot')} · {abl.get('model')}"] = (
+                combos.get(f"{abl.get('base_run')} · {abl.get('slot')} · {abl.get('model')}", 0) + 1
+            )
+            if abl.get("base_run") != base_run or abl.get("slot") != slot_id or abl.get("model") != model_alias:
+                continue
+            if kind and abl.get("target_step_kind") != kind:
+                continue
+            vcell = _slot_dir(name, slot_id, model_alias)
+            computed = attn_store.list_computed(vcell) if vcell.is_dir() else []
+            ev = max(computed) if computed else None
+            a = None
+            if ev is not None:
+                data = await asyncio.to_thread(_load_compact_healed, vcell, ev)
+                if data is not None:
+                    a = _abl_projection(data)
+            variants.append({"name": name, "ablation": abl, "ev": ev, "a": a})
+        combo_list = [{"k": k, "n": n} for k, n in sorted(combos.items(), key=lambda kv: -kv[1])]
+        return {"base_run": base_run, "slot": slot_id, "model": model_alias, "kind": kind, "variants": variants, "combos": combo_list}
+
+    @app.get("/slots/{slot_id}/{model_alias}/attention/{event_index}", response_model=None)
+    async def attention_get(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, event_index: int,
+        request: Request, response: Response,
+        run: str | None = None, view: str = "compact", i: int = 0,
+    ) -> dict[str, object] | Response:
         """One step's stored analysis. The small `compact` view is what the frequent
         poll already wrote to disk, so it's served WITHOUT touching the heavy result;
         the big per-token detail is pulled from the worker ON DEMAND (streamed) only
@@ -2794,12 +3176,26 @@ def create_app() -> FastAPI:
 
         token/present/full ensure `{ev}.full.json` is present+current (one streamed
         pull per step), then derive/serve from it; present/token sidecars are cached
-        on disk so the big result is parsed at most once."""
-        run = _resolve_run(run)
-        _require_slot(slot_id)
-        _require_model(model_alias)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
-        cell_dir = slot_log.events_path.parent
+        on disk so the big result is parsed at most once.
+
+        Poll/read-only: resolves the cell dir WITHOUT hydrating the run's event
+        logs (every view is served from on-disk attention artifacts)."""
+        run, cell_dir = _cell_dir_nohydrate(run, slot_id, model_alias)
+        if not cell_dir.is_dir():
+            raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
+
+        # Revalidation for the on-disk-file views (compact/agg/abl): the <ev>.json
+        # mtime changes on every (re)compute, so it's a correct + cheap validator —
+        # a repeat request 304s before the 0.8-5 MB read + heal/projection.
+        if view in ("compact", "agg", "abl"):
+            try:
+                mtime = attn_store.analysis_path(cell_dir, event_index).stat().st_mtime
+            except OSError:
+                mtime = None
+            if mtime is not None:
+                nm = _revalidate(request, response, _make_etag("attn", view, event_index, mtime))
+                if nm is not None:
+                    return nm
 
         if view == "compact":
             # Heals a legacy full `{ev}.json` down to the small compact on first hit
@@ -2810,8 +3206,30 @@ def create_app() -> FastAPI:
                 raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
             return data
 
+        if view == "agg":
+            # Lean payload for the AGGREGATE views (ablation comparison / cell
+            # overview): the compact MINUS the heavy per-token `tokens` array. The
+            # client's `aggregateAttn` reads only `agg` (entity/attribute rollups), so
+            # shipping thousands of per-token records PER variant — across many
+            # variants — is what froze the /tf page (e.g. the spatial scatter). Same
+            # on-disk source as `compact`; we just drop `tokens` before returning, so
+            # the response is a fraction of the size and the client parses/holds far
+            # less. Views that need per-token detail still use `compact`/`token`.
+            data = await asyncio.to_thread(_load_compact_healed, cell_dir, event_index)
+            if data is None:
+                raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
+            if isinstance(data, dict) and "tokens" in data:
+                data = {k: v for k, v in data.items() if k != "tokens"}
+            return data
+
+        if view == "abl":
+            data = await asyncio.to_thread(_load_compact_healed, cell_dir, event_index)
+            if data is None:
+                raise HTTPException(status_code=404, detail="no attention analysis stored for this step — POST to compute it")
+            return _abl_projection(data)
+
         if view not in ("token", "present", "full"):
-            raise HTTPException(status_code=422, detail=f"unknown view '{view}' (expected compact | token | present | full)")
+            raise HTTPException(status_code=422, detail=f"unknown view '{view}' (expected compact | agg | abl | token | present | full)")
 
         # These need the big result — make sure it's on disk (streamed pull if needed).
         ok = await asyncio.to_thread(
@@ -2911,14 +3329,6 @@ def create_app() -> FastAPI:
                 status_code=409,
                 detail="run is complete; reset to start a new run",
             )
-        # Over the spend cap: a plain resume would just keep spending toward a
-        # limit already hit. The cap holds until raised past the spend (which
-        # resumes the cell) — so refuse here and point at that.
-        if _cap_reached(slot_log.state["events"]):
-            raise HTTPException(
-                status_code=409,
-                detail="spend cap reached — raise the cap to continue",
-            )
         # Startable iff nothing is already driving it (running OR parked at a
         # gate both hold a live task — those advance via /step, not /resume).
         if _live(_tasks.get((run, slot_id, model_alias))):
@@ -2944,55 +3354,6 @@ def create_app() -> FastAPI:
         # run.paused event is what derive_status reads back as paused.
         slot_log.log("run.paused")
         return {"run": run, "slot_id": slot.id, "model": model_alias}
-
-    @app.post("/slots/{slot_id}/{model_alias}/cap-override")
-    async def slot_cap_override(  # pyright: ignore[reportUnusedFunction]
-        slot_id: str, model_alias: str, req: CapOverrideRequest, run: str | None = None,
-    ) -> dict[str, object]:
-        """Set a cell's spend cap to an explicit ceiling (0 = uncapped) by
-        appending the `run.cap_override` the cap math reads — allowed anytime the
-        cell is live (running or paused), not only once it has tripped its cap. If
-        the cap was the only thing holding a parked cell and the new ceiling clears
-        its settled spend, RESUME it (a plain /resume stays refused while capped);
-        if it's live and the new ceiling is already breached, stop it the way the
-        backfill enforcer would. 400 when the cap system is off, 409 on a cell that
-        hasn't started (nothing to cap) or is complete."""
-        run = _resolve_run(run)
-        slot = _require_slot(slot_id)
-        _require_model(model_alias)
-        slot_log = _require_slot_log(run, slot_id, model_alias)
-        if SPEND_CAP_USD <= 0:
-            raise HTTPException(status_code=400, detail="spend cap is disabled")
-        events = slot_log.state["events"]
-        if not any(e.get("kind") == "run.start" for e in events):
-            raise HTTPException(status_code=409, detail="cell hasn't started")
-        if any(e.get("kind") == "run.done" for e in events):
-            raise HTTPException(status_code=409, detail="run is complete")
-        new_cap = max(0.0, float(req.cap))
-        was_capped = _cap_reached(events)
-        slot_log.log("run.cap_override", cap=new_cap, spend=_cell_spend(events))
-        key: RunKey = (run, slot_id, model_alias)
-        resumed = False
-        if _cap_reached(events) and _live(_tasks.get(key)):
-            # Lowered below what's already been spent while still running — stop
-            # it now rather than waiting on the next settled cost to trip it.
-            await _cancel_task(*key)
-            slot_log.log("run.cap_reached", spend=_cell_spend(events), cap=new_cap)
-        elif was_capped and not _cap_reached(events) and not _live(_tasks.get(key)):
-            # The cap was the only thing holding it and the new ceiling clears
-            # spend. A stepped cell gets a one-call budget so it advances like a
-            # /step relaunch rather than running free.
-            if key in _stepped_cells:
-                _gate_intents[key] = {"budget": 1}
-            await _start_cell(run, slot_id, model_alias)
-            resumed = True
-        return {
-            "run": run,
-            "slot_id": slot.id,
-            "model": model_alias,
-            "cap": new_cap,
-            "resumed": resumed,
-        }
 
     @app.post("/slots/{slot_id}/{model_alias}/retry-mesh/{node_id}")
     async def slot_retry_mesh(  # pyright: ignore[reportUnusedFunction]
@@ -3922,30 +4283,24 @@ def create_app() -> FastAPI:
         _require_model(model_alias)
         if req.until is not None and req.until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
-        result = await _advance_cell(run, slot_id, model_alias, auto=req.auto, until=req.until, until_before=req.until_before)
-        if result == "capped":
-            raise HTTPException(
-                status_code=409,
-                detail="spend cap reached — raise the cap to continue",
-            )
+        result = await _advance_cell(run, slot_id, model_alias, auto=req.auto, until=req.until)
         if result in ("missing", "done", "not_runnable", "in_flight"):
             raise HTTPException(status_code=409, detail=f"cannot step: {result}")
         return {"run": run, "slot_id": slot_id, "model": model_alias, "auto": req.auto, "result": result}
 
     @app.post("/runs/{run}/step-all")
-    async def run_step_all(run: str, auto: bool = False, until: str | None = None, until_before: bool = False) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def run_step_all(run: str, auto: bool = False, until: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Advance EVERY stepped cell in the run — regardless of whether it's
         paused at a live gate, mid-call, or sitting paused with no task (the
         "move the whole experiment forward" action). Each gets ONE queued step
         (so none is skipped for being mid-call), keeping the run in lockstep.
-        `auto=true` runs them all to completion; `until=<step>` runs them all to
-        the next call of that step — pausing AFTER it, or BEFORE it (it doesn't
-        execute) when `until_before=true`."""
+        `auto=true` runs them all to completion; `until=<step>` fast-forwards
+        them all to the next call of that step."""
         if until is not None and until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {until}")
         results: dict[str, list[str]] = {}
         for r, slot_id, alias in [k for k in _stepped_cells if k[0] == run]:
-            res = await _advance_cell(r, slot_id, alias, auto=auto, until=until, until_before=until_before)
+            res = await _advance_cell(r, slot_id, alias, auto=auto, until=until)
             results.setdefault(res, []).append(f"{slot_id}/{alias}")
         advanced = results.get("stepped", []) + results.get("launched", []) + results.get("queued", []) + results.get("seeking", [])
         return {"run": run, "advanced": advanced, "auto": auto, "until": until, "by_result": results}
@@ -3958,17 +4313,16 @@ def create_app() -> FastAPI:
         """Advance a simulation branch by one LLM call. Like the source
         "step", this QUEUES a credit when the branch is mid-call (so a batch
         "step sims" never errors on a branch that isn't sitting at a gate),
-        runs it to completion with `auto`, or fast-forwards THROUGH the next
-        call of `until` (it executes) and pauses before the following one.
-        `model` (an alias) re-aims the next gated call at a chosen LLM. 409 only
-        when there's genuinely nothing to advance."""
+        runs it to completion with `auto`, or fast-forwards to the next call of
+        `until` and pauses there. `model` (an alias) re-aims the next gated call
+        at a chosen LLM. 409 only when there's genuinely nothing to advance."""
         _require_branch(branch_id)
         if req.until is not None and req.until not in prompt_store.STEPS:
             raise HTTPException(status_code=400, detail=f"unknown step: {req.until}")
         if req.model is not None and req.model not in MODELS:
             raise HTTPException(status_code=400, detail=f"unknown model: {req.model}")
         model_id = MODELS[req.model] if req.model is not None else None
-        result = await _advance_branch(branch_id, auto=req.auto, until=req.until, until_before=req.until_before, model=model_id)
+        result = await _advance_branch(branch_id, auto=req.auto, until=req.until, model=model_id)
         if result in ("missing", "done", "not_runnable"):
             raise HTTPException(status_code=409, detail=f"cannot step: {result}")
         return {"branch": branch_id, "auto": req.auto, "until": req.until, "result": result, "ran_model": req.model}
@@ -4028,7 +4382,9 @@ def create_app() -> FastAPI:
         # objects-optimized, so the bare `/objects/` segment is correct either way).
         seg = f"/{BRANCHES_SUBDIR}/{branch_id}/objects/"
         dest_seg = f"/{slot_id}/{model_alias}/objects/"
-        branch_events = list(br.log.state["events"])
+        # FULL events off disk — this rewrite becomes the source cell's log, so
+        # it must carry every step's prompt/output (the slim buffer drops them).
+        branch_events = br.log.full_events()
         src_log.close()
 
         def _write_promoted() -> None:
@@ -4109,44 +4465,31 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/runs/{run}/prompt-templates/restore")
-    async def restore_run_prompts(run: str, step: str | None = None, version: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Overwrite the run's prompt snapshot from a source version. Defaults
-        to the run's BASE version (the inverse of the `update_version` sync,
-        which pushes the run's snapshot ONTO the version); pass `version` to
-        restore from ANY existing prompt version instead. With `step`, revert
-        ONLY that step's templates (the per-prompt revert); without it,
-        hard-replace every step. Either way this discards the prompt lab's
-        in-place edits to the reverted step(s). The run's base
-        (`run.json.prompt_version`) is left unchanged — this pulls content, it
-        does not re-base the run. Running cells keep the templates they launched
-        with; every later relaunch/rerun/resume renders the restored bytes."""
+    async def restore_run_prompts(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Reset the run's prompt snapshot back to its base version — the
+        inverse of the `update_version` sync (which pushes the run's snapshot
+        ONTO the version). Hard-replaces every step template in the run's
+        snapshot with the source version's, discarding the prompt lab's in-place
+        edits. Running cells keep the templates they launched with; every later
+        relaunch/rerun/resume renders the restored bytes."""
         _require_run_prompts(run)
-        base = _run_meta(run).get("prompt_version")
-        source = version if version is not None else base
-        if not isinstance(source, str) or not source or not prompt_store.version_exists(source):
-            if version is not None:
-                raise HTTPException(status_code=404, detail=f"unknown prompt version: {version!r}")
+        version = _run_meta(run).get("prompt_version")
+        if not isinstance(version, str) or not prompt_store.version_exists(version):
             raise HTTPException(
                 status_code=409,
                 detail=(
                     f"run {run!r} has no existing base version to restore from"
-                    + (f" — {base!r} no longer exists" if isinstance(base, str) and base else "")
+                    + (f" — {version!r} no longer exists" if isinstance(version, str) and version else "")
                 ),
             )
-        if step is not None and step not in prompt_store.STEPS:
-            raise HTTPException(status_code=404, detail=f"unknown step: {step}")
         run_snapshot = _run_dir(run) / prompt_store.RUN_PROMPTS_SUBDIR
-        version_dir = prompt_store.VERSIONS_DIR / source
         try:
-            # dest = the run snapshot, src = the chosen source version — one
-            # step, or all of them.
-            if step is None:
-                prompt_store.sync_templates(run_snapshot, version_dir)
-            else:
-                prompt_store.restore_step(run_snapshot, version_dir, step)
+            # dest = the run snapshot, src = the base version: the exact reverse
+            # of the `update_version` sync above.
+            prompt_store.sync_templates(run_snapshot, prompt_store.VERSIONS_DIR / version)
         except prompt_store.PromptTemplateError as e:
             raise HTTPException(status_code=400, detail=str(e))
-        return {"run": run, "restored_from": source, "step": step}
+        return {"run": run, "restored_from": version}
 
     @app.post("/runs/{run}/simulate-step")
     async def simulate_step(  # pyright: ignore[reportUnusedFunction]
@@ -4186,7 +4529,7 @@ def create_app() -> FastAPI:
             cut_step: str | None = None
             for i, e in enumerate(events):
                 if (e.get("kind") == "cache.llm" and e.get("template") in steps
-                        and isinstance(e.get("variables"), dict)):
+                        and e.get("has_variables")):
                     cut = i
                     cut_step = str(e.get("template"))
                     break
@@ -4231,7 +4574,16 @@ def create_app() -> FastAPI:
         snapshot matches the prompts the branches actually ran with, so they
         resume cleanly)."""
         name = req.name.strip()
-        if not name or "/" in name or "\\" in name or name.startswith("."):
+        abl_meta = req.ablation if isinstance(req.ablation, dict) else None
+        # An ablation variant folds under its base run:
+        # runs/<base>/ablations/<experiment>/<variant>. The server is authoritative
+        # for that path (derived from the ablation meta), so a client-proposed name
+        # is only the fallback for non-ablation saves.
+        if abl_meta:
+            nested = ablation_cfg.nested_run_id(abl_meta)
+            if nested:
+                name = nested
+        if not _valid_run_name(name, allow_ablation_subtree=bool(abl_meta)):
             raise HTTPException(status_code=400, detail="invalid run name")
         run_dir = _run_dir(name)
         if run_dir.exists():
@@ -4285,7 +4637,9 @@ def create_app() -> FastAPI:
             # id-keyed bundle regardless; this keeps image-hover URLs valid too.)
             seg = f"/{req.base_run}/{BRANCHES_SUBDIR}/{branch_id}/objects/"
             dest_seg = f"/{name}/{br.slot}/{br.model}/objects/"
-            branch_events = list(br.log.state["events"])
+            # FULL events off disk — the saved run's log must carry each step's
+            # prompt/output so its attention export + cache replay still work.
+            branch_events = br.log.full_events()
             dest_events = dest / "events.jsonl"
 
             def _write_cell(evs=branch_events, path=dest_events, _seg=seg, _dest=dest_seg) -> None:
@@ -4299,182 +4653,16 @@ def create_app() -> FastAPI:
             await asyncio.to_thread(_hardlink_tree, bdir / "objects", dest / "objects")
             copied.append(f"{br.slot}/{br.model}")
         _hydrate_run(name)
+        # Register the new variant in its base run's ablations manifest (the
+        # discovery index) so /runs/<base>/ablations lists it without a scan.
+        if abl_meta and abl_meta.get("base_run"):
+            try:
+                ablation_manifest.refresh(_run_dir(str(abl_meta["base_run"])))
+            except OSError:
+                pass
         global _current_run
         _current_run = name
         return {"current": name, "copied": copied, "skipped": skipped}
-
-    @app.post("/runs/ab-test")
-    async def ab_test_run(req: AbTestRequest) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Launch a NEW run (B) seeded with a source run's ROOT zone plans.
-        Each selected (slot, model) cell's log is copied through its root
-        `divider.zone_plan` and nothing else, then the cell is started on the
-        chosen prompt version. The resumable divider replays that one committed
-        plan verbatim and re-derives the whole scene below it under B's
-        prompts — an A/B that holds the top-level plan fixed and varies
-        everything downstream. Non-destructive to the source run (read-only)."""
-        name = req.name.strip()
-        if not name or "/" in name or "\\" in name or name.startswith("."):
-            raise HTTPException(status_code=400, detail="invalid run name")
-        version = req.prompt_version.strip()
-        if not prompt_store.version_exists(version):
-            raise HTTPException(status_code=404, detail=f"unknown prompt version: {version}")
-        try:
-            prompt_store.validate_version(version)
-        except prompt_store.PromptTemplateError as e:
-            raise HTTPException(status_code=409, detail=str(e))
-        if not _run_dir(req.source_run).is_dir():
-            raise HTTPException(status_code=404, detail=f"unknown source run: {req.source_run}")
-        run_dir = _run_dir(name)
-        if run_dir.exists():
-            raise HTTPException(status_code=409, detail=f"run already exists: {name}")
-        # Read source cells from memory (idempotent hydrate) so a still-running
-        # source run's live log can't hand us a torn final line.
-        _hydrate_run(req.source_run)
-
-        run_dir.mkdir(parents=True)
-        try:
-            prompt_store.snapshot_into_run(version, run_dir)
-        except Exception:
-            shutil.rmtree(run_dir, ignore_errors=True)
-            raise
-        (run_dir / RUN_META_NAME).write_text(
-            json.dumps(
-                {
-                    "prompt_version": version,
-                    "created_at": datetime.now().isoformat(timespec="seconds"),
-                    "ab_from": req.source_run,
-                }
-            )
-            + "\n",
-            encoding="utf-8",
-        )
-        seeded: list[tuple[str, str]] = []
-        skipped: list[str] = []
-        seen: set[tuple[str, str]] = set()
-        for cell in req.cells:
-            key = (cell.slot, cell.model)
-            if key in seen:
-                continue
-            seen.add(key)
-            if cell.slot not in SLOTS_BY_ID or cell.model not in MODELS:
-                skipped.append(f"{cell.slot}/{cell.model}")
-                continue
-            src = _slot_logs.get((req.source_run, cell.slot, cell.model))
-            events = src.state["events"] if src is not None else []
-            cut = _root_plan_cut(events)
-            if cut is None:
-                skipped.append(f"{cell.slot}/{cell.model}")
-                continue
-            dest = _slot_dir(name, cell.slot, cell.model)
-            dest.mkdir(parents=True, exist_ok=True)
-            with (dest / "events.jsonl").open("w", encoding="utf-8") as f:
-                for e in events[:cut]:
-                    f.write(json.dumps(e) + "\n")
-            seeded.append(key)
-        if not seeded:
-            # Nothing to launch — don't leave an empty A/B run behind.
-            shutil.rmtree(run_dir, ignore_errors=True)
-            raise HTTPException(
-                status_code=400,
-                detail="no selected cell had a committed root zone plan to seed from",
-            )
-        # Hydrate B (picks up the seeded prefixes) then start each seeded cell:
-        # the divider replays the copied root plan and runs the rest fresh.
-        _hydrate_run(name)
-        for slot_id, model_alias in seeded:
-            await _start_cell(name, slot_id, model_alias)
-        global _current_run
-        _current_run = name
-        return {
-            "current": name,
-            "seeded": [f"{s}/{m}" for s, m in seeded],
-            "skipped": skipped,
-        }
-
-    @app.post("/runs/{run}/copy-slot")
-    async def copy_slot(run: str, req: CopySlotRequest) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Copy an entire slot folder (all its model cells + meshes) from
-        `source_run` into this run, OVERWRITING this run's slot dir. Every live
-        task / generate-regen worker / sim branch on the destination's cells for
-        this slot is torn down first (as reset does), then the source slot is
-        copied over and object URLs in the copied logs are rewritten to this run
-        so meshes/images resolve here. The source run is untouched."""
-        dest_run = run
-        source_run = req.source_run
-        slot = _require_slot(req.slot)
-        if source_run == dest_run:
-            raise HTTPException(status_code=400, detail="source and destination runs are the same")
-        if not _run_dir(source_run).is_dir():
-            raise HTTPException(status_code=404, detail=f"unknown source run: {source_run}")
-        if not _run_dir(dest_run).is_dir():
-            raise HTTPException(status_code=404, detail=f"unknown run: {dest_run}")
-        src_slot_dir = _run_dir(source_run) / slot.id
-        if not src_slot_dir.is_dir() or not any(
-            (src_slot_dir / alias / "events.jsonl").is_file() for alias in MODEL_ALIASES
-        ):
-            raise HTTPException(status_code=400, detail=f"slot {slot.id!r} has no data in run {source_run!r}")
-        _hydrate_run(source_run)
-        _hydrate_run(dest_run)
-        # Tear down every destination cell under this slot so nothing writes into
-        # the dir we're about to replace (same teardown reset does, applied to the
-        # whole slot row), and note which had data — the "replaced" report.
-        replaced: list[str] = []
-        for alias in MODEL_ALIASES:
-            key: RunKey = (dest_run, slot.id, alias)
-            dest_log = _slot_logs.get(key)
-            if dest_log is not None and dest_log.state["events"]:
-                replaced.append(f"{slot.id}/{alias}")
-            await _discard_branches_of_cell(dest_run, slot.id, alias)
-            await _cancel_task(dest_run, slot.id, alias)
-            await _cancel_cell_generation(dest_run, slot.id, alias)
-            _set_stepped(key, False)
-            _gate_intents.pop(key, None)
-            if dest_log is not None:
-                dest_log.close()
-                _slot_logs.pop(key, None)
-        dest_slot_dir = _run_dir(dest_run) / slot.id
-
-        def _copy() -> None:
-            shutil.rmtree(dest_slot_dir, ignore_errors=True)
-            shutil.copytree(src_slot_dir, dest_slot_dir)
-            # Repoint object/image URLs from the source cell path to this run's,
-            # per model cell (GLBs load by id regardless; this keeps image-hover
-            # URLs valid and self-contained even if the source run is deleted).
-            for alias in MODEL_ALIASES:
-                events_path = dest_slot_dir / alias / "events.jsonl"
-                if not events_path.is_file():
-                    continue
-                src_seg = f"/{source_run}/{slot.id}/{alias}/objects/"
-                dst_seg = f"/{dest_run}/{slot.id}/{alias}/objects/"
-                text = events_path.read_text(encoding="utf-8")
-                if src_seg in text:
-                    events_path.write_text(text.replace(src_seg, dst_seg), encoding="utf-8")
-
-        await asyncio.to_thread(_copy)
-        # Rebuild the destination slot's SlotLogs from the copied logs (mirrors
-        # _hydrate_run for this slot), restoring any stepped markers the copy
-        # brought over. Nothing is auto-launched — the cells come in whatever
-        # state their copied log implies.
-        copied: list[str] = []
-        for alias in MODEL_ALIASES:
-            cell_dir = dest_slot_dir / alias
-            cell_dir.mkdir(parents=True, exist_ok=True)
-            key = (dest_run, slot.id, alias)
-            new_log = SlotLog(_run_id(dest_run, slot.id, alias), cell_dir / "events.jsonl")
-            new_log.hydrate_from_disk()
-            _slot_logs[key] = new_log
-            _maybe_launch(slot, alias, new_log)
-            if (cell_dir / ".stepped").exists():
-                _stepped_cells.add(key)
-            if new_log.state["events"]:
-                copied.append(f"{slot.id}/{alias}")
-        return {
-            "run": dest_run,
-            "source_run": source_run,
-            "slot": slot.id,
-            "copied": copied,
-            "replaced": replaced,
-        }
 
     @app.get("/versions")
     async def list_versions() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -4537,63 +4725,6 @@ def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, float
     return usage
 
 
-# --- per-cell spend cap -------------------------------------------------------
-# A cell's authoritative spend is the sum of its settled `llm.cost` events (the
-# backfill prices each `cache.llm` against OpenRouter's own total). The ceiling
-# is the value carried by the cell's latest `run.cap_override` event, or
-# SPEND_CAP_USD when it has none — so setting a new cap is just appending an
-# override the reader picks up, and a rewind past it falls back to the prior one.
-# Everything is derived from the durable log, so it survives restarts. A ceiling
-# of 0 (or less) means uncapped.
-
-
-def _cell_spend(events: list[dict[str, object]]) -> float:
-    total = 0.0
-    for e in events:
-        if e.get("kind") == "llm.cost":
-            c = e.get("cost")
-            if isinstance(c, (int, float)):
-                total += float(c)
-    return total
-
-
-def _cap_override_value(events: list[dict[str, object]]) -> float | None:
-    """The ceiling set by the cell's most recent `run.cap_override`, or None if
-    it was never overridden — the last one wins."""
-    value = None
-    for e in events:
-        if e.get("kind") == "run.cap_override":
-            c = e.get("cap")
-            if isinstance(c, (int, float)):
-                value = float(c)
-    return value
-
-
-def _effective_cap(events: list[dict[str, object]]) -> float:
-    """The cell's current ceiling: its latest explicit override, else the
-    SPEND_CAP_USD default. A value ≤ 0 means uncapped."""
-    override = _cap_override_value(events)
-    return override if override is not None else SPEND_CAP_USD
-
-
-def _cap_reached(events: list[dict[str, object]]) -> bool:
-    """True when the cell has a positive ceiling and settled spend has hit it —
-    THE source of truth for the `capped` status. The `run.cap_reached` event is
-    only a durable notice, never the condition itself, so raising the cap past
-    the spend un-caps the cell without any log surgery."""
-    cap = _effective_cap(events)
-    return cap > 0 and _cell_spend(events) >= cap
-
-
-def _cap_summary(events: list[dict[str, object]]) -> dict[str, object] | None:
-    """The cost tracker's per-cell cap panel: settled `spend` and the current
-    `limit` ceiling (0 = uncapped). None only when the cap system is off
-    (SPEND_CAP_USD ≤ 0), so there is no cap to show or set."""
-    if SPEND_CAP_USD <= 0:
-        return None
-    return {"spend": _cell_spend(events), "limit": _effective_cap(events)}
-
-
 def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
@@ -4623,9 +4754,6 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             # Per-model token/request totals for the cost tracker (the run's
             # actual spend = source cells; branch simulations aren't counted).
             "usage": _usage_summary(events),
-            # Per-cell spend cap panel: settled spend, current ceiling, whether
-            # it's tripped, and the override count. None when the cap is off.
-            "cap": _cap_summary(events),
         }
     return {
         "id": slot.id,
@@ -4900,76 +5028,6 @@ def _scene_nodes_full(slot_log: SlotLog, *, image_log: SlotLog | None = None) ->
     return nodes
 
 
-# Mechanical per-object service steps (asset matching + noun-phrase distillation)
-# — NOT spatial reasoning, and by far the most numerous LLM calls. Omitted from
-# the investigator context entirely (the step gate flags them the same way).
-_INVESTIGATOR_SKIP_STEPS = {"image_prompt", "library_match"}
-
-
-# Per-step variables the investigator's step TIMELINE omits: the scene-wide
-# dumps (the full scene is given ONCE, faithfully rendered, below) and the
-# global root fields (also given once). What remains per step is the compact,
-# step-distinguishing set — zone id/plan/placement/dims, the to-place batch, the
-# retry feedback, the object/image fields — so the timeline stays legible and the
-# reviewer reconstructs what each step saw from (template + these + the scene).
-_INVESTIGATOR_SKIP_VARS = {
-    "SCENE_CONTEXT", "SCENE_CONTEXT_COMPACT", "ROOT_OBJECTS", "ROOT_HEADER",
-    "ADJACENT_ZONES", "SIBLING_OBJECTS", "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF",
-    "ZONE_OBJECTS", "IMAGE_TEMPLATE_FRONT", "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP",
-    "ROOT_PROMPT", "ROOT_PLAN", "ROOT_DIMENSIONS", "ROOT_ORIGIN",
-}
-
-
-def _investigator_bundle(slot_log: SlotLog) -> dict[str, object]:
-    """The per-slot investigator's faithful base grounding for one cell (source
-    or branch): the FULL final scene rendered by the same `scene_context`
-    builders the pipeline injects with (so it's byte-faithful to `{SCENE_CONTEXT}`),
-    plus a chronological timeline of every executed LLM step — its template, the
-    node it ran on, its structured output, its reasoning, and its compact
-    step-specific variable VALUES (heavy scene-wide dumps stripped; the scene is
-    given once, above). The client composes this into the reviewer's system
-    prompt alongside the (separately fetched) prompt templates + the static
-    pipeline explainer; attaching a specific step then adds that call's exact
-    rendered bytes on top."""
-    nodes = _scene_nodes_full(slot_log)
-    root = next((n for n in nodes if n.parent_id is None), None)
-    steps: list[dict[str, object]] = []
-    for e in slot_log.state["events"]:
-        if e.get("kind") != "cache.llm":
-            continue
-        template = e.get("template") or e.get("step")
-        # image_prompt / library_match are mechanical per-object service steps
-        # (the most numerous LLM calls); their output + reasoning bloat the
-        # timeline for zero spatial insight, so they're left out of the base
-        # context. An image_prompt step is still @-attachable on demand;
-        # library_match is kept out of the investigator entirely.
-        if template in _INVESTIGATOR_SKIP_STEPS:
-            continue
-        raw_vars = e.get("variables") if isinstance(e.get("variables"), dict) else {}
-        native = prompt_store.STEP_VARIABLES.get(template, []) if isinstance(template, str) else []
-        vars_out = {
-            k: raw_vars[k]
-            for k in native
-            if k not in _INVESTIGATOR_SKIP_VARS and isinstance(raw_vars.get(k), str) and raw_vars.get(k)
-        }
-        steps.append({
-            "index": e.get("index"),
-            "step": e.get("step"),
-            "template": template,
-            "node": e.get("node"),
-            "output": e.get("output"),
-            "reasoning": e.get("reasoning") or "",
-            "variables": vars_out,
-        })
-    return {
-        "prompt": root.prompt if root is not None else "",
-        "scene_context": scene_context.render_embedded_block(nodes),
-        "root_header": scene_context._root_scene_header(root) if root is not None else "",
-        "root_objects": scene_context.render_root_objects(nodes),
-        "steps": steps,
-    }
-
-
 def _require_slot(slot_id: str) -> Slot:
     slot = SLOTS_BY_ID.get(slot_id)
     if slot is None:
@@ -5053,12 +5111,10 @@ def _objects_dir(cell_dir: Path) -> Path:
     )
 
 
-async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None, until_before: bool = False) -> str:
+async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool, until: str | None = None) -> str:
     """Advance a stepped source cell. Three modes:
       * `auto`   — run it to completion, ungated.
-      * `until`  — fast-forward to the next call of template `until`, pausing
-                   AFTER it (through the call) or, when `until_before`, BEFORE
-                   it (the call doesn't execute).
+      * `until`  — fast-forward to the next call of template `until`, pause there.
       * default  — advance by exactly one LLM call.
 
     Works from EITHER state, which is what keeps a multi-model run in sync:
@@ -5078,16 +5134,8 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
             return "stepped"
         if until is not None:
             if gate.pending and gate.pending.get("template") == until:
-                # Already paused right before a call of the target step.
-                if until_before:
-                    return "stepped"  # that IS the "before X" breakpoint — no-op
-                # "after X": run exactly this call, then pause at the next — a
-                # single step from here. (Re-seeking would skip past it to the
-                # NEXT occurrence of X.)
-                gate.proceed()
-                return "stepped"
+                return "at_target"  # already paused right at it
             gate.until_step = until
-            gate.until_before = until_before
             gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
             return "seeking"
         if gate.proceed():
@@ -5103,31 +5151,24 @@ async def _advance_cell(run: str, slot_id: str, model_alias: str, *, auto: bool,
         return "missing"
     if any(e.get("kind") == "run.done" for e in slot_log.state["events"]):
         return "done"
-    # Over the spend cap — can't relaunch to advance it (a capped cell has no
-    # live gate to release either; the cap enforcement cancelled its task). The
-    # override is the only way forward. "step all" folds this into by_result.
-    if _cap_reached(slot_log.state["events"]):
-        return "capped"
     # No live task and not done → idle / paused / error / crashed: all runnable.
     if auto:
         _set_stepped(key, False)  # finish normally, ungated
     else:
         _set_stepped(key, True)
-        _gate_intents[key] = (
-            {"until": until, "until_before": until_before} if until is not None else {"budget": 1}
-        )
+        _gate_intents[key] = {"until": until} if until is not None else {"budget": 1}
     await _start_cell(run, slot_id, model_alias)
     return "launched"
 
 
-async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = None, until_before: bool = False, model: str | None = None) -> str:
+async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = None, model: str | None = None) -> str:
     """Advance a simulation branch — the branch mirror of `_advance_cell`, so
     "step sims" behaves like "step all": it queues rather than erroring when a
     branch isn't sitting at a live gate.
       * live gate: release a current pause, else QUEUE a credit (budget++) the
         branch spends at its next gate — so a branch mid-call isn't skipped.
       * `auto` runs it to completion; `until` fast-forwards to the next call of
-        that template, pausing AFTER it or (when `until_before`) BEFORE it.
+        that template and pauses there.
       * `model` (an OpenRouter id) re-aims the next gated call at a chosen LLM —
         sticky on the gate until changed, so the same scene context can be
         tested against different models.
@@ -5149,15 +5190,8 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
             return "stepped"
         if until is not None:
             if gate.pending and gate.pending.get("template") == until:
-                # Already paused right before a call of the target step.
-                if until_before:
-                    return "stepped"  # that IS the "before X" breakpoint — no-op
-                # "after X": run exactly this call, then pause at the next
-                # (re-seeking would skip to the NEXT occurrence of X).
-                gate.proceed()
-                return "stepped"
+                return "at_target"
             gate.until_step = until
-            gate.until_before = until_before
             gate.proceed()  # release a current pause to fast-forward (no-op if mid-call)
             return "seeking"
         if gate.proceed():
@@ -5173,10 +5207,8 @@ async def _advance_branch(branch_id: str, *, auto: bool, until: str | None = Non
         blog.truncate_events_to(len(events) - 1)
     if auto:
         intent: dict[str, object] = {"auto": True}
-    elif until is not None:
-        intent = {"until": until, "until_before": until_before}
     else:
-        intent = {"budget": 1}
+        intent = {"until": until} if until is not None else {"budget": 1}
     if model is not None:
         intent["model"] = model  # seed the relaunched gate's override
     br.gate_intent = intent
@@ -5278,6 +5310,14 @@ async def _fork_branch(
                 cell_dir / "objects",
             )
     src_events = list(src_log.state["events"])
+    # Resolve the cut's POSITION from its `index` FIELD (an origin fork's
+    # event_index is the client cut = the index field; a drifted base has
+    # index≠position, so the positional prefix slices below must use the resolved
+    # position or they'd cut at the wrong place). Children fork positionally.
+    if parent is None:
+        resolved = _event_pos_by_index(src_events, event_index)
+        if resolved is not None:
+            event_index = resolved
     event_index = max(0, min(event_index, len(src_events)))
 
     bid = _new_branch_id(slot_id, model_alias)
@@ -5295,8 +5335,11 @@ async def _fork_branch(
 
     # Prefix = source events BEFORE the fork. Dropping that call (and everything
     # after) means `committed.*` replays the prefix and the pipeline re-reaches
-    # it with the (snapshot + overrides) templates.
-    branch_events = [dict(e) for e in src_events[:event_index]]
+    # it with the (snapshot + overrides) templates. Sourced FULL off disk (the
+    # slim buffer omits system/user/output) so the branch's LLM cache replays
+    # the prefix's committed outputs instead of re-running every step.
+    full_src = src_log.full_events()
+    branch_events = [dict(e) for e in full_src[:event_index]]
     # A CHILD fork copies the PARENT branch's log; repoint the parent's object
     # URLs at the child's own dir (the parent's committed meshes are hardlinked
     # into it just above), so the child — and any sim KEPT from it — stays
@@ -5413,7 +5456,6 @@ async def _run_branch(branch_id: str) -> None:
     gate.auto = bool(intent.get("auto", False))
     _b_until = intent.get("until")
     gate.until_step = str(_b_until) if _b_until else None
-    gate.until_before = bool(intent.get("until_before", False))
     br.gate = gate
     llm.set_step_gate(gate.wait)
     prompt = blog.state["prompt"]
@@ -5428,7 +5470,7 @@ async def _run_branch(branch_id: str) -> None:
         raise
     except Exception as e:
         generation.cancel_pending(brun_id)
-        blog.log("run.error", message=_llm_error_message(e))
+        blog.log("run.error", message=f"{type(e).__name__}: {e}")
         return
     finally:
         # The gate lives only for the task's duration — drop it so a finished
@@ -5590,6 +5632,202 @@ def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
     return {"nodes": list(nodes.values()), "last_index": last_index}
 
 
+# HTTP revalidation for the immutable-ish GETs (tf-export, computed attention
+# views). A cheap ETag from the content's change-signals lets a repeat request
+# return 304 (empty body) instead of re-transferring the 0.8-5 MB payload. Paired
+# with `Cache-Control: no-cache` (always revalidate -> never serve stale) and the
+# client fetching these with `cache: "no-cache"`. Cross-origin safe: browser-added
+# conditional headers don't preflight and the CORS middleware stamps the 304.
+_TF_EXPORT_ETAG_VERSION = 1  # bump when teacher_forcing.build_export output changes
+
+
+def _make_etag(*parts: object) -> str:
+    h = hashlib.sha1("\x00".join(str(p) for p in parts).encode("utf-8")).hexdigest()
+    return f'"{h[:24]}"'
+
+
+def _revalidate(request: Request, response: Response, etag: str) -> Response | None:
+    """Stamp the revalidation headers on `response`, and return a 304 (so the caller
+    can skip building the body) when the client's If-None-Match already matches."""
+    response.headers["ETag"] = etag
+    response.headers["Cache-Control"] = "no-cache"
+    inm = request.headers.get("if-none-match")
+    if inm and any(t.strip() == etag for t in inm.split(",")):
+        return Response(status_code=304, headers={"ETag": etag, "Cache-Control": "no-cache"})
+    return None
+
+
+def _pm(vals: list[float]) -> dict[str, float]:
+    """Mean + sample sd (n-1) of a list — mirrors the client's uncertainty.pm."""
+    n = len(vals)
+    if n == 0:
+        return {"m": 0.0, "s": 0.0, "n": 0}
+    m = sum(vals) / n
+    if n < 2:
+        return {"m": m, "s": 0.0, "n": n}
+    var = sum((x - m) ** 2 for x in vals) / (n - 1)
+    return {"m": m, "s": (var if var > 0 else 0.0) ** 0.5, "n": n}
+
+
+def _cell_rollup(compacts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Cell-wide mean±sd (across steps, an absent step counts as 0) of scene entity
+    + component totals, plus per-step scene mass. Mirrors the client's
+    aggregate.js `overviewAggregate` + overview key stats, computed server-side over
+    the stored compacts so the browser stops re-pooling every step on every render."""
+    n = len(compacts)
+    ent: dict[str, dict[str, Any]] = {}
+    comp: dict[str, list[float]] = {}
+    masses: list[float] = []
+    for c in compacts:
+        scene = (c.get("agg") or {}).get("scene") or {}
+        for e in scene.get("entityTotals") or []:
+            cur = ent.setdefault(str(e.get("id")), {"id": e.get("id"), "kind": e.get("kind"), "vals": []})
+            cur["vals"].append(float(e.get("score") or 0.0))
+        for cc in scene.get("componentTotals") or []:
+            comp.setdefault(str(cc.get("component")), []).append(float(cc.get("score") or 0.0))
+        mass = (c.get("agg") or {}).get("mass") or []
+        if mass:
+            masses.append(sum(mass) / len(mass))
+
+    def fold(vals: list[float]) -> dict[str, float]:
+        return _pm(vals + [0.0] * max(0, n - len(vals)))  # zero-pad absent steps
+
+    entity_totals = []
+    for e in ent.values():
+        p = fold(e["vals"])
+        entity_totals.append({"id": e["id"], "kind": e["kind"], "score": p["m"], "sd": p["s"]})
+    entity_totals.sort(key=lambda x: -x["score"])
+    component_totals = []
+    for k, v in comp.items():
+        p = fold(v)
+        component_totals.append({"component": k, "score": p["m"], "sd": p["s"]})
+    component_totals.sort(key=lambda x: -x["score"])
+    return {
+        "n_steps": n,
+        "entityTotals": entity_totals,
+        "componentTotals": component_totals,
+        "mass": _pm(masses),
+    }
+
+
+# `scenario` tag on a `generation.decompose` -> the decompose pass that named the
+# objects (mirrors app.types.scenes.EmittedBy). Fallback only, when the emitting
+# `cache.llm` call for the region wasn't seen (legacy logs).
+_SCENARIO_EMIT = {
+    "anchor": "anchor_decompose",
+    "encapsulating": "encapsulating_decompose",
+    "negative-space": "negative_space_decompose",
+}
+
+
+def _obs_tree(events: list[dict[str, object]]) -> dict[str, object]:
+    """Compact obs projection for the /tf inspector: the scene-node tree
+    (id -> kind/parent) plus each node's EMITTING provenance (the region + pass +
+    call index of the decompose / next-object step that NAMED it).
+
+    Folds the SLIM in-memory buffer only: `bbox` carries kind + structural parent;
+    `generation.decompose` / `generation.next` / `divider.zone_decompose` carry the
+    emitting region + emitted ids; the emitting call (index + pass) is the last
+    `cache.llm` on that region. No `cache.llm` body and no full-log read is needed.
+
+    Mirrors the fields the client's createObsModel (js/events.js) exposes to /tf
+    (`nodes` id->{kind,parentId}, `order`, and `provenance` emitted_by entries with
+    call.node / call.index / call.template), so the browser stops downloading +
+    folding the full (hundreds-of-MB) events.jsonl on every cell switch.
+    """
+    order: list[str] = []
+    nodes: dict[str, dict[str, object]] = {}
+    prov: dict[str, dict[str, object]] = {}
+    # region id -> (emitting cache.llm index, that call's pass/template)
+    region_call: dict[str, tuple[int | None, str | None]] = {}
+
+    def node(nid: str) -> dict[str, object]:
+        n = nodes.get(nid)
+        if n is None:
+            n = {"kind": "zone", "parent_id": None}
+            nodes[nid] = n
+            order.append(nid)
+        return n
+
+    def emit(nid: object, region: str, call: tuple[int | None, str | None]) -> None:
+        # First emit wins — mirrors the client reading provenance via `.find()`.
+        if not isinstance(nid, str) or nid == region or nid in prov:
+            return
+        prov[nid] = {"region": region, "emitted_by": call[1], "call_index": call[0]}
+
+    for e in events:
+        kind = e.get("kind")
+        if kind == "cache.llm":
+            region = e.get("node")
+            if isinstance(region, str):
+                node(region)
+                idx = e.get("index")
+                tmpl = e.get("template") or e.get("step")
+                region_call[region] = (
+                    idx if isinstance(idx, int) else None,
+                    tmpl if isinstance(tmpl, str) else None,
+                )
+        elif kind == "bbox":
+            nid = e.get("id")
+            if isinstance(nid, str):
+                n = node(nid)
+                nk = e.get("node_kind")
+                if isinstance(nk, str):
+                    n["kind"] = nk
+                if e.get("parent_id") is not None:
+                    n["parent_id"] = e.get("parent_id")
+        elif kind in ("divider.zone_decompose", "divider.decompose"):
+            region = e.get("node")
+            children = e.get("children")
+            if isinstance(children, list):
+                call = region_call.get(region) if isinstance(region, str) else None
+                if call is None:
+                    idx = e.get("index")
+                    call = (idx if isinstance(idx, int) else None, "zone_decompose")
+                for c in children:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("id")
+                    if not isinstance(cid, str):
+                        continue
+                    n = node(cid)
+                    if n["parent_id"] is None:
+                        n["parent_id"] = c.get("parent") or (region if isinstance(region, str) else None)
+                    if isinstance(region, str):
+                        emit(cid, region, call)
+        elif kind == "generation.decompose":
+            zone = e.get("zone")
+            objs = e.get("objects")
+            if isinstance(zone, str) and isinstance(objs, list):
+                call = region_call.get(zone)
+                if call is None:
+                    idx = e.get("index")
+                    call = (idx if isinstance(idx, int) else None, _SCENARIO_EMIT.get(e.get("scenario")))  # pyright: ignore[reportArgumentType]
+                for o in objs:
+                    oid = o.get("id") if isinstance(o, dict) else (o if isinstance(o, str) else None)
+                    emit(oid, zone, call)
+        elif kind == "generation.next":
+            zone = e.get("zone")
+            if isinstance(zone, str):
+                call = region_call.get(zone)
+                if call is None:
+                    idx = e.get("index")
+                    call = (idx if isinstance(idx, int) else None, "next_object")
+                emit(e.get("id"), zone, call)
+
+    out_nodes: dict[str, dict[str, object]] = {}
+    for nid in order:
+        n = nodes[nid]
+        rec: dict[str, object] = {"kind": n["kind"], "parent_id": n["parent_id"]}
+        p = prov.get(nid)
+        if p is not None:
+            rec["region"] = p["region"]
+            rec["emitted_by"] = p["emitted_by"]
+            rec["call_index"] = p["call_index"]
+        out_nodes[nid] = rec
+    return {"order": order, "nodes": out_nodes}
+
+
 async def _sse(
     slot_log: SlotLog,
     q: asyncio.Queue[dict[str, object]],
@@ -5609,7 +5847,7 @@ async def _sse(
         while True:
             event = await q.get()
             yield f"data: {json.dumps(event)}\n\n"
-            if event["kind"] in {"run.done", "run.error", "run.paused", "run.cap_reached"}:
+            if event["kind"] in {"run.done", "run.error", "run.paused"}:
                 return
     finally:
         slot_log.unsubscribe(q)
@@ -5939,7 +6177,6 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         gate.auto = bool(intent.get("auto", False))
         _until = intent.get("until")
         gate.until_step = str(_until) if _until else None
-        gate.until_before = bool(intent.get("until_before", False))
         _cell_gates[key] = gate
         llm.set_step_gate(gate.wait)
     # Task-local logprob capture: every real call this cell makes will request
@@ -5953,16 +6190,27 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
     try:
         # Bind the run's prompt snapshot inside the try so a broken/missing
         # snapshot surfaces as a clean run.error instead of a dead task.
-        prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
+        _ps = prompt_store.load_run_prompts(_run_dir(run))
         # Ablation variant runs carry a treatment in run.json; bind it task-locally
         # so the scene renderer applies the shuffle / distractor to the re-inferred
         # steps. A no-op for normal runs (no `ablation` key).
         _abl_meta = (_run_meta(run) or {}).get("ablation")
         if _abl_meta:
+            _treatment = ablation_cfg.treatment_from_meta(_abl_meta)
             ablation_ctx.set_runtime(ablation_cfg.AblationRuntime(
                 target_step_kind=str(_abl_meta.get("target_step_kind") or ""),
-                treatment=ablation_cfg.treatment_from_meta(_abl_meta),
+                treatment=_treatment,
             ))
+            # Coordinate-frame ablation: rewrite the two bbox solvers' OUTPUT-frame
+            # instruction (local<->world) + INPUT scene-context prose to match the
+            # treatment's coord_mode, once here at bind. No-op for the `baseline`
+            # mode and for every non-bbox step (and thus for every replayed prefix
+            # step, which never renders). The per-entity coordinate LINES are gated
+            # separately at render time in scene_context.
+            _cov = ablation_coord.prompt_overrides(_ps, getattr(_treatment, "coord_mode", "baseline"))
+            if _cov:
+                _ps = _ps.with_overrides(_cov)
+        prompt_store.bind(_ps)
         await divider.run(
             run_id=run_id,
             prompt=prompt,
@@ -5980,9 +6228,25 @@ async def _run(run: str, slot_id: str, model_alias: str) -> None:
         slot_log.log("ablation.complete", step=str((_abl_meta or {}).get("target_step_kind") or ""))
     except Exception as e:
         generation.cancel_pending(run_id)
-        # Log the full provider detail (metadata/body), not the SDK's opaque
-        # top-level "Provider returned error", so the run.error event is useful.
-        slot_log.log("run.error", message=_llm_error_message(e))
+        # OpenRouter SDK errors only stringify to the top-level "Provider
+        # returned error" message; the actually useful detail (upstream
+        # provider's complaint, the request body that tripped it) lives on
+        # `data.error.metadata` and on `e.body` (the response body the SDK
+        # already read; `raw_response.text` would re-trigger a read on a
+        # closed streaming response). Pull both into the logged message so
+        # the run.error event tells us what went wrong.
+        details = []
+        data = getattr(e, "data", None)
+        err = getattr(data, "error", None) if data is not None else None
+        if err is not None:
+            metadata = getattr(err, "metadata", None)
+            if metadata:
+                details.append(f"metadata={metadata}")
+        body = getattr(e, "body", None)
+        if body:
+            details.append(f"body={body[:2000]}")
+        suffix = (" | " + " | ".join(details)) if details else ""
+        slot_log.log("run.error", message=f"{type(e).__name__}: {e}{suffix}")
         return
     finally:
         # A gate only lives for the duration of its task — drop it so a paused

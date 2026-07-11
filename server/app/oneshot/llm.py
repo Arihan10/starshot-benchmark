@@ -202,7 +202,7 @@ async def call_structured(
         user=user,
         schema_name=schema_name,
     )
-    hit = cache.find_llm_cache_hit(logging.current_events(), key)
+    hit = cache.find_llm_cache_hit(logging.current_slot(), key)
     if hit is not None:
         return output_schema.model_validate(hit)
 
@@ -298,7 +298,7 @@ async def call_text(
         user=user,
         schema_name=schema_name,
     )
-    hit = cache.find_llm_cache_hit(logging.current_events(), key)
+    hit = cache.find_llm_cache_hit(logging.current_slot(), key)
     if hit is not None:
         return schema.model_validate(hit)
 

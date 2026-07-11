@@ -392,6 +392,17 @@ async def _next_object_batch(
     return False, objects
 
 
+def _coord_emit_global() -> bool:
+    """True when a coordinate-frame ablation has the bbox solver emit world-frame
+    boxes directly (so the local->world conversion is skipped). False on every
+    normal run — the emitted box stays parent-local and is converted as before."""
+    try:
+        from app.ablation import coord
+        return coord.emit_global()
+    except Exception:
+        return False
+
+
 async def _resolve_object_bboxes_batch(
     *,
     specs: list[Any],
@@ -422,6 +433,7 @@ async def _resolve_object_bboxes_batch(
     variables["TO_PLACE"] = scene_context.render_to_place_block(
         specs, by_id, parent_zone=zone.id,
     )
+    scene_context.apply_schema_render(variables)  # schema ablation: also convert TO_PLACE (no-op normally)
     out = await llm.call_llm(
         system=ps.system("object_bbox_batch", variables),
         user=ps.user("object_bbox_batch", variables),
@@ -443,26 +455,32 @@ async def _resolve_object_bboxes_batch(
     assignments_by_id = {a.id: a.bbox for a in out.assignments}
     orientations = {a.id: a.orientation for a in out.assignments}
     bboxes: dict[str, BoundingBox] = {}
-    remaining = set(assignments_by_id.keys())
-    while remaining:
-        progress = False
-        for obj_id in list(remaining):
-            parent_id = spec_parent.get(obj_id, zone.id)
-            if parent_id in bboxes:
-                parent_bbox = bboxes[parent_id]
-            elif parent_id in bbox_by_id:
-                parent_bbox = bbox_by_id[parent_id]
-            elif parent_id in remaining:
-                continue
-            else:
-                parent_bbox = zone.bbox
-            bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
-            remaining.discard(obj_id)
-            progress = True
-        if not progress:
+    if _coord_emit_global():
+        # Coordinate ablation, OUTPUT=global: the solver already emitted each box
+        # in world coordinates, so there is no per-object parent-frame conversion
+        # (and no intra-batch topological pass) to do — the emitted box IS world.
+        bboxes = dict(assignments_by_id)
+    else:
+        remaining = set(assignments_by_id.keys())
+        while remaining:
+            progress = False
             for obj_id in list(remaining):
-                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
-            remaining.clear()
+                parent_id = spec_parent.get(obj_id, zone.id)
+                if parent_id in bboxes:
+                    parent_bbox = bboxes[parent_id]
+                elif parent_id in bbox_by_id:
+                    parent_bbox = bbox_by_id[parent_id]
+                elif parent_id in remaining:
+                    continue
+                else:
+                    parent_bbox = zone.bbox
+                bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(parent_bbox)
+                remaining.discard(obj_id)
+                progress = True
+            if not progress:
+                for obj_id in list(remaining):
+                    bboxes[obj_id] = assignments_by_id[obj_id].to_world_frame(zone.bbox)
+                remaining.clear()
     for sid, b in committed_bboxes.items():
         if b is not None:
             bboxes[sid] = b

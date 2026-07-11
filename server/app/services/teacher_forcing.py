@@ -29,6 +29,7 @@ The whole sequence is assembled from labeled `pieces`, so `segments` +
 
 from __future__ import annotations
 
+import json
 import re
 from typing import Any
 
@@ -111,6 +112,105 @@ def _line_component(stripped: str) -> str | None:
     return None
 
 
+# --- per-attribute token ROLES (context / frame / content) -------------------
+# Within each component's char span, tokens are further split into three roles
+# for the structure-vs-content attention readout:
+#   * context — the key/field NAME ("placement", "Dimensions", "Global origin
+#     corner"); the label the value is filed under.
+#   * frame   — the structural scaffolding around the value: colon, brackets,
+#     braces, parens, commas, quotes, and fixed unit labels (m, deg), plus any
+#     descriptive parenthetical on the key (local-origin's "(relative to X …)").
+#   * content — the actual value token(s): numbers, prose, relationship
+#     targets/kinds, enum, id.
+# The rules are per value-KIND (coord / quoted / relationships / yaw / scalar),
+# char-span based (tokenizer-agnostic — a token inherits the role it overlaps
+# most, resolved downstream in semantic.build_scene_entities), and MIRROR the
+# canonical, human-verifiable classifier in scripts/scene_schema.py
+# (classify_line_roles). The coord ablation renders `key: value` (never XML), so
+# only that form is handled here.
+_ROLE_NUM_RE = re.compile(r"-?\d+(?:\.\d+)?")
+_ROLE_WORD_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_\-]*")
+_ROLE_SCALAR_RE = re.compile(r"[A-Za-z0-9_\-./]+")
+
+
+def _line_value_kind(stripped: str) -> str:
+    if stripped.startswith((
+        "Dimensions:", "Global origin corner:", "Local origin corner",
+        "parent_dimensions:", "parent_region_dimensions:", "parent_global_origin_corner:",
+    )):
+        return "coord"
+    if stripped.startswith((
+        "prompt:", "description:", "placement:", "orientation:", "noun_phrase", "parent_placement:",
+    )):
+        return "quoted"
+    if stripped.startswith("relationships:"):
+        return "relationships"
+    if stripped.startswith("global yaw:"):
+        return "yaw"
+    return "scalar"
+
+
+def _value_content_spans(value: str, kind: str) -> list[tuple[int, int]]:
+    """CONTENT char spans within a field's value (offsets relative to `value`),
+    per its serialized kind. Everything else in the value is FRAME."""
+    if kind in ("coord", "yaw"):
+        return [m.span() for m in _ROLE_NUM_RE.finditer(value)]
+    if kind == "quoted":
+        a = value.find('"')
+        b = value.rfind('"')
+        if a >= 0 and b > a:
+            return [(a + 1, b)]
+        s = value.strip()
+        if s:
+            i = value.find(s)
+            return [(i, i + len(s))]
+        return []
+    if kind == "relationships":
+        a = value.find("[")
+        b = value.rfind("]")
+        lo = a + 1 if a >= 0 else 0
+        hi = b if b > lo else len(value)
+        return [(lo + m.start(), lo + m.end()) for m in _ROLE_WORD_RE.finditer(value[lo:hi])]
+    return [m.span() for m in _ROLE_SCALAR_RE.finditer(value)]
+
+
+def _line_roles(line: str) -> list[tuple[str, int, int]]:
+    """Role sub-spans `(role, start, end)` for one `key: value` line (offsets
+    relative to `line`). Empty for a non-field line."""
+    ci = line.find(":")
+    if ci < 0:
+        return []
+    stripped = line.strip()
+    if _line_component(stripped) is None:
+        return []
+    key_part = line[:ci]
+    value = line[ci + 1:]
+    vbase = ci + 1
+    key_lo = len(key_part) - len(key_part.lstrip())
+    paren = key_part.find("(")                       # local-origin qualifier → frame
+    ctx_hi = paren if paren >= 0 else len(key_part.rstrip())
+    spans: list[tuple[str, int, int]] = []
+    if ctx_hi > key_lo:
+        spans.append(("context", key_lo, ctx_hi))
+    for s, e in _value_content_spans(value, _line_value_kind(stripped)):
+        spans.append(("content", vbase + s, vbase + e))
+    claimed = bytearray(len(line))
+    for _r, s, e in spans:
+        for i in range(s, min(e, len(line))):
+            claimed[i] = 1
+    i, n = key_lo, len(line)
+    while i < n:
+        if not claimed[i] and not line[i].isspace():
+            j = i
+            while j < n and not claimed[j] and not line[j].isspace():
+                j += 1
+            spans.append(("frame", i, j))
+            i = j
+        else:
+            i += 1
+    return spans
+
+
 def _entry_components(text: str) -> list[dict[str, Any]]:
     """Split one entry's own-field text into per-component spans (offsets
     relative to `text`), merging consecutive lines of the same component so a
@@ -141,8 +241,12 @@ def _entry_components(text: str) -> list[dict[str, Any]]:
         if cur is not None and cur["component"] == comp:
             cur["end"] = pos
         else:
-            cur = {"component": comp, "start": start, "end": pos}
+            cur = {"component": comp, "start": start, "end": pos, "roles": []}
             comps.append(cur)
+        # Fold this line's context/frame/content role sub-spans (absolute to the
+        # entry text) onto the component. Parent-block sub-lines contribute too.
+        for role, rs, rre in _line_roles(line.rstrip("\n")):
+            cur["roles"].append({"role": role, "start": start + rs, "end": start + rre})
     return comps
 
 
@@ -155,6 +259,9 @@ def _components_and_parent(seg: str, abs_base: int) -> tuple[list[dict[str, Any]
     for c in comps:
         c["start"] += abs_base
         c["end"] += abs_base
+        for r in c.get("roles", []):
+            r["start"] += abs_base
+            r["end"] += abs_base
     m_pid = re.search(r"(?m)^[ \t]*parent_id: (\S+)", seg)
     m_pval = re.search(r"(?m)^[ \t]*parent: (\S+)", seg)
     m_pname = re.search(r"(?m)^[ \t]*parent_name: (\S+)", seg)
@@ -247,6 +354,20 @@ def has_scene_context(event: dict[str, Any]) -> bool:
     bbox) have no scene yet and return False."""
     variables: dict[str, Any] = event.get("variables") or {}
     user = str(event.get("user") or "")
+    # A SCHEMA ablation renders the scene as XML/prose — which carries NO soft-JSON
+    # `Name:` / `Subregion name:` markers — but logs the per-attribute role span-map
+    # under `__SCENE_ROLES__`. Treat a non-empty logged map whose rendered var is
+    # present verbatim in `user` as scene-bearing, MIRRORING how `build_export`
+    # populates `scene_map` from it — else XML/prose variants read as "no scene".
+    try:
+        logged: dict[str, Any] = json.loads(str(variables.get("__SCENE_ROLES__") or "{}"))
+    except Exception:
+        logged = {}
+    if isinstance(logged, dict):
+        for var_name, smap in logged.items():
+            block = str(variables.get(var_name) or "")
+            if smap and block and block in user:
+                return True
     for var_name in _SCENE_BEARING_VARS:
         block = str(variables.get(var_name) or "")
         if block and _SCENE_MARKER_RE.search(block) and block in user:
@@ -320,6 +441,37 @@ def build_export(
     # (SIBLING_OBJECTS / *_BRIEF) and the bbox solvers (SCENE_CONTEXT) alike get
     # a populated map. Within one block, an entry owns the text from its marker
     # up to the next marker; `source` records which variable it came from.
+    # A SCHEMA ablation renders the scene context as XML/prose, which has no
+    # soft-JSON `key:` grammar to scrape, so the pipeline logs the per-attribute
+    # role span-map (from the shared emitter) under `__SCENE_ROLES__` (offsets
+    # RELATIVE to each variable's string). When present for a variable we consume
+    # it (rebased into `full`) instead of the marker scan; otherwise the soft-JSON
+    # scrape runs — so base runs / legacy events are unaffected.
+    try:
+        _logged_roles: dict[str, Any] = json.loads(str(variables.get("__SCENE_ROLES__") or "{}"))
+    except Exception:
+        _logged_roles = {}
+
+    def _from_logged(entries: list[dict[str, Any]], base: int, source: str | None) -> list[dict[str, Any]]:
+        out_entries: list[dict[str, Any]] = []
+        for ent in entries or []:
+            comps = [{
+                "component": c.get("component"),
+                "start": base + c["start"], "end": base + c["end"],
+                "roles": [{"role": r["role"], "start": base + r["start"], "end": base + r["end"]}
+                          for r in c.get("roles", [])],
+            } for c in ent.get("components", [])]
+            e = {
+                "id": ent.get("id"),
+                "start": base + ent["start"], "end": base + ent["end"],
+                "parent": None, "region": None, "components": comps,
+            }
+            if source is not None:
+                e["kind"] = ent.get("kind") or "object"
+                e["source"] = source
+            out_entries.append(e)
+        return out_entries
+
     scene_map: list[dict[str, Any]] = []
     for var_name in _SCENE_BEARING_VARS:
         block_text = str(variables.get(var_name) or "")
@@ -327,6 +479,10 @@ def build_export(
         if not block_text or block_span is None:
             continue
         base = block_span[0]
+        logged = _logged_roles.get(var_name)
+        if logged:
+            scene_map.extend(_from_logged(logged, base, var_name))
+            continue
         marks = list(_SCENE_MARKER_RE.finditer(block_text))
         for i, m in enumerate(marks):
             nxt = marks[i + 1].start() if i + 1 < len(marks) else len(block_text)
@@ -351,7 +507,12 @@ def build_export(
     tp_span = _span_in_user(tp)
     if tp and tp_span is not None:
         tp_start = tp_span[0]
-        marks = list(_TOPLACE_MARKER_RE.finditer(tp))
+        logged_tp = _logged_roles.get("TO_PLACE")
+        if logged_tp:
+            to_place_map.extend(_from_logged(logged_tp, tp_start, source=None))
+            marks = []  # consumed from the logged span-map (XML/prose TO_PLACE)
+        else:
+            marks = list(_TOPLACE_MARKER_RE.finditer(tp))
         for i, m in enumerate(marks):
             nxt = marks[i + 1].start() if i + 1 < len(marks) else len(tp)
             seg = tp[m.start():nxt]
@@ -365,6 +526,34 @@ def build_export(
                 "region": region,
                 "components": comps,
             })
+
+    # --- XML-gravity instruction-block SENTENCES + tag spans --------------------
+    # A gravity variant logs `__GRAVITY__` (offsets RELATIVE to `user`): the
+    # instruction block's per-sentence spans (+ snippets) + the moved <prompt>
+    # open/close tag spans. Rebase into `full` (+ keep `user_rel` for the native
+    # reconstruct). Empty for every non-gravity step, so base runs are unaffected.
+    gravity_out: dict[str, Any] = {}
+    try:
+        _logged_gravity: dict[str, Any] = json.loads(str(variables.get("__GRAVITY__") or "{}"))
+    except Exception:
+        _logged_gravity = {}
+    if _logged_gravity.get("sentences") is not None:
+        def _grav_span(pair: Any) -> dict[str, Any] | None:
+            if not pair:
+                return None
+            return {"start": user_start + int(pair[0]), "end": user_start + int(pair[1]),
+                    "user_rel": [int(pair[0]), int(pair[1])]}
+        gravity_out = {
+            "mode": _logged_gravity.get("mode"),
+            "block": _grav_span(_logged_gravity.get("block")),
+            "open_tag": _grav_span(_logged_gravity.get("open_tag")),
+            "close_tag": _grav_span(_logged_gravity.get("close_tag")),
+            "sentences": [
+                {"i": s.get("i"), "snippet": s.get("snippet"),
+                 **(_grav_span([s.get("start"), s.get("end")]) or {})}
+                for s in _logged_gravity.get("sentences", [])
+            ],
+        }
 
     # --- output assignments/specs -> spans in the emitted output ----------------
     output_map: list[dict[str, Any]] = []
@@ -400,6 +589,8 @@ def build_export(
         entry["user_rel"] = [entry["start"] - user_start, entry["end"] - user_start]
         for c in entry.get("components", []):
             c["user_rel"] = [c["start"] - user_start, c["end"] - user_start]
+            for r in c.get("roles", []):
+                r["user_rel"] = [r["start"] - user_start, r["end"] - user_start]
 
     for entry in scene_map:
         _tag_input(entry)
@@ -499,5 +690,6 @@ def build_export(
         "to_place_map": to_place_map,
         "output_map": output_map,
         "variables_map": variables_map,
+        "gravity": gravity_out,
         "logprobs": lp_summary,
     }

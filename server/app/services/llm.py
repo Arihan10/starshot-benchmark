@@ -281,7 +281,7 @@ async def call_llm(
         user=user,
         schema_name=schema_name,
     )
-    hit = cache.find_llm_cache_hit(logging.current_events(), key)
+    hit = cache.find_llm_cache_hit(logging.current_slot(), key)
     if hit is not None:
         cached = output_schema.model_validate(hit)
         # Post-fix runs never cache an output that fails `validate`, so a hit is
@@ -308,7 +308,7 @@ async def call_llm(
         # return it without re-running. Only the frontier (whose cache.llm was
         # truncated by the revert) finds nothing and falls through to the gate.
         replay = cache.find_llm_replay(
-            logging.current_events(), system=system, user=user, schema_name=schema_name,
+            logging.current_slot(), system=system, user=user, schema_name=schema_name,
         )
         if replay is not None:
             cached = output_schema.model_validate(replay)
@@ -334,13 +334,31 @@ async def call_llm(
                 user=user,
                 schema_name=schema_name,
             )
-            hit = cache.find_llm_cache_hit(logging.current_events(), key)
+            hit = cache.find_llm_cache_hit(logging.current_slot(), key)
             if hit is not None:
                 cached = output_schema.model_validate(hit)
                 if validate is not None:
                     validate(cached)
                 return cached
 
+    # Ablation: a variant's RE-INFERRED treated step samples with the treatment's
+    # temperature + per-replicate seed, so duplicate re-runs (replicates) are
+    # independent-but-reproducible draws. None on normal runs / non-treated steps
+    # → provider default, byte-identical to before.
+    from app.ablation import context as _abl_ctx
+    sampling = _abl_ctx.sampling_for(template if template is not None else step)
+    # XML-gravity ablation: rewrite the treated step's instruction-block XML tags
+    # per the treatment (strip / move the closing <prompt> across word-count
+    # quarters) and log the quarter+tag span-map under `variables["__GRAVITY__"]`.
+    # Placed AFTER the cache + gate checks so ONLY the variant's re-inferred treated
+    # firing is rewritten — replayed prefix firings cache-hit above and are
+    # untouched. Re-hash so the re-inferred output caches + logs under the ACTUAL
+    # sent user. A no-op (byte-identical) on normal runs / non-treated steps.
+    from app.ablation import gravity as _abl_gravity
+    _g_user = _abl_gravity.rewrite_and_stash(user, variables, template if template is not None else step)
+    if _g_user != user:
+        user = _g_user
+        key = cache.hash_llm_call(model=model, system=system, user=user, schema_name=schema_name)
     validated, reasoning, usage, raw, generation_ids, logprobs_map = await call_llm_once(
         system=system,
         user=user,
@@ -348,6 +366,7 @@ async def call_llm(
         model=model,
         validate=validate,
         step=step,
+        sampling=sampling,
     )
     # When logprob capture is on and the provider returned them, spill the
     # (potentially large) per-token distribution to a content-addressed sidecar
@@ -398,8 +417,8 @@ async def call_llm(
     # downstream (image prompts, flash-lite library/prefab matching, meshes).
     # The ablation targets the TEMPLATE name (e.g. object_bbox_batch,
     # zone_decompose) — root/nested variants differ in `template` while sharing a
-    # `step` id — so match on template (falling back to step).
-    from app.ablation import context as _abl_ctx
+    # `step` id — so match on template (falling back to step). (_abl_ctx already
+    # imported above for the sampling override.)
     _abl_ctx.stop_if_treated_step(template if template is not None else step)
     return validated
 
@@ -413,6 +432,7 @@ async def call_llm_once(
     validate: Callable[[T], None] | None = None,
     step: str | None = None,
     log_retries: bool = True,
+    sampling: dict[str, object] | None = None,
 ) -> tuple[T, str, object, object, list[str], dict[str, object] | None]:
     """One structured-output call with the full resample/backoff budget,
     WITHOUT the content-addressed cache lookup or the `cache.llm` log write
@@ -468,6 +488,14 @@ async def call_llm_once(
         logprobs_kwargs: dict[str, object] = (
             {"logprobs": True, "top_logprobs": TOP_LOGPROBS} if want_logprobs else {}
         )
+        # Ablation sampling override (temperature only) — passed straight through to
+        # the provider; empty on every normal call so routing is unchanged. NB: only
+        # universally-supported params may go here — `provider.require_parameters`
+        # (set below) 404s the call if the chosen provider lacks ANY sent param, so
+        # e.g. `seed` (unsupported by most open-model providers) must NOT be added.
+        sampling_kwargs: dict[str, object] = {}
+        if sampling and sampling.get("temperature") is not None:
+            sampling_kwargs["temperature"] = sampling["temperature"]
         try:
             async with OpenRouter(
                 api_key=os.environ["OPENROUTER_API_KEY"],
@@ -502,6 +530,7 @@ async def call_llm_once(
                         "ignore": ["decart"]
                     },
                     **logprobs_kwargs,
+                    **sampling_kwargs,
                 )
             # Recorded before parsing: this generation was billed regardless of
             # whether its output survives validation below.
@@ -613,22 +642,12 @@ async def call_llm_once(
 _COST_FETCH_CONCURRENCY = 6
 
 
-async def fetch_generation_costs(
-    generation_ids: Iterable[str],
-    on_cost: Callable[[str, float], Awaitable[None]] | None = None,
-) -> dict[str, float]:
+async def fetch_generation_costs(generation_ids: Iterable[str]) -> dict[str, float]:
     """Best-effort `GET /generation` lookup of OpenRouter's settled `total_cost`
     for each (deduped) id, over one shared client with bounded concurrency.
     Returns only the ids that resolved; a 404 (stats not ready yet) or transient
     error simply omits that id, for the caller to retry on its next sweep. The
-    SDK's own retry is disabled — its default budget is an hour.
-
-    `on_cost`, when given, is awaited with `(gid, total_cost)` the MOMENT each
-    lookup returns — after its fetch slot is released, so the callback (which may
-    itself await) doesn't stall the other lookups. This lets a caller act on each
-    settled cost as it lands (e.g. a spend-cap check) instead of waiting on the
-    batch's slowest fetch. A callback fault is isolated so it can't abort the
-    rest of the batch."""
+    SDK's own retry is disabled — its default budget is an hour."""
     ids = list(dict.fromkeys(generation_ids))
     if not ids:
         return {}
@@ -643,13 +662,7 @@ async def fetch_generation_costs(
                 )
             except (OpenRouterError, httpx.HTTPError):
                 return  # not settled yet / transient — next sweep retries
-        cost = res.data.total_cost
-        out[gid] = cost
-        if on_cost is not None:
-            try:
-                await on_cost(gid, cost)
-            except Exception:
-                pass  # a per-cost callback fault must not abort the batch
+            out[gid] = res.data.total_cost
 
     async with OpenRouter(
         api_key=os.environ["OPENROUTER_API_KEY"], timeout_ms=30_000,
@@ -658,34 +671,17 @@ async def fetch_generation_costs(
     return out
 
 
-async def backfill_costs(
-    get_logs: Callable[[], Iterable[logging.SlotLog]],
-    on_priced: Callable[[logging.SlotLog], Awaitable[None]] | None = None,
-) -> int:
-    """Price every logged-but-unpriced LLM call across the current cells: find
-    each `cache.llm` carrying a `generation_id` with no matching `llm.cost`,
-    fetch the settled cost, and append an `llm.cost` event. Idempotent and
-    restart-proof — it reads only the durable log, so a call left unpriced by a
-    slow stat or a live lookup killed mid-flight is recovered on a later pass.
-    Returns the count priced this pass.
-
-    Each cost is appended AS IT RETURNS (via `fetch_generation_costs`'s per-cost
-    hook), and `on_priced(slot_log)` is awaited right after — so a caller's
-    spend-cap check fires the instant the tipping cost lands, not gated behind
-    the sweep's slowest unrelated lookup.
-
-    A cell reset / (re)started / A/B-launched mid-sweep swaps in a FRESH SlotLog;
-    appending through the stale object would stamp the event with its frozen
-    `index` (its old length), colliding with the live writer and breaking the
-    log's index↔position invariant that the prompt lab, rewind, and branch
-    forking all rely on. So liveness is re-checked against `get_logs()`
-    immediately before each append (which has no `await`, so it can't go stale
-    between the check and the write)."""
+async def backfill_costs(slot_logs: Iterable[logging.SlotLog]) -> int:
+    """Price every logged-but-unpriced LLM call across the given cells: find each
+    `cache.llm` carrying a `generation_id` with no matching `llm.cost`, fetch the
+    settled cost, and append an `llm.cost` event. Idempotent and restart-proof —
+    it reads only the durable log, so a call left unpriced by a slow stat or a
+    live lookup killed mid-flight is recovered on a later pass. Returns the count
+    priced this pass."""
     # Resolve the pending set up front: the fetch awaits, and the pipeline keeps
     # appending to these same logs meanwhile — anything new is caught next pass.
     pending: list[tuple[logging.SlotLog, str]] = []
-    seen: set[str] = set()
-    for sl in get_logs():
+    for sl in slot_logs:
         events = sl.state["events"]
         resolved = {
             e.get("generation_id") for e in events if e.get("kind") == "llm.cost"
@@ -694,29 +690,17 @@ async def backfill_costs(
             if e.get("kind") != "cache.llm":
                 continue
             gid = e.get("generation_id")
-            if isinstance(gid, str) and gid not in resolved and gid not in seen:
-                seen.add(gid)  # generation ids are unique; guard against dupes
+            if isinstance(gid, str) and gid not in resolved:
                 pending.append((sl, gid))
     if not pending:
         return 0
-    by_gid = {gid: sl for sl, gid in pending}
+    costs = await fetch_generation_costs(gid for _, gid in pending)
     priced = 0
-
-    async def _apply(gid: str, cost: float) -> None:
-        nonlocal priced
-        sl = by_gid.get(gid)
-        # Skip a SlotLog swapped out during the fetch (reset/restart/A/B): writing
-        # through it would break its index invariant. Re-checked here, right
-        # before the await-free append, so a swap during a prior cost's
-        # `on_priced` await can't slip a stale write through.
-        if sl is None or sl not in get_logs():
-            return
-        sl.log("llm.cost", generation_id=gid, cost=cost)
-        priced += 1
-        if on_priced is not None:
-            await on_priced(sl)
-
-    await fetch_generation_costs((gid for _, gid in pending), on_cost=_apply)
+    for sl, gid in pending:
+        cost = costs.get(gid)
+        if cost is not None:
+            sl.log("llm.cost", generation_id=gid, cost=cost)
+            priced += 1
     return priced
 
 

@@ -134,6 +134,17 @@ async def _decompose_zone(
     )
 
 
+def _coord_emit_global() -> bool:
+    """True when a coordinate-frame ablation has the subregion solver emit
+    world-frame boxes directly (skipping the local->world conversion). False on
+    every normal run — the emitted box stays zone-local and is converted."""
+    try:
+        from app.ablation import coord
+        return coord.emit_global()
+    except Exception:
+        return False
+
+
 async def _resolve_child_bboxes_batch(
     *,
     parent: Node,
@@ -159,6 +170,7 @@ async def _resolve_child_bboxes_batch(
     variables["TO_PLACE"] = scene_context.render_to_place_block(
         children, by_id, parent_zone=parent.id,
     )
+    scene_context.apply_schema_render(variables)  # schema ablation: also convert TO_PLACE (no-op normally)
     out = await llm.call_llm(
         system=ps.system("child_bbox_batch", variables),
         user=ps.user("child_bbox_batch", variables),
@@ -177,10 +189,15 @@ async def _resolve_child_bboxes_batch(
     # authored in the zone's local frame — each converts straight to world
     # against the zone bbox (no per-child parent frame, no topological pass).
     assignments_by_id = {a.id: a.bbox for a in out.assignments}
-    bboxes: dict[str, BoundingBox] = {
-        child_id: assignment.to_world_frame(parent.bbox)
-        for child_id, assignment in assignments_by_id.items()
-    }
+    if _coord_emit_global():
+        # Coordinate ablation, OUTPUT=global: the solver already emitted each
+        # subregion box in world coordinates — no zone-frame conversion needed.
+        bboxes: dict[str, BoundingBox] = dict(assignments_by_id)
+    else:
+        bboxes = {
+            child_id: assignment.to_world_frame(parent.bbox)
+            for child_id, assignment in assignments_by_id.items()
+        }
     for child_id, b in committed_bboxes.items():
         if b is not None:
             bboxes[child_id] = b

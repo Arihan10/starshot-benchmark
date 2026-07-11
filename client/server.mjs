@@ -110,6 +110,33 @@ const server = createServer(async (req, res) => {
     if (path === "/tf" || path === "/tf/" || path === "/tf/index.html") {
         return serveIndex(res, join("tf", "index.html"));
     }
+    // The archived (legacy) attention inspector — the previous /tf, kept intact
+    // for reference. Its files live under public/legacy/, but the URL stays
+    // /tf-legacy/* (see the sub-asset alias below) so the page's absolute asset
+    // paths and every "open legacy" link keep resolving. Meta-injected like the rest.
+    if (
+        path === "/tf-legacy" ||
+        path === "/tf-legacy/" ||
+        path === "/tf-legacy/index.html"
+    ) {
+        return serveIndex(res, join("legacy", "tf-legacy", "index.html"));
+    }
+    // The new analysis workspace (data view). Opened in a modal from /tf's
+    // "open workspace" button, and reachable directly. Same meta-injection.
+    if (
+        path === "/tf-workspace" ||
+        path === "/tf-workspace/" ||
+        path === "/tf-workspace/index.html"
+    ) {
+        return serveIndex(res, join("tf-workspace", "index.html"));
+    }
+    // Legacy inspector sub-assets: its URL stays /tf-legacy/* (so /tf-legacy/tf.js
+    // and the modules' ../../js/* imports still resolve), but the files now live
+    // under public/legacy/tf-legacy/ — remap the URL onto that dir.
+    if (path.startsWith("/tf-legacy/")) {
+        const abs = resolveUnder(PUBLIC_DIR, "/legacy" + path);
+        if (abs) return serveFile(res, abs);
+    }
     if (path.startsWith("/vendor/three/")) {
         const sub = path.slice("/vendor/three/".length);
         const abs = resolveUnder(THREE_DIR, sub);

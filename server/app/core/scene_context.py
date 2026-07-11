@@ -43,6 +43,44 @@ _NO_SUBREGIONS_MESSAGE = "{(none - no other subregions have been planned yet)}"
 # caller-supplied text follows it.
 _TARGET_MARKER = "<-- TARGET:"
 
+def _coord_show_global() -> bool:
+    """Whether the coordinate-frame ablation wants each entity's world
+    (`Global origin corner`) line rendered into scene context. Defaults to True
+    (both frames shown) on any normal run — or if the ablation seam is
+    unavailable — so non-ablation renders stay byte-identical to before."""
+    try:
+        from app.ablation import coord
+        return coord.show_global()
+    except Exception:
+        return True
+
+
+def _coord_show_local() -> bool:
+    """Companion to `_coord_show_global` for the parent-relative
+    (`Local origin corner`) line. True unless a coordinate ablation asks for
+    global-only input."""
+    try:
+        from app.ablation import coord
+        return coord.show_local()
+    except Exception:
+        return True
+
+
+def apply_schema_render(variables: dict[str, str]) -> None:
+    """When a scene-context SCHEMA ablation is bound, RE-RENDER the scene-bearing
+    variables in `variables` into the treated format (XML / prose) IN-PLACE and
+    stash the per-attribute role span-map (via the shared `app.core.scene_render`
+    emitter). A NO-OP on a normal run — or the soft-JSON baseline — so
+    non-ablation renders stay byte-identical. Called at the end of `zone_vars`
+    (covers `SCENE_CONTEXT` et al.) and again by the bbox solvers after they add
+    `TO_PLACE`; it is idempotent, so the second call only converts the new var."""
+    try:
+        from app.ablation import schema as _schema
+        _schema.apply_to_vars(variables)
+    except Exception:
+        pass
+
+
 def _render_proxy_shape(p: ProxyShape | None) -> str:
     return p.value if p is not None else "BOX"
 
@@ -116,10 +154,12 @@ def _object_entry(obj: Node, by_id: dict[str, Node], parent_zone: str, *, compac
         lines.append(f"global yaw: {obj.orientation}deg")
     lines.append(f"Dimensions: {util.format_dimensions(obj.bbox)}")
     if not compact:
-        lines.append(f"Global origin corner: {util.format_global_origin(obj.bbox)}")
-        local = _local_coords_line(obj, by_id)
-        if local is not None:
-            lines.append(local)
+        if _coord_show_global():
+            lines.append(f"Global origin corner: {util.format_global_origin(obj.bbox)}")
+        if _coord_show_local():
+            local = _local_coords_line(obj, by_id)
+            if local is not None:
+                lines.append(local)
     return util.braces("\n".join(lines))
 
 
@@ -156,10 +196,12 @@ def _region_embedded_entry(
             lines.append("relationships: []")
         lines.append(f"proxy_shape: {_render_proxy_shape(region.proxy_shape)}")
         lines.append(f"Dimensions: {util.format_dimensions(region.bbox)}")
-        lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
-        local = _local_coords_line(region, by_id)
-        if local is not None:
-            lines.append(local)
+        if _coord_show_global():
+            lines.append(f"Global origin corner: {util.format_global_origin(region.bbox)}")
+        if _coord_show_local():
+            local = _local_coords_line(region, by_id)
+            if local is not None:
+                lines.append(local)
         if region.parent_id is not None and region.parent_id in by_id:
             parent = by_id[region.parent_id]
             parent_placement = f'"{parent.placement}"' if parent.placement is not None else "(none)"
@@ -657,6 +699,7 @@ def zone_vars(
         "PARENT_ZONE_PLAN": str(parent.plan or "") if parent is not None else "",
         "PARENT_ZONE_ORIGIN": util.format_global_origin(parent.bbox) if parent is not None else "",
     })
+    apply_schema_render(out)  # schema ablation: re-render scene vars as XML/prose (no-op normally)
     return out
 
 

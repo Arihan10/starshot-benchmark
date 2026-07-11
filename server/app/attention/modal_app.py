@@ -417,7 +417,11 @@ class HFAttentionProvider:
     supports_batched = True
 
     def __init__(self, model: Any, tokenizer: Any, config: Any, global_layers: list[int], torch_mod: Any) -> None:
-        self.name = f"hf:{getattr(config, '_name_or_path', 'gemma')}"
+        # `config._name_or_path` is often EMPTY on a sub-config (e.g. Gemma-4's
+        # text_config), which left the label a bare "hf:". Fall back to the
+        # tokenizer's repo id, then a constant. (meta.tokenizer is display-only.)
+        _repo = getattr(config, "_name_or_path", "") or getattr(tokenizer, "name_or_path", "") or "gemma"
+        self.name = f"hf:{_repo}"
         self.model = model
         self.tok = tokenizer
         self.config = config
@@ -1358,6 +1362,11 @@ if _HAS_MODAL:
             "input_key": input_key,
             "prompt_version": prompt_version,
             "req": req,
+            # The analysis version that ACTUALLY produced this content. The adopt
+            # check requires it to equal the running worker's version, so a stale
+            # worker's older-version content (committed under the current req during
+            # a server/worker skew) is never re-adopted by a newer worker.
+            "av": (result.get("meta") or {}).get("analysis_version"),
         })
         return {"h": h, "ev": int(ev)}
 
@@ -1548,7 +1557,8 @@ if _HAS_MODAL:
                 return None
 
         _beater.start()  # keep the lease warm for the whole drain (esp. long forwards)
-        _log("consumer start", model=model_id, part=part, slot=slot)
+        from app.attention.schema import ANALYSIS_VERSION as _consumer_av
+        _log("consumer start", model=model_id, part=part, slot=slot, av=_consumer_av)  # av → skew check
         try:
             while True:
                 # Drain everything immediately available back-to-back; only when the
@@ -1589,10 +1599,15 @@ if _HAS_MODAL:
                 if seen.get(jk) == req:
                     continue  # already resolved this exact request this life — no recompute
                 # Durable cross-life dedup: a committed result for this EXACT request
-                # (same token) is ADOPTED with no forward. A different token (raised
-                # heads / edited content / force → new token) recomputes and overwrites.
+                # (same token) is ADOPTED with no forward — but ONLY if it was produced
+                # by the CURRENT analysis version. A version skew (a v8 server enqueuing
+                # while a v7 worker computed) commits older-version content stamped with
+                # the current req; without the `av` guard a newer worker would re-adopt
+                # that stale content forever instead of recomputing it. A missing `av`
+                # (pre-guard sidecar) is treated as non-matching → recompute. A different
+                # token (raised heads / edited content / force) recomputes and overwrites.
                 meta = _read_meta(h, ev)
-                if meta is not None and str(meta.get("req") or "") == req:
+                if meta is not None and str(meta.get("req") or "") == req and meta.get("av") == _consumer_av:
                     _remark_done(h, ev)
                     seen[jk] = req
                     continue
@@ -2085,8 +2100,11 @@ if _HAS_MODAL:
         runs in a long-running `consume` input (see `_worker_consume`), NOT a background
         task here, so it survives web-container recycles."""
         import fastapi
+        from app.attention.schema import AGG_VERSION as _WORKER_AGG
+        from app.attention.schema import ANALYSIS_VERSION as _WORKER_AV
 
         web_app = fastapi.FastAPI(title="starshot-attention", docs_url="/docs")
+        _log("web start", av=_WORKER_AV, agg=_WORKER_AGG)  # deployed code version (skew check)
 
         # A fresh web container == a fresh deployment (any consumer container from a
         # previous deploy is already gone), so drop ALL stale slot leases now. Without
@@ -2290,6 +2308,8 @@ if _HAS_MODAL:
                 "running": st.get("running", []),
                 "errors": st.get("errors", {}),
                 "done": st.get("done", []),
+                "worker_av": _WORKER_AV,    # deployed worker's analysis_version (server compares → skew warning)
+                "worker_agg": _WORKER_AGG,
             }
 
         @web_app.post("/results")

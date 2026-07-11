@@ -4,6 +4,7 @@
 // /generations/active just reads in-memory task tables).
 
 import { api } from "./api.js";
+import { getAttnProvider } from "./attnbus.js";
 
 let pollTimer = null;
 let expanded = false;
@@ -26,9 +27,14 @@ const STYLE = `
 .ops-row .r-main { color: #b8bcc4; overflow: hidden; text-overflow: ellipsis; }
 .ops-row .r-step { color: #7a808c; margin-left: auto; }
 .ops-empty { color: #7a808c; padding: 5px 9px; }
+.ops-seg { color: #6a7080; font-size: 9px; text-transform: uppercase; letter-spacing: 0.05em; padding: 5px 9px 2px; }
+.ops-row + .ops-seg, .ops-empty + .ops-seg { border-top: 1px solid #23262e; margin-top: 3px; }
 #ops-stop { background: rgba(58,22,32,0.92); color: #ff8080; border: 1px solid #5a2230; border-radius: 7px; padding: 4px 9px; font: 600 11px ui-monospace, Menlo, monospace; cursor: pointer; }
 #ops-stop:hover { background: #4a1a28; border-color: #ff8080; }
 #ops-stop:disabled { opacity: 0.6; cursor: default; }
+#ops-sync { background: rgba(22,32,52,0.92); color: #7aa2f7; border: 1px solid #2a3a5a; border-radius: 7px; padding: 4px 9px; font: 600 11px ui-monospace, Menlo, monospace; cursor: pointer; }
+#ops-sync:hover { background: #1a2740; border-color: #7aa2f7; }
+#ops-sync:disabled { opacity: 0.6; cursor: default; }
 `;
 
 function rowEl(main, step) {
@@ -50,32 +56,75 @@ function rowEmpty(t) {
 	d.textContent = t;
 	return d;
 }
+function segHeader(t) {
+	const d = document.createElement("div");
+	d.className = "ops-seg";
+	d.textContent = t;
+	return d;
+}
+// One attention-queue line (main sequence / ablation): running + queued while
+// busy, else the computed / total progress.
+function attnRow(label, q) {
+	q = q || { running: 0, queued: 0, computed: 0, total: 0 };
+	const busy = (q.running || 0) + (q.queued || 0);
+	const right = busy
+		? `${q.running || 0} running${q.queued ? ` · ${q.queued} queued` : ""}`
+		: `${q.computed || 0}/${q.total || 0} ✓`;
+	return rowEl(label, right);
+}
 
-function render(a) {
+// `a` = /generations/active (OpenRouter/pipeline tasks); `attn` = the /tf attention
+// provider snapshot (null off /tf). The list is SEGMENTED so the Modal attention
+// compute reads separately from the OpenRouter pipeline work.
+function render(a, attn) {
 	const bar = document.getElementById("ops-bar");
 	if (!bar) return;
 	const count = document.getElementById("ops-mon-count");
 	const body = document.getElementById("ops-mon-body");
-	if (!a) { bar.classList.remove("busy"); count.textContent = "—"; body.replaceChildren(rowEmpty("server unreachable")); return; }
-	const pipes = a.pipelines || [];
-	const total = pipes.length + (a.generates?.length || 0) + (a.regens?.length || 0) + (a.retries || 0);
-	bar.classList.toggle("busy", total > 0);
-	count.textContent = total ? `${total} running` : "idle";
-	const rows = pipes.slice(0, 24).map((p) => rowEl(`${p.run} · ${p.slot}/${p.model}`, p.step || ""));
-	if (pipes.length > 24) rows.push(rowEmpty(`+${pipes.length - 24} more pipelines`));
-	if (a.generates?.length) rows.push(rowEl("scene builds", String(a.generates.length)));
-	if (a.regens?.length) rows.push(rowEl("regens", String(a.regens.length)));
-	if (a.retries) rows.push(rowEl("mesh retries", String(a.retries)));
-	if (a.mesh_queue) rows.push(rowEl("mesh queue", String(a.mesh_queue)));
-	if (!rows.length) rows.push(rowEmpty("nothing running"));
+	const syncB = document.getElementById("ops-sync");
+	// The attention ⟳ sync only shows where a provider was published (i.e. /tf).
+	if (syncB) syncB.style.display = attn ? "" : "none";
+	const segmented = !!attn; // headers only make sense when there are ≥2 segments
+
+	const rows = [];
+	let orActive = 0;
+	if (!a) {
+		if (segmented) rows.push(segHeader("openrouter · pipeline"));
+		rows.push(rowEmpty("server unreachable"));
+	} else {
+		const pipes = a.pipelines || [];
+		orActive = pipes.length + (a.generates?.length || 0) + (a.regens?.length || 0) + (a.retries || 0);
+		if (segmented) rows.push(segHeader("openrouter · pipeline"));
+		for (const p of pipes.slice(0, 20)) rows.push(rowEl(`${p.run} · ${p.slot}/${p.model}`, p.step || ""));
+		if (pipes.length > 20) rows.push(rowEmpty(`+${pipes.length - 20} more pipelines`));
+		if (a.generates?.length) rows.push(rowEl("scene builds", String(a.generates.length)));
+		if (a.regens?.length) rows.push(rowEl("regens", String(a.regens.length)));
+		if (a.retries) rows.push(rowEl("mesh retries", String(a.retries)));
+		if (a.mesh_queue) rows.push(rowEl("mesh queue", String(a.mesh_queue)));
+		if (!orActive && !a.mesh_queue) rows.push(rowEmpty("nothing running"));
+	}
+
+	let attnActive = 0;
+	if (attn) {
+		attnActive = (attn.running || 0) + (attn.queued || 0);
+		rows.push(segHeader(`modal · attention${attn.cell ? ` · ${attn.cell}` : ""}`));
+		rows.push(attnRow("main sequence", attn.main));
+		if ((attn.abl?.total || 0) > 0) rows.push(attnRow("ablation", attn.abl));
+	}
 	body.replaceChildren(...rows);
+
+	const active = orActive + attnActive;
+	bar.classList.toggle("busy", active > 0);
+	count.textContent = a === null && !attn ? "—" : active ? `${active} active` : "idle";
 }
 
 async function poll() {
 	if (!document.getElementById("ops-bar")) return;
 	let a = null;
 	try { a = await api.activeGenerations(); } catch { /* server down / endpoint missing */ }
-	render(a);
+	let attn = null;
+	try { attn = getAttnProvider()?.snapshot?.() ?? null; } catch { /* provider not ready */ }
+	render(a, attn);
 }
 
 async function stopAll() {
@@ -91,6 +140,22 @@ async function stopAll() {
 		btn.textContent = "stop failed";
 	}
 	setTimeout(() => { btn.textContent = "⏹ stop"; btn.disabled = false; }, 1600);
+	poll();
+}
+
+// Re-sync the Modal attention-compute queue for the current /tf cell (main sequence
+// + ablation) via the published provider — pulls finished results + surfaces jobs
+// running elsewhere, then resumes polling. Replaces the per-panel /tf sync buttons.
+async function syncAttn() {
+	const p = getAttnProvider();
+	const btn = document.getElementById("ops-sync");
+	if (!p || !btn) return;
+	btn.disabled = true;
+	const prev = btn.textContent;
+	btn.textContent = "⟳ syncing…";
+	try { await p.sync(); } catch { /* best-effort — Modal unreachable */ }
+	btn.disabled = false;
+	btn.textContent = prev;
 	poll();
 }
 
@@ -111,6 +176,7 @@ function build() {
 			</div>
 			<div id="ops-mon-body"></div>
 		</div>
+		<button id="ops-sync" title="Re-sync the Modal attention-compute queue for the current /tf cell (main sequence + ablation) — pulls finished results + surfaces jobs running elsewhere, then resumes polling. Dispatches no new compute." style="display:none">⟳ sync attn</button>
 		<button id="ops-stop" title="Hard-stop every in-flight generation across all runs, cells, and meshes">⏹ stop</button>`;
 	document.body.appendChild(bar);
 	document.getElementById("ops-mon-head").addEventListener("click", () => {
@@ -119,6 +185,7 @@ function build() {
 		document.getElementById("ops-mon-caret").textContent = expanded ? "▾" : "▸";
 	});
 	document.getElementById("ops-stop").addEventListener("click", stopAll);
+	document.getElementById("ops-sync").addEventListener("click", syncAttn);
 	poll();
 	clearInterval(pollTimer);
 	pollTimer = setInterval(poll, 3000);

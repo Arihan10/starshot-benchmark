@@ -18,6 +18,7 @@ Two utility modules read the persisted log: `utils/cache.py`
 from __future__ import annotations
 
 import asyncio
+import gzip
 import json
 import sys
 from contextvars import ContextVar
@@ -28,6 +29,51 @@ from rich.console import Console
 from rich.markup import escape
 
 from app.core.types import BoundingBox, Orientation, ProxyShape
+from app.utils import cache as _cache
+
+# `cache.llm` events embed the FULL rendered prompt (`system`/`user`, whose
+# scene context alone can be ~1MB) plus the model `output`/`reasoning` and the
+# raw `variables` (another SCENE_CONTEXT copy). A completed cell's log reaches
+# hundreds of MB, so keeping every event's heavy fields resident is what turned
+# a few dozen hydrated cells into tens of GB of RAM. We keep only a SLIM
+# projection in memory and read the heavy fields back from disk on demand
+# (`SlotLog.full_event`) — the event log on disk is unchanged and remains the
+# source of truth for the LLM cache, teacher-forcing export, and prompt lab.
+_HEAVY_FIELDS = frozenset({"system", "user", "output", "reasoning", "content", "variables"})
+
+
+def _slim_event(event: dict[str, Any]) -> dict[str, Any]:
+    """In-memory projection of a logged event with the big prompt/output/
+    variables payloads dropped. Only `cache.llm` events carry them; everything
+    else (bbox / model / step / cost / submit …) is already small and kept
+    verbatim. The few in-memory read paths that would otherwise need a heavy
+    field get a precomputed marker so they never touch disk:
+
+      * `has_scene`     — does the prompt contain scene entities (tf-steps
+        timeline, attention gating).
+      * `has_variables` — is the call re-renderable (prompt lab eligibility,
+        branch fork-point scan).
+      * `_rk`           — model-independent content hash for `find_llm_replay`
+        (the committed-prefix replay match, which used to compare the raw
+        `system`/`user`).
+    """
+    if event.get("kind") != "cache.llm":
+        return event
+    slim = {k: v for k, v in event.items() if k not in _HEAVY_FIELDS}
+    slim["has_variables"] = isinstance(event.get("variables"), dict)
+    system = event.get("system")
+    user = event.get("user")
+    schema = event.get("schema")
+    if isinstance(system, str) and isinstance(user, str) and isinstance(schema, str):
+        slim["_rk"] = _cache.replay_key(system, user, schema)
+    # `has_scene_context` lives in teacher_forcing (which imports llm → logging);
+    # a deferred import avoids the load-time cycle and is cheap at call time.
+    try:
+        from app.services.teacher_forcing import has_scene_context
+        slim["has_scene"] = has_scene_context(event)
+    except Exception:  # noqa: BLE001 — a marker miss just disables an optional UI hint
+        slim["has_scene"] = False
+    return slim
 
 # Fixes flushing issue
 try:
@@ -96,6 +142,13 @@ class SlotLog:
     def __init__(self, slot_id: str, events_path: Path) -> None:
         self.slot_id = slot_id
         self.events_path = events_path
+        # A TERMINAL log (a finished ablation variant) may be stored gzipped at
+        # `events.jsonl.gz` (~10× smaller — the log is mostly `cache.llm` text) with
+        # no plain twin. READS transparently fall back to it; any WRITE first
+        # materializes the plain file (`_ensure_plain`), so append/rewrite logic is
+        # unchanged. `_gzipped` tracks which form the last hydrate read.
+        self._gz_path = events_path.with_name(events_path.name + ".gz")
+        self._gzipped = False
         # Status is NOT stored here — it's derived live via `derive_status`
         # (which needs the gate/task runtime the SlotLog can't see). `state`
         # holds only the durable, log-derived data.
@@ -109,6 +162,12 @@ class SlotLog:
         # on every log() event (hundreds per run × many parallel cells) was
         # blowing through macOS's default 256-fd soft limit.
         self._events_file: TextIO | None = None
+        # Byte offset of each event's line in events.jsonl, aligned 1:1 with
+        # state["events"] positions, plus the file's total byte length (the next
+        # append offset). Lets `full_event` seek straight to one event's line and
+        # read back its heavy fields without loading the whole (huge) log.
+        self._offsets: list[int] = []
+        self._end_offset: int = 0
 
     def close(self) -> None:
         """Release the append handle (shutdown / cell reset)."""
@@ -119,8 +178,25 @@ class SlotLog:
                 pass
             self._events_file = None
 
+    def _ensure_plain(self) -> None:
+        """Materialize a plain `events.jsonl` from the gzipped terminal sidecar if
+        that's all that exists — every WRITE path (append / truncate / replace /
+        start) acts on the uncompressed log. A no-op unless a gz-only log is being
+        (re)written (a rare variant resume/edit). The decompressed byte layout is
+        identical, so byte offsets recorded during a gz hydrate stay valid."""
+        if self.events_path.exists() or not self._gz_path.exists():
+            self._gzipped = False
+            return
+        self.events_path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(self._gz_path, "rb") as src, self.events_path.open("wb") as dst:
+            for chunk in iter(lambda: src.read(1 << 20), b""):
+                dst.write(chunk)
+        self._gz_path.unlink()
+        self._gzipped = False
+
     def _ensure_events_append(self) -> TextIO:
         if self._events_file is None or self._events_file.closed:
+            self._ensure_plain()
             self.events_path.parent.mkdir(parents=True, exist_ok=True)
             self._events_file = self.events_path.open("a", encoding="utf-8")
         return self._events_file
@@ -131,47 +207,137 @@ class SlotLog:
     def hydrate_from_disk(self) -> None:
         """Load state from an existing events.jsonl. Prompt + model come
         from the first run.start event, so resume works without a side
-        file."""
+        file. Only the SLIM projection is retained in memory (heavy fields
+        read back on demand via `full_event`); byte offsets are recorded so
+        that read is a single seek."""
         self.state["events"] = []
         self.state["prompt"] = None
         self.state["model"] = None
+        self._offsets = []
+        self._end_offset = 0
+        # Prefer the plain log; fall back to the gzipped terminal sidecar. For gz,
+        # `len(raw)` is the DECOMPRESSED byte width — identical to the plain layout,
+        # so offsets stay valid if the log is later materialized (`_ensure_plain`);
+        # `full_event` re-streams instead of seeking while still gzipped.
+        read_path, self._gzipped = self.events_path, False
         if not self.events_path.exists():
-            return
-        with self.events_path.open("r") as f:
-            for line in f:
-                line = line.strip()
+            if self._gz_path.exists():
+                read_path, self._gzipped = self._gz_path, True
+            else:
+                return
+        offset = 0
+        # Binary so len(raw) is the exact on-disk byte width (offsets must index
+        # bytes, not decoded chars) and a stray non-UTF8 byte can't abort load.
+        _open = (lambda: gzip.open(read_path, "rb")) if self._gzipped else (lambda: read_path.open("rb"))
+        with _open() as f:
+            for raw in f:
+                line = raw.decode("utf-8", "replace").strip()
+                if line:
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        _console.print(
+                            f"[dim]\\[{self.slot_id}][/dim] [red]skipping malformed line in {self.events_path}[/red]"
+                        )
+                    else:
+                        self.state["events"].append(_slim_event(event))
+                        self._offsets.append(offset)
+                        if event.get("kind") == "run.start" and self.state["prompt"] is None:
+                            self.state["prompt"] = event.get("prompt")
+                            self.state["model"] = event.get("model")
+                offset += len(raw)
+        self._end_offset = offset
+
+    def full_event(self, index: int) -> dict[str, Any] | None:
+        """The COMPLETE logged event (heavy fields included) for the event whose
+        `index` is `index`, read straight off disk via its recorded byte offset.
+        Used by the LLM cache hit/replay, the teacher-forcing export, and the
+        prompt-lab detail endpoints — the paths that genuinely need the raw
+        `system`/`user`/`output`/`variables` the slim in-memory buffer drops."""
+        pos: int | None = None
+        events = self.state["events"]
+        if 0 <= index < len(events) and events[index].get("index") == index:
+            pos = index  # fast path: the index==position invariant holds
+        else:
+            for i, e in enumerate(events):
+                if e.get("index") == index:
+                    pos = i
+                    break
+        if pos is None or pos >= len(self._offsets):
+            return None
+        try:
+            if self._gzipped:
+                # gz can't seek by byte offset — re-stream to the pos-th non-blank
+                # line (mirrors hydrate's line accounting). Streaming, so memory is
+                # one line at a time, never the whole (decompressed) log.
+                count = 0
+                with gzip.open(self._gz_path, "rb") as f:
+                    for raw in f:
+                        line = raw.decode("utf-8", "replace").strip()
+                        if not line:
+                            continue
+                        if count == pos:
+                            return json.loads(line)
+                        count += 1
+                return None
+            with self.events_path.open("rb") as f:
+                f.seek(self._offsets[pos])
+                raw = f.readline()
+            return json.loads(raw.decode("utf-8", "replace"))
+        except (OSError, ValueError):
+            return None
+
+    def full_events(self) -> list[dict[str, Any]]:
+        """Every event with its heavy fields, read from disk in order. Only for
+        the rare surgical rewrite (object wipe) that must re-emit the full log;
+        normal reads use the slim buffer + `full_event`."""
+        out: list[dict[str, Any]] = []
+        read_path, is_gz = self.events_path, False
+        if not self.events_path.exists():
+            if self._gz_path.exists():
+                read_path, is_gz = self._gz_path, True
+            else:
+                return out
+        _open = (lambda: gzip.open(read_path, "rb")) if is_gz else (lambda: read_path.open("rb"))
+        with _open() as f:
+            for raw in f:
+                line = raw.decode("utf-8", "replace").strip()
                 if not line:
                     continue
                 try:
-                    event = json.loads(line)
+                    out.append(json.loads(line))
                 except json.JSONDecodeError:
-                    _console.print(
-                        f"[dim]\\[{self.slot_id}][/dim] [red]skipping malformed line in {self.events_path}[/red]"
-                    )
                     continue
-                self.state["events"].append(event)
-                if event.get("kind") == "run.start" and self.state["prompt"] is None:
-                    self.state["prompt"] = event.get("prompt")
-                    self.state["model"] = event.get("model")
+        return out
 
     def truncate_events_to(self, n: int) -> int:
         """Keep only the first `n` events on disk and in memory. Returns
-        the new length."""
+        the new length. Truncates the file at the byte offset of line `n`, so
+        the retained prefix's bytes (heavy fields included) are untouched — the
+        in-memory buffer being slim never leaks into what's persisted."""
         self._close_events_file()
+        self._ensure_plain()  # rewrite acts on the plain log
         n = max(0, min(n, len(self.state["events"])))
-        self.state["events"] = self.state["events"][:n]
         if n == 0:
             self.events_path.write_text("")
+            keep_bytes = 0
         else:
-            with self.events_path.open("w", encoding="utf-8") as f:
-                for event in self.state["events"]:
-                    f.write(json.dumps(event) + "\n")
+            keep_bytes = self._offsets[n] if n < len(self._offsets) else self._end_offset
+            with self.events_path.open("rb+") as f:
+                f.truncate(keep_bytes)
+        self.state["events"] = self.state["events"][:n]
+        self._offsets = self._offsets[:n]
+        self._end_offset = keep_bytes
         return n
 
     def replace_events(self, events: list[dict[str, Any]]) -> None:
-        """Overwrite the log with `events` (already in final order), rewriting
-        every `index` to its new position so `index == line == list position`
-        holds again, and resyncing the in-memory buffer + append handle.
+        """Overwrite the log with `events` (FULL events, already in final order),
+        rewriting every `index` to its new position so `index == line == list
+        position` holds again, and resyncing the slim buffer + byte offsets.
+
+        Callers MUST pass full events (see `full_events`), never the slim buffer —
+        the rewrite is byte-for-byte what lands on disk, so a slim event here
+        would permanently drop that step's prompt/output from the cache.
 
         Truncation only ever drops the tail, so it leaves indices intact; a
         SURGICAL edit (deleting/rewriting lines mid-log, e.g. wiping one object)
@@ -182,17 +348,33 @@ class SlotLog:
         self._close_events_file()
         for i, event in enumerate(events):
             event["index"] = i
-        self.state["events"] = events
+        # A full rewrite supersedes any gzipped twin — drop it so reads don't find
+        # a stale compressed copy alongside the freshly-written plain log.
+        self._gz_path.unlink(missing_ok=True)
+        self._gzipped = False
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.events_path.open("w", encoding="utf-8") as f:
+        self._offsets = []
+        offset = 0
+        with self.events_path.open("wb") as f:
             for event in events:
-                f.write(json.dumps(event) + "\n")
+                raw = (json.dumps(event) + "\n").encode("utf-8")
+                self._offsets.append(offset)
+                offset += len(raw)
+                f.write(raw)
+        self._end_offset = offset
+        self.state["events"] = [_slim_event(e) for e in events]
 
     def start_run(self, prompt: str, model: str) -> None:
         self._close_events_file()
         self.state["prompt"] = prompt
         self.state["model"] = model
         self.state["events"] = []
+        self._offsets = []
+        self._end_offset = 0
+        # A fresh run supersedes any gzipped twin (e.g. re-running a cell that was
+        # archived) — drop it so the new plain log is the only source.
+        self._gz_path.unlink(missing_ok=True)
+        self._gzipped = False
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
         self.events_path.write_text("")
         self.log("run.start", prompt=prompt, model=model)
@@ -206,10 +388,16 @@ class SlotLog:
             "kind": kind,
             **data,
         }
-        self.state["events"].append(event)
+        raw = (json.dumps(event) + "\n").encode("utf-8")
         f = self._ensure_events_append()
-        f.write(json.dumps(event) + "\n")
+        f.write(raw.decode("utf-8"))
         f.flush()
+        self._offsets.append(self._end_offset)
+        self._end_offset += len(raw)
+        # Buffer keeps the SLIM projection (heavy fields read back via
+        # full_event); live subscribers still get the FULL event so the
+        # observability stream is unchanged.
+        self.state["events"].append(_slim_event(event))
         _print(self.slot_id, event)
         for q in self.subscribers:
             q.put_nowait(event)
@@ -233,9 +421,16 @@ def bind(slot_log: SlotLog) -> None:
     _current.set(slot_log)
 
 
+def current_slot() -> SlotLog:
+    """The bound slot log itself. Cache lookups need it (not just the event
+    list) so they can read a matched event's heavy fields back from disk via
+    `full_event` — the slim in-memory buffer no longer carries `output`."""
+    return _current.get()
+
+
 def current_events() -> list[dict[str, Any]]:
-    """Snapshot of the bound slot's event list. Used by cache lookups
-    (cache.find_llm_cache_hit, resumable.find_done, etc.)."""
+    """Snapshot of the bound slot's (SLIM) event list. Used by resumable
+    submit/done lookups, which only read small bookkeeping fields."""
     return _current.get().state["events"]
 
 

@@ -165,9 +165,6 @@
 			.dot.paused {
 				background: var(--orange);
 			}
-			.dot.capped {
-				background: var(--purple);
-			}
 			.dot.idle {
 				background: #5a5e68;
 			}
@@ -203,90 +200,8 @@
 				overflow: hidden;
 				text-overflow: ellipsis;
 			}
-			/* ---------- run pickers (searchable combobox: topbar + compare B) ---------- */
-			.run-combo {
-				position: relative;
-				flex-shrink: 0;
-			}
-			.run-combo-btn {
-				display: flex;
-				align-items: center;
-				gap: 8px;
+			#run-picker {
 				max-width: 320px;
-			}
-			.run-combo-btn .run-combo-lab {
-				min-width: 0;
-				overflow: hidden;
-				text-overflow: ellipsis;
-				white-space: nowrap;
-			}
-			.run-combo-btn .run-combo-caret {
-				margin-left: auto;
-				color: var(--text-faint);
-				font-size: 10px;
-			}
-			.run-combo.open .run-combo-btn {
-				border-color: var(--accent-line);
-				color: #c8d8f0;
-			}
-			.run-combo-pop {
-				position: absolute;
-				top: calc(100% + 6px);
-				left: 0;
-				display: none;
-				flex-direction: column;
-				width: 340px;
-				max-width: 92vw;
-				background: var(--panel);
-				border: 1px solid var(--line);
-				border-radius: 6px;
-				box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
-				overflow: hidden;
-				z-index: 50;
-			}
-			.run-combo.open .run-combo-pop {
-				display: flex;
-			}
-			.run-combo-search {
-				margin: 8px;
-				align-self: stretch;
-			}
-			.run-combo-list {
-				max-height: 60vh;
-				overflow: auto;
-				padding: 0 4px 6px;
-			}
-			.run-combo-item {
-				display: flex;
-				align-items: baseline;
-				gap: 8px;
-				padding: 6px 8px;
-				border-radius: 4px;
-				cursor: pointer;
-				color: var(--text-dim);
-			}
-			.run-combo-item:hover,
-			.run-combo-item.active {
-				background: #1d2027;
-			}
-			.run-combo-item.current {
-				color: var(--accent);
-			}
-			.run-combo-item .run-combo-item-name {
-				min-width: 0;
-				overflow: hidden;
-				text-overflow: ellipsis;
-				white-space: nowrap;
-			}
-			.run-combo-item .run-combo-item-ver {
-				margin-left: auto;
-				flex-shrink: 0;
-				color: var(--text-faint);
-				font-size: 10px;
-			}
-			.run-combo-empty {
-				padding: 8px;
-				color: var(--text-faint);
 			}
 
 			/* ---------- per-run LLM spend tracker (top-bar pill + dropdown) ---------- */
@@ -428,54 +343,6 @@
 			.cost-empty {
 				color: var(--text-faint);
 				padding: 2px 0;
-			}
-			/* Capped cells: flag the collapsed pill purple so a spend-cap trip is
-			   noticeable without expanding. Every cell shows its cap inline (faint
-			   by default, purple once tripped). */
-			#cost-tracker.has-capped #cost-pill {
-				border-color: var(--purple);
-			}
-			#cost-tracker.has-capped #cost-pill .cost-pill-summary {
-				color: var(--purple);
-			}
-			.cost-cap-row {
-				display: flex;
-				align-items: center;
-				gap: 6px;
-				padding: 1px 0 2px 10px;
-			}
-			.cost-cap-row .cost-cap-msg {
-				color: var(--text-faint);
-				font-size: 10px;
-				font-variant-numeric: tabular-nums;
-				overflow: hidden;
-				text-overflow: ellipsis;
-				white-space: nowrap;
-			}
-			.cost-cap-row.reached .cost-cap-msg {
-				color: var(--purple);
-			}
-			.cost-cap-row .cost-cap-set {
-				margin-left: auto;
-				flex-shrink: 0;
-				padding: 1px 8px;
-				font-size: 10px;
-				color: var(--text-dim);
-				background: transparent;
-				border: 1px solid var(--line);
-				border-radius: 4px;
-				cursor: pointer;
-			}
-			.cost-cap-row .cost-cap-set:hover {
-				border-color: var(--text-dim);
-				color: var(--text);
-			}
-			.cost-cap-row.reached .cost-cap-set {
-				color: var(--purple);
-				border-color: var(--purple);
-			}
-			.cost-cap-row.reached .cost-cap-set:hover {
-				background: rgba(201, 166, 255, 0.14);
 			}
 
 			/* ---------- board ---------- */
@@ -967,97 +834,18 @@
 				white-space: nowrap;
 			}
 			/* "step (all) until <step>" picker — sits next to step / step-all. */
-			/* ---------- step-until picker (custom popover) ---------- */
-			/* Trigger button (replaces the old native <select>); the popover it
-			   opens carries the before/after toggle + the step list. */
-			.step-until {
+			select.step-until {
 				font-size: 11px;
-				padding: 3px 8px;
+				padding: 3px 6px;
 				max-width: 160px;
 				background: var(--panel-2);
 				color: var(--text-dim);
 				border: 1px solid var(--line);
 				border-radius: 5px;
 				cursor: pointer;
-				white-space: nowrap;
 			}
-			.step-until:hover {
+			select.step-until:hover {
 				border-color: var(--accent-line);
-			}
-			.step-until-pop {
-				position: fixed;
-				z-index: 130; /* transient, above the overlay (100) + modals (120) */
-				min-width: 180px;
-				max-height: 60vh;
-				display: flex;
-				flex-direction: column;
-				gap: 4px;
-				padding: 6px;
-				background: var(--panel);
-				border: 1px solid var(--line);
-				border-radius: 8px;
-				box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
-			}
-			.su-seg-row {
-				display: flex;
-				align-items: center;
-				gap: 8px;
-				padding: 2px 4px 6px;
-				border-bottom: 1px solid var(--line);
-			}
-			.su-seg-lab {
-				color: var(--text-faint);
-				text-transform: uppercase;
-				letter-spacing: 0.05em;
-				font-size: 10px;
-			}
-			.su-seg {
-				display: flex;
-				margin-left: auto;
-				border: 1px solid var(--line);
-				border-radius: 6px;
-				overflow: hidden;
-			}
-			.su-seg-btn {
-				font-size: 11px;
-				padding: 3px 10px;
-				background: var(--panel-2);
-				color: var(--text-dim);
-				border: none;
-				cursor: pointer;
-			}
-			.su-seg-btn + .su-seg-btn {
-				border-left: 1px solid var(--line);
-			}
-			.su-seg-btn.on {
-				background: var(--accent);
-				color: var(--bg);
-			}
-			.su-list {
-				display: flex;
-				flex-direction: column;
-				gap: 1px;
-				overflow: auto;
-			}
-			.su-step {
-				text-align: left;
-				font-size: 12px;
-				padding: 5px 8px;
-				background: transparent;
-				color: var(--text);
-				border: none;
-				border-radius: 5px;
-				cursor: pointer;
-				white-space: nowrap;
-			}
-			.su-step:hover {
-				background: var(--panel-2);
-				color: var(--accent);
-			}
-			.su-empty {
-				color: var(--text-faint);
-				font-size: 11px;
-				padding: 6px 8px;
 			}
 
 			/* ---------- board multi-select ---------- */
@@ -1160,7 +948,7 @@
 				position: fixed;
 				inset: 0;
 				background: var(--bg);
-				z-index: 100; /* above the prompt lab (80) AND the compare view (95), so the full scene can be inspected from either; below modals (120) */
+				z-index: 100; /* above the prompt lab (80) AND the compare view (95), so the full scene can be inspected from either; below inquiry (110) + modals (120) */
 				display: flex;
 				flex-direction: column;
 				transform: translateX(100%);
@@ -1223,65 +1011,6 @@
 			}
 			#viewer-toggles button.off {
 				opacity: 0.5;
-			}
-			/* Objects multiselect dropdown (buildObjectsMenu) — lives inline in a
-			   viewer's toggle row; the trigger button inherits the row's button
-			   style, so only the popup + items need styling here. */
-			.vt-menu {
-				position: relative;
-				display: inline-flex;
-			}
-			.vt-menu-pop {
-				position: absolute;
-				bottom: 100%; /* #viewer-toggles is bottom-left, so open upward */
-				left: 0;
-				margin-bottom: 4px;
-				display: none;
-				flex-direction: column;
-				gap: 1px;
-				min-width: 132px;
-				padding: 5px;
-				background: var(--panel-2);
-				border: 1px solid var(--line-2);
-				border-radius: 6px;
-				box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
-				z-index: 10;
-			}
-			.cmp-toggles .vt-menu-pop {
-				/* compare panes carry the toggle row at the TOP, so drop it downward */
-				top: 100%;
-				bottom: auto;
-				margin-top: 4px;
-				margin-bottom: 0;
-			}
-			.vt-menu.open .vt-menu-pop {
-				display: flex;
-			}
-			.vt-menu-item {
-				display: flex;
-				align-items: center;
-				gap: 6px;
-				padding: 2px 4px;
-				font-size: 11px;
-				color: var(--text-dim);
-				cursor: pointer;
-				white-space: nowrap;
-			}
-			.vt-menu-item input {
-				cursor: pointer;
-			}
-			.vt-menu-item:has(input:disabled) {
-				/* the categories greyed out while NONE masks them */
-				opacity: 0.4;
-				cursor: default;
-			}
-			.vt-menu-none {
-				color: var(--text);
-			}
-			.vt-menu-sep {
-				height: 1px;
-				background: var(--line);
-				margin: 3px 0;
 			}
 			/* Zone-layers legend: a colour swatch per nesting depth present in the
                scene, shown only while the zone-layers view is on. Top-left so it
@@ -1669,6 +1398,292 @@
 				flex-direction: column;
 				min-height: 0;
 			}
+			#investigator-resizer {
+				width: 7px;
+				flex-shrink: 0;
+				cursor: col-resize;
+				position: relative;
+				z-index: 6;
+				touch-action: none;
+			}
+			#investigator-resizer::before {
+				content: "";
+				position: absolute;
+				top: 0;
+				bottom: 0;
+				left: 3px;
+				width: 1px;
+				background: var(--line);
+			}
+			#investigator-resizer:hover::before,
+			#investigator-resizer.dragging::before {
+				left: 2px;
+				width: 3px;
+				background: var(--purple);
+			}
+			#investigator,
+			#rc-investigator {
+				width: 380px;
+				flex-shrink: 0;
+				background: var(--panel);
+				border-left: 1px solid var(--line);
+				display: none;
+				flex-direction: column;
+				min-height: 0;
+			}
+			#investigator.open,
+			#rc-investigator.open {
+				display: flex;
+			}
+			#overlay-investigate.on,
+			#rc-investigate.on {
+				border-color: var(--purple);
+				color: var(--purple);
+			}
+			.ivg-head {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 8px 10px;
+				border-bottom: 1px solid var(--line-2);
+				flex-shrink: 0;
+			}
+			.ivg-head-text {
+				display: flex;
+				flex-direction: column;
+				min-width: 0;
+			}
+			.ivg-title {
+				color: var(--purple);
+				font-weight: 600;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				font-size: 10px;
+			}
+			.ivg-sub {
+				font-size: 11px;
+				white-space: nowrap;
+				overflow: hidden;
+				text-overflow: ellipsis;
+			}
+			.ivg-hbtn,
+			.ivg-add,
+			.ivg-send {
+				font-size: 10px;
+				padding: 3px 8px;
+			}
+			.ivg-status {
+				padding: 7px 10px;
+				border-bottom: 1px solid var(--line);
+				font-size: 11px;
+				flex-shrink: 0;
+			}
+			.ivg-body {
+				flex: 1;
+				min-height: 0;
+				overflow-y: auto;
+				padding: 10px;
+				display: flex;
+				flex-direction: column;
+				gap: 8px;
+			}
+			.ivg-hint {
+				color: var(--text-faint);
+				font-size: 12px;
+				line-height: 1.4;
+			}
+			.ivg-hint-emph {
+				color: var(--text-dim);
+				margin-top: 6px;
+			}
+			.ivg-suggest {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 6px;
+				margin-top: 10px;
+			}
+			.ivg-chip {
+				font-size: 11px;
+				text-align: left;
+			}
+			.ivg-msg {
+				display: flex;
+			}
+			.ivg-msg.user {
+				justify-content: flex-end;
+			}
+			.ivg-bubble {
+				max-width: 95%;
+				border: 1px solid var(--line);
+				background: var(--panel-2);
+				border-radius: 8px;
+				padding: 8px 10px;
+				line-height: 1.45;
+				white-space: pre-wrap;
+				overflow-wrap: anywhere;
+			}
+			.ivg-msg.user .ivg-bubble {
+				border-color: var(--purple);
+				background: #221a2e;
+				color: var(--text);
+			}
+			.ivg-msg.error .ivg-bubble {
+				border-color: #7a3f3f;
+				color: var(--red);
+			}
+			.ivg-reasoning {
+				margin: 8px 0 0;
+				padding: 8px;
+				border-radius: 6px;
+				background: #0c0d10;
+				color: var(--text-faint);
+				white-space: pre-wrap;
+				overflow-x: auto;
+			}
+			.ivg-think-toggle {
+				margin-top: 7px;
+				font-size: 10px;
+			}
+			.ivg-dots {
+				display: inline-flex;
+				gap: 4px;
+			}
+			.ivg-dots i {
+				width: 5px;
+				height: 5px;
+				border-radius: 50%;
+				background: var(--text-faint);
+				animation: q-pulse 1.2s ease-in-out infinite;
+			}
+			.ivg-dots i:nth-child(2) {
+				animation-delay: 0.15s;
+			}
+			.ivg-dots i:nth-child(3) {
+				animation-delay: 0.3s;
+			}
+			.ivg-attach {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 6px;
+				align-items: center;
+				padding: 7px 10px;
+				border-top: 1px solid var(--line);
+				background: #14151a;
+				flex-shrink: 0;
+			}
+			.ivg-attach-lab {
+				color: var(--text-faint);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+			}
+			.ivg-pill {
+				display: inline-flex;
+				align-items: center;
+				gap: 5px;
+				padding: 2px 6px;
+				border: 1px solid var(--purple);
+				border-radius: 999px;
+				color: var(--text-dim);
+				font-size: 10px;
+				max-width: 100%;
+			}
+			.ivg-pill-lab {
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.ivg-pill-x {
+				padding: 0;
+				border: 0;
+				background: transparent;
+				color: var(--text-faint);
+			}
+			.ivg-foot {
+				position: relative;
+				padding: 10px;
+				border-top: 1px solid var(--line);
+				background: var(--panel-2);
+				flex-shrink: 0;
+			}
+			.ivg-inputrow {
+				display: flex;
+				gap: 8px;
+				align-items: flex-end;
+			}
+			.ivg-input {
+				flex: 1;
+				min-width: 0;
+				resize: vertical;
+				max-height: 140px;
+				background: #0c0d10;
+				color: var(--text);
+				border: 1px solid var(--line);
+				border-radius: 6px;
+				padding: 7px 8px;
+				font: inherit;
+			}
+			.ivg-footbtns {
+				display: flex;
+				flex-direction: column;
+				gap: 6px;
+			}
+			.ivg-mention {
+				position: absolute;
+				left: 10px;
+				right: 10px;
+				bottom: calc(100% - 4px);
+				max-height: 260px;
+				overflow-y: auto;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-radius: 8px;
+				box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+				z-index: 10;
+			}
+			.ivg-mention-head {
+				padding: 6px 8px 3px;
+				color: var(--text-faint);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+			}
+			.ivg-mention-row {
+				display: flex;
+				align-items: center;
+				gap: 7px;
+				padding: 6px 8px;
+				cursor: pointer;
+				border-top: 1px solid var(--line);
+			}
+			.ivg-mention-row:hover,
+			.ivg-mention-row.active {
+				background: #1c2430;
+			}
+			.ivg-mention-row.on {
+				color: var(--purple);
+			}
+			.ivg-mention-kind,
+			.ivg-mention-step,
+			.ivg-mention-idx {
+				color: var(--text-faint);
+				font-size: 10px;
+				flex-shrink: 0;
+			}
+			.ivg-mention-node {
+				flex: 1;
+				min-width: 0;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.ivg-mention-tick {
+				color: var(--green);
+			}
+			.ivg-mention-empty {
+				padding: 10px;
+				color: var(--text-faint);
+			}
 			.obsdock-head {
 				padding: 8px 12px;
 				border-bottom: 1px solid var(--line-2);
@@ -1935,7 +1950,7 @@
 			.obsm-call .call-revert {
 				margin-left: auto;
 			}
-			/* "why?" — open the scene investigator for a call (obs dock). */
+			/* "why?" — open the decision-inquiry chat for a call (obs dock). */
 			.call-ask {
 				font-size: 9px;
 				padding: 1px 7px;
@@ -2202,48 +2217,26 @@
 				display: block;
 			}
 
-			/* ---------- scene investigator (shared docked chat) ---------- */
-			.inv-toggle.on {
-				border-color: var(--purple);
-				color: var(--purple);
-				background: #221a2e;
-			}
-			#investigator-resizer {
-				width: 7px;
-				flex-shrink: 0;
-				cursor: col-resize;
-				position: relative;
-				z-index: 6;
-				touch-action: none;
-			}
-			#investigator-resizer::before {
-				content: "";
-				position: absolute;
-				top: 0;
-				bottom: 0;
-				left: 3px;
-				width: 1px;
-				background: var(--line);
-			}
-			#investigator-resizer:hover::before,
-			#investigator-resizer.dragging::before {
-				left: 2px;
-				width: 3px;
-				background: var(--accent-line);
-			}
-			.investigator {
-				width: 420px;
-				flex-shrink: 0;
+			/* ---------- decision-inquiry chat ---------- */
+			#inquiry-panel {
+				position: fixed;
+				right: 16px;
+				bottom: 16px;
+				width: min(460px, 92vw);
+				height: min(72vh, 680px);
+				z-index: 110; /* above the overlay (100), below modals (120) */
 				background: var(--panel);
-				border-left: 1px solid var(--line);
+				border: 1px solid #3a3252;
+				border-radius: 10px;
+				box-shadow: 0 12px 40px rgba(0, 0, 0, 0.55);
 				display: none;
 				flex-direction: column;
-				min-height: 0;
+				overflow: hidden;
 			}
-			.investigator.open {
+			#inquiry-panel.open {
 				display: flex;
 			}
-			.ivg-head {
+			.inq-head {
 				display: flex;
 				align-items: center;
 				gap: 8px;
@@ -2252,162 +2245,225 @@
 				border-bottom: 1px solid var(--line);
 				flex-shrink: 0;
 			}
-			.ivg-head-text {
+			.inq-head-text {
 				display: flex;
 				flex-direction: column;
 				min-width: 0;
 			}
-			.ivg-title {
+			.inq-title {
 				color: var(--purple);
 				font-weight: 600;
 			}
-			.ivg-sub {
+			.inq-sub {
 				font-size: 10px;
 				white-space: nowrap;
 				overflow: hidden;
 				text-overflow: ellipsis;
 			}
-			.ivg-hbtn {
+			.inq-clear {
+				font-size: 10px;
+				padding: 2px 8px;
+			}
+			.inq-head button[onclick],
+			.inq-head button {
 				font-size: 11px;
 				padding: 3px 9px;
 			}
-			.ivg-status {
-				padding: 4px 12px;
-				font-size: 10px;
+			/* the exact, prefilled, editable system prompt sent to the reviewer */
+			.inq-prompt {
 				border-bottom: 1px solid var(--line-2);
 				background: #14151a;
 				flex-shrink: 0;
-				white-space: nowrap;
-				overflow: hidden;
-				text-overflow: ellipsis;
 			}
-			.ivg-body {
+			.inq-prompt-head {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				padding: 5px 12px;
+				cursor: pointer;
+				color: var(--text-faint);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				user-select: none;
+			}
+			.inq-prompt-head:hover {
+				color: var(--text-dim);
+			}
+			.inq-prompt-head .size {
+				margin-left: auto;
+				text-transform: none;
+				letter-spacing: 0;
+			}
+			.inq-prompt .caret {
+				width: 9px;
+				flex-shrink: 0;
+				transition: transform 0.12s ease;
+			}
+			.inq-prompt.open > .inq-prompt-head .caret {
+				transform: rotate(90deg);
+			}
+			.inq-prompt-reset {
+				font-size: 10px;
+				padding: 1px 7px;
+				text-transform: none;
+				letter-spacing: 0;
+			}
+			.inq-prompt-body {
+				display: none;
+				padding: 0 12px 8px;
+			}
+			.inq-prompt.open .inq-prompt-body {
+				display: block;
+			}
+			.inq-prompt-text {
+				width: 100%;
+				min-height: 90px;
+				max-height: 30vh;
+				resize: vertical;
+				font-size: 10px;
+				line-height: 1.5;
+				tab-size: 2;
+				background: #0c0d10;
+				border: 1px solid var(--line-2);
+				border-radius: 5px;
+				padding: 7px;
+			}
+			/* transcript */
+			.inq-body {
 				flex: 1;
 				overflow: auto;
 				padding: 12px;
 				display: flex;
 				flex-direction: column;
-				gap: 12px;
+				gap: 10px;
 			}
-			.ivg-hint {
+			.inq-hint {
 				color: var(--text-faint);
 				font-size: 11px;
 				line-height: 1.5;
 			}
-			.ivg-hint-emph {
-				color: var(--text-dim);
-				margin-top: 4px;
-			}
-			.ivg-suggest {
+			.inq-suggest {
 				display: flex;
 				flex-direction: column;
 				gap: 5px;
 				margin-top: 10px;
 			}
-			.ivg-chip {
+			.inq-chip {
 				text-align: left;
 				font-size: 11px;
-				padding: 6px 9px;
+				padding: 5px 9px;
 				color: var(--text-dim);
 				background: var(--panel-2);
 				border: 1px solid var(--line);
 				border-radius: 6px;
 				cursor: pointer;
 			}
-			.ivg-chip:hover {
+			.inq-chip:hover {
 				border-color: var(--purple);
 				color: #e6d6ff;
 				background: #1b1626;
 			}
-			.ivg-msg {
+			.inq-msg {
 				display: flex;
 				flex-direction: column;
-				max-width: 100%;
-			}
-			.ivg-msg.user {
-				align-self: flex-end;
-				align-items: flex-end;
 				max-width: 92%;
 			}
-			.ivg-msg.assistant {
-				align-self: stretch;
-				align-items: flex-start;
-				width: 100%;
+			.inq-msg.user {
+				align-self: flex-end;
+				align-items: flex-end;
 			}
-			.ivg-bubble {
-				padding: 9px 12px;
+			.inq-msg.assistant {
+				align-self: flex-start;
+				align-items: flex-start;
+			}
+			.inq-bubble {
+				white-space: pre-wrap;
+				word-break: break-word;
+				padding: 8px 11px;
 				border-radius: 9px;
 				font-size: 12px;
-				line-height: 1.55;
-				word-break: break-word;
+				line-height: 1.5;
 			}
-			.ivg-msg.user .ivg-bubble {
-				white-space: pre-wrap;
+			.inq-msg.user .inq-bubble {
 				background: #16222e;
 				border: 1px solid var(--accent-line);
 				color: #d8ecff;
 			}
-			.ivg-msg.assistant .ivg-bubble {
+			.inq-msg.assistant .inq-bubble {
 				background: var(--panel-2);
 				border: 1px solid var(--line);
 				color: var(--text);
-				width: 100%;
 			}
-			.ivg-msg.assistant.error .ivg-bubble {
-				white-space: pre-wrap;
+			.inq-msg.assistant.error .inq-bubble {
 				border-color: #7a3f3f;
 				background: #2c1d1d;
 				color: #f0c9c9;
 			}
-			.ivg-think-toggle {
+			/* Seed turns = the step's own input/output the chat continues from:
+               dimmed + height-capped so a big input or output stays compact. */
+			.inq-msg.seed {
+				opacity: 0.78;
+			}
+			.inq-msg.seed .inq-bubble {
+				max-height: 220px;
+				overflow: auto;
+			}
+			.inq-think-actions {
+				display: flex;
+				gap: 6px;
+				align-self: flex-start;
+				margin-top: 3px;
+			}
+			.inq-think-toggle,
+			.inq-think-inject {
 				font-size: 10px;
 				padding: 1px 7px;
-				margin-top: 4px;
-				align-self: flex-start;
 				color: var(--text-faint);
 				background: transparent;
 				border: 1px solid var(--line-2);
 				border-radius: 4px;
 			}
-			.ivg-think-toggle:hover {
+			.inq-think-toggle:hover,
+			.inq-think-inject:hover {
 				color: var(--purple);
 				border-color: #5a4a8a;
 			}
-			.ivg-reasoning {
+			.inq-reasoning {
 				margin-top: 4px;
-				width: 100%;
+				max-width: 100%;
 				background: #0c0d10;
 				border: 1px solid var(--line-2);
 				border-radius: 5px;
 				padding: 7px;
-				max-height: 260px;
+				max-height: 240px;
 				overflow: auto;
 				font-size: 10px;
 				color: var(--text-dim);
 				white-space: pre-wrap;
 				word-break: break-word;
 			}
-			.ivg-dots {
+			.inq-dots {
 				display: inline-flex;
 				gap: 3px;
 				margin-right: 7px;
 				vertical-align: middle;
 			}
-			.ivg-dots i {
+			.inq-dots i {
 				width: 5px;
 				height: 5px;
 				border-radius: 50%;
 				background: var(--purple);
 				opacity: 0.4;
-				animation: ivg-blink 1.1s infinite ease-in-out;
+				animation: inq-blink 1.1s infinite ease-in-out;
 			}
-			.ivg-dots i:nth-child(2) {
+			.inq-dots i:nth-child(2) {
 				animation-delay: 0.18s;
 			}
-			.ivg-dots i:nth-child(3) {
+			.inq-dots i:nth-child(3) {
 				animation-delay: 0.36s;
 			}
-			@keyframes ivg-blink {
+			@keyframes inq-blink {
 				0%,
 				80%,
 				100% {
@@ -2417,280 +2473,37 @@
 					opacity: 1;
 				}
 			}
-			.ivg-attach {
+			.inq-foot {
 				display: flex;
-				flex-wrap: wrap;
-				align-items: center;
-				gap: 5px;
-				padding: 7px 12px;
-				border-top: 1px solid var(--line-2);
-				background: #14151a;
-				flex-shrink: 0;
-			}
-			.ivg-attach-lab {
-				font-size: 10px;
-				color: var(--text-faint);
-				text-transform: uppercase;
-				letter-spacing: 0.04em;
-			}
-			.ivg-pill {
-				display: inline-flex;
-				align-items: center;
-				gap: 5px;
-				font-size: 10px;
-				padding: 2px 4px 2px 8px;
-				border: 1px solid #5a4a8a;
-				border-radius: 10px;
-				color: var(--purple);
-				background: #1b1626;
-				max-width: 100%;
-			}
-			.ivg-pill-lab {
-				overflow: hidden;
-				text-overflow: ellipsis;
-				white-space: nowrap;
-				max-width: 220px;
-			}
-			.ivg-pill-x {
-				font-size: 10px;
-				line-height: 1;
-				padding: 0 4px;
-				border: none;
-				background: none;
-				color: var(--text-faint);
-				cursor: pointer;
-			}
-			.ivg-pill-x:hover {
-				color: #f0c9c9;
-			}
-			.ivg-foot {
-				position: relative;
+				gap: 8px;
+				align-items: flex-end;
 				padding: 9px 12px;
 				border-top: 1px solid var(--line);
 				background: var(--panel-2);
 				flex-shrink: 0;
 			}
-			.ivg-inputrow {
-				display: flex;
-				gap: 8px;
-				align-items: flex-end;
-			}
-			.ivg-input {
+			.inq-input {
 				flex: 1;
 				resize: vertical;
-				min-height: 44px;
-				max-height: 200px;
+				min-height: 38px;
+				max-height: 160px;
 				font-size: 12px;
 				line-height: 1.45;
 			}
-			.ivg-footbtns {
-				display: flex;
-				flex-direction: column;
-				gap: 6px;
+			.inq-send {
+				flex-shrink: 0;
 			}
-			.ivg-add {
-				font-size: 10px;
-				padding: 3px 8px;
+			.inq-reason {
+				flex-shrink: 0;
+				font-size: 11px;
+			}
+			.inq-reason:hover:not(:disabled) {
 				color: var(--purple);
 				border-color: #5a4a8a;
 			}
-			.ivg-add:hover {
-				background: #1b1626;
-			}
-			.ivg-send {
-				flex-shrink: 0;
-			}
-			.ivg-mention {
-				position: absolute;
-				left: 12px;
-				right: 12px;
-				bottom: calc(100% + 4px);
-				max-height: 260px;
-				overflow: auto;
-				background: var(--panel-2);
-				border: 1px solid #5a4a8a;
-				border-radius: 6px;
-				box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
-				z-index: 10;
-			}
-			.ivg-mention-empty {
-				padding: 8px;
-				color: var(--text-faint);
-				font-size: 11px;
-			}
-			.ivg-mention-row {
-				display: flex;
-				align-items: center;
-				gap: 7px;
-				padding: 5px 9px;
-				cursor: pointer;
-				font-size: 11px;
-				color: var(--text-dim);
-			}
-			.ivg-mention-row.active {
-				background: #241d38;
-			}
-			.ivg-mention-row.on .ivg-mention-node {
-				color: var(--purple);
-			}
-			.ivg-mention-head {
-				padding: 5px 9px 2px;
-				font-size: 9px;
-				text-transform: uppercase;
-				letter-spacing: 0.04em;
-				color: var(--text-faint);
-			}
-			.ivg-mention-step {
-				color: var(--accent);
-				flex-shrink: 0;
-			}
-			.ivg-mention-kind {
-				color: var(--green);
-				flex-shrink: 0;
-				text-transform: uppercase;
-				font-size: 9px;
-				letter-spacing: 0.03em;
-			}
-			.ivg-mention-node {
-				overflow: hidden;
-				text-overflow: ellipsis;
-				white-space: nowrap;
-			}
-			.ivg-mention-idx {
-				margin-left: auto;
-				color: var(--text-faint);
-				flex-shrink: 0;
-			}
-			.ivg-mention-tick {
-				color: var(--green);
-				flex-shrink: 0;
-			}
-
-			/* ---------- markdown (investigator answers) ---------- */
-			.md {
-				font-size: 12px;
-				line-height: 1.55;
-			}
-			.md > :first-child {
-				margin-top: 0;
-			}
-			.md > :last-child {
-				margin-bottom: 0;
-			}
-			.md .md-p {
-				margin: 0 0 8px;
-			}
-			.md .md-h {
-				margin: 12px 0 6px;
-				line-height: 1.3;
-				color: var(--text);
-				font-weight: 600;
-			}
-			.md h1.md-h1 {
-				font-size: 15px;
-			}
-			.md h2.md-h2 {
-				font-size: 14px;
-			}
-			.md h3.md-h3 {
-				font-size: 13px;
-			}
-			.md h4.md-h4,
-			.md h5.md-h5,
-			.md h6.md-h6 {
-				font-size: 12px;
-				color: var(--text-dim);
-			}
-			.md .md-ul,
-			.md .md-ol {
-				margin: 0 0 8px;
-				padding-left: 20px;
-			}
-			.md .md-li {
-				margin: 2px 0;
-			}
-			.md .md-li > .md-ul,
-			.md .md-li > .md-ol {
-				margin: 2px 0;
-			}
-			.md .md-quote {
-				margin: 0 0 8px;
-				padding: 2px 10px;
-				border-left: 3px solid var(--line);
-				color: var(--text-dim);
-			}
-			.md .md-hr {
-				border: none;
-				border-top: 1px solid var(--line);
-				margin: 10px 0;
-			}
-			.md .md-pre {
-				margin: 0 0 8px;
-				background: #0c0d10;
-				border: 1px solid var(--line-2);
-				border-radius: 5px;
-				padding: 8px;
-				overflow: auto;
-			}
-			.md .md-pre .md-code {
-				white-space: pre;
-				font:
-					11px/1.5 "SF Mono",
-					ui-monospace,
-					Menlo,
-					monospace;
-				color: var(--text);
-				background: none;
-				padding: 0;
-				border: none;
-			}
-			.md .md-code-inline {
-				font:
-					11px/1.4 "SF Mono",
-					ui-monospace,
-					Menlo,
-					monospace;
-				background: #0c0d10;
-				border: 1px solid var(--line-2);
-				border-radius: 3px;
-				padding: 0 4px;
-				color: #d8ecff;
-				word-break: break-word;
-			}
-			.md .md-link {
-				color: var(--accent);
-				text-decoration: none;
-			}
-			.md .md-link:hover {
-				text-decoration: underline;
-			}
-			.md .md-strong {
-				color: var(--text);
-				font-weight: 600;
-			}
-			.md .md-em {
-				font-style: italic;
-			}
-			.md .md-strike {
-				text-decoration: line-through;
-				opacity: 0.8;
-			}
-			.md .md-table {
-				border-collapse: collapse;
-				margin: 0 0 8px;
-				font-size: 11px;
-				display: block;
-				overflow-x: auto;
-			}
-			.md .md-table th,
-			.md .md-table td {
-				border: 1px solid var(--line);
-				padding: 4px 8px;
-				text-align: left;
-			}
-			.md .md-table th {
-				background: var(--panel);
-				color: var(--text-dim);
+			.inq-reason:disabled {
+				opacity: 0.45;
+				cursor: default;
 			}
 
 			/* ---------- prompt lab ---------- */
@@ -2885,7 +2698,25 @@
 			.abl-cell.notcreated:hover { border-color: var(--green); }
 			.abl-plus { color: var(--text-faint); font-size: 13px; line-height: 1; }
 			.abl-cell.notcreated:hover .abl-plus { color: var(--green); }
+			/* replicate count shown in a cell (green number = replicates done) */
+			.abl-cnt { font: 700 11px ui-monospace, Menlo, monospace; line-height: 1; }
+			.abl-cnt.done { color: var(--green, #8bd17c); }
+			.abl-cnt.running { color: #f0b450; }
+			.abl-cnt.error { color: #ff9d95; }
+			.abl-cnt.idle { color: var(--text-dim); }
+			.abl-card-reps { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
 			.dot.notcreated { background: transparent; box-shadow: inset 0 0 0 1.5px #4a4e58; }
+			/* rubber-band group select on the board */
+			.abl-cell.sel { outline: 2px solid var(--accent); outline-offset: -2px; box-shadow: 0 0 0 2px rgba(122, 162, 247, 0.3); }
+			.abl-drag { position: fixed; z-index: 40; border: 1px solid var(--accent); background: rgba(122, 162, 247, 0.12); pointer-events: none; border-radius: 3px; }
+			#abl-selbar {
+				position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 60;
+				display: flex; gap: 10px; align-items: center; padding: 8px 14px;
+				background: rgba(18, 20, 26, 0.97); border: 1px solid var(--line-2); border-radius: 10px;
+				box-shadow: 0 8px 26px rgba(0, 0, 0, 0.5);
+			}
+			#abl-selbar .abl-selbar-n { font-size: 12px; color: var(--text-dim); }
+			.abl-start.danger { border-color: rgba(248, 81, 73, 0.5); color: var(--err-text, #ff9d95); }
 			/* config strip */
 			#abl-board-config {
 				display: flex;
@@ -3008,24 +2839,6 @@
 			}
 			.lab-step-row .edited-flag {
 				margin-left: auto;
-				color: var(--amber);
-			}
-			.lab-step-row .lab-step-revert {
-				margin-left: auto;
-				padding: 0 4px;
-				border: none;
-				background: none;
-				color: var(--text-faint);
-				cursor: pointer;
-				font-size: 12px;
-				line-height: 1;
-			}
-			/* An edited row already pushes its flag to the right; keep the revert
-			   button snug beside it rather than taking the auto-margin itself. */
-			.lab-step-row .edited-flag + .lab-step-revert {
-				margin-left: 0;
-			}
-			.lab-step-row .lab-step-revert:hover {
 				color: var(--amber);
 			}
 			#lab-editor {
@@ -3484,16 +3297,6 @@
 				padding-bottom: 8px;
 				border-bottom: 1px solid var(--line);
 			}
-			/* The collapsed-by-default input/system diff expander: a toggle that
-               reveals the diffs below the two outputs. */
-			#compare-text .ct-expand {
-				margin: 4px 0 0;
-			}
-			#compare-text .ct-diffs {
-				margin-top: 8px;
-				padding-top: 8px;
-				border-top: 1px dashed var(--line);
-			}
 			.rc-pill {
 				font-size: 10px;
 				padding: 2px 9px;
@@ -3560,64 +3363,10 @@
 			.rv-card .rv-head {
 				display: flex;
 				align-items: center;
-				flex-wrap: wrap;
-				gap: 8px 6px;
+				gap: 8px;
 				padding: 8px 10px;
 				background: var(--panel-2);
 				border-bottom: 1px solid var(--line-2);
-			}
-			/* The per-event "simulate on" LLM picker — tinted so it reads as a
-               distinct config affordance next to the plain action buttons. */
-			.sim-llm-btn {
-				color: var(--purple);
-				border-color: rgba(168, 148, 255, 0.4);
-			}
-			/* Floating model-checkbox popover for the per-event LLM picker. */
-			.model-pop {
-				position: fixed;
-				z-index: 200;
-				background: var(--panel-2);
-				border: 1px solid var(--line-2);
-				border-radius: 6px;
-				padding: 6px;
-				min-width: 150px;
-				max-height: 320px;
-				overflow: auto;
-				box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
-			}
-			.model-pop-head {
-				display: flex;
-				align-items: center;
-				gap: 6px;
-				font-size: 10px;
-				text-transform: uppercase;
-				letter-spacing: 0.04em;
-				color: var(--text-faint);
-				margin-bottom: 5px;
-			}
-			.model-pop-head .fit-btn {
-				margin-left: 0;
-			}
-			.model-pop-rows {
-				display: flex;
-				flex-direction: column;
-				gap: 1px;
-			}
-			.model-pop-row {
-				display: flex;
-				align-items: center;
-				gap: 6px;
-				font-size: 11px;
-				padding: 2px 3px;
-				border-radius: 4px;
-				cursor: pointer;
-			}
-			.model-pop-row:hover {
-				background: rgba(255, 255, 255, 0.04);
-			}
-			.model-pop-row .muted {
-				margin-left: auto;
-				font-size: 9px;
 			}
 			.rv-card .rv-slot {
 				font-weight: 600;
@@ -3892,13 +3641,11 @@
 				background: #221a2e;
 			}
 			#compare-run-b {
+				max-width: 190px;
 				display: none;
 			}
 			#compare-run-b.on {
-				display: block;
-			}
-			#compare-run-b .run-combo-btn {
-				max-width: 220px;
+				display: inline-block;
 			}
 			#runcompare {
 				position: fixed;
@@ -4068,34 +3815,23 @@
 				padding-top: 8px;
 				border-top: 1px dashed var(--line);
 			}
-			/* Global mesh-generation queue panel: every in-flight + waiting
-			   generation across the concurrency pools, from /trellis/queue. Shown
-			   only over the cell overlay; queue.js pins `right` just left of the
-			   observability dock (and the investigator when open) so it never
-			   overlaps the obs tree. The `right` below is only the pre-JS fallback. */
+			/* Global mesh-generation queue panel (bottom-right): every in-flight +
+			   waiting generation across the concurrency pools, from /trellis/queue. */
 			#queue-panel {
 				position: fixed;
 				right: 12px;
 				bottom: 12px;
 				width: 270px;
 				max-height: 50vh;
-				/* Hidden by default — the queue only floats over the main scene
-				   canvas (the cell overlay), never on the board or in the prompt
-				   lab, where it's just noise. Shown by the :has() rule below. */
-				display: none;
+				display: flex;
 				flex-direction: column;
 				background: var(--panel);
 				border: 1px solid var(--line);
 				border-radius: 8px;
-				z-index: 105; /* above the overlay (100), below modals (120) */
+				z-index: 105; /* above the overlay (100), below inquiry (110) + modals (120) */
 				font-size: 12px;
 				box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
 				overflow: hidden;
-			}
-			/* Reveal it only while the main canvas (cell overlay) is up. Mirrors
-			   the app's other context-scoped overlays (e.g. #canvas-host:has(...)). */
-			body:has(#overlay.open) #queue-panel {
-				display: flex;
 			}
 			#queue-head {
 				display: flex;
@@ -4328,7 +4064,7 @@
 	<body>
 		<div id="topbar">
 			<span class="brand">starshot</span>
-			<div id="run-picker" class="run-combo"></div>
+			<select id="run-picker" title="Switch the active run"></select>
 			<button
 				id="btn-new-run"
 				title="Create a new run from a prompt version"
@@ -4393,23 +4129,10 @@
 			>
 				compare runs
 			</button>
-			<div
+			<select
 				id="compare-run-b"
-				class="run-combo"
 				title="The run to compare the active run against"
-			></div>
-			<button
-				id="btn-ab-test"
-				title="Launch a new run (Run B) seeded with this run's zone plans, re-running from the zone plan onwards on a chosen prompt version"
-			>
-				A/B test…
-			</button>
-			<button
-				id="btn-copy-slot"
-				title="Copy a slot from this run into another run, overwriting that run's slot"
-			>
-				copy slot…
-			</button>
+			></select>
 			<span id="status-text"></span>
 			<div id="cost-tracker" class="collapsed">
 				<button
@@ -4452,21 +4175,20 @@
 				<span class="dot idle" id="overlay-dot"></span>
 				<span id="overlay-status" class="muted"></span>
 				<span style="margin-left: auto"></span>
-				<button id="overlay-action"></button>
-				<button id="overlay-reset" class="danger">reset</button>
 				<button
 					id="overlay-investigate"
-					class="inv-toggle"
-					title="Open the scene investigator — ask an AI (Opus 4.8) holistic questions about this cell's whole scene"
+					title="Open the scene investigator chat"
 				>
-					investigate ✦
+					investigate
 				</button>
+				<button id="overlay-action"></button>
+				<button id="overlay-reset" class="danger">reset</button>
 			</div>
 			<div id="overlay-body">
 				<div id="canvas-host">
 					<div id="viewer-toggles">
-						<!-- objects multiselect (anchors/next/negative space/frames) is
-						     inserted here by overlay.js via buildObjectsMenu() -->
+						<button data-toggle="objects">objects</button>
+						<button data-toggle="frames">frames</button>
 						<button data-toggle="zones">zones</button>
 						<button data-toggle="meshes">meshes</button>
 						<button data-toggle="grid">grid</button>
@@ -4517,9 +4239,7 @@
 					title="drag to resize the investigator"
 					style="display: none"
 				></div>
-				<!-- Per-slot investigator chat; built + driven by investigator.js,
-				     toggled from the header (#overlay-investigate). -->
-				<div id="investigator" class="investigator"></div>
+				<div id="investigator"></div>
 			</div>
 		</div>
 		<div id="lab">
@@ -4662,7 +4382,7 @@
 				>
 				<button
 					id="compare-text-toggle"
-					title="Show the two outputs (input / system diff on expand)"
+					title="Show input diff + outputs"
 				>
 					text ▾
 				</button>
@@ -4707,12 +4427,8 @@
 					><input id="runcompare-link" type="checkbox" checked /> link
 					cameras</label
 				>
-				<button
-					id="rc-investigate"
-					class="inv-toggle"
-					title="Open the scene investigator for a pane's cell — ask an AI (Opus 4.8) about its whole scene"
-				>
-					investigate ✦
+				<button id="rc-investigate" title="Open the scene investigator chat">
+					investigate
 				</button>
 			</div>
 			<div id="runcompare-body">
@@ -4750,9 +4466,7 @@
 					<div id="rc-b-host" class="cmp-host"></div>
 					<div id="rc-b-obs" class="rc-obs open"></div>
 				</div>
-				<!-- Scene investigator for run-compare; bound per-pane on "why?"
-				     (see runcompare.js), toggled from #rc-investigate. -->
-				<div id="rc-investigator" class="investigator"></div>
+				<div id="rc-investigator"></div>
 			</div>
 		</div>
 		<div id="modal-root"></div>

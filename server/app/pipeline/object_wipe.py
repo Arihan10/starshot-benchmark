@@ -298,7 +298,10 @@ def wipe_object(
     `/meshes` bundles), so it is wiped first; the generated log is wiped second,
     after handing off the prefab canonical role if needed; files are deleted last
     (after the successor has cloned the raw it inherits)."""
-    lib_events = library_log.state["events"]
+    # FULL events off disk: the transform below is rewritten back via
+    # replace_events, so it must carry every step's prompt/output — the
+    # in-memory buffer is slim (heavy fields dropped) and would drop them.
+    lib_events = library_log.full_events()
     if not any(e.get("kind") == "bbox" and e.get("id") == node_id for e in lib_events):
         return None
 

@@ -4,7 +4,7 @@
 // client-side LRU caches, and the step-kind helpers. Imports only leaves
 // (events.js) so there's no init-order hazard.
 
-import { createObsModel, emittedStep } from "../../js/events.js";
+import { emittedStep } from "../../js/events.js";
 
 export const $ = (id) => document.getElementById(id);
 
@@ -41,13 +41,31 @@ export const COMPONENT_ABBR = {
 };
 export const compHex = (comp) => COMPONENT_COLORS[comp] ?? "#888";
 
-// Full obs model over the WHOLE cell history — a stable id → node lookup used
-// only to recover each entity's true kind for swatch coloring; the per-step
-// scene-tree step selector (renderPipeline) reads it for the node hierarchy.
-export function buildCellObs(events) {
-	const m = createObsModel();
-	for (const e of events) m.feed(e);
-	return m.model;
+// The obs model the /tf drawer + tree read — a stable id → node lookup (kind,
+// structural parent) plus each node's EMITTING provenance (the region + pass +
+// call index of the decompose/next step that named it). Built from the server's
+// compact scene-tree projection (api.tfTree) instead of folding the whole
+// (hundreds-of-MB) events.jsonl client-side. The shape mirrors
+// createObsModel().model so renderPipeline, the attention tree, and present-mode
+// zone/frame coloring (nodes / order / provenance) read it unchanged.
+export function obsFromTree(tree) {
+	const order = Array.isArray(tree?.order) ? tree.order : [];
+	const src = (tree && tree.nodes) || {};
+	const nodes = new Map();
+	const provenance = new Map();
+	for (const id of order) {
+		const n = src[id] || {};
+		nodes.set(id, { id, parentId: n.parent_id ?? null, kind: n.kind ?? "zone" });
+		// Only emitted nodes carry provenance; emittedStep/emittingRegion read
+		// call.template/call.node, present-mode's zone tally reads call.index.
+		if (n.emitted_by != null || n.region != null) {
+			provenance.set(id, [{
+				relation: "emitted_by",
+				call: { node: n.region ?? null, index: n.call_index ?? null, template: n.emitted_by ?? null, step: n.emitted_by ?? null },
+			}]);
+		}
+	}
+	return { nodes, order, provenance, calls: [], log: [], specs: new Map(), errorCount: 0, maxIndex: -1 };
 }
 
 // An encapsulating shell ("frame": floor/roof slabs, walls, ground). The
@@ -88,8 +106,7 @@ export const state = {
 	steps: [],
 	stepIdx: 0,
 	presentSeqId: 0, // bumped to cancel an in-flight end-to-end stitched present run
-	events: [], // full event history for the cell
-	obs: null, // full-history obs model — id→node lookup for entity kind (frames)
+	obs: null, // scene-tree obs model (api.tfTree projection) — id→node kind/parent + emitting provenance
 	export: null, // current tf-export payload
 	highlight: "scene", // scene | to_place | output | variables | none
 	component: "entity", // entity | all | <component name> — sub-filter for scene/to_place
@@ -109,6 +126,7 @@ export const state = {
 	// step's result is fetched (and parsed) at most once per cell visit.
 	compactCache: new Map(), // `${run}:${slot}:${model}:${ev}` -> compact analysis
 	maxHeads: 32, // how many top (layer, head) pairs get per-token detail (compute param)
+	viiSampleN: (() => { try { const v = Number(localStorage.getItem("tf-vii-n")); return v > 0 ? v : 2; } catch { return 2; } })(), // VII sample: latest N firings PER step-kind to (re)compute
 	attnModel: { open: true, hf_url: null, hf_path: null }, // is this cell's model open-weight? (from tf-steps)
 	// Per-step (keyed by event_index) attention status — the single source of
 	// truth for the queue + per-step indicators, mirrored from the server on
@@ -126,6 +144,9 @@ export const state = {
 	// { evs:Set<remaining>, sent:Set<dispatched>, force:bool } or null when idle.
 	attnPlan: null,
 	attnServer: { queued: [], running: [], computed: [] }, // last server queue snapshot
+	attnWorkerVersion: null, // deployed Modal worker's analysis_version (from /attention)
+	attnServerVersion: null, // this server's ANALYSIS_VERSION — skew warns in the compute bar
+	attnDraining: 0, // server-side done-but-not-yet-pulled backlog — poll drains until 0
 	// Cross-step cache for the overview tab: event_index -> stored analysis, so
 	// summarizing the whole cell fetches each step's result at most once.
 	stepAnalyses: new Map(),
@@ -180,7 +201,10 @@ export const bumpView = () => ++state.viewToken;
 // Max attention jobs we keep outstanding on Modal at once. "Compute all" enqueues
 // only this many and tops up as they finish (see startAttnPlan/attnPump), so the
 // GPU queue never holds the whole cell and stops cleanly when we stop requeueing.
-export const ATTN_WINDOW = 10;
+// Sized to keep the fanned-out consumer pool fed (up to 4 parallel consumers per
+// model — H200, or 2×B200 each = 8×B200 total — at ~1 per 3 queued steps) without
+// over-committing the shared per-model FIFO.
+export const ATTN_WINDOW = 16;
 
 // LRU caps for the client-side attention caches (bounded so long sessions don't
 // grow unbounded — the whole point is to NOT hold everything in memory).

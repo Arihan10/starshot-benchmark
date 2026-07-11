@@ -47,10 +47,46 @@ def _shift_entry(entry: dict[str, Any], base: int, rel_key: str) -> dict[str, An
         if crel:
             cc["start"] = base + crel[0]
             cc["end"] = base + crel[1]
+        # Rebase each per-attribute role sub-span (context / frame / content) too,
+        # from its own raw-`user` offsets — else the GPU path maps the structure-vs-
+        # content roles to the WRONG tokens (the mock path skips reconstruct, so this
+        # only bites the real worker).
+        roles = []
+        for r in c.get("roles", []) or []:
+            rrel = r.get("user_rel")
+            rr = dict(r)
+            if rrel:
+                rr["start"] = base + rrel[0]
+                rr["end"] = base + rrel[1]
+            roles.append(rr)
+        if roles:
+            cc["roles"] = roles
         comps.append(cc)
     if comps:
         out["components"] = comps
     return out
+
+
+def _shift_gravity(gravity: dict[str, Any] | None, base: int) -> dict[str, Any]:
+    """Rebase a tf-export gravity block (per-sentence + tag spans) into the
+    reconstructed `full` frame from its raw-`user` offsets. `{}` when absent."""
+    if not gravity or not gravity.get("sentences"):
+        return {}
+
+    def _sp(g: dict[str, Any] | None) -> dict[str, Any] | None:
+        rel = (g or {}).get("user_rel")
+        if not rel:
+            return None
+        return {"start": base + int(rel[0]), "end": base + int(rel[1])}
+
+    return {
+        "mode": gravity.get("mode"),
+        "block": _sp(gravity.get("block")),
+        "open_tag": _sp(gravity.get("open_tag")),
+        "close_tag": _sp(gravity.get("close_tag")),
+        "sentences": [{"i": s.get("i"), "snippet": s.get("snippet"), **(_sp(s) or {})}
+                      for s in gravity.get("sentences", [])],
+    }
 
 
 def build_real_trace(
@@ -113,6 +149,9 @@ def build_real_trace(
          for m in export.get("output_map", [])]
         if out_off >= 0 else []
     )
+    # XML-gravity: the instruction-block quarters + tag spans live in the same
+    # `user` frame as the scene, so they rebase by the same trim-aware `user_off`.
+    gravity = _shift_gravity(export.get("gravity"), user_off) if user_pos >= 0 else {}
 
     check = {
         "user_found": user_pos >= 0,
@@ -144,6 +183,7 @@ def build_real_trace(
         scene_map=scene_map,
         output_map=output_map,
         to_place_map=to_place_map,
+        gravity=gravity,  # XML-gravity: rebased quarter + tag spans (empty otherwise)
         variables_map=export.get("variables_map", []),  # powers the "Variables" region category
         remote_logprobs=remote_logprobs,
         meta={**export.get("meta", {}), "reconstruction": check, "native_template": True},

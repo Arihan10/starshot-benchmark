@@ -6,11 +6,11 @@
 
 import { el } from "../../js/ui.js";
 import { api } from "../../js/api.js";
-import { $, state, ATTN_WINDOW, ATTN_STATUS_LABEL, BBOX_STEP_TEMPLATES, dropStepCaches } from "./state.js";
+import { $, state, ATTN_WINDOW, ATTN_STATUS_LABEL, dropStepCaches } from "./state.js";
 import { renderTimeline, refreshTimeline, loadAttention } from "./render.js";
 import { renderAttention } from "./attnPanel.js";
-import { updateReportCtx, syncTabHighlight } from "./tabs.js";
-import * as report from "./report.js";
+import { syncTabHighlight } from "./tabs.js";
+import { setSceneAttentionCount } from "./reportState.js";
 
 // Attention analysis needs OPEN HF weights; the server (tf-steps.attention) marks
 // closed/API models (gpt/claude/gemini/...) as gated. These drive the compute
@@ -26,7 +26,7 @@ export function renderAttnModelBadge() {
 	if (!host) return;
 	const m = state.attnModel || {};
 	const open = m.open !== false, disabled = !open;
-	for (const id of ["tf-attn-all", "tf-attn-bbox"]) { const b = $(id); if (b) b.disabled = disabled; }
+	for (const id of ["tf-attn-all", "tf-attn-vii"]) { const b = $(id); if (b) b.disabled = disabled; }
 	if (open && m.hf_url) {
 		host.replaceChildren(el("a", { class: "pill", href: m.hf_url, target: "_blank", rel: "noreferrer",
 			title: `open weights on Hugging Face${m.gpu ? ` · runs on ${m.gpu}` : ""}`, text: `🤗 ${m.hf_path || "open"}` }));
@@ -52,6 +52,35 @@ export async function computeAllAttention() {
 	// undefined on an older server response → don't filter in that case.)
 	const evs = state.steps.filter((s) => s.has_scene !== false).map((s) => s.event_index);
 	if (!evs.length) { prog.textContent = "no steps with scene context"; return; }
+	// Gate a large recompute: after an analysis-version bump, previously-computed
+	// steps read as STALE and an additive compute-all would recompute the whole
+	// cell. Confirm first, and let the user OPT OUT of the stale recompute (compute
+	// only the never-computed steps). Skipped when forcing (already an explicit choice).
+	if (!force) {
+		const stale = evs.filter((ev) => state.attnStatus[ev] === "stale");
+		if (stale.length) {
+			const missing = evs.filter((ev) => { const st = state.attnStatus[ev]; return st == null || st === "none" || st === "error"; });
+			const ok = window.confirm(
+				`${stale.length} step${stale.length === 1 ? "" : "s"} in this cell are from an older analysis version (stale)`
+				+ (missing.length ? `, and ${missing.length} were never computed` : "") + `.\n\n`
+				+ `OK — recompute all ${stale.length + missing.length} (one GPU forward each).\n`
+				+ `Cancel — opt out of the stale recompute`
+				+ (missing.length ? `, compute only the ${missing.length} missing.` : ` (keep existing results).`));
+			if (!ok) {
+				if (!missing.length) { prog.textContent = "kept stale results"; return; }
+				for (const ev of missing) state.attnStatus[ev] = "queued";
+				renderTimeline(); renderAttention();
+				prog.textContent = `queuing ${missing.length} missing…`;
+				await startAttnPlan(missing.reverse(), false);
+				return;
+			}
+		}
+	}
+	// Compute from the END first: the latest steps carry the most accumulated scene
+	// context (and are the ones you usually want to see), so dispatch them ahead of
+	// the early ones. attnPump walks the plan Set in insertion order, so a
+	// descending evs order (state.steps is ascending timeline order) = latest-first.
+	evs.reverse();
 	if (force) {
 		// Force: every step re-enters the plan — including ones already "ready".
 		for (const ev of evs) {
@@ -72,21 +101,74 @@ export async function computeAllAttention() {
 	await startAttnPlan(evs, force);
 }
 
-// FORCE-recompute only the bbox-batch steps — refreshes the to-place readout
-// without touching (or depending on the freshness of) every other step. Uses
-// force=true so it ALWAYS recomputes, regardless of the server's is_fresh state.
-export async function recomputeBbox() {
+// Scene-context step kinds whose prompt carries the <VERY_IMPORTANT_INSTRUCTIONS>
+// section — the ones a recompute yields a per-instruction (VII) region split for.
+// (zone_plan_root / zone_decompose have scene context but no VII block.)
+const VII_STEP_KINDS = new Set([
+	"zone_plan", "anchor_decompose", "encapsulating_decompose",
+	"negative_space_decompose", "object_bbox_batch", "child_bbox_batch", "next_object",
+]);
+
+// The representative VII SAMPLE: the VII-bearing scene-context steps grouped by
+// kind, the latest `n` firings per kind (later = more accumulated context = a
+// better representative). Returns an ascending event_index list.
+function viiSampleEvents(n) {
+	const byKind = new Map();
+	for (const s of state.steps) {
+		if (s.has_scene === false) continue;
+		const t = s.template ?? s.step;
+		if (!VII_STEP_KINDS.has(t)) continue;
+		if (!byKind.has(t)) byKind.set(t, []);
+		byKind.get(t).push(s.event_index);
+	}
+	const out = [];
+	for (const evs of byKind.values()) { evs.sort((a, b) => b - a); out.push(...evs.slice(0, Math.max(1, n))); }
+	return [...new Set(out)].sort((a, b) => a - b);
+}
+
+// Compute a representative SAMPLE — the latest `state.viiSampleN` firings of each
+// VERY_IMPORTANT_INSTRUCTIONS-bearing step kind — so the per-instruction (VII)
+// breakdown is available for this cell. ADDITIVE (not force): a step that ALREADY
+// has a current committed result is adopted + pulled from the Volume (no GPU
+// redo — that's the whole point), and only genuinely missing/stale steps are
+// computed. Tick the `force` box only if you want to re-derive an up-to-date one.
+export async function computeViiSample() {
 	if (!state.steps.length) return;
 	if (!attnModelOpen()) { $("tf-attn-progress").textContent = closedModelMsg(); return; }
 	const prog = $("tf-attn-progress");
-	const evs = state.steps
-		.filter((s) => BBOX_STEP_TEMPLATES.has(s.template) && s.has_scene !== false)
-		.map((s) => s.event_index);
-	if (!evs.length) { prog.textContent = "no bbox-batch steps in this cell"; return; }
-	for (const ev of evs) { state.attnStatus[ev] = "queued"; state.attnPendingReload.add(ev); dropStepCaches(ev); }
+	const evs = viiSampleEvents(state.viiSampleN);
+	if (!evs.length) { prog.textContent = "no VERY_IMPORTANT_INSTRUCTIONS-bearing steps in this cell"; return; }
+	const force = $("tf-attn-force")?.checked;
+	for (const ev of evs) {
+		const st = state.attnStatus[ev];
+		if (force || st == null || st === "none" || st === "stale" || st === "error") {
+			state.attnStatus[ev] = "queued";
+			if (force) { state.attnPendingReload.add(ev); dropStepCaches(ev); if (isCurrent(ev) && state.attn?.meta?.event_index === ev) state.attn = null; }
+		}
+	}
 	renderTimeline(); renderAttention();
-	prog.textContent = `queuing ${evs.length} bbox step${evs.length > 1 ? "s" : ""}…`;
-	await startAttnPlan(evs, true);
+	prog.textContent = `queuing VII sample · ${evs.length} step${evs.length > 1 ? "s" : ""}…`;
+	await startAttnPlan(evs, !!force);
+}
+
+// Recover attention state from Modal after a SERVER RESTART. The local server's
+// in-memory queue + this page's poll loop are gone, but Modal's durable queue
+// (keyed by the deterministic cell_hash) and its stored result blobs survive. A
+// single status pull re-reads the queue AND pulls+stores any finished results to
+// local disk (server-side, in attention_list → _pull_remote_attention); we then
+// resume the live poll so anything still running keeps draining + landing. Purely
+// a re-sync — it dispatches NO new compute.
+export async function syncFromModal() {
+	if (!state.steps.length) return;
+	const prog = $("tf-attn-progress");
+	const btn = $("tf-attn-sync");
+	if (btn) btn.disabled = true;
+	if (prog) prog.textContent = "syncing from Modal…";
+	const ok = await syncAttnStatus(); // pulls queue + finished results, applies status, repaints
+	if (btn) btn.disabled = false;
+	if (!ok) { if (prog) prog.textContent = "sync failed — Modal unreachable?"; return; }
+	if (hasPending()) startAttnPoll(); // resume the live loop if anything's still queued/running
+	else updateBatchProgress();        // otherwise just show the recovered ✓ counts
 }
 
 // Per-step status tallied into queue counts (drives the counts row, the
@@ -104,12 +186,21 @@ function attnCounts() {
 	return { ready, running, queued, stale, errors, total: state.steps.length };
 }
 
+// Compact snapshot of THIS cell's MAIN-sequence attention queue for the global ops
+// bar's Modal-attention segment (opsbar.js reads it via the attnbus provider).
+export function attnQueueSnapshot() {
+	const c = attnCounts();
+	return { running: c.running, queued: c.queued, computed: c.ready, stale: c.stale, errors: c.errors, total: c.total };
+}
+
 // Compact top-bar progress line (next to the ⚡ button).
 export function updateBatchProgress() {
 	const prog = $("tf-attn-progress");
 	if (!prog || !state.steps.length) return;
 	const c = attnCounts();
-	const tail = `${c.stale ? ` · ${c.stale} stale` : ""}${c.errors ? ` · ${c.errors} failed` : ""}`;
+	const vw = state.attnWorkerVersion, vs = state.attnServerVersion;
+	const skew = (vw != null && vs != null && vw !== vs) ? ` · ⚠ worker v${vw} ≠ server v${vs} (redeploy modal)` : "";
+	const tail = `${c.stale ? ` · ${c.stale} stale` : ""}${c.errors ? ` · ${c.errors} failed` : ""}${skew}`;
 	prog.textContent = (c.running || c.queued)
 		? `${c.ready}/${c.total} · ${c.running} running · ${c.queued} queued${tail}`
 		: `✓ ${c.ready}/${c.total}${tail}`;
@@ -144,7 +235,7 @@ function attnPlanActive() { return !!(state.attnPlan && state.attnPlan.evs.size)
 async function startAttnPlan(evs, force) {
 	state.attnPlan = { evs: new Set(evs.map(Number)), sent: new Set(), force: !!force };
 	$("tf-attn-all").disabled = true;
-	if ($("tf-attn-bbox")) $("tf-attn-bbox").disabled = true;
+	if ($("tf-attn-vii")) $("tf-attn-vii").disabled = true;
 	// NB: compute-all does NOT reset the queue — the GPU queue is shared per model,
 	// so resetting here would nuke OTHER scenes' pending compute. Stale pending is
 	// cleared on server restart instead (see the server-startup reset).
@@ -213,6 +304,12 @@ export function applyServerStatus(r) {
 	// Stash the raw queue snapshot so attnPump can size the next window against
 	// what Modal is ACTUALLY holding (not our optimistic per-step marks).
 	state.attnServer = { queued: [...queued], running: [...running], computed: [...ready] };
+	// Deployed-worker vs server analysis_version (skew surfaced in the progress line).
+	if (r.worker_version != null) state.attnWorkerVersion = r.worker_version;
+	if (r.server_version != null) state.attnServerVersion = r.server_version;
+	// done-but-not-yet-pulled backlog on the server — keep polling until it's 0 so a
+	// finished batch fully lands locally (see hasPending).
+	state.attnDraining = Number(r.draining) || 0;
 	for (const step of state.steps) {
 		const ev = Number(step.event_index);
 		const prev = state.attnStatus[ev];
@@ -248,12 +345,16 @@ export function applyServerStatus(r) {
 		else if (prev === "queued" || prev === "running") state.attnStatus[ev] = "none"; // server lost track — don't spin forever
 	}
 	attnPlanReconcile(); // drop finished steps from the window; keep the rest "queued"
-	report.setSceneAttentionCount(state.slot, r);
+	setSceneAttentionCount(state.slot, r);
 	syncTabHighlight();
 }
 
-// Anything still working in this cell?
+// Anything still working in this cell? True while jobs are queued/running OR while
+// the server still has finished results to pull back (draining) — so the poll keeps
+// running until every committed result has landed locally, not just until the GPU
+// queue empties.
 export function hasPending() {
+	if ((state.attnDraining || 0) > 0) return true;
 	return state.steps.some((s) => {
 		const st = state.attnStatus[s.event_index];
 		return st === "queued" || st === "running";
@@ -279,36 +380,6 @@ function refreshHead(ev) {
 	}
 }
 
-// Signature of the COMPUTED (ready) step set — the only thing a status poll can
-// change that the report workspace actually renders. Gating the rebuild on this
-// (instead of rebuilding every poll) keeps the analysis view + scroll position
-// stable while a batch computes; a rebuild happens only when a new result lands.
-let _lastReportReady = null;
-function reportReadySig() {
-	const s = state.attnStatus || {};
-	const ready = [];
-	for (const ev in s) if (s[ev] === "ready") ready.push(ev);
-	return ready.sort((a, b) => Number(a) - Number(b)).join(",");
-}
-// Throttle the poll-driven rebuild: during an active batch a step finishes every
-// poll, so an un-throttled rebuild rebuilds the whole (heavy) workspace every tick
-// and the view feels frozen. Coalesce to at most one rebuild per REPORT_RENDER_MS.
-const REPORT_RENDER_MS = 1500;
-let _reportRenderAt = 0, _reportRenderTimer = null;
-function _renderReportNow() {
-	_reportRenderAt = Date.now(); _reportRenderTimer = null;
-	if (state.reportView) report.renderReportWorkspace({ scrollSelection: false });
-}
-function scheduleReportRender() {
-	const since = Date.now() - _reportRenderAt;
-	if (since >= REPORT_RENDER_MS) { _renderReportNow(); return; }
-	if (!_reportRenderTimer) _reportRenderTimer = setTimeout(_renderReportNow, REPORT_RENDER_MS - since);
-}
-export function resetReportReadySig() {
-	_lastReportReady = null;
-	if (_reportRenderTimer) { clearTimeout(_reportRenderTimer); _reportRenderTimer = null; }
-}
-
 // One poll: pull the server-owned queue, mirror it into per-step status, and
 // repaint the (cheap) queue panel. The heavy attention body is only touched
 // when the current step needs it — loaded when it just turned ready (or its
@@ -322,14 +393,6 @@ export async function syncAttnStatus() {
 	applyServerStatus(r);
 	refreshTimeline();
 	updateBatchProgress();
-	updateReportCtx();
-	// Only rebuild the report when the computed-step set actually changed — a poll
-	// that changes nothing (or only queued/running progress) must NOT rebuild it,
-	// or it snaps scroll + flickers the charts under the user.
-	if (state.reportView) {
-		const sig = reportReadySig();
-		if (sig !== _lastReportReady) { _lastReportReady = sig; scheduleReportRender(); }
-	}
 	const cur = state.steps[state.stepIdx];
 	const ev = cur && cur.event_index;
 	if (ev == null) return true;
@@ -360,7 +423,7 @@ export function startAttnPoll() {
 		} else {
 			state.attnPlan = null; // plan complete — stop requeueing (Modal's queue is empty)
 			$("tf-attn-all").disabled = false; // queue drained — re-enable both compute buttons
-			if ($("tf-attn-bbox")) $("tf-attn-bbox").disabled = false;
+			if ($("tf-attn-vii")) $("tf-attn-vii").disabled = false;
 			updateBatchProgress();
 		}
 	};

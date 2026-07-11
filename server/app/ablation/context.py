@@ -32,6 +32,26 @@ def clear() -> None:
     _current.set(None)
 
 
+def sampling_for(step: str | None) -> dict | None:
+    """Sampling overrides for a treated ablation step, else ``None``. When the
+    current run is a variant and `step` is its target kind, return the treatment's
+    `temperature` (if set) — a positive temperature makes each replicate an
+    INDEPENDENT draw (fresh sampling per call), which is what raises certainty.
+
+    NOTE: we deliberately do NOT put `seed` on the wire. OpenRouter is called with
+    ``provider.require_parameters=True`` (needed so json_schema is honored), which
+    also demands the chosen provider support EVERY param sent — and `seed` is
+    unsupported by most open-model providers (qwen/gemma), so sending it 404s the
+    whole call ("no endpoints found that support your parameters"). `temperature`
+    is universally supported, so it's safe. The treatment's `seed` still drives the
+    server-side scene shuffle (that never touches the provider)."""
+    rt = _current.get()
+    if rt is None or not step or step != rt.target_step_kind:
+        return None
+    temp = getattr(rt.treatment, "temperature", None)
+    return {"temperature": float(temp)} if temp is not None else None
+
+
 class AblationComplete(BaseException):
     """Raised the instant an ablation variant re-infers its treated step, to
     unwind the pipeline and skip ALL downstream work — next_object, object_bbox,

@@ -48,7 +48,20 @@ from typing import Any
 #      system's version gate: older results predate the per-object split, so they go
 #      stale and a recompute resolves them (the version is also part of the GPU
 #      dedup `req_token`, so recompute actually re-derives instead of reusing).
-ANALYSIS_VERSION = 7
+#   8: the VERY_IMPORTANT_INSTRUCTIONS prompt section is sub-segmented into
+#      per-SENTENCE regions (prompt.VERY_IMPORTANT_INSTRUCTIONS#NN, split on
+#      sentence-ending punctuation . ! ? — commas/semicolons do NOT split) so the
+#      buckets region view resolves attention onto INDIVIDUAL instructions, not the
+#      whole block. Changes the region partition, so every step is stale until
+#      recomputed (targeted via the /tf "compute sample" path). The client compiles
+#      these leaves into whole sentences, so finer legacy splits still read as one.
+# NOTE: the per-attribute token-ROLE split (`attr_role` in buckets, powering the
+# structure-vs-content graph) is intentionally ADDITIVE — it is emitted on every
+# fresh compute, and its ABSENCE on older results is tolerated by the frontend, so
+# it deliberately does NOT bump this gate. No forced global recompute: the L/G→L
+# baseline and every existing analysis stay reusable; recompute a step only when
+# you want its `attr_role` populated (e.g. the new coord variants, computed fresh).
+ANALYSIS_VERSION = 8
 
 # Version of the region/type/progression aggregate view (`AnalysisResult.buckets`).
 # Recorded in `meta.agg_version` and folded into the compute-request identity
@@ -68,7 +81,14 @@ ANALYSIS_VERSION = 7
 #      tag kinds (wider type grid); refreshes the compute-request identity.
 #   5: generation-progression bucket resolution raised (48 → 128) so the "per feature"
 #      view can infer each output item's region mix from the finer token buckets.
-AGG_VERSION = 5
+#   6: VERY_IMPORTANT_INSTRUCTIONS split into per-SENTENCE sub-tags (prompt.<TAG>#NN,
+#      each carrying a `snippet` of its text) — a finer organized-section partition;
+#      refreshes the compute-request identity so the region grid re-derives.
+# NOTE: `attr_role` (per-attribute context/frame/content segments) is added to the
+# buckets grid ADDITIVELY — present on fresh computes, absent-tolerated on old ones
+# — so it deliberately does NOT bump this gate (avoids invalidating every stored
+# analysis / forcing a recompute of the reusable baseline).
+AGG_VERSION = 6
 
 # TARGETED version for the to-place attention readout (bbox-batch steps only).
 # Bumping this re-computes ONLY steps that carry a to-place batch (their stored
@@ -131,6 +151,11 @@ class GenerationTrace:
     # from tf-export. Powers the aggregation-expansion "Variables" region category
     # (scene context / to-place / other large context blocks). Empty on older exports.
     variables_map: list[dict[str, Any]] = field(default_factory=list)
+    # XML-gravity ablation: the treated step's instruction-block SENTENCES (+
+    # snippets) + the moved neutral <prompt> open/close tag spans (char offsets in
+    # `full_text`), rebased from tf-export's logged `__GRAVITY__` map. Empty on
+    # every non-gravity step. Powers the per-sentence tag-distance-vs-attention readout.
+    gravity: dict[str, Any] = field(default_factory=dict)
     # Optional remote generation trace for validation / alignment.
     remote_logprobs: dict[str, Any] | None = None
     meta: dict[str, Any] = field(default_factory=dict)

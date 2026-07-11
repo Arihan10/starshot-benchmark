@@ -12,7 +12,6 @@ import { currentTokenHeads } from "./render.js";
 import { computeStep } from "./attnQueue.js";
 import { renderPlacement } from "./placement.js";
 import { longestComputedRun } from "./presentCtx.js";
-import * as report from "./report.js";
 
 // Fills #tf-attn-panel: a compact section head (status + recompute) then the
 // body, resolved deterministically from the step's status (never stuck on a
@@ -75,7 +74,6 @@ export function renderAttention() {
 	// (cleared when we're not showing a map).
 	if (displayed) applyAttnHighlight();
 	else state.viewer?.clearAttnHighlight?.();
-	if (state.reportView) { state.reportSelections.token = state.attnToken; state.reportSelections.head = state.attnHead; report.saveReportState(); report.renderReportWorkspace(); }
 	renderPlacement(); // and the placement tab (bbox steps)
 }
 

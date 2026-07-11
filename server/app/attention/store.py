@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -157,30 +158,170 @@ def _meta_flags(path: Path) -> dict[str, Any]:
     return flags
 
 
+# --- per-cell status manifest -----------------------------------------------
+#
+# `attention/index.json` mirrors the mtime-stable freshness flags of every stored
+# `<ev>.json` so the status poll serves fresh/stale from ONE small read instead of
+# globbing the dir and stat/head-reading each analysis on every call (the O(#steps)
+# per-poll cost, multiplied across cells by the ablation views). It persists across
+# restarts and is the single status source P4's ablation aggregate reads.
+#
+# It is a CACHE, kept correct by two rules: (1) every in-process writer
+# (`save_dict` / `delete`) updates it, and (2) `list_status` trusts it only when its
+# key set matches the `<ev>.json` files on disk (one dir scan, names only) — any
+# add/remove (incl. external scripts, or a lost concurrent update) forces a
+# reconcile that reads flags for just the new files. `_meta_flags` still backs the
+# reconcile, so a missing/old manifest degrades to exactly the previous behavior.
+MANIFEST_VERSION = 1
+_MANIFEST_NAME = "index.json"
+_manifest_locks: dict[str, threading.Lock] = {}
+_manifest_locks_guard = threading.Lock()
+
+
+def _manifest_path(cell_dir: Path) -> Path:
+    return cell_dir / "attention" / _MANIFEST_NAME
+
+
+def _manifest_lock(cell_dir: Path) -> threading.Lock:
+    key = str(cell_dir)
+    with _manifest_locks_guard:
+        lk = _manifest_locks.get(key)
+        if lk is None:
+            lk = threading.Lock()
+            _manifest_locks[key] = lk
+        return lk
+
+
+def _flags_from_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """The mtime-stable freshness flags, from an in-hand result `meta` (no re-read).
+    Same keys/shape as `_meta_flags`, so the two are interchangeable in the manifest."""
+    v = meta.get("analysis_version")
+    mh = meta.get("max_heads")
+    return {
+        "mock": bool(meta.get("mock")),
+        "version": v if isinstance(v, int) else None,
+        "template": meta.get("template"),
+        "to_place_version": meta.get("to_place_version"),
+        "to_place_present": meta.get("to_place_present"),
+        "max_heads": mh if isinstance(mh, int) else None,
+    }
+
+
+def _read_manifest(cell_dir: Path) -> dict[str, Any] | None:
+    """The manifest's per-ev flags map (`{ "<ev>": flags }`), or None when absent /
+    unreadable / a different MANIFEST_VERSION (treated as no manifest -> rebuild)."""
+    try:
+        raw = json.loads(_manifest_path(cell_dir).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict) or raw.get("v") != MANIFEST_VERSION:
+        return None
+    steps = raw.get("steps")
+    return steps if isinstance(steps, dict) else None
+
+
+def _write_manifest(cell_dir: Path, steps: dict[str, Any]) -> None:
+    path = _manifest_path(cell_dir)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".index.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"v": MANIFEST_VERSION, "steps": steps}), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # best-effort cache; list_status reconciles from disk if it's stale/missing
+
+
+def _manifest_set(cell_dir: Path, event_index: int, flags: dict[str, Any]) -> None:
+    with _manifest_lock(cell_dir):
+        steps = _read_manifest(cell_dir) or {}
+        steps[str(event_index)] = flags
+        _write_manifest(cell_dir, steps)
+
+
+def _manifest_drop(cell_dir: Path, event_index: int) -> None:
+    with _manifest_lock(cell_dir):
+        steps = _read_manifest(cell_dir)
+        if steps is not None and steps.pop(str(event_index), None) is not None:
+            _write_manifest(cell_dir, steps)
+
+
+def _evs_on_disk(attn_dir: Path) -> set[int]:
+    """The event indices with a stored `<ev>.json` — names only (one dir scan, no
+    per-file stat). Skips the manifest + temp files (non-int stems)."""
+    evs: set[int] = set()
+    try:
+        with os.scandir(attn_dir) as it:
+            for entry in it:
+                name = entry.name
+                if not name.endswith(".json"):
+                    continue
+                try:
+                    evs.add(int(name[:-5]))
+                except ValueError:
+                    continue  # index.json / *.full.json / other non-analysis files
+    except OSError:
+        pass
+    return evs
+
+
+def _cell_flags(cell_dir: Path) -> dict[str, Any]:
+    """Per-ev freshness flags for the cell. Served from the manifest when its key
+    set matches the `<ev>.json` files on disk; otherwise reconciled (flags read only
+    for files new to the manifest) and the manifest rewritten. Falls back to the
+    full per-file scan when there's no manifest yet."""
+    attn_dir = cell_dir / "attention"
+    disk = _evs_on_disk(attn_dir)
+    if not disk:
+        return {}
+    manifest = _read_manifest(cell_dir)
+    if manifest is not None:
+        man_evs: set[int] = set()
+        for k in manifest:
+            try:
+                man_evs.add(int(k))
+            except (TypeError, ValueError):
+                continue
+        if man_evs == disk:
+            return manifest  # trusted: same file set (in-process writers keep flags current)
+    # Reconcile: keep known entries, read flags for files new to the manifest, drop
+    # vanished ones. Only genuinely new results are read off disk.
+    manifest = manifest or {}
+    out: dict[str, Any] = {}
+    for ev in disk:
+        key = str(ev)
+        out[key] = manifest.get(key) or _meta_flags(analysis_path(cell_dir, ev))
+    with _manifest_lock(cell_dir):
+        _write_manifest(cell_dir, out)
+    return out
+
+
+def _classify_fresh(f: dict[str, Any], min_heads: int) -> bool:
+    ok = (not f.get("mock")) and f.get("version") == ANALYSIS_VERSION and not _needs_to_place_recompute(f)
+    if ok and min_heads:
+        stored = f.get("max_heads")
+        stored = 4 if stored is None else stored  # legacy results held top-4
+        if stored < min_heads:
+            ok = False
+    return ok
+
+
 def list_status(cell_dir: Path, *, min_heads: int = 0) -> dict[str, list[int]]:
     """Partition stored analyses into `fresh` (REAL + current analysis version, and
     — for to-place-bearing steps — current TO_PLACE_VERSION) and `stale` (mock, an
     older version, or a bbox-batch step missing the current to-place readout).
     When `min_heads` > 0, results computed with fewer instrumented heads count as
-    stale so raising the UI head budget shows them as needing recompute."""
-    d = cell_dir / "attention"
-    if not d.is_dir():
-        return {"fresh": [], "stale": []}
+    stale so raising the UI head budget shows them as needing recompute.
+
+    Reads the per-cell manifest (see above) rather than stat/head-scanning every
+    file each call; the classification is unchanged from the per-file flags."""
     fresh: list[int] = []
     stale: list[int] = []
-    for p in d.glob("*.json"):
+    for key, f in _cell_flags(cell_dir).items():
         try:
-            ev = int(p.stem)
-        except ValueError:
+            ev = int(key)
+        except (TypeError, ValueError):
             continue
-        f = _meta_flags(p)
-        ok = (not f["mock"]) and f["version"] == ANALYSIS_VERSION and not _needs_to_place_recompute(f)
-        if min_heads:
-            stored = f.get("max_heads")
-            stored = 4 if stored is None else stored  # legacy results held top-4
-            if stored < min_heads:
-                ok = False
-        (fresh if ok else stale).append(ev)
+        (fresh if _classify_fresh(f, min_heads) else stale).append(ev)
     return {"fresh": sorted(fresh), "stale": sorted(stale)}
 
 
@@ -209,6 +350,8 @@ def save_dict(cell_dir: Path, event_index: int, data: dict[str, Any]) -> Path:
     finally:
         tmp.unlink(missing_ok=True)  # no-op after a successful replace
     _META_CACHE.pop(str(path), None)  # force a fresh mock/version read next status poll
+    meta = data.get("meta")
+    _manifest_set(cell_dir, event_index, _flags_from_meta(meta if isinstance(meta, dict) else {}))
     return path
 
 
@@ -232,3 +375,4 @@ def delete(cell_dir: Path, event_index: int) -> None:
     except OSError:
         pass
     _META_CACHE.pop(str(path), None)
+    _manifest_drop(cell_dir, event_index)

@@ -300,7 +300,9 @@ def _bucketize(mat: np.ndarray, out_q: int, max_buckets: int) -> tuple[list[list
 
 
 def _assemble_buckets(whole: dict[str, Any] | None, out_q: int,
-                      region_tokens: list[int], type_tokens: list[int], n_tokens: int) -> dict[str, Any]:
+                      region_tokens: list[int], type_tokens: list[int], n_tokens: int,
+                      attr_role_tokens: list[int] | None = None,
+                      gravity_tokens: list[int] | None = None) -> dict[str, Any]:
     """The unified aggregation-expansion view. Head-average each per-(head, query)
     whole-row group in `whole["groups"]` and compress it along generation
     progression into buckets (reasoning/output split respected). Emits the region
@@ -334,6 +336,13 @@ def _assemble_buckets(whole: dict[str, Any] | None, out_q: int,
         "type_names": list(names.get("type", [])), "type": _grid("type"),
         "type_organized": _grid("type_organized"), "type_free": _grid("type_free"),
         "type_tokens": list(type_tokens),
+        # Per-attribute context/frame/content structure-vs-content readout.
+        "attr_role_names": list(names.get("attr_role", [])), "attr_role": _grid("attr_role"),
+        "attr_role_tokens": list(attr_role_tokens or []),
+        # XML-gravity: per-quarter attention over generation progression (the tag
+        # positions ride in meta.gravity). Additive — absent on non-gravity steps.
+        "gravity_names": list(names.get("gravity", [])), "gravity": _grid("gravity"),
+        "gravity_tokens": list(gravity_tokens or []),
     }
 
 
@@ -400,7 +409,7 @@ def analyze(
     replay. When `max_query_tokens` is 0 (default), every completion token is
     scored. A positive cap evenly subsamples very long reasoning regions so the
     (O(N) per query, per head) reduction stays responsive."""
-    tok = tokenizer or semantic.get_tokenizer(trace.model_id, prefer_real=False)
+    tok = tokenizer or semantic.get_tokenizer(trace.model_id)
     offsets = tok.encode_with_offsets(trace.full_text)
     scene_idx = semantic.build_scene_entities(trace.scene_map, offsets)
     scene_cols = np.array(sorted(scene_idx.scene_tokens), dtype=np.int64)
@@ -459,6 +468,35 @@ def analyze(
     }
     region_tokens = [len(s) for s in region_seg]
     type_tokens = [len(s) for s in type_seg]
+    # Per-attribute token ROLES (context / frame / content) → whole-row segments, so
+    # the SAME generic group reduction (GPU + fallback) yields structure-vs-content
+    # attention per attribute, MARGINAL over entities. One segment per (component,
+    # role) present in the scene (+ to-place entities folded in). Names are
+    # "<component>|<role>"; the frontend divides each segment's summed mass by its
+    # token count (shipped as attr_role_tokens) for the length-normalized density.
+    _role_union: dict[str, set[int]] = {}
+    for _ridx in (scene_idx, tp_idx):
+        if _ridx is None:
+            continue
+        for _rec in _ridx.entities.values():
+            for _cname, _rr in (_rec.get("roles") or {}).items():
+                for _role, _rtoks in _rr.items():
+                    _role_union.setdefault(f"{_cname}|{_role}", set()).update(_rtoks)
+    attr_role_names = list(_role_union.keys())
+    attr_role_seg = [sorted(_role_union[k]) for k in attr_role_names]
+    attr_role_tokens = [len(s) for s in attr_role_seg]
+    if attr_role_seg:
+        whole_plan["groups"]["attr_role"] = attr_role_seg
+        whole_plan["names"]["attr_role"] = attr_role_names
+    # XML-gravity: the treated instruction block's word-count QUARTERS as segments,
+    # reduced by the SAME whole-row primitive so the frontend gets per-quarter
+    # attention; `grav_meta` carries the quarter/tag TOKEN positions for the
+    # tag-distance readout. Present only on a gravity variant's treated step.
+    grav_names, grav_segs, grav_meta = semantic.gravity_segments(getattr(trace, "gravity", None), offsets)
+    gravity_tokens = [len(s) for s in grav_segs]
+    if grav_segs:
+        whole_plan["groups"]["gravity"] = grav_segs
+        whole_plan["names"]["gravity"] = grav_names
 
     prov = provider or MockAttentionProvider(len(offsets), scene_idx.scene_tokens)
     buckets: dict[str, Any] = {}
@@ -495,7 +533,7 @@ def analyze(
                 }
             by_group, whole = prov.head_token_stats(
                 selected, np.array(query_indices, dtype=np.int64), plans, whole_plan=whole_plan)
-            buckets = _assemble_buckets(whole, out_q, region_tokens, type_tokens, len(offsets))
+            buckets = _assemble_buckets(whole, out_q, region_tokens, type_tokens, len(offsets), attr_role_tokens, gravity_tokens)
             sc_scale, sc_ratio, sc_ent, sc_comp = by_group["scene"]
             scene_g = {"scale": sc_scale, "ratio": sc_ratio,
                        "grp": _prep_group_from_scores(scene_mem, sc_ent, sc_comp, top_k)}
@@ -563,7 +601,7 @@ def analyze(
                 index=i, char=[tok_s, tok_e], text=offsets[i][0], output_entity=out_entity, heads=heads,
             ))
         whole = {"groups": whole_acc, "names": whole_plan["names"], "region_meta": region_meta}
-        buckets = _assemble_buckets(whole, out_q, region_tokens, type_tokens, len(offsets))
+        buckets = _assemble_buckets(whole, out_q, region_tokens, type_tokens, len(offsets), attr_role_tokens, gravity_tokens)
 
     return AnalysisResult(
         # Trace/run context + export assumptions ride along FIRST, so the worker-
@@ -601,6 +639,9 @@ def analyze(
             "agg_version": AGG_VERSION,
             "n_regions": len(region_names),
             "n_type_classes": len(type_names),
+            # XML-gravity: quarter/tag TOKEN positions for the tag-distance readout
+            # (empty {} on non-gravity steps). Additive — does not gate freshness.
+            "gravity": grav_meta,
             # Axes for the across-heads / across-depths grid.
             "n_heads": prov.num_heads(),
             "global_layers": list(prov.global_attention_layers()),

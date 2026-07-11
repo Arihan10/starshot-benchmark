@@ -10,8 +10,6 @@ import { escapeHtml } from "./util.js";
 import { jumpTo, renderExport } from "./exportPanel.js";
 import { renderAttention, applyAttnHighlight } from "./attnPanel.js";
 import { updateBatchProgress } from "./attnQueue.js";
-import { updateReportCtx } from "./tabs.js";
-import * as report from "./report.js";
 
 // --- timeline (step nav + per-step compute status, merged) -------------------
 
@@ -100,8 +98,6 @@ export function gotoStep(k) {
 	renderScene(step);
 	renderPipeline();
 	renderExportForStep(step, token);
-	updateReportCtx();
-	if (state.reportView) { report.saveReportState(); report.renderReportWorkspace(); }
 }
 
 export function renderScene(step) {

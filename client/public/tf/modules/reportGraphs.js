@@ -155,42 +155,25 @@ function comparePeerHeads(ctx, title = "selected head/layer attention") {
 
 // ---- ablation research-question graphs ------------------------------------
 
-// "XML existence": for each step KIND in the selection, the attention split
-// across ATTRIBUTES with prompt XML kept (✓) vs stripped (✗) — two overlaid
-// profiles per kind (spider = normalized shape, matrix = raw mean ± sd), reusing
-// the attribute-compare machinery. `treatByKey`: peer key → { method, xml, kind }.
-function ablationXmlSplit(cmp, treatByKey) {
-	const { overviewAggregate, reportCard, reportEmpty, el, showErr } = d();
+// ONE "XML existence" card: the attention split across ATTRIBUTES with prompt XML
+// kept (✓) vs stripped (✗) — two overlaid profiles (spider = normalized shape,
+// matrix = raw mean ± sd). `onRows` / `offRows` are the pooled computed rows for
+// each XML state. report.js orchestrates: an "all kinds" card first, then one
+// SELECTED step kind (rather than laying every kind out).
+function xmlSplitCard(title, sub, onRows, offRows) {
+	const { overviewAggregate, reportCard, reportEmpty, showErr } = d();
 	const errOn = !showErr || showErr();
 	const profileFrom = (rows, label, color) => {
 		const totals = overviewAggregate(rows).componentTotals;
-		return {
-			label, color, n: rows.length,
-			map: new Map(totals.map((c) => [c.component, c.score])),
-			err: new Map(totals.map((c) => [c.component, c.sd || 0])),
-		};
+		return { label, color, map: new Map(totals.map((c) => [c.component, c.score])), err: new Map(totals.map((c) => [c.component, c.sd || 0])) };
 	};
-	const byKind = new Map();
-	for (const p of cmp.peers) {
-		const t = treatByKey.get(String(p.key));
-		if (!t) continue; // the base run carries no treatment — skip it here
-		const kind = t.kind || (p.rows[0] && p.rows[0].template) || "?";
-		if (!byKind.has(kind)) byKind.set(kind, { on: [], off: [] });
-		const b = byKind.get(kind);
-		for (const r of p.rows) (t.xml ? b.on : b.off).push(r);
-	}
-	if (!byKind.size) return reportCard("XML existence", "no treatments on the selected variants", reportEmpty("select variants (xml on / off) for a step kind on the left"));
-	const cards = [...byKind.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([kind, { on, off }]) => {
-		const profiles = [];
-		if (on.length) profiles.push(profileFrom(on, "xml \u2713", "#6bd96e"));
-		if (off.length) profiles.push(profileFrom(off, "xml \u2717", "#ff6b9d"));
-		if (!profiles.length) return null;
-		const comps = pickAxes(profiles.flatMap((pr) => [...pr.map.entries()]));
-		const max = axisMax(profiles.flatMap((pr) => comps.map((c) => ({ v: pr.map.get(c) || 0, e: pr.err.get(c) || 0 }))), (x) => x.v, (x) => x.e, errOn);
-		const sub = `${on.length} step${on.length === 1 ? "" : "s"} xml\u2713 · ${off.length} xml\u2717 · attention split across attributes`;
-		return reportCard(`${kind} \u2014 attribute split by XML`, sub, spiderChart(profiles), comps.length ? peerMatrix(profiles, comps, max, "xml") : null);
-	}).filter(Boolean);
-	return el("div", { class: "abl-q-cards" }, ...cards);
+	const profiles = [];
+	if (onRows.length) profiles.push(profileFrom(onRows, "xml \u2713", "#6bd96e"));
+	if (offRows.length) profiles.push(profileFrom(offRows, "xml \u2717", "#ff6b9d"));
+	if (!profiles.length) return reportCard(title, sub, reportEmpty("no computed variants for this selection"));
+	const comps = pickAxes(profiles.flatMap((pr) => [...pr.map.entries()]));
+	const max = axisMax(profiles.flatMap((pr) => comps.map((c) => ({ v: pr.map.get(c) || 0, e: pr.err.get(c) || 0 }))), (x) => x.v, (x) => x.e, errOn);
+	return reportCard(title, sub, spiderChart(profiles), comps.length ? peerMatrix(profiles, comps, max, "xml") : null);
 }
 
 // "Scene ordering" scatter: x = an object's position in the (shuffled) scene
@@ -209,8 +192,145 @@ function ablationOrderCard(title, sub, rawPoints, meanPoints, opts = {}) {
 	const corr = rawPoints.length >= 3 ? `\u03c1=${tr.rho.toFixed(2)} ${arrow} p=${tr.p < 0.001 ? "<0.001" : tr.p.toFixed(3)}` : null;
 	const chart = scatterChart(pts, {
 		xLabel: "position in context  (0 = first \u2192 1 = last)",
-		yFmt: opts.yFmt || ((v) => (Math.abs(v) >= 1 ? v.toFixed(2) : v.toFixed(3))),
-		xMax: 1, corrLabel: corr, legend: opts.legend, height: 150,
+		yFmt: opts.yFmt || ((v) => (Math.abs(v) >= 1 ? v.toFixed(v >= 100 ? 0 : 1) : v.toFixed(3))),
+		xMax: 1, corrLabel: corr, legend: opts.legend, height: 230, logY: opts.logY,
+	});
+	return reportCard(title, sub, chart);
+}
+
+// Companion to ablationOrderCard: how the position→attention correlation holds up
+// as you FOCUS on the objects that matter. x = focus threshold (min attention
+// share), y = Spearman ρ(position, attention) over the objects kept at that
+// threshold — one line per shuffle method. A flat line near 0 ⇒ ordering doesn't
+// bias attention; a line that dives negative as focus rises ⇒ the FEW objects that
+// matter are the early ones. y is fixed to [-1, 1] with a zero baseline (ρ is
+// signed, which svgFrame/lineChart don't do). series: [{ method, color,
+// points:[{x, y, n}] }].
+function rhoCurveCard(title, sub, series, opts = {}) {
+	const { reportCard, reportEmpty, el } = d();
+	const withPts = (series || []).filter((s) => (s.points || []).length);
+	if (!withPts.length) return reportCard(title, sub, reportEmpty(opts.empty || "not enough objects to correlate — widen the scope or lower the focus"));
+	const W = 960, H = 250, padL = 46, padR = 14, padT = 12, padB = 34;
+	// x = focus threshold. Linear by default; LOG (opts.logX) spreads the crowded
+	// small values, with the x=0 ("all objects") point parked in its own left slot
+	// since log(0) is undefined.
+	const logX = !!opts.logX;
+	const allX = withPts.flatMap((s) => s.points.map((p) => p.x));
+	const xMax = Math.max(...allX, 0.005);
+	const posX = allX.filter((x) => x > 0);
+	const minPos = posX.length ? Math.min(...posX) : 0.0005;
+	const lgLo = Math.log10(minPos), lgHi = Math.log10(xMax), lgSpan = (lgHi - lgLo) || 1;
+	const lgAll = lgLo - lgSpan * 0.08; // where x=0 sits on a log axis
+	const tx = (x) => logX ? (x > 0 ? Math.log10(x) : lgAll) : x;
+	const tMin = logX ? lgAll : 0, tMax = logX ? lgHi : xMax;
+	const X = (x) => padL + ((tx(x) - tMin) / ((tMax - tMin) || 1)) * (W - padL - padR);
+	const yMin = opts.yMin ?? -0.5;
+	const yMax = opts.yMax ?? 0.5;
+
+	const Y = (y) =>
+	padT +
+	((yMax - Math.max(yMin, Math.min(yMax, y))) / (yMax - yMin)) *
+		(H - padT - padB);
+	const pct = (v) => `${(v * 100).toFixed(v > 0 && v < 0.02 ? 2 : 1)}%`;
+	const svg = svgEl("svg", { class: "gsvg", viewBox: `0 0 ${W} ${H}`, style: "width:100%;height:auto;display:block;overflow:visible" });
+	for (const gy of [-0.5, 0.25, 0, 0.25, 0.5]) {
+		const yy = Y(gy);
+		svg.appendChild(svgEl("line", { x1: padL, y1: yy.toFixed(1), x2: W - padR, y2: yy.toFixed(1), stroke: gy === 0 ? "rgba(255,255,255,0.24)" : "rgba(255,255,255,0.06)" }));
+		svg.appendChild(svgEl("text", { x: padL - 6, y: yy.toFixed(1), fill: "rgba(220,230,245,0.5)", "font-size": 10, "text-anchor": "end", "dominant-baseline": "middle" }, gy.toFixed(1)));
+	}
+	const xticks = [];
+	if (logX) {
+		xticks.push({ x: 0, label: "all" });
+		for (let k = Math.floor(lgLo); k <= Math.ceil(lgHi); k++) for (const m of [1, 2, 5]) {
+			const v = m * Math.pow(10, k);
+			if (v >= minPos * 0.999 && v <= xMax * 1.001) xticks.push({ x: v, label: pct(v) });
+		}
+	} else {
+		for (let i = 0; i <= 4; i++) xticks.push({ x: (i / 4) * xMax, label: pct((i / 4) * xMax) });
+	}
+	for (const t of xticks) {
+		const xx = X(t.x);
+		svg.appendChild(svgEl("line", { x1: xx.toFixed(1), y1: padT, x2: xx.toFixed(1), y2: (H - padB).toFixed(1), stroke: "rgba(255,255,255,0.05)" }));
+		svg.appendChild(svgEl("text", { x: xx.toFixed(1), y: H - padB + 14, fill: "rgba(220,230,245,0.5)", "font-size": 10, "text-anchor": "middle" }, t.label));
+	}
+	svg.appendChild(svgEl("text", { x: ((padL + W - padR) / 2).toFixed(1), y: H - 4, fill: "rgba(220,230,245,0.82)", "font-size": 11, "text-anchor": "middle" }, (opts.xLabel || "focus  (min attention share)") + (logX ? "  · log" : "")));
+	const my = ((padT + (H - padB)) / 2).toFixed(1);
+	svg.appendChild(svgEl("text", { x: 12, y: my, fill: "rgba(220,230,245,0.82)", "font-size": 11, "text-anchor": "middle", transform: `rotate(-90 12 ${my})` }, "Spearman \u03c1 (position \u00b7 attention)"));
+	// mark where the scatter's currently-selected focus sits on the curve
+	if (opts.markX != null && opts.markX > 0 && opts.markX <= xMax) {
+		const mx = X(opts.markX);
+		svg.appendChild(svgEl("line", { x1: mx.toFixed(1), y1: padT, x2: mx.toFixed(1), y2: (H - padB).toFixed(1), stroke: "rgba(232,193,74,0.6)", "stroke-dasharray": "3 3" }));
+		svg.appendChild(svgEl("text", { x: mx.toFixed(1), y: padT + 9, fill: "rgba(232,193,74,0.9)", "font-size": 9.5, "text-anchor": "middle" }, "focus"));
+	}
+	for (const s of withPts) {
+		const pts = [...s.points].sort((a, b) => a.x - b.x);
+		let dd = "";
+		pts.forEach((p, i) => { dd += (i ? "L" : "M") + X(p.x).toFixed(2) + "," + Y(p.y).toFixed(2) + " "; });
+		svg.appendChild(svgEl("path", { d: dd.trim(), fill: "none", stroke: s.color, "stroke-width": 1.8, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+		for (const p of pts) {
+			const dot = svgEl("circle", { cx: X(p.x).toFixed(2), cy: Y(p.y).toFixed(2), r: 2.8, fill: s.color });
+			dot.appendChild(svgEl("title", null, `${s.method} · focus ≥${(p.x * 100).toFixed(2)}% · ρ=${p.y.toFixed(2)} · n=${p.n}`));
+			svg.appendChild(dot);
+		}
+	}
+	const wrap = el("div", { class: "gwrap" }, svg);
+	wrap.appendChild(chartLegend(withPts.map((s) => ({ label: s.method, color: s.color }))));
+	return reportCard(title, sub, wrap);
+}
+
+// "Spatial relevance" JOINTPLOT: x = an object's distance-to-target RANK (1 =
+// closest), y = its ray-trace visibility RANK (1 = most visible). Points are
+// grouped into ATTENTION TIERS (high / mid / low, by tercile) and colored
+// categorically, with marginal distributions on the top (x) + right (y). The
+// question reads straight off the marginals: if the HIGH-attention tier's top
+// marginal skews to low distance rank (and its right marginal to low visibility
+// rank), the model attends to what's close + visible. Spearman ρ (attention vs
+// each rank, NEGATIVE = attends closer / more visible) rides in the corner.
+// `rawPoints`: [{ x, y, attn, label }].
+// Joint scatter of distance-rank (x) vs visibility-rank (y). Each point is one
+// (variant, object): COLOR = its type (scene-order / step-kind / xml — cats come
+// in via opts), SIZE = its attention (bigger circle ⇒ more attention). Marginals
+// show how each type is distributed over closeness / visibility.
+// Rendering one SVG <circle> per point freezes/crashes the DOM when there are
+// thousands (variants × objects × replicates), and `Math.max(...hugeArray)`
+// overflows the call stack. Cap the RENDERED dots (stats are still computed on
+// the full set) via a deterministic stride, so the sample is uniform and stable
+// across the report's frequent re-renders (no flicker).
+const MAX_SCATTER_POINTS = 3000;
+function downsamplePoints(arr, max = MAX_SCATTER_POINTS) {
+	if (arr.length <= max) return arr;
+	const stride = arr.length / max, out = [];
+	for (let i = 0; out.length < max && i < arr.length; i += stride) out.push(arr[Math.floor(i)]);
+	return out;
+}
+
+function spatialScatterCard(title, sub, rawPoints, opts = {}) {
+	const { reportCard, reportEmpty } = d();
+	if (!rawPoints.length) return reportCard(title, sub, reportEmpty(opts.empty || "no positioned objects with attention yet"));
+	// reduce, NOT Math.max(...spread): the set can be tens of thousands of points
+	// and a spread that large blows the call stack (a crash source here).
+	let maxA = 1e-9, maxRank = 1;
+	for (const p of rawPoints) { const a = p.attn || 0; if (a > maxA) maxA = a; if (p.x > maxRank) maxRank = p.x; if (p.y > maxRank) maxRank = p.y; }
+	// Correlation is over ALL points; only the rendered dots are capped.
+	const rd = spearman(rawPoints.map((p) => p.attn), rawPoints.map((p) => p.x));
+	const rv = spearman(rawPoints.map((p) => p.attn), rawPoints.map((p) => p.y));
+	const corr = rawPoints.length >= 3 ? `attn·dist \u03c1=${rd.toFixed(2)} · attn·vis \u03c1=${rv.toFixed(2)}` : null;
+	// attention drives BOTH size and opacity: area-proportional radius (sqrt, so a
+	// 4× busier object reads ~2× wider) and alpha ramped from 0.5 → 1.0 so heavier
+	// objects read as more solid without hiding the low-attention tail.
+	const shown = downsamplePoints(rawPoints);
+	const pts = shown.map((p) => {
+		const f = Math.sqrt(Math.max(0, p.attn || 0) / maxA);
+		return { x: p.x, y: p.y, cat: p.cat, label: p.label, r: 2.6 + 6.4 * f, o: 0.5 + 0.5 * f };
+	});
+	const sizeLabel = shown.length < rawPoints.length
+		? `○ size + opacity = attention · showing ${shown.length.toLocaleString()} of ${rawPoints.length.toLocaleString()} pts`
+		: "○ size + opacity = attention";
+	const chart = jointScatter(pts, {
+		cats: opts.cats, xMax: maxRank, yMax: maxRank, corrLabel: corr, sizeLabel,
+		xLabel: "distance-to-target rank  (1 = closest \u2192)",
+		yLabel: "ray-visibility rank  (1 = most visible)",
+		xFmt: (v) => String(Math.round(v)), yFmt: (v) => String(Math.round(v)),
 	});
 	return reportCard(title, sub, chart);
 }
@@ -306,15 +426,24 @@ function attachAxisTooltip(canvas, spots, ABBR) {
 // never changes when you add peers or flip error bars, and each polygon simply
 // lays on top of the others, self-scaled to its own peak.
 function spiderNormalize(profiles, components) {
-	return profiles.map((p) => {
+	// SUM (L1) normalization, not peak-to-peak: each attribute is its SHARE of the
+	// profile's total attention (value / Σ over all attributes) — "how much does
+	// this field attend relative to the sum". So the shape is a proportion
+	// distribution, comparable across profiles regardless of magnitude. A single
+	// SHARED display scale (the largest share across every profile) maps to the
+	// ring edge, so the shares stay directly comparable AND use the ring — never a
+	// per-profile peak rescale that would flatten differences in magnitude.
+	const props = profiles.map((p) => {
 		const rawVals = components.map((c) => Math.max(0, p.map.get(c) || 0));
 		const rawErrs = components.map((c) => (p.err ? Math.max(0, p.err.get(c) || 0) : 0));
-		const denom = Math.max(1e-9, ...rawVals);
-		return {
-			vals: rawVals.map((v) => v / denom),
-			errs: rawErrs.map((e) => e / denom),
-		};
+		const sum = rawVals.reduce((a, b) => a + b, 0) || 1;
+		return { vals: rawVals.map((v) => v / sum), errs: rawErrs.map((e) => e / sum) };
 	});
+	const scale = Math.max(1e-9, ...props.flatMap((p) => p.vals));
+	return props.map((p) => ({
+		vals: p.vals.map((v) => v / scale),
+		errs: p.errs.map((e) => e / scale),
+	}));
 }
 
 function spiderChart(profiles) {
@@ -328,10 +457,10 @@ function spiderChart(profiles) {
 	// nothing present in the data is silently dropped.
 	const present = new Set(profiles.flatMap((p) => [...p.map.keys()]));
 	const components = [...ATTR_AXIS_ORDER, ...[...present].filter((c) => !ATTR_AXIS_ORDER.includes(c))];
-	// Per-vertex coordinates in [0..1], each profile scaled as the ratio of every
-	// attribute to its own most-attended attribute (see spiderNormalize). One
-	// profile or several, the rule is identical — so an overlaid comparison reads
-	// as SHAPE and matches the single-item view exactly.
+	// Per-vertex coordinates in [0..1]: each profile is normalized to its attribute
+	// SHARES (value / its own sum), then a shared scale maps the largest share to
+	// the ring (see spiderNormalize). One profile or several, the rule is identical
+	// — an overlaid comparison reads as the SHARE distribution, comparable in shape.
 	const norm = spiderNormalize(profiles, components);
 	const canvas = el("canvas", { class: "attr-radial" });
 	canvas.width = 320; canvas.height = 320;
@@ -558,6 +687,7 @@ function ensureChartCSS() {
 	s.id = "tf-chart-css";
 	s.textContent =
 		".gwrap{position:relative}" +
+		".gwrap.square{max-width:460px;margin:0 auto}" +
 		".gsvg{touch-action:none}" +
 		".gsvg .garea{transition:fill-opacity .12s ease}" +
 		".gsvg .garea:hover{fill-opacity:.98}" +
@@ -573,18 +703,26 @@ function ensureChartCSS() {
 }
 // Shared axis frame as SVG: output shade, y grid + ticks (0..yMax), three x
 // ticks, axis label. Returns the <svg>, coordinate mappers, and plot rectangle.
-function svgFrame(W, H, { padL, padR, padT, padB, xMin, xMax, yMax, yFmt, xFmt, xLabel, shade, xTicks = true, botGutter = 0 }) {
+function svgFrame(W, H, { padL, padR, padT, padB, xMin, xMax, yMax, yFmt, xFmt, xLabel, shade, xTicks = true, botGutter = 0, logY = false }) {
 	ensureChartCSS();
 	const px0 = padL, px1 = W - padR, py0 = padT, py1 = H - padB;
 	const xr = (xMax - xMin) || 1; yMax = yMax || 1;
 	const X = (x) => px0 + ((x - xMin) / xr) * (px1 - px0);
-	const Y = (y) => py1 - (Math.max(0, Math.min(yMax, y)) / yMax) * (py1 - py0);
+	// log-y (log1p) spreads a heavy-tailed magnitude (raw attention sums span 0..1000s)
+	// so most points don't collapse onto the axis. Gridlines stay evenly spaced;
+	// their LABELS carry the (inverse-mapped) data value.
+	const _lg = (v) => Math.log10(1 + Math.max(0, v));
+	const yTop = logY ? (_lg(yMax) || 1) : yMax;
+	const Y = logY
+		? (y) => py1 - (_lg(Math.max(0, Math.min(yMax, y))) / yTop) * (py1 - py0)
+		: (y) => py1 - (Math.max(0, Math.min(yMax, y)) / yMax) * (py1 - py0);
 	const svg = svgEl("svg", { class: "gsvg", viewBox: `0 0 ${W} ${H}`, style: "width:100%;height:auto;display:block;overflow:visible" });
 	if (shade && shade.to > shade.from) svg.appendChild(svgEl("rect", { x: X(shade.from), y: py0, width: Math.max(0, X(shade.to) - X(shade.from)), height: py1 - py0, fill: "rgba(122,79,208,0.14)" }));
 	for (const f of [0, 0.25, 0.5, 0.75, 1]) {
-		const yy = Y(yMax * f);
+		const yy = py1 - f * (py1 - py0);
+		const val = logY ? (Math.pow(10, f * yTop) - 1) : yMax * f;
 		svg.appendChild(svgEl("line", { x1: px0, y1: yy, x2: px1, y2: yy, stroke: "rgba(255,255,255,0.07)" }));
-		svg.appendChild(svgEl("text", { x: px0 - 5, y: yy, fill: "rgba(220,230,245,0.5)", "font-size": 10, "text-anchor": "end", "dominant-baseline": "middle" }, yFmt ? yFmt(yMax * f) : (yMax * f).toFixed(2)));
+		svg.appendChild(svgEl("text", { x: px0 - 5, y: yy, fill: "rgba(220,230,245,0.5)", "font-size": 10, "text-anchor": "end", "dominant-baseline": "middle" }, yFmt ? yFmt(val) : val.toFixed(2)));
 	}
 	// A bottom gutter (e.g. the reasoning token-type strip) pushes ticks + label down.
 	const tickY = py1 + botGutter;
@@ -763,12 +901,19 @@ function lineChart(series, opts = {}) {
 // label. points: { x, y, color?, r? }.
 function scatterChart(points, opts = {}) {
 	const { el, niceMax } = d();
-	const W = 960, H = Math.round((opts.height || 145) * CHART_H), padL = 46, padR = 14, padT = 10, padB = 26;
+	const padL = 46, padR = 14, padT = 10, padB = 26;
+	// `square` gives a square PLOT area (equal visual scale on both axes) — right
+	// when x and y are the same kind of quantity (e.g. two rankings). W/H are
+	// picked so (W-padX) === (H-padY); a max-width on the wrap keeps it compact.
+	const sq = !!opts.square;
+	const W = sq ? 660 : 960;
+	const H = sq ? 636 : Math.round((opts.height || 145) * CHART_H);
 	if (!points.length) return el("div", { class: "hint", text: "no data to plot" });
 	const nice = (v) => (niceMax ? niceMax(v) : v * 1.05);
 	const xMax = opts.xMax != null ? opts.xMax : nice(Math.max(...points.map((p) => p.x), 1e-9));
-	const yMax = opts.yMax != null ? opts.yMax : nice(Math.max(...points.map((p) => p.y), 1e-9));
-	const fr = svgFrame(W, H, { padL, padR, padT, padB, xMin: 0, xMax, yMax, yFmt: opts.yFmt, xFmt: opts.xFmt, xLabel: opts.xLabel });
+	const rawYMax = Math.max(...points.map((p) => p.y), 1e-9);
+	const yMax = opts.yMax != null ? opts.yMax : (opts.logY ? rawYMax * 1.15 : nice(rawYMax));
+	const fr = svgFrame(W, H, { padL, padR, padT, padB, xMin: 0, xMax, yMax, yFmt: opts.yFmt, xFmt: opts.xFmt, xLabel: opts.xLabel, logY: opts.logY });
 	if (opts.refLine) {
 		const m = Math.min(xMax, yMax);
 		fr.svg.appendChild(svgEl("line", { x1: fr.X(0), y1: fr.Y(0), x2: fr.X(m), y2: fr.Y(m), stroke: "rgba(255,255,255,0.25)", "stroke-width": 1, "stroke-dasharray": "4 3" }));
@@ -780,8 +925,70 @@ function scatterChart(points, opts = {}) {
 		fr.svg.appendChild(dot);
 	}
 	svgCorner(fr, opts.corrLabel);
-	const wrap = el("div", { class: "gwrap" }, fr.svg);
+	const wrap = el("div", { class: `gwrap${sq ? " square" : ""}` }, fr.svg);
 	if (opts.legend) wrap.appendChild(chartLegend(opts.legend));
+	return wrap;
+}
+
+// Joint scatter with MARGINAL distributions (a jointplot): a square main scatter,
+// colored by CATEGORY, with per-category smoothed histograms along the TOP (x) and
+// RIGHT (y) axes + a legend. `points`: [{ x, y, cat, label, r? }]; `cats`:
+// [{ key, color, label }] in draw/legend order. The marginals let you read each
+// group's x / y distribution at a glance (e.g. "do high-attention objects skew to
+// low distance rank?").
+function jointScatter(points, opts = {}) {
+	const { el } = d();
+	if (!points.length) return el("div", { class: "hint", text: "no data to plot" });
+	const cats = (opts.cats && opts.cats.length) ? opts.cats : [{ key: "", color: "#7aa2f7", label: "" }];
+	const colorOf = new Map(cats.map((c) => [c.key, c.color]));
+	const W = 578, H = 560, m = 76, gap = 6, padL = 46, padR = 12, padT = 10, padB = 30;
+	const mainL = padL, mainR = W - padR - m - gap, mainT = padT + m + gap, mainB = H - padB; // square main plot
+	const xMax = opts.xMax || Math.max(...points.map((p) => p.x), 1);
+	const yMax = opts.yMax || Math.max(...points.map((p) => p.y), 1);
+	const X = (x) => mainL + (x / (xMax || 1)) * (mainR - mainL);
+	const Y = (y) => mainB - (y / (yMax || 1)) * (mainB - mainT);
+	const xf = opts.xFmt || ((v) => String(Math.round(v))), yf = opts.yFmt || ((v) => String(Math.round(v)));
+	const svg = svgEl("svg", { class: "gsvg", viewBox: `0 0 ${W} ${H}`, style: "width:100%;height:auto;display:block;overflow:visible" });
+	for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+		const gy = mainB - f * (mainB - mainT), gx = mainL + f * (mainR - mainL);
+		svg.appendChild(svgEl("line", { x1: mainL, y1: gy.toFixed(1), x2: mainR, y2: gy.toFixed(1), stroke: "rgba(255,255,255,0.06)" }));
+		svg.appendChild(svgEl("line", { x1: gx.toFixed(1), y1: mainT, x2: gx.toFixed(1), y2: mainB, stroke: "rgba(255,255,255,0.06)" }));
+		svg.appendChild(svgEl("text", { x: gx.toFixed(1), y: mainB + 14, fill: "rgba(220,230,245,0.5)", "font-size": 10, "text-anchor": "middle" }, xf(f * xMax)));
+		svg.appendChild(svgEl("text", { x: mainL - 6, y: gy.toFixed(1), fill: "rgba(220,230,245,0.5)", "font-size": 10, "text-anchor": "end", "dominant-baseline": "middle" }, yf(f * yMax)));
+	}
+	if (opts.xLabel) svg.appendChild(svgEl("text", { x: ((mainL + mainR) / 2).toFixed(1), y: H - 4, fill: "rgba(220,230,245,0.82)", "font-size": 11, "text-anchor": "middle" }, opts.xLabel));
+	if (opts.yLabel) { const my = ((mainT + mainB) / 2).toFixed(1); svg.appendChild(svgEl("text", { x: 12, y: my, fill: "rgba(220,230,245,0.82)", "font-size": 11, "text-anchor": "middle", transform: `rotate(-90 12 ${my})` }, opts.yLabel)); }
+	// per-category smoothed marginal histograms (top = x, right = y)
+	const nb = Math.min(Math.max(6, Math.round(Math.max(xMax, yMax))), 24);
+	const binOf = (vals, mx) => { const b = new Array(nb).fill(0); for (const v of vals) b[Math.min(nb - 1, Math.max(0, Math.floor((v / (mx || 1)) * nb)))] += 1; return b; };
+	const smooth = (b) => b.map((_, i) => (b[i - 1] || 0) * 0.25 + b[i] * 0.5 + (b[i + 1] || 0) * 0.25);
+	const topB = cats.map((c) => smooth(binOf(points.filter((p) => p.cat === c.key).map((p) => p.x), xMax)));
+	const topMax = Math.max(1e-9, ...topB.flat());
+	cats.forEach((c, ci) => {
+		let dd = `M ${mainL.toFixed(1)} ${(padT + m).toFixed(1)}`;
+		topB[ci].forEach((v, i) => { dd += ` L ${(mainL + ((i + 0.5) / nb) * (mainR - mainL)).toFixed(1)} ${((padT + m) - (v / topMax) * (m - 3)).toFixed(1)}`; });
+		dd += ` L ${mainR.toFixed(1)} ${(padT + m).toFixed(1)} Z`;
+		svg.appendChild(svgEl("path", { d: dd, fill: hexA(c.color, 0.32), stroke: c.color, "stroke-width": 1 }));
+	});
+	const rgtB = cats.map((c) => smooth(binOf(points.filter((p) => p.cat === c.key).map((p) => p.y), yMax)));
+	const rgtMax = Math.max(1e-9, ...rgtB.flat()), rx0 = mainR + gap;
+	cats.forEach((c, ci) => {
+		let dd = `M ${rx0.toFixed(1)} ${mainB.toFixed(1)}`;
+		rgtB[ci].forEach((v, i) => { dd += ` L ${(rx0 + (v / rgtMax) * (m - 3)).toFixed(1)} ${(mainB - ((i + 0.5) / nb) * (mainB - mainT)).toFixed(1)}`; });
+		dd += ` L ${rx0.toFixed(1)} ${mainT.toFixed(1)} Z`;
+		svg.appendChild(svgEl("path", { d: dd, fill: hexA(c.color, 0.32), stroke: c.color, "stroke-width": 1 }));
+	});
+	for (const p of points) {
+		const dot = svgEl("circle", { class: "gpt", cx: X(p.x).toFixed(2), cy: Y(p.y).toFixed(2), r: p.r || 3.4, fill: colorOf.get(p.cat) || "#7aa2f7", "fill-opacity": p.o ?? 0.68 });
+		dot.appendChild(svgEl("title", null, p.label || `(${xf(p.x)}, ${yf(p.y)})`));
+		svg.appendChild(dot);
+	}
+	if (opts.corrLabel) svg.appendChild(svgEl("text", { x: (mainR - 2).toFixed(1), y: mainT + 2, fill: "rgba(220,230,245,0.9)", "font-size": 11, "text-anchor": "end", "dominant-baseline": "hanging" }, opts.corrLabel));
+	const wrap = el("div", { class: "gwrap square" }, svg);
+	const legendItems = cats.filter((c) => c.label).map((c) => el("span", { class: "pin-pill" },
+		el("i", { style: `width:11px;height:11px;border-radius:50%;background:${c.color};display:inline-block;flex:none` }), el("span", { text: c.label })));
+	if (opts.sizeLabel) legendItems.push(el("span", { class: "muted", style: "font-size:11px;align-self:center", text: opts.sizeLabel }));
+	wrap.appendChild(el("div", { class: "attr-legend compact", style: "justify-content:center;margin-top:6px", }, ...legendItems));
 	return wrap;
 }
 
@@ -1773,17 +1980,21 @@ function _regionProgression(rows, { normalize, zoom }) {
 // pipeline appearance (min event_index) so the x-axis reads in run order.
 const _kindOf = (r) => (r.step && (r.step.template ?? r.step.step)) || "?";
 const _zoneOf = (r) => (r.step && r.step.node) || "(scene)";
-const _GROUP_KEY = { step: (r) => r.step?.event_index ?? 0, kind: _kindOf, zone: _zoneOf };
+// `abl` groups by the ablation ITEM: rows are pre-tagged (report.js) with
+// _ablGroup (column key), _ablOrd (column order), _ablLabel (display) so the same
+// stacks can put one column per ablation factor level on the x-axis.
+const _GROUP_KEY = { step: (r) => r.step?.event_index ?? 0, kind: _kindOf, zone: _zoneOf, abl: (r) => r._ablGroup ?? "?" };
 function _groupRows(rows, dim) {
 	const keyOf = _GROUP_KEY[dim] || _GROUP_KEY.step;
+	const abl = dim === "abl";
 	const map = new Map();
 	for (const r of rows) {
-		const k = keyOf(r), ev = r.step?.event_index ?? 0;
-		if (!map.has(k)) map.set(k, { key: k, rows: [], ord: ev });
-		const g = map.get(k); g.rows.push(r); g.ord = Math.min(g.ord, ev);
+		const k = keyOf(r), ord = abl ? (r._ablOrd ?? 0) : (r.step?.event_index ?? 0);
+		if (!map.has(k)) map.set(k, { key: k, rows: [], ord, label: abl ? (r._ablLabel ?? String(k)) : null });
+		const g = map.get(k); g.rows.push(r); g.ord = Math.min(g.ord, ord);
 	}
 	const groups = [...map.values()].sort((a, b) => a.ord - b.ord);
-	groups.forEach((g, i) => { g.label = dim === "step" ? String(i + 1) : String(g.key); });
+	groups.forEach((g, i) => { if (g.label == null) g.label = dim === "step" ? String(i + 1) : String(g.key); });
 	return groups;
 }
 // Average a per-row vector across a group's steps. `vecOf(row)` returns a step's
@@ -1819,13 +2030,17 @@ const SECTION_COLORS = [
 // Stable color: index into the (sorted) tag list so a tag keeps its hue across
 // steps/scenes of the same template.
 function sectionColor(tag, tags) { const i = tags.indexOf(tag); return SECTION_COLORS[(i < 0 ? 0 : i) % SECTION_COLORS.length]; }
+// The section breakdown shows each organized <tag> as ONE layer — VII sub-sentences
+// (VERY_IMPORTANT_INSTRUCTIONS#NN) collapse back to the whole section (the
+// per-instruction split is the dedicated VII view's job, not this overview).
+const _collapseSectionTag = (t) => (t || "section").replace(/#\d+$/, "");
 // Sorted union of organized-tag names across a selection's steps.
 function _sectionTags(rows) {
 	const set = new Set();
 	for (const r of rows) {
 		const b = _validBuckets(r.a);
 		if (!b) continue;
-		(b.region_meta || []).forEach((m) => { if (m && m.category === "text" && m.sub === "organized") set.add(m.tag || "section"); });
+		(b.region_meta || []).forEach((m) => { if (m && m.category === "text" && m.sub === "organized") set.add(_collapseSectionTag(m.tag)); });
 	}
 	return [...set].sort();
 }
@@ -1835,7 +2050,7 @@ function _sectionRowsFor(b, tags, tagIdx, normalize) {
 	const nt = normalize ? (b.n_tokens || 1) : 1;
 	return grid.map((row) => {
 		const o = new Array(tags.length).fill(0);
-		meta.forEach((m, c) => { if (m && m.category === "text" && m.sub === "organized") { const k = tagIdx.get(m.tag || "section"); if (k != null) o[k] += row[c] / nt; } });
+		meta.forEach((m, c) => { if (m && m.category === "text" && m.sub === "organized") { const k = tagIdx.get(_collapseSectionTag(m.tag)); if (k != null) o[k] += row[c] / nt; } });
 		return o;
 	});
 }
@@ -1919,7 +2134,7 @@ const _densFmt = (v) => (v >= 0.01 ? v.toFixed(2) : v === 0 ? "0" : v.toExponent
 
 // Axis options for a grouped stacked area (one column per group). Step groups keep
 // a numeric ordinal axis; categorical dims (kind/zone) label every column.
-const _GROUP_XLABEL = { step: "step (selection order)", kind: "step kind", zone: "zone" };
+const _GROUP_XLABEL = { step: "step (selection order)", kind: "step kind", zone: "zone", abl: "ablation item" };
 function _groupXOpts(agg) {
 	const xs = agg.grid.map((_, i) => i);
 	// step = an ordered sequence → stacked area reads as a progression. kind/zone are
@@ -2102,21 +2317,29 @@ function bucketsSectionCard(rows, allRows, { level, group, vlines = null, zoom =
 	const grouped = group && group !== "progression";
 	const agg = grouped ? _sectionByGroup(allRows, group, { normalize }) : _sectionProgression(rows, { normalize, zoom });
 	if (!agg || !agg.tags.length) return markWide(reportCard("prompt sections · organized <tags>", null, reportEmpty("no organized <tag> sections carry attention in this selection")));
-	const layers = agg.tags.map((t, k) => ({ label: `<${t}>`, color: sectionColor(t, agg.tags), values: agg.grid.map((row) => row[k]) }));
+	// 100%-stacked COMPOSITION: normalize each x-column so its <tag> sections sum to 1.
+	// The raw stack summed to the total ORGANIZED attention (which drifts with position
+	// / step / normalize toggle), so you couldn't compare the section MIX across columns
+	// — every column has a different total height. Sharing to 1 answers "OF the attention
+	// organized text draws here, how is it split across <output>/<judging_criteria>/…",
+	// which is comparable everywhere. A column with no organized attention stays empty.
+	const grid = agg.grid.map((row) => { const s = row.reduce((a, v) => a + v, 0); return s > 1e-12 ? row.map((v) => v / s) : row.map(() => 0); });
+	const layers = agg.tags.map((t, k) => ({ label: `<${t}>`, color: sectionColor(t, agg.tags), values: grid.map((row) => row[k]) }));
 	const gx = grouped ? _groupXOpts(agg) : null;
 	const xs = grouped ? gx.xs : _progXs(agg.G, agg.meanNq, curX());
 	const shadeFrom = (!grouped && agg.outFrac) ? xs[Math.round(agg.outFrac * (agg.G - 1))] : null; // 0 (zoomed) → no shade
 	const chart = stackAreaChart(layers, xs, {
 		xLabel: grouped ? gx.xLabel : (zoom ? "output " : "") + xLabelFor(curX()),
 		xFmt: grouped ? gx.xFmt : xFmtFor(curX()), catLabels: grouped ? gx.catLabels : null, bars: grouped ? gx.bars : false,
-		yFmt: normalize ? _densFmt : pctFmt, share: false, sideLabels: true, height: 176,
+		yFmt: pctFmt, share: true, yMax: 1, sideLabels: true, height: 176,
 		shade: shadeFrom != null ? { from: shadeFrom, to: xs[xs.length - 1] } : null,
 		vlines: grouped ? null : vlines, hi: grouped ? null : hi,
 		legend: layers.map((L) => ({ label: L.label, color: L.color })),
 	});
-	let sub = `${normalize ? "per-token density" : "share of total attention"} · one ${grouped && gx.bars ? "bar" : grouped ? "column" : "area"} = <tag> section · y auto-fit`;
-	if (grouped) sub += ` · per ${group === "step" ? "step" : group}`;
-	else { if (zoom) sub += " · output region only"; if (agg.n > 1) sub += ` · mean of ${agg.n} steps`; }
+	let sub = grouped
+		? `composition · each ${gx.bars ? "bar" : "column"}'s <tag> sections sum to 100% · per ${group === "step" ? "step" : group}`
+		: "composition · <tag> sections sum to 100% at each position (section mix, not magnitude)";
+	if (!grouped) { if (zoom) sub += " · output region only"; if (agg.n > 1) sub += ` · mean of ${agg.n} steps`; }
 	return markWide(reportCard("prompt sections · organized <tags>", sub, chart));
 }
 
@@ -2130,16 +2353,19 @@ function bucketsSectionCompareCard(peers) {
 	for (const p of peers) {
 		const agg = _sectionProgression(p.rows, { normalize, tags: allTags });
 		if (!agg) continue;
+		// Composition (column sums to 1), same as the single graph — so the section MIX
+		// is comparable across peers, not confounded by each peer's organized total.
+		const grid = agg.grid.map((row) => { const s = row.reduce((a, v) => a + v, 0); return s > 1e-12 ? row.map((v) => v / s) : row.map(() => 0); });
 		cols.push(el("div", { style: "flex:1;min-width:220px" },
 			el("div", { class: "graph-card-sub", style: "margin:0 0 2px 2px", text: p.label },
 				el("span", { class: "frame-sw", style: `background:${p.color};margin-left:6px` })),
-			stackAreaChart(agg.tags.map((t, k) => ({ label: `<${t}>`, color: sectionColor(t, allTags), values: agg.grid.map((row) => row[k]) })),
+			stackAreaChart(agg.tags.map((t, k) => ({ label: `<${t}>`, color: sectionColor(t, allTags), values: grid.map((row) => row[k]) })),
 				_progXs(agg.G, agg.meanNq, curX()),
-				{ xLabel: xLabelFor(curX()), xFmt: xFmtFor(curX()), yFmt: normalize ? _densFmt : pctFmt, share: false, height: 150, sideLabels: false })));
+				{ xLabel: xLabelFor(curX()), xFmt: xFmtFor(curX()), yFmt: pctFmt, share: true, yMax: 1, height: 150, sideLabels: false })));
 	}
 	if (!cols.length) return markWide(reportCard("prompt sections · organized <tags> · compared", null, reportEmpty("no compared selection carries organized sections")));
 	return markWide(reportCard("prompt sections · organized <tags> · compared",
-		`${normalize ? "per-token density" : "share of total attention"} · one stack per selection · y auto-fit`,
+		"composition · each stack's <tag> sections sum to 100% · one stack per selection",
 		el("div", { style: "display:flex;gap:14px;flex-wrap:wrap" }, ...cols),
 		chartLegend(allTags.map((t) => ({ label: `<${t}>`, color: sectionColor(t, allTags) })))));
 }
@@ -2256,6 +2482,209 @@ export function renderTokenOrdering(rows, { level = "step", cmp = null, allRows 
 	return cards.map(markWide);
 }
 
+// Generic SVG radar/spider: axes = [{label,color?}], series = [{label,color,
+// values[]}] (values aligned to axes). Each series is L1-normalized to its SHARE
+// distribution (value / Σ) — the same "shape, not magnitude" convention as the
+// attribute spider — then a shared scale maps the largest share to the ring. Hover
+// a vertex for the exact share.
+function radarChart(axes, series, opts = {}) {
+	const { el } = d();
+	const A = axes.length;
+	if (A < 3 || !series.length) return el("div", { class: "hint", text: opts.empty || "not enough axes to plot a radar" });
+	const normed = series.map((s) => {
+		const vals = axes.map((_, k) => Math.max(0, s.values[k] || 0));
+		const sum = vals.reduce((a, b) => a + b, 0) || 1;
+		return { label: s.label, color: s.color || "#7aa2f7", share: vals.map((v) => v / sum) };
+	});
+	const scale = Math.max(1e-9, ...normed.flatMap((s) => s.share));
+	const W = 380, H = 360, cx = W / 2, cy = H / 2 + 4, R = 116;
+	const ang = (k) => -Math.PI / 2 + (k / A) * Math.PI * 2;
+	const pt = (k, r) => [cx + Math.cos(ang(k)) * R * r, cy + Math.sin(ang(k)) * R * r];
+	const svg = svgEl("svg", { class: "gsvg", viewBox: `0 0 ${W} ${H}`, style: "width:100%;height:auto;display:block;overflow:visible;max-width:440px;margin:0 auto" });
+	for (const rr of [0.25, 0.5, 0.75, 1]) {
+		let dd = "";
+		for (let k = 0; k <= A; k++) { const [x, y] = pt(k % A, rr); dd += (k ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1) + " "; }
+		svg.appendChild(svgEl("path", { d: dd + "Z", fill: "none", stroke: "rgba(255,255,255,0.07)" }));
+	}
+	axes.forEach((ax, k) => {
+		const [x, y] = pt(k, 1);
+		svg.appendChild(svgEl("line", { x1: cx, y1: cy, x2: x.toFixed(1), y2: y.toFixed(1), stroke: "rgba(255,255,255,0.08)" }));
+		const [lx, ly] = pt(k, 1.13);
+		const anchor = Math.abs(lx - cx) < 8 ? "middle" : lx < cx ? "end" : "start";
+		svg.appendChild(svgEl("text", { x: lx.toFixed(1), y: ly.toFixed(1), fill: ax.color || "rgba(220,230,245,0.75)", "font-size": 9.5, "text-anchor": anchor, "dominant-baseline": "middle" }, ax.label));
+	});
+	for (const s of normed) {
+		let dd = "";
+		s.share.forEach((v, k) => { const [x, y] = pt(k, Math.min(1, v / scale)); dd += (k ? "L" : "M") + x.toFixed(1) + "," + y.toFixed(1) + " "; });
+		svg.appendChild(svgEl("path", { d: dd + "Z", fill: hexA(s.color, 0.12), stroke: s.color, "stroke-width": 1.8, "stroke-linejoin": "round" }));
+		s.share.forEach((v, k) => {
+			const [x, y] = pt(k, Math.min(1, v / scale));
+			const dot = svgEl("circle", { cx: x.toFixed(1), cy: y.toFixed(1), r: 2.4, fill: s.color });
+			dot.appendChild(svgEl("title", null, `${s.label} · ${axes[k].label}: ${(v * 100).toFixed(1)}%`));
+			svg.appendChild(dot);
+		});
+	}
+	const wrap = el("div", { class: "gwrap" }, svg);
+	wrap.appendChild(chartLegend(series.map((s) => ({ label: s.label, color: s.color || "#7aa2f7" }))));
+	return wrap;
+}
+
+// One polygon per ablation item over the category×subcategory axes. Falls back to
+// the stacked-bar card when too few subcategories carry attention to form a radar.
+function ablBreakdownRegionSpider(rows, colorMap) {
+	const { reportCard, reportEmpty } = d();
+	const normalize = d().normalize ? d().normalize() : false;
+	const agg = _regionByGroup(rows, "abl", { normalize });
+	if (!agg) return reportCard("attention by category \u00d7 subcategory", null, reportEmpty("no computed variants carry a bucket view"));
+	const present = REGION_SUBS.map((_, k) => k).filter((k) => agg.grid.some((row) => row[k] > 1e-9));
+	if (present.length < 3) return bucketsRegionCard(rows, rows, { level: "kind", group: "abl" });
+	const axes = present.map((k) => ({ label: REGION_SUBS[k][2], color: REGION_SUBS[k][3] }));
+	const series = agg.grid.map((row, i) => ({ label: agg.labels[i], color: (colorMap && colorMap.get(agg.labels[i])) || "#7aa2f7", values: present.map((k) => row[k]) }));
+	return reportCard("attention by category \u00d7 subcategory", "one polygon per ablation item \u00b7 L1-normalized to each item's SHARE across subcategories (shape) \u00b7 axis = subcategory", radarChart(axes, series));
+}
+
+// A compact "treatments" legend card: the treatment → color key for the compared
+// ablation levels, so every graph below reads unambiguously by color.
+function ablTreatmentLegendCard(rows, colorMap) {
+	const { reportCard } = d();
+	const seen = new Map(); // label -> ord (peer order)
+	for (const r of rows) { const l = r._ablLabel; if (l != null && !seen.has(l)) seen.set(l, r._ablOrd ?? 0); }
+	if (!seen.size) return null;
+	const items = [...seen.entries()].sort((a, b) => a[1] - b[1]).map(([label]) => ({ label, color: (colorMap && colorMap.get(label)) || "#7aa2f7" }));
+	return reportCard("treatments", "color key for the compared ablation levels", chartLegend(items));
+}
+
+// Ablation breakdown: the SAME token-type breakdown as step/kind/scene, keyed to
+// the ablation item. Category × subcategory stays a SPIDER (its SHAPE compares
+// directly), while the prompt <tag> sections AND the word / token types are
+// STACKED BARS — one column per ablation level — with the word/token-type bars
+// LAST. Rows are pre-tagged (report.js) with _ablGroup / _ablOrd / _ablLabel;
+// `colorMap` maps each level → its color.
+export function renderAblationBreakdown(rows, colorMap) {
+	const { reportCard, reportEmpty } = d();
+	rows = (rows || []).filter((r) => r && r.a);
+	if (!rows.length) return [markWide(reportCard("attention breakdown", null, reportEmpty("compute variants (⚗ ablation tab) — their token-type breakdown then compares here")))];
+	return [
+		ablTreatmentLegendCard(rows, colorMap),
+		ablBreakdownRegionSpider(rows, colorMap),
+		bucketsSectionCard(rows, rows, { level: "kind", group: "abl" }),
+		bucketsWordTypeCard(rows, rows, { level: "kind", group: "abl" }),
+	].filter(Boolean).map(markWide);
+}
+
+// STRUCTURE vs CONTENT: aggregate the per-attribute `attr_role` buckets (one
+// segment per <attribute>|<role>, role ∈ {context, frame, content}) across each
+// ablation group's rows, summing attention MASS and token COUNT separately per
+// segment NAME so the density is correct across steps with different scenes.
+// density = Σ mass / Σ token-count = the length-normalized mean per-token
+// attention on that role's tokens — exactly "how much is it attending to
+// frame / content / context, normalized to length of each".
+function _attrRoleByGroup(allRows) {
+	const valid = (allRows || []).filter((r) => r && r.a && r.a.buckets
+		&& Array.isArray(r.a.buckets.attr_role) && (r.a.buckets.attr_role_names || []).length);
+	if (!valid.length) return null;
+	const groups = new Map(); // ablGroup key -> { label, ord, mass:Map(name→Σ), cnt:Map(name→Σ) }
+	for (const r of valid) {
+		const key = r._ablGroup ?? "all";
+		let g = groups.get(key);
+		if (!g) groups.set(key, g = { label: r._ablLabel ?? key, ord: r._ablOrd ?? 0, mass: new Map(), cnt: new Map() });
+		const b = r.a.buckets, names = b.attr_role_names || [], counts = b.attr_role_tokens || [], grid = b.attr_role || [];
+		const segMass = new Array(names.length).fill(0);
+		for (const row of grid) for (let k = 0; k < row.length; k++) segMass[k] += row[k];  // sum over progression buckets
+		names.forEach((nm, k) => {
+			g.mass.set(nm, (g.mass.get(nm) || 0) + segMass[k]);
+			g.cnt.set(nm, (g.cnt.get(nm) || 0) + (counts[k] || 0));
+		});
+	}
+	const allNames = new Set();
+	const perGroup = [...groups.values()].sort((a, b) => a.ord - b.ord).map((g) => {
+		const density = new Map();
+		for (const nm of g.mass.keys()) { allNames.add(nm); const c = g.cnt.get(nm) || 0; density.set(nm, c ? g.mass.get(nm) / c : 0); }
+		return { label: g.label, density };
+	});
+	return { perGroup, names: [...allNames] };
+}
+
+// Role stack order (bottom → top) + the opacity SHADE each role is drawn at, so a
+// bar's hue reads as its TREATMENT while the three segments read as the roles.
+const STRUCT_ROLES = ["context", "frame", "content"];
+const STRUCT_ROLE_OP = { context: 0.4, frame: 0.68, content: 1 };
+
+// Grouped STACKED-BAR chart of the per-attribute context/frame/content split:
+// x = attributes (grouped), one bar per treatment within a group, each bar stacked
+// into its 3 role segments (shaded by STRUCT_ROLE_OP). Bar height = length-
+// normalized attention density (mass ÷ tokens); a shared y-scale keeps bars
+// comparable. Hover a segment for the exact per-token value.
+function attrRoleBars(agg, colorMap) {
+	const attrTotal = (attr) => agg.perGroup.reduce((s, g) => s + STRUCT_ROLES.reduce((t, r) => t + (g.density.get(`${attr}|${r}`) || 0), 0), 0);
+	const attrs = [...new Set(agg.names.map((n) => n.slice(0, n.lastIndexOf("|"))))]
+		.filter((a) => attrTotal(a) > 1e-9)
+		.sort((a, b) => attrTotal(b) - attrTotal(a)); // most-attended attribute first
+	if (!attrs.length) return null;
+	const treats = agg.perGroup;
+	const colorOf = (label) => (colorMap && colorMap.get(label)) || "#7aa2f7";
+	let yMax = 0;
+	for (const a of attrs) for (const g of treats) { const s = STRUCT_ROLES.reduce((t, r) => t + (g.density.get(`${a}|${r}`) || 0), 0); if (s > yMax) yMax = s; }
+	yMax = yMax || 1;
+	const barW = 14, barGap = 2, groupGap = 18, padL = 46, padR = 12, padT = 12, padB = 72, plotH = 200;
+	const groupW = Math.max(barW, treats.length * (barW + barGap) - barGap);
+	const plotW = Math.max(1, attrs.length * (groupW + groupGap) - groupGap);
+	const W = padL + plotW + padR, H = padT + plotH + padB;
+	const y0 = padT, y1 = padT + plotH;
+	const Y = (v) => y1 - (Math.max(0, Math.min(yMax, v)) / yMax) * (y1 - y0);
+	const svg = svgEl("svg", { class: "gsvg", viewBox: `0 0 ${W} ${H}`, style: `width:100%;max-width:${W}px;height:auto;display:block;overflow:visible` });
+	for (const f of [0, 0.25, 0.5, 0.75, 1]) {
+		const yy = y1 - f * (y1 - y0);
+		svg.appendChild(svgEl("line", { x1: padL, y1: yy, x2: W - padR, y2: yy, stroke: "rgba(255,255,255,0.07)" }));
+		svg.appendChild(svgEl("text", { x: padL - 5, y: yy, fill: "rgba(220,230,245,0.5)", "font-size": 9, "text-anchor": "end", "dominant-baseline": "middle" }, (yMax * f).toFixed(3)));
+	}
+	attrs.forEach((attr, ai) => {
+		const gx = padL + ai * (groupW + groupGap);
+		treats.forEach((g, ti) => {
+			const bx = gx + ti * (barW + barGap);
+			const col = colorOf(g.label);
+			let acc = 0;
+			for (const role of STRUCT_ROLES) {
+				const v = g.density.get(`${attr}|${role}`) || 0;
+				if (v > 1e-12) {
+					const yTop = Y(acc + v), yBot = Y(acc);
+					svg.appendChild(svgEl("rect", { class: "gpt", x: bx, y: yTop, width: barW, height: Math.max(0.6, yBot - yTop), fill: col, "fill-opacity": STRUCT_ROLE_OP[role], stroke: "rgba(13,15,20,0.55)", "stroke-width": 0.5 },
+						svgEl("title", null, `${attr} · ${role}\n${g.label}: ${v.toFixed(4)} per token`)));
+				}
+				acc += v;
+			}
+		});
+		svg.appendChild(svgEl("text", { x: gx + groupW / 2, y: y1 + 11, fill: "rgba(220,230,245,0.72)", "font-size": 9.5, "text-anchor": "end", transform: `rotate(-40 ${gx + groupW / 2} ${y1 + 11})` }, attr));
+	});
+	return svg;
+}
+
+// STRUCTURE vs CONTENT: for EACH attribute, one bar per treatment, and each bar is
+// split into 3 segments — context / frame / content — by its length-normalized
+// attention density. Bar hue = treatment (legend); segment shade = role. Rows are
+// pre-tagged (report.js) with _ablGroup / _ablLabel / _ablOrd.
+export function renderAblationStructure(rows, colorMap) {
+	const { el, reportCard, reportEmpty } = d();
+	rows = (rows || []).filter((r) => r && r.a);
+	const agg = _attrRoleByGroup(rows);
+	if (!agg) {
+		return [markWide(reportCard("structure vs content", null,
+			reportEmpty("compute variants (⚗ ablation tab) — the per-attribute context / frame / content attention split compares here. Needs recomputed attention (analysis v9+): the attr_role buckets ship only on freshly-computed steps.")))];
+	}
+	const chart = attrRoleBars(agg, colorMap);
+	if (!chart) {
+		return [markWide(reportCard("structure vs content", null,
+			reportEmpty("not enough attributes with a well-defined context/frame/content split in scope")))];
+	}
+	const treatLegend = chartLegend(agg.perGroup.map((g) => ({ label: g.label, color: (colorMap && colorMap.get(g.label)) || "#7aa2f7" })));
+	const roleLegend = el("div", { class: "seg-legend", style: "font-size:10px;gap:12px;margin-top:4px;flex-wrap:wrap" },
+		el("span", { class: "muted", text: "segment (bottom→top):" }),
+		...STRUCT_ROLES.map((r) => el("span", {}, el("span", { class: "frame-sw", style: `background:#9aa4b2;opacity:${STRUCT_ROLE_OP[r]}` }), el("span", { text: ` ${r}` }))));
+	return [markWide(reportCard("structure vs content — per attribute",
+		"one bar per treatment, grouped by attribute · each bar's 3 segments = its context / frame / content attention density (mass ÷ tokens, length-normalized) · bar hue = treatment, segment shade = role",
+		chart, treatLegend, roleLegend))];
+}
+
 // Peer comparison: overlay each selected step/kind/scene, colored like the rest
 // of the report's comparisons. To-place cards appear when any peer has bbox steps.
 function renderTokenOrderingCompare(cmp) {
@@ -2277,6 +2706,8 @@ export {
 	attributeProfileGraph,
 	compareAttributesGraph,
 	placementObjectsGraph,
-	ablationXmlSplit,
+	xmlSplitCard,
 	ablationOrderCard,
+	rhoCurveCard,
+	spatialScatterCard,
 };

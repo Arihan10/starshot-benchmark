@@ -24,6 +24,47 @@ from itertools import product
 # the model for the treated steps.
 SHUFFLE_METHODS: tuple[str, ...] = ("order", "random", "distance", "raytrace")
 
+# Coordinate-frame axis levels (a SINGLE enumerated axis — the input->output
+# representation for the two bbox solvers; see app.ablation.coord). "baseline"
+# is the current L/G->L behaviour and carries no run-name tag. The tags mirror
+# ablationcore.js `coordTagOf` verbatim so a variant's name is identical whether
+# it was launched from the wizard (JS) or this module. Duplicated here (not
+# imported from `coord`) to keep this config module import-cycle-free.
+COORD_MODES: tuple[str, ...] = ("baseline", "lg2g", "l2l", "g2g", "g2l")
+_COORD_TAGS: dict[str, str] = {
+    "lg2g": "crd-LG2G",
+    "l2l": "crd-L2L",
+    "g2g": "crd-G2G",
+    "g2l": "crd-G2L",
+}
+
+# Scene-context SCHEMA axis levels (a SINGLE enumerated axis — how the treated
+# step's scene context is SERIALIZED; see app.ablation.schema). "baseline" is the
+# current soft-JSON and carries no run-name tag. Tags mirror ablationcore.js
+# `schemaTagOf`. Duplicated here (not imported) to keep this config module
+# import-cycle-free.
+SCHEMA_MODES: tuple[str, ...] = ("baseline", "xml", "prose")
+_SCHEMA_TAGS: dict[str, str] = {
+    "xml": "sch-XML",
+    "prose": "sch-PROSE",
+}
+
+# XML-gravity axis levels (a SINGLE enumerated axis — where the neutral <prompt>
+# closing tag sits within the treated step's instruction block; see
+# app.ablation.gravity). "baseline" is the untouched base cell (real
+# VERY_IMPORTANT_INSTRUCTIONS tags) and carries no tag; "none" strips all tags
+# (the experiment's own comparison anchor); q1..q4 place the closing tag after
+# each word-count quarter. Tags mirror ablationcore.js `gravityTagOf`. Duplicated
+# here (not imported) to keep this config module import-cycle-free.
+GRAVITY_MODES: tuple[str, ...] = ("baseline", "none", "q1", "q2", "q3", "q4")
+_GRAVITY_TAGS: dict[str, str] = {
+    "none": "grav-none",
+    "q1": "grav-Q1",
+    "q2": "grav-Q2",
+    "q3": "grav-Q3",
+    "q4": "grav-Q4",
+}
+
 
 @dataclass(frozen=True)
 class Treatment:
@@ -34,11 +75,38 @@ class Treatment:
     xml_tags: bool = True          # keep vs strip prompt XML section tags
     section_order: str = "default"  # named permutation of prompt sections
     distractors: int = 0           # count of irrelevant objects injected
-    seed: int = 0                  # RNG seed (random shuffle / distractor pick)
+    # Coordinate-frame axis (single enumerated level; see app.ablation.coord):
+    # baseline | lg2g | l2l | g2g | g2l. Drives the two bbox solvers' scene-context
+    # INPUT representation (local / global / both) and OUTPUT frame (local / global).
+    # A treatment identity axis (part of the run-name tag), NOT crossed with the rest.
+    coord_mode: str = "baseline"
+    # Scene-context SCHEMA axis (single enumerated level; see app.ablation.schema):
+    # baseline (soft-JSON) | xml | prose. Re-renders the treated step's scene
+    # context in that format (INPUT-only; the bbox output stays JSON). Also a
+    # treatment identity axis, part of the run-name tag, NOT crossed with the rest.
+    schema_mode: str = "baseline"
+    # XML-gravity axis (single enumerated level; see app.ablation.gravity):
+    # baseline (untouched) | none (tags stripped) | q1..q4 (neutral closing tag
+    # after that word-count quarter). Rewrites the treated step's instruction
+    # block at bind; a treatment identity axis, part of the run-name tag.
+    gravity_mode: str = "baseline"
+    seed: int = 0                  # RNG seed (random shuffle / distractor pick / sampling)
+    # Sampling temperature for the RE-INFERRED treated step. None → the provider's
+    # default. A positive value + a per-replicate `seed` is what makes duplicate
+    # re-runs (replicates) INDEPENDENT draws — else a deterministic decode would
+    # reproduce the same output and only fake-narrow the confidence interval. It's
+    # NOT part of the run-name tag (a sampling knob, not a treatment identity).
+    temperature: float | None = None
 
     def tag(self) -> str:
         """A short, filename-safe descriptor used in the auto-generated run name."""
         parts = [self.shuffle_method]
+        if self.coord_mode and self.coord_mode != "baseline":
+            parts.append(_COORD_TAGS.get(self.coord_mode, self.coord_mode))
+        if self.schema_mode and self.schema_mode != "baseline":
+            parts.append(_SCHEMA_TAGS.get(self.schema_mode, self.schema_mode))
+        if self.gravity_mode and self.gravity_mode != "baseline":
+            parts.append(_GRAVITY_TAGS.get(self.gravity_mode, self.gravity_mode))
         if not self.xml_tags:
             parts.append("noxml")
         if self.section_order != "default":
@@ -131,7 +199,7 @@ class AblationSpec:
         deduped: dict[str, AblationVariant] = {}
         for v in out:
             deduped.setdefault(v.run_name(), v)
-        return list(deduped.values())
+        return list[AblationVariant](deduped.values())
 
 
 _UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
@@ -181,10 +249,86 @@ def variant_to_meta(variant: AblationVariant) -> dict:
 
 def treatment_from_meta(meta: dict) -> Treatment:
     t = dict((meta or {}).get("treatment") or {})
+    temp = t.get("temperature")
     return Treatment(
         shuffle_method=t.get("shuffle_method", "order"),
         xml_tags=bool(t.get("xml_tags", True)),
         section_order=t.get("section_order", "default"),
         distractors=int(t.get("distractors", 0) or 0),
+        coord_mode=str(t.get("coord_mode", "baseline") or "baseline"),
+        schema_mode=str(t.get("schema_mode", "baseline") or "baseline"),
+        gravity_mode=str(t.get("gravity_mode", "baseline") or "baseline"),
         seed=int(t.get("seed", 0) or 0),
+        temperature=(float(temp) if temp is not None else None),
     )
+
+
+# --- nested layout (runs/<base>/ablations/<experiment>/<variant>/) -----------
+# A variant used to be a FLAT top-level run (`<base>__abl-...`); it now lives
+# under its base run. These pure helpers derive the two path segments from the
+# variant's `ablation` meta block (run.json) — the single source of truth (the
+# old folder name was a lossy encoding). Kept here, import-cycle-free, so the
+# `/runs/<base>/ablations` endpoint, `from-branches`, and the migration script
+# all compute identical paths.
+
+ABLATIONS_SUBDIR = "ablations"
+
+# The treatment axes in priority order — MIRRORS ablationcore.js ABLATION_AXES so
+# a variant's experiment bucket is identical whether derived here or in the UI.
+# `field` reads the stored treatment; a value != `baseline` means "this axis is
+# the one this variant varies". `id` is the experiment-folder name.
+_EXPERIMENT_AXES: tuple[tuple[str, str, object], ...] = (
+    ("coord", "coord_mode", "baseline"),
+    ("schema", "schema_mode", "baseline"),
+    ("gravity", "gravity_mode", "baseline"),
+    ("shuffle", "shuffle_method", "order"),
+    ("distractors", "distractors", 0),
+    ("attend", "attend_target", ""),
+)
+
+
+def experiment_id(abl: dict) -> str:
+    """The `<experiment>` folder for a variant: its explicit ``label`` if set,
+    else the study inferred from the single axis its treatment varies (coord /
+    schema / gravity / shuffle / distractors / attend). An all-baseline launched
+    variant (e.g. the shuffle study's ``order`` / ``noxml`` arms — coord & schema
+    baselines are the un-forked cell, so they never launch all-baseline) buckets
+    under ``shuffle``. The manifest still carries the full treatment, so a UI can
+    always regroup regardless of this human-facing folder."""
+    label = str((abl or {}).get("label") or "").strip()
+    if label:
+        return _slug(label, 40)
+    t = dict((abl or {}).get("treatment") or {})
+    for exp_id, field, baseline in _EXPERIMENT_AXES:
+        val = t.get(field)
+        if val is not None and val != baseline:
+            return exp_id
+    return "shuffle"
+
+
+def variant_id(abl: dict) -> str:
+    """The `<variant>` folder: ``<target_step_kind>@<cut>-<treatment.tag>[-r<rep>]``
+    (replicate omitted when 1). Reproduces today's flat-name suffix (minus the
+    ``<base>__abl-`` prefix) because it reuses ``Treatment.tag()``."""
+    kind = _slug(str((abl or {}).get("target_step_kind") or "step"), 24)
+    tag = _slug(treatment_from_meta(abl).tag(), 40)
+    cut = (abl or {}).get("cut")
+    stem = f"{kind}@{cut}-{tag}" if cut is not None else f"{kind}-{tag}"
+    rep = int((abl or {}).get("replicate") or 1)
+    return f"{stem}-r{rep}" if rep > 1 else stem
+
+
+def ablation_rel_path(abl: dict) -> str:
+    """The variant's path RELATIVE to its base run dir:
+    ``ablations/<experiment>/<variant>``."""
+    return f"{ABLATIONS_SUBDIR}/{experiment_id(abl)}/{variant_id(abl)}"
+
+
+def nested_run_id(abl: dict) -> str | None:
+    """The variant's full logical run id (also its subpath under RUNS_DIR and its
+    /artifacts URL segment): ``<base>/ablations/<experiment>/<variant>``. ``None``
+    if the meta lacks a ``base_run`` (not a well-formed ablation)."""
+    base = str((abl or {}).get("base_run") or "").strip()
+    if not base:
+        return None
+    return f"{base}/{ablation_rel_path(abl)}"

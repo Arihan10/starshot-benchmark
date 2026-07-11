@@ -64,8 +64,7 @@ MODELS: dict[str, str] = {
     "opus-fable": "anthropic/claude-fable-latest",
     "glm": "z-ai/glm-5.2",
     "qwen": "qwen/qwen3.7-max",
-    # Open-weight Qwen (Apache-2.0) — the attention analysis can load its HF
-    # weights (Qwen/Qwen3.5-122B-A10B) and replay it; see app.attention.models.
+    "qwen-3.6-31B": "qwen/qwen3.6-35b-a3b",
     "qwen-122b": "qwen/qwen3.5-122b-a10b",
     "kimi": "moonshotai/kimi-k2-thinking",
     "sonnet": "anthropic/claude-sonnet-4.6",

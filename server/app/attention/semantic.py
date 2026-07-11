@@ -5,11 +5,12 @@ The attention math works in TOKEN space; the frontend works in ENTITY space
 the tf-export char-span maps:
 
   * A `Tokenizer` produces an OFFSET MAPPING — for each token, its [start, end)
-    char span in the reconstructed `full` text. The real path uses the Gemma HF
-    tokenizer (`return_offsets_mapping`); a mock regex tokenizer (contiguous,
-    subword-ish) lets the whole pipeline + all the span math run locally with
-    no model. Both expose identical offset semantics, so swapping in the real
-    tokenizer changes token boundaries but not any downstream logic.
+    char span in the reconstructed `full` text. On the real (GPU) path the Modal
+    worker's `HFAttentionProvider` IS the tokenizer (Gemma HF `return_offsets_
+    mapping`, kept 1:1 with the forward-pass `input_ids`); a mock regex tokenizer
+    (contiguous, subword-ish) lets the whole pipeline + all the span math run
+    locally with no model. Both expose identical offset semantics, so the real
+    provider changes token boundaries but not any downstream logic.
 
   * `build_scene_entities` turns each scene_map entry (char spans + components +
     parent, from tf-export) into its TOKEN indices — merged across every
@@ -23,6 +24,7 @@ overlaps it (`tok.start < ce and tok.end > cs`).
 
 from __future__ import annotations
 
+import bisect
 import re
 from typing import Any, Protocol
 
@@ -49,40 +51,18 @@ class MockTokenizer:
         return [(m.group(0), m.start(), m.end()) for m in _MOCK_TOKEN_RE.finditer(text)]
 
 
-class HFTokenizer:
-    """Real Gemma tokenizer offset mapping. Import + load are lazy/guarded so the
-    server never hard-depends on `transformers`; used only on a worker that has
-    it. `add_special_tokens=False` because `full_text` already carries the chat
-    template's control tokens as text (the mock reconstruction) — the real
-    worker path instead re-applies `apply_chat_template` and tokenizes that."""
+def get_tokenizer(model_id: str) -> Tokenizer:
+    """The local, model-free MOCK regex tokenizer.
 
-    def __init__(self, model_id: str) -> None:
-        from transformers import AutoTokenizer  # type: ignore
-
-        self.name = f"hf:{model_id}"
-        self._tok = AutoTokenizer.from_pretrained(model_id)
-
-    def encode_with_offsets(self, text: str) -> list[tuple[str, int, int]]:
-        enc = self._tok(text, return_offsets_mapping=True, add_special_tokens=False)
-        out: list[tuple[str, int, int]] = []
-        for tid, (s, e) in zip(enc["input_ids"], enc["offset_mapping"], strict=False):
-            if e <= s:
-                continue  # special/empty
-            out.append((self._tok.decode([tid]), int(s), int(e)))
-        return out
-
-
-def get_tokenizer(model_id: str, *, prefer_real: bool = False) -> Tokenizer:
-    """The real HF tokenizer (`prefer_real=True`) or the EXPLICIT mock regex
-    tokenizer (`prefer_real=False` — the local, model-free pipeline).
-
-    A requested real tokenizer that fails to load RAISES — we must NEVER silently
-    fall back to the mock: its regex token boundaries differ from the model's BPE,
-    so every char-span → token mapping (and thus the entire attention readout)
-    would be wrong while looking perfectly plausible. Fail loud, don't compute
-    garbage. The mock is returned ONLY when it is explicitly asked for."""
-    if prefer_real:
-        return HFTokenizer(model_id)  # propagate load errors — no silent mock fallback
+    There is deliberately NO real-HF-tokenizer variant here. The real (GPU)
+    attention path never tokenizes separately: the Modal worker's
+    `HFAttentionProvider` (modal_app.py) IS its own tokenizer — it keeps its offset
+    list 1:1 with the forward pass `input_ids` and is passed straight into
+    `worker.analyze(tokenizer=provider, provider=provider)`. A separately-loaded HF
+    tokenizer here would be a TRAP: to stay aligned it would have to reproduce that
+    EXACT 1:1 token set, and any divergence (e.g. dropping zero-width/special
+    tokens) silently shifts every char-span → token mapping. So a real char→token
+    mapping must ONLY ever come from the same provider that produced the attention."""
     return MockTokenizer()
 
 
@@ -91,8 +71,47 @@ def _overlaps(tok_s: int, tok_e: int, cs: int, ce: int) -> bool:
 
 
 def tokens_in_span(offsets: list[tuple[str, int, int]], cs: int, ce: int) -> list[int]:
-    """Token indices whose char span overlaps [cs, ce)."""
+    """Token indices whose char span overlaps [cs, ce). O(n) linear scan — kept
+    for one-off callers; use `OffsetIndex` for the many-span hot paths."""
     return [i for i, (_, s, e) in enumerate(offsets) if _overlaps(s, e, cs, ce)]
+
+
+class OffsetIndex:
+    """Precomputed sorted-offset index for O(log n) repeated `tokens_in_span`.
+
+    HF tokenizers (and the mock) emit char spans that are SORTED and
+    NON-OVERLAPPING, so the tokens overlapping [cs, ce) form a CONTIGUOUS index
+    range recoverable with two binary searches, instead of the O(n_tokens) scan
+    `tokens_in_span` does per span. `build_scene_entities` / `region_segments`
+    issue thousands of span lookups against the SAME offsets, so building this
+    once turns their cost from O(n_spans · n_tokens) into O(n_spans · log n).
+
+    The result is IDENTICAL to `tokens_in_span` (same overlap predicate). A
+    defensive monotonicity check falls back to the linear scan if a tokenizer
+    ever emits non-monotonic offsets (not expected for the tokenizers here)."""
+
+    __slots__ = ("_offsets", "_starts", "_ends", "_monotonic")
+
+    def __init__(self, offsets: list[tuple[str, int, int]]) -> None:
+        self._offsets = offsets
+        self._starts = [s for _, s, _ in offsets]
+        self._ends = [e for _, _, e in offsets]
+        st, en = self._starts, self._ends
+        self._monotonic = (
+            all(st[i] <= st[i + 1] for i in range(len(st) - 1))
+            and all(en[i] <= en[i + 1] for i in range(len(en) - 1))
+        )
+
+    def tokens_in_span(self, cs: int, ce: int) -> list[int]:
+        """Token indices whose char span overlaps [cs, ce) — identical to the
+        free `tokens_in_span`, in O(log n) on monotonic offsets. With starts and
+        ends both ascending, {s < ce} is a prefix and {e > cs} is a suffix, so
+        their intersection is the contiguous range [first end>cs, first start>=ce)."""
+        if self._monotonic and ce > cs:
+            lo = bisect.bisect_right(self._ends, cs)     # first token with end > cs
+            hi = bisect.bisect_left(self._starts, ce)    # first token with start >= ce
+            return list(range(lo, hi)) if hi > lo else []
+        return [i for i, (_, s, e) in enumerate(self._offsets) if s < ce and e > cs]
 
 
 def completion_token_start(offsets: list[tuple[str, int, int]], completion_start: int) -> int:
@@ -126,11 +145,12 @@ def build_scene_entities(
     """Fold every scene_map occurrence into per-id token sets (+ per-component),
     merging duplicate occurrences of the same entity id."""
     idx = SceneTokenIndex()
+    oi = OffsetIndex(offsets)  # built once; every span lookup below is O(log n)
     for entry in scene_map:
         eid = entry.get("id")
         if not isinstance(eid, str):
             continue
-        toks = tokens_in_span(offsets, entry["start"], entry["end"])
+        toks = oi.tokens_in_span(entry["start"], entry["end"])
         if not toks:
             continue
         rec = idx.entities.setdefault(eid, {
@@ -139,18 +159,87 @@ def build_scene_entities(
             "region": entry.get("region"),
             "tokens": set(),
             "components": {},
+            "roles": {},
         })
         rec["tokens"].update(toks)
         idx.scene_tokens.update(toks)
         for comp in entry.get("components", []) or []:
-            ctoks = tokens_in_span(offsets, comp["start"], comp["end"])
+            cname = comp["component"]
+            ctoks = oi.tokens_in_span(comp["start"], comp["end"])
             if ctoks:
-                rec["components"].setdefault(comp["component"], set()).update(ctoks)
-    # Freeze to sorted lists for stable, JSON-friendly output.
+                rec["components"].setdefault(cname, set()).update(ctoks)
+            # Per-attribute token ROLES (context / frame / content), for the
+            # structure-vs-content attention readout. Char sub-spans → token sets.
+            for r in comp.get("roles", []) or []:
+                rtoks = oi.tokens_in_span(r["start"], r["end"])
+                if rtoks:
+                    rec["roles"].setdefault(cname, {}).setdefault(r["role"], set()).update(rtoks)
+    # Freeze to sorted lists for stable, JSON-friendly output. Roles are made
+    # DISJOINT by priority (content > context > frame) so a token that straddles
+    # a `:` / quote boundary is counted in exactly one role (no double-counted mass).
     for rec in idx.entities.values():
         rec["tokens"] = sorted(rec["tokens"])
         rec["components"] = {k: sorted(v) for k, v in rec["components"].items()}
+        roles_out: dict[str, dict[str, list[int]]] = {}
+        for cname, rr in rec["roles"].items():
+            content = set(rr.get("content", ()))
+            context = set(rr.get("context", ())) - content
+            frame = set(rr.get("frame", ())) - content - context
+            out = {}
+            if context:
+                out["context"] = sorted(context)
+            if frame:
+                out["frame"] = sorted(frame)
+            if content:
+                out["content"] = sorted(content)
+            if out:
+                roles_out[cname] = out
+        rec["roles"] = roles_out
     return idx
+
+
+def gravity_segments(
+    gravity: dict[str, Any] | None,
+    offsets: list[tuple[str, int, int]],
+) -> tuple[list[str], list[list[int]], dict[str, Any]]:
+    """Map a rebased XML-gravity block onto per-SENTENCE token segments. Returns
+    `(names, segs, meta)`: `names` = ['s1', 's2', …] (one per sentence present);
+    `segs` = each sentence's overlapping token indices (fed to the SAME whole-row
+    reduction as region/type/attr_role); `meta` = {mode, sentences:[{i, tok_start,
+    tok_end, n_tokens, snippet}], open_tok, close_tok, block:[t0,t1]} — the token
+    positions + text the per-sentence tag-distance readout needs. Empty when the
+    step carries no gravity block."""
+    sentences = (gravity or {}).get("sentences") or []
+    if not sentences:
+        return [], [], {}
+    oi = OffsetIndex(offsets)
+
+    def _span_toks(obj: dict[str, Any] | None) -> list[int]:
+        if not obj or obj.get("start") is None or obj.get("end") is None:
+            return []
+        return oi.tokens_in_span(int(obj["start"]), int(obj["end"]))
+
+    names: list[str] = []
+    segs: list[list[int]] = []
+    smeta: list[dict[str, Any]] = []
+    for s in sentences:
+        toks = _span_toks(s)
+        names.append(f"s{s.get('i')}")
+        segs.append(toks)
+        smeta.append({"i": s.get("i"), "snippet": s.get("snippet"),
+                      "tok_start": (toks[0] if toks else None),
+                      "tok_end": (toks[-1] if toks else None), "n_tokens": len(toks)})
+    blk_toks = _span_toks((gravity or {}).get("block"))
+    open_toks = _span_toks((gravity or {}).get("open_tag"))
+    close_toks = _span_toks((gravity or {}).get("close_tag"))
+    meta = {
+        "mode": (gravity or {}).get("mode"),
+        "sentences": smeta,
+        "open_tok": (open_toks[0] if open_toks else None),
+        "close_tok": (close_toks[0] if close_toks else None),
+        "block": ([blk_toks[0], blk_toks[-1]] if blk_toks else None),
+    }
+    return names, segs, meta
 
 
 # --- aggregation expansion: context regions + word/token types --------------
@@ -192,6 +281,39 @@ def xml_tag_spans(text: str, lo: int, hi: int) -> list[tuple[str, int, int]]:
     return spans
 
 
+# Prompt sections (by XML tag name) that are split into per-SENTENCE sub-regions
+# (prompt.<TAG>#NN) instead of a single whole-section region, so the attention
+# readout resolves onto individual instructions rather than the whole block. The
+# team iterates heavily on VERY_IMPORTANT_INSTRUCTIONS, so it's split by default.
+SENTENCE_SPLIT_TAGS = frozenset({"VERY_IMPORTANT_INSTRUCTIONS"})
+
+# Sentence terminators. VII is split into whole SENTENCES — NOT clauses: commas,
+# semicolons and colons do NOT split, so a full instruction stays one segment.
+_SENT_END = frozenset(".!?")
+
+
+def _sentence_spans(text: str, lo: int, hi: int) -> list[tuple[int, int]]:
+    """Split [lo, hi) of `text` into SENTENCE sub-spans. A boundary is a sentence-
+    ending mark (. ! ?) FOLLOWED BY whitespace or the span end — so decimals
+    ("0.5"), inline dots and mid-token abbreviations don't split — or a newline
+    (line / bullet items). The terminator stays with its sentence; whitespace-only
+    fragments are dropped (never an empty segment)."""
+    spans: list[tuple[int, int]] = []
+    start = i = lo
+    while i < hi:
+        ch = text[i]
+        if ch == "\n" or (ch in _SENT_END and (i + 1 >= hi or text[i + 1].isspace())):
+            j = i + 1
+            if text[start:j].strip():
+                spans.append((start, j))
+            start = i = j
+        else:
+            i += 1
+    if start < hi and text[start:hi].strip():
+        spans.append((start, hi))
+    return spans
+
+
 # Large rendered context variables → the "Variables" region category. Names mirror
 # teacher_forcing._SCENE_BEARING_VARS (kept here to avoid a service import); every
 # other rendered variable at least LARGE_VAR_MIN_CHARS long falls into `var.other`.
@@ -204,7 +326,7 @@ LARGE_VAR_MIN_CHARS = 200
 
 
 def _variable_owner(
-    variables_map: list[dict[str, Any]], offsets: list[tuple[str, int, int]], in_set: set[int],
+    variables_map: list[dict[str, Any]], oi: "OffsetIndex", in_set: set[int],
 ) -> dict[int, str]:
     """Map each input token inside a large rendered context variable to its Variables
     SUBCATEGORY leaf (`var.scene_content` / `var.to_place` / `var.other`). Assigned
@@ -215,7 +337,7 @@ def _variable_owner(
         for v in variables_map:
             if not pred(v):
                 continue
-            for ti in tokens_in_span(offsets, v["start"], v["end"]):
+            for ti in oi.tokens_in_span(v["start"], v["end"]):
                 if ti in in_set:
                     owner[ti] = leaf
 
@@ -236,12 +358,15 @@ def region_segments(
       * completion — `reasoning`, `output` (the model's own generated text);
       * variables  — `var.scene_content` / `var.to_place` / `var.other` (large
         rendered context blocks in the prompt);
-      * text       — `prompt.<tag>` (organized XML sections; tag kept for the
-        which-section view) and `prompt.free` (free prompt text).
+      *         text       — `prompt.<tag>` (organized XML sections; tag kept for the
+        which-section view) and `prompt.free` (free prompt text). Tags in
+        SENTENCE_SPLIT_TAGS are further split into per-sentence leaves
+        `prompt.<tag>#NN` (each meta carries a `snippet` of the sentence text).
     Priority for an input token: VARIABLE → XML tag (organized) → free. Leaf names
     + meta travel with the grid (they vary per step), so aggregation keys by name."""
     frames = frames or {}
     variables_map = variables_map or []
+    oi = OffsetIndex(offsets)  # built once; shared across every span lookup below
     names: list[str] = []
     segs: list[list[int]] = []
     meta: list[dict[str, Any]] = []
@@ -253,7 +378,7 @@ def region_segments(
 
     for nm in COMPLETION_REGIONS:
         fr = frames.get(nm)
-        toks = (tokens_in_span(offsets, fr["start"], fr["end"])
+        toks = (oi.tokens_in_span(fr["start"], fr["end"])
                 if isinstance(fr, dict) and isinstance(fr.get("start"), int)
                 and isinstance(fr.get("end"), int) and fr["end"] > fr["start"] else [])
         _add(nm, toks, {"category": "completion", "sub": nm})
@@ -261,14 +386,31 @@ def region_segments(
     inp = frames.get("input") or {}
     ilo, ihi = inp.get("start"), inp.get("end")
     if isinstance(ilo, int) and isinstance(ihi, int) and ihi > ilo:
-        input_tokens = tokens_in_span(offsets, ilo, ihi)
+        input_tokens = oi.tokens_in_span(ilo, ihi)
         in_set = set(input_tokens)
-        owner = _variable_owner(variables_map, offsets, in_set)      # variables win
+        owner = _variable_owner(variables_map, oi, in_set)      # variables win
+        sentence_snippets: dict[str, str] = {}                      # split-sentence leaf -> its text
         for name, s, e in sorted(xml_tag_spans(full_text, ilo, ihi), key=lambda t: -(t[2] - t[1])):
-            leaf = f"prompt.{name}"
-            for ti in tokens_in_span(offsets, s, e):
-                if ti in in_set and ti not in owner:                # don't override a variable
-                    owner[ti] = leaf
+            if name in SENTENCE_SPLIT_TAGS:
+                # Split this section's INNER text (drop the <tag>…</tag> delimiters)
+                # into per-sentence leaves prompt.<TAG>#NN, so attention resolves onto
+                # individual instructions rather than the whole block. #NN is zero-
+                # padded so leaves sort in reading order.
+                gt = full_text.find(">", s, e)
+                lt = full_text.rfind("<", s, e)
+                c_lo = gt + 1 if gt != -1 else s
+                c_hi = lt if lt > c_lo else e
+                for k, (cs, ce) in enumerate(_sentence_spans(full_text, c_lo, c_hi), start=1):
+                    leaf = f"prompt.{name}#{k:02d}"
+                    for ti in oi.tokens_in_span(cs, ce):
+                        if ti in in_set and ti not in owner:        # don't override a variable
+                            owner[ti] = leaf
+                    sentence_snippets.setdefault(leaf, " ".join(full_text[cs:ce].split())[:400])
+            else:
+                leaf = f"prompt.{name}"
+                for ti in oi.tokens_in_span(s, e):
+                    if ti in in_set and ti not in owner:            # don't override a variable
+                        owner[ti] = leaf
         for ti in input_tokens:
             owner.setdefault(ti, "prompt.free")                     # remainder = free text
         groups: dict[str, list[int]] = {}
@@ -281,6 +423,8 @@ def region_segments(
                 m = {"category": "text", "sub": "free"}
             else:
                 m = {"category": "text", "sub": "organized", "tag": leaf.split(".", 1)[1]}
+                if leaf in sentence_snippets:                        # per-instruction snippet
+                    m["snippet"] = sentence_snippets[leaf]
             _add(leaf, groups[leaf], m)
     # Catch-all: every token in NO named region above (chat-template control tokens
     # like <bos>/turn markers/<end_of_turn>, and any completion tokens a step's frames

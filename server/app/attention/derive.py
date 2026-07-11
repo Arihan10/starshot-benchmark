@@ -46,6 +46,9 @@ from typing import Any
 #   5: word-type `structural` split into bracket/separator/quote/operator tag kinds
 #      (wider type grid) — rebuild compact so the frontend gets the new leaves.
 #   6: progression bucket resolution raised (48 → 128) — rebuild compact.
+# NOTE: buckets now also carry the per-attribute `attr_role` grid; it's passed
+# through verbatim on fresh computes and its absence on old sidecars is tolerated,
+# so it deliberately does NOT bump this gate (no forced sidecar rebuild).
 DERIVED_VERSION = 6
 
 # How many entities/attributes to keep in the precomputed matrices/rollups.
