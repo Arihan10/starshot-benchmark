@@ -84,7 +84,7 @@ MODELS: dict[str, str] = {
     "opus-new": "anthropic/claude-opus-4.8",
     "opus-fable": "anthropic/claude-fable-5",
     "grokky": "x-ai/grok-4.5",
-    "glm": "z-ai/glm-5.2",
+    "glm": "z-ai/glm-5.2",                                                                                                                                                      
     "qwen": "qwen/qwen3.7-max",
     "kimi": "moonshotai/kimi-k2-thinking",
     "sonnet": "anthropic/claude-sonnet-4.6",
