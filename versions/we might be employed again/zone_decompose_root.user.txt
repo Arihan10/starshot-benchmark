@@ -14,4 +14,13 @@ when determining the list of subregions you want to place in this scene, careful
 reason carefully about the role in the scene that each subregion should have, and how that translates to how large they should be. in particular, consider the relative sizing of each subregion you output and the most narratively sensible way to distribute the space of the parent region. When coming up with the placement of each, reason about the spatial layout of the subregions as a whole and think about how they interact with each other rather than focusing on one at a time.
 
 note that although the subregions are contained by the parent region, they aren't always strictly partitioning it - sometimes, a parent region is intended to be fully partitioned into individual subregions, while at other times, a parent region acts as more of an abstract container, and the subregions are simply contained within with negative space remaining.
+
+<OUTPUT_GUIDANCE>
+for each subregion you have chosen to output, two things are especially worth paying attention to. 
+
+firstly, the prompt for each subregion should be a succinct, high-level description of its purpose - not what it contains. it should explain from a narrative standpoint what happens in this place and what this place is used for, focusing on the intention of the region rather than what is inside. a separate planning step will design the inside, using the prompt you provide here. it is important that this downstream planning step has full creative agency over the contents of the region to represent the purpose you write here, and that you do not restrict its freedom in any way. REMEMBER: you are only explaining what happens in this region and what it's for in the broader context of the scene's narrative, NOT what is inside the region.
+
+secondly, the placement text represents a semantic spatial description of where the subregion sits, relative to existing regions or objects in the scene. your output for the placement text and the relationships list of each subregion will be used as a guide to a downstream step that will compute its exact bounding box and coordinates. as such, the placement text for each subregion should mention any structural quirks and details for each subregion that may be important for the downstream coordinate resolver step to know about - tiny things like slight offsets or protrusions from neighboring regions that the relationships array is unable to represent. The placement text, however, should NOT contain any precise coordinates or numbers; you are just describing what you envision for its placement as a result of reasoning spatially about the existing scene context, not any precise numbers.
+</OUTPUT_GUIDANCE>
+
 </IMPORTANT_INSTRUCTIONS>
