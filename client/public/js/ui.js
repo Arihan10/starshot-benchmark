@@ -354,13 +354,27 @@ export function foldedPre(text, variables, cls = "") {
 // tracking it while edited. Defaults to EXPANDED (`fitted`) so boxes fill the
 // space and show their full content without a click; the button then clamps
 // back to a fixed scrollable height.
+// Nearest scrollable ancestor — auto-grow briefly collapses the textarea to
+// measure its content, which clamps this container's scrollTop; we snapshot and
+// restore it so typing never yanks the view to the top.
+function scrollableAncestor(node) {
+  for (let p = node.parentElement; p; p = p.parentElement) {
+    const oy = getComputedStyle(p).overflowY;
+    if ((oy === "auto" || oy === "scroll") && p.scrollHeight > p.clientHeight) return p;
+  }
+  return null;
+}
+
 export function fitToggle(target, { fitted = true } = {}) {
   const isTextarea = target.tagName === "TEXTAREA";
   let active = false;
   const sync = () => {
     if (!active) return;
+    const sc = scrollableAncestor(target);
+    const top = sc ? sc.scrollTop : 0;
     target.style.height = "auto";
     target.style.height = `${target.scrollHeight + 2}px`;
+    if (sc) sc.scrollTop = top;
   };
   const set = (on) => {
     active = on;

@@ -1047,6 +1047,13 @@ async function fetchReviewCard(ev, ref, seq) {
   }
 }
 
+// The divider steps that decide/enact a zone's atomicity — the only steps where
+// locking a zone atomic is meaningful (and clean: the fork sits before the
+// zone's children, so forcing it to a leaf strands nothing).
+function stepDecidesAtomicity(step) {
+  return !!step && (step.startsWith("zone_plan") || step.startsWith("zone_decompose"));
+}
+
 function reviewCard(ev, zoneCount = 1, { branch = null, label = null } = {}) {
   const body = el("div", { class: "rv-body" }, el("div", { class: "rv-loading", text: "loading…" }));
   const cmpBtn = el("button", {
@@ -1076,6 +1083,21 @@ function reviewCard(ev, zoneCount = 1, { branch = null, label = null } = {}) {
   const stepBtn = makeStepBtn(ev.slot, ev.model);
   // The LLM picker for this event's downstream sim — paired with "simulate".
   const simModelBtn = makeSimModelBtn(ev);
+  // "⚛ atomic" — lock THIS zone to a leaf when it's simulated. Only offered on
+  // the steps that decide/enact decomposition, where the lock is clean.
+  const atomicBtn = (ev.node && stepDecidesAtomicity(state.lab.step))
+    ? el("button", {
+        class: `ev-scene-btn lab-atomic-btn${state.lab.atomicLocks.has(ev.node) ? " on" : ""}`,
+        text: "⚛ atomic",
+        title: "lock this zone atomic — force it to a leaf (no decomposition) when this zone is simulated",
+        onclick: (e) => {
+          const locks = state.lab.atomicLocks;
+          if (locks.has(ev.node)) locks.delete(ev.node);
+          else locks.add(ev.node);
+          e.currentTarget.classList.toggle("on", locks.has(ev.node));
+        },
+      })
+    : null;
   const card = el("div", { class: "rv-card" },
     el("div", { class: "rv-head" },
       el("span", { class: "rv-slot", text: ev.slot }),
@@ -1093,6 +1115,7 @@ function reviewCard(ev, zoneCount = 1, { branch = null, label = null } = {}) {
         title: "run the current prompt edit on this event",
         onclick: () => testEvents([ev]),
       }),
+      atomicBtn,
       simModelBtn,
       simCellBtn,
       stepBtn,
@@ -1671,6 +1694,8 @@ async function forkOne(ev, overrides, { model = null, seed = null, version = nul
       seed,
       model,
       version,
+      // Lock this fork's zone atomic when the user flagged it (⚛ on the card).
+      atomic_locks: state.lab.atomicLocks.has(ev.node) ? [ev.node] : [],
     });
     const bid = resp.branch?.id;
     if (bid) {

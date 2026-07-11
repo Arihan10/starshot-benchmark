@@ -53,7 +53,7 @@ from app.core.slots import (
     Slot,
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
-from app.pipeline import divider, generation, object_wipe
+from app.pipeline import committed, divider, generation, object_wipe
 from app.services import llm, prefabs, threed
 from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
@@ -219,6 +219,9 @@ class Branch:
     # Next-launch gate intent for a PAUSED branch (budget / auto / until /
     # model) — consumed by `_run_branch` when a step advance relaunches it.
     gate_intent: dict[str, object] = field(default_factory=dict)
+    # Node ids this branch has LOCKED to atomic — the prompt-lab "lock a zone
+    # atomic" test override, forced into `is_atomic` when the branch re-runs.
+    atomic_locks: list[str] = field(default_factory=list)
 
 
 # branch_id -> Branch. Process-global: ids are unique across runs, and each
@@ -544,6 +547,9 @@ class BranchRequest(BaseModel):
     # Run this branch under a source version instead of the run snapshot — the
     # prompt-set A/B lineage (the current-version lineage omits it).
     version: str | None = None
+    # Node ids to LOCK atomic for this fork — the prompt-lab "lock a zone atomic"
+    # toggle. Each forces `is_atomic=True` so the zone is a leaf when it re-runs.
+    atomic_locks: list[str] = []
 
 
 class BranchStepRequest(BaseModel):
@@ -1005,6 +1011,7 @@ def _branch_manifest(br: Branch) -> dict[str, object]:
         "overrides": br.overrides,
         "model_pin": br.model_pin,
         "version": br.version,
+        "atomic_locks": br.atomic_locks,
     }
 
 
@@ -1516,6 +1523,7 @@ def _hydrate_branches(run: str) -> None:
             log=blog,
             model_pin=data.get("model_pin") if isinstance(data.get("model_pin"), str) else None,
             version=data.get("version") if isinstance(data.get("version"), str) else None,
+            atomic_locks=(list(data["atomic_locks"]) if isinstance(data.get("atomic_locks"), list) else []),
         )
 
 
@@ -3105,6 +3113,7 @@ def create_app() -> FastAPI:
             overrides=req.overrides, seed=req.seed,
             model_pin=pin, gate_budget=1 if pin else 0,
             version=req.version,
+            atomic_locks=req.atomic_locks,
         )
         return {
             "branch": _branch_summary(br),
@@ -4604,6 +4613,7 @@ async def _fork_branch(
     model_pin: str | None = None,
     gate_budget: int = 0,
     version: str | None = None,
+    atomic_locks: list[str] | None = None,
 ) -> Branch:
     """Fork a new simulation branch (allocating a fresh id) and start it gated.
     Many forks of one cell coexist — nothing prior is discarded.
@@ -4701,6 +4711,7 @@ async def _fork_branch(
         overrides={s: dict(r) for s, r in overrides.items()},
         log=blog, model_pin=model_pin, version=version,
         gate_intent={"budget": gate_budget} if gate_budget else {},
+        atomic_locks=list(atomic_locks or []),
     )
     _branches[bid] = br
     _write_branch_manifest(br)
@@ -4763,6 +4774,7 @@ async def _run_branch(branch_id: str) -> None:
     br = _branches[branch_id]
     blog = br.log
     rlog.bind(blog)
+    committed.bind_forced_atomic(br.atomic_locks)
     intent = br.gate_intent or {}
     br.gate_intent = {}
     pin = intent.get("model") or br.model_pin

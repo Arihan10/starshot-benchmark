@@ -33,10 +33,13 @@ it is essential that you DO NOT just list out objects that make sense in the reg
 in your description DO NOT use flowery language, do not adjectivize every object. you should be concise and direct with your wording, coveying the layout efficiently by semantically placing objects relative to eachother and existing geometry. do not be meta about the prompt and pipeline as a whole, though good within your reasoning, DO NOT enumerate things the prompt tells you focus on, DO NOT output meta quantities like the mood or atmosphere, DO NOT output quantities like coordinates or dimensions. finally, your role is to expand a description of the scene, there is no need to reiterate qualities that all downstream steps will recieve as well; ex. surrounding regions' positions, what other objects already exist, transition points, etc. 
 
 <region_decomposition>
-also decide is_atomic: does this region get an object generation pass now, or decompose into subregions? larger regions come out sparser from a single pass - not inherently bad, since ideal sparsity depends on the scene's purpose and the region's narrative (distinct function vs. open, negative-space-like area).
+also decide is_atomic: does this region get an object generation pass now, or decompose into subregions? larger regions come out sparser from a single pass - it's not inherently bad, since ideal sparsity depends on the scene's purpose and the region's narrative (distinct function vs. open, negative-space-like area).
 
-read a region's function from its id, baseline idea, and your description. decompose (is_atomic=false) when it spans multiple distinct functions or is far too large for its function - either way a single pass leaves it visibly sparse (e.g. a floor with living + kitchen + dining, a plaza with several activity zones). but a school courtyard or empty desert, however large, stays one region: one function, and size matches it.
-never mention subdivision in the description — is_atomic alone decides that.
+read a region's function from its id, baseline idea, and your description. decompose the region into subregions (is_atomic=false) when it has multiple functions that can be seperated or is too large for its function, either way a single pass leaves it visibly sparse (e.g. a floor with living + kitchen + dining, a plaza with several activity zones) but a school courtyard or empty desert, however large, stays one region: one function, and size matches it.
+
+don't worry about subdivided regions feeling disjoint, if it serves multiple functions, choose to decompose into subregions, trust that subdivided siblings will look cohesive when put together. 
+
+never mention subdivision in the description - is_atomic alone decides that.
 </region_decomposition>
 
 <thinking> 

@@ -74,7 +74,7 @@ async def _plan_zone(
     Works for any zone (root or nested) — the root just passes empty `nodes`."""
     hit = committed.zone_plan(zone_id)
     if hit is not None:
-        return hit
+        return committed.apply_atomic_lock(zone_id, hit)
     ps = prompt_store.current()
     if not nodes:
         step = "zone_plan_root"
@@ -92,7 +92,7 @@ async def _plan_zone(
             target_text="This is the region you are to plan and flesh out from.",
         )
         output_schema = schemas.ZonePlanOutput
-    return await llm.call_llm(
+    out = await llm.call_llm(
         system=ps.system(step, variables),
         user=ps.user(step, variables),
         output_schema=output_schema,
@@ -101,6 +101,7 @@ async def _plan_zone(
         template=step,
         variables=variables,
     )
+    return committed.apply_atomic_lock(zone_id, out)
 
 
 async def _decompose_zone(

@@ -58,6 +58,10 @@ export const state = {
     // forks an extra lineage per target under this version, side by side with
     // one under the run's current prompts. null ⇒ single-version simulate.
     compareVersion: null,
+    // Zone node ids the user has locked to atomic for their next simulation:
+    // each forked branch forces `is_atomic=true` on its zone, so it's tested as
+    // a leaf (no further decomposition). Step-independent like `selection`.
+    atomicLocks: new Set(),
   },
 };
 
