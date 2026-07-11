@@ -38,11 +38,39 @@ when an object was decomposed but never bbox-resolved.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from contextvars import ContextVar
 from typing import Any
 
 from app.core import schemas
 from app.core.types import BoundingBox
 from app.utils import logging
+
+
+# --- prompt-lab "lock atomic" override --------------------------------------
+# Node ids the active simulation branch has LOCKED to atomic: a per-branch test
+# override that forces `is_atomic=True` on a zone's plan when the branch re-runs
+# the divider, so the zone is treated as a leaf (no decomposition) regardless of
+# the LLM's — or the committed — decision. Task-local (a ContextVar, like the
+# prompt-set / slot-log bindings); default empty ⇒ no locks, so source-cell runs
+# are unaffected. Re-applied on every run, so it holds across resume even though
+# the log's committed `is_atomic` may still read false.
+_forced_atomic: ContextVar[frozenset[str]] = ContextVar(
+    "forced_atomic", default=frozenset()
+)
+
+
+def bind_forced_atomic(node_ids: Iterable[str] | None) -> None:
+    """Bind the current task's forced-atomic node set — call at branch entry."""
+    _forced_atomic.set(frozenset(node_ids or ()))
+
+
+def apply_atomic_lock(node_id: str, plan_out: Any) -> Any:
+    """Return `plan_out` with `is_atomic` forced True when the active branch has
+    locked `node_id` atomic; otherwise return it unchanged."""
+    if node_id in _forced_atomic.get() and not plan_out.is_atomic:
+        plan_out.is_atomic = True
+    return plan_out
 
 
 def zone_plan(node_id: str) -> Any | None:

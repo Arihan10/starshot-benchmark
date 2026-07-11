@@ -60,6 +60,7 @@ function resetLabSession() {
   state.lab.sims = new Map();
   state.lab.simStep = null;
   state.lab.simEditedSteps = [];
+  state.lab.atomicLocks = new Set();
 }
 
 async function switchRun(name) {

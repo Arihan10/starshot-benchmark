@@ -59,7 +59,7 @@ MODELS: dict[str, str] = {
     "opus": "anthropic/claude-opus-4.6",
     "deepseek": "deepseek/deepseek-v4-pro",
     "opus-new": "anthropic/claude-opus-4.8",
-    "opus-fable": "anthropic/claude-fable-latest",
+    "opus-fable": "anthropic/claude-fable-5",
     "grokky": "x-ai/grok-4.5",
     "glm": "z-ai/glm-5.2",
     "qwen": "qwen/qwen3.7-max",
@@ -70,6 +70,8 @@ MODELS: dict[str, str] = {
     "gemma": "google/gemma-4-31b-it",
     "hy3": "tencent/hy3", 
     "luna-pro": "openai/gpt-5.6-luna-pro",
+    "terra-pro": "openai/gpt-5.6-terra-pro",
+    "sol-pro": "openai/gpt-5.6-sol-pro"
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())
