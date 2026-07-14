@@ -127,12 +127,12 @@ const LOG_BUILDERS = {
     "mesh.submit": null,
     "llm.json_decode_error": (e) => [
         e.final ? "error" : "warn",
-        `LLM JSON decode${e.final ? " (final attempt)" : ""}: ${e.reason ?? ""}`,
+        `LLM JSON decode${e.final ? " (final attempt)" : ""}${e.code != null ? ` [HTTP ${e.code}]` : ""}: ${e.reason ?? ""}`,
     ],
     "llm.retry": (e) => ["warn", `LLM parse retry: ${e.reason ?? ""}`],
     "llm.transport_retry": (e) => [
         "warn",
-        `provider flap (attempt ${e.attempt ?? "?"}, backoff ${e.backoff_s ?? "?"}s): ${e.reason ?? ""}`,
+        `provider flap (attempt ${e.attempt ?? "?"}${e.code != null ? `, HTTP ${e.code}` : ""}, backoff ${e.backoff_s ?? "?"}s): ${e.reason ?? ""}`,
     ],
     "llm.validation_retry": (e) => [
         "warn",

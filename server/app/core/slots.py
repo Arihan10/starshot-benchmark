@@ -70,7 +70,12 @@ MODELS: dict[str, str] = {
     "sonnet": "anthropic/claude-sonnet-4.6",
     "sonnet-new": "anthropic/claude-sonnet-5",
     "minimax": "minimax/minimax-m3",
-    "gemma": "google/gemma-4-31b-it"
+    "gemma": "google/gemma-4-31b-it",
+    # Custom OpenAI-compatible endpoints (bypass OpenRouter, $0 in the cost
+    # meter). The VALUE must match a key in `app.services.llm.CUSTOM_ENDPOINTS`,
+    # which routes it to that endpoint's `{base_url}/chat/completions`. The alias
+    # is otherwise normal — it adds a selectable column per slot.
+    "hy3": "custom/hy3",
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())

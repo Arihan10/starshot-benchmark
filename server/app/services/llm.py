@@ -13,10 +13,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import sys
 from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import TypeVar
 
 import httpx
@@ -52,6 +55,92 @@ def current_model() -> str:
     if model is None:
         raise RuntimeError("llm.set_model() must be called before current_model()")
     return model
+
+
+# --- Custom OpenAI-compatible endpoints (bypass OpenRouter) -----------------
+#
+# The pipeline normally routes every call through the OpenRouter SDK. To
+# benchmark a model served by our OWN OpenAI-compatible endpoint (a local
+# vLLM/SGLang, a Modal gateway, a proxy, ...) WITHOUT it hitting OpenRouter or
+# accruing spend, register it here.
+#
+# The hard filter is the model id itself: whatever `set_model()` binds (the
+# VALUE side of `app.core.slots.MODELS`) is looked up in this registry on every
+# call. A match short-circuits the OpenRouter transport in `call_llm_once` /
+# `chat` and issues a plain httpx POST to `{base_url}/chat/completions` instead.
+#
+# Cost: a custom call is NEVER given a generation_id (there's no OpenRouter
+# billing record to price), so `call_llm` logs `generation_id=None`, the cost
+# backfill skips it, and `_usage_summary` counts it as a request at $0 with 0
+# pending. Tokens are still surfaced when the endpoint returns a `usage` block.
+#
+# To activate one:
+#   1. Add a CustomEndpoint below, keyed by the model id you'll route on
+#      (e.g. "custom/local-model").
+#   2. Point an alias at that same id in `app.core.slots.MODELS` so the
+#      dashboard can select it (e.g. "custom": "custom/local-model").
+# Attention analysis stays gated off for it (no open-weight spec), same as any
+# closed model — see app.attention.models.resolve_open_model.
+
+
+@dataclass(frozen=True)
+class CustomEndpoint:
+    """One OpenAI-compatible chat-completions backend that replaces OpenRouter
+    for a specific model id."""
+
+    # Model id sent in the request body (what the endpoint expects). May differ
+    # from the registry key, which is the id the pipeline routes on.
+    model: str
+    # OpenAI-compatible API root, e.g. "http://localhost:8000/v1" (no trailing
+    # slash). "/chat/completions" is appended.
+    base_url: str
+    # Env var holding the bearer key; None for auth-less endpoints.
+    api_key_env: str | None = None
+    # Generation cap; None defers to the endpoint's default.
+    max_tokens: int | None = None
+    # Extra request-body fields merged verbatim (e.g. {"reasoning": {"effort":
+    # "high"}} or {"temperature": 0.7}). The endpoint owns these knobs — nothing
+    # OpenRouter-specific (require_parameters, provider routing) is sent here.
+    extra: dict[str, object] = field(default_factory=dict)
+
+
+# Keyed by the model id `set_model()` binds (the value side of core.slots.MODELS).
+# With no entries every call goes to OpenRouter exactly as before.
+CUSTOM_ENDPOINTS: dict[str, CustomEndpoint] = {
+    # Tencent Hy3 (Hy3-FP8) served by our own vLLM router on Modal. Auth-less
+    # (the reference client's api_key "EMPTY" == no bearer, verified: requests
+    # with no Authorization header return 200). hy3 is a reasoning model whose
+    # thinking is a CHAT-TEMPLATE kwarg — it reasons when reasoning_effort !=
+    # "no_think" and returns the trace on `message.reasoning` (NOT inline
+    # <think> tags, verified live). Critically, guided decoding
+    # (`response_format: json_schema`, strict) and reasoning COEXIST: content is
+    # clean schema-conforming JSON while reasoning rides its own field — so the
+    # all-structured pipeline works unchanged. $0 in the cost meter (a custom
+    # call gets no generation_id). max_tokens is left unset so verbose reasoning
+    # can't truncate the JSON body against a tight cap (262k context).
+    "custom/hy3": CustomEndpoint(
+        model="hy3",
+        base_url="https://starshot-aitools--hy3-vllm-openai-router.modal.run/v1",
+        api_key_env=None,
+        extra={
+            "chat_template_kwargs": {
+                "reasoning_effort": "high",
+                "enable_thinking": True,
+            },
+        },
+    ),
+}
+
+
+def _custom_endpoint(model: str | None) -> CustomEndpoint | None:
+    """The CustomEndpoint a model id routes to, or None to use OpenRouter."""
+    return CUSTOM_ENDPOINTS.get(model) if model else None
+
+
+# Custom endpoints may be local/cold-starting and form the whole response at
+# once, so the read window is generous (mirrors the one-shot dLLM client);
+# there's no token stream to keep the connection chatty.
+_CUSTOM_TIMEOUT = httpx.Timeout(connect=30.0, read=900.0, write=60.0, pool=60.0)
 
 
 # Model-specific runtime injections — quirks of particular providers, NOT
@@ -136,6 +225,18 @@ def _looks_like_logprobs_unsupported(e: Exception) -> bool:
         kw in msg
         for kw in ("logprob", "no endpoints", "no allowed providers", "does not support")
     )
+
+
+def _http_status(e: BaseException) -> int | None:
+    """Best-effort backend HTTP status off an OpenRouter/httpx error, for the
+    retry log's `code` field. None when the flap carried no response (a dropped
+    connection or timeout) — those have no status to attribute it to."""
+    for attr in ("raw_response", "response"):
+        code = getattr(getattr(e, attr, None), "status_code", None)
+        if isinstance(code, int):
+            return code
+    code = getattr(e, "status_code", None)
+    return code if isinstance(code, int) else None
 
 
 def _serialize_logprobs(choice: object) -> dict[str, object] | None:
@@ -450,6 +551,22 @@ async def call_llm_once(
     SlotLog binding) skips the per-attempt diagnostic events so no `logging`
     ContextVar is required."""
 
+    # Hard filter: a registered custom id bypasses OpenRouter entirely and is
+    # served by our own OpenAI-compatible endpoint at $0 cost (no generation_id).
+    cfg = _custom_endpoint(model)
+    if cfg is not None:
+        return await _call_custom_once(
+            cfg,
+            system=system,
+            user=user,
+            output_schema=output_schema,
+            model=model,
+            validate=validate,
+            step=step,
+            log_retries=log_retries,
+            sampling=sampling,
+        )
+
     def _retry_log(kind: str, **data: object) -> None:
         if log_retries:
             logging.log(kind, **data)
@@ -624,6 +741,263 @@ async def call_llm_once(
                 reason=f"{type(e).__name__}: {str(e)[:200]}",
                 attempt=transport_attempt,
                 backoff_s=backoff,
+                code=_http_status(e),  # backend HTTP status (429/503/…); None on a dropped connection
+            )
+            await asyncio.sleep(backoff)
+            transport_attempt += 1
+        except (ValidationError, ValueError, KeyError, IndexError, TypeError, AttributeError) as e:
+            if parse_attempt >= PARSE_MAX - 1:
+                raise
+            _retry_log("llm.retry", reason=f"{type(e).__name__}: {str(e)[:160]}")
+            parse_attempt += 1
+
+
+class CustomEndpointError(Exception):
+    """A custom OpenAI-compatible endpoint returned a non-retryable (4xx) error
+    — a config problem (bad model id, auth, unsupported body), not a flap. It
+    exhausts no resample/transport budget; the call fails fast."""
+
+
+class _EmptyResponseError(httpx.HTTPError):
+    """A self-hosted endpoint returned a 2xx with an EMPTY body/answer. On our
+    Modal-hosted vLLM router that means the edge was cold-starting, the request
+    timed out, or it was cancelled — the proxy forwards the empty 2xx through
+    unchanged (it only absorbs 3xx/4xx/5xx transients). That's infrastructure,
+    NOT the model emitting bad JSON, so we subclass httpx.HTTPError to retry it
+    on the transport budget (longer, cold-start backoff) instead of spending the
+    parse budget and mis-blaming the model with an `llm.json_decode_error`."""
+
+
+def _custom_headers(cfg: CustomEndpoint) -> dict[str, str]:
+    headers = {"Content-Type": "application/json"}
+    if cfg.api_key_env is not None:
+        key = os.environ.get(cfg.api_key_env)
+        if not key:
+            raise CustomEndpointError(
+                f"{cfg.api_key_env} is not set — required for {cfg.model} at {cfg.base_url}"
+            )
+        headers["Authorization"] = f"Bearer {key}"
+    return headers
+
+
+def _custom_reasoning(message: dict[str, object]) -> str:
+    """The reasoning trace wherever an OpenAI-compatible endpoint puts it
+    (`reasoning` or `reasoning_content`); empty when it emits none."""
+    for k in ("reasoning", "reasoning_content"):
+        v = message.get(k)
+        if isinstance(v, str) and v:
+            return v
+    return ""
+
+
+_THINK_RE = re.compile(r"<think>(.*?)</think>", re.DOTALL)
+
+
+def _split_think_tags(content: str) -> tuple[str, str]:
+    """Pull inline `<think>...</think>` reasoning out of `content`, returning
+    `(reasoning, cleaned_content)` and unwrapping any `<answer>...</answer>`.
+
+    A vLLM `--reasoning-parser` normally separates thinking into the `reasoning`
+    field, leaving `content` clean (this is what hy3 does — verified live). This
+    is the FALLBACK for a server/config that leaves the scaffold inline, so the
+    JSON body still parses and the reasoning is still captured (mirrors the
+    reference hy3 client). Caller only invokes it when `<think>` is present, so
+    the normal clean-content path is byte-identical."""
+    m = _THINK_RE.search(content)
+    if m:
+        reasoning, answer = m.group(1), content[m.end():]
+    else:  # opened but never closed (shouldn't happen on a non-streamed body)
+        reasoning, answer = content.split("<think>", 1)[1], ""
+    answer = answer.replace("<answer>", "").replace("</answer>", "")
+    return reasoning.strip(), answer.strip()
+
+
+def _custom_usage(usage: object) -> object | None:
+    """Wrap the endpoint's `usage` dict as an attribute object so `call_llm`'s
+    `getattr(usage, "prompt_tokens", None)` reads it the same as an SDK usage.
+    None when the endpoint omitted usage (tokens then show as blank, like a
+    provider that skips usage on the OpenRouter path)."""
+    if not isinstance(usage, dict):
+        return None
+    return SimpleNamespace(
+        prompt_tokens=usage.get("prompt_tokens"),
+        completion_tokens=usage.get("completion_tokens"),
+    )
+
+
+async def _call_custom_once(
+    cfg: CustomEndpoint,
+    *,
+    system: str,
+    user: str,
+    output_schema: type[T],
+    model: str,
+    validate: Callable[[T], None] | None = None,
+    step: str | None = None,
+    log_retries: bool = True,
+    sampling: dict[str, object] | None = None,
+) -> tuple[T, str, object, object, list[str], dict[str, object] | None]:
+    """`call_llm_once` for a hard-filtered custom id: a plain httpx POST to
+    `{cfg.base_url}/chat/completions` (OpenAI-compatible, `response_format:
+    json_schema`) instead of the OpenRouter SDK, keeping the SAME
+    parse/validate/transport resample budgets and the SAME return contract.
+
+    The 5th tuple slot (`generation_ids`) is ALWAYS empty: a custom call has no
+    OpenRouter billing record, so `call_llm` logs `generation_id=None`, the cost
+    backfill skips it, and `_usage_summary` prices it at $0 with 0 pending. The
+    6th (`logprobs`) is always None — the OpenRouter-specific top-token capture
+    doesn't ride this path."""
+
+    def _retry_log(kind: str, **data: object) -> None:
+        if log_retries:
+            logging.log(kind, **data)
+
+    parse_attempt = 0
+    transport_attempt = 0
+    id_validation_attempt = 0
+    PARSE_MAX = 4
+    TRANSPORT_MAX = 8
+    ID_VALIDATION_MAX = 5
+    TRANSPORT_BACKOFF = [2, 4, 8, 16, 30, 30, 30, 30]
+
+    url = f"{cfg.base_url}/chat/completions"
+    headers = _custom_headers(cfg)
+    body: dict[str, object] = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": output_schema.__name__,
+                "strict": True,
+                # Raw wire key is "schema" (the OpenRouter SDK's alias is
+                # "schema_"); a plain OpenAI-compatible endpoint wants "schema".
+                "schema": _normalize_schema(output_schema.model_json_schema()),
+            },
+        },
+        "stream": False,
+    }
+    # Ablation temperature override, same as the OpenRouter path; the endpoint
+    # owns whether it honors it. Absent on every normal call.
+    if sampling and sampling.get("temperature") is not None:
+        body["temperature"] = sampling["temperature"]
+    if cfg.max_tokens is not None:
+        body["max_tokens"] = cfg.max_tokens
+    if cfg.extra:
+        body.update(cfg.extra)
+
+    while True:
+        content: object = None
+        finish_reason: object = None
+        status: object = None  # backend HTTP status, for the retry log's `code`
+        try:
+            async with httpx.AsyncClient(timeout=_CUSTOM_TIMEOUT) as client:
+                res = await client.post(url, headers=headers, json=body)
+            status = res.status_code
+            # 5xx / cold-start hiccups are flaps (the model never saw the
+            # request) → transport retry; 4xx is a config error → fail fast.
+            if res.status_code >= 500:
+                raise httpx.HTTPError(f"HTTP {res.status_code}: {res.text[:500]}")
+            if res.status_code >= 400:
+                raise CustomEndpointError(
+                    f"{cfg.model} HTTP {res.status_code}: {res.text[:1000]}"
+                )
+            # A 2xx whose BODY isn't a real completion — EMPTY/blank, or not even
+            # valid JSON — is the vLLM/Modal edge cold-starting, timing out, or the
+            # request being cancelled (the proxy forwards the 2xx through unchanged,
+            # only absorbing 3xx/4xx/5xx). Infrastructure, not the model: retry on
+            # the transport budget instead of mis-blaming it as json_decode_error.
+            # (A malformed *content* string below — the model's own answer — still
+            # counts as a genuine parse failure.)
+            if not (res.text or "").strip():
+                raise _EmptyResponseError(f"empty HTTP {res.status_code} body")
+            try:
+                response = res.json()
+            except json.JSONDecodeError as e:
+                raise _EmptyResponseError(
+                    f"non-JSON HTTP {res.status_code} body: {res.text[:160]!r}"
+                ) from e
+            choice = (response.get("choices") or [{}])[0]
+            finish_reason = choice.get("finish_reason")
+            message = choice.get("message") or {}
+            content = message.get("content")
+            reasoning = _custom_reasoning(message)
+            # Fallback for a server that leaves the reasoning scaffold inline
+            # instead of on `message.reasoning` — strip it so the JSON parses.
+            # No-op for hy3 (clean content), so the normal path is untouched.
+            if isinstance(content, str) and "<think>" in content:
+                inline_reasoning, content = _split_think_tags(content)
+                reasoning = reasoning or inline_reasoning
+            # An empty / whitespace-only answer (a 2xx that never carried a real
+            # completion) is the same cold-start / cancel / timeout transient as
+            # an empty HTTP body — retry on the transport budget, NOT as bad JSON.
+            # The exception is finish_reason="length": the model DID answer but
+            # its (long) reasoning truncated the JSON — a real budget problem, so
+            # that stays on the parse path below.
+            if (
+                content is None or (isinstance(content, str) and not content.strip())
+            ) and finish_reason != "length":
+                raise _EmptyResponseError(
+                    f"empty answer body (HTTP {res.status_code}, finish_reason={finish_reason!r})"
+                )
+            args = json.loads(content) if isinstance(content, str) else content
+            if args is None:
+                refusal = message.get("refusal")
+                raise ValueError(
+                    "model returned no content "
+                    f"(finish_reason={choice.get('finish_reason')!r}, "
+                    f"refusal={refusal if isinstance(refusal, str) else None!r})"
+                )
+            validated = output_schema.model_validate(args)
+            if validate is not None:
+                validate(validated)
+            usage = _custom_usage(response.get("usage"))
+            # Empty generation_ids → $0 in the cost meter (see docstring).
+            return validated, reasoning, usage, args, [], None
+        except OutputValidationError as e:
+            if id_validation_attempt >= ID_VALIDATION_MAX - 1:
+                raise
+            _retry_log(
+                "llm.validation_retry",
+                step=step,
+                reason=str(e),
+                attempt=id_validation_attempt,
+            )
+            id_validation_attempt += 1
+        except CustomEndpointError:
+            raise  # 4xx: config problem — no retry would help
+        except json.JSONDecodeError as e:
+            final = parse_attempt >= PARSE_MAX - 1
+            # finish_reason is the key attribution signal here: "length" = the
+            # (very long) reasoning ate the token budget so the JSON answer was
+            # truncated/empty; "stop" with empty content = the model ended after
+            # reasoning without emitting the answer. Logged so empties self-explain.
+            _retry_log(
+                "llm.json_decode_error",
+                step=step,
+                reason=f"JSONDecodeError: {e}",
+                attempt=parse_attempt,
+                final=final,
+                finish_reason=finish_reason,
+                code=status,
+                content=content if isinstance(content, str) else repr(content),
+            )
+            if final:
+                raise
+            parse_attempt += 1
+        except httpx.HTTPError as e:
+            if transport_attempt >= TRANSPORT_MAX - 1:
+                raise
+            backoff = TRANSPORT_BACKOFF[min(transport_attempt, len(TRANSPORT_BACKOFF) - 1)]
+            _retry_log(
+                "llm.transport_retry",
+                reason=f"{type(e).__name__}: {str(e)[:200]}",
+                attempt=transport_attempt,
+                backoff_s=backoff,
+                code=status,  # backend HTTP status (empty-body 2xx, 5xx flap, …); None on a dropped connection
             )
             await asyncio.sleep(backoff)
             transport_attempt += 1
@@ -722,6 +1096,11 @@ async def chat(
     cell's pipeline. It keeps only the transport-retry budget (provider flaps
     like Anthropic 503s); there is no JSON to parse, so no parse/validation
     resampling."""
+    cfg = _custom_endpoint(model)
+    if cfg is not None:
+        return await _chat_custom(
+            cfg, system=system, messages=messages, reasoning_effort=reasoning_effort
+        )
     transport_attempt = 0
     TRANSPORT_MAX = 8
     TRANSPORT_BACKOFF = [2, 4, 8, 16, 30, 30, 30, 30]
@@ -749,6 +1128,60 @@ async def chat(
             # Provider flap (Anthropic 503, dropped connection) — the model
             # never saw the request, so back off and resend, same budget as
             # call_llm_once's transport retries.
+            if transport_attempt >= TRANSPORT_MAX - 1:
+                raise
+            backoff = TRANSPORT_BACKOFF[min(transport_attempt, len(TRANSPORT_BACKOFF) - 1)]
+            await asyncio.sleep(backoff)
+            transport_attempt += 1
+
+
+async def _chat_custom(
+    cfg: CustomEndpoint,
+    *,
+    system: str,
+    messages: list[dict[str, str]],
+    reasoning_effort: str = "xhigh",
+) -> tuple[str, str]:
+    """`chat` for a hard-filtered custom id: a plain httpx POST to
+    `{cfg.base_url}/chat/completions` with no `response_format`, same
+    transport-retry budget, same `(text, reasoning)` return. `reasoning_effort`
+    is advisory here — the endpoint's own reasoning knobs come from `cfg.extra`
+    (nothing OpenRouter-shaped is assumed)."""
+    transport_attempt = 0
+    TRANSPORT_MAX = 8
+    TRANSPORT_BACKOFF = [2, 4, 8, 16, 30, 30, 30, 30]
+    url = f"{cfg.base_url}/chat/completions"
+    headers = _custom_headers(cfg)
+    body: dict[str, object] = {
+        "model": cfg.model,
+        "messages": [{"role": "system", "content": system}, *messages],
+        "stream": False,
+    }
+    if cfg.max_tokens is not None:
+        body["max_tokens"] = cfg.max_tokens
+    if cfg.extra:
+        body.update(cfg.extra)
+    while True:
+        try:
+            async with httpx.AsyncClient(timeout=_CUSTOM_TIMEOUT) as client:
+                res = await client.post(url, headers=headers, json=body)
+            if res.status_code >= 500:
+                raise httpx.HTTPError(f"HTTP {res.status_code}: {res.text[:500]}")
+            if res.status_code >= 400:
+                raise CustomEndpointError(
+                    f"{cfg.model} HTTP {res.status_code}: {res.text[:1000]}"
+                )
+            response = res.json()
+            choice = (response.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            content = message.get("content")
+            text = content if isinstance(content, str) else str(content or "")
+            reasoning = _custom_reasoning(message)
+            if "<think>" in text:
+                inline_reasoning, text = _split_think_tags(text)
+                reasoning = reasoning or inline_reasoning
+            return text, reasoning
+        except httpx.HTTPError:
             if transport_attempt >= TRANSPORT_MAX - 1:
                 raise
             backoff = TRANSPORT_BACKOFF[min(transport_attempt, len(TRANSPORT_BACKOFF) - 1)]

@@ -5,7 +5,7 @@
 
 import { el } from "../../js/ui.js";
 import { $, state } from "./state.js";
-import { stepLLM } from "./data.js";
+import { stepLLM, ensureEvents } from "./data.js";
 
 function section(label, text) {
 	const t = String(text ?? "");
@@ -18,16 +18,26 @@ function section(label, text) {
 		el("div", { class: "pv-sec-body" }, pre));
 }
 
-export function openPromptView(step) {
+export async function openPromptView(step) {
 	const root = $("modal-root");
 	if (!root || !step) return;
 	const ev = step.event_index;
-	const e = stepLLM(ev);
-	const tmpl = step.template ?? step.step ?? "?";
-	const node = step.node ? ` · ${step.node}` : "";
 
 	const onKey = (k) => { if (k.key === "Escape") close(); };
 	function close() { root.replaceChildren(); document.removeEventListener("keydown", onKey); }
+
+	// The prompt text lives in the cell's event log, pulled lazily on first use
+	// (the data/ablation views never download it). Show a spinner while it loads.
+	if (!Array.isArray(state.events)) {
+		root.replaceChildren(el("div", { class: "pv-overlay", onclick: (k) => { if (k.target === k.currentTarget) close(); } },
+			el("div", { class: "pv-panel" }, el("div", { class: "pv-empty", text: "loading prompts…" }))));
+		document.addEventListener("keydown", onKey);
+		try { await ensureEvents(); } catch { /* stepLLM falls back to the 'events not loaded' body */ }
+		if (!root.querySelector(".pv-overlay")) return; // closed while loading
+	}
+	const e = stepLLM(ev);
+	const tmpl = step.template ?? step.step ?? "?";
+	const node = step.node ? ` · ${step.node}` : "";
 
 	let body;
 	if (!e) {

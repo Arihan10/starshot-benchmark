@@ -247,6 +247,184 @@ export function stackAreaChart(layers, xs, opts = {}) {
 	return wrap;
 }
 
+// --- vertical bar chart ------------------------------------------------------
+// A categorical bar chart with a real x/y frame. Supports DIVERGING values (bars
+// grow up for positive, down for negative from a zero baseline) — used by the VII
+// Δ (attention − fit) view. bars: [{ value, color, label }]. opts: { width,
+// height, yFmt, yLabel, empty, tip(bar)->html, onClick(bar), hot(bar)->bool }.
+// The x-axis order is the caller's (sort before passing in).
+export function barChart(bars, opts = {}) {
+	if (!bars.length) return el("div", { class: "empty", text: opts.empty || "no data to plot" });
+	const W = Math.round(opts.width || 720), H = Math.round(opts.height || 300), fs = fontScale(W);
+	const padL = Math.round(40 + 10 * fs), padR = 12, padT = Math.round(10 + 6 * fs), padB = Math.round(16 + 12 * fs);
+	const px0 = padL, px1 = W - padR, py0 = padT, py1 = H - padB;
+	const vals = bars.map((b) => +b.value || 0);
+	const maxV = Math.max(...vals), minV = Math.min(...vals);
+	const yTop = maxV > 0 ? niceMax(maxV) : 0;
+	const yBot = minV < 0 ? -niceMax(-minV) : 0;
+	const span = (yTop - yBot) || 1;
+	const Y = (v) => py1 - ((v - yBot) / span) * (py1 - py0);
+	const yf = opts.yFmt || ((v) => v.toFixed(2));
+	const svg = svgEl("svg", { class: "gsvg", viewBox: `0 0 ${W} ${H}`, width: W, height: H });
+	const ticks = [...new Set([yBot, yBot / 2, 0, yTop / 2, yTop])].filter((t) => t >= yBot - 1e-9 && t <= yTop + 1e-9);
+	for (const t of ticks) {
+		const yy = Y(t);
+		svg.appendChild(svgEl("line", { x1: px0, y1: yy, x2: px1, y2: yy, stroke: Math.abs(t) < 1e-12 ? "rgba(255,255,255,0.28)" : "rgba(255,255,255,0.07)" }));
+		svg.appendChild(svgEl("text", { x: px0 - 6, y: yy, fill: "rgba(220,230,245,0.62)", "font-size": fpx(11.5, fs), "text-anchor": "end", "dominant-baseline": "middle" }, yf(t)));
+	}
+	if (opts.yLabel) svg.appendChild(svgEl("text", { x: px0, y: py0 - fpx(2, fs), fill: "rgba(220,230,245,0.82)", "font-size": fpx(11.5, fs), "text-anchor": "start" }, opts.yLabel));
+	const n = bars.length, bw = (px1 - px0) / n, gap = Math.min(3, bw * 0.2), zeroY = Y(0);
+	const rects = [];
+	bars.forEach((b, i) => {
+		const x = px0 + i * bw + gap / 2, w = Math.max(1, bw - gap);
+		const yv = Y(+b.value || 0);
+		const top = Math.min(zeroY, yv), h = Math.max(1, Math.abs(yv - zeroY));
+		const hot = opts.hot ? !!opts.hot(b) : false;
+		const rect = svgEl("rect", { x: x.toFixed(2), y: top.toFixed(2), width: w.toFixed(2), height: h.toFixed(2), fill: b.color || "#7aa2f7", "fill-opacity": hot ? 1 : 0.85, rx: Math.min(2, w / 3).toFixed(1), stroke: hot ? "#fff" : "none", "stroke-width": hot ? 1.2 : 0, style: opts.onClick ? "cursor:pointer" : "" });
+		if (!opts.tip && b.label != null) rect.appendChild(svgEl("title", null, `${b.label} · ${yf(+b.value || 0)}`));
+		if (opts.onClick) rect.addEventListener("click", () => opts.onClick(b));
+		rects.push({ b, rect, cx: x + w / 2, hot });
+		svg.appendChild(rect);
+	});
+	const wrap = el("div", { class: "gwrap" }, svg);
+	if (opts.tip) barHover(wrap, { svg, W, H, px0, px1, py0, py1 }, rects, opts.tip);
+	return wrap;
+}
+// Nearest-bar hover for barChart: emphasize the bar under the cursor + show
+// tip(bar) HTML in a floating .graph-tip (same UX as scatterHover).
+function barHover(wrap, fr, rects, tipFn) {
+	if (!rects.length) return;
+	const tip = el("div", { class: "graph-tip scatter-tip" });
+	wrap.appendChild(tip);
+	let cur = null;
+	const reset = () => { if (cur) { cur.rect.setAttribute("stroke", cur.hot ? "#fff" : "none"); cur.rect.setAttribute("stroke-width", cur.hot ? 1.2 : 0); cur = null; } };
+	const hide = () => { tip.style.opacity = "0"; reset(); };
+	fr.svg.addEventListener("pointermove", (ev) => {
+		const r = fr.svg.getBoundingClientRect();
+		const vx = (ev.clientX - r.left) * (fr.W / (r.width || fr.W));
+		if (vx < fr.px0 - 2 || vx > fr.px1 + 2) return hide();
+		let best = null, bd = Infinity;
+		for (const rc of rects) { const dd = Math.abs(rc.cx - vx); if (dd < bd) { bd = dd; best = rc; } }
+		if (!best) return hide();
+		if (best !== cur) { reset(); best.rect.setAttribute("stroke", "#fff"); best.rect.setAttribute("stroke-width", 1.4); cur = best; }
+		tip.innerHTML = tipFn(best.b);
+		const wr = wrap.getBoundingClientRect();
+		const tw = tip.offsetWidth || 160, th = tip.offsetHeight || 60;
+		let left = ev.clientX - wr.left + 14; if (left + tw > wr.width) left = ev.clientX - wr.left - tw - 14;
+		let top = ev.clientY - wr.top + 12; if (top + th > wr.height) top = ev.clientY - wr.top - th - 12;
+		tip.style.left = Math.max(0, left) + "px"; tip.style.top = Math.max(0, top) + "px"; tip.style.opacity = "1";
+	});
+	fr.svg.addEventListener("pointerleave", hide);
+}
+
+// --- box-and-whisker (quartile) plot ----------------------------------------
+// Linear-interpolated quantile of a SORTED array.
+function quantile(sorted, q) {
+	const n = sorted.length;
+	if (!n) return 0;
+	if (n === 1) return sorted[0];
+	const pos = (n - 1) * q, lo = Math.floor(pos), hi = Math.min(n - 1, lo + 1), t = pos - lo;
+	return sorted[lo] * (1 - t) + sorted[hi] * t;
+}
+// Five-number summary + Tukey whiskers (1.5·IQR, clamped to real data) + outliers.
+export function boxStats(values) {
+	const s = [...values].sort((a, b) => a - b), n = s.length;
+	const q1 = quantile(s, 0.25), med = quantile(s, 0.5), q3 = quantile(s, 0.75), iqr = q3 - q1;
+	const loF = q1 - 1.5 * iqr, hiF = q3 + 1.5 * iqr;
+	let wLo = s[0], wHi = s[n - 1];
+	for (const v of s) { if (v >= loF) { wLo = v; break; } }
+	for (let i = n - 1; i >= 0; i--) { if (s[i] <= hiF) { wHi = s[i]; break; } }
+	const outliers = s.filter((v) => v < wLo || v > wHi);
+	const mean = s.reduce((a, v) => a + v, 0) / n;
+	return { n, min: s[0], max: s[n - 1], q1, med, q3, mean, wLo, wHi, outliers };
+}
+// Grouped box plot. clusters: [{ label, boxes: [{ label, color, values:[] }] }].
+// Each box draws a Q1–Q3 box, a median line, a mean tick, 1.5·IQR whiskers and
+// outlier dots; boxes are packed into labeled clusters along x (e.g. one cluster
+// per step kind, one box per tag). opts: { width, height, yLabel, yFmt, yMax,
+// empty, tip(entry)->html }. Renders at its own width (scroll if it overflows).
+export function boxPlotChart(clusters, opts = {}) {
+	const active = [];
+	for (const c of clusters || []) { const bs = (c.boxes || []).filter((b) => (b.values || []).length); if (bs.length) active.push({ label: c.label, boxes: bs }); }
+	if (!active.length) return el("div", { class: "empty", text: opts.empty || "no data to plot" });
+	const W = Math.round(opts.width || 900), fs = fontScale(W), H = Math.round(opts.height || 360);
+	const BOX_W = Math.round(22 + 8 * fs), BOX_GAP = Math.round(7 * fs), CLUSTER_GAP = Math.round(30 * fs);
+	const padL = Math.round(40 + 12 * fs), padR = 14, padT = Math.round(10 + 6 * fs), padB = Math.round(30 + 18 * fs);
+	// lay boxes out left→right, tracking each cluster's x-span for its label
+	let x = padL + CLUSTER_GAP / 2, ymax = 0;
+	const laid = [];
+	for (const c of active) {
+		const start = x;
+		const boxes = c.boxes.map((b) => {
+			const st = boxStats(b.values), xc = x + BOX_W / 2;
+			ymax = Math.max(ymax, st.max);
+			x += BOX_W + BOX_GAP;
+			return { label: b.label, color: b.color, st, xc };
+		});
+		x -= BOX_GAP;
+		laid.push({ cluster: c.label, boxes, x0: start, x1: x });
+		x += CLUSTER_GAP;
+	}
+	const svgW = Math.max(W, Math.round(x - CLUSTER_GAP + padR));
+	const px0 = padL, px1 = svgW - padR, py0 = padT, py1 = H - padB;
+	const yMax = opts.yMax != null ? opts.yMax : niceMax(ymax || 1e-9);
+	const Y = (v) => py1 - (Math.max(0, Math.min(yMax, v)) / yMax) * (py1 - py0);
+	const yf = opts.yFmt || ((v) => v.toFixed(2));
+	const svg = svgEl("svg", { class: "gsvg", viewBox: `0 0 ${svgW} ${H}`, width: svgW, height: H });
+	for (const f of [0, .25, .5, .75, 1]) {
+		const yy = py1 - f * (py1 - py0);
+		svg.appendChild(svgEl("line", { x1: px0, y1: yy, x2: px1, y2: yy, stroke: "rgba(255,255,255,0.07)" }));
+		svg.appendChild(svgEl("text", { x: px0 - 6, y: yy, fill: "rgba(220,230,245,0.62)", "font-size": fpx(12, fs), "text-anchor": "end", "dominant-baseline": "middle" }, yf(yMax * f)));
+	}
+	if (opts.yLabel) svg.appendChild(svgEl("text", { x: 13, y: (py0 + py1) / 2, fill: "rgba(220,230,245,0.82)", "font-size": fpx(12.5, fs), "text-anchor": "middle", transform: `rotate(-90 13 ${(py0 + py1) / 2})` }, opts.yLabel));
+	const hw = Math.max(3, BOX_W / 2), cap = hw * 0.7;
+	const entries = [];
+	for (const c of laid) {
+		for (const b of c.boxes) {
+			const { st, xc, color } = b;
+			// whisker line + caps
+			svg.appendChild(svgEl("line", { x1: xc, y1: Y(st.wLo).toFixed(1), x2: xc, y2: Y(st.wHi).toFixed(1), stroke: hexA(color, 0.6), "stroke-width": 1.2 }));
+			svg.appendChild(svgEl("line", { x1: (xc - cap).toFixed(1), y1: Y(st.wHi).toFixed(1), x2: (xc + cap).toFixed(1), y2: Y(st.wHi).toFixed(1), stroke: hexA(color, 0.7), "stroke-width": 1.2 }));
+			svg.appendChild(svgEl("line", { x1: (xc - cap).toFixed(1), y1: Y(st.wLo).toFixed(1), x2: (xc + cap).toFixed(1), y2: Y(st.wLo).toFixed(1), stroke: hexA(color, 0.7), "stroke-width": 1.2 }));
+			// box (Q1–Q3)
+			const yT = Y(st.q3), yB = Y(st.q1);
+			svg.appendChild(svgEl("rect", { x: (xc - hw).toFixed(1), y: yT.toFixed(1), width: (hw * 2).toFixed(1), height: Math.max(1, yB - yT).toFixed(1), fill: hexA(color, 0.3), stroke: color, "stroke-width": 1.3, rx: 2 }));
+			// median (bright) + mean (thin dashed)
+			svg.appendChild(svgEl("line", { x1: (xc - hw).toFixed(1), y1: Y(st.med).toFixed(1), x2: (xc + hw).toFixed(1), y2: Y(st.med).toFixed(1), stroke: color, "stroke-width": 2.4 }));
+			svg.appendChild(svgEl("line", { x1: (xc - hw).toFixed(1), y1: Y(st.mean).toFixed(1), x2: (xc + hw).toFixed(1), y2: Y(st.mean).toFixed(1), stroke: "rgba(255,255,255,0.7)", "stroke-width": 1, "stroke-dasharray": "3 2" }));
+			for (const o of st.outliers) svg.appendChild(svgEl("circle", { cx: xc.toFixed(1), cy: Y(o).toFixed(1), r: 2.2, fill: color, "fill-opacity": 0.7 }));
+			entries.push({ cluster: c.cluster, label: b.label, color, st, xc });
+		}
+		// cluster (step-kind) label, centered under its boxes
+		const cxm = (c.x0 + c.x1) / 2;
+		svg.appendChild(svgEl("line", { x1: c.x0.toFixed(1), y1: (py1 + 6).toFixed(1), x2: c.x1.toFixed(1), y2: (py1 + 6).toFixed(1), stroke: "rgba(220,230,245,0.22)", "stroke-width": 1 }));
+		svg.appendChild(svgEl("text", { x: cxm.toFixed(1), y: (py1 + fpx(18, fs)).toFixed(1), fill: "rgba(220,230,245,0.82)", "font-size": fpx(12, fs), "text-anchor": "middle" }, c.cluster));
+	}
+	const wrap = el("div", { class: "gwrap" }, svg);
+	if (opts.tip) boxHover(wrap, { svg, W: svgW, H, px0, px1, py0, py1 }, entries, opts.tip, hw + BOX_GAP);
+	return wrap;
+}
+function boxHover(wrap, fr, entries, tipFn, reach) {
+	if (!entries.length) return;
+	const tip = el("div", { class: "graph-tip scatter-tip" });
+	wrap.appendChild(tip);
+	const hide = () => { tip.style.opacity = "0"; };
+	fr.svg.addEventListener("pointermove", (ev) => {
+		const r = fr.svg.getBoundingClientRect(), sc = fr.W / (r.width || fr.W);
+		const vx = (ev.clientX - r.left) * sc;
+		let best = null, bd = Infinity;
+		for (const e of entries) { const dd = Math.abs(e.xc - vx); if (dd < bd) { bd = dd; best = e; } }
+		if (!best || bd > (reach || 20)) return hide();
+		tip.innerHTML = tipFn(best);
+		const wr = wrap.getBoundingClientRect();
+		const tw = tip.offsetWidth || 180, th = tip.offsetHeight || 70;
+		let left = ev.clientX - wr.left + 14; if (left + tw > wr.width) left = ev.clientX - wr.left - tw - 14;
+		let top = ev.clientY - wr.top + 12; if (top + th > wr.height) top = ev.clientY - wr.top - th - 12;
+		tip.style.left = Math.max(0, left) + "px"; tip.style.top = Math.max(0, top) + "px"; tip.style.opacity = "1";
+	});
+	fr.svg.addEventListener("pointerleave", hide);
+}
+
 // --- scatter -----------------------------------------------------------------
 // points: [{x,y,color,r,label}]. opts: { height, xLabel, xFmt, yFmt, xMax, yMax,
 // corrLabel, legend, refLine }.
@@ -506,7 +684,7 @@ function attachAxisTooltip(canvas, spots, logicalSize) {
 // the canvas ring + an axis legend decoding the abbreviations. `size` (px) makes
 // it fill the space it's given; the canvas is rendered at devicePixelRatio for
 // crisp text at any scale.
-export function spiderChart(profiles, { size = 340, axes = null, labelOf = null, colorOf = null } = {}) {
+export function spiderChart(profiles, { size = 340, axes = null, labelOf = null, colorOf = null, fillOpacity = 0.2, strokeOpacity = 1, lineWidth = 2, dots = true } = {}) {
 	const present = new Set(profiles.flatMap((p) => [...p.map.keys()]));
 	// Axes: an explicit ordered list (e.g. token-type classes) restricted to those
 	// actually present, else the fixed attribute axis order. `labelOf`/`colorOf` let
@@ -564,10 +742,14 @@ export function spiderChart(profiles, { size = 340, axes = null, labelOf = null,
 			i ? ctx.lineTo(x, y) : ctx.moveTo(x, y);
 		});
 		ctx.closePath();
-		ctx.fillStyle = `${color}33`; ctx.strokeStyle = color; ctx.lineWidth = 2;
-		ctx.fill(); ctx.stroke();
-		// vertex dots
-		components.forEach((_, i) => {
+		// globalAlpha (not a baked-in hex alpha) so the fill works for any color
+		// format (hex OR hsl) and the caller can make overlaid polygons translucent.
+		ctx.fillStyle = color; ctx.strokeStyle = color; ctx.lineWidth = lineWidth;
+		ctx.globalAlpha = fillOpacity; ctx.fill();
+		ctx.globalAlpha = strokeOpacity; ctx.stroke();
+		ctx.globalAlpha = 1;
+		// vertex dots (skipped when overlaying many polygons, to cut clutter)
+		if (dots) components.forEach((_, i) => {
 			const ang = -Math.PI / 2 + (i / components.length) * Math.PI * 2;
 			const val = Math.max(0, Math.min(1, norm[pi][i]));
 			if (val <= 0.001) return;

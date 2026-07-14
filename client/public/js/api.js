@@ -400,6 +400,27 @@ export const api = {
 	// `full` = the whole thing (debug/back-compat).
 	attentionGet: (run, slot, model, eventIndex, { view = "compact", i } = {}) =>
 		request(cellPath(slot, model, `/attention/${eventIndex}`), { params: { run, view, i }, cache: "no-cache" }),
+	// Batch a cell's stored per-step attention projections into ONE request (kills
+	// the per-step `attentionGet` N+1) plus a server-computed cell-wide rollup.
+	// `evs` = the explicit event indices to pull (array → comma list); omit to
+	// batch every computed step. `view`: agg (token-free rollups the data cards
+	// pool) | buckets (just the VII grids) | abl (ultra-light) | compact. Sent
+	// no-cache so an unchanged cell can 304 (ETag) instead of re-shipping the batch.
+	cellAggregate: (run, slot, model, { view = "agg", evs } = {}) =>
+		request(cellPath(slot, model, "/attention/cell-aggregate"), {
+			params: { run, view, evs: Array.isArray(evs) ? evs.join(",") : evs },
+			cache: "no-cache",
+		}),
+	// Discover a base cell's ablation variants server-side + batch each variant's
+	// treated-step `abl` projection in ONE request (collapses the client's /runs
+	// filter + per-variant index probe + per-variant fetch — the ablation N+1).
+	// `run` = the BASE run; `kind` optionally filters by target step kind. Returns
+	// { base_run, slot, model, variants:[{name, ablation, ev, a}], combos }.
+	ablationCompare: (run, slot, model, { kind } = {}) =>
+		request(cellPath(slot, model, "/ablation-compare"), {
+			params: { run, kind },
+			cache: "no-cache",
+		}),
 
 	// --- simulation branches (keyed by branch id) ---
 	// A branch is a first-class fork living in the run's flat `_branches/<id>/`

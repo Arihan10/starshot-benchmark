@@ -8,7 +8,7 @@ import { $, state, ALL, bumpLoad } from "./modules/state.js";
 import {
 	loadRuns, loadCell, loadSteps, computedSteps, regionOptions, stepOptions, loadRows, selectedSteps,
 } from "./modules/data.js";
-import { spiderCard, compositionCard, rhoFocusCard, outputCard, tagsCard, viiCard } from "./modules/cards.js";
+import { spiderCard, compositionCard, structureCard, rhoFocusCard, outputCard, tagsCard, viiCard } from "./modules/cards.js";
 import { renderAblation } from "./modules/ablation.js";
 import { renderContent, closeContentWindows } from "./modules/content.js";
 import { openPromptView } from "./modules/promptview.js";
@@ -164,6 +164,7 @@ async function renderCards(view, innerId) {
 		scopeLine(shown.length, total);
 		cardsHost.replaceChildren(
 			el("div", { class: "dv-row" }, spiderCard(shown), compositionCard(shown)),
+			structureCard(shown),
 			rhoFocusCard(shown),
 			outputCard(shown),
 			tagsCard(shown),

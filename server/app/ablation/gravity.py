@@ -225,6 +225,44 @@ def _build(prefix: str, inner: str, suffix: str, mode: str) -> tuple[str, dict[s
     return text, smap
 
 
+def rederive_sentences(user: str, logged: dict[str, Any]) -> list[dict[str, Any]]:
+    """Per-sentence spans (offsets into `user`, + snippets) DERIVED at attribution
+    time from the committed rewritten `user` and a logged `__GRAVITY__` map's
+    `block` + tag positions — independent of the map's OWN segmentation.
+
+    This is what makes per-sentence attribution work on ALREADY-committed variants
+    of ANY logged shape (e.g. an older `quarters` map) WITHOUT re-inference: the
+    block/tag char spans are stable across shapes, so we carve the tags out of the
+    block and re-segment the instruction text here, at compute time. Mirrors the
+    split `_build` records for a fresh variant, so fresh + old variants agree."""
+    block = logged.get("block")
+    if not block:
+        return []
+    bs, be = int(block[0]), int(block[1])
+    tags = sorted((t for t in (logged.get("open_tag"), logged.get("close_tag")) if t),
+                  key=lambda t: int(t[0]))
+    ranges: list[tuple[int, int]] = []          # block minus the inserted tag spans
+    cur = bs
+    for t in tags:
+        ts, te = int(t[0]), int(t[1])
+        if ts > cur:
+            ranges.append((cur, ts))
+        cur = max(cur, te)
+    if be > cur:
+        ranges.append((cur, be))
+    if not ranges:
+        ranges = [(bs, be)]
+    out: list[tuple[int, int]] = []
+    for rs, re_ in ranges:
+        for ss, se in _sentences(user[rs:re_]):
+            a, b = _trim_span(user, rs + ss, rs + se)
+            if user[a:b].strip():
+                out.append((a, b))
+    out.sort()
+    return [{"i": k + 1, "start": a, "end": b, "snippet": user[a:b][:200]}
+            for k, (a, b) in enumerate(out)]
+
+
 def rewrite_and_stash(user: str, variables: dict[str, Any] | None, template: str | None) -> str:
     """On a variant's fresh treated call, rewrite the instruction block per the
     bound gravity_mode and stash the per-sentence/tag span-map under `ROLES_VAR`.

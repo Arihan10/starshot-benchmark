@@ -222,33 +222,35 @@ def main() -> int:
         env={**env, "STARSHOT_RUNS_DIR": str(runs_dir)},
         process_group=0,
     )
-
-    if not _wait_for_port(SERVER_HOST, server_port, proc=server, timeout=30.0):
-        print(
-            f"[run_request] server never became reachable at {server_url} — aborting",
-            file=sys.stderr,
-        )
-        _shutdown(server)
-        return 1
-    print(f"[run_request] server ready, launching viewer at {client_url}", flush=True)
-
-    client = subprocess.Popen(
-        ["node", "server.mjs"],
-        cwd=CLIENT_DIR,
-        env={**env, "SERVER_URL": server_url, "PORT": str(client_port)},
-        process_group=0,
-    )
+    client: subprocess.Popen[bytes] | None = None
     # The children run in their OWN process groups so `_shutdown` can kill each
-    # whole `uv run uvicorn` / `node` TREE without killing this launcher. The
-    # flip side: they no longer receive the terminal's SIGHUP (window close) or a
-    # `kill` SIGTERM, so closing the terminal used to ORPHAN a uvicorn holding
-    # gigabytes of RAM. Route those signals through the same KeyboardInterrupt
-    # path as Ctrl-C so the `finally` below always tears the children down.
+    # whole `uv run uvicorn` / `node` TREE without killing this launcher. The flip
+    # side: they don't get the terminal's SIGHUP (window close) or a `kill` SIGTERM,
+    # so route those through the same KeyboardInterrupt path as Ctrl-C. Install the
+    # handlers + open the try/finally BEFORE the startup wait: a Ctrl-C/kill while
+    # the (cold `uv run`) server is still binding must ALSO tear it down, or the
+    # uvicorn child is orphaned — it lingers on its port, binds late, and makes the
+    # next launch's logs interleave / appear to bind the wrong port.
     def _relay_shutdown(_signum: int, _frame: object) -> None:
         raise KeyboardInterrupt
     for _sig in (signal.SIGTERM, signal.SIGHUP):
         signal.signal(_sig, _relay_shutdown)
     try:
+        # Cold starts (uv env resolve + heavy app import + lifespan) can take a while;
+        # give it real headroom so a slow-but-fine boot isn't aborted as "unreachable".
+        if not _wait_for_port(SERVER_HOST, server_port, proc=server, timeout=120.0):
+            print(
+                f"[run_request] server never became reachable at {server_url} — aborting",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"[run_request] server ready, launching viewer at {client_url}", flush=True)
+        client = subprocess.Popen(
+            ["node", "server.mjs"],
+            cwd=CLIENT_DIR,
+            env={**env, "SERVER_URL": server_url, "PORT": str(client_port)},
+            process_group=0,
+        )
         while True:
             if server.poll() is not None:
                 return server.returncode or 0
@@ -258,7 +260,8 @@ def main() -> int:
     except KeyboardInterrupt:
         return 0
     finally:
-        _shutdown(client)
+        if client is not None:
+            _shutdown(client)
         _shutdown(server)
 
 

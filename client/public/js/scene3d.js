@@ -12,8 +12,16 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+// Fat (thick) wireframe lines: WebGL ignores LineBasicMaterial.linewidth, so
+// box OUTLINES are drawn as screen-space fat lines (LineSegments2 + LineMaterial).
+import { LineSegments2 } from "three/addons/lines/LineSegments2.js";
+import { LineSegmentsGeometry } from "three/addons/lines/LineSegmentsGeometry.js";
+import { LineMaterial } from "three/addons/lines/LineMaterial.js";
 
-const BBOX_COLOR_DEFAULT = 0xff3b3b; // zones
+// Thickness (screen px) of every box wireframe outline — Box3Helper's 1px lines
+// read as hairlines, so all outlines use fat lines at this width.
+const BBOX_LINE_WIDTH = 2;
+const BBOX_COLOR_DEFAULT = 0xff0000; // zones
 // Objects are colored by the decomposition step that emitted them, so the
 // benchmark reader can see at a glance which pass produced each object:
 // anchor_decompose (the defining objects) keeps the canonical object green,
@@ -39,7 +47,41 @@ const OBJECT_COLOR_BY_STEP = {
 	next_object: BBOX_COLOR_NEXT_OBJECT,
 	negative_space_decompose: BBOX_COLOR_NEGATIVE_SPACE,
 };
+
+// The most-saturated version of a color (max S in HSL, hue + lightness kept),
+// so the bounding-box OUTLINES read as a vivid, solid version of their kind
+// colour. Pure sRGB-hex math (colour-space agnostic); memoized.
+const _satCache = new Map();
+function maxSaturate(hex) {
+	let v = _satCache.get(hex);
+	if (v != null) return v;
+	const r = ((hex >> 16) & 255) / 255, g = ((hex >> 8) & 255) / 255, b = (hex & 255) / 255;
+	const mx = Math.max(r, g, b), mn = Math.min(r, g, b), l = (mx + mn) / 2, d = mx - mn;
+	if (d < 1e-6) { _satCache.set(hex, hex); return hex; } // gray → no hue to saturate
+	let h;
+	if (mx === r) h = ((g - b) / d) % 6;
+	else if (mx === g) h = (b - r) / d + 2;
+	else h = (r - g) / d + 4;
+	h = ((h / 6) % 1 + 1) % 1;
+	const c = 1 - Math.abs(2 * l - 1); // chroma at S = 1
+	const x = c * (1 - Math.abs(((h * 6) % 2) - 1));
+	const m = l - c / 2;
+	const hh = h * 6;
+	let rr, gg, bb;
+	if (hh < 1) { rr = c; gg = x; bb = 0; }
+	else if (hh < 2) { rr = x; gg = c; bb = 0; }
+	else if (hh < 3) { rr = 0; gg = c; bb = x; }
+	else if (hh < 4) { rr = 0; gg = x; bb = c; }
+	else if (hh < 5) { rr = x; gg = 0; bb = c; }
+	else { rr = c; gg = 0; bb = x; }
+	const out = (Math.round((rr + m) * 255) << 16) | (Math.round((gg + m) * 255) << 8) | Math.round((bb + m) * 255);
+	_satCache.set(hex, out);
+	return out;
+}
 const BBOX_DIM_OPACITY = 0.35;
+// Focus-highlight dim: when a blue highlight is up, every non-highlighted
+// wireframe fades to this (lighter + more transparent) so the focus pops.
+const HL_DIM_OPACITY = 0.1;
 const PROXY_BASE_OPACITY = 0.55;
 const PROXY_DIM_OPACITY = 0.2;
 // Zone-layers view: a faint translucent fill on each zone box so overlapping
@@ -127,7 +169,46 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// Present-mode "resolving" boxes: an object's box grows from its origin corner
 	// to full size as the tokens describing it stream in.
 	const resolvingRoot = new THREE.Group();
-	scene.add(sceneRoot, bboxRoot, overlayRoot, attnRoot, neuralRoot, resolvingRoot);
+	// "Result" highlight: solid blue boxes over the entities a step produced (the
+	// content view's post-zone toggle), on its own root so it coexists with the
+	// yellow→red attention overlay (attnRoot) rather than replacing it.
+	const resultRoot = new THREE.Group();
+	// "Hover" highlight: a strong GREEN box over the single entity the user is
+	// hovering (tree / ranking / plan). Its own root so it sits ON TOP of the
+	// attention overlay rather than replacing it — the other entities' attention
+	// stays visible while the hovered one reads clearly green.
+	const hoverRoot = new THREE.Group();
+	scene.add(sceneRoot, bboxRoot, overlayRoot, attnRoot, neuralRoot, resolvingRoot, resultRoot, hoverRoot);
+
+	// A thick wireframe box (the 12 edges of `box3`), drawn as screen-space fat
+	// lines so it actually reads at BBOX_LINE_WIDTH — WebGL ignores the linewidth
+	// of ordinary lines. Exposes `.box` (the Box3) and a `.material` with
+	// `.color`/`.opacity`/`.depthTest`, so it drops in wherever Box3Helper was
+	// used. LineMaterial needs the viewport resolution (kept current on resize).
+	const _fatTmpSize = new THREE.Vector3();
+	const _fatTmpCenter = new THREE.Vector3();
+	const _fatTmpRes = new THREE.Vector2();
+	function makeFatBox(box3, color) {
+		box3.getSize(_fatTmpSize);
+		box3.getCenter(_fatTmpCenter);
+		const bg = new THREE.BoxGeometry(
+			Math.max(_fatTmpSize.x, 1e-4),
+			Math.max(_fatTmpSize.y, 1e-4),
+			Math.max(_fatTmpSize.z, 1e-4),
+		);
+		const eg = new THREE.EdgesGeometry(bg);
+		const geo = new LineSegmentsGeometry().fromEdgesGeometry(eg);
+		bg.dispose();
+		eg.dispose();
+		const mat = new LineMaterial({ linewidth: BBOX_LINE_WIDTH, transparent: true, opacity: 1 });
+		mat.color.set(color);
+		renderer.getSize(_fatTmpRes);
+		mat.resolution.set(_fatTmpRes.x || 1, _fatTmpRes.y || 1);
+		const seg = new LineSegments2(geo, mat);
+		seg.position.copy(_fatTmpCenter);
+		seg.box = box3; // Box3Helper-compatible: callers read `.box`
+		return seg;
+	}
 
 	const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 5000);
 	camera.position.set(14, 10, 14);
@@ -317,6 +398,14 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// frame) that's already in the context scene doesn't show before it resolves.
 	const presentHidden = new Set();
 
+	// Blue "focus" highlight (the current zone + a step's results). When active
+	// with `highlightDim`, every OTHER wireframe is faded way down (lighter +
+	// more transparent) so the highlighted boxes read as the focus, and the blue
+	// overlay pulses (`resultFlash`) via the animate loop for discoverability.
+	const highlightIds = new Set();
+	let highlightDim = false;
+	let resultFlash = false;
+
 	function effectivelyHidden(id) {
 		let cur = nodeInfo(id);
 		let isSelf = true;
@@ -423,7 +512,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				: id === hoveredId
 					? BBOX_COLOR_HOVER
 					: baseBboxColor(id, helper.userData.nodeKind);
-		helper.material.color.setHex(color);
+		// The OUTLINE reads as the most-saturated version of its kind colour.
+		helper.material.color.setHex(maxSaturate(color));
 		// The proxy wireframe always tracks its object's bbox color.
 		const proxy = proxies.get(id);
 		if (proxy) proxy.material.color.setHex(color);
@@ -496,11 +586,25 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const visible =
 			categoryOn(kind, id) &&
 			(id === selectedId || id === hoveredId || show.bboxes);
-		const dim =
+		const selDim =
 			selectedId !== null && id !== selectedId && id !== hoveredId;
+		// Focus highlight: fade every wireframe that isn't in the highlight set
+		// (and isn't the active select/hover) way down — lighter + more
+		// transparent — so the blue-highlighted boxes read as the focus.
+		const hlDim =
+			highlightDim &&
+			highlightIds.size > 0 &&
+			!highlightIds.has(id) &&
+			id !== selectedId &&
+			id !== hoveredId;
+		const dim = selDim || hlDim;
 		if (helper) {
 			helper.visible = visible;
-			helper.material.opacity = dim ? BBOX_DIM_OPACITY : 1;
+			helper.material.opacity = hlDim
+				? HL_DIM_OPACITY
+				: dim
+					? BBOX_DIM_OPACITY
+					: 1;
 		}
 		if (proxy) {
 			// Proxies are an opt-in debug layer (hidden by default): shown only when
@@ -1110,7 +1214,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				Math.max(origin[2], fz),
 			),
 		);
-		const helper = new THREE.Box3Helper(box3, BBOX_COLOR_DEFAULT);
+		const helper = makeFatBox(box3, BBOX_COLOR_DEFAULT);
 		helper.material.transparent = true;
 		helper.material.opacity = 1;
 		helper.userData.nodeKind = kind;
@@ -1184,7 +1288,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// Defaults reproduce the original flat mapping (used by the /tf cross-highlight).
 	function setAttnHighlight(items, opts = {}) {
 		clearAttnHighlight();
-		const { gamma = 1, minWeight = 0, contrast = false } = opts;
+		const { gamma = 1, minWeight = 0, contrast = false, hotRamp = false } = opts;
 		for (const it of items ?? []) {
 			const helper = bboxes.get(it.id);
 			if (!helper) continue;
@@ -1194,12 +1298,21 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			w = Math.pow(Math.max(0, Math.min(1, w)), gamma);
 			const size = helper.box.getSize(new THREE.Vector3());
 			const center = helper.box.getCenter(new THREE.Vector3());
-			// weight ramp: cool (low) -> hot yellow (high). With `contrast`, also ramp
-			// lightness so strong attention reads bright and weak stays muted.
-			const light = contrast ? 0.30 + 0.42 * w : 0.55;
-			const fillOp = contrast ? 0.05 + 0.55 * w : 0.1 + 0.35 * w;
-			const edgeOp = contrast ? 0.25 + 0.75 * w : 0.45 + 0.55 * w;
-			const color = new THREE.Color().setHSL(0.16 + (1 - w) * 0.42, 0.95, light);
+			// weight ramp. Default: cool (low) -> hot yellow (high); with `contrast`,
+			// lightness also ramps. `hotRamp`: yellow (low, transparent) -> red (high,
+			// opaque) — the shared attention scale used across the content view (3D
+			// wireframes + heat badges), so opacity grows straight with attention.
+			const light = hotRamp ? (0.5 + 0.06 * w) : contrast ? 0.30 + 0.42 * w : 0.55;
+			// hotRamp: opacity tracks attention HARD via a STEEPER-than-colour curve
+			// (w^2.4) — the strongly-attended read near-solid, the weakly-attended
+			// fall off fast to nearly clear, so how much an item is attended is
+			// legible from opacity alone. (Colour still tracks the log-scaled `w`.)
+			const ow = hotRamp ? Math.pow(w, 2.4) : w;
+			const fillOp = hotRamp ? (0.006 + 0.85 * ow) : contrast ? 0.05 + 0.55 * w : 0.1 + 0.35 * w;
+			const edgeOp = hotRamp ? (0.03 + 0.97 * ow) : contrast ? 0.25 + 0.75 * w : 0.45 + 0.55 * w;
+			const color = hotRamp
+				? new THREE.Color().setHSL(0.16 * (1 - w), 0.92, light) // 0.16 (yellow) → 0 (red)
+				: new THREE.Color().setHSL(0.16 + (1 - w) * 0.42, 0.95, light);
 			const fill = new THREE.Mesh(
 				new THREE.BoxGeometry(Math.max(size.x, 1e-3), Math.max(size.y, 1e-3), Math.max(size.z, 1e-3)),
 				new THREE.MeshBasicMaterial({ color, transparent: true, opacity: fillOp, depthTest: false, depthWrite: false }),
@@ -1208,7 +1321,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			fill.renderOrder = 998;
 			fill.layers.enableAll();
 			attnRoot.add(fill);
-			const edge = new THREE.Box3Helper(helper.box.clone(), color);
+			const edge = makeFatBox(helper.box.clone(), color);
 			edge.material.depthTest = false;
 			edge.material.transparent = true;
 			edge.material.opacity = edgeOp;
@@ -1216,6 +1329,132 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			edge.layers.enableAll();
 			attnRoot.add(edge);
 		}
+	}
+
+	// --- "result" / focus highlight -----------------------------------------
+	// Solid BLUE fill + bright edge over a set of entity ids — the CURRENT zone
+	// and/or the objects/zones a step produced. Separate root from the attention
+	// overlay so results (blue) and attention (yellow→red) can be shown together.
+	// `flash` pulses the blue every frame (animate loop) for discoverability;
+	// `dimOthers` fades every OTHER wireframe way down so the focus stands out.
+	function _clearResultBoxes() {
+		while (resultRoot.children.length > 0) {
+			const child = resultRoot.children[0];
+			resultRoot.remove(child);
+			child.geometry?.dispose?.();
+			child.material?.dispose?.();
+		}
+	}
+	function clearResultHighlight() {
+		_clearResultBoxes();
+		const hadDim = highlightDim && highlightIds.size > 0;
+		highlightIds.clear();
+		highlightDim = false;
+		resultFlash = false;
+		if (hadDim) refreshAllVisibility(); // restore the dimmed wireframes
+	}
+	// Build the blue fill (+ optional halo) + edge boxes for a set of ids in a given
+	// style, appending them to resultRoot. Shared by setResultHighlight (pronounced
+	// current/target zone) and addResultHighlight (subtler post-zone results), so the
+	// two can coexist with DIFFERENT looks in one render.
+	function _addResultBoxes(ids, { color, fillOp, edgeOp, edgeScale, glow }) {
+		const col = new THREE.Color(color);
+		for (const id of ids ?? []) {
+			const helper = bboxes.get(id);
+			if (!helper) continue;
+			const size = helper.box.getSize(new THREE.Vector3());
+			const center = helper.box.getCenter(new THREE.Vector3());
+			const fill = new THREE.Mesh(
+				new THREE.BoxGeometry(Math.max(size.x, 1e-3), Math.max(size.y, 1e-3), Math.max(size.z, 1e-3)),
+				new THREE.MeshBasicMaterial({ color: col.clone(), transparent: true, opacity: fillOp, depthTest: false, depthWrite: false }),
+			);
+			fill.position.copy(center);
+			fill.renderOrder = 994;
+			fill.layers.enableAll();
+			fill.userData.baseOp = fillOp;
+			resultRoot.add(fill);
+			// translucent extra-fat halo (glow), drawn under the crisp edge
+			if (glow) {
+				const halo = makeFatBox(helper.box.clone(), col.clone());
+				halo.material.linewidth = BBOX_LINE_WIDTH * edgeScale * 2.0;
+				halo.material.depthTest = false;
+				halo.material.transparent = true;
+				halo.material.opacity = 0.3;
+				halo.renderOrder = 993;
+				halo.layers.enableAll();
+				halo.userData.baseOp = 0.3;
+				resultRoot.add(halo);
+			}
+			const edge = makeFatBox(helper.box.clone(), col.clone());
+			edge.material.linewidth = BBOX_LINE_WIDTH * edgeScale;
+			edge.material.depthTest = false;
+			edge.material.transparent = true;
+			edge.material.opacity = edgeOp;
+			edge.renderOrder = 995;
+			edge.layers.enableAll();
+			edge.userData.baseOp = edgeOp;
+			resultRoot.add(edge);
+		}
+	}
+	// Primary highlight (clears any prior). PRONOUNCED by default: strong blue fill +
+	// a THICK crisp edge over a translucent extra-fat HALO — used for the current /
+	// target zone so it reads unmistakably.
+	function setResultHighlight(ids, opts = {}) {
+		_clearResultBoxes();
+		const { color = 0x3a92ff, fillOp = 0.5, edgeOp = 1.0, flash = false, dimOthers = false, edgeScale = 2.6, glow = true } = opts;
+		highlightIds.clear();
+		for (const id of ids ?? []) highlightIds.add(id);
+		resultFlash = !!flash;
+		highlightDim = !!dimOthers;
+		_addResultBoxes(ids, { color, fillOp, edgeOp, edgeScale, glow });
+		if (highlightDim) refreshAllVisibility(); // fade the non-highlighted wireframes
+	}
+	// APPEND a second highlight group without clearing the first — keeps its own
+	// (subtler) style. Defaults reproduce the ORIGINAL result look (thin edge, 0.3
+	// fill, no halo, classic blue) so post-zone results stay as they were while the
+	// target zone stays pronounced. Ids join highlightIds so dimOthers spares them.
+	function addResultHighlight(ids, opts = {}) {
+		const { color = 0x2f86ff, fillOp = 0.3, edgeOp = 1.0, edgeScale = 1, glow = false } = opts;
+		for (const id of ids ?? []) highlightIds.add(id);
+		_addResultBoxes(ids, { color, fillOp, edgeOp, edgeScale, glow });
+		if (highlightDim) refreshAllVisibility();
+	}
+
+	// --- hover highlight (tree / ranking cross-highlight) --------------------
+	// A single STRONG GREEN box over the hovered entity, on its own root so the
+	// attention overlay (and every other entity) stays put — the hovered one just
+	// gets a bright green outline + tint on top. Drawn above everything.
+	function clearHoverHighlight() {
+		while (hoverRoot.children.length > 0) {
+			const child = hoverRoot.children[0];
+			hoverRoot.remove(child);
+			child.geometry?.dispose?.();
+			child.material?.dispose?.();
+		}
+	}
+	function setHoverHighlight(id, opts = {}) {
+		clearHoverHighlight();
+		const { color = 0x24ff86, fillOp = 0.26, edgeOp = 1.0 } = opts;
+		const helper = bboxes.get(id);
+		if (!helper) return;
+		const col = new THREE.Color(color);
+		const size = helper.box.getSize(new THREE.Vector3());
+		const center = helper.box.getCenter(new THREE.Vector3());
+		const fill = new THREE.Mesh(
+			new THREE.BoxGeometry(Math.max(size.x, 1e-3), Math.max(size.y, 1e-3), Math.max(size.z, 1e-3)),
+			new THREE.MeshBasicMaterial({ color: col.clone(), transparent: true, opacity: fillOp, depthTest: false, depthWrite: false }),
+		);
+		fill.position.copy(center);
+		fill.renderOrder = 1000;
+		fill.layers.enableAll();
+		hoverRoot.add(fill);
+		const edge = makeFatBox(helper.box.clone(), col.clone());
+		edge.material.depthTest = false;
+		edge.material.transparent = true;
+		edge.material.opacity = edgeOp;
+		edge.renderOrder = 1001;
+		edge.layers.enableAll();
+		hoverRoot.add(edge);
 	}
 
 	// --- present-mode neural activation --------------------------------------
@@ -1297,6 +1536,19 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			g.fill.material.opacity = 0.05 + 0.22 * v;
 			g.edge.material.opacity = 0.14 + 0.46 * v;
 			g.fill.scale.setScalar(1 + 0.04 * v);
+		}
+	}
+
+	// Pulse the blue focus highlight (current zone / step results) so it draws
+	// the eye. Each child stores its base opacity; we scale it by a sinusoid.
+	function _tickResultFlash(t) {
+		if (!resultFlash || resultRoot.children.length === 0) return;
+		// Floor kept high so the blue stays STRONG through the flash (0.7 → 1.0×).
+		const p = 0.7 + 0.3 * (0.5 + 0.5 * Math.sin(t * Math.PI * 1.8));
+		for (const child of resultRoot.children) {
+			const base = child.userData?.baseOp;
+			if (base == null || !child.material) continue;
+			child.material.opacity = base * p;
 		}
 	}
 
@@ -1523,7 +1775,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 					Math.max(origin[2], fz),
 				),
 			);
-			const helper = new THREE.Box3Helper(box3, BBOX_COLOR_OVERLAY);
+			const helper = makeFatBox(box3, BBOX_COLOR_OVERLAY);
 			// Draw on top of everything so the proposal reads against the scene.
 			helper.material.depthTest = false;
 			helper.material.transparent = true;
@@ -1954,6 +2206,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		}
 		clearOverlayBoxes();
 		clearAttnHighlight();
+		clearResultHighlight();
+		clearHoverHighlight();
 		clearNeuralActivation();
 		clearResolving();
 		clearOrientationArrow();
@@ -2048,6 +2302,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		renderer.setSize(w, h);
 		camera.aspect = w / h;
 		camera.updateProjectionMatrix();
+		// Fat lines are sized in screen space — feed them the new viewport so the
+		// outline thickness stays constant across resizes.
+		scene.traverse((o) => { if (o.isLineSegments2 && o.material?.resolution) o.material.resolution.set(w, h); });
 	}
 	const resizeObserver = new ResizeObserver(resize);
 	resizeObserver.observe(host);
@@ -2284,6 +2541,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		if (orbitFocus) controls.target.lerp(orbitFocus, 1 - Math.exp(-dt / 1.6)); // gentle cinematic drift
 		controls.update();
 		_tickNeural(dt, now / 1000);
+		_tickResultFlash(now / 1000);
 
 		gridMat.uniforms.uCameraPos.value.copy(camera.position);
 		const camDist = Math.max(
@@ -2322,6 +2580,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		clearOverlayBoxes,
 		setAttnHighlight,
 		clearAttnHighlight,
+		setResultHighlight,
+		addResultHighlight,
+		clearResultHighlight,
+		setHoverHighlight,
+		clearHoverHighlight,
 		setOverlayVisible: (v) => {
 			overlayRoot.visible = v;
 		},

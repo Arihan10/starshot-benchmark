@@ -3336,6 +3336,68 @@ def create_app() -> FastAPI:
         await _start_cell(run, slot_id, model_alias)
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
+    @app.post("/start-all/{model_alias}")
+    async def start_all(  # pyright: ignore[reportUnusedFunction]
+        model_alias: str,
+        run: str | None = None,
+        limit: int | None = None,
+        restart_errored: bool = True,
+    ) -> dict[str, object]:
+        """Saturate a (self-hosted) backend: launch this model across MANY slots
+        in one call, each as its own pipeline task, so the backend sees
+        `started`-many concurrent request chains instead of one.
+
+        A single run drives the LLM strictly SEQUENTIALLY — the divider awaits
+        one call at a time — so cross-cell concurrency is the throughput lever
+        for a self-hosted model (e.g. hy3), where under-utilization, not spend,
+        is the cost. Each cell is an independent task; N started cells give the
+        backend up to N in-flight requests to batch.
+
+        Idempotent and safe to re-fire: a cell already `run.done`, or driven by a
+        live task (running / parked at a step gate), is SKIPPED — so this only
+        starts the idle/paused frontier and never double-runs a cell.
+        `restart_errored=false` also skips cells whose last event is `run.error`.
+        `limit` caps how many NEW cells to launch this call (in slot order) —
+        e.g. to match the backend's max concurrent batch."""
+        run = _resolve_run(run)
+        _require_model(model_alias)
+        # No prompt snapshot -> nothing can launch. Surface it once here rather
+        # than as a per-cell failure (mirrors _start_cell's own guard).
+        _require_run_prompts(run)
+        started: list[str] = []
+        skipped: dict[str, str] = {}
+        for slot in SLOTS:
+            if limit is not None and len(started) >= limit:
+                skipped[slot.id] = "limit"
+                continue
+            key: RunKey = (run, slot.id, model_alias)
+            slot_log = _slot_logs.get(key)
+            if slot_log is None:
+                skipped[slot.id] = "no-cell"
+                continue
+            events = slot_log.state["events"]
+            if any(e.get("kind") == "run.done" for e in events):
+                skipped[slot.id] = "done"
+                continue
+            if _live(_tasks.get(key)):
+                skipped[slot.id] = "running"
+                continue
+            if not restart_errored and events and events[-1].get("kind") == "run.error":
+                skipped[slot.id] = "error"
+                continue
+            # _start_cell awaits only the (fast) cancel of any stale task, then
+            # spawns _run — so the loop creates every task back-to-back and they
+            # execute concurrently; it does NOT wait for a pipeline to finish.
+            await _start_cell(run, slot.id, model_alias)
+            started.append(slot.id)
+        return {
+            "run": run,
+            "model": model_alias,
+            "started": started,
+            "started_count": len(started),
+            "skipped": skipped,
+        }
+
     @app.post("/slots/{slot_id}/{model_alias}/pause")
     async def slot_pause(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)

@@ -5,10 +5,11 @@
 // log-Y toggle) in place.
 
 import { el } from "../../js/ui.js";
-import { state, COLORS, compHex, entityHex } from "./state.js";
-import { poolComponents, poolKindTotals, contextPoints, poolOutputs, sectionProgression, outputSegments, progXOfToken, viiInstructions, viiScatterModel } from "./data.js";
-import { spiderChart, pieChart, scatterChart, stackAreaChart, svgEl, pctFmt, chartHost, repaint, fontScale, escTip, chartLegend } from "./charts.js";
-import { rhoFocusSeries, rhoCurveChart, spearmanTrend, FOCUS_THRESHOLDS } from "./ablation.js";
+import { emittingRegion } from "../../js/events.js";
+import { state, ALL, COLORS, compHex, entityHex, ATTR_AXIS_ORDER } from "./state.js";
+import { poolComponents, poolKindTotals, contextPoints, poolOutputs, tagScatterModel, viiInstructions, viiScatterModel, loadAllCellProfiles, overlayKindFilter } from "./data.js";
+import { spiderChart, pieChart, scatterChart, barChart, boxPlotChart, svgEl, chartHost, repaint, fontScale, escTip, chartLegend, hexA } from "./charts.js";
+import { rhoFocusSeries, rhoCurveChart, spearmanTrend, FOCUS_THRESHOLDS, attrRoleTotals, STRUCT_ROLES, stackedGroupedBarChart } from "./ablation.js";
 import { runViiReport } from "./viiReport.js";
 
 // p-value formatter + x-binned mean line for the context-order scatter's trend overlay.
@@ -88,14 +89,127 @@ const empty = (msg) => el("div", { class: "empty", text: msg });
 const vh = (frac, min, max) => Math.max(min, Math.min(Math.round(window.innerHeight * frac), max));
 
 // --- 1. attribute spider -----------------------------------------------------
+// Overlay mode: compare every run × model cell's attribute profile on ONE spider,
+// coloured by MODEL (each model = a hue). Persisted per session; cached by the
+// compared step KIND so re-renders (window drags, cell swaps) don't refetch.
+let _spiderOverlay = (() => { try { return localStorage.getItem("tf-spider-overlay") === "1"; } catch { return false; } })();
+let _overlayCache = null; // { key, data:{profiles,scanned,capped} }
+
+// Evenly-spaced hue per model (max separation), stable for a given model set.
+function modelColorMap(models) {
+	const uniq = [...new Set(models)].sort();
+	const m = new Map();
+	uniq.forEach((name, i) => m.set(name, `hsl(${Math.round((i / Math.max(1, uniq.length)) * 360)}, 68%, 60%)`));
+	return m;
+}
+
 export function spiderCard(rows) {
 	const comps = poolComponents(rows);
-	if (!comps.length) return card("attribute breakdown", null, empty("no attribute attention in this selection"));
-	const profile = { label: "attention", color: "#7aa2f7", map: new Map(comps.map((c) => [c.component, c.score])) };
+	const single = comps.length ? { label: "attention", color: "#7aa2f7", map: new Map(comps.map((c) => [c.component, c.score])) } : null;
 	const sub = rows.length === 1 ? "one step" : `mean across ${rows.length} steps`;
-	// canvas ring fills its column, capped so it never dwarfs the viewport height
-	const host = chartHost((w) => spiderChart([profile], { size: Math.min(w, vh(0.62, 300, 560)) }), (w) => w);
-	return card("attribute breakdown", `${sub} · hover an axis for its value`, host);
+	const kind = overlayKindFilter();
+	const kindTxt = kind || "whole scene";
+
+	const bodyHost = el("div");
+	const toggle = el("button", {
+		class: `mini-toggle${_spiderOverlay ? " on" : ""}`,
+		title: "overlay every run × model cell's attribute profile on this spider, coloured by model (compares the SAME step kind across cells)",
+	}, _spiderOverlay ? "◉ compare all runs × models" : "○ compare all runs × models");
+
+	const renderSingle = () => {
+		if (!single) { bodyHost.replaceChildren(empty("no attribute attention in this selection")); return; }
+		bodyHost.replaceChildren(chartHost((w) => spiderChart([single], { size: Math.min(w, vh(0.62, 300, 560)) }), (w) => w));
+	};
+	const renderOverlay = (data) => {
+		const profiles = (data.profiles || []).filter((p) => p.map && p.map.size);
+		if (!profiles.length) { bodyHost.replaceChildren(empty("no computed attention across cells for this step kind")); return; }
+		const colorOf = modelColorMap(profiles.map((p) => p.model));
+		const series = profiles.map((p) => ({ label: `${p.model} · ${p.run}/${p.slot} (${p.n})`, color: colorOf.get(p.model), map: p.map }));
+		// half-transparent, scaled down as more polygons overlap so they stay legible
+		const n = series.length;
+		const fillOpacity = Math.max(0.08, Math.min(0.5, 2.0 / n));
+		const host = chartHost((w) => spiderChart(series, { size: Math.min(w, vh(0.62, 300, 560)), fillOpacity, strokeOpacity: 0.85, lineWidth: 1.6, dots: n <= 8 }), (w) => w);
+		const legend = chartLegend([...colorOf.entries()].map(([m, c]) => ({ key: m, label: m, color: c })));
+		const note = el("div", { class: "out-hint", style: "margin:6px 0 0", text: `${profiles.length} cells · ${kindTxt} · each polygon = one cell, L1-normalized to its attribute SHARE so shapes are comparable · colour = model${data.capped ? " · capped" : ""}` });
+		bodyHost.replaceChildren(host, legend, note);
+	};
+
+	const run = () => {
+		if (!_spiderOverlay) { renderSingle(); return; }
+		if (_overlayCache && _overlayCache.key === kind) { renderOverlay(_overlayCache.data); return; }
+		bodyHost.replaceChildren(empty(`loading all cells (${kindTxt})…`));
+		const token = state.loadToken;
+		loadAllCellProfiles(kind, token).then((data) => {
+			if (!data || token !== state.loadToken || !_spiderOverlay) return; // stale / toggled off
+			_overlayCache = { key: kind, data };
+			renderOverlay(data);
+		}).catch(() => { if (token === state.loadToken) bodyHost.replaceChildren(empty("failed to load cells")); });
+	};
+
+	const subOf = () => _spiderOverlay ? `all cells · ${kindTxt} · model = hue` : `${sub} · hover an axis for its value`;
+	let cardEl = null;
+	toggle.onclick = () => {
+		_spiderOverlay = !_spiderOverlay;
+		try { localStorage.setItem("tf-spider-overlay", _spiderOverlay ? "1" : "0"); } catch { /* ignore */ }
+		toggle.classList.toggle("on", _spiderOverlay);
+		toggle.textContent = _spiderOverlay ? "◉ compare all runs × models" : "○ compare all runs × models";
+		const s = cardEl && cardEl.querySelector(".card-sub");
+		if (s) s.textContent = subOf();
+		run();
+	};
+
+	run();
+	cardEl = card("attribute breakdown", subOf(), toggle, bodyHost);
+	return cardEl;
+}
+
+// --- structure vs content (per attribute) -----------------------------------
+// For the MAIN sequence: split each attribute's attention into context (the key
+// name) / frame (brackets · quotes · punctuation) / content (the value), pooled
+// across the selection. One bar per attribute, each normalized to 100% so the
+// context/frame/content PROPORTION compares. Reuses the ablation attr_role split
+// (server-classified per each attribute's real serialized form).
+export function structureCard(rows) {
+	const mass = new Map(), toks = new Map();               // `${attr}|${role}` -> pooled mass / tokens
+	for (const r of rows) {
+		for (const seg of attrRoleTotals(r.a)) {
+			if (String(seg.name).indexOf("|") < 0) continue; // attr_role segments only
+			mass.set(seg.name, (mass.get(seg.name) || 0) + (seg.mass || 0));
+			toks.set(seg.name, (toks.get(seg.name) || 0) + (seg.tokens || 0));
+		}
+	}
+	const density = (attr, role) => { const mk = `${attr}|${role}`; const t = toks.get(mk) || 0; return t ? (mass.get(mk) || 0) / t : 0; };
+	const attrSet = new Set();
+	for (const k of mass.keys()) attrSet.add(k.slice(0, k.lastIndexOf("|")));
+	const attrTotal = (a) => STRUCT_ROLES.reduce((t, r) => t + density(a, r.key), 0);
+	const attrs = [...attrSet].filter((a) => attrTotal(a) > 1e-9).sort((a, b) => attrTotal(b) - attrTotal(a));
+	if (!attrs.length) return card("structure vs content", "context / frame / content attention per attribute", empty("no attribute role-split tokens in this selection — recompute this sequence's attention (analysis v9+)"));
+	const rawMass = (attr, role) => mass.get(`${attr}|${role}`) || 0;
+	const cats = attrs.map((a) => ({ label: a }));
+	const scope = rows.length === 1 ? "one step" : `pooled across ${rows.length} steps`;
+	let normalized = true; // normalized: each bar = 100% (density proportion) · off: bar height = total attention (mass)
+	const capNorm = () => normalized
+		? `one bar per attribute · each = 100% of its context / frame / content attention (length-normalized mass ÷ tokens) · ${scope}`
+		: `one bar per attribute · bar HEIGHT = total attention (mass) to it, split context / frame / content · ${scope}`;
+	const hf = (w) => Math.round(vh(0.5, 280, 500));
+	const REF = "#aeb9cc";
+	const roleLegend = el("div", { class: "chart-legend", style: "gap:14px;margin-top:5px;font-size:11.5px" },
+		el("span", { class: "muted", text: "segment shade (faint→solid):" }),
+		...STRUCT_ROLES.map((r) => el("div", { class: "lg" }, el("span", { class: "sw", style: `background:${hexA(REF, r.op)};width:13px;height:13px` }), el("span", { text: r.label.split(" (")[0] }))));
+	const host = chartHost((w, h) => {
+		const v = normalized ? density : rawMass;
+		const series = [{ key: "seq", label: rows.length === 1 ? "step" : `${rows.length} steps`, color: "#7aa2f7",
+			values: attrs.map((a) => ({ context: v(a, "context"), frame: v(a, "frame"), content: v(a, "content") })) }];
+		return stackedGroupedBarChart(w, cats, series, STRUCT_ROLES, { height: h, normalize: normalized });
+	}, hf);
+	const cap = el("div", { class: "out-hint", style: "margin:0", text: capNorm() });
+	const toggle = el("button", { class: `mini-toggle${normalized ? " on" : ""}`,
+		title: "normalized: each bar = 100% (length-normalized density) · off: bar height = total attention (mass) paid to the attribute",
+		onclick: (e) => { normalized = !normalized; e.currentTarget.classList.toggle("on", normalized); cap.textContent = capNorm(); repaint(host); } }, "normalize");
+	const body = el("div", {},
+		el("div", { style: "display:flex;align-items:center;gap:10px;margin:0 0 8px" }, toggle, cap),
+		host, roleLegend);
+	return card("structure vs content", "context / frame / content attention per attribute", body);
 }
 
 // --- 2. composition (pie) + context-order scatter ---------------------------
@@ -212,12 +326,71 @@ export function rhoFocusCard(rows) {
 
 // --- 3. output graph (bins = emitted objects, sub-bins = attributes) ---------
 // Segment-output view: one bin per emitted object, stacked by its attributes.
-// Hovering a bin fisheye-enlarges it (neighbors compress) so the attribute
-// sub-bins are big enough to read/select; clicking a bin pins its full breakdown
-// (every attribute's exact value + the scene entities it attended) below.
-function buildOutputSvg(items, maxTotal, w, h, foc, hooks) {
+// CLICKING a bin fisheye-enlarges it (neighbours compress) AND pins its full
+// breakdown below; clicking again collapses. X labels are laid out vertically and
+// the chart grows to fit them; a sort control reorders / groups the bins (by
+// height, prefix, zone) or filters them (search), with tiered grouping brackets
+// drawn below the labels for prefix / zone.
+
+// The grouping PATH for an item under a mode: prefix → underscore tokens minus the
+// leaf (its own last segment); zone → the ancestor-zone chain (root → region).
+const _prefixPath = (id) => String(id || "").split("_").filter(Boolean).slice(0, -1);
+function _zonePath(id) {
+	const m = state.obs;
+	if (!m || !m.nodes) return [];
+	const chain = [];
+	let region = emittingRegion(m, id);
+	let hops = 0;
+	while (region && m.nodes.has(region) && hops < 64) { chain.push(region); region = m.nodes.get(region).parentId; hops += 1; }
+	return chain.reverse();
+}
+const _pathFor = (it, mode) => (mode === "zone" ? (it._zone || []) : mode === "prefix" ? (it._prefix || []) : []);
+
+// Tiered grouping brackets: for the sorted `items`, at each depth L build the
+// contiguous runs that share the same path prefix (and actually reach depth L). A
+// deeper run whose span duplicates a shallower one is dropped (no redundant single-
+// child bracket). Returns [ [ {i0,i1,label} ] per tier ], capped at MAX_TIERS.
+const MAX_TIERS = 3;
+function computeTiers(items, mode) {
+	if (mode !== "prefix" && mode !== "zone") return [];
+	const paths = items.map((it) => _pathFor(it, mode));
+	const depth = Math.min(MAX_TIERS, paths.reduce((mx, p) => Math.max(mx, p.length), 0));
+	const tiers = [];
+	const spansAbove = new Set(); // "i0:i1" spans already drawn at a shallower tier
+	for (let L = 0; L < depth; L++) {
+		const groups = [];
+		let start = -1, key = null;
+		const flush = (end) => { if (key != null && start >= 0) groups.push({ i0: start, i1: end, label: paths[start][L] }); };
+		for (let i = 0; i < items.length; i++) {
+			const p = paths[i];
+			const k = p.length > L ? p.slice(0, L + 1).join("\u0000") : null;
+			if (k !== key) { flush(i - 1); key = k; start = k != null ? i : -1; }
+		}
+		flush(items.length - 1);
+		const kept = groups.filter((grp) => !spansAbove.has(`${grp.i0}:${grp.i1}`)); // drop redundant single-child tiers
+		if (kept.length) { tiers.push(kept); for (const grp of kept) spansAbove.add(`${grp.i0}:${grp.i1}`); }
+	}
+	return tiers;
+}
+
+// Chart metrics that BOTH the height function and the SVG builder must agree on —
+// the bottom area (padB) grows with the longest vertical label + the grouping
+// bracket tiers, so the graph height adapts to the labels.
+function outMetrics(items, mode, w) {
 	const fs = fontScale(w), F = (b) => +(b * fs).toFixed(1);
-	const MINBIN = Math.round(26 + 4 * fs), padL = Math.round(38 + 12 * fs), padR = 14, padT = Math.round(10 + 6 * fs), padB = Math.round(66 + 36 * fs);
+	const padT = Math.round(10 + 6 * fs), padL = Math.round(38 + 12 * fs), padR = 14;
+	const maxChars = Math.min(46, items.reduce((mx, it) => Math.max(mx, String(it.id || "").length), 3));
+	const labelH = maxChars * F(6.6) + F(6);         // vertical label extent
+	const tiers = computeTiers(items, mode);
+	const TIER_H = F(22);
+	const bracketH = tiers.length ? (F(8) + tiers.length * TIER_H) : 0;
+	const padB = Math.round(F(8) + labelH + bracketH + F(8));
+	return { fs, F, padT, padL, padR, labelH, tiers, TIER_H, padB };
+}
+
+function buildOutputSvg(items, maxTotal, w, h, foc, mode, hooks) {
+	const { fs, F, padT, padL, padR, labelH, tiers, TIER_H, padB } = outMetrics(items, mode, w);
+	const MINBIN = Math.round(26 + 4 * fs);
 	const nb = items.length;
 	const svgW = Math.max(w, padL + padR + nb * MINBIN);
 	const plotW = svgW - padL - padR;
@@ -225,26 +398,40 @@ function buildOutputSvg(items, maxTotal, w, h, foc, hooks) {
 	if (foc == null || foc < 0 || nb === 1) {
 		widths = items.map(() => plotW / nb);
 	} else {
-		const FW = Math.max(MINBIN, Math.min(plotW * 0.55, 340, plotW - (nb - 1) * 6));
+		const FWbase = Math.max(MINBIN, Math.min(plotW * 0.55, 340, plotW - (nb - 1) * 6));
+		// expand-no-shrink: the enlarged bar is never narrower than its uniform width.
+		const FW = Math.max(FWbase, plotW / nb);
 		const others = nb > 1 ? Math.max(6, (plotW - FW) / (nb - 1)) : plotW;
 		widths = items.map((_, i) => (i === foc ? FW : others));
 	}
-	const plotH = Math.max(160, h - padT - padB), H = padT + plotH + padB;
+	const plotH = Math.max(150, h - padT - padB), H = padT + plotH + padB;
+	const axisY = padT + plotH;
 	const svg = svgEl("svg", { class: "out-svg", viewBox: `0 0 ${svgW} ${H}`, width: svgW, height: H });
 	for (const f of [0, 0.25, 0.5, 0.75, 1]) {
-		const yy = padT + plotH - f * plotH;
+		const yy = axisY - f * plotH;
 		svg.appendChild(svgEl("line", { x1: padL, y1: yy, x2: svgW - padR, y2: yy, stroke: "rgba(255,255,255,0.06)" }));
 		svg.appendChild(svgEl("text", { x: padL - 7, y: yy, fill: "rgba(220,230,245,0.62)", "font-size": F(12), "text-anchor": "end", "dominant-baseline": "middle" }, (maxTotal * f).toFixed(maxTotal < 1 ? 2 : maxTotal < 10 ? 1 : 0)));
 	}
 	svg.appendChild(svgEl("text", { x: 13, y: padT + plotH / 2, fill: "rgba(220,230,245,0.82)", "font-size": F(12.5), "text-anchor": "middle", transform: `rotate(-90 13 ${padT + plotH / 2})` }, "attention"));
+	// SEARCH divider geometry: the x of the seam between the matched items (moved to the
+	// front) and the rest — derived from the (possibly fisheye) widths so it lands exactly
+	// on the boundary. A faint green band tints the matched cohort behind its bars.
+	const bnd = hooks && hooks.boundary != null ? hooks.boundary : -1;
+	let bndX = null;
+	if (bnd > 0 && bnd < nb) {
+		bndX = padL; for (let i = 0; i < bnd; i++) bndX += widths[i];
+		svg.appendChild(svgEl("rect", { x: padL.toFixed(1), y: padT.toFixed(1), width: (bndX - padL).toFixed(1), height: plotH.toFixed(1), fill: "rgba(57,217,138,0.07)" }));
+	}
+	const xs = []; // per-item {x0, x1, cx} — brackets span these (respects the fisheye widths)
 	let x = padL;
 	items.forEach((it, i) => {
 		const bw = widths[i], focused = i === foc;
+		xs.push({ x0: x, x1: x + bw, cx: x + bw / 2 });
 		const g = svgEl("g", { class: `out-bin${focused ? " foc" : ""}` });
-		g.appendChild(svgEl("title", null, `${it.id}${it.step ? ` · ${it.step}` : ""} · ${it.n} tok · total attention ${it.total.toFixed(3)}${focused ? "" : " · hover to enlarge, click to pin"}`));
-		// full-column transparent hit area (so gaps above the stack still hover/click)
+		g.appendChild(svgEl("title", null, `${it.id}${it.step ? ` · ${it.step}` : ""} · ${it.n} tok · total attention ${it.total.toFixed(3)} · click to ${focused ? "collapse" : "expand"}`));
+		// full-column transparent hit area (so gaps above the stack still click)
 		g.appendChild(svgEl("rect", { x: x.toFixed(1), y: padT, width: bw.toFixed(1), height: plotH, fill: "transparent" }));
-		let yBase = padT + plotH;
+		let yBase = axisY;
 		for (const a of it.attrs) {
 			const hgt = (a.score / maxTotal) * plotH;
 			if (hgt <= 0.2) continue;
@@ -252,21 +439,39 @@ function buildOutputSvg(items, maxTotal, w, h, foc, hooks) {
 			const rect = svgEl("rect", { class: "out-seg", x: (x + 1.5).toFixed(1), y: segY.toFixed(1), width: Math.max(1, bw - 3).toFixed(1), height: hgt.toFixed(1), fill: compHex(a.component), "fill-opacity": 0.9 });
 			rect.appendChild(svgEl("title", null, `${it.id} · ${a.component} = ${a.score.toFixed(4)} (${((a.score / (it.total || 1)) * 100).toFixed(0)}% of its attention)`));
 			g.appendChild(rect);
-			// attribute labels only when the bin is enlarged (readable width)
 			if (focused && hgt >= F(16) && bw >= F(70)) g.appendChild(svgEl("text", { class: "out-seg-lab", x: (x + bw / 2).toFixed(1), y: (segY + hgt / 2).toFixed(1), fill: "#06070a", "font-size": F(12.5), "font-weight": 700, "text-anchor": "middle", "dominant-baseline": "middle" }, `${a.component} · ${((a.score / (it.total || 1)) * 100).toFixed(0)}%`));
 			yBase = segY;
 		}
-		if (i < nb - 1) g.appendChild(svgEl("line", { x1: (x + bw).toFixed(1), y1: padT, x2: (x + bw).toFixed(1), y2: (padT + plotH).toFixed(1), stroke: "rgba(255,255,255,0.5)", "stroke-width": 1 }));
-		if (focused || bw >= F(19)) {
-			const nm = it.id.length > 24 ? it.id.slice(0, 23) + "…" : it.id;
-			const lx = x + bw / 2, ly = padT + plotH + 7;
-			g.appendChild(svgEl("text", { class: "out-name", x: lx.toFixed(1), y: ly.toFixed(1), "font-size": F(12), "text-anchor": "end", transform: `rotate(-38 ${lx.toFixed(1)} ${ly.toFixed(1)})` }, nm));
-		}
-		g.addEventListener("pointerenter", () => hooks.onEnter(i));
+		if (i < nb - 1) g.appendChild(svgEl("line", { x1: (x + bw).toFixed(1), y1: padT, x2: (x + bw).toFixed(1), y2: axisY.toFixed(1), stroke: "rgba(255,255,255,0.5)", "stroke-width": 1 }));
+		// vertical x-axis label (the chart height was sized to fit these)
+		const lx = xs[i].cx, ly = axisY + F(8);
+		const nm = it.id.length > 46 ? it.id.slice(0, 45) + "…" : it.id;
+		const gLab = svgEl("g", { transform: `translate(${lx.toFixed(1)},${ly.toFixed(1)}) rotate(90)` });
+		gLab.appendChild(svgEl("text", { class: "out-name", "text-anchor": "start", "dominant-baseline": "middle", "font-size": F(11) }, nm));
+		g.appendChild(gLab);
 		g.addEventListener("click", () => hooks.onClick(i));
 		svg.appendChild(g);
 		x += bw;
 	});
+	// SEARCH divider: a bold green seam from the plot top down through the labels, tagged
+	// with the match count — matched objects are LEFT of it, the rest of the scene continue
+	// to the right (same height scale) so the two cohorts are directly comparable.
+	if (bndX != null) {
+		svg.appendChild(svgEl("line", { x1: bndX.toFixed(1), y1: (padT - F(2)).toFixed(1), x2: bndX.toFixed(1), y2: (axisY + F(6) + labelH).toFixed(1), stroke: "#39d98a", "stroke-width": 2.5 }));
+		svg.appendChild(svgEl("text", { x: (bndX + F(5)).toFixed(1), y: (padT + F(10)).toFixed(1), fill: "#39d98a", "font-size": F(11), "font-weight": 700, "text-anchor": "start" }, `◂ ${bnd} match${bnd === 1 ? "" : "es"}`));
+	}
+	// tiered grouping brackets, below the labels
+	if (tiers.length) {
+		const top = axisY + F(8) + labelH + F(6);
+		tiers.forEach((groups, L) => {
+			const ty = top + L * TIER_H + TIER_H * 0.42;
+			for (const grp of groups) {
+				const gx0 = xs[grp.i0].x0 + 3, gx1 = xs[grp.i1].x1 - 3;
+				svg.appendChild(svgEl("path", { d: `M${gx0.toFixed(1)} ${(ty - 4).toFixed(1)} L${gx0.toFixed(1)} ${ty.toFixed(1)} L${gx1.toFixed(1)} ${ty.toFixed(1)} L${gx1.toFixed(1)} ${(ty - 4).toFixed(1)}`, fill: "none", stroke: "rgba(220,230,245,0.32)", "stroke-width": 1 }));
+				svg.appendChild(svgEl("text", { x: ((gx0 + gx1) / 2).toFixed(1), y: (ty + F(11)).toFixed(1), fill: "rgba(220,230,245,0.72)", "font-size": F(10.5), "text-anchor": "middle" }, grp.label));
+			}
+		});
+	}
 	return svg;
 }
 function outputDetail(it) {
@@ -290,69 +495,273 @@ function outputDetail(it) {
 		el("div", { class: "od-bars" }, ...bars),
 		ents);
 }
+const OUT_SORTS = [["height", "height"], ["prefix", "prefix"], ["zone", "zone"], ["search", "search"]];
 export function outputCard(rows) {
-	const items = poolOutputs(rows);
-	if (!items.length) return card("output", null, empty("this selection emits no output items (e.g. a plan step) — pick a decompose / bbox step"));
-	const maxTotal = Math.max(1e-9, ...items.map((it) => it.total));
+	const allItems = poolOutputs(rows);
+	if (!allItems.length) return card("output", null, empty("this selection emits no output items (e.g. a plan step) — pick a decompose / bbox step"));
+	// annotate each item with its grouping paths (for the tiered brackets)
+	for (const it of allItems) { it._prefix = _prefixPath(it.id); it._zone = _zonePath(it.id); }
+	const maxTotal = Math.max(1e-9, ...allItems.map((it) => it.total));
 	const keyOf = (it) => `${it.ev}:${it.id}`;
-	let focus = null, selKey = null;
+	let sortMode = "height";      // height | prefix | zone | search
+	let query = "";
+	let expanded = null;          // key of the clicked/expanded item (fisheye + pinned detail)
+
+	// The displayed (sorted / filtered) item list for the current mode.
+	const cmpPath = (a, b) => {
+		const pa = _pathFor(a, sortMode), pb = _pathFor(b, sortMode);
+		for (let i = 0; i < Math.max(pa.length, pb.length); i++) { const x = pa[i] || "", y = pb[i] || ""; if (x !== y) return x < y ? -1 : 1; }
+		return String(a.id) < String(b.id) ? -1 : 1;
+	};
+	const searchHit = () => { const q = query.trim().toLowerCase(); return q ? ((it) => String(it.id).toLowerCase().includes(q)) : null; };
+	function displayed() {
+		if (sortMode === "prefix" || sortMode === "zone") return [...allItems].sort(cmpPath);
+		const byH = (a, b) => b.total - a.total;
+		const hit = sortMode === "search" ? searchHit() : null;
+		// SEARCH doesn't hide non-matches: it moves the matched objects to the FRONT
+		// (by height), then keeps the rest (by height) after a green divider — so a
+		// searched cohort (e.g. every "wall") can be compared against the whole scene.
+		if (hit) return [...allItems.filter(hit)].sort(byH).concat([...allItems.filter((it) => !hit(it))].sort(byH));
+		return [...allItems].sort(byH); // height (and empty-query search) by height
+	}
+	// Index of the divider = how many items matched (they sit at the front). -1 when
+	// not searching / empty query / all-or-none match (no meaningful split to draw).
+	function searchBoundary() {
+		const hit = sortMode === "search" ? searchHit() : null;
+		if (!hit) return -1;
+		let n = 0; for (const it of allItems) if (hit(it)) n++;
+		return n > 0 && n < allItems.length ? n : -1;
+	}
 	const detail = el("div", { class: "out-detail" });
-	const selIdx = () => (selKey ? items.findIndex((it) => keyOf(it) === selKey) : -1);
-	const host = chartHost((w, h) => buildOutputSvg(items, maxTotal, w, h, focus != null ? focus : selIdx(), {
-		onEnter: (i) => { if (focus !== i) { focus = i; repaint(host); } },
-		onClick: (i) => { const k = keyOf(items[i]); selKey = selKey === k ? null : k; renderDetail(); repaint(host); },
-	}), () => vh(0.5, 320, 560));
+	const host = chartHost((w, h) => {
+		const list = displayed();
+		const foc = expanded ? list.findIndex((it) => keyOf(it) === expanded) : -1;
+		return buildOutputSvg(list, maxTotal, w, h, foc, sortMode, {
+			onClick: (i) => { const k = keyOf(list[i]); expanded = expanded === k ? null : k; renderDetail(); repaint(host); },
+			boundary: searchBoundary(),
+		});
+	}, (w) => { const m = outMetrics(displayed(), sortMode, w); return m.padT + vh(0.42, 240, 480) + m.padB; });
 	host.style.overflowX = "auto";
-	host.addEventListener("mouseleave", () => { if (focus != null) { focus = null; repaint(host); } });
+
 	function renderDetail() {
-		const i = selIdx();
-		detail.replaceChildren(i < 0
-			? el("div", { class: "out-detail-hint", text: "hover a column to enlarge it and read its attributes · click a column to pin its full breakdown here" })
-			: outputDetail(items[i]));
+		const it = expanded ? allItems.find((x) => keyOf(x) === expanded) : null;
+		detail.replaceChildren(it ? outputDetail(it)
+			: el("div", { class: "out-detail-hint", text: "click a column to expand it and pin its full attribute breakdown here" }));
 	}
 	renderDetail();
-	const sub = rows.length === 1 ? `${items.length} output objects` : `${items.length} output objects · ${rows.length} steps`;
-	return card("output", sub, host,
-		el("div", { class: "out-hint", text: "each bin = one emitted object (output-zoom) · stacked by attribute · height = attention it drew · hover to enlarge, click to pin the breakdown" }),
+
+	// sort / group control + (search mode) filter box
+	const controls = el("div", { class: "out-sortbar" });
+	const searchInput = el("input", { class: "vii-search", type: "text", placeholder: "search id — matches ◂ green divider ▸ rest…",
+		oninput: (e) => { query = e.target.value; if (sortMode === "search") repaint(host); } });
+	function buildControls() {
+		const seg = el("div", { class: "seg-ctl" }, ...OUT_SORTS.map(([id, lab]) =>
+			el("button", { class: `seg-btn${sortMode === id ? " on" : ""}`, onclick: () => { sortMode = id; expanded = null; renderDetail(); buildControls(); repaint(host); } }, lab)));
+		controls.replaceChildren(el("span", { class: "muted", style: "font-size:12px", text: "sort" }), seg,
+			...(sortMode === "search" ? [searchInput] : []));
+		if (sortMode === "search") setTimeout(() => searchInput.focus(), 0);
+	}
+	buildControls();
+
+	// attribute colour legend — the stacked segments are coloured by attribute
+	// (component); show only the attributes actually present, in canonical order.
+	const present = new Set();
+	for (const it of allItems) for (const a of it.attrs) if (a.score > 0) present.add(a.component);
+	const legendComps = [...ATTR_AXIS_ORDER.filter((c) => present.has(c)), ...[...present].filter((c) => !ATTR_AXIS_ORDER.includes(c))];
+	const legend = el("div", { class: "chart-legend", style: "gap:7px 13px;margin-top:8px;font-size:11.5px" },
+		el("span", { class: "muted", text: "attribute" }),
+		...legendComps.map((c) => el("div", { class: "lg", title: c }, el("span", { class: "sw", style: `background:${compHex(c)}` }), el("span", { text: c }))));
+
+	const sub = rows.length === 1 ? `${allItems.length} output objects` : `${allItems.length} output objects · ${rows.length} steps`;
+	return card("output", sub, controls, host, legend,
+		el("div", { class: "out-hint", text: "each bin = one emitted object · stacked by attribute · height = attention it drew · click a column to expand + pin its breakdown · sort by height / prefix / zone, or search (matches move left of a green divider, the rest of the scene continue on the right at the same scale so you can compare)" }),
 		detail);
 }
 
 // --- 4. prompt tag breakdown (organized <tags>) -----------------------------
 const SECTION_COLORS = ["#7aa2f7", "#6bd96e", "#e0a94a", "#b46aff", "#4af0e0", "#ff6b9d", "#ff9e64", "#9ece6a", "#f7768e", "#7dcfff", "#c98bdb", "#e6db74"];
+const tagCompact = (t) => (t || "").replace(/_/g, " ");
+// Attention over organized <tag> blocks, two ways (toggle). BOX (default): for each
+// step KIND, a box per TAG — the distribution of that tag section's attention across
+// the steps of that kind (Q1–Q3, median, 1.5·IQR whiskers, outliers). SCATTER: the
+// VII scatter's twin — each dot = one tag block in one step (x = length in tokens,
+// y = attention, normalized so the top block = 1) with a linear fit + σ-below-trend
+// ranking. Both color by tag.
 export function tagsCard(rows) {
-	const agg = sectionProgression(rows);
-	if (!agg || !agg.tags.length) return card("prompt tag breakdown", null, empty("no organized <tag> prompt sections carry attention in this selection"));
-	const grid = agg.grid.map((row) => { const s = row.reduce((a, v) => a + v, 0); return s > 1e-12 ? row.map((v) => v / s) : row.map(() => 0); });
-	const layers = agg.tags.map((t, k) => ({ label: `<${t}>`, color: SECTION_COLORS[k % SECTION_COLORS.length], values: grid.map((row) => row[k]) }));
-	const xs = Array.from({ length: agg.G }, (_, g) => (agg.G === 1 ? 0 : g / (agg.G - 1)) * agg.meanNq);
-	// single-step segment-output overlay: object bands (hover the lane to zoom) + item/field vlines
-	let bands = null, vlines = null;
-	if (rows.length === 1 && (rows[0].a.tokens || []).length) {
-		const a = rows[0].a, segs = outputSegments(a);
-		if (segs && segs.items.length) {
-			const px = progXOfToken(a), N = (a.tokens || []).length;
-			bands = segs.items.map((it, k) => ({ id: it.label, label: it.label, x0: px(it.i0), x1: k + 1 < segs.items.length ? px(segs.items[k + 1].i0) : px(N - 1) }));
-			vlines = [
-				...segs.items.map((it) => ({ x: px(it.i0), label: it.label, major: true })),
-				...segs.fields.map((f) => ({ x: px(f.i), label: f.label, major: false })),
-			];
+	const TITLE = "prompt tag breakdown";
+	const model = tagScatterModel(rows);
+	if (!model) return card(TITLE, null, empty("no organized <tag> prompt sections carry attention in this selection"));
+	const { P, max, slope, fit, ranked, marked, xMaxTok, items, tags } = model;
+	const tagColorMap = new Map(tags.map((t, i) => [t, SECTION_COLORS[i % SECTION_COLORS.length]]));
+	const tagColor = (t) => tagColorMap.get(t) || "#7aa2f7";
+	const rowText = (p) => `<${p.tag}> · ${p.node}`;
+	const nSteps = new Set(P.map((p) => p.ev)).size;
+	const sub = `${items.length} tag block${items.length === 1 ? "" : "s"} · ${tags.length} tag${tags.length === 1 ? "" : "s"} · ${nSteps} step${nSteps === 1 ? "" : "s"} · trend ${slope >= 0 ? "+" : "−"}${Math.abs(slope * 100).toFixed(2)}%/tok · ${marked.size} over-length pick${marked.size === 1 ? "" : "s"}`;
+	const sideOf = (w) => Math.max(300, Math.min(w, vh(0.62, 320, 600))); // square side, capped
+	let query = "", selKey = null;
+	const host = chartHost((w) => {
+		const q = query.trim().toLowerCase();
+		const side = sideOf(w);
+		const pts = P.map((p) => ({ ...p, r: 4.5, color: tagColor(p.tag), hit: q ? (p.tag.toLowerCase().includes(q) || String(p.node).toLowerCase().includes(q)) : false }));
+		return scatterChart(pts, {
+			width: side, height: side, yMax: 1, xMax: xMaxTok,
+			xLabel: "section length (tokens)",
+			xFmt: (v) => String(Math.round(v)),
+			yFmt: (v) => v.toFixed(2),
+			empty: "no tag sections to plot",
+			line: { points: [{ x: 0, y: fit(0) }, { x: xMaxTok, y: fit(xMaxTok) }], color: "#ff2b2b", width: 2, dash: "5 4" },
+			yErr: (p) => p.ey,
+			dim: q ? (p) => !p.hit : null,
+			hot: (p) => (q && p.hit) || p.key === selKey,
+			ring: (p) => (marked.has(p.key) ? "#39d98a" : null),
+			tip: (p) => {
+				const rel = Math.round(p.resid * 100); // in % of the top block (y is ÷ max)
+				const trend = p.resid < 0 ? `<span class="below">${-rel}% below trend · ${p.z.toFixed(1)}σ</span>` : `${rel}% above trend`;
+				const sw = `<span style="display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;background:${tagColor(p.tag)}"></span>`;
+				return `<div class="xh">${(p.share * 100).toFixed(3)}% attention · ${p.tokens} tokens · ±${(p.ey * max * 100).toFixed(3)}%</div>`
+					+ `<div class="tip-trend">${sw}&lt;${escTip(p.tag)}&gt; · ${escTip(tagCompact(p.kind))} · ${marked.has(p.key) ? "★ over-length · " : ""}${trend}</div>`
+					+ `<div class="tip-sentence">step node: ${escTip(String(p.node))}</div>`;
+			},
+		});
+	}, (w) => sideOf(w));
+	host.classList.add("vii-plot-host");
+	// Right panel — Δ chart / ★ attended / σ trim over the SAME (tag, step) blocks.
+	const focused = state.step !== ALL;
+	let rightMode = focused ? "delta" : "trim";
+	let deltaSort = "delta";  // delta | attention | length | tag
+	let deltaDesc = true;
+	const rightBox = el("div", { class: "vii-rank" });
+	const spotlight = (p) => { selKey = selKey === p.key ? null : p.key; renderRight(); repaint(host); };
+	const wireRow = (row, p) => {
+		row.onclick = () => {
+			const sel = window.getSelection();
+			if (sel && sel.rangeCount && !sel.isCollapsed && row.contains(sel.anchorNode)) return;
+			spotlight(p);
+		};
+		row._key = p.key;
+	};
+	const rankRow = (p, i, valText, pos) => {
+		const row = el("button", { class: `vii-rk${p.key === selKey ? " on" : ""}${marked.has(p.key) ? " pick" : ""}`, style: `box-shadow:inset 3px 0 0 ${tagColor(p.tag)}` },
+			el("span", { class: "vii-rk-n", text: String(i + 1) }),
+			el("span", { class: `vii-rk-z${pos ? " pos" : ""}`, text: valText }),
+			el("span", { class: "vii-rk-txt", text: rowText(p) }));
+		wireRow(row, p);
+		return row;
+	};
+	const sortedForDelta = () => {
+		const dir = deltaDesc ? -1 : 1;
+		const byResid = (a, b) => (a.resid - b.resid) * dir;
+		const cmp = deltaSort === "attention" ? (a, b) => (a.share - b.share) * dir
+			: deltaSort === "length" ? (a, b) => (a.tokens - b.tokens) * dir
+				: deltaSort === "tag" ? (a, b) => (tags.indexOf(a.tag) - tags.indexOf(b.tag)) || byResid(a, b)
+					: byResid;
+		return [...P].sort(cmp);
+	};
+	const deltaTip = (p) => {
+		const pos = p.resid >= 0;
+		return `<div class="xh">${(p.share * 100).toFixed(3)}% attn · ${p.tokens} tok</div>`
+			+ `<div class="tip-trend"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;background:${tagColor(p.tag)}"></span>&lt;${escTip(p.tag)}&gt; · ${escTip(String(p.node))} · Δ ${pos ? "+" : "−"}${Math.abs(p.resid * 100).toFixed(1)}% vs fit${marked.has(p.key) ? " · ★ over-length" : ""}</div>`;
+	};
+	const renderRight = () => {
+		const modeBtn = (id, label, title) => {
+			const b = el("button", { class: `seg-btn${rightMode === id ? " on" : ""}`, title }, label);
+			b.onclick = () => { rightMode = id; renderRight(); };
+			return b;
+		};
+		const seg = el("div", { class: "seg-ctl" },
+			modeBtn("delta", "Δ chart", "bar chart: attention minus the length-fit per tag block (x sortable several ways)"),
+			modeBtn("attended", "★ attended", "ranked by raw attention — the most-attended tag blocks"),
+			modeBtn("trim", "σ trim", "farthest below the trend — long but under-attended tag blocks"));
+		const head = el("div", { class: "vii-rank-head vii-rank-tools" }, seg);
+		if (rightMode === "delta") {
+			const sortSel = el("select", { class: "vii-sort-sel", title: "sort the x-axis" },
+				...[["delta", "Δ attn−fit"], ["attention", "attention"], ["length", "length"], ["tag", "tag"]]
+					.map(([v, t]) => el("option", { value: v, text: t, ...(v === deltaSort ? { selected: "" } : {}) })));
+			sortSel.onchange = (e) => { deltaSort = e.target.value; renderRight(); };
+			const dirBtn = el("button", { class: "mini-toggle on", title: "sort direction", text: deltaDesc ? "↓ high" : "↑ low" });
+			dirBtn.onclick = () => { deltaDesc = !deltaDesc; renderRight(); };
+			head.append(sortSel, dirBtn);
+			const bars = sortedForDelta().map((p) => ({ value: p.resid, color: tagColor(p.tag), label: rowText(p), _p: p }));
+			const chartWrap = el("div", { class: "vii-delta-chart" });
+			chartWrap.appendChild(chartHost(
+				(w) => barChart(bars, { width: w, height: 300, yLabel: "attention − fit", yFmt: (v) => `${(v * 100).toFixed(0)}%`, empty: "no tag blocks to plot", tip: (b) => deltaTip(b._p), hot: (b) => b._p.key === selKey, onClick: (b) => spotlight(b._p) }),
+				() => 300));
+			rightBox.replaceChildren(head, chartWrap);
+			return;
 		}
-	}
-	let zoom = null; // { x0, x1, id } while hovering an object band in the lane
-	const host = chartHost((w, h) => stackAreaChart(layers, xs, {
-		width: w, height: h, share: true, yMax: 1, xLabel: "generated token", xFmt: (v) => String(Math.round(v)), yFmt: pctFmt,
-		legend: layers.map((L) => ({ label: L.label, color: L.color })),
-		vlines, bands, selBand: zoom ? zoom.id : null, corner: zoom ? `zoomed: ${zoom.id}` : null,
-		xMin: zoom ? zoom.x0 : null, xMax: zoom ? zoom.x1 : null,
-		onBand: bands ? (id) => {
-			const b = id ? bands.find((x) => x.id === id) : null;
-			const nz = b ? { x0: b.x0, x1: b.x1, id: b.id } : null;
-			if ((nz && zoom && nz.id === zoom.id) || (!nz && !zoom)) return;
-			zoom = nz; repaint(host);
-		} : null,
-	}), () => vh(0.46, 300, 520));
-	const sub = bands ? `${bands.length} output objects · segment overlay · hover the lane to zoom` : (agg.n > 1 ? `mean of ${agg.n} steps · pick one step for the segment overlay` : "one step");
-	return card("prompt tag breakdown", `${sub} · <tag> section mix over generation`, host);
+		let list;
+		if (rightMode === "attended") {
+			list = [...P].sort((a, b) => b.share - a.share).map((p, i) => rankRow(p, i, `${(p.share * 100).toFixed(2)}%`, true));
+		} else {
+			list = ranked.map((p, i) => rankRow(p, i, `${p.z >= 0 ? "+" : ""}${p.z.toFixed(1)}σ`, p.z > 0));
+		}
+		rightBox.replaceChildren(head, el("div", { class: "vii-rank-list" }, ...list));
+	};
+	renderRight();
+	const main = el("div", { class: "vii-main" }, host, rightBox);
+	const legend = el("div", { class: "vii-legend" },
+		el("span", { class: "vii-legend-lab", text: "tag" }),
+		chartLegend(tags.map((t) => ({ key: t, label: `<${t}>`, color: tagColor(t) }))));
+	const count = el("span", { class: "vii-search-n" });
+	const search = el("input", { class: "vii-search", type: "search", placeholder: "search tags / step nodes to highlight on the plot…", spellcheck: "false" });
+	const sync = () => {
+		const q = query.trim().toLowerCase();
+		const m = q ? P.filter((p) => p.tag.toLowerCase().includes(q) || String(p.node).toLowerCase().includes(q)).length : 0;
+		count.textContent = q ? `${m} match${m === 1 ? "" : "es"}` : "";
+		repaint(host);
+	};
+	search.oninput = (e) => { query = e.target.value; sync(); };
+	const ico = svgEl("svg", { viewBox: "0 0 16 16", class: "vii-search-ico", width: 14, height: 14 });
+	ico.appendChild(svgEl("path", { d: "M6.5 1a5.5 5.5 0 0 1 4.38 8.82l3.9 3.9-1.06 1.06-3.9-3.9A5.5 5.5 0 1 1 6.5 1zm0 1.5a4 4 0 1 0 0 8 4 4 0 0 0 0-8z", fill: "currentColor" }));
+	const bar = el("div", { class: "vii-searchbar" }, ico, search, count);
+	const scatterNode = el("div", {}, bar, main,
+		el("div", { class: "vii-hint", text: "each dot = one organized <tag> block in one step. x = its length (tokens) · y = attention drawn, normalized so the most-attended block = 1 · whiskers = ±1 standard error · dashed line = linear fit. dots are colored by TAG (see legend). RIGHT panel — Δ vs length: attention minus the fit (sortable bars); ★ attended: ranked by raw attention; σ trim: farthest below the trend (green-ringed = long but under-attended sections). hover a dot for its score; click a row to spotlight it; search to highlight matches." }));
+
+	// BOX view: for each step KIND, one box per TAG — the distribution of that tag
+	// section's attention across the steps of that kind (grouped by kind on x).
+	const boxHost = (() => {
+		const kinds = viiKindsPresent(P);
+		const clusters = kinds.map((k) => {
+			const byTag = new Map();
+			for (const p of P) if (p.kind === k) { let arr = byTag.get(p.tag); if (!arr) { arr = []; byTag.set(p.tag, arr); } arr.push(p.share); }
+			const boxes = tags.filter((t) => byTag.has(t)).map((t) => ({ label: t, color: tagColor(t), values: byTag.get(t) }));
+			return { label: tagCompact(k), boxes };
+		}).filter((c) => c.boxes.length);
+		const hAt = () => vh(0.5, 320, 560);
+		const h = chartHost((w) => boxPlotChart(clusters, {
+			width: w, height: hAt(), yLabel: "attention share", yFmt: (v) => `${(v * 100).toFixed(0)}%`,
+			empty: "no tag sections to plot",
+			tip: (e) => `<div class="xh">&lt;${escTip(e.label)}&gt; · ${escTip(e.cluster)} · n=${e.st.n}</div>`
+				+ `<div class="tip-trend">median ${(e.st.med * 100).toFixed(2)}% · IQR ${(e.st.q1 * 100).toFixed(2)}–${(e.st.q3 * 100).toFixed(2)}% · mean ${(e.st.mean * 100).toFixed(2)}%</div>`
+				+ `<div class="tip-sentence">range ${(e.st.min * 100).toFixed(2)}–${(e.st.max * 100).toFixed(2)}%${e.st.outliers.length ? ` · ${e.st.outliers.length} outlier${e.st.outliers.length === 1 ? "" : "s"}` : ""}</div>`,
+		}), hAt);
+		h.style.overflowX = "auto";
+		return h;
+	})();
+	const boxNode = el("div", {}, boxHost,
+		el("div", { class: "vii-hint", text: "each box = one <tag> section's attention across the steps of a kind — grouped by step kind on the x-axis, colored by tag. box = Q1–Q3 · bright line = median · dashed = mean · whiskers = 1.5×IQR · dots = outliers. y = attention share. hover a box for its five-number summary." }));
+
+	// box (default) / scatter view toggle
+	let view = "box";
+	const body = el("div", { class: "vii-body" }, boxNode);
+	const viewSeg = el("div", { class: "seg-ctl" });
+	const mkBtns = () => [
+		["box", "▧ box plot", "per step kind, a box per tag: its attention distribution (Q1–Q3, median, whiskers)"],
+		["scatter", "· scatter", "attention vs length per (tag, step), with the linear fit + ranking"],
+	].map(([id, lab, title]) => {
+		const b = el("button", { class: `seg-btn${view === id ? " on" : ""}`, title }, lab);
+		b.onclick = () => {
+			if (view === id) return;
+			view = id;
+			viewSeg.replaceChildren(...mkBtns());
+			body.replaceChildren(view === "box" ? boxNode : scatterNode);
+			repaint(view === "box" ? boxHost : host);
+		};
+		return b;
+	});
+	viewSeg.replaceChildren(...mkBtns());
+	const controls = el("div", { class: "vii-viewbar" }, el("span", { class: "muted", style: "font-size:12px", text: "view" }), viewSeg);
+	return card(TITLE, sub, controls, legend, body);
 }
 
 // --- 5. per-instruction attention within VERY_IMPORTANT_INSTRUCTIONS ---------
@@ -430,29 +839,91 @@ export function viiCard(rows) {
 		});
 	}, (w) => sideOf(w));
 	host.classList.add("vii-plot-host");
-	// right-hand ranking by z = distance below the fit ÷ its error. Hover a row to read
-	// its full text (it wraps in place); click to spotlight it on the scatter (and keep it
-	// expanded via .on). Full label stays in the DOM span, so it's readable + accessible.
-	const rankRows = ranked.map((p, i) => {
-		const row = el("button", { class: `vii-rk${marked.has(p.key) ? " pick" : ""}`, style: `box-shadow:inset 3px 0 0 ${viiKindColor(p.kind)}` },
-			el("span", { class: "vii-rk-n", text: String(i + 1) }),
-			el("span", { class: `vii-rk-z${p.z > 0 ? " pos" : ""}`, text: `${p.z >= 0 ? "+" : ""}${p.z.toFixed(1)}σ` }),
-			el("span", { class: "vii-rk-txt", text: p.label }));
+	// Right panel — switchable views over the SAME instructions, each row clickable
+	// to spotlight it on the scatter (drag-selecting text to copy is preserved):
+	//   delta    — attention MINUS the length-fit (residual): a diverging bar list,
+	//              sortable, so length-adjusted over/under-attention reads at a glance
+	//   attended — ranked by RAW attention (the best / most-attended instructions)
+	//   trim     — the original σ-below-trend ranking (trim candidates)
+	// Default = delta for a focused (step-kind / single-step) selection, else trim.
+	const focused = state.step !== ALL;
+	let rightMode = focused ? "delta" : "trim";
+	// x-axis sort orders for the Δ bar chart ("sorted in several ways").
+	let deltaSort = "delta";  // delta | attention | length | kind
+	let deltaDesc = true;
+	const rightBox = el("div", { class: "vii-rank" });
+	const spotlight = (p) => { selKey = selKey === p.key ? null : p.key; renderRight(); repaint(host); };
+	const wireRow = (row, p) => {
 		row.onclick = () => {
-			// if the user just drag-selected text in this row, let them copy it — don't
-			// treat the mouseup as a spotlight toggle (a plain click collapses the selection).
 			const sel = window.getSelection();
 			if (sel && sel.rangeCount && !sel.isCollapsed && row.contains(sel.anchorNode)) return;
-			selKey = selKey === p.key ? null : p.key;
-			rankRows.forEach((rr) => rr.classList.toggle("on", rr === row && selKey === p.key));
-			repaint(host);
+			spotlight(p);
 		};
+		row._key = p.key;
+	};
+	const rankRow = (p, i, valText, pos) => {
+		const row = el("button", { class: `vii-rk${p.key === selKey ? " on" : ""}${marked.has(p.key) ? " pick" : ""}`, style: `box-shadow:inset 3px 0 0 ${viiKindColor(p.kind)}` },
+			el("span", { class: "vii-rk-n", text: String(i + 1) }),
+			el("span", { class: `vii-rk-z${pos ? " pos" : ""}`, text: valText }),
+			el("span", { class: "vii-rk-txt", text: p.label }));
+		wireRow(row, p);
 		return row;
-	});
-	const rankBox = el("div", { class: "vii-rank" },
-		el("div", { class: "vii-rank-head", text: "worst → best · σ below trend" }),
-		el("div", { class: "vii-rank-list" }, ...rankRows));
-	const main = el("div", { class: "vii-main" }, host, rankBox);
+	};
+	// Sort the instructions for the Δ bar chart's x-axis by the chosen key.
+	const sortedForDelta = () => {
+		const dir = deltaDesc ? -1 : 1;
+		const ord = viiKindsPresent(P);
+		const byResid = (a, b) => (a.resid - b.resid) * dir;
+		const cmp = deltaSort === "attention" ? (a, b) => (a.share - b.share) * dir
+			: deltaSort === "length" ? (a, b) => (a.tokens - b.tokens) * dir
+				: deltaSort === "kind" ? (a, b) => (ord.indexOf(a.kind) - ord.indexOf(b.kind)) || byResid(a, b)
+					: byResid;
+		return [...P].sort(cmp);
+	};
+	const deltaTip = (p) => {
+		const pos = p.resid >= 0;
+		return `<div class="xh">${(p.share * 100).toFixed(3)}% attn · ${p.tokens} tok</div>`
+			+ `<div class="tip-trend"><span style="display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;background:${viiKindColor(p.kind)}"></span>${escTip(viiKindLabel(p.kind))} · Δ ${pos ? "+" : "−"}${Math.abs(p.resid * 100).toFixed(1)}% vs fit${marked.has(p.key) ? " · ★ trim" : ""}</div>`
+			+ `<div class="tip-sentence">${escTip(p.label)}</div>`;
+	};
+	const renderRight = () => {
+		const modeBtn = (id, label, title) => {
+			const b = el("button", { class: `seg-btn${rightMode === id ? " on" : ""}`, title }, label);
+			b.onclick = () => { rightMode = id; renderRight(); };
+			return b;
+		};
+		const seg = el("div", { class: "seg-ctl" },
+			modeBtn("delta", "Δ chart", "bar chart: attention minus the length-fit per instruction (x sortable several ways)"),
+			modeBtn("attended", "★ attended", "ranked by raw attention — the most-attended instructions"),
+			modeBtn("trim", "σ trim", "farthest below the trend — the trim candidates"));
+		const head = el("div", { class: "vii-rank-head vii-rank-tools" }, seg);
+		if (rightMode === "delta") {
+			// x-axis sort control (several ways) + direction toggle
+			const sortSel = el("select", { class: "vii-sort-sel", title: "sort the x-axis" },
+				...[["delta", "Δ attn−fit"], ["attention", "attention"], ["length", "length"], ["kind", "step kind"]]
+					.map(([v, t]) => el("option", { value: v, text: t, ...(v === deltaSort ? { selected: "" } : {}) })));
+			sortSel.onchange = (e) => { deltaSort = e.target.value; renderRight(); };
+			const dirBtn = el("button", { class: "mini-toggle on", title: "sort direction", text: deltaDesc ? "↓ high" : "↑ low" });
+			dirBtn.onclick = () => { deltaDesc = !deltaDesc; renderRight(); };
+			head.append(sortSel, dirBtn);
+			const bars = sortedForDelta().map((p) => ({ value: p.resid, color: viiKindColor(p.kind), label: p.label, _p: p }));
+			const chartWrap = el("div", { class: "vii-delta-chart" });
+			chartWrap.appendChild(chartHost(
+				(w) => barChart(bars, { width: w, height: 300, yLabel: "attention − fit", yFmt: (v) => `${(v * 100).toFixed(0)}%`, empty: "no instructions to plot", tip: (b) => deltaTip(b._p), hot: (b) => b._p.key === selKey, onClick: (b) => spotlight(b._p) }),
+				() => 300));
+			rightBox.replaceChildren(head, chartWrap);
+			return;
+		}
+		let list;
+		if (rightMode === "attended") {
+			list = [...P].sort((a, b) => b.share - a.share).map((p, i) => rankRow(p, i, `${(p.share * 100).toFixed(2)}%`, true));
+		} else {
+			list = ranked.map((p, i) => rankRow(p, i, `${p.z >= 0 ? "+" : ""}${p.z.toFixed(1)}σ`, p.z > 0));
+		}
+		rightBox.replaceChildren(head, el("div", { class: "vii-rank-list" }, ...list));
+	};
+	renderRight();
+	const main = el("div", { class: "vii-main" }, host, rightBox);
 	// shared step-kind legend for both the dots and the ranked rows' left color bar
 	const legend = el("div", { class: "vii-legend" },
 		el("span", { class: "vii-legend-lab", text: "step kind" }),
@@ -472,5 +943,5 @@ export function viiCard(rows) {
 	reportBtn.onclick = () => runViiReport(reportBtn);
 	const bar = el("div", { class: "vii-searchbar" }, ico, search, count, reportBtn);
 	return card(TITLE, sub, bar, legend, main,
-		el("div", { class: "vii-hint", text: "each dot = one instruction (sentence). x = its length (tokens) · y = attention drawn, normalized so the most-attended = 1 · whiskers = ±1 standard error · dashed line = linear fit. dots (and each ranked row's left bar) are colored by the STEP KIND the instruction belongs to — see the legend. green rings and the right-hand ranking = the instructions farthest BELOW the trend with the most certainty (score σ = distance below ÷ error) — the best candidates to trim. hover a dot for its score + text; click a ranked row to spotlight it; search to highlight matches." }));
+		el("div", { class: "vii-hint", text: "each dot = one instruction (variable values like ids / coordinates are masked so the same instruction merges across steps). x = its length (tokens) · y = attention drawn, normalized so the most-attended = 1 · whiskers = ±1 standard error · dashed line = linear fit. dots + rows are colored by STEP KIND (see legend). RIGHT panel — Δ vs length: attention minus the fit (diverging bars, sortable); ★ attended: ranked by raw attention (best-attended); σ trim: farthest below the trend (green-ringed = trim candidates). hover a dot for its score; click a row to spotlight it; search to highlight matches." }));
 }

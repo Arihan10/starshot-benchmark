@@ -6,7 +6,7 @@
 // the per-entity/attribute rollups, the per-output-item rollups, and the buckets.
 
 import { api } from "../../js/api.js";
-import { state, ALL, entityKindLabel, buildCellObs } from "./state.js";
+import { state, ALL, entityKindLabel, obsFromTree } from "./state.js";
 
 // Bounded-concurrency map (so an ALL/ALL selection doesn't fire 30 fetches at once).
 export async function pool(items, size, fn) {
@@ -36,25 +36,56 @@ export async function loadCell(run) {
 	return { slots: state.slots, models: state.models, defaultModel: data.defaultModel };
 }
 
-// Fetch this cell's steps, event history (for frame recovery), and attention
-// status together. Populates state.steps / state.obs / state.attnStatus.
+// Fetch this cell's steps, scene-tree projection (for frame recovery), and
+// attention status together. Populates state.steps / state.obs / state.attnStatus.
+// The obs model comes from the compact api.tfTree projection — NOT a fold of the
+// whole (100+ MB) events.jsonl; the per-step prompt/content/VII views pull the
+// full log lazily via ensureEvents() so the data + ablation views never wait on it.
 export async function loadSteps(run, slot, model) {
-	const [stepsResp, events, computed] = await Promise.all([
+	const [stepsResp, tree, computed] = await Promise.all([
 		api.tfSteps(run, slot, model),
-		api.eventsHistory(run, slot, model),
+		api.tfTree(run, slot, model).catch((e) => { console.warn("[tf-workspace] tf-tree failed:", e); return { order: [], nodes: {} }; }),
 		api.attentionList(run, slot, model, {}).catch(() => ({ computed: [], stale: [] })),
 	]);
 	state.steps = stepsResp.steps ?? [];
-	state.events = events ?? [];
-	state.obs = buildCellObs(events ?? []);
+	state.obs = obsFromTree(tree);
+	state.events = null;      // lazy — see ensureEvents()
+	state.eventsKey = null;
 	state.attnStatus = {};
 	for (const ev of computed.computed ?? []) state.attnStatus[ev] = "ready";
 	for (const ev of computed.stale ?? []) if (!state.attnStatus[ev]) state.attnStatus[ev] = "stale";
 	return state.steps;
 }
 
+// Lazily pull this cell's full cache.llm history (the big events.jsonl). ONLY the
+// per-step prompt viewer, content view, and VII report read it (via stepLLM), so
+// the default data + ablation views never download it. Memoized per cell; a
+// concurrent second caller shares the one in-flight download, and a download that
+// finishes after the user switched cells is discarded (staleness guard).
+let _eventsInFlight = null, _eventsInFlightKey = null;
+export async function ensureEvents() {
+	const key = `${state.run}/${state.slot}/${state.model}`;
+	if (state.eventsKey === key && Array.isArray(state.events)) return state.events;
+	if (_eventsInFlight && _eventsInFlightKey === key) return _eventsInFlight;
+	_eventsInFlightKey = key;
+	_eventsInFlight = (async () => {
+		try {
+			const events = await api.eventsHistory(state.run, state.slot, state.model);
+			if (`${state.run}/${state.slot}/${state.model}` === key) {
+				state.events = events ?? [];
+				state.eventsKey = key;
+			}
+			return events ?? [];
+		} finally {
+			if (_eventsInFlightKey === key) { _eventsInFlight = null; _eventsInFlightKey = null; }
+		}
+	})();
+	return _eventsInFlight;
+}
+
 // The logged cache.llm call for a step (its exact system/user prompts + reasoning
-// + output), used by the per-step prompt viewer.
+// + output), used by the per-step prompt/content/VII views. Returns null until
+// ensureEvents() has populated state.events — every caller awaits it first.
 export function stepLLM(ev) {
 	return (state.events || []).find((e) => e && e.kind === "cache.llm" && e.index === ev) || null;
 }
@@ -216,6 +247,74 @@ export function poolComponents(rows) {
 		const p = pm(vals.concat(Array(Math.max(0, n - vals.length)).fill(0)));
 		return { component, score: p.m, sd: p.s };
 	}).sort((a, b) => b.score - a.score);
+}
+
+// --- cross-cell overlay (attribute spider across every run × model) ----------
+// The step KIND to compare across cells: the current step selection generalized
+// to a template kind (so it exists in other cells too), or null = pool all of a
+// cell's computed scene steps.
+export function overlayKindFilter() {
+	if (state.step === ALL) return null;
+	if (state.region === ALL) return state.step; // step IS a template kind
+	const s = (state.steps || []).find((x) => String(x.event_index) === String(state.step));
+	return s ? (s.template ?? s.step ?? null) : null; // a specific event → its kind
+}
+
+// One cell's attribute profile: mean per-attribute SCENE attention over its
+// computed steps of `kind` (or all computed scene steps when kind == null).
+// Non-mutating — never touches state.aggCache / state.slots — so it's safe to
+// run against cells OTHER than the one currently selected.
+async function cellComponentProfile(run, slot, model, kind) {
+	// Cheap disk-scan first — most cells have no computed attention, so skip the
+	// heavier steps fetch (and the aggregate) for them.
+	let idx; try { idx = await api.attentionIndex(run, slot, model, {}); } catch { return null; }
+	const computed = new Set([...(idx.fresh || idx.computed || []), ...(idx.stale || [])].map(Number).filter(Number.isFinite));
+	if (!computed.size) return null;
+	let steps; try { steps = await api.tfSteps(run, slot, model); } catch { return null; }
+	const stepList = steps.steps || (Array.isArray(steps) ? steps : []);
+	const evs = stepList
+		.filter((s) => computed.has(s.event_index) && s.has_scene !== false && (kind == null || (s.template ?? s.step) === kind))
+		.map((s) => s.event_index);
+	if (!evs.length) return null;
+	let resp;
+	// `abl` = the ultra-light projection (~50 KB/step vs multi-MB) — it carries
+	// `agg.scene.componentTotals`, which is all the spider needs.
+	try { resp = await api.cellAggregate(run, slot, model, { view: "abl", evs }); } catch { return null; }
+	const rows = (resp?.steps || []).filter((st) => st.a).map((st) => ({ a: st.a }));
+	if (!rows.length) return null;
+	const comps = poolComponents(rows);
+	if (!comps.length) return null;
+	return { run, slot, model, n: rows.length, map: new Map(comps.map((c) => [c.component, c.score])) };
+}
+
+// Load EVERY (run, slot, model) cell's attribute profile for `kind`, so the data
+// view can overlay them on one spider (colored by model). Enumerates cells from
+// each run's slot/model manifest (skipping cells with no logged events), then
+// pools each cell's profile with bounded concurrency + a hard cap. Token-guarded
+// against the caller's selection. Returns { profiles, scanned, capped } | null.
+const OVERLAY_MAX_CELLS = 80;
+export async function loadAllCellProfiles(kind, token) {
+	const runs = (state.runs && state.runs.length) ? state.runs : await loadRuns();
+	if (token != null && token !== state.loadToken) return null;
+	const cells = [];
+	await pool(runs, 6, async (run) => {
+		let man; try { man = await api.slots(run); } catch { return; }
+		for (const s of man.slots || []) for (const m of man.models || []) {
+			if ((s.runs?.[m]?.events_count ?? 0) <= 0) continue; // no events → no attention possible
+			cells.push({ run, slot: s.id, model: m });
+		}
+	});
+	if (token != null && token !== state.loadToken) return null;
+	const capped = cells.length > OVERLAY_MAX_CELLS;
+	const use = capped ? cells.slice(0, OVERLAY_MAX_CELLS) : cells;
+	const profiles = [];
+	await pool(use, 5, async (c) => {
+		if (token != null && token !== state.loadToken) return;
+		const p = await cellComponentProfile(c.run, c.slot, c.model, kind);
+		if (p && (token == null || token === state.loadToken)) profiles.push(p);
+	});
+	if (token != null && token !== state.loadToken) return null;
+	return { profiles, scanned: use.length, capped };
 }
 
 // Total attention split across zone / object / frame across the selection, for
@@ -401,8 +500,28 @@ const _isViiMeta = (m) => m && m.category === "text" && m.sub === "organized"
 	&& typeof m.tag === "string" && m.tag.startsWith("VERY_IMPORTANT_INSTRUCTIONS");
 const _viiOrd = (tag) => { const m = /#(\d+)$/.exec(tag || ""); return m ? +m[1] : 0; };
 const _endsSentence = (s) => /[.!?]["')\]]?\s*$/.test((s || "").trim());
+const _escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+// Canonicalize an instruction for GROUPING: the same instruction template renders
+// with different VARIABLES per step (the zone/object id it acts on, coordinates,
+// dimensions, yaw), so a naive text key splits one instruction into many. We mask
+// the variable parts — scene entity ids (from `idSet`) and any number — plus
+// lowercase + collapse whitespace, so "…relative to living_room (5.0m by 3.0m)"
+// and "…relative to bedroom (2.4m by 4.1m)" collapse to ONE class. `idSet` is the
+// union of scene entity ids across the selection (built by the caller).
+function _canonVii(text, idRe) {
+	let s = String(text || "");
+	if (idRe) s = s.replace(idRe, "\u27e8id\u27e9");
+	s = s.replace(/-?\d+(?:\.\d+)?/g, "#"); // coords / dimensions / measurements / yaw
+	return s.replace(/\s+/g, " ").trim().toLowerCase();
+}
 export function viiInstructions(rows) {
-	const acc = new Map(); // sentence text -> { key, label, tokens, samples:[per-bucket shares], nSteps, kinds:Map }
+	// Union of scene entity ids across the selection → the mask for the group key,
+	// so an instruction's per-step id substitution doesn't fork it into many.
+	const idSet = new Set();
+	for (const r of rows) for (const e of (r.a.scene_entities || [])) if (e && typeof e.id === "string" && e.id) idSet.add(e.id);
+	const idAlt = [...idSet].sort((a, b) => b.length - a.length).map(_escRe).join("|"); // longest-first so a prefix doesn't shadow
+	const idRe = idAlt ? new RegExp(`\\b(?:${idAlt})\\b`, "g") : null;
+	const acc = new Map(); // canonical key -> { key, label, tokens, samples:[per-bucket shares], nSteps, kinds:Map }
 	for (const r of rows) {
 		const kind = r.template || "?"; // the step kind whose VII wording carries this instruction
 		const b = validBuckets(r.a);
@@ -415,9 +534,11 @@ export function viiInstructions(rows) {
 		leaves.sort((a, b) => a.ord - b.ord);
 		let txt = "", tk = 0, has = false, perBucket = new Array(nb).fill(0);
 		const flush = () => {
-			const key = txt.trim();
+			const raw = txt.trim();
+			const key = _canonVii(raw, idRe); // group by the variable-masked template
 			if (key && has) {
-				const rec = acc.get(key) || { key, label: key, tokens: 0, samples: [], nSteps: 0, kinds: new Map() };
+				const rec = acc.get(key) || { key, label: raw, tokens: 0, samples: [], nSteps: 0, kinds: new Map() };
+				if (raw.length > rec.label.length) rec.label = raw; // keep the fullest real sentence as the readable label
 				for (const v of perBucket) rec.samples.push(v); // pool this step's per-bucket sentence shares
 				rec.tokens = Math.max(rec.tokens, tk); rec.nSteps += 1;
 				rec.kinds.set(kind, (rec.kinds.get(kind) || 0) + 1); // tally which step kind(s) carry this instruction
@@ -453,7 +574,10 @@ export function viiInstructions(rows) {
 // mean share (the y-normalizer), so callers can recover raw shares.
 const _SIG_FLOOR = 0.01; // sigma floor (normalized) so near-zero-error points don't blow up z
 export function viiScatterModel(rows) {
-	const items = viiInstructions(rows).filter((it) => it.key !== "VERY_IMPORTANT_INSTRUCTIONS");
+	// Drop the degenerate "whole-section" pseudo-instruction (a leaf that's just the
+	// bare tag) — robust to the canonical (lowercased/masked) group key by matching
+	// the raw label.
+	const items = viiInstructions(rows).filter((it) => !/^VERY_IMPORTANT_INSTRUCTIONS(?:#\d+)?$/.test(it.label || ""));
 	if (!items.length) return null;
 	const max = Math.max(1e-9, ...items.map((it) => it.score));
 	const P = items.map((it) => ({ it, key: it.key, label: it.label, x: it.tokens, y: it.score / max, ey: it.err / max, share: it.score, tokens: it.tokens, kind: it.kind, kinds: it.kinds }));
@@ -470,4 +594,66 @@ export function viiScatterModel(rows) {
 	const marked = new Set(ranked.filter((p) => p.z > 0).slice(0, K).map((p) => p.key));
 	const xMaxTok = Math.max(...P.map((p) => p.x), 1);
 	return { items, P, max, slope, intercept, fit, ranked, marked, xMaxTok, n };
+}
+
+// --- per-(tag, step) attention vs length (tag-breakdown scatter) -------------
+// Each organized <tag> block, per STEP it appears in, becomes ONE data point: its
+// token length and the mean attention share it drew (mean over the generation
+// buckets), plus the SE of that mean (spikiness → the scatter's y error bar).
+// Unlike viiInstructions (which pools one point per instruction ACROSS steps),
+// this keeps every (tag, step) occurrence as its own dot — so a tag contributes
+// one dot per step it appears in. VII collapses to a single block here (its per-
+// instruction split is the VII card's job), exactly as the old layered breakdown.
+export function tagBlockInstances(rows) {
+	const out = [];
+	for (const r of rows) {
+		const b = validBuckets(r.a);
+		if (!b) continue;
+		const meta = b.region_meta || [], grid = b.region || [], toks = b.region_tokens || [];
+		const nb = grid.length || 1;
+		const byTag = new Map(); // tag -> { cols:[c], tokens }
+		meta.forEach((m, c) => {
+			if (!(m && m.category === "text" && m.sub === "organized")) return;
+			const tag = _collapseTag(m.tag);
+			const rec = byTag.get(tag) || { cols: [], tokens: 0 };
+			rec.cols.push(c); rec.tokens += (toks[c] || 0);
+			byTag.set(tag, rec);
+		});
+		for (const [tag, rec] of byTag) {
+			if (!rec.tokens) continue;
+			const perBucket = new Array(nb).fill(0);
+			for (let bi = 0; bi < nb; bi++) { let s = 0; for (const c of rec.cols) s += (grid[bi] && grid[bi][c]) || 0; perBucket[bi] = s; }
+			const N = nb || 1;
+			const score = perBucket.reduce((a, v) => a + v, 0) / N;         // mean attention share over generation
+			const variance = perBucket.reduce((a, v) => a + (v - score) ** 2, 0) / N;
+			const err = Math.sqrt(variance / N);                            // SE of the mean (uncertainty)
+			out.push({ key: `${r.event_index}:${tag}`, tag, node: r.node, kind: r.template || "?", ev: r.event_index, score, err, tokens: rec.tokens });
+		}
+	}
+	return out;
+}
+
+// Shared model behind the tag-breakdown scatter: normalized points, a least-
+// squares fit of attention vs length, and each point's z = SEs BELOW the trend
+// (the ranking score). Mirrors viiScatterModel but over (tag, step) blocks, so a
+// tag that draws little attention for its length reads as an over-length pick.
+export function tagScatterModel(rows) {
+	const items = tagBlockInstances(rows);
+	if (!items.length) return null;
+	const max = Math.max(1e-9, ...items.map((it) => it.score));
+	const P = items.map((it) => ({ ...it, label: `<${it.tag}>`, x: it.tokens, y: it.score / max, ey: it.err / max, share: it.score }));
+	const n = P.length;
+	let sx = 0, sy = 0, sxx = 0, sxy = 0;
+	for (const p of P) { sx += p.x; sy += p.y; sxx += p.x * p.x; sxy += p.x * p.y; }
+	const denom = n * sxx - sx * sx;
+	const slope = denom ? (n * sxy - sx * sy) / denom : 0;
+	const intercept = (sy - slope * sx) / (n || 1);
+	const fit = (x) => intercept + slope * x;
+	P.forEach((p) => { p.resid = p.y - fit(p.x); p.z = -p.resid / Math.max(p.ey, _SIG_FLOOR); });
+	const ranked = [...P].sort((a, b) => b.z - a.z);
+	const K = Math.max(1, Math.min(8, Math.round(n * 0.15)));
+	const marked = new Set(ranked.filter((p) => p.z > 0).slice(0, K).map((p) => p.key));
+	const xMaxTok = Math.max(...P.map((p) => p.x), 1);
+	const tags = [...new Set(P.map((p) => p.tag))].sort();
+	return { items, P, max, slope, intercept, fit, ranked, marked, xMaxTok, n, tags };
 }

@@ -1,12 +1,17 @@
-// Content view — the per-step "structure" page, ported to the workspace's
-// conventions: a 3D scene shaded by attention, the scene/attention badge tree,
-// and the active zone's plan + the step's output + reasoning (entity phrases
-// colored by attention). Tree badges, plan phrases, and output/reasoning entities
-// all cross-highlight each other and the 3D scene (bidirectional, via ctHover).
+// Content view — the per-step "structure" page as a RESIZABLE TILED workspace
+// (replacing the old floating/drawable windows):
 //
-// It is a SINGLE-step view: the header region + step selectors must resolve to one
-// step (like the "prompts" button). Reuses the shared data layer + the same
-// three.js viewer engine as the legacy inspector (scene3d.createViewer).
+//   ┌───────────────┬───────────────────────────┐
+//   │ Attention Tree │ 3D scene (attention-shaded)│
+//   │                ├─────────────┬─────────────┤
+//   │ Original       │ Zone plan   │ Attention ·  │
+//   │ content        │ (upstream)  │ sorted list  │
+//   └───────────────┴─────────────┴─────────────┘
+//
+// Tree badges, plan phrases, output/reasoning entities, and the sorted list all
+// cross-highlight each other and the 3D scene (bidirectional, via ctHover). It is
+// a SINGLE-step view for the per-step tiles (plan / output); the tree + 3D + list
+// work for any selection (aggregate). Reuses the shared three.js viewer engine.
 
 import { el } from "../../js/ui.js";
 import { api } from "../../js/api.js";
@@ -16,24 +21,23 @@ import {
 	$, state, ALL, COLORS, COMPONENT_COLORS, entityHex, entityKindLabel,
 	bumpLoad, ctHoverReset, ctHoverRegister,
 } from "./state.js";
-import { selectedSteps, loadRows, stepLLM } from "./data.js";
+import { selectedSteps, loadRows, stepLLM, ensureEvents } from "./data.js";
 
 // --- small helpers -----------------------------------------------------------
 
 const fmtNum = (v) => (v >= 1 ? v.toFixed(1) : v >= 0.01 ? v.toFixed(3) : v.toFixed(4));
-// attention heat ramp (dark blue → bright yellow), matches the legacy tree.
+// legacy attention heat ramp (dark blue → bright yellow) — kept for the text spans.
 const heat = (t) => { t = Math.max(0, Math.min(1, t)); return `hsl(${(212 - 162 * t).toFixed(0)}, 70%, ${(32 + 28 * t).toFixed(0)}%)`; };
+// SHARED attention scale: low = yellow, high = red — used by the heat badges + the
+// sorted list + the 3D wireframe overlay (via scene3d's hotRamp) so every
+// attention read across the content view is consistent.
+const attnColor = (t) => { t = Math.max(0, Math.min(1, t)); return `hsl(${(58 - 58 * t).toFixed(0)}, ${(86 + 8 * t).toFixed(0)}%, ${(55 - 6 * t).toFixed(0)}%)`; };
 function alpha(hex, a) {
 	const h = String(hex).replace("#", "");
 	const n = h.length === 3 ? h.split("").map((c) => c + c).join("") : h;
 	const r = parseInt(n.slice(0, 2), 16) || 0, g = parseInt(n.slice(2, 4), 16) || 0, b = parseInt(n.slice(4, 6), 16) || 0;
 	return `rgba(${r},${g},${b},${a})`;
 }
-const card = (title, sub, ...body) => {
-	const head = el("div", { class: "card-head" }, el("span", { class: "card-title", text: title }));
-	if (sub) head.appendChild(el("span", { class: "card-sub", text: sub }));
-	return el("div", { class: "card" }, head, el("div", { class: "card-body" }, ...body.filter(Boolean)));
-};
 const emptyCard = (msg, big = "▦") => el("div", { class: "empty" }, el("span", { class: "big", text: big }), el("div", { text: msg }));
 
 // The zone a step operates in: its own node when that's a zone, else the region
@@ -45,6 +49,22 @@ function targetZoneOf(step) {
 	return step.node;
 }
 
+// The nearest ANCESTOR zone of `zoneId` (the upstream parent it belongs to), or
+// null at the root. Used so the zone-plan tile shows the governing parent plan.
+function parentZoneOf(zoneId) {
+	const m = state.obs;
+	if (!m || !zoneId) return null;
+	let cur = m.nodes.get(zoneId);
+	cur = cur?.parentId ? m.nodes.get(cur.parentId) : null;
+	let hops = 0;
+	while (cur && hops < 64) {
+		if (cur.kind === "zone") return cur.id;
+		cur = cur.parentId ? m.nodes.get(cur.parentId) : null;
+		hops += 1;
+	}
+	return null;
+}
+
 // id → { score, kind } and the peak, from a single step's scene aggregate.
 function entityScores(a) {
 	const ent = new Map(); let max = 0;
@@ -53,8 +73,7 @@ function entityScores(a) {
 }
 
 // Mean per-entity attention across a multi-step selection (absent counts as 0) —
-// the aggregate the tree + 3D shading use when more than one step is in scope, so
-// the structure view works for ANY selection (just less rich than a single step).
+// the aggregate the tree + 3D shading use when more than one step is in scope.
 function aggregateRows(rows) {
 	if (rows.length === 1) return entityScores(rows[0].a);
 	const n = rows.length || 1;
@@ -241,15 +260,19 @@ function buildTree(agg, targetZone, heatOnly) {
 		const reg = regionOf(id);
 		const isTarget = id === targetZone;
 		const t = own(id) / maxOne;
+		// A coloured RIGHT edge encodes the entity KIND (zone / object / frame),
+		// so kinds stay distinguishable even in heat mode where the badge body is
+		// attention-coloured. (In width mode this matches the body colour.)
+		const rightHex = isRoot ? "#9aa7bd" : entityHex(n?.kind, id);
 		let style, cls;
 		if (heatMode) {
-			const dark = !isRoot && t > 0.52;
-			style = `background:${isRoot ? "#464d5b" : heat(t)};border-color:${isRoot ? "#6b7280" : heat(Math.min(1, t + 0.12))};color:${dark ? "#141414" : "#e8eefc"}`;
+			const hot = attnColor(t); // yellow (low) → red (high) — the shared scale
+			style = `background:${isRoot ? "#464d5b" : hot};border-color:${isRoot ? "#6b7280" : hot};color:${isRoot ? "#e8eefc" : (t > 0.5 ? "#fff" : "#2a1e08")};border-right:3px solid ${rightHex}`;
 			cls = `ct-badge heat${zone ? " zone" : ""}${isRoot ? " root" : ""}${isTarget ? " target" : ""}`;
 		} else {
 			const hex = isRoot ? "#9aa7bd" : entityHex(n?.kind, id);
 			const wpct = isRoot ? FILL : (FILL * own(id)) / maxRow;
-			style = `width:${wpct.toFixed(3)}%;background:${hex}2e;border-color:${hex}`;
+			style = `width:${wpct.toFixed(3)}%;background:${hex}2e;border-color:${hex};border-right:3px solid ${rightHex}`;
 			cls = `ct-badge${zone ? " zone" : ""}${isRoot ? " root" : ""}${isTarget ? " target" : ""}`;
 		}
 		const b = el("div", {
@@ -257,28 +280,166 @@ function buildTree(agg, targetZone, heatOnly) {
 			title: `${id} · ${kindLab}${reg ? ` · in ${reg}` : ""}${isTarget ? " · current step's zone" : ""} · attention ${fmtNum(own(id))}`,
 			onclick: () => focusEntity(id),
 		}, el("span", { class: "ct-badge-lab", text: id }));
+		if (!heatMode) { b.dataset.id = id; b.dataset.rel = isRoot ? "1" : t.toFixed(4); } // for the leader-arm label layout
 		ctHoverRegister(id, b);
 		return b;
 	};
 
-	const treeView = (heatMode) => el("div", { class: `ct-tree-view${heatMode ? " ct-heat" : ""}` },
-		...rows.map((r) => el("div", { class: "ct-row", style: `margin-left:${r.depth * INDENT}px` }, ...r.ids.map((id) => badge(id, r.zone, heatMode)))));
+	// Width mode gives each ZONE its own full-width row; OBJECTS + FRAMES share a
+	// row (clipped names drop to a label lane below, joined by a leader arm). Heat
+	// badges are uniform width, so their names always fit.
+	const treeView = (heatMode) => {
+		const view = el("div", { class: `ct-tree-view${heatMode ? " ct-heat" : ""}` });
+		for (const r of rows) {
+			const indent = `margin-left:${r.depth * INDENT}px`;
+			const rowEl = el("div", { class: `ct-row${r.zone ? " zone-row" : " leaf-row"}`, style: (heatMode || r.zone) ? indent : "" },
+				...r.ids.map((id) => badge(id, r.zone, heatMode)));
+			if (heatMode) { view.appendChild(rowEl); continue; }
+			if (r.zone) {
+				for (const id of r.ids) rowEl.appendChild(el("span", { class: "ct-zone-name-ext", text: id, title: id, onclick: () => focusEntity(id) }));
+				view.appendChild(rowEl);
+			} else {
+				const lane = el("div", { class: "ct-labels" });
+				const arms = document.createElementNS(SVGNS, "svg"); arms.setAttribute("class", "ct-arms");
+				const group = el("div", { class: "ct-rowgroup", style: indent }, rowEl, lane);
+				group.appendChild(arms);
+				view.appendChild(group);
+			}
+		}
+		return view;
+	};
 
 	const legend = el("div", { class: "ct-tree-legend" },
 		...[["root", "#9aa7bd"], ["zone", COLORS.zone], ["frame", COLORS.frame], ["object", COLORS.object]]
 			.map(([k, hex]) => el("span", {}, el("i", { style: `background:${hex}` }), el("span", { text: ` ${k}` }))));
 
 	const sub = (capText, heatMode) => el("div", {}, el("div", { class: "ct-tree-cap", text: capText }), treeView(heatMode));
-	return el("div", { class: "ct-tree" },
-		...(heatOnly ? [] : [sub("badge width = attention · hover for full name · click → focus", false)]),
-		sub("badge color = attention · uniform width", true),
+	const treeRoot = el("div", { class: "ct-tree" },
+		...(heatOnly ? [] : [sub("badge width = attention · right edge = kind · hover for full name · click → focus", false)]),
+		sub("badge colour = attention (yellow→red) · right edge = kind", true),
 		legend);
+	if (!heatOnly) fitTreeLabels(treeRoot);
+	return treeRoot;
 }
 
-// --- 3D viewer (created once, reused; shown in a draggable/resizable popout) ---
+const SVGNS = "http://www.w3.org/2000/svg";
+// Leader-arm label layout tunables (mirrors the tf overview tree).
+const _LBL = { H: 15, DROP: 8, GAP: 3, LGAP: 8, PAD: 12, MAX: 14, REL_MIN: 0.13 };
+let _measCtx = null;
 
-const MINW_KEY = "tf-ct-minw", KINDS_KEY = "tf-ct-kinds";
-let ctMinW = (() => { try { const v = Number(localStorage.getItem(MINW_KEY)); return v >= 0 && v <= 0.95 ? v : 0.12; } catch { return 0.12; } })();
+// Place below-row labels + leader arms for ONE leaf rowgroup (objects/frames share
+// a row). A badge shows its name inline only when the text fits its measured width;
+// otherwise — if the entity is relevant enough — the name moves to the label lane
+// below and a 3-segment arm points from the badge down to it. Idempotent.
+function layoutLeafGroup(group) {
+	const rowEl = group.querySelector(".ct-row");
+	const lane = group.querySelector(".ct-labels");
+	const arms = group.querySelector(".ct-arms");
+	if (!rowEl || !lane || !arms) return;
+	lane.replaceChildren();
+	while (arms.firstChild) arms.removeChild(arms.firstChild);
+	const badges = [...rowEl.children];
+	if (!badges.length) return;
+	for (const b of badges) { // clear stale glow bindings (badges persist across relayouts)
+		if (b._glowOn) { b.removeEventListener("mouseenter", b._glowOn); b.removeEventListener("mouseleave", b._glowOff); b._glowOn = b._glowOff = null; }
+		b.classList.remove("ct-hot");
+	}
+	_measCtx = _measCtx || document.createElement("canvas").getContext("2d");
+	const cs = getComputedStyle(badges[0]);
+	_measCtx.font = `${cs.fontSize} ${cs.fontFamily}`;
+	let shorts = [];
+	for (const b of badges) {
+		const fits = _measCtx.measureText(b.dataset.id || "").width <= b.clientWidth - _LBL.PAD - 2;
+		b.classList.toggle("lab-out", !fits);
+		if (!fits && Number(b.dataset.rel) >= _LBL.REL_MIN) shorts.push(b);
+	}
+	if (shorts.length > _LBL.MAX) shorts = shorts.sort((a, z) => Number(z.dataset.rel) - Number(a.dataset.rel)).slice(0, _LBL.MAX);
+	if (!shorts.length) { lane.style.height = "0px"; arms.style.display = "none"; return; }
+	arms.style.display = "";
+	const groupW = group.clientWidth;
+	const items = shorts
+		.map((b) => { const d = lane.appendChild(el("div", { class: "ct-label", text: b.dataset.id, title: b.dataset.id, onclick: () => focusEntity(b.dataset.id) })); d.dataset.id = b.dataset.id; return { b, d }; })
+		.map((it) => ({ ...it, bc: it.b.offsetLeft + it.b.offsetWidth / 2, lw: it.d.offsetWidth }))
+		.sort((a, z) => a.bc - z.bc);
+	for (const it of items) { // hovering a badge OR its label glows both + the arm
+		const on = () => { it.b.classList.add("ct-hot"); it.d.classList.add("ct-hot"); it.p?.classList.add("hot"); };
+		const off = () => { it.b.classList.remove("ct-hot"); it.d.classList.remove("ct-hot"); it.p?.classList.remove("hot"); };
+		it.b._glowOn = on; it.b._glowOff = off;
+		it.b.addEventListener("mouseenter", on); it.b.addEventListener("mouseleave", off);
+		it.d.addEventListener("mouseenter", on); it.d.addEventListener("mouseleave", off);
+	}
+	const levelRight = [];
+	for (const it of items) {
+		const px = Math.max(0, Math.min(it.bc - it.lw / 2, Math.max(0, groupW - it.lw)));
+		let lvl = levelRight.findIndex((r) => px >= r + _LBL.LGAP);
+		if (lvl === -1) { lvl = levelRight.length; levelRight.push(0); }
+		levelRight[lvl] = px + it.lw;
+		it.x = px; it.lvl = lvl;
+		it.d.style.left = `${px}px`;
+		it.d.style.top = `${_LBL.DROP + lvl * (_LBL.H + _LBL.GAP)}px`;
+	}
+	const used = levelRight.length || 1;
+	lane.style.height = `${_LBL.DROP + used * (_LBL.H + _LBL.GAP) + 2}px`;
+	const gW = group.clientWidth, gH = group.clientHeight;
+	arms.setAttribute("width", gW); arms.setAttribute("height", gH);
+	arms.setAttribute("viewBox", `0 0 ${gW} ${gH}`);
+	const by = rowEl.offsetHeight;
+	for (const it of items) {
+		const lcx = it.x + it.lw / 2;
+		const ly = lane.offsetTop + _LBL.DROP + it.lvl * (_LBL.H + _LBL.GAP);
+		const mid = by + Math.max(3, (ly - by) / 2);
+		const p = document.createElementNS(SVGNS, "path");
+		p.setAttribute("d", `M${it.bc.toFixed(1)} ${by}L${it.bc.toFixed(1)} ${mid.toFixed(1)}L${lcx.toFixed(1)} ${mid.toFixed(1)}L${lcx.toFixed(1)} ${ly.toFixed(1)}`);
+		p.setAttribute("fill", "none"); p.setAttribute("stroke", "rgba(255,255,255,0.26)"); p.setAttribute("stroke-width", "1");
+		arms.appendChild(p); it.p = p; // link so a badge/label hover can glow it too
+	}
+}
+
+// Post-layout label pass for the width tree; re-runs when its WIDTH changes.
+function fitTreeLabels(root) {
+	let lastW = -1;
+	const run = () => {
+		for (const row of root.querySelectorAll(".ct-tree-view:not(.ct-heat) .ct-row.zone-row")) {
+			const lab = row.querySelector(".ct-badge.zone .ct-badge-lab");
+			if (lab) row.classList.toggle("show-ext", lab.scrollWidth - lab.clientWidth > 1);
+		}
+		for (const g of root.querySelectorAll(".ct-tree-view:not(.ct-heat) .ct-rowgroup")) layoutLeafGroup(g);
+	};
+	requestAnimationFrame(() => { lastW = Math.round(root.clientWidth); run(); });
+	try { new ResizeObserver(() => { const w = Math.round(root.clientWidth); if (w !== lastW) { lastW = w; run(); } }).observe(root); } catch { /* ignore */ }
+}
+
+// --- 3D viewer (created once, reused; mounted inline into the 3D tile) --------
+
+const KINDS_KEY = "tf-ct-kinds", TOPFRAC_KEY = "tf-ct-topfrac";
+// Attention-threshold cutoff as a FRACTION of the ranked entities shown (1 = all).
+// The slider steps per-object over this ranking (feature: deterministic control).
+let ctTopFrac = (() => { try { const v = Number(localStorage.getItem(TOPFRAC_KEY)); return v > 0 && v <= 1 ? v : 1; } catch { return 1; } })();
+let ctKinds = null; // Set of shown entity kinds (persisted); (re)initialised per render
+// "Post-zone" view: extend the render forward to everything placed up to (but
+// before) the NEXT zone plan, so a step's downstream effects are visible; the
+// entities produced in that window are highlighted BLUE. Single-step only.
+const POSTZONE_KEY = "tf-ct-postzone";
+let ctPostZone = (() => { try { return localStorage.getItem(POSTZONE_KEY) === "1"; } catch { return false; } })();
+// Blue "focus" highlight: the current zone (and, in post-zone mode, the step's
+// results) are drawn in flashing blue and every OTHER wireframe is dimmed. On by
+// default; toggleable since the flash/dim can distract during close inspection.
+const HL_KEY = "tf-ct-highlight";
+let ctHighlight = (() => { try { return localStorage.getItem(HL_KEY) !== "0"; } catch { return true; } })();
+const _isZonePlan = (t) => /(^|_)zone_plan/.test(t || "");
+// The event index of the NEXT zone-plan step after `step` — the boundary the
+// post-zone view stops just before. null = this is the last zone, so render to the
+// end of the scene.
+function nextZonePlanIndex(step) {
+	let best = null;
+	for (const s of state.steps || []) {
+		const ev = s.event_index;
+		if (ev == null || ev <= step.event_index) continue;
+		if (!_isZonePlan(s.template ?? s.step)) continue;
+		if (best == null || ev < best) best = ev;
+	}
+	return best;
+}
 
 function ensureViewer() {
 	if (state.viewer3d && state._ctHost) return true;
@@ -289,177 +450,363 @@ function ensureViewer() {
 	} catch { state.viewer3d = null; state._ctHost = null; return false; }
 }
 
-// Focus an entity in 3D (select + frame) and glow it.
+// Focus an entity in 3D: frame the camera on it + mark it strong green, without
+// collapsing the attention overlay (every other entity's attention stays put).
 function focusEntity(id) {
 	state.viewer3d?.select?.(id, { frame: true });
-	state.viewer3d?.setAttnHighlight?.([{ id, weight: 1 }]);
+	state.viewer3d?.setHoverHighlight?.(id);
 }
 
-// The 3D popout: a draggable + resizable floating window that reparents the shared
-// viewer host into itself, shows the scene shaded by the CURRENT selection's
-// attention, and refreshes in place on selection change. Not shown until opened.
-let _win3d = null;
-export function close3DWindow() {
-	if (!_win3d) return;
-	document.removeEventListener("keydown", _win3d.onKey, true);
-	state.viewer3d?.clearAttnHighlight?.();
-	state.viewer3d?.setActive?.(false);
-	if (state._ctHost && state._ctHost.parentNode) state._ctHost.parentNode.removeChild(state._ctHost); // keep the host alive
-	_win3d.win.remove();
-	_win3d = null;
+// The kinds present (with attention) in the current aggregate.
+function kindsPresentOf(agg) {
+	return ["zone", "frame", "object"].filter((k) => [...agg.ent].some(([id, v]) => entityKindLabel(v.kind, id) === k && v.score > 0));
 }
-function open3DWindow() {
-	if (_win3d) { _win3d.win.style.zIndex = String(++_winZ); refresh3DWindow(); return; }
-	if (!ensureViewer()) return;
-	const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); close3DWindow(); } };
-	const sub = el("span", { class: "ct-win-sub" });
-	const head = el("div", { class: "ct-win-head" },
-		el("span", { style: "color:var(--text-faint)", text: "⠿" }),
-		el("span", { class: "ct-win-title", text: "3D scene" }), sub, el("span", { style: "flex:1" }),
-		el("button", { class: "ct-win-close", title: "close (Esc)", text: "×", onclick: close3DWindow }));
-	const controls = el("div", { class: "ct-3d-controls" });
-	const body = el("div", { class: "ct-win-3d-body" }, state._ctHost, controls);
-	const grip = el("div", { class: "ct-win-resize", title: "drag to resize" });
-	const win = el("div", { class: "ct-win ct-win-3d" }, head, body, grip);
-	win.style.zIndex = String(++_winZ);
-	document.body.appendChild(win);
-	dragWin(win, head);
-	resizeWin(win, grip);
-	document.addEventListener("keydown", onKey, true);
-	state.viewer3d.setActive(true);
-	_win3d = { win, sub, controls, onKey, active: null };
-	refresh3DWindow();
-}
-// Recompute shading (over the current selection's aggregate) + reload the scene,
-// in place — so the popout tracks region/step changes without being recreated.
-function refresh3DWindow() {
-	if (!_win3d) return;
+
+// Load the most-built scene in scope + shade it by attention, and (re)build the
+// inline controls (per-object threshold slider · type toggles · hide-meshes ·
+// post-zone). `controls` is the controls container INSIDE the 3D tile body;
+// `step`/`single` describe the current selection (post-zone needs a single step).
+function refresh3DTile(controls, agg, step, single, targetZone) {
+	if (!state.viewer3d) return;
 	const token = state.loadToken;
-	const rows = state.rows || [];
 	const sel = selectedSteps();
-	if (!sel.length || !rows.length) { _win3d.sub.textContent = "no step in scope"; return; }
-	const agg = aggregateRows(rows);
-	_win3d.sub.textContent = sel.length === 1 ? `${sel[0].template ?? sel[0].step} · ${sel[0].node ?? ""}` : `${sel.length} steps`;
+	const rows = state.rows || [];
 
-	const kindsPresent = ["zone", "frame", "object"].filter((k) => [...agg.ent].some(([id, v]) => entityKindLabel(v.kind, id) === k && v.score > 0));
-	let active = _win3d.active;
-	if (!active) {
-		active = new Set(kindsPresent);
-		try { const saved = (localStorage.getItem(KINDS_KEY) || "").split(",").filter(Boolean).filter((k) => kindsPresent.includes(k)); if (saved.length) active = new Set(saved); } catch { /* ignore */ }
-		_win3d.active = active;
+	const kindsPresent = kindsPresentOf(agg);
+	if (!ctKinds) {
+		ctKinds = new Set(kindsPresent);
+		try { const saved = (localStorage.getItem(KINDS_KEY) || "").split(",").filter(Boolean).filter((k) => kindsPresent.includes(k)); if (saved.length) ctKinds = new Set(saved); } catch { /* ignore */ }
 	}
-	const shadeItems = () => {
-		const items = [...agg.ent].filter(([id, v]) => v.score > 0 && active.has(entityKindLabel(v.kind, id)) && (state.viewer3d?.hasBbox?.(id) ?? true));
-		const max = Math.max(1e-9, ...items.map(([, v]) => v.score));
-		return items.map(([id, v]) => ({ id, weight: v.score / max }));
+
+	// Ranked, kind-filtered, present-in-scene entities (highest attention first).
+	// The current zone is excluded while the blue focus highlight is on — it's
+	// drawn in blue, so keeping it out of the attention overlay (and its colour
+	// scale + slider count) stops the two highlights stacking + conflicting.
+	const ranked = () => [...agg.ent]
+		.filter(([id, v]) => v.score > 0 && ctKinds.has(entityKindLabel(v.kind, id)) && (state.viewer3d?.hasBbox?.(id) ?? true) && !(ctHighlight && id === targetZone))
+		.map(([id, v]) => ({ id, score: v.score }))
+		.sort((a, b) => b.score - a.score);
+
+	// Shade: LOG attention scale — map each score's log between the min/max
+	// attended present, so differences at the (crowded) low end stay legible and
+	// the max attended maps to full intensity. Show the top-K by the per-object
+	// threshold, colour yellow→red via the shared hot ramp.
+	const applyShade = () => {
+		const items = ranked();
+		const total = items.length;
+		const scores = items.map((i) => i.score).filter((s) => s > 0);
+		const lmax = scores.length ? Math.log(Math.max(...scores)) : 0;
+		const lmin = scores.length ? Math.log(Math.min(...scores)) : 0;
+		const span = lmax - lmin;
+		const flat = !(span > 1e-6); // one item / all-equal → everything full
+		const wOf = (s) => (flat || s <= 0) ? 1 : Math.max(0, Math.min(1, (Math.log(s) - lmin) / span));
+		const k = Math.max(1, Math.min(total || 1, Math.round(ctTopFrac * (total || 1)) || (total || 1)));
+		const shown = items.slice(0, k).map((i) => ({ id: i.id, weight: wOf(i.score) }));
+		// gamma 1: the log mapping already shapes the scale; the hot ramp then
+		// makes higher (log-)attention read redder + more opaque.
+		state.viewer3d.setAttnHighlight(shown, { gamma: 1, hotRamp: true });
+		return { total, k };
 	};
-	const applyBase = () => state.viewer3d?.setAttnHighlight?.(shadeItems(), { gamma: 2.0, minWeight: ctMinW, contrast: true });
-	state.applyBaseHighlight = applyBase;
+	state.applyBaseHighlight = applyShade;
 
-	const minwLab = el("span", { class: "ct-minw-lab", text: `${Math.round(ctMinW * 100)}%` });
-	const minw = el("div", { class: "ct-minw" }, el("span", { text: "min attn" }),
-		el("input", { type: "range", min: "0", max: "0.9", step: "0.01", value: String(ctMinW), title: "hide entities below this fraction of the peak attention",
-			oninput: (e) => { ctMinW = Number(e.target.value); try { localStorage.setItem(MINW_KEY, String(ctMinW)); } catch { /* ignore */ } minwLab.textContent = `${Math.round(ctMinW * 100)}%`; applyBase(); } }),
-		minwLab);
-	const kindBtns = kindsPresent.map((k) => {
-		const b = el("button", { class: `ct-kind${active.has(k) ? " on" : ""}`, title: `toggle ${k}s` }, el("i", { style: `background:${COLORS[k] || "#888"}` }), el("span", { text: k }));
-		b.onclick = () => { if (active.has(k)) active.delete(k); else active.add(k); b.classList.toggle("on", active.has(k)); try { localStorage.setItem(KINDS_KEY, [...active].join(",")); } catch { /* ignore */ } applyBase(); };
-		return b;
-	});
-	_win3d.controls.replaceChildren(
-		el("div", { class: "ct-3d-legend" }, el("span", { text: "attention" }), el("span", { class: "muted", text: "low" }), el("span", { class: "ct-3d-bar" }), el("span", { class: "muted", text: "high" })),
-		minw,
-		kindsPresent.length > 1 ? el("div", { class: "ct-minw" }, el("span", { text: "types" }), ...kindBtns) : null);
+	// Entity-type toggles drive the viewer's category visibility too, so turning
+	// a kind off hides its WIREFRAMES (and meshes), not just its attention overlay.
+	// A kind with no toggle button (not present with attention) stays visible, so a
+	// stale off-state can't hide wireframes the user has no control to bring back.
+	const applyKindVis = () => {
+		const t = state.viewer3d?.toggles;
+		if (!t) return;
+		const on = (k) => !kindsPresent.includes(k) || ctKinds.has(k);
+		t.zones = on("zone");
+		t.frames = on("frame");
+		const obj = on("object");
+		t.anchors = obj; t.next = obj; t.negativeSpace = obj;
+		state.viewer3d.refreshVisibility?.();
+	};
 
-	// load the most-built scene in scope, then shade it
-	const renderUntil = Math.max(...sel.map((s) => (s.render_until != null ? s.render_until : -1)));
-	const opts = renderUntil >= 0 ? { untilIndex: renderUntil } : {};
-	state.viewer3d.setActive(true);
-	state.viewer3d.clear();
-	api.scene(state.run, state.slot, state.model, opts).then((proj) => {
-		if (token !== state.loadToken || !_win3d) return;
-		applySceneProjection(state.viewer3d, proj);
-		state.viewer3d.prefetchBundle(api.meshesUrl(state.run, state.slot, state.model, opts));
-		applyBase();
-	}).catch(() => { /* non-fatal */ });
-}
-function resizeWin(win, grip) {
-	grip.addEventListener("pointerdown", (e) => {
-		const r = win.getBoundingClientRect();
-		const sx = e.clientX, sy = e.clientY, ow = r.width, oh = r.height;
-		const move = (ev) => { win.style.width = `${Math.max(300, ow + (ev.clientX - sx))}px`; win.style.height = `${Math.max(240, oh + (ev.clientY - sy))}px`; };
-		const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
-		window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
-		e.preventDefault(); e.stopPropagation();
-	});
+	// Blue focus highlight, kept in closure vars so the toggle can re-apply without
+	// re-fetching the scene (`loadScene` fills them). The current/target zone gets the
+	// PRONOUNCED style; the post-zone step results keep the ORIGINAL (subtler) blue.
+	let hlZone = [];      // current/target zone → pronounced
+	let hlResults = [];   // post-zone step results → original look
+	const applyHL = () => {
+		if (!ctHighlight || (!hlZone.length && !hlResults.length)) { state.viewer3d.clearResultHighlight?.(); return; }
+		state.viewer3d.setResultHighlight?.(hlZone, { flash: true, dimOthers: false }); // pronounced blue flash; other outlines stay fully opaque
+		if (hlResults.length) state.viewer3d.addResultHighlight?.(hlResults, { flash: true }); // original post-zone look (appends)
+	};
+
+	const buildControls = () => {
+		const items = ranked();
+		const total = items.length;
+		const k = Math.max(1, Math.min(total || 1, Math.round(ctTopFrac * (total || 1)) || (total || 1)));
+		// per-object threshold slider: one step = one entity in/out of the view.
+		const slLab = el("span", { class: "ct-minw-lab", text: total ? `top ${k}/${total}` : "—" });
+		const slider = el("input", {
+			type: "range", min: "1", max: String(Math.max(1, total)), step: "1", value: String(k),
+			title: "attention threshold — each step adds/removes one entity (ranked by attention)",
+			...(total ? {} : { disabled: "" }),
+			oninput: (e) => {
+				const v = Number(e.target.value);
+				ctTopFrac = total ? v / total : 1;
+				try { localStorage.setItem(TOPFRAC_KEY, String(ctTopFrac)); } catch { /* ignore */ }
+				slLab.textContent = `top ${v}/${total}`;
+				applyShade();
+			},
+		});
+		const sl = el("div", { class: "ct-minw" }, el("span", { text: "show" }), slider, slLab);
+		// entity-type toggles
+		const kindBtns = kindsPresent.map((kk) => {
+			const b = el("button", { class: `ct-kind${ctKinds.has(kk) ? " on" : ""}`, title: `toggle ${kk}s` }, el("i", { style: `background:${COLORS[kk] || "#888"}` }), el("span", { text: kk }));
+			b.onclick = () => {
+				if (ctKinds.has(kk)) ctKinds.delete(kk); else ctKinds.add(kk);
+				if (!ctKinds.size) ctKinds.add(kk); // never empty
+				b.classList.toggle("on", ctKinds.has(kk));
+				try { localStorage.setItem(KINDS_KEY, [...ctKinds].join(",")); } catch { /* ignore */ }
+				applyKindVis(); // hide/show this kind's wireframes + meshes too
+				buildControls(); applyShade(); // total changed → rebuild the slider bounds
+			};
+			return b;
+		});
+		// hide / unhide ALL meshes (matches the main client's control)
+		const meshesOn = state.viewer3d?.getVisibility?.().meshes !== false;
+		const hideBtn = el("button", { class: `ct-kind${meshesOn ? " on" : ""}`, title: "hide / show every mesh (the wireframe boxes stay)" },
+			el("span", { text: meshesOn ? "◧ meshes" : "▢ meshes" }));
+		hideBtn.onclick = () => {
+			const v = state.viewer3d.getVisibility().meshes === false; // → turning ON
+			state.viewer3d.setMeshesVisible(v);
+			hideBtn.classList.toggle("on", v);
+			hideBtn.replaceChildren(el("span", { text: v ? "◧ meshes" : "▢ meshes" }));
+		};
+		// POST-ZONE toggle (single step only): extend the render to before the next
+		// zone plan, with this step's results highlighted blue.
+		const postBtn = single ? el("button", { class: `ct-kind${ctPostZone ? " on" : ""}`, title: "post-zone: show everything placed up to (before) the NEXT zone plan — this step's downstream effects; its results are highlighted blue" },
+			el("span", { text: `${ctPostZone ? "◉" : "○"} post-zone` })) : null;
+		if (postBtn) postBtn.onclick = () => {
+			ctPostZone = !ctPostZone;
+			try { localStorage.setItem(POSTZONE_KEY, ctPostZone ? "1" : "0"); } catch { /* ignore */ }
+			postBtn.classList.toggle("on", ctPostZone);
+			postBtn.replaceChildren(el("span", { text: `${ctPostZone ? "◉" : "○"} post-zone` }));
+			loadScene();
+		};
+		// BLUE highlight toggle: current zone (+ post-zone results) flash in blue,
+		// other wireframes dim. On by default.
+		const hlBtn = el("button", { class: `ct-kind${ctHighlight ? " on" : ""}`, title: "highlight the current zone (and step results) in flashing blue; dim the other wireframes" },
+			el("span", { text: `${ctHighlight ? "◉" : "○"} highlight` }));
+		hlBtn.onclick = () => {
+			ctHighlight = !ctHighlight;
+			try { localStorage.setItem(HL_KEY, ctHighlight ? "1" : "0"); } catch { /* ignore */ }
+			hlBtn.classList.toggle("on", ctHighlight);
+			hlBtn.replaceChildren(el("span", { text: `${ctHighlight ? "◉" : "○"} highlight` }));
+			applyHL();
+			buildControls(); applyShade(); // current zone enters/leaves the attention overlay
+		};
+		const blueSw = el("span", { style: "display:inline-block;width:12px;height:10px;border-radius:2px;background:#3d8bff;border:1px solid rgba(255,255,255,0.25)" });
+		const blueLabel = (ctPostZone && single) ? "current zone · step results" : "current zone";
+		controls.replaceChildren(
+			el("div", { class: "ct-3d-legend" }, el("span", { text: "attention (log)" }), el("span", { class: "muted", text: "low" }), el("span", { class: "ct-3d-bar" }), el("span", { class: "muted", text: "high" })),
+			ctHighlight ? el("div", { class: "ct-3d-legend" }, blueSw, el("span", { class: "muted", text: blueLabel })) : null,
+			sl,
+			kindsPresent.length > 1 ? el("div", { class: "ct-minw" }, el("span", { text: "types" }), ...kindBtns) : null,
+			el("div", { class: "ct-minw" }, hideBtn, hlBtn, ...(postBtn ? [postBtn] : [])),
+		);
+	};
+
+	// Load the scene (normal: up to render_until; post-zone: up to before the next
+	// zone plan) + shade attention, and — in post-zone mode — BLUE-highlight the
+	// entities produced as this step's results (present at the boundary but not
+	// before the step ran).
+	const loadScene = () => {
+		if (!sel.length || !rows.length) return;
+		const renderUntil = Math.max(...sel.map((s) => (s.render_until != null ? s.render_until : -1)));
+		let untilIndex = renderUntil >= 0 ? renderUntil : null;
+		let beforeIdx = null;
+		const postMode = ctPostZone && single && step;
+		if (postMode) {
+			untilIndex = nextZonePlanIndex(step); // null → render to the end of the scene
+			beforeIdx = step.event_index;          // the scene BEFORE this step's products
+		}
+		const opts = untilIndex != null ? { untilIndex } : {};
+		state.viewer3d.setActive(true);
+		state.viewer3d.clear(); // also clears the result highlight
+		const scenes = [api.scene(state.run, state.slot, state.model, opts)];
+		if (postMode) scenes.push(api.scene(state.run, state.slot, state.model, { untilIndex: beforeIdx }));
+		Promise.all(scenes).then(([proj, before]) => {
+			if (token !== state.loadToken || state.view !== "content") return;
+			applySceneProjection(state.viewer3d, proj);
+			state.viewer3d.prefetchBundle(api.meshesUrl(state.run, state.slot, state.model, opts));
+			applyKindVis(); // reflect the type toggles on the freshly-built wireframes/meshes
+			buildControls(); // bboxes now exist → accurate per-object slider bounds / toggles
+			applyShade();
+			// Blue focus highlight: the current zone always (pronounced), plus this
+			// step's results in post-zone mode (renderable at the boundary but not
+			// before it ran) — kept as a SEPARATE group so they retain the original look.
+			hlZone = (targetZone && (state.viewer3d.hasBbox?.(targetZone) ?? false)) ? [targetZone] : [];
+			const results = new Set();
+			if (postMode && before) {
+				const boxed = (nodes) => (nodes || []).filter((n) => Array.isArray(n.origin) && Array.isArray(n.dimensions)).map((n) => n.id);
+				const had = new Set(boxed(before.nodes));
+				for (const id of boxed(proj.nodes)) if (!had.has(id) && id !== targetZone) results.add(id);
+			}
+			hlResults = [...results];
+			applyHL();
+		}).catch(() => { /* non-fatal */ });
+	};
+
+	buildControls();
+	loadScene();
 }
 
 // --- story: zone plan + output + reasoning ----------------------------------
 
-function planBlock(step, a, targetZone) {
-	const node = state.obs?.nodes?.get(targetZone);
-	if (!node) return null;
-	const isPlanStep = /(^|_)zone_plan/.test(step.template ?? step.step ?? "");
-	const text = isPlanStep ? (node.prompt || node.plan || "") : (node.plan || node.prompt || "");
+function planProseFrom(output) {
+	let o = output;
+	if (typeof o === "string") { const s = o.trim(); if (!s) return null; try { o = JSON.parse(s); } catch { return s; } }
+	if (o && typeof o === "object") return typeof o.plan === "string" ? o.plan : typeof o.description === "string" ? o.description : null;
+	return null;
+}
+// The active zone's plan text, recovered from the event log: the zone's OWN
+// zone_plan output, else the prompt the parent zone_decompose assigned it.
+function zonePlanText(zoneId) {
+	if (!zoneId) return null;
+	const evs = state.events || [];
+	for (const e of evs) {
+		if (e?.kind !== "cache.llm" || e.node !== zoneId) continue;
+		if (/(^|_)zone_plan/.test(e.step ?? e.template ?? "")) { const t = planProseFrom(e.output); if (t && t.trim()) return t; }
+	}
+	for (const e of evs) {
+		if (e?.kind !== "cache.llm" || !/zone_decompose/.test(e.step ?? e.template ?? "")) continue;
+		let o = e.output; if (typeof o === "string") { try { o = JSON.parse(o); } catch { o = null; } }
+		const hit = (o?.subregions || []).find((s) => s && s.id === zoneId);
+		if (hit && typeof hit.prompt === "string" && hit.prompt.trim()) return hit.prompt;
+	}
+	return null;
+}
+// A labelled plan block for one zone id.
+function planFor(zoneId, a, capText) {
+	const text = zonePlanText(zoneId);
 	if (!text || !String(text).trim()) return null;
+	const node = state.obs?.nodes?.get(zoneId);
 	return el("div", { style: "margin-bottom:14px" },
-		el("div", { class: "ct-plan-lab" }, el("span", { class: "sw", style: `background:${entityHex(node.kind || "zone", targetZone)}` }), el("span", { text: ` ${isPlanStep ? "zone prompt" : "zone plan"} · ${targetZone}` })),
+		el("div", { class: "ct-plan-lab" }, el("span", { class: "sw", style: `background:${entityHex(node?.kind || "zone", zoneId || "zone")}` }), el("span", { text: ` ${capText}${zoneId ? " · " + zoneId : ""}` })),
 		clampProse(planHighlightNodes(String(text), a)));
 }
+// The zone-plan tile body. Feature: when viewing a SUBZONE, show the UPSTREAM
+// PARENT zone plan it belongs to (the governing context), then the subzone's own
+// plan below. At the root there's no parent, so just the local plan.
+function zonePlanBody(a, targetZone) {
+	if (!targetZone) return el("div", { class: "muted", text: "no zone in scope for this step" });
+	const parent = parentZoneOf(targetZone);
+	const blocks = [];
+	if (parent) {
+		blocks.push(planFor(parent, a, "upstream zone plan"));
+		blocks.push(planFor(targetZone, a, "this subzone"));
+	} else {
+		blocks.push(planFor(targetZone, a, "zone plan"));
+	}
+	const kept = blocks.filter(Boolean);
+	if (!kept.length) return el("div", { class: "muted", text: `no zone plan recovered for ${parent || targetZone}` });
+	return el("div", {}, ...kept);
+}
+
+// The step's structured output, pretty-printed, entity ids highlighted.
 function outputBlock(a, llm) {
 	const out = llm?.output;
-	if (out == null || !String(out).trim()) return null;
-	const pre = el("pre", {}); for (const n of fmtOutputNodes(String(out), entityCtx(a))) pre.appendChild(n);
+	if (out == null) return null;
+	let text;
+	if (typeof out === "string") text = out;
+	else { try { text = JSON.stringify(out, null, 2); } catch { text = String(out); } }
+	if (!text || !text.trim()) return null;
+	const pre = el("pre", {}); for (const n of fmtOutputNodes(text, entityCtx(a))) pre.appendChild(n);
 	return el("div", { class: "ct-out" }, el("div", { class: "ct-plan-lab", text: "output" }), el("div", { class: "ct-code" }, pre));
 }
-function reasoningNodes(a, llm) {
+function reasoningBlock(a, llm) {
 	const r = llm?.reasoning;
 	if (r == null || !String(r).trim()) return null;
-	return highlightNodes(String(r), entityCtx(a));
+	const pre = el("pre", { style: "margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,Menlo,monospace" });
+	for (const n of highlightNodes(String(r), entityCtx(a))) pre.appendChild(n);
+	return el("div", { class: "ct-out" }, el("div", { class: "ct-plan-lab", text: "reasoning" }), el("div", { class: "ct-code" }, pre));
+}
+// "Original content" tile: the step's own generated output + reasoning.
+function originalContentBody(single, step, rows) {
+	if (!single) return el("div", { class: "muted", text: "output + reasoning are per-step — narrow to a single step (pick a region, then a step) to see them." });
+	const a = rows[0].a, llm = stepLLM(step.event_index);
+	const parts = [outputBlock(a, llm), reasoningBlock(a, llm)].filter(Boolean);
+	if (!parts.length) return el("div", { class: "muted", text: "no output or reasoning captured for this step" });
+	return el("div", {}, ...parts);
 }
 
-// --- detached (drag-out) windows --------------------------------------------
+// --- attention-sorted list tile ---------------------------------------------
 
-const _wins = new Map(); // key -> { win, body, sub, build }
-let _winZ = 80;
-function subLabel(step) { return `${step.template ?? step.step ?? "?"} · ${step.node ?? ""}`; }
-
-function openWindow(key, title, step, build) {
-	const existing = _wins.get(key);
-	if (existing) { existing.build = build; existing.body.replaceChildren(build()); existing.sub.textContent = subLabel(step); existing.win.style.zIndex = String(++_winZ); return; }
-	const body = el("div", { class: "ct-win-body" }, build());
-	const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); close(); } };
-	const close = () => { win.remove(); document.removeEventListener("keydown", onKey, true); _wins.delete(key); };
-	const sub = el("span", { class: "ct-win-sub", text: subLabel(step) });
-	const head = el("div", { class: "ct-win-head" }, el("span", { style: "color:var(--text-faint)", text: "⠿" }), el("span", { class: "ct-win-title", text: title }), sub, el("span", { style: "flex:1" }), el("button", { class: "ct-win-close", title: "close (Esc)", text: "×", onclick: close }));
-	const win = el("div", { class: "ct-win" }, head, body);
-	const off = _wins.size * 26; win.style.top = `${96 + off}px`; win.style.right = `${24 + off}px`; win.style.zIndex = String(++_winZ);
-	document.body.appendChild(win);
-	dragWin(win, head);
-	document.addEventListener("keydown", onKey, true);
-	_wins.set(key, { win, body, sub, build });
+let ctSortTab = "all"; // all | zone | object | frame
+function sortedListBody(agg) {
+	const wrap = el("div", {});
+	const render = () => {
+		const items = [...agg.ent]
+			.map(([id, v]) => ({ id, score: v.score, kind: entityKindLabel(v.kind, id) }))
+			.filter((i) => i.score > 0 && (ctSortTab === "all" || i.kind === ctSortTab))
+			.sort((a, b) => b.score - a.score);
+		const tabs = el("div", { class: "ct-sort-tabs" },
+			...["all", "zone", "object", "frame"].map((t) => el("button", { class: `ct-sort-tab${t === ctSortTab ? " on" : ""}`, text: t, onclick: () => { ctSortTab = t; render(); } })));
+		const list = el("div", { class: "ct-sort-list" }, ...items.map((it, i) => {
+			const row = el("div", { class: "ct-sort-row", title: `${it.id} · ${it.kind} · attention ${it.score.toFixed(4)} — hover to locate · click → focus`, onclick: () => focusEntity(it.id) },
+				el("span", { class: "ct-sort-rank", text: String(i + 1) }),
+				el("span", { class: "ct-sort-sw", style: `background:${entityHex(it.kind, it.id)}` }),
+				el("span", { class: "ct-sort-nm", text: it.id }),
+				el("span", { class: "ct-sort-val", text: it.score.toFixed(3) }));
+			ctHoverRegister(it.id, row);
+			return row;
+		}));
+		wrap.replaceChildren(tabs, items.length ? list : el("div", { class: "muted", style: "font-size:12px", text: "no attended entities" }));
+	};
+	render();
+	return wrap;
 }
-function refreshWindows(step) { for (const [, e] of _wins) { try { e.body.replaceChildren(e.build()); e.sub.textContent = subLabel(step); } catch { /* ignore */ } } }
-function closeTextWindows() { for (const [, e] of _wins) e.win.remove(); _wins.clear(); }
-export function closeContentWindows() { closeTextWindows(); close3DWindow(); }
-function dragWin(win, handle) {
-	handle.addEventListener("pointerdown", (e) => {
-		if (e.target.closest("button")) return;
-		const r = win.getBoundingClientRect();
-		win.style.left = `${r.left}px`; win.style.top = `${r.top}px`; win.style.right = "auto";
-		const sx = e.clientX, sy = e.clientY, ox = r.left, oy = r.top;
-		const move = (ev) => {
-			const w = win.offsetWidth;
-			win.style.left = `${Math.min(window.innerWidth - 80, Math.max(80 - w, ox + (ev.clientX - sx)))}px`;
-			win.style.top = `${Math.min(window.innerHeight - 36, Math.max(0, oy + (ev.clientY - sy)))}px`;
-		};
-		const up = () => { window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
-		window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
+
+// --- tiles + resizable splitters --------------------------------------------
+
+function tile(title, sub, body, { cls = "", tools = null } = {}) {
+	const head = el("div", { class: "ct-tile-head" }, el("span", { class: "ct-tile-title", text: title }));
+	if (sub) head.appendChild(el("span", { class: "ct-tile-sub", text: sub }));
+	if (tools) head.appendChild(tools);
+	const kids = Array.isArray(body) ? body : [body];
+	return el("div", { class: `ct-tile ${cls}` }, head, el("div", { class: "ct-tile-body" }, ...kids));
+}
+
+// A draggable splitter that resizes a grid track by writing a px CSS var on
+// `target` (the grid element that declares the var). Persisted to localStorage.
+function mkSplit(axis, target, varName, min = 130) {
+	const split = el("div", { class: `ct-split ${axis === "x" ? "col" : "row"}` });
+	const key = `tf-ct-split-${varName}`;
+	try { const saved = localStorage.getItem(key); if (saved) target.style.setProperty(varName, saved); } catch { /* ignore */ }
+	split.addEventListener("pointerdown", (e) => {
 		e.preventDefault();
+		split.classList.add("dragging");
+		try { split.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+		const move = (ev) => {
+			const rect = target.getBoundingClientRect();
+			const v = axis === "x"
+				? Math.max(min, Math.min(rect.width - min, ev.clientX - rect.left))
+				: Math.max(min, Math.min(rect.height - min, ev.clientY - rect.top));
+			const px = `${Math.round(v)}px`;
+			target.style.setProperty(varName, px);
+			try { localStorage.setItem(key, px); } catch { /* ignore */ }
+		};
+		const up = () => { split.classList.remove("dragging"); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+		window.addEventListener("pointermove", move); window.addEventListener("pointerup", up);
 	});
+	return split;
 }
 
 // --- orchestration -----------------------------------------------------------
+
+// Called when leaving the content view / switching cell: park the shared 3D
+// viewer (stop drawing, clear the shading) and detach its canvas host so the
+// next mount reparents it cleanly. (Named closeContentWindows for app.js.)
+export function closeContentWindows() {
+	state.viewer3d?.clearAttnHighlight?.();
+	state.viewer3d?.setActive?.(false);
+	if (state._ctHost && state._ctHost.parentNode) state._ctHost.parentNode.removeChild(state._ctHost);
+}
 
 export async function renderContent() {
 	if (state.view !== "content") return;
@@ -471,73 +818,56 @@ export async function renderContent() {
 	const sel = selectedSteps();
 	if (!sel.length) {
 		state.viewer3d?.clearAttnHighlight?.();
-		host.replaceChildren(card("content", "no computed step", emptyCard("no computed attention for this selection — pick a region + step with computed attention.")));
+		host.replaceChildren(emptyCard("no computed attention for this selection — pick a region + step with computed attention."));
 		return;
 	}
 
 	$("dv-loading").classList.add("on");
-	if (!host.querySelector(".card")) host.replaceChildren(emptyCard("loading…", "⧗"));
+	if (!host.querySelector(".ct-grid")) host.replaceChildren(emptyCard("loading…", "⧗"));
 	let rows;
-	try { rows = await loadRows(token); } catch (e) { if (token === state.loadToken) host.replaceChildren(emptyCard(`failed: ${e.message}`)); $("dv-loading").classList.remove("on"); return; }
+	try {
+		[rows] = await Promise.all([
+			loadRows(token),
+			ensureEvents().catch((e) => { console.warn("[tf-workspace] events load failed — output/reasoning text unavailable:", e); return null; }),
+		]);
+	} catch (e) { if (token === state.loadToken) host.replaceChildren(emptyCard(`failed: ${e.message}`)); $("dv-loading").classList.remove("on"); return; }
 	if (token !== state.loadToken) return;
 	$("dv-loading").classList.remove("on");
 	if (!rows.length) { host.replaceChildren(emptyCard("no attention data for this selection")); return; }
 	state.rows = rows;
 
-	// The structure view works for ANY selection: a single step is the richest
-	// (adds its zone plan + output + reasoning); a multi-step scope shows the
-	// aggregate attention tree (mean over the steps).
 	const single = rows.length === 1;
 	const step = single ? (sel.find((s) => String(s.event_index) === String(rows[0].event_index)) || sel[0]) : null;
 	const agg = aggregateRows(rows);
 	const targetZone = single ? targetZoneOf(step) : (state.region !== ALL ? state.region : null);
+	const a = single ? rows[0].a : null;
+	ensureViewer();
 
-	// toolbar: the 3D popout always; the per-step plan/output + reasoning popouts
-	// only when the scope is a single step.
-	const tools = el("div", { class: "ct-toolbar" },
-		el("button", { class: "ct-btn", title: "open the scene shaded by this selection's attention in a draggable 3D window", text: "⤢ 3D scene", onclick: open3DWindow }));
-	if (single) {
-		tools.appendChild(el("button", { class: "ct-btn", title: "pop the zone plan + output into a draggable window", text: "⤢ plan · output", onclick: () => openWindow("planout", "zone plan · output", step, () => planOutBody(step)) }));
-		tools.appendChild(el("button", { class: "ct-btn", title: "show this step's reasoning in a draggable popup", text: "🧠 reasoning", onclick: () => openWindow("reason", "reasoning", step, () => reasoningBody(step)) }));
-	}
+	// --- tiles ---
+	const treeSub = single ? "this step's attention" : `mean over ${rows.length} steps${state.region !== ALL ? ` · ${state.region}` : ""}`;
+	const treeTile = tile("attention tree", treeSub, buildTree(agg, targetZone, false), { cls: "ct-tree-tile" });
+	const origSub = single ? `${step.template ?? step.step} · ${step.node ?? ""}` : `${rows.length} steps`;
+	const origTile = tile("original content", origSub, originalContentBody(single, step, rows));
 
-	const treeCard = card("attention tree",
-		single ? "scene structure · this step's attention" : `scene structure · mean over ${rows.length} steps${state.region !== ALL ? ` · ${state.region}` : ""}`,
-		buildTree(agg, targetZone, false));
+	// 3D tile: the shared viewer host + an inline controls strip, both DIRECT
+	// children of the (flex-column) tile body so the canvas fills and the controls
+	// pin below.
+	const controls = el("div", { class: "ct-3d-controls" });
+	const threeDTile = tile("3D scene", single ? `${step.template ?? step.step} · ${step.node ?? ""}` : `${rows.length} steps`, [state._ctHost, controls], { cls: "ct-3d" });
 
-	const cards = [treeCard];
-	if (single) {
-		const a = rows[0].a, llm = stepLLM(step.event_index);
-		const plan = planBlock(step, a, targetZone);
-		cards.push(card("step story", `${step.template ?? step.step} · ${step.node ?? ""}`, plan || el("div", { class: "muted", text: "no zone plan for this step" }), outputBlock(a, llm)));
-	} else {
-		cards.push(card("step story", `${rows.length} steps in scope`,
-			el("div", { class: "muted", text: "the zone plan, output and reasoning are per-step — narrow to a single step (pick a region, then a specific step) to see them." })));
-	}
+	const zoneTile = tile("zone plan", targetZone ? (parentZoneOf(targetZone) ? `upstream of ${targetZone}` : targetZone) : "", single || targetZone ? zonePlanBody(a || (rows[0] && rows[0].a), targetZone) : el("div", { class: "muted", text: "pick a single step / region to see its zone plan" }));
+	const sortTile = tile("attention · sorted", "highest-attended first", sortedListBody(agg));
 
-	host.replaceChildren(tools, ...cards);
-	if (single) refreshWindows(step); else closeTextWindows(); // per-step popouts don't apply to a multi-step scope
-	if (_win3d) refresh3DWindow();
-}
+	// --- assemble the resizable grid ---
+	const grid = el("div", { class: "ct-grid" });
+	const leftCol = el("div", { class: "ct-col left" });
+	leftCol.append(treeTile, mkSplit("y", leftCol, "--ct-lT"), origTile);
+	const rightCol = el("div", { class: "ct-col right" });
+	const rbottom = el("div", { class: "ct-rbottom" });
+	rbottom.append(zoneTile, mkSplit("x", rbottom, "--ct-bL"), sortTile);
+	rightCol.append(threeDTile, mkSplit("y", rightCol, "--ct-rT"), rbottom);
+	grid.append(leftCol, mkSplit("x", grid, "--ct-cL"), rightCol);
 
-// Window body builders — recomputed from the CURRENT step on every refresh.
-function currentStep() { const sel = selectedSteps(); return sel.length === 1 ? sel[0] : null; }
-function currentRowA() {
-	const step = currentStep(); if (!step) return null;
-	const key = `${state.run}:${state.slot}:${state.model}:${step.event_index}:compact`;
-	return state.aggCache.get(key) || (state.rows || []).find((r) => String(r.event_index) === String(step.event_index))?.a || null;
-}
-function planOutBody(step) {
-	const a = currentRowA(); const s = currentStep() || step;
-	if (!a) return el("div", { class: "muted", text: "loading…" });
-	const plan = planBlock(s, a, targetZoneOf(s));
-	return el("div", {}, plan || el("div", { class: "muted", text: "no zone plan" }), el("div", { style: "margin-top:10px" }, outputBlock(a, stepLLM(s.event_index)) || el("div", { class: "muted", text: "no output" })));
-}
-function reasoningBody(step) {
-	const a = currentRowA(); const s = currentStep() || step;
-	const nodes = a ? reasoningNodes(a, stepLLM(s.event_index)) : null;
-	if (!nodes) return el("div", { class: "muted", text: "no reasoning captured for this step" });
-	const pre = el("pre", { style: "margin:0;white-space:pre-wrap;overflow-wrap:anywhere;font:12px/1.55 ui-monospace,Menlo,monospace" });
-	for (const n of nodes) pre.appendChild(n);
-	return pre;
+	host.replaceChildren(grid);
+	refresh3DTile(controls, agg, step, single, targetZone);
 }

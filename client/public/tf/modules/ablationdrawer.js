@@ -40,6 +40,7 @@ const byName = new Map();     // name -> variant record (kind/cut/label/treatmen
 const attnState = new Map();  // name -> "computed"|"queued"|"running"|"error"|"stale"|"none" (absent = checking)
 const attnError = new Map();  // name -> last failure message (worker exception + code)
 const treatedIdx = new Map(); // name -> its OWN treated-step event_index (stable, cached)
+const runState = new Map();    // name -> RUN lifecycle (done|running|paused|error|idle) from /run-status — the SAME "done" the board shows, so the matrix can distinguish "inference done" from "attention done"
 let renderToken = 0;          // guards a stale scene's async load from repainting
 
 // Unified compute queue — the SAME model as attnQueue.js (the main /tf framework),
@@ -51,10 +52,17 @@ const plan = new Set();       // variant names we want computed (≈ state.attnP
 const sent = new Set();       // variants already enqueued this session (≈ plan.sent)
 const attempts = new Map();   // name -> enqueue attempts (bounds re-dispatch of lost jobs)
 const noneStreak = new Map(); // name -> consecutive polls a SENT variant read "none"
-let planForce = false;        // recompute even when a (stale) file already exists
+// Variants the user asked to FORCE-recompute (↻ recompute): they re-run even when
+// the stored result is version-FRESH (same input_key + analysis_version) but
+// semantically superseded — e.g. after redeploying the worker with new attribution
+// (gravity quarters→sentences) where the version didn't bump. Without this the
+// server's is_fresh short-circuits and the file is reused verbatim.
+const forced = new Set();     // name -> must send force=true on (re)enqueue
 let pollTimer = null;         // the ONE poll loop (≈ attnQueue._attnPollTimer)
 let queueTotal = 0, queueDone = 0; // batch progress for the header
 let syncing = false;          // a manual ⟳ sync (backend re-pull) is in flight
+let synced = false;           // has THIS cell been confirmed against the live backend? until then
+                              // the matrix shows live stages as "unsynced" (never a misleading color)
 let selectedLabel = null;     // the RUN (label) the matrix is showing — chosen via the dropdown
 
 // Canonical step order for the matrix rows (anything unknown sorts after, alpha).
@@ -150,6 +158,14 @@ async function refreshAttn() {
 			attnState.set(v.name, (s.fresh || []).length ? "computed" : (s.stale || []).length ? "stale" : "none");
 		} catch { attnState.set(v.name, "none"); }
 	});
+	// Cheap per-variant RUN status (the board's "done") so the matrix can show
+	// inference-done distinctly from attention-done. /run-status is O(1) (tail scan,
+	// or "done" for a gzipped terminal log), so this per-variant pass is light.
+	await pool(variants, 12, async (v) => {
+		if (!live()) return;
+		try { const { status } = await api.runStatus(v.name, state.slot, state.model); runState.set(v.name, status || "idle"); }
+		catch { /* leave unknown → shows as checking/idle */ }
+	});
 	if (!live()) return;
 	paint(); // disk truth shown immediately; the live-queue pass fills in below
 	const pending = variants.filter((v) => attnState.get(v.name) === "none" && !plan.has(v.name));
@@ -217,7 +233,7 @@ async function enqueueVariant(n) {
 	sent.add(n);
 	attempts.set(n, (attempts.get(n) || 0) + 1);
 	noneStreak.delete(n);
-	const force = planForce || attnState.get(n) === "stale"; // recompute-to-refresh forces past the stale file
+	const force = forced.has(n) || attnState.get(n) === "stale"; // ↻ recompute (forced) or a stale file both bypass the server's is_fresh reuse
 	attnError.delete(n);
 	const idx = await resolveTreated(v);
 	if (idx == null) { attnState.set(n, "error"); attnError.set(n, "couldn't resolve the treated step's event index from the variant's events.jsonl"); plan.delete(n); queueDone += 1; return; }
@@ -280,7 +296,7 @@ function startPoll() {
 		for (const n of [...plan]) {
 			if (!sent.has(n)) continue; // not dispatched yet — leave the optimistic "queued"
 			const st = attnState.get(n);
-			if (st === "computed" || st === "stale" || st === "error") { plan.delete(n); queueDone += 1; continue; }
+			if (st === "computed" || st === "stale" || st === "error") { plan.delete(n); forced.delete(n); queueDone += 1; continue; }
 			if (st === "running" || st === "queued") { noneStreak.delete(n); continue; } // server has it → keep waiting
 			// "none": the server doesn't (yet) know this job. Tolerate registration lag,
 			// then re-dispatch a lost enqueue; give up after MAX_ATTEMPTS.
@@ -292,7 +308,7 @@ function startPoll() {
 		await drawerPump(); // top the window back up as jobs finish
 		paint();
 		if (queueActive()) pollTimer = setTimeout(tick, 1200);
-		else { queueTotal = 0; queueDone = 0; attempts.clear(); noneStreak.clear(); paint(); } // whole plan resolved → settle
+		else { queueTotal = 0; queueDone = 0; attempts.clear(); noneStreak.clear(); forced.clear(); paint(); } // whole plan resolved → settle
 	};
 	pollTimer = setTimeout(tick, 400);
 }
@@ -300,7 +316,7 @@ function startPoll() {
 // Stop requeueing + polling; jobs already on Modal drain on their own and reappear
 // on the next refresh (≈ leaving the page in the main framework).
 function stopQueue() {
-	plan.clear(); sent.clear(); attempts.clear(); noneStreak.clear();
+	plan.clear(); sent.clear(); attempts.clear(); noneStreak.clear(); forced.clear();
 	if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
 	queueTotal = 0; queueDone = 0;
 	paint();
@@ -337,7 +353,7 @@ async function showError(v) {
 			el("pre", { style: `white-space:pre-wrap;word-break:break-word;font-size:12px;max-width:560px;border-radius:8px;padding:10px;margin:0;${tone}` }, body),
 		],
 		actions: [
-			...(busy ? [] : [el("button", { class: "abl-dr-btn primary", onclick: () => { close(); computeMany([v]); } }, live === "computed" ? "↻ recompute" : "↻ retry")]),
+			...(busy ? [] : [el("button", { class: "abl-dr-btn primary", onclick: () => { close(); computeMany([v], { force: live === "computed" }); } }, live === "computed" ? "↻ recompute" : "↻ retry")]),
 			el("button", { class: "abl-dr-btn", onclick: close }, "close"),
 		],
 	}));
@@ -347,14 +363,18 @@ async function showError(v) {
 // the single poll loop — which handles dispatch, top-up and settle. Additive: a
 // second ⚡ while a queue is running just extends the same plan (like the main
 // framework's compute-all), so there's no "already running" bounce.
-function computeMany(list) {
-	const todo = (list || []).filter((v) => hasSceneContext(v.kind) && attnState.get(v.name) !== "computed" && !plan.has(v.name));
-	if (!todo.length) { toast(queueActive() ? "those are already queued" : "nothing to compute — already done"); return; }
+function computeMany(list, { force = false } = {}) {
+	// A FORCE recompute INCLUDES already-"computed" variants (the whole point — get
+	// past a version-fresh-but-superseded file); a normal compute skips them. Both
+	// skip variants already in THIS session's plan (no duplicate dispatch).
+	const todo = (list || []).filter((v) => hasSceneContext(v.kind) && !plan.has(v.name) && (force || attnState.get(v.name) !== "computed"));
+	if (!todo.length) { toast(queueActive() ? "those are already queued" : force ? "nothing here to recompute" : "nothing to compute — already done"); return; }
 	if (!queueActive()) { queueTotal = 0; queueDone = 0; } // fresh batch → reset the counter
 	queueTotal += todo.length;
 	for (const v of todo) {
 		byName.set(v.name, v);
 		plan.add(v.name);
+		if (force) forced.add(v.name); // sticky until the variant settles → survives a lost-job re-dispatch
 		attempts.delete(v.name); noneStreak.delete(v.name);
 		if (attnState.get(v.name) !== "stale") attnState.set(v.name, "queued"); // keep stale so enqueue forces past it
 	}
@@ -389,6 +409,12 @@ export async function syncFromBackend() {
 			attnState.set(v.name, (s.fresh || []).length ? "computed" : (s.stale || []).length ? "stale" : "none");
 		} catch { attnState.set(v.name, "none"); }
 	});
+	// Refresh RUN status too (inference done vs not) for the matrix segments.
+	await pool(variants, 12, async (v) => {
+		if (!live()) return;
+		try { const { status } = await api.runStatus(v.name, state.slot, state.model); runState.set(v.name, status || "idle"); }
+		catch { /* keep prior */ }
+	});
 	if (!live()) { syncing = false; return; }
 	paint();
 	// Phase 2 — the LIVE server queue for every not-yet-computed variant, so an
@@ -414,6 +440,7 @@ export async function syncFromBackend() {
 		queueTotal += adopted.length;
 	}
 	syncing = false;
+	synced = true; // this cell's live stages are now confirmed
 	if (plan.size) startPoll();
 	paint();
 }
@@ -429,6 +456,83 @@ export function ablQueueSnapshot() {
 		else if (s === "computed") computed++;
 	}
 	return { running, queued, computed, total: variants.length };
+}
+
+// ---- combined status: attention × inference ---------------------------------
+// Each variant folds TWO independent facts into ONE distinctly-colored token:
+//   * ATTENTION-compute state (attnState: computed / queued / running / stale / error)
+//   * RUN/INFERENCE state (runState from /run-status — the board's "done")
+// so a matrix cell shows, at a glance, how many variants have attention done
+// (green), only inference done — the run finished but no attention yet (blue), are
+// computing/queued (amber), still running inference (purple), stale (orange),
+// failed (red), or are idle/not-run (grey).
+// The pipeline stages a variant moves through, each a distinct color:
+//   needed → inferring (calling the LLM) → inferred (run done) →
+//   computing (attention on Modal) → attn (attention done).
+const SEG = {
+	attn:      { label: "attention done", color: "#6bd96e" },       // green
+	computing: { label: "computing attention (on GPU)", color: "#4af0e0" }, // cyan · pulsing
+	queued:    { label: "queued for attention", color: "#ffd43b" }, // bright yellow · static (waiting)
+	inferred:  { label: "inference done · no attention", color: "#7aa2f7" }, // blue
+	inferring: { label: "inferring (calling LLM)", color: "#c78bff" },       // purple · pulsing
+	stale:     { label: "stale attention", color: "#b8791f" },      // brown
+	error:     { label: "failed", color: "#ff5f5f" },               // red
+	needed:    { label: "needed · not run", color: "#454b57" },     // grey
+	unsynced:  { label: "not synced — ⟳ to confirm", color: "#2c2f38" }, // faint
+};
+const SEG_ORDER = ["attn", "computing", "queued", "inferred", "inferring", "stale", "error", "needed", "unsynced"];
+
+// One token per variant, by pipeline priority. UNTIL the cell is synced against the
+// live backend, we DON'T assert a definite live stage (a cheap disk read can lag
+// the compute queue) — everything reads "unsynced" so a color is never misleading.
+// After ⟳ sync (or while our own compute poll is live), the real stage shows.
+// Attention COMPUTING (running on the GPU) is kept distinct from QUEUED (waiting).
+function combinedState(name) {
+	const a = attnState.get(name);
+	// Attention on disk is authoritative regardless of sync (it's the stored result).
+	if (a === "computed") return "attn";
+	if (a === "stale") return "stale";
+	if (a === "error") return "error";
+	// Live stages are only trusted once confirmed — before that, don't guess.
+	if (!synced && !plan.has(name)) return "unsynced";
+	if (a === "running") return "computing";               // actively computing on the GPU
+	if (a === "queued" || plan.has(name)) return "queued"; // waiting in the attention queue
+	const r = runState.get(name);
+	if (r === "running") return "inferring";
+	if (r === "done") return "inferred";
+	return "needed";
+}
+
+// The three nested counts a cell shows as `attn/infer/total` (e.g. 1/2/3):
+//   attnDone ⊆ inferDone ⊆ total. inferDone counts every variant whose run has
+//   finished (attention done/computing/queued/stale all imply the run finished,
+//   plus a plain run-done). `computing` (on GPU) is split from `queued` (waiting).
+function tally(vs) {
+	let attnDone = 0, inferDone = 0, computing = 0, queued = 0, inferring = 0, error = 0;
+	for (const v of vs) {
+		const a = attnState.get(v.name);
+		const r = runState.get(v.name);
+		const ranAttn = a === "computed" || a === "stale" || a === "queued" || a === "running" || plan.has(v.name);
+		if (a === "computed") attnDone++;
+		if (ranAttn || r === "done") inferDone++;
+		if (a === "running") computing++;
+		else if (a === "queued" || plan.has(v.name)) queued++;
+		if (r === "running" && !ranAttn) inferring++;
+		if (a === "error") error++;
+	}
+	return { attnDone, inferDone, computing, queued, inferring, error, total: vs.length };
+}
+
+// A group's colored segments — one per variant, ordered so the "done" states lead.
+function segBar(vs) {
+	const counts = {};
+	for (const v of vs) { const s = combinedState(v.name); counts[s] = (counts[s] || 0) + 1; }
+	const bar = el("div", { class: "abl-seg" });
+	for (const s of SEG_ORDER) {
+		const n = counts[s];
+		if (n) bar.appendChild(el("div", { class: `abl-seg-p st-${s}`, style: `flex:${n}`, title: `${n} · ${SEG[s].label}` }));
+	}
+	return bar;
 }
 
 // ---- rendering ------------------------------------------------------------
@@ -464,22 +568,37 @@ function paint() {
 		...runs.map((r) => el("option", { value: r.label, text: `${r.label || "(no label)"} · ${r.axis ? r.axis.id : "baseline"} · ${frac(r.variants)}`, ...(r.label === selectedLabel ? { selected: "" } : {}) })));
 	const runningN = variants.filter((v) => attnState.get(v.name) === "running").length;
 	const checking = runVs.some((v) => !attnState.has(v.name));
-	const staleN = runVs.filter((v) => attnState.get(v.name) === "stale").length;
-	const failedN = runVs.filter((v) => attnState.get(v.name) === "error").length;
+	const T = tally(runVs);
 	const status = active
 		? `queue ${queueDone}/${queueTotal} · ${runningN} running · ≤${ATTN_WINDOW} outstanding`
-		: checking ? "checking…" : `${runVs.filter(isDone).length}/${runVs.length} ✓${staleN ? ` · ${staleN} stale` : ""}${failedN ? ` · ${failedN} failed` : ""}`;
+		: checking ? "checking…"
+			: `⚡ ${T.attnDone} attn · ▶ ${T.inferDone} inferred · ${T.total} total${T.computing ? ` · ⧗ ${T.computing} computing` : ""}${T.queued ? ` · … ${T.queued} queued` : ""}${T.inferring ? ` · ↻ ${T.inferring} inferring` : ""}${T.error ? ` · ✕ ${T.error}` : ""}${synced ? "" : " · unsynced"}`;
 
 	const mainBtn = active
 		? el("button", { class: "abl-dr-btn danger", title: "stop queueing (jobs already on the GPU finish + reappear on refresh)", onclick: stopQueue }, "⏹ stop")
 		: el("button", { class: "abl-dr-btn", title: `compute this run's treated-step attention — ${ATTN_WINDOW} kept outstanding on the GPU, the rest queue`,
 			onclick: () => computePending(runVs) }, "⚡ compute run");
+	// FORCE re-run — recomputes EVERY variant in the run, including ones already
+	// marked computed. Needed when the stored result is version-fresh (same input_key
+	// + analysis_version) but semantically superseded, e.g. after redeploying the
+	// worker with new attribution (gravity quarters→sentences) where the version
+	// didn't bump — the normal compute would short-circuit on is_fresh.
+	const recomputeBtn = active ? null
+		: el("button", { class: "abl-dr-btn", title: "FORCE re-run this run's treated-step attention — recomputes even variants already ✓ computed (use after redeploying the worker so superseded results refresh)",
+			onclick: () => computeMany(runVs, { force: true }) }, "↻ recompute run");
 	// (Re-syncing the Modal attention queue now lives in the global ops bar's
 	// attention ⟳ sync, bottom-left — it drives this drawer's syncFromBackend.)
+	// ⟳ sync: confirm every variant's live stage against the backend. Colors are
+	// provisional (faint) until this runs, so a status is never asserted from a
+	// stale/cheap read. Highlighted when the cell is still unsynced.
+	const syncBtn = el("button", { class: `abl-dr-btn${synced || syncing ? "" : " primary"}`,
+		...(syncing ? { disabled: "" } : {}),
+		title: "confirm every variant's status against the live compute backend — colors are provisional until this runs",
+		onclick: () => { syncFromBackend(); } }, syncing ? "⟳ syncing…" : synced ? "⟳ re-sync" : "⟳ sync");
 	const head = el("div", { class: "abl-dr-head" },
 		el("span", { class: "abl-dr-lbl", text: "run" }), runSel,
 		el("span", { class: "abl-dr-count", text: status }),
-		el("span", { class: "abl-dr-grow" }), mainBtn);
+		el("span", { class: "abl-dr-grow" }), syncBtn, ...(recomputeBtn ? [recomputeBtn] : []), mainBtn);
 	const bar = active
 		? el("div", { class: "abl-dr-bar" }, el("div", { class: "abl-dr-bar-fill", style: `width:${queueTotal ? Math.round((100 * queueDone) / queueTotal) : 0}%` }))
 		: null;
@@ -500,18 +619,6 @@ function paint() {
 	const columns = [...levelMap.values()].sort((a, b) => (a.rank - b.rank) || (a.label < b.label ? -1 : 1));
 	const kinds = [...new Set(runVs.map((v) => v.kind))].sort((a, b) => (kindRank(a) - kindRank(b)) || (a < b ? -1 : 1));
 
-	// Aggregate a group's per-variant states, surfacing work-to-do over done.
-	const aggStatus = (vs) => {
-		if (vs.some((v) => !attnState.has(v.name))) return "checking";
-		const has = (s) => vs.some((v) => attnState.get(v.name) === s);
-		if (has("running")) return "running";
-		if (has("queued")) return "queued";
-		if (has("error")) return "error";
-		if (has("none")) return "none";
-		if (has("stale")) return "stale";
-		return "done"; // every variant computed
-	};
-
 	let grid;
 	if (!columns.length) {
 		grid = el("div", { class: "abl-dr-hint", text: "this run has no ablation levels to show" });
@@ -519,10 +626,12 @@ function paint() {
 		grid = el("div", { class: "abl-mx", style: `grid-template-columns: minmax(116px, 1.3fr) repeat(${columns.length}, minmax(56px, 1fr))` });
 		grid.appendChild(el("div", { class: "abl-mx-corner", text: "kind ╲ level" }));
 		for (const col of columns) {
-			grid.appendChild(el("div", { class: "abl-mx-colh", title: `${col.label} · ${col.variants.length} variant${col.variants.length === 1 ? "" : "s"} — click to compute this level across kinds`,
+			const ct = tally(col.variants);
+			grid.appendChild(el("div", { class: "abl-mx-colh", title: `${col.label} · attn ${ct.attnDone} / inferred ${ct.inferDone} / total ${ct.total} — click to compute this level across kinds`,
 				onclick: () => computePending(col.variants) },
 				el("span", { class: "abl-mx-colh-label", text: col.label }),
-				el("span", { class: "abl-mx-colh-axis", text: frac(col.variants) })));
+				el("span", { class: "abl-mx-colh-axis", text: `${ct.attnDone}/${ct.inferDone}/${ct.total}` }),
+				segBar(col.variants)));
 		}
 		for (const kind of kinds) {
 			const rowVs = runVs.filter((v) => v.kind === kind);
@@ -532,16 +641,32 @@ function paint() {
 				const vs = cellMap.get(`${kind}\u0000${col.key}`) || [];
 				if (!vs.length) { grid.appendChild(el("div", { class: "abl-mx-cell empty", title: `no ${col.label} variant for ${kind}` })); continue; }
 				const failed = vs.filter((v) => attnState.get(v.name) === "error");
-				grid.appendChild(el("div", { class: `abl-mx-cell ${aggStatus(vs)}`,
-					title: `${kind} · ${col.label} · ${frac(vs)} computed${failed.length ? ` · ${failed.length} failed` : ""} — click to compute the rest`,
+				const t = tally(vs);
+				grid.appendChild(el("div", { class: `abl-mx-cell2${synced ? "" : " provisional"}`,
+					title: `${kind} · ${col.label}   (attn / inferred / total)`
+						+ `\nattention done   ${t.attnDone}`
+						+ `\ninference done   ${t.inferDone}`
+						+ `\ntotal needed     ${t.total}`
+						+ (t.computing ? `\ncomputing attn   ${t.computing}` : "")
+						+ (t.queued ? `\nqueued for attn  ${t.queued}` : "")
+						+ (t.inferring ? `\ninferring (LLM)  ${t.inferring}` : "")
+						+ (t.error ? `\nfailed           ${t.error}` : "")
+						+ (synced ? "" : "\n⟳ not synced — colors provisional")
+						+ "\nclick to compute the rest",
 					onclick: () => { failed.length === vs.length && vs.length === 1 ? showError(vs[0]) : computePending(vs); } },
-					el("span", { text: frac(vs) })));
+					el("span", { class: "abl-mx-num", text: `${t.attnDone}/${t.inferDone}/${t.total}` }),
+					segBar(vs)));
 			}
 		}
 	}
 
+	const legendStates = ["attn", "computing", "queued", "inferred", "inferring", "needed", "stale", "error", ...(synced ? [] : ["unsynced"])];
+	const legend = el("div", { class: "abl-legend" },
+		...legendStates.map((s) =>
+			el("span", { class: "abl-legend-item", title: SEG[s].label }, el("i", { style: `background:${SEG[s].color}` }), SEG[s].label)));
 	host.replaceChildren(head, ...(bar ? [bar] : []),
-		el("div", { class: "abl-dr-hint", text: "pick a run above · rows = step kinds · columns = its ablation levels. click a cell to compute that group, a column for the whole level, a row for the kind. then open workspace → ablation to compare." }),
+		el("div", { class: "abl-dr-hint", text: "cell number = attention done / inference done / total. the bar = one colored segment per variant (its pipeline stage). ⟳ sync to confirm live status. click a cell to compute that group, a column for a whole level, a row for a kind." }),
+		legend,
 		grid);
 }
 
@@ -564,7 +689,9 @@ export async function renderAblationDrawer() {
 	if (cellChanged) {
 		stopQueue();       // wind down the previous cell's queue (clears plan/sent/poll)
 		attnState.clear();
+		runState.clear();
 		treatedIdx.clear();
+		synced = false;    // new cell → live stages unconfirmed until ⟳ sync
 		selectedLabel = null; // re-default the run picker for the new cell
 	}
 	paint();             // show the list immediately (statuses "·" = checking)

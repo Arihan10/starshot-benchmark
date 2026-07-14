@@ -48,10 +48,36 @@ export const ATTR_AXIS_ORDER = [
 // Build an obs model over the WHOLE cell history — a stable id → node lookup used
 // only to recover each entity's true kind (the export/attention maps only carry
 // "zone"/"object", so encapsulating shells must be recovered as "frame").
+// LEGACY: needs the full events.jsonl. Superseded by obsFromTree (below), which
+// reads the server's compact projection instead of folding ~100MB client-side.
 export function buildCellObs(events) {
 	const m = createObsModel();
 	for (const e of events) m.feed(e);
 	return m.model;
+}
+
+// The obs model built from the server's compact scene-tree projection (api.tfTree)
+// — a stable id → node lookup (kind, structural parent) plus each node's EMITTING
+// provenance (region + pass + call index). Replaces downloading + folding the
+// whole (100+ MB) events.jsonl just to recover id→kind/parent/region. The shape
+// mirrors createObsModel().model so isFrameEntity / emittedStep / emittingRegion
+// read it unchanged (kept in sync with /tf's obsFromTree).
+export function obsFromTree(tree) {
+	const order = Array.isArray(tree?.order) ? tree.order : [];
+	const src = (tree && tree.nodes) || {};
+	const nodes = new Map();
+	const provenance = new Map();
+	for (const id of order) {
+		const n = src[id] || {};
+		nodes.set(id, { id, parentId: n.parent_id ?? null, kind: n.kind ?? "zone" });
+		if (n.emitted_by != null || n.region != null) {
+			provenance.set(id, [{
+				relation: "emitted_by",
+				call: { node: n.region ?? null, index: n.call_index ?? null, template: n.emitted_by ?? null, step: n.emitted_by ?? null },
+			}]);
+		}
+	}
+	return { nodes, order, provenance, calls: [], log: [], specs: new Map(), errorCount: 0, maxIndex: -1 };
 }
 
 // An encapsulating shell ("frame"): a node emitted by the encapsulating_decompose
@@ -90,8 +116,9 @@ export const state = {
 	slots: [],     // [{ id, runs: { model: { events_count } } }]
 	models: [],
 	steps: [],     // tf-steps (each: event_index, template/step, node, has_scene, render_until)
-	events: [],    // full cache.llm event history (for the per-step prompt viewer)
-	obs: null,     // obs model (id → node) for frame recovery
+	events: null,  // LAZY full cache.llm history (per-step prompt/content/VII only) — pulled by ensureEvents(), not on cell load
+	eventsKey: null, // `${run}/${slot}/${model}` the loaded `events` belong to (staleness guard)
+	obs: null,     // obs model (id → node kind/parent + provenance) from api.tfTree — frame recovery, no events.jsonl fold
 	attnStatus: {},// event_index -> "ready" | "stale" | "none" | ...
 
 	// --- ablation view ---
@@ -115,7 +142,7 @@ export const state = {
 
 	// --- content view (per-step "structure" page: 3D · tree · plan/output/reasoning) ---
 	viewer3d: null,            // the content view's three.js viewer (created once, reused)
-	applyBaseHighlight: null,  // restore the 3D view's default attention shading after a hover (set by content.js)
+	applyBaseHighlight: null,  // re-apply the 3D view's default attention shading (set by content.js)
 };
 
 export const bumpLoad = () => ++state.loadToken;
@@ -136,6 +163,8 @@ export function ctHoverRegister(id, node) {
 function ctSetHover(id, on) {
 	const nodes = ctHover.get(id);
 	if (nodes) for (const n of nodes) n.classList.toggle("hot", on);
-	if (on) state.viewer3d?.setAttnHighlight?.([{ id, weight: 1 }]);
-	else state.applyBaseHighlight?.();
+	// Add a strong GREEN box on the hovered entity WITHOUT clearing the attention
+	// overlay, so every other entity's attention stays visible.
+	if (on) state.viewer3d?.setHoverHighlight?.(id);
+	else state.viewer3d?.clearHoverHighlight?.();
 }

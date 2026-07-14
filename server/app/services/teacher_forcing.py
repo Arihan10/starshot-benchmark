@@ -537,21 +537,28 @@ def build_export(
         _logged_gravity: dict[str, Any] = json.loads(str(variables.get("__GRAVITY__") or "{}"))
     except Exception:
         _logged_gravity = {}
-    if _logged_gravity.get("sentences") is not None:
+    if _logged_gravity.get("block") is not None:
+        from app.ablation import gravity as _abl_gravity
+
         def _grav_span(pair: Any) -> dict[str, Any] | None:
             if not pair:
                 return None
             return {"start": user_start + int(pair[0]), "end": user_start + int(pair[1]),
                     "user_rel": [int(pair[0]), int(pair[1])]}
+        # Re-derive the per-sentence split HERE from the committed `user` + the
+        # logged block/tag positions (NOT the logged segmentation), so a plain
+        # attention recompute regenerates per-sentence gravity for variants logged
+        # under any shape (incl. an older `quarters` map) — no re-inference needed.
+        _sents = _abl_gravity.rederive_sentences(user, _logged_gravity)
         gravity_out = {
             "mode": _logged_gravity.get("mode"),
             "block": _grav_span(_logged_gravity.get("block")),
             "open_tag": _grav_span(_logged_gravity.get("open_tag")),
             "close_tag": _grav_span(_logged_gravity.get("close_tag")),
             "sentences": [
-                {"i": s.get("i"), "snippet": s.get("snippet"),
-                 **(_grav_span([s.get("start"), s.get("end")]) or {})}
-                for s in _logged_gravity.get("sentences", [])
+                {"i": s["i"], "snippet": s.get("snippet"),
+                 **(_grav_span([s["start"], s["end"]]) or {})}
+                for s in _sents
             ],
         }
 

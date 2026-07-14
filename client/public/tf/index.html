@@ -210,6 +210,28 @@
 			.abl-mx-cell.checking { opacity: 0.55; }
 			.abl-mx-cell.empty { cursor: default; border-style: dashed; opacity: 0.22; }
 			.abl-mx-cell.empty:hover { outline: none; }
+			/* segmented matrix cell: a number (attention computed) + a per-variant
+			   colored bar (attention done / inference done / computing / idle / …) */
+			.abl-mx-cell2 { cursor: pointer; min-height: 30px; border-radius: 5px; border: 1px solid var(--line); background: transparent; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; padding: 3px 5px; }
+			.abl-mx-cell2:hover { outline: 1px solid var(--accent); }
+			.abl-mx-num { font: 600 11px ui-monospace, Menlo, monospace; color: var(--text-dim); font-variant-numeric: tabular-nums; }
+			.abl-seg { display: flex; width: 100%; height: 6px; gap: 1px; border-radius: 3px; overflow: hidden; }
+			.abl-seg-p { min-width: 2px; border-radius: 1px; }
+			.abl-seg-p.st-attn { background: #6bd96e; }       /* attention done */
+			.abl-seg-p.st-computing { background: #4af0e0; animation: abl-dr-pulse 1s ease-in-out infinite; } /* computing attention on GPU (pulses = active) */
+			.abl-seg-p.st-queued { background: #ffd43b; }     /* queued for attention — bright yellow (static = waiting), distinct from brown stale */
+			.abl-seg-p.st-inferred { background: #7aa2f7; }   /* inference done, no attention */
+			.abl-seg-p.st-inferring { background: #c78bff; animation: abl-dr-pulse 1s ease-in-out infinite; } /* calling the LLM */
+			.abl-seg-p.st-stale { background: #b8791f; }
+			.abl-seg-p.st-error { background: #ff5f5f; }
+			.abl-seg-p.st-needed { background: #454b57; }     /* planned / not run */
+			.abl-seg-p.st-unsynced { background: #2c2f38; }   /* not confirmed against the backend yet */
+			/* provisional (pre-sync) cells: dimmed + dashed so a color is never asserted */
+			.abl-mx-cell2.provisional { opacity: 0.58; border-style: dashed; }
+			/* color legend under the run header */
+			.abl-legend { display: flex; flex-wrap: wrap; gap: 5px 12px; padding: 2px 12px 8px; font-size: 10.5px; color: var(--text-dim); }
+			.abl-legend-item { display: inline-flex; align-items: center; gap: 5px; white-space: nowrap; }
+			.abl-legend-item i { width: 12px; height: 8px; border-radius: 2px; display: inline-block; flex: none; }
 			/* ablation ANOVA table */
 			.anv-summary { font-size: 12px; color: var(--text-dim); line-height: 1.7; margin-bottom: 12px; }
 			.abl-anova { border-collapse: collapse; font: 12px ui-monospace, Menlo, monospace; width: 100%; }
