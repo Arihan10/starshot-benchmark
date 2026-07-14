@@ -150,6 +150,17 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage2/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
+    // Stage 3 (free-space voxelizer + clearance field). `body` may carry `pitch`
+    // (m). Status returns the `voxels.bin` URL the viewer draws as an overlay.
+    splatStage3Start: (run, slot, model, body) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage3/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+            { method: "POST", body },
+        ),
+    splatStage3Status: (run, slot, model) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage3/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+        ),
     // Live snapshot of the process-global mesh queue — every in-flight + waiting
     // generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
     // pool. { pools: [{id,label,cap}], entries: [{slot_id,job_id,state,backend,pool,…}] }.

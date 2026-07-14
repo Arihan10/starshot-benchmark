@@ -77,6 +77,8 @@ if str(_REPO_ROOT) not in sys.path:
 from splat import stage1 as splat_stage1  # noqa: E402
 from splat import stage2 as splat_stage2  # noqa: E402
 from splat import stage3 as splat_stage3  # noqa: E402
+from splat import stage4 as splat_stage4  # noqa: E402
+from splat import stage5 as splat_stage5  # noqa: E402  (torch/nvdiffrast lazy inside)
 
 # Node de-optimizer (server/tools/optimize-assets/deoptimize.mjs): rewrites a
 # cell's KTX2/Meshopt library GLBs to vanilla glTF so the trimesh-based Stage-1
@@ -169,6 +171,21 @@ _splat_stage2_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 # sidecar holds the summary so 'done' survives a restart.
 _splat_stage3_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage3_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# --- Stage 4 coverage-camera-planning jobs (background, one per CELL) ---------
+# Feature-adaptive patches + greedy camera placement (splat/stage4.py). Writes
+# `splat/cameras.json` (+ `patches.bin`); a `cameras.json` on disk is the 'done'
+# marker. Same shape/keying as the earlier stages.
+_splat_stage4_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_splat_stage4_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# --- Stage 5 reference-render jobs (background, one per CELL) -----------------
+# Unlit nvdiffrast renders (splat/stage5.py) of the Stage-4 camera plan → per-view
+# RGB/depth/alpha + `splat/refs/transforms.json` (the 'done' marker). CUDA-only:
+# on a non-GPU host the job finishes with a clear 'needs CUDA' error. Same
+# shape/keying as the earlier stages.
+_splat_stage5_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_splat_stage5_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 _current_run: str = ""
 
 
@@ -2027,6 +2044,241 @@ async def _run_splat_stage3_cell(run: str, slot: str, model: str, pitch: float) 
         _splat_stage3_tasks.pop(key, None)
 
 
+class Stage4Request(BaseModel):
+    """Coverage-planner knobs (all optional; omitted → defaults). `min_gain`
+    truncates the diminishing tail (higher = fewer cameras); `angles_per_patch`
+    is K; `patch_min_spacing` sets the finest patch/footprint detail. The cube-face
+    `render_resolution` + `min_px_per_patch` set the shared reference-render
+    intrinsics from which the footprint budget (view distance) is derived — matching
+    what Stage 5 will render."""
+
+    patch_min_spacing: float | None = None
+    patch_max_spacing: float | None = None
+    collision_clearance: float | None = None
+    margin: float | None = None
+    angles_per_patch: int | None = None
+    angular_sectors: int | None = None
+    near_frac: float | None = None
+    tex_k: float | None = None
+    min_gain: int | None = None
+    max_candidates: int | None = None
+    render_resolution: int | None = None
+    min_px_per_patch: float | None = None
+
+
+def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
+    """Clamp a request into PlanParams; omitted fields keep the sampler defaults."""
+    d = splat_stage4.PlanParams()
+    if req is None:
+        return d
+
+    def pick(v: float | None, lo: float, hi: float, default: float) -> float:
+        return float(min(max(v, lo), hi)) if v is not None else default
+
+    return splat_stage4.PlanParams(
+        patch_min_spacing=pick(req.patch_min_spacing, 0.02, 0.5, d.patch_min_spacing),
+        patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
+        tex_k=pick(req.tex_k, 0.0, 50.0, d.tex_k),
+        collision_clearance=pick(req.collision_clearance, 0.05, 2.0, d.collision_clearance),
+        margin=pick(req.margin, 0.0, 10.0, d.margin),
+        angles_per_patch=int(pick(req.angles_per_patch, 1, 12, d.angles_per_patch)),
+        angular_sectors=int(pick(req.angular_sectors, 3, 16, d.angular_sectors)),
+        near_frac=pick(req.near_frac, 0.1, 1.0, d.near_frac),
+        min_gain=int(pick(req.min_gain, 1, 500, d.min_gain)),
+        max_candidates=int(pick(req.max_candidates, 200, 20000, d.max_candidates)),
+        render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
+        min_px_per_patch=pick(req.min_px_per_patch, 2.0, 64.0, d.min_px_per_patch),
+    )
+
+
+def _cameras_path(run: str, slot: str, model: str) -> Path:
+    """Where a cell's Stage-4 camera plan lives (`splat/cameras.json`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage4.CAMERAS_NAME
+
+
+def _splat_stage4_status(run: str, slot: str, model: str) -> dict[str, Any]:
+    """Public Stage-4 state: live job, else 'done' (with the plan summary) when
+    `cameras.json` is on disk, else 'idle'. Carries `url` (cameras.json) and
+    `patches_url` (patches.bin) for the viewer."""
+    cams = _cameras_path(run, slot, model)
+    url = _artifact_url(cams)
+    patches_url = _artifact_url(cams.with_name(splat_stage4.PATCHES_NAME))
+    job = _splat_stage4_jobs.get((run, slot, model))
+    if job is not None:
+        return {**job, "url": url, "patches_url": patches_url}
+    if url is not None:
+        summary: Any = None
+        with contextlib.suppress(Exception):
+            payload = json.loads(cams.read_text(encoding="utf-8"))
+            summary = {k: v for k, v in payload.items() if k != "cameras"}
+        return {
+            "run": run, "slot": slot, "model": model,
+            "running": False, "phase": "done", "status": "done",
+            "current_id": None, "error": None, "summary": summary,
+            "url": url, "patches_url": patches_url,
+        }
+    return {
+        "run": run, "slot": slot, "model": model,
+        "running": False, "phase": "idle", "status": "idle",
+        "current_id": None, "error": None, "summary": None,
+        "url": None, "patches_url": None,
+    }
+
+
+def _plan_from_source(
+    run: str,
+    slot: str,
+    model: str,
+    src_dir: Path,
+    kind: str,
+    out_path: Path,
+    plan_params: splat_stage4.PlanParams,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Plan cameras for a cell, de-optimizing a library source to vanilla ONCE
+    first. Tracks `job['phase']` ('deopt' / 'plan') + progress. Blocking."""
+
+    def _progress(done: int, total: int, current: str) -> None:
+        job["phase"], job["done"], job["total"], job["current_id"] = (
+            "plan", done, total, current,
+        )
+
+    def _run(vanilla_dir: Path) -> dict[str, Any]:
+        job["phase"] = "plan"
+        return splat_stage4.plan_cameras(
+            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
+            out_path=out_path, params=plan_params, progress=_progress,
+        )
+
+    if kind != "library":
+        return _run(src_dir)
+    job["phase"] = "deopt"
+    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
+        vanilla_dir = Path(tmp)
+        _deoptimize_dir(src_dir, vanilla_dir)
+        return _run(vanilla_dir)
+
+
+async def _run_splat_stage4_cell(
+    run: str, slot: str, model: str, plan_params: splat_stage4.PlanParams
+) -> None:
+    """Plan ONE cell's coverage cameras off the event loop, tracking phase/progress.
+    `cameras.json` (written by plan_cameras) is the 'done' marker."""
+    key = (run, slot, model)
+    job = _splat_stage4_jobs[key]
+    try:
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
+        src_dir, kind = source
+        out_path = _cameras_path(run, slot, model)
+        summary = await asyncio.to_thread(
+            _plan_from_source, run, slot, model, src_dir, kind, out_path, plan_params, job,
+        )
+        job["summary"] = summary
+        job["status"] = "done"
+        job["phase"] = "done"
+        job["current_id"] = None
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _splat_stage4_tasks.pop(key, None)
+
+
+def _refs_dir(run: str, slot: str, model: str) -> Path:
+    """Where a cell's Stage-5 reference renders live (`splat/refs/`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage5.REFS_DIRNAME
+
+
+def _splat_stage5_status(run: str, slot: str, model: str) -> dict[str, Any]:
+    """Public Stage-5 state: live job, else 'done' (with a small summary read from
+    `refs/transforms.json`) when it's on disk, else 'idle'. Carries `url`
+    (transforms.json) for downstream consumers."""
+    transforms = _refs_dir(run, slot, model) / splat_stage5.TRANSFORMS_NAME
+    url = _artifact_url(transforms)
+    job = _splat_stage5_jobs.get((run, slot, model))
+    if job is not None:
+        return {**job, "url": url}
+    if url is not None:
+        summary: Any = None
+        with contextlib.suppress(Exception):
+            doc = json.loads(transforms.read_text(encoding="utf-8"))
+            summary = {"resolution": doc.get("w"), "views": len(doc.get("frames", []))}
+        return {
+            "run": run, "slot": slot, "model": model,
+            "running": False, "phase": "done", "status": "done",
+            "current_id": None, "error": None, "summary": summary, "url": url,
+        }
+    return {
+        "run": run, "slot": slot, "model": model,
+        "running": False, "phase": "idle", "status": "idle",
+        "current_id": None, "error": None, "summary": None, "url": None,
+    }
+
+
+def _render_refs_from_source(
+    run: str, slot: str, model: str, src_dir: Path, kind: str,
+    cameras_path: Path, out_dir: Path, job: dict[str, Any],
+) -> dict[str, Any]:
+    """Render one cell's references, de-optimizing a library source to vanilla ONCE
+    first. Tracks `job['phase']` ('deopt' / 'render'). Blocking — nvdiffrast (imported
+    lazily inside render_references) needs CUDA."""
+
+    def _progress(done: int, total: int, current: str) -> None:
+        job["phase"], job["done"], job["total"], job["current_id"] = (
+            "render", done, total, current,
+        )
+
+    def _run(vanilla_dir: Path) -> dict[str, Any]:
+        job["phase"] = "render"
+        return splat_stage5.render_references(
+            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
+            cameras_path=cameras_path, out_dir=out_dir, progress=_progress,
+        )
+
+    if kind != "library":
+        return _run(src_dir)
+    job["phase"] = "deopt"
+    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
+        vanilla_dir = Path(tmp)
+        _deoptimize_dir(src_dir, vanilla_dir)
+        return _run(vanilla_dir)
+
+
+async def _run_splat_stage5_cell(run: str, slot: str, model: str) -> None:
+    """Render ONE cell's references off the event loop. Requires the Stage-4
+    `cameras.json`; `refs/transforms.json` (written last) is the 'done' marker."""
+    key = (run, slot, model)
+    job = _splat_stage5_jobs[key]
+    try:
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
+        cameras_path = _cameras_path(run, slot, model)
+        if not cameras_path.is_file():
+            raise FileNotFoundError("run Stage 4 first (no camera plan)")
+        src_dir, kind = source
+        out_dir = _refs_dir(run, slot, model)
+        summary = await asyncio.to_thread(
+            _render_refs_from_source,
+            run, slot, model, src_dir, kind, cameras_path, out_dir, job,
+        )
+        job["summary"] = summary
+        job["status"] = "done"
+        job["phase"] = "done"
+        job["current_id"] = None
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _splat_stage5_tasks.pop(key, None)
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -2686,6 +2938,98 @@ def create_app() -> FastAPI:
         """Live Stage-3 state of one cell ('idle' / 'pending' / a running job /
         'done' with the voxel `url` / 'error')."""
         return _splat_stage3_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/stage4/{slot}/{model}")
+    async def splat_stage4_start(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: Stage4Request | None = None
+    ) -> dict[str, object]:
+        """Plan coverage cameras for ONE cell — feature-adaptive patches + greedy
+        set-cover over the free space (see splat/stage4.py) → `splat/cameras.json`
+        (+ `patches.bin`), the input for Stage 5 reference renders and the
+        occlusion-cull list. Knobs in the body (K, min_gain, patch spacing, …);
+        idempotent while running; re-runs (overwrites) on a fresh POST."""
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no convertible build for {slot}/{model} in {run}",
+            )
+        plan_params = _stage4_params(body)
+        _, kind = source
+        key = (run, slot, model)
+        existing = _splat_stage4_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        job: dict[str, Any] = {
+            "run": run,
+            "slot": slot,
+            "model": model,
+            "source": kind,
+            "total": 0,
+            "done": 0,
+            "running": True,
+            "status": "pending",
+            "phase": "pending",
+            "current_id": None,
+            "error": None,
+            "summary": None,
+            "url": None,
+            "patches_url": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _splat_stage4_jobs[key] = job
+        _splat_stage4_tasks[key] = asyncio.create_task(
+            _run_splat_stage4_cell(run, slot, model, plan_params)
+        )
+        return dict(job)
+
+    @app.get("/runs/{run}/splat/stage4/{slot}/{model}")
+    async def splat_stage4_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Stage-4 state of one cell ('idle' / 'pending' / a running job /
+        'done' with the camera-plan `url` / 'error')."""
+        return _splat_stage4_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/stage5/{slot}/{model}")
+    async def splat_stage5_start(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Render ONE cell's UNLIT reference images from its Stage-4 camera plan —
+        per-view RGB (albedo) + planar-Z depth + alpha into `splat/refs/` (see
+        splat/stage5.py), the supervision for the Stage-6 gsplat fine-tune. Requires
+        Stage 4 (`cameras.json`) first. CUDA-only: on a non-GPU host the job finishes
+        with a clear 'needs CUDA' error. Idempotent while running; re-runs (overwrites)
+        on a fresh POST."""
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no convertible build for {slot}/{model} in {run}",
+            )
+        if not _cameras_path(run, slot, model).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 4 first (no camera plan)")
+        _, kind = source
+        key = (run, slot, model)
+        existing = _splat_stage5_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        job: dict[str, Any] = {
+            "run": run, "slot": slot, "model": model, "source": kind,
+            "total": 0, "done": 0, "running": True, "status": "pending",
+            "phase": "pending", "current_id": None, "error": None, "summary": None,
+            "url": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _splat_stage5_jobs[key] = job
+        _splat_stage5_tasks[key] = asyncio.create_task(
+            _run_splat_stage5_cell(run, slot, model)
+        )
+        return dict(job)
+
+    @app.get("/runs/{run}/splat/stage5/{slot}/{model}")
+    async def splat_stage5_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Stage-5 state of one cell ('idle' / 'pending' / a running job /
+        'done' with the `refs/transforms.json` `url` / 'error')."""
+        return _splat_stage5_status(run, slot, model)
 
     @app.get("/trellis/queue")
     async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

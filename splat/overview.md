@@ -43,7 +43,7 @@
 - **Materials:** PBR — base color (albedo), normal, metallic-roughness. `server/app/utils/glass.py` flags transparent surfaces; the metalness channel flags reflective ones.
 - **Scene AABB (the free-fly play volume):** the axis-aligned box enclosing **all placed geometry**. Usually the `root` zone bbox, but because objects can be placed outside root, compute it as the **per-axis max extent over every placed node**. Derived per scene — **not a tunable knob**.
 - **Coordinates:** Y-up, right-handed, meters. Canonical front: +X = right, +Y = up, +Z = toward the viewer.
-- **Existing infra to reuse:** Modal GPU workers; the Three.js debug viewer `client/public/js/scene3d.js` (KTX2/Meshopt loader + lighting rig) — reusable headless for reference renders.
+- **Existing infra to reuse:** GPU workers — **Modal, or a local CUDA box** (the current unlit run targets a colleague's **RTX 3060 / 8 GB**). The Three.js viewer `client/public/js/scene3d.js` (KTX2/Meshopt loaders) is the **product/debug viewer** — its loaders are also reused by the splat viewer's mesh-compare overlay — but **reference renders do NOT use it**: a browser/WebGL stack is impractical on a compute box, so Stage 5 uses a headless GPU rasterizer (**nvdiffrast** — see §5).
 
 ---
 
@@ -98,12 +98,13 @@ Cameras and the fine-tune are **included**; only lighting is deferred (reference
 - **Method:** scatter candidate positions through free space (denser where clearance is small); at each, use a **cubemap** (6× 90° outward views) so orientation isn't a variable; pick positions **greedily (set-cover)** — repeatedly take the one covering the most still-under-covered surface — until every visible patch is seen from ≥ a few angles and ≥ once close enough to meet the **footprint/sharpness budget**; include **near + far** views (multi-scale) with a mip-style train filter.
 - **Camera bounds:** positions are clamped to free space eroded by a small **collision clearance** (§7) and to the scene AABB. **Free-fly is preserved** — this is a thin safety shell, not a back-off.
 
-### Stage 5 — Reference renders (UNLIT)  [new — cheap]
-- **In:** composed mesh + camera poses.
+### Stage 5 — Reference renders (UNLIT)  [new — cheap; renderer: nvdiffrast]
+- **In:** composed mesh (the **de-optimized vanilla GLBs** — geometry + UVs + PNG-transcoded base color, the same source Stages 1–3 read) + camera poses.
 - **Out, per camera:** **RGB (albedo, unlit)** + **depth** + **alpha mask**.
-- Render the scene with a **flat/unlit (albedo) shader** — pure rasterization, **no path tracer, no denoiser** (unlit rasterization has no Monte-Carlo noise). Can reuse the Three.js viewer headless with an unlit material.
+- **Renderer — `nvdiffrast` (headless CUDA rasterizer).** Rasterize the triangles from each **pinhole** pose (matching the fine-tune's camera convention), interpolate UVs, and **sample the base-color texture per fragment = albedo** — a flat/unlit shade with **no lighting, no path tracer, no denoiser** (pure rasterization has no Monte-Carlo noise). **Depth** comes from the raster z-buffer, **alpha** from triangle coverage; **honor the base-color alpha for glass** (`BLEND`/`MASK`, per §7) so the references and the splat agree on transparency.
+- **Why nvdiffrast (not headless Three.js):** its `RasterizeCudaContext` is **pure CUDA — no browser/WebGL/EGL/display** — so it runs cleanly on a compute box and lives in the **same PyTorch/CUDA process as the gsplat fine-tune** (shared GPU; tensors flow directly, no disk/browser round-trip). A headless Three.js/WebGL renderer would drag a browser stack onto the server for no benefit (voters see the *splat*, not this mesh render). **Trade-offs:** nvdiffrast is a **rasterizer only** — ideal for unlit, but it **cannot do lit GI** (the lit path swaps renderers, §6), and it is **CUDA-only** (runs on the RTX 3060 / Modal, **not** Apple Silicon).
 - Depth + alpha are lighting-independent and are emitted here for the fine-tune's losses.
-- **Design note:** implement this behind a **pluggable "reference renderer" interface** (`pose → {rgb, depth, alpha}`) so the lit path-traced version (§6) drops in later.
+- **Design note:** keep this behind a **pluggable "reference renderer" interface** (`pose → {rgb, depth, alpha}`) so the lit **path-traced** backend (Blender Cycles / Mitsuba, §6) drops in without touching Stages 4/6.
 
 ### Stage 6 — Splat fine-tune  [integrate: gsplat / splatfacto]
 - **In:** surfel cloud (init) + unlit reference renders (+ depth + alpha + exact poses).
@@ -130,7 +131,7 @@ Cameras and the fine-tune are **included**; only lighting is deferred (reference
 
 Reuse the **surfel init (1–2) and the camera plan (3–4) unchanged** (computed once). Adding lighting **re-runs stages 5–7**. The changes:
 
-1. **Stage 5 becomes lit + path-traced.** Swap the reference renderer from `unlit-rasterize` to **path-traced under the standard environment** (sky HDRI + interior emitters + interior fill), output **HDR RGB** + **denoised** (OIDN/OptiX) + depth + alpha. Depth/alpha logic unchanged (depth loss stays alpha-gated). This is the expensive component; it drops into the pluggable interface from Stage 5.
+1. **Stage 5 becomes lit + path-traced.** Swap the reference-renderer backend from **`nvdiffrast` (unlit rasterizer)** to a **path tracer** (Blender Cycles / Mitsuba — a rasterizer can't do GI) under the standard environment (sky HDRI + interior emitters + interior fill), output **HDR RGB** + **denoised** (OIDN/OptiX) + depth + alpha. Depth/alpha logic unchanged (depth loss stays alpha-gated). This is the expensive component; it drops into the pluggable interface from Stage 5.
 2. **Optional new step (between 2 and 6): per-surfel lighting bake.** Evaluate path-traced outgoing radiance per surfel under the environment and fit SH — locks in diffuse GI/shadows/color-bleed everywhere, including barely-seen surfaces, as a better init. (May be partly redundant with the image fine-tune — see §12.)
 3. **Stage 6 enables view-dependence.** Turn SH degree > 0 **on shiny surfaces only** (metalness flag) so glossy/reflective response is learned; matte stays degree-0.
 4. **Lighting rig specifics (§8 caveats):** interior emitters + a standard neutral **interior fill applied to every enclosed region** (so a lamp-less-but-well-laid-out room isn't penalized), and a **decoupled neutral background** for display (don't necessarily show the literal sky; black for space scenes).
@@ -212,6 +213,7 @@ Derived (not tuned): the **scene AABB** play volume.
 - **2D Gaussian Splatting (surfels):** Huang et al., SIGGRAPH 2024 (`hbb1/2d-gaussian-splatting`); Gaussian Surfels.
 - **Compression / streaming:** SOG (Spatially Ordered Gaussians, PlayCanvas), SOGS (Self-Organizing Gaussians, Fraunhofer HHI), `.spz` (Niantic), Reduced-3DGS (per-Gaussian SH degree). SH is ~75–81% of a raw Gaussian's data.
 - **Web viewers:** Spark (Three.js), mkkellogg GaussianSplats3D (Three.js), PlayCanvas/SuperSplat (WebGPU + streamed SOG LOD).
+- **Reference rendering (unlit):** `nvdiffrast` — headless CUDA rasterizer (`RasterizeCudaContext`; no browser/EGL/display), albedo + depth + coverage, in the same PyTorch/CUDA process as the trainer. **CUDA-only** (RTX 3060 / Modal).
 - **Path tracing (lighting phase):** Blender Cycles / Mitsuba / OptiX; denoise OIDN/OptiX.
 - **Lighting-into-GS / PBR mesh→GS literature:** CVPR-W 2026 "Efficient Conversion of 3D PBR Meshes to a Relightable Triplane-Based 3DGS for Transmission"; TexGaussian (CVPR 2025); MGM; GBake (reflection probes); GI-GS / GS-IR / Relightable 3D Gaussians; PRTGS. Baking lineage: SNeRG, MERF (browser), BakedSDF.
 
@@ -219,8 +221,8 @@ Derived (not tuned): the **scene AABB** play volume.
 
 ## 12. Open questions to iterate on  [OPEN]
 
-- **Reference renderer:** headless Three.js (matches product viewer, simplest) vs. Blender/Mitsuba (batteries-included passes) — for both the unlit and later lit paths.
-- **Splat trainer:** gsplat vs. splatfacto vs. Inria; how invasive the surfel-init + depth-loss changes are.
+- **Reference renderer:** **[DECIDED]** unlit → **nvdiffrast** (headless CUDA rasterizer, in-process with the trainer); lit → **Blender Cycles / Mitsuba** (path tracer) behind the same interface. Headless Three.js rejected (browser/WebGL on a compute box, no upside). *Still open:* the exact lit backend, and whether heavy unlit render volume (views × cells) should move to Modal.
+- **Splat trainer:** **[DECIDED — unlit] `gsplat` on the local CUDA box** (RTX 3060 / 8 GB). **Locked Stage 4→5→6 contract** (verified against gsplat's `rasterization`, COLMAP parser, and `simple_trainer`): **OpenCV** camera convention (camera +Z forward, +Y down); Stage 5 emits per-view **camera-to-world** in `transforms.json` (`convention: opencv_c2w`) → trainer takes `viewmats = inv(c2w)`; pinhole `K` with `f = R/(2·tan(fov/2))`, `cx=cy=R/2`; **depth = planar camera-space Z in metres** (gsplat `render_mode="RGB+ED"`, projection depth — NOT ray distance); **albedo = sRGB 8-bit**, compared directly with no linearization (matches Stage-2 surfel colours); **SH degree 0** (unlit), so Stage-2 `cloud.ply` is a drop-in init (same `f_dc=(c−0.5)/C0`). Alpha-gated depth L1 is kept (gsplat renders depth). *Still open:* gsplat vs. splatfacto harness, chunked-training threshold, how invasive the surfel-init change is. (The Apple-Silicon **Brush** alternative has no depth loss — a CUDA-loss fallback only.)
 - **SH strategy for lighting phase:** degree per surface class; how to detect "shiny enough" from metalness/roughness.
 - **LOD & chunking thresholds:** the scene-size cutoff for chunked training; LOD depth policy.
 - **Coverage budget defaults:** angles-per-patch and footprint budget starting values; collision clearance value (absolute vs. scaled to scene).

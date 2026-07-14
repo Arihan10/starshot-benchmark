@@ -11,6 +11,10 @@
 // restart and no manual command.
 
 import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
+import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { api } from "./api.js";
 import { el } from "./ui.js";
 
@@ -24,6 +28,20 @@ let openSeq = 0; // bumps on open/close to cancel in-flight loads/polls
 let pollTimer = null;
 let current = null; // { run, slot, model, source }
 let inputs = null; // control input elements, by key
+let voxelPoints = null; // Stage-3 free-space overlay (THREE.Points), lazy
+let meshGroup = null; // original-mesh overlay (THREE.Group), lazy
+let mode = "splat"; // "splat" | "mesh" — the view switch (not an overlay)
+
+// WASD free-fly state (see movementTick). mkkellogg owns mouse orbit/zoom; this
+// adds keyboard walk by translating the camera + orbit target together per frame.
+const MOVE_CODES = new Set([
+    "KeyW", "KeyA", "KeyS", "KeyD", "KeyQ", "KeyE",
+    "Space", "ShiftLeft", "ShiftRight",
+]);
+const pressed = new Set();
+let moveRaf = 0;
+let moveLast = 0;
+let moveSpeed = 3; // metres/sec, sized per scene from its AABB on load
 
 const POLL_MS = 1200;
 const BYTES_PER_SPLAT = 68; // 17 float32 — for the density→size estimate
@@ -54,6 +72,69 @@ function framing(aabb) {
     return { position: [c[0] + d, c[1] + d * 0.6, c[2] + d], lookAt: c };
 }
 
+// ---- WASD free-fly ----------------------------------------------------------
+
+// Base fly speed scaled to the scene: ~a third of its diagonal per second (Shift
+// sprints 3×), clamped so small props aren't glacial and big scenes aren't wild.
+function speedFor(aabb) {
+    if (!aabb || !aabb.min || !aabb.max) return 3;
+    const d = Math.hypot(
+        aabb.max[0] - aabb.min[0],
+        aabb.max[1] - aabb.min[1],
+        aabb.max[2] - aabb.min[2],
+    );
+    return Math.min(25, Math.max(2, d * 0.35));
+}
+
+const _fwd = new THREE.Vector3();
+const _right = new THREE.Vector3();
+const _move = new THREE.Vector3();
+const _WORLD_UP = new THREE.Vector3(0, 1, 0);
+
+function movementTick(now) {
+    moveRaf = requestAnimationFrame(movementTick);
+    const cam = viewer && viewer.camera;
+    const controls = viewer && viewer.controls;
+    const dt = Math.min(0.05, (now - moveLast) / 1000 || 0); // clamp big frame gaps
+    moveLast = now;
+    if (!cam || !controls || pressed.size === 0) return;
+    cam.updateMatrixWorld();
+    // Horizontal forward/right (drop the pitch → walk, don't dive); Q/E/Space are
+    // world-vertical. This keeps W from drifting up/down when the view is tilted.
+    cam.getWorldDirection(_fwd);
+    _fwd.y = 0;
+    if (_fwd.lengthSq() < 1e-8) {
+        // looking straight up/down → use the screen-up direction as forward
+        _fwd.setFromMatrixColumn(cam.matrixWorld, 1).setY(0);
+    }
+    _fwd.normalize();
+    _right.setFromMatrixColumn(cam.matrixWorld, 0).setY(0).normalize();
+    _move.set(0, 0, 0);
+    if (pressed.has("KeyW")) _move.add(_fwd);
+    if (pressed.has("KeyS")) _move.sub(_fwd);
+    if (pressed.has("KeyD")) _move.add(_right);
+    if (pressed.has("KeyA")) _move.sub(_right);
+    if (pressed.has("KeyE") || pressed.has("Space")) _move.add(_WORLD_UP);
+    if (pressed.has("KeyQ")) _move.sub(_WORLD_UP);
+    if (_move.lengthSq() === 0) return;
+    const sprint = pressed.has("ShiftLeft") || pressed.has("ShiftRight") ? 3 : 1;
+    _move.normalize().multiplyScalar(moveSpeed * sprint * dt);
+    cam.position.add(_move);
+    controls.target.add(_move); // move the orbit target too → look direction preserved
+}
+
+function startMovement() {
+    if (moveRaf) return;
+    moveLast = performance.now();
+    moveRaf = requestAnimationFrame(movementTick);
+}
+
+function stopMovement() {
+    if (moveRaf) cancelAnimationFrame(moveRaf);
+    moveRaf = 0;
+    pressed.clear();
+}
+
 // Read the live camera so a re-splat reload can keep the same view.
 function captureCamera() {
     try {
@@ -65,7 +146,38 @@ function captureCamera() {
     }
 }
 
+function disposeObj(obj) {
+    obj?.traverse?.((o) => {
+        o.geometry?.dispose?.();
+        const mats = Array.isArray(o.material) ? o.material : o.material ? [o.material] : [];
+        for (const m of mats) {
+            for (const k in m) {
+                const v = m[k];
+                if (v && v.isTexture) v.dispose?.();
+            }
+            m.dispose?.();
+        }
+    });
+}
+
 async function teardown() {
+    stopMovement();
+    // Overlays live in the viewer's threeScene; free their GPU resources and
+    // reset their toggles before the viewer (and its GL context) goes away.
+    for (const key of ["voxelPoints", "meshGroup"]) {
+        const obj = key === "voxelPoints" ? voxelPoints : meshGroup;
+        if (obj) {
+            viewer?.threeScene?.remove(obj);
+            disposeObj(obj);
+        }
+    }
+    voxelPoints = null;
+    meshGroup = null;
+    // A rebuild (re-splat) returns to splat mode; the splat is visible by default
+    // on the new viewer, and the overlays are gone.
+    mode = "splat";
+    syncModeButtons();
+    if (inputs && inputs._fsRow) inputs._fsRow.style.display = "none";
     const v = viewer;
     viewer = null;
     if (v) {
@@ -106,6 +218,8 @@ async function loadClouds(seq, url, detailUrl, summary, camera) {
     }
     if (seq !== openSeq) return;
     v.start();
+    moveSpeed = speedFor(summary && summary.scene_aabb);
+    startMovement();
     const baseN = summary && summary.splats;
     setStatus(
         (baseN ? `${baseN.toLocaleString()} splats` : "loaded") +
@@ -165,6 +279,215 @@ function checkRow(key, label, checked) {
     return el("label", { class: "svc-check" }, input, el("span", { text: label }));
 }
 
+// ---- overlays (Stage-3 free space + original mesh) --------------------------
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function setOverlay(text) {
+    if (inputs && inputs._overlay) inputs._overlay.textContent = text || "";
+}
+
+// Clearance → colour: 0 (at a surface) warm red, 1 (most open) cool blue.
+function clearanceColor(t) {
+    const x = Math.max(0, Math.min(1, t));
+    return [1 - 0.8 * x, 0.25 + 0.45 * x, 0.2 + 0.8 * x];
+}
+
+// Build the free-voxel point cloud from voxels.bin ([x,y,z,clearance] float32).
+async function buildVoxels(url, summary) {
+    const res = await fetch(url, { cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const arr = new Float32Array(await res.arrayBuffer());
+    const n = (arr.length / 4) | 0;
+    const pos = new Float32Array(n * 3);
+    const col = new Float32Array(n * 3);
+    const cmax = (summary && summary.clearance_max) || 1;
+    for (let i = 0; i < n; i++) {
+        pos[i * 3] = arr[i * 4];
+        pos[i * 3 + 1] = arr[i * 4 + 1];
+        pos[i * 3 + 2] = arr[i * 4 + 2];
+        const [r, g, b] = clearanceColor(arr[i * 4 + 3] / cmax);
+        col[i * 3] = r;
+        col[i * 3 + 1] = g;
+        col[i * 3 + 2] = b;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
+    const mat = new THREE.PointsMaterial({
+        size: ((summary && summary.pitch) || 0.12) * 0.5,
+        vertexColors: true,
+        transparent: true,
+        opacity: 0.5,
+        sizeAttenuation: true,
+        depthWrite: false,
+        // X-ray: the free-space field is a VOLUMETRIC overlay filling the room
+        // interior, so it must draw THROUGH the (opaque) wall splats — otherwise
+        // the interior cloud is hidden behind the walls from an outside camera,
+        // which is exactly the "I see no free space inside" symptom.
+        depthTest: false,
+    });
+    const pts = new THREE.Points(geo, mat);
+    pts.renderOrder = 999; // composite the overlay last, over the splats
+    return pts;
+}
+
+// Ensure Stage 3 has run for the open cell; compute + poll if not. Returns status.
+async function ensureStage3() {
+    const c = current;
+    let st = await api.splatStage3Status(c.run, c.slot, c.model);
+    if (st.status === "done" && st.url) return st;
+    setOverlay("computing free space…");
+    await api.splatStage3Start(c.run, c.slot, c.model, {});
+    const seq = openSeq;
+    while (seq === openSeq) {
+        await sleep(1000);
+        st = await api.splatStage3Status(c.run, c.slot, c.model);
+        if (!st.running) break;
+        setOverlay(`free space: ${st.phase || ""} ${st.total ? `${st.done}/${st.total}` : ""}`);
+    }
+    if (st.status !== "done" || !st.url) throw new Error(st.error || "voxelize failed");
+    return st;
+}
+
+function syncModeButtons() {
+    if (!inputs) return;
+    inputs._splatBtn?.classList.toggle("on", mode === "splat");
+    inputs._meshBtn?.classList.toggle("on", mode === "mesh");
+}
+
+function splatVisible(on) {
+    const sm = viewer && viewer.getSplatMesh && viewer.getSplatMesh();
+    if (sm) sm.visible = on;
+}
+
+// Lazily build + add the free-space points (added hidden); returns success.
+async function ensureVoxels() {
+    if (voxelPoints) return true;
+    const seq = openSeq;
+    try {
+        const st = await ensureStage3();
+        if (seq !== openSeq || !viewer) return false;
+        const pts = await buildVoxels(api.absUrl(st.url + `?t=${Date.now()}`), st.summary);
+        if (seq !== openSeq || !viewer) {
+            disposeObj(pts);
+            return false;
+        }
+        voxelPoints = pts;
+        voxelPoints.visible = false;
+        viewer.threeScene.add(voxelPoints);
+        const fv = (st.summary && st.summary.free_voxels) || 0;
+        setOverlay(`free space: ${fv.toLocaleString()} voxels`);
+        return true;
+    } catch (e) {
+        setOverlay(`free space failed: ${e.message}`);
+        return false;
+    }
+}
+
+// Free-space voxels are only shown alongside the mesh (they share its exact world
+// frame), via the checkbox that appears in mesh mode.
+async function setFreeSpace(on) {
+    if (mode !== "mesh") return;
+    if (on) {
+        const ok = await ensureVoxels();
+        if (ok && voxelPoints && mode === "mesh") voxelPoints.visible = true;
+    } else if (voxelPoints) {
+        voxelPoints.visible = false;
+    }
+}
+
+// Load the cell's original mesh (SMB1 bundle) into the splat scene, coincident
+// with the cloud, for a splat-vs-mesh look comparison.
+async function buildMeshGroup() {
+    const res = await fetch(
+        api.meshesUrl(current.run, current.slot, current.model, {}),
+        { cache: "no-store" },
+    );
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const ab = await res.arrayBuffer();
+    const buf = new Uint8Array(ab);
+    const dv = new DataView(ab);
+    const dec = new TextDecoder();
+    if (buf.length < 4 || dec.decode(buf.subarray(0, 4)) !== "SMB1") {
+        throw new Error("not an SMB1 bundle");
+    }
+    const ktx2 = new KTX2Loader()
+        .setTranscoderPath("/vendor/three/examples/jsm/libs/basis/")
+        .detectSupport(viewer.renderer);
+    MeshoptDecoder.useWorkers?.(2);
+    const loader = new GLTFLoader().setKTX2Loader(ktx2).setMeshoptDecoder(MeshoptDecoder);
+    const group = new THREE.Group();
+    let off = 4; // past the "SMB1" magic
+    while (off + 4 <= buf.length) {
+        const idLen = dv.getUint32(off, true);
+        off += 4 + idLen; // skip the id string
+        if (off + 4 > buf.length) break;
+        const glbLen = dv.getUint32(off, true);
+        off += 4;
+        if (off + glbLen > buf.length) break;
+        const glb = ab.slice(off, off + glbLen);
+        off += glbLen;
+        try {
+            const gltf = await loader.parseAsync(glb, "");
+            group.add(gltf.scene);
+        } catch {
+            /* skip a bad object */
+        }
+    }
+    ktx2.dispose?.();
+    return group.children.length ? group : null;
+}
+
+// Lazily build + add the original mesh (added hidden); returns success.
+async function ensureMesh() {
+    if (meshGroup) return true;
+    setOverlay("loading original mesh…");
+    const seq = openSeq;
+    try {
+        const g = await buildMeshGroup();
+        if (seq !== openSeq || !viewer) {
+            disposeObj(g);
+            return false;
+        }
+        if (!g) throw new Error("no mesh bundle");
+        meshGroup = g;
+        meshGroup.visible = false;
+        viewer.threeScene.add(meshGroup);
+        setOverlay("");
+        return true;
+    } catch (e) {
+        setOverlay(`mesh failed: ${e.message}`);
+        return false;
+    }
+}
+
+// Switch the view between the Gaussian splat and the original mesh (same world
+// frame → identical pose). Splat mode hides the mesh + free space; mesh mode
+// hides the splat, shows the mesh, and turns the free-space field on by default.
+async function setMode(next) {
+    mode = next;
+    syncModeButtons();
+    if (inputs && inputs._fsRow) {
+        inputs._fsRow.style.display = next === "mesh" ? "" : "none";
+    }
+    if (next === "splat") {
+        splatVisible(true);
+        if (meshGroup) meshGroup.visible = false;
+        if (voxelPoints) voxelPoints.visible = false;
+        setOverlay("");
+        return;
+    }
+    // mesh mode: hide the splat, show the mesh, free space on by default
+    splatVisible(false);
+    const ok = await ensureMesh();
+    if (mode !== "mesh") return; // switched back while the mesh was loading
+    if (ok && meshGroup) meshGroup.visible = true;
+    if (inputs && inputs.freespace && inputs.freespace.checked) {
+        await setFreeSpace(true);
+    }
+}
+
 const kFmt = (v) => `${Math.round(v / 1000)}k · ~${((v * BYTES_PER_SPLAT) / 1e6).toFixed(0)}MB`;
 
 function buildControls(summary) {
@@ -205,7 +528,35 @@ function buildControls(summary) {
         actual.textContent = actualText(summary);
     }
 
+    // View mode: Gaussian splat vs. the original mesh — a switch, not an overlay.
+    // Free space is drawn WITH the mesh (same world frame), on by default there.
+    mode = "splat";
+    const splatBtn = el("button", {
+        class: "svc-seg-btn on",
+        text: "splat",
+        onclick: () => setMode("splat"),
+    });
+    const meshBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "mesh",
+        onclick: () => setMode("mesh"),
+    });
+    inputs._splatBtn = splatBtn;
+    inputs._meshBtn = meshBtn;
+    const seg = el("div", { class: "svc-seg" }, splatBtn, meshBtn);
+    const fsRow = checkRow("freespace", "free space", true);
+    inputs.freespace.addEventListener("change", () =>
+        setFreeSpace(inputs.freespace.checked),
+    );
+    inputs._fsRow = fsRow;
+    fsRow.style.display = "none"; // shown only in mesh mode
+    const overlay = el("div", { class: "svc-actual" });
+    inputs._overlay = overlay;
+
     controlsEl.append(
+        el("div", { class: "svc-title", text: "view" }),
+        seg,
+        fsRow,
         el("div", { class: "svc-title", text: "sampler knobs" }),
         density,
         radius,
@@ -215,6 +566,7 @@ function buildControls(summary) {
         detailDensity,
         el("div", { class: "svc-actions" }, btn),
         actual,
+        overlay,
     );
 }
 
@@ -350,4 +702,15 @@ export function initSplatViewer() {
         },
         true,
     );
+    // WASD/QE/Shift walk — only while the viewer is open, and not while typing in
+    // the controls panel. keyup always clears so a key can't stick.
+    window.addEventListener("keydown", (ev) => {
+        if (!isSplatViewerOpen() || !MOVE_CODES.has(ev.code)) return;
+        const tag = ev.target && ev.target.tagName;
+        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+        pressed.add(ev.code);
+        if (ev.code === "Space") ev.preventDefault(); // don't scroll the page
+    });
+    window.addEventListener("keyup", (ev) => pressed.delete(ev.code));
+    window.addEventListener("blur", () => pressed.clear());
 }

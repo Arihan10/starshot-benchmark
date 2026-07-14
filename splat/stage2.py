@@ -216,7 +216,7 @@ def _surfel_radii(points: np.ndarray, spacing: float, radius_frac: float) -> np.
     return (nn * radius_frac).astype(np.float32)
 
 
-def _surfel_colors(
+def surfel_colors(
     geom: trimesh.Trimesh, points: np.ndarray, face_idx: np.ndarray
 ) -> np.ndarray:
     """Per-surfel RGBA in [0,1]. When the mesh has a readable base-color texture,
@@ -282,7 +282,7 @@ def _sample_object(
     lens[lens == 0] = 1.0
     normals = normals / lens
 
-    colors = _surfel_colors(geom, points, face_idx)  # (S,4) in [0,1]
+    colors = surfel_colors(geom, points, face_idx)  # (S,4) in [0,1]
     radius = _surfel_radii(points, spacing, params.radius_frac)  # sized to spacing
     return {
         "position": points.astype(np.float32),
