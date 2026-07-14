@@ -14,9 +14,12 @@ Three scenarios:
                        drifting content that fills the interstitial
                        space between zones. No completion loop.
 
-Per scenario: decompose objects (LLM, a single call) -> resolve every
-object's bbox in a single batch LLM call (trusted, no retry) -> spawn
-background Trellis 2 jobs that fan out via SSE events as each mesh lands.
+Per scenario: decompose objects (LLM, a single call) -> split any object the
+mesh step can't build as one coherent mesh into its constituent pieces (the
+optional `object_decomp` pass, `_split_objects`; a pass-through on versions
+without it) -> resolve every object's bbox in a single batch LLM call (trusted,
+no retry) -> spawn background Trellis 2 jobs that fan out via SSE events as each
+mesh lands.
 There is NO validate-and-retry step: a decomposition whose ids collide with
 already-placed nodes is accepted as-is (the retry could never resolve a
 genuine boundary/anchor overlap and just re-billed the call), and the
@@ -277,6 +280,58 @@ _DECOMP_STEPS: dict[str, tuple[str, str]] = {
 }
 
 
+async def _split_objects(
+    *,
+    zone: Node,
+    specs: list[Any],
+    all_nodes: list[Node],
+) -> list[Any]:
+    """object_decomp — the object-splitting pass between a region's object
+    decomposition and the bbox solver.
+
+    Takes the object specs an upstream step (anchor / encapsulating /
+    negative-space / next_object) proposed for `zone` and returns the final,
+    generation-ready set: any object the mesh step can't produce as one coherent
+    mesh — a container whose interior must hold other objects, a collection
+    standing in for many separate items, a surface carrying openings or that has
+    to conform to an uneven run of neighbours — is split into its constituent
+    pieces (each its own spec, with references re-pointed onto the pieces), while
+    everything already single-mesh-buildable passes through unchanged. The
+    decompose steps used to carry this splitting burden inline; concentrating it
+    here lets them reason about WHAT belongs in the region without also
+    pre-fracturing their own output.
+
+    A pass-through — the proposed specs are returned untouched — when the active
+    prompt version carries no `object_decomp` template (older versions still
+    split inline) or there is nothing to split. Runs only on a FRESH
+    decomposition; a resume replays the already-committed post-split specs
+    (see `_decompose_objects` / the anchor loop), so it never re-splits."""
+    ps = prompt_store.current()
+    if not specs or not ps.has("object_decomp"):
+        return specs
+    by_id = {n.id: n for n in all_nodes}
+    variables = scene_context.zone_vars(
+        zone_id=zone.id,
+        zone_prompt=zone.prompt,
+        zone_plan=zone.plan,
+        nodes=all_nodes,
+        target_text="This is the region whose proposed objects you are to split into buildable pieces.",
+    )
+    variables["PROPOSED_OBJECTS"] = scene_context.render_to_place_block(
+        specs, by_id, parent_zone=zone.id,
+    )
+    out = await llm.call_llm(
+        system=ps.system("object_decomp", variables),
+        user=ps.user("object_decomp", variables),
+        output_schema=schemas.ObjectDecompOutput,
+        node_id=zone.id,
+        step="object_decomp",
+        template="object_decomp",
+        variables=variables,
+    )
+    return list(out.objects)
+
+
 async def _decompose_objects(
     *,
     zone: Node,
@@ -333,6 +388,11 @@ async def _decompose_objects(
         )
         return []
     specs = list(out.objects)
+    # object_decomp: split any proposed object the mesh step can't build as a
+    # single coherent mesh into its constituent pieces. A pass-through on
+    # versions without the step. Runs before uniquify so the emitted split
+    # pieces are de-collided against the scene too.
+    specs = await _split_objects(zone=zone, specs=specs, all_nodes=all_nodes)
     # Rename any id colliding with an existing node with an incrementing index
     existing_ids = {n.id for n in all_nodes}
     for old, new in uniquify_ids(specs, existing_ids=existing_ids):
@@ -379,6 +439,9 @@ async def _next_object_batch(
     objects = list(decision.objects)
     if not decision.objects_required or not objects:
         return True, []
+    # object_decomp: split this round's proposed detail objects into buildable
+    # pieces (a pass-through on versions without the step) before de-colliding.
+    objects = await _split_objects(zone=zone, specs=objects, all_nodes=all_nodes)
     # Rename any id colliding with an existing node with an incrementing index
     existing_ids = {n.id for n in all_nodes}
     for old, new in uniquify_ids(objects, existing_ids=existing_ids):

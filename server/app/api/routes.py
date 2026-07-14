@@ -29,6 +29,9 @@ import re
 import secrets
 import shutil
 import struct
+import subprocess
+import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections.abc import AsyncIterator
@@ -66,6 +69,23 @@ from app.utils.logging import SlotLog
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", _REPO_ROOT / "runs"))
 
+# The splat pipeline lives in the top-level `splat/` package (repo root), outside
+# the server's `app` package — put the repo root on sys.path so it imports
+# cleanly, mirroring how _REPO_ROOT anchors RUNS_DIR above.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from splat import stage1 as splat_stage1  # noqa: E402
+from splat import stage2 as splat_stage2  # noqa: E402
+from splat import stage3 as splat_stage3  # noqa: E402
+
+# Node de-optimizer (server/tools/optimize-assets/deoptimize.mjs): rewrites a
+# cell's KTX2/Meshopt library GLBs to vanilla glTF so the trimesh-based Stage-1
+# assembler can read them. The from-scratch generated RAW build is already
+# vanilla and skips this. Reuses the optimizer tool's node_modules.
+_DEOPT_DIR = _REPO_ROOT / "server" / "tools" / "optimize-assets"
+_DEOPT_SCRIPT = _DEOPT_DIR / "deoptimize.mjs"
+_NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
+
 # Which per-cell mesh directory the scene bundle streams from. Defaults to the
 # originals ("objects"); set STARSHOT_OBJECTS_SUBDIR=objects-optimized to serve
 # the re-baked optimized set (scripts/rebake_runs.py) instead. Falls back to
@@ -84,7 +104,14 @@ SPEND_CAP_USD = float(os.environ.get("STARSHOT_SPEND_CAP_USD", "200"))
 
 # Python's mimetypes doesn't know glTF; without these the artifact route would
 # hand the loader its GLBs as text/plain.
-_ARTIFACT_MEDIA_TYPES = {".glb": "model/gltf-binary", ".gltf": "model/gltf+json"}
+_ARTIFACT_MEDIA_TYPES = {
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    # Stage-2 Gaussian clouds + Stage-3 free-voxel packs — raw bytes the splat
+    # viewer fetches (.ply cloud, .bin voxel field).
+    ".ply": "application/octet-stream",
+    ".bin": "application/octet-stream",
+}
 
 # Per-run metadata written at creation (chosen prompt version, created_at).
 RUN_META_NAME = "run.json"
@@ -118,6 +145,30 @@ _generate_tasks: dict[GenKey, asyncio.Task[None]] = {}
 _regen_tasks: dict[GenKey, asyncio.Task[None]] = {}
 _regen_queues: dict[GenKey, asyncio.Queue["RegenJob"]] = {}
 _hydrated_runs: set[str] = set()
+
+# --- Stage 1 splat conversion jobs (background, one per CELL) ----------------
+# Keyed by (run, slot, model): selecting a run lists cells; clicking a cell
+# starts its own conversion to a scene manifest (splat/stage1.py). The worker
+# updates its job dict's counters in place from a worker thread;
+# `_splat_stage1_tasks` holds the live task so it stays referenced.
+_splat_stage1_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_splat_stage1_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# --- Stage 2 splat sampling jobs (background, one per CELL) -------------------
+# Same shape/keying as Stage 1: a cell's placed meshes (generated, or library
+# de-optimized on the fly) are sampled into a Gaussian cloud `splat/cloud.ply`
+# (splat/stage2.py). A sidecar `cloud.json` holds the summary so 'done' survives
+# a restart; the status also carries the .ply's `/artifacts` URL for the viewer.
+_splat_stage2_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_splat_stage2_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# --- Stage 3 free-space voxelization jobs (background, one per CELL) ----------
+# Same shape/keying as Stage 1/2: a cell's meshes (generated, or library de-
+# optimized) are voxelized into a solid/empty grid + clearance field, and the
+# free voxels written to `splat/voxels.bin` (splat/stage3.py). A `voxels.json`
+# sidecar holds the summary so 'done' survives a restart.
+_splat_stage3_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_splat_stage3_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 _current_run: str = ""
 
 
@@ -1159,6 +1210,7 @@ _PROMPT_STEP_ORDER = [
     "child_bbox_batch",
     "encapsulating_decompose",
     "anchor_decompose",
+    "object_decomp",
     "object_bbox_batch",
     "next_object",
     "negative_space_decompose",
@@ -1527,6 +1579,454 @@ def _hydrate_branches(run: str) -> None:
         )
 
 
+def _placed_count(mesh_dir: Path) -> int:
+    """Count placed `<id>.glb` in `mesh_dir` (the served meshes), excluding the
+    `<id>.raw.glb` pre-placement intermediates. 0 if the dir is absent."""
+    if not mesh_dir.is_dir():
+        return 0
+    return sum(1 for p in mesh_dir.glob("*.glb") if not p.name.endswith(".raw.glb"))
+
+
+def _splat_source(run: str, slot: str, model: str) -> tuple[Path, str] | None:
+    """The Stage-1 mesh source for a cell + its kind, or None if the cell has no
+    placed meshes in any build. Prefers the from-scratch generated RAW build
+    (`objects-generated/`) — vanilla glTF the trimesh assembler reads directly —
+    and falls back to the asset-library build (`objects-optimized/` / `objects/`),
+    which is KTX2/Meshopt and must be de-optimized to vanilla first (see
+    `_deoptimize_dir`). Disk-only; never hydrates the run."""
+    rid = _run_id(run, slot, model)
+    raw_dir = generation.latest_generated_dirs(RUNS_DIR, rid)[0]
+    if _placed_count(raw_dir) > 0:
+        return raw_dir, "generated"
+    cell_dir = _slot_dir(run, slot, model)
+    for name in ("objects-optimized", OBJECTS_SUBDIR, "objects"):
+        lib_dir = cell_dir / name
+        if _placed_count(lib_dir) > 0:
+            return lib_dir, "library"
+    return None
+
+
+def _discover_splat_stage1_cells(run: str) -> list[tuple[str, str, int, str]]:
+    """(slot, model, placed_count, source_kind) for every cell in `run` that has
+    placed meshes in either build — the cells Stage 1 can convert. `source_kind`
+    is 'generated' (vanilla raw build) or 'library' (KTX2/Meshopt, de-optimized
+    on convert). Disk-only; never hydrates the run."""
+    out: list[tuple[str, str, int, str]] = []
+    for slot in SLOTS:
+        for alias in MODEL_ALIASES:
+            source = _splat_source(run, slot.id, alias)
+            if source is None:
+                continue
+            src_dir, kind = source
+            out.append((slot.id, alias, _placed_count(src_dir), kind))
+    return out
+
+
+def _splat_cell_status(
+    run: str,
+    slot: str,
+    model: str,
+    placed: int | None = None,
+    source: str | None = None,
+) -> dict[str, Any]:
+    """Public Stage-1 state for one cell: the live job if one exists, else 'done'
+    with the summary read back from an existing manifest, else 'idle'. `placed`
+    (from a disk scan) seeds the progress denominator before a job starts;
+    `source` ('generated' / 'library') is the build it converts from."""
+    job = _splat_stage1_jobs.get((run, slot, model))
+    if job is not None:
+        return dict(job)
+    manifest = _slot_dir(run, slot, model) / "splat" / splat_stage1.MANIFEST_NAME
+    if manifest.exists():
+        summary: Any = None
+        with contextlib.suppress(Exception):
+            summary = json.loads(manifest.read_text(encoding="utf-8")).get("summary")
+        total = (summary or {}).get("counts", {}).get("placed", placed or 0)
+        return {
+            "run": run, "slot": slot, "model": model, "source": source,
+            "total": total, "done": total, "running": False,
+            "status": "done", "current_id": None, "error": None, "summary": summary,
+        }
+    return {
+        "run": run, "slot": slot, "model": model, "source": source,
+        "total": placed or 0, "done": 0, "running": False,
+        "status": "idle", "current_id": None, "error": None, "summary": None,
+    }
+
+
+def _deoptimize_dir(src_dir: Path, out_dir: Path) -> None:
+    """Rewrite every placed GLB in `src_dir` (a KTX2/Meshopt library build) to
+    vanilla glTF in `out_dir` via the Node de-optimizer, so the trimesh Stage-1
+    assembler can read them. Blocking (subprocess) — call off the event loop."""
+    result = subprocess.run(
+        [
+            _NODE_BIN, str(_DEOPT_SCRIPT),
+            "--in-dir", str(src_dir), "--out-dir", str(out_dir),
+        ],
+        cwd=str(_DEOPT_DIR),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()[:500]
+        raise RuntimeError(f"de-optimize failed ({result.returncode}): {detail}")
+
+
+def _assemble_cell_from_source(
+    run: str,
+    slot: str,
+    model: str,
+    src_dir: Path,
+    kind: str,
+    events_path: Path,
+    out_path: Path,
+    progress: splat_stage1.ProgressCb,
+) -> dict[str, Any]:
+    """Run Stage 1 for one cell. A 'generated' source is vanilla and assembled
+    directly; a 'library' source is KTX2/Meshopt, so it's de-optimized into a
+    throwaway temp dir first (the on-disk originals are untouched). Blocking —
+    run via asyncio.to_thread."""
+    if kind != "library":
+        return splat_stage1.assemble_cell(
+            run=run, slot=slot, model=model, raw_dir=src_dir,
+            events_path=events_path, out_path=out_path, runs_dir=RUNS_DIR,
+            progress=progress,
+        )
+    # Temp on the runs volume (not the system temp, which may be a small/full
+    # tmpfs) — mirrors scripts/export_scene_usd.py; auto-removed on exit.
+    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
+        vanilla_dir = Path(tmp)
+        _deoptimize_dir(src_dir, vanilla_dir)
+        return splat_stage1.assemble_cell(
+            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
+            events_path=events_path, out_path=out_path, runs_dir=RUNS_DIR,
+            progress=progress,
+        )
+
+
+async def _run_splat_stage1_cell(run: str, slot: str, model: str) -> None:
+    """Convert ONE cell: the blocking work (optional library de-optimize +
+    trimesh assembly) runs off the event loop via a thread, and per-object
+    progress lands in the cell's job dict that the status endpoints serve."""
+    key = (run, slot, model)
+    job = _splat_stage1_jobs[key]
+    try:
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
+        src_dir, kind = source
+        events_path = _slot_dir(run, slot, model) / "events.jsonl"
+        out_path = _slot_dir(run, slot, model) / "splat" / splat_stage1.MANIFEST_NAME
+
+        def _progress(done: int, total: int, current: str) -> None:
+            job["done"], job["total"], job["current_id"] = done, total, current
+
+        job["summary"] = await asyncio.to_thread(
+            _assemble_cell_from_source,
+            run, slot, model, src_dir, kind, events_path, out_path, _progress,
+        )
+        job["status"] = "done"
+        job["current_id"] = None
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _splat_stage1_tasks.pop(key, None)
+
+
+class Stage2Request(BaseModel):
+    """Live sampling knobs for a Stage-2 re-splat (all optional; omitted fields
+    take the sampler defaults). `base_spacing` (metres) overrides `target_splats`;
+    `detail_splats`, when set, also builds a denser `cloud.detail.ply` LOD."""
+
+    target_splats: int = splat_stage2.DEFAULT_TARGET_SPLATS
+    base_spacing: float | None = None
+    radius_frac: float = splat_stage2.DEFAULT_RADIUS_FRAC
+    flatness: float = splat_stage2.DEFAULT_FLATNESS
+    adaptive: bool = True
+    detail_splats: int | None = None
+
+
+def _stage2_params(
+    req: Stage2Request | None,
+) -> tuple[splat_stage2.SampleParams, splat_stage2.SampleParams | None]:
+    """Clamp a request into a (base, detail|None) SampleParams pair. Detail shares
+    the base's radius/flatness/adaptive knobs but its own (denser) target count."""
+    req = req or Stage2Request()
+    target = int(min(max(req.target_splats, 5_000), 3_000_000))
+    radius = float(min(max(req.radius_frac, 0.3), 3.0))
+    flat = float(min(max(req.flatness, 0.01), 0.5))
+    base_spacing = (
+        float(min(max(req.base_spacing, 0.002), 0.5))
+        if req.base_spacing is not None
+        else None
+    )
+    base = splat_stage2.SampleParams(
+        target_splats=target, base_spacing=base_spacing,
+        radius_frac=radius, flatness=flat, adaptive=bool(req.adaptive),
+    )
+    detail = None
+    if req.detail_splats:
+        detail = splat_stage2.SampleParams(
+            target_splats=int(min(max(req.detail_splats, target), 5_000_000)),
+            base_spacing=None, radius_frac=radius, flatness=flat,
+            adaptive=bool(req.adaptive),
+        )
+    return base, detail
+
+
+def _cloud_path(run: str, slot: str, model: str) -> Path:
+    """Where a cell's Stage-2 base Gaussian cloud lives (`splat/cloud.ply`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage2.CLOUD_NAME
+
+
+def _detail_cloud_path(run: str, slot: str, model: str) -> Path:
+    """The optional denser LOD streamed in behind the base (`cloud.detail.ply`)."""
+    return _cloud_path(run, slot, model).with_suffix(".detail.ply")
+
+
+def _artifact_url(path: Path) -> str | None:
+    """`/artifacts` URL for a file under RUNS_DIR, or None if absent/outside."""
+    if not path.is_file():
+        return None
+    try:
+        return f"/artifacts/{path.resolve().relative_to(RUNS_DIR.resolve()).as_posix()}"
+    except ValueError:
+        return None
+
+
+def _splat_stage2_status(
+    run: str, slot: str, model: str, source: str | None = None
+) -> dict[str, Any]:
+    """Public Stage-2 state for one cell: the live job if one exists, else 'done'
+    (with the `cloud.json` summary) when a base cloud is on disk, else 'idle'.
+    Carries `url` (base `.ply`) and `detail_url` (the denser LOD, if built) as
+    `/artifacts` paths so the client can lazy-load then stream without extra calls."""
+    url = _artifact_url(_cloud_path(run, slot, model))
+    detail_url = _artifact_url(_detail_cloud_path(run, slot, model))
+    job = _splat_stage2_jobs.get((run, slot, model))
+    if job is not None:
+        return {**job, "url": url, "detail_url": detail_url}
+    if url is not None:
+        summary: Any = None
+        with contextlib.suppress(Exception):
+            summary = json.loads(
+                _cloud_path(run, slot, model).with_suffix(".json").read_text(encoding="utf-8")
+            )
+        total = (summary or {}).get("objects_total", 0)
+        return {
+            "run": run, "slot": slot, "model": model, "source": source,
+            "total": total, "done": total, "running": False, "phase": "done",
+            "status": "done", "current_id": None, "error": None,
+            "summary": summary, "url": url, "detail_url": detail_url,
+        }
+    return {
+        "run": run, "slot": slot, "model": model, "source": source,
+        "total": 0, "done": 0, "running": False, "phase": "idle",
+        "status": "idle", "current_id": None, "error": None,
+        "summary": None, "url": None, "detail_url": None,
+    }
+
+
+def _sample_cell_lods(
+    run: str,
+    slot: str,
+    model: str,
+    src_dir: Path,
+    kind: str,
+    out_path: Path,
+    base_params: splat_stage2.SampleParams,
+    detail_params: splat_stage2.SampleParams | None,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Sample a cell into a base cloud (and, if `detail_params`, a denser LOD),
+    de-optimizing a library source to vanilla ONCE and reusing it for both LODs.
+    Tracks `job['phase']` ('deopt' / 'base' / 'detail') + progress. Blocking — run
+    via asyncio.to_thread."""
+    detail_path = out_path.with_suffix(".detail.ply")
+
+    def _phase_progress(phase: str) -> splat_stage2.ProgressCb:
+        def cb(done: int, total: int, current: str) -> None:
+            job["phase"], job["done"], job["total"], job["current_id"] = (
+                phase, done, total, current,
+            )
+        return cb
+
+    def _sample(vanilla_dir: Path) -> dict[str, Any]:
+        job["phase"] = "base"
+        summary = splat_stage2.sample_cell(
+            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
+            out_path=out_path, params=base_params, progress=_phase_progress("base"),
+        )
+        if detail_params is not None:
+            job["phase"], job["done"], job["total"] = "detail", 0, 0
+            det = splat_stage2.sample_cell(
+                run=run, slot=slot, model=model, raw_dir=vanilla_dir,
+                out_path=detail_path, params=detail_params,
+                progress=_phase_progress("detail"),
+            )
+            summary["detail"] = {
+                "splats": det["splats"], "bytes": det["bytes"],
+                "base_spacing": det["base_spacing"], "params": det["params"],
+            }
+        else:
+            detail_path.unlink(missing_ok=True)  # drop any stale detail LOD
+        return summary
+
+    if kind != "library":
+        return _sample(src_dir)
+    job["phase"] = "deopt"
+    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
+        vanilla_dir = Path(tmp)
+        _deoptimize_dir(src_dir, vanilla_dir)
+        return _sample(vanilla_dir)
+
+
+async def _run_splat_stage2_cell(
+    run: str,
+    slot: str,
+    model: str,
+    base_params: splat_stage2.SampleParams,
+    detail_params: splat_stage2.SampleParams | None,
+) -> None:
+    """Sample ONE cell into a base cloud (+ optional detail LOD) off the event
+    loop, tracking phase/progress in the job dict and writing the `cloud.json`
+    sidecar so 'done' state survives a restart."""
+    key = (run, slot, model)
+    job = _splat_stage2_jobs[key]
+    try:
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
+        src_dir, kind = source
+        out_path = _cloud_path(run, slot, model)
+        summary = await asyncio.to_thread(
+            _sample_cell_lods, run, slot, model, src_dir, kind,
+            out_path, base_params, detail_params, job,
+        )
+        job["summary"] = summary
+        with contextlib.suppress(Exception):
+            out_path.with_suffix(".json").write_text(
+                json.dumps(summary, indent=1), encoding="utf-8"
+            )
+        job["status"] = "done"
+        job["phase"] = "done"
+        job["current_id"] = None
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _splat_stage2_tasks.pop(key, None)
+
+
+class Stage3Request(BaseModel):
+    """Free-space voxelization request. `pitch` (metres) sets the voxel edge;
+    omitted → the default navigational grid."""
+
+    pitch: float | None = None
+
+
+def _voxels_path(run: str, slot: str, model: str) -> Path:
+    """Where a cell's Stage-3 free-voxel pack lives (`splat/voxels.bin`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage3.VOXELS_NAME
+
+
+def _splat_stage3_status(run: str, slot: str, model: str) -> dict[str, Any]:
+    """Public Stage-3 state for one cell: the live job, else 'done' (with the
+    `voxels.json` summary) when the pack is on disk, else 'idle'. Carries `url`
+    (the `.bin`) so the viewer can fetch + draw the free voxels + clearance."""
+    url = _artifact_url(_voxels_path(run, slot, model))
+    job = _splat_stage3_jobs.get((run, slot, model))
+    if job is not None:
+        return {**job, "url": url}
+    if url is not None:
+        summary: Any = None
+        with contextlib.suppress(Exception):
+            summary = json.loads(
+                _voxels_path(run, slot, model).with_suffix(".json").read_text(encoding="utf-8")
+            )
+        return {
+            "run": run, "slot": slot, "model": model,
+            "running": False, "phase": "done", "status": "done",
+            "current_id": None, "error": None, "summary": summary, "url": url,
+        }
+    return {
+        "run": run, "slot": slot, "model": model,
+        "running": False, "phase": "idle", "status": "idle",
+        "current_id": None, "error": None, "summary": None, "url": None,
+    }
+
+
+def _voxelize_from_source(
+    run: str,
+    slot: str,
+    model: str,
+    src_dir: Path,
+    kind: str,
+    out_path: Path,
+    pitch: float,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Voxelize a cell's free space, de-optimizing a library source to vanilla
+    ONCE first. Tracks `job['phase']` ('deopt' / 'voxelize') + progress. Blocking —
+    run via asyncio.to_thread."""
+
+    def _progress(done: int, total: int, current: str) -> None:
+        job["phase"], job["done"], job["total"], job["current_id"] = (
+            "voxelize", done, total, current,
+        )
+
+    def _run(vanilla_dir: Path) -> dict[str, Any]:
+        job["phase"] = "voxelize"
+        return splat_stage3.compute_free_space(
+            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
+            out_path=out_path, pitch=pitch, progress=_progress,
+        )
+
+    if kind != "library":
+        return _run(src_dir)
+    job["phase"] = "deopt"
+    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
+        vanilla_dir = Path(tmp)
+        _deoptimize_dir(src_dir, vanilla_dir)
+        return _run(vanilla_dir)
+
+
+async def _run_splat_stage3_cell(run: str, slot: str, model: str, pitch: float) -> None:
+    """Voxelize ONE cell's free space off the event loop, tracking phase/progress
+    and writing the `voxels.json` sidecar so 'done' survives a restart."""
+    key = (run, slot, model)
+    job = _splat_stage3_jobs[key]
+    try:
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
+        src_dir, kind = source
+        out_path = _voxels_path(run, slot, model)
+        summary = await asyncio.to_thread(
+            _voxelize_from_source, run, slot, model, src_dir, kind, out_path, pitch, job,
+        )
+        job["summary"] = summary
+        with contextlib.suppress(Exception):
+            out_path.with_suffix(".json").write_text(
+                json.dumps(summary, indent=1), encoding="utf-8"
+            )
+        job["status"] = "done"
+        job["phase"] = "done"
+        job["current_id"] = None
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _splat_stage3_tasks.pop(key, None)
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -1875,7 +2375,11 @@ def create_app() -> FastAPI:
                     "variables": prompt_store.ALL_VARIABLES,
                     "native": prompt_store.STEP_VARIABLES[step],
                 }
-                for step in prompt_store.STEPS
+                # The steps THIS snapshot actually carries (see PromptSet.steps),
+                # not the global list — so a snapshot predating an optional step
+                # (e.g. object_decomp) neither surfaces it in the lab nor trips
+                # the ps.template lookup below, while a newer one exposes it.
+                for step in ps.steps()
             ],
         }
 
@@ -2010,6 +2514,178 @@ def create_app() -> FastAPI:
             "default_model": DEFAULT_MODEL_ALIAS,
             "slots": [_slot_summary(s, run) for s in SLOTS],
         }
+
+    @app.get("/runs/{run}/splat/cells")
+    async def splat_cells_list(run: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Every convertible cell in `run` (one with a generated or library build)
+        plus its current Stage-1 state: 'idle' (never converted), a live job's
+        progress, or 'done' (a manifest is already on disk). The screen renders
+        this on run select and polls it while any cell is converting. Disk-only —
+        never hydrates or activates the run."""
+        if not (RUNS_DIR / run).is_dir():
+            raise HTTPException(status_code=404, detail=f"run not found: {run}")
+        cells = []
+        for slot, model, placed, source in _discover_splat_stage1_cells(run):
+            cell = _splat_cell_status(run, slot, model, placed, source)
+            # Stage 2 (surfel sampling) state + the cloud URL, so the screen can
+            # offer "sample" / "view" alongside the Stage-1 convert control.
+            cell["stage2"] = _splat_stage2_status(run, slot, model, source)
+            cells.append(cell)
+        return {"run": run, "cells": cells}
+
+    @app.post("/runs/{run}/splat/stage1/{slot}/{model}")
+    async def splat_stage1_start(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Start Stage 1 for ONE cell — its meshes (the vanilla `objects-generated/`
+        build, or the KTX2/Meshopt library build de-optimized on the fly) +
+        `events.jsonl` become a validated `splat/scene.json` (see splat/stage1.py).
+        Idempotent while running (returns the live job); a finished cell re-runs on
+        a fresh POST (cheap, overwrites). Poll the GET (or the cells list) for
+        progress."""
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no convertible build for {slot}/{model} in {run}",
+            )
+        _, kind = source
+        key = (run, slot, model)
+        existing = _splat_stage1_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        job: dict[str, Any] = {
+            "run": run,
+            "slot": slot,
+            "model": model,
+            "source": kind,
+            "total": 0,
+            "done": 0,
+            "running": True,
+            "status": "pending",
+            "current_id": None,
+            "error": None,
+            "summary": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _splat_stage1_jobs[key] = job
+        _splat_stage1_tasks[key] = asyncio.create_task(
+            _run_splat_stage1_cell(run, slot, model)
+        )
+        return dict(job)
+
+    @app.get("/runs/{run}/splat/stage1/{slot}/{model}")
+    async def splat_stage1_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Stage-1 state of one cell ('idle' / 'pending' / a running job /
+        'done' / 'error')."""
+        return _splat_cell_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/stage2/{slot}/{model}")
+    async def splat_stage2_start(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: Stage2Request | None = None
+    ) -> dict[str, object]:
+        """(Re-)sample ONE cell's placed meshes into a pre-fine-tuning Gaussian
+        cloud `splat/cloud.ply` (see splat/stage2.py), using the tunable knobs in
+        the request body (density via `target_splats`, `radius_frac`, `flatness`,
+        `adaptive`) — set live from the client, no restart. If `detail_splats` is
+        given, also builds a denser `cloud.detail.ply` LOD for background streaming.
+        Idempotent while running; re-runs (overwrites) on a fresh POST."""
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no convertible build for {slot}/{model} in {run}",
+            )
+        _, kind = source
+        base_params, detail_params = _stage2_params(body)
+        key = (run, slot, model)
+        existing = _splat_stage2_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        job: dict[str, Any] = {
+            "run": run,
+            "slot": slot,
+            "model": model,
+            "source": kind,
+            "total": 0,
+            "done": 0,
+            "running": True,
+            "status": "pending",
+            "phase": "pending",
+            "detail": detail_params is not None,
+            "current_id": None,
+            "error": None,
+            "summary": None,
+            "url": None,
+            "detail_url": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _splat_stage2_jobs[key] = job
+        _splat_stage2_tasks[key] = asyncio.create_task(
+            _run_splat_stage2_cell(run, slot, model, base_params, detail_params)
+        )
+        return dict(job)
+
+    @app.get("/runs/{run}/splat/stage2/{slot}/{model}")
+    async def splat_stage2_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Stage-2 state of one cell ('idle' / 'pending' / a running job /
+        'done' with the cloud `url` / 'error')."""
+        return _splat_stage2_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/stage3/{slot}/{model}")
+    async def splat_stage3_start(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: Stage3Request | None = None
+    ) -> dict[str, object]:
+        """Voxelize ONE cell's free space into a solid/empty grid + clearance
+        field, writing the free voxels to `splat/voxels.bin` (see splat/stage3.py)
+        — the foundation for camera placement / occlusion culling, and drawn as a
+        toggleable overlay in the viewer. Optional `pitch` (m) sets the voxel edge.
+        Idempotent while running; re-runs (overwrites) on a fresh POST."""
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no convertible build for {slot}/{model} in {run}",
+            )
+        pitch = (
+            float(min(max(body.pitch, 0.02), 1.0))
+            if body is not None and body.pitch is not None
+            else splat_stage3.DEFAULT_PITCH
+        )
+        _, kind = source
+        key = (run, slot, model)
+        existing = _splat_stage3_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        job: dict[str, Any] = {
+            "run": run,
+            "slot": slot,
+            "model": model,
+            "source": kind,
+            "pitch": pitch,
+            "total": 0,
+            "done": 0,
+            "running": True,
+            "status": "pending",
+            "phase": "pending",
+            "current_id": None,
+            "error": None,
+            "summary": None,
+            "url": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _splat_stage3_jobs[key] = job
+        _splat_stage3_tasks[key] = asyncio.create_task(
+            _run_splat_stage3_cell(run, slot, model, pitch)
+        )
+        return dict(job)
+
+    @app.get("/runs/{run}/splat/stage3/{slot}/{model}")
+    async def splat_stage3_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Stage-3 state of one cell ('idle' / 'pending' / a running job /
+        'done' with the voxel `url` / 'error')."""
+        return _splat_stage3_status(run, slot, model)
 
     @app.get("/trellis/queue")
     async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

@@ -18,7 +18,9 @@ text files. The server picks up new folders immediately — no restart needed.
 
 Each version folder must contain one `<step>.system.txt` and one
 `<step>.user.txt` for every pipeline step below. A missing file fails run
-creation / resume loudly.
+creation / resume loudly — with the exception of the steps marked **optional**,
+which a version may omit (the pipeline skips that pass when its templates are
+absent), so versions predating an optional step keep loading and resuming.
 
 | step | fired | purpose |
 | --- | --- | --- |
@@ -31,6 +33,7 @@ creation / resume loudly.
 | `encapsulating_decompose` | per region | decide + enumerate the region's shell / perimeter objects |
 | `anchor_decompose` | per atomic region | enumerate the defining objects of an atomic leaf |
 | `negative_space_decompose` | per non-atomic region + root | fill interstitial gaps with ambient objects |
+| `object_decomp` *(optional)* | per object batch, before `object_bbox_batch` | split any proposed object the mesh step can't build as one coherent mesh (containers, collections, surfaces with openings) into its constituent pieces; pass the rest through. Omitted on versions that split inline in the decompose steps instead. |
 | `object_bbox_batch` | per object batch | resolve object bboxes in one call |
 | `next_object` | loop per atomic region | propose more objects or declare the region done |
 | `image_prompt` | per object | distill the object into a noun phrase for image generation |
@@ -113,6 +116,7 @@ its prompt (and plan, for `overall_bbox`) known. For `child_bbox_batch` the
 | `` `{ZONE_PLAN}` `` | target region plan (empty string until authored) |
 | `` `{ZONE_PLACEMENT}` `` | target region placement — the semantic spatial description of where it sits within its parent (empty for the root, or until authored) |
 | `` `{ZONE_DIMENSIONS}` `` | target region bbox dimensions, `(x, y, z) m` |
+| `` `{FORMATTED_ZONE_DIMENSIONS}` `` | target region bbox dimensions in spoken form, `Wm by Hm by Dm` (e.g. `3.00m by 2.50m by 4.00m`) |
 | `` `{ZONE_ORIGIN}` `` | target region bbox world origin corner, `(x, y, z) m` |
 | `` `{ZONE_OBJECTS}` `` | flat list of the objects placed DIRECTLY inside the target region (its current contents) — e.g. to remind `next_object` what's already in the zone before it decides what to add. Placeholder line until the zone holds objects. |
 | `` `{PARENT_ZONE_ID}` `` | the target region's ENCLOSING parent region id — the zone one level up the tree, distinct from `` `{ZONE_ID}` `` (the region in focus). Empty for the root, which has no parent. |
@@ -124,6 +128,7 @@ its prompt (and plan, for `overall_bbox`) known. For `child_bbox_batch` the
 | variable | natively populated on | resolves to |
 | --- | --- | --- |
 | `` `{TO_PLACE}` `` | `child_bbox_batch`, `object_bbox_batch` | pseudo-JSON block of the specs whose bboxes the solver must emit (id, parent, relationship kind, parent dims/origin, proxy shape, orientation for objects, prompt, placement, relationships) |
+| `` `{PROPOSED_OBJECTS}` `` | `object_decomp` | pseudo-JSON block of the objects a decompose step proposed for the region (same shape as `` `{TO_PLACE}` ``), which `object_decomp` analyses and may split into buildable pieces |
 | `` `{RETRY_BLOCK}` `` | `anchor_decompose`, `encapsulating_decompose`, `negative_space_decompose`, `next_object` | empty on the first attempt; after a rejected attempt, the prior emissions + rejection reasons with instructions to fix them |
 | `` `{ADJACENT_ZONES}` `` | `encapsulating_decompose` | the regions adjacent to the target zone — the nearest region in each direction, found by casting a sphere of rays from the zone's centre (occlusion-aware, distance uncapped) — rendered in the same embedded form as `` `{SCENE_CONTEXT}` `` (plan, bbox, inline objects, nested subregions) but trimmed to just those neighbours; empty when the zone has no neighbours |
 | `` `{OBJECT_PROMPT}` `` | `image_prompt` | the object's original prompt text |

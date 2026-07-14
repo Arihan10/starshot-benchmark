@@ -49,12 +49,11 @@ def _render_proxy_shape(p: ProxyShape | None) -> str:
 
 def _root_scene_header(root: Node) -> str:
     """Root prompt, plan, and overall bounding box — injected at the top of every prompt that shows scene context. The root bbox is delivered in natural language — its `W by H by D` dimensions plus its origin corner, tagged `(scene root)` — instead of the raw `origin/dimensions` coordinate dump, while still surfacing every value the box carries."""
-    dx, dy, dz = root.bbox.dimensions
     ox, oy, oz = root.bbox.origin
     return (
         f'prompt: "{root.prompt}"\n'
         f'description: "{root.plan}"\n'
-        f"Overall scene (root) bounding box: {dx:.2f}m by {dy:.2f}m by {dz:.2f}m, with its origin corner at ({ox:.2f}, {oy:.2f}, {oz:.2f}) m"
+        f"Overall scene (root) bounding box: {util.format_dimensions_natural(root.bbox)}, with its origin corner at ({ox:.2f}, {oy:.2f}, {oz:.2f}) m"
     )
 
 
@@ -618,6 +617,7 @@ def zone_vars(
         "ZONE_PLAN": str(zone_plan or ""),
         "ZONE_PLACEMENT": str(focus.placement or "") if focus is not None else "",
         "ZONE_DIMENSIONS": util.format_dimensions(zone_bbox),
+        "FORMATTED_ZONE_DIMENSIONS": util.format_dimensions_natural(zone_bbox),
         "ZONE_ORIGIN": util.format_global_origin(zone_bbox),
         "ZONE_OBJECTS": render_zone_objects(zone_id, nodes),
         "PARENT_ZONE_ID": parent_zone_id,
@@ -842,6 +842,12 @@ def sample_variables() -> dict[str, str]:
         ),
     ]
     out["TO_PLACE"] = render_to_place_block(to_place, by_id, parent_zone="reading_nook")
+
+    # PROPOSED_OBJECTS: the object_decomp step's input — the objects an upstream
+    # decompose step proposed for a region, which object_decomp analyses for
+    # splitting. Rendered with the same block as TO_PLACE (same spec shape), so
+    # the sample reuses that batch.
+    out["PROPOSED_OBJECTS"] = out["TO_PLACE"]
 
     # RETRY_BLOCK: one rejected prior attempt, in the bulk-decompose feedback shape.
     rejected = [

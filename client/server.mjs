@@ -14,6 +14,15 @@ const __dirname = fileURLToPath(new URL(".", import.meta.url));
 const PUBLIC_DIR = resolve(__dirname, "public");
 const THREE_DIR = resolve(__dirname, "node_modules", "three");
 const GIFJS_DIR = resolve(__dirname, "node_modules", "gif.js", "dist");
+// The Gaussian-splat viewer (@mkkellogg/gaussian-splats-3d) for the Stage-2
+// cloud preview — an ESM build that imports 'three' (resolved via the importmap).
+const GSPLAT_DIR = resolve(
+    __dirname,
+    "node_modules",
+    "@mkkellogg",
+    "gaussian-splats-3d",
+    "build",
+);
 
 const PORT = Number(process.env.PORT ?? 8766);
 const SERVER_URL = process.env.SERVER_URL ?? "http://127.0.0.1:8765";
@@ -107,6 +116,11 @@ const server = createServer(async (req, res) => {
     if (url.startsWith("/vendor/gifjs/")) {
         const sub = url.slice("/vendor/gifjs/".length);
         const abs = resolveUnder(GIFJS_DIR, sub);
+        if (abs) return serveFile(res, abs);
+    }
+    if (url.startsWith("/vendor/gsplat/")) {
+        const sub = url.slice("/vendor/gsplat/".length);
+        const abs = resolveUnder(GSPLAT_DIR, sub);
         if (abs) return serveFile(res, abs);
     }
     const pub = resolveUnder(PUBLIC_DIR, url);

@@ -40,7 +40,9 @@ VERSIONS_DIR = Path(os.environ.get("STARSHOT_VERSIONS_DIR", _REPO_ROOT / "versio
 # Subfolder of a run dir holding its prompt snapshot.
 RUN_PROMPTS_SUBDIR = "prompts"
 
-# Every step a version must provide, as `<step>.system.txt` + `<step>.user.txt`.
+# Every pipeline step, as `<step>.system.txt` + `<step>.user.txt`, in canonical
+# firing order. All but `OPTIONAL_STEPS` are REQUIRED — a version missing one
+# fails to load loudly.
 STEPS: list[str] = [
     "zone_plan_root",
     "zone_plan",
@@ -51,10 +53,19 @@ STEPS: list[str] = [
     "encapsulating_decompose",
     "anchor_decompose",
     "negative_space_decompose",
+    "object_decomp",
     "object_bbox_batch",
     "next_object",
     "image_prompt",
 ]
+
+# Steps a version MAY omit and still load. `object_decomp` (the object-splitting
+# pass that sits between each object-decomposition step and `object_bbox_batch`)
+# postdates most versions; a version without it simply skips that pass, keeping
+# the splitting guidance inline in each decompose step the way it used to. So it
+# is not required for load-completeness, and older run snapshots created before
+# it existed keep loading and resuming untouched.
+OPTIONAL_STEPS: frozenset[str] = frozenset({"object_decomp"})
 
 # The full variable vocabulary, in display order (scene-wide, target-zone,
 # step-specific). EVERY render receives EVERY variable: ones whose backing
@@ -65,9 +76,10 @@ ALL_VARIABLES: list[str] = [
     "ROOT_PROMPT", "ROOT_PLAN", "ROOT_DIMENSIONS", "ROOT_ORIGIN", "ROOT_HEADER",
     "ROOT_OBJECTS", "SCENE_CONTEXT", "SCENE_CONTEXT_COMPACT",
     "ZONE_ID", "ZONE_PROMPT", "ZONE_PLAN", "ZONE_PLACEMENT", "ZONE_DIMENSIONS",
+    "FORMATTED_ZONE_DIMENSIONS",
     "ZONE_ORIGIN", "ZONE_OBJECTS", "PARENT_ZONE_ID", "PARENT_ZONE_PLAN", "PARENT_ZONE_ORIGIN",
     "SIBLING_OBJECTS", "ROOT_OBJECTS_BRIEF", "OTHER_SUBREGIONS_BRIEF",
-    "TO_PLACE", "RETRY_BLOCK", "ADJACENT_ZONES",
+    "TO_PLACE", "PROPOSED_OBJECTS", "RETRY_BLOCK", "ADJACENT_ZONES",
     "OBJECT_PROMPT", "OBJECT_DIMENSIONS", "PROXY_SHAPE", "IMAGE_TEMPLATE_FRONT",
     "IMAGE_TEMPLATE_SIDE", "IMAGE_TEMPLATE_TOP", "PRIOR_SUBJECTS",
 ]
@@ -85,7 +97,7 @@ LEGACY_VARIABLES: list[str] = ["DEEPSEEK_SUFFIX"]
 _ZONE_VARIABLES = [
     "ROOT_PROMPT", "ROOT_PLAN", "ROOT_DIMENSIONS", "ROOT_ORIGIN", "ROOT_HEADER",
     "ROOT_OBJECTS", "SCENE_CONTEXT", "SCENE_CONTEXT_COMPACT", "ZONE_ID", "ZONE_PROMPT", "ZONE_PLAN",
-    "ZONE_PLACEMENT", "ZONE_DIMENSIONS", "ZONE_ORIGIN", "ZONE_OBJECTS", "PARENT_ZONE_ID",
+    "ZONE_PLACEMENT", "ZONE_DIMENSIONS", "FORMATTED_ZONE_DIMENSIONS", "ZONE_ORIGIN", "ZONE_OBJECTS", "PARENT_ZONE_ID",
     "PARENT_ZONE_PLAN", "PARENT_ZONE_ORIGIN",
 ]
 STEP_VARIABLES: dict[str, list[str]] = {
@@ -98,6 +110,7 @@ STEP_VARIABLES: dict[str, list[str]] = {
     "encapsulating_decompose": _ZONE_VARIABLES + ["RETRY_BLOCK", "ADJACENT_ZONES"],
     "anchor_decompose": _ZONE_VARIABLES + ["RETRY_BLOCK"],
     "negative_space_decompose": _ZONE_VARIABLES + ["RETRY_BLOCK"],
+    "object_decomp": _ZONE_VARIABLES + ["PROPOSED_OBJECTS"],
     "object_bbox_batch": _ZONE_VARIABLES + ["TO_PLACE"],
     "next_object": _ZONE_VARIABLES + ["RETRY_BLOCK"],
     # The image_prompt step deliberately runs on a REDUCED, graduated scene
@@ -163,6 +176,19 @@ class PromptSet:
             raise PromptTemplateError(f"prompt set {self.name!r} has no {step}.{role}.txt")
         return text
 
+    def has(self, step: str) -> bool:
+        """Whether this set carries BOTH roles of `step` — the gate the pipeline
+        reads before firing an optional step (a version predating it omits the
+        files, so the pass is skipped rather than crashing on a missing render)."""
+        return all((step, role) in self.templates for role in _ROLES)
+
+    def steps(self) -> list[str]:
+        """The steps this set actually provides, in canonical `STEPS` order —
+        every required step plus whichever optional steps this version carries.
+        What the prompt-lab / investigator enumerate, so an older snapshot never
+        surfaces (or renders) an optional step it doesn't have."""
+        return [s for s in STEPS if self.has(s)]
+
     def with_overrides(self, overrides: dict[str, dict[str, str]]) -> PromptSet:
         """A copy of this set with `{step: {"system": text, "user": text}}`
         template overrides applied — the prompt-lab's in-memory edit, used by
@@ -183,7 +209,10 @@ def _load_dir(path: Path, name: str) -> PromptSet:
         for role in _ROLES:
             f = path / f"{step}.{role}.txt"
             if not f.is_file():
-                missing.append(f.name)
+                # An OPTIONAL step is allowed to be absent (older versions
+                # predate it): skip it silently rather than failing the load.
+                if step not in OPTIONAL_STEPS:
+                    missing.append(f.name)
                 continue
             templates[(step, role)] = f.read_text(encoding="utf-8")
     if missing:

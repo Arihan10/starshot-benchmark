@@ -76,6 +76,7 @@ MARKERS = {
     "negative_space_decompose": "This is the region whose interstitial negative space you are filling.",
     "object_bbox_batch": "This is the subregion whose objects you are to place.",
     "next_object": "This is the subregion you are deciding whether to add more objects to.",
+    "object_decomp": "This is the region whose proposed objects you are to split into buildable pieces.",
 }
 
 VAR_TOKEN_RE = re.compile(r"`\{([A-Z][A-Z0-9_]*)\}`")
@@ -304,12 +305,23 @@ def test_resolver() -> None:
 def test_static_integrity() -> None:
     versions = sorted(p for p in (REPO / "versions").iterdir() if p.is_dir())
     expect(len(versions) >= 1, "no version folders found")
-    expected_files = {f"{s}.{r}.txt" for s in prompt_store.STEPS for r in ("system", "user")}
+    # Required files must all be present; OPTIONAL steps (e.g. object_decomp) may
+    # be present or absent, so a version is valid iff it has every required file
+    # and no file outside the required + optional set.
+    required_files = {
+        f"{s}.{r}.txt" for s in prompt_store.STEPS for r in ("system", "user")
+        if s not in prompt_store.OPTIONAL_STEPS
+    }
+    optional_files = {
+        f"{s}.{r}.txt" for s in prompt_store.OPTIONAL_STEPS for r in ("system", "user")
+    }
     for vdir in versions:
-        prompt_store._load_dir(vdir, vdir.name)  # raises on missing files
+        prompt_store._load_dir(vdir, vdir.name)  # raises on missing required files
         files = {p.name for p in vdir.glob("*.txt")}
-        expect(files == expected_files,
-               f"{vdir.name}: unexpected/missing txt files: {sorted(files ^ expected_files)}")
+        missing = required_files - files
+        extra = files - required_files - optional_files
+        expect(not missing and not extra,
+               f"{vdir.name}: missing={sorted(missing)} unexpected={sorted(extra)}")
         for f in sorted(vdir.glob("*.txt")):
             text = f.read_text(encoding="utf-8")
             expect(text.strip() != "", f"{vdir.name}/{f.name} is empty")
@@ -549,6 +561,8 @@ def test_edge_scenes() -> None:
                                 nodes=nodes, target_text="t")
     expect(v["ZONE_DIMENSIONS"] == util.format_dimensions(nodes[0].bbox),
            "missing-zone bbox fallback broken")
+    expect(v["FORMATTED_ZONE_DIMENSIONS"] == util.format_dimensions_natural(nodes[0].bbox),
+           "missing-zone formatted bbox fallback broken")
 
     # unplanned zone rendered through a plan-bearing template: explicit ""
     v = zv(nodes, nodes[0], "anchor_decompose", plan_override=None)

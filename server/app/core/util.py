@@ -241,6 +241,12 @@ def format_dimensions(bbox: BoundingBox) -> str:
     return f"{_fmt_vec(bbox.dimensions)} m"
 
 
+def format_dimensions_natural(bbox: BoundingBox) -> str:
+    """The bbox's dimensions in the spoken `W by H by D` form — e.g. `3.00m by 2.50m by 4.00m` — rather than the `(x, y, z) m` vector `format_dimensions` renders."""
+    dx, dy, dz = bbox.dimensions
+    return f"{dx:.2f}m by {dy:.2f}m by {dz:.2f}m"
+
+
 def format_global_origin(bbox: BoundingBox) -> str:
     """World-space origin corner of a bbox in meters; its size is rendered separately via `format_dimensions`. The caller supplies the leading label (e.g. "Global origin corner:")."""
     return f"{_fmt_vec(bbox.origin)} m"

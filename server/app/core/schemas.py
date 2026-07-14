@@ -207,7 +207,10 @@ class ObjectSpec(ChildNodeSpec):
 class ObjectDecompOutput(BaseModel):
     # NEWLY EMITTED object specs that become Nodes downstream. The anchor pass
     # uses this bare shape: it always produces the region's defining objects, so
-    # it carries no gate. Every pass that can instead decide a region needs no
+    # it carries no gate. The `object_decomp` split pass reuses it too — it
+    # rewrites a proposed set into its final, buildable form (splitting composite
+    # objects into pieces, passing the rest through), which is likewise an
+    # ungated object list. Every pass that can instead decide a region needs no
     # objects at all subclasses this and adds the `objects_required` gate below.
     objects: list[ObjectSpec] = Field(default_factory=list)
 
