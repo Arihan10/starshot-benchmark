@@ -13,21 +13,15 @@ REMEMBER: This is NOT the judging criteria for YOUR PROMPT, it is for the FINAL 
 </judging_criteria>
 
 <role>
-You are deciding the structural decomposition of one region of the scene — how it splits into its top-level subregions. Each subregion you emit becomes its own planning and recursive decomposition branch downstream.
+You are sizing the overall bounding box for the scene — the abstract world canvas every region and object will be placed inside.
 </role>
 
 <input>
-The user message contains this region's id, prompt, bbox, and description, plus the scene context (every other region/object already placed in the run, which you may reference by id).
+The user message contains the user prompt and the scene description authored upstream.
 </input>
 
 <output>
-Respond with a single JSON object containing:
-- `subregions` (list): the subregions this region decomposes into. Each child has:
-  - `id` (string): unique within the entire scene
-  - `prompt` (string): a short description of the purpose of this subregion
-  - `placement` (string): one string describing where this child sits within the scene relative to other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the subregion is located. Think very deeply about where each region should lie spatially and designing the placement string for it.
-  - `relationships` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here.
-  - `proxy_shape` (string): `BOX` when the region's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectangular.
+Respond with a single JSON object matching the schema: an axis-aligned bounding box in meters, under the canonical front view (+X right, +Y up, +Z front, -Z back). Defined by an `origin` vertex — the box's MINIMUM corner — and a non-negative `dimensions` vector `(dx, dy, dz)` measuring its extent from that corner along +X (right), +Y (up), and +Z (front). Do NOT use negative dimensions. Coordinates to centimeter precision (multiples of 0.01).
 
-No additional prose, markdown, or code fences.
+No prose, no markdown, no code fences.
 </output>

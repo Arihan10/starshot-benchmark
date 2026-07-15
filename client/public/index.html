@@ -1574,6 +1574,17 @@
 				color: var(--text-faint);
 				font-size: 10px;
 			}
+			#trace-panel .tp-atomic {
+				font-size: 9px;
+				padding: 0 5px;
+				border-radius: 3px;
+				border: 1px solid var(--line-2);
+				color: var(--text-faint);
+			}
+			#trace-panel .tp-atomic.is-atomic {
+				border-color: var(--accent-line);
+				color: var(--accent);
+			}
 			#trace-panel .tp-count {
 				margin-left: auto;
 				flex-shrink: 0;
@@ -3589,7 +3600,7 @@
 				padding: 9px 11px;
 				font-size: 12.5px;
 				line-height: 1.6;
-				max-height: 260px;
+				max-height: 130px;
 				overflow: auto;
 			}
 			.rv-card.err {
@@ -4134,6 +4145,40 @@
 			.q-state {
 				color: var(--text-dim);
 				font-size: 10px;
+			}
+			.q-elapsed {
+				color: var(--text-faint);
+				font-size: 10px;
+				font-variant-numeric: tabular-nums;
+				min-width: 40px;
+				text-align: right;
+			}
+			/* Prefab group in the queue: a canonical row (caret + "+N" reuse count)
+			   with its shared-mesh reuse rows nested under it; the caret collapses
+			   the group (reuses derive from the canonical, so they queue together). */
+			.q-parent {
+				cursor: pointer;
+			}
+			.q-gcaret {
+				color: var(--text-faint);
+				font-size: 9px;
+				width: 9px;
+				flex-shrink: 0;
+			}
+			.q-gcount {
+				color: var(--text-faint);
+				font-size: 10px;
+				flex-shrink: 0;
+			}
+			.q-children.collapsed {
+				display: none;
+			}
+			.q-child {
+				padding-left: 14px;
+				opacity: 0.85;
+			}
+			.q-child .q-job {
+				color: var(--text-dim);
 			}
 			/* Reference image in the object viewer, beneath the 3D mini preview. */
 			.tp-img-wrap {

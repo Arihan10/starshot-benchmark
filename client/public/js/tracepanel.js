@@ -112,7 +112,7 @@ export function createTracePanel(
 	};
 
 	// Per-object texture maps: the raw mesh's PBR maps (base color, roughness,
-	// metallic, occlusion, normal, emissive), each rendered to its own thumbnail
+	// metallic, occlusion, normal, emissive, transparency), each rendered to its own thumbnail
 	// so every map can be inspected separately. Filled by `renderMaps` once the
 	// raw GLB loads; hidden when the focused node exposes no readable maps.
 	const mapsGrid = el("div", { class: "tp-maps-grid" });
@@ -767,8 +767,8 @@ export function createTracePanel(
 	}
 
 	// Render one texture (optionally a single channel, splatted to grayscale) to a
-	// capped 2D canvas. channel ∈ {null, "r", "g", "b"} — glTF packs occlusion in
-	// R, roughness in G, and metalness in B of the metallic-roughness texture.
+	// capped 2D canvas. channel ∈ {null, "r", "g", "b", "a"} — glTF packs occlusion
+	// in R, roughness in G, metalness in B, and opacity in the base-colour alpha.
 	function drawMapCanvas(src, channel) {
 		const scale = Math.min(1, MAP_CANVAS_CAP / Math.max(src.w, src.h));
 		const cw = Math.max(1, Math.round(src.w * scale));
@@ -790,7 +790,7 @@ export function createTracePanel(
 				return null;
 			}
 			const px = data.data;
-			const off = channel === "r" ? 0 : channel === "g" ? 1 : 2;
+			const off = channel === "r" ? 0 : channel === "g" ? 1 : channel === "b" ? 2 : 3;
 			for (let i = 0; i < px.length; i += 4) {
 				const v = px[i + off];
 				px[i] = px[i + 1] = px[i + 2] = v;
@@ -875,6 +875,11 @@ export function createTracePanel(
 				if (!found.ao && m.aoMap) found.ao = m.aoMap;
 				if (!found.emissive && m.emissiveMap)
 					found.emissive = m.emissiveMap;
+				// Opacity is the base-colour texture's ALPHA channel (glTF alphaMode
+				// BLEND/MASK — what the glassify transform bakes into). Only surfaced
+				// when the material actually uses it, so opaque meshes get no flat tile.
+				if (!found.alpha && m.map && (m.transparent || m.alphaTest > 0))
+					found.alpha = m.map;
 			}
 		});
 		const tiles = [];
@@ -890,6 +895,7 @@ export function createTracePanel(
 		add(found.ao, "r", "occlusion", "occlusion");
 		add(found.normal, null, "normal", "normal");
 		add(found.emissive, null, "emissive", "emissive");
+		add(found.alpha, "a", "transparency", "transparency");
 		if (!tiles.length) return;
 		mapsGrid.replaceChildren(...tiles);
 		mapsWrap.style.display = "";
@@ -1339,6 +1345,15 @@ export function createTracePanel(
 			el("span", { class: `dot ${statusDot(n)}` }),
 			el("span", { class: "obsm-id", text: id }),
 			n ? el("span", { class: "tp-kind", text: n.kind }) : null,
+			n && n.kind === "zone" && n.atomic != null
+				? el("span", {
+						class: `tp-atomic ${n.atomic ? "is-atomic" : "is-composite"}`,
+						text: n.atomic ? "atomic" : "composite",
+						title: n.atomic
+							? "atomic zone — a leaf; its objects are generated directly (no sub-zones)"
+							: "composite zone — decomposed into sub-zones / objects",
+					})
+				: null,
 			via
 				? el("span", {
 						class: "obsm-via",
@@ -1414,7 +1429,7 @@ export function createTracePanel(
 			const prov = (model.provenance?.get(id) ?? [])
 				.map((p) => `${p.relation}#${p.call.index}`)
 				.join(",");
-			return `${id}:${n?.calls.length ?? 0}:${prov}:${expandedNodes.has(id) ? 1 : 0}`;
+			return `${id}:${n?.calls.length ?? 0}:${n?.atomic ?? ""}:${prov}:${expandedNodes.has(id) ? 1 : 0}`;
 		};
 		const exp = [...expandedCalls].sort((a, b) => a - b).join(",");
 		return `${focusId}|exp:${exp}|${chain.map(nodeSig).join(";")}`;

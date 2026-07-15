@@ -283,8 +283,8 @@ export function createObsDock(hostEl, { trace = true } = {}) {
     return wrap;
   }
 
-  // The in-place detail: exact bytes sent/received. System, user, and output
-  // are open; reasoning and per-variable values stay one click away.
+  // The in-place detail: exact bytes sent/received. Only the output is open;
+  // system, user, reasoning, and per-variable values stay one click away.
   function callDetail(call) {
     const detail = el("div", { class: "call-detail" });
     detail.appendChild(el("div", {
@@ -296,8 +296,8 @@ export function createObsDock(hostEl, { trace = true } = {}) {
         call.seeded ? "SEEDED from a vetted prompt-lab test (no live call)" : null,
       ].filter(Boolean).join(" · "),
     }));
-    detail.appendChild(section("system — exact bytes sent", call.system ?? "", { variables: call.variables }));
-    detail.appendChild(section("user — exact bytes sent", call.user ?? "", { variables: call.variables }));
+    detail.appendChild(section("system — exact bytes sent", call.system ?? "", { variables: call.variables, open: false }));
+    detail.appendChild(section("user — exact bytes sent", call.user ?? "", { variables: call.variables, open: false }));
     detail.appendChild(section("output — exact bytes received", fmtJson(call.output)));
     if (call.reasoning) detail.appendChild(section("reasoning", call.reasoning, { open: false }));
     if (call.variables && typeof call.variables === "object") {

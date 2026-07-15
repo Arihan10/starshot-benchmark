@@ -17,6 +17,8 @@ generation module that drives this.
 
 from __future__ import annotations
 
+import asyncio
+import sys
 from typing import Any
 
 from pydantic import BaseModel
@@ -58,6 +60,44 @@ def _fmt_size(bbox: BoundingBox) -> str:
     return f"{w:.2f}×{h:.2f}×{d:.2f}m"
 
 
+# Prefab matching is a cheap, best-effort de-dup call, so a hung/failing one must
+# never stall the whole generate. Cap each attempt at a hard wall-clock minute
+# (`wait_for` cancels the in-flight request outright, unlike the shared 180s
+# client timeout + the SDK's own long internal retry) and retry a couple of
+# times. Deliberately light: no backoff, a tiny attempt budget, and a "no match"
+# fallback so every candidate simply generates on its own if matching gives up.
+PREFAB_MATCH_TIMEOUT_S = 60.0
+PREFAB_MATCH_ATTEMPTS = 3
+
+
+async def _match_call(*, user: str, seed_id: str) -> DuplicateMatchOutput | None:
+    """One prefab-match LLM call, capped at PREFAB_MATCH_TIMEOUT_S per attempt and
+    retried up to PREFAB_MATCH_ATTEMPTS times. Returns the parsed output, or None
+    when every attempt timed out / errored. Cancellation (build teardown) is a
+    BaseException, so it propagates past the `except Exception` untouched."""
+    for attempt in range(1, PREFAB_MATCH_ATTEMPTS + 1):
+        try:
+            return await asyncio.wait_for(
+                llm.call_llm(
+                    system=SYSTEM_PREFAB_MATCH,
+                    user=user,
+                    output_schema=DuplicateMatchOutput,
+                    node_id=seed_id,
+                    step="prefab_match",
+                ),
+                timeout=PREFAB_MATCH_TIMEOUT_S,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort: any failure falls back to no-match
+            giving_up = attempt >= PREFAB_MATCH_ATTEMPTS
+            print(
+                f"[prefabs] prefab_match {seed_id!r} attempt {attempt}/{PREFAB_MATCH_ATTEMPTS} "
+                f"failed ({type(e).__name__}: {str(e)[:140]}) — "
+                f"{'giving up (no matches)' if giving_up else 'retrying'}",
+                file=sys.stderr,
+            )
+    return None
+
+
 async def match_duplicates(
     *,
     seed_id: str,
@@ -83,15 +123,13 @@ async def match_duplicates(
     )
     token = llm._current_model.set(MODELS["gemini-flash-lite"])
     try:
-        out = await llm.call_llm(
-            system=SYSTEM_PREFAB_MATCH,
-            user=user,
-            output_schema=DuplicateMatchOutput,
-            node_id=seed_id,
-            step="prefab_match",
-        )
+        out = await _match_call(user=user, seed_id=seed_id)
     finally:
         llm._current_model.reset(token)
+    if out is None:
+        # Timed out / errored past the retry budget — match nothing so every
+        # candidate just generates on its own rather than stalling the build.
+        return []
     valid = {cid for cid, _, _ in candidates}
     seen: set[str] = set()
     matches: list[str] = []
