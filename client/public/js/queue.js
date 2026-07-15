@@ -78,15 +78,59 @@ export function initQueuePanel() {
 		}
 	});
 
+	// Total time a row has been in flight, from the server's first-seen epoch
+	// (`enqueued_at`). Ticked locally each second so it advances between the
+	// ~1.5s polls; server + browser share the host clock, so no skew handling.
+	function fmtElapsed(sinceSec) {
+		if (!sinceSec) return "";
+		const s = Math.max(0, Math.floor(Date.now() / 1000 - sinceSec));
+		if (s < 60) return `${s}s`;
+		return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, "0")}s`;
+	}
+
+	function updateElapsed() {
+		for (const span of body.querySelectorAll(".q-elapsed[data-since]")) {
+			span.textContent = fmtElapsed(Number(span.dataset.since));
+		}
+	}
+
+	function rowEl(e, { child = false } = {}) {
+		return el(
+			"div",
+			{ class: `q-row${child ? " q-child" : ""}` },
+			el("span", { class: `q-dot ${e.state}` }),
+			el("span", { class: "q-job", text: e.job_id, title: e.slot_id ?? "" }),
+			e.backend ? el("span", { class: "q-backend", text: e.backend }) : null,
+			el("span", { class: "q-state", text: e.state }),
+			el("span", { class: "q-elapsed", dataset: { since: String(e.enqueued_at ?? "") } }),
+		);
+	}
+
 	function render(pools, entries) {
 		body.textContent = "";
 		if (!entries.length) {
 			body.appendChild(el("div", { class: "q-empty", text: "nothing in flight" }));
 			return;
 		}
-		// Group by pool in the server's pool order; any unknown pool falls to the end.
-		const byPool = new Map(pools.map((p) => [p.id, []]));
+		// Nest prefab reuses under the canonical they share a mesh with: a child
+		// row names its canonical's job id (same slot); everything else is
+		// top-level. An orphan (canonical not currently queued) stays top-level.
+		const keyOf = (slotId, jobId) => `${slotId}\u0000${jobId}`;
+		const byKey = new Map(entries.map((e) => [keyOf(e.slot_id, e.job_id), e]));
+		const childrenOf = new Map();
+		const top = [];
 		for (const e of entries) {
+			const parentKey =
+				e.canonical && e.canonical !== e.job_id ? keyOf(e.slot_id, e.canonical) : null;
+			if (parentKey && byKey.has(parentKey)) {
+				(childrenOf.get(parentKey) ?? childrenOf.set(parentKey, []).get(parentKey)).push(e);
+			} else {
+				top.push(e);
+			}
+		}
+		// Group top-level rows by pool in the server's order; unknown pools last.
+		const byPool = new Map(pools.map((p) => [p.id, []]));
+		for (const e of top) {
 			if (!byPool.has(e.pool)) byPool.set(e.pool, []);
 			byPool.get(e.pool).push(e);
 		}
@@ -94,33 +138,46 @@ export function initQueuePanel() {
 		for (const [poolId, rows] of byPool) {
 			if (!rows.length) continue;
 			const pool = meta.get(poolId);
+			// Cap counts TOP-LEVEL processing rows only — reuses derive locally and
+			// don't consume the pool's (Trellis/Hunyuan) concurrency budget.
 			const processing = rows.filter((r) => r.state === "processing").length;
-			body.appendChild(
+			const section = el(
+				"div",
+				{ class: "q-section" },
 				el(
 					"div",
-					{ class: "q-section" },
-					el(
-						"div",
-						{ class: "q-sec-head" },
-						el("span", { class: "q-sec-lab", text: pool?.label ?? poolId }),
-						el("span", {
-							class: "q-sec-cap",
-							text: pool?.cap ? `${processing}/${pool.cap}` : String(rows.length),
-						}),
-					),
-					...rows.map((e) =>
-						el(
-							"div",
-							{ class: "q-row" },
-							el("span", { class: `q-dot ${e.state}` }),
-							el("span", { class: "q-job", text: e.job_id, title: e.slot_id ?? "" }),
-							e.backend ? el("span", { class: "q-backend", text: e.backend }) : null,
-							el("span", { class: "q-state", text: e.state }),
-						),
-					),
+					{ class: "q-sec-head" },
+					el("span", { class: "q-sec-lab", text: pool?.label ?? poolId }),
+					el("span", {
+						class: "q-sec-cap",
+						text: pool?.cap ? `${processing}/${pool.cap}` : String(rows.length),
+					}),
 				),
 			);
+			for (const e of rows) {
+				const kids = childrenOf.get(keyOf(e.slot_id, e.job_id)) ?? [];
+				if (!kids.length) {
+					section.appendChild(rowEl(e));
+					continue;
+				}
+				// A canonical with reuses: an expandable group (default open). The
+				// caret toggles the nested child rows; a "+N" badge shows the count.
+				const kidsWrap = el("div", { class: "q-children" }, ...kids.map((k) => rowEl(k, { child: true })));
+				const caret = el("span", { class: "q-gcaret", text: "▾" });
+				const row = rowEl(e);
+				row.classList.add("q-parent");
+				row.prepend(caret);
+				row.appendChild(el("span", { class: "q-gcount", text: `+${kids.length}` }));
+				row.addEventListener("click", () => {
+					const collapsed = kidsWrap.classList.toggle("collapsed");
+					caret.textContent = collapsed ? "▸" : "▾";
+				});
+				section.appendChild(row);
+				section.appendChild(kidsWrap);
+			}
+			body.appendChild(section);
 		}
+		updateElapsed();
 	}
 
 	async function tick() {
@@ -139,5 +196,7 @@ export function initQueuePanel() {
 		setTimeout(tick, busy ? POLL_BUSY_MS : POLL_IDLE_MS);
 	}
 
+	// Advance the in-flight timers every second, independent of the poll cadence.
+	setInterval(updateElapsed, 1000);
 	tick();
 }

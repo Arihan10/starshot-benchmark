@@ -85,8 +85,9 @@ const LIGHTING_DEFAULTS = {
 };
 
 // Selected-map projection ("on mesh" control): each map's material slot + the
-// packed channel to isolate (glTF packs occlusion=R, roughness=G, metalness=B);
-// channel -1 shows the whole RGB map (base/normal/emissive).
+// packed channel to isolate (glTF packs occlusion=R, roughness=G, metalness=B,
+// and opacity in the base-colour ALPHA channel=3); channel -1 shows the whole
+// RGB map (base/normal/emissive).
 const MAP_PROJECTION_SPEC = {
 	base: { slot: "map", channel: -1 },
 	roughness: { slot: "roughnessMap", alt: "metalnessMap", channel: 1 },
@@ -94,6 +95,7 @@ const MAP_PROJECTION_SPEC = {
 	occlusion: { slot: "aoMap", channel: 0 },
 	normal: { slot: "normalMap", channel: -1 },
 	emissive: { slot: "emissiveMap", channel: -1 },
+	transparency: { slot: "map", channel: 3 },
 };
 // How far the rest of the scene desaturates toward dark grey while a map is
 // projected (0 = off, 1 = full), via the shared `_inspectDim` uniform.
@@ -149,14 +151,19 @@ function buildInspectorMaterial(sourceMat, spec) {
 			// channels; leave colour maps for three to tone-map + encode.
 			.replace(
 				"#include <opaque_fragment>",
-				`if ( uProjChannel >= 0 ) {
+				`if ( uProjChannel == 3 ) {
+					// Opacity view: false-colour the base-colour alpha, then force the
+					// fragment opaque so the heatmap reads even on transparent texels.
+					outgoingLight = _proj_srgb2lin( _proj_turbo( diffuseColor.a ) );
+					diffuseColor.a = 1.0;
+				} else if ( uProjChannel >= 0 ) {
 					float _v = uProjChannel == 0 ? outgoingLight.r : ( uProjChannel == 1 ? outgoingLight.g : outgoingLight.b );
 					outgoingLight = _proj_srgb2lin( _proj_turbo( _v ) );
 				}
 				#include <opaque_fragment>`,
 			);
 	};
-	mat.customProgramCacheKey = () => "mapproj1|" + channel;
+	mat.customProgramCacheKey = () => "mapproj2|" + channel;
 	return mat;
 }
 
@@ -183,12 +190,15 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	const overlayRoot = new THREE.Group();
 	scene.add(sceneRoot, bboxRoot, overlayRoot);
 
-	const camera = new THREE.PerspectiveCamera(50, 1, 0.05, 5000);
+	const camera = new THREE.PerspectiveCamera(75, 1, 0.05, 5000);
 	camera.position.set(14, 10, 14);
 	const controls = new OrbitControls(camera, renderer.domElement);
 	controls.enableDamping = true;
 	controls.dampingFactor = 0.08;
 	controls.target.set(0, 1, 0);
+	// Free MIDDLE + RIGHT for our own handlers: middle-click hides a node, and
+	// holding right drags a first-person look. Left still orbits; wheel zooms.
+	controls.mouseButtons = { LEFT: THREE.MOUSE.ROTATE, MIDDLE: null, RIGHT: null };
 	controls.update();
 
 	let cameraUserMoved = false;
@@ -213,8 +223,14 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		? new PointerLockControls(camera, renderer.domElement)
 		: null;
 	let cameraMode = "orbit"; // "orbit" | "fp"
-	const orbitFov = camera.fov; // restored on FP exit
-	const FP_FOV_SCALE = 1.5; // FP widens the view +50% for a natural walk-through
+	// Hold RIGHT to look: a MOMENTARY first-person fly (pointer lock) for the
+	// duration of the hold — same mechanism as the permanent toggle, so the
+	// mouse-look is 1:1 (cursor captured, no screen-edge stall). `rmbInitiated`
+	// marks a lock that came from the right-hold (so it exits on release and
+	// doesn't flip the toggle button); `rmbHeld` tracks the physical button for
+	// the async-lock race guard.
+	let rmbInitiated = false;
+	let rmbHeld = false;
 	let fpSpeedScale = 10; // scene-scaled walk speed + target-ahead distance
 	let onCameraModeCb = () => {};
 	const _fpDir = new THREE.Vector3();
@@ -231,33 +247,42 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 	function setCameraMode(mode) {
 		if (!fp) return;
-		if (mode === "fp") fp.lock(); // requestPointerLock — needs the click gesture
-		else fp.unlock();
+		if (mode === "fp") {
+			rmbInitiated = false; // a toggle-driven lock (drives the button)
+			fp.lock(); // requestPointerLock — needs the click gesture
+		} else {
+			fp.unlock();
+		}
 	}
 
 	if (fp) {
 		// The lock/unlock events are the single source of truth for the mode, so
-		// Esc (browser-native exit) and a refused lock are both handled cleanly.
+		// Esc (native exit), a refused lock, and the right-hold all resolve here.
 		fp.addEventListener("lock", () => {
 			cameraMode = "fp";
 			fpSpeedScale = sceneRadius();
-			camera.fov = orbitFov * FP_FOV_SCALE;
-			camera.updateProjectionMatrix();
 			controls.enabled = false; // stop orbit input; the loop skips its update()
 			setHovered(null);
 			tooltip.style.display = "none";
-			onCameraModeCb("fp");
+			// Right-hold released before the async lock engaged — exit straight out.
+			if (rmbInitiated && !rmbHeld) {
+				fp.unlock();
+				return;
+			}
+			// A right-hold look is momentary; only the toggle drives the button.
+			if (!rmbInitiated) onCameraModeCb("fp");
 		});
 		fp.addEventListener("unlock", () => {
 			cameraMode = "orbit";
-			camera.fov = orbitFov; // restore the orbit view
-			camera.updateProjectionMatrix();
 			syncTargetAhead(); // hand the FP pose to orbit before it takes back over
 			controls.enabled = true;
 			controls.update();
 			setHovered(null);
 			tooltip.style.display = "none";
-			onCameraModeCb("orbit");
+			const wasRmb = rmbInitiated;
+			rmbInitiated = false;
+			rmbHeld = false;
+			if (!wasRmb) onCameraModeCb("orbit");
 		});
 	}
 
@@ -978,10 +1003,25 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		_downY = ev.clientY;
 		_downT = performance.now();
 		_downButton = ev.button;
+		// Hold RIGHT to look (momentary FP via pointer lock). Only from orbit —
+		// if already in FP (the toggle), leave that lock alone.
+		if (ev.button === 2 && fp && cameraMode === "orbit") {
+			rmbInitiated = true;
+			rmbHeld = true;
+			fp.lock();
+		}
 	});
 	renderer.domElement.addEventListener("pointerup", (ev) => {
+		if (ev.button === 2) {
+			rmbHeld = false;
+			if (cameraMode === "fp" && rmbInitiated) fp.unlock(); // end the look
+			return;
+		}
 		if (cameraMode !== "orbit") return; // FP: the pointer is captured for look
-		if (_downButton !== 0 || ev.button !== 0) return;
+		// A click (not a drag) of the SAME button that went down: LEFT selects,
+		// MIDDLE toggles per-node hide.
+		if (ev.button !== _downButton || (ev.button !== 0 && ev.button !== 1))
+			return;
 		const dx = ev.clientX - _downX;
 		const dy = ev.clientY - _downY;
 		if (Math.hypot(dx, dy) > CLICK_MAX_MOVE_PX) return;
@@ -990,22 +1030,27 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
 		pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
 		raycaster.setFromCamera(pointer, camera);
-		const id = pickHoveredId();
-		if (id !== null) select(id);
-		else clearSelection();
+		if (ev.button === 0) {
+			const id = pickHoveredId();
+			if (id !== null) select(id);
+			else clearSelection();
+		} else {
+			const id = pickRightClickId(); // middle-click hide
+			if (id !== null) toggleHidden(id);
+		}
 	});
 
-	// Right-click toggles per-node hide for the picked id. The mesh disappears,
-	// the bbox stays as a volumetric reference and as the click target for
-	// un-hiding. Suppresses the browser's default context menu.
+	// A cancelled right-hold (lost pointer) exits the look like a normal release.
+	renderer.domElement.addEventListener("pointercancel", () => {
+		if (!rmbHeld) return;
+		rmbHeld = false;
+		if (cameraMode === "fp" && rmbInitiated) fp.unlock();
+	});
+
+	// Right-hold is the look handle (see pointerdown), so suppress the browser
+	// context menu. Per-node hide is on middle-click (see pointerup).
 	renderer.domElement.addEventListener("contextmenu", (ev) => {
 		ev.preventDefault();
-		const rect = renderer.domElement.getBoundingClientRect();
-		pointer.x = ((ev.clientX - rect.left) / rect.width) * 2 - 1;
-		pointer.y = -((ev.clientY - rect.top) / rect.height) * 2 + 1;
-		raycaster.setFromCamera(pointer, camera);
-		const id = pickRightClickId();
-		if (id !== null) toggleHidden(id);
 	});
 
 	function isTypingTarget(t) {
@@ -1060,7 +1105,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 	// First-person flycam: W/S fly along the look direction (pitch included, so
 	// looking up climbs and down dives); A/D strafe level; Q/E lower/raise on
-	// world Y; Shift sprints. Mouse-look is applied by fp on mousemove.
+	// world Y; Shift sprints. Mouse-look comes from the FP pointer lock (the
+	// toggle or a right-hold).
 	function applyFpMove(dt) {
 		if (pressedKeys.size === 0) return;
 		const speed =
@@ -2267,6 +2313,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			active = v;
 			if (!v) {
 				if (fp && fp.isLocked) fp.unlock();
+				rmbHeld = false;
 				pressedKeys.clear();
 				setHovered(null);
 				tooltip.style.display = "none";

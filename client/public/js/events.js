@@ -230,6 +230,9 @@ export function createObsModel() {
                 parentId: null,
                 prompt: null,
                 plan: null,
+                // Zone atomicity from `divider.zone_plan` (true = leaf, false =
+                // decomposed). null until that step folds, or for non-zones.
+                atomic: null,
                 imagePrompt: null,
                 kind: "zone",
                 phase: null,
@@ -363,11 +366,11 @@ export function createObsModel() {
                 return true;
             }
             case "divider.zone_plan": {
-                if (
-                    typeof event.node === "string" &&
-                    typeof event.plan === "string"
-                ) {
-                    node(event.node).plan = event.plan;
+                if (typeof event.node === "string") {
+                    const n = node(event.node);
+                    if (typeof event.plan === "string") n.plan = event.plan;
+                    if (typeof event.is_atomic === "boolean")
+                        n.atomic = event.is_atomic;
                 }
                 return true;
             }

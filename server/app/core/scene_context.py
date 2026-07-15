@@ -541,12 +541,10 @@ def wrap_image_prompt(
         )
     )
     base = (
-        f"Generate a direct, perfect {view_phrase} of {description} "
+        f"Generate a direct, perfect {view_phrase} of {description}, one-to-one"
         f"that roughly can be captured within {_article(hitbox)} {hitbox} "
         "hitbox without bending or deforming the object's natural "
         f"proportions. The object should not fully be in {_article(silhouette)} "
-        f"{silhouette} shape unless its dimensions and nature dictate it is naturally that shape. Prioritize "
-        "realism over confinement to the hitbox shape."
         f"{reference_clause} "
         "Capture the entire model in the image. Render against a "
         "clean, empty white background with no other objects, dimension markings, or graphics."

@@ -227,6 +227,11 @@ def queue_snapshot() -> list[dict[str, Any]]:
             "job_id": job_id,
             "state": entry["state"],
             "since": entry["since"],
+            # First-seen epoch time (total in-flight); the canonical this row
+            # shares a mesh with, so the panel can nest reuses under it (None on
+            # a canonical / standalone job).
+            "enqueued_at": entry.get("enqueued_at", entry["since"]),
+            "canonical": entry.get("canonical"),
             "task_id": entry.get("task_id"),
             "backend": backend,
             "pool": _pool_for(backend),
@@ -239,14 +244,21 @@ def _queue_set(slot_id: str | None, job_id: str, state: str, **extra: Any) -> No
         return
     key = (slot_id, job_id)
     cur = _QUEUE.get(key)
-    merged = {k: v for k, v in (cur or {}).items() if k not in {"state", "since"}}
+    now = time.time()
+    merged = {
+        k: v for k, v in (cur or {}).items() if k not in {"state", "since", "enqueued_at"}
+    }
     # Overlay only explicitly-provided fields, so a state transition that omits
-    # `backend`/`task_id` keeps what an earlier call recorded (e.g. mark_queued
-    # tags the backend; the later mark_processing needn't repeat it).
+    # `backend`/`task_id`/`canonical` keeps what an earlier call recorded (e.g.
+    # mark_queued tags the backend; the later mark_processing needn't repeat it).
     merged.update({k: v for k, v in extra.items() if v is not None})
     _QUEUE[key] = {
         "state": state,
-        "since": cur["since"] if cur and cur["state"] == state else time.time(),
+        # `since` marks the CURRENT state's start (resets on transition);
+        # `enqueued_at` is the first-seen time and never resets, so the panel can
+        # show total time-in-flight across the waiting→processing handoff.
+        "since": cur["since"] if cur and cur["state"] == state else now,
+        "enqueued_at": (cur or {}).get("enqueued_at", now),
         **merged,
     }
 
@@ -262,14 +274,22 @@ def inflight_ids(slot_id: str) -> set[str]:
     return {jid for (sid, jid) in _QUEUE if sid == slot_id}
 
 
-def mark_queued(slot_id: str | None, job_id: str, *, backend: str | None = None) -> None:
+def mark_queued(
+    slot_id: str | None,
+    job_id: str,
+    *,
+    backend: str | None = None,
+    canonical: str | None = None,
+) -> None:
     """Register an externally-managed job (e.g. a regeneration awaiting its turn
     in a per-cell worker) as `waiting` in the shared queue snapshot, so it shows
     in the same queue panel as live mesh work. `backend` tags the row so the
-    panel buckets it into the right pool section. When the job actually submits,
-    `generate_mesh` takes over the (slot_id, job_id) entry; pair this with
-    `unmark_queued` at hand-off / cancellation so it can't leak."""
-    _queue_set(slot_id, job_id, "waiting", backend=backend)
+    panel buckets it into the right pool section. `canonical` (a prefab
+    canonical's job id) nests this row under that canonical's entry — set it on a
+    reuse so the shared-mesh group shows as one expandable entry. When the job
+    actually submits, `generate_mesh` takes over the (slot_id, job_id) entry; pair
+    this with `unmark_queued` at hand-off / cancellation so it can't leak."""
+    _queue_set(slot_id, job_id, "waiting", backend=backend, canonical=canonical)
 
 
 def unmark_queued(slot_id: str | None, job_id: str) -> None:
@@ -279,14 +299,20 @@ def unmark_queued(slot_id: str | None, job_id: str) -> None:
 
 
 def mark_processing(
-    slot_id: str | None, job_id: str, *, task_id: str | None = None, backend: str | None = None,
+    slot_id: str | None,
+    job_id: str,
+    *,
+    task_id: str | None = None,
+    backend: str | None = None,
+    canonical: str | None = None,
 ) -> None:
     """Promote a queue entry to `processing` for an externally-managed job that
     runs its own submit/poll lifecycle outside `generate_mesh` — e.g. the direct
     Tencent Hunyuan backend, which still belongs in the shared queue panel as the
-    live in-flight row. `backend` tags the row's pool section. Pair with
-    `mark_queued` (waiting) and `unmark_queued`."""
-    _queue_set(slot_id, job_id, "processing", task_id=task_id, backend=backend)
+    live in-flight row. `backend` tags the row's pool section; `canonical` nests
+    it under a shared-mesh canonical (see `mark_queued`). Pair with `mark_queued`
+    (waiting) and `unmark_queued`."""
+    _queue_set(slot_id, job_id, "processing", task_id=task_id, backend=backend, canonical=canonical)
 
 
 def _retry_delay(attempt: int, err: BaseException) -> float:

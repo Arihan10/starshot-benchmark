@@ -45,7 +45,7 @@ from app.core import prompt_store, scene_context, schemas
 from app.core.slots import MODELS
 from app.core.types import BoundingBox, Node, ProxyShape
 from app.pipeline import committed
-from app.services import hunyuan, hunyuan_tencent, llm, nano_banana, prefabs, symmetry, threed
+from app.services import hunyuan, hunyuan_tencent, llm, mesh_jobs, nano_banana, prefabs, symmetry, threed
 from app.utils import glass, glb_place, logging
 from app.utils.geometry import export_glb, rescale_mesh_to_bbox, rotate_mesh
 from app.utils.topology import uniquify_ids
@@ -1359,20 +1359,29 @@ async def generate_assets(
     async def _reuse(node: Node, source_id: str) -> None:
         # Wait for the source's mesh to land, then rescale ITS raw Trellis output
         # into this node's slot — exactly as a fresh build would, so the reuse
-        # lands identically posed. No Nano-Banana, no Trellis.
-        await raw_ready[source_id].wait()
-        async with node_lock(run_id, node.id):
-            # Full-set gate (see `_fresh`): a reuse with a stale optimized twin but
-            # a missing unoptimized served mesh is re-derived, not skipped.
-            if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=True):
-                return
-            await _rescale_reuse_from_raw(
-                node,
-                src_raw=raw_dir / f"{source_id}.raw.glb",
-                raw_dir=raw_dir,
-                opt_dir=opt_dir,
-                source_id=source_id,
-            )
+        # lands identically posed. No Nano-Banana, no Trellis. Surfaces in the
+        # queue panel nested under its canonical (`canonical=source_id`): waiting
+        # while the canonical's mesh is still generating, processing during the
+        # rescale, then dropped.
+        slot = logging.current_slot_id()
+        mesh_jobs.mark_queued(slot, node.id, canonical=source_id)
+        try:
+            await raw_ready[source_id].wait()
+            async with node_lock(run_id, node.id):
+                # Full-set gate (see `_fresh`): a reuse with a stale optimized twin
+                # but a missing unoptimized served mesh is re-derived, not skipped.
+                if artifacts_complete(raw_dir, opt_dir, node.id, is_reuse=True):
+                    return
+                mesh_jobs.mark_processing(slot, node.id, canonical=source_id)
+                await _rescale_reuse_from_raw(
+                    node,
+                    src_raw=raw_dir / f"{source_id}.raw.glb",
+                    raw_dir=raw_dir,
+                    opt_dir=opt_dir,
+                    source_id=source_id,
+                )
+        finally:
+            mesh_jobs.unmark_queued(slot, node.id)
 
     # Apply the scene grouping. Seed this version's log with each decision so regen
     # / resolve_group / the reuse-images fork read the grouping from here, while
@@ -1557,14 +1566,20 @@ async def propagate_reuses(
     the gather."""
     raw_dir, opt_dir = generated_dirs(runs_dir, run_id)
     src_raw = raw_dir / f"{canonical_id}.raw.glb"
+    slot = logging.current_slot_id()
 
     async def _one(node: Node) -> None:
         # Lock per reuse so a concurrent whole-scene generate (or another regen)
-        # of the same node can't write its files at the same time.
-        async with node_lock(run_id, node.id):
-            await _rescale_reuse_from_raw(
-                node, src_raw=src_raw, raw_dir=raw_dir, opt_dir=opt_dir, source_id=canonical_id,
-            )
+        # of the same node can't write its files at the same time. Surfaces in the
+        # queue panel nested under its canonical while it re-derives.
+        mesh_jobs.mark_processing(slot, node.id, canonical=canonical_id)
+        try:
+            async with node_lock(run_id, node.id):
+                await _rescale_reuse_from_raw(
+                    node, src_raw=src_raw, raw_dir=raw_dir, opt_dir=opt_dir, source_id=canonical_id,
+                )
+        finally:
+            mesh_jobs.unmark_queued(slot, node.id)
 
     coros = [_one(node) for node in reuses]
     if coros:

@@ -23,11 +23,11 @@ The user message contains this region's id, prompt, bbox, and description, plus 
 <output>
 Respond with a single JSON object containing:
 - `subregions` (list): the subregions this region decomposes into. Each child has:
-  - `id` (string): unique within the entire scene
-  - `prompt` (string): a short description of the purpose of this subregion
-  - `placement` (string): one string describing where this child sits within the scene relative to other regions and objects around it. This placement should NOT contain any precise coordinates, which will all be resolved later through a downstream solver step; it should only be a semantic spatial description of where the subregion is located. Think very deeply about where each region should lie spatially and designing the placement string for it.
-  - `relationships` (list of {target, kind}): OPTIONAL spatial relationships to other already-placed nodes to assist in the downstream spatial resolver step. Think very deeply and precisely about what each of these relationships with other objects is spatially. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT repeat the parent here.
-  - `proxy_shape` (string): `BOX` when the region's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectangular.
+  - `id` (string): a unique name describing this subregion within the entire scene. shouldn't overlap with any other existing regions or objects.
+  - `prompt` (string): a short seed describing what this subregion is.
+  - `placement` (string): a short sentence describing where this subregion sits within the scene relative to other regions and objects around it. should not contain precise coordinates or dimensions, it should only be a semantic spatial description of where the subregion is located.
+  - `relationships` (list of {target, kind}): spatial relationships to other subregions you output in your list to assist the downstream step that determines the exact coordinates and dimensions of this subregion. Each entry has a `target` (the peer's id) and a `kind` — one of ON, BESIDE, ABOVE, BELOW, ATTACHED, IN. Do NOT include the parent region in this list as it is redundant information; the downstream step will already know this subregion is a child of the larger parent region.
+  - `proxy_shape` (string): the rough shape that the subregion takes overall. `BOX` when the region's silhouette is a rectangular prism (the default), or `SPHERE` / `CAPSULE` / `HEMISPHERE` when it is non-rectangular.
 
 No additional prose, markdown, or code fences.
 </output>

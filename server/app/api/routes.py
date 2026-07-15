@@ -2894,9 +2894,10 @@ def create_app() -> FastAPI:
         destination group (we resolve it to that group's canonical); `node_id`
         becomes a reuse of it and its mesh is re-derived from the canonical's raw
         (rescaled into `node_id`'s own bbox/orientation) — no Nano-Banana, no mesh
-        backend, so it's effectively instant. If `node_id` was itself a prefab
-        canonical with reuses, those reuses move into the destination group too, so
-        the flat prefab star is preserved. With `group=true` the ENTIRE source group
+        backend, so it's effectively instant. SOLO by default: only `node_id`
+        moves — if it was its group's canonical with reuses, the group is first
+        handed off to a surviving reuse (like unlink) so its siblings stay put and
+        the flat prefab star stays valid. With `group=true` the ENTIRE source group
         (canonical + every reuse) moves into the destination, even when `node_id` is
         a reuse — its old canonical and siblings come along. Runs on the SAME
         per-version worker as regenerate/symmetrize, serialized per group via the
@@ -5038,25 +5039,15 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     gen_log.log("symmetry.applied", id=dst_id, cut_plane=cp, **extra)
                 break
 
-    async def _do_unlink(node_id: str, node: Node) -> None:
-        """Pull `node_id` out of its prefab group into a STANDALONE asset with its
-        OWN raw mesh, WITHOUT rebuilding it — so it stops sharing and the user can
-        then regenerate it alone. A reuse clones its canonical's raw (inheriting its
-        geometry + symmetry) and is promoted to its own canonical; its served mesh,
-        already derived from that same raw, stays valid. A canonical WITH reuses
-        hands the group off to one of those reuses — that reuse inherits `node_id`'s
-        raw (via `clone_canonical_raw`) + symmetry and the rest are repointed to it,
-        while `node_id` stays standalone with its own raw. A lone canonical is
-        already independent."""
+    async def _handoff_canonical(node_id: str, reuse_ids: list[str]) -> None:
+        """Hand `node_id`'s canonical role off to one of its reuses so the
+        ORIGINAL group survives intact when `node_id` leaves it — a solo unlink OR
+        a solo link into another group. The first reuse clones `node_id`'s raw (+
+        its symmetry) and is promoted to canonical; the rest repoint to it. Their
+        served meshes already derive from that same raw, so none rebuild. A no-op
+        when there are no reuses to promote (a lone canonical is already
+        standalone)."""
         assert lib_log is not None
-        canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
-        if canonical_id != node_id:
-            await generation.clone_canonical_raw(
-                runs_dir=RUNS_DIR, run_id=run_id, source_id=canonical_id, dest_id=node_id,
-            )
-            _carry_symmetry(canonical_id, node_id)
-            gen_log.log("prefab.match", id=node_id, reuse_id="", description=node.prompt)
-            return
         if not reuse_ids:
             return
         new_canon = reuse_ids[0]
@@ -5076,14 +5067,38 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                 description=rnode.prompt if rnode else "",
             )
 
+    async def _do_unlink(node_id: str, node: Node) -> None:
+        """Pull `node_id` out of its prefab group into a STANDALONE asset with its
+        OWN raw mesh, WITHOUT rebuilding it — so it stops sharing and the user can
+        then regenerate it alone. A reuse clones its canonical's raw (inheriting its
+        geometry + symmetry) and is promoted to its own canonical; its served mesh,
+        already derived from that same raw, stays valid. A canonical WITH reuses
+        hands the group off to one of those reuses — that reuse inherits `node_id`'s
+        raw (via `clone_canonical_raw`) + symmetry and the rest are repointed to it,
+        while `node_id` stays standalone with its own raw. A lone canonical is
+        already independent."""
+        assert lib_log is not None
+        canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
+        if canonical_id != node_id:
+            await generation.clone_canonical_raw(
+                runs_dir=RUNS_DIR, run_id=run_id, source_id=canonical_id, dest_id=node_id,
+            )
+            _carry_symmetry(canonical_id, node_id)
+            gen_log.log("prefab.match", id=node_id, reuse_id="", description=node.prompt)
+            return
+        # A canonical WITH reuses hands the group off to one of them; a lone
+        # canonical is already standalone (the helper no-ops).
+        await _handoff_canonical(node_id, reuse_ids)
+
     async def _do_link(node_id: str, target_id: str, *, link_group: bool = False) -> None:
         """Link `node_id` INTO the prefab group of `target_id` (any group member;
         resolved to that group's canonical), re-deriving its mesh from the
-        canonical's raw. If `node_id` was itself a canonical with reuses, those
-        reuses come along so the flat prefab star is preserved. With
-        `link_group=True` the entire SOURCE group (canonical + every reuse) moves
-        into the destination — even when `node_id` is a reuse, its old canonical
-        and siblings come along too."""
+        canonical's raw. SOLO by default: ONLY `node_id` moves — if it is its
+        group's canonical with reuses, the original group is first handed off to a
+        surviving reuse (like unlink) so its siblings stay put and the flat prefab
+        star stays valid. With `link_group=True` the entire SOURCE group (canonical
+        + every reuse) moves into the destination — even when `node_id` is a reuse,
+        its old canonical and siblings come along too."""
         assert lib_log is not None
         dest_canonical, _ = prefabs.resolve_group(gen_log.state["events"], target_id)
         async with canon_locks.setdefault(dest_canonical, asyncio.Lock()):
@@ -5099,9 +5114,14 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                 return
             if link_group:
                 mover_ids = [own_canonical, *own_reuses]
-            elif own_canonical == node_id:
-                mover_ids = [node_id, *own_reuses]
             else:
+                # Solo link: ONLY node_id moves. If it is its group's canonical
+                # with reuses, hand the ORIGINAL group off to a surviving reuse
+                # first (like unlink) so the siblings we're NOT moving stay intact
+                # — moving the canonical alone would otherwise orphan its reuses
+                # onto a node that is now itself a reuse (breaking the flat star).
+                if own_canonical == node_id and own_reuses:
+                    await _handoff_canonical(node_id, own_reuses)
                 mover_ids = [node_id]
             movers = [
                 n for mid in mover_ids if (n := _reconstruct_node(lib_log, mid)) is not None

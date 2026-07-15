@@ -1338,7 +1338,7 @@ function teardownCard3d(ref) {
 function diffInputSection(label, oldUser, newUser) {
   const pre = diffPre(oldUser, newUser);
   return el("div", { class: "rv-sec" },
-    el("div", { class: "lab" }, el("span", { text: label }), fitToggle(pre)),
+    el("div", { class: "lab" }, el("span", { text: label }), fitToggle(pre, { fitted: false })),
     pre,
   );
 }
@@ -1355,8 +1355,8 @@ function abOutputSection(previousOutput, result) {
       el("span", { class: changed ? "rv-changed" : "rv-unchanged", text: changed ? "● changed" : "○ unchanged" }),
     ),
     el("div", { class: "rv-ab" },
-      el("div", {}, el("div", { class: "ab-h", text: "previous" }), prevPre, fitToggle(prevPre)),
-      el("div", { class: "ab-edited" }, el("div", { class: "ab-h", text: `current · ${result.tokens_out ?? "?"} tok` }), curPre, fitToggle(curPre)),
+      el("div", {}, el("div", { class: "ab-h", text: "previous" }), prevPre, fitToggle(prevPre, { fitted: false })),
+      el("div", { class: "ab-edited" }, el("div", { class: "ab-h", text: `current · ${result.tokens_out ?? "?"} tok` }), curPre, fitToggle(curPre, { fitted: false })),
     ),
   );
 }
@@ -1385,7 +1385,7 @@ function updateReviewTestSummary() {
 function reviewSection(label, text) {
   const pre = el("pre", { text });
   return el("div", { class: "rv-sec" },
-    el("div", { class: "lab" }, el("span", { text: label }), fitToggle(pre)),
+    el("div", { class: "lab" }, el("span", { text: label }), fitToggle(pre, { fitted: false })),
     pre,
   );
 }
