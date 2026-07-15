@@ -1,40 +1,37 @@
 """Stage 4 — Coverage camera planner (feature-adaptive patches + greedy set-cover).
 
 Picks the fewest camera POSITIONS in free space so every visible surface patch is
-seen from ≥ K distinct cameras, close enough to meet a feature-adaptive footprint
-budget. Per the overview (§5 Stage 4): the output feeds Stage 5 (reference renders)
-and yields the occlusion-cull list as a byproduct.
+seen from ≥ K distinct azimuthal sectors, close enough to meet a feature-adaptive
+footprint budget. The output feeds Stage 5 (reference renders) and yields the
+occlusion-cull list as a byproduct.
 
-Self-contained (like stage1/2/3): takes explicit paths; the server resolves the
-cell and de-optimizes a library build to vanilla first. One surface-sampling pass
-drives everything — occupancy grid, clearance field, adaptive patches, candidates.
+CONNECTED (Option A): Stage 4 consumes the outputs of the earlier stages and loads
+NO meshes and computes NO occupancy of its own —
+  * **Stage 2 free-space grid** (`freespace.npz`): candidate camera positions
+    (reachable free cells with enough clearance) + the fine occupancy the
+    line-of-sight ray-march uses. No re-voxelization.
+  * **Stage 3 surfel cloud** (`cloud.ply`): the patch source. Patches are a
+    feature-adaptive thinning of the surfels, whose normals were already oriented to
+    free space in Stage 3 — so the front-facing test is reliable regardless of the
+    mesh's original winding.
 
 Pipeline:
-  1. Sample the placed meshes (blue-noise) → points + normals + triangle areas.
-  2. Feature-adaptive PATCHES: target spacing s(x) shrinks with local detail
-     (curvature via normal variance, and triangle size); denser where detail is,
-     so the plan captures the scene's real fidelity. (Texture-gradient detail —
-     the "busy wallpaper" case — is the next signal to add.)
-  3. Occupancy + clearance over the scene AABB PLUS an exterior margin, so cameras
-     can also see the outer silhouette (both faces of a dividing wall, etc. — only
-     genuinely buried surface is culled).
-  4. CANDIDATE positions = safe free voxels (clearance ≥ collision_clearance),
-     denser where clearance is small.
-  5. COVERAGE: a candidate covers a patch if it's front-facing, within the patch's
-     feature-scaled view distance, and has line-of-sight (voxel ray-march on the
-     occupancy grid — no mesh raycasting). Cubemaps mean orientation isn't a
-     variable, so a covered patch lands on some face.
-  6. GREEDY multicover (sparse mat-vec): repeatedly take the candidate covering the
-     most still-under-covered patches until all visible patches hit K, or no gain
-     remains (the rest → occlusion-cull list).
+  1. Read the surfel cloud → points + oriented normals + albedo.
+  2. Feature-adaptive PATCHES: spacing shrinks with local detail (curvature via
+     normal variance, texture via albedo variance); denser where detail is.
+  3. CANDIDATE positions = reachable free cells (Stage 2) with clearance ≥
+     collision_clearance, subsampled denser where clearance is small.
+  4. COVERAGE: a candidate covers a patch if front-facing, within the patch's
+     feature-scaled view distance, and unoccluded (fine-grid ray-march). Cubemaps
+     mean orientation isn't a variable, so a covered patch lands on some face.
+  5. GREEDY multicover until every visible patch hits K sectors + a near view.
 
 Output: `cameras.json` — a shared cube-face `intrinsics` block (90° FOV, render
-resolution, and the footprint budget DERIVED from them), the six `cube_faces`, and
-the chosen camera POSITIONS, each tagged with the cube faces worth rendering +
-coverage — plus `patches.bin` (packed float32 [x,y,z, nx,ny,nz, feature_scale,
-covered_count] per patch) and a summary. The plan is CUBEMAP-NATIVE: each position
-renders as up to six 90° pinhole faces in Stage 5, so no single look direction is
-emitted.
+resolution, DERIVED footprint budget), the six `cube_faces`, and the chosen camera
+POSITIONS each tagged with the cube faces worth rendering + coverage — plus
+`patches.bin` (packed float32 [x,y,z, nx,ny,nz, feature_scale, sectors_seen] per
+patch) and a summary. CUBEMAP-NATIVE: each position renders as up to six 90° pinhole
+faces in Stage 5, so no single look direction is emitted.
 """
 
 from __future__ import annotations
@@ -48,18 +45,20 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import trimesh
-from scipy import ndimage
 from scipy.spatial import cKDTree
 
-from splat import stage2  # per-texel albedo for the texture-detail signal
+from splat.stage2 import FreeSpace, load_free_space
 
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 CAMERAS_NAME = "cameras.json"
 PATCHES_NAME = "patches.bin"
+PATCH_VIEWS_NAME = "patch_views.json"
 
-# progress(done, total, current_id) — called during the surface-sampling pass.
+# SH degree-0 basis constant (matches Stage 3): colour = 0.5 + C0 * f_dc.
+_SH_C0 = 0.28209479177387814
+
+# progress(done, total, current_id) — called during the coverage build.
 ProgressCb = Callable[[int, int, str], None]
 
 # The six cube-map faces a camera POSITION renders in Stage 5: outward view
@@ -79,33 +78,25 @@ CUBE_FACES: dict[str, dict[str, list[float]]] = {
 
 @dataclass(frozen=True)
 class PlanParams:
-    """Stage-4 knobs (overview §9). Defaults target a room-scale cell."""
+    """Stage-4 knobs (overview §9). Defaults target a room-scale cell. Occupancy
+    pitch/margin now live in the Stage-2 grid, not here."""
 
     patch_min_spacing: float = 0.06   # s_min (m): finest patch spacing = footprint detail
     patch_max_spacing: float = 0.30   # s_max (m): flat-region patch spacing
     curvature_k: float = 14.0         # curvature → spacing sensitivity
-    tri_k: float = 3.0                # triangle-size → spacing sensitivity
     tex_k: float = 8.0                # texture-gradient → spacing sensitivity
     collision_clearance: float = 0.25  # cameras stay ≥ this from any surface (m)
-    margin: float = 1.5               # exterior play-volume margin around the AABB (m)
-    pitch: float = 0.12               # occupancy / visibility voxel size (m)
     angles_per_patch: int = 3         # K: distinct viewing ANGLES (sectors) per patch
     angular_sectors: int = 8          # azimuthal quantization around the patch normal
     near_frac: float = 0.5            # a "near" (detail) view is within near_frac*view_dist
     min_gain: int = 1                 # stop once the best camera adds < this many
-                                      # new patch-satisfactions (truncates the
-                                      # diminishing tail; 1 = cover all reachable)
-    max_candidates: int = 5000        # cap on candidate camera positions (more =
-                                      # more coverage of hard-to-reach patches)
-    # Cube-face reference-render intrinsics (SHARED with Stage 5). A cubemap tiles
-    # every direction with six square 90° faces, so face_fov_deg is fixed at 90;
-    # render_resolution is each face's pixel size and min_px_per_patch the sharpness
-    # target. footprint_k (hence view_dist) is DERIVED from these (see the property)
-    # so the plan's coverage distances match exactly what Stage 5 renders, instead
-    # of a magic constant that silently bakes in an assumed resolution/FOV.
-    face_fov_deg: float = 90.0        # cubemap face FOV; keep at 90 (six faces tile 360°)
-    render_resolution: int = 512      # each cube face is R×R px (overview §12: 512–1024)
-    min_px_per_patch: float = 10.0    # a patch must span ≥ this many px in its best view
+    max_candidates: int = 5000        # cap on candidate camera positions
+    # Cube-face reference-render intrinsics (SHARED with Stage 5). FOV fixed at 90°
+    # (six faces tile 360°); footprint_k (hence view_dist) is DERIVED from the render
+    # resolution + min_px_per_patch so coverage distances match what Stage 5 renders.
+    face_fov_deg: float = 90.0
+    render_resolution: int = 512
+    min_px_per_patch: float = 10.0
     view_dist_min: float = 0.5        # (m)
     view_dist_max: float = 4.0        # (m)
     seed: int = 0
@@ -118,10 +109,8 @@ class PlanParams:
 
     @property
     def footprint_k(self) -> float:
-        """view_dist = footprint_k * feature_scale. Derived so a patch of size s
-        seen at view_dist spans exactly `min_px_per_patch` pixels: inverting
-        px ≈ focal_px * s / d at px = min_px_per_patch gives
-        d = (focal_px / min_px_per_patch) * s."""
+        """view_dist = footprint_k * feature_scale. Derived so a patch of size s seen
+        at view_dist spans exactly `min_px_per_patch` pixels."""
         return self.focal_px / self.min_px_per_patch
 
     def as_summary(self) -> dict[str, Any]:
@@ -129,8 +118,6 @@ class PlanParams:
             "patch_min_spacing": self.patch_min_spacing,
             "patch_max_spacing": self.patch_max_spacing,
             "collision_clearance": self.collision_clearance,
-            "margin": self.margin,
-            "pitch": self.pitch,
             "angles_per_patch": self.angles_per_patch,
             "angular_sectors": self.angular_sectors,
             "near_frac": self.near_frac,
@@ -142,103 +129,58 @@ class PlanParams:
         }
 
 
-def _iter_geoms(mesh: trimesh.Trimesh | trimesh.Scene) -> list[trimesh.Trimesh]:
-    if isinstance(mesh, trimesh.Scene):
-        return [g for g in mesh.geometry.values() if hasattr(g, "faces")]
-    return [mesh]
-
-
-def placed_object_ids(raw_dir: Path) -> list[str]:
-    return sorted(
-        p.name[: -len(".glb")]
-        for p in raw_dir.glob("*.glb")
-        if not p.name.endswith(".raw.glb")
-    )
-
-
-def _sample_surface(
-    raw_dir: Path, ids: list[str], s_min: float, progress: ProgressCb | None
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Blue-noise sample every placed mesh at ~s_min. Returns (points, normals,
-    tri_area, albedo, aabb_min, aabb_max) — the shared pass that seeds everything.
-    Albedo (per-texel base colour) feeds the texture-detail signal."""
-    pos_parts: list[np.ndarray] = []
-    nrm_parts: list[np.ndarray] = []
-    area_parts: list[np.ndarray] = []
-    col_parts: list[np.ndarray] = []
-    lo = np.array([np.inf, np.inf, np.inf])
-    hi = np.array([-np.inf, -np.inf, -np.inf])
-    total = len(ids)
-    for done, node_id in enumerate(ids, start=1):
-        try:
-            m = trimesh.load(raw_dir / f"{node_id}.glb", process=False)
-            for g in _iter_geoms(m):
-                if len(g.faces) == 0 or g.area <= 0:
-                    continue
-                b = np.asarray(g.bounds, dtype=float)
-                lo, hi = np.minimum(lo, b[0]), np.maximum(hi, b[1])
-                n = int(g.area / (s_min * s_min) * 1.5) + 8
-                try:
-                    pts, fidx = trimesh.sample.sample_surface_even(g, n, radius=s_min)
-                except Exception:
-                    pts, fidx = trimesh.sample.sample_surface(g, n)
-                if len(pts) == 0:
-                    continue
-                fidx = np.asarray(fidx)
-                pts = np.asarray(pts, dtype=np.float32)
-                nrm = np.asarray(g.face_normals[fidx], dtype=np.float64)
-                ln = np.linalg.norm(nrm, axis=1, keepdims=True)
-                ln[ln == 0] = 1.0
-                try:
-                    col = stage2.surfel_colors(g, pts, fidx)[:, :3].astype(np.float32)
-                except Exception:
-                    col = np.full((len(pts), 3), 0.6, dtype=np.float32)
-                pos_parts.append(pts)
-                nrm_parts.append((nrm / ln).astype(np.float32))
-                area_parts.append(np.asarray(g.area_faces[fidx], dtype=np.float32))
-                col_parts.append(col)
-            del m
-        except Exception:
-            pass
-        if progress is not None:
-            progress(done, total, node_id)
-    if not pos_parts:
-        raise RuntimeError("no surface sampled (every mesh failed or was empty)")
-    return (
-        np.concatenate(pos_parts),
-        np.concatenate(nrm_parts),
-        np.concatenate(area_parts),
-        np.concatenate(col_parts),
-        lo,
-        hi,
-    )
+def _read_cloud(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Read a Stage-3 surfel `.ply` → (positions, unit normals, rgb in [0,1]). Handles
+    both the 2DGS (16 float/vertex, two scales) and 3DGS (17, three scales) layouts:
+    the first nine properties (xyz, normal, f_dc_0..2) are identical in both and are
+    all Stage 4 needs — only the trailing scale count differs. Normals are already
+    oriented to free space by Stage 3."""
+    raw = Path(path).read_bytes()
+    marker = b"end_header\n"
+    i = raw.find(marker)
+    if i < 0:
+        raise ValueError(f"{path} is not a binary .ply cloud")
+    header = raw[:i].decode("ascii", errors="replace")
+    n = None
+    stride = 0
+    for line in header.splitlines():
+        s = line.strip()
+        if s.startswith("element vertex"):
+            n = int(s.split()[-1])
+        elif s.startswith("property "):
+            stride += 1
+    if n is None or stride < 9:
+        raise ValueError(f"{path}: unexpected .ply header (n={n}, stride={stride})")
+    body = np.frombuffer(raw[i + len(marker):], dtype="<f4")
+    if body.size < n * stride:
+        raise ValueError(f"{path}: truncated cloud ({body.size} < {n * stride})")
+    arr = body[: n * stride].reshape(n, stride)
+    pos = arr[:, 0:3].astype(np.float64)
+    nrm = arr[:, 3:6].astype(np.float64)
+    ln = np.linalg.norm(nrm, axis=1, keepdims=True)
+    ln[ln == 0] = 1.0
+    nrm = nrm / ln
+    col = np.clip(0.5 + _SH_C0 * arr[:, 6:9], 0.0, 1.0).astype(np.float32)
+    return pos, nrm, col
 
 
 def _feature_spacing(
-    points: np.ndarray,
-    normals: np.ndarray,
-    tri_area: np.ndarray,
-    albedo: np.ndarray,
-    p: PlanParams,
+    points: np.ndarray, normals: np.ndarray, albedo: np.ndarray, p: PlanParams
 ) -> np.ndarray:
-    """Per-point target spacing s(x): small where detail is high. Combines
-    curvature (local normal variance), triangle size, and texture gradient (local
-    albedo variance — the "busy wallpaper on a flat wall" case); the densest wins."""
+    """Per-point target spacing s(x): small where detail is high. Combines curvature
+    (local normal variance) and texture gradient (local albedo variance); the densest
+    wins. (Triangle-size detail is folded into the surfel density already.)"""
     n = len(points)
     tree = cKDTree(points)
     k = min(9, n)
     _, idx = tree.query(points, k=k)
-    neigh_idx = idx[:, 1:] if k > 1 else idx  # exclude self
-    # Curvature ≈ 1 − mean cosine between a point's normal and its neighbours'.
+    neigh_idx = idx[:, 1:] if k > 1 else idx
     cos = np.clip(np.einsum("nkc,nc->nk", normals[neigh_idx], normals), -1.0, 1.0)
-    curv = 1.0 - cos.mean(axis=1)  # 0 flat → ~2 sharp
+    curv = 1.0 - cos.mean(axis=1)
     s_curv = p.patch_max_spacing / (1.0 + p.curvature_k * curv)
-    # Small source triangle ⇒ fine detail in the original mesh.
-    s_tri = p.tri_k * np.sqrt(np.maximum(tri_area, 1e-9))
-    # Texture gradient ≈ local albedo variation among neighbours (per-channel std).
     tex_var = albedo[neigh_idx].std(axis=1).mean(axis=1)
     s_tex = p.patch_max_spacing / (1.0 + p.tex_k * tex_var)
-    s = np.minimum(np.minimum(s_curv, s_tri), s_tex)
+    s = np.minimum(s_curv, s_tex)
     return np.clip(s, p.patch_min_spacing, p.patch_max_spacing).astype(np.float32)
 
 
@@ -249,52 +191,23 @@ def _adaptive_patches(
     s_min: float,
     rng: np.random.Generator,
 ) -> np.ndarray:
-    """Thin the dense blue-noise sample to feature-adaptive density: keep point i
-    with probability (s_min / s_i)^2, so flat regions get sparse patches and
-    detailed regions keep (near-)all of theirs. Returns the kept indices."""
+    """Thin the dense surfel set to feature-adaptive density: keep point i with
+    probability (s_min / s_i)^2, so flat regions get sparse patches and detailed
+    regions keep (near-)all of theirs. Returns the kept indices."""
     keep_p = np.clip((s_min / spacing) ** 2, 0.0, 1.0)
     keep = rng.random(len(points)) < keep_p
     return np.nonzero(keep)[0]
 
 
-def _occupancy_clearance(
-    points: np.ndarray, lo: np.ndarray, hi: np.ndarray, pitch: float, margin: float
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Solid/empty grid (from binned surface points) + clearance field (EDT, m)
-    over the AABB grown by `margin` (so exterior cameras exist). Returns
-    (occupancy, clearance, origin)."""
-    origin = lo - margin
-    dims = np.ceil((hi - lo + 2 * margin) / pitch).astype(int) + 1
-    dims = np.maximum(dims, 1)
-    nx, ny, nz = (int(dims[0]), int(dims[1]), int(dims[2]))
-    idx = np.floor((points - origin) / pitch).astype(np.int64)
-    inb = np.all((idx >= 0) & (idx < dims), axis=1)
-    idx = idx[inb]
-    occ = np.zeros((nx, ny, nz), dtype=bool)
-    occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
-    clearance = ndimage.distance_transform_edt(~occ).astype(np.float32) * pitch
-    return occ, clearance, origin
-
-
-def _candidates(
-    occ: np.ndarray,
-    clearance: np.ndarray,
-    origin: np.ndarray,
-    pitch: float,
-    p: PlanParams,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Candidate camera positions: free voxels with clearance ≥ collision_clearance,
-    subsampled to ≤ max_candidates with weight ∝ 1/clearance² (denser near
-    surfaces, where more/closer vantages are needed). Returns (M,3) world points."""
-    free = (~occ) & (clearance >= p.collision_clearance)
-    cells = np.argwhere(free)
-    if len(cells) == 0:
+def _candidates(fs: FreeSpace, p: PlanParams, rng: np.random.Generator) -> np.ndarray:
+    """Candidate camera positions: reachable free cells (Stage 2) with clearance ≥
+    collision_clearance, subsampled to ≤ max_candidates with weight ∝ 1/clearance²
+    (denser near surfaces). Returns (M,3) world points."""
+    centers, clv = fs.free_candidates(p.collision_clearance)
+    if len(centers) == 0:
         return np.zeros((0, 3), dtype=np.float32)
-    centers = (origin + (cells + 0.5) * pitch).astype(np.float32)
     if len(centers) > p.max_candidates:
-        cl = clearance[free]
-        w = 1.0 / np.maximum(cl, pitch) ** 2
+        w = 1.0 / np.maximum(clv, fs.pitch) ** 2
         w /= w.sum()
         pick = rng.choice(len(centers), size=p.max_candidates, replace=False, p=w)
         centers = centers[pick]
@@ -302,33 +215,23 @@ def _candidates(
 
 
 def _visible(
-    cam: np.ndarray,
-    patch_pos: np.ndarray,
-    occ: np.ndarray,
-    origin: np.ndarray,
-    pitch: float,
-    n_steps: int,
+    cam: np.ndarray, patch_pos: np.ndarray, fs: FreeSpace, n_steps: int
 ) -> np.ndarray:
-    """Line-of-sight from one camera to many patches: True where no solid voxel
-    lies strictly between them. Samples n_steps points along each segment (spacing
-    ≤ pitch for in-range patches) and skips the endpoints (camera cell, patch's own
-    surface cell)."""
+    """Line-of-sight from one camera to many patches: True where no solid FINE voxel
+    lies strictly between them. Samples n_steps points along each segment and skips
+    the endpoints (camera cell, patch's own surface cell)."""
     m = len(patch_pos)
     if m == 0:
         return np.zeros(0, dtype=bool)
-    d = patch_pos - cam  # (m,3)
+    d = patch_pos - cam
     dist = np.linalg.norm(d, axis=1)
     dist = np.where(dist < 1e-6, 1e-6, dist)
     t = np.linspace(0.0, 1.0, n_steps)  # (K,)
     pts = cam[None, None, :] + t[None, :, None] * d[:, None, :]  # (m,K,3)
-    idx = np.floor((pts - origin) / pitch).astype(np.int64)  # (m,K,3)
-    dims = np.array(occ.shape)
-    idx = np.clip(idx, 0, dims - 1)
-    hit = occ[idx[:, :, 0], idx[:, :, 1], idx[:, :, 2]]  # (m,K)
-    # Only count samples strictly between the endpoints: skip ~1 voxel from the
-    # camera and ~1.5 voxels before the patch (its own surface voxel).
-    tvalid = (t[None, :] > (pitch / dist)[:, None]) & (
-        t[None, :] < 1.0 - (1.5 * pitch / dist)[:, None]
+    hit = fs.fine_occupied(pts.reshape(-1, 3)).reshape(m, n_steps)  # (m,K)
+    pf = fs.pitch_fine
+    tvalid = (t[None, :] > (pf / dist)[:, None]) & (
+        t[None, :] < 1.0 - (1.5 * pf / dist)[:, None]
     )
     return ~(hit & tvalid).any(axis=1)
 
@@ -354,16 +257,15 @@ def _build_coverage(
     view_dist: np.ndarray,
     t1: np.ndarray,
     t2: np.ndarray,
-    occ: np.ndarray,
-    origin: np.ndarray,
+    fs: FreeSpace,
     p: PlanParams,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Covering (candidate, patch) pairs, each tagged with the azimuthal SECTOR the
     camera views the patch from and whether it's a NEAR (detail-distance) view. A
-    pair exists if the camera is front-facing, within the patch's view distance,
-    and unoccluded. Returns COO arrays (cand_idx, patch_idx, sector, is_near)."""
+    pair exists if the camera is front-facing, within the patch's view distance, and
+    unoccluded. Returns COO arrays (cand_idx, patch_idx, sector, is_near)."""
     tree = cKDTree(patch_pos)
-    n_steps = int(np.ceil(p.view_dist_max / p.pitch)) + 2
+    n_steps = int(np.ceil(p.view_dist_max / fs.pitch_fine)) + 2
     a = p.angular_sectors
     cc: list[np.ndarray] = []
     pp: list[np.ndarray] = []
@@ -381,11 +283,10 @@ def _build_coverage(
         cand, cdist = idx[sel], dist[sel]
         if len(cand) == 0:
             continue
-        vis = _visible(cam, patch_pos[cand], occ, origin, p.pitch, n_steps)
+        vis = _visible(cam, patch_pos[cand], fs, n_steps)
         hit, hdist = cand[vis], cdist[vis]
         if len(hit) == 0:
             continue
-        # Azimuth of the patch→camera direction in each patch's tangent frame.
         vd = (cam - patch_pos[hit]) / hdist[:, None]
         az = np.arctan2(
             np.einsum("mc,mc->m", vd, t2[hit]), np.einsum("mc,mc->m", vd, t1[hit])
@@ -418,20 +319,19 @@ def _greedy_angular(
     a: int,
 ) -> tuple[list[int], np.ndarray, np.ndarray]:
     """Greedy coverage where a patch is satisfied by ≥ k DISTINCT azimuthal sectors
-    AND ≥ 1 near view. Each step takes the camera advancing the most patches (adding
-    a new sector, or the missing near view); stops below `min_gain`. Returns (chosen
-    candidate indices, per-patch sector bitmask, per-patch has-near)."""
+    AND ≥ 1 near view. Each step takes the camera advancing the most patches; stops
+    below `min_gain`. Returns (chosen candidate indices, sector bitmask, has-near)."""
     angmask = np.zeros(n_patch, dtype=np.int64)
     hasnear = np.zeros(n_patch, dtype=bool)
     lut = np.array([bin(i).count("1") for i in range(1 << a)], dtype=np.int16)
-    pair_bit = np.int64(1) << sector  # (nnz,) the sector bit each pair would set
+    pair_bit = np.int64(1) << sector
     taken = np.zeros(n_cand, dtype=bool)
     chosen: list[int] = []
     while True:
-        pop = lut[angmask[pp]]                          # distinct sectors so far
+        pop = lut[angmask[pp]]
         new_sector = (angmask[pp] & pair_bit) == 0
-        ang_contrib = new_sector & (pop < k)            # adds a still-needed sector
-        near_contrib = is_near & (~hasnear[pp])         # supplies the missing near view
+        ang_contrib = new_sector & (pop < k)
+        near_contrib = is_near & (~hasnear[pp])
         contrib = ang_contrib | near_contrib
         if not contrib.any():
             break
@@ -464,55 +364,60 @@ def plan_cameras(
     run: str,
     slot: str,
     model: str,
-    raw_dir: Path,
+    freespace_path: Path,
+    surfels_path: Path,
     out_path: Path,
     params: PlanParams = PlanParams(),
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
-    """Plan coverage cameras for one cell; write `cameras.json` (to `out_path`) +
-    `patches.bin` (beside it) and return a summary."""
-    if not raw_dir.is_dir():
-        raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
-    ids = placed_object_ids(raw_dir)
-    if not ids:
-        raise FileNotFoundError(f"no placed meshes in {raw_dir}")
+    """Plan coverage cameras for one cell from the Stage-2 free-space grid
+    (`freespace_path`) + Stage-3 surfel cloud (`surfels_path`); write `cameras.json`
+    (to `out_path`) + `patches.bin` (beside it) and return a summary."""
+    if not Path(freespace_path).is_file():
+        raise FileNotFoundError(f"free-space grid not found: {freespace_path} (run Stage 2)")
+    if not Path(surfels_path).is_file():
+        raise FileNotFoundError(f"surfel cloud not found: {surfels_path} (run Stage 3)")
     rng = np.random.default_rng(params.seed)
 
-    points, normals, tri_area, albedo, lo, hi = _sample_surface(
-        raw_dir, ids, params.patch_min_spacing, progress
-    )
+    if progress is not None:
+        progress(0, 3, "load")
+    fs = load_free_space(Path(freespace_path))
+    points, normals, albedo = _read_cloud(Path(surfels_path))
+    lo = points.min(axis=0)
+    hi = points.max(axis=0)
 
-    # Feature-adaptive patches (curvature + triangle size + texture gradient).
-    spacing = _feature_spacing(points, normals, tri_area, albedo, params)
+    # Feature-adaptive patches (curvature + texture gradient) from the surfels.
+    if progress is not None:
+        progress(1, 3, "patches")
+    spacing = _feature_spacing(points, normals, albedo, params)
     keep = _adaptive_patches(points, normals, spacing, params.patch_min_spacing, rng)
-    patch_pos = points[keep]
-    patch_nrm = normals[keep]
+    patch_pos = points[keep].astype(np.float32)
+    patch_nrm = normals[keep].astype(np.float32)
     patch_feat = spacing[keep]
     t1, t2 = _tangent_frames(patch_nrm)
     view_dist = np.clip(
         params.footprint_k * patch_feat, params.view_dist_min, params.view_dist_max
     ).astype(np.float32)
 
-    # Occupancy + clearance (+ exterior margin) and candidate camera positions.
-    occ, clearance, origin = _occupancy_clearance(
-        points, lo, hi, params.pitch, params.margin
-    )
-    candidates = _candidates(occ, clearance, origin, params.pitch, params, rng)
+    # Candidate camera positions from the reachable free space (no re-voxelization).
+    candidates = _candidates(fs, params, rng)
     if len(candidates) == 0:
-        raise RuntimeError("no candidate camera positions (free space empty)")
+        raise RuntimeError("no candidate camera positions (reachable free space empty)")
 
     # Coverage (per-pair sector + near) + angular greedy.
+    if progress is not None:
+        progress(2, 3, "coverage")
     n_patch = len(patch_pos)
     k = params.angles_per_patch
     a = params.angular_sectors
     cc, pp, sector, is_near = _build_coverage(
-        candidates, patch_pos, patch_nrm, view_dist, t1, t2, occ, origin, params
+        candidates, patch_pos, patch_nrm, view_dist, t1, t2, fs, params
     )
     chosen, angmask, hasnear = _greedy_angular(
         cc, pp, sector, is_near, len(candidates), n_patch, k, params.min_gain, a
     )
 
-    # Per-patch stats: distinct angles seen, and satisfaction (≥K angles + a near view).
+    # Per-patch stats: distinct angles seen, and satisfaction (≥K angles + near view).
     lut = np.array([bin(i).count("1") for i in range(1 << a)], dtype=np.int16)
     sectors_seen = lut[angmask].astype(np.int32)
     satisfied_mask = (sectors_seen >= k) & hasnear
@@ -524,28 +429,30 @@ def plan_cameras(
     occluded = int((~seen_any).sum())
 
     # Per-camera cube faces + coverage count (group the COO pairs by candidate).
-    # CUBEMAP-NATIVE: each chosen POSITION renders as up to six 90° pinhole faces in
-    # Stage 5; we emit only the faces that actually saw covered patches (the rest
-    # stare into void/backfaces), so Stage 5 can skip rendering empty faces.
+    # CUBEMAP-NATIVE: emit only the faces that actually saw covered patches. Also
+    # build the per-patch VIEW INDEX (patch → [(camera_index, face_index), …]) so the
+    # debug viewer can map a selected surface patch to its Stage-5 reference images.
     cameras: list[dict[str, Any]] = []
+    patch_views: list[list[list[int]]] = [[] for _ in range(n_patch)]
     if len(cc):
         order = np.argsort(cc, kind="stable")
         cc_s, pp_s = cc[order], pp[order]
-        for ci in chosen:
+        for out_idx, ci in enumerate(chosen):
             a0 = int(np.searchsorted(cc_s, ci, "left"))
             a1 = int(np.searchsorted(cc_s, ci, "right"))
             seen = pp_s[a0:a1]
             cam = candidates[ci]
             faces: list[dict[str, Any]] = []
             if len(seen):
-                counts = np.bincount(
-                    _face_of(patch_pos[seen] - cam), minlength=len(CUBE_FACE_NAMES)
-                )
+                face_idx = _face_of(patch_pos[seen] - cam)  # per-seen-patch face
+                counts = np.bincount(face_idx, minlength=len(CUBE_FACE_NAMES))
                 faces = [
                     {"dir": CUBE_FACE_NAMES[i], "covers": int(counts[i])}
                     for i in range(len(CUBE_FACE_NAMES))
                     if counts[i] > 0
                 ]
+                for p, fi in zip(seen.tolist(), face_idx.tolist()):
+                    patch_views[p].append([out_idx, fi])
             cameras.append(
                 {
                     "pos": [round(float(v), 4) for v in cam],
@@ -554,8 +461,18 @@ def plan_cameras(
                 }
             )
 
-    # patches.bin: [x,y,z, nx,ny,nz, feature_scale, sectors_seen] × N (the viewer
-    # colours each patch by how many distinct angles saw it; 0 = occlusion-culled).
+    # patch_views.json: for each patch (index matches patches.bin row order), the
+    # list of [camera_index, face_index] that cover it — face_index into `faces`.
+    # camera_index matches Stage 5's `cam{index:05d}_{face}` render ids.
+    patch_views_path = out_path.with_name(PATCH_VIEWS_NAME)
+    tmp_pv = patch_views_path.with_suffix(patch_views_path.suffix + ".tmp")
+    tmp_pv.write_text(
+        json.dumps({"faces": list(CUBE_FACE_NAMES), "views": patch_views}),
+        encoding="utf-8",
+    )
+    tmp_pv.replace(patch_views_path)
+
+    # patches.bin: [x,y,z, nx,ny,nz, feature_scale, sectors_seen] × N.
     pdata = np.concatenate(
         [
             patch_pos.astype("<f4"),
@@ -591,11 +508,10 @@ def plan_cameras(
         "params": params.as_summary(),
     }
 
-    # Shared cube-face intrinsics Stage 5 renders with (and Stage 6 trains against):
-    # FOV is fixed at 90°, so `resolution` alone sets sharpness and `footprint_k` is
-    # the derived value the plan above actually used. near < collision_clearance so a
-    # surface at the clearance limit isn't clipped; far spans the padded play volume.
-    padded_ext = (hi - lo) + 2.0 * params.margin
+    # Shared cube-face intrinsics Stage 5 renders with (and Stage 6 trains against).
+    # near < collision_clearance so a surface at the clearance limit isn't clipped;
+    # far spans the full free-space grid diagonal (the play volume).
+    grid_diag = float(np.linalg.norm(np.array(fs.occ_fine.shape) * fs.pitch_fine))
     intrinsics = {
         "face_fov_deg": params.face_fov_deg,
         "resolution": params.render_resolution,
@@ -603,7 +519,7 @@ def plan_cameras(
         "footprint_k": round(params.footprint_k, 4),
         "focal_px": round(params.focal_px, 3),
         "near": round(min(0.05, params.collision_clearance * 0.5), 4),
-        "far": round(float(np.linalg.norm(padded_ext)), 3),
+        "far": round(grid_diag, 3),
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -618,4 +534,5 @@ def plan_cameras(
     tmp.replace(out_path)
     summary["bytes"] = out_path.stat().st_size
     summary["patches_bytes"] = patches_path.stat().st_size
+    summary["patch_views_bytes"] = patch_views_path.stat().st_size
     return summary

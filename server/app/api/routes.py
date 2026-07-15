@@ -156,19 +156,19 @@ _hydrated_runs: set[str] = set()
 _splat_stage1_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage1_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
-# --- Stage 2 splat sampling jobs (background, one per CELL) -------------------
-# Same shape/keying as Stage 1: a cell's placed meshes (generated, or library
-# de-optimized on the fly) are sampled into a Gaussian cloud `splat/cloud.ply`
-# (splat/stage2.py). A sidecar `cloud.json` holds the summary so 'done' survives
-# a restart; the status also carries the .ply's `/artifacts` URL for the viewer.
+# --- Stage 2 free-space voxelization jobs (background, one per CELL) ----------
+# The shared spatial foundation (Option A, runs first): a cell's meshes (generated,
+# or library de-optimized) are voxelized into a dual-resolution occupancy +
+# clearance + reachability grid `splat/freespace.npz` (splat/stage2.py), with a
+# `voxels.bin` viz cloud + `freespace.json` sidecar so 'done' survives a restart.
 _splat_stage2_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage2_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
-# --- Stage 3 free-space voxelization jobs (background, one per CELL) ----------
-# Same shape/keying as Stage 1/2: a cell's meshes (generated, or library de-
-# optimized) are voxelized into a solid/empty grid + clearance field, and the
-# free voxels written to `splat/voxels.bin` (splat/stage3.py). A `voxels.json`
-# sidecar holds the summary so 'done' survives a restart.
+# --- Stage 3 surfel sampling jobs (background, one per CELL) ------------------
+# Same shape/keying: a cell's placed meshes + the Stage-2 free-space grid are
+# sampled into a Gaussian cloud `splat/cloud.ply` (splat/stage3.py) — normals
+# oriented to free space, hidden faces culled. A `cloud.json` sidecar holds the
+# summary; the status carries the .ply's `/artifacts` URL for the viewer.
 _splat_stage3_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage3_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
@@ -1754,54 +1754,41 @@ async def _run_splat_stage1_cell(run: str, slot: str, model: str) -> None:
 
 
 class Stage2Request(BaseModel):
-    """Live sampling knobs for a Stage-2 re-splat (all optional; omitted fields
-    take the sampler defaults). `base_spacing` (metres) overrides `target_splats`;
-    `detail_splats`, when set, also builds a denser `cloud.detail.ply` LOD."""
+    """Free-space voxelizer knobs (Stage 2 — the shared spatial foundation). All
+    optional; omitted → defaults. `pitch` (m) is the coarse navigational edge,
+    `refine` sets the fine occupancy scale (pitch/refine), `margin` (m) grows the
+    exterior play volume."""
 
-    target_splats: int = splat_stage2.DEFAULT_TARGET_SPLATS
-    base_spacing: float | None = None
-    radius_frac: float = splat_stage2.DEFAULT_RADIUS_FRAC
-    flatness: float = splat_stage2.DEFAULT_FLATNESS
-    adaptive: bool = True
-    detail_splats: int | None = None
+    pitch: float | None = None
+    refine: int | None = None
+    margin: float | None = None
 
 
-def _stage2_params(
-    req: Stage2Request | None,
-) -> tuple[splat_stage2.SampleParams, splat_stage2.SampleParams | None]:
-    """Clamp a request into a (base, detail|None) SampleParams pair. Detail shares
-    the base's radius/flatness/adaptive knobs but its own (denser) target count."""
-    req = req or Stage2Request()
-    target = int(min(max(req.target_splats, 5_000), 3_000_000))
-    radius = float(min(max(req.radius_frac, 0.3), 3.0))
-    flat = float(min(max(req.flatness, 0.01), 0.5))
-    base_spacing = (
-        float(min(max(req.base_spacing, 0.002), 0.5))
-        if req.base_spacing is not None
-        else None
+def _stage2_params(req: Stage2Request | None) -> splat_stage2.FreeSpaceParams:
+    """Clamp a request into FreeSpaceParams; omitted fields keep the defaults."""
+    d = splat_stage2.FreeSpaceParams()
+    if req is None:
+        return d
+    return splat_stage2.FreeSpaceParams(
+        pitch=float(min(max(req.pitch, 0.02), 1.0)) if req.pitch is not None else d.pitch,
+        refine=int(min(max(req.refine, 1), 6)) if req.refine is not None else d.refine,
+        margin=float(min(max(req.margin, 0.0), 10.0)) if req.margin is not None else d.margin,
     )
-    base = splat_stage2.SampleParams(
-        target_splats=target, base_spacing=base_spacing,
-        radius_frac=radius, flatness=flat, adaptive=bool(req.adaptive),
-    )
-    detail = None
-    if req.detail_splats:
-        detail = splat_stage2.SampleParams(
-            target_splats=int(min(max(req.detail_splats, target), 5_000_000)),
-            base_spacing=None, radius_frac=radius, flatness=flat,
-            adaptive=bool(req.adaptive),
-        )
-    return base, detail
 
 
 def _cloud_path(run: str, slot: str, model: str) -> Path:
-    """Where a cell's Stage-2 base Gaussian cloud lives (`splat/cloud.ply`)."""
-    return _slot_dir(run, slot, model) / "splat" / splat_stage2.CLOUD_NAME
+    """Where a cell's Stage-3 base Gaussian cloud lives (`splat/cloud.ply`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage3.CLOUD_NAME
 
 
 def _detail_cloud_path(run: str, slot: str, model: str) -> Path:
     """The optional denser LOD streamed in behind the base (`cloud.detail.ply`)."""
     return _cloud_path(run, slot, model).with_suffix(".detail.ply")
+
+
+def _freespace_path(run: str, slot: str, model: str) -> Path:
+    """Where a cell's Stage-2 free-space grid lives (`splat/freespace.npz`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage2.FREESPACE_NAME
 
 
 def _artifact_url(path: Path) -> str | None:
@@ -1817,13 +1804,157 @@ def _artifact_url(path: Path) -> str | None:
 def _splat_stage2_status(
     run: str, slot: str, model: str, source: str | None = None
 ) -> dict[str, Any]:
-    """Public Stage-2 state for one cell: the live job if one exists, else 'done'
-    (with the `cloud.json` summary) when a base cloud is on disk, else 'idle'.
-    Carries `url` (base `.ply`) and `detail_url` (the denser LOD, if built) as
-    `/artifacts` paths so the client can lazy-load then stream without extra calls."""
+    """Public Stage-2 (free-space) state: the live job if one exists, else 'done'
+    (with the `freespace.json` summary) when the grid is on disk, else 'idle'. `url`
+    is the `voxels.bin` viz overlay the viewer draws."""
+    grid = _freespace_path(run, slot, model)
+    url = _artifact_url(_voxels_path(run, slot, model))
+    job = _splat_stage2_jobs.get((run, slot, model))
+    if job is not None:
+        return {**job, "url": url}
+    if grid.is_file():
+        summary: Any = None
+        with contextlib.suppress(Exception):
+            summary = json.loads(grid.with_suffix(".json").read_text(encoding="utf-8"))
+        return {
+            "run": run, "slot": slot, "model": model, "source": source,
+            "running": False, "phase": "done", "status": "done",
+            "current_id": None, "error": None, "summary": summary, "url": url,
+        }
+    return {
+        "run": run, "slot": slot, "model": model, "source": source,
+        "running": False, "phase": "idle", "status": "idle",
+        "current_id": None, "error": None, "summary": None, "url": None,
+    }
+
+
+def _voxels_path(run: str, slot: str, model: str) -> Path:
+    """Where a cell's Stage-2 free-voxel viz pack lives (`splat/voxels.bin`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage2.VOXELS_NAME
+
+
+def _voxelize_from_source(
+    run: str,
+    slot: str,
+    model: str,
+    src_dir: Path,
+    kind: str,
+    out_path: Path,
+    params: splat_stage2.FreeSpaceParams,
+    job: dict[str, Any],
+) -> dict[str, Any]:
+    """Compute a cell's free-space grid (Stage 2), de-optimizing a library source to
+    vanilla ONCE first. Tracks `job['phase']` ('deopt' / 'voxelize'). Blocking."""
+
+    def _progress(done: int, total: int, current: str) -> None:
+        job["phase"], job["done"], job["total"], job["current_id"] = (
+            "voxelize", done, total, current,
+        )
+
+    def _run(vanilla_dir: Path) -> dict[str, Any]:
+        job["phase"] = "voxelize"
+        return splat_stage2.compute_free_space(
+            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
+            out_path=out_path, params=params, progress=_progress,
+        )
+
+    if kind != "library":
+        return _run(src_dir)
+    job["phase"] = "deopt"
+    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
+        vanilla_dir = Path(tmp)
+        _deoptimize_dir(src_dir, vanilla_dir)
+        return _run(vanilla_dir)
+
+
+async def _run_splat_stage2_cell(
+    run: str, slot: str, model: str, params: splat_stage2.FreeSpaceParams
+) -> None:
+    """Compute ONE cell's free-space grid off the event loop, tracking phase/progress
+    and writing the `freespace.json` sidecar so 'done' survives a restart."""
+    key = (run, slot, model)
+    job = _splat_stage2_jobs[key]
+    try:
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
+        src_dir, kind = source
+        out_path = _freespace_path(run, slot, model)
+        summary = await asyncio.to_thread(
+            _voxelize_from_source, run, slot, model, src_dir, kind, out_path, params, job,
+        )
+        job["summary"] = summary
+        with contextlib.suppress(Exception):
+            out_path.with_suffix(".json").write_text(
+                json.dumps(summary, indent=1), encoding="utf-8"
+            )
+        job["status"] = "done"
+        job["phase"] = "done"
+        job["current_id"] = None
+    except Exception as exc:
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _splat_stage2_tasks.pop(key, None)
+
+
+class Stage3Request(BaseModel):
+    """Surfel sampler knobs (Stage 3). All optional; omitted → sampler defaults.
+    `base_spacing` (m) overrides `target_splats`; `detail_splats` also builds a denser
+    `cloud.detail.ply` LOD; `cull_hidden` drops surfels with no reachable free space
+    on either side (uses the Stage-2 grid)."""
+
+    target_splats: int = splat_stage3.DEFAULT_TARGET_SPLATS
+    base_spacing: float | None = None
+    radius_frac: float = splat_stage3.DEFAULT_RADIUS_FRAC
+    flatness: float = splat_stage3.DEFAULT_FLATNESS
+    adaptive: bool = True
+    cull_hidden: bool = True
+    detail_splats: int | None = None
+    representation: str | None = None  # "2dgs" (default) | "3dgs" (compat/compression)
+
+
+def _stage3_params(
+    req: Stage3Request | None,
+) -> tuple[splat_stage3.SampleParams, splat_stage3.SampleParams | None]:
+    """Clamp a request into a (base, detail|None) SampleParams pair."""
+    req = req or Stage3Request()
+    target = int(min(max(req.target_splats, 5_000), 3_000_000))
+    radius = float(min(max(req.radius_frac, 0.3), 3.0))
+    flat = float(min(max(req.flatness, 0.01), 0.5))
+    base_spacing = (
+        float(min(max(req.base_spacing, 0.002), 0.5))
+        if req.base_spacing is not None
+        else None
+    )
+    rep = req.representation if req.representation in ("2dgs", "3dgs") else "2dgs"
+    base = splat_stage3.SampleParams(
+        target_splats=target, base_spacing=base_spacing, radius_frac=radius,
+        flatness=flat, adaptive=bool(req.adaptive), cull_hidden=bool(req.cull_hidden),
+        representation=rep,
+    )
+    detail = None
+    if req.detail_splats:
+        detail = splat_stage3.SampleParams(
+            target_splats=int(min(max(req.detail_splats, target), 5_000_000)),
+            base_spacing=None, radius_frac=radius, flatness=flat,
+            adaptive=bool(req.adaptive), cull_hidden=bool(req.cull_hidden),
+            representation=rep,
+        )
+    return base, detail
+
+
+def _splat_stage3_status(
+    run: str, slot: str, model: str, source: str | None = None
+) -> dict[str, Any]:
+    """Public Stage-3 (surfels) state: the live job, else 'done' (with the
+    `cloud.json` summary) when the base cloud is on disk, else 'idle'. Carries `url`
+    (base `.ply`) and `detail_url` (the denser LOD, if built)."""
     url = _artifact_url(_cloud_path(run, slot, model))
     detail_url = _artifact_url(_detail_cloud_path(run, slot, model))
-    job = _splat_stage2_jobs.get((run, slot, model))
+    job = _splat_stage3_jobs.get((run, slot, model))
     if job is not None:
         return {**job, "url": url, "detail_url": detail_url}
     if url is not None:
@@ -1853,18 +1984,18 @@ def _sample_cell_lods(
     model: str,
     src_dir: Path,
     kind: str,
+    freespace_path: Path,
     out_path: Path,
-    base_params: splat_stage2.SampleParams,
-    detail_params: splat_stage2.SampleParams | None,
+    base_params: splat_stage3.SampleParams,
+    detail_params: splat_stage3.SampleParams | None,
     job: dict[str, Any],
 ) -> dict[str, Any]:
-    """Sample a cell into a base cloud (and, if `detail_params`, a denser LOD),
-    de-optimizing a library source to vanilla ONCE and reusing it for both LODs.
-    Tracks `job['phase']` ('deopt' / 'base' / 'detail') + progress. Blocking — run
-    via asyncio.to_thread."""
+    """Sample a cell into a base surfel cloud (and, if `detail_params`, a denser LOD),
+    consuming the Stage-2 free-space grid and de-optimizing a library source ONCE.
+    Tracks `job['phase']` ('deopt' / 'base' / 'detail'). Blocking."""
     detail_path = out_path.with_suffix(".detail.ply")
 
-    def _phase_progress(phase: str) -> splat_stage2.ProgressCb:
+    def _phase_progress(phase: str) -> splat_stage3.ProgressCb:
         def cb(done: int, total: int, current: str) -> None:
             job["phase"], job["done"], job["total"], job["current_id"] = (
                 phase, done, total, current,
@@ -1873,16 +2004,17 @@ def _sample_cell_lods(
 
     def _sample(vanilla_dir: Path) -> dict[str, Any]:
         job["phase"] = "base"
-        summary = splat_stage2.sample_cell(
+        summary = splat_stage3.sample_cell(
             run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-            out_path=out_path, params=base_params, progress=_phase_progress("base"),
+            freespace_path=freespace_path, out_path=out_path,
+            params=base_params, progress=_phase_progress("base"),
         )
         if detail_params is not None:
             job["phase"], job["done"], job["total"] = "detail", 0, 0
-            det = splat_stage2.sample_cell(
+            det = splat_stage3.sample_cell(
                 run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-                out_path=detail_path, params=detail_params,
-                progress=_phase_progress("detail"),
+                freespace_path=freespace_path, out_path=detail_path,
+                params=detail_params, progress=_phase_progress("detail"),
             )
             summary["detail"] = {
                 "splats": det["splats"], "bytes": det["bytes"],
@@ -1901,131 +2033,29 @@ def _sample_cell_lods(
         return _sample(vanilla_dir)
 
 
-async def _run_splat_stage2_cell(
+async def _run_splat_stage3_cell(
     run: str,
     slot: str,
     model: str,
-    base_params: splat_stage2.SampleParams,
-    detail_params: splat_stage2.SampleParams | None,
+    base_params: splat_stage3.SampleParams,
+    detail_params: splat_stage3.SampleParams | None,
 ) -> None:
-    """Sample ONE cell into a base cloud (+ optional detail LOD) off the event
-    loop, tracking phase/progress in the job dict and writing the `cloud.json`
-    sidecar so 'done' state survives a restart."""
-    key = (run, slot, model)
-    job = _splat_stage2_jobs[key]
-    try:
-        source = _splat_source(run, slot, model)
-        if source is None:
-            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
-        src_dir, kind = source
-        out_path = _cloud_path(run, slot, model)
-        summary = await asyncio.to_thread(
-            _sample_cell_lods, run, slot, model, src_dir, kind,
-            out_path, base_params, detail_params, job,
-        )
-        job["summary"] = summary
-        with contextlib.suppress(Exception):
-            out_path.with_suffix(".json").write_text(
-                json.dumps(summary, indent=1), encoding="utf-8"
-            )
-        job["status"] = "done"
-        job["phase"] = "done"
-        job["current_id"] = None
-    except Exception as exc:
-        job["status"] = "error"
-        job["error"] = f"{type(exc).__name__}: {exc}"
-    finally:
-        job["running"] = False
-        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
-        _splat_stage2_tasks.pop(key, None)
-
-
-class Stage3Request(BaseModel):
-    """Free-space voxelization request. `pitch` (metres) sets the voxel edge;
-    omitted → the default navigational grid."""
-
-    pitch: float | None = None
-
-
-def _voxels_path(run: str, slot: str, model: str) -> Path:
-    """Where a cell's Stage-3 free-voxel pack lives (`splat/voxels.bin`)."""
-    return _slot_dir(run, slot, model) / "splat" / splat_stage3.VOXELS_NAME
-
-
-def _splat_stage3_status(run: str, slot: str, model: str) -> dict[str, Any]:
-    """Public Stage-3 state for one cell: the live job, else 'done' (with the
-    `voxels.json` summary) when the pack is on disk, else 'idle'. Carries `url`
-    (the `.bin`) so the viewer can fetch + draw the free voxels + clearance."""
-    url = _artifact_url(_voxels_path(run, slot, model))
-    job = _splat_stage3_jobs.get((run, slot, model))
-    if job is not None:
-        return {**job, "url": url}
-    if url is not None:
-        summary: Any = None
-        with contextlib.suppress(Exception):
-            summary = json.loads(
-                _voxels_path(run, slot, model).with_suffix(".json").read_text(encoding="utf-8")
-            )
-        return {
-            "run": run, "slot": slot, "model": model,
-            "running": False, "phase": "done", "status": "done",
-            "current_id": None, "error": None, "summary": summary, "url": url,
-        }
-    return {
-        "run": run, "slot": slot, "model": model,
-        "running": False, "phase": "idle", "status": "idle",
-        "current_id": None, "error": None, "summary": None, "url": None,
-    }
-
-
-def _voxelize_from_source(
-    run: str,
-    slot: str,
-    model: str,
-    src_dir: Path,
-    kind: str,
-    out_path: Path,
-    pitch: float,
-    job: dict[str, Any],
-) -> dict[str, Any]:
-    """Voxelize a cell's free space, de-optimizing a library source to vanilla
-    ONCE first. Tracks `job['phase']` ('deopt' / 'voxelize') + progress. Blocking —
-    run via asyncio.to_thread."""
-
-    def _progress(done: int, total: int, current: str) -> None:
-        job["phase"], job["done"], job["total"], job["current_id"] = (
-            "voxelize", done, total, current,
-        )
-
-    def _run(vanilla_dir: Path) -> dict[str, Any]:
-        job["phase"] = "voxelize"
-        return splat_stage3.compute_free_space(
-            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-            out_path=out_path, pitch=pitch, progress=_progress,
-        )
-
-    if kind != "library":
-        return _run(src_dir)
-    job["phase"] = "deopt"
-    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
-        vanilla_dir = Path(tmp)
-        _deoptimize_dir(src_dir, vanilla_dir)
-        return _run(vanilla_dir)
-
-
-async def _run_splat_stage3_cell(run: str, slot: str, model: str, pitch: float) -> None:
-    """Voxelize ONE cell's free space off the event loop, tracking phase/progress
-    and writing the `voxels.json` sidecar so 'done' survives a restart."""
+    """Sample ONE cell into surfels off the event loop. Requires the Stage-2
+    free-space grid; writes the `cloud.json` sidecar so 'done' survives a restart."""
     key = (run, slot, model)
     job = _splat_stage3_jobs[key]
     try:
         source = _splat_source(run, slot, model)
         if source is None:
             raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
+        freespace = _freespace_path(run, slot, model)
+        if not freespace.is_file():
+            raise FileNotFoundError("run Stage 2 (free-space) first")
         src_dir, kind = source
-        out_path = _voxels_path(run, slot, model)
+        out_path = _cloud_path(run, slot, model)
         summary = await asyncio.to_thread(
-            _voxelize_from_source, run, slot, model, src_dir, kind, out_path, pitch, job,
+            _sample_cell_lods, run, slot, model, src_dir, kind,
+            freespace, out_path, base_params, detail_params, job,
         )
         job["summary"] = summary
         with contextlib.suppress(Exception):
@@ -2055,7 +2085,6 @@ class Stage4Request(BaseModel):
     patch_min_spacing: float | None = None
     patch_max_spacing: float | None = None
     collision_clearance: float | None = None
-    margin: float | None = None
     angles_per_patch: int | None = None
     angular_sectors: int | None = None
     near_frac: float | None = None
@@ -2080,7 +2109,6 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
         tex_k=pick(req.tex_k, 0.0, 50.0, d.tex_k),
         collision_clearance=pick(req.collision_clearance, 0.05, 2.0, d.collision_clearance),
-        margin=pick(req.margin, 0.0, 10.0, d.margin),
         angles_per_patch=int(pick(req.angles_per_patch, 1, 12, d.angles_per_patch)),
         angular_sectors=int(pick(req.angular_sectors, 3, 16, d.angular_sectors)),
         near_frac=pick(req.near_frac, 0.1, 1.0, d.near_frac),
@@ -2098,82 +2126,73 @@ def _cameras_path(run: str, slot: str, model: str) -> Path:
 
 def _splat_stage4_status(run: str, slot: str, model: str) -> dict[str, Any]:
     """Public Stage-4 state: live job, else 'done' (with the plan summary) when
-    `cameras.json` is on disk, else 'idle'. Carries `url` (cameras.json) and
-    `patches_url` (patches.bin) for the viewer."""
+    `cameras.json` is on disk, else 'idle'. Carries `url` (cameras.json),
+    `patches_url` (patches.bin), and `patch_views_url` (patch_views.json — the
+    per-patch → covering camera/face index the debug viewer selects against)."""
     cams = _cameras_path(run, slot, model)
     url = _artifact_url(cams)
     patches_url = _artifact_url(cams.with_name(splat_stage4.PATCHES_NAME))
+    patch_views_url = _artifact_url(cams.with_name(splat_stage4.PATCH_VIEWS_NAME))
     job = _splat_stage4_jobs.get((run, slot, model))
     if job is not None:
-        return {**job, "url": url, "patches_url": patches_url}
+        return {**job, "url": url, "patches_url": patches_url, "patch_views_url": patch_views_url}
     if url is not None:
         summary: Any = None
         with contextlib.suppress(Exception):
             payload = json.loads(cams.read_text(encoding="utf-8"))
             summary = {k: v for k, v in payload.items() if k != "cameras"}
+            if isinstance(payload.get("cameras"), list):
+                summary["cameras"] = len(payload["cameras"])
         return {
             "run": run, "slot": slot, "model": model,
             "running": False, "phase": "done", "status": "done",
             "current_id": None, "error": None, "summary": summary,
-            "url": url, "patches_url": patches_url,
+            "url": url, "patches_url": patches_url, "patch_views_url": patch_views_url,
         }
     return {
         "run": run, "slot": slot, "model": model,
         "running": False, "phase": "idle", "status": "idle",
         "current_id": None, "error": None, "summary": None,
-        "url": None, "patches_url": None,
+        "url": None, "patches_url": None, "patch_views_url": None,
     }
 
 
-def _plan_from_source(
-    run: str,
-    slot: str,
-    model: str,
-    src_dir: Path,
-    kind: str,
-    out_path: Path,
-    plan_params: splat_stage4.PlanParams,
-    job: dict[str, Any],
+def _plan_cameras_cell(
+    run: str, slot: str, model: str, out_path: Path,
+    plan_params: splat_stage4.PlanParams, job: dict[str, Any],
 ) -> dict[str, Any]:
-    """Plan cameras for a cell, de-optimizing a library source to vanilla ONCE
-    first. Tracks `job['phase']` ('deopt' / 'plan') + progress. Blocking."""
+    """Plan cameras from the Stage-2 free-space grid + Stage-3 surfel cloud — no mesh
+    loading, no de-optimization (that's why Stage 4 can't run off a raw mesh)."""
 
     def _progress(done: int, total: int, current: str) -> None:
         job["phase"], job["done"], job["total"], job["current_id"] = (
             "plan", done, total, current,
         )
 
-    def _run(vanilla_dir: Path) -> dict[str, Any]:
-        job["phase"] = "plan"
-        return splat_stage4.plan_cameras(
-            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-            out_path=out_path, params=plan_params, progress=_progress,
-        )
-
-    if kind != "library":
-        return _run(src_dir)
-    job["phase"] = "deopt"
-    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
-        vanilla_dir = Path(tmp)
-        _deoptimize_dir(src_dir, vanilla_dir)
-        return _run(vanilla_dir)
+    job["phase"] = "plan"
+    return splat_stage4.plan_cameras(
+        run=run, slot=slot, model=model,
+        freespace_path=_freespace_path(run, slot, model),
+        surfels_path=_cloud_path(run, slot, model),
+        out_path=out_path, params=plan_params, progress=_progress,
+    )
 
 
 async def _run_splat_stage4_cell(
     run: str, slot: str, model: str, plan_params: splat_stage4.PlanParams
 ) -> None:
-    """Plan ONE cell's coverage cameras off the event loop, tracking phase/progress.
-    `cameras.json` (written by plan_cameras) is the 'done' marker."""
+    """Plan ONE cell's coverage cameras off the event loop. Requires the Stage-2
+    free-space grid + Stage-3 surfel cloud; `cameras.json` is the 'done' marker."""
     key = (run, slot, model)
     job = _splat_stage4_jobs[key]
     try:
-        source = _splat_source(run, slot, model)
-        if source is None:
-            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
-        src_dir, kind = source
+        if not _freespace_path(run, slot, model).is_file():
+            raise FileNotFoundError("run Stage 2 (free-space) first")
+        if not _cloud_path(run, slot, model).is_file():
+            raise FileNotFoundError("run Stage 3 (surfels) first")
         out_path = _cameras_path(run, slot, model)
         summary = await asyncio.to_thread(
-            _plan_from_source, run, slot, model, src_dir, kind, out_path, plan_params, job,
+            _plan_cameras_cell, run, slot, model, out_path, plan_params, job,
         )
         job["summary"] = summary
         job["status"] = "done"
@@ -2191,6 +2210,54 @@ async def _run_splat_stage4_cell(
 def _refs_dir(run: str, slot: str, model: str) -> Path:
     """Where a cell's Stage-5 reference renders live (`splat/refs/`)."""
     return _slot_dir(run, slot, model) / "splat" / splat_stage5.REFS_DIRNAME
+
+
+def _splat_stage_artifacts(run: str, slot: str, model: str) -> dict[int, list[Path]]:
+    """The on-disk output(s) of each splat stage for one cell, keyed by stage number
+    (2..5; Stage 1's `scene.json` is the base). Used to REVERT downstream on re-run."""
+    d = _slot_dir(run, slot, model) / "splat"
+    fs = _freespace_path(run, slot, model)
+    cloud = _cloud_path(run, slot, model)
+    cams = _cameras_path(run, slot, model)
+    return {
+        1: [d / splat_stage1.MANIFEST_NAME],
+        2: [fs, fs.with_suffix(".json"), _voxels_path(run, slot, model)],
+        3: [cloud, cloud.with_suffix(".json"), _detail_cloud_path(run, slot, model)],
+        4: [
+            cams,
+            cams.with_name(splat_stage4.PATCHES_NAME),
+            cams.with_name(splat_stage4.PATCH_VIEWS_NAME),
+        ],
+        5: [_refs_dir(run, slot, model)],
+    }
+
+
+def _revert_after(run: str, slot: str, model: str, stage: int) -> None:
+    """Re-running stage `stage` invalidates every LATER stage: cancel their live jobs
+    and delete their on-disk outputs. This makes a re-run act as a revert — the
+    pipeline can never show stale downstream results built on a superseded input."""
+    import shutil
+
+    key = (run, slot, model)
+    tables: dict[int, tuple[dict[Any, Any], dict[Any, Any]]] = {
+        2: (_splat_stage2_jobs, _splat_stage2_tasks),
+        3: (_splat_stage3_jobs, _splat_stage3_tasks),
+        4: (_splat_stage4_jobs, _splat_stage4_tasks),
+        5: (_splat_stage5_jobs, _splat_stage5_tasks),
+    }
+    artifacts = _splat_stage_artifacts(run, slot, model)
+    for s in range(stage + 1, 6):
+        jobs, tasks = tables[s]
+        task = tasks.pop(key, None)
+        if task is not None:
+            task.cancel()
+        jobs.pop(key, None)
+        for p in artifacts.get(s, []):
+            with contextlib.suppress(Exception):
+                if p.is_dir():
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
+                    p.unlink(missing_ok=True)
 
 
 def _splat_stage5_status(run: str, slot: str, model: str) -> dict[str, Any]:
@@ -2779,9 +2846,13 @@ def create_app() -> FastAPI:
         cells = []
         for slot, model, placed, source in _discover_splat_stage1_cells(run):
             cell = _splat_cell_status(run, slot, model, placed, source)
-            # Stage 2 (surfel sampling) state + the cloud URL, so the screen can
-            # offer "sample" / "view" alongside the Stage-1 convert control.
+            # Per-stage state so the screen can offer each step on a cell row, in
+            # dependency order: Stage 2 free-space → Stage 3 surfels → Stage 4
+            # cameras → Stage 5 reference renders.
             cell["stage2"] = _splat_stage2_status(run, slot, model, source)
+            cell["stage3"] = _splat_stage3_status(run, slot, model, source)
+            cell["stage4"] = _splat_stage4_status(run, slot, model)
+            cell["stage5"] = _splat_stage5_status(run, slot, model)
             cells.append(cell)
         return {"run": run, "cells": cells}
 
@@ -2804,6 +2875,7 @@ def create_app() -> FastAPI:
         existing = _splat_stage1_jobs.get(key)
         if existing is not None and existing.get("running"):
             return dict(existing)
+        _revert_after(run, slot, model, 1)  # re-running invalidates all later stages
         job: dict[str, Any] = {
             "run": run,
             "slot": slot,
@@ -2835,12 +2907,11 @@ def create_app() -> FastAPI:
     async def splat_stage2_start(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: Stage2Request | None = None
     ) -> dict[str, object]:
-        """(Re-)sample ONE cell's placed meshes into a pre-fine-tuning Gaussian
-        cloud `splat/cloud.ply` (see splat/stage2.py), using the tunable knobs in
-        the request body (density via `target_splats`, `radius_frac`, `flatness`,
-        `adaptive`) — set live from the client, no restart. If `detail_splats` is
-        given, also builds a denser `cloud.detail.ply` LOD for background streaming.
-        Idempotent while running; re-runs (overwrites) on a fresh POST."""
+        """Compute ONE cell's free-space grid — dual-resolution occupancy + clearance
+        + reachability → `splat/freespace.npz` (+ `voxels.bin` viz), see
+        splat/stage2.py. The shared spatial foundation Stage 3 (surfels) and Stage 4
+        (cameras) consume. Optional body: `pitch`/`refine`/`margin`. Idempotent while
+        running; re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -2848,11 +2919,65 @@ def create_app() -> FastAPI:
                 detail=f"no convertible build for {slot}/{model} in {run}",
             )
         _, kind = source
-        base_params, detail_params = _stage2_params(body)
+        params = _stage2_params(body)
         key = (run, slot, model)
         existing = _splat_stage2_jobs.get(key)
         if existing is not None and existing.get("running"):
             return dict(existing)
+        _revert_after(run, slot, model, 2)  # re-running invalidates all later stages
+        job: dict[str, Any] = {
+            "run": run,
+            "slot": slot,
+            "model": model,
+            "source": kind,
+            "total": 0,
+            "done": 0,
+            "running": True,
+            "status": "pending",
+            "phase": "pending",
+            "current_id": None,
+            "error": None,
+            "summary": None,
+            "url": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _splat_stage2_jobs[key] = job
+        _splat_stage2_tasks[key] = asyncio.create_task(
+            _run_splat_stage2_cell(run, slot, model, params)
+        )
+        return dict(job)
+
+    @app.get("/runs/{run}/splat/stage2/{slot}/{model}")
+    async def splat_stage2_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Stage-2 (free-space) state of one cell ('idle' / 'pending' / a running
+        job / 'done' with the `voxels.bin` viz `url` / 'error')."""
+        return _splat_stage2_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/stage3/{slot}/{model}")
+    async def splat_stage3_start(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: Stage3Request | None = None
+    ) -> dict[str, object]:
+        """(Re-)sample ONE cell's placed meshes into a pre-fine-tuning Gaussian cloud
+        `splat/cloud.ply` (see splat/stage3.py), consuming the Stage-2 free-space grid
+        to orient normals + cull hidden faces. Knobs: `target_splats`/`base_spacing`/
+        `radius_frac`/`flatness`/`adaptive`/`cull_hidden`/`detail_splats`. Requires
+        Stage 2 first. Idempotent while running; re-runs (overwrites) on a fresh POST."""
+        source = _splat_source(run, slot, model)
+        if source is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"no convertible build for {slot}/{model} in {run}",
+            )
+        if not _freespace_path(run, slot, model).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
+        _, kind = source
+        base_params, detail_params = _stage3_params(body)
+        key = (run, slot, model)
+        existing = _splat_stage3_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        _revert_after(run, slot, model, 3)  # re-running invalidates all later stages
         job: dict[str, Any] = {
             "run": run,
             "slot": slot,
@@ -2872,71 +2997,16 @@ def create_app() -> FastAPI:
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
         }
-        _splat_stage2_jobs[key] = job
-        _splat_stage2_tasks[key] = asyncio.create_task(
-            _run_splat_stage2_cell(run, slot, model, base_params, detail_params)
-        )
-        return dict(job)
-
-    @app.get("/runs/{run}/splat/stage2/{slot}/{model}")
-    async def splat_stage2_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Live Stage-2 state of one cell ('idle' / 'pending' / a running job /
-        'done' with the cloud `url` / 'error')."""
-        return _splat_stage2_status(run, slot, model)
-
-    @app.post("/runs/{run}/splat/stage3/{slot}/{model}")
-    async def splat_stage3_start(  # pyright: ignore[reportUnusedFunction]
-        run: str, slot: str, model: str, body: Stage3Request | None = None
-    ) -> dict[str, object]:
-        """Voxelize ONE cell's free space into a solid/empty grid + clearance
-        field, writing the free voxels to `splat/voxels.bin` (see splat/stage3.py)
-        — the foundation for camera placement / occlusion culling, and drawn as a
-        toggleable overlay in the viewer. Optional `pitch` (m) sets the voxel edge.
-        Idempotent while running; re-runs (overwrites) on a fresh POST."""
-        source = _splat_source(run, slot, model)
-        if source is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"no convertible build for {slot}/{model} in {run}",
-            )
-        pitch = (
-            float(min(max(body.pitch, 0.02), 1.0))
-            if body is not None and body.pitch is not None
-            else splat_stage3.DEFAULT_PITCH
-        )
-        _, kind = source
-        key = (run, slot, model)
-        existing = _splat_stage3_jobs.get(key)
-        if existing is not None and existing.get("running"):
-            return dict(existing)
-        job: dict[str, Any] = {
-            "run": run,
-            "slot": slot,
-            "model": model,
-            "source": kind,
-            "pitch": pitch,
-            "total": 0,
-            "done": 0,
-            "running": True,
-            "status": "pending",
-            "phase": "pending",
-            "current_id": None,
-            "error": None,
-            "summary": None,
-            "url": None,
-            "started_at": datetime.now().isoformat(timespec="seconds"),
-            "finished_at": None,
-        }
         _splat_stage3_jobs[key] = job
         _splat_stage3_tasks[key] = asyncio.create_task(
-            _run_splat_stage3_cell(run, slot, model, pitch)
+            _run_splat_stage3_cell(run, slot, model, base_params, detail_params)
         )
         return dict(job)
 
     @app.get("/runs/{run}/splat/stage3/{slot}/{model}")
     async def splat_stage3_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Live Stage-3 state of one cell ('idle' / 'pending' / a running job /
-        'done' with the voxel `url` / 'error')."""
+        """Live Stage-3 (surfels) state of one cell ('idle' / 'pending' / a running
+        job / 'done' with the cloud `url` / 'error')."""
         return _splat_stage3_status(run, slot, model)
 
     @app.post("/runs/{run}/splat/stage4/{slot}/{model}")
@@ -2954,12 +3024,17 @@ def create_app() -> FastAPI:
                 status_code=404,
                 detail=f"no convertible build for {slot}/{model} in {run}",
             )
+        if not _freespace_path(run, slot, model).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
+        if not _cloud_path(run, slot, model).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 3 (surfels) first")
         plan_params = _stage4_params(body)
         _, kind = source
         key = (run, slot, model)
         existing = _splat_stage4_jobs.get(key)
         if existing is not None and existing.get("running"):
             return dict(existing)
+        _revert_after(run, slot, model, 4)  # re-running invalidates Stage 5
         job: dict[str, Any] = {
             "run": run,
             "slot": slot,

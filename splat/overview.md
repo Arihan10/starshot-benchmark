@@ -75,38 +75,40 @@ Cameras and the fine-tune are **included**; only lighting is deferred (reference
 - **Out:** one composed, world-placed mesh in memory + per-object PBR materials + the reconstructed node tree (world AABBs, kinds, parents) + the derived scene AABB.
 - Mostly reads existing outputs.
 
-### Stage 2 — Surfel sampler (mesh → Gaussians)  [new — core]
-- **In:** composed mesh + materials.
-- **Out:** a Gaussian cloud, one **surfel** (flat, surface-aligned 2D Gaussian) per sample:
+### Stage 2 — Free-space voxelizer + clearance field (the foundation)  [new]
+- **In:** composed mesh + scene AABB.
+- **Out:** a **reusable dual-resolution grid** (`freespace.npz`): a FINE occupancy grid (accurate near surfaces, for occlusion / thin-gaps) + a COARSE clearance field (distance to nearest surface, for navigation) + a **reachability mask** (free cells in a large enough connected component — exterior + rooms, minus tiny object-interior hollows). Plus a `voxels.bin` viz cloud.
+- **Runs FIRST (Option A)** so it's the shared spatial foundation both Stage 3 (surfels) and Stage 4 (cameras) consume — nothing downstream re-voxelizes. Resolution is **adaptive** (fine near surfaces); **reachability** is what separates real navigable free space from a solid's hollow interior (surface voxelization leaves interiors "empty").
+
+### Stage 3 — Surfel sampler (mesh → Gaussians)  [new — core]
+- **In:** composed mesh + materials + the **Stage-2 free-space grid**.
+- **Out:** a **2DGS surfel cloud** (`cloud.ply`), one **surfel** (flat, surface-aligned 2D Gaussian) per sample:
   - **position** = surface sample point;
-  - **orientation** = aligned to the surface **normal** (disk lies flush on the surface);
+  - **orientation** = the surface **normal, flipped toward reachable free space** using the grid (robust to unreliable TRELLIS winding — the grid, not the mesh, decides "outward");
   - **scale** = from **local sample spacing** (so disks tile without gaps/overlap — see §7 "two dials");
   - **color** = **albedo** at that point;
   - **opacity** = the sampled base-color **alpha**, honoring `alphaMode` (see §7 "Opacity init"): **1** for opaque materials (raw TRELLIS), the baked alpha for glass;
   - carry material (metalness/roughness/normal) for later.
+  - **format** = a **2DGS `.ply`** (two tangent scales, no thickness axis); a `3dgs` mode appends a thin third scale for 3DGS-only viewers / SOG-SPZ compression.
+- **Hidden-face culling:** surfels with no reachable free space on either side (a solid's interior, or the seam between two abutting objects) are dropped — never seen, so wasted budget + floater seeds.
 - **Sampling:** area-weighted triangle pick + blue-noise (Poisson-disk) even spacing; **density adaptive to local feature size** (denser on thin/high-curvature geometry — see §8).
 - **Reference impls:** `mesh2gaussian`, `Mesh2Splat`; otherwise `trimesh` + `numpy`.
 
-### Stage 3 — Free-space voxelizer + clearance field  [new]
-- **In:** composed mesh + scene AABB.
-- **Out:** voxel grid (solid/empty) over the AABB + a **clearance field** (distance from each empty cell to the nearest surface).
-- Foundation for both camera placement and occlusion culling. Use adaptive resolution (finer near surfaces).
-
 ### Stage 4 — Coverage camera planner (free-fly)  [new]
-- **In:** free-space grid + clearance field + surfels.
-- **Out:** a set of **camera poses** covering every visible surface, + an **occlusion-cull list** (surfaces invisible from all free space).
-- **Method:** scatter candidate positions through free space (denser where clearance is small); at each, use a **cubemap** (6× 90° outward views) so orientation isn't a variable; pick positions **greedily (set-cover)** — repeatedly take the one covering the most still-under-covered surface — until every visible patch is seen from ≥ a few angles and ≥ once close enough to meet the **footprint/sharpness budget**; include **near + far** views (multi-scale) with a mip-style train filter.
-- **Camera bounds:** positions are clamped to free space eroded by a small **collision clearance** (§7) and to the scene AABB. **Free-fly is preserved** — this is a thin safety shell, not a back-off.
+- **In:** the **Stage-2 free-space grid** (reachable candidates + fine-grid occlusion) + the **Stage-3 surfel cloud** (the patch source). Loads **no meshes** and recomputes **no occupancy** — so it can't run off a raw mesh.
+- **Out:** **cubemap-native camera poses** (position + the cube faces worth rendering) + the shared render `intrinsics` (90° FOV, resolution, DERIVED footprint budget) + an **occlusion-cull list**.
+- **Method:** scatter candidate positions through reachable free space (denser where clearance is small); at each, use a **cubemap** (6× 90° outward views) so orientation isn't a variable; pick positions **greedily (set-cover)** — repeatedly take the one covering the most still-under-covered surface — until every visible patch is seen from ≥ a few angles and ≥ once close enough to meet the **footprint/sharpness budget**; include **near + far** views (multi-scale) with a mip-style train filter.
+- **Camera bounds:** positions restricted to reachable free space eroded by a small **collision clearance** (§7). **Free-fly is preserved** — this is a thin safety shell, not a back-off.
 
 ### Stage 5 — Reference renders (UNLIT)  [new — cheap; renderer: nvdiffrast]
-- **In:** composed mesh (the **de-optimized vanilla GLBs** — geometry + UVs + PNG-transcoded base color, the same source Stages 1–3 read) + camera poses.
+- **In:** composed mesh (the **de-optimized vanilla GLBs** — geometry + UVs + PNG-transcoded base color, the same source Stages 2–3 read) + camera poses.
 - **Out, per camera:** **RGB (albedo, unlit)** + **depth** + **alpha mask**.
 - **Renderer — `nvdiffrast` (headless CUDA rasterizer).** Rasterize the triangles from each **pinhole** pose (matching the fine-tune's camera convention), interpolate UVs, and **sample the base-color texture per fragment = albedo** — a flat/unlit shade with **no lighting, no path tracer, no denoiser** (pure rasterization has no Monte-Carlo noise). **Depth** comes from the raster z-buffer, **alpha** from triangle coverage; **honor the base-color alpha for glass** (`BLEND`/`MASK`, per §7) so the references and the splat agree on transparency.
 - **Why nvdiffrast (not headless Three.js):** its `RasterizeCudaContext` is **pure CUDA — no browser/WebGL/EGL/display** — so it runs cleanly on a compute box and lives in the **same PyTorch/CUDA process as the gsplat fine-tune** (shared GPU; tensors flow directly, no disk/browser round-trip). A headless Three.js/WebGL renderer would drag a browser stack onto the server for no benefit (voters see the *splat*, not this mesh render). **Trade-offs:** nvdiffrast is a **rasterizer only** — ideal for unlit, but it **cannot do lit GI** (the lit path swaps renderers, §6), and it is **CUDA-only** (runs on the RTX 3060 / Modal, **not** Apple Silicon).
 - Depth + alpha are lighting-independent and are emitted here for the fine-tune's losses.
 - **Design note:** keep this behind a **pluggable "reference renderer" interface** (`pose → {rgb, depth, alpha}`) so the lit **path-traced** backend (Blender Cycles / Mitsuba, §6) drops in without touching Stages 4/6.
 
-### Stage 6 — Splat fine-tune  [integrate: gsplat / splatfacto]
+### Stage 6 — Splat fine-tune  [integrate: gsplat 2DGS]
 - **In:** surfel cloud (init) + unlit reference renders (+ depth + alpha + exact poses).
 - **Out:** an optimized splat — geometrically clean, artifact-free, **flat-shaded**.
 - **Losses:** photometric (splat RGB vs unlit reference RGB) + **depth loss (alpha-gated)** for floater suppression. Densification adds Gaussians where rendered error is high; pruning removes redundant ones.
@@ -197,22 +199,22 @@ Derived (not tuned): the **scene AABB** play volume.
 
 ## 10. Build milestones & sequencing
 
-- **M0 — smoke test (optional, ~1–2 days):** Stages 1, 2, encode, 8 only (raw surfels → view). Answers "does a converted splat of our scenes look acceptable?" No cameras, no fine-tune, no lighting.
+- **M0 — smoke test (optional, ~1–2 days):** Stages 1, 2, 3, encode, 8 only (free-space → raw surfels → view). Answers "does a converted splat of our scenes look acceptable?" No cameras, no fine-tune, no lighting.
 - **M1 — full unlit pipeline (the current target):** Stages 1–8 with **unlit** reference renders. Validates the entire coverage + fine-tune + compression machinery cheaply. Output: clean flat-lit free-fly splats.
 - **M2 — add lighting:** apply §6 deltas (path-traced references + optional bake + SH-on). Reuses M1's surfel init + camera plan.
 - **M3 — SceneBench product:** bake orchestration (Modal, per cell, parallel); serving + pairing + Elo/vote backend; free-fly LOD-streamed frontend with synced A/B cameras + client post-FX (bloom/tonemap/vignette, not baked).
 
-**Dependency shape:** M1 stages are a chain (1→2, 3→4→5→6→7→8). Lighting (M2) touches only Stage 5 shading + optional bake + SH flag.
+**Dependency shape:** M1 stages are a strict chain (1→2→3→4→5→6→7→8) — free-space (2) feeds both surfels (3) and cameras (4); each stage consumes the previous stage's artifacts (you can't run Stage 4 off a raw mesh). Lighting (M2) touches only Stage 5 shading + optional bake + SH flag.
 
 ---
 
 ## 11. Tooling & references
 
 - **Mesh→splat conversion:** `mesh2gaussian`, `Mesh2Splat` (surface splatting from GLB, PBR-aware).
-- **Splat trainer:** `gsplat` / Nerfstudio `splatfacto` / Inria 3DGS (modify to init from surfels + add depth loss).
+- **Splat trainer (chosen):** **`gsplat` 2DGS** (`rasterization_2dgs` / `simple_trainer_2dgs`) — init from our surfels + alpha-gated depth loss, plus 2DGS's normal-consistency / depth-distortion regularizers. (`splatfacto` / Inria 3DGS remain 3DGS fallbacks.)
 - **2D Gaussian Splatting (surfels):** Huang et al., SIGGRAPH 2024 (`hbb1/2d-gaussian-splatting`); Gaussian Surfels.
 - **Compression / streaming:** SOG (Spatially Ordered Gaussians, PlayCanvas), SOGS (Self-Organizing Gaussians, Fraunhofer HHI), `.spz` (Niantic), Reduced-3DGS (per-Gaussian SH degree). SH is ~75–81% of a raw Gaussian's data.
-- **Web viewers:** Spark (Three.js), mkkellogg GaussianSplats3D (Three.js), PlayCanvas/SuperSplat (WebGPU + streamed SOG LOD).
+- **Web viewers:** mkkellogg GaussianSplats3D (Three.js — our client; **renders 2DGS**), PlayCanvas Engine v2.16+ / SuperSplat (WebGPU, **native 2DGS**), Spark (Three.js, 3DGS). *2DGS SOG/SPZ compression is still landing — see §12.*
 - **Reference rendering (unlit):** `nvdiffrast` — headless CUDA rasterizer (`RasterizeCudaContext`; no browser/EGL/display), albedo + depth + coverage, in the same PyTorch/CUDA process as the trainer. **CUDA-only** (RTX 3060 / Modal).
 - **Path tracing (lighting phase):** Blender Cycles / Mitsuba / OptiX; denoise OIDN/OptiX.
 - **Lighting-into-GS / PBR mesh→GS literature:** CVPR-W 2026 "Efficient Conversion of 3D PBR Meshes to a Relightable Triplane-Based 3DGS for Transmission"; TexGaussian (CVPR 2025); MGM; GBake (reflection probes); GI-GS / GS-IR / Relightable 3D Gaussians; PRTGS. Baking lineage: SNeRG, MERF (browser), BakedSDF.
@@ -222,7 +224,7 @@ Derived (not tuned): the **scene AABB** play volume.
 ## 12. Open questions to iterate on  [OPEN]
 
 - **Reference renderer:** **[DECIDED]** unlit → **nvdiffrast** (headless CUDA rasterizer, in-process with the trainer); lit → **Blender Cycles / Mitsuba** (path tracer) behind the same interface. Headless Three.js rejected (browser/WebGL on a compute box, no upside). *Still open:* the exact lit backend, and whether heavy unlit render volume (views × cells) should move to Modal.
-- **Splat trainer:** **[DECIDED — unlit] `gsplat` on the local CUDA box** (RTX 3060 / 8 GB). **Locked Stage 4→5→6 contract** (verified against gsplat's `rasterization`, COLMAP parser, and `simple_trainer`): **OpenCV** camera convention (camera +Z forward, +Y down); Stage 5 emits per-view **camera-to-world** in `transforms.json` (`convention: opencv_c2w`) → trainer takes `viewmats = inv(c2w)`; pinhole `K` with `f = R/(2·tan(fov/2))`, `cx=cy=R/2`; **depth = planar camera-space Z in metres** (gsplat `render_mode="RGB+ED"`, projection depth — NOT ray distance); **albedo = sRGB 8-bit**, compared directly with no linearization (matches Stage-2 surfel colours); **SH degree 0** (unlit), so Stage-2 `cloud.ply` is a drop-in init (same `f_dc=(c−0.5)/C0`). Alpha-gated depth L1 is kept (gsplat renders depth). *Still open:* gsplat vs. splatfacto harness, chunked-training threshold, how invasive the surfel-init change is. (The Apple-Silicon **Brush** alternative has no depth loss — a CUDA-loss fallback only.)
+- **Splat trainer / representation:** **[DECIDED — unlit] 2DGS via `gsplat`** (`rasterization_2dgs` / `simple_trainer_2dgs`) on the local CUDA box (RTX 3060 / 8 GB) — flat surfel disks, a native fit for our mesh-init surfels and a better match for thin geometry, our exact depth references, and free-fly close-ups. Ecosystem verified sufficient (2026): **training** = gsplat 2DGS (projection depth `D`/`ED`, render-normals, depth-distortion + normal-consistency regularizers, same OpenCV `viewmats`/`Ks` conventions as the 3DGS path); **browser rendering** = PlayCanvas Engine v2.16+ native 2DGS, SuperSplat, and **mkkellogg `GaussianSplats3D` — already our client viewer**. **Locked Stage 4→5→6 contract (unchanged — 2DGS shares it):** **OpenCV** camera convention (+Z forward, +Y down); Stage 5 emits per-view **camera-to-world** in `transforms.json` (`convention: opencv_c2w`) → trainer takes `viewmats = inv(c2w)`; pinhole `K` (`f = R/(2·tan(fov/2))`, `cx=cy=R/2`); **depth = planar camera-space Z in metres** (`render_mode="RGB+ED"`, projection depth — NOT ray distance); **albedo = sRGB 8-bit** compared directly; **SH degree 0** (unlit). Stage-3 surfels are a drop-in init (2DGS `.ply` = ours minus the third scale). Alpha-gated depth L1 kept, plus 2DGS's normal/distortion regularizers for free. **One caveat — compressed streaming:** 2DGS→SOG (`splat-transform`) and SPZ are still landing (SOG support in-progress at PlayCanvas; SPZ/glTF KHR are 3DGS-centric). For M1 (rooms) deliver 2DGS uncompressed/lightly quantized via mkkellogg; if SOG/SPZ is needed sooner, flatten 2DGS→3DGS (`scale_2 = log(1e-6)`) for the compression step only. (Plain **3DGS** remains the fallback if we lose CUDA or need SOG/SPZ immediately.)
 - **SH strategy for lighting phase:** degree per surface class; how to detect "shiny enough" from metalness/roughness.
 - **LOD & chunking thresholds:** the scene-size cutoff for chunked training; LOD depth policy.
 - **Coverage budget defaults:** angles-per-patch and footprint budget starting values; collision clearance value (absolute vs. scaled to scene).

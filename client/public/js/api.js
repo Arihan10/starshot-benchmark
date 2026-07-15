@@ -127,10 +127,10 @@ export const api = {
     // Splat pipeline, per cell. `splatStageCells` lists a run's convertible cells
     // (those with a generated or library build) + each one's state — idle /
     // pending / running / done / error, with {done, total, current_id, summary}.
-    // Each cell also carries a `stage2` sub-state (same shape, plus a cloud `url`).
-    // The screen renders this on run select and polls it while any cell is busy.
-    // `splatStage1Start` assembles ONE cell into a `splat/scene.json` manifest;
-    // `splatStage2Start` samples its meshes into a `splat/cloud.ply` Gaussian cloud.
+    // Each cell also carries per-stage sub-states: `stage2` (free-space), `stage3`
+    // (surfels, plus a cloud `url`), `stage4` (cameras), `stage5` (refs). The screen
+    // renders this on run select and polls while any cell is busy.
+    // `splatStage1Start` assembles ONE cell into a `splat/scene.json` manifest.
     splatStageCells: (run) =>
         request(`/runs/${encodeURIComponent(run)}/splat/cells`),
     splatStage1Start: (run, slot, model) =>
@@ -138,9 +138,9 @@ export const api = {
             `/runs/${encodeURIComponent(run)}/splat/stage1/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
             { method: "POST" },
         ),
-    // `body` carries the live sampling knobs (target_splats / radius_frac /
-    // flatness / adaptive / detail_splats); omit for defaults. `splatStage2Status`
-    // polls one cell's live sampling state (phase + progress + cloud/detail URLs).
+    // Stage 2 (free-space voxelizer + clearance + reachability). `body` may carry
+    // `pitch`/`refine`/`margin`. Status returns the `voxels.bin` viz URL the viewer
+    // draws as an overlay.
     splatStage2Start: (run, slot, model, body) =>
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage2/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
@@ -150,8 +150,9 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage2/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
-    // Stage 3 (free-space voxelizer + clearance field). `body` may carry `pitch`
-    // (m). Status returns the `voxels.bin` URL the viewer draws as an overlay.
+    // Stage 3 (surfel sampler → cloud.ply). `body` carries sampling knobs
+    // (target_splats / radius_frac / flatness / adaptive / cull_hidden /
+    // detail_splats); requires Stage 2 first. Status returns cloud/detail URLs.
     splatStage3Start: (run, slot, model, body) =>
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage3/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
@@ -160,6 +161,28 @@ export const api = {
     splatStage3Status: (run, slot, model) =>
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage3/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+        ),
+    // Stage 4 (coverage camera planner → cameras.json) and Stage 5 (unlit
+    // nvdiffrast reference renders → refs/). `splatStage4Start` body may carry
+    // PlanParams knobs; Stage 5 takes none. Stage 5 requires Stage 4 done, and is
+    // CUDA-only (a non-GPU server returns a clear 'needs CUDA' error).
+    splatStage4Start: (run, slot, model, body) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage4/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+            { method: "POST", body },
+        ),
+    splatStage4Status: (run, slot, model) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage4/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+        ),
+    splatStage5Start: (run, slot, model) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage5/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+            { method: "POST" },
+        ),
+    splatStage5Status: (run, slot, model) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage5/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
     // Live snapshot of the process-global mesh queue — every in-flight + waiting
     // generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
