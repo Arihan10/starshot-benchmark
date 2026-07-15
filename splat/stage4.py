@@ -90,7 +90,14 @@ class PlanParams:
     angular_sectors: int = 8          # azimuthal quantization around the patch normal
     near_frac: float = 0.5            # a "near" (detail) view is within near_frac*view_dist
     min_gain: int = 1                 # stop once the best camera adds < this many
-    max_candidates: int = 5000        # cap on candidate camera positions
+    # Candidate positions are drawn from the NEAR-SURFACE band (reachable cells with
+    # clearance in [collision_clearance, view_dist_max] — farther cells see nothing
+    # within view distance) at ~`candidate_spacing` apart, so the candidate COUNT
+    # scales with the near-surface area, not a fixed budget. `max_candidates` is only
+    # a SAFETY ceiling (even-downsample + warn if a scene ever exceeds it), not the
+    # room-scale cap it used to be.
+    candidate_spacing: float = 0.5    # target spacing (m) between candidate positions
+    max_candidates: int = 200_000     # safety ceiling on candidate positions
     # Cube-face reference-render intrinsics (SHARED with Stage 5). FOV fixed at 90°
     # (six faces tile 360°); footprint_k (hence view_dist) is DERIVED from the render
     # resolution + min_px_per_patch so coverage distances match what Stage 5 renders.
@@ -121,6 +128,7 @@ class PlanParams:
             "angles_per_patch": self.angles_per_patch,
             "angular_sectors": self.angular_sectors,
             "near_frac": self.near_frac,
+            "candidate_spacing": self.candidate_spacing,
             "max_candidates": self.max_candidates,
             "face_fov_deg": self.face_fov_deg,
             "render_resolution": self.render_resolution,
@@ -199,18 +207,26 @@ def _adaptive_patches(
     return np.nonzero(keep)[0]
 
 
-def _candidates(fs: FreeSpace, p: PlanParams, rng: np.random.Generator) -> np.ndarray:
-    """Candidate camera positions: reachable free cells (Stage 2) with clearance ≥
-    collision_clearance, subsampled to ≤ max_candidates with weight ∝ 1/clearance²
-    (denser near surfaces). Returns (M,3) world points."""
-    centers, clv = fs.free_candidates(p.collision_clearance)
+def _candidates(fs: FreeSpace, p: PlanParams) -> np.ndarray:
+    """Candidate camera positions: reachable NEAR-SURFACE free cells (clearance in
+    [collision_clearance, view_dist_max]) sampled ~`candidate_spacing` apart, so the
+    count scales with the near-surface area rather than a fixed budget. If a scene
+    still exceeds `max_candidates`, evenly downsample (and warn) — never silently
+    fall back to a room-scale cap. Returns (M,3) world points."""
+    centers, _ = fs.free_candidates(
+        p.collision_clearance, p.view_dist_max, p.candidate_spacing
+    )
     if len(centers) == 0:
         return np.zeros((0, 3), dtype=np.float32)
-    if len(centers) > p.max_candidates:
-        w = 1.0 / np.maximum(clv, fs.pitch) ** 2
-        w /= w.sum()
-        pick = rng.choice(len(centers), size=p.max_candidates, replace=False, p=w)
-        centers = centers[pick]
+    if p.max_candidates and len(centers) > p.max_candidates:
+        step = int(np.ceil(len(centers) / p.max_candidates))
+        logging.warning(
+            "stage4: %d near-surface candidates at spacing %.2fm exceeds the "
+            "max_candidates ceiling %d; even-downsampling by %dx (raise "
+            "max_candidates or candidate_spacing to keep full density)",
+            len(centers), p.candidate_spacing, p.max_candidates, step,
+        )
+        centers = centers[::step]
     return centers
 
 
@@ -407,8 +423,8 @@ def plan_cameras(
         params.footprint_k * patch_feat, params.view_dist_min, params.view_dist_max
     ).astype(np.float32)
 
-    # Candidate camera positions from the reachable free space (no re-voxelization).
-    candidates = _candidates(fs, params, rng)
+    # Candidate camera positions from the reachable near-surface band (no re-voxelization).
+    candidates = _candidates(fs, params)
     if len(candidates) == 0:
         raise RuntimeError("no candidate camera positions (reachable free space empty)")
 
@@ -519,7 +535,7 @@ def plan_cameras(
     # Shared cube-face intrinsics Stage 5 renders with (and Stage 6 trains against).
     # near < collision_clearance so a surface at the clearance limit isn't clipped;
     # far spans the full free-space grid diagonal (the play volume).
-    grid_diag = float(np.linalg.norm(np.array(fs.occ_fine.shape) * fs.pitch_fine))
+    grid_diag = float(np.linalg.norm(np.array(fs.fine_shape) * fs.pitch_fine))
     intrinsics = {
         "face_fov_deg": params.face_fov_deg,
         "resolution": params.render_resolution,

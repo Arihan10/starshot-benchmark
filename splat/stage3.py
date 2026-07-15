@@ -53,6 +53,10 @@ CLOUD_NAME = "cloud.ply"
 _SH_C0 = 0.28209479177387814
 
 DEFAULT_TARGET_SPLATS = 150_000
+# Surfel budget as a DENSITY (surfels per m² of surface) rather than a fixed count,
+# so the cloud resolution stays constant as scenes grow (count scales with area).
+# ~80/m² reproduces the previous 150k default on a room-scale (~1900 m²) cell.
+DEFAULT_SPLAT_DENSITY = 80.0
 DEFAULT_RADIUS_FRAC = 0.9
 DEFAULT_FLATNESS = 0.1
 
@@ -75,7 +79,8 @@ class SampleParams:
     scales spacing per object; `cull_hidden` drops surfels with no reachable free
     space on either side (needs the Stage-2 grid)."""
 
-    target_splats: int = DEFAULT_TARGET_SPLATS
+    target_splats: int | None = None      # explicit count override; else density × area
+    splat_density: float | None = DEFAULT_SPLAT_DENSITY  # surfels per m² (area-scaled count)
     base_spacing: float | None = None
     radius_frac: float = DEFAULT_RADIUS_FRAC
     flatness: float = DEFAULT_FLATNESS   # 3dgs-mode only: thin third scale = radius*flatness
@@ -86,6 +91,7 @@ class SampleParams:
     def as_summary(self) -> dict[str, Any]:
         return {
             "target_splats": self.target_splats,
+            "splat_density": self.splat_density,
             "base_spacing": self.base_spacing,
             "radius_frac": self.radius_frac,
             "flatness": self.flatness,
@@ -383,13 +389,26 @@ def _scene_area_and_diag(raw_dir: Path, ids: list[str]) -> tuple[float, float]:
     return area, diag
 
 
+def _effective_target(params: SampleParams, total_area: float) -> int | None:
+    """The surfel count the packing model aims for: an explicit `target_splats` if
+    given, else `splat_density × total_area` (so the count — and thus fidelity —
+    scales with surface area instead of a fixed room-scale budget)."""
+    if params.target_splats:
+        return int(params.target_splats)
+    if params.splat_density and total_area > 0:
+        return int(round(params.splat_density * total_area))
+    return None
+
+
 def _resolve_base_spacing(params: SampleParams, total_area: float, diag: float) -> float:
-    """Base surfel spacing (metres): explicit override, else target_splats via the
-    packing model, else ~0.3% of the scene diagonal. Always clamped."""
+    """Base surfel spacing (metres): explicit override, else the area-scaled target
+    (density × area, or an explicit count) via the packing model, else ~0.3% of the
+    scene diagonal. Always clamped."""
+    target = _effective_target(params, total_area)
     if params.base_spacing is not None:
         s = params.base_spacing
-    elif params.target_splats and total_area > 0:
-        s = float((_AREAL_K * total_area / params.target_splats) ** (1.0 / _SPACING_EXP))
+    elif target and total_area > 0:
+        s = float((_AREAL_K * total_area / target) ** (1.0 / _SPACING_EXP))
     else:
         s = diag * 0.003
     return float(np.clip(s, *_SPACING_CLAMP))
@@ -483,6 +502,7 @@ def sample_cell(
         "objects_sampled": objects_sampled,
         "objects_total": total,
         "base_spacing": base_spacing,
+        "target_effective": _effective_target(params, total_area),
         "total_area": round(total_area, 2),
         "params": params.as_summary(),
         "scene_aabb": {"min": aabb_min, "max": aabb_max},

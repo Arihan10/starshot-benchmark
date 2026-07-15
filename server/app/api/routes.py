@@ -2027,11 +2027,13 @@ async def _run_splat_stage2_cell(
 
 class Stage3Request(BaseModel):
     """Surfel sampler knobs (Stage 3). All optional; omitted → sampler defaults.
-    `base_spacing` (m) overrides `target_splats`; `detail_splats` also builds a denser
-    `cloud.detail.ply` LOD; `cull_hidden` drops surfels with no reachable free space
-    on either side (uses the Stage-2 grid)."""
+    Count is set by `splat_density` (surfels per m², so it scales with surface area);
+    `target_splats` (explicit count) or `base_spacing` (m) override it. `detail_splats`
+    also builds a denser `cloud.detail.ply` LOD; `cull_hidden` drops surfels with no
+    reachable free space on either side (uses the Stage-2 grid)."""
 
-    target_splats: int = splat_stage3.DEFAULT_TARGET_SPLATS
+    target_splats: int | None = None      # explicit count override; else density × area
+    splat_density: float | None = None     # surfels per m² (area-scaled count; the default)
     base_spacing: float | None = None
     radius_frac: float = splat_stage3.DEFAULT_RADIUS_FRAC
     flatness: float = splat_stage3.DEFAULT_FLATNESS
@@ -2046,7 +2048,18 @@ def _stage3_params(
 ) -> tuple[splat_stage3.SampleParams, splat_stage3.SampleParams | None]:
     """Clamp a request into a (base, detail|None) SampleParams pair."""
     req = req or Stage3Request()
-    target = int(min(max(req.target_splats, 5_000), 3_000_000))
+    # Count is area-scaled by DENSITY by default; an explicit target_splats overrides.
+    # The ceiling is generous (not a room-scale cap) so large scenes aren't clipped.
+    target = (
+        int(min(max(req.target_splats, 5_000), 50_000_000))
+        if req.target_splats is not None
+        else None
+    )
+    density = (
+        float(min(max(req.splat_density, 2.0), 2_000.0))
+        if req.splat_density is not None
+        else splat_stage3.DEFAULT_SPLAT_DENSITY
+    )
     radius = float(min(max(req.radius_frac, 0.3), 3.0))
     flat = float(min(max(req.flatness, 0.01), 0.5))
     base_spacing = (
@@ -2056,15 +2069,15 @@ def _stage3_params(
     )
     rep = req.representation if req.representation in ("2dgs", "3dgs") else "2dgs"
     base = splat_stage3.SampleParams(
-        target_splats=target, base_spacing=base_spacing, radius_frac=radius,
-        flatness=flat, adaptive=bool(req.adaptive), cull_hidden=bool(req.cull_hidden),
-        representation=rep,
+        target_splats=target, splat_density=density, base_spacing=base_spacing,
+        radius_frac=radius, flatness=flat, adaptive=bool(req.adaptive),
+        cull_hidden=bool(req.cull_hidden), representation=rep,
     )
     detail = None
     if req.detail_splats:
         detail = splat_stage3.SampleParams(
-            target_splats=int(min(max(req.detail_splats, target), 5_000_000)),
-            base_spacing=None, radius_frac=radius, flatness=flat,
+            target_splats=int(min(max(req.detail_splats, 50_000), 50_000_000)),
+            splat_density=None, base_spacing=None, radius_frac=radius, flatness=flat,
             adaptive=bool(req.adaptive), cull_hidden=bool(req.cull_hidden),
             representation=rep,
         )
@@ -2227,6 +2240,7 @@ class Stage4Request(BaseModel):
     near_frac: float | None = None
     tex_k: float | None = None
     min_gain: int | None = None
+    candidate_spacing: float | None = None
     max_candidates: int | None = None
     render_resolution: int | None = None
     min_px_per_patch: float | None = None
@@ -2250,7 +2264,10 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         angular_sectors=int(pick(req.angular_sectors, 3, 16, d.angular_sectors)),
         near_frac=pick(req.near_frac, 0.1, 1.0, d.near_frac),
         min_gain=int(pick(req.min_gain, 1, 500, d.min_gain)),
-        max_candidates=int(pick(req.max_candidates, 200, 20000, d.max_candidates)),
+        candidate_spacing=pick(req.candidate_spacing, 0.1, 3.0, d.candidate_spacing),
+        # Generous safety ceiling (was a room-scale 20k cap); Stage 4 even-downsamples
+        # and warns if a scene exceeds it, so large scenes aren't silently clipped.
+        max_candidates=int(pick(req.max_candidates, 1000, 5_000_000, d.max_candidates)),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
         min_px_per_patch=pick(req.min_px_per_patch, 2.0, 64.0, d.min_px_per_patch),
     )

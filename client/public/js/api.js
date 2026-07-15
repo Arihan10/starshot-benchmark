@@ -165,8 +165,8 @@ export const api = {
             `/runs/${encodeURIComponent(run)}/splat/stage2/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
     // Stage 3 (surfel sampler → cloud.ply). `body` carries sampling knobs
-    // (target_splats / radius_frac / flatness / adaptive / cull_hidden /
-    // detail_splats); requires Stage 2 first. Status returns cloud/detail URLs.
+    // (splat_density / target_splats / radius_frac / flatness / adaptive /
+    // cull_hidden / detail_splats); requires Stage 2 first. Status returns cloud/detail URLs.
     splatStage3Start: (run, slot, model, body) =>
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage3/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,

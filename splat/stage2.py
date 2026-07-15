@@ -10,11 +10,15 @@ recomputes occupancy; that's the point of running this first (overview §, Optio
 DUAL RESOLUTION (the "adaptive" part). Two aligned grids sharing one origin:
   * a FINE occupancy grid (`pitch_fine = pitch / refine`) — accurate near surfaces,
     so thin occluders/gaps aren't missed by the visibility ray-march or the surfel
-    hidden-face test;
+    hidden-face test. Stored SPARSELY (sorted linear indices of the occupied cells
+    only) so its memory tracks the amount of SURFACE, not the scene's bounding-box
+    VOLUME — the fine resolution stays fixed regardless of scene size (no
+    auto-coarsening), and huge open scenes no longer blow up a dense array.
   * a COARSE clearance field (`pitch`, a navigational scale) — the distance from
     each empty cell to the nearest surface, driving camera candidate placement.
-The coarse occupancy is a block-max of the fine grid, so the two never disagree.
-A cell-count guard coarsens `pitch_fine` for very large scenes to bound memory.
+The coarse occupancy is derived from the same occupied fine cells, so the two never
+disagree. The coarse field is genuinely volumetric (it measures empty space) and so
+stays dense; it is the next thing to chunk for extreme scene sizes.
 
 Occupancy is a SURFACE voxelization via dense area-weighted point sampling (robust
 for the non-watertight composed scene). Interior cells of thick solids read as
@@ -59,8 +63,30 @@ _PITCH_CLAMP = (0.02, 1.0)
 _OVERSAMPLE = 4.0
 # Cap the exported free-voxel viz cloud (stride if a scene has more).
 _MAX_VIZ_VOXELS = 500_000
-# Guard on the dense fine grid — coarsen pitch_fine if a scene would exceed this.
-_MAX_FINE_CELLS = 120_000_000
+
+# Absolute-lattice voxel encoding: occupied fine voxels are binned in a scene-
+# independent integer lattice (floor(point / pitch_fine)) so binning needs no origin
+# (computed only after the AABB is known). Coords are packed into one int64 with a
+# large offset+radix, supporting a ±_VOX_OFF-cell span (~±42 km at 0.04 m).
+_VOX_OFF = 1 << 20
+_VOX_RADIX = 1 << 21
+
+
+def _abs_encode(vox: np.ndarray) -> np.ndarray:
+    """Pack (N,3) absolute integer voxel coords into sorted-able int64 keys."""
+    v = vox.astype(np.int64)
+    return ((v[:, 0] + _VOX_OFF) * _VOX_RADIX + (v[:, 1] + _VOX_OFF)) * _VOX_RADIX + (
+        v[:, 2] + _VOX_OFF
+    )
+
+
+def _abs_decode(lin: np.ndarray) -> np.ndarray:
+    """Inverse of `_abs_encode`: int64 keys → (N,3) absolute voxel coords."""
+    lin = lin.astype(np.int64)
+    iz = lin % _VOX_RADIX - _VOX_OFF
+    iy = (lin // _VOX_RADIX) % _VOX_RADIX - _VOX_OFF
+    ix = lin // (_VOX_RADIX * _VOX_RADIX) - _VOX_OFF
+    return np.stack([ix, iy, iz], axis=1)
 
 # progress(done, total, current_id) — called after each object is voxelized.
 ProgressCb = Callable[[int, int, str], None]
@@ -90,17 +116,19 @@ class FreeSpaceParams:
 
 @dataclass(frozen=True)
 class FreeSpace:
-    """A loaded free-space grid. Aligned grids share `origin`: the fine occupancy
-    (`occ_fine`, edge `pitch_fine`), the coarse clearance (`clearance`, edge
-    `pitch`, metres), and the coarse `reachable` mask (free cells in a large enough
-    connected component — exterior + rooms, minus tiny object-interior hollows).
-    `refine = pitch / pitch_fine`."""
+    """A loaded free-space grid. Aligned grids share `origin`: the SPARSE fine
+    occupancy (`occ_lin` — sorted linear indices into a `fine_dims` grid of edge
+    `pitch_fine`), the coarse clearance (`clearance`, edge `pitch`, metres), and the
+    coarse `reachable` mask (free cells in a large enough connected component —
+    exterior + rooms, minus tiny object-interior hollows). `refine = pitch /
+    pitch_fine`."""
 
     origin: np.ndarray        # (3,) world corner of fine cell [0,0,0]
     pitch: float              # coarse edge (m)
     pitch_fine: float         # fine edge (m)
     refine: int
-    occ_fine: np.ndarray      # bool [fx,fy,fz]
+    fine_dims: np.ndarray     # (3,) int64 fine grid dims [fnx,fny,fnz]
+    occ_lin: np.ndarray       # (K,) int64 SORTED linear indices of occupied fine cells
     clearance: np.ndarray     # float32 [cx,cy,cz] (m)
     reachable: np.ndarray     # bool [cx,cy,cz] — navigable free space
 
@@ -108,15 +136,25 @@ class FreeSpace:
     def coarse_dims(self) -> tuple[int, int, int]:
         return self.clearance.shape  # type: ignore[return-value]
 
+    @property
+    def fine_shape(self) -> tuple[int, int, int]:
+        return (int(self.fine_dims[0]), int(self.fine_dims[1]), int(self.fine_dims[2]))
+
     def fine_occupied(self, points: np.ndarray) -> np.ndarray:
-        """Boolean per world point: does its FINE voxel contain surface? Points
-        outside the grid read as False (empty)."""
+        """Boolean per world point: does its FINE voxel contain surface? Membership
+        is a binary search into the sorted sparse `occ_lin`. Points outside the grid
+        read as False (empty)."""
         idx = np.floor((points - self.origin) / self.pitch_fine).astype(np.int64)
-        dims = np.asarray(self.occ_fine.shape)
+        dims = self.fine_dims
         inb = np.all((idx >= 0) & (idx < dims), axis=1)
         out = np.zeros(len(points), dtype=bool)
+        if not self.occ_lin.size or not inb.any():
+            return out
         ii = idx[inb]
-        out[inb] = self.occ_fine[ii[:, 0], ii[:, 1], ii[:, 2]]
+        lin = (ii[:, 0] * dims[1] + ii[:, 1]) * dims[2] + ii[:, 2]
+        pos = np.searchsorted(self.occ_lin, lin)
+        pos = np.clip(pos, 0, self.occ_lin.size - 1)
+        out[inb] = self.occ_lin[pos] == lin
         return out
 
     def reachable_free(self, points: np.ndarray) -> np.ndarray:
@@ -132,25 +170,76 @@ class FreeSpace:
         out[inb] = self.reachable[ii[:, 0], ii[:, 1], ii[:, 2]]
         return out
 
-    def free_candidates(self, min_clearance: float) -> tuple[np.ndarray, np.ndarray]:
-        """NAVIGABLE free-cell world centres with clearance ≥ `min_clearance`, and
-        their clearances — the camera-candidate pool for Stage 4. Restricted to
-        reachable space, so cameras never spawn inside solids/tiny hollows."""
+    def free_candidates(
+        self,
+        min_clearance: float,
+        max_clearance: float | None = None,
+        spacing: float | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """NAVIGABLE free-cell world centres (+ their clearances) — the camera-
+        candidate pool for Stage 4. Restricted to reachable space, so cameras never
+        spawn inside solids/tiny hollows.
+
+        `max_clearance` keeps only the NEAR-SURFACE band (cells whose nearest surface
+        is within reach of a camera); cells farther than any view distance can see
+        nothing and are dropped. `spacing` (m) thins the band to ~one candidate per
+        `spacing`-sized block, picking the MOST-OPEN cell in each block — so the
+        candidate count scales with the near-surface area, not a fixed budget."""
         free = self.reachable & (self.clearance >= min_clearance)
-        cells = np.argwhere(free)
+        if max_clearance is not None:
+            free &= self.clearance <= max_clearance
+        stride = 1 if spacing is None else max(1, int(round(spacing / self.pitch)))
+        if stride == 1:
+            cells = np.argwhere(free)
+            centers = (self.origin + (cells + 0.5) * self.pitch).astype(np.float32)
+            return centers, self.clearance[free]
+        # One representative per stride³ block: the eligible cell CLOSEST to a surface
+        # (smallest clearance, but still ≥ collision_clearance) — closest safe camera
+        # spots best serve the near/detail-view coverage requirement. Pad up so no
+        # edge block is lost; +inf marks ineligible cells.
+        score = np.where(free, self.clearance, np.float32(np.inf))
+        nx, ny, nz = score.shape
+        pad = [(-nx) % stride, (-ny) % stride, (-nz) % stride]
+        score = np.pad(score, [(0, pad[0]), (0, pad[1]), (0, pad[2])], constant_values=np.inf)
+        pnx, pny, pnz = score.shape
+        blocks = (
+            score.reshape(pnx // stride, stride, pny // stride, stride, pnz // stride, stride)
+            .transpose(0, 2, 4, 1, 3, 5)
+            .reshape(pnx // stride, pny // stride, pnz // stride, stride**3)
+        )
+        best = blocks.argmin(axis=3)
+        keep = np.isfinite(blocks.min(axis=3))
+        bxyz = np.argwhere(keep)
+        off = best[keep]
+        ox, oy, oz = off // (stride * stride), (off // stride) % stride, off % stride
+        cells = np.stack(
+            [bxyz[:, 0] * stride + ox, bxyz[:, 1] * stride + oy, bxyz[:, 2] * stride + oz],
+            axis=1,
+        )
         centers = (self.origin + (cells + 0.5) * self.pitch).astype(np.float32)
-        return centers, self.clearance[free]
+        return centers, self.clearance[cells[:, 0], cells[:, 1], cells[:, 2]]
 
 
 def load_free_space(path: Path) -> FreeSpace:
-    """Load a `freespace.npz` written by `compute_free_space`."""
+    """Load a `freespace.npz` written by `compute_free_space`. Accepts the sparse
+    layout (`fine_dims` + `occ_lin`) and, for back-compat, a legacy dense `occ_fine`
+    (flattened to sparse on load)."""
     with np.load(path) as z:
+        files = set(z.files)
+        if "occ_lin" in files:
+            fine_dims = z["fine_dims"].astype(np.int64)
+            occ_lin = z["occ_lin"].astype(np.int64)
+        else:  # legacy dense occupancy → sparse (C-order linear matches fine_occupied)
+            occ = z["occ_fine"].astype(bool)
+            fine_dims = np.array(occ.shape, dtype=np.int64)
+            occ_lin = np.flatnonzero(occ.reshape(-1)).astype(np.int64)
         return FreeSpace(
             origin=z["origin"].astype(np.float64),
             pitch=float(z["pitch"]),
             pitch_fine=float(z["pitch_fine"]),
             refine=int(z["refine"]),
-            occ_fine=z["occ_fine"].astype(bool),
+            fine_dims=fine_dims,
+            occ_lin=occ_lin,
             clearance=z["clearance"].astype(np.float32),
             reachable=z["reachable"].astype(bool),
         )
@@ -173,13 +262,6 @@ def placed_object_ids(raw_dir: Path) -> list[str]:
         for p in raw_dir.glob("*.glb")
         if not p.name.endswith(".raw.glb")
     )
-
-
-def _block_max(occ: np.ndarray, r: int) -> np.ndarray:
-    """Down-sample a fine boolean grid to coarse by OR-ing each r×r×r block (a cell
-    is solid if any fine sub-cell is). `occ` dims must be multiples of r."""
-    fx, fy, fz = occ.shape
-    return occ.reshape(fx // r, r, fy // r, r, fz // r, r).any(axis=(1, 3, 5))
 
 
 def compute_free_space(
@@ -209,8 +291,12 @@ def compute_free_space(
     if progress is not None:
         progress(0, total, "")
 
-    # One pass: accumulate world surface points + the union AABB.
-    pts_parts: list[np.ndarray] = []
+    # One pass: sample each surface, binning points into an ABSOLUTE integer voxel
+    # lattice (floor(point / pitch_fine)) and keeping only the UNIQUE occupied cells,
+    # so we never hold the raw point cloud — memory tracks surface, not volume. The
+    # grid origin (which needs the AABB) is resolved afterwards; absolute-lattice
+    # keys are origin-independent.
+    key_parts: list[np.ndarray] = []
     lo = np.array([np.inf, np.inf, np.inf])
     hi = np.array([-np.inf, -np.inf, -np.inf])
     for done, node_id in enumerate(ids, start=1):
@@ -223,44 +309,41 @@ def compute_free_space(
                 lo, hi = np.minimum(lo, b[0]), np.maximum(hi, b[1])
                 count = int(g.area / (pitch_fine * pitch_fine) * _OVERSAMPLE) + 8
                 p, _ = trimesh.sample.sample_surface(g, count)
-                pts_parts.append(np.asarray(p, dtype=np.float32))
+                vox = np.floor(np.asarray(p, dtype=np.float64) / pitch_fine).astype(np.int64)
+                key_parts.append(np.unique(_abs_encode(vox)))
             del m
         except Exception:  # skip a bad mesh, keep going
             pass
         if progress is not None:
             progress(done, total, node_id)
 
-    if not pts_parts or not np.isfinite(lo).all():
+    if not key_parts or not np.isfinite(lo).all():
         raise RuntimeError("no surface sampled (every mesh failed or was empty)")
-    pts = np.concatenate(pts_parts, axis=0)
+    occ_abs = _abs_decode(np.unique(np.concatenate(key_parts)))  # (K,3) absolute coords
 
-    # Fine grid over the AABB + margin. Origin one fine-voxel below the padded box so
-    # boundary cells are empty; fine dims padded to a multiple of `refine` so the
-    # coarse grid is an exact block-reduction.
-    origin = lo - margin - pitch_fine
-    extent = (hi - lo) + 2.0 * margin + 2.0 * pitch_fine
-    fdims = np.ceil(extent / pitch_fine).astype(int) + 1
+    # Fine grid over the AABB + margin, origin snapped to the absolute lattice (a
+    # multiple of pitch_fine, and of `refine` cells so the coarse grid is an exact
+    # block-reduction). No cell-count guard: occupancy is sparse, so the fine
+    # resolution is held fixed regardless of scene size.
+    imin = np.floor((lo - margin) / pitch_fine).astype(np.int64) - 1
+    imin -= imin % refine  # align down to a coarse-cell boundary
+    imax = np.ceil((hi + margin) / pitch_fine).astype(np.int64) + 1
+    fdims = (imax - imin) + 1
     fdims = ((np.maximum(fdims, refine) + refine - 1) // refine) * refine  # multiple of refine
-
-    # Guard memory: coarsen pitch_fine (drop refine) if the fine grid is too large.
-    while int(np.prod(fdims)) > _MAX_FINE_CELLS and refine > 1:
-        refine -= 1
-        pitch_fine = pitch / refine
-        origin = lo - margin - pitch_fine
-        extent = (hi - lo) + 2.0 * margin + 2.0 * pitch_fine
-        fdims = np.ceil(extent / pitch_fine).astype(int) + 1
-        fdims = ((np.maximum(fdims, refine) + refine - 1) // refine) * refine
     fnx, fny, fnz = int(fdims[0]), int(fdims[1]), int(fdims[2])
+    origin = imin.astype(np.float64) * pitch_fine
 
-    # Fine occupancy: bin surface points → solid fine cells.
-    vidx = np.floor((pts - origin) / pitch_fine).astype(np.int64)
-    inb = np.all((vidx >= 0) & (vidx < fdims), axis=1)
-    vidx = vidx[inb]
-    occ_fine = np.zeros((fnx, fny, fnz), dtype=bool)
-    occ_fine[vidx[:, 0], vidx[:, 1], vidx[:, 2]] = True
+    # Occupied fine cells → local linear indices (drop any outside the padded grid).
+    local = occ_abs - imin
+    inb = np.all((local >= 0) & (local < fdims), axis=1)
+    local = local[inb]
+    occ_lin = np.unique((local[:, 0] * fny + local[:, 1]) * fnz + local[:, 2])
 
-    # Coarse occupancy (block-max) → clearance (EDT over empties), in metres.
-    occ_coarse = _block_max(occ_fine, refine)
+    # Coarse occupancy from the same occupied cells (a coarse cell is solid if any
+    # fine sub-cell is) → clearance (EDT over empties), in metres.
+    occ_coarse = np.zeros((fnx // refine, fny // refine, fnz // refine), dtype=bool)
+    cc = local // refine
+    occ_coarse[cc[:, 0], cc[:, 1], cc[:, 2]] = True
     clearance = ndimage.distance_transform_edt(~occ_coarse).astype(np.float32) * pitch
 
     # Reachability: label connected free components (6-connectivity) and keep only
@@ -286,7 +369,8 @@ def compute_free_space(
         pitch=np.float64(pitch),
         pitch_fine=np.float64(pitch_fine),
         refine=np.int64(refine),
-        occ_fine=occ_fine,
+        fine_dims=np.array([fnx, fny, fnz], dtype=np.int64),
+        occ_lin=occ_lin.astype(np.int64),
         clearance=clearance,
         reachable=reachable,
     )
@@ -321,7 +405,7 @@ def compute_free_space(
         "dims_coarse": list(occ_coarse.shape),
         "origin": [round(v, 5) for v in origin.tolist()],
         "scene_aabb": {"min": lo.tolist(), "max": hi.tolist()},
-        "solid_voxels_fine": int(occ_fine.sum()),
+        "solid_voxels_fine": int(occ_lin.size),
         "free_voxels": int(free_coarse.sum()),
         "reachable_voxels": reach_count,
         "exported_voxels": int(sel.shape[0]),

@@ -596,9 +596,16 @@ function buildControls(summary) {
     inputs = {};
     controlsEl.replaceChildren();
 
+    // Surfel budget is a DENSITY (surfels per m²) so it scales with scene size; the
+    // count/size estimate needs the cell's surface area (known after a first sample).
+    const area = (summary && summary.total_area) || 0;
+    const dFmt = (v) =>
+        area
+            ? `${v}/m² · ~${Math.round((v * area) / 1000)}k · ${((v * area * BYTES_PER_SPLAT) / 1e6).toFixed(0)}MB`
+            : `${v}/m²`;
     const density = sliderRow(
-        "density", "density", 20000, 1200000, 10000,
-        p.target_splats || 150000, kFmt,
+        "density", "surfels/m²", 10, 300, 5,
+        p.splat_density || 80, dFmt,
     );
     const radius = sliderRow(
         "radius", "overlap", 0.5, 1.6, 0.05,
@@ -704,7 +711,7 @@ function actualText(summary) {
 
 function readParams() {
     const body = {
-        target_splats: Math.round(Number(inputs.density.value)),
+        splat_density: Number(inputs.density.value),
         radius_frac: Number(inputs.radius.value),
         flatness: Number(inputs.flatness.value),
         adaptive: inputs.adaptive.checked,
