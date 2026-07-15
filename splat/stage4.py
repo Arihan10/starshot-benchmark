@@ -262,8 +262,9 @@ def _build_coverage(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Covering (candidate, patch) pairs, each tagged with the azimuthal SECTOR the
     camera views the patch from and whether it's a NEAR (detail-distance) view. A
-    pair exists if the camera is front-facing, within the patch's view distance, and
-    unoccluded. Returns COO arrays (cand_idx, patch_idx, sector, is_near)."""
+    pair exists if the camera is within the patch's view distance from EITHER side
+    (two-sided; winding-agnostic) and unoccluded. Returns COO arrays (cand_idx,
+    patch_idx, sector, is_near)."""
     tree = cKDTree(patch_pos)
     n_steps = int(np.ceil(p.view_dist_max / fs.pitch_fine)) + 2
     a = p.angular_sectors
@@ -278,8 +279,15 @@ def _build_coverage(
         d = patch_pos[idx] - cam
         dist = np.linalg.norm(d, axis=1)
         dist = np.where(dist < 1e-6, 1e-6, dist)
-        facing = np.einsum("mc,mc->m", patch_nrm[idx], -d) > 0
-        sel = facing & (dist <= view_dist[idx])
+        # TWO-SIDED coverage: a candidate may see a patch from EITHER side (|cos|),
+        # not just the side its normal points. TRELLIS winding is unreliable and its
+        # meshes are thin shells with reachable free space on BOTH sides — so Stage
+        # 3's orient-to-free-space keeps the original (often inward) winding, and a
+        # SIGNED front-facing test then wrongly culls ~half the surface. A small
+        # grazing cutoff drops near-edge-on views; the occlusion ray-march (below)
+        # still stops a camera seeing a patch through solid geometry.
+        cos = np.abs(np.einsum("mc,mc->m", patch_nrm[idx], d)) / dist
+        sel = (cos > 0.1) & (dist <= view_dist[idx])
         cand, cdist = idx[sel], dist[sel]
         if len(cand) == 0:
             continue

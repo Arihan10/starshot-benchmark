@@ -231,6 +231,9 @@ async function loadClouds(seq, url, detailUrl, summary, camera) {
         await v.addSplatScene(url, {
             showLoadingUI: true,
             splatAlphaRemovalThreshold: 1,
+            // Set the format explicitly: the cache-buster query (`?t=…`) defeats
+            // mkkellogg's extension sniffing ("File format not supported").
+            format: GaussianSplats3D.SceneFormat.Ply,
         });
     } catch (e) {
         if (seq === openSeq) setStatus(`failed: ${e && e.message ? e.message : e}`, "var(--red)");
@@ -248,7 +251,11 @@ async function loadClouds(seq, url, detailUrl, summary, camera) {
     );
     if (!detailUrl) return;
     // Stream the denser LOD in the background; when it lands, drop the base scene.
-    v.addSplatScene(detailUrl, { showLoadingUI: false, splatAlphaRemovalThreshold: 1 })
+    v.addSplatScene(detailUrl, {
+        showLoadingUI: false,
+        splatAlphaRemovalThreshold: 1,
+        format: GaussianSplats3D.SceneFormat.Ply,
+    })
         .then(() => {
             if (seq !== openSeq || viewer !== v) return;
             try {
@@ -577,10 +584,12 @@ function buildControls(summary) {
     const overlay = el("div", { class: "svc-actual" });
     inputs._overlay = overlay;
     inputs._stepper = el("div", { class: "svc-stepper" });
+    inputs._coverage = el("div", { class: "svc-coverage" });
 
     controlsEl.append(
         el("div", { class: "svc-title", text: "pipeline" }),
         inputs._stepper,
+        inputs._coverage,
         el("div", { class: "svc-title", text: "view" }),
         seg,
         fsRow,
@@ -947,6 +956,55 @@ function renderStepper() {
             btn.title = st.error || "failed — click to retry";
         }
         row.appendChild(btn);
+        box.appendChild(row);
+    }
+    renderCoverage();
+}
+
+const fmtInt = (n) => (n == null ? "?" : Number(n).toLocaleString());
+
+// Coverage readout for the planned camera set (Stage 4's summary): how well the
+// greedy covered the surface, so we can tell at a glance if cameras/greedy are
+// healthy. Shown only once cameras are planned.
+function renderCoverage() {
+    const box = inputs && inputs._coverage;
+    if (!box) return;
+    box.replaceChildren();
+    const s4 = stageState(cellStatus, 4);
+    const sum = s4.status === "done" ? s4.summary : null;
+    if (!sum) return;
+    const cov = sum.coverage || {};
+    const patches = sum.patches || 0;
+    const seen = cov.seen_at_least_once || 0;
+    const sat = cov.satisfied || 0;
+    const satPct = cov.satisfied_pct != null ? cov.satisfied_pct : (patches ? Math.round((100 * sat) / patches) : 0);
+    const seenPct = patches ? Math.round((100 * seen) / patches) : 0;
+    const satColor = satPct >= 90 ? "var(--green)" : satPct >= 70 ? "#d0a020" : "var(--red)";
+
+    box.appendChild(el("div", { class: "svc-title", text: "coverage" }));
+    const rows = [
+        ["patches", fmtInt(patches), null],
+        ["cameras · candidates", `${fmtInt(sum.cameras)} · ${fmtInt(sum.candidates)}`, null],
+        ["satisfied (≥K angles)", `${fmtInt(sat)} · ${satPct}%`, satColor],
+        ["under-covered", fmtInt(Math.max(0, seen - sat)), null],
+        ["occlusion-culled", fmtInt(cov.occlusion_culled), cov.occlusion_culled ? "var(--red)" : null],
+        ["reached (≥1 view)", `${fmtInt(seen)} · ${seenPct}%`, null],
+        ["mean angles/patch", cov.mean_angles_seen != null ? String(cov.mean_angles_seen) : "?", null],
+        ["target K / sectors", `${sum.angles_per_patch ?? "?"} / ${sum.angular_sectors ?? "?"}`, null],
+    ];
+    for (const [k, v, color] of rows) {
+        const row = el("div");
+        Object.assign(row.style, {
+            display: "flex",
+            justifyContent: "space-between",
+            gap: "10px",
+            fontSize: "12px",
+            padding: "1px 0",
+        });
+        row.appendChild(el("span", { class: "muted", text: k }));
+        const val = el("span", { text: String(v) });
+        if (color) val.style.color = color;
+        row.appendChild(val);
         box.appendChild(row);
     }
 }
