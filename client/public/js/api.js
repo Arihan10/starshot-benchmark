@@ -128,11 +128,25 @@ export const api = {
     // (those with a generated or library build) + each one's state — idle /
     // pending / running / done / error, with {done, total, current_id, summary}.
     // Each cell also carries per-stage sub-states: `stage2` (free-space), `stage3`
-    // (surfels, plus a cloud `url`), `stage4` (cameras), `stage5` (refs). The screen
-    // renders this on run select and polls while any cell is busy.
+    // (surfels, plus a cloud `url`), `stage4` (cameras), `stage5` (refs), and
+    // `stage6` (the Stage-6 fine-tune — disk-only `{status, url}` for trained.ply,
+    // produced by the backend training script). The screen renders this on run
+    // select and polls while any cell is busy.
     // `splatStage1Start` assembles ONE cell into a `splat/scene.json` manifest.
     splatStageCells: (run) =>
         request(`/runs/${encodeURIComponent(run)}/splat/cells`),
+    // Pin / read which asset build the splat pipeline samples + renders for a cell:
+    // 'auto' | 'generated' (raw) | 'generated-lite' | 'generated-optimized' | 'library'.
+    // Applied by every stage server-side; re-run the stages to regenerate against it.
+    splatGetSource: (run, slot, model) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/source/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+        ),
+    splatSetSource: (run, slot, model, source) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/source/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+            { method: "POST", params: { source } },
+        ),
     splatStage1Start: (run, slot, model) =>
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage1/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
@@ -282,10 +296,19 @@ export const api = {
             method: "POST",
             params: { run },
         }),
-    generateStatus: (run, slot, model, { optimized = true } = {}) =>
+    generateStatus: (run, slot, model, { optimized = true, variant } = {}) =>
         request(cellPath(slot, model, "/generate"), {
-            params: { run, optimized: optimized ? 1 : 0 },
+            params: { run, optimized: optimized ? 1 : 0, ...(variant ? { variant } : {}) },
         }),
+    // Build (or resume) this cell's LITE presentation tier (objects-generated-lite/)
+    // as a background job; poll buildLiteStatus for {running, done, total, ok, status}.
+    buildLite: (run, slot, model) =>
+        request(cellPath(slot, model, "/build-lite"), {
+            method: "POST",
+            params: { run },
+        }),
+    buildLiteStatus: (run, slot, model) =>
+        request(cellPath(slot, model, "/build-lite"), { params: { run } }),
     regenerate: (
         run,
         slot,
@@ -405,12 +428,13 @@ export const api = {
     //   mode="generated" streams the cell's from-scratch generated build instead
     //     of the library objects/; optimized=false streams the raw bbox-fitted
     //     Trellis mesh instead of the served KTX2/Meshopt twin.
-    meshesUrl: (run, slot, model, { untilIndex, mode, optimized } = {}) =>
+    meshesUrl: (run, slot, model, { untilIndex, mode, optimized, variant } = {}) =>
         u(cellPath(slot, model, "/meshes"), {
             run,
             until_index: untilIndex,
             mode,
             optimized: optimized === false ? 0 : undefined,
+            variant,
         }).toString(),
     // Full source-cell history backfill (cache.llm payloads included) from disk.
     async eventsHistory(run, slot, model) {

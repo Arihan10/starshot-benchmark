@@ -3,9 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Offline pass that decimates + compresses the Trellis asset library into assets-optimized/.",
+  "description": "Offline pass that decimates + compresses Trellis assets. Presets: optimized (web-streaming) -> assets-optimized/, lite (presentation) -> assets-lite/.",
   "scripts": {
-    "optimize": "node optimize.mjs"
+    "optimize": "node optimize.mjs",
+    "optimize:lite": "node optimize.mjs --preset lite"
   },
   "dependencies": {
     "@gltf-transform/core": "^4.3.0",

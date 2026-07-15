@@ -161,10 +161,16 @@ async def apply_symmetrize(
     cut_plane: CutPlane,
     node_id: str,
     keep_positive: bool | None = None,
-) -> trimesh.Trimesh | trimesh.Scene:
+) -> trimesh.Scene:
     """Mirror `mesh` per the already-resolved `cut_plane` (no LLM call). Returns
     the mesh unchanged for `none`; a mesh-level failure is logged and degrades
     to the original so generation never aborts over symmetry.
+
+    Always returns a `Scene`: `symmetrize_mesh` yields a single `Trimesh`, which is
+    re-wrapped so downstream `rescale_mesh_to_bbox` records placement as a node
+    transform (a `Scene`'s transform lands in the scene graph, a `Trimesh`'s bakes
+    into vertices) — keeping symmetrized objects on the same local-geometry +
+    node-transform paradigm as un-symmetrized ones.
 
     `keep_positive` overrides which half is kept (None = the plane's default,
     +Z/+Y). It's recorded in the `symmetry.applied` event so a prefab reuse
@@ -172,7 +178,7 @@ async def apply_symmetrize(
     `_rescale_reuse_from_raw`)."""
     params = _PLANE_PARAMS.get(cut_plane)
     if params is None:
-        return mesh
+        return mesh if isinstance(mesh, trimesh.Scene) else trimesh.Scene(mesh)
     axis, default_keep = params
     keep = default_keep if keep_positive is None else keep_positive
     try:
@@ -186,9 +192,9 @@ async def apply_symmetrize(
             cut_plane=cut_plane,
             reason=f"mesh_failed: {type(e).__name__}: {str(e)[:200]}",
         )
-        return mesh
+        return mesh if isinstance(mesh, trimesh.Scene) else trimesh.Scene(mesh)
     logging.log("symmetry.applied", id=node_id, cut_plane=cut_plane, axis=axis, keep_positive=keep)
-    return out
+    return trimesh.Scene(out)
 
 
 async def _optimize(src: Path, dst: Path) -> None:
@@ -240,10 +246,13 @@ async def build_symmetric_glb(
         scene = trimesh.load(src)
         symmetric = symmetrize_mesh(scene, axis=axis, keep_positive=keep_positive)
         target = bbox if bbox is not None else _natural_bbox(symmetric)
-        placed = rescale_mesh_to_bbox(symmetric, target, orientation=orientation)
+        triangles = int(len(symmetric.faces))
+        # Wrap in a Scene so placement lands as a node transform (not baked into
+        # vertices) — the same paradigm every other served GLB uses.
+        placed = rescale_mesh_to_bbox(trimesh.Scene(symmetric), target, orientation=orientation)
         raw_out.parent.mkdir(parents=True, exist_ok=True)
         export_glb(placed, raw_out)
-        return {"triangles": int(len(placed.faces)), "raw_bytes": raw_out.stat().st_size}
+        return {"triangles": triangles, "raw_bytes": raw_out.stat().st_size}
 
     stats = await asyncio.to_thread(_process)
     if opt_out is not None:

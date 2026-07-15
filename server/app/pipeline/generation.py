@@ -137,6 +137,9 @@ _library_match_slot = asyncio.Semaphore(LIBRARY_MATCH_CONCURRENCY)
 # The asset-library build (objects/ + events.jsonl) is separate and unaffected.
 GENERATED_RAW_SUBDIR = "objects-generated"
 GENERATED_OPT_SUBDIR = "objects-generated-optimized"
+# Presentation "lite" twin (server/scripts/build_lite_assets.py): near-lossless
+# geometry + high-res UASTC, sitting beside the raw/optimized builds.
+GENERATED_LITE_SUBDIR = "objects-generated-lite"
 GENERATED_EVENTS_NAME = "events.generated.jsonl"
 
 # Older builds nested each build under generated/<n>/. We no longer create those;
@@ -178,6 +181,14 @@ def latest_generated_dirs(runs_dir: Path, run_id: str) -> tuple[Path, Path]:
         base = runs_dir / run_id / _LEGACY_GENERATED_DIR / version
         return base / GENERATED_RAW_SUBDIR, base / GENERATED_OPT_SUBDIR
     return raw, opt
+
+
+def latest_generated_lite_dir(runs_dir: Path, run_id: str) -> Path:
+    """The `objects-generated-lite/` dir beside whichever generated build
+    latest_generated_dirs resolves (the single build, else the newest legacy
+    generated/<n>/ build)."""
+    raw, _ = latest_generated_dirs(runs_dir, run_id)
+    return raw.parent / GENERATED_LITE_SUBDIR
 
 
 def latest_generated_events_path(runs_dir: Path, run_id: str) -> Path:

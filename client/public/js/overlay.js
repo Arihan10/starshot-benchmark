@@ -44,6 +44,9 @@ let lastLayersSig = null; // skips rebuilding the layer legend when unchanged
 // Asset view: which mesh build the 3D view shows + the generate gate's polling.
 let assetMode = "library"; // "library" | "generated"
 let optimizedView = true; // generated meshes: optimized KTX2/Meshopt twin vs raw
+let liteOn = false; // when on, show the lite presentation tier (overrides optimized/raw)
+// The effective scene-wide variant for generated meshes.
+const genVariant = () => (liteOn ? "lite" : optimizedView ? "optimized" : "raw");
 // Per-object override of the scene-wide optimized/raw toggle: node id ->
 // "optimized" | "raw". Absent = follow `optimizedView`. Reset whenever the
 // scene-wide toggle flips (it sets a fresh baseline for every object).
@@ -56,6 +59,8 @@ let busyNodes = new Set(); // node ids currently queued/processing on a mesh bac
 let assetBtn = null;
 let genBtn = null;
 let optBtn = null;
+let liteBtn = null;
+let liteGenBtn = null;
 let genStatusEl = null;
 
 // Cache-bust a generated mesh URL by its mtime token, so a regenerated asset
@@ -380,8 +385,20 @@ function setupAssetControls() {
 		text: "optimized",
 		onclick: toggleOptimized,
 	});
+	liteBtn = el("button", {
+		id: "btn-asset-lite",
+		title: "generated view: show the LITE presentation tier — visually identical to raw, far smaller (overrides optimized/raw)",
+		text: "lite",
+		onclick: toggleLite,
+	});
+	liteGenBtn = el("button", {
+		id: "btn-build-lite",
+		title: "build (or resume) this scene's lite presentation assets (objects-generated-lite)",
+		text: "⚡ build lite",
+		onclick: onBuildLite,
+	});
 	genStatusEl = el("span", { id: "gen-status", class: "gen-status" });
-	refit.after(assetBtn, genBtn, optBtn, genStatusEl);
+	refit.after(assetBtn, genBtn, optBtn, liteBtn, liteGenBtn, genStatusEl);
 	syncAssetControls();
 }
 
@@ -394,12 +411,18 @@ function syncAssetControls() {
 	const gen = show && assetMode === "generated";
 	genBtn.style.display = gen ? "" : "none";
 	optBtn.style.display = gen ? "" : "none";
+	liteBtn.style.display = gen ? "" : "none";
+	liteGenBtn.style.display = gen ? "" : "none";
 	genStatusEl.style.display = gen ? "" : "none";
 	assetBtn.classList.toggle("on", assetMode === "generated");
 	assetBtn.textContent =
 		assetMode === "generated" ? "generated ✓" : "generated";
-	optBtn.classList.toggle("on", optimizedView);
+	// optimized/raw sub-toggle; the lite toggle overrides it (dimmed while on).
+	optBtn.classList.toggle("on", !liteOn && optimizedView);
 	optBtn.textContent = optimizedView ? "optimized ✓" : "raw";
+	optBtn.disabled = liteOn;
+	liteBtn.classList.toggle("on", liteOn);
+	liteBtn.textContent = liteOn ? "lite ✓" : "lite";
 }
 
 function setAssetMode(mode) {
@@ -423,12 +446,24 @@ function setAssetMode(mode) {
 function toggleOptimized() {
 	if (!state.view || state.view.branch || assetMode !== "generated") return;
 	optimizedView = !optimizedView;
-	// The scene-wide flip is a fresh baseline — drop per-object overrides so every
-	// object follows the new global mode.
+	liteOn = false; // the optimized/raw toggle takes over from lite
+	repullGenerated();
+}
+
+// Separate toggle for the lite presentation tier: when on, the scene shows the
+// lite variant (overriding the optimized/raw toggle); off falls back to it.
+function toggleLite() {
+	if (!state.view || state.view.branch || assetMode !== "generated") return;
+	liteOn = !liteOn;
+	repullGenerated();
+}
+
+// Re-pull the generated meshes from the freshly-chosen variant dir: the scene-
+// wide flip is a fresh baseline, so drop per-object overrides + what's loaded and
+// let the poll re-attach.
+function repullGenerated() {
 	objOptMode = new Map();
 	syncAssetControls();
-	// Re-pull from the other source (optimized twin vs raw): drop what's loaded
-	// and let the poll re-attach from the freshly-chosen dir.
 	stopGenPoll();
 	loadedGen = new Map();
 	genMeshSig = null;
@@ -436,6 +471,52 @@ function toggleOptimized() {
 	tracePanel.clearProjection(); // clearMeshes ended it viewer-side
 	tracePanel.rerenderInfo();
 	pollGenerated();
+}
+
+// Build (or resume) this scene's lite assets, then poll until done and — if the
+// lite view is active — re-pull to show them.
+async function onBuildLite() {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		await api.buildLite(state.run, slot, model);
+		toast(`building lite for ${slot} · ${model}…`, "ok");
+		pollLiteBuild();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+let liteBuildTimer = null;
+async function pollLiteBuild() {
+	if (liteBuildTimer) {
+		clearTimeout(liteBuildTimer);
+		liteBuildTimer = null;
+	}
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	let st = null;
+	try {
+		st = await api.buildLiteStatus(state.run, slot, model);
+	} catch {
+		/* transient — retried below if still running */
+	}
+	// Cell changed under us — stop.
+	if (!state.view || state.view.slot !== slot || state.view.model !== model)
+		return;
+	if (!st) return;
+	if (genStatusEl && assetMode === "generated") {
+		genStatusEl.textContent = st.running
+			? `building lite… ${st.done}/${st.total}`
+			: st.ok === false
+				? "lite build failed"
+				: `${st.done} lite`;
+	}
+	if (st.running) {
+		liteBuildTimer = setTimeout(pollLiteBuild, 1500);
+	} else if (liteOn && assetMode === "generated") {
+		repullGenerated(); // freshly-built lite meshes are now on disk
+	}
 }
 
 // Forget the generated-view bookkeeping (on cell open, mode switch, or toggle).
@@ -492,10 +573,14 @@ function concreteNodeCount() {
 // the scene-wide `optimizedView`. Falls back to whichever variant exists (then
 // the status' global url) so a half-built object still renders.
 function variantFor(m) {
-	const mode = objOptMode.get(m.id) ?? (optimizedView ? "optimized" : "raw");
+	const mode = objOptMode.get(m.id) ?? genVariant();
+	if (mode === "lite" && m.liteUrl) return { url: m.liteUrl, v: m.liteV };
 	if (mode === "optimized" && m.optUrl) return { url: m.optUrl, v: m.optV };
 	if (mode === "raw" && m.unoptUrl) return { url: m.unoptUrl, v: m.unoptV };
+	// Fallbacks so a half-built object still renders (prefer optimized, then
+	// lite, then the raw twin, then the status url).
 	if (m.optUrl) return { url: m.optUrl, v: m.optV };
+	if (m.liteUrl) return { url: m.liteUrl, v: m.liteV };
 	if (m.unoptUrl) return { url: m.unoptUrl, v: m.unoptV };
 	return { url: m.url, v: m.v };
 }
@@ -529,6 +614,7 @@ async function pollGenerated() {
 	try {
 		status = await api.generateStatus(run, slot, model, {
 			optimized: optimizedView,
+			variant: genVariant(),
 		});
 	} catch {
 		/* transient — the next poll (if still in generated mode) retries */
@@ -558,6 +644,8 @@ async function pollGenerated() {
 				optV: m.optV,
 				unoptUrl: m.unoptUrl,
 				unoptV: m.unoptV,
+				liteUrl: m.liteUrl,
+				liteV: m.liteV,
 				// Renders (stale optimized twin) but its raw/unoptimized backing is
 				// missing — a regen that died midway. Surfaced so it isn't silent.
 				incomplete: !!m.incomplete,

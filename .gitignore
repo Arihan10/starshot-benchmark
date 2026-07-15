@@ -4,6 +4,7 @@ runs/
 client/node_modules/
 server/app/assets_library/assets/
 server/app/assets_library/assets-optimized/
+server/app/assets_library/assets-lite/
 server/app/assets_library/assets-optimized-test/
 server/app/assets_library/assets-uastc-test/
 server/tools/optimize-assets/node_modules/

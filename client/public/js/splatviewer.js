@@ -31,6 +31,8 @@ let inputs = null; // control input elements, by key
 let voxelPoints = null; // Stage-2 free-space overlay (THREE.Points), lazy
 let meshGroup = null; // original-mesh overlay (THREE.Group), lazy
 let mode = "splat"; // "splat" | "mesh" — the view switch (not an overlay)
+let splatSource = "surfels"; // "surfels" (Stage-3 cloud.ply) | "trained" (Stage-6 trained.ply)
+let trainedUrl = null; // /artifacts URL of the Stage-6 trained.ply, when it exists
 
 // Patch-selection debug feature (needs Stage 4 + Stage 5). A selectable points
 // overlay of the coverage patches; clicking one opens its Stage-5 reference images
@@ -196,7 +198,7 @@ async function teardown() {
     // A rebuild (re-splat) returns to splat mode; the splat is visible by default
     // on the new viewer, and the overlays are gone.
     mode = "splat";
-    syncModeButtons();
+    syncViewButtons();
     if (inputs && inputs._fsRow) inputs._fsRow.style.display = "none";
     const v = viewer;
     viewer = null;
@@ -377,10 +379,80 @@ async function ensureFreeSpace() {
     return st;
 }
 
-function syncModeButtons() {
+// Highlight the active view in the 3-way switch. "original" is mesh mode; the
+// two splat sources map to whichever .ply is loaded.
+function syncViewButtons() {
     if (!inputs) return;
-    inputs._splatBtn?.classList.toggle("on", mode === "splat");
-    inputs._meshBtn?.classList.toggle("on", mode === "mesh");
+    const active = mode === "mesh" ? "original" : splatSource;
+    inputs._surfBtn?.classList.toggle("on", active === "surfels");
+    inputs._trainBtn?.classList.toggle("on", active === "trained");
+    inputs._origBtn?.classList.toggle("on", active === "original");
+}
+
+// Enable the "trained" toggle once Stage 6 has written trained.ply (surfaced by
+// the cell poll — Stage 6 is a backend script, so the splat just appears here).
+function updateSourceAvail() {
+    trainedUrl = (cellStatus && cellStatus.stage6 && cellStatus.stage6.url) || null;
+    const btn = inputs && inputs._trainBtn;
+    if (!btn) return;
+    btn.disabled = !trainedUrl;
+    btn.title = trainedUrl
+        ? "the Stage-6 fine-tuned splat (trained.ply)"
+        : "run Stage 6 (the training script) to produce trained.ply";
+    if (!trainedUrl && splatSource === "trained") splatSource = "surfels";
+    syncViewButtons();
+}
+
+// Switch which splat is loaded (surfels ↔ trained). Both share the cell's world
+// frame, so the live camera is preserved across the reload; the fresh viewer
+// starts in splat view (mesh / free-space / patch overlays reset).
+async function setSource(next) {
+    if (next === splatSource) return;
+    const s3 = (cellStatus && cellStatus.stage3) || {};
+    if (next === "trained" && !trainedUrl) return;
+    if (next === "surfels" && !s3.url) return;
+    splatSource = next;
+    mode = "splat";
+    syncViewButtons();
+    if (inputs && inputs._fsRow) inputs._fsRow.style.display = "none";
+    const cam = captureCamera();
+    const bust = `?t=${Date.now()}`;
+    cloudLoaded = true;
+    if (next === "trained") {
+        setStatus("loading trained splat…", "var(--purple)");
+        await loadClouds(
+            openSeq,
+            api.absUrl(trainedUrl + bust),
+            null,
+            { scene_aabb: s3.summary && s3.summary.scene_aabb },
+            cam,
+        );
+    } else {
+        setStatus("loading surfels…", "var(--purple)");
+        await loadClouds(
+            openSeq,
+            api.absUrl(s3.url + bust),
+            s3.detail_url ? api.absUrl(s3.detail_url + bust) : null,
+            s3.summary,
+            cam,
+        );
+    }
+}
+
+// The unified 3-way view switch. surfels ↔ trained reload the splat scene (a
+// different .ply); original flips to the mesh overlay. Reuses setSource (reload)
+// and setMode (visibility), so flipping between an already-loaded splat and the
+// mesh is instant — no reload — which is what makes the side-by-side snappy.
+async function setView(next) {
+    if (next === "original") {
+        await setMode("mesh");
+        return;
+    }
+    if (splatSource !== next) {
+        await setSource(next); // loads the other .ply and returns to splat view
+        return;
+    }
+    if (mode !== "splat") await setMode("splat"); // already loaded — just reveal it
 }
 
 function splatVisible(on) {
@@ -494,7 +566,7 @@ async function ensureMesh() {
 // hides the splat, shows the mesh, and turns the free-space field on by default.
 async function setMode(next) {
     mode = next;
-    syncModeButtons();
+    syncViewButtons();
     if (inputs && inputs._fsRow) {
         inputs._fsRow.style.display = next === "mesh" ? "" : "none";
     }
@@ -555,22 +627,36 @@ function buildControls(summary) {
         actual.textContent = actualText(summary);
     }
 
-    // View mode: Gaussian splat vs. the original mesh — a switch, not an overlay.
-    // Free space is drawn WITH the mesh (same world frame), on by default there.
+    // One 3-way view switch: the pre-fine-tune surfels (Stage 3), the trained
+    // splat (Stage 6), or the original meshes — flip between all three in place
+    // for a side-by-side (same world frame → identical pose). surfels ↔ trained
+    // reload the splat; "original" reuses the mesh overlay (setMode) and its
+    // free-space checkbox below. "trained" stays disabled until trained.ply exists.
     mode = "splat";
-    const splatBtn = el("button", {
+    splatSource = "surfels";
+    const surfBtn = el("button", {
         class: "svc-seg-btn on",
-        text: "splat",
-        onclick: () => setMode("splat"),
+        text: "surfels",
+        title: "the pre-fine-tuning surfel cloud (Stage 3)",
+        onclick: () => setView("surfels"),
     });
-    const meshBtn = el("button", {
+    const trainBtn = el("button", {
         class: "svc-seg-btn",
-        text: "mesh",
-        onclick: () => setMode("mesh"),
+        text: "trained",
+        disabled: true, // enabled by updateSourceAvail once trained.ply exists
+        onclick: () => setView("trained"),
     });
-    inputs._splatBtn = splatBtn;
-    inputs._meshBtn = meshBtn;
-    const seg = el("div", { class: "svc-seg" }, splatBtn, meshBtn);
+    const origBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "original",
+        title: "the original generated meshes (same world frame)",
+        onclick: () => setView("original"),
+    });
+    inputs._surfBtn = surfBtn;
+    inputs._trainBtn = trainBtn;
+    inputs._origBtn = origBtn;
+    const seg = el("div", { class: "svc-seg" }, surfBtn, trainBtn, origBtn);
+
     const fsRow = checkRow("freespace", "free space", true);
     inputs.freespace.addEventListener("change", () =>
         setFreeSpace(inputs.freespace.checked),
@@ -672,6 +758,9 @@ function pollResplat() {
             if (inputs && inputs._actual && st.summary) {
                 inputs._actual.textContent = actualText(st.summary);
             }
+            // A re-splat regenerates the base cloud → back to the surfels source.
+            splatSource = "surfels";
+            syncViewButtons();
             const bust = `?t=${Date.now()}`;
             loadClouds(
                 openSeq,
@@ -917,10 +1006,57 @@ async function runStage(n) {
     pollStages();
 }
 
+// Asset builds the splat pipeline can sample + render from (value → label).
+const SPLAT_SOURCES = [
+    ["auto", "auto"],
+    ["generated", "raw"],
+    ["generated-lite", "lite"],
+    ["generated-optimized", "optimized"],
+    ["library", "library"],
+];
+
+// The source picker: which mesh build the splat stages sample + render. Persists
+// server-side per cell (splat/source.json) and applies on the next stage run.
+function renderSourcePicker() {
+    const row = el("div", { class: "svc-step" });
+    row.appendChild(el("span", { class: "svc-step-n muted", text: "◆" }));
+    row.appendChild(el("span", { class: "svc-step-label", text: "source" }));
+    const pref = (current && current.sourcePref) || "auto";
+    const sel = el("select", {
+        class: "splat-source-select",
+        title: "which asset build the splat pipeline samples + renders from (re-run the stages to apply)",
+        onchange: (e) => onPickSource(e.target.value),
+    });
+    for (const [val, label] of SPLAT_SOURCES) {
+        const opt = el("option", { value: val, text: label });
+        opt.selected = val === pref;
+        sel.appendChild(opt);
+    }
+    row.appendChild(sel);
+    if (current && current.source)
+        row.appendChild(el("span", { class: "muted", text: ` using ${current.source}` }));
+    return row;
+}
+
+async function onPickSource(val) {
+    const c = current;
+    if (!c) return;
+    try {
+        const res = await api.splatSetSource(c.run, c.slot, c.model, val);
+        c.sourcePref = val;
+        if (res && res.resolved) c.source = res.resolved;
+        setStatus(`source: ${val} — re-run the stages to apply`, "var(--purple)");
+    } catch (e) {
+        setStatus(`source failed: ${e.message}`, "var(--red)");
+    }
+    renderStepper();
+}
+
 function renderStepper() {
     const box = inputs && inputs._stepper;
     if (!box) return;
     box.replaceChildren();
+    box.appendChild(renderSourcePicker());
     const cell = cellStatus;
     for (const stage of STAGES) {
         const st = stageState(cell, stage.n);
@@ -959,6 +1095,7 @@ function renderStepper() {
         box.appendChild(row);
     }
     renderCoverage();
+    updateSourceAvail();
 }
 
 const fmtInt = (n) => (n == null ? "?" : Number(n).toLocaleString());
@@ -1090,12 +1227,24 @@ export async function openSplatViewer(opts) {
         slot: opts.slot,
         model: opts.model,
         source: opts.source,
+        sourcePref: "auto",
     };
     cloudLoaded = false;
     cellStatus = null;
+    splatSource = "surfels";
+    trainedUrl = null;
     overlay.classList.add("open");
     subEl.textContent = opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
     buildControls(opts.summary || null);
+    try {
+        const sp = await api.splatGetSource(opts.run, opts.slot, opts.model);
+        if (seq === openSeq && sp) {
+            current.sourcePref = sp.source || "auto";
+            if (sp.resolved) current.source = sp.resolved;
+        }
+    } catch {
+        /* non-fatal — the picker just defaults to 'auto' */
+    }
     renderStepper();
     if (opts.url) {
         cloudLoaded = true;

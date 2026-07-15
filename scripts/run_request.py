@@ -29,6 +29,24 @@ CLIENT_DIR = REPO_ROOT / "client"
 
 SERVER_HOST = "127.0.0.1"
 
+# The API server runs the Stage-5 nvdiffrast renderer IN-PROCESS (see
+# server/app/api/routes.py) when the client hits the "render references" button, so
+# its interpreter must have torch + nvdiffrast + CUDA. The server's own `uv` env can
+# be a Python version that has no torch wheels (e.g. 3.14), so prefer a dedicated
+# Python 3.12 CUDA env (`.venv-splat` at the repo root) when it exists, falling back
+# to `uv run` (the server's own env) otherwise. `STARSHOT_SPLAT_PYTHON` overrides the
+# interpreter path.
+#
+# CUDA_HOME lets nvdiffrast locate `nvcc` for its one-time kernel build; we
+# deliberately do NOT prepend the toolkit's `bin` to PATH — its CUDA runtime DLLs
+# would shadow torch's bundled ones and break torch.linalg (cusolver). Override the
+# toolkit location with `STARSHOT_CUDA_HOME`.
+_SPLAT_PYTHON_DEFAULT = REPO_ROOT / ".venv-splat" / (
+    "Scripts/python.exe" if os.name == "nt" else "bin/python"
+)
+SPLAT_PYTHON = Path(os.environ.get("STARSHOT_SPLAT_PYTHON", str(_SPLAT_PYTHON_DEFAULT)))
+CUDA_HOME = os.environ.get("STARSHOT_CUDA_HOME", r"D:\cuda12")
+
 
 def _child_env() -> dict[str, str]:
     """Clean env for spawned subprocesses.
@@ -42,6 +60,29 @@ def _child_env() -> dict[str, str]:
     env = {k: v for k, v in os.environ.items() if k not in {"VIRTUAL_ENV", "UV_PROJECT_ENVIRONMENT"}}
     env.setdefault("PYTHONUNBUFFERED", "1")
     return env
+
+
+def _server_command(server_port: int) -> tuple[list[str], dict[str, str], str]:
+    """(argv, extra_env, label) to launch the API server.
+
+    Prefers the Python 3.12 CUDA env (`.venv-splat`) so the in-process Stage-5
+    nvdiffrast renderer can `import torch`; falls back to `uv run` (the server's own
+    env) when that venv is absent. Launching the CUDA env's python DIRECTLY — not via
+    `uv run` — is deliberate: `uv run` re-syncs the server env from its
+    pyproject/lock and would uninstall torch/nvdiffrast (they aren't declared there).
+    """
+    uvicorn_args = [
+        "-m", "uvicorn", "app.main:app",
+        "--host", SERVER_HOST, "--port", str(server_port),
+        "--log-level", "info",
+    ]
+    if SPLAT_PYTHON.is_file():
+        extra_env: dict[str, str] = {}
+        if Path(CUDA_HOME).is_dir():
+            extra_env["CUDA_HOME"] = CUDA_HOME
+            extra_env["CUDA_PATH"] = CUDA_HOME
+        return [str(SPLAT_PYTHON), *uvicorn_args], extra_env, f"CUDA env {SPLAT_PYTHON}"
+    return ["uv", "run", "python", *uvicorn_args], {}, "uv run (server env — no torch)"
 
 
 def _pick_free_port() -> int:
@@ -208,18 +249,16 @@ def main() -> int:
 
     env = _child_env()
 
+    server_cmd, server_extra_env, server_label = _server_command(server_port)
     print(
-        f"[run_request] starting API server on {server_url} (runs={runs_dir})",
+        f"[run_request] starting API server on {server_url} (runs={runs_dir}) "
+        f"[{server_label}]",
         flush=True,
     )
     server = subprocess.Popen(
-        [
-            "uv", "run", "uvicorn", "app.main:app",
-            "--host", SERVER_HOST, "--port", str(server_port),
-            "--log-level", "info",
-        ],
+        server_cmd,
         cwd=SERVER_DIR,
-        env={**env, "STARSHOT_RUNS_DIR": str(runs_dir)},
+        env={**env, "STARSHOT_RUNS_DIR": str(runs_dir), **server_extra_env},
         process_group=0,
     )
 

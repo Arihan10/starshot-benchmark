@@ -95,8 +95,8 @@ class PlanParams:
     # (six faces tile 360°); footprint_k (hence view_dist) is DERIVED from the render
     # resolution + min_px_per_patch so coverage distances match what Stage 5 renders.
     face_fov_deg: float = 90.0
-    render_resolution: int = 512
-    min_px_per_patch: float = 10.0
+    render_resolution: int = 1024
+    min_px_per_patch: float = 20.0
     view_dist_min: float = 0.5        # (m)
     view_dist_max: float = 4.0        # (m)
     seed: int = 0

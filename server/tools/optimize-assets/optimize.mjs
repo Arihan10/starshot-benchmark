@@ -33,15 +33,25 @@
  * reads them today). `--texture-format webp` falls back to plain WebP, which the
  * current viewer already renders but which decodes to full RGBA8 in VRAM.
  *
+ * Two presets pick the tuning knobs (both run the identical transform chain):
+ *   optimized  web-streaming tier — aggressive decimation + small ETC1S maps.
+ *              Tiny, but visibly degraded. -> assets-optimized/  (default)
+ *   lite       presentation tier (ported from the Unity replay) — near-lossless,
+ *              error-bounded geometry + high-res UASTC. Visually identical to the
+ *              raw asset at ~5x smaller / ~10x less texture VRAM. -> assets-lite/
+ * Explicit flags (--target-tris, --texture-size, --uastc/--no-uastc, ...)
+ * override the chosen preset.
+ *
  * Usage:
  *   npm install
- *   node optimize.mjs                          # everything, defaults (KTX2/ETC1S)
+ *   node optimize.mjs                          # optimized preset (default), all assets
+ *   node optimize.mjs --preset lite            # lite preset -> assets-lite/
  *   node optimize.mjs --limit 3                 # smoke test on first 3 assets
- *   node optimize.mjs --target-tris 12000 --texture-size 256 --concurrency 4
+ *   node optimize.mjs --preset lite --texture-size 2048   # override a preset knob
  *   node optimize.mjs --texture-format webp     # WebP instead of KTX2
- *   node optimize.mjs --uastc                   # KTX2 UASTC (higher quality, larger)
  *   node optimize.mjs --force                   # re-optimize even if output exists
  *   node optimize.mjs --input <dir> --output <dir>
+ *   node optimize.mjs --preset lite --file <in.glb> --out-file <out.glb>  # single file
  */
 
 import { NodeIO, Logger } from "@gltf-transform/core";
@@ -66,24 +76,41 @@ import { mkdir, readdir, stat, copyFile, writeFile } from "node:fs/promises";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DEFAULT_INPUT = path.resolve(HERE, "../../app/assets_library/assets");
-const DEFAULT_OUTPUT = path.resolve(HERE, "../../app/assets_library/assets-optimized");
+const OUTPUT_DIRS = {
+  optimized: path.resolve(HERE, "../../app/assets_library/assets-optimized"),
+  lite: path.resolve(HERE, "../../app/assets_library/assets-lite"),
+};
+
+// Named tuning presets. Both run the IDENTICAL transform chain (weld ->
+// simplify -> prune -> resize + KTX2 -> meshopt); only these knobs differ.
+//   optimized  web-streaming tier: aggressive decimation + small ETC1S maps.
+//              Tiny on disk, but visibly degraded (the original default).
+//   lite       presentation tier ported from the Unity replay: error-bounded
+//              (near-lossless) geometry + high-res UASTC, so it stays visually
+//              identical to the raw asset while landing ~5x smaller on disk and
+//              ~10x lighter in texture VRAM. `targetTris` is a high ceiling —
+//              `error` does the (visually safe) decimation, since Trellis
+//              massively over-tessellates flat regions.
+const PRESETS = {
+  optimized: { targetTris: 15000, error: 0.01, textureSize: 256, uastc: false },
+  lite: { targetTris: 150000, error: 0.005, textureSize: 1024, uastc: true },
+};
 
 function parseArgs(argv) {
   const opts = {
     input: DEFAULT_INPUT,
-    output: DEFAULT_OUTPUT,
+    output: null, // resolved from the preset below unless --output is given
     file: null,
     outFile: null,
-    targetTris: 15000,
-    error: 0.01,
-    textureSize: 256,
+    preset: "optimized",
     textureFormat: "ktx2",
-    uastc: false,
     concurrency: Math.min(4, Math.max(1, os.cpus().length)),
     force: false,
     pngs: true,
     limit: Infinity,
   };
+  // Tuning knobs default to the chosen preset's value; an explicit flag wins.
+  const override = {};
   for (let i = 2; i < argv.length; i++) {
     const arg = argv[i];
     const next = () => argv[++i];
@@ -92,11 +119,13 @@ function parseArgs(argv) {
       case "--output": opts.output = path.resolve(next()); break;
       case "--file": opts.file = path.resolve(next()); break;
       case "--out-file": opts.outFile = path.resolve(next()); break;
-      case "--target-tris": opts.targetTris = Number(next()); break;
-      case "--error": opts.error = Number(next()); break;
-      case "--texture-size": opts.textureSize = Number(next()); break;
+      case "--preset": opts.preset = next(); break;
+      case "--target-tris": override.targetTris = Number(next()); break;
+      case "--error": override.error = Number(next()); break;
+      case "--texture-size": override.textureSize = Number(next()); break;
       case "--texture-format": opts.textureFormat = next(); break;
-      case "--uastc": opts.uastc = true; break;
+      case "--uastc": override.uastc = true; break;
+      case "--no-uastc": override.uastc = false; break;
       case "--concurrency": opts.concurrency = Math.max(1, Number(next())); break;
       case "--limit": opts.limit = Number(next()); break;
       case "--force": opts.force = true; break;
@@ -105,6 +134,17 @@ function parseArgs(argv) {
         throw new Error(`unknown argument: ${arg}`);
     }
   }
+  const preset = PRESETS[opts.preset];
+  if (!preset) {
+    throw new Error(
+      `--preset must be one of ${Object.keys(PRESETS).join(", ")}, got: ${opts.preset}`,
+    );
+  }
+  opts.targetTris = override.targetTris ?? preset.targetTris;
+  opts.error = override.error ?? preset.error;
+  opts.textureSize = override.textureSize ?? preset.textureSize;
+  opts.uastc = override.uastc ?? preset.uastc;
+  if (!opts.output) opts.output = OUTPUT_DIRS[opts.preset] ?? OUTPUT_DIRS.optimized;
   if (opts.textureFormat !== "ktx2" && opts.textureFormat !== "webp") {
     throw new Error(`--texture-format must be 'ktx2' or 'webp', got: ${opts.textureFormat}`);
   }
@@ -290,7 +330,8 @@ async function main() {
   const texDesc =
     opts.textureFormat === "ktx2" ? `ktx2/${opts.uastc ? "uastc" : "etc1s"}` : "webp";
   console.log(
-    `[opt] target ~${kT(opts.targetTris)} tris, ${opts.textureSize}px ${texDesc}, ` +
+    `[opt] preset ${opts.preset}: target ~${kT(opts.targetTris)} tris (err ${opts.error}), ` +
+      `${opts.textureSize}px ${texDesc}, ` +
       `concurrency ${opts.concurrency}${opts.force ? ", force" : ""}`,
   );
 
@@ -329,6 +370,7 @@ async function main() {
       {
         generatedAt: new Date().toISOString(),
         options: {
+          preset: opts.preset,
           targetTris: opts.targetTris,
           error: opts.error,
           textureSize: opts.textureSize,

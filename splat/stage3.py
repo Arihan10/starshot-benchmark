@@ -112,8 +112,11 @@ def placed_object_ids(raw_dir: Path) -> list[str]:
 
 
 def _iter_geoms(mesh: trimesh.Trimesh | trimesh.Scene) -> list[trimesh.Trimesh]:
+    # dump() bakes each geometry's scene-graph node transform into world space; plain
+    # scene.geometry returns LOCAL vertices, which collapses node-placed objects
+    # (generated assets carry placement on the node) to the origin.
     if isinstance(mesh, trimesh.Scene):
-        return [g for g in mesh.geometry.values() if hasattr(g, "faces")]
+        return [g for g in mesh.dump(concatenate=False) if hasattr(g, "faces")]
     return [mesh]
 
 

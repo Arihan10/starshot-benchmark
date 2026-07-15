@@ -79,6 +79,7 @@ from splat import stage2 as splat_stage2  # noqa: E402
 from splat import stage3 as splat_stage3  # noqa: E402
 from splat import stage4 as splat_stage4  # noqa: E402
 from splat import stage5 as splat_stage5  # noqa: E402  (torch/nvdiffrast lazy inside)
+from splat import stage6 as splat_stage6  # noqa: E402  (torch/gsplat lazy inside)
 
 # Node de-optimizer (server/tools/optimize-assets/deoptimize.mjs): rewrites a
 # cell's KTX2/Meshopt library GLBs to vanilla glTF so the trimesh-based Stage-1
@@ -87,6 +88,10 @@ from splat import stage5 as splat_stage5  # noqa: E402  (torch/nvdiffrast lazy i
 _DEOPT_DIR = _REPO_ROOT / "server" / "tools" / "optimize-assets"
 _DEOPT_SCRIPT = _DEOPT_DIR / "deoptimize.mjs"
 _NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
+
+# Offline "lite" (presentation-tier) asset builder — driven per-cell by the
+# build-lite endpoint (background subprocess, progress polled by the client).
+_BUILD_LITE_SCRIPT = _REPO_ROOT / "server" / "scripts" / "build_lite_assets.py"
 
 # Which per-cell mesh directory the scene bundle streams from. Defaults to the
 # originals ("objects"); set STARSHOT_OBJECTS_SUBDIR=objects-optimized to serve
@@ -155,6 +160,13 @@ _hydrated_runs: set[str] = set()
 # `_splat_stage1_tasks` holds the live task so it stays referenced.
 _splat_stage1_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage1_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# --- lite-asset build jobs (background, one per CELL) -------------------------
+# A cell's generated raw build -> objects-generated-lite/ via build_lite_assets.py.
+# The task streams the driver's "[i/N]" progress into the job dict the status
+# endpoint serves.
+_lite_build_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_lite_build_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
 # --- Stage 2 free-space voxelization jobs (background, one per CELL) ----------
 # The shared spatial foundation (Option A, runs first): a cell's meshes (generated,
@@ -1604,23 +1616,131 @@ def _placed_count(mesh_dir: Path) -> int:
     return sum(1 for p in mesh_dir.glob("*.glb") if not p.name.endswith(".raw.glb"))
 
 
-def _splat_source(run: str, slot: str, model: str) -> tuple[Path, str] | None:
-    """The Stage-1 mesh source for a cell + its kind, or None if the cell has no
-    placed meshes in any build. Prefers the from-scratch generated RAW build
-    (`objects-generated/`) — vanilla glTF the trimesh assembler reads directly —
-    and falls back to the asset-library build (`objects-optimized/` / `objects/`),
-    which is KTX2/Meshopt and must be de-optimized to vanilla first (see
-    `_deoptimize_dir`). Disk-only; never hydrates the run."""
+# Generated-build asset variants the scene viewer + splat can select between.
+_GEN_VARIANTS = ("raw", "lite", "optimized")
+# Splat mesh-source overrides (persisted per cell in splat/source.json).
+_SPLAT_SOURCE_CHOICES = ("generated", "generated-lite", "generated-optimized", "library")
+
+
+def _generated_variant_dir(rid: str, variant: str) -> Path:
+    """The generated build dir for a variant: raw (objects-generated), lite
+    (objects-generated-lite), or optimized (objects-generated-optimized)."""
+    raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
+    if variant == "raw":
+        return raw_dir
+    if variant == "lite":
+        return raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+    return opt_dir
+
+
+def _resolve_gen_variant(variant: str | None, optimized: bool) -> str:
+    """Normalize the client's asset-variant selection: the explicit `variant`
+    (raw/lite/optimized) when valid, else the legacy `optimized` bool."""
+    if variant in _GEN_VARIANTS:
+        return variant  # type: ignore[return-value]
+    return "optimized" if optimized else "raw"
+
+
+def _splat_source_pref_path(run: str, slot: str, model: str) -> Path:
+    return _slot_dir(run, slot, model) / "splat" / "source.json"
+
+
+def _splat_source_pref(run: str, slot: str, model: str) -> str | None:
+    """The persisted splat source override for a cell, or None (auto)."""
+    try:
+        val = json.loads(
+            _splat_source_pref_path(run, slot, model).read_text(encoding="utf-8")
+        ).get("source")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return None
+    return val if val in _SPLAT_SOURCE_CHOICES else None
+
+
+def _splat_source(
+    run: str, slot: str, model: str, source: str | None = None,
+) -> tuple[Path, str] | None:
+    """The splat mesh source for a cell + its kind, or None if the cell has no placed
+    meshes in any build. A `source` (arg, else the cell's persisted override) pins the
+    build; when absent or not on disk it AUTO-picks the OPTIMIZED (decimated) twin — the
+    intended splat sample/render source, since the raw build's multi-million-triangle
+    meshes are far too heavy for nvdiffrast (Stage 5). Auto order:
+      1. `objects-generated-optimized/` — the generated optimized twin (KTX2/Meshopt);
+      2. the asset-library build (`objects-optimized/` / `objects/`, KTX2/Meshopt);
+      3. `objects-generated/` — the raw vanilla build, only as a last resort.
+    Everything but the raw build is KTX2/Meshopt and is de-optimized to vanilla first
+    (see `_deoptimize_dir`); only kind `"generated"` skips that step. Disk-only; never
+    hydrates the run."""
     rid = _run_id(run, slot, model)
-    raw_dir = generation.latest_generated_dirs(RUNS_DIR, rid)[0]
-    if _placed_count(raw_dir) > 0:
-        return raw_dir, "generated"
+    raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
+    lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
     cell_dir = _slot_dir(run, slot, model)
+
+    if source is None:
+        source = _splat_source_pref(run, slot, model)
+    if source is not None:
+        pinned = {
+            "generated-lite": (lite_dir, "generated-lite"),
+            "generated-optimized": (opt_dir, "generated-optimized"),
+            "generated": (raw_dir, "generated"),
+        }.get(source)
+        if pinned is not None and _placed_count(pinned[0]) > 0:
+            return pinned
+        if source == "library":
+            for name in ("objects-optimized", OBJECTS_SUBDIR, "objects"):
+                lib_dir = cell_dir / name
+                if _placed_count(lib_dir) > 0:
+                    return lib_dir, "library"
+        # requested build isn't on disk — fall through to the auto order below.
+
+    if _placed_count(opt_dir) > 0:
+        return opt_dir, "generated-optimized"
     for name in ("objects-optimized", OBJECTS_SUBDIR, "objects"):
         lib_dir = cell_dir / name
         if _placed_count(lib_dir) > 0:
             return lib_dir, "library"
+    if _placed_count(raw_dir) > 0:
+        return raw_dir, "generated"
     return None
+
+
+async def _run_lite_build(
+    run: str, slot: str, model: str, src_dir: Path, out_dir: Path,
+) -> None:
+    """Background: build the cell's lite tier (src_dir -> out_dir) via
+    build_lite_assets.py, streaming its "[i/N]" progress into the job dict."""
+    import re
+    import sys
+
+    key = (run, slot, model)
+    job = _lite_build_jobs[key]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable, "-u", str(_BUILD_LITE_SCRIPT),
+            "--src-dir", str(src_dir), "--out-dir", str(out_dir),
+            cwd=str(_REPO_ROOT),
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        assert proc.stdout is not None
+        async for chunk in proc.stdout:
+            line = chunk.decode(errors="replace").strip()
+            if not line:
+                continue
+            m = re.search(r"\[(\d+)/(\d+)\]", line)
+            if m:
+                job["done"] = int(m.group(1))
+                job["total"] = int(m.group(2))
+            job["status"] = line[:200]
+        rc = await proc.wait()
+        job["ok"] = rc == 0
+        job["status"] = "done" if rc == 0 else f"failed (exit {rc})"
+    except Exception as exc:  # noqa: BLE001 - surface to the status poller
+        job["ok"] = False
+        job["error"] = str(exc)
+        job["status"] = "error"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
 
 
 def _discover_splat_stage1_cells(run: str) -> list[tuple[str, str, int, str]]:
@@ -1703,7 +1823,7 @@ def _assemble_cell_from_source(
     directly; a 'library' source is KTX2/Meshopt, so it's de-optimized into a
     throwaway temp dir first (the on-disk originals are untouched). Blocking —
     run via asyncio.to_thread."""
-    if kind != "library":
+    if kind == "generated":
         return splat_stage1.assemble_cell(
             run=run, slot=slot, model=model, raw_dir=src_dir,
             events_path=events_path, out_path=out_path, runs_dir=RUNS_DIR,
@@ -1786,6 +1906,11 @@ def _detail_cloud_path(run: str, slot: str, model: str) -> Path:
     return _cloud_path(run, slot, model).with_suffix(".detail.ply")
 
 
+def _trained_path(run: str, slot: str, model: str) -> Path:
+    """Where a cell's Stage-6 fine-tuned splat lives (`splat/trained.ply`)."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage6.TRAINED_NAME
+
+
 def _freespace_path(run: str, slot: str, model: str) -> Path:
     """Where a cell's Stage-2 free-space grid lives (`splat/freespace.npz`)."""
     return _slot_dir(run, slot, model) / "splat" / splat_stage2.FREESPACE_NAME
@@ -1858,7 +1983,7 @@ def _voxelize_from_source(
             out_path=out_path, params=params, progress=_progress,
         )
 
-    if kind != "library":
+    if kind == "generated":
         return _run(src_dir)
     job["phase"] = "deopt"
     with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
@@ -1978,6 +2103,18 @@ def _splat_stage3_status(
     }
 
 
+def _splat_stage6_status(run: str, slot: str, model: str) -> dict[str, Any]:
+    """Public Stage-6 (fine-tune) state — disk-only. Stage 6 runs as a standalone
+    backend script (no server job), so this just exposes the trained `.ply` for the
+    viewer: 'done' with its `/artifacts` `url` when `trained.ply` is present, else
+    'idle'."""
+    url = _artifact_url(_trained_path(run, slot, model))
+    return {
+        "run": run, "slot": slot, "model": model,
+        "status": "done" if url else "idle", "url": url,
+    }
+
+
 def _sample_cell_lods(
     run: str,
     slot: str,
@@ -2024,7 +2161,7 @@ def _sample_cell_lods(
             detail_path.unlink(missing_ok=True)  # drop any stale detail LOD
         return summary
 
-    if kind != "library":
+    if kind == "generated":
         return _sample(src_dir)
     job["phase"] = "deopt"
     with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
@@ -2306,7 +2443,7 @@ def _render_refs_from_source(
             cameras_path=cameras_path, out_dir=out_dir, progress=_progress,
         )
 
-    if kind != "library":
+    if kind == "generated":
         return _run(src_dir)
     job["phase"] = "deopt"
     with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
@@ -2853,8 +2990,35 @@ def create_app() -> FastAPI:
             cell["stage3"] = _splat_stage3_status(run, slot, model, source)
             cell["stage4"] = _splat_stage4_status(run, slot, model)
             cell["stage5"] = _splat_stage5_status(run, slot, model)
+            cell["stage6"] = _splat_stage6_status(run, slot, model)
             cells.append(cell)
         return {"run": run, "cells": cells}
+
+    @app.get("/runs/{run}/splat/source/{slot}/{model}")
+    async def splat_source_get(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The cell's splat source override ('auto' when none) + the build it
+        currently resolves to."""
+        pref = _splat_source_pref(run, slot, model)
+        resolved = _splat_source(run, slot, model)
+        return {"source": pref or "auto", "resolved": resolved[1] if resolved else None}
+
+    @app.post("/runs/{run}/splat/source/{slot}/{model}")
+    async def splat_source_set(run: str, slot: str, model: str, source: str = "auto") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Pin which asset build the splat pipeline samples/renders for this cell:
+        'generated' (raw), 'generated-lite', 'generated-optimized', 'library', or
+        'auto' (clear). Applied by every stage through _splat_source — re-run the
+        stages to regenerate against the new source."""
+        path = _splat_source_pref_path(run, slot, model)
+        src = (source or "auto").strip()
+        if src in ("", "auto"):
+            path.unlink(missing_ok=True)
+        elif src in _SPLAT_SOURCE_CHOICES:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"source": src}), encoding="utf-8")
+        else:
+            raise HTTPException(status_code=400, detail=f"invalid source: {src!r}")
+        resolved = _splat_source(run, slot, model)
+        return {"source": src or "auto", "resolved": resolved[1] if resolved else None}
 
     @app.post("/runs/{run}/splat/stage1/{slot}/{model}")
     async def splat_stage1_start(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -3222,7 +3386,7 @@ def create_app() -> FastAPI:
         return _scene_projection(events)
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True, variant: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
@@ -3249,7 +3413,7 @@ def create_app() -> FastAPI:
             events = events[:until_index]
         if mode == "generated":
             rid = _run_id(run, slot_id, model_alias)
-            objects_dir = generation.latest_generated_dirs(RUNS_DIR, rid)[1 if optimized else 0]
+            objects_dir = _generated_variant_dir(rid, _resolve_gen_variant(variant, optimized))
         else:
             objects_dir = _objects_dir(cell_dir)
         return StreamingResponse(
@@ -3523,6 +3687,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         run: str | None = None,
         optimized: bool = True,
+        variant: str | None = None,
     ) -> dict[str, object]:
         """Gate state for the client: whether a build/regen is in flight for this
         cell's generated build and the ids of its finished GLBs. Polled while the
@@ -3555,7 +3720,10 @@ def create_app() -> FastAPI:
         canonical_of = _generated_prefab(gen_events_path)
         image_prompts = _generated_image_prompts(gen_events_path)
         raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
-        gen_dir = opt_dir if optimized else raw_dir
+        lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+        gen_dir = {"raw": raw_dir, "lite": lite_dir, "optimized": opt_dir}[
+            _resolve_gen_variant(variant, optimized)
+        ]
 
         def _variant(path: Path) -> tuple[str, int] | None:
             """(url, mtime) for a generated GLB, or None when it isn't on disk."""
@@ -3591,6 +3759,7 @@ def create_app() -> FastAPI:
                 # first, the optimized twin after); the client falls back.
                 opt_v = _variant(opt_dir / f"{mesh_id}.glb")
                 unopt_v = _variant(raw_dir / f"{mesh_id}.glb")
+                lite_v = _variant(lite_dir / f"{mesh_id}.glb")
                 # A served twin whose raw/unoptimized backing is missing is a torn
                 # "ghost" (a regen that died midway): it still renders but can't be
                 # re-derived (reorient/symmetrize/reuse) or shown in the per-object
@@ -3608,6 +3777,8 @@ def create_app() -> FastAPI:
                     "optV": opt_v[1] if opt_v else None,
                     "unoptUrl": unopt_v[0] if unopt_v else None,
                     "unoptV": unopt_v[1] if unopt_v else None,
+                    "liteUrl": lite_v[0] if lite_v else None,
+                    "liteV": lite_v[1] if lite_v else None,
                     "raw": f"/artifacts/{raw_p.relative_to(RUNS_DIR).as_posix()}" if raw_p.exists() else None,
                     "sym": info["plane"] if info else "none",
                     "symWas": info["was"] if info else None,
@@ -3632,6 +3803,69 @@ def create_app() -> FastAPI:
             "ids": ids,
             "meshes": meshes,
             "busy": sorted(busy),
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/build-lite")
+    async def slot_build_lite(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, run: str | None = None,
+    ) -> dict[str, object]:
+        """Build (or resume) this cell's LITE presentation tier —
+        objects-generated/ -> objects-generated-lite/ via build_lite_assets.py — as a
+        background job. Idempotent while running (returns the live job). Poll the GET."""
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        rid = _run_id(run, slot_id, model_alias)
+        raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
+        out_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+        total = _placed_count(raw_dir)
+        if total == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="no generated build to build lite from — run ⚡ generate first",
+            )
+        key = (run, slot_id, model_alias)
+        existing = _lite_build_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        job: dict[str, Any] = {
+            "run": run,
+            "slot": slot_id,
+            "model": model_alias,
+            "running": True,
+            "ok": None,
+            "done": 0,
+            "total": total,
+            "status": "pending",
+            "error": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _lite_build_jobs[key] = job
+        _lite_build_tasks[key] = asyncio.create_task(
+            _run_lite_build(run, slot_id, model_alias, raw_dir, out_dir)
+        )
+        return dict(job)
+
+    @app.get("/slots/{slot_id}/{model_alias}/build-lite")
+    async def slot_build_lite_status(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str, model_alias: str, run: str | None = None,
+    ) -> dict[str, object]:
+        """Live lite-build state for a cell: the running job, else a disk summary."""
+        run = _resolve_run(run)
+        key = (run, slot_id, model_alias)
+        job = _lite_build_jobs.get(key)
+        if job is not None:
+            return dict(job)
+        rid = _run_id(run, slot_id, model_alias)
+        raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
+        lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+        return {
+            "running": False,
+            "ok": None,
+            "done": _placed_count(lite_dir),
+            "total": _placed_count(raw_dir),
+            "status": "idle",
+            "error": None,
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/regenerate/{node_id}")

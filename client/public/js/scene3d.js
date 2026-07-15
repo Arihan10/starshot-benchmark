@@ -231,7 +231,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 	function setCameraMode(mode) {
 		if (!fp) return;
-		if (mode === "fp") fp.lock(); // requestPointerLock — needs the click gesture
+		if (mode === "fp")
+			fp.lock(); // requestPointerLock — needs the click gesture
 		else fp.unlock();
 	}
 
@@ -1069,8 +1070,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			dt;
 		if (pressedKeys.has("w") || pressedKeys.has("s")) {
 			fp.getDirection(_fpDir); // full look dir, including pitch
-			if (pressedKeys.has("w")) camera.position.addScaledVector(_fpDir, speed);
-			if (pressedKeys.has("s")) camera.position.addScaledVector(_fpDir, -speed);
+			if (pressedKeys.has("w"))
+				camera.position.addScaledVector(_fpDir, speed);
+			if (pressedKeys.has("s"))
+				camera.position.addScaledVector(_fpDir, -speed);
 		}
 		if (pressedKeys.has("d")) fp.moveRight(speed);
 		if (pressedKeys.has("a")) fp.moveRight(-speed);
@@ -1534,7 +1537,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		model.traverse((o) => {
 			if (!o.isMesh || !o.material) return;
 			const mats = Array.isArray(o.material) ? o.material : [o.material];
-			for (const m of mats) if (mapProjectionTexture(m, spec)) hasAny = true;
+			for (const m of mats)
+				if (mapProjectionTexture(m, spec)) hasAny = true;
 		});
 		if (!hasAny) return false;
 		model.traverse((o) => {
@@ -1888,7 +1892,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// this so a projection paint means "show EXACTLY this", in both directions.
 	function pruneTo({ bboxIds, meshIds }) {
 		// Restore before dispose if the projected object is being pruned.
-		if (projectedId !== null && !meshIds.has(projectedId)) clearMapProjection();
+		if (projectedId !== null && !meshIds.has(projectedId))
+			clearMapProjection();
 		for (const id of [...bboxes.keys()]) {
 			if (bboxIds.has(id)) continue;
 			const helper = bboxes.get(id);
@@ -2060,7 +2065,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		renderer.getDrawingBufferSize(_oitSize);
 		const w = Math.max(1, _oitSize.x);
 		const h = Math.max(1, _oitSize.y);
-		if (opaqueTarget && opaqueTarget.width === w && opaqueTarget.height === h)
+		if (
+			opaqueTarget &&
+			opaqueTarget.width === w &&
+			opaqueTarget.height === h
+		)
 			return;
 		disposeOITTargets();
 		// accum + reveal share the opaque depth (depth-test only, no writes).
@@ -2220,7 +2229,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		// back as the source of truth for its per-map button state.
 		setMapProjection,
 		clearMapProjection,
-		getMapProjection: (id) => (projectedId === id ? projectedMapType : null),
+		getMapProjection: (id) =>
+			projectedId === id ? projectedMapType : null,
 		// Lighting engine (main viewer only; no-ops + null elsewhere). The panel
 		// (lighting.js) drives setLighting; lightingDefaults seeds its reset.
 		setLighting: (partial) => lightingRig?.setLighting(partial),

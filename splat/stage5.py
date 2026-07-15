@@ -229,8 +229,11 @@ def _require_cuda_renderer():  # noqa: ANN202 - returns (torch, nvdiffrast.torch
 
 
 def _iter_geoms(mesh: trimesh.Trimesh | trimesh.Scene) -> list[trimesh.Trimesh]:
+    # dump() bakes each geometry's scene-graph node transform into world space; plain
+    # scene.geometry returns LOCAL vertices, which collapses node-placed objects
+    # (generated assets carry placement on the node) to the origin.
     if isinstance(mesh, trimesh.Scene):
-        return [g for g in mesh.geometry.values() if hasattr(g, "faces")]
+        return [g for g in mesh.dump(concatenate=False) if hasattr(g, "faces")]
     return [mesh]
 
 
@@ -278,15 +281,47 @@ def placed_object_ids(raw_dir: Path) -> list[str]:
     )
 
 
+# nvdiffrast's CudaRaster packs the triangle index into 24 bits, so ONE rasterize()
+# call handles at most 2**24 triangles; beyond that it faults (CUDA 700) and poisons
+# the context. Frustum culling keeps most views under this; a view still over it after
+# culling raises instead of crashing.
+_NVDIFFRAST_MAX_TRIS = 1 << 24  # 16,777,216
+
+
+def _frustum_planes(mvp: np.ndarray) -> np.ndarray:
+    """The 6 frustum planes [6,4] (a,b,c,d) of a world->clip matrix `mvp` (row-major,
+    clip = mvp @ [x,y,z,1]); a world point is inside when plane·[x,y,z,1] >= 0. The
+    Gribb-Hartmann combinations of the clip rows (left,right,bottom,top,near,far)."""
+    r0, r1, r2, r3 = mvp[0], mvp[1], mvp[2], mvp[3]
+    return np.stack([r3 + r0, r3 - r0, r3 + r1, r3 - r1, r3 + r2, r3 - r2])
+
+
+def _objects_in_frustum(
+    aabb_min: np.ndarray, aabb_max: np.ndarray, planes: np.ndarray
+) -> np.ndarray:
+    """Conservative AABB-vs-frustum test -> [G] bool keep mask: an object is kept
+    unless its AABB is fully outside some plane (the corner furthest toward the plane
+    normal is still outside). Never culls a partially-visible box."""
+    n = planes[:, :3]                                                        # [6,3]
+    pv = np.where(n[None] > 0.0, aabb_max[:, None, :], aabb_min[:, None, :])  # [G,6,3]
+    dot = np.einsum("gpc,pc->gp", pv, n) + planes[:, 3]                       # [G,6]
+    return (dot >= 0.0).all(axis=1)
+
+
 class _Scene:
     """Composed-scene GPU buffers, built once per cell: one global vertex/triangle
-    soup + per-triangle material index + per-material RGBA textures & alpha modes."""
+    soup + per-triangle material index + per-material RGBA textures & alpha modes.
+    Also records per-object (per-geom) world AABBs + triangle ranges (on the CPU) so
+    Stage-5 can frustum-cull each view."""
 
     def __init__(self, torch, raw_dir: Path, ids: list[str]):  # noqa: ANN001
         verts: list[np.ndarray] = []
         faces: list[np.ndarray] = []
         uvs: list[np.ndarray] = []
         tri_mat: list[np.ndarray] = []
+        aabb_min: list[np.ndarray] = []
+        aabb_max: list[np.ndarray] = []
+        tri_count: list[int] = []
         self.textures: list[Any] = []          # list of [1,th,tw,4] cuda tensors
         self.alpha_modes: list[str] = []
         self.warnings: list[str] = []
@@ -314,6 +349,9 @@ class _Scene:
                 uvs.append(uv)
                 faces.append(np.asarray(geom.faces, dtype=np.int32) + voff)
                 tri_mat.append(np.full(nf, mat_id, dtype=np.int64))
+                aabb_min.append(v.min(axis=0))
+                aabb_max.append(v.max(axis=0))
+                tri_count.append(nf)
                 self.textures.append(
                     torch.as_tensor(tex, dtype=torch.float32, device="cuda")[None]
                 )
@@ -334,28 +372,79 @@ class _Scene:
         self.verts_h = torch.cat([self.verts, ones], dim=1)  # [V,4]
         self.n_materials = len(self.textures)
 
+        # Per-object world AABBs + triangle ranges (kept on the CPU) for frustum
+        # culling: the cull test runs in numpy with no GPU sync, and the ranges index
+        # self.tris / self.tri_mat directly (vertices stay shared and uncapped, so
+        # culling only ever subsets triangles).
+        counts = np.asarray(tri_count, dtype=np.int64)
+        self.obj_tri_count = counts
+        self.obj_tri_start = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.int64)
+        self.obj_aabb_min = np.asarray(aabb_min, dtype=np.float32)  # [G,3] world
+        self.obj_aabb_max = np.asarray(aabb_max, dtype=np.float32)  # [G,3] world
+        self.n_objects = int(counts.shape[0])
 
-def _render_view(torch, dr, glctx, scene, c2w, proj, resolution, params):  # noqa: ANN001
+
+def _visible_tris(torch, scene, keep):  # noqa: ANN001
+    """(tris, tri_mat) restricted to the frustum-visible objects: the full buffers
+    when every object is kept (zero-copy), else the concatenation of the kept
+    objects' contiguous triangle ranges (copies only the visible triangles)."""
+    if keep.all():
+        return scene.tris, scene.tri_mat
+    idx = np.nonzero(keep)[0]
+    if idx.size == 0:
+        return scene.tris[:0], scene.tri_mat[:0]
+    starts, counts = scene.obj_tri_start[idx], scene.obj_tri_count[idx]
+    tri_parts = [scene.tris[int(s) : int(s + c)] for s, c in zip(starts, counts)]
+    mat_parts = [scene.tri_mat[int(s) : int(s + c)] for s, c in zip(starts, counts)]
+    return torch.cat(tri_parts), torch.cat(mat_parts)
+
+
+def _render_view(torch, dr, glctx, scene, c2w, proj_np, resolution, params):  # noqa: ANN001
     """Render one pinhole view → (rgb [H,W,3], depth [H,W], alpha [H,W]) as numpy,
-    already flipped to top-down (row 0 = top) to match gsplat / normal images."""
-    w2c = torch.linalg.inv(c2w)                     # OpenCV world→camera [4,4]
+    already flipped to top-down (row 0 = top) to match gsplat / normal images.
+
+    Objects whose world AABB is fully outside the view frustum are culled before
+    rasterizing — exact for an unlit rasterizer (off-screen geometry can't affect a
+    flat-albedo image), and the mechanism that keeps a view's triangle count under
+    nvdiffrast's per-call limit. `c2w`/`proj_np` are numpy so the cull test runs on
+    the CPU without a GPU sync."""
+    w2c_np = np.linalg.inv(c2w)                     # OpenCV world→camera [4,4]
+    keep = _objects_in_frustum(
+        scene.obj_aabb_min, scene.obj_aabb_max, _frustum_planes(proj_np @ w2c_np)
+    )
+    if not keep.any():                              # nothing in view → background frame
+        empty = np.zeros((resolution, resolution), dtype=np.float32)
+        rgb_bg = np.broadcast_to(
+            np.asarray(params.background, dtype=np.float32), (resolution, resolution, 3)
+        ).copy()
+        return rgb_bg, empty, empty.copy()
+    tris, tri_mat = _visible_tris(torch, scene, keep)
+    if int(tris.shape[0]) > _NVDIFFRAST_MAX_TRIS:
+        raise RuntimeError(
+            f"{int(tris.shape[0]):,} triangles visible in one view after frustum "
+            f"culling exceeds nvdiffrast's {_NVDIFFRAST_MAX_TRIS:,} per-call limit — "
+            f"use the optimized (lighter) source or triangle-chunked rendering."
+        )
+
+    w2c = torch.as_tensor(w2c_np, dtype=torch.float32, device="cuda")
+    proj = torch.as_tensor(proj_np, dtype=torch.float32, device="cuda")
     v_cam = scene.verts_h @ w2c.T                   # [V,4]; column 2 = planar Z
     cam_z = v_cam[:, 2:3].contiguous()              # planar depth attribute (metres)
     pos_clip = (v_cam @ proj.T).contiguous()        # [V,4] clip space
-    rast, _ = dr.rasterize(glctx, pos_clip[None], scene.tris, (resolution, resolution))
+    rast, _ = dr.rasterize(glctx, pos_clip[None], tris, (resolution, resolution))
     tri_id = rast[..., 3].long()                    # [1,H,W]; 0 = empty, else idx+1
     covered = tri_id > 0
 
     # Per-pixel planar depth (perspective-correct interpolation of camera-space Z).
-    depth, _ = dr.interpolate(cam_z[None], rast, scene.tris)          # [1,H,W,1]
+    depth, _ = dr.interpolate(cam_z[None], rast, tris)               # [1,H,W,1]
     # Per-pixel UV; flip V because glTF v=0 is the texture TOP but nvdiffrast t=0 is
     # the BOTTOM (see module docstring / smoke test).
-    uv, _ = dr.interpolate(scene.uv[None], rast, scene.tris)          # [1,H,W,2]
+    uv, _ = dr.interpolate(scene.uv[None], rast, tris)               # [1,H,W,2]
     uv = torch.cat([uv[..., 0:1], 1.0 - uv[..., 1:2]], dim=-1).contiguous()
 
-    # Per-pixel material id (gather via triangle id), then composite each material
-    # present in this view. Looping only present materials keeps interior faces cheap.
-    mat_pix = torch.where(covered, scene.tri_mat[(tri_id - 1).clamp(min=0)], tri_id.new_full(tri_id.shape, -1))
+    # Per-pixel material id (gather via triangle id into the VISIBLE subset's
+    # tri_mat), then composite each material present in this view.
+    mat_pix = torch.where(covered, tri_mat[(tri_id - 1).clamp(min=0)], tri_id.new_full(tri_id.shape, -1))
     bg = torch.tensor(params.background, dtype=torch.float32, device="cuda")
     rgb = bg.expand(1, resolution, resolution, 3).clone()
     alpha = torch.zeros((1, resolution, resolution, 1), dtype=torch.float32, device="cuda")
@@ -429,15 +518,13 @@ def render_references(
 
     glctx = dr.RasterizeCudaContext()
     scene = _Scene(torch, raw_dir, ids)
-    proj = torch.as_tensor(proj_np, dtype=torch.float32, device="cuda")
 
     if progress is not None:
         progress(0, total, "")
 
     frames: list[dict[str, Any]] = []
     for done, view in enumerate(views, start=1):
-        c2w = torch.as_tensor(view["c2w"], dtype=torch.float32, device="cuda")
-        rgb, depth, alpha = _render_view(torch, dr, glctx, scene, c2w, proj, resolution, params)
+        rgb, depth, alpha = _render_view(torch, dr, glctx, scene, view["c2w"], proj_np, resolution, params)
 
         vid = view["id"]
         rgb_path = out_dir / "rgb" / f"{vid}.png"
