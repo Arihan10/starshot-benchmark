@@ -714,6 +714,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		helper.material.depthTest = false;
 		helper.material.transparent = true;
 		helper.renderOrder = 998;
+		helper.layers.set(OVERLAY_LAYER);
 		axesGroup = new THREE.Group();
 		axesGroup.add(helper);
 		axesGroup.position.set(center[0] ?? 0, center[1] ?? 0, center[2] ?? 0);
@@ -762,6 +763,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			part.material.depthTest = false;
 			part.material.transparent = true;
 			part.renderOrder = 997;
+			part.layers.set(OVERLAY_LAYER);
 		}
 		scene.add(arrow);
 		orientationArrow = arrow;
@@ -1373,6 +1375,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			helper.material.depthTest = false;
 			helper.material.transparent = true;
 			helper.renderOrder = 999;
+			helper.layers.set(OVERLAY_LAYER);
 			overlayRoot.add(helper);
 		}
 	}
@@ -1994,6 +1997,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// (windows, pools, the mostly-opaque car) with no per-triangle sorting. Only
 	// engaged while transparent meshes are loaded; otherwise the plain path runs.
 	const OIT_LAYER = 1;
+	// Depth-test-off gizmos (orientation arrow, axes, overlay boxes) live here so
+	// they render in a dedicated final pass AFTER the OIT composite — otherwise the
+	// composite quad overwrites them wherever a generated mesh is in front.
+	const OVERLAY_LAYER = 2;
 	// Depth pre-pass cutoff: fragments at/above this occlude (write depth) so solid
 	// surfaces and window frames don't bleed the background; genuine glass below it
 	// blends. Sits just above typical window alpha (~0.6-0.78) and below the
@@ -2145,6 +2152,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		});
 		if (_oitMats.length === 0) {
 			renderer.setRenderTarget(null);
+			camera.layers.set(0);
+			camera.layers.enable(OVERLAY_LAYER);
 			renderer.render(scene, camera);
 			return;
 		}
@@ -2203,6 +2212,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		renderer.setRenderTarget(null);
 		oitCompose.uniforms.uExposure.value = renderer.toneMappingExposure;
 		renderer.render(oitQuadScene, oitQuadCamera);
+
+		// Overlay pass: depth-test-off gizmos (arrow, axes, overlay boxes) live on
+		// OVERLAY_LAYER and must render AFTER the composite so they aren't occluded.
+		renderer.autoClear = false;
+		camera.layers.set(OVERLAY_LAYER);
+		renderer.render(scene, camera);
 	}
 
 	let disposed = false;
