@@ -5,7 +5,10 @@ supervision the Stage-6 gsplat fine-tune trains against:
 
   * **RGB** — unlit albedo (the base-color texel per fragment; no lighting).
   * **depth** — planar camera-space Z, in metres (matches gsplat's `D`/`ED`
-    "projection depth"), of the nearest opaque surface.
+    "projection depth"), of the nearest opaque surface. Persisted as a 16-bit PNG
+    (log-quantized over the shared [near, far] to uint16, code 0 = background) —
+    ~5-10x smaller than raw float32 and near-lossless for the alpha-gated depth
+    loss (see `encode_depth_u16` / `load_depth_png`).
   * **alpha** — coverage in [0,1] (1 = opaque hit, 0 = empty), times the
     base-color alpha so glass reads as low-alpha for the alpha-gated depth loss.
 
@@ -61,6 +64,16 @@ logging.getLogger("trimesh").setLevel(logging.ERROR)
 # Written under a cell's `splat/refs/` dir.
 REFS_DIRNAME = "refs"
 TRANSFORMS_NAME = "transforms.json"
+
+# Depth storage: a 16-bit PNG (not raw float32). Planar-Z metres are LOG-quantized
+# over the shared [near, far] into uint16 codes 1..65535, with code 0 reserved for
+# background (no surface). Log spacing keeps relative precision constant (~0.01% —
+# sub-mm near the camera), which is near-lossless for the alpha-gated depth L1,
+# while PNG's predictive filters pack the smooth integer field ~5-10x smaller than
+# float32. Decoded to metric metres by `load_depth_png` (Stage 6); the [near, far]
+# used here is the same pair recorded in transforms.json, so decode is unambiguous.
+DEPTH_ENCODING = "planar_z_log_uint16_png"
+_DEPTH_CODE_MAX = 65535   # uint16 max; code 0 == background
 
 # progress(done, total, current) — called after each rendered view.
 ProgressCb = Callable[[int, int, str], None]
@@ -174,6 +187,51 @@ def enumerate_views(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return views
 
 
+def encode_depth_u16(depth: np.ndarray, near: float, far: float) -> np.ndarray:
+    """Planar-Z depth (metres; 0 = background) → uint16 codes for a 16-bit PNG:
+    code 0 = background, 1..65535 = LOG-spaced positions over [near, far]. A
+    foreground sample is clamped into [near, far] first, so a surface closer than
+    `near` still encodes to code 1 (never 0) and stays in the alpha-gated depth
+    loss instead of being read back as background."""
+    near = max(float(near), 1e-6)
+    far = max(float(far), near * (1.0 + 1e-6))
+    z = np.clip(depth, near, far)
+    t = np.log(z / near) / np.log(far / near)                        # 0..1 over [near, far]
+    codes = np.rint(t * (_DEPTH_CODE_MAX - 1)).astype(np.int32) + 1   # 1.._DEPTH_CODE_MAX
+    return np.where(depth > 0.0, codes, 0).astype(np.uint16)
+
+
+def decode_depth_u16(codes: np.ndarray, near: float, far: float) -> np.ndarray:
+    """Inverse of `encode_depth_u16`: uint16 codes → planar-Z metres, 0 where the
+    code is 0 (background). `near`/`far` must match the encode."""
+    near = max(float(near), 1e-6)
+    far = max(float(far), near * (1.0 + 1e-6))
+    codes = np.asarray(codes)
+    t = (codes.astype(np.float32) - 1.0) / (_DEPTH_CODE_MAX - 1)
+    z = near * np.exp(t * np.log(far / near))
+    return np.where(codes > 0, z, 0.0).astype(np.float32)
+
+
+def save_depth_png(path: Path, depth: np.ndarray, near: float, far: float) -> None:
+    """Write planar-Z depth [H,W] as a 16-bit grayscale PNG (log-uint16; see
+    `encode_depth_u16`)."""
+    from PIL import Image
+
+    codes = encode_depth_u16(depth, near, far)
+    h, w = codes.shape
+    data = np.ascontiguousarray(codes, dtype="<u2").tobytes()   # little-endian, matches "I;16"
+    Image.frombytes("I;16", (w, h), data).save(path)
+
+
+def load_depth_png(path: Path, near: float, far: float) -> np.ndarray:
+    """Read a 16-bit depth PNG written by `save_depth_png` → planar-Z metres [H,W].
+    `near`/`far` must match the encode (both are recorded in transforms.json)."""
+    from PIL import Image
+
+    codes = np.asarray(Image.open(path))
+    return decode_depth_u16(codes, near, far)
+
+
 def write_transforms(
     out_dir: Path,
     K: np.ndarray,
@@ -181,15 +239,17 @@ def write_transforms(
     near: float,
     far: float,
     frames: list[dict[str, Any]],
+    depth_encoding: str = DEPTH_ENCODING,
 ) -> Path:
     """Write `transforms.json`: shared pinhole intrinsics + per-frame OpenCV
     camera-to-world and artifact paths. `convention` is tagged so Stage 6 knows to
     take `viewmats = inv(transform_matrix)` (gsplat OpenCV), NOT the Nerfstudio
-    OpenGL c2w."""
+    OpenGL c2w. `depth_encoding` records how the depth maps are stored (the
+    log-uint16 PNG scheme, decoded with `near`/`far`)."""
     doc = {
         "camera_model": "pinhole",
         "convention": "opencv_c2w",     # transform_matrix is OpenCV camera-to-world
-        "depth": "planar_z_metric",     # gsplat render_mode D/ED
+        "depth": depth_encoding,        # gsplat render_mode D/ED, log-uint16 PNG storage
         "color_space": "srgb",
         "w": resolution,
         "h": resolution,
@@ -536,8 +596,8 @@ def render_references(
             "transform_matrix": view["c2w"].tolist(),
         }
         if params.save_depth:
-            np.save(out_dir / "depth" / f"{vid}.npy", depth.astype(np.float32))
-            frame["depth_path"] = f"depth/{vid}.npy"
+            save_depth_png(out_dir / "depth" / f"{vid}.png", depth, near, far)
+            frame["depth_path"] = f"depth/{vid}.png"
         if params.save_alpha:
             Image.fromarray((np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)).save(
                 out_dir / "alpha" / f"{vid}.png"
@@ -547,7 +607,10 @@ def render_references(
         if progress is not None:
             progress(done, total, vid)
 
-    write_transforms(out_dir, K, resolution, near, far, frames)
+    write_transforms(
+        out_dir, K, resolution, near, far, frames,
+        depth_encoding=DEPTH_ENCODING if params.save_depth else "none",
+    )
 
     return {
         "run": run,

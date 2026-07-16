@@ -42,10 +42,11 @@ if summary["warnings"]:
     print("warnings:", summary["warnings"][:5])
 
 # sanity: outputs exist, depth in metres is plausible, alpha in [0,1]
-frames = json.loads((OUT / "transforms.json").read_text(encoding="utf-8"))["frames"]
+doc = json.loads((OUT / "transforms.json").read_text(encoding="utf-8"))
+frames = doc["frames"]
 f0 = frames[0]
 rgb = np.asarray(Image.open(OUT / f0["file_path"]).convert("RGB"))
-depth = np.load(OUT / f0["depth_path"])
+depth = stage5.load_depth_png(OUT / f0["depth_path"], doc["near"], doc["far"])
 alpha = np.asarray(Image.open(OUT / f0["alpha_path"]), np.float32) / 255.0
 cov = float((alpha > 0.5).mean())
 dvals = depth[depth > 0]

@@ -116,7 +116,7 @@ except Exception as e:
 
 vid = "cam00000_+z"
 rgb = np.asarray(Image.open(out_dir / "rgb" / f"{vid}.png").convert("RGB"), dtype=np.float32) / 255.0
-depth = np.load(out_dir / "depth" / f"{vid}.npy")
+depth = stage5.load_depth_png(out_dir / "depth" / f"{vid}.png", near, far)
 alpha = np.asarray(Image.open(out_dir / "alpha" / f"{vid}.png"), dtype=np.float32) / 255.0
 print(f"  rgb {rgb.shape}, depth {depth.shape}, alpha {alpha.shape}")
 
@@ -164,7 +164,7 @@ check("background depth == 0", abs(float(depth[brow, bcol])) < 1e-6)
 # --- 5. transforms.json ------------------------------------------------------
 doc = json.loads((out_dir / "transforms.json").read_text(encoding="utf-8"))
 check("transforms convention/depth tags + 1 frame",
-      doc.get("convention") == "opencv_c2w" and doc.get("depth") == "planar_z_metric"
+      doc.get("convention") == "opencv_c2w" and doc.get("depth") == stage5.DEPTH_ENCODING
       and len(doc.get("frames", [])) == 1)
 
 # save a copy of the render for eyeballing

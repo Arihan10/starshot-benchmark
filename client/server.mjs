@@ -23,6 +23,8 @@ const GSPLAT_DIR = resolve(
     "gaussian-splats-3d",
     "build",
 );
+// PlayCanvas engine (ESM bundle) — renders the SOG-encoded trained splat.
+const PLAYCANVAS_DIR = resolve(__dirname, "node_modules", "playcanvas", "build");
 
 const PORT = Number(process.env.PORT ?? 8766);
 const SERVER_URL = process.env.SERVER_URL ?? "http://127.0.0.1:8765";
@@ -121,6 +123,11 @@ const server = createServer(async (req, res) => {
     if (url.startsWith("/vendor/gsplat/")) {
         const sub = url.slice("/vendor/gsplat/".length);
         const abs = resolveUnder(GSPLAT_DIR, sub);
+        if (abs) return serveFile(res, abs);
+    }
+    if (url.startsWith("/vendor/playcanvas/")) {
+        const sub = url.slice("/vendor/playcanvas/".length);
+        const abs = resolveUnder(PLAYCANVAS_DIR, sub);
         if (abs) return serveFile(res, abs);
     }
     const pub = resolveUnder(PUBLIC_DIR, url);

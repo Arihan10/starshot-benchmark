@@ -150,7 +150,7 @@ with tempfile.TemporaryDirectory() as td:
                "transform_matrix": v0["c2w"].tolist()}]
     out = stage5.write_transforms(Path(td), K, R, near, far, frames)
     doc = json.loads(out.read_text(encoding="utf-8"))
-    ok = (doc["convention"] == "opencv_c2w" and doc["depth"] == "planar_z_metric"
+    ok = (doc["convention"] == "opencv_c2w" and doc["depth"] == stage5.DEPTH_ENCODING
           and doc["w"] == R and np.isclose(doc["fl_x"], K[0, 0]) and len(doc["frames"]) == 1)
     check("write_transforms fields + convention tags", ok)
 

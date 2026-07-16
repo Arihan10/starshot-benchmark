@@ -275,20 +275,26 @@ def _build_coverage(
     t2: np.ndarray,
     fs: FreeSpace,
     p: PlanParams,
+    progress: ProgressCb | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Covering (candidate, patch) pairs, each tagged with the azimuthal SECTOR the
     camera views the patch from and whether it's a NEAR (detail-distance) view. A
     pair exists if the camera is within the patch's view distance from EITHER side
     (two-sided; winding-agnostic) and unoccluded. Returns COO arrays (cand_idx,
-    patch_idx, sector, is_near)."""
+    patch_idx, sector, is_near). Streams `progress("coverage", candidates_done,
+    total)` as it goes — this per-candidate ray-march is the stage's long pole."""
     tree = cKDTree(patch_pos)
     n_steps = int(np.ceil(p.view_dist_max / fs.pitch_fine)) + 2
     a = p.angular_sectors
+    n_cand = len(candidates)
+    report_every = max(1, n_cand // 200)   # ~200 progress ticks across the candidate loop
     cc: list[np.ndarray] = []
     pp: list[np.ndarray] = []
     sec: list[np.ndarray] = []
     near: list[np.ndarray] = []
     for ci, cam in enumerate(candidates):
+        if progress is not None and ci % report_every == 0:
+            progress(ci, n_cand, "coverage")
         idx = np.asarray(tree.query_ball_point(cam, p.view_dist_max), dtype=int)
         if len(idx) == 0:
             continue
@@ -341,10 +347,12 @@ def _greedy_angular(
     k: int,
     min_gain: int,
     a: int,
+    progress: ProgressCb | None = None,
 ) -> tuple[list[int], np.ndarray, np.ndarray]:
     """Greedy coverage where a patch is satisfied by ≥ k DISTINCT azimuthal sectors
     AND ≥ 1 near view. Each step takes the camera advancing the most patches; stops
-    below `min_gain`. Returns (chosen candidate indices, sector bitmask, has-near)."""
+    below `min_gain`. Returns (chosen candidate indices, sector bitmask, has-near).
+    Streams `progress("select", cameras_chosen, 0)` as cameras accumulate."""
     angmask = np.zeros(n_patch, dtype=np.int64)
     hasnear = np.zeros(n_patch, dtype=bool)
     lut = np.array([bin(i).count("1") for i in range(1 << a)], dtype=np.int16)
@@ -366,6 +374,8 @@ def _greedy_angular(
             break
         taken[c] = True
         chosen.append(c)
+        if progress is not None and len(chosen) % 25 == 0:
+            progress(len(chosen), 0, "select")
         m = cc == c
         np.bitwise_or.at(angmask, pp[m], pair_bit[m])
         near_hits = pp[m][is_near[m]]
@@ -404,7 +414,7 @@ def plan_cameras(
     rng = np.random.default_rng(params.seed)
 
     if progress is not None:
-        progress(0, 3, "load")
+        progress(0, 0, "load")
     fs = load_free_space(Path(freespace_path))
     points, normals, albedo = _read_cloud(Path(surfels_path))
     lo = points.min(axis=0)
@@ -412,7 +422,7 @@ def plan_cameras(
 
     # Feature-adaptive patches (curvature + texture gradient) from the surfels.
     if progress is not None:
-        progress(1, 3, "patches")
+        progress(0, 0, "patches")
     spacing = _feature_spacing(points, normals, albedo, params)
     keep = _adaptive_patches(points, normals, spacing, params.patch_min_spacing, rng)
     patch_pos = points[keep].astype(np.float32)
@@ -428,18 +438,20 @@ def plan_cameras(
     if len(candidates) == 0:
         raise RuntimeError("no candidate camera positions (reachable free space empty)")
 
-    # Coverage (per-pair sector + near) + angular greedy.
-    if progress is not None:
-        progress(2, 3, "coverage")
+    # Coverage (per-pair sector + near) + angular greedy. Coverage is the long phase
+    # (a per-candidate occlusion ray-march), so it streams fine-grained progress
+    # (candidates processed / total) instead of a single coarse tick.
     n_patch = len(patch_pos)
     k = params.angles_per_patch
     a = params.angular_sectors
     cc, pp, sector, is_near = _build_coverage(
-        candidates, patch_pos, patch_nrm, view_dist, t1, t2, fs, params
+        candidates, patch_pos, patch_nrm, view_dist, t1, t2, fs, params, progress
     )
     chosen, angmask, hasnear = _greedy_angular(
-        cc, pp, sector, is_near, len(candidates), n_patch, k, params.min_gain, a
+        cc, pp, sector, is_near, len(candidates), n_patch, k, params.min_gain, a, progress
     )
+    if progress is not None:
+        progress(0, 0, "write")
 
     # Per-patch stats: distinct angles seen, and satisfaction (≥K angles + near view).
     lut = np.array([bin(i).count("1") for i in range(1 << a)], dtype=np.int16)

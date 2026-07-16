@@ -9,6 +9,10 @@
   "dependencies": {
     "@mkkellogg/gaussian-splats-3d": "^0.4.7",
     "gif.js": "^0.2.0",
+    "playcanvas": "^2.20.6",
     "three": "^0.163.0"
+  },
+  "devDependencies": {
+    "@playcanvas/splat-transform": "^3.0.0"
   }
 }

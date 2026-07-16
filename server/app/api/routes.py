@@ -118,6 +118,9 @@ _ARTIFACT_MEDIA_TYPES = {
     # viewer fetches (.ply cloud, .bin voxel field).
     ".ply": "application/octet-stream",
     ".bin": "application/octet-stream",
+    # SOG-encoded trained splat (client/tools/ply-to-sog.mjs) — a zip bundle the
+    # PlayCanvas gsplat loader fetches as raw bytes.
+    ".sog": "application/octet-stream",
 }
 
 # Per-run metadata written at creation (chosen prompt version, created_at).
@@ -2120,11 +2123,15 @@ def _splat_stage6_status(run: str, slot: str, model: str) -> dict[str, Any]:
     """Public Stage-6 (fine-tune) state — disk-only. Stage 6 runs as a standalone
     backend script (no server job), so this just exposes the trained `.ply` for the
     viewer: 'done' with its `/artifacts` `url` when `trained.ply` is present, else
-    'idle'."""
-    url = _artifact_url(_trained_path(run, slot, model))
+    'idle'. `sog_url` is the SOG-encoded twin beside it (client/tools/ply-to-sog.mjs),
+    surfaced the same disk-checked way so the viewer's PlayCanvas 'sog' view lights up
+    without a HEAD probe (FastAPI GET routes don't answer HEAD)."""
+    trained = _trained_path(run, slot, model)
+    url = _artifact_url(trained)
+    sog_url = _artifact_url(trained.with_suffix(".sog"))
     return {
         "run": run, "slot": slot, "model": model,
-        "status": "done" if url else "idle", "url": url,
+        "status": "done" if url else "idle", "url": url, "sog_url": sog_url,
     }
 
 

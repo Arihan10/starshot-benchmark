@@ -17,6 +17,7 @@ import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { api } from "./api.js";
 import { el } from "./ui.js";
+import { closeSogView, isSogOpen, openSogView, setSogVisible } from "./sogviewer.js";
 
 let overlay = null;
 let canvasEl = null;
@@ -30,9 +31,10 @@ let current = null; // { run, slot, model, source }
 let inputs = null; // control input elements, by key
 let voxelPoints = null; // Stage-2 free-space overlay (THREE.Points), lazy
 let meshGroup = null; // original-mesh overlay (THREE.Group), lazy
-let mode = "splat"; // "splat" | "mesh" — the view switch (not an overlay)
+let mode = "splat"; // "splat" | "mesh" | "sog" — the view switch (not an overlay)
 let splatSource = "surfels"; // "surfels" (Stage-3 cloud.ply) | "trained" (Stage-6 trained.ply)
 let trainedUrl = null; // /artifacts URL of the Stage-6 trained.ply, when it exists
+let sogUrl = null; // /artifacts URL of trained.sog (from stage6.sog_url), rendered via PlayCanvas
 
 // Patch-selection debug feature (needs Stage 4 + Stage 5). A selectable points
 // overlay of the coverage patches; clicking one opens its Stage-5 reference images
@@ -48,6 +50,7 @@ let _downXY = null; // pointer-down pos, to tell a click from an orbit drag
 // Pipeline stepper state (the side panel drives the whole splat pipeline).
 let cellStatus = null; // last-fetched per-stage status of the open cell
 let cloudLoaded = false; // whether a surfel cloud is currently in the canvas
+let runningAll = false; // the "run all (1-5)" sequential driver is active
 
 // WASD free-fly state (see movementTick). mkkellogg owns mouse orbit/zoom; this
 // adds keyboard walk by translating the camera + orbit target together per frame.
@@ -114,6 +117,7 @@ function movementTick(now) {
     const controls = viewer && viewer.controls;
     const dt = Math.min(0.05, (now - moveLast) / 1000 || 0); // clamp big frame gaps
     moveLast = now;
+    if (mode === "sog") return; // the PlayCanvas view owns WASD while visible
     if (!cam || !controls || pressed.size === 0) return;
     cam.updateMatrixWorld();
     // Horizontal forward/right (drop the pitch → walk, don't dive); Q/E/Space are
@@ -179,6 +183,7 @@ function disposeObj(obj) {
 
 async function teardown() {
     stopMovement();
+    closeSogView(); // the PlayCanvas canvas lives in canvasEl too (replaceChildren below)
     // Overlays live in the viewer's threeScene; free their GPU resources and
     // reset their toggles before the viewer (and its GL context) goes away.
     for (const obj of [voxelPoints, meshGroup, patchPoints]) {
@@ -379,28 +384,83 @@ async function ensureFreeSpace() {
     return st;
 }
 
-// Highlight the active view in the 3-way switch. "original" is mesh mode; the
-// two splat sources map to whichever .ply is loaded.
+// Highlight the active view in the 4-way switch. "original" is mesh mode, "sog"
+// is the PlayCanvas view; the two splat sources map to whichever .ply is loaded.
 function syncViewButtons() {
     if (!inputs) return;
-    const active = mode === "mesh" ? "original" : splatSource;
+    const active =
+        mode === "mesh" ? "original" : mode === "sog" ? "sog" : splatSource;
     inputs._surfBtn?.classList.toggle("on", active === "surfels");
     inputs._trainBtn?.classList.toggle("on", active === "trained");
+    inputs._sogBtn?.classList.toggle("on", active === "sog");
     inputs._origBtn?.classList.toggle("on", active === "original");
 }
 
-// Enable the "trained" toggle once Stage 6 has written trained.ply (surfaced by
-// the cell poll — Stage 6 is a backend script, so the splat just appears here).
-function updateSourceAvail() {
-    trainedUrl = (cellStatus && cellStatus.stage6 && cellStatus.stage6.url) || null;
-    const btn = inputs && inputs._trainBtn;
+function syncSogBtn() {
+    const btn = inputs && inputs._sogBtn;
     if (!btn) return;
-    btn.disabled = !trainedUrl;
-    btn.title = trainedUrl
-        ? "the Stage-6 fine-tuned splat (trained.ply)"
-        : "run Stage 6 (the training script) to produce trained.ply";
+    btn.disabled = !sogUrl;
+    btn.title = sogUrl
+        ? "the SOG-encoded trained splat, rendered with PlayCanvas"
+        : "encode it first: node client/tools/ply-to-sog.mjs …/trained.ply …/trained.sog";
+}
+
+// Enable the "trained" and "sog" toggles from the cell poll's Stage-6 status
+// (Stage 6 is a backend script, so trained.ply / trained.sog just appear on disk
+// and the server surfaces both URLs — no client-side existence probe).
+function updateSourceAvail() {
+    const s6 = (cellStatus && cellStatus.stage6) || {};
+    trainedUrl = s6.url || null;
+    const btn = inputs && inputs._trainBtn;
+    if (btn) {
+        btn.disabled = !trainedUrl;
+        btn.title = trainedUrl
+            ? "the Stage-6 fine-tuned splat (trained.ply)"
+            : "run Stage 6 (the training script) to produce trained.ply";
+    }
     if (!trainedUrl && splatSource === "trained") splatSource = "surfels";
+
+    sogUrl = s6.sog_url || null;
+    syncSogBtn();
     syncViewButtons();
+}
+
+// Switch to the SOG (PlayCanvas) view: hide the three.js splat/mesh/overlays and
+// reveal the PlayCanvas canvas, opening it (and loading trained.sog) on first
+// use. The camera pose carries over from the live mkkellogg camera.
+async function setSogMode() {
+    if (!sogUrl || mode === "sog") {
+        syncViewButtons();
+        return;
+    }
+    const cam = captureCamera();
+    mode = "sog";
+    syncViewButtons();
+    if (inputs && inputs._fsRow) inputs._fsRow.style.display = "none";
+    splatVisible(false);
+    if (meshGroup) meshGroup.visible = false;
+    if (voxelPoints) voxelPoints.visible = false;
+    hidePatchModal();
+    try {
+        if (!isSogOpen()) {
+            setStatus("loading SOG (PlayCanvas)…", "var(--purple)");
+            const s3 = (cellStatus && cellStatus.stage3) || {};
+            await openSogView({
+                container: canvasEl,
+                url: api.absUrl(sogUrl),
+                view: cam || framing(s3.summary && s3.summary.scene_aabb),
+                speed: moveSpeed,
+            });
+        }
+        if (mode !== "sog") return; // switched away while loading
+        setSogVisible(true);
+        setStatus("SOG · PlayCanvas", "var(--green)");
+    } catch (e) {
+        setStatus(`SOG failed: ${e && e.message ? e.message : e}`, "var(--red)");
+        mode = "splat";
+        splatVisible(true);
+        syncViewButtons();
+    }
 }
 
 // Switch which splat is loaded (surfels ↔ trained). Both share the cell's world
@@ -439,11 +499,17 @@ async function setSource(next) {
     }
 }
 
-// The unified 3-way view switch. surfels ↔ trained reload the splat scene (a
-// different .ply); original flips to the mesh overlay. Reuses setSource (reload)
-// and setMode (visibility), so flipping between an already-loaded splat and the
-// mesh is instant — no reload — which is what makes the side-by-side snappy.
+// The unified view switch. surfels ↔ trained reload the splat scene (a
+// different .ply); original flips to the mesh overlay; sog flips to the
+// PlayCanvas view. Reuses setSource (reload) and setMode (visibility), so
+// flipping between an already-loaded splat and the mesh is instant — no reload
+// — which is what makes the side-by-side snappy.
 async function setView(next) {
+    if (next === "sog") {
+        await setSogMode();
+        return;
+    }
+    if (isSogOpen()) setSogVisible(false); // leaving sog: reveal the three.js canvas
     if (next === "original") {
         await setMode("mesh");
         return;
@@ -653,6 +719,12 @@ function buildControls(summary) {
         disabled: true, // enabled by updateSourceAvail once trained.ply exists
         onclick: () => setView("trained"),
     });
+    const sogBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "sog",
+        disabled: true, // enabled by updateSourceAvail once trained.sog exists
+        onclick: () => setView("sog"),
+    });
     const origBtn = el("button", {
         class: "svc-seg-btn",
         text: "original",
@@ -661,8 +733,9 @@ function buildControls(summary) {
     });
     inputs._surfBtn = surfBtn;
     inputs._trainBtn = trainBtn;
+    inputs._sogBtn = sogBtn;
     inputs._origBtn = origBtn;
-    const seg = el("div", { class: "svc-seg" }, surfBtn, trainBtn, origBtn);
+    const seg = el("div", { class: "svc-seg" }, surfBtn, trainBtn, sogBtn, origBtn);
 
     const fsRow = checkRow("freespace", "free space", true);
     inputs.freespace.addEventListener("change", () =>
@@ -1013,6 +1086,104 @@ async function runStage(n) {
     pollStages();
 }
 
+// Latest per-stage status object for the open cell (or null on transient failure).
+async function fetchCellStatus() {
+    if (!current) return null;
+    const payload = await api.splatStageCells(current.run);
+    return (payload.cells || []).find(
+        (c) => c.slot === current.slot && c.model === current.model,
+    );
+}
+
+// Show the surfel cloud once Stage 3 is done (mirrors pollStages' cloud load).
+async function maybeLoadCloud(seq) {
+    const s3 = cellStatus && cellStatus.stage3;
+    if (s3 && s3.status === "done" && s3.url && !cloudLoaded) {
+        cloudLoaded = true;
+        const bust = `?t=${Date.now()}`;
+        await loadClouds(
+            seq,
+            api.absUrl(s3.url + bust),
+            s3.detail_url ? api.absUrl(s3.detail_url + bust) : null,
+            s3.summary,
+            captureCamera(),
+        );
+    }
+}
+
+// Poll one stage until it leaves the running state, re-rendering each tick.
+// Resolves on "done", throws on "error", returns early if the viewer switched.
+async function waitStageDone(n, seq) {
+    while (seq === openSeq && current) {
+        await sleep(POLL_MS);
+        if (seq !== openSeq || !current) return;
+        let cell;
+        try {
+            cell = await fetchCellStatus();
+        } catch {
+            continue; // transient — retry next tick
+        }
+        if (seq !== openSeq) return;
+        cellStatus = cell;
+        renderStepper();
+        const st = stageState(cell, n);
+        if (st.status === "done") return;
+        if (st.status === "error") throw new Error(st.error || `stage ${n} failed`);
+    }
+}
+
+// Run stages 1→5 in order, from the first not-yet-done through Stage 5, waiting for
+// each before the next. Skips completed stages; stops (and reports) on the first
+// error. Drives its own polling, so the interval poll is paused meanwhile.
+async function runAll() {
+    if (!current || runningAll) return;
+    const seq = openSeq;
+    runningAll = true;
+    stopPoll();
+    renderStepper();
+    try {
+        for (const stage of STAGES) {
+            if (seq !== openSeq || !current) return;
+            let cell;
+            try {
+                cell = await fetchCellStatus();
+            } catch {
+                throw new Error("cell status unavailable");
+            }
+            if (seq !== openSeq) return;
+            cellStatus = cell;
+            if (stageDone(cell, stage.n)) {
+                renderStepper();
+                continue;
+            }
+            if (stage.n > 1 && !stageDone(cell, stage.n - 1)) {
+                throw new Error(`stage ${stage.n - 1} did not complete`);
+            }
+            if (stage.n <= 3) cloudLoaded = false; // re-running ≤3 reverts the cloud
+            setStatus(`run all: stage ${stage.n} (${stage.label})…`, "var(--purple)");
+            await STAGE_START[stage.n](current.run, current.slot, current.model);
+            await waitStageDone(stage.n, seq);
+            if (stage.n >= 3) await maybeLoadCloud(seq);
+        }
+        if (seq === openSeq) setStatus("run all: all stages complete", "var(--green)");
+    } catch (e) {
+        if (seq === openSeq) setStatus(`run all stopped: ${e.message}`, "var(--red)");
+    } finally {
+        runningAll = false;
+        if (seq === openSeq) {
+            const cell = await fetchCellStatus().catch(() => null);
+            if (cell) {
+                cellStatus = cell;
+                await maybeLoadCloud(seq);
+                renderStepper();
+                if (anyStageRunning(cell)) pollStages();
+            } else {
+                renderStepper();
+            }
+        }
+    }
+}
+
 // Asset builds the splat pipeline can sample + render from (value → label).
 const SPLAT_SOURCES = [
     ["auto", "auto"],
@@ -1072,11 +1243,29 @@ function renderStepper() {
         const gated = stage.n > 1 && !stageDone(cell, stage.n - 1);
         const row = el("div", { class: "svc-step" });
         row.appendChild(el("span", { class: "svc-step-n muted", text: `${stage.n}` }));
-        row.appendChild(el("span", { class: "svc-step-label", text: stage.label }));
+        const labelEl = el("span", { class: "svc-step-label", text: stage.label });
+        row.appendChild(labelEl);
         let btn;
         if (running) {
-            const prog = st.total ? `${st.done}/${st.total}` : st.phase || "…";
-            btn = el("button", { class: "splat-stage2-btn", disabled: true, text: prog });
+            // `current_id` is the live sub-step: Stage 4's phase (load / patches /
+            // coverage / select / write) or the object/view id the others are on. Show
+            // it next to the label so the long coverage phase isn't an opaque wait.
+            const phase =
+                st.current_id && st.current_id !== "plan" ? String(st.current_id) : "";
+            if (phase) labelEl.textContent = `${stage.label} · ${phase.slice(0, 22)}`;
+            const prog = st.total
+                ? `${st.done}/${st.total}`
+                : st.done
+                  ? String(st.done)
+                  : "…";
+            btn = el("button", {
+                class: "splat-stage2-btn",
+                disabled: true,
+                text: prog,
+                title:
+                    `${phase} ${st.total ? `${st.done}/${st.total}` : ""}`.trim() ||
+                    "running",
+            });
         } else if (gated) {
             btn = el("button", {
                 class: "splat-stage2-btn",
@@ -1087,6 +1276,7 @@ function renderStepper() {
         } else {
             btn = el("button", {
                 class: `splat-stage2-btn${done ? " view" : ""}`,
+                disabled: runningAll,
                 text: done ? "re-run" : stage.verb,
                 title: done
                     ? "re-run — discards every later stage"
@@ -1101,8 +1291,29 @@ function renderStepper() {
         row.appendChild(btn);
         box.appendChild(row);
     }
+    box.appendChild(renderRunAll(cell));
     renderCoverage();
     updateSourceAvail();
+}
+
+// "run all" control row: runs stages 1→5 in order from the first not-yet-done.
+// Disabled while any stage (or the sequence itself) is running, or once all done.
+function renderRunAll(cell) {
+    const busy = runningAll || anyStageRunning(cell);
+    const allDone = STAGES.every((s) => stageDone(cell, s.n));
+    const row = el("div", { class: "svc-step" });
+    row.appendChild(el("span", { class: "svc-step-n muted", text: "▶" }));
+    row.appendChild(el("span", { class: "svc-step-label", text: "run all" }));
+    row.appendChild(
+        el("button", {
+            class: "splat-stage2-btn",
+            disabled: busy || allDone,
+            text: runningAll ? "running…" : allDone ? "all done" : "run 1–5",
+            title: "run every stage in order, from the first not-yet-done through Stage 5",
+            onclick: () => runAll(),
+        }),
+    );
+    return row;
 }
 
 const fmtInt = (n) => (n == null ? "?" : Number(n).toLocaleString());
@@ -1237,9 +1448,11 @@ export async function openSplatViewer(opts) {
         sourcePref: "auto",
     };
     cloudLoaded = false;
+    runningAll = false;
     cellStatus = null;
     splatSource = "surfels";
     trainedUrl = null;
+    sogUrl = null;
     overlay.classList.add("open");
     subEl.textContent = opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
     buildControls(opts.summary || null);

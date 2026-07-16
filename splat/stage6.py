@@ -22,8 +22,9 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
       feeds the strategy's scene-scale-normalized grow/prune thresholds).
   * Poses: `transform_matrix` is OpenCV camera-to-world → `viewmats = inv(c2w)`.
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
-  * Depth: planar camera-space Z (metres) → gsplat `render_mode="RGB+ED"`
-    expected depth; alpha-gated L1 against the reference depth.
+  * Depth: planar camera-space Z (metres), decoded from Stage 5's log-uint16 depth
+    PNG via the shared [near, far] (legacy float32 `.npy` renders still read as-is)
+    → gsplat `render_mode="RGB+ED"` expected depth; alpha-gated L1 against it.
   * Colour: sRGB albedo compared directly (no sRGB↔linear); SH degree a config
     flag (0 = unlit, the decided default), raisable later for shiny surfaces.
 
@@ -56,7 +57,7 @@ from typing import Any
 
 import numpy as np
 
-from splat.stage5 import TRANSFORMS_NAME
+from splat.stage5 import TRANSFORMS_NAME, load_depth_png
 
 logging.getLogger("PIL").setLevel(logging.ERROR)
 
@@ -212,6 +213,22 @@ def _load_alpha(path: Path) -> np.ndarray:
     return (np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0)[..., None]
 
 
+def _read_depth(view: dict[str, Any]) -> np.ndarray | None:
+    """Reference depth for a view as [H,W,1] float32 planar-Z metres, or None.
+    Stage 5 now writes a log-uint16 depth PNG (decoded via `load_depth_png` with the
+    view's [near, far]); legacy float32 `.npy` renders are still read directly, so
+    existing reference sets need not be regenerated."""
+    dp = view["depth"]
+    if dp is None:
+        return None
+    if dp.suffix == ".png":
+        near, far = view.get("depth_near"), view.get("depth_far")
+        if near is None or far is None:
+            raise ValueError(f"{dp}: PNG depth needs 'near'/'far' in transforms.json")
+        return load_depth_png(dp, near, far)[..., None]
+    return np.load(dp).astype(np.float32)[..., None]
+
+
 def _fmt_hms(seconds: float) -> str:
     s = int(max(seconds, 0.0))
     h, r = divmod(s, 3600)
@@ -344,8 +361,8 @@ def _load_view(torch, view: dict[str, Any], device):  # noqa: ANN001
     else:
         alpha = torch.ones((1, rgb.shape[1], rgb.shape[2], 1), device=device)
     depth = None
-    if view["depth"] is not None:
-        d = np.load(view["depth"]).astype(np.float32)[..., None]
+    d = _read_depth(view)
+    if d is not None:
         depth = torch.from_numpy(np.ascontiguousarray(d)).to(device).unsqueeze(0)
     return rgb, alpha, depth
 
@@ -373,8 +390,8 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  
             vms.append(v["viewmat"])
             rgbs.append(torch.from_numpy(rgb))
             alphas.append(torch.from_numpy(alpha))
-            if v["depth"] is not None:
-                d = np.load(v["depth"]).astype(np.float32)[..., None]
+            d = _read_depth(v)
+            if d is not None:
                 depths.append(torch.from_numpy(np.ascontiguousarray(d)))
         depth = torch.stack(depths) if len(depths) == batch else None
         return torch.stack(vms), torch.stack(rgbs), torch.stack(alphas), depth
@@ -450,6 +467,10 @@ def train_splat(
     )
 
     # Index the supervision set (paths + poses only; pixels stream from disk per step).
+    # `near`/`far` (shared across the plan) let `_read_depth` decode the log-uint16
+    # depth PNGs back to metric metres.
+    depth_near = float(doc["near"]) if "near" in doc else None
+    depth_far = float(doc["far"]) if "far" in doc else None
     views: list[dict[str, Any]] = []
     cam_centers: list[np.ndarray] = []
     for fr in frames:
@@ -461,6 +482,8 @@ def train_splat(
                 "rgb": refs_dir / fr["file_path"],
                 "alpha": refs_dir / fr["alpha_path"] if fr.get("alpha_path") else None,
                 "depth": refs_dir / fr["depth_path"] if fr.get("depth_path") else None,
+                "depth_near": depth_near,
+                "depth_far": depth_far,
             }
         )
     n_views = len(views)
