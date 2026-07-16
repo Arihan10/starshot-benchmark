@@ -72,7 +72,8 @@ MODELS: dict[str, str] = {
     "hy3": "tencent/hy3", 
     "luna-pro": "openai/gpt-5.6-luna-pro",
     "terra-pro": "openai/gpt-5.6-terra-pro",
-    "sol-pro": "openai/gpt-5.6-sol-pro"
+    "sol-pro": "openai/gpt-5.6-sol-pro",
+    "kimi-k3": "moonshotai/kimi-k3"
 }
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())
