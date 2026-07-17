@@ -63,14 +63,6 @@ class OpenAICompatModel:
     base_url: str
     # Env var holding the bearer key; None for auth-less endpoints.
     api_key_env: str | None = None
-    # Stream the completion over SSE and reassemble the `content` +
-    # `reasoning_content` deltas, instead of one buffered non-streamed POST.
-    # Streaming makes the httpx read timeout measure the gap BETWEEN chunks
-    # rather than the whole generation, so a long thinking response (Kimi K3 at
-    # reasoning_effort=max) can't trip the read cap as long as tokens keep
-    # flowing. Off by default — the LongCat entries stay on their verified
-    # non-streamed path.
-    stream: bool = False
     # Sampling / length knobs, each sent only when set (None defers to the
     # provider's own default).
     max_tokens: int | None = None
@@ -124,15 +116,12 @@ OPENAI_COMPAT_MODELS: dict[str, OpenAICompatModel] = {
     # are fixed server-side — so they go through `extra` / stay unset. The
     # schema-conformant answer comes back on `content` (thinking on
     # `reasoning_content`), the exact shape `_send_openai_compatible` parses.
-    # Streamed (`stream=True`): max-effort thinking over a large token cap can
-    # run for many minutes, so we reassemble the SSE deltas instead of buffering
-    # one non-streamed response — the read timeout then gates the gap between
-    # chunks, not total generation time.
+    # Non-streamed (one buffered POST); the generous compat read timeout (45 min)
+    # covers K3's multi-minute max-effort generations.
     "moonshotai/kimi-k3": OpenAICompatModel(
         model="kimi-k3",
         base_url="https://api.moonshot.ai/v1",
         api_key_env="MOONSHOT_API_KEY",
-        stream=True,
         extra={"reasoning_effort": "max", "max_completion_tokens": 1048576},
     ),
     "longcat/LongCat-2.0": OpenAICompatModel(

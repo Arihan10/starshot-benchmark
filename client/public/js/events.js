@@ -155,26 +155,6 @@ const LOG_BUILDERS = {
                 `${detail ? ` — ${detail}` : ""}`,
         ];
     },
-    // Live progress for a streamed (Kimi) call: heartbeats while it runs, then a
-    // done-summary with time-to-first-token + tokens/sec. The client collapses
-    // consecutive beats of one call into a single updating row (see feed()).
-    "llm.stream_progress": (e) => {
-        const who = [e.model, e.step, e.node].filter(Boolean).join(" · ");
-        if (e.done) {
-            const out =
-                e.tokens_out != null ? `${e.tokens_out} tok` : `${e.chars ?? 0} chars`;
-            const rate = e.tokens_per_s != null ? `, ${e.tokens_per_s} tok/s` : "";
-            const ttft = e.ttft_s != null ? `, first token ${e.ttft_s}s` : "";
-            return [
-                "info",
-                `streamed ${who}: ${out} in ${Math.round(e.elapsed_s ?? 0)}s${rate}${ttft}`,
-            ];
-        }
-        return [
-            "info",
-            `⋯ streaming ${who}: ${e.chars ?? 0} chars, ${Math.round(e.elapsed_s ?? 0)}s${e.phase ? ` (${e.phase})` : ""}`,
-        ];
-    },
     "llm.validation_retry": (e) => [
         "warn",
         `${e.step ?? "step"}: output ids mismatched (attempt ${e.attempt ?? "?"}): ${e.reason ?? ""}`,
@@ -226,13 +206,7 @@ function classifyLogEvent(event) {
     if (builder === null) return null;
     if (builder) {
         const [severity, text] = builder(event);
-        const entry = { index: event.index, kind: event.kind, severity, text };
-        // Collapse consecutive heartbeats of ONE streamed call into a single
-        // updating row (the done-summary lands on the same key, replacing the
-        // last beat). Keyed on the call identity so distinct calls don't merge.
-        if (event.kind === "llm.stream_progress")
-            entry.collapse = `stream:${event.node ?? ""}:${event.step ?? ""}:${event.model ?? ""}`;
-        return entry;
+        return { index: event.index, kind: event.kind, severity, text };
     }
     // Unmapped kinds: surface anything that smells like a failure, skip the rest.
     if (/\.(error|failed)$/.test(event.kind ?? "")) {
@@ -376,14 +350,7 @@ export function createObsModel() {
         }
         const entry = classifyLogEvent(event);
         if (entry) {
-            const last = model.log[model.log.length - 1];
-            // Replace (not append) when this row collapses onto the previous one —
-            // keeps a streaming call to a single live, updating heartbeat row.
-            if (entry.collapse && last && last.collapse === entry.collapse) {
-                model.log[model.log.length - 1] = entry;
-            } else {
-                model.log.push(entry);
-            }
+            model.log.push(entry);
             if (entry.severity === "error") model.errorCount += 1;
         }
         switch (event.kind) {
