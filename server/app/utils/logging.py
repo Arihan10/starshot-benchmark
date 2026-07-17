@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, TextIO
@@ -201,8 +202,14 @@ class SlotLog:
         self.log("run.done")
 
     def log(self, kind: str, **data: Any) -> None:
+        # `ts` (epoch seconds) is stamped on every event so the client can show
+        # WHEN a call happened and how long the gap to the next event was — e.g.
+        # a transport-retry storm's per-attempt spacing. Additive + optional:
+        # older logs without it still replay, and cache keys are computed
+        # separately (never from the event dict), so it can't shift a cache hit.
         event: dict[str, Any] = {
             "index": len(self.state["events"]),
+            "ts": time.time(),
             "kind": kind,
             **data,
         }
@@ -332,7 +339,7 @@ def suppress_console() -> None:
 
 def _console_fields(event: dict[str, Any]) -> list[tuple[str, Any]]:
     kind = str(event.get("kind", "?"))
-    fields = [(k, v) for k, v in event.items() if k != "kind"]
+    fields = [(k, v) for k, v in event.items() if k not in ("kind", "ts")]
     if kind in _CONSOLE_COMPACT_KINDS:
         fields = [(k, v) for k, v in fields if k not in _CONSOLE_OMIT_FIELDS]
     return fields

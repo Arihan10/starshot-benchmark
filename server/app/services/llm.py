@@ -1,9 +1,15 @@
-"""Single-shot structured call to OpenRouter via `response_format: json_schema`.
+"""Single-shot structured LLM call via `response_format: json_schema`.
+
+Most models route through OpenRouter; ids registered in
+`slots.OPENAI_COMPAT_MODELS` (e.g. LongCat) are sent straight to their own
+OpenAI-compatible `/chat/completions` endpoint instead. Only the transport
+differs — cache, resample/transport retries, reasoning + token capture, and
+the compare gate are shared by both.
 
 The model is task-local: each `_run` task calls `set_model()` once with
-the OpenRouter id for its alias, and every `call_llm()` on that task
-inherits via a ContextVar. Concurrent runs against the same slot with
-different models therefore don't race on a module global.
+the model id for its alias, and every `call_llm()` on that task inherits via
+a ContextVar. Concurrent runs against the same slot with different models
+therefore don't race on a module global.
 
 Up to 4 resamples on parse / validation failures.
 """
@@ -14,9 +20,11 @@ import asyncio
 import json
 import os
 import sys
-from collections.abc import Awaitable, Callable, Iterable
+import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextvars import ContextVar
-from pathlib import Path
+from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import TypeVar
 
 import httpx
@@ -24,6 +32,7 @@ from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError
 from pydantic import BaseModel, ValidationError
 
+from app.core.slots import OPENAI_COMPAT_MODELS, OpenAICompatModel
 from app.utils import cache, logging
 
 from app.core.slots import DEFAULT_REASONING, REASONING_DOWNGRADE_LIST
@@ -229,6 +238,7 @@ async def call_llm(
         model=model,
         validate=validate,
         step=step,
+        node_id=node_id,
     )
     # cache.llm carries everything needed for the LLM-call cache (key +
     # output), the observability view (node + step + model + system + user +
@@ -261,6 +271,295 @@ async def call_llm(
     return validated
 
 
+# --- transport dispatch -------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Completion:
+    """One structured response, normalized across transports so
+    `call_llm_once`'s parse/validate/resample loop is backend-agnostic.
+    `generation_id` is OpenRouter's billed id (summed into the run's settled USD
+    cost); it is None for third-party OpenAI-compatible backends, which have no
+    `/generation` record — those calls still log token counts, but carry no cost
+    and never show as "resolving"."""
+
+    content: object
+    reasoning: str
+    usage: object
+    generation_id: str | None
+    finish_reason: object = None
+    refusal: str | None = None
+
+
+# Read budget for the direct OpenAI-compatible transport. For a buffered
+# (non-streamed) call it caps the WHOLE generation; for a streamed call it caps
+# the gap BETWEEN chunks (so a long thinking response can't trip it as long as
+# tokens keep flowing). Set high (45 min) to also absorb a slow FIRST token —
+# Kimi K3 at reasoning_effort=max can think for minutes before the first delta
+# under load — instead of aborting a call that's still making progress.
+_OPENAI_COMPAT_TIMEOUT = httpx.Timeout(connect=30.0, read=2700.0, write=60.0, pool=60.0)
+
+# OpenRouter SDK per-request read budget (ms in the SDK). Kept as a constant so
+# the transport-retry diagnostics can report the cap a timeout actually hit.
+_OPENROUTER_TIMEOUT_S = 180.0
+
+
+# How often a streamed call emits a "still streaming" heartbeat (wall seconds
+# between beats). Coarse on purpose — enough to prove liveness + rough throughput
+# on a multi-minute thinking call without flooding the event log.
+_STREAM_HEARTBEAT_S = 30.0
+
+
+async def _accumulate_sse(
+    lines: AsyncIterator[str],
+    *,
+    on_progress: Callable[[dict[str, object]], None] | None = None,
+    heartbeat_s: float = _STREAM_HEARTBEAT_S,
+) -> tuple[str | None, str, dict[str, object], object]:
+    """Fold an OpenAI-style SSE token stream into one completion. Each `data:`
+    line is a chunk whose `choices[0].delta` carries incremental `content` (the
+    answer) and/or `reasoning_content` (the thinking trace) text; the terminal
+    chunk may carry `usage` (when `stream_options.include_usage` is honored) plus
+    the final `finish_reason`, and the stream ends on `data: [DONE]`. Returns
+    `(content, reasoning, usage_raw, finish_reason)` — `content` is None when no
+    answer delta ever arrived, so the caller's blank-content fallback still fires.
+    Non-`data:` lines (SSE comments / `event:` frames) and unparseable chunks are
+    skipped; the read timeout now gates the GAP between chunks, not total time.
+
+    `on_progress`, when given, is called (never awaited) with a plain dict at most
+    once per `heartbeat_s` while streaming — `{elapsed_s, chars, chunks, phase}` —
+    and once more at the end with `{done: True, elapsed_s, ttft_s, chars, chunks,
+    tokens_out, tokens_per_s}`. That turns a long silent thinking call into a
+    visible "still streaming" trail. `ttft_s` (time to the FIRST delta) doubles as
+    a buffered-vs-incremental probe: ttft ≈ elapsed ⇒ the provider held the whole
+    body then dumped it at once; ttft ≪ elapsed ⇒ genuine incremental streaming."""
+    content_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    usage_raw: dict[str, object] = {}
+    finish_reason: object = None
+    start = time.monotonic()
+    ttft: float | None = None
+    chunks = 0
+    chars = 0
+    phase = "connecting"
+    last_beat = start
+    async for line in lines:
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            chunk = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(chunk.get("usage"), dict):
+            usage_raw = chunk["usage"]
+        choices = chunk.get("choices") or []
+        if not choices:
+            continue  # a usage-only terminal chunk carries empty choices
+        choice = choices[0]
+        delta = choice.get("delta") or {}
+        piece = delta.get("content")
+        if isinstance(piece, str):
+            content_parts.append(piece)
+            chars += len(piece)
+            phase = "answering"
+        rpiece = delta.get("reasoning_content")
+        if not isinstance(rpiece, str):
+            rpiece = delta.get("reasoning")
+        if isinstance(rpiece, str):
+            reasoning_parts.append(rpiece)
+            chars += len(rpiece)
+            if phase != "answering":
+                phase = "thinking"
+        if ttft is None and (piece or rpiece):
+            ttft = time.monotonic() - start
+        chunks += 1
+        if choice.get("finish_reason"):
+            finish_reason = choice["finish_reason"]
+        now = time.monotonic()
+        if on_progress is not None and now - last_beat >= heartbeat_s:
+            last_beat = now
+            on_progress(
+                {"elapsed_s": round(now - start, 1), "chars": chars,
+                 "chunks": chunks, "phase": phase}
+            )
+    elapsed = time.monotonic() - start
+    if on_progress is not None:
+        tokens_out = usage_raw.get("completion_tokens")
+        tps = (
+            round(tokens_out / elapsed, 1)
+            if isinstance(tokens_out, (int, float)) and elapsed > 0
+            else None
+        )
+        on_progress(
+            {"done": True, "elapsed_s": round(elapsed, 1),
+             "ttft_s": round(ttft, 1) if ttft is not None else None,
+             "chars": chars, "chunks": chunks,
+             "tokens_out": tokens_out, "tokens_per_s": tps}
+        )
+    content = "".join(content_parts) if content_parts else None
+    return content, "".join(reasoning_parts), usage_raw, finish_reason
+
+
+async def _send_openai_compatible(
+    cfg: OpenAICompatModel,
+    *,
+    system: str,
+    user: str,
+    schema_name: str,
+    wire_schema: object,
+    on_progress: Callable[[dict[str, object]], None] | None = None,
+) -> _Completion:
+    """One `POST {base_url}/chat/completions` to a third-party OpenAI-compatible
+    endpoint, returning the same normalized shape as the OpenRouter path.
+    `response_format: json_schema` is sent because the pipeline's prompts carry
+    no free-form JSON instructions — the schema param IS the structure contract.
+    Sampling knobs + `extra` (e.g. `thinking` / `reasoning_effort`) come from the
+    model config. When `cfg.stream` is set the completion is read as an SSE token
+    stream and the `content` / `reasoning_content` deltas reassembled (so the read
+    timeout gates the gap between chunks, not the whole generation); otherwise the
+    body is read in one shot. A non-2xx raises `httpx.HTTPStatusError`, which
+    `call_llm_once` folds into its transport-retry budget alongside the SDK's
+    provider flaps."""
+    body: dict[str, object] = {
+        "model": cfg.model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {"name": schema_name, "strict": True, "schema": wire_schema},
+        },
+        "stream": cfg.stream,
+    }
+    if cfg.stream:
+        # Ask for a usage summary on the terminal chunk (OpenAI convention);
+        # providers that don't honor it simply omit usage, which we tolerate.
+        body["stream_options"] = {"include_usage": True}
+    if cfg.max_tokens is not None:
+        body["max_tokens"] = cfg.max_tokens
+    if cfg.temperature is not None:
+        body["temperature"] = cfg.temperature
+    if cfg.top_p is not None:
+        body["top_p"] = cfg.top_p
+    body.update(cfg.extra)
+    headers = {"Content-Type": "application/json"}
+    if cfg.api_key_env is not None:
+        api_key = os.environ.get(cfg.api_key_env)
+        if not api_key:
+            raise RuntimeError(
+                f"{cfg.api_key_env} is not set — required for {cfg.model} at {cfg.base_url}"
+            )
+        headers["Authorization"] = f"Bearer {api_key}"
+    url = f"{cfg.base_url}/chat/completions"
+    async with httpx.AsyncClient(timeout=_OPENAI_COMPAT_TIMEOUT) as client:
+        if cfg.stream:
+            async with client.stream("POST", url, headers=headers, json=body) as res:
+                if res.status_code // 100 != 2:
+                    # Buffer the error body so raise_for_status carries a message,
+                    # then let it raise HTTPStatusError into the retry loop.
+                    await res.aread()
+                    res.raise_for_status()
+                content, reasoning, usage_raw, finish_reason = await _accumulate_sse(
+                    res.aiter_lines(), on_progress=on_progress,
+                )
+        else:
+            res = await client.post(url, headers=headers, json=body)
+            res.raise_for_status()
+            data = res.json()
+            choice = (data.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            usage_raw = data.get("usage") or {}
+            content = message.get("content")
+            reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+            finish_reason = choice.get("finish_reason")
+    # Attribute access so `call_llm` reads it exactly like the SDK's typed usage.
+    usage = SimpleNamespace(
+        prompt_tokens=usage_raw.get("prompt_tokens"),
+        completion_tokens=usage_raw.get("completion_tokens"),
+    )
+    # Answer channel is `content`; the thinking trace is `reasoning_content`
+    # (LongCat / Kimi) or `reasoning`. But LongCat returns the schema-conformant
+    # JSON ON `reasoning_content` and leaves `content` empty whenever a
+    # `response_format` is set (verified live, thinking on OR off) — so when
+    # `content` is blank, take the reasoning text AS the answer (it IS the
+    # answer, not a separate trace, hence no reasoning is reported then).
+    if not isinstance(reasoning, str):
+        reasoning = ""
+    if (content is None or (isinstance(content, str) and not content.strip())) and reasoning:
+        content, reasoning = reasoning, ""
+    return _Completion(
+        content=content,
+        reasoning=reasoning,
+        usage=usage,
+        generation_id=None,
+        finish_reason=finish_reason,
+    )
+
+
+async def _send_structured(
+    *, model: str, system: str, user: str, output_schema: type[BaseModel],
+    on_progress: Callable[[dict[str, object]], None] | None = None,
+) -> _Completion:
+    """Issue ONE structured request for `model`, dispatching by transport: an id
+    registered in `OPENAI_COMPAT_MODELS` goes straight to its OpenAI-compatible
+    `base_url`; every other id routes through the OpenRouter SDK (unchanged).
+    Both return a normalized `_Completion`. `on_progress` (streamed compat models
+    only) receives the per-call streaming heartbeats; the OpenRouter path ignores
+    it (its SDK call is non-streamed)."""
+    schema_name = output_schema.__name__
+    wire_schema = _normalize_schema(output_schema.model_json_schema())
+    cfg = OPENAI_COMPAT_MODELS.get(model)
+    if cfg is not None:
+        return await _send_openai_compatible(
+            cfg, system=system, user=user, schema_name=schema_name, wire_schema=wire_schema,
+            on_progress=on_progress,
+        )
+    async with OpenRouter(
+        api_key=os.environ["OPENROUTER_API_KEY"],
+        timeout_ms=int(_OPENROUTER_TIMEOUT_S * 1000),
+    ) as client:
+        response = await client.chat.send_async(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+            response_format={  # pyright: ignore[reportArgumentType]
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema_": wire_schema,
+                },
+            },
+            reasoning={"effort": _reasoning_effort(model)},
+            # Force routing to a provider that actually honors the parameters we
+            # send. Omitted, OpenRouter silently strips any param the chosen
+            # provider lacks — so a model whose provider can't do
+            # `response_format: json_schema` (GLM) falls back to a free-form
+            # completion and emits fenced / prose / null content instead of
+            # schema-conformant JSON.
+            provider={
+                "require_parameters": True,
+                "sort": "latency",
+                "ignore": ["decart"],
+            },
+        )
+    message = response.choices[0].message
+    return _Completion(
+        content=message.content,
+        reasoning=getattr(message, "reasoning", None) or "",
+        usage=getattr(response, "usage", None),
+        generation_id=getattr(response, "id", None),
+        finish_reason=response.choices[0].finish_reason,
+        refusal=message.refusal if isinstance(message.refusal, str) else None,
+    )
+
+
 async def call_llm_once(
     *,
     system: str,
@@ -269,6 +568,7 @@ async def call_llm_once(
     model: str,
     validate: Callable[[T], None] | None = None,
     step: str | None = None,
+    node_id: str | None = None,
     log_retries: bool = True,
 ) -> tuple[T, str, object, object, list[str]]:
     """One structured-output call with the full resample/backoff budget,
@@ -288,6 +588,16 @@ async def call_llm_once(
     def _retry_log(kind: str, **data: object) -> None:
         if log_retries:
             logging.log(kind, **data)
+
+    # Streaming heartbeats for this call — attributed with model/step/node and
+    # logged as `llm.stream_progress`, so an in-flight (otherwise silent) thinking
+    # call shows a live "still streaming" trail plus a final ttft / tokens-per-sec
+    # summary. Gated on `log_retries` for the same reason the retry diagnostics
+    # are: the prompt sandbox runs with no bound SlotLog, nothing to log to.
+    def _emit_stream_progress(info: dict[str, object]) -> None:
+        logging.log("llm.stream_progress", model=model, step=step, node=node_id, **info)
+
+    on_progress = _emit_stream_progress if log_retries else None
 
     # Two independent budgets:
     #   * `parse_attempt` — JSON-decode / Pydantic-validation failures.
@@ -316,44 +626,19 @@ async def call_llm_once(
     generation_ids: list[str] = []
     while True:
         content: object = None
+        attempt_start = time.monotonic()
         try:
-            async with OpenRouter(
-                api_key=os.environ["OPENROUTER_API_KEY"],
-                timeout_ms=180_000,
-            ) as client:
-                response = await client.chat.send_async(
-                    model=model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    response_format={
-                        "type": "json_schema",
-                        "json_schema": {
-                            "name": output_schema.__name__,
-                            "strict": True,
-                            "schema_": _normalize_schema(output_schema.model_json_schema()),
-                        },
-                    },
-                    reasoning={"effort": _reasoning_effort(model)},
-                    # Force routing to a provider that actually honors the
-                    # parameters we send. Omitted, OpenRouter silently strips
-                    # any param the chosen provider lacks — so a model whose
-                    # provider can't do `response_format: json_schema` (GLM)
-                    # falls back to a free-form completion and emits fenced /
-                    # prose / null content instead of schema-conformant JSON.
-                    provider={
-                        "require_parameters": True,
-                        "sort": "latency",
-                        "ignore": ["decart"]
-                    },
-                )
-            # Recorded before parsing: this generation was billed regardless of
-            # whether its output survives validation below.
-            if getattr(response, "id", None):
-                generation_ids.append(response.id)
-            message = response.choices[0].message
-            content = message.content
+            comp = await _send_structured(
+                model=model, system=system, user=user, output_schema=output_schema,
+                on_progress=on_progress,
+            )
+            # Recorded before parsing: an OpenRouter generation was billed
+            # regardless of whether its output survives validation below.
+            # Third-party OpenAI-compatible backends carry no billed id, so
+            # nothing is appended and those calls never show as cost-pending.
+            if comp.generation_id:
+                generation_ids.append(comp.generation_id)
+            content = comp.content
             args = json.loads(content) if isinstance(content, str) else content
             # A reasoning-heavy turn can finish with no answer body (`content`
             # null, or the bare literal `null`) — resample it with a clear reason
@@ -361,10 +646,9 @@ async def call_llm_once(
             # `model_type` error. finish_reason/refusal pin down truncation vs.
             # a content filter for the retry log.
             if args is None:
-                refusal = message.refusal if isinstance(message.refusal, str) else None
                 raise ValueError(
                     "model returned no content "
-                    f"(finish_reason={response.choices[0].finish_reason!r}, refusal={refusal!r})"
+                    f"(finish_reason={comp.finish_reason!r}, refusal={comp.refusal!r})"
                 )
             validated = output_schema.model_validate(args)
             if validate is not None:
@@ -372,19 +656,15 @@ async def call_llm_once(
                 # caller's cache.llm log, so a failing output is never cached
                 # and each resample re-runs the call fresh.
                 validate(validated)
-            reasoning = getattr(message, "reasoning", None) or ""
-            # Token counts feed the per-call trace panels only — the run's spend
-            # is the authoritative `total_cost` `call_llm` pulls from the
-            # /generation endpoint, not derived from these. `usage` is absent on
-            # the rare provider that omits it; completion_tokens already includes
-            # reasoning tokens, so no separate reasoning field is needed.
-            usage = getattr(response, "usage", None)
             # Return the raw parsed response (`args`) alongside the validated
             # model so callers can log EXACTLY what the model emitted — the wire
             # field names and values — rather than a re-serialized, attribute-
-            # named `model_dump` — plus every billed generation id so the caller
-            # can price the call against OpenRouter's settled cost.
-            return validated, reasoning, usage, args, generation_ids
+            # named `model_dump`. `comp.usage` feeds the per-call trace panels;
+            # `generation_ids` lets `call_llm` price the call against OpenRouter's
+            # settled cost (empty for third-party backends, which have no
+            # /generation record — completion_tokens already includes reasoning
+            # tokens, so no separate reasoning field is needed).
+            return validated, comp.reasoning, comp.usage, args, generation_ids
         except OutputValidationError as e:
             if id_validation_attempt >= ID_VALIDATION_MAX - 1:
                 raise
@@ -418,9 +698,25 @@ async def call_llm_once(
             backoff = TRANSPORT_BACKOFF[
                 min(transport_attempt, len(TRANSPORT_BACKOFF) - 1)
             ]
+            # Attribute the flap so the log strip is self-diagnosable: which
+            # model/step/node, how long the attempt ran, and the read cap it hit
+            # (a `ReadTimeout` whose elapsed ≈ timeout_s is a generation-too-long
+            # timeout, not a transient drop). `httpx.ReadTimeout` carries no
+            # message, so `exc_type` — not `reason` — is what actually names it.
+            timeout_s = (
+                _OPENAI_COMPAT_TIMEOUT.read
+                if model in OPENAI_COMPAT_MODELS
+                else _OPENROUTER_TIMEOUT_S
+            )
             _retry_log(
                 "llm.transport_retry",
-                reason=f"{type(e).__name__}: {str(e)[:200]}",
+                reason=f"{type(e).__name__}: {str(e)[:2000]}",
+                exc_type=type(e).__name__,
+                model=model,
+                step=step,
+                node=node_id,
+                elapsed_s=round(time.monotonic() - attempt_start, 1),
+                timeout_s=timeout_s,
                 attempt=transport_attempt,
                 backoff_s=backoff,
             )

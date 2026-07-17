@@ -130,10 +130,51 @@ const LOG_BUILDERS = {
         `LLM JSON decode${e.final ? " (final attempt)" : ""}: ${e.reason ?? ""}`,
     ],
     "llm.retry": (e) => ["warn", `LLM parse retry: ${e.reason ?? ""}`],
-    "llm.transport_retry": (e) => [
-        "warn",
-        `provider flap (attempt ${e.attempt ?? "?"}, backoff ${e.backoff_s ?? "?"}s): ${e.reason ?? ""}`,
-    ],
+    "llm.transport_retry": (e) => {
+        // Attribution the bare ReadTimeout never carried: which model/step/node,
+        // and how long the attempt ran vs its read cap (elapsed ≈ cap ⇒ the
+        // generation outran the timeout, not a transient drop). exc_type names
+        // the failure because httpx.ReadTimeout has an empty message. Older
+        // events (reason/attempt/backoff only) still render via the fallbacks.
+        const who = [e.model, e.step, e.node].filter(Boolean).join(" · ");
+        const timing =
+            e.elapsed_s != null
+                ? `${Math.round(e.elapsed_s)}s${e.timeout_s != null ? `/${e.timeout_s}s cap` : ""}, `
+                : "";
+        const head =
+            e.exc_type ?? (e.reason ? String(e.reason).split(":")[0] : "flap");
+        // Raw provider text minus the redundant "ExcType: " prefix; empty for timeouts.
+        let detail = String(e.reason ?? "");
+        const ci = detail.indexOf(": ");
+        if (ci !== -1) detail = detail.slice(ci + 2);
+        detail = detail.trim();
+        return [
+            "warn",
+            `provider flap: ${head}${who ? ` [${who}]` : ""} ` +
+                `(${timing}attempt ${e.attempt ?? "?"}, backoff ${e.backoff_s ?? "?"}s)` +
+                `${detail ? ` — ${detail}` : ""}`,
+        ];
+    },
+    // Live progress for a streamed (Kimi) call: heartbeats while it runs, then a
+    // done-summary with time-to-first-token + tokens/sec. The client collapses
+    // consecutive beats of one call into a single updating row (see feed()).
+    "llm.stream_progress": (e) => {
+        const who = [e.model, e.step, e.node].filter(Boolean).join(" · ");
+        if (e.done) {
+            const out =
+                e.tokens_out != null ? `${e.tokens_out} tok` : `${e.chars ?? 0} chars`;
+            const rate = e.tokens_per_s != null ? `, ${e.tokens_per_s} tok/s` : "";
+            const ttft = e.ttft_s != null ? `, first token ${e.ttft_s}s` : "";
+            return [
+                "info",
+                `streamed ${who}: ${out} in ${Math.round(e.elapsed_s ?? 0)}s${rate}${ttft}`,
+            ];
+        }
+        return [
+            "info",
+            `⋯ streaming ${who}: ${e.chars ?? 0} chars, ${Math.round(e.elapsed_s ?? 0)}s${e.phase ? ` (${e.phase})` : ""}`,
+        ];
+    },
     "llm.validation_retry": (e) => [
         "warn",
         `${e.step ?? "step"}: output ids mismatched (attempt ${e.attempt ?? "?"}): ${e.reason ?? ""}`,
@@ -185,7 +226,13 @@ function classifyLogEvent(event) {
     if (builder === null) return null;
     if (builder) {
         const [severity, text] = builder(event);
-        return { index: event.index, kind: event.kind, severity, text };
+        const entry = { index: event.index, kind: event.kind, severity, text };
+        // Collapse consecutive heartbeats of ONE streamed call into a single
+        // updating row (the done-summary lands on the same key, replacing the
+        // last beat). Keyed on the call identity so distinct calls don't merge.
+        if (event.kind === "llm.stream_progress")
+            entry.collapse = `stream:${event.node ?? ""}:${event.step ?? ""}:${event.model ?? ""}`;
+        return entry;
     }
     // Unmapped kinds: surface anything that smells like a failure, skip the rest.
     if (/\.(error|failed)$/.test(event.kind ?? "")) {
@@ -329,7 +376,14 @@ export function createObsModel() {
         }
         const entry = classifyLogEvent(event);
         if (entry) {
-            model.log.push(entry);
+            const last = model.log[model.log.length - 1];
+            // Replace (not append) when this row collapses onto the previous one —
+            // keeps a streaming call to a single live, updating heartbeat row.
+            if (entry.collapse && last && last.collapse === entry.collapse) {
+                model.log[model.log.length - 1] = entry;
+            } else {
+                model.log.push(entry);
+            }
             if (entry.severity === "error") model.errorCount += 1;
         }
         switch (event.kind) {
