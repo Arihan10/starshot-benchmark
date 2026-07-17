@@ -107,6 +107,7 @@ class PlanParams:
     view_dist_min: float = 0.5        # (m)
     view_dist_max: float = 4.0        # (m)
     seed: int = 0
+    gpu: bool = True                  # run the coverage ray-march on CUDA when available (else CPU)
 
     @property
     def focal_px(self) -> float:
@@ -130,6 +131,7 @@ class PlanParams:
             "near_frac": self.near_frac,
             "candidate_spacing": self.candidate_spacing,
             "max_candidates": self.max_candidates,
+            "gpu": self.gpu,
             "face_fov_deg": self.face_fov_deg,
             "render_resolution": self.render_resolution,
             "min_px_per_patch": self.min_px_per_patch,
@@ -337,6 +339,127 @@ def _build_coverage(
     )
 
 
+def _try_cuda():  # noqa: ANN202 - returns the torch module or None
+    """Return the `torch` module iff it imports AND a CUDA device is present, else
+    None. Imported lazily so Stage 4 stays importable + CPU-runnable without torch;
+    the GPU coverage path is opt-in via `PlanParams.gpu`."""
+    try:
+        import torch
+    except Exception:
+        return None
+    return torch if torch.cuda.is_available() else None
+
+
+def _build_coverage_gpu(
+    candidates: np.ndarray,
+    patch_pos: np.ndarray,
+    patch_nrm: np.ndarray,
+    view_dist: np.ndarray,
+    t1: np.ndarray,
+    t2: np.ndarray,
+    fs: FreeSpace,
+    p: PlanParams,
+    torch: Any,
+    progress: ProgressCb | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """GPU port of `_build_coverage` (identical COO outputs). The CPU KD-tree still
+    finds each candidate's in-range patches — cheap, and NOT the bottleneck — but the
+    per-pair front-facing/distance filter and the occlusion RAY-MARCH (the hot loop:
+    m × n_steps sparse-grid membership tests) run on CUDA in candidate batches. The
+    fine occupancy is the same sparse `occ_lin` searched with `torch.searchsorted`
+    (mirrors `FreeSpace.fine_occupied`). Not bit-identical to the CPU path (float
+    ordering / voxel-boundary rounding), by design."""
+    dev = torch.device("cuda")
+    n_cand = len(candidates)
+    n_steps = int(np.ceil(p.view_dist_max / fs.pitch_fine)) + 2
+    a = p.angular_sectors
+    pf = float(fs.pitch_fine)
+    d1, d2 = int(fs.fine_dims[1]), int(fs.fine_dims[2])
+
+    occ_lin = torch.as_tensor(fs.occ_lin, dtype=torch.int64, device=dev)
+    origin = torch.as_tensor(fs.origin, dtype=torch.float32, device=dev)
+    dims = torch.as_tensor(fs.fine_dims, dtype=torch.int64, device=dev)
+    ppos = torch.as_tensor(patch_pos, dtype=torch.float32, device=dev)
+    pnrm = torch.as_tensor(patch_nrm, dtype=torch.float32, device=dev)
+    vdist = torch.as_tensor(view_dist, dtype=torch.float32, device=dev)
+    t1g = torch.as_tensor(t1, dtype=torch.float32, device=dev)
+    t2g = torch.as_tensor(t2, dtype=torch.float32, device=dev)
+    t_lin = torch.linspace(0.0, 1.0, n_steps, dtype=torch.float32, device=dev)
+
+    tree = cKDTree(patch_pos)
+    cand_batch = 4096
+    pair_cap = 150_000                 # (candidate, patch) pairs processed at once (VRAM bound)
+    cc_o: list[np.ndarray] = []
+    pp_o: list[np.ndarray] = []
+    sec_o: list[np.ndarray] = []
+    near_o: list[np.ndarray] = []
+
+    def _occluded(cam, pp_, dist_):  # noqa: ANN001 - (P,3),(P,3),(P,) → (P,) bool
+        """True where a solid FINE voxel lies strictly between camera and patch
+        (mirrors `_visible`'s negation, endpoints skipped via `tvalid`)."""
+        pts = cam[:, None, :] + t_lin[None, :, None] * (pp_ - cam)[:, None, :]   # (P,K,3)
+        fidx = torch.floor((pts - origin) / pf).to(torch.int64)                  # (P,K,3)
+        inb = ((fidx >= 0) & (fidx < dims)).all(dim=2)                           # (P,K)
+        lin = (fidx[..., 0] * d1 + fidx[..., 1]) * d2 + fidx[..., 2]             # (P,K)
+        posi = torch.searchsorted(occ_lin, lin.clamp(min=0)).clamp(max=occ_lin.numel() - 1)
+        occ = (occ_lin[posi] == lin) & inb                                      # (P,K)
+        tvalid = (t_lin[None, :] > (pf / dist_)[:, None]) & (
+            t_lin[None, :] < 1.0 - (1.5 * pf / dist_)[:, None]
+        )
+        return (occ & tvalid).any(dim=1)
+
+    for b0 in range(0, n_cand, cand_batch):
+        cams_np = np.ascontiguousarray(candidates[b0 : b0 + cand_batch], dtype=np.float32)
+        neigh = tree.query_ball_point(cams_np, p.view_dist_max, workers=-1)
+        lengths = np.fromiter((len(x) for x in neigh), dtype=np.int64, count=len(neigh))
+        n_pairs = int(lengths.sum())
+        if n_pairs:
+            local = np.repeat(np.arange(len(neigh), dtype=np.int64), lengths)
+            pidx = np.concatenate([np.asarray(x, dtype=np.int64) for x in neigh if len(x)])
+            cams_b = torch.as_tensor(cams_np, device=dev)
+            # Walk the (candidate, in-range-patch) pairs in ≤pair_cap slices so the
+            # per-slice filter AND ray-march stay within VRAM no matter how dense the
+            # scene is around a candidate — a volumetric interior can put thousands of
+            # patches within view distance of one camera, so the whole batch's pair
+            # list must never be materialised at once.
+            for s0 in range(0, n_pairs, pair_cap):
+                s1 = s0 + pair_cap
+                loc = torch.as_tensor(local[s0:s1], device=dev)
+                pj = torch.as_tensor(pidx[s0:s1], device=dev)
+                cam = cams_b[loc]
+                dvec = ppos[pj] - cam
+                dist = torch.linalg.norm(dvec, dim=1).clamp_min(1e-6)
+                cosang = (pnrm[pj] * dvec).sum(1).abs() / dist
+                sel = (cosang > 0.1) & (dist <= vdist[pj])
+                loc, pj, cam, dist = loc[sel], pj[sel], cam[sel], dist[sel]
+                if pj.shape[0] == 0:
+                    continue
+                vis = ~_occluded(cam, ppos[pj], dist)
+                loc, pj, cam, dist = loc[vis], pj[vis], cam[vis], dist[vis]
+                if pj.shape[0] == 0:
+                    continue
+                vd = (cam - ppos[pj]) / dist[:, None]
+                az = torch.atan2((vd * t2g[pj]).sum(1), (vd * t1g[pj]).sum(1))
+                sector = torch.clamp(((az + np.pi) / (2 * np.pi) * a).to(torch.int64), 0, a - 1)
+                near = dist <= p.near_frac * vdist[pj]
+                cc_o.append((loc + b0).cpu().numpy())
+                pp_o.append(pj.cpu().numpy())
+                sec_o.append(sector.cpu().numpy())
+                near_o.append(near.cpu().numpy())
+        if progress is not None:
+            progress(min(b0 + cand_batch, n_cand), n_cand, "coverage")
+
+    if not cc_o:
+        e = np.zeros(0, dtype=np.int64)
+        return e, e, e, np.zeros(0, dtype=bool)
+    return (
+        np.concatenate(cc_o),
+        np.concatenate(pp_o),
+        np.concatenate(sec_o),
+        np.concatenate(near_o),
+    )
+
+
 def _greedy_angular(
     cc: np.ndarray,
     pp: np.ndarray,
@@ -382,6 +505,66 @@ def _greedy_angular(
         if len(near_hits):
             hasnear[near_hits] = True
     return chosen, angmask, hasnear
+
+
+def _greedy_angular_gpu(
+    cc: np.ndarray,
+    pp: np.ndarray,
+    sector: np.ndarray,
+    is_near: np.ndarray,
+    n_cand: int,
+    n_patch: int,
+    k: int,
+    min_gain: int,
+    a: int,
+    torch: Any,
+    progress: ProgressCb | None = None,
+) -> tuple[list[int], np.ndarray, np.ndarray]:
+    """GPU port of `_greedy_angular` — same greedy, same coverage guarantee (each
+    patch reaching k distinct sectors + a near view), same result up to argmax
+    tie-breaks. The sequential ROUND loop stays in Python (each pick depends on the
+    last), but every round's per-pair contribution, per-candidate gain (bincount) and
+    the winner's patch updates run on CUDA — turning the O(rounds × pairs) tail from a
+    single-thread numpy grind into batched GPU passes. Each candidate's patches are
+    unique, so the winner's sector-mask update is a collision-free scatter. Returns
+    (chosen candidate indices, sector bitmask, has-near) — the last two as numpy for
+    the same downstream stats as the CPU path."""
+    dev = torch.device("cuda")
+    cc_t = torch.as_tensor(cc, dtype=torch.int64, device=dev)
+    pp_t = torch.as_tensor(pp, dtype=torch.int64, device=dev)
+    near_t = torch.as_tensor(is_near, dtype=torch.bool, device=dev)
+    pair_bit = torch.ones((), dtype=torch.int64, device=dev) << torch.as_tensor(
+        sector, dtype=torch.int64, device=dev
+    )
+    lut = torch.tensor(
+        [bin(i).count("1") for i in range(1 << a)], dtype=torch.int16, device=dev
+    )
+    angmask = torch.zeros(n_patch, dtype=torch.int64, device=dev)
+    hasnear = torch.zeros(n_patch, dtype=torch.bool, device=dev)
+    taken = torch.zeros(n_cand, dtype=torch.bool, device=dev)
+    min_g = float(max(min_gain, 1))
+    chosen: list[int] = []
+    while True:
+        am = angmask[pp_t]
+        contrib = (((am & pair_bit) == 0) & (lut[am] < k)) | (near_t & ~hasnear[pp_t])
+        if not bool(contrib.any()):
+            break
+        gain = torch.bincount(cc_t, weights=contrib.to(torch.float32), minlength=n_cand)
+        gain[taken] = -1.0
+        c = int(gain.argmax())
+        if float(gain[c]) < min_g:
+            break
+        taken[c] = True
+        chosen.append(c)
+        if progress is not None and len(chosen) % 200 == 0:
+            progress(len(chosen), 0, "select")
+        m = cc_t == c
+        patches_c = pp_t[m]
+        angmask[patches_c] = angmask[patches_c] | pair_bit[m]   # unique patches → collision-free
+        near_c = patches_c[near_t[m]]
+        if near_c.numel():
+            hasnear[near_c] = True
+    return chosen, angmask.cpu().numpy(), hasnear.cpu().numpy()
 
 
 def _face_of(dirs: np.ndarray) -> np.ndarray:
@@ -444,12 +627,27 @@ def plan_cameras(
     n_patch = len(patch_pos)
     k = params.angles_per_patch
     a = params.angular_sectors
-    cc, pp, sector, is_near = _build_coverage(
-        candidates, patch_pos, patch_nrm, view_dist, t1, t2, fs, params, progress
-    )
-    chosen, angmask, hasnear = _greedy_angular(
-        cc, pp, sector, is_near, len(candidates), n_patch, k, params.min_gain, a, progress
-    )
+    torch = _try_cuda() if params.gpu else None
+    if params.gpu and torch is None:
+        logging.getLogger(__name__).warning(
+            "stage4: gpu requested but CUDA/torch unavailable — using the CPU coverage path"
+        )
+    if torch is not None:
+        cc, pp, sector, is_near = _build_coverage_gpu(
+            candidates, patch_pos, patch_nrm, view_dist, t1, t2, fs, params, torch, progress
+        )
+    else:
+        cc, pp, sector, is_near = _build_coverage(
+            candidates, patch_pos, patch_nrm, view_dist, t1, t2, fs, params, progress
+        )
+    if torch is not None:
+        chosen, angmask, hasnear = _greedy_angular_gpu(
+            cc, pp, sector, is_near, len(candidates), n_patch, k, params.min_gain, a, torch, progress
+        )
+    else:
+        chosen, angmask, hasnear = _greedy_angular(
+            cc, pp, sector, is_near, len(candidates), n_patch, k, params.min_gain, a, progress
+        )
     if progress is not None:
         progress(0, 0, "write")
 

@@ -167,6 +167,24 @@ check("transforms convention/depth tags + 1 frame",
       doc.get("convention") == "opencv_c2w" and doc.get("depth") == stage5.DEPTH_ENCODING
       and len(doc.get("frames", [])) == 1)
 
+# --- 6. chunked rasterization is output-identical (pure compute change) ------
+# Force a 1-triangle chunk so the 2-triangle quad rasterizes in TWO batches merged by
+# nearest depth; the result must match the single-batch render pixel-for-pixel.
+chunk_dir = work / "refs_chunked"
+_orig_cap = stage5._RASTER_CHUNK_TRIS
+try:
+    stage5._RASTER_CHUNK_TRIS = 1
+    stage5.render_references(run="smoke", slot="smoke", model="smoke",
+                             raw_dir=raw_dir, cameras_path=cameras_path, out_dir=chunk_dir)
+finally:
+    stage5._RASTER_CHUNK_TRIS = _orig_cap
+rgb_c = np.asarray(Image.open(chunk_dir / "rgb" / f"{vid}.png").convert("RGB"), np.float32) / 255.0
+depth_c = stage5.load_depth_png(chunk_dir / "depth" / f"{vid}.png", near, far)
+alpha_c = np.asarray(Image.open(chunk_dir / "alpha" / f"{vid}.png"), np.float32) / 255.0
+check("chunked rgb == single-pass rgb", np.array_equal(rgb_c, rgb))
+check("chunked depth == single-pass depth", np.allclose(depth_c, depth, atol=1e-4))
+check("chunked alpha == single-pass alpha", np.array_equal(alpha_c, alpha))
+
 # save a copy of the render for eyeballing
 Image.open(out_dir / "rgb" / f"{vid}.png").save(work / "preview_rgb.png")
 print(f"\nartifacts in: {work}")

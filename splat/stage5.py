@@ -187,6 +187,20 @@ def enumerate_views(plan: dict[str, Any]) -> list[dict[str, Any]]:
     return views
 
 
+def _view_rendered(out_dir: Path, vid: str, save_depth: bool, save_alpha: bool) -> bool:
+    """Stage-5 resume signal: True when a view's expected reference images are all
+    already on disk. Writes are atomic (`_save_png_atomic` / `save_depth_png`), so a
+    present file is a complete one — a resumed render skips these and renders only
+    the views still missing."""
+    if not (out_dir / "rgb" / f"{vid}.png").is_file():
+        return False
+    if save_depth and not (out_dir / "depth" / f"{vid}.png").is_file():
+        return False
+    if save_alpha and not (out_dir / "alpha" / f"{vid}.png").is_file():
+        return False
+    return True
+
+
 def encode_depth_u16(depth: np.ndarray, near: float, far: float) -> np.ndarray:
     """Planar-Z depth (metres; 0 = background) → uint16 codes for a 16-bit PNG:
     code 0 = background, 1..65535 = LOG-spaced positions over [near, far]. A
@@ -212,15 +226,25 @@ def decode_depth_u16(codes: np.ndarray, near: float, far: float) -> np.ndarray:
     return np.where(codes > 0, z, 0.0).astype(np.float32)
 
 
+def _save_png_atomic(img: Any, path: Path) -> None:
+    """Save a PIL image via a temp file + atomic replace, so a crash mid-write never
+    leaves a torn PNG. The presence of a view's images is Stage 5's resume signal
+    (`_view_rendered`); a half-written one would fool it (and later break the Stage-6
+    decode). Format is forced since the `.tmp` suffix hides the extension PIL sniffs."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    img.save(tmp, format="PNG")
+    tmp.replace(path)
+
+
 def save_depth_png(path: Path, depth: np.ndarray, near: float, far: float) -> None:
     """Write planar-Z depth [H,W] as a 16-bit grayscale PNG (log-uint16; see
-    `encode_depth_u16`)."""
+    `encode_depth_u16`). Atomic (temp-file + replace), like the RGB/alpha writes."""
     from PIL import Image
 
     codes = encode_depth_u16(depth, near, far)
     h, w = codes.shape
     data = np.ascontiguousarray(codes, dtype="<u2").tobytes()   # little-endian, matches "I;16"
-    Image.frombytes("I;16", (w, h), data).save(path)
+    _save_png_atomic(Image.frombytes("I;16", (w, h), data), path)
 
 
 def load_depth_png(path: Path, near: float, far: float) -> np.ndarray:
@@ -341,11 +365,21 @@ def placed_object_ids(raw_dir: Path) -> list[str]:
     )
 
 
-# nvdiffrast's CudaRaster packs the triangle index into 24 bits, so ONE rasterize()
-# call handles at most 2**24 triangles; beyond that it faults (CUDA 700) and poisons
-# the context. Frustum culling keeps most views under this; a view still over it after
-# culling raises instead of crashing.
-_NVDIFFRAST_MAX_TRIS = 1 << 24  # 16,777,216
+# nvdiffrast's CudaRaster has TWO independent per-rasterize() limits:
+#   * the triangle id is returned in a float32 channel (24-bit mantissa), so at most
+#     2**24 triangles can be indexed exactly; AND
+#   * the coarse binner stores triangle-tile "subtriangles" in a fixed segment buffer
+#     that overflows ("subtriangle count overflow") far BELOW 2**24 when triangles are
+#     large or densely overlapping — it scales with triangles × tiles-covered ×
+#     resolution, so a ~16M-triangle 1024² view of a dense scene trips it even though
+#     the id limit is fine. (Small, scattered triangles rasterize fine well past 12M.)
+# So a view is rasterized in conservative ≤_RASTER_CHUNK_TRIS batches (well under both
+# limits) merged by nearest depth; a batch that STILL overflows the bin buffer is
+# halved and retried. That overflow is a CHECKED failure that leaves the CUDA context
+# intact (unlike the CUDA-700 fault from pathological overdraw), so the retry is safe.
+_NVDIFFRAST_MAX_TRIS = 1 << 24     # hard triangle-id ceiling (float32 mantissa)
+_RASTER_CHUNK_TRIS = 2_000_000     # initial triangles per rasterize() call (subtriangle-safe)
+_MIN_CHUNK_TRIS = 65_536           # split floor; a subtriangle overflow below this re-raises
 
 
 def _frustum_planes(mvp: np.ndarray) -> np.ndarray:
@@ -465,9 +499,11 @@ def _render_view(torch, dr, glctx, scene, c2w, proj_np, resolution, params):  # 
 
     Objects whose world AABB is fully outside the view frustum are culled before
     rasterizing — exact for an unlit rasterizer (off-screen geometry can't affect a
-    flat-albedo image), and the mechanism that keeps a view's triangle count under
-    nvdiffrast's per-call limit. `c2w`/`proj_np` are numpy so the cull test runs on
-    the CPU without a GPU sync."""
+    flat-albedo image), and the cheap way to shrink the triangle count. Whatever
+    survives is rasterized in ≤-cap batches merged by nearest depth (see below), so an
+    arbitrarily heavy view renders correctly instead of hitting nvdiffrast's per-call
+    triangle limit. `c2w`/`proj_np` are numpy so the cull test runs on the CPU without
+    a GPU sync."""
     w2c_np = np.linalg.inv(c2w)                     # OpenCV world→camera [4,4]
     keep = _objects_in_frustum(
         scene.obj_aabb_min, scene.obj_aabb_max, _frustum_planes(proj_np @ w2c_np)
@@ -479,44 +515,91 @@ def _render_view(torch, dr, glctx, scene, c2w, proj_np, resolution, params):  # 
         ).copy()
         return rgb_bg, empty, empty.copy()
     tris, tri_mat = _visible_tris(torch, scene, keep)
-    if int(tris.shape[0]) > _NVDIFFRAST_MAX_TRIS:
-        raise RuntimeError(
-            f"{int(tris.shape[0]):,} triangles visible in one view after frustum "
-            f"culling exceeds nvdiffrast's {_NVDIFFRAST_MAX_TRIS:,} per-call limit — "
-            f"use the optimized (lighter) source or triangle-chunked rendering."
-        )
 
+    # Per-vertex transforms are shared by every triangle batch → compute them once over
+    # the full (uncapped) vertex buffer; batches only ever subset the triangle indices.
     w2c = torch.as_tensor(w2c_np, dtype=torch.float32, device="cuda")
     proj = torch.as_tensor(proj_np, dtype=torch.float32, device="cuda")
     v_cam = scene.verts_h @ w2c.T                   # [V,4]; column 2 = planar Z
     cam_z = v_cam[:, 2:3].contiguous()              # planar depth attribute (metres)
     pos_clip = (v_cam @ proj.T).contiguous()        # [V,4] clip space
-    rast, _ = dr.rasterize(glctx, pos_clip[None], tris, (resolution, resolution))
-    tri_id = rast[..., 3].long()                    # [1,H,W]; 0 = empty, else idx+1
-    covered = tri_id > 0
 
-    # Per-pixel planar depth (perspective-correct interpolation of camera-space Z).
-    depth, _ = dr.interpolate(cam_z[None], rast, tris)               # [1,H,W,1]
-    # Per-pixel UV; flip V because glTF v=0 is the texture TOP but nvdiffrast t=0 is
-    # the BOTTOM (see module docstring / smoke test).
-    uv, _ = dr.interpolate(scene.uv[None], rast, tris)               # [1,H,W,2]
-    uv = torch.cat([uv[..., 0:1], 1.0 - uv[..., 1:2]], dim=-1).contiguous()
-
-    # Per-pixel material id (gather via triangle id into the VISIBLE subset's
-    # tri_mat), then composite each material present in this view.
-    mat_pix = torch.where(covered, tri_mat[(tri_id - 1).clamp(min=0)], tri_id.new_full(tri_id.shape, -1))
+    # Nearest-surface composite, accumulated across triangle batches (see the
+    # _NVDIFFRAST_MAX_TRIS note): a view with more visible triangles than one
+    # rasterize() call can resolve is split into contiguous ≤-cap batches and merged
+    # here by nearest camera-space Z. The merge is a per-pixel `min` over depth —
+    # commutative + associative, and Z is monotonic in nvdiffrast's own z/w z-test
+    # order — so the composite is IDENTICAL to a single hypothetical over-cap call. A
+    # view under the cap runs as ONE batch (exactly the original single-pass path), so
+    # this is purely a compute-level workaround and changes no output.
     bg = torch.tensor(params.background, dtype=torch.float32, device="cuda")
     rgb = bg.expand(1, resolution, resolution, 3).clone()
     alpha = torch.zeros((1, resolution, resolution, 1), dtype=torch.float32, device="cuda")
-    for m in torch.unique(mat_pix[covered]).tolist():
-        sel = (mat_pix == m)[..., None]                              # [1,H,W,1]
-        col = dr.texture(scene.textures[m], uv, filter_mode="linear", boundary_mode="wrap")
-        a = col[..., 3:4]
-        if scene.alpha_modes[m] == "MASK":
-            a = (a >= params.mask_alpha_cutoff).float()
-        rgb = torch.where(sel, col[..., :3], rgb)
-        alpha = torch.where(sel, a, alpha)
-    depth = torch.where(covered[..., None], depth, torch.zeros_like(depth))
+    depth_best = torch.full((1, resolution, resolution, 1), float("inf"), device="cuda")
+    covered_any = torch.zeros((1, resolution, resolution), dtype=torch.bool, device="cuda")
+
+    # Triangle ranges (start, count) to rasterize, as a LIFO stack: start at the
+    # conservative chunk size, and if a range still overflows the bin buffer, split it
+    # in half and retry the halves. Depth-merge is order-independent, so any splitting
+    # yields the identical composite.
+    n_tris = int(tris.shape[0])
+    work: list[tuple[int, int]] = []
+    start = 0
+    while start < n_tris:
+        count = min(_RASTER_CHUNK_TRIS, n_tris - start)
+        work.append((start, count))
+        start += count
+    while work:
+        start, count = work.pop()
+        tris_b = tris[start : start + count]
+        tri_mat_b = tri_mat[start : start + count]
+        try:
+            rast, _ = dr.rasterize(glctx, pos_clip[None], tris_b, (resolution, resolution))
+        except RuntimeError as exc:
+            # "subtriangle count overflow" is a CHECKED bin-buffer overflow (context
+            # intact) → halve this range and retry. Anything else (e.g. a CUDA-700
+            # fault, which poisons the context) is fatal and propagates.
+            if count > _MIN_CHUNK_TRIS and "subtriangle" in str(exc).lower():
+                half = count // 2
+                work.append((start, half))
+                work.append((start + half, count - half))
+                continue
+            raise
+        tri_id = rast[..., 3].long()                # [1,H,W]; 0 = empty, else idx+1
+        covered = tri_id > 0
+
+        # Per-pixel planar depth (perspective-correct interpolation of camera-space Z).
+        depth_b, _ = dr.interpolate(cam_z[None], rast, tris_b)       # [1,H,W,1]
+        # Per-pixel UV; flip V because glTF v=0 is the texture TOP but nvdiffrast t=0 is
+        # the BOTTOM (see module docstring / smoke test).
+        uv, _ = dr.interpolate(scene.uv[None], rast, tris_b)         # [1,H,W,2]
+        uv = torch.cat([uv[..., 0:1], 1.0 - uv[..., 1:2]], dim=-1).contiguous()
+
+        # Per-pixel material id (gather via triangle id into THIS batch's tri_mat), then
+        # composite each material present in the batch into per-batch buffers.
+        mat_pix = torch.where(
+            covered, tri_mat_b[(tri_id - 1).clamp(min=0)], tri_id.new_full(tri_id.shape, -1)
+        )
+        rgb_b = bg.expand(1, resolution, resolution, 3).clone()
+        alpha_b = torch.zeros((1, resolution, resolution, 1), dtype=torch.float32, device="cuda")
+        for m in torch.unique(mat_pix[covered]).tolist():
+            sel = (mat_pix == m)[..., None]                          # [1,H,W,1]
+            col = dr.texture(scene.textures[m], uv, filter_mode="linear", boundary_mode="wrap")
+            a = col[..., 3:4]
+            if scene.alpha_modes[m] == "MASK":
+                a = (a >= params.mask_alpha_cutoff).float()
+            rgb_b = torch.where(sel, col[..., :3], rgb_b)
+            alpha_b = torch.where(sel, a, alpha_b)
+
+        # This batch wins a pixel only where it covers AND is nearer than every earlier
+        # batch — a running per-pixel z-buffer that resolves the global nearest surface.
+        win = covered[..., None] & (depth_b < depth_best)            # [1,H,W,1]
+        depth_best = torch.where(win, depth_b, depth_best)
+        rgb = torch.where(win.expand(-1, -1, -1, 3), rgb_b, rgb)
+        alpha = torch.where(win, alpha_b, alpha)
+        covered_any |= covered
+
+    depth = torch.where(covered_any[..., None], depth_best, torch.zeros_like(depth_best))
 
     # nvdiffrast frame memory is bottom-up → flip vertically for top-down images.
     def _top_down(t):  # noqa: ANN001
@@ -534,12 +617,21 @@ def render_references(
     cameras_path: Path,
     out_dir: Path,
     params: RenderParams = RenderParams(),
+    resume: bool = True,
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
     """Render every (camera, face) in `cameras_path` from the placed vanilla meshes
     in `raw_dir` into `out_dir` (`rgb/`, `depth/`, `alpha/`, `transforms.json`).
 
-    Requires a CUDA GPU + nvdiffrast (raises a clear error otherwise). Returns a
+    Resume-safe: with `resume` (default), views whose images are already on disk are
+    skipped and only the missing ones re-render — so an interrupted render continues
+    where it stopped. `transforms.json` is rebuilt from the full, deterministic view
+    list either way, so a resumed run reproduces the identical file. Pass
+    `resume=False` (the server wipes `refs/` for this) to force a full re-render.
+
+    Requires a CUDA GPU + nvdiffrast only when something is left to render (raises a
+    clear error then); a finalize-only resume — every image already present, just
+    `transforms.json` missing after a crash — completes on any host. Returns a
     compact summary.
 
     Smoke tests to run once on the GPU box (they validate the two convention flips
@@ -549,7 +641,6 @@ def render_references(
       2. Depth — the rendered planar Z of a known box equals the measured
          perpendicular distance (not the ray distance).
     """
-    torch, dr = _require_cuda_renderer()
     from PIL import Image
 
     if not raw_dir.is_dir():
@@ -576,19 +667,49 @@ def render_references(
     for sub in ("rgb", "depth", "alpha"):
         (out_dir / sub).mkdir(parents=True, exist_ok=True)
 
-    glctx = dr.RasterizeCudaContext()
-    scene = _Scene(torch, raw_dir, ids)
+    # Resume: render only the views whose images aren't already on disk. The plan is
+    # deterministic, so `frames` (below) is assembled for every view regardless of
+    # which this run rendered — the finished `transforms.json` is identical.
+    pending = {
+        v["id"]
+        for v in views
+        if not (resume and _view_rendered(out_dir, v["id"], params.save_depth, params.save_alpha))
+    }
+    skipped = total - len(pending)
+
+    # The GPU rasterizer (and the CUDA requirement) is only needed when there's
+    # something left to render, so a finalize-only resume completes on any host.
+    torch = dr = glctx = scene = None
+    warnings: list[str] = []
+    if pending:
+        torch, dr = _require_cuda_renderer()
+        glctx = dr.RasterizeCudaContext()
+        scene = _Scene(torch, raw_dir, ids)
+        warnings = scene.warnings
 
     if progress is not None:
-        progress(0, total, "")
+        progress(0, total, "resume" if skipped else "")
 
     frames: list[dict[str, Any]] = []
+    rendered = 0
     for done, view in enumerate(views, start=1):
-        rgb, depth, alpha = _render_view(torch, dr, glctx, scene, view["c2w"], proj_np, resolution, params)
-
         vid = view["id"]
-        rgb_path = out_dir / "rgb" / f"{vid}.png"
-        Image.fromarray((np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)).save(rgb_path)
+        if vid in pending:
+            rgb, depth, alpha = _render_view(
+                torch, dr, glctx, scene, view["c2w"], proj_np, resolution, params
+            )
+            _save_png_atomic(
+                Image.fromarray((np.clip(rgb, 0.0, 1.0) * 255.0).astype(np.uint8)),
+                out_dir / "rgb" / f"{vid}.png",
+            )
+            if params.save_depth:
+                save_depth_png(out_dir / "depth" / f"{vid}.png", depth, near, far)
+            if params.save_alpha:
+                _save_png_atomic(
+                    Image.fromarray((np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)),
+                    out_dir / "alpha" / f"{vid}.png",
+                )
+            rendered += 1
         frame: dict[str, Any] = {
             "file_path": f"rgb/{vid}.png",
             "camera_index": view["camera_index"],
@@ -596,12 +717,8 @@ def render_references(
             "transform_matrix": view["c2w"].tolist(),
         }
         if params.save_depth:
-            save_depth_png(out_dir / "depth" / f"{vid}.png", depth, near, far)
             frame["depth_path"] = f"depth/{vid}.png"
         if params.save_alpha:
-            Image.fromarray((np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)).save(
-                out_dir / "alpha" / f"{vid}.png"
-            )
             frame["alpha_path"] = f"alpha/{vid}.png"
         frames.append(frame)
         if progress is not None:
@@ -617,11 +734,13 @@ def render_references(
         "slot": slot,
         "model": model,
         "views": total,
+        "views_rendered": rendered,
+        "views_skipped": skipped,
         "cameras": len(plan["cameras"]),
         "resolution": resolution,
-        "materials": scene.n_materials,
+        "materials": scene.n_materials if scene is not None else None,
         "params": params.as_summary(),
-        "warnings": scene.warnings,
+        "warnings": warnings,
         "out_dir": str(out_dir),
     }
 

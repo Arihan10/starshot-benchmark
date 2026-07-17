@@ -83,11 +83,11 @@ check("Stage 5 rendered the expected number of views", s5["views"] == n_views)
 check("Stage 5 wrote transforms.json", (refs / stage5.TRANSFORMS_NAME).is_file())
 
 doc = json.loads((refs / stage5.TRANSFORMS_NAME).read_text(encoding="utf-8"))
-check("transforms tagged opencv_c2w + planar_z_metric",
-      doc["convention"] == "opencv_c2w" and doc["depth"] == "planar_z_metric")
+check("transforms tagged opencv_c2w + log-uint16 PNG depth",
+      doc["convention"] == "opencv_c2w" and doc["depth"] == stage5.DEPTH_ENCODING)
 # spot-check one rendered view: depth positive where alpha>0, alpha in [0,1]
 f0 = doc["frames"][0]
-depth = np.load(refs / f0["depth_path"])
+depth = stage5.load_depth_png(refs / f0["depth_path"], doc["near"], doc["far"])
 alpha = np.asarray(Image.open(refs / f0["alpha_path"]), np.float32) / 255.0
 hit = alpha > 0.5
 check("rendered depth is finite + positive on hit pixels",

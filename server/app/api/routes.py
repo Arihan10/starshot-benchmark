@@ -121,6 +121,8 @@ _ARTIFACT_MEDIA_TYPES = {
     # SOG-encoded trained splat (client/tools/ply-to-sog.mjs) — a zip bundle the
     # PlayCanvas gsplat loader fetches as raw bytes.
     ".sog": "application/octet-stream",
+    # Stage-6 training log — served inline so `log_url` opens live in a browser.
+    ".log": "text/plain; charset=utf-8",
 }
 
 # Per-run metadata written at creation (chosen prompt version, created_at).
@@ -201,6 +203,14 @@ _splat_stage4_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 # shape/keying as the earlier stages.
 _splat_stage5_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage5_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# --- Stage 6 fine-tune processes (background, one per CELL) -------------------
+# Unlike stages 1-5 (in-process asyncio jobs), Stage 6 is a long (hours) CUDA
+# training run launched as a DETACHED child process (see `_spawn_stage6`) that
+# streams to splat/stage6.log and is polled via `popen.poll()` — so it runs async
+# and never blocks the event loop. Value: {popen, logf, iterations, started_at,
+# returncode}. The record is kept after exit so 'done'/'error' + log survive polls.
+_splat_stage6_procs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _current_run: str = ""
 
 
@@ -1914,6 +1924,44 @@ def _trained_path(run: str, slot: str, model: str) -> Path:
     return _slot_dir(run, slot, model) / "splat" / splat_stage6.TRAINED_NAME
 
 
+def _stage6_log_path(run: str, slot: str, model: str) -> Path:
+    """Where the Stage-6 training process streams its stdout/stderr
+    (`splat/stage6.log`) — also served under `/artifacts` for live viewing."""
+    return _slot_dir(run, slot, model) / "splat" / "stage6.log"
+
+
+def _stage6_ckpt_dir(run: str, slot: str, model: str) -> Path:
+    """Where Stage-6 resumable checkpoints live (`splat/ckpt/`, see splat/stage6.py).
+    Present (with no trained.ply) means an interrupted run can be resumed."""
+    return _slot_dir(run, slot, model) / "splat" / splat_stage6.CKPT_DIRNAME
+
+
+def _latest_ckpt_step(ckpt_dir: Path) -> int | None:
+    """Highest checkpoint step on disk (from the `step_NNNNNN.pt` names), or None."""
+    if not ckpt_dir.is_dir():
+        return None
+    steps = [
+        int(p.stem.split("_")[1])
+        for p in ckpt_dir.glob("step_*.pt")
+        if "_" in p.stem and p.stem.split("_")[-1].isdigit()
+    ]
+    return max(steps) if steps else None
+
+
+def _tail_text(path: Path, max_bytes: int = 8192) -> str | None:
+    """The last `max_bytes` of a file, decoded leniently, or None if absent — enough
+    to show a live training tail without shipping a multi-MB log on every poll."""
+    if not path.is_file():
+        return None
+    try:
+        with path.open("rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - max_bytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return None
+
+
 def _freespace_path(run: str, slot: str, model: str) -> Path:
     """Where a cell's Stage-2 free-space grid lives (`splat/freespace.npz`)."""
     return _slot_dir(run, slot, model) / "splat" / splat_stage2.FREESPACE_NAME
@@ -2119,20 +2167,113 @@ def _splat_stage3_status(
     }
 
 
+class Stage6Request(BaseModel):
+    """Stage-6 fine-tune knobs (all optional). `iterations` overrides the trainer
+    default; omitted → the CLI default (30k). `restart` forces a from-scratch retry
+    (drop any checkpoint + trained.ply); omitted → resume from the latest checkpoint."""
+
+    iterations: int | None = None
+    restart: bool = False
+
+
 def _splat_stage6_status(run: str, slot: str, model: str) -> dict[str, Any]:
-    """Public Stage-6 (fine-tune) state — disk-only. Stage 6 runs as a standalone
-    backend script (no server job), so this just exposes the trained `.ply` for the
-    viewer: 'done' with its `/artifacts` `url` when `trained.ply` is present, else
-    'idle'. `sog_url` is the SOG-encoded twin beside it (client/tools/ply-to-sog.mjs),
-    surfaced the same disk-checked way so the viewer's PlayCanvas 'sog' view lights up
-    without a HEAD probe (FastAPI GET routes don't answer HEAD)."""
+    """Public Stage-6 (fine-tune) state. Stage 6 runs as a DETACHED background
+    training PROCESS (see `_spawn_stage6`), so this reports its live state —
+    'running' (with `pid` + a `log_tail` streamed from splat/stage6.log), 'done'
+    (trained.ply + its `/artifacts` `url`), 'error' (non-zero exit + log), or 'idle'
+    — plus the `sog_url` twin (client/tools/ply-to-sog.mjs) and the `log_url`. Falls
+    back to a disk-only view when no process is tracked (e.g. after a server restart,
+    or a run done in a bare terminal): 'done' when trained.ply is present."""
     trained = _trained_path(run, slot, model)
     url = _artifact_url(trained)
-    sog_url = _artifact_url(trained.with_suffix(".sog"))
-    return {
+    log_path = _stage6_log_path(run, slot, model)
+    ckpt_step = _latest_ckpt_step(_stage6_ckpt_dir(run, slot, model))
+    base = {
         "run": run, "slot": slot, "model": model,
-        "status": "done" if url else "idle", "url": url, "sog_url": sog_url,
+        "sog_url": _artifact_url(trained.with_suffix(".sog")),
+        "log_url": _artifact_url(log_path),
+        # An interrupted run left a checkpoint but no trained.ply → the next launch
+        # resumes it (see `_spawn_stage6` / splat/stage6.py).
+        "ckpt_step": ckpt_step,
+        "resumable": url is None and ckpt_step is not None,
     }
+    rec = _splat_stage6_procs.get((run, slot, model))
+    if rec is not None:
+        rc = rec["popen"].poll()
+        tail = _tail_text(log_path)
+        if rc is None:
+            return {
+                **base, "status": "running", "running": True, "url": url,
+                "pid": rec["popen"].pid, "iterations": rec.get("iterations"),
+                "started_at": rec.get("started_at"), "error": None, "log_tail": tail,
+            }
+        # Finished — close the log handle once, but keep the record so the terminal
+        # state (done/error + log) survives later polls until the next launch.
+        if rec.get("logf") is not None:
+            with contextlib.suppress(Exception):
+                rec["logf"].close()
+            rec["logf"] = None
+        rec["returncode"] = rc
+        if rc == 0 and url is not None:
+            return {**base, "status": "done", "running": False, "url": url,
+                    "error": None, "log_tail": tail}
+        return {**base, "status": "error", "running": False, "url": url,
+                "error": f"training exited with code {rc}", "log_tail": tail}
+    return {
+        **base, "status": "done" if url else "idle", "running": False,
+        "url": url, "error": None, "log_tail": _tail_text(log_path),
+    }
+
+
+def _spawn_stage6(
+    run: str, slot: str, model: str, iterations: int | None, restart: bool = False
+) -> dict[str, Any]:
+    """Launch the Stage-6 fine-tune as a DETACHED background process on this host,
+    streaming stdout+stderr to splat/stage6.log. It runs under the server's OWN
+    interpreter — the `.venv-splat` CUDA env that already hosts the in-process Stage-5
+    renderer (see scripts/run_request.py), with CUDA_HOME inherited — so no separate
+    env wiring is needed. Detached (`DETACHED_PROCESS` / `start_new_session`) and
+    polled via `popen.poll()`, so it never blocks the event loop.
+
+    Resumes from the latest `splat/ckpt/` checkpoint by default (so a crashed run
+    continues where it stopped); `restart` first drops trained.ply + the checkpoints
+    for an explicit from-scratch retry."""
+    out = _trained_path(run, slot, model)
+    log_path = _stage6_log_path(run, slot, model)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    if restart:
+        import shutil
+
+        out.unlink(missing_ok=True)
+        shutil.rmtree(_stage6_ckpt_dir(run, slot, model), ignore_errors=True)
+    cmd = [
+        sys.executable, "-u", "-m", "splat.stage6",
+        "--cloud", str(_cloud_path(run, slot, model)),
+        "--refs", str(_refs_dir(run, slot, model)),
+        "--out", str(out), "--run", run, "--slot", slot, "--model", model,
+        "--resume",  # continue from a checkpoint if one survived; restart wiped it
+    ]
+    if iterations is not None:
+        cmd += ["--iterations", str(int(iterations))]
+    logf = open(log_path, "wb")  # noqa: SIM115 - inherited by the child; closed on finish
+    logf.write(f"$ {' '.join(cmd)}\n\n".encode())
+    logf.flush()
+    kwargs: dict[str, Any] = {
+        "cwd": str(_REPO_ROOT), "stdout": logf, "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        kwargs["start_new_session"] = True
+    popen = subprocess.Popen(cmd, **kwargs)
+    _splat_stage6_procs[(run, slot, model)] = {
+        "popen": popen, "logf": logf, "iterations": iterations,
+        "started_at": datetime.now().isoformat(timespec="seconds"), "returncode": None,
+    }
+    return _splat_stage6_status(run, slot, model)
 
 
 def _sample_cell_lods(
@@ -2251,6 +2392,7 @@ class Stage4Request(BaseModel):
     max_candidates: int | None = None
     render_resolution: int | None = None
     min_px_per_patch: float | None = None
+    gpu: bool | None = None  # run the coverage ray-march on CUDA (default on); False forces CPU
 
 
 def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
@@ -2277,6 +2419,7 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         max_candidates=int(pick(req.max_candidates, 1000, 5_000_000, d.max_candidates)),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
         min_px_per_patch=pick(req.min_px_per_patch, 2.0, 64.0, d.min_px_per_patch),
+        gpu=req.gpu if req.gpu is not None else d.gpu,
     )
 
 
@@ -2419,6 +2562,11 @@ def _revert_after(run: str, slot: str, model: str, stage: int) -> None:
                     shutil.rmtree(p, ignore_errors=True)
                 else:
                     p.unlink(missing_ok=True)
+    # Any re-run at/upstream of Stage 5 also invalidates the Stage-6 resume state (its
+    # checkpoints were trained against the now-superseded cloud/references), so drop
+    # them — a later training launch starts fresh instead of resuming onto stale data.
+    with contextlib.suppress(Exception):
+        shutil.rmtree(_stage6_ckpt_dir(run, slot, model), ignore_errors=True)
 
 
 def _splat_stage5_status(run: str, slot: str, model: str) -> dict[str, Any]:
@@ -3254,13 +3402,14 @@ def create_app() -> FastAPI:
         return _splat_stage4_status(run, slot, model)
 
     @app.post("/runs/{run}/splat/stage5/{slot}/{model}")
-    async def splat_stage5_start(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def splat_stage5_start(run: str, slot: str, model: str, restart: bool = False) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Render ONE cell's UNLIT reference images from its Stage-4 camera plan —
         per-view RGB (albedo) + planar-Z depth + alpha into `splat/refs/` (see
         splat/stage5.py), the supervision for the Stage-6 gsplat fine-tune. Requires
         Stage 4 (`cameras.json`) first. CUDA-only: on a non-GPU host the job finishes
-        with a clear 'needs CUDA' error. Idempotent while running; re-runs (overwrites)
-        on a fresh POST."""
+        with a clear 'needs CUDA' error. Idempotent while running. A fresh POST RESUMES
+        (renders only the views still missing on disk); pass `restart=true` to wipe
+        `refs/` and re-render every view from scratch."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -3274,6 +3423,12 @@ def create_app() -> FastAPI:
         existing = _splat_stage5_jobs.get(key)
         if existing is not None and existing.get("running"):
             return dict(existing)
+        if restart:
+            import shutil
+
+            shutil.rmtree(_refs_dir(run, slot, model), ignore_errors=True)
+            # New references supersede whatever the Stage-6 checkpoints trained on.
+            shutil.rmtree(_stage6_ckpt_dir(run, slot, model), ignore_errors=True)
         job: dict[str, Any] = {
             "run": run, "slot": slot, "model": model, "source": kind,
             "total": 0, "done": 0, "running": True, "status": "pending",
@@ -3293,6 +3448,39 @@ def create_app() -> FastAPI:
         """Live Stage-5 state of one cell ('idle' / 'pending' / a running job /
         'done' with the `refs/transforms.json` `url` / 'error')."""
         return _splat_stage5_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/stage6/{slot}/{model}")
+    async def splat_stage6_start(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: Stage6Request | None = None
+    ) -> dict[str, object]:
+        """Launch ONE cell's Stage-6 fine-tune (gsplat 2DGS) as a DETACHED background
+        training process on the server host, streaming to splat/stage6.log — watch it
+        live via this cell's status `log_tail` (or open the `log_url` artifact). Needs
+        Stage 3 (`cloud.ply`) + Stage 5 (`refs/transforms.json`). Runs async: it does
+        not block the server. Idempotent while training (returns the live job). A fresh
+        POST after an interruption RESUMES from the latest `splat/ckpt/` checkpoint;
+        pass `restart: true` (or POST after a clean finish) to train from scratch,
+        overwriting trained.ply."""
+        if not _cloud_path(run, slot, model).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 3 (surfels) first")
+        if not (_refs_dir(run, slot, model) / splat_stage5.TRANSFORMS_NAME).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 5 (references) first")
+        key = (run, slot, model)
+        rec = _splat_stage6_procs.get(key)
+        if rec is not None and rec["popen"].poll() is None:
+            return _splat_stage6_status(run, slot, model)  # already training
+        if rec is not None and rec.get("logf") is not None:
+            with contextlib.suppress(Exception):
+                rec["logf"].close()
+        iterations = body.iterations if body is not None else None
+        restart = bool(body.restart) if body is not None else False
+        return _spawn_stage6(run, slot, model, iterations, restart)
+
+    @app.get("/runs/{run}/splat/stage6/{slot}/{model}")
+    async def splat_stage6_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Stage-6 state ('idle' / 'running' with `pid` + `log_tail` / 'done'
+        with the trained `.ply` `url` / 'error'). See `_splat_stage6_status`."""
+        return _splat_stage6_status(run, slot, model)
 
     @app.get("/trellis/queue")
     async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
