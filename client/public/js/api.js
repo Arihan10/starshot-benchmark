@@ -189,14 +189,27 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage4/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
-    splatStage5Start: (run, slot, model) =>
+    // A plain POST RESUMES (renders only the views still missing on disk); pass
+    // `{ restart: true }` to wipe refs/ and re-render every view from scratch.
+    splatStage5Start: (run, slot, model, opts) =>
         request(
-            `/runs/${encodeURIComponent(run)}/splat/stage5/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+            `/runs/${encodeURIComponent(run)}/splat/stage5/${encodeURIComponent(slot)}/${encodeURIComponent(model)}${
+                opts && opts.restart ? "?restart=true" : ""
+            }`,
             { method: "POST" },
         ),
     splatStage5Status: (run, slot, model) =>
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage5/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+        ),
+    splatStage6Start: (run, slot, model, body) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage6/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+            { method: "POST", body },
+        ),
+    splatStage6Status: (run, slot, model) =>
+        request(
+            `/runs/${encodeURIComponent(run)}/splat/stage6/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
     // Live snapshot of the process-global mesh queue — every in-flight + waiting
     // generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1

@@ -4046,6 +4046,10 @@
                 min-height: 0;
                 position: relative;
                 overflow: hidden;
+                /* Own stacking context so the PlayCanvas SOG canvas (absolute,
+                   z-indexed) overlays the mkkellogg canvas here WITHOUT painting
+                   over the controls panel / header / help that float above it. */
+                isolation: isolate;
             }
             #splat-viewer-canvas canvas {
                 display: block;
@@ -4606,7 +4610,8 @@
                 "imports": {
                     "three": "/vendor/three/build/three.module.js",
                     "three/addons/": "/vendor/three/examples/jsm/",
-                    "@mkkellogg/gaussian-splats-3d": "/vendor/gsplat/gaussian-splats-3d.module.js"
+                    "@mkkellogg/gaussian-splats-3d": "/vendor/gsplat/gaussian-splats-3d.module.js",
+                    "playcanvas": "/vendor/playcanvas/playcanvas.mjs"
                 }
             }
         </script>

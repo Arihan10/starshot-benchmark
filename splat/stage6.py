@@ -24,8 +24,10 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
   * Depth: alpha-weighted EXPECTED planar camera-space Z (metres) — Stage 5
     composites depth-peeled layers with the same statistic gsplat
-    `render_mode="RGB+ED"` renders (plain surface Z wherever the nearest hit
-    is opaque); alpha-gated L1 against the reference depth.
+    `render_mode="RGB+ED"` renders (plain surface Z wherever the nearest hit is
+    opaque) — decoded from Stage 5's log-uint16 depth PNG via the shared
+    [near, far] (legacy float32 `.npy` renders still read as-is); alpha-gated L1
+    against it.
   * Colour: sRGB albedo compared directly (no sRGB↔linear); SH degree a config
     flag (0 = unlit, the decided default), raisable later for shiny surfaces.
 
@@ -40,6 +42,12 @@ LOSSES (per view):
   * depth — alpha-gated L1 (the strongest floater suppressor);
   * 2DGS regularizers — normal consistency (render normals vs normals-from-depth)
     and optional depth distortion.
+
+RESUMABLE: every `ckpt_every` steps the full training state (params + per-param
+Adam + means LR schedule + densification-strategy accumulators + step) is written
+to `splat/ckpt/` (atomic, most-recent-`ckpt_keep` kept). An interrupted run resumes
+from the latest checkpoint and continues to `iterations`; the checkpoints are
+deleted once trained.ply is written. Pass `resume=False` to force a fresh run.
 
 CUDA-ONLY: torch + gsplat compile/require CUDA, so this runs on the GPU box, NOT
 Apple Silicon. Both are imported LAZILY inside the trainer so the server (which
@@ -59,7 +67,7 @@ from typing import Any
 
 import numpy as np
 
-from splat.stage5 import TRANSFORMS_NAME
+from splat.stage5 import TRANSFORMS_NAME, load_depth_png
 
 logging.getLogger("PIL").setLevel(logging.ERROR)
 
@@ -127,6 +135,13 @@ class TrainParams:
     batch: int = 1                     # views rendered per step — >1 fills the GPU + VRAM headroom
     prefetch: bool = True              # decode/stack the next batch on a background thread (hide disk I/O)
 
+    # Resumable checkpoints: every `ckpt_every` steps write the full training state
+    # (params + per-param Adam + densification strategy + step) to `splat/ckpt/`,
+    # keeping the most recent `ckpt_keep`. An interrupted run resumes from the latest
+    # and continues to `iterations`; they're deleted once trained.ply is written.
+    ckpt_every: int = 2000             # 0 disables checkpointing
+    ckpt_keep: int = 2
+
     @property
     def resolved_refine_stop(self) -> int:
         return self.refine_stop_iter if self.refine_stop_iter is not None else int(self.iterations * 0.5)
@@ -146,6 +161,7 @@ class TrainParams:
             "grow_grad2d": self.grow_grad2d,
             "prune_opa": self.prune_opa,
             "batch": self.batch,
+            "ckpt_every": self.ckpt_every,
         }
 
 
@@ -213,6 +229,22 @@ def _load_alpha(path: Path) -> np.ndarray:
     from PIL import Image
 
     return (np.asarray(Image.open(path).convert("L"), dtype=np.float32) / 255.0)[..., None]
+
+
+def _read_depth(view: dict[str, Any]) -> np.ndarray | None:
+    """Reference depth for a view as [H,W,1] float32 planar-Z metres, or None.
+    Stage 5 now writes a log-uint16 depth PNG (decoded via `load_depth_png` with the
+    view's [near, far]); legacy float32 `.npy` renders are still read directly, so
+    existing reference sets need not be regenerated."""
+    dp = view["depth"]
+    if dp is None:
+        return None
+    if dp.suffix == ".png":
+        near, far = view.get("depth_near"), view.get("depth_far")
+        if near is None or far is None:
+            raise ValueError(f"{dp}: PNG depth needs 'near'/'far' in transforms.json")
+        return load_depth_png(dp, near, far)[..., None]
+    return np.load(dp).astype(np.float32)[..., None]
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -347,8 +379,8 @@ def _load_view(torch, view: dict[str, Any], device):  # noqa: ANN001
     else:
         alpha = torch.ones((1, rgb.shape[1], rgb.shape[2], 1), device=device)
     depth = None
-    if view["depth"] is not None:
-        d = np.load(view["depth"]).astype(np.float32)[..., None]
+    d = _read_depth(view)
+    if d is not None:
         depth = torch.from_numpy(np.ascontiguousarray(d)).to(device).unsqueeze(0)
     return rgb, alpha, depth
 
@@ -376,8 +408,8 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  
             vms.append(v["viewmat"])
             rgbs.append(torch.from_numpy(rgb))
             alphas.append(torch.from_numpy(alpha))
-            if v["depth"] is not None:
-                d = np.load(v["depth"]).astype(np.float32)[..., None]
+            d = _read_depth(v)
+            if d is not None:
                 depths.append(torch.from_numpy(np.ascontiguousarray(d)))
         depth = torch.stack(depths) if len(depths) == batch else None
         return torch.stack(vms), torch.stack(rgbs), torch.stack(alphas), depth
@@ -415,6 +447,57 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  
         yield to_dev(item)
 
 
+CKPT_DIRNAME = "ckpt"
+
+
+def _ckpt_dir(out_path: Path) -> Path:
+    """Where Stage-6 resumable checkpoints live (`splat/ckpt/`, beside trained.ply)."""
+    return out_path.parent / CKPT_DIRNAME
+
+
+def _strat_state_to(state: dict[str, Any], mover: Callable[[Any], Any]) -> dict[str, Any]:
+    """Copy a gsplat strategy-state dict, moving its tensors via `mover` (`.cpu()` for
+    save, `.to(device)` for load) and passing scalars / None through untouched."""
+    return {k: mover(v) if hasattr(v, "to") else v for k, v in state.items()}
+
+
+def _save_checkpoint(  # noqa: ANN001
+    torch, ckpt_dir, step, splats, optimizers, means_sched, strat_state, meta, keep
+) -> None:
+    """Atomically write a full training checkpoint (params + per-param Adam state +
+    means scheduler + densification-strategy state + step), then prune to the most
+    recent `keep`. Everything is stored on the CPU so it reloads on any device."""
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "step": int(step),
+        "params": {k: v.detach().cpu() for k, v in splats.items()},
+        "optimizers": {n: o.state_dict() for n, o in optimizers.items()},
+        "means_sched": means_sched.state_dict(),
+        "strat_state": _strat_state_to(strat_state, lambda v: v.detach().cpu()),
+        "meta": meta,
+    }
+    path = ckpt_dir / f"step_{int(step):06d}.pt"
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, tmp)
+    tmp.replace(path)
+    if keep > 0:
+        for old in sorted(ckpt_dir.glob("step_*.pt"))[:-keep]:
+            old.unlink(missing_ok=True)
+
+
+def _load_checkpoint(torch, ckpt_dir: Path, device):  # noqa: ANN001
+    """The newest valid checkpoint in `ckpt_dir` (loaded to `device`), or None. Tries
+    newest-first, skipping any that fail to load (tolerating a torn tail file)."""
+    if not ckpt_dir.is_dir():
+        return None
+    for path in sorted(ckpt_dir.glob("step_*.pt"), reverse=True):
+        try:
+            return torch.load(path, map_location=device, weights_only=False)
+        except Exception:
+            continue
+    return None
+
+
 def train_splat(
     *,
     run: str,
@@ -424,12 +507,17 @@ def train_splat(
     refs_dir: Path,
     out_path: Path,
     params: TrainParams = TrainParams(),
+    resume: bool = True,
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
     """Fine-tune the Stage-3 surfel cloud at `cloud_path` against the Stage-5
     references in `refs_dir`, writing the optimized 2DGS splat to `out_path`.
     Requires a CUDA GPU + gsplat (raises a clear error otherwise). Returns a
-    compact summary (init/final splat counts, final metrics, bytes)."""
+    compact summary (init/final splat counts, final metrics, bytes).
+
+    With `resume` (default), continues from the latest `splat/ckpt/` checkpoint when
+    one is present and compatible (same SH config); otherwise starts from the surfel
+    init. Pass `resume=False` to ignore any checkpoint and train from scratch."""
     torch, F, gsplat = _require_cuda_trainer()
     from gsplat import DefaultStrategy, rasterization_2dgs
 
@@ -453,6 +541,10 @@ def train_splat(
     )
 
     # Index the supervision set (paths + poses only; pixels stream from disk per step).
+    # `near`/`far` (shared across the plan) let `_read_depth` decode the log-uint16
+    # depth PNGs back to metric metres.
+    depth_near = float(doc["near"]) if "near" in doc else None
+    depth_far = float(doc["far"]) if "far" in doc else None
     views: list[dict[str, Any]] = []
     cam_centers: list[np.ndarray] = []
     for fr in frames:
@@ -464,35 +556,52 @@ def train_splat(
                 "rgb": refs_dir / fr["file_path"],
                 "alpha": refs_dir / fr["alpha_path"] if fr.get("alpha_path") else None,
                 "depth": refs_dir / fr["depth_path"] if fr.get("depth_path") else None,
+                "depth_near": depth_near,
+                "depth_far": depth_far,
             }
         )
     n_views = len(views)
+
+    # Surfel init (also the scene-scale fallback source when there's ≤1 camera).
+    init = _load_cloud(cloud_path)
+    n_init = int(init["means"].shape[0])
 
     # Scene scale = camera-cloud radius (× 1.1), the 3DGS spatial LR / density unit.
     centers = np.stack(cam_centers, axis=0)
     scene_scale = float(np.linalg.norm(centers - centers.mean(0), axis=1).max()) if n_views > 1 else 0.0
     if scene_scale <= 1e-6:
-        init_means = _load_cloud(cloud_path)["means"]
-        scene_scale = float(np.linalg.norm(init_means.max(0) - init_means.min(0))) * 0.5
+        scene_scale = float(np.linalg.norm(init["means"].max(0) - init["means"].min(0))) * 0.5
     scene_scale = max(scene_scale * 1.1, 1e-3)
 
-    # Build the model from the surfel init.
-    init = _load_cloud(cloud_path)
-    n_init = int(init["means"].shape[0])
-    splats = torch.nn.ParameterDict(
-        {
-            "means": torch.nn.Parameter(torch.from_numpy(init["means"])),
-            "scales": torch.nn.Parameter(torch.from_numpy(init["scales"])),
-            "quats": torch.nn.Parameter(torch.from_numpy(init["quats"])),
-            "opacities": torch.nn.Parameter(torch.from_numpy(init["opacities"])),
-            "sh0": torch.nn.Parameter(torch.from_numpy(init["sh0"])),
-        }
-    ).to(device)
     bands = (params.sh_degree + 1) ** 2
-    if bands > 1:
-        splats["shN"] = torch.nn.Parameter(
-            torch.zeros((n_init, bands - 1, 3), dtype=torch.float32, device=device)
+
+    # Resume from the latest checkpoint when present + compatible (same SH config),
+    # else build from the surfel init. `meta` guards against reloading a checkpoint
+    # whose model shape no longer matches this cloud's SH bands.
+    ckpt_dir = _ckpt_dir(out_path)
+    meta = {"sh_degree": params.sh_degree, "n_init": n_init}
+    ckpt = _load_checkpoint(torch, ckpt_dir, device) if resume else None
+    if ckpt is not None and ckpt.get("meta", {}).get("sh_degree") != params.sh_degree:
+        ckpt = None
+
+    if ckpt is not None:
+        splats = torch.nn.ParameterDict(
+            {k: torch.nn.Parameter(v.to(device)) for k, v in ckpt["params"].items()}
         )
+    else:
+        splats = torch.nn.ParameterDict(
+            {
+                "means": torch.nn.Parameter(torch.from_numpy(init["means"])),
+                "scales": torch.nn.Parameter(torch.from_numpy(init["scales"])),
+                "quats": torch.nn.Parameter(torch.from_numpy(init["quats"])),
+                "opacities": torch.nn.Parameter(torch.from_numpy(init["opacities"])),
+                "sh0": torch.nn.Parameter(torch.from_numpy(init["sh0"])),
+            }
+        ).to(device)
+        if bands > 1:
+            splats["shN"] = torch.nn.Parameter(
+                torch.zeros((n_init, bands - 1, 3), dtype=torch.float32, device=device)
+            )
 
     lrs = {
         "means": params.means_lr * scene_scale,
@@ -527,19 +636,34 @@ def train_splat(
     strategy.check_sanity(splats, optimizers)
     strat_state = strategy.initialize_state(scene_scale=scene_scale)
 
+    # Restore optimizer / scheduler / densification state so a resumed run continues
+    # exactly where it stopped (Adam moments, LR-decay position, grow/prune counters).
+    # The scheduler is created above from the base (undecayed) LR, then its state is
+    # loaded, so base_lrs stay correct while the current LR follows the checkpoint.
+    start_step = 0
+    if ckpt is not None:
+        for name, opt in optimizers.items():
+            sd = ckpt["optimizers"].get(name)
+            if sd is not None:
+                opt.load_state_dict(sd)
+        means_sched.load_state_dict(ckpt["means_sched"])
+        strat_state = _strat_state_to(ckpt["strat_state"], lambda v: v.to(device))
+        start_step = int(ckpt["step"]) + 1
+
     window = _gaussian_window(torch, 11, 1.5, device, channels=3)
     dist_on = params.dist_lambda > 0.0
 
+    n_last = int(splats["means"].shape[0])
     if progress is not None:
-        progress(0, params.iterations, f"init={n_init} views={n_views} scale={scene_scale:.2f}")
+        where = f"resume@{start_step} n={n_last}" if start_step else f"init={n_init}"
+        progress(start_step, params.iterations, f"{where} views={n_views} scale={scene_scale:.2f}")
 
     t_start = t_last = time.perf_counter()
-    done_last = 0
-    n_last = n_init
+    done_last = start_step
     log_every = max(params.log_every, 1)
     stream = _view_stream(torch, views, device, max(params.batch, 1), params.prefetch, params.seed)
 
-    for step in range(params.iterations):
+    for step in range(start_step, params.iterations):
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
 
         active_sh = min(step // max(params.sh_degree_interval, 1), params.sh_degree)
@@ -627,6 +751,16 @@ def train_splat(
             )
             t_last, done_last, n_last = now, done, n_now
 
+        if (
+            params.ckpt_every > 0
+            and (step + 1) % params.ckpt_every == 0
+            and step + 1 < params.iterations
+        ):
+            _save_checkpoint(
+                torch, ckpt_dir, step, splats, optimizers, means_sched,
+                strat_state, meta, params.ckpt_keep,
+            )
+
     # Final metrics over a capped subset + write the splat.
     if progress is not None:
         progress(
@@ -649,6 +783,12 @@ def train_splat(
             splats["scales"].detach().cpu().numpy()[:, :2],
             out_path,
         )
+    # Training finished + the final splat is on disk → the periodic checkpoints are
+    # obsolete; drop them so a later resume doesn't re-enter a completed run.
+    import shutil
+
+    shutil.rmtree(ckpt_dir, ignore_errors=True)
+
     n_final = int(splats["means"].shape[0])
 
     return {
@@ -742,6 +882,14 @@ def _main() -> None:
         "--batch", type=int, default=TrainParams.batch,
         help="views rendered per step; >1 fills the GPU (use ~1/batch the iterations)",
     )
+    ap.add_argument(
+        "--ckpt-every", type=int, default=TrainParams.ckpt_every,
+        help="write a resumable checkpoint every N steps (0 disables)",
+    )
+    ap.add_argument(
+        "--resume", action=argparse.BooleanOptionalAction, default=True,
+        help="resume from the latest checkpoint beside --out (splat/ckpt) if present",
+    )
     ap.add_argument("--run", default="?")
     ap.add_argument("--slot", default="?")
     ap.add_argument("--model", default="?")
@@ -763,7 +911,9 @@ def _main() -> None:
             sh_degree=args.sh_degree,
             refine_stop_iter=args.refine_stop_iter,
             batch=args.batch,
+            ckpt_every=args.ckpt_every,
         ),
+        resume=args.resume,
         progress=_log,
     )
     print(json.dumps(summary, indent=1), flush=True)
