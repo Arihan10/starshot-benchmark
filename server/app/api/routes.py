@@ -2038,6 +2038,7 @@ class Stage3Request(BaseModel):
     radius_frac: float = splat_stage3.DEFAULT_RADIUS_FRAC
     flatness: float = splat_stage3.DEFAULT_FLATNESS
     adaptive: bool = True
+    feature_boost: float = splat_stage3.DEFAULT_FEATURE_BOOST  # crease/boundary refinement (1 = off)
     cull_hidden: bool = True
     detail_splats: int | None = None
     representation: str | None = None  # "2dgs" (default) | "3dgs" (compat/compression)
@@ -2068,18 +2069,19 @@ def _stage3_params(
         else None
     )
     rep = req.representation if req.representation in ("2dgs", "3dgs") else "2dgs"
+    boost = float(min(max(req.feature_boost, 1.0), 8.0))
     base = splat_stage3.SampleParams(
         target_splats=target, splat_density=density, base_spacing=base_spacing,
         radius_frac=radius, flatness=flat, adaptive=bool(req.adaptive),
-        cull_hidden=bool(req.cull_hidden), representation=rep,
+        feature_boost=boost, cull_hidden=bool(req.cull_hidden), representation=rep,
     )
     detail = None
     if req.detail_splats:
         detail = splat_stage3.SampleParams(
             target_splats=int(min(max(req.detail_splats, 50_000), 50_000_000)),
             splat_density=None, base_spacing=None, radius_frac=radius, flatness=flat,
-            adaptive=bool(req.adaptive), cull_hidden=bool(req.cull_hidden),
-            representation=rep,
+            adaptive=bool(req.adaptive), feature_boost=boost,
+            cull_hidden=bool(req.cull_hidden), representation=rep,
         )
     return base, detail
 
@@ -2227,18 +2229,19 @@ async def _run_splat_stage3_cell(
 class Stage4Request(BaseModel):
     """Coverage-planner knobs (all optional; omitted → defaults). `min_gain`
     truncates the diminishing tail (higher = fewer cameras); `angles_per_patch`
-    is K; `patch_min_spacing` sets the finest patch/footprint detail. The cube-face
-    `render_resolution` + `min_px_per_patch` set the shared reference-render
-    intrinsics from which the footprint budget (view distance) is derived — matching
-    what Stage 5 will render."""
+    is K; `patch_fraction` is the uniform surfel→patch thinning (detail now
+    arrives in the cloud itself — Stage 3's feature-adaptive density — so there
+    are no detector knobs here). The cube-face `render_resolution` +
+    `min_px_per_patch` set the shared reference-render intrinsics from which the
+    footprint budget (view distance) is derived — matching what Stage 5 will
+    render."""
 
-    patch_min_spacing: float | None = None
-    patch_max_spacing: float | None = None
+    patch_fraction: float | None = None
     collision_clearance: float | None = None
     angles_per_patch: int | None = None
     angular_sectors: int | None = None
     near_frac: float | None = None
-    tex_k: float | None = None
+    headon_cos: float | None = None
     min_gain: int | None = None
     candidate_spacing: float | None = None
     max_candidates: int | None = None
@@ -2256,13 +2259,12 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         return float(min(max(v, lo), hi)) if v is not None else default
 
     return splat_stage4.PlanParams(
-        patch_min_spacing=pick(req.patch_min_spacing, 0.02, 0.5, d.patch_min_spacing),
-        patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
-        tex_k=pick(req.tex_k, 0.0, 50.0, d.tex_k),
+        patch_fraction=pick(req.patch_fraction, 0.05, 1.0, d.patch_fraction),
         collision_clearance=pick(req.collision_clearance, 0.05, 2.0, d.collision_clearance),
         angles_per_patch=int(pick(req.angles_per_patch, 1, 12, d.angles_per_patch)),
         angular_sectors=int(pick(req.angular_sectors, 3, 16, d.angular_sectors)),
         near_frac=pick(req.near_frac, 0.1, 1.0, d.near_frac),
+        headon_cos=pick(req.headon_cos, 0.0, 0.95, d.headon_cos),
         min_gain=int(pick(req.min_gain, 1, 500, d.min_gain)),
         candidate_spacing=pick(req.candidate_spacing, 0.1, 3.0, d.candidate_spacing),
         # Generous safety ceiling (was a room-scale 20k cap); Stage 4 even-downsamples

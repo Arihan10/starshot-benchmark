@@ -15,11 +15,25 @@ first). Two things use it:
     buried (a solid's interior, or the seam between two abutting objects) and is
     dropped — it would never be seen, so it's wasted budget and a floater seed.
 
-Sampling (overview §): per-object blue-noise (Poisson-disk) even spacing, adaptive
-per object by feature size. Each surfel: position (world; placement baked into the
-vertices), rotation (quaternion aligning +Z to the oriented normal), scale (r, r,
-~0), color (per-texel albedo), opacity (base-color alpha honouring `alphaMode`).
-Stored SH is degree 0 (`f_dc`) — unlit / view-independent.
+Sampling (overview §): per-object blue-noise (Poisson-disk) even spacing in
+FEATURE-ADAPTIVE BANDS. Detail is measured ONCE, from the mesh itself (its
+feature edges: creases sharper than `_CREASE_ANGLE` + open boundaries — full-
+fidelity signals, not statistics of an already-sampled proxy): flat interiors
+sample at the density-knob spacing exactly as before, while crease/boundary
+neighbourhoods — thin members, frames, slats, corners, which by construction lie
+within a base-spacing of a feature edge — sample up to `feature_boost`× finer
+(boost²× the density). Purely additive: flats are unchanged and detail rides on
+top, so the density knob keeps its meaning. Downstream, the cloud's local
+density IS the detail field: Stage 4 reads it (local sample spacing) instead of
+re-detecting detail from the cloud, and Stage 6's densification starts from
+capacity that already exists where the close-up cameras will look.
+
+Each surfel: position (world; placement baked into the vertices), rotation
+(quaternion aligning +Z to the oriented normal), scale (r, r, ~0), color (albedo
+FOOTPRINT-AVERAGED over the disk — the texture's mip level matching the disk's
+texel diameter, so one disk summarizes the area it covers instead of a single
+pinprick texel), opacity (base-color alpha honouring `alphaMode`, averaged the
+same way). Stored SH is degree 0 (`f_dc`) — unlit / view-independent.
 
 Pure library: `sample_cell` takes explicit paths; the server resolves a cell to them
 (de-optimizing a library build to vanilla first) and passes the Stage-2
@@ -38,7 +52,7 @@ import numpy as np
 import trimesh
 from scipy.spatial import cKDTree
 
-from splat.stage2 import FreeSpace, load_free_space
+from splat.stage2 import FreeSpace, _subdivide_edges, _valid_tri_mask, load_free_space
 
 # Poisson-disk elimination routinely returns fewer than the oversample budget
 # (that's the point — it thins clumps), which trimesh logs as "only got N/M
@@ -59,6 +73,14 @@ DEFAULT_TARGET_SPLATS = 150_000
 DEFAULT_SPLAT_DENSITY = 80.0
 DEFAULT_RADIUS_FRAC = 0.9
 DEFAULT_FLATNESS = 0.1
+# Feature-adaptive density: sampling within one base-spacing of a FEATURE EDGE
+# (a crease sharper than _CREASE_ANGLE, or an open boundary) is refined in
+# octave bands down to base/feature_boost. 25° cleanly separates man-made
+# creases (box corners, frames, rail edges ~60-90°) from the small per-edge
+# angles of dense smooth meshes (~10-15°), so smooth blobs stay single-band.
+DEFAULT_FEATURE_BOOST = 4.0
+_CREASE_ANGLE = np.deg2rad(25.0)
+_EDGE_PT_CAP = 400_000  # stride a pathological crease soup instead of exploding
 
 # Empirical density model tying surfel count to spacing (see overview §7).
 _SPACING_EXP = 2.5
@@ -68,6 +90,7 @@ _SPACING_CLAMP = (0.004, 0.25)
 # Opacity is stored pre-sigmoid; clamp alpha off the 0/1 asymptotes.
 _ALPHA_CLAMP = (1e-3, 1.0 - 1e-3)
 
+
 # Material alpha modes whose sampled base-color alpha is meaningful (glass, cutout).
 # Everything else is forced opaque so a stray texture alpha channel can't punch holes.
 _TRANSPARENT_ALPHA_MODES = ("BLEND", "MASK")
@@ -76,8 +99,10 @@ _TRANSPARENT_ALPHA_MODES = ("BLEND", "MASK")
 @dataclass(frozen=True)
 class SampleParams:
     """Global sampling knobs for one pass — set live from the splat client. `adaptive`
-    scales spacing per object; `cull_hidden` drops surfels with no reachable free
-    space on either side (needs the Stage-2 grid)."""
+    scales spacing per object; `feature_boost` is the feature-adaptive density
+    dial — crease/boundary neighbourhoods sample up to this factor FINER than the
+    base spacing (1.0 disables, restoring uniform density); `cull_hidden` drops
+    surfels with no reachable free space on either side (needs the Stage-2 grid)."""
 
     target_splats: int | None = None      # explicit count override; else density × area
     splat_density: float | None = DEFAULT_SPLAT_DENSITY  # surfels per m² (area-scaled count)
@@ -85,6 +110,7 @@ class SampleParams:
     radius_frac: float = DEFAULT_RADIUS_FRAC
     flatness: float = DEFAULT_FLATNESS   # 3dgs-mode only: thin third scale = radius*flatness
     adaptive: bool = True
+    feature_boost: float = DEFAULT_FEATURE_BOOST  # max refinement near feature edges (1 = off)
     cull_hidden: bool = True
     representation: str = "2dgs"          # "2dgs" (native surfels) | "3dgs" (compat/compression)
 
@@ -96,6 +122,7 @@ class SampleParams:
             "radius_frac": self.radius_frac,
             "flatness": self.flatness,
             "adaptive": self.adaptive,
+            "feature_boost": self.feature_boost,
             "cull_hidden": self.cull_hidden,
             "representation": self.representation,
         }
@@ -192,6 +219,105 @@ def _object_spacing(geom: trimesh.Trimesh, base_spacing: float, adaptive: bool) 
     return base_spacing * scale
 
 
+def _feature_edge_points(geom: trimesh.Trimesh, step: float) -> np.ndarray | None:
+    """Points sampled every ~`step` metres along the mesh's FEATURE edges: open
+    boundary edges (used by exactly one face) + creases where adjacent faces meet
+    at more than `_CREASE_ANGLE`. These mark where the surface actually has
+    detail — corners, frames, the sides and ends of thin members — and drive the
+    feature-adaptive sampling bands. None when the mesh has no feature edges
+    (smooth closed blobs sample uniformly, exactly as before)."""
+    try:
+        parts = []
+        ang = np.asarray(geom.face_adjacency_angles)
+        if ang.size:
+            parts.append(np.asarray(geom.face_adjacency_edges)[ang > _CREASE_ANGLE])
+        boundary = trimesh.grouping.group_rows(geom.edges_sorted, require_count=1)
+        if len(boundary):
+            parts.append(np.asarray(geom.edges_sorted)[boundary])
+        if not parts:
+            return None
+        edges = np.concatenate(parts, axis=0)
+    except Exception:
+        return None
+    if not len(edges):
+        return None
+    v0 = np.asarray(geom.vertices)[edges[:, 0]]
+    v1 = np.asarray(geom.vertices)[edges[:, 1]]
+    seg = v1 - v0
+    length = np.linalg.norm(seg, axis=1)
+    cnt = np.maximum(np.ceil(length / max(step, 1e-6)).astype(np.int64) + 1, 2)
+    total = int(cnt.sum())
+    if total > _EDGE_PT_CAP:
+        stride = int(np.ceil(total / _EDGE_PT_CAP))
+        cnt = np.maximum(cnt // stride, 2)
+        total = int(cnt.sum())
+    rep = np.repeat(np.arange(len(edges)), cnt)
+    start = np.concatenate([[0], np.cumsum(cnt)[:-1]])
+    t = (np.arange(total) - start[rep]) / (cnt[rep] - 1)
+    return (v0[rep] + t[:, None] * seg[rep]).astype(np.float64)
+
+
+def _soup_mesh(tris: np.ndarray, uv3: np.ndarray | None, material) -> trimesh.Trimesh:  # noqa: ANN001
+    """Standalone mesh from a triangle soup (vertices duplicated per triangle),
+    carrying per-vertex UVs + the ORIGINAL material so `surfel_colors` samples
+    the same texture through the same path on a band as on the whole object."""
+    verts = tris.reshape(-1, 3)
+    faces = np.arange(len(verts), dtype=np.int64).reshape(-1, 3)
+    visual = None
+    if uv3 is not None and material is not None:
+        visual = trimesh.visual.TextureVisuals(uv=uv3.reshape(-1, 2), material=material)
+    return trimesh.Trimesh(vertices=verts, faces=faces, visual=visual, process=False)
+
+
+def _spacing_bands(
+    geom: trimesh.Trimesh, spacing: float, boost: float
+) -> list[tuple[trimesh.Trimesh, float]]:
+    """Split one object into `(mesh, spacing)` sampling bands by distance to its
+    feature edges — the feature-adaptive density core. Faces are midpoint-split
+    to ~`spacing` resolution (so a large wall face can straddle bands), then each
+    piece's target spacing is its centroid's distance to the nearest feature
+    edge, clamped to [spacing/boost, spacing] and quantized to octaves: a piece
+    at distance d needs disks no larger than ~d to keep them off the crease, and
+    pieces ON thin members (everywhere within a half-width of an edge) land in
+    the finest band — which is precisely what makes rails/slats/frames sample at
+    feature scale instead of wall scale. Flat interiors (d ≥ spacing) keep the
+    base spacing bit-for-bit; detail is ADDITIVE, so the density knob's meaning
+    is unchanged on flats and the total grows only with feature-area fraction.
+
+    Falls back to a single base-spacing band when boost ≤ 1, the mesh has no
+    feature edges (smooth blobs), or its triangles are degenerate."""
+    if boost <= 1.0:
+        return [(geom, spacing)]
+    edge_pts = _feature_edge_points(geom, step=spacing * 0.5)
+    if edge_pts is None:
+        return [(geom, spacing)]
+
+    tris = np.asarray(geom.triangles, dtype=np.float64)
+    uv = getattr(getattr(geom, "visual", None), "uv", None)
+    material = getattr(getattr(geom, "visual", None), "material", None)
+    uv3 = None
+    if uv is not None and len(uv) == len(geom.vertices):
+        uv3 = np.asarray(uv, dtype=np.float64)[np.asarray(geom.faces)]
+    keep = _valid_tri_mask(tris)
+    tris = tris[keep]
+    uv3 = uv3[keep] if uv3 is not None else None
+    if not len(tris):
+        return [(geom, spacing)]
+    tris, uv3 = _subdivide_edges(tris, spacing, uv3)
+
+    d = cKDTree(edge_pts).query(tris.mean(axis=1))[0]
+    factor = spacing / np.clip(d, spacing / boost, spacing)
+    level = np.ceil(np.log2(np.maximum(factor, 1.0)) - 1e-9)
+    f = np.minimum(2.0 ** level, boost)
+
+    bands: list[tuple[trimesh.Trimesh, float]] = []
+    for lf in np.unique(f):
+        m = f == lf
+        band_uv = uv3[m] if uv3 is not None else None
+        bands.append((_soup_mesh(tris[m], band_uv, material), spacing / float(lf)))
+    return bands
+
+
 def _surfel_radii(points: np.ndarray, spacing: float, radius_frac: float) -> np.ndarray:
     """Per-surfel disk radius from the LOCAL sample spacing (nearest-neighbour
     distance), so disks tile without gaps. Outliers clamped to the object median."""
@@ -206,12 +332,87 @@ def _surfel_radii(points: np.ndarray, spacing: float, radius_frac: float) -> np.
     return (nn * radius_frac).astype(np.float32)
 
 
-def surfel_colors(
-    geom: trimesh.Trimesh, points: np.ndarray, face_idx: np.ndarray
+def _build_mips(image) -> list[np.ndarray]:  # noqa: ANN001 - PIL.Image
+    """RGBA float32 [0,1] mip pyramid: level 0 is the full-resolution texture,
+    each next level a 2× box (area-average) downsample, ending at 1×1. One
+    level-k texel stores the mean of a ~2^k-texel-wide block of the original,
+    so sampling level log2(d) approximates a d-texel-wide average in a single
+    lookup."""
+    from PIL import Image
+
+    img = image.convert("RGBA")
+    levels = [np.asarray(img, dtype=np.float32) / 255.0]
+    w, h = img.size
+    while max(w, h) > 1:
+        w, h = max(1, w // 2), max(1, h // 2)
+        img = img.resize((w, h), Image.BOX)
+        levels.append(np.asarray(img, dtype=np.float32) / 255.0)
+    return levels
+
+
+def _mip_sample(
+    mips: list[np.ndarray], uvs: np.ndarray, levels: np.ndarray
 ) -> np.ndarray:
-    """Per-surfel RGBA in [0,1]. When the mesh has a readable base-color texture,
-    samples it at each surfel's barycentric-interpolated UV (per-texel albedo);
-    otherwise falls back to the per-face mean of the per-vertex colours."""
+    """RGBA per (uv, mip level), replicating `trimesh.visual.color.uv_to_color`'s
+    pixel convention at every level (nearest texel, v=0 at the image bottom,
+    wrap): a level-0 lookup matches the old point-sample path texel-for-texel,
+    and coarser levels return footprint averages in the same frame."""
+    uvs = np.nan_to_num(np.asarray(uvs, dtype=np.float64), nan=0.0)
+    out = np.empty((len(uvs), 4), dtype=np.float32)
+    for k in np.unique(levels):
+        tex = mips[int(k)]
+        h, w = tex.shape[:2]
+        sel = levels == k
+        x = np.round((uvs[sel, 0] * (w - 1)) % w).astype(np.int64) % w
+        y = np.round(((1.0 - uvs[sel, 1]) * (h - 1)) % h).astype(np.int64) % h
+        out[sel] = tex[y, x]
+    return out
+
+
+def _footprint_levels(
+    geom: trimesh.Trimesh,
+    face_idx: np.ndarray,
+    radii: np.ndarray,
+    tex_wh: tuple[int, int],
+    n_levels: int,
+) -> np.ndarray:
+    """Mip level per surfel. A disk of radius r covers ≈ 2·r·ρ texels across,
+    where ρ (texels/metre) is its triangle's linear texel density —
+    sqrt(UV area × texture pixel count / world area). Level = round(log2 of the
+    texel diameter), clamped to the pyramid. Degenerate UV or world triangles
+    give ρ = 0 → level 0 (the old point sample), a graceful fallback."""
+    uf, inv = np.unique(np.asarray(face_idx), return_inverse=True)
+    fv = np.asarray(geom.faces)[uf]                              # (U,3) vert ids
+    tri = np.asarray(geom.vertices)[fv]                          # (U,3,3) world
+    aw = 0.5 * np.linalg.norm(
+        np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1
+    )
+    uvt = np.asarray(geom.visual.uv, dtype=np.float64)[fv]       # (U,3,2)
+    d1 = uvt[:, 1] - uvt[:, 0]
+    d2 = uvt[:, 2] - uvt[:, 0]
+    auv = 0.5 * np.abs(d1[:, 0] * d2[:, 1] - d1[:, 1] * d2[:, 0])
+    auv_tex = auv * float(tex_wh[0]) * float(tex_wh[1])          # texel² / face
+    rho = np.sqrt(auv_tex / np.maximum(aw, 1e-18))               # texels / metre
+    diam = 2.0 * np.asarray(radii, dtype=np.float64) * rho[inv]
+    lvl = np.log2(np.maximum(np.nan_to_num(diam), 1.0))
+    return np.clip(np.round(lvl), 0, n_levels - 1).astype(np.int64)
+
+
+def surfel_colors(
+    geom: trimesh.Trimesh,
+    points: np.ndarray,
+    face_idx: np.ndarray,
+    radii: np.ndarray | None = None,
+) -> np.ndarray:
+    """Per-surfel RGBA in [0,1]. With a readable base-color texture, each surfel
+    gets the FOOTPRINT AVERAGE of the texture over its disk: the mip level whose
+    filter width matches the disk's texel diameter is sampled at the surfel's
+    barycentric-interpolated UV. One disk summarizes the area it covers instead
+    of one pinprick texel — busy textures init as their local mean rather than
+    per-surfel noise — and alpha averages identically (soft MASK-cutout / glass
+    boundaries). With `radii=None`, or wherever the UV mapping is degenerate,
+    this reduces to the old level-0 point sample (texel-identical to
+    `uv_to_color`). No texture → per-face mean of the per-vertex colours."""
     faces = np.asarray(geom.faces[face_idx])
     visual = getattr(geom, "visual", None)
     material = getattr(visual, "material", None)
@@ -223,10 +424,14 @@ def surfel_colors(
             bary = trimesh.triangles.points_to_barycentric(tris, points)
             face_uv = np.asarray(uv)[faces]
             uvs = np.einsum("sj,sjk->sk", bary, face_uv)
-            cols = np.asarray(
-                trimesh.visual.color.uv_to_color(uvs, image), dtype=np.float32
-            )
-            cols = cols / 255.0
+            mips = _build_mips(image)
+            if radii is not None and len(mips) > 1:
+                levels = _footprint_levels(
+                    geom, face_idx, radii, (image.width, image.height), len(mips)
+                )
+            else:
+                levels = np.zeros(len(points), dtype=np.int64)
+            cols = _mip_sample(mips, uvs, levels)
             factor = getattr(material, "baseColorFactor", None)
             if factor is not None:
                 fa = np.asarray(factor, dtype=np.float32).reshape(-1)
@@ -242,41 +447,67 @@ def surfel_colors(
     return _vertex_colors(geom)[faces].mean(axis=1)
 
 
-def _sample_object(
-    geom: trimesh.Trimesh, base_spacing: float, params: SampleParams
+def _sample_band(
+    mesh: trimesh.Trimesh, spacing: float, opaque: bool, params: SampleParams
 ) -> dict[str, np.ndarray] | None:
-    """Blue-noise sample one placed mesh into surfels. Returns per-surfel arrays
-    (position, normal, color rgba, radius) or None if the mesh is empty. Opacity is
-    forced to 1 unless the material is genuinely BLEND/MASK (honour `alphaMode`, so a
-    stray opaque-texture alpha channel can't punch holes)."""
-    if len(geom.faces) == 0 or geom.area <= 0:
+    """Blue-noise sample one band mesh at one spacing → per-surfel arrays
+    (position, normal, color rgba, radius), or None if nothing sampled. Radii and
+    colour footprints are band-local, so a fine band's small disks average small
+    texture regions and a coarse band's large disks average large ones."""
+    if len(mesh.faces) == 0 or mesh.area <= 0:
         return None
-    spacing = _object_spacing(geom, base_spacing, params.adaptive)
-    budget = int(geom.area / (spacing * spacing) * 2.0) + 8
+    budget = int(mesh.area / (spacing * spacing) * 2.0) + 8
     try:
-        points, face_idx = trimesh.sample.sample_surface_even(geom, budget, radius=spacing)
+        points, face_idx = trimesh.sample.sample_surface_even(mesh, budget, radius=spacing)
     except Exception:
-        points, face_idx = trimesh.sample.sample_surface(geom, budget)
+        points, face_idx = trimesh.sample.sample_surface(mesh, budget)
     points = np.asarray(points, dtype=np.float64)
     face_idx = np.asarray(face_idx)
     if len(points) == 0:
         return None
 
-    normals = np.asarray(geom.face_normals[face_idx], dtype=np.float64)
+    normals = np.asarray(mesh.face_normals[face_idx], dtype=np.float64)
     lens = np.linalg.norm(normals, axis=1, keepdims=True)
     lens[lens == 0] = 1.0
     normals = normals / lens
 
-    colors = surfel_colors(geom, points, face_idx)  # (S,4) in [0,1]
-    if _alpha_mode(geom) not in _TRANSPARENT_ALPHA_MODES:
-        colors[:, 3] = 1.0  # opaque material → ignore any texture alpha channel
+    # Radii first: colors are footprint-averaged over each disk, so the color
+    # lookup needs to know how much surface each surfel covers.
     radius = _surfel_radii(points, spacing, params.radius_frac)
+    colors = surfel_colors(mesh, points, face_idx, radii=radius)  # (S,4) in [0,1]
+    if opaque:
+        colors[:, 3] = 1.0  # opaque material → ignore any texture alpha channel
     return {
         "position": points.astype(np.float32),
         "normal": normals.astype(np.float32),
         "color": colors.astype(np.float32),
         "radius": radius,
     }
+
+
+def _sample_object(
+    geom: trimesh.Trimesh, base_spacing: float, params: SampleParams
+) -> dict[str, np.ndarray] | None:
+    """Sample one placed mesh into surfels across its feature-adaptive spacing
+    bands (`_spacing_bands`): flat regions at the base spacing, crease/boundary
+    neighbourhoods up to `feature_boost`× finer. Returns concatenated per-surfel
+    arrays (position, normal, color rgba, radius) or None if the mesh is empty.
+    Opacity is forced to 1 unless the material is genuinely BLEND/MASK (honour
+    `alphaMode`, so a stray opaque-texture alpha channel can't punch holes)."""
+    if len(geom.faces) == 0 or geom.area <= 0:
+        return None
+    spacing = _object_spacing(geom, base_spacing, params.adaptive)
+    opaque = _alpha_mode(geom) not in _TRANSPARENT_ALPHA_MODES
+    parts: list[dict[str, np.ndarray]] = []
+    for band_mesh, band_spacing in _spacing_bands(geom, spacing, params.feature_boost):
+        band = _sample_band(band_mesh, band_spacing, opaque, params)
+        if band is not None:
+            parts.append(band)
+    if not parts:
+        return None
+    if len(parts) == 1:
+        return parts[0]
+    return {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]}
 
 
 def _orient_and_cull(

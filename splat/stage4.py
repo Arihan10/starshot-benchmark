@@ -1,4 +1,4 @@
-"""Stage 4 — Coverage camera planner (feature-adaptive patches + greedy set-cover).
+"""Stage 4 — Coverage camera planner (density-carried detail + greedy set-cover).
 
 Picks the fewest camera POSITIONS in free space so every visible surface patch is
 seen from ≥ K distinct azimuthal sectors, close enough to meet a feature-adaptive
@@ -8,23 +8,33 @@ occlusion-cull list as a byproduct.
 CONNECTED (Option A): Stage 4 consumes the outputs of the earlier stages and loads
 NO meshes and computes NO occupancy of its own —
   * **Stage 2 free-space grid** (`freespace.npz`): candidate camera positions
-    (reachable free cells with enough clearance) + the fine occupancy the
-    line-of-sight ray-march uses. No re-voxelization.
-  * **Stage 3 surfel cloud** (`cloud.ply`): the patch source. Patches are a
-    feature-adaptive thinning of the surfels, whose normals were already oriented to
-    free space in Stage 3 — so the front-facing test is reliable regardless of the
-    mesh's original winding.
+    (reachable free cells with enough clearance) + the OPAQUE fine occupancy the
+    line-of-sight ray-march uses (glass-classed cells occupy space but pass
+    light, so geometry behind windows is coverable). No re-voxelization.
+  * **Stage 3 surfel cloud** (`cloud.ply`): the patch source. Stage 3 samples at
+    FEATURE-ADAPTIVE density (finer near creases/boundaries/thin members), so
+    the cloud's local density IS the detail field — Stage 4 reads it (each
+    point's local sample spacing) rather than re-detecting detail from cloud
+    statistics, per the measure-once-consume-downstream principle. Normals were
+    already oriented to free space in Stage 3, so the front-facing test is
+    reliable regardless of the mesh's original winding.
 
 Pipeline:
-  1. Read the surfel cloud → points + oriented normals + albedo.
-  2. Feature-adaptive PATCHES: spacing shrinks with local detail (curvature via
-     normal variance, texture via albedo variance); denser where detail is.
+  1. Read the surfel cloud → points + oriented normals.
+  2. PATCHES: a UNIFORM thinning (`patch_fraction`) of the surfels — uniform so
+     the patches inherit Stage 3's adaptive density profile (an adaptive re-thin
+     would apply detail weighting twice). Each patch's feature scale = its local
+     sample spacing (mean 3-NN distance), which drives its view distance.
   3. CANDIDATE positions = reachable free cells (Stage 2) with clearance ≥
-     collision_clearance, subsampled denser where clearance is small.
+     collision_clearance: a uniform ~candidate_spacing lattice PLUS a refined
+     full-resolution tier inside fine patches' near-view shells — the standpoint
+     SUPPLY follows the cloud's density field, so close-up demands are actually
+     satisfiable (engages only where demand outruns the lattice).
   4. COVERAGE: a candidate covers a patch if front-facing, within the patch's
      feature-scaled view distance, and unoccluded (fine-grid ray-march). Cubemaps
      mean orientation isn't a variable, so a covered patch lands on some face.
-  5. GREEDY multicover until every visible patch hits K sectors + a near view.
+  5. GREEDY multicover until every visible patch hits K sectors + a near view +
+     a head-on view (anti-grazing: sectors alone can all be edge-on).
 
 Output: `cameras.json` — a shared cube-face `intrinsics` block (90° FOV, render
 resolution, DERIVED footprint budget), the six `cube_faces`, and the chosen camera
@@ -79,16 +89,19 @@ CUBE_FACES: dict[str, dict[str, list[float]]] = {
 @dataclass(frozen=True)
 class PlanParams:
     """Stage-4 knobs (overview §9). Defaults target a room-scale cell. Occupancy
-    pitch/margin now live in the Stage-2 grid, not here."""
+    pitch/margin live in the Stage-2 grid; DETAIL lives in the Stage-3 cloud's
+    density (patches inherit it via uniform thinning, so there are no detector
+    knobs here any more)."""
 
-    patch_min_spacing: float = 0.06   # s_min (m): finest patch spacing = footprint detail
-    patch_max_spacing: float = 0.30   # s_max (m): flat-region patch spacing
-    curvature_k: float = 14.0         # curvature → spacing sensitivity
-    tex_k: float = 8.0                # texture-gradient → spacing sensitivity
+    patch_fraction: float = 0.5       # uniform fraction of surfels kept as patches
     collision_clearance: float = 0.25  # cameras stay ≥ this from any surface (m)
     angles_per_patch: int = 3         # K: distinct viewing ANGLES (sectors) per patch
     angular_sectors: int = 8          # azimuthal quantization around the patch normal
     near_frac: float = 0.5            # a "near" (detail) view is within near_frac*view_dist
+    # ≥1 view per patch must be HEAD-ON: |incidence cosine| at least this (0.5 =
+    # within 60° of the normal). Azimuth sectors alone can all be satisfied by
+    # grazing views, which supervise silhouettes but never the surface's face.
+    headon_cos: float = 0.5
     min_gain: int = 1                 # stop once the best camera adds < this many
     # Candidate positions are drawn from the NEAR-SURFACE band (reachable cells with
     # clearance in [collision_clearance, view_dist_max] — farther cells see nothing
@@ -106,7 +119,7 @@ class PlanParams:
     min_px_per_patch: float = 20.0
     view_dist_min: float = 0.5        # (m)
     view_dist_max: float = 4.0        # (m)
-    seed: int = 0
+    seed: int = 0                     # reserved (patch selection is deterministic now)
 
     @property
     def focal_px(self) -> float:
@@ -122,12 +135,12 @@ class PlanParams:
 
     def as_summary(self) -> dict[str, Any]:
         return {
-            "patch_min_spacing": self.patch_min_spacing,
-            "patch_max_spacing": self.patch_max_spacing,
+            "patch_fraction": self.patch_fraction,
             "collision_clearance": self.collision_clearance,
             "angles_per_patch": self.angles_per_patch,
             "angular_sectors": self.angular_sectors,
             "near_frac": self.near_frac,
+            "headon_cos": self.headon_cos,
             "candidate_spacing": self.candidate_spacing,
             "max_candidates": self.max_candidates,
             "face_fov_deg": self.face_fov_deg,
@@ -172,70 +185,87 @@ def _read_cloud(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return pos, nrm, col
 
 
-def _feature_spacing(
-    points: np.ndarray, normals: np.ndarray, albedo: np.ndarray, p: PlanParams
-) -> np.ndarray:
-    """Per-point target spacing s(x): small where detail is high. Combines curvature
-    (local normal variance) and texture gradient (local albedo variance); the densest
-    wins. (Triangle-size detail is folded into the surfel density already.)"""
+def _local_spacing(points: np.ndarray) -> np.ndarray:
+    """Per-point local sample spacing (mean distance to the 3 nearest
+    neighbours) — the feature-scale field. Stage 3 samples finer where the mesh
+    has detail, so the cloud's own density carries the detail signal; reading it
+    here replaces the old cloud-statistics detector (curvature/texture variance),
+    which could never see features finer than the sampling it measured."""
     n = len(points)
-    tree = cKDTree(points)
-    k = min(9, n)
-    _, idx = tree.query(points, k=k)
-    neigh_idx = idx[:, 1:] if k > 1 else idx
-    cos = np.clip(np.einsum("nkc,nc->nk", normals[neigh_idx], normals), -1.0, 1.0)
-    curv = 1.0 - cos.mean(axis=1)
-    s_curv = p.patch_max_spacing / (1.0 + p.curvature_k * curv)
-    tex_var = albedo[neigh_idx].std(axis=1).mean(axis=1)
-    s_tex = p.patch_max_spacing / (1.0 + p.tex_k * tex_var)
-    s = np.minimum(s_curv, s_tex)
-    return np.clip(s, p.patch_min_spacing, p.patch_max_spacing).astype(np.float32)
+    if n < 2:
+        return np.full(n, 0.1, dtype=np.float32)
+    k = min(4, n)
+    dist, _ = cKDTree(points).query(points, k=k)
+    return dist[:, 1:].mean(axis=1).astype(np.float32)
 
 
-def _adaptive_patches(
-    points: np.ndarray,
-    normals: np.ndarray,
-    spacing: np.ndarray,
-    s_min: float,
-    rng: np.random.Generator,
-) -> np.ndarray:
-    """Thin the dense surfel set to feature-adaptive density: keep point i with
-    probability (s_min / s_i)^2, so flat regions get sparse patches and detailed
-    regions keep (near-)all of theirs. Returns the kept indices."""
-    keep_p = np.clip((s_min / spacing) ** 2, 0.0, 1.0)
-    keep = rng.random(len(points)) < keep_p
-    return np.nonzero(keep)[0]
+def _candidates(
+    fs: FreeSpace,
+    p: PlanParams,
+    fine_pos: np.ndarray | None = None,
+    fine_shell: np.ndarray | None = None,
+) -> tuple[np.ndarray, int]:
+    """Candidate camera positions in two tiers, returned as `(centers (M,3),
+    refined_count)`:
 
+      * UNIFORM tier — reachable near-surface cells (clearance in
+        [collision_clearance, view_dist_max]) thinned to ~`candidate_spacing`,
+        so the count scales with near-surface area (as before).
+      * REFINED tier — the SUPPLY side of feature-adaptive density: every
+        navigation cell (full grid resolution, no thinning) within each fine
+        patch's near-view shell (`fine_shell` metres around `fine_pos`). Fine
+        patches demand views closer than the uniform lattice reliably provides
+        (its nearest standpoint is ~one spacing away); without this tier they
+        read permanently unsatisfied no matter what the greedy picks. Engages
+        only where demand outruns the lattice — uniform clouds get no refined
+        tier and behave exactly as before.
 
-def _candidates(fs: FreeSpace, p: PlanParams) -> np.ndarray:
-    """Candidate camera positions: reachable NEAR-SURFACE free cells (clearance in
-    [collision_clearance, view_dist_max]) sampled ~`candidate_spacing` apart, so the
-    count scales with the near-surface area rather than a fixed budget. If a scene
-    still exceeds `max_candidates`, evenly downsample (and warn) — never silently
-    fall back to a room-scale cap. Returns (M,3) world points."""
+    Both tiers are cell centres, so the merge dedupes on integer cell coords.
+    `max_candidates` stays a safety ceiling on the merged set (even-downsample
+    + warn)."""
     centers, _ = fs.free_candidates(
         p.collision_clearance, p.view_dist_max, p.candidate_spacing
     )
-    if len(centers) == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    if p.max_candidates and len(centers) > p.max_candidates:
-        step = int(np.ceil(len(centers) / p.max_candidates))
+    tiers = [centers] if len(centers) else []
+    n_refined = 0
+    if fine_pos is not None and len(fine_pos):
+        # Full-resolution near-surface band (bounded: the coarse grid is capped
+        # by Stage 2's max_coarse_cells, and this keeps only the band subset).
+        all_cells, _ = fs.free_candidates(p.collision_clearance, p.view_dist_max)
+        if len(all_cells):
+            d, i = cKDTree(fine_pos).query(all_cells, k=1)
+            shell = np.asarray(fine_shell, dtype=np.float64)[i]
+            refined = all_cells[d <= shell]
+            n_refined = int(len(refined))
+            if n_refined:
+                tiers.append(refined)
+    if not tiers:
+        return np.zeros((0, 3), dtype=np.float32), 0
+    cand = np.concatenate(tiers, axis=0)
+    # Dedupe on the coarse cell lattice (both tiers emit exact cell centres).
+    cell = np.round((cand - fs.origin.astype(np.float32)) / fs.pitch - 0.5).astype(np.int64)
+    _, uniq = np.unique(cell, axis=0, return_index=True)
+    cand = cand[np.sort(uniq)]
+    if p.max_candidates and len(cand) > p.max_candidates:
+        step = int(np.ceil(len(cand) / p.max_candidates))
         logging.warning(
-            "stage4: %d near-surface candidates at spacing %.2fm exceeds the "
-            "max_candidates ceiling %d; even-downsampling by %dx (raise "
-            "max_candidates or candidate_spacing to keep full density)",
-            len(centers), p.candidate_spacing, p.max_candidates, step,
+            "stage4: %d candidates (incl. %d refined) exceeds the max_candidates "
+            "ceiling %d; even-downsampling by %dx (raise max_candidates or "
+            "candidate_spacing to keep full density)",
+            len(cand), n_refined, p.max_candidates, step,
         )
-        centers = centers[::step]
-    return centers
+        cand = cand[::step]
+    return cand, n_refined
 
 
 def _visible(
     cam: np.ndarray, patch_pos: np.ndarray, fs: FreeSpace, n_steps: int
 ) -> np.ndarray:
-    """Line-of-sight from one camera to many patches: True where no solid FINE voxel
-    lies strictly between them. Samples n_steps points along each segment and skips
-    the endpoints (camera cell, patch's own surface cell)."""
+    """Line-of-sight from one camera to many patches: True where no OCCLUDING fine
+    voxel lies strictly between them. Glass-classed cells (window panes, cutout
+    gaps — Stage 2's `occ_lin_glass`) pass light, so surfaces behind glazing are
+    coverable. Samples n_steps points along each segment and skips the endpoints
+    (camera cell, patch's own surface cell)."""
     m = len(patch_pos)
     if m == 0:
         return np.zeros(0, dtype=bool)
@@ -244,7 +274,7 @@ def _visible(
     dist = np.where(dist < 1e-6, 1e-6, dist)
     t = np.linspace(0.0, 1.0, n_steps)  # (K,)
     pts = cam[None, None, :] + t[None, :, None] * d[:, None, :]  # (m,K,3)
-    hit = fs.fine_occupied(pts.reshape(-1, 3)).reshape(m, n_steps)  # (m,K)
+    hit = fs.fine_occluding(pts.reshape(-1, 3)).reshape(m, n_steps)  # (m,K)
     pf = fs.pitch_fine
     tvalid = (t[None, :] > (pf / dist)[:, None]) & (
         t[None, :] < 1.0 - (1.5 * pf / dist)[:, None]
@@ -271,16 +301,20 @@ def _build_coverage(
     patch_pos: np.ndarray,
     patch_nrm: np.ndarray,
     view_dist: np.ndarray,
+    near_req: np.ndarray,
     t1: np.ndarray,
     t2: np.ndarray,
     fs: FreeSpace,
     p: PlanParams,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Covering (candidate, patch) pairs, each tagged with the azimuthal SECTOR the
-    camera views the patch from and whether it's a NEAR (detail-distance) view. A
-    pair exists if the camera is within the patch's view distance from EITHER side
-    (two-sided; winding-agnostic) and unoccluded. Returns COO arrays (cand_idx,
-    patch_idx, sector, is_near)."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Covering (candidate, patch) pairs, each tagged with the azimuthal SECTOR
+    the camera views the patch from, whether it's a NEAR (detail-distance,
+    `near_req`) view, and whether it's HEAD-ON (|incidence cosine| ≥ headon_cos —
+    the anti-grazing signal: K azimuth sectors alone can all be edge-on, which
+    supervises silhouettes but never the face of the surface). A pair exists if
+    the camera is within the patch's view distance from EITHER side (two-sided;
+    winding-agnostic) and unoccluded. Returns COO arrays (cand_idx, patch_idx,
+    sector, is_near, is_head)."""
     tree = cKDTree(patch_pos)
     n_steps = int(np.ceil(p.view_dist_max / fs.pitch_fine)) + 2
     a = p.angular_sectors
@@ -288,6 +322,7 @@ def _build_coverage(
     pp: list[np.ndarray] = []
     sec: list[np.ndarray] = []
     near: list[np.ndarray] = []
+    head: list[np.ndarray] = []
     for ci, cam in enumerate(candidates):
         idx = np.asarray(tree.query_ball_point(cam, p.view_dist_max), dtype=int)
         if len(idx) == 0:
@@ -304,11 +339,11 @@ def _build_coverage(
         # still stops a camera seeing a patch through solid geometry.
         cos = np.abs(np.einsum("mc,mc->m", patch_nrm[idx], d)) / dist
         sel = (cos > 0.1) & (dist <= view_dist[idx])
-        cand, cdist = idx[sel], dist[sel]
+        cand, cdist, ccos = idx[sel], dist[sel], cos[sel]
         if len(cand) == 0:
             continue
         vis = _visible(cam, patch_pos[cand], fs, n_steps)
-        hit, hdist = cand[vis], cdist[vis]
+        hit, hdist, hcos = cand[vis], cdist[vis], ccos[vis]
         if len(hit) == 0:
             continue
         vd = (cam - patch_pos[hit]) / hdist[:, None]
@@ -319,15 +354,18 @@ def _build_coverage(
         cc.append(np.full(len(hit), ci, dtype=np.int64))
         pp.append(hit.astype(np.int64))
         sec.append(sector)
-        near.append(hdist <= p.near_frac * view_dist[hit])
+        near.append(hdist <= near_req[hit])
+        head.append(hcos >= p.headon_cos)
     if not cc:
         e = np.zeros(0, dtype=np.int64)
-        return e, e, e, np.zeros(0, dtype=bool)
+        b = np.zeros(0, dtype=bool)
+        return e, e, e, b, b.copy()
     return (
         np.concatenate(cc),
         np.concatenate(pp),
         np.concatenate(sec),
         np.concatenate(near),
+        np.concatenate(head),
     )
 
 
@@ -336,17 +374,20 @@ def _greedy_angular(
     pp: np.ndarray,
     sector: np.ndarray,
     is_near: np.ndarray,
+    is_head: np.ndarray,
     n_cand: int,
     n_patch: int,
     k: int,
     min_gain: int,
     a: int,
-) -> tuple[list[int], np.ndarray, np.ndarray]:
-    """Greedy coverage where a patch is satisfied by ≥ k DISTINCT azimuthal sectors
-    AND ≥ 1 near view. Each step takes the camera advancing the most patches; stops
-    below `min_gain`. Returns (chosen candidate indices, sector bitmask, has-near)."""
+) -> tuple[list[int], np.ndarray, np.ndarray, np.ndarray]:
+    """Greedy coverage where a patch is satisfied by ≥ k DISTINCT azimuthal
+    sectors AND ≥ 1 near view AND ≥ 1 head-on view. Each step takes the camera
+    advancing the most patches; stops below `min_gain`. Returns (chosen
+    candidate indices, sector bitmask, has-near, has-headon)."""
     angmask = np.zeros(n_patch, dtype=np.int64)
     hasnear = np.zeros(n_patch, dtype=bool)
+    hashead = np.zeros(n_patch, dtype=bool)
     lut = np.array([bin(i).count("1") for i in range(1 << a)], dtype=np.int16)
     pair_bit = np.int64(1) << sector
     taken = np.zeros(n_cand, dtype=bool)
@@ -356,7 +397,8 @@ def _greedy_angular(
         new_sector = (angmask[pp] & pair_bit) == 0
         ang_contrib = new_sector & (pop < k)
         near_contrib = is_near & (~hasnear[pp])
-        contrib = ang_contrib | near_contrib
+        head_contrib = is_head & (~hashead[pp])
+        contrib = ang_contrib | near_contrib | head_contrib
         if not contrib.any():
             break
         gain = np.bincount(cc, weights=contrib.astype(np.float64), minlength=n_cand)
@@ -371,7 +413,10 @@ def _greedy_angular(
         near_hits = pp[m][is_near[m]]
         if len(near_hits):
             hasnear[near_hits] = True
-    return chosen, angmask, hasnear
+        head_hits = pp[m][is_head[m]]
+        if len(head_hits):
+            hashead[head_hits] = True
+    return chosen, angmask, hasnear, hashead
 
 
 def _face_of(dirs: np.ndarray) -> np.ndarray:
@@ -401,20 +446,25 @@ def plan_cameras(
         raise FileNotFoundError(f"free-space grid not found: {freespace_path} (run Stage 2)")
     if not Path(surfels_path).is_file():
         raise FileNotFoundError(f"surfel cloud not found: {surfels_path} (run Stage 3)")
-    rng = np.random.default_rng(params.seed)
 
     if progress is not None:
         progress(0, 3, "load")
     fs = load_free_space(Path(freespace_path))
-    points, normals, albedo = _read_cloud(Path(surfels_path))
+    points, normals, _albedo = _read_cloud(Path(surfels_path))
     lo = points.min(axis=0)
     hi = points.max(axis=0)
 
-    # Feature-adaptive patches (curvature + texture gradient) from the surfels.
+    # Patches: UNIFORM thinning of the cloud, deterministic (every stride-th
+    # surfel). Stage 3's density is already feature-adaptive, so the patches
+    # inherit its profile — an adaptive re-thin here would weight detail twice.
+    # Each patch's feature scale is its LOCAL SAMPLE SPACING (measured on the
+    # full cloud, before thinning), which drives the footprint view distance:
+    # fine-band patches demand close cameras, flat-band patches allow far ones.
     if progress is not None:
         progress(1, 3, "patches")
-    spacing = _feature_spacing(points, normals, albedo, params)
-    keep = _adaptive_patches(points, normals, spacing, params.patch_min_spacing, rng)
+    spacing = _local_spacing(points)
+    stride = max(1, int(round(1.0 / min(max(params.patch_fraction, 1e-3), 1.0))))
+    keep = np.arange(0, len(points), stride)
     patch_pos = points[keep].astype(np.float32)
     patch_nrm = normals[keep].astype(np.float32)
     patch_feat = spacing[keep]
@@ -422,29 +472,46 @@ def plan_cameras(
     view_dist = np.clip(
         params.footprint_k * patch_feat, params.view_dist_min, params.view_dist_max
     ).astype(np.float32)
+    # A "near" view can never be REQUIRED closer than cameras can physically
+    # get: collision clearance plus one navigation cell of discretization.
+    # Without this floor, fine-band patches (feature scale a few cm →
+    # near_frac·view_dist below the clearance) would demand views no candidate
+    # can provide and read as permanently unsatisfied.
+    near_floor = params.collision_clearance + fs.pitch
+    near_req = np.maximum(params.near_frac * view_dist, near_floor).astype(np.float32)
 
-    # Candidate camera positions from the reachable near-surface band (no re-voxelization).
-    candidates = _candidates(fs, params)
+    # Candidate camera positions from the reachable near-surface band (no
+    # re-voxelization). FINE patches — those whose near-view requirement is
+    # tighter than the uniform lattice reliably supplies (nearest standpoint ~one
+    # candidate_spacing away) — get a REFINED full-resolution tier inside their
+    # near shells, so the standpoint supply follows Stage 3's density field.
+    fine = near_req < 1.5 * params.candidate_spacing
+    candidates, n_refined = _candidates(
+        fs, params,
+        fine_pos=patch_pos[fine],
+        fine_shell=near_req[fine] + fs.pitch,
+    )
     if len(candidates) == 0:
         raise RuntimeError("no candidate camera positions (reachable free space empty)")
 
-    # Coverage (per-pair sector + near) + angular greedy.
+    # Coverage (per-pair sector + near + head-on) + angular greedy.
     if progress is not None:
         progress(2, 3, "coverage")
     n_patch = len(patch_pos)
     k = params.angles_per_patch
     a = params.angular_sectors
-    cc, pp, sector, is_near = _build_coverage(
-        candidates, patch_pos, patch_nrm, view_dist, t1, t2, fs, params
+    cc, pp, sector, is_near, is_head = _build_coverage(
+        candidates, patch_pos, patch_nrm, view_dist, near_req, t1, t2, fs, params
     )
-    chosen, angmask, hasnear = _greedy_angular(
-        cc, pp, sector, is_near, len(candidates), n_patch, k, params.min_gain, a
+    chosen, angmask, hasnear, hashead = _greedy_angular(
+        cc, pp, sector, is_near, is_head, len(candidates), n_patch, k, params.min_gain, a
     )
 
-    # Per-patch stats: distinct angles seen, and satisfaction (≥K angles + near view).
+    # Per-patch stats: distinct angles seen, and satisfaction (≥K angles + near
+    # view + head-on view).
     lut = np.array([bin(i).count("1") for i in range(1 << a)], dtype=np.int16)
     sectors_seen = lut[angmask].astype(np.int32)
-    satisfied_mask = (sectors_seen >= k) & hasnear
+    satisfied_mask = (sectors_seen >= k) & hasnear & hashead
     seen_any = np.zeros(n_patch, dtype=bool)
     if len(pp):
         seen_any[np.unique(pp)] = True
@@ -516,6 +583,7 @@ def plan_cameras(
         "model": model,
         "patches": n_patch,
         "candidates": int(len(candidates)),
+        "candidates_refined": int(n_refined),
         "cameras": len(cameras),
         "angles_per_patch": k,
         "angular_sectors": a,
@@ -524,6 +592,8 @@ def plan_cameras(
             "satisfied_pct": round(100.0 * satisfied / max(n_patch, 1), 1),
             "seen_at_least_once": seen_once,
             "occlusion_culled": occluded,
+            "has_near": int(hasnear.sum()),
+            "has_headon": int(hashead.sum()),
             "mean_angles_seen": (
                 round(float(sectors_seen[seen_any].mean()), 2) if seen_once else 0.0
             ),

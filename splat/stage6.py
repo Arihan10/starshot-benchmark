@@ -22,18 +22,21 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
       feeds the strategy's scene-scale-normalized grow/prune thresholds).
   * Poses: `transform_matrix` is OpenCV camera-to-world → `viewmats = inv(c2w)`.
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
-  * Depth: planar camera-space Z (metres) → gsplat `render_mode="RGB+ED"`
-    expected depth; alpha-gated L1 against the reference depth.
+  * Depth: alpha-weighted EXPECTED planar camera-space Z (metres) — Stage 5
+    composites depth-peeled layers with the same statistic gsplat
+    `render_mode="RGB+ED"` renders (plain surface Z wherever the nearest hit
+    is opaque); alpha-gated L1 against the reference depth.
   * Colour: sRGB albedo compared directly (no sRGB↔linear); SH degree a config
     flag (0 = unlit, the decided default), raisable later for shiny surfaces.
 
 LOSSES (per view):
-  * photometric — alpha-weighted L1 + D-SSIM on RGB vs the unlit reference (both
-    on the same black background; the alpha weight makes glass, which reads as
-    straight albedo in the reference but renders premultiplied, defer to the
-    alpha loss rather than being forced opaque);
-  * alpha (mask) — L1(render α, reference α): exact nvdiffrast masks make empty
-    space stay empty and glass stay see-through;
+  * photometric — alpha-weighted L1 + D-SSIM on RGB vs the unlit reference,
+    both premultiplied over the same black background (Stage 5 depth-peels and
+    over-composites its layers, so glass pixels compare like with like);
+  * alpha (mask) — L1(render α, reference α): the reference α is ACCUMULATED
+    coverage (glass-over-wall ≈ 1, glass-over-void ≈ pane alpha), so empty
+    space stays empty and geometry behind glazing is no longer pushed
+    transparent;
   * depth — alpha-gated L1 (the strongest floater suppressor);
   * 2DGS regularizers — normal consistency (render normals vs normals-from-depth)
     and optional depth distortion.

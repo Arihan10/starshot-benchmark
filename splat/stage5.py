@@ -1,13 +1,30 @@
-"""Stage 5 — Reference renders (UNLIT) via nvdiffrast.
+"""Stage 5 — Reference renders (UNLIT) via nvdiffrast, COMPOSITED through glass.
 
 Renders the composed mesh scene from the Stage-4 camera plan into the per-view
-supervision the Stage-6 gsplat fine-tune trains against:
+supervision the Stage-6 gsplat fine-tune trains against. Surfaces are DEPTH-
+PEELED (nvdiffrast `DepthPeeler`, up to `peel_layers` nearest layers per pixel)
+and alpha-composited front-to-back, exactly how the splat renderer blends — so
+a window pixel shows the room behind the pane, not the bare pane:
 
-  * **RGB** — unlit albedo (the base-color texel per fragment; no lighting).
-  * **depth** — planar camera-space Z, in metres (matches gsplat's `D`/`ED`
-    "projection depth"), of the nearest opaque surface.
-  * **alpha** — coverage in [0,1] (1 = opaque hit, 0 = empty), times the
-    base-color alpha so glass reads as low-alpha for the alpha-gated depth loss.
+  * **RGB** — unlit albedo, "over"-composited: Σ cᵢ·αᵢ·Πⱼ<ᵢ(1−αⱼ), plus the
+    background under the remaining transmittance.
+  * **depth** — alpha-weighted EXPECTED planar camera-space Z in metres —
+    the same statistic gsplat's `render_mode="RGB+ED"` renders, so the depth
+    loss compares like with like. For an opaque nearest surface this reduces
+    to its plain Z (the old value); 0 where nothing is hit.
+  * **alpha** — ACCUMULATED coverage 1−Π(1−αᵢ): glass-over-wall reads ~1 (the
+    wall is still there), glass-over-void reads the pane's own alpha.
+
+WHY compositing matters (the glass fix, paired with Stage 2's `occ_lin_glass` +
+Stage 4's see-through-glass planning): single-layer references claimed
+α = 0.065 and pure-pane RGB for every window pixel, while a correct splat
+renders pane-over-room with α ≈ 1 — so the Stage-6 alpha loss actively pushed
+everything behind windows transparent. Composited references make the alpha /
+photometric / depth losses consistent with what a correct splat produces.
+Per glTF, OPAQUE materials ignore their texture's alpha channel entirely
+(forced to 1 here, matching Stages 2/3); MASK binarizes at its cutoff; only
+BLEND composites fractionally. All-opaque scenes terminate after one extra
+(empty) peel pass, so they pay ~nothing.
 
 Plus a `transforms.json` recording, per rendered face, the exact camera-to-world
 pose + shared pinhole intrinsics, all in **gsplat's native OpenCV convention**
@@ -72,10 +89,17 @@ _MID_GREY = np.array([0.6, 0.6, 0.6, 1.0], dtype=np.float32)
 class RenderParams:
     """Stage-5 knobs. Intrinsics (resolution, FOV, near/far) are READ from the
     Stage-4 `cameras.json` `intrinsics` block so the renders match the plan; only
-    the render-side options live here."""
+    the render-side options live here.
+
+    `peel_layers` caps the depth-peeling passes per view. Peeling stops early
+    once every covered pixel is opacity-saturated — an all-opaque view exits
+    after the second (empty) pass — so the cap only bites on stacks of many
+    BLEND surfaces (each pane multiplies transmittance by ~0.935; truncation
+    error after 8 layers is negligible)."""
 
     background: tuple[float, float, float] = (0.0, 0.0, 0.0)  # empty-pixel RGB
     mask_alpha_cutoff: float = 0.5   # alphaMode=MASK: texel alpha below this → empty
+    peel_layers: int = 8             # max composited depth layers per pixel
     save_alpha: bool = True
     save_depth: bool = True
 
@@ -83,6 +107,7 @@ class RenderParams:
         return {
             "background": list(self.background),
             "mask_alpha_cutoff": self.mask_alpha_cutoff,
+            "peel_layers": self.peel_layers,
         }
 
 
@@ -189,7 +214,10 @@ def write_transforms(
     doc = {
         "camera_model": "pinhole",
         "convention": "opencv_c2w",     # transform_matrix is OpenCV camera-to-world
-        "depth": "planar_z_metric",     # gsplat render_mode D/ED
+        # Alpha-weighted expected planar Z over the composited layers (metres) —
+        # the statistic gsplat's render_mode="RGB+ED" produces; plain surface Z
+        # wherever the nearest hit is opaque.
+        "depth": "planar_z_expected_metric",
         "color_space": "srgb",
         "w": resolution,
         "h": resolution,
@@ -399,9 +427,23 @@ def _visible_tris(torch, scene, keep):  # noqa: ANN001
     return torch.cat(tri_parts), torch.cat(mat_parts)
 
 
+# A pixel counts as opacity-saturated (deeper layers invisible) once its
+# remaining transmittance drops below this; also the floor for the expected-
+# depth normalization so empty pixels stay exactly 0.
+_SATURATION_EPS = 1e-4
+
+
 def _render_view(torch, dr, glctx, scene, c2w, proj_np, resolution, params):  # noqa: ANN001
     """Render one pinhole view → (rgb [H,W,3], depth [H,W], alpha [H,W]) as numpy,
     already flipped to top-down (row 0 = top) to match gsplat / normal images.
+
+    DEPTH-PEELED COMPOSITING: layers are rasterized nearest-first (nvdiffrast
+    `DepthPeeler`; each pass reports the next surface behind the previous one)
+    and blended front-to-back with the standard "over" operator — per layer i,
+    weight w = (remaining transmittance)·αᵢ; rgb += w·cᵢ; alpha += w; the
+    depth accumulator += w·zᵢ is normalized to EXPECTED depth at the end
+    (gsplat "ED"). Peeling stops as soon as no covered pixel has transmittance
+    left, so all-opaque views do exactly one real pass + one empty one.
 
     Objects whose world AABB is fully outside the view frustum are culled before
     rasterizing — exact for an unlit rasterizer (off-screen geometry can't affect a
@@ -431,32 +473,64 @@ def _render_view(torch, dr, glctx, scene, c2w, proj_np, resolution, params):  # 
     v_cam = scene.verts_h @ w2c.T                   # [V,4]; column 2 = planar Z
     cam_z = v_cam[:, 2:3].contiguous()              # planar depth attribute (metres)
     pos_clip = (v_cam @ proj.T).contiguous()        # [V,4] clip space
-    rast, _ = dr.rasterize(glctx, pos_clip[None], tris, (resolution, resolution))
-    tri_id = rast[..., 3].long()                    # [1,H,W]; 0 = empty, else idx+1
-    covered = tri_id > 0
 
-    # Per-pixel planar depth (perspective-correct interpolation of camera-space Z).
-    depth, _ = dr.interpolate(cam_z[None], rast, tris)               # [1,H,W,1]
-    # Per-pixel UV; flip V because glTF v=0 is the texture TOP but nvdiffrast t=0 is
-    # the BOTTOM (see module docstring / smoke test).
-    uv, _ = dr.interpolate(scene.uv[None], rast, tris)               # [1,H,W,2]
-    uv = torch.cat([uv[..., 0:1], 1.0 - uv[..., 1:2]], dim=-1).contiguous()
-
-    # Per-pixel material id (gather via triangle id into the VISIBLE subset's
-    # tri_mat), then composite each material present in this view.
-    mat_pix = torch.where(covered, tri_mat[(tri_id - 1).clamp(min=0)], tri_id.new_full(tri_id.shape, -1))
-    bg = torch.tensor(params.background, dtype=torch.float32, device="cuda")
-    rgb = bg.expand(1, resolution, resolution, 3).clone()
+    rgb = torch.zeros((1, resolution, resolution, 3), dtype=torch.float32, device="cuda")
     alpha = torch.zeros((1, resolution, resolution, 1), dtype=torch.float32, device="cuda")
-    for m in torch.unique(mat_pix[covered]).tolist():
-        sel = (mat_pix == m)[..., None]                              # [1,H,W,1]
-        col = dr.texture(scene.textures[m], uv, filter_mode="linear", boundary_mode="wrap")
-        a = col[..., 3:4]
-        if scene.alpha_modes[m] == "MASK":
-            a = (a >= params.mask_alpha_cutoff).float()
-        rgb = torch.where(sel, col[..., :3], rgb)
-        alpha = torch.where(sel, a, alpha)
-    depth = torch.where(covered[..., None], depth, torch.zeros_like(depth))
+    depth_acc = torch.zeros_like(alpha)             # Σ w·z, normalized at the end
+    with dr.DepthPeeler(glctx, pos_clip[None], tris, (resolution, resolution)) as peeler:
+        for _layer in range(max(1, params.peel_layers)):
+            rast, _ = peeler.rasterize_next_layer()
+            tri_id = rast[..., 3].long()            # [1,H,W]; 0 = empty, else idx+1
+            covered = tri_id > 0
+            trans = 1.0 - alpha                     # transmittance BEFORE this layer
+            active = covered & (trans[..., 0] > _SATURATION_EPS)  # [1,H,W]
+            if not active.any():                    # no geometry left, or all saturated
+                break
+
+            # Per-pixel planar depth (perspective-correct camera-space Z) + UV;
+            # flip V because glTF v=0 is the texture TOP but nvdiffrast t=0 is
+            # the BOTTOM (see module docstring / smoke test).
+            layer_z, _ = dr.interpolate(cam_z[None], rast, tris)     # [1,H,W,1]
+            uv, _ = dr.interpolate(scene.uv[None], rast, tris)       # [1,H,W,2]
+            uv = torch.cat([uv[..., 0:1], 1.0 - uv[..., 1:2]], dim=-1).contiguous()
+
+            # Per-pixel material id (gather via triangle id into the VISIBLE
+            # subset's tri_mat), then shade each material present in this layer.
+            mat_pix = torch.where(
+                covered, tri_mat[(tri_id - 1).clamp(min=0)], tri_id.new_full(tri_id.shape, -1)
+            )
+            layer_rgb = torch.zeros_like(rgb)
+            layer_a = torch.zeros_like(alpha)
+            for m in torch.unique(mat_pix[active]).tolist():
+                sel = ((mat_pix == m) & active)[..., None]           # [1,H,W,1]
+                col = dr.texture(
+                    scene.textures[m], uv, filter_mode="linear", boundary_mode="wrap"
+                )
+                a = col[..., 3:4]
+                mode = scene.alpha_modes[m]
+                if mode == "MASK":
+                    a = (a >= params.mask_alpha_cutoff).float()
+                elif mode != "BLEND":
+                    a = torch.ones_like(a)  # glTF OPAQUE ignores texture alpha
+                layer_rgb = torch.where(sel, col[..., :3], layer_rgb)
+                layer_a = torch.where(sel, a, layer_a)
+
+            # Front-to-back "over": this layer contributes what still gets through.
+            w = trans * layer_a                     # layer_a is 0 off-active pixels
+            rgb = rgb + w * layer_rgb
+            depth_acc = depth_acc + w * layer_z
+            alpha = alpha + w
+
+    # Expected depth (Σ w·z / Σ w); exact surface Z wherever the first hit is
+    # opaque. Background under the remaining transmittance, matching how the
+    # splat premultiplies over the (black) training background.
+    depth = torch.where(
+        alpha > _SATURATION_EPS,
+        depth_acc / alpha.clamp(min=_SATURATION_EPS),
+        torch.zeros_like(depth_acc),
+    )
+    bg = torch.tensor(params.background, dtype=torch.float32, device="cuda")
+    rgb = rgb + (1.0 - alpha) * bg
 
     # nvdiffrast frame memory is bottom-up → flip vertically for top-down images.
     def _top_down(t):  # noqa: ANN001
@@ -482,12 +556,17 @@ def render_references(
     Requires a CUDA GPU + nvdiffrast (raises a clear error otherwise). Returns a
     compact summary.
 
-    Smoke tests to run once on the GPU box (they validate the two convention flips
-    that can't be checked without a device):
+    Smoke tests to run once on the GPU box (they validate the convention flips +
+    the peeling path, none of which can be checked without a device):
       1. Pose round-trip — feed a frame's c2w + K into gsplat on the Stage-2 cloud;
          the splat render must align pixel-for-pixel with the reference RGB.
       2. Depth — the rendered planar Z of a known box equals the measured
          perpendicular distance (not the ray distance).
+      3. Glass compositing — a BLEND pane (alpha a) at z1 in front of an opaque
+         wall at z2 must produce rgb = a·pane + (1−a)·wall, alpha = 1, and
+         depth = a·z1 + (1−a)·z2 (expected depth); with no wall behind it,
+         alpha = a and rgb = a·pane + (1−a)·background. An all-opaque view must
+         match the pre-peeling output exactly.
     """
     torch, dr = _require_cuda_renderer()
     from PIL import Image
