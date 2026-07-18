@@ -29,15 +29,16 @@ CLIENT_DIR = REPO_ROOT / "client"
 
 SERVER_HOST = "127.0.0.1"
 
-# The API server runs the Stage-5 nvdiffrast renderer IN-PROCESS (see
-# server/app/api/routes.py) when the client hits the "render references" button, so
-# its interpreter must have torch + nvdiffrast + CUDA. The server's own `uv` env can
-# be a Python version that has no torch wheels (e.g. 3.14), so prefer a dedicated
-# Python 3.12 CUDA env (`.venv-splat` at the repo root) when it exists, falling back
-# to `uv run` (the server's own env) otherwise. `STARSHOT_SPLAT_PYTHON` overrides the
-# interpreter path.
+# The API server spawns Stage-6 training (`sys.executable -m splat.stage6`, see
+# server/app/api/routes.py) with ITS OWN interpreter, so that interpreter must
+# have torch + gsplat + CUDA. (Stage 5 no longer needs any of this — it renders
+# through the WebGL capture page.) The server's own `uv` env can be a Python
+# version that has no torch wheels (e.g. 3.14), so prefer a dedicated Python 3.12
+# CUDA env (`.venv-splat` at the repo root) when it exists, falling back to
+# `uv run` (the server's own env) otherwise. `STARSHOT_SPLAT_PYTHON` overrides
+# the interpreter path.
 #
-# CUDA_HOME lets nvdiffrast locate `nvcc` for its one-time kernel build; we
+# CUDA_HOME lets the CUDA extensions locate `nvcc` for one-time kernel builds; we
 # deliberately do NOT prepend the toolkit's `bin` to PATH — its CUDA runtime DLLs
 # would shadow torch's bundled ones and break torch.linalg (cusolver). Override the
 # toolkit location with `STARSHOT_CUDA_HOME`.
@@ -65,11 +66,12 @@ def _child_env() -> dict[str, str]:
 def _server_command(server_port: int) -> tuple[list[str], dict[str, str], str]:
     """(argv, extra_env, label) to launch the API server.
 
-    Prefers the Python 3.12 CUDA env (`.venv-splat`) so the in-process Stage-5
-    nvdiffrast renderer can `import torch`; falls back to `uv run` (the server's own
-    env) when that venv is absent. Launching the CUDA env's python DIRECTLY — not via
-    `uv run` — is deliberate: `uv run` re-syncs the server env from its
-    pyproject/lock and would uninstall torch/nvdiffrast (they aren't declared there).
+    Prefers the Python 3.12 CUDA env (`.venv-splat`) so the Stage-6 trainer the
+    server spawns with its own interpreter can `import torch`/gsplat; falls back to
+    `uv run` (the server's own env) when that venv is absent. Launching the CUDA
+    env's python DIRECTLY — not via `uv run` — is deliberate: `uv run` re-syncs the
+    server env from its pyproject/lock and would uninstall torch/gsplat (they
+    aren't declared there).
     """
     uvicorn_args = [
         "-m", "uvicorn", "app.main:app",
@@ -258,7 +260,16 @@ def main() -> int:
     server = subprocess.Popen(
         server_cmd,
         cwd=SERVER_DIR,
-        env={**env, "STARSHOT_RUNS_DIR": str(runs_dir), **server_extra_env},
+        env={
+            **env,
+            "STARSHOT_RUNS_DIR": str(runs_dir),
+            # Both ports are ephemeral (picked above), so tell the server its own
+            # public origin AND the client's — the Stage-5 capture job mints the
+            # worker-page URL (client origin) that POSTs frames back (API origin).
+            "STARSHOT_API_ORIGIN": server_url,
+            "STARSHOT_CLIENT_ORIGIN": client_url,
+            **server_extra_env,
+        },
         process_group=0,
     )
 

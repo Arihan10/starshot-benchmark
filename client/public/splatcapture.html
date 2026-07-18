@@ -1,0 +1,52 @@
+<!doctype html>
+<!-- Stage-5 reference-capture worker (splat pipeline). Loaded headless by the
+     server (server/app/services/refcapture.py) with the job in the query
+     string, or manually in any browser as a fallback when headless GPU is
+     unavailable. All logic lives in js/splatcapture.js; this shell only
+     provides the importmap (same three.js the debug viewer uses) + a status
+     readout. Append &selftest=1 to run the render-convention self-test
+     instead of a capture job. -->
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>starshot · splat capture</title>
+        <style>
+            body {
+                margin: 0;
+                background: #101114;
+                color: #e6e6e6;
+                font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+            }
+            #status {
+                padding: 12px 14px;
+                white-space: pre-wrap;
+            }
+            #status .err {
+                color: #ff8080;
+            }
+            #status .ok {
+                color: #8bd17c;
+            }
+            canvas {
+                width: 256px;
+                height: 256px;
+                display: block;
+                margin: 0 14px;
+                border: 1px solid #2a2d35;
+            }
+        </style>
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "/vendor/three/build/three.module.js",
+                    "three/addons/": "/vendor/three/examples/jsm/"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <div id="status">splat capture: starting…</div>
+        <script type="module" src="/js/splatcapture.js"></script>
+    </body>
+</html>

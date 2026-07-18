@@ -33,12 +33,17 @@
  * reads them today). `--texture-format webp` falls back to plain WebP, which the
  * current viewer already renders but which decodes to full RGBA8 in VRAM.
  *
- * Two presets pick the tuning knobs (both run the identical transform chain):
+ * Three presets pick the tuning knobs (all run the identical transform chain):
  *   optimized  web-streaming tier — aggressive decimation + small ETC1S maps.
  *              Tiny, but visibly degraded. -> assets-optimized/  (default)
  *   lite       presentation tier (ported from the Unity replay) — near-lossless,
  *              error-bounded geometry + high-res UASTC. Visually identical to the
  *              raw asset at ~5x smaller / ~10x less texture VRAM. -> assets-lite/
+ *   splat      splat-pipeline render/sample tier — optimized-grade geometry (the
+ *              error bound does the visually-safe decimation) with lite-grade
+ *              1024px base-color maps, ETC1S so they stay GPU-compressed in VRAM,
+ *              and every non-base-color map STRIPPED (the splat pipeline is
+ *              unlit: albedo + alpha is all it reads). -> assets-splat/
  * Explicit flags (--target-tris, --texture-size, --uastc/--no-uastc, ...)
  * override the chosen preset.
  *
@@ -79,9 +84,10 @@ const DEFAULT_INPUT = path.resolve(HERE, "../../app/assets_library/assets");
 const OUTPUT_DIRS = {
   optimized: path.resolve(HERE, "../../app/assets_library/assets-optimized"),
   lite: path.resolve(HERE, "../../app/assets_library/assets-lite"),
+  splat: path.resolve(HERE, "../../app/assets_library/assets-splat"),
 };
 
-// Named tuning presets. Both run the IDENTICAL transform chain (weld ->
+// Named tuning presets. All run the IDENTICAL transform chain (weld ->
 // simplify -> prune -> resize + KTX2 -> meshopt); only these knobs differ.
 //   optimized  web-streaming tier: aggressive decimation + small ETC1S maps.
 //              Tiny on disk, but visibly degraded (the original default).
@@ -91,9 +97,18 @@ const OUTPUT_DIRS = {
 //              ~10x lighter in texture VRAM. `targetTris` is a high ceiling —
 //              `error` does the (visually safe) decimation, since Trellis
 //              massively over-tessellates flat regions.
+//   splat      splat-pipeline render/sample tier (see splat/overview.md §5):
+//              geometry decimated like `optimized` (in practice the error bound,
+//              not the ceiling, is what stops the simplifier on Trellis meshes)
+//              but with full-res 1024px base color kept, encoded ETC1S so a whole
+//              scene's textures stay GPU-compressed (~0.5-1 B/texel in VRAM vs 16
+//              for decoded float RGBA). stripMaps drops normal/MR/emissive/
+//              occlusion up front — the splat pipeline is unlit and reads only
+//              base color + alpha, so they'd waste encode time, disk, and VRAM.
 const PRESETS = {
   optimized: { targetTris: 15000, error: 0.01, textureSize: 256, uastc: false },
   lite: { targetTris: 150000, error: 0.005, textureSize: 1024, uastc: true },
+  splat: { targetTris: 60000, error: 0.01, textureSize: 1024, uastc: false, stripMaps: true },
 };
 
 function parseArgs(argv) {
@@ -126,6 +141,8 @@ function parseArgs(argv) {
       case "--texture-format": opts.textureFormat = next(); break;
       case "--uastc": override.uastc = true; break;
       case "--no-uastc": override.uastc = false; break;
+      case "--strip-maps": override.stripMaps = true; break;
+      case "--no-strip-maps": override.stripMaps = false; break;
       case "--concurrency": opts.concurrency = Math.max(1, Number(next())); break;
       case "--limit": opts.limit = Number(next()); break;
       case "--force": opts.force = true; break;
@@ -144,6 +161,7 @@ function parseArgs(argv) {
   opts.error = override.error ?? preset.error;
   opts.textureSize = override.textureSize ?? preset.textureSize;
   opts.uastc = override.uastc ?? preset.uastc;
+  opts.stripMaps = override.stripMaps ?? preset.stripMaps ?? false;
   if (!opts.output) opts.output = OUTPUT_DIRS[opts.preset] ?? OUTPUT_DIRS.optimized;
   if (opts.textureFormat !== "ktx2" && opts.textureFormat !== "webp") {
     throw new Error(`--texture-format must be 'ktx2' or 'webp', got: ${opts.textureFormat}`);
@@ -197,6 +215,18 @@ async function optimizeFile(io, inPath, outPath, opts) {
   document.setLogger(QUIET_LOGGER);
   const srcTris = triangleCount(document);
   const ratio = Math.min(1, opts.targetTris / Math.max(1, srcTris));
+
+  // Unlit tiers (preset splat) keep only base color + alpha: detach the other
+  // PBR maps up front so the prune() below drops their textures before the
+  // (expensive) resize + KTX2 encode ever sees them.
+  if (opts.stripMaps) {
+    for (const material of document.getRoot().listMaterials()) {
+      material.setNormalTexture(null);
+      material.setMetallicRoughnessTexture(null);
+      material.setEmissiveTexture(null);
+      material.setOcclusionTexture(null);
+    }
+  }
 
   await document.transform(
     dedup(),

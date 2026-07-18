@@ -22,24 +22,26 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
       feeds the strategy's scene-scale-normalized grow/prune thresholds).
   * Poses: `transform_matrix` is OpenCV camera-to-world → `viewmats = inv(c2w)`.
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
-  * Depth: alpha-weighted EXPECTED planar camera-space Z (metres) — Stage 5
-    composites depth-peeled layers with the same statistic gsplat
-    `render_mode="RGB+ED"` renders (plain surface Z wherever the nearest hit is
-    opaque) — decoded from Stage 5's log-uint16 depth PNG via the shared
-    [near, far] (legacy float32 `.npy` renders still read as-is); alpha-gated L1
-    against it.
+  * Depth: planar camera-space Z (metres), decoded from the SZF frame's log-uint16
+    codes via the shared [near, far] (legacy 16-bit PNG / float32 `.npy` sets still
+    read as-is). The loss compares the reference against the splat's MEDIAN depth
+    (`depth_mode="median"`, the transmittance-0.5 crossing) — the same "nearest
+    depth-WRITING surface" statistic Stage 5 stores, which BLEND glass (α ≈ 0.065)
+    never shifts; expected (ED) depth would mix the pane into every window pixel
+    and steadily push glass opacity toward zero.
   * Colour: sRGB albedo compared directly (no sRGB↔linear); SH degree a config
     flag (0 = unlit, the decided default), raisable later for shiny surfaces.
 
 LOSSES (per view):
-  * photometric — alpha-weighted L1 + D-SSIM on RGB vs the unlit reference,
-    both premultiplied over the same black background (Stage 5 depth-peels and
-    over-composites its layers, so glass pixels compare like with like);
-  * alpha (mask) — L1(render α, reference α): the reference α is ACCUMULATED
-    coverage (glass-over-wall ≈ 1, glass-over-void ≈ pane alpha), so empty
-    space stays empty and geometry behind glazing is no longer pushed
-    transparent;
-  * depth — alpha-gated L1 (the strongest floater suppressor);
+  * photometric — full-frame L1 + D-SSIM on RGB vs the unlit reference. Both
+    sides are premultiplied-over-black (the reference alpha-blends over a black
+    clear colour; gsplat composites with no background), so glass/MASK pixels
+    compare like-with-like and background pixels directly penalize floater
+    energy;
+  * alpha (mask) — L1(render α, reference α): the renderer's exact coverage
+    masks make empty space stay empty and glass stay see-through;
+  * depth — alpha-gated L1 on the median depth (floater suppression that cannot
+    fade glass);
   * 2DGS regularizers — normal consistency (render normals vs normals-from-depth)
     and optional depth distortion.
 
@@ -67,7 +69,12 @@ from typing import Any
 
 import numpy as np
 
-from splat.stage5 import TRANSFORMS_NAME, load_depth_png
+from splat.stage5 import (
+    TRANSFORMS_NAME,
+    decode_depth_u16,
+    load_depth_png,
+    load_reference_frame,
+)
 
 logging.getLogger("PIL").setLevel(logging.ERROR)
 
@@ -115,10 +122,19 @@ class TrainParams:
     refine_start_iter: int = 500
     refine_stop_iter: int | None = None  # None → int(iterations * 0.5) at runtime
     refine_every: int = 100
-    reset_every: int = 3000
+    # 0 DISABLES periodic opacity resets (the default here): a reset clamps every
+    # opacity to 2·prune_opa, but surfels no training view covers (occluded
+    # regions kept at their mesh-true init) receive no gradient and would stay
+    # dimmed forever. The pinned gsplat 1.5.3 never fires resets anyway (its
+    # trigger `step % reset_every == 0 & step > 0` parses as `… and (0 > 0)`);
+    # this makes that behaviour deliberate and upgrade-proof.
+    reset_every: int = 0
     grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
-    prune_opa: float = 0.05
+    # Keep pruning BELOW the glass init: glass.py panes seed opacity at
+    # GLASS_ALPHA = 0.065 (logit −2.67), and the old 0.05 threshold left only
+    # ~0.3 logits of drift before a pane surfel was permanently pruned.
+    prune_opa: float = 0.03
     absgrad: bool = False
     cap_max: int = 3_000_000           # freeze densification past this many Gaussians (VRAM guard)
 
@@ -128,7 +144,13 @@ class TrainParams:
     # cloud. Non-packed is also cheap at our per-cell Gaussian counts.)
     near_plane: float = 0.01
     far_plane: float = 1e10
-    depth_mode: str = "expected"       # 2DGS depth for RGB+ED: "expected" | "median"
+    # Depth statistic the depth loss (and normals-from-depth) compares: "median"
+    # = the transmittance-0.5 crossing — the same "nearest depth-WRITING surface"
+    # the references store, which BLEND glass (α ≈ 0.065) never shifts, so depth
+    # supervision cannot fade panes; "expected" = the alpha-weighted mean (ED) —
+    # denser gradients, but it mixes the pane into every window pixel and pushes
+    # glass opacity toward 0.
+    depth_mode: str = "median"
     seed: int = 0
     eval_max_views: int = 128          # cap final-metric renders (plans can have thousands of views)
     log_every: int = 50                # emit a progress line every N steps
@@ -153,11 +175,13 @@ class TrainParams:
             "ssim_lambda": self.ssim_lambda,
             "alpha_lambda": self.alpha_lambda,
             "depth_lambda": self.depth_lambda,
+            "depth_mode": self.depth_mode,
             "alpha_gate": self.alpha_gate,
             "normal_lambda": self.normal_lambda,
             "dist_lambda": self.dist_lambda,
             "refine": self.refine,
             "refine_stop_iter": self.resolved_refine_stop,
+            "reset_every": self.reset_every,
             "grow_grad2d": self.grow_grad2d,
             "prune_opa": self.prune_opa,
             "batch": self.batch,
@@ -213,9 +237,16 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
     sh0 = stack("f_dc_0", "f_dc_1", "f_dc_2").reshape(-1, 1, 3)
     if "scale_2" in col:
         scales = stack("scale_0", "scale_1", "scale_2")
-    else:  # 2DGS cloud: synthesize an isotropic third log-scale (render ignores it)
+    else:
+        # 2DGS cloud: synthesize a TINY third log-scale. Rendering ignores it and
+        # the strategy's grow/prune thresholds take max() over scales (unchanged),
+        # but DefaultStrategy's split() displaces children along ALL three scaled
+        # axes — a normal-axis scale equal to the tangent radius would eject every
+        # child a full radius off the surface. 1% of the smaller tangent radius
+        # keeps splits in-plane.
         two = stack("scale_0", "scale_1")
-        scales = np.concatenate([two, two[:, 1:2]], axis=1)
+        third = (two.min(axis=1, keepdims=True) + np.log(0.01)).astype(np.float32)
+        scales = np.concatenate([two, third], axis=1)
     return {"means": means, "quats": quats, "opacities": opacities, "sh0": sh0, "scales": scales}
 
 
@@ -232,10 +263,10 @@ def _load_alpha(path: Path) -> np.ndarray:
 
 
 def _read_depth(view: dict[str, Any]) -> np.ndarray | None:
-    """Reference depth for a view as [H,W,1] float32 planar-Z metres, or None.
-    Stage 5 now writes a log-uint16 depth PNG (decoded via `load_depth_png` with the
-    view's [near, far]); legacy float32 `.npy` renders are still read directly, so
-    existing reference sets need not be regenerated."""
+    """LEGACY reference depth for a view as [H,W,1] float32 planar-Z metres, or
+    None: the log-uint16 depth PNG of pre-SZF reference sets (decoded via
+    `load_depth_png` with the view's [near, far]), or the even older float32
+    `.npy`. Current sets carry depth inside the SZF frame (`_view_arrays`)."""
     dp = view["depth"]
     if dp is None:
         return None
@@ -245,6 +276,30 @@ def _read_depth(view: dict[str, Any]) -> np.ndarray | None:
             raise ValueError(f"{dp}: PNG depth needs 'near'/'far' in transforms.json")
         return load_depth_png(dp, near, far)[..., None]
     return np.load(dp).astype(np.float32)[..., None]
+
+
+def _view_arrays(view: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """One view's supervision as numpy: (rgb [H,W,3] in [0,1], alpha [H,W,1] in
+    [0,1], depth [H,W,1] planar-Z metres | None). The current Stage-5 contract is
+    ONE SZF frame per view (all three planes, one open + zstd decode — ~4x faster
+    than the PNG triple it replaced); the legacy branch keeps pre-SZF reference
+    sets (PNG triple, `.npy` depth) trainable without regeneration."""
+    frame = view.get("frame")
+    if frame is not None:
+        rgba, codes = load_reference_frame(frame)
+        rgb = rgba[..., :3].astype(np.float32) / 255.0
+        alpha = rgba[..., 3:4].astype(np.float32) / 255.0
+        near, far = view.get("depth_near"), view.get("depth_far")
+        if near is None or far is None:
+            raise ValueError(f"{frame}: SZF depth needs 'near'/'far' in transforms.json")
+        return rgb, alpha, decode_depth_u16(codes, near, far)[..., None]
+    rgb = _load_rgb(view["rgb"])
+    alpha = (
+        _load_alpha(view["alpha"])
+        if view["alpha"] is not None
+        else np.ones((rgb.shape[0], rgb.shape[1], 1), dtype=np.float32)
+    )
+    return rgb, alpha, _read_depth(view)
 
 
 def _fmt_hms(seconds: float) -> str:
@@ -373,13 +428,10 @@ def _load_view(torch, view: dict[str, Any], device):  # noqa: ANN001
     """Stream one view's supervision to the GPU: rgb [1,H,W,3], alpha [1,H,W,1],
     depth [1,H,W,1] | None. Pixels are read from disk on demand so plans with
     thousands of 512² views never have to fit in host RAM."""
-    rgb = torch.from_numpy(np.ascontiguousarray(_load_rgb(view["rgb"]))).to(device).unsqueeze(0)
-    if view["alpha"] is not None:
-        alpha = torch.from_numpy(np.ascontiguousarray(_load_alpha(view["alpha"]))).to(device).unsqueeze(0)
-    else:
-        alpha = torch.ones((1, rgb.shape[1], rgb.shape[2], 1), device=device)
+    rgb_np, alpha_np, d = _view_arrays(view)
+    rgb = torch.from_numpy(np.ascontiguousarray(rgb_np)).to(device).unsqueeze(0)
+    alpha = torch.from_numpy(np.ascontiguousarray(alpha_np)).to(device).unsqueeze(0)
     depth = None
-    d = _read_depth(view)
     if d is not None:
         depth = torch.from_numpy(np.ascontiguousarray(d)).to(device).unsqueeze(0)
     return rgb, alpha, depth
@@ -389,26 +441,21 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  
     """Infinite stream of training batches — `(viewmats [B,4,4], rgb [B,H,W,3],
     alpha [B,H,W,1], depth [B,H,W,1] | None)` on `device`, B random views each.
 
-    With `prefetch`, a daemon thread does the expensive part (PNG/`.npy` decode +
-    stacking) for the NEXT batch while the GPU trains on the current one, so the
-    render loop never stalls on disk. The host→device copy stays synchronous (the
-    decode is the real cost), which keeps it correct with no tensor-lifetime traps."""
+    With `prefetch`, a daemon thread does the expensive part (SZF zstd / legacy
+    PNG decode + stacking) for the NEXT batch while the GPU trains on the current
+    one, so the render loop never stalls on disk. The host→device copy stays
+    synchronous (the decode is the real cost), which keeps it correct with no
+    tensor-lifetime traps."""
     n = len(views)
 
     def decode_batch(rng) -> tuple:  # noqa: ANN001 - CPU tensors, stacked to [B,...]
         vms, rgbs, alphas, depths = [], [], [], []
         for _ in range(batch):
             v = views[int(rng.integers(0, n))]
-            rgb = np.ascontiguousarray(_load_rgb(v["rgb"]))
-            alpha = (
-                np.ascontiguousarray(_load_alpha(v["alpha"]))
-                if v["alpha"] is not None
-                else np.ones((rgb.shape[0], rgb.shape[1], 1), dtype=np.float32)
-            )
+            rgb, alpha, d = _view_arrays(v)
             vms.append(v["viewmat"])
-            rgbs.append(torch.from_numpy(rgb))
-            alphas.append(torch.from_numpy(alpha))
-            d = _read_depth(v)
+            rgbs.append(torch.from_numpy(np.ascontiguousarray(rgb)))
+            alphas.append(torch.from_numpy(np.ascontiguousarray(alpha)))
             if d is not None:
                 depths.append(torch.from_numpy(np.ascontiguousarray(d)))
         depth = torch.stack(depths) if len(depths) == batch else None
@@ -540,20 +587,30 @@ def train_splat(
         device=device,
     )
 
-    # Index the supervision set (paths + poses only; pixels stream from disk per step).
-    # `near`/`far` (shared across the plan) let `_read_depth` decode the log-uint16
-    # depth PNGs back to metric metres.
+    # Index the supervision set (paths + poses only; pixels stream from disk per
+    # step). Current sets carry ONE SZF frame per view (`frame_path`); legacy
+    # PNG-triple sets (`file_path`/`alpha_path`/`depth_path`) stay trainable.
+    # `near`/`far` (shared across the plan) decode the log-uint16 depth codes
+    # back to metric metres.
     depth_near = float(doc["near"]) if "near" in doc else None
     depth_far = float(doc["far"]) if "far" in doc else None
     views: list[dict[str, Any]] = []
     cam_centers: list[np.ndarray] = []
-    for fr in frames:
+    for i, fr in enumerate(frames):
         c2w = np.asarray(fr["transform_matrix"], dtype=np.float64)
         cam_centers.append(c2w[:3, 3])
+        frame_rel = fr.get("frame_path")
+        rgb_rel = fr.get("file_path")
+        if frame_rel is None and rgb_rel is None:
+            raise ValueError(
+                f"{refs_dir / TRANSFORMS_NAME}: frame {i} has neither 'frame_path' "
+                "(SZF) nor 'file_path' (legacy PNG) — re-run Stage 5"
+            )
         views.append(
             {
                 "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
-                "rgb": refs_dir / fr["file_path"],
+                "frame": refs_dir / frame_rel if frame_rel else None,
+                "rgb": refs_dir / rgb_rel if rgb_rel else None,
                 "alpha": refs_dir / fr["alpha_path"] if fr.get("alpha_path") else None,
                 "depth": refs_dir / fr["depth_path"] if fr.get("depth_path") else None,
                 "depth_near": depth_near,
@@ -621,13 +678,17 @@ def train_splat(
         optimizers["means"], gamma=0.01 ** (1.0 / max(params.iterations, 1))
     )
 
+    # reset_every=0 disables opacity resets by pushing the trigger past the last
+    # step (see TrainParams). Accepted side effect: the strategy's scale-based
+    # prune (gated on `step > reset_every`) also never fires — our init has no
+    # giant blobs and the alpha/depth losses punish oversized splats directly.
     strategy = DefaultStrategy(
         prune_opa=params.prune_opa,
         grow_grad2d=params.grow_grad2d,
         grow_scale3d=params.grow_scale3d,
         refine_start_iter=params.refine_start_iter,
         refine_stop_iter=params.resolved_refine_stop,
-        reset_every=params.reset_every,
+        reset_every=params.reset_every if params.reset_every > 0 else params.iterations + 1,
         refine_every=params.refine_every,
         absgrad=params.absgrad,
         key_for_gradient="gradient_2dgs",
@@ -669,7 +730,7 @@ def train_splat(
         active_sh = min(step // max(params.sh_degree_interval, 1), params.sh_degree)
         colors, sh_deg = _render_inputs(torch, splats, active_sh)
 
-        renders, pred_alpha, normals, normals_from_depth, distort, _median, info = rasterization_2dgs(
+        renders, pred_alpha, normals, normals_from_depth, distort, median_depth, info = rasterization_2dgs(
             means=splats["means"],
             quats=splats["quats"],
             scales=torch.exp(splats["scales"]),
@@ -689,22 +750,24 @@ def train_splat(
             absgrad=params.absgrad,
         )
         pred_rgb = renders[..., :3]
-        pred_depth = renders[..., 3:4]
+        pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
 
         if params.refine:
             strategy.step_pre_backward(splats, optimizers, strat_state, step, info)
 
-        # Photometric: alpha-weighted L1 + full-frame D-SSIM (both on black bg).
-        w = gt_alpha
-        l1 = ((pred_rgb - gt_rgb).abs() * w).sum() / (w.sum() * 3.0 + 1e-8)
+        # Photometric: full-frame L1 + D-SSIM. Both sides are premultiplied-over-
+        # black (the reference alpha-blends over a black clear colour; gsplat
+        # composites with no background), so glass/MASK pixels compare like-with-
+        # like and background pixels directly penalize floater energy.
+        l1 = (pred_rgb - gt_rgb).abs().mean()
         ssim = _ssim(F, pred_rgb.clamp(0, 1).permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
         loss = (1.0 - params.ssim_lambda) * l1 + params.ssim_lambda * (1.0 - ssim)
 
-        # Alpha (coverage/opacity) — exact nvdiffrast masks.
+        # Alpha (coverage/opacity) — the renderer's exact coverage masks.
         if params.alpha_lambda > 0.0:
             loss = loss + params.alpha_lambda * (pred_alpha - gt_alpha).abs().mean()
 
-        # Depth — alpha-gated L1 (metres).
+        # Depth — alpha-gated L1 (metres) on the `depth_mode` statistic.
         if gt_depth is not None and params.depth_lambda > 0.0:
             gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
             if gate.any():
@@ -824,7 +887,7 @@ def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params
         for i in sel:
             v = views[int(i)]
             gt_rgb, gt_alpha, gt_depth = _load_view(torch, v, device)
-            renders, _alpha, *_rest, _info = rasterization_2dgs(
+            renders, _alpha, _normals, _nfd, _distort, median_depth, _info = rasterization_2dgs(
                 means=splats["means"],
                 quats=splats["quats"],
                 scales=torch.exp(splats["scales"]),
@@ -842,7 +905,7 @@ def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params
                 depth_mode=params.depth_mode,
             )
             pred_rgb = renders[..., :3].clamp(0, 1)
-            pred_depth = renders[..., 3:4]
+            pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
             fg = gt_alpha > params.alpha_gate
             fg3 = fg.expand_as(gt_rgb)
             if fg3.any():

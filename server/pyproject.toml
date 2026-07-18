@@ -19,6 +19,7 @@ dependencies = [
     "google-genai>=1.0",
     "scipy>=1.18.0",
     "modal>=1.5.2",
+    "zstandard>=0.23 ; python_full_version < '3.14'",
 ]
 
 [dependency-groups]

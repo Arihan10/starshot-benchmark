@@ -49,6 +49,11 @@ let patchViews = null; // per-patch [[camera_index, face_index], …]
 let patchFaces = null; // face-name lookup (index → "+x" …)
 let refsBase = null; // /artifacts base URL of the Stage-5 refs/ dir, or null
 let patchesOn = false;
+let cameraPoints = null; // THREE.Points of Stage-4 camera POSITIONS (view-only overlay)
+let camPlaying = false; // greedy-order playback of the camera overlay is running
+let camPlayReq = null; // requestAnimationFrame handle for playback
+let camRevealed = 0; // camera points currently revealed (greedy order == array order)
+let camPlayLast = 0; // previous playback frame timestamp (ms), for dt
 let patchModalEl = null; // the right-side image modal (created lazily)
 let _downXY = null; // pointer-down pos, to tell a click from an orbit drag
 
@@ -207,7 +212,7 @@ async function teardown() {
 	closeSogView(); // the PlayCanvas canvas lives in canvasEl too (replaceChildren below)
 	// Overlays live in the viewer's threeScene; free their GPU resources and
 	// reset their toggles before the viewer (and its GL context) goes away.
-	for (const obj of [voxelPoints, meshGroup, patchPoints]) {
+	for (const obj of [voxelPoints, meshGroup, patchPoints, cameraPoints]) {
 		if (obj) {
 			viewer?.threeScene?.remove(obj);
 			disposeObj(obj);
@@ -220,6 +225,9 @@ async function teardown() {
 	patchFaces = null;
 	refsBase = null;
 	patchesOn = false;
+	stopCamPlay();
+	cameraPoints = null;
+	camRevealed = 0;
 	hidePatchModal();
 	// A rebuild (re-splat) returns to splat mode; the splat is visible by default
 	// on the new viewer, and the overlays are gone.
@@ -825,6 +833,37 @@ function buildControls(summary) {
 	inputs.patches.addEventListener("change", () =>
 		setPatches(inputs.patches.checked),
 	);
+	// Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
+	const camRow = checkRow("cameras", "camera positions", false);
+	inputs.cameras.addEventListener("change", () =>
+		setCameras(inputs.cameras.checked),
+	);
+	// Greedy-order playback: reveal the cameras in the order Stage 4 chose them,
+	// at an adjustable rate (points/sec). The count column tracks the current pick.
+	const camPlayBtn = el("button", {
+		class: "splat-stage2-btn",
+		text: "▶ play",
+		title: "reveal camera positions in the order Stage 4 greedily chose them",
+		onclick: () => toggleCamPlay(),
+	});
+	inputs._camPlayBtn = camPlayBtn;
+	inputs._camPlayVal = el("span", { class: "svc-val", text: "" });
+	const camPlayRow = el(
+		"div",
+		{ class: "svc-row" },
+		el("span", { class: "svc-lab", text: "greedy" }),
+		camPlayBtn,
+		inputs._camPlayVal,
+	);
+	const camSpeedRow = sliderRow(
+		"camspeed",
+		"speed",
+		5,
+		5000,
+		5,
+		200,
+		(v) => `${Math.round(v)}/s`,
+	);
 	const overlay = el("div", { class: "svc-actual" });
 	inputs._overlay = overlay;
 	inputs._stepper = el("div", { class: "svc-stepper" });
@@ -856,6 +895,9 @@ function buildControls(summary) {
 		seg,
 		fsRow,
 		patchRow,
+		camRow,
+		camPlayRow,
+		camSpeedRow,
 		el("div", { class: "svc-title", text: "sampler knobs" }),
 		density,
 		radius,
@@ -1066,6 +1108,146 @@ async function setPatches(on) {
 	}
 }
 
+// ---- camera-position overlay (Stage-4 cameras.json → placed positions) ------
+
+// One cyan disk per placed camera. View-only (no picking), X-rayed through the
+// splat like the patch overlay so the whole coverage rig reads at a glance.
+function buildCameras(cams) {
+	const n = cams.length;
+	const pos = new Float32Array(n * 3);
+	for (let i = 0; i < n; i++) {
+		const p = cams[i].pos;
+		pos[i * 3] = p[0];
+		pos[i * 3 + 1] = p[1];
+		pos[i * 3 + 2] = p[2];
+	}
+	const geo = new THREE.BufferGeometry();
+	geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+	// Opaque disks (alphaTest cutout) that WRITE depth. The viewer renders the
+	// scene first, then the splats depth-test against it — writing depth is what
+	// lets a point in front of the splat survive the splat pass instead of being
+	// overpainted, while a point genuinely behind geometry is correctly occluded.
+	const mat = new THREE.PointsMaterial({
+		size: 0.3,
+		color: 0x5ce6ff,
+		sizeAttenuation: true,
+		map: patchSprite(),
+		alphaTest: 0.5,
+	});
+	return new THREE.Points(geo, mat);
+}
+
+// Fetch the Stage-4 plan (cameras.json) for the open cell and build the overlay.
+async function ensureCameras() {
+	if (cameraPoints) return true;
+	const c = current;
+	setOverlay("loading cameras…");
+	const s4 = await api.splatStage4Status(c.run, c.slot, c.model);
+	if (s4.status !== "done" || !s4.url) {
+		setOverlay("plan cameras first (Stage 4)");
+		return false;
+	}
+	const seq = openSeq;
+	const plan = await fetch(api.absUrl(s4.url + `?t=${Date.now()}`), {
+		cache: "no-store",
+	}).then((r) => r.json());
+	if (seq !== openSeq || !viewer) return false;
+	const cams = plan.cameras || [];
+	cameraPoints = buildCameras(cams);
+	cameraPoints.visible = false;
+	viewer.threeScene.add(cameraPoints);
+	setCamReveal(camTotal()); // start fully revealed; playback resets to 0
+	setOverlay(`cameras: ${cams.length.toLocaleString()} placed`);
+	return true;
+}
+
+async function setCameras(on) {
+	if (on) {
+		const ok = await ensureCameras();
+		if (ok && cameraPoints) {
+			cameraPoints.visible = true;
+			if (!camPlaying) setCamReveal(camTotal()); // static toggle = show all
+		}
+	} else {
+		stopCamPlay();
+		if (cameraPoints) cameraPoints.visible = false;
+	}
+}
+
+// ---- greedy-order playback (reveal camera points in Stage-4 selection order) --
+
+function camTotal() {
+	const a = cameraPoints && cameraPoints.geometry.getAttribute("position");
+	return a ? a.count : 0;
+}
+
+// Reveal the first `k` cameras (greedy order) via the draw range, force a viewer
+// frame (it only auto-renders on camera motion), and update the count readout.
+function setCamReveal(k) {
+	const total = camTotal();
+	camRevealed = Math.max(0, Math.min(total, k));
+	const n = Math.floor(camRevealed);
+	if (cameraPoints) {
+		cameraPoints.geometry.setDrawRange(0, n);
+		viewer?.forceRenderNextFrame?.();
+	}
+	if (inputs && inputs._camPlayVal) {
+		inputs._camPlayVal.textContent = !total
+			? ""
+			: n >= 1000
+				? `${(n / 1000).toFixed(1)}k`
+				: String(n);
+	}
+}
+
+function updateCamPlayBtn() {
+	if (inputs && inputs._camPlayBtn) {
+		inputs._camPlayBtn.textContent = camPlaying ? "⏸ pause" : "▶ play";
+	}
+}
+
+function stopCamPlay() {
+	camPlaying = false;
+	if (camPlayReq) cancelAnimationFrame(camPlayReq);
+	camPlayReq = null;
+	updateCamPlayBtn();
+}
+
+function camPlayTick(now) {
+	if (!camPlaying || !cameraPoints || !viewer) {
+		stopCamPlay();
+		return;
+	}
+	const dt = camPlayLast ? Math.min(0.1, (now - camPlayLast) / 1000) : 0;
+	camPlayLast = now;
+	const speed =
+		Number(inputs && inputs.camspeed && inputs.camspeed.value) || 200;
+	setCamReveal(camRevealed + speed * dt); // points/sec, framerate-independent
+	if (camRevealed >= camTotal()) {
+		stopCamPlay(); // reached the end — leave every point revealed
+		return;
+	}
+	camPlayReq = requestAnimationFrame(camPlayTick);
+}
+
+// Play/pause the greedy-order reveal. Ensures the overlay is loaded + visible,
+// restarts from the beginning when already at the end, else resumes.
+async function toggleCamPlay() {
+	if (camPlaying) {
+		stopCamPlay();
+		return;
+	}
+	const ok = await ensureCameras();
+	if (!ok || !cameraPoints) return;
+	cameraPoints.visible = true;
+	if (inputs && inputs.cameras) inputs.cameras.checked = true;
+	if (camRevealed >= camTotal()) setCamReveal(0); // at the end → restart
+	camPlaying = true;
+	camPlayLast = 0;
+	updateCamPlayBtn();
+	camPlayReq = requestAnimationFrame(camPlayTick);
+}
+
 // Pick the front-most patch under the cursor in SCREEN space (project every patch
 // to pixels, take the nearest within a small radius, closest to camera). This is
 // robust where a Points raycaster's world-space threshold is finicky.
@@ -1188,7 +1370,10 @@ const STAGE_START = {
 	2: (r, s, m) => api.splatStage2Start(r, s, m),
 	3: (r, s, m) => api.splatStage3Start(r, s, m),
 	4: (r, s, m) => api.splatStage4Start(r, s, m),
-	5: (r, s, m) => api.splatStage5Start(r, s, m),
+	// Stage 5 resumes by default (renders only the views still missing on disk); an
+	// explicit re-run of a DONE stage passes restart so the server wipes refs/ and
+	// re-renders every view from scratch.
+	5: (r, s, m, restart) => api.splatStage5Start(r, s, m, { restart }),
 };
 
 function stageState(cell, n) {
@@ -1213,9 +1398,13 @@ async function runStage(n) {
 	if (!c) return;
 	// Re-running at/before surfels reverts the cloud → drop it from the canvas.
 	if (n <= 3) cloudLoaded = false;
+	// Clicking a DONE stage is an explicit re-run: wipe its outputs and start fresh
+	// (Stage 5's restart). A not-done stage runs, or for Stage 5 resumes from the
+	// views already on disk after an unexpected stop.
+	const restart = stageDone(cellStatus, n);
 	setStatus(`starting stage ${n}…`, "var(--purple)");
 	try {
-		await STAGE_START[n](c.run, c.slot, c.model);
+		await STAGE_START[n](c.run, c.slot, c.model, restart);
 	} catch (e) {
 		setStatus(`stage ${n} failed: ${e.message}`, "var(--red)");
 		return;
@@ -1319,7 +1508,11 @@ async function runAll() {
 			"var(--purple)",
 		);
 		try {
-			await api.splatStage6Start(current.run, current.slot, current.model);
+			await api.splatStage6Start(
+				current.run,
+				current.slot,
+				current.model,
+			);
 		} catch (e) {
 			setStatus(
 				`run all: training failed to start: ${e.message}`,
@@ -1345,62 +1538,43 @@ async function runAll() {
 	}
 }
 
-// Asset builds the splat pipeline can sample + render from (value → label).
-const SPLAT_SOURCES = [
-	["auto", "auto"],
-	["generated", "raw"],
-	["generated-lite", "lite"],
-	["generated-optimized", "optimized"],
-	["library", "library"],
-];
-
-// The source picker: which mesh build the splat stages sample + render. Persists
-// server-side per cell (splat/source.json) and applies on the next stage run.
-function renderSourcePicker() {
+// The splat pipeline always samples + renders the per-cell SPLAT asset tier
+// (built on demand by the stage jobs — optimize.mjs --preset splat), so there
+// is no source picker: the stepper row shows the tier build as a stage phase.
+function renderSourceRow() {
 	const row = el("div", { class: "svc-step" });
 	row.appendChild(el("span", { class: "svc-step-n muted", text: "◆" }));
 	row.appendChild(el("span", { class: "svc-step-label", text: "source" }));
-	const pref = (current && current.sourcePref) || "auto";
-	const sel = el("select", {
-		class: "splat-source-select",
-		title: "which asset build the splat pipeline samples + renders from (re-run the stages to apply)",
-		onchange: (e) => onPickSource(e.target.value),
-	});
-	for (const [val, label] of SPLAT_SOURCES) {
-		const opt = el("option", { value: val, text: label });
-		opt.selected = val === pref;
-		sel.appendChild(opt);
-	}
-	row.appendChild(sel);
-	if (current && current.source)
-		row.appendChild(
-			el("span", { class: "muted", text: ` using ${current.source}` }),
-		);
+	row.appendChild(
+		el("span", {
+			class: "muted",
+			text: "splat tier (decimated · KTX2/ETC1S)",
+		}),
+	);
 	return row;
 }
 
-async function onPickSource(val) {
-	const c = current;
-	if (!c) return;
-	try {
-		const res = await api.splatSetSource(c.run, c.slot, c.model, val);
-		c.sourcePref = val;
-		if (res && res.resolved) c.source = res.resolved;
-		setStatus(
-			`source: ${val} — re-run the stages to apply`,
-			"var(--purple)",
-		);
-	} catch (e) {
-		setStatus(`source failed: ${e.message}`, "var(--red)");
-	}
-	renderStepper();
+// Format a capture throughput (images/second) compactly, or null when there's
+// nothing meaningful to show yet.
+function fmtRate(r) {
+	if (r == null || !isFinite(r) || r <= 0) return null;
+	return r >= 10 ? String(Math.round(r)) : r.toFixed(1);
+}
+
+// A rough ETA string from the remaining view count and the live rate.
+function fmtEta(remaining, rate) {
+	if (!rate || rate <= 0 || remaining <= 0) return null;
+	const s = remaining / rate;
+	if (s < 90) return `${Math.round(s)}s`;
+	if (s < 5400) return `${Math.round(s / 60)}m`;
+	return `${(s / 3600).toFixed(1)}h`;
 }
 
 function renderStepper() {
 	const box = inputs && inputs._stepper;
 	if (!box) return;
 	box.replaceChildren();
-	box.appendChild(renderSourcePicker());
+	box.appendChild(renderSourceRow());
 	const cell = cellStatus;
 	for (const stage of STAGES) {
 		const st = stageState(cell, stage.n);
@@ -1417,14 +1591,22 @@ function renderStepper() {
 		});
 		row.appendChild(labelEl);
 		let btn;
+		let extra = null; // trailing muted info (e.g. Stage-5 live throughput)
 		if (running) {
 			// `current_id` is the live sub-step: Stage 4's phase (load / patches /
 			// coverage / select / write) or the object/view id the others are on. Show
 			// it next to the label so the long coverage phase isn't an opaque wait.
+			// Stage 5 during `render` shows the throughput instead of the (noisy)
+			// per-view id — its named warm-up phases (tier / deopt / launch) still show.
 			const phase =
-				st.current_id && st.current_id !== "plan"
-					? String(st.current_id)
-					: "";
+				stage.n === 5
+					? st.phase &&
+						!["render", "done", "pending", "plan"].includes(st.phase)
+						? st.phase
+						: ""
+					: st.current_id && st.current_id !== "plan"
+						? String(st.current_id)
+						: "";
 			if (phase)
 				labelEl.textContent = `${stage.label} · ${phase.slice(0, 22)}`;
 			const prog = st.total
@@ -1440,6 +1622,20 @@ function renderStepper() {
 					`${phase} ${st.total ? `${st.done}/${st.total}` : ""}`.trim() ||
 					"running",
 			});
+			// Live capture throughput for Stage 5 (server-computed images/second).
+			const rate = stage.n === 5 ? fmtRate(st.rate) : null;
+			if (rate) {
+				const remaining = (st.total || 0) - (st.done || 0);
+				const eta = fmtEta(remaining, st.rate);
+				const avg = fmtRate(st.rate_avg);
+				extra = el("span", {
+					class: "muted",
+					text: eta ? `${rate} img/s · ETA ${eta}` : `${rate} img/s`,
+					title: avg
+						? `live ${rate} img/s · session avg ${avg} img/s`
+						: `${rate} img/s`,
+				});
+			}
 		} else if (gated) {
 			btn = el("button", {
 				class: "splat-stage2-btn",
@@ -1453,7 +1649,9 @@ function renderStepper() {
 				disabled: runningAll,
 				text: done ? "re-run" : stage.verb,
 				title: done
-					? "re-run — discards every later stage"
+					? stage.n === 5
+						? "re-run — wipe all references and re-render from scratch"
+						: "re-run — discards every later stage"
 					: `run stage ${stage.n}`,
 				onclick: () => runStage(stage.n),
 			});
@@ -1463,6 +1661,7 @@ function renderStepper() {
 			btn.title = st.error || "failed — click to retry";
 		}
 		row.appendChild(btn);
+		if (extra) row.appendChild(extra);
 		box.appendChild(row);
 	}
 	box.appendChild(renderRunAll(cell));
@@ -1476,7 +1675,8 @@ function renderStepper() {
 function renderRunAll(cell) {
 	const busy = runningAll || anyStageRunning(cell);
 	const allDone =
-		STAGES.every((s) => stageDone(cell, s.n)) && cell?.stage6?.status === "done";
+		STAGES.every((s) => stageDone(cell, s.n)) &&
+		cell?.stage6?.status === "done";
 	const row = el("div", { class: "svc-step" });
 	row.appendChild(el("span", { class: "svc-step-n muted", text: "▶" }));
 	row.appendChild(el("span", { class: "svc-step-label", text: "run all" }));
@@ -1526,7 +1726,12 @@ function renderStage6(cell) {
 		btn = el("button", {
 			class: `splat-stage2-btn${status === "done" ? " view" : ""}`,
 			disabled: !s5done || runningAll,
-			text: status === "done" ? "re-train" : resumable ? "resume training" : "train",
+			text:
+				status === "done"
+					? "re-train"
+					: resumable
+						? "resume training"
+						: "train",
 			title: s5done
 				? "launch the Stage-6 fine-tune as a background job on the server host"
 				: "run stage 5 (references) first",
@@ -1569,7 +1774,9 @@ function renderStage6(cell) {
 async function startStage6(restart = false) {
 	if (!current) return;
 	setStatus(
-		restart ? "restarting training (stage 6)…" : "launching training (stage 6)…",
+		restart
+			? "restarting training (stage 6)…"
+			: "launching training (stage 6)…",
 		"var(--purple)",
 	);
 	try {
@@ -1734,7 +1941,6 @@ export async function openSplatViewer(opts) {
 		slot: opts.slot,
 		model: opts.model,
 		source: opts.source,
-		sourcePref: "auto",
 	};
 	cloudLoaded = false;
 	runningAll = false;
@@ -1746,15 +1952,6 @@ export async function openSplatViewer(opts) {
 	subEl.textContent =
 		opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
 	buildControls(opts.summary || null);
-	try {
-		const sp = await api.splatGetSource(opts.run, opts.slot, opts.model);
-		if (seq === openSeq && sp) {
-			current.sourcePref = sp.source || "auto";
-			if (sp.resolved) current.source = sp.resolved;
-		}
-	} catch {
-		/* non-fatal — the picker just defaults to 'auto' */
-	}
 	renderStepper();
 	if (opts.url) {
 		cloudLoaded = true;

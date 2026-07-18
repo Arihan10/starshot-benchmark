@@ -36,6 +36,12 @@ function isRunning(cell) {
     return cell.status === "running" || cell.status === "pending";
 }
 
+// Compact images/second for the live capture readout, or null when not meaningful.
+function fmtRate(r) {
+    if (r == null || !isFinite(r) || r <= 0) return null;
+    return r >= 10 ? String(Math.round(r)) : r.toFixed(1);
+}
+
 function subRunning(s) {
     return !!s && (s.status === "running" || s.status === "pending");
 }
@@ -233,10 +239,19 @@ function stageControl(cell, opts) {
     const gate = opts.gate ? opts.gate(cell) : null;
     let btn;
     if (subRunning(s)) {
-        const label =
-            s.phase === "deopt"
-                ? "de-optimizing…"
-                : `${opts.runningVerb} ${s.total ? `${s.done}/${s.total}` : "…"}`;
+        let label;
+        if (s.phase === "deopt") {
+            label = "de-optimizing…";
+        } else if (s.phase === "tier") {
+            label = "building tier…"; // splat asset tier build (shared warm-up)
+        } else {
+            const prog = s.total ? `${s.done}/${s.total}` : "…";
+            // Stage 5 carries a live images/second; other stages don't set `rate`.
+            const rate = fmtRate(s.rate);
+            label = rate
+                ? `${opts.runningVerb} ${prog} · ${rate}/s`
+                : `${opts.runningVerb} ${prog}`;
+        }
         btn = el("button", { class: "splat-stage2-btn", disabled: true, text: label });
     } else if (gate) {
         btn = el("button", {
@@ -306,7 +321,8 @@ function stage4Control(cell) {
 }
 
 // Stage 5 — unlit reference renders (refs/), gated on the Stage-4 camera plan.
-// CUDA-only: on a non-GPU server the job returns a clear "needs CUDA" error.
+// Rendered by the headless WebGL capture page against the cell's splat tier;
+// on failure the job's error carries the capture URL for a manual-browser run.
 function stage5Control(cell) {
     return stageControl(cell, {
         key: "stage5",
@@ -318,7 +334,9 @@ function stage5Control(cell) {
         errLabel: "refs failed — retry",
         doneText: (s) => {
             const n = s.summary && s.summary.views;
-            return n != null ? `${n} views` : null;
+            if (n == null) return null;
+            const r = s.summary && s.summary.img_per_s;
+            return r ? `${n} views · ${r}/s` : `${n} views`;
         },
         gate: (c) =>
             c.stage4 && c.stage4.status === "done"

@@ -32,6 +32,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import time
+from collections import deque
+from urllib.parse import quote
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections.abc import AsyncIterator
@@ -39,7 +42,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -57,7 +60,7 @@ from app.core.slots import (
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import committed, divider, generation, object_wipe
-from app.services import llm, prefabs, threed
+from app.services import llm, prefabs, refcapture, threed
 from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
@@ -78,20 +81,49 @@ from splat import stage1 as splat_stage1  # noqa: E402
 from splat import stage2 as splat_stage2  # noqa: E402
 from splat import stage3 as splat_stage3  # noqa: E402
 from splat import stage4 as splat_stage4  # noqa: E402
-from splat import stage5 as splat_stage5  # noqa: E402  (torch/nvdiffrast lazy inside)
+from splat import stage5 as splat_stage5  # noqa: E402  (torch-free contract module)
 from splat import stage6 as splat_stage6  # noqa: E402  (torch/gsplat lazy inside)
 
-# Node de-optimizer (server/tools/optimize-assets/deoptimize.mjs): rewrites a
-# cell's KTX2/Meshopt library GLBs to vanilla glTF so the trimesh-based Stage-1
-# assembler can read them. The from-scratch generated RAW build is already
-# vanilla and skips this. Reuses the optimizer tool's node_modules.
+# Node de-optimizer (server/tools/optimize-assets/deoptimize.mjs): rewrites the
+# cell's KTX2/Meshopt SPLAT tier to vanilla glTF so the trimesh-based stages
+# (1-3) can read it; Stage 5's WebGL capture renders the tier directly. Reuses
+# the optimizer tool's node_modules.
 _DEOPT_DIR = _REPO_ROOT / "server" / "tools" / "optimize-assets"
 _DEOPT_SCRIPT = _DEOPT_DIR / "deoptimize.mjs"
 _NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
 
-# Offline "lite" (presentation-tier) asset builder — driven per-cell by the
-# build-lite endpoint (background subprocess, progress polled by the client).
+# Offline per-cell asset-tier builder (lite presentation tier + the splat
+# sample/render tier) — driven by the build-lite endpoint and by the splat
+# stages' _ensure_splat_tier (background subprocess, progress polled).
 _BUILD_LITE_SCRIPT = _REPO_ROOT / "server" / "scripts" / "build_lite_assets.py"
+
+# Stage-5 reference capture (splat/stage5.py + client/public/js/splatcapture.js):
+# the render worker page is served by the CLIENT static server and POSTs frames
+# back to THIS API — both origins are needed to mint the capture URL the
+# headless browser (or a human, as fallback) opens. The launchers
+# (scripts/run_request.py etc.) bind BOTH processes to ephemeral ports, so the
+# origins can't be hardcoded: explicit env overrides win, else they're derived
+# from the stage-5 start request itself (see _capture_origins).
+_CLIENT_ORIGIN_ENV = "STARSHOT_CLIENT_ORIGIN"
+_API_ORIGIN_ENV = "STARSHOT_API_ORIGIN"
+
+
+def _capture_origins(request: Request | None) -> tuple[str, str]:
+    """(api_origin, client_origin) for a capture session. Preference order:
+    explicit env override → derived from the start request (the API origin is
+    exactly how the dashboard reached this server — `request.base_url` — and the
+    dashboard page that POSTed is served by the client server, so its `Origin`
+    header IS the client origin) → the bare server.mjs defaults (8765/8766)."""
+    api = os.environ.get(_API_ORIGIN_ENV)
+    client = os.environ.get(_CLIENT_ORIGIN_ENV)
+    if request is not None:
+        if not api:
+            api = str(request.base_url).rstrip("/")
+        if not client:
+            origin = request.headers.get("origin")
+            if origin and origin != "null":
+                client = origin.rstrip("/")
+    return api or "http://127.0.0.1:8765", client or "http://127.0.0.1:8766"
 
 # Which per-cell mesh directory the scene bundle streams from. Defaults to the
 # originals ("objects"); set STARSHOT_OBJECTS_SUBDIR=objects-optimized to serve
@@ -174,8 +206,8 @@ _lite_build_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _lite_build_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
 # --- Stage 2 free-space voxelization jobs (background, one per CELL) ----------
-# The shared spatial foundation (Option A, runs first): a cell's meshes (generated,
-# or library de-optimized) are voxelized into a dual-resolution occupancy +
+# The shared spatial foundation (Option A, runs first): the cell's splat tier
+# (de-optimized once) is voxelized into a dual-resolution occupancy +
 # clearance + reachability grid `splat/freespace.npz` (splat/stage2.py), with a
 # `voxels.bin` viz cloud + `freespace.json` sidecar so 'done' survives a restart.
 _splat_stage2_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -197,12 +229,15 @@ _splat_stage4_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage4_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
 # --- Stage 5 reference-render jobs (background, one per CELL) -----------------
-# Unlit nvdiffrast renders (splat/stage5.py) of the Stage-4 camera plan → per-view
-# RGB/depth/alpha + `splat/refs/transforms.json` (the 'done' marker). CUDA-only:
-# on a non-GPU host the job finishes with a clear 'needs CUDA' error. Same
-# shape/keying as the earlier stages.
+# Unlit WebGL capture (splat/stage5.py contract; the renderer is the headless
+# capture page client/public/js/splatcapture.js) of the Stage-4 camera plan →
+# per-view RGB/depth/alpha + `splat/refs/transforms.json` (the 'done' marker).
+# Same job shape/keying as the earlier stages. `_splat_stage5_state` holds the
+# NON-serializable capture session (token, views, browser process, encode
+# futures) the manifest/frames/finish endpoints work against.
 _splat_stage5_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage5_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+_splat_stage5_state: dict[tuple[str, str, str], dict[str, Any]] = {}
 
 # --- Stage 6 fine-tune processes (background, one per CELL) -------------------
 # Unlike stages 1-5 (in-process asyncio jobs), Stage 6 is a long (hours) CUDA
@@ -1629,10 +1664,8 @@ def _placed_count(mesh_dir: Path) -> int:
     return sum(1 for p in mesh_dir.glob("*.glb") if not p.name.endswith(".raw.glb"))
 
 
-# Generated-build asset variants the scene viewer + splat can select between.
+# Generated-build asset variants the scene viewer can select between.
 _GEN_VARIANTS = ("raw", "lite", "optimized")
-# Splat mesh-source overrides (persisted per cell in splat/source.json).
-_SPLAT_SOURCE_CHOICES = ("generated", "generated-lite", "generated-optimized", "library")
 
 
 def _generated_variant_dir(rid: str, variant: str) -> Path:
@@ -1654,65 +1687,49 @@ def _resolve_gen_variant(variant: str | None, optimized: bool) -> str:
     return "optimized" if optimized else "raw"
 
 
-def _splat_source_pref_path(run: str, slot: str, model: str) -> Path:
-    return _slot_dir(run, slot, model) / "splat" / "source.json"
+# --- the splat asset tier ------------------------------------------------------
+# Every splat stage samples/renders ONE canonical per-cell build: the SPLAT tier
+# (optimize.mjs --preset splat) — moderate error-bounded decimation + 1024px
+# KTX2/ETC1S base color (other maps stripped; the pipeline is unlit) + Meshopt.
+# Stage 5's WebGL capture renders it directly (KTX2 stays GPU-compressed);
+# stages 1-3 de-optimize it to vanilla once per run for trimesh. Built lazily
+# from the cell's vanilla source by `_ensure_splat_tier`.
 
 
-def _splat_source_pref(run: str, slot: str, model: str) -> str | None:
-    """The persisted splat source override for a cell, or None (auto)."""
-    try:
-        val = json.loads(
-            _splat_source_pref_path(run, slot, model).read_text(encoding="utf-8")
-        ).get("source")
-    except (OSError, json.JSONDecodeError, AttributeError):
-        return None
-    return val if val in _SPLAT_SOURCE_CHOICES else None
-
-
-def _splat_source(
-    run: str, slot: str, model: str, source: str | None = None,
-) -> tuple[Path, str] | None:
-    """The splat mesh source for a cell + its kind, or None if the cell has no placed
-    meshes in any build. A `source` (arg, else the cell's persisted override) pins the
-    build; when absent or not on disk it AUTO-picks the OPTIMIZED (decimated) twin — the
-    intended splat sample/render source, since the raw build's multi-million-triangle
-    meshes are far too heavy for nvdiffrast (Stage 5). Auto order:
-      1. `objects-generated-optimized/` — the generated optimized twin (KTX2/Meshopt);
-      2. the asset-library build (`objects-optimized/` / `objects/`, KTX2/Meshopt);
-      3. `objects-generated/` — the raw vanilla build, only as a last resort.
-    Everything but the raw build is KTX2/Meshopt and is de-optimized to vanilla first
-    (see `_deoptimize_dir`); only kind `"generated"` skips that step. Disk-only; never
-    hydrates the run."""
+def _splat_tier_source(run: str, slot: str, model: str) -> Path | None:
+    """The VANILLA build the splat tier is built from: the generated raw build,
+    else the library's raw `objects/`. KTX2-only cells (nothing but optimized
+    twins on disk) have no rebuildable source — optimize.mjs can't decode KTX2
+    inputs — so they return None. Disk-only; never hydrates the run."""
     rid = _run_id(run, slot, model)
-    raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
-    lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
-    cell_dir = _slot_dir(run, slot, model)
-
-    if source is None:
-        source = _splat_source_pref(run, slot, model)
-    if source is not None:
-        pinned = {
-            "generated-lite": (lite_dir, "generated-lite"),
-            "generated-optimized": (opt_dir, "generated-optimized"),
-            "generated": (raw_dir, "generated"),
-        }.get(source)
-        if pinned is not None and _placed_count(pinned[0]) > 0:
-            return pinned
-        if source == "library":
-            for name in ("objects-optimized", OBJECTS_SUBDIR, "objects"):
-                lib_dir = cell_dir / name
-                if _placed_count(lib_dir) > 0:
-                    return lib_dir, "library"
-        # requested build isn't on disk — fall through to the auto order below.
-
-    if _placed_count(opt_dir) > 0:
-        return opt_dir, "generated-optimized"
-    for name in ("objects-optimized", OBJECTS_SUBDIR, "objects"):
-        lib_dir = cell_dir / name
-        if _placed_count(lib_dir) > 0:
-            return lib_dir, "library"
+    raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
     if _placed_count(raw_dir) > 0:
-        return raw_dir, "generated"
+        return raw_dir
+    lib_dir = _slot_dir(run, slot, model) / "objects"
+    if _placed_count(lib_dir) > 0:
+        return lib_dir
+    return None
+
+
+def _splat_tier_dir(run: str, slot: str, model: str) -> Path:
+    """Where a cell's splat tier lives: beside the generated build when the cell
+    has one (`objects-generated-splat/`, mirroring the lite/optimized twins), else
+    `objects-splat/` in the cell dir (library cells)."""
+    rid = _run_id(run, slot, model)
+    raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
+    if _placed_count(raw_dir) > 0 or (raw_dir.parent / generation.GENERATED_SPLAT_SUBDIR).is_dir():
+        return raw_dir.parent / generation.GENERATED_SPLAT_SUBDIR
+    return _slot_dir(run, slot, model) / "objects-splat"
+
+
+def _splat_source(run: str, slot: str, model: str) -> tuple[Path, str] | None:
+    """The splat pipeline's mesh source for a cell — always the SPLAT tier — or
+    None when the cell can neither rebuild it (no vanilla source) nor already has
+    it on disk. The returned dir may not exist yet; stage jobs call
+    `_ensure_splat_tier` before touching it."""
+    tier = _splat_tier_dir(run, slot, model)
+    if _placed_count(tier) > 0 or _splat_tier_source(run, slot, model) is not None:
+        return tier, "splat"
     return None
 
 
@@ -1756,19 +1773,65 @@ async def _run_lite_build(
         job["finished_at"] = datetime.now().isoformat(timespec="seconds")
 
 
+async def _ensure_splat_tier(run: str, slot: str, model: str, job: dict[str, Any]) -> Path:
+    """Build (or freshen) the cell's splat tier from its vanilla source, streaming
+    the builder's "[i/N]" progress into `job` under phase 'tier'. Idempotent and
+    resumable — the builder skips up-to-date twins, so a built tier returns in one
+    subprocess pass of stat checks. Returns the tier dir; raises when the cell has
+    no vanilla source and no prebuilt tier."""
+    tier = _splat_tier_dir(run, slot, model)
+    src = _splat_tier_source(run, slot, model)
+    if src is None:
+        if _placed_count(tier) > 0:
+            return tier  # prebuilt tier shipped without its source — use as-is
+        raise FileNotFoundError(
+            "no vanilla build to make the splat tier from (need objects-generated/ "
+            "or a raw library objects/)"
+        )
+    job["phase"] = "tier"
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable, "-u", str(_BUILD_LITE_SCRIPT), "--preset", "splat",
+        "--src-dir", str(src), "--out-dir", str(tier),
+        cwd=str(_REPO_ROOT),
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    assert proc.stdout is not None
+    tail = ""
+    async for chunk in proc.stdout:
+        line = chunk.decode(errors="replace").strip()
+        if not line:
+            continue
+        tail = line
+        m = re.search(r"\[(\d+)/(\d+)\]", line)
+        if m:
+            job["done"], job["total"] = int(m.group(1)), int(m.group(2))
+            job["current_id"] = "tier"
+    rc = await proc.wait()
+    if rc != 0:
+        raise RuntimeError(f"splat-tier build failed (exit {rc}): {tail[:300]}")
+    if _placed_count(tier) == 0:
+        raise RuntimeError(f"splat-tier build produced no meshes in {tier}")
+    return tier
+
+
 def _discover_splat_stage1_cells(run: str) -> list[tuple[str, str, int, str]]:
-    """(slot, model, placed_count, source_kind) for every cell in `run` that has
-    placed meshes in either build — the cells Stage 1 can convert. `source_kind`
-    is 'generated' (vanilla raw build) or 'library' (KTX2/Meshopt, de-optimized
-    on convert). Disk-only; never hydrates the run."""
+    """(slot, model, placed_count, source_kind) for every cell in `run` the splat
+    pipeline can work on — one whose splat tier is built or buildable. The count is
+    the built tier's placed meshes, else the vanilla source's (what the tier will
+    contain once built). Disk-only; never hydrates the run."""
     out: list[tuple[str, str, int, str]] = []
     for slot in SLOTS:
         for alias in MODEL_ALIASES:
             source = _splat_source(run, slot.id, alias)
             if source is None:
                 continue
-            src_dir, kind = source
-            out.append((slot.id, alias, _placed_count(src_dir), kind))
+            tier_dir, kind = source
+            placed = _placed_count(tier_dir)
+            if placed == 0:
+                src = _splat_tier_source(run, slot.id, alias)
+                placed = _placed_count(src) if src is not None else 0
+            out.append((slot.id, alias, placed, kind))
     return out
 
 
@@ -1822,31 +1885,23 @@ def _deoptimize_dir(src_dir: Path, out_dir: Path) -> None:
         raise RuntimeError(f"de-optimize failed ({result.returncode}): {detail}")
 
 
-def _assemble_cell_from_source(
+def _assemble_cell_from_tier(
     run: str,
     slot: str,
     model: str,
-    src_dir: Path,
-    kind: str,
+    tier_dir: Path,
     events_path: Path,
     out_path: Path,
     progress: splat_stage1.ProgressCb,
 ) -> dict[str, Any]:
-    """Run Stage 1 for one cell. A 'generated' source is vanilla and assembled
-    directly; a 'library' source is KTX2/Meshopt, so it's de-optimized into a
-    throwaway temp dir first (the on-disk originals are untouched). Blocking —
-    run via asyncio.to_thread."""
-    if kind == "generated":
-        return splat_stage1.assemble_cell(
-            run=run, slot=slot, model=model, raw_dir=src_dir,
-            events_path=events_path, out_path=out_path, runs_dir=RUNS_DIR,
-            progress=progress,
-        )
+    """Run Stage 1 for one cell off its splat tier: the tier is KTX2/Meshopt, so
+    it's de-optimized into a throwaway temp dir first (the on-disk tier is
+    untouched). Blocking — run via asyncio.to_thread."""
     # Temp on the runs volume (not the system temp, which may be a small/full
     # tmpfs) — mirrors scripts/export_scene_usd.py; auto-removed on exit.
     with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
         vanilla_dir = Path(tmp)
-        _deoptimize_dir(src_dir, vanilla_dir)
+        _deoptimize_dir(tier_dir, vanilla_dir)
         return splat_stage1.assemble_cell(
             run=run, slot=slot, model=model, raw_dir=vanilla_dir,
             events_path=events_path, out_path=out_path, runs_dir=RUNS_DIR,
@@ -1855,25 +1910,23 @@ def _assemble_cell_from_source(
 
 
 async def _run_splat_stage1_cell(run: str, slot: str, model: str) -> None:
-    """Convert ONE cell: the blocking work (optional library de-optimize +
-    trimesh assembly) runs off the event loop via a thread, and per-object
+    """Convert ONE cell: ensure the splat tier, then run the blocking work (tier
+    de-optimize + trimesh assembly) off the event loop via a thread; per-object
     progress lands in the cell's job dict that the status endpoints serve."""
     key = (run, slot, model)
     job = _splat_stage1_jobs[key]
     try:
-        source = _splat_source(run, slot, model)
-        if source is None:
-            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
-        src_dir, kind = source
+        tier_dir = await _ensure_splat_tier(run, slot, model, job)
         events_path = _slot_dir(run, slot, model) / "events.jsonl"
         out_path = _slot_dir(run, slot, model) / "splat" / splat_stage1.MANIFEST_NAME
+        job["phase"] = "assemble"
 
         def _progress(done: int, total: int, current: str) -> None:
             job["done"], job["total"], job["current_id"] = done, total, current
 
         job["summary"] = await asyncio.to_thread(
-            _assemble_cell_from_source,
-            run, slot, model, src_dir, kind, events_path, out_path, _progress,
+            _assemble_cell_from_tier,
+            run, slot, model, tier_dir, events_path, out_path, _progress,
         )
         job["status"] = "done"
         job["current_id"] = None
@@ -2009,38 +2062,32 @@ def _voxels_path(run: str, slot: str, model: str) -> Path:
     return _slot_dir(run, slot, model) / "splat" / splat_stage2.VOXELS_NAME
 
 
-def _voxelize_from_source(
+def _voxelize_from_tier(
     run: str,
     slot: str,
     model: str,
-    src_dir: Path,
-    kind: str,
+    tier_dir: Path,
     out_path: Path,
     params: splat_stage2.FreeSpaceParams,
     job: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compute a cell's free-space grid (Stage 2), de-optimizing a library source to
-    vanilla ONCE first. Tracks `job['phase']` ('deopt' / 'voxelize'). Blocking."""
+    """Compute a cell's free-space grid (Stage 2) off its splat tier, de-optimizing
+    it to vanilla ONCE first. Tracks `job['phase']` ('deopt' / 'voxelize'). Blocking."""
 
     def _progress(done: int, total: int, current: str) -> None:
         job["phase"], job["done"], job["total"], job["current_id"] = (
             "voxelize", done, total, current,
         )
 
-    def _run(vanilla_dir: Path) -> dict[str, Any]:
+    job["phase"] = "deopt"
+    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
+        vanilla_dir = Path(tmp)
+        _deoptimize_dir(tier_dir, vanilla_dir)
         job["phase"] = "voxelize"
         return splat_stage2.compute_free_space(
             run=run, slot=slot, model=model, raw_dir=vanilla_dir,
             out_path=out_path, params=params, progress=_progress,
         )
-
-    if kind == "generated":
-        return _run(src_dir)
-    job["phase"] = "deopt"
-    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
-        vanilla_dir = Path(tmp)
-        _deoptimize_dir(src_dir, vanilla_dir)
-        return _run(vanilla_dir)
 
 
 async def _run_splat_stage2_cell(
@@ -2051,13 +2098,10 @@ async def _run_splat_stage2_cell(
     key = (run, slot, model)
     job = _splat_stage2_jobs[key]
     try:
-        source = _splat_source(run, slot, model)
-        if source is None:
-            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
-        src_dir, kind = source
+        tier_dir = await _ensure_splat_tier(run, slot, model, job)
         out_path = _freespace_path(run, slot, model)
         summary = await asyncio.to_thread(
-            _voxelize_from_source, run, slot, model, src_dir, kind, out_path, params, job,
+            _voxelize_from_tier, run, slot, model, tier_dir, out_path, params, job,
         )
         job["summary"] = summary
         with contextlib.suppress(Exception):
@@ -2089,7 +2133,6 @@ class Stage3Request(BaseModel):
     radius_frac: float = splat_stage3.DEFAULT_RADIUS_FRAC
     flatness: float = splat_stage3.DEFAULT_FLATNESS
     adaptive: bool = True
-    feature_boost: float = splat_stage3.DEFAULT_FEATURE_BOOST  # crease/boundary refinement (1 = off)
     cull_hidden: bool = True
     detail_splats: int | None = None
     representation: str | None = None  # "2dgs" (default) | "3dgs" (compat/compression)
@@ -2120,19 +2163,18 @@ def _stage3_params(
         else None
     )
     rep = req.representation if req.representation in ("2dgs", "3dgs") else "2dgs"
-    boost = float(min(max(req.feature_boost, 1.0), 8.0))
     base = splat_stage3.SampleParams(
         target_splats=target, splat_density=density, base_spacing=base_spacing,
         radius_frac=radius, flatness=flat, adaptive=bool(req.adaptive),
-        feature_boost=boost, cull_hidden=bool(req.cull_hidden), representation=rep,
+        cull_hidden=bool(req.cull_hidden), representation=rep,
     )
     detail = None
     if req.detail_splats:
         detail = splat_stage3.SampleParams(
             target_splats=int(min(max(req.detail_splats, 50_000), 50_000_000)),
             splat_density=None, base_spacing=None, radius_frac=radius, flatness=flat,
-            adaptive=bool(req.adaptive), feature_boost=boost,
-            cull_hidden=bool(req.cull_hidden), representation=rep,
+            adaptive=bool(req.adaptive), cull_hidden=bool(req.cull_hidden),
+            representation=rep,
         )
     return base, detail
 
@@ -2282,8 +2324,7 @@ def _sample_cell_lods(
     run: str,
     slot: str,
     model: str,
-    src_dir: Path,
-    kind: str,
+    tier_dir: Path,
     freespace_path: Path,
     out_path: Path,
     base_params: splat_stage3.SampleParams,
@@ -2291,7 +2332,7 @@ def _sample_cell_lods(
     job: dict[str, Any],
 ) -> dict[str, Any]:
     """Sample a cell into a base surfel cloud (and, if `detail_params`, a denser LOD),
-    consuming the Stage-2 free-space grid and de-optimizing a library source ONCE.
+    consuming the Stage-2 free-space grid and de-optimizing the splat tier ONCE.
     Tracks `job['phase']` ('deopt' / 'base' / 'detail'). Blocking."""
     detail_path = out_path.with_suffix(".detail.ply")
 
@@ -2324,12 +2365,10 @@ def _sample_cell_lods(
             detail_path.unlink(missing_ok=True)  # drop any stale detail LOD
         return summary
 
-    if kind == "generated":
-        return _sample(src_dir)
     job["phase"] = "deopt"
     with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
         vanilla_dir = Path(tmp)
-        _deoptimize_dir(src_dir, vanilla_dir)
+        _deoptimize_dir(tier_dir, vanilla_dir)
         return _sample(vanilla_dir)
 
 
@@ -2345,16 +2384,13 @@ async def _run_splat_stage3_cell(
     key = (run, slot, model)
     job = _splat_stage3_jobs[key]
     try:
-        source = _splat_source(run, slot, model)
-        if source is None:
-            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
         freespace = _freespace_path(run, slot, model)
         if not freespace.is_file():
             raise FileNotFoundError("run Stage 2 (free-space) first")
-        src_dir, kind = source
+        tier_dir = await _ensure_splat_tier(run, slot, model, job)
         out_path = _cloud_path(run, slot, model)
         summary = await asyncio.to_thread(
-            _sample_cell_lods, run, slot, model, src_dir, kind,
+            _sample_cell_lods, run, slot, model, tier_dir,
             freespace, out_path, base_params, detail_params, job,
         )
         job["summary"] = summary
@@ -2376,25 +2412,33 @@ async def _run_splat_stage3_cell(
 
 class Stage4Request(BaseModel):
     """Coverage-planner knobs (all optional; omitted → defaults). `min_gain`
-    truncates the diminishing tail (higher = fewer cameras); `angles_per_patch`
-    is K; `patch_fraction` is the uniform surfel→patch thinning (detail now
-    arrives in the cloud itself — Stage 3's feature-adaptive density — so there
-    are no detector knobs here). The cube-face `render_resolution` +
-    `min_px_per_patch` set the shared reference-render intrinsics from which the
-    footprint budget (view distance) is derived — matching what Stage 5 will
-    render."""
+    truncates the diminishing tail (higher = fewer images); `patch_min_spacing`
+    sets the finest patch detail. Scale is not a knob: view distances derive per
+    patch from the SCALE LADDER (see splat/stage4.py) — `finest_px_per_patch` is
+    its single dial, the sharpest demanded resolution in pixels per patch
+    feature (capped at `render_resolution`, where a view saturates); the ladder
+    runs from there down to 1 px in octaves. `angular_bins` is the single
+    direction dial: equal-solid-angle cells (an explicit direct-facing cap + a
+    ring of azimuth cells) tiling the hemisphere around each patch normal, all
+    suppliable cells demanded. The old `near_frac` / `min_px_per_patch` /
+    `angles_per_patch` / `angular_sectors` knobs are gone (subsumed; unknown
+    fields in a request body are ignored)."""
 
-    patch_fraction: float | None = None
+    patch_min_spacing: float | None = None
+    patch_max_spacing: float | None = None
     collision_clearance: float | None = None
-    angles_per_patch: int | None = None
-    angular_sectors: int | None = None
-    near_frac: float | None = None
-    headon_cos: float | None = None
+    angular_bins: int | None = None
+    finest_px_per_patch: float | None = None
+    tex_k: float | None = None
     min_gain: int | None = None
+    # Hard image budget (the cost dial, in rendered-reference units): the greedy
+    # stops after this many images, keeping the near-optimal prefix; the
+    # summary's coverage `curve` reports what fraction of demands any budget
+    # buys. Omitted/None = run to completion of every suppliable demand.
+    max_views: int | None = None
     candidate_spacing: float | None = None
     max_candidates: int | None = None
     render_resolution: int | None = None
-    min_px_per_patch: float | None = None
     gpu: bool | None = None  # run the coverage ray-march on CUDA (default on); False forces CPU
 
 
@@ -2408,19 +2452,24 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         return float(min(max(v, lo), hi)) if v is not None else default
 
     return splat_stage4.PlanParams(
-        patch_fraction=pick(req.patch_fraction, 0.05, 1.0, d.patch_fraction),
+        patch_min_spacing=pick(req.patch_min_spacing, 0.02, 0.5, d.patch_min_spacing),
+        patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
+        tex_k=pick(req.tex_k, 0.0, 50.0, d.tex_k),
         collision_clearance=pick(req.collision_clearance, 0.05, 2.0, d.collision_clearance),
-        angles_per_patch=int(pick(req.angles_per_patch, 1, 12, d.angles_per_patch)),
-        angular_sectors=int(pick(req.angular_sectors, 3, 16, d.angular_sectors)),
-        near_frac=pick(req.near_frac, 0.1, 1.0, d.near_frac),
-        headon_cos=pick(req.headon_cos, 0.0, 0.95, d.headon_cos),
+        angular_bins=int(pick(req.angular_bins, 2, 16, d.angular_bins)),
+        # PlanParams itself caps the effective value at render_resolution
+        # (saturation); the clamp here is just request hygiene.
+        finest_px_per_patch=pick(req.finest_px_per_patch, 2.0, 2048.0, d.finest_px_per_patch),
         min_gain=int(pick(req.min_gain, 1, 500, d.min_gain)),
+        max_views=(
+            int(pick(req.max_views, 100, 5_000_000, 0)) if req.max_views is not None
+            else d.max_views
+        ),
         candidate_spacing=pick(req.candidate_spacing, 0.1, 3.0, d.candidate_spacing),
         # Generous safety ceiling (was a room-scale 20k cap); Stage 4 even-downsamples
         # and warns if a scene exceeds it, so large scenes aren't silently clipped.
         max_candidates=int(pick(req.max_candidates, 1000, 5_000_000, d.max_candidates)),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
-        min_px_per_patch=pick(req.min_px_per_patch, 2.0, 64.0, d.min_px_per_patch),
         gpu=req.gpu if req.gpu is not None else d.gpu,
     )
 
@@ -2571,15 +2620,50 @@ def _revert_after(run: str, slot: str, model: str, stage: int) -> None:
         shutil.rmtree(_stage6_ckpt_dir(run, slot, model), ignore_errors=True)
 
 
+# Stage-5 capture throughput: a trailing window over frame-completion timestamps
+# gives the LIVE images/second (decays to 0 on a stall); the session mean since
+# the first frame gives the honest overall rate (excludes tier-build/plan warm-up).
+_RATE_WINDOW_S = 5.0
+
+
+def _stage5_capture_rate(state: dict[str, Any]) -> dict[str, float]:
+    """Fresh throughput for a live capture session, computed at read time so the
+    window is always current: `rate` = images/second over the trailing
+    `_RATE_WINDOW_S` (0 until the window has data; decays to 0 within the window
+    after frames stop), `rate_avg` = frames encoded ÷ time since the first frame."""
+    now = time.monotonic()
+    buf: deque[float] = state["frame_times"]
+    while buf and now - buf[0] > _RATE_WINDOW_S:
+        buf.popleft()
+    first = state.get("first_frame_at")
+    # During warm-up (< one full window since the first frame) divide by the
+    # elapsed time, not the full window, so the number isn't understated.
+    window = min(_RATE_WINDOW_S, now - first) if first is not None else _RATE_WINDOW_S
+    rate = len(buf) / window if window > 1e-3 else 0.0
+    encoded = int(state.get("session_encoded", 0))
+    elapsed = (now - first) if first is not None else 0.0
+    rate_avg = encoded / elapsed if elapsed > 1e-3 else 0.0
+    return {"rate": round(rate, 1), "rate_avg": round(rate_avg, 1)}
+
+
 def _splat_stage5_status(run: str, slot: str, model: str) -> dict[str, Any]:
     """Public Stage-5 state: live job, else 'done' (with a small summary read from
     `refs/transforms.json`) when it's on disk, else 'idle'. Carries `url`
-    (transforms.json) for downstream consumers."""
+    (transforms.json) for downstream consumers. While a capture session is
+    producing frames, also carries the live `rate` / `rate_avg` (images/second)."""
     transforms = _refs_dir(run, slot, model) / splat_stage5.TRANSFORMS_NAME
     url = _artifact_url(transforms)
-    job = _splat_stage5_jobs.get((run, slot, model))
+    key = (run, slot, model)
+    job = _splat_stage5_jobs.get(key)
     if job is not None:
-        return {**job, "url": url}
+        out = {**job, "url": url}
+        state = _splat_stage5_state.get(key)
+        # Attach the throughput only once frames are actually flowing (a live
+        # session past its first encoded frame), so the UI shows img/s during
+        # capture and nothing during the tier-build / plan / launch phases.
+        if state is not None and state.get("first_frame_at") is not None:
+            out.update(_stage5_capture_rate(state))
+        return out
     if url is not None:
         summary: Any = None
         with contextlib.suppress(Exception):
@@ -2597,54 +2681,201 @@ def _splat_stage5_status(run: str, slot: str, model: str) -> dict[str, Any]:
     }
 
 
-def _render_refs_from_source(
-    run: str, slot: str, model: str, src_dir: Path, kind: str,
-    cameras_path: Path, out_dir: Path, job: dict[str, Any],
-) -> dict[str, Any]:
-    """Render one cell's references, de-optimizing a library source to vanilla ONCE
-    first. Tracks `job['phase']` ('deopt' / 'render'). Blocking — nvdiffrast (imported
-    lazily inside render_references) needs CUDA."""
-
-    def _progress(done: int, total: int, current: str) -> None:
-        job["phase"], job["done"], job["total"], job["current_id"] = (
-            "render", done, total, current,
-        )
-
-    def _run(vanilla_dir: Path) -> dict[str, Any]:
-        job["phase"] = "render"
-        return splat_stage5.render_references(
-            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-            cameras_path=cameras_path, out_dir=out_dir, progress=_progress,
-        )
-
-    if kind == "generated":
-        return _run(src_dir)
-    job["phase"] = "deopt"
-    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
-        vanilla_dir = Path(tmp)
-        _deoptimize_dir(src_dir, vanilla_dir)
-        return _run(vanilla_dir)
+# Capture-session watchdog limits. First frame covers the page's whole warm-up
+# (bundle download + KTX2/Meshopt decode of the full scene); between frames the
+# renderer is expected to stream steadily.
+_CAPTURE_FIRST_FRAME_S = 900.0
+_CAPTURE_STALL_S = 300.0
 
 
-async def _run_splat_stage5_cell(run: str, slot: str, model: str) -> None:
-    """Render ONE cell's references off the event loop. Requires the Stage-4
-    `cameras.json`; `refs/transforms.json` (written last) is the 'done' marker."""
+class Stage5FinishRequest(BaseModel):
+    """The capture page's sign-off body: the WebGL renderer string it ran on and
+    its throughput/per-view timing breakdown, or the error that stopped it
+    (partial artifacts stay for the next resume)."""
+
+    renderer: str | None = None
+    stats: dict[str, Any] | None = None
+    error: str | None = None
+# Encode backlog cap, in POST batches (~24 MB of raw frames each) buffered in
+# memory awaiting the encode pool before the frames endpoint pushes back on
+# the capture page.
+_CAPTURE_ENCODE_BACKLOG = 8
+
+# Capture SHARDS: the pending views are split into this many disjoint subsets,
+# each rendered by its own headless browser in parallel (each ~1 GB VRAM). Helps
+# when the per-page CLIENT is the bottleneck (heavy per-view render, or low-res
+# where POST bodies are small). MEASURED CEILING: at 1024² the wall is the single
+# server event loop ingesting the uncompressed ~6 MB/view POST bodies (GPU ~15%
+# idle, server ~2 cores), so extra shards there are ~throughput-neutral until the
+# wire payload is compressed client-side. Default 2 (safe, mild win); tune via
+# STARSHOT_CAPTURE_SHARDS (1 = single browser).
+_CAPTURE_SHARDS = max(1, int(os.environ.get("STARSHOT_CAPTURE_SHARDS", "2")))
+
+
+def _write_stage5_transforms(out_dir: Path, plan: dict[str, Any], views: list[dict[str, Any]]) -> None:
+    """Write the cell's `transforms.json` from the (deterministic) plan — identical
+    whether the views were rendered in one session or resumed across many."""
+    intr = plan["intrinsics"]
+    resolution = int(intr["resolution"])
+    K = splat_stage5.intrinsics_matrix(resolution, float(intr["face_fov_deg"]))
+    splat_stage5.write_transforms(
+        out_dir, K, resolution, float(intr["near"]), float(intr["far"]),
+        splat_stage5.reference_frames(views),
+    )
+
+
+async def _run_splat_stage5_cell(
+    run: str, slot: str, model: str, api_origin: str, client_origin: str
+) -> None:
+    """Supervise ONE cell's reference capture: ensure the splat tier, compute the
+    pending view list, launch the headless capture browser at the worker page, and
+    watch the session the manifest/frames/finish endpoints drive until it finishes
+    (or stalls / dies). `refs/transforms.json` (written last) is the 'done' marker.
+    `api_origin`/`client_origin` come from `_capture_origins` at start time (the
+    launcher binds both processes to ephemeral ports, so they vary per boot)."""
     key = (run, slot, model)
     job = _splat_stage5_jobs[key]
+    state: dict[str, Any] | None = None
+    procs: list[tuple[Any, Path]] = []
     try:
-        source = _splat_source(run, slot, model)
-        if source is None:
-            raise FileNotFoundError(f"no convertible build for {slot}/{model} in {run}")
         cameras_path = _cameras_path(run, slot, model)
         if not cameras_path.is_file():
             raise FileNotFoundError("run Stage 4 first (no camera plan)")
-        src_dir, kind = source
+        await _ensure_splat_tier(run, slot, model, job)
+
+        job["phase"] = "plan"
+        plan = await asyncio.to_thread(splat_stage5.load_camera_plan, cameras_path)
+        views = await asyncio.to_thread(splat_stage5.enumerate_views, plan)
         out_dir = _refs_dir(run, slot, model)
-        summary = await asyncio.to_thread(
-            _render_refs_from_source,
-            run, slot, model, src_dir, kind, cameras_path, out_dir, job,
+        (out_dir / splat_stage5.FRAMES_DIRNAME).mkdir(parents=True, exist_ok=True)
+        pending = await asyncio.to_thread(splat_stage5.pending_views, out_dir, views)
+        skipped = len(views) - len(pending)
+        job["total"], job["done"] = len(views), skipped
+
+        # SHARDING: split the pending views into up to `_CAPTURE_SHARDS` disjoint
+        # strided subsets, each rendered by its own headless browser in parallel
+        # (each authenticates with its own token). Fewer shards than that if there
+        # are few pending views. One shared `state` holds all tokens + the global
+        # pending set (decremented as frames land, regardless of shard).
+        pending_ids = sorted(v["id"] for v in pending)
+        n_shards = min(_CAPTURE_SHARDS, len(pending_ids)) or 1
+        tokens = [secrets.token_urlsafe(16) for _ in range(n_shards)]
+        shard_pending = {tokens[i]: pending_ids[i::n_shards] for i in range(n_shards)}
+
+        intr = plan["intrinsics"]
+        state = {
+            "tokens": set(tokens),
+            "shard_pending": shard_pending,
+            "finished_tokens": set(),
+            "out_dir": out_dir,
+            "plan": plan,
+            "views": views,
+            "pending": set(pending_ids),
+            "resolution": int(intr["resolution"]),
+            "near": float(intr["near"]),
+            "far": float(intr["far"]),
+            "fov_deg": float(intr["face_fov_deg"]),
+            "outstanding": set(),     # asyncio-wrapped encode futures in flight
+            "encode_errors": [],
+            "client_error": None,
+            "renderer": None,
+            "finished": asyncio.Event(),
+            "last_frame_at": time.monotonic(),
+            "got_frames": False,
+            # Throughput tracking (see _stage5_capture_rate): a trailing-window
+            # deque of frame-completion times + a session counter/start for the mean.
+            "frame_times": deque(),
+            "first_frame_at": None,
+            "session_encoded": 0,
+        }
+        _splat_stage5_state[key] = state
+
+        if pending_ids:
+            capture_urls = [
+                f"{client_origin}/splatcapture.html?api={quote(api_origin, safe='')}"
+                f"&run={quote(run, safe='')}&slot={quote(slot, safe='')}"
+                f"&model={quote(model, safe='')}&token={tok}"
+                for tok in tokens
+            ]
+            job["capture_url"] = capture_urls[0]   # first shard, for manual fallback / messages
+            job["capture_urls"] = capture_urls
+            job["shards"] = n_shards
+            job["phase"] = "launch"
+            for url in capture_urls:
+                proc, profile = refcapture.launch_capture_browser(url)
+                procs.append((proc, profile))
+            job["phase"] = "render"
+            while not state["finished"].is_set():
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(state["finished"].wait(), timeout=5.0)
+                    break
+                # Encode failures are systemic (bad path, full disk, version skew),
+                # never transient — abort the session on the first one instead of
+                # letting the pages render every remaining view for nothing.
+                if state["encode_errors"]:
+                    raise RuntimeError(
+                        f"frame encoding is failing ({len(state['encode_errors'])} so "
+                        f"far; first: {state['encode_errors'][0]}) — capture aborted"
+                    )
+                idle = time.monotonic() - state["last_frame_at"]
+                # Every shard browser dead with a quiet wire means the pages are
+                # gone (a manually-opened tab would still be posting).
+                if all(p.poll() is not None for p, _ in procs) and idle > 30.0:
+                    codes = ", ".join(str(p.returncode) for p, _ in procs)
+                    raise RuntimeError(
+                        f"capture browsers exited (codes {codes}) before finishing — "
+                        f"open {capture_urls[0]} in a normal browser to render "
+                        "manually, then POST stage 5 again to finalize"
+                    )
+                limit = _CAPTURE_STALL_S if state["got_frames"] else _CAPTURE_FIRST_FRAME_S
+                if idle > limit:
+                    raise RuntimeError(
+                        f"capture stalled ({int(idle)}s without frames) — check the "
+                        f"headless browser's GPU/WebGL, or open {capture_urls[0]} manually"
+                    )
+            if state["client_error"]:
+                raise RuntimeError(f"capture page: {state['client_error']}")
+            # All shards signed off — drain the last in-flight encodes before
+            # judging completeness (frames POSTed right before /finish may still
+            # be encoding; their callbacks decrement `pending`).
+            while state["outstanding"]:
+                await asyncio.wait(list(state["outstanding"]))
+            if state["encode_errors"]:
+                raise RuntimeError(
+                    f"{len(state['encode_errors'])} frame(s) failed to encode "
+                    f"(first: {state['encode_errors'][0]})"
+                )
+            if state["pending"]:
+                raise RuntimeError(
+                    f"{len(state['pending'])} view(s) still missing after the capture "
+                    "session — POST stage 5 again to resume"
+                )
+
+        # Everything on disk (either just rendered, or a finalize-only resume) →
+        # write transforms.json, the durable 'done' marker.
+        job["phase"] = "finalize"
+        await asyncio.to_thread(_write_stage5_transforms, out_dir, plan, views)
+        # Achieved capture throughput this session (frames encoded ÷ wall time
+        # since the first frame) — a persistent record of the tangible speed, so a
+        # finished Stage 5 can report e.g. "20634 views · 89/s".
+        first = state.get("first_frame_at")
+        encoded = int(state.get("session_encoded", 0))
+        img_per_s = (
+            round(encoded / (time.monotonic() - first), 1)
+            if first is not None and encoded and time.monotonic() - first > 1e-3
+            else None
         )
-        job["summary"] = summary
+        job["summary"] = {
+            "run": run, "slot": slot, "model": model,
+            "views": len(views),
+            "views_rendered": int(job["done"]) - skipped,
+            "views_skipped": skipped,
+            "cameras": len(plan["cameras"]),
+            "resolution": state["resolution"],
+            "renderer": state["renderer"],
+            "img_per_s": img_per_s,
+            "out_dir": str(out_dir),
+        }
         job["status"] = "done"
         job["phase"] = "done"
         job["current_id"] = None
@@ -2652,6 +2883,9 @@ async def _run_splat_stage5_cell(run: str, slot: str, model: str) -> None:
         job["status"] = "error"
         job["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        for proc, profile in procs:
+            refcapture.terminate_browser(proc, profile)
+        _splat_stage5_state.pop(key, None)
         job["running"] = False
         job["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _splat_stage5_tasks.pop(key, None)
@@ -3168,40 +3402,13 @@ def create_app() -> FastAPI:
             cells.append(cell)
         return {"run": run, "cells": cells}
 
-    @app.get("/runs/{run}/splat/source/{slot}/{model}")
-    async def splat_source_get(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """The cell's splat source override ('auto' when none) + the build it
-        currently resolves to."""
-        pref = _splat_source_pref(run, slot, model)
-        resolved = _splat_source(run, slot, model)
-        return {"source": pref or "auto", "resolved": resolved[1] if resolved else None}
-
-    @app.post("/runs/{run}/splat/source/{slot}/{model}")
-    async def splat_source_set(run: str, slot: str, model: str, source: str = "auto") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Pin which asset build the splat pipeline samples/renders for this cell:
-        'generated' (raw), 'generated-lite', 'generated-optimized', 'library', or
-        'auto' (clear). Applied by every stage through _splat_source — re-run the
-        stages to regenerate against the new source."""
-        path = _splat_source_pref_path(run, slot, model)
-        src = (source or "auto").strip()
-        if src in ("", "auto"):
-            path.unlink(missing_ok=True)
-        elif src in _SPLAT_SOURCE_CHOICES:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"source": src}), encoding="utf-8")
-        else:
-            raise HTTPException(status_code=400, detail=f"invalid source: {src!r}")
-        resolved = _splat_source(run, slot, model)
-        return {"source": src or "auto", "resolved": resolved[1] if resolved else None}
-
     @app.post("/runs/{run}/splat/stage1/{slot}/{model}")
     async def splat_stage1_start(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Start Stage 1 for ONE cell — its meshes (the vanilla `objects-generated/`
-        build, or the KTX2/Meshopt library build de-optimized on the fly) +
-        `events.jsonl` become a validated `splat/scene.json` (see splat/stage1.py).
-        Idempotent while running (returns the live job); a finished cell re-runs on
-        a fresh POST (cheap, overwrites). Poll the GET (or the cells list) for
-        progress."""
+        """Start Stage 1 for ONE cell — its splat tier (built on demand from the
+        vanilla source, then de-optimized for trimesh) + `events.jsonl` become a
+        validated `splat/scene.json` (see splat/stage1.py). Idempotent while running
+        (returns the live job); a finished cell re-runs on a fresh POST (cheap,
+        overwrites). Poll the GET (or the cells list) for progress."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -3404,14 +3611,16 @@ def create_app() -> FastAPI:
         return _splat_stage4_status(run, slot, model)
 
     @app.post("/runs/{run}/splat/stage5/{slot}/{model}")
-    async def splat_stage5_start(run: str, slot: str, model: str, restart: bool = False) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+    async def splat_stage5_start(run: str, slot: str, model: str, request: Request, restart: bool = False) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Render ONE cell's UNLIT reference images from its Stage-4 camera plan —
         per-view RGB (albedo) + planar-Z depth + alpha into `splat/refs/` (see
         splat/stage5.py), the supervision for the Stage-6 gsplat fine-tune. Requires
-        Stage 4 (`cameras.json`) first. CUDA-only: on a non-GPU host the job finishes
-        with a clear 'needs CUDA' error. Idempotent while running. A fresh POST RESUMES
-        (renders only the views still missing on disk); pass `restart=true` to wipe
-        `refs/` and re-render every view from scratch."""
+        Stage 4 (`cameras.json`) first. The renderer is a headless WebGL capture
+        page (client/public/js/splatcapture.js) run against the cell's splat tier;
+        the job's `capture_url` can also be opened in any browser as a manual
+        fallback. Idempotent while running. A fresh POST RESUMES (renders only the
+        views still missing on disk); pass `restart=true` to wipe `refs/` and
+        re-render every view from scratch."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -3426,8 +3635,6 @@ def create_app() -> FastAPI:
         if existing is not None and existing.get("running"):
             return dict(existing)
         if restart:
-            import shutil
-
             shutil.rmtree(_refs_dir(run, slot, model), ignore_errors=True)
             # New references supersede whatever the Stage-6 checkpoints trained on.
             shutil.rmtree(_stage6_ckpt_dir(run, slot, model), ignore_errors=True)
@@ -3435,13 +3642,14 @@ def create_app() -> FastAPI:
             "run": run, "slot": slot, "model": model, "source": kind,
             "total": 0, "done": 0, "running": True, "status": "pending",
             "phase": "pending", "current_id": None, "error": None, "summary": None,
-            "url": None,
+            "url": None, "capture_url": None, "renderer": None,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
         }
         _splat_stage5_jobs[key] = job
+        api_origin, client_origin = _capture_origins(request)
         _splat_stage5_tasks[key] = asyncio.create_task(
-            _run_splat_stage5_cell(run, slot, model)
+            _run_splat_stage5_cell(run, slot, model, api_origin, client_origin)
         )
         return dict(job)
 
@@ -3450,6 +3658,144 @@ def create_app() -> FastAPI:
         """Live Stage-5 state of one cell ('idle' / 'pending' / a running job /
         'done' with the `refs/transforms.json` `url` / 'error')."""
         return _splat_stage5_status(run, slot, model)
+
+    # --- Stage-5 capture protocol (the worker page's endpoints) ----------------
+    # The page authenticates with the per-session token minted by the runner, so
+    # a stale page from a superseded job can never write into a fresh one.
+
+    def _stage5_state_for(run: str, slot: str, model: str, token: str) -> dict[str, Any]:
+        state = _splat_stage5_state.get((run, slot, model))
+        if state is None or token not in state["tokens"]:
+            raise HTTPException(
+                status_code=409,
+                detail="no live capture session for this cell (stale token?) — POST stage 5 to start one",
+            )
+        return state
+
+    @app.get("/runs/{run}/splat/stage5/{slot}/{model}/manifest")
+    async def splat_stage5_manifest(run: str, slot: str, model: str, token: str = "") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The capture page's work order: shared intrinsics, the camera-plan and
+        splat-tier bundle URLs, and THIS shard's still-missing view ids (each
+        token owns a disjoint subset; the intersection with the global pending set
+        skips any already on disk on a resume)."""
+        state = _stage5_state_for(run, slot, model, token)
+        pending = state["pending"]
+        shard = [vid for vid in state["shard_pending"][token] if vid in pending]
+        return {
+            "run": run, "slot": slot, "model": model,
+            "resolution": state["resolution"],
+            "near": state["near"],
+            "far": state["far"],
+            "fov_deg": state["fov_deg"],
+            "background": list(splat_stage5.BACKGROUND_RGB),
+            "cameras_url": _artifact_url(_cameras_path(run, slot, model)),
+            "bundle_url": (
+                f"/slots/{quote(slot, safe='')}/{quote(model, safe='')}/meshes"
+                f"?run={quote(run, safe='')}&variant=splat"
+            ),
+            "pending": shard,
+            "total": len(state["views"]),
+        }
+
+    @app.post("/runs/{run}/splat/stage5/{slot}/{model}/frames")
+    async def splat_stage5_frames(run: str, slot: str, model: str, request: Request, token: str = "") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Ingest one binary SRF1 frame batch from the capture page: each view's
+        raw RGBA + depth-code buffers go straight to the PNG encode pool (the
+        artifacts land atomically; `job['done']` advances as encodes finish). Backs
+        off when the encode backlog is full, which flow-controls the renderer."""
+        state = _stage5_state_for(run, slot, model, token)
+        body = await request.body()
+        try:
+            frames = refcapture.parse_frame_batch(body)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        state["last_frame_at"] = time.monotonic()
+        state["got_frames"] = True
+        job = _splat_stage5_jobs.get((run, slot, model))
+        batch: list[tuple[str, int, int, int]] = []
+        for vid, resolution, rgba_off, depth_off in frames:
+            if resolution != state["resolution"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"{vid}: resolution {resolution} != plan {state['resolution']}",
+                )
+            if vid not in state["pending"]:
+                continue  # duplicate of an already-encoded view (page retry) — skip
+            batch.append((vid, resolution, rgba_off, depth_off))
+        if batch:
+            # The whole POST batch goes to the pool as ONE task, body untouched:
+            # descriptors only on the event loop, pixel slicing in the worker —
+            # the loop was measured saturating a core on byte copies at ~100/s.
+            vids = [b[0] for b in batch]
+            afut = asyncio.wrap_future(
+                refcapture.submit_encode_batch(state["out_dir"], body, batch)
+            )
+            state["outstanding"].add(afut)
+
+            def _encoded(f: asyncio.Future, vids: list[str] = vids) -> None:
+                state["outstanding"].discard(f)
+                exc = f.exception()
+                if exc is not None:
+                    state["encode_errors"].append(f"{vids[0]}…{vids[-1]}: {exc}")
+                    return
+                now = time.monotonic()
+                state["last_frame_at"] = now
+                # Views are "done" the instant their frames land on disk, so time
+                # completions here for the live throughput readout.
+                if state.get("first_frame_at") is None:
+                    state["first_frame_at"] = now
+                for vid in vids:
+                    state["pending"].discard(vid)
+                    state["frame_times"].append(now)
+                state["session_encoded"] = int(state.get("session_encoded", 0)) + len(vids)
+                if job is not None:
+                    job["done"] = int(job.get("done") or 0) + len(vids)
+                    job["current_id"] = vids[-1]
+
+            afut.add_done_callback(_encoded)
+        while len(state["outstanding"]) > _CAPTURE_ENCODE_BACKLOG:
+            await asyncio.wait(list(state["outstanding"]), return_when=asyncio.FIRST_COMPLETED)
+        return {
+            "done": int(job.get("done") or 0) if job else 0,
+            "total": len(state["views"]),
+        }
+
+    @app.post("/runs/{run}/splat/stage5/{slot}/{model}/finish")
+    async def splat_stage5_finish(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: Stage5FinishRequest | None = None, token: str = "",
+    ) -> dict[str, object]:
+        """The capture page's sign-off: drain the in-flight encodes and report how
+        many views are still missing (0 ⇒ the supervising job finalizes
+        transforms.json and lands 'done'). A body `error` marks the session failed
+        — partial artifacts stay on disk for the next resume."""
+        state = _stage5_state_for(run, slot, model, token)
+        payload = body or Stage5FinishRequest()
+        if payload.renderer:
+            state["renderer"] = payload.renderer
+        if payload.stats:
+            job = _splat_stage5_jobs.get((run, slot, model))
+            if job is not None:
+                # Merge per-shard timing; keep the max observed throughput label.
+                prev = job.get("capture_stats") or {}
+                merged = dict(payload.stats)
+                if prev.get("views_per_s") and payload.stats.get("views_per_s"):
+                    merged["views_per_s"] = round(prev["views_per_s"] + payload.stats["views_per_s"], 2)
+                job["capture_stats"] = merged
+        if payload.error:
+            # One shard failing fails the whole session (partial frames stay for
+            # the next resume) — wake the supervisor immediately.
+            state["client_error"] = str(payload.error)[:500]
+            state["finished"].set()
+            return {"ok": False, "missing": len(state["pending"])}
+        # This shard is done rendering + posting. Mark it; the SUPERVISOR drains
+        # the shared in-flight encodes and finalizes only once EVERY shard has
+        # signed off (draining here would block this shard on other shards' still-
+        # arriving frames, since `outstanding` is session-wide).
+        state["finished_tokens"].add(token)
+        if state["finished_tokens"] >= state["tokens"]:
+            state["finished"].set()
+        missing = len(state["pending"])
+        return {"ok": missing == 0 and not state["encode_errors"], "missing": missing}
 
     @app.post("/runs/{run}/splat/stage6/{slot}/{model}")
     async def splat_stage6_start(  # pyright: ignore[reportUnusedFunction]
@@ -3621,6 +3967,18 @@ def create_app() -> FastAPI:
         # `<id>.raw.glb` intermediates, so either dir streams the finished set.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
+        # `variant=splat` streams the cell's splat tier UNfiltered — the exact set
+        # the splat stages sample/deopt, so the Stage-5 capture renders precisely
+        # what Stages 2/3 measured (no committed-event filtering).
+        if variant == "splat":
+            tier_dir = _splat_tier_dir(run, slot_id, model_alias)
+            if _placed_count(tier_dir) == 0:
+                raise HTTPException(status_code=409, detail="splat tier not built for this cell")
+            return StreamingResponse(
+                _mesh_bundle(tier_dir, None),
+                media_type="application/octet-stream",
+                headers={"Cache-Control": "no-store"},
+            )
         cell_dir = slot_log.events_path.parent
         events = list(slot_log.state["events"])
         if until_index is not None:

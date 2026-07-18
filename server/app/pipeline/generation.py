@@ -140,6 +140,10 @@ GENERATED_OPT_SUBDIR = "objects-generated-optimized"
 # Presentation "lite" twin (server/scripts/build_lite_assets.py): near-lossless
 # geometry + high-res UASTC, sitting beside the raw/optimized builds.
 GENERATED_LITE_SUBDIR = "objects-generated-lite"
+# Splat-pipeline sample/render tier (build_lite_assets.py --preset splat):
+# optimized-grade decimation + 1024px KTX2/ETC1S base color, other maps stripped.
+# The single asset source every splat stage (2/3/5) reads.
+GENERATED_SPLAT_SUBDIR = "objects-generated-splat"
 GENERATED_EVENTS_NAME = "events.generated.jsonl"
 
 # Older builds nested each build under generated/<n>/. We no longer create those;

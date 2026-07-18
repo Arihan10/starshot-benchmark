@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Offline "lite" asset builder for starshot-benchmark runs.
+"""Offline per-cell asset-tier builder for starshot-benchmark runs.
 
-Ported from the Unity replay's raw-lite tier. Produces presentation-quality GLB
-twins that are visually identical to the raw meshes but land ~5x smaller on disk
-(and far lighter in VRAM), by running each raw GLB through the shared optimizer's
-`lite` preset: weld + dedup + error-bounded (near-lossless) simplify + prune +
-Meshopt geometry compression + KTX2/UASTC textures.
+Ported from the Unity replay's raw-lite tier. Runs each raw GLB through the
+shared optimizer (server/tools/optimize-assets/optimize.mjs) under a chosen
+`--preset` (default `lite`), producing a drop-in twin directory:
+
+  lite   presentation tier — weld + dedup + error-bounded (near-lossless)
+         simplify + prune + Meshopt geometry compression + KTX2/UASTC textures.
+         Visually identical to raw at ~5x smaller on disk.
+  splat  splat-pipeline sample/render tier — optimized-grade decimation with
+         1024px KTX2/ETC1S base color, all other PBR maps stripped (the splat
+         pipeline is unlit). The single asset source every splat stage reads.
 
 On-disk contract (matches the Unity replay's AssetSource.ResolveMeshPath, so the
 Starshot Replay window loads the output without any further wiring):
@@ -109,8 +114,8 @@ def _copy_png(src_glb: Path, out_dir: Path, force: bool) -> None:
             pass
 
 
-def _build_one(target: Target, src: Path, force: bool) -> str:
-    """Build one lite GLB via `optimize.mjs --preset lite`. Returns done|skip."""
+def _build_one(target: Target, src: Path, force: bool, preset: str = "lite") -> str:
+    """Build one GLB twin via `optimize.mjs --preset <preset>`. Returns done|skip."""
     out = target.out_dir / src.name
     if not force and _is_fresh(src, out):
         _copy_png(src, target.out_dir, force)
@@ -124,7 +129,7 @@ def _build_one(target: Target, src: Path, force: bool) -> str:
     try:
         proc = subprocess.run(
             [
-                _NODE_BIN, str(_OPTIMIZE_SCRIPT), "--preset", "lite",
+                _NODE_BIN, str(_OPTIMIZE_SCRIPT), "--preset", preset,
                 "--file", str(src), "--out-file", str(tmp),
             ],
             cwd=str(_OPTIMIZE_DIR),
@@ -209,7 +214,9 @@ def main() -> int:
                         help='asset set: "library" or a generated version number (default: library)')
     parser.add_argument("--targets-file", help='JSON {"targets":[{run,slot,model,version}]}')
     parser.add_argument("--src-dir", help="explicit raw source dir (bypasses --runs/--filter/--version)")
-    parser.add_argument("--out-dir", help="explicit lite output dir (used with --src-dir)")
+    parser.add_argument("--out-dir", help="explicit output dir (used with --src-dir)")
+    parser.add_argument("--preset", default="lite", choices=("lite", "splat"),
+                        help="optimizer preset for the twin (default: lite)")
     parser.add_argument("--force", action="store_true", help="rebuild even if the lite GLB is up to date")
     parser.add_argument("--limit", type=int, default=0, help="build at most N files (0 = all; for smoke tests)")
     parser.add_argument("--concurrency", type=int, default=4, help="parallel optimizer processes")
@@ -235,11 +242,11 @@ def main() -> int:
         return 0
 
     print(f"[lite] {total} file(s) across {len(targets)} set(s) "
-          f"-> lite tier (preset lite), concurrency {args.concurrency}", flush=True)
+          f"-> preset {args.preset}, concurrency {args.concurrency}", flush=True)
 
     done = built = skipped = failed = 0
     with ThreadPoolExecutor(max_workers=max(1, args.concurrency)) as pool:
-        futures = {pool.submit(_build_one, t, src, args.force): (t, src) for t, src in work}
+        futures = {pool.submit(_build_one, t, src, args.force, args.preset): (t, src) for t, src in work}
         for future in as_completed(futures):
             target, src = futures[future]
             done += 1
