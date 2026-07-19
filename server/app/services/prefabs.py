@@ -18,7 +18,6 @@ generation module that drives this.
 from __future__ import annotations
 
 import asyncio
-import sys
 from typing import Any
 
 from pydantic import BaseModel
@@ -26,6 +25,7 @@ from pydantic import BaseModel
 from app.core.slots import MODELS
 from app.core.types import BoundingBox
 from app.services import llm
+from app.utils import logging as rlog
 
 SYSTEM_PREFAB_MATCH = """\
 You are part of a 3D scene builder that generates assets from scratch. To keep \
@@ -89,11 +89,10 @@ async def _match_call(*, user: str, seed_id: str) -> DuplicateMatchOutput | None
             )
         except Exception as e:  # noqa: BLE001 — best-effort: any failure falls back to no-match
             giving_up = attempt >= PREFAB_MATCH_ATTEMPTS
-            print(
+            rlog.console_note(
                 f"[prefabs] prefab_match {seed_id!r} attempt {attempt}/{PREFAB_MATCH_ATTEMPTS} "
                 f"failed ({type(e).__name__}: {str(e)[:140]}) — "
-                f"{'giving up (no matches)' if giving_up else 'retrying'}",
-                file=sys.stderr,
+                f"{'giving up (no matches)' if giving_up else 'retrying'}"
             )
     return None
 

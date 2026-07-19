@@ -293,6 +293,9 @@ export function createObsDock(hostEl, { trace = true } = {}) {
       text: [
         call.model ?? "",
         `tokens ${call.tokens_in ?? "?"} in / ${call.tokens_out ?? "?"} out`,
+        call.flight_ms != null
+          ? `flight ${(call.flight_ms / 1000).toFixed(1)}s${(call.attempts ?? 1) > 1 ? ` (${call.attempts} tries)` : ""}`
+          : null,
         call.seeded ? "SEEDED from a vetted prompt-lab test (no live call)" : null,
       ].filter(Boolean).join(" · "),
     }));

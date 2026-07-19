@@ -18,8 +18,12 @@ Two utility modules read the persisted log: `utils/cache.py`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
+import logging as _stdlib_logging
+import queue
 import sys
+import threading
 import time
 from contextvars import ContextVar
 from pathlib import Path
@@ -36,8 +40,90 @@ try:
 except (AttributeError, OSError, ValueError):
     pass
 
-_console = Console()
 _console_suppressed = False
+
+
+class _NonBlockingStream:
+    """Write-through text stream wrapper that never blocks the caller.
+
+    Pipeline logging and uvicorn's access log both write from the asyncio event
+    loop. A blocking write to a stalled stdout — a terminal whose window/panel
+    was closed while the process kept running, or a Windows console paused by a
+    text selection — freezes the loop and hangs every request until the sink
+    drains, which may be never. So `write()` parks the text on a bounded queue
+    and returns at once; a daemon thread does the real write. If the sink wedges
+    the queue fills and writes are dropped (events.jsonl + SSE still hold every
+    event). Non-write attributes delegate to the wrapped stream so terminal
+    detection (isatty/encoding/fileno) is unchanged."""
+
+    def __init__(self, stream: TextIO, *, maxsize: int = 65_536) -> None:
+        self._stream = stream
+        self._queue: queue.Queue[str] = queue.Queue(maxsize=maxsize)
+        self.dropped = 0
+        threading.Thread(
+            target=self._drain, name="log-stream-writer", daemon=True
+        ).start()
+
+    def _drain(self) -> None:
+        while True:
+            chunk = self._queue.get()
+            if _console_suppressed:
+                continue
+            try:
+                self._stream.write(chunk)
+                self._stream.flush()
+            except Exception:
+                pass
+
+    def write(self, text: str) -> int:
+        if not _console_suppressed:
+            try:
+                self._queue.put_nowait(text)
+            except queue.Full:
+                self.dropped += 1
+        return len(text)
+
+    def flush(self) -> None:
+        # The drainer flushes after every chunk; a caller-side flush must never
+        # block the event loop, so it is a no-op.
+        pass
+
+    def __getattr__(self, name: str) -> Any:
+        stream = self.__dict__.get("_stream")
+        if stream is None:
+            raise AttributeError(name)
+        return getattr(stream, name)
+
+
+_console = Console(file=_NonBlockingStream(sys.stdout))
+
+
+def console_note(message: str) -> None:
+    """Emit a one-off diagnostic line without blocking the caller — for paths
+    off the SlotLog stream (key rotation, prefab-match fallbacks) that would
+    otherwise `print()` straight to a possibly-stalled stdout on the loop."""
+    if _console_suppressed:
+        return
+    _console.print(message, markup=False, highlight=False)
+
+
+def install_nonblocking_stdlib_logging() -> None:
+    """Defer uvicorn's per-request log writes off the event loop.
+
+    Uvicorn logs each request from the loop thread; on a stalled stdout that
+    blocks the loop exactly like the pipeline console did, so a reconnecting
+    client's polling would re-freeze the server. Wrap each uvicorn
+    StreamHandler's stream so only the real write is deferred — the handler and
+    its formatter are untouched. Idempotent; call once at startup after uvicorn
+    has configured logging."""
+    for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+        for handler in _stdlib_logging.getLogger(name).handlers:
+            stream = getattr(handler, "stream", None)
+            if isinstance(handler, _stdlib_logging.StreamHandler) and not isinstance(
+                stream, _NonBlockingStream
+            ):
+                with contextlib.suppress(Exception):
+                    handler.setStream(_NonBlockingStream(stream))
 
 _CONSOLE_OMIT_FIELDS = frozenset({"system", "user", "output", "reasoning", "content"})
 _CONSOLE_COMPACT_KINDS = frozenset({"cache.llm"})
@@ -355,19 +441,10 @@ def _print(slot_id: str, event: dict[str, Any]) -> None:
         f"[dim]\\[{slot_id}][/dim] [bold {color}]{kind}[/bold {color}]",
     )
     if not fields:
-        _flush_stdout()
         return
     width = max(len(k) for k, _ in fields)
     for k, v in fields:
         _console.print(f"  [dim]{k.ljust(width)}[/dim]  {escape(_fmt(v))}")
-    _flush_stdout()
-
-
-def _flush_stdout() -> None:
-    try:
-        sys.stdout.flush()
-    except OSError:
-        pass
 
 
 def _fmt(value: Any) -> str:

@@ -11,6 +11,7 @@ import { initLab } from "./promptlab.js";
 import { initCompare } from "./compare.js";
 import { initRunCompare } from "./runcompare.js";
 import { initCost } from "./cost.js";
+import { initFlights } from "./flights.js";
 import { initQueuePanel } from "./queue.js";
 import { initLighting } from "./lighting.js";
 import { createRunCombo } from "./runcombo.js";
@@ -677,6 +678,7 @@ document.getElementById("btn-copy-cell").addEventListener("click", copyCellModal
   initCompare();
   initRunCompare();
   initCost();
+  initFlights();
   initQueuePanel();
 
   try {

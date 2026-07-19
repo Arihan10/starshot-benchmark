@@ -56,6 +56,7 @@ from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import committed, divider, generation, object_wipe
 from app.services import llm, prefabs, threed
 from app.services import symmetry as sym_svc
+from app.utils import flightlog
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
@@ -1076,6 +1077,24 @@ def _resolve_run(run: str | None) -> str:
     return resolved
 
 
+def _parse_flight_filters(raw: str | None) -> dict[str, list[str]]:
+    """The api-log's facet filters arrive as a JSON object `{facet: [values]}`.
+    Malformed input is treated as no filter rather than erroring the page."""
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {
+        str(k): [str(x) for x in v]
+        for k, v in data.items()
+        if isinstance(v, list) and v
+    }
+
+
 def _run_meta(run: str) -> dict[str, object]:
     """The run's `run.json` (prompt version name, created_at), or {} for runs
     that predate the file-based prompt versioning."""
@@ -1530,6 +1549,9 @@ def _hydrate_branches(run: str) -> None:
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+        # Move uvicorn's per-request access/error logging off the event loop so a
+        # stalled stdout (closed/hidden terminal) can't freeze request handling.
+        rlog.install_nonblocking_stdlib_logging()
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         global _current_run
         # Open on the most recently touched run (if any); other runs hydrate
@@ -2023,6 +2045,55 @@ def create_app() -> FastAPI:
             "pools": threed.queue_pools(),
             "entries": threed.queue_snapshot(),
         }
+
+    @app.get("/flights")
+    async def flights(  # pyright: ignore[reportUnusedFunction]
+        run: str | None = None, cursor: str | None = None, limit: int = 100, filters: str | None = None,
+    ) -> dict[str, object]:
+        """One keyset page (newest first, 100 by default) of a run's first-party
+        LLM request ledger (`app.utils.flightlog`), unified across the run's
+        per-scene SQLite DBs via ATTACH. Metadata only — prompt bytes are fetched
+        lazily via `/flights/detail`."""
+        limit = max(1, min(limit, 200))
+        return await asyncio.to_thread(
+            flightlog.page, _resolve_run(run), cursor=cursor, limit=limit,
+            filters=_parse_flight_filters(filters),
+        )
+
+    @app.get("/flights/detail")
+    async def flight_detail(scene: str, id: int) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The exact system/user prompt + model output for ONE request row, read
+        straight from its scene DB (never from `events.jsonl`)."""
+        data = await asyncio.to_thread(flightlog.detail, scene, id)
+        if data is None:
+            raise HTTPException(status_code=404, detail="no prompt captured for this request")
+        return data
+
+    @app.get("/flights/facets")
+    async def flight_facets(run: str | None = None, filters: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Per-attribute distinct values + counts (for the filter dropdowns) and
+        the total matching count, computed server-side across the run's scenes."""
+        return await asyncio.to_thread(
+            flightlog.facets, _resolve_run(run), filters=_parse_flight_filters(filters),
+        )
+
+    @app.get("/flights/stream")
+    async def flights_stream(run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        """Live SSE tail of new request rows for `run`, filtered by scene prefix.
+        History comes from `/flights`; this only streams rows as they land."""
+        prefix = _resolve_run(run) + "/"
+        q = flightlog.subscribe()
+
+        async def gen() -> AsyncIterator[str]:
+            try:
+                while True:
+                    row = await q.get()
+                    if str(row.get("slot") or "").startswith(prefix):
+                        yield f"data: {json.dumps(row)}\n\n"
+            finally:
+                flightlog.unsubscribe(q)
+
+        return StreamingResponse(gen(), media_type="text/event-stream")
 
     @app.post("/generations/stop")
     async def stop_all_generations() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

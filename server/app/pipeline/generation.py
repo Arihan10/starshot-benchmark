@@ -2003,13 +2003,16 @@ async def run(
         return
 
     # Resume: replay the anchor completion loop's already-committed object
-    # decisions in order (re-resolving from the log, re-spawning only the
-    # meshes still missing), then stop if the loop had run to completion.
-    # Otherwise fall through and continue from the frontier with fresh
-    # `next_object` decisions.
-    for spec in committed.next_object_specs(zone.id):
+    # decisions, re-solving each ROUND's objects together in one
+    # `object_bbox_batch` exactly as they were placed live. Grouping by round
+    # reproduces that call's prompt so the placement replays from the LLM cache
+    # instead of re-billing each object in its own single-object call, and keeps
+    # intra-round parent/relationship resolution intact. Then stop if the loop
+    # had run to completion; otherwise fall through to fresh `next_object`
+    # rounds.
+    for group in committed.next_object_rounds(zone.id):
         replayed = await _resolve_and_generate(
-            specs=[spec],
+            specs=group,
             zone=zone,
             all_nodes=all_nodes,
             scenario="anchor",
@@ -2030,9 +2033,11 @@ async def run(
     # loop; a round that proposes only already-attempted ids means no progress
     # is possible — stop.
     #
-    # The model proposes a LIST of objects per round. Each accepted object is
-    # committed as its own `generation.next` event so resume replays them one
-    # at a time regardless of how they were proposed.
+    # The model proposes a LIST of objects per round; each accepted object is
+    # committed as its own `generation.next` event. Those per-round blocks are
+    # written contiguously, so a resume regroups them (see
+    # `committed.next_object_rounds`) and re-solves each round in one
+    # `object_bbox_batch` rather than one call per object.
     attempted: set[str] = set()
     while True:
         done, objects = await _next_object_batch(

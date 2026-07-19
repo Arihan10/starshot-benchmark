@@ -1237,6 +1237,9 @@ export function createTracePanel(
 				text: [
 					call.model ?? "",
 					`${call.tokens_in ?? "?"} in / ${call.tokens_out ?? "?"} out tok`,
+					call.flight_ms != null
+						? `flight ${(call.flight_ms / 1000).toFixed(1)}s${(call.attempts ?? 1) > 1 ? ` (${call.attempts} tries)` : ""}`
+						: null,
 				]
 					.filter(Boolean)
 					.join(" · "),

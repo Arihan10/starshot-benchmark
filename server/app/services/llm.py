@@ -25,7 +25,7 @@ from collections.abc import Awaitable, Callable, Iterable
 from contextvars import ContextVar
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import TypeVar
+from typing import Any, TypeVar
 
 import httpx
 from openrouter import OpenRouter
@@ -33,7 +33,7 @@ from openrouter.errors import OpenRouterError
 from pydantic import BaseModel, ValidationError
 
 from app.core.slots import OPENAI_COMPAT_MODELS, OpenAICompatModel
-from app.utils import cache, logging
+from app.utils import cache, flightlog, keypool, logging
 
 from app.core.slots import DEFAULT_REASONING, REASONING_DOWNGRADE_LIST
 
@@ -251,6 +251,12 @@ async def call_llm(
     # so we DON'T resolve it here: the backfill sweep (`backfill_costs`) prices
     # it off the log and appends a separate `llm.cost` event, which
     # `_usage_summary` joins back by id.
+    #
+    # `flight` is the ledger row of the FINAL (successful) HTTP attempt — its
+    # request/response wall-clock times and flight duration land on the event so
+    # the trace panels show call latency next to the tokens. Additive: older
+    # logs without these fields replay unchanged.
+    flight = flightlog.last_flight()
     logging.log(
         "cache.llm",
         key=key,
@@ -267,6 +273,10 @@ async def call_llm(
         tokens_in=getattr(usage, "prompt_tokens", None),
         tokens_out=getattr(usage, "completion_tokens", None),
         generation_id=generation_ids[-1] if generation_ids else None,
+        t_request=flight["t_request"] if flight else None,
+        t_response=flight["t_response"] if flight else None,
+        flight_ms=flight["flight_ms"] if flight else None,
+        attempts=flight["attempt"] if flight else None,
     )
     return validated
 
@@ -295,11 +305,49 @@ class _Completion:
 # non-streamed, so this caps the WHOLE generation — a thinking-enabled model
 # forms its entire body before responding. Set high (45 min) because Kimi K3 at
 # reasoning_effort=max can genuinely take many minutes to complete.
-_OPENAI_COMPAT_TIMEOUT = httpx.Timeout(connect=30.0, read=2700.0, write=60.0, pool=60.0)
+_OPENAI_COMPAT_TIMEOUT = httpx.Timeout(connect=30.0, read=5400.0, write=60.0, pool=60.0)
 
 # OpenRouter SDK per-request read budget (ms in the SDK). Kept as a constant so
 # the transport-retry diagnostics can report the cap a timeout actually hit.
 _OPENROUTER_TIMEOUT_S = 180.0
+
+# 429 (rate-limit) retry policy — separate from the general transport-flap
+# budget. Every 429 gets EXPONENTIAL backoff, but a rotating key pool defers the
+# sleep until a whole sweep of the pool has 429'd (each key tried once): keys
+# are rolled with NO delay between them, and only an all-keys-exhausted sweep
+# backs off. OpenRouter and single-key compat models have an effective pool size
+# of 1, so every 429 backs off — the identical arithmetic, `pool_size == 1`.
+RATE_LIMIT_MAX = 8
+_RATE_LIMIT_BASE_S = 2.0
+_RATE_LIMIT_CAP_S = 60.0
+
+
+def _http_status(exc: Exception) -> int | None:
+    """The HTTP status behind a transport error, or None for a status-less flap
+    (timeout, dropped connection). A 429 surfaces as `OpenRouterError.status_code`
+    on the SDK path and `HTTPStatusError.response.status_code` on the direct
+    httpx (compat) path; a bare `ReadTimeout`/`RemoteProtocolError` carries no
+    status and stays a general flap."""
+    if isinstance(exc, httpx.HTTPStatusError):
+        return exc.response.status_code
+    if isinstance(exc, OpenRouterError):
+        return getattr(exc, "status_code", None)
+    return None
+
+
+def _rate_limit_backoff(sweep_index: int) -> float:
+    """Exponential backoff (seconds) for the `sweep_index`-th (0-based) all-keys-
+    exhausted sweep: base·2^i, capped at `_RATE_LIMIT_CAP_S`."""
+    return min(_RATE_LIMIT_BASE_S * (2**sweep_index), _RATE_LIMIT_CAP_S)
+
+
+def _rate_limit_pool_size(model: str) -> int:
+    """Keys to try before a 429 backs off: a rotating compat model's live pool
+    size, else 1 (OpenRouter / single-key compat — back off on every 429)."""
+    cfg = OPENAI_COMPAT_MODELS.get(model)
+    if cfg is not None and cfg.rotate and cfg.api_key_env is not None:
+        return keypool.get_pool(cfg.api_key_env).size
+    return 1
 
 
 async def _send_openai_compatible(
@@ -319,7 +367,13 @@ async def _send_openai_compatible(
     `httpx.HTTPStatusError`, which `call_llm_once` folds into its transport-retry
     budget alongside the SDK's provider flaps. The generous read timeout
     (`_OPENAI_COMPAT_TIMEOUT`, 45 min) covers a multi-minute thinking generation
-    forming its whole body before the response arrives."""
+    forming its whole body before the response arrives.
+
+    `rotate`-enabled models draw their bearer key from the shared per-provider
+    `keypool` instead of the plain env var; a 429 reports the key's generation
+    back to the pool (first reporter advances it, concurrent duplicates no-op)
+    and still raises — the transport retry re-enters here and picks up the
+    pool's new active key."""
     body: dict[str, object] = {
         "model": cfg.model,
         "messages": [
@@ -340,22 +394,67 @@ async def _send_openai_compatible(
         body["top_p"] = cfg.top_p
     body.update(cfg.extra)
     headers = {"Content-Type": "application/json"}
+    pool: keypool.KeyPool | None = None
+    generation = 0
+    api_key: str | None = None
     if cfg.api_key_env is not None:
-        api_key = os.environ.get(cfg.api_key_env)
-        if not api_key:
-            raise RuntimeError(
-                f"{cfg.api_key_env} is not set — required for {cfg.model} at {cfg.base_url}"
-            )
+        if cfg.rotate:
+            pool = keypool.get_pool(cfg.api_key_env)
+            generation, api_key = pool.current()
+        else:
+            api_key = os.environ.get(cfg.api_key_env, "")
+            if not api_key:
+                raise RuntimeError(
+                    f"{cfg.api_key_env} is not set — required for {cfg.model} at {cfg.base_url}"
+                )
         headers["Authorization"] = f"Bearer {api_key}"
-    async with httpx.AsyncClient(timeout=_OPENAI_COMPAT_TIMEOUT) as client:
-        res = await client.post(
-            f"{cfg.base_url}/chat/completions", headers=headers, json=body,
+    t_request = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=_OPENAI_COMPAT_TIMEOUT) as client:
+            res = await client.post(
+                f"{cfg.base_url}/chat/completions", headers=headers, json=body,
+            )
+    except httpx.HTTPError as e:
+        # Status-less flap (timeout, dropped connection) — the flight still
+        # happened, so it still gets a ledger row.
+        flightlog.record(
+            transport="direct", model=cfg.model, base_url=cfg.base_url, api_key=api_key,
+            error=f"{type(e).__name__}: {e}", exc_type=type(e).__name__,
+            t_request=t_request, t_response=time.time(),
         )
+        raise
+    t_response = time.time()
+    # Parse the success body BEFORE recording so the row carries token usage; a
+    # 200 with an unparseable body is recorded, then raised into the parse-retry
+    # budget exactly where `res.json()` used to raise.
+    data: Any = None
+    body_error: json.JSONDecodeError | None = None
+    if res.is_success:
+        try:
+            data = res.json()
+        except json.JSONDecodeError as e:
+            body_error = e
+    usage_raw = (data.get("usage") or {}) if isinstance(data, dict) else {}
+    flightlog.record(
+        transport="direct", model=cfg.model, base_url=cfg.base_url, api_key=api_key,
+        status=res.status_code,
+        error=(f"unparseable response body: {body_error}" if body_error
+               else None if res.is_success else res.text[:500]),
+        tokens_in=usage_raw.get("prompt_tokens"),
+        tokens_out=usage_raw.get("completion_tokens"),
+        t_request=t_request, t_response=t_response,
+    )
+    if pool is not None and res.status_code == 429:
+        # Roll the pool to the next key, then raise into the transport-retry
+        # budget as before — the retried attempt re-enters this function and
+        # picks up the pool's new active key. The generation CAS makes a burst
+        # of parallel 429s on one key advance the pool exactly once.
+        pool.rotate(generation)
     res.raise_for_status()
-    data = res.json()
+    if body_error is not None:
+        raise body_error
     choice = (data.get("choices") or [{}])[0]
     message = choice.get("message") or {}
-    usage_raw = data.get("usage") or {}
     # Attribute access so `call_llm` reads it exactly like the SDK's typed usage.
     usage = SimpleNamespace(
         prompt_tokens=usage_raw.get("prompt_tokens"),
@@ -396,42 +495,61 @@ async def _send_structured(
         return await _send_openai_compatible(
             cfg, system=system, user=user, schema_name=schema_name, wire_schema=wire_schema,
         )
-    async with OpenRouter(
-        api_key=os.environ["OPENROUTER_API_KEY"],
-        timeout_ms=int(_OPENROUTER_TIMEOUT_S * 1000),
-    ) as client:
-        response = await client.chat.send_async(
-            model=model,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            response_format={  # pyright: ignore[reportArgumentType]
-                "type": "json_schema",
-                "json_schema": {
-                    "name": schema_name,
-                    "strict": True,
-                    "schema_": wire_schema,
+    t_request = time.time()
+    try:
+        async with OpenRouter(
+            api_key=os.environ["OPENROUTER_API_KEY"],
+            timeout_ms=int(_OPENROUTER_TIMEOUT_S * 1000),
+        ) as client:
+            response = await client.chat.send_async(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                response_format={  # pyright: ignore[reportArgumentType]
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema_": wire_schema,
+                    },
                 },
-            },
-            reasoning={"effort": _reasoning_effort(model)},
-            # Force routing to a provider that actually honors the parameters we
-            # send. Omitted, OpenRouter silently strips any param the chosen
-            # provider lacks — so a model whose provider can't do
-            # `response_format: json_schema` (GLM) falls back to a free-form
-            # completion and emits fenced / prose / null content instead of
-            # schema-conformant JSON.
-            provider={
-                "require_parameters": True,
-                "sort": "latency",
-                "ignore": ["decart"],
-            },
+                reasoning={"effort": _reasoning_effort(model)},
+                # Force routing to a provider that actually honors the parameters we
+                # send. Omitted, OpenRouter silently strips any param the chosen
+                # provider lacks — so a model whose provider can't do
+                # `response_format: json_schema` (GLM) falls back to a free-form
+                # completion and emits fenced / prose / null content instead of
+                # schema-conformant JSON.
+                provider={
+                    "require_parameters": True,
+                    "sort": "latency",
+                    "ignore": ["decart"],
+                },
+            )
+    except (OpenRouterError, httpx.HTTPError) as e:
+        # OpenRouter's own dashboard logs its side; this row is the LOCAL record
+        # of the same flight, so the ledger reads uniformly across transports.
+        flightlog.record(
+            transport="openrouter", model=model,
+            status=_http_status(e), error=str(e)[:500], exc_type=type(e).__name__,
+            t_request=t_request, t_response=time.time(),
         )
+        raise
+    usage = getattr(response, "usage", None)
+    flightlog.record(
+        transport="openrouter", model=model, status=200,
+        tokens_in=getattr(usage, "prompt_tokens", None),
+        tokens_out=getattr(usage, "completion_tokens", None),
+        generation_id=getattr(response, "id", None),
+        t_request=t_request, t_response=time.time(),
+    )
     message = response.choices[0].message
     return _Completion(
         content=message.content,
         reasoning=getattr(message, "reasoning", None) or "",
-        usage=getattr(response, "usage", None),
+        usage=usage,
         generation_id=getattr(response, "id", None),
         finish_reason=response.choices[0].finish_reason,
         refusal=message.refusal if isinstance(message.refusal, str) else None,
@@ -467,7 +585,12 @@ async def call_llm_once(
         if log_retries:
             logging.log(kind, **data)
 
-    # Two independent budgets:
+    # Bind the flight-ledger context: every HTTP attempt below records a row
+    # stamped with this logical call's id + step/node, so a retry storm groups
+    # back to the one pipeline call that caused it.
+    flightlog.begin_call(step=step, node=node_id)
+
+    # Independent retry budgets, one per failure class:
     #   * `parse_attempt` — JSON-decode / Pydantic-validation failures.
     #     The model misbehaved; resampling fixes it. 4 tries.
     #   * `transport_attempt` — provider returned a non-success body
@@ -476,8 +599,13 @@ async def call_llm_once(
     #     model never saw the request, so this isn't "the LLM was wrong" —
     #     it's a flap. Larger budget + longer backoff so a multi-second
     #     provider hiccup doesn't fail the run.
+    #   * `rate_limit_attempt` — a 429, peeled off the transport class: it's the
+    #     provider throttling us, not flapping. Gets its own EXPONENTIAL backoff,
+    #     and for a rotating key pool the sleep is deferred until a full sweep
+    #     of keys has 429'd (see `_rate_limit_*`).
     parse_attempt = 0
     transport_attempt = 0
+    rate_limit_attempt = 0
     id_validation_attempt = 0
     PARSE_MAX = 4
     TRANSPORT_MAX = 8
@@ -531,6 +659,15 @@ async def call_llm_once(
             # settled cost (empty for third-party backends, which have no
             # /generation record — completion_tokens already includes reasoning
             # tokens, so no separate reasoning field is needed).
+            #
+            # The one place the exact prompt + output enter the flight ledger:
+            # fill the winning attempt's row in its scene DB. No-op when there's
+            # no bound scene (sandbox) or logging is off.
+            if log_retries:
+                flightlog.attach_prompt(
+                    system=system, user=user, output=args,
+                    reasoning=comp.reasoning, schema=output_schema.__name__,
+                )
             return validated, comp.reasoning, comp.usage, args, generation_ids
         except OutputValidationError as e:
             if id_validation_attempt >= ID_VALIDATION_MAX - 1:
@@ -555,6 +692,35 @@ async def call_llm_once(
                 raise
             parse_attempt += 1
         except (OpenRouterError, httpx.HTTPError) as e:
+            # A 429 is the provider throttling us, not a flap. Rate-limit path:
+            # for a rotating pool `_send_openai_compatible` has already rolled to
+            # the next key, so the next attempt tries it with NO delay; we only
+            # sleep once a whole sweep of the pool has 429'd (`attempt % pool`).
+            # OpenRouter / single-key have pool_size 1, so every 429 backs off —
+            # the same arithmetic. Backoff grows exponentially per exhausted
+            # sweep.
+            if _http_status(e) == 429:
+                if rate_limit_attempt >= RATE_LIMIT_MAX - 1:
+                    raise
+                rate_limit_attempt += 1
+                pool_size = _rate_limit_pool_size(model)
+                swept = rate_limit_attempt % pool_size == 0
+                backoff = (
+                    _rate_limit_backoff(rate_limit_attempt // pool_size - 1) if swept else 0.0
+                )
+                _retry_log(
+                    "llm.rate_limit_retry",
+                    model=model,
+                    step=step,
+                    node=node_id,
+                    attempt=rate_limit_attempt,
+                    pool_size=pool_size,
+                    action="backoff" if swept else "rotate",
+                    backoff_s=backoff,
+                )
+                if backoff:
+                    await asyncio.sleep(backoff)
+                continue
             # httpx.RemoteProtocolError ("incomplete chunked read") and kin
             # surface when OpenRouter or an upstream provider drops the HTTP
             # connection mid-response. The SDK does not always wrap these as
@@ -733,7 +899,9 @@ async def chat(
     TRANSPORT_MAX = 8
     TRANSPORT_BACKOFF = [2, 4, 8, 16, 30, 30, 30, 30]
     wire: list[dict[str, str]] = [{"role": "system", "content": system}, *messages]
+    flightlog.begin_call(kind="chat")
     while True:
+        t_request = time.time()
         try:
             async with OpenRouter(
                 api_key=os.environ["OPENROUTER_API_KEY"],
@@ -747,15 +915,28 @@ async def chat(
                     messages=wire,  # pyright: ignore[reportArgumentType]
                     reasoning={"effort": reasoning_effort},
                 )
+            usage = getattr(response, "usage", None)
+            flightlog.record(
+                transport="openrouter", model=model, status=200,
+                tokens_in=getattr(usage, "prompt_tokens", None),
+                tokens_out=getattr(usage, "completion_tokens", None),
+                generation_id=getattr(response, "id", None),
+                t_request=t_request, t_response=time.time(),
+            )
             message = response.choices[0].message
             content = message.content
             text = content if isinstance(content, str) else str(content or "")
             reasoning = getattr(message, "reasoning", None) or ""
             return text, reasoning
-        except (OpenRouterError, httpx.HTTPError):
+        except (OpenRouterError, httpx.HTTPError) as e:
             # Provider flap (Anthropic 503, dropped connection) — the model
             # never saw the request, so back off and resend, same budget as
             # call_llm_once's transport retries.
+            flightlog.record(
+                transport="openrouter", model=model,
+                status=_http_status(e), error=str(e)[:500], exc_type=type(e).__name__,
+                t_request=t_request, t_response=time.time(),
+            )
             if transport_attempt >= TRANSPORT_MAX - 1:
                 raise
             backoff = TRANSPORT_BACKOFF[min(transport_attempt, len(TRANSPORT_BACKOFF) - 1)]

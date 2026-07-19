@@ -457,6 +457,33 @@ export const api = {
 			body: { steps, cells },
 		}),
 
+	// --- LLM request ledger (the first-party "activity log", SQLite-backed) ---
+	// One keyset page (newest first) of a run's requests, unified across its
+	// per-scene DBs. `filters` is {facet: [values]}; `cursor` pages older.
+	// Returns { rows, cursor, has_more } — metadata only, no prompt bytes.
+	flightsPage: (run, { cursor, filters, limit = 100 } = {}) =>
+		request("/flights", {
+			params: {
+				run,
+				cursor,
+				limit,
+				filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
+			},
+		}),
+	// Per-attribute distinct values + counts (filter dropdowns) + total.
+	flightFacets: (run, filters) =>
+		request("/flights/facets", {
+			params: {
+				run,
+				filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
+			},
+		}),
+	// The exact system/user prompt + output for ONE row, fetched lazily on
+	// opening its detail panel. `scene` is the row's `slot`.
+	flightDetail: (scene, id) => request("/flights/detail", { params: { scene, id } }),
+	// SSE tail of new rows for `run` (history comes from flightsPage).
+	flightsStreamUrl: (run) => u("/flights/stream", { run }).toString(),
+
 	// --- reviewer chat ---
 	// The stateless reviewer (Claude Opus 4.8, xhigh) behind the scene
 	// investigator. `body` carries the client-assembled `system` (analyst framing

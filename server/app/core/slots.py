@@ -63,6 +63,12 @@ class OpenAICompatModel:
     base_url: str
     # Env var holding the bearer key; None for auth-less endpoints.
     api_key_env: str | None = None
+    # When True, the bearer key comes from a rotating pool that rolls to the
+    # next key whenever the provider answers HTTP 429. The pool loads from
+    # `{api_key_env}_ARRAY` (JSON array or comma/newline-separated), falling
+    # back to the single `api_key_env` var — a one-key pool never rotates, so
+    # enabling this without an `_ARRAY` var changes nothing.
+    rotate: bool = False
     # Sampling / length knobs, each sent only when set (None defers to the
     # provider's own default).
     max_tokens: int | None = None
@@ -108,37 +114,26 @@ MODELS: dict[str, str] = {
 # `base_url` instead of the OpenRouter SDK). Any id absent here routes through
 # OpenRouter exactly as before.
 OPENAI_COMPAT_MODELS: dict[str, OpenAICompatModel] = {
-    # Kimi K3 (Moonshot), OpenAI-compatible. Served straight from Moonshot's own
-    # gateway rather than OpenRouter, so the `kimi-k3` alias above resolves here.
-    # K3 always thinks; effort is the top-level `reasoning_effort` (only `max`
-    # today), NOT the K2.x `thinking` object. The length knob is
-    # `max_completion_tokens` (not `max_tokens`), and temperature/top_p/n/penalties
-    # are fixed server-side — so they go through `extra` / stay unset. The
-    # schema-conformant answer comes back on `content` (thinking on
-    # `reasoning_content`), the exact shape `_send_openai_compatible` parses.
-    # Non-streamed (one buffered POST); the generous compat read timeout (45 min)
-    # covers K3's multi-minute max-effort generations.
-    "moonshotai/kimi-k3": OpenAICompatModel(
-        model="kimi-k3",
-        base_url="https://api.moonshot.ai/v1",
-        api_key_env="MOONSHOT_API_KEY",
-        extra={"reasoning_effort": "max", "max_completion_tokens": 1048576},
-    ),
+    # "moonshotai/kimi-k3": OpenAICompatModel(
+    #     model="kimi-k3",
+    #     base_url="https://api.moonshot.ai/v1",
+    #     api_key_env="MOONSHOT_API_KEY",
+    #     rotate=True,
+    #     extra={"reasoning_effort": "max", "max_completion_tokens": 1048576},
+    # ),
     "longcat/LongCat-2.0": OpenAICompatModel(
         model="LongCat-2.0",
         base_url="https://api.longcat.chat/openai/v1",
         api_key_env="LONGCAT_API_KEY",
+        rotate=True,
         max_tokens=131072,
-        # Thinking on; the trace comes back on `reasoning_content`.
         extra={"thinking": {"type": "enabled"}},
     ),
-    # Same LongCat-2.0 weights, served by SiliconFlow instead of Meituan's own
-    # gateway. SiliconFlow's thinking toggle is `enable_thinking` (not LongCat's
-    # native `thinking` object); the answer/trace come back the same way.
     "siliconflow/LongCat-2.0": OpenAICompatModel(
         model="meituan-longcat/LongCat-2.0",
         base_url="https://api.siliconflow.com/v1",
         api_key_env="SILICONFLOW_API_KEY",
+        rotate=True,
         extra={"enable_thinking": True},
     ),
 }
