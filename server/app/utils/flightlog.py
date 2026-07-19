@@ -353,6 +353,46 @@ def detail(scene: str, row_id: int) -> dict[str, Any] | None:
             "reasoning": r["reasoning"], "schema": r["schema"]}
 
 
+def histogram(run: str, *, filters: dict[str, list[str]], buckets: int = 48) -> dict[str, Any]:
+    """Request counts bucketed uniformly over the run's time span (the activity
+    chart above the log table). Two passes over the batched ATTACH: min/max of
+    `t_response` under the filters, then a GROUP BY on the bucket index."""
+    scenes = _scene_keys(run)
+    where, params = _where(filters, None)
+    t0 = t1 = None
+    for batch in _batches(scenes):
+        con = sqlite3.connect(":memory:")
+        try:
+            _attach(con, batch)
+            union = _union(batch, "t_response, status, exc_type, transport, kind, model, provider, slot, step, api_key")
+            row = con.execute(
+                f"SELECT MIN(t_response), MAX(t_response) FROM ({union}) WHERE 1=1{where}", params
+            ).fetchone()
+        finally:
+            con.close()
+        if row and row[0] is not None:
+            t0 = row[0] if t0 is None else min(t0, row[0])
+            t1 = row[1] if t1 is None else max(t1, row[1])
+    if t0 is None or t1 is None:
+        return {"buckets": [], "t0": None, "t1": None, "bucket_s": 0}
+    width = max((t1 - t0) / buckets, 1e-6)
+    counts = [0] * buckets
+    for batch in _batches(scenes):
+        con = sqlite3.connect(":memory:")
+        try:
+            _attach(con, batch)
+            union = _union(batch, "t_response, status, exc_type, transport, kind, model, provider, slot, step, api_key")
+            q = (
+                f"SELECT CAST((t_response - ?) / ? AS INTEGER) AS b, COUNT(*) "
+                f"FROM ({union}) WHERE t_response IS NOT NULL{where} GROUP BY b"
+            )
+            for b, c in con.execute(q, (t0, width, *params)).fetchall():
+                counts[min(max(int(b), 0), buckets - 1)] += c
+        finally:
+            con.close()
+    return {"buckets": counts, "t0": t0, "t1": t1, "bucket_s": width}
+
+
 def facets(run: str, *, filters: dict[str, list[str]]) -> dict[str, Any]:
     """Per-attribute distinct values + counts for the filter UI, plus the total.
     Each facet's counts reflect all OTHER active filters (standard faceted

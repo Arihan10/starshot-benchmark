@@ -2077,6 +2077,14 @@ def create_app() -> FastAPI:
             flightlog.facets, _resolve_run(run), filters=_parse_flight_filters(filters),
         )
 
+    @app.get("/flights/histogram")
+    async def flight_histogram(run: str | None = None, filters: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Bucketed request counts over the run's time span — the activity chart
+        above the log table."""
+        return await asyncio.to_thread(
+            flightlog.histogram, _resolve_run(run), filters=_parse_flight_filters(filters),
+        )
+
     @app.get("/flights/stream")
     async def flights_stream(run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         """Live SSE tail of new request rows for `run`, filtered by scene prefix.

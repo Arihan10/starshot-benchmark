@@ -478,6 +478,14 @@ export const api = {
 				filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
 			},
 		}),
+	// Bucketed request counts over the run's span — the activity chart.
+	flightHistogram: (run, filters) =>
+		request("/flights/histogram", {
+			params: {
+				run,
+				filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
+			},
+		}),
 	// The exact system/user prompt + output for ONE row, fetched lazily on
 	// opening its detail panel. `scene` is the row's `slot`.
 	flightDetail: (scene, id) => request("/flights/detail", { params: { scene, id } }),

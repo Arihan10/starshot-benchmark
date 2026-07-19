@@ -1,82 +1,155 @@
-// The api log — a first-party request-log page styled after OpenRouter's Logs
-// view (server: app/utils/flightlog.py, per-scene SQLite DBs). Left: the
-// request table with an activity histogram, scoped to one run and paginated
-// 100 at a time. Right: "Generation details" for the selected row — stat cards,
-// overview/request key-values, a provider-response latency bar, and the exact
-// system/user prompt + output (fetched lazily on selection).
+// The Logs view — styled after OpenRouter's Logs page: light theme, "Logs"
+// header with tabs, a green activity histogram, a Date/Model/Provider table,
+// and a "Generation details" side panel with stat cards, Overview/Request
+// sections, provider-response latency bars, and collapsible Prompt/Completion.
+//
+// Data: the first-party SQLite flight ledger (app/utils/flightlog.py), scoped
+// to one run (unified server-side via ATTACH). The list is keyset-paginated
+// 100 at a time with server-side facet filters; prompt bytes are fetched only
+// when a row's detail panel is opened.
 
 import { api } from "./api.js";
 import { state as appState } from "./state.js";
 import { el } from "./ui.js";
 
 const PAGE = 100;
-const MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+const FACETS = [
+	{ key: "transport", label: "transport" },
+	{ key: "status", label: "status" },
+	{ key: "kind", label: "kind" },
+	{ key: "model", label: "model" },
+	{ key: "provider", label: "provider" },
+	{ key: "slot", label: "scene", display: (v) => shortSlotLabel(v) },
+	{ key: "step", label: "step" },
+	{ key: "key", label: "key" },
+];
 
 const state = {
 	open: false,
 	es: null,
 	run: null,
-	rows: [],
+	rows: [], // loaded rows, newest first
 	seen: new Set(),
-	selectedKey: null,
-	pageIndex: 0,
-	cursors: [null], // cursors[i] fetches page i
+	cursor: null,
 	hasMore: false,
 	loading: false,
+	filters: {}, // facet key -> Set(values)
+	facetData: {},
+	total: 0,
+	histo: null,
+	histoAt: 0,
+	selectedKey: null,
 };
 
 // --- formatting ------------------------------------------------------------------
 
+// "Jul 18, 05:38 PM" — OpenRouter's date column format.
 function fmtDate(ts) {
 	if (!ts) return "—";
 	const d = new Date(ts * 1000);
-	let h = d.getHours();
-	const ap = h >= 12 ? "PM" : "AM";
-	h = h % 12 || 12;
-	return `${MON[d.getMonth()]} ${d.getDate()}, ${String(h).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")} ${ap}`;
+	const day = d.toLocaleString("en-US", { month: "short", day: "2-digit" });
+	const time = d.toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", hour12: true });
+	return `${day}, ${time}`;
 }
 
-const fmtNum = (n) => (n == null ? "—" : Number(n).toLocaleString());
+const fmtStamp = (ts) => {
+	if (!ts) return "—";
+	const d = new Date(ts * 1000);
+	return `${d.toLocaleTimeString([], { hour12: false })}.${String(d.getMilliseconds()).padStart(3, "0")}`;
+};
 
-function fmtDur(ms) {
-	if (ms == null) return "--";
+function fmtFlight(ms) {
+	if (ms == null) return "—";
 	if (ms < 1000) return `${ms} ms`;
 	if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
 	const m = Math.floor(ms / 60_000);
-	return `${m}m ${Math.round((ms % 60_000) / 1000)}s`;
+	return `${m}m ${String(Math.round((ms % 60_000) / 1000)).padStart(2, "0")}s`;
 }
 
+const fmtTok = (n) => (n == null ? "?" : n.toLocaleString("en-US"));
+
 function throughput(r) {
-	if (!r.tokens_out || !r.flight_ms) return "--";
+	if (!r.tokens_out || !r.flight_ms) return null;
 	return `${(r.tokens_out / (r.flight_ms / 1000)).toFixed(1)} tok/s`;
 }
 
-function prettyModel(id) {
-	if (!id) return "?";
-	const s = (id.includes("/") ? id.split("/").pop() : id).replace(/[-_]/g, " ").trim();
-	return s.split(/\s+/).map((w) => (/^[a-z]/.test(w) ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
+// --- friendly names + avatar chips -------------------------------------------------
+
+const ACRONYMS = new Set(["gpt", "glm", "hy3", "ai"]);
+
+// "moonshotai/kimi-k3" -> "Kimi K3"; "google/gemini-3.1-flash-lite" ->
+// "Gemini 3.1 Flash Lite" — the OpenRouter-style display name.
+function friendlyModel(id) {
+	const tail = String(id ?? "?").split("/").pop() || "?";
+	return tail
+		.split(/[-_ ]+/)
+		.map((w) => (ACRONYMS.has(w.toLowerCase()) ? w.toUpperCase()
+			: /^[a-z]/.test(w) ? w[0].toUpperCase() + w.slice(1) : w))
+		.join(" ");
 }
 
-function prettyProvider(r) {
+const PROVIDER_NAMES = {
+	"openrouter": "OpenRouter",
+	"api.moonshot.ai": "Moonshot AI",
+	"api.moonshot.cn": "Moonshot AI",
+	"api.longcat.chat": "LongCat",
+	"api.siliconflow.com": "SiliconFlow",
+	"api.inceptionlabs.ai": "Inception",
+};
+
+function friendlyProvider(r) {
 	if (r.transport === "openrouter") return "OpenRouter";
-	const host = (r.provider || "").replace(/^api\./, "").replace(/\.(ai|com|chat|run|io|net)$/, "");
-	if (!host) return r.transport || "?";
-	return host.split(/[.\-]/).map((w) => (w ? w[0].toUpperCase() + w.slice(1) : w)).join(" ");
+	const host = r.provider || "?";
+	if (PROVIDER_NAMES[host]) return PROVIDER_NAMES[host];
+	const core = host.replace(/^api\./, "").split(".")[0] || "?";
+	return core[0].toUpperCase() + core.slice(1);
 }
 
-function iconColor(s) {
+function hueOf(s) {
 	let h = 0;
 	for (const c of String(s)) h = (h * 31 + c.charCodeAt(0)) >>> 0;
-	return `hsl(${h % 360} 52% 46%)`;
+	return h % 360;
 }
 
-function icon(label) {
-	const ch = (String(label).match(/[a-z0-9]/i) || ["?"])[0].toUpperCase();
-	return el("span", { class: "flog-ico", style: `background:${iconColor(label)}`, text: ch });
+const avatar = (name) =>
+	el("span", {
+		class: "fl-ava",
+		style: `background:hsl(${hueOf(name)} 60% 46%)`,
+		text: (String(name)[0] || "?").toUpperCase(),
+	});
+
+function shortSlotLabel(slot) {
+	if (!slot) return "Unknown";
+	const p = String(slot).split("/");
+	if (p.length >= 3 && p[1] === "_branches") return `branch:${p.slice(2).join("/")}`;
+	return p.length >= 3 ? p[1] : String(slot);
+}
+
+function statusValue(r) {
+	if (r.status != null) return String(r.status);
+	return r.exc_type || "error";
+}
+
+function bucket(r) {
+	if (r.ok) return "ok";
+	if (r.status === 429) return "429";
+	return "err";
+}
+
+function statusChip(r) {
+	if (r.ok) return el("span", { class: "fl-chip ok", text: String(r.status ?? 200) });
+	if (r.status === 429) return el("span", { class: "fl-chip warn", text: "429" });
+	if (r.status != null) return el("span", { class: "fl-chip err", text: String(r.status) });
+	return el("span", { class: "fl-chip err", text: r.exc_type || "error", title: r.error || "" });
 }
 
 const rowKey = (r) => `${r.slot}\u0000${r.id}`;
-const isErr = (r) => !r.ok && r.status !== 429;
+
+function facetValue(key, r) {
+	if (key === "status") return statusValue(r);
+	return r[key] ?? null;
+}
 
 // --- view ------------------------------------------------------------------------
 
@@ -85,131 +158,511 @@ export function initFlights() {
 	const btn = document.getElementById("btn-flights");
 	if (!view || !btn) return;
 
-	// --- left: list ------------------------------------------------------------
-	const runSel = el("select", { class: "flog-run", title: "which run's requests to show" });
+	const runSel = el("select", { id: "fl-run", title: "which run's logs to show" });
 	runSel.addEventListener("change", () => setRun(runSel.value));
-	const liveDot = el("span", { class: "flog-live", title: "live tail" });
-	const backBtn = el("button", { class: "flog-back", text: "← board", onclick: close });
+	const liveDot = el("span", { class: "fl-live", title: "live tail" });
+	const statsEl = el("span", { class: "fl-stats" });
 
-	const lhead = el("div", { class: "flog-lhead" },
-		el("div", { class: "flog-lhead-top" },
-			el("div", {},
-				el("div", { class: "flog-title", text: "Logs" }),
-				el("div", { class: "flog-sub", text: "View your request logs and history." }),
-			),
-			el("div", { class: "flog-ctl" }, liveDot, runSel, backBtn),
+	// --- facet popovers ---------------------------------------------------------
+
+	let openPopover = null;
+	function closePopover() {
+		if (openPopover) { openPopover.node.remove(); openPopover = null; }
+	}
+
+	function openFacetPopover(def, wrap, syncBtn) {
+		closePopover();
+		const sel = filterSet(def.key);
+		const search = el("input", { class: "fl-pop-search", type: "text", placeholder: `filter ${def.label}…` });
+		const list = el("div", { class: "fl-pop-list" });
+		function renderList() {
+			const values = state.facetData[def.key] || [];
+			const q = search.value.trim().toLowerCase();
+			const label = (v) => (def.display ? def.display(v) : String(v));
+			list.textContent = "";
+			const shown = q ? values.filter((x) => label(x.value).toLowerCase().includes(q)) : values;
+			if (!shown.length) {
+				list.append(el("div", { class: "fl-pop-empty", text: "no values" }));
+				return;
+			}
+			for (const { value, count } of shown) {
+				const on = sel.has(value);
+				const cb = el("input", { type: "checkbox", ...(on ? { checked: "" } : {}) });
+				const item = el("label", { class: `fl-pop-item${on ? " on" : ""}` },
+					cb,
+					el("span", { class: "fl-pop-val", text: label(value), title: String(value) }),
+					el("span", { class: "fl-pop-count", text: String(count) }),
+				);
+				cb.addEventListener("change", () => {
+					if (cb.checked) sel.add(value); else sel.delete(value);
+					item.classList.toggle("on", cb.checked);
+					syncBtn();
+					applyFilters();
+				});
+				list.append(item);
+			}
+		}
+		search.addEventListener("input", renderList);
+		const clear = el("button", { class: "fl-pop-clear", text: "clear" });
+		clear.addEventListener("click", () => { sel.clear(); syncBtn(); renderList(); applyFilters(); });
+		const node = el("div", { class: "fl-pop" },
+			search,
+			list,
+			el("div", { class: "fl-pop-foot" }, el("span", { class: "fl-pop-lab", text: def.label }), clear),
+		);
+		node._wrap = wrap;
+		node.addEventListener("click", (ev) => ev.stopPropagation());
+		wrap.append(node);
+		openPopover = { node, _wrap: wrap, renderList };
+		renderList();
+		search.focus();
+	}
+
+	function buildFacet(def) {
+		const badge = el("span", { class: "fl-facet-badge" });
+		const btnf = el("button", { class: "fl-facet" },
+			el("span", { text: def.label }),
+			badge,
+			el("span", { class: "fl-facet-caret", text: "▾" }),
+		);
+		const wrap = el("div", { class: "fl-facet-wrap" }, btnf);
+		function sync() {
+			const n = filterSet(def.key).size;
+			badge.textContent = n ? String(n) : "";
+			wrap.classList.toggle("active", n > 0);
+		}
+		btnf.addEventListener("click", (ev) => {
+			ev.stopPropagation();
+			if (openPopover && openPopover._wrap === wrap) closePopover();
+			else openFacetPopover(def, wrap, sync);
+		});
+		sync();
+		return { wrap, sync };
+	}
+
+	const facetControls = FACETS.map(buildFacet);
+	const clearAllBtn = el("button", { class: "fl-clear-all", title: "reset every filter" });
+	clearAllBtn.addEventListener("click", () => {
+		state.filters = {};
+		for (const fc of facetControls) fc.sync();
+		closePopover();
+		syncClearAll();
+		applyFilters();
+	});
+	function syncClearAll() {
+		const active = FACETS.filter((f) => filterSet(f.key).size > 0).length;
+		clearAllBtn.style.display = active ? "" : "none";
+		clearAllBtn.textContent = `clear filters (${active})`;
+	}
+
+	// --- header: Logs title, tabs, toolbar ---------------------------------------
+
+	const head = el("div", { id: "flights-head" },
+		el("button", { id: "flights-close", text: "← board" }),
+		el("div", { class: "fl-title-block" },
+			el("div", { class: "fl-title", text: "Logs" }),
+			el("div", { class: "fl-subtitle", text: "View your request logs and history." }),
 		),
-		el("div", { class: "flog-tabs" }, el("div", { class: "flog-tab active", text: "Generations" })),
+		el("span", { style: "margin-left:auto" }),
+		runSel,
+		liveDot,
 	);
 
-	const chartEl = el("div", { class: "flog-chart" });
-	const thead = el("div", { class: "flog-thead" },
-		el("div", { text: "Date" }), el("div", { text: "Model" }),
-		el("div", { text: "Provider" }), el("div", { text: "Scene" }),
+	const tabs = el("div", { class: "or-tabs" },
+		el("button", { class: "or-tab active", text: "Generations" }),
+		el("button", { class: "or-tab", disabled: true, text: "Upstream Requests", title: "not tracked in this benchmark" }),
+		el("button", { class: "or-tab", disabled: true, text: "Sessions", title: "not tracked in this benchmark" }),
+		el("button", { class: "or-tab", disabled: true, text: "Videos", title: "not tracked in this benchmark" }),
 	);
-	const rowsEl = el("div", { class: "flog-rows" });
 
-	const pageLab = el("span", { class: "flog-page-lab" });
-	const prevBtn = el("button", { class: "flog-arrow", text: "←", title: "newer", onclick: () => nav(-1) });
-	const nextBtn = el("button", { class: "flog-arrow", text: "→", title: "older", onclick: () => nav(1) });
-	const pager = el("div", { class: "flog-pager" }, pageLab, prevBtn, nextBtn);
+	const filterBar = el("div", { id: "flights-filters" },
+		...facetControls.map((fc) => fc.wrap), clearAllBtn,
+		el("span", { style: "margin-left:auto" }),
+		statsEl,
+	);
 
-	const listEl = el("div", { class: "flog-list" }, lhead, chartEl, thead, rowsEl, pager);
-	const detailEl = el("div", { class: "flog-detail" });
-	view.append(listEl, detailEl);
+	const chartEl = el("div", { class: "fl-chart" });
 
-	document.addEventListener("keydown", (ev) => {
-		if (ev.key === "Escape" && state.open && !document.getElementById("modal-root").firstChild) close();
+	const cols = el("div", { class: "fl-row fl-cols" },
+		el("span", { text: "Date" }),
+		el("span", { text: "Model" }),
+		el("span", { text: "Provider" }),
+		el("span", { text: "App" }),
+		el("span", { text: "Tokens" }),
+		el("span", { text: "Status" }),
+	);
+	const rowsEl = el("div", { id: "flights-rows" });
+	const detailEl = el("div", { id: "flights-detail" });
+	const main = el("div", { id: "flights-main" },
+		el("div", { id: "flights-table" }, chartEl, cols, rowsEl),
+		detailEl,
+	);
+	view.append(head, tabs, filterBar, main);
+
+	rowsEl.addEventListener("scroll", () => {
+		if (state.hasMore && !state.loading &&
+			rowsEl.scrollTop + rowsEl.clientHeight >= rowsEl.scrollHeight - 240) {
+			loadOlder();
+		}
 	});
 
-	// --- data ------------------------------------------------------------------
+	head.querySelector("#flights-close").addEventListener("click", close);
+	document.addEventListener("keydown", (ev) => {
+		if (ev.key !== "Escape" || !state.open || document.getElementById("modal-root").firstChild) return;
+		if (openPopover) closePopover();
+		else if (state.selectedKey != null) deselect();
+		else close();
+	});
+	document.addEventListener("click", (ev) => {
+		if (openPopover && !openPopover.node.contains(ev.target) && !openPopover._wrap.contains(ev.target)) {
+			closePopover();
+		}
+	});
 
-	async function loadPage() {
+	// --- filters + data -----------------------------------------------------------
+
+	function filterSet(key) {
+		return (state.filters[key] ??= new Set());
+	}
+	function filtersParam() {
+		const out = {};
+		for (const [k, s] of Object.entries(state.filters)) if (s.size) out[k] = [...s];
+		return out;
+	}
+	function matches(r) {
+		return Object.entries(state.filters).every(([k, s]) => !s.size || s.has(facetValue(k, r)));
+	}
+
+	let applyTimer = null;
+	function applyFilters() {
+		syncClearAll();
+		clearTimeout(applyTimer);
+		applyTimer = setTimeout(() => { reload(); refreshFacets(); refreshHistogram(); }, 160);
+	}
+
+	async function reload() {
 		if (!state.run) return;
 		state.loading = true;
-		renderPager();
-		let res;
+		state.rows = [];
+		state.seen.clear();
+		state.cursor = null;
+		state.hasMore = false;
+		render();
 		try {
-			res = await api.flightsPage(state.run, { cursor: state.cursors[state.pageIndex], limit: PAGE });
+			const res = await api.flightsPage(state.run, { filters: filtersParam(), limit: PAGE });
+			ingest(res, true);
 		} catch (e) {
 			state.loading = false;
 			rowsEl.textContent = "";
-			rowsEl.append(el("div", { class: "flog-empty", text: `failed to load: ${e.message}` }));
+			rowsEl.append(el("div", { class: "fl-empty", text: `failed to load: ${e.message}` }));
 			return;
 		}
 		state.loading = false;
-		state.rows = res.rows || [];
-		state.seen = new Set(state.rows.map(rowKey));
+		render();
+	}
+
+	async function loadOlder() {
+		if (!state.run || state.loading || !state.hasMore) return;
+		state.loading = true;
+		renderFooter();
+		try {
+			const res = await api.flightsPage(state.run, { cursor: state.cursor, filters: filtersParam(), limit: PAGE });
+			ingest(res, false);
+		} catch { /* transient — retried by scrolling */ }
+		state.loading = false;
+		render();
+	}
+
+	function ingest(res, reset) {
+		if (reset) { state.rows = []; state.seen.clear(); }
+		for (const r of res.rows || []) {
+			const k = rowKey(r);
+			if (state.seen.has(k)) continue;
+			state.seen.add(k);
+			state.rows.push(r);
+		}
+		state.cursor = res.cursor;
 		state.hasMore = !!res.has_more;
-		state.cursors[state.pageIndex + 1] = res.cursor;
-		renderRows();
-		renderChart();
-		renderPager();
-		autoSelect();
+		sortRows();
 	}
 
-	function nav(dir) {
-		const target = state.pageIndex + dir;
-		if (target < 0 || (dir > 0 && !state.hasMore) || state.loading) return;
-		state.pageIndex = target;
-		loadPage();
-	}
-
-	function autoSelect() {
-		if (state.selectedKey && state.rows.some((r) => rowKey(r) === state.selectedKey)) {
-			markSelected();
-			return;
-		}
-		if (state.rows.length) select(state.rows[0]);
-		else deselect();
-	}
-
-	// --- render: list ----------------------------------------------------------
-
-	function renderChart() {
-		chartEl.textContent = "";
-		const ts = state.rows.map((r) => r.t_response || 0).filter(Boolean);
-		if (ts.length < 2) return;
-		const min = Math.min(...ts), max = Math.max(...ts);
-		const span = max - min || 1;
-		const bins = 32;
-		const counts = new Array(bins).fill(0);
-		for (const t of ts) counts[Math.min(bins - 1, Math.floor(((t - min) / span) * bins))] += 1;
-		const mx = Math.max(1, ...counts);
-		for (const c of counts) {
-			chartEl.append(el("div", { class: "flog-bar", style: `height:${Math.max(5, Math.round((c / mx) * 100))}%` }));
-		}
-	}
-
-	function rowEl(r) {
-		const mLabel = prettyModel(r.model);
-		const pLabel = prettyProvider(r);
-		return el("div", {
-			class: `flog-row${isErr(r) ? " err" : ""}${rowKey(r) === state.selectedKey ? " selected" : ""}`,
-			dataset: { k: rowKey(r) },
-			onclick: () => select(r),
-		},
-			el("div", { class: "flog-date", text: fmtDate(r.t_response), title: fmtDate(r.t_response) }),
-			el("div", { class: "flog-mv" }, icon(mLabel), el("span", { text: mLabel, title: r.model || "" })),
-			el("div", { class: "flog-mv" }, icon(pLabel), el("span", { text: pLabel, title: r.base_url || "" })),
-			el("div", { class: "flog-app", text: sceneName(r.slot), title: r.slot || "" }),
+	function sortRows() {
+		state.rows.sort((a, b) =>
+			(b.t_response || 0) - (a.t_response || 0) ||
+			(a.slot < b.slot ? 1 : a.slot > b.slot ? -1 : 0) ||
+			(b.id || 0) - (a.id || 0),
 		);
 	}
 
-	function renderRows() {
+	async function refreshFacets() {
+		if (!state.run) return;
+		try {
+			const res = await api.flightFacets(state.run, filtersParam());
+			state.facetData = res.facets || {};
+			state.total = res.total || 0;
+		} catch { return; }
+		renderStats();
+		if (openPopover) openPopover.renderList();
+	}
+
+	async function refreshHistogram() {
+		if (!state.run) return;
+		state.histoAt = Date.now();
+		try {
+			state.histo = await api.flightHistogram(state.run, filtersParam());
+		} catch { state.histo = null; }
+		renderChart();
+	}
+
+	// --- chart ----------------------------------------------------------------
+
+	function renderChart() {
+		chartEl.textContent = "";
+		const h = state.histo;
+		if (!h || !h.buckets || !h.buckets.length) return;
+		const max = Math.max(...h.buckets, 1);
+		for (let i = 0; i < h.buckets.length; i++) {
+			const c = h.buckets[i];
+			const bar = el("span", { class: `fl-bar${c ? "" : " zero"}` });
+			bar.style.height = c ? `${Math.max(9, (c / max) * 100)}%` : "2px";
+			bar.title = `${c} request${c === 1 ? "" : "s"} · ${fmtDate(h.t0 + i * h.bucket_s)}`;
+			chartEl.append(bar);
+		}
+	}
+
+	// --- table ------------------------------------------------------------------
+
+	function renderStats() {
+		const sc = Object.fromEntries((state.facetData.status || []).map((x) => [String(x.value), x.count]));
+		let ok = 0, limited = 0, err = 0;
+		for (const [v, c] of Object.entries(sc)) {
+			if (/^2\d\d$/.test(v)) ok += c;
+			else if (v === "429") limited += c;
+			else err += c;
+		}
+		statsEl.textContent = state.total
+			? `${state.total.toLocaleString("en-US")} requests · ${ok.toLocaleString("en-US")} ok · ${limited} × 429 · ${err} err`
+			: (state.run ? "no requests match" : "");
+	}
+
+	function rowEl(r) {
+		const k = rowKey(r);
+		const model = friendlyModel(r.model);
+		const provider = friendlyProvider(r);
+		return el("div",
+			{
+				class: `fl-row${k === state.selectedKey ? " selected" : ""}`,
+				dataset: { k },
+				onclick: () => select(r),
+			},
+			el("span", { class: "fl-date", text: fmtDate(r.t_response), title: fmtStamp(r.t_response) }),
+			el("span", { class: "fl-cell", title: r.model ?? "" }, avatar(model), el("span", { class: "fl-cell-txt", text: model })),
+			el("span", { class: "fl-cell", title: r.base_url || "" }, avatar(provider), el("span", { class: "fl-cell-txt", text: provider })),
+			el("span", {
+				class: `fl-app${r.slot ? "" : " unknown"}`,
+				text: shortSlotLabel(r.slot),
+				title: [r.slot, r.step, r.node].filter(Boolean).join(" · "),
+			}),
+			el("span", { class: "fl-tokens", text: r.ok ? `${fmtTok(r.tokens_in)} → ${fmtTok(r.tokens_out)}` : "" }),
+			statusChip(r),
+		);
+	}
+
+	const footEl = el("div", { class: "fl-more" });
+	function renderFooter() {
+		footEl.textContent = "";
+		if (state.loading) {
+			footEl.append(el("div", { class: "fl-more-msg", text: "loading…" }));
+		} else if (state.hasMore) {
+			footEl.append(el("button", { class: "fl-more-btn", text: `Load ${PAGE} older`, onclick: loadOlder }));
+		} else if (state.rows.length) {
+			footEl.append(el("div", { class: "fl-more-msg", text: `end · ${state.rows.length} shown` }));
+		}
+	}
+
+	let renderQueued = false;
+	function scheduleRender() {
+		if (renderQueued) return;
+		renderQueued = true;
+		setTimeout(() => { renderQueued = false; if (state.open) render(); }, 120);
+	}
+
+	function render() {
+		renderStats();
+		const atTop = rowsEl.scrollTop <= 4;
+		const prevH = rowsEl.scrollHeight;
+		const prevTop = rowsEl.scrollTop;
 		rowsEl.textContent = "";
 		if (!state.rows.length) {
-			rowsEl.append(el("div", { class: "flog-empty", text:
-				state.loading ? "loading…" : "no requests recorded for this run yet" }));
+			rowsEl.append(el("div", { class: "fl-empty", text:
+				state.loading ? "loading…"
+					: Object.values(state.filters).some((s) => s.size) ? "No requests match the current filters."
+					: "No requests recorded for this run yet." }));
 			return;
 		}
 		for (const r of state.rows) rowsEl.append(rowEl(r));
+		renderFooter();
+		rowsEl.append(footEl);
+		if (!atTop) rowsEl.scrollTop = prevTop + (rowsEl.scrollHeight - prevH);
 	}
 
-	function renderPager() {
-		prevBtn.disabled = state.pageIndex === 0 || state.loading;
-		nextBtn.disabled = !state.hasMore || state.loading;
-		pageLab.textContent = state.loading ? "loading…" : state.run ? `page ${state.pageIndex + 1}` : "";
+	// --- Generation details panel -------------------------------------------------
+
+	let detailToken = 0;
+
+	function card(label, value, { title = "" } = {}) {
+		return el("div", { class: "fl-card" },
+			el("div", { class: "fl-card-lab", text: label }),
+			el("div", { class: "fl-card-val", text: value ?? "--", title }),
+		);
+	}
+
+	function kv(key, value, { mono = true, dim = false } = {}) {
+		return el("div", { class: "fl-kv" },
+			el("span", { class: "fl-kv-k", text: key }),
+			el("span", { class: `fl-kv-v${mono ? " mono" : ""}${dim ? " dim" : ""}`,
+				text: value ?? "—", title: value == null ? "" : String(value) }),
+		);
+	}
+
+	function section(title, ...children) {
+		return el("div", { class: "fl-d-sec" },
+			el("div", { class: "fl-d-sec-title", text: title }),
+			...children,
+		);
+	}
+
+	function collapsible(title, meta, content, { open = false, mono = true } = {}) {
+		const caret = el("span", { class: "fl-sec-caret", text: "›" });
+		const sec = el("div", { class: `fl-sec${open ? " open" : ""}` });
+		sec.append(
+			el("div", { class: "fl-sec-head",
+				onclick: () => sec.classList.toggle("open") },
+				caret,
+				el("span", { class: "fl-sec-title", text: title }),
+				meta ? el("span", { class: "fl-sec-meta", text: meta }) : null,
+			),
+			el("pre", { class: `fl-pre${mono ? "" : " sans"}`, text: content || "—" }),
+		);
+		return sec;
+	}
+
+	// Latency bars for every loaded attempt of the same logical call — the
+	// "Provider Responses" module (a 429 sweep shows one bar per key tried).
+	function responseBars(r) {
+		let attempts = [r];
+		if (r.call != null) {
+			attempts = state.rows
+				.filter((x) => x.slot === r.slot && x.call === r.call)
+				.sort((a, b) => (a.attempt || 0) - (b.attempt || 0));
+			if (!attempts.length) attempts = [r];
+		}
+		const total = attempts.reduce((s, a) => s + (a.flight_ms || 0), 0) || 1;
+		const wrap = el("div", { class: "fl-bars" });
+		for (const a of attempts) {
+			const frac = Math.max(0.04, (a.flight_ms || 0) / total);
+			const cls = a.ok ? "ok" : bucket(a) === "429" ? "warn" : "err";
+			wrap.append(el("div", { class: "fl-bar-row" },
+				el("span", { class: "fl-bar-lab", text: friendlyProvider(a), title: a.base_url || "" }),
+				statusChip(a),
+				el("span", { class: "fl-bar-track" },
+					el("span", { class: `fl-bar-fill ${cls}`, style: `width:${(frac * 100).toFixed(1)}%`,
+						text: a.ok && a.tokens_out ? `${fmtTok(a.tokens_out)} tokens` : "" }),
+				),
+				el("span", { class: "fl-bar-time", text: fmtFlight(a.flight_ms) }),
+			));
+		}
+		if (attempts.length > 1) {
+			wrap.append(el("div", { class: "fl-bar-total", text: `Total: ${fmtFlight(total)}` }));
+		}
+		return wrap;
+	}
+
+	async function loadPrompts(r, container) {
+		const token = ++detailToken;
+		container.textContent = "";
+		container.append(el("div", { class: "fl-d-note", text: "loading prompt + completion…" }));
+		let data = null;
+		try { data = await api.flightDetail(r.slot, r.id); } catch { data = null; }
+		if (token !== detailToken) return;
+		container.textContent = "";
+		if (!data || (!data.system && !data.user && !data.output)) {
+			container.append(el("div", { class: "fl-d-note", text: r.ok
+				? "No prompt captured for this request (pre-SQLite history, or served from cache)."
+				: "This attempt failed — the prompt + completion live on the retry that succeeded." }));
+			return;
+		}
+		container.append(
+			collapsible("Prompt", r.tokens_in != null ? `${fmtTok(r.tokens_in)} tokens` : `${(data.user || "").length} chars`, data.user ?? ""),
+			collapsible("System", `${(data.system || "").length} chars`, data.system ?? ""),
+			collapsible("Completion", r.tokens_out != null ? `${fmtTok(r.tokens_out)} tokens` : null, data.output ?? "", { open: true }),
+			data.reasoning ? collapsible("Reasoning", `${data.reasoning.length} chars`, data.reasoning) : null,
+			data.schema ? el("div", { class: "fl-d-schema", text: `schema · ${data.schema}` }) : null,
+		);
+	}
+
+	function renderDetail(r) {
+		const model = friendlyModel(r.model);
+		const provider = friendlyProvider(r);
+		const parts = (r.slot || "").split("/");
+		const isBranch = parts.length >= 3 && parts[1] === "_branches";
+		detailEl.textContent = "";
+		const promptsEl = el("div", { class: "fl-d-prompts" });
+		detailEl.append(
+			el("div", { class: "fl-d-head" },
+				el("div", { class: "fl-d-head-top" },
+					el("span", { class: "fl-d-title", text: "Generation details" }),
+					el("button", { class: "fl-d-close", text: "✕", title: "close (Esc)", onclick: deselect }),
+				),
+				el("div", { class: "fl-d-chips" },
+					el("span", { class: "fl-mchip" }, avatar(model), el("span", { text: model })),
+					el("span", { class: "fl-mchip" }, avatar(provider), el("span", { text: provider })),
+				),
+			),
+			el("div", { class: "fl-d-body" },
+				el("div", { class: "fl-cards" },
+					card("Provider latency", fmtFlight(r.flight_ms)),
+					card("Throughput", throughput(r) ?? "--"),
+					card("Cost", "--", { title: "settled costs live on the run's spend tracker" }),
+					card("Tokens", r.tokens_in != null || r.tokens_out != null
+						? `${fmtTok(r.tokens_in)} → ${fmtTok(r.tokens_out)}` : "--"),
+					card("Attempt", r.attempt != null ? `#${r.attempt}${r.call != null ? ` of call ${r.call}` : ""}` : "--"),
+					card("API key", r.key ?? "--"),
+				),
+				section("Overview",
+					kv("Model ID", r.model),
+					kv("Kind", r.kind, { mono: false }),
+					kv("Transport", r.transport, { mono: false }),
+					kv("Scene", r.slot ?? "Unknown"),
+					isBranch ? kv("Branch", parts.slice(2).join("/")) : null,
+					r.step ? kv("Step", r.step) : null,
+					r.node ? kv("Node", r.node) : null,
+				),
+				section("Request",
+					kv("Request at", fmtStamp(r.t_request), { mono: false }),
+					kv("Response at", fmtStamp(r.t_response), { mono: false }),
+					kv("Endpoint", r.base_url || (r.transport === "openrouter" ? "openrouter.ai/api/v1" : "—")),
+					r.generation_id ? kv("Generation ID", r.generation_id) : null,
+					kv("Status", statusValue(r), { mono: false }),
+				),
+				r.error ? el("pre", { class: "fl-d-err", text: r.error }) : null,
+				section("Provider Responses", responseBars(r)),
+				promptsEl,
+			),
+			el("div", { class: "fl-d-nav" },
+				el("button", { class: "fl-nav-btn", text: "←", title: "previous request", onclick: () => step(1) }),
+				el("button", { class: "fl-nav-btn", text: "→", title: "next request", onclick: () => step(-1) }),
+			),
+		);
+		loadPrompts(r, promptsEl);
+	}
+
+	// Move the selection up/down the visible (newest-first) list.
+	function step(dir) {
+		if (state.selectedKey == null) return;
+		const idx = state.rows.findIndex((x) => rowKey(x) === state.selectedKey);
+		const next = state.rows[idx + dir];
+		if (next) select(next);
 	}
 
 	function markSelected() {
@@ -218,162 +671,34 @@ export function initFlights() {
 		}
 	}
 
-	// --- render: detail --------------------------------------------------------
-
-	let detailToken = 0;
-
-	function card(labelText, valueText, ico) {
-		return el("div", { class: "flog-card" },
-			el("div", { class: "flog-card-lab" }, ico ? el("span", { text: ico }) : null, el("span", { text: labelText })),
-			el("div", { class: "flog-card-val", text: valueText }),
-		);
-	}
-	function kv(k, v, { mono = false, link = false } = {}) {
-		return el("div", { class: "flog-kv" },
-			el("span", { class: "flog-kv-k", text: k }),
-			el("span", { class: `flog-kv-v${mono ? " flog-mono" : ""}${link ? " flog-mono" : ""}`, text: v ?? "—", title: v == null ? "" : String(v) }),
-		);
-	}
-
-	function fold(title, subtitle, { open = false } = {}) {
-		const caret = el("span", { text: open ? "▾" : "▸" });
-		const body = el("div", { class: "flog-fold-body" });
-		const node = el("div", { class: `flog-fold${open ? " open" : ""}` },
-			el("div", { class: "flog-fold-h",
-				onclick: () => { node.classList.toggle("open"); caret.textContent = node.classList.contains("open") ? "▾" : "▸"; } },
-				caret,
-				el("span", { text: title }),
-				subtitle ? el("span", { class: "flog-fold-ct", text: subtitle }) : null,
-			),
-			body,
-		);
-		return { node, body };
-	}
-
 	function select(r) {
-		state.selectedKey = rowKey(r);
+		const k = rowKey(r);
+		if (state.selectedKey === k) { deselect(); return; }
+		state.selectedKey = k;
 		markSelected();
+		detailEl.classList.add("open");
 		renderDetail(r);
 	}
 
 	function deselect() {
 		state.selectedKey = null;
+		detailEl.classList.remove("open");
+		detailEl.textContent = "";
 		markSelected();
-		detailEl.textContent = "";
-		detailEl.append(el("div", { class: "flog-ph", text: "Select a request to see its details." }));
 	}
 
-	function renderDetail(r) {
-		const mLabel = prettyModel(r.model);
-		const pLabel = prettyProvider(r);
-		detailEl.textContent = "";
-		for (const _k of [
-			el("div", { class: "flog-d-head" },
-				el("span", { class: "flog-d-title", text: "Generation details" }),
-				el("button", { class: "flog-x", text: "✕", title: "close (Esc)", onclick: deselect }),
-			),
-			el("div", { class: "flog-pills" },
-				el("span", { class: "flog-pill" }, icon(mLabel), el("span", { text: mLabel })),
-				el("span", { class: "flog-pill" }, icon(pLabel), el("span", { text: pLabel })),
-			),
-			el("div", { class: "flog-cards" },
-				card("Provider latency", fmtDur(r.flight_ms), "◷"),
-				card("Throughput", throughput(r), "⚡"),
-				card("Cost", "--", "$"),
-				card("Tokens", r.tokens_in != null || r.tokens_out != null ? `${fmtNum(r.tokens_in)} → ${fmtNum(r.tokens_out)}` : "--"),
-				card("Fallbacks", "--", "⟳"),
-				card("Fallback latency", "--"),
-			),
-			r.error ? el("div", { class: "flog-err-box", text: r.error }) : null,
-			el("div", { class: "flog-sech", text: "Overview" }),
-			kv("Model ID", r.model, { mono: true }),
-			kv("Transport", r.transport),
-			kv("Endpoint", r.base_url || (r.transport === "openrouter" ? "openrouter.ai/api/v1" : "—"), { mono: true }),
-			kv("Kind", r.kind),
-			el("div", { class: "flog-sech", text: "Request" }),
-			kv("API Key", r.key || "—", { mono: true }),
-			kv("Generation ID", r.generation_id || "—", { mono: true }),
-			kv("Scene", r.slot, { mono: true }),
-			r.step ? kv("Step", r.step) : null,
-			r.node ? kv("Node", r.node) : null,
-			kv("Attempt", r.call != null ? `call #${r.call} · try ${r.attempt}` : `try ${r.attempt ?? 1}`),
-			kv("Streaming", "false"),
-			el("div", { class: "flog-sech", text: "Provider Responses" }),
-			providerResponses(r),
-		].filter(Boolean)) detailEl.append(_k);
-
-		// Collapsible prompt/output/reasoning (lazy) + raw JSON (immediate).
-		const prompt = fold("Prompt", r.tokens_in != null ? `${fmtNum(r.tokens_in)} tokens` : "");
-		const completion = fold("Completion", r.tokens_out != null ? `${fmtNum(r.tokens_out)} tokens` : "");
-		const reasoning = fold("Reasoning", "");
-		const raw = fold("Generation Data", "Raw JSON");
-		raw.body.append(el("pre", { class: "flog-pre", text: JSON.stringify(r, null, 2) }));
-		for (const f of [prompt, completion, reasoning]) f.body.append(el("div", { class: "flog-note", text: "loading…" }));
-		detailEl.append(prompt.node, completion.node, reasoning.node, raw.node);
-
-		loadPrompts(r, { prompt, completion, reasoning });
-	}
-
-	function providerResponses(r) {
-		const wrap = el("div", {});
-		const ok = r.ok;
-		const badge = el("span", { class: `flog-badge ${ok ? "ok" : "err"}`, text: r.status != null ? String(r.status) : (r.exc_type || "err") });
-		wrap.append(el("div", { class: "flog-resp-row" },
-			el("div", { class: "flog-resp-lab" }, icon(prettyProvider(r)), el("span", { text: prettyProvider(r) }), badge),
-			el("div", { class: "flog-track" }, el("div", { class: "flog-fill green", style: "width:100%" })),
-			el("div", { class: "flog-resp-t", text: fmtDur(r.flight_ms) }),
-		));
-		if (r.tokens_out) {
-			wrap.append(el("div", { class: "flog-resp-row" },
-				el("div", { class: "flog-resp-lab" }, el("span", { text: "Generation" })),
-				el("div", { class: "flog-track" },
-					el("div", { class: "flog-fill blue", style: "width:100%", text: `${fmtNum(r.tokens_out)} tokens · ${throughput(r)}` })),
-				el("div", { class: "flog-resp-t", text: fmtDur(r.flight_ms) }),
-			));
-		}
-		wrap.append(el("div", { class: "flog-total", text: `Total: ${fmtDur(r.flight_ms)}` }));
-		return wrap;
-	}
-
-	async function loadPrompts(r, folds) {
-		const token = ++detailToken;
-		let data = null;
-		try { data = await api.flightDetail(r.slot, r.id); } catch { data = null; }
-		if (token !== detailToken) return; // superseded
-		const fill = (f, parts, emptyMsg) => {
-			f.body.textContent = "";
-			const has = parts.some(([, v]) => v);
-			if (!has) { f.body.append(el("div", { class: "flog-note", text: emptyMsg })); return; }
-			for (const [lab, v] of parts) {
-				if (!v) continue;
-				if (lab) f.body.append(el("div", { class: "flog-pre-lab", text: lab }));
-				f.body.append(el("pre", { class: "flog-pre", text: v }));
-			}
-		};
-		const note = r.ok
-			? "no prompt captured (pre-SQLite history, or served from cache)."
-			: "this attempt failed — the prompt + output are on the retry that succeeded.";
-		fill(folds.prompt, [["system", data?.system], ["user", data?.user]], note);
-		fill(folds.completion, [["", data?.output]], note);
-		if (data?.reasoning) {
-			fill(folds.reasoning, [["", data.reasoning]], "");
-		} else {
-			folds.reasoning.node.remove();
-		}
-	}
-
-	// --- live tail -------------------------------------------------------------
+	// --- live tail -----------------------------------------------------------
 
 	function feed(row) {
-		if (row.id == null || state.pageIndex !== 0) return;
+		if (row.id == null) return;
 		const k = rowKey(row);
-		if (state.seen.has(k)) return;
+		if (state.seen.has(k) || !matches(row)) return;
 		state.seen.add(k);
-		state.rows.unshift(row);
-		if (state.rows.length > PAGE) state.rows.pop();
-		renderRows();
-		renderChart();
-		markSelected();
+		state.rows.push(row);
+		state.total += 1;
+		sortRows();
+		scheduleRender();
+		if (Date.now() - state.histoAt > 15_000) refreshHistogram();
 	}
 
 	function openStream() {
@@ -389,7 +714,7 @@ export function initFlights() {
 
 	async function populateRuns() {
 		let runs = [];
-		try { runs = (await api.runs()).runs || []; } catch { /* keep */ }
+		try { runs = (await api.runs()).runs || []; } catch { /* keep current */ }
 		runSel.textContent = "";
 		for (const r of runs) runSel.append(el("option", { value: r.name, text: r.name }));
 		if (state.run) runSel.value = state.run;
@@ -397,12 +722,13 @@ export function initFlights() {
 
 	function setRun(run) {
 		if (!run || run === state.run) return;
+		deselect();
+		closePopover();
 		state.run = run;
 		runSel.value = run;
-		state.pageIndex = 0;
-		state.cursors = [null];
-		state.selectedKey = null;
-		loadPage();
+		reload();
+		refreshFacets();
+		refreshHistogram();
 		openStream();
 	}
 
@@ -411,34 +737,28 @@ export function initFlights() {
 		view.classList.add("open");
 		await populateRuns();
 		const run = state.run || appState.run || runSel.value;
-		if (run) {
+		if (run && run !== state.run) {
 			state.run = run;
 			runSel.value = run;
-			state.pageIndex = 0;
-			state.cursors = [null];
-			loadPage();
+		}
+		if (state.run) {
+			reload();
+			refreshFacets();
+			refreshHistogram();
 			openStream();
 		} else {
-			deselect();
-			renderRows();
+			render();
 		}
 	}
 
 	function close() {
 		state.open = false;
 		view.classList.remove("open");
+		closePopover();
 		state.es?.close();
 		state.es = null;
 		liveDot.classList.remove("on");
 	}
 
 	btn.addEventListener("click", () => (state.open ? close() : open()));
-}
-
-// The cell/branch name out of a "<run>/<slot>/<model>" path (the row's scene).
-function sceneName(slot) {
-	if (!slot) return "—";
-	const p = String(slot).split("/");
-	if (p.length >= 3 && p[1] === "_branches") return `branch:${p.slice(2).join("/")}`;
-	return p.length >= 3 ? p[1] : String(slot);
 }
