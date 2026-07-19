@@ -8,11 +8,11 @@ server (`app.api.routes`) resolves a `(run, slot, model)` cell to those paths
 (handling the legacy `generated/<n>/` layout) and calls in. Nothing here imports
 the server.
 
-Why the raw `objects-generated/` set (never the optimized twin):
-  * The optimized GLBs are KTX2/Meshopt (`extensionsRequired`), which trimesh
-    cannot decode — so a Python sampler literally can't read them.
-  * They are decimated (~15k tris / 256px) and incomplete (only a subset survive
-    optimization). The raw set is full-fidelity, complete, and vanilla glTF.
+Meshes are consumed AS-IS through `splat.assets.load_geoms`: vanilla glTF via
+trimesh (full materials), KTX2/Meshopt sets via the in-process decoder (no
+de-optimization step — geometry decodes natively; textures stay undecoded and
+materials degrade to alphaMode/baseColorFactor stubs carrying the KTX2 pixel
+size read from the image header).
 
 Why no monolithic composed mesh: generation bakes every mesh into world space
 (`rescale_mesh_to_bbox`), verified here — a mesh's world AABB equals its bbox
@@ -34,7 +34,8 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import trimesh
+
+from splat.assets import load_geoms
 
 MANIFEST_VERSION = 1
 MANIFEST_NAME = "scene.json"
@@ -93,29 +94,29 @@ def _bbox_corners(node: dict[str, Any]) -> tuple[np.ndarray, np.ndarray] | None:
     return np.minimum(a, b), np.maximum(a, b)
 
 
-def _iter_geoms(mesh: trimesh.Trimesh | trimesh.Scene) -> list[trimesh.Trimesh]:
-    if isinstance(mesh, trimesh.Scene):
-        return list(mesh.geometry.values())
-    return [mesh]
-
-
-def _material_info(geoms: list[trimesh.Trimesh]) -> dict[str, Any] | None:
+def _material_info(geoms: list[Any]) -> dict[str, Any] | None:
     """PBR facts from the first geometry that has a material — read WITHOUT
-    decoding textures (PIL `.size` reads only the image header), so this stays
-    cheap. `alpha_mode` drives later opacity init (OPAQUE → 1)."""
+    decoding texels: vanilla files expose a PIL image whose `.size` reads only
+    the header; KTX2 stubs carry `ktx2_texture_size` from the KTX2 header.
+    `alpha_mode` drives later opacity init (OPAQUE → 1)."""
     for geom in geoms:
         material = getattr(getattr(geom, "visual", None), "material", None)
         if material is None:
             continue
         base = getattr(material, "baseColorTexture", None)
+        ktx2 = getattr(material, "ktx2_texture_size", None)
         return {
             "alpha_mode": getattr(material, "alphaMode", None),
-            "base_color": base is not None,
+            "base_color": base is not None or ktx2 is not None,
             "normal": getattr(material, "normalTexture", None) is not None,
             "metallic_roughness": (
                 getattr(material, "metallicRoughnessTexture", None) is not None
             ),
-            "texture_size": list(base.size) if base is not None else None,
+            "texture_size": (
+                list(base.size) if base is not None
+                else list(ktx2) if ktx2 is not None
+                else None
+            ),
         }
     return None
 
@@ -126,13 +127,12 @@ def _object_record(
     """Load one placed mesh and collect geometry + material facts + AABB drift
     against its bbox event. Raises on an unreadable GLB (the caller records it as
     a warning and moves on)."""
-    mesh = trimesh.load(mesh_path, process=False)
+    geoms = load_geoms(mesh_path)
     try:
-        geoms = _iter_geoms(mesh)
         vertices = int(sum(len(g.vertices) for g in geoms))
         faces = int(sum(len(g.faces) for g in geoms))
-        bounds = np.asarray(mesh.bounds, dtype=float)  # world AABB (placement baked in)
-        amin, amax = bounds[0], bounds[1]
+        gb = np.array([g.bounds for g in geoms], dtype=float)  # world AABBs (baked)
+        amin, amax = gb[:, 0].min(axis=0), gb[:, 1].max(axis=0)
 
         orientation = int(node.get("orientation", 0) or 0)
         corners = _bbox_corners(node)
@@ -162,8 +162,9 @@ def _object_record(
             "material": _material_info(geoms),
         }
     finally:
-        # trimesh holds decoded arrays + PIL images; drop them before the next.
-        del mesh
+        # loaded geometries hold decoded arrays (+ PIL images on the vanilla
+        # path); drop them before the next object.
+        del geoms
 
 
 def assemble_cell(

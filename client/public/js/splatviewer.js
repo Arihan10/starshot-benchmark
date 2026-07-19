@@ -1,14 +1,10 @@
 // Full-screen Gaussian-splat viewer for Stage-2 clouds, on @mkkellogg/gaussian-
 // splats-3d (orbit controls + WASM sort).
 //
-// LOD streaming: lazy-loads the ~10 MB base cloud (cloud.ply) for a fast first
-// paint, then streams the denser detail LOD (cloud.detail.ply) in the background
-// and swaps it in (removeSplatScene(base)) once it's ready.
-//
-// Live controls: a panel exposes the sampler's global knobs (density / overlap /
-// flatness / adaptive / detail) and re-splats the open cell — POST the knobs,
-// poll progress, reload in place (camera preserved) — so tuning needs no server
-// restart and no manual command.
+// Live controls: the panel exposes the sampler's ONE quality knob (`detail`, a
+// density multiplier — everything else is derived server-side) and re-splats
+// the open cell — POST the knob, poll progress, reload in place (camera
+// preserved) — so tuning needs no server restart and no manual command.
 
 import * as GaussianSplats3D from "@mkkellogg/gaussian-splats-3d";
 import * as THREE from "three";
@@ -34,7 +30,10 @@ let openSeq = 0; // bumps on open/close to cancel in-flight loads/polls
 let pollTimer = null;
 let current = null; // { run, slot, model, source }
 let inputs = null; // control input elements, by key
-let voxelPoints = null; // Stage-2 free-space overlay (THREE.Points), lazy
+let voxelPoints = null; // Stage-2 voxel overlay (THREE.Group: green cover + red garbage shells), lazy
+let freePoints = null; // Stage-2 FREE-volume overlay (THREE.Group of blue shells), lazy
+let freeShells = null; // [{t, cells, mesh}] per pre-meshed clearance threshold (slider index)
+let voxelLights = null; // scene lights (THREE.Group) for solid voxel-only mode, lazy
 let meshGroup = null; // original-mesh overlay (THREE.Group), lazy
 let mode = "splat"; // "splat" | "mesh" | "sog" — the view switch (not an overlay)
 let splatSource = "surfels"; // "surfels" (Stage-3 cloud.ply) | "trained" (Stage-6 trained.ply)
@@ -61,6 +60,7 @@ let _downXY = null; // pointer-down pos, to tell a click from an orbit drag
 let cellStatus = null; // last-fetched per-stage status of the open cell
 let cloudLoaded = false; // whether a surfel cloud is currently in the canvas
 let runningAll = false; // the "run all (1-5)" sequential driver is active
+let assetSource = null; // {source, available, active_kind} — which assets feed the pipeline
 
 // WASD free-fly state (see movementTick). mkkellogg owns mouse orbit/zoom; this
 // adds keyboard walk by translating the camera + orbit target together per frame.
@@ -212,13 +212,16 @@ async function teardown() {
 	closeSogView(); // the PlayCanvas canvas lives in canvasEl too (replaceChildren below)
 	// Overlays live in the viewer's threeScene; free their GPU resources and
 	// reset their toggles before the viewer (and its GL context) goes away.
-	for (const obj of [voxelPoints, meshGroup, patchPoints, cameraPoints]) {
+	for (const obj of [voxelPoints, freePoints, voxelLights, meshGroup, patchPoints, cameraPoints]) {
 		if (obj) {
 			viewer?.threeScene?.remove(obj);
 			disposeObj(obj);
 		}
 	}
 	voxelPoints = null;
+	freePoints = null;
+	freeShells = null;
+	voxelLights = null;
 	meshGroup = null;
 	patchPoints = null;
 	patchViews = null;
@@ -233,7 +236,9 @@ async function teardown() {
 	// on the new viewer, and the overlays are gone.
 	mode = "splat";
 	syncViewButtons();
-	if (inputs && inputs._fsRow) inputs._fsRow.style.display = "none";
+	if (inputs && inputs.voxels) inputs.voxels.checked = false;
+	if (inputs && inputs.garbage) inputs.garbage.checked = false;
+	if (inputs && inputs.freevox) inputs.freevox.checked = false;
 	const v = viewer;
 	viewer = null;
 	if (v) {
@@ -246,12 +251,9 @@ async function teardown() {
 	if (canvasEl) canvasEl.replaceChildren();
 }
 
-// Build a fresh viewer, load the base cloud, then stream the detail LOD behind it.
-async function loadClouds(seq, url, detailUrl, summary, camera) {
-	await teardown();
-	if (seq !== openSeq) return;
-	const view = camera || framing(summary && summary.scene_aabb);
-	const v = new GaussianSplats3D.Viewer({
+// One viewer construction shared by the splat and mesh-first paths.
+function makeViewer(view) {
+	return new GaussianSplats3D.Viewer({
 		rootElement: canvasEl,
 		selfDrivenMode: true,
 		useBuiltInControls: true,
@@ -262,6 +264,90 @@ async function loadClouds(seq, url, detailUrl, summary, camera) {
 		initialCameraPosition: view.position,
 		initialCameraLookAt: view.lookAt,
 	});
+}
+
+// A 1-splat PLY (INRIA 3DGS layout) as a blob URL: sub-micron scale, near-zero
+// alpha, parked far below any scene. mkkellogg's self-driven render loop gates
+// on "splat render ready", which only flips once a splat scene has been ADDED —
+// with zero scenes it never renders threeScene at all, so a mesh-only view
+// needs this invisible seed scene to make the canvas draw.
+function dummySplatPlyUrl() {
+	const header =
+		"ply\nformat binary_little_endian 1.0\nelement vertex 1\n" +
+		"property float x\nproperty float y\nproperty float z\n" +
+		"property float nx\nproperty float ny\nproperty float nz\n" +
+		"property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n" +
+		"property float opacity\n" +
+		"property float scale_0\nproperty float scale_1\nproperty float scale_2\n" +
+		"property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n" +
+		"end_header\n";
+	// opacity logit −4 → α ≈ 0.018 (survives alpha-removal, invisible);
+	// log-scales −14 → ~8e-7 m; y = −9999 keeps it out of any framing.
+	const vals = new Float32Array([
+		0, -9999, 0, 0, 0, 1, 0, 0, 0, -4, -14, -14, -14, 1, 0, 0, 0,
+	]);
+	const head = new TextEncoder().encode(header);
+	const buf = new Uint8Array(head.length + vals.byteLength);
+	buf.set(head, 0);
+	buf.set(new Uint8Array(vals.buffer), head.length);
+	return URL.createObjectURL(
+		new Blob([buf], { type: "application/octet-stream" }),
+	);
+}
+
+// MESH-FIRST view: the stage-2 voxel grid is measured off the ORIGINAL meshes,
+// so the viewer opens on them (the cell's SELECTED splat asset set) before any
+// surfel cloud exists — the voxel/free overlays render over the exact geometry
+// they were computed from, no Stage 3 required. When Stage 3 later completes,
+// loadClouds tears this down and replaces it with the splat view as usual.
+async function openMeshView(seq) {
+	await teardown();
+	if (seq !== openSeq || !current) return;
+	const aabb =
+		cellStatus?.stage2?.summary?.scene_aabb ||
+		cellStatus?.summary?.scene_aabb ||
+		null;
+	const v = makeViewer(framing(aabb));
+	viewer = v;
+	try {
+		// Seed the invisible dummy scene FIRST (see dummySplatPlyUrl) so the
+		// library's render loop actually draws threeScene.
+		const dummy = dummySplatPlyUrl();
+		try {
+			await v.addSplatScene(dummy, {
+				showLoadingUI: false,
+				splatAlphaRemovalThreshold: 1,
+				format: GaussianSplats3D.SceneFormat.Ply,
+			});
+		} finally {
+			URL.revokeObjectURL(dummy);
+		}
+		if (seq !== openSeq || viewer !== v) return;
+		v.start();
+	} catch (e) {
+		if (seq === openSeq)
+			setStatus(`viewer failed: ${e && e.message ? e.message : e}`, "var(--red)");
+		return;
+	}
+	moveSpeed = speedFor(aabb);
+	startMovement();
+	mode = "mesh";
+	syncViewButtons();
+	const ok = await ensureMesh();
+	if (seq !== openSeq || viewer !== v) return;
+	if (ok && meshGroup) meshGroup.visible = true;
+	setStatus(
+		"original mesh — voxel overlays available; run surfels (Stage 3) for the splat",
+		"",
+	);
+}
+
+// Build a fresh viewer and load the cell's surfel cloud.
+async function loadClouds(seq, url, summary, camera) {
+	await teardown();
+	if (seq !== openSeq) return;
+	const view = camera || framing(summary && summary.scene_aabb);
+	const v = makeViewer(view);
 	viewer = v;
 	try {
 		await v.addSplatScene(url, {
@@ -284,37 +370,7 @@ async function loadClouds(seq, url, detailUrl, summary, camera) {
 	moveSpeed = speedFor(summary && summary.scene_aabb);
 	startMovement();
 	const baseN = summary && summary.splats;
-	setStatus(
-		(baseN ? `${baseN.toLocaleString()} splats` : "loaded") +
-			(detailUrl ? " · streaming detail…" : ""),
-		"var(--green)",
-	);
-	if (!detailUrl) return;
-	// Stream the denser LOD in the background; when it lands, drop the base scene.
-	v.addSplatScene(detailUrl, {
-		showLoadingUI: false,
-		splatAlphaRemovalThreshold: 1,
-		format: GaussianSplats3D.SceneFormat.Ply,
-	})
-		.then(() => {
-			if (seq !== openSeq || viewer !== v) return;
-			try {
-				if (v.getSceneCount() > 1) v.removeSplatScene(0);
-			} catch {
-				/* keep both if removal fails — just a touch heavier */
-			}
-			const dN = summary && summary.detail && summary.detail.splats;
-			setStatus(
-				dN
-					? `${dN.toLocaleString()} splats (detail LOD)`
-					: "detail LOD loaded",
-				"var(--green)",
-			);
-		})
-		.catch(() => {
-			if (seq === openSeq)
-				setStatus("detail LOD failed — showing base", "");
-		});
+	setStatus(baseN ? `${baseN.toLocaleString()} splats` : "loaded", "var(--green)");
 }
 
 // ---- controls panel ---------------------------------------------------------
@@ -354,7 +410,7 @@ function checkRow(key, label, checked) {
 	);
 }
 
-// ---- overlays (Stage-3 free space + original mesh) --------------------------
+// ---- overlays (Stage-2 voxels + original mesh) --------------------------------
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -362,57 +418,229 @@ function setOverlay(text) {
 	if (inputs && inputs._overlay) inputs._overlay.textContent = text || "";
 }
 
-// Clearance → colour: 0 (at a surface) warm red, 1 (most open) cool blue.
-function clearanceColor(t) {
-	const x = Math.max(0, Math.min(1, t));
-	return [1 - 0.8 * x, 0.25 + 0.45 * x, 0.2 + 0.8 * x];
+// One translucent VOLUME layer: a merged boundary shell rendered as a
+// non-depth-writing transparent surface, so same-class voxel regions read as
+// one collective shape over the scene (mesh or splat view). x-ray layers draw
+// faintly THROUGH everything (garbage is inside objects — without it, sealed
+// interiors are undiscoverable from outside).
+// Translucent, unlit OVERLAY material — the shell drawn as a colored haze over
+// a splat/mesh view (non-depth-writing so it doesn't occlude the scene).
+function voxelOverlayMat(color, opacity, xray) {
+	return new THREE.MeshBasicMaterial({
+		color,
+		transparent: true,
+		opacity,
+		depthWrite: false,
+		depthTest: !xray,
+		side: THREE.DoubleSide,
+	});
 }
 
-// Build the free-voxel point cloud from voxels.bin ([x,y,z,clearance] float32).
-async function buildVoxels(url, summary) {
-	const res = await fetch(url, { cache: "no-store" });
-	if (!res.ok) throw new Error(`HTTP ${res.status}`);
-	const arr = new Float32Array(await res.arrayBuffer());
-	const n = (arr.length / 4) | 0;
-	const pos = new Float32Array(n * 3);
-	const col = new Float32Array(n * 3);
-	const cmax = (summary && summary.clearance_max) || 1;
-	for (let i = 0; i < n; i++) {
-		pos[i * 3] = arr[i * 4];
-		pos[i * 3 + 1] = arr[i * 4 + 1];
-		pos[i * 3 + 2] = arr[i * 4 + 2];
-		const [r, g, b] = clearanceColor(arr[i * 4 + 3] / cmax);
-		col[i * 3] = r;
-		col[i * 3 + 1] = g;
-		col[i * 3 + 2] = b;
+// Solid, lit voxel material (MeshLambert): opaque + depth-writing, so the shells
+// CONSTRUCT the scene as shaded blocks — a color-coded silhouette. Scene lights
+// (ensureVoxelLights) give it form; DoubleSide keeps it correct from inside a
+// hollow.
+function voxelSolidMat(color) {
+	return new THREE.MeshLambertMaterial({ color, side: THREE.DoubleSide });
+}
+
+// One voxel shell layer. Starts in the overlay look; `applyVoxelStyle` swaps it
+// to the solid lit look for voxel-only mode. Style metadata rides on the mesh
+// so a single pass can restyle (and dispose) every layer.
+function volumeLayer(geo, color, opacity, xray) {
+	const mesh = new THREE.Mesh(geo, voxelOverlayMat(color, opacity, xray));
+	mesh.userData.voxColor = color;
+	mesh.userData.voxOpacity = opacity;
+	mesh.userData.voxXray = xray;
+	mesh.userData.voxSolid = false;
+	if (xray) mesh.renderOrder = 998; // over the splats, under the patch overlay
+	return mesh;
+}
+
+// Expand SVX3 quad records (u16 x,y,z · u8 face · u8 pad · u16 run — one
+// run-merged exposed voxel face each) into an indexed BufferGeometry. face =
+// axis*2 (+side: plane at the cell's max corner on that axis) or axis*2+1
+// (−side); the run extends along z for x/y faces, y for z faces.
+function quadGeometry(dv, byteOff, count, origin, pitch) {
+	const pos = new Float32Array(count * 12);
+	const idx = new Uint32Array(count * 6);
+	const ax = [0, 0], // run/width axis lookup per face axis
+		o = [0, 0, 0];
+	for (let q = 0; q < count; q++) {
+		const b = byteOff + q * 10;
+		o[0] = dv.getUint16(b, true);
+		o[1] = dv.getUint16(b + 2, true);
+		o[2] = dv.getUint16(b + 4, true);
+		const face = dv.getUint8(b + 6);
+		const run = dv.getUint16(b + 8, true);
+		const axis = face >> 1;
+		const positive = (face & 1) === 0;
+		const runAxis = axis === 2 ? 1 : 2;
+		const widthAxis = 3 - axis - runAxis;
+		// Quad corner in world space: cell min corner, plane offset on `axis`.
+		const px = origin[0] + o[0] * pitch;
+		const py = origin[1] + o[1] * pitch;
+		const pz = origin[2] + o[2] * pitch;
+		const base = [px, py, pz];
+		if (positive) base[axis] += pitch;
+		const ru = [0, 0, 0];
+		ru[runAxis] = run * pitch;
+		const wu = [0, 0, 0];
+		wu[widthAxis] = pitch;
+		const p = q * 12;
+		pos[p] = base[0];
+		pos[p + 1] = base[1];
+		pos[p + 2] = base[2];
+		pos[p + 3] = base[0] + ru[0];
+		pos[p + 4] = base[1] + ru[1];
+		pos[p + 5] = base[2] + ru[2];
+		pos[p + 6] = base[0] + ru[0] + wu[0];
+		pos[p + 7] = base[1] + ru[1] + wu[1];
+		pos[p + 8] = base[2] + ru[2] + wu[2];
+		pos[p + 9] = base[0] + wu[0];
+		pos[p + 10] = base[1] + wu[1];
+		pos[p + 11] = base[2] + wu[2];
+		const v = q * 4;
+		const i = q * 6;
+		idx[i] = v;
+		idx[i + 1] = v + 1;
+		idx[i + 2] = v + 2;
+		idx[i + 3] = v;
+		idx[i + 4] = v + 2;
+		idx[i + 5] = v + 3;
 	}
 	const geo = new THREE.BufferGeometry();
 	geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
-	geo.setAttribute("color", new THREE.BufferAttribute(col, 3));
-	const mat = new THREE.PointsMaterial({
-		size: ((summary && summary.pitch) || 0.12) * 0.5,
-		vertexColors: true,
-		transparent: true,
-		opacity: 0.5,
-		sizeAttenuation: true,
-		depthWrite: false,
-		// X-ray: the free-space field is a VOLUMETRIC overlay filling the room
-		// interior, so it must draw THROUGH the (opaque) wall splats — otherwise
-		// the interior cloud is hidden behind the walls from an outside camera,
-		// which is exactly the "I see no free space inside" symptom.
-		depthTest: false,
-	});
-	const pts = new THREE.Points(geo, mat);
-	pts.renderOrder = 999; // composite the overlay last, over the splats
-	return pts;
+	geo.setIndex(new THREE.BufferAttribute(idx, 1));
+	// Face normals for the lit solid material (voxel-only mode). Quad verts
+	// aren't shared between faces, so this stays flat per-face — the crisp
+	// blocky look, and it's ignored by the unlit overlay material.
+	geo.computeVertexNormals();
+	return geo;
 }
 
-// Ensure Stage 2 (free-space) has run for the open cell; compute + poll if not.
+// Build the voxel overlays from voxels.bin (SVX3): merged VOLUMETRIC boundary
+// shells per class — cover (green), garbage (red, solid + x-ray pair), and the
+// free volume pre-meshed at a ladder of clearance thresholds (blue; the slider
+// swaps shells). Returns { group, shells: [{t, cells, mesh}] } — shell meshes
+// live in their own group (freePoints) with only the active one visible.
+async function buildVoxels(url, summary) {
+	const res = await fetch(url, { cache: "no-store" });
+	if (!res.ok) throw new Error(`HTTP ${res.status}`);
+	const ab = await res.arrayBuffer();
+	const dv = new DataView(ab);
+	// Pre-SVX3 packs (point layouts) — ask for a recompute instead of
+	// misparsing positions.
+	if (ab.byteLength < 16 || dv.getUint32(0, false) !== 0x53565833) {
+		throw new Error("stale voxel pack — recompute free space (stage 2)");
+	}
+	const nCover = dv.getUint32(4, true);
+	const nGar = dv.getUint32(8, true);
+	const nShells = dv.getUint32(12, true);
+	const pitch = (summary && summary.pitch) || 0.03;
+	const origin = (summary && summary.origin) || [0, 0, 0];
+	let off = 16;
+	const group = new THREE.Group();
+	if (nCover) {
+		const geo = quadGeometry(dv, off, nCover, origin, pitch);
+		const cover = volumeLayer(geo, 0x3ddc6a, 0.3, false);
+		cover.userData.voxClass = "cover";
+		group.add(cover);
+	}
+	off += nCover * 10;
+	if (nGar) {
+		const geo = quadGeometry(dv, off, nGar, origin, pitch);
+		const garSolid = volumeLayer(geo, 0xff4438, 0.4, false);
+		garSolid.userData.voxClass = "garbage";
+		group.add(garSolid);
+		const garXray = volumeLayer(geo, 0xff4438, 0.12, true);
+		garXray.userData.voxClass = "garbage";
+		group.add(garXray);
+	}
+	off += nGar * 10;
+	const shells = [];
+	for (let s = 0; s < nShells; s++) {
+		const t = dv.getFloat32(off, true);
+		const quads = dv.getUint32(off + 4, true);
+		const cells = dv.getUint32(off + 8, true);
+		off += 12;
+		const geo = quadGeometry(dv, off, quads, origin, pitch);
+		off += quads * 10;
+		const mesh = volumeLayer(geo, 0x3d8bff, 0.22, false);
+		mesh.userData.voxClass = "free";
+		mesh.userData.voxTranslucentOnly = true; // filling volume — never opaque
+		mesh.visible = false;
+		shells.push({ t, cells, mesh });
+	}
+	if (off > ab.byteLength) throw new Error("truncated voxel pack");
+	return { group, shells };
+}
+
+// Show only the slider's shell of the blue FREE volume — an instant geometry
+// swap between pre-meshed clearance thresholds, nothing touches the server.
+function updateFreeFilter() {
+	if (!inputs || !inputs.freeclear) return;
+	if (!freeShells || !freeShells.length) {
+		if (inputs._freeVal) inputs._freeVal.textContent = "";
+		return;
+	}
+	const i = Math.max(
+		0,
+		Math.min(freeShells.length - 1, Math.round(Number(inputs.freeclear.value))),
+	);
+	for (let s = 0; s < freeShells.length; s++) {
+		freeShells[s].mesh.visible = s === i;
+	}
+	if (inputs._freeVal) {
+		inputs._freeVal.textContent = `${freeShells[i].t.toFixed(2)}m · ${freeShells[i].cells.toLocaleString()}`;
+	}
+	viewer?.forceRenderNextFrame?.();
+}
+
+// The shell the slider currently points at (or null pre-load).
+function activeShell() {
+	if (!freeShells || !freeShells.length || !inputs || !inputs.freeclear) {
+		return null;
+	}
+	const i = Math.max(
+		0,
+		Math.min(freeShells.length - 1, Math.round(Number(inputs.freeclear.value))),
+	);
+	return freeShells[i];
+}
+
+// POST the active shell's threshold to the server — re-bakes clearance_m in
+// freespace.npz (no re-voxelization) and invalidates stages 4+; until then the
+// slider is a client-side preview only.
+async function applyClearance() {
+	const shell = activeShell();
+	if (!current || !shell) return;
+	const btn = inputs._freeApply;
+	if (btn) btn.disabled = true;
+	try {
+		const st = await api.splatStage2Clearance(
+			current.run,
+			current.slot,
+			current.model,
+			{ clearance: shell.t },
+		);
+		const n = (st.summary && st.summary.free_voxels) || 0;
+		setOverlay(
+			`clearance ${shell.t.toFixed(2)}m applied — ${n.toLocaleString()} free vox · stages 4+ invalidated`,
+		);
+	} catch (e) {
+		setOverlay(`clearance apply failed: ${e.message}`);
+	} finally {
+		if (btn) btn.disabled = false;
+	}
+}
+
+// Ensure Stage 2 (the voxel grid) has run for the open cell; compute + poll if not.
 async function ensureFreeSpace() {
 	const c = current;
 	let st = await api.splatStage2Status(c.run, c.slot, c.model);
 	if (st.status === "done" && st.url) return st;
-	setOverlay("computing free space…");
+	setOverlay("voxelizing…");
 	await api.splatStage2Start(c.run, c.slot, c.model, {});
 	const seq = openSeq;
 	while (seq === openSeq) {
@@ -420,7 +648,7 @@ async function ensureFreeSpace() {
 		st = await api.splatStage2Status(c.run, c.slot, c.model);
 		if (!st.running) break;
 		setOverlay(
-			`free space: ${st.phase || ""} ${st.total ? `${st.done}/${st.total}` : ""}`,
+			`voxelizing: ${st.phase || ""} ${st.total ? `${st.done}/${st.total}` : ""}`,
 		);
 	}
 	if (st.status !== "done" || !st.url)
@@ -433,11 +661,18 @@ async function ensureFreeSpace() {
 function syncViewButtons() {
 	if (!inputs) return;
 	const active =
-		mode === "mesh" ? "original" : mode === "sog" ? "sog" : splatSource;
+		mode === "mesh"
+			? "original"
+			: mode === "sog"
+				? "sog"
+				: mode === "voxels"
+					? "voxels"
+					: splatSource;
 	inputs._surfBtn?.classList.toggle("on", active === "surfels");
 	inputs._trainBtn?.classList.toggle("on", active === "trained");
 	inputs._sogBtn?.classList.toggle("on", active === "sog");
 	inputs._origBtn?.classList.toggle("on", active === "original");
+	inputs._voxViewBtn?.classList.toggle("on", active === "voxels");
 }
 
 function syncSogBtn() {
@@ -480,10 +715,10 @@ async function setSogMode() {
 	const cam = captureCamera();
 	mode = "sog";
 	syncViewButtons();
-	if (inputs && inputs._fsRow) inputs._fsRow.style.display = "none";
 	splatVisible(false);
 	if (meshGroup) meshGroup.visible = false;
-	if (voxelPoints) voxelPoints.visible = false;
+	if (voxelPoints) voxelPoints.visible = false; // PlayCanvas owns the canvas
+	if (freePoints) freePoints.visible = false;
 	hidePatchModal();
 	try {
 		if (!isSogOpen()) {
@@ -512,7 +747,7 @@ async function setSogMode() {
 
 // Switch which splat is loaded (surfels ↔ trained). Both share the cell's world
 // frame, so the live camera is preserved across the reload; the fresh viewer
-// starts in splat view (mesh / free-space / patch overlays reset).
+// starts in splat view (mesh / voxel / patch overlays reset).
 async function setSource(next) {
 	if (next === splatSource) return;
 	const s3 = (cellStatus && cellStatus.stage3) || {};
@@ -521,7 +756,6 @@ async function setSource(next) {
 	splatSource = next;
 	mode = "splat";
 	syncViewButtons();
-	if (inputs && inputs._fsRow) inputs._fsRow.style.display = "none";
 	const cam = captureCamera();
 	const bust = `?t=${Date.now()}`;
 	cloudLoaded = true;
@@ -530,19 +764,12 @@ async function setSource(next) {
 		await loadClouds(
 			openSeq,
 			api.absUrl(trainedUrl + bust),
-			null,
 			{ scene_aabb: s3.summary && s3.summary.scene_aabb },
 			cam,
 		);
 	} else {
 		setStatus("loading surfels…", "var(--purple)");
-		await loadClouds(
-			openSeq,
-			api.absUrl(s3.url + bust),
-			s3.detail_url ? api.absUrl(s3.detail_url + bust) : null,
-			s3.summary,
-			cam,
-		);
+		await loadClouds(openSeq, api.absUrl(s3.url + bust), s3.summary, cam);
 	}
 }
 
@@ -561,6 +788,17 @@ async function setView(next) {
 		await setMode("mesh");
 		return;
 	}
+	if (next === "voxels") {
+		// Works with or without a splat (it hides whatever's underneath); the
+		// mesh-first dummy scene keeps the render loop alive pre-Stage-3.
+		await setMode("voxels");
+		return;
+	}
+	// Pre-Stage-3 (mesh-first view): there is no splat to reveal yet.
+	if (next === "surfels" && !cloudLoaded) {
+		setStatus("no splat yet — run surfels (Stage 3)", "");
+		return;
+	}
 	if (splatSource !== next) {
 		await setSource(next); // loads the other .ply and returns to splat view
 		return;
@@ -573,52 +811,143 @@ function splatVisible(on) {
 	if (sm) sm.visible = on;
 }
 
-// Lazily build + add the free-space points (added hidden); returns success.
+// Lazily build + add the voxel overlays (added hidden); returns success. One
+// fetch builds BOTH the occupied/garbage group and the blue FREE layer; the
+// clearance slider is initialized from the grid's baked threshold + observed
+// clearance range on first build.
 async function ensureVoxels() {
 	if (voxelPoints) return true;
 	const seq = openSeq;
 	try {
 		const st = await ensureFreeSpace();
 		if (seq !== openSeq || !viewer) return false;
-		const pts = await buildVoxels(
+		const built = await buildVoxels(
 			api.absUrl(st.url + `?t=${Date.now()}`),
 			st.summary,
 		);
 		if (seq !== openSeq || !viewer) {
-			disposeObj(pts);
+			disposeObj(built.group);
+			for (const s of built.shells) disposeObj(s.mesh);
 			return false;
 		}
-		voxelPoints = pts;
+		voxelPoints = built.group;
 		voxelPoints.visible = false;
 		viewer.threeScene.add(voxelPoints);
+		freeShells = built.shells;
+		freePoints = new THREE.Group();
+		for (const s of freeShells) freePoints.add(s.mesh);
+		freePoints.visible = false;
+		viewer.threeScene.add(freePoints);
+		// The slider indexes the pre-meshed shell ladder; default to the shell
+		// carrying the BAKED threshold (always in the ladder — what stage 4 uses).
+		const p = (st.summary && st.summary.params) || {};
+		if (inputs && inputs.freeclear && freeShells.length) {
+			inputs.freeclear.min = 0;
+			inputs.freeclear.max = freeShells.length - 1;
+			inputs.freeclear.step = 1;
+			let best = 0;
+			for (let i = 0; i < freeShells.length; i++) {
+				if (
+					Math.abs(freeShells[i].t - (p.clearance ?? freeShells[0].t)) <
+					Math.abs(freeShells[best].t - (p.clearance ?? freeShells[0].t))
+				) {
+					best = i;
+				}
+			}
+			inputs.freeclear.value = best;
+		}
+		updateFreeFilter();
+		const sv = (st.summary && st.summary.solid_voxels) || 0;
+		const gv = (st.summary && st.summary.garbage_voxels) || 0;
 		const fv = (st.summary && st.summary.free_voxels) || 0;
-		setOverlay(`free space: ${fv.toLocaleString()} voxels`);
+		setOverlay(
+			`occupied: ${sv.toLocaleString()} · garbage: ${gv.toLocaleString()} · free@${(p.clearance ?? 0.35).toFixed(2)}m: ${fv.toLocaleString()}`,
+		);
 		return true;
 	} catch (e) {
-		setOverlay(`free space failed: ${e.message}`);
+		setOverlay(`voxels failed: ${e.message}`);
 		return false;
 	}
 }
 
-// Free-space voxels are only shown alongside the mesh (they share its exact world
-// frame), via the checkbox that appears in mesh mode.
-async function setFreeSpace(on) {
-	if (mode !== "mesh") return;
+// The voxel overlay — Stage 2's occupied cells (green) + garbage cells (red)
+// over whichever scene is showing (splat or mesh; same world frame). A plain
+// view-only toggle, exactly like the camera-position overlay.
+async function setVoxels(on) {
 	if (on) {
 		const ok = await ensureVoxels();
-		if (ok && voxelPoints && mode === "mesh") voxelPoints.visible = true;
-	} else if (voxelPoints) {
-		voxelPoints.visible = false;
+		if (!ok) return;
 	}
+	// Central chokepoint: applies overlay-vs-solid style, x-ray gating, and
+	// visibility from the checkboxes + current mode.
+	syncVoxelVisibility();
+	viewer?.forceRenderNextFrame?.();
+}
+
+// The FREE-voxel overlay (blue) — the camera-placeable subset of empty space at
+// the slider's clearance threshold (NOT all empty space). Same lazy build as
+// the cover overlay (one shared fetch).
+async function setFreeVoxels(on) {
+	if (on) {
+		const ok = await ensureVoxels();
+		if (!ok) return;
+		updateFreeFilter();
+	}
+	syncVoxelVisibility();
+	viewer?.forceRenderNextFrame?.();
+}
+
+// UNLIT swap for one glTF material: MeshBasicMaterial keeping the base-color
+// map/factor + alpha semantics. The splat viewer's scene has NO lights (splats
+// don't need them), so GLTFLoader's PBR materials would render pure black.
+// Unlit is also the truer debug view: the whole pipeline is unlit albedo
+// (Stage 5 renders exactly this), and MeshBasic ignores TRELLIS's unreliable
+// normals; DoubleSide keeps wrong-winding faces visible.
+function unlitMaterial(m) {
+	const u = new THREE.MeshBasicMaterial({
+		map: m.map || null,
+		color: m.color ? m.color.clone() : new THREE.Color(0xffffff),
+		transparent: !!m.transparent,
+		opacity: m.opacity != null ? m.opacity : 1,
+		alphaTest: m.alphaTest || 0,
+		side: THREE.DoubleSide,
+		vertexColors: !!m.vertexColors,
+	});
+	// The old material's textures stay owned by `u.map`; drop only the program.
+	m.dispose();
+	return u;
+}
+
+function makeUnlit(root) {
+	root.traverse((o) => {
+		if (!o.isMesh || !o.material) return;
+		o.material = Array.isArray(o.material)
+			? o.material.map(unlitMaterial)
+			: unlitMaterial(o.material);
+	});
 }
 
 // Load the cell's original mesh (SMB1 bundle) into the splat scene, coincident
-// with the cloud, for a splat-vs-mesh look comparison.
+// with the cloud, for a splat-vs-mesh look comparison. Streams the cell's
+// SELECTED splat asset set (`variant=splat` follows the assets picker — served
+// AS-IS, no tier build), so the mesh on screen is exactly the geometry Stage 2
+// voxelized and Stage 3 samples. Falls back to the default serving set if the
+// selected source has nothing streamable.
 async function buildMeshGroup() {
-	const res = await fetch(
-		api.meshesUrl(current.run, current.slot, current.model, {}),
+	let res = await fetch(
+		api.meshesUrl(current.run, current.slot, current.model, {
+			variant: "splat",
+		}),
 		{ cache: "no-store" },
 	);
+	if (!res.ok) {
+		res = await fetch(
+			api.meshesUrl(current.run, current.slot, current.model, {}),
+			{ cache: "no-store" },
+		);
+		if (res.ok)
+			setOverlay("showing default assets (splat tier not built yet)");
+	}
 	if (!res.ok) throw new Error(`HTTP ${res.status}`);
 	const ab = await res.arrayBuffer();
 	const buf = new Uint8Array(ab);
@@ -647,6 +976,7 @@ async function buildMeshGroup() {
 		off += glbLen;
 		try {
 			const gltf = await loader.parseAsync(glb, "");
+			makeUnlit(gltf.scene); // lightless scene — PBR would render black
 			group.add(gltf.scene);
 		} catch {
 			/* skip a bad object */
@@ -679,90 +1009,231 @@ async function ensureMesh() {
 	}
 }
 
+// The voxel overlays follow their checkboxes in every three.js view (splat AND
+// mesh — same world frame); only the PlayCanvas SOG view hides them.
+function syncVoxelVisibility() {
+	const solo = mode === "voxels";
+	if (solo) ensureVoxelLights();
+	// Voxel-only mode renders the shells SOLID + lit (they construct the scene);
+	// every other view draws them as the translucent overlay.
+	applyVoxelStyle(solo);
+	if (voxelLights) voxelLights.visible = solo;
+	const notSog = mode !== "sog";
+	const coverOn = !!(inputs && inputs.voxels && inputs.voxels.checked);
+	const garbageOn = !!(inputs && inputs.garbage && inputs.garbage.checked);
+	if (voxelPoints) {
+		// The group rides along; each shell is gated by its own class toggle, so
+		// cover (green) and garbage (red) are independent controls.
+		voxelPoints.visible = notSog && (coverOn || garbageOn);
+		for (const m of voxelPoints.children) {
+			const cls = m.userData && m.userData.voxClass;
+			let on = cls === "garbage" ? garbageOn : coverOn;
+			// The x-ray garbage duplicate is an OVERLAY affordance (see sealed
+			// interiors through walls); it only z-fights the solid pass in
+			// voxel-only mode, so drop it there.
+			if (m.userData && m.userData.voxXray && solo) on = false;
+			m.visible = on;
+		}
+	}
+	if (freePoints) {
+		freePoints.visible =
+			notSog && !!(inputs && inputs.freevox && inputs.freevox.checked);
+	}
+}
+
+// Every voxel shell mesh across both groups (cover, garbage solid + x-ray, and
+// each free-clearance shell).
+function collectVoxelMeshes() {
+	const out = [];
+	if (voxelPoints) voxelPoints.traverse((o) => o.isMesh && out.push(o));
+	if (freeShells) for (const s of freeShells) out.push(s.mesh);
+	return out;
+}
+
+// Swap every voxel shell between the translucent OVERLAY look (over a splat or
+// mesh) and the SOLID lit look (voxel-only mode). Idempotent per mesh — only
+// rebuilds a material when the style actually flips — and disposes the replaced
+// one so repeated view switches don't leak GPU programs.
+function applyVoxelStyle(solid) {
+	for (const m of collectVoxelMeshes()) {
+		const d = m.userData;
+		// FREE is a filling volume (camera-placeable space) — opaque it would
+		// paint over the whole scene, so it stays translucent even in solid mode.
+		const wantSolid = solid && !d.voxTranslucentOnly;
+		if (d.voxSolid === wantSolid) continue;
+		const old = m.material;
+		m.material = wantSolid
+			? voxelSolidMat(d.voxColor)
+			: voxelOverlayMat(d.voxColor, d.voxOpacity, d.voxXray);
+		old?.dispose?.();
+		m.renderOrder = !wantSolid && d.voxXray ? 998 : 0;
+		d.voxSolid = wantSolid;
+	}
+}
+
+// Lazily light the scene for solid voxel-only mode (hemisphere + key/fill). The
+// other views are unlit (splats have their own shader; the mesh overlay is
+// MeshBasic), so these only ever shade the solid voxel material — and they're
+// toggled off (voxelLights.visible) outside voxel-only mode.
+function ensureVoxelLights() {
+	if (voxelLights || !viewer) return;
+	const g = new THREE.Group();
+	g.add(new THREE.HemisphereLight(0xffffff, 0x2a2a33, 1.1));
+	const key = new THREE.DirectionalLight(0xffffff, 1.1);
+	key.position.set(0.5, 1.0, 0.35);
+	g.add(key);
+	const fill = new THREE.DirectionalLight(0xffffff, 0.45);
+	fill.position.set(-0.55, 0.35, -0.6);
+	g.add(fill);
+	viewer.threeScene.add(g);
+	voxelLights = g;
+}
+
 // Switch the view between the Gaussian splat and the original mesh (same world
-// frame → identical pose). Splat mode hides the mesh + free space; mesh mode
-// hides the splat, shows the mesh, and turns the free-space field on by default.
+// frame → identical pose). Splat mode hides the mesh; mesh mode hides the splat
+// and shows the mesh. Overlays (voxels / patches / cameras) ride along.
 async function setMode(next) {
 	mode = next;
 	syncViewButtons();
-	if (inputs && inputs._fsRow) {
-		inputs._fsRow.style.display = next === "mesh" ? "" : "none";
-	}
 	if (next === "splat") {
 		splatVisible(true);
 		if (meshGroup) meshGroup.visible = false;
-		if (voxelPoints) voxelPoints.visible = false;
+		syncVoxelVisibility();
 		setOverlay("");
 		return;
 	}
-	// mesh mode: hide the splat, show the mesh, free space on by default
+	if (next === "voxels") {
+		// Voxel-only: nothing underneath — the shells ARE the scene. Hide the
+		// splat + mesh, ensure the grid is built, and default the cover layer on
+		// so the view isn't black on entry (the free volume keeps its own
+		// toggle/slider). syncVoxelVisibility switches the shells to solid+lit.
+		splatVisible(false);
+		if (meshGroup) meshGroup.visible = false;
+		const ok = await ensureVoxels();
+		if (mode !== "voxels") return; // switched away while building
+		if (
+			ok &&
+			inputs &&
+			inputs.voxels &&
+			!inputs.voxels.checked &&
+			(!inputs.garbage || !inputs.garbage.checked) &&
+			(!inputs.freevox || !inputs.freevox.checked)
+		) {
+			inputs.voxels.checked = true; // don't open on a black screen
+		}
+		syncVoxelVisibility();
+		setOverlay(
+			ok
+				? "voxel-only — solid shaded shells (toggle cover/garbage/free below)"
+				: "",
+		);
+		viewer?.forceRenderNextFrame?.();
+		return;
+	}
+	// mesh mode: hide the splat, show the mesh
 	splatVisible(false);
 	const ok = await ensureMesh();
 	if (mode !== "mesh") return; // switched back while the mesh was loading
 	if (ok && meshGroup) meshGroup.visible = true;
-	if (inputs && inputs.freespace && inputs.freespace.checked) {
-		await setFreeSpace(true);
+	syncVoxelVisibility();
+}
+
+// ---- splat asset-source selector (which meshes feed the pipeline) -----------
+
+function syncAssetSourceUI() {
+	if (!inputs || !inputs._srcBtns) return;
+	const st = assetSource;
+	for (const [kind, btn] of Object.entries(inputs._srcBtns)) {
+		const n = st && st.available ? st.available[kind] || 0 : 0;
+		btn.classList.toggle("on", !!st && st.source === kind);
+		btn.disabled = !st || (kind !== "auto" && n === 0);
+		btn.title =
+			kind === "auto"
+				? "generated build when present, else the library build"
+				: `${n} ${kind} meshes on disk`;
+	}
+	if (inputs._srcVal) {
+		inputs._srcVal.textContent = st
+			? `→ ${st.active_dir || "none"}`
+			: "";
 	}
 }
 
-const kFmt = (v) =>
-	`${Math.round(v / 1000)}k · ~${((v * BYTES_PER_SPLAT) / 1e6).toFixed(0)}MB`;
+async function refreshAssetSource() {
+	if (!current) return;
+	try {
+		assetSource = await api.splatSourceGet(
+			current.run,
+			current.slot,
+			current.model,
+		);
+	} catch {
+		assetSource = null;
+	}
+	syncAssetSourceUI();
+}
+
+// Pin a different asset set: the server wipes every stage output (the meshes
+// changed), so the stepper resets to idle and the pipeline is re-run from
+// stage 1 against the newly selected source.
+async function setAssetSource(kind) {
+	if (!current || !assetSource || assetSource.source === kind) return;
+	try {
+		assetSource = await api.splatSourceSet(
+			current.run,
+			current.slot,
+			current.model,
+			{ source: kind },
+		);
+		const cell = await fetchCellStatus().catch(() => null);
+		if (cell) {
+			cellStatus = cell;
+			renderStepper();
+		}
+		// Every stage output was reverted server-side and the meshes changed:
+		// drop the stale cloud/overlays and land on the mesh-first view of the
+		// newly selected asset set (voxel overlays recompute from there).
+		cloudLoaded = false;
+		await openMeshView(openSeq);
+		setStatus(
+			`splat assets: ${kind} — stages reset, re-run the pipeline`,
+			"var(--purple)",
+		);
+	} catch (e) {
+		setStatus(`asset switch failed: ${e.message}`, "var(--red)");
+	}
+	syncAssetSourceUI();
+}
 
 function buildControls(summary) {
 	if (!controlsEl) return;
 	const p = (summary && summary.params) || {};
-	const detail = summary && summary.detail;
 	inputs = {};
 	controlsEl.replaceChildren();
 
-	// Surfel budget is a DENSITY (surfels per m²) so it scales with scene size; the
-	// count/size estimate needs the cell's surface area (known after a first sample).
-	const area = (summary && summary.total_area) || 0;
-	const dFmt = (v) =>
-		area
-			? `${v}/m² · ~${Math.round((v * area) / 1000)}k · ${((v * area * BYTES_PER_SPLAT) / 1e6).toFixed(0)}MB`
-			: `${v}/m²`;
-	const density = sliderRow(
-		"density",
-		"surfels/m²",
-		10,
-		300,
-		5,
-		p.splat_density || 80,
-		dFmt,
-	);
-	const radius = sliderRow(
-		"radius",
-		"overlap",
-		0.5,
-		1.6,
-		0.05,
-		p.radius_frac != null ? p.radius_frac : 0.9,
-		(v) => v.toFixed(2),
-	);
-	const flat = sliderRow(
-		"flatness",
-		"flatness",
-		0.02,
-		0.4,
-		0.01,
-		p.flatness != null ? p.flatness : 0.1,
-		(v) => v.toFixed(2),
-	);
-	const adaptive = checkRow(
-		"adaptive",
-		"adaptive density",
-		p.adaptive !== false,
-	);
-	const detailOn = checkRow("detail", "stream detail LOD", !!detail);
-	const detailDensity = sliderRow(
-		"detailDensity",
+	// THE quality knob: `detail` multiplies surfel density around the calibrated
+	// default look (1 = default, 2 = twice the surfels/m², 0.5 = half). Spacing,
+	// disk radius, feature refinement, culling are all derived server-side. The
+	// count/size estimate scales the last run's actual output by the multiplier
+	// ratio (needs one completed sample; before that it shows the spacing only).
+	const lastDetail = p.detail || 1;
+	const lastSampled = (summary && summary.sampled) || 0;
+	// Mirrors stage3's _BASE_SPACING (2.95 cm at detail=1), display only.
+	const spacingCm = (v) => (2.95 / Math.sqrt(v)).toFixed(2);
+	const dFmt = (v) => {
+		const s = `${v.toFixed(2)}× · ${spacingCm(v)}cm`;
+		if (!lastSampled) return s;
+		const est = (lastSampled * v) / lastDetail;
+		return `${s} · ~${Math.round(est / 1000)}k · ${((est * BYTES_PER_SPLAT) / 1e6).toFixed(0)}MB`;
+	};
+	const detail = sliderRow(
 		"detail",
-		100000,
-		2000000,
-		50000,
-		(detail && detail.splats) || 600000,
-		kFmt,
+		"detail",
+		0.25,
+		4,
+		0.05,
+		lastDetail,
+		dFmt,
 	);
 
 	const btn = el("button", {
@@ -780,8 +1251,8 @@ function buildControls(summary) {
 	// One 3-way view switch: the pre-fine-tune surfels (Stage 3), the trained
 	// splat (Stage 6), or the original meshes — flip between all three in place
 	// for a side-by-side (same world frame → identical pose). surfels ↔ trained
-	// reload the splat; "original" reuses the mesh overlay (setMode) and its
-	// free-space checkbox below. "trained" stays disabled until trained.ply exists.
+	// reload the splat; "original" reuses the mesh overlay (setMode). "trained"
+	// stays disabled until trained.ply exists.
 	mode = "splat";
 	splatSource = "surfels";
 	const surfBtn = el("button", {
@@ -808,10 +1279,18 @@ function buildControls(summary) {
 		title: "the original generated meshes (same world frame)",
 		onclick: () => setView("original"),
 	});
+	const voxViewBtn = el("button", {
+		class: "svc-seg-btn",
+		text: "voxels",
+		title:
+			"voxel-only: the stage-2 shells construct the scene as solid shaded blocks (green cover · red garbage · blue free, per their toggles below)",
+		onclick: () => setView("voxels"),
+	});
 	inputs._surfBtn = surfBtn;
 	inputs._trainBtn = trainBtn;
 	inputs._sogBtn = sogBtn;
 	inputs._origBtn = origBtn;
+	inputs._voxViewBtn = voxViewBtn;
 	const seg = el(
 		"div",
 		{ class: "svc-seg" },
@@ -819,14 +1298,65 @@ function buildControls(summary) {
 		trainBtn,
 		sogBtn,
 		origBtn,
+		voxViewBtn,
 	);
 
-	const fsRow = checkRow("freespace", "free space", true);
-	inputs.freespace.addEventListener("change", () =>
-		setFreeSpace(inputs.freespace.checked),
+	// Stage-2 voxel overlay: occupied cells as green disks over the scene,
+	// garbage cells (sealed interiors) as red x-ray disks — one toggle, like
+	// the camera-position overlay, just denser.
+	const voxRow = checkRow("voxels", "solid voxels (green cover)", false);
+	inputs.voxels.addEventListener("change", () =>
+		setVoxels(inputs.voxels.checked),
 	);
-	inputs._fsRow = fsRow;
-	fsRow.style.display = "none"; // shown only in mesh mode
+	const garbageRow = checkRow(
+		"garbage",
+		"garbage voxels (red · sealed interiors)",
+		false,
+	);
+	inputs.garbage.addEventListener("change", () =>
+		setVoxels(inputs.garbage.checked),
+	);
+	// FREE-voxel overlay (blue): the camera-placeable subset of empty space at
+	// the clearance slider's threshold. The slider indexes the pack's
+	// pre-meshed shell ladder (an instant geometry swap — no server call);
+	// "apply" re-bakes the threshold into freespace.npz so stage 4 plans
+	// against it (and invalidates stages 4+).
+	const freeRow = checkRow("freevox", "free volume (blue · camera-placeable)", false);
+	inputs.freevox.addEventListener("change", () =>
+		setFreeVoxels(inputs.freevox.checked),
+	);
+	inputs._freeVal = el("span", { class: "svc-val", text: "" });
+	const freeClearInput = el("input", {
+		type: "range",
+		class: "svc-range",
+		min: 0, // reconfigured to the shell ladder once stage 2 loads
+		max: 1,
+		step: 1,
+		value: 0,
+	});
+	inputs.freeclear = freeClearInput;
+	freeClearInput.addEventListener("input", () => updateFreeFilter());
+	const freeClearRow = el(
+		"div",
+		{ class: "svc-row" },
+		el("span", { class: "svc-lab", text: "clearance" }),
+		freeClearInput,
+		inputs._freeVal,
+	);
+	const freeApplyBtn = el("button", {
+		class: "splat-stage2-btn",
+		text: "apply",
+		title:
+			"bake this clearance into freespace.npz (stage 4 plans against it; stages 4+ are invalidated)",
+		onclick: () => applyClearance(),
+	});
+	inputs._freeApply = freeApplyBtn;
+	const freeApplyRow = el(
+		"div",
+		{ class: "svc-row" },
+		el("span", { class: "svc-lab", text: "" }),
+		freeApplyBtn,
+	);
 	// Patch inspector (needs Stage 4 + Stage 5): select a coverage patch on the
 	// splat and open its reference images in the right-side modal.
 	const patchRow = checkRow("patches", "patches (click to inspect)", false);
@@ -884,8 +1414,42 @@ function buildControls(summary) {
 		color: "#cfcfe0",
 	});
 
+	// Asset-source selector: which meshes the WHOLE pipeline samples/renders.
+	// Populated by refreshAssetSource() once the server state arrives.
+	inputs._srcBtns = {
+		auto: el("button", {
+			class: "splat-stage2-btn",
+			text: "auto",
+			disabled: true,
+			onclick: () => setAssetSource("auto"),
+		}),
+		generated: el("button", {
+			class: "splat-stage2-btn",
+			text: "generated",
+			disabled: true,
+			onclick: () => setAssetSource("generated"),
+		}),
+		library: el("button", {
+			class: "splat-stage2-btn",
+			text: "library",
+			disabled: true,
+			onclick: () => setAssetSource("library"),
+		}),
+	};
+	inputs._srcVal = el("span", { class: "svc-val", text: "" });
+	const srcRow = el(
+		"div",
+		{ class: "svc-row" },
+		el("span", { class: "svc-lab", text: "assets" }),
+		inputs._srcBtns.auto,
+		inputs._srcBtns.generated,
+		inputs._srcBtns.library,
+		inputs._srcVal,
+	);
+
 	controlsEl.append(
 		el("div", { class: "svc-title", text: "pipeline" }),
+		srcRow,
 		inputs._stepper,
 		inputs._coverage,
 		el("div", { class: "svc-title", text: "training (stage 6)" }),
@@ -893,18 +1457,17 @@ function buildControls(summary) {
 		inputs._log,
 		el("div", { class: "svc-title", text: "view" }),
 		seg,
-		fsRow,
+		voxRow,
+		garbageRow,
+		freeRow,
+		freeClearRow,
+		freeApplyRow,
 		patchRow,
 		camRow,
 		camPlayRow,
 		camSpeedRow,
-		el("div", { class: "svc-title", text: "sampler knobs" }),
-		density,
-		radius,
-		flat,
-		adaptive,
-		detailOn,
-		detailDensity,
+		el("div", { class: "svc-title", text: "sampler" }),
+		detail,
 		el("div", { class: "svc-actions" }, btn),
 		actual,
 		overlay,
@@ -913,24 +1476,11 @@ function buildControls(summary) {
 
 function actualText(summary) {
 	const mb = (summary.bytes / 1e6).toFixed(1);
-	let t = `actual: ${summary.splats.toLocaleString()} · ${mb} MB`;
-	if (summary.detail) {
-		t += ` (detail ${summary.detail.splats.toLocaleString()} · ${(summary.detail.bytes / 1e6).toFixed(0)} MB)`;
-	}
-	return t;
+	return `actual: ${summary.splats.toLocaleString()} · ${mb} MB`;
 }
 
 function readParams() {
-	const body = {
-		splat_density: Number(inputs.density.value),
-		radius_frac: Number(inputs.radius.value),
-		flatness: Number(inputs.flatness.value),
-		adaptive: inputs.adaptive.checked,
-	};
-	if (inputs.detail.checked) {
-		body.detail_splats = Math.round(Number(inputs.detailDensity.value));
-	}
-	return body;
+	return { detail: Number(inputs.detail.value) };
 }
 
 async function resplat() {
@@ -992,7 +1542,6 @@ function pollResplat() {
 			loadClouds(
 				openSeq,
 				api.absUrl(st.url + bust),
-				st.detail_url ? api.absUrl(st.detail_url + bust) : null,
 				st.summary,
 				captureCamera(), // keep the current view across the re-splat
 			);
@@ -1427,13 +1976,7 @@ async function maybeLoadCloud(seq) {
 	if (s3 && s3.status === "done" && s3.url && !cloudLoaded) {
 		cloudLoaded = true;
 		const bust = `?t=${Date.now()}`;
-		await loadClouds(
-			seq,
-			api.absUrl(s3.url + bust),
-			s3.detail_url ? api.absUrl(s3.detail_url + bust) : null,
-			s3.summary,
-			captureCamera(),
-		);
+		await loadClouds(seq, api.absUrl(s3.url + bust), s3.summary, captureCamera());
 	}
 }
 
@@ -1597,7 +2140,7 @@ function renderStepper() {
 			// coverage / select / write) or the object/view id the others are on. Show
 			// it next to the label so the long coverage phase isn't an opaque wait.
 			// Stage 5 during `render` shows the throughput instead of the (noisy)
-			// per-view id — its named warm-up phases (tier / deopt / launch) still show.
+			// per-view id — its named warm-up phases (plan / launch) still show.
 			const phase =
 				stage.n === 5
 					? st.phase &&
@@ -1886,14 +2429,12 @@ function pollStages() {
 			loadClouds(
 				openSeq,
 				api.absUrl(s3.url + bust),
-				s3.detail_url ? api.absUrl(s3.detail_url + bust) : null,
 				s3.summary,
 				captureCamera(),
 			);
 		} else if ((!s3 || s3.status !== "done") && cloudLoaded) {
-			cloudLoaded = false; // surfels reverted → clear the canvas
-			void teardown();
-			setStatus("no splat yet — run surfels (Stage 3)", "");
+			cloudLoaded = false; // surfels reverted → fall back to the mesh view
+			void openMeshView(openSeq);
 		}
 		if (!anyStageRunning(cell)) stopPoll();
 	};
@@ -1919,13 +2460,7 @@ async function refreshStepper(seq) {
 	if (s3 && s3.status === "done" && s3.url && !cloudLoaded) {
 		cloudLoaded = true;
 		setStatus("loading splat…", "var(--purple)");
-		await loadClouds(
-			seq,
-			api.absUrl(s3.url),
-			s3.detail_url ? api.absUrl(s3.detail_url) : null,
-			s3.summary,
-			null,
-		);
+		await loadClouds(seq, api.absUrl(s3.url), s3.summary, null);
 	}
 	if (anyStageRunning(cell)) pollStages();
 }
@@ -1951,22 +2486,22 @@ export async function openSplatViewer(opts) {
 	overlay.classList.add("open");
 	subEl.textContent =
 		opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
+	assetSource = null;
 	buildControls(opts.summary || null);
 	renderStepper();
+	void refreshAssetSource();
 	if (opts.url) {
 		cloudLoaded = true;
 		setStatus("loading…", "var(--purple)");
-		await loadClouds(
-			seq,
-			opts.url,
-			opts.detailUrl || null,
-			opts.summary,
-			null,
-		);
+		await loadClouds(seq, opts.url, opts.summary, null);
 		void refreshStepper(seq);
 	} else {
-		setStatus("no splat yet — run surfels (Stage 3)", "");
-		await refreshStepper(seq);
+		// MESH-FIRST: no surfel cloud yet, but the stage-2 voxel grid is
+		// measured off the original meshes — open on them so the voxel/free
+		// overlays are inspectable before Stage 3 ever runs.
+		setStatus("no splat yet — showing original mesh", "");
+		await refreshStepper(seq); // may load the cloud if Stage 3 is done
+		if (seq === openSeq && !cloudLoaded) await openMeshView(seq);
 	}
 }
 

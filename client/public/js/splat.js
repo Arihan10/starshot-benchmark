@@ -110,7 +110,6 @@ function openView(cell) {
         model: cell.model,
         source: cell.source,
         url: api.absUrl(s.url),
-        detailUrl: s.detail_url ? api.absUrl(s.detail_url) : null,
         summary: s.summary,
         label: `${cell.slot} · ${cell.model}${cell.source ? ` · ${cell.source}` : ""}`,
     });
@@ -205,7 +204,7 @@ function freeSpaceControl(cell) {
         doneTitle: "recompute the free-space grid",
         errLabel: "free space failed — retry",
         doneText: (s) => {
-            const n = s.summary && s.summary.reachable_voxels;
+            const n = s.summary && s.summary.free_voxels;
             return n != null ? `${n.toLocaleString()} vox` : null;
         },
         start: (c) => startStage(c, "stage2", api.splatStage2Start),
@@ -239,19 +238,12 @@ function stageControl(cell, opts) {
     const gate = opts.gate ? opts.gate(cell) : null;
     let btn;
     if (subRunning(s)) {
-        let label;
-        if (s.phase === "deopt") {
-            label = "de-optimizing…";
-        } else if (s.phase === "tier") {
-            label = "building tier…"; // splat asset tier build (shared warm-up)
-        } else {
-            const prog = s.total ? `${s.done}/${s.total}` : "…";
-            // Stage 5 carries a live images/second; other stages don't set `rate`.
-            const rate = fmtRate(s.rate);
-            label = rate
-                ? `${opts.runningVerb} ${prog} · ${rate}/s`
-                : `${opts.runningVerb} ${prog}`;
-        }
+        const prog = s.total ? `${s.done}/${s.total}` : "…";
+        // Stage 5 carries a live images/second; other stages don't set `rate`.
+        const rate = fmtRate(s.rate);
+        const label = rate
+            ? `${opts.runningVerb} ${prog} · ${rate}/s`
+            : `${opts.runningVerb} ${prog}`;
         btn = el("button", { class: "splat-stage2-btn", disabled: true, text: label });
     } else if (gate) {
         btn = el("button", {
@@ -321,8 +313,9 @@ function stage4Control(cell) {
 }
 
 // Stage 5 — unlit reference renders (refs/), gated on the Stage-4 camera plan.
-// Rendered by the headless WebGL capture page against the cell's splat tier;
-// on failure the job's error carries the capture URL for a manual-browser run.
+// Rendered by the headless WebGL capture page against the cell's selected
+// asset set; on failure the job's error carries the capture URL for a
+// manual-browser run.
 function stage5Control(cell) {
     return stageControl(cell, {
         key: "stage5",

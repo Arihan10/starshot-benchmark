@@ -1,66 +1,116 @@
-"""Stage 2 — Free-space voxelizer + clearance field (adaptive).
+"""Stage 2 — Free-space voxelizer (single uniform grid + two-phase flood fill).
 
 The shared spatial FOUNDATION of the splat pipeline: discretizes a cell's composed
-scene into occupancy + a clearance field over the scene AABB (grown by an exterior
-margin so cameras can see outer silhouettes), and writes a REUSABLE grid that both
-Stage 3 (surfel sampler — orient normals to free space, cull hidden faces) and
-Stage 4 (camera planner — candidates + occlusion) consume. Nothing downstream
-recomputes occupancy; that's the point of running this first (overview §, Option A).
+scene into ONE voxel grid of uniform pitch (the scene AABB grown by an exterior
+margin so cameras can see outer silhouettes), classifies every cell as COVER
+(surface), EMPTY (air a viewer could see — ambient + rescued cavities) or
+GARBAGE (sealed interiors — object hollows, seams), then derives FREE — the
+camera-placeable subset of EMPTY at sufficient clearance from any cover — and
+writes a REUSABLE grid that both Stage 3 (surfel sampler — orient normals to
+empty space, cull hidden faces) and Stage 4 (camera planner — candidates +
+occlusion) consume. Nothing downstream recomputes occupancy; that's the point
+of running this first.
 
-DUAL RESOLUTION (the "adaptive" part). Two aligned grids sharing one origin:
-  * a FINE occupancy grid (`pitch_fine = pitch / refine`) — accurate near surfaces,
-    so thin occluders/gaps aren't missed by the visibility ray-march or the surfel
-    hidden-face test. Stored SPARSELY (sorted linear indices of the occupied cells
-    only) so its memory tracks the amount of SURFACE, not the scene's bounding-box
-    VOLUME — the fine resolution stays fixed regardless of scene size (no
-    auto-coarsening), and huge open scenes no longer blow up a dense array.
-  * a COARSE clearance field (`pitch`, a navigational scale) — the distance from
-    each empty cell to the nearest surface, driving camera candidate placement.
-The coarse occupancy is derived from the same occupied fine cells, so the two never
-disagree. The coarse field is genuinely volumetric (it measures empty space) and so
-stays dense — the memory wall for large/sparse scenes (open arenas, cities, mostly-
-empty space). To bound it, the coarse block factor is chosen ADAPTIVELY per scene so
-the dense arrays never exceed `max_coarse_cells` (a coarser navigation grid on huge
-scenes); the FINE occupancy is sparse and keeps its fixed resolution, so occlusion /
-thin-gap accuracy is unchanged. Scenes that already fit are byte-identical to before.
+OCCUPANCY is an EXACT surface voxelization: every cell whose cube a triangle
+touches is marked — big triangles are midpoint-split until each piece spans at
+most a 3×3×3 cell block, then a separating-axis triangle/cube test decides each
+cell. Deterministic and gap-free, so the visibility ray-march can't leak through
+pinholes in walls and the flood fill can't escape into sealed interiors. No
+winding/closure assumptions, so the non-watertight composed scene is fine. The
+cover set is stored SPARSELY (sorted linear indices), so its memory tracks the
+amount of SURFACE; the dense arrays (component labels, clearance, the free mask)
+scale as O(volume) = (extent / pitch)³ — oversized outdoor scenes need a coarser
+requested `pitch` (or a future banded/hierarchical build) to fit in RAM.
 
-Occupancy is an EXACT surface voxelization: every fine cell whose cube a triangle
-touches is marked — big triangles are midpoint-split until each piece spans at most
-a 3×3×3 cell block, then a separating-axis triangle/cube test decides each cell.
-Deterministic and gap-free, unlike the random point sampling it replaces, which
-left ~2% of surface cells unmarked; each missed cell was a pinhole the Stage-4
-visibility ray-march could see through (false line-of-sight through a wall) or the
-reachability flood fill could leak through (a sealed interior reading as navigable).
-No winding/closure assumptions, so the non-watertight composed scene is fine.
-Interior cells of thick solids still read as empty; that's also fine — Stage 3/4
-use the fine occupancy for line-of-sight, which naturally excludes buried points.
+GLASS (transparent surfaces occupy space but don't block sight). Classified
+DURING voxelization — it is per-triangle-piece work fused into the same
+subdivision pass that marks cover, so it touches only transparent-candidate
+surface pieces, never the grid: surfaces whose material is BLEND/MASK are
+classified per ~cell-sized piece by sampled base-color alpha (`glass.py` drives
+window panes to alpha ≈ 0.065 inside an otherwise-opaque texture); pieces below
+the occlusion cutoff land in a separate GLASS cell class. Glass cells still
+count as cover for clearance / the flood fill — a camera can't sit inside a
+pane, and the fill doesn't walk through a closed window — but they are EXCLUDED
+from the occlusion set the Stage-4 visibility ray-march tests (`occluding`), so
+surfaces behind glazing are coverable. OPAQUE materials (the glTF default, and
+the vast majority) ignore texture alpha entirely.
 
-GLASS (transparent surfaces occupy space but don't block sight). Surfaces whose
-material is BLEND/MASK are classified per ~cell-sized piece by sampled base-color
-alpha (`glass.py` drives window panes to alpha ≈ 0.065 inside an otherwise-opaque
-texture): pieces below the occlusion cutoff land in a separate GLASS cell class.
-Glass cells still count as surface for clearance / navigation / reachability — a
-camera can't sit inside a pane, and the flood fill doesn't walk through a closed
-window — but they are EXCLUDED from the occlusion set the Stage-4 visibility
-ray-march tests (`fine_occluding`), so surfaces behind glazing are coverable.
-OPAQUE materials (the glTF default, and the vast majority) ignore texture alpha
-entirely, matching Stage 3/5 semantics.
+EMPTY vs GARBAGE — the two-phase fill. Cover is voxelized for the WHOLE scene
+first, then empty space is discovered by one 6-connected flood fill (face
+neighbours only — a diagonal fill would slip through the corner-touching
+staircase a thin oblique wall voxelizes into) whose result depends only on the
+seed set; labels are assigned exactly once at the end (empty = reached, garbage
+= the unreached remainder), so no precedence/override bookkeeping exists:
 
-Pure library (like the other stages): takes explicit paths; the server resolves the
-cell and de-optimizes a library build to vanilla first (trimesh can't read
-KTX2/Meshopt).
+  * PHASE 1 (ambient). Seeds are (a) the grid's boundary shell — the exterior
+    margin, always ambient — and (b) every object's AUGMENTED SHELL: the 1-cell
+    ring around its mesh-derived AABB, keeping only cells that are unoccupied
+    AND outside every other object's AABB. Since meshes (and therefore their
+    hollow interiors) lie inside their AABBs, a surviving seed is provably
+    ambient air — it can never sit inside another object's sealed hollow. The
+    per-voxel exclusion (not per-direction) is what lets flush, mutually
+    abutting architecture still seed: a wall's room-facing shell loses only the
+    rows inside the floor/ceiling/side-wall boxes, so sealed rooms are seeded
+    directly by their own bounding surfaces. The exclusion constrains SEEDS
+    only — the fill itself flows wherever occupancy permits (over sofa seats,
+    under arches), or bbox-covered air would wrongly read sealed.
+  * PHASE 2 (nested rescue, to fixpoint). An object NONE of whose shell cells
+    were reached is sealed away from all discovered free space — fully nested
+    (a bottle in a closed cabinet), which per the product decision should be
+    coverable: its shell seeds the cavity (exclusion waived). The trigger is
+    per-object ALL-OR-NOTHING: one reached shell cell means the object is
+    exposed (a cushion whose top sits in room air) and its buried faces are
+    interpenetration seams to cull, not a cavity to open. Rounds admit ONE
+    cavity at a time, preferring the component adjacent to the most pending
+    objects (component size, then lowest label, break ties), and re-evaluate —
+    an outside-in order, so in a scene whose interior phase 1 couldn't seed at
+    all (a sealed hull whose bbox swallows every shell) the room air opens
+    first and a clipping cushion drops out of the pending set BEFORE its
+    sofa's hollow could be considered. Deterministic; rounds ≤ nesting depth.
+
+    Consequences, decided deliberately: rescue is a FURNISHED-cavity detector —
+    a sealed room containing no standalone object stays garbage (nothing worth
+    seeing there); an object straddling an open and a sealed region rescues
+    neither; the nesting distinction is only as sharp as the pitch.
+
+CLEARANCE → FREE (the stage-2 clearance pass, run right after the fill).
+Clearance = metres from each cell to the nearest cover cell (EDT over the one
+grid). FREE = the EMPTY cells with clearance ≥ `clearance_m` — where a camera
+can physically sit. The mask is DERIVED, not stored: the npz carries the empty
+mask, the clearance field and the `clearance_m` scalar, and `load_free_space`
+computes `free = empty & (clearance >= clearance_m)` — so mask and threshold
+can never disagree, and re-thresholding (`apply_clearance`) rewrites ONE scalar
+without re-voxelizing. Consumers split cleanly: Stage 3's orient/cull reads
+EMPTY (`empty_at` — a surfel beside a 10 cm gap has visible air there even
+though no camera fits); Stage 4's candidates read FREE (`free_candidates`,
+which further band-limits by clearance + thins by spacing).
+
+Pure library (like the other stages): takes explicit paths and reads the
+meshes AS-IS through `splat.assets.load_geoms` — vanilla glTF via trimesh,
+KTX2/Meshopt sets via the in-process decoder (no de-optimization step). On
+compressed sets texel data is unavailable, so BLEND/MASK glass classification
+falls back to the constant `baseColorFactor` alpha.
 
 Outputs (under a cell's `splat/` dir):
-  * `freespace.npz` — the reusable grid (origin, pitch, pitch_fine, refine, fine
-    occupancy incl. the glass subset, coarse clearance). Consumed by Stages 3 and
-    4; load via `load_free_space`.
-  * `voxels.bin` — packed float32 `[x,y,z,clearance]` per free coarse voxel (world
-    centre + metres), strided under a cap, for the client overlay.
+  * `freespace.npz` — the reusable grid (origin, pitch, dims, sparse cover incl.
+    the glass subset, clearance, the empty mask, the baked `clearance_m`).
+    Consumed by Stages 3 and 4; load via `load_free_space`. Older layouts
+    (dual-resolution, or pre-clearance single-grid) are rejected with a clear
+    re-run error rather than carried as compat shims.
+  * `voxels.bin` — the SVX3 viz pack for the client overlay: VOLUMETRIC
+    boundary shells, not points. Cover, garbage, and the free volume (at a
+    ladder of clearance thresholds, the baked one included) are each
+    surface-extracted into run-merged exposed-face quads (`_boundary_quads`),
+    so the client renders merged translucent shapes with interior faces
+    culled, and the clearance slider swaps pre-meshed shells (see the wire
+    layout at `_VIZ_MAGIC`).
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import struct
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,20 +126,45 @@ logging.getLogger("trimesh").setLevel(logging.ERROR)
 # Artifacts written under a cell's `splat/` dir.
 FREESPACE_NAME = "freespace.npz"
 VOXELS_NAME = "voxels.bin"
+# Viz pack (SVX3): VOLUMETRIC boundary shells per voxel class. Header = magic +
+# u32 LE counts (cover quads, garbage quads, free shells); then cover quads,
+# garbage quads, then per shell a header (f32 clearance threshold, u32 quads,
+# u32 cell count) + its quads. One quad = one run-merged exposed voxel face:
+# u16 cell x,y,z · u8 face (axis*2, +side at the cell's max corner on that
+# axis; axis*2+1, −side at the min corner) · u8 pad · u16 run length along the
+# in-plane run axis (z for x/y faces, y for z faces) — 10 bytes.
+_VIZ_MAGIC = b"SVX3"
+_VIZ_HEADER = struct.Struct("<4sIII")
+_SHELL_HEADER = struct.Struct("<fII")
+_QUAD_DTYPE = np.dtype(
+    [("x", "<u2"), ("y", "<u2"), ("z", "<u2"), ("f", "u1"), ("p", "u1"), ("r", "<u2")]
+)
+# The free volume is pre-meshed at these thresholds (voxel multiples, capped at
+# the scene's clearance ceiling, the baked threshold always included) so the
+# client slider swaps shells instantly instead of re-meshing.
+_SHELL_STEPS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64)
 
-DEFAULT_PITCH = 0.12       # coarse voxel edge (m) — navigational, for clearance
-DEFAULT_REFINE = 3         # fine = pitch / refine (0.04 m by default) — for occlusion
+DEFAULT_PITCH = 0.03       # the uniform voxel edge (m) — one grid for everything
+# The baked FREE threshold (m): a camera needs at least this much clearance.
+# The default equals ONE VOXEL at the default pitch — the most permissive
+# meaningful setting: every empty cell is ≥ 1 voxel from cover by definition,
+# so FREE ≡ EMPTY out of the box, and per-scene tightening happens through the
+# client slider's apply (`apply_clearance`, in place). For reference, 0.35 was
+# the measured knee of the passage-survival curve across the benchmark runs
+# (~2/3 of sub-2m facing gaps keep centerline candidates) — a sensible value
+# when tightening for production plans.
+DEFAULT_CLEARANCE = 0.03
+# Tolerance for every `clearance >= threshold` test. A cell exactly ON a
+# lattice distance stores just below its true value (float32 pitch products,
+# then float16 in the npz: 1 voxel × 0.03 → 0.0299988), so an exact-equality
+# threshold — e.g. the one-voxel default above — would otherwise exclude the
+# very tier it names. 2.5e-4 absorbs float16 half-ulp rounding for thresholds
+# up to ~0.5 m while staying far below the smallest gap between distinct EDT
+# tiers, so no cell from a genuinely lower tier can sneak in.
+_CLEARANCE_EPS = 2.5e-4
 _PITCH_CLAMP = (0.02, 1.0)
-# Ceiling on the DENSE coarse grid (clearance + reachability arrays). These scale as
-# O(volume) = (extent / coarse_pitch)³, so a large or mostly-empty scene (open arena,
-# city, outer space) would otherwise exhaust RAM. When a scene exceeds this, the
-# coarse block factor is grown (coarser navigation grid) until it fits; the FINE
-# occupancy is sparse and stays at its fixed resolution, so occlusion/thin-gap
-# accuracy is unaffected. ~48M cells ≈ ~1 GB peak across the transient EDT/label
-# temporaries. Scenes under this are byte-identical to the pre-cap behavior.
-DEFAULT_MAX_COARSE_CELLS = 48_000_000
 # Exact voxelization: triangles are midpoint-split until every edge spans at most
-# this many fine cells, so each piece's candidate block for the separating-axis
+# this many cells, so each piece's candidate block for the separating-axis
 # test is at most 3×3×3 cells (a triangle's extent is bounded by its longest edge).
 _SUBDIV_EDGE_CELLS = 2.0
 # Material alpha modes whose sampled base-color alpha is meaningful (matches Stage
@@ -99,11 +174,9 @@ _TRANSPARENT_ALPHA_MODES = ("BLEND", "MASK")
 # this. glass.py panes carry alpha ≈ 0.065 (transmissive — light passes); window
 # frames / solid texels carry ≈ 1. MASK materials use their own glTF alphaCutoff.
 _OCCLUDING_ALPHA = 0.5
-# Cap the exported free-voxel viz cloud (stride if a scene has more).
-_MAX_VIZ_VOXELS = 500_000
 
-# Absolute-lattice voxel encoding: occupied fine voxels are binned in a scene-
-# independent integer lattice (floor(point / pitch_fine)) so binning needs no origin
+# Absolute-lattice voxel encoding: occupied voxels are binned in a scene-
+# independent integer lattice (floor(point / pitch)) so binning needs no origin
 # (computed only after the AABB is known). Coords are packed into one int64 with a
 # large offset+radix, supporting a ±_VOX_OFF-cell span (~±42 km at 0.04 m).
 _VOX_OFF = 1 << 20
@@ -132,118 +205,116 @@ ProgressCb = Callable[[int, int, str], None]
 
 @dataclass(frozen=True)
 class FreeSpaceParams:
-    """Stage-2 knobs. `pitch` is the coarse (clearance/navigation) scale; the fine
-    occupancy scale is `pitch / refine`. `margin` grows the grid beyond the scene
-    AABB so exterior camera vantages exist (Stage 4). `reachable_min_volume` (m³) is
-    the smallest free pocket kept as navigable — larger drops tiny object-interior
-    hollows, smaller keeps closets/nooks (see reachability below).
-
-    `max_coarse_cells` bounds the DENSE coarse grid: if the requested `pitch` would
-    make it larger, the coarse block factor is grown (a coarser navigation grid,
-    coarser `pitch`) until it fits, so large/sparse scenes don't exhaust RAM. The
-    fine occupancy is sparse and keeps its `pitch / refine` resolution regardless.
-    Set to 0 to disable the cap (the exact pre-cap behavior)."""
+    """Stage-2 knobs. `pitch` is the uniform voxel edge of the single grid;
+    `margin` grows the grid beyond the scene AABB so exterior camera vantages
+    exist (Stage 4); `clearance` (m) is the baked FREE threshold — empty cells
+    at least this far from any cover cell are camera-placeable. `workers`
+    parallelizes the per-object mesh pass (0 = auto: min(cores, 8); 1 =
+    serial); the output is byte-identical for any value."""
 
     pitch: float = DEFAULT_PITCH
-    refine: int = DEFAULT_REFINE
     margin: float = 1.5
-    reachable_min_volume: float = 0.25
-    max_coarse_cells: int = DEFAULT_MAX_COARSE_CELLS
+    clearance: float = DEFAULT_CLEARANCE
+    workers: int = 0
 
     def as_summary(self) -> dict[str, Any]:
         return {
             "pitch": self.pitch,
-            "refine": self.refine,
             "margin": self.margin,
-            "reachable_min_volume": self.reachable_min_volume,
-            "max_coarse_cells": self.max_coarse_cells,
+            "clearance": self.clearance,
+            "workers": self.workers,
         }
 
 
 @dataclass(frozen=True)
 class FreeSpace:
-    """A loaded free-space grid. Aligned grids share `origin`: the SPARSE fine
-    occupancy (`occ_lin` — sorted linear indices into a `fine_dims` grid of edge
-    `pitch_fine`; `occ_lin_opaque` is the subset with opaque surface), the coarse
-    clearance (`clearance`, edge `pitch`, metres), and the coarse `reachable` mask
-    (free cells in a large enough connected component — exterior + rooms, minus
-    tiny object-interior hollows). `refine = pitch / pitch_fine`.
+    """A loaded free-space grid — ONE uniform lattice of edge `pitch`: the
+    SPARSE cover (`occ_lin` — sorted linear indices into a `dims` grid;
+    `occ_lin_opaque` is the subset with opaque surface), `clearance` (metres to
+    the nearest cover cell), the `empty` mask (ambient air + rescued cavities —
+    everything a viewer could see; the unreached remainder is garbage: sealed
+    object hollows and seams), and the baked `clearance_m` threshold. FREE —
+    the camera-placeable subset — is DERIVED: `free = empty & (clearance >=
+    clearance_m)`, so the mask can never disagree with the threshold.
 
-    Two fine queries with different jobs: `fine_occupied` answers "is there ANY
-    surface here" (physical presence — glass included), `fine_occluding` answers
+    Two cover queries with different jobs: `occupied` answers "is there ANY
+    surface here" (physical presence — glass included), `occluding` answers
     "does this cell block sight" (opaque only — glass passes light)."""
 
-    origin: np.ndarray        # (3,) world corner of fine cell [0,0,0]
-    pitch: float              # coarse edge (m)
-    pitch_fine: float         # fine edge (m)
-    refine: int
-    fine_dims: np.ndarray     # (3,) int64 fine grid dims [fnx,fny,fnz]
-    occ_lin: np.ndarray       # (K,) int64 SORTED linear indices of ALL occupied fine
-                              # cells (opaque + glass) — clearance/reachability basis
+    origin: np.ndarray        # (3,) world corner of cell [0,0,0]
+    pitch: float              # voxel edge (m)
+    dims: np.ndarray          # (3,) int64 grid dims [nx,ny,nz]
+    occ_lin: np.ndarray       # (K,) int64 SORTED linear indices of ALL cover
+                              # cells (opaque + glass) — clearance/fill basis
     occ_lin_opaque: np.ndarray  # (K2,) int64 SORTED subset that blocks line-of-sight
-    clearance: np.ndarray     # float32 [cx,cy,cz] (m)
-    reachable: np.ndarray     # bool [cx,cy,cz] — navigable free space
+    clearance: np.ndarray     # float32 [nx,ny,nz] (m)
+    empty: np.ndarray         # bool [nx,ny,nz] — EMPTY (viewable air) cells
+    clearance_m: float        # baked FREE threshold (m)
 
     @property
-    def coarse_dims(self) -> tuple[int, int, int]:
-        return self.clearance.shape  # type: ignore[return-value]
+    def free(self) -> np.ndarray:
+        """bool [nx,ny,nz] — FREE (camera-placeable) cells, derived from the
+        baked threshold (epsilon absorbs float16/lattice rounding so a
+        threshold equal to a lattice distance includes its own tier)."""
+        return self.empty & (self.clearance >= self.clearance_m - _CLEARANCE_EPS)
 
     @property
-    def fine_shape(self) -> tuple[int, int, int]:
-        return (int(self.fine_dims[0]), int(self.fine_dims[1]), int(self.fine_dims[2]))
+    def shape(self) -> tuple[int, int, int]:
+        return (int(self.dims[0]), int(self.dims[1]), int(self.dims[2]))
 
     @property
     def imin(self) -> np.ndarray:
-        """Absolute fine-lattice index of the grid corner (`origin = imin *
-        pitch_fine`). Queries bin with `floor(point / pitch_fine) - imin` — the SAME
-        absolute-lattice expression the occupancy was BUILT with — so a query point
-        and a build-time sample in the same physical cell get the identical index.
-        Subtracting the float `origin` first (`floor((point - origin) / pitch_fine)`)
+        """Absolute lattice index of the grid corner (`origin = imin * pitch`).
+        Queries bin with `floor(point / pitch) - imin` — the SAME absolute-
+        lattice expression the occupancy was BUILT with — so a query point and a
+        build-time sample in the same physical cell get the identical index.
+        Subtracting the float `origin` first (`floor((point - origin) / pitch)`)
         rounds differently and, for some origins, mis-bins nearly every point."""
-        return np.round(self.origin / self.pitch_fine).astype(np.int64)
+        return np.round(self.origin / self.pitch).astype(np.int64)
 
-    def _fine_member(self, points: np.ndarray, lin_sorted: np.ndarray) -> np.ndarray:
-        """Boolean per world point: is its FINE voxel in the sorted sparse index set
+    def _bin(self, points: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """(grid indices, in-bounds mask) per world point."""
+        idx = np.floor(points / self.pitch).astype(np.int64) - self.imin
+        inb = np.all((idx >= 0) & (idx < self.dims), axis=1)
+        return idx, inb
+
+    def _member(self, points: np.ndarray, lin_sorted: np.ndarray) -> np.ndarray:
+        """Boolean per world point: is its voxel in the sorted sparse index set
         `lin_sorted`? Binary search; points outside the grid read as False."""
-        idx = np.floor(points / self.pitch_fine).astype(np.int64) - self.imin
-        dims = self.fine_dims
-        inb = np.all((idx >= 0) & (idx < dims), axis=1)
+        idx, inb = self._bin(points)
         out = np.zeros(len(points), dtype=bool)
         if not lin_sorted.size or not inb.any():
             return out
         ii = idx[inb]
-        lin = (ii[:, 0] * dims[1] + ii[:, 1]) * dims[2] + ii[:, 2]
+        lin = (ii[:, 0] * self.dims[1] + ii[:, 1]) * self.dims[2] + ii[:, 2]
         pos = np.searchsorted(lin_sorted, lin)
         pos = np.clip(pos, 0, lin_sorted.size - 1)
         out[inb] = lin_sorted[pos] == lin
         return out
 
-    def fine_occupied(self, points: np.ndarray) -> np.ndarray:
-        """Boolean per world point: does its FINE voxel contain ANY surface
+    def occupied(self, points: np.ndarray) -> np.ndarray:
+        """Boolean per world point: does its voxel contain ANY surface
         (opaque or glass)? The physical-presence query — clearance, navigation,
         and "is there something here" all mean this one."""
-        return self._fine_member(points, self.occ_lin)
+        return self._member(points, self.occ_lin)
 
-    def fine_occluding(self, points: np.ndarray) -> np.ndarray:
-        """Boolean per world point: does its FINE voxel BLOCK line-of-sight?
+    def occluding(self, points: np.ndarray) -> np.ndarray:
+        """Boolean per world point: does its voxel BLOCK line-of-sight?
         Opaque surface only — glass-classed cells pass light, so the Stage-4
         visibility ray-march can see (and plan coverage) through window panes."""
-        return self._fine_member(points, self.occ_lin_opaque)
+        return self._member(points, self.occ_lin_opaque)
 
-    def reachable_free(self, points: np.ndarray) -> np.ndarray:
-        """Boolean per world point: is it in NAVIGABLE free space (a large enough
-        free component)? This is what distinguishes exterior/room air from a solid's
-        hollow interior — the signal Stage 3 uses to orient normals + cull hidden
-        faces, and Stage 4 to place cameras. Outside-grid points read as False."""
-        # Bin via the fine absolute lattice then block-reduce (matches the build's
-        # `local // refine`); using `floor((point - origin) / pitch)` would round
-        # inconsistently with how occupancy was built (see `imin`).
-        idx = (np.floor(points / self.pitch_fine).astype(np.int64) - self.imin) // self.refine
-        dims = np.asarray(self.reachable.shape)
-        inb = np.all((idx >= 0) & (idx < dims), axis=1)
+    def empty_at(self, points: np.ndarray) -> np.ndarray:
+        """Boolean per world point: is it in EMPTY space (ambient air or a
+        rescued cavity)? This is what distinguishes viewable air from a solid's
+        sealed hollow — the signal Stage 3 uses to orient normals + cull hidden
+        faces. Deliberately NOT clearance-filtered: a surfel beside a thin gap
+        has visible air there even though no camera fits (that's `free`).
+        Outside-grid points read as False."""
+        idx, inb = self._bin(points)
         out = np.zeros(len(points), dtype=bool)
         ii = idx[inb]
-        out[inb] = self.reachable[ii[:, 0], ii[:, 1], ii[:, 2]]
+        out[inb] = self.empty[ii[:, 0], ii[:, 1], ii[:, 2]]
         return out
 
     def free_candidates(
@@ -252,28 +323,30 @@ class FreeSpace:
         max_clearance: float | None = None,
         spacing: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """NAVIGABLE free-cell world centres (+ their clearances) — the camera-
-        candidate pool for Stage 4. Restricted to reachable space, so cameras never
-        spawn inside solids/tiny hollows.
+        """FREE-cell world centres (+ their clearances) — the camera-candidate
+        pool for Stage 4, based on the BAKED free mask (empty ∧ clearance ≥
+        `clearance_m`), so cameras never spawn inside solids, sealed hollows,
+        or hugging a surface. `min_clearance` can only tighten further — the
+        baked threshold is the floor (re-bake via `apply_clearance` to relax).
 
         `max_clearance` keeps only the NEAR-SURFACE band (cells whose nearest surface
         is within reach of a camera); cells farther than any view distance can see
         nothing and are dropped. `spacing` (m) thins the band to ~one candidate per
         `spacing`-sized block, picking the MOST-OPEN cell in each block — so the
         candidate count scales with the near-surface area, not a fixed budget."""
-        free = self.reachable & (self.clearance >= min_clearance)
+        eligible = self.free & (self.clearance >= min_clearance - _CLEARANCE_EPS)
         if max_clearance is not None:
-            free &= self.clearance <= max_clearance
+            eligible &= self.clearance <= max_clearance
         stride = 1 if spacing is None else max(1, int(round(spacing / self.pitch)))
         if stride == 1:
-            cells = np.argwhere(free)
+            cells = np.argwhere(eligible)
             centers = (self.origin + (cells + 0.5) * self.pitch).astype(np.float32)
-            return centers, self.clearance[free]
+            return centers, self.clearance[eligible]
         # One representative per stride³ block: the eligible cell CLOSEST to a surface
         # (smallest clearance, but still ≥ collision_clearance) — closest safe camera
         # spots best serve the near/detail-view coverage requirement. Pad up so no
         # edge block is lost; +inf marks ineligible cells.
-        score = np.where(free, self.clearance, np.float32(np.inf))
+        score = np.where(eligible, self.clearance, np.float32(np.inf))
         nx, ny, nz = score.shape
         pad = [(-nx) % stride, (-ny) % stride, (-nz) % stride]
         score = np.pad(score, [(0, pad[0]), (0, pad[1]), (0, pad[2])], constant_values=np.inf)
@@ -297,46 +370,55 @@ class FreeSpace:
 
 
 def load_free_space(path: Path) -> FreeSpace:
-    """Load a `freespace.npz` written by `compute_free_space`. Accepts the sparse
-    layout (`fine_dims` + `occ_lin`) and, for back-compat, a legacy dense `occ_fine`
-    (flattened to sparse on load). Grids written before the glass class (no
-    `occ_lin_glass`) degrade gracefully: every cell occludes, the old behavior."""
+    """Load a `freespace.npz` written by `compute_free_space`. Older layouts
+    (dual-resolution, or single-grid without the baked clearance) are rejected
+    with a re-run error — no compat shims."""
     with np.load(path) as z:
         files = set(z.files)
-        if "occ_lin" in files:
-            fine_dims = z["fine_dims"].astype(np.int64)
-            occ_lin = z["occ_lin"].astype(np.int64)
-        else:  # legacy dense occupancy → sparse (C-order linear matches fine_occupied)
-            occ = z["occ_fine"].astype(bool)
-            fine_dims = np.array(occ.shape, dtype=np.int64)
-            occ_lin = np.flatnonzero(occ.reshape(-1)).astype(np.int64)
-        glass = (
-            z["occ_lin_glass"].astype(np.int64)
-            if "occ_lin_glass" in files
-            else np.zeros(0, dtype=np.int64)
-        )
+        if "empty" not in files or "clearance_m" not in files or "dims" not in files:
+            raise ValueError(
+                f"{path} is a pre-clearance free-space grid — re-run Stage 2"
+            )
+        occ_lin = z["occ_lin"].astype(np.int64)
+        glass = z["occ_lin_glass"].astype(np.int64)
         return FreeSpace(
             origin=z["origin"].astype(np.float64),
             pitch=float(z["pitch"]),
-            pitch_fine=float(z["pitch_fine"]),
-            refine=int(z["refine"]),
-            fine_dims=fine_dims,
+            dims=z["dims"].astype(np.int64),
             occ_lin=occ_lin,
             # Glass is stored as the disjoint transmissive-only subset, so the
             # occlusion set is simply "all minus glass" (stays sorted).
             occ_lin_opaque=np.setdiff1d(occ_lin, glass, assume_unique=True),
             clearance=z["clearance"].astype(np.float32),
-            reachable=z["reachable"].astype(bool),
+            empty=z["empty"].astype(bool),
+            clearance_m=float(z["clearance_m"]),
         )
 
 
-def _iter_geoms(mesh: trimesh.Trimesh | trimesh.Scene) -> list[trimesh.Trimesh]:
-    # dump() bakes each geometry's scene-graph node transform into world space; plain
-    # scene.geometry returns LOCAL vertices, which collapses node-placed objects
-    # (generated assets carry placement on the node) to the origin.
-    if isinstance(mesh, trimesh.Scene):
-        return [g for g in mesh.dump(concatenate=False) if hasattr(g, "faces")]
-    return [mesh]
+def apply_clearance(path: Path, clearance: float) -> dict[str, Any]:
+    """Re-bake the FREE threshold of an existing `freespace.npz` IN PLACE — the
+    'apply' behind the client's clearance slider. No re-voxelization: the fill's
+    empty mask and the clearance field are threshold-independent, so only the
+    `clearance_m` scalar changes (the viz pack stays valid too — its empty
+    quads carry per-cell clearance). Returns a summary patch
+    `{clearance, free_voxels}` for the sidecar."""
+    path = Path(path)
+    with np.load(path) as z:
+        if "empty" not in z.files or "clearance_m" not in z.files:
+            raise ValueError(f"{path} is a pre-clearance grid — re-run Stage 2")
+        data = {k: z[k] for k in z.files}
+    c = float(clearance)
+    data["clearance_m"] = np.float64(c)
+    free_count = int(
+        (
+            data["empty"].astype(bool)
+            & (data["clearance"].astype(np.float32) >= c - _CLEARANCE_EPS)
+        ).sum()
+    )
+    tmp = path.with_suffix(path.suffix + ".tmp.npz")
+    np.savez_compressed(tmp, **data)
+    tmp.replace(path)
+    return {"clearance": c, "free_voxels": free_count}
 
 
 def placed_object_ids(raw_dir: Path) -> list[str]:
@@ -436,7 +518,7 @@ def _valid_tri_mask(tris: np.ndarray) -> np.ndarray:
 
 
 def _voxelize_cells(tris: np.ndarray, pitch: float) -> np.ndarray:
-    """Absolute lattice coords (K,3) of every fine cell touched by the given
+    """Absolute lattice coords (K,3) of every cell touched by the given
     (already-small, post-`_subdivide_edges`) triangles. Each triangle's lattice
     AABB bounds its candidate block; offsets are enumerated to the batch's max
     span, so any triangle size is handled (post-subdivision the span is ≤ 2)."""
@@ -469,7 +551,7 @@ def _voxelize_cells(tris: np.ndarray, pitch: float) -> np.ndarray:
 
 
 def _voxelize_surface(tris: np.ndarray, pitch: float) -> np.ndarray:
-    """Absolute lattice coords (K,3) of every fine cell touched by any triangle.
+    """Absolute lattice coords (K,3) of every cell touched by any triangle.
     DETERMINISTIC and complete — every cell a triangle overlaps is marked, none
     are missed — unlike the random point sampling this replaces (which left
     ~e^-oversample of surface cells unmarked: pinholes for rays / flood fill)."""
@@ -566,51 +648,289 @@ def _voxelize_geom(
     )
 
 
-def _fine_grid_dims(
-    lo: np.ndarray, hi: np.ndarray, margin: float, pitch_fine: float, refine: int
+def _grid_dims(
+    lo: np.ndarray, hi: np.ndarray, margin: float, pitch: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fine-grid lower corner (absolute lattice index `imin`) + dims for a given
-    coarse block factor `refine`. Dims are padded to a multiple of `refine` so the
-    coarse grid (`dims // refine`) is an exact block-reduction. Factored out so the
-    adaptive cap below sizes `refine` with the SAME arithmetic the build uses."""
-    imin = np.floor((lo - margin) / pitch_fine).astype(np.int64) - 1
-    imin -= imin % refine  # align down to a coarse-cell boundary
-    imax = np.ceil((hi + margin) / pitch_fine).astype(np.int64) + 1
-    fdims = (imax - imin) + 1
-    fdims = ((np.maximum(fdims, refine) + refine - 1) // refine) * refine
-    return imin, fdims
+    """Grid lower corner (absolute lattice index) + dims covering the scene AABB
+    + `margin`, padded one extra cell so the boundary shell — phase 1's
+    always-ambient seed layer — lies strictly outside the padded AABB."""
+    imin = np.floor((lo - margin) / pitch).astype(np.int64) - 1
+    imax = np.ceil((hi + margin) / pitch).astype(np.int64) + 1
+    return imin, imax - imin + 1
 
 
-def _fit_refine(
-    lo: np.ndarray,
-    hi: np.ndarray,
-    margin: float,
-    pitch_fine: float,
-    base_refine: int,
-    max_coarse_cells: int,
-) -> int:
-    """Smallest coarse block factor ≥ `base_refine` whose DENSE coarse grid holds
-    ≤ `max_coarse_cells` cells. This is what bounds the clearance/reachability
-    memory regardless of scene size — only the COARSE grid coarsens; the fine
-    occupancy stays sparse at `pitch_fine`. Returns `base_refine` unchanged whenever
-    the scene already fits, so small/medium cells are byte-identical to the pre-cap
-    behavior; only oversized scenes coarsen."""
-    refine = max(1, int(base_refine))
-    if not max_coarse_cells or max_coarse_cells <= 0:
-        return refine
-    _, fdims = _fine_grid_dims(lo, hi, margin, pitch_fine, refine)
-    coarse = int(np.prod(fdims // refine))
-    if coarse <= max_coarse_cells:
-        return refine
-    # Coarse cells ~ 1/refine³, so seed from the cube-root scaling, then verify and
-    # bump by one until it fits (robust to the margin/padding rounding).
-    refine = max(refine, int(np.ceil(refine * (coarse / max_coarse_cells) ** (1.0 / 3.0))))
-    while refine < 100_000:
-        _, fdims = _fine_grid_dims(lo, hi, margin, pitch_fine, refine)
-        if int(np.prod(fdims // refine)) <= max_coarse_cells:
+def _shell_slabs(
+    vlo: np.ndarray, vhi: np.ndarray, dims: np.ndarray
+) -> list[tuple[slice, slice, slice]]:
+    """The six one-cell-thick faces of the AUGMENTED box `[vlo-1, vhi+1]` — an
+    object's shell ring — as index slabs, skipping faces that fall outside the
+    grid. Slabs overlap along the box edges; every consumer treats them as a
+    set, so the duplication is harmless."""
+    a_lo = vlo - 1
+    a_hi = vhi + 1
+    c_lo = np.maximum(a_lo, 0)
+    c_hi = np.minimum(a_hi, dims - 1)
+    slabs: list[tuple[slice, slice, slice]] = []
+    for axis in range(3):
+        for face in (int(a_lo[axis]), int(a_hi[axis])):
+            if face < 0 or face >= int(dims[axis]):
+                continue  # clipped by the grid — that side has no ring layer
+            sl = [
+                slice(int(c_lo[0]), int(c_hi[0]) + 1),
+                slice(int(c_lo[1]), int(c_hi[1]) + 1),
+                slice(int(c_lo[2]), int(c_hi[2]) + 1),
+            ]
+            sl[axis] = slice(face, face + 1)
+            slabs.append((sl[0], sl[1], sl[2]))
+    return slabs
+
+
+def _classify_empty(
+    occ: np.ndarray, boxes: list[tuple[str, np.ndarray, np.ndarray]]
+) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
+    """EMPTY mask over the grid via the two-phase fill (module docstring): label
+    the connected components of non-cover space once (6-connectivity — equivalent
+    to running every flood fill, since a component is reached iff any of its cells
+    is seeded), mark the components holding phase-1 ambient seeds, then run the
+    nested-object rescue to fixpoint. `boxes` are the objects' (id, vlo, vhi)
+    grid-index AABBs. Returns (empty bool array, rescued bool array — the
+    subset of empty opened by the rescue rather than phase-1 ambient air,
+    fill stats)."""
+    dims = np.asarray(occ.shape, dtype=np.int64)
+    labels, n_comp = ndimage.label(~occ, ndimage.generate_binary_structure(3, 1))
+    sizes = np.bincount(labels.ravel(), minlength=n_comp + 1)
+    reached = np.zeros(n_comp + 1, dtype=bool)
+
+    # Margin seeds: the grid's boundary shell lies beyond the scene AABB + margin
+    # (see `_grid_dims`), so its empty cells are ambient by construction.
+    for axis in range(3):
+        for face in (0, int(dims[axis]) - 1):
+            sl: list[Any] = [slice(None)] * 3
+            sl[axis] = face
+            reached[np.unique(labels[tuple(sl)])] = True
+    reached[0] = False  # label 0 is the cover itself, never free
+
+    # How many object AABBs cover each cell — the phase-1 seed exclusion. An
+    # object's ring lies outside its OWN box, so any nonzero count there means
+    # ANOTHER object's box: exactly the cells where a seed could sit inside a
+    # foreign hollow.
+    cnt = np.zeros(occ.shape, dtype=np.uint16)
+    for _nid, vlo, vhi in boxes:
+        cnt[vlo[0] : vhi[0] + 1, vlo[1] : vhi[1] + 1, vlo[2] : vhi[2] + 1] += 1
+
+    # Phase 1: per object, seed the shell ring's empty cells outside all other
+    # boxes; also record ALL empty ring components for the rescue trigger.
+    ring_labels: list[np.ndarray] = []
+    for _nid, vlo, vhi in boxes:
+        parts: list[np.ndarray] = []
+        for sl in _shell_slabs(vlo, vhi, dims):
+            lab = labels[sl]
+            empty = lab > 0
+            if not empty.any():
+                continue
+            parts.append(np.unique(lab[empty]))
+            seed = empty & (cnt[sl] == 0)
+            if seed.any():
+                reached[np.unique(lab[seed])] = True
+        ring_labels.append(
+            np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.int64)
+        )
+    del cnt
+    seeded_components = int(reached.sum())
+
+    # Phase 2 — nested rescue, to fixpoint. Trigger: an object with ZERO reached
+    # ring cells is sealed away from all discovered free space (fully nested).
+    # Admit ONE cavity per round — the component adjacent to the most pending
+    # objects (then the largest, then the lowest label) — and re-evaluate: the
+    # outside-in order that opens a hull's room air before a clipping cushion's
+    # sofa hollow ever gets considered (the cushion drops out of pending first).
+    pending = [i for i in range(len(boxes)) if ring_labels[i].size]
+    dead = len(boxes) - len(pending)  # ring fully occupied — zero-gap embedded
+    sealed_ids: set[str] = set()
+    rescued_comps: list[int] = []
+    rescue_rounds = 0
+    while True:
+        pending = [i for i in pending if not reached[ring_labels[i]].any()]
+        if not pending:
             break
-        refine += 1
-    return refine
+        sealed_ids.update(boxes[i][0] for i in pending)
+        adj = np.zeros(n_comp + 1, dtype=np.int64)
+        for i in pending:
+            rl = ring_labels[i]
+            adj[rl[~reached[rl]]] += 1
+        order = np.lexsort(
+            (-np.arange(n_comp + 1, dtype=np.int64), sizes, adj)
+        )
+        reached[int(order[-1])] = True
+        rescued_comps.append(int(order[-1]))
+        rescue_rounds += 1
+
+    empty = reached[labels]  # cover cells carry label 0 → False
+    # Cells opened BY the rescue (vs phase-1 ambient air) — rare, semantically
+    # interesting pockets the viz export keeps un-strided.
+    rescued = (
+        np.isin(labels, np.asarray(rescued_comps, dtype=np.int64))
+        if rescued_comps
+        else np.zeros_like(empty)
+    )
+    stats = {
+        "components": int(n_comp),
+        "components_open": int(reached.sum()),
+        "components_seeded": seeded_components,
+        "rescue_rounds": rescue_rounds,
+        "objects": len(boxes),
+        "objects_sealed": sorted(sealed_ids),
+        "objects_embedded": dead,
+    }
+    return empty, rescued, stats
+
+
+def _voxelize_object_task(
+    node_id: str, glb_path: str, pitch: float
+) -> tuple[str, np.ndarray, np.ndarray, np.ndarray | None, np.ndarray | None]:
+    """Voxelize ONE placed GLB → `(node_id, opaque_keys, glass_keys, lo, hi)`.
+
+    The process-pool work unit of the mesh pass: everything it returns is
+    origin-independent (sorted unique absolute-lattice int64 keys + the mesh
+    world AABB), so per-object results merge with `np.unique(concatenate(...))`
+    in ANY completion order — the parallel build is byte-identical to the
+    serial one. A bad mesh returns empty keys (the serial skip behavior)."""
+    from splat.assets import load_geoms
+
+    empty = np.zeros(0, dtype=np.int64)
+    opaque_parts: list[np.ndarray] = []
+    glass_parts: list[np.ndarray] = []
+    lo: np.ndarray | None = None
+    hi: np.ndarray | None = None
+    try:
+        geoms = load_geoms(Path(glb_path))
+        for g in geoms:
+            if len(g.faces) == 0 or g.area <= 0:
+                continue
+            b = np.asarray(g.bounds, dtype=float)
+            lo = b[0].copy() if lo is None else np.minimum(lo, b[0])
+            hi = b[1].copy() if hi is None else np.maximum(hi, b[1])
+            opaque_cells, glass_cells = _voxelize_geom(g, pitch)
+            if len(opaque_cells):
+                opaque_parts.append(np.unique(_abs_encode(opaque_cells)))
+            if len(glass_cells):
+                glass_parts.append(np.unique(_abs_encode(glass_cells)))
+        del geoms
+    except Exception:  # a bad mesh voxelizes to nothing — keep going
+        return node_id, empty, empty, None, None
+    opaque = np.unique(np.concatenate(opaque_parts)) if opaque_parts else empty
+    glass = np.unique(np.concatenate(glass_parts)) if glass_parts else empty
+    return node_id, opaque, glass, lo, hi
+
+
+def _iter_voxelized(
+    ids: list[str], raw_dir: Path, pitch: float, workers: int
+):  # noqa: ANN201 - yields _voxelize_object_task results
+    """Yield per-object voxelization results, serially (`workers <= 1`) or from
+    a process pool. The pool uses the SPAWN context: stage jobs run off worker
+    threads (asyncio.to_thread), where forking risks deadlock; spawn costs one
+    interpreter+import per worker (~seconds), amortized over a minutes-long
+    mesh pass. Object-level parallelism is the right grain — the loop is
+    embarrassingly parallel and each task is itself vectorized numpy."""
+    if workers <= 1 or len(ids) == 1:
+        for node_id in ids:
+            yield _voxelize_object_task(node_id, str(raw_dir / f"{node_id}.glb"), pitch)
+        return
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    try:
+        ctx = multiprocessing.get_context("spawn")
+        pool = ProcessPoolExecutor(max_workers=workers, mp_context=ctx)
+    except Exception:  # sandboxed/limited environments — degrade, don't die
+        logging.getLogger(__name__).warning(
+            "stage2: process pool unavailable — voxelizing serially"
+        )
+        for node_id in ids:
+            yield _voxelize_object_task(node_id, str(raw_dir / f"{node_id}.glb"), pitch)
+        return
+    with pool:
+        futures = [
+            pool.submit(
+                _voxelize_object_task, node_id, str(raw_dir / f"{node_id}.glb"), pitch
+            )
+            for node_id in ids
+        ]
+        for fut in as_completed(futures):
+            yield fut.result()
+
+
+def _boundary_quads(mask: np.ndarray) -> np.ndarray:
+    """Surface-extract a boolean voxel volume into run-merged face quads —
+    (Q,5) int32 `[x, y, z, face, run]`. A face survives only where the
+    neighbour on that side leaves the mask (interior faces culled), so the
+    quads tile exactly the boundary of each connected region — the merged,
+    volumetric look. Contiguous faces are merged into RUNS along one in-plane
+    axis (z for x/y faces, y for z faces): fully vectorized 1-D greedy meshing
+    (flat walls/floors collapse into long strips; staircase surfaces stay per
+    cell). `face` = axis*2 (+side, plane at the cell's max corner on that
+    axis) or axis*2+1 (−side, at the min corner)."""
+    parts: list[np.ndarray] = []
+    for axis in range(3):
+        for neg in (0, 1):
+            exposed = mask.copy()
+            dst = [slice(None)] * 3
+            src = [slice(None)] * 3
+            if neg == 0:  # +side face: exposed unless the +axis neighbour is set
+                dst[axis], src[axis] = slice(None, -1), slice(1, None)
+            else:  # −side face: exposed unless the −axis neighbour is set
+                dst[axis], src[axis] = slice(1, None), slice(None, -1)
+            exposed[tuple(dst)] &= ~mask[tuple(src)]
+            if not exposed.any():
+                continue
+            run_axis = 1 if axis == 2 else 2
+            moved = np.moveaxis(exposed, run_axis, 2)  # run axis last
+            d0, d1, run_len = moved.shape
+            rows = moved.reshape(-1, run_len)
+            # Run extraction: pad each row, diff — +1 marks a run start, −1 one
+            # past its end. argwhere scans row-major, so starts/ends pair 1:1.
+            padded = np.zeros((rows.shape[0], run_len + 2), dtype=np.int8)
+            padded[:, 1:-1] = rows
+            d = np.diff(padded, axis=1)
+            starts = np.argwhere(d == 1)
+            ends = np.argwhere(d == -1)
+            if not len(starts):
+                continue
+            row_i, col0 = starts[:, 0], starts[:, 1]
+            runs = ends[:, 1] - col0
+            i0, i1 = np.divmod(row_i, d1)
+            # Invert the moveaxis: moved coords (i0, i1, col0) → grid (x,y,z).
+            if run_axis == 2:
+                x, y, z = i0, i1, col0
+            else:  # axis == 2 faces run along y: moved order is (x, z, y)
+                x, y, z = i0, col0, i1
+            quad = np.empty((len(runs), 5), dtype=np.int32)
+            quad[:, 0], quad[:, 1], quad[:, 2] = x, y, z
+            quad[:, 3] = axis * 2 + neg
+            quad[:, 4] = runs
+            parts.append(quad)
+    if not parts:
+        return np.zeros((0, 5), dtype=np.int32)
+    return np.concatenate(parts, axis=0)
+
+
+def _pack_quads(quads: np.ndarray) -> bytes:
+    """(Q,5) int32 quads → the SVX3 10-byte wire records (`_QUAD_DTYPE`)."""
+    rec = np.zeros(len(quads), dtype=_QUAD_DTYPE)
+    rec["x"], rec["y"], rec["z"] = quads[:, 0], quads[:, 1], quads[:, 2]
+    rec["f"] = quads[:, 3]
+    rec["r"] = quads[:, 4]
+    return rec.tobytes()
+
+
+def _shell_thresholds(pitch: float, clearance_m: float, cl_max: float) -> list[float]:
+    """The free-shell ladder: voxel multiples (`_SHELL_STEPS`) up to the scene's
+    clearance ceiling, with the BAKED threshold always included (so the default
+    shell equals the FREE mask stage 4 plans against). Sorted, deduped."""
+    top = max(cl_max, pitch) + 1e-9
+    ts = {round(pitch * s, 4) for s in _SHELL_STEPS if pitch * s <= top}
+    ts.add(round(float(clearance_m), 4))
+    return sorted(t for t in ts if t > 0)
 
 
 def compute_free_space(
@@ -623,56 +943,54 @@ def compute_free_space(
     params: FreeSpaceParams = FreeSpaceParams(),
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
-    """Voxelize the cell's placed meshes into a dual-resolution occupancy + clearance
-    grid, writing `freespace.npz` (to `out_path`) + `voxels.bin` (beside it). Returns
-    a summary (grid dims, counts, clearance stats)."""
+    """Voxelize the cell's placed meshes into the single uniform occupancy grid
+    (in parallel across objects — see `_iter_voxelized`), classify empty vs
+    garbage with the two-phase fill, run the clearance pass (EDT + the baked
+    FREE threshold), and write `freespace.npz` (to `out_path`) + the SVX3
+    `voxels.bin` viz pack (beside it). Returns a summary (grid dims, counts,
+    fill + clearance stats). Output is byte-identical for any worker count."""
     if not raw_dir.is_dir():
         raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
     ids = placed_object_ids(raw_dir)
     if not ids:
         raise FileNotFoundError(f"no placed meshes in {raw_dir}")
-    base_pitch = float(np.clip(params.pitch, *_PITCH_CLAMP))
-    base_refine = max(1, int(params.refine))
-    # FINE occupancy resolution is FIXED (scene-independent): the fine grid is sparse
-    # (occ_lin), so accurate occlusion / thin-gap detection is kept at `pitch_fine`
-    # for every scene. The COARSE block factor (hence `pitch`) is picked AFTER the
-    # AABB is known so the dense coarse grid can be bounded (see `_fit_refine`).
-    pitch_fine = base_pitch / base_refine
+    pitch = float(np.clip(params.pitch, *_PITCH_CLAMP))
     margin = float(max(0.0, params.margin))
+    clearance_m = float(max(0.0, params.clearance))
+    workers = (
+        params.workers if params.workers > 0 else min(os.cpu_count() or 1, 8)
+    )
 
     total = len(ids)
     if progress is not None:
         progress(0, total, "")
 
-    # One pass: voxelize each surface EXACTLY (every fine cell a triangle touches,
-    # via _voxelize_geom) into an ABSOLUTE integer voxel lattice
-    # (floor(point / pitch_fine)), keeping only the UNIQUE occupied cells — memory
-    # tracks surface, not volume. Deterministic and gap-free, so the visibility
-    # ray-march can't leak through pinholes in walls and the reachability flood
-    # fill can't escape into sealed interiors. BLEND/MASK surfaces are classified
-    # per piece into OPAQUE vs GLASS cells (glass occupies space but won't block
-    # sight). The grid origin (which needs the AABB) is resolved afterwards;
-    # absolute-lattice keys are origin-independent.
+    # The MESH PASS — the stage's long pole, parallelized per object: voxelize
+    # each surface EXACTLY (every cell a triangle touches, via _voxelize_geom)
+    # into an ABSOLUTE integer lattice, keeping only the UNIQUE occupied cells,
+    # and record each object's mesh-derived world AABB — the boxes the fill's
+    # seeding rules run on (actual placed geometry, immune to divider bbox
+    # drift / unmeshed leaves). BLEND/MASK surfaces are classified per piece
+    # into OPAQUE vs GLASS cells (glass occupies space but won't block sight).
+    # The grid origin (which needs the AABB) is resolved afterwards; absolute-
+    # lattice keys are origin-independent, which is exactly what makes the
+    # merge order-independent and the parallel output byte-identical.
     opaque_parts: list[np.ndarray] = []
     glass_parts: list[np.ndarray] = []
+    obj_lo: dict[str, np.ndarray] = {}
+    obj_hi: dict[str, np.ndarray] = {}
     lo = np.array([np.inf, np.inf, np.inf])
     hi = np.array([-np.inf, -np.inf, -np.inf])
-    for done, node_id in enumerate(ids, start=1):
-        try:
-            m = trimesh.load(raw_dir / f"{node_id}.glb", process=False)
-            for g in _iter_geoms(m):
-                if len(g.faces) == 0 or g.area <= 0:
-                    continue
-                b = np.asarray(g.bounds, dtype=float)
-                lo, hi = np.minimum(lo, b[0]), np.maximum(hi, b[1])
-                opaque_cells, glass_cells = _voxelize_geom(g, pitch_fine)
-                if len(opaque_cells):
-                    opaque_parts.append(np.unique(_abs_encode(opaque_cells)))
-                if len(glass_cells):
-                    glass_parts.append(np.unique(_abs_encode(glass_cells)))
-            del m
-        except Exception:  # skip a bad mesh, keep going
-            pass
+    for done, (node_id, op_keys, gl_keys, olo, ohi) in enumerate(
+        _iter_voxelized(ids, raw_dir, pitch, workers), start=1
+    ):
+        if len(op_keys):
+            opaque_parts.append(op_keys)
+        if len(gl_keys):
+            glass_parts.append(gl_keys)
+        if olo is not None and ohi is not None:
+            lo, hi = np.minimum(lo, olo), np.maximum(hi, ohi)
+            obj_lo[node_id], obj_hi[node_id] = olo, ohi
         if progress is not None:
             progress(done, total, node_id)
 
@@ -685,120 +1003,125 @@ def compute_free_space(
     glass_keys = (
         np.unique(np.concatenate(glass_parts)) if glass_parts else empty_keys
     )
+
+    imin, dims = _grid_dims(lo, hi, margin, pitch)
+    nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
+    origin = imin.astype(np.float64) * pitch
+
+    def to_lin(keys: np.ndarray) -> np.ndarray:
+        """Absolute lattice keys → sorted unique local linear indices (drops
+        out-of-grid cells)."""
+        v = _abs_decode(keys) - imin
+        v = v[np.all((v >= 0) & (v < dims), axis=1)]
+        return np.unique((v[:, 0] * ny + v[:, 1]) * nz + v[:, 2])
+
+    opaque_lin = to_lin(opaque_keys)
     # A cell with BOTH classes (e.g. window frame + pane) occludes: opaque wins,
     # keeping the two stored sets disjoint (glass = transmissive-only cells).
-    glass_keys = np.setdiff1d(glass_keys, opaque_keys, assume_unique=True)
-    all_keys = np.sort(np.concatenate([opaque_keys, glass_keys]))
-    occ_abs = _abs_decode(all_keys)  # (K,3) absolute coords — ALL surface
+    glass_lin = np.setdiff1d(to_lin(glass_keys), opaque_lin, assume_unique=True)
+    occ_lin = np.union1d(opaque_lin, glass_lin)
 
-    # Adaptive COARSE resolution — the memory bound. Pick the coarse block factor so
-    # the dense clearance/reachability arrays hold ≤ max_coarse_cells; scenes that
-    # already fit keep base_refine/base_pitch (byte-identical output), only large or
-    # mostly-empty scenes coarsen. The fine occupancy below stays sparse + fixed-res.
-    refine = _fit_refine(lo, hi, margin, pitch_fine, base_refine, params.max_coarse_cells)
-    pitch = refine * pitch_fine
-    coarse_capped = refine != base_refine
+    occ = np.zeros((nx, ny, nz), dtype=bool)
+    occ.reshape(-1)[occ_lin] = True
 
-    # Fine grid over the AABB + margin, origin snapped to the absolute lattice (a
-    # multiple of pitch_fine, and of `refine` cells so the coarse grid is an exact
-    # block-reduction).
-    imin, fdims = _fine_grid_dims(lo, hi, margin, pitch_fine, refine)
-    fnx, fny, fnz = int(fdims[0]), int(fdims[1]), int(fdims[2])
-    origin = imin.astype(np.float64) * pitch_fine
+    # Per-object grid-index AABBs (all cells the mesh AABB touches — a superset
+    # of the object's own cover cells, so its ring is always strictly outside).
+    boxes: list[tuple[str, np.ndarray, np.ndarray]] = []
+    for node_id in ids:
+        if node_id not in obj_lo:
+            continue
+        vlo = np.floor(obj_lo[node_id] / pitch).astype(np.int64) - imin
+        vhi = np.floor(obj_hi[node_id] / pitch).astype(np.int64) - imin
+        boxes.append(
+            (node_id, np.clip(vlo, 0, dims - 1), np.clip(vhi, 0, dims - 1))
+        )
 
-    # Occupied fine cells → local linear indices (drop any outside the padded grid).
-    local = occ_abs - imin
-    inb = np.all((local >= 0) & (local < fdims), axis=1)
-    local = local[inb]
-    occ_lin = np.unique((local[:, 0] * fny + local[:, 1]) * fnz + local[:, 2])
+    empty, rescued, fill_stats = _classify_empty(occ, boxes)
 
-    # The glass subset through the identical transform (stays disjoint from the
-    # opaque cells and a subset of occ_lin; load derives opaque = all − glass).
-    glass_local = _abs_decode(glass_keys) - imin
-    glass_local = glass_local[np.all((glass_local >= 0) & (glass_local < fdims), axis=1)]
-    glass_lin = np.unique(
-        (glass_local[:, 0] * fny + glass_local[:, 1]) * fnz + glass_local[:, 2]
+    # The CLEARANCE PASS (right after the fill): EDT over non-cover cells →
+    # metres to the nearest cover cell, then FREE = the empty cells at ≥
+    # `clearance_m` — where a camera can physically sit. The labels above never
+    # consult clearance; FREE is a pure derivation, re-bakeable in place
+    # (`apply_clearance`) without re-running anything else.
+    clearance = (
+        ndimage.distance_transform_edt(~occ).astype(np.float32) * np.float32(pitch)
     )
+    free = empty & (clearance >= clearance_m - _CLEARANCE_EPS)
 
-    # Coarse occupancy from the same occupied cells (a coarse cell is solid if any
-    # fine sub-cell is) → clearance (EDT over empties), in metres.
-    occ_coarse = np.zeros((fnx // refine, fny // refine, fnz // refine), dtype=bool)
-    cc = local // refine
-    occ_coarse[cc[:, 0], cc[:, 1], cc[:, 2]] = True
-    clearance = ndimage.distance_transform_edt(~occ_coarse).astype(np.float32) * pitch
-
-    # Reachability: label connected free components (6-connectivity) and keep only
-    # those large enough to be navigable (exterior + rooms), dropping the tiny
-    # hollows a surface voxelization leaves inside solid objects. This is the signal
-    # that separates real free space from a solid's interior.
-    free_coarse = ~occ_coarse
-    labels, n_comp = ndimage.label(free_coarse, ndimage.generate_binary_structure(3, 1))
-    reachable = np.zeros_like(free_coarse)
-    if n_comp > 0:
-        sizes = np.bincount(labels.ravel())
-        sizes[0] = 0  # label 0 is the solid background
-        # Floor at 8 cells so a coarsened (capped) grid still drops sub-voxel specks;
-        # when coarse_capped raises `pitch`, the effective min pocket is 8·pitch³.
-        min_cells = max(8, int(params.reachable_min_volume / (pitch**3)))
-        keep = np.nonzero(sizes >= min_cells)[0]
-        reachable = np.isin(labels, keep)
-
-    # Persist the reusable grid.
+    # Persist the reusable grid (float16 clearance halves the file at ~0.05%
+    # relative error — comparisons carry _CLEARANCE_EPS, so exact-lattice
+    # thresholds survive the quantization). FREE is derived on load from
+    # `empty` + `clearance` + `clearance_m`, never stored.
     out_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_npz = out_path.with_suffix(out_path.suffix + ".tmp.npz")
     np.savez_compressed(
         tmp_npz,
         origin=origin.astype(np.float64),
         pitch=np.float64(pitch),
-        pitch_fine=np.float64(pitch_fine),
-        refine=np.int64(refine),
-        fine_dims=np.array([fnx, fny, fnz], dtype=np.int64),
+        dims=np.array([nx, ny, nz], dtype=np.int64),
         occ_lin=occ_lin.astype(np.int64),
         occ_lin_glass=glass_lin.astype(np.int64),
-        clearance=clearance,
-        reachable=reachable,
+        clearance=clearance.astype(np.float16),
+        empty=empty,
+        clearance_m=np.float64(clearance_m),
     )
     tmp_npz.replace(out_path)
 
-    # Viz cloud: NAVIGABLE (reachable) coarse cells + clearance, strided under a cap.
-    reach_idx = np.argwhere(reachable)
-    reach_count = int(reach_idx.shape[0])
-    stride = max(1, int(np.ceil(reach_count / _MAX_VIZ_VOXELS)))
-    sel = reach_idx[::stride]
-    centers = origin + (sel.astype(np.float32) + 0.5) * pitch
-    clv = clearance[sel[:, 0], sel[:, 1], sel[:, 2]] if len(sel) else np.zeros(0, dtype=np.float32)
-    viz = (
-        np.concatenate([centers, clv[:, None]], axis=1).astype("<f4")
-        if len(sel)
-        else np.zeros((0, 4), dtype="<f4")
-    )
+    # SVX3 viz pack (see module docstring): VOLUMETRIC boundary shells, not
+    # points. Each class (cover, garbage, and the free volume at a ladder of
+    # clearance thresholds) is surface-extracted — only faces whose neighbour
+    # leaves the class survive, run-merged into strips — so the client renders
+    # merged translucent shapes with interior faces culled, and the clearance
+    # slider swaps between pre-meshed shells instead of re-filtering points.
+    empty_count = int(empty.sum())
+    free_count = int(free.sum())
+    cl_empty = clearance[empty]
+    cl_max = float(cl_empty.max()) if cl_empty.size else pitch
+
+    shells: list[tuple[float, np.ndarray, int]] = []
+    for t in _shell_thresholds(pitch, clearance_m, cl_max):
+        m = empty & (clearance >= t - _CLEARANCE_EPS)
+        shells.append((t, _boundary_quads(m), int(m.sum())))
+    cover_q = _boundary_quads(occ)
+    garbage_q = _boundary_quads(~occ & ~empty)
+
     viz_path = out_path.with_name(VOXELS_NAME)
     tmp_viz = viz_path.with_suffix(viz_path.suffix + ".tmp")
-    tmp_viz.write_bytes(viz.tobytes())
+    with tmp_viz.open("wb") as f:
+        f.write(_VIZ_HEADER.pack(_VIZ_MAGIC, len(cover_q), len(garbage_q), len(shells)))
+        f.write(_pack_quads(cover_q))
+        f.write(_pack_quads(garbage_q))
+        for t, q, cells in shells:
+            f.write(_SHELL_HEADER.pack(t, len(q), cells))
+            f.write(_pack_quads(q))
     tmp_viz.replace(viz_path)
 
-    cl_free = clearance[free_coarse]
     return {
         "run": run,
         "slot": slot,
         "model": model,
         "pitch": pitch,
-        "pitch_fine": round(pitch_fine, 5),
-        "refine": refine,
-        "refine_base": base_refine,
-        "coarse_capped": coarse_capped,
-        "dims_fine": [fnx, fny, fnz],
-        "dims_coarse": list(occ_coarse.shape),
+        "dims": [nx, ny, nz],
         "origin": [round(v, 5) for v in origin.tolist()],
         "scene_aabb": {"min": lo.tolist(), "max": hi.tolist()},
-        "solid_voxels_fine": int(occ_lin.size),
-        "glass_voxels_fine": int(glass_lin.size),
-        "free_voxels": int(free_coarse.sum()),
-        "reachable_voxels": reach_count,
-        "exported_voxels": int(sel.shape[0]),
-        "stride": stride,
-        "clearance_max": float(cl_free.max()) if cl_free.size else 0.0,
-        "clearance_mean": round(float(cl_free.mean()), 4) if cl_free.size else 0.0,
+        "solid_voxels": int(occ_lin.size),
+        "glass_voxels": int(glass_lin.size),
+        "empty_voxels": empty_count,
+        "free_voxels": free_count,
+        "garbage_voxels": int(nx * ny * nz - occ_lin.size) - empty_count,
+        "rescued_voxels": int(rescued.sum()),
+        "fill": fill_stats,
+        "viz": {
+            "cover_quads": int(len(cover_q)),
+            "garbage_quads": int(len(garbage_q)),
+            "shells": [
+                {"clearance": round(t, 4), "quads": int(len(q)), "cells": c}
+                for t, q, cells in shells
+                for c in (cells,)
+            ],
+        },
+        "clearance_max": cl_max if cl_empty.size else 0.0,
+        "clearance_mean": round(float(cl_empty.mean()), 4) if cl_empty.size else 0.0,
         "params": params.as_summary(),
         "bytes": viz_path.stat().st_size,
         "grid_bytes": out_path.stat().st_size,

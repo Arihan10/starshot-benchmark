@@ -20,6 +20,11 @@ dependencies = [
     "scipy>=1.18.0",
     "modal>=1.5.2",
     "zstandard>=0.23 ; python_full_version < '3.14'",
+    # splat/assets.py: in-process EXT_meshopt_compression decode (no de-opt step)
+    "meshoptimizer>=0.2.20",
+    # splat/assets.py: runs the vendored Basis Universal KTX2 transcoder
+    # (splat/vendor/*.wasm) — pure-Python wheels on Windows/macOS/Linux.
+    "wasmtime>=46.0.1",
 ]
 
 [dependency-groups]
