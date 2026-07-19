@@ -2421,12 +2421,12 @@ class Stage4Request(BaseModel):
     direction dial: equal-solid-angle cells (an explicit direct-facing cap + a
     ring of azimuth cells) tiling the hemisphere around each patch normal, all
     suppliable cells demanded. The old `near_frac` / `min_px_per_patch` /
-    `angles_per_patch` / `angular_sectors` knobs are gone (subsumed; unknown
+    `angles_per_patch` / `angular_sectors` / `collision_clearance` knobs are
+    gone (subsumed — camera standoff is emergent from the scale ladder; unknown
     fields in a request body are ignored)."""
 
     patch_min_spacing: float | None = None
     patch_max_spacing: float | None = None
-    collision_clearance: float | None = None
     angular_bins: int | None = None
     finest_px_per_patch: float | None = None
     tex_k: float | None = None
@@ -2439,7 +2439,6 @@ class Stage4Request(BaseModel):
     candidate_spacing: float | None = None
     max_candidates: int | None = None
     render_resolution: int | None = None
-    gpu: bool | None = None  # run the coverage ray-march on CUDA (default on); False forces CPU
 
 
 def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
@@ -2455,7 +2454,6 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         patch_min_spacing=pick(req.patch_min_spacing, 0.02, 0.5, d.patch_min_spacing),
         patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
         tex_k=pick(req.tex_k, 0.0, 50.0, d.tex_k),
-        collision_clearance=pick(req.collision_clearance, 0.05, 2.0, d.collision_clearance),
         angular_bins=int(pick(req.angular_bins, 2, 16, d.angular_bins)),
         # PlanParams itself caps the effective value at render_resolution
         # (saturation); the clamp here is just request hygiene.
@@ -2470,7 +2468,6 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         # and warns if a scene exceeds it, so large scenes aren't silently clipped.
         max_candidates=int(pick(req.max_candidates, 1000, 5_000_000, d.max_candidates)),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
-        gpu=req.gpu if req.gpu is not None else d.gpu,
     )
 
 
@@ -2517,14 +2514,30 @@ def _plan_cameras_cell(
     plan_params: splat_stage4.PlanParams, job: dict[str, Any],
 ) -> dict[str, Any]:
     """Plan cameras from the Stage-2 free-space grid + Stage-3 surfel cloud — no mesh
-    loading, no de-optimization (that's why Stage 4 can't run off a raw mesh)."""
+    loading, no de-optimization (that's why Stage 4 can't run off a raw mesh).
+
+    The progress callback also derives a live `rate` (actions/second) for the
+    current planning STEP — candidates ray-marched during 'coverage', cameras
+    picked during 'select' — as an EMA of Δdone/Δt that resets whenever the
+    sub-step changes, so each step reports its own throughput. Marker steps
+    (load / patches / write) don't stream a count, so their rate stays 0."""
+    meter = {"step": None, "t": 0.0, "done": 0, "rate": 0.0}
 
     def _progress(done: int, total: int, current: str) -> None:
+        now = time.monotonic()
+        if current != meter["step"]:          # new sub-step → restart the baseline
+            meter.update(step=current, t=now, done=done, rate=0.0)
+        elif done > meter["done"]:             # streaming step → EMA of Δdone/Δt
+            inst = (done - meter["done"]) / max(now - meter["t"], 1e-3)
+            meter["rate"] = inst if meter["rate"] <= 0.0 else 0.5 * meter["rate"] + 0.5 * inst
+            meter["t"], meter["done"] = now, done
         job["phase"], job["done"], job["total"], job["current_id"] = (
             "plan", done, total, current,
         )
+        job["rate"] = round(meter["rate"], 1)
 
     job["phase"] = "plan"
+    job["rate"] = 0.0
     return splat_stage4.plan_cameras(
         run=run, slot=slot, model=model,
         freespace_path=_freespace_path(run, slot, model),
@@ -3593,6 +3606,7 @@ def create_app() -> FastAPI:
             "current_id": None,
             "error": None,
             "summary": None,
+            "rate": 0.0,
             "url": None,
             "patches_url": None,
             "started_at": datetime.now().isoformat(timespec="seconds"),

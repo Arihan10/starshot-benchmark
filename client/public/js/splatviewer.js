@@ -1622,19 +1622,30 @@ function renderStepper() {
 					`${phase} ${st.total ? `${st.done}/${st.total}` : ""}`.trim() ||
 					"running",
 			});
-			// Live capture throughput for Stage 5 (server-computed images/second).
-			const rate = stage.n === 5 ? fmtRate(st.rate) : null;
+			// Live server-computed throughput next to the running step. Stage 5 =
+			// images/second (with session avg); Stage 4 = the current planning
+			// step's actions/second — candidates ray-marched ('coverage'), cameras
+			// picked ('select'). Marker steps don't stream a count, so no rate.
+			const rate = stage.n === 5 || stage.n === 4 ? fmtRate(st.rate) : null;
 			if (rate) {
 				const remaining = (st.total || 0) - (st.done || 0);
 				const eta = fmtEta(remaining, st.rate);
-				const avg = fmtRate(st.rate_avg);
-				extra = el("span", {
-					class: "muted",
-					text: eta ? `${rate} img/s · ETA ${eta}` : `${rate} img/s`,
-					title: avg
-						? `live ${rate} img/s · session avg ${avg} img/s`
-						: `${rate} img/s`,
-				});
+				if (stage.n === 5) {
+					const avg = fmtRate(st.rate_avg);
+					extra = el("span", {
+						class: "muted",
+						text: eta ? `${rate} img/s · ETA ${eta}` : `${rate} img/s`,
+						title: avg
+							? `live ${rate} img/s · session avg ${avg} img/s`
+							: `${rate} img/s`,
+					});
+				} else {
+					extra = el("span", {
+						class: "muted",
+						text: eta ? `${rate}/s · ETA ${eta}` : `${rate}/s`,
+						title: `${phase || "step"} · ${rate} actions/s`,
+					});
+				}
 			}
 		} else if (gated) {
 			btn = el("button", {
@@ -1655,6 +1666,16 @@ function renderStepper() {
 					: `run stage ${stage.n}`,
 				onclick: () => runStage(stage.n),
 			});
+		}
+		// Planned reference-image count (image files Stage 5 will create), shown before capture.
+		if (stage.n === 5 && !running && !extra) {
+			const planned = stageState(cell, 4).summary?.views;
+			if (planned != null)
+				extra = el("span", {
+					class: "muted",
+					text: `${fmtInt(planned)} views`,
+					title: "reference images this render will create (from the Stage-4 plan)",
+				});
 		}
 		if (st.status === "error") {
 			btn.classList.add("err");
@@ -1824,6 +1845,7 @@ function renderCoverage() {
 			`${fmtInt(sum.cameras)} · ${fmtInt(sum.candidates)}`,
 			null,
 		],
+		["views (image files)", fmtInt(sum.views), null],
 		["satisfied (≥K angles)", `${fmtInt(sat)} · ${satPct}%`, satColor],
 		["under-covered", fmtInt(Math.max(0, seen - sat)), null],
 		[

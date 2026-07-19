@@ -248,31 +248,32 @@ class FreeSpace:
 
     def free_candidates(
         self,
-        min_clearance: float,
         max_clearance: float | None = None,
         spacing: float | None = None,
     ) -> tuple[np.ndarray, np.ndarray]:
         """NAVIGABLE free-cell world centres (+ their clearances) — the camera-
         candidate pool for Stage 4. Restricted to reachable space, so cameras never
-        spawn inside solids/tiny hollows.
+        spawn inside solids/tiny hollows. No clearance floor: wall-adjacent cells
+        are eligible, and camera–surface standoff is EMERGENT in Stage 4 (its
+        scale ladder demands nothing closer than a patch's d_min).
 
         `max_clearance` keeps only the NEAR-SURFACE band (cells whose nearest surface
         is within reach of a camera); cells farther than any view distance can see
         nothing and are dropped. `spacing` (m) thins the band to ~one candidate per
-        `spacing`-sized block, picking the MOST-OPEN cell in each block — so the
-        candidate count scales with the near-surface area, not a fixed budget."""
-        free = self.reachable & (self.clearance >= min_clearance)
+        `spacing`-sized block, picking each block's cell CLOSEST to a surface — so
+        the candidate count scales with the near-surface area, not a fixed budget."""
+        free = self.reachable
         if max_clearance is not None:
-            free &= self.clearance <= max_clearance
+            free = free & (self.clearance <= max_clearance)
         stride = 1 if spacing is None else max(1, int(round(spacing / self.pitch)))
         if stride == 1:
             cells = np.argwhere(free)
             centers = (self.origin + (cells + 0.5) * self.pitch).astype(np.float32)
             return centers, self.clearance[free]
-        # One representative per stride³ block: the eligible cell CLOSEST to a surface
-        # (smallest clearance, but still ≥ collision_clearance) — closest safe camera
-        # spots best serve the near/detail-view coverage requirement. Pad up so no
-        # edge block is lost; +inf marks ineligible cells.
+        # One representative per stride³ block: the eligible cell CLOSEST to a
+        # surface (smallest clearance) — the closest camera spots best serve the
+        # near/detail-view coverage requirement. Pad up so no edge block is lost;
+        # +inf marks ineligible cells.
         score = np.where(free, self.clearance, np.float32(np.inf))
         nx, ny, nz = score.shape
         pad = [(-nx) % stride, (-ny) % stride, (-nz) % stride]
