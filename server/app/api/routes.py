@@ -1992,9 +1992,10 @@ def _latest_ckpt_step(ckpt_dir: Path) -> int | None:
     """Highest checkpoint step on disk (from the `step_NNNNNN.pt` names), or None."""
     if not ckpt_dir.is_dir():
         return None
+    # rglob: tiled runs checkpoint under per-tile subdirs (splat/ckpt/tile_NNN/).
     steps = [
         int(p.stem.split("_")[1])
-        for p in ckpt_dir.glob("step_*.pt")
+        for p in ckpt_dir.rglob("step_*.pt")
         if "_" in p.stem and p.stem.split("_")[-1].isdigit()
     ]
     return max(steps) if steps else None

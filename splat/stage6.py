@@ -54,6 +54,33 @@ to `splat/ckpt/` (atomic, most-recent-`ckpt_keep` kept). An interrupted run resu
 from the latest checkpoint and continues to `iterations`; the checkpoints are
 deleted once trained.ply is written. Pass `resume=False` to force a fresh run.
 
+TILED TRAINING (scenes past the single-GPU VRAM wall): a seed larger than the
+tile budget (default 2/3 of `cap_max`, leaving densification headroom) trains as
+GROUND-PLANE TILES instead of one frozen over-budget run — the smallest (x,z)
+grid whose largest expanded tile (core + margin ring) fits the budget. Each tile
+trains sequentially in this process with the FULL budget to itself: views are
+assigned by exact visibility (their reference-depth pixels unproject into the
+tile's expanded box), every loss is masked to pixels the tile OWNS (its surface
++ true background, so boundary Gaussians never chase foreign content), and
+depth-seeding is clipped to the box. Merge keeps each Gaussian iff its mean lies
+in its tile's CORE cell — cores partition space exactly, so overlaps never
+double-ship and there is no seam by construction. Per-tile results are cached
+(`splat/ckpt/tiles/`) with a params signature: an interrupted tiled run resumes
+at the first unfinished tile (and inside it, from its own checkpoint). This is
+strictly MORE capacity than a monolithic run: n tiles × cap_max total, on the
+same GPU. Because the references are exact synthetic renders (posed, unlit,
+depth-true), the classic tiling artifacts (exposure seams, mis-assigned cameras)
+don't apply.
+
+LOD EXPORT (wide shots / progressive delivery): beside trained.ply, an octave
+ladder `trained.lod1.ply`, `trained.lod2.ply`, … — each level ~4× fewer
+Gaussians, built by opacity·area-weighted MOMENT MATCHING (cluster mean/
+covariance → tangent frame via eigendecomposition; opacity preserves the
+cluster's opacity·area within the new disk). A pulled-back camera renders the
+coarse level as a prefiltered anti-aliased average instead of shimmering
+sub-pixel splats, and the same 2DGS `.ply` layout means every existing viewer /
+compressor reads the levels unchanged.
+
 CUDA-ONLY: torch + gsplat compile/require CUDA, so this runs on the GPU box, NOT
 Apple Silicon. Both are imported LAZILY inside the trainer so the server (which
 imports this module for the route + the torch-free PLY/pose IO) stays importable
@@ -222,9 +249,33 @@ class TrainParams:
     ckpt_every: int = 2000             # 0 disables checkpointing
     ckpt_keep: int = 2
 
+    # Tiled training (module docstring §TILED TRAINING). Seeds beyond the budget
+    # train as ground-plane tiles, each with the full budget of densification
+    # headroom, merged by core ownership. None → 2/3 of cap_max (room to grow to
+    # the cap); 0 disables tiling (a huge seed then trains frozen, as before).
+    tile_max: int | None = None
+    tile_margin_frac: float = 0.10       # context ring, fraction of the tile side
+    tile_margin_min_m: float = 0.5       # … clamped to physical bounds (metres)
+    tile_margin_max_m: float = 4.0
+    tile_max_tiles: int = 64             # split-loop safety cap (VRAM guards still hold)
+    tile_assign_stride: int = 8          # depth-pixel subsample for view→tile assignment
+    tile_assign_min_frac: float = 0.005  # assign a view when ≥ this fraction of its fg …
+    tile_assign_min_px: int = 24         # … or ≥ this many strided fg pixels land in the tile
+    # LOD ladder exported beside trained.ply (module docstring §LOD EXPORT):
+    # levels stop early once a level would hold ≤ `lod_min_count`. 0 disables.
+    lod_levels: int = 3
+    lod_min_count: int = 150_000
+
     @property
     def resolved_refine_stop(self) -> int:
         return self.refine_stop_iter if self.refine_stop_iter is not None else int(self.iterations * 0.5)
+
+    @property
+    def resolved_tile_budget(self) -> int:
+        """Seed count above which the run tiles (0 = tiling disabled)."""
+        if self.tile_max is not None:
+            return max(int(self.tile_max), 0)
+        return max(int(self.cap_max * 2 / 3), 1)
 
     def as_summary(self) -> dict[str, Any]:
         return {
@@ -252,6 +303,9 @@ class TrainParams:
             "depth_densify_max": self.depth_densify_max,
             "batch": self.batch,
             "ckpt_every": self.ckpt_every,
+            "tile_budget": self.resolved_tile_budget,
+            "tile_margin_frac": self.tile_margin_frac,
+            "lod_levels": self.lod_levels,
         }
 
 
@@ -503,7 +557,7 @@ def _load_view(torch, view: dict[str, Any], device):  # noqa: ANN001
     return rgb, alpha, depth
 
 
-def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, start_step: int = 0):  # noqa: ANN001
+def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, start_step: int = 0, stop=None):  # noqa: ANN001
     """Infinite stream of training batches — `(viewmats [B,4,4], rgb [B,H,W,3],
     alpha [B,H,W,1], depth [B,H,W,1] | None)` on `device`, B views each.
 
@@ -520,7 +574,9 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, st
     PNG decode + stacking) for the NEXT batch while the GPU trains on the current
     one, so the render loop never stalls on disk. The host→device copy stays
     synchronous (the decode is the real cost), which keeps it correct with no
-    tensor-lifetime traps."""
+    tensor-lifetime traps. `stop` (a threading.Event) lets a caller that abandons
+    the stream mid-epoch (tiled runs train many streams per process) release the
+    worker thread and its queued batches instead of leaking them."""
     n = len(views)
 
     def epoch_perm(e: int) -> np.ndarray:
@@ -574,8 +630,15 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, st
     def worker() -> None:
         idx_gen = draw_indices(start_step * batch)
         try:
-            while True:
-                q.put(decode_batch(idx_gen))  # blocks when the queue is full
+            while stop is None or not stop.is_set():
+                item = decode_batch(idx_gen)
+                while True:  # bounded put so a set `stop` can't strand a full queue
+                    try:
+                        q.put(item, timeout=0.5)
+                        break
+                    except queue.Full:
+                        if stop is not None and stop.is_set():
+                            return
         except Exception as exc:  # surface to the main thread rather than deadlock
             q.put(exc)
 
@@ -704,14 +767,16 @@ def _aa_scale_floor(torch, splats, cam_tree, focal, aa_min_px):  # noqa: ANN001
     return float(np.median(floor_r))
 
 
-def _depth_seed(torch, gt_rgb, gt_alpha, gt_depth, pred_alpha, pred_depth, viewmats, K, params, max_new):  # noqa: ANN001
+def _depth_seed(torch, gt_rgb, gt_alpha, gt_depth, pred_alpha, pred_depth, viewmats, K, params, max_new, box=None):  # noqa: ANN001
     """Seed Gaussians at reference-depth surfaces the splat is missing. Per batched
     view: pixels with a reference opaque surface (gt_alpha > alpha_gate, gt_depth > 0)
     that the render doesn't cover (pred_alpha < miss_alpha) or resolves well BEHIND
     (pred_depth > gt_depth·(1+tol)) are unprojected to world at the reference depth
     (OpenCV: x=(px−cx)/fx·d, y=(py−cy)/fy·d, z=d; world = c2w·p_cam) and returned as
     new-Gaussian tensors (colour = reference albedo, normal toward the camera, scale
-    from the pixel footprint). None when nothing is deficient / no budget."""
+    from the pixel footprint). None when nothing is deficient / no budget. `box`
+    ((lo, hi) device tensors) clips seeds to a tile's expanded region — a tiled run
+    must not grow Gaussians for surface a neighbouring tile owns."""
     if gt_depth is None or max_new <= 0:
         return None
     device = gt_rgb.device
@@ -736,6 +801,11 @@ def _depth_seed(torch, gt_rgb, gt_alpha, gt_depth, pred_alpha, pred_depth, viewm
         p_cam = torch.stack([x, y, d], dim=1)                       # [K,3] OpenCV camera frame
         c2w = torch.linalg.inv(viewmats[b])
         world = p_cam @ c2w[:3, :3].transpose(0, 1) + c2w[:3, 3]    # [K,3]
+        if box is not None:
+            inb = ((world >= box[0]) & (world <= box[1])).all(dim=1)
+            if not bool(inb.any()):
+                continue
+            row, col, d, world = row[inb], col[inb], d[inb], world[inb]
         normal = c2w[:3, 3][None, :] - world                        # face the camera that saw it
         normal = normal / (normal.norm(dim=1, keepdim=True) + 1e-12)
         pos_l.append(world)
@@ -759,6 +829,484 @@ def _depth_seed(torch, gt_rgb, gt_alpha, gt_depth, pred_alpha, pred_depth, viewm
     return {"means": means, "scales": scales, "quats": quats, "opacities": opac, "sh0": sh0}
 
 
+# --- tiled training (scenes past the single-GPU VRAM wall) + LOD export --------
+
+
+@dataclass(frozen=True)
+class _TileGrid:
+    """Ground-plane (x,z) tiling. CORE cells partition space exactly (clamped
+    floor-division ownership, so boundary/fly-away points always belong to
+    exactly one cell); each tile TRAINS its core plus a `margin` context ring,
+    and the merge keeps core-owned Gaussians only — overlaps never double-ship."""
+
+    lo: tuple[float, float]      # grid origin (min x, min z)
+    step: tuple[float, float]    # cell size per axis (m)
+    k: tuple[int, int]           # cells per axis
+    margin: float                # trained-context ring (m)
+    y: tuple[float, float]       # vertical bounds shared by every expanded box
+
+    @property
+    def n_tiles(self) -> int:
+        return self.k[0] * self.k[1]
+
+    def owner(self, means: np.ndarray) -> np.ndarray:
+        """Flat core-cell index per point (clamped at the rim)."""
+        ix = np.clip(((means[:, 0] - self.lo[0]) / self.step[0]).astype(np.int64), 0, self.k[0] - 1)
+        iz = np.clip(((means[:, 2] - self.lo[1]) / self.step[1]).astype(np.int64), 0, self.k[1] - 1)
+        return ix * self.k[1] + iz
+
+    def expanded_box(self, t: int) -> tuple[np.ndarray, np.ndarray]:
+        """World AABB a tile trains (core + margin ring, full height)."""
+        ix, iz = divmod(t, self.k[1])
+        lo = np.array(
+            [self.lo[0] + ix * self.step[0] - self.margin, self.y[0],
+             self.lo[1] + iz * self.step[1] - self.margin],
+            dtype=np.float64,
+        )
+        hi = np.array(
+            [self.lo[0] + (ix + 1) * self.step[0] + self.margin, self.y[1],
+             self.lo[1] + (iz + 1) * self.step[1] + self.margin],
+            dtype=np.float64,
+        )
+        return lo, hi
+
+    def signature(self, n_init: int, params: TrainParams) -> str:
+        """Cache key for per-tile results: any change to the cloud, the grid, or
+        the training length invalidates cached tiles."""
+        return (
+            f"{n_init}:{self.k[0]}x{self.k[1]}:{self.margin:.3f}"
+            f":{params.iterations}:{params.sh_degree}:{params.resolved_tile_budget}"
+        )
+
+
+def _plan_tiles(
+    means: np.ndarray,
+    budget: int,
+    margin_frac: float,
+    margin_min: float,
+    margin_max: float,
+    max_tiles: int,
+) -> _TileGrid:
+    """Smallest ground-plane grid whose largest EXPANDED tile (core + margin ring)
+    holds ≤ `budget` seeds: start 1×1 and repeatedly split the axis with the longer
+    cell side. Counting the seeds themselves means density skew (a packed corner)
+    splits further while empty water/air adds no tiles. The margin rides the cell
+    size (clamped to physical bounds and < half a cell, so a point reaches at most
+    the adjacent cell's ring); `max_tiles` caps the loop — the VRAM guards still
+    bound whatever the worst tile does."""
+    x = means[:, 0].astype(np.float64)
+    z = means[:, 2].astype(np.float64)
+    lo = (float(x.min()), float(z.min()))
+    ext = (max(float(x.max()) - lo[0], 1e-6), max(float(z.max()) - lo[1], 1e-6))
+    y = (float(means[:, 1].min()) - margin_max, float(means[:, 1].max()) + margin_max)
+
+    kx = kz = 1
+    while True:
+        step = (ext[0] / kx, ext[1] / kz)
+        margin = float(np.clip(margin_frac * min(step), margin_min, min(margin_max, 0.45 * min(step))))
+        ix = np.clip((x - lo[0]) / step[0], 0, kx - 1e-9).astype(np.int64)
+        iz = np.clip((z - lo[1]) / step[1], 0, kz - 1e-9).astype(np.int64)
+        counts = np.zeros(kx * kz, dtype=np.int64)
+        # A point loads its own cell plus any neighbour whose margin band it sits
+        # in (margin < step/2 → only the 8 adjacent cells can qualify).
+        for ox in (-1, 0, 1):
+            for oz in (-1, 0, 1):
+                jx, jz = ix + ox, iz + oz
+                ok = (jx >= 0) & (jx < kx) & (jz >= 0) & (jz < kz)
+                if ox != 0:
+                    edge = lo[0] + (jx + (1 if ox < 0 else 0)) * step[0]
+                    ok &= np.abs(x - edge) <= margin
+                if oz != 0:
+                    edge = lo[1] + (jz + (1 if oz < 0 else 0)) * step[1]
+                    ok &= np.abs(z - edge) <= margin
+                if ok.any():
+                    counts += np.bincount(jx[ok] * kz + jz[ok], minlength=kx * kz)
+        if int(counts.max()) <= budget or kx * kz >= max_tiles:
+            if int(counts.max()) > budget:
+                logging.getLogger(__name__).warning(
+                    "stage6: tile split capped at %d tiles with %d seeds in the worst "
+                    "tile (budget %d) — the VRAM guards will bound that tile's growth",
+                    kx * kz, int(counts.max()), budget,
+                )
+            return _TileGrid(lo, step, (kx, kz), margin, y)
+        if step[0] >= step[1]:
+            kx += 1
+        else:
+            kz += 1
+
+
+def _frustum_sees(c2w: np.ndarray, K_np: np.ndarray, width: int, height: int, box) -> bool:  # noqa: ANN001
+    """Fallback view→tile test for reference sets WITHOUT depth (legacy): does the
+    camera plausibly see the box? True when the camera sits inside it or any box
+    corner projects into the (padded) image in front of the camera. Coarser than
+    the depth-exact assignment — it can only over-assign, never starve a tile."""
+    lo, hi = box
+    c = c2w[:3, 3]
+    if bool(np.all(c >= lo) and np.all(c <= hi)):
+        return True
+    corners = np.array([[cx, cy, cz] for cx in (lo[0], hi[0]) for cy in (lo[1], hi[1]) for cz in (lo[2], hi[2])])
+    p_cam = (corners - c) @ c2w[:3, :3]  # R.T rows applied — camera-frame points
+    zed = p_cam[:, 2]
+    front = zed > 1e-6
+    if not front.any():
+        return False
+    u = K_np[0, 0] * p_cam[front, 0] / zed[front] + K_np[0, 2]
+    v = K_np[1, 1] * p_cam[front, 1] / zed[front] + K_np[1, 2]
+    pad_w, pad_h = 0.2 * width, 0.2 * height
+    return bool(((u >= -pad_w) & (u <= width + pad_w) & (v >= -pad_h) & (v <= height + pad_h)).any())
+
+
+def _assign_views(  # noqa: ANN001
+    views,
+    grid: _TileGrid,
+    K_np: np.ndarray,
+    width: int,
+    height: int,
+    stride: int,
+    min_frac: float,
+    min_px: int,
+    progress: ProgressCb | None,
+) -> list[list[int]]:
+    """Which reference views supervise each tile: a view is assigned wherever its
+    (strided) foreground depth pixels unproject into the tile's EXPANDED box — the
+    same exact-ownership signal the loss mask uses, so every assigned view has real
+    work and no tile trains against cameras that can't see it. Views without depth
+    fall back to the frustum test; pure-background views supervise nothing."""
+    fx, fy, cx, cy = K_np[0, 0], K_np[1, 1], K_np[0, 2], K_np[1, 2]
+    boxes = [grid.expanded_box(t) for t in range(grid.n_tiles)]
+    lo_all = np.stack([b[0] for b in boxes])  # [T,3]
+    hi_all = np.stack([b[1] for b in boxes])
+    assigned: list[list[int]] = [[] for _ in range(grid.n_tiles)]
+    n = len(views)
+    for i, v in enumerate(views):
+        if progress is not None and i % 250 == 0:
+            progress(i, n, f"assigning views to tiles ({i}/{n})")
+        try:
+            _rgb, alpha, depth = _view_arrays(v)
+        except Exception:
+            alpha, depth = None, None
+        if depth is None or alpha is None:
+            for t in range(grid.n_tiles):
+                if _frustum_sees(v["c2w"], K_np, width, height, boxes[t]):
+                    assigned[t].append(i)
+            continue
+        a = alpha[::stride, ::stride, 0]
+        d = depth[::stride, ::stride, 0]
+        fg = (a > 0.01) & (d > 0)
+        total = int(fg.sum())
+        if total == 0:
+            continue
+        rr, cc = np.nonzero(fg)
+        dz = d[fg].astype(np.float64)
+        px = (cc * stride + 0.5 - cx) / fx * dz
+        py = (rr * stride + 0.5 - cy) / fy * dz
+        c2w = v["c2w"]
+        world = np.stack([px, py, dz], axis=1) @ c2w[:3, :3].T + c2w[:3, 3]
+        inb = (world[None, :, :] >= lo_all[:, None, :]).all(-1)
+        inb &= (world[None, :, :] <= hi_all[:, None, :]).all(-1)  # [T,P]
+        need = max(min_px, int(np.ceil(min_frac * total)))
+        for t in np.nonzero(inb.sum(axis=1) >= need)[0]:
+            assigned[int(t)].append(i)
+    return assigned
+
+
+def _unproject_depth(torch, gt_depth, viewmats, K, px, py):  # noqa: ANN001
+    """Reference depth → world points [B,H,W,3] (OpenCV pinhole; `px`/`py` are the
+    precomputed pixel-centre grids). Zero-depth (background) pixels land at the
+    camera centre — callers gate on depth > 0."""
+    d = gt_depth[..., 0]
+    x = (px[None] - K[0, 2]) / K[0, 0] * d
+    y = (py[None] - K[1, 2]) / K[1, 1] * d
+    p_cam = torch.stack([x, y, d], dim=-1)
+    c2w = torch.linalg.inv(viewmats)
+    return torch.einsum("bhwc,brc->bhwr", p_cam, c2w[:, :3, :3]) + c2w[:, None, None, :3, 3]
+
+
+def _tile_mask(torch, lo, hi, gt_alpha, gt_depth, world):  # noqa: ANN001
+    """Per-pixel supervision mask [B,H,W,1] for one tile: TRUE-BACKGROUND pixels
+    (empty along the whole ray — every tile must keep its airspace clear) plus
+    pixels whose reference surface lies INSIDE the tile's expanded box (content
+    this tile owns). Foreground owned by other tiles is excluded: supervising it
+    would drag boundary Gaussians toward content this tile cannot represent (the
+    classic tiling haze)."""
+    bg = gt_alpha[..., 0] <= 0.005
+    inbox = (world >= lo).all(-1) & (world <= hi).all(-1)
+    owned = (gt_depth[..., 0] > 0.0) & inbox
+    return (bg | owned).unsqueeze(-1).float()
+
+
+def _train_tiled(  # noqa: ANN001
+    torch,
+    F,
+    views,
+    K,
+    width: int,
+    height: int,
+    init: dict[str, np.ndarray],
+    grid: _TileGrid,
+    scene_scale: float,
+    params: TrainParams,
+    resume: bool,
+    ckpt_root: Path,
+    progress: ProgressCb | None,
+) -> tuple[dict[str, np.ndarray], list[dict[str, Any]]]:
+    """Train the scene one tile at a time — each within the VRAM budget, each with
+    the FULL densification headroom a monolithic run would have had to share — and
+    merge by core ownership. Per-tile results are cached (`ckpt/tiles/tile_NNN.npz`)
+    under a params signature, so an interrupted run resumes at the first unfinished
+    tile; a signature mismatch discards the stale cache. Tiles whose seeds no view
+    supervises pass their init through untouched (exactly what an unsupervised
+    region does in a single run — no gradient ever reaches it).
+
+    Per-tile ITERATIONS scale with the tile's supervision share (2× its fraction
+    of the plan's views, floored at 20%, capped at 100% of `params.iterations`):
+    a tile that sees a twentieth of the views converges in far fewer steps than
+    the whole scene needs, so total wall clock stays a few × a single run rather
+    than n_tiles ×, while every tile keeps full densification headroom. All
+    step-derived schedules (refine window, LR decay, depth-seed window) ride the
+    scaled count automatically."""
+    import gc
+    import shutil
+    from dataclasses import replace
+
+    K_np = K.detach().cpu().numpy().astype(np.float64)
+    owner = grid.owner(init["means"])
+    core_counts = np.bincount(owner, minlength=grid.n_tiles)
+    live = [t for t in range(grid.n_tiles) if core_counts[t] > 0]
+    n_init = int(init["means"].shape[0])
+    bands = (params.sh_degree + 1) ** 2
+
+    assigned = _assign_views(
+        views, grid, K_np, width, height, params.tile_assign_stride,
+        params.tile_assign_min_frac, params.tile_assign_min_px, progress,
+    )
+
+    tiles_dir = ckpt_root / "tiles"
+    manifest_path = tiles_dir / "tiles.json"
+    sig = grid.signature(n_init, params)
+    manifest: dict[str, Any] = {"signature": sig, "done": {}}
+    if not resume:
+        shutil.rmtree(ckpt_root, ignore_errors=True)
+    elif manifest_path.is_file():
+        try:
+            old = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if old.get("signature") == sig:
+                manifest = old
+            else:
+                shutil.rmtree(ckpt_root, ignore_errors=True)
+        except Exception:
+            shutil.rmtree(ckpt_root, ignore_errors=True)
+    tiles_dir.mkdir(parents=True, exist_ok=True)
+
+    def save_manifest() -> None:
+        tmp = manifest_path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
+        tmp.replace(manifest_path)
+
+    # Per-tile iterations ∝ supervision share (see docstring): 2× the tile's
+    # view fraction, floored at 20% and 200 steps, capped at the full schedule.
+    def tile_iters(n_assigned: int) -> int:
+        share = n_assigned / max(len(views), 1)
+        return max(200, int(round(params.iterations * min(1.0, max(0.2, 2.0 * share)))))
+
+    iters = [tile_iters(len(assigned[t])) if assigned[t] else 0 for t in live]
+    offsets = np.concatenate([[0], np.cumsum(iters)])
+    grand_total = max(int(offsets[-1]), 1)
+
+    parts: list[dict[str, np.ndarray]] = []
+    infos: list[dict[str, Any]] = []
+    for pos, t in enumerate(live):
+        tag = f"tile {pos + 1}/{len(live)}"
+        npz_path = tiles_dir / f"tile_{t:03d}.npz"
+        cached = manifest["done"].get(str(t))
+        if cached is not None and npz_path.is_file():
+            with np.load(npz_path) as zf:
+                parts.append({k: zf[k] for k in zf.files})
+            infos.append(cached)
+            if progress is not None:
+                progress(int(offsets[pos + 1]), grand_total,
+                         f"[{tag}] cached ({cached['final']} splats)")
+            continue
+
+        lo, hi = grid.expanded_box(t)
+        lo32, hi32 = lo.astype(np.float32), hi.astype(np.float32)
+        sel = ((init["means"] >= lo32).all(axis=1)) & ((init["means"] <= hi32).all(axis=1))
+        sub = {k: v[sel] for k, v in init.items()}
+        vidx = assigned[t]
+
+        if not vidx:
+            core = grid.owner(sub["means"]) == t
+            arrays = {k: v[core] for k, v in sub.items()}
+            if bands > 1:
+                arrays["shN"] = np.zeros((int(core.sum()), bands - 1, 3), dtype=np.float32)
+            info: dict[str, Any] = {
+                "tile": t, "init": int(sel.sum()), "final": int(core.sum()),
+                "seeded": 0, "pruned": 0, "views": 0, "iters": 0,
+                "skipped": "no views see this tile",
+            }
+            logging.getLogger(__name__).warning(
+                "stage6: %s has %d seeds but no assigned views — passing its init through",
+                tag, int(sel.sum()),
+            )
+        else:
+            torch.manual_seed(params.seed + t)
+            t_params = replace(params, iterations=iters[pos])
+            base = int(offsets[pos])
+
+            def tile_progress(done_s: int, total_s: int, msg: str, _base=base, _tag=tag) -> None:
+                if progress is not None:
+                    progress(_base + done_s, grand_total, f"[{_tag}] {msg}")
+
+            arrays, tinfo = _train_one(
+                torch, F, [views[i] for i in vidx], K, width, height, sub,
+                scene_scale, np.stack([views[i]["c2w"][:3, 3] for i in vidx]),
+                t_params, resume, ckpt_root / f"tile_{t:03d}",
+                tile_progress if progress is not None else None,
+                tile_box=(lo, hi),
+            )
+            core = grid.owner(arrays["means"]) == t
+            arrays = {k: v[core] for k, v in arrays.items()}
+            info = {"tile": t, **tinfo, "final": int(arrays["means"].shape[0]), "iters": iters[pos]}
+            shutil.rmtree(ckpt_root / f"tile_{t:03d}", ignore_errors=True)
+            torch.cuda.empty_cache()
+            gc.collect()
+
+        tmp = tiles_dir / f".tile_{t:03d}.tmp.npz"
+        np.savez(tmp, **arrays)
+        tmp.replace(npz_path)
+        parts.append(arrays)
+        infos.append(info)
+        manifest["done"][str(t)] = info
+        save_manifest()
+
+    merged = {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]}
+    return merged, infos
+
+
+def _lod_aggregate(arrays: dict[str, np.ndarray], voxel: float) -> dict[str, np.ndarray]:
+    """One LOD octave: Gaussians sharing a `voxel` collapse to ONE whose first two
+    moments match the cluster's opacity·area-weighted mixture — mean and covariance
+    (each disk's R·diag(s²)·Rᵀ plus the spread of the means) — with the tangent
+    frame recovered by eigendecomposition. Colour is the same weighted mean, and
+    opacity preserves the cluster's opacity·area within the new disk (a fully
+    covered patch stays opaque; sparse glass stays translucent). Sub-pixel detail
+    thereby collapses to its prefiltered average — the same reason mip maps beat
+    point-sampling minified textures."""
+    means = arrays["means"].astype(np.float64)
+    q = arrays["quats"].astype(np.float64)
+    q /= np.linalg.norm(q, axis=1, keepdims=True) + 1e-12
+    s = np.exp(arrays["scales"].astype(np.float64)[:, :2])
+    alpha = 1.0 / (1.0 + np.exp(-arrays["opacities"].astype(np.float64)))
+    col = arrays["sh0"].reshape(-1, 3).astype(np.float64)
+
+    ids = np.floor((means - means.min(axis=0, keepdims=True)) / voxel).astype(np.int64)
+    _, inv = np.unique(ids, axis=0, return_inverse=True)
+    m = int(inv.max()) + 1
+
+    w = np.maximum(alpha * s[:, 0] * s[:, 1], 1e-12)  # opacity·area
+    wsum = np.bincount(inv, weights=w, minlength=m)
+
+    def wmean(v: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [np.bincount(inv, weights=w * v[:, j], minlength=m) for j in range(v.shape[1])],
+            axis=1,
+        ) / wsum[:, None]
+
+    mu = wmean(means)
+    color = wmean(col)
+
+    # Per-Gaussian covariance R·diag(s1²,s2²,0)·Rᵀ from the (wxyz) quats.
+    ww, xx, yy, zz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    R = np.empty((len(q), 3, 3))
+    R[:, 0, 0] = 1 - 2 * (yy * yy + zz * zz)
+    R[:, 0, 1] = 2 * (xx * yy - ww * zz)
+    R[:, 0, 2] = 2 * (xx * zz + ww * yy)
+    R[:, 1, 0] = 2 * (xx * yy + ww * zz)
+    R[:, 1, 1] = 1 - 2 * (xx * xx + zz * zz)
+    R[:, 1, 2] = 2 * (yy * zz - ww * xx)
+    R[:, 2, 0] = 2 * (xx * zz - ww * yy)
+    R[:, 2, 1] = 2 * (yy * zz + ww * xx)
+    R[:, 2, 2] = 1 - 2 * (xx * xx + yy * yy)
+    lam = np.zeros((len(q), 3))
+    lam[:, 0] = s[:, 0] ** 2
+    lam[:, 1] = s[:, 1] ** 2
+    cov = np.einsum("nij,nj,nkj->nik", R, lam, R)
+
+    # Cluster covariance = E[C + μμᵀ] − μ̄μ̄ᵀ (moment matching), accumulated per
+    # unique symmetric entry.
+    second = cov + means[:, :, None] * means[:, None, :]
+    ccov = np.zeros((m, 3, 3))
+    for a_i in range(3):
+        for b_i in range(a_i, 3):
+            v = np.bincount(inv, weights=w * second[:, a_i, b_i], minlength=m) / wsum
+            ccov[:, a_i, b_i] = v
+            ccov[:, b_i, a_i] = v
+    ccov -= mu[:, :, None] * mu[:, None, :]
+    ccov += np.eye(3)[None] * 1e-12
+
+    evals, evecs = np.linalg.eigh(ccov)  # ascending
+    r1 = np.sqrt(np.maximum(evals[:, 2], 1e-12))
+    r2 = np.sqrt(np.maximum(evals[:, 1], 1e-12))
+    frame = np.stack([evecs[:, :, 2], evecs[:, :, 1], evecs[:, :, 0]], axis=2)
+    neg = np.linalg.det(frame) < 0
+    frame[neg, :, 1] *= -1.0
+    from scipy.spatial.transform import Rotation
+
+    qn = Rotation.from_matrix(frame).as_quat()  # xyzw
+    quats = np.concatenate([qn[:, 3:4], qn[:, :3]], axis=1)
+
+    alpha_new = np.clip(wsum / np.maximum(r1 * r2, 1e-12), 0.02, 0.995)
+    logit = np.log(alpha_new / (1.0 - alpha_new))
+    log_r = np.log(np.stack([r1, r2], axis=1))
+    third = log_r.min(axis=1, keepdims=True) + np.log(0.01)
+    return {
+        "means": mu.astype(np.float32),
+        "quats": quats.astype(np.float32),
+        "opacities": logit.astype(np.float32),
+        "sh0": color.astype(np.float32).reshape(-1, 1, 3),
+        "scales": np.concatenate([log_r, third], axis=1).astype(np.float32),
+    }
+
+
+def _export_lod(  # noqa: ANN001
+    arrays: dict[str, np.ndarray],
+    out_path: Path,
+    params: TrainParams,
+    progress: ProgressCb | None,
+) -> list[dict[str, Any]] | None:
+    """Write the LOD ladder beside the trained splat (`trained.lod1.ply`, …): each
+    level ~4× fewer via `_lod_aggregate` at a doubling voxel, stopping once a level
+    reaches `lod_min_count`. Same 2DGS layout as trained.ply, so every existing
+    viewer/compressor reads the levels unchanged (SH0 — the ladder is unlit like
+    the base). Stale lod files from earlier runs are removed first."""
+    for old in out_path.parent.glob(f"{out_path.stem}.lod*.ply"):
+        old.unlink(missing_ok=True)
+    if params.lod_levels <= 0:
+        return None
+    out: list[dict[str, Any]] = []
+    cur = arrays
+    # 2× the median disk radius ≈ one 2×2-neighbour cluster per voxel on a
+    # surface — the ~4×-per-octave reduction the ladder documents.
+    base_voxel = 2.0 * float(np.median(np.exp(arrays["scales"][:, :2]).max(axis=1)))
+    for level in range(1, params.lod_levels + 1):
+        if int(cur["means"].shape[0]) <= params.lod_min_count:
+            break
+        if progress is not None:
+            progress(1, 1, f"LOD {level}: aggregating {int(cur['means'].shape[0])} splats")
+        cur = _lod_aggregate(cur, base_voxel * (2.0 ** (level - 1)))
+        path = out_path.with_name(f"{out_path.stem}.lod{level}.ply")
+        quats = cur["quats"] / (np.linalg.norm(cur["quats"], axis=1, keepdims=True) + 1e-12)
+        _encode_trained_ply(
+            cur["means"], quats.astype(np.float32), cur["sh0"].reshape(-1, 3),
+            cur["opacities"], cur["scales"][:, :2], path,
+        )
+        out.append({
+            "level": level, "splats": int(cur["means"].shape[0]),
+            "bytes": path.stat().st_size, "path": path.name,
+        })
+    return out or None
+
+
 def train_splat(
     *,
     run: str,
@@ -772,15 +1320,21 @@ def train_splat(
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
     """Fine-tune the Stage-3 surfel cloud at `cloud_path` against the Stage-5
-    references in `refs_dir`, writing the optimized 2DGS splat to `out_path`.
-    Requires a CUDA GPU + gsplat (raises a clear error otherwise). Returns a
-    compact summary (init/final splat counts, final metrics, bytes).
+    references in `refs_dir`, writing the optimized 2DGS splat to `out_path`
+    (plus the `trained.lodK.ply` ladder). Requires a CUDA GPU + gsplat (raises a
+    clear error otherwise). Returns a compact summary (init/final splat counts,
+    per-tile breakdown when tiled, final metrics, bytes).
 
-    With `resume` (default), continues from the latest `splat/ckpt/` checkpoint when
-    one is present and compatible (same SH config); otherwise starts from the surfel
-    init. Pass `resume=False` to ignore any checkpoint and train from scratch."""
-    torch, F, gsplat = _require_cuda_trainer()
-    from gsplat import DefaultStrategy, rasterization_2dgs
+    Seeds larger than `params.resolved_tile_budget` train TILED (module docstring
+    §TILED TRAINING): ground-plane cells trained one at a time — each fits VRAM
+    with densification headroom a monolithic run wouldn't have — then merged by
+    core ownership. Smaller seeds keep the single-run path unchanged.
+
+    With `resume` (default), continues from the latest `splat/ckpt/` checkpoint
+    when present and compatible (same SH config); tiled runs additionally resume
+    at the first unfinished tile (`splat/ckpt/tiles/`). `resume=False` starts
+    fresh."""
+    torch, F, _ = _require_cuda_trainer()
 
     cloud_path, refs_dir, out_path = Path(cloud_path), Path(refs_dir), Path(out_path)
     if not cloud_path.is_file():
@@ -805,7 +1359,7 @@ def train_splat(
     # step). Current sets carry ONE SZF frame per view (`frame_path`); legacy
     # PNG-triple sets (`file_path`/`alpha_path`/`depth_path`) stay trainable.
     # `near`/`far` (shared across the plan) decode the log-uint16 depth codes
-    # back to metric metres.
+    # back to metric metres. `c2w` is kept for tile view-assignment.
     depth_near = float(doc["near"]) if "near" in doc else None
     depth_far = float(doc["far"]) if "far" in doc else None
     views: list[dict[str, Any]] = []
@@ -823,6 +1377,7 @@ def train_splat(
         views.append(
             {
                 "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
+                "c2w": c2w,
                 "frame": refs_dir / frame_rel if frame_rel else None,
                 "rgb": refs_dir / rgb_rel if rgb_rel else None,
                 "alpha": refs_dir / fr["alpha_path"] if fr.get("alpha_path") else None,
@@ -837,19 +1392,141 @@ def train_splat(
     init = _load_cloud(cloud_path)
     n_init = int(init["means"].shape[0])
 
-    # Scene scale = camera-cloud radius (× 1.1), the 3DGS spatial LR / density unit.
+    # Scene scale = camera-cloud radius (× 1.1), the 3DGS spatial LR / density
+    # unit — GLOBAL even when tiled, so every tile's thresholds match the
+    # single-run semantics.
     centers = np.stack(cam_centers, axis=0)
     scene_scale = float(np.linalg.norm(centers - centers.mean(0), axis=1).max()) if n_views > 1 else 0.0
     if scene_scale <= 1e-6:
         scene_scale = float(np.linalg.norm(init["means"].max(0) - init["means"].min(0))) * 0.5
     scene_scale = max(scene_scale * 1.1, 1e-3)
 
+    # Single run when the seed fits the budget; otherwise plan the tile grid.
+    ckpt_root = _ckpt_dir(out_path)
+    budget = params.resolved_tile_budget
+    grid = None
+    if budget > 0 and n_init > budget:
+        grid = _plan_tiles(
+            init["means"], budget, params.tile_margin_frac,
+            params.tile_margin_min_m, params.tile_margin_max_m, params.tile_max_tiles,
+        )
+        if grid.n_tiles <= 1:
+            grid = None
+
+    t_start = time.perf_counter()
+    if grid is None:
+        arrays, one = _train_one(
+            torch, F, views, K, width, height, init, scene_scale, centers,
+            params, resume, ckpt_root, progress, tile_box=None,
+        )
+        tiles_summary = None
+        n_seeded, n_pruned = one["seeded"], one["pruned"]
+    else:
+        if progress is not None:
+            progress(
+                0, grid.n_tiles * params.iterations,
+                f"tiling: {n_init} seeds > budget {budget} -> {grid.k[0]}x{grid.k[1]} "
+                f"grid, margin {grid.margin:.2f}m",
+            )
+        arrays, tiles_summary = _train_tiled(
+            torch, F, views, K, width, height, init, grid, scene_scale,
+            params, resume, ckpt_root, progress,
+        )
+        n_seeded = int(sum(t["seeded"] for t in tiles_summary))
+        n_pruned = int(sum(t["pruned"] for t in tiles_summary))
+
+    n_final = int(arrays["means"].shape[0])
+
+    # Final metrics over a capped subset of ALL views against the merged model
+    # (OOM-guarded: a merged cloud too big to render skips metrics, not the run),
+    # then export the splat + its LOD ladder.
+    if progress is not None:
+        progress(
+            1, 1,
+            f"training done in {_fmt_hms(time.perf_counter() - t_start)} - "
+            f"evaluating {min(n_views, params.eval_max_views)} views + writing {out_path.name}",
+        )
+    metrics = None
+    try:
+        from gsplat import rasterization_2dgs
+
+        splats_t = {k: torch.from_numpy(v).to(device) for k, v in arrays.items()}
+        metrics = _evaluate(
+            torch, rasterization_2dgs, splats_t, views, K, width, height, params, device
+        )
+        del splats_t
+    except torch.cuda.OutOfMemoryError:
+        torch.cuda.empty_cache()
+        if progress is not None:
+            progress(1, 1, f"eval skipped: merged model ({n_final} splats) exceeds VRAM")
+
+    quats = arrays["quats"] / (np.linalg.norm(arrays["quats"], axis=1, keepdims=True) + 1e-12)
+    _encode_trained_ply(
+        arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
+        arrays["opacities"], arrays["scales"][:, :2], out_path,
+    )
+    lod_summary = _export_lod(arrays, out_path, params, progress)
+
+    # Training finished + the final splat is on disk → the checkpoints (and any
+    # tile caches under them) are obsolete; drop them so a later resume doesn't
+    # re-enter a completed run.
+    import shutil
+
+    shutil.rmtree(ckpt_root, ignore_errors=True)
+
+    return {
+        "run": run,
+        "slot": slot,
+        "model": model,
+        "splats_init": n_init,
+        "splats_final": n_final,
+        "splats_pruned_final": n_pruned,
+        "splats_depth_seeded": n_seeded,
+        "iterations": params.iterations,
+        "views": n_views,
+        "resolution": width,
+        "scene_scale": round(scene_scale, 4),
+        "tiles": tiles_summary,
+        "lod": lod_summary,
+        "metrics": metrics,
+        "params": params.as_summary(),
+        "bytes": out_path.stat().st_size,
+        "out_path": str(out_path),
+    }
+
+
+def _train_one(  # noqa: ANN001
+    torch,
+    F,
+    views,
+    K,
+    width: int,
+    height: int,
+    init: dict[str, np.ndarray],
+    scene_scale: float,
+    centers: np.ndarray,
+    params: TrainParams,
+    resume: bool,
+    ckpt_dir: Path,
+    progress: ProgressCb | None,
+    tile_box=None,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """ONE gsplat 2DGS optimization — the whole scene, or one tile — returning
+    `(trained arrays as numpy, counters)`. `tile_box` ((lo, hi) world corners of
+    the tile's expanded region) masks every loss to pixels this run OWNS (its own
+    surface + true background — `_tile_mask`) and clips depth-seeding to the box;
+    None trains unmasked, the single-run behavior. Checkpoints under `ckpt_dir`
+    (the caller owns cleanup)."""
+    from gsplat import DefaultStrategy, rasterization_2dgs
+
+    device = torch.device("cuda")
+    n_views = len(views)
+    n_init = int(init["means"].shape[0])
     bands = (params.sh_degree + 1) ** 2
 
     # Resume from the latest checkpoint when present + compatible (same SH config),
     # else build from the surfel init. `meta` guards against reloading a checkpoint
     # whose model shape no longer matches this cloud's SH bands.
-    ckpt_dir = _ckpt_dir(out_path)
     meta = {"sh_degree": params.sh_degree, "n_init": n_init}
     ckpt = _load_checkpoint(torch, ckpt_dir, device) if resume else None
     if ckpt is not None and ckpt.get("meta", {}).get("sh_degree") != params.sh_degree:
@@ -946,10 +1623,33 @@ def train_splat(
     t_start = t_last = time.perf_counter()
     done_last = start_step
     log_every = max(params.log_every, 1)
-    stream = _view_stream(torch, views, device, max(params.batch, 1), params.prefetch, params.seed, start_step)
+    import threading
+
+    stop_ev = threading.Event()
+    stream = _view_stream(
+        torch, views, device, max(params.batch, 1), params.prefetch, params.seed,
+        start_step, stop=stop_ev,
+    )
+
+    # Tile-mask constants: the box corners on-device + pixel-centre grids for the
+    # per-batch depth unprojection. None → unmasked (single-run behavior).
+    box_lo = box_hi = px_grid = py_grid = None
+    if tile_box is not None:
+        box_lo = torch.tensor(tile_box[0], dtype=torch.float32, device=device)
+        box_hi = torch.tensor(tile_box[1], dtype=torch.float32, device=device)
+        ys = torch.arange(height, dtype=torch.float32, device=device) + 0.5
+        xs = torch.arange(width, dtype=torch.float32, device=device) + 0.5
+        py_grid, px_grid = torch.meshgrid(ys, xs, indexing="ij")
 
     for step in range(start_step, params.iterations):
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
+
+        # Tiled runs supervise only pixels this tile OWNS: its surface + true
+        # background (exact ownership from the reference depth).
+        mask = None
+        if box_lo is not None and gt_depth is not None:
+            world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
+            mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
 
         active_sh = min(step // max(params.sh_degree_interval, 1), params.sh_degree)
         colors, sh_deg = _render_inputs(torch, splats, active_sh)
@@ -982,18 +1682,31 @@ def train_splat(
         # Photometric: full-frame L1 + D-SSIM. Both sides are premultiplied-over-
         # black (the reference alpha-blends over a black clear colour; gsplat
         # composites with no background), so glass/MASK pixels compare like-with-
-        # like and background pixels directly penalize floater energy.
-        l1 = (pred_rgb - gt_rgb).abs().mean()
-        ssim = _ssim(F, pred_rgb.clamp(0, 1).permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
+        # like and background pixels directly penalize floater energy. Under a
+        # tile mask, L1 averages over owned pixels only and SSIM sees ground
+        # truth composited outside the mask (its windows carry no gradient from
+        # content a neighbouring tile owns).
+        if mask is None:
+            l1 = (pred_rgb - gt_rgb).abs().mean()
+            ssim_rgb = pred_rgb
+        else:
+            msum = mask.sum().clamp_min(1.0)
+            l1 = ((pred_rgb - gt_rgb).abs() * mask).sum() / (msum * 3.0)
+            ssim_rgb = torch.where(mask > 0, pred_rgb, gt_rgb.detach())
+        ssim = _ssim(F, ssim_rgb.clamp(0, 1).permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
         loss = (1.0 - params.ssim_lambda) * l1 + params.ssim_lambda * (1.0 - ssim)
 
         # Alpha (coverage/opacity) — the renderer's exact coverage masks.
         if params.alpha_lambda > 0.0:
-            loss = loss + params.alpha_lambda * (pred_alpha - gt_alpha).abs().mean()
+            aerr = (pred_alpha - gt_alpha).abs()
+            aloss = aerr.mean() if mask is None else (aerr * mask).sum() / mask.sum().clamp_min(1.0)
+            loss = loss + params.alpha_lambda * aloss
 
         # Depth — alpha-gated L1 (metres) on the `depth_mode` statistic.
         if gt_depth is not None and params.depth_lambda > 0.0:
             gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
+            if mask is not None:
+                gate = gate & (mask > 0)
             if gate.any():
                 dl = ((pred_depth - gt_depth).abs() * gate).sum() / (gate.sum() + 1e-8)
                 loss = loss + params.depth_lambda * dl
@@ -1001,9 +1714,11 @@ def train_splat(
         # 2DGS normal consistency (render normals vs normals-from-depth), fg only.
         if params.normal_lambda > 0.0 and step >= params.normal_start_iter:
             nerr = 1.0 - (normals * normals_from_depth).sum(dim=-1)
-            mask = gt_alpha.squeeze(-1) > params.alpha_gate
-            if mask.any():
-                loss = loss + params.normal_lambda * nerr[mask].mean()
+            fg_mask = gt_alpha.squeeze(-1) > params.alpha_gate
+            if mask is not None:
+                fg_mask = fg_mask & (mask.squeeze(-1) > 0)
+            if fg_mask.any():
+                loss = loss + params.normal_lambda * nerr[fg_mask].mean()
 
         # 2DGS depth distortion.
         if dist_on and step >= params.dist_start_iter:
@@ -1057,6 +1772,7 @@ def train_splat(
                 else _depth_seed(
                     torch, gt_rgb, gt_alpha, gt_depth, pred_alpha.detach(),
                     pred_depth.detach(), viewmats, K, params, int(params.depth_densify_max),
+                    box=(box_lo, box_hi) if box_lo is not None else None,
                 )
             )
             if new is not None:
@@ -1096,10 +1812,13 @@ def train_splat(
                 strat_state, meta, params.ckpt_keep,
             )
 
-    # One-shot cleanup prune before eval + export: densification stopped at
-    # refine_stop, so low-opacity floaters that drifted below prune_opa in the back
-    # half are still present. Prune once here so BOTH the reported metrics and the
-    # written splat reflect the shipped model.
+    # Release the prefetch worker (tiled runs create one stream per tile).
+    stop_ev.set()
+
+    # One-shot cleanup prune before returning: densification stopped at
+    # refine_stop, so low-opacity floaters that drifted below prune_opa in the
+    # back half are still present. Prune here so the returned model is the
+    # shipped one.
     n_pruned = (
         _final_prune(torch, splats, params.prune_opa, params.prune_scale3d, scene_scale)
         if params.final_prune
@@ -1112,53 +1831,17 @@ def train_splat(
             f"(-> {int(splats['means'].shape[0])} splats)",
         )
 
-    # Final metrics over a capped subset + write the splat.
-    if progress is not None:
-        progress(
-            params.iterations,
-            params.iterations,
-            f"training done in {_fmt_hms(time.perf_counter() - t_start)} - "
-            f"evaluating {min(n_views, params.eval_max_views)} views + writing {out_path.name}",
-        )
-    metrics = _evaluate(
-        torch, rasterization_2dgs, splats, views, K, width, height, params, device
-    )
-
     with torch.no_grad():
-        quats = torch.nn.functional.normalize(splats["quats"].detach(), dim=-1).cpu().numpy()
-        _encode_trained_ply(
-            splats["means"].detach().cpu().numpy(),
-            quats,
-            splats["sh0"].detach().cpu().numpy().reshape(-1, 3),
-            splats["opacities"].detach().cpu().numpy(),
-            splats["scales"].detach().cpu().numpy()[:, :2],
-            out_path,
-        )
-    # Training finished + the final splat is on disk → the periodic checkpoints are
-    # obsolete; drop them so a later resume doesn't re-enter a completed run.
-    import shutil
-
-    shutil.rmtree(ckpt_dir, ignore_errors=True)
-
-    n_final = int(splats["means"].shape[0])
-
-    return {
-        "run": run,
-        "slot": slot,
-        "model": model,
-        "splats_init": n_init,
-        "splats_final": n_final,
-        "splats_pruned_final": n_pruned,
-        "splats_depth_seeded": n_seeded,
-        "iterations": params.iterations,
+        arrays = {k: v.detach().cpu().numpy() for k, v in splats.items()}
+    info = {
+        "init": n_init,
+        "final": int(arrays["means"].shape[0]),
+        "seeded": n_seeded,
+        "pruned": n_pruned,
         "views": n_views,
-        "resolution": width,
-        "scene_scale": round(scene_scale, 4),
-        "metrics": metrics,
-        "params": params.as_summary(),
-        "bytes": out_path.stat().st_size,
-        "out_path": str(out_path),
+        "train_s": round(time.perf_counter() - t_start, 1),
     }
+    return arrays, info
 
 
 def _final_prune(torch, splats, prune_opa: float, prune_scale3d: float, scene_scale: float) -> int:  # noqa: ANN001
@@ -1270,6 +1953,15 @@ def _main() -> None:
         help="seed Gaussians at reference-depth surfaces the splat is missing",
     )
     ap.add_argument(
+        "--tile-max", type=int, default=None,
+        help="max seed Gaussians for a single run; larger clouds train as ground-"
+             "plane tiles and merge (default: 2/3 of cap_max; 0 disables tiling)",
+    )
+    ap.add_argument(
+        "--lod-levels", type=int, default=TrainParams.lod_levels,
+        help="LOD ladder levels exported beside trained.ply (0 disables)",
+    )
+    ap.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
         help="resume from the latest checkpoint beside --out (splat/ckpt) if present",
     )
@@ -1298,6 +1990,8 @@ def _main() -> None:
             vram_min_free_gb=args.vram_min_free_gb,
             antialias=args.antialias,
             depth_densify=args.depth_densify,
+            tile_max=args.tile_max,
+            lod_levels=args.lod_levels,
         ),
         resume=args.resume,
         progress=_log,
