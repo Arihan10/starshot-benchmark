@@ -41,6 +41,9 @@ const cellPath = (slot, model, tail = "") =>
 
 // Read a JSONL event log straight from the artifact server (full history,
 // cache.llm payloads included). Tolerates a torn final line written mid-flush.
+// The whole file becomes one string, so it's capped at V8's ~512 MB string
+// limit — fine for the compare/board/runcompare panels (small/older cells), but
+// the single-cell overlay uses the slim streaming path below instead.
 async function readEventsJsonl(rel) {
 	const res = await fetch(u(`/artifacts/${rel}`), { cache: "no-store" });
 	if (!res.ok) return [];
@@ -54,6 +57,43 @@ async function readEventsJsonl(rel) {
 			/* torn tail line mid-write */
 		}
 	}
+	return out;
+}
+
+// Stream a SLIM NDJSON event history (the server strips cache.llm prompt/output
+// bytes; see /events-history). Parsed line-by-line off the response stream, so a
+// multi-gigabyte scene's history never has to become a single JS string — the
+// ~512 MB string cap that made whole-file reads fail on large logs. Only one
+// line is ever held in `buf` at a time; heavy per-call bytes load lazily via
+// eventBytes(). Tolerates a torn final line written mid-flush.
+async function readEventsStream(url) {
+	const res = await fetch(url, { cache: "no-store" });
+	if (!res.ok) return [];
+	const reader = res.body.getReader();
+	const decoder = new TextDecoder();
+	const out = [];
+	let buf = "";
+	const push = (line) => {
+		const s = line.trim();
+		if (s) {
+			try {
+				out.push(JSON.parse(s));
+			} catch {
+				/* torn line mid-write */
+			}
+		}
+	};
+	for (;;) {
+		const { done, value } = await reader.read();
+		if (done) break;
+		buf += decoder.decode(value, { stream: true });
+		let nl;
+		while ((nl = buf.indexOf("\n")) !== -1) {
+			push(buf.slice(0, nl));
+			buf = buf.slice(nl + 1);
+		}
+	}
+	push(buf + decoder.decode());
 	return out;
 }
 
@@ -148,6 +188,14 @@ export const api = {
 		}),
 	pause: (run, slot, model) =>
 		request(cellPath(slot, model, "/pause"), {
+			method: "POST",
+			params: { run },
+		}),
+	// Graceful pause: stop issuing new LLM calls but let the in-flight call finish
+	// and commit before pausing (no re-run/re-bill on resume). Returns immediately
+	// with {status:"pausing"}; the cell flips to paused once the call drains.
+	pauseSoft: (run, slot, model) =>
+		request(cellPath(slot, model, "/pause-soft"), {
 			method: "POST",
 			params: { run },
 		}),
@@ -334,10 +382,21 @@ export const api = {
 			mode,
 			optimized: optimized === false ? 0 : undefined,
 		}).toString(),
-	// Full source-cell history backfill (cache.llm payloads included) from disk.
+	// Full source-cell history backfill (cache.llm payloads included) from disk —
+	// used by compare/board/runcompare, which render call bytes inline.
 	async eventsHistory(run, slot, model) {
 		return readEventsJsonl(`${run}/${slot}/${model}/events.jsonl`);
 	},
+	// SLIM source-cell history for the observability tree: the server strips
+	// cache.llm prompt/output bytes, so a multi-GB scene's tree loads; expand
+	// fetches a call's bytes on demand via eventBytes(). Used by the overlay.
+	async eventsHistorySlim(run, slot, model) {
+		return readEventsStream(u(cellPath(slot, model, "/events-history"), { run }).toString());
+	},
+	// The heavy bytes (system/user/output/reasoning/variables) for ONE call,
+	// fetched on demand when its tree row is expanded.
+	eventBytes: (run, slot, model, index) =>
+		request(cellPath(slot, model, "/event-bytes"), { params: { run, index } }),
 	artifactUrl: (path) => u(`/artifacts/${path}`).toString(),
 	absUrl: (path) => new URL(path, SERVER_URL).toString(),
 
@@ -358,6 +417,11 @@ export const api = {
 	async branchEventsHistory(run, bid) {
 		return readEventsJsonl(`${run}/_branches/${bid}/events.jsonl`);
 	},
+	async branchEventsHistorySlim(run, bid) {
+		return readEventsStream(u(`/branches/${encodeURIComponent(bid)}/events-history`).toString());
+	},
+	branchEventBytes: (bid, index) =>
+		request(`/branches/${encodeURIComponent(bid)}/event-bytes`, { params: { index } }),
 
 	// --- prompt lab ---
 	promptTemplates: (run) =>
@@ -478,9 +542,20 @@ export const api = {
 				filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
 			},
 		}),
+	// Bucketed request counts over the run's span — the activity chart.
+	flightHistogram: (run, filters) =>
+		request("/flights/histogram", {
+			params: {
+				run,
+				filters: filters && Object.keys(filters).length ? JSON.stringify(filters) : undefined,
+			},
+		}),
 	// The exact system/user prompt + output for ONE row, fetched lazily on
 	// opening its detail panel. `scene` is the row's `slot`.
 	flightDetail: (scene, id) => request("/flights/detail", { params: { scene, id } }),
+	// Resolve one flight row from a scene's cache.llm call (scene→log jump).
+	flightLocate: (scene, { generation_id, t_request } = {}) =>
+		request("/flights/locate", { params: { scene, generation_id, t_request } }),
 	// SSE tail of new rows for `run` (history comes from flightsPage).
 	flightsStreamUrl: (run) => u("/flights/stream", { run }).toString(),
 

@@ -284,8 +284,6 @@ export function createObsModel() {
     // zones (not just objects) an emitted_by, so the emittance lineage can climb
     // region→region all the way to the root.
     function recordProvenance(event) {
-        const out = event.output;
-        if (!out || typeof out !== "object") return;
         const relation =
             event.step === "child_bbox_batch" ||
             event.step === "object_bbox_batch"
@@ -306,6 +304,16 @@ export function createObsModel() {
             arr.push({ relation, call: event });
             model.provenance.set(cid, arr);
         };
+        // Slim history/live events carry the ids precomputed as `emitted` (the
+        // server extracted them from `output` before stripping the heavy bytes).
+        // Full events (compare/branch replays, legacy logs) still carry `output`,
+        // so fall back to walking it.
+        if (Array.isArray(event.emitted)) {
+            for (const cid of event.emitted) tag(cid);
+            return;
+        }
+        const out = event.output;
+        if (!out || typeof out !== "object") return;
         const tagList = (list) => {
             if (Array.isArray(list)) for (const x of list) tag(x?.id);
         };

@@ -1186,6 +1186,14 @@
 			#overlay-head .crumbs {
 				color: var(--text-faint);
 			}
+			#overlay-head .ov-to-logs {
+				color: var(--accent);
+				border-color: var(--accent-line);
+			}
+			#overlay-head .ov-to-logs:hover:not(:disabled) {
+				color: var(--accent);
+				background: var(--panel-2);
+			}
 			#overlay-status {
 				min-width: 0;
 				white-space: nowrap;
@@ -2030,6 +2038,21 @@
 				color: #e6d6ff;
 				border-color: var(--purple);
 				background: rgba(201, 166, 255, 0.16);
+			}
+			/* "log ↗" — jump to this call's api-log entry (obs dock + trace panel). */
+			.call-log {
+				font-size: 9px;
+				padding: 1px 7px;
+				color: var(--accent);
+				border: 1px solid var(--accent-line);
+				border-radius: 4px;
+				background: transparent;
+				white-space: nowrap;
+			}
+			.call-log:hover {
+				color: #d6ecff;
+				border-color: var(--accent);
+				background: rgba(154, 212, 255, 0.16);
 			}
 			/* obs dock emit-trace mode (root → object lineage of one node). */
 			.obs-call.emits .step-badge {
@@ -4325,7 +4348,7 @@
 				inset: 0;
 				display: none;
 				flex-direction: row;
-				z-index: 60;
+				z-index: 118; /* above the scene overlay (100) + tooltip (110), below modals (120), so the log can sit over an open scene */
 				--l-fg: #111827;
 				--l-muted: #6b7280;
 				--l-faint: #9ca3af;
@@ -4433,6 +4456,161 @@
 				color: var(--l-fg);
 				border-bottom-color: var(--l-accent);
 			}
+			/* filter bar (facet dropdowns) — matches the light theme */
+			.flog-filters {
+				display: flex;
+				flex-wrap: wrap;
+				align-items: center;
+				gap: 7px;
+				padding: 12px 22px 4px;
+				flex-shrink: 0;
+			}
+			.flog-facet-wrap {
+				position: relative;
+			}
+			.flog-facet {
+				display: flex;
+				align-items: center;
+				gap: 6px;
+				border: 1px solid var(--l-border);
+				border-radius: 7px;
+				background: #fff;
+				color: var(--l-muted);
+				font: inherit;
+				font-size: 12px;
+				padding: 5px 9px;
+				cursor: pointer;
+			}
+			.flog-facet:hover {
+				border-color: var(--l-faint);
+				color: var(--l-fg);
+			}
+			.flog-facet-wrap.active .flog-facet {
+				border-color: var(--l-accent);
+				color: var(--l-accent);
+				background: #f5f5ff;
+			}
+			.flog-facet-badge:not(:empty) {
+				min-width: 16px;
+				text-align: center;
+				padding: 0 4px;
+				border-radius: 9px;
+				background: var(--l-accent);
+				color: #fff;
+				font-size: 10px;
+				font-weight: 600;
+			}
+			.flog-facet-caret {
+				color: var(--l-faint);
+				font-size: 10px;
+			}
+			.flog-clear-all {
+				border: 1px solid var(--l-border);
+				border-radius: 7px;
+				background: #fff;
+				color: var(--l-red);
+				font: inherit;
+				font-size: 12px;
+				padding: 5px 9px;
+				cursor: pointer;
+			}
+			.flog-clear-all:hover {
+				border-color: var(--l-red);
+			}
+			.flog-pop {
+				position: absolute;
+				top: calc(100% + 5px);
+				left: 0;
+				z-index: 80;
+				width: 250px;
+				max-width: 80vw;
+				background: #fff;
+				border: 1px solid var(--l-border);
+				border-radius: 9px;
+				box-shadow: 0 10px 30px rgba(16, 24, 40, 0.14);
+				display: flex;
+				flex-direction: column;
+				overflow: hidden;
+			}
+			.flog-pop-search {
+				margin: 8px;
+				padding: 6px 8px;
+				border: 1px solid var(--l-border);
+				border-radius: 6px;
+				background: #fff;
+				color: var(--l-fg);
+				font: inherit;
+				font-size: 12px;
+			}
+			.flog-pop-search:focus {
+				outline: none;
+				border-color: var(--l-accent);
+			}
+			.flog-pop-list {
+				max-height: 300px;
+				overflow-y: auto;
+			}
+			.flog-pop-item {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 6px 12px;
+				cursor: pointer;
+				font-size: 12.5px;
+				color: var(--l-fg);
+			}
+			.flog-pop-item:hover {
+				background: var(--l-hover);
+			}
+			.flog-pop-item.on {
+				color: var(--l-accent);
+			}
+			.flog-pop-item input {
+				margin: 0;
+				flex-shrink: 0;
+				accent-color: var(--l-accent);
+			}
+			.flog-pop-val {
+				flex: 1;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.flog-pop-count {
+				color: var(--l-faint);
+				font-variant-numeric: tabular-nums;
+			}
+			.flog-pop-empty {
+				padding: 12px;
+				color: var(--l-faint);
+				text-align: center;
+			}
+			.flog-pop-foot {
+				display: flex;
+				align-items: center;
+				justify-content: space-between;
+				gap: 8px;
+				padding: 7px 12px;
+				border-top: 1px solid var(--l-border);
+			}
+			.flog-pop-lab {
+				color: var(--l-faint);
+				font-size: 11px;
+			}
+			.flog-pop-clear {
+				border: 1px solid var(--l-border);
+				border-radius: 6px;
+				background: #fff;
+				color: var(--l-muted);
+				font: inherit;
+				font-size: 11px;
+				padding: 3px 9px;
+				cursor: pointer;
+			}
+			.flog-pop-clear:hover {
+				border-color: var(--l-faint);
+				color: var(--l-fg);
+			}
 			.flog-chart {
 				display: flex;
 				align-items: flex-end;
@@ -4452,10 +4630,15 @@
 			.flog-thead,
 			.flog-row {
 				display: grid;
-				grid-template-columns: 138px 1.35fr 1.2fr 1fr;
-				gap: 12px;
+				grid-template-columns: 118px 1fr 0.95fr 1.05fr 1.1fr 58px;
+				gap: 10px;
 				align-items: center;
 				padding: 0 22px;
+			}
+			/* both-times mode needs a wider first column for the stacked pair */
+			.flog-list.tc-both .flog-thead,
+			.flog-list.tc-both .flog-row {
+				grid-template-columns: 158px 1fr 0.95fr 1.05fr 1.1fr 58px;
 			}
 			.flog-thead {
 				height: 34px;
@@ -4494,6 +4677,44 @@
 				color: var(--l-muted);
 				font-variant-numeric: tabular-nums;
 			}
+			/* header control that swaps the first column between start/end/both */
+			.flog-timecol {
+				justify-self: start;
+				border: 0;
+				background: transparent;
+				color: var(--l-muted);
+				font: inherit;
+				font-size: 12px;
+				padding: 0;
+				margin: 0;
+				cursor: pointer;
+			}
+			.flog-timecol:hover {
+				color: var(--l-fg);
+			}
+			.flog-timecol:focus {
+				outline: none;
+			}
+			.flog-date-both {
+				display: flex;
+				flex-direction: column;
+				justify-content: center;
+				gap: 1px;
+				font-size: 11px;
+				line-height: 1.2;
+				font-variant-numeric: tabular-nums;
+			}
+			.flog-date-both > span {
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.flog-date-both .flog-ts-a {
+				color: var(--l-muted);
+			}
+			.flog-date-both .flog-ts-b {
+				color: var(--l-faint);
+			}
 			.flog-mv {
 				display: flex;
 				align-items: center;
@@ -4518,7 +4739,29 @@
 				color: #fff;
 			}
 			.flog-app {
+				color: var(--l-fg);
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				min-width: 0;
+			}
+			.flog-app .flog-zone {
 				color: var(--l-faint);
+			}
+			.flog-step {
+				font-family: var(--l-mono);
+				font-size: 11.5px;
+				color: var(--l-fg);
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				min-width: 0;
+			}
+			.flog-time {
+				color: var(--l-muted);
+				text-align: right;
+				font-variant-numeric: tabular-nums;
+				white-space: nowrap;
 			}
 			.flog-empty {
 				padding: 40px;
@@ -4600,6 +4843,32 @@
 				border-radius: 999px;
 				padding: 4px 11px;
 				font-size: 12px;
+			}
+			/* detail actions: jump back into the 3D scene from a log entry */
+			.flog-d-actions {
+				display: flex;
+				flex-wrap: wrap;
+				gap: 8px;
+				margin: 6px 0 2px;
+			}
+			.flog-goto {
+				border: 1px solid var(--l-accent);
+				border-radius: 7px;
+				background: #f5f5ff;
+				color: var(--l-accent);
+				font: inherit;
+				font-size: 12px;
+				font-weight: 500;
+				padding: 5px 11px;
+				cursor: pointer;
+				max-width: 100%;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+			}
+			.flog-goto:hover {
+				background: var(--l-accent);
+				color: #fff;
 			}
 			.flog-cards {
 				display: grid;

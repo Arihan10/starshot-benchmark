@@ -76,6 +76,12 @@ class OpenAICompatModel:
     top_p: float | None = None
     # Extra request-body fields merged verbatim (e.g. LongCat's `thinking`).
     extra: dict[str, object] = field(default_factory=dict)
+    # USD per 1,000,000 tokens, input and output. These backends bill by token
+    # and (unlike OpenRouter) return no per-request cost, so this IS the price:
+    # `token_cost` derives each call's spend from its token counts. Both must be
+    # set for a model to be priced; None leaves it cost-tracked only by tokens.
+    price_in: float | None = None
+    price_out: float | None = None
 
 
 # Short alias -> OpenRouter model id. Aliases are the stable identifiers
@@ -93,6 +99,7 @@ MODELS: dict[str, str] = {
     "grokky": "x-ai/grok-4.5",
     "glm": "z-ai/glm-5.2",                                                                                                                                                      
     "qwen": "qwen/qwen3.7-max",
+    "qwen-max-preview": "qwen/qwen3.8-max-preview",
     "kimi": "moonshotai/kimi-k2-thinking",
     "sonnet": "anthropic/claude-sonnet-4.6",
     "sonnet-new": "anthropic/claude-sonnet-5",
@@ -114,13 +121,19 @@ MODELS: dict[str, str] = {
 # `base_url` instead of the OpenRouter SDK). Any id absent here routes through
 # OpenRouter exactly as before.
 OPENAI_COMPAT_MODELS: dict[str, OpenAICompatModel] = {
-    # "moonshotai/kimi-k3": OpenAICompatModel(
-    #     model="kimi-k3",
-    #     base_url="https://api.moonshot.ai/v1",
-    #     api_key_env="MOONSHOT_API_KEY",
-    #     rotate=True,
-    #     extra={"reasoning_effort": "max", "max_completion_tokens": 1048576},
-    # ),
+    "moonshotai/kimi-k3": OpenAICompatModel(
+        model="kimi-k3",
+        base_url="https://api.moonshot.ai/v1",
+        api_key_env="MOONSHOT_API_KEY",
+        rotate=True,
+        extra={"reasoning_effort": "max", "max_completion_tokens": 1048576},
+        # Moonshot list price (July 2026): $3.00 / $15.00 per 1M tokens. Applied
+        # to kimi-k3 spend regardless of transport — the run also billed some
+        # calls through OpenRouter BYOK, which reports $0, so the token rate is
+        # the only true cost for both the direct and BYOK legs.
+        price_in=3.00,
+        price_out=15.00,
+    ),
     "longcat/LongCat-2.0": OpenAICompatModel(
         model="LongCat-2.0",
         base_url="https://api.longcat.chat/openai/v1",
@@ -136,7 +149,49 @@ OPENAI_COMPAT_MODELS: dict[str, OpenAICompatModel] = {
         rotate=True,
         extra={"enable_thinking": True},
     ),
+    "qwen/qwen3.8-max-preview": OpenAICompatModel(
+        model="qwen3.8-max-preview",
+        base_url="https://token-plan.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1",
+        api_key_env="ALIBABA_API_KEY",
+        rotate=False,
+        extra={"reasoning_effort": "xhigh"},
+        # Alibaba Model Studio (International) Qwen-Max rate. `qwen3.8-max-preview`
+        # is a preview alias — confirm against the current Model Studio price
+        # sheet and adjust if it differs.
+        price_in=1.20,
+        price_out=6.00,
+    ),
 }
+
+
+def model_pricing(model_id: str | None) -> tuple[float, float] | None:
+    """`(price_in, price_out)` USD per 1M tokens for `model_id`, or None if it
+    has no static price. Matches BOTH the OpenRouter id an event/BYOK-flight
+    records (`moonshotai/kimi-k3`) and the provider-side id a direct flight
+    records (`cfg.model`, e.g. `kimi-k3`), so one price covers a model however
+    it was routed."""
+    if not model_id:
+        return None
+    for or_id, cfg in OPENAI_COMPAT_MODELS.items():
+        if cfg.price_in is None or cfg.price_out is None:
+            continue
+        if model_id == or_id or model_id == cfg.model:
+            return cfg.price_in, cfg.price_out
+    return None
+
+
+def token_cost(
+    model_id: str | None, tokens_in: int | None, tokens_out: int | None
+) -> float | None:
+    """USD cost of one call from its token counts and `model_id`'s static price,
+    or None when the model is unpriced (routes through OpenRouter's settled cost
+    instead) or no tokens were recorded (an errored attempt). Missing side
+    counts to 0 so a partial usage record still prices what it has."""
+    pricing = model_pricing(model_id)
+    if pricing is None or (tokens_in is None and tokens_out is None):
+        return None
+    price_in, price_out = pricing
+    return (tokens_in or 0) / 1_000_000 * price_in + (tokens_out or 0) / 1_000_000 * price_out
 
 MODEL_ALIASES: list[str] = list(MODELS.keys())
 

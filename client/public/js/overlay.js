@@ -62,6 +62,11 @@ let genStatusEl = null;
 // (same id + path, new bytes) reloads instead of serving a stale cached GLB.
 const withV = (url, v) => url + (url.includes("?") ? "&" : "?") + "v=" + v;
 
+// Set when this cell was opened from the api-log, so the header can offer a
+// "← logs" return (the log stays one Escape/back away, scene loaded behind it).
+let cameFromLog = false;
+let toLogsBtn = null;
+
 export function initOverlay(sceneViewer) {
 	viewer = sceneViewer;
 	// The right dock stays a pure node tree + log here — the left panel owns the
@@ -74,6 +79,8 @@ export function initOverlay(sceneViewer) {
 		onNavigate: focusNode,
 		onClose: () => viewer.clearSelection(),
 		onInquire: investigateCall,
+		onOpenLog: openLogForCall,
+		loadCallBytes,
 		// Project (or clear) a focused-object map onto its mesh; returns whether it
 		// took. `mapProjectionOf` reads the viewer's live state back for the panel.
 		onProjectMap: (id, desc) =>
@@ -228,10 +235,21 @@ export function initOverlay(sceneViewer) {
 	// investigator with that step attached. Reads the live view at click time, so
 	// it's shared across source AND branch views.
 	dock.setOnInquire(investigateCall);
+	dock.setOnOpenLog(openLogForCall);
+	dock.setCallBytesLoader(loadCallBytes);
 
-	document
-		.getElementById("overlay-close")
-		.addEventListener("click", closeOverlay);
+	const closeBtn = document.getElementById("overlay-close");
+	closeBtn.addEventListener("click", closeOverlay);
+	// When this cell was reached from the api-log, offer a one-click return to
+	// it. The log overlays the scene (which stays loaded), so it's a fast toggle.
+	toLogsBtn = el("button", {
+		class: "ov-to-logs",
+		text: "← logs",
+		title: "return to the api log (scene stays loaded)",
+		onclick: () => emit("open-flights"),
+	});
+	toLogsBtn.style.display = "none";
+	closeBtn.after(toLogsBtn);
 	document.addEventListener("keydown", (ev) => {
 		if (
 			ev.key === "Escape" &&
@@ -879,6 +897,7 @@ function initObsResizer() {
 function setupInvestigator() {
 	inv = createInvestigator(document.getElementById("investigator"), {
 		onClose: () => setInvestigator(false),
+		loadCallBytes,
 	});
 	document
 		.getElementById("overlay-investigate")
@@ -966,6 +985,19 @@ function focusNode(id) {
 	}
 }
 
+// A node to focus once the incoming cell has loaded it — set when the api log
+// opens a cell via `emit("open-cell", { focus })`. Retried as history folds /
+// events stream, then cleared, so a log→scene jump lands on the exact place.
+let pendingFocus = null;
+function tryPendingFocus() {
+	if (!pendingFocus) return;
+	const id = pendingFocus;
+	if (viewer.hasBbox(id) || obs.model.nodes.has(id)) {
+		pendingFocus = null;
+		focusNode(id);
+	}
+}
+
 // "why?" on a call row (dock OR the left trace panel) → open the investigator
 // with that step attached as deep context. The per-step chat is now just the
 // shared investigator focused on one call; it reads the live view (which the
@@ -975,6 +1007,45 @@ function investigateCall(call) {
 	if (!state.view || call?.index == null) return;
 	setInvestigator(true);
 	inv.attachStep(call.index);
+}
+
+// Slim history/live streams omit each call's heavy prompt/output/reasoning/
+// variables bytes (so a multi-GB scene's tree loads); the dock, trace panel, and
+// investigator fetch them per-call on demand through this. It hydrates the SHARED
+// call object in place, so a call is fetched at most once no matter which panel
+// opens it first, and is a no-op once hydrated (or when the call already carries
+// bytes — compare/legacy full events). Reads the CURRENT cell's context.
+async function loadCallBytes(call) {
+	if (!call || call.index == null || call.system !== undefined) return call;
+	const { slot, model, branch } = state.view ?? {};
+	if (!branch && (!slot || !model)) return call;
+	try {
+		const bytes = branch
+			? await api.branchEventBytes(branch, call.index)
+			: await api.eventBytes(state.run, slot, model, call.index);
+		if (bytes && typeof bytes === "object") Object.assign(call, bytes);
+	} catch {
+		/* leave the call slim — the panels show a placeholder */
+	}
+	return call;
+}
+
+// "log ↗" on a call row → open the api log to this exact call. The flight
+// ledger keys rows by scene (`slot`): a source cell is `<run>/<slot>/<model>`,
+// a branch is `<run>/_branches/<bid>`. The call is matched there by its
+// generation_id (OpenRouter) or t_request (direct), the same join the log uses.
+function openLogForCall(call) {
+	if (!state.view || !call) return;
+	const { slot, model, branch } = state.view;
+	const scene = branch
+		? `${state.run}/_branches/${branch}`
+		: `${state.run}/${slot}/${model}`;
+	emit("open-flight", {
+		run: state.run,
+		scene,
+		generation_id: call.generation_id ?? null,
+		t_request: call.t_request ?? null,
+	});
 }
 
 function scheduleTreeRender() {
@@ -991,6 +1062,7 @@ function scheduleTreeRender() {
 		// New zones may have streamed in — refresh the legend so a new depth's
 		// swatch appears (no-ops when the depth set is unchanged).
 		refreshZoneLayers();
+		tryPendingFocus(); // node from a log→scene jump may have just streamed in
 	});
 }
 
@@ -999,19 +1071,24 @@ export async function openCell({
 	model,
 	branch = false,
 	forceLive = false,
+	focus = null,
+	fromLog = false,
 }) {
 	const seq = ++openSeq;
 	const run = state.run;
+	pendingFocus = focus || null;
 	// Keep the camera when this re-renders the SAME cell while the overlay is
 	// already open — the branch selector swapping between the source run and its
 	// per-LLM simulation lineages, or a revert/step reload. Swapping like that
 	// shouldn't pull the user off the part of the scene they're inspecting. A
 	// fresh open (overlay closed) or a different cell still frames the scene anew.
-	const keepCamera =
-		overlayEl.classList.contains("open") &&
-		!!state.view &&
-		state.view.slot === slot &&
-		state.view.model === model;
+	const sameCell =
+		!!state.view && state.view.slot === slot && state.view.model === model;
+	const keepCamera = overlayEl.classList.contains("open") && sameCell;
+	// Opening from the log arms the "← logs" return; opening a *different* cell
+	// any other way clears it. Same-cell reloads (revert/branch) keep it as-is.
+	if (fromLog) cameFromLog = true;
+	else if (!sameCell) cameFromLog = false;
 	stream?.close();
 	stream = null;
 	// A fresh cell open always starts on the library build; the generated view
@@ -1065,8 +1142,8 @@ export async function openCell({
 	let history = [];
 	try {
 		history = branch
-			? await api.branchEventsHistory(run, branch)
-			: await api.eventsHistory(run, slot, model);
+			? await api.branchEventsHistorySlim(run, branch)
+			: await api.eventsHistorySlim(run, slot, model);
 	} catch {
 		/* never-started cell */
 	}
@@ -1082,6 +1159,7 @@ export async function openCell({
 	refreshZoneLayers();
 	if (branch && state.lab.simStep) dock.renderPinned(obs.model);
 	renderHeader(); // error message comes from the just-loaded log
+	tryPendingFocus(); // a log→scene jump lands on its node once history folds
 
 	// `forceLive` subscribes without waiting for the next poll — used right
 	// after a revert relaunches the cell, so the polled summary is still stale.
@@ -1167,6 +1245,7 @@ function renderHeader() {
 	statusEl.textContent = statusText;
 	statusEl.title = statusText;
 	statusEl.classList.toggle("is-error", status === "error");
+	if (toLogsBtn) toLogsBtn.style.display = cameFromLog ? "" : "none";
 
 	// Action button: source cells start/resume/pause; branches pause/resume.
 	// "Live" = a running task OR one parked at a step gate (pending) — both are
@@ -1207,6 +1286,22 @@ function renderHeader() {
 		capBtn.onclick = onCapOverride;
 	} else {
 		capBtn?.remove();
+	}
+
+	// Graceful pause: a live source cell can "finish & pause" — stop issuing new
+	// LLM calls but let the in-flight one finish + commit before pausing, vs the
+	// action button's immediate hard pause. Hidden on branches and non-live cells.
+	let softBtn = document.getElementById("overlay-soft-pause");
+	if (!branch && live) {
+		if (!softBtn) {
+			softBtn = el("button", { id: "overlay-soft-pause" });
+			actionBtn.before(softBtn);
+		}
+		softBtn.textContent = "finish & pause";
+		softBtn.title = "stop issuing new LLM calls, let the in-flight call finish and commit, then pause — resume won't re-run or re-bill it";
+		softBtn.onclick = onSoftPause;
+	} else {
+		softBtn?.remove();
 	}
 
 	// One-call-at-a-time stepping controls. Shown whenever the cell is gated:
@@ -1475,6 +1570,21 @@ async function onAction() {
 	}
 }
 
+// Graceful pause (source cells): stop new LLM calls, let the in-flight one finish
+// and commit, then pause. The cell stays "running" until it drains, then flips to
+// paused on the next poll — so no reload/stream re-wire here, just a heads-up.
+async function onSoftPause() {
+	const { slot, model, branch } = state.view ?? {};
+	if (!slot || branch) return;
+	try {
+		await api.pauseSoft(state.run, slot, model);
+		toast("finishing the in-flight call, then pausing…", "ok");
+		emit("poll-now");
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
 async function onReset() {
 	const { slot, model } = state.view ?? {};
 	if (!slot) return;
@@ -1518,6 +1628,8 @@ export function closeOverlay() {
 	stopGenPoll();
 	assetMode = "library";
 	state.view = null;
+	cameFromLog = false;
+	if (toLogsBtn) toLogsBtn.style.display = "none";
 	overlayEl.classList.remove("open");
 	viewer.setActive(false);
 	dock.setPinStep(null);

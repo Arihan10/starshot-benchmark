@@ -143,8 +143,13 @@ def _transform(
     Dropped: the node's own per-node events (`id == node_id`), its resumable
     provider bookkeeping (`job_id == node_id`), its own LLM calls
     (`cache.llm` with `node == node_id`) plus their `llm.cost` rows, its `step`
-    markers, and warnings that name it as a `source`."""
+    markers, and warnings that name it as a `source`.
+
+    An `llm.cost` joins its call by `generation_id` (OpenRouter) or by the
+    content-hash `key` (a token-priced compat backend), so both are collected
+    from the dropped calls and both forms of cost row are removed."""
     dropped_gen_ids: set[str] = set()
+    dropped_keys: set[str] = set()
     survivors: list[dict[str, Any]] = []
     for e in events:
         kind = e.get("kind")
@@ -162,12 +167,21 @@ def _transform(
                 gid = e.get("generation_id")
                 if isinstance(gid, str):
                     dropped_gen_ids.add(gid)
+                key = e.get("key")
+                if isinstance(key, str):
+                    dropped_keys.add(key)
             continue
         survivors.append(e)
+
+    def _is_dropped_cost(e: dict[str, Any]) -> bool:
+        if e.get("kind") != "llm.cost":
+            return False
+        return e.get("generation_id") in dropped_gen_ids or e.get("key") in dropped_keys
+
     return [
         _edit_event(e, node_id=node_id, region_id=region_id, new_canonical=new_canonical)
         for e in survivors
-        if not (e.get("kind") == "llm.cost" and e.get("generation_id") in dropped_gen_ids)
+        if not _is_dropped_cost(e)
     ]
 
 

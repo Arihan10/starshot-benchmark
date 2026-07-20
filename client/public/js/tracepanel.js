@@ -46,6 +46,11 @@ export function createTracePanel(
 		onNavigate = () => {},
 		onClose = () => {},
 		onInquire = null,
+		onOpenLog = null,
+		// Fetch a slim call's heavy bytes on demand (history/live streams omit
+		// them); hydrates the shared call object in place. null = calls already
+		// carry full bytes inline (nothing to fetch).
+		loadCallBytes = null,
 		// Project a map onto the focused object's mesh (null desc clears); returns
 		// whether it took. `mapProjectionOf` reads the viewer's live projection back.
 		onProjectMap = () => {},
@@ -1228,35 +1233,47 @@ export function createTracePanel(
 	}
 
 	function callDetail(call, nodeId) {
-		const detail = el(
-			"div",
-			{ class: "obsm-detail tp-call-detail" },
-			el("div", {
-				class: "muted",
-				style: "margin-bottom:6px",
-				text: [
-					call.model ?? "",
-					`${call.tokens_in ?? "?"} in / ${call.tokens_out ?? "?"} out tok`,
-					call.flight_ms != null
-						? `flight ${(call.flight_ms / 1000).toFixed(1)}s${(call.attempts ?? 1) > 1 ? ` (${call.attempts} tries)` : ""}`
-						: null,
-				]
-					.filter(Boolean)
-					.join(" · "),
-			}),
-			outputSection(call, nodeId),
-			collapsedSection("input (user)", call.user ?? "", {
-				variables: call.variables,
-			}),
-			collapsedSection("system", call.system ?? "", {
-				variables: call.variables,
-			}),
-			call.reasoning
-				? collapsedSection("reasoning", call.reasoning)
-				: null,
-		);
+		const detail = el("div", { class: "obsm-detail tp-call-detail" });
 		detail.addEventListener("click", (ev) => ev.stopPropagation());
+		// Slim calls (history/live streams) carry no bytes; fetch them on open,
+		// hydrating the shared call object so the dock/investigator reuse them.
+		if (call.system !== undefined || !loadCallBytes) {
+			fillCallDetail(detail, call, nodeId);
+		} else {
+			detail.appendChild(el("div", { class: "muted", text: "loading exact bytes…" }));
+			Promise.resolve(loadCallBytes(call)).then(() => {
+				detail.textContent = "";
+				fillCallDetail(detail, call, nodeId);
+			}).catch(() => {
+				detail.textContent = "";
+				detail.appendChild(el("div", { class: "muted", text: "failed to load call bytes" }));
+			});
+		}
 		return detail;
+	}
+
+	function fillCallDetail(detail, call, nodeId) {
+		detail.appendChild(el("div", {
+			class: "muted",
+			style: "margin-bottom:6px",
+			text: [
+				call.model ?? "",
+				`${call.tokens_in ?? "?"} in / ${call.tokens_out ?? "?"} out tok`,
+				call.flight_ms != null
+					? `flight ${(call.flight_ms / 1000).toFixed(1)}s${(call.attempts ?? 1) > 1 ? ` (${call.attempts} tries)` : ""}`
+					: null,
+			]
+				.filter(Boolean)
+				.join(" · "),
+		}));
+		detail.appendChild(outputSection(call, nodeId));
+		detail.appendChild(collapsedSection("input (user)", call.user ?? "", {
+			variables: call.variables,
+		}));
+		detail.appendChild(collapsedSection("system", call.system ?? "", {
+			variables: call.variables,
+		}));
+		if (call.reasoning) detail.appendChild(collapsedSection("reasoning", call.reasoning));
 	}
 
 	function callRow({ call, relation }, nodeId) {
@@ -1309,6 +1326,18 @@ export function createTracePanel(
 						onclick: (ev) => {
 							ev.stopPropagation();
 							onInquire(call);
+						},
+					})
+				: null,
+			onOpenLog
+				? el("button", {
+						class: "call-log",
+						text: "log ↗",
+						style: onInquire ? "" : "margin-left:auto",
+						title: "open this exact call in the api log — its prompt, output, latency, status, and key",
+						onclick: (ev) => {
+							ev.stopPropagation();
+							onOpenLog(call);
 						},
 					})
 				: null,

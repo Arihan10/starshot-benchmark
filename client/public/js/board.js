@@ -256,6 +256,10 @@ function bulkResume() {
   runBulk("resumed/started", (c) => api.resume(state.run, c.slot, c.model, stepped));
 }
 function bulkPause() { runBulk("paused", (c) => api.pause(state.run, c.slot, c.model)); }
+// Graceful pause: stop new LLM calls but let each cell's in-flight call finish +
+// commit before pausing (resume won't re-run or re-bill it). Returns immediately;
+// each cell stays running until it drains, then flips to paused on the next poll.
+function bulkPauseSoft() { runBulk("finishing & pausing", (c) => api.pauseSoft(state.run, c.slot, c.model)); }
 // Set one new spend cap on every started (non-done) cell in the selection —
 // raising the ceiling past a capped cell's spend also resumes it. Idle/done
 // cells have no run to cap, so they're filtered out client-side.
@@ -307,6 +311,7 @@ const bulkActionEls = [
   el("button", { class: "primary", title: "start idle / resume paused selected cells", onclick: bulkResume }, "resume / start"),
   el("label", { class: "bulk-stepped", title: "resume/start in step mode (pause before each LLM call)" }, steppedCheck, "stepped"),
   el("button", { title: "pause selected running cells", onclick: bulkPause }, "pause"),
+  el("button", { title: "finish the in-flight LLM call on each selected running cell, commit it, then pause — resume won't re-run or re-bill it", onclick: bulkPauseSoft }, "finish & pause"),
   el("button", { title: "advance each selected cell by one LLM call", onclick: () => bulkStep(null) }, "step"),
   untilSel,
   el("button", { title: "set the spend cap on selected cells (raising past spend resumes capped ones)", onclick: bulkOverride }, "set caps"),

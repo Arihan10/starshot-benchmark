@@ -73,6 +73,14 @@ export function createObsDock(hostEl, { trace = true } = {}) {
   // Overlay-provided: "ask why the model did this" — opens the investigator with
   // this call attached as context. Read-only, so it's offered on branch calls too.
   let onInquire = null;
+  // Overlay-provided: "open this exact call in the api log" — jumps to the
+  // flight-ledger row (prompt, output, latency, key). Read-only.
+  let onOpenLog = null;
+  // Overlay-provided: fetch a slim call's exact system/user/output/reasoning/
+  // variables bytes on demand — the history + live streams omit them so a huge
+  // scene's tree can load. Returns a Promise of the bytes object; null in
+  // read-only panes (compare) whose calls already carry full bytes inline.
+  let callBytesLoader = null;
   // Overlay-provided: "add this zone to the prompt lab's downstream-simulation
   // slots". null hides the affordance (e.g. on a branch view — you simulate from
   // the source, not from an existing branch).
@@ -89,6 +97,8 @@ export function createObsDock(hostEl, { trace = true } = {}) {
   function setOnNodeClick(fn) { onNodeClick = fn; }
   function setOnRevert(fn) { onRevert = fn; }
   function setOnInquire(fn) { onInquire = fn; }
+  function setOnOpenLog(fn) { onOpenLog = fn; }
+  function setCallBytesLoader(fn) { callBytesLoader = fn; }
   function setOnAddSim(fn) { onAddSim = fn; }
   function setHiddenApi(api) { hiddenApi = api; }
 
@@ -277,6 +287,12 @@ export function createObsDock(hostEl, { trace = true } = {}) {
           title: "open the scene investigator with this step attached — ask about it in the context of the whole scene",
           onclick: (ev) => { ev.stopPropagation(); onInquire(call); },
         }) : null,
+        onOpenLog ? el("button", {
+          class: "call-log",
+          text: "log ↗",
+          title: "open this exact call in the api log — its prompt, output, latency, status, and key",
+          onclick: (ev) => { ev.stopPropagation(); onOpenLog(call); },
+        }) : null,
       ),
     );
     if (expanded) wrap.appendChild(callDetail(call));
@@ -285,8 +301,32 @@ export function createObsDock(hostEl, { trace = true } = {}) {
 
   // The in-place detail: exact bytes sent/received. Only the output is open;
   // system, user, reasoning, and per-variable values stay one click away.
+  // The heavy bytes may be absent on a slim call (history/live streams omit
+  // them); fetch them via `callBytesLoader` on first open (it hydrates the
+  // shared call object), then fill. Full calls (compare panes, or already
+  // hydrated) carry `system` inline and render at once.
   function callDetail(call) {
     const detail = el("div", { class: "call-detail" });
+    detail.addEventListener("click", (ev) => ev.stopPropagation());
+    // `callBytesLoader` hydrates the shared call object in place, so a call is
+    // fetched at most once no matter which panel (dock/trace/investigator) opens
+    // it first; once `call.system` is set we render inline.
+    if (call.system !== undefined || !callBytesLoader) {
+      fillCallDetail(detail, call);
+    } else {
+      detail.appendChild(el("div", { class: "muted", text: "loading exact bytes…" }));
+      Promise.resolve(callBytesLoader(call)).then(() => {
+        detail.textContent = "";
+        fillCallDetail(detail, call);
+      }).catch(() => {
+        detail.textContent = "";
+        detail.appendChild(el("div", { class: "muted", text: "failed to load call bytes" }));
+      });
+    }
+    return detail;
+  }
+
+  function fillCallDetail(detail, call) {
     detail.appendChild(el("div", {
       class: "muted",
       style: "margin-bottom:6px",
@@ -322,8 +362,6 @@ export function createObsDock(hostEl, { trace = true } = {}) {
       }
       detail.appendChild(wrap);
     }
-    detail.addEventListener("click", (ev) => ev.stopPropagation());
-    return detail;
   }
 
   // Clicking a node focuses its bbox in 3D. With trace enabled it also flips
@@ -658,6 +696,8 @@ export function createObsDock(hostEl, { trace = true } = {}) {
     setOnNodeClick,
     setOnRevert,
     setOnInquire,
+    setOnOpenLog,
+    setCallBytesLoader,
     setOnAddSim,
     setHiddenApi,
     markSelected,

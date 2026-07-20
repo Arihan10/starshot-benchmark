@@ -56,9 +56,15 @@ from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import committed, divider, generation, object_wipe
 from app.services import llm, prefabs, threed
 from app.services import symmetry as sym_svc
-from app.utils import flightlog
+from app.utils import boardcache, cellsummary, flightlog
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
+from app.utils.cellsummary import (
+    cap_override_value as _cap_override_value,
+    cell_spend as _cell_spend,
+    last_step as _last_step,
+    usage_summary as _usage_summary,
+)
 
 # Parent directory holding many named runs. Each immediate subdirectory
 # is one run; cells live at RUNS_DIR/<run>/<slot>/<model>. Anchored to the
@@ -98,6 +104,10 @@ RunKey = tuple[str, str, str]
 GenKey = tuple[str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
+# Per-cell background "graceful pause" drainers (see /pause-soft): each waits for
+# the cell's in-flight LLM calls to finish + commit, then cancels the idle task
+# and stamps run.paused. Aborted by any hard cancel / relaunch (see _cancel_task).
+_soft_pause_tasks: dict[RunKey, asyncio.Task[None]] = {}
 _retry_tasks: set[asyncio.Task[None]] = set()
 # In-flight "generate from-scratch assets" task per (cell, version). Drives the
 # client's generate gate (a version can't re-trigger until its current build
@@ -240,9 +250,16 @@ _COST_BACKFILL_INTERVAL_S = 20
 
 
 def _all_cost_logs() -> list[SlotLog]:
-    """Snapshot of every in-memory cell + branch log to sweep (the sweep awaits,
-    and these registries can change under it)."""
-    return [*_slot_logs.values(), *(b.log for b in _branches.values())]
+    """Snapshot of the cell + branch logs to sweep for unpriced OpenRouter costs.
+    Only logs whose events are already LOADED are included: an unloaded cell
+    would be force-parsed just to be scanned (defeating lazy hydration), and its
+    costs settled before it went idle — a reactivation reloads it, so a later
+    sweep catches anything genuinely left. (The sweep awaits, and these
+    registries can change under it, so this is a snapshot.)"""
+    return [
+        sl for sl in (*_slot_logs.values(), *(b.log for b in _branches.values()))
+        if sl.loaded
+    ]
 
 
 async def _cost_backfill_loop() -> None:
@@ -256,6 +273,34 @@ async def _cost_backfill_loop() -> None:
         except Exception:
             pass  # best-effort observability — never let the sweep die
         await asyncio.sleep(_COST_BACKFILL_INTERVAL_S)
+
+
+# Cap enforcement is polled separately from the (network-bound) cost sweep above,
+# and much more often, because the sweep's per-cost hook only fires when an
+# OpenRouter cost SETTLES. A cell spending purely on token-priced compat models
+# (kimi-k3 / qwen / longcat — priced inline at call time, no OpenRouter
+# generation to settle) would otherwise never trip the cap. This loop closes
+# that gap cheaply (in-memory events only, no network).
+_CAP_ENFORCE_INTERVAL_S = 5
+
+
+async def _cap_enforce_loop() -> None:
+    """Re-check every LIVE cell's settled spend against its cap and pause any that
+    has crossed it — the same soft tripwire `_enforce_cap_for_log` applies on cost
+    settle, just polled so token-priced spend enforces too. Only touches cells
+    with a live task (few, and always loaded), so it's cheap."""
+    while True:
+        try:
+            if SPEND_CAP_USD > 0:
+                for key, task in list(_tasks.items()):
+                    if not _live(task):
+                        continue
+                    sl = _slot_logs.get(key)
+                    if sl is not None:
+                        await _enforce_cap_for_log(sl)
+        except Exception:
+            pass  # a cap-check fault must never kill the loop
+        await asyncio.sleep(_CAP_ENFORCE_INTERVAL_S)
 
 
 async def _enforce_cap_for_log(slot_log: SlotLog) -> None:
@@ -441,17 +486,6 @@ def _gate_awaiting(gate: "CellGate | None") -> bool:
     """True when a step gate is parked before its next call — surfaced as
     paused/awaiting (the awaited step is the gate's `pending`)."""
     return gate is not None and gate.pending is not None
-
-
-def _cell_status(key: RunKey, slot_log: SlotLog) -> str:
-    """Live status of a source cell — its event log refined by its live
-    gate (awaiting), task (running), and settled spend vs. its cap (capped)."""
-    return rlog.derive_status(
-        slot_log.state["events"],
-        awaiting=_gate_awaiting(_cell_gates.get(key)),
-        live=_live(_tasks.get(key)),
-        capped=_cap_reached(slot_log.state["events"]),
-    )
 
 
 def _branch_status(br: "Branch") -> str:
@@ -1569,13 +1603,19 @@ def create_app() -> FastAPI:
         # unpriced by a prior process that exited mid-lookup (the resumed run's
         # cells hydrate above, so this sweep recovers them).
         cost_task = asyncio.create_task(_cost_backfill_loop())
+        # Poll live cells against their spend cap independently of the cost sweep,
+        # so token-priced (compat) spend enforces the cap too.
+        cap_task = asyncio.create_task(_cap_enforce_loop())
         try:
             yield
         finally:
             rlog.suppress_console()
             cost_task.cancel()
+            cap_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cost_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await cap_task
             for slot_log in _slot_logs.values():
                 slot_log.close()
             for run_name, slot_id, model_alias in list(_slot_logs.keys()):
@@ -2026,11 +2066,14 @@ def create_app() -> FastAPI:
     @app.get("/slots")
     async def list_slots(run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         run = _resolve_run(run)
+        # One read of the run's board cache for the whole poll (not one SQLite
+        # open per cell), freshness-checked per cell in `_cell_summary`.
+        cache_rows = boardcache.load_all(_run_dir(run))
         return {
             "run": run,
             "models": MODEL_ALIASES,
             "default_model": DEFAULT_MODEL_ALIAS,
-            "slots": [_slot_summary(s, run) for s in SLOTS],
+            "slots": [_slot_summary(s, run, cache_rows) for s in SLOTS],
         }
 
     @app.get("/trellis/queue")
@@ -2076,6 +2119,28 @@ def create_app() -> FastAPI:
         return await asyncio.to_thread(
             flightlog.facets, _resolve_run(run), filters=_parse_flight_filters(filters),
         )
+
+    @app.get("/flights/histogram")
+    async def flight_histogram(run: str | None = None, filters: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Bucketed request counts over the run's time span — the activity chart
+        above the log table, filter-aware."""
+        return await asyncio.to_thread(
+            flightlog.histogram, _resolve_run(run), filters=_parse_flight_filters(filters),
+        )
+
+    @app.get("/flights/locate")
+    async def flight_locate(  # pyright: ignore[reportUnusedFunction]
+        scene: str, generation_id: str | None = None, t_request: float | None = None,
+    ) -> dict[str, object]:
+        """Resolve ONE flight row from a scene's `cache.llm` event (by
+        generation_id or t_request) — the scene→log jump. `scene` is the row's
+        `slot` (`<run>/<slot>/<model>`)."""
+        row = await asyncio.to_thread(
+            flightlog.locate, scene, generation_id=generation_id, t_request=t_request,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="no matching flight for this call")
+        return row
 
     @app.get("/flights/stream")
     async def flights_stream(run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
@@ -2179,6 +2244,28 @@ def create_app() -> FastAPI:
             _sse(slot_log, q, snapshot),
             media_type="text/event-stream",
         )
+
+    @app.get("/slots/{slot_id}/{model_alias}/events-history")
+    async def slot_events_history(slot_id: str, model_alias: str, run: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        """The full history backfill for the observability tree, SLIMMED and
+        streamed as NDJSON: every event with `cache.llm` prompt/output/reasoning/
+        variables bytes stripped (see `_slim_event`). This is what lets a multi-GB
+        log's tree load — the client never materializes the raw file as one string
+        — with the heavy bytes fetched per-call via `/event-bytes` on expand."""
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        return StreamingResponse(
+            _slim_ndjson(list(slot_log.state["events"])),
+            media_type="application/x-ndjson",
+        )
+
+    @app.get("/slots/{slot_id}/{model_alias}/event-bytes")
+    async def slot_event_bytes(slot_id: str, model_alias: str, index: int, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The heavy bytes for ONE event, fetched on demand when a tree call row is
+        expanded (the slim history/live streams omit them)."""
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        return _event_bytes(slot_log, index)
 
     @app.get("/slots/{slot_id}/{model_alias}/scene")
     async def slot_scene(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -2336,6 +2423,42 @@ def create_app() -> FastAPI:
         # run.paused event is what derive_status reads back as paused.
         slot_log.log("run.paused")
         return {"run": run, "slot_id": slot.id, "model": model_alias}
+
+    @app.post("/slots/{slot_id}/{model_alias}/pause-soft")
+    async def slot_pause_soft(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
+        """Graceful pause: stop issuing NEW LLM calls but let every in-flight call
+        RETURN and commit first, then pause — unlike /pause, which cancels the task
+        (and its in-flight request) immediately. Returns right away with status
+        "pausing"; a background drainer waits for the in-flight calls to finish,
+        then cancels the now-idle task and stamps run.paused. Because the in-flight
+        calls commit, resume replays them instead of re-running (or re-billing) them.
+        A hard /pause, /reset, or /resume overrides a pending soft pause."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        key = (run, slot_id, model_alias)
+        if not _live(_tasks.get(key)):
+            raise HTTPException(status_code=400, detail="slot is not running")
+        existing = _soft_pause_tasks.get(key)
+        if existing is not None and not existing.done():
+            return {"run": run, "slot_id": slot.id, "model": model_alias, "status": "pausing"}
+        llm.request_soft_pause(slot_log.slot_id)
+
+        async def _drain_then_pause() -> None:
+            try:
+                await llm.await_drain(slot_log.slot_id)
+                # The pipeline may have finished on its own while draining; only
+                # convert to a pause if it's still live.
+                if _live(_tasks.get(key)):
+                    await _cancel_task(run, slot_id, model_alias)
+                    slot_log.log("run.paused")
+            finally:
+                llm.clear_soft_pause(slot_log.slot_id)
+                _soft_pause_tasks.pop(key, None)
+
+        _soft_pause_tasks[key] = asyncio.create_task(_drain_then_pause())
+        return {"run": run, "slot_id": slot.id, "model": model_alias, "status": "pausing"}
 
     @app.post("/slots/{slot_id}/{model_alias}/cap-override")
     async def slot_cap_override(  # pyright: ignore[reportUnusedFunction]
@@ -3230,6 +3353,21 @@ def create_app() -> FastAPI:
             ]
         return StreamingResponse(_sse(blog, q, snapshot), media_type="text/event-stream")
 
+    @app.get("/branches/{branch_id}/events-history")
+    async def branch_events_history(branch_id: str) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+        """Slim NDJSON history backfill for a branch's observability tree (see
+        `slot_events_history`)."""
+        blog = _require_branch(branch_id).log
+        return StreamingResponse(
+            _slim_ndjson(list(blog.state["events"])),
+            media_type="application/x-ndjson",
+        )
+
+    @app.get("/branches/{branch_id}/event-bytes")
+    async def branch_event_bytes(branch_id: str, index: int) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The heavy bytes for ONE branch event, fetched on demand on expand."""
+        return _event_bytes(_require_branch(branch_id).log, index)
+
     @app.get("/branches/{branch_id}/meshes")
     async def branch_meshes(branch_id: str, since_index: int | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         """The branch's committed meshes. A branch hardlinks the prefix's source
@@ -3963,88 +4101,15 @@ def create_app() -> FastAPI:
     return app
 
 
-def _last_step(events: list[dict[str, object]]) -> dict[str, object] | None:
-    """The most recent pipeline-location marker — what the board cards show
-    as "where is this cell right now"."""
-    for e in reversed(events):
-        if e.get("kind") == "step":
-            return {"node": e.get("node"), "phase": e.get("phase")}
-    return None
-
-
-def _usage_summary(events: list[dict[str, object]]) -> dict[str, dict[str, float]]:
-    """Per-model token, request, USD-cost, and unresolved-lookup totals from a
-    cell's `cache.llm` events, so the UI cost tracker can show the run's
-    authoritative spend and how much of it is still settling. Returns
-    `{ model_id: {"in": tokens_in, "out": tokens_out, "req": n, "cost": usd,
-    "pending": n} }`.
-
-    `cost` is OpenRouter's own settled `total_cost`, which lands a beat after the
-    call (its /generation stats lag the completion) as a separate `llm.cost`
-    event keyed by `generation_id` — written by the backfill sweep. We index
-    those, then attribute each to its `cache.llm` call's model — so the cost
-    lands on the right model, and a cost whose call was since dropped (a rewind
-    that raced the lookup) is ignored. `pending` counts calls carrying a
-    `generation_id` that the sweep hasn't priced yet; it drains to 0 once every
-    call is resolved (the run's spend has caught up). A call with no
-    `generation_id` (a legacy log) is neither priced nor pending — it just
-    counts as a request, matching the tracker's old request-only degradation."""
-    cost_by_gen: dict[str, float] = {}
-    for e in events:
-        if e.get("kind") != "llm.cost":
-            continue
-        gid, c = e.get("generation_id"), e.get("cost")
-        if isinstance(gid, str) and isinstance(c, (int, float)):
-            cost_by_gen[gid] = float(c)
-    usage: dict[str, dict[str, float]] = {}
-    for e in events:
-        if e.get("kind") != "cache.llm":
-            continue
-        model = str(e.get("model") or "?")
-        u = usage.setdefault(model, {"in": 0, "out": 0, "req": 0, "cost": 0.0, "pending": 0})
-        ti, to = e.get("tokens_in"), e.get("tokens_out")
-        u["in"] += int(ti) if isinstance(ti, (int, float)) else 0
-        u["out"] += int(to) if isinstance(to, (int, float)) else 0
-        u["req"] += 1
-        gid = e.get("generation_id")
-        if isinstance(gid, str):
-            if gid in cost_by_gen:
-                u["cost"] += cost_by_gen[gid]
-            else:
-                u["pending"] += 1
-    return usage
-
-
 # --- per-cell spend cap -------------------------------------------------------
-# A cell's authoritative spend is the sum of its settled `llm.cost` events (the
-# backfill prices each `cache.llm` against OpenRouter's own total). The ceiling
-# is the value carried by the cell's latest `run.cap_override` event, or
-# SPEND_CAP_USD when it has none — so setting a new cap is just appending an
-# override the reader picks up, and a rewind past it falls back to the prior one.
-# Everything is derived from the durable log, so it survives restarts. A ceiling
-# of 0 (or less) means uncapped.
-
-
-def _cell_spend(events: list[dict[str, object]]) -> float:
-    total = 0.0
-    for e in events:
-        if e.get("kind") == "llm.cost":
-            c = e.get("cost")
-            if isinstance(c, (int, float)):
-                total += float(c)
-    return total
-
-
-def _cap_override_value(events: list[dict[str, object]]) -> float | None:
-    """The ceiling set by the cell's most recent `run.cap_override`, or None if
-    it was never overridden — the last one wins."""
-    value = None
-    for e in events:
-        if e.get("kind") == "run.cap_override":
-            c = e.get("cap")
-            if isinstance(c, (int, float)):
-                value = float(c)
-    return value
+# A cell's authoritative spend is the sum of its calls' settled costs
+# (`cellsummary.cell_spend`, imported as `_cell_spend`). The ceiling is the value
+# carried by the cell's latest `run.cap_override` event, or SPEND_CAP_USD when it
+# has none — so setting a new cap is just appending an override the reader picks
+# up, and a rewind past it falls back to the prior one. Everything is derived
+# from the durable log, so it survives restarts. A ceiling of 0 (or less) means
+# uncapped. `_cell_spend` / `_cap_override_value` live in `cellsummary` (shared
+# with the board-summary cache); the SPEND_CAP_USD default is applied here.
 
 
 def _effective_cap(events: list[dict[str, object]]) -> float:
@@ -4063,22 +4128,77 @@ def _cap_reached(events: list[dict[str, object]]) -> bool:
     return cap > 0 and _cell_spend(events) >= cap
 
 
-def _cap_summary(events: list[dict[str, object]]) -> dict[str, object] | None:
-    """The cost tracker's per-cell cap panel: settled `spend` and the current
-    `limit` ceiling (0 = uncapped). None only when the cap system is off
-    (SPEND_CAP_USD ≤ 0), so there is no cap to show or set."""
+def _cell_summary(
+    run: str,
+    slot_id: str,
+    model_alias: str,
+    slot_log: SlotLog | None,
+    cache_rows: dict[str, tuple[tuple[int, float], dict[str, object]]],
+) -> dict[str, object]:
+    """A cell's board summary (event count, last step, per-model usage, spend,
+    status markers) sourced so activating a run needn't re-parse a huge log:
+
+      * no slot_log / no events.jsonl → the trivial empty summary;
+      * a cached row fresh for the log's (size, mtime) → it, verbatim;
+      * otherwise fold the events (loading them if needed — a cache miss or an
+        active cell whose log has grown) and refresh the cache.
+
+    `cache_rows` is the run's whole `board.db` preloaded once for the poll."""
+    if slot_log is None:
+        return cellsummary.summarize([])
+    sig = boardcache.file_sig(slot_log.events_path)
+    if sig is None:
+        return cellsummary.summarize([])  # untouched cell — no log on disk yet
+    scene = f"{slot_id}/{model_alias}"
+    cached = cache_rows.get(scene)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+    summary = cellsummary.summarize(slot_log.state["events"])
+    boardcache.put(_run_dir(run), scene, sig, summary)
+    return summary
+
+
+def _status_from_summary(key: RunKey, summary: dict[str, object]) -> str:
+    """A cell's live status from its cached summary + runtime overlay — the
+    cache-backed equivalent of `derive_status(events, ...)`, so the board needn't
+    hold the events to know a cell is done/capped/paused/running."""
+    spend = float(summary.get("spend") or 0.0)
+    override = summary.get("cap_override")
+    cap = override if isinstance(override, (int, float)) else SPEND_CAP_USD
+    return rlog.derive_status_fields(
+        has_done=bool(summary.get("has_done")),
+        last_is_error=bool(summary.get("last_is_error")),
+        has_events=int(summary.get("events_count") or 0) > 0,
+        awaiting=_gate_awaiting(_cell_gates.get(key)),
+        live=_live(_tasks.get(key)),
+        capped=cap > 0 and spend >= cap,
+    )
+
+
+def _cap_summary_from(summary: dict[str, object]) -> dict[str, object] | None:
+    """The cost tracker's cap panel from a cached summary (settled `spend` +
+    `limit` ceiling). None when the cap system is off (SPEND_CAP_USD ≤ 0)."""
     if SPEND_CAP_USD <= 0:
         return None
-    return {"spend": _cell_spend(events), "limit": _effective_cap(events)}
+    spend = float(summary.get("spend") or 0.0)
+    override = summary.get("cap_override")
+    limit = override if isinstance(override, (int, float)) else SPEND_CAP_USD
+    return {"spend": spend, "limit": limit}
 
 
-def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
+def _slot_summary(
+    slot: Slot,
+    run: str,
+    cache_rows: dict[str, tuple[tuple[int, float], dict[str, object]]],
+) -> dict[str, object]:
     runs: dict[str, dict[str, object]] = {}
     for alias in MODEL_ALIASES:
         key: RunKey = (run, slot.id, alias)
         slot_log = _slot_logs.get(key)
-        state = slot_log.state if slot_log is not None else {"events": []}
-        events = state.get("events", [])
+        # Board summary from board.db when the cell's events aren't loaded, so
+        # activating a run doesn't parse every (multi-GB) log; a miss falls back
+        # to a one-time parse that then repopulates the cache.
+        summary = _cell_summary(run, slot.id, alias, slot_log, cache_rows)
         # Every TOP-LEVEL simulation forked from this cell (fan-out children are
         # excluded — they live transiently inside the compare view). A cell can
         # now carry several at once (different zones / parallel sims).
@@ -4088,10 +4208,10 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
         ]
         cgate = _cell_gates.get(key)
         runs[alias] = {
-            "status": _cell_status(key, slot_log) if slot_log is not None else "idle",
-            "events_count": len(events),
-            "last_kind": events[-1]["kind"] if events else None,
-            "last_step": _last_step(events),
+            "status": _status_from_summary(key, summary) if slot_log is not None else "idle",
+            "events_count": summary["events_count"],
+            "last_kind": summary["last_kind"],
+            "last_step": summary["last_step"],
             "stepped": (run, slot.id, alias) in _stepped_cells,
             "pending": cgate.pending if cgate is not None else None,
             "current": cgate.current if cgate is not None else None,
@@ -4099,10 +4219,10 @@ def _slot_summary(slot: Slot, run: str) -> dict[str, object]:
             "branches": branches,
             # Per-model token/request totals for the cost tracker (the run's
             # actual spend = source cells; branch simulations aren't counted).
-            "usage": _usage_summary(events),
+            "usage": summary["usage"],
             # Per-cell spend cap panel: settled spend, current ceiling, whether
             # it's tripped, and the override count. None when the cap is off.
-            "cap": _cap_summary(events),
+            "cap": _cap_summary_from(summary),
         }
     return {
         "id": slot.id,
@@ -4119,7 +4239,7 @@ def _maybe_launch(slot: Slot, model_alias: str, slot_log: SlotLog) -> None:
     by `derive_status`, so a cell killed mid-run reads as paused (no live task)
     and a completed/errored cell reads done/error straight from its log — no
     boot-time fix-up."""
-    if not slot_log.state["events"]:
+    if slot_log.is_empty:
         slot_log.state["prompt"] = slot.prompt
     slot_log.state["model"] = MODELS[model_alias]
 
@@ -4443,8 +4563,18 @@ def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
 
 
 async def _cancel_task(run: str, slot_id: str, model_alias: str) -> None:
-    _cell_gates.pop((run, slot_id, model_alias), None)
-    task = _tasks.pop((run, slot_id, model_alias), None)
+    key = (run, slot_id, model_alias)
+    # Abort a pending graceful (soft) pause drainer so a hard pause / reset /
+    # relaunch overrides it — UNLESS we ARE that drainer (it calls _cancel_task to
+    # perform the pause once in-flight calls have drained; cancelling itself would
+    # abort mid-teardown). Clearing the llm flag lets a relaunch issue calls again.
+    sp = _soft_pause_tasks.get(key)
+    if sp is not None and sp is not asyncio.current_task():
+        _soft_pause_tasks.pop(key, None)
+        sp.cancel()
+    llm.clear_soft_pause(_run_id(run, slot_id, model_alias))
+    _cell_gates.pop(key, None)
+    task = _tasks.pop(key, None)
     if task is None or task.done():
         return
     task.cancel()
@@ -5034,6 +5164,72 @@ def _scene_projection(events: list[dict[str, object]]) -> dict[str, object]:
     return {"nodes": list(nodes.values()), "last_index": last_index}
 
 
+# The heavy `cache.llm` fields: the exact prompt/output/reasoning bytes plus the
+# resolved template variables. They dwarf everything else in a log (a deep zone's
+# object_bbox_batch prompt alone runs to megabytes), so the observability tree is
+# served WITHOUT them — the client folds the slim stream into the node tree and
+# fetches these per-call, on demand, via `/event-bytes` when a row is expanded.
+# This is a serve-time projection ONLY; the on-disk `events.jsonl` is untouched.
+_CACHE_LLM_HEAVY = ("system", "user", "output", "reasoning", "variables")
+
+
+def _emitted_ids(output: object) -> list[str]:
+    """The node ids a finished decompose / bbox-batch call named or placed, pulled
+    from its structured `output` — the one thing the obs tree needs the output FOR
+    (provenance: the "via {step}" pill, emitted_by / placed_by lineage). Mirrors
+    the client's `recordProvenance` walk so the slim stream carries the ids without
+    the bytes."""
+    if not isinstance(output, dict):
+        return []
+    ids: list[str] = []
+    for key in ("subregions", "children", "objects", "assignments"):
+        seq = output.get(key)
+        if isinstance(seq, list):
+            for item in seq:
+                if isinstance(item, dict) and isinstance(item.get("id"), str):
+                    ids.append(item["id"])
+    obj = output.get("object")
+    if isinstance(obj, dict) and isinstance(obj.get("id"), str):
+        ids.append(obj["id"])
+    return ids
+
+
+def _slim_event(event: dict[str, object]) -> dict[str, object]:
+    """A `cache.llm` event with its heavy prompt/output/reasoning/variables bytes
+    stripped and replaced by a compact `emitted` id list; every other kind passes
+    through unchanged. Returns a NEW dict for `cache.llm` — the in-memory event is
+    left intact, since the LLM cache reads `cache.llm.output` and resume reads
+    event fields off these same objects, so mutating them would corrupt both."""
+    if event.get("kind") != "cache.llm":
+        return event
+    slim = {k: v for k, v in event.items() if k not in _CACHE_LLM_HEAVY}
+    slim["emitted"] = _emitted_ids(event.get("output"))
+    return slim
+
+
+def _event_bytes(slot_log: SlotLog, index: int) -> dict[str, object]:
+    """The heavy bytes for ONE event (system/user/output/reasoning/variables +
+    schema), fetched on demand when a call row is expanded. Read from the in-memory
+    log by index (events keep `index == list position`, with a scan fallback)."""
+    events = slot_log.state["events"]
+    e: dict[str, object] | None = None
+    if 0 <= index < len(events) and events[index].get("index") == index:
+        e = events[index]
+    else:
+        e = next((x for x in events if x.get("index") == index), None)
+    if e is None:
+        raise HTTPException(status_code=404, detail=f"no event at index {index}")
+    return {k: e.get(k) for k in ("system", "user", "output", "reasoning", "variables", "schema")}
+
+
+async def _slim_ndjson(events: list[dict[str, object]]) -> AsyncIterator[str]:
+    """Stream `events` as slim NDJSON (one JSON object per line). Neither the
+    server nor the client ever builds the whole log as a single string, so a
+    multi-gigabyte scene's tree loads without hitting the ~512 MB JS string cap."""
+    for e in events:
+        yield json.dumps(_slim_event(e)) + "\n"
+
+
 async def _sse(
     slot_log: SlotLog,
     q: asyncio.Queue[dict[str, object]],
@@ -5047,12 +5243,16 @@ async def _sse(
     # standalone mesh retry) gets the historical timeline and then waits
     # on the live queue for the retry's new events, instead of being
     # disconnected the instant the past `run.done` replays.
+    # Events are slimmed the same way the history backfill is (`_slim_event`):
+    # cache.llm prompt/output bytes are stripped and fetched per-call on expand,
+    # so the obs model's memory stays bounded even across a long live run. Scene
+    # dispatch is unaffected (it reads bbox/model/divider events, never cache.llm).
     try:
         for event in snapshot:
-            yield f"data: {json.dumps(event)}\n\n"
+            yield f"data: {json.dumps(_slim_event(event))}\n\n"
         while True:
             event = await q.get()
-            yield f"data: {json.dumps(event)}\n\n"
+            yield f"data: {json.dumps(_slim_event(event))}\n\n"
             if event["kind"] in {"run.done", "run.error", "run.paused", "run.cap_reached"}:
                 return
     finally:

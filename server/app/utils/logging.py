@@ -25,6 +25,7 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Callable
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, TextIO
@@ -164,17 +165,82 @@ def derive_status(
         boot. All resolve to a resumable `paused` without any boot fix-up.
       * `idle`    — empty log: a fresh, never-started cell.
     """
-    if any(e.get("kind") == "run.done" for e in events):
+    return derive_status_fields(
+        has_done=any(e.get("kind") == "run.done" for e in events),
+        last_is_error=bool(events) and events[-1].get("kind") == "run.error",
+        has_events=bool(events),
+        awaiting=awaiting,
+        live=live,
+        capped=capped,
+    )
+
+
+def derive_status_fields(
+    *,
+    has_done: bool,
+    last_is_error: bool,
+    has_events: bool,
+    awaiting: bool = False,
+    live: bool = False,
+    capped: bool = False,
+) -> str:
+    """`derive_status` reduced to the three log-derived facts it actually needs —
+    whether the cell ever finished, whether its last event was an error, and
+    whether it has any events — plus the runtime overlay. This lets a cached
+    board summary resolve status without the events in hand; see `derive_status`
+    for the resolution order these follow."""
+    if has_done:
         return "done"
     if capped:
         return "capped"
-    if events and events[-1].get("kind") == "run.error":
+    if last_is_error:
         return "error"
     if awaiting:
         return "paused"
     if live:
         return "running"
-    return "paused" if events else "idle"
+    return "paused" if has_events else "idle"
+
+
+class _LazyState(dict):
+    """A SlotLog's `state`, with `events` parsed from disk only on first access.
+
+    Activating a run builds a SlotLog per cell; eagerly parsing every cell's
+    `events.jsonl` (the biggest are gigabytes) is what made run-switching slow.
+    So the events list loads lazily: `state["events"]` reads the log the first
+    time it's touched, and the board reads its cached summary (`boardcache`)
+    INSTEAD of the events — so only a cell actually operated on pays to parse.
+    `prompt`/`model` are plain eager keys (set from a cheap one-line meta read).
+    Every other mapping op is unchanged, so the many `slot_log.state["events"]`
+    call sites keep working transparently."""
+
+    def __init__(self, load_events: Callable[[], list[dict[str, Any]]]) -> None:
+        super().__init__(prompt=None, model=None)
+        self._load_events = load_events
+        self.events_loaded = False
+
+    def ensure_events(self) -> None:
+        if not self.events_loaded:
+            self.events_loaded = True
+            dict.__setitem__(self, "events", self._load_events())
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "events":
+            self.ensure_events()
+        return dict.__getitem__(self, key)
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        if key == "events":
+            self.events_loaded = True  # an explicit assignment replaces the load
+        dict.__setitem__(self, key, value)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        if key == "events":
+            self.ensure_events()
+        return dict.get(self, key, default)
+
+    def __contains__(self, key: object) -> bool:
+        return key == "events" or dict.__contains__(self, key)
 
 
 class SlotLog:
@@ -185,12 +251,9 @@ class SlotLog:
         self.events_path = events_path
         # Status is NOT stored here — it's derived live via `derive_status`
         # (which needs the gate/task runtime the SlotLog can't see). `state`
-        # holds only the durable, log-derived data.
-        self.state: dict[str, Any] = {
-            "prompt": None,
-            "model": None,
-            "events": [],
-        }
+        # holds only the durable, log-derived data. `events` loads lazily from
+        # disk on first access (see `_LazyState`), so building a SlotLog is cheap.
+        self.state: dict[str, Any] = _LazyState(self._load_events_from_disk)
         self.subscribers: list[asyncio.Queue[dict[str, Any]]] = []
         # Append handle kept open for the life of the cell. Opening events.jsonl
         # on every log() event (hundreds per run × many parallel cells) was
@@ -216,30 +279,77 @@ class SlotLog:
         self.close()
 
     def hydrate_from_disk(self) -> None:
-        """Load state from an existing events.jsonl. Prompt + model come
-        from the first run.start event, so resume works without a side
-        file."""
-        self.state["events"] = []
-        self.state["prompt"] = None
-        self.state["model"] = None
+        """Reset to the on-disk log WITHOUT parsing it. Events load lazily on
+        first access to `state["events"]`, so activating a run needn't read every
+        cell's (possibly multi-GB) log — the board reads its cached summary
+        instead. Prompt + model are the exception: they come from the first
+        run.start, read here via a cheap one-line scan so resume/prefill work
+        while the events stay unloaded."""
+        self._close_events_file()
+        self.state = _LazyState(self._load_events_from_disk)
+        prompt, model = self._read_meta()
+        self.state["prompt"] = prompt
+        self.state["model"] = model
+
+    def _load_events_from_disk(self) -> list[dict[str, Any]]:
+        """Parse the whole event log into memory — the lazy backing for
+        `state["events"]`, run at most once per cell (on first access)."""
+        events: list[dict[str, Any]] = []
         if not self.events_path.exists():
-            return
-        with self.events_path.open("r") as f:
+            return events
+        with self.events_path.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
                     continue
                 try:
-                    event = json.loads(line)
+                    events.append(json.loads(line))
                 except json.JSONDecodeError:
                     _console.print(
                         f"[dim]\\[{self.slot_id}][/dim] [red]skipping malformed line in {self.events_path}[/red]"
                     )
-                    continue
-                self.state["events"].append(event)
-                if event.get("kind") == "run.start" and self.state["prompt"] is None:
-                    self.state["prompt"] = event.get("prompt")
-                    self.state["model"] = event.get("model")
+        return events
+
+    def _read_meta(self) -> tuple[str | None, str | None]:
+        """`(prompt, model)` from the first run.start — one line, so it's O(1)
+        regardless of log size. None for a fresh/legacy log without a leading
+        run.start (the full load, when it happens, carries the real values)."""
+        try:
+            with self.events_path.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except json.JSONDecodeError:
+                        return None, None
+                    if e.get("kind") == "run.start":
+                        p, m = e.get("prompt"), e.get("model")
+                        return (p if isinstance(p, str) else None,
+                                m if isinstance(m, str) else None)
+                    return None, None
+        except OSError:
+            return None, None
+        return None, None
+
+    @property
+    def loaded(self) -> bool:
+        """Whether the event list is in memory. The cost-backfill sweep uses this
+        to skip cells that would otherwise be force-loaded just to be scanned."""
+        return isinstance(self.state, _LazyState) and self.state.events_loaded
+
+    @property
+    def is_empty(self) -> bool:
+        """Whether the cell has no events — answered WITHOUT loading them (stats
+        the file) so the board/launch path needn't parse a huge log to learn a
+        cell is non-empty."""
+        if isinstance(self.state, _LazyState) and self.state.events_loaded:
+            return not self.state["events"]
+        try:
+            return self.events_path.stat().st_size == 0
+        except OSError:
+            return True
 
     def truncate_events_to(self, n: int) -> int:
         """Keep only the first `n` events on disk and in memory. Returns

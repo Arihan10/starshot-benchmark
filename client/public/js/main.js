@@ -2,7 +2,7 @@
 // Owns the canonical state.slots refresh loop every panel renders from.
 
 import { api } from "./api.js";
-import { state, emit, on } from "./state.js";
+import { state, emit, on, branchSummaryById } from "./state.js";
 import { el, toast, openModal, field, stepUntilSelect } from "./ui.js";
 import { createViewer } from "./scene3d.js";
 import { renderBoard } from "./board.js";
@@ -99,6 +99,29 @@ runCombo = createRunCombo(runPickerEl, {
 on("switch-run", async (name) => {
   await refreshRuns();
   await switchRun(name);
+});
+
+// api log → scene viewer: switch to the request's run if needed, then open its
+// cell in the overlay, focusing the node the call produced. Branch flights
+// resolve their origin cell (slot/model) from the live /slots snapshot.
+on("open-cell-focus", async ({ run, slot, model, branch = false, focus = null }) => {
+  if (run && run !== state.run) {
+    await refreshRuns();
+    await switchRun(run);
+  }
+  let openSlot = slot;
+  let openModel = model;
+  let openBranch = branch;
+  if (openBranch && (!openSlot || !openModel)) {
+    const b = branchSummaryById(openBranch);
+    if (b) { openSlot = b.slot; openModel = b.model; }
+    else { openBranch = false; }
+  }
+  if (!openSlot || !openModel) {
+    toast("couldn't resolve that request's cell", "err");
+    return;
+  }
+  emit("open-cell", { slot: openSlot, model: openModel, branch: openBranch, focus, fromLog: true });
 });
 
 // --- slots polling -----------------------------------------------------------------

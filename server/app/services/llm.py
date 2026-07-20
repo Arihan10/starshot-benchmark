@@ -32,7 +32,7 @@ from openrouter import OpenRouter
 from openrouter.errors import OpenRouterError
 from pydantic import BaseModel, ValidationError
 
-from app.core.slots import OPENAI_COMPAT_MODELS, OpenAICompatModel
+from app.core.slots import OPENAI_COMPAT_MODELS, OpenAICompatModel, model_pricing, token_cost
 from app.utils import cache, flightlog, keypool, logging
 
 from app.core.slots import DEFAULT_REASONING, REASONING_DOWNGRADE_LIST
@@ -109,6 +109,48 @@ _step_gate: ContextVar[StepGate | None] = ContextVar("_step_gate", default=None)
 
 def set_step_gate(gate: StepGate | None) -> None:
     _step_gate.set(gate)
+
+
+# --- graceful ("finish current, start no more") pause ------------------------
+# A soft pause, distinct from the hard cancel: `request_soft_pause` marks a cell's
+# slot id so `call_llm` stops STARTING new calls (it parks until the task is later
+# cancelled), while every call already in flight is left to finish and commit its
+# `cache.llm`. `_inflight` counts logical calls in progress per cell so the
+# /pause-soft handler can wait for that drain before cancelling the (now idle)
+# task and marking the run paused. Keyed by the composite slot id
+# `logging.current_slot_id()` returns (== `SlotLog.slot_id` == `_run_id(...)`).
+_soft_paused: set[str] = set()
+_inflight: dict[str, int] = {}
+
+
+def request_soft_pause(slot_id: str) -> None:
+    """Stop `slot_id` from STARTING new LLM calls; in-flight ones still finish."""
+    _soft_paused.add(slot_id)
+
+
+def clear_soft_pause(slot_id: str) -> None:
+    """Lift the soft pause so a relaunch / resume can issue calls again."""
+    _soft_paused.discard(slot_id)
+
+
+def is_soft_paused(slot_id: str | None) -> bool:
+    return slot_id is not None and slot_id in _soft_paused
+
+
+async def await_drain(
+    slot_id: str, *, poll_s: float = 0.2, timeout_s: float | None = None
+) -> None:
+    """Block until no logical LLM call is in flight for `slot_id`. A soft pause
+    stops new calls from starting, so the count only falls — this returns once the
+    currently-running call(s) have returned AND committed. `timeout_s=None` waits
+    as long as the longest in-flight call needs (which is the whole point)."""
+    waited = 0.0
+    while _inflight.get(slot_id, 0) > 0:
+        await asyncio.sleep(poll_s)
+        if timeout_s is not None:
+            waited += poll_s
+            if waited >= timeout_s:
+                return
 
 
 class OutputValidationError(Exception):
@@ -231,54 +273,85 @@ async def call_llm(
                     validate(cached)
                 return cached
 
-    validated, reasoning, usage, raw, generation_ids = await call_llm_once(
-        system=system,
-        user=user,
-        output_schema=output_schema,
-        model=model,
-        validate=validate,
-        step=step,
-        node_id=node_id,
-    )
-    # cache.llm carries everything needed for the LLM-call cache (key +
-    # output), the observability view (node + step + model + system + user +
-    # reasoning), and the prompt lab (template + variables). Older log lines
-    # that lack the newer fields still replay correctly — the client treats
-    # them as unattributed / not re-renderable.
-    #
-    # `generation_id` ties this call to OpenRouter's billing record. Its settled
-    # USD cost lags the completion (and a live lookup would die with a restart),
-    # so we DON'T resolve it here: the backfill sweep (`backfill_costs`) prices
-    # it off the log and appends a separate `llm.cost` event, which
-    # `_usage_summary` joins back by id.
-    #
-    # `flight` is the ledger row of the FINAL (successful) HTTP attempt — its
-    # request/response wall-clock times and flight duration land on the event so
-    # the trace panels show call latency next to the tokens. Additive: older
-    # logs without these fields replay unchanged.
-    flight = flightlog.last_flight()
-    logging.log(
-        "cache.llm",
-        key=key,
-        node=node_id,
-        step=step,
-        template=template,
-        model=model,
-        schema=schema_name,
-        system=system,
-        user=user,
-        variables=variables,
-        output=raw,
-        reasoning=reasoning,
-        tokens_in=getattr(usage, "prompt_tokens", None),
-        tokens_out=getattr(usage, "completion_tokens", None),
-        generation_id=generation_ids[-1] if generation_ids else None,
-        t_request=flight["t_request"] if flight else None,
-        t_response=flight["t_response"] if flight else None,
-        flight_ms=flight["flight_ms"] if flight else None,
-        attempts=flight["attempt"] if flight else None,
-    )
-    return validated
+    # Graceful pause: while a soft pause is active, DON'T start a new call — park
+    # until the task is cancelled (the /pause-soft handler cancels once in-flight
+    # calls have drained + committed). Parking (rather than raising) keeps sibling
+    # in-flight calls in the same gather from being torn down. `_inflight` spans
+    # the call AND its cache.llm commit below, so a call that started always
+    # finishes and is recorded before the count can reach zero.
+    slot = logging.current_slot_id()
+    if is_soft_paused(slot):
+        await asyncio.Event().wait()  # never set → parks until CancelledError
+    if slot is not None:
+        _inflight[slot] = _inflight.get(slot, 0) + 1
+    try:
+        validated, reasoning, usage, raw, generation_ids = await call_llm_once(
+            system=system,
+            user=user,
+            output_schema=output_schema,
+            model=model,
+            validate=validate,
+            step=step,
+            node_id=node_id,
+        )
+        # cache.llm carries everything needed for the LLM-call cache (key +
+        # output), the observability view (node + step + model + system + user +
+        # reasoning), and the prompt lab (template + variables). Older log lines
+        # that lack the newer fields still replay correctly — the client treats
+        # them as unattributed / not re-renderable.
+        #
+        # `generation_id` ties this call to OpenRouter's billing record. Its settled
+        # USD cost lags the completion (and a live lookup would die with a restart),
+        # so we DON'T resolve it here: the backfill sweep (`backfill_costs`) prices
+        # it off the log and appends a separate `llm.cost` event, which
+        # `_usage_summary` joins back by id.
+        #
+        # `flight` is the ledger row of the FINAL (successful) HTTP attempt — its
+        # request/response wall-clock times and flight duration land on the event so
+        # the trace panels show call latency next to the tokens. Additive: older
+        # logs without these fields replay unchanged.
+        flight = flightlog.last_flight()
+        tokens_in = getattr(usage, "prompt_tokens", None)
+        tokens_out = getattr(usage, "completion_tokens", None)
+        logging.log(
+            "cache.llm",
+            key=key,
+            node=node_id,
+            step=step,
+            template=template,
+            model=model,
+            schema=schema_name,
+            system=system,
+            user=user,
+            variables=variables,
+            output=raw,
+            reasoning=reasoning,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            generation_id=generation_ids[-1] if generation_ids else None,
+            t_request=flight["t_request"] if flight else None,
+            t_response=flight["t_response"] if flight else None,
+            flight_ms=flight["flight_ms"] if flight else None,
+            attempts=flight["attempt"] if flight else None,
+        )
+        # Statically-priced compat backends (Moonshot, Alibaba, ...) return no
+        # per-request cost, so price this call from its token counts NOW and
+        # record it as an `llm.cost` keyed by the content-hash `key` — the
+        # external analogue of OpenRouter's `generation_id`. `_usage_summary`
+        # prefers this key-join over any OpenRouter cost for the same call, which
+        # is what makes a BYOK leg (billed at $0 through OpenRouter) settle at its
+        # true token cost. Unpriced models emit nothing here and fall through to
+        # the settled-cost sweep as before.
+        cost = token_cost(model, tokens_in, tokens_out)
+        if cost is not None:
+            logging.log(
+                "llm.cost", key=key, cost=cost, model=model,
+                tokens_in=tokens_in, tokens_out=tokens_out,
+            )
+        return validated
+    finally:
+        if slot is not None:
+            _inflight[slot] = max(0, _inflight.get(slot, 1) - 1)
 
 
 # --- transport dispatch -------------------------------------------------------
@@ -303,9 +376,9 @@ class _Completion:
 
 # Read budget for the direct OpenAI-compatible transport. The call is
 # non-streamed, so this caps the WHOLE generation — a thinking-enabled model
-# forms its entire body before responding. Set high (45 min) because Kimi K3 at
+# forms its entire body before responding. Set high (1.5h) because Kimi K3 at
 # reasoning_effort=max can genuinely take many minutes to complete.
-_OPENAI_COMPAT_TIMEOUT = httpx.Timeout(connect=30.0, read=5400.0, write=60.0, pool=60.0)
+_OPENAI_COMPAT_TIMEOUT = httpx.Timeout(connect=30.0, read=7200.0, write=60.0, pool=60.0)
 
 # OpenRouter SDK per-request read budget (ms in the SDK). Kept as a constant so
 # the transport-retry diagnostics can report the cap a timeout actually hit.
@@ -843,12 +916,28 @@ async def backfill_costs(
     pending: list[tuple[logging.SlotLog, str]] = []
     seen: set[str] = set()
     for sl in get_logs():
+        # Never FORCE-LOAD a cell's log just to price it. A cell's events parse
+        # lazily on first access (see `_LazyState`); an idle/never-opened cell's
+        # log can be gigabytes, and eagerly loading every cell each sweep is what
+        # OOMs the process with no scene even open. A cell that's actually active
+        # (generating / opened) is already loaded, so its fresh costs still get
+        # priced here; a genuinely idle cell's costs were priced while it ran and
+        # get re-priced the moment it's next loaded.
+        if not sl.loaded:
+            continue
         events = sl.state["events"]
         resolved = {
             e.get("generation_id") for e in events if e.get("kind") == "llm.cost"
         }
         for e in events:
             if e.get("kind") != "cache.llm":
+                continue
+            # A statically-priced compat backend is token-priced at call time
+            # (its own `llm.cost`, key-joined); it must NOT be OpenRouter-priced
+            # here. This is the fix for a BYOK leg, which carries a real
+            # generation_id yet bills $0 through OpenRouter — leaving it in the
+            # sweep would append that $0 and mask the true token cost.
+            if model_pricing(e.get("model")) is not None:
                 continue
             gid = e.get("generation_id")
             if isinstance(gid, str) and gid not in resolved and gid not in seen:

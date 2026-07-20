@@ -199,7 +199,7 @@ function collapseHeavyVars(text, variables) {
 
 // ── the shared chat component ────────────────────────────────────────────────
 
-export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
+export function createInvestigator(hostEl, { onClose = () => {}, loadCallBytes = null } = {}) {
   let refs = null; // { title, sub, status, body, attach, input, sendBtn, mention }
   let ctx = null; // { run, slot, model, branch }
   let currentId = null;
@@ -602,6 +602,12 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
     syncSendControls();
     renderTranscript();
     await ensureBase();
+    // Attached steps' exact bytes are stripped from the slim history/live streams;
+    // fetch them (hydrating the shared call objects in place) so `attachmentBlock`
+    // embeds the real prompt/output/reasoning, not "(empty)".
+    if (loadCallBytes) {
+      await Promise.all([...t.attached].map((idx) => loadCallBytes(callByIndex(idx))));
+    }
     let result = null;
     let error = null;
     if (!t.base) {
@@ -750,6 +756,9 @@ export function createInvestigator(hostEl, { onClose = () => {} } = {}) {
       // even via a "why?" click on its call row.
       if (callByIndex(index)?.template === "library_match") return;
       t.attached.add(index);
+      // Warm the slim call's heavy bytes now so the context preview + send embed
+      // the real prompt/output (sendTurn also awaits this, defensively).
+      if (loadCallBytes) Promise.resolve(loadCallBytes(callByIndex(index))).catch(() => {});
       renderAttach();
       updateStatus();
       ensureBase();
