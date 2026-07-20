@@ -140,9 +140,11 @@ export const api = {
 			`/runs/${encodeURIComponent(run)}/splat/stage1/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
 			{ method: "POST" },
 		),
-	// Stage 2 (free-space voxelizer + clearance + reachability). `body` may carry
-	// `pitch`/`refine`/`margin`. Status returns the `voxels.bin` viz URL the viewer
-	// draws as an overlay.
+	// Stage 2 (free-space voxelizer: single uniform grid, flood-fill empty/garbage
+	// classification + the clearance pass baking the FREE threshold). `body` may
+	// carry `pitch`/`margin`/`clearance`. Status returns the `voxels.bin` URL —
+	// an SVX2 pack (occupied + garbage triples, empty [x,y,z,clearance] quads)
+	// the viewer draws as the green/red/blue voxel overlay.
 	splatStage2Start: (run, slot, model, body) =>
 		request(
 			`/runs/${encodeURIComponent(run)}/splat/stage2/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
@@ -152,9 +154,30 @@ export const api = {
 		request(
 			`/runs/${encodeURIComponent(run)}/splat/stage2/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
 		),
-	// Stage 3 (surfel sampler → cloud.ply). `body` carries sampling knobs
-	// (splat_density / target_splats / radius_frac / flatness / adaptive /
-	// cull_hidden / detail_splats); requires Stage 2 first. Status returns cloud/detail URLs.
+	// Re-bake the FREE threshold of an existing grid (the clearance slider's
+	// "apply"): rewrites clearance_m in freespace.npz — no re-voxelization —
+	// and invalidates stages 4+ (stage 3 reads EMPTY, which is unchanged).
+	splatStage2Clearance: (run, slot, model, body) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/stage2/${encodeURIComponent(slot)}/${encodeURIComponent(model)}/clearance`,
+			{ method: "POST", body },
+		),
+	// Which asset set feeds the cell's splat pipeline: "auto" (generated build,
+	// else library), "generated", or "library". Assets are consumed AS-IS (no
+	// tier build / de-optimization); setting it invalidates every stage output
+	// (the meshes changed).
+	splatSourceGet: (run, slot, model) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/source/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+		),
+	splatSourceSet: (run, slot, model, body) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/source/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+			{ method: "POST", body },
+		),
+	// Stage 3 (surfel sampler → cloud.ply). `body` carries THE quality knob
+	// (`detail`, a density multiplier; 1 = default look — everything else is
+	// derived server-side); requires Stage 2 first. Status returns the cloud URL.
 	splatStage3Start: (run, slot, model, body) =>
 		request(
 			`/runs/${encodeURIComponent(run)}/splat/stage3/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,

@@ -24,11 +24,13 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
   * Depth: planar camera-space Z (metres), decoded from the SZF frame's log-uint16
     codes via the shared [near, far] (legacy 16-bit PNG / float32 `.npy` sets still
-    read as-is). The loss compares the reference against the splat's MEDIAN depth
-    (`depth_mode="median"`, the transmittance-0.5 crossing) — the same "nearest
-    depth-WRITING surface" statistic Stage 5 stores, which BLEND glass (α ≈ 0.065)
-    never shifts; expected (ED) depth would mix the pane into every window pixel
-    and steadily push glass opacity toward zero.
+    read as-is). The loss compares the reference against the splat's EXPECTED depth
+    (`depth_mode="expected"`, the ED channel) — the one per-pixel term that sees a
+    low-opacity floater stranded in front of an opaque surface (photometric L1 and
+    the alpha loss are both blind to it there). `depth_mode="median"` (the
+    transmittance-0.5 crossing) is cleaner at silhouettes and never fades BLEND
+    glass (α ≈ 0.065 stays below the crossing), but is blind to those floaters —
+    reserve it for genuinely glass-heavy scenes.
   * Colour: sRGB albedo compared directly (no sRGB↔linear); SH degree a config
     flag (0 = unlit, the decided default), raisable later for shiny surfaces.
 
@@ -40,8 +42,9 @@ LOSSES (per view):
     energy;
   * alpha (mask) — L1(render α, reference α): the renderer's exact coverage
     masks make empty space stay empty and glass stay see-through;
-  * depth — alpha-gated L1 on the median depth (floater suppression that cannot
-    fade glass);
+  * depth — alpha-gated L1 on the expected depth (the one term that suppresses
+    low-opacity floaters in front of opaque surfaces; `depth_mode` switches it to
+    median for glass scenes);
   * 2DGS regularizers — normal consistency (render normals vs normals-from-depth)
     and optional depth distortion.
 
@@ -81,6 +84,10 @@ logging.getLogger("PIL").setLevel(logging.ERROR)
 # The optimized splat written under a cell's `splat/` dir (a 2DGS `.ply`, the
 # same layout Stage 3 emits so Stage 7/8 + the viewer read it identically).
 TRAINED_NAME = "trained.ply"
+
+# SH degree-0 basis constant (matches Stage 3/4): colour = 0.5 + C0·f_dc, so a
+# seeded Gaussian's albedo → f_dc = (rgb − 0.5)/C0.
+_SH_C0 = 0.28209479177387814
 
 # progress(done, total, message) — called periodically during training.
 ProgressCb = Callable[[int, int, str], None]
@@ -137,6 +144,54 @@ class TrainParams:
     prune_opa: float = 0.03
     absgrad: bool = False
     cap_max: int = 3_000_000           # freeze densification past this many Gaussians (VRAM guard)
+    # Final cleanup prune (once, before eval + export). Densification/pruning stop at
+    # refine_stop (50% of iters), so opacity that drifts below prune_opa in the back
+    # half — the low-opacity floaters stranded at silhouette/depth edges — otherwise
+    # ships. This drops them, plus any Gaussian whose max tangent radius exceeds
+    # prune_scale3d·scene_scale (runaway blobs; a safe no-op on well-behaved clouds,
+    # whose largest surfel sits well under that). prune_scale3d=0 disables the scale
+    # guard; final_prune=False disables the whole pass.
+    final_prune: bool = True
+    prune_scale3d: float = 0.1
+
+    # Adaptive VRAM guard. cap_max is the hard ceiling; additionally freeze
+    # densification (and pause depth-seeding) when free VRAM drops below this many
+    # GB — after one empty_cache retry to release reusable cached blocks — so an
+    # 8 GB card can't densify itself over the WDDM shared-memory cliff that
+    # collapsed a real run to 0.05 it/s. 0 disables (rely on cap_max alone).
+    # (`expandable_segments` would fight fragmentation on Linux/Modal but is a
+    # no-op on Windows, so this free-margin freeze is the portable mechanism.)
+    vram_min_free_gb: float = 0.8
+
+    # Anti-aliasing — a Mip-Splatting-style 3D low-pass computed from the exact
+    # cameras. Every `aa_every` steps, lower-bound each Gaussian's two in-plane
+    # log-scales so it projects to ≥ `aa_min_scale_px` std from its NEAREST camera
+    # (radius floor = px·d_nn/focal). A Gaussian the closest camera can't resolve
+    # would alias — shimmer across the scale ladder's octaves under free-fly. The
+    # floor scales with distance, so close-viewed detail and large surfaces are
+    # untouched; only genuinely sub-pixel Gaussians are inflated.
+    antialias: bool = True
+    aa_min_scale_px: float = 1.0
+    aa_every: int = 200
+
+    # Depth-guided densification (unique to this pipeline's EXACT reference depth).
+    # Every `depth_densify_every` steps, find reference pixels holding an opaque
+    # surface the splat is MISSING — rendered α < `miss_alpha` (a hole) or rendered
+    # depth behind the reference by > `depth_tol` (a near surface absent) — unproject
+    # them to world at the reference depth, and seed Gaussians there (colour =
+    # reference albedo, normal toward the camera). This fills real geometry directly
+    # instead of waiting for screen-space gradients to diffuse a clone into the gap,
+    # and it grows surface rather than the edge floaters densification-at-silhouettes
+    # produces. Capped at `depth_densify_max` per pass, paused under VRAM pressure,
+    # and only inside the densification window.
+    depth_densify: bool = True
+    depth_densify_every: int = 500
+    depth_densify_start: int = 500
+    depth_densify_max: int = 20_000
+    depth_densify_miss_alpha: float = 0.5
+    depth_densify_depth_tol: float = 0.1
+    depth_densify_opacity: float = 0.5
+    depth_densify_scale_px: float = 1.0
 
     # Runtime. (2DGS renders non-packed: gsplat's packed depth path is broken —
     # its SH branch mis-broadcasts and its precomputed-colour path skips the
@@ -144,13 +199,16 @@ class TrainParams:
     # cloud. Non-packed is also cheap at our per-cell Gaussian counts.)
     near_plane: float = 0.01
     far_plane: float = 1e10
-    # Depth statistic the depth loss (and normals-from-depth) compares: "median"
-    # = the transmittance-0.5 crossing — the same "nearest depth-WRITING surface"
-    # the references store, which BLEND glass (α ≈ 0.065) never shifts, so depth
-    # supervision cannot fade panes; "expected" = the alpha-weighted mean (ED) —
-    # denser gradients, but it mixes the pane into every window pixel and pushes
-    # glass opacity toward 0.
-    depth_mode: str = "median"
+    # Depth statistic the depth loss (and normals-from-depth) compares. "expected"
+    # (default) = the alpha-weighted mean (ED): the ONLY per-pixel term that sees a
+    # low-opacity floater stranded in front of an opaque surface — L1 is camouflaged
+    # (the floater blends toward its backing's colour), the alpha loss is saturated
+    # (coverage behind it is already 1), and the median's transmittance-0.5 crossing
+    # sits on the surface BEHIND it, so only the expected depth is shifted by a front
+    # floater. "median" = the transmittance-0.5 crossing: cleaner at silhouettes and
+    # it never fades BLEND glass (α ≈ 0.065 stays below the crossing), but it's blind
+    # to those floaters — use it only for genuinely glass-heavy scenes.
+    depth_mode: str = "expected"
     seed: int = 0
     eval_max_views: int = 128          # cap final-metric renders (plans can have thousands of views)
     log_every: int = 50                # emit a progress line every N steps
@@ -184,6 +242,14 @@ class TrainParams:
             "reset_every": self.reset_every,
             "grow_grad2d": self.grow_grad2d,
             "prune_opa": self.prune_opa,
+            "final_prune": self.final_prune,
+            "prune_scale3d": self.prune_scale3d,
+            "vram_min_free_gb": self.vram_min_free_gb,
+            "antialias": self.antialias,
+            "aa_min_scale_px": self.aa_min_scale_px,
+            "depth_densify": self.depth_densify,
+            "depth_densify_every": self.depth_densify_every,
+            "depth_densify_max": self.depth_densify_max,
             "batch": self.batch,
             "ckpt_every": self.ckpt_every,
         }
@@ -437,9 +503,18 @@ def _load_view(torch, view: dict[str, Any], device):  # noqa: ANN001
     return rgb, alpha, depth
 
 
-def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  # noqa: ANN001
+def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, start_step: int = 0):  # noqa: ANN001
     """Infinite stream of training batches — `(viewmats [B,4,4], rgb [B,H,W,3],
-    alpha [B,H,W,1], depth [B,H,W,1] | None)` on `device`, B random views each.
+    alpha [B,H,W,1], depth [B,H,W,1] | None)` on `device`, B views each.
+
+    Views are drawn WITHOUT replacement: each epoch is a fresh permutation of all
+    n views walked `batch` at a time (reshuffled on wrap), so every reference
+    image contributes and exposure is uniform — the coverage Stage 4 solved for is
+    actually delivered to the optimizer, instead of the ~e^(-steps·batch/n) of
+    views a with-replacement draw would never touch on a large plan. The schedule
+    is a pure function of the global draw counter (`start_step·batch`), each
+    epoch's permutation seeded by `(seed, epoch)`, so a checkpoint resume continues
+    the exact same view order rather than restarting it.
 
     With `prefetch`, a daemon thread does the expensive part (SZF zstd / legacy
     PNG decode + stacking) for the NEXT batch while the GPU trains on the current
@@ -448,10 +523,28 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  
     tensor-lifetime traps."""
     n = len(views)
 
-    def decode_batch(rng) -> tuple:  # noqa: ANN001 - CPU tensors, stacked to [B,...]
+    def epoch_perm(e: int) -> np.ndarray:
+        """View order for epoch `e`, seeded by (seed, epoch) so a resumed run
+        reproduces the identical shuffle."""
+        return np.random.default_rng([seed, e]).permutation(n)
+
+    def draw_indices(start_draw: int):  # noqa: ANN202 - infinite view-index stream
+        """Concatenated per-epoch permutations from global draw `start_draw` on:
+        view = perm(d // n)[d % n]. Every view appears exactly once per n draws; a
+        batch straddling an epoch boundary simply spans two permutations."""
+        d = start_draw
+        cur_e, perm = -1, None
+        while True:
+            e = d // n
+            if e != cur_e:
+                cur_e, perm = e, epoch_perm(e)
+            yield int(perm[d % n])
+            d += 1
+
+    def decode_batch(idx_gen) -> tuple:  # noqa: ANN001 - CPU tensors, stacked to [B,...]
         vms, rgbs, alphas, depths = [], [], [], []
         for _ in range(batch):
-            v = views[int(rng.integers(0, n))]
+            v = views[next(idx_gen)]
             rgb, alpha, d = _view_arrays(v)
             vms.append(v["viewmat"])
             rgbs.append(torch.from_numpy(np.ascontiguousarray(rgb)))
@@ -469,9 +562,9 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  
         )
 
     if not prefetch:
-        rng = np.random.default_rng(seed)
+        idx_gen = draw_indices(start_step * batch)
         while True:
-            yield to_dev(decode_batch(rng))
+            yield to_dev(decode_batch(idx_gen))
 
     import queue
     import threading
@@ -479,10 +572,10 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int):  
     q: queue.Queue = queue.Queue(maxsize=3)
 
     def worker() -> None:
-        rng = np.random.default_rng(seed)
+        idx_gen = draw_indices(start_step * batch)
         try:
             while True:
-                q.put(decode_batch(rng))  # blocks when the queue is full
+                q.put(decode_batch(idx_gen))  # blocks when the queue is full
         except Exception as exc:  # surface to the main thread rather than deadlock
             q.put(exc)
 
@@ -543,6 +636,127 @@ def _load_checkpoint(torch, ckpt_dir: Path, device):  # noqa: ANN001
         except Exception:
             continue
     return None
+
+
+def _quat_from_normal(torch, normals):  # noqa: ANN001 - [M,3] unit → [M,4] wxyz (+Z→normal)
+    """Shortest-arc quaternions rotating +Z onto each unit normal (the axis Stage 3
+    and the exporter treat as the surfel normal, so `_quats_to_normals` inverts this).
+    Antipodal (+Z ≈ −normal) rotates 180° about X."""
+    nx, ny, nz = normals[:, 0], normals[:, 1], normals[:, 2]
+    q = torch.stack([1.0 + nz, -ny, nx, torch.zeros_like(nz)], dim=1)
+    antip = q[:, 0] < 1e-6
+    if bool(antip.any()):
+        flip = torch.tensor([0.0, 1.0, 0.0, 0.0], device=normals.device, dtype=q.dtype)
+        q = torch.where(antip[:, None], flip, q)
+    return q / (q.norm(dim=1, keepdim=True) + 1e-12)
+
+
+def _append_gaussians(torch, splats, optimizers, strat_state, new):  # noqa: ANN001
+    """Grow the model by the Gaussians in `new` (per-key tensors; any key a splat has
+    but `new` omits — e.g. shN — is zero-filled), extending each Adam optimizer's
+    moments and the strategy's running state (grad2d/count) with zeros so training
+    stays consistent. Call AFTER the strategy's per-step work, so the step's `info`
+    (sized to the pre-append count) is never used against the grown tensors."""
+    m = int(new["means"].shape[0])
+    for name in list(splats.keys()):
+        p_old = splats[name]
+        add = (
+            new[name].to(device=p_old.device, dtype=p_old.dtype)
+            if name in new
+            else torch.zeros((m, *p_old.shape[1:]), device=p_old.device, dtype=p_old.dtype)
+        )
+        p_new = torch.nn.Parameter(
+            torch.cat([p_old.detach(), add], dim=0), requires_grad=p_old.requires_grad
+        )
+        opt = optimizers.get(name)
+        if opt is not None:
+            st = opt.state.pop(p_old, None)
+            if st is not None:
+                for key in ("exp_avg", "exp_avg_sq"):
+                    if key in st and torch.is_tensor(st[key]):
+                        z = torch.zeros((m, *st[key].shape[1:]), device=st[key].device, dtype=st[key].dtype)
+                        st[key] = torch.cat([st[key], z], dim=0)
+                opt.state[p_new] = st
+            for g in opt.param_groups:
+                if len(g["params"]) == 1 and g["params"][0] is p_old:
+                    g["params"] = [p_new]
+        splats[name] = p_new
+    for key in ("grad2d", "count"):
+        v = strat_state.get(key)
+        if torch.is_tensor(v):
+            strat_state[key] = torch.cat([v, torch.zeros(m, device=v.device, dtype=v.dtype)], dim=0)
+
+
+def _aa_scale_floor(torch, splats, cam_tree, focal, aa_min_px):  # noqa: ANN001
+    """Lower-bound each Gaussian's two in-plane log-scales so its projected std is
+    ≥ `aa_min_px` from the NEAREST camera (radius floor = aa_min_px·d_nn/focal). Only
+    inflates Gaussians a close camera would render sub-pixel; larger/close-viewed
+    ones are untouched (the floor shrinks with camera distance). Returns the median
+    floor radius in metres, for logging."""
+    means_np = splats["means"].detach().cpu().numpy()
+    d_nn = np.asarray(cam_tree.query(means_np, k=1, workers=-1)[0], dtype=np.float64)
+    floor_r = (aa_min_px * np.maximum(d_nn, 1e-6) / max(float(focal), 1e-6)).astype(np.float32)
+    log_floor = torch.from_numpy(np.log(np.maximum(floor_r, 1e-9))).to(splats["scales"].device)
+    with torch.no_grad():
+        s = splats["scales"]
+        s[:, 0] = torch.maximum(s[:, 0], log_floor)
+        s[:, 1] = torch.maximum(s[:, 1], log_floor)
+    return float(np.median(floor_r))
+
+
+def _depth_seed(torch, gt_rgb, gt_alpha, gt_depth, pred_alpha, pred_depth, viewmats, K, params, max_new):  # noqa: ANN001
+    """Seed Gaussians at reference-depth surfaces the splat is missing. Per batched
+    view: pixels with a reference opaque surface (gt_alpha > alpha_gate, gt_depth > 0)
+    that the render doesn't cover (pred_alpha < miss_alpha) or resolves well BEHIND
+    (pred_depth > gt_depth·(1+tol)) are unprojected to world at the reference depth
+    (OpenCV: x=(px−cx)/fx·d, y=(py−cy)/fy·d, z=d; world = c2w·p_cam) and returned as
+    new-Gaussian tensors (colour = reference albedo, normal toward the camera, scale
+    from the pixel footprint). None when nothing is deficient / no budget."""
+    if gt_depth is None or max_new <= 0:
+        return None
+    device = gt_rgb.device
+    B = gt_rgb.shape[0]
+    fx, fy, cx, cy = K[0, 0], K[1, 1], K[0, 2], K[1, 2]
+    focal = float(K[0, 0])
+    cap_b = max(1, max_new // B)
+    pos_l, col_l, nrm_l, dep_l = [], [], [], []
+    for b in range(B):
+        surface = (gt_alpha[b, ..., 0] > params.alpha_gate) & (gt_depth[b, ..., 0] > 0)
+        hole = pred_alpha[b, ..., 0] < params.depth_densify_miss_alpha
+        behind = (~hole) & (pred_depth[b, ..., 0] > gt_depth[b, ..., 0] * (1.0 + params.depth_densify_depth_tol))
+        idx = (surface & (hole | behind)).nonzero(as_tuple=False)
+        if idx.shape[0] == 0:
+            continue
+        if idx.shape[0] > cap_b:
+            idx = idx[torch.randperm(idx.shape[0], device=device)[:cap_b]]
+        row, col = idx[:, 0], idx[:, 1]
+        d = gt_depth[b, row, col, 0]
+        x = (col.to(d.dtype) + 0.5 - cx) / fx * d
+        y = (row.to(d.dtype) + 0.5 - cy) / fy * d
+        p_cam = torch.stack([x, y, d], dim=1)                       # [K,3] OpenCV camera frame
+        c2w = torch.linalg.inv(viewmats[b])
+        world = p_cam @ c2w[:3, :3].transpose(0, 1) + c2w[:3, 3]    # [K,3]
+        normal = c2w[:3, 3][None, :] - world                        # face the camera that saw it
+        normal = normal / (normal.norm(dim=1, keepdim=True) + 1e-12)
+        pos_l.append(world)
+        col_l.append(gt_rgb[b, row, col, :])
+        nrm_l.append(normal)
+        dep_l.append(d)
+    if not pos_l:
+        return None
+    means = torch.cat(pos_l, 0).float()
+    color = torch.cat(col_l, 0).clamp(0.0, 1.0)
+    normals = torch.cat(nrm_l, 0)
+    depths = torch.cat(dep_l, 0)
+    m = means.shape[0]
+    sh0 = ((color - 0.5) / _SH_C0)[:, None, :].float()
+    quats = _quat_from_normal(torch, normals).float()
+    radius = (params.depth_densify_scale_px * depths / max(focal, 1e-6)).clamp_min(1e-6)
+    log_r = torch.log(radius)
+    scales = torch.stack([log_r, log_r, log_r + float(np.log(0.01))], dim=1).float()
+    a = float(np.clip(params.depth_densify_opacity, 1e-3, 1.0 - 1e-3))
+    opac = torch.full((m,), float(np.log(a / (1.0 - a))), device=device).float()
+    return {"means": means, "scales": scales, "quats": quats, "opacities": opac, "sh0": sh0}
 
 
 def train_splat(
@@ -714,6 +928,16 @@ def train_splat(
     window = _gaussian_window(torch, 11, 1.5, device, channels=3)
     dist_on = params.dist_lambda > 0.0
 
+    # Nearest-camera KD-tree for the anti-aliasing scale floor (cameras are fixed,
+    # so build once); `focal` (= fl_x) converts a camera distance to a pixel span.
+    cam_tree = None
+    focal = float(K[0, 0].item())
+    if params.antialias and n_views > 0:
+        from scipy.spatial import cKDTree
+
+        cam_tree = cKDTree(centers)
+    n_seeded = 0
+
     n_last = int(splats["means"].shape[0])
     if progress is not None:
         where = f"resume@{start_step} n={n_last}" if start_step else f"init={n_init}"
@@ -722,7 +946,7 @@ def train_splat(
     t_start = t_last = time.perf_counter()
     done_last = start_step
     log_every = max(params.log_every, 1)
-    stream = _view_stream(torch, views, device, max(params.batch, 1), params.prefetch, params.seed)
+    stream = _view_stream(torch, views, device, max(params.batch, 1), params.prefetch, params.seed, start_step)
 
     for step in range(start_step, params.iterations):
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
@@ -793,8 +1017,56 @@ def train_splat(
 
         if params.refine:
             strategy.step_post_backward(splats, optimizers, strat_state, step, info, packed=False)
+            # Adaptive VRAM: cap_max is the hard ceiling; also freeze densification
+            # when free VRAM nears the WDDM shared-memory cliff (after one empty_cache
+            # retry to release reusable cached blocks), so growth can't collapse
+            # throughput into PCIe paging.
             if len(splats["means"]) > params.cap_max:
-                strategy.refine_stop_iter = step  # freeze densification (VRAM guard)
+                strategy.refine_stop_iter = step
+            elif params.vram_min_free_gb > 0.0 and step < strategy.refine_stop_iter:
+                need = params.vram_min_free_gb * 1e9
+                free_b = torch.cuda.mem_get_info()[0]
+                if free_b < need:
+                    torch.cuda.empty_cache()
+                    free_b = torch.cuda.mem_get_info()[0]
+                    if free_b < need:
+                        strategy.refine_stop_iter = step
+                        if progress is not None:
+                            progress(
+                                step + 1, params.iterations,
+                                f"VRAM guard: {free_b / 1e9:.2f}GB free < {params.vram_min_free_gb}GB - "
+                                f"froze densification at n={len(splats['means'])}",
+                            )
+
+        # Depth-guided densification: seed Gaussians at reference surfaces the splat
+        # is missing (holes / too-far). After the strategy so this step's `info` is
+        # never used against the grown tensors; inside the densification window and
+        # only while VRAM allows growth.
+        if (
+            params.depth_densify
+            and params.depth_densify_start <= step < strategy.refine_stop_iter
+            and (step + 1) % max(params.depth_densify_every, 1) == 0
+            and len(splats["means"]) < params.cap_max
+        ):
+            tight = (
+                params.vram_min_free_gb > 0.0
+                and torch.cuda.mem_get_info()[0] < 1.5 * params.vram_min_free_gb * 1e9
+            )
+            new = (
+                None if tight
+                else _depth_seed(
+                    torch, gt_rgb, gt_alpha, gt_depth, pred_alpha.detach(),
+                    pred_depth.detach(), viewmats, K, params, int(params.depth_densify_max),
+                )
+            )
+            if new is not None:
+                _append_gaussians(torch, splats, optimizers, strat_state, new)
+                n_seeded += int(new["means"].shape[0])
+
+        # Anti-aliasing floor: keep every Gaussian resolvable by its nearest camera
+        # so it can't shimmer across the scale-ladder octaves under free-fly.
+        if params.antialias and cam_tree is not None and (step + 1) % max(params.aa_every, 1) == 0:
+            _aa_scale_floor(torch, splats, cam_tree, focal, params.aa_min_scale_px)
 
         if progress is not None and (step % log_every == 0 or step == params.iterations - 1):
             now = time.perf_counter()
@@ -824,12 +1096,28 @@ def train_splat(
                 strat_state, meta, params.ckpt_keep,
             )
 
+    # One-shot cleanup prune before eval + export: densification stopped at
+    # refine_stop, so low-opacity floaters that drifted below prune_opa in the back
+    # half are still present. Prune once here so BOTH the reported metrics and the
+    # written splat reflect the shipped model.
+    n_pruned = (
+        _final_prune(torch, splats, params.prune_opa, params.prune_scale3d, scene_scale)
+        if params.final_prune
+        else 0
+    )
+    if progress is not None and n_pruned:
+        progress(
+            params.iterations, params.iterations,
+            f"final prune: -{n_pruned} floaters below opacity {params.prune_opa} "
+            f"(-> {int(splats['means'].shape[0])} splats)",
+        )
+
     # Final metrics over a capped subset + write the splat.
     if progress is not None:
         progress(
             params.iterations,
             params.iterations,
-            f"training done in {_fmt_hms(time.perf_counter() - t_start)} — "
+            f"training done in {_fmt_hms(time.perf_counter() - t_start)} - "
             f"evaluating {min(n_views, params.eval_max_views)} views + writing {out_path.name}",
         )
     metrics = _evaluate(
@@ -860,6 +1148,8 @@ def train_splat(
         "model": model,
         "splats_init": n_init,
         "splats_final": n_final,
+        "splats_pruned_final": n_pruned,
+        "splats_depth_seeded": n_seeded,
         "iterations": params.iterations,
         "views": n_views,
         "resolution": width,
@@ -869,6 +1159,24 @@ def train_splat(
         "bytes": out_path.stat().st_size,
         "out_path": str(out_path),
     }
+
+
+def _final_prune(torch, splats, prune_opa: float, prune_scale3d: float, scene_scale: float) -> int:  # noqa: ANN001
+    """One-shot cleanup before export: drop Gaussians below `prune_opa` opacity (the
+    low-opacity floaters left after densification stopped) and, when `prune_scale3d
+    > 0`, any whose max tangent radius exceeds `prune_scale3d·scene_scale` (runaway
+    blobs). Mutates `splats` in place — the optimizer is done, so the pruned
+    parameters need no grad or Adam state — and returns the count removed."""
+    with torch.no_grad():
+        keep = torch.sigmoid(splats["opacities"]).flatten() >= prune_opa
+        if prune_scale3d > 0.0:
+            max_radius = torch.exp(splats["scales"]).max(dim=-1).values
+            keep = keep & (max_radius <= prune_scale3d * scene_scale)
+        removed = int((~keep).sum())
+        if removed:
+            for name in list(splats.keys()):
+                splats[name] = torch.nn.Parameter(splats[name][keep], requires_grad=False)
+    return removed
 
 
 def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params, device):  # noqa: ANN001
@@ -950,6 +1258,18 @@ def _main() -> None:
         help="write a resumable checkpoint every N steps (0 disables)",
     )
     ap.add_argument(
+        "--vram-min-free-gb", type=float, default=TrainParams.vram_min_free_gb,
+        help="freeze densification when free VRAM drops below this (0 disables)",
+    )
+    ap.add_argument(
+        "--antialias", action=argparse.BooleanOptionalAction, default=TrainParams.antialias,
+        help="Mip-style per-Gaussian scale floor from the nearest camera (anti-shimmer)",
+    )
+    ap.add_argument(
+        "--depth-densify", action=argparse.BooleanOptionalAction, default=TrainParams.depth_densify,
+        help="seed Gaussians at reference-depth surfaces the splat is missing",
+    )
+    ap.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
         help="resume from the latest checkpoint beside --out (splat/ckpt) if present",
     )
@@ -975,6 +1295,9 @@ def _main() -> None:
             refine_stop_iter=args.refine_stop_iter,
             batch=args.batch,
             ckpt_every=args.ckpt_every,
+            vram_min_free_gb=args.vram_min_free_gb,
+            antialias=args.antialias,
+            depth_densify=args.depth_densify,
         ),
         resume=args.resume,
         progress=_log,

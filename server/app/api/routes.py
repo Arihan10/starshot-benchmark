@@ -31,7 +31,6 @@ import shutil
 import struct
 import subprocess
 import sys
-import tempfile
 import time
 from collections import deque
 from urllib.parse import quote
@@ -84,17 +83,11 @@ from splat import stage4 as splat_stage4  # noqa: E402
 from splat import stage5 as splat_stage5  # noqa: E402  (torch-free contract module)
 from splat import stage6 as splat_stage6  # noqa: E402  (torch/gsplat lazy inside)
 
-# Node de-optimizer (server/tools/optimize-assets/deoptimize.mjs): rewrites the
-# cell's KTX2/Meshopt SPLAT tier to vanilla glTF so the trimesh-based stages
-# (1-3) can read it; Stage 5's WebGL capture renders the tier directly. Reuses
-# the optimizer tool's node_modules.
-_DEOPT_DIR = _REPO_ROOT / "server" / "tools" / "optimize-assets"
-_DEOPT_SCRIPT = _DEOPT_DIR / "deoptimize.mjs"
-_NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
-
-# Offline per-cell asset-tier builder (lite presentation tier + the splat
-# sample/render tier) — driven by the build-lite endpoint and by the splat
-# stages' _ensure_splat_tier (background subprocess, progress polled).
+# Offline per-cell lite-tier builder (the LITE presentation tier the viewer
+# streams) — driven by the build-lite endpoint (background subprocess, progress
+# polled). The splat stages neither build nor convert anything: the selected
+# asset set is consumed AS-IS (vanilla via trimesh; KTX2/Meshopt via the
+# in-process decoder in splat/assets.py, texels included).
 _BUILD_LITE_SCRIPT = _REPO_ROOT / "server" / "scripts" / "build_lite_assets.py"
 
 # Stage-5 reference capture (splat/stage5.py + client/public/js/splatcapture.js):
@@ -207,8 +200,9 @@ _lite_build_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
 # --- Stage 2 free-space voxelization jobs (background, one per CELL) ----------
 # The shared spatial foundation (Option A, runs first): the cell's splat tier
-# (de-optimized once) is voxelized into a dual-resolution occupancy +
-# clearance + reachability grid `splat/freespace.npz` (splat/stage2.py), with a
+# (de-optimized once) is voxelized into a single uniform occupancy grid whose
+# empty cells are classified free vs garbage by the two-phase flood fill, plus
+# a clearance field → `splat/freespace.npz` (splat/stage2.py), with a
 # `voxels.bin` viz cloud + `freespace.json` sidecar so 'done' survives a restart.
 _splat_stage2_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage2_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
@@ -1687,50 +1681,93 @@ def _resolve_gen_variant(variant: str | None, optimized: bool) -> str:
     return "optimized" if optimized else "raw"
 
 
-# --- the splat asset tier ------------------------------------------------------
-# Every splat stage samples/renders ONE canonical per-cell build: the SPLAT tier
-# (optimize.mjs --preset splat) — moderate error-bounded decimation + 1024px
-# KTX2/ETC1S base color (other maps stripped; the pipeline is unlit) + Meshopt.
-# Stage 5's WebGL capture renders it directly (KTX2 stays GPU-compressed);
-# stages 1-3 de-optimize it to vanilla once per run for trimesh. Built lazily
-# from the cell's vanilla source by `_ensure_splat_tier`.
+# --- splat asset sources ---------------------------------------------------------
+# The splat stages consume a cell's asset sets AS-IS — no tier build, no
+# de-optimization. Vanilla glTF loads through trimesh; KTX2/Meshopt sets are
+# decoded in-process by `splat/assets.py` (meshopt geometry natively; KTX2
+# texels are NOT decoded — materials degrade to alphaMode/baseColorFactor
+# stubs). Stage 5's WebGL capture renders any of these encodings directly.
+#
+# "auto" prefers the generated build, else the library; an explicit choice is
+# persisted per cell in `splat/source.json` so every stage job, the discovery
+# listing, and the meshes endpoint resolve the SAME assets across restarts.
+_SPLAT_SOURCES = ("auto", "generated", "library")
 
 
-def _splat_tier_source(run: str, slot: str, model: str) -> Path | None:
-    """The VANILLA build the splat tier is built from: the generated raw build,
-    else the library's raw `objects/`. KTX2-only cells (nothing but optimized
-    twins on disk) have no rebuildable source — optimize.mjs can't decode KTX2
-    inputs — so they return None. Disk-only; never hydrates the run."""
+def _splat_source_pref_path(run: str, slot: str, model: str) -> Path:
+    return _slot_dir(run, slot, model) / "splat" / "source.json"
+
+
+def _splat_source_pref(run: str, slot: str, model: str) -> str:
+    """The cell's persisted splat-asset choice ('auto' when unset/invalid)."""
+    try:
+        pref = json.loads(
+            _splat_source_pref_path(run, slot, model).read_text(encoding="utf-8")
+        ).get("source")
+    except Exception:
+        return "auto"
+    return pref if pref in _SPLAT_SOURCES else "auto"
+
+
+def _generated_asset_dir(run: str, slot: str, model: str) -> Path | None:
+    """The generated build's directly-consumable set: the lite KTX2 build when
+    present, else the optimized twin, else the raw vanilla build."""
     rid = _run_id(run, slot, model)
-    raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
-    if _placed_count(raw_dir) > 0:
-        return raw_dir
-    lib_dir = _slot_dir(run, slot, model) / "objects"
-    if _placed_count(lib_dir) > 0:
-        return lib_dir
+    raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
+    lite_dir = raw_dir.parent / generation.GENERATED_LITE_SUBDIR
+    for d in (lite_dir, opt_dir, raw_dir):
+        if _placed_count(d) > 0:
+            return d
     return None
 
 
-def _splat_tier_dir(run: str, slot: str, model: str) -> Path:
-    """Where a cell's splat tier lives: beside the generated build when the cell
-    has one (`objects-generated-splat/`, mirroring the lite/optimized twins), else
-    `objects-splat/` in the cell dir (library cells)."""
-    rid = _run_id(run, slot, model)
-    raw_dir, _ = generation.latest_generated_dirs(RUNS_DIR, rid)
-    if _placed_count(raw_dir) > 0 or (raw_dir.parent / generation.GENERATED_SPLAT_SUBDIR).is_dir():
-        return raw_dir.parent / generation.GENERATED_SPLAT_SUBDIR
-    return _slot_dir(run, slot, model) / "objects-splat"
+def _library_asset_dir(run: str, slot: str, model: str) -> Path | None:
+    """The library build's directly-consumable set (`objects/`, else the
+    migrated `objects-optimized/` twin)."""
+    for name in ("objects", "objects-optimized"):
+        d = _slot_dir(run, slot, model) / name
+        if _placed_count(d) > 0:
+            return d
+    return None
 
 
 def _splat_source(run: str, slot: str, model: str) -> tuple[Path, str] | None:
-    """The splat pipeline's mesh source for a cell — always the SPLAT tier — or
-    None when the cell can neither rebuild it (no vanilla source) nor already has
-    it on disk. The returned dir may not exist yet; stage jobs call
-    `_ensure_splat_tier` before touching it."""
-    tier = _splat_tier_dir(run, slot, model)
-    if _placed_count(tier) > 0 or _splat_tier_source(run, slot, model) is not None:
-        return tier, "splat"
+    """The mesh dir the splat pipeline reads AS-IS, honouring the cell's source
+    preference: 'auto' = generated build else library; an explicit pref pins
+    exactly one (None when that set has no meshes, rather than silently
+    substituting the other). Disk-only; never hydrates the run."""
+    pref = _splat_source_pref(run, slot, model)
+    if pref == "generated":
+        d = _generated_asset_dir(run, slot, model)
+        return (d, "generated") if d is not None else None
+    if pref == "library":
+        d = _library_asset_dir(run, slot, model)
+        return (d, "library") if d is not None else None
+    d = _generated_asset_dir(run, slot, model)
+    if d is not None:
+        return d, "generated"
+    d = _library_asset_dir(run, slot, model)
+    if d is not None:
+        return d, "library"
     return None
+
+
+def _splat_source_state(run: str, slot: str, model: str) -> dict[str, Any]:
+    """The selector's view of a cell: the persisted pref, per-set mesh counts,
+    and what the pipeline would actually resolve to right now."""
+    gen = _generated_asset_dir(run, slot, model)
+    lib = _library_asset_dir(run, slot, model)
+    resolved = _splat_source(run, slot, model)
+    return {
+        "run": run, "slot": slot, "model": model,
+        "source": _splat_source_pref(run, slot, model),
+        "available": {
+            "generated": _placed_count(gen) if gen is not None else 0,
+            "library": _placed_count(lib) if lib is not None else 0,
+        },
+        "active_kind": resolved[1] if resolved else None,
+        "active_dir": resolved[0].name if resolved else None,
+    }
 
 
 async def _run_lite_build(
@@ -1774,64 +1811,31 @@ async def _run_lite_build(
 
 
 async def _ensure_splat_tier(run: str, slot: str, model: str, job: dict[str, Any]) -> Path:
-    """Build (or freshen) the cell's splat tier from its vanilla source, streaming
-    the builder's "[i/N]" progress into `job` under phase 'tier'. Idempotent and
-    resumable — the builder skips up-to-date twins, so a built tier returns in one
-    subprocess pass of stat checks. Returns the tier dir; raises when the cell has
-    no vanilla source and no prebuilt tier."""
-    tier = _splat_tier_dir(run, slot, model)
-    src = _splat_tier_source(run, slot, model)
-    if src is None:
-        if _placed_count(tier) > 0:
-            return tier  # prebuilt tier shipped without its source — use as-is
+    """Resolve the cell's splat asset dir. NO build step remains — the selected
+    set is consumed AS-IS (vanilla via trimesh, KTX2/Meshopt via the in-process
+    decoder in splat/assets.py); the name survives only for its stage-job call
+    sites. Raises when the selected source has no meshes."""
+    source = _splat_source(run, slot, model)
+    if source is None:
         raise FileNotFoundError(
-            "no vanilla build to make the splat tier from (need objects-generated/ "
-            "or a raw library objects/)"
+            "no meshes for the selected splat assets (need a generated build "
+            "or library objects/ matching the choice)"
         )
-    job["phase"] = "tier"
-    proc = await asyncio.create_subprocess_exec(
-        sys.executable, "-u", str(_BUILD_LITE_SCRIPT), "--preset", "splat",
-        "--src-dir", str(src), "--out-dir", str(tier),
-        cwd=str(_REPO_ROOT),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    assert proc.stdout is not None
-    tail = ""
-    async for chunk in proc.stdout:
-        line = chunk.decode(errors="replace").strip()
-        if not line:
-            continue
-        tail = line
-        m = re.search(r"\[(\d+)/(\d+)\]", line)
-        if m:
-            job["done"], job["total"] = int(m.group(1)), int(m.group(2))
-            job["current_id"] = "tier"
-    rc = await proc.wait()
-    if rc != 0:
-        raise RuntimeError(f"splat-tier build failed (exit {rc}): {tail[:300]}")
-    if _placed_count(tier) == 0:
-        raise RuntimeError(f"splat-tier build produced no meshes in {tier}")
-    return tier
+    return source[0]
 
 
 def _discover_splat_stage1_cells(run: str) -> list[tuple[str, str, int, str]]:
     """(slot, model, placed_count, source_kind) for every cell in `run` the splat
-    pipeline can work on — one whose splat tier is built or buildable. The count is
-    the built tier's placed meshes, else the vanilla source's (what the tier will
-    contain once built). Disk-only; never hydrates the run."""
+    pipeline can work on — one whose selected asset set has meshes on disk.
+    Disk-only; never hydrates the run."""
     out: list[tuple[str, str, int, str]] = []
     for slot in SLOTS:
         for alias in MODEL_ALIASES:
             source = _splat_source(run, slot.id, alias)
             if source is None:
                 continue
-            tier_dir, kind = source
-            placed = _placed_count(tier_dir)
-            if placed == 0:
-                src = _splat_tier_source(run, slot.id, alias)
-                placed = _placed_count(src) if src is not None else 0
-            out.append((slot.id, alias, placed, kind))
+            src_dir, kind = source
+            out.append((slot.id, alias, _placed_count(src_dir), kind))
     return out
 
 
@@ -1867,24 +1871,6 @@ def _splat_cell_status(
     }
 
 
-def _deoptimize_dir(src_dir: Path, out_dir: Path) -> None:
-    """Rewrite every placed GLB in `src_dir` (a KTX2/Meshopt library build) to
-    vanilla glTF in `out_dir` via the Node de-optimizer, so the trimesh Stage-1
-    assembler can read them. Blocking (subprocess) — call off the event loop."""
-    result = subprocess.run(
-        [
-            _NODE_BIN, str(_DEOPT_SCRIPT),
-            "--in-dir", str(src_dir), "--out-dir", str(out_dir),
-        ],
-        cwd=str(_DEOPT_DIR),
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout or "").strip()[:500]
-        raise RuntimeError(f"de-optimize failed ({result.returncode}): {detail}")
-
-
 def _assemble_cell_from_tier(
     run: str,
     slot: str,
@@ -1894,19 +1880,14 @@ def _assemble_cell_from_tier(
     out_path: Path,
     progress: splat_stage1.ProgressCb,
 ) -> dict[str, Any]:
-    """Run Stage 1 for one cell off its splat tier: the tier is KTX2/Meshopt, so
-    it's de-optimized into a throwaway temp dir first (the on-disk tier is
-    untouched). Blocking — run via asyncio.to_thread."""
-    # Temp on the runs volume (not the system temp, which may be a small/full
-    # tmpfs) — mirrors scripts/export_scene_usd.py; auto-removed on exit.
-    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
-        vanilla_dir = Path(tmp)
-        _deoptimize_dir(tier_dir, vanilla_dir)
-        return splat_stage1.assemble_cell(
-            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-            events_path=events_path, out_path=out_path, runs_dir=RUNS_DIR,
-            progress=progress,
-        )
+    """Run Stage 1 for one cell directly off its selected asset dir — no
+    de-optimization (splat/assets.py decodes KTX2/Meshopt in-process).
+    Blocking — run via asyncio.to_thread."""
+    return splat_stage1.assemble_cell(
+        run=run, slot=slot, model=model, raw_dir=tier_dir,
+        events_path=events_path, out_path=out_path, runs_dir=RUNS_DIR,
+        progress=progress,
+    )
 
 
 async def _run_splat_stage1_cell(run: str, slot: str, model: str) -> None:
@@ -1941,13 +1922,35 @@ async def _run_splat_stage1_cell(run: str, slot: str, model: str) -> None:
 
 class Stage2Request(BaseModel):
     """Free-space voxelizer knobs (Stage 2 — the shared spatial foundation). All
-    optional; omitted → defaults. `pitch` (m) is the coarse navigational edge,
-    `refine` sets the fine occupancy scale (pitch/refine), `margin` (m) grows the
-    exterior play volume."""
+    optional; omitted → defaults. `pitch` (m) is the uniform voxel edge of the
+    single grid, `margin` (m) grows the exterior play volume, `clearance` (m) is
+    the baked FREE threshold (camera standoff from any surface). `workers` caps
+    the per-object voxelization pool (1 = serial, lowest peak RAM; omitted →
+    auto = min(cpu, 8))."""
 
     pitch: float | None = None
-    refine: int | None = None
     margin: float | None = None
+    clearance: float | None = None
+    workers: int | None = None
+
+
+class Stage2ClearanceRequest(BaseModel):
+    """Re-bake the FREE threshold of an existing grid (the client slider's
+    'apply') — no re-voxelization."""
+
+    clearance: float
+
+
+class SplatSourceRequest(BaseModel):
+    """Pin the asset set the splat pipeline samples/renders for a cell."""
+
+    source: str  # "auto" | "generated" | "library"
+
+
+def _clamp_clearance(v: float) -> float:
+    # Floor matches the pitch clamp's floor: one voxel is the smallest
+    # meaningful clearance (clearance == pitch ⇒ FREE ≡ EMPTY).
+    return float(min(max(v, 0.02), 2.0))
 
 
 def _stage2_params(req: Stage2Request | None) -> splat_stage2.FreeSpaceParams:
@@ -1957,19 +1960,15 @@ def _stage2_params(req: Stage2Request | None) -> splat_stage2.FreeSpaceParams:
         return d
     return splat_stage2.FreeSpaceParams(
         pitch=float(min(max(req.pitch, 0.02), 1.0)) if req.pitch is not None else d.pitch,
-        refine=int(min(max(req.refine, 1), 6)) if req.refine is not None else d.refine,
         margin=float(min(max(req.margin, 0.0), 10.0)) if req.margin is not None else d.margin,
+        clearance=_clamp_clearance(req.clearance) if req.clearance is not None else d.clearance,
+        workers=max(1, min(int(req.workers), 32)) if req.workers is not None else d.workers,
     )
 
 
 def _cloud_path(run: str, slot: str, model: str) -> Path:
     """Where a cell's Stage-3 base Gaussian cloud lives (`splat/cloud.ply`)."""
     return _slot_dir(run, slot, model) / "splat" / splat_stage3.CLOUD_NAME
-
-
-def _detail_cloud_path(run: str, slot: str, model: str) -> Path:
-    """The optional denser LOD streamed in behind the base (`cloud.detail.ply`)."""
-    return _cloud_path(run, slot, model).with_suffix(".detail.ply")
 
 
 def _trained_path(run: str, slot: str, model: str) -> Path:
@@ -2058,7 +2057,8 @@ def _splat_stage2_status(
 
 
 def _voxels_path(run: str, slot: str, model: str) -> Path:
-    """Where a cell's Stage-2 free-voxel viz pack lives (`splat/voxels.bin`)."""
+    """Where a cell's Stage-2 voxel viz pack lives (`splat/voxels.bin` —
+    SVX1: occupied + garbage cell centres)."""
     return _slot_dir(run, slot, model) / "splat" / splat_stage2.VOXELS_NAME
 
 
@@ -2071,23 +2071,37 @@ def _voxelize_from_tier(
     params: splat_stage2.FreeSpaceParams,
     job: dict[str, Any],
 ) -> dict[str, Any]:
-    """Compute a cell's free-space grid (Stage 2) off its splat tier, de-optimizing
-    it to vanilla ONCE first. Tracks `job['phase']` ('deopt' / 'voxelize'). Blocking."""
+    """Compute a cell's free-space grid (Stage 2) directly off its selected
+    asset dir — no de-optimization (splat/assets.py decodes KTX2/Meshopt
+    in-process). Blocking.
+
+    The progress callback also derives a live `rate` (actions/second) for the
+    current step — objects/s during 'voxelize', boundary extractions/s during
+    'viz' — as an EMA of Δdone/Δt, reset whenever the step changes so each step
+    reports its own throughput. The single-pass marker steps (reduce / fill /
+    clearance / write) don't stream a count, so their rate stays 0."""
+    meter = {"step": None, "t": 0.0, "done": 0, "rate": 0.0}
 
     def _progress(done: int, total: int, current: str) -> None:
+        step = current or "voxelize"
+        now = time.monotonic()
+        if step != meter["step"]:          # new step → restart the rate baseline
+            meter.update(step=step, t=now, done=done, rate=0.0)
+        elif done > meter["done"]:          # streaming step → EMA of Δdone/Δt
+            inst = (done - meter["done"]) / max(now - meter["t"], 1e-3)
+            meter["rate"] = inst if meter["rate"] <= 0.0 else 0.5 * meter["rate"] + 0.5 * inst
+            meter["t"], meter["done"] = now, done
         job["phase"], job["done"], job["total"], job["current_id"] = (
-            "voxelize", done, total, current,
+            step, done, total, step,
         )
+        job["rate"] = round(meter["rate"], 1)
 
-    job["phase"] = "deopt"
-    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
-        vanilla_dir = Path(tmp)
-        _deoptimize_dir(tier_dir, vanilla_dir)
-        job["phase"] = "voxelize"
-        return splat_stage2.compute_free_space(
-            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-            out_path=out_path, params=params, progress=_progress,
-        )
+    job["phase"] = "voxelize"
+    job["rate"] = 0.0
+    return splat_stage2.compute_free_space(
+        run=run, slot=slot, model=model, raw_dir=tier_dir,
+        out_path=out_path, params=params, progress=_progress,
+    )
 
 
 async def _run_splat_stage2_cell(
@@ -2121,75 +2135,38 @@ async def _run_splat_stage2_cell(
 
 
 class Stage3Request(BaseModel):
-    """Surfel sampler knobs (Stage 3). All optional; omitted → sampler defaults.
-    Count is set by `splat_density` (surfels per m², so it scales with surface area);
-    `target_splats` (explicit count) or `base_spacing` (m) override it. `detail_splats`
-    also builds a denser `cloud.detail.ply` LOD; `cull_hidden` drops surfels with no
-    reachable free space on either side (uses the Stage-2 grid)."""
+    """Surfel sampler knobs (Stage 3). ONE quality knob: `detail` multiplies
+    surfel density around the calibrated default look (1 = default resolution,
+    2 = twice the surfels/m², 0.5 = half); spacing, disk radius, feature
+    refinement, and culling are all derived from it (see splat/stage3.py).
+    `representation` is a format flag only ("2dgs" default | "3dgs" compat)."""
 
-    target_splats: int | None = None      # explicit count override; else density × area
-    splat_density: float | None = None     # surfels per m² (area-scaled count; the default)
-    base_spacing: float | None = None
-    radius_frac: float = splat_stage3.DEFAULT_RADIUS_FRAC
-    flatness: float = splat_stage3.DEFAULT_FLATNESS
-    adaptive: bool = True
-    cull_hidden: bool = True
-    detail_splats: int | None = None
-    representation: str | None = None  # "2dgs" (default) | "3dgs" (compat/compression)
+    detail: float | None = None
+    representation: str | None = None
 
 
-def _stage3_params(
-    req: Stage3Request | None,
-) -> tuple[splat_stage3.SampleParams, splat_stage3.SampleParams | None]:
-    """Clamp a request into a (base, detail|None) SampleParams pair."""
+def _stage3_params(req: Stage3Request | None) -> splat_stage3.SampleParams:
+    """Clamp a request into SampleParams; omitted fields keep the defaults."""
     req = req or Stage3Request()
-    # Count is area-scaled by DENSITY by default; an explicit target_splats overrides.
-    # The ceiling is generous (not a room-scale cap) so large scenes aren't clipped.
-    target = (
-        int(min(max(req.target_splats, 5_000), 50_000_000))
-        if req.target_splats is not None
-        else None
-    )
-    density = (
-        float(min(max(req.splat_density, 2.0), 2_000.0))
-        if req.splat_density is not None
-        else splat_stage3.DEFAULT_SPLAT_DENSITY
-    )
-    radius = float(min(max(req.radius_frac, 0.3), 3.0))
-    flat = float(min(max(req.flatness, 0.01), 0.5))
-    base_spacing = (
-        float(min(max(req.base_spacing, 0.002), 0.5))
-        if req.base_spacing is not None
-        else None
+    detail = (
+        float(min(max(req.detail, 0.05), 16.0))
+        if req.detail is not None
+        else splat_stage3.DEFAULT_DETAIL
     )
     rep = req.representation if req.representation in ("2dgs", "3dgs") else "2dgs"
-    base = splat_stage3.SampleParams(
-        target_splats=target, splat_density=density, base_spacing=base_spacing,
-        radius_frac=radius, flatness=flat, adaptive=bool(req.adaptive),
-        cull_hidden=bool(req.cull_hidden), representation=rep,
-    )
-    detail = None
-    if req.detail_splats:
-        detail = splat_stage3.SampleParams(
-            target_splats=int(min(max(req.detail_splats, 50_000), 50_000_000)),
-            splat_density=None, base_spacing=None, radius_frac=radius, flatness=flat,
-            adaptive=bool(req.adaptive), cull_hidden=bool(req.cull_hidden),
-            representation=rep,
-        )
-    return base, detail
+    return splat_stage3.SampleParams(detail=detail, representation=rep)
 
 
 def _splat_stage3_status(
     run: str, slot: str, model: str, source: str | None = None
 ) -> dict[str, Any]:
     """Public Stage-3 (surfels) state: the live job, else 'done' (with the
-    `cloud.json` summary) when the base cloud is on disk, else 'idle'. Carries `url`
-    (base `.ply`) and `detail_url` (the denser LOD, if built)."""
+    `cloud.json` summary) when the cloud is on disk, else 'idle'. Carries `url`
+    (the `.ply`)."""
     url = _artifact_url(_cloud_path(run, slot, model))
-    detail_url = _artifact_url(_detail_cloud_path(run, slot, model))
     job = _splat_stage3_jobs.get((run, slot, model))
     if job is not None:
-        return {**job, "url": url, "detail_url": detail_url}
+        return {**job, "url": url}
     if url is not None:
         summary: Any = None
         with contextlib.suppress(Exception):
@@ -2201,13 +2178,13 @@ def _splat_stage3_status(
             "run": run, "slot": slot, "model": model, "source": source,
             "total": total, "done": total, "running": False, "phase": "done",
             "status": "done", "current_id": None, "error": None,
-            "summary": summary, "url": url, "detail_url": detail_url,
+            "summary": summary, "url": url,
         }
     return {
         "run": run, "slot": slot, "model": model, "source": source,
         "total": 0, "done": 0, "running": False, "phase": "idle",
         "status": "idle", "current_id": None, "error": None,
-        "summary": None, "url": None, "detail_url": None,
+        "summary": None, "url": None,
     }
 
 
@@ -2320,64 +2297,41 @@ def _spawn_stage6(
     return _splat_stage6_status(run, slot, model)
 
 
-def _sample_cell_lods(
+def _sample_cell_blocking(
     run: str,
     slot: str,
     model: str,
     tier_dir: Path,
     freespace_path: Path,
     out_path: Path,
-    base_params: splat_stage3.SampleParams,
-    detail_params: splat_stage3.SampleParams | None,
+    params: splat_stage3.SampleParams,
     job: dict[str, Any],
 ) -> dict[str, Any]:
-    """Sample a cell into a base surfel cloud (and, if `detail_params`, a denser LOD),
-    consuming the Stage-2 free-space grid and de-optimizing the splat tier ONCE.
-    Tracks `job['phase']` ('deopt' / 'base' / 'detail'). Blocking."""
-    detail_path = out_path.with_suffix(".detail.ply")
+    """Sample a cell into its surfel cloud directly off its selected asset dir —
+    no de-optimization (splat/assets.py reads any encoding in-process, KTX2
+    texels included), consuming the Stage-2 free-space grid. Blocking."""
 
-    def _phase_progress(phase: str) -> splat_stage3.ProgressCb:
-        def cb(done: int, total: int, current: str) -> None:
-            job["phase"], job["done"], job["total"], job["current_id"] = (
-                phase, done, total, current,
-            )
-        return cb
-
-    def _sample(vanilla_dir: Path) -> dict[str, Any]:
-        job["phase"] = "base"
-        summary = splat_stage3.sample_cell(
-            run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-            freespace_path=freespace_path, out_path=out_path,
-            params=base_params, progress=_phase_progress("base"),
+    def _progress(done: int, total: int, current: str) -> None:
+        job["phase"], job["done"], job["total"], job["current_id"] = (
+            "sample", done, total, current,
         )
-        if detail_params is not None:
-            job["phase"], job["done"], job["total"] = "detail", 0, 0
-            det = splat_stage3.sample_cell(
-                run=run, slot=slot, model=model, raw_dir=vanilla_dir,
-                freespace_path=freespace_path, out_path=detail_path,
-                params=detail_params, progress=_phase_progress("detail"),
-            )
-            summary["detail"] = {
-                "splats": det["splats"], "bytes": det["bytes"],
-                "base_spacing": det["base_spacing"], "params": det["params"],
-            }
-        else:
-            detail_path.unlink(missing_ok=True)  # drop any stale detail LOD
-        return summary
 
-    job["phase"] = "deopt"
-    with tempfile.TemporaryDirectory(prefix="splat-deopt-", dir=str(RUNS_DIR)) as tmp:
-        vanilla_dir = Path(tmp)
-        _deoptimize_dir(tier_dir, vanilla_dir)
-        return _sample(vanilla_dir)
+    job["phase"] = "sample"
+    summary = splat_stage3.sample_cell(
+        run=run, slot=slot, model=model, raw_dir=tier_dir,
+        freespace_path=freespace_path, out_path=out_path,
+        params=params, progress=_progress,
+    )
+    # The detail-LOD twin is retired; scrub any stale copy from older runs.
+    out_path.with_suffix(".detail.ply").unlink(missing_ok=True)
+    return summary
 
 
 async def _run_splat_stage3_cell(
     run: str,
     slot: str,
     model: str,
-    base_params: splat_stage3.SampleParams,
-    detail_params: splat_stage3.SampleParams | None,
+    params: splat_stage3.SampleParams,
 ) -> None:
     """Sample ONE cell into surfels off the event loop. Requires the Stage-2
     free-space grid; writes the `cloud.json` sidecar so 'done' survives a restart."""
@@ -2390,8 +2344,8 @@ async def _run_splat_stage3_cell(
         tier_dir = await _ensure_splat_tier(run, slot, model, job)
         out_path = _cloud_path(run, slot, model)
         summary = await asyncio.to_thread(
-            _sample_cell_lods, run, slot, model, tier_dir,
-            freespace, out_path, base_params, detail_params, job,
+            _sample_cell_blocking, run, slot, model, tier_dir,
+            freespace, out_path, params, job,
         )
         job["summary"] = summary
         with contextlib.suppress(Exception):
@@ -2412,8 +2366,10 @@ async def _run_splat_stage3_cell(
 
 class Stage4Request(BaseModel):
     """Coverage-planner knobs (all optional; omitted → defaults). `min_gain`
-    truncates the diminishing tail (higher = fewer images); `patch_min_spacing`
-    sets the finest patch detail. Scale is not a knob: view distances derive per
+    truncates the diminishing tail (higher = fewer images); `patch_min_spacing` /
+    `patch_max_spacing` bound the patch feature scale — detail concentration is
+    inherited from the Stage-3 cloud's own density (geometry + texture), not
+    re-detected here. Scale is not a knob: view distances derive per
     patch from the SCALE LADDER (see splat/stage4.py) — `finest_px_per_patch` is
     its single dial, the sharpest demanded resolution in pixels per patch
     feature (capped at `render_resolution`, where a view saturates); the ladder
@@ -2421,15 +2377,15 @@ class Stage4Request(BaseModel):
     direction dial: equal-solid-angle cells (an explicit direct-facing cap + a
     ring of azimuth cells) tiling the hemisphere around each patch normal, all
     suppliable cells demanded. The old `near_frac` / `min_px_per_patch` /
-    `angles_per_patch` / `angular_sectors` / `collision_clearance` knobs are
-    gone (subsumed — camera standoff is emergent from the scale ladder; unknown
+    `angles_per_patch` / `angular_sectors` / `collision_clearance` / `curvature_k`
+    / `tex_k` knobs are gone (subsumed — camera standoff is emergent from the
+    scale ladder, and patch detail is inherited from the Stage-3 cloud; unknown
     fields in a request body are ignored)."""
 
     patch_min_spacing: float | None = None
     patch_max_spacing: float | None = None
     angular_bins: int | None = None
     finest_px_per_patch: float | None = None
-    tex_k: float | None = None
     min_gain: int | None = None
     # Hard image budget (the cost dial, in rendered-reference units): the greedy
     # stops after this many images, keeping the near-optimal prefix; the
@@ -2453,7 +2409,6 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
     return splat_stage4.PlanParams(
         patch_min_spacing=pick(req.patch_min_spacing, 0.02, 0.5, d.patch_min_spacing),
         patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
-        tex_k=pick(req.tex_k, 0.0, 50.0, d.tex_k),
         angular_bins=int(pick(req.angular_bins, 2, 16, d.angular_bins)),
         # PlanParams itself caps the effective value at render_resolution
         # (saturation); the clamp here is just request hygiene.
@@ -2590,7 +2545,9 @@ def _splat_stage_artifacts(run: str, slot: str, model: str) -> dict[int, list[Pa
     return {
         1: [d / splat_stage1.MANIFEST_NAME],
         2: [fs, fs.with_suffix(".json"), _voxels_path(run, slot, model)],
-        3: [cloud, cloud.with_suffix(".json"), _detail_cloud_path(run, slot, model)],
+        # cloud.detail.ply is the RETIRED detail-LOD twin; still listed so
+        # reverts scrub any stale copy older runs left behind.
+        3: [cloud, cloud.with_suffix(".json"), cloud.with_suffix(".detail.ply")],
         4: [
             cams,
             cams.with_name(splat_stage4.PATCHES_NAME),
@@ -3461,15 +3418,64 @@ def create_app() -> FastAPI:
         'done' / 'error')."""
         return _splat_cell_status(run, slot, model)
 
+    @app.get("/runs/{run}/splat/source/{slot}/{model}")
+    async def splat_source_get(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The cell's splat-asset selection: persisted pref ('auto' / 'generated'
+        / 'library'), per-set mesh counts, and the currently-resolved source."""
+        return _splat_source_state(run, slot, model)
+
+    @app.post("/runs/{run}/splat/source/{slot}/{model}")
+    async def splat_source_set(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: SplatSourceRequest
+    ) -> dict[str, object]:
+        """Pin which asset set feeds the cell's splat pipeline. Changing it
+        invalidates EVERY stage output (scene manifest, free-space grid, cloud,
+        cameras, refs — they were all measured off the other meshes); the cached
+        per-source tier dirs survive, so switching back is cheap. No-op when the
+        pref is unchanged."""
+        if body.source not in _SPLAT_SOURCES:
+            raise HTTPException(
+                status_code=422,
+                detail=f"source must be one of {', '.join(_SPLAT_SOURCES)}",
+            )
+        state = _splat_source_state(run, slot, model)
+        if body.source == state["source"]:
+            return state
+        if body.source != "auto" and state["available"].get(body.source, 0) == 0:
+            raise HTTPException(
+                status_code=409,
+                detail=f"no {body.source} meshes on disk for {slot}/{model}",
+            )
+        key = (run, slot, model)
+        for jobs, tasks in ((_splat_stage1_jobs, _splat_stage1_tasks),):
+            task = tasks.pop(key, None)
+            if task is not None:
+                task.cancel()
+            jobs.pop(key, None)
+        # Stage 1's manifest is "the base" (not in the revert table); drop it
+        # by hand, then revert everything after it.
+        with contextlib.suppress(Exception):
+            (_slot_dir(run, slot, model) / "splat" / splat_stage1.MANIFEST_NAME).unlink(
+                missing_ok=True
+            )
+        _revert_after(run, slot, model, 1)
+        path = _splat_source_pref_path(run, slot, model)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({"source": body.source}), encoding="utf-8")
+        tmp.replace(path)
+        return _splat_source_state(run, slot, model)
+
     @app.post("/runs/{run}/splat/stage2/{slot}/{model}")
     async def splat_stage2_start(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: Stage2Request | None = None
     ) -> dict[str, object]:
-        """Compute ONE cell's free-space grid — dual-resolution occupancy + clearance
-        + reachability → `splat/freespace.npz` (+ `voxels.bin` viz), see
-        splat/stage2.py. The shared spatial foundation Stage 3 (surfels) and Stage 4
-        (cameras) consume. Optional body: `pitch`/`refine`/`margin`. Idempotent while
-        running; re-runs (overwrites) on a fresh POST."""
+        """Compute ONE cell's free-space grid — single uniform occupancy +
+        flood-fill free/garbage classification + clearance → `splat/freespace.npz`
+        (+ `voxels.bin` viz), see splat/stage2.py. The shared spatial foundation
+        Stage 3 (surfels) and Stage 4 (cameras) consume. Optional body:
+        `pitch`/`margin`/`clearance`/`workers` (workers=1 minimises peak RAM).
+        Idempotent while running; re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -3496,6 +3502,7 @@ def create_app() -> FastAPI:
             "current_id": None,
             "error": None,
             "summary": None,
+            "rate": 0.0,
             "url": None,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
@@ -3512,15 +3519,56 @@ def create_app() -> FastAPI:
         job / 'done' with the `voxels.bin` viz `url` / 'error')."""
         return _splat_stage2_status(run, slot, model)
 
+    @app.post("/runs/{run}/splat/stage2/{slot}/{model}/clearance")
+    async def splat_stage2_clearance(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: Stage2ClearanceRequest
+    ) -> dict[str, object]:
+        """RE-BAKE the FREE threshold of an existing free-space grid (the client
+        clearance slider's 'apply'): rewrites only the `clearance_m` scalar in
+        `freespace.npz` — no re-voxelization, and the viz pack stays valid (its
+        empty quads carry per-cell clearance). FREE feeds Stage 4's candidates
+        (Stage 3 reads EMPTY only), so stages 4+ are invalidated; Stage 3
+        survives. Returns the refreshed Stage-2 status."""
+        key = (run, slot, model)
+        existing = _splat_stage2_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            raise HTTPException(status_code=409, detail="stage 2 is running — wait for it")
+        grid = _freespace_path(run, slot, model)
+        if not grid.is_file():
+            raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
+        clearance = _clamp_clearance(body.clearance)
+        try:
+            patch = await asyncio.to_thread(
+                splat_stage2.apply_clearance, grid, clearance
+            )
+        except ValueError as exc:  # pre-clearance grid layout
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        _revert_after(run, slot, model, 3)  # new FREE → replan cameras/refs
+        # Fold the patch into the sidecar (and any done-job snapshot) so the
+        # next status poll reflects the applied threshold.
+        sidecar = grid.with_suffix(".json")
+        summary: dict[str, Any] = {}
+        with contextlib.suppress(Exception):
+            summary = json.loads(sidecar.read_text(encoding="utf-8"))
+        summary["free_voxels"] = patch["free_voxels"]
+        summary.setdefault("params", {})["clearance"] = patch["clearance"]
+        with contextlib.suppress(Exception):
+            tmp = sidecar.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(summary, indent=1), encoding="utf-8")
+            tmp.replace(sidecar)
+        if existing is not None:
+            existing["summary"] = summary
+        return _splat_stage2_status(run, slot, model)
+
     @app.post("/runs/{run}/splat/stage3/{slot}/{model}")
     async def splat_stage3_start(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: Stage3Request | None = None
     ) -> dict[str, object]:
         """(Re-)sample ONE cell's placed meshes into a pre-fine-tuning Gaussian cloud
         `splat/cloud.ply` (see splat/stage3.py), consuming the Stage-2 free-space grid
-        to orient normals + cull hidden faces. Knobs: `target_splats`/`base_spacing`/
-        `radius_frac`/`flatness`/`adaptive`/`cull_hidden`/`detail_splats`. Requires
-        Stage 2 first. Idempotent while running; re-runs (overwrites) on a fresh POST."""
+        to orient normals + cull hidden faces. ONE knob: `detail` (density multiplier;
+        1 = the calibrated default look). Requires Stage 2 first. Idempotent while
+        running; re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -3530,7 +3578,7 @@ def create_app() -> FastAPI:
         if not _freespace_path(run, slot, model).is_file():
             raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
         _, kind = source
-        base_params, detail_params = _stage3_params(body)
+        params = _stage3_params(body)
         key = (run, slot, model)
         existing = _splat_stage3_jobs.get(key)
         if existing is not None and existing.get("running"):
@@ -3546,18 +3594,16 @@ def create_app() -> FastAPI:
             "running": True,
             "status": "pending",
             "phase": "pending",
-            "detail": detail_params is not None,
             "current_id": None,
             "error": None,
             "summary": None,
             "url": None,
-            "detail_url": None,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
         }
         _splat_stage3_jobs[key] = job
         _splat_stage3_tasks[key] = asyncio.create_task(
-            _run_splat_stage3_cell(run, slot, model, base_params, detail_params)
+            _run_splat_stage3_cell(run, slot, model, params)
         )
         return dict(job)
 
@@ -3981,13 +4027,18 @@ def create_app() -> FastAPI:
         # `<id>.raw.glb` intermediates, so either dir streams the finished set.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
-        # `variant=splat` streams the cell's splat tier UNfiltered — the exact set
-        # the splat stages sample/deopt, so the Stage-5 capture renders precisely
-        # what Stages 2/3 measured (no committed-event filtering).
+        # `variant=splat` streams the cell's SELECTED splat asset set UNfiltered
+        # — the exact meshes the splat stages read AS-IS — so the Stage-5
+        # capture renders precisely what Stages 2/3 measured (no
+        # committed-event filtering).
         if variant == "splat":
-            tier_dir = _splat_tier_dir(run, slot_id, model_alias)
-            if _placed_count(tier_dir) == 0:
-                raise HTTPException(status_code=409, detail="splat tier not built for this cell")
+            source = _splat_source(run, slot_id, model_alias)
+            tier_dir = source[0] if source is not None else None
+            if tier_dir is None or _placed_count(tier_dir) == 0:
+                raise HTTPException(
+                    status_code=409,
+                    detail="no meshes for the selected splat assets",
+                )
             return StreamingResponse(
                 _mesh_bundle(tier_dir, None),
                 media_type="application/octet-stream",
