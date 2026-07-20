@@ -28,20 +28,31 @@ it. Everything that used to be a knob is a derived law or a fixed constant:
   * feature refinement — `_FEATURE_BOOST`, always on (see below);
   * hidden-face culling — always on (pure win, not a fidelity choice).
 
-Sampling: per-object blue-noise (Poisson-disk) even spacing in
-FEATURE-ADAPTIVE BANDS. Detail is measured ONCE, from the mesh itself (its
-feature edges: creases sharper than `_CREASE_ANGLE` + open boundaries — full-
-fidelity signals, not statistics of an already-sampled proxy): flat interiors
-sample at the knob spacing exactly, while crease/boundary neighbourhoods —
-thin members, frames, slats, corners, which by construction lie within a
-base-spacing of a feature edge — sample up to `_FEATURE_BOOST`× finer
-(boost²× the density). Purely additive: flats are unchanged and detail rides on
-top, so the knob keeps its meaning. Band LABELING is two-level (coarse split →
-conservative flat test → fine split only near edges), which changes the cost,
-not the labels (`_spacing_bands`). Downstream, the cloud's local density IS
-the detail field: Stage 4 reads it (local sample spacing) instead of
-re-detecting detail from the cloud, and Stage 6's densification starts from
-capacity that already exists where the close-up cameras will look.
+Sampling: per-object GRID-THINNED blue noise in FEATURE-ADAPTIVE BANDS.
+Candidates are seeded area-weighted surface points; a lattice of
+~`_THIN_CELL_FACTOR`×spacing cells keeps ONE winner per (cell, normal-facing
+bucket), then a same-facing-only minimum-distance pass removes near-duplicates
+(`_thin_band`). Equivalent evenness/density to the old oversample-and-eliminate
+Poisson sampler (calibrated to the same yield) at a fraction of the memory —
+no KD-trees, no all-pairs arrays — and two deliberate improvements: THIN
+GEOMETRY keeps both faces (opposite-facing points never eliminate each other,
+where the old 3D-distance elimination silently starved double-sided sheets),
+and sampling is SEEDED per (object, geometry, band), so a cell resamples to
+the byte-identical cloud for any worker count.
+
+Detail is measured ONCE, from the mesh itself (its feature edges: creases
+sharper than `_CREASE_ANGLE` + open boundaries — full-fidelity signals, not
+statistics of an already-sampled proxy): flat interiors sample at the knob
+spacing exactly, while crease/boundary neighbourhoods — thin members, frames,
+slats, corners, which by construction lie within a base-spacing of a feature
+edge — sample up to `_FEATURE_BOOST`× finer (boost²× the density). Purely
+additive: flats are unchanged and detail rides on top, so the knob keeps its
+meaning. Band LABELING is two-level (coarse split → conservative flat test →
+fine split only near edges), which changes the cost, not the labels
+(`_spacing_bands`). Downstream, the cloud's local density IS the detail field:
+Stage 4 reads it (local sample spacing) instead of re-detecting detail from
+the cloud, and Stage 6's densification starts from capacity that already
+exists where the close-up cameras will look.
 
 PIPELINE PER OBJECT (parallel across objects — `_iter_sampled`, spawn pool,
 id-ordered merge): load → band labeling → per band: sample, radii, ORIENT +
@@ -67,6 +78,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,11 +89,9 @@ import trimesh
 from scipy.spatial import cKDTree
 
 from splat.assets import load_geoms
-from splat.stage2 import FreeSpace, _subdivide_edges, _valid_tri_mask
+from splat.stage2 import FreeSpace, _abs_encode, _subdivide_edges, _valid_tri_mask
 
-# Poisson-disk elimination routinely returns fewer than the oversample budget
-# (that's the point — it thins clumps), which trimesh logs as "only got N/M
-# samples!" per object. Silence it so a whole-cell run isn't a wall of warnings.
+# trimesh logs per-file load noise; silence it for whole-cell runs.
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
 # The Gaussian cloud filename written under a cell's `splat/` dir (a 3DGS `.ply`).
@@ -128,6 +138,35 @@ _EDGE_PT_CAP = 400_000  # stride a pathological crease soup instead of exploding
 # skips more interior but widens the must-refine strip (the conservative test
 # subtracts the piece circumradius, which grows with the limit).
 _CLASSIFY_COARSE = 4.0
+
+# --- grid-thinning sampler knobs (all internal; calibrated together so the
+# kept density matches the old Poisson eliminator's ~0.75/spacing² yield) -----
+# Thinning lattice cell edge, × spacing: one winner survives per (cell, facing
+# bucket). Bigger cells = sparser; 1.25 + the dedup below lands on the old
+# yield (verified against the old sampler on synthetic planes and the hotel
+# benchmark cell).
+_THIN_CELL_FACTOR = 1.25
+# Candidate budget, × area/spacing² (≈ 2.9 candidates per surface cell → ~94%
+# of cells occupied). The old sampler generated 6×/spacing² internally.
+_THIN_CANDIDATES = 2.4
+# Near-duplicate floor, × spacing: SAME-FACING winners closer than this lose
+# one point (the old eliminator's hard floor was 1.0 × spacing; radii clamp to
+# the band median, so the softer floor shows up as a few smaller disks, not
+# holes). OPPOSITE-facing points are never duplicates — that's what keeps both
+# faces of thin sheets alive.
+_THIN_MIN_DIST_FRAC = 0.7
+# Two winners count as "same-facing" when their unit normals' dot exceeds
+# this: parallel faces (sheet sides, dot −1) and perpendicular crease faces
+# (dot 0) both survive; only genuinely co-oriented near-pairs dedup.
+_THIN_DUP_NORMAL_DOT = 0.5
+# The 13 lexicographically-positive neighbour offsets: enumerating pairs from
+# one side of each cell boundary visits every unordered cross-cell pair once.
+_HALF_OFFSETS = np.array(
+    [o for o in np.ndindex(3, 3, 3)], dtype=np.int64
+).__sub__(1)
+_HALF_OFFSETS = _HALF_OFFSETS[
+    np.lexsort((_HALF_OFFSETS[:, 2], _HALF_OFFSETS[:, 1], _HALF_OFFSETS[:, 0]))
+][14:]  # strictly greater than (0,0,0) in lexicographic order
 # The EMPTY mask is served to samplers as a MEMORY-MAPPED uncompressed sidecar
 # (`freespace.npz.empty.npy`, written beside the npz on first use): pool
 # workers then share ONE physical copy through the page cache instead of each
