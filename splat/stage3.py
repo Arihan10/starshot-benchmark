@@ -17,8 +17,9 @@ first). Two things use it:
 
 ONE KNOB — `detail`. It is a density multiplier around the calibrated default
 look: sample spacing = `_BASE_SPACING / sqrt(detail)`, so detail=1 reproduces
-the default resolution (~3 cm between surfels on flats, refined to ~0.75 cm
-near feature edges), detail=2 doubles the surfel density, detail=0.5 halves
+    the default resolution (~3 cm between surfels at base, refined to ~0.75 cm
+near feature edges and relaxed to ~6 cm on flat, uniformly-coloured regions),
+detail=2 doubles the surfel density, detail=0.5 halves
 it. Everything that used to be a knob is a derived law or a fixed constant:
   * spacing      — the knob itself (count follows: N ∝ area × detail);
   * disk radius  — `_RADIUS_FRAC` × the local sample spacing (disks tile);
@@ -26,6 +27,8 @@ it. Everything that used to be a knob is a derived law or a fixed constant:
     surfels have no thickness; 3DGS-only viewers/compressors need a nonzero
     third scale, so it writes radius × 0.1);
   * feature refinement — `_FEATURE_BOOST`, always on (see below);
+  * flat coarsening    — `_COARSEN_MAX`, always on (the refinement's mirror:
+    flat + uniform regions sample coarser; see below);
   * hidden-face culling — always on (pure win, not a fidelity choice).
 
 Sampling: per-object GRID-THINNED blue noise in FEATURE-ADAPTIVE BANDS.
@@ -167,6 +170,19 @@ _HALF_OFFSETS = np.array(
 _HALF_OFFSETS = _HALF_OFFSETS[
     np.lexsort((_HALF_OFFSETS[:, 2], _HALF_OFFSETS[:, 1], _HALF_OFFSETS[:, 0]))
 ][14:]  # strictly greater than (0,0,0) in lexicographic order
+# Feature-adaptive COARSENING — the mirror of the refinement above. Flat pieces
+# far from every feature edge sample up to _COARSEN_MAX× COARSER where the surface
+# is planar at the COARSENED FOOTPRINT scale (normal spread within _FLAT_ANGLE,
+# from an area-weighted normal structure tensor per footprint-sized voxel — it
+# sums NNᵀ, so it's sign-invariant, unreliable TRELLIS winding can't read a flat
+# wall as folded, and it's tessellation-independent; flats AND gently curved
+# panels qualify while tight curvature stays at base) AND the base-colour texels
+# are near-uniform (channel range < _FLAT_COLOR_VAR, so a textured rug/painting
+# keeps its density). Stage 6 retrains colour, so this is ~lossless.
+_COARSEN_MAX = 2.0
+_FLAT_ANGLE = np.deg2rad(10.0)
+_FLAT_COLOR_VAR = 0.06
+_FLAT_MIN_PIECES = 8  # skip coarsening on meshes with fewer flat pieces than this
 # The EMPTY mask is served to samplers as a MEMORY-MAPPED uncompressed sidecar
 # (`freespace.npz.empty.npy`, written beside the npz on first use): pool
 # workers then share ONE physical copy through the page cache instead of each
@@ -335,6 +351,72 @@ def _soup_mesh(tris: np.ndarray, uv3: np.ndarray | None, material) -> trimesh.Tr
     return trimesh.Trimesh(vertices=verts, faces=faces, visual=visual, process=False)
 
 
+def _piece_color_uniform(
+    tris: np.ndarray, uv3: np.ndarray | None, material  # noqa: ANN001
+) -> np.ndarray:
+    """Per-piece bool: do the base-colour texels stay within `_FLAT_COLOR_VAR`
+    across the piece? Sampled at each piece's corners, edge midpoints and centroid
+    through the same `uv_to_color` path as `surfel_colors`. Pieces with no readable
+    texture read as uniform (nothing to resolve)."""
+    n = len(tris)
+    image = getattr(material, "baseColorTexture", None)
+    if image is None or uv3 is None:
+        return np.ones(n, dtype=bool)
+    bary = np.array(
+        [[1, 0, 0], [0, 1, 0], [0, 0, 1],
+         [0.5, 0.5, 0], [0, 0.5, 0.5], [0.5, 0, 0.5],
+         [1 / 3, 1 / 3, 1 / 3]],
+        dtype=np.float64,
+    )
+    uvs = np.einsum("pb,nbc->npc", bary, uv3)  # (n, P, 2) — affine over each triangle
+    try:
+        cols = np.asarray(
+            trimesh.visual.color.uv_to_color(uvs.reshape(-1, 2), image), dtype=np.float32
+        )[:, :3] / 255.0
+    except Exception:
+        return np.ones(n, dtype=bool)
+    cols = cols.reshape(n, len(bary), 3)
+    rng = (cols.max(axis=1) - cols.min(axis=1)).max(axis=1)  # widest channel spread
+    return rng <= _FLAT_COLOR_VAR
+
+
+def _coarsen_factors(
+    tris: np.ndarray, uv3: np.ndarray | None, material, spacing: float  # noqa: ANN001
+) -> np.ndarray:
+    """Per-piece coarsening factor (1 = keep base spacing, up to `_COARSEN_MAX`,
+    octave-quantized) for the flat, far-from-edge pieces — how far BELOW base
+    density a piece can sample without losing signal. Planarity is read at the
+    COARSENED FOOTPRINT scale from an area-weighted normal structure tensor per
+    footprint-sized voxel: its top eigenvalue → 1 on a plane, and summing NNᵀ
+    makes it sign-invariant (unreliable winding can't read a flat wall as folded)
+    and tessellation-independent. A piece coarsens where that spread is within
+    `_FLAT_ANGLE` (flats and gently curved panels qualify; tight curvature stays
+    at base), gated to 1 wherever the base colour is not near-uniform
+    (`_piece_color_uniform`). All-ones when there are too few pieces."""
+    n = len(tris)
+    if n <= _FLAT_MIN_PIECES:
+        return np.ones(n, dtype=np.float64)
+    cent = tris.mean(axis=1)
+    cx = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
+    area = 0.5 * np.linalg.norm(cx, axis=1)
+    nrm = cx / (2.0 * area[:, None] + 1e-12)
+    key = np.floor(cent / (_COARSEN_MAX * spacing)).astype(np.int64)
+    _, inv = np.unique(key, axis=0, return_inverse=True)
+    inv = inv.reshape(-1)
+    v = int(inv.max()) + 1
+    tens = np.zeros((v, 3, 3))
+    np.add.at(tens, inv, (nrm[:, :, None] * nrm[:, None, :]) * area[:, None, None])
+    wsum = np.zeros(v)
+    np.add.at(wsum, inv, area)
+    tens /= wsum[:, None, None] + 1e-12
+    lam1 = np.linalg.eigvalsh(tens)[:, -1]  # top eigenvalue ∈ (~1/3, 1]; 1 = planar
+    theta = np.arcsin(np.sqrt(np.clip(1.0 - lam1, 0.0, 1.0)))[inv]
+    factor = np.clip(_FLAT_ANGLE / np.maximum(theta, 1e-6), 1.0, _COARSEN_MAX)
+    factor[~_piece_color_uniform(tris, uv3, material)] = 1.0
+    level = np.floor(np.log2(factor) + 1e-9)
+    return np.minimum(2.0 ** level, _COARSEN_MAX)
+
+
 def _spacing_bands(
     geom: trimesh.Trimesh, spacing: float, boost: float = _FEATURE_BOOST
 ) -> list[tuple[trimesh.Trimesh, float]]:
@@ -345,10 +427,10 @@ def _spacing_bands(
     needs disks no larger than ~d to keep them off the crease, and pieces ON
     thin members (everywhere within a half-width of an edge) land in the
     finest band — which is precisely what makes rails/slats/frames sample at
-    feature scale instead of wall scale. Flat interiors (d ≥ spacing) keep the
-    base spacing bit-for-bit; detail refinement is ADDITIVE, so the detail
-    knob's meaning is unchanged on flats and the total grows only with
-    feature-area fraction.
+    feature scale instead of wall scale. Flat interiors keep the base spacing
+    unless they are also COARSENABLE (below); refinement is ADDITIVE off that
+    base, so the detail knob still anchors the look while the total grows with
+    the feature-area fraction and shrinks with the flat, uniform fraction.
 
     Labeling is TWO-LEVEL for speed, with labels IDENTICAL to a full split:
       1. split to `_CLASSIFY_COARSE`× spacing and keep any piece whose whole
@@ -364,11 +446,13 @@ def _spacing_bands(
     sampled distribution). Big flat scenes skip almost everything; foliage-like
     meshes (edges everywhere) refine everything and merely match the old cost.
 
-    Falls back to a single base-spacing band when the mesh has no feature edges
-    (smooth blobs and terrain) or its triangles are degenerate."""
+    The MIRROR of the refinement also runs: flat pieces far from every feature
+    edge are COARSENED up to `_COARSEN_MAX`× where they are nearly planar AND
+    uniformly coloured (`_coarsen_factors`), so walls/floors/ceilings and smooth
+    low-curvature panels sample below base density. A mesh with no feature edges
+    (smooth blobs, terrain) skips the edge test and coarsens throughout; a
+    degenerate mesh falls back to a single base-spacing band."""
     edge_pts = _feature_edge_points(geom, step=spacing * 0.5)
-    if edge_pts is None:
-        return [(geom, spacing)]
 
     tris = np.asarray(geom.triangles, dtype=np.float64)
     uv = getattr(getattr(geom, "visual", None), "uv", None)
@@ -382,17 +466,37 @@ def _spacing_bands(
     if not len(tris):
         return [(geom, spacing)]
 
-    tree = cKDTree(edge_pts)
-
-    # Pass 1 — coarse split + conservative base-band test.
+    # Pass 1 — coarse split, then the conservative base-band test (skipped when
+    # the mesh has no feature edges: every piece is then a coarsening candidate).
     tris_c, uv3_c = _subdivide_edges(tris, spacing * _CLASSIFY_COARSE, uv3)
     cent = tris_c.mean(axis=1)
-    d_c = tree.query(cent)[0]
-    circum = np.linalg.norm(tris_c - cent[:, None, :], axis=2).max(axis=1)
-    flat = (d_c - circum) >= spacing
+    if edge_pts is not None:
+        tree = cKDTree(edge_pts)
+        d_c = tree.query(cent)[0]
+        circum = np.linalg.norm(tris_c - cent[:, None, :], axis=2).max(axis=1)
+        flat = (d_c - circum) >= spacing
+    else:
+        tree = None
+        flat = np.ones(len(tris_c), dtype=bool)
 
-    base_tris: list[np.ndarray] = [tris_c[flat]]
-    base_uv: list[np.ndarray] | None = [uv3_c[flat]] if uv3_c is not None else None
+    # The flat, far-from-edge pieces are the COARSENING candidates: split them by
+    # planarity + colour uniformity into base (factor 1) and coarser octave bands.
+    flat_tris = tris_c[flat]
+    flat_uv = uv3_c[flat] if uv3_c is not None else None
+    cf = _coarsen_factors(flat_tris, flat_uv, material, spacing)
+    base_tris: list[np.ndarray] = []
+    base_uv: list[np.ndarray] | None = [] if uv3_c is not None else None
+    coarser: list[tuple[float, np.ndarray, np.ndarray | None]] = []
+    for c in np.unique(cf):
+        m = cf == c
+        if c <= 1.0:
+            base_tris.append(flat_tris[m])
+            if base_uv is not None and flat_uv is not None:
+                base_uv.append(flat_uv[m])
+        else:
+            coarser.append(
+                (float(c), flat_tris[m], flat_uv[m] if flat_uv is not None else None)
+            )
     finer: list[tuple[float, np.ndarray, np.ndarray | None]] = []
 
     # Pass 2 — full-resolution classification for the near-edge remainder.
@@ -417,10 +521,13 @@ def _spacing_bands(
                 )
 
     bands: list[tuple[trimesh.Trimesh, float]] = []
-    bt = np.concatenate(base_tris, axis=0)
-    if len(bt):
-        bu = np.concatenate(base_uv, axis=0) if base_uv is not None else None
-        bands.append((_soup_mesh(bt, bu, material), spacing))
+    if base_tris:
+        bt = np.concatenate(base_tris, axis=0)
+        if len(bt):
+            bu = np.concatenate(base_uv, axis=0) if base_uv is not None else None
+            bands.append((_soup_mesh(bt, bu, material), spacing))
+    for cfac, band_tris, band_uv in coarser:
+        bands.append((_soup_mesh(band_tris, band_uv, material), spacing * cfac))
     for lf, band_tris, band_uv in finer:
         bands.append((_soup_mesh(band_tris, band_uv, material), spacing / lf))
     return bands or [(geom, spacing)]

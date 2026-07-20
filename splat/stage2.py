@@ -18,9 +18,12 @@ cell. Deterministic and gap-free, so the visibility ray-march can't leak through
 pinholes in walls and the flood fill can't escape into sealed interiors. No
 winding/closure assumptions, so the non-watertight composed scene is fine. The
 cover set is stored SPARSELY (sorted linear indices), so its memory tracks the
-amount of SURFACE; the dense arrays (component labels, clearance, the free mask)
-scale as O(volume) = (extent / pitch)³ — oversized outdoor scenes need a coarser
-requested `pitch` (or a future banded/hierarchical build) to fit in RAM.
+amount of SURFACE; the dense fields (the empty mask, clearance) are built
+STREAMED in X-SLABS — x is the outermost axis, so a slab is contiguous in
+memory, on disk, and in the sorted cover keys — with full-resolution
+intermediates in disk-backed .npy scratch files the OS pages in and out freely.
+Resident memory is slab-sized plus O(surface + components), nearly independent
+of scene volume; disk and runtime still scale with it.
 
 GLASS (transparent surfaces occupy space but don't block sight). Classified
 DURING voxelization — it is per-triangle-piece work fused into the same
@@ -97,6 +100,9 @@ Outputs (under a cell's `splat/` dir):
     Consumed by Stages 3 and 4; load via `load_free_space`. Older layouts
     (dual-resolution, or pre-clearance single-grid) are rejected with a clear
     re-run error rather than carried as compat shims.
+  * `freespace.npz.empty.npy` — the empty mask as an uncompressed sidecar,
+    promoted from the fill's scratch so Stage 3's pool workers memory-map one
+    shared copy without ever decompressing the npz mask themselves.
   * `voxels.bin` — the SVX3 viz pack for the client overlay: VOLUMETRIC
     boundary shells, not points. Cover, garbage, and the free volume (at a
     ladder of clearance thresholds, the baked one included) are each
@@ -111,6 +117,7 @@ from __future__ import annotations
 import logging
 import os
 import struct
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,6 +133,11 @@ logging.getLogger("trimesh").setLevel(logging.ERROR)
 # Artifacts written under a cell's `splat/` dir.
 FREESPACE_NAME = "freespace.npz"
 VOXELS_NAME = "voxels.bin"
+# Uncompressed empty-mask twin (`freespace.npz.empty.npy`), written beside the
+# npz so Stage 3's pool workers memory-map ONE shared copy instead of each
+# decompressing a private mask. Stage 3 treats a sidecar older than the npz as
+# stale — hence the post-write touch in `compute_free_space`.
+_EMPTY_SIDECAR_SUFFIX = ".empty.npy"
 # Viz pack (SVX3): VOLUMETRIC boundary shells per voxel class. Header = magic +
 # u32 LE counts (cover quads, garbage quads, free shells); then cover quads,
 # garbage quads, then per shell a header (f32 clearance threshold, u32 quads,
@@ -144,7 +156,7 @@ _QUAD_DTYPE = np.dtype(
 # client slider swaps shells instantly instead of re-meshing.
 _SHELL_STEPS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64)
 
-DEFAULT_PITCH = 0.03       # the uniform voxel edge (m) — one grid for everything
+DEFAULT_PITCH = 0.03      # the uniform voxel edge (m) — one grid for everything
 # The baked FREE threshold (m): a camera needs at least this much clearance.
 # The default equals ONE VOXEL at the default pitch — the most permissive
 # meaningful setting: every empty cell is ≥ 1 voxel from cover by definition,
@@ -163,6 +175,20 @@ DEFAULT_CLEARANCE = 0.03
 # tiers, so no cell from a genuinely lower tier can sneak in.
 _CLEARANCE_EPS = 2.5e-4
 _PITCH_CLAMP = (0.02, 1.0)
+# Flat-chunk length for whole-grid reductions (the FREE count, clearance stats,
+# float16 conversion): bounds each per-chunk temporary to tens of MB where a
+# single whole-grid call would materialize multi-GB copies.
+_CHUNK_CELLS = 1 << 24
+# Per-slab working-set target for the streamed grid passes (labels + masks +
+# temps, ~16 B/cell during the fill). Purely a resource knob: every streamed
+# pass produces identical output for ANY slab partition.
+_SLAB_TARGET_BYTES = 256 * 1024**2
+# Scratch files older than this are swept at build start. Live scratches are
+# never this old (phases write continuously); only hard-killed builds — whose
+# cleanup never ran — leave older ones behind, and those are multi-GB litter.
+_SCRATCH_TTL_S = 6 * 3600.0
+# Parabola x-pass sentinel: "this plane holds no cover" (see `_parabola_pass`).
+_NO_SITE = np.int64(1) << 62
 # Exact voxelization: triangles are midpoint-split until every edge spans at most
 # this many cells, so each piece's candidate block for the separating-axis
 # test is at most 3×3×3 cells (a triangle's extent is bounded by its longest edge).
@@ -199,7 +225,11 @@ def _abs_decode(lin: np.ndarray) -> np.ndarray:
     ix = lin // (_VOX_RADIX * _VOX_RADIX) - _VOX_OFF
     return np.stack([ix, iy, iz], axis=1)
 
-# progress(done, total, current_id) — called after each object is voxelized.
+# progress(done, total, step) — `step` names the current phase ("voxelize" |
+# "reduce" | "fill" | "clearance" | "write" | "viz"). done/total count items in
+# the STREAMING phases (objects for "voxelize"; grid slabs/bundles for "fill",
+# "clearance" and "viz"); single-pass marker phases report (0, 0) — the step
+# name is the signal, and a constant step string lets the caller meter a rate.
 ProgressCb = Callable[[int, int, str], None]
 
 
@@ -209,8 +239,9 @@ class FreeSpaceParams:
     `margin` grows the grid beyond the scene AABB so exterior camera vantages
     exist (Stage 4); `clearance` (m) is the baked FREE threshold — empty cells
     at least this far from any cover cell are camera-placeable. `workers`
-    parallelizes the per-object mesh pass (0 = auto: min(cores, 8); 1 =
-    serial); the output is byte-identical for any value."""
+    parallelizes the per-object mesh pass (0 = auto: sized to fit available
+    RAM, capped at min(cores, 8); 1 = serial); the output is byte-identical
+    for any value."""
 
     pitch: float = DEFAULT_PITCH
     margin: float = 1.5
@@ -685,58 +716,187 @@ def _shell_slabs(
     return slabs
 
 
-def _classify_empty(
-    occ: np.ndarray, boxes: list[tuple[str, np.ndarray, np.ndarray]]
-) -> tuple[np.ndarray, np.ndarray, dict[str, Any]]:
-    """EMPTY mask over the grid via the two-phase fill (module docstring): label
-    the connected components of non-cover space once (6-connectivity — equivalent
-    to running every flood fill, since a component is reached iff any of its cells
-    is seeded), mark the components holding phase-1 ambient seeds, then run the
-    nested-object rescue to fixpoint. `boxes` are the objects' (id, vlo, vhi)
-    grid-index AABBs. Returns (empty bool array, rescued bool array — the
-    subset of empty opened by the rescue rather than phase-1 ambient air,
-    fill stats)."""
-    dims = np.asarray(occ.shape, dtype=np.int64)
-    labels, n_comp = ndimage.label(~occ, ndimage.generate_binary_structure(3, 1))
-    sizes = np.bincount(labels.ravel(), minlength=n_comp + 1)
+# --- streamed grid passes ------------------------------------------------------
+# The dense fields are never held whole: the grid is processed in X-SLABS. x is
+# the array's outermost axis, so a slab [x0, x1) is one contiguous range of
+# linear indices — contiguous in memory, on disk, and (because `occ_lin` is
+# sorted) one contiguous SEGMENT of the sparse cover keys, so any slab's dense
+# occupancy is rebuilt on demand and no full occupancy array exists at all.
+
+
+def _slab_planes(ny: int, nz: int) -> int:
+    """X-planes per slab so a slab's working set (~16 B/cell across labels,
+    masks and temps) stays near `_SLAB_TARGET_BYTES`. A resource knob only —
+    every streamed pass yields identical output for any slab partition."""
+    return max(1, int(_SLAB_TARGET_BYTES // max(1, ny * nz * 16)))
+
+
+def _occ_slab(occ_lin: np.ndarray, x0: int, x1: int, ny: int, nz: int) -> np.ndarray:
+    """Dense occupancy of x-planes [x0, x1), rebuilt from the sorted sparse
+    cover keys (binary search bounds one contiguous key segment per slab)."""
+    plane = ny * nz
+    lo, hi = np.searchsorted(occ_lin, [x0 * plane, x1 * plane])
+    slab = np.zeros((x1 - x0) * plane, dtype=bool)
+    slab[occ_lin[lo:hi] - x0 * plane] = True
+    return slab.reshape(x1 - x0, ny, nz)
+
+
+def _covered_slab(
+    boxes: list[tuple[str, np.ndarray, np.ndarray]], x0: int, x1: int, ny: int, nz: int
+) -> np.ndarray:
+    """Cells of x-planes [x0, x1) covered by ANY object AABB. Ring cells sit on
+    the shell of the AUGMENTED box [vlo-1, vhi+1], strictly outside their own
+    object's box, so exactly where the seed test reads it "covered by any box"
+    ⇔ "covered by ANOTHER object's box" (the phase-1 seed exclusion)."""
+    slab = np.zeros((x1 - x0, ny, nz), dtype=bool)
+    for _nid, vlo, vhi in boxes:
+        a, b = max(int(vlo[0]), x0), min(int(vhi[0]) + 1, x1)
+        if a < b:
+            slab[a - x0 : b - x0, vlo[1] : vhi[1] + 1, vlo[2] : vhi[2] + 1] = True
+    return slab
+
+
+def _fill_streamed(
+    occ_lin: np.ndarray,
+    dims: np.ndarray,
+    boxes: list[tuple[str, np.ndarray, np.ndarray]],
+    empty_path: Path,
+    tick: Callable[[], None] | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """EMPTY mask via the two-phase fill (module docstring), streamed: classic
+    two-pass connected-component labeling over x-slabs. Sweep 1 labels each
+    slab independently (6-connectivity, so slabs couple only through the one
+    shared face plane), records seam label pairs, per-component sizes, and the
+    margin/ring seed bookkeeping; a union-find merge then yields the global
+    components, on which phase 1 + the nested-object rescue run UNCHANGED
+    (they only ever consumed component-level tables). Sweep 2 relabels each
+    slab (deterministic) and writes the final mask straight into the
+    uncompressed `.npy` at `empty_path` — the multi-GB label array of the
+    whole-grid version never exists.
+
+    Provisional ids are `slab base + scipy local label`; scipy numbers labels
+    in first-encounter raster order (and slabs partition raster order), so the
+    MIN provisional id of a merged component ranks components exactly as a
+    whole-grid scan would — final ids replicate the unstreamed numbering, and
+    with it the rescue's lowest-label tie-break, for any slab partition.
+    Returns (count of cells opened by the rescue, fill stats)."""
+    nx, ny, nz = (int(v) for v in dims)
+    step = _slab_planes(ny, nz)
+    starts = list(range(0, nx, step))
+    struct = ndimage.generate_binary_structure(3, 1)
+
+    bases: list[int] = [0] * len(starts)  # provisional-id base per slab
+    n_prov = 0
+    size_parts: list[np.ndarray] = []     # per-slab component cell counts
+    pairs: list[np.ndarray] = []          # (P,2) provisional ids touching a seam
+    seed_parts: list[np.ndarray] = []     # provisional ids seeded (margin/rings)
+    ring_prov: list[list[np.ndarray]] = [[] for _ in boxes]
+    prev_plane: np.ndarray | None = None  # previous slab's last plane, prov ids
+
+    for si, x0 in enumerate(starts):
+        x1 = min(x0 + step, nx)
+        air = _occ_slab(occ_lin, x0, x1, ny, nz)
+        np.logical_not(air, out=air)
+        labels, n_local = ndimage.label(air, struct)
+        del air
+        base = bases[si] = n_prov
+        n_prov += int(n_local)
+        size_parts.append(np.bincount(labels.ravel(), minlength=n_local + 1)[1:])
+
+        def prov_of(lab: np.ndarray) -> np.ndarray:
+            u = np.unique(lab)
+            return u[u > 0].astype(np.int64) + base
+
+        # Seam with the previous slab: 6-connectivity couples only same-(y,z)
+        # cells of the two touching planes.
+        first = labels[0].astype(np.int64)
+        first[first > 0] += base
+        if prev_plane is not None:
+            both = (prev_plane > 0) & (first > 0)
+            if both.any():
+                pairs.append(
+                    np.unique(np.stack([prev_plane[both], first[both]], axis=1), axis=0)
+                )
+        prev_plane = labels[-1].astype(np.int64)
+        prev_plane[prev_plane > 0] += base
+
+        # Margin seeds: the grid's boundary shell lies beyond the scene AABB +
+        # margin (see `_grid_dims`), so its air cells are ambient by construction.
+        faces = [labels[:, 0, :], labels[:, -1, :], labels[:, :, 0], labels[:, :, -1]]
+        if x0 == 0:
+            faces.append(labels[0])
+        if x1 == nx:
+            faces.append(labels[-1])
+        seed_parts.extend(prov_of(f) for f in faces)
+
+        # Phase-1 rings: this slab's slice of every object's shell ring — ALL
+        # air ring components (rescue trigger) + the uncovered ones (seeds).
+        covered = _covered_slab(boxes, x0, x1, ny, nz)
+        for bi, (_nid, vlo, vhi) in enumerate(boxes):
+            for sl in _shell_slabs(vlo, vhi, dims):
+                a, b = max(sl[0].start, x0), min(sl[0].stop, x1)
+                if a >= b:
+                    continue
+                lsl = (slice(a - x0, b - x0), sl[1], sl[2])
+                lab = labels[lsl]
+                airm = lab > 0
+                if not airm.any():
+                    continue
+                ring_prov[bi].append(np.unique(lab[airm]).astype(np.int64) + base)
+                seed = airm & ~covered[lsl]
+                if seed.any():
+                    seed_parts.append(np.unique(lab[seed]).astype(np.int64) + base)
+        del labels, covered
+        if tick is not None:
+            tick()
+
+    # Merge the per-slab labelings: union-find keeping the SMALLEST provisional
+    # id as each root (= global first-encounter order, see docstring).
+    parent = np.arange(n_prov + 1, dtype=np.int64)
+
+    def find(i: int) -> int:
+        root = i
+        while parent[root] != root:
+            root = int(parent[root])
+        while parent[i] != root:  # path compression
+            parent[i], i = root, int(parent[i])
+        return root
+
+    for pr in pairs:
+        for a, b in pr:
+            ra, rb = find(int(a)), find(int(b))
+            if ra != rb:
+                if ra > rb:
+                    ra, rb = rb, ra
+                parent[rb] = ra
+    ids = np.arange(1, n_prov + 1, dtype=np.int64)
+    roots = parent[ids]
+    while True:  # vectorized pointer jumping to full resolution
+        nxt = parent[roots]
+        if (nxt == roots).all():
+            break
+        roots = nxt
+
+    uniq_roots, root_rank = np.unique(roots, return_inverse=True)
+    n_comp = int(uniq_roots.size)
+    # Final ids 1..K in ascending root order = first-encounter raster order.
+    prov_to_final = np.zeros(n_prov + 1, dtype=np.int64)
+    prov_to_final[1:] = root_rank + 1
+    sizes = np.zeros(n_comp + 1, dtype=np.int64)
+    np.add.at(
+        sizes,
+        prov_to_final[1:],
+        np.concatenate(size_parts) if size_parts else np.zeros(0, np.int64),
+    )
+
     reached = np.zeros(n_comp + 1, dtype=bool)
-
-    # Margin seeds: the grid's boundary shell lies beyond the scene AABB + margin
-    # (see `_grid_dims`), so its empty cells are ambient by construction.
-    for axis in range(3):
-        for face in (0, int(dims[axis]) - 1):
-            sl: list[Any] = [slice(None)] * 3
-            sl[axis] = face
-            reached[np.unique(labels[tuple(sl)])] = True
-    reached[0] = False  # label 0 is the cover itself, never free
-
-    # How many object AABBs cover each cell — the phase-1 seed exclusion. An
-    # object's ring lies outside its OWN box, so any nonzero count there means
-    # ANOTHER object's box: exactly the cells where a seed could sit inside a
-    # foreign hollow.
-    cnt = np.zeros(occ.shape, dtype=np.uint16)
-    for _nid, vlo, vhi in boxes:
-        cnt[vlo[0] : vhi[0] + 1, vlo[1] : vhi[1] + 1, vlo[2] : vhi[2] + 1] += 1
-
-    # Phase 1: per object, seed the shell ring's empty cells outside all other
-    # boxes; also record ALL empty ring components for the rescue trigger.
-    ring_labels: list[np.ndarray] = []
-    for _nid, vlo, vhi in boxes:
-        parts: list[np.ndarray] = []
-        for sl in _shell_slabs(vlo, vhi, dims):
-            lab = labels[sl]
-            empty = lab > 0
-            if not empty.any():
-                continue
-            parts.append(np.unique(lab[empty]))
-            seed = empty & (cnt[sl] == 0)
-            if seed.any():
-                reached[np.unique(lab[seed])] = True
-        ring_labels.append(
-            np.unique(np.concatenate(parts)) if parts else np.zeros(0, dtype=np.int64)
-        )
-    del cnt
+    for part in seed_parts:
+        reached[prov_to_final[part]] = True
     seeded_components = int(reached.sum())
+    ring_labels = [
+        np.unique(prov_to_final[np.concatenate(rp)]) if rp else np.zeros(0, np.int64)
+        for rp in ring_prov
+    ]
 
     # Phase 2 — nested rescue, to fixpoint. Trigger: an object with ZERO reached
     # ring cells is sealed away from all discovered free space (fully nested).
@@ -765,13 +925,31 @@ def _classify_empty(
         rescued_comps.append(int(order[-1]))
         rescue_rounds += 1
 
-    empty = reached[labels]  # cover cells carry label 0 → False
-    # Cells opened BY the rescue (vs phase-1 ambient air) — rare, semantically
-    # interesting pockets the viz export keeps un-strided.
-    rescued = (
-        np.isin(labels, np.asarray(rescued_comps, dtype=np.int64))
+    # Sweep 2: relabel each slab (scipy is deterministic, so local labels and
+    # bases replay exactly) and stream the final mask to disk.
+    mm = np.lib.format.open_memmap(
+        empty_path, mode="w+", dtype=bool, shape=(nx, ny, nz)
+    )
+    for si, x0 in enumerate(starts):
+        x1 = min(x0 + step, nx)
+        air = _occ_slab(occ_lin, x0, x1, ny, nz)
+        np.logical_not(air, out=air)
+        labels, n_local = ndimage.label(air, struct)
+        del air
+        base = bases[si]
+        lut = np.zeros(n_local + 1, dtype=bool)
+        lut[1:] = reached[prov_to_final[base + 1 : base + n_local + 1]]
+        mm[x0:x1] = lut[labels]
+        del labels
+        if tick is not None:
+            tick()
+    mm.flush()
+    del mm
+
+    rescued_cells = (
+        int(sizes[np.asarray(rescued_comps, dtype=np.int64)].sum())
         if rescued_comps
-        else np.zeros_like(empty)
+        else 0
     )
     stats = {
         "components": int(n_comp),
@@ -782,7 +960,7 @@ def _classify_empty(
         "objects_sealed": sorted(sealed_ids),
         "objects_embedded": dead,
     }
-    return empty, rescued, stats
+    return rescued_cells, stats
 
 
 def _voxelize_object_task(
@@ -923,6 +1101,82 @@ def _pack_quads(quads: np.ndarray) -> bytes:
     return rec.tobytes()
 
 
+def _viz_streamed(
+    occ_lin: np.ndarray,
+    empty_mm: np.ndarray,
+    d2_mm: np.ndarray,
+    dims: np.ndarray,
+    pitch: float,
+    thresholds: list[float],
+    tick: Callable[[], None] | None = None,
+) -> tuple[np.ndarray, np.ndarray, list[tuple[float, np.ndarray, int]]]:
+    """All SVX3 boundary extractions (every clearance shell + cover + garbage)
+    in ONE x-slab sweep instead of a full-grid pass per class. Exactness and
+    order both survive slab chunking: face exposure looks one cell along the
+    face axis (a one-plane halo covers the x-faces), runs merge along z (x/y
+    faces) or y (z faces) — never along x — so no run crosses a slab seam, and
+    `_boundary_quads` emits face ids in ascending order with row-major (x-outer)
+    rows, so regrouping per-face across ascending slabs reproduces the
+    whole-grid quad order byte for byte. Returns (cover, garbage, shells) in
+    the shapes the pack/write step already consumes."""
+    nx, ny, nz = (int(v) for v in dims)
+    step = _slab_planes(ny, nz)
+    n_cat = len(thresholds) + 2  # shells…, cover, garbage
+    face_parts: list[list[list[np.ndarray]]] = [
+        [[] for _ in range(6)] for _ in range(n_cat)
+    ]
+    cells = [0] * len(thresholds)
+
+    for x0 in range(0, nx, step):
+        x1 = min(x0 + step, nx)
+        sx = x1 - x0
+        h0, h1 = max(x0 - 1, 0), min(x1 + 1, nx)
+        lo_pad = x0 - h0  # 1 when a left halo plane exists
+        occ_h = _occ_slab(occ_lin, h0, h1, ny, nz)
+        emp_h = np.asarray(empty_mm[h0:h1])
+        cl_h = _clearance_chunk(np.asarray(d2_mm[h0:h1]), pitch)
+
+        def padded(mask_h: np.ndarray) -> np.ndarray:
+            """Slab core in [1, sx] with halo planes (or grid-edge False)."""
+            p = np.zeros((sx + 2, ny, nz), dtype=bool)
+            p[1 : 1 + sx] = mask_h[lo_pad : lo_pad + sx]
+            if lo_pad:
+                p[0] = mask_h[0]
+            if h1 > x1:
+                p[sx + 1] = mask_h[-1]
+            return p
+
+        def emit(cat: int, mask_h: np.ndarray) -> None:
+            q = _boundary_quads(padded(mask_h))
+            if len(q):
+                q = q[(q[:, 0] >= 1) & (q[:, 0] <= sx)]  # core cells only
+            if not len(q):
+                return
+            q[:, 0] += x0 - 1  # padded → grid x
+            b = np.searchsorted(q[:, 3], np.arange(7))  # face ids ascend
+            for f in range(6):
+                if b[f + 1] > b[f]:
+                    face_parts[cat][f].append(q[b[f] : b[f + 1]])
+
+        for ti, t in enumerate(thresholds):
+            m_h = emp_h & (cl_h >= t - _CLEARANCE_EPS)
+            cells[ti] += int(m_h[lo_pad : lo_pad + sx].sum())
+            emit(ti, m_h)
+        emit(len(thresholds), occ_h)
+        emit(len(thresholds) + 1, ~occ_h & ~emp_h)
+        if tick is not None:
+            tick()
+
+    def gather(cat: int) -> np.ndarray:
+        parts = [a for f in range(6) for a in face_parts[cat][f]]
+        return (
+            np.concatenate(parts, axis=0) if parts else np.zeros((0, 5), np.int32)
+        )
+
+    shells = [(t, gather(ti), cells[ti]) for ti, t in enumerate(thresholds)]
+    return gather(len(thresholds)), gather(len(thresholds) + 1), shells
+
+
 def _shell_thresholds(pitch: float, clearance_m: float, cl_max: float) -> list[float]:
     """The free-shell ladder: voxel multiples (`_SHELL_STEPS`) up to the scene's
     clearance ceiling, with the BAKED threshold always included (so the default
@@ -931,6 +1185,286 @@ def _shell_thresholds(pitch: float, clearance_m: float, cl_max: float) -> list[f
     ts = {round(pitch * s, 4) for s in _SHELL_STEPS if pitch * s <= top}
     ts.add(round(float(clearance_m), 4))
     return sorted(t for t in ts if t > 0)
+
+
+# ---------------------------------------------------------------------------
+# Memory-aware worker sizing. Each mesh-pass worker is a fresh SPAWN interpreter
+# (numpy + scipy + trimesh re-imported, ~0.3-0.5 GB RSS each) that then holds a
+# decoded mesh plus its float64 voxel scratch — so peak RAM is `workers ×
+# per-object`, and a fixed `min(cpu, 8)` OOMs small boxes and memory-capped
+# containers. The auto path (`workers == 0`) sizes the pool to a fraction of the
+# ACTUALLY usable memory, and degrades to the static cap when memory can't be
+# probed. Worker count never changes the output (absolute-lattice keys merge
+# order-independently), so this is purely a resource guard.
+_MEM_BUDGET_FRACTION = 0.6          # share of usable RAM the mesh pass may claim
+_WORKER_BASE_BYTES = 600 * 1024**2  # spawn interpreter + numpy/scipy/trimesh + slack
+_WORKER_FILE_MULT = 16              # decoded mesh + voxel scratch, per GLB byte
+_MAX_AUTO_WORKERS = 8               # ceiling even on huge-RAM, many-core hosts
+
+
+def _cgroup_available_bytes() -> int | None:
+    """Bytes left under a Linux cgroup memory cap (v2 then v1), or None when
+    unconstrained / not on Linux. psutil and sysconf report the HOST, so a
+    container's real ceiling is only visible here — callers `min()` it in."""
+    for limit_f, usage_f in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes",
+         "/sys/fs/cgroup/memory/memory.usage_in_bytes"),
+    ):
+        try:
+            raw = Path(limit_f).read_text().strip()
+            if raw == "max":
+                continue
+            limit = int(raw)
+            if limit >= 1 << 62:  # v1 "unlimited" sentinel — treat as no cap
+                continue
+            usage = int(Path(usage_f).read_text().strip())
+            return max(0, limit - usage)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def _windows_available_bytes() -> int | None:
+    """Available physical bytes via `GlobalMemoryStatusEx.ullAvailPhys` — the
+    stdlib-only path where psutil is absent (as on the splat venv)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class _MemoryStatusEx(ctypes.Structure):
+        _fields_ = [
+            ("dwLength", ctypes.c_ulong),
+            ("dwMemoryLoad", ctypes.c_ulong),
+            ("ullTotalPhys", ctypes.c_ulonglong),
+            ("ullAvailPhys", ctypes.c_ulonglong),
+            ("ullTotalPageFile", ctypes.c_ulonglong),
+            ("ullAvailPageFile", ctypes.c_ulonglong),
+            ("ullTotalVirtual", ctypes.c_ulonglong),
+            ("ullAvailVirtual", ctypes.c_ulonglong),
+            ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+        ]
+
+    try:
+        stat = _MemoryStatusEx()
+        stat.dwLength = ctypes.sizeof(_MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return int(stat.ullAvailPhys)
+    except Exception:
+        return None
+    return None
+
+
+def _posix_available_bytes() -> int | None:
+    """Available physical bytes via `SC_AVPHYS_PAGES` (Linux / most Unix); None
+    where the name is unsupported (macOS, Windows)."""
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_AVPHYS_PAGES"))
+    except (ValueError, AttributeError, OSError):
+        return None
+
+
+def _available_memory_bytes() -> int | None:
+    """Best-effort USABLE memory in bytes: the MIN of every signal we can read
+    (psutil, POSIX sysconf, the Windows API, a Linux cgroup cap), so a container
+    limit wins over host RAM. None when nothing is detectable — the caller then
+    keeps its static worker cap rather than guessing."""
+    vals: list[int] = []
+    try:
+        import psutil  # type: ignore  # optional; never a hard dependency
+
+        vals.append(int(psutil.virtual_memory().available))
+    except Exception:
+        pass
+    for probe in (
+        _posix_available_bytes(),
+        _windows_available_bytes(),
+        _cgroup_available_bytes(),
+    ):
+        if probe is not None and probe > 0:
+            vals.append(probe)
+    return min(vals) if vals else None
+
+
+def _auto_worker_count(ids: list[str], raw_dir: Path, hard_cap: int) -> int:
+    """Mesh-pass worker count sized so `workers × per-object peak` fits the
+    memory budget. Per-object peak is estimated from the LARGEST placed GLB
+    (decode + voxel scratch scale with it) over the fixed spawn-import RSS floor.
+    Clamped to [1, min(hard_cap, #objects)]; falls back to `hard_cap` when
+    memory or the files can't be read (never worse than the old static cap)."""
+    ceiling = max(1, min(hard_cap, len(ids)))
+    if ceiling <= 1:
+        return ceiling
+    avail = _available_memory_bytes()
+    if avail is None:
+        return ceiling
+    try:
+        largest = max((raw_dir / f"{i}.glb").stat().st_size for i in ids)
+    except OSError:
+        return ceiling
+    per_worker = _WORKER_BASE_BYTES + _WORKER_FILE_MULT * largest
+    fit = int(avail * _MEM_BUDGET_FRACTION) // per_worker
+    n = int(max(1, min(ceiling, fit)))
+    if n < ceiling:
+        logging.getLogger(__name__).info(
+            "stage2: mesh pass using %d/%d workers (~%.1f GB usable, ~%.0f MB/worker est.)",
+            n, ceiling, avail / 1024**3, per_worker / 1024**2,
+        )
+    return n
+
+
+# --- streamed exact clearance (squared EDT in integer voxel units) -------------
+# The exact Euclidean distance transform is SEPARABLE: with e²(x', y, z) the 2-D
+# squared EDT of plane x' (over (y, z)),
+#
+#     d²(x, y, z) = min over x' of [ (x - x')² + e²(x', y, z) ]
+#
+# so the field is built in two streamed phases sharing ONE int32 scratch file:
+# phase 1 computes each plane's 2-D squared EDT (the `edt` package; its float32
+# results are exact integers while the plane diagonal² < 2^24) during an x-slab
+# sweep; phase 2 runs the remaining 1-D minimization along x (`_parabola_pass`,
+# exact int64 arithmetic) over column bundles read back from the scratch. All
+# values are exact integer squared distances — deterministic for any slab or
+# bundle partition — and metres are derived per chunk as
+# float32(pitch · sqrt(d²)). Cover cells carry d² = 0, the grid edge is not a
+# cover source (matches `black_border=False`), and `pitch` is isotropic.
+
+
+def _dist2_planes(
+    occ_lin: np.ndarray,
+    dims: np.ndarray,
+    scratch: Path,
+    workers: int = 1,
+    tick: Callable[[], None] | None = None,
+) -> None:
+    """Phase 1: per-plane 2-D squared EDT → int32 scratch memmap. Planes with
+    no cover at all store −1 (no in-plane site; resolved by phase 2). `workers`
+    threads the C++ transform — integer-exact results either way."""
+    # Imported at call time (not module load) so read-only users of stage2 —
+    # grid loading, FreeSpace, Stage 4 — don't need `edt`; only building a grid does.
+    import edt
+
+    nx, ny, nz = (int(v) for v in dims)
+    if ny * ny + nz * nz >= 1 << 24 or nx * nx + ny * ny + nz * nz >= 1 << 31:
+        raise RuntimeError(
+            f"grid {nx}x{ny}x{nz} exceeds the exact-EDT integer range — "
+            "use a coarser pitch"
+        )
+    mm = np.lib.format.open_memmap(
+        scratch, mode="w+", dtype=np.int32, shape=(nx, ny, nz)
+    )
+    step = _slab_planes(ny, nz)
+    for x0 in range(0, nx, step):
+        x1 = min(x0 + step, nx)
+        occ = _occ_slab(occ_lin, x0, x1, ny, nz)
+        out = np.empty((x1 - x0, ny, nz), dtype=np.int32)
+        for i in range(x1 - x0):
+            if occ[i].any():
+                out[i] = edt.edtsq(
+                    ~occ[i], black_border=False, parallel=max(1, workers)
+                ).astype(np.int32)
+            else:
+                out[i] = -1
+        mm[x0:x1] = out
+        if tick is not None:
+            tick()
+    mm.flush()
+    del mm
+
+
+def _parabola_pass(g: np.ndarray) -> np.ndarray:
+    """Exact 1-D lower-envelope pass of the squared EDT (Felzenszwalb &
+    Huttenlocher), vectorized ACROSS columns: `g` is (n, C) int64 per-column
+    parabola costs (`_NO_SITE` marks positions with no site) and the result is
+    f[x] = min over q of (g[q] + (x − q)²). Each column keeps its own site
+    stack in shared arrays; the pop loop runs while ANY column still pops
+    (amortized O(1) per push, as in the scalar algorithm). Envelope boundaries
+    are compared as int64 rationals (cross-multiplied), so results are exact
+    integers — no float ties, identical for any column batching."""
+    n, c_cnt = g.shape
+    cols = np.arange(c_cnt)
+    v = np.zeros((n, c_cnt), dtype=np.int64)        # stacked site positions
+    gv = np.full((n, c_cnt), _NO_SITE, np.int64)    # stacked site costs
+    num = np.zeros((n + 1, c_cnt), dtype=np.int64)  # left boundary of site k,
+    den = np.ones((n + 1, c_cnt), dtype=np.int64)   # as a rational num/den
+    top = np.full(c_cnt, -1, dtype=np.int64)        # stack depth − 1
+    neg_inf = np.int64(-1) << 40                    # below any real boundary
+
+    for q in range(n):
+        gq = g[q]
+        has = gq < _NO_SITE
+        if not has.any():
+            continue
+        # Pop stacked sites the new parabola dominates: intersection abscissa
+        # s(q, top) ≤ the top site's own left boundary.
+        while True:
+            act = has & (top >= 0)
+            if not act.any():
+                break
+            ci = cols[act]
+            ti = top[act]
+            vt = v[ti, ci]
+            s_num = (gq[act] + q * q) - (gv[ti, ci] + vt * vt)
+            s_den = 2 * (q - vt)  # > 0: sites are pushed in ascending order
+            pop = s_num * den[ti, ci] <= num[ti, ci] * s_den
+            if not pop.any():
+                break
+            top[ci[pop]] -= 1
+        # Push site q on every column that has it.
+        ci = cols[has]
+        ti = top[has] + 1
+        prev = np.maximum(ti - 1, 0)
+        vt = v[prev, ci]
+        s_num = np.where(
+            ti > 0, (gq[has] + q * q) - (gv[prev, ci] + vt * vt), neg_inf
+        )
+        s_den = np.where(ti > 0, 2 * (q - vt), np.int64(1))
+        v[ti, ci] = q
+        gv[ti, ci] = gq[has]
+        num[ti, ci] = s_num
+        den[ti, ci] = s_den
+        top[has] = ti
+
+    f = np.full((n, c_cnt), _NO_SITE, np.int64)
+    k = np.zeros(c_cnt, dtype=np.int64)
+    for x in range(n):
+        while True:  # advance past boundaries left of x: z[k+1] < x
+            adv = (k < top) & (num[k + 1, cols] < x * den[k + 1, cols])
+            if not adv.any():
+                break
+            k[adv] += 1
+        vk = v[k, cols]
+        f[x] = np.where(top >= 0, gv[k, cols] + (x - vk) * (x - vk), _NO_SITE)
+    return f
+
+
+def _dist2_xpass(
+    dims: np.ndarray, scratch: Path, tick: Callable[[], None] | None = None
+) -> None:
+    """Phase 2: finish the squared EDT along x, in place in the scratch —
+    bundles of full-x column blocks stream through `_parabola_pass`."""
+    nx, ny, nz = (int(v) for v in dims)
+    mm = np.lib.format.open_memmap(scratch, mode="r+")
+    # ~6 int64 arrays of (nx, rows·nz) live during a bundle.
+    rows = max(1, int(_SLAB_TARGET_BYTES // max(1, nx * nz * 8 * 6)))
+    for y0 in range(0, ny, rows):
+        y1 = min(y0 + rows, ny)
+        g = mm[:, y0:y1, :].reshape(nx, -1).astype(np.int64)
+        g[g < 0] = _NO_SITE  # planes without cover contribute no site
+        f = _parabola_pass(g)
+        # Every column has ≥ 1 site (the grid has cover somewhere), so the
+        # minimum is always finite and fits int32 (guarded in _dist2_planes).
+        mm[:, y0:y1, :] = f.reshape(nx, y1 - y0, nz).astype(np.int32)
+        if tick is not None:
+            tick()
+    mm.flush()
+    del mm
+
+
+def _clearance_chunk(d2: np.ndarray, pitch: float) -> np.ndarray:
+    """Integer squared distances → metres, float32: the ONE conversion every
+    consumer of the field shares (stats, shells, the stored float16)."""
+    return (np.sqrt(d2.astype(np.float64)) * pitch).astype(np.float32)
 
 
 def compute_free_space(
@@ -947,8 +1481,9 @@ def compute_free_space(
     (in parallel across objects — see `_iter_voxelized`), classify empty vs
     garbage with the two-phase fill, run the clearance pass (EDT + the baked
     FREE threshold), and write `freespace.npz` (to `out_path`) + the SVX3
-    `voxels.bin` viz pack (beside it). Returns a summary (grid dims, counts,
-    fill + clearance stats). Output is byte-identical for any worker count."""
+    `voxels.bin` viz pack + the `.empty.npy` sidecar (beside it). Returns a
+    summary (grid dims, counts, fill + clearance stats). Output is
+    byte-identical for any worker count and any slab partition."""
     if not raw_dir.is_dir():
         raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
     ids = placed_object_ids(raw_dir)
@@ -958,12 +1493,13 @@ def compute_free_space(
     margin = float(max(0.0, params.margin))
     clearance_m = float(max(0.0, params.clearance))
     workers = (
-        params.workers if params.workers > 0 else min(os.cpu_count() or 1, 8)
+        params.workers if params.workers > 0
+        else _auto_worker_count(ids, raw_dir, min(os.cpu_count() or 1, _MAX_AUTO_WORKERS))
     )
 
     total = len(ids)
     if progress is not None:
-        progress(0, total, "")
+        progress(0, total, "voxelize")
 
     # The MESH PASS — the stage's long pole, parallelized per object: voxelize
     # each surface EXACTLY (every cell a triangle touches, via _voxelize_geom)
@@ -992,10 +1528,15 @@ def compute_free_space(
             lo, hi = np.minimum(lo, olo), np.maximum(hi, ohi)
             obj_lo[node_id], obj_hi[node_id] = olo, ohi
         if progress is not None:
-            progress(done, total, node_id)
+            # Constant "voxelize" step (not the node id) so the caller can meter an
+            # objects/second rate; done/total already says which object. Parallel
+            # completion order makes a per-id label noise anyway.
+            progress(done, total, "voxelize")
 
     if (not opaque_parts and not glass_parts) or not np.isfinite(lo).all():
         raise RuntimeError("no surface voxelized (every mesh failed or was empty)")
+    if progress is not None:
+        progress(0, 0, "reduce")  # merge keys → grid + occupancy (single pass)
     empty_keys = np.zeros(0, dtype=np.int64)
     opaque_keys = (
         np.unique(np.concatenate(opaque_parts)) if opaque_parts else empty_keys
@@ -1003,6 +1544,7 @@ def compute_free_space(
     glass_keys = (
         np.unique(np.concatenate(glass_parts)) if glass_parts else empty_keys
     )
+    del opaque_parts, glass_parts  # the merged keys supersede the partials
 
     imin, dims = _grid_dims(lo, hi, margin, pitch)
     nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
@@ -1020,9 +1562,7 @@ def compute_free_space(
     # keeping the two stored sets disjoint (glass = transmissive-only cells).
     glass_lin = np.setdiff1d(to_lin(glass_keys), opaque_lin, assume_unique=True)
     occ_lin = np.union1d(opaque_lin, glass_lin)
-
-    occ = np.zeros((nx, ny, nz), dtype=bool)
-    occ.reshape(-1)[occ_lin] = True
+    del opaque_keys, glass_keys, opaque_lin  # occ_lin/glass_lin carry it forward
 
     # Per-object grid-index AABBs (all cells the mesh AABB touches — a superset
     # of the object's own cover cells, so its ring is always strictly outside).
@@ -1036,54 +1576,160 @@ def compute_free_space(
             (node_id, np.clip(vlo, 0, dims - 1), np.clip(vhi, 0, dims - 1))
         )
 
-    empty, rescued, fill_stats = _classify_empty(occ, boxes)
-
-    # The CLEARANCE PASS (right after the fill): EDT over non-cover cells →
-    # metres to the nearest cover cell, then FREE = the empty cells at ≥
-    # `clearance_m` — where a camera can physically sit. The labels above never
-    # consult clearance; FREE is a pure derivation, re-bakeable in place
-    # (`apply_clearance`) without re-running anything else.
-    clearance = (
-        ndimage.distance_transform_edt(~occ).astype(np.float32) * np.float32(pitch)
-    )
-    free = empty & (clearance >= clearance_m - _CLEARANCE_EPS)
-
-    # Persist the reusable grid (float16 clearance halves the file at ~0.05%
-    # relative error — comparisons carry _CLEARANCE_EPS, so exact-lattice
-    # thresholds survive the quantization). FREE is derived on load from
-    # `empty` + `clearance` + `clearance_m`, never stored.
+    # Streamed grid phases (module docstring): the dense fields live in
+    # disk-backed scratch files beside the outputs, processed in x-slabs —
+    # nothing grid-sized is ever resident. The empty scratch is PROMOTED to the
+    # `.empty.npy` sidecar Stage 3 memory-maps, so its first sampler run no
+    # longer decompresses and rewrites the mask itself.
+    #
+    # Scratch names carry a per-invocation token: builds for the same cell can
+    # OVERLAP (a revert's task.cancel() can't stop a build already running in a
+    # worker thread, and a fresh POST then starts another), and with fixed
+    # names the first build's cleanup deletes the scratches out from under the
+    # survivor — a mid-build FileNotFoundError. Unique names make overlap
+    # harmless: each build only ever touches (and finally deletes) its own
+    # scratches, while the age-gated sweep below reclaims the litter of builds
+    # killed too hard for their cleanup to run.
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_npz = out_path.with_suffix(out_path.suffix + ".tmp.npz")
-    np.savez_compressed(
-        tmp_npz,
-        origin=origin.astype(np.float64),
-        pitch=np.float64(pitch),
-        dims=np.array([nx, ny, nz], dtype=np.int64),
-        occ_lin=occ_lin.astype(np.int64),
-        occ_lin_glass=glass_lin.astype(np.int64),
-        clearance=clearance.astype(np.float16),
-        empty=empty,
-        clearance_m=np.float64(clearance_m),
-    )
-    tmp_npz.replace(out_path)
+    sidecar = out_path.with_name(out_path.name + _EMPTY_SIDECAR_SUFFIX)
+    token = f"{os.getpid():x}-{int(time.time() * 1000):x}"
+    empty_tmp = out_path.with_name(f"{out_path.name}.empty.{token}.tmp.npy")
+    dist2_tmp = out_path.with_name(f"{out_path.name}.dist2.{token}.tmp.npy")
+    f16_tmp = out_path.with_name(f"{out_path.name}.cl16.{token}.tmp.npy")
+    tmp_npz = out_path.with_name(f"{out_path.name}.{token}.tmp.npz")
+    now = time.time()
+    for stale in out_path.parent.glob(out_path.name + ".*.tmp.np*"):
+        try:
+            if now - stale.stat().st_mtime > _SCRATCH_TTL_S:
+                stale.unlink()
+        except OSError:
+            pass
+    step = _slab_planes(ny, nz)
+    n_slabs = (nx + step - 1) // step
 
-    # SVX3 viz pack (see module docstring): VOLUMETRIC boundary shells, not
-    # points. Each class (cover, garbage, and the free volume at a ladder of
-    # clearance thresholds) is surface-extracted — only faces whose neighbour
-    # leaves the class survive, run-merged into strips — so the client renders
-    # merged translucent shapes with interior faces culled, and the clearance
-    # slider swaps between pre-meshed shells instead of re-filtering points.
-    empty_count = int(empty.sum())
-    free_count = int(free.sum())
-    cl_empty = clearance[empty]
-    cl_max = float(cl_empty.max()) if cl_empty.size else pitch
+    def _stepper(total: int, name: str) -> Callable[[], None]:
+        done = 0
+        if progress is not None:
+            progress(0, total, name)
 
-    shells: list[tuple[float, np.ndarray, int]] = []
-    for t in _shell_thresholds(pitch, clearance_m, cl_max):
-        m = empty & (clearance >= t - _CLEARANCE_EPS)
-        shells.append((t, _boundary_quads(m), int(m.sum())))
-    cover_q = _boundary_quads(occ)
-    garbage_q = _boundary_quads(~occ & ~empty)
+        def tick() -> None:
+            nonlocal done
+            done += 1
+            if progress is not None:
+                progress(done, total, name)
+
+        return tick
+
+    try:
+        # THE FILL — streamed two-pass labeling (a tick per slab per sweep).
+        rescued_cells, fill_stats = _fill_streamed(
+            occ_lin, dims, boxes, empty_tmp, _stepper(2 * n_slabs, "fill")
+        )
+
+        # THE CLEARANCE PASS — exact squared EDT into the int32 scratch:
+        # per-plane 2-D transforms (a tick per slab), then the 1-D x-pass over
+        # column bundles (a tick per bundle). FREE stays a pure derivation
+        # (empty ∧ clearance ≥ clearance_m), re-bakeable via `apply_clearance`.
+        bundle_rows = max(1, int(_SLAB_TARGET_BYTES // max(1, nx * nz * 8 * 6)))
+        tick = _stepper(n_slabs + (ny + bundle_rows - 1) // bundle_rows, "clearance")
+        _dist2_planes(occ_lin, dims, dist2_tmp, workers, tick)
+        _dist2_xpass(dims, dist2_tmp, tick)
+
+        # Windows note: every memmap handle (and every VIEW of one) below is
+        # scoped inside a helper or deleted before the file is renamed/unlinked
+        # — a surviving view pins the file and the promote/cleanup would fail.
+
+        def _empty_stats() -> tuple[int, int, float, float]:
+            """(empty_count, free_count, cl_max, cl_mean) — FREE count +
+            clearance stats over EMPTY cells, flat-chunked off the memmaps:
+            three scalars, never a grid-sized copy."""
+            emp = np.load(empty_tmp, mmap_mode="r")
+            d2 = np.load(dist2_tmp, mmap_mode="r")
+            n_empty = int(emp.sum())
+            if not n_empty:
+                # `pitch` keeps the shell ladder non-empty; the summary reports 0.
+                return 0, 0, pitch, 0.0
+            thr = clearance_m - _CLEARANCE_EPS
+            n_free = 0
+            mx = 0.0
+            acc = 0.0
+            flat_d2 = d2.reshape(-1)
+            flat_emp = emp.reshape(-1)
+            for i in range(0, flat_d2.size, _CHUNK_CELLS):
+                ce = _clearance_chunk(
+                    flat_d2[i : i + _CHUNK_CELLS][flat_emp[i : i + _CHUNK_CELLS]],
+                    pitch,
+                )
+                if ce.size:
+                    n_free += int((ce >= thr).sum())
+                    mx = max(mx, float(ce.max()))
+                    acc += float(ce.sum(dtype=np.float64))
+            return n_empty, n_free, mx, acc / n_empty
+
+        empty_count, free_count, cl_max, cl_mean = _empty_stats()
+
+        # Persist the reusable grid (float16 clearance halves the file at
+        # ~0.05% relative error — comparisons carry _CLEARANCE_EPS, so
+        # exact-lattice thresholds survive the quantization). Both grid-sized
+        # entries are MEMMAPS: np.savez_compressed streams each into the zip in
+        # buffered chunks, so the write holds no grid-sized array either.
+        if progress is not None:
+            progress(0, 0, "write")
+
+        def _bake_f16() -> None:
+            d2 = np.load(dist2_tmp, mmap_mode="r")
+            cl16 = np.lib.format.open_memmap(
+                f16_tmp, mode="w+", dtype=np.float16, shape=(nx, ny, nz)
+            )
+            flat16 = cl16.reshape(-1)
+            flat_d2 = d2.reshape(-1)
+            for i in range(0, flat_d2.size, _CHUNK_CELLS):
+                flat16[i : i + _CHUNK_CELLS] = _clearance_chunk(
+                    flat_d2[i : i + _CHUNK_CELLS], pitch
+                ).astype(np.float16)
+            cl16.flush()
+
+        _bake_f16()
+        cl16 = np.load(f16_tmp, mmap_mode="r")
+        empty_mm = np.load(empty_tmp, mmap_mode="r")
+        np.savez_compressed(
+            tmp_npz,
+            origin=origin.astype(np.float64),
+            pitch=np.float64(pitch),
+            dims=np.array([nx, ny, nz], dtype=np.int64),
+            occ_lin=occ_lin.astype(np.int64),
+            occ_lin_glass=glass_lin.astype(np.int64),
+            clearance=cl16,
+            empty=empty_mm,
+            clearance_m=np.float64(clearance_m),
+        )
+        del cl16, empty_mm
+        tmp_npz.replace(out_path)
+        # Promote the empty scratch to the Stage-3 sidecar AFTER the npz lands,
+        # and touch it: rename keeps the content mtime, and Stage 3 rebuilds a
+        # sidecar that reads older than its npz.
+        empty_tmp.replace(sidecar)
+        os.utime(sidecar)
+
+        # SVX3 viz pack (module docstring): every class extracted in ONE slab
+        # sweep — the tail's slowest pass touches the grid once, not per class.
+        thresholds = _shell_thresholds(pitch, clearance_m, cl_max)
+        empty_mm = np.load(sidecar, mmap_mode="r")
+        d2_mm = np.load(dist2_tmp, mmap_mode="r")
+        cover_q, garbage_q, shells = _viz_streamed(
+            occ_lin, empty_mm, d2_mm, dims, pitch, thresholds,
+            _stepper(n_slabs, "viz"),
+        )
+        del empty_mm, d2_mm
+    finally:
+        # Scratches are build-local (unique names). On failure a leaked memmap
+        # handle can pin one on Windows — best-effort: the TTL sweep of the
+        # next build reclaims anything left behind.
+        for p in (dist2_tmp, f16_tmp, empty_tmp, tmp_npz):
+            try:
+                p.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     viz_path = out_path.with_name(VOXELS_NAME)
     tmp_viz = viz_path.with_suffix(viz_path.suffix + ".tmp")
@@ -1109,7 +1755,7 @@ def compute_free_space(
         "empty_voxels": empty_count,
         "free_voxels": free_count,
         "garbage_voxels": int(nx * ny * nz - occ_lin.size) - empty_count,
-        "rescued_voxels": int(rescued.sum()),
+        "rescued_voxels": rescued_cells,
         "fill": fill_stats,
         "viz": {
             "cover_quads": int(len(cover_q)),
@@ -1120,8 +1766,8 @@ def compute_free_space(
                 for c in (cells,)
             ],
         },
-        "clearance_max": cl_max if cl_empty.size else 0.0,
-        "clearance_mean": round(float(cl_empty.mean()), 4) if cl_empty.size else 0.0,
+        "clearance_max": cl_max if empty_count else 0.0,
+        "clearance_mean": round(cl_mean, 4) if empty_count else 0.0,
         "params": params.as_summary(),
         "bytes": viz_path.stat().st_size,
         "grid_bytes": out_path.stat().st_size,

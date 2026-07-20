@@ -1924,11 +1924,14 @@ class Stage2Request(BaseModel):
     """Free-space voxelizer knobs (Stage 2 — the shared spatial foundation). All
     optional; omitted → defaults. `pitch` (m) is the uniform voxel edge of the
     single grid, `margin` (m) grows the exterior play volume, `clearance` (m) is
-    the baked FREE threshold (camera standoff from any surface)."""
+    the baked FREE threshold (camera standoff from any surface). `workers` caps
+    the per-object voxelization pool (1 = serial, lowest peak RAM; omitted →
+    auto = min(cpu, 8))."""
 
     pitch: float | None = None
     margin: float | None = None
     clearance: float | None = None
+    workers: int | None = None
 
 
 class Stage2ClearanceRequest(BaseModel):
@@ -1959,6 +1962,7 @@ def _stage2_params(req: Stage2Request | None) -> splat_stage2.FreeSpaceParams:
         pitch=float(min(max(req.pitch, 0.02), 1.0)) if req.pitch is not None else d.pitch,
         margin=float(min(max(req.margin, 0.0), 10.0)) if req.margin is not None else d.margin,
         clearance=_clamp_clearance(req.clearance) if req.clearance is not None else d.clearance,
+        workers=max(1, min(int(req.workers), 32)) if req.workers is not None else d.workers,
     )
 
 
@@ -1988,9 +1992,10 @@ def _latest_ckpt_step(ckpt_dir: Path) -> int | None:
     """Highest checkpoint step on disk (from the `step_NNNNNN.pt` names), or None."""
     if not ckpt_dir.is_dir():
         return None
+    # rglob: tiled runs checkpoint under per-tile subdirs (splat/ckpt/tile_NNN/).
     steps = [
         int(p.stem.split("_")[1])
-        for p in ckpt_dir.glob("step_*.pt")
+        for p in ckpt_dir.rglob("step_*.pt")
         if "_" in p.stem and p.stem.split("_")[-1].isdigit()
     ]
     return max(steps) if steps else None
@@ -2069,14 +2074,31 @@ def _voxelize_from_tier(
 ) -> dict[str, Any]:
     """Compute a cell's free-space grid (Stage 2) directly off its selected
     asset dir — no de-optimization (splat/assets.py decodes KTX2/Meshopt
-    in-process). Blocking."""
+    in-process). Blocking.
+
+    The progress callback also derives a live `rate` (actions/second) for the
+    current step — objects/s during 'voxelize', boundary extractions/s during
+    'viz' — as an EMA of Δdone/Δt, reset whenever the step changes so each step
+    reports its own throughput. The single-pass marker steps (reduce / fill /
+    clearance / write) don't stream a count, so their rate stays 0."""
+    meter = {"step": None, "t": 0.0, "done": 0, "rate": 0.0}
 
     def _progress(done: int, total: int, current: str) -> None:
+        step = current or "voxelize"
+        now = time.monotonic()
+        if step != meter["step"]:          # new step → restart the rate baseline
+            meter.update(step=step, t=now, done=done, rate=0.0)
+        elif done > meter["done"]:          # streaming step → EMA of Δdone/Δt
+            inst = (done - meter["done"]) / max(now - meter["t"], 1e-3)
+            meter["rate"] = inst if meter["rate"] <= 0.0 else 0.5 * meter["rate"] + 0.5 * inst
+            meter["t"], meter["done"] = now, done
         job["phase"], job["done"], job["total"], job["current_id"] = (
-            "voxelize", done, total, current,
+            step, done, total, step,
         )
+        job["rate"] = round(meter["rate"], 1)
 
     job["phase"] = "voxelize"
+    job["rate"] = 0.0
     return splat_stage2.compute_free_space(
         run=run, slot=slot, model=model, raw_dir=tier_dir,
         out_path=out_path, params=params, progress=_progress,
@@ -2345,8 +2367,10 @@ async def _run_splat_stage3_cell(
 
 class Stage4Request(BaseModel):
     """Coverage-planner knobs (all optional; omitted → defaults). `min_gain`
-    truncates the diminishing tail (higher = fewer images); `patch_min_spacing`
-    sets the finest patch detail. Scale is not a knob: view distances derive per
+    truncates the diminishing tail (higher = fewer images); `patch_min_spacing` /
+    `patch_max_spacing` bound the patch feature scale — detail concentration is
+    inherited from the Stage-3 cloud's own density (geometry + texture), not
+    re-detected here. Scale is not a knob: view distances derive per
     patch from the SCALE LADDER (see splat/stage4.py) — `finest_px_per_patch` is
     its single dial, the sharpest demanded resolution in pixels per patch
     feature (capped at `render_resolution`, where a view saturates); the ladder
@@ -2354,15 +2378,15 @@ class Stage4Request(BaseModel):
     direction dial: equal-solid-angle cells (an explicit direct-facing cap + a
     ring of azimuth cells) tiling the hemisphere around each patch normal, all
     suppliable cells demanded. The old `near_frac` / `min_px_per_patch` /
-    `angles_per_patch` / `angular_sectors` knobs are gone (subsumed; unknown
+    `angles_per_patch` / `angular_sectors` / `collision_clearance` / `curvature_k`
+    / `tex_k` knobs are gone (subsumed — camera standoff is emergent from the
+    scale ladder, and patch detail is inherited from the Stage-3 cloud; unknown
     fields in a request body are ignored)."""
 
     patch_min_spacing: float | None = None
     patch_max_spacing: float | None = None
-    collision_clearance: float | None = None
     angular_bins: int | None = None
     finest_px_per_patch: float | None = None
-    tex_k: float | None = None
     min_gain: int | None = None
     # Hard image budget (the cost dial, in rendered-reference units): the greedy
     # stops after this many images, keeping the near-optimal prefix; the
@@ -2372,7 +2396,6 @@ class Stage4Request(BaseModel):
     candidate_spacing: float | None = None
     max_candidates: int | None = None
     render_resolution: int | None = None
-    gpu: bool | None = None  # run the coverage ray-march on CUDA (default on); False forces CPU
 
 
 def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
@@ -2387,14 +2410,6 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
     return splat_stage4.PlanParams(
         patch_min_spacing=pick(req.patch_min_spacing, 0.02, 0.5, d.patch_min_spacing),
         patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
-        tex_k=pick(req.tex_k, 0.0, 50.0, d.tex_k),
-        # None (the default) defers to the grid's baked clearance_m at plan
-        # time; an explicit value can only tighten (the baked mask is the floor).
-        collision_clearance=(
-            _clamp_clearance(req.collision_clearance)
-            if req.collision_clearance is not None
-            else d.collision_clearance
-        ),
         angular_bins=int(pick(req.angular_bins, 2, 16, d.angular_bins)),
         # PlanParams itself caps the effective value at render_resolution
         # (saturation); the clamp here is just request hygiene.
@@ -2409,7 +2424,6 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         # and warns if a scene exceeds it, so large scenes aren't silently clipped.
         max_candidates=int(pick(req.max_candidates, 1000, 5_000_000, d.max_candidates)),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
-        gpu=req.gpu if req.gpu is not None else d.gpu,
     )
 
 
@@ -2456,14 +2470,30 @@ def _plan_cameras_cell(
     plan_params: splat_stage4.PlanParams, job: dict[str, Any],
 ) -> dict[str, Any]:
     """Plan cameras from the Stage-2 free-space grid + Stage-3 surfel cloud — no mesh
-    loading, no de-optimization (that's why Stage 4 can't run off a raw mesh)."""
+    loading, no de-optimization (that's why Stage 4 can't run off a raw mesh).
+
+    The progress callback also derives a live `rate` (actions/second) for the
+    current planning STEP — candidates ray-marched during 'coverage', cameras
+    picked during 'select' — as an EMA of Δdone/Δt that resets whenever the
+    sub-step changes, so each step reports its own throughput. Marker steps
+    (load / patches / write) don't stream a count, so their rate stays 0."""
+    meter = {"step": None, "t": 0.0, "done": 0, "rate": 0.0}
 
     def _progress(done: int, total: int, current: str) -> None:
+        now = time.monotonic()
+        if current != meter["step"]:          # new sub-step → restart the baseline
+            meter.update(step=current, t=now, done=done, rate=0.0)
+        elif done > meter["done"]:             # streaming step → EMA of Δdone/Δt
+            inst = (done - meter["done"]) / max(now - meter["t"], 1e-3)
+            meter["rate"] = inst if meter["rate"] <= 0.0 else 0.5 * meter["rate"] + 0.5 * inst
+            meter["t"], meter["done"] = now, done
         job["phase"], job["done"], job["total"], job["current_id"] = (
             "plan", done, total, current,
         )
+        job["rate"] = round(meter["rate"], 1)
 
     job["phase"] = "plan"
+    job["rate"] = 0.0
     return splat_stage4.plan_cameras(
         run=run, slot=slot, model=model,
         freespace_path=_freespace_path(run, slot, model),
@@ -3445,8 +3475,8 @@ def create_app() -> FastAPI:
         flood-fill free/garbage classification + clearance → `splat/freespace.npz`
         (+ `voxels.bin` viz), see splat/stage2.py. The shared spatial foundation
         Stage 3 (surfels) and Stage 4 (cameras) consume. Optional body:
-        `pitch`/`margin`. Idempotent while running; re-runs (overwrites) on a
-        fresh POST."""
+        `pitch`/`margin`/`clearance`/`workers` (workers=1 minimises peak RAM).
+        Idempotent while running; re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -3473,6 +3503,7 @@ def create_app() -> FastAPI:
             "current_id": None,
             "error": None,
             "summary": None,
+            "rate": 0.0,
             "url": None,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
@@ -3622,6 +3653,7 @@ def create_app() -> FastAPI:
             "current_id": None,
             "error": None,
             "summary": None,
+            "rate": 0.0,
             "url": None,
             "patches_url": None,
             "started_at": datetime.now().isoformat(timespec="seconds"),

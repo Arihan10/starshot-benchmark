@@ -2141,104 +2141,161 @@ function fmtEta(remaining, rate) {
     return `${(s / 3600).toFixed(1)}h`;
 }
 
+// Per-stage wall-clock for the CURRENT running step, so the number-less marker
+// steps (Stage 2's reduce/fill/clearance/write, Stage 4's load/patches/write —
+// single bulk passes with no per-item count to stream) show a live elapsed
+// timer instead of a frozen "…". Keyed by stage number → {phase, t0}; resets
+// when the step changes or the stage stops running (see renderStepper).
+const _stepClocks = new Map();
+
+function _stepElapsedSecs(stageN, phase) {
+	const key = phase || "run";
+	const rec = _stepClocks.get(stageN);
+	if (!rec || rec.phase !== key) {
+		_stepClocks.set(stageN, { phase: key, t0: Date.now() });
+		return 0;
+	}
+	return Math.round((Date.now() - rec.t0) / 1000);
+}
+
+function fmtStepSecs(s) {
+	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+}
+
 function renderStepper() {
-    const box = inputs && inputs._stepper;
-    if (!box) return;
-    box.replaceChildren();
-    box.appendChild(renderSourceRow());
-    const cell = cellStatus;
-    for (const stage of STAGES) {
-        const st = stageState(cell, stage.n);
-        const done = st.status === "done";
-        const running = st.status === "running" || st.status === "pending";
-        const gated = stage.n > 1 && !stageDone(cell, stage.n - 1);
-        const row = el("div", { class: "svc-step" });
-        row.appendChild(
-            el("span", { class: "svc-step-n muted", text: `${stage.n}` }),
-        );
-        const labelEl = el("span", {
-            class: "svc-step-label",
-            text: stage.label,
-        });
-        row.appendChild(labelEl);
-        let btn;
-        let extra = null; // trailing muted info (e.g. Stage-5 live throughput)
-        if (running) {
-            // `current_id` is the live sub-step: Stage 4's phase (load / patches /
-            // coverage / select / write) or the object/view id the others are on. Show
-            // it next to the label so the long coverage phase isn't an opaque wait.
-            // Stage 5 during `render` shows the throughput instead of the (noisy)
-            // per-view id — its named warm-up phases (plan / launch) still show.
-            const phase =
-                stage.n === 5
-                    ? st.phase &&
-                      !["render", "done", "pending", "plan"].includes(st.phase)
-                        ? st.phase
-                        : ""
-                    : st.current_id && st.current_id !== "plan"
-                      ? String(st.current_id)
-                      : "";
-            if (phase)
-                labelEl.textContent = `${stage.label} · ${phase.slice(0, 22)}`;
-            const prog = st.total
-                ? `${st.done}/${st.total}`
-                : st.done
-                  ? String(st.done)
-                  : "…";
-            btn = el("button", {
-                class: "splat-stage2-btn",
-                disabled: true,
-                text: prog,
-                title:
-                    `${phase} ${st.total ? `${st.done}/${st.total}` : ""}`.trim() ||
-                    "running",
-            });
-            // Live capture throughput for Stage 5 (server-computed images/second).
-            const rate = stage.n === 5 ? fmtRate(st.rate) : null;
-            if (rate) {
-                const remaining = (st.total || 0) - (st.done || 0);
-                const eta = fmtEta(remaining, st.rate);
-                const avg = fmtRate(st.rate_avg);
-                extra = el("span", {
-                    class: "muted",
-                    text: eta ? `${rate} img/s · ETA ${eta}` : `${rate} img/s`,
-                    title: avg
-                        ? `live ${rate} img/s · session avg ${avg} img/s`
-                        : `${rate} img/s`,
-                });
-            }
-        } else if (gated) {
-            btn = el("button", {
-                class: "splat-stage2-btn",
-                disabled: true,
-                text: stage.verb,
-                title: `run stage ${stage.n - 1} first`,
-            });
-        } else {
-            btn = el("button", {
-                class: `splat-stage2-btn${done ? " view" : ""}`,
-                disabled: runningAll,
-                text: done ? "re-run" : stage.verb,
-                title: done
-                    ? stage.n === 5
-                        ? "re-run — wipe all references and re-render from scratch"
-                        : "re-run — discards every later stage"
-                    : `run stage ${stage.n}`,
-                onclick: () => runStage(stage.n),
-            });
-        }
-        if (st.status === "error") {
-            btn.classList.add("err");
-            btn.title = st.error || "failed — click to retry";
-        }
-        row.appendChild(btn);
-        if (extra) row.appendChild(extra);
-        box.appendChild(row);
-    }
-    box.appendChild(renderRunAll(cell));
-    renderStage6(cell);
-    renderCoverage();
-    updateSourceAvail();
+	const box = inputs && inputs._stepper;
+	if (!box) return;
+	box.replaceChildren();
+	box.appendChild(renderSourceRow());
+	const cell = cellStatus;
+	for (const stage of STAGES) {
+		const st = stageState(cell, stage.n);
+		const done = st.status === "done";
+		const running = st.status === "running" || st.status === "pending";
+		const gated = stage.n > 1 && !stageDone(cell, stage.n - 1);
+		if (!running) _stepClocks.delete(stage.n); // reset the step timer between runs
+		const row = el("div", { class: "svc-step" });
+		row.appendChild(
+			el("span", { class: "svc-step-n muted", text: `${stage.n}` }),
+		);
+		const labelEl = el("span", {
+			class: "svc-step-label",
+			text: stage.label,
+		});
+		row.appendChild(labelEl);
+		let btn;
+		let extra = null; // trailing muted info (e.g. Stage-5 live throughput)
+		if (running) {
+			// `current_id` is the live sub-step: Stage 4's phase (load / patches /
+			// coverage / select / write) or the object/view id the others are on. Show
+			// it next to the label so the long coverage phase isn't an opaque wait.
+			// Stage 5 during `render` shows the throughput instead of the (noisy)
+			// per-view id — its named warm-up phases (plan / launch) still show.
+			const phase =
+				stage.n === 5
+					? st.phase &&
+						!["render", "done", "pending", "plan"].includes(st.phase)
+						? st.phase
+						: ""
+					: st.current_id && st.current_id !== "plan"
+						? String(st.current_id)
+						: "";
+			if (phase)
+				labelEl.textContent = `${stage.label} · ${phase.slice(0, 22)}`;
+			const prog = st.total
+				? `${st.done}/${st.total}`
+				: st.done
+					? String(st.done)
+					: "…";
+			btn = el("button", {
+				class: "splat-stage2-btn",
+				disabled: true,
+				text: prog,
+				title:
+					`${phase} ${st.total ? `${st.done}/${st.total}` : ""}`.trim() ||
+					"running",
+			});
+			// Live server-computed throughput next to the running step. Stage 5 =
+			// images/second (with session avg); Stages 2 & 4 = the current step's
+			// actions/second — objects voxelized / shells extracted (Stage 2),
+			// candidates ray-marched / cameras picked (Stage 4). Single-pass marker
+			// steps don't stream a count, so no rate shows for them.
+			const rate =
+				stage.n === 5 || stage.n === 4 || stage.n === 2
+					? fmtRate(st.rate)
+					: null;
+			if (rate) {
+				const remaining = (st.total || 0) - (st.done || 0);
+				const eta = fmtEta(remaining, st.rate);
+				if (stage.n === 5) {
+					const avg = fmtRate(st.rate_avg);
+					extra = el("span", {
+						class: "muted",
+						text: eta ? `${rate} img/s · ETA ${eta}` : `${rate} img/s`,
+						title: avg
+							? `live ${rate} img/s · session avg ${avg} img/s`
+							: `${rate} img/s`,
+					});
+				} else {
+					extra = el("span", {
+						class: "muted",
+						text: eta ? `${rate}/s · ETA ${eta}` : `${rate}/s`,
+						title: `${phase || "step"} · ${rate} actions/s`,
+					});
+				}
+			} else {
+				// A number-less running step (e.g. Stage 2 reduce / fill / clearance /
+				// write): a single bulk pass with no per-item count to stream, so show
+				// a live elapsed timer — it reads as working, not frozen at "…".
+				const secs = _stepElapsedSecs(stage.n, phase || st.phase || "run");
+				extra = el("span", {
+					class: "muted",
+					text: fmtStepSecs(secs),
+					title: `${phase || st.phase || "step"} · ${fmtStepSecs(secs)} elapsed`,
+				});
+			}
+		} else if (gated) {
+			btn = el("button", {
+				class: "splat-stage2-btn",
+				disabled: true,
+				text: stage.verb,
+				title: `run stage ${stage.n - 1} first`,
+			});
+		} else {
+			btn = el("button", {
+				class: `splat-stage2-btn${done ? " view" : ""}`,
+				disabled: runningAll,
+				text: done ? "re-run" : stage.verb,
+				title: done
+					? stage.n === 5
+						? "re-run — wipe all references and re-render from scratch"
+						: "re-run — discards every later stage"
+					: `run stage ${stage.n}`,
+				onclick: () => runStage(stage.n),
+			});
+		}
+		// Planned reference-image count (image files Stage 5 will create), shown before capture.
+		if (stage.n === 5 && !running && !extra) {
+			const planned = stageState(cell, 4).summary?.views;
+			if (planned != null)
+				extra = el("span", {
+					class: "muted",
+					text: `${fmtInt(planned)} views`,
+					title: "reference images this render will create (from the Stage-4 plan)",
+				});
+		}
+		if (st.status === "error") {
+			btn.classList.add("err");
+			btn.title = st.error || "failed — click to retry";
+		}
+		row.appendChild(btn);
+		if (extra) row.appendChild(extra);
+		box.appendChild(row);
+	}
+	box.appendChild(renderRunAll(cell));
+	renderStage6(cell);
+	renderCoverage();
+	updateSourceAvail();
 }
 
 // "run all" control row: runs stages 1→5 in order from the first not-yet-done.
@@ -2387,48 +2444,49 @@ function renderCoverage() {
     const satColor =
         satPct >= 90 ? "var(--green)" : satPct >= 70 ? "#d0a020" : "var(--red)";
 
-    box.appendChild(el("div", { class: "svc-title", text: "coverage" }));
-    const rows = [
-        ["patches", fmtInt(patches), null],
-        [
-            "cameras · candidates",
-            `${fmtInt(sum.cameras)} · ${fmtInt(sum.candidates)}`,
-            null,
-        ],
-        ["satisfied (≥K angles)", `${fmtInt(sat)} · ${satPct}%`, satColor],
-        ["under-covered", fmtInt(Math.max(0, seen - sat)), null],
-        [
-            "occlusion-culled",
-            fmtInt(cov.occlusion_culled),
-            cov.occlusion_culled ? "var(--red)" : null,
-        ],
-        ["reached (≥1 view)", `${fmtInt(seen)} · ${seenPct}%`, null],
-        [
-            "mean angles/patch",
-            cov.mean_angles_seen != null ? String(cov.mean_angles_seen) : "?",
-            null,
-        ],
-        [
-            "target K / sectors",
-            `${sum.angles_per_patch ?? "?"} / ${sum.angular_sectors ?? "?"}`,
-            null,
-        ],
-    ];
-    for (const [k, v, color] of rows) {
-        const row = el("div");
-        Object.assign(row.style, {
-            display: "flex",
-            justifyContent: "space-between",
-            gap: "10px",
-            fontSize: "12px",
-            padding: "1px 0",
-        });
-        row.appendChild(el("span", { class: "muted", text: k }));
-        const val = el("span", { text: String(v) });
-        if (color) val.style.color = color;
-        row.appendChild(val);
-        box.appendChild(row);
-    }
+	box.appendChild(el("div", { class: "svc-title", text: "coverage" }));
+	const rows = [
+		["patches", fmtInt(patches), null],
+		[
+			"cameras · candidates",
+			`${fmtInt(sum.cameras)} · ${fmtInt(sum.candidates)}`,
+			null,
+		],
+		["views (image files)", fmtInt(sum.views), null],
+		["satisfied (≥K angles)", `${fmtInt(sat)} · ${satPct}%`, satColor],
+		["under-covered", fmtInt(Math.max(0, seen - sat)), null],
+		[
+			"occlusion-culled",
+			fmtInt(cov.occlusion_culled),
+			cov.occlusion_culled ? "var(--red)" : null,
+		],
+		["reached (≥1 view)", `${fmtInt(seen)} · ${seenPct}%`, null],
+		[
+			"mean angles/patch",
+			cov.mean_angles_seen != null ? String(cov.mean_angles_seen) : "?",
+			null,
+		],
+		[
+			"target K / sectors",
+			`${sum.angles_per_patch ?? "?"} / ${sum.angular_sectors ?? "?"}`,
+			null,
+		],
+	];
+	for (const [k, v, color] of rows) {
+		const row = el("div");
+		Object.assign(row.style, {
+			display: "flex",
+			justifyContent: "space-between",
+			gap: "10px",
+			fontSize: "12px",
+			padding: "1px 0",
+		});
+		row.appendChild(el("span", { class: "muted", text: k }));
+		const val = el("span", { text: String(v) });
+		if (color) val.style.color = color;
+		row.appendChild(val);
+		box.appendChild(row);
+	}
 }
 
 // Fetch this cell's per-stage status; re-render the stepper; load (or drop) the
