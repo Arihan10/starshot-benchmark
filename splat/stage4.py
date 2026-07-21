@@ -44,11 +44,10 @@ own surface voxels.)
 THE PATCH MIP PYRAMID (keeps the ladder tractable): at octave o the image
 resolves detail at 2^o × the base scale, so demands only need to exist at 2^o ×
 coarser patch spacing — patch p is demanded at octaves 0..oct_top[p] with
-P(oct_top ≥ o) = 4^-o, a NESTED thinning (total demands ≈ 4/3 × patches). Pairs
-for octave o are generated only against the octave-o demand set, with a
-per-octave search radius: coarse octaves search far but over exponentially fewer
-patches, so pairs-per-candidate stay ~constant per octave and each (candidate,
-patch) pair lands in exactly one octave.
+P(oct_top ≥ o) = 4^-o, a NESTED thinning (total demands ≈ 4/3 × patches). Each
+owed octave is supplied demand-major (below): a patch emits a few head-on aim
+points only for the octaves it actually owes, so coarse octaves cost a handful
+of aim points over exponentially fewer patches.
 
 DIRECTION CELLS (equal-solid-angle bins; replaces azimuth-only sectors): view
 directions are binned on the folded hemisphere around each patch normal into
@@ -56,13 +55,12 @@ directions are binned on the folded hemisphere around each patch normal into
 field) + one ring of azimuth cells (`_bin_of`) — so elevation diversity is
 enforced and near-normal views land deterministically. The demand is every
 SUPPLIABLE cell. Direction supply is scale-free (any resolving view counts), and
-comes from a dedicated band-0/1 APERTURE pass over the full patch set: one band
-alone cannot reliably supply ring cells (their cameras sit at dist = d_eff·cosθ,
-which for the finest band's grazing elevations collapses onto the surface
-itself), which is exactly the flaw that used to confine angular supply to the
-finest shell and multiply close cameras. Aperture pairs whose band the pyramid
-doesn't demand carry `owed = False`: they supply direction cells without
-inflating scale demands.
+comes from each patch's APERTURE aim points — a shell at ~1.5·d_min in
+hemisphere directions around the normal (`_build_coverage`). A shell (not a
+single fine ray) is what supplies ring cells reliably: a lone fine-band camera
+sits at dist = d_eff·cosθ, which for grazing elevations collapses onto the
+surface itself. An aperture pair whose octave the pyramid doesn't demand carries
+`owed = False`: it supplies a direction cell without inflating scale demands.
 
 Pipeline:
   1. Read the surfel cloud → points + oriented normals.
@@ -72,9 +70,13 @@ Pipeline:
   3. CANDIDATE positions = reachable free cells (Stage 2), subsampled denser
      where clearance is small; the greedy's own scale demands keep chosen
      cameras off surfaces (no demand exists below a patch's d_min).
-  4. COVERAGE: aperture pass (bands 0-1, all patches) + pyramid passes (band ≥ 2
-     demand sets); a pair exists where d_eff lands in the pass's bands and the
-     fine-grid ray-march is clear; each pair is tagged with its cube FACE.
+  4. COVERAGE (demand-major): each patch asks directly for its few suppliers —
+     a bounded set of aim points (an aperture SHELL around the patch normal for
+     direction cells + the finest octave, plus head-on points per owed coarse
+     octave) each snapped to the nearest candidate and verified by the fine-grid
+     ray-march — instead of enumerating every candidate in range. Work and memory
+     scale with DEMANDS (patches × cells), not free volume × surface. Each
+     surviving pair carries its direction cell + supplied octave.
   5. GREEDY multicover over IMAGES — (candidate, face) units, the true cost unit
      of Stages 5/6 — until every visible patch hits every suppliable direction
      cell + every suppliable owed octave. Faces that add nothing are never
@@ -364,14 +366,19 @@ def _band_of(d_eff: np.ndarray, d_min: np.ndarray, n_oct: int) -> np.ndarray:
     ).astype(np.int64)
 
 
-def _scale_buckets(d_min: np.ndarray) -> list[np.ndarray]:
-    """Group patch indices by the octave of their `d_min` (their feature scale),
-    so a mixed-scale pass can use a per-bucket search radius instead of the
-    global max — the aperture pass over the FULL patch set would otherwise query
-    the coarsest patch's radius against the finest patches' density."""
-    lo = float(d_min.min())
-    bucket = np.clip(np.floor(np.log2(np.maximum(d_min, 1e-12) / lo)), 0, 62).astype(np.int64)
-    return [np.nonzero(bucket == b)[0] for b in range(int(bucket.max()) + 1) if (bucket == b).any()]
+def _hemisphere_dirs(n: int) -> np.ndarray:
+    """`n` roughly even unit directions on the +z hemisphere (local frame), with
+    the FIRST one exactly head-on ((0,0,1)). Rotated into a patch's tangent frame
+    these are its supplier AIM POINTS — a handful of directions around the patch
+    normal that between them fall into every direction cell, so the snap-to-
+    nearest-candidate search finds one supplier per suppliable cell instead of
+    testing every candidate in range. Fibonacci spiral in the polar angle (z from
+    1 down toward the equator) for near-uniform spacing."""
+    i = np.arange(int(max(n, 1)), dtype=np.float64)
+    z = np.clip(1.0 - i / max(n, 1), 1e-3, 1.0)
+    r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    phi = i * (np.pi * (3.0 - np.sqrt(5.0)))
+    return np.stack([r * np.cos(phi), r * np.sin(phi), z], axis=1)
 
 
 def _rescue_pairs(
@@ -474,36 +481,42 @@ def _build_coverage(
     torch: Any,
     progress: ProgressCb | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Covering (candidate, patch) pairs, each tagged with the DIRECTION CELL the
-    camera views the patch from (`_bin_of`: cap + ring cells), the scale-ladder
-    OCTAVE the view supplies, and whether that octave is OWED (a real scale
-    demand) or exists for angular supply only. Returns COO arrays (cand_idx,
-    patch_idx, bin, octave, owed).
+    """DEMAND-MAJOR covering (candidate, patch) pairs, each tagged with the
+    DIRECTION CELL the camera views the patch from (`_bin_of`: cap + ring cells),
+    the scale-ladder OCTAVE the view supplies (`_band_of`), and whether that
+    octave is OWED (a real scale demand) or exists for angular supply only.
+    Returns COO arrays (cand_idx, patch_idx, bin, octave, owed).
 
-    Pass plan: an APERTURE pass (bands 0-1 over the full patch set, scale-
-    bucketed radii) supplies every patch's direction cells — a single band's
-    ring-cell views sit at dist = d_eff·cos, which for the finest band collapses
-    onto the surface itself (below the grid's own resolution), so direction
-    diversity needs an aperture wider than one band; band-0 pairs are owed by
-    every patch, band-1 pairs only where
-    the pyramid demands band 1 (`oct_top ≥ 1`). Then PYRAMID passes for bands
-    ≥ 2, one per octave o against the demand set `oct_top >= o` (nested 4^-o
-    thinning), all owed. `d_eff = dist / |cos θ|` is two-sided (winding-agnostic;
-    incidence folds into scale, no grazing cutoff) and a pure function of the
-    pair, so every pair lands in exactly one band/pass; per-pass radii keep
-    pairs-per-candidate bounded. A patch with NO pair is rescued
-    (`_rescue_pairs`) at its FINEST visible band rather than dropped.
+    Rather than enumerate every (candidate, patch) pair in range and ray-march
+    all of them — the supplier relation is ~1000× larger than the handful of
+    views the greedy keeps, which is what made this stage's memory blow up — this
+    asks each patch directly for its few suppliers. Per patch we generate a
+    BOUNDED set of aim points and snap each to the nearest real candidate cell:
 
-    Runs on CUDA: the CPU KD-tree finds each candidate's in-range patches per
-    pass (cheap, not the bottleneck), but the per-pair band filter, direction-
-    cell binning and the occlusion RAY-MARCH (the hot loop: m × n_steps
-    sparse-grid membership tests) run on the GPU in candidate batches. Occupancy
-    is the single grid's sparse `occ_lin` searched with `torch.searchsorted`
-    (mirrors `FreeSpace._member`; see `_occluded`). Coarse octaves march longer
-    rays, so the pair slice size
-    scales down with the pass's step count to hold the ray-march buffer
-    ~constant. Streams `progress(pass·n_cand + cand, n_passes·n_cand,
-    "coverage")` — the stage's long pole."""
+      * APERTURE aim points — a shell at ~1.5·d_min in `_hemisphere_dirs`
+        directions around the patch normal — supply its DIRECTION CELLS and
+        finest octave. Real standoff cameras spread over the free hemisphere, so
+        ring cells are supplied from an aperture wider than one band (the flaw a
+        single fine shell has: its grazing cameras collapse onto the surface).
+      * PYRAMID aim points — head-on (+ two tilts) at ~1.5·2^o·d_min for each
+        OWED octave o ≥ 1 — supply the coarse scale demands. Owed octaves are
+        rare (P(oct_top ≥ o) = 4^-o), so this is a few aim points per patch.
+
+    Each snapped (candidate, patch) pair is verified EXACTLY with the same
+    formulas the demand model uses: two-sided incidence `d_eff = dist/|cos θ|`
+    (winding-agnostic; incidence folds into scale, no grazing cutoff), octave
+    (`_band_of`) and direction cell (`_bin_of`) — so a pair lands in exactly the
+    cell/octave a full enumeration would give it; only the redundant extra
+    suppliers per cell are never generated. Patches left with no visible pair are
+    handed to `_rescue_pairs` (their nearest candidates, best effort) as before.
+    Work and memory scale with DEMANDS (patches × cells), not free volume ×
+    surface.
+
+    Runs on CUDA: only the occlusion RAY-MARCH touches the GPU (occupancy is the
+    single grid's sparse `occ_lin` searched with `torch.searchsorted`; see
+    `_occluded`); aim-point construction, snapping (a CPU KD-tree) and the exact
+    per-pair binning are numpy. Pairs march in distance-sorted slices so short
+    rays take few steps; `progress(done, total, "coverage")` streams the march."""
     dev = torch.device("cuda")
     n_cand = len(candidates)
     n_oct = p.n_octaves
@@ -516,21 +529,6 @@ def _build_coverage(
     occ_lin = torch.as_tensor(fs.occ_lin, dtype=torch.int64, device=dev)
     origin = torch.as_tensor(fs.origin, dtype=torch.float32, device=dev)
     dims = torch.as_tensor(fs.dims, dtype=torch.int64, device=dev)
-    ppos = torch.as_tensor(patch_pos, dtype=torch.float32, device=dev)
-    pnrm = torch.as_tensor(patch_nrm, dtype=torch.float32, device=dev)
-    dmin_t = torch.as_tensor(d_min, dtype=torch.float32, device=dev)
-    dmax_t = torch.as_tensor(d_max, dtype=torch.float32, device=dev)
-    octtop_t = torch.as_tensor(oct_top, dtype=torch.int64, device=dev)
-    t1g = torch.as_tensor(t1, dtype=torch.float32, device=dev)
-    t2g = torch.as_tensor(t2, dtype=torch.float32, device=dev)
-
-    cand_batch = 4096
-    cc_o: list[np.ndarray] = []
-    pp_o: list[np.ndarray] = []
-    bin_o: list[np.ndarray] = []
-    octv_o: list[np.ndarray] = []
-    owed_o: list[np.ndarray] = []
-    seen = np.zeros(n_patch, dtype=bool)
 
     def _occluded(cam, pp_, dist_, t_lin):  # noqa: ANN001 - (P,3),(P,3),(P,),(K,) → (P,) bool
         """True where a solid voxel lies strictly between camera and patch (the
@@ -561,126 +559,122 @@ def _build_coverage(
             res[nz[0][occ_lin[posi] == lin_m]] = True
         return res
 
-    def _pass(idx_sub: np.ndarray, r_pass: float, band_lo: int, band_hi: int, prog_base: int, total: int) -> (
-        list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]
-    ):
-        """One pass of every candidate against `idx_sub` patches within `r_pass`:
-        per-pair band filter (keep bands in [band_lo, band_hi]) + occlusion
-        ray-march. Returns kept (cand, patch, bin, band, owed) chunks; marks
-        `seen`."""
-        out: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-        tree = cKDTree(patch_pos[idx_sub])
-        n_steps = int(np.ceil(min(r_pass, diag) / fs.pitch)) + 2
-        t_lin = torch.linspace(0.0, 1.0, n_steps, dtype=torch.float32, device=dev)
-        # Slice size × step count ≈ constant so the (P, K, 3) ray-march buffer
-        # stays within VRAM whether the pass marches 0.5 m or 50 m rays.
-        pair_cap = int(np.clip(15_000_000 // n_steps, 4_096, 150_000))
-        # Pre-size candidate chunks by neighbour COUNTS (return_length is a cheap
-        # C pass) so the Python list-of-lists a positional query materialises
-        # never holds more than ~pair_chunk entries: a room-scale ball can span
-        # most of the patch cloud, and thousands of such lists at once is an
-        # out-of-memory, not a working set.
-        pair_chunk = 4_000_000
-        lengths_all = tree.query_ball_point(
-            np.ascontiguousarray(candidates, dtype=np.float32), r_pass,
-            workers=-1, return_length=True,
-        ).astype(np.int64)
-        b0 = 0
-        while b0 < n_cand:
-            b1 = b0 + 1
-            tot = int(lengths_all[b0])
-            while (
-                b1 < n_cand
-                and b1 - b0 < cand_batch
-                and tot + int(lengths_all[b1]) <= pair_chunk
-            ):
-                tot += int(lengths_all[b1])
-                b1 += 1
-            cams_np = np.ascontiguousarray(candidates[b0:b1], dtype=np.float32)
-            neigh = tree.query_ball_point(cams_np, r_pass, workers=-1)
-            lengths = np.fromiter((len(x) for x in neigh), dtype=np.int64, count=len(neigh))
-            n_pairs = int(lengths.sum())
-            if n_pairs:
-                local = np.repeat(np.arange(len(neigh), dtype=np.int64), lengths)
-                pidx = idx_sub[
-                    np.concatenate([np.asarray(x, dtype=np.int64) for x in neigh if len(x)])
-                ]
-                cams_b = torch.as_tensor(cams_np, device=dev)
-                # Walk the (candidate, in-range-patch) pairs in ≤pair_cap slices so
-                # the per-slice filter AND ray-march stay within VRAM no matter how
-                # dense the scene is around a candidate.
-                for s0 in range(0, n_pairs, pair_cap):
-                    s1 = s0 + pair_cap
-                    loc = torch.as_tensor(local[s0:s1], device=dev)
-                    pj = torch.as_tensor(pidx[s0:s1], device=dev)
-                    cam = cams_b[loc]
-                    dvec = ppos[pj] - cam
-                    dist = torch.linalg.norm(dvec, dim=1).clamp_min(1e-9)
-                    # Two-sided |cos| (winding-agnostic); incidence folds into the
-                    # effective distance, which picks the octave — no grazing cutoff.
-                    cosang = (pnrm[pj] * dvec).sum(1).abs() / dist
-                    d_eff = dist / cosang.clamp_min(1e-12)
-                    band = torch.clamp(
-                        torch.floor(torch.log2(d_eff / dmin_t[pj])), 0.0, float(n_oct - 1)
-                    ).to(torch.int64)
-                    sel = (d_eff <= dmax_t[pj]) & (band >= band_lo) & (band <= band_hi)
-                    loc, pj, dist, band = loc[sel], pj[sel], dist[sel], band[sel]
-                    if pj.shape[0] == 0:
-                        continue
-                    cam = cams_b[loc]
-                    vis = ~_occluded(cam, ppos[pj], dist, t_lin)
-                    loc, pj, dist, band = loc[vis], pj[vis], dist[vis], band[vis]
-                    if pj.shape[0] == 0:
-                        continue
-                    cam = cams_b[loc]
-                    vd = (cam - ppos[pj]) / dist[:, None]
-                    # Direction cell (`_bin_of` in torch): cap if |cos| clears
-                    # 1 − 1/b, else an azimuth cell of the remaining ring.
-                    z = (vd * pnrm[pj]).sum(1).abs()
-                    az = torch.atan2((vd * t2g[pj]).sum(1), (vd * t1g[pj]).sum(1))
-                    ring = 1 + torch.clamp(
-                        ((az + np.pi) / (2 * np.pi) * (b - 1)).to(torch.int64), 0, b - 2
-                    )
-                    bint = torch.where(z >= 1.0 - 1.0 / b, torch.zeros_like(ring), ring)
-                    owed_t = octtop_t[pj] >= band
-                    pj_np = pj.cpu().numpy()
-                    seen[pj_np] = True
-                    out.append(
-                        (
-                            (loc + b0).cpu().numpy(),
-                            pj_np,
-                            bint.cpu().numpy(),
-                            band.cpu().numpy(),
-                            owed_t.cpu().numpy(),
-                        )
-                    )
+    def _visible(ci_arr: np.ndarray, gi_arr: np.ndarray) -> np.ndarray:
+        """Occlusion ray-march for (candidate ci_arr[i] → patch gi_arr[i]); True
+        where the sightline is clear. Distance-sorted slices keep the (P,K,3)
+        buffer bounded — short rays march few steps, only the far tail pays long
+        ones (n_steps sized to each slice's longest segment)."""
+        out = np.zeros(len(ci_arr), dtype=bool)
+        if not len(ci_arr):
+            return out
+        dist = np.linalg.norm(candidates[ci_arr] - patch_pos[gi_arr], axis=1)
+        order = np.argsort(dist, kind="stable")
+        ci_s, gi_s, dist_s = ci_arr[order], gi_arr[order], dist[order]
+        vis_s = np.zeros(len(ci_s), dtype=bool)
+        for s0 in range(0, len(ci_s), _RESCUE_SLICE):
+            s1 = min(s0 + _RESCUE_SLICE, len(ci_s))
+            n_steps = int(np.ceil(min(float(dist_s[s1 - 1]), diag) / pf)) + 2
+            cam = torch.as_tensor(
+                np.ascontiguousarray(candidates[ci_s[s0:s1]], dtype=np.float32), device=dev
+            )
+            pat = torch.as_tensor(
+                np.ascontiguousarray(patch_pos[gi_s[s0:s1]], dtype=np.float32), device=dev
+            )
+            dst = torch.linalg.norm(pat - cam, dim=1).clamp_min(1e-6)
+            t_lin = torch.linspace(0.0, 1.0, n_steps, dtype=torch.float32, device=dev)
+            vis_s[s0:s1] = (~_occluded(cam, pat, dst, t_lin)).cpu().numpy()
             if progress is not None:
-                progress(prog_base + b1, total, "coverage")
-            b0 = b1
+                progress(s1, len(ci_s), "coverage")
+        out[order] = vis_s
         return out
 
-    # Pass plan (see docstring): aperture buckets (bands 0..1, full set) +
-    # pyramid bands ≥ 2, then the rescue.
-    ap_hi = min(1, n_oct - 1)
-    plan: list[tuple[np.ndarray, float, int, int]] = [
-        (idx, float(d_min[idx].max()) * float(2 ** (ap_hi + 1)), 0, ap_hi)
-        for idx in _scale_buckets(d_min)
-    ]
-    for o in range(2, n_oct):
-        idx_o = np.nonzero(oct_top >= o)[0]
-        if idx_o.size:
-            plan.append((idx_o, float(d_min[idx_o].max()) * float(2 ** (o + 1)), o, o))
-    total = (len(plan) + 1) * n_cand
-    for pi, (idx_sub, r_pass, lo, hi) in enumerate(plan):
-        for chunk in _pass(idx_sub, r_pass, lo, hi, pi * n_cand, total):
-            cc_o.append(chunk[0])
-            pp_o.append(chunk[1])
-            bin_o.append(chunk[2])
-            octv_o.append(chunk[3])
-            owed_o.append(chunk[4])
+    # --- BOUNDED aim points per patch, snapped to the nearest candidate -------
+    # Row 0 of the dictionary is head-on; rotated into each patch's tangent frame
+    # (local +z → normal, +x → t1, +y → t2) the set spreads over the free
+    # hemisphere so it lands in every direction cell.
+    n_dirs = int(max(8, 3 * b))
+    dl = _hemisphere_dirs(n_dirs)
 
-    # RESCUE pass (`_rescue_pairs`): best effort for patches with no pair at
-    # all, against their nearest candidates; the ray-march runs on CUDA.
+    def _aim(dirs_local: np.ndarray, idx: np.ndarray, radius: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """World aim points (`dirs_local` rotated into each patch's tangent frame,
+        scaled by per-patch `radius`) + their parent patch index, patch-major."""
+        uw = (
+            dirs_local[:, 2][None, :, None] * patch_nrm[idx][:, None, :]
+            + dirs_local[:, 0][None, :, None] * t1[idx][:, None, :]
+            + dirs_local[:, 1][None, :, None] * t2[idx][:, None, :]
+        )  # (S, D, 3)
+        tgt = patch_pos[idx][:, None, :] + radius[:, None, None] * uw
+        return tgt.reshape(-1, 3), np.repeat(idx, dirs_local.shape[0])
+
+    all_idx = np.arange(n_patch, dtype=np.int64)
+    tgt_parts, par_parts = [], []
+    if n_patch:
+        ap_tgt, ap_par = _aim(dl, all_idx, 1.5 * d_min)  # aperture: bins + octave 0
+        tgt_parts.append(ap_tgt)
+        par_parts.append(ap_par)
+        coarse = dl[: min(3, n_dirs)]  # head-on + up to two tilts
+        for o in range(1, n_oct):      # pyramid: one shell per owed octave ≥ 1
+            sel = np.nonzero(oct_top >= o)[0]
+            if sel.size:
+                t_o, p_o = _aim(coarse, sel, (1.5 * (2.0 ** o)) * d_min[sel])
+                tgt_parts.append(t_o)
+                par_parts.append(p_o)
+
+    if tgt_parts:
+        tgt = np.concatenate(tgt_parts, axis=0).astype(np.float64)
+        par = np.concatenate(par_parts, axis=0)
+        _, ci = cKDTree(candidates).query(tgt, k=1, workers=-1)
+        ci = np.asarray(ci, dtype=np.int64)
+        keep = ci < n_cand  # scipy pads a miss (empty tree) with n_cand
+        ci, par = ci[keep], par[keep]
+    else:
+        ci = np.zeros(0, dtype=np.int64)
+        par = np.zeros(0, dtype=np.int64)
+
+    # Exact per-pair geometry; drop unresolvable (d_eff > d_max) pairs.
+    if len(ci):
+        vd = candidates[ci] - patch_pos[par]
+        dist = np.linalg.norm(vd, axis=1)
+        ok = dist > 1e-6
+        ci, par, vd, dist = ci[ok], par[ok], vd[ok], dist[ok]
+        cos = np.abs(np.einsum("mc,mc->m", vd, patch_nrm[par])) / dist
+        d_eff = dist / np.maximum(cos, 1e-12)
+        ok = d_eff <= d_max[par]
+        ci, par, dist, d_eff = ci[ok], par[ok], dist[ok], d_eff[ok]
+        # One pair per (patch, candidate): sort by distance so `unique` keeps the
+        # nearest instance of each (multiple aim points can snap to one cell).
+        order = np.argsort(dist, kind="stable")
+        ci, par, d_eff = ci[order], par[order], d_eff[order]
+        _, uidx = np.unique(par * np.int64(n_cand) + ci, return_index=True)
+        ci, par, d_eff = ci[uidx], par[uidx], d_eff[uidx]
+
+    cc_o: list[np.ndarray] = []
+    pp_o: list[np.ndarray] = []
+    bin_o: list[np.ndarray] = []
+    octv_o: list[np.ndarray] = []
+    owed_o: list[np.ndarray] = []
+    seen = np.zeros(n_patch, dtype=bool)
+
+    if len(ci):
+        vis = _visible(ci, par)
+        ci, par, d_eff = ci[vis], par[vis], d_eff[vis]
+    if len(ci):
+        vd = candidates[ci] - patch_pos[par]
+        vd /= np.linalg.norm(vd, axis=1, keepdims=True) + 1e-12
+        z = np.abs(np.einsum("mc,mc->m", vd, patch_nrm[par]))
+        az = np.arctan2(
+            np.einsum("mc,mc->m", vd, t2[par]), np.einsum("mc,mc->m", vd, t1[par])
+        )
+        band = _band_of(d_eff, d_min[par], n_oct)
+        cc_o.append(ci)
+        pp_o.append(par)
+        bin_o.append(_bin_of(z, az, b))
+        octv_o.append(band)
+        owed_o.append(oct_top[par] >= band)
+        seen[par] = True
+
+    # RESCUE (`_rescue_pairs`): best effort for patches no aim point could see,
+    # against their nearest candidates; the ray-march runs on CUDA.
     def _bins_np(vd: np.ndarray, hit: np.ndarray) -> np.ndarray:
         z = np.abs(np.einsum("mc,mc->m", vd, patch_nrm[hit]))
         az = np.arctan2(
@@ -698,8 +692,7 @@ def _build_coverage(
     rescue = _rescue_pairs(
         candidates, patch_pos, patch_nrm, d_min, d_max, np.nonzero(~seen)[0],
         _bins_np, _visible_gpu, fs, p, diag,
-        None if progress is None
-        else (lambda done, tot: progress(len(plan) * n_cand + int(done / max(tot, 1) * n_cand), total, "coverage")),
+        None if progress is None else (lambda done, tot: progress(done, max(tot, 1), "coverage")),
     )
     if rescue is not None:
         cc_o.append(rescue[0])
@@ -916,14 +909,15 @@ def plan_cameras(
         n_oct - 1,
     )
 
-    # Candidate camera positions from the reachable near-surface band (no re-voxelization).
+    # Candidate camera positions from the reachable free cells (no re-voxelization).
     candidates = _candidates(fs, params)
     if len(candidates) == 0:
         raise RuntimeError("no candidate camera positions (reachable free space empty)")
 
     # Coverage (per-pair direction cell + octave + owed) + greedy multicover over
-    # IMAGES. Coverage is the long phase (a per-candidate occlusion ray-march on
-    # CUDA), so it streams fine-grained progress (passes × candidates).
+    # IMAGES. Coverage is the long phase (a demand-major occlusion ray-march on
+    # CUDA — each patch's own bounded aim points), so it streams progress as the
+    # snapped pairs are marched.
     b = params.bins
     torch = _try_cuda()
     if torch is None:
