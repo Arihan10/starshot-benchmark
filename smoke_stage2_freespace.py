@@ -45,7 +45,7 @@ from splat.stage2 import (
 LEGACY_GRID = Path("runs/good_opus_new_hotel2/hotel-room/opus-new/splat/freespace.npz")
 NPZ_SCHEMA = {
     "origin", "pitch", "dims", "occ_lin", "occ_lin_glass",
-    "clearance", "empty", "clearance_m",
+    "skin_lin", "zone_lin", "cand_pos", "cand_clear", "clearance_m",
 }
 
 _results: list[tuple[str, bool, str]] = []
@@ -138,21 +138,20 @@ def main() -> int:
             k: summary[k]
             for k in (
                 "pitch", "dims", "solid_voxels", "glass_voxels", "empty_voxels",
-                "free_voxels", "garbage_voxels", "fill",
+                "free_voxels", "candidates", "garbage_voxels", "skin_bricks",
+                "zone_bricks", "fill",
             )
         }
         print(json.dumps(slim, indent=1))
 
         check("requested pitch kept", summary["pitch"] == 0.03)
-        # Default clearance == one voxel: every empty cell is ≥ 1 voxel from
-        # cover by definition, so FREE ≡ EMPTY out of the box. This is also the
-        # _CLEARANCE_EPS regression test — without the epsilon, float rounding
-        # (1 voxel × 0.03 stores just under 0.03) would exclude the entire
-        # one-voxel tier and break the identity.
+        # Default clearance == one voxel: every candidate sits in reached air
+        # ≥ 1 voxel from cover by construction, so the baked filter passes the
+        # ENTIRE candidate list out of the box.
         check(
-            "default (one-voxel) clearance ⇒ FREE ≡ EMPTY",
-            summary["free_voxels"] == summary["empty_voxels"],
-            f"free={summary['free_voxels']} empty={summary['empty_voxels']}",
+            "default (one-voxel) clearance passes every candidate",
+            summary["free_voxels"] == summary["candidates"] > 0,
+            f"free={summary['free_voxels']} candidates={summary['candidates']}",
         )
         check(
             "rescue fired for exactly the bottle",
@@ -183,32 +182,28 @@ def main() -> int:
         check("sofa hollow is GARBAGE (cushion is exposed)", not empty_at([2.2, 0.5, 1.4]))
         check("cabinet cavity is EMPTY (bottle rescued it)", empty_at([5.1, 0.5, 4.1]))
 
-        # Re-bake a production-style threshold and exercise the clearance
-        # filter: mid-room air is FREE; the air just above the floor is EMPTY
-        # but too close to cover to be FREE.
+        # Re-bake a production-style threshold and exercise the candidate
+        # filter (instant — candidates carry their clearance annotations):
+        # tightening must shrink the passing set without touching anything else.
         patch35 = apply_clearance(out_path, 0.35)
         fs35 = load_free_space(out_path)
-        free = fs35.free
-        empty = fs35.empty
+        c35 = fs35.free_candidates()
         check(
-            "apply(0.35): FREE becomes a strict subset of EMPTY",
+            "apply(0.35): candidate filter tightens",
             fs35.clearance_m == 0.35
-            and not bool((free & ~empty).any())
-            and 0 < patch35["free_voxels"] < summary["empty_voxels"]
-            and patch35["free_voxels"] == int(free.sum()),
-            f"free@0.35={patch35['free_voxels']}",
+            and 0 < patch35["free_voxels"] < summary["candidates"]
+            and patch35["free_voxels"] == len(c35),
+            f"passing@0.35={patch35['free_voxels']} of {summary['candidates']}",
         )
-
-        def cell(p: list[float]) -> tuple[int, int, int]:
-            i = (np.floor(np.array(p) / fs35.pitch).astype(np.int64) - fs35.imin)
-            return int(i[0]), int(i[1]), int(i[2])
-
-        mid = cell([3.0, 1.5, 2.5])       # room centre: metres of clearance
-        low = cell([3.0, 0.16, 2.5])      # ~2 voxels above the floor slab
-        check("mid-room air is FREE", bool(free[mid]))
+        # Every passing candidate sits in EMPTY air, and each one's annotated
+        # clearance honours the threshold; a candidate hugging the floor
+        # (clearance < 0.35) must have been filtered out.
+        in_empty = bool(fs35.empty_at(c35.astype(np.float64)).all())
+        check("candidates@0.35 sit in EMPTY air", len(c35) > 0 and in_empty)
+        kept = fs35.cand_clear[fs35.cand_clear >= 0.35 - 3e-4]
         check(
-            "near-floor air is EMPTY but not FREE (clearance filter)",
-            bool(empty[low]) and not bool(free[low]),
+            "candidate annotations honour the threshold",
+            len(kept) == len(c35) and bool((kept >= 0.35 - 3e-4).all()),
         )
 
         # Cover classes: glass occupies but never occludes; opaque does both.
@@ -221,17 +216,6 @@ def main() -> int:
         check(
             "wall occupies and occludes",
             bool(fs.occupied(wall_pt)[0]) and bool(fs.occluding(wall_pt)[0]),
-        )
-
-        # Candidate pool (against the 0.35 bake): centres exist, sit in EMPTY
-        # space, and honour the BAKED clearance floor even when the caller
-        # passes a looser minimum (epsilon-tolerant, matching the free mask).
-        centers, clear = fs35.free_candidates(0.2, max_clearance=3.0, spacing=0.5)
-        ok = len(centers) > 0 and bool(fs35.empty_at(centers.astype(np.float64)).all())
-        check("free_candidates returns empty-space centres", ok, f"n={len(centers)}")
-        check(
-            "candidates honour the baked floor + band",
-            bool((clear >= fs35.clearance_m - 3e-4).all() and (clear <= 3.0).all()),
         )
 
         # The SVX3 viz pack: volumetric boundary shells. Header counts match the
@@ -287,33 +271,32 @@ def main() -> int:
                     total += int(e.sum())
             return total
 
+        # Cover quads must tile the EXACT boundary of the occupancy (garbage's
+        # exact reconstruction needs the transient zone-garbage set, so it is
+        # checked structurally above: sections tile the file byte-exactly).
         with np.load(out_path) as z:
             occ_mask = np.zeros(tuple(z["dims"]), dtype=bool)
             occ_mask.reshape(-1)[z["occ_lin"]] = True
-            empty_mask = z["empty"].astype(bool)
         check(
             "SVX3 cover shell tiles the exact boundary (runs sum = exposed faces)",
             int(cov_q["r"].sum()) == exposed_faces(occ_mask),
             f"runs={int(cov_q['r'].sum())}",
         )
-        check(
-            "SVX3 garbage shell tiles the exact boundary",
-            int(gar_q["r"].sum()) == exposed_faces(~occ_mask & ~empty_mask),
-        )
+        check("SVX3 garbage shell present", int(gar_q["r"].sum()) > 0)
 
-        # A second re-bake tightens monotonically; empty/cover data untouched.
+        # A second re-bake tightens monotonically; grid data untouched.
         patch = apply_clearance(out_path, 0.8)
         fs2 = load_free_space(out_path)
         check(
             "apply_clearance re-bakes monotonically",
             fs2.clearance_m == 0.8
-            and patch["free_voxels"] == int(fs2.free.sum())
+            and patch["free_voxels"] == len(fs2.free_candidates())
             and 0 < patch["free_voxels"] < patch35["free_voxels"]
-            and int(fs2.empty.sum()) == summary["empty_voxels"],
-            f"free@0.35={patch35['free_voxels']} free@0.8={patch['free_voxels']}",
+            and np.array_equal(fs2.skin_lin, fs.skin_lin),
+            f"passing@0.35={patch35['free_voxels']} passing@0.8={patch['free_voxels']}",
         )
 
-    # Pre-clearance layouts (whatever generation is on disk, or a synthesized
+    # Pre-candidate layouts (whatever generation is on disk, or a synthesized
     # one) must be rejected with the re-run error, not half-loaded.
     with tempfile.TemporaryDirectory(prefix="smoke-legacy-") as tmp:
         legacy_path = Path(tmp) / "freespace.npz"
@@ -324,19 +307,19 @@ def main() -> int:
             occ_lin=np.zeros(0, dtype=np.int64),
             occ_lin_glass=np.zeros(0, dtype=np.int64),
             clearance=np.zeros((4, 4, 4), dtype=np.float16),
-            free=np.ones((4, 4, 4), dtype=bool),  # the pre-clearance key
+            empty=np.ones((4, 4, 4), dtype=bool),  # an old dense-layout key
         )
         try:
             load_free_space(legacy_path)
-            check("pre-clearance grid is rejected", False, "loaded without error")
+            check("pre-candidate grid is rejected", False, "loaded without error")
         except ValueError as exc:
-            check("pre-clearance grid is rejected", "re-run Stage 2" in str(exc))
+            check("pre-candidate grid is rejected", "re-run Stage 2" in str(exc))
     if LEGACY_GRID.is_file():
         try:
             load_free_space(LEGACY_GRID)
-            print("[NOTE] on-disk grid already carries the clearance layout")
+            print("[NOTE] on-disk grid already carries the candidate layout")
         except ValueError as exc:
-            check("on-disk pre-clearance grid is rejected", "re-run Stage 2" in str(exc))
+            check("on-disk pre-candidate grid is rejected", "re-run Stage 2" in str(exc))
 
     failed = [name for name, ok, _ in _results if not ok]
     print(f"\n{len(_results) - len(failed)}/{len(_results)} checks passed")

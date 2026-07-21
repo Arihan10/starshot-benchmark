@@ -6,74 +6,90 @@ a cloud of flat, surface-aligned 2D Gaussians (surfels), written as a **2DGS `.p
 v2.16+) read and the Stage-6 gsplat **2DGS** fine-tune inits from. A `3dgs` mode appends
 a thin third scale for 3DGS-only viewers / SOG-SPZ compression.
 
-Consumes the **Stage-2 free-space grid** (per Option A the free-space foundation runs
-first). Two things use it:
+Consumes the **Stage-2 free-space grid** (`stage2.load_free_space`):
   * **Normal orientation (fixes unreliable TRELLIS winding):** each surfel's normal is
-    flipped to point toward FREE space (the Stage-2 free mask), rather than trusting
-    the mesh's face winding — so disks face the viewer regardless of authoring.
-  * **Hidden-face culling:** a surfel with no free space on EITHER side is
-    buried (a solid's interior, or the seam between two abutting objects) and is
-    dropped — it would never be seen, so it's wasted budget and a floater seed.
+    flipped to point toward EMPTY space (`fs.empty_at`), rather than trusting the mesh's
+    face winding — so disks face the viewer regardless of authoring.
+  * **Hidden-face culling:** a surfel with no empty space on EITHER side is buried
+    (a solid's interior, or the seam between two abutting objects) and is dropped.
 
-ONE KNOB — `detail`. It is a density multiplier around the calibrated default
-look: sample spacing = `_BASE_SPACING / sqrt(detail)`, so detail=1 reproduces
-    the default resolution (~3 cm between surfels at base, refined to ~0.75 cm
-near feature edges and relaxed to ~6 cm on flat, uniformly-coloured regions),
-detail=2 doubles the surfel density, detail=0.5 halves
-it. Everything that used to be a knob is a derived law or a fixed constant:
-  * spacing      — the knob itself (count follows: N ∝ area × detail);
-  * disk radius  — `_RADIUS_FRAC` × the local sample spacing (disks tile);
-  * flatness     — `_FLATNESS`, used ONLY by the `3dgs` compat export (2D
-    surfels have no thickness; 3DGS-only viewers/compressors need a nonzero
-    third scale, so it writes radius × 0.1);
-  * feature refinement — `_FEATURE_BOOST`, always on (see below);
-  * flat coarsening    — `_COARSEN_MAX`, always on (the refinement's mirror:
-    flat + uniform regions sample coarser; see below);
-  * hidden-face culling — always on (pure win, not a fidelity choice).
+ONE KNOB — `detail`. Base spacing = `_BASE_SPACING / sqrt(detail)`, so detail=1
+reproduces the default ~3 cm base, detail=2 doubles density, 0.5 halves it. Disk
+radius = `_RADIUS_FRAC` × the surfel's cell size; the rest are fixed constants.
 
-Sampling: per-object GRID-THINNED blue noise in FEATURE-ADAPTIVE BANDS.
-Candidates are seeded area-weighted surface points; a lattice of
-~`_THIN_CELL_FACTOR`×spacing cells keeps ONE winner per (cell, normal-facing
-bucket), then a same-facing-only minimum-distance pass removes near-duplicates
-(`_thin_band`). Equivalent evenness/density to the old oversample-and-eliminate
-Poisson sampler (calibrated to the same yield) at a fraction of the memory —
-no KD-trees, no all-pairs arrays — and two deliberate improvements: THIN
-GEOMETRY keeps both faces (opposite-facing points never eliminate each other,
-where the old 3D-distance elimination silently starved double-sided sheets),
-and sampling is SEEDED per (object, geometry, band), so a cell resamples to
-the byte-identical cloud for any worker count.
+SCENE-SCALE ADAPTIVITY (angular, not metric). A screen pixel is an ANGLE, so the
+metric detail worth storing scales with typical viewing distance — which scales
+with a scene's open sightlines, not its bounding box. Per cell we derive a scale
+`k` from the Stage-2 candidates' distance-to-surface (`_scene_scale`) and sample
+each object at `base · clamp(obj_diag / _VIEW_REF_M, 1, k)` (`_object_spacing`):
+small props stay at `base` at any scene size, large-area surface (terrain, long
+walls) reaches the ceiling `base·k`. Indoor scenes (hotel-anchored) get k=1 and
+are UNCHANGED; a 60,000 m² swamp gets k≈2.2, and with coarsening its cloud drops
+from ~1.25 GB (uniform-base coarsened) to ~240 MB — angular fidelity held roughly
+constant while metric fidelity tracks how far the surface is actually seen.
 
-Detail is measured ONCE, from the mesh itself (its feature edges: creases
-sharper than `_CREASE_ANGLE` + open boundaries — full-fidelity signals, not
-statistics of an already-sampled proxy): flat interiors sample at the knob
-spacing exactly, while crease/boundary neighbourhoods — thin members, frames,
-slats, corners, which by construction lie within a base-spacing of a feature
-edge — sample up to `_FEATURE_BOOST`× finer (boost²× the density). Purely
-additive: flats are unchanged and detail rides on top, so the knob keeps its
-meaning. Band LABELING is two-level (coarse split → conservative flat test →
-fine split only near edges), which changes the cost, not the labels
-(`_spacing_bands`). Downstream, the cloud's local density IS the detail field:
-Stage 4 reads it (local sample spacing) instead of re-detecting detail from
-the cloud, and Stage 6's densification starts from capacity that already
-exists where the close-up cameras will look.
+SAMPLING — SEEDED DARTS + LATTICE-HASH THINNING. Candidates are area-weighted random
+surface points (`trimesh.sample.sample_surface`, SEEDED per object/slab — no
+worker-count dependence), then thinned by an integer lattice: bin each candidate into
+a cell of edge `_THIN_CELL_FACTOR·spacing` and keep the ONE candidate nearest the cell
+centre. This replaces the old oversample-and-eliminate Poisson sampler — which,
+MEASURED on a hotel cell, generated ~36× the kept points, built a KD-tree over them
+and materialized a ~1.7-BILLION-entry too-close-pair table (~54 GB transient, ~22 GB
+peak RSS, ~63 % of runtime) — with a few integer passes: no KD-tree, no pair table,
+2.4× oversample instead of ~6×. Every surfel is a real dart sitting exactly on the
+(lite) mesh surface with its face index → exact barycentric UV → exact base-colour
+texel, so the colour/orient/cull paths are the long-validated ones.
+
+FEATURE-ADAPTIVE DENSITY = GEOMETRY-DRIVEN COARSENING (both directions matter; this
+is the one that pays). After orient+cull+colour, surviving base surfels are merged
+BOTTOM-UP in octaves (cell edge 2·s, 4·s, … up to `2^_COARSEN_OCTAVES·s`): the nodes
+in each parent cell are split into two FACING SIDES (by the sign of each oriented
+normal against the group's principal axis — orientation is already air-corrected, so
+the two faces of a wall/sheet split cleanly and NEVER merge), and a side collapses
+into ONE bigger surfel only when a single flat disk truly represents it:
+  * FILLED  — accumulated base-cell count ≥ `_MERGE_FILL·4^k` (a sliver or border
+    never becomes a big disk overhanging air);
+  * SMOOTH  — oriented normals agree (`1 − |mean n̂| ≤ _MERGE_FLAT`): gently curved
+    mud/rock coarsens, tight curvature stays fine;
+  * COPLANAR — member positions lie within `_MERGE_OFFSET_FRAC·s` (ABSOLUTE, base-
+    spacing scale) of the side's plane: silhouettes stay tight and stacked parallel
+    sheets can never fuse, whatever their normals say.
+Merged colour is the base-count-weighted mean of the members' EXACT texel colours —
+an average of true on-surface samples (never a mip/footprint filter, so UV-atlas
+gutters can't bleed in). NO colour gate: a textured-but-flat surface coarsens; its
+high-frequency albedo is Stage 6's job (it retrains colour against the reference
+renders and densifies only where those renders demand it). This is what makes splat
+size track scene INFORMATION instead of scene AREA: a swamp's mudflats collapse to
+~24 cm disks while its cattails stay at 3 cm — without it, a 59,600 m² outdoor cell
+at uniform 3 cm density is ~46 M surfels ≈ 3 GB of float32 PLY versus 156 MB of lite
+GLBs, i.e. paying area-rent for content the source encodes in kilobytes.
+
+CHUNKING: an object whose candidate budget exceeds `_CHUNK_MAX_CANDIDATES` is sampled
+in `_CHUNK_EXTENT`-metre spatial slabs (partition its triangles, sample each), so a
+single huge mesh (terrain, a racetrack ribbon) has BOUNDED transient memory — the
+lattice keys are absolute, so slab seams cost only a one-cell layer at base density
+(merging is per-slab too; a parent cell cut by a slab boundary just stays finer).
+
+Optional `_FEATURE_REFINE` (OFF): the legacy crease/boundary band refinement
+(`_spacing_bands`) that samples near feature edges up to `_FEATURE_BOOST`× finer. On
+dense organic TRELLIS meshes the >25° crease test fires on ~85 % of surface, so it
+multiplies counts 4-6× — the old sampler only survived it because its eliminator
+undersampled those bands back to ~base density. Off until a detector separates real
+edges from organic bumpiness.
 
 PIPELINE PER OBJECT (parallel across objects — `_iter_sampled`, spawn pool,
-id-ordered merge): load → band labeling → per band: sample, radii, ORIENT +
-CULL against the Stage-2 EMPTY mask, then color ONLY the visible surfels
-(buried seams never pay texture lookups).
+id-ordered merge): load → darts → THIN → ORIENT + CULL → colour survivors → COARSEN →
+emit. Deterministic end to end (seeded darts, integer lattices), so a cell resamples
+to the identical cloud for any worker count.
 
-Each surfel: position (world; placement baked into the vertices), rotation
-(quaternion aligning +Z to the oriented normal), scale (r, r, ~0), color (the
-EXACT base-color texel at the surfel's UV — see `surfel_colors` for why the
-footprint-averaged variant was reverted), opacity (that texel's alpha,
-honouring `alphaMode`). Stored SH is degree 0 (`f_dc`) — unlit /
-view-independent.
+Each surfel: position (world), rotation (quaternion aligning +Z to the oriented
+normal), scale (r, r, ~0), color (exact texel for base surfels; member-mean for
+merged), opacity (texel alpha, honouring `alphaMode`). Stored SH is degree 0
+(`f_dc`) — unlit / view-independent.
 
-Pure library: `sample_cell` takes explicit paths; the server resolves a cell to
-them and passes the Stage-2 `freespace.npz`. Meshes are consumed AS-IS through
+Pure library: `sample_cell` takes explicit paths. Meshes are consumed AS-IS through
 `splat.assets.load_geoms` — vanilla glTF via trimesh, KTX2/Meshopt sets via the
-in-process decoder (geometry natively; KTX2 base color BasisU-transcoded), so
-albedo sampling behaves identically on every encoding.
+in-process decoder — so albedo sampling behaves identically on every encoding.
 """
 
 from __future__ import annotations
@@ -81,7 +97,6 @@ from __future__ import annotations
 import logging
 import os
 import time
-import zlib
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -92,133 +107,108 @@ import trimesh
 from scipy.spatial import cKDTree
 
 from splat.assets import load_geoms
-from splat.stage2 import FreeSpace, _abs_encode, _subdivide_edges, _valid_tri_mask
+from splat.stage2 import FreeSpace, _subdivide_edges, _valid_tri_mask, load_free_space
 
 # trimesh logs per-file load noise; silence it for whole-cell runs.
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
-# The Gaussian cloud filename written under a cell's `splat/` dir (a 3DGS `.ply`).
+# The Gaussian cloud filename written under a cell's `splat/` dir (a 2DGS `.ply`).
 CLOUD_NAME = "cloud.ply"
 
-# SH degree-0 basis constant: colour c in [0,1] maps to f_dc = (c - 0.5) / C0
-# (the 3DGS convention every viewer inverts as colour = 0.5 + C0 * f_dc).
+# SH degree-0 basis constant: colour c in [0,1] maps to f_dc = (c - 0.5) / C0.
 _SH_C0 = 0.28209479177387814
 
-# The calibrated default resolution: the flat-interior sample spacing (m) at
-# detail = 1, MEASURED so detail=1 reproduces the accepted default cloud's
-# budget (hotel-room benchmark: ~2.1M sampled / ~1.6M kept / ~100 MB). The old
-# defaults hit that budget with per-object adaptive coarsening (walls ~4 cm,
-# props ~1-2 cm); the one-knob sampler is uniform, and 2.95 cm uniform lands
-# the same total with the budget spread evenly (walls slightly finer than
-# before, tiny props slightly coarser, feature bands still at spacing/4).
-# Calibrated against the FIXED asset loader (correct meshopt index decode).
+# The calibrated default resolution: base sample spacing (m) at detail = 1.
 _BASE_SPACING = 0.0295
-# spacing = _BASE_SPACING / sqrt(detail): detail multiplies DENSITY (surfels
-# per m²), the intuitive direction (2 = twice the surfels, 0.5 = half).
 DEFAULT_DETAIL = 1.0
 _DETAIL_CLAMP = (0.05, 16.0)
 _SPACING_CLAMP = (0.004, 0.25)
 
-# Derived-value constants (were knobs; see module docstring for their laws).
-# Disk σ = _RADIUS_FRAC × local sample spacing — disks tile without gaps at
-# blue-noise spacing; Stage 6 fine-tunes scales from there.
+# Disk σ = _RADIUS_FRAC × the surfel's cell size (base spacing for unmerged surfels,
+# 2^k× that for merged ones) — disks tile their cell block; Stage 6 fine-tunes scales.
 _RADIUS_FRAC = 0.9
-# 3dgs-mode only: the fake thickness (third scale = radius × _FLATNESS) that
-# 3DGS-only viewers / SOG-SPZ compressors need (a true 0 breaks log-scale
-# encoding). The default 2dgs output has no thickness axis at all.
+# 3dgs-mode only: fake thickness (third scale = radius × _FLATNESS).
 _FLATNESS = 0.1
-# Feature-adaptive density: sampling within one base-spacing of a FEATURE EDGE
-# (a crease sharper than _CREASE_ANGLE, or an open boundary) is refined in
-# octave bands down to base/_FEATURE_BOOST. 25° cleanly separates man-made
-# creases (box corners, frames, rail edges ~60-90°) from the small per-edge
-# angles of dense smooth meshes (~10-15°), so smooth blobs stay single-band.
+
+# --- lattice-hash thinning (replaces the Poisson oversample-and-eliminate) ----
+# Thinning cell edge, × spacing: ONE winner survives per cell (the candidate nearest
+# the cell centre — a soft, even spacing; no hard Poisson floor, no all-pairs pass).
+_THIN_CELL_FACTOR = 1.0
+# Candidate budget, × area/spacing²: ~2.4 per cell → ~91 % of cells occupied
+# (Poisson e^-2.4); the old sampler generated ~6×/spacing².
+_THIN_CANDIDATES = 2.4
+
+# --- geometry-driven coarsening (see module docstring) -------------------------
+# Octaves of bottom-up merging above base spacing: 3 → biggest surfel 8·s (~24 cm at
+# detail 1). Raising it grows the flat-region win quadratically but tests each extra
+# level against the same absolute planarity guard.
+_COARSEN_OCTAVES = 3
+# FILLED: a (parent cell, side) merges only when its accumulated base-cell count is
+# at least this fraction of the in-plane expectation 4^k (a flat sheet through a
+# 2^k-cell cube crosses ~(2^k)² base cells; borders/slivers fall short and stay fine).
+_MERGE_FILL = 0.5
+# SMOOTH: oriented-normal agreement, as 1 − |mean unit normal| ≤ this. cos-form of a
+# ~12° spread — gentle terrain curvature merges, tight curvature doesn't.
+_MERGE_FLAT = float(1.0 - np.cos(np.deg2rad(12.0)))
+# COPLANAR: members must lie within this × BASE spacing of the side's plane —
+# absolute, not per-level, so merged silhouettes stay sub-spacing tight and two
+# stacked sheets (thin wall faces, leaf layers) can never fuse.
+_MERGE_OFFSET_FRAC = 0.35
+
+# --- scene-scale-adaptive spacing (angular fidelity, not metric) ---------------
+# A screen pixel is an ANGLE, so the metric detail worth storing scales with
+# typical viewing distance. We estimate that per cell from the Stage-2 camera
+# candidates' distance-to-surface (`cand_clear`) — the scene's open-sightline
+# statistic — NOT the bounding-box diagonal (which misreads a big building full
+# of small rooms as far-viewed). `k = clamp(P_pctl(cand_clear)/ref, 1, kmax)`,
+# anchored so a hotel-room's ~1.7 m P90 gives k=1 (indoor scenes UNCHANGED).
+# cand_clear is capped by the Stage-2 coverage band (~5 m), so k is a
+# conservative under-estimate for very open scenes — the safe direction.
+_SIGHTLINE_PCTL = 90
+_SIGHTLINE_REF_M = 1.73         # hotel-room P90(cand_clear): the k=1 anchor
+_SCENE_K_CLAMP = (1.0, 4.0)
+# Per-object floor: an object is typically framed from ~its own diagonal away, so
+# its spacing scales with `obj_diag / _VIEW_REF_M`, clamped to [base, base·k].
+# So small props (cattail, chair) stay at base however large the scene, mid-size
+# hero objects scale with their own size, and only large-area surface (terrain,
+# long walls) reaches the scene ceiling. 2 m = the hotel-anchor framing distance.
+_VIEW_REF_M = 2.0
+
+# --- legacy feature refinement (OFF by default; see module docstring) ----------
+_FEATURE_REFINE = False
 _FEATURE_BOOST = 4.0
 _CREASE_ANGLE = np.deg2rad(25.0)
 _EDGE_PT_CAP = 400_000  # stride a pathological crease soup instead of exploding
-# Band labeling's first-pass split limit (× spacing). Pieces PROVABLY at base-
-# band distance stop here (16× fewer pieces than a full split on big flats);
-# only near-edge pieces refine to `spacing`. 4× balances the two costs: higher
-# skips more interior but widens the must-refine strip (the conservative test
-# subtracts the piece circumradius, which grows with the limit).
-_CLASSIFY_COARSE = 4.0
+_CLASSIFY_COARSE = 4.0  # band labeling's first-pass split limit (× spacing)
 
-# --- grid-thinning sampler knobs (all internal; calibrated together so the
-# kept density matches the old Poisson eliminator's ~0.75/spacing² yield) -----
-# Thinning lattice cell edge, × spacing: one winner survives per (cell, facing
-# bucket). Bigger cells = sparser; 1.25 + the dedup below lands on the old
-# yield (verified against the old sampler on synthetic planes and the hotel
-# benchmark cell).
-_THIN_CELL_FACTOR = 1.25
-# Candidate budget, × area/spacing² (≈ 2.9 candidates per surface cell → ~94%
-# of cells occupied). The old sampler generated 6×/spacing² internally.
-_THIN_CANDIDATES = 2.4
-# Near-duplicate floor, × spacing: SAME-FACING winners closer than this lose
-# one point (the old eliminator's hard floor was 1.0 × spacing; radii clamp to
-# the band median, so the softer floor shows up as a few smaller disks, not
-# holes). OPPOSITE-facing points are never duplicates — that's what keeps both
-# faces of thin sheets alive.
-_THIN_MIN_DIST_FRAC = 0.7
-# Two winners count as "same-facing" when their unit normals' dot exceeds
-# this: parallel faces (sheet sides, dot −1) and perpendicular crease faces
-# (dot 0) both survive; only genuinely co-oriented near-pairs dedup.
-_THIN_DUP_NORMAL_DOT = 0.5
-# The 13 lexicographically-positive neighbour offsets: enumerating pairs from
-# one side of each cell boundary visits every unordered cross-cell pair once.
-_HALF_OFFSETS = np.array(
-    [o for o in np.ndindex(3, 3, 3)], dtype=np.int64
-).__sub__(1)
-_HALF_OFFSETS = _HALF_OFFSETS[
-    np.lexsort((_HALF_OFFSETS[:, 2], _HALF_OFFSETS[:, 1], _HALF_OFFSETS[:, 0]))
-][14:]  # strictly greater than (0,0,0) in lexicographic order
-# Feature-adaptive COARSENING — the mirror of the refinement above. Flat pieces
-# far from every feature edge sample up to _COARSEN_MAX× COARSER where the surface
-# is planar at the COARSENED FOOTPRINT scale (normal spread within _FLAT_ANGLE,
-# from an area-weighted normal structure tensor per footprint-sized voxel — it
-# sums NNᵀ, so it's sign-invariant, unreliable TRELLIS winding can't read a flat
-# wall as folded, and it's tessellation-independent; flats AND gently curved
-# panels qualify while tight curvature stays at base) AND the base-colour texels
-# are near-uniform (channel range < _FLAT_COLOR_VAR, so a textured rug/painting
-# keeps its density). Stage 6 retrains colour, so this is ~lossless.
-_COARSEN_MAX = 2.0
-_FLAT_ANGLE = np.deg2rad(10.0)
-_FLAT_COLOR_VAR = 0.06
-_FLAT_MIN_PIECES = 8  # skip coarsening on meshes with fewer flat pieces than this
-# The EMPTY mask is served to samplers as a MEMORY-MAPPED uncompressed sidecar
-# (`freespace.npz.empty.npy`, written beside the npz on first use): pool
-# workers then share ONE physical copy through the page cache instead of each
-# decompressing a private one — the difference between parallel and OOM on
-# outdoor grids (a swamp/city cell reaches billions of cells ≈ GBs of mask).
-_EMPTY_SIDECAR_SUFFIX = ".empty.npy"
-# When the sidecar can't be written/mapped (read-only runs dir), workers fall
-# back to private in-memory masks; cap the pool so resident copies stay under
-# this budget instead of OOMing the box on huge grids.
+# --- chunking: bound a single huge object's transient memory -------------------
+_CHUNK_MAX_CANDIDATES = 8_000_000
+_CHUNK_EXTENT = 8.0
+
+# When the skin bitmask sidecar can't be memory-mapped, workers hold a private
+# copy; cap the pool so resident copies stay under this budget.
 _WORKER_GRID_BUDGET = 3_000_000_000  # bytes, across all workers
 
 # Opacity is stored pre-sigmoid; clamp alpha off the 0/1 asymptotes.
 _ALPHA_CLAMP = (1e-3, 1.0 - 1e-3)
 
-
 # Material alpha modes whose sampled base-color alpha is meaningful (glass, cutout).
-# Everything else is forced opaque so a stray texture alpha channel can't punch holes.
 _TRANSPARENT_ALPHA_MODES = ("BLEND", "MASK")
 
 
 @dataclass(frozen=True)
 class SampleParams:
-    """THE sampling knob (plus a format flag). `detail` multiplies surfel
-    density around the calibrated default look (1 = today's resolution, 2 =
-    twice the surfels per m², 0.5 = half); everything else — spacing, disk
-    radius, feature refinement, culling, 3dgs thickness — is derived (module
-    docstring). `representation` picks the output encoding only: `2dgs`
-    (native flat surfels, the default and what Stage 6 trains) or `3dgs`
-    (adds a thin third scale for 3DGS-only viewers / SOG-SPZ compression)."""
+    """THE sampling knob (plus a format flag). `detail` multiplies surfel density
+    around the calibrated default look. `representation` picks the output encoding:
+    `2dgs` (native flat surfels, the default and what Stage 6 trains) or `3dgs`
+    (adds a thin third scale)."""
 
     detail: float = DEFAULT_DETAIL
     representation: str = "2dgs"
 
     @property
     def spacing(self) -> float:
-        """Flat-interior sample spacing (m) this detail level resolves to."""
+        """Base sample spacing (m) this detail level resolves to."""
         d = float(np.clip(self.detail, *_DETAIL_CLAMP))
         return float(np.clip(_BASE_SPACING / np.sqrt(d), *_SPACING_CLAMP))
 
@@ -252,9 +242,8 @@ def _alpha_mode(geom: trimesh.Trimesh) -> str:
 
 
 def _vertex_colors(geom: trimesh.Trimesh) -> np.ndarray:
-    """Per-vertex RGBA in [0,1] for `geom`: sampled from a readable base-color
-    texture at the vertex UVs when present, else the material's baseColorFactor,
-    else neutral grey."""
+    """Per-vertex RGBA in [0,1]: from a readable base-color texture at the vertex
+    UVs when present, else the material's baseColorFactor, else neutral grey."""
     n = len(geom.vertices)
     visual = getattr(geom, "visual", None)
     try:
@@ -286,8 +275,8 @@ def _vertex_colors(geom: trimesh.Trimesh) -> np.ndarray:
 
 
 def _align_quaternions(normals: np.ndarray) -> np.ndarray:
-    """Shortest-arc quaternions (w,x,y,z) rotating +Z (the surfel's flat axis) onto
-    each unit `normal`. Antipodal case (n ≈ −Z) rotates 180° about X."""
+    """Shortest-arc quaternions (w,x,y,z) rotating +Z onto each unit `normal`.
+    Antipodal case (n ≈ −Z) rotates 180° about X."""
     n = normals.shape[0]
     dot = normals[:, 2]
     quat = np.empty((n, 4), dtype=np.float64)
@@ -302,12 +291,8 @@ def _align_quaternions(normals: np.ndarray) -> np.ndarray:
 
 
 def _feature_edge_points(geom: trimesh.Trimesh, step: float) -> np.ndarray | None:
-    """Points sampled every ~`step` metres along the mesh's FEATURE edges: open
-    boundary edges (used by exactly one face) + creases where adjacent faces meet
-    at more than `_CREASE_ANGLE`. These mark where the surface actually has
-    detail — corners, frames, the sides and ends of thin members — and drive the
-    feature-adaptive sampling bands. None when the mesh has no feature edges
-    (smooth closed blobs sample uniformly, exactly as before)."""
+    """Points sampled every ~`step` m along the mesh's FEATURE edges: open boundary
+    edges + creases sharper than `_CREASE_ANGLE`. None when the mesh has none."""
     try:
         parts = []
         ang = np.asarray(geom.face_adjacency_angles)
@@ -341,8 +326,8 @@ def _feature_edge_points(geom: trimesh.Trimesh, step: float) -> np.ndarray | Non
 
 def _soup_mesh(tris: np.ndarray, uv3: np.ndarray | None, material) -> trimesh.Trimesh:  # noqa: ANN001
     """Standalone mesh from a triangle soup (vertices duplicated per triangle),
-    carrying per-vertex UVs + the ORIGINAL material so `surfel_colors` samples
-    the same texture through the same path on a band as on the whole object."""
+    carrying per-corner UVs + the ORIGINAL material so colour lookups go through
+    the same texture path as on the whole object."""
     verts = tris.reshape(-1, 3)
     faces = np.arange(len(verts), dtype=np.int64).reshape(-1, 3)
     visual = None
@@ -351,108 +336,17 @@ def _soup_mesh(tris: np.ndarray, uv3: np.ndarray | None, material) -> trimesh.Tr
     return trimesh.Trimesh(vertices=verts, faces=faces, visual=visual, process=False)
 
 
-def _piece_color_uniform(
-    tris: np.ndarray, uv3: np.ndarray | None, material  # noqa: ANN001
-) -> np.ndarray:
-    """Per-piece bool: do the base-colour texels stay within `_FLAT_COLOR_VAR`
-    across the piece? Sampled at each piece's corners, edge midpoints and centroid
-    through the same `uv_to_color` path as `surfel_colors`. Pieces with no readable
-    texture read as uniform (nothing to resolve)."""
-    n = len(tris)
-    image = getattr(material, "baseColorTexture", None)
-    if image is None or uv3 is None:
-        return np.ones(n, dtype=bool)
-    bary = np.array(
-        [[1, 0, 0], [0, 1, 0], [0, 0, 1],
-         [0.5, 0.5, 0], [0, 0.5, 0.5], [0.5, 0, 0.5],
-         [1 / 3, 1 / 3, 1 / 3]],
-        dtype=np.float64,
-    )
-    uvs = np.einsum("pb,nbc->npc", bary, uv3)  # (n, P, 2) — affine over each triangle
-    try:
-        cols = np.asarray(
-            trimesh.visual.color.uv_to_color(uvs.reshape(-1, 2), image), dtype=np.float32
-        )[:, :3] / 255.0
-    except Exception:
-        return np.ones(n, dtype=bool)
-    cols = cols.reshape(n, len(bary), 3)
-    rng = (cols.max(axis=1) - cols.min(axis=1)).max(axis=1)  # widest channel spread
-    return rng <= _FLAT_COLOR_VAR
-
-
-def _coarsen_factors(
-    tris: np.ndarray, uv3: np.ndarray | None, material, spacing: float  # noqa: ANN001
-) -> np.ndarray:
-    """Per-piece coarsening factor (1 = keep base spacing, up to `_COARSEN_MAX`,
-    octave-quantized) for the flat, far-from-edge pieces — how far BELOW base
-    density a piece can sample without losing signal. Planarity is read at the
-    COARSENED FOOTPRINT scale from an area-weighted normal structure tensor per
-    footprint-sized voxel: its top eigenvalue → 1 on a plane, and summing NNᵀ
-    makes it sign-invariant (unreliable winding can't read a flat wall as folded)
-    and tessellation-independent. A piece coarsens where that spread is within
-    `_FLAT_ANGLE` (flats and gently curved panels qualify; tight curvature stays
-    at base), gated to 1 wherever the base colour is not near-uniform
-    (`_piece_color_uniform`). All-ones when there are too few pieces."""
-    n = len(tris)
-    if n <= _FLAT_MIN_PIECES:
-        return np.ones(n, dtype=np.float64)
-    cent = tris.mean(axis=1)
-    cx = np.cross(tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0])
-    area = 0.5 * np.linalg.norm(cx, axis=1)
-    nrm = cx / (2.0 * area[:, None] + 1e-12)
-    key = np.floor(cent / (_COARSEN_MAX * spacing)).astype(np.int64)
-    _, inv = np.unique(key, axis=0, return_inverse=True)
-    inv = inv.reshape(-1)
-    v = int(inv.max()) + 1
-    tens = np.zeros((v, 3, 3))
-    np.add.at(tens, inv, (nrm[:, :, None] * nrm[:, None, :]) * area[:, None, None])
-    wsum = np.zeros(v)
-    np.add.at(wsum, inv, area)
-    tens /= wsum[:, None, None] + 1e-12
-    lam1 = np.linalg.eigvalsh(tens)[:, -1]  # top eigenvalue ∈ (~1/3, 1]; 1 = planar
-    theta = np.arcsin(np.sqrt(np.clip(1.0 - lam1, 0.0, 1.0)))[inv]
-    factor = np.clip(_FLAT_ANGLE / np.maximum(theta, 1e-6), 1.0, _COARSEN_MAX)
-    factor[~_piece_color_uniform(tris, uv3, material)] = 1.0
-    level = np.floor(np.log2(factor) + 1e-9)
-    return np.minimum(2.0 ** level, _COARSEN_MAX)
-
-
 def _spacing_bands(
     geom: trimesh.Trimesh, spacing: float, boost: float = _FEATURE_BOOST
 ) -> list[tuple[trimesh.Trimesh, float]]:
-    """Split one object into `(mesh, spacing)` sampling bands by distance to its
-    feature edges — the feature-adaptive density core. Each piece's target
-    spacing is its centroid's distance to the nearest feature edge, clamped to
-    [spacing/boost, spacing] and quantized to octaves: a piece at distance d
-    needs disks no larger than ~d to keep them off the crease, and pieces ON
-    thin members (everywhere within a half-width of an edge) land in the
-    finest band — which is precisely what makes rails/slats/frames sample at
-    feature scale instead of wall scale. Flat interiors keep the base spacing
-    unless they are also COARSENABLE (below); refinement is ADDITIVE off that
-    base, so the detail knob still anchors the look while the total grows with
-    the feature-area fraction and shrinks with the flat, uniform fraction.
-
-    Labeling is TWO-LEVEL for speed, with labels IDENTICAL to a full split:
-      1. split to `_CLASSIFY_COARSE`× spacing and keep any piece whose whole
-         extent provably sits at base-band distance (centroid distance minus
-         circumradius ≥ spacing — conservative, so no descendant could have
-         classified finer);
-      2. only the remaining near-edge pieces split down to `spacing` and
-         classify by centroid, exactly as the one-level version did.
-    Midpoint splitting is per-piece deterministic, so the refined pieces are
-    the very pieces the full split would have produced; skipped interiors stay
-    coarse, which sampling cannot see (area-weighted candidates, affine UVs,
-    identical plane normals — tessellation granularity doesn't affect the
-    sampled distribution). Big flat scenes skip almost everything; foliage-like
-    meshes (edges everywhere) refine everything and merely match the old cost.
-
-    The MIRROR of the refinement also runs: flat pieces far from every feature
-    edge are COARSENED up to `_COARSEN_MAX`× where they are nearly planar AND
-    uniformly coloured (`_coarsen_factors`), so walls/floors/ceilings and smooth
-    low-curvature panels sample below base density. A mesh with no feature edges
-    (smooth blobs, terrain) skips the edge test and coarsens throughout; a
-    degenerate mesh falls back to a single base-spacing band."""
+    """LEGACY feature-adaptive band split (only used when `_FEATURE_REFINE` is on):
+    split one object into `(mesh, spacing)` bands by distance to its feature edges,
+    refining crease/boundary neighbourhoods up to `boost`× finer. Two-level labeling
+    for speed; falls back to a single base-spacing band when the mesh has no feature
+    edges or its triangles are degenerate."""
     edge_pts = _feature_edge_points(geom, step=spacing * 0.5)
+    if edge_pts is None:
+        return [(geom, spacing)]
 
     tris = np.asarray(geom.triangles, dtype=np.float64)
     uv = getattr(getattr(geom, "visual", None), "uv", None)
@@ -466,40 +360,17 @@ def _spacing_bands(
     if not len(tris):
         return [(geom, spacing)]
 
-    # Pass 1 — coarse split, then the conservative base-band test (skipped when
-    # the mesh has no feature edges: every piece is then a coarsening candidate).
+    tree = cKDTree(edge_pts)
     tris_c, uv3_c = _subdivide_edges(tris, spacing * _CLASSIFY_COARSE, uv3)
     cent = tris_c.mean(axis=1)
-    if edge_pts is not None:
-        tree = cKDTree(edge_pts)
-        d_c = tree.query(cent)[0]
-        circum = np.linalg.norm(tris_c - cent[:, None, :], axis=2).max(axis=1)
-        flat = (d_c - circum) >= spacing
-    else:
-        tree = None
-        flat = np.ones(len(tris_c), dtype=bool)
+    d_c = tree.query(cent)[0]
+    circum = np.linalg.norm(tris_c - cent[:, None, :], axis=2).max(axis=1)
+    flat = (d_c - circum) >= spacing
 
-    # The flat, far-from-edge pieces are the COARSENING candidates: split them by
-    # planarity + colour uniformity into base (factor 1) and coarser octave bands.
-    flat_tris = tris_c[flat]
-    flat_uv = uv3_c[flat] if uv3_c is not None else None
-    cf = _coarsen_factors(flat_tris, flat_uv, material, spacing)
-    base_tris: list[np.ndarray] = []
-    base_uv: list[np.ndarray] | None = [] if uv3_c is not None else None
-    coarser: list[tuple[float, np.ndarray, np.ndarray | None]] = []
-    for c in np.unique(cf):
-        m = cf == c
-        if c <= 1.0:
-            base_tris.append(flat_tris[m])
-            if base_uv is not None and flat_uv is not None:
-                base_uv.append(flat_uv[m])
-        else:
-            coarser.append(
-                (float(c), flat_tris[m], flat_uv[m] if flat_uv is not None else None)
-            )
+    base_tris: list[np.ndarray] = [tris_c[flat]]
+    base_uv: list[np.ndarray] | None = [uv3_c[flat]] if uv3_c is not None else None
     finer: list[tuple[float, np.ndarray, np.ndarray | None]] = []
 
-    # Pass 2 — full-resolution classification for the near-edge remainder.
     near = ~flat
     if near.any():
         tris_f, uv3_f = _subdivide_edges(
@@ -521,44 +392,51 @@ def _spacing_bands(
                 )
 
     bands: list[tuple[trimesh.Trimesh, float]] = []
-    if base_tris:
-        bt = np.concatenate(base_tris, axis=0)
-        if len(bt):
-            bu = np.concatenate(base_uv, axis=0) if base_uv is not None else None
-            bands.append((_soup_mesh(bt, bu, material), spacing))
-    for cfac, band_tris, band_uv in coarser:
-        bands.append((_soup_mesh(band_tris, band_uv, material), spacing * cfac))
+    bt = np.concatenate(base_tris, axis=0)
+    if len(bt):
+        bu = np.concatenate(base_uv, axis=0) if base_uv is not None else None
+        bands.append((_soup_mesh(bt, bu, material), spacing))
     for lf, band_tris, band_uv in finer:
         bands.append((_soup_mesh(band_tris, band_uv, material), spacing / lf))
     return bands or [(geom, spacing)]
 
 
-def _surfel_radii(points: np.ndarray, spacing: float) -> np.ndarray:
-    """Per-surfel disk radius: `_RADIUS_FRAC` × the LOCAL sample spacing
-    (nearest-neighbour distance), so disks tile without gaps. Outliers clamped
-    to the band median."""
+def _thin_band(points: np.ndarray, spacing: float) -> np.ndarray:
+    """Lattice-hash thin candidate darts → kept indices. Bins each candidate into a
+    cell of edge `_THIN_CELL_FACTOR·spacing` and keeps the ONE candidate nearest the
+    cell centre. O(N) integer passes — no KD-tree, no pair table. A single winner
+    per cell matches the old sampler's effective handling of coincident opposite
+    faces and avoids the winding-driven doubling a pre-orientation facing split
+    causes (facing handling happens later, in the coarsener, POST-orientation)."""
     n = len(points)
-    if n < 2:
-        return np.full(n, spacing * _RADIUS_FRAC, dtype=np.float32)
-    nn = cKDTree(points).query(points, k=2)[0][:, 1]
-    good = nn[nn > 0]
-    med = float(np.median(good)) if good.size else spacing
-    nn = np.where(nn > 0, nn, med)
-    nn = np.clip(nn, med * 0.5, med * 2.5)
-    return (nn * _RADIUS_FRAC).astype(np.float32)
+    if n == 0:
+        return np.zeros(0, dtype=np.int64)
+    cs = spacing * _THIN_CELL_FACTOR
+    cell = np.floor(points / cs).astype(np.int64)
+    loc = cell - cell.min(axis=0)
+    nx = int(loc[:, 0].max()) + 1
+    ny = int(loc[:, 1].max()) + 1
+    nz = int(loc[:, 2].max()) + 1
+    if nx * ny * nz < (1 << 61):
+        gid = (loc[:, 0] * ny + loc[:, 1]) * nz + loc[:, 2]
+    else:  # astronomically large single object — fall back to row-unique
+        _, gid = np.unique(loc, axis=0, return_inverse=True)
+        gid = gid.reshape(-1)
+    center = (cell.astype(np.float64) + 0.5) * cs
+    d2 = ((points - center) ** 2).sum(axis=1)
+    order = np.lexsort((d2, gid))
+    gid_s = gid[order]
+    first = np.ones(len(order), dtype=bool)
+    first[1:] = gid_s[1:] != gid_s[:-1]
+    return order[first]
 
 
 def surfel_colors(
     geom: trimesh.Trimesh, points: np.ndarray, face_idx: np.ndarray
 ) -> np.ndarray:
-    """Per-surfel RGBA in [0,1]. When the mesh has a readable base-color texture,
-    samples it at each surfel's barycentric-interpolated UV — the EXACT texel at
-    that spot on the surface, full resolution. (A footprint-averaged variant
-    using mip pyramids was tried and reverted: on TRELLIS UV atlases the filter
-    crossed island boundaries into the black gutters, painting dark blotches on
-    small detailed objects; the point sample is the long-validated behavior and
-    Stage 6 retrains colors against the reference renders regardless.)
-    Otherwise falls back to the per-face mean of the per-vertex colours."""
+    """Per-surfel RGBA in [0,1]. With a readable base-color texture, samples it at
+    each surfel's barycentric-interpolated UV — the EXACT texel at that spot, full
+    resolution. Otherwise the per-face mean of the per-vertex colours."""
     faces = np.asarray(geom.faces[face_idx])
     visual = getattr(geom, "visual", None)
     material = getattr(visual, "material", None)
@@ -589,101 +467,16 @@ def surfel_colors(
     return _vertex_colors(geom)[faces].mean(axis=1)
 
 
-def _sample_band(
-    mesh: trimesh.Trimesh,
-    spacing: float,
-    opaque: bool,
-    fs: FreeSpace,
-) -> tuple[dict[str, np.ndarray] | None, int]:
-    """Blue-noise sample one band mesh at one spacing → `(per-surfel arrays for
-    the VISIBLE surfels | None, sampled count)`.
-
-    Order matters for cost, not results: radii come from ALL sampled points
-    (buried neighbours count toward nearest-neighbour spacing, as before), the
-    orient/cull probe runs next, and colors — the texture lookups — are
-    computed for the survivors only. The probe reads the float32-rounded
-    positions/normals, exactly the values the encoder will write, so the keep
-    mask is bit-identical to the old cull-after-everything flow."""
-    if len(mesh.faces) == 0 or mesh.area <= 0:
-        return None, 0
-    budget = int(mesh.area / (spacing * spacing) * 2.0) + 8
-    try:
-        points, face_idx = trimesh.sample.sample_surface_even(mesh, budget, radius=spacing)
-    except Exception:
-        points, face_idx = trimesh.sample.sample_surface(mesh, budget)
-    points = np.asarray(points, dtype=np.float64)
-    face_idx = np.asarray(face_idx)
-    sampled = len(points)
-    if sampled == 0:
-        return None, 0
-
-    normals = np.asarray(mesh.face_normals[face_idx], dtype=np.float64)
-    lens = np.linalg.norm(normals, axis=1, keepdims=True)
-    lens[lens == 0] = 1.0
-    normals = normals / lens
-
-    radius = _surfel_radii(points, spacing)
-    pos32 = points.astype(np.float32)
-    nrm32 = normals.astype(np.float32)
-    keep, oriented = _orient_and_cull(pos32, nrm32, fs)
-    if not keep.any():
-        return None, sampled
-
-    colors = surfel_colors(mesh, points[keep], face_idx[keep])  # (S,4) in [0,1]
-    if opaque:
-        colors[:, 3] = 1.0  # opaque material → ignore any texture alpha channel
-    return {
-        "position": pos32[keep],
-        "normal": oriented[keep],
-        "color": colors.astype(np.float32),
-        "radius": radius[keep],
-    }, sampled
-
-
-def _sample_object(
-    geom: trimesh.Trimesh, spacing: float, fs: FreeSpace
-) -> tuple[dict[str, np.ndarray] | None, int]:
-    """Sample one placed mesh into surfels across its feature-adaptive spacing
-    bands (`_spacing_bands`): flat regions at the knob spacing, crease/boundary
-    neighbourhoods up to `_FEATURE_BOOST`× finer. Returns `(concatenated
-    per-surfel arrays for the VISIBLE surfels | None, total sampled count)`.
-    Opacity is forced to 1 unless the material is genuinely BLEND/MASK (honour
-    `alphaMode`, so a stray opaque-texture alpha channel can't punch holes)."""
-    if len(geom.faces) == 0 or geom.area <= 0:
-        return None, 0
-    opaque = _alpha_mode(geom) not in _TRANSPARENT_ALPHA_MODES
-    parts: list[dict[str, np.ndarray]] = []
-    sampled = 0
-    for band_mesh, band_spacing in _spacing_bands(geom, spacing):
-        band, n = _sample_band(band_mesh, band_spacing, opaque, fs)
-        sampled += n
-        if band is not None:
-            parts.append(band)
-    if not parts:
-        return None, sampled
-    if len(parts) == 1:
-        return parts[0], sampled
-    return {
-        k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]
-    }, sampled
-
-
 def _orient_and_cull(
     positions: np.ndarray, normals: np.ndarray, fs: FreeSpace
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Use the Stage-2 EMPTY mask to (1) flip each normal toward the open side,
+    """Use the Stage-2 empty query to (1) flip each normal toward the open side,
     and (2) mark surfels to keep. A side is "open" if any probe offset along
     ±normal lands in empty (viewable) air. Returns (keep_mask, oriented_normals).
-    Runs per band, BEFORE color lookups, so buried surfels never pay for
-    texture sampling.
 
-    Deliberately EMPTY, not the clearance-filtered FREE: a surfel beside a thin
-    gap is visible through it even though no camera fits there — filtering to
-    FREE would wrongly cull every surface bordering a sub-clearance passage.
-
-    Buried surfels (neither side open — solid interiors, seams between abutting
-    objects) are dropped: they would never be seen, so they are wasted budget
-    and floater seeds. Free-standing thin surfaces (both sides open) keep their
+    Deliberately EMPTY, not clearance-filtered: a surfel beside a thin gap is
+    visible through it even though no camera fits. Buried surfels (neither side
+    open) are dropped; free-standing thin surfaces (both sides open) keep their
     original normal."""
     offsets = np.array([1.0, 1.5, 2.0], dtype=np.float64) * fs.pitch
     plus_open = np.zeros(len(positions), dtype=bool)
@@ -697,6 +490,289 @@ def _orient_and_cull(
     return plus_open | minus_open, oriented
 
 
+def _group_ids(cells: np.ndarray) -> np.ndarray:
+    """(N,) int64 group id per (N,3) integer cell row (offset to non-negative and
+    packed to one int64 when the local lattice fits, else row-unique)."""
+    loc = cells - cells.min(axis=0)
+    nx = int(loc[:, 0].max()) + 1
+    ny = int(loc[:, 1].max()) + 1
+    nz = int(loc[:, 2].max()) + 1
+    if nx * ny * nz < (1 << 61):
+        return (loc[:, 0] * ny + loc[:, 1]) * nz + loc[:, 2]
+    _, gid = np.unique(loc, axis=0, return_inverse=True)
+    return gid.reshape(-1)
+
+
+def _coarsen(
+    pos: np.ndarray,
+    nrm: np.ndarray,
+    col: np.ndarray,
+    spacing: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Geometry-driven bottom-up merging of surviving base surfels (module
+    docstring): per octave level k, group nodes by parent cell of edge `2^k·s`,
+    split each group into two facing SIDES against its principal normal axis
+    (normals are already air-oriented), and collapse a side into ONE surfel when it
+    is FILLED, SMOOTH and COPLANAR. Returns `(positions, normals, colors, radii)`
+    with radii = `_RADIUS_FRAC` × each node's cell size. Deterministic; O(N) integer
+    group passes per level."""
+    n = len(pos)
+    radii = np.full(n, _RADIUS_FRAC * spacing, dtype=np.float32)
+    if n < 4 or _COARSEN_OCTAVES <= 0:
+        return pos, nrm, col, radii
+
+    pos = pos.astype(np.float64)
+    nrm = nrm.astype(np.float64)
+    col = col.astype(np.float64)
+    count = np.ones(n, dtype=np.float64)  # accumulated base-cell count per node
+    offset_tol = _MERGE_OFFSET_FRAC * spacing
+
+    for k in range(1, _COARSEN_OCTAVES + 1):
+        L = spacing * (2.0 ** k)
+        cell = np.floor(pos / L).astype(np.int64)
+        gid = _group_ids(cell)
+        _, inv = np.unique(gid, return_inverse=True)
+        inv = inv.reshape(-1)
+        g = int(inv.max()) + 1
+
+        # Principal normal axis per group: top eigenvector of Σ n·nᵀ (sign-free,
+        # so mixed winding/orientation across the group cannot hide a two-sided
+        # cell). Six bincounts build the symmetric tensors — no (N,3,3) temp,
+        # no unbuffered np.add.at.
+        tens = np.empty((g, 3, 3))
+        for i in range(3):
+            for j in range(i, 3):
+                tij = np.bincount(inv, nrm[:, i] * nrm[:, j], g)
+                tens[:, i, j] = tij
+                tens[:, j, i] = tij
+        _, v = np.linalg.eigh(tens)
+        axis = v[:, :, 2]  # eigenvector of the largest eigenvalue
+        side = (np.einsum("nj,nj->n", nrm, axis[inv]) >= 0.0).astype(np.int64)
+        sid = inv * 2 + side
+        ns = 2 * g
+
+        # Per-(group, side) reductions.
+        scnt = np.bincount(sid, minlength=ns)                     # member nodes
+        sbase = np.bincount(sid, count, ns)                       # base cells
+        wsum = np.maximum(sbase, 1e-12)
+        mpos = np.stack(
+            [np.bincount(sid, count * pos[:, i], ns) for i in range(3)], axis=1
+        ) / wsum[:, None]
+        mnrm = np.stack(
+            [np.bincount(sid, count * nrm[:, i], ns) for i in range(3)], axis=1
+        )
+        mlen = np.linalg.norm(mnrm, axis=1)
+        mdir = mnrm / np.maximum(mlen, 1e-12)[:, None]
+        mcol = np.stack(
+            [np.bincount(sid, count * col[:, i], ns) for i in range(4)], axis=1
+        ) / wsum[:, None]
+
+        # COPLANAR: spread of member projections onto the side's mean normal,
+        # reduced per side via one sort + reduceat (buffered, unlike ufunc.at).
+        off = np.einsum("nj,nj->n", pos - mpos[sid], mdir[sid])
+        order = np.argsort(sid, kind="stable")
+        sid_s = sid[order]
+        starts = np.ones(len(order), dtype=bool)
+        starts[1:] = sid_s[1:] != sid_s[:-1]
+        idx = np.flatnonzero(starts)
+        present = sid_s[idx]
+        omin = np.full(ns, np.inf)
+        omax = np.full(ns, -np.inf)
+        omin[present] = np.minimum.reduceat(off[order], idx)
+        omax[present] = np.maximum.reduceat(off[order], idx)
+
+        # SMOOTH: oriented-normal agreement (mean of unit normals stays ~unit).
+        nspread = 1.0 - mlen / np.maximum(sbase, 1e-12)
+
+        merge = (
+            (scnt >= 2)
+            & (sbase >= _MERGE_FILL * (4.0 ** k))
+            & (nspread <= _MERGE_FLAT)
+            & ((omax - omin) <= offset_tol)
+        )
+        if not merge.any():
+            break
+
+        drop = merge[sid]  # members absorbed into a merged node
+        keep_pos = pos[~drop]
+        keep_nrm = nrm[~drop]
+        keep_col = col[~drop]
+        keep_cnt = count[~drop]
+        keep_rad = radii[~drop]
+
+        m = np.nonzero(merge)[0]
+        new_pos = mpos[m]
+        new_nrm = mdir[m]
+        new_col = mcol[m]
+        new_cnt = sbase[m]
+        new_rad = np.full(len(m), _RADIUS_FRAC * L, dtype=np.float32)
+
+        pos = np.concatenate([keep_pos, new_pos], axis=0)
+        nrm = np.concatenate([keep_nrm, new_nrm], axis=0)
+        col = np.concatenate([keep_col, new_col], axis=0)
+        count = np.concatenate([keep_cnt, new_cnt], axis=0)
+        radii = np.concatenate([keep_rad, new_rad], axis=0)
+
+    return (
+        pos.astype(np.float32),
+        nrm.astype(np.float32),
+        col.astype(np.float32),
+        radii.astype(np.float32),
+    )
+
+
+def _band_seed(mesh: trimesh.Trimesh, spacing: float, salt: int) -> int:
+    """Deterministic per-(sub)mesh seed from stable geometry facts + a slab salt,
+    so a mesh resamples identically for any worker count / run."""
+    a = int(round(float(mesh.area) * 1000.0))
+    return (len(mesh.faces) * 2654435761 + a + int(spacing * 1e6) + salt * 40503) & 0x7FFFFFFF
+
+
+def _band_darts(
+    mesh: trimesh.Trimesh, spacing: float, opaque: bool, fs: FreeSpace, seed: int
+) -> tuple[dict[str, np.ndarray] | None, int]:
+    """One (sub)mesh → surfels: seeded darts, lattice thin, orient+cull against
+    `fs.empty_at`, colour survivors (exact texels), then geometry-driven COARSEN.
+    Returns `(per-surfel arrays | None, base-surfel count before coarsening)`."""
+    if len(mesh.faces) == 0 or mesh.area <= 0:
+        return None, 0
+    budget = int(mesh.area / (spacing * spacing) * _THIN_CANDIDATES) + 8
+    try:
+        points, face_idx = trimesh.sample.sample_surface(mesh, budget, seed=seed)
+    except Exception:
+        return None, 0
+    points = np.asarray(points, dtype=np.float64)
+    face_idx = np.asarray(face_idx)
+    if len(points) == 0:
+        return None, 0
+
+    keep_idx = _thin_band(points, spacing)
+    if len(keep_idx) == 0:
+        return None, 0
+    points = points[keep_idx]
+    face_idx = face_idx[keep_idx]
+    thinned = len(points)
+
+    normals = np.asarray(mesh.face_normals[face_idx], dtype=np.float64)
+    lens = np.linalg.norm(normals, axis=1, keepdims=True)
+    lens[lens == 0] = 1.0
+    normals = normals / lens
+
+    pos32 = points.astype(np.float32)
+    nrm32 = normals.astype(np.float32)
+    keep, oriented = _orient_and_cull(pos32, nrm32, fs)
+    if not keep.any():
+        return None, thinned
+
+    colors = surfel_colors(mesh, points[keep], face_idx[keep]).astype(np.float32)
+    if opaque:
+        colors[:, 3] = 1.0
+
+    cpos, cnrm, ccol, crad = _coarsen(
+        pos32[keep], oriented[keep].astype(np.float32), colors, spacing
+    )
+    return {
+        "position": cpos,
+        "normal": cnrm,
+        "color": ccol,
+        "radius": crad,
+    }, thinned
+
+
+def _sample_band(
+    mesh: trimesh.Trimesh, spacing: float, opaque: bool, fs: FreeSpace
+) -> tuple[dict[str, np.ndarray] | None, int]:
+    """Sample one mesh at one spacing. Small meshes go through `_band_darts`
+    directly; a mesh whose dart budget exceeds `_CHUNK_MAX_CANDIDATES` is
+    partitioned into `_CHUNK_EXTENT`-metre spatial slabs (by triangle centroid) and
+    sampled slab by slab, so transient memory is bounded regardless of size."""
+    if len(mesh.faces) == 0 or mesh.area <= 0:
+        return None, 0
+    budget = int(mesh.area / (spacing * spacing) * _THIN_CANDIDATES) + 8
+    if budget <= _CHUNK_MAX_CANDIDATES:
+        return _band_darts(mesh, spacing, opaque, fs, _band_seed(mesh, spacing, 0))
+
+    tris = np.asarray(mesh.triangles, dtype=np.float64)
+    uv = getattr(getattr(mesh, "visual", None), "uv", None)
+    material = getattr(getattr(mesh, "visual", None), "material", None)
+    # Index UVs BY FACE — correct for a raw geom's per-vertex UVs and a soup's
+    # per-corner UVs alike (a soup's faces are arange, so this equals a reshape).
+    uv3 = (
+        np.asarray(uv, dtype=np.float64)[np.asarray(mesh.faces)]
+        if uv is not None and len(uv) == len(mesh.vertices)
+        else None
+    )
+    cent = tris.mean(axis=1)
+    slab = np.floor(cent / _CHUNK_EXTENT).astype(np.int64)
+    slab -= slab.min(axis=0)
+    sy = int(slab[:, 1].max()) + 1
+    sz = int(slab[:, 2].max()) + 1
+    skey = (slab[:, 0] * sy + slab[:, 1]) * sz + slab[:, 2]
+    parts: list[dict[str, np.ndarray]] = []
+    thinned = 0
+    for si, sk in enumerate(np.unique(skey)):
+        m = skey == sk
+        sub = _soup_mesh(tris[m], uv3[m] if uv3 is not None else None, material)
+        part, n = _band_darts(sub, spacing, opaque, fs, _band_seed(sub, spacing, si + 1))
+        thinned += n
+        if part is not None:
+            parts.append(part)
+    if not parts:
+        return None, thinned
+    if len(parts) == 1:
+        return parts[0], thinned
+    return {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]}, thinned
+
+
+def _scene_scale(cand_clear: np.ndarray) -> float:
+    """Scene-scale factor k from the Stage-2 candidate clearances (open-sightline
+    statistic): `clamp(P_pctl(cand_clear) / _SIGHTLINE_REF_M, *_SCENE_K_CLAMP)`.
+    Falls back to 1.0 (no scaling) when candidates are too sparse to estimate."""
+    if cand_clear is None or len(cand_clear) < 64:
+        return 1.0
+    p = float(np.percentile(np.asarray(cand_clear, dtype=np.float64), _SIGHTLINE_PCTL))
+    return float(np.clip(p / _SIGHTLINE_REF_M, *_SCENE_K_CLAMP))
+
+
+def _object_spacing(geom: trimesh.Trimesh, base: float, k: float) -> float:
+    """Per-object sample spacing: `base · clamp(obj_diag / _VIEW_REF_M, 1, k)`.
+    Small props stay at `base`; large-area surface reaches the scene ceiling
+    `base·k`; mid-size objects scale with their own diagonal (framed from ~their
+    own size away)."""
+    b = np.asarray(geom.bounds, dtype=np.float64)
+    diag = float(np.linalg.norm(b[1] - b[0]))
+    return base * float(np.clip(diag / _VIEW_REF_M, 1.0, k))
+
+
+def _sample_object(
+    geom: trimesh.Trimesh, base: float, k: float, fs: FreeSpace
+) -> tuple[dict[str, np.ndarray] | None, int]:
+    """Sample one placed mesh into surfels at its scene-scale-adaptive spacing
+    (`_object_spacing`), then geometry-coarsen. With `_FEATURE_REFINE` on, split
+    into legacy feature bands first. Returns `(concatenated per-surfel arrays for
+    the VISIBLE surfels | None, total base-surfel count)`. Opacity is forced to 1
+    unless the material is genuinely BLEND/MASK."""
+    if len(geom.faces) == 0 or geom.area <= 0:
+        return None, 0
+    spacing = _object_spacing(geom, base, k)
+    opaque = _alpha_mode(geom) not in _TRANSPARENT_ALPHA_MODES
+    bands = _spacing_bands(geom, spacing) if _FEATURE_REFINE else [(geom, spacing)]
+    parts: list[dict[str, np.ndarray]] = []
+    sampled = 0
+    for band_mesh, band_spacing in bands:
+        band, n = _sample_band(band_mesh, band_spacing, opaque, fs)
+        sampled += n
+        if band is not None:
+            parts.append(band)
+    if not parts:
+        return None, sampled
+    if len(parts) == 1:
+        return parts[0], sampled
+    return {
+        k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]
+    }, sampled
+
+
 def _encode_ply(
     positions: np.ndarray,
     normals: np.ndarray,
@@ -705,12 +781,9 @@ def _encode_ply(
     out_path: Path,
     representation: str = "2dgs",
 ) -> None:
-    """Write surfels as a binary Gaussian `.ply` (SH degree 0). Default `2dgs` emits a
-    true flat disk: **two tangent scales** (scale_0/scale_1, no thickness) — the
-    orientation quaternion's first two columns are the tangent vectors, its third the
-    normal. `3dgs` appends a thin third scale (`scale_2 = radius × _FLATNESS`) for
-    3DGS-only viewers / SOG-SPZ compression. Shared fields: xyz, normal, f_dc_0..2,
-    opacity, scales, rot_0..3."""
+    """Write surfels as a binary Gaussian `.ply` (SH degree 0). `2dgs` = two tangent
+    scales (no thickness); `3dgs` appends a thin third scale. Shared fields: xyz,
+    normal, f_dc_0..2, opacity, scales, rot_0..3."""
     n = positions.shape[0]
     quats = _align_quaternions(normals).astype(np.float32)
 
@@ -765,94 +838,36 @@ def _encode_ply(
 
 
 # --- per-object work units (serial and process-pool) ---------------------------
-# Stage 3's probe reads ONLY the EMPTY mask (`empty_at`), so workers load a slim
-# grid: the mask + lattice geometry, skipping the clearance field and sparse
-# cover sets that dominate a large grid's decode time and memory. One copy per
-# process, cached across that worker's objects.
+# The grid is loaded once per process (spawn workers cache it) via stage2's loader;
+# the skin bitmask sidecar is memory-mapped, so every worker probing the same grid
+# shares ONE physical copy through the OS page cache.
 
-# (path, grid) as ONE reference: reads/writes are atomic under the GIL, so
-# concurrent stage-3 jobs on different cells in one server process can thrash
-# the slot but never observe a mismatched pair.
 _TASK_FS: tuple[str, FreeSpace] | None = None
 
 
-def _mapped_empty_mask(npz_path: Path, z, dims: np.ndarray):  # noqa: ANN001, ANN202
-    """The EMPTY mask as a read-only memory map. Writes the uncompressed
-    sidecar on first use (or when the npz is newer — a stage-2 re-run), with a
-    per-process temp + atomic replace so concurrent jobs can't tear it. Any
-    failure (read-only volume, corrupt sidecar) falls back to a private
-    in-memory copy; None signals the caller to decompress from the npz."""
-    sidecar = npz_path.with_name(npz_path.name + _EMPTY_SIDECAR_SUFFIX)
-    try:
-        if (
-            not sidecar.is_file()
-            or sidecar.stat().st_mtime < npz_path.stat().st_mtime
-        ):
-            tmp = sidecar.with_name(f"{sidecar.name}.{os.getpid()}.tmp.npy")
-            np.save(tmp, np.asarray(z["empty"], dtype=bool))
-            tmp.replace(sidecar)
-        mask = np.load(sidecar, mmap_mode="r")
-        if mask.dtype == np.bool_ and tuple(mask.shape) == tuple(int(v) for v in dims):
-            return mask
-    except Exception:
-        pass
-    return None
-
-
-def _load_empty_probe(path: Path) -> FreeSpace:
-    """The slice of the Stage-2 grid stage 3 actually consumes: the EMPTY mask
-    plus origin/pitch/dims. Validates the layout exactly like
-    `stage2.load_free_space` (clear re-run error on stale grids); the untouched
-    heavy members (clearance, cover sets) are left empty. The mask itself is
-    memory-mapped whenever possible, so every process probing the same grid
-    shares one physical copy through the OS page cache."""
-    nothing = np.zeros(0, dtype=np.int64)
-    with np.load(path) as z:
-        files = set(z.files)
-        if "empty" not in files or "clearance_m" not in files or "dims" not in files:
-            raise ValueError(f"{path} is a pre-clearance free-space grid — re-run Stage 2")
-        dims = z["dims"].astype(np.int64)
-        empty = _mapped_empty_mask(path, z, dims)
-        if empty is None:
-            empty = z["empty"].astype(bool)
-        return FreeSpace(
-            origin=z["origin"].astype(np.float64),
-            pitch=float(z["pitch"]),
-            dims=dims,
-            occ_lin=nothing,
-            occ_lin_opaque=nothing,
-            clearance=np.zeros((0, 0, 0), dtype=np.float32),
-            empty=empty,
-            clearance_m=float(z["clearance_m"]),
-        )
-
-
 def _task_free_space(path: str) -> FreeSpace:
-    """Process-wide cached probe grid (spawn workers load it once, then reuse
-    it for every object they sample)."""
+    """Process-wide cached free-space grid (spawn workers load it once)."""
     global _TASK_FS
     cached = _TASK_FS
     if cached is None or cached[0] != path:
-        cached = (path, _load_empty_probe(Path(path)))
+        cached = (path, load_free_space(Path(path)))
         _TASK_FS = cached
     return cached[1]
 
 
 def _sample_object_task(
-    node_id: str, glb_path: str, spacing: float, freespace_path: str
+    node_id: str, glb_path: str, base: float, k: float, freespace_path: str
 ) -> tuple[str, dict[str, np.ndarray] | None, float, int, str | None]:
     """Sample ONE placed GLB → `(node_id, visible-surfel arrays | None, surface
-    area, sampled count, error | None)`. The process-pool work unit: results
-    are per-object and merged by the caller in id order, so the parallel run
-    has the same structure as the serial one. A failing mesh reports its error
-    instead of raising (the serial skip-and-warn behavior)."""
+    area, base-surfel count, error | None)`. The process-pool work unit; results
+    merge by id order. A failing mesh reports its error instead of raising."""
     try:
         fs = _task_free_space(freespace_path)
         parts: list[dict[str, np.ndarray]] = []
         area = 0.0
         sampled = 0
         for geom in load_geoms(Path(glb_path)):
-            part, n = _sample_object(geom, spacing, fs)
+            part, n = _sample_object(geom, base, k, fs)
             sampled += n
             if part is None:
                 continue
@@ -869,10 +884,7 @@ def _sample_object_task(
 
 
 def _make_pool(workers: int):  # noqa: ANN202 - ProcessPoolExecutor | None
-    """A SPAWN-context process pool, or None when the environment forbids
-    subprocesses (degrade to serial, don't die). Spawn, not fork: stage jobs
-    run off worker threads (asyncio.to_thread), where forking risks deadlock;
-    spawn costs one interpreter+import per worker, amortized over the pass."""
+    """A SPAWN-context process pool, or None when subprocesses are forbidden."""
     if workers <= 1:
         return None
     import multiprocessing
@@ -889,18 +901,16 @@ def _make_pool(workers: int):  # noqa: ANN202 - ProcessPoolExecutor | None
 
 
 def _iter_sampled(
-    ids: list[str], raw_dir: Path, spacing: float, freespace_path: str, pool
+    ids: list[str], raw_dir: Path, base: float, k: float, freespace_path: str, pool
 ):  # noqa: ANN201, ANN001 - yields _sample_object_task results
-    """Yield per-object sampling results, serially (`pool=None`) or from the
-    given process pool. Object-level parallelism is the right grain today — a
-    scene dominated by ONE huge mesh (terrain, a racetrack ribbon) serializes
-    on it and simply matches the old cost; splitting big objects into chunks
-    needs the grid-thinning sampler first (chunk-local Poisson elimination
-    would double density along the seams)."""
+    """Yield per-object sampling results, serially (`pool=None`) or from the given
+    process pool. Object-level parallelism is the grain; lattice thinning bounds
+    each object's memory (no pair table), and huge single meshes chunk internally
+    (`_sample_band`), so no object OOMs a worker."""
     if pool is None:
         for node_id in ids:
             yield _sample_object_task(
-                node_id, str(raw_dir / f"{node_id}.glb"), spacing, freespace_path
+                node_id, str(raw_dir / f"{node_id}.glb"), base, k, freespace_path
             )
         return
     from concurrent.futures import as_completed
@@ -911,7 +921,8 @@ def _iter_sampled(
                 _sample_object_task,
                 node_id,
                 str(raw_dir / f"{node_id}.glb"),
-                spacing,
+                base,
+                k,
                 freespace_path,
             )
             for node_id in ids
@@ -933,16 +944,12 @@ def sample_cell(
     workers: int = 0,
 ) -> dict[str, Any]:
     """Sample every placed mesh in `raw_dir` into a Gaussian splat written to
-    `out_path`, consuming the Stage-2 free-space grid at `freespace_path` to
-    orient normals + cull hidden faces (per object, before coloring). ONE pass
-    over the meshes: the `detail` knob resolves to a spacing directly (no area
-    pre-pass), and total surface area is accumulated during sampling for the
-    summary (it feeds the client's count/size estimate, not the math).
-
-    `workers` parallelizes the per-object pass (0 = auto: min(cores, 8), then
-    capped so every worker's copy of the EMPTY mask fits the memory budget;
-    1 = serial). Results merge in id order, so the output's structure doesn't
-    depend on the worker count (sampling itself is unseeded, as always)."""
+    `out_path`, consuming the Stage-2 free-space grid at `freespace_path` to orient
+    normals + cull hidden faces. `workers` parallelizes the per-object pass (0 =
+    auto: min(cores, 8); 1 = serial). Sampling is SEEDED, so the output is
+    deterministic for any worker count; results merge in id order. The summary's
+    `sampled` counts BASE surfels (pre-coarsening); `splats` counts the emitted
+    (post-coarsening) cloud."""
     if not raw_dir.is_dir():
         raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
     if not Path(freespace_path).is_file():
@@ -951,19 +958,15 @@ def sample_cell(
     if not ids:
         raise FileNotFoundError(f"no placed meshes in {raw_dir}")
 
-    # Validate the grid layout up front (one clear error instead of a warning
-    # per object) and prime the parent-side cache for the serial path.
     fs_path = str(freespace_path)
     probe = _task_free_space(fs_path)
-    spacing = params.spacing
+    base = params.spacing
+    scene_k = _scene_scale(probe.cand_clear)
 
     if workers <= 0:
         workers = min(os.cpu_count() or 1, 8)
-    if not isinstance(probe.empty, np.memmap):
-        # The mask sidecar couldn't be mapped, so every worker holds a PRIVATE
-        # decompressed copy — cap the pool so huge outdoor grids (billions of
-        # cells) shrink parallelism instead of OOMing the box.
-        mem_cap = max(1, int(_WORKER_GRID_BUDGET // max(probe.empty.nbytes, 1)))
+    if not isinstance(probe.skin_empty, np.memmap):
+        mem_cap = max(1, int(_WORKER_GRID_BUDGET // max(probe.skin_empty.nbytes, 1)))
         workers = min(workers, mem_cap)
     workers = max(1, min(workers, len(ids)))
     pool = _make_pool(workers)
@@ -978,7 +981,7 @@ def sample_cell(
     results: dict[str, tuple[dict[str, np.ndarray] | None, float, int, str | None]] = {}
     done = 0
     for node_id, part, area, n_sampled, err in _iter_sampled(
-        ids, raw_dir, spacing, fs_path, pool
+        ids, raw_dir, base, scene_k, fs_path, pool
     ):
         done += 1
         results[node_id] = (part, area, n_sampled, err)
@@ -986,7 +989,6 @@ def sample_cell(
             progress(done, total, node_id)
     sample_s = time.perf_counter() - t0
 
-    # Merge in id order — deterministic structure whatever the completion order.
     pos_parts: list[np.ndarray] = []
     nrm_parts: list[np.ndarray] = []
     col_parts: list[np.ndarray] = []
@@ -1019,7 +1021,6 @@ def sample_cell(
     normals = np.concatenate(nrm_parts, axis=0)
     colors = np.concatenate(col_parts, axis=0)
     radii = np.concatenate(rad_parts, axis=0)
-    culled = int(sampled - positions.shape[0])
 
     t1 = time.perf_counter()
     _encode_ply(positions, normals, colors, radii, out_path, params.representation)
@@ -1033,10 +1034,12 @@ def sample_cell(
         "model": model,
         "splats": int(positions.shape[0]),
         "sampled": int(sampled),
-        "culled_hidden": culled,
+        "culled_hidden": max(0, int(sampled - positions.shape[0])),
         "objects_sampled": objects_sampled,
         "objects_total": total,
-        "spacing": spacing,
+        "spacing": base,
+        "scene_scale": round(scene_k, 3),
+        "scene_spacing": round(base * scene_k, 4),
         "total_area": round(total_area, 2),
         "workers": workers,
         "timings": {"sample_s": round(sample_s, 2), "encode_s": round(encode_s, 2)},

@@ -182,10 +182,10 @@ class PlanParams:
     # visible as left-to-right sweeps — leaving one side of the scene denser
     # when cut). The summary's coverage `curve` reports what any budget buys.
     max_views: int | None = None
-    # Candidate positions are drawn from the NEAR-SURFACE band (reachable cells
-    # with clearance up to the band-0 reach of the coarsest patch — see
+    # Candidate positions are drawn from the reachable FREE cells (see
     # `_candidates`) at ~`candidate_spacing` apart, so the candidate COUNT
-    # scales with the near-surface area, not a fixed budget.
+    # scales with the free volume, not a fixed budget. Stage 4 reads no per-cell
+    # clearance — the FREE mask already encodes the standoff floor.
     # `max_candidates` is only a SAFETY ceiling (even-downsample + warn if a
     # scene ever exceeds it), not the room-scale cap it used to be.
     candidate_spacing: float = 0.5    # target spacing (m) between candidate positions
@@ -291,40 +291,24 @@ def _local_spacing(points: np.ndarray, k: int = 8) -> np.ndarray:
     return d[:, 1:].mean(axis=1)
 
 
-def _candidate_band(p: PlanParams) -> float:
-    """Outer clearance edge (m) of the candidate field, DERIVED from the ladder:
-    a candidate is only ever needed within band 0 of some patch (every coarser
-    band is reachable from farther away, i.e. from other patches' bands), and the
-    farthest band-0 view of the coarsest patch is at
-    2 · patch_max_spacing · focal / finest_px — beyond that clearance a cell can
-    supply no finest-scale demand. Also the rescue pass's search reach: the
-    farthest a candidate the field even CONTAINS can plausibly be from a surface
-    it must cover."""
-    return 2.0 * p.patch_max_spacing * p.focal_px / p.finest_px
-
-
 def _candidates(fs: FreeSpace, p: PlanParams) -> np.ndarray:
-    """Candidate camera positions: reachable NEAR-SURFACE free cells sampled
-    ~`candidate_spacing` apart, so the count scales with the near-surface area
-    rather than a fixed budget. The band runs from the wall-adjacent cells (the
-    only standoff is Stage 2's baked one-voxel FREE floor — beyond it standoff is
-    EMERGENT: the ladder demands nothing below a patch's d_min, so point-blank
-    candidates only win where occlusion leaves no farther supplier, and the
-    ray-march fails closed on segments too short to verify) out to
-    `_candidate_band`, the ladder-derived outer edge. (Interim until candidates
-    span the whole reachable volume; grazing views already let this band supply
-    far octaves.) If a scene still exceeds `max_candidates`, evenly downsample
-    (and warn) — never silently fall back to a room-scale cap. Returns (M,3)
-    world points."""
-    # min_clearance=0 adds no floor beyond Stage 2's baked FREE mask (reachable
-    # empty ∧ clearance ≥ clearance_m); max_clearance is the near-surface band.
-    centers, _ = fs.free_candidates(0.0, _candidate_band(p), p.candidate_spacing)
+    """Candidate camera positions: reachable FREE cells sampled ~`candidate_spacing`
+    apart, so the count scales with the free volume rather than a fixed budget.
+    Standoff is fully baked into the FREE mask (Stage 2's one-voxel floor) and
+    otherwise EMERGENT — the ladder demands nothing below a patch's d_min, so
+    point-blank candidates only win where occlusion leaves no farther supplier,
+    and the ray-march fails closed on segments too short to verify. Stage 4
+    reads no per-cell clearance: `free_candidates` thins the raw FREE mask by
+    spacing alone. If a scene exceeds `max_candidates`, evenly downsample (and
+    warn) — never silently fall back to a room-scale cap. Returns (M,3) world
+    points."""
+    centers = fs.free_candidates(p.candidate_spacing)
     if len(centers) == 0:
         return np.zeros((0, 3), dtype=np.float32)
     if p.max_candidates and len(centers) > p.max_candidates:
         step = int(np.ceil(len(centers) / p.max_candidates))
         logging.warning(
-            "stage4: %d near-surface candidates at spacing %.2fm exceeds the "
+            "stage4: %d free candidates at spacing %.2fm exceeds the "
             "max_candidates ceiling %d; even-downsampling by %dx (raise "
             "max_candidates or candidate_spacing to keep full density)",
             len(centers), p.candidate_spacing, p.max_candidates, step,

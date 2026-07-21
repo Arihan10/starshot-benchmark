@@ -1,29 +1,49 @@
-"""Stage 2 — Free-space voxelizer (single uniform grid + two-phase flood fill).
+"""Stage 2 — Free-space voxelizer (surface-band two-tier flood fill).
 
-The shared spatial FOUNDATION of the splat pipeline: discretizes a cell's composed
-scene into ONE voxel grid of uniform pitch (the scene AABB grown by an exterior
-margin so cameras can see outer silhouettes), classifies every cell as COVER
-(surface), EMPTY (air a viewer could see — ambient + rescued cavities) or
-GARBAGE (sealed interiors — object hollows, seams), then derives FREE — the
-camera-placeable subset of EMPTY at sufficient clearance from any cover — and
-writes a REUSABLE grid that both Stage 3 (surfel sampler — orient normals to
-empty space, cull hidden faces) and Stage 4 (camera planner — candidates +
-occlusion) consume. Nothing downstream recomputes occupancy; that's the point
-of running this first.
+The shared spatial FOUNDATION of the splat pipeline: discretizes a cell's
+composed scene on ONE uniform 3 cm lattice (the fidelity scale, deliberately
+scene-size independent — big scenes contain small objects), classifies the air
+NEAR SURFACES as COVER (surface), EMPTY (air a viewer could see — ambient +
+rescued cavities) or GARBAGE (sealed interiors — object hollows, seams), and
+emits the camera CANDIDATE list Stage 4 plans from. Work and storage scale
+with SURFACE AREA, never scene volume: air is only ever examined within the
+camera-coverage band of a surface, at two resolutions —
+
+  * the FINE SKIN — every 8³-voxel brick within one brick of a cover brick —
+    is processed at full 3 cm resolution. All correctness lives here: thin
+    walls, seams, seal detection, Stage 3's orient/cull probes (which only
+    ever look 1-2 voxels off a surface).
+  * the COARSE ZONE — cover-free bricks from the skin out to `coverage`
+    metres — is processed per brick. A brick out here provably contains no
+    surface (any brick with cover is, by definition, inside the skin), so it
+    is a single all-air node: connectivity needs no fine resolution, and thin
+    barriers can never be crossed at brick granularity because they only
+    exist inside the skin.
+  * beyond `coverage`: unexplored, unlabeled, unstored. Cameras are never
+    placed there (a camera farther than the band from every surface supplies
+    no finest-scale demand), and per the training design far appearance comes
+    from close-up references + the Stage-6 LOD ladder, not far cameras.
+
+Nothing downstream recomputes occupancy; that's the point of running this
+first. Stage 4 receives its candidate positions directly (each annotated with
+its distance to the nearest surface), so no dense free-space volume exists
+anywhere in the pipeline.
 
 OCCUPANCY is an EXACT surface voxelization: every cell whose cube a triangle
 touches is marked — big triangles are midpoint-split until each piece spans at
 most a 3×3×3 cell block, then a separating-axis triangle/cube test decides each
 cell. Deterministic and gap-free, so the visibility ray-march can't leak through
 pinholes in walls and the flood fill can't escape into sealed interiors. No
-winding/closure assumptions, so the non-watertight composed scene is fine. The
-cover set is stored SPARSELY (sorted linear indices), so its memory tracks the
-amount of SURFACE; the dense fields (the empty mask, clearance) are built
-STREAMED in X-SLABS — x is the outermost axis, so a slab is contiguous in
-memory, on disk, and in the sorted cover keys — with full-resolution
-intermediates in disk-backed .npy scratch files the OS pages in and out freely.
-Resident memory is slab-sized plus O(surface + components), nearly independent
-of scene volume; disk and runtime still scale with it.
+winding/closure assumptions, so the non-watertight composed scene is fine.
+Pieces STREAM through the test in bounded `_BATCH_PIECES` batches
+(`_piece_batches`), each deduped to sorted keys on its own, so a worker's
+transient memory tracks the batch — never an object's whole subdivided soup —
+and the key set is byte-identical for any batch size. The cover set is stored
+SPARSELY (sorted linear indices), so its memory tracks the amount of SURFACE.
+Fine occupancy is only ever materialized per 8³ BRICK inside the skin (rebuilt
+on demand from the sorted keys, which are x-major and therefore contiguous per
+brick x-layer); no dense fine-resolution array over the grid ever exists, in
+RAM or on disk.
 
 GLASS (transparent surfaces occupy space but don't block sight). Classified
 DURING voxelization — it is per-triangle-piece work fused into the same
@@ -38,12 +58,16 @@ from the occlusion set the Stage-4 visibility ray-march tests (`occluding`), so
 surfaces behind glazing are coverable. OPAQUE materials (the glTF default, and
 the vast majority) ignore texture alpha entirely.
 
-EMPTY vs GARBAGE — the two-phase fill. Cover is voxelized for the WHOLE scene
-first, then empty space is discovered by one 6-connected flood fill (face
-neighbours only — a diagonal fill would slip through the corner-touching
-staircase a thin oblique wall voxelizes into) whose result depends only on the
-seed set; labels are assigned exactly once at the end (empty = reached, garbage
-= the unreached remainder), so no precedence/override bookkeeping exists:
+EMPTY vs GARBAGE — the two-phase, two-tier fill. Connectivity is 6-connected
+at fine resolution inside the skin (face neighbours only — a diagonal fill
+would slip through the corner-touching staircase a thin oblique wall voxelizes
+into) and per-brick in the zone; the two tiers stitch at skin-brick faces.
+Restricted to the explored band, the resulting components are IDENTICAL to a
+whole-grid fine fill's: a zone brick is pure air (internally 6-connected), two
+adjacent air bricks always connect (their shared 8×8 face is all air), and a
+skin face cell connects to an adjacent air brick exactly as its fine neighbour
+would. Labels are assigned once at the end (empty = reached, garbage = the
+unreached remainder within the band):
 
   * PHASE 1 (ambient). Seeds are (a) the grid's boundary shell — the exterior
     margin, always ambient — and (b) every object's AUGMENTED SHELL: the 1-cell
@@ -54,9 +78,13 @@ seed set; labels are assigned exactly once at the end (empty = reached, garbage
     per-voxel exclusion (not per-direction) is what lets flush, mutually
     abutting architecture still seed: a wall's room-facing shell loses only the
     rows inside the floor/ceiling/side-wall boxes, so sealed rooms are seeded
-    directly by their own bounding surfaces. The exclusion constrains SEEDS
-    only — the fill itself flows wherever occupancy permits (over sofa seats,
-    under arches), or bbox-covered air would wrongly read sealed.
+    directly by their own bounding surfaces. Per-object self-seeding is ALSO
+    what makes the band cut safe for disconnected content (a swamp's islands,
+    a platformer's floating platforms): every object's neighbourhood seeds
+    itself, so no path through unexplored open air is ever required. The
+    exclusion constrains SEEDS only — the fill itself flows wherever occupancy
+    permits (over sofa seats, under arches), or bbox-covered air would wrongly
+    read sealed.
   * PHASE 2 (nested rescue, to fixpoint). An object NONE of whose shell cells
     were reached is sealed away from all discovered free space — fully nested
     (a bottle in a closed cabinet), which per the product decision should be
@@ -76,17 +104,17 @@ seed set; labels are assigned exactly once at the end (empty = reached, garbage
     seeing there); an object straddling an open and a sealed region rescues
     neither; the nesting distinction is only as sharp as the pitch.
 
-CLEARANCE → FREE (the stage-2 clearance pass, run right after the fill).
-Clearance = metres from each cell to the nearest cover cell (EDT over the one
-grid). FREE = the EMPTY cells with clearance ≥ `clearance_m` — where a camera
-can physically sit. The mask is DERIVED, not stored: the npz carries the empty
-mask, the clearance field and the `clearance_m` scalar, and `load_free_space`
-computes `free = empty & (clearance >= clearance_m)` — so mask and threshold
-can never disagree, and re-thresholding (`apply_clearance`) rewrites ONE scalar
-without re-voxelizing. Consumers split cleanly: Stage 3's orient/cull reads
-EMPTY (`empty_at` — a surfel beside a 10 cm gap has visible air there even
-though no camera fits); Stage 4's candidates read FREE (`free_candidates`,
-which further band-limits by clearance + thins by spacing).
+CANDIDATES (the free-voxel product, emitted directly). Camera positions are
+picked from reached air at ~half-metre spacing — in the skin, the first free
+fine cell per 2×2×2-brick block; in the zone, the first reached brick's centre
+per block — and each is annotated with its distance to the nearest surface
+(exact within the skin via a local search; brick-granular in the zone, where
+sub-voxel precision cannot matter). The baked `clearance_m` (and the client
+slider's re-bakes via `apply_clearance`, now an instant metadata rewrite) is a
+FILTER over the annotated list. Stage 4 consumes the list as-is: it computes
+no clearance and derives no free volume of its own. Camera standoff beyond
+the baked floor stays EMERGENT (the scale ladder demands nothing below a
+patch's d_min).
 
 Pure library (like the other stages): takes explicit paths and reads the
 meshes AS-IS through `splat.assets.load_geoms` — vanilla glTF via trimesh,
@@ -94,22 +122,20 @@ KTX2/Meshopt sets via the in-process decoder (no de-optimization step). On
 compressed sets texel data is unavailable, so BLEND/MASK glass classification
 falls back to the constant `baseColorFactor` alpha.
 
-Outputs (under a cell's `splat/` dir):
-  * `freespace.npz` — the reusable grid (origin, pitch, dims, sparse cover incl.
-    the glass subset, clearance, the empty mask, the baked `clearance_m`).
-    Consumed by Stages 3 and 4; load via `load_free_space`. Older layouts
-    (dual-resolution, or pre-clearance single-grid) are rejected with a clear
-    re-run error rather than carried as compat shims.
-  * `freespace.npz.empty.npy` — the empty mask as an uncompressed sidecar,
-    promoted from the fill's scratch so Stage 3's pool workers memory-map one
-    shared copy without ever decompressing the npz mask themselves.
+Outputs (under a cell's `splat/` dir), all O(surface + candidates):
+  * `freespace.npz` — metadata + sparse structures: origin/pitch/dims, the
+    sorted fine cover (incl. the glass subset), the sorted skin-brick ids, the
+    reached zone-brick ids, the candidate positions + clearance annotations,
+    and the baked `clearance_m`. Older layouts (dense fields, mask sidecars)
+    are rejected with a clear re-run error rather than carried as compat shims.
+  * `freespace.npz.skin.npy` — the per-skin-brick EMPTY bitmasks (512 bits =
+    one uint64[8] per brick), the ONLY per-cell payload, memory-mapped by the
+    loaders so Stage 3's pool workers share one physical copy.
   * `voxels.bin` — the SVX3 viz pack for the client overlay: VOLUMETRIC
-    boundary shells, not points. Cover, garbage, and the free volume (at a
-    ladder of clearance thresholds, the baked one included) are each
-    surface-extracted into run-merged exposed-face quads (`_boundary_quads`),
-    so the client renders merged translucent shapes with interior faces
-    culled, and the clearance slider swaps pre-meshed shells (see the wire
-    layout at `_VIZ_MAGIC`).
+    boundary shells as run-merged exposed-face quads (`_boundary_quads`).
+    Cover and garbage are fine-resolution (they live in the skin); the free
+    volume is ONE shell at brick resolution (the slider's preview ladder died
+    with the dense clearance field — its 'apply' still re-filters candidates).
 """
 
 from __future__ import annotations
@@ -133,11 +159,11 @@ logging.getLogger("trimesh").setLevel(logging.ERROR)
 # Artifacts written under a cell's `splat/` dir.
 FREESPACE_NAME = "freespace.npz"
 VOXELS_NAME = "voxels.bin"
-# Uncompressed empty-mask twin (`freespace.npz.empty.npy`), written beside the
-# npz so Stage 3's pool workers memory-map ONE shared copy instead of each
-# decompressing a private mask. Stage 3 treats a sidecar older than the npz as
-# stale — hence the post-write touch in `compute_free_space`.
-_EMPTY_SIDECAR_SUFFIX = ".empty.npy"
+# Uncompressed sidecar holding the per-skin-brick EMPTY bitmasks (uint64
+# (S, 8) — 512 bits per brick, raster order within the brick). The one
+# per-cell payload; kept out of the npz so loaders memory-map it and Stage 3's
+# pool workers share ONE physical copy through the page cache.
+_SKIN_SIDECAR_SUFFIX = ".skin.npy"
 # Viz pack (SVX3): VOLUMETRIC boundary shells per voxel class. Header = magic +
 # u32 LE counts (cover quads, garbage quads, free shells); then cover quads,
 # garbage quads, then per shell a header (f32 clearance threshold, u32 quads,
@@ -151,48 +177,54 @@ _SHELL_HEADER = struct.Struct("<fII")
 _QUAD_DTYPE = np.dtype(
     [("x", "<u2"), ("y", "<u2"), ("z", "<u2"), ("f", "u1"), ("p", "u1"), ("r", "<u2")]
 )
-# The free volume is pre-meshed at these thresholds (voxel multiples, capped at
-# the scene's clearance ceiling, the baked threshold always included) so the
-# client slider swaps shells instantly instead of re-meshing.
-_SHELL_STEPS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64)
-
-DEFAULT_PITCH = 0.03      # the uniform voxel edge (m) — one grid for everything
+DEFAULT_PITCH = 0.03      # the uniform voxel edge (m) — the FIDELITY scale,
+                          # deliberately scene-size independent
 # The baked FREE threshold (m): a camera needs at least this much clearance.
 # The default equals ONE VOXEL at the default pitch — the most permissive
 # meaningful setting: every empty cell is ≥ 1 voxel from cover by definition,
-# so FREE ≡ EMPTY out of the box, and per-scene tightening happens through the
-# client slider's apply (`apply_clearance`, in place). For reference, 0.35 was
-# the measured knee of the passage-survival curve across the benchmark runs
-# (~2/3 of sub-2m facing gaps keep centerline candidates) — a sensible value
-# when tightening for production plans.
+# so every reached cell is a candidate source out of the box, and per-scene
+# tightening happens through the client slider's apply (`apply_clearance`,
+# now an instant candidate re-filter). For reference, 0.35 was the measured
+# knee of the passage-survival curve across the benchmark runs (~2/3 of
+# sub-2m facing gaps keep centerline candidates) — a sensible value when
+# tightening for production plans.
 DEFAULT_CLEARANCE = 0.03
-# Tolerance for every `clearance >= threshold` test. A cell exactly ON a
-# lattice distance stores just below its true value (float32 pitch products,
-# then float16 in the npz: 1 voxel × 0.03 → 0.0299988), so an exact-equality
-# threshold — e.g. the one-voxel default above — would otherwise exclude the
-# very tier it names. 2.5e-4 absorbs float16 half-ulp rounding for thresholds
-# up to ~0.5 m while staying far below the smallest gap between distinct EDT
-# tiers, so no cell from a genuinely lower tier can sneak in.
+# The camera-coverage band (m): air is explored, labeled and candidate-seeded
+# only within this distance of a surface. DERIVED from the scale ladder at the
+# Stage-4 defaults — a camera supplies the finest demanded scale of even the
+# coarsest patch only within 2·patch_max_spacing·focal_px/finest_px =
+# 2·0.30·512/64 ≈ 4.8 m — and rounded up. Beyond it a camera supplies only
+# coarse octaves, which near-surface cameras already supply across horizontal
+# distance, and far appearance is the Stage-6 LOD ladder's job.
+DEFAULT_COVERAGE = 5.0
+# Tolerance for `clearance >= threshold` candidate filters: absorbs float32
+# annotation rounding so a threshold equal to an exact lattice distance (the
+# one-voxel default) includes its own tier.
 _CLEARANCE_EPS = 2.5e-4
 _PITCH_CLAMP = (0.02, 1.0)
-# Flat-chunk length for whole-grid reductions (the FREE count, clearance stats,
-# float16 conversion): bounds each per-chunk temporary to tens of MB where a
-# single whole-grid call would materialize multi-GB copies.
-_CHUNK_CELLS = 1 << 24
-# Per-slab working-set target for the streamed grid passes (labels + masks +
-# temps, ~16 B/cell during the fill). Purely a resource knob: every streamed
-# pass produces identical output for ANY slab partition.
-_SLAB_TARGET_BYTES = 256 * 1024**2
+# The two-tier granularities, in fine voxels per axis. A BRICK (8³ = 24 cm at
+# default pitch) is the skin/zone unit: cover-containing bricks + their 1-ring
+# form the fine skin, so fine treatment always extends ≥ 8 voxels beyond any
+# surface (Stage 3 probes need 3). Candidates thin to one per CAND block
+# (2×2×2 bricks ≈ 0.5 m — the camera-planning granularity, matching the old
+# stage-4 candidate spacing).
+_BRICK = 8
+_CAND_BRICKS = 2
 # Scratch files older than this are swept at build start. Live scratches are
 # never this old (phases write continuously); only hard-killed builds — whose
-# cleanup never ran — leave older ones behind, and those are multi-GB litter.
+# cleanup never ran — leave older ones behind.
 _SCRATCH_TTL_S = 6 * 3600.0
-# Parabola x-pass sentinel: "this plane holds no cover" (see `_parabola_pass`).
-_NO_SITE = np.int64(1) << 62
 # Exact voxelization: triangles are midpoint-split until every edge spans at most
 # this many cells, so each piece's candidate block for the separating-axis
 # test is at most 3×3×3 cells (a triangle's extent is bounded by its longest edge).
 _SUBDIV_EDGE_CELLS = 2.0
+# Mesh-pass batch size, in subdivided PIECES: each batch is subdivided, SAT-
+# tested and key-encoded on its own, so a worker's transient working set
+# (pieces + overlap temporaries + hit cells, ~0.5-1 KB/piece at peak) stays
+# ~100 MB regardless of object size — a big slab/window used to materialize
+# its whole multi-million-piece soup at once (~1.4 GB). Purely an evaluation-
+# order knob: pieces and their deduped keys are identical for ANY batch size.
+_BATCH_PIECES = 1 << 17
 # Material alpha modes whose sampled base-color alpha is meaningful (matches Stage
 # 3/5): only BLEND/MASK surfaces can be classed as glass; OPAQUE ignores alpha.
 _TRANSPARENT_ALPHA_MODES = ("BLEND", "MASK")
@@ -235,17 +267,20 @@ ProgressCb = Callable[[int, int, str], None]
 
 @dataclass(frozen=True)
 class FreeSpaceParams:
-    """Stage-2 knobs. `pitch` is the uniform voxel edge of the single grid;
-    `margin` grows the grid beyond the scene AABB so exterior camera vantages
-    exist (Stage 4); `clearance` (m) is the baked FREE threshold — empty cells
-    at least this far from any cover cell are camera-placeable. `workers`
+    """Stage-2 knobs. `pitch` is the uniform fine voxel edge (the fidelity
+    scale — scene-size independent); `margin` grows the grid beyond the scene
+    AABB so exterior camera vantages exist (Stage 4); `clearance` (m) is the
+    baked candidate filter — camera spots at least this far from any surface;
+    `coverage` (m) is the camera band — air is explored and candidate-seeded
+    only within this distance of a surface (module docstring). `workers`
     parallelizes the per-object mesh pass (0 = auto: sized to fit available
-    RAM, capped at min(cores, 8); 1 = serial); the output is byte-identical
+    RAM, capped at min(cores, 16); 1 = serial); the output is byte-identical
     for any value."""
 
     pitch: float = DEFAULT_PITCH
     margin: float = 1.5
     clearance: float = DEFAULT_CLEARANCE
+    coverage: float = DEFAULT_COVERAGE
     workers: int = 0
 
     def as_summary(self) -> dict[str, Any]:
@@ -253,41 +288,50 @@ class FreeSpaceParams:
             "pitch": self.pitch,
             "margin": self.margin,
             "clearance": self.clearance,
+            "coverage": self.coverage,
             "workers": self.workers,
         }
 
 
 @dataclass(frozen=True)
 class FreeSpace:
-    """A loaded free-space grid — ONE uniform lattice of edge `pitch`: the
-    SPARSE cover (`occ_lin` — sorted linear indices into a `dims` grid;
-    `occ_lin_opaque` is the subset with opaque surface), `clearance` (metres to
-    the nearest cover cell), the `empty` mask (ambient air + rescued cavities —
-    everything a viewer could see; the unreached remainder is garbage: sealed
-    object hollows and seams), and the baked `clearance_m` threshold. FREE —
-    the camera-placeable subset — is DERIVED: `free = empty & (clearance >=
-    clearance_m)`, so the mask can never disagree with the threshold.
+    """A loaded free-space grid — ONE uniform fine lattice of edge `pitch`,
+    represented SPARSELY throughout (module docstring):
+
+      * `occ_lin` — sorted fine linear indices of ALL cover cells (opaque +
+        glass); `occ_lin_opaque` the line-of-sight-blocking subset.
+      * `skin_lin` + `skin_empty` — the fine skin: sorted brick linear ids
+        (bricks of `_BRICK`³ fine cells on the derived `bdims` grid) and each
+        brick's 512-bit EMPTY bitmask (uint8 (S, 64), little bit order, raster
+        order within the brick). Air near surfaces at full resolution — what
+        Stage 3's probes read.
+      * `zone_lin` — sorted brick ids of REACHED coarse-zone bricks (pure air
+        between the skin and the coverage band edge). Empty at brick
+        granularity.
+      * `cand_pos` + `cand_clear` — the camera-candidate list (world positions
+        + distance-to-nearest-surface annotations). What Stage 4 plans from;
+        the baked `clearance_m` filters it at load (`free_candidates`).
 
     Two cover queries with different jobs: `occupied` answers "is there ANY
     surface here" (physical presence — glass included), `occluding` answers
     "does this cell block sight" (opaque only — glass passes light)."""
 
     origin: np.ndarray        # (3,) world corner of cell [0,0,0]
-    pitch: float              # voxel edge (m)
-    dims: np.ndarray          # (3,) int64 grid dims [nx,ny,nz]
-    occ_lin: np.ndarray       # (K,) int64 SORTED linear indices of ALL cover
-                              # cells (opaque + glass) — clearance/fill basis
+    pitch: float              # fine voxel edge (m)
+    dims: np.ndarray          # (3,) int64 fine grid dims [nx,ny,nz]
+    occ_lin: np.ndarray       # (K,) int64 SORTED fine linear cover indices
     occ_lin_opaque: np.ndarray  # (K2,) int64 SORTED subset that blocks line-of-sight
-    clearance: np.ndarray     # float32 [nx,ny,nz] (m)
-    empty: np.ndarray         # bool [nx,ny,nz] — EMPTY (viewable air) cells
-    clearance_m: float        # baked FREE threshold (m)
+    skin_lin: np.ndarray      # (S,) int64 SORTED skin-brick linear ids
+    skin_empty: np.ndarray    # (S,64) uint8 per-brick EMPTY bitmasks
+    zone_lin: np.ndarray      # (Z,) int64 SORTED reached zone-brick ids
+    cand_pos: np.ndarray      # (M,3) float32 candidate world positions
+    cand_clear: np.ndarray    # (M,) float32 distance to nearest surface (m)
+    clearance_m: float        # baked candidate clearance filter (m)
 
     @property
-    def free(self) -> np.ndarray:
-        """bool [nx,ny,nz] — FREE (camera-placeable) cells, derived from the
-        baked threshold (epsilon absorbs float16/lattice rounding so a
-        threshold equal to a lattice distance includes its own tier)."""
-        return self.empty & (self.clearance >= self.clearance_m - _CLEARANCE_EPS)
+    def bdims(self) -> np.ndarray:
+        """(3,) int64 brick-grid dims (`ceil(dims / _BRICK)`)."""
+        return (self.dims + _BRICK - 1) // _BRICK
 
     @property
     def shape(self) -> tuple[int, int, int]:
@@ -335,121 +379,163 @@ class FreeSpace:
         visibility ray-march can see (and plan coverage) through window panes."""
         return self._member(points, self.occ_lin_opaque)
 
+    def _brick_lin(self, cells: np.ndarray) -> np.ndarray:
+        """(N,) int64 brick linear ids of (N,3) fine cell indices."""
+        b = cells >> 3  # _BRICK == 8
+        bd = self.bdims
+        return (b[:, 0] * bd[1] + b[:, 1]) * bd[2] + b[:, 2]
+
     def empty_at(self, points: np.ndarray) -> np.ndarray:
         """Boolean per world point: is it in EMPTY space (ambient air or a
-        rescued cavity)? This is what distinguishes viewable air from a solid's
-        sealed hollow — the signal Stage 3 uses to orient normals + cull hidden
-        faces. Deliberately NOT clearance-filtered: a surfel beside a thin gap
-        has visible air there even though no camera fits (that's `free`).
-        Outside-grid points read as False."""
+        rescued cavity)? Answered at fine resolution inside the skin (the
+        per-brick bitmasks) and at brick resolution in the coarse zone (a
+        reached zone brick is all air). This is what distinguishes viewable
+        air from a solid's sealed hollow — the signal Stage 3 uses to orient
+        normals + cull hidden faces; its probes sit 1-2 voxels off surfaces,
+        always inside the skin. Points outside the grid or beyond the
+        coverage band read as False."""
         idx, inb = self._bin(points)
         out = np.zeros(len(points), dtype=bool)
+        if not inb.any():
+            return out
         ii = idx[inb]
-        out[inb] = self.empty[ii[:, 0], ii[:, 1], ii[:, 2]]
+        blin = self._brick_lin(ii)
+        res = np.zeros(len(ii), dtype=bool)
+        if self.skin_lin.size:
+            pos = np.searchsorted(self.skin_lin, blin)
+            pos_c = np.clip(pos, 0, self.skin_lin.size - 1)
+            in_skin = self.skin_lin[pos_c] == blin
+            if in_skin.any():
+                loc = ii[in_skin] & 7
+                bit = (loc[:, 0] * 8 + loc[:, 1]) * 8 + loc[:, 2]
+                words = np.asarray(
+                    self.skin_empty[pos_c[in_skin], bit >> 3]
+                )
+                res[in_skin] = (words >> (bit & 7).astype(np.uint8)) & 1 == 1
+        else:
+            in_skin = np.zeros(len(ii), dtype=bool)
+        rest = ~in_skin
+        if rest.any() and self.zone_lin.size:
+            bl = blin[rest]
+            pos = np.clip(np.searchsorted(self.zone_lin, bl), 0, self.zone_lin.size - 1)
+            res[rest] = self.zone_lin[pos] == bl
+        out[inb] = res
         return out
 
-    def free_candidates(
-        self,
-        min_clearance: float,
-        max_clearance: float | None = None,
-        spacing: float | None = None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """FREE-cell world centres (+ their clearances) — the camera-candidate
-        pool for Stage 4, based on the BAKED free mask (empty ∧ clearance ≥
-        `clearance_m`), so cameras never spawn inside solids, sealed hollows,
-        or hugging a surface. `min_clearance` can only tighten further — the
-        baked threshold is the floor (re-bake via `apply_clearance` to relax).
+    def free_candidates(self, spacing: float | None = None) -> np.ndarray:
+        """The camera-candidate positions for Stage 4: the stored candidate
+        list filtered by the baked clearance (each candidate carries its
+        distance to the nearest surface). Candidates were emitted at
+        ~`_CAND_BRICKS`-brick spacing (≈ 0.5 m) at build time, so `spacing` is
+        accepted for API compatibility but does no further thinning below
+        that. Returns (M,3) float32 world points."""
+        del spacing  # emission spacing is baked at build time
+        keep = self.cand_clear >= (self.clearance_m - _CLEARANCE_EPS)
+        return np.ascontiguousarray(self.cand_pos[keep])
 
-        `max_clearance` keeps only the NEAR-SURFACE band (cells whose nearest surface
-        is within reach of a camera); cells farther than any view distance can see
-        nothing and are dropped. `spacing` (m) thins the band to ~one candidate per
-        `spacing`-sized block, picking the MOST-OPEN cell in each block — so the
-        candidate count scales with the near-surface area, not a fixed budget."""
-        eligible = self.free & (self.clearance >= min_clearance - _CLEARANCE_EPS)
-        if max_clearance is not None:
-            eligible &= self.clearance <= max_clearance
-        stride = 1 if spacing is None else max(1, int(round(spacing / self.pitch)))
-        if stride == 1:
-            cells = np.argwhere(eligible)
-            centers = (self.origin + (cells + 0.5) * self.pitch).astype(np.float32)
-            return centers, self.clearance[eligible]
-        # One representative per stride³ block: the eligible cell CLOSEST to a surface
-        # (smallest clearance, but still ≥ collision_clearance) — closest safe camera
-        # spots best serve the near/detail-view coverage requirement. Pad up so no
-        # edge block is lost; +inf marks ineligible cells.
-        score = np.where(eligible, self.clearance, np.float32(np.inf))
-        nx, ny, nz = score.shape
-        pad = [(-nx) % stride, (-ny) % stride, (-nz) % stride]
-        score = np.pad(score, [(0, pad[0]), (0, pad[1]), (0, pad[2])], constant_values=np.inf)
-        pnx, pny, pnz = score.shape
-        blocks = (
-            score.reshape(pnx // stride, stride, pny // stride, stride, pnz // stride, stride)
-            .transpose(0, 2, 4, 1, 3, 5)
-            .reshape(pnx // stride, pny // stride, pnz // stride, stride**3)
+
+def _savez_fast(path: Path, **arrays: np.ndarray) -> None:
+    """`np.savez_compressed`-compatible writer at deflate level 1. numpy
+    hardcodes level 6, which crawls (~25 MB/s) through the multi-hundred-MB
+    sorted cover arrays of foliage scenes for a ~15% size win over level 1;
+    level 1 writes ~4× faster and `np.load` reads either unchanged."""
+    import zipfile
+
+    with zipfile.ZipFile(
+        path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=1,
+        allowZip64=True,
+    ) as zf:
+        for name, arr in arrays.items():
+            with zf.open(f"{name}.npy", "w", force_zip64=True) as f:
+                np.lib.format.write_array(f, np.asanyarray(arr))
+
+
+def _load_skin_sidecar(npz_path: Path, n_bricks: int) -> np.ndarray:
+    """Memory-map the per-skin-brick EMPTY bitmask sidecar. mmap keeps it off
+    the heap (Stage 3's pool workers share one physical copy); a mmap failure
+    with the file present falls back to an in-RAM load; missing/mismatched
+    means an old or torn grid — re-run Stage 2."""
+    p = npz_path.with_name(npz_path.name + _SKIN_SIDECAR_SUFFIX)
+    if not p.is_file():
+        raise ValueError(f"{p} missing — re-run Stage 2 (no skin sidecar)")
+    try:
+        m = np.load(p, mmap_mode="r")
+    except Exception:
+        m = np.load(p)
+    if m.dtype != np.uint8 or m.shape != (n_bricks, 64):
+        raise ValueError(
+            f"{p} is not the ({n_bricks}, 64) uint8 bitmask this grid expects — "
+            "re-run Stage 2"
         )
-        best = blocks.argmin(axis=3)
-        keep = np.isfinite(blocks.min(axis=3))
-        bxyz = np.argwhere(keep)
-        off = best[keep]
-        ox, oy, oz = off // (stride * stride), (off // stride) % stride, off % stride
-        cells = np.stack(
-            [bxyz[:, 0] * stride + ox, bxyz[:, 1] * stride + oy, bxyz[:, 2] * stride + oz],
-            axis=1,
-        )
-        centers = (self.origin + (cells + 0.5) * self.pitch).astype(np.float32)
-        return centers, self.clearance[cells[:, 0], cells[:, 1], cells[:, 2]]
+    return m
+
+
+_NPZ_REQUIRED = (
+    "origin", "pitch", "dims", "occ_lin", "occ_lin_glass",
+    "skin_lin", "zone_lin", "cand_pos", "cand_clear", "clearance_m",
+)
 
 
 def load_free_space(path: Path) -> FreeSpace:
-    """Load a `freespace.npz` written by `compute_free_space`. Older layouts
-    (dual-resolution, or single-grid without the baked clearance) are rejected
-    with a re-run error — no compat shims."""
+    """Load a `freespace.npz` (metadata + sparse structures) plus its skin
+    bitmask sidecar (memory-mapped). Older layouts (dense fields, mask
+    sidecars, pre-candidate grids) are rejected with a re-run error — no
+    compat shims."""
+    path = Path(path)
     with np.load(path) as z:
         files = set(z.files)
-        if "empty" not in files or "clearance_m" not in files or "dims" not in files:
+        if any(k not in files for k in _NPZ_REQUIRED):
             raise ValueError(
-                f"{path} is a pre-clearance free-space grid — re-run Stage 2"
+                f"{path} is a pre-candidate free-space grid — re-run Stage 2"
             )
+        origin = z["origin"].astype(np.float64)
+        pitch = float(z["pitch"])
+        dims = z["dims"].astype(np.int64)
         occ_lin = z["occ_lin"].astype(np.int64)
         glass = z["occ_lin_glass"].astype(np.int64)
-        return FreeSpace(
-            origin=z["origin"].astype(np.float64),
-            pitch=float(z["pitch"]),
-            dims=z["dims"].astype(np.int64),
-            occ_lin=occ_lin,
-            # Glass is stored as the disjoint transmissive-only subset, so the
-            # occlusion set is simply "all minus glass" (stays sorted).
-            occ_lin_opaque=np.setdiff1d(occ_lin, glass, assume_unique=True),
-            clearance=z["clearance"].astype(np.float32),
-            empty=z["empty"].astype(bool),
-            clearance_m=float(z["clearance_m"]),
-        )
+        skin_lin = z["skin_lin"].astype(np.int64)
+        zone_lin = z["zone_lin"].astype(np.int64)
+        cand_pos = z["cand_pos"].astype(np.float32)
+        cand_clear = z["cand_clear"].astype(np.float32)
+        clearance_m = float(z["clearance_m"])
+    return FreeSpace(
+        origin=origin,
+        pitch=pitch,
+        dims=dims,
+        occ_lin=occ_lin,
+        # Glass is stored as the disjoint transmissive-only subset, so the
+        # occlusion set is simply "all minus glass" (stays sorted).
+        occ_lin_opaque=np.setdiff1d(occ_lin, glass, assume_unique=True),
+        skin_lin=skin_lin,
+        skin_empty=_load_skin_sidecar(path, int(skin_lin.size)),
+        zone_lin=zone_lin,
+        cand_pos=cand_pos,
+        cand_clear=cand_clear,
+        clearance_m=clearance_m,
+    )
 
 
 def apply_clearance(path: Path, clearance: float) -> dict[str, Any]:
-    """Re-bake the FREE threshold of an existing `freespace.npz` IN PLACE — the
-    'apply' behind the client's clearance slider. No re-voxelization: the fill's
-    empty mask and the clearance field are threshold-independent, so only the
-    `clearance_m` scalar changes (the viz pack stays valid too — its empty
-    quads carry per-cell clearance). Returns a summary patch
-    `{clearance, free_voxels}` for the sidecar."""
+    """Re-bake the candidate clearance filter of an existing grid — the
+    'apply' behind the client's clearance slider. INSTANT: candidates carry
+    their distance-to-surface annotations, so only the `clearance_m` scalar
+    is rewritten and the filtered count reported. Returns a summary patch
+    `{clearance, free_voxels}` (free_voxels = candidates passing) for the
+    sidecar."""
     path = Path(path)
     with np.load(path) as z:
-        if "empty" not in z.files or "clearance_m" not in z.files:
-            raise ValueError(f"{path} is a pre-clearance grid — re-run Stage 2")
+        if any(k not in z.files for k in _NPZ_REQUIRED):
+            raise ValueError(f"{path} is a pre-candidate grid — re-run Stage 2")
         data = {k: z[k] for k in z.files}
     c = float(clearance)
     data["clearance_m"] = np.float64(c)
-    free_count = int(
-        (
-            data["empty"].astype(bool)
-            & (data["clearance"].astype(np.float32) >= c - _CLEARANCE_EPS)
-        ).sum()
+    count = int(
+        (data["cand_clear"].astype(np.float32) >= c - _CLEARANCE_EPS).sum()
     )
     tmp = path.with_suffix(path.suffix + ".tmp.npz")
-    np.savez_compressed(tmp, **data)
+    _savez_fast(tmp, **data)
     tmp.replace(path)
-    return {"clearance": c, "free_voxels": free_count}
+    return {"clearance": c, "free_voxels": count}
 
 
 def placed_object_ids(raw_dir: Path) -> list[str]:
@@ -504,10 +590,77 @@ def _subdivide_edges(
     return done[:, :, :3], done[:, :, 3:]
 
 
+def _piece_batches(
+    tris: np.ndarray, limit: float, attrs: np.ndarray | None = None
+):  # noqa: ANN201 - yields (pieces (P,3,3), piece_attrs (P,3,K) | None)
+    """Stream `_subdivide_edges(tris, limit, attrs)` in BOUNDED batches of
+    ~`_BATCH_PIECES` pieces, so the mesh pass never materializes an object's
+    whole subdivided soup.
+
+    Correctness: the midpoint recursion is per-triangle independent (a split
+    reads only the triangle's own vertices) and its termination test only the
+    current piece's edges — so subdividing any GROUPING of the inputs, and
+    even PRE-SPLITTING an oversized triangle at a coarser limit and resuming,
+    replays the identical recursion tree and emits exactly the pieces of the
+    one-shot call, just grouped. Consumers dedupe through sorted unique keys,
+    so the grouping is invisible in the output: byte-identical for any batch
+    size. Only peak memory changes."""
+    if not len(tris):
+        return
+    limit = max(float(limit), 1e-9)
+
+    def est(t: np.ndarray) -> np.ndarray:
+        """~2× overestimate of each triangle's leaf-piece count ((longest
+        edge / limit)² tracks the recursion's leaf count within a small
+        constant). Sizing only — error moves per-batch memory, never output."""
+        e = np.stack(
+            [t[:, 1] - t[:, 0], t[:, 2] - t[:, 1], t[:, 0] - t[:, 2]], axis=1
+        )
+        longest = np.linalg.norm(e, axis=2).max(axis=1)
+        n = 2.0 * np.ceil(np.maximum(longest, 0.0) / limit) ** 2
+        return np.maximum(n, 1.0).astype(np.int64)
+
+    n_est = est(tris)
+    if int(n_est.sum()) <= _BATCH_PIECES:  # common small-object fast path
+        yield _subdivide_edges(tris, limit, attrs)
+        return
+
+    # A single triangle whose estimate alone exceeds the budget (a huge
+    # ground/wall quad) is pre-split at a coarser limit — the same recursion,
+    # paused (children's edges ≤ limit·√(budget/2) ⇒ each child re-estimates
+    # within the budget) — then its children batch like ordinary inputs.
+    big = n_est > _BATCH_PIECES
+    if big.any():
+        coarse = limit * float(np.sqrt(_BATCH_PIECES / 2.0))
+        bt, ba = _subdivide_edges(
+            tris[big], coarse, attrs[big] if attrs is not None else None
+        )
+        tris = np.concatenate([tris[~big], bt], axis=0)
+        if attrs is not None:
+            attrs = np.concatenate([attrs[~big], ba], axis=0)
+        n_est = est(tris)
+
+    # Contiguous groups whose estimates sum to ≲ the budget (a group may run
+    # one entry past the boundary, so ≤ ~2× worst case — still batch-sized).
+    start = np.cumsum(n_est) - n_est
+    group = start // _BATCH_PIECES
+    for gid in range(int(group[-1]) + 1):
+        m = group == gid
+        if m.any():
+            yield _subdivide_edges(
+                tris[m], limit, attrs[m] if attrs is not None else None
+            )
+
+
 def _tri_cell_overlap(tris: np.ndarray, cells: np.ndarray, pitch: float) -> np.ndarray:
-    """EXACT triangle ↔ cell intersection (separating-axis test), vectorized over
+    """Triangle ↔ cell intersection (separating-axis test), vectorized over
     pairs: `tris` (P,3,3) world vertices vs `cells` (P,3) absolute lattice coords
     of each cell's min corner (a closed cube of edge `pitch`). Returns (P,) bool.
+    Runs in the INPUT dtype — float32 from the mesh pass: the sources store at
+    most float32 (vanilla glTF) or normalized-int16 (quantized sets, ~0.1-1 mm
+    steps), so float32's ≤ tens-of-µm decision fuzz at world scale is orders of
+    magnitude below the geometry's own quantization, and half the memory
+    traffic of the float64 this replaced.
 
     Two convex shapes overlap unless some axis separates them. The cube's three
     face axes are separated already by construction (candidates come from the
@@ -518,7 +671,7 @@ def _tri_cell_overlap(tris: np.ndarray, cells: np.ndarray, pitch: float) -> np.n
     most inside that edge — the Schwarz–Seidel / Akenine-Möller formulation).
     A degenerate projection (normal component 0) passes trivially and simply
     constrains nothing; the other projections + the plane test still decide."""
-    v = tris - cells.astype(np.float64)[:, None, :] * pitch  # cell-local vertices
+    v = tris - cells.astype(tris.dtype)[:, None, :] * tris.dtype.type(pitch)
     n = np.cross(v[:, 1] - v[:, 0], v[:, 2] - v[:, 0])       # (P,3) plane normal
     # Plane vs cube (cube spans [0, pitch]³ in cell-local coords).
     s = np.einsum("pc,pc->p", n, 0.5 * pitch - v[:, 0])      # n · (centre − v0)
@@ -581,17 +734,43 @@ def _voxelize_cells(tris: np.ndarray, pitch: float) -> np.ndarray:
     return np.concatenate(out, axis=0)
 
 
+def _merge_keys(parts: list[np.ndarray]) -> np.ndarray:
+    """Sorted unique union of ALREADY-SORTED unique key arrays (empty-safe).
+    Concatenate + STABLE sort — numpy's timsort detects the pre-sorted runs
+    and effectively k-way MERGES them (~O(N log k)) where `np.unique`'s
+    run-blind introsort pays a full O(N log N) — then a linear dedupe. At
+    swamp-scale cover counts (10⁸ keys) this is the difference between
+    seconds and minutes in the reduce phase."""
+    if not parts:
+        return np.zeros(0, dtype=np.int64)
+    if len(parts) == 1:
+        return parts[0]
+    merged = np.concatenate(parts)
+    merged.sort(kind="stable")
+    keep = np.empty(merged.size, dtype=bool)
+    keep[0] = True
+    np.not_equal(merged[1:], merged[:-1], out=keep[1:])
+    return merged[keep]
+
+
 def _voxelize_surface(tris: np.ndarray, pitch: float) -> np.ndarray:
-    """Absolute lattice coords (K,3) of every cell touched by any triangle.
-    DETERMINISTIC and complete — every cell a triangle overlaps is marked, none
-    are missed — unlike the random point sampling this replaces (which left
-    ~e^-oversample of surface cells unmarked: pinholes for rays / flood fill)."""
-    tris = np.asarray(tris, dtype=np.float64)
+    """Sorted unique absolute-lattice KEYS of every cell touched by any
+    triangle. DETERMINISTIC and complete — every cell a triangle overlaps is
+    marked, none are missed — unlike the random point sampling this replaces
+    (which left ~e^-oversample of surface cells unmarked: pinholes for rays /
+    the flood fill). Pieces stream through the overlap test in `_BATCH_PIECES`
+    groups (each deduped on its own), so peak memory tracks the batch, not the
+    object; the merged key set is identical for any batch size. float32
+    throughout — matching the sources' own precision ceiling (float32 or
+    normalized-int16 positions; see `_tri_cell_overlap`)."""
+    tris = np.asarray(tris, dtype=np.float32)
     tris = tris[_valid_tri_mask(tris)]
-    if not len(tris):
-        return np.zeros((0, 3), dtype=np.int64)
-    tris, _ = _subdivide_edges(tris, _SUBDIV_EDGE_CELLS * pitch)
-    return _voxelize_cells(tris, pitch)
+    parts: list[np.ndarray] = []
+    for pieces, _ in _piece_batches(tris, _SUBDIV_EDGE_CELLS * pitch):
+        cells = _voxelize_cells(pieces, pitch)
+        if len(cells):
+            parts.append(np.unique(_abs_encode(cells)))
+    return _merge_keys(parts)
 
 
 def _geom_alpha_sampler(geom: trimesh.Trimesh):  # noqa: ANN202 - (sampler|None, cutoff)
@@ -648,35 +827,40 @@ def _geom_alpha_sampler(geom: trimesh.Trimesh):  # noqa: ANN202 - (sampler|None,
 def _voxelize_geom(
     geom: trimesh.Trimesh, pitch: float
 ) -> tuple[np.ndarray, np.ndarray]:
-    """`(opaque_cells, glass_cells)` — each (K,3) absolute lattice coords — for
-    one geometry. OPAQUE materials take the pure-geometry path (no texture
-    reads). BLEND/MASK triangles are subdivided to ~cell-sized pieces WITH their
-    UVs, each piece classified by base-color alpha at its centroid, and the two
-    groups voxelized separately — so one window mesh yields occluding frame
-    cells AND transmissive pane cells at cell granularity. A cell containing
-    both classes is resolved to opaque by the caller (opaque wins)."""
-    tris = np.asarray(geom.triangles, dtype=np.float64)
-    empty = np.zeros((0, 3), dtype=np.int64)
+    """`(opaque_keys, glass_keys)` — each sorted unique absolute-lattice int64
+    keys — for one geometry. OPAQUE materials take the pure-geometry path (no
+    texture reads). BLEND/MASK triangles are subdivided to ~cell-sized pieces
+    WITH their UVs, each piece classified by base-color alpha at its centroid,
+    and the two groups voxelized separately — so one window mesh yields
+    occluding frame cells AND transmissive pane cells at cell granularity. A
+    cell containing both classes is resolved to opaque by the caller (opaque
+    wins). Pieces stream in `_BATCH_PIECES` groups (see `_piece_batches`), so
+    a big mesh never holds its whole subdivided soup in RAM. float32
+    throughout — the sources' own precision ceiling (`_tri_cell_overlap`);
+    UVs are stored float32 / normalized-uint16 to begin with."""
+    tris = np.asarray(geom.triangles, dtype=np.float32)
+    nothing = np.zeros(0, dtype=np.int64)
     sampler, cutoff = _geom_alpha_sampler(geom)
     if sampler is None:
-        return _voxelize_surface(tris, pitch), empty
+        return _voxelize_surface(tris, pitch), nothing
 
     uv = getattr(getattr(geom, "visual", None), "uv", None)
     if uv is not None and len(uv) == len(geom.vertices):
-        uv3 = np.asarray(uv, dtype=np.float64)[np.asarray(geom.faces)]  # (T,3,2)
+        uv3 = np.asarray(uv, dtype=np.float32)[np.asarray(geom.faces)]  # (T,3,2)
     else:
-        uv3 = np.zeros((len(tris), 3, 2), dtype=np.float64)
+        uv3 = np.zeros((len(tris), 3, 2), dtype=np.float32)
     keep = _valid_tri_mask(tris)
     tris, uv3 = tris[keep], uv3[keep]
-    if not len(tris):
-        return empty, empty
-    tris, uv3 = _subdivide_edges(tris, _SUBDIV_EDGE_CELLS * pitch, uv3)
-    alpha = sampler(uv3.mean(axis=1))
-    occluding = alpha >= cutoff
-    return (
-        _voxelize_cells(tris[occluding], pitch),
-        _voxelize_cells(tris[~occluding], pitch),
-    )
+    op_parts: list[np.ndarray] = []
+    gl_parts: list[np.ndarray] = []
+    for pieces, uvp in _piece_batches(tris, _SUBDIV_EDGE_CELLS * pitch, uv3):
+        alpha = sampler(uvp.mean(axis=1))
+        occluding = alpha >= cutoff
+        for mask, parts in ((occluding, op_parts), (~occluding, gl_parts)):
+            cells = _voxelize_cells(pieces[mask], pitch)
+            if len(cells):
+                parts.append(np.unique(_abs_encode(cells)))
+    return _merge_keys(op_parts), _merge_keys(gl_parts)
 
 
 def _grid_dims(
@@ -716,29 +900,17 @@ def _shell_slabs(
     return slabs
 
 
-# --- streamed grid passes ------------------------------------------------------
-# The dense fields are never held whole: the grid is processed in X-SLABS. x is
-# the array's outermost axis, so a slab [x0, x1) is one contiguous range of
-# linear indices — contiguous in memory, on disk, and (because `occ_lin` is
-# sorted) one contiguous SEGMENT of the sparse cover keys, so any slab's dense
-# occupancy is rebuilt on demand and no full occupancy array exists at all.
+# --- the two-tier band fill ------------------------------------------------
+# Fine resolution exists only inside SKIN bricks (cover bricks + their 1-ring);
+# everything else within the coverage band is a single all-air BRICK node.
+# The brick grid itself (volume / 8³) is always small enough to hold dense, so
+# brick-level classification, distance and connectivity are single scipy calls.
 
-
-def _slab_planes(ny: int, nz: int) -> int:
-    """X-planes per slab so a slab's working set (~16 B/cell across labels,
-    masks and temps) stays near `_SLAB_TARGET_BYTES`. A resource knob only —
-    every streamed pass yields identical output for any slab partition."""
-    return max(1, int(_SLAB_TARGET_BYTES // max(1, ny * nz * 16)))
-
-
-def _occ_slab(occ_lin: np.ndarray, x0: int, x1: int, ny: int, nz: int) -> np.ndarray:
-    """Dense occupancy of x-planes [x0, x1), rebuilt from the sorted sparse
-    cover keys (binary search bounds one contiguous key segment per slab)."""
-    plane = ny * nz
-    lo, hi = np.searchsorted(occ_lin, [x0 * plane, x1 * plane])
-    slab = np.zeros((x1 - x0) * plane, dtype=bool)
-    slab[occ_lin[lo:hi] - x0 * plane] = True
-    return slab.reshape(x1 - x0, ny, nz)
+_STRUCT6 = ndimage.generate_binary_structure(3, 1)
+# Labels a BATCH of bricks in ONE C call: 6-connectivity inside each brick,
+# no connectivity across the batch axis.
+_STRUCT6_BATCH = np.zeros((3, 3, 3, 3), dtype=bool)
+_STRUCT6_BATCH[1] = _STRUCT6
 
 
 def _covered_slab(
@@ -756,154 +928,370 @@ def _covered_slab(
     return slab
 
 
-def _fill_streamed(
+def _layer_bricks(
+    occ_lin: np.ndarray,
+    bx: int,
+    dims: np.ndarray,
+    skin_plane: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """One brick x-layer's fine occupancy: `(slot, coords, occ4)` where `slot`
+    is the (nby, nbz) int32 plane mapping brick (by,bz) → batch index (−1
+    outside the skin), `coords` the (S,2) raster-ordered (by, bz) of the
+    layer's skin bricks, and `occ4` the (S,8,8,8) bool occupancy — cover cells
+    scattered from the x-contiguous slice of the sorted keys, with the
+    out-of-grid padding of partial edge bricks marked OCCUPIED so it can never
+    read as air. Deterministic: identical for both fill sweeps."""
+    nx, ny, nz = (int(v) for v in dims)
+    plane = ny * nz
+    coords = np.argwhere(skin_plane)  # (S,2) raster (by, bz)
+    slot = np.full(skin_plane.shape, -1, dtype=np.int32)
+    slot[coords[:, 0], coords[:, 1]] = np.arange(len(coords), dtype=np.int32)
+    occ4 = np.zeros((len(coords), _BRICK, _BRICK, _BRICK), dtype=bool)
+    x0, x1 = bx * _BRICK, min(bx * _BRICK + _BRICK, nx)
+    lo, hi = np.searchsorted(occ_lin, [x0 * plane, x1 * plane])
+    seg = occ_lin[lo:hi]
+    if seg.size:
+        x = seg // plane
+        rem = seg % plane
+        y, z = rem // nz, rem % nz
+        s = slot[y >> 3, z >> 3]  # cover bricks are always skin → s ≥ 0
+        occ4[s, (x - x0), y & 7, z & 7] = True
+    # Solid-pad the grid's ragged edges (partial bricks) so padding never
+    # counts as air in labeling, sizes, or the packed bitmasks.
+    if x1 - x0 < _BRICK:
+        occ4[:, x1 - x0 :, :, :] = True
+    ye, ze = ny - (ny >> 3 << 3), nz - (nz >> 3 << 3)
+    if ye:
+        occ4[slot[ny >> 3, :][slot[ny >> 3, :] >= 0], :, ye:, :] = True
+    if ze:
+        occ4[slot[:, nz >> 3][slot[:, nz >> 3] >= 0], :, :, ze:] = True
+    return slot, coords, occ4
+
+
+def _face_pairs(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+    """(P,2) unique positive label pairs from two matching face planes."""
+    both = (a > 0) & (b > 0)
+    if not both.any():
+        return np.zeros((0, 2), dtype=np.int64)
+    return np.unique(np.stack([a[both], b[both]], axis=1), axis=0)
+
+
+def _fill_two_tier(
     occ_lin: np.ndarray,
     dims: np.ndarray,
     boxes: list[tuple[str, np.ndarray, np.ndarray]],
-    empty_path: Path,
+    coverage_bricks: float,
     tick: Callable[[], None] | None = None,
-) -> tuple[int, dict[str, Any]]:
-    """EMPTY mask via the two-phase fill (module docstring), streamed: classic
-    two-pass connected-component labeling over x-slabs. Sweep 1 labels each
-    slab independently (6-connectivity, so slabs couple only through the one
-    shared face plane), records seam label pairs, per-component sizes, and the
-    margin/ring seed bookkeeping; a union-find merge then yields the global
-    components, on which phase 1 + the nested-object rescue run UNCHANGED
-    (they only ever consumed component-level tables). Sweep 2 relabels each
-    slab (deterministic) and writes the final mask straight into the
-    uncompressed `.npy` at `empty_path` — the multi-GB label array of the
-    whole-grid version never exists.
+) -> dict[str, Any]:
+    """The band-limited two-phase fill (module docstring), two-tier:
 
-    Provisional ids are `slab base + scipy local label`; scipy numbers labels
-    in first-encounter raster order (and slabs partition raster order), so the
-    MIN provisional id of a merged component ranks components exactly as a
-    whole-grid scan would — final ids replicate the unstreamed numbering, and
-    with it the rescue's lowest-label tie-break, for any slab partition.
-    Returns (count of cells opened by the rescue, fill stats)."""
+    Sweep 1 labels each SKIN brick's air at fine resolution (one batched
+    scipy call per brick x-layer; provisional ids = layer base + local label,
+    raster-deterministic), records brick-face stitching pairs (fine↔fine
+    across skin-brick faces, fine↔zone where a face borders a coarse-zone
+    brick), per-component sizes, and the seed/ring bookkeeping — per-object
+    AABB shell rings with the cross-object exclusion, exactly the classic
+    phase-1 rules, evaluated per tier. Zone bricks (cover-free, within the
+    coverage band) are labeled in one dense brick-grid scipy call; their
+    components join the graph through the stitching pairs. Restricted to the
+    explored band the components equal a whole-grid fine fill's (module
+    docstring). Global components come from one sparse connected-components
+    call, renumbered by minimum provisional id (first-encounter raster order);
+    phase 2 (nested rescue) then runs UNCHANGED on the component tables.
+    Sweep 2 replays the layer labeling and packs the per-brick EMPTY / AIR
+    bitmasks.
+
+    Returns everything downstream steps consume: the sorted skin-brick ids +
+    their bitmasks, reached / garbage zone-brick ids, the brick-level distance
+    field (zone candidate annotations), counts and fill stats."""
     nx, ny, nz = (int(v) for v in dims)
-    step = _slab_planes(ny, nz)
-    starts = list(range(0, nx, step))
-    struct = ndimage.generate_binary_structure(3, 1)
+    nbx = (nx + _BRICK - 1) // _BRICK
+    nby = (ny + _BRICK - 1) // _BRICK
+    nbz = (nz + _BRICK - 1) // _BRICK
 
-    bases: list[int] = [0] * len(starts)  # provisional-id base per slab
-    n_prov = 0
-    size_parts: list[np.ndarray] = []     # per-slab component cell counts
-    pairs: list[np.ndarray] = []          # (P,2) provisional ids touching a seam
-    seed_parts: list[np.ndarray] = []     # provisional ids seeded (margin/rings)
-    ring_prov: list[list[np.ndarray]] = [[] for _ in boxes]
-    prev_plane: np.ndarray | None = None  # previous slab's last plane, prov ids
+    # --- brick classification (dense brick grids — volume/512, always small) --
+    plane = ny * nz
+    brick_occ = np.zeros((nbx, nby, nbz), dtype=bool)
+    for bx in range(nbx):
+        x0, x1 = bx * _BRICK, min(bx * _BRICK + _BRICK, nx)
+        lo, hi = np.searchsorted(occ_lin, [x0 * plane, x1 * plane])
+        seg = occ_lin[lo:hi]
+        if seg.size:
+            rem = seg % plane
+            brick_occ[bx, (rem // nz) >> 3, (rem % nz) >> 3] = True
+    brick_skin = ndimage.binary_dilation(brick_occ, structure=np.ones((3, 3, 3), bool))
+    # Distance (brick units) to the nearest cover brick: the band mask + the
+    # coarse candidate clearance annotation.
+    brick_dist = ndimage.distance_transform_edt(~brick_occ)
+    zone = ~brick_skin & (brick_dist <= coverage_bricks)
+    zone_lbl, n_zone = ndimage.label(zone, _STRUCT6)
 
-    for si, x0 in enumerate(starts):
-        x1 = min(x0 + step, nx)
-        air = _occ_slab(occ_lin, x0, x1, ny, nz)
-        np.logical_not(air, out=air)
-        labels, n_local = ndimage.label(air, struct)
-        del air
-        base = bases[si] = n_prov
-        n_prov += int(n_local)
-        size_parts.append(np.bincount(labels.ravel(), minlength=n_local + 1)[1:])
+    # Exact real-cell count per brick (edge bricks are partial).
+    def _spans(n: int, nb: int) -> np.ndarray:
+        s = np.full(nb, _BRICK, dtype=np.int64)
+        if n & 7:
+            s[-1] = n & 7
+        return s
 
-        def prov_of(lab: np.ndarray) -> np.ndarray:
-            u = np.unique(lab)
-            return u[u > 0].astype(np.int64) + base
+    sx, sy, sz = _spans(nx, nbx), _spans(ny, nby), _spans(nz, nbz)
+    brick_cells = sx[:, None, None] * sy[None, :, None] * sz[None, None, :]
 
-        # Seam with the previous slab: 6-connectivity couples only same-(y,z)
-        # cells of the two touching planes.
-        first = labels[0].astype(np.int64)
-        first[first > 0] += base
-        if prev_plane is not None:
-            both = (prev_plane > 0) & (first > 0)
-            if both.any():
-                pairs.append(
-                    np.unique(np.stack([prev_plane[both], first[both]], axis=1), axis=0)
-                )
-        prev_plane = labels[-1].astype(np.int64)
-        prev_plane[prev_plane > 0] += base
+    # --- sweep 1: fine labels per skin brick + stitching + seeds/rings --------
+    bases: list[int] = [0] * nbx      # provisional-id base per brick layer
+    n_fine = 0
+    size_parts: list[np.ndarray] = []
+    ff_pairs: list[np.ndarray] = []   # fine↔fine provisional pairs
+    fz_pairs: list[np.ndarray] = []   # (fine prov, zone comp) pairs
+    seed_fine: list[np.ndarray] = []  # seeded fine provisional ids
+    seed_zone: list[np.ndarray] = []  # seeded zone comp ids
+    ring_fine: list[list[np.ndarray]] = [[] for _ in boxes]
+    ring_zone: list[list[np.ndarray]] = [[] for _ in boxes]
+    prev_face: np.ndarray | None = None  # (nby,nbz,8,8) prov ids of +x faces
+    # Per-object augmented-box x-range, to skip layers cheaply.
+    box_x = [(int(v[1][0]) - 1, int(v[2][0]) + 1) for v in boxes]
+    # Stitching pairs dominate the fill's memory on dense-foliage scenes
+    # (hundreds of millions of label adjacencies): store them at the smallest
+    # dtype the node-id ceiling permits (int32 covers 512 cells per skin brick
+    # + every zone comp on any realistic grid) and dedupe once per layer.
+    cap_nodes = 512 * int(brick_skin.sum()) + n_zone + 2
+    pair_dtype = np.int32 if cap_nodes < 2**31 - 1 else np.int64
 
-        # Margin seeds: the grid's boundary shell lies beyond the scene AABB +
-        # margin (see `_grid_dims`), so its air cells are ambient by construction.
-        faces = [labels[:, 0, :], labels[:, -1, :], labels[:, :, 0], labels[:, :, -1]]
-        if x0 == 0:
-            faces.append(labels[0])
-        if x1 == nx:
-            faces.append(labels[-1])
-        seed_parts.extend(prov_of(f) for f in faces)
+    def _fold_pairs(dst: list[np.ndarray], parts: list[np.ndarray]) -> None:
+        """Concat + dedupe one layer's pair blocks, store at `pair_dtype`."""
+        if parts:
+            dst.append(
+                np.unique(np.concatenate(parts), axis=0).astype(pair_dtype)
+            )
 
-        # Phase-1 rings: this slab's slice of every object's shell ring — ALL
-        # air ring components (rescue trigger) + the uncovered ones (seeds).
-        covered = _covered_slab(boxes, x0, x1, ny, nz)
-        for bi, (_nid, vlo, vhi) in enumerate(boxes):
-            for sl in _shell_slabs(vlo, vhi, dims):
-                a, b = max(sl[0].start, x0), min(sl[0].stop, x1)
-                if a >= b:
+    for bx in range(nbx):
+        x0, x1 = bx * _BRICK, min(bx * _BRICK + _BRICK, nx)
+        skin_plane = brick_skin[bx]
+        have_skin = bool(skin_plane.any())
+        labels4 = None
+        slot = np.full((nby, nbz), -1, dtype=np.int32)
+        base = bases[bx] = n_fine
+        if have_skin:
+            slot, coords, occ4 = _layer_bricks(occ_lin, bx, dims, skin_plane)
+            air4 = ~occ4
+            labels4, n_local = ndimage.label(air4, _STRUCT6_BATCH)
+            n_fine += int(n_local)
+            size_parts.append(
+                np.bincount(labels4.ravel(), minlength=n_local + 1)[1:]
+            )
+            lxe = x1 - x0 - 1  # last REAL local x plane of this layer
+            layer_ff: list[np.ndarray] = []
+            layer_fz: list[np.ndarray] = []
+
+            # fine↔fine, within-layer (+y / +z brick faces).
+            for axis, (dy, dz) in ((1, (1, 0)), (2, (0, 1))):
+                sa = slot[: nby - dy, : nbz - dz]
+                sb = slot[dy:, dz:]
+                m = (sa >= 0) & (sb >= 0)
+                if not m.any():
                     continue
-                lsl = (slice(a - x0, b - x0), sl[1], sl[2])
-                lab = labels[lsl]
-                airm = lab > 0
-                if not airm.any():
+                ia, ib = sa[m], sb[m]
+                if axis == 1:
+                    fa, fb = labels4[ia, :, 7, :], labels4[ib, :, 0, :]
+                else:
+                    fa, fb = labels4[ia, :, :, 7], labels4[ib, :, :, 0]
+                p = _face_pairs(fa.astype(np.int64), fb.astype(np.int64))
+                if len(p):
+                    layer_ff.append(p + base)
+
+            # fine↔fine, cross-layer (−x faces vs the previous layer's +x).
+            cur_first = np.zeros((nby, nbz, _BRICK, _BRICK), dtype=np.int64)
+            has = slot >= 0
+            cur_first[has] = labels4[slot[has], 0].astype(np.int64)
+            cur_first[cur_first > 0] += base
+            if prev_face is not None:
+                p = _face_pairs(prev_face.reshape(-1), cur_first.reshape(-1))
+                if len(p):
+                    layer_ff.append(p)
+            nxt_face = np.zeros((nby, nbz, _BRICK, _BRICK), dtype=np.int64)
+            if lxe == _BRICK - 1:  # a partial layer's +x side is grid edge
+                nxt_face[has] = labels4[slot[has], _BRICK - 1].astype(np.int64)
+                nxt_face[nxt_face > 0] += base
+            prev_face = nxt_face
+
+            # fine↔zone: any skin-brick face bordering a zone brick connects
+            # its air cells to that brick's coarse component. Fully vectorized:
+            # the selected bricks' face labels pair with their zone comp
+            # broadcast per cell, deduped in one pass — no per-brick loop.
+            for dxyz, face in (
+                ((-1, 0, 0), lambda s: labels4[s, 0]),
+                ((1, 0, 0), lambda s: labels4[s, lxe]),
+                ((0, -1, 0), lambda s: labels4[s, :, 0]),
+                ((0, 1, 0), lambda s: labels4[s, :, 7]),
+                ((0, 0, -1), lambda s: labels4[s, :, :, 0]),
+                ((0, 0, 1), lambda s: labels4[s, :, :, 7]),
+            ):
+                dx, dy, dz = dxyz
+                nbx_i = bx + dx
+                if nbx_i < 0 or nbx_i >= nbx:
                     continue
-                ring_prov[bi].append(np.unique(lab[airm]).astype(np.int64) + base)
-                seed = airm & ~covered[lsl]
-                if seed.any():
-                    seed_parts.append(np.unique(lab[seed]).astype(np.int64) + base)
-        del labels, covered
+                by = coords[:, 0] + dy
+                bz = coords[:, 1] + dz
+                ok = (by >= 0) & (by < nby) & (bz >= 0) & (bz < nbz)
+                if not ok.any():
+                    continue
+                zc = np.zeros(len(coords), dtype=np.int64)
+                zc[ok] = zone_lbl[nbx_i, by[ok], bz[ok]]
+                sel = np.nonzero(zc > 0)[0]
+                if not sel.size:
+                    continue
+                fl = face(sel).reshape(len(sel), -1).astype(np.int64)
+                zz = np.broadcast_to(zc[sel][:, None], fl.shape)
+                m = fl > 0
+                if m.any():
+                    layer_fz.append(
+                        np.unique(
+                            np.stack([fl[m] + base, zz[m]], axis=1), axis=0
+                        )
+                    )
+
+            # Boundary seeds (fine): air on the six grid faces is ambient.
+            def _seed(lab: np.ndarray) -> None:
+                u = np.unique(lab)
+                u = u[u > 0]
+                if u.size:
+                    seed_fine.append(u.astype(np.int64) + base)
+
+            if bx == 0:
+                _seed(labels4[:, 0])
+            if x1 == nx:
+                _seed(labels4[:, lxe])
+            for edge_b, edge_l, axis in (
+                (0, 0, 1), ((ny - 1) >> 3, (ny - 1) & 7, 1),
+                (0, 0, 2), ((nz - 1) >> 3, (nz - 1) & 7, 2),
+            ):
+                s = slot[edge_b, :] if axis == 1 else slot[:, edge_b]
+                s = s[s >= 0]
+                if s.size:
+                    _seed(labels4[s, :, edge_l, :] if axis == 1 else labels4[s, :, :, edge_l])
+            _fold_pairs(ff_pairs, layer_ff)
+            _fold_pairs(fz_pairs, layer_fz)
+        else:
+            prev_face = np.zeros((nby, nbz, _BRICK, _BRICK), dtype=np.int64)
+
+        # Phase-1 rings: this layer's slice of every object's shell ring — ALL
+        # air ring nodes (rescue trigger) + the uncovered ones (seeds), each
+        # resolved per tier (fine label inside skin bricks, coarse component
+        # inside zone bricks, nothing beyond the band).
+        touching = [
+            bi for bi, (lo_x, hi_x) in enumerate(box_x)
+            if lo_x <= x1 - 1 and hi_x >= x0
+        ]
+        if touching:
+            covered = _covered_slab(boxes, x0, x1, ny, nz)
+            for bi in touching:
+                _nid, vlo, vhi = boxes[bi]
+                for sl in _shell_slabs(vlo, vhi, dims):
+                    a, b = max(sl[0].start, x0), min(sl[0].stop, x1)
+                    if a >= b:
+                        continue
+                    X = np.arange(a, b, dtype=np.int64)[:, None, None]
+                    Y = np.arange(sl[1].start, sl[1].stop, dtype=np.int64)[None, :, None]
+                    Z = np.arange(sl[2].start, sl[2].stop, dtype=np.int64)[None, None, :]
+                    s = slot[Y >> 3, Z >> 3]
+                    fine_lab = np.zeros(np.broadcast_shapes(X.shape, Y.shape, Z.shape), np.int64)
+                    if labels4 is not None:
+                        m = np.broadcast_to(s >= 0, fine_lab.shape)
+                        lab = labels4[
+                            np.broadcast_to(np.maximum(s, 0), fine_lab.shape),
+                            np.broadcast_to(X & 7, fine_lab.shape),
+                            np.broadcast_to(Y & 7, fine_lab.shape),
+                            np.broadcast_to(Z & 7, fine_lab.shape),
+                        ]
+                        fine_lab = np.where(m, lab, 0).astype(np.int64)
+                    zc = np.broadcast_to(zone_lbl[bx, Y >> 3, Z >> 3], fine_lab.shape)
+                    cov = covered[X - x0, Y, Z]
+                    fa = fine_lab > 0
+                    za = (zc > 0) & ~np.broadcast_to(s >= 0, fine_lab.shape)
+                    if fa.any():
+                        ring_fine[bi].append(np.unique(fine_lab[fa]) + base)
+                        sm = fa & ~cov
+                        if sm.any():
+                            seed_fine.append(np.unique(fine_lab[sm]) + base)
+                    if za.any():
+                        ring_zone[bi].append(np.unique(zc[za]))
+                        sm = za & ~cov
+                        if sm.any():
+                            seed_zone.append(np.unique(zc[sm]))
         if tick is not None:
             tick()
 
-    # Merge the per-slab labelings: union-find keeping the SMALLEST provisional
-    # id as each root (= global first-encounter order, see docstring).
-    parent = np.arange(n_prov + 1, dtype=np.int64)
+    # Zone boundary seeds: zone bricks on the grid's outer brick shell hold
+    # boundary cells — ambient by construction (the margin).
+    for face in (
+        zone_lbl[0], zone_lbl[-1], zone_lbl[:, 0], zone_lbl[:, -1],
+        zone_lbl[:, :, 0], zone_lbl[:, :, -1],
+    ):
+        u = np.unique(face)
+        u = u[u > 0]
+        if u.size:
+            seed_zone.append(u.astype(np.int64))
 
-    def find(i: int) -> int:
-        root = i
-        while parent[root] != root:
-            root = int(parent[root])
-        while parent[i] != root:  # path compression
-            parent[i], i = root, int(parent[i])
-        return root
+    # --- global components: one sparse connected-components call ------------
+    # Node space: fine provisional ids 1..n_fine, zone comps n_fine+1..+n_zone.
+    n_nodes = n_fine + n_zone + 1
+    edges = ff_pairs + [
+        np.stack([p[:, 0], p[:, 1] + n_fine], axis=1) for p in fz_pairs
+    ]
+    if edges:
+        e = np.concatenate(edges, axis=0)
+    else:
+        e = np.zeros((0, 2), dtype=np.int64)
+    from scipy.sparse import coo_matrix
+    from scipy.sparse.csgraph import connected_components
 
-    for pr in pairs:
-        for a, b in pr:
-            ra, rb = find(int(a)), find(int(b))
-            if ra != rb:
-                if ra > rb:
-                    ra, rb = rb, ra
-                parent[rb] = ra
-    ids = np.arange(1, n_prov + 1, dtype=np.int64)
-    roots = parent[ids]
-    while True:  # vectorized pointer jumping to full resolution
-        nxt = parent[roots]
-        if (nxt == roots).all():
-            break
-        roots = nxt
-
-    uniq_roots, root_rank = np.unique(roots, return_inverse=True)
-    n_comp = int(uniq_roots.size)
-    # Final ids 1..K in ascending root order = first-encounter raster order.
-    prov_to_final = np.zeros(n_prov + 1, dtype=np.int64)
-    prov_to_final[1:] = root_rank + 1
-    sizes = np.zeros(n_comp + 1, dtype=np.int64)
-    np.add.at(
-        sizes,
-        prov_to_final[1:],
-        np.concatenate(size_parts) if size_parts else np.zeros(0, np.int64),
+    g = coo_matrix(
+        (np.ones(len(e), dtype=np.int8), (e[:, 0], e[:, 1])),
+        shape=(n_nodes, n_nodes),
     )
+    _n_raw, comp_raw = connected_components(g, directed=False)
+    # Renumber components 1..K by their minimum member node id — global
+    # first-encounter raster order, replicating the classic fill's numbering
+    # semantics (and with it the rescue's lowest-label tie-break).
+    minid = np.full(_n_raw, np.iinfo(np.int64).max, dtype=np.int64)
+    np.minimum.at(minid, comp_raw, np.arange(n_nodes, dtype=np.int64))
+    live = np.zeros(_n_raw, dtype=bool)
+    live[comp_raw[1:]] = True  # node 0 is a dummy
+    order = np.argsort(np.where(live, minid, np.iinfo(np.int64).max), kind="stable")
+    final_of_raw = np.zeros(_n_raw, dtype=np.int64)
+    n_comp = int(live.sum())
+    final_of_raw[order[:n_comp]] = np.arange(1, n_comp + 1)
+    node_final = final_of_raw[comp_raw]  # node id → final comp (1..K)
+    node_final[0] = 0
+
+    sizes = np.zeros(n_comp + 1, dtype=np.int64)
+    if n_fine:
+        np.add.at(
+            sizes, node_final[1 : n_fine + 1], np.concatenate(size_parts)
+        )
+    if n_zone:
+        zone_sizes = np.bincount(
+            zone_lbl[zone].ravel(), weights=brick_cells[zone].ravel(),
+            minlength=n_zone + 1,
+        )[1:].astype(np.int64)
+        np.add.at(sizes, node_final[n_fine + 1 :], zone_sizes)
 
     reached = np.zeros(n_comp + 1, dtype=bool)
-    for part in seed_parts:
-        reached[prov_to_final[part]] = True
+    for part in seed_fine:
+        reached[node_final[part]] = True
+    for part in seed_zone:
+        reached[node_final[part + n_fine]] = True
     seeded_components = int(reached.sum())
-    ring_labels = [
-        np.unique(prov_to_final[np.concatenate(rp)]) if rp else np.zeros(0, np.int64)
-        for rp in ring_prov
-    ]
+    ring_labels = []
+    for bi in range(len(boxes)):
+        nodes = [node_final[p] for p in ring_fine[bi]]
+        nodes += [node_final[p + n_fine] for p in ring_zone[bi]]
+        ring_labels.append(
+            np.unique(np.concatenate(nodes)) if nodes else np.zeros(0, np.int64)
+        )
 
-    # Phase 2 — nested rescue, to fixpoint. Trigger: an object with ZERO reached
-    # ring cells is sealed away from all discovered free space (fully nested).
-    # Admit ONE cavity per round — the component adjacent to the most pending
-    # objects (then the largest, then the lowest label) — and re-evaluate: the
-    # outside-in order that opens a hull's room air before a clipping cushion's
-    # sofa hollow ever gets considered (the cushion drops out of pending first).
+    # Phase 2 — nested rescue, to fixpoint (UNCHANGED semantics: an object with
+    # ZERO reached ring cells is sealed; admit ONE cavity per round — most
+    # pending-adjacent, then largest, then lowest label — and re-evaluate).
     pending = [i for i in range(len(boxes)) if ring_labels[i].size]
     dead = len(boxes) - len(pending)  # ring fully occupied — zero-gap embedded
     sealed_ids: set[str] = set()
@@ -918,33 +1306,71 @@ def _fill_streamed(
         for i in pending:
             rl = ring_labels[i]
             adj[rl[~reached[rl]]] += 1
-        order = np.lexsort(
-            (-np.arange(n_comp + 1, dtype=np.int64), sizes, adj)
-        )
+        order = np.lexsort((-np.arange(n_comp + 1, dtype=np.int64), sizes, adj))
         reached[int(order[-1])] = True
         rescued_comps.append(int(order[-1]))
         rescue_rounds += 1
 
-    # Sweep 2: relabel each slab (scipy is deterministic, so local labels and
-    # bases replay exactly) and stream the final mask to disk.
-    mm = np.lib.format.open_memmap(
-        empty_path, mode="w+", dtype=bool, shape=(nx, ny, nz)
-    )
-    for si, x0 in enumerate(starts):
-        x1 = min(x0 + step, nx)
-        air = _occ_slab(occ_lin, x0, x1, ny, nz)
-        np.logical_not(air, out=air)
-        labels, n_local = ndimage.label(air, struct)
-        del air
-        base = bases[si]
+    # --- sweep 2: replay labels, pack the per-brick bitmasks ----------------
+    skin_lin_parts: list[np.ndarray] = []
+    air_parts: list[np.ndarray] = []
+    empty_parts: list[np.ndarray] = []
+    first_empty_parts: list[np.ndarray] = []
+    empty_fine = 0
+    air_fine = 0
+    for bx in range(nbx):
+        skin_plane = brick_skin[bx]
+        if not skin_plane.any():
+            if tick is not None:
+                tick()
+            continue
+        slot, coords, occ4 = _layer_bricks(occ_lin, bx, dims, skin_plane)
+        air4 = ~occ4
+        labels4, n_local = ndimage.label(air4, _STRUCT6_BATCH)
+        base = bases[bx]
         lut = np.zeros(n_local + 1, dtype=bool)
-        lut[1:] = reached[prov_to_final[base + 1 : base + n_local + 1]]
-        mm[x0:x1] = lut[labels]
-        del labels
+        lut[1:] = reached[node_final[base + 1 : base + n_local + 1]]
+        empty4 = lut[labels4]
+        s_l = len(coords)
+        flat_e = empty4.reshape(s_l, 512)
+        flat_a = air4.reshape(s_l, 512)
+        empty_parts.append(np.packbits(flat_e, axis=1, bitorder="little"))
+        air_parts.append(np.packbits(flat_a, axis=1, bitorder="little"))
+        first = np.argmax(flat_e, axis=1).astype(np.int16)
+        first[~flat_e.any(axis=1)] = -1
+        first_empty_parts.append(first)
+        empty_fine += int(flat_e.sum())
+        air_fine += int(flat_a.sum())
+        skin_lin_parts.append(
+            (np.int64(bx) * nby + coords[:, 0]) * nbz + coords[:, 1]
+        )
         if tick is not None:
             tick()
-    mm.flush()
-    del mm
+
+    nothing64 = np.zeros(0, dtype=np.int64)
+    skin_lin = (
+        np.concatenate(skin_lin_parts) if skin_lin_parts else nothing64
+    )
+    skin_air = (
+        np.concatenate(air_parts) if air_parts else np.zeros((0, 64), np.uint8)
+    )
+    skin_empty = (
+        np.concatenate(empty_parts) if empty_parts else np.zeros((0, 64), np.uint8)
+    )
+    skin_first_empty = (
+        np.concatenate(first_empty_parts) if first_empty_parts
+        else np.zeros(0, np.int16)
+    )
+
+    # Zone brick partitions by reached-ness (their comps are labeled air).
+    zone_ids_grid = np.flatnonzero(zone)  # raster brick linear ids
+    zone_comp = node_final[zone_lbl[zone].ravel() + n_fine]
+    zone_reached_m = reached[zone_comp]
+    zone_reached = zone_ids_grid[zone_reached_m]
+    zone_garbage = zone_ids_grid[~zone_reached_m]
+    zone_cells_all = brick_cells[zone].ravel()
+    empty_zone = int(zone_cells_all[zone_reached_m].sum())
+    garbage_zone = int(zone_cells_all[~zone_reached_m].sum())
 
     rescued_cells = (
         int(sizes[np.asarray(rescued_comps, dtype=np.int64)].sum())
@@ -960,7 +1386,21 @@ def _fill_streamed(
         "objects_sealed": sorted(sealed_ids),
         "objects_embedded": dead,
     }
-    return rescued_cells, stats
+    return {
+        "skin_lin": skin_lin,
+        "skin_air": skin_air,
+        "skin_empty": skin_empty,
+        "skin_first_empty": skin_first_empty,
+        "zone_reached": zone_reached,
+        "zone_garbage": zone_garbage,
+        "brick_dist": brick_dist,
+        "brick_skin": brick_skin,
+        "empty_voxels": empty_fine + empty_zone,
+        "garbage_voxels": (air_fine - empty_fine) + garbage_zone,
+        "rescued_cells": rescued_cells,
+        "stats": stats,
+        "n_layers": nbx,
+    }
 
 
 def _voxelize_object_task(
@@ -988,17 +1428,15 @@ def _voxelize_object_task(
             b = np.asarray(g.bounds, dtype=float)
             lo = b[0].copy() if lo is None else np.minimum(lo, b[0])
             hi = b[1].copy() if hi is None else np.maximum(hi, b[1])
-            opaque_cells, glass_cells = _voxelize_geom(g, pitch)
-            if len(opaque_cells):
-                opaque_parts.append(np.unique(_abs_encode(opaque_cells)))
-            if len(glass_cells):
-                glass_parts.append(np.unique(_abs_encode(glass_cells)))
+            op_keys, gl_keys = _voxelize_geom(g, pitch)  # already sorted unique
+            if len(op_keys):
+                opaque_parts.append(op_keys)
+            if len(gl_keys):
+                glass_parts.append(gl_keys)
         del geoms
     except Exception:  # a bad mesh voxelizes to nothing — keep going
         return node_id, empty, empty, None, None
-    opaque = np.unique(np.concatenate(opaque_parts)) if opaque_parts else empty
-    glass = np.unique(np.concatenate(glass_parts)) if glass_parts else empty
-    return node_id, opaque, glass, lo, hi
+    return node_id, _merge_keys(opaque_parts), _merge_keys(glass_parts), lo, hi
 
 
 def _iter_voxelized(
@@ -1101,90 +1539,367 @@ def _pack_quads(quads: np.ndarray) -> bytes:
     return rec.tobytes()
 
 
-def _viz_streamed(
-    occ_lin: np.ndarray,
-    empty_mm: np.ndarray,
-    d2_mm: np.ndarray,
-    dims: np.ndarray,
-    pitch: float,
-    thresholds: list[float],
-    tick: Callable[[], None] | None = None,
-) -> tuple[np.ndarray, np.ndarray, list[tuple[float, np.ndarray, int]]]:
-    """All SVX3 boundary extractions (every clearance shell + cover + garbage)
-    in ONE x-slab sweep instead of a full-grid pass per class. Exactness and
-    order both survive slab chunking: face exposure looks one cell along the
-    face axis (a one-plane halo covers the x-faces), runs merge along z (x/y
-    faces) or y (z faces) — never along x — so no run crosses a slab seam, and
-    `_boundary_quads` emits face ids in ascending order with row-major (x-outer)
-    rows, so regrouping per-face across ascending slabs reproduces the
-    whole-grid quad order byte for byte. Returns (cover, garbage, shells) in
-    the shapes the pack/write step already consumes."""
+def _brick_quads(mask: np.ndarray) -> np.ndarray:
+    """Boundary quads of a BRICK-level bool grid, scaled to fine cell coords:
+    each brick-face quad becomes `_BRICK` fine rows of run `_BRICK × run`.
+    Coarse by design — used for the zone-level classes of the viz pack, where
+    per-cell resolution can't exist (and wouldn't render legibly anyway)."""
+    q = _boundary_quads(mask)
+    if not len(q):
+        return q
+    B = _BRICK
+    axis = q[:, 3] >> 1
+    neg = q[:, 3] & 1
+    # Row axis: the in-plane axis that is NOT the run axis (run: z for x/y
+    # faces, y for z faces) and not the face axis.
+    row_axis = np.where(axis == 0, 1, np.where(axis == 1, 0, 0))
+    out = np.repeat(q, B, axis=0).astype(np.int32)
+    out[:, :3] *= B
+    out[:, 4] *= B
+    rows = np.tile(np.arange(B, dtype=np.int32), len(q))
+    out[np.arange(len(out)), row_axis.repeat(B)] += rows
+    # The face plane sits at the cell's max corner for +faces: those quads'
+    # face-axis coordinate must point at the LAST fine cell of the brick.
+    plus = np.repeat(neg == 0, B)
+    out[np.arange(len(out))[plus], axis.repeat(B)[plus]] += B - 1
+    return out
+
+
+# Bricks per chunk in the viz extraction: an unpacked chunk plus its exposure
+# copies stays ~100-200 MB regardless of scene size (the packed inputs stay
+# packed — 64 B/brick — and neighbour face planes unpack on demand).
+_VIZ_CHUNK = 1 << 16
+# Cell budget for FINE-resolution viz shells. The client builds the overlay's
+# geometry quad-by-quad on its main thread (~0.4 quads per class cell), so a
+# foliage scene's 54M cover cells → 21M quads → a 250 MB pack and >1 GB of
+# JS arrays: the overlay never renders. Past this budget a class falls back
+# to BRICK-resolution shells (24 cm — still perfectly legible as a debug
+# overlay, ~50× fewer quads), which is what the free volume always uses.
+_VIZ_FINE_CELL_CAP = 4_000_000
+
+
+def _brick_class_quads(
+    brick_ids: np.ndarray, bits: np.ndarray, dims: np.ndarray
+) -> np.ndarray:
+    """EXACT fine-resolution boundary quads of a per-brick cell class:
+    `brick_ids` (B,) sorted brick linear ids, `bits` (B,64) uint8 PACKED cell
+    masks (little bit order — the storage format, so callers compose classes
+    with bytewise logic and never unpack whole scenes). Bricks unpack in
+    `_VIZ_CHUNK` batches; exposure is evaluated with true cross-brick
+    neighbours — in-brick shifts plus the adjacent brick's matching face
+    plane, unpacked on demand through the sorted ids. A missing neighbour
+    reads as exposed (grid edge / not-in-class air), exactly like a whole-grid
+    extraction treats beyond-array; the out-of-grid padding of partial edge
+    bricks is masked off after unpacking. Quads are emitted per direction in
+    ascending brick order — identical output for any chunk size."""
+    if not brick_ids.size:
+        return np.zeros((0, 5), dtype=np.int32)
     nx, ny, nz = (int(v) for v in dims)
-    step = _slab_planes(ny, nz)
-    n_cat = len(thresholds) + 2  # shells…, cover, garbage
-    face_parts: list[list[list[np.ndarray]]] = [
-        [[] for _ in range(6)] for _ in range(n_cat)
-    ]
-    cells = [0] * len(thresholds)
+    nbx = (nx + _BRICK - 1) // _BRICK
+    nby = (ny + _BRICK - 1) // _BRICK
+    nbz = (nz + _BRICK - 1) // _BRICK
+    S = len(brick_ids)
+    bx = brick_ids // (nby * nbz)
+    by = (brick_ids // nbz) % nby
+    bz = brick_ids % nbz
+    strides = {0: nby * nbz, 1: nbz, 2: 1}
+    coords = {0: bx, 1: by, 2: bz}
+    limits = {0: nbx, 1: nby, 2: nbz}
 
-    for x0 in range(0, nx, step):
-        x1 = min(x0 + step, nx)
-        sx = x1 - x0
-        h0, h1 = max(x0 - 1, 0), min(x1 + 1, nx)
-        lo_pad = x0 - h0  # 1 when a left halo plane exists
-        occ_h = _occ_slab(occ_lin, h0, h1, ny, nz)
-        emp_h = np.asarray(empty_mm[h0:h1])
-        cl_h = _clearance_chunk(np.asarray(d2_mm[h0:h1]), pitch)
+    def unpack(rows: np.ndarray, idx: np.ndarray) -> np.ndarray:
+        """(K,8,8,8) bool cells of `bits[idx]` with grid padding masked off."""
+        c = (
+            np.unpackbits(rows, axis=1, bitorder="little")
+            .astype(bool)
+            .reshape(-1, _BRICK, _BRICK, _BRICK)
+        )
+        if nx & 7:
+            c[bx[idx] == nbx - 1, (nx & 7):, :, :] = False
+        if ny & 7:
+            c[by[idx] == nby - 1, :, (ny & 7):, :] = False
+        if nz & 7:
+            c[bz[idx] == nbz - 1, :, :, (nz & 7):] = False
+        return c
 
-        def padded(mask_h: np.ndarray) -> np.ndarray:
-            """Slab core in [1, sx] with halo planes (or grid-edge False)."""
-            p = np.zeros((sx + 2, ny, nz), dtype=bool)
-            p[1 : 1 + sx] = mask_h[lo_pad : lo_pad + sx]
-            if lo_pad:
-                p[0] = mask_h[0]
-            if h1 > x1:
-                p[sx + 1] = mask_h[-1]
-            return p
+    parts: list[np.ndarray] = []
+    for axis in range(3):
+        for neg in (0, 1):
+            step = -1 if neg else 1
+            # Neighbour lookup over the FULL id array (cheap int ops).
+            nb = brick_ids + step * strides[axis]
+            valid = (coords[axis] + step >= 0) & (coords[axis] + step < limits[axis])
+            pos = np.clip(np.searchsorted(brick_ids, nb), 0, S - 1)
+            found = valid & (brick_ids[pos] == nb)
+            face_i = 0 if neg == 0 else _BRICK - 1
+            for c0 in range(0, S, _VIZ_CHUNK):
+                c1 = min(c0 + _VIZ_CHUNK, S)
+                idx = np.arange(c0, c1)
+                cells = unpack(bits[c0:c1], idx)
+                exposed = cells.copy()
+                sl_dst = [slice(None)] * 4
+                sl_src = [slice(None)] * 4
+                if neg == 0:
+                    sl_dst[axis + 1], sl_src[axis + 1] = slice(None, -1), slice(1, None)
+                else:
+                    sl_dst[axis + 1], sl_src[axis + 1] = slice(1, None), slice(None, -1)
+                exposed[tuple(sl_dst)] &= ~cells[tuple(sl_src)]
+                # Brick-boundary plane: the neighbour's matching face, unpacked
+                # only for the neighbours this chunk actually has.
+                f_c = found[c0:c1]
+                nb_plane = np.zeros((c1 - c0, _BRICK, _BRICK), dtype=bool)
+                if f_c.any():
+                    nb_idx = pos[c0:c1][f_c]
+                    nb_cells = unpack(bits[nb_idx], nb_idx)
+                    if axis == 0:
+                        nb_plane[f_c] = nb_cells[:, face_i, :, :]
+                    elif axis == 1:
+                        nb_plane[f_c] = nb_cells[:, :, face_i, :]
+                    else:
+                        nb_plane[f_c] = nb_cells[:, :, :, face_i]
+                sl_edge = [slice(None)] * 4
+                sl_edge[axis + 1] = _BRICK - 1 if neg == 0 else 0
+                exposed[tuple(sl_edge)] &= ~nb_plane
+                # Run extraction: z-runs for x/y faces, y-runs for z faces.
+                if axis == 2:
+                    rows = np.moveaxis(exposed, 3, 2).reshape(-1, _BRICK)
+                else:
+                    rows = exposed.reshape(-1, _BRICK)
+                padded = np.zeros((rows.shape[0], _BRICK + 2), dtype=np.int8)
+                padded[:, 1:-1] = rows
+                d = np.diff(padded, axis=1)
+                starts = np.argwhere(d == 1)
+                ends = np.argwhere(d == -1)
+                if not len(starts):
+                    continue
+                row_i, col0 = starts[:, 0], starts[:, 1]
+                runs = (ends[:, 1] - col0).astype(np.int32)
+                s_i, r = np.divmod(row_i, _BRICK * _BRICK)
+                s_i += c0
+                i0, i1 = np.divmod(r, _BRICK)
+                if axis == 2:  # rows were (lx, lz, ly): run along y
+                    lx, ly, lz = i0, col0, i1
+                else:          # rows were (lx, ly, lz): run along z
+                    lx, ly, lz = i0, i1, col0
+                quad = np.empty((len(runs), 5), dtype=np.int32)
+                quad[:, 0] = bx[s_i] * _BRICK + lx
+                quad[:, 1] = by[s_i] * _BRICK + ly
+                quad[:, 2] = bz[s_i] * _BRICK + lz
+                quad[:, 3] = axis * 2 + neg
+                quad[:, 4] = runs
+                parts.append(quad)
+    if not parts:
+        return np.zeros((0, 5), dtype=np.int32)
+    return np.concatenate(parts, axis=0)
 
-        def emit(cat: int, mask_h: np.ndarray) -> None:
-            q = _boundary_quads(padded(mask_h))
-            if len(q):
-                q = q[(q[:, 0] >= 1) & (q[:, 0] <= sx)]  # core cells only
-            if not len(q):
-                return
-            q[:, 0] += x0 - 1  # padded → grid x
-            b = np.searchsorted(q[:, 3], np.arange(7))  # face ids ascend
-            for f in range(6):
-                if b[f + 1] > b[f]:
-                    face_parts[cat][f].append(q[b[f] : b[f + 1]])
 
-        for ti, t in enumerate(thresholds):
-            m_h = emp_h & (cl_h >= t - _CLEARANCE_EPS)
-            cells[ti] += int(m_h[lo_pad : lo_pad + sx].sum())
-            emit(ti, m_h)
-        emit(len(thresholds), occ_h)
-        emit(len(thresholds) + 1, ~occ_h & ~emp_h)
-        if tick is not None:
-            tick()
+def _viz_two_tier(
+    fill: dict[str, Any], dims: np.ndarray, clearance_m: float, n_cover: int
+) -> tuple[np.ndarray, np.ndarray, list[tuple[float, np.ndarray, int]], dict[str, str]]:
+    """The SVX3 viz classes from the two-tier fill. Cover and garbage are
+    EXACT fine-resolution boundary extractions while their cell counts fit
+    `_VIZ_FINE_CELL_CAP`, composed as PACKED bitmasks (bytewise logic on the
+    storage format — nothing scene-sized is ever unpacked): cover = ¬air over
+    the skin bricks; garbage = (air ∧ ¬empty) over the skin bricks unioned
+    with garbage zone bricks as 0xFF rows (the union extraction culls
+    interior faces across the fine/coarse boundary automatically). PAST the
+    cap — foliage scenes with tens of millions of cover cells — a class falls
+    back to brick-resolution shells: the client assembles overlay geometry
+    quad-by-quad on its main thread, and 20M+ fine quads simply never render
+    there. The free volume is always ONE brick-resolution shell (a per-cell
+    free ladder died with the dense clearance field; the slider's 'apply'
+    still re-filters candidates server-side). Returns (cover, garbage,
+    shells, resolutions) — `resolutions` names the per-class choice for the
+    summary."""
+    nbx = (int(dims[0]) + _BRICK - 1) // _BRICK
+    nby = (int(dims[1]) + _BRICK - 1) // _BRICK
+    nbz = (int(dims[2]) + _BRICK - 1) // _BRICK
+    skin_lin = fill["skin_lin"]
+    air_b = fill["skin_air"]
+    emp_b = fill["skin_empty"]
+    res: dict[str, str] = {}
 
-    def gather(cat: int) -> np.ndarray:
-        parts = [a for f in range(6) for a in face_parts[cat][f]]
-        return (
-            np.concatenate(parts, axis=0) if parts else np.zeros((0, 5), np.int32)
+    if n_cover <= _VIZ_FINE_CELL_CAP:
+        cover_q = _brick_class_quads(skin_lin, np.invert(air_b), dims)
+        res["cover"] = "fine"
+    else:
+        # Occupied bricks are exactly the zeros of the brick distance field.
+        occ_b = fill["brick_dist"] == 0
+        cover_q = _brick_quads(occ_b)
+        res["cover"] = "brick"
+
+    n_garbage = int(fill["garbage_voxels"])
+    zg = fill["zone_garbage"]
+    if n_garbage <= _VIZ_FINE_CELL_CAP:
+        garb_ids = skin_lin
+        garb_bits = air_b & np.invert(emp_b)
+        if zg.size:
+            garb_ids = np.concatenate([garb_ids, zg])
+            garb_bits = np.concatenate(
+                [garb_bits, np.full((zg.size, 64), 0xFF, dtype=np.uint8)]
+            )
+            order = np.argsort(garb_ids, kind="stable")
+            garb_ids, garb_bits = garb_ids[order], garb_bits[order]
+        garbage_q = _brick_class_quads(garb_ids, garb_bits, dims)
+        res["garbage"] = "fine"
+    else:
+        gar_b = np.zeros((nbx, nby, nbz), dtype=bool)
+        has_garb = (air_b & np.invert(emp_b)).any(axis=1)
+        if has_garb.any():
+            gar_b.reshape(-1)[skin_lin[has_garb]] = True
+        if zg.size:
+            gar_b.reshape(-1)[zg] = True
+        garbage_q = _brick_quads(gar_b)
+        res["garbage"] = "brick"
+
+    free_b = np.zeros((nbx, nby, nbz), dtype=bool)
+    has_empty = emp_b.any(axis=1)
+    if has_empty.any():
+        free_b.reshape(-1)[skin_lin[has_empty]] = True
+    if fill["zone_reached"].size:
+        free_b.reshape(-1)[fill["zone_reached"]] = True
+    shells = [(float(clearance_m), _brick_quads(free_b), int(fill["empty_voxels"]))]
+    res["free"] = "brick"
+    return cover_q, garbage_q, shells, res
+
+
+def _emit_candidates(
+    fill: dict[str, Any],
+    occ_lin: np.ndarray,
+    dims: np.ndarray,
+    origin: np.ndarray,
+    pitch: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """The camera-candidate list: one position per `_CAND_BRICKS`³-brick block
+    of reached air, each annotated with its distance to the nearest surface.
+
+    Skin blocks pick the lowest-raster skin brick with empty air and that
+    brick's first empty cell (deterministic), annotated EXACTLY via a local
+    search over the cover cells of the brick's 3×3×3 neighbourhood (a skin
+    brick always has cover within it — that's what makes it skin). Blocks
+    with no skin-empty fall to their lowest reached zone brick, positioned at
+    the brick's central cell and annotated from the brick-level distance
+    field (±1 brick — sub-voxel precision cannot matter half a metre from
+    everything). Returns (cand_pos (M,3) float32 world, cand_clear (M,)
+    float32 metres)."""
+    nx, ny, nz = (int(v) for v in dims)
+    nby = (ny + _BRICK - 1) // _BRICK
+    nbz = (nz + _BRICK - 1) // _BRICK
+    skin_lin = fill["skin_lin"]
+    first = fill["skin_first_empty"]
+
+    def brick_xyz(lin: np.ndarray) -> np.ndarray:
+        return np.stack(
+            [lin // (nby * nbz), (lin // nbz) % nby, lin % nbz], axis=1
         )
 
-    shells = [(t, gather(ti), cells[ti]) for ti, t in enumerate(thresholds)]
-    return gather(len(thresholds)), gather(len(thresholds) + 1), shells
+    # --- skin candidates: per cand-block, first empty cell of lowest brick --
+    havef = first >= 0
+    s_lin = skin_lin[havef]
+    s_first = first[havef].astype(np.int64)
+    sxyz = brick_xyz(s_lin)
+    blk = (
+        (sxyz[:, 0] // _CAND_BRICKS) * ((nby + 1) // _CAND_BRICKS + 1)
+        + sxyz[:, 1] // _CAND_BRICKS
+    ) * ((nbz + 1) // _CAND_BRICKS + 1) + sxyz[:, 2] // _CAND_BRICKS
+    # skin_lin ascends ⇒ within a block the first row is the lowest brick.
+    _u, idx = np.unique(blk, return_index=True)
+    pick_lin, pick_first, pick_xyz = s_lin[idx], s_first[idx], sxyz[idx]
+    lx, r = np.divmod(pick_first, _BRICK * _BRICK)
+    ly, lz = np.divmod(r, _BRICK)
+    cells = pick_xyz * _BRICK + np.stack([lx, ly, lz], axis=1)
 
+    # Exact local clearance: min distance to any cover cell in the 27 bricks
+    # around the candidate's brick (cover coords grouped per occupied brick).
+    # Everything cover-sized is held at the SMALLEST sufficient dtype — int16
+    # coords (grid axes are < 32K cells by construction), int32 brick ids —
+    # and dropped as soon as the sorted copy exists: ~10 B per cover cell
+    # instead of the ~50 B the int64 version peaked at on foliage scenes.
+    plane = ny * nz
+    cov_x = occ_lin // plane
+    cov_rem = occ_lin % plane
+    cov = np.empty((len(occ_lin), 3), dtype=np.int16)
+    cov[:, 0] = cov_x
+    cov[:, 1] = cov_rem // nz
+    cov[:, 2] = cov_rem % nz
+    del cov_x, cov_rem
+    cov_brick = (
+        (cov[:, 0].astype(np.int32) >> 3) * nby + (cov[:, 1] >> 3)
+    ) * nbz + (cov[:, 2] >> 3)
+    order = np.argsort(cov_brick, kind="stable")
+    cov_sorted = cov[order]
+    cb_sorted = cov_brick[order]
+    del cov, cov_brick, order
+    cb_ids, cb_starts = np.unique(cb_sorted, return_index=True)
+    cb_ends = np.append(cb_starts[1:], len(cb_sorted))
+    del cb_sorted
 
-def _shell_thresholds(pitch: float, clearance_m: float, cl_max: float) -> list[float]:
-    """The free-shell ladder: voxel multiples (`_SHELL_STEPS`) up to the scene's
-    clearance ceiling, with the BAKED threshold always included (so the default
-    shell equals the FREE mask stage 4 plans against). Sorted, deduped."""
-    top = max(cl_max, pitch) + 1e-9
-    ts = {round(pitch * s, 4) for s in _SHELL_STEPS if pitch * s <= top}
-    ts.add(round(float(clearance_m), 4))
-    return sorted(t for t in ts if t > 0)
+    clear = np.full(len(cells), np.inf, dtype=np.float64)
+    offs = np.array(
+        [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)],
+        dtype=np.int64,
+    )
+    nbx = (nx + _BRICK - 1) // _BRICK
+    # Vectorized over candidates, 27 neighbour offsets at a time: gather each
+    # candidate's cover cells through the CSR ranges (repeat/cumsum expansion)
+    # and reduce min distance with minimum.at — squared distances in int32
+    # (local extents span ≤ 3 bricks, d² ≤ 3·24²). Chunked so the expanded
+    # pair arrays stay tens of MB.
+    for c0 in range(0, len(cells), 65536):
+        c1 = min(c0 + 65536, len(cells))
+        cc = cells[c0:c1].astype(np.int32)
+        bb = pick_xyz[c0:c1]
+        best = np.full(c1 - c0, np.iinfo(np.int32).max, dtype=np.int32)
+        for off in offs:
+            qb = bb + off
+            ok = np.all((qb >= 0) & (qb < [nbx, nby, nbz]), axis=1)
+            if not ok.any():
+                continue
+            ql = (qb[:, 0] * nby + qb[:, 1]) * nbz + qb[:, 2]
+            p = np.clip(np.searchsorted(cb_ids, ql), 0, len(cb_ids) - 1)
+            found = ok & (cb_ids[p] == ql)
+            if not found.any():
+                continue
+            fi = np.nonzero(found)[0]
+            starts, ends = cb_starts[p[fi]], cb_ends[p[fi]]
+            counts = (ends - starts).astype(np.int64)
+            # ranges: for each found candidate, indices starts[k]..ends[k)
+            total = int(counts.sum())
+            if not total:
+                continue
+            rep = np.repeat(np.arange(len(fi)), counts)
+            base = np.repeat(starts, counts)
+            step = np.arange(total) - np.repeat(
+                np.concatenate([[0], np.cumsum(counts)[:-1]]), counts
+            )
+            diff = cov_sorted[base + step].astype(np.int32) - cc[fi][rep]
+            d2 = (diff * diff).sum(axis=1)
+            np.minimum.at(best, fi[rep], d2)
+        clear[c0:c1] = np.sqrt(best.astype(np.float64)) * pitch
+    skin_pos = (origin + (cells + 0.5) * pitch).astype(np.float32)
+    skin_clear = clear.astype(np.float32)
+    skin_blk = blk[idx]
+
+    # --- zone candidates: per cand-block, lowest reached zone brick ----------
+    z_lin = fill["zone_reached"]
+    if z_lin.size:
+        zxyz = brick_xyz(z_lin)
+        zblk = (
+            (zxyz[:, 0] // _CAND_BRICKS) * ((nby + 1) // _CAND_BRICKS + 1)
+            + zxyz[:, 1] // _CAND_BRICKS
+        ) * ((nbz + 1) // _CAND_BRICKS + 1) + zxyz[:, 2] // _CAND_BRICKS
+        _zu, zidx = np.unique(zblk, return_index=True)
+        # Skin wins a contested block (nearer the content).
+        keep = ~np.isin(_zu, skin_blk)
+        zidx = zidx[keep]
+        zc = np.minimum(zxyz[zidx] * _BRICK + _BRICK // 2, np.array([nx, ny, nz]) - 1)
+        zpos = (origin + (zc + 0.5) * pitch).astype(np.float32)
+        bd = fill["brick_dist"].reshape(-1)[z_lin[zidx]]
+        zclear = (bd * _BRICK * pitch).astype(np.float32)
+        pos = np.concatenate([skin_pos, zpos], axis=0)
+        cl = np.concatenate([skin_clear, zclear], axis=0)
+    else:
+        pos, cl = skin_pos, skin_clear
+    return pos, cl
 
 
 # ---------------------------------------------------------------------------
@@ -1199,7 +1914,11 @@ def _shell_thresholds(pitch: float, clearance_m: float, cl_max: float) -> list[f
 _MEM_BUDGET_FRACTION = 0.6          # share of usable RAM the mesh pass may claim
 _WORKER_BASE_BYTES = 600 * 1024**2  # spawn interpreter + numpy/scipy/trimesh + slack
 _WORKER_FILE_MULT = 16              # decoded mesh + voxel scratch, per GLB byte
-_MAX_AUTO_WORKERS = 8               # ceiling even on huge-RAM, many-core hosts
+# Ceiling even on huge-RAM, many-core hosts. 16 (was 8): since the mesh pass
+# streams pieces in bounded batches a worker peaks ~300 MB, so 16 workers fit
+# a 16 GB box with headroom — the old cap predates the batching and was
+# sized for 1.5 GB workers.
+_MAX_AUTO_WORKERS = 16
 
 
 def _cgroup_available_bytes() -> int | None:
@@ -1313,160 +2032,6 @@ def _auto_worker_count(ids: list[str], raw_dir: Path, hard_cap: int) -> int:
     return n
 
 
-# --- streamed exact clearance (squared EDT in integer voxel units) -------------
-# The exact Euclidean distance transform is SEPARABLE: with e²(x', y, z) the 2-D
-# squared EDT of plane x' (over (y, z)),
-#
-#     d²(x, y, z) = min over x' of [ (x - x')² + e²(x', y, z) ]
-#
-# so the field is built in two streamed phases sharing ONE int32 scratch file:
-# phase 1 computes each plane's 2-D squared EDT (the `edt` package; its float32
-# results are exact integers while the plane diagonal² < 2^24) during an x-slab
-# sweep; phase 2 runs the remaining 1-D minimization along x (`_parabola_pass`,
-# exact int64 arithmetic) over column bundles read back from the scratch. All
-# values are exact integer squared distances — deterministic for any slab or
-# bundle partition — and metres are derived per chunk as
-# float32(pitch · sqrt(d²)). Cover cells carry d² = 0, the grid edge is not a
-# cover source (matches `black_border=False`), and `pitch` is isotropic.
-
-
-def _dist2_planes(
-    occ_lin: np.ndarray,
-    dims: np.ndarray,
-    scratch: Path,
-    workers: int = 1,
-    tick: Callable[[], None] | None = None,
-) -> None:
-    """Phase 1: per-plane 2-D squared EDT → int32 scratch memmap. Planes with
-    no cover at all store −1 (no in-plane site; resolved by phase 2). `workers`
-    threads the C++ transform — integer-exact results either way."""
-    # Imported at call time (not module load) so read-only users of stage2 —
-    # grid loading, FreeSpace, Stage 4 — don't need `edt`; only building a grid does.
-    import edt
-
-    nx, ny, nz = (int(v) for v in dims)
-    if ny * ny + nz * nz >= 1 << 24 or nx * nx + ny * ny + nz * nz >= 1 << 31:
-        raise RuntimeError(
-            f"grid {nx}x{ny}x{nz} exceeds the exact-EDT integer range — "
-            "use a coarser pitch"
-        )
-    mm = np.lib.format.open_memmap(
-        scratch, mode="w+", dtype=np.int32, shape=(nx, ny, nz)
-    )
-    step = _slab_planes(ny, nz)
-    for x0 in range(0, nx, step):
-        x1 = min(x0 + step, nx)
-        occ = _occ_slab(occ_lin, x0, x1, ny, nz)
-        out = np.empty((x1 - x0, ny, nz), dtype=np.int32)
-        for i in range(x1 - x0):
-            if occ[i].any():
-                out[i] = edt.edtsq(
-                    ~occ[i], black_border=False, parallel=max(1, workers)
-                ).astype(np.int32)
-            else:
-                out[i] = -1
-        mm[x0:x1] = out
-        if tick is not None:
-            tick()
-    mm.flush()
-    del mm
-
-
-def _parabola_pass(g: np.ndarray) -> np.ndarray:
-    """Exact 1-D lower-envelope pass of the squared EDT (Felzenszwalb &
-    Huttenlocher), vectorized ACROSS columns: `g` is (n, C) int64 per-column
-    parabola costs (`_NO_SITE` marks positions with no site) and the result is
-    f[x] = min over q of (g[q] + (x − q)²). Each column keeps its own site
-    stack in shared arrays; the pop loop runs while ANY column still pops
-    (amortized O(1) per push, as in the scalar algorithm). Envelope boundaries
-    are compared as int64 rationals (cross-multiplied), so results are exact
-    integers — no float ties, identical for any column batching."""
-    n, c_cnt = g.shape
-    cols = np.arange(c_cnt)
-    v = np.zeros((n, c_cnt), dtype=np.int64)        # stacked site positions
-    gv = np.full((n, c_cnt), _NO_SITE, np.int64)    # stacked site costs
-    num = np.zeros((n + 1, c_cnt), dtype=np.int64)  # left boundary of site k,
-    den = np.ones((n + 1, c_cnt), dtype=np.int64)   # as a rational num/den
-    top = np.full(c_cnt, -1, dtype=np.int64)        # stack depth − 1
-    neg_inf = np.int64(-1) << 40                    # below any real boundary
-
-    for q in range(n):
-        gq = g[q]
-        has = gq < _NO_SITE
-        if not has.any():
-            continue
-        # Pop stacked sites the new parabola dominates: intersection abscissa
-        # s(q, top) ≤ the top site's own left boundary.
-        while True:
-            act = has & (top >= 0)
-            if not act.any():
-                break
-            ci = cols[act]
-            ti = top[act]
-            vt = v[ti, ci]
-            s_num = (gq[act] + q * q) - (gv[ti, ci] + vt * vt)
-            s_den = 2 * (q - vt)  # > 0: sites are pushed in ascending order
-            pop = s_num * den[ti, ci] <= num[ti, ci] * s_den
-            if not pop.any():
-                break
-            top[ci[pop]] -= 1
-        # Push site q on every column that has it.
-        ci = cols[has]
-        ti = top[has] + 1
-        prev = np.maximum(ti - 1, 0)
-        vt = v[prev, ci]
-        s_num = np.where(
-            ti > 0, (gq[has] + q * q) - (gv[prev, ci] + vt * vt), neg_inf
-        )
-        s_den = np.where(ti > 0, 2 * (q - vt), np.int64(1))
-        v[ti, ci] = q
-        gv[ti, ci] = gq[has]
-        num[ti, ci] = s_num
-        den[ti, ci] = s_den
-        top[has] = ti
-
-    f = np.full((n, c_cnt), _NO_SITE, np.int64)
-    k = np.zeros(c_cnt, dtype=np.int64)
-    for x in range(n):
-        while True:  # advance past boundaries left of x: z[k+1] < x
-            adv = (k < top) & (num[k + 1, cols] < x * den[k + 1, cols])
-            if not adv.any():
-                break
-            k[adv] += 1
-        vk = v[k, cols]
-        f[x] = np.where(top >= 0, gv[k, cols] + (x - vk) * (x - vk), _NO_SITE)
-    return f
-
-
-def _dist2_xpass(
-    dims: np.ndarray, scratch: Path, tick: Callable[[], None] | None = None
-) -> None:
-    """Phase 2: finish the squared EDT along x, in place in the scratch —
-    bundles of full-x column blocks stream through `_parabola_pass`."""
-    nx, ny, nz = (int(v) for v in dims)
-    mm = np.lib.format.open_memmap(scratch, mode="r+")
-    # ~6 int64 arrays of (nx, rows·nz) live during a bundle.
-    rows = max(1, int(_SLAB_TARGET_BYTES // max(1, nx * nz * 8 * 6)))
-    for y0 in range(0, ny, rows):
-        y1 = min(y0 + rows, ny)
-        g = mm[:, y0:y1, :].reshape(nx, -1).astype(np.int64)
-        g[g < 0] = _NO_SITE  # planes without cover contribute no site
-        f = _parabola_pass(g)
-        # Every column has ≥ 1 site (the grid has cover somewhere), so the
-        # minimum is always finite and fits int32 (guarded in _dist2_planes).
-        mm[:, y0:y1, :] = f.reshape(nx, y1 - y0, nz).astype(np.int32)
-        if tick is not None:
-            tick()
-    mm.flush()
-    del mm
-
-
-def _clearance_chunk(d2: np.ndarray, pitch: float) -> np.ndarray:
-    """Integer squared distances → metres, float32: the ONE conversion every
-    consumer of the field shares (stats, shells, the stored float16)."""
-    return (np.sqrt(d2.astype(np.float64)) * pitch).astype(np.float32)
-
-
 def compute_free_space(
     *,
     run: str,
@@ -1477,13 +2042,14 @@ def compute_free_space(
     params: FreeSpaceParams = FreeSpaceParams(),
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
-    """Voxelize the cell's placed meshes into the single uniform occupancy grid
-    (in parallel across objects — see `_iter_voxelized`), classify empty vs
-    garbage with the two-phase fill, run the clearance pass (EDT + the baked
-    FREE threshold), and write `freespace.npz` (to `out_path`) + the SVX3
-    `voxels.bin` viz pack + the `.empty.npy` sidecar (beside it). Returns a
-    summary (grid dims, counts, fill + clearance stats). Output is
-    byte-identical for any worker count and any slab partition."""
+    """Voxelize the cell's placed meshes into the uniform fine occupancy
+    lattice (in parallel across objects — see `_iter_voxelized`), classify the
+    near-surface air empty vs garbage with the two-tier band fill, emit the
+    annotated camera-candidate list, and write `freespace.npz` (metadata +
+    sparse structures, to `out_path`) + the SVX3 `voxels.bin` viz pack + the
+    `.skin.npy` bitmask sidecar (beside it). Returns a summary (grid dims,
+    counts, fill stats). Output is byte-identical for any worker count and
+    any mesh-pass batch size."""
     if not raw_dir.is_dir():
         raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
     ids = placed_object_ids(raw_dir)
@@ -1492,6 +2058,7 @@ def compute_free_space(
     pitch = float(np.clip(params.pitch, *_PITCH_CLAMP))
     margin = float(max(0.0, params.margin))
     clearance_m = float(max(0.0, params.clearance))
+    coverage_m = float(max(params.coverage, pitch * _BRICK * 2))
     workers = (
         params.workers if params.workers > 0
         else _auto_worker_count(ids, raw_dir, min(os.cpu_count() or 1, _MAX_AUTO_WORKERS))
@@ -1536,32 +2103,50 @@ def compute_free_space(
     if (not opaque_parts and not glass_parts) or not np.isfinite(lo).all():
         raise RuntimeError("no surface voxelized (every mesh failed or was empty)")
     if progress is not None:
-        progress(0, 0, "reduce")  # merge keys → grid + occupancy (single pass)
-    empty_keys = np.zeros(0, dtype=np.int64)
-    opaque_keys = (
-        np.unique(np.concatenate(opaque_parts)) if opaque_parts else empty_keys
-    )
-    glass_keys = (
-        np.unique(np.concatenate(glass_parts)) if glass_parts else empty_keys
-    )
+        progress(0, 0, "reduce")  # merge keys → grid + occupancy
+    # Run-aware merges: per-object key arrays are already sorted unique, so
+    # `_merge_keys`' timsort effectively k-way merges them instead of paying a
+    # run-blind full sort over every cover incidence.
+    opaque_keys = _merge_keys(opaque_parts)
+    glass_keys = _merge_keys(glass_parts)
     del opaque_parts, glass_parts  # the merged keys supersede the partials
 
     imin, dims = _grid_dims(lo, hi, margin, pitch)
     nx, ny, nz = int(dims[0]), int(dims[1]), int(dims[2])
     origin = imin.astype(np.float64) * pitch
+    shift = _VOX_RADIX.bit_length() - 1  # the key packing is pure bit-fields
 
     def to_lin(keys: np.ndarray) -> np.ndarray:
-        """Absolute lattice keys → sorted unique local linear indices (drops
-        out-of-grid cells)."""
-        v = _abs_decode(keys) - imin
-        v = v[np.all((v >= 0) & (v < dims), axis=1)]
-        return np.unique((v[:, 0] * ny + v[:, 1]) * nz + v[:, 2])
+        """SORTED unique absolute keys → sorted unique local linear indices
+        (drops out-of-grid cells) with NO sort: both encodings are x-major /
+        y-mid / z-minor lexicographic, so the mapping is strictly monotone and
+        the input's order survives the arithmetic. Shift/mask decode (the
+        radix is a power of two — integer division is ~10× slower), chunked
+        so temporaries stay tens of MB at swamp-scale key counts."""
+        out = np.empty(keys.size, dtype=np.int64)
+        n = 0
+        mask = _VOX_RADIX - 1
+        for i in range(0, keys.size, 1 << 24):
+            k = keys[i : i + (1 << 24)]
+            xl = (k >> (2 * shift)) - _VOX_OFF - imin[0]
+            yl = ((k >> shift) & mask) - _VOX_OFF - imin[1]
+            zl = (k & mask) - _VOX_OFF - imin[2]
+            m = (
+                (xl >= 0) & (xl < nx) & (yl >= 0) & (yl < ny)
+                & (zl >= 0) & (zl < nz)
+            )
+            lin = (xl[m] * ny + yl[m]) * nz + zl[m]
+            out[n : n + lin.size] = lin
+            n += lin.size
+        return out[:n]
 
     opaque_lin = to_lin(opaque_keys)
     # A cell with BOTH classes (e.g. window frame + pane) occludes: opaque wins,
     # keeping the two stored sets disjoint (glass = transmissive-only cells).
     glass_lin = np.setdiff1d(to_lin(glass_keys), opaque_lin, assume_unique=True)
-    occ_lin = np.union1d(opaque_lin, glass_lin)
+    # Disjoint sorted union: timsort merges the two runs in ~O(N).
+    occ_lin = np.concatenate([opaque_lin, glass_lin])
+    occ_lin.sort(kind="stable")
     del opaque_keys, glass_keys, opaque_lin  # occ_lin/glass_lin carry it forward
 
     # Per-object grid-index AABBs (all cells the mesh AABB touches — a superset
@@ -1576,26 +2161,15 @@ def compute_free_space(
             (node_id, np.clip(vlo, 0, dims - 1), np.clip(vhi, 0, dims - 1))
         )
 
-    # Streamed grid phases (module docstring): the dense fields live in
-    # disk-backed scratch files beside the outputs, processed in x-slabs —
-    # nothing grid-sized is ever resident. The empty scratch is PROMOTED to the
-    # `.empty.npy` sidecar Stage 3 memory-maps, so its first sampler run no
-    # longer decompresses and rewrites the mask itself.
-    #
     # Scratch names carry a per-invocation token: builds for the same cell can
     # OVERLAP (a revert's task.cancel() can't stop a build already running in a
-    # worker thread, and a fresh POST then starts another), and with fixed
-    # names the first build's cleanup deletes the scratches out from under the
-    # survivor — a mid-build FileNotFoundError. Unique names make overlap
-    # harmless: each build only ever touches (and finally deletes) its own
-    # scratches, while the age-gated sweep below reclaims the litter of builds
+    # worker thread, and a fresh POST then starts another); unique names make
+    # overlap harmless, and the age-gated sweep reclaims the litter of builds
     # killed too hard for their cleanup to run.
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    sidecar = out_path.with_name(out_path.name + _EMPTY_SIDECAR_SUFFIX)
+    skin_sidecar = out_path.with_name(out_path.name + _SKIN_SIDECAR_SUFFIX)
     token = f"{os.getpid():x}-{int(time.time() * 1000):x}"
-    empty_tmp = out_path.with_name(f"{out_path.name}.empty.{token}.tmp.npy")
-    dist2_tmp = out_path.with_name(f"{out_path.name}.dist2.{token}.tmp.npy")
-    f16_tmp = out_path.with_name(f"{out_path.name}.cl16.{token}.tmp.npy")
+    skin_tmp = out_path.with_name(f"{out_path.name}.skin.{token}.tmp.npy")
     tmp_npz = out_path.with_name(f"{out_path.name}.{token}.tmp.npz")
     now = time.time()
     for stale in out_path.parent.glob(out_path.name + ".*.tmp.np*"):
@@ -1604,8 +2178,6 @@ def compute_free_space(
                 stale.unlink()
         except OSError:
             pass
-    step = _slab_planes(ny, nz)
-    n_slabs = (nx + step - 1) // step
 
     def _stepper(total: int, name: str) -> Callable[[], None]:
         done = 0
@@ -1620,112 +2192,54 @@ def compute_free_space(
 
         return tick
 
+    # THE FILL — the two-tier band fill (module docstring): fine labeling per
+    # skin-brick layer (2 sweeps → a tick per layer per sweep), coarse zone in
+    # dense brick-grid calls, seeds/rescue on component tables.
+    coverage_bricks = max(1.0, coverage_m / (pitch * _BRICK))
+    nbx = (nx + _BRICK - 1) // _BRICK
+    fill = _fill_two_tier(
+        occ_lin, dims, boxes, coverage_bricks, _stepper(2 * nbx, "fill")
+    )
+
+    # CANDIDATES — the camera positions Stage 4 plans from, annotated with
+    # their distance to the nearest surface (module docstring).
+    if progress is not None:
+        progress(0, 0, "candidates")
+    cand_pos, cand_clear = _emit_candidates(fill, occ_lin, dims, origin, pitch)
+    free_count = int((cand_clear >= clearance_m - _CLEARANCE_EPS).sum())
+
+    # SVX3 viz pack: fine cover/garbage quads (brick-level past the client's
+    # renderable budget) + the brick-level free shell.
+    if progress is not None:
+        progress(0, 0, "viz")
+    cover_q, garbage_q, shells, viz_res = _viz_two_tier(
+        fill, dims, clearance_m, int(occ_lin.size)
+    )
+
+    if progress is not None:
+        progress(0, 0, "write")
     try:
-        # THE FILL — streamed two-pass labeling (a tick per slab per sweep).
-        rescued_cells, fill_stats = _fill_streamed(
-            occ_lin, dims, boxes, empty_tmp, _stepper(2 * n_slabs, "fill")
-        )
-
-        # THE CLEARANCE PASS — exact squared EDT into the int32 scratch:
-        # per-plane 2-D transforms (a tick per slab), then the 1-D x-pass over
-        # column bundles (a tick per bundle). FREE stays a pure derivation
-        # (empty ∧ clearance ≥ clearance_m), re-bakeable via `apply_clearance`.
-        bundle_rows = max(1, int(_SLAB_TARGET_BYTES // max(1, nx * nz * 8 * 6)))
-        tick = _stepper(n_slabs + (ny + bundle_rows - 1) // bundle_rows, "clearance")
-        _dist2_planes(occ_lin, dims, dist2_tmp, workers, tick)
-        _dist2_xpass(dims, dist2_tmp, tick)
-
-        # Windows note: every memmap handle (and every VIEW of one) below is
-        # scoped inside a helper or deleted before the file is renamed/unlinked
-        # — a surviving view pins the file and the promote/cleanup would fail.
-
-        def _empty_stats() -> tuple[int, int, float, float]:
-            """(empty_count, free_count, cl_max, cl_mean) — FREE count +
-            clearance stats over EMPTY cells, flat-chunked off the memmaps:
-            three scalars, never a grid-sized copy."""
-            emp = np.load(empty_tmp, mmap_mode="r")
-            d2 = np.load(dist2_tmp, mmap_mode="r")
-            n_empty = int(emp.sum())
-            if not n_empty:
-                # `pitch` keeps the shell ladder non-empty; the summary reports 0.
-                return 0, 0, pitch, 0.0
-            thr = clearance_m - _CLEARANCE_EPS
-            n_free = 0
-            mx = 0.0
-            acc = 0.0
-            flat_d2 = d2.reshape(-1)
-            flat_emp = emp.reshape(-1)
-            for i in range(0, flat_d2.size, _CHUNK_CELLS):
-                ce = _clearance_chunk(
-                    flat_d2[i : i + _CHUNK_CELLS][flat_emp[i : i + _CHUNK_CELLS]],
-                    pitch,
-                )
-                if ce.size:
-                    n_free += int((ce >= thr).sum())
-                    mx = max(mx, float(ce.max()))
-                    acc += float(ce.sum(dtype=np.float64))
-            return n_empty, n_free, mx, acc / n_empty
-
-        empty_count, free_count, cl_max, cl_mean = _empty_stats()
-
-        # Persist the reusable grid (float16 clearance halves the file at
-        # ~0.05% relative error — comparisons carry _CLEARANCE_EPS, so
-        # exact-lattice thresholds survive the quantization). Both grid-sized
-        # entries are MEMMAPS: np.savez_compressed streams each into the zip in
-        # buffered chunks, so the write holds no grid-sized array either.
-        if progress is not None:
-            progress(0, 0, "write")
-
-        def _bake_f16() -> None:
-            d2 = np.load(dist2_tmp, mmap_mode="r")
-            cl16 = np.lib.format.open_memmap(
-                f16_tmp, mode="w+", dtype=np.float16, shape=(nx, ny, nz)
-            )
-            flat16 = cl16.reshape(-1)
-            flat_d2 = d2.reshape(-1)
-            for i in range(0, flat_d2.size, _CHUNK_CELLS):
-                flat16[i : i + _CHUNK_CELLS] = _clearance_chunk(
-                    flat_d2[i : i + _CHUNK_CELLS], pitch
-                ).astype(np.float16)
-            cl16.flush()
-
-        _bake_f16()
-        cl16 = np.load(f16_tmp, mmap_mode="r")
-        empty_mm = np.load(empty_tmp, mmap_mode="r")
-        np.savez_compressed(
+        np.save(skin_tmp, fill["skin_empty"])
+        _savez_fast(
             tmp_npz,
             origin=origin.astype(np.float64),
             pitch=np.float64(pitch),
             dims=np.array([nx, ny, nz], dtype=np.int64),
             occ_lin=occ_lin.astype(np.int64),
             occ_lin_glass=glass_lin.astype(np.int64),
-            clearance=cl16,
-            empty=empty_mm,
+            skin_lin=fill["skin_lin"].astype(np.int64),
+            zone_lin=fill["zone_reached"].astype(np.int64),
+            cand_pos=cand_pos.astype(np.float32),
+            cand_clear=cand_clear.astype(np.float32),
             clearance_m=np.float64(clearance_m),
         )
-        del cl16, empty_mm
         tmp_npz.replace(out_path)
-        # Promote the empty scratch to the Stage-3 sidecar AFTER the npz lands,
-        # and touch it: rename keeps the content mtime, and Stage 3 rebuilds a
-        # sidecar that reads older than its npz.
-        empty_tmp.replace(sidecar)
-        os.utime(sidecar)
-
-        # SVX3 viz pack (module docstring): every class extracted in ONE slab
-        # sweep — the tail's slowest pass touches the grid once, not per class.
-        thresholds = _shell_thresholds(pitch, clearance_m, cl_max)
-        empty_mm = np.load(sidecar, mmap_mode="r")
-        d2_mm = np.load(dist2_tmp, mmap_mode="r")
-        cover_q, garbage_q, shells = _viz_streamed(
-            occ_lin, empty_mm, d2_mm, dims, pitch, thresholds,
-            _stepper(n_slabs, "viz"),
-        )
-        del empty_mm, d2_mm
+        # Promote the sidecar AFTER the npz lands (loaders treat it as the
+        # sole home of the per-cell empty bits).
+        skin_tmp.replace(skin_sidecar)
+        os.utime(skin_sidecar)
     finally:
-        # Scratches are build-local (unique names). On failure a leaked memmap
-        # handle can pin one on Windows — best-effort: the TTL sweep of the
-        # next build reclaims anything left behind.
-        for p in (dist2_tmp, f16_tmp, empty_tmp, tmp_npz):
+        for p in (skin_tmp, tmp_npz):
             try:
                 p.unlink(missing_ok=True)
             except OSError:
@@ -1738,7 +2252,11 @@ def compute_free_space(
         f.write(_pack_quads(cover_q))
         f.write(_pack_quads(garbage_q))
         for t, q, cells in shells:
-            f.write(_SHELL_HEADER.pack(t, len(q), cells))
+            # `cells` is DISPLAY-ONLY (the client's slider label) and the wire
+            # field is u32: a large open scene's in-band air can exceed 2³²
+            # cells (a 200 m platformer level did), so saturate rather than
+            # overflow — quad counts stay exact (they drive parsing offsets).
+            f.write(_SHELL_HEADER.pack(t, len(q), min(int(cells), 0xFFFFFFFF)))
             f.write(_pack_quads(q))
     tmp_viz.replace(viz_path)
 
@@ -1752,22 +2270,24 @@ def compute_free_space(
         "scene_aabb": {"min": lo.tolist(), "max": hi.tolist()},
         "solid_voxels": int(occ_lin.size),
         "glass_voxels": int(glass_lin.size),
-        "empty_voxels": empty_count,
-        "free_voxels": free_count,
-        "garbage_voxels": int(nx * ny * nz - occ_lin.size) - empty_count,
-        "rescued_voxels": rescued_cells,
-        "fill": fill_stats,
+        "empty_voxels": int(fill["empty_voxels"]),
+        "free_voxels": free_count,       # candidates passing the baked filter
+        "candidates": int(len(cand_pos)),
+        "garbage_voxels": int(fill["garbage_voxels"]),
+        "rescued_voxels": int(fill["rescued_cells"]),
+        "skin_bricks": int(fill["skin_lin"].size),
+        "zone_bricks": int(fill["zone_reached"].size + fill["zone_garbage"].size),
+        "fill": fill["stats"],
         "viz": {
             "cover_quads": int(len(cover_q)),
             "garbage_quads": int(len(garbage_q)),
+            "resolution": viz_res,
             "shells": [
                 {"clearance": round(t, 4), "quads": int(len(q)), "cells": c}
                 for t, q, cells in shells
                 for c in (cells,)
             ],
         },
-        "clearance_max": cl_max if empty_count else 0.0,
-        "clearance_mean": round(cl_mean, 4) if empty_count else 0.0,
         "params": params.as_summary(),
         "bytes": viz_path.stat().st_size,
         "grid_bytes": out_path.stat().st_size,

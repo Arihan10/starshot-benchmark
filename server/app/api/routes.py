@@ -201,8 +201,9 @@ _lite_build_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 # --- Stage 2 free-space voxelization jobs (background, one per CELL) ----------
 # The shared spatial foundation (Option A, runs first): the cell's splat tier
 # (de-optimized once) is voxelized into a single uniform occupancy grid whose
-# empty cells are classified free vs garbage by the two-phase flood fill, plus
-# a clearance field → `splat/freespace.npz` (splat/stage2.py), with a
+# empty cells are classified free vs garbage by the two-phase flood fill, and
+# the camera-placeable subset baked into a FREE mask → `splat/freespace.npz`
+# (+ `.empty.npy`/`.free.npy` mask sidecars, splat/stage2.py), with a
 # `voxels.bin` viz cloud + `freespace.json` sidecar so 'done' survives a restart.
 _splat_stage2_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_stage2_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
@@ -1922,15 +1923,17 @@ async def _run_splat_stage1_cell(run: str, slot: str, model: str) -> None:
 
 class Stage2Request(BaseModel):
     """Free-space voxelizer knobs (Stage 2 — the shared spatial foundation). All
-    optional; omitted → defaults. `pitch` (m) is the uniform voxel edge of the
-    single grid, `margin` (m) grows the exterior play volume, `clearance` (m) is
-    the baked FREE threshold (camera standoff from any surface). `workers` caps
-    the per-object voxelization pool (1 = serial, lowest peak RAM; omitted →
-    auto = min(cpu, 8))."""
+    optional; omitted → defaults. `pitch` (m) is the uniform fine voxel edge
+    (scene-size independent), `margin` (m) grows the exterior play volume,
+    `clearance` (m) is the baked candidate filter (camera standoff from any
+    surface), `coverage` (m) the camera band — air is explored/candidate-seeded
+    only within this distance of a surface. `workers` caps the per-object
+    voxelization pool (1 = serial, lowest peak RAM; omitted → auto)."""
 
     pitch: float | None = None
     margin: float | None = None
     clearance: float | None = None
+    coverage: float | None = None
     workers: int | None = None
 
 
@@ -1962,6 +1965,7 @@ def _stage2_params(req: Stage2Request | None) -> splat_stage2.FreeSpaceParams:
         pitch=float(min(max(req.pitch, 0.02), 1.0)) if req.pitch is not None else d.pitch,
         margin=float(min(max(req.margin, 0.0), 10.0)) if req.margin is not None else d.margin,
         clearance=_clamp_clearance(req.clearance) if req.clearance is not None else d.clearance,
+        coverage=float(min(max(req.coverage, 1.0), 20.0)) if req.coverage is not None else d.coverage,
         workers=max(1, min(int(req.workers), 32)) if req.workers is not None else d.workers,
     )
 
@@ -2545,7 +2549,15 @@ def _splat_stage_artifacts(run: str, slot: str, model: str) -> dict[int, list[Pa
     cams = _cameras_path(run, slot, model)
     return {
         1: [d / splat_stage1.MANIFEST_NAME],
-        2: [fs, fs.with_suffix(".json"), _voxels_path(run, slot, model)],
+        2: [
+            fs,
+            fs.with_suffix(".json"),
+            fs.with_name(fs.name + splat_stage2._SKIN_SIDECAR_SUFFIX),
+            # Older-layout sidecars, still listed so reverts scrub stale copies.
+            fs.with_name(fs.name + ".empty.npy"),
+            fs.with_name(fs.name + ".free.npy"),
+            _voxels_path(run, slot, model),
+        ],
         # cloud.detail.ply is the RETIRED detail-LOD twin; still listed so
         # reverts scrub any stale copy older runs left behind.
         3: [cloud, cloud.with_suffix(".json"), cloud.with_suffix(".detail.ply")],
@@ -3524,12 +3536,12 @@ def create_app() -> FastAPI:
     async def splat_stage2_clearance(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: Stage2ClearanceRequest
     ) -> dict[str, object]:
-        """RE-BAKE the FREE threshold of an existing free-space grid (the client
-        clearance slider's 'apply'): rewrites only the `clearance_m` scalar in
-        `freespace.npz` — no re-voxelization, and the viz pack stays valid (its
-        empty quads carry per-cell clearance). FREE feeds Stage 4's candidates
-        (Stage 3 reads EMPTY only), so stages 4+ are invalidated; Stage 3
-        survives. Returns the refreshed Stage-2 status."""
+        """RE-BAKE the candidate clearance filter of an existing free-space
+        grid (the client clearance slider's 'apply'). INSTANT: candidates
+        carry their distance-to-surface annotations, so only the `clearance_m`
+        scalar is rewritten. The filter feeds Stage 4's candidates (Stage 3
+        reads EMPTY only), so stages 4+ are invalidated; Stage 3 survives.
+        Returns the refreshed Stage-2 status."""
         key = (run, slot, model)
         existing = _splat_stage2_jobs.get(key)
         if existing is not None and existing.get("running"):
