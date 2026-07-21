@@ -216,20 +216,26 @@ def next_object_specs(zone_id: str) -> list[Any]:
 
 
 def next_done(zone_id: str) -> bool:
-    """True if the zone's anchor completion loop already TERMINATED — by either
-    of its two exits:
-      * `generation.next.done`  — the model said the zone is complete, or
-      * `generation.next.stuck` — the progress guard tripped (the model kept
-        re-proposing objects that can't be admitted).
+    """True if the zone's anchor completion loop already TERMINATED — by any of
+    its three exits:
+      * `generation.next.done`   — the model said the zone is complete,
+      * `generation.next.stuck`  — the progress guard tripped (the model kept
+        re-proposing objects that can't be admitted), or
+      * `generation.next.capped` — the optional round cap
+        (`STARSHOT_NEXT_OBJECT_CAP`) was reached.
 
-    Both are terminal, so resume must treat either as "loop complete". Counting
-    only `done` meant a zone that ended via the stuck guard had no marker, so
-    `next_done` stayed False and EVERY resume/rewind/fork re-ran (and re-got-
-    stuck on) that zone's `next_object` loop — blocking the resume from ever
-    reaching later zones (and re-billing the stuck calls each time)."""
+    All three are terminal, so resume must treat any of them as "loop complete".
+    Counting only `done` meant a zone that ended via the stuck guard had no
+    marker, so `next_done` stayed False and EVERY resume/rewind/fork re-ran (and
+    re-got-stuck on) that zone's `next_object` loop — blocking the resume from
+    ever reaching later zones (and re-billing the stuck calls each time). A
+    capped zone is terminal for the same reason: its cap decision is baked into
+    the log, so a resume replays the placed rounds and stops without re-deciding
+    (a rewind past the cap event is the way to re-open the loop)."""
     return (
         logging.find_event("generation.next.done", zone=zone_id) is not None
         or logging.find_event("generation.next.stuck", zone=zone_id) is not None
+        or logging.find_event("generation.next.capped", zone=zone_id) is not None
     )
 
 

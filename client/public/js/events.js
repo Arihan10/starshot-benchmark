@@ -179,6 +179,10 @@ const LOG_BUILDERS = {
         "warn",
         `${e.zone}: completion loop stuck re-proposing ${e.id ?? "?"} — stopped`,
     ],
+    "generation.next.capped": (e) => [
+        "info",
+        `${e.zone}: next-object cap reached (${e.rounds ?? "?"}/${e.cap ?? "?"} rounds) — stopped`,
+    ],
     "generation.dedup_drop": (e) => [
         "warn",
         `${e.zone}: dropped duplicate ${e.id} (${e.reason ?? ""})`,
@@ -497,6 +501,38 @@ export function createObsModel() {
     }
 
     return { model, feed, reset, rewindTerminal, lastCallOf, lastError };
+}
+
+// The pipeline steps that ran on/for a node — what the 3D hover tooltip lists
+// beneath the node's base info. Two sources, both pure tree data (no logs):
+//   * the node's OWN attributed calls (`event.node === id`): a zone's plan /
+//     decompose / next_object / bbox-batch rounds, an object's image_prompt, …
+//   * its PROVENANCE calls — the decompose that NAMED it (`emitted_by`) and the
+//     bbox-batch that PLACED it (`placed_by`), which ran on its region but are
+//     what brought it into being.
+// Deduped by step name (a step run many times — object_bbox_batch, next_object —
+// collapses to one entry carrying its `count`), ordered by first execution, each
+// tagged with its provenance `relation` ("emitted_by"/"placed_by") when it has
+// one and its `flightMs` — the step's grouped flight time, summed across the
+// step's calls (null when none of them carry timing).
+export function nodeStepsOf(model, id) {
+    if (!model || !id) return [];
+    const byStep = new Map(); // step name -> { step, count, index, relation, flightMs }
+    const add = (call, relation) => {
+        const step = call.template ?? call.step ?? "?";
+        let e = byStep.get(step);
+        if (!e) {
+            e = { step, count: 0, index: call.index ?? 0, relation: relation ?? null, flightMs: null };
+            byStep.set(step, e);
+        }
+        e.count += 1;
+        if (typeof call.index === "number" && call.index < e.index) e.index = call.index;
+        if (relation && !e.relation) e.relation = relation;
+        if (typeof call.flight_ms === "number") e.flightMs = (e.flightMs ?? 0) + call.flight_ms;
+    };
+    for (const p of model.provenance?.get(id) ?? []) add(p.call, p.relation);
+    for (const c of model.nodes.get(id)?.calls ?? []) add(c, null);
+    return [...byStep.values()].sort((a, b) => a.index - b.index);
 }
 
 // The decomposition step recorded as a node's `emitted_by` provenance — the

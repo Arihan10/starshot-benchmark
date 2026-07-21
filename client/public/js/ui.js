@@ -500,3 +500,58 @@ export function diffPre(oldStr, newStr) {
   }
   return pre;
 }
+
+// --- LLM-call timing (shared by the sidebar call rows' hover) ----------------
+// Formatted to match the api log's own cards so a call reads identically whether
+// hovered in the scene sidebar or opened in the flight ledger. All values come
+// from the slim `cache.llm` event the obs tree already holds — no log fetch.
+
+const _MON = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Provider latency, formatted like the log ("340 ms" / "1.2 s" / "1m 5s").
+export function fmtDurationMs(ms) {
+  if (ms == null) return "--";
+  if (ms < 1000) return `${ms} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  const m = Math.floor(ms / 60_000);
+  return `${m}m ${Math.round((ms % 60_000) / 1000)}s`;
+}
+
+// Exact wall-clock of a call boundary ("Jul 18, 05:38:12.481 PM"); `ts` is epoch seconds.
+export function fmtClockTime(ts) {
+  if (!ts) return "—";
+  const d = new Date(ts * 1000);
+  let h = d.getHours();
+  const ap = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  return `${_MON[d.getMonth()]} ${d.getDate()}, ${p(h)}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)} ${ap}`;
+}
+
+// Completion tokens per wall-clock second of the (final) provider call — the
+// log's throughput. null when either side is missing (a seeded / legacy call).
+export function callThroughput(call) {
+  if (!call || call.tokens_out == null || !call.flight_ms) return null;
+  return call.tokens_out / (call.flight_ms / 1000);
+}
+
+// A call's execution stats as a multi-line hover string for the sidebar call
+// rows: generation time (provider latency, + retry count), token throughput,
+// token counts, and the exact request/response wall-clock times. "" when the
+// call carries no timing (a seeded prompt-lab result / legacy log), so callers
+// can `|| fallback` another title.
+export function callTimingTitle(call) {
+  if (!call) return "";
+  const lines = [];
+  if (call.flight_ms != null) {
+    const tries = (call.attempts ?? 1) > 1 ? ` · ${call.attempts} attempts` : "";
+    lines.push(`generation time: ${fmtDurationMs(call.flight_ms)}${tries}`);
+  }
+  const tp = callThroughput(call);
+  if (tp != null) lines.push(`throughput: ${tp.toFixed(1)} tok/s`);
+  if (call.tokens_in != null || call.tokens_out != null)
+    lines.push(`tokens: ${call.tokens_in ?? "?"} in → ${call.tokens_out ?? "?"} out`);
+  if (call.t_request != null) lines.push(`requested: ${fmtClockTime(call.t_request)}`);
+  if (call.t_response != null) lines.push(`responded: ${fmtClockTime(call.t_response)}`);
+  return lines.join("\n");
+}

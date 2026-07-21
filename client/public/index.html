@@ -2054,6 +2054,22 @@
 				border-color: var(--accent);
 				background: rgba(154, 212, 255, 0.16);
 			}
+			/* "obs ↗" — jump from a truncated trace step to its full call in the
+			   observability panel (trace panel only). */
+			.call-obs {
+				font-size: 9px;
+				padding: 1px 7px;
+				color: var(--amber);
+				border: 1px solid var(--amber);
+				border-radius: 4px;
+				background: transparent;
+				white-space: nowrap;
+			}
+			.call-obs:hover {
+				color: #ffe6b0;
+				border-color: var(--amber);
+				background: rgba(240, 200, 120, 0.16);
+			}
 			/* obs dock emit-trace mode (root → object lineage of one node). */
 			.obs-call.emits .step-badge {
 				border-color: var(--amber);

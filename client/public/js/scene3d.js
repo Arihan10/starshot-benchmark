@@ -13,6 +13,7 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { fmtDurationMs } from "./ui.js";
 
 const BBOX_COLOR_DEFAULT = 0xff3b3b; // zones
 // Objects are colored by the decomposition step that emitted them, so the
@@ -436,6 +437,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// Overlay-provided callbacks: node info for the tooltip + hidden-state
 	// ancestor walks, selection / hidden-set sync to the observability tree.
 	let nodeInfo = () => null;
+	// Overlay-provided: the pipeline steps that ran on/for a node (its own calls +
+	// the provenance that named/placed it), listed in the hover tooltip. Defaults
+	// to none — the mini / compare viewers don't wire it, so their tooltip stays
+	// id + base info.
+	let nodeSteps = () => [];
 	let onSelectCb = () => {};
 	let onHiddenChangeCb = () => {};
 	// Overlay-provided: the decomposition step that emitted a node (its
@@ -922,6 +928,37 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			row.appendChild(lbl);
 			row.appendChild(document.createTextNode(text));
 			tooltip.appendChild(row);
+		}
+		// The pipeline steps that ran on/for this node — not just its base info.
+		// One PER LINE: the step name (×count when it ran more than once), tagged
+		// (generated)/(placed) for the provenance calls that named/positioned the
+		// node, and the step's grouped flight time (summed across its calls).
+		const steps = nodeSteps(id);
+		if (steps.length) {
+			const relTag = { emitted_by: "generated", placed_by: "placed" };
+			const head = document.createElement("div");
+			head.textContent = "steps:";
+			head.style.marginTop = "4px";
+			head.style.color = "#7a8190";
+			tooltip.appendChild(head);
+			for (const s of steps) {
+				const row = document.createElement("div");
+				row.style.color = "#bdbdbd";
+				row.style.paddingLeft = "10px";
+				row.appendChild(
+					document.createTextNode(
+						`${s.step}${s.count > 1 ? ` ×${s.count}` : ""}` +
+							`${s.relation ? ` (${relTag[s.relation] ?? s.relation})` : ""}`,
+					),
+				);
+				if (s.flightMs != null) {
+					const t = document.createElement("span");
+					t.textContent = ` · ${fmtDurationMs(s.flightMs)}`;
+					t.style.color = "#8a9099";
+					row.appendChild(t);
+				}
+				tooltip.appendChild(row);
+			}
 		}
 		placeTooltip(clientX, clientY);
 	}
@@ -2308,6 +2345,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		isHidden: (id) => hiddenIds.has(id),
 		setNodeInfo: (fn) => {
 			nodeInfo = fn;
+		},
+		setNodeSteps: (fn) => {
+			nodeSteps = fn;
 		},
 		setOriginOf: (fn) => {
 			originOf = fn;

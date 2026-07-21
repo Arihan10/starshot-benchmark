@@ -17,6 +17,7 @@ import {
 	applySceneProjection,
 	createObsModel,
 	emittedStep,
+	nodeStepsOf,
 } from "./events.js";
 import { statusView } from "./status.js";
 import { createObsDock } from "./obstree.js";
@@ -80,6 +81,9 @@ export function initOverlay(sceneViewer) {
 		onClose: () => viewer.clearSelection(),
 		onInquire: investigateCall,
 		onOpenLog: openLogForCall,
+		// "obs ↗" on a trace step → expand + reveal that same call in the
+		// observability dock (its full, untruncated bytes vs. the trace's node slice).
+		onOpenInObs: (call) => dock.expandCall(call),
 		loadCallBytes,
 		// Project (or clear) a focused-object map onto its mesh; returns whether it
 		// took. `mapProjectionOf` reads the viewer's live state back for the panel.
@@ -203,6 +207,10 @@ export function initOverlay(sceneViewer) {
 	// without toggling it off. 3D-side picks highlight + reveal the tree row,
 	// and the hover tooltip reads seed/plan/image text from the obs model.
 	viewer.setNodeInfo((id) => obs.model.nodes.get(id) ?? null);
+	// Hovering a bbox in 3D lists the pipeline steps that ran on/for the node
+	// (its calls + the provenance that named/placed it) under its base info —
+	// read from the same folded obs model the tree uses.
+	viewer.setNodeSteps((id) => nodeStepsOf(obs.model, id));
 	// Color objects in 3D by the decomposition step that emitted them (next_object
 	// purple, anchor green, negative_space brown) — read from the same provenance
 	// the tree shows as "via {step}". `recolorAll` (below) repaints once a load's

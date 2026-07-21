@@ -2471,32 +2471,61 @@ def create_app() -> FastAPI:
         its settled spend, RESUME it (a plain /resume stays refused while capped);
         if it's live and the new ceiling is already breached, stop it the way the
         backfill enforcer would. 400 when the cap system is off, 409 on a cell that
-        hasn't started (nothing to cap) or is complete."""
+        hasn't started (nothing to cap) or is complete.
+
+        Never force-loads the event log: a cell's log can be multiple GB (Kimi at
+        max reasoning), and materializing it here is what used to OOM mid-parse and
+        then leave the cell's state permanently broken (`KeyError: 'events'`). A
+        cell whose events aren't already in memory is read via the bounded
+        streaming reader (off the event loop) and its override is appended straight
+        to disk. Auto-resume — which reloads the whole log — is therefore only done
+        for an already-loaded cell; an unloaded multi-GB cell has its cap set and
+        stays paused for an explicit resume."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         if SPEND_CAP_USD <= 0:
             raise HTTPException(status_code=400, detail="spend cap is disabled")
-        events = slot_log.state["events"]
+        # Loaded cells read/append in memory (kept in sync). An unloaded cell
+        # streams slim events in bounded memory off the loop — the same reader the
+        # board summary uses — and never materializes its (possibly multi-GB) log.
+        loaded = slot_log.loaded
+        if loaded:
+            events = slot_log.state["events"]
+        else:
+            events = await asyncio.to_thread(
+                lambda: list(cellsummary.iter_events(slot_log.events_path))
+            )
         if not any(e.get("kind") == "run.start" for e in events):
             raise HTTPException(status_code=409, detail="cell hasn't started")
         if any(e.get("kind") == "run.done" for e in events):
             raise HTTPException(status_code=409, detail="run is complete")
         new_cap = max(0.0, float(req.cap))
+        spend = _cell_spend(events)
         was_capped = _cap_reached(events)
-        slot_log.log("run.cap_override", cap=new_cap, spend=_cell_spend(events))
+        if loaded:
+            slot_log.log("run.cap_override", cap=new_cap, spend=spend)
+        else:
+            slot_log.append_unloaded("run.cap_override", len(events), cap=new_cap, spend=spend)
         key: RunKey = (run, slot_id, model_alias)
         resumed = False
-        if _cap_reached(events) and _live(_tasks.get(key)):
-            # Lowered below what's already been spent while still running — stop
-            # it now rather than waiting on the next settled cost to trip it.
+        # The override event carries no cost, so settled spend is unchanged and the
+        # new capped state is a direct comparison against the new ceiling — no
+        # re-fold of the (possibly huge) log needed.
+        now_capped = new_cap > 0 and spend >= new_cap
+        if now_capped and _live(_tasks.get(key)):
+            # Lowered below what's already been spent while still running — stop it
+            # now rather than waiting on the next settled cost to trip it. A live
+            # cell's events are in memory, so log() is safe here.
             await _cancel_task(*key)
-            slot_log.log("run.cap_reached", spend=_cell_spend(events), cap=new_cap)
-        elif was_capped and not _cap_reached(events) and not _live(_tasks.get(key)):
+            slot_log.log("run.cap_reached", spend=spend, cap=new_cap)
+        elif was_capped and not now_capped and not _live(_tasks.get(key)) and loaded:
             # The cap was the only thing holding it and the new ceiling clears
             # spend. A stepped cell gets a one-call budget so it advances like a
-            # /step relaunch rather than running free.
+            # /step relaunch rather than running free. Only auto-resumed when the
+            # log is already loaded — resuming reloads the whole log, which a
+            # multi-GB unloaded cell can't afford.
             if key in _stepped_cells:
                 _gate_intents[key] = {"budget": 1}
             await _start_cell(run, slot_id, model_alias)
@@ -4153,7 +4182,17 @@ def _cell_summary(
     cached = cache_rows.get(scene)
     if cached is not None and cached[0] == sig:
         return cached[1]
-    summary = cellsummary.summarize(slot_log.state["events"])
+    # Fold from the in-memory list when it's already loaded, else via the bounded
+    # streaming reader — so a cache miss on a multi-GB log (Kimi at max reasoning)
+    # is summarized without ever materializing it, which would OOM the poll. This
+    # is the same reader the board-cache pre-warm uses, and it yields the identical
+    # summary (it keeps every field the folds read).
+    events = (
+        slot_log.state["events"]
+        if slot_log.loaded
+        else list(cellsummary.iter_events(slot_log.events_path))
+    )
+    summary = cellsummary.summarize(events)
     boardcache.put(_run_dir(run), scene, sig, summary)
     return summary
 

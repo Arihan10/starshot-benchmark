@@ -14,7 +14,7 @@
 // rebuilt only when the focus changes (or its data streams in), so the mini
 // viewer's WebGL context survives the body's frequent rebuilds.
 
-import { el, foldedPre, fmtJson, shortBytes } from "./ui.js";
+import { el, foldedPre, fmtJson, shortBytes, callTimingTitle, fmtClockTime } from "./ui.js";
 import { emittanceLineage, extractRelevantOutput } from "./events.js";
 import { createViewer } from "./scene3d.js";
 import { api } from "./api.js";
@@ -47,6 +47,10 @@ export function createTracePanel(
 		onClose = () => {},
 		onInquire = null,
 		onOpenLog = null,
+		// Jump from a (node-truncated) trace step to its FULL call in the
+		// observability panel — expands + scrolls that call open in the obs dock.
+		// null hides the affordance.
+		onOpenInObs = null,
 		// Fetch a slim call's heavy bytes on demand (history/live streams omit
 		// them); hydrates the shared call object in place. null = calls already
 		// carry full bytes inline (nothing to fetch).
@@ -1266,6 +1270,18 @@ export function createTracePanel(
 				.filter(Boolean)
 				.join(" · "),
 		}));
+		// Exact request/response wall-clock — the call's start and end (matches the
+		// api log's detail). Only when timing was recorded (not a seeded/legacy call).
+		if (call.t_request != null || call.t_response != null) {
+			detail.appendChild(el("div", {
+				class: "muted",
+				style: "margin-bottom:6px",
+				text: [
+					call.t_request != null ? `requested ${fmtClockTime(call.t_request)}` : null,
+					call.t_response != null ? `responded ${fmtClockTime(call.t_response)}` : null,
+				].filter(Boolean).join(" · "),
+			}));
+		}
 		detail.appendChild(outputSection(call, nodeId));
 		detail.appendChild(collapsedSection("input (user)", call.user ?? "", {
 			variables: call.variables,
@@ -1289,6 +1305,9 @@ export function createTracePanel(
 			"div",
 			{
 				class: `obsm-call tp-call${relation === "emitted_by" ? " emits" : ""}`,
+				// Hover shows the call's execution stats: generation time (provider
+				// latency), token throughput, and the exact request/response times.
+				title: callTimingTitle(call),
 				onclick: () => {
 					if (expandedCalls.has(call.index)) {
 						expandedCalls.delete(call.index);
@@ -1338,6 +1357,18 @@ export function createTracePanel(
 						onclick: (ev) => {
 							ev.stopPropagation();
 							onOpenLog(call);
+						},
+					})
+				: null,
+			onOpenInObs
+				? el("button", {
+						class: "call-obs",
+						text: "obs ↗",
+						style: onInquire || onOpenLog ? "" : "margin-left:auto",
+						title: "open this call in the observability panel — its full, untruncated system / user / output (this trace shows only this node's slice)",
+						onclick: (ev) => {
+							ev.stopPropagation();
+							onOpenInObs(call);
 						},
 					})
 				: null,

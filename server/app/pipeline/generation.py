@@ -1967,6 +1967,28 @@ def cancel_pending(run_id: str) -> None:
         t.cancel()
 
 
+def _next_object_cap() -> int | None:
+    """Optional ceiling on how many `next_object` ROUNDS an anchor zone runs —
+    each round being one `next_object` LLM call that proposes objects plus the
+    single `object_bbox_batch` that places them (the anchor_decompose pass that
+    precedes the loop is never counted).
+
+    Read live from `STARSHOT_NEXT_OBJECT_CAP` so it can change between runs
+    without a restart. Unset, non-numeric, or negative → UNCAPPED (loop until the
+    model itself says the zone is complete); `0` → run no rounds at all; `N` →
+    stop after N placing rounds. The cap is checked BEFORE issuing each call, so a
+    capped loop never spends an extra `next_object` call just to read the model's
+    stop signal — at the cap it moves straight to the next pipeline step."""
+    raw = os.environ.get("STARSHOT_NEXT_OBJECT_CAP", "").strip()
+    if not raw:
+        return None
+    try:
+        cap = int(raw)
+    except ValueError:
+        return None
+    return cap if cap >= 0 else None
+
+
 async def run(
     *,
     zone: Node,
@@ -2010,6 +2032,12 @@ async def run(
     # intra-round parent/relationship resolution intact. Then stop if the loop
     # had run to completion; otherwise fall through to fresh `next_object`
     # rounds.
+    #
+    # Optional next_object round cap (see `_next_object_cap`). Rounds already
+    # committed — replayed just below on resume — count toward it, so a resumed
+    # capped run can't overshoot the ceiling a prior process already reached.
+    cap = _next_object_cap()
+    rounds = 0
     for group in committed.next_object_rounds(zone.id):
         replayed = await _resolve_and_generate(
             specs=group,
@@ -2020,6 +2048,7 @@ async def run(
             run_id=run_id,
         )
         all_nodes.extend(replayed)
+        rounds += 1
     if committed.next_done(zone.id):
         return
 
@@ -2040,6 +2069,21 @@ async def run(
     # `object_bbox_batch` rather than one call per object.
     attempted: set[str] = set()
     while True:
+        # Cap reached: stop WITHOUT issuing another `next_object` call — the
+        # requirement is that a cap of N places objects across N rounds and then
+        # moves on, never spending an extra call just to fetch the model's stop
+        # signal. Recorded as a third terminal exit alongside `.done`/`.stuck` so
+        # resume/rewind/fork treat the zone as complete (see `committed.next_done`)
+        # rather than re-entering the loop.
+        if cap is not None and rounds >= cap:
+            logging.log_once(
+                "generation.next.capped",
+                match_fields=("zone",),
+                zone=zone.id,
+                cap=cap,
+                rounds=rounds,
+            )
+            return
         done, objects = await _next_object_batch(
             zone=zone,
             all_nodes=all_nodes,
@@ -2078,3 +2122,4 @@ async def run(
             run_id=run_id,
         )
         all_nodes.extend(new_nodes)
+        rounds += 1

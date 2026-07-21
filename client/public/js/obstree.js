@@ -8,7 +8,7 @@
 // an independent full dock from one implementation. The host is laid out as a
 // flex column (head / pinned / body / log); the dock fills it.
 
-import { el, fitToggle, fmtJson, shortBytes, foldedPre } from "./ui.js";
+import { el, fitToggle, fmtJson, shortBytes, foldedPre, callTimingTitle, fmtClockTime } from "./ui.js";
 import { callEmits } from "./obsmini.js";
 
 // `trace:false` keeps the dock a pure node tree + log — clicking a node row
@@ -265,7 +265,9 @@ export function createObsDock(hostEl, { trace = true } = {}) {
             if (typeof call.node === "string") onNodeClick(call.node, { ensureSelected: true });
             toggleCall(call);
           },
-          title: seeded ? "seeded from a prompt-lab test result" : "",
+          // Hover shows the call's execution stats (generation time, throughput,
+          // request/response times); a seeded call has no timing, so note that instead.
+          title: callTimingTitle(call) || (seeded ? "seeded from a prompt-lab test result" : ""),
         },
         el("span", { class: "call-caret", text: expanded ? "▾" : "▸" }),
         el("span", { class: "step-badge", text: call.template ?? call.step ?? "?" }),
@@ -339,6 +341,18 @@ export function createObsDock(hostEl, { trace = true } = {}) {
         call.seeded ? "SEEDED from a vetted prompt-lab test (no live call)" : null,
       ].filter(Boolean).join(" · "),
     }));
+    // Exact request/response wall-clock — the call's start and end (matches the
+    // api log's detail). Only when timing was recorded (not a seeded/legacy call).
+    if (call.t_request != null || call.t_response != null) {
+      detail.appendChild(el("div", {
+        class: "muted",
+        style: "margin-bottom:6px",
+        text: [
+          call.t_request != null ? `requested ${fmtClockTime(call.t_request)}` : null,
+          call.t_response != null ? `responded ${fmtClockTime(call.t_response)}` : null,
+        ].filter(Boolean).join(" · "),
+      }));
+    }
     detail.appendChild(section("system — exact bytes sent", call.system ?? "", { variables: call.variables, open: false }));
     detail.appendChild(section("user — exact bytes sent", call.user ?? "", { variables: call.variables, open: false }));
     detail.appendChild(section("output — exact bytes received", fmtJson(call.output)));

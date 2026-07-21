@@ -220,9 +220,18 @@ class _LazyState(dict):
         self.events_loaded = False
 
     def ensure_events(self) -> None:
-        if not self.events_loaded:
-            self.events_loaded = True
-            dict.__setitem__(self, "events", self._load_events())
+        # Mark loaded only AFTER a successful parse. Setting the flag first meant a
+        # failed load (e.g. a MemoryError materializing a multi-GB log) left the
+        # flag True with no `events` key — poisoning the state so every later
+        # access raised a misleading `KeyError: 'events'` forever instead of
+        # retrying. Now a failed load leaves the flag False (the exception
+        # propagates, surfacing the REAL error, and the next access retries), and
+        # the `not-contains` guard heals a state already poisoned that way.
+        if self.events_loaded and dict.__contains__(self, "events"):
+            return
+        events = self._load_events()
+        dict.__setitem__(self, "events", events)
+        self.events_loaded = True
 
     def __getitem__(self, key: str) -> Any:
         if key == "events":
@@ -416,6 +425,24 @@ class SlotLog:
         _print(self.slot_id, event)
         for q in self.subscribers:
             q.put_nowait(event)
+
+    def append_unloaded(self, kind: str, index: int, **data: Any) -> dict[str, Any]:
+        """Append ONE event to disk (and broadcast) at `index`, WITHOUT loading a
+        lazily-hydrated log into memory — for an external writer (e.g. a spend-cap
+        override) acting on a cell whose log is too large to materialize. `index`
+        is the on-disk event count the caller already computed from a bounded
+        stream (`cellsummary.iter_events`), so it continues the log's position
+        sequence. `log()` stays the path for a loaded cell (it keeps
+        `state['events']` in sync); this deliberately leaves the events unloaded,
+        so the next load picks the appended event up from disk."""
+        event: dict[str, Any] = {"index": index, "ts": time.time(), "kind": kind, **data}
+        f = self._ensure_events_append()
+        f.write(json.dumps(event) + "\n")
+        f.flush()
+        _print(self.slot_id, event)
+        for q in self.subscribers:
+            q.put_nowait(event)
+        return event
 
     def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
         q: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
