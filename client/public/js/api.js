@@ -123,13 +123,17 @@ export const api = {
 				include_overall_bbox: includeOverallBbox,
 			},
 		}),
-	// Copy an entire slot folder (every model cell + its meshes) from
-	// `sourceRun` into `destRun`, OVERWRITING destRun's slot. Returns
-	// {run, source_run, slot, copied:[...], replaced:[...]}.
-	copySlot: (destRun, sourceRun, slot) =>
-		request(`/runs/${encodeURIComponent(destRun)}/copy-slot`, {
+	// Start the target cell (`run`/`slot`/`model`) seeded with ANOTHER cell's
+	// committed ROOT zone plan + overall bounding box. The source cell
+	// (`sourceSlot`, `sourceModel`) on the same run is copied through its root
+	// zone plan + overall bbox; the target replays that fixed plan + canvas and
+	// re-derives everything inside it under its own prompt + model. Returns
+	// {run, slot_id, model, source_slot, source_model, seed_events}.
+	seedStart: (run, slot, model, sourceSlot, sourceModel) =>
+		request(cellPath(slot, model, "/seed-start"), {
 			method: "POST",
-			body: { source_run: sourceRun, slot },
+			params: { run },
+			body: { source_slot: sourceSlot, source_model: sourceModel },
 		}),
 	// Copy ONE cell (log + meshes) for a shared `slot` from
 	// (`sourceRun`, `sourceModel`) into (`destRun`, `destModel`), OVERWRITING the

@@ -696,13 +696,17 @@ class AbTestRequest(BaseModel):
     include_overall_bbox: bool = False
 
 
-class CopySlotRequest(BaseModel):
-    """Copy an entire slot folder (all its model cells + meshes) from
-    `source_run` into the destination run (the path `run`), OVERWRITING the
-    destination's slot dir. The source run is left untouched."""
+class SeedStartRequest(BaseModel):
+    """Start the target cell (the path `slot_id`/`model_alias` on `run`) seeded
+    with ANOTHER cell's ROOT zone plan + overall bounding box. The source cell
+    (`source_slot`, `source_model`) on the same run is copied through its root
+    `divider.zone_plan` and root `bbox` and no further; the target then replays
+    that fixed plan + canvas verbatim and re-derives everything inside it under
+    the TARGET scene's own prompt + model. Source and target may differ in slot
+    and/or model. The source cell is left untouched."""
 
-    source_run: str
-    slot: str
+    source_slot: str
+    source_model: str
 
 
 class CopyCellRequest(BaseModel):
@@ -3246,6 +3250,81 @@ def create_app() -> FastAPI:
             slot_log.state["model"] = MODELS[model_alias]
         return {"run": run, "slot_id": slot.id, "model": model_alias}
 
+    @app.post("/slots/{slot_id}/{model_alias}/seed-start")
+    async def slot_seed_start(  # pyright: ignore[reportUnusedFunction]
+        slot_id: str,
+        model_alias: str,
+        req: SeedStartRequest,
+        run: str | None = None,
+    ) -> dict[str, object]:
+        """Start the target cell seeded with ANOTHER cell's committed ROOT zone
+        plan + overall bounding box. The source cell (`source_slot`,
+        `source_model`) on the same run is copied through its root
+        `divider.zone_plan` and root `bbox`; the target is wiped (as reset does),
+        given that prefix, and started — so the resumable divider replays the
+        fixed plan + canvas verbatim and re-derives everything inside it under
+        the TARGET scene's own prompt + model. Source and target may differ in
+        slot and/or model (holding the plan fixed while varying the model is the
+        core benchmark comparison). The source cell is untouched."""
+        run = _resolve_run(run)
+        slot = _require_slot(slot_id)
+        _require_model(model_alias)
+        _require_run_prompts(run)
+        _require_slot(req.source_slot)
+        _require_model(req.source_model)
+        if (req.source_slot, req.source_model) == (slot_id, model_alias):
+            raise HTTPException(status_code=400, detail="source and target are the same cell")
+        src_log = _require_slot_log(run, req.source_slot, req.source_model)
+        cut = _root_plan_cut(src_log.state["events"], through_overall_bbox=True)
+        if cut is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"source cell {req.source_slot}/{req.source_model} has no committed "
+                    "root zone plan + overall bounding box to seed from"
+                ),
+            )
+        # Re-stamp the copied prefix's run.start to the TARGET cell's prompt +
+        # model: the re-run then issues the target model's calls under the target
+        # scene's prompt, while the committed root plan + bbox — looked up by node
+        # id, so prompt/model-independent — still replay verbatim. Everything else
+        # in the prefix is kept as-is; a true contiguous prefix resumes cleanly.
+        seed = [dict(e) for e in src_log.state["events"][:cut]]
+        for e in seed:
+            if e.get("kind") == "run.start":
+                e["prompt"] = slot.prompt
+                e["model"] = MODELS[model_alias]
+                break
+        # Wipe the target cell exactly as reset does before writing the seed, so
+        # no live task / generation / branch races the dir we replace.
+        key: RunKey = (run, slot.id, model_alias)
+        await _discard_branches_of_cell(run, slot.id, model_alias)
+        await _cancel_task(run, slot_id, model_alias)
+        await _cancel_cell_generation(run, slot.id, model_alias)
+        _set_stepped(key, False)
+        _gate_intents.pop(key, None)
+        slot_dir = _slot_dir(run, slot.id, model_alias)
+        shutil.rmtree(slot_dir, ignore_errors=True)
+        slot_dir.mkdir(parents=True, exist_ok=True)
+        old_log = _slot_logs.get(key)
+        if old_log is not None:
+            old_log.close()
+        with (slot_dir / "events.jsonl").open("w", encoding="utf-8") as f:
+            for e in seed:
+                f.write(json.dumps(e) + "\n")
+        slot_log = SlotLog(_run_id(run, slot.id, model_alias), slot_dir / "events.jsonl")
+        slot_log.hydrate_from_disk()
+        _slot_logs[key] = slot_log
+        await _start_cell(run, slot.id, model_alias)
+        return {
+            "run": run,
+            "slot_id": slot.id,
+            "model": model_alias,
+            "source_slot": req.source_slot,
+            "source_model": req.source_model,
+            "seed_events": cut,
+        }
+
     @app.post("/slots/{slot_id}/{model_alias}/delete-object/{node_id}")
     async def slot_delete_object(  # pyright: ignore[reportUnusedFunction]
         slot_id: str,
@@ -3957,91 +4036,6 @@ def create_app() -> FastAPI:
             "current": name,
             "seeded": [f"{s}/{m}" for s, m in seeded],
             "skipped": skipped,
-        }
-
-    @app.post("/runs/{run}/copy-slot")
-    async def copy_slot(run: str, req: CopySlotRequest) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Copy an entire slot folder (all its model cells + meshes) from
-        `source_run` into this run, OVERWRITING this run's slot dir. Every live
-        task / generate-regen worker / sim branch on the destination's cells for
-        this slot is torn down first (as reset does), then the source slot is
-        copied over and object URLs in the copied logs are rewritten to this run
-        so meshes/images resolve here. The source run is untouched."""
-        dest_run = run
-        source_run = req.source_run
-        slot = _require_slot(req.slot)
-        if source_run == dest_run:
-            raise HTTPException(status_code=400, detail="source and destination runs are the same")
-        if not _run_dir(source_run).is_dir():
-            raise HTTPException(status_code=404, detail=f"unknown source run: {source_run}")
-        if not _run_dir(dest_run).is_dir():
-            raise HTTPException(status_code=404, detail=f"unknown run: {dest_run}")
-        src_slot_dir = _run_dir(source_run) / slot.id
-        if not src_slot_dir.is_dir() or not any(
-            (src_slot_dir / alias / "events.jsonl").is_file() for alias in MODEL_ALIASES
-        ):
-            raise HTTPException(status_code=400, detail=f"slot {slot.id!r} has no data in run {source_run!r}")
-        _hydrate_run(source_run)
-        _hydrate_run(dest_run)
-        # Tear down every destination cell under this slot so nothing writes into
-        # the dir we're about to replace (same teardown reset does, applied to the
-        # whole slot row), and note which had data — the "replaced" report.
-        replaced: list[str] = []
-        for alias in MODEL_ALIASES:
-            key: RunKey = (dest_run, slot.id, alias)
-            dest_log = _slot_logs.get(key)
-            if dest_log is not None and dest_log.state["events"]:
-                replaced.append(f"{slot.id}/{alias}")
-            await _discard_branches_of_cell(dest_run, slot.id, alias)
-            await _cancel_task(dest_run, slot.id, alias)
-            await _cancel_cell_generation(dest_run, slot.id, alias)
-            _set_stepped(key, False)
-            _gate_intents.pop(key, None)
-            if dest_log is not None:
-                dest_log.close()
-                _slot_logs.pop(key, None)
-        dest_slot_dir = _run_dir(dest_run) / slot.id
-
-        def _copy() -> None:
-            shutil.rmtree(dest_slot_dir, ignore_errors=True)
-            shutil.copytree(src_slot_dir, dest_slot_dir)
-            # Repoint object/image URLs from the source cell path to this run's,
-            # per model cell (GLBs load by id regardless; this keeps image-hover
-            # URLs valid and self-contained even if the source run is deleted).
-            for alias in MODEL_ALIASES:
-                events_path = dest_slot_dir / alias / "events.jsonl"
-                if not events_path.is_file():
-                    continue
-                src_seg = f"/{source_run}/{slot.id}/{alias}/objects/"
-                dst_seg = f"/{dest_run}/{slot.id}/{alias}/objects/"
-                text = events_path.read_text(encoding="utf-8")
-                if src_seg in text:
-                    events_path.write_text(text.replace(src_seg, dst_seg), encoding="utf-8")
-
-        await asyncio.to_thread(_copy)
-        # Rebuild the destination slot's SlotLogs from the copied logs (mirrors
-        # _hydrate_run for this slot), restoring any stepped markers the copy
-        # brought over. Nothing is auto-launched — the cells come in whatever
-        # state their copied log implies.
-        copied: list[str] = []
-        for alias in MODEL_ALIASES:
-            cell_dir = dest_slot_dir / alias
-            cell_dir.mkdir(parents=True, exist_ok=True)
-            key = (dest_run, slot.id, alias)
-            new_log = SlotLog(_run_id(dest_run, slot.id, alias), cell_dir / "events.jsonl")
-            new_log.hydrate_from_disk()
-            _slot_logs[key] = new_log
-            _maybe_launch(slot, alias, new_log)
-            if (cell_dir / ".stepped").exists():
-                _stepped_cells.add(key)
-            if new_log.state["events"]:
-                copied.append(f"{slot.id}/{alias}")
-        return {
-            "run": dest_run,
-            "source_run": source_run,
-            "slot": slot.id,
-            "copied": copied,
-            "replaced": replaced,
         }
 
     @app.post("/runs/{run}/copy-cell")

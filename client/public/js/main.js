@@ -482,69 +482,97 @@ async function abTestModal() {
   }));
 }
 
-// Copy a whole slot folder (every model cell + its meshes) from THIS run into
-// another run, overwriting that run's slot. Warns first about any populated
-// cells in the destination slot that the copy would delete/replace.
-async function copySlotModal() {
+// Start a scene's generation seeded with ANOTHER scene's committed root zone
+// plan + overall bounding box: pick a SOURCE cell to grab the plan + canvas
+// from and the TARGET cell (slot + model) to run. The target replays that fixed
+// plan + bbox verbatim and re-derives everything inside it under its OWN prompt
+// + model — so holding a source fixed while varying the target model is the
+// benchmark's core comparison. The target is reset first; the source is
+// untouched. The server rejects a source with no committed root plan + bbox.
+async function seedStartModal() {
   if (!state.run) return;
-  const sourceRun = state.run;
-  const populated = state.slots.filter((s) => state.models.some((m) => (s.runs?.[m]?.events_count ?? 0) > 0));
-  if (!populated.length) { toast(`no slots with data in "${sourceRun}" to copy`, "err"); return; }
-  const others = state.runs.map((r) => r.name).filter((n) => n !== sourceRun);
-  if (!others.length) { toast("no other run to copy into — create one first", "err"); return; }
-
-  const slotSel = el("select", {}, populated.map((s) => el("option", { value: s.id, text: s.id })));
-  const destSel = el("select", {}, others.map((n) => el("option", { value: n, text: n })));
-  const warnEl = el("div", { class: "m-hint" });
-
-  // Preflight the destination: list any of its cells under the chosen slot that
-  // already have data (they'd be deleted/replaced by the overwrite).
-  async function refreshWarn() {
-    const destRun = destSel.value;
-    const slotId = slotSel.value;
-    warnEl.className = "m-hint";
-    warnEl.textContent = "checking destination…";
-    let cells = null;
-    try {
-      const payload = await api.slots(destRun);
-      const s = payload.slots.find((x) => x.id === slotId);
-      cells = s ? Object.entries(s.runs || {}).filter(([, c]) => (c?.events_count ?? 0) > 0).map(([m]) => m) : [];
-    } catch { cells = null; }
-    if (destSel.value !== destRun || slotSel.value !== slotId) return; // a later change superseded this
-    if (cells === null) { warnEl.textContent = "couldn't read the destination run's contents."; return; }
-    if (cells.length) {
-      warnEl.className = "m-error";
-      warnEl.textContent = `⚠ Deletes & replaces ${cells.length} existing cell${cells.length === 1 ? "" : "s"} in "${destRun}/${slotId}": ${cells.join(", ")}.`;
-    } else {
-      warnEl.textContent = `"${destRun}/${slotId}" is empty — nothing will be overwritten.`;
+  // Seed candidates: every started cell on this run. The server validates each
+  // actually committed a root zone plan + overall bbox and rejects otherwise.
+  const sources = [];
+  for (const slot of state.slots) {
+    for (const m of state.models) {
+      const c = slot.runs?.[m];
+      if (c && (c.events_count ?? 0) > 0) {
+        sources.push({ slot: slot.id, model: m, events: c.events_count ?? 0 });
+      }
     }
   }
-  slotSel.addEventListener("change", refreshWarn);
-  destSel.addEventListener("change", refreshWarn);
+  if (!sources.length) { toast(`no started cells in "${state.run}" to seed from`, "err"); return; }
 
-  openModal(`copy a slot from "${sourceRun}"`, (close, setError) => {
+  const sourceSel = el("select", {}, sources.map((c) =>
+    el("option", { value: `${c.slot}|${c.model}`, text: `${c.slot} · ${c.model} · ${c.events} ev` })));
+  const slotSel = el("select", {}, state.slots.map((s) => el("option", { value: s.id, text: s.id })));
+  const modelSel = el("select", {}, state.models.map((m) => el("option", { value: m, text: m })));
+  const warnEl = el("div", { class: "m-hint" });
+
+  // slot ids may contain spaces but never "|", so the last "|" splits the pair.
+  const srcOf = () => {
+    const v = sourceSel.value;
+    const i = v.lastIndexOf("|");
+    return { slot: v.slice(0, i), model: v.slice(i + 1) };
+  };
+
+  // Same cell as the source is invalid; a populated target is reset & reseeded
+  // (destructive), an idle one just fills in.
+  function refreshWarn() {
+    const src = srcOf();
+    const targetSlot = slotSel.value, targetModel = modelSel.value;
+    if (targetSlot === src.slot && targetModel === src.model) {
+      warnEl.className = "m-error";
+      warnEl.textContent = "target and source are the same cell — pick a different target model or source.";
+      return;
+    }
+    const count = state.slots.find((s) => s.id === targetSlot)?.runs?.[targetModel]?.events_count ?? 0;
+    warnEl.className = count > 0 ? "m-error" : "m-hint";
+    warnEl.textContent = count > 0
+      ? `⚠ "${targetSlot} · ${targetModel}" has ${count} event${count === 1 ? "" : "s"} — reset & reseeded.`
+      : `"${targetSlot} · ${targetModel}" is idle — nothing overwritten.`;
+  }
+
+  // Nudge the target to the source's OWN slot (the coherent case: hold that
+  // scene's plan + canvas fixed, vary the model) and off the source's model so
+  // the default target is a valid, different cell.
+  function alignTargetToSource() {
+    const src = srcOf();
+    slotSel.value = src.slot;
+    if (modelSel.value === src.model) {
+      const alt = state.models.find((m) => m !== src.model);
+      if (alt) modelSel.value = alt;
+    }
+  }
+
+  sourceSel.addEventListener("change", () => { alignTargetToSource(); refreshWarn(); });
+  slotSel.addEventListener("change", refreshWarn);
+  modelSel.addEventListener("change", refreshWarn);
+  alignTargetToSource();
+
+  openModal("seed a scene's start", (close, setError) => {
     refreshWarn();
     return {
       body: [
-        field("slot", slotSel),
-        field("copy into run", destSel),
+        field("seed root plan + overall bbox from", sourceSel),
+        field("scene to start (slot)", slotSel),
+        field("start with model", modelSel),
         el("div", { class: "m-hint", text:
-          `Copies the entire "${sourceRun}/<slot>" folder (every model cell + its meshes) into the chosen run, overwriting that run's slot. The source run is untouched.` }),
+          "Starts the target cell holding the source's root zone plan + overall bounding box fixed, regenerating everything inside them under the target scene's own prompt + model. The target is reset first; the source is untouched." }),
         warnEl,
       ],
       actions: [
         el("button", { text: "cancel", onclick: close }),
-        el("button", { class: "danger", text: "copy slot", onclick: async () => {
-          const slotId = slotSel.value;
-          const destRun = destSel.value;
+        el("button", { class: "primary", text: "seed & start", onclick: async () => {
+          const src = srcOf();
+          const targetSlot = slotSel.value, targetModel = modelSel.value;
+          if (targetSlot === src.slot && targetModel === src.model) { setError("pick a different target cell"); return; }
           try {
-            const r = await api.copySlot(destRun, sourceRun, slotId);
+            await api.seedStart(state.run, targetSlot, targetModel, src.slot, src.model);
             close();
-            const nCopied = r.copied?.length ?? 0;
-            const nReplaced = r.replaced?.length ?? 0;
-            toast(`copied "${slotId}" → "${destRun}" — ${nCopied} cell${nCopied === 1 ? "" : "s"}${nReplaced ? `, replaced ${nReplaced}` : ""}`, "ok");
-            await refreshRuns();
-            if (destRun === state.run) await refreshSlots();
+            toast(`seeded "${targetSlot} · ${targetModel}" from "${src.slot} · ${src.model}" — started`, "ok");
+            refreshSlots();
           } catch (e) { setError(e.message); }
         } }),
       ],
@@ -688,7 +716,7 @@ document.getElementById("btn-new-run").addEventListener("click", newRunModal);
 document.getElementById("btn-start-cells").addEventListener("click", startCellsModal);
 document.getElementById("btn-reset-all").addEventListener("click", resetAllModal);
 document.getElementById("btn-ab-test").addEventListener("click", abTestModal);
-document.getElementById("btn-copy-slot").addEventListener("click", copySlotModal);
+document.getElementById("btn-seed-start").addEventListener("click", seedStartModal);
 document.getElementById("btn-copy-cell").addEventListener("click", copyCellModal);
 
 // --- boot ------------------------------------------------------------------------

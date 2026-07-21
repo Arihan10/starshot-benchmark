@@ -65,6 +65,10 @@ function zoneLayerColorHex(depth) {
 }
 
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
+// Cap the device pixel ratio: beyond ~2x, HiDPI displays quietly render 4-9x the
+// fragments (multiplied again by the OIT multi-pass), which dominates the cost on
+// large scenes for no visible gain.
+const MAX_PIXEL_RATIO = 2;
 const MESH_BUNDLE_MAGIC = "SMB1";
 const MAX_INFLIGHT = 20;
 const CLICK_MAX_MOVE_PX = 4;
@@ -169,8 +173,11 @@ function buildInspectorMaterial(sourceMat, spec) {
 }
 
 export function createViewer(host, { keyboard = true, lighting = false } = {}) {
-	const renderer = new THREE.WebGLRenderer({ antialias: true });
-	renderer.setPixelRatio(window.devicePixelRatio);
+	const renderer = new THREE.WebGLRenderer({
+		antialias: true,
+		powerPreference: "high-performance",
+	});
+	renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
 	renderer.setClearColor(0x101114);
 	// Physically-based tone mapping + shadows for the MAIN viewer only; the mini /
 	// compare viewers keep flat linear shading (lighting=false), so the engine
@@ -180,6 +187,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		renderer.toneMappingExposure = 1.0;
 		renderer.shadowMap.enabled = true;
 		renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+		// A directional shadow map depends only on the geometry + sun angle, never
+		// on the view camera — so re-rendering it every frame (the default) is pure
+		// waste. We drive it on demand via invalidateShadow() when meshes or the
+		// light actually move; a plain camera orbit never touches it.
+		renderer.shadowMap.autoUpdate = false;
+		renderer.shadowMap.needsUpdate = true;
 	}
 	host.prepend(renderer.domElement);
 
@@ -190,6 +203,34 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// wireframes drawn on top of the current scene, excluded from fit.
 	const overlayRoot = new THREE.Group();
 	scene.add(sceneRoot, bboxRoot, overlayRoot);
+
+	// --- render-on-demand --------------------------------------------------------
+	// The scene is static between interactions (no animation/skinning), and many
+	// viewers can be live at once (a board tile per cell, the two compare panes),
+	// so drawing every frame regardless of change pins the GPU for nothing.
+	// Instead every state change marks a frame dirty via invalidate(); the loop
+	// draws exactly one frame and idles. Camera motion (orbit damping, fly keys,
+	// FP mouse-look) is detected in the loop / control events and self-invalidates.
+	let needsRender = true;
+	// The transparent-material list only changes when the scene graph does, so we
+	// rebuild it on this flag rather than traversing every mesh each frame.
+	let oitDirty = true;
+	const invalidate = () => {
+		needsRender = true;
+	};
+	// Geometry changed (mesh added / removed / re-materialed): the frame, the OIT
+	// set, and the (view-independent) shadow map all need refreshing.
+	const invalidateGeometry = () => {
+		needsRender = true;
+		oitDirty = true;
+		if (lighting) renderer.shadowMap.needsUpdate = true;
+	};
+	// The sun moved (angle/intensity via the lighting panel): redraw + re-cast the
+	// shadow map, but the OIT material set is untouched.
+	const invalidateShadow = () => {
+		needsRender = true;
+		if (lighting) renderer.shadowMap.needsUpdate = true;
+	};
 
 	const camera = new THREE.PerspectiveCamera(75, 1, 0.05, 5000);
 	camera.position.set(14, 10, 14);
@@ -233,6 +274,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	let rmbInitiated = false;
 	let rmbHeld = false;
 	let fpSpeedScale = 10; // scene-scaled walk speed + target-ahead distance
+	// Fly-speed multiplier the scroll wheel adjusts in first-person mode. It
+	// scales the scene-derived base speed (so the same value feels consistent at
+	// any scene size) and persists across FP sessions + scenes as a view preference.
+	let speedMultiplier = 1;
 	let onCameraModeCb = () => {};
 	const _fpDir = new THREE.Vector3();
 
@@ -257,6 +302,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	}
 
 	if (fp) {
+		// FP mouse-look mutates the camera outside the orbit path (its own mousemove
+		// handler), so repaint whenever it fires a change.
+		fp.addEventListener("change", invalidate);
 		// The lock/unlock events are the single source of truth for the mode, so
 		// Esc (native exit), a refused lock, and the right-hold all resolve here.
 		fp.addEventListener("lock", () => {
@@ -280,6 +328,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			controls.update();
 			setHovered(null);
 			tooltip.style.display = "none";
+			hideSpeedHud(); // fly-speed control only applies in FP
 			const wasRmb = rmbInitiated;
 			rmbInitiated = false;
 			rmbHeld = false;
@@ -496,6 +545,68 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	].join("; ");
 	document.body.appendChild(tooltip);
 
+	// Transient fly-speed HUD (main / FP viewer only). A small readout pinned to
+	// the left of the screen that flashes when the scroll wheel changes the speed
+	// and fades out shortly after — hidden the rest of the time. pointer-events:none
+	// so it never intercepts a click; opacity (not display) toggles so it fades.
+	const speedHud = keyboard ? document.createElement("div") : null;
+	let speedHudTimer = null;
+	if (speedHud) {
+		speedHud.style.cssText = [
+			"position: fixed",
+			"left: 18px",
+			"top: 50%",
+			"transform: translateY(-50%)",
+			"padding: 6px 11px",
+			"background: rgba(22, 24, 29, 0.94)",
+			"color: #e6e6e6",
+			"border: 1px solid #2a2d35",
+			"border-radius: 6px",
+			"font: 12px ui-monospace, SFMono-Regular, Menlo, monospace",
+			"pointer-events: none",
+			"opacity: 0",
+			"transition: opacity 0.25s ease",
+			"z-index: 110",
+			"white-space: nowrap",
+		].join("; ");
+		document.body.appendChild(speedHud);
+	}
+	function showSpeedHud() {
+		if (!speedHud) return;
+		speedHud.textContent = `fly speed ×${speedMultiplier.toFixed(2)}`;
+		speedHud.style.opacity = "1";
+		if (speedHudTimer) clearTimeout(speedHudTimer);
+		speedHudTimer = setTimeout(() => {
+			speedHud.style.opacity = "0";
+		}, 1200);
+	}
+	function hideSpeedHud() {
+		if (!speedHud) return;
+		if (speedHudTimer) {
+			clearTimeout(speedHudTimer);
+			speedHudTimer = null;
+		}
+		speedHud.style.opacity = "0";
+	}
+
+	// Scroll wheel adjusts the fly speed IN FIRST-PERSON MODE (multiplicative, so
+	// each notch feels the same at any current speed), flashing the HUD. In orbit
+	// mode the wheel is left to OrbitControls' zoom, untouched. Non-passive so the
+	// page can't scroll under the locked pointer.
+	if (keyboard) {
+		renderer.domElement.addEventListener(
+			"wheel",
+			(ev) => {
+				if (cameraMode !== "fp") return; // orbit: wheel stays zoom
+				ev.preventDefault();
+				const factor = ev.deltaY < 0 ? 1.15 : 1 / 1.15; // scroll up = faster
+				speedMultiplier = Math.min(16, Math.max(0.05, speedMultiplier * factor));
+				showSpeedHud();
+			},
+			{ passive: false },
+		);
+	}
+
 	// --- shared helpers ----------------------------------------------------------
 
 	function disposeMaterial(material) {
@@ -668,6 +779,9 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		for (const id of bboxes.keys()) applyBboxVisibility(id);
 		for (const id of models.keys()) applyModelVisibility(id);
 		grid.visible = show.grid;
+		// Hiding/showing a mesh changes what casts shadows, so re-cast (no-op in the
+		// flat mini viewers, where invalidateShadow just marks the frame dirty).
+		invalidateShadow();
 	}
 
 	// Re-derive every bbox's base color — called after the obs model's provenance
@@ -675,6 +789,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// their decomposition step was known defaulted to the object green.
 	function recolorAll() {
 		for (const id of bboxes.keys()) applyBboxColor(id);
+		invalidate();
 	}
 
 	// --- zone-layers view --------------------------------------------------------
@@ -707,6 +822,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// The axes are world-aligned (there is one global canonical front view), so
 	// they're placed AT the inspected node to show how its geometry sits in it.
 	function setAxes(on, { center = [0, 0, 0], size = 1 } = {}) {
+		invalidate();
 		if (axesGroup) {
 			scene.remove(axesGroup);
 			axesGroup.traverse((o) => {
@@ -729,6 +845,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 	function clearOrientationArrow() {
 		if (!orientationArrow) return;
+		invalidate();
 		scene.remove(orientationArrow);
 		orientationArrow.line?.geometry?.dispose?.();
 		orientationArrow.line?.material?.dispose?.();
@@ -773,6 +890,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		}
 		scene.add(arrow);
 		orientationArrow = arrow;
+		invalidate();
 	}
 
 	// The depths currently present among zone bboxes + each one's runtime color,
@@ -802,6 +920,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyBboxColor(id);
 		if (prev !== null) applyBboxVisibility(prev);
 		if (id !== null) applyBboxVisibility(id);
+		invalidate();
 	}
 
 	// --- picking -------------------------------------------------------------------
@@ -927,7 +1046,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			lbl.style.color = "#7a8190";
 			row.appendChild(lbl);
 			row.appendChild(document.createTextNode(text));
-			tooltip.appendChild(row);
+		tooltip.appendChild(row);
 		}
 		// The pipeline steps that ran on/for this node — not just its base info.
 		// One PER LINE: the step name (×count when it ran more than once), tagged
@@ -978,6 +1097,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		camera.far = Math.max(100, radius * 100);
 		camera.updateProjectionMatrix();
 		controls.update();
+		invalidate();
 	}
 
 	// Toggle selection (re-selecting clears, like the old tree click). Framing
@@ -998,6 +1118,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			}
 		}
 		if (notify) onSelectCb(selectedId);
+		invalidate();
 		return selectedId;
 	}
 
@@ -1009,6 +1130,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyBboxColor(prev);
 		for (const bid of bboxes.keys()) applyBboxVisibility(bid);
 		clearOrientationArrow();
+		invalidate();
 		if (notify) onSelectCb(null);
 	}
 
@@ -1146,10 +1268,20 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// looking up climbs and down dives); A/D strafe level; Q/E lower/raise on
 	// world Y; Shift sprints. Mouse-look comes from the FP pointer lock (the
 	// toggle or a right-hold).
+	// Returns whether the camera actually moved this frame, so the render loop can
+	// invalidate only when it did (shift alone, or no keys, moves nothing).
 	function applyFpMove(dt) {
-		if (pressedKeys.size === 0) return;
+		const moving =
+			pressedKeys.has("w") ||
+			pressedKeys.has("s") ||
+			pressedKeys.has("a") ||
+			pressedKeys.has("d") ||
+			pressedKeys.has("e") ||
+			pressedKeys.has("q");
+		if (!moving) return false;
 		const speed =
 			Math.max(2, fpSpeedScale * 0.5) *
+			speedMultiplier *
 			(pressedKeys.has("shift") ? 3 : 1) *
 			dt;
 		if (pressedKeys.has("w") || pressedKeys.has("s")) {
@@ -1162,11 +1294,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		if (pressedKeys.has("e")) camera.position.y += speed;
 		if (pressedKeys.has("q")) camera.position.y -= speed;
 		cameraUserMoved = true;
+		return true;
 	}
 
 	function applyKeyboardMove(dt) {
 		if (cameraMode === "fp") return applyFpMove(dt);
-		if (pressedKeys.size === 0) return;
+		if (pressedKeys.size === 0) return false;
 		const shifted = pressedKeys.has("shift");
 		const camDist = Math.max(
 			1,
@@ -1175,7 +1308,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const speed = Math.max(2, camDist * 0.6) * (shifted ? 3 : 1) * dt;
 		_fwd.subVectors(controls.target, camera.position);
 		_fwd.y = 0;
-		if (_fwd.lengthSq() === 0) return;
+		if (_fwd.lengthSq() === 0) return false;
 		_fwd.normalize();
 		_right.crossVectors(_fwd, _worldUp).normalize();
 		_move.set(0, 0, 0);
@@ -1185,10 +1318,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		if (pressedKeys.has("a")) _move.addScaledVector(_right, -speed);
 		if (pressedKeys.has("e")) _move.addScaledVector(_worldUp, speed);
 		if (pressedKeys.has("q")) _move.addScaledVector(_worldUp, -speed);
+		let moved = false;
 		if (_move.lengthSq() !== 0) {
 			camera.position.add(_move);
 			controls.target.add(_move);
 			cameraUserMoved = true;
+			moved = true;
 		}
 		if (pressedKeys.has("r") || pressedKeys.has("f")) {
 			const rate = shifted ? 4 : 1.5;
@@ -1203,8 +1338,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				);
 				camera.position.copy(controls.target).add(offset);
 				cameraUserMoved = true;
+				moved = true;
 			}
 		}
+		return moved;
 	}
 
 	// --- scene population --------------------------------------------------------------
@@ -1229,6 +1366,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		camera.far = Math.max(100, radius * 100);
 		camera.updateProjectionMatrix();
 		controls.update();
+		invalidate();
 	}
 
 	// Half the scene's largest dimension (meshes, else bboxes) — scales the FP
@@ -1373,6 +1511,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyBboxColor(id);
 		applyBboxVisibility(id);
 		scheduleFit();
+		invalidate();
 	}
 
 	// Proposed-placement overlay — the prompt-lab's "after" boxes (a tested
@@ -1385,6 +1524,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			child.geometry?.dispose?.();
 			child.material?.dispose?.();
 		}
+		invalidate();
 	}
 
 	function setOverlayBoxes(boxes) {
@@ -1641,6 +1781,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			o.userData.__oit = false;
 			o.layers.set(0);
 		});
+		invalidateGeometry();
 		return true;
 	}
 
@@ -1658,6 +1799,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			delete o.userData.__projLayerMask;
 			delete o.userData.__projOit;
 		});
+		invalidateGeometry();
 	}
 
 	// Project `desc.mapType` of object `id`; false when the mesh isn't loaded or
@@ -1702,6 +1844,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		applyModelVisibility(id);
 		if (reproject) setMapProjection(id, { mapType: reproject });
 		scheduleFit();
+		invalidateGeometry();
 	}
 
 	const failedUrls = new Set(); // `${gen}|${url}` — don't re-parse known-bad GLBs
@@ -1947,6 +2090,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		// doesn't yank the user's vantage. A plain clear re-arms the auto-fit so a
 		// freshly-opened scene frames itself.
 		cameraUserMoved = keepCamera;
+		invalidateGeometry();
 	}
 
 	// Drop every loaded GLB mesh while KEEPING the bbox/proxy structure (and the
@@ -1965,6 +2109,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		}
 		models.clear();
 		failedUrls.clear();
+		invalidateGeometry();
 	}
 
 	// Reconcile the scene DOWN to an exact id set: drop every bbox/proxy/mesh no
@@ -2009,6 +2154,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			models.delete(id);
 		}
 		scheduleFit();
+		invalidateGeometry();
 	}
 
 	function scheduleFit() {
@@ -2018,9 +2164,13 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	function resize() {
 		const w = host.clientWidth || 1;
 		const h = host.clientHeight || 1;
+		renderer.setPixelRatio(
+			Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO),
+		);
 		renderer.setSize(w, h);
 		camera.aspect = w / h;
 		camera.updateProjectionMatrix();
+		invalidate();
 	}
 	const resizeObserver = new ResizeObserver(resize);
 	resizeObserver.observe(host);
@@ -2180,13 +2330,20 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	}
 
 	const _oitMats = [];
-	function renderFrame() {
+	// Rebuilt only when the scene graph changes (oitDirty) rather than every frame:
+	// the traverse is O(all meshes) and was the render loop's standing per-frame tax
+	// on large scenes.
+	function rebuildOitMats() {
 		_oitMats.length = 0;
 		sceneRoot.traverse((o) => {
 			if (!o.userData.__oit || !o.material) return;
 			if (Array.isArray(o.material)) _oitMats.push(...o.material);
 			else _oitMats.push(o.material);
 		});
+		oitDirty = false;
+	}
+	function renderFrame() {
+		if (oitDirty) rebuildOitMats();
 		if (_oitMats.length === 0) {
 			renderer.setRenderTarget(null);
 			camera.layers.set(0);
@@ -2265,18 +2422,22 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const now = performance.now();
 		const dt = Math.min(0.1, (now - lastMoveT) / 1000);
 		lastMoveT = now;
-		applyKeyboardMove(dt);
-		if (cameraMode === "fp") syncTargetAhead();
-		else controls.update();
 
-		gridMat.uniforms.uCameraPos.value.copy(camera.position);
-		const camDist = Math.max(
-			1,
-			camera.position.distanceTo(controls.target),
-		);
-		gridMat.uniforms.uFadeStart.value = camDist * 0.5;
-		gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
+		// Camera motion is the primary "something changed" signal. Keyboard fly
+		// reports whether it moved; orbit + damping is driven by controls.update()
+		// (true while still settling); FP mouse-look self-invalidates via 'change'.
+		const moved = applyKeyboardMove(dt);
+		let cameraChanged = moved;
+		if (cameraMode === "fp") {
+			syncTargetAhead();
+		} else if (controls.update()) {
+			cameraChanged = true;
+		}
+		if (cameraChanged) invalidate();
 
+		// Hover pick runs only after a pointer move (pointerDirty); setHovered
+		// invalidates only when the hovered id actually changes, so idly sweeping
+		// the cursor over the same object costs a raycast but no redraw.
 		if (cameraMode === "orbit" && pointerDirty && !controlsInteracting) {
 			pointerDirty = false;
 			if (pointerInsideCanvas) {
@@ -2291,9 +2452,23 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 
 		if (fitPending) {
 			fitPending = false;
-			fitToScene();
+			fitToScene(); // invalidates when it actually reframes
 			lightingRig?.refit();
 		}
+
+		// Render-on-demand: draw exactly one frame when dirty, then idle. Nothing in
+		// the scene animates on its own, so a settled view costs only this loop's
+		// cheap bookkeeping — freeing the GPU for the other live viewers on screen.
+		if (!needsRender) return;
+		needsRender = false;
+
+		// The grid's distance fade tracks the camera, so it only needs refreshing on
+		// a frame we're actually drawing.
+		gridMat.uniforms.uCameraPos.value.copy(camera.position);
+		const camDist = Math.max(1, camera.position.distanceTo(controls.target));
+		gridMat.uniforms.uFadeStart.value = camDist * 0.5;
+		gridMat.uniforms.uFadeEnd.value = camDist * 6.0;
+
 		renderFrame();
 	})();
 
@@ -2306,6 +2481,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		clearOverlayBoxes,
 		setOverlayVisible: (v) => {
 			overlayRoot.visible = v;
+			invalidate();
 		},
 		setBboxesVisible: (v) => {
 			show.bboxes = v;
@@ -2321,7 +2497,10 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		getMapProjection: (id) => (projectedId === id ? projectedMapType : null),
 		// Lighting engine (main viewer only; no-ops + null elsewhere). The panel
 		// (lighting.js) drives setLighting; lightingDefaults seeds its reset.
-		setLighting: (partial) => lightingRig?.setLighting(partial),
+		setLighting: (partial) => {
+			lightingRig?.setLighting(partial);
+			invalidateShadow(); // exposure/intensity redraw; sun angle re-casts shadows
+		},
 		getLighting: () => lightingRig?.getLighting() ?? null,
 		lightingDefaults: lightingRig ? LIGHTING_DEFAULTS : null,
 		hasModel: (id) => models.has(id),
@@ -2372,8 +2551,12 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				pressedKeys.clear();
 				setHovered(null);
 				tooltip.style.display = "none";
+				hideSpeedHud();
 			} else {
 				resize();
+				// Re-cast the shadow + rebuild the OIT set on the first shown frame,
+				// in case the scene changed (or the GL buffers were dropped) while hidden.
+				invalidateGeometry();
 			}
 		},
 		// Camera read/write + change hook — lets the compare view keep two
@@ -2389,6 +2572,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			camera.updateProjectionMatrix();
 			controls.update();
 			cameraUserMoved = true;
+			invalidate();
 		},
 		onCameraChange: (cb) => controls.addEventListener("change", cb),
 		// First-person camera mode (main viewer only; a no-op where fp is null).
@@ -2422,6 +2606,8 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			oitQuad.geometry.dispose();
 			controls.dispose();
 			tooltip.remove();
+			if (speedHudTimer) clearTimeout(speedHudTimer);
+			speedHud?.remove();
 			renderer.dispose();
 			renderer.forceContextLoss?.();
 			renderer.domElement.remove();
