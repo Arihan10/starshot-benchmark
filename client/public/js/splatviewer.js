@@ -19,6 +19,7 @@ import {
     openSogView,
     setSogVisible,
 } from "./sogviewer.js";
+import { openRefsViewer } from "./refsviewer.js";
 
 let overlay = null;
 let canvasEl = null;
@@ -59,7 +60,7 @@ let _downXY = null; // pointer-down pos, to tell a click from an orbit drag
 // Pipeline stepper state (the side panel drives the whole splat pipeline).
 let cellStatus = null; // last-fetched per-stage status of the open cell
 let cloudLoaded = false; // whether a surfel cloud is currently in the canvas
-let runningAll = false; // the "run all (1-3 → modal)" sequential driver is active
+let runningAll = false; // the "run all (local stages 1-5)" sequential driver is active
 let assetSource = null; // {source, available, active_kind} — which assets feed the pipeline
 let modalPrev = null; // previous poll's cell.modal.status (to catch the done transition)
 let modalLog = []; // accumulated remote-train heartbeat lines (the live log pane)
@@ -1376,6 +1377,23 @@ function buildControls(summary) {
         dFmt,
     );
 
+    // Forced per-object pool size — a RESOURCE knob (not part of SampleParams):
+    // 0 = auto (min(cores, 8) server-side); >=1 pins the pool (re-clamped to the
+    // object count + a memory cap in stage3). `summary.workers` is the RESOLVED
+    // count of the last run, shown as a hint; the slider defaults to auto so a
+    // re-splat never silently pins the pool after one run.
+    const lastWorkers = (summary && summary.workers) || 0;
+    const workers = sliderRow(
+        "workers",
+        "workers",
+        0,
+        32,
+        1,
+        0,
+        (v) =>
+            v < 1 ? (lastWorkers ? `auto (last ${lastWorkers})` : "auto") : `${Math.round(v)}`,
+    );
+
     const btn = el("button", {
         class: "svc-resplat",
         text: "re-splat",
@@ -1518,6 +1536,29 @@ function buildControls(summary) {
     inputs.patches.addEventListener("change", () =>
         setPatches(inputs.patches.checked),
     );
+    // Browse the Stage-5 reference frames (RGB · alpha · depth) as a lazy
+    // thumbnail matrix + full-res inspector, decoded from the SZF containers
+    // client-side (opens its own overlay; resolves the refs via Stage-5 status).
+    const refsBtn = el("button", {
+        class: "splat-stage2-btn",
+        text: "view refs",
+        title: "browse the Stage-5 reference frames (RGB · alpha · depth)",
+        onclick: () => {
+            if (!current) return;
+            openRefsViewer({
+                run: current.run,
+                slot: current.slot,
+                model: current.model,
+                label: subEl?.textContent,
+            });
+        },
+    });
+    const refsRow = el(
+        "div",
+        { class: "svc-row" },
+        el("span", { class: "svc-lab", text: "refs" }),
+        refsBtn,
+    );
     // Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
     const camRow = checkRow("cameras", "camera positions", false);
     inputs.cameras.addEventListener("change", () =>
@@ -1619,11 +1660,13 @@ function buildControls(summary) {
         freeApplyRow,
         voxPointsRow,
         patchRow,
+        refsRow,
         camRow,
         camPlayRow,
         camSpeedRow,
         el("div", { class: "svc-title", text: "sampler" }),
         detail,
+        workers,
         el("div", { class: "svc-actions" }, btn),
         actual,
         overlay,
@@ -1636,7 +1679,10 @@ function actualText(summary) {
 }
 
 function readParams() {
-    return { detail: Number(inputs.detail.value) };
+    return {
+        detail: Number(inputs.detail.value),
+        workers: Math.round(Number(inputs.workers.value)),
+    };
 }
 
 async function resplat() {
@@ -2060,23 +2106,30 @@ function showPatchModal(index) {
 
 // ---- pipeline stepper (the side panel: run/re-run each stage, gated) ---------
 
-// The LOCAL splat stages in dependency order (1-3): they run on this machine and
-// prepare the inputs the Modal train job consumes. Stage 1's status is the cell
-// itself; Stages 2-3 live on `cell.stageN`. A stage is runnable only once the
-// previous is done; re-running a done stage REVERTS everything after it
-// (server-side). Stages 4-6 (cameras → references → fine-tune) run REMOTELY as
-// one "train on modal" job (see renderModal), so they're no longer per-stage
-// rows here — the camera plan + references need a CUDA GPU, and doing all three
-// in one A100 container keeps the big reference-image set off this machine.
+// The LOCAL splat stages in dependency order (1-5): they all run on this machine.
+// Stage 1's status is the cell itself; Stages 2-5 live on `cell.stageN`. A stage is
+// runnable only once the previous is done; re-running a done stage REVERTS
+// everything after it (server-side). Stage 4 (cameras) + Stage 5 (references) run
+// locally here so the pipeline can be driven step-by-step and its refs inspected
+// before committing to a train. Stage 6 (the fine-tune) still runs REMOTELY via the
+// "train on modal" job (see renderModal), which re-plans/re-renders 4-5 on the A100
+// as part of that one-shot remote run.
 const STAGES = [
     { n: 1, label: "assemble", verb: "convert" },
     { n: 2, label: "free space", verb: "voxelize" },
     { n: 3, label: "surfels", verb: "sample" },
+    { n: 4, label: "cameras", verb: "plan" },
+    { n: 5, label: "references", verb: "render" },
 ];
 const STAGE_START = {
     1: (r, s, m) => api.splatStage1Start(r, s, m),
     2: (r, s, m) => api.splatStage2Start(r, s, m),
-    3: (r, s, m) => api.splatStage3Start(r, s, m),
+    3: (r, s, m) => api.splatStage3Start(r, s, m, readParams()),
+    4: (r, s, m) => api.splatStage4Start(r, s, m),
+    // Stage 5 resumes by default (renders only the views still missing on disk); an
+    // explicit re-run of a DONE stage passes restart so the server wipes refs/ and
+    // re-renders every view from scratch.
+    5: (r, s, m, restart) => api.splatStage5Start(r, s, m, { restart }),
 };
 
 function stageState(cell, n) {
@@ -2204,21 +2257,11 @@ async function runAll() {
             if (stage.n >= 3) await maybeLoadCloud(seq);
         }
         if (seq !== openSeq || !current) return;
-        // Local stages 1–3 done → launch the remote train (stages 4–6) on the
-        // A100. pollStages (below) then streams its phase + training heartbeat
-        // through the cells status; the run continues on Modal on its own.
-        setStatus(
-            "run all: stages 1–3 done — training on Modal (stages 4–6)…",
-            "var(--purple)",
-        );
-        try {
-            await api.splatModalStart(current.run, current.slot, current.model);
-        } catch (e) {
-            setStatus(
-                `run all: remote train failed to start: ${e.message}`,
-                "var(--red)",
-            );
-        }
+        // All LOCAL stages (1–5) done — including the camera plan + reference
+        // renders, ready to inspect. Stage 6 (the fine-tune) stays on the Modal
+        // A100: launch it from the "train on modal" panel when you want the
+        // trained splat (that remote run re-plans/re-renders 4–5 itself).
+        setStatus("run all: local stages 1–5 done", "var(--green)");
     } catch (e) {
         if (seq === openSeq)
             setStatus(`run all stopped: ${e.message}`, "var(--red)");
@@ -2427,14 +2470,13 @@ function renderStepper() {
 	updateSourceAvail();
 }
 
-// "run all" control row: runs local stages 1→3 in order from the first
-// not-yet-done, then launches the remote train (stages 4-6) on the A100.
-// Disabled while anything is running, or once trained.ply exists.
+// "run all" control row: runs local stages 1→5 in order from the first
+// not-yet-done (assemble → free space → surfels → cameras → references). Stage 6
+// (the fine-tune) is launched separately from the "train on modal" panel.
+// Disabled while anything is running, or once all local stages are done.
 function renderRunAll(cell) {
     const busy = runningAll || anyStageRunning(cell);
-    const allDone =
-        STAGES.every((s) => stageDone(cell, s.n)) &&
-        cell?.modal?.status === "done";
+    const allDone = STAGES.every((s) => stageDone(cell, s.n));
     const row = el("div", { class: "svc-step" });
     row.appendChild(el("span", { class: "svc-step-n muted", text: "▶" }));
     row.appendChild(el("span", { class: "svc-step-label", text: "run all" }));
@@ -2442,8 +2484,8 @@ function renderRunAll(cell) {
         el("button", {
             class: "splat-stage2-btn",
             disabled: busy || allDone,
-            text: runningAll ? "running…" : allDone ? "all done" : "run 1–6",
-            title: "run local stages 1–3 in order, then train on Modal (stages 4–6)",
+            text: runningAll ? "running…" : allDone ? "all done" : "run 1–5",
+            title: "run local stages 1–5 in order (assemble → free space → surfels → cameras → references)",
             onclick: () => runAll(),
         }),
     );

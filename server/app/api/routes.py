@@ -2172,10 +2172,13 @@ class Stage3Request(BaseModel):
     surfel density around the calibrated default look (1 = default resolution,
     2 = twice the surfels/m², 0.5 = half); spacing, disk radius, feature
     refinement, and culling are all derived from it (see splat/stage3.py).
-    `representation` is a format flag only ("2dgs" default | "3dgs" compat)."""
+    `representation` is a format flag only ("2dgs" default | "3dgs" compat).
+    `workers` FORCES the per-object pool size (0/omitted = auto — min(cores, 8);
+    >=1 pins it, re-clamped to the object count + a memory cap in `sample_cell`)."""
 
     detail: float | None = None
     representation: str | None = None
+    workers: int | None = None
 
 
 def _stage3_params(req: Stage3Request | None) -> splat_stage3.SampleParams:
@@ -2188,6 +2191,16 @@ def _stage3_params(req: Stage3Request | None) -> splat_stage3.SampleParams:
     )
     rep = req.representation if req.representation in ("2dgs", "3dgs") else "2dgs"
     return splat_stage3.SampleParams(detail=detail, representation=rep)
+
+
+def _stage3_workers(req: Stage3Request | None) -> int:
+    """The forced Stage-3 pool size from a request: 0 (auto) when omitted, else
+    clamped to a sane [1, 64] ceiling. `sample_cell` re-clamps a forced value to
+    the object count + a memory cap, so this only bounds absurd input."""
+    req = req or Stage3Request()
+    if req.workers is None:
+        return 0
+    return int(min(max(req.workers, 0), 64))
 
 
 def _splat_stage3_status(
@@ -2622,10 +2635,12 @@ def _sample_cell_blocking(
     out_path: Path,
     params: splat_stage3.SampleParams,
     job: dict[str, Any],
+    workers: int = 0,
 ) -> dict[str, Any]:
     """Sample a cell into its surfel cloud directly off its selected asset dir —
     no de-optimization (splat/assets.py reads any encoding in-process, KTX2
-    texels included), consuming the Stage-2 free-space grid. Blocking."""
+    texels included), consuming the Stage-2 free-space grid. `workers` forces the
+    per-object pool size (0 = auto). Blocking."""
 
     def _progress(done: int, total: int, current: str) -> None:
         job["phase"], job["done"], job["total"], job["current_id"] = (
@@ -2636,7 +2651,7 @@ def _sample_cell_blocking(
     summary = splat_stage3.sample_cell(
         run=run, slot=slot, model=model, raw_dir=tier_dir,
         freespace_path=freespace_path, out_path=out_path,
-        params=params, progress=_progress,
+        params=params, progress=_progress, workers=workers,
     )
     # The detail-LOD twin is retired; scrub any stale copy from older runs.
     out_path.with_suffix(".detail.ply").unlink(missing_ok=True)
@@ -2648,9 +2663,11 @@ async def _run_splat_stage3_cell(
     slot: str,
     model: str,
     params: splat_stage3.SampleParams,
+    workers: int = 0,
 ) -> None:
     """Sample ONE cell into surfels off the event loop. Requires the Stage-2
-    free-space grid; writes the `cloud.json` sidecar so 'done' survives a restart."""
+    free-space grid; writes the `cloud.json` sidecar so 'done' survives a restart.
+    `workers` forces the per-object pool size (0 = auto)."""
     key = (run, slot, model)
     job = _splat_stage3_jobs[key]
     try:
@@ -2661,7 +2678,7 @@ async def _run_splat_stage3_cell(
         out_path = _cloud_path(run, slot, model)
         summary = await asyncio.to_thread(
             _sample_cell_blocking, run, slot, model, tier_dir,
-            freespace, out_path, params, job,
+            freespace, out_path, params, job, workers,
         )
         job["summary"] = summary
         with contextlib.suppress(Exception):
@@ -3015,6 +3032,7 @@ def _write_stage5_transforms(out_dir: Path, plan: dict[str, Any], views: list[di
     splat_stage5.write_transforms(
         out_dir, K, resolution, float(intr["near"]), float(intr["far"]),
         splat_stage5.reference_frames(views),
+        lighting=splat_stage5.LIGHTING,
     )
 
 
@@ -3042,6 +3060,11 @@ async def _run_splat_stage5_cell(
         views = await asyncio.to_thread(splat_stage5.enumerate_views, plan)
         out_dir = _refs_dir(run, slot, model)
         (out_dir / splat_stage5.FRAMES_DIRNAME).mkdir(parents=True, exist_ok=True)
+        # Phase-1 lighting guard: if the recorded capture settings changed since the
+        # frames on disk were rendered (a different lighting / colour pipeline), drop
+        # them so this (resumed) session re-renders every view under one consistent
+        # lighting rather than mixing two (splat_stage5.reconcile_capture_meta).
+        await asyncio.to_thread(splat_stage5.reconcile_capture_meta, out_dir)
         pending = await asyncio.to_thread(splat_stage5.pending_views, out_dir, views)
         skipped = len(views) - len(pending)
         job["total"], job["done"] = len(views), skipped
@@ -3903,8 +3926,9 @@ def create_app() -> FastAPI:
     ) -> dict[str, object]:
         """(Re-)sample ONE cell's placed meshes into a pre-fine-tuning Gaussian cloud
         `splat/cloud.ply` (see splat/stage3.py), consuming the Stage-2 free-space grid
-        to orient normals + cull hidden faces. ONE knob: `detail` (density multiplier;
-        1 = the calibrated default look). Requires Stage 2 first. Idempotent while
+        to orient normals + cull hidden faces. ONE quality knob: `detail` (density
+        multiplier; 1 = the calibrated default look); `workers` optionally FORCES the
+        per-object pool size (0 = auto). Requires Stage 2 first. Idempotent while
         running; re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
@@ -3916,6 +3940,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
         _, kind = source
         params = _stage3_params(body)
+        workers = _stage3_workers(body)
         key = (run, slot, model)
         existing = _splat_stage3_jobs.get(key)
         if existing is not None and existing.get("running"):
@@ -3940,7 +3965,7 @@ def create_app() -> FastAPI:
         }
         _splat_stage3_jobs[key] = job
         _splat_stage3_tasks[key] = asyncio.create_task(
-            _run_splat_stage3_cell(run, slot, model, params)
+            _run_splat_stage3_cell(run, slot, model, params, workers)
         )
         return dict(job)
 
@@ -4085,6 +4110,7 @@ def create_app() -> FastAPI:
             "far": state["far"],
             "fov_deg": state["fov_deg"],
             "background": list(splat_stage5.BACKGROUND_RGB),
+            "lighting": splat_stage5.LIGHTING,
             "cameras_url": _artifact_url(_cameras_path(run, slot, model)),
             "bundle_url": (
                 f"/slots/{quote(slot, safe='')}/{quote(model, safe='')}/meshes"

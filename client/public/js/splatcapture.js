@@ -7,36 +7,62 @@
 //
 // Protocol (server = server/app/api/routes.py + services/refcapture.py):
 //   1. GET  {api}/runs/{run}/splat/stage5/{slot}/{model}/manifest?token=…
-//        → { resolution, near, far, fov_deg, background, bundle_url,
+//        → { resolution, near, far, fov_deg, background, lighting, bundle_url,
 //            cameras_url, pending: [view ids], total }
 //   2. fetch cameras_url (the Stage-4 plan) + bundle_url (SMB1 mesh bundle)
 //   3. for each pending view: render → async-read RGBA8 + packed log-u16
 //      depth → POST binary SRF1 batches to …/frames?token=…
 //   4. POST …/finish?token=… → the server verifies + writes transforms.json.
 //
-// Per view, two passes:
-//   * scene pass  → rtColor (RGBA8 + float depth texture): unlit albedo,
-//     alpha-blended in stored-sRGB space (background under the remainder),
-//     alpha channel = accumulated coverage. Opaque + alphaMode=MASK write
-//     depth; alphaMode=BLEND glass does not (its depth is the surface behind).
-//   * pack pass   → rtDepth (RGBA8): fullscreen triangle converting the depth
+// LIT capture (Phase 1): materials render as matte PBR surfaces (toLit) under a
+// FIXED light rig borrowed from the debug mesh viewer (setupLighting: image-based
+// ambient + a shadow-casting sun + a hemisphere fill), so lighting and shadows
+// are baked into the reference frames. The rig is sent by the server (manifest
+// `lighting`, = splat/stage5.py LIGHTING) and recorded in transforms.json, so it
+// is identical for every view and every (resumed) session.
+//
+// Per view, three passes:
+//   * scene pass   → rtScene (RGBA16F + float depth): the lit scene shaded in
+//     LINEAR light (HDR, no encode). alpha channel = accumulated coverage;
+//     opaque + alphaMode=MASK write depth, alphaMode=BLEND glass does not (its
+//     depth is the surface behind).
+//   * present pass → rtColor (RGBA8): fullscreen triangle applying a fixed
+//     ACES-filmic tone map + sRGB encode (no auto-exposure) — the display colour
+//     the refs store and gsplat trains against. Done in our own shader (stored
+//     verbatim) so it's deterministic across three.js versions.
+//   * pack pass    → rtDepth (RG8): fullscreen triangle converting the depth
 //     texture to planar view-space Z metres, log-quantized to the EXACT uint16
-//     codes splat/stage5.py's encode_depth_u16 defines (RG = hi/lo byte).
+//     codes splat/stage5.py's encode_depth_u16 defines (RG = lo/hi byte).
 //
 // Readback is a PBO + fence ring, so the GPU renders view N+1 while view N's
 // bytes drain — no rAF, no sync stalls. The loop yields via MessageChannel
 // (immune to background-timer throttling in headless Chrome).
 //
-// ?selftest=1 renders a synthetic UV-encoding quad through the identical path
-// and asserts the pose/flip/planar-depth/alpha conventions in-page (the WebGL
-// twin of the old nvdiffrast GPU smoke). No job endpoints needed.
+// ?selftest=1 renders a synthetic UV-encoding quad through the present pass in
+// linear mode and asserts the pose/flip/planar-depth/alpha conventions in-page,
+// plus a flat-grey check of the ACES+sRGB colour transform (the WebGL twin of
+// the old nvdiffrast GPU smoke). No job endpoints needed.
 
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
+import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
+// Fallback light rig, used only if the manifest omits `lighting` (e.g. the page
+// opened by hand). The server sends splat/stage5.py's LIGHTING as the source of
+// truth; keep these in sync. Phase 1: shade lit + bake into the reference frames.
+const DEFAULT_LIGHTING = {
+    env: 0.35,
+    key: 3.5,
+    fill: 0.2,
+    azimuth_deg: 34.0,
+    elevation_deg: 48.0,
+    shadows: true,
+    tone_mapping: "aces_filmic",
+    exposure: 1.0,
+};
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
 const MAX_PARSE_INFLIGHT = 4; // concurrent GLB parses while streaming the bundle
 const READ_SEGMENTS = 3; // readback segments in flight (ring depth)
@@ -115,12 +141,18 @@ function createRenderer() {
         powerPreference: "high-performance",
     });
     if (!renderer.capabilities.isWebGL2) throw new Error("WebGL2 unavailable");
-    // Raw byte passthrough: no tone mapping anywhere; render targets are raw by
-    // construction (three only encodes to the canvas), and every base-color map
-    // is forced to NoColorSpace below, so texels blend in stored-sRGB space —
-    // exactly the statistic gsplat trains against.
+    // Lit capture (Phase 1): the scene is shaded in LINEAR light into a half-float
+    // target, then the present pass (createCapture) tone-maps + sRGB-encodes it
+    // explicitly. Global tone mapping stays OFF so the scene target keeps linear
+    // HDR (the present pass owns the whole display transform); the ShaderMaterial
+    // passes store their output verbatim, so the encode is deterministic across
+    // three.js versions. Shadow maps render ONCE — the scene and the sun are both
+    // static — via autoUpdate off + a single needsUpdate before the loop.
     renderer.toneMapping = THREE.NoToneMapping;
     renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.autoUpdate = false;
     renderer.setSize(256, 256); // preview canvas only; targets carry the real res
     document.body.appendChild(renderer.domElement);
     renderer.domElement.addEventListener("webglcontextlost", (e) => {
@@ -136,39 +168,123 @@ function rendererName(renderer) {
     return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : "unknown";
 }
 
-// One material class for the whole capture: unlit base color. Copies exactly
+// One material class for the whole capture: a LIT PBR surface (Phase 1). Copies
 // the glTF inputs the refs contract reads (map, baseColorFactor, opacity,
-// alphaMode via transparent/alphaTest) and drops everything else. DoubleSide
-// because Trellis winding is unreliable (matches the pipeline's assumption);
-// BLEND glass keeps depthWrite OFF so depth is the surface behind the pane.
-function toUnlit(orig) {
-    const m = new THREE.MeshBasicMaterial();
+// alphaMode via transparent/alphaTest) and forces a MATTE dielectric response
+// (metalness 0, roughness 1): the splat asset tier strips the metallic-roughness
+// map, and the glTF default metalnessFactor is 1 (fully metal → near-black under
+// an env), so pinning matte gives clean diffuse shading and is exactly Phase 1's
+// scope (shiny surfaces are a later phase). The base-color map is tagged sRGB so
+// it decodes to linear for shading. DoubleSide because Trellis winding is
+// unreliable (three flips the normal per back-face, so lit shading is correct on
+// the visible side regardless); BLEND glass keeps depthWrite OFF so depth is the
+// surface behind the pane.
+function toLit(orig) {
+    const m = new THREE.MeshStandardMaterial();
     m.map = orig.map || null;
-    if (m.map) m.map.colorSpace = THREE.NoColorSpace; // raw texels, no shader decode
+    if (m.map) m.map.colorSpace = THREE.SRGBColorSpace; // base colour is sRGB → decode for shading
     if (orig.color) m.color.copy(orig.color); // baseColorFactor
+    m.metalness = 0.0;
+    m.roughness = 1.0;
     m.opacity = orig.opacity ?? 1;
     m.transparent = orig.transparent === true;
     m.alphaTest = orig.alphaTest || 0;
     m.side = THREE.DoubleSide;
     m.depthWrite = !m.transparent;
-    m.toneMapped = false;
     m.vertexColors = orig.vertexColors === true;
     return m;
 }
 
-function prepareUnlit(root) {
+function prepareLit(root) {
     root.traverse((o) => {
         if (!o.isMesh || !o.material) return;
+        // Generated meshes often ship without normals; shading needs them.
+        if (o.geometry && !o.geometry.getAttribute("normal")) {
+            o.geometry.computeVertexNormals();
+        }
+        o.castShadow = true;
+        o.receiveShadow = true;
         const orig = o.material;
-        o.material = Array.isArray(orig) ? orig.map(toUnlit) : toUnlit(orig);
+        o.material = Array.isArray(orig) ? orig.map(toLit) : toLit(orig);
         for (const m of Array.isArray(orig) ? orig : [orig]) m.dispose();
     });
 }
 
-// Capture pipeline: scene target (color + float depth texture) and the
-// depth-pack target + fullscreen pass converting window-space depth to the
-// contract's log-uint16 codes (RG = hi/lo byte; 0 = background).
-function createCapture(renderer, resolution, near, far, fovDeg, background) {
+// The fixed light rig, added once to the loaded scene (Phase 1). Mirrors the
+// debug mesh viewer (client/public/js/scene3d.js): image-based ambient from a
+// prefiltered RoomEnvironment (lights but is NOT drawn — the background stays the
+// black, alpha-0 clear so empty pixels read as empty coverage), a hemisphere
+// fill, and one shadow-casting sun placed from the config's azimuth/elevation.
+// The sun's shadow frustum is fit to the scene's bounding sphere; no ground
+// shadow-catcher plane (shadows fall on the real meshes, which all receive).
+function setupLighting(renderer, scene, cfg, box) {
+    const pmrem = new THREE.PMREMGenerator(renderer);
+    const envScene = new RoomEnvironment(renderer);
+    scene.environment = pmrem.fromScene(envScene, 0.04).texture;
+    scene.environmentIntensity = cfg.env;
+    envScene.dispose();
+    pmrem.dispose();
+
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x202028, cfg.fill);
+    scene.add(hemi);
+
+    const SHADOW_MAP_SIZE = 4096;
+    const key = new THREE.DirectionalLight(0xffffff, cfg.key);
+    key.castShadow = cfg.shadows !== false;
+    key.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
+    key.shadow.bias = -0.0001;
+
+    const center = new THREE.Vector3();
+    const size = new THREE.Vector3();
+    if (box && !box.isEmpty()) {
+        box.getCenter(center);
+        box.getSize(size);
+    } else {
+        center.set(0, 0, 0);
+        size.set(20, 20, 20);
+    }
+    const radius = Math.max(0.5, 0.5 * Math.hypot(size.x, size.y, size.z));
+    const az = THREE.MathUtils.degToRad(cfg.azimuth_deg);
+    const el = THREE.MathUtils.degToRad(cfg.elevation_deg);
+    const cosEl = Math.cos(el);
+    const dir = new THREE.Vector3(
+        Math.sin(az) * cosEl,
+        Math.sin(el),
+        Math.cos(az) * cosEl,
+    ).normalize();
+    const dist = radius * 3;
+    key.position.copy(center).addScaledVector(dir, dist);
+    key.target.position.copy(center);
+    key.target.updateMatrixWorld();
+
+    const cam = key.shadow.camera;
+    const extent = radius * 1.05;
+    cam.left = -extent;
+    cam.right = extent;
+    cam.top = extent;
+    cam.bottom = -extent;
+    cam.near = Math.max(0.01, dist - radius * 1.1);
+    cam.far = dist + radius * 1.1;
+    cam.updateProjectionMatrix();
+    // Normal-offset bias scaled to the shadow texel's world size (matches the mesh
+    // viewer) — the main defense against self-shadow acne at any scene scale.
+    key.shadow.normalBias = ((2 * extent) / SHADOW_MAP_SIZE) * 2.0;
+    scene.add(key, key.target);
+}
+
+// Capture pipeline. Three passes per view:
+//   1. scene  → rtScene (RGBA16F + float depth): the LIT scene shaded in LINEAR
+//      light (no tone map / encode), so highlights stay HDR instead of clipping.
+//   2. present→ rtColor (RGBA8): a fullscreen pass applying a fixed ACES-filmic
+//      tone map + sRGB encode — the display colour the refs store and gsplat
+//      trains against. Alpha (accumulated coverage) passes through untouched.
+//   3. pack   → rtDepth (RG8): window-space depth → the contract's log-uint16
+//      codes (RG = lo/hi byte; 0 = background).
+// The tone map + encode are done in OUR OWN ShaderMaterial (whose output three
+// stores verbatim), NOT via three's render-target colour handling, so the stored
+// pixels are deterministic across three.js versions. `exposure` and `uLinear`
+// (curve-off, for the self-test's raw-value checks) parameterize the present pass.
+function createCapture(renderer, resolution, near, far, fovDeg, background, exposure = 1.0) {
     const depthTexture = new THREE.DepthTexture(resolution, resolution);
     depthTexture.type = THREE.FloatType;
     const targetOpts = {
@@ -177,10 +293,20 @@ function createCapture(renderer, resolution, near, far, fovDeg, background) {
         generateMipmaps: false,
         stencilBuffer: false,
     };
-    const rtColor = new THREE.WebGLRenderTarget(resolution, resolution, {
+    // Lit scene → linear HDR + depth. Half-float holds values > 1 so the tone map
+    // (present pass) has real highlight detail to compress; kept linear so the
+    // present pass owns the whole display transform.
+    const rtScene = new THREE.WebGLRenderTarget(resolution, resolution, {
         ...targetOpts,
         depthBuffer: true,
         depthTexture,
+        type: THREE.HalfFloatType,
+    });
+    // Final 8-bit readback target for colour: the present pass writes already-
+    // encoded sRGB bytes, so nothing else touches them.
+    const rtColor = new THREE.WebGLRenderTarget(resolution, resolution, {
+        ...targetOpts,
+        depthBuffer: false,
     });
     // Depth pack target is RG8 (two bytes/pixel), NOT RGBA8: the pack shader writes
     // the log-u16 code's low byte to R and high byte to G, so the readback bytes
@@ -195,19 +321,75 @@ function createCapture(renderer, resolution, near, far, fovDeg, background) {
         type: THREE.UnsignedByteType,
     });
 
+    const fullscreenVS = /* glsl */ `
+        varying vec2 vUv;
+        void main() {
+            vUv = uv;
+            gl_Position = vec4(position.xy, 0.0, 1.0);
+        }
+    `;
+
+    // Present: linear HDR → ACES-filmic (three.js' exact fit, so the splat looks
+    // like the mesh viewer) → sRGB, 8-bit. uLinear = true bypasses the curve
+    // (clamp only) for the self-test, whose checks are written against raw values.
+    const presentMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+            tScene: { value: rtScene.texture },
+            uExposure: { value: exposure },
+            uLinear: { value: false },
+        },
+        vertexShader: fullscreenVS,
+        fragmentShader: /* glsl */ `
+            precision highp float;
+            uniform sampler2D tScene;
+            uniform float uExposure;
+            uniform bool uLinear;
+            varying vec2 vUv;
+            vec3 acesFilmic(vec3 x) {
+                const mat3 inMat = mat3(
+                    vec3(0.59719, 0.07600, 0.02840),
+                    vec3(0.35458, 0.90834, 0.13383),
+                    vec3(0.04823, 0.01566, 0.83777)
+                );
+                const mat3 outMat = mat3(
+                    vec3( 1.60475, -0.10208, -0.00327),
+                    vec3(-0.53108,  1.10813, -0.07276),
+                    vec3(-0.07367, -0.00605,  1.07602)
+                );
+                x = inMat * x;
+                vec3 a = x * (x + 0.0245786) - 0.000090537;
+                vec3 b = x * (0.983729 * x + 0.4329510) + 0.238081;
+                x = a / b;
+                x = outMat * x;
+                return clamp(x, 0.0, 1.0);
+            }
+            vec3 linearToSrgb(vec3 c) {
+                c = clamp(c, 0.0, 1.0);
+                vec3 lo = c * 12.92;
+                vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+                return mix(lo, hi, step(vec3(0.0031308), c));
+            }
+            void main() {
+                vec4 s = texture2D(tScene, vUv);
+                if (uLinear) {
+                    gl_FragColor = vec4(clamp(s.rgb, 0.0, 1.0), s.a);
+                    return;
+                }
+                vec3 c = linearToSrgb(acesFilmic(s.rgb * uExposure));
+                gl_FragColor = vec4(c, s.a);
+            }
+        `,
+        depthTest: false,
+        depthWrite: false,
+    });
+
     const packMaterial = new THREE.ShaderMaterial({
         uniforms: {
             tDepth: { value: depthTexture },
             uNear: { value: near },
             uFar: { value: far },
         },
-        vertexShader: /* glsl */ `
-            varying vec2 vUv;
-            void main() {
-                vUv = uv;
-                gl_Position = vec4(position.xy, 0.0, 1.0);
-            }
-        `,
+        vertexShader: fullscreenVS,
         fragmentShader: /* glsl */ `
             precision highp float;
             uniform sampler2D tDepth;
@@ -235,21 +417,28 @@ function createCapture(renderer, resolution, near, far, fovDeg, background) {
         depthTest: false,
         depthWrite: false,
     });
-    // Fullscreen triangle (no index, no camera transform — clip-space verts).
-    const geo = new THREE.BufferGeometry();
-    geo.setAttribute(
-        "position",
-        new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3),
-    );
-    geo.setAttribute(
-        "uv",
-        new THREE.BufferAttribute(new Float32Array([0, 0, 2, 0, 0, 2]), 2),
-    );
-    const packScene = new THREE.Scene();
-    const tri = new THREE.Mesh(geo, packMaterial);
-    tri.frustumCulled = false;
-    packScene.add(tri);
-    const packCamera = new THREE.Camera();
+
+    // A fullscreen triangle (no index, no camera transform — clip-space verts)
+    // per pass, both driven by one throwaway ortho-less camera.
+    function fullscreenScene(material) {
+        const geo = new THREE.BufferGeometry();
+        geo.setAttribute(
+            "position",
+            new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3),
+        );
+        geo.setAttribute(
+            "uv",
+            new THREE.BufferAttribute(new Float32Array([0, 0, 2, 0, 0, 2]), 2),
+        );
+        const scene = new THREE.Scene();
+        const tri = new THREE.Mesh(geo, material);
+        tri.frustumCulled = false;
+        scene.add(tri);
+        return scene;
+    }
+    const presentScene = fullscreenScene(presentMaterial);
+    const packScene = fullscreenScene(packMaterial);
+    const fsCamera = new THREE.Camera();
 
     const camera = new THREE.PerspectiveCamera(fovDeg, 1, near, far);
     const bg = new THREE.Color(background[0], background[1], background[2]);
@@ -263,13 +452,19 @@ function createCapture(renderer, resolution, near, far, fovDeg, background) {
             .add(camera.position);
         camera.lookAt(lookTarget);
         renderer.setClearColor(bg, 0); // alpha 0 = empty coverage
+        renderer.setRenderTarget(rtScene);
+        renderer.render(scene, camera); // lit, linear HDR + depth
         renderer.setRenderTarget(rtColor);
-        renderer.render(scene, camera);
+        renderer.render(presentScene, fsCamera); // ACES + sRGB → 8-bit
         renderer.setRenderTarget(rtDepth);
-        renderer.render(packScene, packCamera);
+        renderer.render(packScene, fsCamera); // depth → log-u16 codes
     }
 
-    return { rtColor, rtDepth, renderView, camera };
+    function setLinear(on) {
+        presentMaterial.uniforms.uLinear.value = !!on;
+    }
+
+    return { rtColor, rtDepth, renderView, camera, setLinear };
 }
 
 // PBO + fence async readback, SEGMENTED: each view's color + packed-depth RGBA
@@ -430,7 +625,7 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
-                prepareUnlit(gltf.scene);
+                prepareLit(gltf.scene);
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -503,6 +698,18 @@ async function runCapture() {
     status(`scene: ${loaded} objects loaded${badObjects ? `, ${badObjects} failed` : ""}`);
     if (loaded === 0) throw new Error("no objects loaded from the mesh bundle");
 
+    // Fixed light rig (Phase 1): added once, identical for every view. The sun is
+    // placed from the scene's bounds; the shadow map is rendered ONCE (static
+    // scene + light) via renderer.shadowMap.autoUpdate=false + one needsUpdate.
+    const lighting = manifest.lighting || DEFAULT_LIGHTING;
+    const sceneBox = new THREE.Box3().setFromObject(scene);
+    setupLighting(renderer, scene, lighting, sceneBox);
+    renderer.shadowMap.needsUpdate = true;
+    status(
+        `lighting: env ${lighting.env} · sun ${lighting.key} @ ${lighting.azimuth_deg}°/` +
+            `${lighting.elevation_deg}° · ${lighting.tone_mapping} exposure ${lighting.exposure}`,
+    );
+
     const capture = createCapture(
         renderer,
         R,
@@ -510,6 +717,7 @@ async function runCapture() {
         manifest.far,
         manifest.fov_deg,
         manifest.background,
+        lighting.exposure ?? 1.0,
     );
     const ring = createReadbackRing(renderer, R);
 
@@ -809,6 +1017,45 @@ async function runBench(n, mode) {
     status(line, "ok");
 }
 
+// Reference JS twins of the present pass's tone map + transfer (for grey, ACES'
+// input/output matrices preserve the value, so scalar math matches the shader).
+function acesFilmicJs(v) {
+    const a = v * (v + 0.0245786) - 0.000090537;
+    const b = v * (0.983729 * v + 0.4329510) + 0.238081;
+    return Math.min(Math.max(a / b, 0), 1);
+}
+function srgbEncodeJs(c) {
+    c = Math.min(Math.max(c, 0), 1);
+    return c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055;
+}
+
+// Validate the DISPLAY-COLOUR transform (linear → ACES-filmic → sRGB) on THIS
+// GPU/driver: render a flat linear mid-grey through the real present pass and
+// check the encoded byte matches the reference math. This guards the silent
+// colour corruption the old unlit path couldn't have — the lit capture now bakes
+// every surface's colour through exactly this transform.
+function colorPipelineCheck(renderer, capture, R) {
+    const GREY = 0.5;
+    const scene = new THREE.Scene();
+    const mat = new THREE.MeshBasicMaterial({ color: new THREE.Color(GREY, GREY, GREY) });
+    mat.side = THREE.DoubleSide; // the plane faces +z; the camera looks at its back
+    mat.toneMapped = false;
+    const quad = new THREE.Mesh(new THREE.PlaneGeometry(100, 100), mat);
+    quad.position.set(0, 0, 2);
+    scene.add(quad);
+    capture.setLinear(false); // exercise the ACES+sRGB curve (real capture path)
+    capture.renderView(scene, [0, 0, 0], { forward: [0, 0, 1], up: [0, 1, 0] });
+    capture.setLinear(true);
+    const px = new Uint8Array(4);
+    renderer.readRenderTargetPixels(capture.rtColor, R >> 1, R >> 1, 1, 1, px);
+    const expect = Math.round(srgbEncodeJs(acesFilmicJs(GREY)) * 255);
+    return {
+        name: "display colour transform (linear→ACES→sRGB)",
+        ok: Math.abs(px[0] - expect) <= 3,
+        detail: `linear grey ${GREY} → ${px[0]} (want ~${expect})`,
+    };
+}
+
 async function runSelftest() {
     const renderer = createRenderer();
     status(`WebGL: ${rendererName(renderer)}`);
@@ -818,6 +1065,10 @@ async function runSelftest() {
     const scene = buildUvQuadScene();
 
     const capture = createCapture(renderer, R, near, far, 90.0, [0, 0, 0]);
+    // The convention checks below are written against RAW values, so probe the UV
+    // quad through the present pass in linear (curve-off) mode; the ACES+sRGB
+    // colour transform is validated separately (colorPipelineCheck).
+    capture.setLinear(true);
     capture.renderView(scene, [0, 0, 0], { forward: [0, 0, 1], up: [0, 1, 0] });
 
     const rgba = new Uint8Array(R * R * 4);
@@ -830,6 +1081,7 @@ async function runSelftest() {
     const codes = new Uint16Array(depthRG.buffer);
 
     const results = selftestChecks(rgba, codes, R, near, far);
+    results.push(colorPipelineCheck(renderer, capture, R));
     for (const r of results) {
         status(`[${r.ok ? "PASS" : "FAIL"}] ${r.name}${r.detail ? ` — ${r.detail}` : ""}`, r.ok ? "ok" : "err");
     }
