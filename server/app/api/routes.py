@@ -3016,6 +3016,9 @@ async def _run_splat_stage5_cell(
         plan = await asyncio.to_thread(splat_stage5.load_camera_plan, cameras_path)
         views = await asyncio.to_thread(splat_stage5.enumerate_views, plan)
         out_dir = _refs_dir(run, slot, model)
+        # Drop frames rendered under a stale lighting/colour pipeline (e.g. the
+        # pre-reflective matte shading) so they re-render under the current one.
+        await asyncio.to_thread(splat_stage5.reconcile_capture_meta, out_dir)
         (out_dir / splat_stage5.FRAMES_DIRNAME).mkdir(parents=True, exist_ok=True)
         pending = await asyncio.to_thread(splat_stage5.pending_views, out_dir, views)
         skipped = len(views) - len(pending)
@@ -3729,6 +3732,34 @@ def create_app() -> FastAPI:
         """Live Stage-1 state of one cell ('idle' / 'pending' / a running job /
         'done' / 'error')."""
         return _splat_cell_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/reveal/{slot}/{model}")
+    async def splat_reveal(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Open this cell's splat/ folder in the SERVER host's file browser
+        (Explorer / Finder / xdg-open) — a local-dev convenience, since the
+        browser can't open a local directory itself. Falls back to the cell dir
+        when splat/ doesn't exist yet."""
+        cell = _slot_dir(run, slot, model)
+        target = cell / "splat"
+        if not target.is_dir():
+            target = cell
+        if not target.is_dir():
+            raise HTTPException(status_code=404, detail=f"no such cell: {slot}/{model}")
+        target = target.resolve()
+        if not target.is_relative_to(RUNS_DIR.resolve()):
+            raise HTTPException(status_code=400, detail="refusing to open a path outside runs/")
+        opener = (
+            ["explorer", str(target)]
+            if sys.platform == "win32"
+            else ["open", str(target)]
+            if sys.platform == "darwin"
+            else ["xdg-open", str(target)]
+        )
+        try:
+            subprocess.Popen(opener)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"failed to open folder: {exc}") from exc
+        return {"opened": str(target)}
 
     @app.get("/runs/{run}/splat/source/{slot}/{model}")
     async def splat_source_get(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

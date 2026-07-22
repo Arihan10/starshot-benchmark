@@ -205,6 +205,12 @@ export async function openSogView({ container, url, view, speed: spd }) {
     }
     if (!app) throw new Error("sog view closed while loading"); // closed mid-load
     const splat = new Entity("sog-splat");
+    // View-dependent colour is data-driven: PlayCanvas' gsplat renderer reads and
+    // evaluates whatever spherical-harmonic bands the SOG carries, with no toggle
+    // to set here. The trained splat is degree 2 (splat/stage6.py), and
+    // client/tools/ply-to-sog.mjs preserves the PLY's f_rest through the
+    // 2DGS→3DGS flatten so splat-transform bakes it into the SOG — so switching
+    // to the SOG view shows the same moving highlights as the mkkellogg view.
     splat.addComponent("gsplat", { asset });
     app.root.addChild(splat);
 

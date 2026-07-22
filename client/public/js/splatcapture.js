@@ -14,9 +14,10 @@
 //      depth → POST binary SRF1 batches to …/frames?token=…
 //   4. POST …/finish?token=… → the server verifies + writes transforms.json.
 //
-// LIT capture (Phase 1): materials render as matte PBR surfaces (toLit) under a
-// FIXED light rig borrowed from the debug mesh viewer (setupLighting: image-based
-// ambient + a shadow-casting sun + a hemisphere fill), so lighting and shadows
+// LIT capture (Phase 1): materials render as PBR surfaces (authored metallic-
+// roughness intact, so metals/glossies reflect + highlight per view) under a FIXED
+// light rig (splatlight.js — image-based ambient + a shadow-casting sun + a
+// hemisphere fill, shared with the debug viewers), so lighting and shadows
 // are baked into the reference frames. The rig is sent by the server (manifest
 // `lighting`, = splat/stage5.py LIGHTING) and recorded in transforms.json, so it
 // is identical for every view and every (resumed) session.
@@ -47,22 +48,12 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
-import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { normalizeLighting, prepareLitScene, createLightRig } from "./splatlight.js";
 
 const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
-// Fallback light rig, used only if the manifest omits `lighting` (e.g. the page
-// opened by hand). The server sends splat/stage5.py's LIGHTING as the source of
-// truth; keep these in sync. Phase 1: shade lit + bake into the reference frames.
-const DEFAULT_LIGHTING = {
-    env: 0.35,
-    key: 3.5,
-    fill: 0.2,
-    azimuth_deg: 34.0,
-    elevation_deg: 48.0,
-    shadows: true,
-    tone_mapping: "aces_filmic",
-    exposure: 1.0,
-};
+// The bake rig + lit PBR materials live in splatlight.js (shared with the debug
+// viewers). The server sends splat/stage5.py's LIGHTING in the manifest, and
+// `normalizeLighting` falls back to the shared defaults when it's absent.
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
 const MAX_PARSE_INFLIGHT = 4; // concurrent GLB parses while streaming the bundle
 const READ_SEGMENTS = 3; // readback segments in flight (ring depth)
@@ -166,110 +157,6 @@ function rendererName(renderer) {
     const gl = renderer.getContext();
     const info = gl.getExtension("WEBGL_debug_renderer_info");
     return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : "unknown";
-}
-
-// One material class for the whole capture: a LIT PBR surface (Phase 1). Copies
-// the glTF inputs the refs contract reads (map, baseColorFactor, opacity,
-// alphaMode via transparent/alphaTest) and forces a MATTE dielectric response
-// (metalness 0, roughness 1): the splat asset tier strips the metallic-roughness
-// map, and the glTF default metalnessFactor is 1 (fully metal → near-black under
-// an env), so pinning matte gives clean diffuse shading and is exactly Phase 1's
-// scope (shiny surfaces are a later phase). The base-color map is tagged sRGB so
-// it decodes to linear for shading. DoubleSide because Trellis winding is
-// unreliable (three flips the normal per back-face, so lit shading is correct on
-// the visible side regardless); BLEND glass keeps depthWrite OFF so depth is the
-// surface behind the pane.
-function toLit(orig) {
-    const m = new THREE.MeshStandardMaterial();
-    m.map = orig.map || null;
-    if (m.map) m.map.colorSpace = THREE.SRGBColorSpace; // base colour is sRGB → decode for shading
-    if (orig.color) m.color.copy(orig.color); // baseColorFactor
-    m.metalness = 0.0;
-    m.roughness = 1.0;
-    m.opacity = orig.opacity ?? 1;
-    m.transparent = orig.transparent === true;
-    m.alphaTest = orig.alphaTest || 0;
-    m.side = THREE.DoubleSide;
-    m.depthWrite = !m.transparent;
-    m.vertexColors = orig.vertexColors === true;
-    return m;
-}
-
-function prepareLit(root) {
-    root.traverse((o) => {
-        if (!o.isMesh || !o.material) return;
-        // Generated meshes often ship without normals; shading needs them.
-        if (o.geometry && !o.geometry.getAttribute("normal")) {
-            o.geometry.computeVertexNormals();
-        }
-        o.castShadow = true;
-        o.receiveShadow = true;
-        const orig = o.material;
-        o.material = Array.isArray(orig) ? orig.map(toLit) : toLit(orig);
-        for (const m of Array.isArray(orig) ? orig : [orig]) m.dispose();
-    });
-}
-
-// The fixed light rig, added once to the loaded scene (Phase 1). Mirrors the
-// debug mesh viewer (client/public/js/scene3d.js): image-based ambient from a
-// prefiltered RoomEnvironment (lights but is NOT drawn — the background stays the
-// black, alpha-0 clear so empty pixels read as empty coverage), a hemisphere
-// fill, and one shadow-casting sun placed from the config's azimuth/elevation.
-// The sun's shadow frustum is fit to the scene's bounding sphere; no ground
-// shadow-catcher plane (shadows fall on the real meshes, which all receive).
-function setupLighting(renderer, scene, cfg, box) {
-    const pmrem = new THREE.PMREMGenerator(renderer);
-    const envScene = new RoomEnvironment(renderer);
-    scene.environment = pmrem.fromScene(envScene, 0.04).texture;
-    scene.environmentIntensity = cfg.env;
-    envScene.dispose();
-    pmrem.dispose();
-
-    const hemi = new THREE.HemisphereLight(0xffffff, 0x202028, cfg.fill);
-    scene.add(hemi);
-
-    const SHADOW_MAP_SIZE = 4096;
-    const key = new THREE.DirectionalLight(0xffffff, cfg.key);
-    key.castShadow = cfg.shadows !== false;
-    key.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
-    key.shadow.bias = -0.0001;
-
-    const center = new THREE.Vector3();
-    const size = new THREE.Vector3();
-    if (box && !box.isEmpty()) {
-        box.getCenter(center);
-        box.getSize(size);
-    } else {
-        center.set(0, 0, 0);
-        size.set(20, 20, 20);
-    }
-    const radius = Math.max(0.5, 0.5 * Math.hypot(size.x, size.y, size.z));
-    const az = THREE.MathUtils.degToRad(cfg.azimuth_deg);
-    const el = THREE.MathUtils.degToRad(cfg.elevation_deg);
-    const cosEl = Math.cos(el);
-    const dir = new THREE.Vector3(
-        Math.sin(az) * cosEl,
-        Math.sin(el),
-        Math.cos(az) * cosEl,
-    ).normalize();
-    const dist = radius * 3;
-    key.position.copy(center).addScaledVector(dir, dist);
-    key.target.position.copy(center);
-    key.target.updateMatrixWorld();
-
-    const cam = key.shadow.camera;
-    const extent = radius * 1.05;
-    cam.left = -extent;
-    cam.right = extent;
-    cam.top = extent;
-    cam.bottom = -extent;
-    cam.near = Math.max(0.01, dist - radius * 1.1);
-    cam.far = dist + radius * 1.1;
-    cam.updateProjectionMatrix();
-    // Normal-offset bias scaled to the shadow texel's world size (matches the mesh
-    // viewer) — the main defense against self-shadow acne at any scene scale.
-    key.shadow.normalBias = ((2 * extent) / SHADOW_MAP_SIZE) * 2.0;
-    scene.add(key, key.target);
 }
 
 // Capture pipeline. Three passes per view:
@@ -625,7 +512,7 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
-                prepareLit(gltf.scene);
+                prepareLitScene(gltf.scene);
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -701,13 +588,15 @@ async function runCapture() {
     // Fixed light rig (Phase 1): added once, identical for every view. The sun is
     // placed from the scene's bounds; the shadow map is rendered ONCE (static
     // scene + light) via renderer.shadowMap.autoUpdate=false + one needsUpdate.
-    const lighting = manifest.lighting || DEFAULT_LIGHTING;
+    const rawLighting = manifest.lighting || {};
+    const lighting = normalizeLighting(rawLighting);
     const sceneBox = new THREE.Box3().setFromObject(scene);
-    setupLighting(renderer, scene, lighting, sceneBox);
+    const rig = createLightRig(renderer, scene, { defaults: lighting });
+    rig.refit(sceneBox);
     renderer.shadowMap.needsUpdate = true;
     status(
-        `lighting: env ${lighting.env} · sun ${lighting.key} @ ${lighting.azimuth_deg}°/` +
-            `${lighting.elevation_deg}° · ${lighting.tone_mapping} exposure ${lighting.exposure}`,
+        `lighting: env ${lighting.env} · sun ${lighting.key} @ ${lighting.azimuth}°/` +
+            `${lighting.elevation}° · ${rawLighting.tone_mapping || "aces_filmic"} exposure ${lighting.exposure}`,
     );
 
     const capture = createCapture(

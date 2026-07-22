@@ -154,6 +154,9 @@ image = (
         _REPO / "client/public/js/splatcapture.js", f"{_ASSETS}/js/splatcapture.js"
     )
     .add_local_file(
+        _REPO / "client/public/js/splatlight.js", f"{_ASSETS}/js/splatlight.js"
+    )
+    .add_local_file(
         _REPO / "client/public/js/splatcapture-worker.js",
         f"{_ASSETS}/js/splatcapture-worker.js",
     )

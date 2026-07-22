@@ -67,6 +67,12 @@ class QuantConfig:
     opacity_bits: int = 8
     scale_bits: int = 16
     quat_bits: int = 8
+    # View-dependent SH rest coefficients (`f_rest_*`). 8-bit per coefficient over
+    # its own observed range is near-lossless like the SH0 colour (they're small,
+    # low-frequency contributions) and, at degree 2's 24 coeffs/Gaussian, is the
+    # difference between ~24 B/splat here and the ~96 B raw float32 they'd cost as
+    # a passthrough — so this is the main size lever for a view-dependent splat.
+    sh_bits: int = 8
     opacity_clamp: float = 1e-4
 
     def as_summary(self) -> dict[str, Any]:
@@ -252,7 +258,17 @@ def quantize_ply(
             raise ValueError(f"{in_path}: missing required property '{req}' (not a 2DGS splat?)")
 
     scale_fields = sorted(n for n in ply_order if n.startswith("scale_"))
-    known = set(_POS) | set(_NORMAL) | set(_COLOR) | {_OPACITY} | set(scale_fields) | set(_QUAT)
+    # Higher-order SH (view-dependent colour): quantised like colour rather than
+    # passed through raw. Numeric-sorted so f_rest_2 precedes f_rest_10 (the ply
+    # order); decode maps by name, so the order is for tidiness, not correctness.
+    sh_fields = sorted(
+        (n for n in ply_order if n.startswith("f_rest_")),
+        key=lambda s: int(s.rsplit("_", 1)[-1]),
+    )
+    known = (
+        set(_POS) | set(_NORMAL) | set(_COLOR) | {_OPACITY}
+        | set(scale_fields) | set(sh_fields) | set(_QUAT)
+    )
     extras = [n for n in ply_order if n not in known]
 
     blocks: list[dict[str, Any]] = []
@@ -283,6 +299,8 @@ def quantize_ply(
         blob.extend(raw)
     if scale_fields:
         add_uniform(scale_fields, config.scale_bits)
+    if sh_fields:
+        add_uniform(sh_fields, config.sh_bits)
 
     quats = np.stack([cols[r] for r in _QUAT], axis=1)
     comp, idx = _encode_quats(quats, config.quat_bits)
@@ -425,6 +443,16 @@ def _measure_error(orig: dict[str, np.ndarray], deq: dict[str, np.ndarray]) -> d
         rel = np.abs(sd - so) / (so + 1e-12)
         out["scale_rel_mean"] = round(float(rel.mean()), 5)
         out["scale_rel_max"] = round(float(rel.max()), 5)
+
+    # View-dependent SH rest coefficients — error in raw coefficient units (the
+    # DC/colour error above is the dominant term; these are corrections on top).
+    sh_fields = [n for n in orig if n.startswith("f_rest_")]
+    if sh_fields:
+        so = np.stack([orig[n] for n in sh_fields], axis=1).astype(np.float64)
+        sd = np.stack([deq[n] for n in sh_fields], axis=1).astype(np.float64)
+        e = np.abs(so - sd)
+        out["sh_mean"] = round(float(e.mean()), 6)
+        out["sh_max"] = round(float(e.max()), 6)
 
     qo = np.stack([orig[r] for r in _QUAT], axis=1).astype(np.float64)
     qd = np.stack([deq[r] for r in _QUAT], axis=1).astype(np.float64)

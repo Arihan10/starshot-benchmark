@@ -187,6 +187,7 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
+        sh_rest=arrays.get("shN"),  # preserve view-dependent colour through compaction
     )
 
     # --- verify A: original vs compacted, same poses --------------------------
@@ -363,6 +364,9 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
         "quats": params.quats_lr * lr_scale,
         "opacities": params.opacities_lr * lr_scale,
         "sh0": params.sh0_lr * lr_scale,
+        # shN is present whenever the trained splat is view-dependent (SH>0); the
+        # optimizer loop below iterates splats.keys(), so its LR must exist here.
+        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam([{"params": [splats[name]], "lr": lrs[name]}], eps=1e-15)
@@ -405,6 +409,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
+        sh_rest=arrays.get("shN"),  # preserve view-dependent colour through the slim
     )
 
     t2 = time.perf_counter()
