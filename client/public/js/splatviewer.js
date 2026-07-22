@@ -1257,6 +1257,23 @@ function buildControls(summary) {
         dFmt,
     );
 
+    // Forced per-object pool size — a RESOURCE knob (not part of SampleParams):
+    // 0 = auto (min(cores, 8) server-side); >=1 pins the pool (re-clamped to the
+    // object count + a memory cap in stage3). `summary.workers` is the RESOLVED
+    // count of the last run, shown as a hint; the slider defaults to auto so a
+    // re-splat never silently pins the pool after one run.
+    const lastWorkers = (summary && summary.workers) || 0;
+    const workers = sliderRow(
+        "workers",
+        "workers",
+        0,
+        32,
+        1,
+        0,
+        (v) =>
+            v < 1 ? (lastWorkers ? `auto (last ${lastWorkers})` : "auto") : `${Math.round(v)}`,
+    );
+
     const btn = el("button", {
         class: "svc-resplat",
         text: "re-splat",
@@ -1491,6 +1508,7 @@ function buildControls(summary) {
         camSpeedRow,
         el("div", { class: "svc-title", text: "sampler" }),
         detail,
+        workers,
         el("div", { class: "svc-actions" }, btn),
         actual,
         overlay,
@@ -1503,7 +1521,10 @@ function actualText(summary) {
 }
 
 function readParams() {
-    return { detail: Number(inputs.detail.value) };
+    return {
+        detail: Number(inputs.detail.value),
+        workers: Math.round(Number(inputs.workers.value)),
+    };
 }
 
 async function resplat() {
@@ -1940,7 +1961,7 @@ const STAGES = [
 const STAGE_START = {
     1: (r, s, m) => api.splatStage1Start(r, s, m),
     2: (r, s, m) => api.splatStage2Start(r, s, m),
-    3: (r, s, m) => api.splatStage3Start(r, s, m),
+    3: (r, s, m) => api.splatStage3Start(r, s, m, readParams()),
     4: (r, s, m) => api.splatStage4Start(r, s, m),
     // Stage 5 resumes by default (renders only the views still missing on disk); an
     // explicit re-run of a DONE stage passes restart so the server wipes refs/ and
