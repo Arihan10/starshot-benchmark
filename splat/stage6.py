@@ -184,13 +184,20 @@ class TrainParams:
     # trigger `step % reset_every == 0 & step > 0` parses as `… and (0 > 0)`);
     # this makes that behaviour deliberate and upgrade-proof.
     reset_every: int = 0
-    grow_grad2d: float = 0.0002
+    # grow_grad2d is the ABS-gradient split threshold (absgrad below): absolute
+    # gradients don't cancel across a splat, so they run larger — raised ~3x from
+    # the non-abs 0.0002 (gsplat's guidance). Drop it and the cloud over-densifies.
+    grow_grad2d: float = 0.0006
     grow_scale3d: float = 0.01
     # Keep pruning BELOW the glass init: glass.py panes seed opacity at
     # GLASS_ALPHA = 0.065 (logit −2.67), and the old 0.05 threshold left only
     # ~0.3 logits of drift before a pane surfel was permanently pruned.
     prune_opa: float = 0.03
-    absgrad: bool = False
+    # AbsGS: accumulate the ABSOLUTE per-pixel view-space position gradient for
+    # the grow/split test, so a splat straddling high-frequency detail on a flat
+    # surface — whose opposite-side gradients cancel under the mean criterion —
+    # still densifies. Requires the raised grow_grad2d above.
+    absgrad: bool = True
     cap_max: int = 3_000_000           # freeze densification past this many Gaussians (VRAM guard)
     # Final cleanup prune (once, before eval + export). Densification/pruning stop at
     # refine_stop (50% of iters), so opacity that drifts below prune_opa in the back
@@ -367,6 +374,7 @@ class TrainParams:
             "refine_stop_iter": self.resolved_refine_stop,
             "reset_every": self.reset_every,
             "grow_grad2d": self.grow_grad2d,
+            "absgrad": self.absgrad,
             "prune_opa": self.prune_opa,
             "final_prune": self.final_prune,
             "prune_scale3d": self.prune_scale3d,
@@ -1546,10 +1554,13 @@ def train_splat(
             torch, rasterization_2dgs, splats_t, views, K, width, height, params, device
         )
         del splats_t
-    except torch.cuda.OutOfMemoryError:
+    except (torch.cuda.OutOfMemoryError, MemoryError) as exc:
+        # Eval is best-effort: a CUDA OOM (merged model too big to render) OR a HOST
+        # OOM (reference-frame zstd decode on a RAM-starved box) must not lose the
+        # trained splat — skip metrics and let the export below run regardless.
         torch.cuda.empty_cache()
         if progress is not None:
-            progress(1, 1, f"eval skipped: merged model ({n_final} splats) exceeds VRAM")
+            progress(1, 1, f"eval skipped ({type(exc).__name__}: {n_final} splats) - exporting splat anyway")
 
     quats = arrays["quats"] / (np.linalg.norm(arrays["quats"], axis=1, keepdims=True) + 1e-12)
     _encode_trained_ply(
