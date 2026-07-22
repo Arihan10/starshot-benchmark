@@ -81,25 +81,42 @@ coarse level as a prefiltered anti-aliased average instead of shimmering
 sub-pixel splats, and the same 2DGS `.ply` layout means every existing viewer /
 compressor reads the levels unchanged.
 
-COMPACTION (delivered-size cleanup): after the optimization, ONE deletion pass
-removes the Gaussians the reference views provably cannot show — the dominant
-lever on delivered size (the SOG/PLY footprint is ~linear in count, and
-densification stacks Gaussians many-deep on already-covered surfaces). Each
-Gaussian's TOTAL rendered contribution is MEASURED through the rasterizer
-itself: a pixel is Σᵢ wᵢ·cᵢ (wᵢ = opacity × kernel × transmittance), so one
-backward pass of Σ(all pixels of all views) w.r.t. the SH0 colours accumulates
-each Gaussian's Σ wᵢ over every pixel it touches in every view. A Gaussian
-whose total is below `compact_eps` (default 0.5/255) could not shift ANY single
-rendered pixel by even half an 8-bit display step even if its entire mass landed
-on that one pixel — deleting it is imperceptible BY CONSTRUCTION, per Gaussian.
-Survivors are NOT touched (no re-optimization), so fidelity is exactly the
-trained model's. Gaussians whose SH0 colour clamps to pure black in all three
-channels are gradient-blind to this measure and are force-kept. Note the
-deliberate behaviour change vs. plain training: surfels in fully-occluded
-regions (kept at their mesh-true init, never supervised) are deleted — invisible
-from every planned view ≈ invisible from all reachable free space. Runs per
-TILE against that tile's assigned views, and imposes NO count cap — each
-scene/tile keeps every Gaussian its own views can see. `compact=False` disables.
+COMPACTION (delivered-size cleanup): after the optimization, a measured pass
+deletes Gaussians the delivered splat doesn't need, then briefly re-tunes the
+survivors — the dominant lever on delivered size (the SOG/PLY footprint is
+~linear in count, and densification stacks Gaussians many-deep while depth-
+seeding scatters some off-surface). Three signals compose (`_select_keep`):
+  1. LOSSLESS contribution — each Gaussian's TOTAL rendered blend weight is
+     MEASURED through the rasterizer (a pixel is Σᵢ wᵢ·cᵢ, wᵢ = opacity × kernel
+     × transmittance, so one backward of Σ(all pixels of all views) w.r.t. the
+     SH0 colours accumulates each Gaussian's Σ wᵢ). Below `compact_eps`
+     (0.5/255) a Gaussian can't shift ANY pixel by half a display step even with
+     its whole mass on one pixel — deleting it is imperceptible by construction.
+  2. SURFACE PRIOR (`surface_max_dist` m) — drop any Gaussian farther than that
+     from every Stage-3 init surfel. Those surfels sit EXACTLY on the source
+     meshes, so "airborne" is decidable, not inferred (a filter photogrammetry
+     can't have): this removes the opaque floater clouds an under-supervised
+     open scene grows above/around objects (and the depth-seeds that landed at
+     wrong depths). Set 0 to disable; raise it for scenes with metre-scale-
+     sampled huge objects (skydome/terrain), whose legitimate surfels are sparse.
+  3. BUDGET — cut the low-contributors, gated by MEASURED quality. Default mode
+     is ADAPTIVE (`compact_max_db_drop`, 1.0 dB): bisect the keep fraction, and
+     for each probe prune → short heal → evaluate PSNR against the reference
+     views; accept the deepest cut whose drop from the post-cull baseline stays
+     within the budget. Every scene thus finds its own safe cut — a bloated one
+     sheds 60-70%, an information-dense one automatically keeps more — instead
+     of trusting a fixed percentage. `compact_keep_frac` (used when the dB gate
+     is None) applies a fixed scene-relative fraction instead; neither is ever
+     an absolute count cap. Ranking is OPACITY-NORMALIZED (weight/α), so
+     translucent-by-design content (glass panes at α≈0.065) is scored by what
+     it covers, not penalized for being see-through.
+Pure-black Gaussians (gradient-blind to the measure) are force-kept unless the
+surface prior culls them. Then `compact_heal_steps` of the standard supervision
+loss (no densification, means LR damped) let neighbours absorb the deleted
+Gaussians' residual so nothing tears. Runs per TILE against that tile's own
+views + init surfels. The dB gate is a GLOBAL-AVERAGE guard (PSNR over the eval
+subset) — it bounds overall fidelity, not any single detail. `compact=False`
+disables the whole pass.
 
 CUDA-ONLY: torch + gsplat compile/require CUDA, so this runs on the GPU box, NOT
 Apple Silicon. Both are imported LAZILY inside the trainer so the server (which
@@ -229,18 +246,35 @@ class TrainParams:
     final_prune: bool = True
     prune_scale3d: float = 0.1
 
-    # COMPACTION (post-training deletion; module docstring §COMPACTION). ONE
-    # measured pass: accumulate every Gaussian's total rendered blend weight over
-    # ALL reference views (through the rasterizer — the exact quantity pixels
-    # see), then delete those below `compact_eps`. At the 0.5/255 default a
-    # deleted Gaussian could not move any single rendered pixel by half an 8-bit
-    # display step even with its whole mass on one pixel, and survivors are not
-    # re-optimized — fidelity is the trained model's, by construction. This is
-    # the biggest DELIVERED-SIZE lever (SOG/PLY bytes are ~linear in count;
-    # densification stacks Gaussians many-deep on covered surfaces) and imposes
-    # NO count cap — each scene/tile keeps everything its own views can see.
+    # COMPACTION (post-training cleanup; module docstring §COMPACTION). A measured
+    # deletion (three composable signals) + a short heal of the survivors.
     compact: bool = True
-    compact_eps: float = 0.5 / 255.0      # total blend weight below which a Gaussian is unrenderable
+    # (1) LOSSLESS: total rendered blend weight below which a Gaussian can't move
+    # any pixel by half a display step — deleting it is imperceptible.
+    compact_eps: float = 0.5 / 255.0
+    # (2) SURFACE PRIOR (m): drop Gaussians farther than this from every Stage-3
+    # surfel (opaque floaters / mis-seeded depth points open scenes grow). The
+    # base surfel spacing clamps to ≤0.25 m, so 0.6 m cleanly separates airborne
+    # junk from real surface; 0 disables. Raise for metre-scale-sampled huge
+    # objects (skydome/terrain) whose legitimate surfels are sparse.
+    surface_max_dist: float = 0.6
+    # (3) BUDGET, quality-gated (the default): bisect the keep fraction and
+    # accept the deepest cut whose measured PSNR drop (probe: prune -> short heal
+    # -> eval on the seeded eval subset) stays within this many dB of the
+    # post-cull baseline. Each scene finds its own safe cut; None disables the
+    # search and falls back to `compact_keep_frac`. Cost ≈ compact_probes ×
+    # (probe-heal + eval) per run/tile.
+    compact_max_db_drop: float | None = 1.0
+    compact_probes: int = 3               # bisection probes (granularity ~0.9/2^probes)
+    compact_probe_heal_steps: int = 150   # short heal before each probe's eval
+    # Fixed-fraction fallback (used only when compact_max_db_drop is None):
+    # keep the top this-fraction by normalized contribution — SCENE-RELATIVE,
+    # never an absolute cap. None = no budget cut at all.
+    compact_keep_frac: float | None = None
+    # Heal after deletion: fine-tune steps (no densification, means LR damped) so
+    # survivors fill the deleted Gaussians' residual. 0 disables.
+    compact_heal_steps: int = 500
+    compact_heal_means_lr_frac: float = 0.1
 
     # Adaptive VRAM guard. cap_max is the hard ceiling; additionally freeze
     # densification (and pause depth-seeding) when free VRAM drops below this many
@@ -412,6 +446,10 @@ class TrainParams:
             "prune_scale3d": self.prune_scale3d,
             "compact": self.compact,
             "compact_eps": self.compact_eps,
+            "surface_max_dist": self.surface_max_dist,
+            "compact_max_db_drop": self.compact_max_db_drop,
+            "compact_keep_frac": self.compact_keep_frac,
+            "compact_heal_steps": self.compact_heal_steps,
             "vram_min_free_gb": self.vram_min_free_gb,
             "antialias": self.antialias,
             "aa_min_scale_px": self.aa_min_scale_px,
@@ -1555,6 +1593,7 @@ def train_splat(
         tiles_summary = None
         n_seeded, n_pruned = one["seeded"], one["pruned"]
         n_compacted = one.get("compacted", 0)
+        compact_search = one.get("compact_search")
     else:
         if progress is not None:
             progress(
@@ -1569,6 +1608,7 @@ def train_splat(
         n_seeded = int(sum(t["seeded"] for t in tiles_summary))
         n_pruned = int(sum(t["pruned"] for t in tiles_summary))
         n_compacted = int(sum(t.get("compacted", 0) for t in tiles_summary))
+        compact_search = None  # per-tile searches live in tiles_summary entries
 
     n_final = int(arrays["means"].shape[0])
 
@@ -1620,6 +1660,7 @@ def train_splat(
         "splats_final": n_final,
         "splats_pruned_final": n_pruned,
         "splats_compacted": n_compacted,
+        "compact_search": compact_search,
         "splats_depth_seeded": n_seeded,
         "iterations": params.iterations,
         "views": n_views,
@@ -1755,6 +1796,110 @@ def _blind_mask(torch, sh0):  # noqa: ANN001
     unconditionally."""
     rgb = 0.5 + _SH_C0 * sh0.detach()[:, 0, :]
     return (rgb < 0).all(dim=1)
+
+
+def _select_keep(torch, weights, sh0, opacities, means, init_means, eps, surface_max_dist, keep_count):  # noqa: ANN001
+    """Boolean keep-mask for compaction (module docstring §COMPACTION), composing
+    up to three signals from the measured contribution `weights`:
+      * LOSSLESS — keep every Gaussian with contribution > `eps` (below it it
+        cannot move any pixel by half a display step), plus pure-black
+        `_blind_mask` Gaussians the measure can't see;
+      * SURFACE PRIOR — with `surface_max_dist` > 0 and `init_means` given, drop
+        any Gaussian farther than that (metres) from every Stage-3 surfel; this
+        OVERRIDES lossless/blind, so bright and black floaters both go;
+      * BUDGET — with `keep_count` not None, additionally keep only the top
+        `keep_count` survivors by OPACITY-NORMALIZED contribution (weight/α:
+        what the Gaussian would paint if opaque). Raw blend weight scores
+        translucent-BY-DESIGN content as unimportant — ranked raw, the hotel's
+        α≈0.065 window panes were 99.5% deleted at keep-30% — while w/α ranks a
+        pane like the surface it covers. Blind Gaussians are kept regardless.
+    Shared by the training-loop compaction and the post-hoc experiment runners so
+    the selection is identical everywhere."""
+    blind = _blind_mask(torch, sh0)
+    keep = (weights > eps) | blind
+    if surface_max_dist and surface_max_dist > 0 and init_means is not None:
+        from scipy.spatial import cKDTree
+
+        d, _ = cKDTree(np.asarray(init_means)).query(means.detach().cpu().numpy(), k=1, workers=-1)
+        keep = keep & torch.from_numpy(d <= float(surface_max_dist)).to(keep.device)
+    if keep_count is not None and int(keep_count) < int(keep.sum()):
+        # α floor well below prune_opa: a near-dead Gaussian must not be promoted
+        # 50x by the normalization.
+        alpha = torch.sigmoid(opacities.detach().flatten()).clamp_min(0.02)
+        rank = weights / alpha
+        forced = blind & keep                         # blind survivors can't be ranked
+        rankable = keep & ~forced
+        n_extra = max(int(keep_count) - int(forced.sum()), 0)
+        new_keep = forced.clone()
+        if n_extra > 0 and int(rankable.sum()) > 0:
+            r = rank.clone()
+            r[~rankable] = float("-inf")
+            top = torch.topk(r, min(n_extra, int(rankable.sum()))).indices
+            new_keep[top] = True
+        keep = new_keep
+    return keep
+
+
+def _heal(  # noqa: ANN001
+    torch, F, rasterization_2dgs, splats, views, K, width, height, params,
+    scene_scale, steps, box_lo, box_hi, px_grid, py_grid, progress,
+):
+    """Short fine-tune of the compaction SURVIVORS (no densification) so
+    neighbours absorb the deleted Gaussians' residual and the model doesn't tear.
+    Fresh Adam (training already converged; moments aren't worth carrying), means
+    LR damped by `compact_heal_means_lr_frac`. `box_lo`/… (a tile's box) mask the
+    loss to owned pixels, matching how the tile trained; None trains unmasked."""
+    import threading
+
+    device = splats["means"].device
+    b = max(int(params.batch), 1)
+    lr_scale = float(np.sqrt(b))
+    lrs = {
+        "means": params.means_lr * scene_scale * lr_scale * params.compact_heal_means_lr_frac,
+        "scales": params.scales_lr * lr_scale,
+        "quats": params.quats_lr * lr_scale,
+        "opacities": params.opacities_lr * lr_scale,
+        "sh0": params.sh0_lr * lr_scale,
+        "shN": params.shN_lr * lr_scale,
+    }
+    optimizers = {
+        name: torch.optim.Adam([{"params": [splats[name]], "lr": lrs[name]}], eps=1e-15)
+        for name in splats.keys()
+    }
+    window = _gaussian_window(torch, 11, 1.5, device, channels=3)
+    stop_ev = threading.Event()
+    stream = _view_stream(torch, views, device, b, params.prefetch, params.seed, 0, stop=stop_ev)
+    try:
+        for step in range(int(steps)):
+            viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
+            mask = None
+            if box_lo is not None and gt_depth is not None:
+                world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
+                mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
+            colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
+            renders, pred_alpha, normals, nfd, distort, median_depth, _info = _render_batch(
+                torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K,
+                width, height, params, dist_on=False,
+            )
+            pred_rgb = renders[..., :3]
+            pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
+            loss = _supervision_loss(
+                torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
+                pred_rgb, pred_alpha, pred_depth, normals, nfd, distort, mask,
+                normals_active=True, dist_active=(params.dist_lambda > 0.0),
+            )
+            loss.backward()
+            for opt in optimizers.values():
+                opt.step()
+                opt.zero_grad(set_to_none=True)
+            if progress is not None and (step % max(params.log_every, 1) == 0 or step == int(steps) - 1):
+                progress(
+                    params.iterations, params.iterations,
+                    f"compact/heal {step + 1}/{int(steps)} loss={float(loss):.4f} "
+                    f"n={int(splats['means'].shape[0])}",
+                )
+    finally:
+        stop_ev.set()
 
 
 def _train_one(  # noqa: ANN001
@@ -2033,32 +2178,121 @@ def _train_one(  # noqa: ANN001
     # Release the prefetch worker (tiled runs create one stream per tile).
     stop_ev.set()
 
-    # Compaction (module docstring §COMPACTION): ONE measured deletion — total
-    # rendered blend weight per Gaussian over ALL of this run's views, then drop
-    # what falls below `compact_eps` (unrenderable by construction; survivors
-    # untouched). Per tile this uses the tile's own assigned views — the same
-    # supervision granularity training itself had. Gradient-blind pure-black
-    # Gaussians are force-kept.
+    # Compaction (module docstring §COMPACTION): measure each Gaussian's total
+    # rendered contribution over this run's views, apply the unconditional culls
+    # (lossless-invisible + off-surface floaters), then the quality-gated budget
+    # cut, and heal the survivors. Per tile this uses the tile's own views + init
+    # surfels — the supervision granularity training itself had.
     n_compacted = 0
+    compact_search = None
     if params.compact:
-        with torch.no_grad():
-            n_before = int(splats["means"].shape[0])
+        n_before = int(splats["means"].shape[0])
         weights = _contribution_weights(
             torch, rasterization_2dgs, splats, views, K, width, height, params, progress,
         )
+
+        # Unconditional culls first — junk removal, not gated by the dB budget
+        # (floaters INFLATE training-view PSNR by overfitting it, so a gate would
+        # wrongly defend them; the swamp's cull improved true depth accuracy).
         with torch.no_grad():
-            keep = (weights > params.compact_eps) | _blind_mask(torch, splats["sh0"])
-            n_compacted = int((~keep).sum())
-            if n_compacted:
-                for name in list(splats.keys()):
-                    splats[name] = torch.nn.Parameter(splats[name][keep], requires_grad=False)
+            keep = _select_keep(
+                torch, weights, splats["sh0"], splats["opacities"], splats["means"],
+                init["means"], params.compact_eps, params.surface_max_dist, None,
+            )
+            for name in list(splats.keys()):
+                splats[name] = torch.nn.Parameter(splats[name][keep].detach(), requires_grad=True)
+            weights = weights[keep]
+        n0 = int(splats["means"].shape[0])
         if progress is not None:
             progress(
                 params.iterations, params.iterations,
-                f"compact: -{n_compacted} of {n_before} splats invisible from the "
-                f"reference views (total weight <= {params.compact_eps:.5f}) "
-                f"-> {int(splats['means'].shape[0])}",
+                f"compact: -{n_before - n0} unrenderable (<{params.compact_eps:.4f}) or "
+                f">{params.surface_max_dist}m off-surface -> {n0}",
             )
+
+        # Budget cut. Adaptive (default): bisect the keep fraction, accepting the
+        # deepest cut whose probe (prune -> short heal -> eval) stays within
+        # `compact_max_db_drop` of the post-cull baseline. Fixed fallback:
+        # `compact_keep_frac`. Ranking is opacity-normalized inside _select_keep.
+        chosen = None
+        if params.compact_max_db_drop is not None and n0 > 0:
+            ev0 = _evaluate(
+                torch, rasterization_2dgs, {k: v.detach() for k, v in splats.items()},
+                views, K, width, height, params, device,
+            )
+            psnr0 = float(ev0["psnr"])
+            lo, hi = 0.10, 1.0
+            best = None
+            for pi in range(max(params.compact_probes, 1)):
+                mid = (lo + hi) / 2.0
+                with torch.no_grad():
+                    kmask = _select_keep(
+                        torch, weights, splats["sh0"], splats["opacities"], splats["means"],
+                        None, params.compact_eps, 0.0, max(1, round(mid * n0)),
+                    )
+                    probe = {
+                        k: torch.nn.Parameter(v.detach()[kmask].clone()) for k, v in splats.items()
+                    }
+                if params.compact_probe_heal_steps > 0:
+                    _heal(
+                        torch, F, rasterization_2dgs, probe, views, K, width, height, params,
+                        scene_scale, params.compact_probe_heal_steps,
+                        box_lo, box_hi, px_grid, py_grid, None,
+                    )
+                ev = _evaluate(
+                    torch, rasterization_2dgs, {k: v.detach() for k, v in probe.items()},
+                    views, K, width, height, params, device,
+                )
+                drop = psnr0 - float(ev["psnr"])
+                ok = drop <= params.compact_max_db_drop
+                if progress is not None:
+                    progress(
+                        params.iterations, params.iterations,
+                        f"compact/search {pi + 1}/{params.compact_probes}: keep {mid:.2f} "
+                        f"-> {ev['psnr']:.2f} dB (drop {drop:+.2f}) {'ok' if ok else 'too lossy'}",
+                    )
+                if ok:
+                    best, hi = (mid, kmask), mid
+                else:
+                    lo = mid
+                del probe
+                torch.cuda.empty_cache()
+            if best is not None and best[0] < 1.0:
+                chosen = best[1]
+                compact_search = {
+                    "psnr_clean": round(psnr0, 3),
+                    "keep_frac": round(best[0], 3),
+                    "max_db_drop": params.compact_max_db_drop,
+                    "probes": params.compact_probes,
+                }
+        elif params.compact_keep_frac is not None and n0 > 0:
+            with torch.no_grad():
+                chosen = _select_keep(
+                    torch, weights, splats["sh0"], splats["opacities"], splats["means"],
+                    None, params.compact_eps, 0.0, max(1, round(params.compact_keep_frac * n0)),
+                )
+
+        if chosen is not None:
+            with torch.no_grad():
+                for name in list(splats.keys()):
+                    splats[name] = torch.nn.Parameter(splats[name][chosen].detach(), requires_grad=True)
+            if progress is not None:
+                progress(
+                    params.iterations, params.iterations,
+                    f"compact/budget: -{n0 - int(splats['means'].shape[0])} low-contribution "
+                    f"-> {int(splats['means'].shape[0])}",
+                )
+
+        n_compacted = n_before - int(splats["means"].shape[0])
+        if params.compact_heal_steps > 0 and n_compacted > 0:
+            _heal(
+                torch, F, rasterization_2dgs, splats, views, K, width, height, params,
+                scene_scale, params.compact_heal_steps, box_lo, box_hi, px_grid, py_grid, progress,
+            )
+            # Heal moved scales; re-assert the anti-alias floor so no survivor
+            # dropped below one pixel from its nearest camera.
+            if params.antialias and cam_tree is not None:
+                _aa_scale_floor(torch, splats, cam_tree, focal, params.aa_min_scale_px)
 
     # One-shot cleanup prune before returning: densification stopped at
     # refine_stop, so low-opacity floaters that drifted below prune_opa in the
@@ -2084,6 +2318,7 @@ def _train_one(  # noqa: ANN001
         "seeded": n_seeded,
         "pruned": n_pruned,
         "compacted": n_compacted,
+        "compact_search": compact_search,
         "views": n_views,
         "train_s": round(time.perf_counter() - t_start, 1),
     }
@@ -2218,14 +2453,33 @@ def _main() -> None:
     )
     ap.add_argument(
         "--compact", action=argparse.BooleanOptionalAction, default=TrainParams.compact,
-        help="post-training compaction: delete Gaussians whose measured rendered "
-             "contribution across all reference views is below --compact-eps "
-             "(imperceptible by construction; survivors untouched)",
+        help="post-training compaction: delete unrenderable + off-surface "
+             "Gaussians (+ optional budget frac), then heal the survivors",
     )
     ap.add_argument(
         "--compact-eps", type=float, default=TrainParams.compact_eps,
-        help="total blend-weight threshold for deletion (default 0.5/255: cannot "
-             "move any single rendered pixel by half an 8-bit step)",
+        help="lossless deletion threshold (default 0.5/255: below it a Gaussian "
+             "cannot move any pixel by half an 8-bit step)",
+    )
+    ap.add_argument(
+        "--surface-max-dist", type=float, default=TrainParams.surface_max_dist,
+        help="delete Gaussians farther than this (m) from any Stage-3 surfel "
+             "(floater cull; 0 disables)",
+    )
+    ap.add_argument(
+        "--compact-max-db-drop", type=float, default=TrainParams.compact_max_db_drop,
+        help="quality-gated budget cut: accept the deepest cut whose measured "
+             "PSNR drop stays within this many dB (bisection; <=0 disables the "
+             "search and falls back to --compact-keep-frac)",
+    )
+    ap.add_argument(
+        "--compact-keep-frac", type=float, default=TrainParams.compact_keep_frac,
+        help="fixed fallback: keep only the top this-fraction by normalized "
+             "contribution (used when the dB gate is disabled)",
+    )
+    ap.add_argument(
+        "--compact-heal-steps", type=int, default=TrainParams.compact_heal_steps,
+        help="fine-tune steps after deletion so survivors fill in (0 disables)",
     )
     ap.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
@@ -2261,6 +2515,12 @@ def _main() -> None:
             lod_levels=args.lod_levels,
             compact=args.compact,
             compact_eps=args.compact_eps,
+            surface_max_dist=args.surface_max_dist,
+            compact_max_db_drop=(
+                args.compact_max_db_drop if args.compact_max_db_drop and args.compact_max_db_drop > 0 else None
+            ),
+            compact_keep_frac=args.compact_keep_frac,
+            compact_heal_steps=args.compact_heal_steps,
         ),
         resume=args.resume,
         progress=_log,

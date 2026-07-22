@@ -271,6 +271,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
         _read_transforms,
         _render_batch,
         _render_inputs,
+        _select_keep,
         _supervision_loss,
         _view_stream,
     )
@@ -280,6 +281,12 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     heal_steps = int(spec["heal_steps"])
     diff_views = int(spec["diff_views"])
     means_lr_frac = float(spec.get("means_lr_frac", 0.1))
+    # Optional SURFACE PRIOR (metres; 0 disables): the Stage-3 init cloud lies
+    # exactly ON the source meshes, so any trained Gaussian farther than this
+    # from every init surfel is airborne junk — the camouflaged opaque floaters
+    # under-supervised outdoor runs grow — and is force-removed before ranking.
+    # A pipeline-unique fix: photogrammetry has no exact surface to snap to.
+    surface_max_dist = float(spec.get("surface_max_dist", 0.0))
 
     modal_app.volume.reload()
     cell = Path(modal_app.VOL) / "cells" / run / slot / model / "splat"
@@ -299,24 +306,42 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     def log(done: int, total: int, msg: str) -> None:
         print(f"[slim {run}/{slot}/{model}] {done}/{total} {msg}", flush=True)
 
-    # --- 1. measure + 2. rank-prune -------------------------------------------
+    # Surface reference = the Stage-3 surfels (inputs/cloud.ply), NOT trained.ply.
+    surf_means = None
+    if surface_max_dist > 0:
+        inputs = cell.parent / "inputs"
+        if (inputs / "cloud.ply").is_file():
+            surf_cloud = inputs / "cloud.ply"
+        elif (inputs / "cloud.ply.zst").is_file():
+            surf_cloud = Path("/tmp") / f"{run}-{slot}-{model}-cloud.ply"
+            if not surf_cloud.is_file():
+                modal_app._zstd_decompress(inputs / "cloud.ply.zst", surf_cloud)
+        else:
+            raise FileNotFoundError(f"surface prior needs cloud.ply[.zst] under {inputs}")
+        surf_means = _load_cloud(surf_cloud)["means"]
+
+    # --- 1. measure + 2. select (shared with the Stage-6 pipeline) ------------
     t0 = time.perf_counter()
     weights = _contribution_weights(
         torch, rasterization_2dgs, original, views, K, width, height, params, log
     )
-    blind = _blind_mask(torch, original["sh0"])
-    n_blind = int(blind.sum())
-    keep = blind.clone()
-    n_rank = max(keep_target - n_blind, 0)
-    if n_rank > 0:
-        w_rank = weights.clone()
-        w_rank[blind] = -1.0  # blind ones already kept; exclude from ranking
-        top = torch.topk(w_rank, k=min(n_rank, n - n_blind)).indices
-        keep[top] = True
+    keep = _select_keep(
+        torch, weights, original["sh0"], original["opacities"], original["means"],
+        surf_means, params.compact_eps, surface_max_dist, keep_target,
+    )
+    n_offsurf = 0
+    if surf_means is not None:
+        from scipy.spatial import cKDTree
+
+        d_surf, _ = cKDTree(np.asarray(surf_means)).query(
+            original["means"].detach().cpu().numpy(), k=1, workers=-1
+        )
+        n_offsurf = int((d_surf > surface_max_dist).sum())
+    n_blind = int((_blind_mask(torch, original["sh0"]) & keep).sum())
     removed = int(n - int(keep.sum()))
     measure_s = time.perf_counter() - t0
-    log(1, 1, f"pruned {removed:,} of {n:,} by measured contribution "
-              f"(kept {int(keep.sum()):,} = top-{keep_target:,} incl. {n_blind:,} blind)")
+    log(1, 1, f"pruned {removed:,} of {n:,} ({n_offsurf:,} off-surface + "
+              f"{removed - n_offsurf:,} low-contribution/budget; kept {int(keep.sum()):,})")
 
     # Survivors become trainable parameters for the heal.
     splats = torch.nn.ParameterDict(
@@ -395,10 +420,12 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
         "keep_target": keep_target,
         "heal_steps": heal_steps,
         "means_lr_frac": means_lr_frac,
+        "surface_max_dist": surface_max_dist,
         "views": len(views),
         "splats_in": n,
         "splats_kept": int(keep.sum()),
         "splats_removed": removed,
+        "splats_removed_offsurface": n_offsurf,
         "removed_pct": round(100.0 * removed / max(n, 1), 2),
         "blind_force_kept": n_blind,
         "bytes_in": trained.stat().st_size,
@@ -461,34 +488,47 @@ def smoke_train(spec: dict[str, Any]) -> dict[str, Any]:
     def log(done: int, total: int, msg: str) -> None:
         print(f"[smoke {run}/{slot}/{model}] {done}/{total} {msg}", flush=True)
 
+    # Small run, densification ON. `compact` from the spec exercises the new
+    # post-training cleanup (surface cull + contribution prune + heal) end-to-end;
+    # LODs/checkpoints off for speed. Nothing is written to the Volume.
+    compact = bool(spec.get("compact", False))
+    train_overrides = spec.get("train") or {}
     summary = train_splat(
         run=run, slot=slot, model=model,
         cloud_path=cloud, refs_dir=refs, out_path=scratch_out,
-        # Small run, densification ON (the crashing path), compaction + LODs off
-        # to keep it quick. Nothing is written to the Volume.
-        params=TrainParams(iterations=iterations, compact=False, lod_levels=0, ckpt_every=0),
+        params=TrainParams(
+            iterations=iterations, compact=compact, lod_levels=0, ckpt_every=0,
+            **train_overrides,
+        ),
         resume=False,
         progress=log,
     )
     return {
         "ok": True,
         "cell": f"{run}/{slot}/{model}",
+        "compact": compact,
         "splats_init": summary["splats_init"],
         "splats_final": summary["splats_final"],
+        "splats_compacted": summary.get("splats_compacted"),
         "iterations_steps": summary["iterations"],
         "metrics": summary.get("metrics"),
     }
 
 
 @app.local_entrypoint()
-def slim(cell: str, keep: int = 350_000, heal_steps: int = 1000, diff_views: int = 128) -> None:
+def slim(
+    cell: str, keep: int = 350_000, heal_steps: int = 1000, diff_views: int = 128,
+    surface_max_dist: float = 0.0,
+) -> None:
     """Run the contribution-prune + heal experiment on a cell and pull the
-    artifacts back beside the local trained.ply."""
+    artifacts back beside the local trained.ply. `--surface-max-dist D` also
+    force-removes Gaussians > D metres off every mesh surface (floater killer)."""
     cell_dir = Path(cell).resolve()
     run, slot, model = cell_dir.parts[-3], cell_dir.parts[-2], cell_dir.parts[-1]
     summary = slim_cell.remote(
         {"run": run, "slot": slot, "model": model, "keep": keep,
-         "heal_steps": heal_steps, "diff_views": diff_views}
+         "heal_steps": heal_steps, "diff_views": diff_views,
+         "surface_max_dist": surface_max_dist}
     )
     print(json.dumps(summary, indent=1))
 
@@ -507,13 +547,16 @@ def slim(cell: str, keep: int = 350_000, heal_steps: int = 1000, diff_views: int
 
 
 @app.local_entrypoint()
-def smoke(cell: str, iterations: int = 1500) -> None:
-    """Run the non-destructive densification smoke test on a cell."""
+def smoke(cell: str, iterations: int = 1500, compact: bool = False, keep_frac: float = 0.0) -> None:
+    """Non-destructive densification smoke test. `--compact` also exercises the
+    new post-training cleanup (surface cull + heal); `--keep-frac F` adds the
+    budget prune, so `--compact --keep-frac 0.35` runs the full path end-to-end."""
     cell_dir = Path(cell).resolve()
     run, slot, model = cell_dir.parts[-3], cell_dir.parts[-2], cell_dir.parts[-1]
-    summary = smoke_train.remote(
-        {"run": run, "slot": slot, "model": model, "iterations": iterations}
-    )
+    spec: dict[str, Any] = {"run": run, "slot": slot, "model": model, "iterations": iterations, "compact": compact}
+    if keep_frac > 0:
+        spec["train"] = {"compact_keep_frac": keep_frac}
+    summary = smoke_train.remote(spec)
     print(json.dumps(summary, indent=1))
 
 
