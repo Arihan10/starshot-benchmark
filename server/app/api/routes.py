@@ -83,6 +83,15 @@ from splat import stage4 as splat_stage4  # noqa: E402
 from splat import stage5 as splat_stage5  # noqa: E402  (torch-free contract module)
 from splat import stage6 as splat_stage6  # noqa: E402  (torch/gsplat lazy inside)
 
+# Client for the Modal GPU pipeline (stages 4-6 on an A100; see splat/modal_app.py).
+# Guarded: the Modal SDK is a server dep, but a host without it (or without Modal
+# credentials) should still boot — the /splat/modal endpoints then report a clear
+# 'unavailable' instead of 500ing at import.
+try:
+    from splat import modal_sync as splat_modal  # noqa: E402
+except Exception:  # noqa: BLE001 - any import failure disables the remote path
+    splat_modal = None  # type: ignore[assignment]
+
 # Offline per-cell lite-tier builder (the LITE presentation tier the viewer
 # streams) — driven by the build-lite endpoint (background subprocess, progress
 # polled). The splat stages neither build nor convert anything: the selected
@@ -241,6 +250,21 @@ _splat_stage5_state: dict[tuple[str, str, str], dict[str, Any]] = {}
 # and never blocks the event loop. Value: {popen, logf, iterations, started_at,
 # returncode}. The record is kept after exit so 'done'/'error' + log survive polls.
 _splat_stage6_procs: dict[tuple[str, str, str], dict[str, Any]] = {}
+
+# --- Modal remote train jobs (stages 4-6 on the A100) ------------------------
+# One asyncio SUPERVISOR task per cell mirrors the stage-job pattern: it pushes
+# the cell's stage-1-3 inputs to the Modal Volume (content-deduped), spawns
+# `run_cell(stages=[4,5,6])`, streams that container's heartbeat, and pulls
+# `trained.ply` (+ cameras.json / patches) back — so the EXISTING Stage-6 status
+# and the viewer's "trained" toggle light up with no extra wiring. Stage 7
+# (quantize / LODs) is intentionally not requested yet. Value:
+# {status, running, phase, heartbeat, call_id, error, started_at, ...}.
+_splat_modal_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_splat_modal_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+# The remote stage window the button drives (7 deferred by decision).
+_MODAL_STAGES = [4, 5, 6]
+_MODAL_POLL_S = 4.0
+
 _current_run: str = ""
 
 
@@ -2302,6 +2326,185 @@ def _spawn_stage6(
     return _splat_stage6_status(run, slot, model)
 
 
+class ModalTrainRequest(BaseModel):
+    """Remote-train knobs — ALL optional and ALL owned by the CLIENT. The server
+    forwards whatever is set straight through to the Stage-6 trainer and injects
+    no training-length policy of its own (defaults live in the client UI; the
+    library's TrainParams only carries mechanism fallbacks). `epochs` sets the
+    training length as passes over the view set (iterations = epochs × n_views);
+    `iterations` is the raw view-draw budget fallback; `batch` is the GPU-fill
+    speed knob. `restart` forces a from-scratch remote run (drop the checkpoint +
+    trained.ply for this cell) instead of resuming."""
+
+    epochs: float | None = None
+    iterations: int | None = None
+    batch: int | None = None
+    restart: bool = False
+
+    def train_overrides(self) -> dict[str, Any]:
+        """The set TrainParams overrides (drops unset fields so the server injects
+        no defaults — the trainer's own fallbacks apply to anything omitted)."""
+        fields = ("epochs", "iterations", "batch")
+        return {k: v for k in fields if (v := getattr(self, k)) is not None}
+
+
+def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
+    """Public state of a cell's Modal train job (stages 4-6 on the A100). Reports
+    the supervisor's live phase (push / spawn / run / pull) and the container's
+    last heartbeat (stage + step/total + message — during training the message is
+    the live `loss=… | X it/s` line), or a disk-only view when no job is tracked
+    ('done' when trained.ply is already local, else 'idle')."""
+    trained = _trained_path(run, slot, model)
+    url = _artifact_url(trained)
+    cams_local = _cameras_path(run, slot, model).is_file()
+    # Mid-run debug sample PNGs pulled from the Volume (refs/samples/*.png).
+    sample_dir = _slot_dir(run, slot, model) / "splat" / "refs" / "samples"
+    sample_urls = (
+        [u for p in sorted(sample_dir.glob("*.png")) if (u := _artifact_url(p))]
+        if sample_dir.is_dir() else []
+    )
+    job = _splat_modal_jobs.get((run, slot, model))
+    base = {
+        "run": run, "slot": slot, "model": model,
+        "trained_url": url, "sample_urls": sample_urls,
+    }
+    if job is None:
+        return {
+            **base, "status": "done" if url else "idle", "phase": None,
+            "stage": None, "done": 0, "total": 0, "msg": None, "error": None,
+            "plan_pulled": cams_local, "refs_ready": False,
+        }
+    hb = job.get("heartbeat") or {}
+    return {
+        **base,
+        "status": job.get("status", "running"),
+        "phase": job.get("phase"),
+        "stage": hb.get("stage"),
+        "done": int(hb.get("done", 0) or 0),
+        "total": int(hb.get("total", 0) or 0),
+        "msg": hb.get("msg") or job.get("msg"),
+        "call_id": job.get("call_id"),
+        "error": job.get("error"),
+        "started_at": job.get("started_at"),
+        # Progressive-availability flags: the camera plan is local (overlays +
+        # coverage viewable) / the references have been rendered on the Volume.
+        "plan_pulled": bool(job.get("plan_pulled")) or cams_local,
+        "refs_ready": bool(job.get("refs_ready")),
+    }
+
+
+async def _run_splat_modal_cell(
+    run: str, slot: str, model: str, opts: dict[str, Any]
+) -> None:
+    """Supervise ONE cell's remote train: push stage-1-3 inputs → spawn
+    `run_cell(4,5,6)` → stream heartbeat → pull `trained.ply`. Every Modal SDK
+    call (blocking network I/O) runs in a worker thread so the event loop stays
+    free; the artifacts land in the cell's local `splat/` dir exactly where the
+    Stage-6 status + viewer read them."""
+    key = (run, slot, model)
+    job = _splat_modal_jobs[key]
+    try:
+        if splat_modal is None:
+            raise RuntimeError(
+                "the Modal SDK isn't available on this server host — "
+                "install it and configure Modal credentials"
+            )
+        cell_dir = _slot_dir(run, slot, model)
+        # Gate: the remote pipeline consumes the local stage-2/3 outputs.
+        needed = {
+            "free-space grid (Stage 2)": _freespace_path(run, slot, model),
+            "skin sidecar (Stage 2)": cell_dir / "splat" / "freespace.npz.skin.npy",
+            "surfel cloud (Stage 3)": _cloud_path(run, slot, model),
+        }
+        missing = [name for name, p in needed.items() if not p.is_file()]
+        if missing:
+            raise RuntimeError(
+                f"run stages 2-3 locally first — missing: {', '.join(missing)}"
+            )
+        tier_dir = await _ensure_splat_tier(run, slot, model, job)
+
+        job["phase"] = "push"
+        job["msg"] = "uploading inputs (deduped)…"
+        pushed = await asyncio.to_thread(
+            splat_modal.push_cell, cell_dir, tier_dir, True
+        )
+
+        job["phase"] = "spawn"
+        job["msg"] = "spawning the A100 job…"
+        # Forward the client's train overrides VERBATIM — the server adds nothing.
+        train: dict[str, Any] = dict(opts.get("train") or {})
+        call_id = await asyncio.to_thread(
+            splat_modal.spawn_cell, cell_dir, pushed, _MODAL_STAGES,
+            None, train, None, bool(opts.get("restart")),
+        )
+        job["call_id"] = call_id
+        job["phase"] = "run"
+        job["msg"] = "planning cameras…"
+
+        # Stream the container heartbeat until the call resolves, PROGRESSIVELY
+        # pulling artifacts as each remote stage commits them to the Volume — so
+        # the camera-position + patch overlays and the coverage panel become
+        # viewable over the surfel cloud the moment stage 4 finishes, WHILE
+        # stages 5/6 keep running on the A100. run_cell commits at every stage
+        # boundary, and the heartbeat `stage` marks which stage is now live
+        # (plan → refs → train → done), so `stage` past "plan" means the camera
+        # plan is on the Volume.
+        while True:
+            if key not in _splat_modal_jobs:
+                return  # cell closed / job cleared — stop supervising
+            st = await asyncio.to_thread(splat_modal.job_status, cell_dir)
+            job["heartbeat"] = st.get("heartbeat")
+            hb_stage = (st.get("heartbeat") or {}).get("stage")
+            # Stage 4 done → pull JUST the small camera-plan artifacts
+            # (cameras.json / patches.bin / patch_views.json — `include_ply=False`,
+            # so no plys and never the multi-GB refs). Guarded so it fires once;
+            # the final pull is the backstop if the heartbeat was missed.
+            if not job.get("plan_pulled") and hb_stage in ("refs", "train", "done"):
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(splat_modal.pull_cell, cell_dir, False, True)
+                    if _cameras_path(run, slot, model).is_file():
+                        job["plan_pulled"] = True
+                        job["msg"] = "cameras ready — training; camera positions viewable"
+            # Stage 5 done → the references exist on the Volume (kept there — too
+            # large to pull; the patch-image inspector would read them via an
+            # on-demand frame proxy, not a bulk download).
+            if hb_stage in ("train", "done"):
+                job["refs_ready"] = True
+            # Pull the mid-run debug sample PNGs while stage 5 renders (a handful
+            # of small files; cheap + idempotent) so the picture-taking is
+            # inspectable live. Stop once we have the full set or stage 5 is past.
+            if hb_stage in ("refs", "train", "done") and not job.get("samples_done"):
+                with contextlib.suppress(Exception):
+                    names = await asyncio.to_thread(splat_modal.pull_samples, cell_dir)
+                    job["samples"] = names
+                    if len(names) >= 8 or hb_stage in ("train", "done"):
+                        job["samples_done"] = True
+            state = st.get("state")
+            if state == "done":
+                job["result"] = st.get("result")
+                break
+            if state == "failed":
+                raise RuntimeError(st.get("error") or "the Modal job failed")
+            await asyncio.sleep(_MODAL_POLL_S)
+
+        job["phase"] = "pull"
+        job["msg"] = "downloading trained.ply…"
+        pulled = await asyncio.to_thread(splat_modal.pull_cell, cell_dir, True, True)
+        job["pulled"] = pulled
+        if not _trained_path(run, slot, model).is_file():
+            raise RuntimeError("the job finished but trained.ply did not arrive")
+        job["status"] = "done"
+        job["phase"] = "done"
+        job["msg"] = "trained.ply ready"
+    except Exception as exc:  # noqa: BLE001 - surface to the status poller
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _splat_modal_tasks.pop(key, None)
+
+
 def _sample_cell_blocking(
     run: str,
     slot: str,
@@ -3382,6 +3585,11 @@ def create_app() -> FastAPI:
             cell["stage4"] = _splat_stage4_status(run, slot, model)
             cell["stage5"] = _splat_stage5_status(run, slot, model)
             cell["stage6"] = _splat_stage6_status(run, slot, model)
+            # The Modal remote-train job (stages 4-6 on the A100). Carried on the
+            # same poll the viewer already runs, so its live phase/heartbeat and
+            # completion (trained.ply pulled → stage6.url set) flow with no extra
+            # client polling.
+            cell["modal"] = _splat_modal_status(run, slot, model)
             cells.append(cell)
         return {"run": run, "cells": cells}
 
@@ -3902,6 +4110,48 @@ def create_app() -> FastAPI:
         """Live Stage-6 state ('idle' / 'running' with `pid` + `log_tail` / 'done'
         with the trained `.ply` `url` / 'error'). See `_splat_stage6_status`."""
         return _splat_stage6_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/modal/{slot}/{model}")
+    async def splat_modal_start(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, body: ModalTrainRequest | None = None
+    ) -> dict[str, object]:
+        """Train ONE cell on the Modal A100: stages 4 (cameras) → 5 (references)
+        → 6 (fine-tune) run remotely, and `trained.ply` is pulled back so the
+        viewer's 'trained' toggle lights up. Needs the local Stage 2 + Stage 3
+        outputs (freespace + cloud). Idempotent while running (returns the live
+        job); a fresh POST after completion re-runs only what changed remotely,
+        and `restart: true` forces a from-scratch remote train. The whole thing
+        is async: it never blocks the server. Poll the GET (or the cells list's
+        per-cell `modal` field) for the live phase + training step."""
+        if splat_modal is None:
+            raise HTTPException(
+                status_code=503,
+                detail="the Modal SDK isn't available on this server host",
+            )
+        key = (run, slot, model)
+        existing = _splat_modal_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return _splat_modal_status(run, slot, model)  # already running
+        opts = {
+            "train": body.train_overrides() if body is not None else {},
+            "restart": bool(body.restart) if body is not None else False,
+        }
+        _splat_modal_jobs[key] = {
+            "status": "running", "running": True, "phase": "start",
+            "heartbeat": None, "error": None, "msg": "starting…",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        _splat_modal_tasks[key] = asyncio.create_task(
+            _run_splat_modal_cell(run, slot, model, opts)
+        )
+        return _splat_modal_status(run, slot, model)
+
+    @app.get("/runs/{run}/splat/modal/{slot}/{model}")
+    async def splat_modal_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Live Modal remote-train state: 'idle' / 'running' (with `phase` +
+        `stage`/`done`/`total`/`msg` heartbeat) / 'done' (trained.ply local, its
+        `trained_url` set) / 'error'. See `_splat_modal_status`."""
+        return _splat_modal_status(run, slot, model)
 
     @app.get("/trellis/queue")
     async def trellis_queue() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

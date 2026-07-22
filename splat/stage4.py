@@ -73,10 +73,12 @@ Pipeline:
   4. COVERAGE (demand-major): each patch asks directly for its few suppliers —
      a bounded set of aim points (an aperture SHELL around the patch normal for
      direction cells + the finest octave, plus head-on points per owed coarse
-     octave) each snapped to the nearest candidate and verified by the fine-grid
-     ray-march — instead of enumerating every candidate in range. Work and memory
-     scale with DEMANDS (patches × cells), not free volume × surface. Each
-     surviving pair carries its direction cell + supplied octave.
+     octave) snapped to the nearest candidate, PLUS its physically-closest
+     candidates taken directly (the near probes — what reaches cameras inside a
+     cavity the aim shells overshoot), each verified by the fine-grid ray-march —
+     instead of enumerating every candidate in range. Work and memory scale with
+     DEMANDS (patches × cells), not free volume × surface. Each surviving pair
+     carries its direction cell + supplied octave.
   5. GREEDY multicover over IMAGES — (candidate, face) units, the true cost unit
      of Stages 5/6 — until every visible patch hits every suppliable direction
      cell + every suppliable owed octave. Faces that add nothing are never
@@ -103,7 +105,7 @@ from typing import Any
 import numpy as np
 from scipy.spatial import cKDTree
 
-from splat.stage2 import FreeSpace, load_free_space
+from splat.stage2 import _CLEARANCE_EPS, FreeSpace, load_free_space
 
 logging.getLogger("trimesh").setLevel(logging.ERROR)
 
@@ -114,6 +116,14 @@ PATCH_VIEWS_NAME = "patch_views.json"
 # SH degree-0 basis constant (matches Stage 3): colour = 0.5 + C0 * f_dc.
 _SH_C0 = 0.28209479177387814
 
+# Nearest-candidate probes added per patch in the demand-major coverage build
+# (see `_build_coverage`): the k physically-closest reachable camera spots, always
+# tried alongside the ideal-distance aim points. The aim points sit at ~1.5·d_min,
+# so in any space smaller than that (a fridge, cabinet, drawer) they overshoot the
+# enclosure and snap to an outside spot the walls then occlude; the near probes are
+# what let a camera that already sits INSIDE a cavity actually be used — captured by
+# design, not left to the best-effort rescue.
+_NEAR_PROBES = 8
 # Rescue-pass budget (see `_rescue_pairs`): nearest candidates tried per unseen
 # patch, and the flat pair count per ray-march slice.
 _RESCUE_K = 32
@@ -149,16 +159,19 @@ class PlanParams:
     patch's d_min, so the greedy keeps cameras off open surfaces by itself, and
     near-wall picks emerge only where occlusion leaves no other supplier."""
 
-    # Patch FEATURE-SCALE band (the scale ladder's floor/ceiling). Detail is NOT
-    # re-detected here: the local surfel spacing — Stage 3's own feature-adaptive
-    # density, dense over BOTH geometry and texture — is mapped into [s_min, s_max]
-    # to drive each patch's ladder, and patches are a UNIFORM thinning of the
-    # surfels (rate (s_min/s_max)²) so their density RIDES the cloud's (denser
-    # surfels → more patches) instead of a separate curvature/texture model. s_min
-    # also sets the effective camera standoff: d_min = s_min·focal/finest_px is the
-    # closest any demand sits, so the greedy never places a camera nearer than that.
-    patch_min_spacing: float = 0.06   # s_min (m): finest patch feature scale
-    patch_max_spacing: float = 0.30   # s_max (m): coarsest patch feature scale
+    # Patch FEATURE-SCALE anchors. Detail is NOT re-detected here: each surfel's
+    # OWN DISC RADIUS — the footprint Stage 3 gave it (object-scale spacing) — is
+    # mapped into feature scale (the coarsest surfaces' P90 radius → s_max) to
+    # drive its ladder, so a big surfel is viewed from far with few octaves and a
+    # fine one up close. `s_min` is a hard FLOOR (the finest scale, and the
+    # closest any demand sits: d_min = s_min·focal/finest_px); `s_max` is only the
+    # P90 ANCHOR, not a ceiling — surfaces coarser than P90 ride ABOVE it uncapped,
+    # so a mountain's metre-scale surfels demand metre-scale (far, few) views
+    # rather than being squashed to s_max and demanding phantom closeups. Patches
+    # are a UNIFORM thinning of the surfels (rate (s_min/s_max)²), so camera effort
+    # tracks the actual splat the fine-tune optimizes.
+    patch_min_spacing: float = 0.06   # s_min (m): finest feature scale (hard floor)
+    patch_max_spacing: float = 0.30   # s_max (m): P90 feature-scale anchor (not a cap)
     # The angular-quality dial: the number of EQUAL-SOLID-ANGLE direction cells
     # tiling the (folded, two-sided) hemisphere around each patch normal — cell 0
     # is an explicit polar CAP (|cos θ| ≥ 1 − 1/B: the direct-facing field, 1/B of
@@ -184,14 +197,12 @@ class PlanParams:
     # visible as left-to-right sweeps — leaving one side of the scene denser
     # when cut). The summary's coverage `curve` reports what any budget buys.
     max_views: int | None = None
-    # Candidate positions are drawn from the reachable FREE cells (see
-    # `_candidates`) at ~`candidate_spacing` apart, so the candidate COUNT
-    # scales with the free volume, not a fixed budget. Stage 4 reads no per-cell
-    # clearance — the FREE mask already encodes the standoff floor.
-    # `max_candidates` is only a SAFETY ceiling (even-downsample + warn if a
-    # scene ever exceeds it), not the room-scale cap it used to be.
-    candidate_spacing: float = 0.5    # target spacing (m) between candidate positions
-    max_candidates: int = 200_000     # safety ceiling on candidate positions
+    # Candidate positions are the reachable FREE cells (see `_candidates`),
+    # CLEARANCE-STRATIFIED: `candidate_spacing` is the finest cell — kept at full
+    # baked density near surfaces — and the cell grows ∝ clearance out in open
+    # air, so the count is scene-size-stable per unit surface. There is no count
+    # ceiling: candidates are only a snap KD-tree for the demand-major build.
+    candidate_spacing: float = 0.5    # finest candidate cell (m), near surfaces
     # Cube-face reference-render intrinsics (SHARED with Stage 5). FOV fixed at
     # 90° (six faces tile 360°); the ladder's distance bands are DERIVED from the
     # render resolution + finest_px_per_patch so coverage scales match what
@@ -236,18 +247,18 @@ class PlanParams:
             "max_views": self.max_views,
             "min_gain": self.min_gain,
             "candidate_spacing": self.candidate_spacing,
-            "max_candidates": self.max_candidates,
             "face_fov_deg": self.face_fov_deg,
             "render_resolution": self.render_resolution,
         }
 
 
-def _read_cloud(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Read a Stage-3 surfel `.ply` → (positions, unit normals, rgb in [0,1]). Handles
-    both the 2DGS (16 float/vertex, two scales) and 3DGS (17, three scales) layouts:
-    the first nine properties (xyz, normal, f_dc_0..2) are identical in both and are
-    all Stage 4 needs — only the trailing scale count differs. Normals are already
-    oriented to free space by Stage 3."""
+def _read_cloud(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Read a Stage-3 surfel `.ply` → (positions, unit normals, rgb in [0,1], disc
+    radius). Handles both the 2DGS (16 float/vertex, two scales) and 3DGS (17, three
+    scales) layouts: xyz/normal/f_dc_0..2 and scale_0 are at identical offsets in
+    both. Radius = exp(scale_0) (the in-plane tangent σ); used to spot the giant
+    merged discs the virtual-patch pass re-tiles. Normals are already oriented to
+    free space by Stage 3."""
     raw = Path(path).read_bytes()
     marker = b"end_header\n"
     i = raw.find(marker)
@@ -274,49 +285,39 @@ def _read_cloud(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     ln[ln == 0] = 1.0
     nrm = nrm / ln
     col = np.clip(0.5 + _SH_C0 * arr[:, 6:9], 0.0, 1.0).astype(np.float32)
-    return pos, nrm, col
+    rad = np.exp(arr[:, 10].astype(np.float64))  # scale_0 stored as log σ
+    return pos, nrm, col, rad
 
 
-def _local_spacing(points: np.ndarray, k: int = 8) -> np.ndarray:
-    """Per-surfel LOCAL SAMPLE SPACING: the mean distance to its `k` nearest
-    surfels — i.e. the Stage-3 cloud's OWN density read back out. The sampler
-    already made that density feature-adaptive over BOTH geometry (crease /
-    boundary bands) and texture (albedo-complexity bands), so `dense == detailed`.
-    Stage 4 reads this instead of re-detecting curvature / albedo variance from
-    the cloud (the retired curvature_k / tex_k path), honouring Stage 3's contract
-    that the cloud's local density IS the detail field."""
-    n = len(points)
-    if n < 2:
-        return np.full(n, 1.0, dtype=np.float64)
-    kk = min(k + 1, n)
-    d, _ = cKDTree(points).query(points, k=kk, workers=-1)
-    return d[:, 1:].mean(axis=1)
+def _candidates(fs: FreeSpace, p: PlanParams) -> tuple[np.ndarray, np.ndarray]:
+    """Candidate camera positions + their clearances, CLEARANCE-STRATIFIED: full
+    baked density near surfaces — where fine-detail band-0 targeting needs ~half-
+    metre precision — and thinned ∝ clearance out in open air, where a candidate
+    serves metre-to-tens-of-metre views and tolerates metres of positional error.
 
-
-def _candidates(fs: FreeSpace, p: PlanParams) -> np.ndarray:
-    """Candidate camera positions: reachable FREE cells sampled ~`candidate_spacing`
-    apart, so the count scales with the free volume rather than a fixed budget.
-    Standoff is fully baked into the FREE mask (Stage 2's one-voxel floor) and
-    otherwise EMERGENT — the ladder demands nothing below a patch's d_min, so
-    point-blank candidates only win where occlusion leaves no farther supplier,
-    and the ray-march fails closed on segments too short to verify. Stage 4
-    reads no per-cell clearance: `free_candidates` thins the raw FREE mask by
-    spacing alone. If a scene exceeds `max_candidates`, evenly downsample (and
-    warn) — never silently fall back to a room-scale cap. Returns (M,3) world
-    points."""
-    centers = fs.free_candidates(p.candidate_spacing)
-    if len(centers) == 0:
-        return np.zeros((0, 3), dtype=np.float32)
-    if p.max_candidates and len(centers) > p.max_candidates:
-        step = int(np.ceil(len(centers) / p.max_candidates))
-        logging.warning(
-            "stage4: %d free candidates at spacing %.2fm exceeds the "
-            "max_candidates ceiling %d; even-downsampling by %dx (raise "
-            "max_candidates or candidate_spacing to keep full density)",
-            len(centers), p.candidate_spacing, p.max_candidates, step,
-        )
-        centers = centers[::step]
-    return centers
+    This replaces the old flat `max_candidates` ceiling + raster stride, which
+    downsampled in x-major stripes — thinning exactly the near-surface cells fine
+    work depends on — and whose count grew with the whole free volume. Here the
+    positional tolerance is taken as ~half the viewing distance (≈ clearance) and
+    floored at `candidate_spacing`, snapped to a power-of-two multiple so the
+    per-clearance grids are NESTED (no incommensurate-lattice artifacts) and
+    candidates of different clearance never dedupe against each other; count is
+    then scene-size-stable per unit surface. Candidates are only a snap KD-tree
+    for the demand-major coverage build, so there is no ceiling on their number.
+    Returns (pos (M,3) float32, clear (M,) float32)."""
+    keep = fs.cand_clear >= (fs.clearance_m - _CLEARANCE_EPS)
+    pos = np.ascontiguousarray(fs.cand_pos[keep]).astype(np.float32)
+    clear = np.ascontiguousarray(fs.cand_clear[keep]).astype(np.float32)
+    if len(pos) == 0:
+        return pos, clear
+    base = max(float(p.candidate_spacing), 1e-3)
+    level = np.maximum(
+        0, np.floor(np.log2(np.maximum(clear * 0.5, base) / base))
+    ).astype(np.int64)
+    cell = base * (2.0 ** level)
+    q = np.floor(pos / cell[:, None]).astype(np.int64)
+    _, idx = np.unique(np.column_stack([level, q]), axis=0, return_index=True)
+    return pos[idx], clear[idx]
 
 
 def _tangent_frames(normals: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -478,6 +479,7 @@ def _build_coverage(
     t2: np.ndarray,
     fs: FreeSpace,
     p: PlanParams,
+    reach: float,
     torch: Any,
     progress: ProgressCb | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -493,14 +495,29 @@ def _build_coverage(
     asks each patch directly for its few suppliers. Per patch we generate a
     BOUNDED set of aim points and snap each to the nearest real candidate cell:
 
-      * APERTURE aim points — a shell at ~1.5·d_min in `_hemisphere_dirs`
-        directions around the patch normal — supply its DIRECTION CELLS and
-        finest octave. Real standoff cameras spread over the free hemisphere, so
-        ring cells are supplied from an aperture wider than one band (the flaw a
-        single fine shell has: its grazing cameras collapse onto the surface).
-      * PYRAMID aim points — head-on (+ two tilts) at ~1.5·2^o·d_min for each
-        OWED octave o ≥ 1 — supply the coarse scale demands. Owed octaves are
-        rare (P(oct_top ≥ o) = 4^-o), so this is a few aim points per patch.
+      * APERTURE aim points — a shell at min(1.5·d_min, `reach`) in
+        `_hemisphere_dirs` directions around the patch normal — supply its
+        DIRECTION CELLS and finest octave. Real standoff cameras spread over the
+        free hemisphere, so ring cells are supplied from an aperture wider than
+        one band (the flaw a single fine shell has: its grazing cameras collapse
+        onto the surface). The `reach` clamp keeps a big-surface patch (whose
+        1.5·d_min is tens of metres) aimed at the achievable near standoff — the
+        candidate band is thin, so those cameras sit close and supply band 0 —
+        instead of at empty air no candidate occupies.
+      * PYRAMID aim points — head-on (+ two tilts) at 1.5·2^o·d_min for each
+        OWED octave o ≥ 1 whose ideal standoff is within `reach` — supply the
+        coarse scale demands. Owed octaves are rare (P(oct_top ≥ o) = 4^-o), and
+        those beyond `reach` are unsuppliable given the band (skipped, not chased
+        into far junk snaps; far appearance is the Stage-6 LOD ladder's job).
+      * NEAREST-CANDIDATE probes — each patch's `_NEAR_PROBES` physically-closest
+        candidates, taken directly (no aim/snap). Both shells above sit at ≥ ~0.7 m
+        (the ideal view distance), so in any enclosure smaller than that — a fridge,
+        cabinet, drawer — every aim overshoots the walls and snaps outside, and the
+        camera spots that already sit INSIDE the cavity are never chosen. The near
+        probes are those interior spots, so cavity contents are captured by design
+        rather than only by the best-effort rescue. On open surfaces the nearest
+        spot is point-blank (tiny footprint, low gain) and the greedy passes it over,
+        so this adds interior coverage without inflating open-scene camera counts.
 
     Each snapped (candidate, patch) pair is verified EXACTLY with the same
     formulas the demand model uses: two-sided incidence `d_eff = dist/|cos θ|`
@@ -513,8 +530,9 @@ def _build_coverage(
     surface.
 
     Runs on CUDA: only the occlusion RAY-MARCH touches the GPU (occupancy is the
-    single grid's sparse `occ_lin` searched with `torch.searchsorted`; see
-    `_occluded`); aim-point construction, snapping (a CPU KD-tree) and the exact
+    single grid's sparse opaque-cover set `occ_opaque` searched with
+    `torch.searchsorted`; see `_occluded`); aim-point construction, snapping (a
+    CPU KD-tree) and the exact
     per-pair binning are numpy. Pairs march in distance-sorted slices so short
     rays take few steps; `progress(done, total, "coverage")` streams the march."""
     dev = torch.device("cuda")
@@ -526,7 +544,11 @@ def _build_coverage(
     d1, d2 = int(fs.dims[1]), int(fs.dims[2])
     diag = _grid_diag(fs)
 
-    occ_lin = torch.as_tensor(fs.occ_lin, dtype=torch.int64, device=dev)
+    # Coverage plans THROUGH glass: the ray-march tests only the OPAQUE cover
+    # subset (glass-classed voxels pass light), so a surface seen only through a
+    # pane (e.g. a sealed display case's contents) is coverable, not occlusion-
+    # culled. Revisit when glass turns optically real (refraction/reflection).
+    occ_opaque = torch.as_tensor(fs.occ_lin_opaque, dtype=torch.int64, device=dev)
     origin = torch.as_tensor(fs.origin, dtype=torch.float32, device=dev)
     dims = torch.as_tensor(fs.dims, dtype=torch.int64, device=dev)
 
@@ -536,10 +558,11 @@ def _build_coverage(
         the segment is too short to verify at all (FAIL CLOSED, below).
 
         ONE grid: every in-bounds, in-range sample is looked up in the sparse
-        cover set `occ_lin` with `torch.searchsorted` (mirrors `FreeSpace._member`
-        on the single `pitch` lattice); a hit means an occupied voxel sits on the
-        open segment. `occ_lin` is ALL cover (glass included), matching the
-        physical-presence `occupied` query."""
+        cover set `occ_opaque` with `torch.searchsorted` (mirrors `FreeSpace.
+        occluding` on the single `pitch` lattice); a hit means a sight-blocking
+        voxel sits on the open segment. `occ_opaque` is the OPAQUE cover subset
+        (glass excluded), so line-of-sight — and thus coverage planning — passes
+        through glass, matching the `occluding` query."""
         pts = cam[:, None, :] + t_lin[None, :, None] * (pp_ - cam)[:, None, :]   # (P,K,3)
         fidx = torch.floor((pts - origin) / pf).to(torch.int64)                  # (P,K,3)
         inb = ((fidx >= 0) & (fidx < dims)).all(dim=2)                           # (P,K)
@@ -555,8 +578,8 @@ def _build_coverage(
         if nz[0].numel():
             fx = fidx[nz[0], nz[1]]                                             # (M,3)
             lin_m = (fx[:, 0] * d1 + fx[:, 1]) * d2 + fx[:, 2]                  # (M,)
-            posi = torch.searchsorted(occ_lin, lin_m.clamp(min=0)).clamp(max=occ_lin.numel() - 1)
-            res[nz[0][occ_lin[posi] == lin_m]] = True
+            posi = torch.searchsorted(occ_opaque, lin_m.clamp(min=0)).clamp(max=occ_opaque.numel() - 1)
+            res[nz[0][occ_opaque[posi] == lin_m]] = True
         return res
 
     def _visible(ci_arr: np.ndarray, gi_arr: np.ndarray) -> np.ndarray:
@@ -588,7 +611,7 @@ def _build_coverage(
         out[order] = vis_s
         return out
 
-    # --- BOUNDED aim points per patch, snapped to the nearest candidate -------
+    # --- BOUNDED supplier probes per patch: aim points (snapped) + near probes -
     # Row 0 of the dictionary is head-on; rotated into each patch's tangent frame
     # (local +z → normal, +x → t1, +y → t2) the set spreads over the free
     # hemisphere so it lands in every direction cell.
@@ -609,27 +632,49 @@ def _build_coverage(
     all_idx = np.arange(n_patch, dtype=np.int64)
     tgt_parts, par_parts = [], []
     if n_patch:
-        ap_tgt, ap_par = _aim(dl, all_idx, 1.5 * d_min)  # aperture: bins + octave 0
+        # Aperture: bins + finest octave, clamped to the achievable standoff.
+        ap_tgt, ap_par = _aim(dl, all_idx, np.minimum(1.5 * d_min, reach))
         tgt_parts.append(ap_tgt)
         par_parts.append(ap_par)
         coarse = dl[: min(3, n_dirs)]  # head-on + up to two tilts
         for o in range(1, n_oct):      # pyramid: one shell per owed octave ≥ 1
-            sel = np.nonzero(oct_top >= o)[0]
+            r_o = (1.5 * (2.0 ** o)) * d_min  # ideal standoff for octave o
+            sel = np.nonzero((oct_top >= o) & (r_o <= reach))[0]  # skip beyond reach
             if sel.size:
-                t_o, p_o = _aim(coarse, sel, (1.5 * (2.0 ** o)) * d_min[sel])
+                t_o, p_o = _aim(coarse, sel, r_o[sel])
                 tgt_parts.append(t_o)
                 par_parts.append(p_o)
 
-    if tgt_parts:
+    cand_tree = cKDTree(candidates) if n_cand else None
+    if tgt_parts and cand_tree is not None:
         tgt = np.concatenate(tgt_parts, axis=0).astype(np.float64)
         par = np.concatenate(par_parts, axis=0)
-        _, ci = cKDTree(candidates).query(tgt, k=1, workers=-1)
+        _, ci = cand_tree.query(tgt, k=1, workers=-1)
         ci = np.asarray(ci, dtype=np.int64)
         keep = ci < n_cand  # scipy pads a miss (empty tree) with n_cand
         ci, par = ci[keep], par[keep]
     else:
         ci = np.zeros(0, dtype=np.int64)
         par = np.zeros(0, dtype=np.int64)
+
+    # NEAREST-CANDIDATE PROBES: for EVERY patch, also consider its `_NEAR_PROBES`
+    # physically-closest candidates directly. The aim points above target the
+    # patch's ideal view distance (~1.5·d_min) and overshoot any enclosure smaller
+    # than that — a fridge, cabinet, drawer — snapping to an outside spot the walls
+    # occlude; the nearest candidates are the reachable viewpoints that DO see into
+    # a cavity (the interior camera spots that already exist). They merge with the
+    # aim-point pairs through the dedup below, are pruned by the same d_eff ≤ d_max
+    # and occlusion tests, and cost only short rays; on open surfaces they are
+    # point-blank, low-gain views the greedy passes over, so they add nothing there.
+    if n_patch and cand_tree is not None:
+        kq = int(min(_NEAR_PROBES, n_cand))
+        _, cknn = cand_tree.query(patch_pos, k=kq, workers=-1)
+        cknn = np.asarray(cknn, dtype=np.int64).reshape(n_patch, kq)
+        cnear = cknn.ravel()
+        pnear = np.repeat(np.arange(n_patch, dtype=np.int64), kq)
+        keep = cnear < n_cand
+        ci = np.concatenate([ci, cnear[keep]])
+        par = np.concatenate([par, pnear[keep]])
 
     # Exact per-pair geometry; drop unresolvable (d_eff > d_max) pairs.
     if len(ci):
@@ -864,29 +909,36 @@ def plan_cameras(
     if progress is not None:
         progress(0, 0, "load")
     fs = load_free_space(Path(freespace_path))
-    points, normals, _ = _read_cloud(Path(surfels_path))
+    points, normals, _, radius = _read_cloud(Path(surfels_path))
     lo = points.min(axis=0)
     hi = points.max(axis=0)
 
-    # Patches = the Stage-3 surfels UNIFORMLY thinned, so patch density inherits
-    # the cloud's own feature-adaptive density (geometry AND texture) — detail is
-    # ridden, not re-detected. patch_feat (each patch's ladder feature scale) is
-    # the local surfel spacing mapped into [s_min, s_max]: the coarse (flat) end
-    # anchors at s_max, finer surfels ride proportionally below it. The uniform
-    # keep rate (s_min/s_max)² matches the old flat-region thinning exactly, so
-    # flats are unchanged and detail simply rides on top.
+    # Patches = the Stage-3 surfels UNIFORMLY thinned. Each patch's ladder FEATURE
+    # SCALE is set by the surfel's OWN SIZE — its disc radius, i.e. the footprint
+    # Stage 3 gave it. A big surfel (a coarsely-sampled mountain face, a merged flat
+    # wall) IS low-detail by construction, so it's photographed from FARther with
+    # FEWER octaves; a small surfel (a fine prop) demands close, fine views. Reading
+    # size directly means camera effort tracks the actual splat the fine-tune will
+    # optimize — no separate detail signal, no density inference (which coarsening
+    # would fool). Radius maps into [s_min, s_max] with the coarsest surfaces' P90 →
+    # patch_max_spacing; the uniform keep rate (s_min/s_max)² sets patch count.
     if progress is not None:
         progress(0, 0, "patches")
-    surf_spacing = _local_spacing(points)
-    scale = params.patch_max_spacing / max(float(np.percentile(surf_spacing, 90)), 1e-6)
-    keep = np.nonzero(
-        rng.random(len(points))
-        < (params.patch_min_spacing / params.patch_max_spacing) ** 2
-    )[0]
+    keep_rate = (params.patch_min_spacing / params.patch_max_spacing) ** 2
+    scale = params.patch_max_spacing / max(float(np.percentile(radius, 90)), 1e-6)
+    keep = np.nonzero(rng.random(len(points)) < keep_rate)[0]
     patch_pos = points[keep].astype(np.float32)
     patch_nrm = normals[keep].astype(np.float32)
-    patch_feat = np.clip(
-        surf_spacing[keep] * scale, params.patch_min_spacing, params.patch_max_spacing
+    # Feature scale rides each surfel's own radius (p90 anchored to patch_max_spacing),
+    # floored at patch_min_spacing but UNCAPPED above: a metre-scale surfel on a
+    # 200 m mountain keeps its metre feature scale, so its d_min is tens of metres
+    # and it demands few coarse views — instead of the old hard [s_min, s_max] clip
+    # squashing every object into a 5× band and demanding 64-px closeups of geometry
+    # the source resolves at metres. Mirrors Stage 3's uncapped object-scale spacing;
+    # the ~constant texels-per-feature margin (feat ∝ surfel spacing ∝ texel size)
+    # holds fidelity at every scale.
+    patch_feat = np.maximum(
+        radius[keep] * scale, params.patch_min_spacing
     ).astype(np.float32)
     t1, t2 = _tangent_frames(patch_nrm)
     n_patch = len(patch_pos)
@@ -909,10 +961,18 @@ def plan_cameras(
         n_oct - 1,
     )
 
-    # Candidate camera positions from the reachable free cells (no re-voxelization).
-    candidates = _candidates(fs, params)
+    # Candidate camera positions (+ clearances) from the reachable free cells,
+    # clearance-stratified (no re-voxelization).
+    candidates, cand_clear = _candidates(fs, params)
     if len(candidates) == 0:
         raise RuntimeError("no candidate camera positions (reachable free space empty)")
+    # REACH: the farthest standoff a candidate can actually occupy — candidates
+    # hug surfaces within Stage 2's coverage band, so ~2× the deepest clearance
+    # bounds any cross-open-space view. Aim points beyond it target air no
+    # candidate lives in, so the coverage build clamps the aperture to it and
+    # skips owed octaves whose ideal standoff exceeds it (they are unsuppliable
+    # given the band; far appearance is the Stage-6 LOD ladder's job).
+    reach = max(2.0 * float(cand_clear.max()), 4.0 * float(params.candidate_spacing))
 
     # Coverage (per-pair direction cell + octave + owed) + greedy multicover over
     # IMAGES. Coverage is the long phase (a demand-major occlusion ray-march on
@@ -928,7 +988,7 @@ def plan_cameras(
         )
     cc, pp, binv, octave, owed = _build_coverage(
         candidates, patch_pos, patch_nrm, d_min, d_max, oct_top, t1, t2, fs,
-        params, torch, progress,
+        params, reach, torch, progress,
     )
 
     # IMAGE units (the greedy's selectable): unit = candidate·6 + cube face of

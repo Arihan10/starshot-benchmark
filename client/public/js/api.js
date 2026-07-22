@@ -222,6 +222,20 @@ export const api = {
 		request(
 			`/runs/${encodeURIComponent(run)}/splat/stage6/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
 		),
+	// Modal remote train (stages 4-6 on an A100): one call plans cameras, renders
+	// references, and fine-tunes on the GPU box, then pulls trained.ply back so
+	// the "trained" viewer toggle lights up. Needs local Stage 2 + Stage 3.
+	// `body` may carry `{ iterations, restart }`. Status returns the live phase +
+	// training heartbeat (also folded into `splatStageCells`' per-cell `modal`).
+	splatModalStart: (run, slot, model, body) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+			{ method: "POST", body },
+		),
+	splatModalStatus: (run, slot, model) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+		),
 	// Live snapshot of the process-global mesh queue — every in-flight + waiting
 	// generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
 	// pool. { pools: [{id,label,cap}], entries: [{slot_id,job_id,state,backend,pool,…}] }.

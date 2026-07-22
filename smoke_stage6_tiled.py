@@ -177,6 +177,7 @@ def main() -> None:
             depth_densify_every=200, depth_densify_max=1500,
             tile_max=6000, lod_levels=2, lod_min_count=1500,
             ckpt_every=0, eval_max_views=12, log_every=100,
+            batch=1,  # pin the reference (batch-1) schedule: this tests tiling
         ),
         resume=False, progress=log,
     )
@@ -209,6 +210,7 @@ def main() -> None:
             iterations=250, refine_start_iter=100, tile_max=0,
             lod_levels=1, lod_min_count=1500, ckpt_every=0,
             eval_max_views=8, log_every=100,
+            batch=1,  # pin the reference (batch-1) schedule: single-run control
         ),
         resume=False, progress=log,
     )

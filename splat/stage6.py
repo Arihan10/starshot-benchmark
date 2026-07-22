@@ -119,17 +119,38 @@ _SH_C0 = 0.28209479177387814
 # progress(done, total, message) — called periodically during training.
 ProgressCb = Callable[[int, int, str], None]
 
+# Floor on the resolved optimizer-step count (matches the tiled per-tile floor):
+# even a tiny epoch/budget still runs enough steps to seat the LR schedule.
+_MIN_STEPS = 200
+
 
 @dataclass(frozen=True)
 class TrainParams:
     """Stage-6 knobs. Learning rates follow the gsplat/3DGS defaults; the means LR
     is scaled by the scene extent at runtime and decayed exponentially.
 
-    `refine_stop_iter` defaults to None → resolved at runtime to 50% of
-    `iterations` (the gsplat standard), so densification scales automatically
-    with training length. Pass an explicit int to override."""
+    SCHEDULE (resolved per run by `resolve_schedule`, against the plan's view
+    count + `batch`): `iterations` is a VIEW-DRAW budget — the number of
+    reference-image presentations, i.e. optimizer_steps × batch — so the actual
+    step count is `budget // batch`. Raising `batch` therefore SPEEDS a run at
+    constant work (fewer, fuller optimizer steps) instead of multiplying it, and
+    the step-denominated cadences below (refine/densify windows, `ckpt_every`,
+    the regularizer start iters, …) are written at batch-1 and divided by
+    `batch` here so densification stays view-consistent across batch sizes.
+    `epochs`, when set, OVERRIDES the budget as whole passes over the view set
+    (`epochs × n_views`) — the scene-size-independent way to dial training
+    length, since a bigger scene has proportionally more views (Stage 4 places
+    cameras by surface area), and a mesh-exact init needs far fewer epochs than
+    photogrammetry's ~16.
 
+    `refine_stop_iter` defaults to None → resolved to 50% of the (post-batch)
+    step count, so densification scales automatically with training length."""
+
+    # VIEW-DRAW budget (optimizer steps × batch); `epochs` overrides it when set.
+    # See the class docstring + `resolve_schedule` — `iterations // batch` is the
+    # step count the loop actually runs.
     iterations: int = 30_000
+    epochs: float | None = None
     sh_degree: int = 0                 # active SH bands (0 = unlit albedo, decided default)
     sh_degree_interval: int = 1000     # raise the active degree every N steps (if sh_degree > 0)
 
@@ -239,7 +260,14 @@ class TrainParams:
     seed: int = 0
     eval_max_views: int = 128          # cap final-metric renders (plans can have thousands of views)
     log_every: int = 50                # emit a progress line every N steps
-    batch: int = 1                     # views rendered per step — >1 fills the GPU + VRAM headroom
+    # Views per optimizer step. The schedule holds VIEW-DRAWS constant
+    # (steps = iterations // batch), so this is a pure SPEED knob — it fills the
+    # A100's idle SMs by amortizing per-step overhead, at constant total work.
+    # Conservative default: rasterization activation memory (esp. the tile-
+    # intersection buffer) scales ~linearly with batch and is scene-dependent, so
+    # 3 keeps a dense/large cell well clear of the VRAM ceiling and the single-
+    # step OOM the free-margin guard can't catch (it only throttles growth).
+    batch: int = 3
     prefetch: bool = True              # decode/stack the next batch on a background thread (hide disk I/O)
 
     # Resumable checkpoints: every `ckpt_every` steps write the full training state
@@ -277,9 +305,56 @@ class TrainParams:
             return max(int(self.tile_max), 0)
         return max(int(self.cap_max * 2 / 3), 1)
 
+    def resolve_schedule(self, n_views: int) -> "TrainParams":
+        """Concrete per-run (or per-TILE) schedule for `n_views` reference images
+        at this `batch`, in actual optimizer-STEP units. `epochs`, when set, is
+        the training length as whole passes over the view set — `iterations` is
+        derived as `epochs × n_views` view-draws — else the `iterations` field is
+        used directly as that budget. The step count is then `budget // batch`
+        (batch is a pure speed knob at constant work), and the step-denominated
+        cadences (refine/densify windows, `ckpt_every`, regularizer starts, …)
+        are divided by `batch` so densification stays view-consistent. Returns a
+        NEW TrainParams whose `iterations` + cadences are the step counts the
+        trainer runs, so every downstream consumer (the loop, `resolved_refine_stop`,
+        the LR schedule) is unchanged. Called per TILE with the tile's own view
+        count, so each tile trains `epochs` passes over the views that supervise
+        it."""
+        from dataclasses import replace
+
+        b = max(int(self.batch), 1)
+        budget = (
+            max(1, round(self.epochs * max(n_views, 1)))
+            if self.epochs is not None
+            else max(1, int(self.iterations))
+        )
+        steps = max(_MIN_STEPS, round(budget / b))
+
+        def per_batch(v: int, floor: int = 1) -> int:
+            return max(floor, round(v / b))
+
+        return replace(
+            self,
+            iterations=steps,
+            refine_start_iter=per_batch(self.refine_start_iter),
+            refine_every=per_batch(self.refine_every),
+            refine_stop_iter=(
+                None if self.refine_stop_iter is None
+                else per_batch(self.refine_stop_iter)
+            ),
+            depth_densify_every=per_batch(self.depth_densify_every),
+            depth_densify_start=per_batch(self.depth_densify_start),
+            normal_start_iter=per_batch(self.normal_start_iter),
+            dist_start_iter=per_batch(self.dist_start_iter),
+            sh_degree_interval=per_batch(self.sh_degree_interval),
+            aa_every=per_batch(self.aa_every),
+            ckpt_every=(0 if self.ckpt_every == 0 else per_batch(self.ckpt_every)),
+        )
+
     def as_summary(self) -> dict[str, Any]:
         return {
             "iterations": self.iterations,
+            "epochs": self.epochs,
+            "batch": self.batch,
             "sh_degree": self.sh_degree,
             "ssim_lambda": self.ssim_lambda,
             "alpha_lambda": self.alpha_lambda,
@@ -301,7 +376,6 @@ class TrainParams:
             "depth_densify": self.depth_densify,
             "depth_densify_every": self.depth_densify_every,
             "depth_densify_max": self.depth_densify_max,
-            "batch": self.batch,
             "ckpt_every": self.ckpt_every,
             "tile_budget": self.resolved_tile_budget,
             "tile_margin_frac": self.tile_margin_frac,
@@ -608,13 +682,23 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, st
             if d is not None:
                 depths.append(torch.from_numpy(np.ascontiguousarray(d)))
         depth = torch.stack(depths) if len(depths) == batch else None
-        return torch.stack(vms), torch.stack(rgbs), torch.stack(alphas), depth
+        # Page-lock the host batch so the H2D copy overlaps compute (its cost
+        # grows with `batch`; pinning + non_blocking keeps it off the step's
+        # critical path). Pinning runs on the prefetch thread, not the GPU one.
+        pin = torch.cuda.is_available()
+
+        def _fin(t):  # noqa: ANN001, ANN202
+            return t.pin_memory() if (pin and t is not None) else t
+
+        return _fin(torch.stack(vms)), _fin(torch.stack(rgbs)), _fin(torch.stack(alphas)), _fin(depth)
 
     def to_dev(b) -> tuple:  # noqa: ANN001
         vm, rgb, alpha, depth = b
         return (
-            vm.to(device), rgb.to(device), alpha.to(device),
-            depth.to(device) if depth is not None else None,
+            vm.to(device, non_blocking=True),
+            rgb.to(device, non_blocking=True),
+            alpha.to(device, non_blocking=True),
+            depth.to(device, non_blocking=True) if depth is not None else None,
         )
 
     if not prefetch:
@@ -1067,7 +1151,6 @@ def _train_tiled(  # noqa: ANN001
     scaled count automatically."""
     import gc
     import shutil
-    from dataclasses import replace
 
     K_np = K.detach().cpu().numpy().astype(np.float64)
     owner = grid.owner(init["means"])
@@ -1103,13 +1186,15 @@ def _train_tiled(  # noqa: ANN001
         tmp.write_text(json.dumps(manifest, indent=1), encoding="utf-8")
         tmp.replace(manifest_path)
 
-    # Per-tile iterations ∝ supervision share (see docstring): 2× the tile's
-    # view fraction, floored at 20% and 200 steps, capped at the full schedule.
-    def tile_iters(n_assigned: int) -> int:
-        share = n_assigned / max(len(views), 1)
-        return max(200, int(round(params.iterations * min(1.0, max(0.2, 2.0 * share)))))
-
-    iters = [tile_iters(len(assigned[t])) if assigned[t] else 0 for t in live]
+    # Per-tile SCHEDULE: resolve each tile against ITS OWN assigned-view count
+    # (TrainParams.resolve_schedule), so a tile's step cap / densify window /
+    # convergence bounds scale to the work it actually has — a sparse tile trains
+    # (and, under convergence, plateaus) in far fewer steps than a dense one,
+    # while every tile keeps full densification headroom. Empty tiles cost 0.
+    tile_params = {
+        t: params.resolve_schedule(len(assigned[t])) for t in live if assigned[t]
+    }
+    iters = [tile_params[t].iterations if assigned[t] else 0 for t in live]
     offsets = np.concatenate([[0], np.cumsum(iters)])
     grand_total = max(int(offsets[-1]), 1)
 
@@ -1150,7 +1235,7 @@ def _train_tiled(  # noqa: ANN001
             )
         else:
             torch.manual_seed(params.seed + t)
-            t_params = replace(params, iterations=iters[pos])
+            t_params = tile_params[t]
             base = int(offsets[pos])
 
             def tile_progress(done_s: int, total_s: int, msg: str, _base=base, _tag=tag) -> None:
@@ -1388,6 +1473,12 @@ def train_splat(
         )
     n_views = len(views)
 
+    # NOTE: the training SCHEDULE (epochs/convergence bounds → concrete step
+    # counts, cadences scaled by batch) is resolved per RUN just before
+    # _train_one — against the full view count for a single run, and per TILE
+    # (each against its own view count) inside _train_tiled — so `params` here
+    # stays the raw client-supplied policy.
+
     # Surfel init (also the scene-scale fallback source when there's ≤1 camera).
     init = _load_cloud(cloud_path)
     n_init = int(init["means"].shape[0])
@@ -1417,7 +1508,7 @@ def train_splat(
     if grid is None:
         arrays, one = _train_one(
             torch, F, views, K, width, height, init, scene_scale, centers,
-            params, resume, ckpt_root, progress, tile_box=None,
+            params.resolve_schedule(n_views), resume, ckpt_root, progress, tile_box=None,
         )
         tiles_summary = None
         n_seeded, n_pruned = one["seeded"], one["pruned"]
@@ -1551,13 +1642,18 @@ def _train_one(  # noqa: ANN001
                 torch.zeros((n_init, bands - 1, 3), dtype=torch.float32, device=device)
             )
 
+    # A batched step averages B views' gradients, so scale every LR by sqrt(B) to
+    # keep per-view convergence ~constant as `batch` rises — variance-matching
+    # (sqrt, not linear), the safe rule for the quat/opacity/densification heads.
+    # batch=1 → factor 1 (bit-identical to the pre-batch schedule).
+    lr_scale = float(np.sqrt(max(params.batch, 1)))
     lrs = {
-        "means": params.means_lr * scene_scale,
-        "scales": params.scales_lr,
-        "quats": params.quats_lr,
-        "opacities": params.opacities_lr,
-        "sh0": params.sh0_lr,
-        "shN": params.shN_lr,
+        "means": params.means_lr * scene_scale * lr_scale,
+        "scales": params.scales_lr * lr_scale,
+        "quats": params.quats_lr * lr_scale,
+        "opacities": params.opacities_lr * lr_scale,
+        "sh0": params.sh0_lr * lr_scale,
+        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam(
@@ -1926,7 +2022,15 @@ def _main() -> None:
     ap.add_argument("--cloud", required=True, type=Path, help="Stage-3 cloud.ply (init)")
     ap.add_argument("--refs", required=True, type=Path, help="Stage-5 refs/ dir")
     ap.add_argument("--out", required=True, type=Path, help="output trained.ply")
-    ap.add_argument("--iterations", type=int, default=TrainParams.iterations)
+    ap.add_argument(
+        "--iterations", type=int, default=TrainParams.iterations,
+        help="VIEW-DRAW budget (optimizer steps × batch); steps run = iterations // batch",
+    )
+    ap.add_argument(
+        "--epochs", type=float, default=TrainParams.epochs,
+        help="passes over the view set; overrides --iterations "
+             "(budget = epochs × n_views, steps = budget // batch)",
+    )
     ap.add_argument("--sh-degree", type=int, default=TrainParams.sh_degree)
     ap.add_argument(
         "--refine-stop-iter", type=int, default=None,
@@ -1934,7 +2038,8 @@ def _main() -> None:
     )
     ap.add_argument(
         "--batch", type=int, default=TrainParams.batch,
-        help="views rendered per step; >1 fills the GPU (use ~1/batch the iterations)",
+        help="views per optimizer step (fills the GPU); steps = budget // batch, "
+             "so it's a speed knob at CONSTANT work (no need to adjust iterations)",
     )
     ap.add_argument(
         "--ckpt-every", type=int, default=TrainParams.ckpt_every,
@@ -1983,6 +2088,7 @@ def _main() -> None:
         out_path=args.out,
         params=TrainParams(
             iterations=args.iterations,
+            epochs=args.epochs,
             sh_degree=args.sh_degree,
             refine_stop_iter=args.refine_stop_iter,
             batch=args.batch,
