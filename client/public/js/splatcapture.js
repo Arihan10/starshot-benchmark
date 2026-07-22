@@ -14,7 +14,8 @@
 //      depth → POST binary SRF1 batches to …/frames?token=…
 //   4. POST …/finish?token=… → the server verifies + writes transforms.json.
 //
-// LIT capture (Phase 1): materials render as matte PBR surfaces under a FIXED
+// LIT capture (Phase 1): materials render as PBR surfaces (authored metallic-
+// roughness intact, so metals/glossies reflect + highlight per view) under a FIXED
 // light rig (splatlight.js — image-based ambient + a shadow-casting sun + a
 // hemisphere fill, shared with the debug viewers), so lighting and shadows
 // are baked into the reference frames. The rig is sent by the server (manifest
@@ -50,7 +51,7 @@ import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { normalizeLighting, prepareLitScene, createLightRig } from "./splatlight.js";
 
 const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
-// The bake rig + matte materials live in splatlight.js (shared with the debug
+// The bake rig + lit PBR materials live in splatlight.js (shared with the debug
 // viewers). The server sends splat/stage5.py's LIGHTING in the manifest, and
 // `normalizeLighting` falls back to the shared defaults when it's absent.
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);

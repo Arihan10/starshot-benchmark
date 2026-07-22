@@ -291,14 +291,21 @@ async function teardown() {
 }
 
 // One viewer construction shared by the splat and mesh-first paths.
-function makeViewer(view) {
+// The Stage-6 trained splat now carries view-dependent colour (spherical
+// harmonics degree 2, matching splat/stage6.py `sh_degree`), so highlights move
+// with the camera; the Stage-3 surfel cloud and the mesh-mode dummy are flat
+// (degree 0). mkkellogg allocates SH buffers for the viewer's configured degree,
+// so it's set PER LOAD (loadClouds) — 0 for surfels/mesh, 2 for trained.
+const TRAINED_SH_DEGREE = 0;
+
+function makeViewer(view, shDegree = 0) {
 	return new GaussianSplats3D.Viewer({
 		rootElement: canvasEl,
 		selfDrivenMode: true,
 		useBuiltInControls: true,
 		sharedMemoryForWorkers: false, // no COOP/COEP needed on the static server
 		dynamicScene: false,
-		sphericalHarmonicsDegree: 0, // our .ply is f_dc only (unlit)
+		sphericalHarmonicsDegree: shDegree, // 0 = flat (surfels/mesh); 2 = trained view-dependent
 		cameraUp: [0, 1, 0],
 		initialCameraPosition: view.position,
 		initialCameraLookAt: view.lookAt,
@@ -387,12 +394,13 @@ async function openMeshView(seq) {
 	);
 }
 
-// Build a fresh viewer and load the cell's surfel cloud.
-async function loadClouds(seq, url, summary, camera) {
+// Build a fresh viewer and load a cloud. `shDegree` sizes the viewer's spherical
+// harmonics (0 for the flat surfel cloud, TRAINED_SH_DEGREE for the trained splat).
+async function loadClouds(seq, url, summary, camera, shDegree = 0) {
 	await teardown();
 	if (seq !== openSeq) return;
 	const view = camera || framing(summary && summary.scene_aabb);
-	const v = makeViewer(view);
+	const v = makeViewer(view, shDegree);
 	viewer = v;
 	try {
 		await v.addSplatScene(url, {
@@ -921,6 +929,7 @@ async function setSource(next) {
 			api.absUrl(trainedUrl + bust),
 			{ scene_aabb: s3.summary && s3.summary.scene_aabb },
 			cam,
+			TRAINED_SH_DEGREE, // trained.ply carries degree-2 view-dependent colour
 		);
 	} else {
 		setStatus("loading surfels…", "var(--purple)");
@@ -1108,7 +1117,7 @@ async function buildMeshGroup() {
 		off += glbLen;
 		try {
 			const gltf = await loader.parseAsync(glb, "");
-			prepareLitScene(gltf.scene); // matte-lit, exactly like the Stage-5 capture
+			prepareLitScene(gltf.scene); // lit PBR, exactly like the Stage-5 capture
 			group.add(gltf.scene);
 		} catch {
 			/* skip a bad object */
@@ -1151,7 +1160,9 @@ async function meshLightingCfg() {
 		const c = current;
 		const s5 = await api.splatStage5Status(c.run, c.slot, c.model);
 		if (s5 && s5.status === "done" && s5.url) {
-			const doc = await fetch(api.absUrl(s5.url), { cache: "no-store" }).then((r) => r.json());
+			const doc = await fetch(api.absUrl(s5.url), {
+				cache: "no-store",
+			}).then((r) => r.json());
 			if (doc && doc.lighting) cfg = normalizeLighting(doc.lighting);
 		}
 	} catch {
@@ -1170,10 +1181,13 @@ async function enableMeshLighting() {
 	const cfg = await meshLightingCfg();
 	// The config fetch can await; bail if we left mesh mode / the viewer changed
 	// meanwhile, so we never strand ACES on the splat view.
-	if (meshLit || mode !== "mesh" || seq !== openSeq || !viewer || !meshGroup) return;
+	if (meshLit || mode !== "mesh" || seq !== openSeq || !viewer || !meshGroup)
+		return;
 	prevRenderState = applyMeshToneMapping(viewer.renderer);
 	if (!meshRig) {
-		meshRig = createLightRig(viewer.renderer, viewer.threeScene, { defaults: cfg });
+		meshRig = createLightRig(viewer.renderer, viewer.threeScene, {
+			defaults: cfg,
+		});
 	}
 	meshRig.setEnabled(true);
 	meshRig.refit(new THREE.Box3().setFromObject(meshGroup));
@@ -1185,7 +1199,8 @@ async function enableMeshLighting() {
 function disableMeshLighting() {
 	if (!meshLit) return;
 	meshRig?.setEnabled(false);
-	if (viewer && prevRenderState) restoreToneMapping(viewer.renderer, prevRenderState);
+	if (viewer && prevRenderState)
+		restoreToneMapping(viewer.renderer, prevRenderState);
 	prevRenderState = null;
 	meshLit = false;
 	viewer?.forceRenderNextFrame?.();
@@ -1608,6 +1623,32 @@ function buildControls(summary) {
 		el("span", { class: "svc-lab", text: "refs" }),
 		refsBtn,
 	);
+	// Reveal this cell's splat/ folder in the OS file browser (server-side open;
+	// the server runs on this machine).
+	const folderBtn = el("button", {
+		class: "splat-stage2-btn",
+		text: "reveal",
+		title: "open this cell's splat/ folder in your OS file browser (Explorer / Finder)",
+		onclick: async () => {
+			if (!current) return;
+			try {
+				const r = await api.splatReveal(
+					current.run,
+					current.slot,
+					current.model,
+				);
+				setStatus(`opened ${r.opened}`, "");
+			} catch (e) {
+				setStatus(`could not open folder: ${e.message}`, "#ff8080");
+			}
+		},
+	});
+	const folderRow = el(
+		"div",
+		{ class: "svc-row" },
+		el("span", { class: "svc-lab", text: "folder" }),
+		folderBtn,
+	);
 	// Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
 	const camRow = checkRow("cameras", "camera positions", false);
 	inputs.cameras.addEventListener("change", () =>
@@ -1646,6 +1687,7 @@ function buildControls(summary) {
 	inputs._modal = el("div", { class: "svc-coverage" });
 	inputs._log = el("pre", { class: "svc-log" });
 	Object.assign(inputs._log.style, {
+		minHeight: "64px",
 		maxHeight: "180px",
 		overflowY: "auto",
 		margin: "4px 0 0",
@@ -1710,6 +1752,7 @@ function buildControls(summary) {
 		voxPointsRow,
 		patchRow,
 		refsRow,
+		folderRow,
 		camRow,
 		camPlayRow,
 		camSpeedRow,
@@ -2155,23 +2198,34 @@ function showPatchModal(index) {
 
 // ---- pipeline stepper (the side panel: run/re-run each stage, gated) ---------
 
-// The LOCAL splat stages in dependency order (1-3): they run on this machine and
-// prepare the inputs the Modal train job consumes. Stage 1's status is the cell
-// itself; Stages 2-3 live on `cell.stageN`. A stage is runnable only once the
+// The LOCAL splat stages in dependency order. Stage 1's status is the cell
+// itself; Stages 2-5 live on `cell.stageN`. A stage is runnable only once the
 // previous is done; re-running a done stage REVERTS everything after it
-// (server-side). Stages 4-6 (cameras → references → fine-tune) run REMOTELY as
-// one "train on modal" job (see renderModal), so they're no longer per-stage
-// rows here — the camera plan + references need a CUDA GPU, and doing all three
-// in one A100 container keeps the big reference-image set off this machine.
+// (server-side). Stages 4 (cameras) and 5 (references) run LOCALLY here too —
+// camera planning is CPU-only and references render through the headless WebGL
+// capture (no GPU) — so each has its own row for iterating without Modal. The
+// Modal "train" job (see renderModal) still runs 4-6 together on an A100 for the
+// full GPU fine-tune; "run all" runs local 1-3 then hands off to it.
 const STAGES = [
 	{ n: 1, label: "assemble", verb: "convert" },
 	{ n: 2, label: "free space", verb: "voxelize" },
 	{ n: 3, label: "surfels", verb: "sample" },
+	{ n: 4, label: "cameras", verb: "plan" },
+	{ n: 5, label: "references", verb: "render" },
 ];
+// The subset "run all" drives locally before handing 4-6 to Modal — the Stage-4/5
+// rows above still run those two locally + independently, so this keeps run-all's
+// flow (local prep → Modal train) exactly as it was.
+const RUNALL_LOCAL_STAGES = STAGES.filter((s) => s.n <= 3);
 const STAGE_START = {
 	1: (r, s, m) => api.splatStage1Start(r, s, m),
 	2: (r, s, m) => api.splatStage2Start(r, s, m),
 	3: (r, s, m) => api.splatStage3Start(r, s, m, readParams()),
+	// Stage 4 re-plans on each run; Stage 5 RESUMES the views still missing on
+	// disk by default and only wipes + re-renders everything when re-run on a
+	// done stage (restart) — matching splat/stage5.py's resume signal.
+	4: (r, s, m) => api.splatStage4Start(r, s, m),
+	5: (r, s, m, restart) => api.splatStage5Start(r, s, m, { restart }),
 };
 
 function stageState(cell, n) {
@@ -2269,7 +2323,7 @@ async function runAll() {
 	stopPoll();
 	renderStepper();
 	try {
-		for (const stage of STAGES) {
+		for (const stage of RUNALL_LOCAL_STAGES) {
 			if (seq !== openSeq || !current) return;
 			let cell;
 			try {
@@ -2538,7 +2592,7 @@ function renderStepper() {
 function renderRunAll(cell) {
 	const busy = runningAll || anyStageRunning(cell);
 	const allDone =
-		STAGES.every((s) => stageDone(cell, s.n)) &&
+		RUNALL_LOCAL_STAGES.every((s) => stageDone(cell, s.n)) &&
 		cell?.modal?.status === "done";
 	const row = el("div", { class: "svc-step" });
 	row.appendChild(el("span", { class: "svc-step-n muted", text: "▶" }));

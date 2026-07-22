@@ -140,6 +140,13 @@ export const api = {
 			`/runs/${encodeURIComponent(run)}/splat/stage1/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
 			{ method: "POST" },
 		),
+	// Open this cell's splat/ folder in the server host's OS file browser
+	// (the server runs on your machine — the browser can't do it directly).
+	splatReveal: (run, slot, model) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/reveal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+			{ method: "POST" },
+		),
 	// Stage 2 (free-space voxelizer: single uniform grid, flood-fill empty/garbage
 	// classification + the clearance pass baking the FREE threshold). `body` may
 	// carry `pitch`/`margin`/`clearance`. Status returns the `voxels.bin` URL —

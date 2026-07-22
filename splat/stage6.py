@@ -31,8 +31,10 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     transmittance-0.5 crossing) is cleaner at silhouettes and never fades BLEND
     glass (α ≈ 0.065 stays below the crossing), but is blind to those floaters —
     reserve it for genuinely glass-heavy scenes.
-  * Colour: sRGB albedo compared directly (no sRGB↔linear); SH degree a config
-    flag (0 = unlit, the decided default), raisable later for shiny surfaces.
+  * Colour: sRGB compared directly (no sRGB↔linear); SH degree is a config flag —
+    degree 2 (view-dependent colour, the web viewer's maximum) is the default now
+    that capture is lit, so highlights/soft reflections move with the camera; set
+    0 to force flat unlit albedo. Higher orders ramp in over `sh_degree_interval`.
 
 LOSSES (per view):
   * photometric — full-frame L1 + D-SSIM on RGB vs the unlit reference. Both
@@ -171,7 +173,14 @@ class TrainParams:
     # step count the loop actually runs.
     iterations: int = 30_000
     epochs: float | None = None
-    sh_degree: int = 0                 # active SH bands (0 = unlit albedo, decided default)
+    # View-dependent colour. 2 = the web viewer's (mkkellogg) maximum and the
+    # standard for believable specular/sheen; 1 is a lighter option (a third the
+    # extra coefficients); 0 = flat unlit albedo. Degree 2 is the default now that
+    # capture bakes lighting (Phase 1) — SH is what lets a highlight move with the
+    # camera instead of being averaged into a dull smear. It adds (D+1)²−1 = 8
+    # coeffs per colour channel (24 floats/Gaussian), so it also drives the memory
+    # + size knobs below (cap_max, the tile budget, vram_min_free_gb).
+    sh_degree: int = 0
     sh_degree_interval: int = 1000     # raise the active degree every N steps (if sh_degree > 0)
 
     # Loss weights.
@@ -218,7 +227,16 @@ class TrainParams:
     # GLASS_ALPHA = 0.065 (logit −2.67), and the old 0.05 threshold left only
     # ~0.3 logits of drift before a pane surfel was permanently pruned.
     prune_opa: float = 0.03
-    cap_max: int = 3_000_000           # freeze densification past this many Gaussians (VRAM guard)
+    # Hard densification ceiling (VRAM guard). Trimmed from 3M to 2.5M for
+    # degree-2 SH: view-dependent colour makes each Gaussian ~2.7x heavier in
+    # training memory (14 → 38 trainable floats, ×4 with grad + Adam moments) and
+    # ~2.5x larger on disk (16 → 40 floats), so a mild cap curbs both the VRAM
+    # peak and the file size while SH's view-dependence offsets the slightly lower
+    # ceiling (net quality neutral-to-better under the lit references). Kept high
+    # rather than halved because quality is primary and the main box (A100) has
+    # ample VRAM; big scenes are unaffected — they TILE (n_tiles × cap_max total),
+    # and the lower derived tile budget just makes them tile a little sooner.
+    cap_max: int = 2_500_000
     # Final cleanup prune (once, before eval + export). Densification/pruning stop at
     # refine_stop (50% of iters), so opacity that drifts below prune_opa in the back
     # half — the low-opacity floaters stranded at silhouette/depth edges — otherwise
@@ -249,7 +267,11 @@ class TrainParams:
     # collapsed a real run to 0.05 it/s. 0 disables (rely on cap_max alone).
     # (`expandable_segments` would fight fragmentation on Linux/Modal but is a
     # no-op on Windows, so this free-margin freeze is the portable mechanism.)
-    vram_min_free_gb: float = 0.8
+    # Raised 0.8 → 1.5 for degree-2 SH: each densification round now allocates
+    # ~2x the per-Gaussian memory, so the freeze needs a wider margin to catch the
+    # cliff before a growth step overshoots it. It's a near-full floor, so it never
+    # triggers where VRAM is plentiful (the A100) — no quality cost there.
+    vram_min_free_gb: float = 1.5
 
     # Anti-aliasing — a Mip-Splatting-style 3D low-pass computed from the exact
     # cameras. Every `aa_every` steps, lower-bound each Gaussian's two in-plane
@@ -432,7 +454,8 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
     """Parse a Stage-3 binary-little-endian float `.ply` into gsplat 2DGS init
     arrays: means [N,3], quats [N,4] (wxyz), opacities [N] (logit), sh0 [N,1,3]
     (SH0 coeffs), scales [N,3] (log; a synthesized third axis when the cloud is
-    the 2-scale 2DGS format)."""
+    the 2-scale 2DGS format), plus shN [N,K-1,3] when the ply carries `f_rest_*`
+    (a trained view-dependent splat re-used as init; the Stage-3 cloud has none)."""
     raw = Path(path).read_bytes()
     marker = b"end_header\n"
     cut = raw.find(marker)
@@ -483,7 +506,19 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
         two = stack("scale_0", "scale_1")
         third = (two.min(axis=1, keepdims=True) + np.log(0.01)).astype(np.float32)
         scales = np.concatenate([two, third], axis=1)
-    return {"means": means, "quats": quats, "opacities": opacities, "sh0": sh0, "scales": scales}
+    out = {"means": means, "quats": quats, "opacities": opacities, "sh0": sh0, "scales": scales}
+    # Higher-order SH, if the ply carries it (a trained.ply re-used as init):
+    # invert the INRIA channel-major f_rest layout back to gsplat's [N, K-1, 3].
+    # The Stage-3 init cloud has none (SH0), so this is a no-op on the normal path.
+    rest_names = sorted(
+        (p for p in props if p.startswith("f_rest_")),
+        key=lambda s: int(s.rsplit("_", 1)[-1]),
+    )
+    if rest_names and len(rest_names) % 3 == 0:
+        rest = np.stack([col[p] for p in rest_names], axis=1).astype(np.float32)
+        per = len(rest_names) // 3
+        out["shN"] = np.ascontiguousarray(rest.reshape(-1, 3, per).transpose(0, 2, 1))
+    return out
 
 
 def _load_rgb(path: Path) -> np.ndarray:
@@ -560,20 +595,39 @@ def _encode_trained_ply(
     opacity: np.ndarray,
     scales2: np.ndarray,
     out_path: Path,
+    sh_rest: np.ndarray | None = None,
 ) -> None:
     """Write the trained model as a Stage-3-compatible 2DGS `.ply` (two tangent
-    log-scales, SH degree 0). Values are stored raw (opacity as logit, scales as
-    log, colour as `f_dc`) exactly as the viewers/Stage 7 expect."""
+    log-scales). Values are stored raw (opacity as logit, scales as log, colour as
+    `f_dc`) exactly as the viewers/Stage 7 expect.
+
+    `sh_rest` (the higher-order SH coefficients, shape [N, K-1, 3] in gsplat
+    coeff-major order) makes the model VIEW-DEPENDENT: they're written as
+    `f_rest_*` right after `f_dc` in the INRIA channel-major layout — all of
+    channel 0's coefficients, then channel 1's, then channel 2's — which every
+    SH-aware reader (the web viewer, the SOG encoder, the compressor) expects.
+    `sh_rest=None` writes the degree-0 flat-colour file, byte-identical to the
+    pre-SH exporter — used for the LOD ladder (distant levels don't need
+    view-dependence)."""
     n = means.shape[0]
     normals = _quats_to_normals(quats)
     cols = [
         means[:, 0], means[:, 1], means[:, 2],
         normals[:, 0], normals[:, 1], normals[:, 2],
         f_dc[:, 0], f_dc[:, 1], f_dc[:, 2],
+    ]
+    rest_props = ""
+    if sh_rest is not None and sh_rest.size and sh_rest.shape[1] > 0:
+        # gsplat shN is [N, coeff, channel]; the INRIA .ply f_rest layout is
+        # channel-major (channel outer, coeff inner), so transpose then flatten.
+        rest = np.ascontiguousarray(np.transpose(sh_rest, (0, 2, 1)).reshape(n, -1))
+        cols.extend(rest[:, j] for j in range(rest.shape[1]))
+        rest_props = "".join(f"property float f_rest_{j}\n" for j in range(rest.shape[1]))
+    cols.extend([
         opacity,
         scales2[:, 0], scales2[:, 1],
         quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3],
-    ]
+    ])
     data = np.stack(cols, axis=1).astype("<f4")
     header = (
         "ply\n"
@@ -582,7 +636,8 @@ def _encode_trained_ply(
         "property float x\n" "property float y\n" "property float z\n"
         "property float nx\n" "property float ny\n" "property float nz\n"
         "property float f_dc_0\n" "property float f_dc_1\n" "property float f_dc_2\n"
-        "property float opacity\n"
+        + rest_props
+        + "property float opacity\n"
         "property float scale_0\n" "property float scale_1\n"
         "property float rot_0\n" "property float rot_1\n"
         "property float rot_2\n" "property float rot_3\n"
@@ -1602,6 +1657,7 @@ def train_splat(
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
+        sh_rest=arrays.get("shN"),
     )
     lod_summary = _export_lod(arrays, out_path, params, progress)
 
@@ -1809,9 +1865,19 @@ def _train_one(  # noqa: ANN001
             }
         ).to(device)
         if bands > 1:
-            splats["shN"] = torch.nn.Parameter(
-                torch.zeros((n_init, bands - 1, 3), dtype=torch.float32, device=device)
-            )
+            # Reuse the init's higher-order SH when present AND the degree matches
+            # (a trained splat re-fed as init); the Stage-3 cloud carries none, so
+            # the normal path starts them at zero and trains them up.
+            init_shN = init.get("shN")
+            if (
+                init_shN is not None
+                and init_shN.shape[0] == n_init
+                and init_shN.shape[1] == bands - 1
+            ):
+                shN0 = torch.from_numpy(np.ascontiguousarray(init_shN)).to(device)
+            else:
+                shN0 = torch.zeros((n_init, bands - 1, 3), dtype=torch.float32, device=device)
+            splats["shN"] = torch.nn.Parameter(shN0)
 
     # A batched step averages B views' gradients, so scale every LR by sqrt(B) to
     # keep per-view convergence ~constant as `batch` rises — variance-matching

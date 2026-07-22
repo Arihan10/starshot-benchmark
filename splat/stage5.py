@@ -143,8 +143,9 @@ LIGHTING: dict[str, Any] = {
 
 # Bumped whenever the COLOUR PIPELINE itself changes (tone map / transfer / how
 # materials are shaded), so a reference set rendered by an older pipeline is
-# detected as stale even when `LIGHTING` is byte-identical.
-COLOR_PIPELINE = "linear-aces-srgb-v1"
+# detected as stale even when `LIGHTING` is byte-identical. v2: materials render
+# with their authored metallic-roughness (reflective) instead of forced matte.
+COLOR_PIPELINE = "linear-aces-srgb-v2"
 
 # Sidecar under a cell's refs/ recording the capture settings the on-disk frames
 # were rendered with, so a resume can detect a change (see `reconcile_capture_meta`).
