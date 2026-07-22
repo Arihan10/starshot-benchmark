@@ -261,6 +261,10 @@ _splat_stage6_procs: dict[tuple[str, str, str], dict[str, Any]] = {}
 # {status, running, phase, heartbeat, call_id, error, started_at, ...}.
 _splat_modal_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_modal_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+# Cells whose sticky-hook re-attach is mid-flight (between the async job_status
+# probe and claiming the job), so the startup scan and a concurrent status poll
+# can't double-attach one cell (which would race two supervisors on its pull).
+_splat_modal_reattaching: set[tuple[str, str, str]] = set()
 # The remote stage window the button drives (7 deferred by decision).
 _MODAL_STAGES = [4, 5, 6]
 _MODAL_POLL_S = 4.0
@@ -2168,13 +2172,10 @@ class Stage3Request(BaseModel):
     surfel density around the calibrated default look (1 = default resolution,
     2 = twice the surfels/m², 0.5 = half); spacing, disk radius, feature
     refinement, and culling are all derived from it (see splat/stage3.py).
-    `representation` is a format flag only ("2dgs" default | "3dgs" compat).
-    `workers` FORCES the per-object pool size (0/omitted = auto — min(cores, 8);
-    >=1 pins it, re-clamped to the object count + a memory cap in `sample_cell`)."""
+    `representation` is a format flag only ("2dgs" default | "3dgs" compat)."""
 
     detail: float | None = None
     representation: str | None = None
-    workers: int | None = None
 
 
 def _stage3_params(req: Stage3Request | None) -> splat_stage3.SampleParams:
@@ -2187,16 +2188,6 @@ def _stage3_params(req: Stage3Request | None) -> splat_stage3.SampleParams:
     )
     rep = req.representation if req.representation in ("2dgs", "3dgs") else "2dgs"
     return splat_stage3.SampleParams(detail=detail, representation=rep)
-
-
-def _stage3_workers(req: Stage3Request | None) -> int:
-    """The forced Stage-3 pool size from a request: 0 (auto) when omitted, else
-    clamped to a sane [1, 64] ceiling. `sample_cell` re-clamps a forced value to
-    the object count + a memory cap, so this only bounds absurd input."""
-    req = req or Stage3Request()
-    if req.workers is None:
-        return 0
-    return int(min(max(req.workers, 0), 64))
 
 
 def _splat_stage3_status(
@@ -2407,13 +2398,20 @@ def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
 
 
 async def _run_splat_modal_cell(
-    run: str, slot: str, model: str, opts: dict[str, Any]
+    run: str, slot: str, model: str, opts: dict[str, Any],
+    *, attach_call_id: str | None = None,
 ) -> None:
     """Supervise ONE cell's remote train: push stage-1-3 inputs → spawn
     `run_cell(4,5,6)` → stream heartbeat → pull `trained.ply`. Every Modal SDK
     call (blocking network I/O) runs in a worker thread so the event loop stays
     free; the artifacts land in the cell's local `splat/` dir exactly where the
-    Stage-6 status + viewer read them."""
+    Stage-6 status + viewer read them.
+
+    `attach_call_id` RE-ATTACHES to a container a previous process already
+    spawned (the sticky hook after a server restart — see `_reattach_modal_job`):
+    push + spawn are skipped, the persisted call id is adopted, and we jump
+    straight to streaming the heartbeat + pulling artifacts, so an interrupted
+    supervisor picks the run back up without launching a duplicate."""
     key = (run, slot, model)
     job = _splat_modal_jobs[key]
     try:
@@ -2423,36 +2421,41 @@ async def _run_splat_modal_cell(
                 "install it and configure Modal credentials"
             )
         cell_dir = _slot_dir(run, slot, model)
-        # Gate: the remote pipeline consumes the local stage-2/3 outputs.
-        needed = {
-            "free-space grid (Stage 2)": _freespace_path(run, slot, model),
-            "skin sidecar (Stage 2)": cell_dir / "splat" / "freespace.npz.skin.npy",
-            "surfel cloud (Stage 3)": _cloud_path(run, slot, model),
-        }
-        missing = [name for name, p in needed.items() if not p.is_file()]
-        if missing:
-            raise RuntimeError(
-                f"run stages 2-3 locally first — missing: {', '.join(missing)}"
+        if attach_call_id is None:
+            # Gate: the remote pipeline consumes the local stage-2/3 outputs.
+            needed = {
+                "free-space grid (Stage 2)": _freespace_path(run, slot, model),
+                "skin sidecar (Stage 2)": cell_dir / "splat" / "freespace.npz.skin.npy",
+                "surfel cloud (Stage 3)": _cloud_path(run, slot, model),
+            }
+            missing = [name for name, p in needed.items() if not p.is_file()]
+            if missing:
+                raise RuntimeError(
+                    f"run stages 2-3 locally first — missing: {', '.join(missing)}"
+                )
+            tier_dir = await _ensure_splat_tier(run, slot, model, job)
+
+            job["phase"] = "push"
+            job["msg"] = "uploading inputs (deduped)…"
+            pushed = await asyncio.to_thread(
+                splat_modal.push_cell, cell_dir, tier_dir, True
             )
-        tier_dir = await _ensure_splat_tier(run, slot, model, job)
 
-        job["phase"] = "push"
-        job["msg"] = "uploading inputs (deduped)…"
-        pushed = await asyncio.to_thread(
-            splat_modal.push_cell, cell_dir, tier_dir, True
-        )
-
-        job["phase"] = "spawn"
-        job["msg"] = "spawning the A100 job…"
-        # Forward the client's train overrides VERBATIM — the server adds nothing.
-        train: dict[str, Any] = dict(opts.get("train") or {})
-        call_id = await asyncio.to_thread(
-            splat_modal.spawn_cell, cell_dir, pushed, _MODAL_STAGES,
-            None, train, None, bool(opts.get("restart")),
-        )
+            job["phase"] = "spawn"
+            job["msg"] = "spawning the A100 job…"
+            # Forward the client's train overrides VERBATIM — the server adds nothing.
+            train: dict[str, Any] = dict(opts.get("train") or {})
+            call_id = await asyncio.to_thread(
+                splat_modal.spawn_cell, cell_dir, pushed, _MODAL_STAGES,
+                None, train, None, bool(opts.get("restart")),
+            )
+        else:
+            # Re-attach: adopt the call the prior process spawned; the job record
+            # on disk (splat/modal-job.json) already holds it, so nothing to push.
+            call_id = attach_call_id
         job["call_id"] = call_id
         job["phase"] = "run"
-        job["msg"] = "planning cameras…"
+        job["msg"] = "re-attached — streaming remote progress…" if attach_call_id else "planning cameras…"
 
         # Stream the container heartbeat until the call resolves, PROGRESSIVELY
         # pulling artifacts as each remote stage commits them to the Volume — so
@@ -2518,6 +2521,73 @@ async def _run_splat_modal_cell(
         _splat_modal_tasks.pop(key, None)
 
 
+async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
+    """Re-hook the server to a Modal train a PREVIOUS process spawned — the
+    sticky hook that survives a restart. The call id persists in the cell's
+    `splat/modal-job.json`, so we can query the live state without re-spawning.
+    Idempotent: a no-op if the cell is already tracked, has no job record, or the
+    trained splat is already local. If the recorded call is still RUNNING, the
+    in-memory job + streaming supervisor are rebuilt (skipping push/spawn, so no
+    duplicate container); if it finished while the server was down, `trained.ply`
+    is pulled so the viewer lights up. Returns True when a live job is now
+    tracked."""
+    if splat_modal is None:
+        return False
+    key = (run, slot, model)
+    tracked = _splat_modal_jobs.get(key)
+    if tracked is not None and tracked.get("running"):
+        return True  # already supervising this cell
+    if key in _splat_modal_reattaching:
+        return False  # a concurrent re-attach is already resolving this cell
+    cell_dir = _slot_dir(run, slot, model)
+    if not splat_modal._job_path(cell_dir).is_file():
+        return False  # nothing was ever spawned for this cell
+    if _trained_path(run, slot, model).is_file():
+        return False  # result already local — nothing to recover
+    _splat_modal_reattaching.add(key)
+    try:
+        try:
+            st = await asyncio.to_thread(splat_modal.job_status, cell_dir)
+        except Exception:
+            return False  # torn record / expired call id — leave it alone
+        state = st.get("state")
+        if state == "running":
+            _splat_modal_jobs[key] = {
+                "status": "running", "running": True, "phase": "run",
+                "heartbeat": st.get("heartbeat"), "call_id": st.get("call_id"),
+                "error": None, "msg": "re-attached after server restart",
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+                "reattached": True,
+            }
+            _splat_modal_tasks[key] = asyncio.create_task(
+                _run_splat_modal_cell(run, slot, model, {}, attach_call_id=st.get("call_id"))
+            )
+            return True
+        if state == "done":
+            # Finished while we were down → land the artifacts locally.
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(splat_modal.pull_cell, cell_dir, True, True)
+        return False
+    finally:
+        _splat_modal_reattaching.discard(key)
+
+
+async def _reattach_all_modal_jobs() -> None:
+    """Scan every cell for a persisted Modal job record and re-attach any a prior
+    process left running (`_reattach_modal_job`). Run once at startup so a
+    restarted server re-hooks live A100 trains across ALL runs, not just the
+    open one — the container keeps training regardless; this resumes streaming +
+    the auto-pull of its result."""
+    if splat_modal is None or not RUNS_DIR.exists():
+        return
+    for job_file in sorted(RUNS_DIR.glob("*/*/*/splat/modal-job.json")):
+        parts = job_file.relative_to(RUNS_DIR).parts
+        if len(parts) < 3:
+            continue
+        with contextlib.suppress(Exception):
+            await _reattach_modal_job(parts[0], parts[1], parts[2])
+
+
 def _sample_cell_blocking(
     run: str,
     slot: str,
@@ -2527,12 +2597,10 @@ def _sample_cell_blocking(
     out_path: Path,
     params: splat_stage3.SampleParams,
     job: dict[str, Any],
-    workers: int = 0,
 ) -> dict[str, Any]:
     """Sample a cell into its surfel cloud directly off its selected asset dir —
     no de-optimization (splat/assets.py reads any encoding in-process, KTX2
-    texels included), consuming the Stage-2 free-space grid. `workers` forces the
-    per-object pool size (0 = auto). Blocking."""
+    texels included), consuming the Stage-2 free-space grid. Blocking."""
 
     def _progress(done: int, total: int, current: str) -> None:
         job["phase"], job["done"], job["total"], job["current_id"] = (
@@ -2543,7 +2611,7 @@ def _sample_cell_blocking(
     summary = splat_stage3.sample_cell(
         run=run, slot=slot, model=model, raw_dir=tier_dir,
         freespace_path=freespace_path, out_path=out_path,
-        params=params, progress=_progress, workers=workers,
+        params=params, progress=_progress,
     )
     # The detail-LOD twin is retired; scrub any stale copy from older runs.
     out_path.with_suffix(".detail.ply").unlink(missing_ok=True)
@@ -2555,11 +2623,9 @@ async def _run_splat_stage3_cell(
     slot: str,
     model: str,
     params: splat_stage3.SampleParams,
-    workers: int = 0,
 ) -> None:
     """Sample ONE cell into surfels off the event loop. Requires the Stage-2
-    free-space grid; writes the `cloud.json` sidecar so 'done' survives a restart.
-    `workers` forces the per-object pool size (0 = auto)."""
+    free-space grid; writes the `cloud.json` sidecar so 'done' survives a restart."""
     key = (run, slot, model)
     job = _splat_stage3_jobs[key]
     try:
@@ -2570,7 +2636,7 @@ async def _run_splat_stage3_cell(
         out_path = _cloud_path(run, slot, model)
         summary = await asyncio.to_thread(
             _sample_cell_blocking, run, slot, model, tier_dir,
-            freespace, out_path, params, job, workers,
+            freespace, out_path, params, job,
         )
         job["summary"] = summary
         with contextlib.suppress(Exception):
@@ -2924,7 +2990,6 @@ def _write_stage5_transforms(out_dir: Path, plan: dict[str, Any], views: list[di
     splat_stage5.write_transforms(
         out_dir, K, resolution, float(intr["near"]), float(intr["far"]),
         splat_stage5.reference_frames(views),
-        lighting=splat_stage5.LIGHTING,
     )
 
 
@@ -2952,11 +3017,6 @@ async def _run_splat_stage5_cell(
         views = await asyncio.to_thread(splat_stage5.enumerate_views, plan)
         out_dir = _refs_dir(run, slot, model)
         (out_dir / splat_stage5.FRAMES_DIRNAME).mkdir(parents=True, exist_ok=True)
-        # Phase-1 lighting guard: if the recorded capture settings changed since the
-        # frames on disk were rendered (a different lighting / colour pipeline), drop
-        # them so this (resumed) session re-renders every view under one consistent
-        # lighting rather than mixing two (splat_stage5.reconcile_capture_meta).
-        await asyncio.to_thread(splat_stage5.reconcile_capture_meta, out_dir)
         pending = await asyncio.to_thread(splat_stage5.pending_views, out_dir, views)
         skipped = len(views) - len(pending)
         job["total"], job["done"] = len(views), skipped
@@ -3120,11 +3180,19 @@ def create_app() -> FastAPI:
         # unpriced by a prior process that exited mid-lookup (the resumed run's
         # cells hydrate above, so this sweep recovers them).
         cost_task = asyncio.create_task(_cost_backfill_loop())
+        # Sticky hook: re-attach to any Modal train a prior process left running
+        # (call id persisted per cell in splat/modal-job.json), so a server
+        # restart resumes streaming + auto-pulls results instead of orphaning the
+        # live A100 containers. Backgrounded so startup never blocks on Modal.
+        reattach_task = asyncio.create_task(_reattach_all_modal_jobs())
         try:
             yield
         finally:
             rlog.suppress_console()
             cost_task.cancel()
+            reattach_task.cancel()
+            for task in _splat_modal_tasks.values():
+                task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cost_task
             for slot_log in _slot_logs.values():
@@ -3810,9 +3878,8 @@ def create_app() -> FastAPI:
     ) -> dict[str, object]:
         """(Re-)sample ONE cell's placed meshes into a pre-fine-tuning Gaussian cloud
         `splat/cloud.ply` (see splat/stage3.py), consuming the Stage-2 free-space grid
-        to orient normals + cull hidden faces. ONE quality knob: `detail` (density
-        multiplier; 1 = the calibrated default look); `workers` optionally FORCES the
-        per-object pool size (0 = auto). Requires Stage 2 first. Idempotent while
+        to orient normals + cull hidden faces. ONE knob: `detail` (density multiplier;
+        1 = the calibrated default look). Requires Stage 2 first. Idempotent while
         running; re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
@@ -3824,7 +3891,6 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
         _, kind = source
         params = _stage3_params(body)
-        workers = _stage3_workers(body)
         key = (run, slot, model)
         existing = _splat_stage3_jobs.get(key)
         if existing is not None and existing.get("running"):
@@ -3849,7 +3915,7 @@ def create_app() -> FastAPI:
         }
         _splat_stage3_jobs[key] = job
         _splat_stage3_tasks[key] = asyncio.create_task(
-            _run_splat_stage3_cell(run, slot, model, params, workers)
+            _run_splat_stage3_cell(run, slot, model, params)
         )
         return dict(job)
 
@@ -3994,7 +4060,6 @@ def create_app() -> FastAPI:
             "far": state["far"],
             "fov_deg": state["fov_deg"],
             "background": list(splat_stage5.BACKGROUND_RGB),
-            "lighting": splat_stage5.LIGHTING,
             "cameras_url": _artifact_url(_cameras_path(run, slot, model)),
             "bundle_url": (
                 f"/slots/{quote(slot, safe='')}/{quote(model, safe='')}/meshes"
@@ -4177,6 +4242,10 @@ def create_app() -> FastAPI:
         """Live Modal remote-train state: 'idle' / 'running' (with `phase` +
         `stage`/`done`/`total`/`msg` heartbeat) / 'done' (trained.ply local, its
         `trained_url` set) / 'error'. See `_splat_modal_status`."""
+        # Sticky hook (belt-and-suspenders to the startup scan): if this cell has
+        # a persisted job the server isn't tracking (e.g. spawned in another run
+        # after startup), re-hook it on poll. Idempotent + cheap once tracked.
+        await _reattach_modal_job(run, slot, model)
         return _splat_modal_status(run, slot, model)
 
     @app.get("/trellis/queue")

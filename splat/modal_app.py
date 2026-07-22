@@ -179,6 +179,19 @@ def _sig(payload: dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def _src_sig(*paths: Path) -> str:
+    """A hash of the deployed SOURCE that implements a stage, folded into that
+    stage's cache signature. Without this the idempotency key is only inputs +
+    params, so editing the pipeline (planner / renderer / trainer) and
+    redeploying would silently REUSE artifacts the old code produced — a changed
+    stage would never re-run. Missing files are skipped (best effort)."""
+    h = hashlib.sha256()
+    for p in paths:
+        with contextlib.suppress(Exception):
+            h.update(Path(p).read_bytes())
+    return h.hexdigest()[:16]
+
+
 def _zstd_decompress(src: Path, dst: Path) -> None:
     import zstandard
 
@@ -256,7 +269,9 @@ class _Heartbeat:
             # Best-effort: a heartbeat hiccup must never fail the run.
             with contextlib.suppress(Exception):
                 status_dict[self.key] = entry
-            print(f"[{stage}] {done}/{total} {msg}", flush=True)
+            # Cell-prefixed so lines from concurrent containers stay attributable
+            # in the aggregated `modal app logs` stream.
+            print(f"[{self.key}] [{stage}] {done}/{total} {msg}", flush=True)
 
         return cb
 
@@ -339,6 +354,17 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     key = f"{run}/{slot}/{model}"
     heart = _Heartbeat(key)
 
+    # Identify this run up front so concurrent containers are distinguishable in
+    # the aggregated `modal app logs` stream (every heartbeat line is also cell-
+    # prefixed — see _Heartbeat). Includes the param overrides so runs that
+    # differ only by plan/train config are told apart too.
+    print(
+        f"=== run_cell START {key} | stages={sorted(stages)} force={force} "
+        f"| plan={spec.get('plan') or {}} train={spec.get('train') or {}} "
+        f"quant={spec.get('quant') or {}} ===",
+        flush=True,
+    )
+
     volume.reload()  # a warm container must see files the client just pushed
     cell = Path(VOL) / "cells" / run / slot / model
     inputs = cell / "inputs"
@@ -361,10 +387,28 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     _ensure_input(inputs, "freespace.npz.skin.npy", in_sha["skin"], scratch)
     cloud = _ensure_input(inputs, "cloud.ply", in_sha["cloud"], scratch)
 
+    # Per-stage CODE versions (see _src_sig): fold the DEPLOYED pipeline source
+    # into each stage's cache signature, so editing a stage + redeploying re-runs
+    # THAT stage (and, by output cascade, the stages after it) instead of
+    # silently reusing an artifact the old code produced. This is what makes a
+    # changed planner / renderer / trainer actually take effect on the next run.
+    import splat.stage4 as _stage4
+    import splat.stage5 as _stage5
+    import splat.stage6 as _stage6
+
+    _js = Path(_ASSETS) / "js"
+    code4 = _src_sig(Path(_stage4.__file__))
+    code5 = _src_sig(
+        Path(_stage5.__file__), Path(modal_capture.__file__),
+        _js / "splatcapture.js", _js / "splatcapture-worker.js",
+    )
+    code6 = _src_sig(Path(_stage6.__file__))
+    code7 = _src_sig(Path(quantize.__file__))
+
     # ---- stage 4: coverage camera plan -----------------------------------------
     plan_params = PlanParams(**(spec.get("plan") or {}))
     sig4 = _sig({"in": [in_sha["freespace"], in_sha["skin"], in_sha["cloud"]],
-                 "params": plan_params.as_summary()})
+                 "params": plan_params.as_summary(), "code": code4})
     cameras = out / "cameras.json"
     art4 = [cameras, out / "patches.bin", out / "patch_views.json"]
     if 4 in stages:
@@ -390,7 +434,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     if 5 in stages:
         if not cameras.is_file():
             raise FileNotFoundError("cameras.json missing — run stage 4 first")
-        sig5 = _sig({"cameras": _sha256(cameras), "tier": in_sha["tier"]})
+        sig5 = _sig({"cameras": _sha256(cameras), "tier": in_sha["tier"], "code": code5})
         if not force and _fresh(status, "5", sig5, [transforms]):
             summary["stages_skipped"].append(5)
         else:
@@ -429,7 +473,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             raise FileNotFoundError("refs/transforms.json missing — run stage 5 first")
         train_params = TrainParams(**(spec.get("train") or {}))
         sig6 = _sig({"cloud": in_sha["cloud"], "refs": _sha256(transforms),
-                     "params": train_params.as_summary()})
+                     "params": train_params.as_summary(), "code": code6})
         if not force and _fresh(status, "6", sig6, [trained]):
             summary["stages_skipped"].append(6)
         else:
@@ -459,7 +503,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
         if not trained.is_file():
             raise FileNotFoundError("trained.ply missing — run stage 6 first")
         quant = quantize.QuantConfig(**(spec.get("quant") or {}))
-        sig7 = _sig({"trained": _sha256(trained), "quant": quant.as_summary()})
+        sig7 = _sig({"trained": _sha256(trained), "quant": quant.as_summary(), "code": code7})
         sqz = out / "trained.sqz"
         if not force and _fresh(status, "7", sig7, [sqz]):
             summary["stages_skipped"].append(7)

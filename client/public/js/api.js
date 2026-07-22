@@ -236,6 +236,13 @@ export const api = {
 		request(
 			`/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
 		),
+	// Detach + cancel a cell's remote train: terminates the A100 container and
+	// clears the job so the cell returns to idle and can be re-launched fresh.
+	splatModalCancel: (run, slot, model) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+			{ method: "DELETE" },
+		),
 	// Live snapshot of the process-global mesh queue — every in-flight + waiting
 	// generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
 	// pool. { pools: [{id,label,cap}], entries: [{slot_id,job_id,state,backend,pool,…}] }.

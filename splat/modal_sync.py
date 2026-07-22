@@ -358,6 +358,30 @@ def job_status(cell_dir: Path) -> dict[str, Any]:
     return out
 
 
+def cancel_cell(cell_dir: Path) -> str | None:
+    """Cancel the cell's recorded Modal function call, TERMINATING its container
+    so the A100 stops billing immediately (not just draining its input queue).
+    Returns the cancelled call id, or None when there's no job record / call id.
+    The local `modal-job.json` is left in place for the caller to remove — the
+    detach flow drops it so the cell reads idle and re-launches clean."""
+    path = _job_path(cell_dir)
+    if not path.is_file():
+        return None
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    call_id = record.get("call_id")
+    if not call_id:
+        return None
+    call = modal.FunctionCall.from_id(call_id)
+    try:
+        call.cancel(terminate_containers=True)
+    except TypeError:  # older Modal SDK without the kwarg
+        call.cancel()
+    return call_id
+
+
 def pull_samples(cell_dir: Path) -> list[str]:
     """Download the mid-run debug sample PNGs (`refs/samples/*.png`) into the
     local `splat/refs/samples/` dir. Cheap + idempotent (skips same-size files);
@@ -485,6 +509,11 @@ def _main() -> None:
     add_cell(p)
     p.add_argument("--no-ply", action="store_true")
 
+    p = sub.add_parser(
+        "cancel", help="cancel the cell's running Modal job (terminates the A100 container)"
+    )
+    add_cell(p)
+
     sub.add_parser("probe", help="report the A100 container's WebGL renderer")
 
     args = ap.parse_args()
@@ -532,6 +561,11 @@ def _main() -> None:
 
     if args.cmd == "pull":
         pull_cell(args.cell, include_ply=not args.no_ply)
+        return
+
+    if args.cmd == "cancel":
+        cid = cancel_cell(args.cell)
+        print(f"cancelled {cid}" if cid else "no recorded Modal job to cancel")
 
 
 if __name__ == "__main__":
