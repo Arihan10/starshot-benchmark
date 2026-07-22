@@ -12,7 +12,7 @@ import { PointerLockControls } from "three/addons/controls/PointerLockControls.j
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
-import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
+import { createLightRig, LIGHTING_DEFAULTS } from "./splatlight.js";
 
 const BBOX_COLOR_DEFAULT = 0xff3b3b; // zones
 // Objects are colored by the decomposition step that emitted them, so the
@@ -69,20 +69,9 @@ const MAX_INFLIGHT = 20;
 const CLICK_MAX_MOVE_PX = 4;
 const CLICK_MAX_DURATION_MS = 400;
 
-// Defaults for the main viewer's lighting engine (exposed so the lighting panel
-// can reset to them). Tuned so the directional KEY light shapes the scene while
-// the IBL environment + hemisphere are fill/reflections rather than washing it
-// flat. azimuth 0°=+Z (front), 90°=+X (right); elevation in degrees.
-const LIGHTING_DEFAULTS = {
-	exposure: 1.0,
-	key: 3.5,
-	fill: 0.2,
-	env: 0.35,
-	shadow: 0.4,
-	azimuth: 34,
-	elevation: 48,
-	shadows: true,
-};
+// The lighting defaults + the rig itself now live in splatlight.js (shared with
+// the Stage-5 capture and the splat viewer's "original" mesh mode), so the main
+// viewer, the trained refs, and the splat preview all share ONE bake rig.
 
 // Selected-map projection ("on mesh" control): each map's material slot + the
 // packed channel to isolate (glTF packs occlusion=R, roughness=G, metalness=B);
@@ -1341,118 +1330,29 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 	// shadows stay crisp at any scale. Returns the handle the viewer exposes to
 	// the lighting panel; only ever called when `lighting` is on.
 	function setupLightingRig() {
-		{
-			const pmrem = new THREE.PMREMGenerator(renderer);
-			const envScene = new RoomEnvironment(renderer);
-			scene.environment = pmrem.fromScene(envScene, 0.04).texture;
-			envScene.dispose();
-			pmrem.dispose();
-		}
-		const hemi = new THREE.HemisphereLight(
-			0xffffff,
-			0x202028,
-			LIGHTING_DEFAULTS.fill,
-		);
-		hemi.layers.enableAll(); // also light the OIT layer
-		scene.add(hemi);
-		const SHADOW_MAP_SIZE = 4096;
-		const key = new THREE.DirectionalLight(0xffffff, LIGHTING_DEFAULTS.key);
-		key.castShadow = true;
-		key.layers.enableAll();
-		key.shadow.mapSize.set(SHADOW_MAP_SIZE, SHADOW_MAP_SIZE);
-		key.shadow.bias = -0.0001;
-		scene.add(key, key.target);
-		const catcher = new THREE.Mesh(
-			new THREE.PlaneGeometry(1, 1),
-			new THREE.ShadowMaterial({
-				opacity: LIGHTING_DEFAULTS.shadow,
-				depthWrite: false,
-			}),
-		);
-		catcher.rotation.x = -Math.PI / 2;
-		catcher.receiveShadow = true;
-		catcher.renderOrder = -1;
-		scene.add(catcher);
-
-		const lightDir = new THREE.Vector3(4, 8, 6).normalize();
-		const center = new THREE.Vector3();
-		const dim = new THREE.Vector3();
-		let lastBox = null;
-		const state = { ...LIGHTING_DEFAULTS };
-
-		function fitShadow(box) {
-			const hasGeom = !!box && !box.isEmpty();
-			lastBox = hasGeom ? box : null;
-			if (hasGeom) {
-				box.getCenter(center);
-				box.getSize(dim);
-			} else {
-				center.set(0, 0, 0);
-				dim.set(20, 20, 20);
-			}
-			// Bounding-sphere radius (half the diagonal) so the ortho frustum
-			// encloses the whole scene, depth precision spent tightly on it.
-			const radius = Math.max(0.5, 0.5 * Math.hypot(dim.x, dim.y, dim.z));
-			const minY = hasGeom ? box.min.y : 0;
-			const dist = radius * 3;
-			key.position.copy(center).addScaledVector(lightDir, dist);
-			key.target.position.copy(center);
-			key.target.updateMatrixWorld();
-			const cam = key.shadow.camera;
-			const extent = radius * 1.05;
-			cam.left = -extent;
-			cam.right = extent;
-			cam.top = extent;
-			cam.bottom = -extent;
-			cam.near = Math.max(0.01, dist - radius * 1.1);
-			cam.far = dist + radius * 1.1;
-			cam.updateProjectionMatrix();
-			// Normal-offset bias scaled to the shadow texel's world size — the main
-			// defense against self-shadow acne, kept consistent across scene scales.
-			key.shadow.normalBias = ((2 * extent) / SHADOW_MAP_SIZE) * 2.0;
-			catcher.position.set(center.x, minY + radius * 0.003, center.z);
-			catcher.scale.set(radius * 6, radius * 6, 1);
-		}
-
-		function applyAngles() {
-			const az = THREE.MathUtils.degToRad(state.azimuth);
-			const el = THREE.MathUtils.degToRad(state.elevation);
-			const cosEl = Math.cos(el);
-			lightDir
-				.set(Math.sin(az) * cosEl, Math.sin(el), Math.cos(az) * cosEl)
-				.normalize();
-			fitShadow(lastBox);
-		}
-
-		function applyScalars() {
-			renderer.toneMappingExposure = state.exposure;
-			key.intensity = state.key;
-			hemi.intensity = state.fill;
-			scene.environmentIntensity = state.env;
-			catcher.material.opacity = state.shadow;
-			// Caster stays on; reception is gated through the shared uniform so
-			// toggling needs no shader recompile.
-			_forceReceiveShadow.value = state.shadows;
-			catcher.visible = state.shadows;
-		}
-
-		applyScalars();
-		fitShadow(null);
-
+		const rig = createLightRig(renderer, scene, {
+			catcher: true,
+			// The caster stays on; reception is gated through the shared uniform
+			// (below), so toggling shadows needs no shader recompile.
+			keepCasterOn: true,
+			decorateLights: ({ hemi, key }) => {
+				hemi.layers.enableAll(); // also light the OIT layer
+				key.layers.enableAll();
+			},
+			onShadows: (on) => {
+				_forceReceiveShadow.value = on;
+			},
+		});
 		return {
 			refit() {
 				const box = new THREE.Box3();
 				if (sceneRoot.children.length > 0) box.setFromObject(sceneRoot);
 				if (box.isEmpty())
 					for (const helper of bboxes.values()) box.union(helper.box);
-				fitShadow(box.isEmpty() ? null : box);
+				rig.refit(box.isEmpty() ? null : box);
 			},
-			setLighting(partial) {
-				Object.assign(state, partial);
-				applyScalars();
-				applyAngles();
-			},
-			getLighting: () => ({ ...state }),
+			setLighting: (partial) => rig.setLighting(partial),
+			getLighting: () => rig.getLighting(),
 		};
 	}
 

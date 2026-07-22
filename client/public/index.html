@@ -4062,6 +4062,11 @@
                 top: 12px;
                 left: 12px;
                 width: 244px;
+                /* Scroll when the stepper + view/sampler knobs outgrow the
+                   viewport; leave room for the help hint pinned at the bottom. */
+                max-height: calc(100% - 60px);
+                overflow-y: auto;
+                overscroll-behavior: contain;
                 padding: 10px 12px;
                 background: rgba(0, 0, 0, 0.62);
                 border: 1px solid var(--line);
