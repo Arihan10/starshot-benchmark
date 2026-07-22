@@ -2924,6 +2924,7 @@ def _write_stage5_transforms(out_dir: Path, plan: dict[str, Any], views: list[di
     splat_stage5.write_transforms(
         out_dir, K, resolution, float(intr["near"]), float(intr["far"]),
         splat_stage5.reference_frames(views),
+        lighting=splat_stage5.LIGHTING,
     )
 
 
@@ -2951,6 +2952,11 @@ async def _run_splat_stage5_cell(
         views = await asyncio.to_thread(splat_stage5.enumerate_views, plan)
         out_dir = _refs_dir(run, slot, model)
         (out_dir / splat_stage5.FRAMES_DIRNAME).mkdir(parents=True, exist_ok=True)
+        # Phase-1 lighting guard: if the recorded capture settings changed since the
+        # frames on disk were rendered (a different lighting / colour pipeline), drop
+        # them so this (resumed) session re-renders every view under one consistent
+        # lighting rather than mixing two (splat_stage5.reconcile_capture_meta).
+        await asyncio.to_thread(splat_stage5.reconcile_capture_meta, out_dir)
         pending = await asyncio.to_thread(splat_stage5.pending_views, out_dir, views)
         skipped = len(views) - len(pending)
         job["total"], job["done"] = len(views), skipped
@@ -3988,6 +3994,7 @@ def create_app() -> FastAPI:
             "far": state["far"],
             "fov_deg": state["fov_deg"],
             "background": list(splat_stage5.BACKGROUND_RGB),
+            "lighting": splat_stage5.LIGHTING,
             "cameras_url": _artifact_url(_cameras_path(run, slot, model)),
             "bundle_url": (
                 f"/slots/{quote(slot, safe='')}/{quote(model, safe='')}/meshes"

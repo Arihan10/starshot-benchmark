@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import time
@@ -154,10 +155,12 @@ def resolve_tier_dir(cell_dir: Path, override: Path | None = None) -> Path:
 
 
 def _compress_to_tmp(zstandard, src: Path) -> Path:
-    tmp = Path(tempfile.mkstemp(suffix=".zst")[1])
-    with src.open("rb") as fi, tmp.open("wb") as fo:
+    # Close the fd mkstemp opened (via os.fdopen) — a leaked handle blocks the
+    # later unlink on Windows (WinError 32); POSIX tolerates unlinking it.
+    fd, name = tempfile.mkstemp(suffix=".zst")
+    with os.fdopen(fd, "wb") as fo, src.open("rb") as fi:
         zstandard.ZstdCompressor(level=3).copy_stream(fi, fo)
-    return tmp
+    return Path(name)
 
 
 def _existing_cas_shas(vol: modal.Volume) -> set[str]:
@@ -234,8 +237,12 @@ def push_cell(
                 uploaded_bytes += p.stat().st_size
 
             def put_json(payload: Any, remote: str) -> None:
-                tmp = Path(tempfile.mkstemp(suffix=".json")[1])
-                tmp.write_text(json.dumps(payload, indent=1), encoding="utf-8")
+                # Close mkstemp's fd (see _compress_to_tmp) so the finally-unlink
+                # doesn't hit WinError 32 on Windows.
+                fd, name = tempfile.mkstemp(suffix=".json")
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(payload, f, indent=1)
+                tmp = Path(name)
                 tmp_files.append(tmp)
                 batch.put_file(tmp, remote)
 

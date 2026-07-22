@@ -121,6 +121,35 @@ _DEPTH_CODE_MAX = 65535   # uint16 max; code 0 == background
 # clear colour and anything compositing against the refs.
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
 
+# --- lighting (Phase 1: baked lighting) ----------------------------------------
+# The FIXED light rig every reference view is rendered with, mirrored from the
+# debug mesh viewer (client/public/js/scene3d.js) so the trained splat looks like
+# the mesh preview. It is deliberately constant and scene-independent: identical
+# for every view AND every session (the sun is placed per scene FROM these angles
+# at capture time), so a resumed render can never mix two lightings. `azimuth_deg`
+# / `elevation_deg` orient the sun (0° = +Z front, 90° = +X right; elevation above
+# the horizon). Colour is shaded in LINEAR light and encoded to sRGB through a
+# fixed ACES-filmic tone map at `exposure` — no auto-exposure — in splatcapture.js.
+LIGHTING: dict[str, Any] = {
+    "env": 0.35,            # image-based ambient (RoomEnvironment) intensity
+    "key": 3.5,             # sun (directional light) intensity
+    "fill": 0.2,            # hemisphere fill intensity
+    "azimuth_deg": 34.0,
+    "elevation_deg": 48.0,
+    "shadows": True,
+    "tone_mapping": "aces_filmic",
+    "exposure": 1.0,
+}
+
+# Bumped whenever the COLOUR PIPELINE itself changes (tone map / transfer / how
+# materials are shaded), so a reference set rendered by an older pipeline is
+# detected as stale even when `LIGHTING` is byte-identical.
+COLOR_PIPELINE = "linear-aces-srgb-v1"
+
+# Sidecar under a cell's refs/ recording the capture settings the on-disk frames
+# were rendered with, so a resume can detect a change (see `reconcile_capture_meta`).
+CAPTURE_META_NAME = "capture.json"
+
 
 # --- zstd (stdlib on Python 3.14+, else the `zstandard` package) ---------------
 
@@ -238,6 +267,48 @@ def pending_views(out_dir: Path, views: list[dict[str, Any]]) -> list[dict[str, 
     """The subset of `views` whose frames are not yet on disk — the work list a
     (possibly resumed) capture session renders."""
     return [v for v in views if not view_rendered(out_dir, v["id"])]
+
+
+def capture_meta() -> dict[str, Any]:
+    """The capture settings that fully determine every stored pixel (lighting,
+    background, colour pipeline) — recorded beside the frames so a resume can tell
+    whether the frames on disk were rendered under the SAME conditions."""
+    return {
+        "lighting": LIGHTING,
+        "background": list(BACKGROUND_RGB),
+        "color_pipeline": COLOR_PIPELINE,
+    }
+
+
+def reconcile_capture_meta(out_dir: Path) -> bool:
+    """Keep a refs dir's frames consistent with the CURRENT capture settings.
+
+    Reads the recorded `capture.json`; if it exists and differs from the current
+    settings — the lighting or the colour pipeline changed since those frames were
+    rendered — deletes the stale frames so the (resumed) render re-does every view
+    under one consistent lighting, then rewrites the record. Returns True when a
+    reset happened. A fresh dir (no record yet) just writes the record. This is
+    what makes "record the lighting so a resume stays consistent" actually hold."""
+    out_dir = Path(out_dir)
+    meta = capture_meta()
+    path = out_dir / CAPTURE_META_NAME
+    prev: Any = None
+    if path.is_file():
+        try:
+            prev = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            prev = None
+    reset = prev is not None and prev != meta
+    if reset:
+        import shutil
+
+        shutil.rmtree(out_dir / FRAMES_DIRNAME, ignore_errors=True)
+    if prev != meta:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(meta, indent=1), encoding="utf-8")
+        tmp.replace(path)
+    return reset
 
 
 # --- depth codec ---------------------------------------------------------------
@@ -414,18 +485,23 @@ def write_transforms(
     far: float,
     frames: list[dict[str, Any]],
     depth_encoding: str = DEPTH_ENCODING,
+    lighting: dict[str, Any] | None = None,
 ) -> Path:
     """Write `transforms.json`: shared pinhole intrinsics + per-frame OpenCV
     camera-to-world and SZF frame paths. `convention` is tagged so Stage 6 knows
     to take `viewmats = inv(transform_matrix)` (gsplat OpenCV), NOT the Nerfstudio
     OpenGL c2w; `frame_format` names the container; `depth` names the value
-    encoding (log-uint16 codes, decoded with `near`/`far`)."""
+    encoding (log-uint16 codes, decoded with `near`/`far`). `lighting` (when the
+    frames were rendered lit — Phase 1) records the fixed rig + tone map the
+    colour was baked with, so the provenance of the supervision is explicit and
+    later relighting phases can read it back; None tags the set as unlit albedo."""
     doc = {
         "camera_model": "pinhole",
         "convention": "opencv_c2w",     # transform_matrix is OpenCV camera-to-world
         "frame_format": FRAME_FORMAT,   # SZF container (zstd RGBA + depth codes)
         "depth": depth_encoding,        # gsplat render_mode D/ED value semantics
         "color_space": "srgb",
+        "lighting": lighting,           # fixed bake rig (Phase 1) or None (unlit albedo)
         "w": resolution,
         "h": resolution,
         "fl_x": float(K[0, 0]),
