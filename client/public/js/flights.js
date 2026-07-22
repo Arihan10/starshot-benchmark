@@ -147,6 +147,15 @@ function throughput(r) {
 	return `${(r.tokens_out / (r.flight_ms / 1000)).toFixed(1)} tok/s`;
 }
 
+// Per-call USD cost. Stored on the flight row for the token-priced compat
+// backends (Moonshot, Alibaba, …); null for OpenRouter calls, whose settled
+// cost lands in the event log (`llm.cost`) and shows in the cost tracker, not
+// the flight ledger — those read "--". Fine precision for the sub-cent norm.
+function fmtCost(v) {
+	if (v == null) return "--";
+	return v >= 1 ? `$${v.toFixed(2)}` : `$${v.toFixed(4)}`;
+}
+
 function prettyModel(id) {
 	if (!id) return "?";
 	const s = (id.includes("/") ? id.split("/").pop() : id)
@@ -873,7 +882,7 @@ export function initFlights() {
 				{ class: "flog-cards" },
 				card("Provider latency", fmtDur(r.flight_ms), "◷"),
 				card("Throughput", throughput(r), "⚡"),
-				card("Cost", "--", "$"),
+				card("Cost", fmtCost(r.cost), "$"),
 				card(
 					"Tokens",
 					r.tokens_in != null || r.tokens_out != null

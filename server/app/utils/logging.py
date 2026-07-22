@@ -252,6 +252,32 @@ class _LazyState(dict):
         return key == "events" or dict.__contains__(self, key)
 
 
+# cache.llm fields kept OUT of the in-memory event buffer. On a large scene these
+# (the rendered prompt context, the full variable set, the model's reasoning) are
+# ~98% of the log's bytes, and nothing in the running pipeline needs them resident:
+# the LLM cache matches on `key`, provenance + object-wipe read `output`, and
+# cross-model replay matches a stored `replay_key` (see cache.py). They stay inline
+# on disk (events.jsonl is untouched) and are read back by byte offset on demand
+# (`SlotLog.read_event_full`) when a client expands a call or the prompt lab
+# re-runs a step. `output` is deliberately KEPT — it's tiny and hot (cache hits +
+# the `emitted` id fold in `_slim_event`).
+_HEAVY_OFFLOAD = ("system", "user", "reasoning", "variables")
+
+
+def _slim_for_memory(event: dict[str, Any]) -> dict[str, Any]:
+    """The in-memory form of an event: for `cache.llm`, the heavy prompt / variables
+    / reasoning bytes are dropped (they live on disk, read on demand); every other
+    kind passes through unchanged. A light `has_variables` bool is kept so the
+    prompt lab can still tell which calls are re-renderable (they logged their
+    variables) without holding the variables themselves in RAM."""
+    if event.get("kind") != "cache.llm":
+        return event
+    slim = {k: v for k, v in event.items() if k not in _HEAVY_OFFLOAD}
+    if isinstance(event.get("variables"), dict):
+        slim["has_variables"] = True
+    return slim
+
+
 class SlotLog:
     """Owns state + disk + subscribers for one slot."""
 
@@ -268,6 +294,15 @@ class SlotLog:
         # on every log() event (hundreds per run × many parallel cells) was
         # blowing through macOS's default 256-fd soft limit.
         self._events_file: TextIO | None = None
+        # Byte offset of each event's line in events.jsonl, parallel to
+        # `state["events"]`, so the heavy bytes dropped from the in-memory (slim)
+        # event can be read back from disk by seeking (`read_event_full`). Built by
+        # the lazy load and kept in sync by log() / truncate / replace.
+        self._offsets: list[int] = []
+        self._byte_len: int = 0  # current on-disk size (the next append offset)
+        # Last time this cell was touched by an API request — the idle-unload sweep
+        # leaves recently-viewed cells loaded (see routes `_idle_unload_loop`).
+        self._touched: float = time.monotonic()
 
     def close(self) -> None:
         """Release the append handle (shutdown / cell reset)."""
@@ -281,7 +316,11 @@ class SlotLog:
     def _ensure_events_append(self) -> TextIO:
         if self._events_file is None or self._events_file.closed:
             self.events_path.parent.mkdir(parents=True, exist_ok=True)
-            self._events_file = self.events_path.open("a", encoding="utf-8")
+            # newline="" disables the platform newline translation (\n -> \r\n on
+            # Windows) so a written line's byte length matches our offset tracking —
+            # otherwise `read_event_full`'s seek would land mid-line and fall back to
+            # a full-file scan on every byte fetch.
+            self._events_file = self.events_path.open("a", encoding="utf-8", newline="")
         return self._events_file
 
     def _close_events_file(self) -> None:
@@ -296,28 +335,78 @@ class SlotLog:
         while the events stay unloaded."""
         self._close_events_file()
         self.state = _LazyState(self._load_events_from_disk)
+        self._offsets = []
+        self._byte_len = 0
         prompt, model = self._read_meta()
         self.state["prompt"] = prompt
         self.state["model"] = model
 
     def _load_events_from_disk(self) -> list[dict[str, Any]]:
-        """Parse the whole event log into memory — the lazy backing for
-        `state["events"]`, run at most once per cell (on first access)."""
+        """Parse the log into SLIM in-memory events (heavy bytes offloaded — see
+        `_slim_for_memory`) and record each line's byte offset so those bytes can be
+        read back on demand (`read_event_full`). Streams line-by-line, so even a
+        multi-GB log only ever holds one raw line plus the slim list in memory. Run
+        at most once per cell (on first access to `state["events"]`)."""
         events: list[dict[str, Any]] = []
+        offsets: list[int] = []
+        self._offsets = offsets
+        self._byte_len = 0
         if not self.events_path.exists():
             return events
-        with self.events_path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+        with self.events_path.open("rb") as f:
+            while True:
+                off = f.tell()
+                raw = f.readline()
+                if not raw:
+                    break
+                line = raw.strip()
                 if not line:
                     continue
                 try:
-                    events.append(json.loads(line))
+                    event = json.loads(line)
                 except json.JSONDecodeError:
                     _console.print(
                         f"[dim]\\[{self.slot_id}][/dim] [red]skipping malformed line in {self.events_path}[/red]"
                     )
+                    continue
+                offsets.append(off)
+                events.append(_slim_for_memory(event))
+        self._byte_len = self.events_path.stat().st_size
         return events
+
+    def read_event_full(self, index: int) -> dict[str, Any] | None:
+        """The FULL event at `index` (heavy bytes included), read from disk by byte
+        offset — the on-demand backing for the fields the in-memory buffer drops.
+        Falls back to a linear scan if the offset index is absent or stale (e.g. a
+        log rewritten by another path). Returns None when there's no such event."""
+        if not self._offsets and isinstance(self.state, _LazyState):
+            self.state["events"]  # trigger the lazy load, which builds `_offsets`
+        off = self._offsets[index] if 0 <= index < len(self._offsets) else None
+        if off is not None:
+            try:
+                with self.events_path.open("rb") as f:
+                    f.seek(off)
+                    raw = f.readline()
+                event = json.loads(raw)
+                if event.get("index") == index:
+                    return event
+            except (OSError, json.JSONDecodeError):
+                pass
+        try:
+            with self.events_path.open("rb") as f:
+                for raw in f:
+                    raw = raw.strip()
+                    if not raw:
+                        continue
+                    try:
+                        event = json.loads(raw)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("index") == index:
+                        return event
+        except OSError:
+            pass
+        return None
 
     def _read_meta(self) -> tuple[str | None, str | None]:
         """`(prompt, model)` from the first run.start — one line, so it's O(1)
@@ -361,17 +450,21 @@ class SlotLog:
             return True
 
     def truncate_events_to(self, n: int) -> int:
-        """Keep only the first `n` events on disk and in memory. Returns
-        the new length."""
+        """Keep only the first `n` events on disk and in memory. Returns the new
+        length. The file is truncated at the byte offset of line `n` — the kept
+        lines (with their full heavy bytes) are left byte-for-byte intact, rather
+        than rewritten from the slim in-memory buffer (which would drop them)."""
         self._close_events_file()
         n = max(0, min(n, len(self.state["events"])))
         self.state["events"] = self.state["events"][:n]
-        if n == 0:
+        cut = self._offsets[n] if n < len(self._offsets) else self._byte_len
+        self._offsets = self._offsets[:n]
+        self._byte_len = cut
+        if cut <= 0:
             self.events_path.write_text("")
         else:
-            with self.events_path.open("w", encoding="utf-8") as f:
-                for event in self.state["events"]:
-                    f.write(json.dumps(event) + "\n")
+            with self.events_path.open("r+b") as f:
+                f.truncate(cut)
         return n
 
     def replace_events(self, events: list[dict[str, Any]]) -> None:
@@ -386,19 +479,33 @@ class SlotLog:
         surviving line — which the client's `idx <= maxIndex` dedup then drops.
         """
         self._close_events_file()
-        for i, event in enumerate(events):
-            event["index"] = i
-        self.state["events"] = events
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.events_path.open("w", encoding="utf-8") as f:
-            for event in events:
-                f.write(json.dumps(event) + "\n")
+        offsets: list[int] = []
+        slim: list[dict[str, Any]] = []
+        byte_len = 0
+        # Callers pass FULL events (heavy bytes included); the disk log stays full
+        # while only the slim projection is kept resident, and offsets are rebuilt.
+        # newline="" keeps a line's byte length == our offset math (see
+        # _ensure_events_append) so the rebuilt offsets stay seek-accurate.
+        with self.events_path.open("w", encoding="utf-8", newline="") as f:
+            for i, event in enumerate(events):
+                event["index"] = i
+                line = json.dumps(event) + "\n"
+                offsets.append(byte_len)
+                f.write(line)
+                byte_len += len(line.encode("utf-8"))
+                slim.append(_slim_for_memory(event))
+        self._offsets = offsets
+        self._byte_len = byte_len
+        self.state["events"] = slim
 
     def start_run(self, prompt: str, model: str) -> None:
         self._close_events_file()
         self.state["prompt"] = prompt
         self.state["model"] = model
         self.state["events"] = []
+        self._offsets = []
+        self._byte_len = 0
         self.events_path.parent.mkdir(parents=True, exist_ok=True)
         self.events_path.write_text("")
         self.log("run.start", prompt=prompt, model=model)
@@ -418,13 +525,20 @@ class SlotLog:
             "kind": kind,
             **data,
         }
-        self.state["events"].append(event)
         f = self._ensure_events_append()
-        f.write(json.dumps(event) + "\n")
+        line = json.dumps(event) + "\n"
+        # Record this line's byte offset BEFORE writing so the heavy bytes we drop
+        # from the in-memory copy can be seeked back later; keep only the slim event
+        # resident. The disk line stays FULL (the cache/observability source).
+        self._offsets.append(self._byte_len)
+        f.write(line)
         f.flush()
+        self._byte_len += len(line.encode("utf-8"))
+        slim = _slim_for_memory(event)
+        self.state["events"].append(slim)
         _print(self.slot_id, event)
         for q in self.subscribers:
-            q.put_nowait(event)
+            q.put_nowait(slim)
 
     def append_unloaded(self, kind: str, index: int, **data: Any) -> dict[str, Any]:
         """Append ONE event to disk (and broadcast) at `index`, WITHOUT loading a

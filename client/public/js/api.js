@@ -243,25 +243,30 @@ export const api = {
 		),
 
 	// --- from-scratch generated assets (Nano-Banana + a mesh backend) ---
-	// The single generated build of a cell, built/regenerated alongside the
-	// library build and viewed by flipping `meshesUrl(..., { mode: "generated" })`.
-	// generate(): build/resume the whole scene's generated assets (409 if a build
-	// is already in flight). generateStatus(): whether a build/regen is running +
-	// the finished ids (each with its symmetry plane, served `url`, and the raw
-	// generation-API `raw` mesh url for the per-object view; plus each mesh's
-	// prefab `canonical`). regenerate/symmetrize/unsymmetrize act on ONE object's
-	// generated mesh; with propagate they apply to its whole prefab group.
-	// `unlink` splits the object out of its group into a standalone asset (its own
-	// raw, no rebuild); `link` moves it into another object's group. backend ∈
-	// {trellis, hunyuan, hunyuan-tencent}.
-	generate: (run, slot, model) =>
+	// VERSIONED: a cell can hold many independent generated builds (V1/V2/V3…),
+	// each fully isolated under `generated/<version>/`, built/regenerated alongside
+	// the library build and viewed by flipping `meshesUrl(..., { mode: "generated",
+	// version })`. Every call below takes an optional `version` (omit → the server
+	// resolves the latest; a pre-versioning build is folded into V1). NOTE: this is
+	// the GENERATED-ASSET version, distinct from the prompt-set `versions()` above.
+	// generate(): build/resume the selected version's assets (409 if that version's
+	// build is already in flight); `newVersion:true` mints + builds the next version.
+	// generateStatus(): whether a build/regen is running + the finished ids (each
+	// with its symmetry plane, served `url`, and the raw generation-API `raw` mesh
+	// url for the per-object view; plus each mesh's prefab `canonical`) + the full
+	// `versions` list and resolved `version`. regenerate/symmetrize/unsymmetrize act
+	// on ONE object's generated mesh; with propagate they apply to its whole prefab
+	// group. `unlink` splits the object out of its group into a standalone asset
+	// (its own raw, no rebuild); `link` moves it into another object's group.
+	// backend ∈ {trellis, hunyuan, hunyuan-tencent}.
+	generate: (run, slot, model, { version = null, newVersion = false } = {}) =>
 		request(cellPath(slot, model, "/generate"), {
 			method: "POST",
-			params: { run },
+			params: { run, version, new: newVersion ? true : undefined },
 		}),
-	generateStatus: (run, slot, model, { optimized = true } = {}) =>
+	generateStatus: (run, slot, model, { optimized = true, version = null } = {}) =>
 		request(cellPath(slot, model, "/generate"), {
-			params: { run, optimized: optimized ? 1 : 0 },
+			params: { run, optimized: optimized ? 1 : 0, version },
 		}),
 	regenerate: (
 		run,
@@ -273,6 +278,7 @@ export const api = {
 			propagate = true,
 			reuseImage = false,
 			regenNounPhrase = false,
+			version = null,
 		} = {},
 	) =>
 		request(
@@ -281,6 +287,7 @@ export const api = {
 				method: "POST",
 				params: {
 					run,
+					version,
 					backend,
 					propagate,
 					reuse_image: reuseImage,
@@ -292,35 +299,35 @@ export const api = {
 	// member of that group) so it shares the group's mesh — the inverse of
 	// `unlink`. Re-derives the object's mesh from the group canonical; no backend
 	// call.
-	link: (run, slot, model, nodeId, target, { group = false } = {}) =>
+	link: (run, slot, model, nodeId, target, { group = false, version = null } = {}) =>
 		request(cellPath(slot, model, `/link/${encodeURIComponent(nodeId)}`), {
 			method: "POST",
-			params: { run, target, group },
+			params: { run, version, target, group },
 		}),
 	// Split a generated object OUT of its prefab group into a standalone asset with
 	// its own copy of the shared raw mesh (the inverse of `link`), so it stops
 	// sharing and can then be regenerated alone. No backend call — a fast local
 	// re-derivation on the regen worker.
-	unlink: (run, slot, model, nodeId) =>
+	unlink: (run, slot, model, nodeId, { version = null } = {}) =>
 		request(cellPath(slot, model, `/unlink/${encodeURIComponent(nodeId)}`), {
 			method: "POST",
-			params: { run },
+			params: { run, version },
 		}),
 	symmetrize: (
 		run,
 		slot,
 		model,
 		nodeId,
-		{ plane = "xy", keepPositive = true, propagate = true } = {},
+		{ plane = "xy", keepPositive = true, propagate = true, version = null } = {},
 	) =>
 		request(
 			cellPath(slot, model, `/symmetrize/${encodeURIComponent(nodeId)}`),
 			{
 				method: "POST",
-				params: { run, plane, keep_positive: keepPositive, propagate },
+				params: { run, version, plane, keep_positive: keepPositive, propagate },
 			},
 		),
-	unsymmetrize: (run, slot, model, nodeId, { propagate = true } = {}) =>
+	unsymmetrize: (run, slot, model, nodeId, { propagate = true, version = null } = {}) =>
 		request(
 			cellPath(
 				slot,
@@ -329,7 +336,7 @@ export const api = {
 			),
 			{
 				method: "POST",
-				params: { run, propagate },
+				params: { run, version, propagate },
 			},
 		),
 	// Change an object's "front view" (which face points +Z in its raw mesh) by
@@ -340,31 +347,31 @@ export const api = {
 		slot,
 		model,
 		nodeId,
-		{ axis = "y", degrees = 90, propagate = true } = {},
+		{ axis = "y", degrees = 90, propagate = true, version = null } = {},
 	) =>
 		request(
 			cellPath(slot, model, `/reorient/${encodeURIComponent(nodeId)}`),
 			{
 				method: "POST",
-				params: { run, axis, degrees, propagate },
+				params: { run, version, axis, degrees, propagate },
 			},
 		),
 	// Force the window/glass transparency transform (white texels → near-clear)
 	// onto an object's served mesh, bypassing the pipeline's keyword + symmetry
 	// gates. Applies to the whole prefab group; dropped by a later regenerate/reset.
-	glassify: (run, slot, model, nodeId) =>
+	glassify: (run, slot, model, nodeId, { version = null } = {}) =>
 		request(
 			cellPath(slot, model, `/glassify/${encodeURIComponent(nodeId)}`),
-			{ method: "POST", params: { run } },
+			{ method: "POST", params: { run, version } },
 		),
 	// Rebuild an object's served mesh from its pristine raw, dropping any in-place
 	// served edit (e.g. a forced glassify) while keeping its current symmetry.
 	// Applies to the whole prefab group. (Named `resetMesh` so it doesn't collide
 	// with the cell-level `reset` above — they're distinct operations.)
-	resetMesh: (run, slot, model, nodeId) =>
+	resetMesh: (run, slot, model, nodeId, { version = null } = {}) =>
 		request(
 			cellPath(slot, model, `/reset-mesh/${encodeURIComponent(nodeId)}`),
-			{ method: "POST", params: { run } },
+			{ method: "POST", params: { run, version } },
 		),
 
 	// --- source cell data ---
@@ -376,15 +383,17 @@ export const api = {
 		}),
 	eventsUrl: (run, slot, model, { since } = {}) =>
 		u(cellPath(slot, model, "/events"), { run, since }).toString(),
-	//   mode="generated" streams the cell's from-scratch generated build instead
-	//     of the library objects/; optimized=false streams the raw bbox-fitted
-	//     Trellis mesh instead of the served KTX2/Meshopt twin.
-	meshesUrl: (run, slot, model, { untilIndex, mode, optimized } = {}) =>
+	//   mode="generated" streams one generated version of the cell instead of the
+	//     library objects/; `version` selects which build (omit → latest);
+	//     optimized=false streams the raw bbox-fitted Trellis mesh instead of the
+	//     served KTX2/Meshopt twin.
+	meshesUrl: (run, slot, model, { untilIndex, mode, optimized, version } = {}) =>
 		u(cellPath(slot, model, "/meshes"), {
 			run,
 			until_index: untilIndex,
 			mode,
 			optimized: optimized === false ? 0 : undefined,
+			version,
 		}).toString(),
 	// Full source-cell history backfill (cache.llm payloads included) from disk —
 	// used by compare/board/runcompare, which render call bytes inline.

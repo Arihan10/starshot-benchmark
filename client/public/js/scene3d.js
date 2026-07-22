@@ -172,12 +172,15 @@ function buildInspectorMaterial(sourceMat, spec) {
 	return mat;
 }
 
-export function createViewer(host, { keyboard = true, lighting = false } = {}) {
+export function createViewer(
+	host,
+	{ keyboard = true, lighting = false, maxPixelRatio = MAX_PIXEL_RATIO } = {},
+) {
 	const renderer = new THREE.WebGLRenderer({
 		antialias: true,
 		powerPreference: "high-performance",
 	});
-	renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO));
+	renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, maxPixelRatio));
 	renderer.setClearColor(0x101114);
 	// Physically-based tone mapping + shadows for the MAIN viewer only; the mini /
 	// compare viewers keep flat linear shading (lighting=false), so the engine
@@ -1578,7 +1581,11 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		);
 		hemi.layers.enableAll(); // also light the OIT layer
 		scene.add(hemi);
-		const SHADOW_MAP_SIZE = 4096;
+		// 2048² (~17 MB) rather than 4096² (~67 MB): a soft contact shadow spread
+		// over the whole scene doesn't need 4K, and on-demand shadow rendering means
+		// there's no temporal shimmer to betray the lower resolution. Bump back up
+		// here if you want crisper contact shadows at the cost of ~50 MB.
+		const SHADOW_MAP_SIZE = 2048;
 		const key = new THREE.DirectionalLight(0xffffff, LIGHTING_DEFAULTS.key);
 		key.castShadow = true;
 		key.layers.enableAll();
@@ -1676,6 +1683,14 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				applyAngles();
 			},
 			getLighting: () => ({ ...state }),
+			// Free the shadow map's GPU texture when the viewer is hidden. three
+			// re-creates it on the next shadow render — invalidateShadow (fired by
+			// setActive on re-show) re-arms needsUpdate — so a closed overlay stops
+			// holding ~17 MB of VRAM it isn't using.
+			releaseGPU() {
+				key.shadow.map?.dispose();
+				key.shadow.map = null;
+			},
 		};
 	}
 
@@ -1714,6 +1729,26 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		m.needsUpdate = true;
 	}
 
+	// Store generated normals as normalized int16 (2 B/component) instead of
+	// float32 (4). The optimized GLBs ship no normals (only int16 POSITION + uint16
+	// TEXCOORD_0), so we compute them — as float32 that buffer is the single
+	// LARGEST vertex attribute on a dense scene (bigger than the quantized
+	// positions), duplicated in both JS heap and VRAM. int16 halves it (~0.5 GB
+	// heap + ~0.5 GB VRAM saved on a ~100 M-vertex scene) and the shader normalizes
+	// per-fragment anyway, so there's no visible quality cost. Picking stays correct
+	// (raycast reads the attribute via fromBufferAttribute, which de-normalizes).
+	function quantizeNormalsInt16(geometry) {
+		const n = geometry.getAttribute("normal");
+		if (!n || !(n.array instanceof Float32Array)) return;
+		const src = n.array;
+		const q = new Int16Array(src.length);
+		for (let i = 0; i < src.length; i++) {
+			const v = src[i] < -1 ? -1 : src[i] > 1 ? 1 : src[i];
+			q[i] = (v * 32767 + (v >= 0 ? 0.5 : -0.5)) | 0; // fast round-to-nearest
+		}
+		geometry.setAttribute("normal", new THREE.BufferAttribute(q, 3, true));
+	}
+
 	// Every loaded GLB: double-sided (Trellis shells are often single-sided),
 	// shadow cast + receive, smooth normals computed when absent (generated meshes
 	// ship without them, which otherwise breaks shadow reception), and the
@@ -1727,6 +1762,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 			child.receiveShadow = true;
 			if (child.geometry && !child.geometry.getAttribute("normal")) {
 				child.geometry.computeVertexNormals();
+				quantizeNormalsInt16(child.geometry);
 			}
 			if (!child.material) return;
 			const mats = Array.isArray(child.material)
@@ -2165,7 +2201,7 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 		const w = host.clientWidth || 1;
 		const h = host.clientHeight || 1;
 		renderer.setPixelRatio(
-			Math.min(window.devicePixelRatio || 1, MAX_PIXEL_RATIO),
+			Math.min(window.devicePixelRatio || 1, maxPixelRatio),
 		);
 		renderer.setSize(w, h);
 		camera.aspect = w / h;
@@ -2552,10 +2588,17 @@ export function createViewer(host, { keyboard = true, lighting = false } = {}) {
 				setHovered(null);
 				tooltip.style.display = "none";
 				hideSpeedHud();
+				// Reclaim the big GPU allocations while hidden: the OIT render targets
+				// (~tens of MB at full size) and the shadow map. Both are lazily
+				// rebuilt on the next active frame (invalidateGeometry below re-arms
+				// them on re-show), so a closed overlay / off-screen tile stops
+				// holding VRAM it isn't drawing to.
+				disposeOITTargets();
+				lightingRig?.releaseGPU();
 			} else {
 				resize();
 				// Re-cast the shadow + rebuild the OIT set on the first shown frame,
-				// in case the scene changed (or the GL buffers were dropped) while hidden.
+				// in case the scene changed (or the GL buffers were freed) while hidden.
 				invalidateGeometry();
 			}
 		},

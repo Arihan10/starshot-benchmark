@@ -215,6 +215,18 @@ def next_object_specs(zone_id: str) -> list[Any]:
     return [spec for group in next_object_rounds(zone_id) for spec in group]
 
 
+def next_object_ids() -> set[str]:
+    """Every object id emitted by ANY zone's anchor-completion (`next_object`)
+    loop, run-wide — read from the committed `generation.next` events. Used by
+    the temporary context-cull patch (`app.pipeline.context_cull`) to drop the
+    'detail' tier from non-focus zones' scene context."""
+    return {
+        e["id"]
+        for e in logging.current_events()
+        if e.get("kind") == "generation.next" and isinstance(e.get("id"), str)
+    }
+
+
 def next_done(zone_id: str) -> bool:
     """True if the zone's anchor completion loop already TERMINATED — by any of
     its three exits:

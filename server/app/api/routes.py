@@ -29,6 +29,7 @@ import re
 import secrets
 import shutil
 import struct
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
 from collections.abc import AsyncIterator
@@ -99,9 +100,11 @@ RUN_META_NAME = "run.json"
 # Keyed by (run_name, slot_id, model_alias). Each cell is an independent
 # pipeline. Lazy-populated: only runs the user has activated are loaded.
 RunKey = tuple[str, str, str]
-# The from-scratch generated build of a cell keys its task tables on
-# (run, slot, model) — one build per cell, separate from the library build.
-GenKey = tuple[str, str, str]
+# The from-scratch generated build keys its task tables on
+# (run, slot, model, gen_version) — one build PER VERSION of a cell, separate from
+# the library build. A cell can hold many independent generated versions; each
+# builds / regenerates concurrently under its own key, log, and dirs.
+GenKey = tuple[str, str, str, str]
 _slot_logs: dict[RunKey, SlotLog] = {}
 _tasks: dict[RunKey, asyncio.Task[None]] = {}
 # Per-cell background "graceful pause" drainers (see /pause-soft): each waits for
@@ -331,6 +334,39 @@ async def _enforce_cap_for_log(slot_log: SlotLog) -> None:
         spend=_cell_spend(events),
         cap=_effective_cap(events),
     )
+
+
+# Idle-unload sweep: how often it runs, and how long a cell must go untouched (no
+# API access) before its in-memory events are dropped. Slim-in-memory already caps
+# a loaded cell at ~2% of its log; this is the secondary reclaim that returns even
+# that to disk once a cell has no open stream, no running work, and hasn't been
+# viewed for a while — so an idle server (all tabs closed) settles back near zero.
+_IDLE_UNLOAD_INTERVAL_S = 60
+_IDLE_UNLOAD_AFTER_S = 300
+
+
+async def _idle_unload_loop() -> None:
+    """Unload the event buffer of cells that are loaded but idle: no SSE subscriber,
+    no live pipeline task / step gate / draining soft-pause, and untouched for
+    `_IDLE_UNLOAD_AFTER_S`. `hydrate_from_disk` resets the SlotLog to lazy and the
+    next access re-parses from disk, so this is purely a memory reclaim. Branch logs
+    (short-lived, not in `_slot_logs`) are left alone."""
+    while True:
+        await asyncio.sleep(_IDLE_UNLOAD_INTERVAL_S)
+        try:
+            now = time.monotonic()
+            for key, sl in list(_slot_logs.items()):
+                if not sl.loaded or sl.subscribers:
+                    continue
+                if _live(_tasks.get(key)) or _live(_soft_pause_tasks.get(key)):
+                    continue
+                if _cell_gates.get(key) is not None:
+                    continue
+                if now - sl._touched < _IDLE_UNLOAD_AFTER_S:
+                    continue
+                sl.hydrate_from_disk()
+        except Exception:
+            pass  # a sweep fault must never kill the loop
 
 
 _cell_gates: dict[RunKey, "CellGate"] = {}
@@ -812,11 +848,28 @@ def _branch_run_id(run: str, branch_id: str) -> str:
     return f"{run}/{BRANCHES_SUBDIR}/{branch_id}"
 
 
-def _gen_slot_id(run: str, slot_id: str, model_alias: str) -> str:
-    """SlotLog id for a cell's generated build — used as the bound log's slot_id
-    and the Trellis queue key, so the generated build never collides with the
-    library build on either."""
-    return f"{_run_id(run, slot_id, model_alias)}::generated"
+def _gen_slot_id(run: str, slot_id: str, model_alias: str, version: str) -> str:
+    """SlotLog id for one generated VERSION of a cell — used as the bound log's
+    slot_id and the Trellis queue key, so the generated build never collides with
+    the library build, and each version's queue / SSE stream is isolated from the
+    others."""
+    return f"{_run_id(run, slot_id, model_alias)}::generated::v{version}"
+
+
+def _resolve_gen_version(
+    run_id: str, version: str | None = None, *, new: bool = False,
+) -> str:
+    """The generated version a request targets, after folding any pre-versioning
+    build into generated/1/ (the non-versioned back-compat path — idempotent, so
+    it's safe to call on every touch). `new` mints the next version; an explicit
+    `version` is honored; otherwise the latest existing, or "1" when the cell has
+    no generated build yet."""
+    generation.migrate_legacy_generated(RUNS_DIR, run_id)
+    if new:
+        return generation.next_generated_version(RUNS_DIR, run_id)
+    if version:
+        return str(version)
+    return generation.latest_generated_version(RUNS_DIR, run_id) or "1"
 
 
 # Parsed symmetry state per generated-events log, cached on the file's
@@ -1172,15 +1225,19 @@ def _require_step_event(
     events = slot_log.state["events"]
     if not (0 <= event_index < len(events)):
         raise HTTPException(status_code=400, detail="event_index out of range")
-    event = events[event_index]
-    if event.get("kind") != "cache.llm":
+    slim = events[event_index]
+    if slim.get("kind") != "cache.llm":
         raise HTTPException(status_code=400, detail="event is not an LLM call")
-    if event.get("template") != step:
+    if slim.get("template") != step:
         raise HTTPException(
             status_code=400,
-            detail=f"event is a {event.get('template') or event.get('step')!r} call, not {step!r}",
+            detail=f"event is a {slim.get('template') or slim.get('step')!r} call, not {step!r}",
         )
-    if not isinstance(event.get("variables"), dict):
+    # The in-memory event is slim (prompt/variables bytes offloaded); read the FULL
+    # event from disk — the prompt lab re-run needs its logged `variables` (and the
+    # callers return its system/user/output/reasoning).
+    event = slot_log.read_event_full(event_index)
+    if event is None or not isinstance(event.get("variables"), dict):
         raise HTTPException(
             status_code=409,
             detail="event predates variable logging — re-run the cell to make it testable",
@@ -1610,16 +1667,21 @@ def create_app() -> FastAPI:
         # Poll live cells against their spend cap independently of the cost sweep,
         # so token-priced (compat) spend enforces the cap too.
         cap_task = asyncio.create_task(_cap_enforce_loop())
+        # Return idle cells' in-memory event buffers to disk (see _idle_unload_loop).
+        idle_task = asyncio.create_task(_idle_unload_loop())
         try:
             yield
         finally:
             rlog.suppress_console()
             cost_task.cancel()
             cap_task.cancel()
+            idle_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cost_task
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await cap_task
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await idle_task
             for slot_log in _slot_logs.values():
                 slot_log.close()
             for run_name, slot_id, model_alias in list(_slot_logs.keys()):
@@ -1971,7 +2033,7 @@ def create_app() -> FastAPI:
             for e in slot_log.state["events"]:
                 if e.get("kind") != "cache.llm" or e.get("template") != step:
                     continue
-                if not isinstance(e.get("variables"), dict):
+                if not e.get("has_variables"):  # slim marker (variables live on disk)
                     continue
                 output = json.dumps(e.get("output"), ensure_ascii=False)
                 items.append(
@@ -2051,6 +2113,10 @@ def create_app() -> FastAPI:
         if match is None:
             where = f"{step} @ {node}" if node else step
             raise HTTPException(status_code=404, detail=f"the branch has not re-run {where} yet")
+        # system/user/reasoning are offloaded from the slim in-memory event — read
+        # the full event from disk by index for them (light fields stay from `match`).
+        idx = match.get("index")
+        full = (br.log.read_event_full(idx) if isinstance(idx, int) else None) or match
         return {
             "branch": branch_id,
             "slot": br.slot,
@@ -2059,10 +2125,10 @@ def create_app() -> FastAPI:
             "index": match.get("index"),
             "node": match.get("node"),
             "model_id": match.get("model"),
-            "system": match.get("system"),
-            "user": match.get("user"),
-            "output": match.get("output"),
-            "reasoning": match.get("reasoning"),
+            "system": full.get("system"),
+            "user": full.get("user"),
+            "output": full.get("output"),
+            "reasoning": full.get("reasoning"),
             "tokens_in": match.get("tokens_in"),
             "tokens_out": match.get("tokens_out"),
         }
@@ -2289,7 +2355,7 @@ def create_app() -> FastAPI:
         return _scene_projection(events)
 
     @app.get("/slots/{slot_id}/{model_alias}/meshes")
-    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
+    async def slot_meshes(slot_id: str, model_alias: str, run: str | None = None, until_index: int | None = None, mode: str | None = None, optimized: bool = True, version: str | None = None) -> StreamingResponse:  # pyright: ignore[reportUnusedFunction]
         # One-request scene bundle: stream every finished GLB for this cell in
         # a single length-prefixed response so the client loads a whole scene
         # over one connection instead of one HTTP request per mesh (browsers
@@ -2303,11 +2369,13 @@ def create_app() -> FastAPI:
         # committed BEFORE that event — paired with /scene?until_index for the
         # compare view's "previous" pane (the original's meshes at the fork).
         #
-        # `mode=generated` streams the cell's from-scratch generated build instead
-        # of the library `objects/` — the OPTIMIZED twin (decimated + KTX2 +
-        # Meshopt) by default, the raw bbox-fitted Trellis mesh when `optimized=0`
-        # (the client's side-by-side comparison). _mesh_bundle skips the
-        # `<id>.raw.glb` intermediates, so either dir streams the finished set.
+        # `mode=generated` streams one generated `version` of the cell instead of
+        # the library `objects/` — the OPTIMIZED twin (decimated + KTX2 + Meshopt)
+        # by default, the raw bbox-fitted Trellis mesh when `optimized=0` (the
+        # client's side-by-side comparison). `version` selects which build (the
+        # latest when omitted; a pre-versioning build is folded into v1 first).
+        # _mesh_bundle skips the `<id>.raw.glb` intermediates, so either dir streams
+        # the finished set.
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         cell_dir = slot_log.events_path.parent
@@ -2316,7 +2384,8 @@ def create_app() -> FastAPI:
             events = events[:until_index]
         if mode == "generated":
             rid = _run_id(run, slot_id, model_alias)
-            objects_dir = generation.latest_generated_dirs(RUNS_DIR, rid)[1 if optimized else 0]
+            gen_version = _resolve_gen_version(rid, version)
+            objects_dir = generation.generated_dirs(RUNS_DIR, rid, gen_version)[1 if optimized else 0]
         else:
             objects_dir = _objects_dir(cell_dir)
         return StreamingResponse(
@@ -2584,24 +2653,33 @@ def create_app() -> FastAPI:
         slot_id: str,
         model_alias: str,
         run: str | None = None,
+        version: str | None = None,
+        new: bool = False,
     ) -> dict[str, object]:
         """The generate gate: build from-scratch (Nano-Banana + a mesh backend)
-        assets for this cell's single generated build (`objects-generated/`),
-        reusing the library build's layout — every object's existing
-        bbox/orientation — so the client's "generated" view is an apples-to-apples
-        swap of matched assets for freshly generated ones.
+        assets for ONE generated `version` of this cell
+        (`generated/<version>/objects-generated/`), reusing the library build's
+        layout — every object's existing bbox/orientation — so the client's
+        "generated" view is an apples-to-apples swap of matched assets for freshly
+        generated ones.
 
-        Resumes in place: meshes already on disk are skipped and bookkeeping lands
-        in events.generated.jsonl. Only one build per cell at a time; re-pressing
-        while it's in flight returns 409 (the gate). The library build (objects/ +
-        events.jsonl) is never touched."""
+        Version selection: `new=true` mints the next version (V1, V2, V3 …) and
+        builds it fresh; an explicit `version` builds/resumes that one; omitting
+        both builds/resumes the latest (a pre-versioning build is folded into V1
+        first). Each version is fully isolated (own dirs + `events.generated.jsonl`).
+
+        Resumes in place: meshes already on disk for the version are skipped and
+        bookkeeping lands in that version's log. Only one build per version at a
+        time; re-pressing while it's in flight returns 409 (the gate). The library
+        build (objects/ + events.jsonl) is never touched."""
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
         run_id = _run_id(run, slot.id, model_alias)
-        generation.generated_dirs(RUNS_DIR, run_id)[0].mkdir(parents=True, exist_ok=True)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(run_id, version, new=new)
+        generation.generated_dirs(RUNS_DIR, run_id, gen_version)[0].mkdir(parents=True, exist_ok=True)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         in_flight = _generate_tasks.get(key)
         if in_flight is not None and not in_flight.done():
             raise HTTPException(status_code=409, detail="generation already running")
@@ -2619,12 +2697,12 @@ def create_app() -> FastAPI:
                 detail="no scene to generate from; build the library scene first",
             )
 
-        # Dedicated generated-build log for resumable bookkeeping (nano_banana /
-        # threed require a bound SlotLog). Kept apart from the library log so the
-        # asset toggle stays a pure folder switch and the library stream is untouched.
+        # Dedicated per-version log for resumable bookkeeping (nano_banana / threed
+        # require a bound SlotLog). Kept apart from the library log so the asset
+        # toggle stays a pure folder switch and the library stream is untouched.
         gen_log = SlotLog(
-            _gen_slot_id(run, slot.id, model_alias),
-            generation.generated_events_path(RUNS_DIR, run_id),
+            _gen_slot_id(run, slot.id, model_alias, gen_version),
+            generation.generated_events_path(RUNS_DIR, run_id, gen_version),
         )
         gen_log.hydrate_from_disk()
 
@@ -2632,11 +2710,14 @@ def create_app() -> FastAPI:
             prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
             rlog.bind(gen_log)
             try:
-                # Prefab grouping lives in the generated build's log; the library
-                # build never groups (it matches an asset per object as built).
-                decisions = await generation.ensure_scene_prefab_groups(nodes=nodes, run_id=run_id)
+                # Prefab grouping lives in this version's log; the library build
+                # never groups (it matches an asset per object as built).
+                decisions = await generation.ensure_scene_prefab_groups(
+                    nodes=nodes, run_id=run_id, version=gen_version,
+                )
                 await generation.generate_assets(
                     nodes=nodes, decisions=decisions, runs_dir=RUNS_DIR, run_id=run_id,
+                    version=gen_version,
                 )
             finally:
                 gen_log.close()
@@ -2646,6 +2727,8 @@ def create_app() -> FastAPI:
             "run": run,
             "slot_id": slot.id,
             "model": model_alias,
+            "version": gen_version,
+            "versions": generation.list_generated_versions(RUNS_DIR, run_id),
             "nodes": len(nodes),
         }
 
@@ -2655,15 +2738,22 @@ def create_app() -> FastAPI:
         model_alias: str,
         run: str | None = None,
         optimized: bool = True,
+        version: str | None = None,
     ) -> dict[str, object]:
-        """Gate state for the client: whether a build/regen is in flight for this
-        cell's generated build and the ids of its finished GLBs. Polled while the
-        "generated" view is active so the client can enable/disable the gate and
-        attach freshly-built meshes one by one as they land."""
+        """Gate state for the client: whether a build/regen is in flight for one
+        generated `version` of this cell and the ids of its finished GLBs. Polled
+        while the "generated" view is active so the client can enable/disable the
+        gate and attach freshly-built meshes one by one as they land. `version`
+        selects which build to report (the latest when omitted; a pre-versioning
+        build is folded into V1 first). The response also carries the full
+        `versions` list + resolved `version` so the client's version selector can
+        populate without a second call."""
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
         rid = _run_id(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(rid, version)
+        versions = generation.list_generated_versions(RUNS_DIR, rid)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         gen_task = _generate_tasks.get(key)
         regen_task = _regen_tasks.get(key)
         regen_queue = _regen_queues.get(key)
@@ -2679,14 +2769,14 @@ def create_app() -> FastAPI:
         # `sym`/`symWas` — the asset's current symmetry plane (none/xy/xz) and, if
         # since un-symmetrized, the plane it used to be mirrored across — so the
         # detail panel tells mirrored / un-symmetrized / never-symmetrized apart.
-        gen_events_path = generation.latest_generated_events_path(RUNS_DIR, rid)
+        gen_events_path = generation.generated_events_path(RUNS_DIR, rid, gen_version)
         sym_map = _generated_symmetry(gen_events_path)
         # node id -> its prefab canonical, so each mesh carries its group. The
         # client buckets meshes by `canonical` to show group membership and offer
         # link / unlink on a single object.
         canonical_of = _generated_prefab(gen_events_path)
         image_prompts = _generated_image_prompts(gen_events_path)
-        raw_dir, opt_dir = generation.latest_generated_dirs(RUNS_DIR, rid)
+        raw_dir, opt_dir = generation.generated_dirs(RUNS_DIR, rid, gen_version)
         gen_dir = opt_dir if optimized else raw_dir
 
         def _variant(path: Path) -> tuple[str, int] | None:
@@ -2753,7 +2843,7 @@ def create_app() -> FastAPI:
         # backend) or still queued in this cell's regen worker (not yet dequeued).
         # The client disables per-object actions on these ids so the user can't
         # double-enqueue a node that's already in flight.
-        gen_slot_id = _gen_slot_id(run, slot_id, model_alias)
+        gen_slot_id = _gen_slot_id(run, slot_id, model_alias, gen_version)
         busy: set[str] = threed.inflight_ids(gen_slot_id)
         if regen_queue is not None:
             for job in list(regen_queue._queue):  # type: ignore[attr-defined]
@@ -2764,6 +2854,8 @@ def create_app() -> FastAPI:
             "ids": ids,
             "meshes": meshes,
             "busy": sorted(busy),
+            "version": gen_version,
+            "versions": versions,
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/regenerate/{node_id}")
@@ -2772,6 +2864,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         propagate: bool = False,
         backend: str = "trellis",
         reuse_image: bool = False,
@@ -2800,7 +2893,8 @@ def create_app() -> FastAPI:
         if backend not in generation.MESH_BACKENDS:
             raise HTTPException(status_code=400, detail=f"unknown backend: {backend}")
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         # A whole-scene generate of this version may be in flight — that's allowed
         # now. The regen and the scene build serialize per-node via
         # generation.node_lock (see _regen_worker), so they never write the same
@@ -2817,7 +2911,7 @@ def create_app() -> FastAPI:
         # Regenerating the noun phrase means a fresh image distilled from it, so a
         # reuse-image request can't also apply — the new phrase needs a new image.
         reuse_image = reuse_image and not regen_noun_phrase
-        gen_slot_id = _gen_slot_id(run, slot.id, model_alias)
+        gen_slot_id = _gen_slot_id(run, slot.id, model_alias, gen_version)
         queue = _regen_queues.setdefault(key, asyncio.Queue())
         queue.put_nowait(RegenJob(
             node_id=node_id, op="regenerate", propagate=propagate,
@@ -2831,7 +2925,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -2850,6 +2944,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         propagate: bool = True,
     ) -> dict[str, object]:
         """Reveal a GENERATED asset's full, un-mirrored mesh: reprocess its existing
@@ -2865,7 +2960,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -2880,7 +2976,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -2899,6 +2995,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         plane: str = "xy",
         keep_positive: bool = True,
         propagate: bool = True,
@@ -2920,7 +3017,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -2937,7 +3035,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -2958,6 +3056,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
         axis: str = "y",
         degrees: int = 90,
         propagate: bool = True,
@@ -2981,7 +3080,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -2997,7 +3097,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -3018,6 +3118,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
         """Force the window/glass transparency transform onto a generated object,
         bypassing the pipeline's keyword + symmetry gates. Bakes per-texel
@@ -3034,7 +3135,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -3048,7 +3150,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -3066,6 +3168,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
         """Rebuild a GENERATED object's served mesh from its pristine raw Trellis
         output, dropping any in-place served edit (notably a forced glassify) while
@@ -3081,7 +3184,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -3095,7 +3199,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -3114,6 +3218,7 @@ def create_app() -> FastAPI:
         node_id: str,
         target: str,
         run: str | None = None,
+        version: str | None = None,
         group: bool = False,
     ) -> dict[str, object]:
         """Link a GENERATED asset INTO another object's prefab group, so it shares
@@ -3134,7 +3239,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -3149,7 +3255,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -3169,6 +3275,7 @@ def create_app() -> FastAPI:
         model_alias: str,
         node_id: str,
         run: str | None = None,
+        version: str | None = None,
     ) -> dict[str, object]:
         """Split a GENERATED asset OUT of its prefab group into a STANDALONE asset
         with its OWN raw mesh — the inverse of `link` — WITHOUT rebuilding it. A
@@ -3184,7 +3291,8 @@ def create_app() -> FastAPI:
         slot = _require_slot(slot_id)
         _require_model(model_alias)
         lib_log = _require_slot_log(run, slot_id, model_alias)
-        key: GenKey = (run, slot_id, model_alias)
+        gen_version = _resolve_gen_version(_run_id(run, slot.id, model_alias), version)
+        key: GenKey = (run, slot_id, model_alias, gen_version)
         prompt_store.bind(prompt_store.load_run_prompts(_run_dir(run)))
         if _reconstruct_node(lib_log, node_id) is None:
             raise HTTPException(
@@ -3195,7 +3303,7 @@ def create_app() -> FastAPI:
         worker = _regen_tasks.get(key)
         if worker is None or worker.done():
             _regen_tasks[key] = asyncio.create_task(
-                _regen_worker(run, slot.id, model_alias)
+                _regen_worker(run, slot.id, model_alias, gen_version)
             )
         return {
             "run": run,
@@ -3821,7 +3929,7 @@ def create_app() -> FastAPI:
             cut_step: str | None = None
             for i, e in enumerate(events):
                 if (e.get("kind") == "cache.llm" and e.get("template") in steps
-                        and isinstance(e.get("variables"), dict)):
+                        and e.get("has_variables")):  # slim marker (variables on disk)
                     cut = i
                     cut_step = str(e.get("template"))
                     break
@@ -4592,6 +4700,9 @@ def _require_slot_log(run: str, slot_id: str, model_alias: str) -> SlotLog:
             status_code=404,
             detail=f"no run for run={run} slot={slot_id} model={model_alias}",
         )
+    # Mark active use so the idle-unload sweep leaves a cell the user is currently
+    # viewing/operating on loaded (it only reclaims cells idle for a while).
+    log._touched = time.monotonic()
     return log
 
 
@@ -4898,24 +5009,38 @@ async def _fork_branch(
     # Prefix = source events BEFORE the fork. Dropping that call (and everything
     # after) means `committed.*` replays the prefix and the pipeline re-reaches
     # it with the (snapshot + overrides) templates.
-    branch_events = [dict(e) for e in src_events[:event_index]]
-    # A CHILD fork copies the PARENT branch's log; repoint the parent's object
-    # URLs at the child's own dir (the parent's committed meshes are hardlinked
-    # into it just above), so the child — and any sim KEPT from it — stays
-    # self-referential after the parent is discarded. Inductively, a child only
-    # ever carries its-own-dir + source-cell URLs (source points at the live
-    # cell and needs no rewrite), so a later commit/save needs just one rewrite.
-    if parent is not None:
+    bevents = bdir / "events.jsonl"
+    if parent is None:
+        # SOURCE fork: byte-copy the committed prefix straight from the source log
+        # so the branch keeps the FULL heavy bytes (writing the slim in-memory copy
+        # would drop system/user/variables/reasoning). Chunked, so even a large
+        # prefix never materializes in memory. A source fork needs no URL rewrite.
+        cut = (src_log._offsets[event_index]
+               if event_index < len(src_log._offsets) else src_log._byte_len)
+        with src_log.events_path.open("rb") as fin, bevents.open("wb") as fout:
+            remaining = cut
+            while remaining > 0:
+                chunk = fin.read(min(remaining, 1 << 20))
+                if not chunk:
+                    break
+                fout.write(chunk)
+                remaining -= len(chunk)
+    else:
+        # CHILD fork (branch-of-branch): repoint the parent branch's object URLs at
+        # this child's dir (its committed meshes were hardlinked in above) so the
+        # child stays self-referential after the parent is discarded, then write the
+        # prefix. The copied cache.llm rows are slim — fine: the branch replays via
+        # `replay_key` + `output`, both kept in the slim event.
+        branch_events = [dict(e) for e in src_events[:event_index]]
         seg = f"/{BRANCHES_SUBDIR}/{parent}/objects/"
         dest_seg = f"/{BRANCHES_SUBDIR}/{bid}/objects/"
         for e in branch_events:
             url = e.get("url")
             if isinstance(url, str) and seg in url:
                 e["url"] = url.replace(seg, dest_seg)
-    bevents = bdir / "events.jsonl"
-    with bevents.open("w", encoding="utf-8") as f:
-        for e in branch_events:
-            f.write(json.dumps(e) + "\n")
+        with bevents.open("w", encoding="utf-8") as f:
+            for e in branch_events:
+                f.write(json.dumps(e) + "\n")
 
     blog = SlotLog(_branch_run_id(run, bid), bevents)
     blog.hydrate_from_disk()
@@ -4926,6 +5051,11 @@ async def _fork_branch(
         blog.log(
             "cache.llm",
             key=cache_hash_for_seed(event, seed),
+            # Model-independent replay key (matches llm.py's cache.llm writes) so the
+            # seed replays across a model swap without system/user resident.
+            replay_key=cache.hash_llm_replay_key(
+                system=seed.system, user=seed.user, schema_name=str(event.get("schema") or ""),
+            ),
             node=event.get("node"),
             step=event.get("step"),
             template=step,
@@ -5242,14 +5372,10 @@ def _slim_event(event: dict[str, object]) -> dict[str, object]:
 
 def _event_bytes(slot_log: SlotLog, index: int) -> dict[str, object]:
     """The heavy bytes for ONE event (system/user/output/reasoning/variables +
-    schema), fetched on demand when a call row is expanded. Read from the in-memory
-    log by index (events keep `index == list position`, with a scan fallback)."""
-    events = slot_log.state["events"]
-    e: dict[str, object] | None = None
-    if 0 <= index < len(events) and events[index].get("index") == index:
-        e = events[index]
-    else:
-        e = next((x for x in events if x.get("index") == index), None)
+    schema), fetched on demand when a call row is expanded. Read FROM DISK by byte
+    offset — the in-memory buffer keeps only the slim event (the heavy prompt /
+    variables / reasoning bytes are offloaded; see `logging._HEAVY_OFFLOAD`)."""
+    e = slot_log.read_event_full(index)
     if e is None:
         raise HTTPException(status_code=404, detail=f"no event at index {index}")
     return {k: e.get(k) for k in ("system", "user", "output", "reasoning", "variables", "schema")}
@@ -5299,9 +5425,9 @@ async def _sse(
 _REGEN_POLL_INTERVAL_S = 0.25
 
 
-async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
-    """Drain the cell's generated-build regeneration queue CONCURRENTLY. The worker
-    owns the generated-events log for the whole drain; `SlotLog.log()` is
+async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) -> None:
+    """Drain ONE generated `version`'s regeneration queue CONCURRENTLY. The worker
+    owns that version's generated-events log for the whole drain; `SlotLog.log()` is
     synchronous, so concurrent items append through it atomically (unique indices,
     no torn lines). Items run in parallel ACROSS prefab groups but are serialized
     WITHIN a group by a per-canonical lock — so two regens that resolve to the same
@@ -5312,15 +5438,15 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
     empty and nothing is in flight; the next enqueue restarts it. Cancellation
     (reset / stop / teardown) cancels in-flight builds and clears any still-queued
     rows from the shared Trellis queue panel."""
-    key: GenKey = (run, slot_id, model_alias)
+    key: GenKey = (run, slot_id, model_alias, version)
     queue = _regen_queues.get(key)
     if queue is None:
         return
     lib_log = _slot_logs.get((run, slot_id, model_alias))
     run_id = _run_id(run, slot_id, model_alias)
-    gen_slot_id = _gen_slot_id(run, slot_id, model_alias)
-    raw_subdir = generation.GENERATED_RAW_SUBDIR
-    gen_log = SlotLog(gen_slot_id, generation.generated_events_path(RUNS_DIR, run_id))
+    gen_slot_id = _gen_slot_id(run, slot_id, model_alias, version)
+    raw_subdir = f"{generation.GENERATED_DIR}/{version}/{generation.GENERATED_RAW_SUBDIR}"
+    gen_log = SlotLog(gen_slot_id, generation.generated_events_path(RUNS_DIR, run_id, version))
     gen_log.hydrate_from_disk()
     rlog.bind(gen_log)
     llm.set_model(MODELS[model_alias])
@@ -5356,7 +5482,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
             return
         new_canon = reuse_ids[0]
         await generation.clone_canonical_raw(
-            runs_dir=RUNS_DIR, run_id=run_id, source_id=node_id, dest_id=new_canon,
+            runs_dir=RUNS_DIR, run_id=run_id, version=version, source_id=node_id, dest_id=new_canon,
         )
         _carry_symmetry(node_id, new_canon)
         new_node = _reconstruct_node(lib_log, new_canon)
@@ -5385,7 +5511,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
         canonical_id, reuse_ids = prefabs.resolve_group(gen_log.state["events"], node_id)
         if canonical_id != node_id:
             await generation.clone_canonical_raw(
-                runs_dir=RUNS_DIR, run_id=run_id, source_id=canonical_id, dest_id=node_id,
+                runs_dir=RUNS_DIR, run_id=run_id, version=version, source_id=canonical_id, dest_id=node_id,
             )
             _carry_symmetry(canonical_id, node_id)
             gen_log.log("prefab.match", id=node_id, reuse_id="", description=node.prompt)
@@ -5436,7 +5562,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                 )
             await generation.propagate_reuses(
                 canonical_id=dest_canonical, reuses=movers,
-                runs_dir=RUNS_DIR, run_id=run_id,
+                runs_dir=RUNS_DIR, run_id=run_id, version=version,
             )
 
     async def _process(job: RegenJob) -> None:
@@ -5482,7 +5608,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # canonical is un-mirrored here; propagate re-derives its reuses
                     # below, which read the canonical's now-`none` symmetry.applied.
                     await generation.unsymmetrize_one(
-                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "symmetrize":
                     # Mirror the existing mesh across the caller-supplied plane (no
@@ -5492,7 +5618,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     cut_plane, keep_positive = job.sym  # type: ignore[misc]
                     await generation.symmetrize_one(
                         node=build_node, cut_plane=cut_plane, keep_positive=keep_positive,  # type: ignore[arg-type]
-                        runs_dir=RUNS_DIR, run_id=run_id,
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "reorient":
                     # Re-front the canonical's raw mesh (rotate which face is +Z);
@@ -5501,7 +5627,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     rax, rdeg = job.reorient  # type: ignore[misc]
                     await generation.reorient_one(
                         node=build_node, axis=rax, degrees=rdeg,  # type: ignore[arg-type]
-                        runs_dir=RUNS_DIR, run_id=run_id,
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "reset":
                     # Rebuild the canonical's served mesh from its pristine raw
@@ -5509,7 +5635,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # reuses below from that same clean raw, so the whole group
                     # reverts together.
                     await generation.reset_from_raw_one(
-                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
+                        node=build_node, runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif op == "glassify":
                     # Force the glass-transparency transform onto the WHOLE prefab
@@ -5517,7 +5643,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # from the shared raw, so apply it to the canonical AND every
                     # reuse directly here and SKIP the raw-replay propagate below.
                     await generation.glassify_group(
-                        nodes=[build_node, *reuses], runs_dir=RUNS_DIR, run_id=run_id,
+                        nodes=[build_node, *reuses], runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 else:
                     if job.reuse_image:
@@ -5527,7 +5653,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                         # prefab sibling still has it), restore it so we reuse the
                         # image instead of re-generating it via the API.
                         generation.recover_group_image(
-                            RUNS_DIR, run_id, build_node.id, [canonical_id, *reuse_ids],
+                            RUNS_DIR, run_id, version, build_node.id, [canonical_id, *reuse_ids],
                         )
                     # Regenerate-noun-phrase: re-distill from the build node's
                     # AUTHORED seed (the library log's bbox prompt), not its current
@@ -5551,7 +5677,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                         )
                     await generation.regenerate_one(
                         node=build_node, runs_dir=RUNS_DIR, run_id=run_id,
-                        subdir=raw_subdir, optimize=True, backend=job.backend, generated=True,
+                        subdir=raw_subdir, optimize=True, backend=job.backend, version=version,
                         reuse_image=job.reuse_image,
                         regen_noun_phrase=job.regen_noun_phrase, seed_prompt=seed_prompt,
                         scene_zone=scene_zone, scene_nodes=scene_nodes,
@@ -5562,7 +5688,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str) -> None:
                     # propagate_reuses replays, so it must not run here.
                     await generation.propagate_reuses(
                         canonical_id=canonical_id, reuses=reuses,
-                        runs_dir=RUNS_DIR, run_id=run_id,
+                        runs_dir=RUNS_DIR, run_id=run_id, version=version,
                     )
                 elif canonical_id != node_id and op not in ("unsymmetrize", "symmetrize", "reorient", "glassify", "reset"):
                     # A reuse regenerated on its own now owns a fresh mesh + raw —

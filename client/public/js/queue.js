@@ -10,36 +10,75 @@
 // where a mesh queue is just noise. It keeps polling while hidden, so the count
 // is already current the moment the overlay opens. Horizontally it's pinned just
 // left of the observability dock (see syncPosition below) so it never overlaps
-// the obs tree / investigator.
+// the obs tree / investigator. Tuck it off-screen via the ▼ control (or the
+// bottom pull tab when tucked) — preference persists in localStorage.
 
 import { api } from "./api.js";
 import { el } from "./ui.js";
 
 const OPEN_KEY = "starshot.queueOpen";
+const DOCKED_KEY = "starshot.queueDocked";
 const POLL_BUSY_MS = 1500; // while anything is in flight
 const POLL_IDLE_MS = 5000; // empty queue — a slow background heartbeat
 
 export function initQueuePanel() {
 	let open = false;
+	let docked = true;
 	try {
 		open = localStorage.getItem(OPEN_KEY) === "1";
+		const dockedRaw = localStorage.getItem(DOCKED_KEY);
+		docked = dockedRaw == null ? !open : dockedRaw === "1";
 	} catch {
 		/* private mode */
 	}
 
 	const countEl = el("span", { class: "q-count" });
+	const tabCountEl = el("span", { class: "q-count" });
 	const caretEl = el("span", { class: "q-caret", text: open ? "▾" : "▸" });
+	const dockBtn = el("span", {
+		class: "q-dock",
+		text: "▼",
+		title: "Tuck the queue off-screen",
+	});
 	const head = el(
 		"div",
 		{ id: "queue-head", title: "every mesh generation currently in flight or waiting" },
 		caretEl,
 		el("span", { class: "q-title", text: "queue" }),
 		countEl,
+		dockBtn,
 	);
 	const body = el("div", { id: "queue-body" });
-	const panel = el("div", { id: "queue-panel" }, head, body);
+	const inner = el("div", { id: "queue-inner" }, head, body);
+	const tab = el(
+		"div",
+		{
+			id: "queue-tab",
+			title: "Show mesh generation queue",
+		},
+		el("span", { class: "q-tab-caret", text: "▲" }),
+		el("span", { class: "q-title", text: "queue" }),
+		tabCountEl,
+	);
+	const panel = el("div", { id: "queue-panel" }, inner, tab);
 	panel.classList.toggle("open", open);
+	panel.classList.toggle("docked-away", docked);
 	document.body.appendChild(panel);
+
+	const setDocked = (next) => {
+		docked = next;
+		panel.classList.toggle("docked-away", docked);
+		try {
+			localStorage.setItem(DOCKED_KEY, docked ? "1" : "0");
+		} catch {
+			/* private mode */
+		}
+	};
+	tab.addEventListener("click", () => setDocked(false));
+	dockBtn.addEventListener("click", (ev) => {
+		ev.stopPropagation();
+		setDocked(true);
+	});
 
 	// Pin the panel just LEFT of the observability dock (and the investigator
 	// column when it's open) so it never overlaps the obs tree or anything else
@@ -192,7 +231,9 @@ export function initQueuePanel() {
 		render(pools, entries);
 		const busy = entries.length > 0;
 		panel.classList.toggle("busy", busy);
-		countEl.textContent = busy ? String(entries.length) : "";
+		const countText = busy ? String(entries.length) : "";
+		countEl.textContent = countText;
+		tabCountEl.textContent = countText;
 		setTimeout(tick, busy ? POLL_BUSY_MS : POLL_IDLE_MS);
 	}
 

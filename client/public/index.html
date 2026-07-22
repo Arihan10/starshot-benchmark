@@ -3984,6 +3984,16 @@
 			#btn-generate {
 				font-weight: 600;
 			}
+			/* Generated-version selector — a native <select> in the toolbar row, so
+			   it needs the dark toolbar look the sibling <button>s inherit. */
+			#btn-gen-version {
+				font-size: 10px;
+				padding: 3px 6px;
+				background: var(--panel);
+				color: var(--text);
+				border: 1px solid var(--line);
+				border-radius: 4px;
+			}
 			.gen-status {
 				font-size: 10px;
 				color: var(--text-faint);
@@ -4063,7 +4073,7 @@
 			#queue-panel {
 				position: fixed;
 				right: 12px;
-				bottom: 12px;
+				bottom: 0;
 				width: 270px;
 				max-height: 50vh;
 				/* Hidden by default — the queue only floats over the main scene
@@ -4071,18 +4081,58 @@
 				   lab, where it's just noise. Shown by the :has() rule below. */
 				display: none;
 				flex-direction: column;
-				background: var(--panel);
-				border: 1px solid var(--line);
-				border-radius: 8px;
+				align-items: flex-end;
 				z-index: 105; /* above the overlay (100), below modals (120) */
 				font-size: 12px;
-				box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
-				overflow: hidden;
+				pointer-events: none;
 			}
 			/* Reveal it only while the main canvas (cell overlay) is up. Mirrors
 			   the app's other context-scoped overlays (e.g. #canvas-host:has(...)). */
 			body:has(#overlay.open) #queue-panel {
 				display: flex;
+			}
+			#queue-inner,
+			#queue-tab {
+				pointer-events: auto;
+			}
+			#queue-inner {
+				display: flex;
+				flex-direction: column;
+				width: 100%;
+				max-height: 50vh;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-radius: 8px;
+				box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+				overflow: hidden;
+				margin-bottom: 12px;
+			}
+			#queue-panel.docked-away #queue-inner {
+				display: none;
+			}
+			#queue-tab {
+				display: none;
+				align-items: center;
+				gap: 6px;
+				padding: 5px 10px 6px;
+				margin-bottom: 0;
+				cursor: pointer;
+				user-select: none;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-bottom: none;
+				border-radius: 8px 8px 0 0;
+				box-shadow: 0 -4px 16px rgba(0, 0, 0, 0.35);
+			}
+			#queue-tab:hover {
+				border-color: var(--accent-line);
+			}
+			#queue-panel.docked-away #queue-tab {
+				display: flex;
+			}
+			#queue-tab .q-tab-caret {
+				color: var(--text-faint);
+				font-size: 9px;
 			}
 			#queue-head {
 				display: flex;
@@ -4093,7 +4143,18 @@
 				user-select: none;
 				flex-shrink: 0;
 			}
-			#queue-head .q-title {
+			#queue-head .q-dock {
+				margin-left: 4px;
+				color: var(--text-faint);
+				font-size: 9px;
+				padding: 0 2px;
+				flex-shrink: 0;
+			}
+			#queue-head .q-dock:hover {
+				color: var(--accent);
+			}
+			#queue-head .q-title,
+			#queue-tab .q-title {
 				color: var(--text-dim);
 				text-transform: uppercase;
 				letter-spacing: 0.05em;
@@ -4103,8 +4164,10 @@
 				color: var(--text-faint);
 				font-size: 10px;
 			}
-			#queue-panel .q-count {
+			#queue-head .q-count {
 				margin-left: auto;
+			}
+			#queue-panel .q-count {
 				min-width: 18px;
 				text-align: center;
 				color: var(--bg);
@@ -4112,6 +4175,9 @@
 				border-radius: 999px;
 				padding: 0 6px;
 				font-variant-numeric: tabular-nums;
+			}
+			#queue-panel .q-count:empty {
+				display: none;
 			}
 			#queue-panel.busy .q-count {
 				background: var(--accent);

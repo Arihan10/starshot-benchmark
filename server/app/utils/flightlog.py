@@ -68,7 +68,7 @@ CREATE INDEX IF NOT EXISTS idx_flights_page ON flights (t_response DESC, id DESC
 _LIST_COLS = (
     "id, t_request, t_response, flight_ms, transport, provider, base_url, model, kind, "
     "status, ok, error, exc_type, api_key AS key, tokens_in, tokens_out, generation_id, "
-    "slot, step, node, call, attempt, (system IS NOT NULL) AS has_prompt"
+    "slot, step, node, call, attempt, cost, (system IS NOT NULL) AS has_prompt"
 )
 
 # Facet key -> the SQL expression its distinct values group on.
@@ -431,6 +431,32 @@ def _ensure_ledgers(run: str) -> None:
         _ensure_ledger(events_path.parent.relative_to(_runs_dir()).as_posix())
 
 
+_cost_ensured: set[str] = set()
+
+
+def _ensure_cost_columns(scenes: list[str]) -> None:
+    """Add the `cost` column to any scene DB that predates it, so the reads can
+    project it uniformly — a DB created before the column existed and never
+    written to since still has the old shape, which would make the `cost`
+    projection raise "no such column". Once per scene per process: the check is a
+    cheap PRAGMA and the ALTER fires at most once."""
+    for scene in scenes:
+        if scene in _cost_ensured:
+            continue
+        path = _scene_db(scene)
+        if not path.exists():
+            continue
+        try:
+            con = _connect(path)
+            try:
+                _ensure_cost_column(con)
+            finally:
+                con.close()
+        except sqlite3.Error:
+            continue
+        _cost_ensured.add(scene)
+
+
 # --- unified reads (ATTACH + batched merge) -----------------------------------
 
 
@@ -487,6 +513,7 @@ def page(run: str, *, cursor: str | None, limit: int, filters: dict[str, list[st
     below the cursor, so the global top `limit` is always within their union."""
     _ensure_ledgers(run)  # legacy scenes with no flights.db → reconstruct from events
     scenes = _scene_keys(run)
+    _ensure_cost_columns(scenes)  # so every attached DB has `cost` for the projection
     where, wparams = _where(filters, _parse_cursor(cursor))
     sql = f"SELECT * FROM ({{union}}) WHERE 1=1{where} ORDER BY t_response DESC, id DESC LIMIT ?"
     merged: list[dict[str, Any]] = []
@@ -550,6 +577,7 @@ def locate(scene: str, *, generation_id: str | None = None, t_request: float | N
     con = _connect(path)
     row = None
     try:
+        _ensure_cost_column(con)  # old DB may predate `cost`; the projection selects it
         if generation_id:
             row = con.execute(
                 f"SELECT {_LIST_COLS} FROM flights WHERE generation_id=? ORDER BY t_response DESC LIMIT 1",

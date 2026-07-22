@@ -45,6 +45,11 @@ let lastLayersSig = null; // skips rebuilding the layer legend when unchanged
 // Asset view: which mesh build the 3D view shows + the generate gate's polling.
 let assetMode = "library"; // "library" | "generated"
 let optimizedView = true; // generated meshes: optimized KTX2/Meshopt twin vs raw
+// The from-scratch generated build is VERSIONED: a cell can hold many isolated
+// builds (V1/V2/V3…). `genVersion` is the one the generated view shows + builds
+// (null = let the server resolve the latest); `genVersions` is every id on disk.
+let genVersion = null;
+let genVersions = [];
 // Per-object override of the scene-wide optimized/raw toggle: node id ->
 // "optimized" | "raw". Absent = follow `optimizedView`. Reset whenever the
 // scene-wide toggle flips (it sets a fresh baseline for every object).
@@ -58,6 +63,8 @@ let assetBtn = null;
 let genBtn = null;
 let optBtn = null;
 let genStatusEl = null;
+let verSel = null; // generated-version <select>
+let newVerBtn = null; // "＋ new version" button
 
 // Cache-bust a generated mesh URL by its mtime token, so a regenerated asset
 // (same id + path, new bytes) reloads instead of serving a stale cached GLB.
@@ -406,8 +413,22 @@ function setupAssetControls() {
 		text: "optimized",
 		onclick: toggleOptimized,
 	});
+	// The generated build is versioned: this <select> picks which build (V1/V2/V3…)
+	// the view shows + the ⚡ generate button builds/resumes; "＋ new version" spins
+	// up the next empty one. Both are generated-view-only (see syncAssetControls).
+	verSel = el("select", {
+		id: "btn-gen-version",
+		title: "which generated version (V1/V2/V3…) to view + build/resume",
+		onchange: () => onVersionChange(verSel.value),
+	});
+	newVerBtn = el("button", {
+		id: "btn-gen-new-version",
+		title: "start a brand-new generated version, built fresh and kept separate from the others",
+		text: "＋ new version",
+		onclick: onNewVersion,
+	});
 	genStatusEl = el("span", { id: "gen-status", class: "gen-status" });
-	refit.after(assetBtn, genBtn, optBtn, genStatusEl);
+	refit.after(assetBtn, genBtn, verSel, newVerBtn, optBtn, genStatusEl);
 	syncAssetControls();
 }
 
@@ -419,6 +440,8 @@ function syncAssetControls() {
 	assetBtn.style.display = show ? "" : "none";
 	const gen = show && assetMode === "generated";
 	genBtn.style.display = gen ? "" : "none";
+	verSel.style.display = gen ? "" : "none";
+	newVerBtn.style.display = gen ? "" : "none";
 	optBtn.style.display = gen ? "" : "none";
 	genStatusEl.style.display = gen ? "" : "none";
 	assetBtn.classList.toggle("on", assetMode === "generated");
@@ -426,6 +449,28 @@ function syncAssetControls() {
 		assetMode === "generated" ? "generated ✓" : "generated";
 	optBtn.classList.toggle("on", optimizedView);
 	optBtn.textContent = optimizedView ? "optimized ✓" : "raw";
+	syncVersionSelector();
+}
+
+// Rebuild the version <select> from `genVersions`/`genVersion` (newest first).
+// Skipped while the user has it open (a poll must not close the dropdown) and
+// when nothing changed; an empty list shows a placeholder until the first build.
+function syncVersionSelector() {
+	if (!verSel) return;
+	const sig = `${genVersions.join(",")}|${genVersion ?? ""}`;
+	if (document.activeElement === verSel) return;
+	if (verSel.dataset.sig !== sig) {
+		verSel.dataset.sig = sig;
+		const opts = genVersions.length
+			? genVersions
+					.slice()
+					.reverse()
+					.map((v) => el("option", { value: String(v), text: `V${v}` }))
+			: [el("option", { value: "", text: "no versions yet" })];
+		verSel.replaceChildren(...opts);
+	}
+	if (genVersion != null && genVersions.map(String).includes(String(genVersion)))
+		verSel.value = String(genVersion);
 }
 
 function setAssetMode(mode) {
@@ -464,13 +509,16 @@ function toggleOptimized() {
 	pollGenerated();
 }
 
-// Forget the generated-view bookkeeping (on cell open, mode switch, or toggle).
+// Forget the generated-view bookkeeping (on cell open or mode switch). Resets the
+// selected version too, so the next poll re-resolves the cell's latest build.
 function clearGeneratedState() {
 	lastGenMesh = new Map();
 	loadedGen = new Map();
 	busyNodes = new Set();
 	objOptMode = new Map();
 	genMeshSig = null;
+	genVersion = null;
+	genVersions = [];
 	if (genStatusEl) genStatusEl.textContent = "";
 }
 
@@ -485,16 +533,67 @@ function loadLibraryMeshes() {
 	);
 }
 
+// ⚡ generate: build/resume the SELECTED version (the server resolves the latest
+// when none is selected yet). Adopt the version + list it returns so the selector
+// reflects a first-ever build (which mints V1) immediately.
 async function onGenerate() {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.generate(state.run, slot, model);
-		toast(`generating ${slot} · ${model}…`, "ok");
+		const r = await api.generate(state.run, slot, model, { version: genVersion });
+		if (r?.version != null) genVersion = String(r.version);
+		if (Array.isArray(r?.versions)) genVersions = r.versions.map(String);
+		syncVersionSelector();
+		toast(`generating ${slot} · ${model} · V${genVersion}…`, "ok");
 		pollGenerated();
 	} catch (e) {
 		toast(e.message, "err");
 	}
+}
+
+// ＋ new version: mint the next version and build it fresh. It starts empty, so
+// drop the current version's meshes and let the poll re-attach V<new>'s as they land.
+async function onNewVersion() {
+	if (!state.view || state.view.branch) return;
+	const { slot, model } = state.view;
+	try {
+		const r = await api.generate(state.run, slot, model, { newVersion: true });
+		if (r?.version != null) genVersion = String(r.version);
+		if (Array.isArray(r?.versions)) genVersions = r.versions.map(String);
+		loadedGen = new Map();
+		lastGenMesh = new Map();
+		busyNodes = new Set();
+		objOptMode = new Map();
+		genMeshSig = null;
+		viewer.clearMeshes();
+		tracePanel.clearProjection();
+		tracePanel.rerenderInfo();
+		syncVersionSelector();
+		toast(`building new version V${genVersion} of ${slot} · ${model}…`, "ok");
+		pollGenerated();
+	} catch (e) {
+		toast(e.message, "err");
+	}
+}
+
+// Switch which generated version the view shows — like the optimized toggle, it
+// drops the current meshes and lets the poll re-attach the chosen version's set
+// (each version is fully isolated on disk).
+function onVersionChange(v) {
+	if (!state.view || state.view.branch || assetMode !== "generated") return;
+	if (!v || String(v) === String(genVersion)) return;
+	genVersion = String(v);
+	stopGenPoll();
+	loadedGen = new Map();
+	lastGenMesh = new Map();
+	busyNodes = new Set();
+	objOptMode = new Map();
+	genMeshSig = null;
+	viewer.clearMeshes();
+	tracePanel.clearProjection();
+	tracePanel.rerenderInfo();
+	syncVersionSelector();
+	pollGenerated();
 }
 
 function stopGenPoll() {
@@ -555,6 +654,7 @@ async function pollGenerated() {
 	try {
 		status = await api.generateStatus(run, slot, model, {
 			optimized: optimizedView,
+			version: genVersion,
 		});
 	} catch {
 		/* transient — the next poll (if still in generated mode) retries */
@@ -568,6 +668,11 @@ async function pollGenerated() {
 	)
 		return;
 	if (!status) return;
+	// Adopt the resolved version + full list so the selector reflects the server's
+	// truth (a first poll resolves "latest"; a new build appears in the list).
+	if (Array.isArray(status.versions)) genVersions = status.versions.map(String);
+	if (status.version != null) genVersion = String(status.version);
+	syncVersionSelector();
 	const meshes = status.meshes ?? [];
 	lastGenMesh = new Map(
 		meshes.map((m) => [
@@ -644,7 +749,7 @@ async function regenerateNode(id, opts) {
 	busyNodes.add(id);
 	tracePanel.rerenderInfo();
 	try {
-		await api.regenerate(state.run, slot, model, id, opts);
+		await api.regenerate(state.run, slot, model, id, { ...opts, version: genVersion });
 		toast(
 			`regenerating ${id}${opts.regenNounPhrase ? " (+ new noun phrase)" : ""} · ${opts.backend}…`,
 			"ok",
@@ -661,7 +766,7 @@ async function linkNode(id, target, { group = false } = {}) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.link(state.run, slot, model, id, target, { group });
+		await api.link(state.run, slot, model, id, target, { group, version: genVersion });
 		toast(`linking ${group ? "group" : id} → ${target}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -677,7 +782,7 @@ async function unlinkNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.unlink(state.run, slot, model, id);
+		await api.unlink(state.run, slot, model, id, { version: genVersion });
 		toast(`unlinking ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -692,6 +797,7 @@ async function symmetrizeNode(id, opts) {
 		await api.symmetrize(state.run, slot, model, id, {
 			...opts,
 			propagate: true,
+			version: genVersion,
 		});
 		toast(`symmetrizing ${id}…`, "ok");
 		pollGenerated();
@@ -704,7 +810,7 @@ async function unsymmetrizeNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.unsymmetrize(state.run, slot, model, id, { propagate: true });
+		await api.unsymmetrize(state.run, slot, model, id, { propagate: true, version: genVersion });
 		toast(`un-symmetrizing ${id}…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -722,6 +828,7 @@ async function reorientNode(id, opts) {
 		await api.reorient(state.run, slot, model, id, {
 			...opts,
 			propagate: true,
+			version: genVersion,
 		});
 		toast(`re-fronting ${id}…`, "ok");
 		pollGenerated();
@@ -738,7 +845,7 @@ async function glassifyNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.glassify(state.run, slot, model, id);
+		await api.glassify(state.run, slot, model, id, { version: genVersion });
 		toast(`applying glass transparency to ${id} + prefab group…`, "ok");
 		pollGenerated();
 	} catch (e) {
@@ -753,7 +860,7 @@ async function resetNode(id) {
 	if (!state.view || state.view.branch) return;
 	const { slot, model } = state.view;
 	try {
-		await api.resetMesh(state.run, slot, model, id);
+		await api.resetMesh(state.run, slot, model, id, { version: genVersion });
 		toast(`resetting ${id} + prefab group from raw…`, "ok");
 		pollGenerated();
 	} catch (e) {

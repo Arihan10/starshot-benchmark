@@ -651,7 +651,10 @@ function makeSceneTile(slot, model) {
     for (const e of entries) {
       if (e.isIntersecting) {
         if (!ref.viewer) {
-          ref.viewer = createViewer(host, { keyboard: false });
+          // Tiles are small glanceable previews and there can be many at once, so
+          // cap them at DPR 1 — a fraction of the framebuffer / OIT-target memory a
+          // full-DPR canvas would take, with no meaningful loss at tile size.
+          ref.viewer = createViewer(host, { keyboard: false, maxPixelRatio: 1 });
           ref.loadedCount = state.slots.find((x) => x.id === slot.id)?.runs?.[model]?.events_count ?? 0;
           ref.lastLoad = performance.now();
           loadTile(ref, slot.id, model);

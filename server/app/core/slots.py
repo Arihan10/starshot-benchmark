@@ -112,6 +112,8 @@ MODELS: dict[str, str] = {
     "hy3": "tencent/hy3",
     "longcat": "longcat/LongCat-2.0",
     "longcat-sf": "siliconflow/LongCat-2.0",
+    "gemini-flash-new": "google/gemini-3.6-flash",
+    "laguna": "poolside/laguna-s-2.1",
 }
 
 # Model ids from MODELS that are actually served by a third-party
@@ -203,4 +205,15 @@ DEFAULT_REASONING = "xhigh"
 
 REASONING_DOWNGRADE_LIST = [
     "openai/gpt-5.5"
+]
+
+# OpenRouter model ids whose only provider can't honor structured outputs
+# (`response_format: json_schema`). For these, `llm._send_structured` omits the
+# response_format param — which would otherwise 404 under `require_parameters`
+# ("No endpoints found that can handle the requested parameters") — and relies on
+# the prompt's `<output>` contract to shape the JSON instead. Keep this to models
+# that genuinely lack structured-output support (e.g. poolside/laguna-s-2.1),
+# since dropping the schema removes the wire-level guarantee that output parses.
+NO_STRUCTURED_OUTPUT_LIST = [
+    "poolside/laguna-s-2.1",
 ]

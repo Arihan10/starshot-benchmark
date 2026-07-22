@@ -35,7 +35,7 @@ from pydantic import BaseModel, ValidationError
 from app.core.slots import OPENAI_COMPAT_MODELS, OpenAICompatModel, model_pricing, token_cost
 from app.utils import cache, flightlog, keypool, logging
 
-from app.core.slots import DEFAULT_REASONING, REASONING_DOWNGRADE_LIST
+from app.core.slots import DEFAULT_REASONING, NO_STRUCTURED_OUTPUT_LIST, REASONING_DOWNGRADE_LIST
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -316,6 +316,11 @@ async def call_llm(
         logging.log(
             "cache.llm",
             key=key,
+            # Model-independent input hash: lets a committed step replay across a
+            # model swap (find_llm_replay) without keeping system/user bytes in RAM.
+            replay_key=cache.hash_llm_replay_key(
+                system=system, user=user, schema_name=schema_name
+            ),
             node=node_id,
             step=step,
             template=template,
@@ -574,33 +579,39 @@ async def _send_structured(
             api_key=os.environ["OPENROUTER_API_KEY"],
             timeout_ms=int(_OPENROUTER_TIMEOUT_S * 1000),
         ) as client:
-            response = await client.chat.send_async(
-                model=model,
-                messages=[
+            send_kwargs: dict[str, Any] = {
+                "model": model,
+                "messages": [
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                response_format={  # pyright: ignore[reportArgumentType]
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": schema_name,
-                        "strict": True,
-                        "schema_": wire_schema,
-                    },
-                },
-                reasoning={"effort": _reasoning_effort(model)},
+                "reasoning": {"effort": _reasoning_effort(model)},
                 # Force routing to a provider that actually honors the parameters we
                 # send. Omitted, OpenRouter silently strips any param the chosen
                 # provider lacks — so a model whose provider can't do
                 # `response_format: json_schema` (GLM) falls back to a free-form
                 # completion and emits fenced / prose / null content instead of
                 # schema-conformant JSON.
-                provider={
+                "provider": {
                     "require_parameters": True,
                     "sort": "latency",
                     "ignore": ["decart"],
                 },
-            )
+            }
+            # A model whose ONLY OpenRouter endpoint lacks structured outputs
+            # (poolside/laguna-s-2.1, …) 404s under require_parameters when we
+            # demand response_format. Drop the schema param for those and lean on
+            # the prompt's `<output>` contract to shape the JSON instead.
+            if model not in NO_STRUCTURED_OUTPUT_LIST:
+                send_kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": schema_name,
+                        "strict": True,
+                        "schema_": wire_schema,
+                    },
+                }
+            response = await client.chat.send_async(**send_kwargs)  # pyright: ignore[reportArgumentType]
     except (OpenRouterError, httpx.HTTPError) as e:
         # OpenRouter's own dashboard logs its side; this row is the LOCAL record
         # of the same flight, so the ledger reads uniformly across transports.
