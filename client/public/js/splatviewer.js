@@ -19,7 +19,6 @@ import {
     openSogView,
     setSogVisible,
 } from "./sogviewer.js";
-import { openRefsViewer } from "./refsviewer.js";
 
 let overlay = null;
 let canvasEl = null;
@@ -60,7 +59,7 @@ let _downXY = null; // pointer-down pos, to tell a click from an orbit drag
 // Pipeline stepper state (the side panel drives the whole splat pipeline).
 let cellStatus = null; // last-fetched per-stage status of the open cell
 let cloudLoaded = false; // whether a surfel cloud is currently in the canvas
-let runningAll = false; // the "run all (local stages 1-5)" sequential driver is active
+let runningAll = false; // the "run all (1-3 → modal)" sequential driver is active
 let assetSource = null; // {source, available, active_kind} — which assets feed the pipeline
 let modalPrev = null; // previous poll's cell.modal.status (to catch the done transition)
 let modalLog = []; // accumulated remote-train heartbeat lines (the live log pane)
@@ -647,7 +646,9 @@ async function buildVoxels(url, summary) {
         group.add(cover);
         const cc = collapseFor("cover");
         const pts = pointLayer(
-            cellPointsGeometry(dv, off, nCover, origin, pitch, cc), 0x3ddc6a, pitch * cc,
+            cellPointsGeometry(dv, off, nCover, origin, pitch, cc),
+            0x3ddc6a,
+            pitch * cc,
         );
         pts.userData.voxClass = "cover";
         group.add(pts);
@@ -663,7 +664,9 @@ async function buildVoxels(url, summary) {
         group.add(garXray);
         const gc = collapseFor("garbage");
         const pts = pointLayer(
-            cellPointsGeometry(dv, off, nGar, origin, pitch, gc), 0xff4438, pitch * gc,
+            cellPointsGeometry(dv, off, nGar, origin, pitch, gc),
+            0xff4438,
+            pitch * gc,
         );
         pts.userData.voxClass = "garbage";
         group.add(pts);
@@ -678,7 +681,9 @@ async function buildVoxels(url, summary) {
         off += 12;
         const geo = quadGeometry(dv, off, quads, origin, pitch);
         const pts = pointLayer(
-            cellPointsGeometry(dv, off, quads, origin, pitch, fc), 0x3d8bff, pitch * fc,
+            cellPointsGeometry(dv, off, quads, origin, pitch, fc),
+            0x3d8bff,
+            pitch * fc,
         );
         pts.userData.voxClass = "free";
         off += quads * 10;
@@ -713,7 +718,8 @@ function updateFreeFilter() {
     for (let s = 0; s < freeShells.length; s++) {
         const active = s === i;
         freeShells[s].mesh.visible = active && !pointsOn;
-        if (freeShells[s].points) freeShells[s].points.visible = active && pointsOn;
+        if (freeShells[s].points)
+            freeShells[s].points.visible = active && pointsOn;
     }
     if (inputs._freeVal) {
         inputs._freeVal.textContent = `${freeShells[i].t.toFixed(2)}m · ${freeShells[i].cells.toLocaleString()}`;
@@ -1377,23 +1383,6 @@ function buildControls(summary) {
         dFmt,
     );
 
-    // Forced per-object pool size — a RESOURCE knob (not part of SampleParams):
-    // 0 = auto (min(cores, 8) server-side); >=1 pins the pool (re-clamped to the
-    // object count + a memory cap in stage3). `summary.workers` is the RESOLVED
-    // count of the last run, shown as a hint; the slider defaults to auto so a
-    // re-splat never silently pins the pool after one run.
-    const lastWorkers = (summary && summary.workers) || 0;
-    const workers = sliderRow(
-        "workers",
-        "workers",
-        0,
-        32,
-        1,
-        0,
-        (v) =>
-            v < 1 ? (lastWorkers ? `auto (last ${lastWorkers})` : "auto") : `${Math.round(v)}`,
-    );
-
     const btn = el("button", {
         class: "svc-resplat",
         text: "re-splat",
@@ -1536,29 +1525,6 @@ function buildControls(summary) {
     inputs.patches.addEventListener("change", () =>
         setPatches(inputs.patches.checked),
     );
-    // Browse the Stage-5 reference frames (RGB · alpha · depth) as a lazy
-    // thumbnail matrix + full-res inspector, decoded from the SZF containers
-    // client-side (opens its own overlay; resolves the refs via Stage-5 status).
-    const refsBtn = el("button", {
-        class: "splat-stage2-btn",
-        text: "view refs",
-        title: "browse the Stage-5 reference frames (RGB · alpha · depth)",
-        onclick: () => {
-            if (!current) return;
-            openRefsViewer({
-                run: current.run,
-                slot: current.slot,
-                model: current.model,
-                label: subEl?.textContent,
-            });
-        },
-    });
-    const refsRow = el(
-        "div",
-        { class: "svc-row" },
-        el("span", { class: "svc-lab", text: "refs" }),
-        refsBtn,
-    );
     // Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
     const camRow = checkRow("cameras", "camera positions", false);
     inputs.cameras.addEventListener("change", () =>
@@ -1660,13 +1626,11 @@ function buildControls(summary) {
         freeApplyRow,
         voxPointsRow,
         patchRow,
-        refsRow,
         camRow,
         camPlayRow,
         camSpeedRow,
         el("div", { class: "svc-title", text: "sampler" }),
         detail,
-        workers,
         el("div", { class: "svc-actions" }, btn),
         actual,
         overlay,
@@ -1679,10 +1643,7 @@ function actualText(summary) {
 }
 
 function readParams() {
-    return {
-        detail: Number(inputs.detail.value),
-        workers: Math.round(Number(inputs.workers.value)),
-    };
+    return { detail: Number(inputs.detail.value) };
 }
 
 async function resplat() {
@@ -2106,30 +2067,23 @@ function showPatchModal(index) {
 
 // ---- pipeline stepper (the side panel: run/re-run each stage, gated) ---------
 
-// The LOCAL splat stages in dependency order (1-5): they all run on this machine.
-// Stage 1's status is the cell itself; Stages 2-5 live on `cell.stageN`. A stage is
-// runnable only once the previous is done; re-running a done stage REVERTS
-// everything after it (server-side). Stage 4 (cameras) + Stage 5 (references) run
-// locally here so the pipeline can be driven step-by-step and its refs inspected
-// before committing to a train. Stage 6 (the fine-tune) still runs REMOTELY via the
-// "train on modal" job (see renderModal), which re-plans/re-renders 4-5 on the A100
-// as part of that one-shot remote run.
+// The LOCAL splat stages in dependency order (1-3): they run on this machine and
+// prepare the inputs the Modal train job consumes. Stage 1's status is the cell
+// itself; Stages 2-3 live on `cell.stageN`. A stage is runnable only once the
+// previous is done; re-running a done stage REVERTS everything after it
+// (server-side). Stages 4-6 (cameras → references → fine-tune) run REMOTELY as
+// one "train on modal" job (see renderModal), so they're no longer per-stage
+// rows here — the camera plan + references need a CUDA GPU, and doing all three
+// in one A100 container keeps the big reference-image set off this machine.
 const STAGES = [
     { n: 1, label: "assemble", verb: "convert" },
     { n: 2, label: "free space", verb: "voxelize" },
     { n: 3, label: "surfels", verb: "sample" },
-    { n: 4, label: "cameras", verb: "plan" },
-    { n: 5, label: "references", verb: "render" },
 ];
 const STAGE_START = {
     1: (r, s, m) => api.splatStage1Start(r, s, m),
     2: (r, s, m) => api.splatStage2Start(r, s, m),
-    3: (r, s, m) => api.splatStage3Start(r, s, m, readParams()),
-    4: (r, s, m) => api.splatStage4Start(r, s, m),
-    // Stage 5 resumes by default (renders only the views still missing on disk); an
-    // explicit re-run of a DONE stage passes restart so the server wipes refs/ and
-    // re-renders every view from scratch.
-    5: (r, s, m, restart) => api.splatStage5Start(r, s, m, { restart }),
+    3: (r, s, m) => api.splatStage3Start(r, s, m),
 };
 
 function stageState(cell, n) {
@@ -2257,11 +2211,21 @@ async function runAll() {
             if (stage.n >= 3) await maybeLoadCloud(seq);
         }
         if (seq !== openSeq || !current) return;
-        // All LOCAL stages (1–5) done — including the camera plan + reference
-        // renders, ready to inspect. Stage 6 (the fine-tune) stays on the Modal
-        // A100: launch it from the "train on modal" panel when you want the
-        // trained splat (that remote run re-plans/re-renders 4–5 itself).
-        setStatus("run all: local stages 1–5 done", "var(--green)");
+        // Local stages 1–3 done → launch the remote train (stages 4–6) on the
+        // A100. pollStages (below) then streams its phase + training heartbeat
+        // through the cells status; the run continues on Modal on its own.
+        setStatus(
+            "run all: stages 1–3 done — training on Modal (stages 4–6)…",
+            "var(--purple)",
+        );
+        try {
+            await api.splatModalStart(current.run, current.slot, current.model);
+        } catch (e) {
+            setStatus(
+                `run all: remote train failed to start: ${e.message}`,
+                "var(--red)",
+            );
+        }
     } catch (e) {
         if (seq === openSeq)
             setStatus(`run all stopped: ${e.message}`, "var(--red)");
@@ -2321,162 +2285,170 @@ function fmtEta(remaining, rate) {
 const _stepClocks = new Map();
 
 function _stepElapsedSecs(stageN, phase) {
-	const key = phase || "run";
-	const rec = _stepClocks.get(stageN);
-	if (!rec || rec.phase !== key) {
-		_stepClocks.set(stageN, { phase: key, t0: Date.now() });
-		return 0;
-	}
-	return Math.round((Date.now() - rec.t0) / 1000);
+    const key = phase || "run";
+    const rec = _stepClocks.get(stageN);
+    if (!rec || rec.phase !== key) {
+        _stepClocks.set(stageN, { phase: key, t0: Date.now() });
+        return 0;
+    }
+    return Math.round((Date.now() - rec.t0) / 1000);
 }
 
 function fmtStepSecs(s) {
-	return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
+    return s < 60
+        ? `${s}s`
+        : `${Math.floor(s / 60)}m${String(s % 60).padStart(2, "0")}s`;
 }
 
 function renderStepper() {
-	const box = inputs && inputs._stepper;
-	if (!box) return;
-	box.replaceChildren();
-	box.appendChild(renderSourceRow());
-	const cell = cellStatus;
-	for (const stage of STAGES) {
-		const st = stageState(cell, stage.n);
-		const done = st.status === "done";
-		const running = st.status === "running" || st.status === "pending";
-		const gated = stage.n > 1 && !stageDone(cell, stage.n - 1);
-		if (!running) _stepClocks.delete(stage.n); // reset the step timer between runs
-		const row = el("div", { class: "svc-step" });
-		row.appendChild(
-			el("span", { class: "svc-step-n muted", text: `${stage.n}` }),
-		);
-		const labelEl = el("span", {
-			class: "svc-step-label",
-			text: stage.label,
-		});
-		row.appendChild(labelEl);
-		let btn;
-		let extra = null; // trailing muted info (e.g. Stage-5 live throughput)
-		if (running) {
-			// `current_id` is the live sub-step: Stage 4's phase (load / patches /
-			// coverage / select / write) or the object/view id the others are on. Show
-			// it next to the label so the long coverage phase isn't an opaque wait.
-			// Stage 5 during `render` shows the throughput instead of the (noisy)
-			// per-view id — its named warm-up phases (plan / launch) still show.
-			const phase =
-				stage.n === 5
-					? st.phase &&
-						!["render", "done", "pending", "plan"].includes(st.phase)
-						? st.phase
-						: ""
-					: st.current_id && st.current_id !== "plan"
-						? String(st.current_id)
-						: "";
-			if (phase)
-				labelEl.textContent = `${stage.label} · ${phase.slice(0, 22)}`;
-			const prog = st.total
-				? `${st.done}/${st.total}`
-				: st.done
-					? String(st.done)
-					: "…";
-			btn = el("button", {
-				class: "splat-stage2-btn",
-				disabled: true,
-				text: prog,
-				title:
-					`${phase} ${st.total ? `${st.done}/${st.total}` : ""}`.trim() ||
-					"running",
-			});
-			// Live server-computed throughput next to the running step. Stage 5 =
-			// images/second (with session avg); Stages 2 & 4 = the current step's
-			// actions/second — objects voxelized / shells extracted (Stage 2),
-			// candidates ray-marched / cameras picked (Stage 4). Single-pass marker
-			// steps don't stream a count, so no rate shows for them.
-			const rate =
-				stage.n === 5 || stage.n === 4 || stage.n === 2
-					? fmtRate(st.rate)
-					: null;
-			if (rate) {
-				const remaining = (st.total || 0) - (st.done || 0);
-				const eta = fmtEta(remaining, st.rate);
-				if (stage.n === 5) {
-					const avg = fmtRate(st.rate_avg);
-					extra = el("span", {
-						class: "muted",
-						text: eta ? `${rate} img/s · ETA ${eta}` : `${rate} img/s`,
-						title: avg
-							? `live ${rate} img/s · session avg ${avg} img/s`
-							: `${rate} img/s`,
-					});
-				} else {
-					extra = el("span", {
-						class: "muted",
-						text: eta ? `${rate}/s · ETA ${eta}` : `${rate}/s`,
-						title: `${phase || "step"} · ${rate} actions/s`,
-					});
-				}
-			} else {
-				// A number-less running step (e.g. Stage 2 reduce / fill / clearance /
-				// write): a single bulk pass with no per-item count to stream, so show
-				// a live elapsed timer — it reads as working, not frozen at "…".
-				const secs = _stepElapsedSecs(stage.n, phase || st.phase || "run");
-				extra = el("span", {
-					class: "muted",
-					text: fmtStepSecs(secs),
-					title: `${phase || st.phase || "step"} · ${fmtStepSecs(secs)} elapsed`,
-				});
-			}
-		} else if (gated) {
-			btn = el("button", {
-				class: "splat-stage2-btn",
-				disabled: true,
-				text: stage.verb,
-				title: `run stage ${stage.n - 1} first`,
-			});
-		} else {
-			btn = el("button", {
-				class: `splat-stage2-btn${done ? " view" : ""}`,
-				disabled: runningAll,
-				text: done ? "re-run" : stage.verb,
-				title: done
-					? stage.n === 5
-						? "re-run — wipe all references and re-render from scratch"
-						: "re-run — discards every later stage"
-					: `run stage ${stage.n}`,
-				onclick: () => runStage(stage.n),
-			});
-		}
-		// Planned reference-image count (image files Stage 5 will create), shown before capture.
-		if (stage.n === 5 && !running && !extra) {
-			const planned = stageState(cell, 4).summary?.views;
-			if (planned != null)
-				extra = el("span", {
-					class: "muted",
-					text: `${fmtInt(planned)} views`,
-					title: "reference images this render will create (from the Stage-4 plan)",
-				});
-		}
-		if (st.status === "error") {
-			btn.classList.add("err");
-			btn.title = st.error || "failed — click to retry";
-		}
-		row.appendChild(btn);
-		if (extra) row.appendChild(extra);
-		box.appendChild(row);
-	}
-	box.appendChild(renderRunAll(cell));
-	renderModal(cell);
-	renderCoverage();
-	updateSourceAvail();
+    const box = inputs && inputs._stepper;
+    if (!box) return;
+    box.replaceChildren();
+    box.appendChild(renderSourceRow());
+    const cell = cellStatus;
+    for (const stage of STAGES) {
+        const st = stageState(cell, stage.n);
+        const done = st.status === "done";
+        const running = st.status === "running" || st.status === "pending";
+        const gated = stage.n > 1 && !stageDone(cell, stage.n - 1);
+        if (!running) _stepClocks.delete(stage.n); // reset the step timer between runs
+        const row = el("div", { class: "svc-step" });
+        row.appendChild(
+            el("span", { class: "svc-step-n muted", text: `${stage.n}` }),
+        );
+        const labelEl = el("span", {
+            class: "svc-step-label",
+            text: stage.label,
+        });
+        row.appendChild(labelEl);
+        let btn;
+        let extra = null; // trailing muted info (e.g. Stage-5 live throughput)
+        if (running) {
+            // `current_id` is the live sub-step: Stage 4's phase (load / patches /
+            // coverage / select / write) or the object/view id the others are on. Show
+            // it next to the label so the long coverage phase isn't an opaque wait.
+            // Stage 5 during `render` shows the throughput instead of the (noisy)
+            // per-view id — its named warm-up phases (plan / launch) still show.
+            const phase =
+                stage.n === 5
+                    ? st.phase &&
+                      !["render", "done", "pending", "plan"].includes(st.phase)
+                        ? st.phase
+                        : ""
+                    : st.current_id && st.current_id !== "plan"
+                      ? String(st.current_id)
+                      : "";
+            if (phase)
+                labelEl.textContent = `${stage.label} · ${phase.slice(0, 22)}`;
+            const prog = st.total
+                ? `${st.done}/${st.total}`
+                : st.done
+                  ? String(st.done)
+                  : "…";
+            btn = el("button", {
+                class: "splat-stage2-btn",
+                disabled: true,
+                text: prog,
+                title:
+                    `${phase} ${st.total ? `${st.done}/${st.total}` : ""}`.trim() ||
+                    "running",
+            });
+            // Live server-computed throughput next to the running step. Stage 5 =
+            // images/second (with session avg); Stages 2 & 4 = the current step's
+            // actions/second — objects voxelized / shells extracted (Stage 2),
+            // candidates ray-marched / cameras picked (Stage 4). Single-pass marker
+            // steps don't stream a count, so no rate shows for them.
+            const rate =
+                stage.n === 5 || stage.n === 4 || stage.n === 2
+                    ? fmtRate(st.rate)
+                    : null;
+            if (rate) {
+                const remaining = (st.total || 0) - (st.done || 0);
+                const eta = fmtEta(remaining, st.rate);
+                if (stage.n === 5) {
+                    const avg = fmtRate(st.rate_avg);
+                    extra = el("span", {
+                        class: "muted",
+                        text: eta
+                            ? `${rate} img/s · ETA ${eta}`
+                            : `${rate} img/s`,
+                        title: avg
+                            ? `live ${rate} img/s · session avg ${avg} img/s`
+                            : `${rate} img/s`,
+                    });
+                } else {
+                    extra = el("span", {
+                        class: "muted",
+                        text: eta ? `${rate}/s · ETA ${eta}` : `${rate}/s`,
+                        title: `${phase || "step"} · ${rate} actions/s`,
+                    });
+                }
+            } else {
+                // A number-less running step (e.g. Stage 2 reduce / fill / clearance /
+                // write): a single bulk pass with no per-item count to stream, so show
+                // a live elapsed timer — it reads as working, not frozen at "…".
+                const secs = _stepElapsedSecs(
+                    stage.n,
+                    phase || st.phase || "run",
+                );
+                extra = el("span", {
+                    class: "muted",
+                    text: fmtStepSecs(secs),
+                    title: `${phase || st.phase || "step"} · ${fmtStepSecs(secs)} elapsed`,
+                });
+            }
+        } else if (gated) {
+            btn = el("button", {
+                class: "splat-stage2-btn",
+                disabled: true,
+                text: stage.verb,
+                title: `run stage ${stage.n - 1} first`,
+            });
+        } else {
+            btn = el("button", {
+                class: `splat-stage2-btn${done ? " view" : ""}`,
+                disabled: runningAll,
+                text: done ? "re-run" : stage.verb,
+                title: done
+                    ? stage.n === 5
+                        ? "re-run — wipe all references and re-render from scratch"
+                        : "re-run — discards every later stage"
+                    : `run stage ${stage.n}`,
+                onclick: () => runStage(stage.n),
+            });
+        }
+        // Planned reference-image count (image files Stage 5 will create), shown before capture.
+        if (stage.n === 5 && !running && !extra) {
+            const planned = stageState(cell, 4).summary?.views;
+            if (planned != null)
+                extra = el("span", {
+                    class: "muted",
+                    text: `${fmtInt(planned)} views`,
+                    title: "reference images this render will create (from the Stage-4 plan)",
+                });
+        }
+        if (st.status === "error") {
+            btn.classList.add("err");
+            btn.title = st.error || "failed — click to retry";
+        }
+        row.appendChild(btn);
+        if (extra) row.appendChild(extra);
+        box.appendChild(row);
+    }
+    box.appendChild(renderRunAll(cell));
+    renderModal(cell);
+    renderCoverage();
+    updateSourceAvail();
 }
 
-// "run all" control row: runs local stages 1→5 in order from the first
-// not-yet-done (assemble → free space → surfels → cameras → references). Stage 6
-// (the fine-tune) is launched separately from the "train on modal" panel.
-// Disabled while anything is running, or once all local stages are done.
+// "run all" control row: runs local stages 1→3 in order from the first
+// not-yet-done, then launches the remote train (stages 4-6) on the A100.
+// Disabled while anything is running, or once trained.ply exists.
 function renderRunAll(cell) {
     const busy = runningAll || anyStageRunning(cell);
-    const allDone = STAGES.every((s) => stageDone(cell, s.n));
+    const allDone =
+        STAGES.every((s) => stageDone(cell, s.n)) &&
+        cell?.modal?.status === "done";
     const row = el("div", { class: "svc-step" });
     row.appendChild(el("span", { class: "svc-step-n muted", text: "▶" }));
     row.appendChild(el("span", { class: "svc-step-label", text: "run all" }));
@@ -2484,8 +2456,8 @@ function renderRunAll(cell) {
         el("button", {
             class: "splat-stage2-btn",
             disabled: busy || allDone,
-            text: runningAll ? "running…" : allDone ? "all done" : "run 1–5",
-            title: "run local stages 1–5 in order (assemble → free space → surfels → cameras → references)",
+            text: runningAll ? "running…" : allDone ? "all done" : "run 1–6",
+            title: "run local stages 1–3 in order, then train on Modal (stages 4–6)",
             onclick: () => runAll(),
         }),
     );
@@ -2500,8 +2472,14 @@ function renderRunAll(cell) {
 function modalCfgControls(disabled) {
     const numRow = (label, key, step, min, max, title) => {
         const input = el("input", {
-            type: "number", value: modalTrainCfg[key], step, min, max,
-            class: "svc-num", title, disabled,
+            type: "number",
+            value: modalTrainCfg[key],
+            step,
+            min,
+            max,
+            class: "svc-num",
+            title,
+            disabled,
             oninput: () => {
                 const v = Number(input.value);
                 if (!Number.isNaN(v)) modalTrainCfg[key] = v;
@@ -2518,10 +2496,22 @@ function modalCfgControls(disabled) {
     return el(
         "div",
         { class: "svc-modal-cfg" },
-        numRow("epochs", "epochs", 1, 1, 200,
-            "passes over the view set → iterations = epochs × number of views"),
-        numRow("batch", "batch", 1, 1, 32,
-            "views per optimizer step (fills the GPU); speed knob at constant work"),
+        numRow(
+            "epochs",
+            "epochs",
+            1,
+            1,
+            200,
+            "passes over the view set → iterations = epochs × number of views",
+        ),
+        numRow(
+            "batch",
+            "batch",
+            1,
+            1,
+            32,
+            "views per optimizer step (fills the GPU); speed knob at constant work",
+        ),
     );
 }
 
@@ -2576,18 +2566,6 @@ function renderModal(cell) {
         btn.title = st.error || "remote train failed — click to retry";
     }
     row.appendChild(btn);
-    // While running, offer a detach that cancels the remote A100 job and frees
-    // the cell to re-launch fresh from stage 4.
-    if (running) {
-        row.appendChild(
-            el("button", {
-                class: "splat-stage2-btn err",
-                text: "detach",
-                title: "cancel the remote A100 job (terminates the container) and free this cell to re-train from stage 4",
-                onclick: () => detachModalTrain(),
-            }),
-        );
-    }
     box.appendChild(row);
 
     // Client-owned training policy — editable while idle (hidden mid-run). These
@@ -2664,7 +2642,8 @@ function renderModal(cell) {
 
     // Accumulate distinct heartbeat lines into the live log pane (a scrolling
     // history, so training-step lines read as progress, not a single value).
-    const line = running && st.msg ? `[${st.stage || st.phase}] ${st.msg}` : null;
+    const line =
+        running && st.msg ? `[${st.stage || st.phase}] ${st.msg}` : null;
     if (line && modalLog[modalLog.length - 1] !== line) {
         modalLog.push(line);
         if (modalLog.length > 400) modalLog.shift();
@@ -2714,30 +2693,6 @@ async function startModalTrain(restart = false) {
     pollStages();
 }
 
-// Detach + cancel the cell's Modal train (terminates the remote A100 container),
-// then re-poll so the cell drops back to idle — free to re-launch from stage 4.
-// Confirms first, since this kills in-flight training.
-async function detachModalTrain() {
-    if (!current) return;
-    if (
-        !window.confirm(
-            "Cancel the remote Modal job and detach?\n\nThis terminates the running A100 container. The cell returns to idle so you can re-train from stage 4.",
-        )
-    )
-        return;
-    setStatus("detaching — cancelling remote job…", "var(--purple)");
-    try {
-        await api.splatModalCancel(current.run, current.slot, current.model);
-    } catch (e) {
-        setStatus(`detach failed: ${e.message}`, "var(--red)");
-        return;
-    }
-    modalLog = [];
-    modalPlanShown = false;
-    setStatus("detached — remote job cancelled", "var(--purple)");
-    pollStages();
-}
-
 const fmtInt = (n) => (n == null ? "?" : Number(n).toLocaleString());
 
 // Coverage readout for the planned camera set (Stage 4's summary): how well the
@@ -2764,49 +2719,49 @@ function renderCoverage() {
     const satColor =
         satPct >= 90 ? "var(--green)" : satPct >= 70 ? "#d0a020" : "var(--red)";
 
-	box.appendChild(el("div", { class: "svc-title", text: "coverage" }));
-	const rows = [
-		["patches", fmtInt(patches), null],
-		[
-			"cameras · candidates",
-			`${fmtInt(sum.cameras)} · ${fmtInt(sum.candidates)}`,
-			null,
-		],
-		["views (image files)", fmtInt(sum.views), null],
-		["satisfied (≥K angles)", `${fmtInt(sat)} · ${satPct}%`, satColor],
-		["under-covered", fmtInt(Math.max(0, seen - sat)), null],
-		[
-			"occlusion-culled",
-			fmtInt(cov.occlusion_culled),
-			cov.occlusion_culled ? "var(--red)" : null,
-		],
-		["reached (≥1 view)", `${fmtInt(seen)} · ${seenPct}%`, null],
-		[
-			"mean angles/patch",
-			cov.mean_angles_seen != null ? String(cov.mean_angles_seen) : "?",
-			null,
-		],
-		[
-			"target K / sectors",
-			`${sum.angles_per_patch ?? "?"} / ${sum.angular_sectors ?? "?"}`,
-			null,
-		],
-	];
-	for (const [k, v, color] of rows) {
-		const row = el("div");
-		Object.assign(row.style, {
-			display: "flex",
-			justifyContent: "space-between",
-			gap: "10px",
-			fontSize: "12px",
-			padding: "1px 0",
-		});
-		row.appendChild(el("span", { class: "muted", text: k }));
-		const val = el("span", { text: String(v) });
-		if (color) val.style.color = color;
-		row.appendChild(val);
-		box.appendChild(row);
-	}
+    box.appendChild(el("div", { class: "svc-title", text: "coverage" }));
+    const rows = [
+        ["patches", fmtInt(patches), null],
+        [
+            "cameras · candidates",
+            `${fmtInt(sum.cameras)} · ${fmtInt(sum.candidates)}`,
+            null,
+        ],
+        ["views (image files)", fmtInt(sum.views), null],
+        ["satisfied (≥K angles)", `${fmtInt(sat)} · ${satPct}%`, satColor],
+        ["under-covered", fmtInt(Math.max(0, seen - sat)), null],
+        [
+            "occlusion-culled",
+            fmtInt(cov.occlusion_culled),
+            cov.occlusion_culled ? "var(--red)" : null,
+        ],
+        ["reached (≥1 view)", `${fmtInt(seen)} · ${seenPct}%`, null],
+        [
+            "mean angles/patch",
+            cov.mean_angles_seen != null ? String(cov.mean_angles_seen) : "?",
+            null,
+        ],
+        [
+            "target K / sectors",
+            `${sum.angles_per_patch ?? "?"} / ${sum.angular_sectors ?? "?"}`,
+            null,
+        ],
+    ];
+    for (const [k, v, color] of rows) {
+        const row = el("div");
+        Object.assign(row.style, {
+            display: "flex",
+            justifyContent: "space-between",
+            gap: "10px",
+            fontSize: "12px",
+            padding: "1px 0",
+        });
+        row.appendChild(el("span", { class: "muted", text: k }));
+        const val = el("span", { text: String(v) });
+        if (color) val.style.color = color;
+        row.appendChild(val);
+        box.appendChild(row);
+    }
 }
 
 // Fetch this cell's per-stage status; re-render the stepper; load (or drop) the

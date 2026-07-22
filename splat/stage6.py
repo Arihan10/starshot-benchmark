@@ -1656,7 +1656,9 @@ def _render_batch(torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K
         render_mode="RGB+ED",
         distloss=dist_on,
         depth_mode=params.depth_mode,
-        absgrad=params.absgrad,
+        # absgrad is unsupported on gsplat 1.5.3's 2DGS densification path
+        # (`gradient_2dgs` never gets `.absgrad`; see grow_grad2d in TrainParams).
+        absgrad=False,
     )
 
 
@@ -1846,7 +1848,9 @@ def _train_one(  # noqa: ANN001
         refine_stop_iter=params.resolved_refine_stop,
         reset_every=params.reset_every if params.reset_every > 0 else params.iterations + 1,
         refine_every=params.refine_every,
-        absgrad=params.absgrad,
+        # absgrad stays off: gsplat 1.5.3 never writes `.absgrad` on the 2DGS
+        # `gradient_2dgs` tensor this strategy reads (see grow_grad2d note above).
+        absgrad=False,
         key_for_gradient="gradient_2dgs",
         verbose=False,
     )
