@@ -15,18 +15,20 @@ Consumes the **Stage-2 free-space grid** (`stage2.load_free_space`):
 
 ONE KNOB — `detail`. Base spacing = `_BASE_SPACING / sqrt(detail)`, so detail=1
 reproduces the default ~3 cm base, detail=2 doubles density, 0.5 halves it. Disk
-radius = `_RADIUS_FRAC` × the surfel's cell size; the rest are fixed constants.
+radius = `_RADIUS_FRAC` × the object's spacing; the rest are fixed constants.
 
-SCENE-SCALE ADAPTIVITY (angular, not metric). A screen pixel is an ANGLE, so the
-metric detail worth storing scales with typical viewing distance — which scales
-with a scene's open sightlines, not its bounding box. Per cell we derive a scale
-`k` from the Stage-2 candidates' distance-to-surface (`_scene_scale`) and sample
-each object at `base · clamp(obj_diag / _VIEW_REF_M, 1, k)` (`_object_spacing`):
-small props stay at `base` at any scene size, large-area surface (terrain, long
-walls) reaches the ceiling `base·k`. Indoor scenes (hotel-anchored) get k=1 and
-are UNCHANGED; a 60,000 m² swamp gets k≈2.2, and with coarsening its cloud drops
-from ~1.25 GB (uniform-base coarsened) to ~240 MB — angular fidelity held roughly
-constant while metric fidelity tracks how far the surface is actually seen.
+OBJECT-SCALE ADAPTIVITY (angular, not metric). A screen pixel is an ANGLE, so the
+metric detail worth storing scales with the distance a surface is actually viewed
+from — and an object is typically framed from ~its own size away. So each object
+samples at `base · max(1, obj_diag / _VIEW_REF_M)` (`_object_spacing`), UNCAPPED:
+small props (obj_diag ≤ ~2 m) stay at `base`, a mountain or skydome gets metre-
+scale surfels — but each surfel still sits ON the surface at its LOCAL normal, so
+a large object reads as a coherent (lower-resolution) surface from EVERY angle.
+This is deliberately NOT done by merging many surfels into one flat disc at their
+mean orientation: that reads fine head-on but fractures into angle-dependent
+billboards ("clouds") when orbited, AND averages the members' colours together,
+bleeding anything painted on a flat surface (wall art, ceiling vents, backdrop
+texture) into a muddy mean. Scale adaptivity is entirely the SPACING's job.
 
 SAMPLING — SEEDED DARTS + LATTICE-HASH THINNING. Candidates are area-weighted random
 surface points (`trimesh.sample.sample_surface`, SEEDED per object/slab — no
@@ -40,35 +42,23 @@ peak RSS, ~63 % of runtime) — with a few integer passes: no KD-tree, no pair t
 (lite) mesh surface with its face index → exact barycentric UV → exact base-colour
 texel, so the colour/orient/cull paths are the long-validated ones.
 
-FEATURE-ADAPTIVE DENSITY = GEOMETRY-DRIVEN COARSENING (both directions matter; this
-is the one that pays). After orient+cull+colour, surviving base surfels are merged
-BOTTOM-UP in octaves (cell edge 2·s, 4·s, … up to `2^_COARSEN_OCTAVES·s`): the nodes
-in each parent cell are split into two FACING SIDES (by the sign of each oriented
-normal against the group's principal axis — orientation is already air-corrected, so
-the two faces of a wall/sheet split cleanly and NEVER merge), and a side collapses
-into ONE bigger surfel only when a single flat disk truly represents it:
-  * FILLED  — accumulated base-cell count ≥ `_MERGE_FILL·4^k` (a sliver or border
-    never becomes a big disk overhanging air);
-  * SMOOTH  — oriented normals agree (`1 − |mean n̂| ≤ _MERGE_FLAT`): gently curved
-    mud/rock coarsens, tight curvature stays fine;
-  * COPLANAR — member positions lie within `_MERGE_OFFSET_FRAC·s` (ABSOLUTE, base-
-    spacing scale) of the side's plane: silhouettes stay tight and stacked parallel
-    sheets can never fuse, whatever their normals say.
-Merged colour is the base-count-weighted mean of the members' EXACT texel colours —
-an average of true on-surface samples (never a mip/footprint filter, so UV-atlas
-gutters can't bleed in). NO colour gate: a textured-but-flat surface coarsens; its
-high-frequency albedo is Stage 6's job (it retrains colour against the reference
-renders and densifies only where those renders demand it). This is what makes splat
-size track scene INFORMATION instead of scene AREA: a swamp's mudflats collapse to
-~24 cm disks while its cattails stay at 3 cm — without it, a 59,600 m² outdoor cell
-at uniform 3 cm density is ~46 M surfels ≈ 3 GB of float32 PLY versus 156 MB of lite
-GLBs, i.e. paying area-rent for content the source encodes in kilobytes.
+NO MERGING (COARSENING RETIRED). Every surviving surfel is emitted individually at
+its object's spacing, keeping the EXACT texel colour sampled at its own position —
+never an area-average of its neighbours. A merge pass was tried and removed: once
+spacing is object-scaled the base surfels are already large (a wall at ~13 cm, a
+backdrop at metres), and multiplying that by octave merging produced ~1 m–20 m discs
+whose single averaged colour bled everything painted on the surface into a mean.
+Object-scaled spacing already makes count track INFORMATION rather than AREA — a flat
+object of ANY size samples to ~`(2/base)²` surfels (spacing ∝ its diagonal), so a
+200 m backdrop and a 2 m panel cost about the same — so the merge bought little size
+and cost fidelity. High-frequency albedo on a coarse-but-flat surface is Stage 6's
+job (it retrains colour against the reference renders and densifies where they
+demand it), starting from crisp per-surfel colour instead of a pre-blurred mean.
 
 CHUNKING: an object whose candidate budget exceeds `_CHUNK_MAX_CANDIDATES` is sampled
 in `_CHUNK_EXTENT`-metre spatial slabs (partition its triangles, sample each), so a
 single huge mesh (terrain, a racetrack ribbon) has BOUNDED transient memory — the
-lattice keys are absolute, so slab seams cost only a one-cell layer at base density
-(merging is per-slab too; a parent cell cut by a slab boundary just stays finer).
+lattice keys are absolute, so slab seams cost only a one-cell layer at base density.
 
 Optional `_FEATURE_REFINE` (OFF): the legacy crease/boundary band refinement
 (`_spacing_bands`) that samples near feature edges up to `_FEATURE_BOOST`× finer. On
@@ -78,14 +68,15 @@ undersampled those bands back to ~base density. Off until a detector separates r
 edges from organic bumpiness.
 
 PIPELINE PER OBJECT (parallel across objects — `_iter_sampled`, spawn pool,
-id-ordered merge): load → darts → THIN → ORIENT + CULL → colour survivors → COARSEN →
-emit. Deterministic end to end (seeded darts, integer lattices), so a cell resamples
+id-ordered merge): load → darts → THIN → ORIENT + CULL → SEALED cull (LOS escape
+march — see the `_SEAL_*` block) → colour survivors → emit. Deterministic end to
+end (seeded darts, integer lattices, fixed march directions), so a cell resamples
 to the identical cloud for any worker count.
 
 Each surfel: position (world), rotation (quaternion aligning +Z to the oriented
-normal), scale (r, r, ~0), color (exact texel for base surfels; member-mean for
-merged), opacity (texel alpha, honouring `alphaMode`). Stored SH is degree 0
-(`f_dc`) — unlit / view-independent.
+normal), scale (r, r, ~0) with r = `_RADIUS_FRAC`·spacing, color (exact texel),
+opacity (texel alpha, honouring `alphaMode`). Stored SH is degree 0 (`f_dc`) —
+unlit / view-independent.
 
 Pure library: `sample_cell` takes explicit paths. Meshes are consumed AS-IS through
 `splat.assets.load_geoms` — vanilla glTF via trimesh, KTX2/Meshopt sets via the
@@ -107,7 +98,12 @@ import trimesh
 from scipy.spatial import cKDTree
 
 from splat.assets import load_geoms
-from splat.stage2 import FreeSpace, _subdivide_edges, _valid_tri_mask, load_free_space
+from splat.stage2 import (
+    FreeSpace,
+    _subdivide_edges,
+    _valid_tri_mask,
+    load_free_space,
+)
 
 # trimesh logs per-file load noise; silence it for whole-cell runs.
 logging.getLogger("trimesh").setLevel(logging.ERROR)
@@ -124,8 +120,8 @@ DEFAULT_DETAIL = 1.0
 _DETAIL_CLAMP = (0.05, 16.0)
 _SPACING_CLAMP = (0.004, 0.25)
 
-# Disk σ = _RADIUS_FRAC × the surfel's cell size (base spacing for unmerged surfels,
-# 2^k× that for merged ones) — disks tile their cell block; Stage 6 fine-tunes scales.
+# Disk σ = _RADIUS_FRAC × the object's spacing — disks slightly overlap their
+# neighbours (full surface coverage); Stage 6 fine-tunes scales from there.
 _RADIUS_FRAC = 0.9
 # 3dgs-mode only: fake thickness (third scale = radius × _FLATNESS).
 _FLATNESS = 0.1
@@ -138,40 +134,57 @@ _THIN_CELL_FACTOR = 1.0
 # (Poisson e^-2.4); the old sampler generated ~6×/spacing².
 _THIN_CANDIDATES = 2.4
 
-# --- geometry-driven coarsening (see module docstring) -------------------------
-# Octaves of bottom-up merging above base spacing: 3 → biggest surfel 8·s (~24 cm at
-# detail 1). Raising it grows the flat-region win quadratically but tests each extra
-# level against the same absolute planarity guard.
-_COARSEN_OCTAVES = 3
-# FILLED: a (parent cell, side) merges only when its accumulated base-cell count is
-# at least this fraction of the in-plane expectation 4^k (a flat sheet through a
-# 2^k-cell cube crosses ~(2^k)² base cells; borders/slivers fall short and stay fine).
-_MERGE_FILL = 0.5
-# SMOOTH: oriented-normal agreement, as 1 − |mean unit normal| ≤ this. cos-form of a
-# ~12° spread — gentle terrain curvature merges, tight curvature doesn't.
-_MERGE_FLAT = float(1.0 - np.cos(np.deg2rad(12.0)))
-# COPLANAR: members must lie within this × BASE spacing of the side's plane —
-# absolute, not per-level, so merged silhouettes stay sub-spacing tight and two
-# stacked sheets (thin wall faces, leaf layers) can never fuse.
-_MERGE_OFFSET_FRAC = 0.35
+# --- provably-sealed surfel cull ------------------------------------------------
+# The orient/cull probe is LOCAL (air within ~2 voxels of either side), so surfels
+# deep inside crevices/folds/seam-pockets survive: air sits right beside them, but
+# no viewer can ever see into it. SEALED = no LINE OF SIGHT to viewable air:
+#   1. PRE-FILTER (cost bound): candidate cracks are surfels where at most
+#      `_SEAL_OPEN_MAX` of the 26 spherical probe directions reach EMPTY air at
+#      `_SEAL_RADIUS_VOX` voxels. Isotropic (26 dirs, not 6 axes) because an
+#      axis-aligned flat OPEN wall scores ~2/6 on an axis probe (tangent probes
+#      run inside its own cover layer) but high on the sphere. Open surfaces skip
+#      the march entirely.
+#   2. LOS ESCAPE MARCH (the decider): from each candidate crack, a straight ray
+#      is marched voxel-by-voxel along each of the 26 directions. A ray DIES
+#      when it leaves EMPTY air (hits cover / garbage / unexplored); it ESCAPES
+#      when it stays in empty air for `_SEAL_MARCH_VOX` consecutive voxels
+#      (~0.5 m) — an unobstructed straight corridor a viewer's eye can sit in
+#      with the surfel in direct line of sight. Stage-2 EMPTY air is by
+#      definition viewer-reachable (ambient + rescued, inside AND outside the
+#      scene), so escaping into it holds the "outside views matter" contract,
+#      and sealed hollows can't fake an escape (their air is garbage — rays die
+#      at the first step). Cull only when NO direction escapes: you cannot back
+#      an eye 0.5 m away from this point in any straight direction without
+#      hitting rock. (A plain Euclidean "viewable candidate within 1.5 m" test
+#      was tried first and culled ~nothing: canyon air is always NEAR a
+#      crevice; it just can't SEE into it.) Residual approximation: sight lines
+#      threading cones narrower than the ~19° gaps between the 26 directions
+#      are missed — surfels visible only through such pinholes cull as sealed,
+#      which is perceptually harmless.
+# Rescued cavities (furnished interiors) keep their surfels: their air is
+# EMPTY, so rays escape into it — by design. Disabled when a scene has almost
+# no open camera candidates (guard for tiny/pathological scenes).
+_SEAL_RADIUS_VOX = 4.0
+_SEAL_OPEN_MAX = 6
+_SEAL_MARCH_VOX = 16
+_SEAL_CAND_CLEAR = 0.20
+_SEAL_MIN_CANDS = 16
+_SEAL_DIRS = np.array(
+    [o for o in np.ndindex(3, 3, 3) if o != (1, 1, 1)], dtype=np.float64
+) - 1.0
+_SEAL_DIRS /= np.linalg.norm(_SEAL_DIRS, axis=1, keepdims=True)
 
-# --- scene-scale-adaptive spacing (angular fidelity, not metric) ---------------
-# A screen pixel is an ANGLE, so the metric detail worth storing scales with
-# typical viewing distance. We estimate that per cell from the Stage-2 camera
-# candidates' distance-to-surface (`cand_clear`) — the scene's open-sightline
-# statistic — NOT the bounding-box diagonal (which misreads a big building full
-# of small rooms as far-viewed). `k = clamp(P_pctl(cand_clear)/ref, 1, kmax)`,
-# anchored so a hotel-room's ~1.7 m P90 gives k=1 (indoor scenes UNCHANGED).
-# cand_clear is capped by the Stage-2 coverage band (~5 m), so k is a
-# conservative under-estimate for very open scenes — the safe direction.
-_SIGHTLINE_PCTL = 90
-_SIGHTLINE_REF_M = 1.73         # hotel-room P90(cand_clear): the k=1 anchor
-_SCENE_K_CLAMP = (1.0, 4.0)
-# Per-object floor: an object is typically framed from ~its own diagonal away, so
-# its spacing scales with `obj_diag / _VIEW_REF_M`, clamped to [base, base·k].
-# So small props (cattail, chair) stay at base however large the scene, mid-size
-# hero objects scale with their own size, and only large-area surface (terrain,
-# long walls) reaches the scene ceiling. 2 m = the hotel-anchor framing distance.
+# --- object-scale-adaptive spacing (angular fidelity, not metric) --------------
+# A screen pixel is an ANGLE, so the metric detail worth storing scales with the
+# distance a surface is actually viewed from — and an object is typically framed
+# from ~its own size away. So spacing scales with the OBJECT'S OWN diagonal:
+# `base · max(1, obj_diag / _VIEW_REF_M)`, UNCAPPED. Small props (cattail, chair,
+# obj_diag ≤ 2 m) stay at `base`; a hero prop scales with itself; a mountain or
+# skydome gets metre-scale surfels — but every surfel still sits ON the surface at
+# its LOCAL normal, so a big object reads as a coherent (lower-resolution) surface
+# from all angles, unlike a merged flat disc. This spacing is the ONLY size lever
+# (no coarsening merge). 2 m = the framing distance the base ~3 cm spacing is
+# calibrated for.
 _VIEW_REF_M = 2.0
 
 # --- legacy feature refinement (OFF by default; see module docstring) ----------
@@ -407,7 +420,7 @@ def _thin_band(points: np.ndarray, spacing: float) -> np.ndarray:
     cell centre. O(N) integer passes — no KD-tree, no pair table. A single winner
     per cell matches the old sampler's effective handling of coincident opposite
     faces and avoids the winding-driven doubling a pre-orientation facing split
-    causes (facing handling happens later, in the coarsener, POST-orientation)."""
+    would cause; orientation is fixed later per surfel in `_orient_and_cull`."""
     n = len(points)
     if n == 0:
         return np.zeros(0, dtype=np.int64)
@@ -490,135 +503,56 @@ def _orient_and_cull(
     return plus_open | minus_open, oriented
 
 
-def _group_ids(cells: np.ndarray) -> np.ndarray:
-    """(N,) int64 group id per (N,3) integer cell row (offset to non-negative and
-    packed to one int64 when the local lattice fits, else row-unique)."""
-    loc = cells - cells.min(axis=0)
-    nx = int(loc[:, 0].max()) + 1
-    ny = int(loc[:, 1].max()) + 1
-    nz = int(loc[:, 2].max()) + 1
-    if nx * ny * nz < (1 << 61):
-        return (loc[:, 0] * ny + loc[:, 1]) * nz + loc[:, 2]
-    _, gid = np.unique(loc, axis=0, return_inverse=True)
-    return gid.reshape(-1)
+def _open_cand_keys(fs: FreeSpace) -> np.ndarray:
+    """The sealed-cull ENABLE gate for one grid (name kept for the threading):
+    non-empty ⇔ the scene has at least `_SEAL_MIN_CANDS` camera candidates with
+    clearance ≥ `_SEAL_CAND_CLEAR`. The LOS escape march needs no candidate
+    index — this only guards tiny/pathological scenes against culling."""
+    if int((fs.cand_clear >= _SEAL_CAND_CLEAR).sum()) < _SEAL_MIN_CANDS:
+        return np.zeros(0, dtype=np.int64)
+    return np.ones(1, dtype=np.int64)
 
 
-def _coarsen(
-    pos: np.ndarray,
-    nrm: np.ndarray,
-    col: np.ndarray,
-    spacing: float,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Geometry-driven bottom-up merging of surviving base surfels (module
-    docstring): per octave level k, group nodes by parent cell of edge `2^k·s`,
-    split each group into two facing SIDES against its principal normal axis
-    (normals are already air-oriented), and collapse a side into ONE surfel when it
-    is FILLED, SMOOTH and COPLANAR. Returns `(positions, normals, colors, radii)`
-    with radii = `_RADIUS_FRAC` × each node's cell size. Deterministic; O(N) integer
-    group passes per level."""
-    n = len(pos)
-    radii = np.full(n, _RADIUS_FRAC * spacing, dtype=np.float32)
-    if n < 4 or _COARSEN_OCTAVES <= 0:
-        return pos, nrm, col, radii
+def _sealed_mask(
+    positions: np.ndarray, fs: FreeSpace, cand_keys: np.ndarray
+) -> np.ndarray:
+    """True per surfel when it is PROVABLY SEALED (module constants): crack-like
+    local air (pre-filter) AND no straight line of sight to open air — no ray
+    among the 26 directions stays in EMPTY air for `_SEAL_MARCH_VOX` consecutive
+    voxels. Empty `cand_keys` (the enable gate) ⇒ no culls."""
+    n = len(positions)
+    if n == 0 or cand_keys.size == 0:
+        return np.zeros(n, dtype=bool)
+    pos = positions.astype(np.float64)
+    openness = np.zeros(n, dtype=np.int16)
+    r = _SEAL_RADIUS_VOX * fs.pitch
+    for d in _SEAL_DIRS:
+        openness += fs.empty_at(pos + d * r).astype(np.int16)
+    crack_idx = np.nonzero(openness <= _SEAL_OPEN_MAX)[0]
+    out = np.zeros(n, dtype=bool)
+    if not len(crack_idx):
+        return out
 
-    pos = pos.astype(np.float64)
-    nrm = nrm.astype(np.float64)
-    col = col.astype(np.float64)
-    count = np.ones(n, dtype=np.float64)  # accumulated base-cell count per node
-    offset_tol = _MERGE_OFFSET_FRAC * spacing
-
-    for k in range(1, _COARSEN_OCTAVES + 1):
-        L = spacing * (2.0 ** k)
-        cell = np.floor(pos / L).astype(np.int64)
-        gid = _group_ids(cell)
-        _, inv = np.unique(gid, return_inverse=True)
-        inv = inv.reshape(-1)
-        g = int(inv.max()) + 1
-
-        # Principal normal axis per group: top eigenvector of Σ n·nᵀ (sign-free,
-        # so mixed winding/orientation across the group cannot hide a two-sided
-        # cell). Six bincounts build the symmetric tensors — no (N,3,3) temp,
-        # no unbuffered np.add.at.
-        tens = np.empty((g, 3, 3))
-        for i in range(3):
-            for j in range(i, 3):
-                tij = np.bincount(inv, nrm[:, i] * nrm[:, j], g)
-                tens[:, i, j] = tij
-                tens[:, j, i] = tij
-        _, v = np.linalg.eigh(tens)
-        axis = v[:, :, 2]  # eigenvector of the largest eigenvalue
-        side = (np.einsum("nj,nj->n", nrm, axis[inv]) >= 0.0).astype(np.int64)
-        sid = inv * 2 + side
-        ns = 2 * g
-
-        # Per-(group, side) reductions.
-        scnt = np.bincount(sid, minlength=ns)                     # member nodes
-        sbase = np.bincount(sid, count, ns)                       # base cells
-        wsum = np.maximum(sbase, 1e-12)
-        mpos = np.stack(
-            [np.bincount(sid, count * pos[:, i], ns) for i in range(3)], axis=1
-        ) / wsum[:, None]
-        mnrm = np.stack(
-            [np.bincount(sid, count * nrm[:, i], ns) for i in range(3)], axis=1
-        )
-        mlen = np.linalg.norm(mnrm, axis=1)
-        mdir = mnrm / np.maximum(mlen, 1e-12)[:, None]
-        mcol = np.stack(
-            [np.bincount(sid, count * col[:, i], ns) for i in range(4)], axis=1
-        ) / wsum[:, None]
-
-        # COPLANAR: spread of member projections onto the side's mean normal,
-        # reduced per side via one sort + reduceat (buffered, unlike ufunc.at).
-        off = np.einsum("nj,nj->n", pos - mpos[sid], mdir[sid])
-        order = np.argsort(sid, kind="stable")
-        sid_s = sid[order]
-        starts = np.ones(len(order), dtype=bool)
-        starts[1:] = sid_s[1:] != sid_s[:-1]
-        idx = np.flatnonzero(starts)
-        present = sid_s[idx]
-        omin = np.full(ns, np.inf)
-        omax = np.full(ns, -np.inf)
-        omin[present] = np.minimum.reduceat(off[order], idx)
-        omax[present] = np.maximum.reduceat(off[order], idx)
-
-        # SMOOTH: oriented-normal agreement (mean of unit normals stays ~unit).
-        nspread = 1.0 - mlen / np.maximum(sbase, 1e-12)
-
-        merge = (
-            (scnt >= 2)
-            & (sbase >= _MERGE_FILL * (4.0 ** k))
-            & (nspread <= _MERGE_FLAT)
-            & ((omax - omin) <= offset_tol)
-        )
-        if not merge.any():
+    # LOS escape march: sealed until some direction escapes. Rays start 2 voxels
+    # out (clear of the surfel's own cover layer) and must stay in EMPTY air for
+    # `_SEAL_MARCH_VOX` consecutive steps to count as an escape.
+    sealed = np.ones(len(crack_idx), dtype=bool)
+    cpos = pos[crack_idx]
+    for d in _SEAL_DIRS:
+        pend = np.nonzero(sealed)[0]
+        if not len(pend):
             break
-
-        drop = merge[sid]  # members absorbed into a merged node
-        keep_pos = pos[~drop]
-        keep_nrm = nrm[~drop]
-        keep_col = col[~drop]
-        keep_cnt = count[~drop]
-        keep_rad = radii[~drop]
-
-        m = np.nonzero(merge)[0]
-        new_pos = mpos[m]
-        new_nrm = mdir[m]
-        new_col = mcol[m]
-        new_cnt = sbase[m]
-        new_rad = np.full(len(m), _RADIUS_FRAC * L, dtype=np.float32)
-
-        pos = np.concatenate([keep_pos, new_pos], axis=0)
-        nrm = np.concatenate([keep_nrm, new_nrm], axis=0)
-        col = np.concatenate([keep_col, new_col], axis=0)
-        count = np.concatenate([keep_cnt, new_cnt], axis=0)
-        radii = np.concatenate([keep_rad, new_rad], axis=0)
-
-    return (
-        pos.astype(np.float32),
-        nrm.astype(np.float32),
-        col.astype(np.float32),
-        radii.astype(np.float32),
-    )
+        p = cpos[pend]
+        alive = np.ones(len(pend), dtype=bool)
+        for t in range(2, 2 + _SEAL_MARCH_VOX):
+            live = np.nonzero(alive)[0]
+            if not len(live):
+                break
+            ok = fs.empty_at(p[live] + d * (t * fs.pitch))
+            alive[live[~ok]] = False
+        sealed[pend[alive]] = False  # alive to the cap = escaped = visible
+    out[crack_idx] = sealed
+    return out
 
 
 def _band_seed(mesh: trimesh.Trimesh, spacing: float, salt: int) -> int:
@@ -629,26 +563,33 @@ def _band_seed(mesh: trimesh.Trimesh, spacing: float, salt: int) -> int:
 
 
 def _band_darts(
-    mesh: trimesh.Trimesh, spacing: float, opaque: bool, fs: FreeSpace, seed: int
-) -> tuple[dict[str, np.ndarray] | None, int]:
+    mesh: trimesh.Trimesh,
+    spacing: float,
+    opaque: bool,
+    fs: FreeSpace,
+    cand_keys: np.ndarray,
+    seed: int,
+) -> tuple[dict[str, np.ndarray] | None, int, int]:
     """One (sub)mesh → surfels: seeded darts, lattice thin, orient+cull against
-    `fs.empty_at`, colour survivors (exact texels), then geometry-driven COARSEN.
-    Returns `(per-surfel arrays | None, base-surfel count before coarsening)`."""
+    `fs.empty_at`, drop PROVABLY SEALED survivors (`_sealed_mask`), colour the
+    rest (exact texels). Every surfel is emitted at the object's own spacing with
+    its EXACT texel colour — no merging, so no cross-boundary colour averaging.
+    Returns `(per-surfel arrays | None, surfel count, sealed-culled count)`."""
     if len(mesh.faces) == 0 or mesh.area <= 0:
-        return None, 0
+        return None, 0, 0
     budget = int(mesh.area / (spacing * spacing) * _THIN_CANDIDATES) + 8
     try:
         points, face_idx = trimesh.sample.sample_surface(mesh, budget, seed=seed)
     except Exception:
-        return None, 0
+        return None, 0, 0
     points = np.asarray(points, dtype=np.float64)
     face_idx = np.asarray(face_idx)
     if len(points) == 0:
-        return None, 0
+        return None, 0, 0
 
     keep_idx = _thin_band(points, spacing)
     if len(keep_idx) == 0:
-        return None, 0
+        return None, 0, 0
     points = points[keep_idx]
     face_idx = face_idx[keep_idx]
     thinned = len(points)
@@ -662,35 +603,46 @@ def _band_darts(
     nrm32 = normals.astype(np.float32)
     keep, oriented = _orient_and_cull(pos32, nrm32, fs)
     if not keep.any():
-        return None, thinned
+        return None, thinned, 0
 
-    colors = surfel_colors(mesh, points[keep], face_idx[keep]).astype(np.float32)
+    idx = np.nonzero(keep)[0]
+    sealed = _sealed_mask(pos32[idx], fs, cand_keys)
+    n_sealed = int(sealed.sum())
+    idx = idx[~sealed]
+    if len(idx) == 0:
+        return None, thinned, n_sealed
+
+    colors = surfel_colors(mesh, points[idx], face_idx[idx]).astype(np.float32)
     if opaque:
         colors[:, 3] = 1.0
 
-    cpos, cnrm, ccol, crad = _coarsen(
-        pos32[keep], oriented[keep].astype(np.float32), colors, spacing
-    )
     return {
-        "position": cpos,
-        "normal": cnrm,
-        "color": ccol,
-        "radius": crad,
-    }, thinned
+        "position": pos32[idx],
+        "normal": oriented[idx].astype(np.float32),
+        "color": colors,
+        "radius": np.full(len(idx), _RADIUS_FRAC * spacing, dtype=np.float32),
+    }, thinned, n_sealed
 
 
 def _sample_band(
-    mesh: trimesh.Trimesh, spacing: float, opaque: bool, fs: FreeSpace
-) -> tuple[dict[str, np.ndarray] | None, int]:
+    mesh: trimesh.Trimesh,
+    spacing: float,
+    opaque: bool,
+    fs: FreeSpace,
+    cand_keys: np.ndarray,
+) -> tuple[dict[str, np.ndarray] | None, int, int]:
     """Sample one mesh at one spacing. Small meshes go through `_band_darts`
     directly; a mesh whose dart budget exceeds `_CHUNK_MAX_CANDIDATES` is
     partitioned into `_CHUNK_EXTENT`-metre spatial slabs (by triangle centroid) and
-    sampled slab by slab, so transient memory is bounded regardless of size."""
+    sampled slab by slab, so transient memory is bounded regardless of size.
+    Returns `(arrays | None, base-surfel count, sealed-culled count)`."""
     if len(mesh.faces) == 0 or mesh.area <= 0:
-        return None, 0
+        return None, 0, 0
     budget = int(mesh.area / (spacing * spacing) * _THIN_CANDIDATES) + 8
     if budget <= _CHUNK_MAX_CANDIDATES:
-        return _band_darts(mesh, spacing, opaque, fs, _band_seed(mesh, spacing, 0))
+        return _band_darts(
+            mesh, spacing, opaque, fs, cand_keys, _band_seed(mesh, spacing, 0)
+        )
 
     tris = np.asarray(mesh.triangles, dtype=np.float64)
     uv = getattr(getattr(mesh, "visual", None), "uv", None)
@@ -710,67 +662,75 @@ def _sample_band(
     skey = (slab[:, 0] * sy + slab[:, 1]) * sz + slab[:, 2]
     parts: list[dict[str, np.ndarray]] = []
     thinned = 0
+    sealed = 0
     for si, sk in enumerate(np.unique(skey)):
         m = skey == sk
         sub = _soup_mesh(tris[m], uv3[m] if uv3 is not None else None, material)
-        part, n = _band_darts(sub, spacing, opaque, fs, _band_seed(sub, spacing, si + 1))
+        part, n, ns = _band_darts(
+            sub, spacing, opaque, fs, cand_keys, _band_seed(sub, spacing, si + 1)
+        )
         thinned += n
+        sealed += ns
         if part is not None:
             parts.append(part)
     if not parts:
-        return None, thinned
+        return None, thinned, sealed
     if len(parts) == 1:
-        return parts[0], thinned
-    return {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]}, thinned
+        return parts[0], thinned, sealed
+    return (
+        {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]},
+        thinned,
+        sealed,
+    )
 
 
-def _scene_scale(cand_clear: np.ndarray) -> float:
-    """Scene-scale factor k from the Stage-2 candidate clearances (open-sightline
-    statistic): `clamp(P_pctl(cand_clear) / _SIGHTLINE_REF_M, *_SCENE_K_CLAMP)`.
-    Falls back to 1.0 (no scaling) when candidates are too sparse to estimate."""
-    if cand_clear is None or len(cand_clear) < 64:
-        return 1.0
-    p = float(np.percentile(np.asarray(cand_clear, dtype=np.float64), _SIGHTLINE_PCTL))
-    return float(np.clip(p / _SIGHTLINE_REF_M, *_SCENE_K_CLAMP))
-
-
-def _object_spacing(geom: trimesh.Trimesh, base: float, k: float) -> float:
-    """Per-object sample spacing: `base · clamp(obj_diag / _VIEW_REF_M, 1, k)`.
-    Small props stay at `base`; large-area surface reaches the scene ceiling
-    `base·k`; mid-size objects scale with their own diagonal (framed from ~their
-    own size away)."""
+def _object_spacing(geom: trimesh.Trimesh, base: float) -> float:
+    """Per-object sample spacing: `base · max(1, obj_diag / _VIEW_REF_M)`, UNCAPPED.
+    Small props (obj_diag ≤ _VIEW_REF_M) stay at `base`; larger objects sample
+    proportionally coarser (a mountain / skydome gets metre-scale surfels), each
+    still on-surface at its local normal — so scale adaptivity comes from spacing,
+    not from merging many surfels into an angle-dependent flat disc."""
     b = np.asarray(geom.bounds, dtype=np.float64)
     diag = float(np.linalg.norm(b[1] - b[0]))
-    return base * float(np.clip(diag / _VIEW_REF_M, 1.0, k))
+    return base * max(diag / _VIEW_REF_M, 1.0)
 
 
 def _sample_object(
-    geom: trimesh.Trimesh, base: float, k: float, fs: FreeSpace
-) -> tuple[dict[str, np.ndarray] | None, int]:
-    """Sample one placed mesh into surfels at its scene-scale-adaptive spacing
-    (`_object_spacing`), then geometry-coarsen. With `_FEATURE_REFINE` on, split
-    into legacy feature bands first. Returns `(concatenated per-surfel arrays for
-    the VISIBLE surfels | None, total base-surfel count)`. Opacity is forced to 1
-    unless the material is genuinely BLEND/MASK."""
+    geom: trimesh.Trimesh,
+    base: float,
+    fs: FreeSpace,
+    cand_keys: np.ndarray | None = None,
+) -> tuple[dict[str, np.ndarray] | None, int, int]:
+    """Sample one placed mesh into surfels at its object-scale-adaptive spacing
+    (`_object_spacing`). With `_FEATURE_REFINE` on, split into legacy feature bands
+    first. Returns `(concatenated per-surfel arrays for the VISIBLE surfels | None,
+    total sampled-surfel count, sealed-culled count)`. Opacity is forced to 1 unless
+    the material is genuinely BLEND/MASK."""
     if len(geom.faces) == 0 or geom.area <= 0:
-        return None, 0
-    spacing = _object_spacing(geom, base, k)
+        return None, 0, 0
+    if cand_keys is None:
+        cand_keys = _open_cand_keys(fs)
+    spacing = _object_spacing(geom, base)
     opaque = _alpha_mode(geom) not in _TRANSPARENT_ALPHA_MODES
     bands = _spacing_bands(geom, spacing) if _FEATURE_REFINE else [(geom, spacing)]
     parts: list[dict[str, np.ndarray]] = []
     sampled = 0
+    sealed = 0
     for band_mesh, band_spacing in bands:
-        band, n = _sample_band(band_mesh, band_spacing, opaque, fs)
+        band, n, ns = _sample_band(band_mesh, band_spacing, opaque, fs, cand_keys)
         sampled += n
+        sealed += ns
         if band is not None:
             parts.append(band)
     if not parts:
-        return None, sampled
+        return None, sampled, sealed
     if len(parts) == 1:
-        return parts[0], sampled
-    return {
-        k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]
-    }, sampled
+        return parts[0], sampled, sealed
+    return (
+        {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]},
+        sampled,
+        sealed,
+    )
 
 
 def _encode_ply(
@@ -842,45 +802,59 @@ def _encode_ply(
 # the skin bitmask sidecar is memory-mapped, so every worker probing the same grid
 # shares ONE physical copy through the OS page cache.
 
-_TASK_FS: tuple[str, FreeSpace] | None = None
+_TASK_FS: tuple[str, FreeSpace, np.ndarray] | None = None
 
 
 def _task_free_space(path: str) -> FreeSpace:
-    """Process-wide cached free-space grid (spawn workers load it once)."""
+    """Process-wide cached free-space grid (spawn workers load it once), with the
+    sealed-cull's open-candidate lattice keys derived alongside."""
     global _TASK_FS
     cached = _TASK_FS
     if cached is None or cached[0] != path:
-        cached = (path, load_free_space(Path(path)))
+        fs = load_free_space(Path(path))
+        cached = (path, fs, _open_cand_keys(fs))
         _TASK_FS = cached
     return cached[1]
 
 
+def _task_cand_keys(path: str) -> np.ndarray:
+    """The cached open-candidate lattice keys for `path` (loads the grid if
+    this process hasn't yet)."""
+    _task_free_space(path)
+    assert _TASK_FS is not None
+    return _TASK_FS[2]
+
+
 def _sample_object_task(
-    node_id: str, glb_path: str, base: float, k: float, freespace_path: str
-) -> tuple[str, dict[str, np.ndarray] | None, float, int, str | None]:
+    node_id: str, glb_path: str, base: float, freespace_path: str
+) -> tuple[str, dict[str, np.ndarray] | None, float, int, int, str | None]:
     """Sample ONE placed GLB → `(node_id, visible-surfel arrays | None, surface
-    area, base-surfel count, error | None)`. The process-pool work unit; results
-    merge by id order. A failing mesh reports its error instead of raising."""
+    area, base-surfel count, sealed-culled count, error | None)`. The process-pool
+    work unit; results merge by id order. A failing mesh reports its error
+    instead of raising."""
     try:
         fs = _task_free_space(freespace_path)
+        cand_keys = _task_cand_keys(freespace_path)
         parts: list[dict[str, np.ndarray]] = []
         area = 0.0
         sampled = 0
+        sealed = 0
         for geom in load_geoms(Path(glb_path)):
-            part, n = _sample_object(geom, base, k, fs)
+            part, n, ns = _sample_object(geom, base, fs, cand_keys)
             sampled += n
+            sealed += ns
             if part is None:
                 continue
             area += float(geom.area)
             parts.append(part)
         if not parts:
-            return node_id, None, area, sampled, None
+            return node_id, None, area, sampled, sealed, None
         if len(parts) == 1:
-            return node_id, parts[0], area, sampled, None
+            return node_id, parts[0], area, sampled, sealed, None
         merged = {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]}
-        return node_id, merged, area, sampled, None
+        return node_id, merged, area, sampled, sealed, None
     except Exception as exc:
-        return node_id, None, 0.0, 0, f"{type(exc).__name__}: {exc}"
+        return node_id, None, 0.0, 0, 0, f"{type(exc).__name__}: {exc}"
 
 
 def _make_pool(workers: int):  # noqa: ANN202 - ProcessPoolExecutor | None
@@ -901,7 +875,7 @@ def _make_pool(workers: int):  # noqa: ANN202 - ProcessPoolExecutor | None
 
 
 def _iter_sampled(
-    ids: list[str], raw_dir: Path, base: float, k: float, freespace_path: str, pool
+    ids: list[str], raw_dir: Path, base: float, freespace_path: str, pool
 ):  # noqa: ANN201, ANN001 - yields _sample_object_task results
     """Yield per-object sampling results, serially (`pool=None`) or from the given
     process pool. Object-level parallelism is the grain; lattice thinning bounds
@@ -910,7 +884,7 @@ def _iter_sampled(
     if pool is None:
         for node_id in ids:
             yield _sample_object_task(
-                node_id, str(raw_dir / f"{node_id}.glb"), base, k, freespace_path
+                node_id, str(raw_dir / f"{node_id}.glb"), base, freespace_path
             )
         return
     from concurrent.futures import as_completed
@@ -922,7 +896,6 @@ def _iter_sampled(
                 node_id,
                 str(raw_dir / f"{node_id}.glb"),
                 base,
-                k,
                 freespace_path,
             )
             for node_id in ids
@@ -948,8 +921,8 @@ def sample_cell(
     normals + cull hidden faces. `workers` parallelizes the per-object pass (0 =
     auto: min(cores, 8); 1 = serial). Sampling is SEEDED, so the output is
     deterministic for any worker count; results merge in id order. The summary's
-    `sampled` counts BASE surfels (pre-coarsening); `splats` counts the emitted
-    (post-coarsening) cloud."""
+    `sampled` counts thinned surfels before visibility culling; `splats` counts the
+    emitted cloud; `culled_hidden` and `culled_sealed` are the two disjoint culls."""
     if not raw_dir.is_dir():
         raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
     if not Path(freespace_path).is_file():
@@ -961,7 +934,6 @@ def sample_cell(
     fs_path = str(freespace_path)
     probe = _task_free_space(fs_path)
     base = params.spacing
-    scene_k = _scene_scale(probe.cand_clear)
 
     if workers <= 0:
         workers = min(os.cpu_count() or 1, 8)
@@ -978,13 +950,15 @@ def sample_cell(
         progress(0, total, "")
 
     t0 = time.perf_counter()
-    results: dict[str, tuple[dict[str, np.ndarray] | None, float, int, str | None]] = {}
+    results: dict[
+        str, tuple[dict[str, np.ndarray] | None, float, int, int, str | None]
+    ] = {}
     done = 0
-    for node_id, part, area, n_sampled, err in _iter_sampled(
-        ids, raw_dir, base, scene_k, fs_path, pool
+    for node_id, part, area, n_sampled, n_sealed, err in _iter_sampled(
+        ids, raw_dir, base, fs_path, pool
     ):
         done += 1
-        results[node_id] = (part, area, n_sampled, err)
+        results[node_id] = (part, area, n_sampled, n_sealed, err)
         if progress is not None:
             progress(done, total, node_id)
     sample_s = time.perf_counter() - t0
@@ -997,14 +971,16 @@ def sample_cell(
     objects_sampled = 0
     total_area = 0.0
     sampled = 0
+    sealed = 0
     for node_id in ids:
-        part, area, n_sampled, err = results[node_id]
+        part, area, n_sampled, n_sealed, err = results[node_id]
         if err is not None:
             warnings.append(f"{node_id}: failed to sample ({err})")
             continue
         objects_sampled += 1
         total_area += area
         sampled += n_sampled
+        sealed += n_sealed
         if part is None:
             continue
         pos_parts.append(part["position"])
@@ -1034,12 +1010,11 @@ def sample_cell(
         "model": model,
         "splats": int(positions.shape[0]),
         "sampled": int(sampled),
-        "culled_hidden": max(0, int(sampled - positions.shape[0])),
+        "culled_hidden": max(0, int(sampled - positions.shape[0] - sealed)),
+        "culled_sealed": int(sealed),
         "objects_sampled": objects_sampled,
         "objects_total": total,
         "spacing": base,
-        "scene_scale": round(scene_k, 3),
-        "scene_spacing": round(base * scene_k, 4),
         "total_area": round(total_area, 2),
         "workers": workers,
         "timings": {"sample_s": round(sample_s, 2), "encode_s": round(encode_s, 2)},

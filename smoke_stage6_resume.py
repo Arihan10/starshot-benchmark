@@ -16,6 +16,7 @@ OUT = Path(__file__).parent / "runs" / "_smoke" / "stage6_tiled"
 PARAMS = TrainParams(
     iterations=300, refine_start_iter=100, tile_max=6000, lod_levels=0,
     ckpt_every=0, eval_max_views=6, log_every=200,
+    batch=1,  # pin the reference (batch-1) schedule: this tests resume mechanics
 )
 
 

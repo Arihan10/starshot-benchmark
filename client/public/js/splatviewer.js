@@ -59,8 +59,21 @@ let _downXY = null; // pointer-down pos, to tell a click from an orbit drag
 // Pipeline stepper state (the side panel drives the whole splat pipeline).
 let cellStatus = null; // last-fetched per-stage status of the open cell
 let cloudLoaded = false; // whether a surfel cloud is currently in the canvas
-let runningAll = false; // the "run all (1-5)" sequential driver is active
+let runningAll = false; // the "run all (1-3 → modal)" sequential driver is active
 let assetSource = null; // {source, available, active_kind} — which assets feed the pipeline
+let modalPrev = null; // previous poll's cell.modal.status (to catch the done transition)
+let modalLog = []; // accumulated remote-train heartbeat lines (the live log pane)
+let modalPlanShown = false; // one-time: revealed the camera overlay when the plan arrived mid-run
+// Client-owned Stage-6 training length (the server injects NO defaults — see
+// server ModalTrainRequest / splat stage6 resolve_schedule). `epochs` = passes
+// over the view set → iterations = epochs × n_views (scene-size independent,
+// since a bigger scene has proportionally more views); `batch` is the GPU-fill
+// speed knob (steps = iterations // batch, constant work). Edited in the "train
+// on modal" panel; sent with every start.
+let modalTrainCfg = {
+    epochs: 12,
+    batch: 3,
+};
 
 // WASD free-fly state (see movementTick). mkkellogg owns mouse orbit/zoom; this
 // adds keyboard walk by translating the camera + orbit target together per frame.
@@ -246,6 +259,7 @@ async function teardown() {
     if (inputs && inputs.voxels) inputs.voxels.checked = false;
     if (inputs && inputs.garbage) inputs.garbage.checked = false;
     if (inputs && inputs.freevox) inputs.freevox.checked = false;
+    if (inputs && inputs.voxpoints) inputs.voxpoints.checked = false;
     const v = viewer;
     viewer = null;
     if (v) {
@@ -466,6 +480,7 @@ function volumeLayer(geo, color, opacity, xray) {
     mesh.userData.voxOpacity = opacity;
     mesh.userData.voxXray = xray;
     mesh.userData.voxSolid = false;
+    mesh.userData.voxKind = "shell";
     if (xray) mesh.renderOrder = 998; // over the splats, under the patch overlay
     return mesh;
 }
@@ -532,6 +547,72 @@ function quadGeometry(dv, byteOff, count, origin, pitch) {
     return geo;
 }
 
+// Expand the SAME SVX3 quads into DEDUPED per-cell CENTER points — a point cloud
+// instead of a merged surface. Points don't form an occluding skin, so a cavity
+// (a fridge interior: is it garbage or free?) is legible from outside by orbiting.
+// `collapse` folds the fine coords onto the class's native cell — 1 for a fine
+// class, 8 (one brick) for a brick-resolution class — so a brick-tiled shell
+// reads as ONE point per brick, not 64 per face. Cell coords sit in [0, D).
+function cellPointsGeometry(dv, byteOff, count, origin, pitch, collapse) {
+    const seen = new Set();
+    const xs = [];
+    const D = 32768; // key radix per axis (~1 km at 3 cm fine); packs into a f64
+    const step = pitch * collapse;
+    const half = step * 0.5;
+    for (let q = 0; q < count; q++) {
+        const b = byteOff + q * 10;
+        const c = [
+            dv.getUint16(b, true),
+            dv.getUint16(b + 2, true),
+            dv.getUint16(b + 4, true),
+        ];
+        const run = dv.getUint16(b + 8, true);
+        const axis = dv.getUint8(b + 6) >> 1;
+        const runAxis = axis === 2 ? 1 : 2; // z-runs for x/y faces, y-runs for z
+        const start = c[runAxis];
+        for (let r = 0; r < run; r++) {
+            c[runAxis] = start + r;
+            const gx = Math.floor(c[0] / collapse);
+            const gy = Math.floor(c[1] / collapse);
+            const gz = Math.floor(c[2] / collapse);
+            const key = (gx * D + gy) * D + gz;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            xs.push(
+                origin[0] + gx * step + half,
+                origin[1] + gy * step + half,
+                origin[2] + gz * step + half,
+            );
+        }
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute(
+        "position",
+        new THREE.BufferAttribute(new Float32Array(xs), 3),
+    );
+    return geo;
+}
+
+// Point-cloud voxel look: world-sized square dots (~0.6 of a cell) that shrink
+// with distance, so the cloud reads as discrete voxels you can orbit through.
+function voxelPointsMat(color, cellSize) {
+    return new THREE.PointsMaterial({
+        color,
+        size: cellSize * 0.6,
+        sizeAttenuation: true,
+    });
+}
+
+// One point-cloud layer for a class (sibling of its `volumeLayer` shell, tagged
+// `voxKind: "points"` so `syncVoxelVisibility` shows shells OR points, never both).
+function pointLayer(geo, color, cellSize) {
+    const pts = new THREE.Points(geo, voxelPointsMat(color, cellSize));
+    pts.userData.voxColor = color;
+    pts.userData.voxKind = "points";
+    pts.visible = false;
+    return pts;
+}
+
 // Build the voxel overlays from voxels.bin (SVX3): merged VOLUMETRIC boundary
 // shells per class — cover (green), garbage (red, solid + x-ray pair), and the
 // free volume pre-meshed at a ladder of clearance thresholds (blue; the slider
@@ -552,6 +633,10 @@ async function buildVoxels(url, summary) {
     const nShells = dv.getUint32(12, true);
     const pitch = (summary && summary.pitch) || 0.03;
     const origin = (summary && summary.origin) || [0, 0, 0];
+    // Per-class point-cloud resolution: a brick-tiled shell (foliage-scale packs)
+    // collapses to one point per 8³ brick; a fine shell stays per-cell.
+    const vizRes = (summary && summary.viz && summary.viz.resolution) || {};
+    const collapseFor = (cls) => (vizRes[cls] === "brick" ? 8 : 1);
     let off = 16;
     const group = new THREE.Group();
     if (nCover) {
@@ -559,6 +644,12 @@ async function buildVoxels(url, summary) {
         const cover = volumeLayer(geo, 0x3ddc6a, 0.3, false);
         cover.userData.voxClass = "cover";
         group.add(cover);
+        const cc = collapseFor("cover");
+        const pts = pointLayer(
+            cellPointsGeometry(dv, off, nCover, origin, pitch, cc), 0x3ddc6a, pitch * cc,
+        );
+        pts.userData.voxClass = "cover";
+        group.add(pts);
     }
     off += nCover * 10;
     if (nGar) {
@@ -569,21 +660,32 @@ async function buildVoxels(url, summary) {
         const garXray = volumeLayer(geo, 0xff4438, 0.12, true);
         garXray.userData.voxClass = "garbage";
         group.add(garXray);
+        const gc = collapseFor("garbage");
+        const pts = pointLayer(
+            cellPointsGeometry(dv, off, nGar, origin, pitch, gc), 0xff4438, pitch * gc,
+        );
+        pts.userData.voxClass = "garbage";
+        group.add(pts);
     }
     off += nGar * 10;
     const shells = [];
+    const fc = collapseFor("free");
     for (let s = 0; s < nShells; s++) {
         const t = dv.getFloat32(off, true);
         const quads = dv.getUint32(off + 4, true);
         const cells = dv.getUint32(off + 8, true);
         off += 12;
         const geo = quadGeometry(dv, off, quads, origin, pitch);
+        const pts = pointLayer(
+            cellPointsGeometry(dv, off, quads, origin, pitch, fc), 0x3d8bff, pitch * fc,
+        );
+        pts.userData.voxClass = "free";
         off += quads * 10;
         const mesh = volumeLayer(geo, 0x3d8bff, 0.22, false);
         mesh.userData.voxClass = "free";
         mesh.userData.voxTranslucentOnly = true; // filling volume — never opaque
         mesh.visible = false;
-        shells.push({ t, cells, mesh });
+        shells.push({ t, cells, mesh, points: pts });
     }
     if (off > ab.byteLength) throw new Error("truncated voxel pack");
     return { group, shells };
@@ -604,8 +706,13 @@ function updateFreeFilter() {
             Math.round(Number(inputs.freeclear.value)),
         ),
     );
+    // Only the slider's shell is visible, drawn as the merged surface OR the
+    // point cloud per the "points" style toggle (never both).
+    const pointsOn = !!(inputs && inputs.voxpoints && inputs.voxpoints.checked);
     for (let s = 0; s < freeShells.length; s++) {
-        freeShells[s].mesh.visible = s === i;
+        const active = s === i;
+        freeShells[s].mesh.visible = active && !pointsOn;
+        if (freeShells[s].points) freeShells[s].points.visible = active && pointsOn;
     }
     if (inputs._freeVal) {
         inputs._freeVal.textContent = `${freeShells[i].t.toFixed(2)}m · ${freeShells[i].cells.toLocaleString()}`;
@@ -854,7 +961,10 @@ async function ensureVoxels() {
         viewer.threeScene.add(voxelPoints);
         freeShells = built.shells;
         freePoints = new THREE.Group();
-        for (const s of freeShells) freePoints.add(s.mesh);
+        for (const s of freeShells) {
+            freePoints.add(s.mesh);
+            if (s.points) freePoints.add(s.points);
+        }
         freePoints.visible = false;
         viewer.threeScene.add(freePoints);
         // The slider indexes the pre-meshed shell ladder; default to the shell
@@ -1044,13 +1154,20 @@ function syncVoxelVisibility() {
     const notSog = mode !== "sog";
     const coverOn = !!(inputs && inputs.voxels && inputs.voxels.checked);
     const garbageOn = !!(inputs && inputs.garbage && inputs.garbage.checked);
+    // Style toggle: draw each class as its merged shell (default) or as a per-cell
+    // POINT cloud (see-through — for reading a cavity's interior classification).
+    const pointsOn = !!(inputs && inputs.voxpoints && inputs.voxpoints.checked);
     if (voxelPoints) {
-        // The group rides along; each shell is gated by its own class toggle, so
+        // The group rides along; each layer is gated by its own class toggle, so
         // cover (green) and garbage (red) are independent controls.
         voxelPoints.visible = notSog && (coverOn || garbageOn);
         for (const m of voxelPoints.children) {
             const cls = m.userData && m.userData.voxClass;
             let on = cls === "garbage" ? garbageOn : coverOn;
+            // Style gate: a class has both a shell and a point layer — show only
+            // the one the toggle selects.
+            const isPts = m.userData && m.userData.voxKind === "points";
+            if (isPts !== pointsOn) on = false;
             // The x-ray garbage duplicate is an OVERLAY affordance (see sealed
             // interiors through walls); it only z-fights the solid pass in
             // voxel-only mode, so drop it there.
@@ -1061,6 +1178,8 @@ function syncVoxelVisibility() {
     if (freePoints) {
         freePoints.visible =
             notSog && !!(inputs && inputs.freevox && inputs.freevox.checked);
+        // Re-apply the shell/points split for the active clearance shell.
+        updateFreeFilter();
     }
 }
 
@@ -1397,6 +1516,19 @@ function buildControls(summary) {
         el("span", { class: "svc-lab", text: "" }),
         freeApplyBtn,
     );
+    // Render style for every voxel class (cover / garbage / free): merged
+    // translucent shells (default) or a per-cell POINT cloud. Points don't form
+    // an occluding skin, so you can orbit and read a cavity's INTERIOR — e.g.
+    // whether a fridge interior is garbage (red = sealed) or free (blue).
+    const voxPointsRow = checkRow(
+        "voxpoints",
+        "point voxels (see inside cavities)",
+        false,
+    );
+    inputs.voxpoints.addEventListener("change", () => {
+        syncVoxelVisibility();
+        viewer?.forceRenderNextFrame?.();
+    });
     // Patch inspector (needs Stage 4 + Stage 5): select a coverage patch on the
     // splat and open its reference images in the right-side modal.
     const patchRow = checkRow("patches", "patches (click to inspect)", false);
@@ -1438,7 +1570,7 @@ function buildControls(summary) {
     inputs._overlay = overlay;
     inputs._stepper = el("div", { class: "svc-stepper" });
     inputs._coverage = el("div", { class: "svc-coverage" });
-    inputs._stage6 = el("div", { class: "svc-coverage" });
+    inputs._modal = el("div", { class: "svc-coverage" });
     inputs._log = el("pre", { class: "svc-log" });
     Object.assign(inputs._log.style, {
         maxHeight: "180px",
@@ -1492,8 +1624,8 @@ function buildControls(summary) {
         srcRow,
         inputs._stepper,
         inputs._coverage,
-        el("div", { class: "svc-title", text: "training (stage 6)" }),
-        inputs._stage6,
+        el("div", { class: "svc-title", text: "train on modal (stages 4–6)" }),
+        inputs._modal,
         inputs._log,
         el("div", { class: "svc-title", text: "view" }),
         seg,
@@ -1502,6 +1634,7 @@ function buildControls(summary) {
         freeRow,
         freeClearRow,
         freeApplyRow,
+        voxPointsRow,
         patchRow,
         camRow,
         camPlayRow,
@@ -1948,15 +2081,18 @@ function showPatchModal(index) {
 
 // ---- pipeline stepper (the side panel: run/re-run each stage, gated) ---------
 
-// The 5 splat stages in dependency order. Stage 1's status is the cell itself;
-// Stages 2–5 live on `cell.stageN`. A stage is runnable only once the previous is
-// done; re-running a done stage REVERTS everything after it (server-side).
+// The LOCAL splat stages in dependency order (1-3): they run on this machine and
+// prepare the inputs the Modal train job consumes. Stage 1's status is the cell
+// itself; Stages 2-3 live on `cell.stageN`. A stage is runnable only once the
+// previous is done; re-running a done stage REVERTS everything after it
+// (server-side). Stages 4-6 (cameras → references → fine-tune) run REMOTELY as
+// one "train on modal" job (see renderModal), so they're no longer per-stage
+// rows here — the camera plan + references need a CUDA GPU, and doing all three
+// in one A100 container keeps the big reference-image set off this machine.
 const STAGES = [
     { n: 1, label: "assemble", verb: "convert" },
     { n: 2, label: "free space", verb: "voxelize" },
     { n: 3, label: "surfels", verb: "sample" },
-    { n: 4, label: "cameras", verb: "plan" },
-    { n: 5, label: "references", verb: "render" },
 ];
 const STAGE_START = {
     1: (r, s, m) => api.splatStage1Start(r, s, m),
@@ -1979,7 +2115,9 @@ function stageDone(cell, n) {
 }
 
 function anyStageRunning(cell) {
-    if (cell && cell.stage6 && cell.stage6.status === "running") return true;
+    // The remote train job (stages 4-6) keeps the poll alive so its live phase +
+    // training heartbeat stream, and so completion is caught for the auto-switch.
+    if (cell && cell.modal && cell.modal.status === "running") return true;
     return STAGES.some((s) => {
         const st = stageState(cell, s.n).status;
         return st === "running" || st === "pending";
@@ -2092,22 +2230,18 @@ async function runAll() {
             if (stage.n >= 3) await maybeLoadCloud(seq);
         }
         if (seq !== openSeq || !current) return;
-        // Stages 1–5 done → launch Stage 6 as a DETACHED background training job on
-        // the server host (async from the server). pollStages (below) then streams
-        // its live log through the cells status; training continues on its own.
+        // Local stages 1–3 done → launch the remote train (stages 4–6) on the
+        // A100. pollStages (below) then streams its phase + training heartbeat
+        // through the cells status; the run continues on Modal on its own.
         setStatus(
-            "run all: stages 1–5 done — launching training (stage 6)…",
+            "run all: stages 1–3 done — training on Modal (stages 4–6)…",
             "var(--purple)",
         );
         try {
-            await api.splatStage6Start(
-                current.run,
-                current.slot,
-                current.model,
-            );
+            await api.splatModalStart(current.run, current.slot, current.model);
         } catch (e) {
             setStatus(
-                `run all: training failed to start: ${e.message}`,
+                `run all: remote train failed to start: ${e.message}`,
                 "var(--red)",
             );
         }
@@ -2314,18 +2448,19 @@ function renderStepper() {
 		box.appendChild(row);
 	}
 	box.appendChild(renderRunAll(cell));
-	renderStage6(cell);
+	renderModal(cell);
 	renderCoverage();
 	updateSourceAvail();
 }
 
-// "run all" control row: runs stages 1→5 in order from the first not-yet-done.
-// Disabled while any stage (or the sequence itself) is running, or once all done.
+// "run all" control row: runs local stages 1→3 in order from the first
+// not-yet-done, then launches the remote train (stages 4-6) on the A100.
+// Disabled while anything is running, or once trained.ply exists.
 function renderRunAll(cell) {
     const busy = runningAll || anyStageRunning(cell);
     const allDone =
         STAGES.every((s) => stageDone(cell, s.n)) &&
-        cell?.stage6?.status === "done";
+        cell?.modal?.status === "done";
     const row = el("div", { class: "svc-step" });
     row.appendChild(el("span", { class: "svc-step-n muted", text: "▶" }));
     row.appendChild(el("span", { class: "svc-step-label", text: "run all" }));
@@ -2334,106 +2469,218 @@ function renderRunAll(cell) {
             class: "splat-stage2-btn",
             disabled: busy || allDone,
             text: runningAll ? "running…" : allDone ? "all done" : "run 1–6",
-            title: "run stages 1–5 in order, then launch Stage 6 training as a background job",
+            title: "run local stages 1–3 in order, then train on Modal (stages 4–6)",
             onclick: () => runAll(),
         }),
     );
     return row;
 }
 
-// Stage-6 training row + live log. Stage 6 is a DETACHED background process on the
-// server host; its status (running / done / error) + a tail of splat/stage6.log
-// arrive through the same cells poll, so the log follows without a separate stream.
-function renderStage6(cell) {
-    const box = inputs && inputs._stage6;
+// The client-owned training-policy controls (convergence bounds + plateau
+// sensitivity + batch) for the "train on modal" panel. Each input writes STRAIGHT
+// back to `modalTrainCfg`, so values persist across the panel's re-renders and
+// are read by `startModalTrain`; defaults live here (client), never on the
+// server. `disabled` greys them out until Stage 3 is ready.
+function modalCfgControls(disabled) {
+    const numRow = (label, key, step, min, max, title) => {
+        const input = el("input", {
+            type: "number", value: modalTrainCfg[key], step, min, max,
+            class: "svc-num", title, disabled,
+            oninput: () => {
+                const v = Number(input.value);
+                if (!Number.isNaN(v)) modalTrainCfg[key] = v;
+            },
+        });
+        input.style.width = "60px";
+        return el(
+            "div",
+            { class: "svc-row" },
+            el("span", { class: "svc-lab", text: label, title }),
+            input,
+        );
+    };
+    return el(
+        "div",
+        { class: "svc-modal-cfg" },
+        numRow("epochs", "epochs", 1, 1, 200,
+            "passes over the view set → iterations = epochs × number of views"),
+        numRow("batch", "batch", 1, 1, 32,
+            "views per optimizer step (fills the GPU); speed knob at constant work"),
+    );
+}
+
+// Remote-train row + live log. One "train on modal" button runs stages 4-6 on
+// the A100 (cameras → references → fine-tune) and pulls trained.ply back; its
+// live phase (push / spawn / plan / refs / train / pull) + the training
+// heartbeat (`stage · step/total · loss=… it/s`) arrive through the same cells
+// poll, and on completion the "trained" view auto-opens.
+function renderModal(cell) {
+    const box = inputs && inputs._modal;
     if (!box) return;
-    const st = (cell && cell.stage6) || {};
+    const st = (cell && cell.modal) || {};
     const status = st.status || "idle";
     const running = status === "running";
-    const s5done = stageDone(cell, 5);
-    const resumable = !!st.resumable; // interrupted: a checkpoint on disk, no trained.ply
+    const s3done = stageDone(cell, 3);
     box.replaceChildren();
     const row = el("div", { class: "svc-step" });
-    row.appendChild(el("span", { class: "svc-step-n muted", text: "6" }));
+    row.appendChild(el("span", { class: "svc-step-n muted", text: "△" }));
     row.appendChild(
         el("span", {
             class: "svc-step-label",
-            text: running ? "training…" : "train",
+            text: running ? `modal · ${st.phase || "run"}` : "train on modal",
         }),
     );
     let btn;
     if (running) {
+        // During training the heartbeat carries step/total; other phases (push /
+        // spawn / refs / pull) show the phase word as the live progress.
+        const prog =
+            st.stage === "train" && st.total
+                ? `${fmtInt(st.done)}/${fmtInt(st.total)}`
+                : st.phase || "…";
         btn = el("button", {
             class: "splat-stage2-btn",
             disabled: true,
-            text: st.pid ? `pid ${st.pid}` : "running",
-            title: "training in a background process — see the log below",
+            text: prog,
+            title: "training on the A100 — see the live log below",
         });
     } else {
-        // "re-train" (done) starts from scratch; "resume training" (interrupted) and
-        // "train" both continue from the latest checkpoint if one is present.
         btn = el("button", {
             class: `splat-stage2-btn${status === "done" ? " view" : ""}`,
-            disabled: !s5done || runningAll,
-            text:
-                status === "done"
-                    ? "re-train"
-                    : resumable
-                      ? "resume training"
-                      : "train",
-            title: s5done
-                ? "launch the Stage-6 fine-tune as a background job on the server host"
-                : "run stage 5 (references) first",
-            onclick: () => startStage6(status === "done"),
+            disabled: !s3done || runningAll,
+            text: status === "done" ? "re-train" : "train on modal",
+            title: s3done
+                ? "plan cameras + render references + fine-tune on the Modal A100 (stages 4–6), then pull trained.ply"
+                : "sample the surfel cloud first (Stage 3)",
+            onclick: () => startModalTrain(status === "done"),
         });
     }
     if (status === "error") {
         btn.classList.add("err");
-        btn.title = st.error || "training failed — click to retry";
+        btn.title = st.error || "remote train failed — click to retry";
     }
     row.appendChild(btn);
     box.appendChild(row);
+
+    // Client-owned training policy — editable while idle (hidden mid-run). These
+    // values are the ONLY source of training-length defaults; the server forwards
+    // them untouched.
+    if (!running) box.appendChild(modalCfgControls(!s3done || runningAll));
+
     const info =
         status === "done"
-            ? "trained.ply ready"
+            ? "trained.ply ready — switch to the “trained” view"
             : status === "error"
-              ? st.error || "training failed"
+              ? st.error || "remote train failed"
               : running
-                ? "training in the background — logs below"
-                : resumable
-                  ? `interrupted at step ${fmtInt(st.ckpt_step)} — resume`
-                  : s5done
-                    ? "ready to train"
-                    : "needs stage 5";
+                ? `${st.phase || "running"}${st.msg ? ` — ${st.msg}` : ""}`
+                : s3done
+                  ? "ready — runs stages 4–6 on the A100"
+                  : "needs the surfel cloud (Stage 3)";
     const sub = el("div", { class: "muted", text: info });
     sub.style.fontSize = "12px";
     box.appendChild(sub);
-    // Live log tail, updated in place so the scroll position / follow-tail sticks.
+
+    // The camera plan is pulled back the moment stage 4 finishes (while stages
+    // 5-6 keep running remotely). Reveal the camera-position overlay ONCE when
+    // it arrives, so the rig is viewable over the surfel cloud mid-run without
+    // waiting for training. One-shot + guarded, so a manual toggle-off sticks.
+    if (running && st.plan_pulled && !modalPlanShown) {
+        modalPlanShown = true;
+        if (inputs && inputs.cameras && !inputs.cameras.checked) {
+            inputs.cameras.checked = true;
+            void setCameras(true);
+        }
+        setStatus(
+            "camera plan ready — showing camera positions (training continues)",
+            "var(--green)",
+        );
+    }
+
+    // Debug sample images pulled from the render mid-run — a quick visual check
+    // that the picture-taking is correct. Click a thumbnail to open it full-size.
+    const samples = st.sample_urls || [];
+    if (samples.length) {
+        const strip = el("div");
+        Object.assign(strip.style, {
+            display: "flex",
+            flexWrap: "wrap",
+            gap: "3px",
+            marginTop: "5px",
+        });
+        for (const u of samples) {
+            const img = el("img");
+            img.src = api.absUrl(u);
+            img.loading = "lazy";
+            img.title = u.split("/").pop();
+            Object.assign(img.style, {
+                width: "46px",
+                height: "46px",
+                objectFit: "cover",
+                borderRadius: "3px",
+                background: "#000",
+                cursor: "pointer",
+            });
+            img.onclick = () => window.open(api.absUrl(u), "_blank");
+            strip.appendChild(img);
+        }
+        box.appendChild(
+            el("div", {
+                class: "muted",
+                text: `render samples (${samples.length})`,
+                style: "font-size:11px;margin-top:4px",
+            }),
+        );
+        box.appendChild(strip);
+    }
+
+    // Accumulate distinct heartbeat lines into the live log pane (a scrolling
+    // history, so training-step lines read as progress, not a single value).
+    const line = running && st.msg ? `[${st.stage || st.phase}] ${st.msg}` : null;
+    if (line && modalLog[modalLog.length - 1] !== line) {
+        modalLog.push(line);
+        if (modalLog.length > 400) modalLog.shift();
+    }
     const log = inputs._log;
     if (log) {
         const following =
             Math.abs(log.scrollHeight - log.clientHeight - log.scrollTop) < 40;
-        log.textContent = st.log_tail || (running ? "starting…" : "");
+        log.textContent = modalLog.length
+            ? modalLog.join("\n")
+            : running
+              ? "starting…"
+              : "";
         if (following) log.scrollTop = log.scrollHeight;
     }
+
+    // Catch the running → done transition: trained.ply has been pulled (the
+    // supervisor sets 'done' only after the pull), so stage6.url is now set —
+    // refresh the toggles and open the trained view for an immediate compare.
+    if (modalPrev === "running" && status === "done") {
+        updateSourceAvail();
+        if (trainedUrl) void setView("trained");
+    }
+    modalPrev = status;
 }
 
-// Launch Stage 6 (detached background training) for the open cell, then poll — which
-// streams the live log through the cells status.
-async function startStage6(restart = false) {
+// Launch the Modal remote train (stages 4-6) for the open cell, then poll — the
+// cells status streams its live phase + training heartbeat.
+async function startModalTrain(restart = false) {
     if (!current) return;
+    modalLog = [];
+    modalPlanShown = false;
     setStatus(
-        restart
-            ? "restarting training (stage 6)…"
-            : "launching training (stage 6)…",
+        restart ? "restarting remote train…" : "starting remote train…",
         "var(--purple)",
     );
     try {
-        await api.splatStage6Start(current.run, current.slot, current.model, {
+        await api.splatModalStart(current.run, current.slot, current.model, {
             restart,
+            epochs: modalTrainCfg.epochs,
+            batch: modalTrainCfg.batch,
         });
     } catch (e) {
-        setStatus(`train failed to start: ${e.message}`, "var(--red)");
+        setStatus(`remote train failed to start: ${e.message}`, "var(--red)");
         return;
     }
     pollStages();
@@ -2590,6 +2837,9 @@ export async function openSplatViewer(opts) {
     splatSource = "surfels";
     trainedUrl = null;
     sogUrl = null;
+    modalPrev = null;
+    modalLog = [];
+    modalPlanShown = false;
     overlay.classList.add("open");
     subEl.textContent =
         opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
