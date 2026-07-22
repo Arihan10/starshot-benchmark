@@ -2534,6 +2534,18 @@ function renderModal(cell) {
         btn.title = st.error || "remote train failed — click to retry";
     }
     row.appendChild(btn);
+    // While running, offer a detach that cancels the remote A100 job and frees
+    // the cell to re-launch fresh from stage 4.
+    if (running) {
+        row.appendChild(
+            el("button", {
+                class: "splat-stage2-btn err",
+                text: "detach",
+                title: "cancel the remote A100 job (terminates the container) and free this cell to re-train from stage 4",
+                onclick: () => detachModalTrain(),
+            }),
+        );
+    }
     box.appendChild(row);
 
     // Client-owned training policy — editable while idle (hidden mid-run). These
@@ -2657,6 +2669,30 @@ async function startModalTrain(restart = false) {
         setStatus(`remote train failed to start: ${e.message}`, "var(--red)");
         return;
     }
+    pollStages();
+}
+
+// Detach + cancel the cell's Modal train (terminates the remote A100 container),
+// then re-poll so the cell drops back to idle — free to re-launch from stage 4.
+// Confirms first, since this kills in-flight training.
+async function detachModalTrain() {
+    if (!current) return;
+    if (
+        !window.confirm(
+            "Cancel the remote Modal job and detach?\n\nThis terminates the running A100 container. The cell returns to idle so you can re-train from stage 4.",
+        )
+    )
+        return;
+    setStatus("detaching — cancelling remote job…", "var(--purple)");
+    try {
+        await api.splatModalCancel(current.run, current.slot, current.model);
+    } catch (e) {
+        setStatus(`detach failed: ${e.message}`, "var(--red)");
+        return;
+    }
+    modalLog = [];
+    modalPlanShown = false;
+    setStatus("detached — remote job cancelled", "var(--purple)");
     pollStages();
 }
 

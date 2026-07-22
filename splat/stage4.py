@@ -80,9 +80,15 @@ Pipeline:
      DEMANDS (patches × cells), not free volume × surface. Each surviving pair
      carries its direction cell + supplied octave.
   5. GREEDY multicover over IMAGES — (candidate, face) units, the true cost unit
-     of Stages 5/6 — until every visible patch hits every suppliable direction
-     cell + every suppliable owed octave. Faces that add nothing are never
-     selected (emergent face culling).
+     of Stages 5/6 — scored by each image's TRUE FOOTPRINT (what the camera
+     actually sees, `_greedy_cover_footprint`), not by the demand-major pairs:
+     the pair count UNDERCOUNTS a camera (only the patches that aimed at it), so
+     scoring by it tracks local patch DENSITY — swarming small props and starving
+     large/background surfaces. Scoring by the real footprint credits one camera
+     for a whole cluster and recognises a wide standoff shot as high-value, until
+     every visible patch hits every suppliable direction cell + owed octave.
+     Faces that add nothing are never selected (emergent face culling). The
+     demand-major pass (step 4) is kept only for the SUPPLIABILITY ledger.
 
 Output: `cameras.json` — a shared cube-face `intrinsics` block (90° FOV, render
 resolution, the scale-ladder anchors), the six `cube_faces`, and the chosen
@@ -886,6 +892,244 @@ def _face_of(dirs: np.ndarray) -> np.ndarray:
     return axis * 2 + negative.astype(np.int64)
 
 
+def _make_gpu_visible(fs: FreeSpace, torch: Any, grid_diag: float):  # noqa: ANN202
+    """A `visible(cams, pts) -> bool` closure (numpy in/out) running the occlusion
+    ray-march on CUDA — the injectable march the footprint greedy scores with.
+    Mirrors `_build_coverage._occluded` (opaque cover set, endpoint skip, FAIL
+    CLOSED on unverifiably-short segments); pairs march in distance-sorted slices
+    so short rays take few steps and only the far tail pays long ones."""
+    dev = torch.device("cuda")
+    occ_opaque = torch.as_tensor(fs.occ_lin_opaque, dtype=torch.int64, device=dev)
+    origin = torch.as_tensor(fs.origin, dtype=torch.float32, device=dev)
+    dims = torch.as_tensor(fs.dims, dtype=torch.int64, device=dev)
+    pf = float(fs.pitch)
+    d1, d2 = int(fs.dims[1]), int(fs.dims[2])
+
+    def _occluded(cam, pp_, dist_, t_lin):  # noqa: ANN001
+        pts = cam[:, None, :] + t_lin[None, :, None] * (pp_ - cam)[:, None, :]
+        fidx = torch.floor((pts - origin) / pf).to(torch.int64)
+        inb = ((fidx >= 0) & (fidx < dims)).all(dim=2)
+        tvalid = (t_lin[None, :] > (pf / dist_)[:, None]) & (
+            t_lin[None, :] < 1.0 - (1.5 * pf / dist_)[:, None]
+        )
+        need = inb & tvalid
+        res = ~tvalid.any(dim=1)
+        nz = need.nonzero(as_tuple=True)
+        if nz[0].numel():
+            fx = fidx[nz[0], nz[1]]
+            lin_m = (fx[:, 0] * d1 + fx[:, 1]) * d2 + fx[:, 2]
+            posi = torch.searchsorted(occ_opaque, lin_m.clamp(min=0)).clamp(
+                max=occ_opaque.numel() - 1
+            )
+            res[nz[0][occ_opaque[posi] == lin_m]] = True
+        return res
+
+    def visible(cams: np.ndarray, pts: np.ndarray) -> np.ndarray:
+        out = np.zeros(len(cams), dtype=bool)
+        if not len(cams):
+            return out
+        dist = np.linalg.norm(pts - cams, axis=1)
+        order = np.argsort(dist, kind="stable")
+        cs, ps, ds = cams[order], pts[order], dist[order]
+        vis = np.zeros(len(cams), dtype=bool)
+        for s0 in range(0, len(cs), _RESCUE_SLICE):
+            s1 = min(s0 + _RESCUE_SLICE, len(cs))
+            n_steps = int(np.ceil(min(float(ds[s1 - 1]), grid_diag) / pf)) + 2
+            cam_t = torch.as_tensor(np.ascontiguousarray(cs[s0:s1], dtype=np.float32), device=dev)
+            pat_t = torch.as_tensor(np.ascontiguousarray(ps[s0:s1], dtype=np.float32), device=dev)
+            dst = torch.linalg.norm(pat_t - cam_t, dim=1).clamp_min(1e-6)
+            t_lin = torch.linspace(0.0, 1.0, n_steps, dtype=torch.float32, device=dev)
+            vis[s0:s1] = (~_occluded(cam_t, pat_t, dst, t_lin)).cpu().numpy()
+        out[order] = vis
+        return out
+
+    return visible
+
+
+def _greedy_cover_footprint(
+    candidates: np.ndarray,
+    patch_pos: np.ndarray,
+    patch_nrm: np.ndarray,
+    d_min: np.ndarray,
+    d_max: np.ndarray,
+    oct_top: np.ndarray,
+    t1: np.ndarray,
+    t2: np.ndarray,
+    grid_diag: float,
+    bins: int,
+    n_oct: int,
+    min_gain: int,
+    max_views: int | None,
+    tie_noise: np.ndarray,
+    visible: Callable[[np.ndarray, np.ndarray], np.ndarray],
+    progress: ProgressCb | None = None,
+) -> tuple[list[int], np.ndarray, np.ndarray, list[int], dict[int, np.ndarray]]:
+    """TRUE-FOOTPRINT lazy (CELF) greedy over IMAGES — the selectable unit is one
+    (candidate, cube-face), `unit = candidate·6 + face`. Unlike `_greedy_cover`,
+    which scored an image by the few patches a demand-major sampling PRE-ASSIGNED
+    to it (so a camera's worth tracked local patch DENSITY, swarming small props
+    and starving large/background surfaces), this scores an image by what the
+    camera ACTUALLY sees — every patch in that face's frustum with a clear
+    sightline. One well-placed camera is then credited for a whole cluster (the
+    swarm collapses) and a wide standoff shot is recognised as high-value (large
+    surfaces get real coverage).
+
+    LAZY CELF: prioritise candidates by an occlusion-free, march-free UPPER BOUND
+    (in-range patch count × max demands/patch — a valid ceiling since occlusion
+    and coverage only reduce), then compute the exact FOOTPRINT (ray-march via
+    `visible`) on pop. A candidate's footprint is scale-BUCKETED (coarse patches
+    resolve from far but are sparse, so a per-bucket radius keeps each query
+    bounded) and MASK-INDEPENDENT, so it's cached once per candidate; only the
+    cheap per-face gain is recomputed on re-eval. Footprints are transient except
+    the cache, so peak RAM tracks EVALUATED candidates, never the camera×patch
+    product. A candidate carries all six faces; one footprint serves them all and
+    each face commits independently (emergent face culling).
+
+    `tie_noise` is per-CANDIDATE (all six faces share it). Returns (chosen unit
+    ids in pick order, per-patch bin bitmask, per-patch octave bitmask, per-pick
+    integer gains, and `cov`: unit id → the patch indices that image covers, for
+    the camera/patch-view emit)."""
+    import heapq
+
+    n_patch = len(patch_pos)
+    n_cand = len(candidates)
+    nf = len(CUBE_FACE_NAMES)
+    binmask = np.zeros(n_patch, dtype=np.int64)
+    octmask = np.zeros(n_patch, dtype=np.int64)
+    chosen: list[int] = []
+    gains: list[int] = []
+    cov: dict[int, np.ndarray] = {}
+    if n_patch == 0 or n_cand == 0:
+        return chosen, binmask, octmask, gains, cov
+
+    # Scale buckets: patches grouped by the octave of their resolvable distance
+    # `d_max`. Coarse patches (big d_max) are sparse, so a per-bucket search
+    # radius keeps every footprint query bounded even though far views are kept.
+    lo = max(float(d_max.min()), 1e-6)
+    bk = np.clip(np.floor(np.log2(np.maximum(d_max, 1e-9) / lo)), 0, 62).astype(np.int64)
+    buckets: list[tuple[np.ndarray, float, cKDTree]] = []
+    for bv in range(int(bk.max()) + 1):
+        idx = np.nonzero(bk == bv)[0]
+        if idx.size:
+            buckets.append((idx, min(float(d_max[idx].max()), grid_diag), cKDTree(patch_pos[idx])))
+
+    def _footprint(c: int):
+        """Every patch candidate c truly sees (resolvable + clear LOS), tagged
+        with cube FACE, direction cell (`_bin_of`), scale octave (`_band_of`) and
+        owed flag — the exact same per-pair semantics `_build_coverage` uses.
+        Mask-INDEPENDENT (pure geometry + visibility), so it is cached."""
+        cpos = candidates[c]
+        parts: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+        for idx, radius, tree in buckets:
+            near = tree.query_ball_point(cpos, radius)
+            if not near:
+                continue
+            gi = idx[np.asarray(near, dtype=np.int64)]
+            dvec = cpos - patch_pos[gi]  # patch → camera
+            dist = np.linalg.norm(dvec, axis=1)
+            ok = dist > 1e-6
+            gi, dvec, dist = gi[ok], dvec[ok], dist[ok]
+            if not len(gi):
+                continue
+            cos = np.abs(np.einsum("kc,kc->k", dvec, patch_nrm[gi])) / dist
+            d_eff = dist / np.maximum(cos, 1e-12)
+            res = d_eff <= d_max[gi]
+            gi, dvec, dist, d_eff = gi[res], dvec[res], dist[res], d_eff[res]
+            if not len(gi):
+                continue
+            vis = visible(np.repeat(cpos[None, :], len(gi), axis=0), patch_pos[gi])
+            gi, dvec, dist, d_eff = gi[vis], dvec[vis], dist[vis], d_eff[vis]
+            if not len(gi):
+                continue
+            vd = dvec / dist[:, None]
+            z = np.abs(np.einsum("kc,kc->k", vd, patch_nrm[gi]))
+            az = np.arctan2(np.einsum("kc,kc->k", vd, t2[gi]), np.einsum("kc,kc->k", vd, t1[gi]))
+            parts.append((
+                gi,
+                _face_of(-dvec),
+                _bin_of(z, az, bins),
+                _band_of(d_eff, d_min[gi], n_oct),
+                oct_top[gi] >= _band_of(d_eff, d_min[gi], n_oct),
+            ))
+        if not parts:
+            return None
+        return tuple(np.concatenate([p[k] for p in parts]) for k in range(5))
+
+    def _face_gains(fp, skip: set[int]) -> np.ndarray:
+        """Per-face marginal gain of footprint `fp` against the live masks (a face
+        contributes a patch's uncovered bin, plus its owed uncovered octave)."""
+        gi, face, binv, band, owed = fp
+        bin_new = (binmask[gi] & (np.int64(1) << binv)) == 0
+        oct_new = owed & ((octmask[gi] & (np.int64(1) << band)) == 0)
+        contrib = bin_new.astype(np.int64) + oct_new.astype(np.int64)
+        g = np.zeros(nf, dtype=np.int64)
+        for f in range(nf):
+            if f in skip:
+                continue
+            m = face == f
+            if m.any():
+                g[f] = int(contrib[m].sum())
+        return g
+
+    # Occlusion-free UPPER BOUND per candidate (march-free): in-range patch count
+    # × max demands/patch. Valid ceiling for any of its faces' true gains.
+    ub = np.zeros(n_cand, dtype=np.float64)
+    for idx, radius, tree in buckets:
+        ub += np.asarray(
+            tree.query_ball_point(candidates, radius, workers=-1, return_length=True),
+            dtype=np.float64,
+        )
+    ub *= float(bins + n_oct)
+
+    fp_cache: dict[int, Any] = {}
+    committed: dict[int, set[int]] = {}
+    heap = [(-(ub[c] + float(tie_noise[c])), int(c)) for c in np.nonzero(ub > 0)[0]]
+    heapq.heapify(heap)
+    min_g = max(int(min_gain), 1)
+
+    while heap and (max_views is None or len(chosen) < max_views):
+        neg, c = heapq.heappop(heap)
+        if c in fp_cache:
+            fp = fp_cache[c]
+        else:
+            fp = _footprint(c)
+            fp_cache[c] = fp
+        if fp is None:
+            continue
+        skip = committed.get(c, set())
+        g = _face_gains(fp, skip)
+        best_f = int(np.argmax(g))
+        best_g = int(g[best_f])
+        nxt = -heap[0][0] if heap else float("-inf")
+        if best_g + float(tie_noise[c]) >= nxt:
+            # c's best face is the exact argmax this round (CELF: every other
+            # unit's current gain ≤ its stored bound ≤ nxt).
+            if best_g < min_g:
+                break
+            gi, face, binv, band, owed = fp
+            m = face == best_f
+            gm = gi[m]
+            np.bitwise_or.at(binmask, gm, np.int64(1) << binv[m])
+            ow = owed[m]
+            if ow.any():
+                np.bitwise_or.at(octmask, gm[ow], np.int64(1) << band[m][ow])
+            u = c * nf + best_f
+            chosen.append(u)
+            gains.append(best_g)
+            cov[u] = gm
+            skip = skip | {best_f}
+            committed[c] = skip
+            rem = _face_gains(fp, skip)
+            rmax = int(rem.max()) if rem.size else 0
+            if rmax > 0:
+                heapq.heappush(heap, (-(rmax + float(tie_noise[c])), c))
+            if progress is not None and len(chosen) % 200 == 0:
+                progress(len(chosen), 0, "select")
+        else:
+            heapq.heappush(heap, (-(best_g + float(tie_noise[c])), c))
+    return chosen, binmask, octmask, gains, cov
+
+
 def plan_cameras(
     *,
     run: str,
@@ -974,11 +1218,9 @@ def plan_cameras(
     # given the band; far appearance is the Stage-6 LOD ladder's job).
     reach = max(2.0 * float(cand_clear.max()), 4.0 * float(params.candidate_spacing))
 
-    # Coverage (per-pair direction cell + octave + owed) + greedy multicover over
-    # IMAGES. Coverage is the long phase (a demand-major occlusion ray-march on
-    # CUDA — each patch's own bounded aim points), so it streams progress as the
-    # snapped pairs are marched.
     b = params.bins
+    n_faces = len(CUBE_FACE_NAMES)
+    grid_diag = _grid_diag(fs)
     torch = _try_cuda()
     if torch is None:
         raise RuntimeError(
@@ -986,35 +1228,35 @@ def plan_cameras(
             "torch is available. Run Stage 4 in the GPU env (the same one Stage 6 "
             "uses)."
         )
+
+    # DEMAND-MAJOR coverage (per-patch aim points + near probes). Kept for the
+    # SUPPLIABILITY ledger only — bin_supply / oct_supply / seen_any (what SOME
+    # camera could cover per patch), the denominator the summary reports against.
+    # Selection no longer runs off this: its per-image score UNDERCOUNTED a
+    # camera's footprint (only the patches that aimed at it), which swarmed small
+    # props and starved large surfaces.
     cc, pp, binv, octave, owed = _build_coverage(
         candidates, patch_pos, patch_nrm, d_min, d_max, oct_top, t1, t2, fs,
         params, reach, torch, progress,
     )
 
-    # IMAGE units (the greedy's selectable): unit = candidate·6 + cube face of
-    # the pair's direction. The image is the true cost unit — Stage 5 renders,
-    # stores and trains per (position, face) — so faces compete individually and
-    # a face adding nothing new is never selected at all.
-    n_faces = len(CUBE_FACE_NAMES)
-    face = (
-        _face_of(patch_pos[pp] - candidates[cc]) if len(cc) else np.zeros(0, dtype=np.int64)
-    )
-    unit = cc * n_faces + face
-    n_units = len(candidates) * n_faces
-    # Seeded per-unit tie-break noise (see `_greedy_cover`): integer gains tie in
-    # huge plateaus over uniform geometry, and argmax would take them in
-    # candidate scan order — the "left-to-right density sweeps"; under a budget
-    # cut that leaves one side of the scene denser. Noise < 0.5 never outvotes a
-    # real demand.
-    tie_noise = (rng.random(n_units) * 0.5).astype(np.float64)
-    # Single greedy path: lazy (CELF) multicover on the CPU — exact-equal to the
-    # naive per-round argmax greedy (see `_greedy_cover`), but skipping the units
-    # that can't be the argmax, so it doesn't rescan all pairs every pick. Runs
-    # off the numpy COO the coverage builder returns (GPU or CPU), and frees the
-    # GPU during selection.
-    chosen_units, binmask, octmask, gains = _greedy_cover(
-        unit, pp, binv, octave, owed, n_units, n_patch,
-        params.min_gain, params.max_views, tie_noise, progress,
+    # SELECTION: true-footprint lazy (CELF) greedy over IMAGES (candidate·6 +
+    # face). Each image is scored by what the camera ACTUALLY sees — the exact
+    # occlusion-marched frustum — so one camera is credited for a whole cluster
+    # (block swarm collapses) and a wide standoff shot is recognised as
+    # high-value (large/background surfaces get real coverage). Per-candidate
+    # tie-break noise (all six faces share it) keeps equal-gain plateaus
+    # spatially uniform under a budget cut. The ray-march runs on CUDA
+    # (`_make_gpu_visible`); footprints are cached per candidate and RAM tracks
+    # evaluated candidates, never the camera×patch product.
+    if progress is not None:
+        progress(0, 0, "select")
+    tie_noise = (rng.random(len(candidates)) * 0.5).astype(np.float64)
+    visible_fn = _make_gpu_visible(fs, torch, grid_diag)
+    chosen_units, binmask, octmask, gains, cov = _greedy_cover_footprint(
+        candidates, patch_pos, patch_nrm, d_min, d_max, oct_top, t1, t2,
+        grid_diag, b, n_oct, params.min_gain, params.max_views, tie_noise,
+        visible_fn, progress,
     )
     if progress is not None:
         progress(0, 0, "write")
@@ -1119,17 +1361,14 @@ def plan_cameras(
                 cam_faces[ci] = []
                 cam_order.append(ci)
             cam_faces[ci].append(fi)
-        order = np.argsort(unit, kind="stable")
-        unit_s, pp_s = unit[order], pp[order]
         for out_idx, ci in enumerate(cam_order):
             cam = candidates[ci]
             faces: list[dict[str, Any]] = []
             covers = 0
             for face_pos, fi in enumerate(sorted(cam_faces[ci])):
-                u = ci * n_faces + fi
-                a0 = int(np.searchsorted(unit_s, u, "left"))
-                a1 = int(np.searchsorted(unit_s, u, "right"))
-                seen = pp_s[a0:a1]
+                # `cov` holds each chosen image's TRUE footprint (the patches that
+                # image sees) from the footprint greedy.
+                seen = cov.get(ci * n_faces + fi, np.zeros(0, dtype=np.int64))
                 faces.append({"dir": CUBE_FACE_NAMES[fi], "covers": int(len(seen))})
                 covers += int(len(seen))
                 for pt in seen.tolist():

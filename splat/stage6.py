@@ -81,6 +81,26 @@ coarse level as a prefiltered anti-aliased average instead of shimmering
 sub-pixel splats, and the same 2DGS `.ply` layout means every existing viewer /
 compressor reads the levels unchanged.
 
+COMPACTION (delivered-size cleanup): after the optimization, ONE deletion pass
+removes the Gaussians the reference views provably cannot show — the dominant
+lever on delivered size (the SOG/PLY footprint is ~linear in count, and
+densification stacks Gaussians many-deep on already-covered surfaces). Each
+Gaussian's TOTAL rendered contribution is MEASURED through the rasterizer
+itself: a pixel is Σᵢ wᵢ·cᵢ (wᵢ = opacity × kernel × transmittance), so one
+backward pass of Σ(all pixels of all views) w.r.t. the SH0 colours accumulates
+each Gaussian's Σ wᵢ over every pixel it touches in every view. A Gaussian
+whose total is below `compact_eps` (default 0.5/255) could not shift ANY single
+rendered pixel by even half an 8-bit display step even if its entire mass landed
+on that one pixel — deleting it is imperceptible BY CONSTRUCTION, per Gaussian.
+Survivors are NOT touched (no re-optimization), so fidelity is exactly the
+trained model's. Gaussians whose SH0 colour clamps to pure black in all three
+channels are gradient-blind to this measure and are force-kept. Note the
+deliberate behaviour change vs. plain training: surfels in fully-occluded
+regions (kept at their mesh-true init, never supervised) are deleted — invisible
+from every planned view ≈ invisible from all reachable free space. Runs per
+TILE against that tile's assigned views, and imposes NO count cap — each
+scene/tile keeps every Gaussian its own views can see. `compact=False` disables.
+
 CUDA-ONLY: torch + gsplat compile/require CUDA, so this runs on the GPU box, NOT
 Apple Silicon. Both are imported LAZILY inside the trainer so the server (which
 imports this module for the route + the torch-free PLY/pose IO) stays importable
@@ -184,20 +204,20 @@ class TrainParams:
     # trigger `step % reset_every == 0 & step > 0` parses as `… and (0 > 0)`);
     # this makes that behaviour deliberate and upgrade-proof.
     reset_every: int = 0
-    # grow_grad2d is the ABS-gradient split threshold (absgrad below): absolute
-    # gradients don't cancel across a splat, so they run larger — raised ~3x from
-    # the non-abs 0.0002 (gsplat's guidance). Drop it and the cloud over-densifies.
-    grow_grad2d: float = 0.0006
+    # Mean (non-absolute) 2D-gradient split threshold — gsplat's default value.
+    # AbsGS (absgrad) is deliberately NOT used: in the pinned gsplat 1.5.3 the
+    # 2DGS backward attaches `.absgrad` to `means2d`, but DefaultStrategy densifies
+    # the 2DGS path off a SEPARATE `gradient_2dgs` tensor (`rendering.py` densify)
+    # that never receives an `.absgrad` — so `absgrad=True` + key_for_gradient=
+    # "gradient_2dgs" raises `'Tensor' object has no attribute 'absgrad'` in
+    # `_update_state`. AbsGS is a 3DGS-`means2d`-only feature here, so we stay on
+    # the mean-gradient criterion (which is what trained every working run).
+    grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
     # Keep pruning BELOW the glass init: glass.py panes seed opacity at
     # GLASS_ALPHA = 0.065 (logit −2.67), and the old 0.05 threshold left only
     # ~0.3 logits of drift before a pane surfel was permanently pruned.
     prune_opa: float = 0.03
-    # AbsGS: accumulate the ABSOLUTE per-pixel view-space position gradient for
-    # the grow/split test, so a splat straddling high-frequency detail on a flat
-    # surface — whose opposite-side gradients cancel under the mean criterion —
-    # still densifies. Requires the raised grow_grad2d above.
-    absgrad: bool = True
     cap_max: int = 3_000_000           # freeze densification past this many Gaussians (VRAM guard)
     # Final cleanup prune (once, before eval + export). Densification/pruning stop at
     # refine_stop (50% of iters), so opacity that drifts below prune_opa in the back
@@ -208,6 +228,19 @@ class TrainParams:
     # guard; final_prune=False disables the whole pass.
     final_prune: bool = True
     prune_scale3d: float = 0.1
+
+    # COMPACTION (post-training deletion; module docstring §COMPACTION). ONE
+    # measured pass: accumulate every Gaussian's total rendered blend weight over
+    # ALL reference views (through the rasterizer — the exact quantity pixels
+    # see), then delete those below `compact_eps`. At the 0.5/255 default a
+    # deleted Gaussian could not move any single rendered pixel by half an 8-bit
+    # display step even with its whole mass on one pixel, and survivors are not
+    # re-optimized — fidelity is the trained model's, by construction. This is
+    # the biggest DELIVERED-SIZE lever (SOG/PLY bytes are ~linear in count;
+    # densification stacks Gaussians many-deep on covered surfaces) and imposes
+    # NO count cap — each scene/tile keeps everything its own views can see.
+    compact: bool = True
+    compact_eps: float = 0.5 / 255.0      # total blend weight below which a Gaussian is unrenderable
 
     # Adaptive VRAM guard. cap_max is the hard ceiling; additionally freeze
     # densification (and pause depth-seeding) when free VRAM drops below this many
@@ -374,10 +407,11 @@ class TrainParams:
             "refine_stop_iter": self.resolved_refine_stop,
             "reset_every": self.reset_every,
             "grow_grad2d": self.grow_grad2d,
-            "absgrad": self.absgrad,
             "prune_opa": self.prune_opa,
             "final_prune": self.final_prune,
             "prune_scale3d": self.prune_scale3d,
+            "compact": self.compact,
+            "compact_eps": self.compact_eps,
             "vram_min_free_gb": self.vram_min_free_gb,
             "antialias": self.antialias,
             "aa_min_scale_px": self.aa_min_scale_px,
@@ -1234,7 +1268,7 @@ def _train_tiled(  # noqa: ANN001
                 arrays["shN"] = np.zeros((int(core.sum()), bands - 1, 3), dtype=np.float32)
             info: dict[str, Any] = {
                 "tile": t, "init": int(sel.sum()), "final": int(core.sum()),
-                "seeded": 0, "pruned": 0, "views": 0, "iters": 0,
+                "seeded": 0, "pruned": 0, "compacted": 0, "views": 0, "iters": 0,
                 "skipped": "no views see this tile",
             }
             logging.getLogger(__name__).warning(
@@ -1520,6 +1554,7 @@ def train_splat(
         )
         tiles_summary = None
         n_seeded, n_pruned = one["seeded"], one["pruned"]
+        n_compacted = one.get("compacted", 0)
     else:
         if progress is not None:
             progress(
@@ -1533,6 +1568,7 @@ def train_splat(
         )
         n_seeded = int(sum(t["seeded"] for t in tiles_summary))
         n_pruned = int(sum(t["pruned"] for t in tiles_summary))
+        n_compacted = int(sum(t.get("compacted", 0) for t in tiles_summary))
 
     n_final = int(arrays["means"].shape[0])
 
@@ -1583,6 +1619,7 @@ def train_splat(
         "splats_init": n_init,
         "splats_final": n_final,
         "splats_pruned_final": n_pruned,
+        "splats_compacted": n_compacted,
         "splats_depth_seeded": n_seeded,
         "iterations": params.iterations,
         "views": n_views,
@@ -1595,6 +1632,127 @@ def train_splat(
         "bytes": out_path.stat().st_size,
         "out_path": str(out_path),
     }
+
+
+def _render_batch(torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on):  # noqa: ANN001
+    """One gsplat 2DGS forward for a batch of views — the shared render call used
+    by both the training loop and the compaction pass. Returns the raw
+    `rasterization_2dgs` tuple (renders, alpha, normals, normals_from_depth,
+    distort, median_depth, info)."""
+    return rasterization_2dgs(
+        means=splats["means"],
+        quats=splats["quats"],
+        scales=torch.exp(splats["scales"]),
+        opacities=torch.sigmoid(splats["opacities"]),
+        colors=colors,
+        viewmats=viewmats,
+        Ks=K.unsqueeze(0).expand(viewmats.shape[0], -1, -1),
+        width=width,
+        height=height,
+        sh_degree=sh_deg,
+        packed=False,
+        near_plane=params.near_plane,
+        far_plane=params.far_plane,
+        render_mode="RGB+ED",
+        distloss=dist_on,
+        depth_mode=params.depth_mode,
+        absgrad=params.absgrad,
+    )
+
+
+def _supervision_loss(  # noqa: ANN001
+    torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
+    pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
+    normals_active, dist_active,
+):
+    """Combined per-view supervision loss — photometric L1 + D-SSIM, alpha
+    (coverage), alpha-gated depth L1, 2DGS normal consistency, and optional depth
+    distortion — shared by the training loop and the compaction pass. Both RGB
+    sides are premultiplied-over-black. `mask` (a tile's owned-pixel mask, or None
+    for a single run) restricts every term to owned pixels; `normals_active` /
+    `dist_active` gate the two regularizers that only switch on partway through a
+    run."""
+    if mask is None:
+        l1 = (pred_rgb - gt_rgb).abs().mean()
+        ssim_rgb = pred_rgb
+    else:
+        msum = mask.sum().clamp_min(1.0)
+        l1 = ((pred_rgb - gt_rgb).abs() * mask).sum() / (msum * 3.0)
+        ssim_rgb = torch.where(mask > 0, pred_rgb, gt_rgb.detach())
+    ssim = _ssim(F, ssim_rgb.clamp(0, 1).permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
+    loss = (1.0 - params.ssim_lambda) * l1 + params.ssim_lambda * (1.0 - ssim)
+
+    if params.alpha_lambda > 0.0:
+        aerr = (pred_alpha - gt_alpha).abs()
+        aloss = aerr.mean() if mask is None else (aerr * mask).sum() / mask.sum().clamp_min(1.0)
+        loss = loss + params.alpha_lambda * aloss
+
+    if gt_depth is not None and params.depth_lambda > 0.0:
+        gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
+        if mask is not None:
+            gate = gate & (mask > 0)
+        if gate.any():
+            dl = ((pred_depth - gt_depth).abs() * gate).sum() / (gate.sum() + 1e-8)
+            loss = loss + params.depth_lambda * dl
+
+    if params.normal_lambda > 0.0 and normals_active:
+        nerr = 1.0 - (normals * normals_from_depth).sum(dim=-1)
+        fg_mask = gt_alpha.squeeze(-1) > params.alpha_gate
+        if mask is not None:
+            fg_mask = fg_mask & (mask.squeeze(-1) > 0)
+        if fg_mask.any():
+            loss = loss + params.normal_lambda * nerr[fg_mask].mean()
+
+    if dist_active and params.dist_lambda > 0.0:
+        loss = loss + params.dist_lambda * distort.mean()
+    return loss
+
+
+def _contribution_weights(  # noqa: ANN001
+    torch, rasterization_2dgs, splats, views, K, width: int, height: int, params, progress=None,
+):
+    """EXACT per-Gaussian rendered contribution, measured through the rasterizer:
+    a pixel is Σᵢ wᵢ·cᵢ with wᵢ the blend weight (opacity × kernel ×
+    transmittance), so the gradient of Σ(all pixels) w.r.t. each Gaussian's SH0
+    colour is C0·Σ wᵢ over every pixel it touches. Accumulated over ALL `views`
+    (batched, one backward each — gradients only flow to a cloned sh0 leaf, the
+    model itself is untouched) and returned as a [N] tensor of total blend
+    weight. Reference pixels are NOT needed — only the poses — so the pass costs
+    roughly one epoch of forwards plus a cheap colour-only backward.
+
+    gsplat clamps SH colours at 0, which zeroes the gradient for clamped
+    channels; at SH degree 0 colour is view-independent, so ONLY Gaussians with
+    all three channels < 0 (rendered pure black) are unmeasurable — callers must
+    force-keep `_blind_mask` Gaussians."""
+    device = splats["means"].device
+    sh0_leaf = splats["sh0"].detach().clone().requires_grad_(True)
+    shadow = {k: (sh0_leaf if k == "sh0" else v.detach()) for k, v in splats.items()}
+    b = max(int(params.batch), 1)
+    n_batches = (len(views) + b - 1) // b
+    for bi, lo in enumerate(range(0, len(views), b)):
+        viewmats = torch.stack(
+            [views[i]["viewmat"] for i in range(lo, min(lo + b, len(views)))]
+        ).to(device)
+        colors, sh_deg = _render_inputs(torch, shadow, params.sh_degree)
+        renders, *_ = _render_batch(
+            torch, rasterization_2dgs, shadow, colors, sh_deg, viewmats, K,
+            width, height, params, dist_on=False,
+        )
+        renders[..., :3].sum().backward()
+        if progress is not None and (bi % 50 == 0 or bi == n_batches - 1):
+            progress(bi + 1, n_batches, f"compact: measuring contribution ({bi + 1}/{n_batches} batches)")
+    if sh0_leaf.grad is None:
+        return torch.zeros(len(sh0_leaf), device=device)
+    return sh0_leaf.grad.abs().amax(dim=(1, 2)) / _SH_C0
+
+
+def _blind_mask(torch, sh0):  # noqa: ANN001
+    """Gaussians whose SH0 colour clamps to pure black in every channel (gsplat
+    clamps colours at 0, killing their gradient): `_contribution_weights` cannot
+    see these even when they are visible, so compaction keeps them
+    unconditionally."""
+    rgb = 0.5 + _SH_C0 * sh0.detach()[:, 0, :]
+    return (rgb < 0).all(dim=1)
 
 
 def _train_one(  # noqa: ANN001
@@ -1760,25 +1918,8 @@ def _train_one(  # noqa: ANN001
 
         active_sh = min(step // max(params.sh_degree_interval, 1), params.sh_degree)
         colors, sh_deg = _render_inputs(torch, splats, active_sh)
-
-        renders, pred_alpha, normals, normals_from_depth, distort, median_depth, info = rasterization_2dgs(
-            means=splats["means"],
-            quats=splats["quats"],
-            scales=torch.exp(splats["scales"]),
-            opacities=torch.sigmoid(splats["opacities"]),
-            colors=colors,
-            viewmats=viewmats,
-            Ks=K.unsqueeze(0).expand(viewmats.shape[0], -1, -1),
-            width=width,
-            height=height,
-            sh_degree=sh_deg,
-            packed=False,
-            near_plane=params.near_plane,
-            far_plane=params.far_plane,
-            render_mode="RGB+ED",
-            distloss=dist_on,
-            depth_mode=params.depth_mode,
-            absgrad=params.absgrad,
+        renders, pred_alpha, normals, normals_from_depth, distort, median_depth, info = _render_batch(
+            torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on
         )
         pred_rgb = renders[..., :3]
         pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
@@ -1786,50 +1927,16 @@ def _train_one(  # noqa: ANN001
         if params.refine:
             strategy.step_pre_backward(splats, optimizers, strat_state, step, info)
 
-        # Photometric: full-frame L1 + D-SSIM. Both sides are premultiplied-over-
-        # black (the reference alpha-blends over a black clear colour; gsplat
-        # composites with no background), so glass/MASK pixels compare like-with-
-        # like and background pixels directly penalize floater energy. Under a
-        # tile mask, L1 averages over owned pixels only and SSIM sees ground
-        # truth composited outside the mask (its windows carry no gradient from
-        # content a neighbouring tile owns).
-        if mask is None:
-            l1 = (pred_rgb - gt_rgb).abs().mean()
-            ssim_rgb = pred_rgb
-        else:
-            msum = mask.sum().clamp_min(1.0)
-            l1 = ((pred_rgb - gt_rgb).abs() * mask).sum() / (msum * 3.0)
-            ssim_rgb = torch.where(mask > 0, pred_rgb, gt_rgb.detach())
-        ssim = _ssim(F, ssim_rgb.clamp(0, 1).permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
-        loss = (1.0 - params.ssim_lambda) * l1 + params.ssim_lambda * (1.0 - ssim)
-
-        # Alpha (coverage/opacity) — the renderer's exact coverage masks.
-        if params.alpha_lambda > 0.0:
-            aerr = (pred_alpha - gt_alpha).abs()
-            aloss = aerr.mean() if mask is None else (aerr * mask).sum() / mask.sum().clamp_min(1.0)
-            loss = loss + params.alpha_lambda * aloss
-
-        # Depth — alpha-gated L1 (metres) on the `depth_mode` statistic.
-        if gt_depth is not None and params.depth_lambda > 0.0:
-            gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
-            if mask is not None:
-                gate = gate & (mask > 0)
-            if gate.any():
-                dl = ((pred_depth - gt_depth).abs() * gate).sum() / (gate.sum() + 1e-8)
-                loss = loss + params.depth_lambda * dl
-
-        # 2DGS normal consistency (render normals vs normals-from-depth), fg only.
-        if params.normal_lambda > 0.0 and step >= params.normal_start_iter:
-            nerr = 1.0 - (normals * normals_from_depth).sum(dim=-1)
-            fg_mask = gt_alpha.squeeze(-1) > params.alpha_gate
-            if mask is not None:
-                fg_mask = fg_mask & (mask.squeeze(-1) > 0)
-            if fg_mask.any():
-                loss = loss + params.normal_lambda * nerr[fg_mask].mean()
-
-        # 2DGS depth distortion.
-        if dist_on and step >= params.dist_start_iter:
-            loss = loss + params.dist_lambda * distort.mean()
+        # Photometric L1 + D-SSIM, alpha, alpha-gated depth, normal consistency,
+        # and optional distortion — the shared supervision loss. Under a tile mask
+        # every term is restricted to pixels this tile OWNS (its surface + true
+        # background), so boundary Gaussians never chase content a neighbour owns.
+        loss = _supervision_loss(
+            torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
+            pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
+            normals_active=step >= params.normal_start_iter,
+            dist_active=dist_on and step >= params.dist_start_iter,
+        )
 
         loss.backward()
         for opt in optimizers.values():
@@ -1922,6 +2029,33 @@ def _train_one(  # noqa: ANN001
     # Release the prefetch worker (tiled runs create one stream per tile).
     stop_ev.set()
 
+    # Compaction (module docstring §COMPACTION): ONE measured deletion — total
+    # rendered blend weight per Gaussian over ALL of this run's views, then drop
+    # what falls below `compact_eps` (unrenderable by construction; survivors
+    # untouched). Per tile this uses the tile's own assigned views — the same
+    # supervision granularity training itself had. Gradient-blind pure-black
+    # Gaussians are force-kept.
+    n_compacted = 0
+    if params.compact:
+        with torch.no_grad():
+            n_before = int(splats["means"].shape[0])
+        weights = _contribution_weights(
+            torch, rasterization_2dgs, splats, views, K, width, height, params, progress,
+        )
+        with torch.no_grad():
+            keep = (weights > params.compact_eps) | _blind_mask(torch, splats["sh0"])
+            n_compacted = int((~keep).sum())
+            if n_compacted:
+                for name in list(splats.keys()):
+                    splats[name] = torch.nn.Parameter(splats[name][keep], requires_grad=False)
+        if progress is not None:
+            progress(
+                params.iterations, params.iterations,
+                f"compact: -{n_compacted} of {n_before} splats invisible from the "
+                f"reference views (total weight <= {params.compact_eps:.5f}) "
+                f"-> {int(splats['means'].shape[0])}",
+            )
+
     # One-shot cleanup prune before returning: densification stopped at
     # refine_stop, so low-opacity floaters that drifted below prune_opa in the
     # back half are still present. Prune here so the returned model is the
@@ -1945,6 +2079,7 @@ def _train_one(  # noqa: ANN001
         "final": int(arrays["means"].shape[0]),
         "seeded": n_seeded,
         "pruned": n_pruned,
+        "compacted": n_compacted,
         "views": n_views,
         "train_s": round(time.perf_counter() - t_start, 1),
     }
@@ -2078,6 +2213,17 @@ def _main() -> None:
         help="LOD ladder levels exported beside trained.ply (0 disables)",
     )
     ap.add_argument(
+        "--compact", action=argparse.BooleanOptionalAction, default=TrainParams.compact,
+        help="post-training compaction: delete Gaussians whose measured rendered "
+             "contribution across all reference views is below --compact-eps "
+             "(imperceptible by construction; survivors untouched)",
+    )
+    ap.add_argument(
+        "--compact-eps", type=float, default=TrainParams.compact_eps,
+        help="total blend-weight threshold for deletion (default 0.5/255: cannot "
+             "move any single rendered pixel by half an 8-bit step)",
+    )
+    ap.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
         help="resume from the latest checkpoint beside --out (splat/ckpt) if present",
     )
@@ -2109,6 +2255,8 @@ def _main() -> None:
             depth_densify=args.depth_densify,
             tile_max=args.tile_max,
             lod_levels=args.lod_levels,
+            compact=args.compact,
+            compact_eps=args.compact_eps,
         ),
         resume=args.resume,
         progress=_log,
