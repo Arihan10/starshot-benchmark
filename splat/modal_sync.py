@@ -412,8 +412,9 @@ def pull_samples(cell_dir: Path) -> list[str]:
 
 def pull_cell(cell_dir: Path, include_ply: bool = True, quiet: bool = False) -> list[str]:
     """Download the run's artifacts into the local `splat/` dir: plan + status
-    + every `.sqz`, plus `trained.ply` and its LOD ladder unless `include_ply`
-    is off. Skips files already present at the same size."""
+    + every `.sqz`, plus the plys unless `include_ply` is off — the RAW Stage-6
+    `trained.ply` AND the delivered Stage-7 `healed.ply` + its LOD ladder, so the
+    viewer can show trained vs healed side by side. Skips same-size files."""
     run, slot, model = _cell_parts(cell_dir)
     vol = _volume()
     remote = f"cells/{run}/{slot}/{model}/splat"
@@ -424,9 +425,11 @@ def pull_cell(cell_dir: Path, include_ply: bool = True, quiet: bool = False) -> 
     wanted = [n for n in _PULL_ALWAYS if n in entries]
     wanted += [n for n in entries if n.endswith(".sqz")]
     if include_ply:
+        # trained.ply (raw, stage 6) + healed.ply and both LOD ladders (stage 7).
         wanted += [
             n for n in entries
-            if n == "trained.ply" or (n.startswith("trained.lod") and n.endswith(".ply"))
+            if n in ("trained.ply", "healed.ply")
+            or (n.endswith(".ply") and (".lod" in n) and n.startswith(("trained", "healed")))
         ]
 
     got: list[str] = []

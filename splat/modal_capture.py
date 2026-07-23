@@ -426,6 +426,13 @@ def capture_refs(
     summary (views, rendered count, renderer string, seconds)."""
     plan = stage5.load_camera_plan(cameras_path)
     views = stage5.enumerate_views(plan)
+    # Capture-settings guard (same mechanism the server's local path uses): if the
+    # frames already on disk were rendered under different settings (lighting or
+    # COLOR_PIPELINE — e.g. the reflective→matte switch), drop them so the resumed
+    # render re-does every view under one consistent look. Keyed to
+    # stage5.capture_meta(), so a COLOR_PIPELINE bump self-invalidates the frames
+    # the caller synced in from the Volume.
+    stage5.reconcile_capture_meta(refs_dir)
     pending = stage5.pending_views(refs_dir, views)
     intr = plan["intrinsics"]
     t0 = time.perf_counter()

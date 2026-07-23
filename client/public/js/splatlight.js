@@ -48,16 +48,33 @@ export function normalizeLighting(raw) {
 	return o;
 }
 
-// Splat-tier display tweaks for ONE glTF material, applied IN PLACE so the
-// material GLTFLoader produced is kept whole — full PBR (base colour + the
-// authored metallic-roughness map and its metalness/roughness factors, plus
-// normal/AO/emissive) — letting metals and glossy surfaces reflect + highlight
-// per view under the env rig, exactly like the mesh viewer. Only two tweaks:
-// DoubleSide (Trellis winding is unreliable) and depthWrite off for BLEND so the
-// depth behind glass survives. Map colour spaces are already set by GLTFLoader.
+// Splat-tier material prep for ONE glTF material, applied IN PLACE. The capture
+// bakes VIEW-INDEPENDENT lighting only: we force the surface to a matte
+// dielectric so the shading is purely diffuse (sun + hemisphere fill + diffuse
+// IBL irradiance) plus shadows — identical from every camera. Metallic-roughness
+// reflections and specular highlights are the view-dependent effects we
+// deliberately drop: a flat (SH-free, degree-0) splat cannot carry them, so if
+// they were baked per view they would only smear into a dull average. Base
+// colour, alpha/transparency, normal, AO and emissive are kept untouched.
+// Plus two structural tweaks: DoubleSide (Trellis winding is unreliable) and
+// depthWrite off for BLEND so the depth behind glass survives.
 export function toLitMaterial(orig) {
 	orig.side = THREE.DoubleSide;
 	orig.depthWrite = orig.transparent !== true;
+	// Matte dielectric: kill the specular lobe's view dependence. Roughness 1 +
+	// metalness 0 turns the env map into flat (irradiance-like) ambient instead
+	// of a moving reflection, and drops the sun's sharp highlight.
+	orig.metalness = 0;
+	orig.roughness = 1;
+	orig.metalnessMap = null;
+	orig.roughnessMap = null;
+	// Secondary specular lobes some glTF (MeshPhysicalMaterial) surfaces add are
+	// all pure view-dependent gloss — neutralize them when present.
+	if ("clearcoat" in orig) orig.clearcoat = 0;
+	if ("sheen" in orig) orig.sheen = 0;
+	if ("specularIntensity" in orig) orig.specularIntensity = 0;
+	if ("iridescence" in orig) orig.iridescence = 0;
+	orig.needsUpdate = true;
 	return orig;
 }
 
@@ -100,9 +117,10 @@ function nullProxyMaterial() {
 }
 
 // In-place: give a loaded glTF scene the normals shading needs (generated meshes
-// often ship without them), shadow flags, and the splat-tier display tweaks (see
-// toLitMaterial). Materials are kept, so their metallic-roughness / normal maps
-// survive into the lit capture. Transparent meshes also get a child DEPTH PROXY
+// often ship without them), shadow flags, and the splat-tier material prep (see
+// toLitMaterial). Materials are forced matte, so the capture bakes VIEW-
+// INDEPENDENT diffuse lighting; normal/AO/emissive maps still apply. Transparent
+// meshes also get a child DEPTH PROXY
 // (see depthProxyMaterial) so their solid parts occlude the scene behind — the fix
 // for mirror/opaque panels rendering see-through and the wall/floor bleeding
 // through them, without a full multi-pass OIT. The lit twin of splatviewer's old

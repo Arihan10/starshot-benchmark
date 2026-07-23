@@ -6,8 +6,9 @@ Deploy with `modal deploy splat/modal_app.py` from the repo root; drive it with
   * LOCAL (Mac): stages 1-3 — scene manifest, free-space grid, surfel cloud.
   * MODAL (one A100-40GB container): stage 4 (camera plan — CUDA ray-march),
     stage 5 (reference renders — headless Chromium against the loopback host in
-    `splat/modal_capture.py`), stage 6 (gsplat 2DGS fine-tune), stage 7
-    (`splat/quantize.py` → `.sqz`).
+    `splat/modal_capture.py`), stage 6 (gsplat 2DGS fine-tune → RAW `trained.ply`),
+    stage 7 (delete + heal + final-prune → delivered `healed.ply` + LOD ladder,
+    then `splat/quantize.py` → `healed.sqz`).
 
 DATA MODEL — one `modal.Volume` ("starshot-splat-cells"):
 
@@ -20,8 +21,9 @@ DATA MODEL — one `modal.Volume` ("starshot-splat-cells"):
                                                 cloud.ply.zst, manifest.json
     cells/{run}/{slot}/{model}/splat/           cameras.json, patches.bin,
                                                 patch_views.json, refs/, ckpt/,
-                                                trained.ply (+ LODs), *.sqz,
-                                                status.json
+                                                trained.ply (RAW, stage 6),
+                                                healed.ply (+ LODs, stage 7),
+                                                healed.sqz, status.json
 
 Inputs are compressed by the CLIENT where it pays (cloud.ply ~1.6-2x, skin
 bitmasks ~3-5x; GLBs/npz are already entropy-coded and upload as-is) and are
@@ -349,7 +351,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     """
     from splat import modal_capture, quantize
     from splat.stage4 import PlanParams, plan_cameras
-    from splat.stage6 import TrainParams, train_splat
+    from splat.stage6 import TrainParams, heal_splat, train_splat
 
     run, slot, model = spec["run"], spec["slot"], spec["model"]
     stages = set(spec.get("stages") or [4, 5, 6, 7])
@@ -404,9 +406,14 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     code5 = _src_sig(
         Path(_stage5.__file__), Path(modal_capture.__file__),
         _js / "splatcapture.js", _js / "splatcapture-worker.js",
+        # splatlight.js defines the bake rig + the (now matte, view-independent)
+        # material prep, so it too determines every captured pixel — fold it in
+        # so a change there re-renders stage 5 instead of silently reusing frames.
+        _js / "splatlight.js",
     )
     code6 = _src_sig(Path(_stage6.__file__))
-    code7 = _src_sig(Path(quantize.__file__))
+    # (stage 7 = heal + quantize folds its own source hash inline — both stage6.py
+    # and quantize.py — so no standalone code7 here.)
 
     # ---- stage 4: coverage camera plan -----------------------------------------
     plan_params = PlanParams(**(spec.get("plan") or {}))
@@ -437,19 +444,48 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     if 5 in stages:
         if not cameras.is_file():
             raise FileNotFoundError("cameras.json missing — run stage 4 first")
-        sig5 = _sig({"cameras": _sha256(cameras), "tier": in_sha["tier"], "code": code5})
+        cam_sha = _sha256(cameras)
+        sig5 = _sig({"cameras": cam_sha, "tier": in_sha["tier"], "code": code5})
         if not force and _fresh(status, "5", sig5, [transforms]):
             summary["stages_skipped"].append(5)
         else:
             refs_scratch = scratch / "refs"
-            if force:
-                # A clean re-render must also drop the Volume copies: the
-                # publish sync below compares by size only, and a re-rendered
-                # same-size frame would otherwise be skipped.
+            # RESUME vs REPLAN. Frames are keyed by POSITIONAL view id
+            # (cam00042_+x), so frames rendered under a DIFFERENT camera plan
+            # collide with the new plan's ids — blindly "resuming" across a replan
+            # would skip re-rendering every colliding view and hand Stage 6 the
+            # OLD plan's pixels against the NEW plan's poses (silently corrupt
+            # supervision). Resume is therefore gated on a plan marker
+            # (`refs/plan.sha` = the cameras.json hash): only a preempted render of
+            # THIS EXACT plan syncs its prior frames back; anything else clears
+            # both copies and renders fresh. This also fixes the invisible stall
+            # the unconditional sync caused after a replan — pulling the entire
+            # stale reference set (many GB) from the Volume with NO heartbeat, so
+            # it looked like stage 4 was hung "writing cameras.json".
+            marker = out / "refs" / "plan.sha"
+            same_plan = False
+            with contextlib.suppress(Exception):
+                same_plan = marker.read_text() == cam_sha
+            if force or not same_plan:
+                heart.stage("refs")(
+                    0, 0,
+                    "fresh render — dropping any stale frames" if not same_plan and not force
+                    else "forced re-render — dropping frames",
+                )
                 shutil.rmtree(refs_scratch, ignore_errors=True)
                 shutil.rmtree(out / "refs", ignore_errors=True)
             else:
-                _sync_dir(out / "refs", refs_scratch)  # resume prior frames
+                # Same plan, resuming a preempted render: syncing the prior frames
+                # from the Volume can take minutes — emit a heartbeat so this step
+                # is VISIBLE (not mistaken for a hung earlier stage).
+                heart.stage("refs")(0, 0, "resuming — syncing prior frames from volume")
+                _sync_dir(out / "refs", refs_scratch)
+            # Stamp the plan marker on both copies before rendering; the capture's
+            # periodic sample commits carry the Volume copy, so a preemption of
+            # THIS plan resumes instead of re-rendering from scratch.
+            for d in (out / "refs", refs_scratch):
+                d.mkdir(parents=True, exist_ok=True)
+                (d / "plan.sha").write_text(cam_sha)
             s5 = modal_capture.capture_refs(
                 run=run, slot=slot, model=model,
                 cameras_path=cameras,
@@ -501,24 +537,51 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             summary["stages_run"].append(6)
             summary["train"] = s6
 
-    # ---- stage 7: near-lossless quantize (.sqz) ---------------------------------
+    # ---- stage 7: heal (delete + heal + final-prune) -> healed.ply, then the
+    # LOD ladder + near-lossless quantize of the DELIVERED (healed) model. Stage 6
+    # emits the raw trained.ply; this is where the cleaned, shippable healed.ply /
+    # healed.lodK.ply / healed.sqz are produced, so the two are viewable apart.
+    healed = out / "healed.ply"
     if 7 in stages:
         if not trained.is_file():
             raise FileNotFoundError("trained.ply missing — run stage 6 first")
+        if not transforms.is_file():
+            raise FileNotFoundError("refs/transforms.json missing — run stage 5 first")
+        train_params = TrainParams(**(spec.get("train") or {}))
         quant = quantize.QuantConfig(**(spec.get("quant") or {}))
-        sig7 = _sig({"trained": _sha256(trained), "quant": quant.as_summary(), "code": code7})
-        sqz = out / "trained.sqz"
-        if not force and _fresh(status, "7", sig7, [sqz]):
+        # Keyed on the raw trained.ply + the surfels (surface prior) + the refs
+        # (heal supervision) + train/quant params + BOTH source files (heal lives
+        # in stage6.py, quantize in quantize.py).
+        sig7 = _sig({
+            "trained": _sha256(trained), "cloud": in_sha["cloud"],
+            "refs": _sha256(transforms), "params": train_params.as_summary(),
+            "quant": quant.as_summary(),
+            "code": _src_sig(Path(_stage6.__file__), Path(quantize.__file__)),
+        })
+        sqz = out / "healed.sqz"
+        if not force and _fresh(status, "7", sig7, [healed, sqz]):
             summary["stages_skipped"].append(7)
         else:
-            s7 = {"main": quantize.quantize_ply(trained, sqz, quant)}
-            for lod in sorted(out.glob("trained.lod*.ply")):
-                s7[lod.stem] = quantize.quantize_ply(
+            if force:
+                for old in out.glob("healed*"):     # drop stale healed artifacts
+                    old.unlink()
+            refs_scratch = scratch / "refs"
+            _sync_dir(out / "refs", refs_scratch)   # heal reads refs from local disk
+            s7: dict[str, Any] = {"heal": heal_splat(
+                run=run, slot=slot, model=model,
+                trained_path=trained, cloud_path=cloud, refs_dir=refs_scratch,
+                out_path=healed, params=train_params,
+                progress=heart.stage("heal", commit=True),
+            )}
+            # Quantize the delivered healed model + its LOD ladder.
+            s7["quantize"] = {"main": quantize.quantize_ply(healed, sqz, quant)}
+            for lod in sorted(out.glob("healed.lod*.ply")):
+                s7["quantize"][lod.stem] = quantize.quantize_ply(
                     lod, lod.with_suffix(".sqz"), quant
                 )
             _record(status, status_path, "7", sig7, s7)
             summary["stages_run"].append(7)
-            summary["quantize"] = s7
+            summary["heal"] = s7
 
     heart.stage("done")(1, 1, "")
     volume.commit()

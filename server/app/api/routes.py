@@ -2004,8 +2004,15 @@ def _cloud_path(run: str, slot: str, model: str) -> Path:
 
 
 def _trained_path(run: str, slot: str, model: str) -> Path:
-    """Where a cell's Stage-6 fine-tuned splat lives (`splat/trained.ply`)."""
+    """Where a cell's RAW Stage-6 fine-tuned splat lives (`splat/trained.ply`)."""
     return _slot_dir(run, slot, model) / "splat" / splat_stage6.TRAINED_NAME
+
+
+def _healed_path(run: str, slot: str, model: str) -> Path:
+    """Where a cell's DELIVERED Stage-7 splat lives (`splat/healed.ply`) — the
+    compacted + healed + pruned model, the 'healed' view's counterpart to the raw
+    'trained' view."""
+    return _slot_dir(run, slot, model) / "splat" / "healed.ply"
 
 
 def _stage6_log_path(run: str, slot: str, model: str) -> Path:
@@ -2360,6 +2367,7 @@ def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
     ('done' when trained.ply is already local, else 'idle')."""
     trained = _trained_path(run, slot, model)
     url = _artifact_url(trained)
+    healed_url = _artifact_url(_healed_path(run, slot, model))  # Stage-7 delivered view
     cams_local = _cameras_path(run, slot, model).is_file()
     # Mid-run debug sample PNGs pulled from the Volume (refs/samples/*.png).
     sample_dir = _slot_dir(run, slot, model) / "splat" / "refs" / "samples"
@@ -2370,7 +2378,8 @@ def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
     job = _splat_modal_jobs.get((run, slot, model))
     base = {
         "run": run, "slot": slot, "model": model,
-        "trained_url": url, "sample_urls": sample_urls,
+        # Two views: raw Stage-6 `trained` and delivered Stage-7 `healed`.
+        "trained_url": url, "healed_url": healed_url, "sample_urls": sample_urls,
     }
     if job is None:
         return {
@@ -2521,6 +2530,51 @@ async def _run_splat_modal_cell(
         _splat_modal_tasks.pop(key, None)
 
 
+# Downstream (Stage 4-7) artifacts a Modal train produces + pulls back — the set
+# cleared on a forced (re)start and refreshed on reattach, so a cell's local
+# splat/ dir never mixes a previous run's outputs with the current one. The
+# Stage 1-3 INPUTS (cloud.ply[.detail.npy], cloud.json/feat, freespace.*, scene /
+# source / voxels) are deliberately EXCLUDED — pushing the next run reads them,
+# and every downstream name here begins "cameras/patches/patch_views/status/
+# slim/compact" or "trained*", none of which collide with an input.
+_MODAL_ARTIFACT_NAMES = (
+    "cameras.json", "patches.bin", "patch_views.json", "status.json",
+    "slim.json", "compact.json",
+)
+# trained* = the RAW Stage-6 model; healed* = the delivered Stage-7 model (+ their
+# LOD ladders / sqz). Both are downstream artifacts; neither prefix collides with
+# a Stage 1-3 input (cloud*/freespace*/scene/source/voxels).
+_MODAL_ARTIFACT_GLOBS = (
+    "trained*.ply", "trained*.sqz", "trained*.sog",
+    "healed*.ply", "healed*.sqz", "healed*.sog",
+)
+
+
+def _clear_modal_artifacts(
+    run: str, slot: str, model: str, *, drop_job_record: bool
+) -> None:
+    """Delete a cell's DOWNSTREAM modal artifacts (the Stage-4 plan, the Stage-6/7
+    splats + LOD ladder + sqz, the pulled debug samples, the modal status copy) so
+    old and new runs never coexist locally and the viewer can't show a stale
+    trained.ply beside a fresh plan. NEVER touches the Stage 1-3 inputs.
+    `drop_job_record=True` also removes `modal-job.json` — a forced restart
+    re-creates it on spawn; a reattach keeps it (it's the call id being adopted)."""
+    import shutil
+
+    d = _slot_dir(run, slot, model) / "splat"
+    if not d.is_dir():
+        return
+    for name in _MODAL_ARTIFACT_NAMES:
+        (d / name).unlink(missing_ok=True)
+    for pat in _MODAL_ARTIFACT_GLOBS:
+        for p in d.glob(pat):
+            with contextlib.suppress(OSError):
+                p.unlink()
+    shutil.rmtree(d / splat_stage5.REFS_DIRNAME / "samples", ignore_errors=True)
+    if drop_job_record:
+        (d / "modal-job.json").unlink(missing_ok=True)  # forced spawn writes a fresh one
+
+
 async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
     """Re-hook the server to a Modal train a PREVIOUS process spawned — the
     sticky hook that survives a restart. The call id persists in the cell's
@@ -2540,10 +2594,23 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
     if key in _splat_modal_reattaching:
         return False  # a concurrent re-attach is already resolving this cell
     cell_dir = _slot_dir(run, slot, model)
-    if not splat_modal._job_path(cell_dir).is_file():
+    job_file = splat_modal._job_path(cell_dir)
+    if not job_file.is_file():
         return False  # nothing was ever spawned for this cell
-    if _trained_path(run, slot, model).is_file():
-        return False  # result already local — nothing to recover
+    # Skip ONLY when the local trained.ply already corresponds to THIS job record
+    # (or a newer run) — compare its mtime to the record's spawn time. A stale
+    # trained.ply from an EARLIER run must never suppress reattaching the job the
+    # record now points at: that orphaned every live A100 train across a restart
+    # for any cell that had ever finished a prior run (the reported bug).
+    trained = _trained_path(run, slot, model)
+    if trained.is_file():
+        try:
+            rec = json.loads(job_file.read_text(encoding="utf-8"))
+            spawned = datetime.fromisoformat(rec["spawned_at"]).timestamp()
+        except Exception:
+            spawned = float("inf")  # unparseable record → don't trust the result; probe
+        if trained.stat().st_mtime >= spawned:
+            return False  # result is from this (or a later) run — nothing to recover
     _splat_modal_reattaching.add(key)
     try:
         try:
@@ -2552,6 +2619,13 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
             return False  # torn record / expired call id — leave it alone
         state = st.get("state")
         if state == "running":
+            # We passed the mtime guard, so any local trained.ply / cameras / etc.
+            # are from an EARLIER run — drop them so the cell shows only this run
+            # (keep modal-job.json: it holds the call id we're reattaching). The
+            # supervisor re-pulls this run's outputs as it streams: the camera
+            # plan the moment Stage 4 is on the Volume, the samples during Stage 5,
+            # and trained.ply (+ LODs / sqz) at completion.
+            _clear_modal_artifacts(run, slot, model, drop_job_record=False)
             _splat_modal_jobs[key] = {
                 "status": "running", "running": True, "phase": "run",
                 "heartbeat": st.get("heartbeat"), "call_id": st.get("call_id"),
@@ -2564,9 +2638,14 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
             )
             return True
         if state == "done":
-            # Finished while we were down → land the artifacts locally.
+            # Finished while we were down → drop any stale earlier-run artifacts,
+            # then land THIS run's outputs locally (cameras + patches + trained.ply
+            # + LODs + sqz + status, plus the debug samples).
+            _clear_modal_artifacts(run, slot, model, drop_job_record=False)
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(splat_modal.pull_cell, cell_dir, True, True)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(splat_modal.pull_samples, cell_dir)
         return False
     finally:
         _splat_modal_reattaching.discard(key)
@@ -4240,27 +4319,54 @@ def create_app() -> FastAPI:
         """Train ONE cell on the Modal A100: stages 4 (cameras) → 5 (references)
         → 6 (fine-tune) run remotely, and `trained.ply` is pulled back so the
         viewer's 'trained' toggle lights up. Needs the local Stage 2 + Stage 3
-        outputs (freespace + cloud). Idempotent while running (returns the live
-        job); a fresh POST after completion re-runs only what changed remotely,
-        and `restart: true` forces a from-scratch remote train. The whole thing
-        is async: it never blocks the server. Poll the GET (or the cells list's
-        per-cell `modal` field) for the live phase + training step."""
+        outputs (freespace + cloud).
+
+        This button is an explicit FRESH, FORCED restart: it cancels any train
+        already running for the cell (ours or a reattached one), deletes the
+        previous run's local artifacts (`_clear_modal_artifacts`), and spawns a
+        from-scratch remote run (force — no signature/cache reuse). CONTINUING a
+        still-running train instead is the job of the AUTOMATIC paths (the startup
+        scan + the status-poll reattach hook), never this button. Async — never
+        blocks the server; poll the GET (or the cells list's per-cell `modal`
+        field) for the live phase + training step."""
         if splat_modal is None:
             raise HTTPException(
                 status_code=503,
                 detail="the Modal SDK isn't available on this server host",
             )
         key = (run, slot, model)
-        existing = _splat_modal_jobs.get(key)
-        if existing is not None and existing.get("running"):
-            return _splat_modal_status(run, slot, model)  # already running
+        # The MANUAL button is an explicit FRESH, FORCED restart — distinct from
+        # the AUTOMATIC paths (startup scan + the status-poll `_reattach_modal_job`
+        # hook), which reattach and CONTINUE a still-running train. So tear down
+        # anything already training this cell — our supervisor task AND the remote
+        # container (whether this process spawned it or reattached to it) — then
+        # spawn a forced from-scratch run (drops the stage-5 frames + stage-6
+        # checkpoints on the Volume; no signature/cache reuse). The running
+        # placeholder is set BEFORE any await so a concurrent status poll can't
+        # reattach the very container we're about to cancel.
+        _splat_modal_jobs[key] = {
+            "status": "running", "running": True, "phase": "start",
+            "heartbeat": None, "error": None, "msg": "restarting (forced)…",
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+        }
+        old_task = _splat_modal_tasks.get(key)
+        if old_task is not None:
+            old_task.cancel()
+            await asyncio.gather(old_task, return_exceptions=True)
+        with contextlib.suppress(Exception):
+            await asyncio.to_thread(splat_modal.cancel_cell, _slot_dir(run, slot, model))
+        # Explicit restart = clean slate: drop every previous-run artifact locally
+        # (incl. modal-job.json — the forced spawn writes a new one) so nothing old
+        # lingers to confuse old-vs-new. Runs AFTER cancel_cell, which needs the
+        # old modal-job.json to terminate the prior container.
+        _clear_modal_artifacts(run, slot, model, drop_job_record=True)
         opts = {
             "train": body.train_overrides() if body is not None else {},
-            "restart": bool(body.restart) if body is not None else False,
+            "restart": True,  # explicit button press = force fresh
         }
         _splat_modal_jobs[key] = {
             "status": "running", "running": True, "phase": "start",
-            "heartbeat": None, "error": None, "msg": "starting…",
+            "heartbeat": None, "error": None, "msg": "forced fresh start…",
             "started_at": datetime.now().isoformat(timespec="seconds"),
         }
         _splat_modal_tasks[key] = asyncio.create_task(

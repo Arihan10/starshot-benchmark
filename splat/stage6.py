@@ -1,14 +1,14 @@
 """Stage 6 — Splat fine-tune (the training run) via gsplat 2DGS.
 
 Takes the **Stage-3 surfel cloud** (`cloud.ply`) as the initialization and
-optimizes it against the **Stage-5 unlit reference renders** (`refs/` — per-view
+optimizes it against the **Stage-5 matte-lit reference renders** (`refs/` — per-view
 RGB + depth + alpha + exact OpenCV poses in `transforms.json`) into an optimized
 2DGS splat (`trained.ply`). This is where the raw mesh-sampled surfels become a
 clean, crisp splat: densification adds Gaussians where the render disagrees with
 the reference (appearance detail on geometrically-flat surfaces), pruning removes
 redundant ones, and the depth loss suppresses floaters.
 
-WHAT THE FINE-TUNE FIXES (all lighting-independent, so it runs unlit): render-
+WHAT THE FINE-TUNE FIXES (all lighting-independent of the loss's own): render-
 operator errors that only appear once flat disks are depth-sorted + alpha-blended
 through the real rasterizer — silhouettes, thin geometry, zoom-in detail, alpha
 edges — plus floaters. The surfel init is ~90% there; this polishes the rest.
@@ -31,13 +31,15 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     transmittance-0.5 crossing) is cleaner at silhouettes and never fades BLEND
     glass (α ≈ 0.065 stays below the crossing), but is blind to those floaters —
     reserve it for genuinely glass-heavy scenes.
-  * Colour: sRGB compared directly (no sRGB↔linear); SH degree is a config flag —
-    degree 2 (view-dependent colour, the web viewer's maximum) is the default now
-    that capture is lit, so highlights/soft reflections move with the camera; set
-    0 to force flat unlit albedo. Higher orders ramp in over `sh_degree_interval`.
+  * Colour: flat per-Gaussian sRGB — the SH degree-0 DC term ONLY — compared
+    directly against the matte, view-independent references (no sRGB->linear).
+    View-dependent colour (spherical harmonics degree > 0) is deliberately NOT
+    used: the capture bakes view-independent lighting, so one flat colour per
+    Gaussian reproduces it exactly, and higher-order SH only smeared the moving
+    reflections that lighting mode already removed.
 
 LOSSES (per view):
-  * photometric — full-frame L1 + D-SSIM on RGB vs the unlit reference. Both
+  * photometric — full-frame L1 + D-SSIM on RGB vs the reference. Both
     sides are premultiplied-over-black (the reference alpha-blends over a black
     clear colour; gsplat composites with no background), so glass/MASK pixels
     compare like-with-like and background pixels directly penalize floater
@@ -190,15 +192,6 @@ class TrainParams:
     # step count the loop actually runs.
     iterations: int = 30_000
     epochs: float | None = None
-    # View-dependent colour. 2 = the web viewer's (mkkellogg) maximum and the
-    # standard for believable specular/sheen; 1 is a lighter option (a third the
-    # extra coefficients); 0 = flat unlit albedo. Degree 2 is the default now that
-    # capture bakes lighting (Phase 1) — SH is what lets a highlight move with the
-    # camera instead of being averaged into a dull smear. It adds (D+1)²−1 = 8
-    # coeffs per colour channel (24 floats/Gaussian), so it also drives the memory
-    # + size knobs below (cap_max, the tile budget, vram_min_free_gb).
-    sh_degree: int = 0
-    sh_degree_interval: int = 1000     # raise the active degree every N steps (if sh_degree > 0)
 
     # Loss weights.
     ssim_lambda: float = 0.2           # photometric = (1-λ)·L1 + λ·(1-SSIM)
@@ -216,7 +209,6 @@ class TrainParams:
     quats_lr: float = 1e-3
     opacities_lr: float = 5e-2
     sh0_lr: float = 2.5e-3
-    shN_lr: float = 2.5e-3 / 20.0
 
     # Densification (gsplat DefaultStrategy, 2DGS gradient key).
     refine: bool = True
@@ -244,15 +236,11 @@ class TrainParams:
     # GLASS_ALPHA = 0.065 (logit −2.67), and the old 0.05 threshold left only
     # ~0.3 logits of drift before a pane surfel was permanently pruned.
     prune_opa: float = 0.03
-    # Hard densification ceiling (VRAM guard). Trimmed from 3M to 2.5M for
-    # degree-2 SH: view-dependent colour makes each Gaussian ~2.7x heavier in
-    # training memory (14 → 38 trainable floats, ×4 with grad + Adam moments) and
-    # ~2.5x larger on disk (16 → 40 floats), so a mild cap curbs both the VRAM
-    # peak and the file size while SH's view-dependence offsets the slightly lower
-    # ceiling (net quality neutral-to-better under the lit references). Kept high
-    # rather than halved because quality is primary and the main box (A100) has
-    # ample VRAM; big scenes are unaffected — they TILE (n_tiles × cap_max total),
-    # and the lower derived tile budget just makes them tile a little sooner.
+    # Hard densification ceiling (VRAM guard). A mild cap curbs both the VRAM
+    # peak and the delivered file size (both ~linear in Gaussian count). Kept high
+    # because quality is primary and the main box (A100) has ample VRAM; big
+    # scenes are unaffected — they TILE (n_tiles × cap_max total), and the derived
+    # tile budget just makes them tile a little sooner.
     cap_max: int = 2_500_000
     # Final cleanup prune (once, before eval + export). Densification/pruning stop at
     # refine_stop (50% of iters), so opacity that drifts below prune_opa in the back
@@ -301,10 +289,9 @@ class TrainParams:
     # collapsed a real run to 0.05 it/s. 0 disables (rely on cap_max alone).
     # (`expandable_segments` would fight fragmentation on Linux/Modal but is a
     # no-op on Windows, so this free-margin freeze is the portable mechanism.)
-    # Raised 0.8 → 1.5 for degree-2 SH: each densification round now allocates
-    # ~2x the per-Gaussian memory, so the freeze needs a wider margin to catch the
-    # cliff before a growth step overshoots it. It's a near-full floor, so it never
-    # triggers where VRAM is plentiful (the A100) — no quality cost there.
+    # A near-full floor, so it never triggers where VRAM is plentiful (the A100)
+    # — no quality cost there — but on a small card it catches the cliff before a
+    # densification growth step overshoots it.
     vram_min_free_gb: float = 1.5
 
     # Anti-aliasing — a Mip-Splatting-style 3D low-pass computed from the exact
@@ -441,7 +428,6 @@ class TrainParams:
             depth_densify_start=per_batch(self.depth_densify_start),
             normal_start_iter=per_batch(self.normal_start_iter),
             dist_start_iter=per_batch(self.dist_start_iter),
-            sh_degree_interval=per_batch(self.sh_degree_interval),
             aa_every=per_batch(self.aa_every),
             ckpt_every=(0 if self.ckpt_every == 0 else per_batch(self.ckpt_every)),
         )
@@ -451,7 +437,6 @@ class TrainParams:
             "iterations": self.iterations,
             "epochs": self.epochs,
             "batch": self.batch,
-            "sh_degree": self.sh_degree,
             "ssim_lambda": self.ssim_lambda,
             "alpha_lambda": self.alpha_lambda,
             "depth_lambda": self.depth_lambda,
@@ -491,9 +476,9 @@ class TrainParams:
 def _load_cloud(path: Path) -> dict[str, np.ndarray]:
     """Parse a Stage-3 binary-little-endian float `.ply` into gsplat 2DGS init
     arrays: means [N,3], quats [N,4] (wxyz), opacities [N] (logit), sh0 [N,1,3]
-    (SH0 coeffs), scales [N,3] (log; a synthesized third axis when the cloud is
-    the 2-scale 2DGS format), plus shN [N,K-1,3] when the ply carries `f_rest_*`
-    (a trained view-dependent splat re-used as init; the Stage-3 cloud has none)."""
+    (SH0 DC colour coeffs), scales [N,3] (log; a synthesized third axis when the
+    cloud is the 2-scale 2DGS format). The splat is flat (degree-0); any stray
+    `f_rest_*` from a legacy view-dependent .ply is ignored."""
     raw = Path(path).read_bytes()
     marker = b"end_header\n"
     cut = raw.find(marker)
@@ -544,19 +529,7 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
         two = stack("scale_0", "scale_1")
         third = (two.min(axis=1, keepdims=True) + np.log(0.01)).astype(np.float32)
         scales = np.concatenate([two, third], axis=1)
-    out = {"means": means, "quats": quats, "opacities": opacities, "sh0": sh0, "scales": scales}
-    # Higher-order SH, if the ply carries it (a trained.ply re-used as init):
-    # invert the INRIA channel-major f_rest layout back to gsplat's [N, K-1, 3].
-    # The Stage-3 init cloud has none (SH0), so this is a no-op on the normal path.
-    rest_names = sorted(
-        (p for p in props if p.startswith("f_rest_")),
-        key=lambda s: int(s.rsplit("_", 1)[-1]),
-    )
-    if rest_names and len(rest_names) % 3 == 0:
-        rest = np.stack([col[p] for p in rest_names], axis=1).astype(np.float32)
-        per = len(rest_names) // 3
-        out["shN"] = np.ascontiguousarray(rest.reshape(-1, 3, per).transpose(0, 2, 1))
-    return out
+    return {"means": means, "quats": quats, "opacities": opacities, "sh0": sh0, "scales": scales}
 
 
 def _load_rgb(path: Path) -> np.ndarray:
@@ -633,39 +606,23 @@ def _encode_trained_ply(
     opacity: np.ndarray,
     scales2: np.ndarray,
     out_path: Path,
-    sh_rest: np.ndarray | None = None,
 ) -> None:
     """Write the trained model as a Stage-3-compatible 2DGS `.ply` (two tangent
     log-scales). Values are stored raw (opacity as logit, scales as log, colour as
-    `f_dc`) exactly as the viewers/Stage 7 expect.
-
-    `sh_rest` (the higher-order SH coefficients, shape [N, K-1, 3] in gsplat
-    coeff-major order) makes the model VIEW-DEPENDENT: they're written as
-    `f_rest_*` right after `f_dc` in the INRIA channel-major layout — all of
-    channel 0's coefficients, then channel 1's, then channel 2's — which every
-    SH-aware reader (the web viewer, the SOG encoder, the compressor) expects.
-    `sh_rest=None` writes the degree-0 flat-colour file, byte-identical to the
-    pre-SH exporter — used for the LOD ladder (distant levels don't need
-    view-dependence)."""
+    `f_dc`) exactly as the viewers/Stage 7 expect. The splat is flat (degree-0):
+    only the SH0 DC colour (`f_dc`) is written — never any `f_rest_*` view-
+    dependent coefficients — so every reader (the web viewer, the SOG encoder, the
+    compressor) shows one colour per Gaussian."""
     n = means.shape[0]
     normals = _quats_to_normals(quats)
     cols = [
         means[:, 0], means[:, 1], means[:, 2],
         normals[:, 0], normals[:, 1], normals[:, 2],
         f_dc[:, 0], f_dc[:, 1], f_dc[:, 2],
-    ]
-    rest_props = ""
-    if sh_rest is not None and sh_rest.size and sh_rest.shape[1] > 0:
-        # gsplat shN is [N, coeff, channel]; the INRIA .ply f_rest layout is
-        # channel-major (channel outer, coeff inner), so transpose then flatten.
-        rest = np.ascontiguousarray(np.transpose(sh_rest, (0, 2, 1)).reshape(n, -1))
-        cols.extend(rest[:, j] for j in range(rest.shape[1]))
-        rest_props = "".join(f"property float f_rest_{j}\n" for j in range(rest.shape[1]))
-    cols.extend([
         opacity,
         scales2[:, 0], scales2[:, 1],
         quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3],
-    ])
+    ]
     data = np.stack(cols, axis=1).astype("<f4")
     header = (
         "ply\n"
@@ -674,8 +631,7 @@ def _encode_trained_ply(
         "property float x\n" "property float y\n" "property float z\n"
         "property float nx\n" "property float ny\n" "property float nz\n"
         "property float f_dc_0\n" "property float f_dc_1\n" "property float f_dc_2\n"
-        + rest_props
-        + "property float opacity\n"
+        "property float opacity\n"
         "property float scale_0\n" "property float scale_1\n"
         "property float rot_0\n" "property float rot_1\n"
         "property float rot_2\n" "property float rot_3\n"
@@ -742,15 +698,15 @@ def _read_transforms(refs_dir: Path) -> dict[str, Any]:
     return json.loads(tp.read_text(encoding="utf-8"))
 
 
-def _render_inputs(torch, splats, active_sh: int):  # noqa: ANN001
-    """SH coefficients [N,K,3] + active `sh_degree` for `rasterization_2dgs`.
-    Always the SH path (degree 0 = just the DC term) rendered non-packed — the
-    only combination that produces depth correctly here: gsplat's packed SH branch
-    mis-broadcasts, and its precomputed-colour path never gathers colours to the
-    visible subset, so both crash on RGB+ED once a view sees only part of the
-    cloud (nnz < N). gsplat applies the +0.5 offset, matching Stage-3's f_dc."""
-    sh = splats["sh0"] if "shN" not in splats else torch.cat([splats["sh0"], splats["shN"]], dim=1)
-    return sh, active_sh
+def _render_inputs(torch, splats):  # noqa: ANN001
+    """SH0 colour coefficients [N,1,3] + SH degree (always 0) for
+    `rasterization_2dgs`. The splat is flat / view-independent — only the DC term
+    exists — rendered via gsplat's SH path at degree 0, the one combination that
+    also produces depth correctly here: gsplat's packed SH branch mis-broadcasts,
+    and its precomputed-colour path never gathers colours to the visible subset,
+    so both crash on RGB+ED once a view sees only part of the cloud (nnz < N).
+    gsplat applies the +0.5 offset, matching Stage-3's f_dc."""
+    return splats["sh0"], 0
 
 
 def _load_view(torch, view: dict[str, Any], device):  # noqa: ANN001
@@ -935,7 +891,7 @@ def _quat_from_normal(torch, normals):  # noqa: ANN001 - [M,3] unit → [M,4] wx
 
 def _append_gaussians(torch, splats, optimizers, strat_state, new):  # noqa: ANN001
     """Grow the model by the Gaussians in `new` (per-key tensors; any key a splat has
-    but `new` omits — e.g. shN — is zero-filled), extending each Adam optimizer's
+    but `new` omits is zero-filled), extending each Adam optimizer's
     moments and the strategy's running state (grad2d/count) with zeros so training
     stays consistent. Call AFTER the strategy's per-step work, so the step's `info`
     (sized to the pre-append count) is never used against the grown tensors."""
@@ -1094,7 +1050,7 @@ class _TileGrid:
         the training length invalidates cached tiles."""
         return (
             f"{n_init}:{self.k[0]}x{self.k[1]}:{self.margin:.3f}"
-            f":{params.iterations}:{params.sh_degree}:{params.resolved_tile_budget}"
+            f":{params.iterations}:{params.resolved_tile_budget}"
         )
 
 
@@ -1292,7 +1248,6 @@ def _train_tiled(  # noqa: ANN001
     core_counts = np.bincount(owner, minlength=grid.n_tiles)
     live = [t for t in range(grid.n_tiles) if core_counts[t] > 0]
     n_init = int(init["means"].shape[0])
-    bands = (params.sh_degree + 1) ** 2
 
     assigned = _assign_views(
         views, grid, K_np, width, height, params.tile_assign_stride,
@@ -1357,8 +1312,6 @@ def _train_tiled(  # noqa: ANN001
         if not vidx:
             core = grid.owner(sub["means"]) == t
             arrays = {k: v[core] for k, v in sub.items()}
-            if bands > 1:
-                arrays["shN"] = np.zeros((int(core.sum()), bands - 1, 3), dtype=np.float32)
             info: dict[str, Any] = {
                 "tile": t, "init": int(sel.sum()), "final": int(core.sum()),
                 "seeded": 0, "pruned": 0, "compacted": 0, "views": 0, "iters": 0,
@@ -1540,10 +1493,15 @@ def train_splat(
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
     """Fine-tune the Stage-3 surfel cloud at `cloud_path` against the Stage-5
-    references in `refs_dir`, writing the optimized 2DGS splat to `out_path`
-    (plus the `trained.lodK.ply` ladder). Requires a CUDA GPU + gsplat (raises a
-    clear error otherwise). Returns a compact summary (init/final splat counts,
-    per-tile breakdown when tiled, final metrics, bytes).
+    references in `refs_dir`, writing the RAW optimized 2DGS splat to `out_path`
+    (`trained.ply`). Requires a CUDA GPU + gsplat (raises a clear error
+    otherwise). Returns a compact summary (init/final splat counts, per-tile
+    breakdown when tiled, final metrics, bytes).
+
+    STAGE 6 IS TRAIN-ONLY: compaction (delete + heal + final-prune) and the LOD
+    ladder now live in Stage 7 (`heal_splat`), which reads this `trained.ply` and
+    emits the delivered `healed.ply`. So `trained.ply` is the un-cleaned model and
+    the two are viewable side by side.
 
     Seeds larger than `params.resolved_tile_budget` train TILED (module docstring
     §TILED TRAINING): ground-plane cells trained one at a time — each fits VRAM
@@ -1560,72 +1518,23 @@ def train_splat(
     if not cloud_path.is_file():
         raise FileNotFoundError(f"surfel cloud not found: {cloud_path} (run Stage 3)")
 
-    doc = _read_transforms(refs_dir)
-    frames = doc.get("frames", [])
-    if not frames:
-        raise RuntimeError(f"{refs_dir/TRANSFORMS_NAME} has no frames (run Stage 5)")
-
     device = torch.device("cuda")
     torch.manual_seed(params.seed)
 
-    width, height = int(doc["w"]), int(doc["h"])
-    K = torch.tensor(
-        [[doc["fl_x"], 0.0, doc["cx"]], [0.0, doc["fl_y"], doc["cy"]], [0.0, 0.0, 1.0]],
-        dtype=torch.float32,
-        device=device,
-    )
-
-    # Index the supervision set (paths + poses only; pixels stream from disk per
-    # step). Current sets carry ONE SZF frame per view (`frame_path`); legacy
-    # PNG-triple sets (`file_path`/`alpha_path`/`depth_path`) stay trainable.
-    # `near`/`far` (shared across the plan) decode the log-uint16 depth codes
-    # back to metric metres. `c2w` is kept for tile view-assignment.
-    depth_near = float(doc["near"]) if "near" in doc else None
-    depth_far = float(doc["far"]) if "far" in doc else None
-    views: list[dict[str, Any]] = []
-    cam_centers: list[np.ndarray] = []
-    for i, fr in enumerate(frames):
-        c2w = np.asarray(fr["transform_matrix"], dtype=np.float64)
-        cam_centers.append(c2w[:3, 3])
-        frame_rel = fr.get("frame_path")
-        rgb_rel = fr.get("file_path")
-        if frame_rel is None and rgb_rel is None:
-            raise ValueError(
-                f"{refs_dir / TRANSFORMS_NAME}: frame {i} has neither 'frame_path' "
-                "(SZF) nor 'file_path' (legacy PNG) — re-run Stage 5"
-            )
-        views.append(
-            {
-                "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
-                "c2w": c2w,
-                "frame": refs_dir / frame_rel if frame_rel else None,
-                "rgb": refs_dir / rgb_rel if rgb_rel else None,
-                "alpha": refs_dir / fr["alpha_path"] if fr.get("alpha_path") else None,
-                "depth": refs_dir / fr["depth_path"] if fr.get("depth_path") else None,
-                "depth_near": depth_near,
-                "depth_far": depth_far,
-            }
-        )
+    # Supervision set + intrinsics (paths + poses only; pixels stream from disk
+    # per step). Shared with the heal stage via `_load_scene`. The training
+    # SCHEDULE (epochs → step counts, cadences scaled by batch) is resolved per
+    # RUN just before _train_one (per TILE inside _train_tiled), so `params` here
+    # stays the raw client-supplied policy.
+    views, K, width, height, centers = _load_scene(torch, refs_dir, device)
     n_views = len(views)
 
-    # NOTE: the training SCHEDULE (epochs/convergence bounds → concrete step
-    # counts, cadences scaled by batch) is resolved per RUN just before
-    # _train_one — against the full view count for a single run, and per TILE
-    # (each against its own view count) inside _train_tiled — so `params` here
-    # stays the raw client-supplied policy.
-
     # Surfel init (also the scene-scale fallback source when there's ≤1 camera).
+    # scene_scale is GLOBAL even when tiled, so every tile's thresholds match the
+    # single-run semantics.
     init = _load_cloud(cloud_path)
     n_init = int(init["means"].shape[0])
-
-    # Scene scale = camera-cloud radius (× 1.1), the 3DGS spatial LR / density
-    # unit — GLOBAL even when tiled, so every tile's thresholds match the
-    # single-run semantics.
-    centers = np.stack(cam_centers, axis=0)
-    scene_scale = float(np.linalg.norm(centers - centers.mean(0), axis=1).max()) if n_views > 1 else 0.0
-    if scene_scale <= 1e-6:
-        scene_scale = float(np.linalg.norm(init["means"].max(0) - init["means"].min(0))) * 0.5
-    scene_scale = max(scene_scale * 1.1, 1e-3)
+    scene_scale = _scene_scale(centers, init["means"])
 
     # Single run when the seed fits the budget; otherwise plan the tile grid.
     ckpt_root = _ckpt_dir(out_path)
@@ -1697,9 +1606,10 @@ def train_splat(
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
-        sh_rest=arrays.get("shN"),
     )
-    lod_summary = _export_lod(arrays, out_path, params, progress)
+    # No LOD ladder here: trained.ply is the RAW model. The delivered LODs are
+    # built on the cleaned model in Stage 7 (`heal_splat` → healed.lodK.ply).
+    lod_summary = None
 
     # Training finished + the final splat is on disk → the checkpoints (and any
     # tile caches under them) are obsolete; drop them so a later resume doesn't
@@ -1723,6 +1633,294 @@ def train_splat(
         "resolution": width,
         "scene_scale": round(scene_scale, 4),
         "tiles": tiles_summary,
+        "lod": lod_summary,
+        "metrics": metrics,
+        "params": params.as_summary(),
+        "bytes": out_path.stat().st_size,
+        "out_path": str(out_path),
+    }
+
+
+def _load_scene(torch, refs_dir: Path, device):  # noqa: ANN001
+    """Reference views + shared intrinsics from a Stage-5 refs dir, exactly as the
+    trainer + the heal stage consume them: per frame the w2c `viewmat`, the c2w
+    (for scene scale / AA), and the SZF (or legacy PNG) frame paths + shared depth
+    near/far. Returns (views, K, width, height, centers). Shared by `train_splat`
+    (Stage 6) and `heal_splat` (Stage 7) so both read the plan identically."""
+    doc = _read_transforms(refs_dir)
+    frames = doc.get("frames", [])
+    if not frames:
+        raise RuntimeError(f"{refs_dir/TRANSFORMS_NAME} has no frames (run Stage 5)")
+    width, height = int(doc["w"]), int(doc["h"])
+    K = torch.tensor(
+        [[doc["fl_x"], 0.0, doc["cx"]], [0.0, doc["fl_y"], doc["cy"]], [0.0, 0.0, 1.0]],
+        dtype=torch.float32,
+        device=device,
+    )
+    depth_near = float(doc["near"]) if "near" in doc else None
+    depth_far = float(doc["far"]) if "far" in doc else None
+    views: list[dict[str, Any]] = []
+    cam_centers: list[np.ndarray] = []
+    for i, fr in enumerate(frames):
+        c2w = np.asarray(fr["transform_matrix"], dtype=np.float64)
+        cam_centers.append(c2w[:3, 3])
+        frame_rel = fr.get("frame_path")
+        rgb_rel = fr.get("file_path")
+        if frame_rel is None and rgb_rel is None:
+            raise ValueError(
+                f"{refs_dir / TRANSFORMS_NAME}: frame {i} has neither 'frame_path' "
+                "(SZF) nor 'file_path' (legacy PNG) — re-run Stage 5"
+            )
+        views.append(
+            {
+                "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
+                "c2w": c2w,
+                "frame": refs_dir / frame_rel if frame_rel else None,
+                "rgb": refs_dir / rgb_rel if rgb_rel else None,
+                "alpha": refs_dir / fr["alpha_path"] if fr.get("alpha_path") else None,
+                "depth": refs_dir / fr["depth_path"] if fr.get("depth_path") else None,
+                "depth_near": depth_near,
+                "depth_far": depth_far,
+            }
+        )
+    return views, K, width, height, np.stack(cam_centers, axis=0)
+
+
+def _scene_scale(centers: np.ndarray, fallback_means: np.ndarray) -> float:
+    """Camera-cloud radius (× 1.1), the 3DGS spatial-LR / density unit — the same
+    value Stage 6 trained with, so the heal's LRs and the prune-scale threshold
+    match. Falls back to half the model's own extent when there's ≤1 camera."""
+    n = int(centers.shape[0])
+    s = float(np.linalg.norm(centers - centers.mean(0), axis=1).max()) if n > 1 else 0.0
+    if s <= 1e-6:
+        s = float(np.linalg.norm(fallback_means.max(0) - fallback_means.min(0))) * 0.5
+    return max(s * 1.1, 1e-3)
+
+
+def _compact_and_heal(  # noqa: ANN001
+    torch, F, rasterization_2dgs, splats, views, K, width: int, height: int,
+    params: "TrainParams", scene_scale: float, device, init_means: np.ndarray,
+    cam_tree, focal: float, progress: ProgressCb | None,
+):
+    """Stage-7 compaction on a TRAINED model (module docstring §COMPACTION), run
+    GLOBALLY over all `views` (no tile box): measure each Gaussian's total rendered
+    contribution, apply the unconditional culls (lossless-invisible + off-surface
+    floaters), the quality-gated budget cut, heal the survivors, then the one-shot
+    cleanup prune. Mutates `splats`; returns `(arrays cpu-numpy, info)`.
+
+    Extracted verbatim from the old end-of-`_train_one` tail so the delivered model
+    is identical to what training used to fold in — only now it is its own stage,
+    operating on the merged `trained.ply` instead of per-tile."""
+    box_lo = box_hi = px_grid = py_grid = None   # global heal: no tile mask
+    n_before = int(splats["means"].shape[0])
+    n_compacted = 0
+    compact_search = None
+    if params.compact:
+        weights = _contribution_weights(
+            torch, rasterization_2dgs, splats, views, K, width, height, params, progress,
+        )
+        with torch.no_grad():
+            keep = _select_keep(
+                torch, weights, splats["sh0"], splats["opacities"], splats["means"],
+                init_means, params.compact_eps, params.surface_max_dist, None,
+            )
+            for name in list(splats.keys()):
+                splats[name] = torch.nn.Parameter(splats[name][keep].detach(), requires_grad=True)
+            weights = weights[keep]
+        n0 = int(splats["means"].shape[0])
+        if progress is not None:
+            progress(
+                1, 1,
+                f"compact: -{n_before - n0} unrenderable (<{params.compact_eps:.4f}) or "
+                f">{params.surface_max_dist}m off-surface -> {n0}",
+            )
+
+        chosen = None
+        if params.compact_max_db_drop is not None and n0 > 0:
+            ev0 = _evaluate(
+                torch, rasterization_2dgs, {k: v.detach() for k, v in splats.items()},
+                views, K, width, height, params, device,
+            )
+            psnr0 = float(ev0["psnr"])
+            lo, hi = 0.10, 1.0
+            best = None
+            for pi in range(max(params.compact_probes, 1)):
+                mid = (lo + hi) / 2.0
+                with torch.no_grad():
+                    kmask = _select_keep(
+                        torch, weights, splats["sh0"], splats["opacities"], splats["means"],
+                        None, params.compact_eps, 0.0, max(1, round(mid * n0)),
+                    )
+                    probe = {
+                        k: torch.nn.Parameter(v.detach()[kmask].clone()) for k, v in splats.items()
+                    }
+                if params.compact_probe_heal_steps > 0:
+                    _heal(
+                        torch, F, rasterization_2dgs, probe, views, K, width, height, params,
+                        scene_scale, params.compact_probe_heal_steps,
+                        box_lo, box_hi, px_grid, py_grid, None,
+                    )
+                ev = _evaluate(
+                    torch, rasterization_2dgs, {k: v.detach() for k, v in probe.items()},
+                    views, K, width, height, params, device,
+                )
+                drop = psnr0 - float(ev["psnr"])
+                ok = drop <= params.compact_max_db_drop
+                if progress is not None:
+                    progress(
+                        1, 1,
+                        f"compact/search {pi + 1}/{params.compact_probes}: keep {mid:.2f} "
+                        f"-> {ev['psnr']:.2f} dB (drop {drop:+.2f}) {'ok' if ok else 'too lossy'}",
+                    )
+                if ok:
+                    best, hi = (mid, kmask), mid
+                else:
+                    lo = mid
+                del probe
+                torch.cuda.empty_cache()
+            if best is not None and best[0] < 1.0:
+                chosen = best[1]
+                compact_search = {
+                    "psnr_clean": round(psnr0, 3),
+                    "keep_frac": round(best[0], 3),
+                    "max_db_drop": params.compact_max_db_drop,
+                    "probes": params.compact_probes,
+                }
+        elif params.compact_keep_frac is not None and n0 > 0:
+            with torch.no_grad():
+                chosen = _select_keep(
+                    torch, weights, splats["sh0"], splats["opacities"], splats["means"],
+                    None, params.compact_eps, 0.0, max(1, round(params.compact_keep_frac * n0)),
+                )
+
+        if chosen is not None:
+            with torch.no_grad():
+                for name in list(splats.keys()):
+                    splats[name] = torch.nn.Parameter(splats[name][chosen].detach(), requires_grad=True)
+            if progress is not None:
+                progress(
+                    1, 1,
+                    f"compact/budget: -{n0 - int(splats['means'].shape[0])} low-contribution "
+                    f"-> {int(splats['means'].shape[0])}",
+                )
+
+        n_compacted = n_before - int(splats["means"].shape[0])
+        if params.compact_heal_steps > 0 and n_compacted > 0:
+            _heal(
+                torch, F, rasterization_2dgs, splats, views, K, width, height, params,
+                scene_scale, params.compact_heal_steps, box_lo, box_hi, px_grid, py_grid, progress,
+            )
+            if params.antialias and cam_tree is not None:
+                _aa_scale_floor(torch, splats, cam_tree, focal, params.aa_min_scale_px)
+
+    n_pruned = (
+        _final_prune(torch, splats, params.prune_opa, params.prune_scale3d, scene_scale)
+        if params.final_prune
+        else 0
+    )
+    if progress is not None and n_pruned:
+        progress(
+            1, 1,
+            f"final prune: -{n_pruned} floaters below opacity {params.prune_opa} "
+            f"(-> {int(splats['means'].shape[0])} splats)",
+        )
+
+    with torch.no_grad():
+        arrays = {k: v.detach().cpu().numpy() for k, v in splats.items()}
+    info = {
+        "final": int(arrays["means"].shape[0]),
+        "compacted": n_compacted,
+        "pruned": n_pruned,
+        "compact_search": compact_search,
+    }
+    return arrays, info
+
+
+def heal_splat(
+    *,
+    run: str,
+    slot: str,
+    model: str,
+    trained_path: Path,
+    cloud_path: Path,
+    refs_dir: Path,
+    out_path: Path,
+    params: TrainParams = TrainParams(),
+    progress: ProgressCb | None = None,
+) -> dict[str, Any]:
+    """STAGE 7 — delete + heal + final-prune on the Stage-6 `trained.ply`, writing
+    the delivered `healed.ply` (+ its LOD ladder) to `out_path`. This is the
+    compaction that used to be folded into training's `trained.ply`; split out so
+    `trained.ply` is the raw optimization output and `healed.ply` is the cleaned
+    deliverable, viewable side by side. Global (whole merged model, all views) —
+    the per-tile compaction is gone with the fold-out. Requires CUDA + gsplat."""
+    torch, F, _ = _require_cuda_trainer()
+    from gsplat import rasterization_2dgs
+    from scipy.spatial import cKDTree
+
+    trained_path, cloud_path = Path(trained_path), Path(cloud_path)
+    refs_dir, out_path = Path(refs_dir), Path(out_path)
+    if not trained_path.is_file():
+        raise FileNotFoundError(f"trained splat not found: {trained_path} (run Stage 6)")
+    if not cloud_path.is_file():
+        raise FileNotFoundError(f"surfel cloud not found: {cloud_path} (run Stage 3)")
+
+    device = torch.device("cuda")
+    torch.manual_seed(params.seed)
+    views, K, width, height, centers = _load_scene(torch, refs_dir, device)
+    n_views = len(views)
+
+    trained_model = _load_cloud(trained_path)   # the trained model to heal
+    init = _load_cloud(cloud_path)              # Stage-3 surfels = the surface prior
+    n_before = int(trained_model["means"].shape[0])
+    scene_scale = _scene_scale(centers, trained_model["means"])
+
+    splats = torch.nn.ParameterDict(
+        {k: torch.nn.Parameter(torch.from_numpy(trained_model[k]).to(device)) for k in trained_model}
+    )
+    cam_tree = cKDTree(centers) if (params.antialias and n_views > 0) else None
+    focal = float(K[0, 0].item())
+
+    t0 = time.perf_counter()
+    if progress is not None:
+        progress(0, 1, f"heal: {n_before} splats, {n_views} views, scale={scene_scale:.2f}")
+    arrays, hinfo = _compact_and_heal(
+        torch, F, rasterization_2dgs, splats, views, K, width, height, params,
+        scene_scale, device, init["means"], cam_tree, focal, progress,
+    )
+    n_final = int(arrays["means"].shape[0])
+
+    metrics = None
+    try:
+        splats_t = {k: torch.from_numpy(v).to(device) for k, v in arrays.items()}
+        metrics = _evaluate(
+            torch, rasterization_2dgs, splats_t, views, K, width, height, params, device
+        )
+        del splats_t
+    except (torch.cuda.OutOfMemoryError, MemoryError):
+        torch.cuda.empty_cache()
+
+    if progress is not None:
+        progress(1, 1, f"heal done in {_fmt_hms(time.perf_counter() - t0)} - writing {out_path.name}")
+    quats = arrays["quats"] / (np.linalg.norm(arrays["quats"], axis=1, keepdims=True) + 1e-12)
+    _encode_trained_ply(
+        arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
+        arrays["opacities"], arrays["scales"][:, :2], out_path,
+    )
+    lod_summary = _export_lod(arrays, out_path, params, progress)
+
+    return {
+        "run": run,
+        "slot": slot,
+        "model": model,
+        "splats_in": n_before,
+        "splats_final": n_final,
+        "splats_compacted": hinfo["compacted"],
+        "splats_pruned_final": hinfo["pruned"],
+        "compact_search": hinfo["compact_search"],
+        "views": n_views,
+        "resolution": width,
+        "scene_scale": round(scene_scale, 4),
         "lod": lod_summary,
         "metrics": metrics,
         "params": params.as_summary(),
@@ -1832,7 +2030,7 @@ def _contribution_weights(  # noqa: ANN001
         viewmats = torch.stack(
             [views[i]["viewmat"] for i in range(lo, min(lo + b, len(views)))]
         ).to(device)
-        colors, sh_deg = _render_inputs(torch, shadow, params.sh_degree)
+        colors, sh_deg = _render_inputs(torch, shadow)
         renders, *_ = _render_batch(
             torch, rasterization_2dgs, shadow, colors, sh_deg, viewmats, K,
             width, height, params, dist_on=False,
@@ -1916,7 +2114,6 @@ def _heal(  # noqa: ANN001
         "quats": params.quats_lr * lr_scale,
         "opacities": params.opacities_lr * lr_scale,
         "sh0": params.sh0_lr * lr_scale,
-        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam([{"params": [splats[name]], "lr": lrs[name]}], eps=1e-15)
@@ -1932,7 +2129,7 @@ def _heal(  # noqa: ANN001
             if box_lo is not None and gt_depth is not None:
                 world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
                 mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
-            colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
+            colors, sh_deg = _render_inputs(torch, splats)
             renders, pred_alpha, normals, nfd, distort, median_depth, _info = _render_batch(
                 torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K,
                 width, height, params, dist_on=False,
@@ -1985,14 +2182,14 @@ def _train_one(  # noqa: ANN001
     device = torch.device("cuda")
     n_views = len(views)
     n_init = int(init["means"].shape[0])
-    bands = (params.sh_degree + 1) ** 2
 
-    # Resume from the latest checkpoint when present + compatible (same SH config),
-    # else build from the surfel init. `meta` guards against reloading a checkpoint
-    # whose model shape no longer matches this cloud's SH bands.
-    meta = {"sh_degree": params.sh_degree, "n_init": n_init}
+    # Resume from the latest checkpoint when present + compatible, else build from
+    # the surfel init. A legacy view-dependent checkpoint (one carrying an `shN`
+    # param) is incompatible with this flat degree-0 model, so it's rejected and
+    # the run starts fresh rather than crashing on the missing SH optimizer.
+    meta = {"n_init": n_init}
     ckpt = _load_checkpoint(torch, ckpt_dir, device) if resume else None
-    if ckpt is not None and ckpt.get("meta", {}).get("sh_degree") != params.sh_degree:
+    if ckpt is not None and "shN" in ckpt.get("params", {}):
         ckpt = None
 
     if ckpt is not None:
@@ -2009,20 +2206,6 @@ def _train_one(  # noqa: ANN001
                 "sh0": torch.nn.Parameter(torch.from_numpy(init["sh0"])),
             }
         ).to(device)
-        if bands > 1:
-            # Reuse the init's higher-order SH when present AND the degree matches
-            # (a trained splat re-fed as init); the Stage-3 cloud carries none, so
-            # the normal path starts them at zero and trains them up.
-            init_shN = init.get("shN")
-            if (
-                init_shN is not None
-                and init_shN.shape[0] == n_init
-                and init_shN.shape[1] == bands - 1
-            ):
-                shN0 = torch.from_numpy(np.ascontiguousarray(init_shN)).to(device)
-            else:
-                shN0 = torch.zeros((n_init, bands - 1, 3), dtype=torch.float32, device=device)
-            splats["shN"] = torch.nn.Parameter(shN0)
 
     # A batched step averages B views' gradients, so scale every LR by sqrt(B) to
     # keep per-view convergence ~constant as `batch` rises — variance-matching
@@ -2035,7 +2218,6 @@ def _train_one(  # noqa: ANN001
         "quats": params.quats_lr * lr_scale,
         "opacities": params.opacities_lr * lr_scale,
         "sh0": params.sh0_lr * lr_scale,
-        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam(
@@ -2131,8 +2313,7 @@ def _train_one(  # noqa: ANN001
             world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
             mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
 
-        active_sh = min(step // max(params.sh_degree_interval, 1), params.sh_degree)
-        colors, sh_deg = _render_inputs(torch, splats, active_sh)
+        colors, sh_deg = _render_inputs(torch, splats)
         renders, pred_alpha, normals, normals_from_depth, distort, median_depth, info = _render_batch(
             torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on
         )
@@ -2244,147 +2425,20 @@ def _train_one(  # noqa: ANN001
     # Release the prefetch worker (tiled runs create one stream per tile).
     stop_ev.set()
 
-    # Compaction (module docstring §COMPACTION): measure each Gaussian's total
-    # rendered contribution over this run's views, apply the unconditional culls
-    # (lossless-invisible + off-surface floaters), then the quality-gated budget
-    # cut, and heal the survivors. Per tile this uses the tile's own views + init
-    # surfels — the supervision granularity training itself had.
-    n_compacted = 0
-    compact_search = None
-    if params.compact:
-        n_before = int(splats["means"].shape[0])
-        weights = _contribution_weights(
-            torch, rasterization_2dgs, splats, views, K, width, height, params, progress,
-        )
-
-        # Unconditional culls first — junk removal, not gated by the dB budget
-        # (floaters INFLATE training-view PSNR by overfitting it, so a gate would
-        # wrongly defend them; the swamp's cull improved true depth accuracy).
-        with torch.no_grad():
-            keep = _select_keep(
-                torch, weights, splats["sh0"], splats["opacities"], splats["means"],
-                init["means"], params.compact_eps, params.surface_max_dist, None,
-            )
-            for name in list(splats.keys()):
-                splats[name] = torch.nn.Parameter(splats[name][keep].detach(), requires_grad=True)
-            weights = weights[keep]
-        n0 = int(splats["means"].shape[0])
-        if progress is not None:
-            progress(
-                params.iterations, params.iterations,
-                f"compact: -{n_before - n0} unrenderable (<{params.compact_eps:.4f}) or "
-                f">{params.surface_max_dist}m off-surface -> {n0}",
-            )
-
-        # Budget cut. Adaptive (default): bisect the keep fraction, accepting the
-        # deepest cut whose probe (prune -> short heal -> eval) stays within
-        # `compact_max_db_drop` of the post-cull baseline. Fixed fallback:
-        # `compact_keep_frac`. Ranking is opacity-normalized inside _select_keep.
-        chosen = None
-        if params.compact_max_db_drop is not None and n0 > 0:
-            ev0 = _evaluate(
-                torch, rasterization_2dgs, {k: v.detach() for k, v in splats.items()},
-                views, K, width, height, params, device,
-            )
-            psnr0 = float(ev0["psnr"])
-            lo, hi = 0.10, 1.0
-            best = None
-            for pi in range(max(params.compact_probes, 1)):
-                mid = (lo + hi) / 2.0
-                with torch.no_grad():
-                    kmask = _select_keep(
-                        torch, weights, splats["sh0"], splats["opacities"], splats["means"],
-                        None, params.compact_eps, 0.0, max(1, round(mid * n0)),
-                    )
-                    probe = {
-                        k: torch.nn.Parameter(v.detach()[kmask].clone()) for k, v in splats.items()
-                    }
-                if params.compact_probe_heal_steps > 0:
-                    _heal(
-                        torch, F, rasterization_2dgs, probe, views, K, width, height, params,
-                        scene_scale, params.compact_probe_heal_steps,
-                        box_lo, box_hi, px_grid, py_grid, None,
-                    )
-                ev = _evaluate(
-                    torch, rasterization_2dgs, {k: v.detach() for k, v in probe.items()},
-                    views, K, width, height, params, device,
-                )
-                drop = psnr0 - float(ev["psnr"])
-                ok = drop <= params.compact_max_db_drop
-                if progress is not None:
-                    progress(
-                        params.iterations, params.iterations,
-                        f"compact/search {pi + 1}/{params.compact_probes}: keep {mid:.2f} "
-                        f"-> {ev['psnr']:.2f} dB (drop {drop:+.2f}) {'ok' if ok else 'too lossy'}",
-                    )
-                if ok:
-                    best, hi = (mid, kmask), mid
-                else:
-                    lo = mid
-                del probe
-                torch.cuda.empty_cache()
-            if best is not None and best[0] < 1.0:
-                chosen = best[1]
-                compact_search = {
-                    "psnr_clean": round(psnr0, 3),
-                    "keep_frac": round(best[0], 3),
-                    "max_db_drop": params.compact_max_db_drop,
-                    "probes": params.compact_probes,
-                }
-        elif params.compact_keep_frac is not None and n0 > 0:
-            with torch.no_grad():
-                chosen = _select_keep(
-                    torch, weights, splats["sh0"], splats["opacities"], splats["means"],
-                    None, params.compact_eps, 0.0, max(1, round(params.compact_keep_frac * n0)),
-                )
-
-        if chosen is not None:
-            with torch.no_grad():
-                for name in list(splats.keys()):
-                    splats[name] = torch.nn.Parameter(splats[name][chosen].detach(), requires_grad=True)
-            if progress is not None:
-                progress(
-                    params.iterations, params.iterations,
-                    f"compact/budget: -{n0 - int(splats['means'].shape[0])} low-contribution "
-                    f"-> {int(splats['means'].shape[0])}",
-                )
-
-        n_compacted = n_before - int(splats["means"].shape[0])
-        if params.compact_heal_steps > 0 and n_compacted > 0:
-            _heal(
-                torch, F, rasterization_2dgs, splats, views, K, width, height, params,
-                scene_scale, params.compact_heal_steps, box_lo, box_hi, px_grid, py_grid, progress,
-            )
-            # Heal moved scales; re-assert the anti-alias floor so no survivor
-            # dropped below one pixel from its nearest camera.
-            if params.antialias and cam_tree is not None:
-                _aa_scale_floor(torch, splats, cam_tree, focal, params.aa_min_scale_px)
-
-    # One-shot cleanup prune before returning: densification stopped at
-    # refine_stop, so low-opacity floaters that drifted below prune_opa in the
-    # back half are still present. Prune here so the returned model is the
-    # shipped one.
-    n_pruned = (
-        _final_prune(torch, splats, params.prune_opa, params.prune_scale3d, scene_scale)
-        if params.final_prune
-        else 0
-    )
-    if progress is not None and n_pruned:
-        progress(
-            params.iterations, params.iterations,
-            f"final prune: -{n_pruned} floaters below opacity {params.prune_opa} "
-            f"(-> {int(splats['means'].shape[0])} splats)",
-        )
-
+    # Stage 6 emits the RAW optimization output. Delete + heal + final-prune is
+    # now its OWN stage (`heal_splat`, Stage 7) operating on the merged
+    # `trained.ply`, so `trained.ply` is the un-cleaned model and `healed.ply` the
+    # deliverable — the two viewable side by side. (The per-tile compaction that
+    # used to run here is gone with the fold-out; Stage 7 heals globally.)
     with torch.no_grad():
         arrays = {k: v.detach().cpu().numpy() for k, v in splats.items()}
     info = {
         "init": n_init,
         "final": int(arrays["means"].shape[0]),
         "seeded": n_seeded,
-        "pruned": n_pruned,
-        "compacted": n_compacted,
-        "compact_search": compact_search,
+        "pruned": 0,             # moved to Stage 7 (heal_splat)
+        "compacted": 0,          # moved to Stage 7 (heal_splat)
+        "compact_search": None,
         "views": n_views,
         "train_s": round(time.perf_counter() - t_start, 1),
     }
@@ -2412,7 +2466,7 @@ def _final_prune(torch, splats, prune_opa: float, prune_scale3d: float, scene_sc
 def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params, device):  # noqa: ANN001
     """Mean PSNR (foreground), RGB L1, and alpha-gated depth L1 over a random
     subset of views (capped by `eval_max_views` — plans can have thousands)."""
-    colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
+    colors, sh_deg = _render_inputs(torch, splats)
     n_eval = min(len(views), params.eval_max_views)
     sel = (
         np.random.default_rng(params.seed).choice(len(views), size=n_eval, replace=False)
@@ -2482,7 +2536,6 @@ def _main() -> None:
         help="passes over the view set; overrides --iterations "
              "(budget = epochs × n_views, steps = budget // batch)",
     )
-    ap.add_argument("--sh-degree", type=int, default=TrainParams.sh_degree)
     ap.add_argument(
         "--refine-stop-iter", type=int, default=None,
         help="stop densification at this step (default: 50%% of iterations)",
@@ -2570,7 +2623,6 @@ def _main() -> None:
         params=TrainParams(
             iterations=args.iterations,
             epochs=args.epochs,
-            sh_degree=args.sh_degree,
             refine_stop_iter=args.refine_stop_iter,
             batch=args.batch,
             ckpt_every=args.ckpt_every,

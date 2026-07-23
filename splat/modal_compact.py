@@ -88,7 +88,7 @@ def _diff_models(torch, np, rasterization_2dgs, model_a, model_b, views, K, widt
             viewmats = views[int(i)]["viewmat"].to(device).unsqueeze(0)
             outs = []
             for model_splats in (model_a, model_b):
-                colors, sh_deg = _render_inputs(torch, model_splats, params.sh_degree)
+                colors, sh_deg = _render_inputs(torch, model_splats)
                 renders, alpha, *_ = _render_batch(
                     torch, rasterization_2dgs, model_splats, colors, sh_deg,
                     viewmats, K, width, height, params, dist_on=False,
@@ -187,7 +187,6 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
-        sh_rest=arrays.get("shN"),  # preserve view-dependent colour through compaction
     )
 
     # --- verify A: original vs compacted, same poses --------------------------
@@ -364,9 +363,6 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
         "quats": params.quats_lr * lr_scale,
         "opacities": params.opacities_lr * lr_scale,
         "sh0": params.sh0_lr * lr_scale,
-        # shN is present whenever the trained splat is view-dependent (SH>0); the
-        # optimizer loop below iterates splats.keys(), so its LR must exist here.
-        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam([{"params": [splats[name]], "lr": lrs[name]}], eps=1e-15)
@@ -380,7 +376,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     stream = _view_stream(torch, views, device, b, params.prefetch, params.seed, 0, stop=stop_ev)
     for step in range(heal_steps):
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
-        colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
+        colors, sh_deg = _render_inputs(torch, splats)
         renders, pred_alpha, normals, nfd, distort, median_depth, _info = _render_batch(
             torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K,
             width, height, params, dist_on=False,
@@ -409,7 +405,6 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
-        sh_rest=arrays.get("shN"),  # preserve view-dependent colour through the slim
     )
 
     t2 = time.perf_counter()

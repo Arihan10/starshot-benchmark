@@ -49,8 +49,9 @@ let meshLit = false; // is the lit rig currently applied to the shared renderer?
 let prevRenderState = null; // renderer tone-map/shadow state saved while lit
 let meshLightingConfig = null; // this cell's captured LIGHTING (transforms.json), cached
 let mode = "splat"; // "splat" | "mesh" | "sog" — the view switch (not an overlay)
-let splatSource = "surfels"; // "surfels" (Stage-3 cloud.ply) | "trained" (Stage-6 trained.ply)
-let trainedUrl = null; // /artifacts URL of the Stage-6 trained.ply, when it exists
+let splatSource = "surfels"; // "surfels" (Stage-3 cloud.ply) | "trained" (Stage-6 RAW trained.ply) | "healed" (Stage-7 delivered healed.ply)
+let trainedUrl = null; // /artifacts URL of the Stage-6 RAW trained.ply, when it exists
+let healedUrl = null; // /artifacts URL of the Stage-7 delivered healed.ply, when it exists
 let sogUrl = null; // /artifacts URL of trained.sog (from stage6.sog_url), rendered via PlayCanvas
 
 // Patch-selection debug feature (needs Stage 4 + Stage 5). A selectable points
@@ -290,22 +291,20 @@ async function teardown() {
 	if (canvasEl) canvasEl.replaceChildren();
 }
 
-// One viewer construction shared by the splat and mesh-first paths.
-// The Stage-6 trained splat now carries view-dependent colour (spherical
-// harmonics degree 2, matching splat/stage6.py `sh_degree`), so highlights move
-// with the camera; the Stage-3 surfel cloud and the mesh-mode dummy are flat
-// (degree 0). mkkellogg allocates SH buffers for the viewer's configured degree,
-// so it's set PER LOAD (loadClouds) — 0 for surfels/mesh, 2 for trained.
-const TRAINED_SH_DEGREE = 0;
-
-function makeViewer(view, shDegree = 0) {
+// One viewer construction shared by the splat and mesh-first paths. The viewer
+// is FLAT by construction: spherical harmonics are disabled (degree 0), so it
+// shows one colour per Gaussian and can never render view-dependent effects.
+// Every cloud — Stage-3 surfels, the Stage-6 trained splat (which bakes the
+// matte capture lighting into DC colour), and the mesh-mode dummy — therefore
+// looks identical from every angle, so nothing view-dependent biases judgement.
+function makeViewer(view) {
 	return new GaussianSplats3D.Viewer({
 		rootElement: canvasEl,
 		selfDrivenMode: true,
 		useBuiltInControls: true,
 		sharedMemoryForWorkers: false, // no COOP/COEP needed on the static server
 		dynamicScene: false,
-		sphericalHarmonicsDegree: shDegree, // 0 = flat (surfels/mesh); 2 = trained view-dependent
+		sphericalHarmonicsDegree: 0, // SH disabled — the viewer is flat / view-independent by design
 		cameraUp: [0, 1, 0],
 		initialCameraPosition: view.position,
 		initialCameraLookAt: view.lookAt,
@@ -394,13 +393,13 @@ async function openMeshView(seq) {
 	);
 }
 
-// Build a fresh viewer and load a cloud. `shDegree` sizes the viewer's spherical
-// harmonics (0 for the flat surfel cloud, TRAINED_SH_DEGREE for the trained splat).
-async function loadClouds(seq, url, summary, camera, shDegree = 0) {
+// Build a fresh viewer and load a cloud. Every cloud renders flat (SH disabled),
+// so there is no per-cloud view-dependence to configure.
+async function loadClouds(seq, url, summary, camera) {
 	await teardown();
 	if (seq !== openSeq) return;
 	const view = camera || framing(summary && summary.scene_aabb);
-	const v = makeViewer(view, shDegree);
+	const v = makeViewer(view);
 	viewer = v;
 	try {
 		await v.addSplatScene(url, {
@@ -832,6 +831,7 @@ function syncViewButtons() {
 					: splatSource;
 	inputs._surfBtn?.classList.toggle("on", active === "surfels");
 	inputs._trainBtn?.classList.toggle("on", active === "trained");
+	inputs._healBtn?.classList.toggle("on", active === "healed");
 	inputs._sogBtn?.classList.toggle("on", active === "sog");
 	inputs._origBtn?.classList.toggle("on", active === "original");
 	inputs._voxViewBtn?.classList.toggle("on", active === "voxels");
@@ -856,10 +856,23 @@ function updateSourceAvail() {
 	if (btn) {
 		btn.disabled = !trainedUrl;
 		btn.title = trainedUrl
-			? "the Stage-6 fine-tuned splat (trained.ply)"
+			? "the Stage-6 RAW fine-tuned splat (trained.ply)"
 			: "run Stage 6 (the training script) to produce trained.ply";
 	}
 	if (!trainedUrl && splatSource === "trained") splatSource = "surfels";
+
+	// The Stage-7 delivered splat (compacted + healed + pruned) — produced by the
+	// modal flow, surfaced as `healed_url` on the cell's modal status (non-null
+	// iff healed.ply is local). Same wiring as `trained`, one stage later.
+	healedUrl = (cellStatus && cellStatus.modal && cellStatus.modal.healed_url) || null;
+	const hbtn = inputs && inputs._healBtn;
+	if (hbtn) {
+		hbtn.disabled = !healedUrl;
+		hbtn.title = healedUrl
+			? "the Stage-7 delivered splat (healed.ply: compacted + healed + pruned)"
+			: "run Stage 7 (heal) to produce healed.ply";
+	}
+	if (!healedUrl && splatSource === "healed") splatSource = "surfels";
 
 	sogUrl = s6.sog_url || null;
 	syncSogBtn();
@@ -915,6 +928,7 @@ async function setSource(next) {
 	if (next === splatSource) return;
 	const s3 = (cellStatus && cellStatus.stage3) || {};
 	if (next === "trained" && !trainedUrl) return;
+	if (next === "healed" && !healedUrl) return;
 	if (next === "surfels" && !s3.url) return;
 	splatSource = next;
 	mode = "splat";
@@ -922,14 +936,14 @@ async function setSource(next) {
 	const cam = captureCamera();
 	const bust = `?t=${Date.now()}`;
 	cloudLoaded = true;
-	if (next === "trained") {
-		setStatus("loading trained splat…", "var(--purple)");
+	if (next === "trained" || next === "healed") {
+		const url = next === "healed" ? healedUrl : trainedUrl;
+		setStatus(`loading ${next} splat…`, "var(--purple)");
 		await loadClouds(
 			openSeq,
-			api.absUrl(trainedUrl + bust),
+			api.absUrl(url + bust),
 			{ scene_aabb: s3.summary && s3.summary.scene_aabb },
 			cam,
-			TRAINED_SH_DEGREE, // trained.ply carries degree-2 view-dependent colour
 		);
 	} else {
 		setStatus("loading surfels…", "var(--purple)");
@@ -1489,6 +1503,12 @@ function buildControls(summary) {
 		disabled: true, // enabled by updateSourceAvail once trained.ply exists
 		onclick: () => setView("trained"),
 	});
+	const healBtn = el("button", {
+		class: "svc-seg-btn",
+		text: "healed",
+		disabled: true, // enabled by updateSourceAvail once healed.ply exists
+		onclick: () => setView("healed"),
+	});
 	const sogBtn = el("button", {
 		class: "svc-seg-btn",
 		text: "sog",
@@ -1509,6 +1529,7 @@ function buildControls(summary) {
 	});
 	inputs._surfBtn = surfBtn;
 	inputs._trainBtn = trainBtn;
+	inputs._healBtn = healBtn;
 	inputs._sogBtn = sogBtn;
 	inputs._origBtn = origBtn;
 	inputs._voxViewBtn = voxViewBtn;
@@ -1517,6 +1538,7 @@ function buildControls(summary) {
 		{ class: "svc-seg" },
 		surfBtn,
 		trainBtn,
+		healBtn,
 		sogBtn,
 		origBtn,
 		voxViewBtn,
@@ -2805,12 +2827,14 @@ function renderModal(cell) {
 		if (following) log.scrollTop = log.scrollHeight;
 	}
 
-	// Catch the running → done transition: trained.ply has been pulled (the
-	// supervisor sets 'done' only after the pull), so stage6.url is now set —
-	// refresh the toggles and open the trained view for an immediate compare.
+	// Catch the running → done transition: the artifacts have been pulled (the
+	// supervisor sets 'done' only after the pull) — refresh the toggles and open
+	// the DELIVERED healed view for an immediate look, falling back to the raw
+	// trained view if the heal stage didn't run.
 	if (modalPrev === "running" && status === "done") {
 		updateSourceAvail();
-		if (trainedUrl) void setView("trained");
+		if (healedUrl) void setView("healed");
+		else if (trainedUrl) void setView("trained");
 	}
 	modalPrev = status;
 }
@@ -2988,6 +3012,7 @@ export async function openSplatViewer(opts) {
 	cellStatus = null;
 	splatSource = "surfels";
 	trainedUrl = null;
+	healedUrl = null;
 	sogUrl = null;
 	modalPrev = null;
 	modalLog = [];
