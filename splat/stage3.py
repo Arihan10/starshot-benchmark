@@ -174,18 +174,40 @@ _SEAL_DIRS = np.array(
 ) - 1.0
 _SEAL_DIRS /= np.linalg.norm(_SEAL_DIRS, axis=1, keepdims=True)
 
-# --- object-scale-adaptive spacing (angular fidelity, not metric) --------------
+# --- object-scale-adaptive spacing (content-anchored, diagonal-capped) ---------
 # A screen pixel is an ANGLE, so the metric detail worth storing scales with the
-# distance a surface is actually viewed from — and an object is typically framed
-# from ~its own size away. So spacing scales with the OBJECT'S OWN diagonal:
-# `base · max(1, obj_diag / _VIEW_REF_M)`, UNCAPPED. Small props (cattail, chair,
-# obj_diag ≤ 2 m) stay at `base`; a hero prop scales with itself; a mountain or
-# skydome gets metre-scale surfels — but every surfel still sits ON the surface at
-# its LOCAL normal, so a big object reads as a coherent (lower-resolution) surface
-# from all angles, unlike a merged flat disc. This spacing is the ONLY size lever
-# (no coarsening merge). 2 m = the framing distance the base ~3 cm spacing is
-# calibrated for.
+# distance a surface is actually viewed from. The old rule used the OBJECT'S OWN
+# diagonal as that distance ("you frame an object from ~its own size away"):
+# `base · max(1, obj_diag / _VIEW_REF_M)`, UNCAPPED. That prior is right for
+# props but WRONG for scene-scale surfaces — a 200 m backdrop in a 10 m-deep
+# level is viewed from ~10 m, not 200 m — and it reads NOTHING about content:
+# measured across the benchmark scenes, 22-65% of surface area gets spacing
+# > 4× coarser than the surface's own TEXTURE (a 3 m-spaced backdrop carrying a
+# 0.57 m/texel painting), so the cloud physically cannot reproduce the lite
+# asset no matter how Stage 6 trains.
+#
+# The fix keeps the diagonal rule as the CEILING (never sample coarser than
+# today) and anchors the floor to the measured texel footprint:
+#
+#     spacing = max(base, min(base·max(1, diag/_VIEW_REF_M),
+#                             _TEXEL_SPACING_MULT · s_tex))
+#
+# where `s_tex` is the object's area-weighted median texel size in metres
+# (√(world_area/texels) per face — the UV jacobian × texture resolution). One
+# surfel per ~3 texels matches the source's information density: content-dense
+# surfaces (walls, backdrops with painted detail) sample finer; content-poor
+# ones (a 720² texture stretched over a 170 m desert) keep the coarse spacing —
+# the count tracks INFORMATION, which the diagonal alone only guessed at.
+# Untextured objects fall back to the diagonal rule. Measured growth across six
+# benchmark scenes: 1.3-2.5× surfels (hotel 529k→720k, platformer 1.44M→2.22M).
 _VIEW_REF_M = 2.0
+_TEXEL_SPACING_MULT = 3.0
+
+# Per-surfel texel-size sidecar written beside the cloud (`cloud.ply.stex.npy`,
+# float32 m/texel, NaN = untextured): Stage 4 anchors each patch's scale ladder
+# to it, so reference-camera effort tracks the same content signal the spacing
+# does. Rows align with the emitted `.ply` surfel order.
+_STEX_SIDECAR_SUFFIX = ".stex.npy"
 
 # --- legacy feature refinement (OFF by default; see module docstring) ----------
 _FEATURE_REFINE = False
@@ -569,6 +591,7 @@ def _band_darts(
     fs: FreeSpace,
     cand_keys: np.ndarray,
     seed: int,
+    s_tex: float = float("nan"),
 ) -> tuple[dict[str, np.ndarray] | None, int, int]:
     """One (sub)mesh → surfels: seeded darts, lattice thin, orient+cull against
     `fs.empty_at`, drop PROVABLY SEALED survivors (`_sealed_mask`), colour the
@@ -621,6 +644,10 @@ def _band_darts(
         "normal": oriented[idx].astype(np.float32),
         "color": colors,
         "radius": np.full(len(idx), _RADIUS_FRAC * spacing, dtype=np.float32),
+        # Content scale for Stage 4's ladder (sidecar; NaN = untextured). The
+        # object-level median: spacing is per-object, so finer granularity here
+        # would imply precision the sampler doesn't act on.
+        "stex": np.full(len(idx), s_tex, dtype=np.float32),
     }, thinned, n_sealed
 
 
@@ -630,6 +657,7 @@ def _sample_band(
     opaque: bool,
     fs: FreeSpace,
     cand_keys: np.ndarray,
+    s_tex: float = float("nan"),
 ) -> tuple[dict[str, np.ndarray] | None, int, int]:
     """Sample one mesh at one spacing. Small meshes go through `_band_darts`
     directly; a mesh whose dart budget exceeds `_CHUNK_MAX_CANDIDATES` is
@@ -641,7 +669,7 @@ def _sample_band(
     budget = int(mesh.area / (spacing * spacing) * _THIN_CANDIDATES) + 8
     if budget <= _CHUNK_MAX_CANDIDATES:
         return _band_darts(
-            mesh, spacing, opaque, fs, cand_keys, _band_seed(mesh, spacing, 0)
+            mesh, spacing, opaque, fs, cand_keys, _band_seed(mesh, spacing, 0), s_tex
         )
 
     tris = np.asarray(mesh.triangles, dtype=np.float64)
@@ -667,7 +695,7 @@ def _sample_band(
         m = skey == sk
         sub = _soup_mesh(tris[m], uv3[m] if uv3 is not None else None, material)
         part, n, ns = _band_darts(
-            sub, spacing, opaque, fs, cand_keys, _band_seed(sub, spacing, si + 1)
+            sub, spacing, opaque, fs, cand_keys, _band_seed(sub, spacing, si + 1), s_tex
         )
         thinned += n
         sealed += ns
@@ -684,15 +712,52 @@ def _sample_band(
     )
 
 
-def _object_spacing(geom: trimesh.Trimesh, base: float) -> float:
-    """Per-object sample spacing: `base · max(1, obj_diag / _VIEW_REF_M)`, UNCAPPED.
-    Small props (obj_diag ≤ _VIEW_REF_M) stay at `base`; larger objects sample
-    proportionally coarser (a mountain / skydome gets metre-scale surfels), each
-    still on-surface at its local normal — so scale adaptivity comes from spacing,
-    not from merging many surfels into an angle-dependent flat disc."""
+def _geom_texel_size(geom: trimesh.Trimesh) -> float:
+    """Area-weighted MEDIAN texel footprint of a mesh in metres/texel — the
+    content scale its base-colour texture actually paints on the surface,
+    from the per-face UV jacobian × texture resolution:
+    `s_tex(face) = √(world_area / (uv_area · W · H))`. NaN when the mesh has
+    no readable texture (or fully degenerate UVs) — callers fall back to the
+    diagonal spacing rule."""
+    visual = getattr(geom, "visual", None)
+    uv = getattr(visual, "uv", None)
+    material = getattr(visual, "material", None)
+    image = getattr(material, "baseColorTexture", None)
+    if image is None or uv is None or len(uv) != len(geom.vertices):
+        return float("nan")
+    try:
+        w, h = image.size
+    except Exception:
+        return float("nan")
+    fuv = np.asarray(uv, dtype=np.float64)[np.asarray(geom.faces)]  # (F,3,2)
+    e1 = fuv[:, 1] - fuv[:, 0]
+    e2 = fuv[:, 2] - fuv[:, 0]
+    texels = 0.5 * np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]) * w * h
+    area = np.asarray(geom.area_faces, dtype=np.float64)
+    ok = (texels > 1e-12) & (area > 1e-12)
+    if not ok.any():
+        return float("nan")
+    s = np.sqrt(area[ok] / texels[ok])
+    aw = area[ok]
+    order = np.argsort(s)
+    cum = np.cumsum(aw[order])
+    return float(s[order][np.searchsorted(cum, 0.5 * cum[-1])])
+
+
+def _object_spacing(geom: trimesh.Trimesh, base: float, s_tex: float | None = None) -> float:
+    """Per-object sample spacing (constants block above): the diagonal rule
+    `base · max(1, obj_diag / _VIEW_REF_M)` as the CEILING, refined down toward
+    `_TEXEL_SPACING_MULT · s_tex` when the surface's texture carries finer
+    content, floored at `base`. `s_tex` NaN/None = untextured → diagonal rule
+    (today's behaviour) unchanged."""
     b = np.asarray(geom.bounds, dtype=np.float64)
     diag = float(np.linalg.norm(b[1] - b[0]))
-    return base * max(diag / _VIEW_REF_M, 1.0)
+    spacing = base * max(diag / _VIEW_REF_M, 1.0)
+    if s_tex is None:
+        s_tex = _geom_texel_size(geom)
+    if np.isfinite(s_tex) and s_tex > 0:
+        spacing = max(base, min(spacing, _TEXEL_SPACING_MULT * s_tex))
+    return spacing
 
 
 def _sample_object(
@@ -710,14 +775,15 @@ def _sample_object(
         return None, 0, 0
     if cand_keys is None:
         cand_keys = _open_cand_keys(fs)
-    spacing = _object_spacing(geom, base)
+    s_tex = _geom_texel_size(geom)
+    spacing = _object_spacing(geom, base, s_tex)
     opaque = _alpha_mode(geom) not in _TRANSPARENT_ALPHA_MODES
     bands = _spacing_bands(geom, spacing) if _FEATURE_REFINE else [(geom, spacing)]
     parts: list[dict[str, np.ndarray]] = []
     sampled = 0
     sealed = 0
     for band_mesh, band_spacing in bands:
-        band, n, ns = _sample_band(band_mesh, band_spacing, opaque, fs, cand_keys)
+        band, n, ns = _sample_band(band_mesh, band_spacing, opaque, fs, cand_keys, s_tex)
         sampled += n
         sealed += ns
         if band is not None:
@@ -967,6 +1033,7 @@ def sample_cell(
     nrm_parts: list[np.ndarray] = []
     col_parts: list[np.ndarray] = []
     rad_parts: list[np.ndarray] = []
+    stex_parts: list[np.ndarray] = []
     warnings: list[str] = []
     objects_sampled = 0
     total_area = 0.0
@@ -987,6 +1054,9 @@ def sample_cell(
         nrm_parts.append(part["normal"])
         col_parts.append(part["color"])
         rad_parts.append(part["radius"])
+        stex_parts.append(
+            part.get("stex", np.full(len(part["position"]), np.nan, dtype=np.float32))
+        )
 
     if not pos_parts:
         if sampled > 0:
@@ -997,9 +1067,16 @@ def sample_cell(
     normals = np.concatenate(nrm_parts, axis=0)
     colors = np.concatenate(col_parts, axis=0)
     radii = np.concatenate(rad_parts, axis=0)
+    stex = np.concatenate(stex_parts, axis=0)
 
     t1 = time.perf_counter()
     _encode_ply(positions, normals, colors, radii, out_path, params.representation)
+    # Texel-size sidecar (row-aligned with the .ply): Stage 4's content-anchored
+    # ladder reads it; anything else ignores it.
+    stex_path = out_path.with_name(out_path.name + _STEX_SIDECAR_SUFFIX)
+    tmp_stex = stex_path.with_suffix(".tmp.npy")
+    np.save(tmp_stex, stex.astype("<f4"))
+    tmp_stex.replace(stex_path)
     encode_s = time.perf_counter() - t1
 
     aabb_min = positions.min(axis=0).tolist()
@@ -1020,6 +1097,11 @@ def sample_cell(
         "timings": {"sample_s": round(sample_s, 2), "encode_s": round(encode_s, 2)},
         "params": params.as_summary(),
         "scene_aabb": {"min": aabb_min, "max": aabb_max},
+        "stex": {
+            "textured_pct": round(100.0 * float(np.isfinite(stex).mean()), 1),
+            "p50": round(float(np.nanmedian(stex)), 5) if np.isfinite(stex).any() else None,
+            "bytes": stex_path.stat().st_size,
+        },
         "warnings": warnings,
         "bytes": out_path.stat().st_size,
     }

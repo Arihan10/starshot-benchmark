@@ -251,6 +251,11 @@ _splat_stage5_state: dict[tuple[str, str, str], dict[str, Any]] = {}
 # and never blocks the event loop. Value: {popen, logf, iterations, started_at,
 # returncode}. The record is kept after exit so 'done'/'error' + log survive polls.
 _splat_stage6_procs: dict[tuple[str, str, str], dict[str, Any]] = {}
+# On-demand SOG encodes (client/tools/ply-to-sog.mjs): one tracked detached child
+# per (run, slot, model, which in {trained, healed}). The CLIENT chooses which
+# model to compress after inspecting both — SOG is deliberately NOT part of the
+# Modal pipeline. Same poll-via-`popen.poll()` lifecycle as _splat_stage6_procs.
+_splat_sog_procs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
 # --- Modal remote train jobs (stages 4-6 on the A100) ------------------------
 # One asyncio SUPERVISOR task per cell mirrors the stage-job pattern: it pushes
@@ -266,8 +271,12 @@ _splat_modal_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 # probe and claiming the job), so the startup scan and a concurrent status poll
 # can't double-attach one cell (which would race two supervisors on its pull).
 _splat_modal_reattaching: set[tuple[str, str, str]] = set()
-# The remote stage window the button drives (7 deferred by decision).
-_MODAL_STAGES = [4, 5, 6]
+# The remote stage window the button drives: 4-6 (plan/refs/RAW train) + 7
+# (delete + heal + final-prune -> the delivered healed.ply, viewable against the
+# raw trained.ply). NOTE: stage 7 requires a deployed image with `heal_splat`
+# (`modal deploy splat/modal_app.py`); .sog is NOT produced here — it's a
+# client-triggered, on-demand encode of the chosen model (see the /splat/sog route).
+_MODAL_STAGES = [4, 5, 6, 7]
 _MODAL_POLL_S = 4.0
 
 _current_run: str = ""
@@ -2253,6 +2262,10 @@ def _splat_stage6_status(run: str, slot: str, model: str) -> dict[str, Any]:
     base = {
         "run": run, "slot": slot, "model": model,
         "sog_url": _artifact_url(trained.with_suffix(".sog")),
+        # Both on-demand SOG encodes (the client picks which model to compress;
+        # see the /splat/sog route). `sog_url` is kept as trained's for back-compat.
+        "trained_sog_url": _artifact_url(trained.with_suffix(".sog")),
+        "healed_sog_url": _artifact_url(_healed_path(run, slot, model).with_suffix(".sog")),
         "log_url": _artifact_url(log_path),
         # An interrupted run left a checkpoint but no trained.ply → the next launch
         # resumes it (see `_spawn_stage6` / splat/stage6.py).
@@ -2336,6 +2349,99 @@ def _spawn_stage6(
         "started_at": datetime.now().isoformat(timespec="seconds"), "returncode": None,
     }
     return _splat_stage6_status(run, slot, model)
+
+
+# --- on-demand SOG encode (client-triggered; never on the Modal pipeline) --------
+
+_SOG_TOOL = _REPO_ROOT / "client" / "tools" / "ply-to-sog.mjs"
+
+
+def _sog_source_path(run: str, slot: str, model: str, which: str) -> Path:
+    """The .ply a SOG encode compresses: the delivered `healed` model or the raw
+    `trained` one."""
+    return _healed_path(run, slot, model) if which == "healed" else _trained_path(run, slot, model)
+
+
+def _sog_log_path(run: str, slot: str, model: str, which: str) -> Path:
+    return _slot_dir(run, slot, model) / "splat" / f"sog-{which}.log"
+
+
+def _sog_encoder_state(run: str, slot: str, model: str, which: str) -> dict[str, Any]:
+    """One model's SOG-encode state: the `.sog` `url` (once encoded), whether its
+    source .ply exists (`source_ready`), and the live child status
+    (running/done/error/idle) — mirrors `_splat_stage6_status`."""
+    src = _sog_source_path(run, slot, model, which)
+    url = _artifact_url(src.with_suffix(".sog"))
+    log_path = _sog_log_path(run, slot, model, which)
+    state: dict[str, Any] = {
+        "which": which, "url": url, "source_ready": src.is_file(),
+        "log_url": _artifact_url(log_path),
+    }
+    rec = _splat_sog_procs.get((run, slot, model, which))
+    if rec is None:
+        state.update(status="done" if url else "idle", running=False, error=None)
+        return state
+    rc = rec["popen"].poll()
+    tail = _tail_text(log_path)
+    if rc is None:
+        state.update(status="running", running=True, pid=rec["popen"].pid,
+                     started_at=rec.get("started_at"), error=None, log_tail=tail)
+        return state
+    if rec.get("logf") is not None:
+        with contextlib.suppress(Exception):
+            rec["logf"].close()
+        rec["logf"] = None
+    rec["returncode"] = rc
+    if rc == 0 and url is not None:
+        state.update(status="done", running=False, error=None, log_tail=tail)
+    else:
+        state.update(status="error", running=False,
+                     error=f"sog encode exited with code {rc}", log_tail=tail)
+    return state
+
+
+def _splat_sog_status(run: str, slot: str, model: str) -> dict[str, Any]:
+    """Both models' SOG-encode state, keyed `encoders.trained` / `encoders.healed`
+    — the client's source for the compress buttons and which `.sog` views exist."""
+    return {
+        "run": run, "slot": slot, "model": model,
+        "encoders": {w: _sog_encoder_state(run, slot, model, w) for w in ("trained", "healed")},
+    }
+
+
+def _spawn_sog(run: str, slot: str, model: str, which: str) -> dict[str, Any]:
+    """Encode one model's .ply → .sog on THIS host via client/tools/ply-to-sog.mjs
+    (PlayCanvas' @playcanvas/splat-transform), as a detached, polled child — the
+    same async lifecycle as `_spawn_stage6`. Runs on demand from the client, never
+    on the Modal A100."""
+    src = _sog_source_path(run, slot, model, which)
+    if not src.is_file():
+        raise HTTPException(status_code=409, detail=f"{which}.ply not on disk — produce it first")
+    out_sog = src.with_suffix(".sog")
+    log_path = _sog_log_path(run, slot, model, which)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    cmd = ["node", str(_SOG_TOOL), str(src), str(out_sog)]
+    logf = open(log_path, "wb")  # noqa: SIM115 - inherited by the child; closed on finish
+    logf.write(f"$ {' '.join(cmd)}\n\n".encode())
+    logf.flush()
+    kwargs: dict[str, Any] = {
+        # cwd under client/ so node resolves @playcanvas/splat-transform from
+        # client/node_modules.
+        "cwd": str(_REPO_ROOT / "client"),
+        "stdout": logf, "stderr": subprocess.STDOUT, "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
+    else:
+        kwargs["start_new_session"] = True
+    popen = subprocess.Popen(cmd, **kwargs)
+    _splat_sog_procs[(run, slot, model, which)] = {
+        "popen": popen, "logf": logf,
+        "started_at": datetime.now().isoformat(timespec="seconds"), "returncode": None,
+    }
+    return _splat_sog_status(run, slot, model)
 
 
 class ModalTrainRequest(BaseModel):
@@ -4317,6 +4423,32 @@ def create_app() -> FastAPI:
         """Live Stage-6 state ('idle' / 'running' with `pid` + `log_tail` / 'done'
         with the trained `.ply` `url` / 'error'). See `_splat_stage6_status`."""
         return _splat_stage6_status(run, slot, model)
+
+    @app.post("/runs/{run}/splat/sog/{slot}/{model}")
+    async def splat_sog_encode(  # pyright: ignore[reportUnusedFunction]
+        run: str, slot: str, model: str, which: str = "trained"
+    ) -> dict[str, object]:
+        """On-demand SOG-encode the chosen model (`?which=trained|healed`, default
+        trained) via client/tools/ply-to-sog.mjs, as a detached child on THIS host
+        — never on the Modal pipeline. The client picks which model after inspecting
+        both. Idempotent while encoding (returns the live job); poll GET for progress
+        and the resulting `.sog` url."""
+        if which not in ("trained", "healed"):
+            raise HTTPException(status_code=400, detail="which must be 'trained' or 'healed'")
+        key = (run, slot, model, which)
+        rec = _splat_sog_procs.get(key)
+        if rec is not None and rec["popen"].poll() is None:
+            return _splat_sog_status(run, slot, model)  # already encoding this model
+        if rec is not None and rec.get("logf") is not None:
+            with contextlib.suppress(Exception):
+                rec["logf"].close()
+        return _spawn_sog(run, slot, model, which)
+
+    @app.get("/runs/{run}/splat/sog/{slot}/{model}")
+    async def splat_sog_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Both models' SOG-encode state (`encoders.trained` / `encoders.healed`:
+        status + the `.sog` url once encoded). See `_splat_sog_status`."""
+        return _splat_sog_status(run, slot, model)
 
     @app.post("/runs/{run}/splat/modal/{slot}/{model}")
     async def splat_modal_start(  # pyright: ignore[reportUnusedFunction]

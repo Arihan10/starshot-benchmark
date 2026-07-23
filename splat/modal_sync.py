@@ -201,6 +201,10 @@ def push_cell(
     for p in (freespace, skin, cloud):
         if not p.is_file():
             raise FileNotFoundError(f"{p} missing — run stages 2-3 locally first")
+    # Optional per-surfel texel-size sidecar (Stage 3): Stage 4's content-
+    # anchored ladder reads it; legacy clouds without one still plan (proxy path).
+    stex = splat_dir / "cloud.ply.stex.npy"
+    has_stex = stex.is_file()
 
     def log(msg: str) -> None:
         if not quiet:
@@ -208,7 +212,7 @@ def push_cell(
 
     glbs = _placed_glbs(tier)
     t0 = time.perf_counter()
-    hashes = _hash_files([*glbs, freespace, skin, cloud])
+    hashes = _hash_files([*glbs, freespace, skin, cloud, *([stex] if has_stex else [])])
     tier_manifest = {p.name[: -len(".glb")]: hashes[p] for p in glbs}
     tier_sha = hashlib.sha256(
         json.dumps(tier_manifest, sort_keys=True).encode("utf-8")
@@ -219,7 +223,9 @@ def push_cell(
         "cloud": hashes[cloud],
         "tier": tier_sha,
     }
-    log(f"hashed {len(glbs)} meshes + 3 inputs in {time.perf_counter() - t0:.1f}s")
+    if has_stex:
+        input_sha["stex"] = hashes[stex]
+    log(f"hashed {len(glbs)} meshes + {3 + has_stex} inputs in {time.perf_counter() - t0:.1f}s")
 
     vol = _volume()
     have = _existing_cas_shas(vol)
@@ -253,6 +259,7 @@ def push_cell(
                 (freespace, "freespace.npz", False),
                 (skin, "freespace.npz.skin.npy", True),
                 (cloud, "cloud.ply", True),
+                *([(stex, "cloud.ply.stex.npy", True)] if has_stex else []),
             ):
                 if remote_manifest.get(name) == hashes[src]:
                     continue
@@ -272,6 +279,7 @@ def push_cell(
                     "freespace.npz": hashes[freespace],
                     "freespace.npz.skin.npy": hashes[skin],
                     "cloud.ply": hashes[cloud],
+                    **({"cloud.ply.stex.npy": hashes[stex]} if has_stex else {}),
                     "tier": tier_sha,
                     "tier_dir": tier.name,
                     "pushed_at": datetime.now(timezone.utc).isoformat(

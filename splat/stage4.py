@@ -90,6 +90,27 @@ cameras each carrying exactly its SELECTED faces + coverage — plus `patches.bi
 (packed float32 [x,y,z, nx,ny,nz, feature_scale, bins_seen] per patch) and a
 summary. CUBEMAP-NATIVE: each position renders only its selected 90° pinhole
 faces in Stage 5, so no single look direction is emitted.
+
+CONTENT ANCHOR (the texel ladder; PlanParams.texel_feat_px): with the Stage-3
+texel sidecar (`cloud.ply.stex.npy`) present, a patch's feature scale is the
+size of `finest_px/texel_feat_px` source TEXELS — the ladder's finest rung is
+the standoff where one texel of the object's own texture spans `texel_feat_px`
+rendered pixels, and nothing finer is ever demanded (the source has nothing
+finer to give; closer views are magnification on the mesh too). This replaces
+the legacy proxy — the surfel's disc radius through a P90 population anchor —
+which read the INIT CLOUD's sampling density as if it were content: a coarsely
+sampled backdrop "demanded" views from beyond the scene and so received almost
+none. Patch THINNING is AREA-FAIR under the same anchor (keep ∝ (surfel
+spacing / (feat/2))²), so the checklist weights a m² of backdrop like a m² of
+prop face instead of inheriting the cloud's ~10,000:1 per-m² density skew.
+
+EXTERIOR SHELLS (PlanParams.exterior_shells): the coarse octaves need REAL far
+standpoints. Any point OUTSIDE the Stage-2 grid is provably open air (all
+geometry lives inside the grid), and the LOS ray-march only samples the
+in-grid segment — so octave-spaced spheres of candidates outside the grid are
+added at zero Stage-2 cost. Open scenes get true mid/far references (instead
+of near-grazing stand-ins whose d_eff merely mimics distance); in interiors
+every exterior pair dies in the ray-march and far octaves stay waived.
 """
 
 from __future__ import annotations
@@ -116,6 +137,24 @@ PATCH_VIEWS_NAME = "patch_views.json"
 # SH degree-0 basis constant (matches Stage 3): colour = 0.5 + C0 * f_dc.
 _SH_C0 = 0.28209479177387814
 
+# Stage 3's disc radius = _RADIUS_FRAC × its sample spacing (pinned to
+# stage3._RADIUS_FRAC; not imported to keep this module trimesh-free for the
+# Stage-5 import chain). Inverting it recovers each surfel's LOCAL sample
+# spacing — the density signal the area-fair patch thinning divides out.
+_RADIUS_FRAC = 0.9
+
+# Stage-3 texel-size sidecar (m/texel per surfel, NaN = untextured), read from
+# beside the cloud: `<cloud>.stex.npy`.
+_STEX_SIDECAR_SUFFIX = ".stex.npy"
+
+# Occlusion ray-march sample budget per GPU slice (pairs × steps). Long
+# exterior rays march thousands of steps, so slices are sized by SAMPLES, not
+# a flat pair count — 2^26 samples ≈ the old 200k-pair × ~335-step slice, ~2.5
+# GB of transient march tensors.
+_MARCH_SAMPLE_BUDGET = 1 << 26
+# Fibonacci directions per exterior shell (azimuth spread feeds ring cells).
+_SHELL_DIRS = 96
+
 # Nearest-candidate probes added per patch in the demand-major coverage build
 # (see `_build_coverage`): the k physically-closest reachable camera spots, always
 # tried alongside the ideal-distance aim points. The aim points sit at ~1.5·d_min,
@@ -125,9 +164,8 @@ _SH_C0 = 0.28209479177387814
 # design, not left to the best-effort rescue.
 _NEAR_PROBES = 8
 # Rescue-pass budget (see `_rescue_pairs`): nearest candidates tried per unseen
-# patch, and the flat pair count per ray-march slice.
+# patch. (March slices are sized by `_MARCH_SAMPLE_BUDGET`, not a pair count.)
 _RESCUE_K = 32
-_RESCUE_SLICE = 200_000
 
 # progress(done, total, current_id) — called during the coverage build.
 ProgressCb = Callable[[int, int, str], None]
@@ -159,19 +197,43 @@ class PlanParams:
     patch's d_min, so the greedy keeps cameras off open surfaces by itself, and
     near-wall picks emerge only where occlusion leaves no other supplier."""
 
-    # Patch FEATURE-SCALE anchors. Detail is NOT re-detected here: each surfel's
-    # OWN DISC RADIUS — the footprint Stage 3 gave it (object-scale spacing) — is
-    # mapped into feature scale (the coarsest surfaces' P90 radius → s_max) to
-    # drive its ladder, so a big surfel is viewed from far with few octaves and a
-    # fine one up close. `s_min` is a hard FLOOR (the finest scale, and the
-    # closest any demand sits: d_min = s_min·focal/finest_px); `s_max` is only the
-    # P90 ANCHOR, not a ceiling — surfaces coarser than P90 ride ABOVE it uncapped,
-    # so a mountain's metre-scale surfels demand metre-scale (far, few) views
-    # rather than being squashed to s_max and demanding phantom closeups. Patches
-    # are a UNIFORM thinning of the surfels (rate (s_min/s_max)²), so camera effort
-    # tracks the actual splat the fine-tune optimizes.
+    # Patch FEATURE-SCALE anchors. The PRIMARY anchor is CONTENT: with the
+    # Stage-3 texel sidecar (`cloud.ply.stex.npy`) present and `texel_feat_px`
+    # > 0, a patch's feature scale is the size of `finest_px/texel_feat_px`
+    # TEXELS — so the ladder's finest rung is the standoff where one source
+    # texel spans `texel_feat_px` pixels, and NO view is demanded beyond what
+    # the source texture can supply (closer views are pure magnification on the
+    # mesh too). Without the sidecar (or texel_feat_px=0) the LEGACY proxy
+    # applies: the surfel's own disc radius mapped through the P90 anchor
+    # (radius·s_max/P90(radius)) — which reads the INIT CLOUD's density as if
+    # it were content, the platformer-backdrop failure mode. `s_min` is a hard
+    # FLOOR either way (the finest scale, and the closest any demand sits:
+    # d_min = s_min·focal/finest_px); `s_max` is only the legacy P90 ANCHOR.
     patch_min_spacing: float = 0.06   # s_min (m): finest feature scale (hard floor)
-    patch_max_spacing: float = 0.30   # s_max (m): P90 feature-scale anchor (not a cap)
+    patch_max_spacing: float = 0.30   # s_max (m): legacy P90 feature-scale anchor
+    # Target pixels-per-TEXEL at the finest demanded view (content anchor):
+    # feat = s_tex · finest_px / texel_feat_px. 3 px/texel reproduces the legacy
+    # behaviour exactly on base-spacing props (their s_tex ≈ 1.4 cm → feat ≈
+    # 0.30 m = the old anchor) while fixing scene-scale surfaces (a 0.57 m/texel
+    # backdrop gets feat ≈ 12 m → finest view ~100 m, not 250 m). 0 = legacy.
+    texel_feat_px: float = 3.0
+    # AREA-FAIR patch thinning: keep-rate per surfel ∝ (surfel spacing / target
+    # patch spacing)² with target = feat/2, so the CHECKLIST density follows the
+    # demanded resolution instead of inheriting the init cloud's density (which
+    # over-weights fine-sampled props ~10,000:1 per m² against coarse backdrops).
+    # On base-spacing props this reproduces the legacy uniform (s_min/s_max)²=4%
+    # keep exactly. False = legacy uniform thinning.
+    fair_patches: bool = True
+    # EXTERIOR CAMERA SHELLS: candidate positions OUTSIDE the Stage-2 grid, on
+    # octave-spaced spheres out to `exterior_span` × the scene diagonal. Every
+    # point outside the grid is PROVABLY open air (all geometry lives inside),
+    # and the LOS ray-march only ever samples the in-grid segment, so no Stage-2
+    # change is needed. These supply the REAL far octaves open scenes owe
+    # (today they're silently clamped to the near band and grazing close views
+    # stand in for far ones); in interiors every exterior pair dies in the
+    # ray-march and the far octaves stay waived, exactly as before. False = off.
+    exterior_shells: bool = True
+    exterior_span: float = 2.0        # max shell radius, × scene diagonal
     # The angular-quality dial: the number of EQUAL-SOLID-ANGLE direction cells
     # tiling the (folded, two-sided) hemisphere around each patch normal — cell 0
     # is an explicit polar CAP (|cos θ| ≥ 1 − 1/B: the direct-facing field, 1/B of
@@ -188,6 +250,20 @@ class PlanParams:
     # O(4^octaves) more close cameras, so it is a real cost dial, not free.
     finest_px_per_patch: float = 64
     min_gain: int = 2                 # stop once the best image adds < this many demands
+    # THE ELBOW CUT: run the (cheap) greedy to completion, then EMIT only the
+    # prefix of picks whose marginal gain ≥ `elbow_mult` × the completion-
+    # average gain — the point of maximum advantage over uniform spending (the
+    # farthest the cumulative-coverage curve gets above the straight ramp).
+    # Measured on the benchmark scenes the curves have a long shallow
+    # midsection — the last 40-90% of images each add a handful of occluded
+    # crevice/ring demands — which a flat `min_gain` cannot see (it's an
+    # absolute count, so a denser area-fair checklist proportionally inflates
+    # the tail: hotel 4.0k, platformer 30.9k images at completion). The cut is
+    # dimensionless and self-normalizing (an image below the plan's own average
+    # efficiency isn't pulling its weight), so each scene finds its own elbow.
+    # The summary reports full-vs-cut counts + the coverage fraction retained;
+    # 0 disables (legacy run-to-min_gain plans).
+    elbow_mult: float = 1.0
     # The image BUDGET — the product cost dial, in the unit the cost is actually
     # paid in (rendered/stored/trained reference images). None = run to
     # completion of every suppliable demand; a number stops the greedy there.
@@ -241,11 +317,16 @@ class PlanParams:
         return {
             "patch_min_spacing": self.patch_min_spacing,
             "patch_max_spacing": self.patch_max_spacing,
+            "texel_feat_px": self.texel_feat_px,
+            "fair_patches": self.fair_patches,
+            "exterior_shells": self.exterior_shells,
+            "exterior_span": self.exterior_span,
             "angular_bins": self.angular_bins,
             "finest_px_per_patch": self.finest_px,
             "octaves": self.n_octaves,
             "max_views": self.max_views,
             "min_gain": self.min_gain,
+            "elbow_mult": self.elbow_mult,
             "candidate_spacing": self.candidate_spacing,
             "face_fov_deg": self.face_fov_deg,
             "render_resolution": self.render_resolution,
@@ -287,6 +368,77 @@ def _read_cloud(path: Path) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndar
     col = np.clip(0.5 + _SH_C0 * arr[:, 6:9], 0.0, 1.0).astype(np.float32)
     rad = np.exp(arr[:, 10].astype(np.float64))  # scale_0 stored as log σ
     return pos, nrm, col, rad
+
+
+def _read_stex(cloud_path: Path, n: int) -> np.ndarray | None:
+    """The Stage-3 per-surfel texel-size sidecar (m/texel, NaN = untextured),
+    row-aligned with the cloud — or None when absent/mismatched (legacy clouds:
+    the radius-proxy feature scale applies)."""
+    p = Path(str(cloud_path) + _STEX_SIDECAR_SUFFIX)
+    if not p.is_file():
+        return None
+    try:
+        arr = np.load(p, mmap_mode="r")
+    except Exception:
+        return None
+    if arr.ndim != 1 or arr.shape[0] != n:
+        return None
+    return np.asarray(arr, dtype=np.float32)
+
+
+def _grid_bounds(fs: FreeSpace) -> tuple[np.ndarray, np.ndarray]:
+    """(lo, hi) world AABB of the Stage-2 grid — everything solid lives inside."""
+    lo = np.asarray(fs.origin, dtype=np.float64)
+    return lo, lo + np.asarray(fs.dims, dtype=np.float64) * float(fs.pitch)
+
+
+def _exterior_shells(fs: FreeSpace, r_need: float, span: float) -> np.ndarray:
+    """Exterior candidate positions: `_SHELL_DIRS` Fibonacci directions on
+    octave-spaced spheres around the grid centre, radii from just outside the
+    grid out to min(r_need, span·grid_diag). Every position is OUTSIDE the grid
+    AABB (radius ≥ 1.1 × half-diagonal ≥ every half-extent), hence provably in
+    open air — all geometry lives inside the grid — and reachable from ambient
+    air by the Stage-2 contract. Empty when the ladder never needs a standoff
+    past the grid boundary."""
+    lo, hi = _grid_bounds(fs)
+    centre = 0.5 * (lo + hi)
+    half_diag = 0.5 * float(np.linalg.norm(hi - lo))
+    r_lo = 1.1 * half_diag
+    r_hi = min(float(r_need), span * 2.0 * half_diag)
+    if r_hi <= r_lo:
+        return np.zeros((0, 3), dtype=np.float32)
+    radii = []
+    r = r_lo
+    while r < r_hi:
+        radii.append(r)
+        r *= 2.0
+    radii.append(r_hi)
+    i = np.arange(_SHELL_DIRS, dtype=np.float64)
+    z = 1.0 - 2.0 * (i + 0.5) / _SHELL_DIRS
+    rho = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    phi = i * (np.pi * (3.0 - np.sqrt(5.0)))
+    dirs = np.stack([rho * np.cos(phi), z, rho * np.sin(phi)], axis=1)
+    pts = np.concatenate([centre + rr * dirs for rr in radii], axis=0)
+    return pts.astype(np.float32)
+
+
+def _march_slices(dist_sorted: np.ndarray, pitch: float, diag: float):
+    """Yield (s0, s1, n_steps) march slices over distance-SORTED pairs, sized so
+    pairs × steps stays within `_MARCH_SAMPLE_BUDGET`. Steps grow with the
+    slice's longest ray, so short rays batch wide and the far tail (exterior
+    shells march the whole grid) narrows instead of materializing a tens-of-GB
+    sample tensor."""
+    n = len(dist_sorted)
+    s0 = 0
+    while s0 < n:
+        steps0 = int(np.ceil(min(float(dist_sorted[s0]), diag) / pitch)) + 2
+        s1 = min(n, s0 + max(1, _MARCH_SAMPLE_BUDGET // steps0))
+        n_steps = int(np.ceil(min(float(dist_sorted[s1 - 1]), diag) / pitch)) + 2
+        while (s1 - s0) * n_steps > _MARCH_SAMPLE_BUDGET and s1 > s0 + 1:
+            s1 = max(s0 + 1, s0 + _MARCH_SAMPLE_BUDGET // n_steps)
+            n_steps = int(np.ceil(min(float(dist_sorted[s1 - 1]), diag) / pitch)) + 2
+        yield s0, s1, n_steps
+        s0 = s1
 
 
 def _candidates(fs: FreeSpace, p: PlanParams) -> tuple[np.ndarray, np.ndarray]:
@@ -438,9 +590,7 @@ def _rescue_pairs(
     order = np.argsort(dist, kind="stable")
     gi, ci, dist, band = gi[order], ci[order], dist[order], band[order]
     vis = np.zeros(gi.size, dtype=bool)
-    for s0 in range(0, gi.size, _RESCUE_SLICE):
-        s1 = min(s0 + _RESCUE_SLICE, gi.size)
-        n_steps = int(np.ceil(min(float(dist[s1 - 1]), diag) / fs.pitch)) + 2
+    for s0, s1, n_steps in _march_slices(dist, fs.pitch, diag):
         vis[s0:s1] = visible_fn(candidates[ci[s0:s1]], patch_pos[gi[s0:s1]], n_steps)
         if progress is not None:
             progress(s1, gi.size)
@@ -482,6 +632,7 @@ def _build_coverage(
     reach: float,
     torch: Any,
     progress: ProgressCb | None = None,
+    reach_far: float | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """DEMAND-MAJOR covering (candidate, patch) pairs, each tagged with the
     DIRECTION CELL the camera views the patch from (`_bin_of`: cap + ring cells),
@@ -594,9 +745,7 @@ def _build_coverage(
         order = np.argsort(dist, kind="stable")
         ci_s, gi_s, dist_s = ci_arr[order], gi_arr[order], dist[order]
         vis_s = np.zeros(len(ci_s), dtype=bool)
-        for s0 in range(0, len(ci_s), _RESCUE_SLICE):
-            s1 = min(s0 + _RESCUE_SLICE, len(ci_s))
-            n_steps = int(np.ceil(min(float(dist_s[s1 - 1]), diag) / pf)) + 2
+        for s0, s1, n_steps in _march_slices(dist_s, pf, diag):
             cam = torch.as_tensor(
                 np.ascontiguousarray(candidates[ci_s[s0:s1]], dtype=np.float32), device=dev
             )
@@ -629,17 +778,29 @@ def _build_coverage(
         tgt = patch_pos[idx][:, None, :] + radius[:, None, None] * uw
         return tgt.reshape(-1, 3), np.repeat(idx, dirs_local.shape[0])
 
+    rf = float(reach if reach_far is None else reach_far)
     all_idx = np.arange(n_patch, dtype=np.int64)
     tgt_parts, par_parts = [], []
     if n_patch:
-        # Aperture: bins + finest octave, clamped to the achievable standoff.
-        ap_tgt, ap_par = _aim(dl, all_idx, np.minimum(1.5 * d_min, reach))
+        # Aperture: bins + finest octave, clamped to the achievable standoff —
+        # `rf` includes the exterior shells, so a scene-scale patch aims its
+        # aperture at its REAL ideal distance when shells supply it.
+        ap_tgt, ap_par = _aim(dl, all_idx, np.minimum(1.5 * d_min, rf))
         tgt_parts.append(ap_tgt)
         par_parts.append(ap_par)
+        # Coarse patches whose ideal standoff lies beyond the near band ALSO
+        # keep the legacy near-band shell: when the far aim dies (interiors;
+        # occluded shells) the near-band cameras still supply their direction
+        # cells + band 0, exactly as before shells existed.
+        far_idx = np.nonzero(1.5 * d_min > reach)[0]
+        if far_idx.size and rf > reach:
+            nb_tgt, nb_par = _aim(dl, far_idx, np.full(far_idx.size, reach))
+            tgt_parts.append(nb_tgt)
+            par_parts.append(nb_par)
         coarse = dl[: min(3, n_dirs)]  # head-on + up to two tilts
         for o in range(1, n_oct):      # pyramid: one shell per owed octave ≥ 1
             r_o = (1.5 * (2.0 ** o)) * d_min  # ideal standoff for octave o
-            sel = np.nonzero((oct_top >= o) & (r_o <= reach))[0]  # skip beyond reach
+            sel = np.nonzero((oct_top >= o) & (r_o <= rf))[0]  # skip beyond reach
             if sel.size:
                 t_o, p_o = _aim(coarse, sel, r_o[sel])
                 tgt_parts.append(t_o)
@@ -770,6 +931,7 @@ def _greedy_cover(
     max_views: int | None,
     tie_noise: np.ndarray,
     progress: ProgressCb | None = None,
+    knee_frac: float = 0.0,
 ) -> tuple[list[int], np.ndarray, np.ndarray, list[int]]:
     """LAZY (CELF) greedy multicover over IMAGES — the selectable unit is one
     (candidate, cube-face) pair, `unit = candidate·6 + face`, the true cost unit
@@ -910,36 +1072,57 @@ def plan_cameras(
         progress(0, 0, "load")
     fs = load_free_space(Path(freespace_path))
     points, normals, _, radius = _read_cloud(Path(surfels_path))
+    stex = _read_stex(Path(surfels_path), len(points))
     lo = points.min(axis=0)
     hi = points.max(axis=0)
 
-    # Patches = the Stage-3 surfels UNIFORMLY thinned. Each patch's ladder FEATURE
-    # SCALE is set by the surfel's OWN SIZE — its disc radius, i.e. the footprint
-    # Stage 3 gave it. A big surfel (a coarsely-sampled mountain face, a merged flat
-    # wall) IS low-detail by construction, so it's photographed from FARther with
-    # FEWER octaves; a small surfel (a fine prop) demands close, fine views. Reading
-    # size directly means camera effort tracks the actual splat the fine-tune will
-    # optimize — no separate detail signal, no density inference (which coarsening
-    # would fool). Radius maps into [s_min, s_max] with the coarsest surfaces' P90 →
-    # patch_max_spacing; the uniform keep rate (s_min/s_max)² sets patch count.
+    # FEATURE SCALE per surfel — the size the ladder treats as "one feature".
+    # CONTENT ANCHOR (module docstring): with the Stage-3 texel sidecar, feat =
+    # the size of `finest_px/texel_feat_px` texels, so the finest demanded view
+    # renders one source texel across `texel_feat_px` pixels and the ladder
+    # never asks for detail the source texture doesn't hold. Untextured surfels
+    # (and legacy clouds without the sidecar) fall back to the radius proxy:
+    # disc radius mapped through the coarsest surfaces' P90 → patch_max_spacing,
+    # floored at patch_min_spacing, uncapped above.
     if progress is not None:
         progress(0, 0, "patches")
-    keep_rate = (params.patch_min_spacing / params.patch_max_spacing) ** 2
-    scale = params.patch_max_spacing / max(float(np.percentile(radius, 90)), 1e-6)
-    keep = np.nonzero(rng.random(len(points)) < keep_rate)[0]
+    p90 = max(float(np.percentile(radius, 90)), 1e-6)
+    feat_all = np.maximum(radius * (params.patch_max_spacing / p90),
+                          params.patch_min_spacing)
+    textured = np.zeros(len(points), dtype=bool)
+    if stex is not None and params.texel_feat_px > 0:
+        textured = np.isfinite(stex) & (stex > 0)
+        feat_all = np.where(
+            textured,
+            np.maximum((params.finest_px / params.texel_feat_px)
+                       * np.nan_to_num(stex, nan=1.0),
+                       params.patch_min_spacing),
+            feat_all,
+        )
+    feat_all = feat_all.astype(np.float32)
+
+    # PATCHES = the surfels thinned. AREA-FAIR (fair_patches): keep-rate per
+    # surfel ∝ (its local sample spacing / target patch spacing)² with target =
+    # feat/2 — the checklist's density then follows the DEMANDED resolution
+    # instead of the cloud's own sampling density (which over-weights fine props
+    # against coarse backdrops ~10,000:1 per m²). On base-spacing props this
+    # equals the legacy uniform keep (s_min/s_max)² ≈ 4%, and with the radius-
+    # proxy feature scale it degenerates to ~uniform too (feat ∝ radius), so
+    # the legacy path is preserved exactly where nothing changed.
+    if params.fair_patches:
+        spacing_local = radius / _RADIUS_FRAC
+        keep_p = np.clip(
+            (spacing_local / np.maximum(feat_all * 0.5, 1e-6)) ** 2, 0.0, 1.0
+        )
+    else:
+        keep_p = np.full(
+            len(points), (params.patch_min_spacing / params.patch_max_spacing) ** 2
+        )
+    keep = np.nonzero(rng.random(len(points)) < keep_p)[0]
     patch_pos = points[keep].astype(np.float32)
     patch_nrm = normals[keep].astype(np.float32)
-    # Feature scale rides each surfel's own radius (p90 anchored to patch_max_spacing),
-    # floored at patch_min_spacing but UNCAPPED above: a metre-scale surfel on a
-    # 200 m mountain keeps its metre feature scale, so its d_min is tens of metres
-    # and it demands few coarse views — instead of the old hard [s_min, s_max] clip
-    # squashing every object into a 5× band and demanding 64-px closeups of geometry
-    # the source resolves at metres. Mirrors Stage 3's uncapped object-scale spacing;
-    # the ~constant texels-per-feature margin (feat ∝ surfel spacing ∝ texel size)
-    # holds fidelity at every scale.
-    patch_feat = np.maximum(
-        radius[keep] * scale, params.patch_min_spacing
-    ).astype(np.float32)
+    patch_feat = feat_all[keep]
+    patch_textured = textured[keep]
     t1, t2 = _tangent_frames(patch_nrm)
     n_patch = len(patch_pos)
 
@@ -966,13 +1149,37 @@ def plan_cameras(
     candidates, cand_clear = _candidates(fs, params)
     if len(candidates) == 0:
         raise RuntimeError("no candidate camera positions (reachable free space empty)")
-    # REACH: the farthest standoff a candidate can actually occupy — candidates
-    # hug surfaces within Stage 2's coverage band, so ~2× the deepest clearance
-    # bounds any cross-open-space view. Aim points beyond it target air no
-    # candidate lives in, so the coverage build clamps the aperture to it and
-    # skips owed octaves whose ideal standoff exceeds it (they are unsuppliable
-    # given the band; far appearance is the Stage-6 LOD ladder's job).
+    # IN-GRID REACH: the farthest standoff a Stage-2 candidate can occupy —
+    # candidates hug surfaces within the coverage band, so ~2× the deepest
+    # clearance bounds any cross-open-space view from the band. The NEAR
+    # aperture clamp keeps using this (it's what pulls interior aim points
+    # inside their rooms — the mechanism interior direction coverage rides on).
     reach = max(2.0 * float(cand_clear.max()), 4.0 * float(params.candidate_spacing))
+    # EXTERIOR SHELLS (module docstring): when the ladder owes standoffs past
+    # the band — 1.5·2^oct_top·d_min beyond `reach` — provably-free positions
+    # outside the grid supply them, and `reach_far` extends to the farthest
+    # shell (== `reach` when no shell is needed/enabled, preserving the legacy
+    # plan exactly). The coverage build emits far aperture/pyramid aim points
+    # only up to `reach_far`; in interiors every exterior pair dies in the LOS
+    # march and far octaves stay waived, as before.
+    reach_far = reach
+    n_exterior = 0
+    if params.exterior_shells and n_patch:
+        r_need = float(
+            np.max(np.minimum(1.5 * (2.0 ** oct_top) * d_min, d_max))
+        )
+        shells = _exterior_shells(fs, r_need, params.exterior_span)
+        n_exterior = len(shells)
+        if n_exterior:
+            grid_lo, grid_hi = _grid_bounds(fs)
+            centre = 0.5 * (grid_lo + grid_hi)
+            shell_r = np.linalg.norm(shells - centre.astype(np.float32), axis=1)
+            half_diag = 0.5 * float(np.linalg.norm(grid_hi - grid_lo))
+            candidates = np.concatenate([candidates, shells])
+            cand_clear = np.concatenate(
+                [cand_clear, (shell_r - half_diag).astype(np.float32)]
+            )
+            reach_far = max(reach, float(shell_r.max()))
 
     # Coverage (per-pair direction cell + octave + owed) + greedy multicover over
     # IMAGES. Coverage is the long phase (a demand-major occlusion ray-march on
@@ -988,7 +1195,7 @@ def plan_cameras(
         )
     cc, pp, binv, octave, owed = _build_coverage(
         candidates, patch_pos, patch_nrm, d_min, d_max, oct_top, t1, t2, fs,
-        params, reach, torch, progress,
+        params, reach, torch, progress, reach_far=reach_far,
     )
 
     # IMAGE units (the greedy's selectable): unit = candidate·6 + cube face of
@@ -1016,6 +1223,40 @@ def plan_cameras(
         unit, pp, binv, octave, owed, n_units, n_patch,
         params.min_gain, params.max_views, tie_noise, progress,
     )
+
+    # THE ELBOW CUT (PlanParams.elbow_mult): gains are non-increasing, so the
+    # kept prefix is picks with gain ≥ mult × completion-average — the point of
+    # maximum advantage over uniform spending. Masks are rebuilt over the kept
+    # prefix so every downstream stat reflects the EMITTED plan; the summary
+    # keeps the full-completion counts for the ledger.
+    views_full = len(chosen_units)
+    covered_full = int(np.sum(gains, dtype=np.int64)) if gains else 0
+    elbow: dict[str, Any] | None = None
+    if params.elbow_mult > 0 and len(gains) > 64:
+        g = np.asarray(gains, dtype=np.int64)
+        avg = float(g.mean())
+        k = int(np.searchsorted(-g, -params.elbow_mult * avg, side="right"))
+        k = max(k, 64)
+        if k < len(chosen_units):
+            chosen_units = chosen_units[:k]
+            gains = gains[:k]
+            binmask = np.zeros(n_patch, dtype=np.int64)
+            octmask = np.zeros(n_patch, dtype=np.int64)
+            if len(unit):
+                kept = np.isin(unit, np.asarray(chosen_units, dtype=np.int64))
+                np.bitwise_or.at(
+                    binmask, pp[kept], np.int64(1) << binv[kept].astype(np.int64)
+                )
+                ow = kept & owed
+                np.bitwise_or.at(
+                    octmask, pp[ow], np.int64(1) << octave[ow].astype(np.int64)
+                )
+        elbow = {
+            "avg_gain": round(avg, 2),
+            "views_full": views_full,
+            "covered_full": covered_full,
+            "covered_cut": int(np.sum(gains, dtype=np.int64)),
+        }
     if progress is not None:
         progress(0, 0, "write")
 
@@ -1168,13 +1409,23 @@ def plan_cameras(
     patches_path.parent.mkdir(parents=True, exist_ok=True)
     patches_path.write_bytes(pdata.tobytes())
 
+    # Exterior-shell usage: how many chosen cameras sit outside the grid (the
+    # far supply actually selected) — the decisive signal that far octaves are
+    # being served by real distance rather than near-grazing stand-ins.
+    n_cand_grid = int(len(candidates)) - n_exterior
+    chosen_cands = {int(u) // n_faces for u in chosen_units}
+    cameras_exterior = sum(1 for cidx in chosen_cands if cidx >= n_cand_grid)
+
     summary = {
         "run": run,
         "slot": slot,
         "model": model,
         "patches": n_patch,
+        "patches_textured_pct": round(100.0 * float(patch_textured.mean()), 1) if n_patch else 0.0,
         "candidates": int(len(candidates)),
+        "exterior_candidates": n_exterior,
         "cameras": len(cameras),
+        "cameras_exterior": cameras_exterior,
         "views": len(chosen_units),
         "angular_bins": b,
         "coverage": {
@@ -1186,6 +1437,7 @@ def plan_cameras(
             "bins": bin_stats,
             "octaves": octave_stats,
             "curve": curve,
+            "elbow": elbow,
         },
         "scene_aabb": {"min": lo.tolist(), "max": hi.tolist()},
         "params": params.as_summary(),
@@ -1195,8 +1447,9 @@ def plan_cameras(
     # plus the scale-ladder anchors the plan was built with (informational).
     # near sits at or below the closest possible camera–surface distance
     # (candidates are free coarse-cell centres, ≥ pitch/2 from any surface
-    # voxel), so no chosen view clips geometry; far spans the full free-space
-    # grid diagonal (the play volume).
+    # voxel), so no chosen view clips geometry; far spans the grid diagonal
+    # PLUS the farthest exterior shell, so a shell camera sees across the
+    # whole play volume.
     grid_diag = _grid_diag(fs)
     intrinsics = {
         "face_fov_deg": params.face_fov_deg,
@@ -1205,7 +1458,7 @@ def plan_cameras(
         "octaves": n_oct,
         "focal_px": round(params.focal_px, 3),
         "near": round(min(0.05, fs.pitch * 0.5), 4),
-        "far": round(grid_diag, 3),
+        "far": round(grid_diag + max(0.0, reach_far - reach), 3),
     }
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
