@@ -49,19 +49,30 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { normalizeLighting, createLightRig } from "./splatlight.js";
+import {
+    OIT_LAYER,
+    TONEMAP_GLSL,
+    setOITBlend,
+    prepareOITScene,
+    collectOITMaterials,
+    decorateOITLights,
+} from "./oit.js";
 
 const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
 // The bake rig + lit PBR materials live in splatlight.js (shared with the debug
 // viewers). The server sends splat/stage5.py's LIGHTING in the manifest, and
 // `normalizeLighting` falls back to the shared defaults when it's absent.
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
+const POST_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2); // gzip+POST pool
 const MAX_PARSE_INFLIGHT = 4; // concurrent GLB parses while streaming the bundle
 const READ_SEGMENTS = 3; // readback segments in flight (ring depth)
 const SEGMENT_VIEWS = 8; // views per segment → ONE getBufferSubData per 8 views
 const POST_BATCH_BYTES = 24 * 1024 * 1024; // ~4 views/batch at 1024² (worker-side)
 const MESH_BUNDLE_MAGIC = "SMB1";
-// Frame batches go over the wire as SRF1 — built + POSTed by the post worker
-// (splatcapture-worker.js), which owns everything after the GPU readback.
+// Frame batches go over the wire as gzip-wrapped SRF1 (SZC1) — built, compressed,
+// and POSTed by a POOL of post workers (splatcapture-worker.js) that own everything
+// after the GPU readback. The pool parallelizes the CPU-bound gzip so it never paces
+// the render thread; the server inflates back to the byte-identical SRF1.
 
 const params = new URLSearchParams(location.search);
 const API = (params.get("api") || "").replace(/\/$/, "");
@@ -159,122 +170,10 @@ function rendererName(renderer) {
     return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : "unknown";
 }
 
-// --- glass: weighted-blended OIT (ported from scene3d.js) --------------------
-// A single alpha-blended pass is draw-order dependent and cannot show objects
-// behind concave / double-sided glass correctly (they go black); the board viewer
-// solves this with weighted-blended OIT, and the capture owns its render loop so
-// it runs the SAME multi-pass here for pixel-parity glass in the training refs.
-const OIT_LAYER = 1;
-const OIT_OPAQUE = 0.8; // α at/above which a transparent fragment is SOLID (writes depth)
-const oitPass = { value: 0 }; // 0 accumulate · 1 revealage · 2 depth pre-pass
-
-// ACES-filmic + sRGB (three.js' exact fit), shared by the present pass (opaque
-// scenes) and the OIT composite (glass scenes) so both store identical colour.
-const TONEMAP_GLSL = /* glsl */ `
-    vec3 acesFilmic(vec3 x) {
-        const mat3 inMat = mat3(
-            vec3(0.59719, 0.07600, 0.02840),
-            vec3(0.35458, 0.90834, 0.13383),
-            vec3(0.04823, 0.01566, 0.83777)
-        );
-        const mat3 outMat = mat3(
-            vec3( 1.60475, -0.10208, -0.00327),
-            vec3(-0.53108,  1.10813, -0.07276),
-            vec3(-0.07367, -0.00605,  1.07602)
-        );
-        x = inMat * x;
-        vec3 a = x * (x + 0.0245786) - 0.000090537;
-        vec3 b = x * (0.983729 * x + 0.4329510) + 0.238081;
-        x = a / b;
-        x = outMat * x;
-        return clamp(x, 0.0, 1.0);
-    }
-    vec3 linearToSrgb(vec3 c) {
-        c = clamp(c, 0.0, 1.0);
-        vec3 lo = c * 12.92;
-        vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
-        return mix(lo, hi, step(vec3(0.0031308), c));
-    }
-`;
-
-// Patch one transparent material for OIT: accumulate premultiplied colour × weight,
-// write coverage in the revealage pass, and write depth only where α ≥ OIT_OPAQUE
-// (frames/mullions stay solid, glass stays see-through). Verbatim from scene3d.js's
-// patchMaterialOIT so the two renderers agree fragment-for-fragment.
-function patchMaterialOIT(m) {
-    if (m.userData.__oitPatched) return;
-    m.userData.__oitPatched = true;
-    m.transparent = true;
-    m.depthWrite = false;
-    m.depthTest = true;
-    m.blending = THREE.CustomBlending;
-    m.blendEquation = THREE.AddEquation;
-    m.blendEquationAlpha = THREE.AddEquation;
-    const prev = m.onBeforeCompile;
-    m.onBeforeCompile = (shader, rndr) => {
-        if (prev) prev(shader, rndr);
-        shader.uniforms.uOITPass = oitPass;
-        shader.fragmentShader = shader.fragmentShader
-            .replace(
-                "#include <common>",
-                "#include <common>\nuniform float uOITPass;",
-            )
-            .replace(
-                "#include <dithering_fragment>",
-                `#include <dithering_fragment>
-                float _a = gl_FragColor.a;
-                if (uOITPass > 1.5) { if (_a < ${OIT_OPAQUE}) discard; }
-                else {
-                    float _ac = _a >= ${OIT_OPAQUE} ? 1.0 : _a;
-                    if (uOITPass < 0.5) {
-                        float _w = clamp(pow(min(1.0, _ac * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - gl_FragCoord.z * 0.9, 3.0), 1e-2, 3e3);
-                        gl_FragColor = vec4(gl_FragColor.rgb * _ac * _w, _ac * _w);
-                    } else {
-                        gl_FragColor = vec4(_ac);
-                    }
-                }`,
-            );
-    };
-    const prevKey = m.customProgramCacheKey?.bind(m);
-    m.customProgramCacheKey = () => "oit1|" + (prevKey ? prevKey() : "");
-    m.needsUpdate = true;
-}
-
-// accum: additive (ONE, ONE); revealage: dst *= (1 − srcAlpha).
-function setOITBlend(m, accum) {
-    m.blendSrc = accum ? THREE.OneFactor : THREE.ZeroFactor;
-    m.blendDst = accum ? THREE.OneFactor : THREE.OneMinusSrcAlphaFactor;
-    m.blendSrcAlpha = m.blendSrc;
-    m.blendDstAlpha = m.blendDst;
-}
-
-// In-place lit-scene prep (the OIT twin of splatlight.prepareLitScene): generate
-// missing normals, cast/receive shadows, force DoubleSide with back-face shadowing
-// (Trellis winding is unreliable), and route transparent meshes onto the OIT layer
-// with the weighted-blend patch. PBR maps are kept whole, so metals/glossies still
-// reflect per view; opaque materials keep their default depth write.
-function prepareCaptureScene(root) {
-    root.traverse((child) => {
-        if (!child.isMesh || !child.material) return;
-        if (child.geometry && !child.geometry.getAttribute("normal")) {
-            child.geometry.computeVertexNormals();
-        }
-        child.castShadow = true;
-        child.receiveShadow = true;
-        const mats = Array.isArray(child.material) ? child.material : [child.material];
-        let oit = false;
-        for (const m of mats) {
-            m.side = THREE.DoubleSide;
-            m.shadowSide = THREE.BackSide;
-            if (m.transparent) oit = true;
-        }
-        if (oit) {
-            for (const m of mats) patchMaterialOIT(m);
-            child.layers.set(OIT_LAYER);
-            child.userData.__oit = true;
-        }
-    });
-}
+// Per-capture OIT pass selector (0 accumulate · 1 revealage · 2 depth pre-pass),
+// shared with the transparent materials patched by prepareOITScene (see oit.js —
+// the same engine the debug viewer's mesh mode runs, so refs and preview match).
+const oitPass = { value: 0 };
 
 // Capture pipeline, per view: shade the lit scene in LINEAR HDR, then tone-map +
 // sRGB-encode in our OWN ShaderMaterial (deterministic across three.js versions)
@@ -474,15 +373,6 @@ function createCapture(renderer, resolution, near, far, fovDeg, background, expo
     // capture). Empty → opaque scene → renderView takes the single-pass fast path
     // (byte-identical to the pre-OIT pipeline).
     let oitMats = null;
-    function collectOIT(scene) {
-        const mats = [];
-        scene.traverse((o) => {
-            if (!o.userData.__oit || !o.material) return;
-            if (Array.isArray(o.material)) mats.push(...o.material);
-            else mats.push(o.material);
-        });
-        return mats;
-    }
 
     // Weighted-blended OIT for a glass scene, mirroring scene3d.js renderFrame:
     // opaque (layer 0) → rtScene, then three glass-only sub-passes (layer 1) — depth
@@ -537,7 +427,7 @@ function createCapture(renderer, resolution, near, far, fovDeg, background, expo
             .set(face.forward[0], face.forward[1], face.forward[2])
             .add(camera.position);
         camera.lookAt(lookTarget);
-        if (oitMats === null) oitMats = collectOIT(scene);
+        if (oitMats === null) oitMats = collectOITMaterials(scene);
         if (oitMats.length === 0) {
             // Opaque scene: one lit pass → present. Unchanged fast path.
             renderer.setClearColor(bg, 0); // alpha 0 = empty coverage
@@ -717,7 +607,7 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
-                prepareCaptureScene(gltf.scene);
+                prepareOITScene(gltf.scene, oitPass);
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -796,7 +686,12 @@ async function runCapture() {
     const rawLighting = manifest.lighting || {};
     const lighting = normalizeLighting(rawLighting);
     const sceneBox = new THREE.Box3().setFromObject(scene);
-    const rig = createLightRig(renderer, scene, { defaults: lighting });
+    // decorateOITLights puts the sun + hemi fill on all layers so the glass moved
+    // onto OIT_LAYER by prepareOITScene is still lit (not just IBL-lit).
+    const rig = createLightRig(renderer, scene, {
+        defaults: lighting,
+        decorateLights: decorateOITLights,
+    });
     rig.refit(sceneBox);
     renderer.shadowMap.needsUpdate = true;
     status(
@@ -838,18 +733,28 @@ async function runCapture() {
         2 * batchViews,
         Math.floor((256 * 1024 * 1024) / (R * R * 6)),
     );
-    const worker = new Worker("/js/splatcapture-worker.js");
+    // POOL of post workers: readback segments round-robin across them, and each gzips
+    // + POSTs its own batches. Gzip is CPU-bound, so one worker would cap the page
+    // below the render rate once the server ingest stops being the wall.
+    const gzip = params.get("nozip") !== "1"; // &nozip=1 posts raw SRF1 (A/B the wire cost)
+    const workers = Array.from(
+        { length: POST_WORKERS },
+        () => new Worker("/js/splatcapture-worker.js"),
+    );
     let postedViews = 0;
     let postError = null; // a failed batch is fatal — silence would strand views
-    let workerDrained = false;
-    worker.onmessage = (ev) => {
-        if (ev.data.posted) postedViews += ev.data.posted;
-        else if (ev.data.error) postError = new Error(ev.data.error);
-        else if (ev.data.drained) workerDrained = true;
-    };
-    worker.postMessage({
-        cfg: { framesUrl: stagePath("/frames"), resolution: R, batchViews },
-    });
+    let drainedWorkers = 0;
+    for (const w of workers) {
+        w.onmessage = (ev) => {
+            if (ev.data.posted) postedViews += ev.data.posted;
+            else if (ev.data.error) postError = new Error(ev.data.error);
+            else if (ev.data.drained) drainedWorkers += 1;
+        };
+        w.postMessage({
+            cfg: { framesUrl: stagePath("/frames"), resolution: R, batchViews, gzip },
+        });
+    }
+    let nextWorker = 0; // round-robin cursor for segment dispatch
 
     let renderedViews = 0;
     let lastProgress = 0;
@@ -875,7 +780,10 @@ async function runCapture() {
         while ((seg = ring.readySealed())) {
             const tc = performance.now();
             const r = ring.collect(seg);
-            worker.postMessage({ segment: r.buffer, ids: r.ids }, [r.buffer]);
+            workers[nextWorker++ % workers.length].postMessage(
+                { segment: r.buffer, ids: r.ids },
+                [r.buffer],
+            );
             buckets.collect += performance.now() - tc;
             progressed = true;
         }
@@ -898,12 +806,12 @@ async function runCapture() {
         else await sleep(2);
         buckets.spin += performance.now() - ty;
     }
-    worker.postMessage({ flush: true });
-    while (!workerDrained) {
+    for (const w of workers) w.postMessage({ flush: true });
+    while (drainedWorkers < workers.length) {
         if (postError) throw postError;
         await sleep(20);
     }
-    worker.terminate();
+    for (const w of workers) w.terminate();
 
     const secs = (performance.now() - t0) / 1000;
     const rate = postedViews / Math.max(secs, 0.001);

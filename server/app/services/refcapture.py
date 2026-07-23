@@ -17,6 +17,7 @@ the server half the stage-5 routes lean on:
 
 from __future__ import annotations
 
+import gzip
 import os
 import shutil
 import struct
@@ -33,6 +34,10 @@ if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
 FRAME_BATCH_MAGIC = b"SRF1"
+# The capture page gzip-wraps the SRF1 batch (SZC1 marker) so the ~6 MB/view POST
+# payload doesn't pace the single-threaded ingest; `decompress_frame_batch` inflates
+# it back to the byte-identical SRF1 body, so parse + encode stay unchanged.
+FRAME_BATCH_GZIP_MAGIC = b"SZC1"
 
 # Frame encode workers — THREADS, deliberately not processes: zstd releases the
 # GIL during compression (both the stdlib module and python-zstandard) and the
@@ -136,6 +141,16 @@ def terminate_browser(proc: subprocess.Popen | None, profile_dir: Path | None) -
 
 
 # --- frame batches -----------------------------------------------------------------
+
+
+def decompress_frame_batch(body: bytes) -> bytes:
+    """Inflate a gzip-wrapped (SZC1) capture batch back to its raw SRF1 bytes.
+
+    The page compresses the POST payload client-side (splatcapture-worker.js) so the
+    single-threaded ingest isn't the wall; the inflated bytes are byte-identical to
+    the page's SRF1 buffer, so `parse_frame_batch` + the encode pool are unchanged.
+    Meant to run off the event loop (gzip releases the GIL); raw SRF1 posts skip it."""
+    return gzip.decompress(body[len(FRAME_BATCH_GZIP_MAGIC):])
 
 
 def parse_frame_batch(body: bytes) -> list[tuple[str, int, int, int]]:

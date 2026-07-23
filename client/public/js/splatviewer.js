@@ -21,13 +21,18 @@ import {
 } from "./sogviewer.js";
 import { openRefsViewer } from "./refsviewer.js";
 import {
-    prepareLitScene,
     createLightRig,
     applyMeshToneMapping,
     restoreToneMapping,
     normalizeLighting,
     LIGHTING_DEFAULTS,
 } from "./splatlight.js";
+import {
+    prepareOITScene,
+    collectOITMaterials,
+    createScreenOIT,
+    decorateOITLights,
+} from "./oit.js";
 
 let overlay = null;
 let canvasEl = null;
@@ -48,6 +53,13 @@ let meshRig = null; // shared lit rig (splatlight) for the "original" mesh view
 let meshLit = false; // is the lit rig currently applied to the shared renderer?
 let prevRenderState = null; // renderer tone-map/shadow state saved while lit
 let meshLightingConfig = null; // this cell's captured LIGHTING (transforms.json), cached
+// Mesh-mode glass: the debug viewer runs the SAME weighted-blended OIT as the
+// Stage-5 capture (oit.js) so the mesh preview matches the trained refs. mkkellogg
+// owns the splat render loop, so in mesh mode we stop it and drive our own OIT loop.
+const meshOitPass = { value: 0 };
+let meshOit = null; // createScreenOIT pipeline (lazy; bound to the viewer's renderer)
+let meshOitMats = []; // the mesh's transparent (glass) materials, gathered per build
+let meshRenderRaf = 0; // our mesh OIT loop's rAF id (nonzero ⇒ mkkellogg is stopped)
 let mode = "splat"; // "splat" | "mesh" | "sog" — the view switch (not an overlay)
 let splatSource = "surfels"; // "surfels" (Stage-3 cloud.ply) | "trained" (Stage-6 RAW trained.ply) | "healed" (Stage-7 delivered healed.ply)
 let trainedUrl = null; // /artifacts URL of the Stage-6 RAW trained.ply, when it exists
@@ -236,6 +248,15 @@ function disposeObj(obj) {
 
 async function teardown() {
     stopMovement();
+    // Stop our mesh OIT loop and free its targets before the GL context goes away;
+    // don't resume mkkellogg (the viewer is being disposed).
+    if (meshRenderRaf) {
+        cancelAnimationFrame(meshRenderRaf);
+        meshRenderRaf = 0;
+    }
+    meshOit?.dispose();
+    meshOit = null;
+    meshOitMats = [];
     closeSogView(); // the PlayCanvas canvas lives in canvasEl too (replaceChildren below)
     // Overlays live in the viewer's threeScene; free their GPU resources and
     // reset their toggles before the viewer (and its GL context) goes away.
@@ -1131,7 +1152,7 @@ async function buildMeshGroup() {
         off += glbLen;
         try {
             const gltf = await loader.parseAsync(glb, "");
-            prepareLitScene(gltf.scene); // lit PBR, exactly like the Stage-5 capture
+            prepareOITScene(gltf.scene, meshOitPass); // glass via OIT, like the capture
             group.add(gltf.scene);
         } catch {
             /* skip a bad object */
@@ -1201,16 +1222,19 @@ async function enableMeshLighting() {
 	if (!meshRig) {
 		meshRig = createLightRig(viewer.renderer, viewer.threeScene, {
 			defaults: cfg,
+			decorateLights: decorateOITLights, // light the OIT-layer glass too
 		});
 	}
 	meshRig.setEnabled(true);
 	meshRig.refit(new THREE.Box3().setFromObject(meshGroup));
 	viewer.renderer.shadowMap.needsUpdate = true;
 	meshLit = true;
+	startMeshRender();
 	viewer.forceRenderNextFrame?.();
 }
 
 function disableMeshLighting() {
+	stopMeshRender();
 	if (!meshLit) return;
 	meshRig?.setEnabled(false);
 	if (viewer && prevRenderState)
@@ -1218,6 +1242,31 @@ function disableMeshLighting() {
 	prevRenderState = null;
 	meshLit = false;
 	viewer?.forceRenderNextFrame?.();
+}
+
+// mkkellogg owns the self-driven loop and renders the mesh scene in ONE pass
+// (which can't composite glass). In mesh mode the splats are hidden, so we stop
+// that loop and drive our own weighted-blended OIT render of viewer.threeScene —
+// the exact engine the Stage-5 capture uses — then hand the loop back on exit.
+function startMeshRender() {
+	if (meshRenderRaf || !viewer) return;
+	if (!meshOit) meshOit = createScreenOIT(viewer.renderer, meshOitPass);
+	meshOitMats = meshGroup ? collectOITMaterials(meshGroup) : [];
+	viewer.stop?.();
+	const tick = () => {
+		meshRenderRaf = requestAnimationFrame(tick);
+		if (mode !== "mesh" || !viewer || !meshOit) return;
+		viewer.controls?.update?.(); // damping + orbit, normally driven by mkkellogg
+		meshOit.render(viewer.threeScene, viewer.camera, meshOitMats);
+	};
+	meshRenderRaf = requestAnimationFrame(tick);
+}
+
+function stopMeshRender() {
+	if (!meshRenderRaf) return;
+	cancelAnimationFrame(meshRenderRaf);
+	meshRenderRaf = 0;
+	viewer?.start?.(); // resume mkkellogg's loop for the splat / voxel modes
 }
 
 // The voxel overlays follow their checkboxes in every three.js view (splat AND
@@ -1671,6 +1720,44 @@ function buildControls(summary) {
 		el("span", { class: "svc-lab", text: "folder" }),
 		folderBtn,
 	);
+	// Export poses + surfels + rendered references to a COLMAP model under
+	// splat/colmap/ (cameras.txt + images.txt + points3D.txt + RGB PNGs) — the
+	// folder Postshot / COLMAP tools ingest (drag in → Camera Poses = Import).
+	// Needs Stage 5 (references) done; the server 409s otherwise.
+	const colmapBtn = el("button", {
+		class: "splat-stage2-btn",
+		text: "export colmap",
+		title: "write splat/colmap/ (cameras + images + points3D + PNGs) for Postshot / COLMAP import — needs Stage 5 references",
+		onclick: async () => {
+			if (!current) return;
+			const label = colmapBtn.textContent;
+			colmapBtn.disabled = true;
+			colmapBtn.textContent = "exporting…";
+			setStatus("exporting COLMAP…", "var(--purple)");
+			try {
+				const r = await api.splatColmapExport(
+					current.run,
+					current.slot,
+					current.model,
+				);
+				setStatus(
+					`COLMAP: ${r.images} images · ${r.points.toLocaleString()} points → splat/colmap (reveal to open)`,
+					"",
+				);
+			} catch (e) {
+				setStatus(`COLMAP export failed: ${e.message}`, "var(--red)");
+			} finally {
+				colmapBtn.disabled = false;
+				colmapBtn.textContent = label;
+			}
+		},
+	});
+	const colmapRow = el(
+		"div",
+		{ class: "svc-row" },
+		el("span", { class: "svc-lab", text: "colmap" }),
+		colmapBtn,
+	);
 	// Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
 	const camRow = checkRow("cameras", "camera positions", false);
 	inputs.cameras.addEventListener("change", () =>
@@ -1775,6 +1862,7 @@ function buildControls(summary) {
 		patchRow,
 		refsRow,
 		folderRow,
+		colmapRow,
 		camRow,
 		camPlayRow,
 		camSpeedRow,

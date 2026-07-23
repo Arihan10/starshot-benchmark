@@ -147,6 +147,15 @@ export const api = {
 			`/runs/${encodeURIComponent(run)}/splat/reveal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
 			{ method: "POST" },
 		),
+	// Export this cell's Stage-3 cloud + Stage-5 references to a COLMAP model under
+	// `splat/colmap/` (cameras.txt + images.txt + points3D.txt + RGB PNGs) — the
+	// folder Postshot / COLMAP-based tools ingest. Needs Stage 3 + Stage 5; 409s
+	// otherwise. Returns { cameras, images, points, dir, url }.
+	splatColmapExport: (run, slot, model) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/colmap/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+			{ method: "POST" },
+		),
 	// Stage 2 (free-space voxelizer: single uniform grid, flood-fill empty/garbage
 	// classification + the clearance pass baking the FREE threshold). `body` may
 	// carry `pitch`/`margin`/`clearance`. Status returns the `voxels.bin` URL —

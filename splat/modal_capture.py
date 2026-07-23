@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import glob
+import gzip
 import mimetypes
 import os
 import shutil
@@ -69,6 +70,7 @@ _PORT = 8765
 _CAPTURE_DEBUG = bool(os.environ.get("STARSHOT_CAPTURE_DEBUG"))
 _SMB1_MAGIC = b"SMB1"
 _SRF1_MAGIC = b"SRF1"
+_SZC1_MAGIC = b"SZC1"  # gzip-wrapped SRF1 (client-side wire compression; see refcapture)
 # Encode workers / backlog mirror the server's capture ingest (routes.py):
 # zstd + the numpy filter release the GIL, so threads parallelize fine.
 _ENCODE_WORKERS = 8
@@ -89,6 +91,13 @@ _RENDER_MODES = ("vulkan", "swiftshader")
 _SAMPLE_COUNT = 8
 
 ProgressCb = Callable[[int, int, str], None]
+
+
+def _decompress_frame_batch(body: bytes) -> bytes:
+    """Inflate a gzip-wrapped (SZC1) batch to its raw SRF1 bytes — mirrors
+    `server/app/services/refcapture.decompress_frame_batch` (the SZC1 wire contract
+    in splatcapture-worker.js). Byte-identical output, so the encode path is unchanged."""
+    return gzip.decompress(body[len(_SZC1_MAGIC):])
 
 
 def _parse_frame_batch(body: bytes) -> list[tuple[str, int, int, int]]:
@@ -188,6 +197,8 @@ def _make_app(state: dict[str, Any]):
     async def frames(request):
         _check_token(request)
         body = await request.read()
+        if body[:4] == _SZC1_MAGIC:
+            body = await asyncio.to_thread(_decompress_frame_batch, body)
         try:
             parsed = _parse_frame_batch(body)
         except ValueError as exc:

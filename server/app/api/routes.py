@@ -82,6 +82,7 @@ from splat import stage3 as splat_stage3  # noqa: E402
 from splat import stage4 as splat_stage4  # noqa: E402
 from splat import stage5 as splat_stage5  # noqa: E402  (torch-free contract module)
 from splat import stage6 as splat_stage6  # noqa: E402  (torch/gsplat lazy inside)
+from splat import colmap as splat_colmap  # noqa: E402  (torch-free; reuses stage5 codec)
 
 # Client for the Modal GPU pipeline (stages 4-6 on an A100; see splat/modal_app.py).
 # Guarded: the Modal SDK is a server dep, but a host without it (or without Modal
@@ -2905,6 +2906,12 @@ def _refs_dir(run: str, slot: str, model: str) -> Path:
     return _slot_dir(run, slot, model) / "splat" / splat_stage5.REFS_DIRNAME
 
 
+def _colmap_dir(run: str, slot: str, model: str) -> Path:
+    """Where a cell's COLMAP export (Postshot / COLMAP import) is written
+    (`splat/colmap/`)."""
+    return _slot_dir(run, slot, model) / "splat" / "colmap"
+
+
 def _splat_stage_artifacts(run: str, slot: str, model: str) -> dict[int, list[Path]]:
     """The on-disk output(s) of each splat stage for one cell, keyed by stage number
     (2..5; Stage 1's `scene.json` is the base). Used to REVERT downstream on re-run."""
@@ -4153,12 +4160,17 @@ def create_app() -> FastAPI:
 
     @app.post("/runs/{run}/splat/stage5/{slot}/{model}/frames")
     async def splat_stage5_frames(run: str, slot: str, model: str, request: Request, token: str = "") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Ingest one binary SRF1 frame batch from the capture page: each view's
-        raw RGBA + depth-code buffers go straight to the PNG encode pool (the
-        artifacts land atomically; `job['done']` advances as encodes finish). Backs
-        off when the encode backlog is full, which flow-controls the renderer."""
+        """Ingest one binary SRF1 frame batch (optionally gzip-wrapped as SZC1) from
+        the capture page: each view's raw RGBA + depth-code buffers go straight to the
+        PNG encode pool (the artifacts land atomically; `job['done']` advances as
+        encodes finish). Backs off when the encode backlog is full, which flow-controls
+        the renderer."""
         state = _stage5_state_for(run, slot, model, token)
         body = await request.body()
+        # The page compresses the ~6 MB/view payload client-side so it doesn't pace the
+        # single-threaded ingest; inflate off the loop back to the byte-identical SRF1.
+        if body[:4] == refcapture.FRAME_BATCH_GZIP_MAGIC:
+            body = await asyncio.to_thread(refcapture.decompress_frame_batch, body)
         try:
             frames = refcapture.parse_frame_batch(body)
         except ValueError as exc:
@@ -4250,6 +4262,28 @@ def create_app() -> FastAPI:
             state["finished"].set()
         missing = len(state["pending"])
         return {"ok": missing == 0 and not state["encode_errors"], "missing": missing}
+
+    @app.post("/runs/{run}/splat/colmap/{slot}/{model}")
+    async def splat_colmap_export(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Export ONE cell's Stage-3 cloud + Stage-5 references to a COLMAP text model
+        under `splat/colmap/` — cameras.txt / images.txt / points3D.txt plus the SZF
+        reference frames decoded to RGB PNG — the folder Postshot / COLMAP-based tools
+        ingest (drag it in → Camera Poses = Import). Needs Stage 3 (`cloud.ply`) +
+        Stage 5 (`refs/transforms.json`); poses are OpenCV camera-to-world, so the
+        extrinsics are inv(c2w) with no OpenGL flip. Overwrites any previous export.
+        Runs off the event loop (decode is CPU-bound); returns a small summary."""
+        if not _cloud_path(run, slot, model).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 3 (surfels) first")
+        if not (_refs_dir(run, slot, model) / splat_stage5.TRANSFORMS_NAME).is_file():
+            raise HTTPException(status_code=409, detail="run Stage 5 (references) first")
+        out_dir = _colmap_dir(run, slot, model)
+        summary = await asyncio.to_thread(
+            splat_colmap.export_colmap,
+            _refs_dir(run, slot, model),
+            _cloud_path(run, slot, model),
+            out_dir,
+        )
+        return {**summary, "url": _artifact_url(out_dir / splat_colmap.CAMERAS_TXT)}
 
     @app.post("/runs/{run}/splat/stage6/{slot}/{model}")
     async def splat_stage6_start(  # pyright: ignore[reportUnusedFunction]

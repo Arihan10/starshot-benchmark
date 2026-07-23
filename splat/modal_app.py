@@ -155,6 +155,12 @@ image = (
     .add_local_file(
         _REPO / "client/public/js/splatcapture.js", f"{_ASSETS}/js/splatcapture.js"
     )
+    # splatcapture.js imports the shared weighted-blended OIT engine (glass); the
+    # loopback host serves it from /js, so it MUST be baked in or the page's ES
+    # module graph 404s and no frames render.
+    .add_local_file(
+        _REPO / "client/public/js/oit.js", f"{_ASSETS}/js/oit.js"
+    )
     .add_local_file(
         _REPO / "client/public/js/splatlight.js", f"{_ASSETS}/js/splatlight.js"
     )

@@ -4,11 +4,12 @@
 // wall (~6 ms/view of swizzle + pack + upload vs ~0.3 ms of actual rendering),
 // so everything after the GPU readback lands here instead: raw buffers arrive
 // as zero-copy transfers, the depth pack-pass RGBA is swizzled to uint16 codes,
-// frames are packed into SRF1 batches, and the batches are POSTed to the API.
+// frames are packed into SRF1 batches, gzip-wrapped (SZC1) so the raw ~6 MB/view
+// payload doesn't pace the single-threaded server ingest, and POSTed to the API.
 // The WebGL thread only renders, fences, and copies buffers out of the PBOs.
 //
 // Protocol (messages in):
-//   { cfg: { framesUrl, resolution, batchViews } }   — once, before any frame
+//   { cfg: { framesUrl, resolution, batchViews, gzip } } — once, before any frame
 //   { segment: ArrayBuffer, ids: [view ids] }        — one readback segment:
 //       per view, [RGBA8 color plane (4·n)][RG8 depth plane (2·n)], packed
 //       back-to-back in id order (transferred zero-copy from the render thread).
@@ -43,6 +44,26 @@ function packBatch(frames, resolution) {
     return new Blob(parts, { type: "application/octet-stream" });
 }
 
+// Wrap the SRF1 batch as "SZC1" + gzip(SRF1). The server detects the marker and
+// inflates back to the byte-identical SRF1 body (refcapture.py / modal_capture.py),
+// so the SZF encode is unchanged — this only lifts the raw payload off the single-
+// threaded ingest. cfg.gzip === false (…&nozip=1) or no CompressionStream posts the
+// raw SRF1 blob instead (both servers accept either).
+const GZIP_MARKER = new Uint8Array([0x53, 0x5a, 0x43, 0x31]); // "SZC1"
+
+async function encodeBody(frames, resolution) {
+    const srf1 = packBatch(frames, resolution);
+    if (cfg.gzip === false || typeof CompressionStream === "undefined") return srf1;
+    try {
+        const gz = await new Response(
+            srf1.stream().pipeThrough(new CompressionStream("gzip")),
+        ).blob();
+        return new Blob([GZIP_MARKER, gz], { type: "application/octet-stream" });
+    } catch {
+        return srf1; // any failure → raw SRF1
+    }
+}
+
 function maybeDrained() {
     if (draining && ready.length === 0 && postsInFlight === 0) {
         postMessage({ drained: true });
@@ -59,7 +80,7 @@ async function flush() {
     try {
         const res = await fetch(cfg.framesUrl, {
             method: "POST",
-            body: packBatch(frames, cfg.resolution),
+            body: await encodeBody(frames, cfg.resolution),
         });
         if (!res.ok) {
             let detail = `HTTP ${res.status}`;
