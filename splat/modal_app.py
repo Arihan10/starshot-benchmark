@@ -391,6 +391,11 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     freespace = _ensure_input(inputs, "freespace.npz", in_sha["freespace"], scratch)
     _ensure_input(inputs, "freespace.npz.skin.npy", in_sha["skin"], scratch)
     cloud = _ensure_input(inputs, "cloud.ply", in_sha["cloud"], scratch)
+    # Optional texel-size sidecar (Stage 3): materialized beside cloud.ply so
+    # Stage 4's content-anchored ladder auto-discovers it; legacy pushes
+    # without one plan through the radius-proxy path unchanged.
+    if in_sha.get("stex"):
+        _ensure_input(inputs, "cloud.ply.stex.npy", in_sha["stex"], scratch)
 
     # Per-stage CODE versions (see _src_sig): fold the DEPLOYED pipeline source
     # into each stage's cache signature, so editing a stage + redeploying re-runs
@@ -417,7 +422,8 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
 
     # ---- stage 4: coverage camera plan -----------------------------------------
     plan_params = PlanParams(**(spec.get("plan") or {}))
-    sig4 = _sig({"in": [in_sha["freespace"], in_sha["skin"], in_sha["cloud"]],
+    sig4 = _sig({"in": [in_sha["freespace"], in_sha["skin"], in_sha["cloud"],
+                        in_sha.get("stex", "")],
                  "params": plan_params.as_summary(), "code": code4})
     cameras = out / "cameras.json"
     art4 = [cameras, out / "patches.bin", out / "patch_views.json"]
@@ -586,6 +592,64 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     heart.stage("done")(1, 1, "")
     volume.commit()
     return summary
+
+
+@app.function(
+    image=image,
+    gpu="A100-40GB",
+    cpu=4.0,
+    memory=8192,
+    timeout=3600,
+    volumes={VOL: volume},
+)
+def eval_cross(spec: dict[str, Any]) -> dict[str, Any]:
+    """Cross-evaluate trained splats on OTHER cells' reference view sets — the
+    fair fidelity readout for a planner A/B: each model is scored against every
+    listed ref set (PSNR/L1/depth over an `eval_max_views` random subset), so a
+    baseline plan's model and a new plan's model face the SAME held-out views
+    (near-band views from one plan, mid/far views from the other).
+
+    spec = {
+      "models": {label: "run/slot/model[/ply_name]"},   # default trained.ply
+      "refs":   {label: "run/slot/model"},              # each cell's splat/refs
+      "eval_max_views": 96,
+    }
+    Returns {model_label: {ref_label: metrics}}.
+    """
+    import torch
+    from gsplat import rasterization_2dgs
+
+    from splat.stage6 import TrainParams, _evaluate, _load_cloud, _load_scene
+
+    volume.reload()
+    device = torch.device("cuda")
+    params = TrainParams(eval_max_views=int(spec.get("eval_max_views", 96)))
+
+    scenes: dict[str, Any] = {}
+    for label, key in spec["refs"].items():
+        refs_dir = Path(VOL) / "cells" / key / "splat" / "refs"
+        views, K, width, height, _ = _load_scene(torch, refs_dir, device)
+        scenes[label] = (views, K, width, height)
+        print(f"refs[{label}] = {key}: {len(views)} views @{width}", flush=True)
+
+    out: dict[str, Any] = {}
+    for label, key in spec["models"].items():
+        parts = key.split("/")
+        ply = parts[3] if len(parts) > 3 else "trained.ply"
+        ply_path = Path(VOL) / "cells" / "/".join(parts[:3]) / "splat" / ply
+        arrays = _load_cloud(ply_path)
+        splats = {k: torch.from_numpy(v).to(device) for k, v in arrays.items()}
+        out[label] = {"splats": int(arrays["means"].shape[0])}
+        for rlabel, (views, K, width, height) in scenes.items():
+            m = _evaluate(
+                torch, rasterization_2dgs, splats, views, K, width, height,
+                params, device,
+            )
+            out[label][rlabel] = m
+            print(f"eval {label} on {rlabel}: {m}", flush=True)
+        del splats
+        torch.cuda.empty_cache()
+    return out
 
 
 # --- deploy-time probe -------------------------------------------------------------

@@ -229,6 +229,18 @@ export const api = {
 		request(
 			`/runs/${encodeURIComponent(run)}/splat/stage6/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
 		),
+	// On-demand SOG encode of a chosen model (`which`: "trained" | "healed") —
+	// runs client/tools/ply-to-sog.mjs on the server host (local, NOT on Modal).
+	// Poll splatSogStatus for progress + the per-model `.sog` url.
+	splatSogEncode: (run, slot, model, which) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/sog/${encodeURIComponent(slot)}/${encodeURIComponent(model)}?which=${encodeURIComponent(which)}`,
+			{ method: "POST" },
+		),
+	splatSogStatus: (run, slot, model) =>
+		request(
+			`/runs/${encodeURIComponent(run)}/splat/sog/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
+		),
 	// Modal remote train (stages 4-6 on an A100): one call plans cameras, renders
 	// references, and fine-tunes on the GPU box, then pulls trained.ply back so
 	// the "trained" viewer toggle lights up. Needs local Stage 2 + Stage 3.

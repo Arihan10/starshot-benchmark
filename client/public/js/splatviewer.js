@@ -52,7 +52,10 @@ let mode = "splat"; // "splat" | "mesh" | "sog" — the view switch (not an over
 let splatSource = "surfels"; // "surfels" (Stage-3 cloud.ply) | "trained" (Stage-6 RAW trained.ply) | "healed" (Stage-7 delivered healed.ply)
 let trainedUrl = null; // /artifacts URL of the Stage-6 RAW trained.ply, when it exists
 let healedUrl = null; // /artifacts URL of the Stage-7 delivered healed.ply, when it exists
-let sogUrl = null; // /artifacts URL of trained.sog (from stage6.sog_url), rendered via PlayCanvas
+let sogUrl = null; // /artifacts URL of the ACTIVE model's .sog, rendered via PlayCanvas
+let trainedSogUrl = null; // /artifacts URL of trained.sog (client-encoded on demand)
+let healedSogUrl = null; // /artifacts URL of healed.sog (client-encoded on demand)
+let sogEncoding = false; // a SOG-encode POST is in flight (drives the ⤓ SOG button)
 
 // Patch-selection debug feature (needs Stage 4 + Stage 5). A selectable points
 // overlay of the coverage patches; clicking one opens its Stage-5 reference images
@@ -837,13 +840,74 @@ function syncViewButtons() {
 	inputs._voxViewBtn?.classList.toggle("on", active === "voxels");
 }
 
+// The .sog to VIEW: the one for the model you're evaluating (trained/healed).
+// surfels has none, so fall back to whichever exists (trained first).
+function activeSogUrl() {
+    if (splatSource === "healed") return healedSogUrl;
+    if (splatSource === "trained") return trainedSogUrl;
+    return trainedSogUrl || healedSogUrl;
+}
+
 function syncSogBtn() {
     const btn = inputs && inputs._sogBtn;
+    if (btn) {
+        const url = activeSogUrl();
+        btn.disabled = !url;
+        btn.title = url
+            ? "view the SOG-encoded splat (PlayCanvas)"
+            : "compress this model to SOG first (the ⤓ SOG button)";
+    }
+    syncSogEncBtn();
+}
+
+// The ⤓ SOG action button compresses whichever model you're evaluating.
+function syncSogEncBtn() {
+    const btn = inputs && inputs._sogEncBtn;
     if (!btn) return;
-    btn.disabled = !sogUrl;
-    btn.title = sogUrl
-        ? "the SOG-encoded trained splat, rendered with PlayCanvas"
-        : "encode it first: node client/tools/ply-to-sog.mjs …/trained.ply …/trained.sog";
+    const which = splatSource; // "trained" | "healed" | "surfels" | …
+    const srcUrl =
+        which === "healed" ? healedUrl : which === "trained" ? trainedUrl : null;
+    btn.disabled = sogEncoding || !srcUrl;
+    btn.textContent = sogEncoding ? "compressing…" : "⤓ SOG";
+    btn.title = srcUrl
+        ? `compress the ${which} splat to SOG (PlayCanvas) — runs locally, not on Modal`
+        : "select the trained or healed splat to compress it to SOG";
+}
+
+// Compress the currently-evaluated model (trained/healed) to SOG on the server
+// (client/tools/ply-to-sog.mjs — local, never on Modal), poll until it lands,
+// then light up the SOG view for that model. run/slot/model are captured up
+// front so a teardown mid-encode can't break the poll.
+async function encodeActiveSog() {
+    const which = splatSource;
+    if ((which !== "trained" && which !== "healed") || sogEncoding || !current) return;
+    const { run, slot, model } = current;
+    sogEncoding = true;
+    syncSogEncBtn();
+    setStatus(`compressing ${which} → SOG…`, "var(--purple)");
+    try {
+        await api.splatSogEncode(run, slot, model, which);
+        for (;;) {
+            await new Promise((r) => setTimeout(r, 1500));
+            const st = await api.splatSogStatus(run, slot, model);
+            const enc = (st && st.encoders && st.encoders[which]) || {};
+            if (enc.status === "running") continue;
+            if (enc.status === "error") {
+                throw new Error(enc.error || "sog encode failed");
+            }
+            if (which === "healed") healedSogUrl = enc.url || healedSogUrl;
+            else trainedSogUrl = enc.url || trainedSogUrl;
+            break;
+        }
+        sogUrl = activeSogUrl();
+        setStatus(`${which} SOG ready — switch to the sog view`, "var(--green)");
+    } catch (e) {
+        setStatus(`SOG encode failed: ${e && e.message ? e.message : e}`, "var(--red)");
+    } finally {
+        sogEncoding = false;
+        syncSogBtn();
+        syncViewButtons();
+    }
 }
 
 // Enable the "trained" and "sog" toggles from the cell poll's Stage-6 status
@@ -874,7 +938,9 @@ function updateSourceAvail() {
 	}
 	if (!healedUrl && splatSource === "healed") splatSource = "surfels";
 
-    sogUrl = s6.sog_url || null;
+    trainedSogUrl = s6.trained_sog_url || s6.sog_url || null;
+    healedSogUrl = s6.healed_sog_url || null;
+    sogUrl = activeSogUrl();
     syncSogBtn();
     syncViewButtons();
 }
@@ -932,6 +998,8 @@ async function setSource(next) {
 	if (next === "surfels" && !s3.url) return;
 	splatSource = next;
 	mode = "splat";
+	sogUrl = activeSogUrl();
+	syncSogBtn();
 	syncViewButtons();
 	const cam = captureCamera();
 	const bust = `?t=${Date.now()}`;
@@ -1512,8 +1580,16 @@ function buildControls(summary) {
 	const sogBtn = el("button", {
 		class: "svc-seg-btn",
 		text: "sog",
-		disabled: true, // enabled by updateSourceAvail once trained.sog exists
+		disabled: true, // enabled once the active model's .sog exists
 		onclick: () => setView("sog"),
+	});
+	// Action (not a view): compress the model you're evaluating (trained/healed)
+	// to SOG on the server (client/tools/ply-to-sog.mjs — local, never on Modal).
+	const sogEncBtn = el("button", {
+		class: "svc-seg-btn svc-seg-act",
+		text: "⤓ SOG",
+		disabled: true, // enabled by syncSogEncBtn when trained/healed is selected
+		onclick: () => void encodeActiveSog(),
 	});
 	const origBtn = el("button", {
 		class: "svc-seg-btn",
@@ -1531,6 +1607,7 @@ function buildControls(summary) {
 	inputs._trainBtn = trainBtn;
 	inputs._healBtn = healBtn;
 	inputs._sogBtn = sogBtn;
+	inputs._sogEncBtn = sogEncBtn;
 	inputs._origBtn = origBtn;
 	inputs._voxViewBtn = voxViewBtn;
 	const seg = el(
@@ -1540,6 +1617,7 @@ function buildControls(summary) {
 		trainBtn,
 		healBtn,
 		sogBtn,
+		sogEncBtn,
 		origBtn,
 		voxViewBtn,
 	);
@@ -3012,6 +3090,9 @@ export async function openSplatViewer(opts) {
 	trainedUrl = null;
 	healedUrl = null;
 	sogUrl = null;
+	trainedSogUrl = null;
+	healedSogUrl = null;
+	sogEncoding = false;
 	modalPrev = null;
 	modalLog = [];
 	modalPlanShown = false;
