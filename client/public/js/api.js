@@ -148,7 +148,7 @@ export const api = {
             { method: "POST" },
         ),
     // Export this cell's Stage-3 cloud + Stage-5 references to a COLMAP model under
-    // `splat/colmap/` (cameras.txt + images.txt + points3D.txt + RGB PNGs) — the
+	// `splat/colmap/` (cameras.txt + images.txt + points3D.txt + RGBA PNGs) — the
     // folder Postshot / COLMAP-based tools ingest. Needs Stage 3 + Stage 5; 409s
     // otherwise. Returns { cameras, images, points, dir, url }.
     splatColmapExport: (run, slot, model) =>

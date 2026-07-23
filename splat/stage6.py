@@ -3,16 +3,17 @@
 Takes a **COLMAP model** as its ONLY input — the same (point cloud + camera poses
 + reference images) triple Postshot ingests and gsplat's `simple_trainer_2dgs`
 trains on, written by `splat_to_colmap.py` / `splat.colmap.export_colmap`
-(`cameras.txt` / `images.txt` / `points3D.txt` + RGB images). The splat is
+(`cameras.txt` / `images.txt` / `points3D.txt` + RGBA images). The splat is
 INITIALIZED from the point cloud the gsplat way (`_init_from_points`: means = point
 xyz, colour = point RGB, isotropic KNN scales, random quats, opacity =
 logit(`init_opa`)) and optimized against the reference images into a clean 2DGS
 splat (`trained.ply`): densification adds Gaussians where the render disagrees with
 the reference, pruning removes redundant ones.
 
-COLMAP carries only RGB (no alpha, no depth), so the alpha/coverage loss, the dense
-depth loss, and depth-guided densification are DISABLED here (nothing to compare
-against) — the active loss set is exactly the reference trainer's: photometric L1 +
+The trainer reads the images as RGB — the export's PNGs also carry a coverage
+alpha (kept for Postshot masking) but it isn't read here — and COLMAP has no depth,
+so the alpha/coverage loss, the dense depth loss, and depth-guided densification are
+DISABLED here (nothing to compare against) — the active loss set is exactly the reference trainer's: photometric L1 +
 D-SSIM, 2DGS normal consistency, and optional depth distortion. (The depth/alpha
 machinery below is retained because Stage 7 `heal_splat` still consumes the
 alpha+depth Stage-5 references.)
@@ -572,7 +573,8 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
 # --- COLMAP text model (the Postshot-style input: points3D + cameras + images) --
 # The model written by `splat.colmap.export_colmap` / `splat_to_colmap.py`: one
 # shared PINHOLE camera, per-image world-to-camera poses, an xyz+rgb point cloud,
-# and the reference images as RGB (no alpha, no depth — same as Postshot). This is
+# and the reference images as RGBA (RGB + coverage alpha; depth dropped — the
+# trainer reads only RGB, the alpha is kept for Postshot masking). This is
 # now the ONLY Stage-6 input; the trainer inits from the point cloud exactly like
 # gsplat's simple_trainer_2dgs.
 
@@ -1861,8 +1863,9 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
     """The COLMAP model (the Postshot-style input) as the trainer consumes it:
     (views, K, width, height, centers, points_xyz, points_rgb). Each view is the
     same dict `_view_stream`/`_evaluate` expect — the w2c `viewmat`, the c2w, and
-    the RGB image path — but with `frame`/`alpha`/`depth` None (COLMAP carries no
-    alpha or depth). `points_xyz`/`points_rgb` seed the splat via `_init_from_points`.
+    the RGB image path — but with `frame`/`alpha`/`depth` None: the image is read as
+    RGB (the PNG's coverage alpha, kept for Postshot masking, is dropped) and COLMAP
+    has no depth. `points_xyz`/`points_rgb` seed the splat via `_init_from_points`.
     Image names resolve against the model dir (flat, as `export_colmap` writes) or
     an `images/` subdir (a standard COLMAP layout)."""
     colmap_dir = Path(colmap_dir)
