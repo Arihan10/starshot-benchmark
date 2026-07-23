@@ -13,14 +13,16 @@ export const OIT_LAYER = 1;
 // window frames/mullions stay opaque, sub-cutoff glass blends and stays see-through.
 export const OIT_OPAQUE = 0.8;
 
-// TEMPORARY (view-independent training): bake the lighting by forcing every surface
-// matte — metalness 0, roughness 1 — so the fixed rig contributes only diffuse
-// shading + soft IBL irradiance + shadows, with NO camera-dependent specular
-// highlights or environment mirror reflections (the moving "glare" a degree-0 /
-// low-SH splat can't fit). This makes every reference frame view-consistent.
-// REVERT when spherical-harmonic / view-dependent training returns: set to false
-// (restores the assets' authored metallic-roughness) AND bump COLOR_PIPELINE in
-// splat/stage5.py so the matte frames re-render.
+// TEMPORARY (view-independent training): bake the lighting so every reference frame
+// is view-consistent. Forcing metalness 0 / roughness 1 alone is NOT enough — the
+// scalars are MULTIPLIED by the metallic-roughness map, so glossy texels keep
+// reflecting unless the map is nulled too. prepareOITScene nulls those maps and
+// zeroes the physical specular layers (clearcoat / sheen / iridescence / specular),
+// leaving pure diffuse shading. The environment is KEPT — its diffuse irradiance is
+// view-independent and is the ambient fill that makes interiors legible + shadows
+// readable; at roughness 1 its specular collapses to a soft blur, not a glare.
+// REVERT when view-dependent (SH) training returns: set false (restores authored
+// PBR) AND bump COLOR_PIPELINE in splat/stage5.py so the matte frames re-render.
 export const BAKE_MATTE = true;
 
 // ACES-filmic + sRGB (three.js' exact fit), shared by the opaque present pass and
@@ -120,11 +122,24 @@ export function prepareOITScene(root, oitPass) {
         for (const m of mats) {
             m.side = THREE.DoubleSide;
             m.shadowSide = THREE.BackSide;
-            // Bake lighting view-independently: matte kills the specular lobe and
-            // turns the IBL into blurred (view-independent) irradiance — no glare.
+            // Bake lighting view-independently: make the surface fully matte so it
+            // reflects nothing. The scalars are MULTIPLIED by the metallic-roughness
+            // map, so null the maps too — else glossy texels stay glossy despite
+            // roughness=1. Zero the physical specular layers as well. The environment
+            // is KEPT (its diffuse irradiance is the view-independent ambient fill);
+            // at roughness 1 its specular is a soft blur, not a glare.
             if (BAKE_MATTE && (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial)) {
                 m.metalness = 0;
                 m.roughness = 1;
+                m.metalnessMap = null;
+                m.roughnessMap = null;
+                if (m.isMeshPhysicalMaterial) {
+                    m.clearcoat = 0;
+                    m.sheen = 0;
+                    m.iridescence = 0;
+                    m.specularIntensity = 0;
+                }
+                m.needsUpdate = true;
             }
             if (m.transparent) oit = true;
         }
