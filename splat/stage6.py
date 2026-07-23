@@ -180,7 +180,7 @@ class TrainParams:
     # camera instead of being averaged into a dull smear. It adds (D+1)²−1 = 8
     # coeffs per colour channel (24 floats/Gaussian), so it also drives the memory
     # + size knobs below (cap_max, the tile budget, vram_min_free_gb).
-    sh_degree: int = 0
+    sh_degree: int = 2
     sh_degree_interval: int = 1000     # raise the active degree every N steps (if sh_degree > 0)
 
     # Loss weights.

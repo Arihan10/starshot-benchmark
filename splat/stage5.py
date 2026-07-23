@@ -145,7 +145,9 @@ LIGHTING: dict[str, Any] = {
 # materials are shaded), so a reference set rendered by an older pipeline is
 # detected as stale even when `LIGHTING` is byte-identical. v2: materials render
 # with their authored metallic-roughness (reflective) instead of forced matte.
-COLOR_PIPELINE = "linear-aces-srgb-v2"
+# v3: transparent surfaces composite through weighted-blended OIT (order-
+# independent), so objects behind glass render correctly instead of going black.
+COLOR_PIPELINE = "linear-aces-srgb-v3"
 
 # Sidecar under a cell's refs/ recording the capture settings the on-disk frames
 # were rendered with, so a resume can detect a change (see `reconcile_capture_meta`).

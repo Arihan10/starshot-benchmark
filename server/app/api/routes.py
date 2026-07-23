@@ -3733,34 +3733,6 @@ def create_app() -> FastAPI:
         'done' / 'error')."""
         return _splat_cell_status(run, slot, model)
 
-    @app.post("/runs/{run}/splat/reveal/{slot}/{model}")
-    async def splat_reveal(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Open this cell's splat/ folder in the SERVER host's file browser
-        (Explorer / Finder / xdg-open) — a local-dev convenience, since the
-        browser can't open a local directory itself. Falls back to the cell dir
-        when splat/ doesn't exist yet."""
-        cell = _slot_dir(run, slot, model)
-        target = cell / "splat"
-        if not target.is_dir():
-            target = cell
-        if not target.is_dir():
-            raise HTTPException(status_code=404, detail=f"no such cell: {slot}/{model}")
-        target = target.resolve()
-        if not target.is_relative_to(RUNS_DIR.resolve()):
-            raise HTTPException(status_code=400, detail="refusing to open a path outside runs/")
-        opener = (
-            ["explorer", str(target)]
-            if sys.platform == "win32"
-            else ["open", str(target)]
-            if sys.platform == "darwin"
-            else ["xdg-open", str(target)]
-        )
-        try:
-            subprocess.Popen(opener)
-        except Exception as exc:
-            raise HTTPException(status_code=500, detail=f"failed to open folder: {exc}") from exc
-        return {"opened": str(target)}
-
     @app.get("/runs/{run}/splat/source/{slot}/{model}")
     async def splat_source_get(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """The cell's splat-asset selection: persisted pref ('auto' / 'generated'

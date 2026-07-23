@@ -296,7 +296,7 @@ async function teardown() {
 // with the camera; the Stage-3 surfel cloud and the mesh-mode dummy are flat
 // (degree 0). mkkellogg allocates SH buffers for the viewer's configured degree,
 // so it's set PER LOAD (loadClouds) — 0 for surfels/mesh, 2 for trained.
-const TRAINED_SH_DEGREE = 0;
+const TRAINED_SH_DEGREE = 2;
 
 function makeViewer(view, shDegree = 0) {
 	return new GaussianSplats3D.Viewer({
@@ -1160,9 +1160,7 @@ async function meshLightingCfg() {
 		const c = current;
 		const s5 = await api.splatStage5Status(c.run, c.slot, c.model);
 		if (s5 && s5.status === "done" && s5.url) {
-			const doc = await fetch(api.absUrl(s5.url), {
-				cache: "no-store",
-			}).then((r) => r.json());
+			const doc = await fetch(api.absUrl(s5.url), { cache: "no-store" }).then((r) => r.json());
 			if (doc && doc.lighting) cfg = normalizeLighting(doc.lighting);
 		}
 	} catch {
@@ -1181,13 +1179,10 @@ async function enableMeshLighting() {
 	const cfg = await meshLightingCfg();
 	// The config fetch can await; bail if we left mesh mode / the viewer changed
 	// meanwhile, so we never strand ACES on the splat view.
-	if (meshLit || mode !== "mesh" || seq !== openSeq || !viewer || !meshGroup)
-		return;
+	if (meshLit || mode !== "mesh" || seq !== openSeq || !viewer || !meshGroup) return;
 	prevRenderState = applyMeshToneMapping(viewer.renderer);
 	if (!meshRig) {
-		meshRig = createLightRig(viewer.renderer, viewer.threeScene, {
-			defaults: cfg,
-		});
+		meshRig = createLightRig(viewer.renderer, viewer.threeScene, { defaults: cfg });
 	}
 	meshRig.setEnabled(true);
 	meshRig.refit(new THREE.Box3().setFromObject(meshGroup));
@@ -1199,8 +1194,7 @@ async function enableMeshLighting() {
 function disableMeshLighting() {
 	if (!meshLit) return;
 	meshRig?.setEnabled(false);
-	if (viewer && prevRenderState)
-		restoreToneMapping(viewer.renderer, prevRenderState);
+	if (viewer && prevRenderState) restoreToneMapping(viewer.renderer, prevRenderState);
 	prevRenderState = null;
 	meshLit = false;
 	viewer?.forceRenderNextFrame?.();
@@ -1623,32 +1617,6 @@ function buildControls(summary) {
 		el("span", { class: "svc-lab", text: "refs" }),
 		refsBtn,
 	);
-	// Reveal this cell's splat/ folder in the OS file browser (server-side open;
-	// the server runs on this machine).
-	const folderBtn = el("button", {
-		class: "splat-stage2-btn",
-		text: "reveal",
-		title: "open this cell's splat/ folder in your OS file browser (Explorer / Finder)",
-		onclick: async () => {
-			if (!current) return;
-			try {
-				const r = await api.splatReveal(
-					current.run,
-					current.slot,
-					current.model,
-				);
-				setStatus(`opened ${r.opened}`, "");
-			} catch (e) {
-				setStatus(`could not open folder: ${e.message}`, "#ff8080");
-			}
-		},
-	});
-	const folderRow = el(
-		"div",
-		{ class: "svc-row" },
-		el("span", { class: "svc-lab", text: "folder" }),
-		folderBtn,
-	);
 	// Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
 	const camRow = checkRow("cameras", "camera positions", false);
 	inputs.cameras.addEventListener("change", () =>
@@ -1752,7 +1720,6 @@ function buildControls(summary) {
 		voxPointsRow,
 		patchRow,
 		refsRow,
-		folderRow,
 		camRow,
 		camPlayRow,
 		camSpeedRow,

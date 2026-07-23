@@ -48,7 +48,7 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
-import { normalizeLighting, prepareLitScene, createLightRig } from "./splatlight.js";
+import { normalizeLighting, createLightRig } from "./splatlight.js";
 
 const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
 // The bake rig + lit PBR materials live in splatlight.js (shared with the debug
@@ -159,18 +159,130 @@ function rendererName(renderer) {
     return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : "unknown";
 }
 
-// Capture pipeline. Three passes per view:
-//   1. scene  → rtScene (RGBA16F + float depth): the LIT scene shaded in LINEAR
-//      light (no tone map / encode), so highlights stay HDR instead of clipping.
-//   2. present→ rtColor (RGBA8): a fullscreen pass applying a fixed ACES-filmic
-//      tone map + sRGB encode — the display colour the refs store and gsplat
-//      trains against. Alpha (accumulated coverage) passes through untouched.
-//   3. pack   → rtDepth (RG8): window-space depth → the contract's log-uint16
-//      codes (RG = lo/hi byte; 0 = background).
-// The tone map + encode are done in OUR OWN ShaderMaterial (whose output three
-// stores verbatim), NOT via three's render-target colour handling, so the stored
-// pixels are deterministic across three.js versions. `exposure` and `uLinear`
-// (curve-off, for the self-test's raw-value checks) parameterize the present pass.
+// --- glass: weighted-blended OIT (ported from scene3d.js) --------------------
+// A single alpha-blended pass is draw-order dependent and cannot show objects
+// behind concave / double-sided glass correctly (they go black); the board viewer
+// solves this with weighted-blended OIT, and the capture owns its render loop so
+// it runs the SAME multi-pass here for pixel-parity glass in the training refs.
+const OIT_LAYER = 1;
+const OIT_OPAQUE = 0.8; // α at/above which a transparent fragment is SOLID (writes depth)
+const oitPass = { value: 0 }; // 0 accumulate · 1 revealage · 2 depth pre-pass
+
+// ACES-filmic + sRGB (three.js' exact fit), shared by the present pass (opaque
+// scenes) and the OIT composite (glass scenes) so both store identical colour.
+const TONEMAP_GLSL = /* glsl */ `
+    vec3 acesFilmic(vec3 x) {
+        const mat3 inMat = mat3(
+            vec3(0.59719, 0.07600, 0.02840),
+            vec3(0.35458, 0.90834, 0.13383),
+            vec3(0.04823, 0.01566, 0.83777)
+        );
+        const mat3 outMat = mat3(
+            vec3( 1.60475, -0.10208, -0.00327),
+            vec3(-0.53108,  1.10813, -0.07276),
+            vec3(-0.07367, -0.00605,  1.07602)
+        );
+        x = inMat * x;
+        vec3 a = x * (x + 0.0245786) - 0.000090537;
+        vec3 b = x * (0.983729 * x + 0.4329510) + 0.238081;
+        x = a / b;
+        x = outMat * x;
+        return clamp(x, 0.0, 1.0);
+    }
+    vec3 linearToSrgb(vec3 c) {
+        c = clamp(c, 0.0, 1.0);
+        vec3 lo = c * 12.92;
+        vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
+        return mix(lo, hi, step(vec3(0.0031308), c));
+    }
+`;
+
+// Patch one transparent material for OIT: accumulate premultiplied colour × weight,
+// write coverage in the revealage pass, and write depth only where α ≥ OIT_OPAQUE
+// (frames/mullions stay solid, glass stays see-through). Verbatim from scene3d.js's
+// patchMaterialOIT so the two renderers agree fragment-for-fragment.
+function patchMaterialOIT(m) {
+    if (m.userData.__oitPatched) return;
+    m.userData.__oitPatched = true;
+    m.transparent = true;
+    m.depthWrite = false;
+    m.depthTest = true;
+    m.blending = THREE.CustomBlending;
+    m.blendEquation = THREE.AddEquation;
+    m.blendEquationAlpha = THREE.AddEquation;
+    const prev = m.onBeforeCompile;
+    m.onBeforeCompile = (shader, rndr) => {
+        if (prev) prev(shader, rndr);
+        shader.uniforms.uOITPass = oitPass;
+        shader.fragmentShader = shader.fragmentShader
+            .replace(
+                "#include <common>",
+                "#include <common>\nuniform float uOITPass;",
+            )
+            .replace(
+                "#include <dithering_fragment>",
+                `#include <dithering_fragment>
+                float _a = gl_FragColor.a;
+                if (uOITPass > 1.5) { if (_a < ${OIT_OPAQUE}) discard; }
+                else {
+                    float _ac = _a >= ${OIT_OPAQUE} ? 1.0 : _a;
+                    if (uOITPass < 0.5) {
+                        float _w = clamp(pow(min(1.0, _ac * 10.0) + 0.01, 3.0) * 1e8 * pow(1.0 - gl_FragCoord.z * 0.9, 3.0), 1e-2, 3e3);
+                        gl_FragColor = vec4(gl_FragColor.rgb * _ac * _w, _ac * _w);
+                    } else {
+                        gl_FragColor = vec4(_ac);
+                    }
+                }`,
+            );
+    };
+    const prevKey = m.customProgramCacheKey?.bind(m);
+    m.customProgramCacheKey = () => "oit1|" + (prevKey ? prevKey() : "");
+    m.needsUpdate = true;
+}
+
+// accum: additive (ONE, ONE); revealage: dst *= (1 − srcAlpha).
+function setOITBlend(m, accum) {
+    m.blendSrc = accum ? THREE.OneFactor : THREE.ZeroFactor;
+    m.blendDst = accum ? THREE.OneFactor : THREE.OneMinusSrcAlphaFactor;
+    m.blendSrcAlpha = m.blendSrc;
+    m.blendDstAlpha = m.blendDst;
+}
+
+// In-place lit-scene prep (the OIT twin of splatlight.prepareLitScene): generate
+// missing normals, cast/receive shadows, force DoubleSide with back-face shadowing
+// (Trellis winding is unreliable), and route transparent meshes onto the OIT layer
+// with the weighted-blend patch. PBR maps are kept whole, so metals/glossies still
+// reflect per view; opaque materials keep their default depth write.
+function prepareCaptureScene(root) {
+    root.traverse((child) => {
+        if (!child.isMesh || !child.material) return;
+        if (child.geometry && !child.geometry.getAttribute("normal")) {
+            child.geometry.computeVertexNormals();
+        }
+        child.castShadow = true;
+        child.receiveShadow = true;
+        const mats = Array.isArray(child.material) ? child.material : [child.material];
+        let oit = false;
+        for (const m of mats) {
+            m.side = THREE.DoubleSide;
+            m.shadowSide = THREE.BackSide;
+            if (m.transparent) oit = true;
+        }
+        if (oit) {
+            for (const m of mats) patchMaterialOIT(m);
+            child.layers.set(OIT_LAYER);
+            child.userData.__oit = true;
+        }
+    });
+}
+
+// Capture pipeline, per view: shade the lit scene in LINEAR HDR, then tone-map +
+// sRGB-encode in our OWN ShaderMaterial (deterministic across three.js versions)
+// → rtColor (RGBA8), and pack window-space depth → rtDepth (RG8 log-uint16 codes).
+// Opaque scenes take one scene pass + present; scenes with transparent meshes run
+// weighted-blended OIT (renderOIT) so glass composites order-independently, and the
+// composite emits the same ACES+sRGB colour plus the accumulated coverage in alpha.
+// `exposure` and `uLinear` (curve-off, for the self-test) parameterize the present.
 function createCapture(renderer, resolution, near, far, fovDeg, background, exposure = 1.0) {
     const depthTexture = new THREE.DepthTexture(resolution, resolution);
     depthTexture.type = THREE.FloatType;
@@ -232,30 +344,7 @@ function createCapture(renderer, resolution, near, far, fovDeg, background, expo
             uniform float uExposure;
             uniform bool uLinear;
             varying vec2 vUv;
-            vec3 acesFilmic(vec3 x) {
-                const mat3 inMat = mat3(
-                    vec3(0.59719, 0.07600, 0.02840),
-                    vec3(0.35458, 0.90834, 0.13383),
-                    vec3(0.04823, 0.01566, 0.83777)
-                );
-                const mat3 outMat = mat3(
-                    vec3( 1.60475, -0.10208, -0.00327),
-                    vec3(-0.53108,  1.10813, -0.07276),
-                    vec3(-0.07367, -0.00605,  1.07602)
-                );
-                x = inMat * x;
-                vec3 a = x * (x + 0.0245786) - 0.000090537;
-                vec3 b = x * (0.983729 * x + 0.4329510) + 0.238081;
-                x = a / b;
-                x = outMat * x;
-                return clamp(x, 0.0, 1.0);
-            }
-            vec3 linearToSrgb(vec3 c) {
-                c = clamp(c, 0.0, 1.0);
-                vec3 lo = c * 12.92;
-                vec3 hi = 1.055 * pow(c, vec3(1.0 / 2.4)) - 0.055;
-                return mix(lo, hi, step(vec3(0.0031308), c));
-            }
+            ${TONEMAP_GLSL}
             void main() {
                 vec4 s = texture2D(tScene, vUv);
                 if (uLinear) {
@@ -323,12 +412,122 @@ function createCapture(renderer, resolution, near, far, fovDeg, background, expo
         scene.add(tri);
         return scene;
     }
+    // OIT composite (glass scenes): resolve accumulate/revealage over the opaque
+    // image in LINEAR, then ACES + sRGB exactly like the present pass. Alpha
+    // carries the accumulated coverage 1 − Π(1−αᵢ) — 1 behind any opaque surface,
+    // the pane's own coverage over empty space — the mask gsplat trains against.
+    const compositeMaterial = new THREE.ShaderMaterial({
+        uniforms: {
+            uOpaque: { value: rtScene.texture },
+            uAccum: { value: null },
+            uReveal: { value: null },
+            uExposure: { value: exposure },
+        },
+        vertexShader: fullscreenVS,
+        fragmentShader: /* glsl */ `
+            precision highp float;
+            uniform sampler2D uOpaque;
+            uniform sampler2D uAccum;
+            uniform sampler2D uReveal;
+            uniform float uExposure;
+            varying vec2 vUv;
+            ${TONEMAP_GLSL}
+            void main() {
+                vec4 accum = texture2D(uAccum, vUv);
+                float reveal = texture2D(uReveal, vUv).r;
+                vec4 op = texture2D(uOpaque, vUv);
+                vec3 oit = accum.rgb / max(accum.a, 1e-5);
+                vec3 lin = mix(oit, op.rgb, reveal);
+                float coverage = 1.0 - reveal * (1.0 - op.a);
+                gl_FragColor = vec4(linearToSrgb(acesFilmic(lin * uExposure)), coverage);
+            }
+        `,
+        depthTest: false,
+        depthWrite: false,
+    });
+
     const presentScene = fullscreenScene(presentMaterial);
     const packScene = fullscreenScene(packMaterial);
+    const compositeScene = fullscreenScene(compositeMaterial);
     const fsCamera = new THREE.Camera();
 
     const camera = new THREE.PerspectiveCamera(fovDeg, 1, near, far);
     const bg = new THREE.Color(background[0], background[1], background[2]);
+
+    // Accumulate + revealage targets, created on first glass use so opaque-only
+    // scenes never allocate them. Both SHARE rtScene's depth texture: the opaque
+    // pass and the α≥OIT_OPAQUE depth pre-pass fill it, and glass is depth-tested
+    // against it so a pane never occludes the room behind it (its depth stays the
+    // opaque surface's, matching the stage-5 depth contract).
+    let accumTarget = null;
+    let revealTarget = null;
+    function ensureOITTargets() {
+        if (accumTarget) return;
+        const opts = { ...targetOpts, type: THREE.HalfFloatType, depthBuffer: true, depthTexture };
+        accumTarget = new THREE.WebGLRenderTarget(resolution, resolution, opts);
+        revealTarget = new THREE.WebGLRenderTarget(resolution, resolution, opts);
+        compositeMaterial.uniforms.uAccum.value = accumTarget.texture;
+        compositeMaterial.uniforms.uReveal.value = revealTarget.texture;
+    }
+
+    // The scene's transparent materials, gathered once (the scene is static per
+    // capture). Empty → opaque scene → renderView takes the single-pass fast path
+    // (byte-identical to the pre-OIT pipeline).
+    let oitMats = null;
+    function collectOIT(scene) {
+        const mats = [];
+        scene.traverse((o) => {
+            if (!o.userData.__oit || !o.material) return;
+            if (Array.isArray(o.material)) mats.push(...o.material);
+            else mats.push(o.material);
+        });
+        return mats;
+    }
+
+    // Weighted-blended OIT for a glass scene, mirroring scene3d.js renderFrame:
+    // opaque (layer 0) → rtScene, then three glass-only sub-passes (layer 1) — depth
+    // pre-pass, accumulate, revealage — composited to rtColor. The shadow map stays
+    // static (renderer.shadowMap.autoUpdate is off), so it is built once.
+    function renderOIT(scene) {
+        ensureOITTargets();
+        // opaque → rtScene: linear colour + the depth glass tests against.
+        camera.layers.set(0);
+        renderer.autoClear = true;
+        renderer.setClearColor(bg, 0);
+        renderer.setRenderTarget(rtScene);
+        renderer.render(scene, camera);
+        // glass sub-passes (layer 1); keep the opaque colour/depth (no auto-clear).
+        renderer.autoClear = false;
+        camera.layers.set(OIT_LAYER);
+        oitPass.value = 2; // depth pre-pass: α≥OIT_OPAQUE writes depth, no colour
+        for (const m of oitMats) {
+            m.depthWrite = true;
+            m.colorWrite = false;
+        }
+        renderer.setRenderTarget(accumTarget);
+        renderer.render(scene, camera);
+        oitPass.value = 0; // accumulate (additive), depth-tested, no depth write
+        for (const m of oitMats) {
+            m.depthWrite = false;
+            m.colorWrite = true;
+            setOITBlend(m, true);
+        }
+        renderer.setRenderTarget(accumTarget);
+        renderer.setClearColor(0x000000, 0);
+        renderer.clear(true, false, false);
+        renderer.render(scene, camera);
+        oitPass.value = 1; // revealage: dst *= (1 − α)
+        for (const m of oitMats) setOITBlend(m, false);
+        renderer.setRenderTarget(revealTarget);
+        renderer.setClearColor(0xffffff, 1);
+        renderer.clear(true, false, false);
+        renderer.render(scene, camera);
+        // composite over opaque → rtColor (ACES + sRGB + coverage alpha).
+        camera.layers.set(0);
+        renderer.autoClear = true;
+        renderer.setRenderTarget(rtColor);
+        renderer.render(compositeScene, fsCamera);
+    }
 
     const lookTarget = new THREE.Vector3();
     function renderView(scene, pos, face) {
@@ -338,11 +537,17 @@ function createCapture(renderer, resolution, near, far, fovDeg, background, expo
             .set(face.forward[0], face.forward[1], face.forward[2])
             .add(camera.position);
         camera.lookAt(lookTarget);
-        renderer.setClearColor(bg, 0); // alpha 0 = empty coverage
-        renderer.setRenderTarget(rtScene);
-        renderer.render(scene, camera); // lit, linear HDR + depth
-        renderer.setRenderTarget(rtColor);
-        renderer.render(presentScene, fsCamera); // ACES + sRGB → 8-bit
+        if (oitMats === null) oitMats = collectOIT(scene);
+        if (oitMats.length === 0) {
+            // Opaque scene: one lit pass → present. Unchanged fast path.
+            renderer.setClearColor(bg, 0); // alpha 0 = empty coverage
+            renderer.setRenderTarget(rtScene);
+            renderer.render(scene, camera); // lit, linear HDR + depth
+            renderer.setRenderTarget(rtColor);
+            renderer.render(presentScene, fsCamera); // ACES + sRGB → 8-bit
+        } else {
+            renderOIT(scene);
+        }
         renderer.setRenderTarget(rtDepth);
         renderer.render(packScene, fsCamera); // depth → log-u16 codes
     }
@@ -512,7 +717,7 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
-                prepareLitScene(gltf.scene);
+                prepareCaptureScene(gltf.scene);
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
