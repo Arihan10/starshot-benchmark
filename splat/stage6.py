@@ -234,24 +234,28 @@ class TrainParams:
     refine_start_iter: int = 500
     refine_stop_iter: int | None = None  # None → int(iterations * 0.5) at runtime
     refine_every: int = 100
-    # Periodic opacity resets at the REFERENCE cadence (3DGS paper / gsplat
-    # default: every 3000): clamp every opacity to 2·prune_opa and zero its Adam
-    # moments, so Gaussians the images actually need re-earn visibility while
-    # junk (floaters, redundant occluded copies) never recovers and is pruned —
-    # the standard anti-floater purge. Re-enabled with the COLMAP point-cloud
-    # init: opacity is a free parameter again (uniform logit(init_opa)), not the
-    # mesh-true material data the old surfel init had to protect. Written in
-    # VIEW-DRAWS like every other cadence (resolve_schedule divides by `batch`);
-    # fires only inside the refine window, exactly like upstream; 0 disables.
-    #
-    # UPSTREAM NOTE (verified 2026-07): the pinned gsplat 1.5.3 wheel's own
-    # trigger is dead code — `step % reset_every == 0 & step > 0` parses as
-    # `… and (0 > 0)`, always False — and 1.5.3 is still the NEWEST release on
-    # the wheel index, PyPI, and GitHub; the `and` fix exists only on unreleased
-    # main. So _train_one fires gsplat's `reset_opa` op itself under main's
-    # exact fixed condition. When a fixed release ships, bump the pin and delete
-    # that block (both firing at the same step would be a harmless no-op).
-    reset_every: int = 3000
+    # Periodic opacity resets (the reference 3DGS/2DGS floater purge: clamp every
+    # opacity to 2·prune_opa + zero its Adam moments, so only image-justified
+    # Gaussians re-earn visibility) — DISABLED by default, deliberately:
+    #   * The cadence is draw-denominated, so passes-between-resets =
+    #     reset_every / n_views. Our plans carry THOUSANDS of views (swamp-land:
+    #     4212 → a reset every 0.71 passes at the reference 3000), so the clamp
+    #     outruns recovery and ships a half-transparent scene — measured on the
+    #     2026-07-23 runs (hotel 24.5 dB, swamp healed to 9.7k splats, vs the
+    #     old loop's 33 dB). Raising epochs does NOT fix this: the spacing is
+    #     set by view count alone; longer runs just reset more often.
+    #   * This pipeline doesn't need the amnesty cycle to kill floaters: Stage 7
+    #     settles them GEOMETRICALLY — the Stage-3 cloud sits exactly on the
+    #     true mesh surfaces, so heal's `surface_max_dist` cull deletes airborne
+    #     Gaussians decidably, and its measured-contribution cull + opacity
+    #     prune handle near-surface haze.
+    # Setting a value > 0 re-enables the reference behavior for reference-shaped
+    # runs (hundreds of views × tens of passes): view-draw units like every
+    # other cadence (resolve_schedule divides by `batch`), firing only inside
+    # the refine window via the in-loop reset in _train_one — the pinned gsplat
+    # 1.5.3 wheel's own trigger is dead code (`== 0 & step` precedence bug;
+    # 1.5.3 is still the newest release everywhere, the fix unreleased on main).
+    reset_every: int = 0
     # Mean (non-absolute) 2D-gradient split threshold — gsplat's default value.
     # AbsGS (absgrad) is deliberately NOT used: in the pinned gsplat 1.5.3 the
     # 2DGS backward attaches `.absgrad` to `means2d`, but DefaultStrategy densifies
@@ -1770,6 +1774,11 @@ def train_splat(
     )
     # No LOD ladder here: trained.ply is the RAW model. The delivered LODs are
     # built on the cleaned model in Stage 7 (`heal_splat` → healed.lodK.ply).
+    # Drop any stale trained.lod*.ply an older (LOD-exporting) run left beside
+    # this path — a fresh trained.ply must never ship next to giant stale
+    # ladders (a 2M-vertex leftover sat beside swamp-land's 84k rewrite).
+    for old in out_path.parent.glob(f"{out_path.stem}.lod*.ply"):
+        old.unlink(missing_ok=True)
     lod_summary = None
 
     # Training finished + the final splat is on disk → the checkpoints (and any

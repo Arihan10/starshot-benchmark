@@ -2622,6 +2622,18 @@ async def _run_splat_modal_cell(
             # on-demand frame proxy, not a bulk download).
             if hb_stage in ("train", "done"):
                 job["refs_ready"] = True
+            # Stage 6 done → trained.ply is committed on the Volume (the
+            # heartbeat only advances to "heal" after the train stage's
+            # boundary commit). Pull it NOW so the raw model is viewable while
+            # stage 7 heals — with heal in the job window, waiting for the
+            # final pull would hold the trained view hostage to healing.
+            # Guarded once; the final pull re-syncs (same-size skip = cheap).
+            if not job.get("trained_pulled") and hb_stage in ("heal", "done"):
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(splat_modal.pull_cell, cell_dir, True, True)
+                    if _trained_path(run, slot, model).is_file():
+                        job["trained_pulled"] = True
+                        job["msg"] = "trained.ply ready — healing continues remotely"
             # Pull the mid-run debug sample PNGs while stage 5 renders (a handful
             # of small files; cheap + idempotent) so the picture-taking is
             # inspectable live. Stop once we have the full set or stage 5 is past.
@@ -2709,12 +2721,13 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
     """Re-hook the server to a Modal train a PREVIOUS process spawned — the
     sticky hook that survives a restart. The call id persists in the cell's
     `splat/modal-job.json`, so we can query the live state without re-spawning.
-    Idempotent: a no-op if the cell is already tracked, has no job record, or the
-    trained splat is already local. If the recorded call is still RUNNING, the
-    in-memory job + streaming supervisor are rebuilt (skipping push/spawn, so no
-    duplicate container); if it finished while the server was down, `trained.ply`
-    is pulled so the viewer lights up. Returns True when a live job is now
-    tracked."""
+    Idempotent: a no-op if the cell is already tracked, has no job record, or
+    the job's DELIVERED splat (healed.ply when stage 7 is in the recorded
+    window, else trained.ply) is already local. If the recorded call is still
+    RUNNING, the in-memory job + streaming supervisor are rebuilt (skipping
+    push/spawn, so no duplicate container); if it finished while the server
+    was down, the artifacts are pulled so the viewer lights up. Returns True
+    when a live job is now tracked."""
     if splat_modal is None:
         return False
     key = (run, slot, model)
@@ -2727,20 +2740,28 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
     job_file = splat_modal._job_path(cell_dir)
     if not job_file.is_file():
         return False  # nothing was ever spawned for this cell
-    # Skip ONLY when the local trained.ply already corresponds to THIS job record
-    # (or a newer run) — compare its mtime to the record's spawn time. A stale
-    # trained.ply from an EARLIER run must never suppress reattaching the job the
-    # record now points at: that orphaned every live A100 train across a restart
-    # for any cell that had ever finished a prior run (the reported bug).
-    trained = _trained_path(run, slot, model)
-    if trained.is_file():
-        try:
-            rec = json.loads(job_file.read_text(encoding="utf-8"))
-            spawned = datetime.fromisoformat(rec["spawned_at"]).timestamp()
-        except Exception:
-            spawned = float("inf")  # unparseable record → don't trust the result; probe
-        if trained.stat().st_mtime >= spawned:
-            return False  # result is from this (or a later) run — nothing to recover
+    # Skip ONLY when this job's DELIVERED artifact is already local and newer
+    # than the record's spawn time. The delivered artifact depends on the
+    # recorded stage window: healed.ply once stage 7 is in it, else
+    # trained.ply. trained.ply alone must NOT suppress reattach — it lands
+    # MID-RUN now (the progressive pull during stage-7 healing, or a manual
+    # download), and treating it as the end state orphaned the running heal
+    # across a restart: healed.ply would never be pulled. A stale artifact
+    # from an EARLIER run must never suppress reattach either — hence the
+    # mtime-vs-spawn comparison.
+    rec: dict[str, Any] | None = None
+    try:
+        rec = json.loads(job_file.read_text(encoding="utf-8"))
+        spawned = datetime.fromisoformat(rec["spawned_at"]).timestamp()
+    except Exception:
+        spawned = float("inf")  # unparseable record → don't trust the result; probe
+    stages = list(((rec or {}).get("spec") or {}).get("stages") or _MODAL_STAGES)
+    final = (
+        _healed_path(run, slot, model) if 7 in stages
+        else _trained_path(run, slot, model)
+    )
+    if final.is_file() and final.stat().st_mtime >= spawned:
+        return False  # result is from this (or a later) run — nothing to recover
     _splat_modal_reattaching.add(key)
     try:
         try:

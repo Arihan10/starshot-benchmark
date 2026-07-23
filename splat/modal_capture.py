@@ -539,7 +539,7 @@ def capture_refs(
             )
 
     # Deterministic from the plan alone (mirrors the server's finalize).
-    K = stage5.intrinsics_matrix(int(intr["resolution"]), float(intr["face_fov_deg"]))
+    K = stage5.intrinsics_matrix(int(intr["resolution"]), float(intr["fov_deg"]))
     stage5.write_transforms(
         refs_dir, K, int(intr["resolution"]),
         float(intr["near"]), float(intr["far"]),

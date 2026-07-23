@@ -103,9 +103,22 @@ _STATION_MAX = 4
 # Stations must be able to stand somewhere at least this clear.
 _STATION_MIN_CLEAR = 0.45
 
-# Shell (root establishing orbit): radius × the scene diagonal, and the floor
-# fraction of scene height below which shell positions are culled (no
-# under-terrain / under-floor backface views).
+# Shell (root establishing orbit): positions are Fibonacci directions
+# projected onto the scene AABB inflated by a PER-AXIS standoff — the shell
+# adapts to the scene's shape (a flat platformer gets broad-side coverage at
+# a sane distance instead of a sphere at its 110 m diagonal). The standoff
+# is 0.6× the axis's own half-extent, floored by BOTH an absolute minimum
+# (must exceed the Stage-2 grid margin, 1.5 m default, so every position is
+# provably outside the grid — open air, no filters needed) and a fraction of
+# the LARGEST half-extent: a thin axis still needs establishing range — a
+# camera 3 m off a 110 m level's broad face frames a ~4% sliver and the
+# level-scale supervision the shell exists for disappears (measured: the
+# platformer's unseen jumped 0.85%→5.7% without this floor).
+# `_SHELL_RADIUS_MULT` survives only in the far-plane bound. Below-floor
+# positions are culled (no under-terrain backface views).
+_SHELL_STANDOFF_FRAC = 0.6
+_SHELL_STANDOFF_MAXAXIS_FRAC = 0.3
+_SHELL_STANDOFF_MIN = 3.0
 _SHELL_RADIUS_MULT = 0.9
 _SHELL_FLOOR_FRAC = 0.05
 
@@ -518,15 +531,25 @@ def _station_views(
 def _shell_cameras(
     lo: np.ndarray, hi: np.ndarray, params: PlanParams
 ) -> tuple[np.ndarray, np.ndarray]:
-    """The root establishing shell: inward-aimed Fibonacci positions on a
-    sphere at `_SHELL_RADIUS_MULT` × the scene diagonal, culled below the
-    scene's floor plane (no under-terrain backface views). Positions are
-    outside the Stage-2 grid — provably open air, no filters needed."""
+    """The root establishing shell, SHAPE-ADAPTIVE: Fibonacci directions from
+    the scene centre projected onto the scene AABB inflated by a per-axis
+    standoff (constants block), so every face is orbited at a standoff
+    proportional to its own extent — not at the whole-scene diagonal. Each
+    position lies ON a face of the inflated box, i.e. beyond the grid margin
+    on its exit axis: provably open air, no validity filters needed. Aims at
+    Halton-jittered targets spread over the scene's middle (× its shape), so
+    elongated scenes get sectional establishing shots along their length.
+    Below-floor positions are culled (no under-terrain backface views)."""
     center = (lo + hi) / 2.0
-    diag = float(np.linalg.norm(hi - lo))
-    radius = max(_SHELL_RADIUS_MULT * diag, 1.0)
+    half = np.maximum((hi - lo) / 2.0, 1e-6)
+    standoff = np.maximum(
+        _SHELL_STANDOFF_FRAC * half,
+        max(_SHELL_STANDOFF_MAXAXIS_FRAC * float(half.max()), _SHELL_STANDOFF_MIN),
+    )
+    box = half + standoff
     dirs = _fib_sphere(max(params.shell_views * 2, 8))  # oversample: floor cull
-    pos = center + dirs * radius
+    t = (box / np.maximum(np.abs(dirs), 1e-9)).min(axis=1)  # ray-box exit
+    pos = center + dirs * t[:, None]
     floor_y = lo[1] + _SHELL_FLOOR_FRAC * max(hi[1] - lo[1], 1e-6)
     pos = pos[pos[:, 1] >= floor_y]
     if len(pos) > params.shell_views:
@@ -536,7 +559,8 @@ def _shell_cameras(
             np.linspace(0, len(pos) - 1, params.shell_views).astype(np.int64)
         )
         pos = pos[sel]
-    fwd = center - pos
+    jitter = (_halton3(len(pos), start=911) - 0.5) * (0.7 * half)
+    fwd = (center + jitter) - pos
     fwd /= np.linalg.norm(fwd, axis=1, keepdims=True)
     return pos, fwd
 
