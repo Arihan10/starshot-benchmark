@@ -1,7 +1,7 @@
 """Stage 6 — Splat fine-tune (the training run) via gsplat 2DGS.
 
 Takes the **Stage-3 surfel cloud** (`cloud.ply`) as the initialization and
-optimizes it against the **Stage-5 matte-lit reference renders** (`refs/` — per-view
+optimizes it against the **Stage-5 lit reference renders** (`refs/` — per-view
 RGB + depth + alpha + exact OpenCV poses in `transforms.json`) into an optimized
 2DGS splat (`trained.ply`). This is where the raw mesh-sampled surfels become a
 clean, crisp splat: densification adds Gaussians where the render disagrees with
@@ -31,12 +31,14 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     transmittance-0.5 crossing) is cleaner at silhouettes and never fades BLEND
     glass (α ≈ 0.065 stays below the crossing), but is blind to those floaters —
     reserve it for genuinely glass-heavy scenes.
-  * Colour: flat per-Gaussian sRGB — the SH degree-0 DC term ONLY — compared
-    directly against the matte, view-independent references (no sRGB->linear).
-    View-dependent colour (spherical harmonics degree > 0) is deliberately NOT
-    used: the capture bakes view-independent lighting, so one flat colour per
-    Gaussian reproduces it exactly, and higher-order SH only smeared the moving
-    reflections that lighting mode already removed.
+  * Colour: spherical harmonics to degree 3 (PostShot's default) — a per-Gaussian
+    DC term (`sh0`) plus 15 higher-order RGB coefficients (`shN`) — compared
+    directly against the LIT references (no sRGB->linear). The Stage-5 capture
+    renders view-DEPENDENT PBR (per-view specular + reflections), so higher-order
+    SH reconstructs those moving highlights as f(view direction) instead of
+    averaging them into one flat colour; the active degree warms up 0→3 over
+    training (`sh_degree` / `sh_degree_interval`). Set `sh_degree=0` for the old
+    flat / view-independent model.
 
 LOSSES (per view):
   * photometric — full-frame L1 + D-SSIM on RGB vs the reference. Both
@@ -203,12 +205,30 @@ class TrainParams:
     normal_start_iter: int = 2000      # let geometry settle before the regularizers bite
     dist_start_iter: int = 1000
 
-    # Learning rates (means_lr is × scene_scale at runtime).
+    # Learning rates (means_lr is × scene_scale at runtime). sh0_lr is the SH DC
+    # (base-colour) LR (INRIA `feature_lr`); shN_lr is the higher-order SH LR at
+    # 1/20 of it (INRIA `feature_lr / 20`) — the standard 3DGS split PostShot's
+    # lineage follows, so the view-dependent bands move slowly and don't fight the
+    # DC colour early on.
     means_lr: float = 1.6e-4
     scales_lr: float = 5e-3
     quats_lr: float = 1e-3
     opacities_lr: float = 5e-2
     sh0_lr: float = 2.5e-3
+    shN_lr: float = 1.25e-4
+
+    # Spherical harmonics (view-dependent colour). Mirrors PostShot's "Max Sph.
+    # Hrm. Degree" (default 3): each Gaussian carries (sh_degree+1)²−1 higher-order
+    # RGB coefficients (15 at degree 3) on top of the DC term, so the specular
+    # highlights + reflections the LIT Stage-5 capture bakes per view are
+    # reconstructed as f(view direction) instead of averaged into one flat colour.
+    # The ACTIVE degree WARMS UP from 0, +1 every `sh_degree_interval` image-draws
+    # (INRIA/3DGS schedule — the interval is written at batch-1 and divided by
+    # `batch` in `resolve_schedule`, like the other cadences), so geometry settles
+    # before the view-dependent bands switch on. sh_degree=0 = flat model (the old
+    # view-independent behaviour), degree 3 = PostShot's default.
+    sh_degree: int = 3
+    sh_degree_interval: int = 1000
 
     # Densification (gsplat DefaultStrategy, 2DGS gradient key).
     refine: bool = True
@@ -429,6 +449,7 @@ class TrainParams:
             normal_start_iter=per_batch(self.normal_start_iter),
             dist_start_iter=per_batch(self.dist_start_iter),
             aa_every=per_batch(self.aa_every),
+            sh_degree_interval=per_batch(self.sh_degree_interval),
             ckpt_every=(0 if self.ckpt_every == 0 else per_batch(self.ckpt_every)),
         )
 
@@ -460,6 +481,9 @@ class TrainParams:
             "vram_min_free_gb": self.vram_min_free_gb,
             "antialias": self.antialias,
             "aa_min_scale_px": self.aa_min_scale_px,
+            "sh_degree": self.sh_degree,
+            "sh_degree_interval": self.sh_degree_interval,
+            "shN_lr": self.shN_lr,
             "depth_densify": self.depth_densify,
             "depth_densify_every": self.depth_densify_every,
             "depth_densify_max": self.depth_densify_max,
@@ -474,11 +498,12 @@ class TrainParams:
 
 
 def _load_cloud(path: Path) -> dict[str, np.ndarray]:
-    """Parse a Stage-3 binary-little-endian float `.ply` into gsplat 2DGS init
-    arrays: means [N,3], quats [N,4] (wxyz), opacities [N] (logit), sh0 [N,1,3]
-    (SH0 DC colour coeffs), scales [N,3] (log; a synthesized third axis when the
-    cloud is the 2-scale 2DGS format). The splat is flat (degree-0); any stray
-    `f_rest_*` from a legacy view-dependent .ply is ignored."""
+    """Parse a binary-little-endian float `.ply` into gsplat 2DGS init arrays:
+    means [N,3], quats [N,4] (wxyz), opacities [N] (logit), sh0 [N,1,3] (SH DC
+    colour coeffs), shN [N,15,3] (the degree-1..3 view-dependent coeffs decoded
+    from `f_rest_*`, always degree-3-sized; zeros for a degree-0 cloud like the
+    Stage-3 init, so the SH-degree warmup grows them from flat), scales [N,3]
+    (log; a synthesized third axis when the cloud is the 2-scale 2DGS format)."""
     raw = Path(path).read_bytes()
     marker = b"end_header\n"
     cut = raw.find(marker)
@@ -517,6 +542,19 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
     quats = stack("rot_0", "rot_1", "rot_2", "rot_3")
     opacities = col["opacity"].astype(np.float32)
     sh0 = stack("f_dc_0", "f_dc_1", "f_dc_2").reshape(-1, 1, 3)
+    # Higher-order SH → shN [N,15,3] (degree-3 storage). A trained/degree-3 .ply
+    # carries `f_rest_0..44` in INRIA channel-major order (all K coeffs of R, then
+    # G, then B): reshape [N,3,K] then transpose to gsplat's coeff-major [N,K,3].
+    # A degree-0 cloud (the Stage-3 init) has none → shN stays zero.
+    rest = sorted(
+        (n for n in col if n.startswith("f_rest_")),
+        key=lambda s: int(s.rsplit("_", 1)[-1]),
+    )
+    shN = np.zeros((count, 15, 3), dtype=np.float32)
+    if rest:
+        flat = np.stack([col[n] for n in rest], axis=1).astype(np.float32)  # [N, 3K]
+        k = min(flat.shape[1] // 3, 15)
+        shN[:, :k, :] = flat[:, : 3 * k].reshape(count, 3, k).transpose(0, 2, 1)
     if "scale_2" in col:
         scales = stack("scale_0", "scale_1", "scale_2")
     else:
@@ -529,7 +567,14 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
         two = stack("scale_0", "scale_1")
         third = (two.min(axis=1, keepdims=True) + np.log(0.01)).astype(np.float32)
         scales = np.concatenate([two, third], axis=1)
-    return {"means": means, "quats": quats, "opacities": opacities, "sh0": sh0, "scales": scales}
+    return {
+        "means": means,
+        "quats": quats,
+        "opacities": opacities,
+        "sh0": sh0,
+        "shN": shN,
+        "scales": scales,
+    }
 
 
 def _load_rgb(path: Path) -> np.ndarray:
@@ -606,19 +651,32 @@ def _encode_trained_ply(
     opacity: np.ndarray,
     scales2: np.ndarray,
     out_path: Path,
+    sh_rest: np.ndarray | None = None,
 ) -> None:
     """Write the trained model as a Stage-3-compatible 2DGS `.ply` (two tangent
     log-scales). Values are stored raw (opacity as logit, scales as log, colour as
-    `f_dc`) exactly as the viewers/Stage 7 expect. The splat is flat (degree-0):
-    only the SH0 DC colour (`f_dc`) is written — never any `f_rest_*` view-
-    dependent coefficients — so every reader (the web viewer, the SOG encoder, the
-    compressor) shows one colour per Gaussian."""
+    `f_dc`) exactly as the viewers/Stage 7 expect. The DC colour (`f_dc`) is always
+    written; when `sh_rest` (gsplat coeff-major degree-1..3 coeffs [N,K,3]) is
+    given and non-empty its K·3 `f_rest_*` view-dependent coefficients are written
+    too, in INRIA channel-major order (all K coeffs of R, then G, then B) between
+    `f_dc` and `opacity`, so the SOG encoder / PlayCanvas viewer reconstruct
+    view-dependent colour. `sh_rest=None` writes a flat degree-0 model (e.g. the
+    LOD ladder), readable identically by every consumer."""
     n = means.shape[0]
     normals = _quats_to_normals(quats)
     cols = [
         means[:, 0], means[:, 1], means[:, 2],
         normals[:, 0], normals[:, 1], normals[:, 2],
         f_dc[:, 0], f_dc[:, 1], f_dc[:, 2],
+    ]
+    rest_props = ""
+    if sh_rest is not None and np.asarray(sh_rest).shape[1] > 0:
+        rest = np.ascontiguousarray(
+            np.asarray(sh_rest, dtype=np.float32).transpose(0, 2, 1).reshape(n, -1)
+        )
+        cols.extend(rest[:, j] for j in range(rest.shape[1]))
+        rest_props = "".join(f"property float f_rest_{j}\n" for j in range(rest.shape[1]))
+    cols += [
         opacity,
         scales2[:, 0], scales2[:, 1],
         quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3],
@@ -631,7 +689,8 @@ def _encode_trained_ply(
         "property float x\n" "property float y\n" "property float z\n"
         "property float nx\n" "property float ny\n" "property float nz\n"
         "property float f_dc_0\n" "property float f_dc_1\n" "property float f_dc_2\n"
-        "property float opacity\n"
+        + rest_props
+        + "property float opacity\n"
         "property float scale_0\n" "property float scale_1\n"
         "property float rot_0\n" "property float rot_1\n"
         "property float rot_2\n" "property float rot_3\n"
@@ -698,15 +757,18 @@ def _read_transforms(refs_dir: Path) -> dict[str, Any]:
     return json.loads(tp.read_text(encoding="utf-8"))
 
 
-def _render_inputs(torch, splats):  # noqa: ANN001
-    """SH0 colour coefficients [N,1,3] + SH degree (always 0) for
-    `rasterization_2dgs`. The splat is flat / view-independent — only the DC term
-    exists — rendered via gsplat's SH path at degree 0, the one combination that
-    also produces depth correctly here: gsplat's packed SH branch mis-broadcasts,
-    and its precomputed-colour path never gathers colours to the visible subset,
-    so both crash on RGB+ED once a view sees only part of the cloud (nnz < N).
-    gsplat applies the +0.5 offset, matching Stage-3's f_dc."""
-    return splats["sh0"], 0
+def _render_inputs(torch, splats, sh_degree):  # noqa: ANN001
+    """SH coefficients [N,16,3] + the ACTIVE `sh_degree` for `rasterization_2dgs`.
+    Concatenates the DC term (`sh0` [N,1,3]) with the higher-order bands (`shN`
+    [N,15,3]) so gsplat evaluates colour as f(view direction) up to the active
+    degree — the SH-degree warmup passes a degree below the stored 3 early on, and
+    gsplat uses only the first (degree+1)² bands (higher bands keep zero gradient
+    until unlocked). Rendered via gsplat's NON-PACKED SH path: its packed SH branch
+    mis-broadcasts and its precomputed-colour path never gathers colours to the
+    visible subset, so both crash on RGB+ED once a view sees only part of the cloud
+    (nnz < N) — but the non-packed SH path is degree-agnostic and produces depth
+    correctly. gsplat applies the +0.5 offset, matching Stage-3's f_dc."""
+    return torch.cat([splats["sh0"], splats["shN"]], dim=1), int(sh_degree)
 
 
 def _load_view(torch, view: dict[str, Any], device):  # noqa: ANN001
@@ -1046,11 +1108,12 @@ class _TileGrid:
         return lo, hi
 
     def signature(self, n_init: int, params: TrainParams) -> str:
-        """Cache key for per-tile results: any change to the cloud, the grid, or
-        the training length invalidates cached tiles."""
+        """Cache key for per-tile results: any change to the cloud, the grid, the
+        training length, or the SH degree invalidates cached tiles (the last so a
+        degree-0 cache never merges into a degree-3 run without the shN column)."""
         return (
             f"{n_init}:{self.k[0]}x{self.k[1]}:{self.margin:.3f}"
-            f":{params.iterations}:{params.resolved_tile_budget}"
+            f":{params.iterations}:{params.resolved_tile_budget}:sh{params.sh_degree}"
         )
 
 
@@ -1606,6 +1669,7 @@ def train_splat(
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
+        sh_rest=arrays["shN"],
     )
     # No LOD ladder here: trained.ply is the RAW model. The delivered LODs are
     # built on the cleaned model in Stage 7 (`heal_splat` → healed.lodK.ply).
@@ -1906,6 +1970,7 @@ def heal_splat(
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
         arrays["opacities"], arrays["scales"][:, :2], out_path,
+        sh_rest=arrays["shN"],
     )
     lod_summary = _export_lod(arrays, out_path, params, progress)
 
@@ -2017,10 +2082,12 @@ def _contribution_weights(  # noqa: ANN001
     weight. Reference pixels are NOT needed — only the poses — so the pass costs
     roughly one epoch of forwards plus a cheap colour-only backward.
 
-    gsplat clamps SH colours at 0, which zeroes the gradient for clamped
-    channels; at SH degree 0 colour is view-independent, so ONLY Gaussians with
-    all three channels < 0 (rendered pure black) are unmeasurable — callers must
-    force-keep `_blind_mask` Gaussians."""
+    gsplat clamps SH colours at 0, which zeroes the gradient for clamped channels.
+    The measure differentiates the DC leaf only — the DC basis contributes C0·Σw to
+    every view regardless of the higher SH bands — so it stays a valid blend-weight
+    proxy at degree 3; a Gaussian whose DC renders pure black in a view is just
+    unmeasured there, so callers force-keep `_blind_mask` (all-DC-channels < 0)
+    Gaussians."""
     device = splats["means"].device
     sh0_leaf = splats["sh0"].detach().clone().requires_grad_(True)
     shadow = {k: (sh0_leaf if k == "sh0" else v.detach()) for k, v in splats.items()}
@@ -2030,7 +2097,7 @@ def _contribution_weights(  # noqa: ANN001
         viewmats = torch.stack(
             [views[i]["viewmat"] for i in range(lo, min(lo + b, len(views)))]
         ).to(device)
-        colors, sh_deg = _render_inputs(torch, shadow)
+        colors, sh_deg = _render_inputs(torch, shadow, params.sh_degree)
         renders, *_ = _render_batch(
             torch, rasterization_2dgs, shadow, colors, sh_deg, viewmats, K,
             width, height, params, dist_on=False,
@@ -2114,6 +2181,7 @@ def _heal(  # noqa: ANN001
         "quats": params.quats_lr * lr_scale,
         "opacities": params.opacities_lr * lr_scale,
         "sh0": params.sh0_lr * lr_scale,
+        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam([{"params": [splats[name]], "lr": lrs[name]}], eps=1e-15)
@@ -2129,7 +2197,7 @@ def _heal(  # noqa: ANN001
             if box_lo is not None and gt_depth is not None:
                 world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
                 mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
-            colors, sh_deg = _render_inputs(torch, splats)
+            colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
             renders, pred_alpha, normals, nfd, distort, median_depth, _info = _render_batch(
                 torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K,
                 width, height, params, dist_on=False,
@@ -2184,12 +2252,12 @@ def _train_one(  # noqa: ANN001
     n_init = int(init["means"].shape[0])
 
     # Resume from the latest checkpoint when present + compatible, else build from
-    # the surfel init. A legacy view-dependent checkpoint (one carrying an `shN`
-    # param) is incompatible with this flat degree-0 model, so it's rejected and
-    # the run starts fresh rather than crashing on the missing SH optimizer.
+    # the surfel init. This model is degree-3 (SH): a legacy FLAT checkpoint (one
+    # with no `shN` param) is incompatible, so it's rejected and the run starts
+    # fresh rather than crashing on the missing SH param/optimizer.
     meta = {"n_init": n_init}
     ckpt = _load_checkpoint(torch, ckpt_dir, device) if resume else None
-    if ckpt is not None and "shN" in ckpt.get("params", {}):
+    if ckpt is not None and "shN" not in ckpt.get("params", {}):
         ckpt = None
 
     if ckpt is not None:
@@ -2204,6 +2272,7 @@ def _train_one(  # noqa: ANN001
                 "quats": torch.nn.Parameter(torch.from_numpy(init["quats"])),
                 "opacities": torch.nn.Parameter(torch.from_numpy(init["opacities"])),
                 "sh0": torch.nn.Parameter(torch.from_numpy(init["sh0"])),
+                "shN": torch.nn.Parameter(torch.from_numpy(init["shN"])),
             }
         ).to(device)
 
@@ -2218,6 +2287,7 @@ def _train_one(  # noqa: ANN001
         "quats": params.quats_lr * lr_scale,
         "opacities": params.opacities_lr * lr_scale,
         "sh0": params.sh0_lr * lr_scale,
+        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam(
@@ -2313,7 +2383,8 @@ def _train_one(  # noqa: ANN001
             world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
             mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
 
-        colors, sh_deg = _render_inputs(torch, splats)
+        active_sh = min(params.sh_degree, step // max(params.sh_degree_interval, 1))
+        colors, sh_deg = _render_inputs(torch, splats, active_sh)
         renders, pred_alpha, normals, normals_from_depth, distort, median_depth, info = _render_batch(
             torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on
         )
@@ -2466,7 +2537,7 @@ def _final_prune(torch, splats, prune_opa: float, prune_scale3d: float, scene_sc
 def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params, device):  # noqa: ANN001
     """Mean PSNR (foreground), RGB L1, and alpha-gated depth L1 over a random
     subset of views (capped by `eval_max_views` — plans can have thousands)."""
-    colors, sh_deg = _render_inputs(torch, splats)
+    colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
     n_eval = min(len(views), params.eval_max_views)
     sel = (
         np.random.default_rng(params.seed).choice(len(views), size=n_eval, replace=False)
@@ -2558,6 +2629,11 @@ def _main() -> None:
         help="Mip-style per-Gaussian scale floor from the nearest camera (anti-shimmer)",
     )
     ap.add_argument(
+        "--sh-degree", type=int, default=TrainParams.sh_degree,
+        help="max spherical-harmonics degree for view-dependent colour "
+             "(PostShot 'Max SH Degree'; default 3, 0 = flat/view-independent)",
+    )
+    ap.add_argument(
         "--depth-densify", action=argparse.BooleanOptionalAction, default=TrainParams.depth_densify,
         help="seed Gaussians at reference-depth surfaces the splat is missing",
     )
@@ -2628,6 +2704,7 @@ def _main() -> None:
             ckpt_every=args.ckpt_every,
             vram_min_free_gb=args.vram_min_free_gb,
             antialias=args.antialias,
+            sh_degree=args.sh_degree,
             depth_densify=args.depth_densify,
             tile_max=args.tile_max,
             lod_levels=args.lod_levels,
