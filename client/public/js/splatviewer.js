@@ -1774,7 +1774,7 @@ function buildControls(summary) {
         folderBtn,
     );
     // Export poses + surfels + rendered references to a COLMAP model under
-    // splat/colmap/ (cameras.txt + images.txt + points3D.txt + RGB PNGs) — the
+	// splat/colmap/ (cameras.txt + images.txt + points3D.txt + RGBA PNGs) — the
     // folder Postshot / COLMAP tools ingest (drag in → Camera Poses = Import).
     // Needs Stage 5 (references) done; the server 409s otherwise.
     const colmapBtn = el("button", {

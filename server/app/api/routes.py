@@ -4359,7 +4359,8 @@ def create_app() -> FastAPI:
     async def splat_colmap_export(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Export ONE cell's Stage-3 cloud + Stage-5 references to a COLMAP text model
         under `splat/colmap/` — cameras.txt / images.txt / points3D.txt plus the SZF
-        reference frames decoded to RGB PNG — the folder Postshot / COLMAP-based tools
+        reference frames decoded to RGBA PNG (coverage alpha kept as a mask) — the
+        folder Postshot / COLMAP-based tools
         ingest (drag it in → Camera Poses = Import). Needs Stage 3 (`cloud.ply`) +
         Stage 5 (`refs/transforms.json`); poses are OpenCV camera-to-world, so the
         extrinsics are inv(c2w) with no OpenGL flip. Overwrites any previous export.

@@ -13,6 +13,16 @@ export const OIT_LAYER = 1;
 // window frames/mullions stay opaque, sub-cutoff glass blends and stays see-through.
 export const OIT_OPAQUE = 0.8;
 
+// TEMPORARY (view-independent training): bake the lighting by forcing every surface
+// matte — metalness 0, roughness 1 — so the fixed rig contributes only diffuse
+// shading + soft IBL irradiance + shadows, with NO camera-dependent specular
+// highlights or environment mirror reflections (the moving "glare" a degree-0 /
+// low-SH splat can't fit). This makes every reference frame view-consistent.
+// REVERT when spherical-harmonic / view-dependent training returns: set to false
+// (restores the assets' authored metallic-roughness) AND bump COLOR_PIPELINE in
+// splat/stage5.py so the matte frames re-render.
+export const BAKE_MATTE = true;
+
 // ACES-filmic + sRGB (three.js' exact fit), shared by the opaque present pass and
 // the OIT composite so both paths store identical display colour.
 export const TONEMAP_GLSL = /* glsl */ `
@@ -110,6 +120,12 @@ export function prepareOITScene(root, oitPass) {
         for (const m of mats) {
             m.side = THREE.DoubleSide;
             m.shadowSide = THREE.BackSide;
+            // Bake lighting view-independently: matte kills the specular lobe and
+            // turns the IBL into blurred (view-independent) irradiance — no glare.
+            if (BAKE_MATTE && (m.isMeshStandardMaterial || m.isMeshPhysicalMaterial)) {
+                m.metalness = 0;
+                m.roughness = 1;
+            }
             if (m.transparent) oit = true;
         }
         if (oit) {

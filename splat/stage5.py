@@ -144,7 +144,11 @@ LIGHTING: dict[str, Any] = {
 # with their authored metallic-roughness (reflective) instead of forced matte.
 # v3: transparent surfaces composite through weighted-blended OIT (order-
 # independent), so objects behind glass render correctly instead of going black.
-COLOR_PIPELINE = "linear-aces-srgb-v3"
+# v4: lighting fully BAKED — materials forced matte (metalness 0, roughness 1) via
+# oit.js BAKE_MATTE, so refs are view-independent (no camera-dependent specular /
+# env reflections) for degree-0 / low-SH training. Revert both together when SH
+# returns (BAKE_MATTE=false + a fresh COLOR_PIPELINE bump).
+COLOR_PIPELINE = "linear-aces-srgb-v4"
 
 # Sidecar under a cell's refs/ recording the capture settings the on-disk frames
 # were rendered with, so a resume can detect a change (see `reconcile_capture_meta`).

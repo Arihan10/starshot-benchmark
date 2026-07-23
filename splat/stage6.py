@@ -1,39 +1,22 @@
 """Stage 6 — Splat fine-tune (the training run) via gsplat 2DGS.
 
-Takes a **COLMAP model** (poses + images, the same triple Postshot ingests and
-gsplat's `simple_trainer_2dgs` trains on, written by `splat_to_colmap.py` /
-`splat.colmap.export_colmap`: `cameras.txt` / `images.txt` / `points3D.txt` +
-RGB images) plus, by default, the **Stage-3 surfel cloud as the init**
-(`params.init`):
+Takes a **COLMAP model** as its ONLY input — the same (point cloud + camera poses
++ reference images) triple Postshot ingests and gsplat's `simple_trainer_2dgs`
+trains on, written by `splat_to_colmap.py` / `splat.colmap.export_colmap`
+(`cameras.txt` / `images.txt` / `points3D.txt` + RGBA images). The splat is
+INITIALIZED from the point cloud the gsplat way (`_init_from_points`: means = point
+xyz, colour = point RGB, isotropic KNN scales, random quats, opacity =
+logit(`init_opa`)) and optimized against the reference images into a clean 2DGS
+splat (`trained.ply`): densification adds Gaussians where the render disagrees with
+the reference, pruning removes redundant ones.
 
-  * `"surfels"` (default) — initialize every Gaussian from `cloud.ply`
-    (`init_ply`): on-surface means, mesh-true quats, tangent-disc scales,
-    exact texel colours, solid opacity (capped at `init_opa_max` so the
-    sigmoid keeps gradient headroom). Geometry starts AT the 2DGS solution;
-    training only fixes render-operator errors, so it needs a fraction of the
-    from-points epochs.
-  * `"points"` — the gsplat `create_splats_with_optimizers` recipe from the
-    COLMAP points3D (`_init_from_points`: means = point xyz, colour = point
-    RGB, isotropic KNN scales, random quats, opacity = logit(`init_opa`)) —
-    the Postshot-parity A/B baseline.
-
-Either way the splat is optimized against the reference images into a clean
-2DGS splat (`trained.ply`): densification adds Gaussians where the render
-disagrees with the reference, pruning removes redundant ones.
-
-SUPERVISION follows the data. A bare COLMAP model carries only RGB, so training is
-the reference trainer's loss set: photometric L1 + D-SSIM, 2DGS normal
-consistency, optional depth distortion. But when the model carries the SZF
-SUPERVISION SIDECAR (`splat.colmap.export_colmap` writes it beside the txt files
-for SZF refs — a pointer to the refs' frames + the shared depth [near, far], no
-pixel duplication; Postshot ignores it), every view also supervises with the
-capture's EXACT alpha + metric-depth planes: the alpha loss keeps empty space
-empty and glass translucent, the alpha-gated expected-depth L1 pins geometry
-without parallax and is the one per-pixel term that sees front floaters (after a
-`depth_start_iter` warm-up so the translucent init can saturate first), and
-depth-guided densification seeds Gaussians at reference surfaces the render is
-missing. `alpha_lambda=0` + `depth_lambda=0` + `depth_densify=False` gives a
-Postshot-parity RGB-only run for A/Bs.
+The trainer reads the images as RGB — the export's PNGs also carry a coverage
+alpha (kept for Postshot masking) but it isn't read here — and COLMAP has no depth,
+so the alpha/coverage loss, the dense depth loss, and depth-guided densification are
+DISABLED here (nothing to compare against) — the active loss set is exactly the reference trainer's: photometric L1 +
+D-SSIM, 2DGS normal consistency, and optional depth distortion. (The depth/alpha
+machinery below is retained because Stage 7 `heal_splat` still consumes the
+alpha+depth Stage-5 references.)
 
 WHAT THE FINE-TUNE FIXES (all lighting-independent of the loss's own): render-
 operator errors that only appear once flat disks are depth-sorted + alpha-blended
@@ -610,7 +593,8 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
 # --- COLMAP text model (the Postshot-style input: points3D + cameras + images) --
 # The model written by `splat.colmap.export_colmap` / `splat_to_colmap.py`: one
 # shared PINHOLE camera, per-image world-to-camera poses, an xyz+rgb point cloud,
-# and the reference images as RGB (no alpha, no depth — same as Postshot). This is
+# and the reference images as RGBA (RGB + coverage alpha; depth dropped — the
+# trainer reads only RGB, the alpha is kept for Postshot masking). This is
 # now the ONLY Stage-6 input; the trainer inits from the point cloud exactly like
 # gsplat's simple_trainer_2dgs.
 
@@ -1962,16 +1946,11 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
     """The COLMAP model (the Postshot-style input) as the trainer consumes it:
     (views, K, width, height, centers, points_xyz, points_rgb). Each view is the
     same dict `_view_stream`/`_evaluate` expect — the w2c `viewmat`, the c2w, and
-    the RGB image path. `points_xyz`/`points_rgb` seed the splat via
-    `_init_from_points`. Image names resolve against the model dir (flat, as
-    `export_colmap` writes) or an `images/` subdir (a standard COLMAP layout).
-
-    SZF SUPERVISION SIDECAR: when `export_colmap` wrote one (SZF refs), each view
-    also gets its `frame` (the refs' SZF file, whose stem matches the image stem)
-    + the shared depth [near, far] — so `_view_arrays` decodes the capture's
-    exact alpha + metric-depth planes alongside a bit-identical RGB, and the
-    alpha/depth supervision terms have real targets. Without the sidecar (legacy
-    PNG refs, or a hand-built COLMAP folder) views stay RGB-only."""
+    the RGB image path — but with `frame`/`alpha`/`depth` None: the image is read as
+    RGB (the PNG's coverage alpha, kept for Postshot masking, is dropped) and COLMAP
+    has no depth. `points_xyz`/`points_rgb` seed the splat via `_init_from_points`.
+    Image names resolve against the model dir (flat, as `export_colmap` writes) or
+    an `images/` subdir (a standard COLMAP layout)."""
     colmap_dir = Path(colmap_dir)
     K_np, width, height = _read_colmap_cameras(colmap_dir / "cameras.txt")
     images = _read_colmap_images(colmap_dir / "images.txt")
