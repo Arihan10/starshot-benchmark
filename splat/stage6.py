@@ -1,21 +1,39 @@
 """Stage 6 — Splat fine-tune (the training run) via gsplat 2DGS.
 
-Takes a **COLMAP model** as its ONLY input — the same (point cloud + camera poses
-+ reference images) triple Postshot ingests and gsplat's `simple_trainer_2dgs`
-trains on, written by `splat_to_colmap.py` / `splat.colmap.export_colmap`
-(`cameras.txt` / `images.txt` / `points3D.txt` + RGB images). The splat is
-INITIALIZED from the point cloud the gsplat way (`_init_from_points`: means = point
-xyz, colour = point RGB, isotropic KNN scales, random quats, opacity =
-logit(`init_opa`)) and optimized against the reference images into a clean 2DGS
-splat (`trained.ply`): densification adds Gaussians where the render disagrees with
-the reference, pruning removes redundant ones.
+Takes a **COLMAP model** (poses + images, the same triple Postshot ingests and
+gsplat's `simple_trainer_2dgs` trains on, written by `splat_to_colmap.py` /
+`splat.colmap.export_colmap`: `cameras.txt` / `images.txt` / `points3D.txt` +
+RGB images) plus, by default, the **Stage-3 surfel cloud as the init**
+(`params.init`):
 
-COLMAP carries only RGB (no alpha, no depth), so the alpha/coverage loss, the dense
-depth loss, and depth-guided densification are DISABLED here (nothing to compare
-against) — the active loss set is exactly the reference trainer's: photometric L1 +
-D-SSIM, 2DGS normal consistency, and optional depth distortion. (The depth/alpha
-machinery below is retained because Stage 7 `heal_splat` still consumes the
-alpha+depth Stage-5 references.)
+  * `"surfels"` (default) — initialize every Gaussian from `cloud.ply`
+    (`init_ply`): on-surface means, mesh-true quats, tangent-disc scales,
+    exact texel colours, solid opacity (capped at `init_opa_max` so the
+    sigmoid keeps gradient headroom). Geometry starts AT the 2DGS solution;
+    training only fixes render-operator errors, so it needs a fraction of the
+    from-points epochs.
+  * `"points"` — the gsplat `create_splats_with_optimizers` recipe from the
+    COLMAP points3D (`_init_from_points`: means = point xyz, colour = point
+    RGB, isotropic KNN scales, random quats, opacity = logit(`init_opa`)) —
+    the Postshot-parity A/B baseline.
+
+Either way the splat is optimized against the reference images into a clean
+2DGS splat (`trained.ply`): densification adds Gaussians where the render
+disagrees with the reference, pruning removes redundant ones.
+
+SUPERVISION follows the data. A bare COLMAP model carries only RGB, so training is
+the reference trainer's loss set: photometric L1 + D-SSIM, 2DGS normal
+consistency, optional depth distortion. But when the model carries the SZF
+SUPERVISION SIDECAR (`splat.colmap.export_colmap` writes it beside the txt files
+for SZF refs — a pointer to the refs' frames + the shared depth [near, far], no
+pixel duplication; Postshot ignores it), every view also supervises with the
+capture's EXACT alpha + metric-depth planes: the alpha loss keeps empty space
+empty and glass translucent, the alpha-gated expected-depth L1 pins geometry
+without parallax and is the one per-pixel term that sees front floaters (after a
+`depth_start_iter` warm-up so the translucent init can saturate first), and
+depth-guided densification seeds Gaussians at reference surfaces the render is
+missing. `alpha_lambda=0` + `depth_lambda=0` + `depth_densify=False` gives a
+Postshot-parity RGB-only run for A/Bs.
 
 WHAT THE FINE-TUNE FIXES (all lighting-independent of the loss's own): render-
 operator errors that only appear once flat disks are depth-sorted + alpha-blended
@@ -149,6 +167,7 @@ from typing import Any
 
 import numpy as np
 
+from splat.colmap import SIDECAR_NAME as _SIDECAR_NAME
 from splat.stage5 import (
     TRANSFORMS_NAME,
     decode_depth_u16,
@@ -211,6 +230,12 @@ class TrainParams:
     dist_lambda: float = 0.0           # 2DGS depth distortion (off by default; over-flattens bounded scenes)
     normal_start_iter: int = 2000      # let geometry settle before the regularizers bite
     dist_start_iter: int = 1000
+    # Depth-loss warm-up (view-draws, batch-scaled like the other cadences): the
+    # point-cloud init starts translucent (init_opa), so early EXPECTED depth
+    # blends through surfaces into whatever lies behind; let opacity saturate
+    # before the metric term bites. (The old opaque surfel init never needed
+    # this — its expected depth was true from step 0.)
+    depth_start_iter: int = 500
 
     # Learning rates (means_lr is × scene_scale at runtime).
     means_lr: float = 1.6e-4
@@ -219,13 +244,22 @@ class TrainParams:
     opacities_lr: float = 5e-2
     sh0_lr: float = 2.5e-3
 
-    # Point-cloud INIT (the COLMAP/Postshot input has only positions + colours, no
-    # per-point orientation/scale/opacity — so we synthesize them exactly as
-    # gsplat's simple_trainer_2dgs `create_splats_with_optimizers` does): opacity =
-    # logit(init_opa); each Gaussian's scale = log(mean distance to its 3 nearest
-    # neighbours × init_scale) (isotropic, repeated to the 3 axes gsplat's 2DGS
-    # densification splits along); quaternions are random (the rasterizer
-    # normalizes). Colours are the points3D RGB mapped to the SH0 DC term.
+    # INIT SOURCE. "surfels" (default): the Stage-3 cloud (`init_ply`) seeds
+    # every Gaussian at the 2DGS solution — on-surface means, mesh-true quats,
+    # tangent-disc scales, exact texel colours, solid opacity. "points": the
+    # gsplat `create_splats_with_optimizers` recipe from the COLMAP points3D
+    # (positions + colours only): opacity = logit(init_opa); each scale =
+    # log(mean distance to 3 nearest neighbours × init_scale) (isotropic);
+    # random quats. The Postshot-parity A/B baseline.
+    init: str = "surfels"
+    # Surfel-init opacity CEILING (the one saturation trap of a near-solution
+    # init): Stage 3 clamps alpha at 1-1e-3 → logit ≈ 6.9, where the sigmoid's
+    # gradient is ~1e-3 and opacity is effectively FROZEN — a mirror/glass
+    # surface could never turn transmissive and floaters could never be
+    # trained away. Capping at 0.9 (logit ≈ 2.2) keeps opacity live while
+    # still rendering solid from step 0.
+    init_opa_max: float = 0.9
+    # "points"-init knobs (gsplat defaults).
     init_opa: float = 0.1
     init_scale: float = 1.0
 
@@ -460,6 +494,7 @@ class TrainParams:
             ),
             depth_densify_every=per_batch(self.depth_densify_every),
             depth_densify_start=per_batch(self.depth_densify_start),
+            depth_start_iter=per_batch(self.depth_start_iter),
             normal_start_iter=per_batch(self.normal_start_iter),
             dist_start_iter=per_batch(self.dist_start_iter),
             aa_every=per_batch(self.aa_every),
@@ -472,11 +507,14 @@ class TrainParams:
             "iterations": self.iterations,
             "epochs": self.epochs,
             "batch": self.batch,
+            "init": self.init,
+            "init_opa_max": self.init_opa_max,
             "init_opa": self.init_opa,
             "init_scale": self.init_scale,
             "ssim_lambda": self.ssim_lambda,
             "alpha_lambda": self.alpha_lambda,
             "depth_lambda": self.depth_lambda,
+            "depth_start_iter": self.depth_start_iter,
             "depth_mode": self.depth_mode,
             "alpha_gate": self.alpha_gate,
             "normal_lambda": self.normal_lambda,
@@ -1642,23 +1680,33 @@ def train_splat(
     model: str,
     colmap_dir: Path,
     out_path: Path,
+    init_ply: Path | None = None,
     params: TrainParams = TrainParams(),
     resume: bool = True,
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
-    """Fine-tune a 2DGS splat from a COLMAP model — the ONLY Stage-6 input, the
-    same (point cloud + camera poses + reference images) triple Postshot ingests
-    and gsplat's `simple_trainer_2dgs` trains on. `colmap_dir` holds `cameras.txt`
-    / `images.txt` / `points3D.txt` + the RGB images, exactly as `splat_to_colmap.py`
-    (`splat.colmap.export_colmap`) writes.
+    """Fine-tune a 2DGS splat from a COLMAP model (poses + images — `colmap_dir`
+    holds `cameras.txt` / `images.txt` / `points3D.txt` + the RGB images, exactly
+    as `splat_to_colmap.py` / `splat.colmap.export_colmap` writes) plus the
+    init selected by `params.init` (module docstring):
 
-    The splat is INITIALIZED from the point cloud (`_init_from_points`, the gsplat
-    `create_splats_with_optimizers` recipe: means = points xyz, colour = points
-    RGB, isotropic KNN scales, random quats, opacity = logit(`init_opa`)) and
-    supervised against the images (photometric L1 + D-SSIM, 2DGS normal
-    consistency, optional distortion). COLMAP carries NO alpha or depth, so the
-    alpha/depth loss terms and depth-guided densification are disabled — there is
-    nothing to compare against — matching the reference trainer. Writes the RAW
+      * "surfels" (default) — `init_ply` (the Stage-3 `cloud.ply`) seeds every
+        Gaussian at the 2DGS solution (on-surface means, mesh-true quats,
+        tangent discs, exact texel colours), with opacity capped at
+        `init_opa_max` for gradient headroom. The metric-depth warm-up
+        (`depth_start_iter`) is zeroed: an opaque surface init's expected
+        depth is true from step 0.
+      * "points" — `_init_from_points` from the COLMAP points3D (the gsplat
+        `create_splats_with_optimizers` recipe) — the Postshot-parity A/B.
+
+    Supervision follows the data (photometric L1 + D-SSIM, 2DGS normal
+    consistency, optional distortion). When the model carries the SZF
+    SUPERVISION SIDECAR (`export_colmap` writes it for SZF refs), every view
+    additionally supervises with the capture's exact alpha (coverage) +
+    metric-depth planes at `alpha_lambda`/`depth_lambda`, and depth-guided
+    densification seeds Gaussians at surfaces the render is missing — set
+    those to 0/0/False for a Postshot-parity RGB-only run. Without the sidecar
+    the terms are forced off (nothing to compare against). Writes the RAW
     optimized 2DGS splat to `out_path` (`trained.ply`); requires a CUDA GPU +
     gsplat (raises a clear error otherwise).
 
@@ -1682,22 +1730,75 @@ def train_splat(
     device = torch.device("cuda")
     torch.manual_seed(params.seed)
 
-    # COLMAP/Postshot input carries no alpha and no depth, so disable the terms
-    # that would have nothing to compare against (alpha coverage, depth L1) and the
-    # depth-guided densification — leaving RGB L1 + D-SSIM, 2DGS normal consistency,
-    # and optional distortion, the simple_trainer_2dgs loss set. The schedule stays
-    # raw here; it is resolved per run/tile just before training.
-    from dataclasses import replace
-    params = replace(params, alpha_lambda=0.0, depth_lambda=0.0, depth_densify=False)
-
     # The Postshot-style input: reference views + shared intrinsics + the init point
-    # cloud, all from the COLMAP model (pixels stream from disk per step).
+    # cloud, all from the COLMAP model (pixels stream from disk per step). The SZF
+    # sidecar, when present, attaches each view's exact alpha + depth planes.
     views, K, width, height, centers, pts_xyz, pts_rgb = _load_colmap(torch, colmap_dir, device)
     n_views = len(views)
 
-    # Init the splat from the point cloud (gsplat recipe). scene_scale is GLOBAL
-    # even when tiled, so every tile's thresholds match the single-run semantics.
-    init = _init_from_points(pts_xyz, pts_rgb, params)
+    # Supervision keys off the DATA: with the SZF sidecar covering EVERY view, the
+    # alpha (coverage) + metric-depth losses and depth-guided densification run at
+    # their configured weights — pass alpha_lambda=0 / depth_lambda=0 /
+    # depth_densify=False for a Postshot-parity (RGB-only) run. Without full
+    # coverage (legacy PNG refs, a hand-built model, torn frames) those terms are
+    # forced OFF: an all-ones alpha target or a missing depth plane would
+    # mis-supervise. The schedule stays raw here; it is resolved per run/tile just
+    # before training.
+    from dataclasses import replace
+    n_frames = sum(1 for v in views if v["frame"] is not None)
+    supervised = n_frames == n_views
+    if not supervised:
+        params = replace(params, alpha_lambda=0.0, depth_lambda=0.0, depth_densify=False)
+    # ALWAYS announce the supervision mode: a silent RGB-only fallback (stale
+    # export, moved folder breaking the relative pointer, torn frames) would
+    # waste a whole run before anyone noticed the depth/alpha terms never fired.
+    if progress is not None:
+        progress(
+            0, 1,
+            (
+                f"supervision: RGB + alpha + depth via szf sidecar ({n_views} views, "
+                f"alpha_lambda={params.alpha_lambda} depth_lambda={params.depth_lambda})"
+                if supervised
+                else "supervision: RGB-only ("
+                + ("no szf sidecar" if n_frames == 0 else f"sidecar resolves only {n_frames}/{n_views} views")
+                + ")"
+            ),
+        )
+
+    # Init the splat (module docstring): the Stage-3 surfel cloud when
+    # params.init == "surfels" (geometry starts AT the 2DGS solution), else the
+    # gsplat from-points recipe. scene_scale is GLOBAL even when tiled, so every
+    # tile's thresholds match the single-run semantics.
+    if params.init == "surfels":
+        if init_ply is None or not Path(init_ply).is_file():
+            raise FileNotFoundError(
+                "params.init='surfels' needs the Stage-3 surfel cloud — pass "
+                f"init_ply= (got {init_ply}); or set init='points' for the "
+                "from-points3D baseline"
+            )
+        init = _load_cloud(Path(init_ply))
+        # Opacity CEILING (see TrainParams.init_opa_max): Stage 3 stores
+        # near-saturated logits whose sigmoid gradient is ~1e-3 — frozen.
+        # Cap the logit so opacity stays trainable (glass panes init well
+        # below the cap and are untouched).
+        p = min(max(params.init_opa_max, 1e-4), 1.0 - 1e-4)
+        init["opacities"] = np.minimum(
+            init["opacities"], np.float32(np.log(p / (1.0 - p)))
+        )
+        # An opaque surface init's EXPECTED depth is true from step 0 — the
+        # translucent-init warm-up would only delay the one loss that sees
+        # front floaters.
+        params = replace(params, depth_start_iter=0)
+        if progress is not None:
+            progress(
+                0, 1,
+                f"init: surfels ({init['means'].shape[0]:,} from {Path(init_ply).name}, "
+                f"opacity ≤ {params.init_opa_max})",
+            )
+    else:
+        init = _init_from_points(pts_xyz, pts_rgb, params)
+        if progress is not None:
+            progress(0, 1, f"init: points3D synthesize ({init['means'].shape[0]:,})")
     n_init = int(init["means"].shape[0])
     scene_scale = _scene_scale(centers, init["means"])
 
@@ -1861,15 +1962,30 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
     """The COLMAP model (the Postshot-style input) as the trainer consumes it:
     (views, K, width, height, centers, points_xyz, points_rgb). Each view is the
     same dict `_view_stream`/`_evaluate` expect — the w2c `viewmat`, the c2w, and
-    the RGB image path — but with `frame`/`alpha`/`depth` None (COLMAP carries no
-    alpha or depth). `points_xyz`/`points_rgb` seed the splat via `_init_from_points`.
-    Image names resolve against the model dir (flat, as `export_colmap` writes) or
-    an `images/` subdir (a standard COLMAP layout)."""
+    the RGB image path. `points_xyz`/`points_rgb` seed the splat via
+    `_init_from_points`. Image names resolve against the model dir (flat, as
+    `export_colmap` writes) or an `images/` subdir (a standard COLMAP layout).
+
+    SZF SUPERVISION SIDECAR: when `export_colmap` wrote one (SZF refs), each view
+    also gets its `frame` (the refs' SZF file, whose stem matches the image stem)
+    + the shared depth [near, far] — so `_view_arrays` decodes the capture's
+    exact alpha + metric-depth planes alongside a bit-identical RGB, and the
+    alpha/depth supervision terms have real targets. Without the sidecar (legacy
+    PNG refs, or a hand-built COLMAP folder) views stay RGB-only."""
     colmap_dir = Path(colmap_dir)
     K_np, width, height = _read_colmap_cameras(colmap_dir / "cameras.txt")
     images = _read_colmap_images(colmap_dir / "images.txt")
     pts_xyz, pts_rgb = _read_colmap_points(colmap_dir / "points3D.txt")
     K = torch.tensor(K_np, dtype=torch.float32, device=device)
+
+    frames_dir = suffix = near = far = None
+    sidecar_path = colmap_dir / _SIDECAR_NAME
+    if sidecar_path.is_file():
+        sc = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        frames_dir = colmap_dir / sc["frames_dir"]
+        suffix = sc.get("suffix", ".szf")
+        near, far = float(sc["near"]), float(sc["far"])
+
     views: list[dict[str, Any]] = []
     centers: list[np.ndarray] = []
     for name, c2w in images:
@@ -1878,17 +1994,22 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
             img = colmap_dir / "images" / name
         if not img.is_file():
             raise FileNotFoundError(f"{colmap_dir}: image '{name}' from images.txt not found")
+        frame = None
+        if frames_dir is not None:
+            f = frames_dir / (Path(name).stem + suffix)
+            if f.is_file():
+                frame = f
         centers.append(c2w[:3, 3])
         views.append(
             {
                 "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
                 "c2w": c2w,
-                "frame": None,
+                "frame": frame,
                 "rgb": img,
                 "alpha": None,
                 "depth": None,
-                "depth_near": None,
-                "depth_far": None,
+                "depth_near": near,
+                "depth_far": far,
             }
         )
     if not views:
@@ -2170,15 +2291,16 @@ def _render_batch(torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K
 def _supervision_loss(  # noqa: ANN001
     torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
     pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
-    normals_active, dist_active,
+    normals_active, dist_active, depth_active=True,
 ):
     """Combined per-view supervision loss — photometric L1 + D-SSIM, alpha
     (coverage), alpha-gated depth L1, 2DGS normal consistency, and optional depth
     distortion — shared by the training loop and the compaction pass. Both RGB
     sides are premultiplied-over-black. `mask` (a tile's owned-pixel mask, or None
     for a single run) restricts every term to owned pixels; `normals_active` /
-    `dist_active` gate the two regularizers that only switch on partway through a
-    run."""
+    `dist_active` / `depth_active` gate the terms that only switch on partway
+    through a run (`depth_active` defaults True for the heal/compact callers,
+    whose models are already opaque)."""
     if mask is None:
         l1 = (pred_rgb - gt_rgb).abs().mean()
         ssim_rgb = pred_rgb
@@ -2194,7 +2316,7 @@ def _supervision_loss(  # noqa: ANN001
         aloss = aerr.mean() if mask is None else (aerr * mask).sum() / mask.sum().clamp_min(1.0)
         loss = loss + params.alpha_lambda * aloss
 
-    if gt_depth is not None and params.depth_lambda > 0.0:
+    if gt_depth is not None and params.depth_lambda > 0.0 and depth_active:
         gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
         if mask is not None:
             gate = gate & (mask > 0)
@@ -2545,6 +2667,7 @@ def _train_one(  # noqa: ANN001
             pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
             normals_active=step >= params.normal_start_iter,
             dist_active=dist_on and step >= params.dist_start_iter,
+            depth_active=step >= params.depth_start_iter,
         )
 
         loss.backward()
@@ -2769,6 +2892,16 @@ def _main() -> None:
     )
     ap.add_argument("--out", required=True, type=Path, help="output trained.ply")
     ap.add_argument(
+        "--init", choices=("surfels", "points"), default=TrainParams.init,
+        help="init source: 'surfels' = the Stage-3 cloud.ply via --init-ply "
+             "(geometry starts AT the 2DGS solution — far fewer epochs); "
+             "'points' = gsplat's from-points3D recipe (Postshot-parity A/B)",
+    )
+    ap.add_argument(
+        "--init-ply", type=Path, default=None,
+        help="the Stage-3 surfel cloud (splat/cloud.ply) — required for --init surfels",
+    )
+    ap.add_argument(
         "--iterations", type=int, default=TrainParams.iterations,
         help="VIEW-DRAW budget (optimizer steps × batch); steps run = iterations // batch",
     )
@@ -2830,7 +2963,9 @@ def _main() -> None:
         model=args.model,
         colmap_dir=args.colmap,
         out_path=args.out,
+        init_ply=args.init_ply,
         params=TrainParams(
+            init=args.init,
             iterations=args.iterations,
             epochs=args.epochs,
             refine_stop_iter=args.refine_stop_iter,

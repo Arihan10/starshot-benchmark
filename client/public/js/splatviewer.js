@@ -99,8 +99,12 @@ let modalPlanShown = false; // one-time: revealed the camera overlay when the pl
 // since a bigger scene has proportionally more views); `batch` is the GPU-fill
 // speed knob (steps = iterations // batch, constant work). Edited in the "train
 // on modal" panel; sent with every start.
+// Default 6 assumes the SURFEL INIT (stage 6 params.init="surfels": geometry
+// starts at the 2DGS solution, training only polishes blend errors). Small
+// scenes (≤ ~1k views) benefit from 10-12 to give densification enough steps;
+// from-points A/B runs want roughly double.
 let modalTrainCfg = {
-    epochs: 12,
+    epochs: 6,
     batch: 3,
 };
 

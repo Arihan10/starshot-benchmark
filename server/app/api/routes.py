@@ -2289,7 +2289,14 @@ def _ensure_stage6_colmap(run: str, slot: str, model: str, restart: bool) -> Pat
     `restart` or when absent; otherwise reused. Blocking (decodes the reference
     frames to RGB), so callers run it off the event loop."""
     colmap_dir = _colmap_dir(run, slot, model)
-    if restart or not (colmap_dir / splat_colmap.CAMERAS_TXT).is_file():
+    # Re-export when absent — or when the model predates the SZF supervision
+    # sidecar while the refs could provide one (SZF frames present): otherwise a
+    # stale export silently keeps training RGB-only.
+    frames_dir = _refs_dir(run, slot, model) / splat_stage5.FRAMES_DIRNAME
+    stale = not (colmap_dir / splat_colmap.CAMERAS_TXT).is_file() or (
+        frames_dir.is_dir() and not (colmap_dir / splat_colmap.SIDECAR_NAME).is_file()
+    )
+    if restart or stale:
         splat_colmap.export_colmap(
             _refs_dir(run, slot, model), _cloud_path(run, slot, model), colmap_dir,
         )
@@ -2325,6 +2332,9 @@ def _spawn_stage6(
     cmd = [
         sys.executable, "-u", "-m", "splat.stage6",
         "--colmap", str(colmap_dir),
+        # Surfel init (stage6 default): seed every Gaussian from the Stage-3
+        # cloud — the same file the COLMAP export above just read.
+        "--init-ply", str(_cloud_path(run, slot, model)),
         "--out", str(out), "--run", run, "--slot", slot, "--model", model,
         "--resume",  # continue from a checkpoint if one survived; restart wiped it
     ]

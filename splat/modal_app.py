@@ -532,7 +532,13 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             # + poses + images) — build it once from this cell's Stage-3 cloud +
             # Stage-5 refs into local scratch, rebuilt on force or when absent.
             colmap_scratch = scratch / "colmap"
-            if force or not (colmap_scratch / splat_colmap.CAMERAS_TXT).is_file():
+            # Rebuild on force, when absent, or when a warm container's export
+            # predates the SZF supervision sidecar the refs could provide.
+            colmap_stale = not (colmap_scratch / splat_colmap.CAMERAS_TXT).is_file() or (
+                (refs_scratch / _stage5.FRAMES_DIRNAME).is_dir()
+                and not (colmap_scratch / splat_colmap.SIDECAR_NAME).is_file()
+            )
+            if force or colmap_stale:
                 heart.stage("train")(0, 0, "building COLMAP model (points3D + cameras + images)")
                 splat_colmap.export_colmap(refs_scratch, cloud, colmap_scratch)
             # out_path lives ON the Volume: trained.ply + LODs land durably and
@@ -545,6 +551,10 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                 run=run, slot=slot, model=model,
                 colmap_dir=colmap_scratch,
                 out_path=trained,
+                # Stage-3 surfel cloud: the default init (params.init="surfels")
+                # seeds every Gaussian at the 2DGS solution; from-points A/Bs
+                # pass train={"init": "points"} and ignore it.
+                init_ply=cloud,
                 params=train_params,
                 resume=not force,
                 progress=heart.stage("train", commit=True),

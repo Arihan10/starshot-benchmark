@@ -31,6 +31,12 @@ from . import stage5
 CAMERAS_TXT = "cameras.txt"
 IMAGES_TXT = "images.txt"
 POINTS_TXT = "points3D.txt"
+# SZF supervision sidecar: a POINTER (no pixel duplication) from the COLMAP model
+# back to the refs' SZF frames + the shared depth [near, far], so splat/stage6 can
+# supervise against the capture's exact alpha + metric-depth planes. Postshot and
+# every other COLMAP consumer simply ignore the extra file. Only written for SZF
+# refs — legacy PNG-triple refs carry no frames to point at.
+SIDECAR_NAME = "szf_sidecar.json"
 
 # SH degree-0 basis constant: Stage 3 stores f_dc = (rgb - 0.5) / C0, so rgb =
 # 0.5 + C0 * f_dc (matches splat/stage3.py's _SH_C0).
@@ -181,4 +187,25 @@ def export_colmap(
     ]
     (out_dir / POINTS_TXT).write_text("".join(pt_lines), encoding="utf-8")
 
-    return {"cameras": 1, "images": len(records), "points": int(len(xyz)), "dir": str(out_dir)}
+    # SZF supervision sidecar (see SIDECAR_NAME): image stems match frame stems, so
+    # a relative frames-dir + suffix + the shared [near, far] is all the trainer
+    # needs to decode each view's exact alpha + depth planes from the refs.
+    sidecar = bool(frames and all(fr.get("frame_path") for fr in frames)
+                   and "near" in doc and "far" in doc)
+    if sidecar:
+        rel = os.path.relpath(frames_dir, out_dir).replace(os.sep, "/")
+        (out_dir / SIDECAR_NAME).write_text(
+            json.dumps({
+                "version": 1,
+                "frames_dir": rel,
+                "suffix": stage5.FRAME_SUFFIX,
+                "near": float(doc["near"]),
+                "far": float(doc["far"]),
+            }, indent=1),
+            encoding="utf-8",
+        )
+
+    return {
+        "cameras": 1, "images": len(records), "points": int(len(xyz)),
+        "sidecar": sidecar, "dir": str(out_dir),
+    }
