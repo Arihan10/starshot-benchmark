@@ -1,12 +1,21 @@
 """Stage 6 — Splat fine-tune (the training run) via gsplat 2DGS.
 
-Takes the **Stage-3 surfel cloud** (`cloud.ply`) as the initialization and
-optimizes it against the **Stage-5 matte-lit reference renders** (`refs/` — per-view
-RGB + depth + alpha + exact OpenCV poses in `transforms.json`) into an optimized
-2DGS splat (`trained.ply`). This is where the raw mesh-sampled surfels become a
-clean, crisp splat: densification adds Gaussians where the render disagrees with
-the reference (appearance detail on geometrically-flat surfaces), pruning removes
-redundant ones, and the depth loss suppresses floaters.
+Takes a **COLMAP model** as its ONLY input — the same (point cloud + camera poses
++ reference images) triple Postshot ingests and gsplat's `simple_trainer_2dgs`
+trains on, written by `splat_to_colmap.py` / `splat.colmap.export_colmap`
+(`cameras.txt` / `images.txt` / `points3D.txt` + RGB images). The splat is
+INITIALIZED from the point cloud the gsplat way (`_init_from_points`: means = point
+xyz, colour = point RGB, isotropic KNN scales, random quats, opacity =
+logit(`init_opa`)) and optimized against the reference images into a clean 2DGS
+splat (`trained.ply`): densification adds Gaussians where the render disagrees with
+the reference, pruning removes redundant ones.
+
+COLMAP carries only RGB (no alpha, no depth), so the alpha/coverage loss, the dense
+depth loss, and depth-guided densification are DISABLED here (nothing to compare
+against) — the active loss set is exactly the reference trainer's: photometric L1 +
+D-SSIM, 2DGS normal consistency, and optional depth distortion. (The depth/alpha
+machinery below is retained because Stage 7 `heal_splat` still consumes the
+alpha+depth Stage-5 references.)
 
 WHAT THE FINE-TUNE FIXES (all lighting-independent of the loss's own): render-
 operator errors that only appear once flat disks are depth-sorted + alpha-blended
@@ -210,18 +219,39 @@ class TrainParams:
     opacities_lr: float = 5e-2
     sh0_lr: float = 2.5e-3
 
+    # Point-cloud INIT (the COLMAP/Postshot input has only positions + colours, no
+    # per-point orientation/scale/opacity — so we synthesize them exactly as
+    # gsplat's simple_trainer_2dgs `create_splats_with_optimizers` does): opacity =
+    # logit(init_opa); each Gaussian's scale = log(mean distance to its 3 nearest
+    # neighbours × init_scale) (isotropic, repeated to the 3 axes gsplat's 2DGS
+    # densification splits along); quaternions are random (the rasterizer
+    # normalizes). Colours are the points3D RGB mapped to the SH0 DC term.
+    init_opa: float = 0.1
+    init_scale: float = 1.0
+
     # Densification (gsplat DefaultStrategy, 2DGS gradient key).
     refine: bool = True
     refine_start_iter: int = 500
     refine_stop_iter: int | None = None  # None → int(iterations * 0.5) at runtime
     refine_every: int = 100
-    # 0 DISABLES periodic opacity resets (the default here): a reset clamps every
-    # opacity to 2·prune_opa, but surfels no training view covers (occluded
-    # regions kept at their mesh-true init) receive no gradient and would stay
-    # dimmed forever. The pinned gsplat 1.5.3 never fires resets anyway (its
-    # trigger `step % reset_every == 0 & step > 0` parses as `… and (0 > 0)`);
-    # this makes that behaviour deliberate and upgrade-proof.
-    reset_every: int = 0
+    # Periodic opacity resets at the REFERENCE cadence (3DGS paper / gsplat
+    # default: every 3000): clamp every opacity to 2·prune_opa and zero its Adam
+    # moments, so Gaussians the images actually need re-earn visibility while
+    # junk (floaters, redundant occluded copies) never recovers and is pruned —
+    # the standard anti-floater purge. Re-enabled with the COLMAP point-cloud
+    # init: opacity is a free parameter again (uniform logit(init_opa)), not the
+    # mesh-true material data the old surfel init had to protect. Written in
+    # VIEW-DRAWS like every other cadence (resolve_schedule divides by `batch`);
+    # fires only inside the refine window, exactly like upstream; 0 disables.
+    #
+    # UPSTREAM NOTE (verified 2026-07): the pinned gsplat 1.5.3 wheel's own
+    # trigger is dead code — `step % reset_every == 0 & step > 0` parses as
+    # `… and (0 > 0)`, always False — and 1.5.3 is still the NEWEST release on
+    # the wheel index, PyPI, and GitHub; the `and` fix exists only on unreleased
+    # main. So _train_one fires gsplat's `reset_opa` op itself under main's
+    # exact fixed condition. When a fixed release ships, bump the pin and delete
+    # that block (both firing at the same step would be a harmless no-op).
+    reset_every: int = 3000
     # Mean (non-absolute) 2D-gradient split threshold — gsplat's default value.
     # AbsGS (absgrad) is deliberately NOT used: in the pinned gsplat 1.5.3 the
     # 2DGS backward attaches `.absgrad` to `means2d`, but DefaultStrategy densifies
@@ -429,6 +459,7 @@ class TrainParams:
             normal_start_iter=per_batch(self.normal_start_iter),
             dist_start_iter=per_batch(self.dist_start_iter),
             aa_every=per_batch(self.aa_every),
+            reset_every=(0 if self.reset_every == 0 else per_batch(self.reset_every)),
             ckpt_every=(0 if self.ckpt_every == 0 else per_batch(self.ckpt_every)),
         )
 
@@ -437,6 +468,8 @@ class TrainParams:
             "iterations": self.iterations,
             "epochs": self.epochs,
             "batch": self.batch,
+            "init_opa": self.init_opa,
+            "init_scale": self.init_scale,
             "ssim_lambda": self.ssim_lambda,
             "alpha_lambda": self.alpha_lambda,
             "depth_lambda": self.depth_lambda,
@@ -530,6 +563,124 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
         third = (two.min(axis=1, keepdims=True) + np.log(0.01)).astype(np.float32)
         scales = np.concatenate([two, third], axis=1)
     return {"means": means, "quats": quats, "opacities": opacities, "sh0": sh0, "scales": scales}
+
+
+# --- COLMAP text model (the Postshot-style input: points3D + cameras + images) --
+# The model written by `splat.colmap.export_colmap` / `splat_to_colmap.py`: one
+# shared PINHOLE camera, per-image world-to-camera poses, an xyz+rgb point cloud,
+# and the reference images as RGB (no alpha, no depth — same as Postshot). This is
+# now the ONLY Stage-6 input; the trainer inits from the point cloud exactly like
+# gsplat's simple_trainer_2dgs.
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def _qvec_to_rotmat(q: np.ndarray) -> np.ndarray:
+    """COLMAP `(qw,qx,qy,qz)` world-to-camera quaternion → 3×3 rotation (the exact
+    inverse of `splat.colmap.rotmat2qvec`)."""
+    w, x, y, z = q
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _read_colmap_cameras(path: Path) -> tuple[np.ndarray, int, int]:
+    """Parse `cameras.txt` → (K [3,3], width, height). Assumes a single shared
+    pinhole camera (what `export_colmap` writes and what the trainer's one shared
+    `K` expects); the first camera record wins if several are present."""
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        model, w, h = parts[1], int(parts[2]), int(parts[3])
+        p = [float(v) for v in parts[4:]]
+        if model in ("PINHOLE", "OPENCV"):
+            fx, fy, cx, cy = p[0], p[1], p[2], p[3]
+        elif model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
+            fx, fy, cx, cy = p[0], p[0], p[1], p[2]
+        else:
+            raise ValueError(f"{path}: unsupported COLMAP camera model {model!r} (need PINHOLE)")
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        return K, w, h
+    raise ValueError(f"{path}: no camera record")
+
+
+def _read_colmap_images(path: Path) -> list[tuple[str, np.ndarray]]:
+    """Parse `images.txt` → [(image_name, c2w [4,4]), …] in file order. Each image's
+    pose line is `ID QW QX QY QZ TX TY TZ CAMERA_ID NAME` (world-to-camera); the
+    optional POINTS2D line (empty in our export) is identified by NOT ending in an
+    image name and skipped, so both our export and a standard model parse."""
+    out: list[tuple[str, np.ndarray]] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 10 or not parts[9].lower().endswith(_IMAGE_EXTS):
+            continue  # a POINTS2D line, not a pose line
+        q = np.array(parts[1:5], dtype=np.float64)
+        t = np.array(parts[5:8], dtype=np.float64)
+        w2c = np.eye(4, dtype=np.float64)
+        w2c[:3, :3] = _qvec_to_rotmat(q)
+        w2c[:3, 3] = t
+        out.append((parts[9], np.linalg.inv(w2c)))
+    return out
+
+
+def _read_colmap_points(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Parse `points3D.txt` → (xyz [N,3] float64, rgb [N,3] uint8). Only the first
+    seven fields per line (ID X Y Z R G B) are read; the variable-length TRACK tail
+    is left unsplit (`maxsplit=7`) so multi-million-point clouds parse quickly."""
+    xyz: list[tuple[float, float, float]] = []
+    rgb: list[tuple[int, int, int]] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line or line[0] == "#":
+            continue
+        p = line.split(maxsplit=7)
+        if len(p) < 7:
+            continue
+        xyz.append((float(p[1]), float(p[2]), float(p[3])))
+        rgb.append((int(p[4]), int(p[5]), int(p[6])))
+    if not xyz:
+        raise ValueError(f"{path}: no 3D points")
+    return np.asarray(xyz, dtype=np.float64), np.asarray(rgb, dtype=np.uint8)
+
+
+def _init_from_points(xyz: np.ndarray, rgb: np.ndarray, params: TrainParams) -> dict[str, np.ndarray]:
+    """gsplat `create_splats_with_optimizers`-style init from a bare point cloud
+    (xyz + rgb) — the same recipe simple_trainer uses for an SfM cloud, so a
+    Postshot-style input trains identically. means = xyz; each scale =
+    log(mean-distance-to-3-nearest-neighbours × init_scale), isotropic over 3 axes;
+    quats random (rasterizer normalizes); opacity = logit(init_opa); colour = the
+    points3D RGB mapped to the SH0 DC term ((rgb−0.5)/C0, matching Stage 3)."""
+    from scipy.spatial import cKDTree
+
+    means = np.ascontiguousarray(xyz, dtype=np.float32)
+    n = int(means.shape[0])
+    k = min(4, n)
+    if k >= 2:
+        dists, _ = cKDTree(means).query(means, k=k, workers=-1)
+        dist_avg = np.sqrt((dists[:, 1:] ** 2).mean(axis=1))
+    else:
+        dist_avg = np.full(n, 0.01, dtype=np.float64)
+    log_scale = np.log(np.maximum(dist_avg * params.init_scale, 1e-9)).astype(np.float32)
+    scales = np.repeat(log_scale[:, None], 3, axis=1)
+
+    rng = np.random.default_rng(params.seed)
+    quats = rng.standard_normal((n, 4)).astype(np.float32)
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True) + 1e-12
+
+    a = float(np.clip(params.init_opa, 1e-3, 1.0 - 1e-3))
+    opacities = np.full(n, float(np.log(a / (1.0 - a))), dtype=np.float32)
+
+    sh0 = (((rgb.astype(np.float32) / 255.0) - 0.5) / _SH_C0)[:, None, :].astype(np.float32)
+    return {"means": means, "scales": scales, "quats": quats, "opacities": opacities, "sh0": sh0}
 
 
 def _load_rgb(path: Path) -> np.ndarray:
@@ -1485,54 +1636,64 @@ def train_splat(
     run: str,
     slot: str,
     model: str,
-    cloud_path: Path,
-    refs_dir: Path,
+    colmap_dir: Path,
     out_path: Path,
     params: TrainParams = TrainParams(),
     resume: bool = True,
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
-    """Fine-tune the Stage-3 surfel cloud at `cloud_path` against the Stage-5
-    references in `refs_dir`, writing the RAW optimized 2DGS splat to `out_path`
-    (`trained.ply`). Requires a CUDA GPU + gsplat (raises a clear error
-    otherwise). Returns a compact summary (init/final splat counts, per-tile
-    breakdown when tiled, final metrics, bytes).
+    """Fine-tune a 2DGS splat from a COLMAP model — the ONLY Stage-6 input, the
+    same (point cloud + camera poses + reference images) triple Postshot ingests
+    and gsplat's `simple_trainer_2dgs` trains on. `colmap_dir` holds `cameras.txt`
+    / `images.txt` / `points3D.txt` + the RGB images, exactly as `splat_to_colmap.py`
+    (`splat.colmap.export_colmap`) writes.
+
+    The splat is INITIALIZED from the point cloud (`_init_from_points`, the gsplat
+    `create_splats_with_optimizers` recipe: means = points xyz, colour = points
+    RGB, isotropic KNN scales, random quats, opacity = logit(`init_opa`)) and
+    supervised against the images (photometric L1 + D-SSIM, 2DGS normal
+    consistency, optional distortion). COLMAP carries NO alpha or depth, so the
+    alpha/depth loss terms and depth-guided densification are disabled — there is
+    nothing to compare against — matching the reference trainer. Writes the RAW
+    optimized 2DGS splat to `out_path` (`trained.ply`); requires a CUDA GPU +
+    gsplat (raises a clear error otherwise).
 
     STAGE 6 IS TRAIN-ONLY: compaction (delete + heal + final-prune) and the LOD
-    ladder now live in Stage 7 (`heal_splat`), which reads this `trained.ply` and
-    emits the delivered `healed.ply`. So `trained.ply` is the un-cleaned model and
-    the two are viewable side by side.
+    ladder live in Stage 7 (`heal_splat`), which reads this `trained.ply`.
 
-    Seeds larger than `params.resolved_tile_budget` train TILED (module docstring
-    §TILED TRAINING): ground-plane cells trained one at a time — each fits VRAM
-    with densification headroom a monolithic run wouldn't have — then merged by
-    core ownership. Smaller seeds keep the single-run path unchanged.
-
-    With `resume` (default), continues from the latest `splat/ckpt/` checkpoint
-    when present and compatible (same SH config); tiled runs additionally resume
-    at the first unfinished tile (`splat/ckpt/tiles/`). `resume=False` starts
-    fresh."""
+    Clouds larger than `params.resolved_tile_budget` train TILED (ground-plane
+    cells trained one at a time, merged by core ownership); smaller clouds train as
+    a single run. With `resume` (default), continues from the latest `splat/ckpt/`
+    checkpoint; `resume=False` starts fresh."""
     torch, F, _ = _require_cuda_trainer()
 
-    cloud_path, refs_dir, out_path = Path(cloud_path), Path(refs_dir), Path(out_path)
-    if not cloud_path.is_file():
-        raise FileNotFoundError(f"surfel cloud not found: {cloud_path} (run Stage 3)")
+    colmap_dir, out_path = Path(colmap_dir), Path(out_path)
+    for req in ("cameras.txt", "images.txt", "points3D.txt"):
+        if not (colmap_dir / req).is_file():
+            raise FileNotFoundError(
+                f"COLMAP model incomplete: missing {req} in {colmap_dir} "
+                "(build it with splat_to_colmap.py / splat.colmap.export_colmap)"
+            )
 
     device = torch.device("cuda")
     torch.manual_seed(params.seed)
 
-    # Supervision set + intrinsics (paths + poses only; pixels stream from disk
-    # per step). Shared with the heal stage via `_load_scene`. The training
-    # SCHEDULE (epochs → step counts, cadences scaled by batch) is resolved per
-    # RUN just before _train_one (per TILE inside _train_tiled), so `params` here
-    # stays the raw client-supplied policy.
-    views, K, width, height, centers = _load_scene(torch, refs_dir, device)
+    # COLMAP/Postshot input carries no alpha and no depth, so disable the terms
+    # that would have nothing to compare against (alpha coverage, depth L1) and the
+    # depth-guided densification — leaving RGB L1 + D-SSIM, 2DGS normal consistency,
+    # and optional distortion, the simple_trainer_2dgs loss set. The schedule stays
+    # raw here; it is resolved per run/tile just before training.
+    from dataclasses import replace
+    params = replace(params, alpha_lambda=0.0, depth_lambda=0.0, depth_densify=False)
+
+    # The Postshot-style input: reference views + shared intrinsics + the init point
+    # cloud, all from the COLMAP model (pixels stream from disk per step).
+    views, K, width, height, centers, pts_xyz, pts_rgb = _load_colmap(torch, colmap_dir, device)
     n_views = len(views)
 
-    # Surfel init (also the scene-scale fallback source when there's ≤1 camera).
-    # scene_scale is GLOBAL even when tiled, so every tile's thresholds match the
-    # single-run semantics.
-    init = _load_cloud(cloud_path)
+    # Init the splat from the point cloud (gsplat recipe). scene_scale is GLOBAL
+    # even when tiled, so every tile's thresholds match the single-run semantics.
+    init = _init_from_points(pts_xyz, pts_rgb, params)
     n_init = int(init["means"].shape[0])
     scene_scale = _scene_scale(centers, init["means"])
 
@@ -1637,6 +1798,7 @@ def train_splat(
         "metrics": metrics,
         "params": params.as_summary(),
         "bytes": out_path.stat().st_size,
+        "colmap_dir": str(colmap_dir),
         "out_path": str(out_path),
     }
 
@@ -1684,6 +1846,45 @@ def _load_scene(torch, refs_dir: Path, device):  # noqa: ANN001
             }
         )
     return views, K, width, height, np.stack(cam_centers, axis=0)
+
+
+def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
+    """The COLMAP model (the Postshot-style input) as the trainer consumes it:
+    (views, K, width, height, centers, points_xyz, points_rgb). Each view is the
+    same dict `_view_stream`/`_evaluate` expect — the w2c `viewmat`, the c2w, and
+    the RGB image path — but with `frame`/`alpha`/`depth` None (COLMAP carries no
+    alpha or depth). `points_xyz`/`points_rgb` seed the splat via `_init_from_points`.
+    Image names resolve against the model dir (flat, as `export_colmap` writes) or
+    an `images/` subdir (a standard COLMAP layout)."""
+    colmap_dir = Path(colmap_dir)
+    K_np, width, height = _read_colmap_cameras(colmap_dir / "cameras.txt")
+    images = _read_colmap_images(colmap_dir / "images.txt")
+    pts_xyz, pts_rgb = _read_colmap_points(colmap_dir / "points3D.txt")
+    K = torch.tensor(K_np, dtype=torch.float32, device=device)
+    views: list[dict[str, Any]] = []
+    centers: list[np.ndarray] = []
+    for name, c2w in images:
+        img = colmap_dir / name
+        if not img.is_file():
+            img = colmap_dir / "images" / name
+        if not img.is_file():
+            raise FileNotFoundError(f"{colmap_dir}: image '{name}' from images.txt not found")
+        centers.append(c2w[:3, 3])
+        views.append(
+            {
+                "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
+                "c2w": c2w,
+                "frame": None,
+                "rgb": img,
+                "alpha": None,
+                "depth": None,
+                "depth_near": None,
+                "depth_far": None,
+            }
+        )
+    if not views:
+        raise RuntimeError(f"{colmap_dir}/images.txt has no image poses")
+    return views, K, width, height, np.stack(centers, axis=0), pts_xyz, pts_rgb
 
 
 def _scene_scale(centers: np.ndarray, fallback_means: np.ndarray) -> float:
@@ -2178,6 +2379,7 @@ def _train_one(  # noqa: ANN001
     None trains unmasked, the single-run behavior. Checkpoints under `ckpt_dir`
     (the caller owns cleanup)."""
     from gsplat import DefaultStrategy, rasterization_2dgs
+    from gsplat.strategy.ops import reset_opa
 
     device = torch.device("cuda")
     n_views = len(views)
@@ -2229,10 +2431,12 @@ def _train_one(  # noqa: ANN001
         optimizers["means"], gamma=0.01 ** (1.0 / max(params.iterations, 1))
     )
 
-    # reset_every=0 disables opacity resets by pushing the trigger past the last
-    # step (see TrainParams). Accepted side effect: the strategy's scale-based
-    # prune (gated on `step > reset_every`) also never fires — our init has no
-    # giant blobs and the alpha/depth losses punish oversized splats directly.
+    # The strategy gets the REAL reset cadence: besides gating the (in-loop)
+    # opacity reset below, `reset_every` also activates the strategy's scale-based
+    # prune (`step > reset_every` → prune_scale3d·scene_scale), matching the
+    # reference loop. reset_every=0 disables both by pushing the trigger past the
+    # last step. The reset itself fires in OUR loop — the pinned 1.5.3 wheel's
+    # internal trigger is dead code (see TrainParams.reset_every).
     strategy = DefaultStrategy(
         prune_opa=params.prune_opa,
         grow_grad2d=params.grow_grad2d,
@@ -2342,6 +2546,30 @@ def _train_one(  # noqa: ANN001
 
         if params.refine:
             strategy.step_post_backward(splats, optimizers, strat_state, step, info, packed=False)
+            # Opacity reset at the reference cadence, under upstream's FIXED
+            # trigger (`step % reset_every == 0 and step > 0`, refine window
+            # only) — executed here because the pinned gsplat 1.5.3 wheel's own
+            # trigger never fires (precedence bug; see TrainParams.reset_every).
+            # gsplat's reset_opa clamps every opacity to 2·prune_opa and zeroes
+            # its Adam moments; only image-justified Gaussians re-earn opacity,
+            # the rest drop below prune_opa and are pruned. Reading the LIVE
+            # strategy.refine_stop_iter keeps resets coupled to the refine
+            # window even after the VRAM guard freezes it.
+            if (
+                params.reset_every > 0
+                and 0 < step < strategy.refine_stop_iter
+                and step % params.reset_every == 0
+            ):
+                reset_opa(
+                    params=splats, optimizers=optimizers, state=strat_state,
+                    value=params.prune_opa * 2.0,
+                )
+                if progress is not None:
+                    progress(
+                        step + 1, params.iterations,
+                        f"opacity reset @{step} (ceiling {2 * params.prune_opa:.2f}) "
+                        f"n={len(splats['means'])}",
+                    )
             # Adaptive VRAM: cap_max is the hard ceiling; also freeze densification
             # when free VRAM nears the WDDM shared-memory cliff (after one empty_cache
             # retry to release reusable cached blocks), so growth can't collapse
@@ -2519,13 +2747,17 @@ def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params
 
 
 def _main() -> None:
-    """Standalone CLI for the GPU box: fine-tune one cell's surfel cloud against
-    its Stage-5 references."""
+    """Standalone CLI for the GPU box: fine-tune a 2DGS splat from a COLMAP model —
+    the Postshot-style (point cloud + poses + images) folder that
+    `splat_to_colmap.py` / `splat.colmap.export_colmap` writes."""
     import argparse
 
-    ap = argparse.ArgumentParser(description="Stage 6 — gsplat 2DGS splat fine-tune")
-    ap.add_argument("--cloud", required=True, type=Path, help="Stage-3 cloud.ply (init)")
-    ap.add_argument("--refs", required=True, type=Path, help="Stage-5 refs/ dir")
+    ap = argparse.ArgumentParser(description="Stage 6 — gsplat 2DGS fine-tune from a COLMAP model")
+    ap.add_argument(
+        "--colmap", required=True, type=Path,
+        help="COLMAP model dir (cameras.txt / images.txt / points3D.txt + RGB "
+             "images) — the folder splat_to_colmap.py writes",
+    )
     ap.add_argument("--out", required=True, type=Path, help="output trained.ply")
     ap.add_argument(
         "--iterations", type=int, default=TrainParams.iterations,
@@ -2546,6 +2778,14 @@ def _main() -> None:
              "so it's a speed knob at CONSTANT work (no need to adjust iterations)",
     )
     ap.add_argument(
+        "--init-opa", type=float, default=TrainParams.init_opa,
+        help="initial Gaussian opacity for the point-cloud init (gsplat default 0.1)",
+    )
+    ap.add_argument(
+        "--init-scale", type=float, default=TrainParams.init_scale,
+        help="scale multiplier on the KNN-derived initial Gaussian size",
+    )
+    ap.add_argument(
         "--ckpt-every", type=int, default=TrainParams.ckpt_every,
         help="write a resumable checkpoint every N steps (0 disables)",
     )
@@ -2558,47 +2798,9 @@ def _main() -> None:
         help="Mip-style per-Gaussian scale floor from the nearest camera (anti-shimmer)",
     )
     ap.add_argument(
-        "--depth-densify", action=argparse.BooleanOptionalAction, default=TrainParams.depth_densify,
-        help="seed Gaussians at reference-depth surfaces the splat is missing",
-    )
-    ap.add_argument(
         "--tile-max", type=int, default=None,
-        help="max seed Gaussians for a single run; larger clouds train as ground-"
+        help="max init Gaussians for a single run; larger clouds train as ground-"
              "plane tiles and merge (default: 2/3 of cap_max; 0 disables tiling)",
-    )
-    ap.add_argument(
-        "--lod-levels", type=int, default=TrainParams.lod_levels,
-        help="LOD ladder levels exported beside trained.ply (0 disables)",
-    )
-    ap.add_argument(
-        "--compact", action=argparse.BooleanOptionalAction, default=TrainParams.compact,
-        help="post-training compaction: delete unrenderable + off-surface "
-             "Gaussians (+ optional budget frac), then heal the survivors",
-    )
-    ap.add_argument(
-        "--compact-eps", type=float, default=TrainParams.compact_eps,
-        help="lossless deletion threshold (default 0.5/255: below it a Gaussian "
-             "cannot move any pixel by half an 8-bit step)",
-    )
-    ap.add_argument(
-        "--surface-max-dist", type=float, default=TrainParams.surface_max_dist,
-        help="delete Gaussians farther than this (m) from any Stage-3 surfel "
-             "(floater cull; 0 disables)",
-    )
-    ap.add_argument(
-        "--compact-max-db-drop", type=float, default=TrainParams.compact_max_db_drop,
-        help="quality-gated budget cut: accept the deepest cut whose measured "
-             "PSNR drop stays within this many dB (bisection; <=0 disables the "
-             "search and falls back to --compact-keep-frac)",
-    )
-    ap.add_argument(
-        "--compact-keep-frac", type=float, default=TrainParams.compact_keep_frac,
-        help="fixed fallback: keep only the top this-fraction by normalized "
-             "contribution (used when the dB gate is disabled)",
-    )
-    ap.add_argument(
-        "--compact-heal-steps", type=int, default=TrainParams.compact_heal_steps,
-        help="fine-tune steps after deletion so survivors fill in (0 disables)",
     )
     ap.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
@@ -2617,28 +2819,19 @@ def _main() -> None:
         run=args.run,
         slot=args.slot,
         model=args.model,
-        cloud_path=args.cloud,
-        refs_dir=args.refs,
+        colmap_dir=args.colmap,
         out_path=args.out,
         params=TrainParams(
             iterations=args.iterations,
             epochs=args.epochs,
             refine_stop_iter=args.refine_stop_iter,
             batch=args.batch,
+            init_opa=args.init_opa,
+            init_scale=args.init_scale,
             ckpt_every=args.ckpt_every,
             vram_min_free_gb=args.vram_min_free_gb,
             antialias=args.antialias,
-            depth_densify=args.depth_densify,
             tile_max=args.tile_max,
-            lod_levels=args.lod_levels,
-            compact=args.compact,
-            compact_eps=args.compact_eps,
-            surface_max_dist=args.surface_max_dist,
-            compact_max_db_drop=(
-                args.compact_max_db_drop if args.compact_max_db_drop and args.compact_max_db_drop > 0 else None
-            ),
-            compact_keep_frac=args.compact_keep_frac,
-            compact_heal_steps=args.compact_heal_steps,
         ),
         resume=args.resume,
         progress=_log,

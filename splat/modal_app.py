@@ -4,11 +4,13 @@ Deploy with `modal deploy splat/modal_app.py` from the repo root; drive it with
 `splat/modal_sync.py` (CLI or from the server). The split:
 
   * LOCAL (Mac): stages 1-3 — scene manifest, free-space grid, surfel cloud.
-  * MODAL (one A100-40GB container): stage 4 (camera plan — CUDA ray-march),
-    stage 5 (reference renders — headless Chromium against the loopback host in
-    `splat/modal_capture.py`), stage 6 (gsplat 2DGS fine-tune → RAW `trained.ply`),
-    stage 7 (delete + heal + final-prune → delivered `healed.ply` + LOD ladder,
-    then `splat/quantize.py` → `healed.sqz`).
+  * MODAL (one A100-40GB container): stage 4 (camera plan — zone-driven
+    single-shot field, pure CPU; lives here only to keep the stage chain in
+    one place), stage 5 (reference renders — headless Chromium against the
+    loopback host in `splat/modal_capture.py`), stage 6 (gsplat 2DGS
+    fine-tune → RAW `trained.ply`), stage 7 (delete + heal + final-prune →
+    delivered `healed.ply` + LOD ladder, then `splat/quantize.py` →
+    `healed.sqz`).
 
 DATA MODEL — one `modal.Volume` ("starshot-splat-cells"):
 
@@ -18,9 +20,9 @@ DATA MODEL — one `modal.Volume` ("starshot-splat-cells"):
     cells/{run}/{slot}/{model}/inputs/          tier.json ({node_id: sha}),
                                                 freespace.npz,
                                                 freespace.npz.skin.npy.zst,
-                                                cloud.ply.zst, manifest.json
-    cells/{run}/{slot}/{model}/splat/           cameras.json, patches.bin,
-                                                patch_views.json, refs/, ckpt/,
+                                                cloud.ply.zst, scene.json,
+                                                manifest.json
+    cells/{run}/{slot}/{model}/splat/           cameras.json, refs/, ckpt/,
                                                 trained.ply (RAW, stage 6),
                                                 healed.ply (+ LODs, stage 7),
                                                 healed.sqz, status.json
@@ -350,12 +352,12 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     spec = {
       run, slot, model: str,
       stages: [4,5,6,7] (any contiguous or sparse subset),
-      input_sha: {freespace, skin, cloud, tier: str},   # uncompressed content
+      input_sha: {freespace, skin, cloud, scene, tier: str},  # uncompressed
       plan / train / quant: {} param overrides (dataclass field names),
       force: bool,
     }
     """
-    from splat import modal_capture, quantize
+    from splat import colmap as splat_colmap, modal_capture, quantize
     from splat.stage4 import PlanParams, plan_cameras
     from splat.stage6 import TrainParams, heal_splat, train_splat
 
@@ -396,12 +398,8 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     # the Volume at stage boundaries with a commit each.
     freespace = _ensure_input(inputs, "freespace.npz", in_sha["freespace"], scratch)
     _ensure_input(inputs, "freespace.npz.skin.npy", in_sha["skin"], scratch)
-    cloud = _ensure_input(inputs, "cloud.ply", in_sha["cloud"], scratch)
-    # Optional texel-size sidecar (Stage 3): materialized beside cloud.ply so
-    # Stage 4's content-anchored ladder auto-discovers it; legacy pushes
-    # without one plan through the radius-proxy path unchanged.
-    if in_sha.get("stex"):
-        _ensure_input(inputs, "cloud.ply.stex.npy", in_sha["stex"], scratch)
+    cloud = _ensure_input(inputs, "cloud.ply", in_sha["cloud"], scratch)  # stage-6 init
+    scene = _ensure_input(inputs, "scene.json", in_sha["scene"], scratch)
 
     # Per-stage CODE versions (see _src_sig): fold the DEPLOYED pipeline source
     # into each stage's cache signature, so editing a stage + redeploying re-runs
@@ -422,17 +420,18 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
         # so a change there re-renders stage 5 instead of silently reusing frames.
         _js / "splatlight.js",
     )
-    code6 = _src_sig(Path(_stage6.__file__))
+    # Stage 6 now trains from the COLMAP export, so its code sig folds in colmap.py
+    # too — editing the exporter re-runs stage 6 rather than reusing a stale model.
+    code6 = _src_sig(Path(_stage6.__file__), Path(splat_colmap.__file__))
     # (stage 7 = heal + quantize folds its own source hash inline — both stage6.py
     # and quantize.py — so no standalone code7 here.)
 
-    # ---- stage 4: coverage camera plan -----------------------------------------
+    # ---- stage 4: camera plan (zone-driven single-shot field; CPU) --------------
     plan_params = PlanParams(**(spec.get("plan") or {}))
-    sig4 = _sig({"in": [in_sha["freespace"], in_sha["skin"], in_sha["cloud"],
-                        in_sha.get("stex", "")],
+    sig4 = _sig({"in": [in_sha["freespace"], in_sha["skin"], in_sha["scene"]],
                  "params": plan_params.as_summary(), "code": code4})
     cameras = out / "cameras.json"
-    art4 = [cameras, out / "patches.bin", out / "patch_views.json"]
+    art4 = [cameras]
     if 4 in stages:
         if not force and _fresh(status, "4", sig4, art4):
             summary["stages_skipped"].append(4)
@@ -440,13 +439,12 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             s4 = plan_cameras(
                 run=run, slot=slot, model=model,
                 freespace_path=freespace,
-                surfels_path=cloud,
+                scene_path=scene,
                 out_path=scratch / "cameras.json",
                 params=plan_params,
                 progress=heart.stage("plan"),
             )
-            for name in ("cameras.json", "patches.bin", "patch_views.json"):
-                shutil.copyfile(scratch / name, out / name)
+            shutil.copyfile(scratch / "cameras.json", cameras)
             _record(status, status_path, "4", sig4, s4)
             summary["stages_run"].append(4)
             summary["plan"] = s4
@@ -463,7 +461,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
         else:
             refs_scratch = scratch / "refs"
             # RESUME vs REPLAN. Frames are keyed by POSITIONAL view id
-            # (cam00042_+x), so frames rendered under a DIFFERENT camera plan
+            # (cam00042), so frames rendered under a DIFFERENT camera plan
             # collide with the new plan's ids — blindly "resuming" across a replan
             # would skip re-rendering every colliding view and hand Stage 6 the
             # OLD plan's pixels against the NEW plan's poses (silently corrupt
@@ -529,7 +527,14 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             summary["stages_skipped"].append(6)
         else:
             refs_scratch = scratch / "refs"
-            _sync_dir(out / "refs", refs_scratch)  # train reads from local disk
+            _sync_dir(out / "refs", refs_scratch)  # export reads refs from local disk
+            # Stage 6 now trains from a COLMAP model (the Postshot-style point cloud
+            # + poses + images) — build it once from this cell's Stage-3 cloud +
+            # Stage-5 refs into local scratch, rebuilt on force or when absent.
+            colmap_scratch = scratch / "colmap"
+            if force or not (colmap_scratch / splat_colmap.CAMERAS_TXT).is_file():
+                heart.stage("train")(0, 0, "building COLMAP model (points3D + cameras + images)")
+                splat_colmap.export_colmap(refs_scratch, cloud, colmap_scratch)
             # out_path lives ON the Volume: trained.ply + LODs land durably and
             # stage-6 checkpoints (splat/ckpt beside it) survive preemption, so
             # Modal's retry resumes mid-training. A fresh (non-resume) run must
@@ -538,8 +543,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                 shutil.rmtree(out / "ckpt", ignore_errors=True)
             s6 = train_splat(
                 run=run, slot=slot, model=model,
-                cloud_path=cloud,
-                refs_dir=refs_scratch,
+                colmap_dir=colmap_scratch,
                 out_path=trained,
                 params=train_params,
                 resume=not force,

@@ -493,9 +493,14 @@ def smoke_train(spec: dict[str, Any]) -> dict[str, Any]:
     # LODs/checkpoints off for speed. Nothing is written to the Volume.
     compact = bool(spec.get("compact", False))
     train_overrides = spec.get("train") or {}
+    # Stage 6 trains from a COLMAP model now (the Postshot-style point cloud + poses
+    # + images) — build one from this cell's refs + cloud into scratch, then train.
+    from splat import colmap as _colmap
+    colmap_dir = scratch / "colmap"
+    _colmap.export_colmap(refs, cloud, colmap_dir)
     summary = train_splat(
         run=run, slot=slot, model=model,
-        cloud_path=cloud, refs_dir=refs, out_path=scratch_out,
+        colmap_dir=colmap_dir, out_path=scratch_out,
         params=TrainParams(
             iterations=iterations, compact=compact, lod_levels=0, ckpt_every=0,
             **train_overrides,

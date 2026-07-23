@@ -10,15 +10,12 @@ the two-phase fill, then asserts the grid, the point queries, and the summary:
     nested (exposed to room air), so the sofa hollow must stay GARBAGE;
   * a closed CABINET with a BOTTLE fully inside — fully nested, so the rescue
     trigger must fire and the cabinet cavity must become FREE;
-  * slab interiors (wall hollows) → GARBAGE; the exterior margin → FREE;
+  * slab interiors (wall hollows) → GARBAGE; the exterior margin → EMPTY;
   * a BLEND glass pane → occupies (`occupied`) but doesn't occlude
     (`occluding`); opaque walls do both;
-  * the CLEARANCE PASS: FREE ⊂ EMPTY (near-surface air is empty but not
-    camera-placeable), `free_candidates` honours the baked threshold, and
-    `apply_clearance` re-bakes it in place without re-voxelizing;
-  * the SVX2 viz pack (occupied/garbage triples + clearance-DESC empty quads);
-  * the npz schema is exactly the single-grid layout, and a pre-clearance
-    `freespace.npz` is REJECTED with the re-run error.
+  * the SVX3 viz pack (cover/garbage quads + the single free shell);
+  * the npz schema is exactly the trimmed layout, and old layouts (dense
+    fields, candidate lists) are REJECTED with the re-run error.
 
 Run from the repo root:  splat/.venv/bin/python smoke_stage2_freespace.py
 """
@@ -37,7 +34,6 @@ import trimesh
 
 from splat.stage2 import (
     FreeSpaceParams,
-    apply_clearance,
     compute_free_space,
     load_free_space,
 )
@@ -45,7 +41,7 @@ from splat.stage2 import (
 LEGACY_GRID = Path("runs/good_opus_new_hotel2/hotel-room/opus-new/splat/freespace.npz")
 NPZ_SCHEMA = {
     "origin", "pitch", "dims", "occ_lin", "occ_lin_glass",
-    "skin_lin", "zone_lin", "cand_pos", "cand_clear", "clearance_m",
+    "skin_lin", "zone_lin",
 }
 
 _results: list[tuple[str, bool, str]] = []
@@ -138,21 +134,12 @@ def main() -> int:
             k: summary[k]
             for k in (
                 "pitch", "dims", "solid_voxels", "glass_voxels", "empty_voxels",
-                "free_voxels", "candidates", "garbage_voxels", "skin_bricks",
-                "zone_bricks", "fill",
+                "garbage_voxels", "skin_bricks", "zone_bricks", "fill",
             )
         }
         print(json.dumps(slim, indent=1))
 
         check("requested pitch kept", summary["pitch"] == 0.03)
-        # Default clearance == one voxel: every candidate sits in reached air
-        # ≥ 1 voxel from cover by construction, so the baked filter passes the
-        # ENTIRE candidate list out of the box.
-        check(
-            "default (one-voxel) clearance passes every candidate",
-            summary["free_voxels"] == summary["candidates"] > 0,
-            f"free={summary['free_voxels']} candidates={summary['candidates']}",
-        )
         check(
             "rescue fired for exactly the bottle",
             summary["fill"]["objects_sealed"] == ["bottle"]
@@ -170,7 +157,6 @@ def main() -> int:
             )
 
         fs = load_free_space(out_path)
-        check("baked clearance loaded", fs.clearance_m == 0.03, f"clearance_m={fs.clearance_m}")
 
         def empty_at(p: list[float]) -> bool:
             return bool(fs.empty_at(np.array([p], dtype=np.float64))[0])
@@ -181,30 +167,6 @@ def main() -> int:
         check("wall slab interior is GARBAGE", not empty_at([0.05, 1.5, 2.0]))
         check("sofa hollow is GARBAGE (cushion is exposed)", not empty_at([2.2, 0.5, 1.4]))
         check("cabinet cavity is EMPTY (bottle rescued it)", empty_at([5.1, 0.5, 4.1]))
-
-        # Re-bake a production-style threshold and exercise the candidate
-        # filter (instant — candidates carry their clearance annotations):
-        # tightening must shrink the passing set without touching anything else.
-        patch35 = apply_clearance(out_path, 0.35)
-        fs35 = load_free_space(out_path)
-        c35 = fs35.free_candidates()
-        check(
-            "apply(0.35): candidate filter tightens",
-            fs35.clearance_m == 0.35
-            and 0 < patch35["free_voxels"] < summary["candidates"]
-            and patch35["free_voxels"] == len(c35),
-            f"passing@0.35={patch35['free_voxels']} of {summary['candidates']}",
-        )
-        # Every passing candidate sits in EMPTY air, and each one's annotated
-        # clearance honours the threshold; a candidate hugging the floor
-        # (clearance < 0.35) must have been filtered out.
-        in_empty = bool(fs35.empty_at(c35.astype(np.float64)).all())
-        check("candidates@0.35 sit in EMPTY air", len(c35) > 0 and in_empty)
-        kept = fs35.cand_clear[fs35.cand_clear >= 0.35 - 3e-4]
-        check(
-            "candidate annotations honour the threshold",
-            len(kept) == len(c35) and bool((kept >= 0.35 - 3e-4).all()),
-        )
 
         # Cover classes: glass occupies but never occludes; opaque does both.
         pane_pt = np.array([[1.4, 1.0, 2.52]])
@@ -249,11 +211,10 @@ def main() -> int:
             and off == len(viz),
             f"cover={n_cov} garbage={n_gar} shells={n_shells}",
         )
-        ts = [t for t, _, _ in shells]
         check(
-            "SVX3 shell ladder ascends and includes the baked clearance",
-            ts == sorted(ts) and any(abs(t - fs.clearance_m) < 1e-6 for t in ts),
-            f"thresholds={[round(t, 3) for t in ts]}",
+            "SVX3 free shell present (single, threshold field vestigial)",
+            len(shells) == 1 and shells[0][1].size > 0,
+            f"shells={len(shells)}",
         )
 
         def exposed_faces(mask: np.ndarray) -> int:
@@ -284,20 +245,8 @@ def main() -> int:
         )
         check("SVX3 garbage shell present", int(gar_q["r"].sum()) > 0)
 
-        # A second re-bake tightens monotonically; grid data untouched.
-        patch = apply_clearance(out_path, 0.8)
-        fs2 = load_free_space(out_path)
-        check(
-            "apply_clearance re-bakes monotonically",
-            fs2.clearance_m == 0.8
-            and patch["free_voxels"] == len(fs2.free_candidates())
-            and 0 < patch["free_voxels"] < patch35["free_voxels"]
-            and np.array_equal(fs2.skin_lin, fs.skin_lin),
-            f"passing@0.35={patch35['free_voxels']} passing@0.8={patch['free_voxels']}",
-        )
-
-    # Pre-candidate layouts (whatever generation is on disk, or a synthesized
-    # one) must be rejected with the re-run error, not half-loaded.
+    # Old layouts (whatever generation is on disk, or a synthesized one) must
+    # be rejected with the re-run error, not half-loaded.
     with tempfile.TemporaryDirectory(prefix="smoke-legacy-") as tmp:
         legacy_path = Path(tmp) / "freespace.npz"
         np.savez(
@@ -311,15 +260,15 @@ def main() -> int:
         )
         try:
             load_free_space(legacy_path)
-            check("pre-candidate grid is rejected", False, "loaded without error")
+            check("old grid layout is rejected", False, "loaded without error")
         except ValueError as exc:
-            check("pre-candidate grid is rejected", "re-run Stage 2" in str(exc))
+            check("old grid layout is rejected", "re-run Stage 2" in str(exc))
     if LEGACY_GRID.is_file():
         try:
             load_free_space(LEGACY_GRID)
-            print("[NOTE] on-disk grid already carries the candidate layout")
+            print("[NOTE] on-disk grid already carries the trimmed layout")
         except ValueError as exc:
-            check("on-disk pre-candidate grid is rejected", "re-run Stage 2" in str(exc))
+            check("on-disk candidate-era grid is rejected", "re-run Stage 2" in str(exc))
 
     failed = [name for name, ok, _ in _results if not ok]
     print(f"\n{len(_results) - len(failed)}/{len(_results)} checks passed")

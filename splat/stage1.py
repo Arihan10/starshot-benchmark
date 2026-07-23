@@ -37,7 +37,7 @@ import numpy as np
 
 from splat.assets import load_geoms
 
-MANIFEST_VERSION = 1
+MANIFEST_VERSION = 2
 MANIFEST_NAME = "scene.json"
 
 # A placed mesh's world AABB should equal its bbox event to within this (metres);
@@ -68,6 +68,42 @@ def read_scene_tree(events_path: Path) -> dict[str, dict[str, Any]]:
             if event.get("kind") == "bbox" and "id" in event:
                 nodes[event["id"]] = event
     return nodes
+
+
+def read_zone_meta(events_path: Path) -> tuple[dict[str, bool], dict[str, str]]:
+    """Per-zone atomicity + per-node zone OWNERSHIP from the divider log.
+
+    `zone_atomic` maps zone id → the divider's `is_atomic` verdict
+    (`divider.zone_plan` events): True = a leaf place populated with objects,
+    False = a container decomposed into sub-zones. `owner` maps a generated
+    node id → the zone whose generation pass emitted it
+    (`generation.decompose` / `generation.next` events) — the semantic
+    "which place does this belong to" that the structural `parent_id` chain
+    does not encode (a bed's parent is the carpet floor, which belongs to
+    the shell zone, not the bedroom). Tolerates a torn final line."""
+    zone_atomic: dict[str, bool] = {}
+    owner: dict[str, str] = {}
+    with events_path.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # torn tail line, or a non-JSON record
+            kind = event.get("kind")
+            if kind == "divider.zone_plan" and event.get("node"):
+                zone_atomic[str(event["node"])] = bool(event.get("is_atomic"))
+            elif kind == "generation.decompose" and event.get("zone"):
+                zone = str(event["zone"])
+                for obj in event.get("objects") or []:
+                    oid = obj.get("id") if isinstance(obj, dict) else obj
+                    if oid:
+                        owner[str(oid)] = zone
+            elif kind == "generation.next" and event.get("zone") and event.get("id"):
+                owner[str(event["id"])] = str(event["zone"])
+    return zone_atomic, owner
 
 
 def placed_object_ids(raw_dir: Path) -> set[str]:
@@ -190,7 +226,28 @@ def assemble_cell(
         raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
 
     nodes = read_scene_tree(events_path)
+    zone_atomic, owner = read_zone_meta(events_path)
     placed = placed_object_ids(raw_dir)
+
+    def _owning_zone(nid: str) -> str | None:
+        """The zone a node belongs to: generation-event provenance first
+        (authoritative — objects structurally parent to whatever supports
+        them, across zones), else the nearest zone ancestor via `parent_id`.
+        Zone nodes resolve to their ENCLOSING zone (None for root)."""
+        got = owner.get(nid)
+        if got is not None:
+            return got
+        seen: set[str] = set()
+        cur = (nodes.get(nid) or {}).get("parent_id")
+        while cur and cur not in seen:
+            seen.add(cur)
+            n = nodes.get(cur)
+            if n is None:
+                return None
+            if n.get("node_kind") == "zone":
+                return cur
+            cur = n.get("parent_id")
+        return None
 
     # Which nodes are meshable (frame/object) and actually have a mesh on disk.
     meshable = {
@@ -267,18 +324,25 @@ def assemble_cell(
     tree = []
     for nid, n in nodes.items():
         corners = _bbox_corners(n)
-        tree.append(
-            {
-                "id": nid,
-                "kind": n.get("node_kind"),
-                "parent_id": n.get("parent_id"),
-                "bbox_min": [round(v, 5) for v in corners[0].tolist()] if corners else None,
-                "bbox_max": [round(v, 5) for v in corners[1].tolist()] if corners else None,
-                "orientation": int(n.get("orientation", 0) or 0),
-                "has_mesh": nid in have_mesh_set,
-                "is_leaf": nid not in parent_ids,
-            }
-        )
+        kind = n.get("node_kind")
+        entry = {
+            "id": nid,
+            "kind": kind,
+            "parent_id": n.get("parent_id"),
+            "zone": _owning_zone(nid),
+            "bbox_min": [round(v, 5) for v in corners[0].tolist()] if corners else None,
+            "bbox_max": [round(v, 5) for v in corners[1].tolist()] if corners else None,
+            "orientation": int(n.get("orientation", 0) or 0),
+            "has_mesh": nid in have_mesh_set,
+            "is_leaf": nid not in parent_ids,
+        }
+        if kind == "zone":
+            # The divider's own verdict: True = an atomic place populated
+            # with objects (Stage 4 gives it a panorama station), False = a
+            # container of sub-zones (establishing views only). None = the
+            # zone never got a plan event (very old logs).
+            entry["is_atomic"] = zone_atomic.get(nid)
+        tree.append(entry)
 
     manifest_rel = None
     if runs_dir is not None:

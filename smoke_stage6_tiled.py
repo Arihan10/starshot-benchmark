@@ -1,10 +1,11 @@
 """End-to-end smoke test for Stage-6 TILED training + LOD export.
 
 Needs no pipeline artifacts: builds a synthetic surfel scene (checkered ground,
-walls, colored pillars), renders legacy PNG-triple references with gsplat itself
-(exact poses + depth, like Stage 5 provides), then trains TILED with a tiny
-budget that forces a multi-tile grid, and asserts the merged output + LOD ladder.
-A short single-run control guards the untiled path against regressions.
+walls, colored pillars), renders PNG references with gsplat itself (exact poses,
+like Stage 5 provides), EXPORTS a COLMAP model from them (points3D + cameras +
+images — the Postshot-style input Stage 6 now trains from), then trains TILED with
+a tiny budget that forces a multi-tile grid, and asserts the merged output + LOD
+ladder. A short single-run control guards the untiled path against regressions.
 
 Run on the GPU box:  python smoke_stage6_tiled.py
 """
@@ -18,6 +19,7 @@ from pathlib import Path
 
 import numpy as np
 
+from splat.colmap import export_colmap
 from splat.stage6 import (
     _SH_C0,
     TrainParams,
@@ -161,8 +163,14 @@ def main() -> None:
     shutil.rmtree(OUT, ignore_errors=True)
     OUT.mkdir(parents=True, exist_ok=True)
     cloud, refs = OUT / "cloud.ply", OUT / "refs"
+    colmap_dir = OUT / "colmap"
     build_scene(cloud)
     render_refs(cloud, refs)
+    # Stage 6 trains from a COLMAP model now — export one (points3D + cameras +
+    # images) from the rendered refs + the surfel cloud, exactly like
+    # splat_to_colmap.py, then train the tiler from it.
+    export_colmap(refs, cloud, colmap_dir)
+    print(f"colmap model -> {colmap_dir}")
 
     def log(done: int, total: int, msg: str) -> None:
         print(f"  [{done}/{total}] {msg}", flush=True)
@@ -171,10 +179,9 @@ def main() -> None:
     t0 = time.perf_counter()
     tiled = train_splat(
         run="smoke", slot="tiled", model="x",
-        cloud_path=cloud, refs_dir=refs, out_path=OUT / "trained_tiled.ply",
+        colmap_dir=colmap_dir, out_path=OUT / "trained_tiled.ply",
         params=TrainParams(
-            iterations=500, refine_start_iter=100, depth_densify_start=150,
-            depth_densify_every=200, depth_densify_max=1500,
+            iterations=500, refine_start_iter=100,
             tile_max=6000, lod_levels=2, lod_min_count=1500,
             ckpt_every=0, eval_max_views=12, log_every=100,
             batch=1,  # pin the reference (batch-1) schedule: this tests tiling
@@ -186,7 +193,10 @@ def main() -> None:
     assert tiled["tiles"] is not None and len(tiled["tiles"]) >= 4, "expected a multi-tile grid"
     assert all(t["views"] > 0 for t in tiled["tiles"]), "a tile trained with no views"
     assert tiled["splats_final"] > 5000, "merged model suspiciously small"
-    assert tiled["metrics"] is not None and tiled["metrics"]["psnr"] > 18.0, (
+    # Point-cloud init (opacity/scale/orientation reset the gsplat way) needs more
+    # steps than the old surfel init to reach a given PSNR, so this short run only
+    # guards that the tiled path trains + merges coherently, not final quality.
+    assert tiled["metrics"] is not None and tiled["metrics"]["psnr"] > 12.0, (
         f"tiled PSNR too low: {tiled['metrics']}"
     )
     assert tiled["lod"], "LOD ladder missing"
@@ -205,7 +215,7 @@ def main() -> None:
     print("\n=== single-run control (tile_max=0) ===")
     single = train_splat(
         run="smoke", slot="single", model="x",
-        cloud_path=cloud, refs_dir=refs, out_path=OUT / "trained_single.ply",
+        colmap_dir=colmap_dir, out_path=OUT / "trained_single.ply",
         params=TrainParams(
             iterations=250, refine_start_iter=100, tile_max=0,
             lod_levels=1, lod_min_count=1500, ckpt_every=0,
@@ -215,7 +225,7 @@ def main() -> None:
         resume=False, progress=log,
     )
     assert single["tiles"] is None, "single run must not tile"
-    assert single["metrics"] is not None and single["metrics"]["psnr"] > 18.0, (
+    assert single["metrics"] is not None and single["metrics"]["psnr"] > 12.0, (
         f"single PSNR too low: {single['metrics']}"
     )
     print("single summary:", json.dumps({k: single[k] for k in (

@@ -204,7 +204,7 @@ function freeSpaceControl(cell) {
         doneTitle: "recompute the free-space grid",
         errLabel: "free space failed — retry",
         doneText: (s) => {
-            const n = s.summary && s.summary.free_voxels;
+            const n = s.summary && s.summary.empty_voxels;
             return n != null ? `${n.toLocaleString()} vox` : null;
         },
         start: (c) => startStage(c, "stage2", api.splatStage2Start),

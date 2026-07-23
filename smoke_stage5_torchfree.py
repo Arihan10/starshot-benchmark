@@ -4,8 +4,8 @@ Validates the reference-render CONTRACT module — everything the capture server
 side runs — on any host:
   * intrinsics_matrix          — focal + principal point at 90 deg
   * opencv_c2w                 — orthonormal, right-handed, OpenCV axis semantics
-  * enumerate_views            — (camera, face) fan-out + c2w consistency
-  * load_camera_plan           — schema guard
+  * enumerate_views            — one view per single-shot camera + c2w consistency
+  * load_camera_plan           — schema guard (plan_version 2; legacy rejected)
   * depth codec                — encode/decode round-trip, background code 0,
                                  near-clamp, and the GPU pack-shader formula match
   * write_reference_frame      — the encode-pool worker: raw RGBA + depth codes →
@@ -28,7 +28,18 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from splat import stage5
-from splat.stage4 import CUBE_FACES, CUBE_FACE_NAMES
+
+# Representative forward/up bases (the retired cube-face table) — still the
+# right probe set for the OpenCV axis-semantics checks: all six axes incl.
+# the ±Y poles where the up vector must switch.
+BASES = {
+    "+x": {"forward": [1.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0]},
+    "-x": {"forward": [-1.0, 0.0, 0.0], "up": [0.0, 1.0, 0.0]},
+    "+y": {"forward": [0.0, 1.0, 0.0], "up": [0.0, 0.0, -1.0]},
+    "-y": {"forward": [0.0, -1.0, 0.0], "up": [0.0, 0.0, 1.0]},
+    "+z": {"forward": [0.0, 0.0, 1.0], "up": [0.0, 1.0, 0.0]},
+    "-z": {"forward": [0.0, 0.0, -1.0], "up": [0.0, 1.0, 0.0]},
+}
 
 FAILS: list[str] = []
 
@@ -48,7 +59,7 @@ check("intrinsics principal point centered", np.isclose(K[0, 2], R / 2) and np.i
       f"cx={K[0,2]}, cy={K[1,2]}")
 
 # --- opencv_c2w axis semantics ----------------------------------------------
-for name, basis in CUBE_FACES.items():
+for name, basis in BASES.items():
     c2w = stage5.opencv_c2w(np.zeros(3), np.asarray(basis["forward"]), np.asarray(basis["up"]))
     Rm = c2w[:3, :3]
     orth = np.allclose(Rm @ Rm.T, np.eye(3), atol=1e-9)
@@ -67,7 +78,7 @@ for name, basis in CUBE_FACES.items():
 # is R_cv · diag(1,−1,−1). Verify that mapping is a pure axis flip (so the two
 # conventions agree by construction — the page never builds an OpenCV matrix).
 flip = np.diag([1.0, -1.0, -1.0])
-for name, basis in CUBE_FACES.items():
+for name, basis in BASES.items():
     Rm = stage5.opencv_c2w(np.zeros(3), np.asarray(basis["forward"]), np.asarray(basis["up"]))[:3, :3]
     gl = Rm @ flip
     # GL camera: column 2 = backward (−forward), column 1 = up.
@@ -101,22 +112,28 @@ check("GPU pack-shader formula matches encode_depth_u16 (±1 code)",
 
 # --- enumerate_views ---------------------------------------------------------
 plan = {
-    "intrinsics": {"resolution": R, "face_fov_deg": 90.0, "near": near, "far": far},
-    "cube_faces": CUBE_FACES,
+    "plan_version": 2,
+    "intrinsics": {"resolution": R, "fov_deg": 70.0, "near": near, "far": far},
     "cameras": [
-        {"pos": [0.0, 1.0, 0.0], "faces": [{"dir": "+x", "covers": 5}, {"dir": "-z", "covers": 3}]},
-        {"pos": [1.0, 1.0, 2.0], "faces": [{"dir": "+y", "covers": 2}]},
+        {"pos": [0.0, 1.0, 0.0], "forward": [1.0, 0.0, 0.0],
+         "up": [0.0, 1.0, 0.0], "kind": "fill", "zone": "root"},
+        {"pos": [0.0, 1.0, 0.0], "forward": [0.0, 0.0, -1.0],
+         "up": [0.0, 1.0, 0.0], "kind": "station", "zone": "root"},
+        {"pos": [1.0, 1.0, 2.0], "forward": [0.0, 1.0, 0.0],
+         "up": [0.0, 0.0, -1.0], "kind": "shell", "zone": None},
     ],
 }
 views = stage5.enumerate_views(plan)
-check("enumerate_views count = sum of faces", len(views) == 3, f"got {len(views)}")
+check("enumerate_views: one view per camera", len(views) == 3, f"got {len(views)}")
 v0 = views[0]
 c2w_expected = stage5.opencv_c2w(np.array([0.0, 1.0, 0.0]),
-                                 np.asarray(CUBE_FACES["+x"]["forward"]),
-                                 np.asarray(CUBE_FACES["+x"]["up"]))
+                                 np.array([1.0, 0.0, 0.0]),
+                                 np.array([0.0, 1.0, 0.0]))
 check("enumerate_views c2w matches opencv_c2w", np.allclose(v0["c2w"], c2w_expected))
 check("enumerate_views ids unique + formatted",
-      {v["id"] for v in views} == {"cam00000_+x", "cam00000_-z", "cam00001_+y"})
+      {v["id"] for v in views} == {"cam00000", "cam00001", "cam00002"})
+check("enumerate_views carries the rig kind",
+      [v["kind"] for v in views] == ["fill", "station", "shell"])
 
 # --- load_camera_plan schema guard + frame writer + resume + transforms -------
 with tempfile.TemporaryDirectory() as td:
@@ -131,13 +148,21 @@ with tempfile.TemporaryDirectory() as td:
     check("load_camera_plan accepts valid schema", ok_good)
 
     bad = Path(td) / "bad.json"
-    bad.write_text(json.dumps({"cameras": []}), encoding="utf-8")  # missing intrinsics/cube_faces
+    # A legacy cubemap plan: no plan_version, cameras carry faces not poses.
+    bad.write_text(
+        json.dumps({
+            "intrinsics": {"resolution": R, "face_fov_deg": 90.0},
+            "cube_faces": {},
+            "cameras": [{"pos": [0, 0, 0], "faces": ["+x"]}],
+        }),
+        encoding="utf-8",
+    )
     try:
         stage5.load_camera_plan(bad)
         raised = False
     except ValueError:
         raised = True
-    check("load_camera_plan rejects legacy/incomplete schema", raised)
+    check("load_camera_plan rejects legacy cubemap schema", raised)
 
     # --- write_reference_frame: the encode-pool worker (SZF container) --------
     # NOTE: refs/frames/ is deliberately NOT pre-created — the writer must own
@@ -177,7 +202,7 @@ with tempfile.TemporaryDirectory() as td:
     check("view_rendered true once the SZF frame exists", stage5.view_rendered(out_dir, vid))
     pend = stage5.pending_views(out_dir, views)
     check("pending_views excludes the rendered view",
-          {v["id"] for v in pend} == {"cam00000_-z", "cam00001_+y"})
+          {v["id"] for v in pend} == {"cam00001", "cam00002"})
 
     # --- write_transforms round-trip -------------------------------------------
     out = stage5.write_transforms(out_dir, K, R, near, far, stage5.reference_frames(views))

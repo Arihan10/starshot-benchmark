@@ -710,15 +710,15 @@ async function runCapture() {
     );
     const ring = createReadbackRing(renderer, R);
 
-    // Pending ids → render entries via the plan (id = cam{index:05d}_{face}).
+    // Pending ids → render entries via the plan (id = cam{index:05d}; each
+    // plan camera is a single shot carrying its own forward/up basis).
     const queue = [];
     for (const vid of manifest.pending) {
-        const m = /^cam(\d+)_(.+)$/.exec(vid);
+        const m = /^cam(\d+)$/.exec(vid);
         if (!m) throw new Error(`unparseable view id from server: ${vid}`);
         const cam = plan.cameras[Number(m[1])];
-        const face = plan.cube_faces[m[2]];
-        if (!cam || !face) throw new Error(`view ${vid} not in the camera plan`);
-        queue.push({ id: vid, pos: cam.pos, face });
+        if (!cam || !cam.forward) throw new Error(`view ${vid} not in the camera plan`);
+        queue.push({ id: vid, pos: cam.pos, face: { forward: cam.forward, up: cam.up } });
     }
 
     // The render thread does ONLY GPU work + PBO copies; the depth swizzle, SRF1

@@ -131,17 +131,24 @@ def export_colmap(
 
     records = []
     for i, fr in enumerate(frames, 1):
-        stem = Path(fr["frame_path"]).stem
+        src = fr.get("frame_path") or fr.get("file_path")
+        if src is None:
+            raise ValueError(f"frame {i} has neither 'frame_path' (SZF) nor 'file_path' (PNG)")
+        stem = Path(src).stem
         w2c = np.linalg.inv(np.asarray(fr["transform_matrix"], dtype=np.float64))
         q = rotmat2qvec(w2c[:3, :3])
         t = w2c[:3, 3]
-        records.append((i, stem, q, t))
+        records.append((i, stem, q, t, fr))
 
     def _decode(rec: tuple) -> None:
-        stem = rec[1]
-        (out_dir / f"{stem}.png").write_bytes(
-            stage5.frame_preview_png(frames_dir / f"{stem}{stage5.FRAME_SUFFIX}")
-        )
+        stem, fr = rec[1], rec[4]
+        dst = out_dir / f"{stem}.png"
+        if fr.get("frame_path"):
+            dst.write_bytes(
+                stage5.frame_preview_png(frames_dir / f"{stem}{stage5.FRAME_SUFFIX}")
+            )
+        else:  # legacy PNG-triple refs: the RGB is already a PNG beside transforms.json
+            shutil.copyfile(refs_dir / fr["file_path"], dst)
 
     with ThreadPoolExecutor(max_workers=_workers(jobs)) as pool:
         list(pool.map(_decode, records))
@@ -152,7 +159,7 @@ def export_colmap(
         "#   POINTS2D[] as (X, Y, POINT3D_ID)\n",
         f"# Number of images: {len(records)}, mean observations per image: 0\n",
     ]
-    for i, stem, q, t in records:
+    for i, stem, q, t, _fr in records:
         img_lines.append(
             f"{i} {q[0]:.10g} {q[1]:.10g} {q[2]:.10g} {q[3]:.10g} "
             f"{t[0]:.10g} {t[1]:.10g} {t[2]:.10g} 1 {stem}.png\n\n"

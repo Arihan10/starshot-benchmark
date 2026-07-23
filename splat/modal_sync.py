@@ -57,7 +57,7 @@ _TIER_CANDIDATES = (
     "objects-optimized",
 )
 # Artifacts pulled back after a run; refs stay remote.
-_PULL_ALWAYS = ("cameras.json", "patches.bin", "patch_views.json", "status.json")
+_PULL_ALWAYS = ("cameras.json", "status.json")
 
 
 def _zstd():
@@ -184,11 +184,17 @@ def _remote_inputs_manifest(vol: modal.Volume, cell_key: str) -> dict[str, str]:
 
 
 def push_cell(
-    cell_dir: Path, tier_dir: Path | None = None, quiet: bool = False
+    cell_dir: Path, tier_dir: Path | None = None, quiet: bool = False,
+    include_cameras: bool = False,
 ) -> dict[str, Any]:
     """Upload one cell's stage-4-onward inputs (deduped, compressed where it
-    pays). Returns {run, slot, model, input_sha:{freespace, skin, cloud, tier}}
-    — exactly the identity block `run_cell` needs."""
+    pays). Returns {run, slot, model, input_sha:{freespace, skin, cloud,
+    scene, tier}} — exactly the identity block `run_cell` needs.
+
+    `include_cameras` ALSO uploads the LOCAL Stage-4 plan (`splat/cameras.json`)
+    to the cell's `splat/` dir on the Volume — where `run_cell`'s stage 5 reads
+    it — so a locally-planned camera set drives the remote render and stage 4 is
+    skipped ('continue on modal'). Without it, stage 4 (re)plans on the A100."""
     zstandard = _zstd()
     run, slot, model = _cell_parts(cell_dir)
     cell_key = f"{run}/{slot}/{model}"
@@ -198,13 +204,14 @@ def push_cell(
     freespace = splat_dir / "freespace.npz"
     skin = splat_dir / "freespace.npz.skin.npy"
     cloud = splat_dir / "cloud.ply"
-    for p in (freespace, skin, cloud):
+    scene = splat_dir / "scene.json"
+    cameras = splat_dir / "cameras.json"
+    required = [freespace, skin, cloud, scene] + ([cameras] if include_cameras else [])
+    for p in required:
         if not p.is_file():
-            raise FileNotFoundError(f"{p} missing — run stages 2-3 locally first")
-    # Optional per-surfel texel-size sidecar (Stage 3): Stage 4's content-
-    # anchored ladder reads it; legacy clouds without one still plan (proxy path).
-    stex = splat_dir / "cloud.ply.stex.npy"
-    has_stex = stex.is_file()
+            raise FileNotFoundError(
+                f"{p} missing — run stages 1-{4 if include_cameras else 3} locally first"
+            )
 
     def log(msg: str) -> None:
         if not quiet:
@@ -212,7 +219,7 @@ def push_cell(
 
     glbs = _placed_glbs(tier)
     t0 = time.perf_counter()
-    hashes = _hash_files([*glbs, freespace, skin, cloud, *([stex] if has_stex else [])])
+    hashes = _hash_files([*glbs, *required])
     tier_manifest = {p.name[: -len(".glb")]: hashes[p] for p in glbs}
     tier_sha = hashlib.sha256(
         json.dumps(tier_manifest, sort_keys=True).encode("utf-8")
@@ -221,11 +228,12 @@ def push_cell(
         "freespace": hashes[freespace],
         "skin": hashes[skin],
         "cloud": hashes[cloud],
+        "scene": hashes[scene],
         "tier": tier_sha,
     }
-    if has_stex:
-        input_sha["stex"] = hashes[stex]
-    log(f"hashed {len(glbs)} meshes + {3 + has_stex} inputs in {time.perf_counter() - t0:.1f}s")
+    if include_cameras:
+        input_sha["cameras"] = hashes[cameras]
+    log(f"hashed {len(glbs)} meshes + {len(required)} inputs in {time.perf_counter() - t0:.1f}s")
 
     vol = _volume()
     have = _existing_cas_shas(vol)
@@ -241,6 +249,14 @@ def push_cell(
                 sha = hashes[p]
                 batch.put_file(p, f"/objects/{sha[:2]}/{sha}.glb")
                 uploaded_bytes += p.stat().st_size
+
+            # The local Stage-4 plan is a stage OUTPUT, not an input: it lands in
+            # the cell's splat/ dir on the Volume (persistent stage state), where
+            # run_cell's stage 5 reads `out/cameras.json`. Always re-sent (tiny),
+            # so 'continue' always renders THIS local plan.
+            if include_cameras:
+                batch.put_file(cameras, f"/cells/{cell_key}/splat/cameras.json")
+                uploaded_bytes += cameras.stat().st_size
 
             def put_json(payload: Any, remote: str) -> None:
                 # Close mkstemp's fd (see _compress_to_tmp) so the finally-unlink
@@ -259,7 +275,7 @@ def push_cell(
                 (freespace, "freespace.npz", False),
                 (skin, "freespace.npz.skin.npy", True),
                 (cloud, "cloud.ply", True),
-                *([(stex, "cloud.ply.stex.npy", True)] if has_stex else []),
+                (scene, "scene.json", False),
             ):
                 if remote_manifest.get(name) == hashes[src]:
                     continue
@@ -279,7 +295,7 @@ def push_cell(
                     "freespace.npz": hashes[freespace],
                     "freespace.npz.skin.npy": hashes[skin],
                     "cloud.ply": hashes[cloud],
-                    **({"cloud.ply.stex.npy": hashes[stex]} if has_stex else {}),
+                    "scene.json": hashes[scene],
                     "tier": tier_sha,
                     "tier_dir": tier.name,
                     "pushed_at": datetime.now(timezone.utc).isoformat(
@@ -501,6 +517,9 @@ def _main() -> None:
     add_cell(p, tier=True)
     p.add_argument("--stages", type=_parse_stages, default=[4, 5, 6, 7],
                    help="e.g. 4-7, 4, or 6,7 (default 4-7)")
+    p.add_argument("--with-cameras", action="store_true",
+                   help="upload the LOCAL splat/cameras.json and skip stage 4 "
+                        "('continue on modal'); pair with --stages 5-7")
     p.add_argument("--plan-json", default="{}", help="PlanParams overrides")
     p.add_argument("--train-json", default="{}", help="TrainParams overrides")
     p.add_argument("--quant-json", default="{}", help="QuantConfig overrides")
@@ -539,7 +558,7 @@ def _main() -> None:
         return
 
     if args.cmd == "run":
-        pushed = push_cell(args.cell, args.tier)
+        pushed = push_cell(args.cell, args.tier, include_cameras=args.with_cameras)
         call_id = spawn_cell(
             args.cell, pushed, args.stages,
             plan=json.loads(args.plan_json),

@@ -458,7 +458,7 @@ def capture_refs(
             "resolution": int(intr["resolution"]),
             "near": float(intr["near"]),
             "far": float(intr["far"]),
-            "fov_deg": float(intr["face_fov_deg"]),
+            "fov_deg": float(intr["fov_deg"]),
             "cameras_path": cameras_path,
             "tier": tier,
             "cas_dir": cas_dir,
