@@ -1,4 +1,4 @@
-"""Stage 5 — Reference renders (UNLIT) via the debug viewer's WebGL stack.
+"""Stage 5 — Reference renders (LIT PBR + scene reflections) via the debug viewer's WebGL stack.
 
 Stage 5 turns the Stage-4 camera plan into the per-view supervision the Stage-6
 gsplat fine-tune trains against. It is split across three pieces; THIS module is
@@ -9,7 +9,8 @@ resume signal, transforms writer) — it renders nothing itself:
     running the exact same WebGL stack as the debug viewer (three.js GLTFLoader
     + KTX2Loader + MeshoptDecoder). It loads the cell's SPLAT asset tier
     (KTX2/ETC1S textures stay GPU-compressed, Meshopt geometry stays quantized),
-    renders every (camera, face) of the plan unlit, and streams raw frames back.
+    renders every (camera, face) of the plan LIT (PBR + baked per-object scene
+    reflections), and streams raw frames back.
   * `server/app/services/refcapture.py` — the ORCHESTRATOR: launches a headless
     Chromium/Edge at the capture page, ingests its frame batches, and encodes
     frames on a process pool (this module's `write_reference_frame`).
@@ -28,11 +29,13 @@ UI's patch inspector (`frame_preview_png`); machines never read PNG.
 
 Per view the SZF planes are:
 
-  * **RGB** — unlit albedo (base-color texel × baseColorFactor; no lighting, no
-    tone mapping, no sRGB↔linear conversion — texels pass through and BLEND in
-    the stored sRGB space, exactly how gsplat composites its training target).
-    Transparent (alphaMode=BLEND) surfaces alpha-blend over what's behind them;
-    empty pixels show the background (black).
+  * **RGB** — the LIT scene: PBR materials (authored metallic-roughness + per-
+    object baked scene reflections) shaded in LINEAR light by the fixed rig (sun +
+    shadows + image-based ambient), then ACES-filmic tone-mapped + sRGB-encoded —
+    the display colour gsplat trains against (view-DEPENDENT, so Stage-6 degree-3
+    SH reconstructs the moving highlights + reflections). Transparent
+    (alphaMode=BLEND) surfaces composite via weighted-blended OIT; empty pixels
+    show the background (black).
   * **alpha** — the RGBA A channel: ACCUMULATED coverage 1−Π(1−αᵢ) in [0,1]
     (glass-over-wall ~1, glass-over-void the pane's own alpha).
   * **depth** — planar camera-space Z in metres (gsplat `D`/`ED` "projection
@@ -121,7 +124,7 @@ _DEPTH_CODE_MAX = 65535   # uint16 max; code 0 == background
 # clear colour and anything compositing against the refs.
 BACKGROUND_RGB = (0.0, 0.0, 0.0)
 
-# --- lighting (Phase 1: baked lighting) ----------------------------------------
+# --- lighting + reflections (baked into the reference frames) -------------------
 # The FIXED light rig every reference view is rendered with, mirrored from the
 # debug mesh viewer (client/public/js/scene3d.js) so the trained splat looks like
 # the mesh preview. It is deliberately constant and scene-independent: identical
@@ -131,7 +134,7 @@ BACKGROUND_RGB = (0.0, 0.0, 0.0)
 # the horizon). Colour is shaded in LINEAR light and encoded to sRGB through a
 # fixed ACES-filmic tone map at `exposure` — no auto-exposure — in splatcapture.js.
 LIGHTING: dict[str, Any] = {
-    "env": 0.35,            # image-based ambient (RoomEnvironment) intensity
+    "env": 0.35,            # image-based ambient (neutral uniform env) intensity
     "key": 3.5,             # sun (directional light) intensity
     "fill": 0.2,            # hemisphere fill intensity
     "azimuth_deg": 34.0,
@@ -139,6 +142,20 @@ LIGHTING: dict[str, Any] = {
     "shadows": True,
     "tone_mapping": "aces_filmic",
     "exposure": 1.0,
+    # Real scene reflections (client/public/js/reflections.js): per-reflective-
+    # object cube probes baked ONCE at capture time. A material reflects the actual
+    # scene when its roughness ≤ `max_rough`; each such object gets a PMREM'd cube
+    # of the surrounding opaque scene as its envMap, so metals / water / glossies
+    # mirror the environment (not the generic RoomEnvironment IBL) — the view-
+    # dependent signal Stage-6 degree-3 SH reconstructs. Mirrors reflections.js
+    # REFLECTION_DEFAULTS; recorded in capture.json so tuning it re-captures.
+    "reflections": {
+        "enabled": True,
+        "max_rough": 0.5,
+        "cube_size": 256,
+        "max_probes": 24,
+        "intensity": 1.0,
+    },
 }
 
 # Bumped whenever the COLOUR PIPELINE itself changes (tone map / transfer / how
@@ -147,7 +164,27 @@ LIGHTING: dict[str, Any] = {
 # with their authored metallic-roughness (reflective) instead of forced matte.
 # v3: transparent surfaces composite through weighted-blended OIT (order-
 # independent), so objects behind glass render correctly instead of going black.
-COLOR_PIPELINE = "linear-aces-srgb-v3"
+# v4: reflective surfaces (roughness ≤ reflections.max_rough) reflect the REAL
+# scene via per-object baked cube probes (client/public/js/reflections.js) instead
+# of the generic RoomEnvironment IBL, so the captured view-dependent highlights are
+# the actual environment (what Stage-6 degree-3 SH reconstructs).
+# v5: the image-based ambient is a NEUTRAL uniform environment (no emissive light
+# panels). Trellis marks nearly every surface metalness=1, whose whole look is its
+# env reflection — RoomEnvironment's studio panels reflected as a fake "source
+# light" hotspot on every surface, unoccluded by the real room. The uniform env
+# has no such hotspot, so only the baked cube probes show real, occluded reflections.
+# v6: light-emitting meshes (lamps / screens / fire — curated names in
+# client/public/js/emissive.js) now GLOW (HDR emissive) and cast a real point light
+# that illuminates the scene with baked, occlusion-respecting shadows.
+# v7: matte surfaces mis-tagged metalness=1 by Trellis are demoted to dielectric
+# (oit.js prepareOITScene) so the sun/ambient light their albedo — a fully-metallic
+# matte surface has no diffuse and went black under the neutral env. Glossy/mirror
+# surfaces keep metalness and reflect via the cube probes.
+# v8: emissive point lights (emissive.js) cap the number that cast SHADOWS (each
+# shadow map is a fragment texture unit; WebGL guarantees only 16, so too many made
+# material shaders fail to link → black meshes on light-heavy scenes). Extra
+# emissive lights still illuminate without shadows.
+COLOR_PIPELINE = "linear-aces-srgb-v8"
 
 # Sidecar under a cell's refs/ recording the capture settings the on-disk frames
 # were rendered with, so a resume can detect a change (see `reconcile_capture_meta`).

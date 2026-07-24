@@ -14,13 +14,21 @@
 //      depth → POST binary SRF1 batches to …/frames?token=…
 //   4. POST …/finish?token=… → the server verifies + writes transforms.json.
 //
-// LIT capture (Phase 1): materials render as PBR surfaces (authored metallic-
-// roughness intact, so metals/glossies reflect + highlight per view) under a FIXED
-// light rig (splatlight.js — image-based ambient + a shadow-casting sun + a
-// hemisphere fill, shared with the debug viewers), so lighting and shadows
-// are baked into the reference frames. The rig is sent by the server (manifest
-// `lighting`, = splat/stage5.py LIGHTING) and recorded in transforms.json, so it
-// is identical for every view and every (resumed) session.
+// LIT capture: materials render as PBR surfaces (authored metallic-roughness
+// intact, so metals/glossies reflect + highlight per view) under a FIXED light rig
+// (splatlight.js — image-based ambient + a shadow-casting sun + a hemisphere fill,
+// shared with the debug viewers), so lighting, shadows, and reflections are baked
+// into the reference frames. The rig is sent by the server (manifest `lighting`, =
+// splat/stage5.py LIGHTING) and recorded in transforms.json, so it is identical
+// for every view and every (resumed) session.
+//
+// FULL SCENE REFLECTIONS (reflections.js): before the render loop, each reflective
+// object (roughness ≤ maxRough) gets a per-object cube map of the surrounding
+// opaque scene baked ONCE and PMREM-prefiltered into its envMap — so metals /
+// water / glossies mirror the ACTUAL scene, not the generic RoomEnvironment IBL.
+// That is the view-dependent signal Stage-6 degree-3 SH reconstructs; baking once
+// (scene + lighting are static) keeps the cost off both per-view capture and
+// training.
 //
 // Per view, three passes:
 //   * scene pass   → rtScene (RGBA16F + float depth): the lit scene shaded in
@@ -49,6 +57,8 @@ import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { normalizeLighting, createLightRig } from "./splatlight.js";
+import { bakeReflectionProbes } from "./reflections.js";
+import { applyEmissiveLighting } from "./emissive.js";
 import {
     OIT_LAYER,
     TONEMAP_GLSL,
@@ -56,6 +66,7 @@ import {
     prepareOITScene,
     collectOITMaterials,
     decorateOITLights,
+    bakeShadowMap,
 } from "./oit.js";
 
 const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
@@ -608,6 +619,7 @@ async function loadScene(renderer, bundleUrl) {
             try {
                 const gltf = await parseGlb(glbB.buffer);
                 prepareOITScene(gltf.scene, oitPass);
+                gltf.scene.userData.objectId = id; // for emissive.js name matching
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -686,6 +698,12 @@ async function runCapture() {
     const rawLighting = manifest.lighting || {};
     const lighting = normalizeLighting(rawLighting);
     const sceneBox = new THREE.Box3().setFromObject(scene);
+    // Emissive meshes (lamps / screens / fire — emissive.js curated names): make
+    // them glow AND add a point light each so they illuminate the scene. Added
+    // before the shadow + reflection bakes so their (occluding) shadows bake once
+    // and their glow + illumination are baked into the cubes and the frames.
+    const emissive = applyEmissiveLighting(scene, scene);
+    if (emissive.count > 0) status(`emissive: ${emissive.count} light source(s)`);
     // decorateOITLights puts the sun + hemi fill on all layers so the glass moved
     // onto OIT_LAYER by prepareOITScene is still lit (not just IBL-lit).
     const rig = createLightRig(renderer, scene, {
@@ -693,11 +711,23 @@ async function runCapture() {
         decorateLights: decorateOITLights,
     });
     rig.refit(sceneBox);
-    renderer.shadowMap.needsUpdate = true;
+    // Bake the shadow map seeing ALL casters (opaque + OIT layers) before the loop:
+    // Trellis marks everything alphaMode=BLEND so every surface is on the OIT layer,
+    // and the per-view opaque pass (camera on layer 0) would otherwise bake an empty
+    // shadow map — no shadows in the refs. Frozen afterwards (autoUpdate off).
+    bakeShadowMap(renderer, scene);
     status(
         `lighting: env ${lighting.env} · sun ${lighting.key} @ ${lighting.azimuth}°/` +
             `${lighting.elevation}° · ${rawLighting.tone_mapping || "aces_filmic"} exposure ${lighting.exposure}`,
     );
+
+    // Real scene reflections, baked ONCE (scene + lighting are static): reflective
+    // objects (roughness ≤ maxRough) reflect the actual opaque scene via per-object
+    // PMREM cube probes instead of the generic RoomEnvironment IBL — the view-
+    // dependent signal Stage-6 degree-3 SH learns. The shadow map is rendered by
+    // the first bake pass (needsUpdate set above) and reused by every view.
+    const refl = bakeReflectionProbes(renderer, scene, { background: manifest.background, oitPass });
+    if (refl.probes > 0) status(`reflections: ${refl.probes} scene probe(s) baked`);
 
     const capture = createCapture(
         renderer,

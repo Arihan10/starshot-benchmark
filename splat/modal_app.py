@@ -155,11 +155,20 @@ image = (
     .add_local_file(
         _REPO / "client/public/js/splatcapture.js", f"{_ASSETS}/js/splatcapture.js"
     )
-    # splatcapture.js imports the shared weighted-blended OIT engine (glass); the
-    # loopback host serves it from /js, so it MUST be baked in or the page's ES
-    # module graph 404s and no frames render.
+    # splatcapture.js imports the shared weighted-blended OIT engine (oit.js — glass
+    # compositing + the all-layers shadow bake), the per-object scene-reflection
+    # baker (reflections.js), and the emissive-light rig (emissive.js — glowing
+    # lamps/screens + their point lights); the loopback host serves them from /js,
+    # so they MUST be baked in or the page's ES module graph 404s and no frames
+    # render.
     .add_local_file(
         _REPO / "client/public/js/oit.js", f"{_ASSETS}/js/oit.js"
+    )
+    .add_local_file(
+        _REPO / "client/public/js/reflections.js", f"{_ASSETS}/js/reflections.js"
+    )
+    .add_local_file(
+        _REPO / "client/public/js/emissive.js", f"{_ASSETS}/js/emissive.js"
     )
     .add_local_file(
         _REPO / "client/public/js/splatlight.js", f"{_ASSETS}/js/splatlight.js"
@@ -417,10 +426,13 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     code5 = _src_sig(
         Path(_stage5.__file__), Path(modal_capture.__file__),
         _js / "splatcapture.js", _js / "splatcapture-worker.js",
-        # splatlight.js defines the bake rig + the (now matte, view-independent)
-        # material prep, so it too determines every captured pixel — fold it in
-        # so a change there re-renders stage 5 instead of silently reusing frames.
-        _js / "splatlight.js",
+        # splatlight.js (bake rig), oit.js (weighted-blended OIT + the all-layers
+        # shadow bake), reflections.js (per-object scene reflections), and
+        # emissive.js (emissive glow + point lights) all determine every captured
+        # pixel — fold them in so a change there re-renders stage 5 instead of
+        # silently reusing frames.
+        _js / "splatlight.js", _js / "oit.js", _js / "reflections.js",
+        _js / "emissive.js",
     )
     code6 = _src_sig(Path(_stage6.__file__))
     # (stage 7 = heal + quantize folds its own source hash inline — both stage6.py

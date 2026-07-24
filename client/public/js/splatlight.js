@@ -2,12 +2,12 @@
 // for the "what gets trained" look, used by the headless reference capture
 // (splatcapture.js), the splat debug viewer's "original" mesh mode
 // (splatviewer.js), and the main mesh viewer (scene3d.js). Mirrors the fixed
-// bake rig in splat/stage5.py (LIGHTING): image-based ambient (RoomEnvironment)
-// + a hemisphere fill + one shadow-casting sun, shaded in linear light and
-// displayed through an ACES-filmic + sRGB transform.
+// bake rig in splat/stage5.py (LIGHTING): image-based ambient (a NEUTRAL uniform
+// environment — no reflected light-panel hotspot) + a hemisphere fill + one
+// shadow-casting sun, shaded in linear light and displayed through an ACES-filmic
+// + sRGB transform.
 
 import * as THREE from "three";
-import { RoomEnvironment } from "three/addons/environments/RoomEnvironment.js";
 
 const SHADOW_MAP_SIZE = 4096;
 
@@ -204,10 +204,19 @@ export function createLightRig(renderer, scene, opts = {}) {
 	} = opts;
 	const state = normalizeLighting(defaults);
 
+	// Image-based lighting from a NEUTRAL, hotspot-free environment. The old source,
+	// three.js' RoomEnvironment, is a synthetic studio with bright emissive light
+	// panels — and because Trellis marks nearly every surface metalness=1 (a fully
+	// metallic surface's whole look IS its env reflection), those panels reflected
+	// as a bright "source light" on every wall / glossy surface, unoccluded by the
+	// real room (a closed bathroom still reflected a light that isn't there). A
+	// UNIFORM env carries the same ambient fill with NO reflected hotspot, so
+	// metallic surfaces read as flat-lit (tinted by their base colour) and only the
+	// baked per-object cube probes (reflections.js) show real, occluded reflections.
 	const pmrem = new THREE.PMREMGenerator(renderer);
-	const envScene = new RoomEnvironment(renderer);
-	const envTex = pmrem.fromScene(envScene, 0.04).texture;
-	envScene.dispose();
+	const envScene = new THREE.Scene();
+	envScene.background = new THREE.Color(0xffffff);
+	const envTex = pmrem.fromScene(envScene).texture;
 	pmrem.dispose();
 	scene.environment = envTex;
 

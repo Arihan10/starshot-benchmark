@@ -32,7 +32,10 @@ import {
     collectOITMaterials,
     createScreenOIT,
     decorateOITLights,
+    bakeShadowMap,
 } from "./oit.js";
+import { bakeReflectionProbes } from "./reflections.js";
+import { applyEmissiveLighting } from "./emissive.js";
 
 let overlay = null;
 let canvasEl = null;
@@ -50,6 +53,8 @@ let freeShells = null; // [{t, cells, mesh}] per pre-meshed clearance threshold 
 let voxelLights = null; // scene lights (THREE.Group) for solid voxel-only mode, lazy
 let meshGroup = null; // original-mesh overlay (THREE.Group), lazy
 let meshRig = null; // shared lit rig (splatlight) for the "original" mesh view
+let meshReflections = null; // baked per-object scene reflections (reflections.js), disposed on teardown
+let meshEmissive = null; // emissive-mesh lights (emissive.js), disposed on teardown
 let meshLit = false; // is the lit rig currently applied to the shared renderer?
 let prevRenderState = null; // renderer tone-map/shadow state saved while lit
 let meshLightingConfig = null; // this cell's captured LIGHTING (transforms.json), cached
@@ -260,6 +265,10 @@ async function teardown() {
     meshOit?.dispose();
     meshOit = null;
     meshOitMats = [];
+    meshReflections?.dispose();
+    meshReflections = null;
+    meshEmissive?.dispose();
+    meshEmissive = null;
     closeSogView(); // the PlayCanvas canvas lives in canvasEl too (replaceChildren below)
     // Overlays live in the viewer's threeScene; free their GPU resources and
     // reset their toggles before the viewer (and its GL context) goes away.
@@ -1211,7 +1220,9 @@ async function buildMeshGroup() {
     let off = 4; // past the "SMB1" magic
     while (off + 4 <= buf.length) {
         const idLen = dv.getUint32(off, true);
-        off += 4 + idLen; // skip the id string
+        off += 4;
+        const id = dec.decode(buf.subarray(off, off + idLen)); // object id (for emissive.js)
+        off += idLen;
         if (off + 4 > buf.length) break;
         const glbLen = dv.getUint32(off, true);
         off += 4;
@@ -1221,6 +1232,7 @@ async function buildMeshGroup() {
         try {
             const gltf = await loader.parseAsync(glb, "");
             prepareOITScene(gltf.scene, meshOitPass); // glass via OIT, like the capture
+            gltf.scene.userData.objectId = id; // for emissive.js name matching
             group.add(gltf.scene);
         } catch {
             /* skip a bad object */
@@ -1295,7 +1307,28 @@ async function enableMeshLighting() {
 	}
 	meshRig.setEnabled(true);
 	meshRig.refit(new THREE.Box3().setFromObject(meshGroup));
-	viewer.renderer.shadowMap.needsUpdate = true;
+	// Emissive meshes (emissive.js curated names): glow + a point light each so they
+	// illuminate the preview exactly like the refs. Before the shadow + reflection
+	// bakes so their (occluding) shadows bake once and their glow/illumination enter
+	// the reflection cubes.
+	if (!meshEmissive) meshEmissive = applyEmissiveLighting(meshGroup, viewer.threeScene);
+	// Bake the shadow map seeing ALL casters (opaque + OIT layers): Trellis marks
+	// every surface alphaMode=BLEND, so they all live on the OIT layer, and the OIT
+	// render bakes shadows during its layer-0 opaque pass — which would test out
+	// every caster and leave the scene shadowless. Frozen afterwards (autoUpdate off).
+	bakeShadowMap(viewer.renderer, viewer.threeScene);
+	// Bake per-object scene reflections ONCE (the same reflections.js the Stage-5
+	// capture uses) so the mesh preview shows the SAME view-dependent reflections
+	// the refs — and therefore the trained splat — will. root = meshGroup: the
+	// viewer wraps every object in one group, so probe per object inside it; cube
+	// void = black, matching the capture background.
+	if (!meshReflections) {
+		meshReflections = bakeReflectionProbes(viewer.renderer, viewer.threeScene, {
+			root: meshGroup,
+			background: [0, 0, 0],
+			oitPass: meshOitPass,
+		});
+	}
 	meshLit = true;
 	startMeshRender();
 	viewer.forceRenderNextFrame?.();

@@ -13,6 +13,14 @@ export const OIT_LAYER = 1;
 // window frames/mullions stay opaque, sub-cutoff glass blends and stays see-through.
 export const OIT_OPAQUE = 0.8;
 
+// oitPass selector values. 0 accumulate · 1 revealage · 2 depth pre-pass are the
+// weighted-blended OIT sub-passes; OPAQUE (3) is a passthrough that emits the
+// normal lit colour with no OIT weighting — used by the reflection-probe bake
+// (reflections.js) to render these BLEND-but-solid surfaces into a cube map as
+// opaque geometry (Trellis marks nearly every surface alphaMode=BLEND, so they
+// live on the OIT layer; a probe that skipped them would capture an empty scene).
+export const OIT_PASS_OPAQUE = 3;
+
 // ACES-filmic + sRGB (three.js' exact fit), shared by the opaque present pass and
 // the OIT composite so both paths store identical display colour.
 export const TONEMAP_GLSL = /* glsl */ `
@@ -54,6 +62,14 @@ export function patchMaterialOIT(m, oitPass) {
     m.blending = THREE.CustomBlending;
     m.blendEquation = THREE.AddEquation;
     m.blendEquationAlpha = THREE.AddEquation;
+    // Solid-vs-glass SHADOW casting: give the shadow depth pass the same OIT_OPAQUE
+    // cutoff the render uses. three.js copies the source material's alphaTest + map
+    // onto the shadow depth material, so an α<OIT_OPAQUE fragment (real glass) is
+    // discarded there and casts NO shadow — light passes through — while solid
+    // regions (frames/mirror, α≈1) still cast. The alpha-test is stripped from the
+    // LIT shader below so the OIT accumulate pass keeps BLENDING the glass instead
+    // of discarding it. Needs a base-colour map for the per-texel alpha.
+    if (m.map) m.alphaTest = OIT_OPAQUE;
     const prev = m.onBeforeCompile;
     m.onBeforeCompile = (shader, rndr) => {
         if (prev) prev(shader, rndr);
@@ -63,11 +79,17 @@ export function patchMaterialOIT(m, oitPass) {
                 "#include <common>",
                 "#include <common>\nuniform float uOITPass;",
             )
+            // Drop the lit shader's alpha-test — `alphaTest` above is for the SHADOW
+            // depth pass ONLY. The OIT passes below decide per-pass whether to blend
+            // (accumulate) or cut (depth pre-pass) via uOITPass, and must not discard
+            // sub-cutoff glass in the accumulate pass.
+            .replace("#include <alphatest_fragment>", "")
             .replace(
                 "#include <dithering_fragment>",
                 `#include <dithering_fragment>
                 float _a = gl_FragColor.a;
-                if (uOITPass > 1.5) { if (_a < ${OIT_OPAQUE}) discard; }
+                if (uOITPass > 2.5) { /* opaque passthrough: keep the lit colour (reflection bake) */ }
+                else if (uOITPass > 1.5) { if (_a < ${OIT_OPAQUE}) discard; }
                 else {
                     float _ac = _a >= ${OIT_OPAQUE} ? 1.0 : _a;
                     if (uOITPass < 0.5) {
@@ -80,7 +102,7 @@ export function patchMaterialOIT(m, oitPass) {
             );
     };
     const prevKey = m.customProgramCacheKey?.bind(m);
-    m.customProgramCacheKey = () => "oit1|" + (prevKey ? prevKey() : "");
+    m.customProgramCacheKey = () => "oit3|" + (prevKey ? prevKey() : "");
     m.needsUpdate = true;
 }
 
@@ -92,11 +114,17 @@ export function setOITBlend(m, accum) {
     m.blendDstAlpha = m.blendDst;
 }
 
+// Roughness at/below which a surface is treated as REFLECTIVE — it keeps its
+// metalness and earns a cube probe (reflections.js). ABOVE it, a metalness=1
+// surface is almost certainly a Trellis mis-tag of a matte dielectric and is
+// demoted (see prepareOITScene). Matches reflections.js REFLECTION_DEFAULTS.maxRough.
+export const REFLECTIVE_MAX_ROUGHNESS = 0.5;
+
 // In-place lit-scene prep: generate missing normals, cast/receive shadows, force
-// DoubleSide with back-face shadowing (Trellis winding is unreliable), and route
-// transparent meshes onto the OIT layer with the weighted-blend patch. PBR maps
-// are kept whole so metals/glossies still reflect; opaque materials keep their
-// default depth write.
+// DoubleSide with back-face shadowing (Trellis winding is unreliable), demote the
+// metalness of MATTE surfaces (see below), and route transparent meshes onto the
+// OIT layer with the weighted-blend patch. Glossy/mirror materials keep their
+// metalness so they still reflect; opaque materials keep their default depth write.
 export function prepareOITScene(root, oitPass) {
     root.traverse((child) => {
         if (!child.isMesh || !child.material) return;
@@ -110,6 +138,20 @@ export function prepareOITScene(root, oitPass) {
         for (const m of mats) {
             m.side = THREE.DoubleSide;
             m.shadowSide = THREE.BackSide;
+            // Trellis mis-tags nearly every surface metalness=1. A fully-metallic
+            // surface has NO diffuse term — its whole look is its env reflection, so
+            // with the neutral (hotspot-free) env it just goes BLACK. A MATTE surface
+            // (rough) is almost certainly a dielectric, so demote its metalness and
+            // let the sun + ambient light its albedo normally. Glossy/mirror surfaces
+            // (roughness ≤ REFLECTIVE_MAX_ROUGHNESS) keep metalness and reflect via
+            // the cube probes.
+            if (
+                m.isMeshStandardMaterial &&
+                m.metalness > 0.5 &&
+                m.roughness > REFLECTIVE_MAX_ROUGHNESS
+            ) {
+                m.metalness = 0;
+            }
             if (m.transparent) oit = true;
         }
         if (oit) {
@@ -139,6 +181,31 @@ export function collectOITMaterials(root) {
 export function decorateOITLights({ hemi, key }) {
     hemi.layers.enableAll();
     key.layers.enableAll();
+}
+
+// Bake the (static) shadow map ONCE, seeing ALL casters — the opaque layer AND the
+// OIT layer. three.js' WebGLShadowMap tests each shadow caster against the CURRENT
+// camera's layers (WebGLShadowMap.renderObject: `object.layers.test(camera.layers)`),
+// and prepareOITScene moves every transparent mesh onto OIT_LAYER. Trellis marks
+// nearly every surface alphaMode=BLEND, so in such scenes ALL geometry lives on the
+// OIT layer — and the OIT render bakes the shadow map during its opaque pass (camera
+// on layer 0), which would test out every caster and leave the map EMPTY (no
+// shadows). This renders a 1×1 throwaway from an all-layers camera to trigger the
+// shadow pass with every caster, then freezes the map (autoUpdate off) so the
+// per-pass camera-layer switching never re-bakes it empty. Scene + sun are static,
+// so once is enough; call it after the light rig is fitted, before the render loop.
+export function bakeShadowMap(renderer, scene) {
+    if (!renderer.shadowMap.enabled) return;
+    const cam = new THREE.PerspectiveCamera();
+    cam.layers.enableAll();
+    const prevTarget = renderer.getRenderTarget();
+    renderer.shadowMap.autoUpdate = false;
+    renderer.shadowMap.needsUpdate = true;
+    const rt = new THREE.WebGLRenderTarget(1, 1);
+    renderer.setRenderTarget(rt);
+    renderer.render(scene, cam); // triggers the shadow pass (all casters), 1×1 colour discarded
+    renderer.setRenderTarget(prevTarget);
+    rt.dispose();
 }
 
 // Screen compositor for the interactive mesh preview (splatviewer.js): render the
