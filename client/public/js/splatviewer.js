@@ -104,8 +104,12 @@ let modalPlanShown = false; // one-time: revealed the camera overlay when the pl
 // since a bigger scene has proportionally more views); `batch` is the GPU-fill
 // speed knob (steps = iterations // batch, constant work). Edited in the "train
 // on modal" panel; sent with every start.
+// Default 6 assumes the SURFEL INIT (stage 6 params.init="surfels": geometry
+// starts at the 2DGS solution, training only polishes blend errors). Small
+// scenes (≤ ~1k views) benefit from 10-12 to give densification enough steps;
+// from-points A/B runs want roughly double.
 let modalTrainCfg = {
-    epochs: 12,
+    epochs: 6,
     batch: 3,
 };
 
@@ -331,17 +335,17 @@ async function teardown() {
 // matte capture lighting into DC colour), and the mesh-mode dummy — therefore
 // looks identical from every angle, so nothing view-dependent biases judgement.
 function makeViewer(view) {
-	return new GaussianSplats3D.Viewer({
-		rootElement: canvasEl,
-		selfDrivenMode: true,
-		useBuiltInControls: true,
-		sharedMemoryForWorkers: false, // no COOP/COEP needed on the static server
-		dynamicScene: false,
-		sphericalHarmonicsDegree: 0, // SH disabled — the viewer is flat / view-independent by design
-		cameraUp: [0, 1, 0],
-		initialCameraPosition: view.position,
-		initialCameraLookAt: view.lookAt,
-	});
+    return new GaussianSplats3D.Viewer({
+        rootElement: canvasEl,
+        selfDrivenMode: true,
+        useBuiltInControls: true,
+        sharedMemoryForWorkers: false, // no COOP/COEP needed on the static server
+        dynamicScene: false,
+        sphericalHarmonicsDegree: 0, // SH disabled — the viewer is flat / view-independent by design
+        cameraUp: [0, 1, 0],
+        initialCameraPosition: view.position,
+        initialCameraLookAt: view.lookAt,
+    });
 }
 
 // A 1-splat PLY (INRIA 3DGS layout) as a blob URL: sub-micron scale, near-zero
@@ -429,36 +433,36 @@ async function openMeshView(seq) {
 // Build a fresh viewer and load a cloud. Every cloud renders flat (SH disabled),
 // so there is no per-cloud view-dependence to configure.
 async function loadClouds(seq, url, summary, camera) {
-	await teardown();
-	if (seq !== openSeq) return;
-	const view = camera || framing(summary && summary.scene_aabb);
-	const v = makeViewer(view);
-	viewer = v;
-	try {
-		await v.addSplatScene(url, {
-			showLoadingUI: true,
-			splatAlphaRemovalThreshold: 1,
-			// Set the format explicitly: the cache-buster query (`?t=…`) defeats
-			// mkkellogg's extension sniffing ("File format not supported").
-			format: GaussianSplats3D.SceneFormat.Ply,
-		});
-	} catch (e) {
-		if (seq === openSeq)
-			setStatus(
-				`failed: ${e && e.message ? e.message : e}`,
-				"var(--red)",
-			);
-		return;
-	}
-	if (seq !== openSeq) return;
-	v.start();
-	moveSpeed = speedFor(summary && summary.scene_aabb);
-	startMovement();
-	const baseN = summary && summary.splats;
-	setStatus(
-		baseN ? `${baseN.toLocaleString()} splats` : "loaded",
-		"var(--green)",
-	);
+    await teardown();
+    if (seq !== openSeq) return;
+    const view = camera || framing(summary && summary.scene_aabb);
+    const v = makeViewer(view);
+    viewer = v;
+    try {
+        await v.addSplatScene(url, {
+            showLoadingUI: true,
+            splatAlphaRemovalThreshold: 1,
+            // Set the format explicitly: the cache-buster query (`?t=…`) defeats
+            // mkkellogg's extension sniffing ("File format not supported").
+            format: GaussianSplats3D.SceneFormat.Ply,
+        });
+    } catch (e) {
+        if (seq === openSeq)
+            setStatus(
+                `failed: ${e && e.message ? e.message : e}`,
+                "var(--red)",
+            );
+        return;
+    }
+    if (seq !== openSeq) return;
+    v.start();
+    moveSpeed = speedFor(summary && summary.scene_aabb);
+    startMovement();
+    const baseN = summary && summary.splats;
+    setStatus(
+        baseN ? `${baseN.toLocaleString()} splats` : "loaded",
+        "var(--green)",
+    );
 }
 
 // ---- controls panel ---------------------------------------------------------
@@ -803,32 +807,6 @@ function activeShell() {
     return freeShells[i];
 }
 
-// POST the active shell's threshold to the server — re-bakes clearance_m in
-// freespace.npz (no re-voxelization) and invalidates stages 4+; until then the
-// slider is a client-side preview only.
-async function applyClearance() {
-    const shell = activeShell();
-    if (!current || !shell) return;
-    const btn = inputs._freeApply;
-    if (btn) btn.disabled = true;
-    try {
-        const st = await api.splatStage2Clearance(
-            current.run,
-            current.slot,
-            current.model,
-            { clearance: shell.t },
-        );
-        const n = (st.summary && st.summary.free_voxels) || 0;
-        setOverlay(
-            `clearance ${shell.t.toFixed(2)}m applied — ${n.toLocaleString()} free vox · stages 4+ invalidated`,
-        );
-    } catch (e) {
-        setOverlay(`clearance apply failed: ${e.message}`);
-    } finally {
-        if (btn) btn.disabled = false;
-    }
-}
-
 // Ensure Stage 2 (the voxel grid) has run for the open cell; compute + poll if not.
 async function ensureFreeSpace() {
     const c = current;
@@ -853,21 +831,21 @@ async function ensureFreeSpace() {
 // Highlight the active view in the 4-way switch. "original" is mesh mode, "sog"
 // is the PlayCanvas view; the two splat sources map to whichever .ply is loaded.
 function syncViewButtons() {
-	if (!inputs) return;
-	const active =
-		mode === "mesh"
-			? "original"
-			: mode === "sog"
-				? "sog"
-				: mode === "voxels"
-					? "voxels"
-					: splatSource;
-	inputs._surfBtn?.classList.toggle("on", active === "surfels");
-	inputs._trainBtn?.classList.toggle("on", active === "trained");
-	inputs._healBtn?.classList.toggle("on", active === "healed");
-	inputs._sogBtn?.classList.toggle("on", active === "sog");
-	inputs._origBtn?.classList.toggle("on", active === "original");
-	inputs._voxViewBtn?.classList.toggle("on", active === "voxels");
+    if (!inputs) return;
+    const active =
+        mode === "mesh"
+            ? "original"
+            : mode === "sog"
+              ? "sog"
+              : mode === "voxels"
+                ? "voxels"
+                : splatSource;
+    inputs._surfBtn?.classList.toggle("on", active === "surfels");
+    inputs._trainBtn?.classList.toggle("on", active === "trained");
+    inputs._healBtn?.classList.toggle("on", active === "healed");
+    inputs._sogBtn?.classList.toggle("on", active === "sog");
+    inputs._origBtn?.classList.toggle("on", active === "original");
+    inputs._voxViewBtn?.classList.toggle("on", active === "voxels");
 }
 
 // The .sog to VIEW: the one for the model you're evaluating (trained/healed).
@@ -896,7 +874,11 @@ function syncSogEncBtn() {
     if (!btn) return;
     const which = splatSource; // "trained" | "healed" | "surfels" | …
     const srcUrl =
-        which === "healed" ? healedUrl : which === "trained" ? trainedUrl : null;
+        which === "healed"
+            ? healedUrl
+            : which === "trained"
+              ? trainedUrl
+              : null;
     btn.disabled = sogEncoding || !srcUrl;
     btn.textContent = sogEncoding ? "compressing…" : "⤓ SOG";
     btn.title = srcUrl
@@ -910,7 +892,8 @@ function syncSogEncBtn() {
 // front so a teardown mid-encode can't break the poll.
 async function encodeActiveSog() {
     const which = splatSource;
-    if ((which !== "trained" && which !== "healed") || sogEncoding || !current) return;
+    if ((which !== "trained" && which !== "healed") || sogEncoding || !current)
+        return;
     const { run, slot, model } = current;
     sogEncoding = true;
     syncSogEncBtn();
@@ -930,9 +913,15 @@ async function encodeActiveSog() {
             break;
         }
         sogUrl = activeSogUrl();
-        setStatus(`${which} SOG ready — switch to the sog view`, "var(--green)");
+        setStatus(
+            `${which} SOG ready — switch to the sog view`,
+            "var(--green)",
+        );
     } catch (e) {
-        setStatus(`SOG encode failed: ${e && e.message ? e.message : e}`, "var(--red)");
+        setStatus(
+            `SOG encode failed: ${e && e.message ? e.message : e}`,
+            "var(--red)",
+        );
     } finally {
         sogEncoding = false;
         syncSogBtn();
@@ -944,29 +933,30 @@ async function encodeActiveSog() {
 // (Stage 6 is a backend script, so trained.ply / trained.sog just appear on disk
 // and the server surfaces both URLs — no client-side existence probe).
 function updateSourceAvail() {
-	const s6 = (cellStatus && cellStatus.stage6) || {};
-	trainedUrl = s6.url || null;
-	const btn = inputs && inputs._trainBtn;
-	if (btn) {
-		btn.disabled = !trainedUrl;
-		btn.title = trainedUrl
-			? "the Stage-6 RAW fine-tuned splat (trained.ply)"
-			: "run Stage 6 (the training script) to produce trained.ply";
-	}
-	if (!trainedUrl && splatSource === "trained") splatSource = "surfels";
+    const s6 = (cellStatus && cellStatus.stage6) || {};
+    trainedUrl = s6.url || null;
+    const btn = inputs && inputs._trainBtn;
+    if (btn) {
+        btn.disabled = !trainedUrl;
+        btn.title = trainedUrl
+            ? "the Stage-6 RAW fine-tuned splat (trained.ply)"
+            : "run Stage 6 (the training script) to produce trained.ply";
+    }
+    if (!trainedUrl && splatSource === "trained") splatSource = "surfels";
 
-	// The Stage-7 delivered splat (compacted + healed + pruned) — produced by the
-	// modal flow, surfaced as `healed_url` on the cell's modal status (non-null
-	// iff healed.ply is local). Same wiring as `trained`, one stage later.
-	healedUrl = (cellStatus && cellStatus.modal && cellStatus.modal.healed_url) || null;
-	const hbtn = inputs && inputs._healBtn;
-	if (hbtn) {
-		hbtn.disabled = !healedUrl;
-		hbtn.title = healedUrl
-			? "the Stage-7 delivered splat (healed.ply: compacted + healed + pruned)"
-			: "run Stage 7 (heal) to produce healed.ply";
-	}
-	if (!healedUrl && splatSource === "healed") splatSource = "surfels";
+    // The Stage-7 delivered splat (compacted + healed + pruned) — produced by the
+    // modal flow, surfaced as `healed_url` on the cell's modal status (non-null
+    // iff healed.ply is local). Same wiring as `trained`, one stage later.
+    healedUrl =
+        (cellStatus && cellStatus.modal && cellStatus.modal.healed_url) || null;
+    const hbtn = inputs && inputs._healBtn;
+    if (hbtn) {
+        hbtn.disabled = !healedUrl;
+        hbtn.title = healedUrl
+            ? "the Stage-7 delivered splat (healed.ply: compacted + healed + pruned)"
+            : "run Stage 7 (heal) to produce healed.ply";
+    }
+    if (!healedUrl && splatSource === "healed") splatSource = "surfels";
 
     trainedSogUrl = s6.trained_sog_url || s6.sog_url || null;
     healedSogUrl = s6.healed_sog_url || null;
@@ -1021,32 +1011,32 @@ async function setSogMode() {
 // frame, so the live camera is preserved across the reload; the fresh viewer
 // starts in splat view (mesh / voxel / patch overlays reset).
 async function setSource(next) {
-	if (next === splatSource) return;
-	const s3 = (cellStatus && cellStatus.stage3) || {};
-	if (next === "trained" && !trainedUrl) return;
-	if (next === "healed" && !healedUrl) return;
-	if (next === "surfels" && !s3.url) return;
-	splatSource = next;
-	mode = "splat";
-	sogUrl = activeSogUrl();
-	syncSogBtn();
-	syncViewButtons();
-	const cam = captureCamera();
-	const bust = `?t=${Date.now()}`;
-	cloudLoaded = true;
-	if (next === "trained" || next === "healed") {
-		const url = next === "healed" ? healedUrl : trainedUrl;
-		setStatus(`loading ${next} splat…`, "var(--purple)");
-		await loadClouds(
-			openSeq,
-			api.absUrl(url + bust),
-			{ scene_aabb: s3.summary && s3.summary.scene_aabb },
-			cam,
-		);
-	} else {
-		setStatus("loading surfels…", "var(--purple)");
-		await loadClouds(openSeq, api.absUrl(s3.url + bust), s3.summary, cam);
-	}
+    if (next === splatSource) return;
+    const s3 = (cellStatus && cellStatus.stage3) || {};
+    if (next === "trained" && !trainedUrl) return;
+    if (next === "healed" && !healedUrl) return;
+    if (next === "surfels" && !s3.url) return;
+    splatSource = next;
+    mode = "splat";
+    sogUrl = activeSogUrl();
+    syncSogBtn();
+    syncViewButtons();
+    const cam = captureCamera();
+    const bust = `?t=${Date.now()}`;
+    cloudLoaded = true;
+    if (next === "trained" || next === "healed") {
+        const url = next === "healed" ? healedUrl : trainedUrl;
+        setStatus(`loading ${next} splat…`, "var(--purple)");
+        await loadClouds(
+            openSeq,
+            api.absUrl(url + bust),
+            { scene_aabb: s3.summary && s3.summary.scene_aabb },
+            cam,
+        );
+    } else {
+        setStatus("loading surfels…", "var(--purple)");
+        await loadClouds(openSeq, api.absUrl(s3.url + bust), s3.summary, cam);
+    }
 }
 
 // The unified view switch. surfels ↔ trained reload the splat scene (a
@@ -1142,9 +1132,9 @@ async function ensureVoxels() {
         updateFreeFilter();
         const sv = (st.summary && st.summary.solid_voxels) || 0;
         const gv = (st.summary && st.summary.garbage_voxels) || 0;
-        const fv = (st.summary && st.summary.free_voxels) || 0;
+        const ev = (st.summary && st.summary.empty_voxels) || 0;
         setOverlay(
-            `occupied: ${sv.toLocaleString()} · garbage: ${gv.toLocaleString()} · free@${(p.clearance ?? 0.35).toFixed(2)}m: ${fv.toLocaleString()}`,
+            `occupied: ${sv.toLocaleString()} · garbage: ${gv.toLocaleString()} · empty: ${ev.toLocaleString()}`,
         );
         return true;
     } catch (e) {
@@ -1269,22 +1259,22 @@ async function ensureMesh() {
 // "original" mesh view matches the trained refs exactly; the shared defaults
 // stand in before a render exists (or if the fetch fails).
 async function meshLightingCfg() {
-	if (meshLightingConfig) return meshLightingConfig;
-	let cfg = LIGHTING_DEFAULTS;
-	try {
-		const c = current;
-		const s5 = await api.splatStage5Status(c.run, c.slot, c.model);
-		if (s5 && s5.status === "done" && s5.url) {
-			const doc = await fetch(api.absUrl(s5.url), {
-				cache: "no-store",
-			}).then((r) => r.json());
-			if (doc && doc.lighting) cfg = normalizeLighting(doc.lighting);
-		}
-	} catch {
-		/* stage 5 not run / unreachable — the shared defaults match the rig */
-	}
-	meshLightingConfig = cfg;
-	return cfg;
+    if (meshLightingConfig) return meshLightingConfig;
+    let cfg = LIGHTING_DEFAULTS;
+    try {
+        const c = current;
+        const s5 = await api.splatStage5Status(c.run, c.slot, c.model);
+        if (s5 && s5.status === "done" && s5.url) {
+            const doc = await fetch(api.absUrl(s5.url), {
+                cache: "no-store",
+            }).then((r) => r.json());
+            if (doc && doc.lighting) cfg = normalizeLighting(doc.lighting);
+        }
+    } catch {
+        /* stage 5 not run / unreachable — the shared defaults match the rig */
+    }
+    meshLightingConfig = cfg;
+    return cfg;
 }
 
 // Light the "original" mesh exactly like the Stage-5 capture (ACES + shadows +
@@ -1335,14 +1325,14 @@ async function enableMeshLighting() {
 }
 
 function disableMeshLighting() {
-	stopMeshRender();
-	if (!meshLit) return;
-	meshRig?.setEnabled(false);
-	if (viewer && prevRenderState)
-		restoreToneMapping(viewer.renderer, prevRenderState);
-	prevRenderState = null;
-	meshLit = false;
-	viewer?.forceRenderNextFrame?.();
+    stopMeshRender();
+    if (!meshLit) return;
+    meshRig?.setEnabled(false);
+    if (viewer && prevRenderState)
+        restoreToneMapping(viewer.renderer, prevRenderState);
+    prevRenderState = null;
+    meshLit = false;
+    viewer?.forceRenderNextFrame?.();
 }
 
 // mkkellogg owns the self-driven loop and renders the mesh scene in ONE pass
@@ -1350,24 +1340,24 @@ function disableMeshLighting() {
 // that loop and drive our own weighted-blended OIT render of viewer.threeScene —
 // the exact engine the Stage-5 capture uses — then hand the loop back on exit.
 function startMeshRender() {
-	if (meshRenderRaf || !viewer) return;
-	if (!meshOit) meshOit = createScreenOIT(viewer.renderer, meshOitPass);
-	meshOitMats = meshGroup ? collectOITMaterials(meshGroup) : [];
-	viewer.stop?.();
-	const tick = () => {
-		meshRenderRaf = requestAnimationFrame(tick);
-		if (mode !== "mesh" || !viewer || !meshOit) return;
-		viewer.controls?.update?.(); // damping + orbit, normally driven by mkkellogg
-		meshOit.render(viewer.threeScene, viewer.camera, meshOitMats);
-	};
-	meshRenderRaf = requestAnimationFrame(tick);
+    if (meshRenderRaf || !viewer) return;
+    if (!meshOit) meshOit = createScreenOIT(viewer.renderer, meshOitPass);
+    meshOitMats = meshGroup ? collectOITMaterials(meshGroup) : [];
+    viewer.stop?.();
+    const tick = () => {
+        meshRenderRaf = requestAnimationFrame(tick);
+        if (mode !== "mesh" || !viewer || !meshOit) return;
+        viewer.controls?.update?.(); // damping + orbit, normally driven by mkkellogg
+        meshOit.render(viewer.threeScene, viewer.camera, meshOitMats);
+    };
+    meshRenderRaf = requestAnimationFrame(tick);
 }
 
 function stopMeshRender() {
-	if (!meshRenderRaf) return;
-	cancelAnimationFrame(meshRenderRaf);
-	meshRenderRaf = 0;
-	viewer?.start?.(); // resume mkkellogg's loop for the splat / voxel modes
+    if (!meshRenderRaf) return;
+    cancelAnimationFrame(meshRenderRaf);
+    meshRenderRaf = 0;
+    viewer?.start?.(); // resume mkkellogg's loop for the splat / voxel modes
 }
 
 // The voxel overlays follow their checkboxes in every three.js view (splat AND
@@ -1634,292 +1624,277 @@ function buildControls(summary) {
         actual.textContent = actualText(summary);
     }
 
-	// One 3-way view switch: the pre-fine-tune surfels (Stage 3), the trained
-	// splat (Stage 6), or the original meshes — flip between all three in place
-	// for a side-by-side (same world frame → identical pose). surfels ↔ trained
-	// reload the splat; "original" reuses the mesh overlay (setMode). "trained"
-	// stays disabled until trained.ply exists.
-	mode = "splat";
-	splatSource = "surfels";
-	const surfBtn = el("button", {
-		class: "svc-seg-btn on",
-		text: "surfels",
-		title: "the pre-fine-tuning surfel cloud (Stage 3)",
-		onclick: () => setView("surfels"),
-	});
-	const trainBtn = el("button", {
-		class: "svc-seg-btn",
-		text: "trained",
-		disabled: true, // enabled by updateSourceAvail once trained.ply exists
-		onclick: () => setView("trained"),
-	});
-	const healBtn = el("button", {
-		class: "svc-seg-btn",
-		text: "healed",
-		disabled: true, // enabled by updateSourceAvail once healed.ply exists
-		onclick: () => setView("healed"),
-	});
-	const sogBtn = el("button", {
-		class: "svc-seg-btn",
-		text: "sog",
-		disabled: true, // enabled once the active model's .sog exists
-		onclick: () => setView("sog"),
-	});
-	// Action (not a view): compress the model you're evaluating (trained/healed)
-	// to SOG on the server (client/tools/ply-to-sog.mjs — local, never on Modal).
-	const sogEncBtn = el("button", {
-		class: "svc-seg-btn svc-seg-act",
-		text: "⤓ SOG",
-		disabled: true, // enabled by syncSogEncBtn when trained/healed is selected
-		onclick: () => void encodeActiveSog(),
-	});
-	const origBtn = el("button", {
-		class: "svc-seg-btn",
-		text: "original",
-		title: "the original generated meshes (same world frame)",
-		onclick: () => setView("original"),
-	});
-	const voxViewBtn = el("button", {
-		class: "svc-seg-btn",
-		text: "voxels",
-		title: "voxel-only: the stage-2 shells construct the scene as solid shaded blocks (green cover · red garbage · blue free, per their toggles below)",
-		onclick: () => setView("voxels"),
-	});
-	inputs._surfBtn = surfBtn;
-	inputs._trainBtn = trainBtn;
-	inputs._healBtn = healBtn;
-	inputs._sogBtn = sogBtn;
-	inputs._sogEncBtn = sogEncBtn;
-	inputs._origBtn = origBtn;
-	inputs._voxViewBtn = voxViewBtn;
-	const seg = el(
-		"div",
-		{ class: "svc-seg" },
-		surfBtn,
-		trainBtn,
-		healBtn,
-		sogBtn,
-		sogEncBtn,
-		origBtn,
-		voxViewBtn,
-	);
+    // One 3-way view switch: the pre-fine-tune surfels (Stage 3), the trained
+    // splat (Stage 6), or the original meshes — flip between all three in place
+    // for a side-by-side (same world frame → identical pose). surfels ↔ trained
+    // reload the splat; "original" reuses the mesh overlay (setMode). "trained"
+    // stays disabled until trained.ply exists.
+    mode = "splat";
+    splatSource = "surfels";
+    const surfBtn = el("button", {
+        class: "svc-seg-btn on",
+        text: "surfels",
+        title: "the pre-fine-tuning surfel cloud (Stage 3)",
+        onclick: () => setView("surfels"),
+    });
+    const trainBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "trained",
+        disabled: true, // enabled by updateSourceAvail once trained.ply exists
+        onclick: () => setView("trained"),
+    });
+    const healBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "healed",
+        disabled: true, // enabled by updateSourceAvail once healed.ply exists
+        onclick: () => setView("healed"),
+    });
+    const sogBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "sog",
+        disabled: true, // enabled once the active model's .sog exists
+        onclick: () => setView("sog"),
+    });
+    // Action (not a view): compress the model you're evaluating (trained/healed)
+    // to SOG on the server (client/tools/ply-to-sog.mjs — local, never on Modal).
+    const sogEncBtn = el("button", {
+        class: "svc-seg-btn svc-seg-act",
+        text: "⤓ SOG",
+        disabled: true, // enabled by syncSogEncBtn when trained/healed is selected
+        onclick: () => void encodeActiveSog(),
+    });
+    const origBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "original",
+        title: "the original generated meshes (same world frame)",
+        onclick: () => setView("original"),
+    });
+    const voxViewBtn = el("button", {
+        class: "svc-seg-btn",
+        text: "voxels",
+        title: "voxel-only: the stage-2 shells construct the scene as solid shaded blocks (green cover · red garbage · blue free, per their toggles below)",
+        onclick: () => setView("voxels"),
+    });
+    inputs._surfBtn = surfBtn;
+    inputs._trainBtn = trainBtn;
+    inputs._healBtn = healBtn;
+    inputs._sogBtn = sogBtn;
+    inputs._sogEncBtn = sogEncBtn;
+    inputs._origBtn = origBtn;
+    inputs._voxViewBtn = voxViewBtn;
+    const seg = el(
+        "div",
+        { class: "svc-seg" },
+        surfBtn,
+        trainBtn,
+        healBtn,
+        sogBtn,
+        sogEncBtn,
+        origBtn,
+        voxViewBtn,
+    );
 
-	// Stage-2 voxel overlay: occupied cells as green disks over the scene,
-	// garbage cells (sealed interiors) as red x-ray disks — one toggle, like
-	// the camera-position overlay, just denser.
-	const voxRow = checkRow("voxels", "solid voxels (green cover)", false);
-	inputs.voxels.addEventListener("change", () =>
-		setVoxels(inputs.voxels.checked),
-	);
-	const garbageRow = checkRow(
-		"garbage",
-		"garbage voxels (red · sealed interiors)",
-		false,
-	);
-	inputs.garbage.addEventListener("change", () =>
-		setVoxels(inputs.garbage.checked),
-	);
-	// FREE-voxel overlay (blue): the camera-placeable subset of empty space at
-	// the clearance slider's threshold. The slider indexes the pack's
-	// pre-meshed shell ladder (an instant geometry swap — no server call);
-	// "apply" re-bakes the threshold into freespace.npz so stage 4 plans
-	// against it (and invalidates stages 4+).
-	const freeRow = checkRow(
-		"freevox",
-		"free volume (blue · camera-placeable)",
-		false,
-	);
-	inputs.freevox.addEventListener("change", () =>
-		setFreeVoxels(inputs.freevox.checked),
-	);
-	inputs._freeVal = el("span", { class: "svc-val", text: "" });
-	const freeClearInput = el("input", {
-		type: "range",
-		class: "svc-range",
-		min: 0, // reconfigured to the shell ladder once stage 2 loads
-		max: 1,
-		step: 1,
-		value: 0,
-	});
-	inputs.freeclear = freeClearInput;
-	freeClearInput.addEventListener("input", () => updateFreeFilter());
-	const freeClearRow = el(
-		"div",
-		{ class: "svc-row" },
-		el("span", { class: "svc-lab", text: "clearance" }),
-		freeClearInput,
-		inputs._freeVal,
-	);
-	const freeApplyBtn = el("button", {
-		class: "splat-stage2-btn",
-		text: "apply",
-		title: "bake this clearance into freespace.npz (stage 4 plans against it; stages 4+ are invalidated)",
-		onclick: () => applyClearance(),
-	});
-	inputs._freeApply = freeApplyBtn;
-	const freeApplyRow = el(
-		"div",
-		{ class: "svc-row" },
-		el("span", { class: "svc-lab", text: "" }),
-		freeApplyBtn,
-	);
-	// Render style for every voxel class (cover / garbage / free): merged
-	// translucent shells (default) or a per-cell POINT cloud. Points don't form
-	// an occluding skin, so you can orbit and read a cavity's INTERIOR — e.g.
-	// whether a fridge interior is garbage (red = sealed) or free (blue).
-	const voxPointsRow = checkRow(
-		"voxpoints",
-		"point voxels (see inside cavities)",
-		false,
-	);
-	inputs.voxpoints.addEventListener("change", () => {
-		syncVoxelVisibility();
-		viewer?.forceRenderNextFrame?.();
-	});
-	// Patch inspector (needs Stage 4 + Stage 5): select a coverage patch on the
-	// splat and open its reference images in the right-side modal.
-	const patchRow = checkRow("patches", "patches (click to inspect)", false);
-	inputs.patches.addEventListener("change", () =>
-		setPatches(inputs.patches.checked),
-	);
-	// Browse the Stage-5 reference frames (RGB · alpha · depth) as a lazy
-	// thumbnail matrix + full-res inspector, decoded from the SZF containers
-	// client-side (opens its own overlay; resolves the refs via Stage-5 status).
-	const refsBtn = el("button", {
-		class: "splat-stage2-btn",
-		text: "view refs",
-		title: "browse the Stage-5 reference frames (RGB · alpha · depth)",
-		onclick: () => {
-			if (!current) return;
-			openRefsViewer({
-				run: current.run,
-				slot: current.slot,
-				model: current.model,
-				label: subEl?.textContent,
-			});
-		},
-	});
-	const refsRow = el(
-		"div",
-		{ class: "svc-row" },
-		el("span", { class: "svc-lab", text: "refs" }),
-		refsBtn,
-	);
-	// Reveal this cell's splat/ folder in the OS file browser (server-side open;
-	// the server runs on this machine).
-	const folderBtn = el("button", {
-		class: "splat-stage2-btn",
-		text: "reveal",
-		title: "open this cell's splat/ folder in your OS file browser (Explorer / Finder)",
-		onclick: async () => {
-			if (!current) return;
-			try {
-				const r = await api.splatReveal(
-					current.run,
-					current.slot,
-					current.model,
-				);
-				setStatus(`opened ${r.opened}`, "");
-			} catch (e) {
-				setStatus(`could not open folder: ${e.message}`, "#ff8080");
-			}
-		},
-	});
-	const folderRow = el(
-		"div",
-		{ class: "svc-row" },
-		el("span", { class: "svc-lab", text: "folder" }),
-		folderBtn,
-	);
-	// Export poses + surfels + rendered references to a COLMAP model under
-	// splat/colmap/ (cameras.txt + images.txt + points3D.txt + RGB PNGs) — the
-	// folder Postshot / COLMAP tools ingest (drag in → Camera Poses = Import).
-	// Needs Stage 5 (references) done; the server 409s otherwise.
-	const colmapBtn = el("button", {
-		class: "splat-stage2-btn",
-		text: "export colmap",
-		title: "write splat/colmap/ (cameras + images + points3D + PNGs) for Postshot / COLMAP import — needs Stage 5 references",
-		onclick: async () => {
-			if (!current) return;
-			const label = colmapBtn.textContent;
-			colmapBtn.disabled = true;
-			colmapBtn.textContent = "exporting…";
-			setStatus("exporting COLMAP…", "var(--purple)");
-			try {
-				const r = await api.splatColmapExport(
-					current.run,
-					current.slot,
-					current.model,
-				);
-				setStatus(
-					`COLMAP: ${r.images} images · ${r.points.toLocaleString()} points → splat/colmap (reveal to open)`,
-					"",
-				);
-			} catch (e) {
-				setStatus(`COLMAP export failed: ${e.message}`, "var(--red)");
-			} finally {
-				colmapBtn.disabled = false;
-				colmapBtn.textContent = label;
-			}
-		},
-	});
-	const colmapRow = el(
-		"div",
-		{ class: "svc-row" },
-		el("span", { class: "svc-lab", text: "colmap" }),
-		colmapBtn,
-	);
-	// Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
-	const camRow = checkRow("cameras", "camera positions", false);
-	inputs.cameras.addEventListener("change", () =>
-		setCameras(inputs.cameras.checked),
-	);
-	// Greedy-order playback: reveal the cameras in the order Stage 4 chose them,
-	// at an adjustable rate (points/sec). The count column tracks the current pick.
-	const camPlayBtn = el("button", {
-		class: "splat-stage2-btn",
-		text: "▶ play",
-		title: "reveal camera positions in the order Stage 4 greedily chose them",
-		onclick: () => toggleCamPlay(),
-	});
-	inputs._camPlayBtn = camPlayBtn;
-	inputs._camPlayVal = el("span", { class: "svc-val", text: "" });
-	const camPlayRow = el(
-		"div",
-		{ class: "svc-row" },
-		el("span", { class: "svc-lab", text: "greedy" }),
-		camPlayBtn,
-		inputs._camPlayVal,
-	);
-	const camSpeedRow = sliderRow(
-		"camspeed",
-		"speed",
-		5,
-		5000,
-		5,
-		200,
-		(v) => `${Math.round(v)}/s`,
-	);
-	const overlay = el("div", { class: "svc-actual" });
-	inputs._overlay = overlay;
-	inputs._stepper = el("div", { class: "svc-stepper" });
-	inputs._coverage = el("div", { class: "svc-coverage" });
-	inputs._modal = el("div", { class: "svc-coverage" });
-	inputs._log = el("pre", { class: "svc-log" });
-	Object.assign(inputs._log.style, {
-		minHeight: "64px",
-		maxHeight: "180px",
-		overflowY: "auto",
-		margin: "4px 0 0",
-		padding: "6px 8px",
-		background: "#0b0b0e",
-		border: "1px solid rgba(255,255,255,0.12)",
-		borderRadius: "4px",
-		font: "11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace",
-		whiteSpace: "pre-wrap",
-		wordBreak: "break-word",
-		color: "#cfcfe0",
-	});
+    // Stage-2 voxel overlay: occupied cells as green disks over the scene,
+    // garbage cells (sealed interiors) as red x-ray disks — one toggle, like
+    // the camera-position overlay, just denser.
+    const voxRow = checkRow("voxels", "solid voxels (green cover)", false);
+    inputs.voxels.addEventListener("change", () =>
+        setVoxels(inputs.voxels.checked),
+    );
+    const garbageRow = checkRow(
+        "garbage",
+        "garbage voxels (red · sealed interiors)",
+        false,
+    );
+    inputs.garbage.addEventListener("change", () =>
+        setVoxels(inputs.garbage.checked),
+    );
+    // FREE-voxel overlay (blue): the reachable EMPTY air (viewer-visible /
+    // camera-placeable space). The slider indexes the pack's pre-meshed shell
+    // ladder (an instant geometry swap — no server call).
+    const freeRow = checkRow(
+        "freevox",
+        "free volume (blue · reachable air)",
+        false,
+    );
+    inputs.freevox.addEventListener("change", () =>
+        setFreeVoxels(inputs.freevox.checked),
+    );
+    inputs._freeVal = el("span", { class: "svc-val", text: "" });
+    const freeClearInput = el("input", {
+        type: "range",
+        class: "svc-range",
+        min: 0, // reconfigured to the shell ladder once stage 2 loads
+        max: 1,
+        step: 1,
+        value: 0,
+    });
+    inputs.freeclear = freeClearInput;
+    freeClearInput.addEventListener("input", () => updateFreeFilter());
+    const freeClearRow = el(
+        "div",
+        { class: "svc-row" },
+        el("span", { class: "svc-lab", text: "shell" }),
+        freeClearInput,
+        inputs._freeVal,
+    );
+    // Render style for every voxel class (cover / garbage / free): merged
+    // translucent shells (default) or a per-cell POINT cloud. Points don't form
+    // an occluding skin, so you can orbit and read a cavity's INTERIOR — e.g.
+    // whether a fridge interior is garbage (red = sealed) or free (blue).
+    const voxPointsRow = checkRow(
+        "voxpoints",
+        "point voxels (see inside cavities)",
+        false,
+    );
+    inputs.voxpoints.addEventListener("change", () => {
+        syncVoxelVisibility();
+        viewer?.forceRenderNextFrame?.();
+    });
+    // Patch inspector (needs Stage 4 + Stage 5): select a coverage patch on the
+    // splat and open its reference images in the right-side modal.
+    const patchRow = checkRow("patches", "patches (click to inspect)", false);
+    inputs.patches.addEventListener("change", () =>
+        setPatches(inputs.patches.checked),
+    );
+    // Browse the Stage-5 reference frames (RGB · alpha · depth) as a lazy
+    // thumbnail matrix + full-res inspector, decoded from the SZF containers
+    // client-side (opens its own overlay; resolves the refs via Stage-5 status).
+    const refsBtn = el("button", {
+        class: "splat-stage2-btn",
+        text: "view refs",
+        title: "browse the Stage-5 reference frames (RGB · alpha · depth)",
+        onclick: () => {
+            if (!current) return;
+            openRefsViewer({
+                run: current.run,
+                slot: current.slot,
+                model: current.model,
+                label: subEl?.textContent,
+            });
+        },
+    });
+    const refsRow = el(
+        "div",
+        { class: "svc-row" },
+        el("span", { class: "svc-lab", text: "refs" }),
+        refsBtn,
+    );
+    // Reveal this cell's splat/ folder in the OS file browser (server-side open;
+    // the server runs on this machine).
+    const folderBtn = el("button", {
+        class: "splat-stage2-btn",
+        text: "reveal",
+        title: "open this cell's splat/ folder in your OS file browser (Explorer / Finder)",
+        onclick: async () => {
+            if (!current) return;
+            try {
+                const r = await api.splatReveal(
+                    current.run,
+                    current.slot,
+                    current.model,
+                );
+                setStatus(`opened ${r.opened}`, "");
+            } catch (e) {
+                setStatus(`could not open folder: ${e.message}`, "#ff8080");
+            }
+        },
+    });
+    const folderRow = el(
+        "div",
+        { class: "svc-row" },
+        el("span", { class: "svc-lab", text: "folder" }),
+        folderBtn,
+    );
+    // Export poses + surfels + rendered references to a COLMAP model under
+	// splat/colmap/ (cameras.txt + images.txt + points3D.txt + RGBA PNGs) — the
+    // folder Postshot / COLMAP tools ingest (drag in → Camera Poses = Import).
+    // Needs Stage 5 (references) done; the server 409s otherwise.
+    const colmapBtn = el("button", {
+        class: "splat-stage2-btn",
+        text: "export colmap",
+        title: "write splat/colmap/ (cameras + images + points3D + PNGs) for Postshot / COLMAP import — needs Stage 5 references",
+        onclick: async () => {
+            if (!current) return;
+            const label = colmapBtn.textContent;
+            colmapBtn.disabled = true;
+            colmapBtn.textContent = "exporting…";
+            setStatus("exporting COLMAP…", "var(--purple)");
+            try {
+                const r = await api.splatColmapExport(
+                    current.run,
+                    current.slot,
+                    current.model,
+                );
+                setStatus(
+                    `COLMAP: ${r.images} images · ${r.points.toLocaleString()} points → splat/colmap (reveal to open)`,
+                    "",
+                );
+            } catch (e) {
+                setStatus(`COLMAP export failed: ${e.message}`, "var(--red)");
+            } finally {
+                colmapBtn.disabled = false;
+                colmapBtn.textContent = label;
+            }
+        },
+    });
+    const colmapRow = el(
+        "div",
+        { class: "svc-row" },
+        el("span", { class: "svc-lab", text: "colmap" }),
+        colmapBtn,
+    );
+    // Every point where Stage 4 placed a camera (cameras.json → positions), view-only.
+    const camRow = checkRow("cameras", "camera positions", false);
+    inputs.cameras.addEventListener("change", () =>
+        setCameras(inputs.cameras.checked),
+    );
+    // Greedy-order playback: reveal the cameras in the order Stage 4 chose them,
+    // at an adjustable rate (points/sec). The count column tracks the current pick.
+    const camPlayBtn = el("button", {
+        class: "splat-stage2-btn",
+        text: "▶ play",
+        title: "reveal camera positions in the order Stage 4 greedily chose them",
+        onclick: () => toggleCamPlay(),
+    });
+    inputs._camPlayBtn = camPlayBtn;
+    inputs._camPlayVal = el("span", { class: "svc-val", text: "" });
+    const camPlayRow = el(
+        "div",
+        { class: "svc-row" },
+        el("span", { class: "svc-lab", text: "greedy" }),
+        camPlayBtn,
+        inputs._camPlayVal,
+    );
+    const camSpeedRow = sliderRow(
+        "camspeed",
+        "speed",
+        5,
+        5000,
+        5,
+        200,
+        (v) => `${Math.round(v)}/s`,
+    );
+    const overlay = el("div", { class: "svc-actual" });
+    inputs._overlay = overlay;
+    inputs._stepper = el("div", { class: "svc-stepper" });
+    inputs._coverage = el("div", { class: "svc-coverage" });
+    inputs._modal = el("div", { class: "svc-coverage" });
+    inputs._log = el("pre", { class: "svc-log" });
+    Object.assign(inputs._log.style, {
+        minHeight: "64px",
+        maxHeight: "180px",
+        overflowY: "auto",
+        margin: "4px 0 0",
+        padding: "6px 8px",
+        background: "#0b0b0e",
+        border: "1px solid rgba(255,255,255,0.12)",
+        borderRadius: "4px",
+        font: "11px/1.4 ui-monospace, SFMono-Regular, Menlo, monospace",
+        whiteSpace: "pre-wrap",
+        wordBreak: "break-word",
+        color: "#cfcfe0",
+    });
 
     // Asset-source selector: which meshes the WHOLE pipeline samples/renders.
     // Populated by refreshAssetSource() once the server state arrives.
@@ -1954,36 +1929,35 @@ function buildControls(summary) {
         inputs._srcVal,
     );
 
-	controlsEl.append(
-		el("div", { class: "svc-title", text: "pipeline" }),
-		srcRow,
-		inputs._stepper,
-		inputs._coverage,
-		el("div", { class: "svc-title", text: "train on modal (stages 4–6)" }),
-		inputs._modal,
-		inputs._log,
-		el("div", { class: "svc-title", text: "view" }),
-		seg,
-		voxRow,
-		garbageRow,
-		freeRow,
-		freeClearRow,
-		freeApplyRow,
-		voxPointsRow,
-		patchRow,
-		refsRow,
-		folderRow,
-		colmapRow,
-		camRow,
-		camPlayRow,
-		camSpeedRow,
-		el("div", { class: "svc-title", text: "sampler" }),
-		detail,
-		workers,
-		el("div", { class: "svc-actions" }, btn),
-		actual,
-		overlay,
-	);
+    controlsEl.append(
+        el("div", { class: "svc-title", text: "pipeline" }),
+        srcRow,
+        inputs._stepper,
+        inputs._coverage,
+        el("div", { class: "svc-title", text: "splat on modal" }),
+        inputs._modal,
+        inputs._log,
+        el("div", { class: "svc-title", text: "view" }),
+        seg,
+        voxRow,
+        garbageRow,
+        freeRow,
+        freeClearRow,
+        voxPointsRow,
+        patchRow,
+        refsRow,
+        folderRow,
+        colmapRow,
+        camRow,
+        camPlayRow,
+        camSpeedRow,
+        el("div", { class: "svc-title", text: "sampler" }),
+        detail,
+        workers,
+        el("div", { class: "svc-actions" }, btn),
+        actual,
+        overlay,
+    );
 }
 
 function actualText(summary) {
@@ -2915,14 +2889,28 @@ function renderModal(cell) {
             title: "training on the A100 — see the live log below",
         });
     } else {
+        // Two placements. "continue on modal" renders + trains from the LOCAL
+        // Stage-4 plan (stages 5–7; keeps cameras.json); "train on modal" lets
+        // Modal (re)plan cameras and overwrite the local plan (stages 4–7).
+        const s4done = stageDone(cell, 4);
+        const contBtn = el("button", {
+            class: "splat-stage2-btn",
+            disabled: !s4done || runningAll,
+            text: "continue on modal",
+            title: s4done
+                ? "render references + build the COLMAP model + 2DGS fine-tune on the A100 from the LOCAL camera plan (stages 5–7); keeps cameras.json"
+                : "plan cameras locally first (Stage 4)",
+            onclick: () => startModalTrain(true, "continue"),
+        });
+        row.appendChild(contBtn);
         btn = el("button", {
             class: `splat-stage2-btn${status === "done" ? " view" : ""}`,
             disabled: !s3done || runningAll,
             text: status === "done" ? "re-train" : "train on modal",
             title: s3done
-                ? "plan cameras + render references + fine-tune on the Modal A100 (stages 4–6), then pull trained.ply"
+                ? "(re)plan cameras + render references + 2DGS fine-tune on the A100 (stages 4–7), overwriting the local plan"
                 : "sample the surfel cloud first (Stage 3)",
-            onclick: () => startModalTrain(status === "done"),
+            onclick: () => startModalTrain(status === "done", "train"),
         });
     }
     if (status === "error") {
@@ -3024,36 +3012,39 @@ function renderModal(cell) {
         if (following) log.scrollTop = log.scrollHeight;
     }
 
-	// Catch the running → done transition: the artifacts have been pulled (the
-	// supervisor sets 'done' only after the pull) — refresh the toggles and open
-	// the DELIVERED healed view for an immediate look, falling back to the raw
-	// trained view if the heal stage didn't run.
-	if (modalPrev === "running" && status === "done") {
-		updateSourceAvail();
-		if (healedUrl) void setView("healed");
-		else if (trainedUrl) void setView("trained");
-	}
-	modalPrev = status;
+    // Catch the running → done transition: the artifacts have been pulled (the
+    // supervisor sets 'done' only after the pull) — refresh the toggles and open
+    // the DELIVERED healed view for an immediate look, falling back to the raw
+    // trained view if the heal stage didn't run.
+    if (modalPrev === "running" && status === "done") {
+        updateSourceAvail();
+        if (healedUrl) void setView("healed");
+        else if (trainedUrl) void setView("trained");
+    }
+    modalPrev = status;
 }
 
-// Launch the Modal remote train (stages 4-6) for the open cell, then poll — the
-// cells status streams its live phase + training heartbeat.
-async function startModalTrain(restart = false) {
+// Launch the Modal remote splat for the open cell, then poll — the cells status
+// streams its live phase + training heartbeat. `mode` is "continue" (render +
+// train from the local Stage-4 plan, stages 5–7) or "train" (Modal replans
+// cameras too, stages 4–7).
+async function startModalTrain(restart = false, mode = "train") {
     if (!current) return;
     modalLog = [];
     modalPlanShown = false;
     setStatus(
-        restart ? "restarting remote train…" : "starting remote train…",
+        `${restart ? "restarting" : "starting"} modal (${mode})…`,
         "var(--purple)",
     );
     try {
         await api.splatModalStart(current.run, current.slot, current.model, {
             restart,
+            mode,
             epochs: modalTrainCfg.epochs,
             batch: modalTrainCfg.batch,
         });
     } catch (e) {
-        setStatus(`remote train failed to start: ${e.message}`, "var(--red)");
+        setStatus(`remote splat failed to start: ${e.message}`, "var(--red)");
         return;
     }
     pollStages();
@@ -3061,9 +3052,9 @@ async function startModalTrain(restart = false) {
 
 const fmtInt = (n) => (n == null ? "?" : Number(n).toLocaleString());
 
-// Coverage readout for the planned camera set (Stage 4's summary): how well the
-// greedy covered the surface, so we can tell at a glance if cameras/greedy are
-// healthy. Shown only once cameras are planned.
+// Camera-plan readout (Stage 4's summary): the object-shell single-shot field —
+// per-rig counts + per-object coverage + cull stats, so we can tell at a
+// glance the plan is healthy. Shown only once cameras are planned.
 function renderCoverage() {
     const box = inputs && inputs._coverage;
     if (!box) return;
@@ -3071,45 +3062,38 @@ function renderCoverage() {
     const s4 = stageState(cellStatus, 4);
     const sum = s4.status === "done" ? s4.summary : null;
     if (!sum) return;
-    const cov = sum.coverage || {};
-    const patches = sum.patches || 0;
-    const seen = cov.seen_at_least_once || 0;
-    const sat = cov.satisfied || 0;
-    const satPct =
-        cov.satisfied_pct != null
-            ? cov.satisfied_pct
-            : patches
-              ? Math.round((100 * sat) / patches)
-              : 0;
-    const seenPct = patches ? Math.round((100 * seen) / patches) : 0;
-    const satColor =
-        satPct >= 90 ? "var(--green)" : satPct >= 70 ? "#d0a020" : "var(--red)";
+    const kinds = sum.kinds || {};
+    const targets = sum.targets || {};
+    const culls = sum.culls || {};
+    const standoff = sum.standoff_m || {};
 
-    box.appendChild(el("div", { class: "svc-title", text: "coverage" }));
+    box.appendChild(el("div", { class: "svc-title", text: "camera plan" }));
     const rows = [
-        ["patches", fmtInt(patches), null],
+        ["cameras (single shots)", fmtInt(sum.cameras), null],
         [
-            "cameras · candidates",
-            `${fmtInt(sum.cameras)} · ${fmtInt(sum.candidates)}`,
-            null,
-        ],
-        ["views (image files)", fmtInt(sum.views), null],
-        ["satisfied (≥K angles)", `${fmtInt(sat)} · ${satPct}%`, satColor],
-        ["under-covered", fmtInt(Math.max(0, seen - sat)), null],
-        [
-            "occlusion-culled",
-            fmtInt(cov.occlusion_culled),
-            cov.occlusion_culled ? "var(--red)" : null,
-        ],
-        ["reached (≥1 view)", `${fmtInt(seen)} · ${seenPct}%`, null],
-        [
-            "mean angles/patch",
-            cov.mean_angles_seen != null ? String(cov.mean_angles_seen) : "?",
+            "ball · shell",
+            `${fmtInt(kinds.ball)} · ${fmtInt(kinds.shell)}`,
             null,
         ],
         [
-            "target K / sectors",
-            `${sum.angles_per_patch ?? "?"} / ${sum.angular_sectors ?? "?"}`,
+            "objects framed / total",
+            `${fmtInt(targets.framed)} / ${fmtInt(targets.total)}`,
+            null,
+        ],
+        [
+            "starved objects",
+            fmtInt(targets.starved),
+            targets.starved ? "#d0a020" : null,
+        ],
+        [
+            "culled pos · blocked · air",
+            `${fmtInt(culls.position)} · ${fmtInt(culls.blocked)} · ${fmtInt(culls.air)}`,
+            null,
+        ],
+        ["deduped", fmtInt(culls.dedupe), null],
+        [
+            "standoff (m) min · med · max",
+            `${standoff.min ?? "?"} · ${standoff.median ?? "?"} · ${standoff.max ?? "?"}`,
             null,
         ],
     ];
@@ -3195,48 +3179,48 @@ async function refreshStepper(seq) {
 // ---- open / close -----------------------------------------------------------
 
 export async function openSplatViewer(opts) {
-	if (!overlay || !opts || !opts.run) return;
-	const seq = ++openSeq;
-	stopPoll();
-	current = {
-		run: opts.run,
-		slot: opts.slot,
-		model: opts.model,
-		source: opts.source,
-	};
-	cloudLoaded = false;
-	runningAll = false;
-	cellStatus = null;
-	splatSource = "surfels";
-	trainedUrl = null;
-	healedUrl = null;
-	sogUrl = null;
-	trainedSogUrl = null;
-	healedSogUrl = null;
-	sogEncoding = false;
-	modalPrev = null;
-	modalLog = [];
-	modalPlanShown = false;
-	overlay.classList.add("open");
-	subEl.textContent =
-		opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
-	assetSource = null;
-	buildControls(opts.summary || null);
-	renderStepper();
-	void refreshAssetSource();
-	if (opts.url) {
-		cloudLoaded = true;
-		setStatus("loading…", "var(--purple)");
-		await loadClouds(seq, opts.url, opts.summary, null);
-		void refreshStepper(seq);
-	} else {
-		// MESH-FIRST: no surfel cloud yet, but the stage-2 voxel grid is
-		// measured off the original meshes — open on them so the voxel/free
-		// overlays are inspectable before Stage 3 ever runs.
-		setStatus("no splat yet — showing original mesh", "");
-		await refreshStepper(seq); // may load the cloud if Stage 3 is done
-		if (seq === openSeq && !cloudLoaded) await openMeshView(seq);
-	}
+    if (!overlay || !opts || !opts.run) return;
+    const seq = ++openSeq;
+    stopPoll();
+    current = {
+        run: opts.run,
+        slot: opts.slot,
+        model: opts.model,
+        source: opts.source,
+    };
+    cloudLoaded = false;
+    runningAll = false;
+    cellStatus = null;
+    splatSource = "surfels";
+    trainedUrl = null;
+    healedUrl = null;
+    sogUrl = null;
+    trainedSogUrl = null;
+    healedSogUrl = null;
+    sogEncoding = false;
+    modalPrev = null;
+    modalLog = [];
+    modalPlanShown = false;
+    overlay.classList.add("open");
+    subEl.textContent =
+        opts.label || `${opts.slot || ""} · ${opts.model || ""}`;
+    assetSource = null;
+    buildControls(opts.summary || null);
+    renderStepper();
+    void refreshAssetSource();
+    if (opts.url) {
+        cloudLoaded = true;
+        setStatus("loading…", "var(--purple)");
+        await loadClouds(seq, opts.url, opts.summary, null);
+        void refreshStepper(seq);
+    } else {
+        // MESH-FIRST: no surfel cloud yet, but the stage-2 voxel grid is
+        // measured off the original meshes — open on them so the voxel/free
+        // overlays are inspectable before Stage 3 ever runs.
+        setStatus("no splat yet — showing original mesh", "");
+        await refreshStepper(seq); // may load the cloud if Stage 3 is done
+        if (seq === openSeq && !cloudLoaded) await openMeshView(seq);
+    }
 }
 
 export function isSplatViewerOpen() {

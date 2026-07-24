@@ -22,3 +22,5 @@ __pycache__/
 *.pyd
 oneshot-runs/
 asset_viewer
+client/public/assets/
+client/tmp-lodtest/

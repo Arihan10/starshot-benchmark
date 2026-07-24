@@ -32,7 +32,7 @@ def interrupting(done: int, total: int, msg: str) -> None:
 try:
     train_splat(
         run="smoke", slot="resume", model="x",
-        cloud_path=OUT / "cloud.ply", refs_dir=OUT / "refs",
+        colmap_dir=OUT / "colmap",
         out_path=OUT / "trained_resume.ply",
         params=PARAMS, resume=False, progress=interrupting,
     )
@@ -55,7 +55,7 @@ def counting(done: int, total: int, msg: str) -> None:
 
 summary = train_splat(
     run="smoke", slot="resume", model="x",
-    cloud_path=OUT / "cloud.ply", refs_dir=OUT / "refs",
+    colmap_dir=OUT / "colmap",
     out_path=OUT / "trained_resume.ply",
     params=PARAMS, resume=True, progress=counting,
 )

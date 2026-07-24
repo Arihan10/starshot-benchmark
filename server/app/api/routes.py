@@ -257,14 +257,14 @@ _splat_stage6_procs: dict[tuple[str, str, str], dict[str, Any]] = {}
 # Modal pipeline. Same poll-via-`popen.poll()` lifecycle as _splat_stage6_procs.
 _splat_sog_procs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
-# --- Modal remote train jobs (stages 4-6 on the A100) ------------------------
+# --- Modal remote splat jobs (stages 4-7 on the A100) ------------------------
 # One asyncio SUPERVISOR task per cell mirrors the stage-job pattern: it pushes
-# the cell's stage-1-3 inputs to the Modal Volume (content-deduped), spawns
-# `run_cell(stages=[4,5,6])`, streams that container's heartbeat, and pulls
-# `trained.ply` (+ cameras.json / patches) back — so the EXISTING Stage-6 status
-# and the viewer's "trained" toggle light up with no extra wiring. Stage 7
-# (quantize / LODs) is intentionally not requested yet. Value:
-# {status, running, phase, heartbeat, call_id, error, started_at, ...}.
+# the cell's local inputs to the Modal Volume (content-deduped), spawns
+# `run_cell` over the stage window for the chosen mode ('train' → 4-7 replanning
+# cameras; 'continue' → 5-7 from the pushed local plan), streams that container's
+# heartbeat, and pulls `cameras.json` + `trained.ply` back — so the EXISTING
+# Stage-6 status and the viewer's "trained" toggle light up with no extra wiring.
+# Value: {status, running, phase, heartbeat, call_id, error, started_at, ...}.
 _splat_modal_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _splat_modal_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 # Cells whose sticky-hook re-attach is mid-flight (between the async job_status
@@ -1962,36 +1962,20 @@ async def _run_splat_stage1_cell(run: str, slot: str, model: str) -> None:
 class Stage2Request(BaseModel):
     """Free-space voxelizer knobs (Stage 2 — the shared spatial foundation). All
     optional; omitted → defaults. `pitch` (m) is the uniform fine voxel edge
-    (scene-size independent), `margin` (m) grows the exterior play volume,
-    `clearance` (m) is the baked candidate filter (camera standoff from any
-    surface), `coverage` (m) the camera band — air is explored/candidate-seeded
-    only within this distance of a surface. `workers` caps the per-object
-    voxelization pool (1 = serial, lowest peak RAM; omitted → auto)."""
+    (scene-size independent), `margin` (m) grows the exterior play volume.
+    `workers` caps the per-object voxelization pool (1 = serial, lowest peak
+    RAM; omitted → auto). Legacy `clearance`/`coverage` fields are ignored
+    (the candidate machinery died with the greedy planner)."""
 
     pitch: float | None = None
     margin: float | None = None
-    clearance: float | None = None
-    coverage: float | None = None
     workers: int | None = None
-
-
-class Stage2ClearanceRequest(BaseModel):
-    """Re-bake the FREE threshold of an existing grid (the client slider's
-    'apply') — no re-voxelization."""
-
-    clearance: float
 
 
 class SplatSourceRequest(BaseModel):
     """Pin the asset set the splat pipeline samples/renders for a cell."""
 
     source: str  # "auto" | "generated" | "library"
-
-
-def _clamp_clearance(v: float) -> float:
-    # Floor matches the pitch clamp's floor: one voxel is the smallest
-    # meaningful clearance (clearance == pitch ⇒ FREE ≡ EMPTY).
-    return float(min(max(v, 0.02), 2.0))
 
 
 def _stage2_params(req: Stage2Request | None) -> splat_stage2.FreeSpaceParams:
@@ -2002,8 +1986,6 @@ def _stage2_params(req: Stage2Request | None) -> splat_stage2.FreeSpaceParams:
     return splat_stage2.FreeSpaceParams(
         pitch=float(min(max(req.pitch, 0.02), 1.0)) if req.pitch is not None else d.pitch,
         margin=float(min(max(req.margin, 0.0), 10.0)) if req.margin is not None else d.margin,
-        clearance=_clamp_clearance(req.clearance) if req.clearance is not None else d.clearance,
-        coverage=float(min(max(req.coverage, 1.0), 20.0)) if req.coverage is not None else d.coverage,
         workers=max(1, min(int(req.workers), 32)) if req.workers is not None else d.workers,
     )
 
@@ -2300,6 +2282,27 @@ def _splat_stage6_status(run: str, slot: str, model: str) -> dict[str, Any]:
     }
 
 
+def _ensure_stage6_colmap(run: str, slot: str, model: str, restart: bool) -> Path:
+    """Build (or reuse) the COLMAP model Stage 6 now trains from — the same
+    (points3D + cameras + images) folder `splat_to_colmap.py` writes and Postshot
+    ingests — from this cell's Stage-3 `cloud.ply` + Stage-5 `refs/`. Rebuilt on
+    `restart` or when absent; otherwise reused. Blocking (decodes the reference
+    frames to RGB), so callers run it off the event loop."""
+    colmap_dir = _colmap_dir(run, slot, model)
+    # Re-export when absent — or when the model predates the SZF supervision
+    # sidecar while the refs could provide one (SZF frames present): otherwise a
+    # stale export silently keeps training RGB-only.
+    frames_dir = _refs_dir(run, slot, model) / splat_stage5.FRAMES_DIRNAME
+    stale = not (colmap_dir / splat_colmap.CAMERAS_TXT).is_file() or (
+        frames_dir.is_dir() and not (colmap_dir / splat_colmap.SIDECAR_NAME).is_file()
+    )
+    if restart or stale:
+        splat_colmap.export_colmap(
+            _refs_dir(run, slot, model), _cloud_path(run, slot, model), colmap_dir,
+        )
+    return colmap_dir
+
+
 def _spawn_stage6(
     run: str, slot: str, model: str, iterations: int | None, restart: bool = False
 ) -> dict[str, Any]:
@@ -2310,9 +2313,13 @@ def _spawn_stage6(
     env wiring is needed. Detached (`DETACHED_PROCESS` / `start_new_session`) and
     polled via `popen.poll()`, so it never blocks the event loop.
 
-    Resumes from the latest `splat/ckpt/` checkpoint by default (so a crashed run
-    continues where it stopped); `restart` first drops trained.ply + the checkpoints
-    for an explicit from-scratch retry."""
+    Stage 6 now trains from a COLMAP model (the Postshot-style point cloud + poses +
+    images), so this first builds/reuses that model from the cell's Stage-3 cloud +
+    Stage-5 refs, then launches the trainer with `--colmap`. Resumes from the latest
+    `splat/ckpt/` checkpoint by default (so a crashed run continues where it
+    stopped); `restart` first drops trained.ply + the checkpoints (and re-exports the
+    COLMAP model) for an explicit from-scratch retry. Blocking on the COLMAP export,
+    so it is dispatched off the event loop by its caller."""
     out = _trained_path(run, slot, model)
     log_path = _stage6_log_path(run, slot, model)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -2321,10 +2328,13 @@ def _spawn_stage6(
 
         out.unlink(missing_ok=True)
         shutil.rmtree(_stage6_ckpt_dir(run, slot, model), ignore_errors=True)
+    colmap_dir = _ensure_stage6_colmap(run, slot, model, restart)
     cmd = [
         sys.executable, "-u", "-m", "splat.stage6",
-        "--cloud", str(_cloud_path(run, slot, model)),
-        "--refs", str(_refs_dir(run, slot, model)),
+        "--colmap", str(colmap_dir),
+        # Surfel init (stage6 default): seed every Gaussian from the Stage-3
+        # cloud — the same file the COLMAP export above just read.
+        "--init-ply", str(_cloud_path(run, slot, model)),
         "--out", str(out), "--run", run, "--slot", slot, "--model", model,
         "--resume",  # continue from a checkpoint if one survived; restart wiped it
     ]
@@ -2458,6 +2468,12 @@ class ModalTrainRequest(BaseModel):
     iterations: int | None = None
     batch: int | None = None
     restart: bool = False
+    # "train"    → Modal (re)plans cameras (stage 4) and OVERWRITES the local
+    #              plan, then renders + fine-tunes (stages 4-7).
+    # "continue" → use the LOCAL Stage-4 plan (splat/cameras.json) as-is; Modal
+    #              runs stages 5-7 only (render references → COLMAP → fine-tune →
+    #              heal). Requires a local camera plan.
+    mode: str = "train"
 
     def train_overrides(self) -> dict[str, Any]:
         """The set TrainParams overrides (drops unset fields so the server injects
@@ -2530,6 +2546,7 @@ async def _run_splat_modal_cell(
     supervisor picks the run back up without launching a duplicate."""
     key = (run, slot, model)
     job = _splat_modal_jobs[key]
+    continue_mode = (opts.get("mode") or "train") == "continue"
     try:
         if splat_modal is None:
             raise RuntimeError(
@@ -2538,31 +2555,39 @@ async def _run_splat_modal_cell(
             )
         cell_dir = _slot_dir(run, slot, model)
         if attach_call_id is None:
-            # Gate: the remote pipeline consumes the local stage-2/3 outputs.
+            # Gate: the remote pipeline consumes the local stage-2/3 outputs (and,
+            # for 'continue', the local stage-4 camera plan it renders from).
             needed = {
                 "free-space grid (Stage 2)": _freespace_path(run, slot, model),
                 "skin sidecar (Stage 2)": cell_dir / "splat" / "freespace.npz.skin.npy",
                 "surfel cloud (Stage 3)": _cloud_path(run, slot, model),
+                "scene manifest (Stage 1)": cell_dir / "splat" / splat_stage1.MANIFEST_NAME,
             }
+            if continue_mode:
+                needed["camera plan (Stage 4)"] = _cameras_path(run, slot, model)
             missing = [name for name, p in needed.items() if not p.is_file()]
             if missing:
+                lo = 4 if continue_mode else 3
                 raise RuntimeError(
-                    f"run stages 2-3 locally first — missing: {', '.join(missing)}"
+                    f"run stages 1-{lo} locally first — missing: {', '.join(missing)}"
                 )
             tier_dir = await _ensure_splat_tier(run, slot, model, job)
 
             job["phase"] = "push"
             job["msg"] = "uploading inputs (deduped)…"
             pushed = await asyncio.to_thread(
-                splat_modal.push_cell, cell_dir, tier_dir, True
+                splat_modal.push_cell, cell_dir, tier_dir, True, continue_mode
             )
 
             job["phase"] = "spawn"
             job["msg"] = "spawning the A100 job…"
+            # 'continue' feeds the LOCAL plan and runs 5-7; 'train' (re)plans on
+            # the A100 across the full 4-7 window.
+            stages = [5, 6, 7] if continue_mode else _MODAL_STAGES
             # Forward the client's train overrides VERBATIM — the server adds nothing.
             train: dict[str, Any] = dict(opts.get("train") or {})
             call_id = await asyncio.to_thread(
-                splat_modal.spawn_cell, cell_dir, pushed, _MODAL_STAGES,
+                splat_modal.spawn_cell, cell_dir, pushed, stages,
                 None, train, None, bool(opts.get("restart")),
             )
         else:
@@ -2571,7 +2596,11 @@ async def _run_splat_modal_cell(
             call_id = attach_call_id
         job["call_id"] = call_id
         job["phase"] = "run"
-        job["msg"] = "re-attached — streaming remote progress…" if attach_call_id else "planning cameras…"
+        job["msg"] = (
+            "re-attached — streaming remote progress…" if attach_call_id
+            else "rendering references…" if continue_mode
+            else "planning cameras…"
+        )
 
         # Stream the container heartbeat until the call resolves, PROGRESSIVELY
         # pulling artifacts as each remote stage commits them to the Volume — so
@@ -2587,10 +2616,11 @@ async def _run_splat_modal_cell(
             st = await asyncio.to_thread(splat_modal.job_status, cell_dir)
             job["heartbeat"] = st.get("heartbeat")
             hb_stage = (st.get("heartbeat") or {}).get("stage")
-            # Stage 4 done → pull JUST the small camera-plan artifacts
-            # (cameras.json / patches.bin / patch_views.json — `include_ply=False`,
-            # so no plys and never the multi-GB refs). Guarded so it fires once;
-            # the final pull is the backstop if the heartbeat was missed.
+            # Stage 4 done → pull JUST the small camera-plan artifact
+            # (cameras.json — `include_ply=False`, so no plys and never the
+            # multi-GB refs). Guarded so it fires once; the final pull is the
+            # backstop if the heartbeat was missed. (In 'continue' mode the plan
+            # is already local; this pulls back the byte-identical copy.)
             if not job.get("plan_pulled") and hb_stage in ("refs", "train", "done"):
                 with contextlib.suppress(Exception):
                     await asyncio.to_thread(splat_modal.pull_cell, cell_dir, False, True)
@@ -2602,6 +2632,18 @@ async def _run_splat_modal_cell(
             # on-demand frame proxy, not a bulk download).
             if hb_stage in ("train", "done"):
                 job["refs_ready"] = True
+            # Stage 6 done → trained.ply is committed on the Volume (the
+            # heartbeat only advances to "heal" after the train stage's
+            # boundary commit). Pull it NOW so the raw model is viewable while
+            # stage 7 heals — with heal in the job window, waiting for the
+            # final pull would hold the trained view hostage to healing.
+            # Guarded once; the final pull re-syncs (same-size skip = cheap).
+            if not job.get("trained_pulled") and hb_stage in ("heal", "done"):
+                with contextlib.suppress(Exception):
+                    await asyncio.to_thread(splat_modal.pull_cell, cell_dir, True, True)
+                    if _trained_path(run, slot, model).is_file():
+                        job["trained_pulled"] = True
+                        job["msg"] = "trained.ply ready — healing continues remotely"
             # Pull the mid-run debug sample PNGs while stage 5 renders (a handful
             # of small files; cheap + idempotent) so the picture-taking is
             # inspectable live. Stop once we have the full set or stage 5 is past.
@@ -2645,8 +2687,7 @@ async def _run_splat_modal_cell(
 # and every downstream name here begins "cameras/patches/patch_views/status/
 # slim/compact" or "trained*", none of which collide with an input.
 _MODAL_ARTIFACT_NAMES = (
-    "cameras.json", "patches.bin", "patch_views.json", "status.json",
-    "slim.json", "compact.json",
+    "cameras.json", "status.json", "slim.json", "compact.json",
 )
 # trained* = the RAW Stage-6 model; healed* = the delivered Stage-7 model (+ their
 # LOD ladders / sqz). Both are downstream artifacts; neither prefix collides with
@@ -2658,20 +2699,24 @@ _MODAL_ARTIFACT_GLOBS = (
 
 
 def _clear_modal_artifacts(
-    run: str, slot: str, model: str, *, drop_job_record: bool
+    run: str, slot: str, model: str, *, drop_job_record: bool, keep_plan: bool = False
 ) -> None:
     """Delete a cell's DOWNSTREAM modal artifacts (the Stage-4 plan, the Stage-6/7
     splats + LOD ladder + sqz, the pulled debug samples, the modal status copy) so
     old and new runs never coexist locally and the viewer can't show a stale
     trained.ply beside a fresh plan. NEVER touches the Stage 1-3 inputs.
     `drop_job_record=True` also removes `modal-job.json` — a forced restart
-    re-creates it on spawn; a reattach keeps it (it's the call id being adopted)."""
+    re-creates it on spawn; a reattach keeps it (it's the call id being adopted).
+    `keep_plan=True` preserves the local `cameras.json` — the 'continue on modal'
+    path feeds that exact plan to the remote render, so it must survive the wipe."""
     import shutil
 
     d = _slot_dir(run, slot, model) / "splat"
     if not d.is_dir():
         return
     for name in _MODAL_ARTIFACT_NAMES:
+        if keep_plan and name == "cameras.json":
+            continue
         (d / name).unlink(missing_ok=True)
     for pat in _MODAL_ARTIFACT_GLOBS:
         for p in d.glob(pat):
@@ -2686,12 +2731,13 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
     """Re-hook the server to a Modal train a PREVIOUS process spawned — the
     sticky hook that survives a restart. The call id persists in the cell's
     `splat/modal-job.json`, so we can query the live state without re-spawning.
-    Idempotent: a no-op if the cell is already tracked, has no job record, or the
-    trained splat is already local. If the recorded call is still RUNNING, the
-    in-memory job + streaming supervisor are rebuilt (skipping push/spawn, so no
-    duplicate container); if it finished while the server was down, `trained.ply`
-    is pulled so the viewer lights up. Returns True when a live job is now
-    tracked."""
+    Idempotent: a no-op if the cell is already tracked, has no job record, or
+    the job's DELIVERED splat (healed.ply when stage 7 is in the recorded
+    window, else trained.ply) is already local. If the recorded call is still
+    RUNNING, the in-memory job + streaming supervisor are rebuilt (skipping
+    push/spawn, so no duplicate container); if it finished while the server
+    was down, the artifacts are pulled so the viewer lights up. Returns True
+    when a live job is now tracked."""
     if splat_modal is None:
         return False
     key = (run, slot, model)
@@ -2704,20 +2750,28 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
     job_file = splat_modal._job_path(cell_dir)
     if not job_file.is_file():
         return False  # nothing was ever spawned for this cell
-    # Skip ONLY when the local trained.ply already corresponds to THIS job record
-    # (or a newer run) — compare its mtime to the record's spawn time. A stale
-    # trained.ply from an EARLIER run must never suppress reattaching the job the
-    # record now points at: that orphaned every live A100 train across a restart
-    # for any cell that had ever finished a prior run (the reported bug).
-    trained = _trained_path(run, slot, model)
-    if trained.is_file():
-        try:
-            rec = json.loads(job_file.read_text(encoding="utf-8"))
-            spawned = datetime.fromisoformat(rec["spawned_at"]).timestamp()
-        except Exception:
-            spawned = float("inf")  # unparseable record → don't trust the result; probe
-        if trained.stat().st_mtime >= spawned:
-            return False  # result is from this (or a later) run — nothing to recover
+    # Skip ONLY when this job's DELIVERED artifact is already local and newer
+    # than the record's spawn time. The delivered artifact depends on the
+    # recorded stage window: healed.ply once stage 7 is in it, else
+    # trained.ply. trained.ply alone must NOT suppress reattach — it lands
+    # MID-RUN now (the progressive pull during stage-7 healing, or a manual
+    # download), and treating it as the end state orphaned the running heal
+    # across a restart: healed.ply would never be pulled. A stale artifact
+    # from an EARLIER run must never suppress reattach either — hence the
+    # mtime-vs-spawn comparison.
+    rec: dict[str, Any] | None = None
+    try:
+        rec = json.loads(job_file.read_text(encoding="utf-8"))
+        spawned = datetime.fromisoformat(rec["spawned_at"]).timestamp()
+    except Exception:
+        spawned = float("inf")  # unparseable record → don't trust the result; probe
+    stages = list(((rec or {}).get("spec") or {}).get("stages") or _MODAL_STAGES)
+    final = (
+        _healed_path(run, slot, model) if 7 in stages
+        else _trained_path(run, slot, model)
+    )
+    if final.is_file() and final.stat().st_mtime >= spawned:
+        return False  # result is from this (or a later) run — nothing to recover
     _splat_modal_reattaching.add(key)
     try:
         try:
@@ -2842,40 +2896,30 @@ async def _run_splat_stage3_cell(
 
 
 class Stage4Request(BaseModel):
-    """Coverage-planner knobs (all optional; omitted → defaults). `min_gain`
-    truncates the diminishing tail (higher = fewer images); `patch_min_spacing` /
-    `patch_max_spacing` bound the patch feature scale — detail concentration is
-    inherited from the Stage-3 cloud's own density (geometry + texture), not
-    re-detected here. Scale is not a knob: view distances derive per
-    patch from the SCALE LADDER (see splat/stage4.py) — `finest_px_per_patch` is
-    its single dial, the sharpest demanded resolution in pixels per patch
-    feature (capped at `render_resolution`, where a view saturates); the ladder
-    runs from there down to 1 px in octaves. `angular_bins` is the single
-    direction dial: equal-solid-angle cells (an explicit direct-facing cap + a
-    ring of azimuth cells) tiling the hemisphere around each patch normal, all
-    suppliable cells demanded. The old `near_frac` / `min_px_per_patch` /
-    `angles_per_patch` / `angular_sectors` / `collision_clearance` / `curvature_k`
-    / `tex_k` knobs are gone (subsumed — camera standoff is emergent from the
-    scale ladder, and patch detail is inherited from the Stage-3 cloud; unknown
-    fields in a request body are ignored)."""
+    """Camera-planner knobs (all optional; omitted → defaults; unknown legacy
+    fields in a request body are ignored). `coverage` is the density dial
+    (dimensionless — views are DERIVED per object as coverage × offset-shell
+    area ÷ frame footprint at the chosen standoff, so there is no per-object
+    cap); `ball_min` floors the per-object guarantee and `max_ball_views`
+    clamps the scene total (the cost dial); `standoff_min` floors the base
+    camera distance (the descent ladder handles tight spaces); `shell_views`
+    sizes the root establishing orbit. `fov_deg`/`render_resolution` are the
+    shared single-shot intrinsics."""
 
-    patch_min_spacing: float | None = None
-    patch_max_spacing: float | None = None
-    angular_bins: int | None = None
-    finest_px_per_patch: float | None = None
-    min_gain: int | None = None
-    # Hard image budget (the cost dial, in rendered-reference units): the greedy
-    # stops after this many images, keeping the near-optimal prefix; the
-    # summary's coverage `curve` reports what fraction of demands any budget
-    # buys. Omitted/None = run to completion of every suppliable demand.
-    max_views: int | None = None
-    candidate_spacing: float | None = None
-    max_candidates: int | None = None
+    coverage: float | None = None
+    detail_px: float | None = None
+    ball_min: int | None = None
+    max_ball_views: int | None = None
+    standoff_min: float | None = None
+    dedupe_spacing: float | None = None
+    shell_views: int | None = None
+    fov_deg: float | None = None
     render_resolution: int | None = None
+    seed: int | None = None
 
 
 def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
-    """Clamp a request into PlanParams; omitted fields keep the sampler defaults."""
+    """Clamp a request into PlanParams; omitted fields keep the planner defaults."""
     d = splat_stage4.PlanParams()
     if req is None:
         return d
@@ -2884,22 +2928,16 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         return float(min(max(v, lo), hi)) if v is not None else default
 
     return splat_stage4.PlanParams(
-        patch_min_spacing=pick(req.patch_min_spacing, 0.02, 0.5, d.patch_min_spacing),
-        patch_max_spacing=pick(req.patch_max_spacing, 0.05, 2.0, d.patch_max_spacing),
-        angular_bins=int(pick(req.angular_bins, 2, 16, d.angular_bins)),
-        # PlanParams itself caps the effective value at render_resolution
-        # (saturation); the clamp here is just request hygiene.
-        finest_px_per_patch=pick(req.finest_px_per_patch, 2.0, 2048.0, d.finest_px_per_patch),
-        min_gain=int(pick(req.min_gain, 1, 500, d.min_gain)),
-        max_views=(
-            int(pick(req.max_views, 100, 5_000_000, 0)) if req.max_views is not None
-            else d.max_views
-        ),
-        candidate_spacing=pick(req.candidate_spacing, 0.1, 3.0, d.candidate_spacing),
-        # Generous safety ceiling (was a room-scale 20k cap); Stage 4 even-downsamples
-        # and warns if a scene exceeds it, so large scenes aren't silently clipped.
-        max_candidates=int(pick(req.max_candidates, 1000, 5_000_000, d.max_candidates)),
+        coverage=pick(req.coverage, 0.05, 5.0, d.coverage),
+        detail_px=pick(req.detail_px, 2.0, 32.0, d.detail_px),
+        ball_min=int(pick(req.ball_min, 1, 256, d.ball_min)),
+        max_ball_views=int(pick(req.max_ball_views, 32, 20_000, d.max_ball_views)),
+        standoff_min=pick(req.standoff_min, 0.1, 5.0, d.standoff_min),
+        dedupe_spacing=pick(req.dedupe_spacing, 0.1, 3.0, d.dedupe_spacing),
+        shell_views=int(pick(req.shell_views, 0, 1024, d.shell_views)),
+        fov_deg=pick(req.fov_deg, 30.0, 120.0, d.fov_deg),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
+        seed=int(pick(req.seed, 0, 2**31 - 1, d.seed)),
     )
 
 
@@ -2910,34 +2948,30 @@ def _cameras_path(run: str, slot: str, model: str) -> Path:
 
 def _splat_stage4_status(run: str, slot: str, model: str) -> dict[str, Any]:
     """Public Stage-4 state: live job, else 'done' (with the plan summary) when
-    `cameras.json` is on disk, else 'idle'. Carries `url` (cameras.json),
-    `patches_url` (patches.bin), and `patch_views_url` (patch_views.json — the
-    per-patch → covering camera/face index the debug viewer selects against)."""
+    `cameras.json` is on disk, else 'idle'. Carries `url` (cameras.json)."""
     cams = _cameras_path(run, slot, model)
     url = _artifact_url(cams)
-    patches_url = _artifact_url(cams.with_name(splat_stage4.PATCHES_NAME))
-    patch_views_url = _artifact_url(cams.with_name(splat_stage4.PATCH_VIEWS_NAME))
     job = _splat_stage4_jobs.get((run, slot, model))
     if job is not None:
-        return {**job, "url": url, "patches_url": patches_url, "patch_views_url": patch_views_url}
+        return {**job, "url": url}
     if url is not None:
         summary: Any = None
         with contextlib.suppress(Exception):
             payload = json.loads(cams.read_text(encoding="utf-8"))
-            summary = {k: v for k, v in payload.items() if k != "cameras"}
-            if isinstance(payload.get("cameras"), list):
-                summary["cameras"] = len(payload["cameras"])
+            summary = payload.get("summary") or {
+                k: v for k, v in payload.items() if k != "cameras"
+            }
         return {
             "run": run, "slot": slot, "model": model,
             "running": False, "phase": "done", "status": "done",
             "current_id": None, "error": None, "summary": summary,
-            "url": url, "patches_url": patches_url, "patch_views_url": patch_views_url,
+            "url": url,
         }
     return {
         "run": run, "slot": slot, "model": model,
         "running": False, "phase": "idle", "status": "idle",
         "current_id": None, "error": None, "summary": None,
-        "url": None, "patches_url": None, "patch_views_url": None,
+        "url": None,
     }
 
 
@@ -2945,35 +2979,23 @@ def _plan_cameras_cell(
     run: str, slot: str, model: str, out_path: Path,
     plan_params: splat_stage4.PlanParams, job: dict[str, Any],
 ) -> dict[str, Any]:
-    """Plan cameras from the Stage-2 free-space grid + Stage-3 surfel cloud — no mesh
-    loading, no de-optimization (that's why Stage 4 can't run off a raw mesh).
-
-    The progress callback also derives a live `rate` (actions/second) for the
-    current planning STEP — candidates ray-marched during 'coverage', cameras
-    picked during 'select' — as an EMA of Δdone/Δt that resets whenever the
-    sub-step changes, so each step reports its own throughput. Marker steps
-    (load / patches / write) don't stream a count, so their rate stays 0."""
-    meter = {"step": None, "t": 0.0, "done": 0, "rate": 0.0}
+    """Plan cameras from the Stage-2 free-space grid + Stage-1 scene manifest
+    (the placed-object AABBs) — no meshes, no surfels, no CUDA. Fast: the
+    per-target "balls" step streams (done, total); the marker steps
+    (load / shell / write) stream no counts."""
 
     def _progress(done: int, total: int, current: str) -> None:
-        now = time.monotonic()
-        if current != meter["step"]:          # new sub-step → restart the baseline
-            meter.update(step=current, t=now, done=done, rate=0.0)
-        elif done > meter["done"]:             # streaming step → EMA of Δdone/Δt
-            inst = (done - meter["done"]) / max(now - meter["t"], 1e-3)
-            meter["rate"] = inst if meter["rate"] <= 0.0 else 0.5 * meter["rate"] + 0.5 * inst
-            meter["t"], meter["done"] = now, done
         job["phase"], job["done"], job["total"], job["current_id"] = (
             "plan", done, total, current,
         )
-        job["rate"] = round(meter["rate"], 1)
 
     job["phase"] = "plan"
     job["rate"] = 0.0
+    manifest = _slot_dir(run, slot, model) / "splat" / splat_stage1.MANIFEST_NAME
     return splat_stage4.plan_cameras(
         run=run, slot=slot, model=model,
         freespace_path=_freespace_path(run, slot, model),
-        surfels_path=_cloud_path(run, slot, model),
+        scene_path=manifest,
         out_path=out_path, params=plan_params, progress=_progress,
     )
 
@@ -2981,15 +3003,17 @@ def _plan_cameras_cell(
 async def _run_splat_stage4_cell(
     run: str, slot: str, model: str, plan_params: splat_stage4.PlanParams
 ) -> None:
-    """Plan ONE cell's coverage cameras off the event loop. Requires the Stage-2
-    free-space grid + Stage-3 surfel cloud; `cameras.json` is the 'done' marker."""
+    """Plan ONE cell's cameras off the event loop. Requires the Stage-2
+    free-space grid + Stage-1 scene manifest; `cameras.json` is the 'done'
+    marker."""
     key = (run, slot, model)
     job = _splat_stage4_jobs[key]
     try:
         if not _freespace_path(run, slot, model).is_file():
             raise FileNotFoundError("run Stage 2 (free-space) first")
-        if not _cloud_path(run, slot, model).is_file():
-            raise FileNotFoundError("run Stage 3 (surfels) first")
+        manifest = _slot_dir(run, slot, model) / "splat" / splat_stage1.MANIFEST_NAME
+        if not manifest.is_file():
+            raise FileNotFoundError("run Stage 1 (scene manifest) first")
         out_path = _cameras_path(run, slot, model)
         summary = await asyncio.to_thread(
             _plan_cameras_cell, run, slot, model, out_path, plan_params, job,
@@ -3041,8 +3065,10 @@ def _splat_stage_artifacts(run: str, slot: str, model: str) -> dict[int, list[Pa
         3: [cloud, cloud.with_suffix(".json"), cloud.with_suffix(".detail.ply")],
         4: [
             cams,
-            cams.with_name(splat_stage4.PATCHES_NAME),
-            cams.with_name(splat_stage4.PATCH_VIEWS_NAME),
+            # Retired greedy-planner artifacts; still listed so reverts scrub
+            # stale copies older runs left behind.
+            cams.with_name("patches.bin"),
+            cams.with_name("patch_views.json"),
         ],
         5: [_refs_dir(run, slot, model)],
     }
@@ -3178,7 +3204,7 @@ def _write_stage5_transforms(out_dir: Path, plan: dict[str, Any], views: list[di
     whether the views were rendered in one session or resumed across many."""
     intr = plan["intrinsics"]
     resolution = int(intr["resolution"])
-    K = splat_stage5.intrinsics_matrix(resolution, float(intr["face_fov_deg"]))
+    K = splat_stage5.intrinsics_matrix(resolution, float(intr["fov_deg"]))
     splat_stage5.write_transforms(
         out_dir, K, resolution, float(intr["near"]), float(intr["far"]),
         splat_stage5.reference_frames(views),
@@ -3238,7 +3264,7 @@ async def _run_splat_stage5_cell(
             "resolution": int(intr["resolution"]),
             "near": float(intr["near"]),
             "far": float(intr["far"]),
-            "fov_deg": float(intr["face_fov_deg"]),
+            "fov_deg": float(intr["fov_deg"]),
             "outstanding": set(),     # asyncio-wrapped encode futures in flight
             "encode_errors": [],
             "client_error": None,
@@ -3978,10 +4004,10 @@ def create_app() -> FastAPI:
         run: str, slot: str, model: str, body: Stage2Request | None = None
     ) -> dict[str, object]:
         """Compute ONE cell's free-space grid — single uniform occupancy +
-        flood-fill free/garbage classification + clearance → `splat/freespace.npz`
+        flood-fill empty/garbage classification → `splat/freespace.npz`
         (+ `voxels.bin` viz), see splat/stage2.py. The shared spatial foundation
         Stage 3 (surfels) and Stage 4 (cameras) consume. Optional body:
-        `pitch`/`margin`/`clearance`/`workers` (workers=1 minimises peak RAM).
+        `pitch`/`margin`/`workers` (workers=1 minimises peak RAM).
         Idempotent while running; re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
@@ -4024,47 +4050,6 @@ def create_app() -> FastAPI:
     async def splat_stage2_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Live Stage-2 (free-space) state of one cell ('idle' / 'pending' / a running
         job / 'done' with the `voxels.bin` viz `url` / 'error')."""
-        return _splat_stage2_status(run, slot, model)
-
-    @app.post("/runs/{run}/splat/stage2/{slot}/{model}/clearance")
-    async def splat_stage2_clearance(  # pyright: ignore[reportUnusedFunction]
-        run: str, slot: str, model: str, body: Stage2ClearanceRequest
-    ) -> dict[str, object]:
-        """RE-BAKE the candidate clearance filter of an existing free-space
-        grid (the client clearance slider's 'apply'). INSTANT: candidates
-        carry their distance-to-surface annotations, so only the `clearance_m`
-        scalar is rewritten. The filter feeds Stage 4's candidates (Stage 3
-        reads EMPTY only), so stages 4+ are invalidated; Stage 3 survives.
-        Returns the refreshed Stage-2 status."""
-        key = (run, slot, model)
-        existing = _splat_stage2_jobs.get(key)
-        if existing is not None and existing.get("running"):
-            raise HTTPException(status_code=409, detail="stage 2 is running — wait for it")
-        grid = _freespace_path(run, slot, model)
-        if not grid.is_file():
-            raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
-        clearance = _clamp_clearance(body.clearance)
-        try:
-            patch = await asyncio.to_thread(
-                splat_stage2.apply_clearance, grid, clearance
-            )
-        except ValueError as exc:  # pre-clearance grid layout
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        _revert_after(run, slot, model, 3)  # new FREE → replan cameras/refs
-        # Fold the patch into the sidecar (and any done-job snapshot) so the
-        # next status poll reflects the applied threshold.
-        sidecar = grid.with_suffix(".json")
-        summary: dict[str, Any] = {}
-        with contextlib.suppress(Exception):
-            summary = json.loads(sidecar.read_text(encoding="utf-8"))
-        summary["free_voxels"] = patch["free_voxels"]
-        summary.setdefault("params", {})["clearance"] = patch["clearance"]
-        with contextlib.suppress(Exception):
-            tmp = sidecar.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(summary, indent=1), encoding="utf-8")
-            tmp.replace(sidecar)
-        if existing is not None:
-            existing["summary"] = summary
         return _splat_stage2_status(run, slot, model)
 
     @app.post("/runs/{run}/splat/stage3/{slot}/{model}")
@@ -4124,11 +4109,12 @@ def create_app() -> FastAPI:
     async def splat_stage4_start(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: Stage4Request | None = None
     ) -> dict[str, object]:
-        """Plan coverage cameras for ONE cell — feature-adaptive patches + greedy
-        set-cover over the free space (see splat/stage4.py) → `splat/cameras.json`
-        (+ `patches.bin`), the input for Stage 5 reference renders and the
-        occlusion-cull list. Knobs in the body (K, min_gain, patch spacing, …);
-        idempotent while running; re-runs (overwrites) on a fresh POST."""
+        """Plan cameras for ONE cell — the zone-driven dense single-shot field
+        (per-zone Halton fills + atomic-zone panorama stations + the root
+        establishing shell; see splat/stage4.py) → `splat/cameras.json`, the
+        input for Stage 5 reference renders. Knobs in the body (density,
+        clamps, station/shell sizes, intrinsics); idempotent while running;
+        re-runs (overwrites) on a fresh POST."""
         source = _splat_source(run, slot, model)
         if source is None:
             raise HTTPException(
@@ -4137,8 +4123,9 @@ def create_app() -> FastAPI:
             )
         if not _freespace_path(run, slot, model).is_file():
             raise HTTPException(status_code=409, detail="run Stage 2 (free-space) first")
-        if not _cloud_path(run, slot, model).is_file():
-            raise HTTPException(status_code=409, detail="run Stage 3 (surfels) first")
+        manifest = _slot_dir(run, slot, model) / "splat" / splat_stage1.MANIFEST_NAME
+        if not manifest.is_file():
+            raise HTTPException(status_code=409, detail="run Stage 1 (scene manifest) first")
         plan_params = _stage4_params(body)
         _, kind = source
         key = (run, slot, model)
@@ -4161,7 +4148,6 @@ def create_app() -> FastAPI:
             "summary": None,
             "rate": 0.0,
             "url": None,
-            "patches_url": None,
             "started_at": datetime.now().isoformat(timespec="seconds"),
             "finished_at": None,
         }
@@ -4373,7 +4359,8 @@ def create_app() -> FastAPI:
     async def splat_colmap_export(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Export ONE cell's Stage-3 cloud + Stage-5 references to a COLMAP text model
         under `splat/colmap/` — cameras.txt / images.txt / points3D.txt plus the SZF
-        reference frames decoded to RGB PNG — the folder Postshot / COLMAP-based tools
+        reference frames decoded to RGBA PNG (coverage alpha kept as a mask) — the
+        folder Postshot / COLMAP-based tools
         ingest (drag it in → Camera Poses = Import). Needs Stage 3 (`cloud.ply`) +
         Stage 5 (`refs/transforms.json`); poses are OpenCV camera-to-world, so the
         extrinsics are inv(c2w) with no OpenGL flip. Overwrites any previous export.
@@ -4416,7 +4403,9 @@ def create_app() -> FastAPI:
                 rec["logf"].close()
         iterations = body.iterations if body is not None else None
         restart = bool(body.restart) if body is not None else False
-        return _spawn_stage6(run, slot, model, iterations, restart)
+        # _spawn_stage6 first builds the COLMAP model (decodes reference frames),
+        # which is blocking — run it off the event loop.
+        return await asyncio.to_thread(_spawn_stage6, run, slot, model, iterations, restart)
 
     @app.get("/runs/{run}/splat/stage6/{slot}/{model}")
     async def splat_stage6_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
@@ -4454,23 +4443,35 @@ def create_app() -> FastAPI:
     async def splat_modal_start(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: ModalTrainRequest | None = None
     ) -> dict[str, object]:
-        """Train ONE cell on the Modal A100: stages 4 (cameras) → 5 (references)
-        → 6 (fine-tune) run remotely, and `trained.ply` is pulled back so the
-        viewer's 'trained' toggle lights up. Needs the local Stage 2 + Stage 3
-        outputs (freespace + cloud).
+        """Splat ONE cell on the Modal A100, in one of two modes (body `mode`):
 
+          * "train" (default) — Modal (re)plans cameras (stage 4) and OVERWRITES
+            the local plan, then renders references, builds the COLMAP model, and
+            fine-tunes (stages 4-7). Needs the local Stage 1-3 outputs.
+          * "continue" — use the LOCAL Stage-4 plan (`splat/cameras.json`) as-is;
+            Modal runs stages 5-7 only (references → COLMAP → 2DGS fine-tune →
+            heal). Needs a local camera plan (run Stage 4 here first).
+
+        `trained.ply` is pulled back so the viewer's 'trained' toggle lights up.
         This button is an explicit FRESH, FORCED restart: it cancels any train
-        already running for the cell (ours or a reattached one), deletes the
-        previous run's local artifacts (`_clear_modal_artifacts`), and spawns a
-        from-scratch remote run (force — no signature/cache reuse). CONTINUING a
-        still-running train instead is the job of the AUTOMATIC paths (the startup
-        scan + the status-poll reattach hook), never this button. Async — never
-        blocks the server; poll the GET (or the cells list's per-cell `modal`
-        field) for the live phase + training step."""
+        already running for the cell, deletes the previous run's downstream local
+        artifacts (`_clear_modal_artifacts` — 'continue' KEEPS the local plan),
+        and spawns a from-scratch remote run (force). CONTINUING a still-running
+        train is the job of the AUTOMATIC paths (startup scan + status-poll
+        reattach hook), never this button. Async — poll the GET (or the cells
+        list's per-cell `modal` field) for the live phase + training step."""
         if splat_modal is None:
             raise HTTPException(
                 status_code=503,
                 detail="the Modal SDK isn't available on this server host",
+            )
+        mode = (body.mode if body is not None else "train") or "train"
+        if mode not in ("train", "continue"):
+            raise HTTPException(status_code=400, detail=f"unknown mode {mode!r}")
+        if mode == "continue" and not _cameras_path(run, slot, model).is_file():
+            raise HTTPException(
+                status_code=409,
+                detail="no local camera plan — run Stage 4 first, or use train mode",
             )
         key = (run, slot, model)
         # The MANUAL button is an explicit FRESH, FORCED restart — distinct from
@@ -4496,11 +4497,15 @@ def create_app() -> FastAPI:
         # Explicit restart = clean slate: drop every previous-run artifact locally
         # (incl. modal-job.json — the forced spawn writes a new one) so nothing old
         # lingers to confuse old-vs-new. Runs AFTER cancel_cell, which needs the
-        # old modal-job.json to terminate the prior container.
-        _clear_modal_artifacts(run, slot, model, drop_job_record=True)
+        # old modal-job.json to terminate the prior container. 'continue' KEEPS the
+        # local camera plan — it's the input the remote render consumes.
+        _clear_modal_artifacts(
+            run, slot, model, drop_job_record=True, keep_plan=(mode == "continue")
+        )
         opts = {
             "train": body.train_overrides() if body is not None else {},
             "restart": True,  # explicit button press = force fresh
+            "mode": mode,
         }
         _splat_modal_jobs[key] = {
             "status": "running", "running": True, "phase": "start",

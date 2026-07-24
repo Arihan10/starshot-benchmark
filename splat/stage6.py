@@ -1,12 +1,22 @@
 """Stage 6 — Splat fine-tune (the training run) via gsplat 2DGS.
 
-Takes the **Stage-3 surfel cloud** (`cloud.ply`) as the initialization and
-optimizes it against the **Stage-5 lit reference renders** (`refs/` — per-view
-RGB + depth + alpha + exact OpenCV poses in `transforms.json`) into an optimized
-2DGS splat (`trained.ply`). This is where the raw mesh-sampled surfels become a
-clean, crisp splat: densification adds Gaussians where the render disagrees with
-the reference (appearance detail on geometrically-flat surfaces), pruning removes
-redundant ones, and the depth loss suppresses floaters.
+Takes a **COLMAP model** as its ONLY input — the same (point cloud + camera poses
++ reference images) triple Postshot ingests and gsplat's `simple_trainer_2dgs`
+trains on, written by `splat_to_colmap.py` / `splat.colmap.export_colmap`
+(`cameras.txt` / `images.txt` / `points3D.txt` + RGBA images). The splat is
+INITIALIZED from the point cloud the gsplat way (`_init_from_points`: means = point
+xyz, colour = point RGB, isotropic KNN scales, random quats, opacity =
+logit(`init_opa`)) and optimized against the reference images into a clean 2DGS
+splat (`trained.ply`): densification adds Gaussians where the render disagrees with
+the reference, pruning removes redundant ones.
+
+The trainer reads the images as RGB — the export's PNGs also carry a coverage
+alpha (kept for Postshot masking) but it isn't read here — and COLMAP has no depth,
+so the alpha/coverage loss, the dense depth loss, and depth-guided densification are
+DISABLED here (nothing to compare against) — the active loss set is exactly the reference trainer's: photometric L1 +
+D-SSIM, 2DGS normal consistency, and optional depth distortion. (The depth/alpha
+machinery below is retained because Stage 7 `heal_splat` still consumes the
+alpha+depth Stage-5 references.)
 
 WHAT THE FINE-TUNE FIXES (all lighting-independent of the loss's own): render-
 operator errors that only appear once flat disks are depth-sorted + alpha-blended
@@ -24,13 +34,14 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
   * Depth: planar camera-space Z (metres), decoded from the SZF frame's log-uint16
     codes via the shared [near, far] (legacy 16-bit PNG / float32 `.npy` sets still
-    read as-is). The loss compares the reference against the splat's EXPECTED depth
-    (`depth_mode="expected"`, the ED channel) — the one per-pixel term that sees a
-    low-opacity floater stranded in front of an opaque surface (photometric L1 and
-    the alpha loss are both blind to it there). `depth_mode="median"` (the
-    transmittance-0.5 crossing) is cleaner at silhouettes and never fades BLEND
-    glass (α ≈ 0.065 stays below the crossing), but is blind to those floaters —
-    reserve it for genuinely glass-heavy scenes.
+    read as-is). The loss compares the reference against the splat's MEDIAN depth
+    (`depth_mode="median"` default, the transmittance-0.5 crossing) — it lands on
+    the nearest OPAQUE surface, exactly what the capture stores as depth GT (BLEND
+    glass doesn't write depth), so a transmissive pane at α ≈ 0.065 stays below the
+    crossing and is invisible to the depth loss instead of being razed as a
+    floater. `depth_mode="expected"` (the ED channel) additionally penalizes low-
+    opacity floaters in front of opaque surfaces, but treats real glass as one of
+    them — reserve it for runs with no glass and no geometric floater cull.
   * Colour: spherical harmonics to degree 3 (PostShot's default) — a per-Gaussian
     DC term (`sh0`) plus 15 higher-order RGB coefficients (`shN`) — compared
     directly against the LIT references (no sRGB->linear). The Stage-5 capture
@@ -48,9 +59,10 @@ LOSSES (per view):
     energy;
   * alpha (mask) — L1(render α, reference α): the renderer's exact coverage
     masks make empty space stay empty and glass stay see-through;
-  * depth — alpha-gated L1 on the expected depth (the one term that suppresses
-    low-opacity floaters in front of opaque surfaces; `depth_mode` switches it to
-    median for glass scenes);
+  * depth — alpha-gated L1 on the median depth (the transmittance-0.5 crossing,
+    which lands on the nearest opaque surface and so leaves transmissive glass
+    untouched; `depth_mode="expected"` instead hunts front floaters at the cost of
+    razing glass — see TrainParams.depth_mode);
   * 2DGS regularizers — normal consistency (render normals vs normals-from-depth)
     and optional depth distortion.
 
@@ -142,6 +154,7 @@ from typing import Any
 
 import numpy as np
 
+from splat.colmap import SIDECAR_NAME as _SIDECAR_NAME
 from splat.stage5 import (
     TRANSFORMS_NAME,
     decode_depth_u16,
@@ -198,12 +211,32 @@ class TrainParams:
     # Loss weights.
     ssim_lambda: float = 0.2           # photometric = (1-λ)·L1 + λ·(1-SSIM)
     alpha_lambda: float = 0.5          # L1(render α, reference α)
-    depth_lambda: float = 0.5          # alpha-gated depth L1 (metres)
+    depth_lambda: float = 0.5          # alpha-gated depth L1 (metres) — median vs the opaque plane
+    # "Record both" — the SECOND depth target, the glass-maker. The stored depth
+    # plane is the nearest OPAQUE surface, so `depth_lambda` (median) pins the wall
+    # but says nothing about a transmissive pane in front of it. This term
+    # supervises the splat's EXPECTED depth (the α-weighted mean) toward the true
+    # TWO-LAYER expected depth, derived at train time from the mesh-exact init
+    # cloud (whose glass surfels sit at α≈0.065 on the panes). Deleting a pane
+    # shifts the splat's expected depth back onto the wall — off this target — so
+    # it is a POSITIVE signal that *requires* the glass, while the median term
+    # keeps the wall pinned (the two together are well-posed: median forbids
+    # sliding the wall forward to fake the expected depth, so the only way to
+    # satisfy both is a wall at its true depth + a pane in front). Derived from the
+    # init cloud, so NO capture change / re-render is needed. 0 disables (default
+    # off until validated); only meaningful with the surfels init.
+    depth_expected_lambda: float = 0.0
     alpha_gate: float = 0.5            # reference α above this = opaque pixel (depth/normal masks)
     normal_lambda: float = 0.05        # 2DGS normal consistency
     dist_lambda: float = 0.0           # 2DGS depth distortion (off by default; over-flattens bounded scenes)
     normal_start_iter: int = 2000      # let geometry settle before the regularizers bite
     dist_start_iter: int = 1000
+    # Depth-loss warm-up (view-draws, batch-scaled like the other cadences): the
+    # point-cloud init starts translucent (init_opa), so the early rendered depth
+    # (expected blends through surfaces; median sits behind them until transmittance
+    # crosses 0.5) is unreliable; let opacity saturate before the metric term bites.
+    # (The opaque surfel init never needs this — its depth is true from step 0.)
+    depth_start_iter: int = 500
 
     # Learning rates (means_lr is × scene_scale at runtime). sh0_lr is the SH DC
     # (base-colour) LR (INRIA `feature_lr`); shN_lr is the higher-order SH LR at
@@ -230,17 +263,51 @@ class TrainParams:
     sh_degree: int = 3
     sh_degree_interval: int = 1000
 
+    # INIT SOURCE. "surfels" (default): the Stage-3 cloud (`init_ply`) seeds
+    # every Gaussian at the 2DGS solution — on-surface means, mesh-true quats,
+    # tangent-disc scales, exact texel colours, solid opacity. "points": the
+    # gsplat `create_splats_with_optimizers` recipe from the COLMAP points3D
+    # (positions + colours only): opacity = logit(init_opa); each scale =
+    # log(mean distance to 3 nearest neighbours × init_scale) (isotropic);
+    # random quats. The Postshot-parity A/B baseline.
+    init: str = "surfels"
+    # Surfel-init opacity CEILING (the one saturation trap of a near-solution
+    # init): Stage 3 clamps alpha at 1-1e-3 → logit ≈ 6.9, where the sigmoid's
+    # gradient is ~1e-3 and opacity is effectively FROZEN — a mirror/glass
+    # surface could never turn transmissive and floaters could never be
+    # trained away. Capping at 0.9 (logit ≈ 2.2) keeps opacity live while
+    # still rendering solid from step 0.
+    init_opa_max: float = 0.9
+    # "points"-init knobs (gsplat defaults).
+    init_opa: float = 0.1
+    init_scale: float = 1.0
+
     # Densification (gsplat DefaultStrategy, 2DGS gradient key).
     refine: bool = True
     refine_start_iter: int = 500
     refine_stop_iter: int | None = None  # None → int(iterations * 0.5) at runtime
     refine_every: int = 100
-    # 0 DISABLES periodic opacity resets (the default here): a reset clamps every
-    # opacity to 2·prune_opa, but surfels no training view covers (occluded
-    # regions kept at their mesh-true init) receive no gradient and would stay
-    # dimmed forever. The pinned gsplat 1.5.3 never fires resets anyway (its
-    # trigger `step % reset_every == 0 & step > 0` parses as `… and (0 > 0)`);
-    # this makes that behaviour deliberate and upgrade-proof.
+    # Periodic opacity resets (the reference 3DGS/2DGS floater purge: clamp every
+    # opacity to 2·prune_opa + zero its Adam moments, so only image-justified
+    # Gaussians re-earn visibility) — DISABLED by default, deliberately:
+    #   * The cadence is draw-denominated, so passes-between-resets =
+    #     reset_every / n_views. Our plans carry THOUSANDS of views (swamp-land:
+    #     4212 → a reset every 0.71 passes at the reference 3000), so the clamp
+    #     outruns recovery and ships a half-transparent scene — measured on the
+    #     2026-07-23 runs (hotel 24.5 dB, swamp healed to 9.7k splats, vs the
+    #     old loop's 33 dB). Raising epochs does NOT fix this: the spacing is
+    #     set by view count alone; longer runs just reset more often.
+    #   * This pipeline doesn't need the amnesty cycle to kill floaters: Stage 7
+    #     settles them GEOMETRICALLY — the Stage-3 cloud sits exactly on the
+    #     true mesh surfaces, so heal's `surface_max_dist` cull deletes airborne
+    #     Gaussians decidably, and its measured-contribution cull + opacity
+    #     prune handle near-surface haze.
+    # Setting a value > 0 re-enables the reference behavior for reference-shaped
+    # runs (hundreds of views × tens of passes): view-draw units like every
+    # other cadence (resolve_schedule divides by `batch`), firing only inside
+    # the refine window via the in-loop reset in _train_one — the pinned gsplat
+    # 1.5.3 wheel's own trigger is dead code (`== 0 & step` precedence bug;
+    # 1.5.3 is still the newest release everywhere, the fix unreleased on main).
     reset_every: int = 0
     # Mean (non-absolute) 2D-gradient split threshold — gsplat's default value.
     # AbsGS (absgrad) is deliberately NOT used: in the pinned gsplat 1.5.3 the
@@ -350,16 +417,23 @@ class TrainParams:
     # cloud. Non-packed is also cheap at our per-cell Gaussian counts.)
     near_plane: float = 0.01
     far_plane: float = 1e10
-    # Depth statistic the depth loss (and normals-from-depth) compares. "expected"
-    # (default) = the alpha-weighted mean (ED): the ONLY per-pixel term that sees a
-    # low-opacity floater stranded in front of an opaque surface — L1 is camouflaged
-    # (the floater blends toward its backing's colour), the alpha loss is saturated
-    # (coverage behind it is already 1), and the median's transmittance-0.5 crossing
-    # sits on the surface BEHIND it, so only the expected depth is shifted by a front
-    # floater. "median" = the transmittance-0.5 crossing: cleaner at silhouettes and
-    # it never fades BLEND glass (α ≈ 0.065 stays below the crossing), but it's blind
-    # to those floaters — use it only for genuinely glass-heavy scenes.
-    depth_mode: str = "expected"
+    # Depth statistic the depth loss (and normals-from-depth) compares. "median"
+    # (default) = the transmittance-0.5 crossing: it sits on the nearest OPAQUE
+    # surface, which is exactly what the capture stores as depth GT (BLEND glass
+    # doesn't write depth), so a correctly-reproduced glass pane at α ≈ 0.065 stays
+    # below the crossing and contributes ZERO depth error — the pane is no longer
+    # seen as a floater to delete. It's also cleaner at silhouettes. "expected" =
+    # the alpha-weighted mean (ED): the one per-pixel term that sees a low-opacity
+    # floater stranded in front of an opaque surface (L1 is camouflaged, the alpha
+    # loss is saturated) — BUT it reads a real transmissive pane as that same
+    # floater and drags its opacity to zero (glass-over-wall gets a residual error
+    # even when perfectly reconstructed), which is why it razed the glass panes.
+    # This pipeline doesn't need expected's floater-hunting: Stage 7 culls airborne
+    # Gaussians GEOMETRICALLY against the exact Stage-3 surfels (surface_max_dist)
+    # plus a measured-contribution + opacity prune. Choose "expected" only for a
+    # run whose geometric post-cull is disabled and that has no transmissive
+    # surfaces to protect.
+    depth_mode: str = "median"
     seed: int = 0
     eval_max_views: int = 128          # cap final-metric renders (plans can have thousands of views)
     log_every: int = 50                # emit a progress line every N steps
@@ -446,10 +520,12 @@ class TrainParams:
             ),
             depth_densify_every=per_batch(self.depth_densify_every),
             depth_densify_start=per_batch(self.depth_densify_start),
+            depth_start_iter=per_batch(self.depth_start_iter),
             normal_start_iter=per_batch(self.normal_start_iter),
             dist_start_iter=per_batch(self.dist_start_iter),
             aa_every=per_batch(self.aa_every),
             sh_degree_interval=per_batch(self.sh_degree_interval),
+            reset_every=(0 if self.reset_every == 0 else per_batch(self.reset_every)),
             ckpt_every=(0 if self.ckpt_every == 0 else per_batch(self.ckpt_every)),
         )
 
@@ -458,9 +534,15 @@ class TrainParams:
             "iterations": self.iterations,
             "epochs": self.epochs,
             "batch": self.batch,
+            "init": self.init,
+            "init_opa_max": self.init_opa_max,
+            "init_opa": self.init_opa,
+            "init_scale": self.init_scale,
             "ssim_lambda": self.ssim_lambda,
             "alpha_lambda": self.alpha_lambda,
             "depth_lambda": self.depth_lambda,
+            "depth_expected_lambda": self.depth_expected_lambda,
+            "depth_start_iter": self.depth_start_iter,
             "depth_mode": self.depth_mode,
             "alpha_gate": self.alpha_gate,
             "normal_lambda": self.normal_lambda,
@@ -575,6 +657,129 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
         "shN": shN,
         "scales": scales,
     }
+
+
+# --- COLMAP text model (the Postshot-style input: points3D + cameras + images) --
+# The model written by `splat.colmap.export_colmap` / `splat_to_colmap.py`: one
+# shared PINHOLE camera, per-image world-to-camera poses, an xyz+rgb point cloud,
+# and the reference images as RGBA (RGB + coverage alpha; depth dropped — the
+# trainer reads only RGB, the alpha is kept for Postshot masking). This is
+# now the ONLY Stage-6 input; the trainer inits from the point cloud exactly like
+# gsplat's simple_trainer_2dgs.
+
+_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff")
+
+
+def _qvec_to_rotmat(q: np.ndarray) -> np.ndarray:
+    """COLMAP `(qw,qx,qy,qz)` world-to-camera quaternion → 3×3 rotation (the exact
+    inverse of `splat.colmap.rotmat2qvec`)."""
+    w, x, y, z = q
+    return np.array(
+        [
+            [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+            [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+            [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+        ],
+        dtype=np.float64,
+    )
+
+
+def _read_colmap_cameras(path: Path) -> tuple[np.ndarray, int, int]:
+    """Parse `cameras.txt` → (K [3,3], width, height). Assumes a single shared
+    pinhole camera (what `export_colmap` writes and what the trainer's one shared
+    `K` expects); the first camera record wins if several are present."""
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split()
+        model, w, h = parts[1], int(parts[2]), int(parts[3])
+        p = [float(v) for v in parts[4:]]
+        if model in ("PINHOLE", "OPENCV"):
+            fx, fy, cx, cy = p[0], p[1], p[2], p[3]
+        elif model in ("SIMPLE_PINHOLE", "SIMPLE_RADIAL"):
+            fx, fy, cx, cy = p[0], p[0], p[1], p[2]
+        else:
+            raise ValueError(f"{path}: unsupported COLMAP camera model {model!r} (need PINHOLE)")
+        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
+        return K, w, h
+    raise ValueError(f"{path}: no camera record")
+
+
+def _read_colmap_images(path: Path) -> list[tuple[str, np.ndarray]]:
+    """Parse `images.txt` → [(image_name, c2w [4,4]), …] in file order. Each image's
+    pose line is `ID QW QX QY QZ TX TY TZ CAMERA_ID NAME` (world-to-camera); the
+    optional POINTS2D line (empty in our export) is identified by NOT ending in an
+    image name and skipped, so both our export and a standard model parse."""
+    out: list[tuple[str, np.ndarray]] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        parts = s.split()
+        if len(parts) < 10 or not parts[9].lower().endswith(_IMAGE_EXTS):
+            continue  # a POINTS2D line, not a pose line
+        q = np.array(parts[1:5], dtype=np.float64)
+        t = np.array(parts[5:8], dtype=np.float64)
+        w2c = np.eye(4, dtype=np.float64)
+        w2c[:3, :3] = _qvec_to_rotmat(q)
+        w2c[:3, 3] = t
+        out.append((parts[9], np.linalg.inv(w2c)))
+    return out
+
+
+def _read_colmap_points(path: Path) -> tuple[np.ndarray, np.ndarray]:
+    """Parse `points3D.txt` → (xyz [N,3] float64, rgb [N,3] uint8). Only the first
+    seven fields per line (ID X Y Z R G B) are read; the variable-length TRACK tail
+    is left unsplit (`maxsplit=7`) so multi-million-point clouds parse quickly."""
+    xyz: list[tuple[float, float, float]] = []
+    rgb: list[tuple[int, int, int]] = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        if not line or line[0] == "#":
+            continue
+        p = line.split(maxsplit=7)
+        if len(p) < 7:
+            continue
+        xyz.append((float(p[1]), float(p[2]), float(p[3])))
+        rgb.append((int(p[4]), int(p[5]), int(p[6])))
+    if not xyz:
+        raise ValueError(f"{path}: no 3D points")
+    return np.asarray(xyz, dtype=np.float64), np.asarray(rgb, dtype=np.uint8)
+
+
+def _init_from_points(xyz: np.ndarray, rgb: np.ndarray, params: TrainParams) -> dict[str, np.ndarray]:
+    """gsplat `create_splats_with_optimizers`-style init from a bare point cloud
+    (xyz + rgb) — the same recipe simple_trainer uses for an SfM cloud, so a
+    Postshot-style input trains identically. means = xyz; each scale =
+    log(mean-distance-to-3-nearest-neighbours × init_scale), isotropic over 3 axes;
+    quats random (rasterizer normalizes); opacity = logit(init_opa); colour = the
+    points3D RGB mapped to the SH0 DC term ((rgb−0.5)/C0, matching Stage 3)."""
+    from scipy.spatial import cKDTree
+
+    means = np.ascontiguousarray(xyz, dtype=np.float32)
+    n = int(means.shape[0])
+    k = min(4, n)
+    if k >= 2:
+        dists, _ = cKDTree(means).query(means, k=k, workers=-1)
+        dist_avg = np.sqrt((dists[:, 1:] ** 2).mean(axis=1))
+    else:
+        dist_avg = np.full(n, 0.01, dtype=np.float64)
+    log_scale = np.log(np.maximum(dist_avg * params.init_scale, 1e-9)).astype(np.float32)
+    scales = np.repeat(log_scale[:, None], 3, axis=1)
+
+    rng = np.random.default_rng(params.seed)
+    quats = rng.standard_normal((n, 4)).astype(np.float32)
+    quats /= np.linalg.norm(quats, axis=1, keepdims=True) + 1e-12
+
+    a = float(np.clip(params.init_opa, 1e-3, 1.0 - 1e-3))
+    opacities = np.full(n, float(np.log(a / (1.0 - a))), dtype=np.float32)
+
+    sh0 = (((rgb.astype(np.float32) / 255.0) - 0.5) / _SH_C0)[:, None, :].astype(np.float32)
+    # Degree-3-sized higher-order SH (zeros): a from-points init is flat, and the
+    # SH-degree warmup grows these from 0 exactly as it does for the degree-0
+    # surfel cloud — keeps the init dict shape identical for `_train_one`.
+    shN = np.zeros((n, 15, 3), dtype=np.float32)
+    return {"means": means, "scales": scales, "quats": quats, "opacities": opacities, "sh0": sh0, "shN": shN}
 
 
 def _load_rgb(path: Path) -> np.ndarray:
@@ -1548,54 +1753,128 @@ def train_splat(
     run: str,
     slot: str,
     model: str,
-    cloud_path: Path,
-    refs_dir: Path,
+    colmap_dir: Path,
     out_path: Path,
+    init_ply: Path | None = None,
     params: TrainParams = TrainParams(),
     resume: bool = True,
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
-    """Fine-tune the Stage-3 surfel cloud at `cloud_path` against the Stage-5
-    references in `refs_dir`, writing the RAW optimized 2DGS splat to `out_path`
-    (`trained.ply`). Requires a CUDA GPU + gsplat (raises a clear error
-    otherwise). Returns a compact summary (init/final splat counts, per-tile
-    breakdown when tiled, final metrics, bytes).
+    """Fine-tune a 2DGS splat from a COLMAP model (poses + images — `colmap_dir`
+    holds `cameras.txt` / `images.txt` / `points3D.txt` + the RGB images, exactly
+    as `splat_to_colmap.py` / `splat.colmap.export_colmap` writes) plus the
+    init selected by `params.init` (module docstring):
+
+      * "surfels" (default) — `init_ply` (the Stage-3 `cloud.ply`) seeds every
+        Gaussian at the 2DGS solution (on-surface means, mesh-true quats,
+        tangent discs, exact texel colours), with opacity capped at
+        `init_opa_max` for gradient headroom. The metric-depth warm-up
+        (`depth_start_iter`) is zeroed: an opaque surface init's expected
+        depth is true from step 0.
+      * "points" — `_init_from_points` from the COLMAP points3D (the gsplat
+        `create_splats_with_optimizers` recipe) — the Postshot-parity A/B.
+
+    Supervision follows the data (photometric L1 + D-SSIM, 2DGS normal
+    consistency, optional distortion). When the model carries the SZF
+    SUPERVISION SIDECAR (`export_colmap` writes it for SZF refs), every view
+    additionally supervises with the capture's exact alpha (coverage) +
+    metric-depth planes at `alpha_lambda`/`depth_lambda`, and depth-guided
+    densification seeds Gaussians at surfaces the render is missing — set
+    those to 0/0/False for a Postshot-parity RGB-only run. Without the sidecar
+    the terms are forced off (nothing to compare against). Writes the RAW
+    optimized 2DGS splat to `out_path` (`trained.ply`); requires a CUDA GPU +
+    gsplat (raises a clear error otherwise).
 
     STAGE 6 IS TRAIN-ONLY: compaction (delete + heal + final-prune) and the LOD
-    ladder now live in Stage 7 (`heal_splat`), which reads this `trained.ply` and
-    emits the delivered `healed.ply`. So `trained.ply` is the un-cleaned model and
-    the two are viewable side by side.
+    ladder live in Stage 7 (`heal_splat`), which reads this `trained.ply`.
 
-    Seeds larger than `params.resolved_tile_budget` train TILED (module docstring
-    §TILED TRAINING): ground-plane cells trained one at a time — each fits VRAM
-    with densification headroom a monolithic run wouldn't have — then merged by
-    core ownership. Smaller seeds keep the single-run path unchanged.
-
-    With `resume` (default), continues from the latest `splat/ckpt/` checkpoint
-    when present and compatible (same SH config); tiled runs additionally resume
-    at the first unfinished tile (`splat/ckpt/tiles/`). `resume=False` starts
-    fresh."""
+    Clouds larger than `params.resolved_tile_budget` train TILED (ground-plane
+    cells trained one at a time, merged by core ownership); smaller clouds train as
+    a single run. With `resume` (default), continues from the latest `splat/ckpt/`
+    checkpoint; `resume=False` starts fresh."""
     torch, F, _ = _require_cuda_trainer()
 
-    cloud_path, refs_dir, out_path = Path(cloud_path), Path(refs_dir), Path(out_path)
-    if not cloud_path.is_file():
-        raise FileNotFoundError(f"surfel cloud not found: {cloud_path} (run Stage 3)")
+    colmap_dir, out_path = Path(colmap_dir), Path(out_path)
+    for req in ("cameras.txt", "images.txt", "points3D.txt"):
+        if not (colmap_dir / req).is_file():
+            raise FileNotFoundError(
+                f"COLMAP model incomplete: missing {req} in {colmap_dir} "
+                "(build it with splat_to_colmap.py / splat.colmap.export_colmap)"
+            )
 
     device = torch.device("cuda")
     torch.manual_seed(params.seed)
 
-    # Supervision set + intrinsics (paths + poses only; pixels stream from disk
-    # per step). Shared with the heal stage via `_load_scene`. The training
-    # SCHEDULE (epochs → step counts, cadences scaled by batch) is resolved per
-    # RUN just before _train_one (per TILE inside _train_tiled), so `params` here
-    # stays the raw client-supplied policy.
-    views, K, width, height, centers = _load_scene(torch, refs_dir, device)
+    # The Postshot-style input: reference views + shared intrinsics + the init point
+    # cloud, all from the COLMAP model (pixels stream from disk per step). The SZF
+    # sidecar, when present, attaches each view's exact alpha + depth planes.
+    views, K, width, height, centers, pts_xyz, pts_rgb = _load_colmap(torch, colmap_dir, device)
     n_views = len(views)
 
-    # Surfel init (also the scene-scale fallback source when there's ≤1 camera).
-    # scene_scale is GLOBAL even when tiled, so every tile's thresholds match the
-    # single-run semantics.
-    init = _load_cloud(cloud_path)
+    # Supervision keys off the DATA: with the SZF sidecar covering EVERY view, the
+    # alpha (coverage) + metric-depth losses and depth-guided densification run at
+    # their configured weights — pass alpha_lambda=0 / depth_lambda=0 /
+    # depth_densify=False for a Postshot-parity (RGB-only) run. Without full
+    # coverage (legacy PNG refs, a hand-built model, torn frames) those terms are
+    # forced OFF: an all-ones alpha target or a missing depth plane would
+    # mis-supervise. The schedule stays raw here; it is resolved per run/tile just
+    # before training.
+    from dataclasses import replace
+    n_frames = sum(1 for v in views if v["frame"] is not None)
+    supervised = n_frames == n_views
+    if not supervised:
+        params = replace(params, alpha_lambda=0.0, depth_lambda=0.0,
+                         depth_expected_lambda=0.0, depth_densify=False)
+    # ALWAYS announce the supervision mode: a silent RGB-only fallback (stale
+    # export, moved folder breaking the relative pointer, torn frames) would
+    # waste a whole run before anyone noticed the depth/alpha terms never fired.
+    if progress is not None:
+        progress(
+            0, 1,
+            (
+                f"supervision: RGB + alpha + depth via szf sidecar ({n_views} views, "
+                f"alpha_lambda={params.alpha_lambda} depth_lambda={params.depth_lambda})"
+                if supervised
+                else "supervision: RGB-only ("
+                + ("no szf sidecar" if n_frames == 0 else f"sidecar resolves only {n_frames}/{n_views} views")
+                + ")"
+            ),
+        )
+
+    # Init the splat (module docstring): the Stage-3 surfel cloud when
+    # params.init == "surfels" (geometry starts AT the 2DGS solution), else the
+    # gsplat from-points recipe. scene_scale is GLOBAL even when tiled, so every
+    # tile's thresholds match the single-run semantics.
+    if params.init == "surfels":
+        if init_ply is None or not Path(init_ply).is_file():
+            raise FileNotFoundError(
+                "params.init='surfels' needs the Stage-3 surfel cloud — pass "
+                f"init_ply= (got {init_ply}); or set init='points' for the "
+                "from-points3D baseline"
+            )
+        init = _load_cloud(Path(init_ply))
+        # Opacity CEILING (see TrainParams.init_opa_max): Stage 3 stores
+        # near-saturated logits whose sigmoid gradient is ~1e-3 — frozen.
+        # Cap the logit so opacity stays trainable (glass panes init well
+        # below the cap and are untouched).
+        p = min(max(params.init_opa_max, 1e-4), 1.0 - 1e-4)
+        init["opacities"] = np.minimum(
+            init["opacities"], np.float32(np.log(p / (1.0 - p)))
+        )
+        # An opaque surface init's rendered depth (expected or median) is true from
+        # step 0 — the translucent-init warm-up would only delay the metric depth
+        # term for no benefit.
+        params = replace(params, depth_start_iter=0)
+        if progress is not None:
+            progress(
+                0, 1,
+                f"init: surfels ({init['means'].shape[0]:,} from {Path(init_ply).name}, "
+                f"opacity ≤ {params.init_opa_max})",
+            )
+    else:
+        init = _init_from_points(pts_xyz, pts_rgb, params)
+        if progress is not None:
+            progress(0, 1, f"init: points3D synthesize ({init['means'].shape[0]:,})")
     n_init = int(init["means"].shape[0])
     scene_scale = _scene_scale(centers, init["means"])
 
@@ -1673,6 +1952,11 @@ def train_splat(
     )
     # No LOD ladder here: trained.ply is the RAW model. The delivered LODs are
     # built on the cleaned model in Stage 7 (`heal_splat` → healed.lodK.ply).
+    # Drop any stale trained.lod*.ply an older (LOD-exporting) run left beside
+    # this path — a fresh trained.ply must never ship next to giant stale
+    # ladders (a 2M-vertex leftover sat beside swamp-land's 84k rewrite).
+    for old in out_path.parent.glob(f"{out_path.stem}.lod*.ply"):
+        old.unlink(missing_ok=True)
     lod_summary = None
 
     # Training finished + the final splat is on disk → the checkpoints (and any
@@ -1701,6 +1985,7 @@ def train_splat(
         "metrics": metrics,
         "params": params.as_summary(),
         "bytes": out_path.stat().st_size,
+        "colmap_dir": str(colmap_dir),
         "out_path": str(out_path),
     }
 
@@ -1748,6 +2033,60 @@ def _load_scene(torch, refs_dir: Path, device):  # noqa: ANN001
             }
         )
     return views, K, width, height, np.stack(cam_centers, axis=0)
+
+
+def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
+    """The COLMAP model (the Postshot-style input) as the trainer consumes it:
+    (views, K, width, height, centers, points_xyz, points_rgb). Each view is the
+    same dict `_view_stream`/`_evaluate` expect — the w2c `viewmat`, the c2w, and
+    the RGB image path — but with `frame`/`alpha`/`depth` None: the image is read as
+    RGB (the PNG's coverage alpha, kept for Postshot masking, is dropped) and COLMAP
+    has no depth. `points_xyz`/`points_rgb` seed the splat via `_init_from_points`.
+    Image names resolve against the model dir (flat, as `export_colmap` writes) or
+    an `images/` subdir (a standard COLMAP layout)."""
+    colmap_dir = Path(colmap_dir)
+    K_np, width, height = _read_colmap_cameras(colmap_dir / "cameras.txt")
+    images = _read_colmap_images(colmap_dir / "images.txt")
+    pts_xyz, pts_rgb = _read_colmap_points(colmap_dir / "points3D.txt")
+    K = torch.tensor(K_np, dtype=torch.float32, device=device)
+
+    frames_dir = suffix = near = far = None
+    sidecar_path = colmap_dir / _SIDECAR_NAME
+    if sidecar_path.is_file():
+        sc = json.loads(sidecar_path.read_text(encoding="utf-8"))
+        frames_dir = colmap_dir / sc["frames_dir"]
+        suffix = sc.get("suffix", ".szf")
+        near, far = float(sc["near"]), float(sc["far"])
+
+    views: list[dict[str, Any]] = []
+    centers: list[np.ndarray] = []
+    for name, c2w in images:
+        img = colmap_dir / name
+        if not img.is_file():
+            img = colmap_dir / "images" / name
+        if not img.is_file():
+            raise FileNotFoundError(f"{colmap_dir}: image '{name}' from images.txt not found")
+        frame = None
+        if frames_dir is not None:
+            f = frames_dir / (Path(name).stem + suffix)
+            if f.is_file():
+                frame = f
+        centers.append(c2w[:3, 3])
+        views.append(
+            {
+                "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
+                "c2w": c2w,
+                "frame": frame,
+                "rgb": img,
+                "alpha": None,
+                "depth": None,
+                "depth_near": near,
+                "depth_far": far,
+            }
+        )
+    if not views:
+        raise RuntimeError(f"{colmap_dir}/images.txt has no image poses")
+    return views, K, width, height, np.stack(centers, axis=0), pts_xyz, pts_rgb
 
 
 def _scene_scale(centers: np.ndarray, fallback_means: np.ndarray) -> float:
@@ -2025,15 +2364,17 @@ def _render_batch(torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K
 def _supervision_loss(  # noqa: ANN001
     torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
     pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
-    normals_active, dist_active,
+    normals_active, dist_active, depth_active=True,
+    pred_expected=None, ed_target=None, ed_gate=None,
 ):
     """Combined per-view supervision loss — photometric L1 + D-SSIM, alpha
     (coverage), alpha-gated depth L1, 2DGS normal consistency, and optional depth
     distortion — shared by the training loop and the compaction pass. Both RGB
     sides are premultiplied-over-black. `mask` (a tile's owned-pixel mask, or None
     for a single run) restricts every term to owned pixels; `normals_active` /
-    `dist_active` gate the two regularizers that only switch on partway through a
-    run."""
+    `dist_active` / `depth_active` gate the terms that only switch on partway
+    through a run (`depth_active` defaults True for the heal/compact callers,
+    whose models are already opaque)."""
     if mask is None:
         l1 = (pred_rgb - gt_rgb).abs().mean()
         ssim_rgb = pred_rgb
@@ -2049,13 +2390,31 @@ def _supervision_loss(  # noqa: ANN001
         aloss = aerr.mean() if mask is None else (aerr * mask).sum() / mask.sum().clamp_min(1.0)
         loss = loss + params.alpha_lambda * aloss
 
-    if gt_depth is not None and params.depth_lambda > 0.0:
+    if gt_depth is not None and params.depth_lambda > 0.0 and depth_active:
         gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
         if mask is not None:
             gate = gate & (mask > 0)
         if gate.any():
             dl = ((pred_depth - gt_depth).abs() * gate).sum() / (gate.sum() + 1e-8)
             loss = loss + params.depth_lambda * dl
+
+    # "Record both" glass-maker: the splat's EXPECTED depth vs the frozen cloud's
+    # two-layer expected depth, over opaque-covered pixels where the cloud target
+    # is valid. Deleting a pane pulls expected depth back onto the wall (off
+    # target), so this requires the transmissive layer; the median term above keeps
+    # the wall pinned so the pair can't be faked by sliding the wall forward.
+    if (
+        ed_target is not None and pred_expected is not None and gt_depth is not None
+        and params.depth_expected_lambda > 0.0 and depth_active
+    ):
+        eg = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
+        if ed_gate is not None:
+            eg = eg & ed_gate
+        if mask is not None:
+            eg = eg & (mask > 0)
+        if eg.any():
+            el = ((pred_expected - ed_target).abs() * eg).sum() / (eg.sum() + 1e-8)
+            loss = loss + params.depth_expected_lambda * el
 
     if params.normal_lambda > 0.0 and normals_active:
         nerr = 1.0 - (normals * normals_from_depth).sum(dim=-1)
@@ -2246,6 +2605,7 @@ def _train_one(  # noqa: ANN001
     None trains unmasked, the single-run behavior. Checkpoints under `ckpt_dir`
     (the caller owns cleanup)."""
     from gsplat import DefaultStrategy, rasterization_2dgs
+    from gsplat.strategy.ops import reset_opa
 
     device = torch.device("cuda")
     n_views = len(views)
@@ -2299,10 +2659,12 @@ def _train_one(  # noqa: ANN001
         optimizers["means"], gamma=0.01 ** (1.0 / max(params.iterations, 1))
     )
 
-    # reset_every=0 disables opacity resets by pushing the trigger past the last
-    # step (see TrainParams). Accepted side effect: the strategy's scale-based
-    # prune (gated on `step > reset_every`) also never fires — our init has no
-    # giant blobs and the alpha/depth losses punish oversized splats directly.
+    # The strategy gets the REAL reset cadence: besides gating the (in-loop)
+    # opacity reset below, `reset_every` also activates the strategy's scale-based
+    # prune (`step > reset_every` → prune_scale3d·scene_scale), matching the
+    # reference loop. reset_every=0 disables both by pushing the trigger past the
+    # last step. The reset itself fires in OUR loop — the pinned 1.5.3 wheel's
+    # internal trigger is dead code (see TrainParams.reset_every).
     strategy = DefaultStrategy(
         prune_opa=params.prune_opa,
         grow_grad2d=params.grow_grad2d,
@@ -2373,6 +2735,18 @@ def _train_one(  # noqa: ANN001
         xs = torch.arange(width, dtype=torch.float32, device=device) + 0.5
         py_grid, px_grid = torch.meshgrid(ys, xs, indexing="ij")
 
+    # "Record both" reference: a FROZEN copy of the init cloud, whose EXPECTED
+    # depth is the true two-layer α-weighted depth (it sits on the glass panes at
+    # α≈0.065). Rendered per batch (no grad) as the target for the expected-depth
+    # term — see TrainParams.depth_expected_lambda. Built only when the term is on.
+    ref_splats = ref_colors = None
+    if params.depth_expected_lambda > 0.0:
+        ref_splats = {
+            k: torch.from_numpy(np.ascontiguousarray(init[k])).to(device)
+            for k in ("means", "scales", "quats", "opacities", "sh0", "shN")
+        }
+        ref_colors, _ = _render_inputs(torch, ref_splats, 0)
+
     for step in range(start_step, params.iterations):
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
 
@@ -2390,19 +2764,35 @@ def _train_one(  # noqa: ANN001
         )
         pred_rgb = renders[..., :3]
         pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
+        # Expected-depth channel (ED) + the frozen-cloud target for the glass-maker
+        # term. The cloud's own rendered alpha gates out its sampling holes, where
+        # its expected depth would be ill-defined.
+        pred_expected = renders[..., 3:4]
+        ed_target = ed_gate = None
+        if ref_splats is not None and gt_depth is not None:
+            with torch.no_grad():
+                r_ren, r_alpha, *_ = _render_batch(
+                    torch, rasterization_2dgs, ref_splats, ref_colors, 0,
+                    viewmats, K, width, height, params, False,
+                )
+            ed_target = r_ren[..., 3:4]
+            ed_gate = r_alpha > 0.5
 
         if params.refine:
             strategy.step_pre_backward(splats, optimizers, strat_state, step, info)
 
-        # Photometric L1 + D-SSIM, alpha, alpha-gated depth, normal consistency,
-        # and optional distortion — the shared supervision loss. Under a tile mask
-        # every term is restricted to pixels this tile OWNS (its surface + true
+        # Photometric L1 + D-SSIM, alpha, alpha-gated depth (median vs the opaque
+        # plane + expected vs the two-layer cloud target), normal consistency, and
+        # optional distortion — the shared supervision loss. Under a tile mask every
+        # term is restricted to pixels this tile OWNS (its surface + true
         # background), so boundary Gaussians never chase content a neighbour owns.
         loss = _supervision_loss(
             torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
             pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
             normals_active=step >= params.normal_start_iter,
             dist_active=dist_on and step >= params.dist_start_iter,
+            depth_active=step >= params.depth_start_iter,
+            pred_expected=pred_expected, ed_target=ed_target, ed_gate=ed_gate,
         )
 
         loss.backward()
@@ -2413,6 +2803,30 @@ def _train_one(  # noqa: ANN001
 
         if params.refine:
             strategy.step_post_backward(splats, optimizers, strat_state, step, info, packed=False)
+            # Opacity reset at the reference cadence, under upstream's FIXED
+            # trigger (`step % reset_every == 0 and step > 0`, refine window
+            # only) — executed here because the pinned gsplat 1.5.3 wheel's own
+            # trigger never fires (precedence bug; see TrainParams.reset_every).
+            # gsplat's reset_opa clamps every opacity to 2·prune_opa and zeroes
+            # its Adam moments; only image-justified Gaussians re-earn opacity,
+            # the rest drop below prune_opa and are pruned. Reading the LIVE
+            # strategy.refine_stop_iter keeps resets coupled to the refine
+            # window even after the VRAM guard freezes it.
+            if (
+                params.reset_every > 0
+                and 0 < step < strategy.refine_stop_iter
+                and step % params.reset_every == 0
+            ):
+                reset_opa(
+                    params=splats, optimizers=optimizers, state=strat_state,
+                    value=params.prune_opa * 2.0,
+                )
+                if progress is not None:
+                    progress(
+                        step + 1, params.iterations,
+                        f"opacity reset @{step} (ceiling {2 * params.prune_opa:.2f}) "
+                        f"n={len(splats['means'])}",
+                    )
             # Adaptive VRAM: cap_max is the hard ceiling; also freeze densification
             # when free VRAM nears the WDDM shared-memory cliff (after one empty_cache
             # retry to release reusable cached blocks), so growth can't collapse
@@ -2590,14 +3004,28 @@ def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params
 
 
 def _main() -> None:
-    """Standalone CLI for the GPU box: fine-tune one cell's surfel cloud against
-    its Stage-5 references."""
+    """Standalone CLI for the GPU box: fine-tune a 2DGS splat from a COLMAP model —
+    the Postshot-style (point cloud + poses + images) folder that
+    `splat_to_colmap.py` / `splat.colmap.export_colmap` writes."""
     import argparse
 
-    ap = argparse.ArgumentParser(description="Stage 6 — gsplat 2DGS splat fine-tune")
-    ap.add_argument("--cloud", required=True, type=Path, help="Stage-3 cloud.ply (init)")
-    ap.add_argument("--refs", required=True, type=Path, help="Stage-5 refs/ dir")
+    ap = argparse.ArgumentParser(description="Stage 6 — gsplat 2DGS fine-tune from a COLMAP model")
+    ap.add_argument(
+        "--colmap", required=True, type=Path,
+        help="COLMAP model dir (cameras.txt / images.txt / points3D.txt + RGB "
+             "images) — the folder splat_to_colmap.py writes",
+    )
     ap.add_argument("--out", required=True, type=Path, help="output trained.ply")
+    ap.add_argument(
+        "--init", choices=("surfels", "points"), default=TrainParams.init,
+        help="init source: 'surfels' = the Stage-3 cloud.ply via --init-ply "
+             "(geometry starts AT the 2DGS solution — far fewer epochs); "
+             "'points' = gsplat's from-points3D recipe (Postshot-parity A/B)",
+    )
+    ap.add_argument(
+        "--init-ply", type=Path, default=None,
+        help="the Stage-3 surfel cloud (splat/cloud.ply) — required for --init surfels",
+    )
     ap.add_argument(
         "--iterations", type=int, default=TrainParams.iterations,
         help="VIEW-DRAW budget (optimizer steps × batch); steps run = iterations // batch",
@@ -2617,6 +3045,14 @@ def _main() -> None:
              "so it's a speed knob at CONSTANT work (no need to adjust iterations)",
     )
     ap.add_argument(
+        "--init-opa", type=float, default=TrainParams.init_opa,
+        help="initial Gaussian opacity for the point-cloud init (gsplat default 0.1)",
+    )
+    ap.add_argument(
+        "--init-scale", type=float, default=TrainParams.init_scale,
+        help="scale multiplier on the KNN-derived initial Gaussian size",
+    )
+    ap.add_argument(
         "--ckpt-every", type=int, default=TrainParams.ckpt_every,
         help="write a resumable checkpoint every N steps (0 disables)",
     )
@@ -2634,47 +3070,9 @@ def _main() -> None:
              "(PostShot 'Max SH Degree'; default 3, 0 = flat/view-independent)",
     )
     ap.add_argument(
-        "--depth-densify", action=argparse.BooleanOptionalAction, default=TrainParams.depth_densify,
-        help="seed Gaussians at reference-depth surfaces the splat is missing",
-    )
-    ap.add_argument(
         "--tile-max", type=int, default=None,
-        help="max seed Gaussians for a single run; larger clouds train as ground-"
+        help="max init Gaussians for a single run; larger clouds train as ground-"
              "plane tiles and merge (default: 2/3 of cap_max; 0 disables tiling)",
-    )
-    ap.add_argument(
-        "--lod-levels", type=int, default=TrainParams.lod_levels,
-        help="LOD ladder levels exported beside trained.ply (0 disables)",
-    )
-    ap.add_argument(
-        "--compact", action=argparse.BooleanOptionalAction, default=TrainParams.compact,
-        help="post-training compaction: delete unrenderable + off-surface "
-             "Gaussians (+ optional budget frac), then heal the survivors",
-    )
-    ap.add_argument(
-        "--compact-eps", type=float, default=TrainParams.compact_eps,
-        help="lossless deletion threshold (default 0.5/255: below it a Gaussian "
-             "cannot move any pixel by half an 8-bit step)",
-    )
-    ap.add_argument(
-        "--surface-max-dist", type=float, default=TrainParams.surface_max_dist,
-        help="delete Gaussians farther than this (m) from any Stage-3 surfel "
-             "(floater cull; 0 disables)",
-    )
-    ap.add_argument(
-        "--compact-max-db-drop", type=float, default=TrainParams.compact_max_db_drop,
-        help="quality-gated budget cut: accept the deepest cut whose measured "
-             "PSNR drop stays within this many dB (bisection; <=0 disables the "
-             "search and falls back to --compact-keep-frac)",
-    )
-    ap.add_argument(
-        "--compact-keep-frac", type=float, default=TrainParams.compact_keep_frac,
-        help="fixed fallback: keep only the top this-fraction by normalized "
-             "contribution (used when the dB gate is disabled)",
-    )
-    ap.add_argument(
-        "--compact-heal-steps", type=int, default=TrainParams.compact_heal_steps,
-        help="fine-tune steps after deletion so survivors fill in (0 disables)",
     )
     ap.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,
@@ -2693,29 +3091,22 @@ def _main() -> None:
         run=args.run,
         slot=args.slot,
         model=args.model,
-        cloud_path=args.cloud,
-        refs_dir=args.refs,
+        colmap_dir=args.colmap,
         out_path=args.out,
+        init_ply=args.init_ply,
         params=TrainParams(
+            init=args.init,
             iterations=args.iterations,
             epochs=args.epochs,
             refine_stop_iter=args.refine_stop_iter,
             batch=args.batch,
+            init_opa=args.init_opa,
+            init_scale=args.init_scale,
             ckpt_every=args.ckpt_every,
             vram_min_free_gb=args.vram_min_free_gb,
             antialias=args.antialias,
             sh_degree=args.sh_degree,
-            depth_densify=args.depth_densify,
             tile_max=args.tile_max,
-            lod_levels=args.lod_levels,
-            compact=args.compact,
-            compact_eps=args.compact_eps,
-            surface_max_dist=args.surface_max_dist,
-            compact_max_db_drop=(
-                args.compact_max_db_drop if args.compact_max_db_drop and args.compact_max_db_drop > 0 else None
-            ),
-            compact_keep_frac=args.compact_keep_frac,
-            compact_heal_steps=args.compact_heal_steps,
         ),
         resume=args.resume,
         progress=_log,

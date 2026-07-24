@@ -1,4 +1,4 @@
-"""CLI: decode Stage-5 SZF reference frames to plain RGB PNGs (alpha + depth dropped).
+"""CLI: decode Stage-5 SZF reference frames to RGBA PNGs (coverage alpha kept, depth dropped).
 
 Thin wrapper over `splat.colmap.decode_frames_to_png`, which reuses the canonical
 SZF codec in `splat.stage5`.

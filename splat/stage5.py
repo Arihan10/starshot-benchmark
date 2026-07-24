@@ -65,9 +65,10 @@ Conventions (LOCKED to match gsplat; validated by the capture page's ?selftest):
   * Pixel origin: WebGL reads frames bottom-up; `write_reference_frame` flips
     rows so row 0 = top, matching gsplat / normal images.
 
-CUBEMAP-NATIVE input: Stage 4 emits camera POSITIONS, each tagged with the cube
-faces worth rendering (`cameras.json` → `intrinsics` + `cube_faces` + `cameras`).
-Every (position, face) becomes one 90° pinhole reference image.
+SINGLE-SHOT input: Stage 4 emits one pinhole camera per plan entry
+(`cameras.json` plan_version 2 → shared `intrinsics` + `cameras[]`, each
+carrying its own `pos` + `forward` + `up`). Every entry becomes exactly one
+reference image at the shared FOV — no cube faces, no per-position fan-out.
 
 No CUDA, torch, or trimesh anywhere in this stage: rendering needs only a
 hardware-WebGL browser, and this module needs numpy + zstd (the Python 3.14+
@@ -83,10 +84,6 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-
-# The cube-face basis is defined ONCE in Stage 4; reuse it so poses derived here
-# match the plan exactly (torch-free import — pulls only numpy/scipy via stage4).
-from splat.stage4 import CUBE_FACES  # noqa: F401  (re-exported for consumers)
 
 # Written under a cell's `splat/refs/` dir.
 REFS_DIRNAME = "refs"
@@ -223,15 +220,18 @@ def _zstd() -> tuple[Any, Any]:
 
 
 def load_camera_plan(cameras_path: Path) -> dict[str, Any]:
-    """Read a Stage-4 `cameras.json`. Requires the cubemap-native schema
-    (`intrinsics` + `cube_faces` + `cameras[].faces`)."""
+    """Read a Stage-4 `cameras.json`. Requires the single-shot schema
+    (plan_version ≥ 2: `intrinsics` + `cameras[]` each carrying `forward`);
+    legacy cubemap plans are rejected with a re-run error."""
     data = json.loads(cameras_path.read_text(encoding="utf-8"))
-    for key in ("intrinsics", "cube_faces", "cameras"):
-        if key not in data:
-            raise ValueError(
-                f"{cameras_path} is not a cubemap-native camera plan (missing "
-                f"'{key}'); re-run Stage 4."
-            )
+    if int(data.get("plan_version") or 0) < 2 or "intrinsics" not in data:
+        raise ValueError(
+            f"{cameras_path} is not a single-shot camera plan (plan_version 2); "
+            "re-run Stage 4."
+        )
+    cams = data.get("cameras") or []
+    if cams and "forward" not in cams[0]:
+        raise ValueError(f"{cameras_path}: cameras carry no poses; re-run Stage 4.")
     return data
 
 
@@ -265,26 +265,22 @@ def intrinsics_matrix(resolution: int, fov_deg: float) -> np.ndarray:
 
 
 def enumerate_views(plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Flatten the plan into one entry per (camera, face) to render: the render
-    id, camera index, face name, world position, and the OpenCV camera-to-world."""
-    faces = plan["cube_faces"]
+    """One render entry per plan camera (single-shot): the render id, camera
+    index, rig kind, world position, and the OpenCV camera-to-world derived
+    from the camera's own forward/up."""
     views: list[dict[str, Any]] = []
     for ci, cam in enumerate(plan["cameras"]):
         pos = np.asarray(cam["pos"], dtype=np.float64)
-        for face in cam.get("faces", []):
-            name = face["dir"] if isinstance(face, dict) else face
-            basis = faces[name]
-            c2w = opencv_c2w(pos, np.asarray(basis["forward"]), np.asarray(basis["up"]))
-            views.append(
-                {
-                    "id": f"cam{ci:05d}_{name}",
-                    "camera_index": ci,
-                    "face": name,
-                    "pos": pos,
-                    "c2w": c2w,
-                    "covers": int(face["covers"]) if isinstance(face, dict) else None,
-                }
-            )
+        c2w = opencv_c2w(pos, np.asarray(cam["forward"]), np.asarray(cam["up"]))
+        views.append(
+            {
+                "id": f"cam{ci:05d}",
+                "camera_index": ci,
+                "kind": cam.get("kind"),
+                "pos": pos,
+                "c2w": c2w,
+            }
+        )
     return views
 
 
@@ -510,7 +506,7 @@ def reference_frames(views: list[dict[str, Any]]) -> list[dict[str, Any]]:
         {
             "frame_path": f"{FRAMES_DIRNAME}/{v['id']}{FRAME_SUFFIX}",
             "camera_index": v["camera_index"],
-            "face": v["face"],
+            "kind": v.get("kind"),
             "transform_matrix": v["c2w"].tolist(),
         }
         for v in views

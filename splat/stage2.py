@@ -1,33 +1,34 @@
-"""Stage 2 — Free-space voxelizer (surface-band two-tier flood fill).
+"""Stage 2 — Free-space voxelizer (occupancy + reachability).
 
 The shared spatial FOUNDATION of the splat pipeline: discretizes a cell's
 composed scene on ONE uniform 3 cm lattice (the fidelity scale, deliberately
-scene-size independent — big scenes contain small objects), classifies the air
-NEAR SURFACES as COVER (surface), EMPTY (air a viewer could see — ambient +
-rescued cavities) or GARBAGE (sealed interiors — object hollows, seams), and
-emits the camera CANDIDATE list Stage 4 plans from. Work and storage scale
-with SURFACE AREA, never scene volume: air is only ever examined within the
-camera-coverage band of a surface, at two resolutions —
+scene-size independent — big scenes contain small objects) and labels air as
+EMPTY (reachable from ambient space — air a viewer could occupy or see) or
+GARBAGE (sealed interiors — object hollows, seams), alongside the COVER
+(surface) set itself. Work and storage scale with SURFACE AREA, never scene
+volume, at two resolutions —
 
   * the FINE SKIN — every 8³-voxel brick within one brick of a cover brick —
     is processed at full 3 cm resolution. All correctness lives here: thin
     walls, seams, seal detection, Stage 3's orient/cull probes (which only
     ever look 1-2 voxels off a surface).
-  * the COARSE ZONE — cover-free bricks from the skin out to `coverage`
-    metres — is processed per brick. A brick out here provably contains no
-    surface (any brick with cover is, by definition, inside the skin), so it
-    is a single all-air node: connectivity needs no fine resolution, and thin
-    barriers can never be crossed at brick granularity because they only
-    exist inside the skin.
-  * beyond `coverage`: unexplored, unlabeled, unstored. Cameras are never
-    placed there (a camera farther than the band from every surface supplies
-    no finest-scale demand), and per the training design far appearance comes
-    from close-up references + the Stage-6 LOD ladder, not far cameras.
+  * the COARSE ZONE — every other brick in the grid — is processed per
+    brick. A brick out here provably contains no surface (any brick with
+    cover is, by definition, inside the skin), so it is a single all-air
+    node: connectivity needs no fine resolution, and thin barriers can never
+    be crossed at brick granularity because they only exist inside the skin.
 
 Nothing downstream recomputes occupancy; that's the point of running this
-first. Stage 4 receives its candidate positions directly (each annotated with
-its distance to the nearest surface), so no dense free-space volume exists
-anywhere in the pipeline.
+first. Three consumers:
+
+  * Stage 3 orients surfel normals toward EMPTY air and culls surfaces no
+    reachable air ever sees (sealed hollows, interpenetration seams) — the
+    visibility filter that keeps never-supervised points out of the splat
+    trainer's init cloud.
+  * Stage 4 validates camera positions (`empty_at` + standoff from the
+    cover set), ray-marches sight lines against the opaque subset, and
+    normalizes camera density per unit of VISIBLE surface (the skin).
+  * The client renders the SVX3 viz pack (`voxels.bin`) as a debug overlay.
 
 OCCUPANCY is an EXACT surface voxelization: every cell whose cube a triangle
 touches is marked — big triangles are midpoint-split until each piece spans at
@@ -104,38 +105,25 @@ unreached remainder within the band):
     seeing there); an object straddling an open and a sealed region rescues
     neither; the nesting distinction is only as sharp as the pitch.
 
-CANDIDATES (the free-voxel product, emitted directly). Camera positions are
-picked from reached air at ~half-metre spacing — in the skin, the first free
-fine cell per 2×2×2-brick block; in the zone, the first reached brick's centre
-per block — and each is annotated with its distance to the nearest surface
-(exact within the skin via a local search; brick-granular in the zone, where
-sub-voxel precision cannot matter). The baked `clearance_m` (and the client
-slider's re-bakes via `apply_clearance`, now an instant metadata rewrite) is a
-FILTER over the annotated list. Stage 4 consumes the list as-is: it computes
-no clearance and derives no free volume of its own. Camera standoff beyond
-the baked floor stays EMERGENT (the scale ladder demands nothing below a
-patch's d_min).
-
 Pure library (like the other stages): takes explicit paths and reads the
 meshes AS-IS through `splat.assets.load_geoms` — vanilla glTF via trimesh,
 KTX2/Meshopt sets via the in-process decoder (no de-optimization step). On
 compressed sets texel data is unavailable, so BLEND/MASK glass classification
 falls back to the constant `baseColorFactor` alpha.
 
-Outputs (under a cell's `splat/` dir), all O(surface + candidates):
+Outputs (under a cell's `splat/` dir), all O(surface):
   * `freespace.npz` — metadata + sparse structures: origin/pitch/dims, the
-    sorted fine cover (incl. the glass subset), the sorted skin-brick ids, the
-    reached zone-brick ids, the candidate positions + clearance annotations,
-    and the baked `clearance_m`. Older layouts (dense fields, mask sidecars)
-    are rejected with a clear re-run error rather than carried as compat shims.
+    sorted fine cover (incl. the glass subset), the sorted skin-brick ids and
+    the reached zone-brick ids. Older layouts (dense fields, mask sidecars,
+    candidate lists) are rejected with a clear re-run error rather than
+    carried as compat shims.
   * `freespace.npz.skin.npy` — the per-skin-brick EMPTY bitmasks (512 bits =
     one uint64[8] per brick), the ONLY per-cell payload, memory-mapped by the
     loaders so Stage 3's pool workers share one physical copy.
   * `voxels.bin` — the SVX3 viz pack for the client overlay: VOLUMETRIC
     boundary shells as run-merged exposed-face quads (`_boundary_quads`).
     Cover and garbage are fine-resolution (they live in the skin); the free
-    volume is ONE shell at brick resolution (the slider's preview ladder died
-    with the dense clearance field — its 'apply' still re-filters candidates).
+    volume is ONE shell at brick resolution.
 """
 
 from __future__ import annotations
@@ -179,37 +167,12 @@ _QUAD_DTYPE = np.dtype(
 )
 DEFAULT_PITCH = 0.03      # the uniform voxel edge (m) — the FIDELITY scale,
                           # deliberately scene-size independent
-# The baked FREE threshold (m): a camera needs at least this much clearance.
-# The default equals ONE VOXEL at the default pitch — the most permissive
-# meaningful setting: every empty cell is ≥ 1 voxel from cover by definition,
-# so every reached cell is a candidate source out of the box, and per-scene
-# tightening happens through the client slider's apply (`apply_clearance`,
-# now an instant candidate re-filter). For reference, 0.35 was the measured
-# knee of the passage-survival curve across the benchmark runs (~2/3 of
-# sub-2m facing gaps keep centerline candidates) — a sensible value when
-# tightening for production plans.
-DEFAULT_CLEARANCE = 0.03
-# The camera-coverage band (m): air is explored, labeled and candidate-seeded
-# only within this distance of a surface. DERIVED from the scale ladder at the
-# Stage-4 defaults — a camera supplies the finest demanded scale of even the
-# coarsest patch only within 2·patch_max_spacing·focal_px/finest_px =
-# 2·0.30·512/64 ≈ 4.8 m — and rounded up. Beyond it a camera supplies only
-# coarse octaves, which near-surface cameras already supply across horizontal
-# distance, and far appearance is the Stage-6 LOD ladder's job.
-DEFAULT_COVERAGE = 5.0
-# Tolerance for `clearance >= threshold` candidate filters: absorbs float32
-# annotation rounding so a threshold equal to an exact lattice distance (the
-# one-voxel default) includes its own tier.
-_CLEARANCE_EPS = 2.5e-4
 _PITCH_CLAMP = (0.02, 1.0)
-# The two-tier granularities, in fine voxels per axis. A BRICK (8³ = 24 cm at
+# The two-tier granularity, in fine voxels per axis. A BRICK (8³ = 24 cm at
 # default pitch) is the skin/zone unit: cover-containing bricks + their 1-ring
 # form the fine skin, so fine treatment always extends ≥ 8 voxels beyond any
-# surface (Stage 3 probes need 3). Candidates thin to one per CAND block
-# (2×2×2 bricks ≈ 0.5 m — the camera-planning granularity, matching the old
-# stage-4 candidate spacing).
+# surface (Stage 3 probes need 3).
 _BRICK = 8
-_CAND_BRICKS = 2
 # Scratch files older than this are swept at build start. Live scratches are
 # never this old (phases write continuously); only hard-killed builds — whose
 # cleanup never ran — leave older ones behind.
@@ -258,10 +221,10 @@ def _abs_decode(lin: np.ndarray) -> np.ndarray:
     return np.stack([ix, iy, iz], axis=1)
 
 # progress(done, total, step) — `step` names the current phase ("voxelize" |
-# "reduce" | "fill" | "clearance" | "write" | "viz"). done/total count items in
-# the STREAMING phases (objects for "voxelize"; grid slabs/bundles for "fill",
-# "clearance" and "viz"); single-pass marker phases report (0, 0) — the step
-# name is the signal, and a constant step string lets the caller meter a rate.
+# "reduce" | "fill" | "viz" | "write"). done/total count items in the
+# STREAMING phases (objects for "voxelize"; brick layers for "fill");
+# single-pass marker phases report (0, 0) — the step name is the signal, and
+# a constant step string lets the caller meter a rate.
 ProgressCb = Callable[[int, int, str], None]
 
 
@@ -269,26 +232,19 @@ ProgressCb = Callable[[int, int, str], None]
 class FreeSpaceParams:
     """Stage-2 knobs. `pitch` is the uniform fine voxel edge (the fidelity
     scale — scene-size independent); `margin` grows the grid beyond the scene
-    AABB so exterior camera vantages exist (Stage 4); `clearance` (m) is the
-    baked candidate filter — camera spots at least this far from any surface;
-    `coverage` (m) is the camera band — air is explored and candidate-seeded
-    only within this distance of a surface (module docstring). `workers`
-    parallelizes the per-object mesh pass (0 = auto: sized to fit available
-    RAM, capped at min(cores, 16); 1 = serial); the output is byte-identical
-    for any value."""
+    AABB so the boundary shell (the fill's always-ambient seed layer) lies
+    strictly outside the scene. `workers` parallelizes the per-object mesh
+    pass (0 = auto: sized to fit available RAM, capped at min(cores, 16);
+    1 = serial); the output is byte-identical for any value."""
 
     pitch: float = DEFAULT_PITCH
     margin: float = 1.5
-    clearance: float = DEFAULT_CLEARANCE
-    coverage: float = DEFAULT_COVERAGE
     workers: int = 0
 
     def as_summary(self) -> dict[str, Any]:
         return {
             "pitch": self.pitch,
             "margin": self.margin,
-            "clearance": self.clearance,
-            "coverage": self.coverage,
             "workers": self.workers,
         }
 
@@ -305,12 +261,9 @@ class FreeSpace:
         brick's 512-bit EMPTY bitmask (uint8 (S, 64), little bit order, raster
         order within the brick). Air near surfaces at full resolution — what
         Stage 3's probes read.
-      * `zone_lin` — sorted brick ids of REACHED coarse-zone bricks (pure air
-        between the skin and the coverage band edge). Empty at brick
+      * `zone_lin` — sorted brick ids of REACHED coarse-zone bricks (pure
+        air anywhere in the grid outside the skin). Empty at brick
         granularity.
-      * `cand_pos` + `cand_clear` — the camera-candidate list (world positions
-        + distance-to-nearest-surface annotations). What Stage 4 plans from;
-        the baked `clearance_m` filters it at load (`free_candidates`).
 
     Two cover queries with different jobs: `occupied` answers "is there ANY
     surface here" (physical presence — glass included), `occluding` answers
@@ -324,9 +277,6 @@ class FreeSpace:
     skin_lin: np.ndarray      # (S,) int64 SORTED skin-brick linear ids
     skin_empty: np.ndarray    # (S,64) uint8 per-brick EMPTY bitmasks
     zone_lin: np.ndarray      # (Z,) int64 SORTED reached zone-brick ids
-    cand_pos: np.ndarray      # (M,3) float32 candidate world positions
-    cand_clear: np.ndarray    # (M,) float32 distance to nearest surface (m)
-    clearance_m: float        # baked candidate clearance filter (m)
 
     @property
     def bdims(self) -> np.ndarray:
@@ -392,8 +342,7 @@ class FreeSpace:
         reached zone brick is all air). This is what distinguishes viewable
         air from a solid's sealed hollow — the signal Stage 3 uses to orient
         normals + cull hidden faces; its probes sit 1-2 voxels off surfaces,
-        always inside the skin. Points outside the grid or beyond the
-        coverage band read as False."""
+        always inside the skin. Points outside the grid read as False."""
         idx, inb = self._bin(points)
         out = np.zeros(len(points), dtype=bool)
         if not inb.any():
@@ -421,17 +370,6 @@ class FreeSpace:
             res[rest] = self.zone_lin[pos] == bl
         out[inb] = res
         return out
-
-    def free_candidates(self, spacing: float | None = None) -> np.ndarray:
-        """The camera-candidate positions for Stage 4: the stored candidate
-        list filtered by the baked clearance (each candidate carries its
-        distance to the nearest surface). Candidates were emitted at
-        ~`_CAND_BRICKS`-brick spacing (≈ 0.5 m) at build time, so `spacing` is
-        accepted for API compatibility but does no further thinning below
-        that. Returns (M,3) float32 world points."""
-        del spacing  # emission spacing is baked at build time
-        keep = self.cand_clear >= (self.clearance_m - _CLEARANCE_EPS)
-        return np.ascontiguousarray(self.cand_pos[keep])
 
 
 def _savez_fast(path: Path, **arrays: np.ndarray) -> None:
@@ -472,21 +410,21 @@ def _load_skin_sidecar(npz_path: Path, n_bricks: int) -> np.ndarray:
 
 _NPZ_REQUIRED = (
     "origin", "pitch", "dims", "occ_lin", "occ_lin_glass",
-    "skin_lin", "zone_lin", "cand_pos", "cand_clear", "clearance_m",
+    "skin_lin", "zone_lin",
 )
 
 
 def load_free_space(path: Path) -> FreeSpace:
     """Load a `freespace.npz` (metadata + sparse structures) plus its skin
     bitmask sidecar (memory-mapped). Older layouts (dense fields, mask
-    sidecars, pre-candidate grids) are rejected with a re-run error — no
+    sidecars, candidate-list grids) are rejected with a re-run error — no
     compat shims."""
     path = Path(path)
     with np.load(path) as z:
         files = set(z.files)
-        if any(k not in files for k in _NPZ_REQUIRED):
+        if any(k not in files for k in _NPZ_REQUIRED) or "cand_pos" in files:
             raise ValueError(
-                f"{path} is a pre-candidate free-space grid — re-run Stage 2"
+                f"{path} is an old free-space grid layout — re-run Stage 2"
             )
         origin = z["origin"].astype(np.float64)
         pitch = float(z["pitch"])
@@ -495,9 +433,6 @@ def load_free_space(path: Path) -> FreeSpace:
         glass = z["occ_lin_glass"].astype(np.int64)
         skin_lin = z["skin_lin"].astype(np.int64)
         zone_lin = z["zone_lin"].astype(np.int64)
-        cand_pos = z["cand_pos"].astype(np.float32)
-        cand_clear = z["cand_clear"].astype(np.float32)
-        clearance_m = float(z["clearance_m"])
     return FreeSpace(
         origin=origin,
         pitch=pitch,
@@ -509,33 +444,7 @@ def load_free_space(path: Path) -> FreeSpace:
         skin_lin=skin_lin,
         skin_empty=_load_skin_sidecar(path, int(skin_lin.size)),
         zone_lin=zone_lin,
-        cand_pos=cand_pos,
-        cand_clear=cand_clear,
-        clearance_m=clearance_m,
     )
-
-
-def apply_clearance(path: Path, clearance: float) -> dict[str, Any]:
-    """Re-bake the candidate clearance filter of an existing grid — the
-    'apply' behind the client's clearance slider. INSTANT: candidates carry
-    their distance-to-surface annotations, so only the `clearance_m` scalar
-    is rewritten and the filtered count reported. Returns a summary patch
-    `{clearance, free_voxels}` (free_voxels = candidates passing) for the
-    sidecar."""
-    path = Path(path)
-    with np.load(path) as z:
-        if any(k not in z.files for k in _NPZ_REQUIRED):
-            raise ValueError(f"{path} is a pre-candidate grid — re-run Stage 2")
-        data = {k: z[k] for k in z.files}
-    c = float(clearance)
-    data["clearance_m"] = np.float64(c)
-    count = int(
-        (data["cand_clear"].astype(np.float32) >= c - _CLEARANCE_EPS).sum()
-    )
-    tmp = path.with_suffix(path.suffix + ".tmp.npz")
-    _savez_fast(tmp, **data)
-    tmp.replace(path)
-    return {"clearance": c, "free_voxels": count}
 
 
 def placed_object_ids(raw_dir: Path) -> list[str]:
@@ -900,11 +809,11 @@ def _shell_slabs(
     return slabs
 
 
-# --- the two-tier band fill ------------------------------------------------
+# --- the two-tier fill -------------------------------------------------------
 # Fine resolution exists only inside SKIN bricks (cover bricks + their 1-ring);
-# everything else within the coverage band is a single all-air BRICK node.
-# The brick grid itself (volume / 8³) is always small enough to hold dense, so
-# brick-level classification, distance and connectivity are single scipy calls.
+# every other brick in the grid is a single all-air BRICK node. The brick grid
+# itself (volume / 8³) is always small enough to hold dense, so brick-level
+# classification and connectivity are single scipy calls.
 
 _STRUCT6 = ndimage.generate_binary_structure(3, 1)
 # Labels a BATCH of bricks in ONE C call: 6-connectivity inside each brick,
@@ -980,10 +889,9 @@ def _fill_two_tier(
     occ_lin: np.ndarray,
     dims: np.ndarray,
     boxes: list[tuple[str, np.ndarray, np.ndarray]],
-    coverage_bricks: float,
     tick: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
-    """The band-limited two-phase fill (module docstring), two-tier:
+    """The whole-grid two-phase fill (module docstring), two-tier:
 
     Sweep 1 labels each SKIN brick's air at fine resolution (one batched
     scipy call per brick x-layer; provisional ids = layer base + local label,
@@ -991,19 +899,18 @@ def _fill_two_tier(
     across skin-brick faces, fine↔zone where a face borders a coarse-zone
     brick), per-component sizes, and the seed/ring bookkeeping — per-object
     AABB shell rings with the cross-object exclusion, exactly the classic
-    phase-1 rules, evaluated per tier. Zone bricks (cover-free, within the
-    coverage band) are labeled in one dense brick-grid scipy call; their
-    components join the graph through the stitching pairs. Restricted to the
-    explored band the components equal a whole-grid fine fill's (module
-    docstring). Global components come from one sparse connected-components
-    call, renumbered by minimum provisional id (first-encounter raster order);
-    phase 2 (nested rescue) then runs UNCHANGED on the component tables.
-    Sweep 2 replays the layer labeling and packs the per-brick EMPTY / AIR
-    bitmasks.
+    phase-1 rules, evaluated per tier. Zone bricks (all cover-free bricks
+    outside the skin) are labeled in one dense brick-grid scipy call; their
+    components join the graph through the stitching pairs. The components
+    equal a whole-grid fine fill's (module docstring). Global components come
+    from one sparse connected-components call, renumbered by minimum
+    provisional id (first-encounter raster order); phase 2 (nested rescue)
+    then runs UNCHANGED on the component tables. Sweep 2 replays the layer
+    labeling and packs the per-brick EMPTY / AIR bitmasks.
 
     Returns everything downstream steps consume: the sorted skin-brick ids +
-    their bitmasks, reached / garbage zone-brick ids, the brick-level distance
-    field (zone candidate annotations), counts and fill stats."""
+    their bitmasks, reached / garbage zone-brick ids, counts and fill
+    stats."""
     nx, ny, nz = (int(v) for v in dims)
     nbx = (nx + _BRICK - 1) // _BRICK
     nby = (ny + _BRICK - 1) // _BRICK
@@ -1020,10 +927,10 @@ def _fill_two_tier(
             rem = seg % plane
             brick_occ[bx, (rem // nz) >> 3, (rem % nz) >> 3] = True
     brick_skin = ndimage.binary_dilation(brick_occ, structure=np.ones((3, 3, 3), bool))
-    # Distance (brick units) to the nearest cover brick: the band mask + the
-    # coarse candidate clearance annotation.
-    brick_dist = ndimage.distance_transform_edt(~brick_occ)
-    zone = ~brick_skin & (brick_dist <= coverage_bricks)
+    # Every cover-free brick outside the skin is coarse-zone air: the fill
+    # labels the WHOLE grid — reachability is a scene-wide topological fact,
+    # and consumers query it anywhere in the grid.
+    zone = ~brick_skin
     zone_lbl, n_zone = ndimage.label(zone, _STRUCT6)
 
     # Exact real-cell count per brick (edge bricks are partial).
@@ -1315,7 +1222,6 @@ def _fill_two_tier(
     skin_lin_parts: list[np.ndarray] = []
     air_parts: list[np.ndarray] = []
     empty_parts: list[np.ndarray] = []
-    first_empty_parts: list[np.ndarray] = []
     empty_fine = 0
     air_fine = 0
     for bx in range(nbx):
@@ -1336,9 +1242,6 @@ def _fill_two_tier(
         flat_a = air4.reshape(s_l, 512)
         empty_parts.append(np.packbits(flat_e, axis=1, bitorder="little"))
         air_parts.append(np.packbits(flat_a, axis=1, bitorder="little"))
-        first = np.argmax(flat_e, axis=1).astype(np.int16)
-        first[~flat_e.any(axis=1)] = -1
-        first_empty_parts.append(first)
         empty_fine += int(flat_e.sum())
         air_fine += int(flat_a.sum())
         skin_lin_parts.append(
@@ -1356,10 +1259,6 @@ def _fill_two_tier(
     )
     skin_empty = (
         np.concatenate(empty_parts) if empty_parts else np.zeros((0, 64), np.uint8)
-    )
-    skin_first_empty = (
-        np.concatenate(first_empty_parts) if first_empty_parts
-        else np.zeros(0, np.int16)
     )
 
     # Zone brick partitions by reached-ness (their comps are labeled air).
@@ -1390,10 +1289,9 @@ def _fill_two_tier(
         "skin_lin": skin_lin,
         "skin_air": skin_air,
         "skin_empty": skin_empty,
-        "skin_first_empty": skin_first_empty,
         "zone_reached": zone_reached,
         "zone_garbage": zone_garbage,
-        "brick_dist": brick_dist,
+        "brick_occ": brick_occ,
         "brick_skin": brick_skin,
         "empty_voxels": empty_fine + empty_zone,
         "garbage_voxels": (air_fine - empty_fine) + garbage_zone,
@@ -1693,7 +1591,7 @@ def _brick_class_quads(
 
 
 def _viz_two_tier(
-    fill: dict[str, Any], dims: np.ndarray, clearance_m: float, n_cover: int
+    fill: dict[str, Any], dims: np.ndarray, n_cover: int
 ) -> tuple[np.ndarray, np.ndarray, list[tuple[float, np.ndarray, int]], dict[str, str]]:
     """The SVX3 viz classes from the two-tier fill. Cover and garbage are
     EXACT fine-resolution boundary extractions while their cell counts fit
@@ -1704,10 +1602,9 @@ def _viz_two_tier(
     interior faces across the fine/coarse boundary automatically). PAST the
     cap — foliage scenes with tens of millions of cover cells — a class falls
     back to brick-resolution shells: the client assembles overlay geometry
-    quad-by-quad on its main thread, and 20M+ fine quads simply never render
-    there. The free volume is always ONE brick-resolution shell (a per-cell
-    free ladder died with the dense clearance field; the slider's 'apply'
-    still re-filters candidates server-side). Returns (cover, garbage,
+    quad-by-quad on its main thread, and 20M+     fine quads simply never render
+    there. The free volume is always ONE brick-resolution shell (its wire
+    threshold field is vestigial and written as 0). Returns (cover, garbage,
     shells, resolutions) — `resolutions` names the per-class choice for the
     summary."""
     nbx = (int(dims[0]) + _BRICK - 1) // _BRICK
@@ -1722,9 +1619,7 @@ def _viz_two_tier(
         cover_q = _brick_class_quads(skin_lin, np.invert(air_b), dims)
         res["cover"] = "fine"
     else:
-        # Occupied bricks are exactly the zeros of the brick distance field.
-        occ_b = fill["brick_dist"] == 0
-        cover_q = _brick_quads(occ_b)
+        cover_q = _brick_quads(fill["brick_occ"])
         res["cover"] = "brick"
 
     n_garbage = int(fill["garbage_voxels"])
@@ -1757,149 +1652,9 @@ def _viz_two_tier(
         free_b.reshape(-1)[skin_lin[has_empty]] = True
     if fill["zone_reached"].size:
         free_b.reshape(-1)[fill["zone_reached"]] = True
-    shells = [(float(clearance_m), _brick_quads(free_b), int(fill["empty_voxels"]))]
+    shells = [(0.0, _brick_quads(free_b), int(fill["empty_voxels"]))]
     res["free"] = "brick"
     return cover_q, garbage_q, shells, res
-
-
-def _emit_candidates(
-    fill: dict[str, Any],
-    occ_lin: np.ndarray,
-    dims: np.ndarray,
-    origin: np.ndarray,
-    pitch: float,
-) -> tuple[np.ndarray, np.ndarray]:
-    """The camera-candidate list: one position per `_CAND_BRICKS`³-brick block
-    of reached air, each annotated with its distance to the nearest surface.
-
-    Skin blocks pick the lowest-raster skin brick with empty air and that
-    brick's first empty cell (deterministic), annotated EXACTLY via a local
-    search over the cover cells of the brick's 3×3×3 neighbourhood (a skin
-    brick always has cover within it — that's what makes it skin). Blocks
-    with no skin-empty fall to their lowest reached zone brick, positioned at
-    the brick's central cell and annotated from the brick-level distance
-    field (±1 brick — sub-voxel precision cannot matter half a metre from
-    everything). Returns (cand_pos (M,3) float32 world, cand_clear (M,)
-    float32 metres)."""
-    nx, ny, nz = (int(v) for v in dims)
-    nby = (ny + _BRICK - 1) // _BRICK
-    nbz = (nz + _BRICK - 1) // _BRICK
-    skin_lin = fill["skin_lin"]
-    first = fill["skin_first_empty"]
-
-    def brick_xyz(lin: np.ndarray) -> np.ndarray:
-        return np.stack(
-            [lin // (nby * nbz), (lin // nbz) % nby, lin % nbz], axis=1
-        )
-
-    # --- skin candidates: per cand-block, first empty cell of lowest brick --
-    havef = first >= 0
-    s_lin = skin_lin[havef]
-    s_first = first[havef].astype(np.int64)
-    sxyz = brick_xyz(s_lin)
-    blk = (
-        (sxyz[:, 0] // _CAND_BRICKS) * ((nby + 1) // _CAND_BRICKS + 1)
-        + sxyz[:, 1] // _CAND_BRICKS
-    ) * ((nbz + 1) // _CAND_BRICKS + 1) + sxyz[:, 2] // _CAND_BRICKS
-    # skin_lin ascends ⇒ within a block the first row is the lowest brick.
-    _u, idx = np.unique(blk, return_index=True)
-    pick_lin, pick_first, pick_xyz = s_lin[idx], s_first[idx], sxyz[idx]
-    lx, r = np.divmod(pick_first, _BRICK * _BRICK)
-    ly, lz = np.divmod(r, _BRICK)
-    cells = pick_xyz * _BRICK + np.stack([lx, ly, lz], axis=1)
-
-    # Exact local clearance: min distance to any cover cell in the 27 bricks
-    # around the candidate's brick (cover coords grouped per occupied brick).
-    # Everything cover-sized is held at the SMALLEST sufficient dtype — int16
-    # coords (grid axes are < 32K cells by construction), int32 brick ids —
-    # and dropped as soon as the sorted copy exists: ~10 B per cover cell
-    # instead of the ~50 B the int64 version peaked at on foliage scenes.
-    plane = ny * nz
-    cov_x = occ_lin // plane
-    cov_rem = occ_lin % plane
-    cov = np.empty((len(occ_lin), 3), dtype=np.int16)
-    cov[:, 0] = cov_x
-    cov[:, 1] = cov_rem // nz
-    cov[:, 2] = cov_rem % nz
-    del cov_x, cov_rem
-    cov_brick = (
-        (cov[:, 0].astype(np.int32) >> 3) * nby + (cov[:, 1] >> 3)
-    ) * nbz + (cov[:, 2] >> 3)
-    order = np.argsort(cov_brick, kind="stable")
-    cov_sorted = cov[order]
-    cb_sorted = cov_brick[order]
-    del cov, cov_brick, order
-    cb_ids, cb_starts = np.unique(cb_sorted, return_index=True)
-    cb_ends = np.append(cb_starts[1:], len(cb_sorted))
-    del cb_sorted
-
-    clear = np.full(len(cells), np.inf, dtype=np.float64)
-    offs = np.array(
-        [(dx, dy, dz) for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)],
-        dtype=np.int64,
-    )
-    nbx = (nx + _BRICK - 1) // _BRICK
-    # Vectorized over candidates, 27 neighbour offsets at a time: gather each
-    # candidate's cover cells through the CSR ranges (repeat/cumsum expansion)
-    # and reduce min distance with minimum.at — squared distances in int32
-    # (local extents span ≤ 3 bricks, d² ≤ 3·24²). Chunked so the expanded
-    # pair arrays stay tens of MB.
-    for c0 in range(0, len(cells), 65536):
-        c1 = min(c0 + 65536, len(cells))
-        cc = cells[c0:c1].astype(np.int32)
-        bb = pick_xyz[c0:c1]
-        best = np.full(c1 - c0, np.iinfo(np.int32).max, dtype=np.int32)
-        for off in offs:
-            qb = bb + off
-            ok = np.all((qb >= 0) & (qb < [nbx, nby, nbz]), axis=1)
-            if not ok.any():
-                continue
-            ql = (qb[:, 0] * nby + qb[:, 1]) * nbz + qb[:, 2]
-            p = np.clip(np.searchsorted(cb_ids, ql), 0, len(cb_ids) - 1)
-            found = ok & (cb_ids[p] == ql)
-            if not found.any():
-                continue
-            fi = np.nonzero(found)[0]
-            starts, ends = cb_starts[p[fi]], cb_ends[p[fi]]
-            counts = (ends - starts).astype(np.int64)
-            # ranges: for each found candidate, indices starts[k]..ends[k)
-            total = int(counts.sum())
-            if not total:
-                continue
-            rep = np.repeat(np.arange(len(fi)), counts)
-            base = np.repeat(starts, counts)
-            step = np.arange(total) - np.repeat(
-                np.concatenate([[0], np.cumsum(counts)[:-1]]), counts
-            )
-            diff = cov_sorted[base + step].astype(np.int32) - cc[fi][rep]
-            d2 = (diff * diff).sum(axis=1)
-            np.minimum.at(best, fi[rep], d2)
-        clear[c0:c1] = np.sqrt(best.astype(np.float64)) * pitch
-    skin_pos = (origin + (cells + 0.5) * pitch).astype(np.float32)
-    skin_clear = clear.astype(np.float32)
-    skin_blk = blk[idx]
-
-    # --- zone candidates: per cand-block, lowest reached zone brick ----------
-    z_lin = fill["zone_reached"]
-    if z_lin.size:
-        zxyz = brick_xyz(z_lin)
-        zblk = (
-            (zxyz[:, 0] // _CAND_BRICKS) * ((nby + 1) // _CAND_BRICKS + 1)
-            + zxyz[:, 1] // _CAND_BRICKS
-        ) * ((nbz + 1) // _CAND_BRICKS + 1) + zxyz[:, 2] // _CAND_BRICKS
-        _zu, zidx = np.unique(zblk, return_index=True)
-        # Skin wins a contested block (nearer the content).
-        keep = ~np.isin(_zu, skin_blk)
-        zidx = zidx[keep]
-        zc = np.minimum(zxyz[zidx] * _BRICK + _BRICK // 2, np.array([nx, ny, nz]) - 1)
-        zpos = (origin + (zc + 0.5) * pitch).astype(np.float32)
-        bd = fill["brick_dist"].reshape(-1)[z_lin[zidx]]
-        zclear = (bd * _BRICK * pitch).astype(np.float32)
-        pos = np.concatenate([skin_pos, zpos], axis=0)
-        cl = np.concatenate([skin_clear, zclear], axis=0)
-    else:
-        pos, cl = skin_pos, skin_clear
-    return pos, cl
 
 
 # ---------------------------------------------------------------------------
@@ -2043,13 +1798,12 @@ def compute_free_space(
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
     """Voxelize the cell's placed meshes into the uniform fine occupancy
-    lattice (in parallel across objects — see `_iter_voxelized`), classify the
-    near-surface air empty vs garbage with the two-tier band fill, emit the
-    annotated camera-candidate list, and write `freespace.npz` (metadata +
-    sparse structures, to `out_path`) + the SVX3 `voxels.bin` viz pack + the
-    `.skin.npy` bitmask sidecar (beside it). Returns a summary (grid dims,
-    counts, fill stats). Output is byte-identical for any worker count and
-    any mesh-pass batch size."""
+    lattice (in parallel across objects — see `_iter_voxelized`), classify
+    the grid's air empty vs garbage with the two-tier fill, and write
+    `freespace.npz` (metadata + sparse structures, to `out_path`) + the SVX3
+    `voxels.bin` viz pack + the `.skin.npy` bitmask sidecar (beside it).
+    Returns a summary (grid dims, counts, fill stats). Output is
+    byte-identical for any worker count and any mesh-pass batch size."""
     if not raw_dir.is_dir():
         raise FileNotFoundError(f"placed-mesh dir not found: {raw_dir}")
     ids = placed_object_ids(raw_dir)
@@ -2057,8 +1811,6 @@ def compute_free_space(
         raise FileNotFoundError(f"no placed meshes in {raw_dir}")
     pitch = float(np.clip(params.pitch, *_PITCH_CLAMP))
     margin = float(max(0.0, params.margin))
-    clearance_m = float(max(0.0, params.clearance))
-    coverage_m = float(max(params.coverage, pitch * _BRICK * 2))
     workers = (
         params.workers if params.workers > 0
         else _auto_worker_count(ids, raw_dir, min(os.cpu_count() or 1, _MAX_AUTO_WORKERS))
@@ -2192,28 +1944,18 @@ def compute_free_space(
 
         return tick
 
-    # THE FILL — the two-tier band fill (module docstring): fine labeling per
+    # THE FILL — the two-tier fill (module docstring): fine labeling per
     # skin-brick layer (2 sweeps → a tick per layer per sweep), coarse zone in
     # dense brick-grid calls, seeds/rescue on component tables.
-    coverage_bricks = max(1.0, coverage_m / (pitch * _BRICK))
     nbx = (nx + _BRICK - 1) // _BRICK
-    fill = _fill_two_tier(
-        occ_lin, dims, boxes, coverage_bricks, _stepper(2 * nbx, "fill")
-    )
-
-    # CANDIDATES — the camera positions Stage 4 plans from, annotated with
-    # their distance to the nearest surface (module docstring).
-    if progress is not None:
-        progress(0, 0, "candidates")
-    cand_pos, cand_clear = _emit_candidates(fill, occ_lin, dims, origin, pitch)
-    free_count = int((cand_clear >= clearance_m - _CLEARANCE_EPS).sum())
+    fill = _fill_two_tier(occ_lin, dims, boxes, _stepper(2 * nbx, "fill"))
 
     # SVX3 viz pack: fine cover/garbage quads (brick-level past the client's
     # renderable budget) + the brick-level free shell.
     if progress is not None:
         progress(0, 0, "viz")
     cover_q, garbage_q, shells, viz_res = _viz_two_tier(
-        fill, dims, clearance_m, int(occ_lin.size)
+        fill, dims, int(occ_lin.size)
     )
 
     if progress is not None:
@@ -2229,9 +1971,6 @@ def compute_free_space(
             occ_lin_glass=glass_lin.astype(np.int64),
             skin_lin=fill["skin_lin"].astype(np.int64),
             zone_lin=fill["zone_reached"].astype(np.int64),
-            cand_pos=cand_pos.astype(np.float32),
-            cand_clear=cand_clear.astype(np.float32),
-            clearance_m=np.float64(clearance_m),
         )
         tmp_npz.replace(out_path)
         # Promote the sidecar AFTER the npz lands (loaders treat it as the
@@ -2271,8 +2010,6 @@ def compute_free_space(
         "solid_voxels": int(occ_lin.size),
         "glass_voxels": int(glass_lin.size),
         "empty_voxels": int(fill["empty_voxels"]),
-        "free_voxels": free_count,       # candidates passing the baked filter
-        "candidates": int(len(cand_pos)),
         "garbage_voxels": int(fill["garbage_voxels"]),
         "rescued_voxels": int(fill["rescued_cells"]),
         "skin_bricks": int(fill["skin_lin"].size),

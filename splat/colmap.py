@@ -2,12 +2,15 @@
 
 Postshot and other radiance-field trainers don't read `transforms.json`; they
 ingest a COLMAP sparse model — `cameras.txt` / `images.txt` / `points3D.txt`
-alongside the RGB images. This module builds that from what stages 3-5 already
+alongside the images. This module builds that from what stages 3-5 already
 produced for a cell:
 
   * intrinsics + per-frame poses  <- refs/transforms.json      (Stage 5)
-  * the RGB images                <- refs/frames/*.szf, decoded (Stage 5)
+  * the RGBA images (albedo + A)  <- refs/frames/*.szf, decoded (Stage 5)
   * the sparse init point cloud   <- cloud.ply surfels          (Stage 3)
+
+The PNGs keep their coverage ALPHA (a ready background/occluder matte Postshot
+can mask against); only the depth plane is dropped.
 
 `transforms.json` poses are OpenCV camera-to-world (the same axes COLMAP uses),
 so the extrinsics are simply `w2c = inv(c2w)` with NO OpenGL flip. Point colours
@@ -31,6 +34,12 @@ from . import stage5
 CAMERAS_TXT = "cameras.txt"
 IMAGES_TXT = "images.txt"
 POINTS_TXT = "points3D.txt"
+# SZF supervision sidecar: a POINTER (no pixel duplication) from the COLMAP model
+# back to the refs' SZF frames + the shared depth [near, far], so splat/stage6 can
+# supervise against the capture's exact alpha + metric-depth planes. Postshot and
+# every other COLMAP consumer simply ignore the extra file. Only written for SZF
+# refs — legacy PNG-triple refs carry no frames to point at.
+SIDECAR_NAME = "szf_sidecar.json"
 
 # SH degree-0 basis constant: Stage 3 stores f_dc = (rgb - 0.5) / C0, so rgb =
 # 0.5 + C0 * f_dc (matches splat/stage3.py's _SH_C0).
@@ -89,15 +98,39 @@ def _workers(jobs: int | None) -> int:
     return jobs if jobs and jobs > 0 else min(8, (os.cpu_count() or 4))
 
 
+def _frame_to_rgba_png(szf_path: Path, png_path: Path) -> None:
+    """Decode ONE SZF reference frame to an RGBA PNG — RGB albedo + the captured
+    coverage alpha (a ready background/occluder matte for Postshot masking); the
+    depth plane is dropped. Reuses the Stage-5 codec."""
+    from PIL import Image
+
+    rgba, _ = stage5.load_reference_frame(szf_path)
+    Image.fromarray(np.ascontiguousarray(rgba)).save(png_path, format="PNG", compress_level=1)
+
+
+def _legacy_pngs_to_rgba(rgb_path: Path, alpha_path: Path | None, png_path: Path) -> None:
+    """Legacy PNG-triple refs: fold the separate RGB + coverage-alpha PNGs into one
+    RGBA PNG so those sets keep transparency too. No alpha sidecar -> copy RGB."""
+    if alpha_path is None or not Path(alpha_path).is_file():
+        shutil.copyfile(rgb_path, png_path)
+        return
+    from PIL import Image
+
+    img = Image.open(rgb_path).convert("RGB")
+    img.putalpha(Image.open(alpha_path).convert("L"))
+    img.save(png_path, format="PNG", compress_level=1)
+
+
 def decode_frames_to_png(frames_dir: Path, out_dir: Path, *, jobs: int | None = None) -> int:
-    """Decode every `*.szf` reference frame in `frames_dir` to an RGB `.png` in
-    `out_dir` (alpha + depth dropped), reusing the Stage-5 codec. Returns the count."""
+    """Decode every `*.szf` reference frame in `frames_dir` to an RGBA `.png` in
+    `out_dir` (depth dropped, coverage alpha kept), reusing the Stage-5 codec.
+    Returns the count."""
     frames_dir, out_dir = Path(frames_dir), Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     szfs = sorted(frames_dir.glob(f"*{stage5.FRAME_SUFFIX}"))
 
     def _decode(szf: Path) -> None:
-        (out_dir / f"{szf.stem}.png").write_bytes(stage5.frame_preview_png(szf))
+        _frame_to_rgba_png(szf, out_dir / f"{szf.stem}.png")
 
     with ThreadPoolExecutor(max_workers=_workers(jobs)) as pool:
         list(pool.map(_decode, szfs))
@@ -107,10 +140,10 @@ def decode_frames_to_png(frames_dir: Path, out_dir: Path, *, jobs: int | None = 
 def export_colmap(
     refs_dir: Path, cloud_ply: Path, out_dir: Path, *, jobs: int | None = None
 ) -> dict[str, Any]:
-    """Write a COLMAP text model (+ decoded RGB PNGs) into `out_dir` from a cell's
-    Stage-5 refs (`refs_dir/transforms.json` + `frames/*.szf`) and Stage-3
-    `cloud_ply`. `out_dir` is wiped first so it always reflects the current refs.
-    Returns a summary: {cameras, images, points, dir}."""
+    """Write a COLMAP text model (+ decoded RGBA PNGs — coverage alpha kept) into
+    `out_dir` from a cell's Stage-5 refs (`refs_dir/transforms.json` +
+    `frames/*.szf`) and Stage-3 `cloud_ply`. `out_dir` is wiped first so it always
+    reflects the current refs. Returns a summary: {cameras, images, points, dir}."""
     refs_dir, cloud_ply, out_dir = Path(refs_dir), Path(cloud_ply), Path(out_dir)
     doc = json.loads((refs_dir / stage5.TRANSFORMS_NAME).read_text(encoding="utf-8"))
     frames = doc["frames"]
@@ -131,17 +164,26 @@ def export_colmap(
 
     records = []
     for i, fr in enumerate(frames, 1):
-        stem = Path(fr["frame_path"]).stem
+        src = fr.get("frame_path") or fr.get("file_path")
+        if src is None:
+            raise ValueError(f"frame {i} has neither 'frame_path' (SZF) nor 'file_path' (PNG)")
+        stem = Path(src).stem
         w2c = np.linalg.inv(np.asarray(fr["transform_matrix"], dtype=np.float64))
         q = rotmat2qvec(w2c[:3, :3])
         t = w2c[:3, 3]
-        records.append((i, stem, q, t))
+        records.append((i, stem, q, t, fr))
 
     def _decode(rec: tuple) -> None:
-        stem = rec[1]
-        (out_dir / f"{stem}.png").write_bytes(
-            stage5.frame_preview_png(frames_dir / f"{stem}{stage5.FRAME_SUFFIX}")
-        )
+        stem, fr = rec[1], rec[4]
+        dst = out_dir / f"{stem}.png"
+        if fr.get("frame_path"):
+            _frame_to_rgba_png(frames_dir / f"{stem}{stage5.FRAME_SUFFIX}", dst)
+        else:  # legacy PNG-triple refs: fold the RGB + alpha sidecars into one RGBA
+            _legacy_pngs_to_rgba(
+                refs_dir / fr["file_path"],
+                (refs_dir / fr["alpha_path"]) if fr.get("alpha_path") else None,
+                dst,
+            )
 
     with ThreadPoolExecutor(max_workers=_workers(jobs)) as pool:
         list(pool.map(_decode, records))
@@ -152,7 +194,7 @@ def export_colmap(
         "#   POINTS2D[] as (X, Y, POINT3D_ID)\n",
         f"# Number of images: {len(records)}, mean observations per image: 0\n",
     ]
-    for i, stem, q, t in records:
+    for i, stem, q, t, _fr in records:
         img_lines.append(
             f"{i} {q[0]:.10g} {q[1]:.10g} {q[2]:.10g} {q[3]:.10g} "
             f"{t[0]:.10g} {t[1]:.10g} {t[2]:.10g} 1 {stem}.png\n\n"
@@ -174,4 +216,25 @@ def export_colmap(
     ]
     (out_dir / POINTS_TXT).write_text("".join(pt_lines), encoding="utf-8")
 
-    return {"cameras": 1, "images": len(records), "points": int(len(xyz)), "dir": str(out_dir)}
+    # SZF supervision sidecar (see SIDECAR_NAME): image stems match frame stems, so
+    # a relative frames-dir + suffix + the shared [near, far] is all the trainer
+    # needs to decode each view's exact alpha + depth planes from the refs.
+    sidecar = bool(frames and all(fr.get("frame_path") for fr in frames)
+                   and "near" in doc and "far" in doc)
+    if sidecar:
+        rel = os.path.relpath(frames_dir, out_dir).replace(os.sep, "/")
+        (out_dir / SIDECAR_NAME).write_text(
+            json.dumps({
+                "version": 1,
+                "frames_dir": rel,
+                "suffix": stage5.FRAME_SUFFIX,
+                "near": float(doc["near"]),
+                "far": float(doc["far"]),
+            }, indent=1),
+            encoding="utf-8",
+        )
+
+    return {
+        "cameras": 1, "images": len(records), "points": int(len(xyz)),
+        "sidecar": sidecar, "dir": str(out_dir),
+    }

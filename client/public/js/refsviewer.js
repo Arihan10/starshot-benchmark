@@ -13,7 +13,10 @@ const FRAME_MAGIC = 0x31465a53; // "SZF1" read as little-endian u32 (S=0x53,Z=0x
 const HEADER_BYTES = 16;
 const FILTER_SUBLEFT = 1;
 const DEPTH_CODE_MAX = 65535; // matches stage5._DEPTH_CODE_MAX; code 0 = background
-const CUBE_FACES = ["+x", "-x", "+y", "-y", "+z", "-z"];
+// Rig kinds of the single-shot camera plan (transforms.json frames[].kind).
+// Older reference sets may still carry fill/station kinds; those views simply
+// group under "all" until re-planned.
+const VIEW_KINDS = ["ball", "shell"];
 const PLANES = [
     ["rgb", "RGB"],
     ["alpha", "alpha"],
@@ -293,7 +296,7 @@ function decodeTile(tile) {
 
 function filteredFrames() {
     const f = state.faceFilter;
-    return f === "all" ? state.frames : state.frames.filter((fr) => fr.face === f);
+    return f === "all" ? state.frames : state.frames.filter((fr) => fr.kind === f);
 }
 
 function makeTile(frame) {
@@ -303,7 +306,7 @@ function makeTile(frame) {
         title: `${frameId(frame)} · cam ${frame.camera_index}`,
     });
     tile._frame = frame;
-    tile.appendChild(el("span", { class: "rfv-tile-lab", text: frame.face }));
+    tile.appendChild(el("span", { class: "rfv-tile-lab", text: frame.kind ?? "" }));
     tile.addEventListener("click", () => openDetail(s.detailOrder.indexOf(frame)));
     return tile;
 }
@@ -467,7 +470,7 @@ function renderDetailMeta() {
     const frame = s.detailOrder[s.detailIndex];
     const rows = [
         ["camera", String(frame.camera_index)],
-        ["face", frame.face],
+        ["kind", frame.kind ?? "?"],
         ["resolution", `${dec.res}²`],
         ["near · far", `${s.near} · ${s.far} m`],
     ];
@@ -633,13 +636,13 @@ function planeSeg(onPick) {
 function faceSeg(onPick) {
     const btns = {};
     const seg = el("div", { class: "rfv-seg" });
-    for (const face of ["all", ...CUBE_FACES]) {
+    for (const kind of ["all", ...VIEW_KINDS]) {
         const b = el("button", {
-            text: face,
-            class: face === "all" ? "on" : "",
-            onclick: () => onPick(face),
+            text: kind,
+            class: kind === "all" ? "on" : "",
+            onclick: () => onPick(kind),
         });
-        btns[face] = b;
+        btns[kind] = b;
         seg.appendChild(b);
     }
     return { seg, btns };
@@ -685,7 +688,7 @@ function buildUI(label) {
         el("span", { class: "rfv-sub", text: label || "" }),
         el("span", { class: "rfv-lab", text: "plane" }),
         plane.seg,
-        el("span", { class: "rfv-lab", text: "face" }),
+        el("span", { class: "rfv-lab", text: "kind" }),
         face.seg,
         s.countEl,
         el("button", { class: "rfv-x", text: "✕ close", onclick: closeRefsViewer }),

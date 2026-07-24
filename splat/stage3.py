@@ -1,10 +1,11 @@
-"""Stage 3 — Surfel sampler (mesh → Gaussian splat).
+"""Stage 3 — Surfel sampler (mesh → init point cloud).
 
-Turns a cell's placed meshes into a **pre-fine-tuning Gaussian splat**:
-a cloud of flat, surface-aligned 2D Gaussians (surfels), written as a **2DGS `.ply`**
-(two tangent scales, no thickness) that 2DGS-capable web viewers (mkkellogg, PlayCanvas
-v2.16+) read and the Stage-6 gsplat **2DGS** fine-tune inits from. A `3dgs` mode appends
-a thin third scale for 3DGS-only viewers / SOG-SPZ compression.
+Turns a cell's placed meshes into the splat trainer's INIT CLOUD: a cloud of
+flat, surface-aligned 2D Gaussians (surfels) carrying exact texel colours,
+written as a **2DGS `.ply`** (two tangent scales, no thickness) that
+2DGS-capable web viewers read, the legacy Stage-6 gsplat fine-tune inits
+from, and the COLMAP/Postshot export converts to `points3D`. A `3dgs` mode
+appends a thin third scale for 3DGS-only viewers / SOG-SPZ compression.
 
 Consumes the **Stage-2 free-space grid** (`stage2.load_free_space`):
   * **Normal orientation (fixes unreliable TRELLIS winding):** each surfel's normal is
@@ -12,6 +13,9 @@ Consumes the **Stage-2 free-space grid** (`stage2.load_free_space`):
     face winding — so disks face the viewer regardless of authoring.
   * **Hidden-face culling:** a surfel with no empty space on EITHER side is buried
     (a solid's interior, or the seam between two abutting objects) and is dropped.
+  * **Sealed-visibility culling:** a surfel with no LINE OF SIGHT to reachable
+    air can never appear in a training image; it is dropped so the trainer is
+    never seeded with points no photo will ever supervise.
 
 ONE KNOB — `detail`. Base spacing = `_BASE_SPACING / sqrt(detail)`, so detail=1
 reproduces the default ~3 cm base, detail=2 doubles density, 0.5 halves it. Disk
@@ -24,48 +28,24 @@ samples at `base · max(1, obj_diag / _VIEW_REF_M)` (`_object_spacing`), UNCAPPE
 small props (obj_diag ≤ ~2 m) stay at `base`, a mountain or skydome gets metre-
 scale surfels — but each surfel still sits ON the surface at its LOCAL normal, so
 a large object reads as a coherent (lower-resolution) surface from EVERY angle.
-This is deliberately NOT done by merging many surfels into one flat disc at their
-mean orientation: that reads fine head-on but fractures into angle-dependent
-billboards ("clouds") when orbited, AND averages the members' colours together,
-bleeding anything painted on a flat surface (wall art, ceiling vents, backdrop
-texture) into a muddy mean. Scale adaptivity is entirely the SPACING's job.
+Count tracks INFORMATION rather than AREA — a flat object of ANY size samples to
+~`(2/base)²` surfels (spacing ∝ its diagonal), so a 200 m backdrop and a 2 m
+panel cost about the same. NO MERGING: every surviving surfel keeps the EXACT
+texel colour sampled at its own position — never an area-average of neighbours
+(averaging bleeds anything painted on a flat surface into a muddy mean).
 
 SAMPLING — SEEDED DARTS + LATTICE-HASH THINNING. Candidates are area-weighted random
 surface points (`trimesh.sample.sample_surface`, SEEDED per object/slab — no
 worker-count dependence), then thinned by an integer lattice: bin each candidate into
 a cell of edge `_THIN_CELL_FACTOR·spacing` and keep the ONE candidate nearest the cell
-centre. This replaces the old oversample-and-eliminate Poisson sampler — which,
-MEASURED on a hotel cell, generated ~36× the kept points, built a KD-tree over them
-and materialized a ~1.7-BILLION-entry too-close-pair table (~54 GB transient, ~22 GB
-peak RSS, ~63 % of runtime) — with a few integer passes: no KD-tree, no pair table,
-2.4× oversample instead of ~6×. Every surfel is a real dart sitting exactly on the
-(lite) mesh surface with its face index → exact barycentric UV → exact base-colour
-texel, so the colour/orient/cull paths are the long-validated ones.
-
-NO MERGING (COARSENING RETIRED). Every surviving surfel is emitted individually at
-its object's spacing, keeping the EXACT texel colour sampled at its own position —
-never an area-average of its neighbours. A merge pass was tried and removed: once
-spacing is object-scaled the base surfels are already large (a wall at ~13 cm, a
-backdrop at metres), and multiplying that by octave merging produced ~1 m–20 m discs
-whose single averaged colour bled everything painted on the surface into a mean.
-Object-scaled spacing already makes count track INFORMATION rather than AREA — a flat
-object of ANY size samples to ~`(2/base)²` surfels (spacing ∝ its diagonal), so a
-200 m backdrop and a 2 m panel cost about the same — so the merge bought little size
-and cost fidelity. High-frequency albedo on a coarse-but-flat surface is Stage 6's
-job (it retrains colour against the reference renders and densifies where they
-demand it), starting from crisp per-surfel colour instead of a pre-blurred mean.
+centre. O(N) integer passes — no KD-tree, no pair table. Every surfel is a real
+dart sitting exactly on the mesh surface with its face index → exact barycentric
+UV → exact base-colour texel.
 
 CHUNKING: an object whose candidate budget exceeds `_CHUNK_MAX_CANDIDATES` is sampled
 in `_CHUNK_EXTENT`-metre spatial slabs (partition its triangles, sample each), so a
 single huge mesh (terrain, a racetrack ribbon) has BOUNDED transient memory — the
 lattice keys are absolute, so slab seams cost only a one-cell layer at base density.
-
-Optional `_FEATURE_REFINE` (OFF): the legacy crease/boundary band refinement
-(`_spacing_bands`) that samples near feature edges up to `_FEATURE_BOOST`× finer. On
-dense organic TRELLIS meshes the >25° crease test fires on ~85 % of surface, so it
-multiplies counts 4-6× — the old sampler only survived it because its eliminator
-undersampled those bands back to ~base density. Off until a detector separates real
-edges from organic bumpiness.
 
 PIPELINE PER OBJECT (parallel across objects — `_iter_sampled`, spawn pool,
 id-ordered merge): load → darts → THIN → ORIENT + CULL → SEALED cull (LOS escape
@@ -95,15 +75,9 @@ from typing import Any
 
 import numpy as np
 import trimesh
-from scipy.spatial import cKDTree
 
 from splat.assets import load_geoms
-from splat.stage2 import (
-    FreeSpace,
-    _subdivide_edges,
-    _valid_tri_mask,
-    load_free_space,
-)
+from splat.stage2 import FreeSpace, load_free_space
 
 # trimesh logs per-file load noise; silence it for whole-cell runs.
 logging.getLogger("trimesh").setLevel(logging.ERROR)
@@ -163,58 +137,21 @@ _THIN_CANDIDATES = 2.4
 #      which is perceptually harmless.
 # Rescued cavities (furnished interiors) keep their surfels: their air is
 # EMPTY, so rays escape into it — by design. Disabled when a scene has almost
-# no open camera candidates (guard for tiny/pathological scenes).
+# no open air at all (guard for tiny/pathological scenes).
 _SEAL_RADIUS_VOX = 4.0
 _SEAL_OPEN_MAX = 6
 _SEAL_MARCH_VOX = 16
-_SEAL_CAND_CLEAR = 0.20
-_SEAL_MIN_CANDS = 16
+_SEAL_MIN_ZONE_BRICKS = 16
 _SEAL_DIRS = np.array(
     [o for o in np.ndindex(3, 3, 3) if o != (1, 1, 1)], dtype=np.float64
 ) - 1.0
 _SEAL_DIRS /= np.linalg.norm(_SEAL_DIRS, axis=1, keepdims=True)
 
-# --- object-scale-adaptive spacing (content-anchored, diagonal-capped) ---------
-# A screen pixel is an ANGLE, so the metric detail worth storing scales with the
-# distance a surface is actually viewed from. The old rule used the OBJECT'S OWN
-# diagonal as that distance ("you frame an object from ~its own size away"):
-# `base · max(1, obj_diag / _VIEW_REF_M)`, UNCAPPED. That prior is right for
-# props but WRONG for scene-scale surfaces — a 200 m backdrop in a 10 m-deep
-# level is viewed from ~10 m, not 200 m — and it reads NOTHING about content:
-# measured across the benchmark scenes, 22-65% of surface area gets spacing
-# > 4× coarser than the surface's own TEXTURE (a 3 m-spaced backdrop carrying a
-# 0.57 m/texel painting), so the cloud physically cannot reproduce the lite
-# asset no matter how Stage 6 trains.
-#
-# The fix keeps the diagonal rule as the CEILING (never sample coarser than
-# today) and anchors the floor to the measured texel footprint:
-#
-#     spacing = max(base, min(base·max(1, diag/_VIEW_REF_M),
-#                             _TEXEL_SPACING_MULT · s_tex))
-#
-# where `s_tex` is the object's area-weighted median texel size in metres
-# (√(world_area/texels) per face — the UV jacobian × texture resolution). One
-# surfel per ~3 texels matches the source's information density: content-dense
-# surfaces (walls, backdrops with painted detail) sample finer; content-poor
-# ones (a 720² texture stretched over a 170 m desert) keep the coarse spacing —
-# the count tracks INFORMATION, which the diagonal alone only guessed at.
-# Untextured objects fall back to the diagonal rule. Measured growth across six
-# benchmark scenes: 1.3-2.5× surfels (hotel 529k→720k, platformer 1.44M→2.22M).
+# --- object-scale-adaptive spacing (the diagonal rule) -------------------------
+# A screen pixel is an ANGLE, so the metric detail worth storing scales with
+# the distance a surface is actually viewed from — and an object is typically
+# framed from ~its own size away: `base · max(1, obj_diag / _VIEW_REF_M)`.
 _VIEW_REF_M = 2.0
-_TEXEL_SPACING_MULT = 3.0
-
-# Per-surfel texel-size sidecar written beside the cloud (`cloud.ply.stex.npy`,
-# float32 m/texel, NaN = untextured): Stage 4 anchors each patch's scale ladder
-# to it, so reference-camera effort tracks the same content signal the spacing
-# does. Rows align with the emitted `.ply` surfel order.
-_STEX_SIDECAR_SUFFIX = ".stex.npy"
-
-# --- legacy feature refinement (OFF by default; see module docstring) ----------
-_FEATURE_REFINE = False
-_FEATURE_BOOST = 4.0
-_CREASE_ANGLE = np.deg2rad(25.0)
-_EDGE_PT_CAP = 400_000  # stride a pathological crease soup instead of exploding
-_CLASSIFY_COARSE = 4.0  # band labeling's first-pass split limit (× spacing)
 
 # --- chunking: bound a single huge object's transient memory -------------------
 _CHUNK_MAX_CANDIDATES = 8_000_000
@@ -325,40 +262,6 @@ def _align_quaternions(normals: np.ndarray) -> np.ndarray:
     return quat
 
 
-def _feature_edge_points(geom: trimesh.Trimesh, step: float) -> np.ndarray | None:
-    """Points sampled every ~`step` m along the mesh's FEATURE edges: open boundary
-    edges + creases sharper than `_CREASE_ANGLE`. None when the mesh has none."""
-    try:
-        parts = []
-        ang = np.asarray(geom.face_adjacency_angles)
-        if ang.size:
-            parts.append(np.asarray(geom.face_adjacency_edges)[ang > _CREASE_ANGLE])
-        boundary = trimesh.grouping.group_rows(geom.edges_sorted, require_count=1)
-        if len(boundary):
-            parts.append(np.asarray(geom.edges_sorted)[boundary])
-        if not parts:
-            return None
-        edges = np.concatenate(parts, axis=0)
-    except Exception:
-        return None
-    if not len(edges):
-        return None
-    v0 = np.asarray(geom.vertices)[edges[:, 0]]
-    v1 = np.asarray(geom.vertices)[edges[:, 1]]
-    seg = v1 - v0
-    length = np.linalg.norm(seg, axis=1)
-    cnt = np.maximum(np.ceil(length / max(step, 1e-6)).astype(np.int64) + 1, 2)
-    total = int(cnt.sum())
-    if total > _EDGE_PT_CAP:
-        stride = int(np.ceil(total / _EDGE_PT_CAP))
-        cnt = np.maximum(cnt // stride, 2)
-        total = int(cnt.sum())
-    rep = np.repeat(np.arange(len(edges)), cnt)
-    start = np.concatenate([[0], np.cumsum(cnt)[:-1]])
-    t = (np.arange(total) - start[rep]) / (cnt[rep] - 1)
-    return (v0[rep] + t[:, None] * seg[rep]).astype(np.float64)
-
-
 def _soup_mesh(tris: np.ndarray, uv3: np.ndarray | None, material) -> trimesh.Trimesh:  # noqa: ANN001
     """Standalone mesh from a triangle soup (vertices duplicated per triangle),
     carrying per-corner UVs + the ORIGINAL material so colour lookups go through
@@ -369,71 +272,6 @@ def _soup_mesh(tris: np.ndarray, uv3: np.ndarray | None, material) -> trimesh.Tr
     if uv3 is not None and material is not None:
         visual = trimesh.visual.TextureVisuals(uv=uv3.reshape(-1, 2), material=material)
     return trimesh.Trimesh(vertices=verts, faces=faces, visual=visual, process=False)
-
-
-def _spacing_bands(
-    geom: trimesh.Trimesh, spacing: float, boost: float = _FEATURE_BOOST
-) -> list[tuple[trimesh.Trimesh, float]]:
-    """LEGACY feature-adaptive band split (only used when `_FEATURE_REFINE` is on):
-    split one object into `(mesh, spacing)` bands by distance to its feature edges,
-    refining crease/boundary neighbourhoods up to `boost`× finer. Two-level labeling
-    for speed; falls back to a single base-spacing band when the mesh has no feature
-    edges or its triangles are degenerate."""
-    edge_pts = _feature_edge_points(geom, step=spacing * 0.5)
-    if edge_pts is None:
-        return [(geom, spacing)]
-
-    tris = np.asarray(geom.triangles, dtype=np.float64)
-    uv = getattr(getattr(geom, "visual", None), "uv", None)
-    material = getattr(getattr(geom, "visual", None), "material", None)
-    uv3 = None
-    if uv is not None and len(uv) == len(geom.vertices):
-        uv3 = np.asarray(uv, dtype=np.float64)[np.asarray(geom.faces)]
-    keep = _valid_tri_mask(tris)
-    tris = tris[keep]
-    uv3 = uv3[keep] if uv3 is not None else None
-    if not len(tris):
-        return [(geom, spacing)]
-
-    tree = cKDTree(edge_pts)
-    tris_c, uv3_c = _subdivide_edges(tris, spacing * _CLASSIFY_COARSE, uv3)
-    cent = tris_c.mean(axis=1)
-    d_c = tree.query(cent)[0]
-    circum = np.linalg.norm(tris_c - cent[:, None, :], axis=2).max(axis=1)
-    flat = (d_c - circum) >= spacing
-
-    base_tris: list[np.ndarray] = [tris_c[flat]]
-    base_uv: list[np.ndarray] | None = [uv3_c[flat]] if uv3_c is not None else None
-    finer: list[tuple[float, np.ndarray, np.ndarray | None]] = []
-
-    near = ~flat
-    if near.any():
-        tris_f, uv3_f = _subdivide_edges(
-            tris_c[near], spacing, uv3_c[near] if uv3_c is not None else None
-        )
-        d = tree.query(tris_f.mean(axis=1))[0]
-        factor = spacing / np.clip(d, spacing / boost, spacing)
-        level = np.ceil(np.log2(np.maximum(factor, 1.0)) - 1e-9)
-        f = np.minimum(2.0 ** level, boost)
-        for lf in np.unique(f):
-            m = f == lf
-            if lf == 1.0:
-                base_tris.append(tris_f[m])
-                if base_uv is not None and uv3_f is not None:
-                    base_uv.append(uv3_f[m])
-            else:
-                finer.append(
-                    (float(lf), tris_f[m], uv3_f[m] if uv3_f is not None else None)
-                )
-
-    bands: list[tuple[trimesh.Trimesh, float]] = []
-    bt = np.concatenate(base_tris, axis=0)
-    if len(bt):
-        bu = np.concatenate(base_uv, axis=0) if base_uv is not None else None
-        bands.append((_soup_mesh(bt, bu, material), spacing))
-    for lf, band_tris, band_uv in finer:
-        bands.append((_soup_mesh(band_tris, band_uv, material), spacing / lf))
-    return bands or [(geom, spacing)]
 
 
 def _thin_band(points: np.ndarray, spacing: float) -> np.ndarray:
@@ -525,25 +363,23 @@ def _orient_and_cull(
     return plus_open | minus_open, oriented
 
 
-def _open_cand_keys(fs: FreeSpace) -> np.ndarray:
-    """The sealed-cull ENABLE gate for one grid (name kept for the threading):
-    non-empty ⇔ the scene has at least `_SEAL_MIN_CANDS` camera candidates with
-    clearance ≥ `_SEAL_CAND_CLEAR`. The LOS escape march needs no candidate
-    index — this only guards tiny/pathological scenes against culling."""
-    if int((fs.cand_clear >= _SEAL_CAND_CLEAR).sum()) < _SEAL_MIN_CANDS:
-        return np.zeros(0, dtype=np.int64)
-    return np.ones(1, dtype=np.int64)
+def _seal_enabled(fs: FreeSpace) -> bool:
+    """The sealed-cull ENABLE gate for one grid: True ⇔ the scene has at least
+    `_SEAL_MIN_ZONE_BRICKS` reached open-air bricks. The LOS escape march needs
+    nothing else — this only guards tiny/pathological scenes (with almost no
+    open air, everything would read as sealed) against culling."""
+    return int(fs.zone_lin.size) >= _SEAL_MIN_ZONE_BRICKS
 
 
 def _sealed_mask(
-    positions: np.ndarray, fs: FreeSpace, cand_keys: np.ndarray
+    positions: np.ndarray, fs: FreeSpace, seal: bool
 ) -> np.ndarray:
     """True per surfel when it is PROVABLY SEALED (module constants): crack-like
     local air (pre-filter) AND no straight line of sight to open air — no ray
     among the 26 directions stays in EMPTY air for `_SEAL_MARCH_VOX` consecutive
-    voxels. Empty `cand_keys` (the enable gate) ⇒ no culls."""
+    voxels. `seal` False (the enable gate) ⇒ no culls."""
     n = len(positions)
-    if n == 0 or cand_keys.size == 0:
+    if n == 0 or not seal:
         return np.zeros(n, dtype=bool)
     pos = positions.astype(np.float64)
     openness = np.zeros(n, dtype=np.int16)
@@ -589,9 +425,8 @@ def _band_darts(
     spacing: float,
     opaque: bool,
     fs: FreeSpace,
-    cand_keys: np.ndarray,
+    seal: bool,
     seed: int,
-    s_tex: float = float("nan"),
 ) -> tuple[dict[str, np.ndarray] | None, int, int]:
     """One (sub)mesh → surfels: seeded darts, lattice thin, orient+cull against
     `fs.empty_at`, drop PROVABLY SEALED survivors (`_sealed_mask`), colour the
@@ -629,7 +464,7 @@ def _band_darts(
         return None, thinned, 0
 
     idx = np.nonzero(keep)[0]
-    sealed = _sealed_mask(pos32[idx], fs, cand_keys)
+    sealed = _sealed_mask(pos32[idx], fs, seal)
     n_sealed = int(sealed.sum())
     idx = idx[~sealed]
     if len(idx) == 0:
@@ -644,10 +479,6 @@ def _band_darts(
         "normal": oriented[idx].astype(np.float32),
         "color": colors,
         "radius": np.full(len(idx), _RADIUS_FRAC * spacing, dtype=np.float32),
-        # Content scale for Stage 4's ladder (sidecar; NaN = untextured). The
-        # object-level median: spacing is per-object, so finer granularity here
-        # would imply precision the sampler doesn't act on.
-        "stex": np.full(len(idx), s_tex, dtype=np.float32),
     }, thinned, n_sealed
 
 
@@ -656,8 +487,7 @@ def _sample_band(
     spacing: float,
     opaque: bool,
     fs: FreeSpace,
-    cand_keys: np.ndarray,
-    s_tex: float = float("nan"),
+    seal: bool,
 ) -> tuple[dict[str, np.ndarray] | None, int, int]:
     """Sample one mesh at one spacing. Small meshes go through `_band_darts`
     directly; a mesh whose dart budget exceeds `_CHUNK_MAX_CANDIDATES` is
@@ -669,7 +499,7 @@ def _sample_band(
     budget = int(mesh.area / (spacing * spacing) * _THIN_CANDIDATES) + 8
     if budget <= _CHUNK_MAX_CANDIDATES:
         return _band_darts(
-            mesh, spacing, opaque, fs, cand_keys, _band_seed(mesh, spacing, 0), s_tex
+            mesh, spacing, opaque, fs, seal, _band_seed(mesh, spacing, 0)
         )
 
     tris = np.asarray(mesh.triangles, dtype=np.float64)
@@ -695,7 +525,7 @@ def _sample_band(
         m = skey == sk
         sub = _soup_mesh(tris[m], uv3[m] if uv3 is not None else None, material)
         part, n, ns = _band_darts(
-            sub, spacing, opaque, fs, cand_keys, _band_seed(sub, spacing, si + 1), s_tex
+            sub, spacing, opaque, fs, seal, _band_seed(sub, spacing, si + 1)
         )
         thinned += n
         sealed += ns
@@ -712,91 +542,31 @@ def _sample_band(
     )
 
 
-def _geom_texel_size(geom: trimesh.Trimesh) -> float:
-    """Area-weighted MEDIAN texel footprint of a mesh in metres/texel — the
-    content scale its base-colour texture actually paints on the surface,
-    from the per-face UV jacobian × texture resolution:
-    `s_tex(face) = √(world_area / (uv_area · W · H))`. NaN when the mesh has
-    no readable texture (or fully degenerate UVs) — callers fall back to the
-    diagonal spacing rule."""
-    visual = getattr(geom, "visual", None)
-    uv = getattr(visual, "uv", None)
-    material = getattr(visual, "material", None)
-    image = getattr(material, "baseColorTexture", None)
-    if image is None or uv is None or len(uv) != len(geom.vertices):
-        return float("nan")
-    try:
-        w, h = image.size
-    except Exception:
-        return float("nan")
-    fuv = np.asarray(uv, dtype=np.float64)[np.asarray(geom.faces)]  # (F,3,2)
-    e1 = fuv[:, 1] - fuv[:, 0]
-    e2 = fuv[:, 2] - fuv[:, 0]
-    texels = 0.5 * np.abs(e1[:, 0] * e2[:, 1] - e1[:, 1] * e2[:, 0]) * w * h
-    area = np.asarray(geom.area_faces, dtype=np.float64)
-    ok = (texels > 1e-12) & (area > 1e-12)
-    if not ok.any():
-        return float("nan")
-    s = np.sqrt(area[ok] / texels[ok])
-    aw = area[ok]
-    order = np.argsort(s)
-    cum = np.cumsum(aw[order])
-    return float(s[order][np.searchsorted(cum, 0.5 * cum[-1])])
-
-
-def _object_spacing(geom: trimesh.Trimesh, base: float, s_tex: float | None = None) -> float:
-    """Per-object sample spacing (constants block above): the diagonal rule
-    `base · max(1, obj_diag / _VIEW_REF_M)` as the CEILING, refined down toward
-    `_TEXEL_SPACING_MULT · s_tex` when the surface's texture carries finer
-    content, floored at `base`. `s_tex` NaN/None = untextured → diagonal rule
-    (today's behaviour) unchanged."""
+def _object_spacing(geom: trimesh.Trimesh, base: float) -> float:
+    """Per-object sample spacing: the diagonal rule
+    `base · max(1, obj_diag / _VIEW_REF_M)` (constants block above)."""
     b = np.asarray(geom.bounds, dtype=np.float64)
     diag = float(np.linalg.norm(b[1] - b[0]))
-    spacing = base * max(diag / _VIEW_REF_M, 1.0)
-    if s_tex is None:
-        s_tex = _geom_texel_size(geom)
-    if np.isfinite(s_tex) and s_tex > 0:
-        spacing = max(base, min(spacing, _TEXEL_SPACING_MULT * s_tex))
-    return spacing
+    return base * max(diag / _VIEW_REF_M, 1.0)
 
 
 def _sample_object(
     geom: trimesh.Trimesh,
     base: float,
     fs: FreeSpace,
-    cand_keys: np.ndarray | None = None,
+    seal: bool | None = None,
 ) -> tuple[dict[str, np.ndarray] | None, int, int]:
     """Sample one placed mesh into surfels at its object-scale-adaptive spacing
-    (`_object_spacing`). With `_FEATURE_REFINE` on, split into legacy feature bands
-    first. Returns `(concatenated per-surfel arrays for the VISIBLE surfels | None,
-    total sampled-surfel count, sealed-culled count)`. Opacity is forced to 1 unless
-    the material is genuinely BLEND/MASK."""
+    (`_object_spacing`). Returns `(per-surfel arrays for the VISIBLE surfels |
+    None, total sampled-surfel count, sealed-culled count)`. Opacity is forced
+    to 1 unless the material is genuinely BLEND/MASK."""
     if len(geom.faces) == 0 or geom.area <= 0:
         return None, 0, 0
-    if cand_keys is None:
-        cand_keys = _open_cand_keys(fs)
-    s_tex = _geom_texel_size(geom)
-    spacing = _object_spacing(geom, base, s_tex)
+    if seal is None:
+        seal = _seal_enabled(fs)
+    spacing = _object_spacing(geom, base)
     opaque = _alpha_mode(geom) not in _TRANSPARENT_ALPHA_MODES
-    bands = _spacing_bands(geom, spacing) if _FEATURE_REFINE else [(geom, spacing)]
-    parts: list[dict[str, np.ndarray]] = []
-    sampled = 0
-    sealed = 0
-    for band_mesh, band_spacing in bands:
-        band, n, ns = _sample_band(band_mesh, band_spacing, opaque, fs, cand_keys, s_tex)
-        sampled += n
-        sealed += ns
-        if band is not None:
-            parts.append(band)
-    if not parts:
-        return None, sampled, sealed
-    if len(parts) == 1:
-        return parts[0], sampled, sealed
-    return (
-        {k: np.concatenate([p[k] for p in parts], axis=0) for k in parts[0]},
-        sampled,
-        sealed,
-    )
+    return _sample_band(geom, spacing, opaque, fs, seal)
 
 
 def _encode_ply(
@@ -868,24 +638,24 @@ def _encode_ply(
 # the skin bitmask sidecar is memory-mapped, so every worker probing the same grid
 # shares ONE physical copy through the OS page cache.
 
-_TASK_FS: tuple[str, FreeSpace, np.ndarray] | None = None
+_TASK_FS: tuple[str, FreeSpace, bool] | None = None
 
 
 def _task_free_space(path: str) -> FreeSpace:
-    """Process-wide cached free-space grid (spawn workers load it once), with the
-    sealed-cull's open-candidate lattice keys derived alongside."""
+    """Process-wide cached free-space grid (spawn workers load it once), with
+    the sealed-cull enable gate derived alongside."""
     global _TASK_FS
     cached = _TASK_FS
     if cached is None or cached[0] != path:
         fs = load_free_space(Path(path))
-        cached = (path, fs, _open_cand_keys(fs))
+        cached = (path, fs, _seal_enabled(fs))
         _TASK_FS = cached
     return cached[1]
 
 
-def _task_cand_keys(path: str) -> np.ndarray:
-    """The cached open-candidate lattice keys for `path` (loads the grid if
-    this process hasn't yet)."""
+def _task_seal(path: str) -> bool:
+    """The cached sealed-cull enable gate for `path` (loads the grid if this
+    process hasn't yet)."""
     _task_free_space(path)
     assert _TASK_FS is not None
     return _TASK_FS[2]
@@ -900,13 +670,13 @@ def _sample_object_task(
     instead of raising."""
     try:
         fs = _task_free_space(freespace_path)
-        cand_keys = _task_cand_keys(freespace_path)
+        seal = _task_seal(freespace_path)
         parts: list[dict[str, np.ndarray]] = []
         area = 0.0
         sampled = 0
         sealed = 0
         for geom in load_geoms(Path(glb_path)):
-            part, n, ns = _sample_object(geom, base, fs, cand_keys)
+            part, n, ns = _sample_object(geom, base, fs, seal)
             sampled += n
             sealed += ns
             if part is None:
@@ -1033,7 +803,6 @@ def sample_cell(
     nrm_parts: list[np.ndarray] = []
     col_parts: list[np.ndarray] = []
     rad_parts: list[np.ndarray] = []
-    stex_parts: list[np.ndarray] = []
     warnings: list[str] = []
     objects_sampled = 0
     total_area = 0.0
@@ -1054,9 +823,6 @@ def sample_cell(
         nrm_parts.append(part["normal"])
         col_parts.append(part["color"])
         rad_parts.append(part["radius"])
-        stex_parts.append(
-            part.get("stex", np.full(len(part["position"]), np.nan, dtype=np.float32))
-        )
 
     if not pos_parts:
         if sampled > 0:
@@ -1067,16 +833,9 @@ def sample_cell(
     normals = np.concatenate(nrm_parts, axis=0)
     colors = np.concatenate(col_parts, axis=0)
     radii = np.concatenate(rad_parts, axis=0)
-    stex = np.concatenate(stex_parts, axis=0)
 
     t1 = time.perf_counter()
     _encode_ply(positions, normals, colors, radii, out_path, params.representation)
-    # Texel-size sidecar (row-aligned with the .ply): Stage 4's content-anchored
-    # ladder reads it; anything else ignores it.
-    stex_path = out_path.with_name(out_path.name + _STEX_SIDECAR_SUFFIX)
-    tmp_stex = stex_path.with_suffix(".tmp.npy")
-    np.save(tmp_stex, stex.astype("<f4"))
-    tmp_stex.replace(stex_path)
     encode_s = time.perf_counter() - t1
 
     aabb_min = positions.min(axis=0).tolist()
@@ -1097,11 +856,6 @@ def sample_cell(
         "timings": {"sample_s": round(sample_s, 2), "encode_s": round(encode_s, 2)},
         "params": params.as_summary(),
         "scene_aabb": {"min": aabb_min, "max": aabb_max},
-        "stex": {
-            "textured_pct": round(100.0 * float(np.isfinite(stex).mean()), 1),
-            "p50": round(float(np.nanmedian(stex)), 5) if np.isfinite(stex).any() else None,
-            "bytes": stex_path.stat().st_size,
-        },
         "warnings": warnings,
         "bytes": out_path.stat().st_size,
     }
