@@ -3019,9 +3019,9 @@ async function startModalTrain(restart = false, mode = "train") {
 
 const fmtInt = (n) => (n == null ? "?" : Number(n).toLocaleString());
 
-// Camera-plan readout (Stage 4's summary): the zone-driven single-shot field —
-// per-rig counts + gating stats, so we can tell at a glance the plan is
-// healthy. Shown only once cameras are planned.
+// Camera-plan readout (Stage 4's summary): the object-shell single-shot field —
+// per-rig counts + per-object coverage + cull stats, so we can tell at a
+// glance the plan is healthy. Shown only once cameras are planned.
 function renderCoverage() {
     const box = inputs && inputs._coverage;
     if (!box) return;
@@ -3030,32 +3030,39 @@ function renderCoverage() {
     const sum = s4.status === "done" ? s4.summary : null;
     if (!sum) return;
     const kinds = sum.kinds || {};
-    const zones = sum.zones || {};
+    const targets = sum.targets || {};
+    const culls = sum.culls || {};
+    const standoff = sum.standoff_m || {};
 
     box.appendChild(el("div", { class: "svc-title", text: "camera plan" }));
     const rows = [
         ["cameras (single shots)", fmtInt(sum.cameras), null],
         [
-            "fill · station · shell",
-            `${fmtInt(kinds.fill)} · ${fmtInt(kinds.station)} · ${fmtInt(kinds.shell)}`,
+            "ball · shell",
+            `${fmtInt(kinds.ball)} · ${fmtInt(kinds.shell)}`,
             null,
         ],
         [
-            "zones (atomic)",
-            `${fmtInt(zones.total)} (${fmtInt(zones.atomic)})`,
+            "objects framed / total",
+            `${fmtInt(targets.framed)} / ${fmtInt(targets.total)}`,
             null,
         ],
         [
-            "stations placed · gated",
-            `${fmtInt(zones.stations_placed)} · ${fmtInt(zones.stations_gated)}`,
-            null,
+            "starved objects",
+            fmtInt(targets.starved),
+            targets.starved ? "#d0a020" : null,
         ],
         [
-            "point-blank culled",
-            fmtInt(sum.culled_point_blank),
-            sum.culled_point_blank ? "#d0a020" : null,
+            "culled pos · blocked · air",
+            `${fmtInt(culls.position)} · ${fmtInt(culls.blocked)} · ${fmtInt(culls.air)}`,
+            null,
         ],
-        ["skin bricks", fmtInt(sum.skin_bricks), null],
+        ["deduped", fmtInt(culls.dedupe), null],
+        [
+            "standoff (m) min · med · max",
+            `${standoff.min ?? "?"} · ${standoff.median ?? "?"} · ${standoff.max ?? "?"}`,
+            null,
+        ],
     ];
     for (const [k, v, color] of rows) {
         const row = el("div");

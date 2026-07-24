@@ -34,13 +34,14 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
   * Depth: planar camera-space Z (metres), decoded from the SZF frame's log-uint16
     codes via the shared [near, far] (legacy 16-bit PNG / float32 `.npy` sets still
-    read as-is). The loss compares the reference against the splat's EXPECTED depth
-    (`depth_mode="expected"`, the ED channel) — the one per-pixel term that sees a
-    low-opacity floater stranded in front of an opaque surface (photometric L1 and
-    the alpha loss are both blind to it there). `depth_mode="median"` (the
-    transmittance-0.5 crossing) is cleaner at silhouettes and never fades BLEND
-    glass (α ≈ 0.065 stays below the crossing), but is blind to those floaters —
-    reserve it for genuinely glass-heavy scenes.
+    read as-is). The loss compares the reference against the splat's MEDIAN depth
+    (`depth_mode="median"` default, the transmittance-0.5 crossing) — it lands on
+    the nearest OPAQUE surface, exactly what the capture stores as depth GT (BLEND
+    glass doesn't write depth), so a transmissive pane at α ≈ 0.065 stays below the
+    crossing and is invisible to the depth loss instead of being razed as a
+    floater. `depth_mode="expected"` (the ED channel) additionally penalizes low-
+    opacity floaters in front of opaque surfaces, but treats real glass as one of
+    them — reserve it for runs with no glass and no geometric floater cull.
   * Colour: flat per-Gaussian sRGB — the SH degree-0 DC term ONLY — compared
     directly against the matte, view-independent references (no sRGB->linear).
     View-dependent colour (spherical harmonics degree > 0) is deliberately NOT
@@ -56,9 +57,10 @@ LOSSES (per view):
     energy;
   * alpha (mask) — L1(render α, reference α): the renderer's exact coverage
     masks make empty space stay empty and glass stay see-through;
-  * depth — alpha-gated L1 on the expected depth (the one term that suppresses
-    low-opacity floaters in front of opaque surfaces; `depth_mode` switches it to
-    median for glass scenes);
+  * depth — alpha-gated L1 on the median depth (the transmittance-0.5 crossing,
+    which lands on the nearest opaque surface and so leaves transmissive glass
+    untouched; `depth_mode="expected"` instead hunts front floaters at the cost of
+    razing glass — see TrainParams.depth_mode);
   * 2DGS regularizers — normal consistency (render normals vs normals-from-depth)
     and optional depth distortion.
 
@@ -207,17 +209,31 @@ class TrainParams:
     # Loss weights.
     ssim_lambda: float = 0.2           # photometric = (1-λ)·L1 + λ·(1-SSIM)
     alpha_lambda: float = 0.5          # L1(render α, reference α)
-    depth_lambda: float = 0.5          # alpha-gated depth L1 (metres)
+    depth_lambda: float = 0.5          # alpha-gated depth L1 (metres) — median vs the opaque plane
+    # "Record both" — the SECOND depth target, the glass-maker. The stored depth
+    # plane is the nearest OPAQUE surface, so `depth_lambda` (median) pins the wall
+    # but says nothing about a transmissive pane in front of it. This term
+    # supervises the splat's EXPECTED depth (the α-weighted mean) toward the true
+    # TWO-LAYER expected depth, derived at train time from the mesh-exact init
+    # cloud (whose glass surfels sit at α≈0.065 on the panes). Deleting a pane
+    # shifts the splat's expected depth back onto the wall — off this target — so
+    # it is a POSITIVE signal that *requires* the glass, while the median term
+    # keeps the wall pinned (the two together are well-posed: median forbids
+    # sliding the wall forward to fake the expected depth, so the only way to
+    # satisfy both is a wall at its true depth + a pane in front). Derived from the
+    # init cloud, so NO capture change / re-render is needed. 0 disables (default
+    # off until validated); only meaningful with the surfels init.
+    depth_expected_lambda: float = 0.0
     alpha_gate: float = 0.5            # reference α above this = opaque pixel (depth/normal masks)
     normal_lambda: float = 0.05        # 2DGS normal consistency
     dist_lambda: float = 0.0           # 2DGS depth distortion (off by default; over-flattens bounded scenes)
     normal_start_iter: int = 2000      # let geometry settle before the regularizers bite
     dist_start_iter: int = 1000
     # Depth-loss warm-up (view-draws, batch-scaled like the other cadences): the
-    # point-cloud init starts translucent (init_opa), so early EXPECTED depth
-    # blends through surfaces into whatever lies behind; let opacity saturate
-    # before the metric term bites. (The old opaque surfel init never needed
-    # this — its expected depth was true from step 0.)
+    # point-cloud init starts translucent (init_opa), so the early rendered depth
+    # (expected blends through surfaces; median sits behind them until transmittance
+    # crosses 0.5) is unreliable; let opacity saturate before the metric term bites.
+    # (The opaque surfel init never needs this — its depth is true from step 0.)
     depth_start_iter: int = 500
 
     # Learning rates (means_lr is × scene_scale at runtime).
@@ -381,16 +397,23 @@ class TrainParams:
     # cloud. Non-packed is also cheap at our per-cell Gaussian counts.)
     near_plane: float = 0.01
     far_plane: float = 1e10
-    # Depth statistic the depth loss (and normals-from-depth) compares. "expected"
-    # (default) = the alpha-weighted mean (ED): the ONLY per-pixel term that sees a
-    # low-opacity floater stranded in front of an opaque surface — L1 is camouflaged
-    # (the floater blends toward its backing's colour), the alpha loss is saturated
-    # (coverage behind it is already 1), and the median's transmittance-0.5 crossing
-    # sits on the surface BEHIND it, so only the expected depth is shifted by a front
-    # floater. "median" = the transmittance-0.5 crossing: cleaner at silhouettes and
-    # it never fades BLEND glass (α ≈ 0.065 stays below the crossing), but it's blind
-    # to those floaters — use it only for genuinely glass-heavy scenes.
-    depth_mode: str = "expected"
+    # Depth statistic the depth loss (and normals-from-depth) compares. "median"
+    # (default) = the transmittance-0.5 crossing: it sits on the nearest OPAQUE
+    # surface, which is exactly what the capture stores as depth GT (BLEND glass
+    # doesn't write depth), so a correctly-reproduced glass pane at α ≈ 0.065 stays
+    # below the crossing and contributes ZERO depth error — the pane is no longer
+    # seen as a floater to delete. It's also cleaner at silhouettes. "expected" =
+    # the alpha-weighted mean (ED): the one per-pixel term that sees a low-opacity
+    # floater stranded in front of an opaque surface (L1 is camouflaged, the alpha
+    # loss is saturated) — BUT it reads a real transmissive pane as that same
+    # floater and drags its opacity to zero (glass-over-wall gets a residual error
+    # even when perfectly reconstructed), which is why it razed the glass panes.
+    # This pipeline doesn't need expected's floater-hunting: Stage 7 culls airborne
+    # Gaussians GEOMETRICALLY against the exact Stage-3 surfels (surface_max_dist)
+    # plus a measured-contribution + opacity prune. Choose "expected" only for a
+    # run whose geometric post-cull is disabled and that has no transmissive
+    # surfaces to protect.
+    depth_mode: str = "median"
     seed: int = 0
     eval_max_views: int = 128          # cap final-metric renders (plans can have thousands of views)
     log_every: int = 50                # emit a progress line every N steps
@@ -497,6 +520,7 @@ class TrainParams:
             "ssim_lambda": self.ssim_lambda,
             "alpha_lambda": self.alpha_lambda,
             "depth_lambda": self.depth_lambda,
+            "depth_expected_lambda": self.depth_expected_lambda,
             "depth_start_iter": self.depth_start_iter,
             "depth_mode": self.depth_mode,
             "alpha_gate": self.alpha_gate,
@@ -1732,7 +1756,8 @@ def train_splat(
     n_frames = sum(1 for v in views if v["frame"] is not None)
     supervised = n_frames == n_views
     if not supervised:
-        params = replace(params, alpha_lambda=0.0, depth_lambda=0.0, depth_densify=False)
+        params = replace(params, alpha_lambda=0.0, depth_lambda=0.0,
+                         depth_expected_lambda=0.0, depth_densify=False)
     # ALWAYS announce the supervision mode: a silent RGB-only fallback (stale
     # export, moved folder breaking the relative pointer, torn frames) would
     # waste a whole run before anyone noticed the depth/alpha terms never fired.
@@ -1769,9 +1794,9 @@ def train_splat(
         init["opacities"] = np.minimum(
             init["opacities"], np.float32(np.log(p / (1.0 - p)))
         )
-        # An opaque surface init's EXPECTED depth is true from step 0 — the
-        # translucent-init warm-up would only delay the one loss that sees
-        # front floaters.
+        # An opaque surface init's rendered depth (expected or median) is true from
+        # step 0 — the translucent-init warm-up would only delay the metric depth
+        # term for no benefit.
         params = replace(params, depth_start_iter=0)
         if progress is not None:
             progress(
@@ -2271,6 +2296,7 @@ def _supervision_loss(  # noqa: ANN001
     torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
     pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
     normals_active, dist_active, depth_active=True,
+    pred_expected=None, ed_target=None, ed_gate=None,
 ):
     """Combined per-view supervision loss — photometric L1 + D-SSIM, alpha
     (coverage), alpha-gated depth L1, 2DGS normal consistency, and optional depth
@@ -2302,6 +2328,24 @@ def _supervision_loss(  # noqa: ANN001
         if gate.any():
             dl = ((pred_depth - gt_depth).abs() * gate).sum() / (gate.sum() + 1e-8)
             loss = loss + params.depth_lambda * dl
+
+    # "Record both" glass-maker: the splat's EXPECTED depth vs the frozen cloud's
+    # two-layer expected depth, over opaque-covered pixels where the cloud target
+    # is valid. Deleting a pane pulls expected depth back onto the wall (off
+    # target), so this requires the transmissive layer; the median term above keeps
+    # the wall pinned so the pair can't be faked by sliding the wall forward.
+    if (
+        ed_target is not None and pred_expected is not None and gt_depth is not None
+        and params.depth_expected_lambda > 0.0 and depth_active
+    ):
+        eg = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
+        if ed_gate is not None:
+            eg = eg & ed_gate
+        if mask is not None:
+            eg = eg & (mask > 0)
+        if eg.any():
+            el = ((pred_expected - ed_target).abs() * eg).sum() / (eg.sum() + 1e-8)
+            loss = loss + params.depth_expected_lambda * el
 
     if params.normal_lambda > 0.0 and normals_active:
         nerr = 1.0 - (normals * normals_from_depth).sum(dim=-1)
@@ -2617,6 +2661,18 @@ def _train_one(  # noqa: ANN001
         xs = torch.arange(width, dtype=torch.float32, device=device) + 0.5
         py_grid, px_grid = torch.meshgrid(ys, xs, indexing="ij")
 
+    # "Record both" reference: a FROZEN copy of the init cloud, whose EXPECTED
+    # depth is the true two-layer α-weighted depth (it sits on the glass panes at
+    # α≈0.065). Rendered per batch (no grad) as the target for the expected-depth
+    # term — see TrainParams.depth_expected_lambda. Built only when the term is on.
+    ref_splats = ref_colors = None
+    if params.depth_expected_lambda > 0.0:
+        ref_splats = {
+            k: torch.from_numpy(np.ascontiguousarray(init[k])).to(device)
+            for k in ("means", "scales", "quats", "opacities", "sh0")
+        }
+        ref_colors, _ = _render_inputs(torch, ref_splats)
+
     for step in range(start_step, params.iterations):
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
 
@@ -2633,13 +2689,27 @@ def _train_one(  # noqa: ANN001
         )
         pred_rgb = renders[..., :3]
         pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
+        # Expected-depth channel (ED) + the frozen-cloud target for the glass-maker
+        # term. The cloud's own rendered alpha gates out its sampling holes, where
+        # its expected depth would be ill-defined.
+        pred_expected = renders[..., 3:4]
+        ed_target = ed_gate = None
+        if ref_splats is not None and gt_depth is not None:
+            with torch.no_grad():
+                r_ren, r_alpha, *_ = _render_batch(
+                    torch, rasterization_2dgs, ref_splats, ref_colors, 0,
+                    viewmats, K, width, height, params, False,
+                )
+            ed_target = r_ren[..., 3:4]
+            ed_gate = r_alpha > 0.5
 
         if params.refine:
             strategy.step_pre_backward(splats, optimizers, strat_state, step, info)
 
-        # Photometric L1 + D-SSIM, alpha, alpha-gated depth, normal consistency,
-        # and optional distortion — the shared supervision loss. Under a tile mask
-        # every term is restricted to pixels this tile OWNS (its surface + true
+        # Photometric L1 + D-SSIM, alpha, alpha-gated depth (median vs the opaque
+        # plane + expected vs the two-layer cloud target), normal consistency, and
+        # optional distortion — the shared supervision loss. Under a tile mask every
+        # term is restricted to pixels this tile OWNS (its surface + true
         # background), so boundary Gaussians never chase content a neighbour owns.
         loss = _supervision_loss(
             torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
@@ -2647,6 +2717,7 @@ def _train_one(  # noqa: ANN001
             normals_active=step >= params.normal_start_iter,
             dist_active=dist_on and step >= params.dist_start_iter,
             depth_active=step >= params.depth_start_iter,
+            pred_expected=pred_expected, ed_target=ed_target, ed_gate=ed_gate,
         )
 
         loss.backward()

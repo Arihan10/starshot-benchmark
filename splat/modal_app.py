@@ -426,7 +426,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     # (stage 7 = heal + quantize folds its own source hash inline — both stage6.py
     # and quantize.py — so no standalone code7 here.)
 
-    # ---- stage 4: camera plan (zone-driven single-shot field; CPU) --------------
+    # ---- stage 4: camera plan (object-shell single-shot field; CPU) -------------
     plan_params = PlanParams(**(spec.get("plan") or {}))
     sig4 = _sig({"in": [in_sha["freespace"], in_sha["skin"], in_sha["scene"]],
                  "params": plan_params.as_summary(), "code": code4})
