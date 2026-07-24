@@ -34,7 +34,7 @@ def main() -> None:
     )
     print(
         f"cameras: {summary['cameras']}  images: {summary['images']}  "
-        f"points: {summary['points']}\n-> {summary['dir']}"
+        f"points: {summary['points']}  szf-sidecar: {summary['sidecar']}\n-> {summary['dir']}"
     )
 
 

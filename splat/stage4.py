@@ -1,121 +1,145 @@
-"""Stage 4 — Camera planner (zone-driven dense field; no coverage optimization).
+"""Stage 4 — Camera planner (tight per-object shells + detail rings + root shell).
 
 Plans the single-shot reference cameras Stage 5 renders and the splat trainer
-consumes. The design replicates the Atlux capture workflow (dense, fixed-count,
-heavily-overlapping DSLR shots) with the human artist replaced by the scene's
-own construction record: THE ZONE TREE PROPOSES, THE GEOMETRY DISPOSES.
+consumes. WE OWN THE GEOMETRY, so the plan is built object-by-object from the
+scene's own construction record instead of scattering undirected views:
 
-  * ZONES PROPOSE. The divider's zone tree (Stage-1 `scene.json`, enriched
-    with per-zone `is_atomic`) says where content lives and how it nests:
-      - every zone contributes a HALTON FILL of its bbox — positions spread
-        low-discrepancy through the zone's air, camera count proportional to
-        the VISIBLE SURFACE (skin bricks) inside its bbox, so budget follows
-        content, not empty volume;
-      - every ATOMIC zone (a leaf place populated with objects) additionally
-        gets outward-facing FIBONACCI STATIONS — the panorama rig an artist
-        would drop in each room — at its highest-clearance interior points,
-        gated by ENCLOSURE (a zone that doesn't wrap the camera, e.g. a small
-        open field, takes no station: its content is convex and the inward
-        fill already covers it), with station count growing with zone extent;
-      - the ROOT gets an inward-facing Fibonacci SHELL outside the scene —
-        the establishing/orbit layer. Interior scenes occlude most of it into
-        harmless exterior views of the building shell; open scenes get the
-        far standpoints a zoomed-out viewer renders from.
-  * GEOMETRY DISPOSES. Every proposal passes the same scene-agnostic filters
-    against the Stage-2 grid: position in reachable EMPTY air, standoff from
-    cover (probe shells), near-surface band (no cameras floating in dead air
-    far from all content), and a global lattice dedupe so overlapping zone
-    bboxes (they are NOT a partition) can't double-spend. Directions come
-    from a global low-discrepancy sphere sequence — a smooth, non-directed
-    field (content-aimed cameras were deliberately rejected: they starve the
-    connective tissue and shatter view overlap) — with a POINT-BLANK CULL
-    that re-aims or drops frames staring into nearby cover.
+  * BALLS, TIGHT AGAINST THE SHAPE. Every placed mesh (props AND architecture
+    — geometry decides, not node kind) gets cameras by SURFACE DARTS: pick one
+    of the object's own cover bricks (the ~8-voxel cubes of the Stage-2 grid
+    its surface actually occupies, ∝ area), pick a direction, step out the
+    standoff, aim back at the brick. The sampling domain is therefore the
+    offset surface of the REAL shape, not of its bounding box: a tree gets
+    cameras under its canopy aiming up and rings around its trunk, a tub gets
+    in-bowl views, an L-shaped sofa never wastes draws on its AABB's empty
+    corner. Per-object bricks are attributed by AABB overlap against the
+    global cover-brick set (no mesh loading; exact per-object attribution via
+    a Stage-2 sidecar is the upgrade path if overlapping-AABB smear ever
+    measures as a problem).
+  * SCALE-MATCHED STANDOFF, WITH DESCENT. The base standoff frames the whole
+    object (`standoff_frac`·diag, floored by `standoff_min`, ceilinged only by
+    the scene-diagonal cap). When the free space cannot FIT that distance — an
+    interior wall cannot be photographed from 5.7 m inside a 7 m room — the
+    planner DESCENDS a fixed ladder (1, ½, ¼ ×, floored near the grid scale)
+    and accepts the first rung where enough of the inner ring survives,
+    re-deriving the count at the accepted distance (closer frames cover less
+    surface each — the 1/d² growth is the physics, bounded by the ladder's
+    fixed depth). A SALVAGE re-walk with escalated draws runs before any
+    target is declared starved; what still fails is genuinely buried.
+  * DETAIL RING (geometry density earns close-ups). Whole-object framing
+    resolves an object's TEXTURE at ~1 px/texel regardless of size, but not
+    sub-texel GEOMETRY — leaves, rock relief, gratings. Each object's feature
+    scale is estimated from facts we already have (ℓ ≈ √(voxel surface area /
+    mesh faces)); when ℓ needs a camera meaningfully closer than the base
+    ring to span `detail_px` pixels, the object earns an extra dart ring at
+    that distance, count derived by the same coverage formula there. A
+    500k-face cypress pays for leaf-scale views; the 2-triangle backdrop and
+    water planes never do — this is the principled replacement for the old
+    fixed 1.6 m section cap (which over-covered flats and was in turn capped
+    by `ball_max`, both now gone).
+  * RING LADDER (the band-limit). One close shell alone trains a splat that
+    shimmers from farther away (sub-pixel splats alias; the delivered viewer
+    has no mip filter). Each object also gets its shell at `ring_mults` × the
+    accepted standoff with `ring_frac` of its budget, so the optimizer is
+    graded at multiple scales.
+  * SHELL — the root establishing orbit outside the scene AABB (unchanged):
+    the far octave the ladders top out at, and the only supervision of
+    whole-scene framings.
 
-There is deliberately NO greedy set-cover, NO per-surface demand accounting,
-NO cube faces, and NO CUDA: redundancy is the coverage guarantee (that is
-what makes the Atlux recipe work), each camera is ONE pinhole shot, and every
-count is a fixed feed-forward function of the scene. Offline coverage
-verification lives in scenebench, not here.
+GEOMETRY STILL DISPOSES. Every candidate passes scene-agnostic filters
+against the Stage-2 grid: POSITION (outside the grid is provably open air;
+inside must be reachable EMPTY air with standoff-scaled clearance), BLOCKED
+(first OPAQUE hit well before the aimed brick = another object owns the frame
+centre; dropped, never re-aimed; glass doesn't block, so framing through
+panes works), PRESENT (some cover — opaque or glass — must lie near the aim
+distance: no air shots), and a global lattice × aim-octant DEDUPE that
+collapses clustered objects' overlapping shells while never stripping a
+target's last camera.
+
+Counts are DERIVED, never capped per object: views = `coverage` × the shell's
+surface area (measured from the object's own cover bricks) ÷ the area one
+frame covers at the standoff ((2·tan(fov/2)·d)²) — dimensionless and
+self-normalizing. `ball_min` floors the per-object guarantee;
+`min_ball_views`/`max_ball_views` bound the SCENE total by proportional
+rescale (a budget guard, not a modeling statement). Deterministic (Halton +
+seeded cursors, no RNG state), pure CPU (numpy only), independent of the
+surfel cloud.
 
 Consumes `freespace.npz` (Stage 2) + `scene.json` (Stage 1). Emits
-`cameras.json` (plan_version 2): shared pinhole `intrinsics` + a flat
-`cameras` list, each `{pos, forward, up, kind: fill|station|shell, zone}`.
-Stage 5 renders one image per entry; poses convert via `opencv_c2w`.
+`cameras.json` (plan_version 3): shared pinhole `intrinsics` + a flat
+`cameras` list, each `{pos, forward, up, kind: ball|shell, zone}`. Stage 5
+renders one image per entry (it accepts plan_version ≥ 2); poses convert via
+`opencv_c2w`.
 """
 
 from __future__ import annotations
 
 import json
-import logging
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import ceil
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from scipy.spatial import cKDTree
 
 from splat.stage2 import FreeSpace, load_free_space
 
-logging.getLogger("trimesh").setLevel(logging.ERROR)
-
 CAMERAS_NAME = "cameras.json"
-PLAN_VERSION = 2
+PLAN_VERSION = 3
 
-# Brick edge of the Stage-2 skin/zone tiers, in fine voxels (stage2._BRICK).
+# Fine voxels per brick edge (matches stage2._BRICK).
 _BRICK = 8
 
-# Fill-camera standoff probes: a position is valid when `occupied` is clear at
-# the point and on two probe shells (26 directions × {r/2, r}) — a cheap,
-# grid-native "at least ~r from any surface" test.
+# Position-validity probes: a position is clear when `occupied` is empty at the
+# point and on three probe shells (26 directions × {r/3, 2r/3, r}) — a cheap,
+# grid-native "at least ~r from any surface" test (three shells so a thin slab
+# can't slip between consecutive radii).
 _CLEAR_DIRS = np.array(
     [o for o in np.ndindex(3, 3, 3) if o != (1, 1, 1)], dtype=np.float64
 ) - 1.0
 _CLEAR_DIRS /= np.linalg.norm(_CLEAR_DIRS, axis=1, keepdims=True)
 
-# Point-blank cull: a frame whose central ray hits opaque cover closer than
-# this is a wall close-up; the planner re-aims it (antipodal, then two
-# orthogonal directions) and drops the camera if nothing survives.
-_MIN_VIEW_M = 0.35
-# Ray-march step, × pitch (1.0 = every voxel; cover is gap-free by build).
-_MARCH_STEP = 1.0
+# Clearance radius rides the ring standoff (`clear = _CLEAR_FRAC × d`) between
+# hard bounds: a 35 cm close-up may stand 6 cm off a shelf, a 4 m room view
+# keeps real clearance. (The near plane is ~1.5 cm — 6 cm never clips.)
+_CLEAR_FRAC = 0.2
+_CLEAR_MIN = 0.06
+_CLEAR_MAX = 0.25
 
-# Station (outward Fibonacci ball) shape: directions per station, and the
-# enclosure gate — the fraction of UPPER-HEMISPHERE probe rays that must hit
-# cover within 1.2 × the zone diagonal for the zone to count as "wrapping the
-# camera". Upper hemisphere only: near any standpoint the ground itself wraps
-# the bottom half of the sphere, so a full-sphere fan scores ≥ 0.5 in an open
-# field and the gate would never fire — walls and ceilings are what make a
-# place concave, and they live above the horizon.
-_STATION_DIRS_DEFAULT = 48
-_ENCLOSURE_DIRS = 64
-_ENCLOSURE_MIN = 0.35
-_ENCLOSURE_MIN_Y = -0.05  # keep a thin below-horizon band (distant walls)
-# Enclosure is a LOCAL property: a wall must sit within panorama range to
-# wrap a standpoint. Without the cap, huge open zones (a 250 m desert) count
-# horizon terrain as "walls" and every dune field earns a panorama.
-_ENCLOSURE_REACH_MAX = 25.0
-# One station per this much zone extent (max axis, metres), capped.
-_STATION_EVERY_M = 8.0
-_STATION_MAX = 4
-# Stations must be able to stand somewhere at least this clear.
-_STATION_MIN_CLEAR = 0.45
+# Candidate oversampling per ring: validity rejection (walls, clutter, self-
+# occlusion) eats a large share of raw draws; the surviving PREFIX of a Halton
+# sequence is itself low-discrepancy, so we keep the first `n` valid.
+_OVERSAMPLE = 4
+# The DESCENT ladder (module docstring): base-standoff multipliers tried in
+# order until enough of the inner ring survives. A rung is accepted when the
+# inner ring keeps ≥ `_ACCEPT_FRAC` of its derived count (the last rung
+# accepts anything it finds).
+_DESCENT_MULTS = (1.0, 0.5, 0.25)
+_DESCENT_DRAW_FLOOR = (48, 48, 64)
+_MIN_STANDOFF = 0.12
+_ACCEPT_FRAC = 0.6
+# SALVAGE: a target that failed the whole ladder re-walks it once with this
+# many draws per rung before being declared starved. Only zero-view targets
+# pay for it, and it reliably finds pockets down to ~1–2% of a shell (a
+# wine-fridge bottle visible through a slit); anything it still misses is
+# genuinely invisible in practice.
+_SALVAGE_DRAWS = 160
 
-# Shell (root establishing orbit): positions are Fibonacci directions
-# projected onto the scene AABB inflated by a PER-AXIS standoff — the shell
-# adapts to the scene's shape (a flat platformer gets broad-side coverage at
-# a sane distance instead of a sphere at its 110 m diagonal). The standoff
-# is 0.6× the axis's own half-extent, floored by BOTH an absolute minimum
-# (must exceed the Stage-2 grid margin, 1.5 m default, so every position is
-# provably outside the grid — open air, no filters needed) and a fraction of
-# the LARGEST half-extent: a thin axis still needs establishing range — a
-# camera 3 m off a 110 m level's broad face frames a ~4% sliver and the
-# level-scale supervision the shell exists for disappears (measured: the
-# platformer's unseen jumped 0.85%→5.7% without this floor).
-# `_SHELL_RADIUS_MULT` survives only in the far-plane bound. Below-floor
-# positions are culled (no under-terrain backface views).
+# Aim-window fuzz around the expected hit distance: the aimed brick centre is
+# within half a brick diagonal of real surface, plus voxel-march quantization.
+# BLOCKED = opaque cover strictly before the window; PRESENT = any cover
+# inside it.
+def _aim_pad(fs: FreeSpace) -> float:
+    return float(0.5 * np.sqrt(3.0) * _BRICK * fs.pitch + 3.0 * fs.pitch)
+
+# Ring standoffs are capped at this fraction of the scene diagonal — beyond it
+# a "ring" is just a worse establishing shell, and the root shell owns that.
+_RING_SCENE_CAP = 0.5
+
+# Shell (root establishing orbit) — unchanged construction: Fibonacci
+# directions projected onto the scene AABB inflated by a per-axis standoff,
+# aims Halton-jittered over the scene middle, below-floor culled.
 _SHELL_STANDOFF_FRAC = 0.6
 _SHELL_STANDOFF_MAXAXIS_FRAC = 0.3
 _SHELL_STANDOFF_MIN = 3.0
@@ -127,48 +151,54 @@ ProgressCb = Callable[[int, int, str], None]
 
 @dataclass(frozen=True)
 class PlanParams:
-    """Stage-4 knobs — every count is feed-forward from these.
+    """Stage-4 knobs — every count is DERIVED from these (module docstring).
 
-    `fill_per_skin_brick` is THE density dial: fill cameras per Stage-2 skin
-    brick (a 24 cm cube touching visible surface), i.e. cameras per unit of
-    visible content. ~0.05 lands a hotel room around 500 fill views. Scene-
-    size independent and content-proportional by construction. `min_fill` /
-    `max_fill` clamp the total (the cost dial); allocation across zones stays
-    proportional to each zone's skin share."""
+    `coverage` is THE density dial, dimensionless: a target's views =
+    coverage × its shell area ÷ one frame's footprint at the chosen standoff
+    — self-normalizing across object sizes, so there is no per-object cap.
+    `detail_px` sets how many pixels an object's typical geometric feature
+    should span in its DETAIL ring (smaller = closer detail cameras; the
+    ring only exists where geometry is finer than the base ring resolves).
+    `ball_min` floors the per-object guarantee; `min_ball_views` /
+    `max_ball_views` bound the SCENE total by proportional rescale (floor 2 —
+    the guarantee survives the clamp). `ring_mults`/`ring_frac` are the
+    multi-scale ring ladder — the train-time band-limit."""
 
-    fill_per_skin_brick: float = 0.05
-    min_fill: int = 96
-    # Benchmarked across the taxonomy: 1600 binds on every scene ≥ ~30 m and
-    # measurably starves coverage (shooter seen≥3 77→82%, desert 79→86% at
-    # 4000). 4000 leaves room-scale scenes untouched (they want ~500) and
-    # keeps the largest plans at a few minutes of render time.
-    max_fill: int = 4000
-    # Fill positions must sit in air at least this clear of any surface …
-    clear_m: float = 0.25
-    # … and within this distance of SOME visible surface (kills dead-air
-    # cameras floating high above open scenes; generous enough to keep
-    # room-center views everywhere indoors).
-    near_surface_m: float = 4.0
-    # Global dedupe lattice for fill positions (≈ the old candidate spacing).
-    fill_spacing: float = 0.45
-    # Station / shell counts.
-    station_dirs: int = _STATION_DIRS_DEFAULT
+    coverage: float = 0.45
+    detail_px: float = 6.0
+    ball_min: int = 6
+    min_ball_views: int = 96
+    max_ball_views: int = 2000
+    # Base standoff: frame the object (`frac` × diag), floored so tiny props
+    # aren't macro-photographed past their texture information. No upper
+    # bound beyond the scene cap — when the space can't fit the distance the
+    # DESCENT ladder finds the one it can (constants block).
+    standoff_frac: float = 0.71
+    standoff_min: float = 0.35
+    # The multi-scale ring ladder (see class docstring).
+    ring_mults: tuple[float, ...] = (1.0, 2.5, 6.25)
+    ring_frac: tuple[float, ...] = (0.6, 0.25, 0.15)
+    # Global dedupe lattice (cell edge, metres) × forward octant.
+    dedupe_spacing: float = 0.4
+    # Root establishing orbit.
     shell_views: int = 128
-    # Shared pinhole intrinsics: one FOV for every camera (DSLR-like, better
-    # pixel utilization than the old 90° cube faces), square frames.
+    # Shared pinhole intrinsics (one FOV for every camera, square frames).
     fov_deg: float = 70.0
     render_resolution: int = 1024
     seed: int = 0
 
     def as_summary(self) -> dict[str, Any]:
         return {
-            "fill_per_skin_brick": self.fill_per_skin_brick,
-            "min_fill": self.min_fill,
-            "max_fill": self.max_fill,
-            "clear_m": self.clear_m,
-            "near_surface_m": self.near_surface_m,
-            "fill_spacing": self.fill_spacing,
-            "station_dirs": self.station_dirs,
+            "coverage": self.coverage,
+            "detail_px": self.detail_px,
+            "ball_min": self.ball_min,
+            "min_ball_views": self.min_ball_views,
+            "max_ball_views": self.max_ball_views,
+            "standoff_frac": self.standoff_frac,
+            "standoff_min": self.standoff_min,
+            "ring_mults": list(self.ring_mults),
+            "ring_frac": list(self.ring_frac),
+            "dedupe_spacing": self.dedupe_spacing,
             "shell_views": self.shell_views,
             "fov_deg": self.fov_deg,
             "render_resolution": self.render_resolution,
@@ -216,9 +246,7 @@ def _fib_sphere(n: int) -> np.ndarray:
 
 def _clear_at(fs: FreeSpace, pts: np.ndarray, r: float) -> np.ndarray:
     """True per point when it sits in reachable EMPTY air with no surface
-    (opaque OR glass) within ~`r`: the centre cell must be EMPTY and three
-    probe shells (26 dirs × {r/3, 2r/3, r}) must be unoccupied — three shells
-    so a thin slab (a 10 cm ceiling) can't slip between consecutive radii."""
+    (opaque OR glass) within ~`r` (constants block)."""
     ok = fs.empty_at(pts)
     for rad in (r / 3.0, 2.0 * r / 3.0, r):
         for k in range(0, len(_CLEAR_DIRS), 13):  # chunk: 13 dirs × N points
@@ -232,56 +260,60 @@ def _clear_at(fs: FreeSpace, pts: np.ndarray, r: float) -> np.ndarray:
     return ok
 
 
-def _first_hit(
-    fs: FreeSpace, origins: np.ndarray, dirs: np.ndarray, t_max: float
-) -> np.ndarray:
-    """Distance to the first OPAQUE cover cell along each ray (∞ = clear to
-    `t_max`). Voxel-stepped march over the sparse occlusion set; only samples
-    inside the grid can hit (outside the grid is provably open air)."""
+def _ray_probe(
+    fs: FreeSpace, origins: np.ndarray, dirs: np.ndarray, t_max: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per ray: (first OPAQUE hit, first ANY-cover hit) distances along `dirs`
+    (∞ = none within that ray's `t_max`). One voxel-stepped march answers both
+    culls — BLOCKED reads the opaque set (glass doesn't block sight), PRESENT
+    reads the full cover set (a window pane counts as its object)."""
     n = len(origins)
-    out = np.full(n, np.inf, dtype=np.float64)
+    opaque = np.full(n, np.inf, dtype=np.float64)
+    any_hit = np.full(n, np.inf, dtype=np.float64)
     if n == 0:
-        return out
-    step = fs.pitch * _MARCH_STEP
-    n_steps = max(1, int(ceil(t_max / step)))
-    alive = np.arange(n)
-    # Chunk the step axis so the transient point buffer stays bounded.
+        return opaque, any_hit
+    step = fs.pitch
     t = step
-    for _ in range(n_steps):
-        if not len(alive):
-            break
+    t_top = float(t_max.max())
+    alive = np.nonzero(t_max >= t)[0]
+    while len(alive) and t <= t_top + 1e-9:
         pts = origins[alive] + dirs[alive] * t
-        hit = fs.occluding(pts)
-        if hit.any():
-            out[alive[hit]] = t
-            alive = alive[~hit]
+        occ = fs.occupied(pts)
+        if occ.any():
+            hit = alive[occ]
+            first = ~np.isfinite(any_hit[hit])
+            any_hit[hit[first]] = t
+            opq = fs.occluding(pts[occ])
+            if opq.any():
+                # A ray is answered once its opaque hit lands (its any-cover
+                # hit is then ≤ it); glass-only hits march on for the opaque.
+                opaque[hit[opq]] = t
+                dead = np.zeros(n, dtype=bool)
+                dead[hit[opq]] = True
+                alive = alive[~dead[alive]]
         t += step
-    return out
+        alive = alive[t_max[alive] >= t]
+    return opaque, any_hit
 
 
-def _skin_centers(fs: FreeSpace) -> np.ndarray:
-    """(S,3) world centres of the Stage-2 skin bricks — the 24 cm cubes that
-    touch visible surface. The planner's proxy for WHERE CONTENT IS: fill
-    budget allocation, the near-surface band, and station scoring all read it."""
-    bd = fs.bdims
-    lin = fs.skin_lin
-    bx = lin // (bd[1] * bd[2])
-    by = (lin // bd[2]) % bd[1]
-    bz = lin % bd[2]
-    cells = np.stack([bx, by, bz], axis=1).astype(np.float64) * _BRICK + _BRICK / 2.0
-    return fs.origin + cells * fs.pitch
-
-
-def _thin_lattice(points: np.ndarray, spacing: float) -> np.ndarray:
-    """Indices of one winner per `spacing` lattice cell (nearest cell centre) —
-    the global dedupe that keeps overlapping zone fills from double-spending."""
+def _thin_lattice_aim(
+    points: np.ndarray, dirs: np.ndarray, spacing: float
+) -> np.ndarray:
+    """Indices of one winner (nearest cell centre) per (`spacing` lattice cell
+    × forward OCTANT) — the global dedupe that collapses overlapping object
+    shells into shared frames while keeping genuinely different aims."""
     if len(points) == 0:
         return np.zeros(0, dtype=np.int64)
     cell = np.floor(points / spacing).astype(np.int64)
     loc = cell - cell.min(axis=0)
     ny = int(loc[:, 1].max()) + 1
     nz = int(loc[:, 2].max()) + 1
-    gid = (loc[:, 0] * ny + loc[:, 1]) * nz + loc[:, 2]
+    octant = (
+        (dirs[:, 0] > 0).astype(np.int64) * 4
+        + (dirs[:, 1] > 0).astype(np.int64) * 2
+        + (dirs[:, 2] > 0).astype(np.int64)
+    )
+    gid = (((loc[:, 0] * ny + loc[:, 1]) * nz) + loc[:, 2]) * 8 + octant
     center = (cell.astype(np.float64) + 0.5) * spacing
     d2 = ((points - center) ** 2).sum(axis=1)
     order = np.lexsort((d2, gid))
@@ -291,241 +323,332 @@ def _thin_lattice(points: np.ndarray, spacing: float) -> np.ndarray:
     return order[first]
 
 
-# --- the zone tree ----------------------------------------------------------------
+# --- the targets (placed meshes) ---------------------------------------------------
 
 
 @dataclass(frozen=True)
-class Zone:
+class Target:
     id: str
-    bbox_min: np.ndarray
-    bbox_max: np.ndarray
-    is_atomic: bool
+    lo: np.ndarray
+    hi: np.ndarray
+    zone: str | None
+    faces: int
 
     @property
     def diag(self) -> float:
-        return float(np.linalg.norm(self.bbox_max - self.bbox_min))
-
-    @property
-    def max_extent(self) -> float:
-        return float((self.bbox_max - self.bbox_min).max())
+        return float(np.linalg.norm(self.hi - self.lo))
 
 
-def _read_zones(scene_path: Path) -> tuple[list[Zone], np.ndarray, np.ndarray]:
-    """Zones (with atomicity) + the scene AABB from a Stage-1 manifest.
-    `is_atomic` falls back to "has no child zones" for pre-enrichment
-    manifests. A scene with no zone nodes degrades to one atomic root zone
-    over the scene AABB — the planner never NEEDS the tree, it only spends
-    better with it."""
+def _read_targets(scene_path: Path) -> tuple[list[Target], np.ndarray, np.ndarray]:
+    """Ball targets + the scene AABB from a Stage-1 manifest. Targets are the
+    PLACED meshes (`objects[]` — ground-truth world AABBs + mesh face counts,
+    the geometry-density signal), each attributed to its owning zone via
+    `nodes[]`. Degenerate AABBs (< 2 cm diagonal) are skipped. A manifest
+    with no placed objects degrades to ONE target over the scene AABB."""
     doc = json.loads(Path(scene_path).read_text(encoding="utf-8"))
     aabb = doc.get("scene_aabb") or {}
     lo = np.asarray(aabb.get("min"), dtype=np.float64)
     hi = np.asarray(aabb.get("max"), dtype=np.float64)
-    nodes = doc.get("nodes") or []
-    zone_nodes = [n for n in nodes if n.get("kind") == "zone" and n.get("bbox_min")]
-    zone_ids = {n["id"] for n in zone_nodes}
-    has_child_zone = {
-        p for n in zone_nodes if (p := n.get("parent_id")) in zone_ids
-    }
-    zones: list[Zone] = []
-    for n in zone_nodes:
-        atomic = n.get("is_atomic")
-        if atomic is None:
-            atomic = n["id"] not in has_child_zone
-        zones.append(
-            Zone(
-                id=n["id"],
-                bbox_min=np.asarray(n["bbox_min"], dtype=np.float64),
-                bbox_max=np.asarray(n["bbox_max"], dtype=np.float64),
-                is_atomic=bool(atomic),
+    zone_of = {n["id"]: n.get("zone") for n in doc.get("nodes") or []}
+    targets: list[Target] = []
+    for obj in doc.get("objects") or []:
+        t_lo = np.asarray(obj["aabb_min"], dtype=np.float64)
+        t_hi = np.asarray(obj["aabb_max"], dtype=np.float64)
+        if float(np.linalg.norm(t_hi - t_lo)) < 0.02:
+            continue
+        targets.append(
+            Target(
+                id=obj["id"], lo=t_lo, hi=t_hi,
+                zone=zone_of.get(obj["id"]), faces=int(obj.get("faces") or 0),
             )
         )
-    if not zones:
-        zones = [Zone(id="root", bbox_min=lo, bbox_max=hi, is_atomic=True)]
-    return zones, lo, hi
+    if not targets:
+        targets = [Target(id="scene", lo=lo, hi=hi, zone=None, faces=0)]
+    return targets, lo, hi
 
 
-# --- rig synthesis ----------------------------------------------------------------
+# --- the tight shells: cover bricks + surface darts --------------------------------
 
 
-def _fill_positions(
-    fs: FreeSpace,
-    zones: list[Zone],
-    skin: np.ndarray,
-    skin_tree: cKDTree,
-    params: PlanParams,
-) -> tuple[np.ndarray, list[str]]:
-    """The Halton fill: per-zone low-discrepancy positions, count ∝ the zone's
-    skin share, filtered to clear reachable air within the near-surface band,
-    then globally lattice-deduped. Returns (positions, owning zone ids)."""
-    # Zone weights: skin bricks inside each zone's bbox (overlaps double-count
-    # here, but the TOTAL is normalized and the dedupe removes double-spend).
-    weights = np.zeros(len(zones), dtype=np.float64)
-    for zi, z in enumerate(zones):
-        inside = np.all((skin >= z.bbox_min) & (skin <= z.bbox_max), axis=1)
-        weights[zi] = float(inside.sum())
-    total_w = float(weights.sum())
-    n_total = int(
-        np.clip(
-            params.fill_per_skin_brick * len(skin), params.min_fill, params.max_fill
-        )
-    )
-    if total_w <= 0:
-        weights[:] = 1.0
-        total_w = float(len(zones))
-
-    pos_parts: list[np.ndarray] = []
-    zone_parts: list[str] = []
-    halton_cursor = params.seed * 7919  # disjoint deterministic runs per seed
-    for zi, z in enumerate(zones):
-        share = weights[zi] / total_w
-        n_zone = int(round(n_total * share))
-        if n_zone <= 0:
-            continue
-        size = np.maximum(z.bbox_max - z.bbox_min, 1e-6)
-        # Oversample: validity rejection (walls, furniture, dead air) plus the
-        # global dedupe eat a large fraction of raw Halton draws.
-        n_draw = max(n_zone * 6, 64)
-        u = _halton3(n_draw, start=halton_cursor)
-        halton_cursor += n_draw
-        pts = z.bbox_min + u * size
-        ok = _clear_at(fs, pts, params.clear_m)
-        if not ok.any():
-            continue
-        pts = pts[ok]
-        near = skin_tree.query(pts, k=1)[0] <= params.near_surface_m
-        pts = pts[near]
-        if not len(pts):
-            continue
-        # Per-zone thin toward its own budget before the global dedupe, so one
-        # huge sloppy bbox can't flood the lattice before small zones draw.
-        if len(pts) > n_zone:
-            stride = np.linspace(0, len(pts) - 1, n_zone).astype(np.int64)
-            pts = pts[np.unique(stride)]
-        pos_parts.append(pts)
-        zone_parts.extend([z.id] * len(pts))
-    if not pos_parts:
-        return np.zeros((0, 3), dtype=np.float64), []
-    pos = np.concatenate(pos_parts, axis=0)
-    zone_ids = np.asarray(zone_parts)
-    keep = _thin_lattice(pos, params.fill_spacing)
-    keep = np.sort(keep)
-    return pos[keep], [str(zone_ids[i]) for i in keep]
+def _cover_brick_centers(fs: FreeSpace) -> np.ndarray:
+    """(B,3) world centres of every brick containing COVER (opaque or glass)
+    — the voxelized surface the darts originate from, and the area measure
+    the counts derive from. Computed once per plan from the sorted fine cover
+    (chunked; no dense array)."""
+    bd = fs.bdims
+    nyz = int(fs.dims[1]) * int(fs.dims[2])
+    nz = int(fs.dims[2])
+    parts: list[np.ndarray] = []
+    for i in range(0, fs.occ_lin.size, 1 << 24):
+        lin = fs.occ_lin[i : i + (1 << 24)]
+        x = lin // nyz
+        rem = lin % nyz
+        y, z = rem // nz, rem % nz
+        blin = ((x >> 3) * bd[1] + (y >> 3)) * bd[2] + (z >> 3)
+        parts.append(np.unique(blin))
+    blin = np.unique(np.concatenate(parts)) if parts else np.zeros(0, np.int64)
+    bx = blin // (bd[1] * bd[2])
+    by = (blin // bd[2]) % bd[1]
+    bz = blin % bd[2]
+    cells = np.stack([bx, by, bz], axis=1).astype(np.float64) * _BRICK + _BRICK / 2.0
+    return fs.origin + cells * fs.pitch
 
 
-def _fill_directions(
-    fs: FreeSpace, pos: np.ndarray, params: PlanParams
+def _dart_samples(
+    centers: np.ndarray, d: float, n: int, start: int
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Directions for the fill: an exactly-uniform Fibonacci set over the
-    sphere, PERMUTED (seeded) so direction is uncorrelated with camera index —
-    the raw golden spiral is z-monotone, and consecutive cameras would
-    otherwise all stare at the ceiling. Point-blank cull: a frame whose
-    central ray hits opaque cover within `_MIN_VIEW_M` tries the antipode,
-    then two orthogonal re-aims, and is dropped if all four stare into
-    nearby cover. Returns (keep_mask, directions)."""
-    n = len(pos)
-    if n == 0:
-        return np.zeros(0, dtype=bool), np.zeros((0, 3))
-    table = _fib_sphere(max(n, 64))
-    perm = np.random.default_rng(params.seed).permutation(len(table))
-    dirs = table[perm[:n]].copy()
-    keep = np.zeros(n, dtype=bool)
-    pending = np.arange(n)
-    for attempt in range(4):
-        if not len(pending):
-            break
-        d = dirs[pending]
-        if attempt == 1:
-            d = -d
-        elif attempt >= 2:
-            # A deterministic orthogonal: rotate about Y then flip.
-            d = np.stack([d[:, 2], d[:, 1], -d[:, 0]], axis=1)
-            if attempt == 3:
-                d = -d
-        hit = _first_hit(fs, pos[pending], d, _MIN_VIEW_M)
-        good = ~np.isfinite(hit)
-        idx = pending[good]
-        dirs[idx] = d[good]
-        keep[idx] = True
-        pending = pending[~good]
-    return keep, dirs
+    """(positions (n,3), forwards (n,3)) by SURFACE DARTS: Halton-pick one of
+    the target's own cover bricks (∝ area — bricks are equal-area patches of
+    voxelized surface), a uniform sphere direction, step out `d`, aim back at
+    the brick. The sampling domain is the offset surface of the REAL shape:
+    concavities (under-canopy air, tub bowls, wardrobe interiors) are reached
+    exactly like convex faces."""
+    u = _halton3(n, start=start)
+    idx = np.minimum((u[:, 0] * len(centers)).astype(np.int64), len(centers) - 1)
+    z = 2.0 * u[:, 1] - 1.0
+    r = np.sqrt(np.maximum(0.0, 1.0 - z * z))
+    phi = 2.0 * np.pi * u[:, 2]
+    dirs = np.stack([r * np.cos(phi), z, r * np.sin(phi)], axis=1)
+    pos = centers[idx] + dirs * d
+    return pos, -dirs
 
 
-def _station_points(
+def _valid_ball_views(
     fs: FreeSpace,
-    zone: Zone,
-    fill_pos: np.ndarray,
-    fill_zone: list[str],
+    d: float,
+    pos: np.ndarray,
+    fwd: np.ndarray,
+    culls: dict[str, int],
+) -> np.ndarray:
+    """Indices of the candidates that pass every filter, in draw order:
+      * POSITION — outside the grid is provably open air; inside needs
+        reachable EMPTY air + a standoff-scaled clearance;
+      * BLOCKED / PRESENT — one voxel march against the aim window around
+        the expected hit distance `d` (module docstring).
+    Cull counters accumulate into `culls`."""
+    g_lo = fs.origin
+    g_hi = fs.origin + fs.dims.astype(np.float64) * fs.pitch
+    pad = _aim_pad(fs)
+
+    inb = np.all((pos >= g_lo) & (pos <= g_hi), axis=1)
+    ok = ~inb
+    if inb.any():
+        r_clear = float(np.clip(_CLEAR_FRAC * d, _CLEAR_MIN, _CLEAR_MAX))
+        ok_in = _clear_at(fs, pos[inb], r_clear)
+        ok[np.nonzero(inb)[0][ok_in]] = True
+    culls["position"] += int(inb.sum() - ok[inb].sum())
+    if not ok.any():
+        return np.zeros(0, dtype=np.int64)
+    idx = np.nonzero(ok)[0]
+
+    t_max = np.full(len(idx), d + pad, dtype=np.float64)
+    opaque_hit, any_hit = _ray_probe(fs, pos[idx], fwd[idx], t_max)
+    blocked = opaque_hit < (d - pad)
+    present = np.isfinite(any_hit)
+    culls["blocked"] += int(blocked.sum())
+    culls["air"] += int((~blocked & ~present).sum())
+    return idx[~blocked & present]
+
+
+# --- the ball planner ---------------------------------------------------------------
+
+
+def _frame_count(area_m2: float, d: float, params: PlanParams, floor: int) -> int:
+    """DERIVED view count at standoff `d`: coverage × shell area ÷ one
+    frame's footprint ((2·tan(fov/2)·d)²) — the self-normalizing allocator
+    (module docstring): frames and shell grow with the same d², so no object
+    size can diverge."""
+    footprint = (2.0 * np.tan(np.radians(params.fov_deg) / 2.0) * d) ** 2
+    n = round(params.coverage * area_m2 / max(footprint, 1e-12))
+    return max(floor, int(n))
+
+
+def _detail_standoff(
+    area_m2: float, faces: int, d_base: float, params: PlanParams
+) -> float | None:
+    """The DETAIL ring's distance for one target, or None when its geometry
+    doesn't earn one. Feature scale ℓ ≈ √(area / faces); the ring sits where
+    ℓ spans `detail_px` pixels. Gated to objects whose features need a camera
+    meaningfully closer than the base ring (< 0.5 × base) — a prop's base
+    ring IS its detail ring, and a low-poly flat never qualifies. Floored at
+    half `standoff_min`: features finer than that are beyond the render/
+    texture information limit anyway."""
+    if faces <= 0 or area_m2 <= 0:
+        return None
+    focal_px = params.render_resolution / (2.0 * np.tan(np.radians(params.fov_deg) / 2.0))
+    ell = float(np.sqrt(area_m2 / faces))
+    d = ell * focal_px / max(params.detail_px, 1e-6)
+    d = max(d, 0.5 * params.standoff_min, _MIN_STANDOFF)
+    return d if d < 0.5 * d_base else None
+
+
+def _ball_budgets(
+    targets: list[Target],
+    brick_counts: np.ndarray,
+    brick_area: float,
     params: PlanParams,
-) -> list[np.ndarray]:
-    """Station standpoints for one atomic zone: among the zone's own validated
-    fill positions (plus its bbox centre), score local clearance by an
-    expanding probe ladder and pick up to `k` far-apart maxima, `k` scaling
-    with zone extent. Empty when nowhere is clear enough to stand."""
-    cand = [p for p, zid in zip(fill_pos, fill_zone) if zid == zone.id]
-    center = (zone.bbox_min + zone.bbox_max) / 2.0
-    cand.append(center)
-    pts = np.asarray(cand, dtype=np.float64)
-    inside = np.all((pts >= zone.bbox_min) & (pts <= zone.bbox_max), axis=1)
-    pts = pts[inside]
-    # Prefer the zone's mid-height band: clearance maxima in furnished rooms
-    # sit just under the ceiling, but a panorama wants to stand where a
-    # viewer's eye flies. Fall back to all candidates when the band is empty.
-    h = max(float(zone.bbox_max[1] - zone.bbox_min[1]), 1e-6)
-    band = (pts[:, 1] >= zone.bbox_min[1] + 0.25 * h) & (
-        pts[:, 1] <= zone.bbox_min[1] + 0.75 * h
+    scene_diag: float,
+) -> tuple[list[float], float]:
+    """Per-target base standoff (scale-matched, scene-capped) + the GLOBAL
+    budget factor: base + gated-detail requests are estimated at the base
+    standoff and the scene total proportionally rescaled into
+    [`min_ball_views`, `max_ball_views`]. A descended target re-derives its
+    count at the accepted rung, so the realized total can exceed the clamp
+    modestly — it is a budget guard, not an exact quota."""
+    standoffs: list[float] = []
+    total = 0
+    for t, nb in zip(targets, brick_counts):
+        d0 = max(params.standoff_frac * t.diag, params.standoff_min)
+        d0 = min(d0, max(_RING_SCENE_CAP * scene_diag, params.standoff_min))
+        standoffs.append(float(d0))
+        area = float(nb) * brick_area
+        total += _frame_count(area, d0, params, params.ball_min)
+        d_det = _detail_standoff(area, t.faces, d0, params)
+        if d_det is not None:
+            total += _frame_count(area, d_det, params, 0)
+    scale = 1.0
+    if total > params.max_ball_views:
+        scale = params.max_ball_views / total
+    elif 0 < total < params.min_ball_views:
+        scale = params.min_ball_views / total
+    return standoffs, scale
+
+
+def _plan_balls(
+    fs: FreeSpace,
+    targets: list[Target],
+    params: PlanParams,
+    scene_diag: float,
+    progress: ProgressCb | None,
+) -> tuple[list[dict[str, Any]], dict[str, int], list[float], dict[str, int]]:
+    """All surviving ball cameras (pre-dedupe) + cull counters + the CHOSEN
+    per-framed-target standoffs + counters {descended, detail_targets,
+    detail_views}. Per target: attribute its cover bricks (AABB overlap
+    against the global cover-brick set), walk the DESCENT ladder on the base
+    ring, then the outer rings and the gated DETAIL ring at the accepted
+    standoff. Every ring keeps the first `n` valid draws."""
+    if progress is not None:
+        progress(0, 0, "bricks")
+    centers = _cover_brick_centers(fs)
+    brick_edge = _BRICK * fs.pitch
+    brick_area = brick_edge * brick_edge
+
+    # Per-target brick attribution: cover bricks whose centre falls in the
+    # target's AABB inflated by one brick. Overlapping AABBs share bricks
+    # (a spoon's set includes table bricks beneath it) — the aim fuzz this
+    # causes is bounded by the validity culls; exact attribution is the
+    # Stage-2-sidecar upgrade path.
+    tbricks: list[np.ndarray] = []
+    for t in targets:
+        m = np.all(
+            (centers >= t.lo - brick_edge) & (centers <= t.hi + brick_edge), axis=1
+        )
+        tbricks.append(np.nonzero(m)[0])
+    standoffs, scale = _ball_budgets(
+        targets, np.array([len(b) for b in tbricks]), brick_area, params, scene_diag
     )
-    if band.any():
-        pts = pts[band]
-    if not len(pts):
-        return []
-    # Clearance ladder: the largest probe radius that stays clear (0 if even
-    # the smallest fails). Coarse but cheap and monotone — enough to rank.
-    ladder = np.array([0.3, 0.45, 0.7, 1.0, 1.4])
-    score = np.zeros(len(pts), dtype=np.float64)
-    for r in ladder:
-        ok = _clear_at(fs, pts, float(r))
-        score[ok] = r
-    good = score >= _STATION_MIN_CLEAR
-    if not good.any():
-        return []
-    pts, score = pts[good], score[good]
-    k = int(np.clip(round(zone.max_extent / _STATION_EVERY_M), 1, _STATION_MAX))
-    # Separation scales with the ZONE, not the global station pitch — a 3 m
-    # bathroom's station must be allowed to exist 2 m from the bedroom's.
-    sep = 0.5 * min(zone.max_extent, _STATION_EVERY_M)
-    picked: list[np.ndarray] = []
-    order = np.argsort(-score, kind="stable")
-    for i in order:
-        p = pts[i]
-        if any(np.linalg.norm(p - q) < sep for q in picked):
-            continue
-        picked.append(p)
-        if len(picked) >= k:
-            break
-    return picked
+
+    culls = {"position": 0, "blocked": 0, "air": 0}
+    cams: list[dict[str, Any]] = []
+    chosen: list[float] = []
+    stats = {"descended": 0, "detail_targets": 0, "detail_views": 0}
+    cursor = params.seed * 7919  # disjoint deterministic Halton runs per seed
+
+    def emit(target: Target, pos: np.ndarray, fwd: np.ndarray, idx: np.ndarray) -> int:
+        for k in idx:
+            cams.append(
+                {
+                    "pos": pos[k],
+                    "forward": fwd[k],
+                    "kind": "ball",
+                    "zone": target.zone,
+                    "target": target.id,
+                }
+            )
+        return int(len(idx))
+
+    for ti, target in enumerate(targets):
+        if progress is not None and ti % 16 == 0:
+            progress(ti, len(targets), "balls")
+        bidx = tbricks[ti]
+        if not len(bidx):
+            continue  # no voxelized surface in its AABB — nothing to frame
+        tc = centers[bidx]
+        area = float(len(bidx)) * brick_area
+        d0 = standoffs[ti]
+        ladder: list[float] = []
+        for m in _DESCENT_MULTS:
+            d = max(d0 * m, _MIN_STANDOFF)
+            if d not in ladder:
+                ladder.append(d)
+
+        def try_rung(d_base: float, n_draw: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, int]:
+            nonlocal cursor
+            n_total = max(2, round(_frame_count(area, d_base, params, params.ball_min) * scale))
+            pos, fwd = _dart_samples(tc, d_base, n_draw, cursor)
+            cursor += n_draw
+            good = _valid_ball_views(fs, d_base, pos, fwd, culls)
+            return pos, fwd, good, n_total
+
+        accepted: tuple[float, int] | None = None
+        for rung, d_base in enumerate(ladder):
+            n_probe = max(2, round(_frame_count(area, d_base, params, params.ball_min) * scale))
+            n_inner = max(1, round(n_probe * params.ring_frac[0]))
+            n_draw = max(
+                n_inner * _OVERSAMPLE,
+                _DESCENT_DRAW_FLOOR[min(rung, len(_DESCENT_DRAW_FLOOR) - 1)],
+            )
+            pos, fwd, good, n_total = try_rung(d_base, n_draw)
+            need = max(1, int(np.ceil(_ACCEPT_FRAC * n_inner)))
+            if len(good) >= need or (rung == len(ladder) - 1 and len(good) > 0):
+                emit(target, pos, fwd, good[:n_inner])
+                accepted = (d_base, n_total)
+                if rung > 0:
+                    stats["descended"] += 1
+                break
+        if accepted is None:
+            # SALVAGE (constants block): one escalated re-walk of the ladder
+            # for the rare-pocket targets the standard draws missed.
+            for d_base in ladder:
+                pos, fwd, good, n_total = try_rung(d_base, _SALVAGE_DRAWS)
+                if len(good):
+                    n_inner = max(1, round(n_total * params.ring_frac[0]))
+                    emit(target, pos, fwd, good[:n_inner])
+                    accepted = (d_base, n_total)
+                    stats["descended"] += 1
+                    break
+        if accepted is None:
+            continue  # starved — no reachable viewpoint at any rung
+
+        d_base, n_total = accepted
+        chosen.append(d_base)
+        for mult, frac in zip(params.ring_mults[1:], params.ring_frac[1:]):
+            n_ring = max(1, round(n_total * frac))
+            d = min(d_base * mult, max(_RING_SCENE_CAP * scene_diag, d_base))
+            n_draw = n_ring * _OVERSAMPLE
+            pos, fwd = _dart_samples(tc, d, n_draw, cursor)
+            cursor += n_draw
+            good = _valid_ball_views(fs, d, pos, fwd, culls)
+            emit(target, pos, fwd, good[:n_ring])
+
+        # DETAIL ring (module docstring): geometry finer than the base ring
+        # resolves earns close darts at its own derived distance and count.
+        d_det = _detail_standoff(area, target.faces, d_base, params)
+        if d_det is not None:
+            n_det = round(_frame_count(area, d_det, params, 0) * scale)
+            if n_det > 0:
+                n_draw = max(n_det * _OVERSAMPLE, 32)
+                pos, fwd = _dart_samples(tc, d_det, n_draw, cursor)
+                cursor += n_draw
+                good = _valid_ball_views(fs, d_det, pos, fwd, culls)
+                kept = emit(target, pos, fwd, good[:n_det])
+                if kept:
+                    stats["detail_targets"] += 1
+                    stats["detail_views"] += kept
+    return cams, culls, chosen, stats
 
 
-def _enclosure(fs: FreeSpace, point: np.ndarray, reach: float) -> float:
-    """Fraction of an UPPER-HEMISPHERE Fibonacci fan of rays from `point`
-    that hit opaque cover within `reach` — how much walls/ceiling WRAP a
-    camera standing there. The ground is deliberately excluded (constants
-    block): open terrain always covers the down-facing half."""
-    dirs = _fib_sphere(_ENCLOSURE_DIRS * 2)
-    dirs = dirs[dirs[:, 1] >= _ENCLOSURE_MIN_Y][:_ENCLOSURE_DIRS]
-    origins = np.broadcast_to(point, (len(dirs), 3)).copy()
-    hit = _first_hit(fs, origins, dirs, reach)
-    return float(np.isfinite(hit).mean())
-
-
-def _station_views(
-    fs: FreeSpace, point: np.ndarray, n_dirs: int
-) -> list[np.ndarray]:
-    """One station's outward Fibonacci directions, minus the point-blank ones
-    (embedded against furniture on one side keeps the open arc)."""
-    dirs = _fib_sphere(n_dirs)
-    origins = np.broadcast_to(point, (len(dirs), 3)).copy()
-    hit = _first_hit(fs, origins, dirs, _MIN_VIEW_M)
-    return [d for d, h in zip(dirs, hit) if not np.isfinite(h)]
+# --- the root shell (unchanged construction) ---------------------------------------
 
 
 def _shell_cameras(
@@ -533,13 +656,9 @@ def _shell_cameras(
 ) -> tuple[np.ndarray, np.ndarray]:
     """The root establishing shell, SHAPE-ADAPTIVE: Fibonacci directions from
     the scene centre projected onto the scene AABB inflated by a per-axis
-    standoff (constants block), so every face is orbited at a standoff
-    proportional to its own extent — not at the whole-scene diagonal. Each
-    position lies ON a face of the inflated box, i.e. beyond the grid margin
-    on its exit axis: provably open air, no validity filters needed. Aims at
-    Halton-jittered targets spread over the scene's middle (× its shape), so
-    elongated scenes get sectional establishing shots along their length.
-    Below-floor positions are culled (no under-terrain backface views)."""
+    standoff (constants block), aims Halton-jittered over the scene's middle,
+    below-floor positions culled. Positions lie beyond the Stage-2 grid margin
+    — provably open air, no validity filters needed."""
     center = (lo + hi) / 2.0
     half = np.maximum((hi - lo) / 2.0, 1e-6)
     standoff = np.maximum(
@@ -553,8 +672,6 @@ def _shell_cameras(
     floor_y = lo[1] + _SHELL_FLOOR_FRAC * max(hi[1] - lo[1], 1e-6)
     pos = pos[pos[:, 1] >= floor_y]
     if len(pos) > params.shell_views:
-        # Even subsample (the Fibonacci order is z-monotone: a prefix
-        # truncation would keep only the top of the sphere).
         sel = np.unique(
             np.linspace(0, len(pos) - 1, params.shell_views).astype(np.int64)
         )
@@ -567,7 +684,7 @@ def _shell_cameras(
 
 def _up_for(forward: np.ndarray) -> np.ndarray:
     """A non-degenerate image-up per forward direction: world +Y, except near
-    the poles where +Z takes over (matches the old cube-face convention)."""
+    the poles where ±Z takes over (straight-down lawn views stay well-posed)."""
     up = np.tile(np.array([0.0, 1.0, 0.0]), (len(forward), 1))
     polar = np.abs(forward[:, 1]) > 0.98
     up[polar] = np.array([0.0, 0.0, 1.0])
@@ -590,77 +707,51 @@ def plan_cameras(
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
     """Plan a cell's cameras (module docstring) and write `cameras.json`.
-    Deterministic (Halton + Fibonacci + seeded assignment; no RNG state), pure
-    CPU, and independent of the surfel cloud. Returns a summary."""
+    Deterministic (Halton + seeded cursors; no RNG state), pure CPU, and
+    independent of the surfel cloud. Returns a summary."""
     fs = load_free_space(Path(freespace_path))
-    zones, lo, hi = _read_zones(Path(scene_path))
+    targets, lo, hi = _read_targets(Path(scene_path))
+    scene_diag = float(np.linalg.norm(hi - lo))
     if progress is not None:
         progress(0, 0, "load")
 
-    skin = _skin_centers(fs)
-    skin_tree = cKDTree(skin)
+    # 1) BALLS — the per-object tight shells (the guarantee layer).
+    ball_cams, culls, standoffs, stats = _plan_balls(
+        fs, targets, params, scene_diag, progress
+    )
+    n_before = len(ball_cams)
+    if n_before:
+        pos = np.asarray([c["pos"] for c in ball_cams])
+        fwd = np.asarray([c["forward"] for c in ball_cams])
+        keep = set(_thin_lattice_aim(pos, fwd, params.dedupe_spacing).tolist())
+        # The dedupe must not strip a target's LAST camera (clustered props'
+        # shells coincide, and the shared winner belongs to one id): re-admit
+        # the first surviving view of any target thinned to zero.
+        have = {ball_cams[i]["target"] for i in keep}
+        for i, c in enumerate(ball_cams):
+            if c["target"] not in have:
+                keep.add(i)
+                have.add(c["target"])
+        ball_cams = [ball_cams[i] for i in sorted(keep)]
+    culls["dedupe"] = n_before - len(ball_cams)
 
-    # 1) FILL — the backbone field.
-    if progress is not None:
-        progress(0, 0, "fill")
-    fill_pos, fill_zone = _fill_positions(fs, zones, skin, skin_tree, params)
-    keep, fill_dir = _fill_directions(fs, fill_pos, params)
-    culled_fill = int((~keep).sum())
-    fill_pos = fill_pos[keep]
-    fill_dir = fill_dir[keep]
-    fill_zone = [z for z, k in zip(fill_zone, keep) if k]
+    framed = {c["target"] for c in ball_cams}
+    starved = sorted(t.id for t in targets if t.id not in framed)
 
-    # 2) STATIONS — outward panoramas in enclosed atomic zones.
-    if progress is not None:
-        progress(0, 0, "stations")
-    station_cams: list[dict[str, Any]] = []
-    placed_points: list[np.ndarray] = []  # global: overlapping zone bboxes
-    stations_placed = 0
-    stations_gated = 0
-    for z in zones:
-        if not z.is_atomic:
-            continue
-        for point in _station_points(fs, z, fill_pos, fill_zone, params):
-            # Overlapping atomic zones (bboxes are not a partition) converge
-            # on the same clearance maxima — one panorama there is enough.
-            # Separation scales with the smaller zone so a small room beside
-            # a large one keeps its own station.
-            sep = 0.5 * min(z.max_extent, _STATION_EVERY_M)
-            if any(np.linalg.norm(point - q) < sep for q in placed_points):
-                continue
-            reach = min(1.2 * z.diag, _ENCLOSURE_REACH_MAX)
-            if _enclosure(fs, point, reach) < _ENCLOSURE_MIN:
-                stations_gated += 1
-                continue
-            views = _station_views(fs, point, params.station_dirs)
-            if not views:
-                continue
-            placed_points.append(point)
-            stations_placed += 1
-            for d in views:
-                station_cams.append(
-                    {"pos": point, "forward": d, "kind": "station", "zone": z.id}
-                )
-
-    # 3) SHELL — the root establishing orbit.
+    # 2) SHELL — the root establishing orbit.
     if progress is not None:
         progress(0, 0, "shell")
     shell_pos, shell_fwd = _shell_cameras(lo, hi, params)
 
-    # Assemble the flat plan.
-    cams: list[dict[str, Any]] = []
-    for p, d, zid in zip(fill_pos, fill_dir, fill_zone):
-        cams.append({"pos": p, "forward": d, "kind": "fill", "zone": zid})
-    cams.extend(station_cams)
+    cams: list[dict[str, Any]] = list(ball_cams)
     for p, d in zip(shell_pos, shell_fwd):
         cams.append({"pos": p, "forward": d, "kind": "shell", "zone": None})
 
     fwd_all = np.asarray([c["forward"] for c in cams], dtype=np.float64)
     up_all = _up_for(fwd_all) if len(cams) else np.zeros((0, 3))
 
-    diag = float(np.linalg.norm(hi - lo))
     near = min(0.05, fs.pitch * 0.5)
-    far = (1.0 + _SHELL_RADIUS_MULT) * diag + 2.0
+    far = (1.0 + _SHELL_RADIUS_MULT) * scene_diag + 2.0
 
     doc = {
         "plan_version": PLAN_VERSION,
@@ -686,26 +777,29 @@ def plan_cameras(
         ],
     }
 
-    counts = {
-        "fill": int(len(fill_pos)),
-        "station": int(len(station_cams)),
-        "shell": int(len(shell_pos)),
-    }
+    d_arr = np.asarray(standoffs) if standoffs else np.zeros(1)
     summary = {
         "run": run,
         "slot": slot,
         "model": model,
         "cameras": len(cams),
         "views": len(cams),  # one shot per camera — kept for status parity
-        "kinds": counts,
-        "zones": {
-            "total": len(zones),
-            "atomic": int(sum(z.is_atomic for z in zones)),
-            "stations_placed": stations_placed,
-            "stations_gated": stations_gated,
+        "kinds": {"ball": len(ball_cams), "shell": int(len(shell_pos))},
+        "targets": {
+            "total": len(targets),
+            "framed": len(framed),
+            "descended": stats["descended"],
+            "detail_ringed": stats["detail_targets"],
+            "starved": len(starved),
+            "starved_ids": starved[:8],
         },
-        "culled_point_blank": culled_fill,
-        "skin_bricks": int(len(skin)),
+        "detail_views": stats["detail_views"],
+        "culls": culls,
+        "standoff_m": {
+            "min": round(float(d_arr.min()), 3),
+            "median": round(float(np.median(d_arr)), 3),
+            "max": round(float(d_arr.max()), 3),
+        },
         "scene_aabb": {"min": lo.tolist(), "max": hi.tolist()},
         "intrinsics": doc["intrinsics"],
         "params": params.as_summary(),

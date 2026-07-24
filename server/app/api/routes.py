@@ -2289,7 +2289,14 @@ def _ensure_stage6_colmap(run: str, slot: str, model: str, restart: bool) -> Pat
     `restart` or when absent; otherwise reused. Blocking (decodes the reference
     frames to RGB), so callers run it off the event loop."""
     colmap_dir = _colmap_dir(run, slot, model)
-    if restart or not (colmap_dir / splat_colmap.CAMERAS_TXT).is_file():
+    # Re-export when absent — or when the model predates the SZF supervision
+    # sidecar while the refs could provide one (SZF frames present): otherwise a
+    # stale export silently keeps training RGB-only.
+    frames_dir = _refs_dir(run, slot, model) / splat_stage5.FRAMES_DIRNAME
+    stale = not (colmap_dir / splat_colmap.CAMERAS_TXT).is_file() or (
+        frames_dir.is_dir() and not (colmap_dir / splat_colmap.SIDECAR_NAME).is_file()
+    )
+    if restart or stale:
         splat_colmap.export_colmap(
             _refs_dir(run, slot, model), _cloud_path(run, slot, model), colmap_dir,
         )
@@ -2325,6 +2332,9 @@ def _spawn_stage6(
     cmd = [
         sys.executable, "-u", "-m", "splat.stage6",
         "--colmap", str(colmap_dir),
+        # Surfel init (stage6 default): seed every Gaussian from the Stage-3
+        # cloud — the same file the COLMAP export above just read.
+        "--init-ply", str(_cloud_path(run, slot, model)),
         "--out", str(out), "--run", run, "--slot", slot, "--model", model,
         "--resume",  # continue from a checkpoint if one survived; restart wiped it
     ]
@@ -2887,21 +2897,21 @@ async def _run_splat_stage3_cell(
 
 class Stage4Request(BaseModel):
     """Camera-planner knobs (all optional; omitted → defaults; unknown legacy
-    fields in a request body are ignored). `fill_per_skin_brick` is the density
-    dial (fill cameras per unit of visible surface); `min_fill`/`max_fill`
-    clamp the fill total (the cost dial); `station_dirs` sizes each atomic
-    zone's outward panorama; `shell_views` sizes the root establishing orbit.
-    `fov_deg`/`render_resolution` are the shared single-shot intrinsics.
-    See splat/stage4.py — there is no greedy, no patches, no coverage
-    accounting: counts are feed-forward from the scene."""
+    fields in a request body are ignored). `coverage` is the density dial
+    (dimensionless — views are DERIVED per object as coverage × offset-shell
+    area ÷ frame footprint at the chosen standoff, so there is no per-object
+    cap); `ball_min` floors the per-object guarantee and `max_ball_views`
+    clamps the scene total (the cost dial); `standoff_min` floors the base
+    camera distance (the descent ladder handles tight spaces); `shell_views`
+    sizes the root establishing orbit. `fov_deg`/`render_resolution` are the
+    shared single-shot intrinsics."""
 
-    fill_per_skin_brick: float | None = None
-    min_fill: int | None = None
-    max_fill: int | None = None
-    clear_m: float | None = None
-    near_surface_m: float | None = None
-    fill_spacing: float | None = None
-    station_dirs: int | None = None
+    coverage: float | None = None
+    detail_px: float | None = None
+    ball_min: int | None = None
+    max_ball_views: int | None = None
+    standoff_min: float | None = None
+    dedupe_spacing: float | None = None
     shell_views: int | None = None
     fov_deg: float | None = None
     render_resolution: int | None = None
@@ -2918,13 +2928,12 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         return float(min(max(v, lo), hi)) if v is not None else default
 
     return splat_stage4.PlanParams(
-        fill_per_skin_brick=pick(req.fill_per_skin_brick, 0.001, 1.0, d.fill_per_skin_brick),
-        min_fill=int(pick(req.min_fill, 8, 10_000, d.min_fill)),
-        max_fill=int(pick(req.max_fill, 32, 20_000, d.max_fill)),
-        clear_m=pick(req.clear_m, 0.05, 2.0, d.clear_m),
-        near_surface_m=pick(req.near_surface_m, 0.5, 50.0, d.near_surface_m),
-        fill_spacing=pick(req.fill_spacing, 0.1, 3.0, d.fill_spacing),
-        station_dirs=int(pick(req.station_dirs, 8, 256, d.station_dirs)),
+        coverage=pick(req.coverage, 0.05, 5.0, d.coverage),
+        detail_px=pick(req.detail_px, 2.0, 32.0, d.detail_px),
+        ball_min=int(pick(req.ball_min, 1, 256, d.ball_min)),
+        max_ball_views=int(pick(req.max_ball_views, 32, 20_000, d.max_ball_views)),
+        standoff_min=pick(req.standoff_min, 0.1, 5.0, d.standoff_min),
+        dedupe_spacing=pick(req.dedupe_spacing, 0.1, 3.0, d.dedupe_spacing),
         shell_views=int(pick(req.shell_views, 0, 1024, d.shell_views)),
         fov_deg=pick(req.fov_deg, 30.0, 120.0, d.fov_deg),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
@@ -2971,8 +2980,9 @@ def _plan_cameras_cell(
     plan_params: splat_stage4.PlanParams, job: dict[str, Any],
 ) -> dict[str, Any]:
     """Plan cameras from the Stage-2 free-space grid + Stage-1 scene manifest
-    (the zone tree) — no meshes, no surfels, no CUDA. Sub-second: the marker
-    steps (load / fill / stations / shell / write) stream no counts."""
+    (the placed-object AABBs) — no meshes, no surfels, no CUDA. Fast: the
+    per-target "balls" step streams (done, total); the marker steps
+    (load / shell / write) stream no counts."""
 
     def _progress(done: int, total: int, current: str) -> None:
         job["phase"], job["done"], job["total"], job["current_id"] = (

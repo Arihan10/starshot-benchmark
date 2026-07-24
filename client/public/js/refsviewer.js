@@ -14,7 +14,9 @@ const HEADER_BYTES = 16;
 const FILTER_SUBLEFT = 1;
 const DEPTH_CODE_MAX = 65535; // matches stage5._DEPTH_CODE_MAX; code 0 = background
 // Rig kinds of the single-shot camera plan (transforms.json frames[].kind).
-const VIEW_KINDS = ["fill", "station", "shell"];
+// Older reference sets may still carry fill/station kinds; those views simply
+// group under "all" until re-planned.
+const VIEW_KINDS = ["ball", "shell"];
 const PLANES = [
     ["rgb", "RGB"],
     ["alpha", "alpha"],
