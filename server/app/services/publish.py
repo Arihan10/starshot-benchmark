@@ -9,7 +9,9 @@ proxies/, tours/). Assets are keyed per cell — run/slot/model, NOT versioned:
   panoramas/<run>/<slot>/<model>/<anchor>.jpg
 
 so re-publishing a cell overwrites its objects (and its D1 row) in place. The
-dollhouse is baked from the cell's generated build (the same meshes the tour was
+dollhouse is baked from whichever raw build the cell's source preference selects
+(the generated Trellis build OR the asset-library build — the same choice the
+splat/tour pipeline resolves, so the preview matches the meshes the tour was
 captured against), cached under the cell so a re-publish only re-bakes when a
 source mesh or the bake script changes.
 """
@@ -17,19 +19,26 @@ source mesh or the bake script changes.
 from __future__ import annotations
 
 import asyncio
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
 from app.services import d1, r2, scene_lite
 
-# Mirrors the generated layout the gate writes (app.pipeline.generation): the
-# single build lives at <cell>/objects-generated/ (raw, PNG-textured meshes),
-# with older cells nested under <cell>/generated/<n>/objects-generated/. Kept as
-# local constants so this stays off the heavy generation import path.
+# Mirrors the on-disk layout the pipeline writes (app.pipeline.generation): the
+# generated build's raw, PNG-textured meshes live at <cell>/objects-generated/
+# (older cells nested under <cell>/generated/<n>/objects-generated/), and the
+# asset-library build's raw meshes at <cell>/objects/. Kept as local constants so
+# this stays off the heavy generation import path.
 _RAW_SUBDIR = "objects-generated"
+_LIBRARY_SUBDIR = "objects"
 _LEGACY_GENERATED_DIR = "generated"
 _PUBLISHED_DIR = "published"  # baked preview cached under the cell
+
+# The cell's mesh-source choice (persisted in splat/source.json by the pipeline).
+# 'auto' = generated build else library; an explicit value pins exactly one set.
+_SPLAT_SOURCES = ("auto", "generated", "library")
 
 # Public origin the bucket is served from — only used to return convenience URLs
 # in the publish response; D1 stores bare keys.
@@ -55,12 +64,24 @@ def _scene_glbs(objects_dir: Path) -> list[Path]:
     return [p for p in objects_dir.glob("*.glb") if not p.name.endswith(".raw.glb")]
 
 
-def _raw_objects_dir(cell: Path) -> Path | None:
-    """The generated build's RAW (PNG-textured) meshes the dollhouse bakes from —
-    the current single build (<cell>/objects-generated/), else the newest legacy
+def _source_pref(cell: Path) -> str:
+    """The cell's persisted mesh-source choice ('auto' when unset/invalid) — the
+    same splat/source.json the splat + tour pipeline reads, so the dollhouse bakes
+    from whatever set the tour was captured against."""
+    try:
+        pref = json.loads(
+            (cell / "splat" / "source.json").read_text(encoding="utf-8")
+        ).get("source")
+    except Exception:
+        return "auto"
+    return pref if pref in _SPLAT_SOURCES else "auto"
+
+
+def _generated_objects_dir(cell: Path) -> Path | None:
+    """The generated build's RAW (PNG-textured) meshes — the current single build
+    (<cell>/objects-generated/), else the newest legacy
     <cell>/generated/<n>/objects-generated/. None when neither has rendered
-    meshes. (scene_lite decodes PNG textures, so it must read the raw set, not the
-    KTX2/Basis optimized twin.)"""
+    meshes."""
     single = cell / _RAW_SUBDIR
     if _scene_glbs(single):
         return single
@@ -77,9 +98,33 @@ def _raw_objects_dir(cell: Path) -> Path | None:
     return None
 
 
+def _library_objects_dir(cell: Path) -> Path | None:
+    """The asset-library build's RAW (PNG-textured) meshes (<cell>/objects/). None
+    when absent or migrated to the KTX2-only `objects-optimized/` twin (which the
+    vertex-color bake can't decode)."""
+    d = cell / _LIBRARY_SUBDIR
+    return d if _scene_glbs(d) else None
+
+
+def _bake_objects_dir(cell: Path) -> Path | None:
+    """The RAW mesh set the dollhouse preview bakes from, honouring the cell's
+    source preference — the same generated-or-library choice the splat/tour
+    pipeline resolves: 'generated'/'library' pin one set, 'auto' prefers the
+    generated build then falls back to the library. None when the chosen set has
+    no PNG-textured meshes on disk. (scene_lite decodes PNG textures, so this is
+    always a raw set, never a KTX2/Basis optimized twin.)"""
+    pref = _source_pref(cell)
+    if pref == "generated":
+        return _generated_objects_dir(cell)
+    if pref == "library":
+        return _library_objects_dir(cell)
+    return _generated_objects_dir(cell) or _library_objects_dir(cell)
+
+
 def has_publishable_meshes(cell: Path) -> bool:
-    """Whether the cell has a generated build with rendered meshes to publish."""
-    return _raw_objects_dir(cell) is not None
+    """Whether the cell has a raw mesh set (generated or library, per its source
+    preference) the dollhouse preview can bake from."""
+    return _bake_objects_dir(cell) is not None
 
 
 def _stale(dst: Path, *sources: Path) -> bool:
@@ -92,11 +137,12 @@ def _stale(dst: Path, *sources: Path) -> bool:
 
 async def _ensure_preview(cell: Path) -> Path:
     """Bake (or reuse the cached) vertex-colored dollhouse and return its path.
-    Cached under the cell, invalidated when a source mesh or the bake script
-    changes."""
-    raw_dir = _raw_objects_dir(cell)
+    Bakes from whichever raw set the cell's source preference selects (generated
+    or library). Cached under the cell, invalidated when a source mesh or the bake
+    script changes."""
+    raw_dir = _bake_objects_dir(cell)
     if raw_dir is None:
-        raise FileNotFoundError("cell has no generated meshes to publish")
+        raise FileNotFoundError("cell has no meshes to publish")
     sources = _scene_glbs(raw_dir)
     out = cell / _PUBLISHED_DIR / "scene-lite.glb"
     if _stale(out, *sources, scene_lite.BAKE_SCRIPT):
@@ -198,7 +244,7 @@ async def publish_cell_local(
     if not cell.is_dir():
         raise FileNotFoundError(f"no such cell: {run}/{slot}/{model}")
     if not has_publishable_meshes(cell):
-        raise FileNotFoundError("cell has no generated meshes to publish")
+        raise FileNotFoundError("cell has no meshes to publish")
     await _ensure_preview(cell)
     row = local_scene_row(runs_dir, run, slot, model)
     return row or {"run": run, "slot": slot, "model": model, "pano_count": 0}
@@ -221,7 +267,7 @@ async def publish_cell(
     if not cell.is_dir():
         raise FileNotFoundError(f"no such cell: {run}/{slot}/{model}")
     if not has_publishable_meshes(cell):
-        raise FileNotFoundError("cell has no generated meshes to publish")
+        raise FileNotFoundError("cell has no meshes to publish")
 
     tour_dir = cell / "tour"
     tour_json = tour_dir / "tour.json"
