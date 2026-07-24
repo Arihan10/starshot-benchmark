@@ -229,6 +229,18 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage6/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
+    // Matterport tour capture (headless walkthrough). `tourAnchors` plans this
+    // cell's 360° capture anchors (read-only LLM pass — the "where the cameras
+    // go" preview). `tourCaptureStart` runs the whole headless capture (plan →
+    // render panos/minimaps/proxy → tour.json → publish to R2/D1);
+    // `tourCaptureStatus` polls the live job ({running, phase, total, summary,
+    // error, url}) — its `url` is the captured tour.json when present.
+    tourAnchors: (run, slot, model) =>
+        request(cellPath(slot, model, "/anchors"), { method: "POST", params: { run } }),
+    tourCaptureStart: (run, slot, model) =>
+        request(cellPath(slot, model, "/tour/capture"), { method: "POST", params: { run } }),
+    tourCaptureStatus: (run, slot, model) =>
+        request(cellPath(slot, model, "/tour/capture"), { params: { run } }),
     // On-demand SOG encode of a chosen model (`which`: "trained" | "healed") —
     // runs client/tools/ply-to-sog.mjs on the server host (local, NOT on Modal).
     // Poll splatSogStatus for progress + the per-model `.sog` url.
@@ -263,6 +275,19 @@ export const api = {
             `/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
             { method: "DELETE" },
         ),
+    // Modal-hosted Stage-5 reference frames (the remote trained splat's training
+    // data — refs never sync locally). `modalRefsTransformsUrl` is the remote
+    // transforms.json (read off the Volume); `modalRefsBase` + a frame's
+    // `frame_path` ("frames/<view>.szf") is the per-frame proxy the refs viewer
+    // fetches ON DEMAND, one SZF per visible thumbnail (no bulk download).
+    modalRefsTransformsUrl: (run, slot, model) =>
+        u(
+            `/runs/${encodeURIComponent(run)}/splat/modal-refs/${encodeURIComponent(slot)}/${encodeURIComponent(model)}/transforms.json`,
+        ).toString(),
+    modalRefsBase: (run, slot, model) =>
+        u(
+            `/runs/${encodeURIComponent(run)}/splat/modal-refs/${encodeURIComponent(slot)}/${encodeURIComponent(model)}/`,
+        ).toString(),
     // Live snapshot of the process-global mesh queue — every in-flight + waiting
     // generation across the Modal Trellis/Hunyuan pool and the Tencent Hunyuan 3.1
     // pool. { pools: [{id,label,cap}], entries: [{slot_id,job_id,state,backend,pool,…}] }.

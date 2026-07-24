@@ -36,10 +36,13 @@ IMAGES_TXT = "images.txt"
 POINTS_TXT = "points3D.txt"
 # SZF supervision sidecar: a POINTER (no pixel duplication) from the COLMAP model
 # back to the refs' SZF frames + the shared depth [near, far], so splat/stage6 can
-# supervise against the capture's exact alpha + metric-depth planes. Postshot and
-# every other COLMAP consumer simply ignore the extra file. Only written for SZF
-# refs — legacy PNG-triple refs carry no frames to point at.
-SIDECAR_NAME = "szf_sidecar.json"
+# supervise against the capture's exact alpha + metric-depth planes. Its content is
+# JSON, but the extension is deliberately NOT `.json`: Postshot (and other trainers)
+# scan the imported folder and treat every `.json` as a nerfstudio-style camera-pose
+# file (which must carry a `frames` member), so a `.json` sidecar aborts the import.
+# A non-scanned extension keeps the file next to the model yet invisible to that
+# importer. Only written for SZF refs — legacy PNG-triple refs have no frames.
+SIDECAR_NAME = "szf_sidecar.szfmeta"
 
 # SH degree-0 basis constant: Stage 3 stores f_dc = (rgb - 0.5) / C0, so rgb =
 # 0.5 + C0 * f_dc (matches splat/stage3.py's _SH_C0).

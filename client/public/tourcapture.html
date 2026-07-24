@@ -1,0 +1,51 @@
+<!doctype html>
+<!-- Headless matterport tour-capture worker. Loaded headless by the server
+     (server/app/api/routes.py `_run_tour_capture` via services/refcapture.py's
+     browser launcher) with the job in the query string, or manually in any
+     browser as a fallback when headless GPU is unavailable. All logic lives in
+     js/tourcapture.js; this shell only provides the importmap (the same three.js
+     the debug viewer + splat capture use) and a status readout. -->
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>starshot · tour capture</title>
+        <style>
+            body {
+                margin: 0;
+                background: #101114;
+                color: #e6e6e6;
+                font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
+            }
+            #status {
+                padding: 12px 14px;
+                white-space: pre-wrap;
+            }
+            #status .err {
+                color: #ff8080;
+            }
+            #status .ok {
+                color: #8bd17c;
+            }
+            canvas {
+                width: 256px;
+                height: 256px;
+                display: block;
+                margin: 0 14px;
+                border: 1px solid #2a2d35;
+            }
+        </style>
+        <script type="importmap">
+            {
+                "imports": {
+                    "three": "/vendor/three/build/three.module.js",
+                    "three/addons/": "/vendor/three/examples/jsm/"
+                }
+            }
+        </script>
+    </head>
+    <body>
+        <div id="status">tour capture: starting…</div>
+        <script type="module" src="/js/tourcapture.js"></script>
+    </body>
+</html>

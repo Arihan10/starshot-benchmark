@@ -328,7 +328,7 @@ class TrainParams:
     # because quality is primary and the main box (A100) has ample VRAM; big
     # scenes are unaffected — they TILE (n_tiles × cap_max total), and the derived
     # tile budget just makes them tile a little sooner.
-    cap_max: int = 2_500_000
+    cap_max: int = 5_000_000
     # Final cleanup prune (once, before eval + export). Densification/pruning stop at
     # refine_stop (50% of iters), so opacity that drifts below prune_opa in the back
     # half — the low-opacity floaters stranded at silhouette/depth edges — otherwise

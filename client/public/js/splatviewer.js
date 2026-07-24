@@ -36,6 +36,7 @@ import {
 } from "./oit.js";
 import { bakeReflectionProbes } from "./reflections.js";
 import { applyEmissiveLighting } from "./emissive.js";
+import { matteNonReflective } from "./reflective.js";
 
 let overlay = null;
 let canvasEl = null;
@@ -89,6 +90,12 @@ let camRevealed = 0; // camera points currently revealed (greedy order == array 
 let camPlayLast = 0; // previous playback frame timestamp (ms), for dt
 let patchModalEl = null; // the right-side image modal (created lazily)
 let _downXY = null; // pointer-down pos, to tell a click from an orbit drag
+
+// Matterport tour capture (headless walkthrough) — mirrors the Stage-4 camera
+// overlay + a Stage-5-style start/poll control, on the same open cell.
+let anchorPoints = null; // THREE.Points of tour ANCHOR positions (view-only overlay)
+let tourJob = null; // last-fetched headless tour-capture job status
+let tourTimer = null; // tour-capture status poll handle
 
 // Pipeline stepper state (the side panel drives the whole splat pipeline).
 let cellStatus = null; // last-fetched per-stage status of the open cell
@@ -283,6 +290,7 @@ async function teardown() {
         meshGroup,
         patchPoints,
         cameraPoints,
+        anchorPoints,
     ]) {
         if (obj) {
             viewer?.threeScene?.remove(obj);
@@ -307,6 +315,9 @@ async function teardown() {
     stopCamPlay();
     cameraPoints = null;
     camRevealed = 0;
+    stopTourPoll();
+    anchorPoints = null;
+    if (inputs && inputs.anchors) inputs.anchors.checked = false;
     hidePatchModal();
     // A rebuild (re-splat) returns to splat mode; the splat is visible by default
     // on the new viewer, and the overlays are gone.
@@ -1221,8 +1232,9 @@ async function buildMeshGroup() {
         off += glbLen;
         try {
             const gltf = await loader.parseAsync(glb, "");
+            gltf.scene.userData.objectId = id; // emissive.js / reflective.js name matching
+            matteNonReflective(gltf.scene, id); // keep curated reflective; matte the rest
             prepareOITScene(gltf.scene, meshOitPass); // glass via OIT, like the capture
-            gltf.scene.userData.objectId = id; // for emissive.js name matching
             group.add(gltf.scene);
         } catch {
             /* skip a bad object */
@@ -1875,6 +1887,33 @@ function buildControls(summary) {
         200,
         (v) => `${Math.round(v)}/s`,
     );
+
+    // ---- matterport tour capture (headless walkthrough) ----
+    // "capture tour" runs the whole headless capture for this cell (plan anchors →
+    // render 360 panos + minimaps + proxy → tour.json → publish to R2/D1), with a
+    // live phase/progress readout. The "anchor positions" overlay shows WHERE the
+    // 360 captures are taken (the captured points when a tour exists, else a fresh
+    // LLM plan preview) — orange disks, the tour twin of the cyan camera overlay.
+    const tourBtn = el("button", {
+        class: "splat-stage2-btn",
+        text: "capture tour",
+        title: "plan 360° anchors, render the matterport walkthrough headlessly, and publish",
+        onclick: () => startTourCapture(),
+    });
+    inputs._tourBtn = tourBtn;
+    inputs._tourStatus = el("span", { class: "svc-val", text: "" });
+    const tourRow = el(
+        "div",
+        { class: "svc-row" },
+        el("span", { class: "svc-lab", text: "tour" }),
+        tourBtn,
+        inputs._tourStatus,
+    );
+    const anchorRow = checkRow("anchors", "anchor positions (orange)", false);
+    inputs.anchors.addEventListener("change", () =>
+        setAnchors(inputs.anchors.checked),
+    );
+
     const overlay = el("div", { class: "svc-actual" });
     inputs._overlay = overlay;
     inputs._stepper = el("div", { class: "svc-stepper" });
@@ -1951,6 +1990,9 @@ function buildControls(summary) {
         camRow,
         camPlayRow,
         camSpeedRow,
+        el("div", { class: "svc-title", text: "matterport" }),
+        tourRow,
+        anchorRow,
         el("div", { class: "svc-title", text: "sampler" }),
         detail,
         workers,
@@ -2284,6 +2326,205 @@ async function toggleCamPlay() {
     camPlayLast = 0;
     updateCamPlayBtn();
     camPlayReq = requestAnimationFrame(camPlayTick);
+}
+
+// ---- matterport tour capture (anchor overlay + headless capture control) -----
+
+// One orange disk per tour anchor — the 360° capture points. View-only, X-rayed
+// through the scene like the (cyan) camera overlay, so the whole walkthrough rig
+// reads at a glance. Accepts the tour.json pano entries or the /anchors plan
+// (both carry a world-space `position`).
+function buildAnchors(anchors) {
+    const n = anchors.length;
+    const pos = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+        const p = anchors[i].position || anchors[i].pos || [0, 0, 0];
+        pos[i * 3] = p[0];
+        pos[i * 3 + 1] = p[1];
+        pos[i * 3 + 2] = p[2];
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.BufferAttribute(pos, 3));
+    const mat = new THREE.PointsMaterial({
+        size: 0.45,
+        color: 0xffa000,
+        sizeAttenuation: true,
+        map: patchSprite(),
+        alphaTest: 0.5,
+    });
+    return new THREE.Points(geo, mat);
+}
+
+// Build the anchor overlay for the open cell: prefer the ACTUAL captured points
+// (tour.json, free), falling back to a fresh LLM plan preview when no tour exists
+// yet. Cached for the session so a toggle never re-plans.
+async function ensureAnchors() {
+    if (anchorPoints) return true;
+    const c = current;
+    if (!c) return false;
+    const seq = openSeq;
+    setOverlay("loading anchors…");
+    let anchors = null;
+    let source = "captured";
+    try {
+        const job = await api.tourCaptureStatus(c.run, c.slot, c.model);
+        if (job && job.url) {
+            const tour = await fetch(api.absUrl(job.url + `?t=${Date.now()}`), {
+                cache: "no-store",
+            }).then((r) => (r.ok ? r.json() : null));
+            if (tour && Array.isArray(tour.panos) && tour.panos.length) {
+                anchors = tour.panos;
+            }
+        }
+    } catch {
+        /* fall through to planning */
+    }
+    if (seq !== openSeq || !viewer) return false;
+    if (!anchors) {
+        source = "planned";
+        setOverlay("planning anchors (LLM)…");
+        try {
+            const plan = await api.tourAnchors(c.run, c.slot, c.model);
+            anchors = Array.isArray(plan.anchors) ? plan.anchors : [];
+        } catch (e) {
+            setOverlay(`anchor plan failed: ${e.message}`);
+            return false;
+        }
+    }
+    if (seq !== openSeq || !viewer) return false;
+    if (!anchors.length) {
+        setOverlay("no anchors");
+        return false;
+    }
+    anchorPoints = buildAnchors(anchors);
+    anchorPoints.visible = false;
+    viewer.threeScene.add(anchorPoints);
+    setOverlay(`anchors (${source}): ${anchors.length} points`);
+    return true;
+}
+
+async function setAnchors(on) {
+    if (on) {
+        const ok = await ensureAnchors();
+        if (ok && anchorPoints) anchorPoints.visible = true;
+        else if (inputs && inputs.anchors) inputs.anchors.checked = false;
+    } else if (anchorPoints) {
+        anchorPoints.visible = false;
+    }
+    viewer?.forceRenderNextFrame?.(); // overlays only repaint on a forced frame
+}
+
+function setTourStatus(text, isErr) {
+    if (inputs && inputs._tourStatus) {
+        inputs._tourStatus.textContent = text || "";
+        inputs._tourStatus.style.color = isErr ? "var(--red, #ff8080)" : "";
+    }
+}
+
+// Paint the capture button + status from the live job (idle → running phase →
+// done / error), mirroring the Stage-5 control's states.
+function renderTour() {
+    const btn = inputs && inputs._tourBtn;
+    if (!btn) return;
+    const j = tourJob;
+    if (j && j.running) {
+        btn.disabled = true;
+        const ph = j.phase || "…";
+        btn.textContent = ph === "plan" ? "planning anchors…" : "capturing tour…";
+        setTourStatus(ph === "render" && j.total ? `${j.total} anchors` : ph);
+    } else if (j && j.status === "error") {
+        btn.disabled = false;
+        btn.textContent = "capture failed — retry";
+        setTourStatus(j.error || "error", true);
+    } else if (j && j.status === "done") {
+        btn.disabled = false;
+        btn.textContent = "re-capture tour";
+        const s = j.summary;
+        setTourStatus(
+            s ? `${s.panos} panos · ${s.minimaps} maps${s.proxy ? " · proxy" : ""}` : "done",
+        );
+    } else {
+        btn.disabled = false;
+        btn.textContent = "capture tour";
+        setTourStatus("");
+    }
+}
+
+function stopTourPoll() {
+    if (tourTimer) {
+        clearInterval(tourTimer);
+        tourTimer = null;
+    }
+}
+
+function pollTour() {
+    stopTourPoll();
+    const seq = openSeq;
+    const tick = async () => {
+        if (seq !== openSeq || !current) return stopTourPoll();
+        let job;
+        try {
+            job = await api.tourCaptureStatus(current.run, current.slot, current.model);
+        } catch {
+            return; // transient — retry next tick
+        }
+        if (seq !== openSeq) return stopTourPoll();
+        tourJob = job;
+        renderTour();
+        if (!job.running) {
+            stopTourPoll();
+            // A fresh capture published new anchors — drop the cached (planned)
+            // overlay so it rebuilds from the captured tour.json; re-show it in
+            // place if it was visible.
+            if (anchorPoints) {
+                const wasVisible = anchorPoints.visible;
+                viewer?.threeScene?.remove(anchorPoints);
+                disposeObj(anchorPoints);
+                anchorPoints = null;
+                if (wasVisible && inputs && inputs.anchors && inputs.anchors.checked) {
+                    void setAnchors(true);
+                }
+            }
+            if (job.status === "done") setStatus("tour capture complete", "var(--green)");
+            else if (job.status === "error") setStatus(`tour capture failed: ${job.error || ""}`, "var(--red)");
+        }
+    };
+    void tick();
+    tourTimer = setInterval(tick, POLL_MS);
+}
+
+async function startTourCapture() {
+    const c = current;
+    if (!c) return;
+    if (tourJob && tourJob.running) return;
+    setStatus("starting tour capture…", "var(--purple)");
+    setTourStatus("starting…");
+    if (inputs && inputs._tourBtn) inputs._tourBtn.disabled = true;
+    try {
+        tourJob = await api.tourCaptureStart(c.run, c.slot, c.model);
+    } catch (e) {
+        setStatus(`tour capture failed: ${e.message}`, "var(--red)");
+        setTourStatus(e.message, true);
+        if (inputs && inputs._tourBtn) inputs._tourBtn.disabled = false;
+        return;
+    }
+    renderTour();
+    pollTour();
+}
+
+// On viewer open: reflect any existing/running capture for this cell.
+async function refreshTour(seq) {
+    if (!current) return;
+    let job;
+    try {
+        job = await api.tourCaptureStatus(current.run, current.slot, current.model);
+    } catch {
+        job = null;
+    }
+    if (seq !== openSeq) return;
+    tourJob = job;
+    renderTour();
+    if (job && job.running) pollTour();
 }
 
 // Pick the front-most patch under the cursor in SCREEN space (project every patch
@@ -3191,6 +3432,7 @@ export async function openSplatViewer(opts) {
     cloudLoaded = false;
     runningAll = false;
     cellStatus = null;
+    tourJob = null;
     splatSource = "surfels";
     trainedUrl = null;
     healedUrl = null;
@@ -3208,6 +3450,7 @@ export async function openSplatViewer(opts) {
     buildControls(opts.summary || null);
     renderStepper();
     void refreshAssetSource();
+    void refreshTour(seq);
     if (opts.url) {
         cloudLoaded = true;
         setStatus("loading…", "var(--purple)");
