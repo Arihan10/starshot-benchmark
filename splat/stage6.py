@@ -458,9 +458,17 @@ class TrainParams:
     # model would be pruned the moment this switched on. Split, don't delete.
     #
     # Enabling this multiplies the count (~2^k for k rounds down to threshold), so
-    # give it a window that ENDS well before `refine_stop_iter` and leave the VRAM
-    # guard (or a `cap_max`) as the backstop.
-    refine_scale2d_stop_iter: int = 0
+    # the window ENDS well before `refine_stop_iter` (8k of the reference 30k, vs a
+    # 15k refine stop) leaving 7k steps of settling, and the VRAM guard — which now
+    # pauses growth reversibly instead of latching refinement off — is the backstop.
+    #
+    # MEASURED, same cell, same references, 30k steps: off -> 559,823 splats at a
+    # 83 px median projected radius, 27.41 dB. On -> 1,536,708 at 22.8 px, 28.73 dB,
+    # at the SAME 126 ms/step because smaller Gaussians touch fewer tiles (render
+    # 47.3 -> 38.1 ms, densification bookkeeping 35.7 -> 11.2 ms). It also let
+    # opacity and colour converge: opacity p50 0.997 -> 0.189, DC luma 0.512 ->
+    # 0.347 against a 0.285 reference.
+    refine_scale2d_stop_iter: int = 8000
     grow_scale2d: float = 0.05
     prune_scale2d: float = 1.0
     # Keep pruning below the opacity a CORRECT glass pane converges to — which is
