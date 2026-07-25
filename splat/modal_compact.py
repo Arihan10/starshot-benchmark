@@ -328,6 +328,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     keep = _select_keep(
         torch, weights, original["sh0"], original["opacities"], original["means"],
         surf_means, params.compact_eps, surface_max_dist, keep_target,
+        alpha_floor=params.prune_opa,
     )
     n_offsurf = 0
     if surf_means is not None:
@@ -386,7 +387,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
         loss = _supervision_loss(
             torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
             pred_rgb, pred_alpha, pred_depth, normals, nfd, distort, None,
-            normals_active=True, dist_active=False,
+            normals_active=True, dist_active=False, scene_scale=scene_scale,
         )
         loss.backward()
         for opt in optimizers.values():

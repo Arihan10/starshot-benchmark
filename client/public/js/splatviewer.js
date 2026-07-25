@@ -109,18 +109,18 @@ let modalPrev = null; // previous poll's cell.modal.status (to catch the done tr
 let modalLog = []; // accumulated remote-train heartbeat lines (the live log pane)
 let modalPlanShown = false; // one-time: revealed the camera overlay when the plan arrived mid-run
 // Client-owned Stage-6 training length (the server injects NO defaults — see
-// server ModalTrainRequest / splat stage6 resolve_schedule). `epochs` = passes
-// over the view set → iterations = epochs × n_views (scene-size independent,
-// since a bigger scene has proportionally more views); `batch` is the GPU-fill
-// speed knob (steps = iterations // batch, constant work). Edited in the "train
-// on modal" panel; sent with every start.
-// Default 6 assumes the SURFEL INIT (stage 6 params.init="surfels": geometry
-// starts at the 2DGS solution, training only polishes blend errors). Small
-// scenes (≤ ~1k views) benefit from 10-12 to give densification enough steps;
-// from-points A/B runs want roughly double.
+// server ModalTrainRequest / splat stage6 TrainParams). `iterations` is the
+// OPTIMIZER-STEP count, the same quantity PostShot's step box and gsplat's
+// max_steps mean, and the length every densification cadence is written against;
+// `batch` is how many reference views each step averages, so it multiplies work
+// per step and never shortens the run. Edited in the "train on modal" panel;
+// sent with every start.
+// 30k is reference/PostShot parity. Shorter runs are better expressed as
+// `epochs` (passes over the view set) on the request, which rescales every
+// cadence with the step count instead of truncating the schedule.
 let modalTrainCfg = {
-    epochs: 6,
-    batch: 3,
+    iterations: 30000,
+    batch: 1,
 };
 
 // Camera rig (splatcam.js) — the same orbit + first-person controls as the main
@@ -3143,12 +3143,12 @@ function modalCfgControls(disabled) {
         "div",
         { class: "svc-modal-cfg" },
         numRow(
-            "epochs",
-            "epochs",
-            1,
-            1,
+            "steps",
+            "iterations",
+            1000,
             200,
-            "passes over the view set → iterations = epochs × number of views",
+            200000,
+            "optimizer steps (PostShot's step box / gsplat max_steps); 30k is reference parity",
         ),
         numRow(
             "batch",
@@ -3156,7 +3156,7 @@ function modalCfgControls(disabled) {
             1,
             1,
             32,
-            "views per optimizer step (fills the GPU); speed knob at constant work",
+            "views averaged per optimizer step — multiplies work per step, does not shorten the run",
         ),
     );
 }
@@ -3348,7 +3348,7 @@ async function startModalTrain(restart = false, mode = "train") {
         await api.splatModalStart(current.run, current.slot, current.model, {
             restart,
             mode,
-            epochs: modalTrainCfg.epochs,
+            iterations: modalTrainCfg.iterations,
             batch: modalTrainCfg.batch,
         });
     } catch (e) {
