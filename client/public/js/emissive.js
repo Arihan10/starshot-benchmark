@@ -99,6 +99,17 @@ function makeGlow(object, o) {
 		const mats = Array.isArray(m.material) ? m.material : [m.material];
 		for (const mat of mats) {
 			if (!mat) continue;
+			// Only materials whose shader HAS an `emissive` uniform may carry one.
+			// Every lit material (Standard/Physical/Phong/Lambert/Toon) initialises
+			// `emissive` in its constructor; MeshBasicMaterial has none — and
+			// three.js's refreshUniformsCommon dereferences `uniforms.emissive.value`
+			// for ANY material with a truthy `emissive`, so stamping one onto an unlit
+			// material throws on the first render. This skips the alpha-tested DEPTH
+			// PROXIES prepareLitScene attaches to transparent meshes (a glass lamp
+			// shade / lit panel gets one): they're colorWrite:false, so glowing them
+			// would be a no-op anyway, and their default-white `color` would wash out
+			// the cast light's tint below.
+			if (mat.emissive === undefined) continue;
 			mat.emissive = new THREE.Color(0xffffff);
 			if (mat.map) mat.emissiveMap = mat.map; // glow follows the fixture's texture
 			mat.emissiveIntensity = o.glowIntensity;

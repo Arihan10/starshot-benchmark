@@ -16,11 +16,13 @@
 //   • bird's-eye minimaps  one top-down slice per storey (Y level)
 //   • tour.json manifest    positions + filenames tying the above together
 //
-// Rendering uses splatlight.js (prepareLitScene + createLightRig +
-// applyMeshToneMapping) — the SAME single-pass lit rig the debug mesh viewer
-// (scene3d.js) uses, so the panos match the viewer (matte-dielectric PBR under a
-// fixed sun + hemisphere fill + neutral IBL, ACES-filmic + sRGB, real shadows,
-// and per-fragment depth proxies so solid parts of transparent meshes occlude).
+// Rendering goes through capturecore.js — the SAME pipeline Stage 5 uses, not a
+// lookalike: the same renderer configuration, the same per-object material prep
+// (reflective.js's matte discriminator + oit.js's transparent-mesh patch), the
+// same emissive / sun / IBL / shadow / reflection-probe bakes, and the same
+// weighted-blended OIT + ACES-filmic present. A pano is therefore the same pixels
+// a Stage-5 reference would be from that position; only the camera pattern (cube
+// faces → equirect) differs.
 //
 // Protocol (server = server/app/api/routes.py):
 //   1. GET  {api}/runs/{run}/tour/capture/{slot}/{model}/manifest?token=…
@@ -38,14 +40,17 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
-import { GLTFExporter } from "three/addons/exporters/GLTFExporter.js";
+import { normalizeLighting } from "./splatlight.js";
+// The render pipeline is SHARED with Stage 5 (splatcapture.js) — see
+// capturecore.js. The ONLY difference between the two captures is the camera
+// pattern: six 90° cube faces per anchor here, the planned directed views there.
 import {
-    normalizeLighting,
-    prepareLitScene,
-    applyMeshToneMapping,
-    createLightRig,
-} from "./splatlight.js";
-import { applyEmissiveLighting } from "./emissive.js";
+    createCapture,
+    createCaptureRenderer,
+    prepareCaptureObject,
+    readTargetTopDown,
+    setupCaptureLighting,
+} from "./capturecore.js";
 
 const DECODE_WORKERS = Math.min(4, navigator.hardwareConcurrency || 2);
 const MAX_PARSE_INFLIGHT = 4; // concurrent GLB parses while streaming the bundle
@@ -117,8 +122,9 @@ function cellPath(tail) {
     );
 }
 
-// Heartbeat during the long, upload-free phases (scene load + shadow bake) so the
-// server's stall timer only fires on a genuinely dead session.
+// Heartbeat so the server's stall timer only fires on a genuinely dead session.
+// Uploads already beat; this covers the upload-free phases (scene load, the
+// shadow/reflection bakes, and the projection-proxy bake).
 async function beat() {
     try {
         await fetch(stagePath("/beat"), { method: "POST" });
@@ -127,10 +133,28 @@ async function beat() {
     }
 }
 
+// A steady background heartbeat for the WHOLE capture. Any phase that yields to
+// the event loop (even briefly) stays alive without sprinkling beat() everywhere;
+// a phase that blocks the main thread (e.g. the monolithic GLB serialize) still
+// needs a fresh beat right before it + a generous server stall window. Big scenes
+// (hundreds of objects) spend real time in the proxy bake, and a silent capture
+// there is exactly what used to trip the stall.
+let _keepalive = null;
+function startKeepalive() {
+    stopKeepalive();
+    _keepalive = setInterval(() => void beat(), 5000);
+}
+function stopKeepalive() {
+    if (_keepalive) {
+        clearInterval(_keepalive);
+        _keepalive = null;
+    }
+}
+
 // --- scene loading (SMB1 bundle → GLTFLoader.parse) --------------------------
 // Mirrors splatcapture.js: one streamed request for the whole scene, each GLB
-// parsed as it arrives. Materials get the shared lit-tier prep (prepareLitScene),
-// and each object's root carries its id so the proxy keeps per-object identity.
+// parsed as it arrives and handed to capturecore's shared per-object prep, which
+// also stamps its id so the proxy keeps per-object identity.
 
 function byteStreamReader(reader) {
     const chunks = [];
@@ -202,8 +226,10 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
-                prepareLitScene(gltf.scene);
-                gltf.scene.userData.objectId = id; // identity for the proxy + emissive.js
+                // id stamp (emissive.js / reflective.js match on it) + the matte
+                // discriminator + the OIT patch — the same prep Stage 5 does, so
+                // the panos shade identically. See capturecore.js.
+                prepareCaptureObject(gltf.scene, id);
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -221,31 +247,6 @@ async function loadScene(renderer, bundleUrl) {
 
 // --- renderer ----------------------------------------------------------------
 
-function createRenderer(faceSize) {
-    const renderer = new THREE.WebGLRenderer({
-        antialias: true,
-        alpha: false,
-        // Read the drawing buffer back AFTER render (readPixels) — the panos and
-        // minimaps are captured straight off the canvas, so it must survive.
-        preserveDrawingBuffer: true,
-        powerPreference: "high-performance",
-    });
-    if (!renderer.capabilities.isWebGL2) throw new Error("WebGL2 unavailable");
-    renderer.setPixelRatio(1); // 1 device px per canvas px → exact readback sizes
-    renderer.setSize(faceSize, faceSize, false);
-    // The shared display transform (linear → ACES-filmic → sRGB) + shadows. Shadow
-    // maps auto-update (the default): the scene is static, but re-baking each face
-    // is cheap at this view count and avoids the stale/uninitialized shadow-map
-    // pitfalls of freezing them without the capture's multi-pass bake.
-    applyMeshToneMapping(renderer);
-    document.body.appendChild(renderer.domElement);
-    renderer.domElement.addEventListener("webglcontextlost", (e) => {
-        e.preventDefault();
-        fail(new Error("WebGL context lost"));
-    });
-    return renderer;
-}
-
 function rendererName(renderer) {
     const gl = renderer.getContext();
     const info = gl.getExtension("WEBGL_debug_renderer_info");
@@ -254,33 +255,18 @@ function rendererName(renderer) {
 
 // Read the current drawing buffer as a top-down {data,width,height} (readPixels
 // is bottom-up; flip rows so it matches the equirect stitch's image convention).
-function readCanvasTopDown(gl, w, h) {
-    const raw = new Uint8Array(w * h * 4);
-    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, raw);
-    const data = new Uint8ClampedArray(w * h * 4);
-    const rowBytes = w * 4;
-    for (let row = 0; row < h; row++) {
-        const src = (h - 1 - row) * rowBytes;
-        data.set(raw.subarray(src, src + rowBytes), row * rowBytes);
-    }
-    return { data, width: w, height: h };
-}
-
 // --- 360° panorama capture ---------------------------------------------------
 
-// Render the six cube faces (90° fov) from `pos` and read each back as a
-// top-down face image. Full parity with the lit viewer (ACES, sRGB, shadows,
-// IBL). Orientation-independent — the face cameras are axis-aligned.
-function renderPanoFaces(renderer, scene, pos, near, far, faceSize) {
-    const gl = renderer.getContext();
-    const faceCam = new THREE.PerspectiveCamera(90, 1, near, far);
-    faceCam.position.set(pos[0], pos[1], pos[2]);
+// Render the six cube faces (90° fov) from `pos` through the SHARED capture
+// pipeline and read each back top-down. Each face is one `renderView` — the exact
+// call Stage 5 makes for a reference view — so glass, reflections, shadows and the
+// ACES present are identical. `opaque` forces alpha to 255: rtColor's alpha is OIT
+// coverage (0 over background), and a JPEG needs solid pixels.
+function renderPanoFaces(renderer, capture, scene, pos, faceSize) {
     const faces = [];
     for (const { f, up } of PANO_FACES) {
-        faceCam.up.set(up[0], up[1], up[2]);
-        faceCam.lookAt(pos[0] + f[0], pos[1] + f[1], pos[2] + f[2]);
-        renderer.render(scene, faceCam);
-        faces.push(readCanvasTopDown(gl, faceSize, faceSize));
+        capture.renderView(scene, pos, { forward: f, up });
+        faces.push(readTargetTopDown(renderer, capture.rtColor, faceSize, faceSize, true));
     }
     return faces;
 }
@@ -394,10 +380,17 @@ function groupAnchorLevels(positions) {
 // Render one top-down orthographic slice (a horizontal slab at camera level, roof
 // cut open) into a PNG blob. The ortho camera looks straight down with -Z "up" in
 // the image, so the stored `bounds` map world (x,z) → image (left,top).
-async function captureMinimapBlob(renderer, scene, bounds, cutTop, cutBottom, yTop, yBot) {
-    const gl = renderer.getContext();
-    const prevSize = renderer.getSize(new THREE.Vector2());
-
+async function captureMinimapBlob(
+    renderer,
+    scene,
+    bounds,
+    cutTop,
+    cutBottom,
+    yTop,
+    yBot,
+    background,
+    exposure,
+) {
     const W = bounds.maxX - bounds.minX;
     const D = bounds.maxZ - bounds.minZ;
     const cx = (bounds.minX + bounds.maxX) / 2;
@@ -423,23 +416,29 @@ async function captureMinimapBlob(renderer, scene, bounds, cutTop, cutBottom, yT
     const planeTop = new THREE.Plane(new THREE.Vector3(0, -1, 0), cutTop);
     const planeBottom = new THREE.Plane(new THREE.Vector3(0, 1, 0), -cutBottom);
     const prevClip = renderer.clippingPlanes;
-    const prevShadow = renderer.shadowMap.enabled;
-    const prevClear = renderer.getClearColor(new THREE.Color());
-    const prevAlpha = renderer.getClearAlpha();
-
+    // The slice needs its own capture instance (it isn't square like a cube face),
+    // but it runs the SAME pipeline — so the slab is lit, glazed and tone-mapped
+    // exactly like the panos. Shadows stay ENABLED on purpose: the map is baked and
+    // frozen, and toggling shadowMap.enabled would recompile every material and
+    // could leave a stale map for the passes that follow.
+    const mini = createCapture(
+        renderer,
+        pw,
+        ph,
+        0.1,
+        Math.max(1, yTop - yBot + 4),
+        50,
+        background,
+        exposure,
+    );
     let data;
     try {
-        renderer.shadowMap.enabled = false; // flat floor-plan reads clearer
         renderer.clippingPlanes = [planeTop, planeBottom];
-        renderer.setClearColor(0x0c0d10, 1);
-        renderer.setSize(pw, ph, false);
-        renderer.render(scene, cam);
-        data = readCanvasTopDown(gl, pw, ph);
+        mini.renderCamera(scene, cam);
+        data = readTargetTopDown(renderer, mini.rtColor, pw, ph, true);
     } finally {
         renderer.clippingPlanes = prevClip;
-        renderer.shadowMap.enabled = prevShadow;
-        renderer.setClearColor(prevClear, prevAlpha);
-        renderer.setSize(prevSize.x, prevSize.y, false);
+        mini.dispose();
     }
 
     const crop = document.createElement("canvas");
@@ -456,7 +455,7 @@ async function captureMinimapBlob(renderer, scene, bounds, cutTop, cutBottom, yT
 
 // Group anchors by level, render + upload one slice per level, and return the
 // manifest `minimaps` array (empty on any failure — the tour stays valid).
-async function buildMinimaps(renderer, scene, positions, onLevel) {
+async function buildMinimaps(renderer, scene, positions, background, exposure, onLevel) {
     if (positions.length === 0) return [];
     const box = new THREE.Box3().setFromObject(scene);
     if (box.isEmpty()) return [];
@@ -479,6 +478,8 @@ async function buildMinimaps(renderer, scene, positions, onLevel) {
             levels[li].minY - MINIMAP_SLICE_BELOW,
             box.max.y,
             box.min.y,
+            background,
+            exposure,
         );
         await uploadMinimap(`minimap-${li}`, blob);
         minimaps.push({ level: li, y: levels[li].y, file: `minimap-${li}.png`, bounds });
@@ -529,35 +530,151 @@ function pickIdOf(obj) {
 // the binary GLB ArrayBuffer, or null when the scene has no meshes.
 async function buildMergedSceneGlbBuffer(scene) {
     scene.updateMatrixWorld(true);
-    const root = new THREE.Group();
-    const mat = new THREE.MeshStandardMaterial();
-    const geoms = [];
-    const objNodes = new Map();
+    // Gather the meshes first (cheap), then bake world geometry in a loop that
+    // YIELDS periodically — a several-hundred-object scene would otherwise block
+    // the main thread long enough to starve the keepalive heartbeat. Group the
+    // baked position (+index) arrays by object id so encodeGlb keeps per-object
+    // nodes (the server's decimation preserves those for object highlighting).
+    const meshes = [];
     scene.traverse((o) => {
-        if (!o.isMesh || !o.geometry) return;
-        if (o.userData?.__depthProxy) return; // prepareLitScene's depth-only twins
-        const g = bakeWorldGeometry(o);
-        if (!g) return;
-        const id = pickIdOf(o);
-        const key = id ?? "";
-        let node = objNodes.get(key);
-        if (!node) {
-            node = new THREE.Group();
-            if (id) node.name = id;
-            objNodes.set(key, node);
-            root.add(node);
-        }
-        node.add(new THREE.Mesh(g, mat));
-        geoms.push(g);
+        if (o.isMesh && o.geometry) meshes.push(o);
     });
-    if (geoms.length === 0) return null;
-    try {
-        const exporter = new GLTFExporter();
-        return await exporter.parseAsync(root, { binary: true, onlyVisible: false });
-    } finally {
-        for (const g of geoms) g.dispose();
-        mat.dispose();
+    const groups = new Map(); // id -> [{ pos: Float32Array, idx: Uint32Array|null }]
+    for (let i = 0; i < meshes.length; i++) {
+        const o = meshes[i];
+        const g = bakeWorldGeometry(o);
+        if (g) {
+            const pos = g.getAttribute("position").array;
+            const index = g.getIndex();
+            const idx = index
+                ? index.array instanceof Uint32Array
+                    ? index.array
+                    : new Uint32Array(index.array)
+                : null;
+            const id = pickIdOf(o) ?? "";
+            const list = groups.get(id) ?? groups.set(id, []).get(id);
+            list.push({ pos, idx });
+        }
+        if ((i & 63) === 63) await sleep(0); // let the keepalive flush
     }
+    if (groups.size === 0) return null;
+    await beat(); // fresh stall window before the (fast) serialize
+    return encodeGlb(groups);
+}
+
+// A minimal position(+index)-only binary GLB writer. GLTFExporter is far too slow
+// for a several-hundred-object scene (its dedup / material / per-accessor
+// validation passes dominate — minutes), and the projection proxy is pure
+// geometry the server decimates anyway. This packs the baked world-space positions
+// straight into one binary chunk: one node per object id (name kept so the server
+// keeps per-object identity through decimation), one primitive per source mesh.
+function encodeGlb(groups) {
+    const GL_FLOAT = 5126;
+    const GL_UINT = 5125;
+    const ARRAY_BUFFER = 34962;
+    const ELEMENT_ARRAY_BUFFER = 34963;
+    const align4 = (n) => (n + 3) & ~3;
+
+    const accessors = [];
+    const bufferViews = [];
+    const meshes = [];
+    const nodes = [];
+    const chunks = []; // typed arrays, in bufferView order
+    let byteOffset = 0;
+
+    const pushView = (arr, target) => {
+        bufferViews.push({ buffer: 0, byteOffset, byteLength: arr.byteLength, target });
+        chunks.push(arr);
+        byteOffset = align4(byteOffset + arr.byteLength);
+        return bufferViews.length - 1;
+    };
+
+    for (const [id, prims] of groups) {
+        const primitives = [];
+        for (const { pos, idx } of prims) {
+            let mnx = Infinity;
+            let mny = Infinity;
+            let mnz = Infinity;
+            let mxx = -Infinity;
+            let mxy = -Infinity;
+            let mxz = -Infinity;
+            for (let i = 0; i < pos.length; i += 3) {
+                const x = pos[i];
+                const y = pos[i + 1];
+                const z = pos[i + 2];
+                if (x < mnx) mnx = x;
+                if (y < mny) mny = y;
+                if (z < mnz) mnz = z;
+                if (x > mxx) mxx = x;
+                if (y > mxy) mxy = y;
+                if (z > mxz) mxz = z;
+            }
+            const posAcc = accessors.length;
+            accessors.push({
+                bufferView: pushView(pos, ARRAY_BUFFER),
+                componentType: GL_FLOAT,
+                count: pos.length / 3,
+                type: "VEC3",
+                min: [mnx, mny, mnz],
+                max: [mxx, mxy, mxz],
+            });
+            const prim = { attributes: { POSITION: posAcc }, mode: 4 };
+            if (idx) {
+                prim.indices = accessors.length;
+                accessors.push({
+                    bufferView: pushView(idx, ELEMENT_ARRAY_BUFFER),
+                    componentType: GL_UINT,
+                    count: idx.length,
+                    type: "SCALAR",
+                });
+            }
+            primitives.push(prim);
+        }
+        nodes.push({ name: id || undefined, mesh: meshes.length });
+        meshes.push({ primitives });
+    }
+
+    const gltf = {
+        asset: { version: "2.0", generator: "tourcapture" },
+        scene: 0,
+        scenes: [{ nodes: nodes.map((_, i) => i) }],
+        nodes,
+        meshes,
+        accessors,
+        bufferViews,
+        buffers: [{ byteLength: byteOffset }],
+    };
+
+    let jsonBytes = new TextEncoder().encode(JSON.stringify(gltf));
+    const jsonPadded = align4(jsonBytes.length);
+    const HEADER = 12;
+    const CHUNK_HEADER = 8;
+    const binStart = HEADER + CHUNK_HEADER + jsonPadded + CHUNK_HEADER;
+    const total = binStart + byteOffset;
+    const out = new ArrayBuffer(total);
+    const dv = new DataView(out);
+    const u8 = new Uint8Array(out);
+    let p = 0;
+    dv.setUint32(p, 0x46546c67, true); // "glTF"
+    dv.setUint32((p += 4), 2, true);
+    dv.setUint32((p += 4), total, true);
+    dv.setUint32((p += 4), jsonPadded, true);
+    dv.setUint32((p += 4), 0x4e4f534a, true); // "JSON"
+    p += 4;
+    u8.set(jsonBytes, p);
+    u8.fill(0x20, p + jsonBytes.length, p + jsonPadded); // pad JSON with spaces
+    p += jsonPadded;
+    dv.setUint32(p, byteOffset, true);
+    dv.setUint32((p += 4), 0x004e4942, true); // "BIN\0"
+    p += 4;
+    for (let k = 0; k < chunks.length; k++) {
+        const arr = chunks[k];
+        u8.set(
+            new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength),
+            binStart + bufferViews[k].byteOffset,
+        );
+    }
+    return out;
 }
 
 // --- uploads -----------------------------------------------------------------
@@ -645,7 +762,7 @@ async function runCapture() {
     const quality = manifest.pano?.quality || DEFAULT_JPEG_QUALITY;
     status(`job: ${RUN}/${SLOT}/${MODEL} — ${anchors.length} anchors @ ${faceSize}² faces`);
 
-    const renderer = createRenderer(faceSize);
+    const renderer = createCaptureRenderer({ onContextLost: fail });
     const glName = rendererName(renderer);
     status(`WebGL: ${glName}`);
     if (/swiftshader|software|llvmpipe/i.test(glName) && params.get("force") !== "1") {
@@ -663,34 +780,38 @@ async function runCapture() {
     if (loaded === 0) throw new Error("no objects loaded from the mesh bundle");
     await beat();
 
-    // Fixed light rig (shared with Stage 5 + the debug viewer). Emissive meshes
-    // (lamps / screens / fire) glow and cast point light; the sun is fit to the
-    // scene bounds and its shadow map baked ONCE (static scene) below.
+    // The exact Stage-5 bake sequence: emissive fixtures (glow + shadow-casting
+    // point lights) → sun/hemi/IBL rig fitted to the scene → ONE shadow bake over
+    // both layers → per-object scene reflection probes.
     const lighting = normalizeLighting(manifest.lighting || {});
-    const sceneBox = new THREE.Box3().setFromObject(scene);
-    // Emissive glow + point lights are a nice-to-have; never let them abort the
-    // whole capture (the sun + IBL below carry the lighting). `castShadow:false` —
-    // we render each face in a SINGLE plain pass (unlike the splat capture's
-    // layered multi-pass), and several shadow-casting point lights in one pass
-    // overrun the light/shadow uniform budget; the fixtures still glow + illuminate.
-    let emissive = { count: 0 };
-    try {
-        emissive = applyEmissiveLighting(scene, scene, { castShadow: false });
-    } catch (e) {
-        status(`emissive skipped: ${e.message}`, "err");
-    }
+    const background = manifest.background || [0, 0, 0];
+    const { emissive, refl, sceneBox } = setupCaptureLighting(renderer, scene, {
+        lighting,
+        background,
+    });
     if (emissive.count > 0) status(`emissive: ${emissive.count} light source(s)`);
-    const rig = createLightRig(renderer, scene, { defaults: lighting });
-    rig.refit(sceneBox);
     status(
         `lighting: env ${lighting.env} · sun ${lighting.key} @ ${lighting.azimuth}°/` +
             `${lighting.elevation}° · exposure ${lighting.exposure}`,
     );
+    if (refl.probes > 0) status(`reflections: ${refl.probes} scene probe(s) baked`);
 
     // Camera clip range from the scene bounds: near tight, far past the far wall.
     const diag = sceneBox.isEmpty() ? 50 : sceneBox.getSize(new THREE.Vector3()).length();
     const near = 0.05;
     const far = Math.max(50, diag * 3);
+    // One capture for every cube face: square, 90° fov — the same pipeline object
+    // Stage 5 drives, just pointed six ways per anchor instead of along a plan.
+    const capture = createCapture(
+        renderer,
+        faceSize,
+        faceSize,
+        near,
+        far,
+        90,
+        background,
+        lighting.exposure ?? 1.0,
+    );
     await beat();
 
     // --- panos, one per anchor ---
@@ -701,7 +822,7 @@ async function runCapture() {
         const pos = Array.isArray(a.position) ? a.position : [0, 0, 0];
         const id = typeof a.id === "string" && a.id ? a.id : `anchor-${String(i).padStart(3, "0")}`;
         progress(`capturing pano ${i + 1}/${anchors.length} (${id})…`);
-        const faces = renderPanoFaces(renderer, scene, pos, near, far, faceSize);
+        const faces = renderPanoFaces(renderer, capture, scene, pos, faceSize);
         const blob = await stitchPanoBlob(faces, faceSize, panoWidth, quality);
         await uploadPano(id, blob);
         panoMeta.push({
@@ -723,6 +844,8 @@ async function runCapture() {
             renderer,
             scene,
             panoMeta.map((p) => p.position),
+            background,
+            lighting.exposure ?? 1.0,
             (li, n) => progress(`rendering minimap ${li + 1}/${n}…`),
         );
         status(`minimaps: ${minimaps.length} level(s)`);
@@ -773,9 +896,12 @@ async function runCapture() {
                     "launched by the server's tour-capture job",
             );
         }
+        startKeepalive();
         await runCapture();
     } catch (e) {
         console.error(e);
         await fail(e);
+    } finally {
+        stopKeepalive();
     }
 })();

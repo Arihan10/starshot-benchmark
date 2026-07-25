@@ -168,7 +168,12 @@ async function bakeColors(doc, sampleSize) {
           .setEmissiveTexture(null)
           .setBaseColorFactor([1, 1, 1, 1])
           .setMetallicFactor(0)
-          .setRoughnessFactor(1);
+          .setRoughnessFactor(1)
+          // The bake writes COLOR_0 alpha = 255 for every vertex, so nothing here
+          // is see-through. Leaving the source's BLEND would make a glTF viewer
+          // draw the WHOLE dollhouse in the transparent queue with depth writes
+          // off — every mesh sorted by centroid, walls showing through each other.
+          .setAlphaMode("OPAQUE");
       }
     }
   }

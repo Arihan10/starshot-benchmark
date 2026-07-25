@@ -229,18 +229,37 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/stage6/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
-    // Matterport tour capture (headless walkthrough). `tourAnchors` plans this
-    // cell's 360° capture anchors (read-only LLM pass — the "where the cameras
-    // go" preview). `tourCaptureStart` runs the whole headless capture (plan →
+    // Matterport tour capture (headless walkthrough). Anchor planning is a
+    // BACKGROUND job (one reasoning call per zone — minutes each), so
+    // `tourAnchorsStart` kicks it off and returns the job immediately and
+    // `tourAnchorsStatus` polls it ({running, status, total, anchors, error});
+    // holding a request open for the whole plan would let a dropped connection
+    // cancel it. `tourCaptureStart` runs the whole headless capture (plan →
     // render panos/minimaps/proxy → tour.json → publish to R2/D1);
     // `tourCaptureStatus` polls the live job ({running, phase, total, summary,
     // error, url}) — its `url` is the captured tour.json when present.
-    tourAnchors: (run, slot, model) =>
+    tourAnchorsStart: (run, slot, model) =>
         request(cellPath(slot, model, "/anchors"), { method: "POST", params: { run } }),
+    tourAnchorsStatus: (run, slot, model) =>
+        request(cellPath(slot, model, "/anchors"), { params: { run } }),
     tourCaptureStart: (run, slot, model) =>
         request(cellPath(slot, model, "/tour/capture"), { method: "POST", params: { run } }),
     tourCaptureStatus: (run, slot, model) =>
         request(cellPath(slot, model, "/tour/capture"), { params: { run } }),
+    // The tours page: `tours` lists every cell with a PLANNED or CAPTURED tour
+    // (scanned off disk, so it survives restarts) plus its publish state.
+    // Publishing bakes the dollhouse and — unless STARSHOT_LOCAL_PUBLISH — uploads
+    // to R2 + D1, so it's a background job: `tourPublish` starts, `…Status` polls.
+    tours: () => request("/tours"),
+    tourPublish: (run, slot, model) =>
+        request(
+            `/tours/${encodeURIComponent(run)}/${encodeURIComponent(slot)}/${encodeURIComponent(model)}/publish`,
+            { method: "POST" },
+        ),
+    tourPublishStatus: (run, slot, model) =>
+        request(
+            `/tours/${encodeURIComponent(run)}/${encodeURIComponent(slot)}/${encodeURIComponent(model)}/publish`,
+        ),
     // On-demand SOG encode of a chosen model (`which`: "trained" | "healed") —
     // runs client/tools/ply-to-sog.mjs on the server host (local, NOT on Modal).
     // Poll splatSogStatus for progress + the per-model `.sog` url.

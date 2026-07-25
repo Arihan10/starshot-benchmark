@@ -3,7 +3,6 @@ import {
 	type Group,
 	type Material,
 	Mesh,
-	type PerspectiveCamera,
 	PlaneGeometry,
 	type Scene,
 	type ShaderMaterial,
@@ -18,16 +17,17 @@ import {
 } from "./materials";
 import type { PanoEntry } from "./panoTextures";
 
-// View-dependent texture mapping. Owns the shared projection shader (one
-// material across every proxy mesh + the floor base) and, each frame, blends the
-// K captures nearest the camera onto the proxy geometry — gluing the panos to
-// real surfaces so they parallax correctly as you move. The backdrop sphere is
-// driven here too (its nearest pano is the projected sky).
+// View-dependent texture mapping. Owns the shared projection shader (one material
+// across every proxy mesh, the floor base, AND the backdrop sphere) and projects
+// an explicit, focused set of captures onto it each frame — gluing the panos to
+// real surfaces so they parallax as you move. The walkthrough only ever sits AT a
+// capture (project that one) or glides BETWEEN two (project the from/to pair,
+// time-weighted), so the set is never more than the couple you're actually
+// travelling through — see `project`.
 export class Projection {
 	readonly material: ShaderMaterial = makeProjectionMaterial();
 	private base: Mesh | null = null;
 	private backdropRadius = SPHERE_RADIUS;
-	private readonly camDist2: number[] = [];
 
 	get proxyBase(): Mesh | null {
 		return this.base;
@@ -35,7 +35,7 @@ export class Projection {
 
 	// Re-skin proxy meshes with the projection shader, recompute normals (the
 	// decimation dropped usable ones), and size the backdrop to the scene extent.
-	setup(root: Group, sphereA: Mesh, sphereAMat: ShaderMaterial) {
+	setup(root: Group, sphereA: Mesh) {
 		root.traverse((o) => {
 			const m = o as Mesh;
 			if (!m.isMesh || !m.geometry) return;
@@ -46,64 +46,61 @@ export class Projection {
 		const box = new Box3().setFromObject(root);
 		const sph = box.getBoundingSphere(new Sphere());
 		this.backdropRadius = Math.max(80, sph.radius * 4);
+		// The backdrop wears the SAME VDTM material as the proxy, so the far field is
+		// the identical continuous K-capture blend as the near field. Driving it from a
+		// single "nearest capture" equirect instead made it hard-cut every time the
+		// nearest changed — and mid-move the nearest is often a THIRD anchor you pass
+		// close to, so its whole vantage flashed across the sky for a few frames (and
+		// flickered outright wherever two captures were near-equidistant). Blending
+		// removes the switch entirely and matches the proxy across its silhouette.
+		// The shader is world-space (it measures direction from each capture's centre),
+		// so the sphere is free to ride with the camera — no placement invariant.
+		sphereA.material = this.material;
 		sphereA.scale.setScalar(this.backdropRadius / SPHERE_RADIUS);
 		sphereA.renderOrder = -1;
-		sphereAMat.uniforms.opacity.value = 1;
-		sphereAMat.depthTest = true; // let the opaque proxy occlude the backdrop
 	}
 
-	update(
-		camera: PerspectiveCamera,
+	// Project an explicit set of captures (index → weight) onto the proxy + the
+	// backdrop. `caps` is the FOCUSED set the engine hands us: one capture at rest,
+	// or the from/to pair while gliding a hop (time-weighted). We deliberately do
+	// NOT blend the K nearest by camera distance — that re-showed every anchor you
+	// merely pass near as a faint, offset room on the far backdrop (their parallax
+	// can't cancel at sphere range → "duplicated many times") and lurched whenever
+	// the nearest set churned (the mid-hop flash). A capture only contributes once
+	// its texture is resident; a blurred placeholder counts, so we never block.
+	project(
 		panos: PanoEntry[],
+		caps: ReadonlyArray<readonly [number, number]>,
 		request: (i: number) => void,
 		sphereA: Mesh,
-		sphereAMat: ShaderMaterial,
+		camPos: Vector3,
 	) {
-		if (panos.length === 0) return;
 		const u = this.material.uniforms;
-		const cam = camera.position;
-		this.camDist2.length = panos.length;
-		for (let i = 0; i < panos.length; i++) {
-			const p = panos[i].position;
-			const dx = cam.x - p[0];
-			const dy = cam.y - p[1];
-			const dz = cam.z - p[2];
-			this.camDist2[i] = dx * dx + dy * dy + dz * dz;
-		}
-		const order = panos
-			.map((_, i) => i)
-			.sort((a, b) => this.camDist2[a] - this.camDist2[b]);
-		const K = Math.min(PROJ_K, panos.length);
-		// Load on movement: kick off the K nearest captures, but project only the
-		// ones already loaded (blurred placeholder counts) so we never block.
-		const ready: number[] = [];
-		for (let k = 0; k < K; k++) {
-			request(order[k]);
-			if (panos[order[k]].texture) ready.push(order[k]);
+		const ready: Array<[number, number]> = [];
+		for (const [idx, weight] of caps) {
+			const p = panos[idx];
+			if (!p) continue;
+			request(idx);
+			if (p.texture) ready.push([idx, weight]);
 		}
 		let wsum = 0;
-		const w: number[] = [];
-		for (let k = 0; k < ready.length; k++) {
-			const ww = 1 / (this.camDist2[ready[k]] + 0.25);
-			w.push(ww);
-			wsum += ww;
-		}
+		for (const [, weight] of ready) wsum += weight;
+		if (wsum <= 0) wsum = 1;
 		for (let k = 0; k < PROJ_K; k++) {
 			if (k < ready.length) {
-				const idx = ready[k];
+				const [idx, weight] = ready[k];
 				u.uTex.value[k] = panos[idx].texture;
 				(u.uCenter.value[k] as Vector3).fromArray(panos[idx].position);
-				u.uWeight.value[k] = w[k] / wsum;
+				u.uWeight.value[k] = weight / wsum;
 			} else {
 				u.uTex.value[k] = DUMMY_TEX;
 				u.uWeight.value[k] = 0;
 			}
 		}
 		u.uCount.value = ready.length;
-		sphereAMat.uniforms.map.value = ready.length
-			? panos[ready[0]].texture
-			: DUMMY_TEX;
-		sphereA.position.copy(cam);
+		// The backdrop rides the camera so it always encloses it; with a single
+		// capture (at rest) that makes it an exact skybox — zero parallax error.
+		sphereA.position.copy(camPos);
 	}
 
 	// A floor slab spanning the proxy's footprint, sat just under its lowest point,

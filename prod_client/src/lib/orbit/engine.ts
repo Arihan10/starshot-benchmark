@@ -1,16 +1,13 @@
 import {
 	Box3,
 	Color,
-	DirectionalLight,
 	Group,
-	HemisphereLight,
 	type Intersection,
 	type Material,
 	MathUtils,
 	Mesh,
 	MOUSE,
 	type Object3D,
-	NoToneMapping,
 	PerspectiveCamera,
 	Plane,
 	type Quaternion,
@@ -46,11 +43,23 @@ import {
 	WASD_MAX_Y_STEP,
 } from "./markers";
 import { SurfaceCursor } from "./cursor";
+import { LightRig } from "./lighting";
+import { prepareLitScene } from "./prepare";
 import { MarkerLayer } from "./markerLayer";
 import { collectObjects, ObjectAddressing } from "./objectAddressing";
 import { type PanoEntry, PanoStreamer } from "./panoTextures";
 import { Projection } from "./projection";
 import { buildMinimapState, levelForY, type MinimapSlice } from "./minimap";
+import {
+	angleDelta,
+	buildNavGraph,
+	type EdgeType,
+	edgeVerb,
+	type NavEdge,
+	type NavGraph,
+	type NavNode,
+} from "./navGraph";
+import { PASS_DUR_SCALE, planZoneTour, TourDirector } from "./tourDirector";
 import {
 	applyLook,
 	cursorRayDir,
@@ -59,7 +68,10 @@ import {
 	pinLook,
 } from "./look";
 import type {
+	Chapter,
 	Connector,
+	MapEdge,
+	NodeDir,
 	OrbitMode,
 	OrbitState,
 	TourManifest,
@@ -69,8 +81,42 @@ import type {
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 const easeInOut = (t: number) =>
 	t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
-const _cursorNdc = new Vector2(); // scratch: native cursor in NDC for raycastInterior
-const _labelPos = new Vector3(); // scratch: project a hovered ring's anchor to screen
+
+// Duration constancy: a hop's length is felt through speed, not time — a 2 m and
+// a 20 m walk both take the same beat. Phase is deliberately slower (a narrative
+// "we are taking you through anyway"); far is a skippable flight.
+const DUR: Record<EdgeType, number> = {
+	walk: 700,
+	portal: 900,
+	phase: 1200,
+	vertical: 1100,
+	far: 2400,
+};
+const REDUCED_DUR = 260;
+const DWELL_MS = 8500; // idle this long in a node → pulse the exits once
+
+// One revolution at a tour's centrepoint. Slow is the point — it's a look around
+// the room, not a spin. Under reduced motion it's slower still: discomfort tracks
+// angular rate, so stretching the same turn is the gentler knob than cutting it.
+const TOUR_PAN_MS = 10000;
+const TOUR_PAN_MS_REDUCED = 15000;
+
+const _cursorNdc = new Vector2();
+const _bez = new Vector3();
+const quadBezier = (
+	a: Vector3,
+	c: Vector3,
+	b: Vector3,
+	t: number,
+	out: Vector3,
+) => {
+	const u = 1 - t;
+	return out
+		.copy(a)
+		.multiplyScalar(u * u)
+		.addScaledVector(c, 2 * u * t)
+		.addScaledVector(b, t * t);
+};
 
 type Transition = {
 	fromPos: Vector3;
@@ -83,12 +129,22 @@ type Transition = {
 	onEnd?: () => void;
 	midDone: boolean;
 };
-type Glide = {
+// A typed interior traversal (one edge of the nav graph). `ctrl` bends the path
+// (an arc for far/vertical hops); `sphere` crossfades the backdrop in sphere-only
+// tours; `dy` is the height change, which names the arrival ("up/down a level").
+// `pass` marks an anchor the auto tour is only walking through, which shortens the
+// hop and skips the arrival narration.
+type Move = {
 	fromPos: Vector3;
 	toPos: Vector3;
+	ctrl: Vector3 | null;
 	start: number;
 	dur: number;
 	index: number;
+	type: EdgeType;
+	dy: number;
+	sphere: boolean;
+	pass: boolean;
 };
 type SavedInterior = {
 	pos: Vector3;
@@ -98,12 +154,12 @@ type SavedInterior = {
 	fov: number;
 };
 
-// A combined dollhouse + interior walkthrough. OVERVIEW orbits the cell's
-// vertex-colored lite scene with a free-pan camera; stepping INSIDE drops into
-// the pano projection walkthrough. Both live in the SAME world frame, so a "you
-// are here" marker dropped at the interior camera maps onto the dollhouse with
-// no coordinate fixup. All per-frame work mutates three.js / the canvas directly
-// (never React), so the UI only re-renders on discrete state changes.
+// A combined dollhouse + interior walkthrough with a TYPED navigation grammar.
+// OVERVIEW orbits the vertex-colored lite scene; stepping INSIDE drops into the
+// pano walkthrough, where every reachable neighbour is classified into one of
+// five edge types (walk / portal / vertical / phase / far), each with its own
+// affordance and its own transition. All per-frame work mutates three.js / the
+// canvas directly (never React), so the UI only re-renders on discrete changes.
 export class OrbitEngine {
 	private readonly host: HTMLElement;
 	private readonly onState: (s: OrbitState) => void;
@@ -112,15 +168,14 @@ export class OrbitEngine {
 	private readonly renderer: WebGLRenderer;
 	private readonly canvas: HTMLCanvasElement;
 	private readonly travelFade: HTMLDivElement;
-	private readonly destLabel: HTMLDivElement; // floating name tag above a hovered gold ring
+	private readonly iris: HTMLDivElement; // vertical-shaft "hatch" wipe overlay
+	private readonly sonarLabels: HTMLDivElement[] = []; // pooled x-ray name tags
 	private readonly scene: Scene;
 	private readonly camera: PerspectiveCamera;
 	private readonly controls: OrbitControls;
+	private readonly rig: LightRig;
 	private readonly ro: ResizeObserver;
 
-	// Post-processing: the beauty pass plus three OutlinePasses (owned by
-	// ObjectAddressing) that silhouette the pinned connectors (orange + fill) /
-	// right-click selected (orange) / hovered (cyan) objects, then a copy to screen.
 	private readonly composer: EffectComposer;
 
 	private readonly sphereA: Mesh;
@@ -129,49 +184,53 @@ export class OrbitEngine {
 	private readonly sphereBMat: ShaderMaterial;
 	private readonly polyMaterial = makePolyMaterial();
 
-	// Subsystems: pano texture streaming, the projection backdrop, the navigation
-	// marker layer, and per-object addressing. The engine wires them, routes
-	// input, and runs the camera / render loop.
 	private readonly streamer: PanoStreamer;
 	private readonly projection = new Projection();
 	private readonly markers: MarkerLayer;
 	private readonly addressing: ObjectAddressing;
+	private readonly director: TourDirector;
 	private readonly requestPano = (i: number) => this.streamer.request(i);
 
 	private readonly dummyCam = new PerspectiveCamera();
 
-	// Surface-adhering ring cursor (interior only); see SurfaceCursor. The raycast
-	// that finds the point under the cursor is shared with click auto-aim, so it
-	// (cursorRay) stays here and the resulting hit is fed to the cursor each frame.
 	private readonly cursor: SurfaceCursor;
 	private readonly cursorRay = new Raycaster();
+	private readonly occluder = new Raycaster(); // LOS tests for the nav graph
 	private pointerClientX = 0;
 	private pointerClientY = 0;
 	private pointerInside = false;
 
 	private currentIndex = -1;
+	// The capture the fly-in is heading to, projected during enter() before the
+	// arrival is `activate`d (currentIndex is still -1 then). Cleared on arrival.
+	private flyTarget = -1;
 	private projectionMode = false;
-	// Bird's-eye minimap slices (one per Y level) + the level each pano sits on
-	// (its nearest minimap by capture height). Empty when the tour has no slices.
 	private minimaps: MinimapSlice[] = [];
 	private panoLevel: number[] = [];
-	// Held image prefetchers for the slices, so every floor is cached up front and
-	// the floor switcher is instant. Kept referenced so the in-flight loads aren't
-	// GC'd; dropped on the next clearScene.
 	private minimapPrefetch: HTMLImageElement[] = [];
 	private liteRoot: Group | null = null;
 	private proxyGroup: Group | null = null;
 	private sharedOverview = false;
-	private proxyView = false; // overview shows the proxy mesh instead of the lite dollhouse
-	// One matte material per proxy object so the bare proxy reads as distinct
-	// parts; reskinProxy's matte path swaps these in, clearScene disposes them.
+	private proxyView = false;
 	private proxyColorMats: Material[] = [];
-	// Cross-zone connectors from the manifest; their proxy objects are highlighted
-	// and click-to-traverse between zones (see travelThroughConnector). Empty when
-	// the scene has none.
-	private connectors: Connector[] = [];
+	private connectors: Connector[] = []; // parsed but not surfaced (highlights hidden for now)
 	private rcDownX = 0;
 	private rcDownY = 0;
+
+	// The typed navigation graph (built at scene load) + per-scene directory data
+	// the chrome reads for chapters / search / the minimap overlay.
+	private navGraph: NavGraph | null = null;
+	private nodeDir: NodeDir[] = [];
+	private chapters: Chapter[] = [];
+	private mapEdges: MapEdge[] = [];
+
+	// Invariants: a back-stack that retraces the exact path (never blocked), the
+	// set of nodes stood on (minimap fill), and a one-slot input buffer so
+	// chained clicks queue instead of blocking.
+	private history: number[] = [];
+	private visited = new Set<number>();
+	private pendingTravel: number | null = null;
+	private arrival: OrbitState["arrival"] = null;
 
 	private mode: OrbitMode = "empty";
 	private readonly sceneCenter = new Vector3();
@@ -179,7 +238,7 @@ export class OrbitEngine {
 	private readonly browsePos = new Vector3();
 
 	private transition: Transition | null = null;
-	private glide: Glide | null = null;
+	private move: Move | null = null;
 
 	private lon = 0;
 	private lat = 0;
@@ -187,25 +246,21 @@ export class OrbitEngine {
 	private dragMoved = 0;
 	private downX = 0;
 	private downY = 0;
-	// The world direction under the cursor when a look-drag begins. pinLook turns
-	// the camera so this stays welded under the cursor as you drag (see pinLook).
 	private readonly grabDir = new Vector3();
-	// Hover-highlight (cyan fill on the object under the cursor) is on by default;
-	// the toolbar toggle flips this. Persistent right-click selections ignore it.
 	private highlightEnabled = true;
 
 	private interiorBusy = false;
 	private savedInterior: SavedInterior | null = null;
 	private peekHeld = false;
-	// Hold-to-locate slice: a world-space horizontal plane (normal pointing down)
-	// installed globally on the renderer while peeking, so everything above the
-	// cut height is removed — the roof / any floor overhead drops away and you see
-	// into the room you're standing in. Cleared on the way back / on scene swaps.
 	private readonly locateClip = new Plane(new Vector3(0, -1, 0), 0);
 
-	private hoveredTargetIndex = -1;
+	private hoveredNavIndex = -1;
 	private hoveredEntryIndex = -1;
-	private hoveredOccluded = false;
+	private lastInputAt = 0;
+	private dwellPulsed = false;
+	private readonly reducedMotion =
+		typeof window !== "undefined" &&
+		window.matchMedia?.("(prefers-reduced-motion: reduce)").matches;
 
 	private autoRotateTimer: ReturnType<typeof setTimeout> | null = null;
 	private lastFrame = 0;
@@ -223,15 +278,10 @@ export class OrbitEngine {
 		this.onState = onState;
 		this.onHold = onHold;
 
-		// AA comes from the composer's multisampled buffer, so the default
-		// framebuffer doesn't need it (the final pass is a fullscreen blit).
 		this.renderer = new WebGLRenderer({ antialias: false });
 		this.renderer.setPixelRatio(window.devicePixelRatio);
-		this.renderer.toneMapping = NoToneMapping;
-		this.renderer.outputColorSpace = SRGBColorSpace;
+		// The display transform (ACES + sRGB + shadows) is owned by LightRig below.
 		this.canvas = this.renderer.domElement;
-		// CSS-size the canvas to fill the host (buffer stays at w*dpr for crisp
-		// HiDPI); setSize(w,h,false) below avoids overriding these styles.
 		Object.assign(this.canvas.style, {
 			display: "block",
 			width: "100%",
@@ -250,33 +300,22 @@ export class OrbitEngine {
 		});
 		host.appendChild(this.travelFade);
 
-		// Floating tag shown above a hovered gold (behind-wall) ring; positioned every
-		// frame from the anchor's world position (positionDestLabel) so it tracks look.
-		this.destLabel = document.createElement("div");
-		Object.assign(this.destLabel.style, {
+		this.iris = document.createElement("div");
+		Object.assign(this.iris.style, {
 			position: "absolute",
-			display: "none",
-			transform: "translate(-50%, -100%)",
-			padding: "2px 8px",
-			borderRadius: "6px",
-			border: "1px solid rgba(255,206,115,0.35)",
-			background: "rgba(12,13,16,0.78)",
-			color: "#ffd98a",
-			font: "600 11px ui-sans-serif, system-ui, sans-serif",
-			whiteSpace: "nowrap",
+			inset: "0",
+			opacity: "0",
 			pointerEvents: "none",
 			zIndex: "2",
 		});
-		host.appendChild(this.destLabel);
+		host.appendChild(this.iris);
 
 		this.scene = new Scene();
 		this.scene.background = new Color(0x0c0d10);
-		this.scene.add(new HemisphereLight(0xffffff, 0x202028, 1.0));
-		const dir1 = new DirectionalLight(0xffffff, 1.1);
-		dir1.position.set(3, 5, 4);
-		const dir2 = new DirectionalLight(0xffffff, 0.5);
-		dir2.position.set(-3, 2, -2);
-		this.scene.add(dir1, dir2);
+		// Neutral IBL + hemisphere fill + a shadow-casting sun, on the same numbers
+		// the panos were baked with (see lighting.ts) so the dollhouse and the
+		// interior agree.
+		this.rig = new LightRig(this.renderer, this.scene);
 
 		this.camera = new PerspectiveCamera(60, 1, 0.05, 2000);
 		this.camera.position.set(4, 3, 5);
@@ -299,7 +338,6 @@ export class OrbitEngine {
 
 		this.sphereAMat = makePanoMaterial();
 		this.sphereBMat = makePanoMaterial();
-		// Valid sampler before any pano texture loads (panos load lazily now).
 		this.sphereAMat.uniforms.map.value = DUMMY_TEX;
 		this.sphereBMat.uniforms.map.value = DUMMY_TEX;
 		this.sphereA = new Mesh(
@@ -319,17 +357,21 @@ export class OrbitEngine {
 			() => this.loadToken,
 			(i) => this.onPanoReady(i),
 		);
-		this.addressing = new ObjectAddressing(
-			this.scene,
-			this.camera,
-			this.canvas,
+		this.addressing = new ObjectAddressing(this.scene, this.camera, this.canvas);
+		this.director = new TourDirector(
+			{
+				busy: () => this.interiorBusy,
+				hop: (index, pass) => this.traverse(index, false, pass),
+				getLook: () => ({ lon: this.lon, lat: this.lat }),
+				setLook: (lon, lat) => {
+					this.lon = lon;
+					this.lat = lat;
+				},
+				onProgress: () => this.emit(),
+			},
+			this.reducedMotion ? TOUR_PAN_MS_REDUCED : TOUR_PAN_MS,
 		);
 
-		// Outline pipeline. The working buffer is sRGB + multisampled so the
-		// composite matches the direct-render look: the pano / projection shaders
-		// aren't colour-managed, so a linear buffer + OutputPass would re-encode
-		// (shift) their colours — an sRGB buffer copied verbatim avoids that while
-		// keeping MSAA. RenderPass → fill → select outline → hover outline → copy.
 		const composerRT = new WebGLRenderTarget(1, 1, { samples: 4 });
 		composerRT.texture.colorSpace = SRGBColorSpace;
 		this.composer = new EffectComposer(this.renderer, composerRT);
@@ -380,34 +422,63 @@ export class OrbitEngine {
 		this.clearScene();
 		this.cursor.dispose();
 		this.markers.dispose();
+		this.rig.dispose();
 		for (const pass of this.composer.passes) pass.dispose();
 		this.composer.dispose();
 		this.renderer.dispose();
 		this.canvas.remove();
 		this.travelFade.remove();
-		this.destLabel.remove();
+		this.iris.remove();
+		for (const l of this.sonarLabels) l.remove();
 	}
 
-	// The pano list is owned by the streamer; the engine reads positions / ids /
-	// textures straight off it.
 	private get panos(): PanoEntry[] {
 		return this.streamer.list;
+	}
+
+	private navNode(i: number): NavNode | null {
+		return this.navGraph && i >= 0 ? (this.navGraph.nodes[i] ?? null) : null;
+	}
+
+	private edgeBetween(from: number, to: number): NavEdge | null {
+		const node = this.navNode(from);
+		return node?.all.find((e) => e.to === to) ?? null;
+	}
+
+	private noteInput() {
+		this.lastInputAt = performance.now();
+		this.dwellPulsed = false;
 	}
 
 	// --- state emission (gated so chrome holds through camera flights) --------
 
 	private emit() {
 		if (this.mode === "transition") return;
-		const cur =
-			this.currentIndex >= 0 ? this.panos[this.currentIndex] : null;
+		const cur = this.currentIndex >= 0 ? this.panos[this.currentIndex] : null;
+		const node = this.navNode(this.currentIndex);
 		let hover: OrbitState["hover"] = null;
 		if (this.mode === "overview" && this.hoveredEntryIndex >= 0) {
 			const p = this.panos[this.hoveredEntryIndex];
 			hover = { id: p.id, name: p.name, occluded: false };
-		} else if (this.mode === "interior" && this.hoveredTargetIndex >= 0) {
-			const p = this.panos[this.hoveredTargetIndex];
-			hover = { id: p.id, name: p.name, occluded: this.hoveredOccluded };
+		} else if (this.mode === "interior" && this.hoveredNavIndex >= 0) {
+			const p = this.panos[this.hoveredNavIndex];
+			const e = this.edgeBetween(this.currentIndex, this.hoveredNavIndex);
+			hover = {
+				id: p.id,
+				name: p.name,
+				occluded: e ? e.type !== "walk" : false,
+			};
 		}
+		const exits =
+			this.mode === "interior" && node
+				? node.rendered.map((e) => ({
+						index: e.to,
+						type: e.type,
+						name: this.panos[e.to]?.name ?? null,
+						dist: e.dist,
+						bearingDeg: (e.bearing * 180) / Math.PI,
+					}))
+				: [];
 		const state: OrbitState = {
 			mode: this.mode,
 			panoCount: this.panos.length,
@@ -425,6 +496,18 @@ export class OrbitEngine {
 			contextMenu: this.addressing.menu,
 			busy: this.interiorBusy,
 			overlay: this.overlay,
+			exits,
+			preview: this.mode === "interior" ? this.buildPreview() : null,
+			arrival: this.mode === "interior" ? this.arrival : null,
+			sonarActive: this.markers.sonarActive,
+			tour: this.director.progress,
+			canGoBack: this.mode === "interior" && this.history.length > 0,
+			trapped: !!node?.trapped,
+			currentZone: cur?.zone ?? null,
+			visited: [...this.visited],
+			nodes: this.nodeDir,
+			chapters: this.chapters,
+			mapEdges: this.mapEdges,
 			minimap: buildMinimapState({
 				minimaps: this.minimaps,
 				panos: this.panos,
@@ -436,6 +519,32 @@ export class OrbitEngine {
 		this.onState(state);
 	}
 
+	// The hover preview card payload, floated at the affordance's projected screen
+	// point. Your heading carries across the hop, so the thumbnail is panned to the
+	// direction you're facing RIGHT NOW — the card shows what you'll actually see
+	// when you land, not some other view of the room.
+	private buildPreview(): OrbitState["preview"] {
+		if (this.hoveredNavIndex < 0) return null;
+		const p = this.panos[this.hoveredNavIndex];
+		if (!p) return null;
+		const e = this.edgeBetween(this.currentIndex, this.hoveredNavIndex);
+		const headingU = (((this.lon / (2 * Math.PI) + 0.5) % 1) + 1) % 1;
+		this.camera.updateMatrixWorld();
+		const s = v3(p.position).project(this.camera);
+		const rect = this.canvas.getBoundingClientRect();
+		return {
+			index: this.hoveredNavIndex,
+			id: p.id,
+			name: p.name ?? null,
+			type: e?.type ?? "walk",
+			dist: e?.dist ?? 0,
+			screenX: rect.left + (s.x * 0.5 + 0.5) * rect.width,
+			screenY: rect.top + (-s.y * 0.5 + 0.5) * rect.height,
+			thumbUrl: p.placeholderUrl,
+			headingU,
+		};
+	}
+
 	private showOverlay(msg: string, { spinner = true, err = false } = {}) {
 		this.overlay = { msg, spinner, err };
 		this.emit();
@@ -445,17 +554,41 @@ export class OrbitEngine {
 		this.emit();
 	}
 
-	// --- travel mask: blur the canvas + dip to bg, peaking mid-move -----------
-
-	private setTravelMask(t: number) {
+	// --- travel FX: the per-type transition "look" ----------------------------
+	// A ground-glide blurs + dims (motion hides proxy warp). A phase tints the
+	// screen blueprint-blue and runs slower — clearly synthetic, never pretending
+	// the wall wasn't there. A vertical shaft irises through a hatch. Reduced-
+	// motion collapses all of it to a quick dip.
+	private setFx(type: EdgeType, t: number) {
 		const m = Math.sin(Math.PI * MathUtils.clamp(t, 0, 1));
-		this.canvas.style.filter =
-			m > 0.002 ? `blur(${(m * 7).toFixed(2)}px)` : "none";
-		this.travelFade.style.opacity = (m * 0.5).toFixed(3);
+		if (this.reducedMotion) {
+			this.canvas.style.filter = "none";
+			this.travelFade.style.background = "#0e0f12";
+			this.travelFade.style.opacity = (m * 0.55).toFixed(3);
+			this.iris.style.opacity = "0";
+			return;
+		}
+		const blurPx =
+			type === "phase" ? m * 9 : type === "vertical" ? m * 5 : type === "far" ? m * 8 : m * 7;
+		this.canvas.style.filter = blurPx > 0.002 ? `blur(${blurPx.toFixed(2)}px)` : "none";
+		const tint =
+			type === "phase" ? "#0b2a44" : type === "far" ? "#0a0c14" : "#0e0f12";
+		this.travelFade.style.background = tint;
+		const fadeAmp = type === "phase" ? 0.6 : type === "vertical" ? 0.3 : type === "far" ? 0.6 : 0.5;
+		this.travelFade.style.opacity = (m * fadeAmp).toFixed(3);
+		if (type === "vertical") {
+			// Close-then-open iris = passing up/down through a hatch.
+			const gap = Math.abs(Math.cos(Math.PI * MathUtils.clamp(t, 0, 1))) * 130;
+			this.iris.style.background = `radial-gradient(circle at 50% 50%, transparent ${gap.toFixed(1)}%, #05070d ${(gap + 7).toFixed(1)}%)`;
+			this.iris.style.opacity = "1";
+		} else {
+			this.iris.style.opacity = "0";
+		}
 	}
-	private clearTravelMask() {
+	private clearFx() {
 		this.canvas.style.filter = "none";
 		this.travelFade.style.opacity = "0";
+		this.iris.style.opacity = "0";
 	}
 
 	private resize() {
@@ -468,24 +601,13 @@ export class OrbitEngine {
 		this.camera.updateProjectionMatrix();
 	}
 
-	// --- input handlers (bound fields so dispose can detach them) -------------
+	// --- input handlers -------------------------------------------------------
 
-	// Right-click an object → per-object menu (hide / outline). A right-DRAG still
-	// pans the overview (OrbitControls RIGHT = PAN), so only a near-stationary
-	// right-click counts. Addressing is an overview activity, so the menu is gated
-	// to it.
 	private onContextMenu = (ev: MouseEvent) => {
 		ev.preventDefault();
 		if (this.mode !== "overview") return;
-		if (
-			Math.hypot(ev.clientX - this.rcDownX, ev.clientY - this.rcDownY) > 6
-		)
-			return;
-		this.addressing.openMenu(
-			ev.clientX,
-			ev.clientY,
-			this.activeObjectRoot(),
-		);
+		if (Math.hypot(ev.clientX - this.rcDownX, ev.clientY - this.rcDownY) > 6) return;
+		this.addressing.openMenu(ev.clientX, ev.clientY, this.activeObjectRoot());
 		this.emit();
 	};
 
@@ -507,32 +629,27 @@ export class OrbitEngine {
 			this.rcDownX = ev.clientX;
 			this.rcDownY = ev.clientY;
 		}
-		if (this.mode !== "interior" || this.interiorBusy) return;
+		if (this.mode !== "interior") return;
+		this.yieldTour(); // before the busy gate, so a click lands mid-hop too
+		if (this.interiorBusy) return;
+		this.noteInput();
 		this.dragging = true;
 		this.dragMoved = 0;
 		this.downX = ev.clientX;
 		this.downY = ev.clientY;
 		this.grabDir.copy(
-			cursorRayDir(
-				this.camera,
-				this.canvas,
-				this.cursorRay,
-				ev.clientX,
-				ev.clientY,
-			),
+			cursorRayDir(this.camera, this.canvas, this.cursorRay, ev.clientX, ev.clientY),
 		);
 		this.canvas.style.cursor = "grabbing";
 		this.canvas.setPointerCapture(ev.pointerId);
 	};
 
 	private onPointerMove = (ev: PointerEvent) => {
-		// Keep the last cursor position for the ring (updated every frame in tick so
-		// it tracks look-drag rotation too, not just raw movement).
 		this.pointerClientX = ev.clientX;
 		this.pointerClientY = ev.clientY;
 		this.pointerInside = true;
 		if (this.mode === "overview") {
-			if (ev.buttons !== 0) return; // skip mid-orbit drag
+			if (ev.buttons !== 0) return;
 			const spot = pickByScreen(
 				ev.clientX,
 				ev.clientY,
@@ -542,15 +659,8 @@ export class OrbitEngine {
 				this.canvas,
 			);
 			const entryIdx = spot ? (spot.userData.targetIndex as number) : -1;
-			// The object highlight is independent of the entry discs: a disc under the
-			// cursor no longer suppresses it, so the object beneath still highlights
-			// (when the toggle is on).
 			const obj = this.highlightEnabled
-				? this.addressing.pickAt(
-						ev.clientX,
-						ev.clientY,
-						this.activeObjectRoot(),
-					)
+				? this.addressing.pickAt(ev.clientX, ev.clientY, this.activeObjectRoot())
 				: null;
 			this.canvas.style.cursor = entryIdx >= 0 || obj ? "pointer" : "";
 			const hoverChanged = this.addressing.setHover(obj);
@@ -561,19 +671,20 @@ export class OrbitEngine {
 		}
 		if (this.mode !== "interior") return;
 		if (this.dragging) {
-			const look = pinLook(
-				this.camera,
-				this.canvas,
-				ev.clientX,
-				ev.clientY,
-				this.grabDir,
-			);
+			this.noteInput();
+			const look = pinLook(this.camera, this.canvas, ev.clientX, ev.clientY, this.grabDir);
 			this.lon = look.lon;
 			this.lat = look.lat;
 			this.dragMoved = Math.max(
 				this.dragMoved,
 				Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY),
 			);
+			// Drop any stale hover preview once the look starts moving.
+			if (this.hoveredNavIndex !== -1) {
+				this.hoveredNavIndex = -1;
+				this.markers.setNavHover(null);
+				this.emit();
+			}
 		} else if (!this.interiorBusy) {
 			this.updateHover(ev);
 		}
@@ -583,44 +694,22 @@ export class OrbitEngine {
 		if (this.mode !== "interior") return;
 		this.dragging = false;
 		this.canvas.style.cursor = "";
-		if (this.dragMoved >= 5 || this.interiorBusy) return;
-		// A click on a highlighted connector object walks through it to the adjacent
-		// zone (target ↔ starting), taking priority over the usual anchor pick.
-		const hit = this.proxyGroup
-			? this.addressing.pickAt(ev.clientX, ev.clientY, this.proxyGroup)
-			: null;
-		if (hit) {
-			const connector = this.connectorFor(hit);
-			if (connector) {
-				this.travelThroughConnector(connector, hit);
-				return;
-			}
+		if (this.dragMoved >= 5) return;
+		this.noteInput();
+		// Click an affordance to traverse its edge; else click-anywhere routing
+		// snaps to the node minimizing (graph cost + angular deviation from click).
+		const spot = this.markers.pickNav(ev.clientX, ev.clientY, this.camera, this.canvas);
+		if (spot) {
+			this.traverse(spot.userData.to as number);
+			return;
 		}
-		// Click a ring to go straight there: a gold behind-wall marker, or a visible
-		// white ring (both draw over / sit in the scene, so a screen-space pick is
-		// what matches what you see). Off the rings, fall back to auto-aim's
-		// nearest-anchor-to-the-clicked-surface pick.
-		const spot = this.markers.pickAnchorMarker(
-			ev.clientX,
-			ev.clientY,
-			this.camera,
-			this.canvas,
-			this.panos,
-			this.currentIndex,
-			this.proxyGroup,
-		);
-		if (spot) this.travelTo(spot.userData.targetIndex as number);
-		else this.autoAimTravel(ev.clientX, ev.clientY);
+		this.clickAnywhere(ev.clientX, ev.clientY);
 	};
 
 	private onWheel = (ev: WheelEvent) => {
 		if (this.mode !== "interior") return;
 		ev.preventDefault();
-		this.camera.fov = MathUtils.clamp(
-			this.camera.fov + ev.deltaY * 0.05,
-			25,
-			120,
-		);
+		this.camera.fov = MathUtils.clamp(this.camera.fov + ev.deltaY * 0.05, 25, 120);
 		this.camera.updateProjectionMatrix();
 	};
 
@@ -642,15 +731,53 @@ export class OrbitEngine {
 		this.cursor.hide();
 	};
 	private onWindowPointerUp = () => this.peekUp();
+
 	private onKeyDown = (ev: KeyboardEvent) => {
 		if (ev.code === "Space" && !ev.repeat) {
 			ev.preventDefault();
 			this.peekDown();
 			return;
 		}
-		// WASD walks the interior: forward is where you're looking (XZ of the look
-		// azimuth), right is 90° off it. One step per press (auto-repeat ignored).
-		if (this.mode !== "interior" || this.interiorBusy || ev.repeat) return;
+		if (this.mode !== "interior") return;
+		// Sonar ping (hold Tab): reveal every node through walls for a few seconds.
+		if (ev.code === "Tab" && !ev.repeat) {
+			ev.preventDefault();
+			this.toggleSonar();
+			return;
+		}
+		if (ev.code === "Escape") {
+			this.yieldTour();
+			if (this.markers.sonarActive) {
+				this.markers.hideSonar();
+				this.emit();
+			}
+			return;
+		}
+		if (this.interiorBusy || ev.repeat) return;
+		if (ev.code === "Backspace") {
+			ev.preventDefault();
+			this.goBack();
+			return;
+		}
+		if (ev.code === "KeyQ") {
+			ev.preventDefault();
+			this.snapTurn(-45);
+			return;
+		}
+		if (ev.code === "KeyE") {
+			ev.preventDefault();
+			this.snapTurn(45);
+			return;
+		}
+		if (ev.code.startsWith("Digit")) {
+			const n = Number(ev.code.slice(5));
+			if (n >= 1) {
+				ev.preventDefault();
+				this.jumpToLevel(n - 1);
+			}
+			return;
+		}
+		// WASD walks the graph edge nearest the look bearing.
 		const fx = Math.cos(this.lon);
 		const fz = Math.sin(this.lon);
 		const rx = -Math.sin(this.lon);
@@ -678,52 +805,27 @@ export class OrbitEngine {
 		if (ev.code === "Space") this.peekUp();
 	};
 
-	// Interior hover: the anchor markers and the object highlight are independent — a
-	// marker under the cursor no longer suppresses the highlight, so the proxy object
-	// beneath still tints (when the toggle is on). The fill overlay is depth-test-off,
-	// so it reads as picking the object straight out of the projected 360 image.
+	// Interior hover: light the affordance under the cursor + surface its preview.
 	private updateHover(ev: PointerEvent) {
 		if (this.currentIndex < 0) return;
-		const spot = this.markers.pickAnchorMarker(
-			ev.clientX,
-			ev.clientY,
-			this.camera,
-			this.canvas,
-			this.panos,
-			this.currentIndex,
-			this.proxyGroup,
-		);
-		this.markers.setRingHover(spot as Mesh | null);
-		const idx = spot ? (spot.userData.targetIndex as number) : -1;
-		const occ = spot ? !!spot.userData.occluded : false;
+		const spot = this.markers.pickNav(ev.clientX, ev.clientY, this.camera, this.canvas);
+		this.markers.setNavHover(spot);
+		const idx = spot ? (spot.userData.to as number) : -1;
 		const obj = this.highlightEnabled
-			? this.addressing.pickAt(
-					ev.clientX,
-					ev.clientY,
-					this.activeObjectRoot(),
-				)
+			? this.addressing.pickAt(ev.clientX, ev.clientY, this.activeObjectRoot())
 			: null;
 		this.canvas.style.cursor = idx >= 0 || obj ? "pointer" : "";
-		const hotspotChanged =
-			idx !== this.hoveredTargetIndex || occ !== this.hoveredOccluded;
-		this.hoveredTargetIndex = idx;
-		this.hoveredOccluded = occ;
-		if (this.addressing.setHover(obj) || hotspotChanged) this.emit();
+		const changed = idx !== this.hoveredNavIndex;
+		this.hoveredNavIndex = idx;
+		if (this.addressing.setHover(obj) || changed) this.emit();
 	}
 
-	// Interior geometry under a screen point: the projection proxy plus its floor
-	// base, or the pano sphere when there's no proxy. Returns the nearest visible
-	// hit (raycasting doesn't skip hidden objects, so walk the parent chain), or
-	// null. Shared by the surface cursor ring and click auto-aim.
-	private raycastInterior(
-		clientX: number,
-		clientY: number,
-	): Intersection | null {
+	// Interior geometry under a screen point (proxy + floor base, or the sphere).
+	private raycastInterior(clientX: number, clientY: number): Intersection | null {
 		const targets: Object3D[] = [];
 		if (this.projectionMode) {
 			if (this.proxyGroup) targets.push(this.proxyGroup);
-			if (this.projection.proxyBase)
-				targets.push(this.projection.proxyBase);
+			if (this.projection.proxyBase) targets.push(this.projection.proxyBase);
 		} else {
 			this.sphereA.updateMatrixWorld();
 			targets.push(this.sphereA);
@@ -745,121 +847,44 @@ export class OrbitEngine {
 		);
 	}
 
-	// Auto-aim travel: world-raycast the click into the interior geometry and walk
-	// to the anchor closest (in world space) to where it lands. Clicking any
-	// surface snaps to the nearest capture point — no need to hit a marker.
-	private autoAimTravel(clientX: number, clientY: number) {
+	// Click-anywhere floor routing: raycast into the scene, then travel to the node
+	// that minimizes graph-ish cost — distance to the hit plus angular deviation
+	// from the click bearing — so the floor itself is the button.
+	private clickAnywhere(clientX: number, clientY: number) {
 		const hit = this.raycastInterior(clientX, clientY);
-		if (hit) this.travelTo(this.nearestPanoTo(hit.point));
-	}
-
-	// The connector whose `id` names the clicked proxy object (matched against its
-	// addressing label, case-insensitively), or null if it isn't a connector.
-	private connectorFor(obj: Object3D): Connector | null {
-		const label = ((obj.userData.objLabel as string) ?? "")
-			.trim()
-			.toLowerCase();
-		return (
-			this.connectors.find((c) => c.id.trim().toLowerCase() === label) ??
-			null
-		);
-	}
-
-	// Walk through a connector: if we're not already in its target_zone, go to the
-	// closest capture in target_zone to the connector; otherwise back to the
-	// closest one in starting_zone. "Closest" is world distance to the object's
-	// bbox center. A no-op if that zone has no captures.
-	private travelThroughConnector(connector: Connector, obj: Object3D) {
-		if (this.interiorBusy || this.currentIndex < 0) return;
-		const here = this.panos[this.currentIndex].zone;
-		const destZone =
-			here === connector.target_zone
-				? connector.starting_zone
-				: connector.target_zone;
-		const at = new Box3().setFromObject(obj).getCenter(new Vector3());
+		if (!hit) return;
+		const cam = this.camera.position;
+		const clickBearing = Math.atan2(hit.point.z - cam.z, hit.point.x - cam.x);
 		let best = -1;
-		let bestD = Infinity;
+		let bestCost = Infinity;
 		for (let i = 0; i < this.panos.length; i++) {
-			if (this.panos[i].zone !== destZone) continue;
-			const d = at.distanceToSquared(v3(this.panos[i].position));
-			if (d < bestD) {
-				bestD = d;
+			if (i === this.currentIndex) continue;
+			const pp = v3(this.panos[i].position);
+			const d = pp.distanceTo(hit.point);
+			const bearing = Math.atan2(pp.z - cam.z, pp.x - cam.x);
+			const ang = Math.abs(angleDelta(clickBearing, bearing));
+			const cost = d + ang * 3; // 1 rad off ≈ 3 m of detour
+			if (cost < bestCost) {
+				bestCost = cost;
 				best = i;
 			}
 		}
-		if (best >= 0) this.travelTo(best);
-	}
-
-	// Place the surface cursor each frame (runs in tick, so it follows both pointer
-	// motion and look-drag rotation). Shown only in the interior when not busy, the
-	// pointer's inside, and it isn't already on an anchor ring (hoveredRing) — that
-	// ring lights up instead, so two rings never stack. The interior raycast is
-	// shared with click auto-aim; the hit (or null) is handed to the cursor.
-	private updateCursorRing() {
-		const active =
-			this.mode === "interior" &&
-			!this.interiorBusy &&
-			this.pointerInside &&
-			!this.markers.hoveredRing;
-		const hit = active
-			? this.raycastInterior(this.pointerClientX, this.pointerClientY)
-			: null;
-		this.cursor.update(hit, this.camera, this.host.clientHeight);
-	}
-
-	// The destination tag floats above a hovered gold (behind-wall) ring: project the
-	// anchor's eye-height world position (above the floor ring) to screen and place
-	// the tag there. Only gold rings get it — the room they lead to is hidden, so
-	// naming it helps. Hidden otherwise.
-	private positionDestLabel() {
-		const ring = this.markers.hoveredRing;
-		if (this.mode !== "interior" || !ring || !ring.userData.occluded) {
-			this.destLabel.style.display = "none";
-			return;
-		}
-		const p = this.panos[ring.userData.targetIndex as number];
-		if (!p) {
-			this.destLabel.style.display = "none";
-			return;
-		}
-		this.camera.updateMatrixWorld();
-		_labelPos.fromArray(p.position).project(this.camera);
-		if (_labelPos.z > 1) {
-			this.destLabel.style.display = "none";
-			return;
-		}
-		this.destLabel.textContent = p.name ?? p.id;
-		this.destLabel.style.left = `${(_labelPos.x * 0.5 + 0.5) * this.host.clientWidth}px`;
-		this.destLabel.style.top = `${(-_labelPos.y * 0.5 + 0.5) * this.host.clientHeight}px`;
-		this.destLabel.style.display = "block";
+		if (best >= 0) this.traverse(best);
 	}
 
 	// --- view toggles (which geometry each mode shows) ------------------------
 
 	private reskinProxy(mat: Material) {
 		if (!this.proxyGroup) return;
-		// Matte skin: each object wears its own color (colorProxyObjects); the
-		// projection skin is one shared shader for all.
 		const matte = mat === this.polyMaterial;
 		this.proxyGroup.traverse((o) => {
 			const m = o as Mesh;
 			if (!m.isMesh) return;
-			m.material = matte
-				? ((m.userData.colorMat as Material) ?? mat)
-				: mat;
+			m.material = matte ? ((m.userData.colorMat as Material) ?? mat) : mat;
 		});
-		// The base mirrors the proxy: panos project onto it in the walkthrough (so
-		// it blends into the floor instead of showing through as a flat fill), and
-		// it goes matte in proxy view. It's a neutral backing slab (not an
-		// addressable object), so it keeps the shared material, not a per-object color.
 		this.projection.setBaseMaterial(mat);
 	}
 
-	// Give each proxy object its own matte color so the bare proxy reads as
-	// distinct parts instead of one gray blob. Clones inherit polyMaterial's
-	// flat-shaded look; hues are spread by golden-ratio stepping so neighbors
-	// never collide. The colors ride in via reskinProxy's matte path; clearScene
-	// disposes the clones.
 	private colorProxyObjects() {
 		if (!this.proxyGroup) return;
 		collectObjects(this.proxyGroup).forEach((obj, i) => {
@@ -872,8 +897,6 @@ export class OrbitEngine {
 		});
 	}
 
-	// The proxy stands in for the dollhouse when there's no lite export, or when
-	// the user flipped on "proxy view" to inspect/address the low-poly geometry.
 	private proxyAsDollhouse(): boolean {
 		return this.sharedOverview || (this.proxyView && !!this.proxyGroup);
 	}
@@ -891,25 +914,17 @@ export class OrbitEngine {
 		}
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
-		this.markers.hotspotGroup.visible = false;
+		this.markers.navGroup.visible = false;
+		this.markers.hideSonar();
 		this.markers.entryGroup.visible = true;
-		this.markers.anchorRingGroup.visible = false;
 		this.markers.you.group.visible = false;
 		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
 
-	// Swap the interior proxy in place between the bare low-poly mesh (proxy view:
-	// flat matte, no pano) and the captured panos projected onto it. The backdrop
-	// sphere is the projected sky, so it's off in proxy view. Safe to call
-	// mid-walkthrough — it leaves the navigation markers alone.
 	private setInteriorProxyView() {
 		if (!this.proxyGroup || !this.projectionMode) return;
-		this.reskinProxy(
-			this.proxyView ? this.polyMaterial : this.projection.material,
-		);
+		this.reskinProxy(this.proxyView ? this.polyMaterial : this.projection.material);
 		this.sphereA.visible = !this.proxyView;
-		// Refresh the projection uniforms after a proxy-view spell (updateProjection
-		// is skipped while it's on) so the first textured frame isn't stale.
 		if (!this.proxyView) this.updateProjection();
 	}
 
@@ -919,11 +934,10 @@ export class OrbitEngine {
 		if (this.projectionMode) {
 			this.setInteriorProxyView();
 		} else {
-			this.sphereA.visible = true; // sphere-only tour: the pano sphere IS the view
+			this.sphereA.visible = true;
 		}
-		this.markers.hotspotGroup.visible = true;
+		this.markers.navGroup.visible = true;
 		this.markers.entryGroup.visible = false;
-		this.markers.anchorRingGroup.visible = true;
 		this.markers.you.group.visible = false;
 		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
@@ -941,25 +955,19 @@ export class OrbitEngine {
 		}
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
-		this.markers.hotspotGroup.visible = false;
+		this.markers.navGroup.visible = false;
+		this.markers.hideSonar();
 		this.markers.entryGroup.visible = false;
-		this.markers.anchorRingGroup.visible = false;
 		this.markers.you.group.visible = true;
 		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
 
-	// Where the bare-proxy / textured swap is offered: the overview needs a lite
-	// scene to swap the proxy in for (sharedOverview tours already show the proxy);
-	// the interior needs a proxy to project onto (i.e. projection mode).
 	private canToggleProxyView(): boolean {
-		if (this.mode === "overview")
-			return !!this.liteRoot && !!this.proxyGroup;
+		if (this.mode === "overview") return !!this.liteRoot && !!this.proxyGroup;
 		if (this.mode === "interior") return this.projectionMode;
 		return false;
 	}
 
-	// Flip between the textured scene (lite dollhouse / projected panos) and the
-	// bare low-poly proxy — in the overview AND the first-person interior.
 	toggleProxyView() {
 		if (!this.canToggleProxyView()) return;
 		this.proxyView = !this.proxyView;
@@ -971,9 +979,6 @@ export class OrbitEngine {
 		this.emit();
 	}
 
-	// Turn the on-hover object highlight on/off (persistent right-click selections
-	// are unaffected). Clearing the live hover on the way off; the next pointer move
-	// re-picks when turned back on.
 	toggleHighlight() {
 		this.highlightEnabled = !this.highlightEnabled;
 		if (!this.highlightEnabled) this.addressing.setHover(null);
@@ -981,12 +986,8 @@ export class OrbitEngine {
 		this.emit();
 	}
 
-	// --- per-object addressing (pick / hide / outline) ------------------------
+	// --- per-object addressing ------------------------------------------------
 
-	// Which loaded root the cursor addresses right now: the dollhouse in overview /
-	// peek (lite, or the proxy when "proxy view" is on or there's no lite), and the
-	// projected proxy in the interior (hover-highlight — see updateHover). The
-	// hover / hide / outline mechanics live in ObjectAddressing.
 	private activeObjectRoot(): Object3D | null {
 		if (this.mode === "overview" || this.mode === "peek") {
 			if (this.proxyView && this.proxyGroup) return this.proxyGroup;
@@ -996,49 +997,72 @@ export class OrbitEngine {
 		return null;
 	}
 
-	// --- right-click object menu (delegated to ObjectAddressing) --------------
-
 	closeMenu() {
 		if (!this.addressing.hasMenu) return;
 		this.addressing.closeMenu();
 		this.emit();
 	}
-
 	toggleMenuTargetHidden() {
 		this.addressing.toggleMenuTargetHidden();
 		this.emit();
 	}
-
 	toggleMenuTargetOutline() {
 		this.addressing.toggleMenuTargetOutline();
 		this.emit();
 	}
-
 	showAllHidden() {
 		this.addressing.showAllHidden();
 		this.emit();
 	}
-
 	clearOutlines() {
 		this.addressing.clearOutlines();
 		this.emit();
 	}
 
-	// --- projection (view-dependent texture mapping) -------------------------
+	// --- projection -----------------------------------------------------------
 
-	// Per-frame VDTM blend, delegated to Projection (which owns the shader and the
-	// backdrop sphere sizing). Skipped while proxy view shows the bare geometry.
 	private updateProjection() {
-		this.projection.update(
-			this.camera,
+		// The proxy has depth, so a projected capture parallaxes and two captures
+		// cross-dissolve anchored to the same surface points — clean. The backdrop is
+		// a depthless camera-centred sphere, so mid-glide the departure and
+		// destination skyboxes land at slightly different angles in the void and smear
+		// against each other ("old images leaking" where there's no geometry to pin
+		// them). So hide it WHILE gliding: the parallax-correct proxy carries the move
+		// and the void reads as clean background, then the backdrop returns — single
+		// and exactly aligned — the moment we settle on the destination capture.
+		this.sphereA.visible = !this.proxyView && !this.move;
+		this.projection.project(
 			this.panos,
+			this.activeCaptures(),
 			this.requestPano,
 			this.sphereA,
-			this.sphereAMat,
+			this.camera.position,
 		);
 	}
 
-	// --- camera flight (mode changes: slerp orientation + lerp position) ------
+	// The capture(s) to project right now: the from/to pair while gliding a hop
+	// (time-weighted so proxy + backdrop cross-dissolve together), else just the
+	// capture you're standing at (an exact skybox — no offset ghosts). During the
+	// overview→interior fly-in the arrival isn't `activate`d yet, so fall back to
+	// the fly target. The walkthrough never free-roams, so this set is exact.
+	private activeCaptures(): Array<[number, number]> {
+		if (this.move) {
+			const to = this.move.index;
+			const from = this.currentIndex;
+			if (from < 0 || from === to) return [[to, 1]];
+			const t = Math.min(1, Math.max(0, (performance.now() - this.move.start) / this.move.dur));
+			const e = easeInOut(t);
+			return [
+				[from, 1 - e],
+				[to, e],
+			];
+		}
+		if (this.currentIndex >= 0) return [[this.currentIndex, 1]];
+		if (this.flyTarget >= 0) return [[this.flyTarget, 1]];
+		return [];
+	}
+
+	// --- camera flight (mode changes) -----------------------------------------
 
 	private startFly(
 		toPos: Vector3,
@@ -1046,8 +1070,6 @@ export class OrbitEngine {
 		dur: number,
 		cbs: { onMid?: () => void; onEnd?: () => void } = {},
 	) {
-		// A camera (not a bare Object3D) so lookAt orients -Z toward the target,
-		// matching how the real camera faces.
 		this.dummyCam.up.copy(this.camera.up);
 		this.dummyCam.position.copy(toPos);
 		this.dummyCam.lookAt(lookTarget);
@@ -1058,7 +1080,7 @@ export class OrbitEngine {
 			fromQuat: this.camera.quaternion.clone(),
 			toQuat: this.dummyCam.quaternion.clone(),
 			start: performance.now(),
-			dur,
+			dur: this.reducedMotion ? REDUCED_DUR : dur,
 			onMid: cbs.onMid,
 			onEnd: cbs.onEnd,
 			midDone: false,
@@ -1067,44 +1089,51 @@ export class OrbitEngine {
 		this.controls.enabled = false;
 		this.controls.autoRotate = false;
 		this.hoveredEntryIndex = -1;
-		this.hoveredTargetIndex = -1;
-		this.markers.setRingHover(null);
+		this.hoveredNavIndex = -1;
+		this.markers.setNavHover(null);
+		this.markers.hideSonar();
 		this.addressing.setHover(null);
 		this.addressing.closeMenu();
 		this.canvas.style.cursor = "";
-		this.emit(); // gated: holds the chrome while mode === "transition"
+		this.emit();
 	}
 
-	// --- travel between anchors (interior) ------------------------------------
+	// --- typed traversal (interior) -------------------------------------------
 
-	private travelTo(index: number) {
-		if (
-			this.interiorBusy ||
-			index === this.currentIndex ||
-			!this.panos[index]
-		)
-			return;
-		this.hoveredTargetIndex = -1;
-		this.markers.setRingHover(null);
-		this.interiorBusy = true;
-		this.markers.hotspotGroup.visible = false;
-
-		if (this.projectionMode) {
-			// Glide through world space; the projection re-blends live (loading the
-			// captures we pass) so geometry + textures interpolate with parallax.
-			this.requestPano(index);
-			this.glide = {
-				fromPos: this.camera.position.clone(),
-				toPos: v3(this.panos[index].position),
-				start: performance.now(),
-				dur: 900,
-				index,
-			};
+	// Traverse to a node by its graph edge type. Chained clicks queue (input
+	// buffering) instead of blocking; the back-stack is pushed unless retracing.
+	private traverse(index: number, reverse = false, pass = false) {
+		if (index === this.currentIndex || !this.panos[index]) return;
+		if (this.interiorBusy) {
+			this.pendingTravel = index; // latest click wins
 			return;
 		}
+		const edge = this.edgeBetween(this.currentIndex, index);
+		const type: EdgeType = edge?.type ?? "far";
+		const dy =
+			edge?.dy ?? this.panos[index].position[1] - this.panos[this.currentIndex].position[1];
+		if (!reverse && this.currentIndex >= 0) this.history.push(this.currentIndex);
+		this.beginMove(index, type, dy, pass);
+	}
 
-		// Sphere mode: wait for the target's texture (a placeholder is enough), then
-		// crossfade the backdrop to it while drifting the camera onto its position.
+	private beginMove(index: number, type: EdgeType, dy: number, pass = false) {
+		this.interiorBusy = true;
+		this.hoveredNavIndex = -1;
+		this.markers.setNavHover(null);
+		this.markers.navGroup.visible = false;
+		this.markers.hideSonar();
+		this.requestPano(index);
+		const fromPos = this.camera.position.clone();
+		const toPos = v3(this.panos[index].position);
+		const ctrl = this.reducedMotion ? null : this.pathControl(fromPos, toPos, type);
+		const dur =
+			(this.reducedMotion ? REDUCED_DUR : DUR[type]) * (pass ? PASS_DUR_SCALE : 1);
+		if (this.projectionMode) {
+			this.move = { fromPos, toPos, ctrl, start: performance.now(), dur, index, type, dy, sphere: false, pass };
+			return;
+		}
+		// Sphere-only tour: wait for a texture (placeholder is enough), then
+		// crossfade the backdrop while the camera drifts onto the destination.
 		const token = this.loadToken;
 		void this.streamer.ensure(index).then(() => {
 			if (this.disposed || token !== this.loadToken) return;
@@ -1112,58 +1141,92 @@ export class OrbitEngine {
 			this.sphereBMat.uniforms.map.value = target.texture ?? DUMMY_TEX;
 			this.sphereBMat.uniforms.opacity.value = 0;
 			this.sphereB.visible = true;
-			const fromPos = this.camera.position.clone();
-			const toPos = v3(target.position);
-			const start = performance.now();
-			const dur = 700;
-			const step = (now: number) => {
-				if (this.disposed || token !== this.loadToken) return;
-				const t = Math.min(1, (now - start) / dur);
-				const e = easeInOut(t);
-				this.sphereBMat.uniforms.opacity.value = e;
-				this.camera.position.lerpVectors(fromPos, toPos, e);
-				this.setTravelMask(t);
-				if (t < 1) {
-					requestAnimationFrame(step);
-					return;
-				}
-				this.sphereAMat.uniforms.map.value =
-					target.texture ?? DUMMY_TEX;
-				this.sphereAMat.uniforms.opacity.value = 1;
-				this.sphereB.visible = false;
-				this.clearTravelMask();
-				this.interiorBusy = false;
-				this.markers.hotspotGroup.visible = true;
-				this.activate(index);
-			};
-			requestAnimationFrame(step);
+			this.move = { fromPos, toPos, ctrl, start: performance.now(), dur, index, type, dy, sphere: true, pass };
 		});
 	}
 
+	// Bend the camera path: vertical shafts rise up-and-over; far flights pull
+	// back toward a dollhouse vantage before pushing in. Walks stay straight.
+	private pathControl(from: Vector3, to: Vector3, type: EdgeType): Vector3 | null {
+		if (type === "vertical") {
+			const c = from.clone().add(to).multiplyScalar(0.5);
+			c.y = Math.max(from.y, to.y) + Math.max(0.5, Math.abs(to.y - from.y) * 0.3);
+			return c;
+		}
+		if (type === "far") {
+			const c = from.clone().add(to).multiplyScalar(0.5);
+			c.y += Math.min(this.sceneMaxDim * 0.6, from.distanceTo(to) * 0.45);
+			return c;
+		}
+		return null;
+	}
+
+	// Bring the hop in flight to its end almost immediately, keeping the eased
+	// position continuous: re-base the timeline so progress resumes from exactly
+	// where it is and reaches 1 in `ms`. Used when the tour is stopped mid-hop —
+	// the eye can't just freeze between two capture points (the projection, the
+	// affordances and the exits all assume you're standing at one), so instead of
+	// gliding on for up to another 2.4s it lands right away.
+	private hurryMove(ms = 240) {
+		const mv = this.move;
+		if (!mv) return;
+		const now = performance.now();
+		const t = Math.min(1, (now - mv.start) / mv.dur);
+		if (t > 0.95) return; // already landing — let it
+		mv.start = now - (t * ms) / (1 - t);
+		mv.dur = ms / (1 - t);
+	}
+
+	private finishMove(mv: Move) {
+		this.clearFx();
+		if (mv.sphere) {
+			const target = this.panos[mv.index];
+			this.sphereAMat.uniforms.map.value = target.texture ?? DUMMY_TEX;
+			this.sphereAMat.uniforms.opacity.value = 1;
+			this.sphereB.visible = false;
+		}
+		this.interiorBusy = false;
+		const p = this.panos[mv.index];
+		if (!mv.pass) {
+			this.arrival = {
+				name: p.name ?? p.id,
+				verb: edgeVerb(mv.type, mv.dy),
+				ts: performance.now(),
+			};
+		}
+		this.activate(mv.index);
+		// Input buffering: run the most recent queued click as one journey.
+		const next = this.pendingTravel;
+		this.pendingTravel = null;
+		if (next != null && next !== this.currentIndex) this.traverse(next);
+	}
+
+	// Land on a node. The look direction is deliberately left alone: heading
+	// persistence across a hop is what keeps the mental map intact — you arrive
+	// facing exactly where you were facing when you left, so the world appears to
+	// slide past you rather than cutting to a new orientation. (The capture
+	// `forward` is a fixed compass direction, not a per-edge "best view", so
+	// snapping to it would just yank the camera back on every move.)
 	private activate(index: number) {
 		this.currentIndex = index;
+		this.flyTarget = -1;
+		this.visited.add(index);
 		this.requestPano(index);
 		if (!this.projectionMode) {
-			this.sphereAMat.uniforms.map.value =
-				this.panos[index].texture ?? DUMMY_TEX;
+			this.sphereAMat.uniforms.map.value = this.panos[index].texture ?? DUMMY_TEX;
 			this.sphereAMat.uniforms.opacity.value = 1;
 		}
-		this.markers.rebuildHotspots(
-			this.panos,
-			this.currentIndex,
-			this.proxyGroup,
-			this.projectionMode,
-		);
+		const node = this.navNode(index);
+		this.markers.buildNav(node, this.panos);
+		this.markers.navGroup.visible = this.mode === "interior";
+		if (node?.trapped) this.markers.pulseExits(performance.now(), 2200);
+		this.noteInput();
 		this.emit();
 	}
 
-	// The streamer owns lazy LQIP→full loading; this fires when the current
-	// capture's texture lands so sphere mode can refresh its backdrop (projection
-	// mode re-reads textures every frame).
 	private onPanoReady(i: number) {
 		if (!this.projectionMode && i === this.currentIndex) {
-			this.sphereAMat.uniforms.map.value =
-				this.panos[i].texture ?? DUMMY_TEX;
+			this.sphereAMat.uniforms.map.value = this.panos[i].texture ?? DUMMY_TEX;
 			this.sphereAMat.uniforms.opacity.value = 1;
 		}
 	}
@@ -1192,11 +1255,13 @@ export class OrbitEngine {
 	enter(index: number | null = null) {
 		if (this.mode !== "overview" || this.panos.length === 0) return;
 		const idx = index ?? this.nearestPanoTo(this.controls.target);
-		this.requestPano(idx); // head start so the texture is ready by the fly-in's end
+		this.requestPano(idx);
 		const p = this.panos[idx];
 		const fwd: [number, number, number] =
 			p.forward && p.forward.length ? p.forward : [0, 0, 1];
 		const toPos = v3(p.position);
+		this.history = []; // a fresh interior session
+		this.flyTarget = idx; // project the arrival during the fly-in (pre-activate)
 		this.startFly(toPos, toPos.clone().add(v3(fwd)), 1100, {
 			onMid: () => {
 				this.setInteriorView();
@@ -1208,14 +1273,15 @@ export class OrbitEngine {
 				const look = forwardToLonLat(fwd);
 				this.lon = look.lon;
 				this.lat = look.lat;
+				this.arrival = null;
 				this.activate(idx);
-				this.emit();
 			},
 		});
 	}
 
 	exit() {
 		if (this.mode !== "interior" || this.interiorBusy) return;
+		this.director.abort();
 		this.startFly(this.browsePos.clone(), this.sceneCenter.clone(), 1000, {
 			onMid: () => {
 				this.setOverviewView();
@@ -1234,23 +1300,101 @@ export class OrbitEngine {
 		});
 	}
 
-	// Walk to a capture from the minimap (interior only; overview uses enter()).
-	travelToIndex(index: number) {
-		if (this.mode !== "interior" || this.interiorBusy) return;
-		this.travelTo(index);
+	// Travel to any node from the chrome (minimap / chapters / search): typed if
+	// it's a direct edge, else a far flight.
+	traverseTo(index: number) {
+		if (this.mode !== "interior" || !this.panos[index]) return;
+		this.yieldTour();
+		this.traverse(index);
 	}
 
-	// WASD: step to the nearest anchor along a horizontal direction. "Nearest" is
-	// XZ-only (Y ignored); a |Δy| gate keeps the step on the current floor and a
-	// reach cap bounds how far one press travels. Only anchors inside a 45° cone of
-	// the direction qualify, so the four keys tile the plane into quadrants.
-	private stepToward(dirX: number, dirZ: number) {
-		if (
-			this.mode !== "interior" ||
-			this.interiorBusy ||
-			this.currentIndex < 0
-		)
+	// Retrace the back-stack one hop (never blocked); empty stack → out to overview.
+	goBack() {
+		if (this.mode !== "interior" || this.interiorBusy) return;
+		this.yieldTour();
+		const prev = this.history.pop();
+		if (prev == null) {
+			this.exit();
 			return;
+		}
+		this.traverse(prev, true);
+	}
+
+	snapTurn(deg: number) {
+		if (this.mode !== "interior") return;
+		this.yieldTour();
+		this.noteInput();
+		this.lon += (deg * Math.PI) / 180;
+	}
+
+	// Start / stop the zone-by-zone auto tour. Stopping leaves the camera exactly
+	// where it is — the itinerary is simply dropped.
+	toggleTour() {
+		if (this.mode !== "interior") return;
+		if (this.director.active) {
+			this.yieldTour();
+			return;
+		}
+		if (!this.navGraph || this.currentIndex < 0) return;
+		this.director.start(
+			planZoneTour(
+				this.navGraph,
+				(i) => this.panos[i]?.zone ?? "",
+				this.currentIndex,
+			),
+		);
+	}
+
+	// Any deliberate navigation hands the view back: the tour writes the look
+	// angles every frame while sweeping, so it has to let go the moment the user
+	// takes over rather than fight them for the camera. Stopping mid-sweep is
+	// instant and leaves the camera untouched; stopping mid-hop can only let go
+	// once the hop has landed, so hurry that landing along.
+	private yieldTour() {
+		if (!this.director.active) return;
+		this.director.stop();
+		if (this.director.active) this.hurryMove();
+	}
+
+	toggleSonar() {
+		if (this.mode !== "interior") return;
+		this.noteInput();
+		if (this.markers.sonarActive) {
+			this.markers.hideSonar();
+		} else {
+			this.markers.buildSonar(this.navNode(this.currentIndex), this.panos, this.currentIndex);
+			this.markers.startSonar(performance.now(), this.camera);
+		}
+		this.emit();
+	}
+
+	// Jump to a floor level (number keys / floor chips): nearest node on it.
+	jumpToLevel(level: number) {
+		if (this.mode !== "interior" || this.interiorBusy) return;
+		if (this.panoLevel[this.currentIndex] === level) return;
+		this.yieldTour();
+		const cur = v3(this.panos[this.currentIndex].position);
+		let best = -1;
+		let bestD = Infinity;
+		for (let i = 0; i < this.panos.length; i++) {
+			if (this.panoLevel[i] !== level) continue;
+			const d = cur.distanceToSquared(v3(this.panos[i].position));
+			if (d < bestD) {
+				bestD = d;
+				best = i;
+			}
+		}
+		if (best >= 0) this.traverse(best);
+	}
+
+	getFacingDeg(): number {
+		return (this.lon * 180) / Math.PI;
+	}
+
+	// WASD: nearest graph neighbour inside a forward cone, one floor only.
+	private stepToward(dirX: number, dirZ: number) {
+		if (this.mode !== "interior" || this.interiorBusy || this.currentIndex < 0) return;
+		this.yieldTour();
 		const cur = this.panos[this.currentIndex].position;
 		let best = -1;
 		let bestDist2 = Infinity;
@@ -1262,14 +1406,13 @@ export class OrbitEngine {
 			const dz = p[2] - cur[2];
 			const dist2 = dx * dx + dz * dz;
 			if (dist2 < 1e-6 || dist2 > WASD_MAX_STEP * WASD_MAX_STEP) continue;
-			if ((dx * dirX + dz * dirZ) / Math.sqrt(dist2) < WASD_DIR_COS)
-				continue;
+			if ((dx * dirX + dz * dirZ) / Math.sqrt(dist2) < WASD_DIR_COS) continue;
 			if (dist2 < bestDist2) {
 				bestDist2 = dist2;
 				best = i;
 			}
 		}
-		if (best >= 0) this.travelTo(best);
+		if (best >= 0) this.traverse(best);
 	}
 
 	private peekStart() {
@@ -1283,21 +1426,13 @@ export class OrbitEngine {
 		};
 		const userPos = this.currentUserWorldPos();
 		this.markers.positionYouMarker(userPos);
-		// Slice the scene flat just above the camera/eye height (userPos is the eye),
-		// dropping the ceiling / roof and anything overhead so the room you're in is
-		// open from above. The plane is world-space, so it stays a clean horizontal
-		// cut as the dollhouse camera orbits.
 		this.locateClip.constant = userPos.y + LOCATE_SLICE_ABOVE_EYE;
 		this.renderer.clippingPlanes = [this.locateClip];
 		const flat = userPos.clone().sub(this.sceneCenter);
 		flat.y = 0;
 		if (flat.lengthSq() < 1e-6) flat.set(0, 0, 1);
 		flat.normalize();
-		const toPos = this.sceneCenter
-			.clone()
-			.addScaledVector(flat, this.sceneMaxDim * 1.5);
-		// Raised vantage (was 0.6) so the camera looks down through the cut into the
-		// opened room rather than side-on across the rooftops.
+		const toPos = this.sceneCenter.clone().addScaledVector(flat, this.sceneMaxDim * 1.5);
 		toPos.y += this.sceneMaxDim * 1.2;
 		this.startFly(toPos, this.sceneCenter.clone(), 850, {
 			onMid: () => {
@@ -1315,7 +1450,6 @@ export class OrbitEngine {
 
 	private peekEnd() {
 		if (this.mode !== "peek" || !this.savedInterior) return;
-		// Seal the scene back up as we drop in — the slice is locate-only.
 		this.renderer.clippingPlanes = [];
 		const s = this.savedInterior;
 		this.startFly(s.pos.clone(), lookTargetFrom(s.pos, s.lon, s.lat), 800, {
@@ -1330,13 +1464,13 @@ export class OrbitEngine {
 				this.lat = s.lat;
 				this.currentIndex = s.index;
 				this.activate(s.index);
-				this.emit();
 			},
 		});
 	}
 
 	peekDown() {
 		if (this.mode !== "interior" || this.interiorBusy) return;
+		this.yieldTour();
 		this.peekHeld = true;
 		this.onHold?.(true);
 		this.peekStart();
@@ -1357,20 +1491,15 @@ export class OrbitEngine {
 			m.geometry?.dispose();
 			const mats = Array.isArray(m.material) ? m.material : [m.material];
 			for (const mat of mats) {
-				// Shared singletons (projection / poly fills) outlive any one cell, so
-				// never dispose them here.
-				if (
-					mat &&
-					mat !== this.projection.material &&
-					mat !== this.polyMaterial
-				)
+				if (mat && mat !== this.projection.material && mat !== this.polyMaterial)
 					mat.dispose();
 			}
 		});
 	}
 
 	private clearScene() {
-		this.loadToken++; // invalidate in-flight loads / sphere-travel steps
+		this.loadToken++;
+		this.director.abort();
 		if (this.liteRoot) {
 			this.scene.remove(this.liteRoot);
 			this.disposeObject(this.liteRoot);
@@ -1381,46 +1510,53 @@ export class OrbitEngine {
 			this.disposeObject(this.proxyGroup);
 			this.proxyGroup = null;
 		}
-		// Per-object proxy colors are detached in projection mode (so disposeObject
-		// can't reach them), so drop them explicitly.
 		for (const m of this.proxyColorMats) m.dispose();
 		this.proxyColorMats = [];
 		this.projection.clearBase(this.scene);
 		this.streamer.reset();
 		this.connectors = [];
+		this.navGraph = null;
+		this.nodeDir = [];
+		this.chapters = [];
+		this.mapEdges = [];
+		this.history = [];
+		this.visited.clear();
+		this.pendingTravel = null;
+		this.arrival = null;
 		this.minimaps = [];
 		this.panoLevel = [];
 		this.minimapPrefetch = [];
 		this.sphereAMat.uniforms.map.value = DUMMY_TEX;
 		this.sphereBMat.uniforms.map.value = DUMMY_TEX;
+		// A projection tour skins the backdrop with the VDTM material and scales it to
+		// the scene — hand it back to the plain equirect material so a sphere-only tour
+		// loaded next still renders its pano.
+		this.sphereA.material = this.sphereAMat;
+		this.sphereA.scale.setScalar(1);
 		this.currentIndex = -1;
+		this.flyTarget = -1;
 		this.markers.clear();
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
 		this.transition = null;
-		this.glide = null;
+		this.move = null;
 		this.interiorBusy = false;
 		this.peekHeld = false;
 		this.savedInterior = null;
-		this.renderer.clippingPlanes = []; // drop any active locate slice
+		this.renderer.clippingPlanes = [];
 		this.hoveredEntryIndex = -1;
-		this.hoveredTargetIndex = -1;
-		// Reset per-object addressing; the old nodes are disposed with the roots.
+		this.hoveredNavIndex = -1;
 		this.proxyView = false;
 		this.addressing.reset();
 		this.canvas.style.cursor = "";
-		this.clearTravelMask();
+		this.clearFx();
+		for (const l of this.sonarLabels) l.style.display = "none";
 	}
 
-	// Build the scene from its R2 assets: the dollhouse (overview) GLB plus an
-	// optional capture-tour manifest (pano positions + proxy). Only the dollhouse
-	// + proxy geometry load here; the pano images load lazily (on enter / on
-	// movement). With no manifest the panos can't be placed, so we orbit the
-	// dollhouse alone — never inventing positions.
 	async loadTour(source: TourSource) {
 		this.mode = "loading";
 		this.controls.enabled = false;
-		this.clearScene(); // bumps loadToken; stale awaits below bail out
+		this.clearScene();
 		const token = this.loadToken;
 		this.showOverlay("loading scene…");
 
@@ -1433,26 +1569,16 @@ export class OrbitEngine {
 			}
 			if (token !== this.loadToken || this.disposed) return;
 
-			// Bird's-eye slices: resolve their URLs and prefetch EVERY floor now
-			// (parallel with the GLB loads below), so paging floors on the minimap
-			// is instant instead of fetching each slice on first view.
 			const mmList =
-				manifest && Array.isArray(manifest.minimaps)
-					? manifest.minimaps
-					: [];
-			this.minimaps = mmList.map((m) => ({
-				...m,
-				url: source.resolveMinimap(m.file),
-			}));
+				manifest && Array.isArray(manifest.minimaps) ? manifest.minimaps : [];
+			this.minimaps = mmList.map((m) => ({ ...m, url: source.resolveMinimap(m.file) }));
 			this.minimapPrefetch = this.minimaps.map((m) => {
 				const img = new Image();
 				img.src = m.url;
 				return img;
 			});
 
-			const list =
-				manifest && Array.isArray(manifest.panos) ? manifest.panos : [];
-			// Panos load lazily (on enter / on movement); just resolve URLs now.
+			const list = manifest && Array.isArray(manifest.panos) ? manifest.panos : [];
 			const entries: PanoEntry[] = list.map((p) => {
 				const { url, placeholderUrl } = source.resolvePano(p.file);
 				return {
@@ -1471,16 +1597,12 @@ export class OrbitEngine {
 			});
 
 			const connectors =
-				manifest && Array.isArray(manifest.connectors)
-					? manifest.connectors
-					: [];
+				manifest && Array.isArray(manifest.connectors) ? manifest.connectors : [];
 
 			let proxyRoot: Group | null = null;
 			if (manifest?.proxy) {
 				try {
-					proxyRoot = await loadGLB(
-						source.resolveProxy(manifest.proxy),
-					);
+					proxyRoot = await loadGLB(source.resolveProxy(manifest.proxy));
 				} catch {
 					proxyRoot = null;
 				}
@@ -1500,10 +1622,7 @@ export class OrbitEngine {
 			this.mode = "empty";
 			this.showOverlay(
 				`failed to load scene: ${e instanceof Error ? e.message : String(e)}`,
-				{
-					spinner: false,
-					err: true,
-				},
+				{ spinner: false, err: true },
 			);
 		}
 	}
@@ -1516,45 +1635,39 @@ export class OrbitEngine {
 	) {
 		this.connectors = connectors;
 		this.streamer.reset(entries);
-		this.panoLevel = entries.map((p) =>
-			levelForY(this.minimaps, p.position[1]),
-		);
+		this.panoLevel = entries.map((p) => levelForY(this.minimaps, p.position[1]));
 		this.projectionMode = !!proxyRoot;
-		this.sharedOverview = !lite && !!proxyRoot; // no lite: the proxy doubles as the dollhouse
+		this.sharedOverview = !lite && !!proxyRoot;
 
 		if (!lite && !proxyRoot) {
 			this.mode = "empty";
-			this.showOverlay("nothing to show for this scene", {
-				spinner: false,
-				err: true,
-			});
+			this.showOverlay("nothing to show for this scene", { spinner: false, err: true });
 			return;
 		}
 
+		// Make both roots shadeable BEFORE anything re-skins them: generate the
+		// missing normals (without which the standard material shades to black),
+		// force the matte splat-tier look, and put falsely-BLEND opaque geometry
+		// back in the opaque queue so depth — not centroid sorting — decides what
+		// occludes what. See prepare.ts.
 		if (lite) {
+			prepareLitScene(lite);
 			this.liteRoot = lite;
 			this.scene.add(lite);
 		}
 		if (proxyRoot) {
-			this.projection.setup(proxyRoot, this.sphereA, this.sphereAMat);
+			prepareLitScene(proxyRoot);
+			this.projection.setup(proxyRoot, this.sphereA);
 			this.proxyGroup = proxyRoot;
 			this.scene.add(proxyRoot);
 		}
 
-		// Tag each placed object in both roots so they can be hovered / hidden /
-		// outlined individually (independently per scene — lite and proxy nodes
-		// don't share identity).
+		// Object addressing on both roots. Connector highlights are intentionally
+		// NOT pinned (hidden for now) — travel is driven entirely by the nav graph.
 		if (this.liteRoot) this.addressing.register(this.liteRoot);
 		if (this.proxyGroup) {
 			this.addressing.register(this.proxyGroup);
-			// Connector objects (doors, stairs, ...) named by the manifest get the
-			// permanent orange outline + fill, and become click-to-traverse.
-			this.addressing.pinConnectors(
-				this.proxyGroup,
-				this.connectors.map((c) => c.id),
-			);
 			this.colorProxyObjects();
-			// Give proxy floor leaks an opaque backing (a base under its footprint).
 			this.projection.buildBase(this.proxyGroup, this.scene);
 		}
 
@@ -1563,17 +1676,20 @@ export class OrbitEngine {
 		const size = box.getSize(new Vector3());
 		box.getCenter(this.sceneCenter);
 		this.sceneMaxDim = Math.max(size.x, size.y, size.z) || 1;
+		this.rig.fit(box); // spend the shadow frustum's precision on this scene
 
 		this.camera.near = Math.max(0.02, this.sceneMaxDim * 0.002);
 		this.camera.far = Math.max(500, this.sceneMaxDim * 60);
 
-		this.markers.build(this.panos, this.sceneMaxDim);
-		this.markers.rebuildHotspots(
-			this.panos,
-			this.currentIndex,
-			this.proxyGroup,
-			this.projectionMode,
+		// Build the typed navigation graph now that geometry + panos are placed.
+		this.navGraph = buildNavGraph(
+			entries.map((p) => ({ position: p.position, zone: p.zone })),
+			this.panoLevel,
+			(a, b) => this.segmentBlocked(a, b),
 		);
+		this.buildSceneDirectory(entries);
+
+		this.markers.build(this.panos, this.sceneMaxDim);
 
 		const dist = this.sceneMaxDim * 1.6;
 		this.browsePos
@@ -1590,16 +1706,70 @@ export class OrbitEngine {
 
 		this.setOverviewView();
 		this.mode = "overview";
-		this.hideOverlay(); // emits the framed overview state
+		this.hideOverlay();
+	}
+
+	// Line-of-sight test for the nav graph: is the straight segment between two
+	// capture points blocked by the proxy? (No proxy → nothing occludes, so every
+	// same-level pair reads as a clear walk.) Trimmed at both ends so hugging a
+	// wall doesn't read as a block.
+	private segmentBlocked(
+		a: [number, number, number],
+		b: [number, number, number],
+	): boolean {
+		if (!this.proxyGroup) return false;
+		const from = v3(a);
+		const d = v3(b).sub(from);
+		const dist = d.length();
+		if (dist < 1e-3) return false;
+		d.divideScalar(dist);
+		this.occluder.set(from, d);
+		this.occluder.near = 0.2;
+		this.occluder.far = dist - 0.2;
+		if (this.occluder.far <= this.occluder.near) return false;
+		return this.occluder.intersectObject(this.proxyGroup, true).length > 0;
+	}
+
+	// Stable per-scene directory + zone chapters + undirected map edges (for the
+	// minimap overlay, chapters drawer, and "take me to" search).
+	private buildSceneDirectory(entries: PanoEntry[]) {
+		this.nodeDir = entries.map((p, i) => ({
+			index: i,
+			name: p.name ?? null,
+			zone: p.zone ?? null,
+			level: this.panoLevel[i],
+		}));
+		const chapters: Chapter[] = [];
+		for (let i = 0; i < entries.length; i++) {
+			const zone = entries[i].zone ?? "";
+			const found = chapters.find((c) => c.zone === zone);
+			if (found) found.count++;
+			else chapters.push({ zone, count: 1, firstIndex: i });
+		}
+		this.chapters = chapters;
+		const seen = new Set<string>();
+		const edges: MapEdge[] = [];
+		if (this.navGraph) {
+			for (const node of this.navGraph.nodes) {
+				for (const e of node.all) {
+					if (e.type === "far") continue;
+					const a = Math.min(node.index, e.to);
+					const b = Math.max(node.index, e.to);
+					const key = `${a}-${b}`;
+					if (seen.has(key)) continue;
+					seen.add(key);
+					edges.push({ a, b, type: e.type });
+				}
+			}
+		}
+		this.mapEdges = edges;
 	}
 
 	// --- render loop ----------------------------------------------------------
 
 	private tick = (time: number) => {
 		const now = performance.now();
-		const dt = this.lastFrame
-			? Math.min(0.05, (time - this.lastFrame) / 1000)
-			: 0;
+		const dt = this.lastFrame ? Math.min(0.05, (time - this.lastFrame) / 1000) : 0;
 		this.lastFrame = time;
 
 		if (this.transition) {
@@ -1609,19 +1779,15 @@ export class OrbitEngine {
 			this.camera.position.lerpVectors(tr.fromPos, tr.toPos, e);
 			this.camera.quaternion.slerpQuaternions(tr.fromQuat, tr.toQuat, e);
 			this.camera.updateMatrixWorld();
-			this.setTravelMask(t);
+			this.travelFade.style.opacity = (Math.sin(Math.PI * t) * 0.5).toFixed(3);
 			if (!tr.midDone && t >= 0.5) {
 				tr.midDone = true;
 				tr.onMid?.();
 			}
-			if (
-				this.proxyGroup?.visible &&
-				this.projectionMode &&
-				!this.proxyView
-			)
+			if (this.proxyGroup?.visible && this.projectionMode && !this.proxyView)
 				this.updateProjection();
 			if (t >= 1) {
-				this.clearTravelMask();
+				this.travelFade.style.opacity = "0";
 				const cb = tr.onEnd;
 				this.transition = null;
 				cb?.();
@@ -1629,32 +1795,49 @@ export class OrbitEngine {
 		} else if (this.mode === "overview") {
 			this.controls.update();
 		} else if (this.mode === "interior") {
-			if (this.glide) {
-				const g = this.glide;
-				const t = Math.min(1, (now - g.start) / g.dur);
-				this.camera.position.lerpVectors(
-					g.fromPos,
-					g.toPos,
-					easeInOut(t),
-				);
-				this.setTravelMask(t);
+			if (this.move) {
+				const mv = this.move;
+				const t = Math.min(1, (now - mv.start) / mv.dur);
+				const e = easeInOut(t);
+				if (mv.ctrl) quadBezier(mv.fromPos, mv.ctrl, mv.toPos, e, _bez);
+				else _bez.lerpVectors(mv.fromPos, mv.toPos, e);
+				this.camera.position.copy(_bez);
+				if (mv.sphere) {
+					this.sphereBMat.uniforms.opacity.value = e;
+					this.sphereA.position.copy(this.camera.position);
+					this.sphereB.position.copy(this.camera.position);
+				}
+				this.setFx(mv.type, t);
 				if (t >= 1) {
-					this.clearTravelMask();
-					const idx = g.index;
-					this.glide = null;
-					this.interiorBusy = false;
-					this.markers.hotspotGroup.visible = true;
-					this.activate(idx);
+					this.move = null;
+					this.finishMove(mv);
 				}
 			}
 			if (this.projectionMode) {
-				if (!this.proxyView) this.updateProjection(); // proxy view shows bare geometry, no panos
-			} else {
+				if (!this.proxyView) this.updateProjection();
+			} else if (!this.move) {
 				this.sphereA.position.copy(this.camera.position);
 			}
+			// The tour drives the same yaw/pitch drag-look writes, so it has to run
+			// before the look is applied.
+			this.director.tick(now);
 			this.lat = applyLook(this.camera, this.lon, this.lat);
+			if (!this.interiorBusy) {
+				this.markers.updateNav(this.camera, this.lon, now, this.host.clientHeight);
+				if (this.markers.sonarActive) {
+					this.markers.updateSonar(now, this.camera, this.host.clientHeight);
+					this.updateSonarLabels();
+					if (!this.markers.sonarActive) this.emit(); // just expired
+				} else if (this.sonarLabels.some((l) => l.style.display !== "none")) {
+					for (const l of this.sonarLabels) l.style.display = "none";
+				}
+				// Never let stillness become stuckness: pulse the exits once on dwell.
+				if (!this.dwellPulsed && now - this.lastInputAt > DWELL_MS) {
+					this.dwellPulsed = true;
+					this.markers.pulseExits(now, 1600);
+				}
+			}
 		} else if (this.mode === "peek") {
-			// Slowly orbit the dollhouse so locating gives a 360 view.
 			const off = this.camera.position.clone().sub(this.sceneCenter);
 			const a = PEEK_ROTATE_SPEED * dt;
 			const c = Math.cos(a);
@@ -1665,7 +1848,6 @@ export class OrbitEngine {
 		}
 
 		this.updateCursorRing();
-		this.positionDestLabel();
 		this.markers.updateEntryDiscs(
 			this.camera,
 			this.host.clientHeight,
@@ -1675,4 +1857,53 @@ export class OrbitEngine {
 		this.addressing.updateOutlines();
 		this.composer.render();
 	};
+
+	private updateCursorRing() {
+		const active =
+			this.mode === "interior" &&
+			!this.interiorBusy &&
+			this.pointerInside &&
+			!this.markers.hoveredNav;
+		const hit = active
+			? this.raycastInterior(this.pointerClientX, this.pointerClientY)
+			: null;
+		this.cursor.update(hit, this.camera, this.host.clientHeight);
+	}
+
+	// X-ray name tags for the nearest sonar nodes (engine-owned DOM pool, so the
+	// reveal labels track look without churning React).
+	private updateSonarLabels() {
+		const targets = this.markers.sonarLabelTargets(this.camera, this.canvas, 8);
+		const rect = this.canvas.getBoundingClientRect();
+		for (let i = 0; i < this.sonarLabels.length; i++) {
+			const el = this.sonarLabels[i];
+			const t = targets[i];
+			if (!t) {
+				el.style.display = "none";
+				continue;
+			}
+			el.textContent = t.name;
+			el.style.left = `${t.x - rect.left}px`;
+			el.style.top = `${t.y - rect.top}px`;
+			el.style.display = "block";
+		}
+		// Grow the pool on demand.
+		while (this.sonarLabels.length < targets.length) {
+			const el = document.createElement("div");
+			Object.assign(el.style, {
+				position: "absolute",
+				transform: "translate(-50%, -140%)",
+				padding: "1px 6px",
+				borderRadius: "5px",
+				background: "rgba(10,12,20,0.82)",
+				color: "#cfe6ff",
+				font: "600 10px ui-sans-serif, system-ui, sans-serif",
+				whiteSpace: "nowrap",
+				pointerEvents: "none",
+				zIndex: "3",
+			});
+			this.host.appendChild(el);
+			this.sonarLabels.push(el);
+		}
+	}
 }

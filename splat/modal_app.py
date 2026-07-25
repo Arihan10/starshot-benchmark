@@ -157,12 +157,20 @@ image = (
     .add_local_file(
         _REPO / "client/public/js/splatcapture.js", f"{_ASSETS}/js/splatcapture.js"
     )
-    # splatcapture.js imports the shared weighted-blended OIT engine (oit.js — glass
-    # compositing + the all-layers shadow bake), the per-object scene-reflection
-    # baker (reflections.js), and the emissive-light rig (emissive.js — glowing
-    # lamps/screens + their point lights); the loopback host serves them from /js,
-    # so they MUST be baked in or the page's ES module graph 404s and no frames
-    # render.
+    # splatcapture.js's whole module graph must be baked in — the loopback host
+    # serves these from /js, so a missing one 404s the page and NO frames render.
+    # capturecore.js is the render pipeline itself (renderer config, material prep,
+    # the light/shadow/reflection bakes, and the OIT + ACES present), shared with the
+    # matterport tour capture; it pulls in the weighted-blended OIT engine (oit.js),
+    # the per-object scene-reflection baker (reflections.js), the emissive-light rig
+    # (emissive.js — glowing lamps/screens + their point lights), the bake rig
+    # (splatlight.js), and the reflective/matte discriminator (reflective.js).
+    .add_local_file(
+        _REPO / "client/public/js/capturecore.js", f"{_ASSETS}/js/capturecore.js"
+    )
+    .add_local_file(
+        _REPO / "client/public/js/reflective.js", f"{_ASSETS}/js/reflective.js"
+    )
     .add_local_file(
         _REPO / "client/public/js/oit.js", f"{_ASSETS}/js/oit.js"
     )
@@ -424,13 +432,14 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     code5 = _src_sig(
         Path(_stage5.__file__), Path(modal_capture.__file__),
         _js / "splatcapture.js", _js / "splatcapture-worker.js",
-        # splatlight.js (bake rig), oit.js (weighted-blended OIT + the all-layers
-        # shadow bake), reflections.js (per-object scene reflections), and
-        # emissive.js (emissive glow + point lights) all determine every captured
-        # pixel — fold them in so a change there re-renders stage 5 instead of
-        # silently reusing frames.
-        _js / "splatlight.js", _js / "oit.js", _js / "reflections.js",
-        _js / "emissive.js",
+        # capturecore.js (the shared render pipeline), splatlight.js (bake rig),
+        # oit.js (weighted-blended OIT + the all-layers shadow bake), reflections.js
+        # (per-object scene reflections), reflective.js (which surfaces stay
+        # reflective vs. forced matte), and emissive.js (emissive glow + point
+        # lights) all determine every captured pixel — fold them in so a change
+        # there re-renders stage 5 instead of silently reusing frames.
+        _js / "capturecore.js", _js / "splatlight.js", _js / "oit.js",
+        _js / "reflections.js", _js / "reflective.js", _js / "emissive.js",
     )
     # Stage 6 now trains from the COLMAP export, so its code sig folds in colmap.py
     # too — editing the exporter re-runs stage 6 rather than reusing a stale model.

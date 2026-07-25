@@ -4173,6 +4173,10 @@
                 color: var(--text);
                 font-weight: 600;
             }
+            #splat-viewer-fp.on {
+                border-color: var(--accent);
+                color: var(--accent);
+            }
             #runcompare {
                 position: fixed;
                 inset: 0;
@@ -5089,6 +5093,12 @@
                 <button id="splat-viewer-close" title="Back to cells (Esc)">
                     ← cells
                 </button>
+                <button
+                    id="splat-viewer-fp"
+                    title="First-person camera (mouse-look). Click to enter · WASD move (W follows look) · Q/E down·up · Shift sprint · scroll to trim the fly speed · Esc to exit. Hold the right mouse button for a momentary look without toggling."
+                >
+                    first-person
+                </button>
                 <span class="title">splat · Stage 2 · pre-fine-tuning cloud</span>
                 <span class="muted" id="splat-viewer-sub"></span>
                 <span style="margin-left: auto"></span>
@@ -5099,8 +5109,12 @@
                  detail LOD) + re-splat; populated by splatviewer.js. -->
             <div id="splat-viewer-controls"></div>
             <div id="splat-viewer-help">
-                <b>WASD</b> move · <b>Q/E</b> down/up · <b>Shift</b> sprint ·
-                drag to look · scroll to zoom
+                <b>drag</b> orbit · <b>middle</b> pan · <b>scroll</b> zoom ·
+                <b>WASD</b> move · <b>Q/E</b> down/up · <b>R/F</b> dolly ·
+                <b>Shift</b> sprint<br />
+                <b>hold right</b> (or the <b>first-person</b> toggle) to fly —
+                the mouse looks, <b>scroll</b> sets the fly speed,
+                <b>Esc</b> exits
             </div>
         </div>
         <div id="modal-root"></div>

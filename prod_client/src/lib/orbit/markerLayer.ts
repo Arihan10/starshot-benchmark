@@ -1,219 +1,260 @@
 import {
-	DoubleSide,
 	Group,
+	type Material,
 	Mesh,
-	MeshBasicMaterial,
+	type MeshBasicMaterial,
 	type Object3D,
 	type PerspectiveCamera,
-	Raycaster,
 	RingGeometry,
 	type Scene,
 	SphereGeometry,
 	Vector3,
 } from "three";
 import {
-	ANCHOR_RING_INNER,
-	ANCHOR_RING_OCCLUDED_COLOR,
-	ANCHOR_RING_OCCLUDED_OPACITY,
-	ANCHOR_RING_OCCLUDED_SCALE,
-	ANCHOR_RING_OPACITY,
-	ANCHOR_RING_OUTER,
-	AUTO_AIM_PX,
 	CAPTURE_EYE_HEIGHT,
 	ENTRY_TARGET_PX,
 	HOTSPOT_FLOOR_DROP,
-	HOTSPOT_MAX_OCCLUDED,
-	HOTSPOT_OCCLUDE_EPS,
-	HOTSPOT_REACH,
-	hotspotScaleForDistance,
 	makeDisc,
+	makeNavMarker,
+	makeSonarDot,
 	makeYouMarker,
+	NAV_AIM_PX,
+	NAV_COLORS,
+	NAV_GAZE_RAD,
+	NAV_REST_OPACITY,
+	NAV_RING_OUTER,
+	NAV_TARGET_PX,
 	pickByScreen,
+	screenScaleForDistance,
+	SONAR_DURATION,
 	type YouMarker,
 } from "./markers";
+import { angleDelta, type NavNode } from "./navGraph";
 import type { PanoEntry } from "./panoTextures";
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
 
-// The interior navigation overlay: white anchor rings on every capture point,
-// warm-gold rings layered onto the nearest behind-wall anchors, the overview
-// entry discs, and the "you are here" pin used while locating. Owns the marker
-// groups + their shared geometry/materials; the engine drives group visibility
-// per mode and feeds in the live panos / camera.
+// The interior navigation overlay. Renders the CURRENT node's typed affordances
+// (walk pucks, portal/vertical chevrons, phase ghost rings), fades them by gaze
+// bearing, drives the sonar reveal of every node, and keeps the overview "enter"
+// discs + the peek "you are here" pin. The engine flips group visibility per mode
+// and feeds in the live nav graph / camera each frame.
 export class MarkerLayer {
-	readonly hotspotGroup = new Group();
-	readonly entryGroup = new Group();
-	// Every anchor as a small white ring laid flat on the floor. Depth-tested
-	// (depthTest defaults on) so scene geometry obstructs it, and never
-	// screen-scaled so it keeps a world-fixed size — smaller far, larger near,
-	// like a real object. One shared geometry + material across all anchors.
-	readonly anchorRingGroup = new Group();
+	readonly entryGroup = new Group(); // overview: one disc per capture ("enter here")
+	readonly navGroup = new Group(); // interior: the current node's typed affordances
+	readonly sonarGroup = new Group(); // interior: x-ray reveal of every node
 	readonly you: YouMarker = makeYouMarker();
 
-	private readonly anchorRingGeo = new RingGeometry(
-		ANCHOR_RING_INNER,
-		ANCHOR_RING_OUTER,
-		40,
-	);
-	private readonly anchorRingMat = new MeshBasicMaterial({
-		color: 0xffffff,
-		transparent: true,
-		opacity: ANCHOR_RING_OPACITY,
-		side: DoubleSide,
-		depthWrite: false,
-	});
-	// The X closest obstructed anchors reuse the ring geometry in warm gold, drawn
-	// over everything (depthTest off) so they show through walls as reachable.
-	private readonly anchorRingOccludedMat = new MeshBasicMaterial({
-		color: ANCHOR_RING_OCCLUDED_COLOR,
-		transparent: true,
-		opacity: ANCHOR_RING_OCCLUDED_OPACITY,
-		side: DoubleSide,
-		depthWrite: false,
-		depthTest: false,
-	});
-	// Full-opacity twins of the two ring materials, swapped onto the single ring the
-	// cursor is over (setRingHover). Rings share the faint base materials, so this
-	// lights just the hovered one — matching its color + depthTest, only at opacity 1.
-	private readonly anchorRingHoverMat = new MeshBasicMaterial({
-		color: 0xffffff,
-		transparent: true,
-		opacity: 1,
-		side: DoubleSide,
-		depthWrite: false,
-	});
-	private readonly anchorRingOccludedHoverMat = new MeshBasicMaterial({
-		color: ANCHOR_RING_OCCLUDED_COLOR,
-		transparent: true,
-		opacity: 1,
-		side: DoubleSide,
-		depthWrite: false,
-		depthTest: false,
-	});
-	private hovered: Mesh | null = null;
-	private readonly occluder = new Raycaster();
+	private hovered: Object3D | null = null;
+	private pulseUntil = 0; // dwell/never-trapped: briefly boost every affordance
+	private sonarStart = 0;
+	private sonarReach = 1;
 
 	constructor(private readonly scene: Scene) {
-		scene.add(this.hotspotGroup, this.entryGroup, this.anchorRingGroup);
-		scene.add(this.you.group);
+		scene.add(this.entryGroup, this.navGroup, this.sonarGroup, this.you.group);
 	}
 
-	get hoveredRing(): Mesh | null {
-		return this.hovered;
-	}
-
-	// Per-scene build: entry discs, white anchor rings, and the "you" marker sized
-	// to the scene. Hotspots are rebuilt separately (they depend on position).
+	// Per-scene build: the overview entry discs + the you-marker sized to the scene.
 	build(panos: PanoEntry[], sceneMaxDim: number) {
 		this.sizeYouMarker(sceneMaxDim);
-		this.buildEntryMarkers(panos);
-		this.buildAnchorRings(panos);
-	}
-
-	// The X closest obstructed (behind-wall) anchors. Same ring as the white anchor
-	// rings but warm gold, larger, and drawn over everything so they read as
-	// reachable through walls. Rebuilt on travel (occlusion is per position).
-	rebuildHotspots(
-		panos: PanoEntry[],
-		currentIndex: number,
-		proxyGroup: Group | null,
-		projectionMode: boolean,
-	) {
-		this.hotspotGroup.clear();
-		if (currentIndex < 0) return;
-		const cur = panos[currentIndex];
-		let nOccluded = 0;
-		for (const i of this.neighborsByDistance(
-			panos,
-			currentIndex,
-			projectionMode,
-		)) {
-			if (!this.anchorOccluded(proxyGroup, cur.position, panos[i].position))
-				continue;
-			const ring = new Mesh(this.anchorRingGeo, this.anchorRingOccludedMat);
-			ring.rotation.x = -Math.PI / 2;
-			ring.scale.setScalar(ANCHOR_RING_OCCLUDED_SCALE);
-			ring.position.fromArray(panos[i].position);
-			ring.position.y -= HOTSPOT_FLOOR_DROP;
-			ring.userData.targetIndex = i;
-			ring.userData.occluded = true;
-			this.hotspotGroup.add(ring);
-			if (++nOccluded >= HOTSPOT_MAX_OCCLUDED) break;
+		this.entryGroup.clear();
+		for (let i = 0; i < panos.length; i++) {
+			const spot = makeDisc(i, 0x9ad4ff, 0x4a8fd8);
+			spot.position.fromArray(panos[i].position);
+			spot.position.y -= HOTSPOT_FLOOR_DROP;
+			this.entryGroup.add(spot);
 		}
 	}
 
-	// Nearest clickable anchor marker under the cursor (screen-space magnetism): a
-	// gold obstructed marker (drawn over everything, always reachable), else a white
-	// ring that scene geometry isn't hiding — an occluded white ring is invisible,
-	// so clicking the wall in front of it must NOT teleport through. Shared by hover
-	// + click, so what lights up is exactly what a click travels to.
-	pickAnchorMarker(
+	// --- typed interior affordances -----------------------------------------
+
+	// Rebuild the affordances for the node the user is standing on. Each rendered
+	// edge (walk/portal/vertical, plus phase when the node is trapped) becomes one
+	// marker at the destination's floor.
+	buildNav(node: NavNode | null, panos: PanoEntry[]) {
+		this.clearNav();
+		if (!node) return;
+		for (const edge of node.rendered) {
+			const floor = v3(panos[edge.to].position);
+			floor.y -= HOTSPOT_FLOOR_DROP;
+			const marker = makeNavMarker(edge, floor);
+			marker.userData.bearing = edge.bearing;
+			marker.userData.pulse = edge.type === "phase"; // trapped ghost never stops pulsing
+			this.navGroup.add(marker);
+		}
+	}
+
+	clearNav() {
+		for (const m of this.navGroup.children) disposeGroup(m);
+		this.navGroup.clear();
+		this.hovered = null;
+	}
+
+	// Gaze-contingent disclosure: affordances rest bright enough to FIND off-axis
+	// and go full as the look swings toward them; phase ghosts + a dwell/never-
+	// trapped pulse breathe. Each marker also gets a minimum on-screen size so a
+	// far (or another-floor) point never shrinks away — near ones keep world size,
+	// distant ones scale UP to stay visible + clickable.
+	updateNav(
+		camera: PerspectiveCamera,
+		cameraAzimuth: number,
+		now: number,
+		viewportHeight: number,
+	) {
+		if (!this.navGroup.visible) return;
+		const pulsing = now < this.pulseUntil;
+		const breathe = 0.7 + 0.3 * Math.sin(now * 0.006);
+		for (const marker of this.navGroup.children) {
+			const bearing = marker.userData.bearing as number;
+			const gaze = Math.max(
+				0,
+				1 - Math.abs(angleDelta(cameraAzimuth, bearing)) / NAV_GAZE_RAD,
+			);
+			let op = NAV_REST_OPACITY + (1 - NAV_REST_OPACITY) * gaze;
+			if (marker === this.hovered) op = 1;
+			else if (marker.userData.pulse || pulsing) op = Math.max(op, breathe);
+			setGroupOpacity(marker, op);
+			const d = camera.position.distanceTo(marker.position);
+			marker.scale.setScalar(
+				Math.max(
+					1,
+					screenScaleForDistance(d, NAV_TARGET_PX, camera.fov, viewportHeight, NAV_RING_OUTER),
+				),
+			);
+		}
+	}
+
+	// Nearest affordance under the cursor (screen-space magnetism). Returns the
+	// marker group; its userData carries the edge target + type.
+	pickNav(
 		clientX: number,
 		clientY: number,
 		camera: PerspectiveCamera,
 		canvas: HTMLCanvasElement,
-		panos: PanoEntry[],
-		currentIndex: number,
-		proxyGroup: Group | null,
 	): Object3D | null {
-		const occluded = pickByScreen(
-			clientX,
-			clientY,
-			this.hotspotGroup,
-			AUTO_AIM_PX,
-			camera,
-			canvas,
-		);
-		if (occluded) return occluded;
-		const ring = pickByScreen(
-			clientX,
-			clientY,
-			this.anchorRingGroup,
-			AUTO_AIM_PX,
-			camera,
-			canvas,
-		);
-		if (!ring) return null;
-		const i = ring.userData.targetIndex as number;
-		if (i === currentIndex) return null;
-		const cur = panos[currentIndex].position;
-		return this.anchorOccluded(proxyGroup, cur, panos[i].position)
-			? null
-			: ring;
+		return pickByScreen(clientX, clientY, this.navGroup, NAV_AIM_PX, camera, canvas);
 	}
 
-	// Light the one ring the cursor is over to full opacity, reverting the one it
-	// left. Rings share faint base materials, so we swap just this mesh's material
-	// to its bolder twin (same color + depthTest, opacity 1).
-	setRingHover(mesh: Mesh | null) {
-		if (mesh === this.hovered) return;
-		if (this.hovered) {
-			this.hovered.material = this.hovered.userData.occluded
-				? this.anchorRingOccludedMat
-				: this.anchorRingMat;
-		}
-		this.hovered = mesh;
-		if (mesh) {
-			mesh.material = mesh.userData.occluded
-				? this.anchorRingOccludedHoverMat
-				: this.anchorRingHoverMat;
+	setNavHover(marker: Object3D | null) {
+		this.hovered = marker;
+	}
+
+	get hoveredNav(): Object3D | null {
+		return this.hovered;
+	}
+
+	// Briefly pulse every exit (idle-dwell nudge, or a trapped node on arrival).
+	pulseExits(now: number, ms = 1400) {
+		this.pulseUntil = now + ms;
+	}
+
+	// --- sonar reveal --------------------------------------------------------
+
+	// Build one x-ray dot per OTHER node, colored by its edge type from the current
+	// node (far when it has no direct edge). Sized/positioned each frame.
+	buildSonar(node: NavNode | null, panos: PanoEntry[], currentIndex: number) {
+		for (const d of this.sonarGroup.children) disposeMesh(d as Mesh);
+		this.sonarGroup.clear();
+		if (!node) return;
+		const typeOf = new Map<number, string>();
+		for (const e of node.all) typeOf.set(e.to, e.type);
+		for (let i = 0; i < panos.length; i++) {
+			if (i === currentIndex) continue;
+			const type = (typeOf.get(i) ?? "far") as keyof typeof NAV_COLORS;
+			const dot = makeSonarDot(NAV_COLORS[type]);
+			dot.position.fromArray(panos[i].position);
+			dot.userData.to = i;
+			dot.userData.type = type;
+			dot.userData.name = panos[i].name ?? panos[i].id;
+			this.sonarGroup.add(dot);
 		}
 	}
 
-	// Floor directly beneath the user (panos sit at eye height), not the global
-	// scene minimum — so the base lands on the level you're standing on.
+	startSonar(now: number, camera: PerspectiveCamera) {
+		this.sonarStart = now;
+		let reach = 1;
+		for (const d of this.sonarGroup.children)
+			reach = Math.max(reach, camera.position.distanceTo(d.position));
+		this.sonarReach = reach * 1.05 + 1;
+		this.sonarGroup.visible = true;
+	}
+
+	get sonarActive(): boolean {
+		return this.sonarGroup.visible;
+	}
+
+	// Expanding reveal front sweeps outward from the camera; dots light as it
+	// passes them, then everything fades. Returns false once finished.
+	updateSonar(now: number, camera: PerspectiveCamera, viewportHeight: number): boolean {
+		if (!this.sonarGroup.visible) return false;
+		const t = (now - this.sonarStart) / SONAR_DURATION;
+		if (t >= 1) {
+			this.hideSonar();
+			return false;
+		}
+		const front = Math.min(1, t / 0.55) * this.sonarReach;
+		const globalFade = t < 0.8 ? 1 : 1 - (t - 0.8) / 0.2;
+		for (const dot of this.sonarGroup.children) {
+			const d = camera.position.distanceTo(dot.position);
+			const reveal = Math.max(0, Math.min(1, (front - d) / 2 + 0.5));
+			const mat = (dot as Mesh).material as MeshBasicMaterial;
+			mat.opacity = reveal * globalFade * 0.95;
+			dot.scale.setScalar(
+				screenScaleForDistance(
+					Math.max(0.2, d),
+					6,
+					camera.fov,
+					viewportHeight,
+					1,
+				),
+			);
+		}
+		return true;
+	}
+
+	hideSonar() {
+		this.sonarGroup.visible = false;
+	}
+
+	// Screen placement of the nearest sonar dots, for the engine's HTML labels.
+	sonarLabelTargets(
+		camera: PerspectiveCamera,
+		canvas: HTMLCanvasElement,
+		max: number,
+	): Array<{ x: number; y: number; name: string; type: string }> {
+		if (!this.sonarGroup.visible) return [];
+		const rect = canvas.getBoundingClientRect();
+		const out: Array<{ x: number; y: number; name: string; type: string; d: number }> = [];
+		const p = new Vector3();
+		for (const dot of this.sonarGroup.children) {
+			const mat = (dot as Mesh).material as MeshBasicMaterial;
+			if (mat.opacity < 0.25) continue;
+			dot.getWorldPosition(p);
+			const d = camera.position.distanceTo(p);
+			p.project(camera);
+			if (p.z > 1) continue;
+			out.push({
+				x: rect.left + (p.x * 0.5 + 0.5) * rect.width,
+				y: rect.top + (-p.y * 0.5 + 0.5) * rect.height,
+				name: dot.userData.name as string,
+				type: dot.userData.type as string,
+				d,
+			});
+		}
+		out.sort((a, b) => a.d - b.d);
+		return out.slice(0, max);
+	}
+
+	// --- peek "you are here" -------------------------------------------------
+
 	positionYouMarker(p: Vector3) {
 		const floorY = p.y - CAPTURE_EYE_HEIGHT;
 		this.you.sphere.position.copy(p);
 		this.you.ring.position.set(p.x, floorY, p.z);
-		this.you.line.geometry.setFromPoints([
-			new Vector3(p.x, floorY, p.z),
-			p.clone(),
-		]);
+		this.you.line.geometry.setFromPoints([new Vector3(p.x, floorY, p.z), p.clone()]);
 	}
 
-	// Overview entry discs render at a constant on-screen size + pulse; the
-	// interior anchor rings (white + gold) are world-fixed, so they're left be.
+	// Overview entry discs render at a constant on-screen size + pulse.
 	updateEntryDiscs(
 		camera: PerspectiveCamera,
 		viewportHeight: number,
@@ -226,12 +267,8 @@ export class MarkerLayer {
 			const hovered = spot.userData.targetIndex === hoveredEntryIndex;
 			const d = camera.position.distanceTo(spot.position);
 			spot.scale.setScalar(
-				hotspotScaleForDistance(
-					d,
-					ENTRY_TARGET_PX,
-					camera.fov,
-					viewportHeight,
-				) * (hovered ? 1.35 : 1),
+				screenScaleForDistance(d, ENTRY_TARGET_PX, camera.fov, viewportHeight) *
+					(hovered ? 1.35 : 1),
 			);
 			const disc = spot.children[0] as Mesh;
 			const ring = spot.children[1] as Mesh;
@@ -241,49 +278,19 @@ export class MarkerLayer {
 		}
 	}
 
-	// Empty the marker groups for a scene swap (the discs/rings are cheap clones
-	// over shared geometry; the shared geo/materials live until dispose()).
 	clear() {
-		this.hotspotGroup.clear();
+		this.clearNav();
+		for (const d of this.sonarGroup.children) disposeMesh(d as Mesh);
+		this.sonarGroup.clear();
+		this.sonarGroup.visible = false;
 		this.entryGroup.clear();
-		this.anchorRingGroup.clear();
-		this.hovered = null;
 		this.you.group.visible = false;
+		this.pulseUntil = 0;
 	}
 
 	dispose() {
-		this.scene.remove(this.anchorRingGroup);
-		this.anchorRingGeo.dispose();
-		this.anchorRingMat.dispose();
-		this.anchorRingOccludedMat.dispose();
-		this.anchorRingHoverMat.dispose();
-		this.anchorRingOccludedHoverMat.dispose();
-	}
-
-	// One white ring per anchor, laid flat on the floor — built once per scene.
-	// Shares anchorRingGeo/anchorRingMat so it's depth-tested (geometry obstructs
-	// it) and world-fixed-size; it shrinks far / grows near like a real object.
-	private buildAnchorRings(panos: PanoEntry[]) {
-		this.anchorRingGroup.clear();
-		for (let i = 0; i < panos.length; i++) {
-			const ring = new Mesh(this.anchorRingGeo, this.anchorRingMat);
-			ring.rotation.x = -Math.PI / 2;
-			ring.position.fromArray(panos[i].position);
-			ring.position.y -= HOTSPOT_FLOOR_DROP;
-			ring.userData.targetIndex = i;
-			ring.userData.occluded = false;
-			this.anchorRingGroup.add(ring);
-		}
-	}
-
-	private buildEntryMarkers(panos: PanoEntry[]) {
-		this.entryGroup.clear();
-		for (let i = 0; i < panos.length; i++) {
-			const spot = makeDisc(i, 0x9ad4ff, 0x4a8fd8);
-			spot.position.fromArray(panos[i].position);
-			spot.position.y -= HOTSPOT_FLOOR_DROP;
-			this.entryGroup.add(spot);
-		}
+		this.clear();
+		this.scene.remove(this.entryGroup, this.navGroup, this.sonarGroup, this.you.group);
 	}
 
 	private sizeYouMarker(sceneMaxDim: number) {
@@ -293,42 +300,27 @@ export class MarkerLayer {
 		this.you.ring.geometry.dispose();
 		this.you.ring.geometry = new RingGeometry(r * 1.6, r * 2.2, 40);
 	}
+}
 
-	// Is the straight line between two capture points blocked by the proxy? Our
-	// "behind a wall/floor" test, trimmed at both ends so a hugged wall doesn't
-	// read as occlusion.
-	private anchorOccluded(
-		proxyGroup: Group | null,
-		fromPos: [number, number, number],
-		toPos: [number, number, number],
-	): boolean {
-		if (!proxyGroup) return false;
-		const from = v3(fromPos);
-		const d = v3(toPos).sub(from);
-		const dist = d.length();
-		if (dist < 1e-3) return false;
-		d.divideScalar(dist);
-		this.occluder.set(from, d);
-		this.occluder.near = HOTSPOT_OCCLUDE_EPS;
-		this.occluder.far = dist - HOTSPOT_OCCLUDE_EPS;
-		if (this.occluder.far <= this.occluder.near) return false;
-		return this.occluder.intersectObject(proxyGroup, true).length > 0;
-	}
+// Set a uniform opacity across every material in an affordance group.
+function setGroupOpacity(marker: Object3D, opacity: number) {
+	marker.traverse((o) => {
+		const m = (o as Mesh).material as Material | Material[] | undefined;
+		if (!m) return;
+		for (const mat of Array.isArray(m) ? m : [m])
+			(mat as MeshBasicMaterial).opacity = opacity;
+	});
+}
 
-	private neighborsByDistance(
-		panos: PanoEntry[],
-		currentIndex: number,
-		projectionMode: boolean,
-	): number[] {
-		const cur = v3(panos[currentIndex].position);
-		const out: Array<[number, number]> = [];
-		for (let i = 0; i < panos.length; i++) {
-			if (i === currentIndex) continue;
-			const d2 = cur.distanceToSquared(v3(panos[i].position));
-			if (projectionMode && d2 > HOTSPOT_REACH * HOTSPOT_REACH) continue;
-			out.push([i, d2]);
-		}
-		out.sort((a, b) => a[1] - b[1]);
-		return out.map((o) => o[0]);
-	}
+function disposeMesh(m: Mesh) {
+	m.geometry?.dispose();
+	const mats = Array.isArray(m.material) ? m.material : [m.material];
+	for (const mat of mats) mat?.dispose();
+}
+
+function disposeGroup(g: Object3D) {
+	g.traverse((o) => {
+		const m = o as Mesh;
+		if (m.isMesh || (o as { isLine?: boolean }).isLine) disposeMesh(m);
+	});
 }

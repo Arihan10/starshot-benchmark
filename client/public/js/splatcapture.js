@@ -56,21 +56,19 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { KTX2Loader } from "three/addons/loaders/KTX2Loader.js";
 import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
-import { normalizeLighting, createLightRig } from "./splatlight.js";
-import { bakeReflectionProbes } from "./reflections.js";
-import { applyEmissiveLighting } from "./emissive.js";
-import { matteNonReflective } from "./reflective.js";
+import { normalizeLighting } from "./splatlight.js";
+// The render pipeline — renderer configuration, per-object material prep, the
+// light/shadow/reflection bakes, and the weighted-blended OIT + ACES present —
+// lives in capturecore.js, SHARED with the matterport tour capture
+// (tourcapture.js). The only difference between the two captures is the camera
+// pattern: Stage 5 renders the planned directed views, the tour renders cube faces.
 import {
-    OIT_LAYER,
-    TONEMAP_GLSL,
-    setOITBlend,
-    prepareOITScene,
-    collectOITMaterials,
-    decorateOITLights,
-    bakeShadowMap,
-} from "./oit.js";
-
-const DEPTH_CODE_MAX = 65535; // matches splat/stage5.py _DEPTH_CODE_MAX
+    createCapture,
+    createCaptureRenderer,
+    DEPTH_CODE_MAX,
+    prepareCaptureObject,
+    setupCaptureLighting,
+} from "./capturecore.js";
 // The bake rig + lit PBR materials live in splatlight.js (shared with the debug
 // viewers). The server sends splat/stage5.py's LIGHTING in the manifest, and
 // `normalizeLighting` falls back to the shared defaults when it's absent.
@@ -147,318 +145,10 @@ function stagePath(tail) {
 
 // --- renderer + capture pipeline ---------------------------------------------
 
-function createRenderer() {
-    const renderer = new THREE.WebGLRenderer({
-        antialias: false,
-        alpha: false,
-        preserveDrawingBuffer: false,
-        powerPreference: "high-performance",
-    });
-    if (!renderer.capabilities.isWebGL2) throw new Error("WebGL2 unavailable");
-    // Lit capture (Phase 1): the scene is shaded in LINEAR light into a half-float
-    // target, then the present pass (createCapture) tone-maps + sRGB-encodes it
-    // explicitly. Global tone mapping stays OFF so the scene target keeps linear
-    // HDR (the present pass owns the whole display transform); the ShaderMaterial
-    // passes store their output verbatim, so the encode is deterministic across
-    // three.js versions. Shadow maps render ONCE — the scene and the sun are both
-    // static — via autoUpdate off + a single needsUpdate before the loop.
-    renderer.toneMapping = THREE.NoToneMapping;
-    renderer.outputColorSpace = THREE.LinearSRGBColorSpace;
-    renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
-    renderer.shadowMap.autoUpdate = false;
-    renderer.setSize(256, 256); // preview canvas only; targets carry the real res
-    document.body.appendChild(renderer.domElement);
-    renderer.domElement.addEventListener("webglcontextlost", (e) => {
-        e.preventDefault();
-        fail(new Error("WebGL context lost"));
-    });
-    return renderer;
-}
-
 function rendererName(renderer) {
     const gl = renderer.getContext();
     const info = gl.getExtension("WEBGL_debug_renderer_info");
     return info ? gl.getParameter(info.UNMASKED_RENDERER_WEBGL) : "unknown";
-}
-
-// Per-capture OIT pass selector (0 accumulate · 1 revealage · 2 depth pre-pass),
-// shared with the transparent materials patched by prepareOITScene (see oit.js —
-// the same engine the debug viewer's mesh mode runs, so refs and preview match).
-const oitPass = { value: 0 };
-
-// Capture pipeline, per view: shade the lit scene in LINEAR HDR, then tone-map +
-// sRGB-encode in our OWN ShaderMaterial (deterministic across three.js versions)
-// → rtColor (RGBA8), and pack window-space depth → rtDepth (RG8 log-uint16 codes).
-// Opaque scenes take one scene pass + present; scenes with transparent meshes run
-// weighted-blended OIT (renderOIT) so glass composites order-independently, and the
-// composite emits the same ACES+sRGB colour plus the accumulated coverage in alpha.
-// `exposure` and `uLinear` (curve-off, for the self-test) parameterize the present.
-function createCapture(renderer, resolution, near, far, fovDeg, background, exposure = 1.0) {
-    const depthTexture = new THREE.DepthTexture(resolution, resolution);
-    depthTexture.type = THREE.FloatType;
-    const targetOpts = {
-        minFilter: THREE.NearestFilter,
-        magFilter: THREE.NearestFilter,
-        generateMipmaps: false,
-        stencilBuffer: false,
-    };
-    // Lit scene → linear HDR + depth. Half-float holds values > 1 so the tone map
-    // (present pass) has real highlight detail to compress; kept linear so the
-    // present pass owns the whole display transform.
-    const rtScene = new THREE.WebGLRenderTarget(resolution, resolution, {
-        ...targetOpts,
-        depthBuffer: true,
-        depthTexture,
-        type: THREE.HalfFloatType,
-    });
-    // Final 8-bit readback target for colour: the present pass writes already-
-    // encoded sRGB bytes, so nothing else touches them.
-    const rtColor = new THREE.WebGLRenderTarget(resolution, resolution, {
-        ...targetOpts,
-        depthBuffer: false,
-    });
-    // Depth pack target is RG8 (two bytes/pixel), NOT RGBA8: the pack shader writes
-    // the log-u16 code's low byte to R and high byte to G, so the readback bytes
-    // ARE the little-endian uint16 code — the CPU swizzle (a 1M-element/view JS
-    // loop, the pipeline's per-view wall at 1024²) is gone, and depth readback is
-    // halved (2 B/px vs 4). RG8 is a plain color-renderable format (no integer-RT
-    // fragility); the ?selftest validates the codes on this GPU/driver.
-    const rtDepth = new THREE.WebGLRenderTarget(resolution, resolution, {
-        ...targetOpts,
-        depthBuffer: false,
-        format: THREE.RGFormat,
-        type: THREE.UnsignedByteType,
-    });
-
-    const fullscreenVS = /* glsl */ `
-        varying vec2 vUv;
-        void main() {
-            vUv = uv;
-            gl_Position = vec4(position.xy, 0.0, 1.0);
-        }
-    `;
-
-    // Present: linear HDR → ACES-filmic (three.js' exact fit, so the splat looks
-    // like the mesh viewer) → sRGB, 8-bit. uLinear = true bypasses the curve
-    // (clamp only) for the self-test, whose checks are written against raw values.
-    const presentMaterial = new THREE.ShaderMaterial({
-        uniforms: {
-            tScene: { value: rtScene.texture },
-            uExposure: { value: exposure },
-            uLinear: { value: false },
-        },
-        vertexShader: fullscreenVS,
-        fragmentShader: /* glsl */ `
-            precision highp float;
-            uniform sampler2D tScene;
-            uniform float uExposure;
-            uniform bool uLinear;
-            varying vec2 vUv;
-            ${TONEMAP_GLSL}
-            void main() {
-                vec4 s = texture2D(tScene, vUv);
-                if (uLinear) {
-                    gl_FragColor = vec4(clamp(s.rgb, 0.0, 1.0), s.a);
-                    return;
-                }
-                vec3 c = linearToSrgb(acesFilmic(s.rgb * uExposure));
-                gl_FragColor = vec4(c, s.a);
-            }
-        `,
-        depthTest: false,
-        depthWrite: false,
-    });
-
-    const packMaterial = new THREE.ShaderMaterial({
-        uniforms: {
-            tDepth: { value: depthTexture },
-            uNear: { value: near },
-            uFar: { value: far },
-        },
-        vertexShader: fullscreenVS,
-        fragmentShader: /* glsl */ `
-            precision highp float;
-            uniform sampler2D tDepth;
-            uniform float uNear;
-            uniform float uFar;
-            varying vec2 vUv;
-            void main() {
-                float d = texture2D(tDepth, vUv).r;             // window-space [0,1]
-                if (d >= 1.0) {                                  // nothing wrote depth
-                    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);     // code 0 = background
-                    return;
-                }
-                float zndc = d * 2.0 - 1.0;
-                float z = 2.0 * uNear * uFar / (uFar + uNear - zndc * (uFar - uNear));
-                // splat/stage5.py encode_depth_u16: log-spaced code 1..65535.
-                float t = clamp(log(z / uNear) / log(uFar / uNear), 0.0, 1.0);
-                float code = floor(t * ${(DEPTH_CODE_MAX - 1).toFixed(1)} + 0.5) + 1.0;
-                float hi = floor(code / 256.0);
-                float lo = code - hi * 256.0;
-                // LOW byte -> R, HIGH byte -> G: on an RG8 target the readback bytes
-                // are [lo, hi] = the code as a little-endian uint16, so no swizzle.
-                gl_FragColor = vec4(lo / 255.0, hi / 255.0, 0.0, 1.0);
-            }
-        `,
-        depthTest: false,
-        depthWrite: false,
-    });
-
-    // A fullscreen triangle (no index, no camera transform — clip-space verts)
-    // per pass, both driven by one throwaway ortho-less camera.
-    function fullscreenScene(material) {
-        const geo = new THREE.BufferGeometry();
-        geo.setAttribute(
-            "position",
-            new THREE.BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3),
-        );
-        geo.setAttribute(
-            "uv",
-            new THREE.BufferAttribute(new Float32Array([0, 0, 2, 0, 0, 2]), 2),
-        );
-        const scene = new THREE.Scene();
-        const tri = new THREE.Mesh(geo, material);
-        tri.frustumCulled = false;
-        scene.add(tri);
-        return scene;
-    }
-    // OIT composite (glass scenes): resolve accumulate/revealage over the opaque
-    // image in LINEAR, then ACES + sRGB exactly like the present pass. Alpha
-    // carries the accumulated coverage 1 − Π(1−αᵢ) — 1 behind any opaque surface,
-    // the pane's own coverage over empty space — the mask gsplat trains against.
-    const compositeMaterial = new THREE.ShaderMaterial({
-        uniforms: {
-            uOpaque: { value: rtScene.texture },
-            uAccum: { value: null },
-            uReveal: { value: null },
-            uExposure: { value: exposure },
-        },
-        vertexShader: fullscreenVS,
-        fragmentShader: /* glsl */ `
-            precision highp float;
-            uniform sampler2D uOpaque;
-            uniform sampler2D uAccum;
-            uniform sampler2D uReveal;
-            uniform float uExposure;
-            varying vec2 vUv;
-            ${TONEMAP_GLSL}
-            void main() {
-                vec4 accum = texture2D(uAccum, vUv);
-                float reveal = texture2D(uReveal, vUv).r;
-                vec4 op = texture2D(uOpaque, vUv);
-                vec3 oit = accum.rgb / max(accum.a, 1e-5);
-                vec3 lin = mix(oit, op.rgb, reveal);
-                float coverage = 1.0 - reveal * (1.0 - op.a);
-                gl_FragColor = vec4(linearToSrgb(acesFilmic(lin * uExposure)), coverage);
-            }
-        `,
-        depthTest: false,
-        depthWrite: false,
-    });
-
-    const presentScene = fullscreenScene(presentMaterial);
-    const packScene = fullscreenScene(packMaterial);
-    const compositeScene = fullscreenScene(compositeMaterial);
-    const fsCamera = new THREE.Camera();
-
-    const camera = new THREE.PerspectiveCamera(fovDeg, 1, near, far);
-    const bg = new THREE.Color(background[0], background[1], background[2]);
-
-    // Accumulate + revealage targets, created on first glass use so opaque-only
-    // scenes never allocate them. Both SHARE rtScene's depth texture: the opaque
-    // pass and the α≥OIT_OPAQUE depth pre-pass fill it, and glass is depth-tested
-    // against it so a pane never occludes the room behind it (its depth stays the
-    // opaque surface's, matching the stage-5 depth contract).
-    let accumTarget = null;
-    let revealTarget = null;
-    function ensureOITTargets() {
-        if (accumTarget) return;
-        const opts = { ...targetOpts, type: THREE.HalfFloatType, depthBuffer: true, depthTexture };
-        accumTarget = new THREE.WebGLRenderTarget(resolution, resolution, opts);
-        revealTarget = new THREE.WebGLRenderTarget(resolution, resolution, opts);
-        compositeMaterial.uniforms.uAccum.value = accumTarget.texture;
-        compositeMaterial.uniforms.uReveal.value = revealTarget.texture;
-    }
-
-    // The scene's transparent materials, gathered once (the scene is static per
-    // capture). Empty → opaque scene → renderView takes the single-pass fast path
-    // (byte-identical to the pre-OIT pipeline).
-    let oitMats = null;
-
-    // Weighted-blended OIT for a glass scene, mirroring scene3d.js renderFrame:
-    // opaque (layer 0) → rtScene, then three glass-only sub-passes (layer 1) — depth
-    // pre-pass, accumulate, revealage — composited to rtColor. The shadow map stays
-    // static (renderer.shadowMap.autoUpdate is off), so it is built once.
-    function renderOIT(scene) {
-        ensureOITTargets();
-        // opaque → rtScene: linear colour + the depth glass tests against.
-        camera.layers.set(0);
-        renderer.autoClear = true;
-        renderer.setClearColor(bg, 0);
-        renderer.setRenderTarget(rtScene);
-        renderer.render(scene, camera);
-        // glass sub-passes (layer 1); keep the opaque colour/depth (no auto-clear).
-        renderer.autoClear = false;
-        camera.layers.set(OIT_LAYER);
-        oitPass.value = 2; // depth pre-pass: α≥OIT_OPAQUE writes depth, no colour
-        for (const m of oitMats) {
-            m.depthWrite = true;
-            m.colorWrite = false;
-        }
-        renderer.setRenderTarget(accumTarget);
-        renderer.render(scene, camera);
-        oitPass.value = 0; // accumulate (additive), depth-tested, no depth write
-        for (const m of oitMats) {
-            m.depthWrite = false;
-            m.colorWrite = true;
-            setOITBlend(m, true);
-        }
-        renderer.setRenderTarget(accumTarget);
-        renderer.setClearColor(0x000000, 0);
-        renderer.clear(true, false, false);
-        renderer.render(scene, camera);
-        oitPass.value = 1; // revealage: dst *= (1 − α)
-        for (const m of oitMats) setOITBlend(m, false);
-        renderer.setRenderTarget(revealTarget);
-        renderer.setClearColor(0xffffff, 1);
-        renderer.clear(true, false, false);
-        renderer.render(scene, camera);
-        // composite over opaque → rtColor (ACES + sRGB + coverage alpha).
-        camera.layers.set(0);
-        renderer.autoClear = true;
-        renderer.setRenderTarget(rtColor);
-        renderer.render(compositeScene, fsCamera);
-    }
-
-    const lookTarget = new THREE.Vector3();
-    function renderView(scene, pos, face) {
-        camera.position.set(pos[0], pos[1], pos[2]);
-        camera.up.set(face.up[0], face.up[1], face.up[2]);
-        lookTarget
-            .set(face.forward[0], face.forward[1], face.forward[2])
-            .add(camera.position);
-        camera.lookAt(lookTarget);
-        if (oitMats === null) oitMats = collectOITMaterials(scene);
-        if (oitMats.length === 0) {
-            // Opaque scene: one lit pass → present. Unchanged fast path.
-            renderer.setClearColor(bg, 0); // alpha 0 = empty coverage
-            renderer.setRenderTarget(rtScene);
-            renderer.render(scene, camera); // lit, linear HDR + depth
-            renderer.setRenderTarget(rtColor);
-            renderer.render(presentScene, fsCamera); // ACES + sRGB → 8-bit
-        } else {
-            renderOIT(scene);
-        }
-        renderer.setRenderTarget(rtDepth);
-        renderer.render(packScene, fsCamera); // depth → log-u16 codes
-    }
-
-    function setLinear(on) {
-        presentMaterial.uniforms.uLinear.value = !!on;
-    }
-
-    return { rtColor, rtDepth, renderView, camera, setLinear };
 }
 
 // PBO + fence async readback, SEGMENTED: each view's color + packed-depth RGBA
@@ -619,9 +309,9 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
-                gltf.scene.userData.objectId = id; // emissive.js / reflective.js name matching
-                matteNonReflective(gltf.scene, id); // keep curated reflective; matte the rest
-                prepareOITScene(gltf.scene, oitPass);
+                // id stamp (emissive.js / reflective.js match on it) + the matte
+                // discriminator + the OIT patch — see capturecore.js.
+                prepareCaptureObject(gltf.scene, id);
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -666,7 +356,7 @@ async function fail(err) {
 // --- capture job -----------------------------------------------------------------
 
 async function runCapture() {
-    const renderer = createRenderer();
+    const renderer = createCaptureRenderer({ onContextLost: fail });
     const glName = rendererName(renderer);
     status(`WebGL: ${glName}`);
     if (/swiftshader|software|llvmpipe/i.test(glName) && params.get("force") !== "1") {
@@ -699,40 +389,23 @@ async function runCapture() {
     // scene + light) via renderer.shadowMap.autoUpdate=false + one needsUpdate.
     const rawLighting = manifest.lighting || {};
     const lighting = normalizeLighting(rawLighting);
-    const sceneBox = new THREE.Box3().setFromObject(scene);
-    // Emissive meshes (lamps / screens / fire — emissive.js curated names): make
-    // them glow AND add a point light each so they illuminate the scene. Added
-    // before the shadow + reflection bakes so their (occluding) shadows bake once
-    // and their glow + illumination are baked into the cubes and the frames.
-    const emissive = applyEmissiveLighting(scene, scene);
-    if (emissive.count > 0) status(`emissive: ${emissive.count} light source(s)`);
-    // decorateOITLights puts the sun + hemi fill on all layers so the glass moved
-    // onto OIT_LAYER by prepareOITScene is still lit (not just IBL-lit).
-    const rig = createLightRig(renderer, scene, {
-        defaults: lighting,
-        decorateLights: decorateOITLights,
+    // Emissive fixtures → sun/hemi/IBL rig fitted to the scene → ONE shadow bake
+    // over both layers → the per-object scene reflection probes, in that order (see
+    // capturecore.js setupCaptureLighting; shared with the tour capture).
+    const { emissive, refl } = setupCaptureLighting(renderer, scene, {
+        lighting,
+        background: manifest.background,
     });
-    rig.refit(sceneBox);
-    // Bake the shadow map seeing ALL casters (opaque + OIT layers) before the loop:
-    // Trellis marks everything alphaMode=BLEND so every surface is on the OIT layer,
-    // and the per-view opaque pass (camera on layer 0) would otherwise bake an empty
-    // shadow map — no shadows in the refs. Frozen afterwards (autoUpdate off).
-    bakeShadowMap(renderer, scene);
+    if (emissive.count > 0) status(`emissive: ${emissive.count} light source(s)`);
     status(
         `lighting: env ${lighting.env} · sun ${lighting.key} @ ${lighting.azimuth}°/` +
             `${lighting.elevation}° · ${rawLighting.tone_mapping || "aces_filmic"} exposure ${lighting.exposure}`,
     );
-
-    // Real scene reflections, baked ONCE (scene + lighting are static): the curated
-    // reflective objects (reflective.js names) reflect the actual opaque scene via
-    // per-object PMREM cube probes instead of the generic RoomEnvironment IBL — the view-
-    // dependent signal Stage-6 degree-3 SH learns. The shadow map is rendered by
-    // the first bake pass (needsUpdate set above) and reused by every view.
-    const refl = bakeReflectionProbes(renderer, scene, { background: manifest.background, oitPass });
     if (refl.probes > 0) status(`reflections: ${refl.probes} scene probe(s) baked`);
 
     const capture = createCapture(
         renderer,
+        R,
         R,
         manifest.near,
         manifest.far,
@@ -978,13 +651,13 @@ function buildUvQuadScene() {
 // where the per-view time goes (GPU/render vs fence+readback vs swizzle) and
 // what the page-side ceiling actually is on this browser/GPU/driver.
 async function runBench(n, mode) {
-    const renderer = createRenderer();
+    const renderer = createCaptureRenderer({ onContextLost: fail });
     status(`WebGL: ${rendererName(renderer)}`);
     const R = Number(params.get("res")) || 512;
     const near = 0.05;
     const far = 10.0;
     const scene = buildUvQuadScene();
-    const capture = createCapture(renderer, R, near, far, 90.0, [0, 0, 0]);
+    const capture = createCapture(renderer, R, R, near, far, 90.0, [0, 0, 0]);
     const view = { pos: [0, 0, 0], face: { forward: [0, 0, 1], up: [0, 1, 0] } };
     const buckets = { render: 0, collect: 0, spin: 0 };
     status(`bench: ${n} views at ${R}² (${mode} readback)…`);
@@ -1091,14 +764,14 @@ function colorPipelineCheck(renderer, capture, R) {
 }
 
 async function runSelftest() {
-    const renderer = createRenderer();
+    const renderer = createCaptureRenderer({ onContextLost: fail });
     status(`WebGL: ${rendererName(renderer)}`);
     const R = 512;
     const near = 0.05;
     const far = 10.0;
     const scene = buildUvQuadScene();
 
-    const capture = createCapture(renderer, R, near, far, 90.0, [0, 0, 0]);
+    const capture = createCapture(renderer, R, R, near, far, 90.0, [0, 0, 0]);
     // The convention checks below are written against RAW values, so probe the UV
     // quad through the present pass in linear (curve-off) mode; the ACES+sRGB
     // colour transform is validated separately (colorPipelineCheck).

@@ -244,6 +244,10 @@ const server = createServer(async (req, res) => {
     if (path === "/playground" || path === "/playground/" || path === "/playground/index.html") {
         return serveIndex(res, join("playground", "index.html"));
     }
+    // The matterport tours index: every planned/captured walkthrough + publish.
+    if (path === "/tours" || path === "/tours/" || path === "/tours.html") {
+        return serveIndex(res, "tours.html");
+    }
     // Splat asset catalogue for the playground picker.
     if (path === "/api/assets") return sendJson(res, { assets: listAssets() });
 

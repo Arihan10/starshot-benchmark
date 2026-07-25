@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <meta name="server-url" content="http://127.0.0.1:8765" />
+        <title>starshot · tours</title>
+        <style>
+            :root {
+                --bg: #0c0d10;
+                --panel: #16181d;
+                --panel-2: #1c1e24;
+                --line: #2a2d35;
+                --text: #e6e6e6;
+                --text-dim: #b8bcc4;
+                --text-faint: #7a808c;
+                --accent: #9ad4ff;
+                --accent-line: #4a8fd8;
+                --green: #8bd17c;
+                --amber: #e0c271;
+                --red: #ff8080;
+                --purple: #c9a6ff;
+            }
+            * { box-sizing: border-box; }
+            html, body { height: 100%; margin: 0; }
+            body {
+                background: var(--bg);
+                color: var(--text);
+                font: 12px/1.45 "SF Mono", ui-monospace, Menlo, monospace;
+            }
+            header {
+                display: flex; align-items: flex-end; justify-content: space-between;
+                gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--line);
+                background: var(--panel);
+            }
+            .brand h1 { margin: 0; font-size: 13px; letter-spacing: 0.04em; }
+            .brand p { margin: 2px 0 0; font-size: 10px; color: var(--text-faint); }
+            .actions { display: flex; align-items: center; gap: 10px; }
+            .actions a { color: var(--accent); text-decoration: none; font-size: 10px; }
+            .actions a:hover { text-decoration: underline; }
+            button {
+                font: inherit; color: var(--text-dim); background: var(--panel-2);
+                border: 1px solid var(--line); border-radius: 4px; padding: 5px 9px; cursor: pointer;
+            }
+            button:hover:not(:disabled) { border-color: var(--accent-line); color: #cfe3fb; }
+            button.primary { background: #21344e; border-color: var(--accent-line); color: #cfe3fb; }
+            button:disabled { opacity: 0.45; cursor: default; }
+            .pill {
+                border: 1px solid var(--line); border-radius: 999px; padding: 2px 9px;
+                font-size: 10px; color: var(--text-dim);
+            }
+            .pill.local { border-color: #3c6b3a; color: var(--green); }
+            .pill.r2 { border-color: #6b5a2a; color: var(--amber); }
+
+            main { padding: 16px 18px 40px; }
+            .msg { color: var(--text-faint); padding: 10px 2px; }
+            .msg.err { color: var(--red); }
+            table { width: 100%; border-collapse: collapse; }
+            th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+            th {
+                font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+                color: var(--text-faint); font-weight: 500;
+            }
+            td { vertical-align: middle; }
+            td.num { font-variant-numeric: tabular-nums; color: var(--text-dim); }
+            tr:hover td { background: rgba(255, 255, 255, 0.02); }
+            .cell-run { color: var(--text); }
+            .cell-sub { color: var(--text-faint); font-size: 10px; }
+            .tag {
+                display: inline-block; border-radius: 3px; padding: 1px 6px;
+                font-size: 10px; border: 1px solid var(--line); color: var(--text-dim);
+            }
+            .tag.captured { border-color: #3c5a6b; color: var(--accent); }
+            .tag.planned { border-color: #5a4a6b; color: var(--purple); }
+            .tag.yes { border-color: #3c6b3a; color: var(--green); }
+            .tag.no { color: var(--text-faint); }
+            .row-actions { display: flex; align-items: center; gap: 8px; justify-content: flex-end; }
+            .row-note { font-size: 10px; color: var(--text-faint); }
+            .row-note.err { color: var(--red); }
+            .row-note.ok { color: var(--green); }
+        </style>
+    </head>
+    <body>
+        <header>
+            <div class="brand">
+                <h1>tours</h1>
+                <p>every cell with a planned or captured matterport walkthrough</p>
+            </div>
+            <div class="actions">
+                <span id="target" class="pill">…</span>
+                <button id="refresh">refresh</button>
+                <a href="/">← pipeline dashboard</a>
+            </div>
+        </header>
+
+        <main>
+            <div id="msg" class="msg">loading…</div>
+            <table id="tbl" hidden>
+                <thead>
+                    <tr>
+                        <th>cell</th>
+                        <th>state</th>
+                        <th>panos</th>
+                        <th>maps</th>
+                        <th>proxy</th>
+                        <th>published</th>
+                        <th>updated</th>
+                        <th></th>
+                    </tr>
+                </thead>
+                <tbody id="rows"></tbody>
+            </table>
+        </main>
+
+        <div id="modal-root"></div>
+        <div id="toast-root"></div>
+        <script type="module" src="/js/tours.js"></script>
+    </body>
+</html>

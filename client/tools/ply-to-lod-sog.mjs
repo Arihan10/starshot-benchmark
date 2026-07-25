@@ -45,6 +45,8 @@ function parseArgs(argv) {
         shIterations: null,
         chunkCount: 256, // -C, K gaussians per chunk (< default 512 → better spatial coverage)
         chunkExtent: 16, // -X, chunk size in world units
+        harmonics: null, // strip SH bands > n (0 = flat colour). null keeps all bands
+        nodeHeap: null, // --max-old-space-size for the splat-transform child (huge scenes)
         discover: true, // prefer a sibling <stem>.lodK.ply ladder when present
         flatScale: 1e-4,
         keepTemp: false,
@@ -57,6 +59,8 @@ function parseArgs(argv) {
         else if (a === "--sh-iterations") opt.shIterations = parseInt(argv[++i], 10);
         else if (a === "--chunk-count") opt.chunkCount = parseInt(argv[++i], 10);
         else if (a === "--chunk-extent") opt.chunkExtent = parseFloat(argv[++i]);
+        else if (a === "--filter-harmonics") opt.harmonics = parseInt(argv[++i], 10);
+        else if (a === "--node-heap") opt.nodeHeap = parseInt(argv[++i], 10);
         else if (a === "--no-discover") opt.discover = false;
         else if (a === "--flat-scale") opt.flatScale = parseFloat(argv[++i]);
         else if (a === "--keep-temp") opt.keepTemp = true;
@@ -65,9 +69,13 @@ function parseArgs(argv) {
     return { pos, opt };
 }
 
+// Node flags prefixed to every splat-transform child (e.g. a bigger heap for
+// many-million-gaussian scenes). Set once from opt in main().
+let NODE_ARGS = [];
+
 function runCli(args) {
     return new Promise((resolve) => {
-        const child = spawn(process.execPath, [CLI, ...args], { stdio: "inherit" });
+        const child = spawn(process.execPath, [...NODE_ARGS, CLI, ...args], { stdio: "inherit" });
         child.on("close", (code) => resolve(code ?? 1));
     });
 }
@@ -131,10 +139,11 @@ async function buildLevels(inPath, lod0, tmpDir, opt, temps) {
         const out = path.join(tmpDir, `lodsog-gen${k}-${process.pid}.ply`);
         // Decimate is CPU/merge-based (no GPU) and must be the FINAL action with a
         // .ply output — one invocation per level, always from LOD0 (the full model).
-        await runOrThrow(
-            [lod0.file, "--decimate", String(count), out, "-w"],
-            `decimate lod${k} (${count})`,
-        );
+        // Strip SH first (when requested) so the temps — and the merge — stay light.
+        const dec = [lod0.file];
+        if (opt.harmonics != null) dec.push("--filter-harmonics", String(opt.harmonics));
+        dec.push("--decimate", String(count), out, "-w");
+        await runOrThrow(dec, `decimate lod${k} (${count})`);
         temps.push(out);
         levels.push(out);
     }
@@ -147,7 +156,8 @@ async function main() {
         console.error(
             "Usage: node tools/ply-to-lod-sog.mjs <in.ply> <outdir | outdir/lod-meta.json> " +
                 "[--gpu <n|cpu>] [--levels N] [--ratio R] [--sh-iterations N] " +
-                "[--chunk-count K] [--chunk-extent M] [--no-discover] [--flat-scale F] [--keep-temp]",
+                "[--chunk-count K] [--chunk-extent M] [--filter-harmonics 0|1|2|3] " +
+                "[--node-heap MB] [--no-discover] [--flat-scale F] [--keep-temp]",
         );
         process.exit(1);
     }
@@ -155,6 +165,7 @@ async function main() {
         console.error(`splat-transform not installed at ${CLI} — run \`npm install\` in client/`);
         process.exit(1);
     }
+    if (opt.nodeHeap) NODE_ARGS = [`--max-old-space-size=${opt.nodeHeap}`];
     const [inPath, outArg] = pos;
     const { dir: outDir, manifest } = resolveOut(outArg);
     fs.mkdirSync(outDir, { recursive: true });
@@ -184,6 +195,8 @@ async function main() {
         args.push(lod0.file, "-l", "0");
         levels.forEach((f, i) => args.push(f, "-l", String(i + 1)));
         args.push(manifest, "--filter-nan");
+        // Strip SH on the full-detail LOD0 too, so every level matches the temps.
+        if (opt.harmonics != null) args.push("--filter-harmonics", String(opt.harmonics));
         if (opt.gpu) args.push("-g", opt.gpu);
         if (opt.shIterations) args.push("-i", String(opt.shIterations));
         await runOrThrow(args, "bundle lod-meta.json");
@@ -206,6 +219,7 @@ async function main() {
                 representation_in: parsePlyHeader(fs.readFileSync(inPath)).props.includes("scale_2")
                     ? "3dgs"
                     : "2dgs",
+                harmonics: opt.harmonics,
                 lod_levels: meta.lodLevels ?? null,
                 counts: meta.counts ?? null,
                 files: Array.isArray(meta.filenames) ? meta.filenames.length : null,

@@ -55,6 +55,8 @@ export type TourManifest = {
 	connectors?: Connector[];
 };
 
+import type { EdgeType } from "./navGraph";
+
 export type OrbitMode =
 	| "empty"
 	| "loading"
@@ -62,6 +64,44 @@ export type OrbitMode =
 	| "interior"
 	| "peek"
 	| "transition";
+
+// One exit affordance of the node you're standing on, surfaced to the "exits"
+// panel + screen reader. `bearingDeg` is the world azimuth to it; the panel
+// rotates an arrow by (bearingDeg − live facing) so it always points true.
+export type NavExit = {
+	index: number;
+	type: EdgeType;
+	name: string | null;
+	dist: number;
+	bearingDeg: number;
+};
+
+// Everything the hover preview card needs: the destination thumbnail pre-rotated
+// to its arrival heading (headingU is the equirect u fraction to center), its
+// name/distance, the edge verb, and where to float (screen px).
+export type HoverPreview = {
+	index: number;
+	id: string;
+	name: string | null;
+	type: EdgeType;
+	dist: number;
+	screenX: number;
+	screenY: number;
+	thumbUrl: string;
+	headingU: number;
+};
+
+// The node directory (stable per scene) that powers chapters + "take me to".
+export type NodeDir = {
+	index: number;
+	name: string | null;
+	zone: string | null;
+	level: number;
+};
+export type Chapter = { zone: string; count: number; firstIndex: number };
+// Undirected edge for the minimap/dollhouse overlay — dashed when it's a phase
+// link so the map never lies.
+export type MapEdge = { a: number; b: number; type: EdgeType };
 
 // The right-click per-object menu, positioned in viewport coords. `label` is
 // null when opened over empty space (only the recovery actions show then).
@@ -91,6 +131,26 @@ export type OrbitState = {
 	contextMenu: ObjectMenu | null;
 	busy: boolean;
 	overlay: { msg: string; spinner: boolean; err: boolean } | null;
+	// --- typed navigation (interior) ---
+	// The current node's in-view exits (the "exits" panel + a11y list).
+	exits: NavExit[];
+	// Rich destination preview for the affordance the cursor is over.
+	preview: HoverPreview | null;
+	// Arrival narration ("Archive · phased through the wall"); a rising `ts` lets
+	// the toast re-fire for repeat arrivals at the same node.
+	arrival: { name: string; verb: string; ts: number } | null;
+	sonarActive: boolean;
+	// Auto tour progress — which zone's centrepoint is being shown, out of how
+	// many. Null whenever the tour isn't running.
+	tour: { stop: number; stops: number; zone: string } | null;
+	canGoBack: boolean;
+	trapped: boolean; // the current node is a sealed room (only phase exits)
+	currentZone: string | null;
+	visited: number[]; // pano indices the user has stood on (minimap fill)
+	// Stable-per-scene directory + groupings for search / chapters / map lines.
+	nodes: NodeDir[];
+	chapters: Chapter[];
+	mapEdges: MapEdge[];
 	// The bird's-eye minimap (interior / peek only). Every captured floor level is
 	// surfaced so the chrome can page between floors without moving the camera;
 	// `currentLevel` is the level the character is actually on. Per level, `points`
@@ -129,5 +189,17 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	contextMenu: null,
 	busy: false,
 	overlay: null,
+	exits: [],
+	preview: null,
+	arrival: null,
+	sonarActive: false,
+	tour: null,
+	canGoBack: false,
+	trapped: false,
+	currentZone: null,
+	visited: [],
+	nodes: [],
+	chapters: [],
+	mapEdges: [],
 	minimap: null,
 };
