@@ -1221,6 +1221,12 @@
 				left: 10px;
 				bottom: 10px;
 				display: flex;
+				/* Wraps (like .cmp-toggles) instead of running off the canvas: with
+				   the obs dock open the host is often ~650px while this row wants
+				   ~1300px, which silently pushed the generated-build controls —
+				   progress label and failure badge included — past the edge. */
+				flex-wrap: wrap;
+				max-width: calc(100% - 20px);
 				gap: 6px;
 				z-index: 5;
 				transition: left 0.2s ease;
@@ -1312,6 +1318,7 @@
 			#canvas-host:has(#trace-panel.open) #zone-layers-legend {
 				left: calc(var(--trace-w) + 16px);
 			}
+			#canvas-host:has(#trace-panel.open) #viewer-toggles,
 			#canvas-host:has(#trace-panel.open) #zone-layers-legend {
 				max-width: calc(100% - var(--trace-w) - 36px);
 			}
@@ -3999,6 +4006,178 @@
 				color: var(--text-faint);
 				align-self: center;
 			}
+			/* Generated-build failure report (genfails.js): the ⚠ button in the
+			   viewer toggle row plus the panel it opens. Reuses the .vt-menu shell,
+			   so it grows upward out of the bottom-left row like the objects
+			   dropdown; everything below is the panel's own content. Shown only
+			   when the build actually left something out. */
+			.gf-btn {
+				border-color: #7a3f3f;
+				color: var(--red);
+			}
+			.gf-btn:hover:not(:disabled),
+			.gf-btn.on {
+				background: #2c1d1d;
+				border-color: #af4f4f;
+			}
+			/* Anchored to the canvas like #lighting-panel — and shifted clear of the
+			   trace panel by the same rule — rather than to its button: the toggle
+			   row is a wide flex row whose right-hand buttons can sit past the
+			   viewport edge, and a button-anchored popover goes off-screen with
+			   them. Wide enough to read a backend error without truncating it. */
+			#genfail-panel {
+				position: absolute;
+				left: 10px;
+				bottom: calc(var(--toggles-h, 30px) + 16px);
+				width: 560px;
+				max-width: calc(100% - 20px);
+				max-height: min(56vh, 520px);
+				display: none;
+				flex-direction: column;
+				background: var(--panel);
+				border: 1px solid var(--line);
+				border-radius: 8px;
+				box-shadow: 0 8px 22px rgba(0, 0, 0, 0.5);
+				overflow: hidden;
+				z-index: 8;
+				transition: left 0.2s ease;
+			}
+			#genfail-panel.open {
+				display: flex;
+			}
+			#canvas-host:has(#trace-panel.open) #genfail-panel {
+				left: calc(var(--trace-w) + 16px);
+				max-width: calc(100% - var(--trace-w) - 36px);
+			}
+			.gf-head {
+				display: flex;
+				align-items: center;
+				gap: 8px;
+				padding: 7px 10px;
+				border-bottom: 1px solid var(--line);
+			}
+			.gf-title {
+				color: var(--text-dim);
+				text-transform: uppercase;
+				letter-spacing: 0.05em;
+				font-size: 10px;
+			}
+			.gf-act {
+				font-size: 10px;
+				color: var(--text-faint);
+				cursor: pointer;
+			}
+			.gf-act:hover {
+				color: var(--accent);
+			}
+			.gf-copy {
+				margin-left: auto;
+			}
+			.gf-x {
+				font-size: 13px;
+				line-height: 1;
+			}
+			.gf-note {
+				padding: 5px 10px;
+				font-size: 10px;
+				color: var(--amber);
+				background: rgba(224, 194, 113, 0.07);
+				border-bottom: 1px solid var(--line-2);
+			}
+			.gf-body {
+				overflow-y: auto;
+				min-height: 0;
+				padding: 0 8px 8px;
+			}
+			.gf-section {
+				margin-top: 6px;
+			}
+			.gf-sec-head {
+				display: flex;
+				justify-content: space-between;
+				color: var(--text-faint);
+				font-size: 10px;
+				text-transform: uppercase;
+				letter-spacing: 0.04em;
+				padding: 2px 0;
+				border-bottom: 1px solid var(--line);
+			}
+			.gf-row {
+				display: flex;
+				align-items: baseline;
+				gap: 7px;
+				padding: 3px 4px;
+				border-radius: 3px;
+				font-size: 11px;
+				color: var(--text-dim);
+				cursor: pointer;
+			}
+			.gf-row:hover {
+				background: #1d2027;
+			}
+			/* Indented under the row above: this object lost its mesh because the
+			   prefab canonical it shares one with failed. */
+			.gf-child {
+				padding-left: 18px;
+			}
+			.gf-child .gf-id {
+				color: var(--text-faint);
+			}
+			.gf-dot {
+				width: 6px;
+				height: 6px;
+				border-radius: 50%;
+				flex-shrink: 0;
+				align-self: center;
+				background: var(--text-faint);
+			}
+			.gf-err .gf-dot {
+				background: var(--red);
+			}
+			.gf-warn .gf-dot {
+				background: var(--amber);
+			}
+			.gf-id {
+				flex-shrink: 0;
+				max-width: 190px;
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				color: var(--text);
+			}
+			.gf-kind,
+			.gf-stale {
+				flex-shrink: 0;
+				font-size: 9px;
+				padding: 0 5px;
+				border: 1px solid var(--line);
+				border-radius: 3px;
+				color: var(--text-faint);
+				white-space: nowrap;
+			}
+			.gf-err .gf-kind {
+				color: var(--red);
+				border-color: #7a3f3f;
+			}
+			.gf-warn .gf-kind {
+				color: var(--amber);
+				border-color: #5a4d2a;
+			}
+			.gf-stale {
+				color: var(--orange);
+				border-color: #6b4526;
+			}
+			.gf-msg {
+				overflow: hidden;
+				text-overflow: ellipsis;
+				white-space: nowrap;
+				color: var(--text-faint);
+			}
+			.gf-more {
+				padding: 5px 2px 2px;
+				font-size: 10px;
+				color: var(--text-faint);
+			}
 			.tp-actions {
 				display: flex;
 				flex-direction: column;
@@ -4357,7 +4536,9 @@
 			#lighting-panel {
 				position: absolute;
 				left: 10px;
-				bottom: 46px;
+				/* Clears the toggle row, whose height changes as it wraps
+				   (overlay.js publishes it as --toggles-h). */
+				bottom: calc(var(--toggles-h, 30px) + 16px);
 				width: 230px;
 				display: none;
 				flex-direction: column;

@@ -33,7 +33,7 @@ from pathlib import Path
 from typing import Any
 
 from app.pipeline import generation
-from app.services import prefabs
+from app.services import prefabs, symmetry
 from app.utils.logging import SlotLog
 
 # Keys whose value is a list of object/subregion spec dicts across the committed
@@ -222,7 +222,7 @@ def _latest_symmetry(events: list[dict[str, Any]], node_id: str) -> dict[str, An
         if e.get("kind") != "symmetry.applied" or e.get("id") != node_id:
             continue
         cut_plane = e.get("cut_plane")
-        if cut_plane in ("xy", "xz"):
+        if cut_plane in symmetry.MIRROR_PLANES:
             state = {"cut_plane": cut_plane}
             if isinstance(e.get("keep_positive"), bool):
                 state["keep_positive"] = e["keep_positive"]

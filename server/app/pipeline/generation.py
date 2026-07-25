@@ -1145,19 +1145,10 @@ async def _rescale_reuse_from_raw(
         return
     try:
         rescaled = raw_dir / f"{node.id}.glb"
-        cut_plane: Literal["none", "xy", "xz"] = "none"
-        keep_positive: bool | None = None
-        applied = logging.find_event("symmetry.applied", id=source_id)
-        if applied is not None:
-            raw_cp = applied.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
-                cut_plane = raw_cp  # type: ignore[assignment]
-            # Carry the canonical's kept-half so a non-default direction (set via
-            # the symmetrize control) mirrors the reuse identically. Absent on
-            # older logs -> None -> the plane's default half.
-            raw_keep = applied.get("keep_positive")
-            if isinstance(raw_keep, bool):
-                keep_positive = raw_keep
+        # Replay the CANONICAL's mirror — plane AND kept half — so the reuse lands
+        # identically posed, including a non-default direction set via the
+        # symmetrize control.
+        cut_plane, keep_positive = symmetry.applied_state(source_id)
         async with _MESH_IO:
             scene = await asyncio.to_thread(trimesh.load, src_raw)
             scene = await symmetry.apply_symmetrize(
@@ -1177,7 +1168,13 @@ async def _rescale_reuse_from_raw(
         src_png = raw_dir / f"{source_id}.png"
         if src_png.exists():
             await asyncio.to_thread(shutil.copyfile, src_png, raw_dir / f"{node.id}.png")
-        await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb")
+        if await _optimize_asset(rescaled, opt_dir / f"{node.id}.glb"):
+            # Every other build path leaves a success marker in the log (a
+            # `<scope>.done`, a `model` event); a reuse landed silently, so one
+            # that failed once still read as failed after a later rebuild fixed
+            # it. Gated on the optimize, which logs its own `generate.optimize_error`
+            # first when it fails — so that failure stays the node's latest word.
+            logging.log("prefab.reuse_derived", id=node.id, source=source_id)
     except Exception as e:  # noqa: BLE001
         logging.log("mesh.error", id=node.id, message=f"{type(e).__name__}: {e}")
 
@@ -1723,7 +1720,7 @@ async def unsymmetrize_one(
 async def symmetrize_one(
     *,
     node: Node,
-    cut_plane: Literal["xy", "xz"],
+    cut_plane: Literal["xy", "xz", "yz"],
     keep_positive: bool,
     runs_dir: Path,
     run_id: str,
@@ -1805,18 +1802,8 @@ async def reorient_one(
             logging.log("mesh.reorient_skip", id=node.id, reason="no raw mesh on disk")
             return
         # Re-apply the object's CURRENT symmetry when re-deriving, so re-fronting
-        # composes with an existing mirror (read from the canonical's log, like
-        # `_rescale_reuse_from_raw`) instead of silently dropping it.
-        cut_plane: Literal["none", "xy", "xz"] = "none"
-        keep_positive: bool | None = None
-        applied = logging.find_event("symmetry.applied", id=node.id)
-        if applied is not None:
-            raw_cp = applied.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
-                cut_plane = raw_cp  # type: ignore[assignment]
-            raw_keep = applied.get("keep_positive")
-            if isinstance(raw_keep, bool):
-                keep_positive = raw_keep
+        # composes with an existing mirror instead of silently dropping it.
+        cut_plane, keep_positive = symmetry.applied_state(node.id)
         try:
             async with _MESH_IO:
                 raw_scene = await asyncio.to_thread(trimesh.load, src_raw)
@@ -1954,19 +1941,9 @@ async def reset_from_raw_one(
         if not src_raw.exists():
             logging.log("mesh.reset_skip", id=node.id, reason="no raw mesh on disk")
             return
-        # Re-apply the object's CURRENT symmetry when re-deriving (read from the
-        # log, like reorient/_rescale_reuse_from_raw), so reset keeps the mirror
-        # instead of silently dropping it.
-        cut_plane: Literal["none", "xy", "xz"] = "none"
-        keep_positive: bool | None = None
-        applied = logging.find_event("symmetry.applied", id=node.id)
-        if applied is not None:
-            raw_cp = applied.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
-                cut_plane = raw_cp  # type: ignore[assignment]
-            raw_keep = applied.get("keep_positive")
-            if isinstance(raw_keep, bool):
-                keep_positive = raw_keep
+        # Re-apply the object's CURRENT symmetry when re-deriving, so reset keeps
+        # the mirror instead of silently dropping it.
+        cut_plane, keep_positive = symmetry.applied_state(node.id)
         try:
             async with _MESH_IO:
                 scene = await asyncio.to_thread(trimesh.load, src_raw)

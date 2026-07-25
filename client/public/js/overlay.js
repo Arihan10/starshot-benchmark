@@ -23,6 +23,7 @@ import { statusView } from "./status.js";
 import { createObsDock } from "./obstree.js";
 import { createTracePanel } from "./tracepanel.js";
 import { createInvestigator } from "./investigator.js";
+import { initGenFailPanel } from "./genfails.js";
 
 const overlayEl = document.getElementById("overlay");
 const titleEl = document.getElementById("overlay-title");
@@ -65,6 +66,7 @@ let optBtn = null;
 let genStatusEl = null;
 let verSel = null; // generated-version <select>
 let newVerBtn = null; // "＋ new version" button
+let genFails = null; // per-object report of what this build didn't return
 
 // Cache-bust a generated mesh URL by its mtime token, so a regenerated asset
 // (same id + path, new bytes) reloads instead of serving a stale cached GLB.
@@ -289,6 +291,16 @@ export function initOverlay(sceneViewer) {
 	// at the head of the row. The remaining layers stay plain on/off buttons.
 	const togglesRow = document.getElementById("viewer-toggles");
 	togglesRow.prepend(buildObjectsMenu(viewer));
+	// The row wraps when the canvas is narrow, so the panels floating directly
+	// above it (lighting, the generated-failure report) can't use a fixed offset.
+	// Publish its live height for them to sit on.
+	if ("ResizeObserver" in window) {
+		const host = document.getElementById("canvas-host");
+		const publishHeight = () =>
+			host.style.setProperty("--toggles-h", `${togglesRow.offsetHeight}px`);
+		new ResizeObserver(publishHeight).observe(togglesRow);
+		publishHeight();
+	}
 	for (const btn of document.querySelectorAll(
 		"#viewer-toggles [data-toggle]",
 	)) {
@@ -428,7 +440,10 @@ function setupAssetControls() {
 		onclick: onNewVersion,
 	});
 	genStatusEl = el("span", { id: "gen-status", class: "gen-status" });
-	refit.after(assetBtn, genBtn, verSel, newVerBtn, optBtn, genStatusEl);
+	// Clicking a failed object frames it in 3D, so "which one is chair_4?" is one
+	// click rather than a hunt — the box is there even when the mesh never landed.
+	genFails = initGenFailPanel({ onSelect: focusNode });
+	refit.after(assetBtn, genBtn, verSel, newVerBtn, optBtn, genFails.button, genStatusEl);
 	syncAssetControls();
 }
 
@@ -444,6 +459,7 @@ function syncAssetControls() {
 	newVerBtn.style.display = gen ? "" : "none";
 	optBtn.style.display = gen ? "" : "none";
 	genStatusEl.style.display = gen ? "" : "none";
+	genFails.setVisible(gen);
 	assetBtn.classList.toggle("on", assetMode === "generated");
 	assetBtn.textContent =
 		assetMode === "generated" ? "generated ✓" : "generated";
@@ -520,6 +536,7 @@ function clearGeneratedState() {
 	genVersion = null;
 	genVersions = [];
 	if (genStatusEl) genStatusEl.textContent = "";
+	genFails?.clear();
 }
 
 // Library meshes load as one bundle (small, complete) onto the current scene.
@@ -565,6 +582,7 @@ async function onNewVersion() {
 		busyNodes = new Set();
 		objOptMode = new Map();
 		genMeshSig = null;
+		genFails.clear();
 		viewer.clearMeshes();
 		tracePanel.clearProjection();
 		tracePanel.rerenderInfo();
@@ -589,6 +607,7 @@ function onVersionChange(v) {
 	busyNodes = new Set();
 	objOptMode = new Map();
 	genMeshSig = null;
+	genFails.clear();
 	viewer.clearMeshes();
 	tracePanel.clearProjection();
 	tracePanel.rerenderInfo();
@@ -730,6 +749,10 @@ async function pollGenerated() {
 	genStatusEl.title = ghosts
 		? `${ghosts} object${ghosts === 1 ? "" : "s"} render from a stale optimized mesh but are missing their raw/unoptimized files (an unfinished regenerate). Regenerate each to rebuild it.`
 		: "";
+	// Which objects came back with nothing, and why. Folded server-side from the
+	// version's own events.generated.jsonl — no SSE stream carries that log, so
+	// this poll is the only route any of it has to the screen.
+	genFails.render(status.failures, { running: !!status.running });
 	if (status.running) genPollTimer = setTimeout(pollGenerated, 1500);
 }
 

@@ -339,7 +339,7 @@ export function createTracePanel(
 			if (nounChk.checked) reuse.checked = false;
 		});
 		const sym = actions.symmetryOf?.(id);
-		const mirrored = !!sym && (sym.plane === "xy" || sym.plane === "xz");
+		const mirrored = !!sym && !!sym.plane && sym.plane !== "none";
 
 		let symRow;
 		if (mirrored) {
@@ -362,12 +362,16 @@ export function createTracePanel(
 				{ class: "tp-act-sel", title: "mirror plane", disabled: busy },
 				el("option", { value: "xy", text: "xy · front/back" }),
 				el("option", { value: "xz", text: "xz · top/bottom" }),
+				el("option", { value: "yz", text: "yz · left/right" }),
 			);
 			const keepSel = el("select", {
 				class: "tp-act-sel",
 				title: "which half to keep, then mirror onto the other",
 				disabled: busy,
 			});
+			// keepPositive=true is the +axis half of the raw mesh frame, where front
+			// is +Z, up is +Y and right is +X — so every label here is from the
+			// viewer's side looking at the object's front.
 			const KEEP = {
 				xy: [
 					["true", "keep front"],
@@ -376,6 +380,10 @@ export function createTracePanel(
 				xz: [
 					["true", "keep top"],
 					["false", "keep bottom"],
+				],
+				yz: [
+					["true", "keep right"],
+					["false", "keep left"],
 				],
 			};
 			const syncKeep = () =>

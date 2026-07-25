@@ -883,8 +883,9 @@ _gen_symmetry_cache: dict[
 def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
     """Map node id -> {'plane': current symmetry plane, 'was': prior mirror plane}.
 
-    'plane' is 'xy'/'xz' when the served mesh is mirrored across that plane, else
-    'none'. 'was' separates the two un-mirrored cases the client must tell apart:
+    'plane' is the plane the served mesh is mirrored across (see
+    `symmetry.CUT_PLANES`), else 'none'. 'was' separates the two un-mirrored
+    cases the client must tell apart:
     a node un-symmetrized after being mirrored ('plane'='none', 'was'= its old
     plane) vs one that was never symmetrized ('plane'='none', 'was'=None).
 
@@ -918,7 +919,7 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
     def _set_plane(nid: str, cut_plane: str, idx: int) -> None:
         entry = applied.setdefault(nid, {"plane": "none", "was": None})
         entry["plane"] = cut_plane
-        if cut_plane in ("xy", "xz"):
+        if cut_plane in sym_svc.MIRROR_PLANES:
             entry["was"] = cut_plane
         applied_idx[nid] = idx
 
@@ -937,7 +938,7 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
                 continue
             if kind == "symmetry.applied":
                 cut_plane = event.get("cut_plane")
-                if cut_plane in ("none", "xy", "xz"):
+                if cut_plane in sym_svc.CUT_PLANES:
                     _set_plane(node_id, cut_plane, idx)
             elif kind == "symmetry.decision" and "applied" in event:
                 # Legacy combined event: older builds recorded the plane AND whether
@@ -948,7 +949,9 @@ def _generated_symmetry(events_path: Path) -> dict[str, dict[str, str | None]]:
                 cut_plane = event.get("cut_plane")
                 _set_plane(
                     node_id,
-                    cut_plane if (event.get("applied") and cut_plane in ("xy", "xz")) else "none",
+                    cut_plane
+                    if (event.get("applied") and cut_plane in sym_svc.MIRROR_PLANES)
+                    else "none",
                     idx,
                 )
             elif kind == "prefab.match":
@@ -1050,6 +1053,234 @@ def _generated_image_prompts(events_path: Path) -> dict[str, str]:
                 prompts[node_id] = prompt
     _gen_image_prompt_cache[events_path] = (sig, prompts)
     return prompts
+
+
+# Backend scopes whose `<scope>.submit` / `.done` / `.abandoned` events the failure
+# fold tracks. Explicit, so an unrelated `<something>.submit` (Nano-Banana's, say)
+# can never be mistaken for a mesh job that owes us a result.
+_MESH_SCOPES = frozenset({"trellis", "hunyuan", "hunyuan_tencent"})
+
+# Events that mean "this node now has a good served mesh", clearing any earlier
+# failure. Needed because a regenerate is non-destructive and appends: without
+# them, an object that failed once would read as failed forever.
+_GEN_RECOVERY_KINDS = frozenset({
+    "model",
+    "prefab.reuse_derived",
+    "symmetry.symmetrized",
+    "symmetry.unsymmetrized",
+    "mesh.reorient",
+    "mesh.reset",
+})
+
+_gen_failure_cache: dict[Path, tuple[tuple[int, int], dict[str, dict[str, object]]]] = {}
+
+
+def _generated_failures(events_path: Path) -> dict[str, dict[str, object]]:
+    """Map node id -> why its last build attempt did not deliver a mesh, folded
+    from one generated version's log. Nodes whose latest word is a success are
+    absent, so this is the CURRENT failure set rather than a history.
+
+    Every way a generated object can come up empty is folded here, because each
+    used to be silent in its own way:
+
+      * `mesh.error`             — the build raised (backend failure, a bad GLB,
+                                   Nano-Banana, disk full).
+      * `prefab.reuse_missing`   — the object shares a mesh with a canonical that
+                                   never produced one, so it is collateral damage
+                                   from a different object's failure.
+      * `generate.optimize_error`— the mesh built fine and the optimizer dropped
+                                   it, so nothing reaches the served view.
+      * `<scope>.abandoned`      — the job ended with no `<scope>.done` (see
+                                   `mesh_jobs.log_abandoned`), which is how a
+                                   cancelled task now announces itself.
+      * a `<scope>.submit` with no terminal event at all — the process died
+                                   mid-job. The `.abandoned` event covers this
+                                   going forward; the fold still infers it so
+                                   logs written before that event existed, and
+                                   hard kills, are not silently clean.
+
+    Latest event per node wins, so a resubmit clears a prior failure (the retry
+    gets to speak for itself) and a failure after a success supersedes it.
+    Cached on the file's (mtime_ns, size) like the sibling folds, since the gate
+    status polls this every ~1.5s while a build runs."""
+    try:
+        st = events_path.stat()
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    cached = _gen_failure_cache.get(events_path)
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+
+    failed: dict[str, dict[str, object]] = {}
+    # Node -> the backend job we saw submitted and have not yet seen accounted
+    # for. Any terminal event clears it; what survives the fold is a job whose
+    # process exited before it could log one.
+    open_submit: dict[str, dict[str, object]] = {}
+
+    with events_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            kind = str(event.get("kind") or "")
+            scope, _, verb = kind.partition(".")
+            if scope in _MESH_SCOPES and verb in ("submit", "done", "abandoned"):
+                # Backend lifecycle events key the node by `job_id`; `task_id` is
+                # the backend's own id for the run.
+                node_id = event.get("job_id")
+                if not isinstance(node_id, str):
+                    continue
+                if verb == "submit":
+                    open_submit[node_id] = {
+                        "backend": scope,
+                        "taskId": event.get("task_id"),
+                        "at": event.get("ts"),
+                    }
+                    failed.pop(node_id, None)
+                    continue
+                open_submit.pop(node_id, None)
+                if verb == "done":
+                    failed.pop(node_id, None)
+                else:
+                    failed[node_id] = {
+                        "kind": "abandoned",
+                        "message": str(
+                            event.get("reason") or "ended without returning a result",
+                        ),
+                        "backend": scope,
+                        "taskId": event.get("task_id"),
+                        "at": event.get("ts"),
+                    }
+                continue
+
+            node_id = event.get("id")
+            if not isinstance(node_id, str):
+                continue
+            if kind == "mesh.error":
+                open_submit.pop(node_id, None)
+                failed[node_id] = {
+                    "kind": "mesh",
+                    "message": str(event.get("message") or "mesh build failed"),
+                    "at": event.get("ts"),
+                }
+            elif kind == "prefab.reuse_missing":
+                source = str(event.get("source") or "")
+                failed[node_id] = {
+                    "kind": "reuse",
+                    "message": (
+                        f"shares a mesh with {source}, which never produced one"
+                        if source
+                        else "shares a mesh with an object that never produced one"
+                    ),
+                    "source": source,
+                    "at": event.get("ts"),
+                }
+            elif kind == "generate.optimize_error":
+                failed[node_id] = {
+                    "kind": "optimize",
+                    "message": str(event.get("message") or "asset optimizer failed"),
+                    "at": event.get("ts"),
+                }
+            elif kind in _GEN_RECOVERY_KINDS:
+                failed.pop(node_id, None)
+
+    for node_id, info in open_submit.items():
+        if node_id in failed:
+            continue
+        failed[node_id] = {
+            "kind": "stuck",
+            "message": (
+                f"submitted to {info['backend']} but the build ended before the "
+                "job reported a result"
+            ),
+            **info,
+        }
+    _gen_failure_cache[events_path] = (sig, failed)
+    return failed
+
+
+def _mtime(path: Path) -> float | None:
+    """Epoch-seconds mtime, or None when the file isn't there. Same clock as an
+    event's `ts`, so a caller can ask whether a file predates a logged event."""
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def _generated_failure_rows(
+    events_path: Path,
+    canonical_of: dict[str, str],
+    opt_dir: Path,
+    busy: set[str],
+    *,
+    include_unbuilt: bool,
+) -> list[dict[str, object]]:
+    """`_generated_failures` shaped for the client: newest first, nodes currently
+    rebuilding dropped (their previous failure is being answered right now), and
+    each row tagged with its prefab `canonical` so the panel can group a whole
+    group's collateral damage under the one object that actually failed.
+
+    A failure is dropped when the served mesh on disk is NEWER than the failure —
+    the object was rebuilt afterwards, so the log's last word about it is stale.
+    Mesh mtime is used rather than a success event in the log because the reuse
+    path historically landed a mesh without logging anything at all, which would
+    otherwise leave hundreds of long-since-rebuilt objects reading as failed.
+    (`prefab.reuse_derived` closes that gap for new builds; this keeps the fold
+    honest on every log written before it existed.)
+
+    What survives is either an object with no served mesh, or one whose mesh
+    PREDATES the failure — flagged `stale`, meaning the viewport is still showing
+    the previous asset. That second case is the one that was impossible to notice:
+    a regenerate is non-destructive, so a failed one looks exactly like a
+    successful one on screen.
+
+    `include_unbuilt` adds the objects that were queued (they have a
+    `prefab.match`) but produced neither a mesh nor a single log line. Only passed
+    when nothing is running, since mid-build those are simply not started yet."""
+    logged = _generated_failures(events_path)
+    rows: list[dict[str, object]] = []
+    for node_id, info in logged.items():
+        if node_id in busy:
+            continue
+        at = info.get("at")
+        served_at = _mtime(opt_dir / f"{node_id}.glb")
+        if served_at is not None and (
+            not isinstance(at, (int, float)) or served_at > at
+        ):
+            continue
+        rows.append({
+            **info,
+            "id": node_id,
+            "canonical": canonical_of.get(node_id, node_id),
+            "stale": served_at is not None,
+        })
+    if include_unbuilt:
+        for node_id, canonical in canonical_of.items():
+            if node_id in busy or node_id in logged:
+                continue
+            if (opt_dir / f"{node_id}.glb").exists():
+                continue
+            rows.append({
+                "id": node_id,
+                "kind": "unbuilt",
+                "message": "queued for this build but never started",
+                "canonical": canonical,
+                "at": None,
+                "stale": False,
+            })
+
+    def _recency(row: dict[str, object]) -> tuple[float, str]:
+        at = row.get("at")
+        return (-(at if isinstance(at, (int, float)) else 0.0), str(row["id"]))
+
+    rows.sort(key=_recency)
+    return rows
 
 
 def _ensure_run_hydrated(run: str) -> None:
@@ -2747,7 +2978,14 @@ def create_app() -> FastAPI:
         selects which build to report (the latest when omitted; a pre-versioning
         build is folded into V1 first). The response also carries the full
         `versions` list + resolved `version` so the client's version selector can
-        populate without a second call."""
+        populate without a second call.
+
+        `failures` is the per-object account of what did NOT come back (see
+        `_generated_failure_rows`). It is derived from the version's own log, so it
+        survives a restart and is just as accurate when the panel is opened long
+        after the build finished — the generated build writes to its own
+        `events.generated.jsonl`, which no SSE stream carries, so this response is
+        the only way any of it reaches the client."""
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
         rid = _run_id(run, slot_id, model_alias)
@@ -2848,12 +3086,24 @@ def create_app() -> FastAPI:
         if regen_queue is not None:
             for job in list(regen_queue._queue):  # type: ignore[attr-defined]
                 busy.add(job.node_id)
+        # A regenerate propagates across a prefab group, so a member is effectively
+        # rebuilding whenever its canonical is. Expanded here — rather than left to
+        # the client, which expands `busy` separately for its own button state — so
+        # a group being fixed right now doesn't flash its old failures.
+        rebuilding = set(busy)
+        for mesh_id, canonical_id in canonical_of.items():
+            if canonical_id in busy:
+                rebuilding.add(mesh_id)
         return {
             "running": running,
             "count": len(ids),
             "ids": ids,
             "meshes": meshes,
             "busy": sorted(busy),
+            "failures": _generated_failure_rows(
+                gen_events_path, canonical_of, opt_dir, rebuilding,
+                include_unbuilt=not running,
+            ),
             "version": gen_version,
             "versions": versions,
         }
@@ -3001,18 +3251,22 @@ def create_app() -> FastAPI:
         propagate: bool = True,
     ) -> dict[str, object]:
         """Mirror a GENERATED asset across `plane` ('xy' = front/back along Z, 'xz' =
-        top/bottom along Y), keeping the `keep_positive` half — the symmetrize
-        counterpart to /unsymmetrize. The plane + direction are supplied by the
-        caller, so NO symmetry LLM decision is made and NO symmetry log is consulted
-        to pick them. Reprocesses the existing raw mesh (no Nano-Banana, no mesh
-        backend) on the SAME per-version worker as regenerate/unsymmetrize, so it
-        enqueues, drains concurrently, and serializes per-node via
-        `generation.node_lock`. With `propagate=true` (the client default) the prefab
-        CANONICAL behind `node_id` is mirrored and every object reusing it is
-        re-derived to match. Pins the node's symmetry decision so later resumes /
-        regenerations keep the mirror."""
-        if plane not in ("xy", "xz"):
-            raise HTTPException(status_code=400, detail=f"plane must be 'xy' or 'xz', got: {plane}")
+        top/bottom along Y, 'yz' = left/right along X), keeping the `keep_positive`
+        half — the symmetrize counterpart to /unsymmetrize. The plane + direction are
+        supplied by the caller, so NO symmetry LLM decision is made and NO symmetry
+        log is consulted to pick them; 'yz' is reachable only this way, since the
+        automatic gate never picks it (see `app.services.symmetry`). Reprocesses the
+        existing raw mesh (no Nano-Banana, no mesh backend) on the SAME per-version
+        worker as regenerate/unsymmetrize, so it enqueues, drains concurrently, and
+        serializes per-node via `generation.node_lock`. With `propagate=true` (the
+        client default) the prefab CANONICAL behind `node_id` is mirrored and every
+        object reusing it is re-derived to match. Pins the node's symmetry decision
+        so later resumes / regenerations keep the mirror."""
+        if plane not in sym_svc.MIRROR_PLANES:
+            allowed = ", ".join(f"'{p}'" for p in sorted(sym_svc.MIRROR_PLANES))
+            raise HTTPException(
+                status_code=400, detail=f"plane must be one of {allowed}; got: {plane}",
+            )
         run = _resolve_run(run)
         slot = _require_slot(slot_id)
         _require_model(model_alias)
@@ -4437,11 +4691,11 @@ def _reconstruct_node(slot_log: SlotLog, node_id: str) -> Node | None:
     orientation: Orientation = int(orientation_raw) if isinstance(orientation_raw, (int, float, str)) else 0  # type: ignore[assignment]
     raw_prompt = image_event.get("prompt") if image_event is not None else bbox_event.get("prompt")
     raw_str = str(raw_prompt) if raw_prompt is not None else ""
-    cut_plane: Literal["none", "xy", "xz"] = "none"
+    cut_plane: sym_svc.CutPlane = "none"
     for event in events:
         if event.get("id") == node_id and event.get("kind") == "symmetry.decision":
             raw_cp = event.get("cut_plane")
-            if raw_cp in ("none", "xy", "xz"):
+            if raw_cp in sym_svc.CUT_PLANES:
                 cut_plane = raw_cp  # type: ignore[assignment]
             break
     encapsulating = bbox_event.get("node_kind") == "frame"
@@ -5461,7 +5715,7 @@ async def _regen_worker(run: str, slot_id: str, model_alias: str, version: str) 
         for e in reversed(gen_log.state["events"]):
             if e.get("kind") == "symmetry.applied" and e.get("id") == src_id:
                 cp = e.get("cut_plane")
-                if cp in ("none", "xy", "xz"):
+                if cp in sym_svc.CUT_PLANES:
                     extra = (
                         {"keep_positive": e["keep_positive"]}
                         if isinstance(e.get("keep_positive"), bool) else {}

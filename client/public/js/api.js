@@ -259,6 +259,8 @@ export const api = {
 	// group. `unlink` splits the object out of its group into a standalone asset
 	// (its own raw, no rebuild); `link` moves it into another object's group.
 	// backend ∈ {trellis, hunyuan, hunyuan-tencent}.
+	// symmetrize plane ∈ {xy front/back, xz top/bottom, yz left/right}, with
+	// keepPositive selecting which half survives (+Z front / +Y top / +X right).
 	generate: (run, slot, model, { version = null, newVersion = false } = {}) =>
 		request(cellPath(slot, model, "/generate"), {
 			method: "POST",

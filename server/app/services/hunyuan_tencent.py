@@ -259,6 +259,11 @@ async def generate_mesh(
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     mesh_jobs.mark_queued(slot_id, job_id, backend=SCOPE)
+    # Hoisted out of the `async with` so the terminal event in the `finally` can
+    # name the Tencent task we walked away from (None if the submit never landed).
+    tencent_job_id: str | None = None
+    logged_done = False
+    exit_reason = mesh_jobs.ABANDONED_CANCELLED
     try:
         async with _GATE, httpx.AsyncClient(follow_redirects=True) as http:
             if isinstance(image, str):
@@ -270,10 +275,10 @@ async def generate_mesh(
             image_b64 = base64.b64encode(image_bytes).decode("ascii")
 
             ack = await _post_signed(http, creds, region, _SUBMIT_ACTION, _submit_params(image_b64))
-            tencent_job_id = ack.get("JobId")
-            if not tencent_job_id:
+            ack_job_id = ack.get("JobId")
+            if not ack_job_id:
                 raise RuntimeError(f"Tencent submit returned no JobId: {ack!r}")
-            tencent_job_id = str(tencent_job_id)
+            tencent_job_id = str(ack_job_id)
             mesh_jobs.mark_processing(slot_id, job_id, task_id=tencent_job_id, backend=SCOPE)
             logging.log(f"{SCOPE}.submit", job_id=job_id, task_id=tencent_job_id)
 
@@ -287,6 +292,16 @@ async def generate_mesh(
             tmp_path.write_bytes(resp.content)
             tmp_path.replace(output_path)
             logging.log(f"{SCOPE}.done", job_id=job_id, task_id=tencent_job_id, saved=str(output_path))
+            logged_done = True
             return output_path
+    except Exception as e:
+        exit_reason = f"{type(e).__name__}: {str(e)[:200]}"
+        raise
     finally:
+        # Same terminal-event guarantee as the Modal-backed core (see
+        # mesh_jobs.log_abandoned): a job that ends without `<SCOPE>.done` says so,
+        # cancellation included — that path raises BaseException and so reaches
+        # this `finally` without any `except` of ours seeing it.
+        if not logged_done:
+            mesh_jobs.log_abandoned(SCOPE, job_id, tencent_job_id, exit_reason)
         mesh_jobs.unmark_queued(slot_id, job_id)

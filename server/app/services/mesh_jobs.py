@@ -26,6 +26,11 @@ Hunyuan rather than per-backend.
 Image generation lives in `app.services.nano_banana`; callers run that first,
 then pass the resulting bytes (or a hosted URL) here.
 
+Every job that reaches the submit loop logs exactly one terminal event —
+`<scope>.done` or `<scope>.abandoned` — so a reader of the log can always tell a
+finished job from one that ended with nothing to show for it. The API layer folds
+those into the per-asset failure list the client renders.
+
 Restart-resilience on completed work lives in `app.utils.resumable`: if
 `<scope>.done` was logged and the saved GLB still exists, we short-circuit and
 reuse it. Anything not done re-submits fresh — we don't probe stale Modal
@@ -120,6 +125,16 @@ class JobLostError(Exception):
     id again is hopeless; the outer retry loop should treat this as a resubmit
     signal: drop the dead task_id and call `_post_generate` again on the next
     attempt."""
+
+
+# Every `generate_mesh` call that gets as far as submitting ends with EXACTLY one
+# terminal event: `<scope>.done` on success, or `<scope>.abandoned` on any other
+# exit. The abandoned case is logged from a `finally`, so it also covers the paths
+# that previously logged nothing at all — notably task cancellation, which raises
+# BaseException and so slips past the `except Exception` in the pipeline's
+# `_generate_one`. That invariant is what lets the client tell "still running"
+# apart from "ended with no mesh and no explanation".
+ABANDONED_CANCELLED = "cancelled before the backend returned a result"
 
 
 # Cap on in-flight jobs at any moment (process-global FIFO across all slots AND
@@ -518,6 +533,25 @@ def _input_hash(
     })
 
 
+def log_abandoned(
+    scope: str, job_id: str, task_id: str | None, reason: str,
+) -> None:
+    """Record `<scope>.abandoned` — the job ended without a `<scope>.done`.
+    `task_id` is the backend job we walked away from (None when we never got one).
+    Shared with `app.services.hunyuan_tencent`, which runs its own submit/poll
+    lifecycle but owes the log the same terminal event.
+
+    Emitted from a `finally`, so it must not raise: an unbound SlotLog (a script
+    or a test calling `generate_mesh` outside a run) would otherwise replace the
+    exception that is already unwinding with a `LookupError`."""
+    try:
+        logging.log(
+            f"{scope}.abandoned", job_id=job_id, task_id=task_id, reason=reason,
+        )
+    except LookupError:
+        logging.console_note(f"[{scope}.abandoned] {job_id}: {reason}")
+
+
 async def generate_mesh(
     image: bytes | str,
     *,
@@ -563,16 +597,18 @@ async def generate_mesh(
 
     slot_id = logging.current_slot_id()
     _queue_set(slot_id, job_id, "waiting", backend=backend.scope)
+    # By default we hold `server_job_id` across outer retries — any retryable
+    # failure during poll or download re-enters the same Modal job instead of
+    # orphaning it and burning a fresh generation. The exception is JobLostError
+    # (404 from Modal): the worker that held the in-memory job table is gone, and
+    # polling the same id is pointless. On JobLost we clear `server_job_id` so the
+    # next attempt does a fresh submit. Hoisted above the `try` so the terminal
+    # event logged in the `finally` can name the task that was left behind.
+    server_job_id: str | None = None
+    logged_done = False
+    exit_reason = ABANDONED_CANCELLED
     try:
         async with _inflight_sem:
-            # By default we hold `server_job_id` across outer retries — any
-            # retryable failure during poll or download re-enters the same Modal
-            # job instead of orphaning it and burning a fresh generation. The
-            # exception is JobLostError (404 from Modal): the worker that held
-            # the in-memory job table is gone, and polling the same id is
-            # pointless. On JobLost we clear `server_job_id` so the next attempt
-            # does a fresh submit.
-            server_job_id: str | None = None
             for attempt in range(MAX_ATTEMPTS):
                 try:
                     if server_job_id is None:
@@ -606,6 +642,7 @@ async def generate_mesh(
                         server_job_id=server_job_id,
                         saved=str(output_path),
                     )
+                    logged_done = True
                     return output_path
                 except JobLostError as e:
                     logging.log(
@@ -648,7 +685,16 @@ async def generate_mesh(
                     if delay > 0:
                         await asyncio.sleep(delay)
             raise AssertionError("unreachable")
+    except Exception as e:
+        exit_reason = f"{type(e).__name__}: {str(e)[:200]}"
+        raise
     finally:
+        # Cancellation raises BaseException, so it reaches this `finally` without
+        # any `except` of ours seeing it — and `_generate_one` won't catch it
+        # either. That is precisely the exit that used to leave no trace, so the
+        # default `exit_reason` covers it.
+        if not logged_done:
+            log_abandoned(backend.scope, job_id, server_job_id, exit_reason)
         # Whether we succeeded, errored, or were cancelled, the job is no longer
         # in flight. Drop unconditionally so a crashed task can't leak into the
         # queue snapshot.
