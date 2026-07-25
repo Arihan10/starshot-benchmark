@@ -1,5 +1,6 @@
 // Full-screen Gaussian-splat viewer for Stage-2 clouds, on @mkkellogg/gaussian-
-// splats-3d (orbit controls + WASM sort).
+// splats-3d (WASM sort). The camera is our own rig (splatcam.js) rather than the
+// library's, so this page flies exactly like the main dashboard viewer.
 //
 // Live controls: the panel exposes the sampler's ONE quality knob (`detail`, a
 // density multiplier — everything else is derived server-side) and re-splats
@@ -18,6 +19,7 @@ import {
     isSogOpen,
     openSogView,
     setSogVisible,
+    sogCamera,
 } from "./sogviewer.js";
 import { openRefsViewer } from "./refsviewer.js";
 import {
@@ -37,6 +39,7 @@ import {
 import { bakeReflectionProbes } from "./reflections.js";
 import { applyEmissiveLighting } from "./emissive.js";
 import { matteNonReflective } from "./reflective.js";
+import { baseSpeedFor, createCameraRig, radiusFor } from "./splatcam.js";
 
 let overlay = null;
 let canvasEl = null;
@@ -120,23 +123,14 @@ let modalTrainCfg = {
     batch: 3,
 };
 
-// WASD free-fly state (see movementTick). mkkellogg owns mouse orbit/zoom; this
-// adds keyboard walk by translating the camera + orbit target together per frame.
-const MOVE_CODES = new Set([
-    "KeyW",
-    "KeyA",
-    "KeyS",
-    "KeyD",
-    "KeyQ",
-    "KeyE",
-    "Space",
-    "ShiftLeft",
-    "ShiftRight",
-]);
-const pressed = new Set();
-let moveRaf = 0;
-let moveLast = 0;
-let moveSpeed = 3; // metres/sec, sized per scene from its AABB on load
+// Camera rig (splatcam.js) — the same orbit + first-person controls as the main
+// dashboard viewer. mkkellogg's built-in OrbitControls are disabled (see
+// makeViewer) so the rig owns the camera outright; it's ticked from cameraTick.
+let rig = null;
+let camRaf = 0;
+let camLast = 0;
+let sceneRadius = 10; // half the scene's largest dimension, from its AABB
+let fpBtn = null; // the header's first-person toggle
 
 const POLL_MS = 1200;
 const BYTES_PER_SPLAT = 68; // 17 float32 — for the density→size estimate
@@ -171,80 +165,68 @@ function framing(aabb) {
     return { position: [c[0] + d, c[1] + d * 0.6, c[2] + d], lookAt: c };
 }
 
-// ---- WASD free-fly ----------------------------------------------------------
+// ---- camera -----------------------------------------------------------------
 
-// Base fly speed scaled to the scene: ~a third of its diagonal per second (Shift
-// sprints 3×), clamped so small props aren't glacial and big scenes aren't wild.
-function speedFor(aabb) {
-    if (!aabb || !aabb.min || !aabb.max) return 3;
-    const d = Math.hypot(
-        aabb.max[0] - aabb.min[0],
-        aabb.max[1] - aabb.min[1],
-        aabb.max[2] - aabb.min[2],
-    );
-    return Math.min(25, Math.max(2, d * 0.35));
+// The rig is ticked here rather than from mkkellogg's loop: orbit damping needs
+// an update() every frame, and the first-person walk has to run even in mesh
+// mode, where that loop is stopped in favour of our OIT pass. mkkellogg only
+// redraws when it notices the camera move, so a moved frame is nudged.
+function cameraTick(now) {
+    camRaf = requestAnimationFrame(cameraTick);
+    const dt = Math.min(0.05, (now - camLast) / 1000 || 0); // clamp big frame gaps
+    camLast = now;
+    if (rig && rig.update(dt)) viewer?.forceRenderNextFrame?.();
 }
 
-const _fwd = new THREE.Vector3();
-const _right = new THREE.Vector3();
-const _move = new THREE.Vector3();
-const _WORLD_UP = new THREE.Vector3(0, 1, 0);
-
-function movementTick(now) {
-    moveRaf = requestAnimationFrame(movementTick);
-    const cam = viewer && viewer.camera;
-    const controls = viewer && viewer.controls;
-    const dt = Math.min(0.05, (now - moveLast) / 1000 || 0); // clamp big frame gaps
-    moveLast = now;
-    if (mode === "sog") return; // the PlayCanvas view owns WASD while visible
-    if (!cam || !controls || pressed.size === 0) return;
-    cam.updateMatrixWorld();
-    // Horizontal forward/right (drop the pitch → walk, don't dive); Q/E/Space are
-    // world-vertical. This keeps W from drifting up/down when the view is tilted.
-    cam.getWorldDirection(_fwd);
-    _fwd.y = 0;
-    if (_fwd.lengthSq() < 1e-8) {
-        // looking straight up/down → use the screen-up direction as forward
-        _fwd.setFromMatrixColumn(cam.matrixWorld, 1).setY(0);
-    }
-    _fwd.normalize();
-    _right.setFromMatrixColumn(cam.matrixWorld, 0).setY(0).normalize();
-    _move.set(0, 0, 0);
-    if (pressed.has("KeyW")) _move.add(_fwd);
-    if (pressed.has("KeyS")) _move.sub(_fwd);
-    if (pressed.has("KeyD")) _move.add(_right);
-    if (pressed.has("KeyA")) _move.sub(_right);
-    if (pressed.has("KeyE") || pressed.has("Space")) _move.add(_WORLD_UP);
-    if (pressed.has("KeyQ")) _move.sub(_WORLD_UP);
-    if (_move.lengthSq() === 0) return;
-    const sprint =
-        pressed.has("ShiftLeft") || pressed.has("ShiftRight") ? 3 : 1;
-    _move.normalize().multiplyScalar(moveSpeed * sprint * dt);
-    cam.position.add(_move);
-    controls.target.add(_move); // move the orbit target too → look direction preserved
+// Bind the rig to a freshly built viewer (both the camera and the canvas are
+// new on every load, so the rig is rebuilt with them).
+function startCamera(v, view) {
+    stopCamera();
+    // mkkellogg builds a 50° camera; the main viewer walks at 75°, which is what
+    // keeps a first-person pass through a room from feeling telephoto.
+    v.camera.fov = 75;
+    v.camera.updateProjectionMatrix();
+    rig = createCameraRig({
+        camera: v.camera,
+        domElement: v.renderer.domElement,
+        target: new THREE.Vector3().fromArray(view.lookAt),
+        radius: sceneRadius,
+        // The PlayCanvas SOG view overlays this canvas and drives its own camera.
+        isActive: () => isSplatViewerOpen() && mode !== "sog",
+    });
+    rig.onModeChange(syncFpButton);
+    syncFpButton("orbit");
+    camLast = performance.now();
+    camRaf = requestAnimationFrame(cameraTick);
 }
 
-function startMovement() {
-    if (moveRaf) return;
-    moveLast = performance.now();
-    moveRaf = requestAnimationFrame(movementTick);
+function stopCamera() {
+    if (camRaf) cancelAnimationFrame(camRaf);
+    camRaf = 0;
+    rig?.dispose();
+    rig = null;
+    syncFpButton("orbit");
 }
 
-function stopMovement() {
-    if (moveRaf) cancelAnimationFrame(moveRaf);
-    moveRaf = 0;
-    pressed.clear();
+function syncFpButton(camMode) {
+    if (!fpBtn) return;
+    fpBtn.classList.toggle("on", camMode === "fp");
+    fpBtn.textContent = camMode === "fp" ? "first-person ✓" : "first-person";
 }
 
-// Read the live camera so a re-splat reload can keep the same view.
+// Whichever camera the visible view owns: the three.js rig, or the PlayCanvas
+// one while the SOG canvas is on top. Both expose the same mode handle.
+function activeCam() {
+    return mode === "sog" && isSogOpen() ? sogCamera : rig;
+}
+
+// Read the live camera so a re-splat reload can keep the same view. In
+// first-person the pivot is parked ahead of the look, so it round-trips too.
 function captureCamera() {
-    try {
-        const p = viewer.camera.position;
-        const t = viewer.controls.target;
-        return { position: [p.x, p.y, p.z], lookAt: [t.x, t.y, t.z] };
-    } catch {
-        return null;
-    }
+    if (!viewer || !rig) return null;
+    const p = viewer.camera.position;
+    const t = rig.orbit.target;
+    return { position: [p.x, p.y, p.z], lookAt: [t.x, t.y, t.z] };
 }
 
 function disposeObj(obj) {
@@ -266,7 +248,7 @@ function disposeObj(obj) {
 }
 
 async function teardown() {
-    stopMovement();
+    stopCamera();
     // Stop our mesh OIT loop and free its targets before the GL context goes away;
     // don't resume mkkellogg (the viewer is being disposed).
     if (meshRenderRaf) {
@@ -349,7 +331,10 @@ function makeViewer(view) {
     return new GaussianSplats3D.Viewer({
         rootElement: canvasEl,
         selfDrivenMode: true,
-        useBuiltInControls: true,
+        // Our own rig (splatcam.js) owns the camera. The library's loop calls
+        // controls.update() unconditionally, which re-aims the camera at the
+        // orbit target — that would fight the first-person pointer-lock look.
+        useBuiltInControls: false,
         sharedMemoryForWorkers: false, // no COOP/COEP needed on the static server
         dynamicScene: false,
         sphericalHarmonicsDegree: 0, // SH disabled — the viewer is flat / view-independent by design
@@ -400,7 +385,9 @@ async function openMeshView(seq) {
         cellStatus?.stage2?.summary?.scene_aabb ||
         cellStatus?.summary?.scene_aabb ||
         null;
-    const v = makeViewer(framing(aabb));
+    const view = framing(aabb);
+    sceneRadius = radiusFor(aabb);
+    const v = makeViewer(view);
     viewer = v;
     try {
         // Seed the invisible dummy scene FIRST (see dummySplatPlyUrl) so the
@@ -425,8 +412,7 @@ async function openMeshView(seq) {
             );
         return;
     }
-    moveSpeed = speedFor(aabb);
-    startMovement();
+    startCamera(v, view);
     mode = "mesh";
     syncViewButtons();
     const ok = await ensureMesh();
@@ -447,6 +433,7 @@ async function loadClouds(seq, url, summary, camera) {
     await teardown();
     if (seq !== openSeq) return;
     const view = camera || framing(summary && summary.scene_aabb);
+    sceneRadius = radiusFor(summary && summary.scene_aabb);
     const v = makeViewer(view);
     viewer = v;
     try {
@@ -467,8 +454,7 @@ async function loadClouds(seq, url, summary, camera) {
     }
     if (seq !== openSeq) return;
     v.start();
-    moveSpeed = speedFor(summary && summary.scene_aabb);
-    startMovement();
+    startCamera(v, view);
     const baseN = summary && summary.splats;
     setStatus(
         baseN ? `${baseN.toLocaleString()} splats` : "loaded",
@@ -985,6 +971,7 @@ async function setSogMode() {
         return;
     }
     const cam = captureCamera();
+    rig?.setMode("orbit"); // the PlayCanvas canvas takes over the pointer lock
     mode = "sog";
     syncViewButtons();
     splatVisible(false);
@@ -1001,7 +988,7 @@ async function setSogMode() {
                 container: canvasEl,
                 url: api.absUrl(sogUrl),
                 view: cam || framing(s3.summary && s3.summary.scene_aabb),
-                speed: moveSpeed,
+                speed: baseSpeedFor(sceneRadius),
             });
         }
         if (mode !== "sog") return; // switched away while loading
@@ -1359,7 +1346,6 @@ function startMeshRender() {
     const tick = () => {
         meshRenderRaf = requestAnimationFrame(tick);
         if (mode !== "mesh" || !viewer || !meshOit) return;
-        viewer.controls?.update?.(); // damping + orbit, normally driven by mkkellogg
         meshOit.render(viewer.threeScene, viewer.camera, meshOitMats);
     };
     meshRenderRaf = requestAnimationFrame(tick);
@@ -1894,10 +1880,20 @@ function buildControls(summary) {
     // live phase/progress readout. The "anchor positions" overlay shows WHERE the
     // 360 captures are taken (the captured points when a tour exists, else a fresh
     // LLM plan preview) — orange disks, the tour twin of the cyan camera overlay.
+    // Two independent steps. "plan anchors" is the LLM pass; it saves the plan to
+    // tour/anchors.json, so "capture tour" (the GPU pass) just renders that plan —
+    // later, or after a restart, without re-planning.
+    const planBtn = el("button", {
+        class: "splat-stage2-btn",
+        text: "plan anchors",
+        title: "step 1: plan the 360° anchor points — saved to tour/anchors.json for the capture to render later",
+        onclick: () => void planOnly(),
+    });
+    inputs._planBtn = planBtn;
     const tourBtn = el("button", {
         class: "splat-stage2-btn",
         text: "capture tour",
-        title: "plan 360° anchors, render the matterport walkthrough headlessly, and publish",
+        title: "step 2: render the saved anchor plan headlessly (panos + minimaps + proxy), write tour.json, and publish",
         onclick: () => startTourCapture(),
     });
     inputs._tourBtn = tourBtn;
@@ -1906,8 +1902,19 @@ function buildControls(summary) {
         "div",
         { class: "svc-row" },
         el("span", { class: "svc-lab", text: "tour" }),
+        planBtn,
         tourBtn,
         inputs._tourStatus,
+        // The other half of the flow: every planned/captured tour across all runs,
+        // each with a publish button.
+        el("a", {
+            href: "/tours",
+            target: "_blank",
+            rel: "noreferrer",
+            text: "all tours ▸",
+            title: "index of every planned / captured tour, with publish buttons",
+            style: "color:var(--accent,#9ad4ff);text-decoration:none;font-size:10px;margin-left:auto",
+        }),
     );
     const anchorRow = checkRow("anchors", "anchor positions (orange)", false);
     inputs.anchors.addEventListener("change", () =>
@@ -2355,6 +2362,66 @@ function buildAnchors(anchors) {
     return new THREE.Points(geo, mat);
 }
 
+// Kick off the server-side anchor plan and poll it to completion. Planning is a
+// background job (one reasoning-model call PER ZONE — minutes each), so we never
+// hold a single request open for the whole thing: the connection would eventually
+// drop and cancel the plan mid-flight. Returns the planned anchors, or null when
+// the open cell changed while we waited.
+async function planAnchors(cell, seq) {
+    let job = await api.tourAnchorsStart(cell.run, cell.slot, cell.model);
+    while (job && job.running) {
+        await sleep(POLL_MS);
+        if (seq !== openSeq) return null;
+        try {
+            job = await api.tourAnchorsStatus(cell.run, cell.slot, cell.model);
+        } catch {
+            continue; // transient — keep polling
+        }
+        setOverlay(`planning anchors (LLM)… ${job.status || ""}`);
+    }
+    if (!job || job.status === "error")
+        throw new Error((job && job.error) || "planning failed");
+    return Array.isArray(job.anchors) ? job.anchors : [];
+}
+
+// Step 1 on its own: plan the anchors and let the server persist them. The plan is
+// a durable artifact, so the capture (step 2) can run much later — or after a
+// server restart — without spending the LLM pass again. A cell that already has a
+// saved plan returns it instantly, so this is safe to click twice.
+async function planOnly() {
+    const c = current;
+    if (!c) return;
+    const seq = openSeq;
+    const btn = inputs && inputs._planBtn;
+    if (btn) {
+        btn.disabled = true;
+        btn.textContent = "planning…";
+    }
+    setTourStatus("planning anchors…");
+    try {
+        const anchors = await planAnchors(c, seq);
+        if (anchors === null) return; // cell changed under us
+        setTourStatus(`${anchors.length} anchors planned`);
+        // Drop the cached overlay so it rebuilds from the new plan, then show it.
+        if (anchorPoints) {
+            viewer?.threeScene?.remove(anchorPoints);
+            disposeObj(anchorPoints);
+            anchorPoints = null;
+        }
+        if (inputs && inputs.anchors) {
+            inputs.anchors.checked = true;
+            await setAnchors(true);
+        }
+    } catch (e) {
+        setTourStatus(`plan failed: ${e.message}`, true);
+    } finally {
+        if (btn && seq === openSeq) {
+            btn.disabled = false;
+            btn.textContent = "plan anchors";
+        }
+    }
+}
+
 // Build the anchor overlay for the open cell: prefer the ACTUAL captured points
 // (tour.json, free), falling back to a fresh LLM plan preview when no tour exists
 // yet. Cached for the session so a toggle never re-plans.
@@ -2384,12 +2451,12 @@ async function ensureAnchors() {
         source = "planned";
         setOverlay("planning anchors (LLM)…");
         try {
-            const plan = await api.tourAnchors(c.run, c.slot, c.model);
-            anchors = Array.isArray(plan.anchors) ? plan.anchors : [];
+            anchors = await planAnchors(c, seq);
         } catch (e) {
             setOverlay(`anchor plan failed: ${e.message}`);
             return false;
         }
+        if (anchors === null) return false; // the open cell changed under us
     }
     if (seq !== openSeq || !viewer) return false;
     if (!anchors.length) {
@@ -3508,7 +3575,7 @@ export function initSplatViewer() {
     });
     overlay.appendChild(patchModalEl);
     // Click-to-pick a patch — distinguish a click from an orbit drag by movement.
-    // Capture phase, so mkkellogg's built-in controls can't swallow the events.
+    // Capture phase, so the rig's canvas handlers can't swallow the events.
     canvasEl.addEventListener(
         "pointerdown",
         (ev) => {
@@ -3525,6 +3592,9 @@ export function initSplatViewer() {
                 ev.clientY - _downXY[1],
             );
             _downXY = null;
+            // Under pointer lock the cursor is frozen, so every click would read
+            // as a pick on whatever the crosshair last sat over.
+            if (rig?.getMode() === "fp") return;
             if (moved > 5 || !patchesOn) return;
             const idx = pickPatch(ev);
             if (idx >= 0) showPatchModal(idx);
@@ -3534,27 +3604,29 @@ export function initSplatViewer() {
     document
         .getElementById("splat-viewer-close")
         .addEventListener("click", closeSplatViewer);
+    // First-person toggle: the button enters FP (pointer lock); the rig flips
+    // back to orbit on Esc or a refused lock, so mirror its state instead of
+    // tracking our own (see startCamera → onModeChange).
+    fpBtn = document.getElementById("splat-viewer-fp");
+    fpBtn.addEventListener("click", () => {
+        const cam = activeCam();
+        if (!cam) return;
+        cam.setMode(cam.getMode() === "fp" ? "orbit" : "fp");
+        fpBtn.blur(); // don't leave the toggle focused under the locked pointer
+    });
+    sogCamera.onModeChange(syncFpButton);
     // Capture-phase Esc: close the viewer (topmost) and swallow the event so the
-    // splat screen's own Esc handler underneath doesn't also close.
+    // splat screen's own Esc handler underneath doesn't also close. In
+    // first-person Esc leaves the look instead — the browser has already dropped
+    // the pointer lock by then, so the viewer must not close out from under it.
     document.addEventListener(
         "keydown",
         (ev) => {
-            if (ev.key === "Escape" && isSplatViewerOpen()) {
-                ev.stopImmediatePropagation();
-                closeSplatViewer();
-            }
+            if (ev.key !== "Escape" || !isSplatViewerOpen()) return;
+            ev.stopImmediatePropagation();
+            if (activeCam()?.consumeEscape()) return;
+            closeSplatViewer();
         },
         true,
     );
-    // WASD/QE/Shift walk — only while the viewer is open, and not while typing in
-    // the controls panel. keyup always clears so a key can't stick.
-    window.addEventListener("keydown", (ev) => {
-        if (!isSplatViewerOpen() || !MOVE_CODES.has(ev.code)) return;
-        const tag = ev.target && ev.target.tagName;
-        if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
-        pressed.add(ev.code);
-        if (ev.code === "Space") ev.preventDefault(); // don't scroll the page
-    });
-    window.addEventListener("keyup", (ev) => pressed.delete(ev.code));
-    window.addEventListener("blur", () => pressed.clear());
 }

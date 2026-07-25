@@ -3448,18 +3448,142 @@ _tour_capture_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
 _tour_capture_state: dict[tuple[str, str, str], dict[str, Any]] = {}
 _tour_capture_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
 
+# Standalone anchor planning (the "where do the cameras go" preview) is a
+# BACKGROUND job for the same reason the capture is: it runs one reasoning-model
+# call PER ZONE, sequentially, each with a 3-minute transport budget and retries
+# — routinely minutes, sometimes tens of minutes. Riding that on the request that
+# started it means any client that gives up (idle socket, tab throttle, reload)
+# cancels the ASGI task and kills the plan mid-flight. The job is polled instead.
+_anchor_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_anchor_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# On-demand publish (the tours page's per-scene button). Publishing bakes the
+# vertex-colored dollhouse through a Node subprocess and — off the local path —
+# uploads every pano to R2, so it's a background job too rather than a request
+# that blocks for minutes.
+_publish_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_publish_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
 # Overall wall-clock budget for one cell's capture, and the max quiet gap (no
 # pano/minimap/proxy landing and no heartbeat) before the session is judged
 # stalled — the first frame includes the scene load + shadow/reflection bakes, so
 # this is generous.
 _TOUR_CAPTURE_TIMEOUT_S = float(os.environ.get("STARSHOT_TOUR_CAPTURE_TIMEOUT", "1800"))
-_TOUR_CAPTURE_STALL_S = float(os.environ.get("STARSHOT_TOUR_CAPTURE_STALL", "300"))
+# The client keepalive beats every ~5s through every phase that yields; this only
+# has to cover the ONE phase it can't — the monolithic projection-proxy GLB
+# serialize, which on a several-hundred-object scene legitimately runs for a few
+# minutes of uninterrupted main-thread work. Generous so a big scene never false-
+# stalls; a genuinely dead session still trips it (just later).
+_TOUR_CAPTURE_STALL_S = float(os.environ.get("STARSHOT_TOUR_CAPTURE_STALL", "600"))
 
 
 def _cell_tour_dir(run: str, slot: str, model: str) -> Path:
     """Where a cell's captured walkthrough lands (panos + minimaps + proxy +
     tour.json) — the exact set services/publish.py uploads to R2."""
     return _slot_dir(run, slot, model) / "tour"
+
+
+# The anchor plan is a DURABLE artifact, deliberately independent of the render.
+# Planning is a long LLM pass (a reasoning call per zone); capture is a long GPU
+# pass. Either can be run — or re-run — without repeating the other, so a plan
+# that succeeded is never lost to a crashed server or a capture you postpone. The
+# plan lives at tour/anchors.json; a capture reuses it verbatim unless asked to
+# re-plan, and clearing a previous render leaves it alone.
+_ANCHOR_PLAN_NAME = "anchors.json"
+
+
+def _anchor_plan_path(run: str, slot: str, model: str) -> Path:
+    return _cell_tour_dir(run, slot, model) / _ANCHOR_PLAN_NAME
+
+
+def _plan_from_tour(run: str, slot: str, model: str) -> dict[str, Any] | None:
+    """Reconstruct the anchor plan from a cell's CAPTURED tour.json — its panos ARE
+    the planned anchors (each carries id / position / name / zone). Lets a cell that
+    was captured before plans were persisted (or whose anchors.json was lost)
+    re-capture WITHOUT re-planning: the anchors it already used are right there."""
+    tour_json = _cell_tour_dir(run, slot, model) / "tour.json"
+    if not tour_json.is_file():
+        return None
+    try:
+        tour = json.loads(tour_json.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a torn tour.json just means "no plan here"
+        return None
+    panos = tour.get("panos") if isinstance(tour, dict) else None
+    if not panos:
+        return None
+    return {
+        "planner_model": tour.get("planner_model"),
+        "namer_model": tour.get("namer_model"),
+        "reasoning": tour.get("planner_reasoning") or "",
+        "anchors": [
+            {
+                "id": p.get("id") or f"anchor-{i:03d}",
+                "name": p.get("name"),
+                "position": p["position"],
+                "zone": p.get("zone"),
+            }
+            for i, p in enumerate(panos)
+            if isinstance(p, dict) and p.get("position")
+        ],
+        "connectors": tour.get("connectors") or [],
+    }
+
+
+def _load_anchor_plan(run: str, slot: str, model: str) -> dict[str, Any] | None:
+    """This cell's saved plan, or None when it has none. Prefers the standalone
+    plan (tour/anchors.json); falls back to the anchors baked into a prior capture
+    (tour.json), so a captured cell never re-plans just to re-render."""
+    path = _anchor_plan_path(run, slot, model)
+    if path.is_file():
+        try:
+            plan = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(plan, dict) and plan.get("anchors"):
+                return plan
+        except Exception:  # noqa: BLE001 - a torn plan falls through to the tour.json copy
+            pass
+    return _plan_from_tour(run, slot, model)
+
+
+def _save_anchor_plan(run: str, slot: str, model: str, plan: dict[str, Any]) -> None:
+    """Write the plan atomically, so a kill mid-write can't leave a torn file."""
+    path = _anchor_plan_path(run, slot, model)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(plan), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _plan_payload(
+    anchors: list[anchors_svc.PlacedAnchor],
+    connectors: list[anchors_svc.PlacedConnector],
+    reasoning: str,
+    names: dict[int, str],
+) -> dict[str, Any]:
+    """The canonical plan shape, shared by the standalone planner and the capture.
+    Anchor ids are the CAPTURE ids (`anchor-NNN`) so a saved plan drops straight
+    into the capture manifest with no re-shaping."""
+    return {
+        "planner_model": anchors_svc.ANCHOR_PLANNER_MODEL,
+        "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
+        "reasoning": reasoning,
+        "anchors": [
+            {"id": f"anchor-{i:03d}", "name": names.get(i), **a.model_dump()}
+            for i, a in enumerate(anchors)
+        ],
+        "connectors": [c.model_dump() for c in connectors],
+    }
+
+
+def _clear_tour_renders(run: str, slot: str, model: str) -> None:
+    """Drop a previous capture's RENDER outputs (panos / minimaps / proxy /
+    tour.json) while KEEPING the anchor plan — re-rendering must never throw away
+    the plan it renders from."""
+    tour_dir = _cell_tour_dir(run, slot, model)
+    tour_dir.mkdir(parents=True, exist_ok=True)
+    for p in (*tour_dir.glob("*.jpg"), *tour_dir.glob("minimap-*.png")):
+        p.unlink(missing_ok=True)
+    for name in ("proxy.glb", "tour.json"):
+        (tour_dir / name).unlink(missing_ok=True)
 
 
 def _tour_bundle_url(run: str, slot: str, model: str) -> str:
@@ -3482,9 +3606,10 @@ def _tour_beat(run: str, slot: str, model: str) -> None:
 
 
 async def _run_tour_capture(
-    run: str, slot: str, model: str, api_origin: str, client_origin: str
+    run: str, slot: str, model: str, api_origin: str, client_origin: str, replan: bool = False
 ) -> None:
-    """Supervise ONE cell's headless matterport capture: plan the 360° anchors,
+    """Supervise ONE cell's headless matterport capture: REUSE the cell's saved
+    anchor plan (planning only when there is none, or when `replan`),
     launch the capture browser at the worker page, and watch the session the
     capture manifest/beat/finish endpoints drive until it finishes (or stalls /
     dies). The page renders + uploads the panos/minimaps/proxy and POSTs the tour
@@ -3495,26 +3620,35 @@ async def _run_tour_capture(
     proc = None
     profile = None
     try:
-        job["phase"] = "plan"
-        slot_log = _require_slot_log(run, slot, model)
+        job["phase"] = "prepare"
         if _splat_source(run, slot, model) is None:
             raise RuntimeError("cell has no meshes to capture (generate the scene first)")
-        nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
-        if not nodes:
-            raise RuntimeError("scene has no placed nodes to plan anchors from")
-        anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
-        if not anchors:
-            raise RuntimeError("anchor planner returned no anchors")
-        anchor_dicts = [
-            {"id": f"anchor-{i:03d}", "name": names.get(i), **a.model_dump()}
-            for i, a in enumerate(anchors)
-        ]
+        # Planning and rendering are SEPARATE steps: a capture just renders whatever
+        # plan already exists (a standalone plan, OR the anchors from a prior
+        # capture's tour.json) and only calls the LLM when there is genuinely no plan
+        # (or the caller forced `replan`). This is why re-capturing never re-plans.
+        plan = None if replan else await asyncio.to_thread(_load_anchor_plan, run, slot, model)
+        job["reused_plan"] = plan is not None
+        if plan is None:
+            job["phase"] = "plan"  # only NOW are we actually calling OpenRouter
+            slot_log = _require_slot_log(run, slot, model)
+            nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
+            if not nodes:
+                raise RuntimeError("scene has no placed nodes to plan anchors from")
+            anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
+            if not anchors:
+                raise RuntimeError("anchor planner returned no anchors")
+            plan = _plan_payload(anchors, connectors, reasoning, names)
+        anchor_dicts = plan["anchors"]
         job["total"] = len(anchor_dicts)
 
-        # Fresh tour dir — supersede any prior capture for this cell.
-        tour_dir = _cell_tour_dir(run, slot, model)
-        await asyncio.to_thread(shutil.rmtree, tour_dir, True)
-        tour_dir.mkdir(parents=True, exist_ok=True)
+        # Persist the resolved plan to anchors.json BEFORE clearing renders — for a
+        # tour.json-reconstructed plan this promotes it to the durable copy, and it
+        # ensures _clear_tour_renders (which deletes tour.json) can't destroy the
+        # plan's only source.
+        await asyncio.to_thread(_save_anchor_plan, run, slot, model, plan)
+        # Supersede the previous RENDER for this cell — the plan above is kept.
+        await asyncio.to_thread(_clear_tour_renders, run, slot, model)
 
         token = secrets.token_urlsafe(16)
         state: dict[str, Any] = {
@@ -3523,10 +3657,10 @@ async def _run_tour_capture(
             "lighting": splat_stage5.LIGHTING,
             "background": list(splat_stage5.BACKGROUND_RGB),
             "anchors": anchor_dicts,
-            "connectors": [c.model_dump() for c in connectors],
-            "planner_model": anchors_svc.ANCHOR_PLANNER_MODEL,
-            "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
-            "planner_reasoning": reasoning,
+            "connectors": plan.get("connectors") or [],
+            "planner_model": plan.get("planner_model"),
+            "namer_model": plan.get("namer_model"),
+            "planner_reasoning": plan.get("reasoning"),
             "finished": asyncio.Event(),
             "client_error": None,
             "renderer": None,
@@ -3578,6 +3712,60 @@ async def _run_tour_capture(
         job["running"] = False
         job["finished_at"] = datetime.now().isoformat(timespec="seconds")
         _tour_capture_tasks.pop(key, None)
+
+
+async def _run_anchor_plan(run: str, slot: str, model: str, nodes: list[Node]) -> None:
+    """Plan ONE cell's 360° capture anchors off the request path, filling the job
+    with the planned anchors / connectors / reasoning (or the failure). The node
+    tree is snapshotted by the caller, so this never touches the cell's log."""
+    key = (run, slot, model)
+    job = _anchor_jobs[key]
+    try:
+        job["status"] = "planning"
+        anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
+        if not anchors:
+            raise RuntimeError("anchor planner returned no anchors")
+        plan = _plan_payload(anchors, connectors, reasoning, names)
+        # Persist the moment planning succeeds: it's the expensive half, and from
+        # here on it's a durable artifact a capture can render from later — even if
+        # this process dies before anything is rendered.
+        await asyncio.to_thread(_save_anchor_plan, run, slot, model, plan)
+        job["anchors"] = plan["anchors"]
+        job["connectors"] = plan["connectors"]
+        job["reasoning"] = plan["reasoning"]
+        job["total"] = len(plan["anchors"])
+        job["status"] = "done"
+    except Exception as exc:  # noqa: BLE001 - surfaced through the job status
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _anchor_tasks.pop(key, None)
+
+
+async def _run_publish(run: str, slot: str, model: str) -> None:
+    """Publish ONE cell off the request path — the same work auto-publish does
+    after a capture, exposed as a button. Honours STARSHOT_LOCAL_PUBLISH: local
+    bakes the dollhouse to disk, otherwise it uploads to R2 + upserts D1."""
+    key = (run, slot, model)
+    job = _publish_jobs[key]
+    try:
+        if _LOCAL_PUBLISH:
+            job["target"] = "local"
+            rec = await publish_svc.publish_cell_local(RUNS_DIR, run, slot, model)
+        else:
+            job["target"] = "r2"
+            rec = await publish_svc.publish_cell(RUNS_DIR, run, slot, model)
+        job["result"] = rec
+        job["status"] = "done"
+    except Exception as exc:  # noqa: BLE001 - surfaced through the job status
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _publish_tasks.pop(key, None)
 
 
 def create_app() -> FastAPI:
@@ -4631,31 +4819,187 @@ def create_app() -> FastAPI:
         scenes = await asyncio.to_thread(publish_svc.list_local_scenes, RUNS_DIR)
         return {"scenes": scenes}
 
+    # --- tours index + on-demand publish -------------------------------------
+
+    def _publish_state(run: str, slot: str, model: str) -> dict[str, object]:
+        job = _publish_jobs.get((run, slot, model))
+        if job is None:
+            return {"running": False, "status": "idle", "error": None}
+        return {
+            "running": bool(job.get("running")),
+            "status": job.get("status"),
+            "error": job.get("error"),
+            "target": job.get("target"),
+        }
+
+    def _tour_row(run: str, slot: str, model: str) -> dict[str, object] | None:
+        """One tours-index row, or None when the cell has neither a planned nor a
+        captured tour. Read straight off disk, so it survives a server restart."""
+        cell = RUNS_DIR / run / slot / model
+        tour_dir = cell / "tour"
+        anchors_json = tour_dir / "anchors.json"
+        tour_json = tour_dir / "tour.json"
+        if not anchors_json.is_file() and not tour_json.is_file():
+            return None
+        planned = 0
+        if anchors_json.is_file():
+            try:
+                plan = json.loads(anchors_json.read_text(encoding="utf-8"))
+                planned = len(plan.get("anchors") or [])
+            except Exception:  # noqa: BLE001 - a torn plan just reads as 0
+                planned = 0
+        preview = cell / "published" / "scene-lite.glb"
+        stamp = max(
+            (p.stat().st_mtime for p in (anchors_json, tour_json) if p.is_file()),
+            default=0.0,
+        )
+        def iso(t: float) -> str:
+            return datetime.fromtimestamp(t).isoformat(timespec="seconds")
+
+        return {
+            "run": run,
+            "slot": slot,
+            "model": model,
+            "planned": planned,
+            "captured": tour_json.is_file(),
+            "panos": len(sorted(tour_dir.glob("*.jpg"))),
+            "minimaps": len(sorted(tour_dir.glob("minimap-*.png"))),
+            "proxy": (tour_dir / "proxy.glb").is_file(),
+            "published": preview.is_file(),
+            "published_at": iso(preview.stat().st_mtime) if preview.is_file() else None,
+            "updated_at": iso(stamp) if stamp else None,
+            "tour_url": _artifact_url(tour_json),
+            "publish": _publish_state(run, slot, model),
+        }
+
+    @app.get("/tours")
+    async def tours_index() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Every cell with a PLANNED or CAPTURED tour, newest first — the catalog
+        behind the tours page. Scans RUNS_DIR, so it reflects disk, not memory."""
+
+        def scan() -> list[dict[str, object]]:
+            rows: list[dict[str, object]] = []
+            if not RUNS_DIR.is_dir():
+                return rows
+            for run_dir in RUNS_DIR.iterdir():
+                if not run_dir.is_dir():
+                    continue
+                for slot_dir in run_dir.iterdir():
+                    if not slot_dir.is_dir():
+                        continue
+                    for model_dir in slot_dir.iterdir():
+                        if not model_dir.is_dir():
+                            continue
+                        row = _tour_row(run_dir.name, slot_dir.name, model_dir.name)
+                        if row is not None:
+                            rows.append(row)
+            rows.sort(key=lambda r: str(r.get("updated_at") or ""), reverse=True)
+            return rows
+
+        return {"tours": await asyncio.to_thread(scan), "local": _LOCAL_PUBLISH}
+
+    @app.post("/tours/{run}/{slot}/{model}/publish")
+    async def tour_publish_start(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Publish this cell NOW — the same work auto-publish does after a capture.
+        Bakes the dollhouse and (unless STARSHOT_LOCAL_PUBLISH) uploads to R2 +
+        upserts D1. Background job, so poll GET; idempotent while running."""
+        key = (run, slot, model)
+        existing = _publish_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        if not (RUNS_DIR / run / slot / model).is_dir():
+            raise HTTPException(404, f"no such cell: {run}/{slot}/{model}")
+        job: dict[str, Any] = {
+            "run": run, "slot": slot, "model": model,
+            "running": True, "status": "publishing", "error": None,
+            "target": "local" if _LOCAL_PUBLISH else "r2",
+            "result": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _publish_jobs[key] = job
+        _publish_tasks[key] = asyncio.create_task(_run_publish(run, slot, model))
+        return dict(job)
+
+    @app.get("/tours/{run}/{slot}/{model}/publish")
+    async def tour_publish_status(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Poll a publish: {running, status, target, result, error}."""
+        job = _publish_jobs.get((run, slot, model))
+        if job is not None:
+            return dict(job)
+        return {
+            "run": run, "slot": slot, "model": model,
+            "running": False, "status": "idle", "error": None,
+            "target": "local" if _LOCAL_PUBLISH else "r2",
+            "result": None, "started_at": None, "finished_at": None,
+        }
+
+    def _anchor_status(run: str, slot: str, model: str) -> dict[str, object]:
+        job = _anchor_jobs.get((run, slot, model))
+        if job is not None:
+            return dict(job)
+        # No live job — surface the SAVED plan when the cell has one, so a finished
+        # plan outlives the process that produced it and the client can discover it
+        # instead of re-planning.
+        plan = _load_anchor_plan(run, slot, model) or {}
+        saved = bool(plan)
+        return {
+            "run": run, "slot": slot, "model": model,
+            "running": False,
+            "status": "done" if saved else "idle",
+            "error": None,
+            "saved": saved,
+            "anchors": plan.get("anchors") or [],
+            "connectors": plan.get("connectors") or [],
+            "reasoning": plan.get("reasoning") or "",
+            "total": len(plan.get("anchors") or []),
+            "planner_model": plan.get("planner_model") or anchors_svc.ANCHOR_PLANNER_MODEL,
+            "namer_model": plan.get("namer_model") or anchors_svc.ANCHOR_NAMER_MODEL,
+            "started_at": None, "finished_at": None,
+        }
+
     @app.post("/slots/{slot_id}/{model_alias}/anchors")
-    async def slot_anchors(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        # Plan 360 capture anchors for this cell's scene with the fixed planner
-        # model. Read-only: reconstructs the Node tree from the cell's log.
+    async def slot_anchors_start(slot_id: str, model_alias: str, run: str | None = None, replan: bool = False) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Plan this cell's 360° anchors in the BACKGROUND and return the job. This
+        is the FIRST of the two independent walkthrough steps (plan, then capture):
+        the result is saved to tour/anchors.json, so a later capture just renders it.
+        Planning is one fixed-planner call PER ZONE (sequential, minutes each), so it
+        deliberately does NOT block the request — a client that gave up would
+        otherwise cancel it mid-plan. Poll GET for the result. A cell that already
+        has a saved plan returns it as-is unless `replan=true`, so minutes of LLM
+        time are never spent by accident. Read-only w.r.t. the cell's log."""
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
+        key = (run, slot_id, model_alias)
+        existing = _anchor_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        if not replan and _load_anchor_plan(run, slot_id, model_alias) is not None:
+            return _anchor_status(run, slot_id, model_alias)
         nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
         if not nodes:
             raise HTTPException(400, "scene has no placed nodes to plan anchors from")
-        try:
-            anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
-        except Exception as e:  # surface provider failures as 502
-            raise HTTPException(502, f"{type(e).__name__}: {e}") from e
-        return {
-            # `id` is the anchor's aggregate list index — the join key the namer
-            # echoed back; `name` is None for any anchor the namer skipped.
-            "anchors": [
-                {"id": i, "name": names.get(i), **a.model_dump()}
-                for i, a in enumerate(anchors)
-            ],
-            "connectors": [c.model_dump() for c in connectors],
-            "reasoning": reasoning,
-            "model": anchors_svc.ANCHOR_PLANNER_MODEL,
+        job: dict[str, Any] = {
+            "run": run, "slot": slot_id, "model": model_alias,
+            "running": True, "status": "pending", "error": None,
+            "anchors": [], "connectors": [], "reasoning": "", "total": 0,
+            "planner_model": anchors_svc.ANCHOR_PLANNER_MODEL,
             "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
         }
+        _anchor_jobs[key] = job
+        _anchor_tasks[key] = asyncio.create_task(
+            _run_anchor_plan(run, slot_id, model_alias, nodes)
+        )
+        return dict(job)
+
+    @app.get("/slots/{slot_id}/{model_alias}/anchors")
+    async def slot_anchors_status(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Poll the anchor plan: {running, status, total, anchors, connectors,
+        reasoning, error}."""
+        run = _resolve_run(run)
+        return _anchor_status(run, slot_id, model_alias)
 
     @app.post("/slots/{slot_id}/{model_alias}/tour/reset")
     async def tour_reset(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
@@ -4735,10 +5079,11 @@ def create_app() -> FastAPI:
         }
 
     @app.post("/slots/{slot_id}/{model_alias}/tour/capture")
-    async def tour_capture_start(slot_id: str, model_alias: str, request: Request, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        # Start the headless capture for this cell: plan anchors, launch the
-        # capture browser, render + upload panos/minimaps/proxy, write tour.json,
-        # and publish to R2/D1. Idempotent while running (returns the live job).
+    async def tour_capture_start(slot_id: str, model_alias: str, request: Request, run: str | None = None, replan: bool = False) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # Render this cell's walkthrough headlessly: reuse the saved anchor plan
+        # (planning only if there isn't one, or with ?replan=true), launch the
+        # capture browser, upload panos/minimaps/proxy, write tour.json, publish.
+        # Idempotent while running (returns the live job).
         run = _resolve_run(run)
         _require_slot_log(run, slot_id, model_alias)
         if _splat_source(run, slot_id, model_alias) is None:
@@ -4757,7 +5102,7 @@ def create_app() -> FastAPI:
         _tour_capture_jobs[key] = job
         api_origin, client_origin = _capture_origins(request)
         _tour_capture_tasks[key] = asyncio.create_task(
-            _run_tour_capture(run, slot_id, model_alias, api_origin, client_origin)
+            _run_tour_capture(run, slot_id, model_alias, api_origin, client_origin, replan)
         )
         return dict(job)
 
