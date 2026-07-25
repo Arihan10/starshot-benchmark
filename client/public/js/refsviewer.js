@@ -523,6 +523,13 @@ function syncPlaneButtons() {
     }
 }
 
+function syncSourceButtons() {
+    if (!state.sourceBtns) return;
+    for (const [key, btn] of Object.entries(state.sourceBtns)) {
+        btn.classList.toggle("on", key === state.source);
+    }
+}
+
 function setPlane(plane) {
     if (state.plane === plane) return;
     state.plane = plane;
@@ -648,6 +655,28 @@ function faceSeg(onPick) {
     return { seg, btns };
 }
 
+// Local (this machine's Stage 5) vs Modal (the remote trained splat's refs, read
+// off the Volume on demand). Toggling re-resolves the source and rebuilds the grid.
+function sourceSeg(onPick) {
+    const btns = {};
+    const seg = el("div", { class: "rfv-seg" });
+    const opts = [
+        ["local", "local", "reference frames rendered on this machine (local Stage 5)"],
+        ["modal", "modal", "reference frames pulled from Modal — the remote trained splat's training data"],
+    ];
+    for (const [key, label, title] of opts) {
+        const b = el("button", {
+            text: label,
+            title,
+            class: key === "local" ? "on" : "",
+            onclick: () => onPick(key),
+        });
+        btns[key] = b;
+        seg.appendChild(b);
+    }
+    return { seg, btns };
+}
+
 function ensureOverlay() {
     injectStyle();
     if (!overlayEl) {
@@ -676,6 +705,8 @@ function ensureOverlay() {
 // Build the whole DOM for a fresh session and stash the live refs on `state`.
 function buildUI(label) {
     const s = state;
+    const source = sourceSeg(setSource);
+    s.sourceBtns = source.btns;
     const plane = planeSeg(setPlane);
     const face = faceSeg(setFace);
     s.faceBtns = face.btns;
@@ -686,6 +717,8 @@ function buildUI(label) {
         { class: "rfv-bar" },
         el("span", { class: "rfv-title", text: "reference frames" }),
         el("span", { class: "rfv-sub", text: label || "" }),
+        el("span", { class: "rfv-lab", text: "source" }),
+        source.seg,
         el("span", { class: "rfv-lab", text: "plane" }),
         plane.seg,
         el("span", { class: "rfv-lab", text: "kind" }),
@@ -732,10 +765,99 @@ function buildUI(label) {
     s.root.replaceChildren(bar, el("div", { class: "rfv-body" }, s.grid, detail));
 }
 
+// --- source loading (local Stage 5 ⇄ Modal Volume) ----------------------------
+
+// Resolve a source to { refsBase, frames, near, far }, cached per source so a
+// toggle back is instant. `local` goes through the Stage-5 status API →
+// transforms.json on the artifact server; `modal` reads the remote transforms.json
+// straight off the Volume via the server proxy, and its per-frame SZFs stream from
+// the sibling `/frames/` proxy — fetched lazily, one per visible thumbnail, so the
+// several-thousand-frame remote set never downloads in bulk.
+async function resolveSource(source) {
+    const s = state;
+    if (s.resolved[source]) return s.resolved[source];
+    let transformsUrl;
+    let refsBase;
+    if (source === "modal") {
+        transformsUrl = api.modalRefsTransformsUrl(s.run, s.slot, s.model);
+        refsBase = api.modalRefsBase(s.run, s.slot, s.model);
+    } else {
+        const s5 = await api.splatStage5Status(s.run, s.slot, s.model);
+        if (s5.status !== "done" || !s5.url) {
+            throw new Error("no local references — render Stage 5 first");
+        }
+        transformsUrl = api.absUrl(s5.url);
+        refsBase = transformsUrl.replace(/transforms\.json(\?.*)?$/, "");
+    }
+    const res = await fetch(transformsUrl, { cache: "no-store" });
+    if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try {
+            const d = await res.json();
+            if (d && d.detail) detail = String(d.detail);
+        } catch {
+            /* non-JSON error body */
+        }
+        throw new Error(detail);
+    }
+    const doc = await res.json();
+    const frames = (doc.frames || []).filter((f) => f && f.frame_path);
+    if (!frames.length) throw new Error("no frames in transforms.json");
+    const resolved = {
+        refsBase,
+        frames,
+        near: Number(doc.near) || 0.01,
+        far: Number(doc.far) || 100,
+    };
+    s.resolved[source] = resolved;
+    return resolved;
+}
+
+// Switch the active source and rebuild the grid. Bumps `gen` so any in-flight
+// decodes/fetches from the previous source are dropped, and clears the raw/tile
+// caches (the two sources' frame URLs differ). A load failure keeps the toggle
+// live, so a cell with ONLY remote refs can still flip to `modal`.
+async function setSource(source) {
+    const s = state;
+    if (!s) return;
+    s.source = source;
+    syncSourceButtons();
+    s.gen++;
+    s.io?.disconnect();
+    s.pending.length = 0;
+    s.rawCache.clear();
+    s.liveTiles.clear();
+    if (s.view === "detail") closeDetail();
+    s.grid.replaceChildren();
+    s.countEl.textContent = source === "modal" ? "loading Modal refs…" : "loading…";
+    const gen = s.gen;
+    let resolved;
+    try {
+        resolved = await resolveSource(source);
+    } catch (e) {
+        if (state === s && s.gen === gen && s.source === source) {
+            s.frames = [];
+            s.detailOrder = [];
+            s.pageFrames = [];
+            s.countEl.textContent = e.message || "failed to load";
+            toast(`refs (${source}): ${e.message}`, "err");
+        }
+        return;
+    }
+    if (state !== s || s.gen !== gen || s.source !== source) return;
+    s.refsBase = resolved.refsBase;
+    s.frames = resolved.frames;
+    s.detailOrder = resolved.frames;
+    s.near = resolved.near;
+    s.far = resolved.far;
+    buildMatrix();
+}
+
 // --- public API ----------------------------------------------------------------
 
-// Open the reference-frame viewer for a cell. Resolves the Stage-5 output on its
-// own (via the status API → transforms.json), so callers only pass the cell.
+// Open the reference-frame viewer for a cell. Builds the shell immediately (so the
+// source toggle is live before anything loads), then loads the LOCAL source; the
+// `modal` toggle pulls the remote trained-splat frames on demand (paginated).
 export async function openRefsViewer({ run, slot, model, label } = {}) {
     if (!run || !slot || !model) return;
     if (state) {
@@ -747,58 +869,21 @@ export async function openRefsViewer({ run, slot, model, label } = {}) {
     }
     const root = ensureOverlay();
     root.classList.add("open");
-    root.replaceChildren(
-        el("div", { class: "rfv-bar" },
-            el("span", { class: "rfv-title", text: "reference frames" }),
-            el("span", { class: "rfv-sub", text: label || `${slot} · ${model}` }),
-            el("span", { class: "rfv-count", text: "loading…" }),
-            el("button", { class: "rfv-x", text: "✕ close", onclick: closeRefsViewer }),
-        ),
-    );
-
-    let s5;
-    try {
-        s5 = await api.splatStage5Status(run, slot, model);
-    } catch (e) {
-        toast(`refs: ${e.message}`, "err");
-        return closeRefsViewer();
-    }
-    if (!root.classList.contains("open")) return;
-    if (s5.status !== "done" || !s5.url) {
-        root.querySelector(".rfv-count").textContent =
-            "no references yet — render Stage 5 first";
-        return;
-    }
-
-    const transformsUrl = api.absUrl(s5.url);
-    const refsBase = transformsUrl.replace(/transforms\.json(\?.*)?$/, "");
-    let doc;
-    try {
-        doc = await fetch(transformsUrl, { cache: "no-store" }).then((r) => r.json());
-    } catch (e) {
-        toast(`refs: ${e.message}`, "err");
-        return closeRefsViewer();
-    }
-    if (!root.classList.contains("open")) return;
-
-    const frames = (doc.frames || []).filter((f) => f && f.frame_path);
-    if (!frames.length) {
-        root.querySelector(".rfv-count").textContent = "no frames in transforms.json";
-        return;
-    }
 
     state = {
         run,
         slot,
         model,
         root,
-        refsBase,
-        frames,
-        detailOrder: frames,
-        near: Number(doc.near) || 0.01,
-        far: Number(doc.far) || 100,
+        refsBase: "",
+        frames: [],
+        detailOrder: [],
+        near: 0.01,
+        far: 100,
         plane: "rgb",
         faceFilter: "all",
+        source: "local",
+        resolved: {}, // per-source cache: { refsBase, frames, near, far }
         view: "matrix",
         gen: 0,
         detailGen: 0,
@@ -811,12 +896,12 @@ export async function openRefsViewer({ run, slot, model, label } = {}) {
         rawCache: new Map(),
         liveTiles: new Map(),
         io: null,
-        pageFrames: frames,
+        pageFrames: [],
         rendered: 0,
         footer: null,
         scrollRaf: 0,
     };
     buildUI(label || `${slot} · ${model}`);
-    buildMatrix();
     syncPlaneButtons();
+    setSource("local");
 }

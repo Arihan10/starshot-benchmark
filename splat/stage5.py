@@ -181,7 +181,14 @@ LIGHTING: dict[str, Any] = {
 # shadow map is a fragment texture unit; WebGL guarantees only 16, so too many made
 # material shaders fail to link → black meshes on light-heavy scenes). Extra
 # emissive lights still illuminate without shadows.
-COLOR_PIPELINE = "linear-aces-srgb-v8"
+# v9: reflectivity is decided by a NAME discriminator (client reflective.js), not the
+# material scalars — Trellis writes metalness=roughness=1 on nearly every surface, so
+# the old scalar demotion couldn't tell a mirror from a wall. Only curated reflective
+# names (mirror/glass/water/polished metal/stone/screens) keep their PBR + a scene cube
+# probe; every other surface is forced fully matte (view-INDEPENDENT: metalness 0,
+# roughness 1, metallic-roughness maps nulled), so the sun + emissive lights no longer
+# paint moving highlights on ordinary walls/furniture that Stage-6 SH would have to chase.
+COLOR_PIPELINE = "linear-aces-srgb-v9"
 
 # Sidecar under a cell's refs/ recording the capture settings the on-disk frames
 # were rendered with, so a resume can detect a change (see `reconcile_capture_meta`).

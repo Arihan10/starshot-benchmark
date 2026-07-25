@@ -1,4 +1,4 @@
-"""Stage 4 — Camera planner (tight per-object shells + detail rings + root shell).
+"""Stage 4 — Camera planner (per-object shells + detail rings + root shell + interior flood-fill).
 
 Plans the single-shot reference cameras Stage 5 renders and the splat trainer
 consumes. WE OWN THE GEOMETRY, so the plan is built object-by-object from the
@@ -45,6 +45,16 @@ scene's own construction record instead of scattering undirected views:
   * SHELL — the root establishing orbit outside the scene AABB (unchanged):
     the far octave the ladders top out at, and the only supervision of
     whole-scene framings.
+  * FLOOD — an interior free-space fill STACKED on the balls (the resurrected
+    pre-per-object flood): a scene-scaled lattice of camera positions in
+    reachable EMPTY air, each firing Fibonacci look directions kept where they
+    see cover. It supervises the walls / floors / ceilings and the baked shadows
+    on them that the object-centric darts never frame.
+  * SWEEP — a targeted tiling of LARGE FLAT surfaces (ceiling / floor / walls /
+    big panels) from their interior side. A big flat's AABB diagonal is huge, so
+    its per-object standoff can't fit the room and its room-side darts get culled
+    — it would otherwise train into a cloud. The sweep grids the face and views
+    each cell perpendicular + oblique (parallax) at a room-fitted standoff.
 
 GEOMETRY STILL DISPOSES. Every candidate passes scene-agnostic filters
 against the Stage-2 grid: POSITION (outside the grid is provably open air;
@@ -164,11 +174,11 @@ class PlanParams:
     the guarantee survives the clamp). `ring_mults`/`ring_frac` are the
     multi-scale ring ladder — the train-time band-limit."""
 
-    coverage: float = 0.45
+    coverage: float = 0.6
     detail_px: float = 6.0
-    ball_min: int = 6
-    min_ball_views: int = 96
-    max_ball_views: int = 2000
+    ball_min: int = 8
+    min_ball_views: int = 128
+    max_ball_views: int = 3000
     # Base standoff: frame the object (`frac` × diag), floored so tiny props
     # aren't macro-photographed past their texture information. No upper
     # bound beyond the scene cap — when the space can't fit the distance the
@@ -182,6 +192,35 @@ class PlanParams:
     dedupe_spacing: float = 0.4
     # Root establishing orbit.
     shell_views: int = 128
+    # INTERIOR FLOOD-FILL (stacked on the balls): fill the reachable free space
+    # with look-around cameras for the wall / floor / ceiling + baked-shadow
+    # coverage the object-centric darts miss. The lattice cell scales with the
+    # scene (`flood_spacing_frac`·diag, floored by `flood_spacing_min`) so the
+    # cell COUNT is scene-size-stable; `flood_dirs` Fibonacci looks per cell;
+    # `flood_clear` is the min standoff from any surface (no jammed views); the
+    # two caps bound the layer on big scenes by deterministic subsample.
+    flood: bool = True
+    flood_spacing_frac: float = 0.05
+    flood_spacing_min: float = 0.6
+    flood_dirs: int = 24
+    flood_clear: float = 0.3
+    flood_max_positions: int = 512
+    flood_max_views: int = 512
+    # LARGE-FLAT SURFACE SWEEP (targeted, NOT a global density bump): a big flat
+    # target (ceiling / floor / wall / panel) has a huge AABB diagonal, so its
+    # per-object standoff can't fit the room and the room-side (looking-AT-it)
+    # darts get culled — it trains into a cloud. This tiles such a target's
+    # interior face from a room-fitted standoff at a perpendicular + two oblique
+    # angles (the parallax that triangulates floaters away). A target qualifies
+    # when its thinnest AABB axis ≤ `sweep_thin_max` and its face area ≥
+    # `sweep_area_min`; `sweep_max_views` bounds the layer (deterministic subsample).
+    sweep: bool = True
+    sweep_thin_max: float = 0.6
+    sweep_area_min: float = 3.0
+    sweep_spacing: float = 1.5
+    sweep_standoff: float = 1.5
+    sweep_oblique: float = 0.6
+    sweep_max_views: int = 512
     # Shared pinhole intrinsics (one FOV for every camera, square frames).
     fov_deg: float = 70.0
     render_resolution: int = 1024
@@ -200,6 +239,20 @@ class PlanParams:
             "ring_frac": list(self.ring_frac),
             "dedupe_spacing": self.dedupe_spacing,
             "shell_views": self.shell_views,
+            "flood": self.flood,
+            "flood_spacing_frac": self.flood_spacing_frac,
+            "flood_spacing_min": self.flood_spacing_min,
+            "flood_dirs": self.flood_dirs,
+            "flood_clear": self.flood_clear,
+            "flood_max_positions": self.flood_max_positions,
+            "flood_max_views": self.flood_max_views,
+            "sweep": self.sweep,
+            "sweep_thin_max": self.sweep_thin_max,
+            "sweep_area_min": self.sweep_area_min,
+            "sweep_spacing": self.sweep_spacing,
+            "sweep_standoff": self.sweep_standoff,
+            "sweep_oblique": self.sweep_oblique,
+            "sweep_max_views": self.sweep_max_views,
             "fov_deg": self.fov_deg,
             "render_resolution": self.render_resolution,
             "seed": self.seed,
@@ -682,6 +735,142 @@ def _shell_cameras(
     return pos, fwd
 
 
+def _flood_cameras(
+    fs: FreeSpace,
+    lo: np.ndarray,
+    hi: np.ndarray,
+    params: PlanParams,
+    scene_diag: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """INTERIOR FLOOD-FILL, stacked on the per-object balls: fill the reachable
+    free space with look-around cameras — the wall / floor / ceiling coverage
+    (and the BAKED shadows on them) the object-centric darts never frame. A
+    lattice over the scene AABB is culled to cells sitting in reachable EMPTY air
+    at least `flood_clear` from any surface (so no view is jammed against a wall);
+    each survivor fires `flood_dirs` Fibonacci directions, kept when the ray sees
+    cover somewhere in the scene (PRESENT — no BLOCKED test: a flood camera just
+    renders whatever it faces). The lattice cell scales with the scene so the cell
+    COUNT is scene-size-stable, and two caps bound the layer by deterministic
+    subsample. Returns (positions, forwards)."""
+    if not params.flood:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    spacing = max(params.flood_spacing_min, params.flood_spacing_frac * scene_diag)
+    axes = [np.arange(lo[i] + spacing / 2.0, hi[i], spacing) for i in range(3)]
+    if any(a.size == 0 for a in axes):
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    gx, gy, gz = np.meshgrid(axes[0], axes[1], axes[2], indexing="ij")
+    grid = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)
+
+    # Positions in reachable EMPTY air, clear of any surface by `flood_clear` — so
+    # every emitted view frames content from at least that far (never jammed).
+    pos0 = grid[_clear_at(fs, grid, params.flood_clear)]
+    if pos0.shape[0] == 0:
+        return np.zeros((0, 3)), np.zeros((0, 3))
+    if pos0.shape[0] > params.flood_max_positions:
+        sel = np.unique(
+            np.linspace(0, pos0.shape[0] - 1, params.flood_max_positions).astype(np.int64)
+        )
+        pos0 = pos0[sel]
+
+    dirs = _fib_sphere(max(int(params.flood_dirs), 1))
+    pos = np.repeat(pos0, len(dirs), axis=0)
+    fwd = np.tile(dirs, (pos0.shape[0], 1))
+
+    # PRESENT: some cover (opaque or glass) along the ray within the scene.
+    t_max = np.full(pos.shape[0], scene_diag + 2.0, dtype=np.float64)
+    _, any_hit = _ray_probe(fs, pos, fwd, t_max)
+    keep = np.isfinite(any_hit)
+    pos, fwd = pos[keep], fwd[keep]
+    if pos.shape[0] > params.flood_max_views:
+        sel = np.unique(
+            np.linspace(0, pos.shape[0] - 1, params.flood_max_views).astype(np.int64)
+        )
+        pos, fwd = pos[sel], fwd[sel]
+    return pos, fwd
+
+
+def _surface_sweep_cameras(
+    fs: FreeSpace,
+    targets: list[Target],
+    lo: np.ndarray,
+    hi: np.ndarray,
+    params: PlanParams,
+    scene_diag: float,
+    culls: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Tile LARGE FLAT targets (ceiling / floor / walls / big panels) from their
+    INTERIOR side — the coverage the omnidirectional per-object darts fail to
+    place on a big overhead or vertical plane. Such a target's AABB diagonal is
+    huge, so `standoff_frac`·diag can't fit the room and every room-side
+    (looking-AT-the-surface) dart is culled, leaving the plane to train into a
+    cloud. A target qualifies when its thinnest axis ≤ `sweep_thin_max` and its
+    face area ≥ `sweep_area_min`; each air-facing side is gridded at
+    `sweep_spacing` and every cell viewed from `sweep_standoff` at a perpendicular
+    + two oblique angles (`sweep_oblique` gives the parallax that triangulates the
+    floaters away). Validated by the shared ball filter (culls fold into the
+    shared tally); capped by deterministic subsample."""
+    if not params.sweep:
+        return []
+    d = min(params.sweep_standoff, max(_RING_SCENE_CAP * scene_diag, params.standoff_min))
+    ob = params.sweep_oblique
+    cams: list[dict[str, Any]] = []
+    for t in targets:
+        size = t.hi - t.lo
+        a = int(np.argmin(size))
+        b, c = [i for i in range(3) if i != a]
+        if size[a] > params.sweep_thin_max or size[b] * size[c] < params.sweep_area_min:
+            continue
+        nb = max(2, int(np.ceil(size[b] / params.sweep_spacing)))
+        nc = max(2, int(np.ceil(size[c] / params.sweep_spacing)))
+        gb = t.lo[b] + (np.arange(nb) + 0.5) * (size[b] / nb)
+        gc = t.lo[c] + (np.arange(nc) + 0.5) * (size[c] / nc)
+        GB, GC = np.meshgrid(gb, gc, indexing="ij")
+        surf = np.zeros((GB.size, 3))
+        surf[:, a] = (t.lo[a] + t.hi[a]) / 2.0
+        surf[:, b] = GB.ravel()
+        surf[:, c] = GC.ravel()
+        eb = np.zeros(3); eb[b] = 1.0
+        ec = np.zeros(3); ec[c] = 1.0
+        # A BOUNDARY flat (ceiling / floor / outer wall — its face sits at the
+        # scene AABB bound on axis `a`) is swept only from its INWARD side; the
+        # outward side is the exterior roof / sub-floor / outside that no interior
+        # viewer sees (and, being open air, would otherwise pass the reachability
+        # gate and waste budget). An INTERIOR flat (a freestanding partition) is
+        # swept from both air-facing sides.
+        margin = max(0.5, size[a] * 2.0)
+        near_hi = bool(t.hi[a] >= hi[a] - margin)
+        near_lo = bool(t.lo[a] <= lo[a] + margin)
+        if near_hi and not near_lo:
+            sides = (-1.0,)
+        elif near_lo and not near_hi:
+            sides = (1.0,)
+        else:
+            sides = (1.0, -1.0)
+        for s in sides:
+            n = np.zeros(3); n[a] = s
+            # skip a side with no reachable air at the camera standoff distance
+            if not fs.empty_at(surf + n * (size[a] * 0.5 + d)).any():
+                continue
+            base = surf + n * (size[a] * 0.5)  # the visible face points
+            for off_b, off_c in ((0.0, 0.0), (ob, 0.0), (0.0, ob)):
+                pos = base + n * d + eb * (off_b * d) + ec * (off_c * d)
+                fwd = base - pos
+                fwd = fwd / np.linalg.norm(fwd, axis=1, keepdims=True)
+                d_eff = d * float(np.sqrt(1.0 + off_b * off_b + off_c * off_c))
+                good = _valid_ball_views(fs, d_eff, pos, fwd, culls)
+                for k in good:
+                    cams.append({
+                        "pos": pos[k], "forward": fwd[k],
+                        "kind": "sweep", "zone": t.zone, "target": t.id,
+                    })
+    if len(cams) > params.sweep_max_views:
+        sel = np.unique(
+            np.linspace(0, len(cams) - 1, params.sweep_max_views).astype(np.int64)
+        )
+        cams = [cams[i] for i in sel]
+    return cams
+
+
 def _up_for(forward: np.ndarray) -> np.ndarray:
     """A non-degenerate image-up per forward direction: world +Y, except near
     the poles where ±Z takes over (straight-down lawn views stay well-posed)."""
@@ -747,6 +936,26 @@ def plan_cameras(
     for p, d in zip(shell_pos, shell_fwd):
         cams.append({"pos": p, "forward": d, "kind": "shell", "zone": None})
 
+    # 3) FLOOD — interior free-space look-around cameras STACKED on the balls +
+    # shell: the wall / floor / ceiling + baked-shadow coverage the object-centric
+    # darts never frame (module docstring).
+    flood_pos = np.zeros((0, 3))
+    if params.flood:
+        if progress is not None:
+            progress(0, 0, "flood")
+        flood_pos, flood_fwd = _flood_cameras(fs, lo, hi, params, scene_diag)
+        for p, d in zip(flood_pos, flood_fwd):
+            cams.append({"pos": p, "forward": d, "kind": "flood", "zone": None})
+
+    # 4) SWEEP — tile LARGE FLAT surfaces (ceiling / floor / walls / panels) from
+    # their interior side: the coverage the omnidirectional per-object darts fail
+    # to place on a big overhead / vertical plane (module docstring). Reuses the
+    # ball validity filter; its culls fold into the shared tally.
+    if progress is not None and params.sweep:
+        progress(0, 0, "sweep")
+    sweep_cams = _surface_sweep_cameras(fs, targets, lo, hi, params, scene_diag, culls)
+    cams.extend(sweep_cams)
+
     fwd_all = np.asarray([c["forward"] for c in cams], dtype=np.float64)
     up_all = _up_for(fwd_all) if len(cams) else np.zeros((0, 3))
 
@@ -784,7 +993,12 @@ def plan_cameras(
         "model": model,
         "cameras": len(cams),
         "views": len(cams),  # one shot per camera — kept for status parity
-        "kinds": {"ball": len(ball_cams), "shell": int(len(shell_pos))},
+        "kinds": {
+            "ball": len(ball_cams),
+            "shell": int(len(shell_pos)),
+            "flood": int(len(flood_pos)),
+            "sweep": len(sweep_cams),
+        },
         "targets": {
             "total": len(targets),
             "framed": len(framed),

@@ -19,6 +19,8 @@ dependencies = [
     "google-genai>=1.0",
     "scipy>=1.18.0",
     "modal>=1.5.2",
+    # services/r2.py: S3-compatible uploads to the Cloudflare R2 bucket (lazy import)
+    "boto3>=1.43.29",
     "zstandard>=0.23 ; python_full_version < '3.14'",
     # splat/assets.py: in-process EXT_meshopt_compression decode (no de-opt step)
     "meshoptimizer>=0.2.20",

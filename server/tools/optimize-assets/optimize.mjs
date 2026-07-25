@@ -63,6 +63,7 @@ import { NodeIO, Logger } from "@gltf-transform/core";
 import { ALL_EXTENSIONS } from "@gltf-transform/extensions";
 import {
   dedup,
+  dequantize,
   weld,
   simplify,
   prune,
@@ -123,6 +124,7 @@ function parseArgs(argv) {
     force: false,
     pngs: true,
     limit: Infinity,
+    proxy: false,
   };
   // Tuning knobs default to the chosen preset's value; an explicit flag wins.
   const override = {};
@@ -147,6 +149,9 @@ function parseArgs(argv) {
       case "--limit": opts.limit = Number(next()); break;
       case "--force": opts.force = true; break;
       case "--no-pngs": opts.pngs = false; break;
+      // Geometry-only decimation for a projection proxy: skip all texture work,
+      // strip materials, and emit a plain (un-meshopt) GLB any GLTFLoader reads.
+      case "--proxy": opts.proxy = true; break;
       default:
         throw new Error(`unknown argument: ${arg}`);
     }
@@ -216,6 +221,23 @@ async function optimizeFile(io, inPath, outPath, opts) {
   const srcTris = triangleCount(document);
   const ratio = Math.min(1, opts.targetTris / Math.max(1, srcTris));
 
+  // Projection proxy (--proxy): strip materials + every non-POSITION attribute
+  // UP FRONT. The proxy is re-textured by reprojecting the panos and gets fresh
+  // normals in the viewer, so it needs geometry only — and dropping UV/normal
+  // seams is what lets the simplifier actually reach a low triangle budget
+  // (attribute discontinuities otherwise lock most edges, plateauing ~half the
+  // source).
+  if (opts.proxy) {
+    for (const mesh of document.getRoot().listMeshes()) {
+      for (const prim of mesh.listPrimitives()) {
+        prim.setMaterial(null);
+        for (const semantic of prim.listSemantics()) {
+          if (semantic !== "POSITION") prim.setAttribute(semantic, null);
+        }
+      }
+    }
+  }
+
   // Unlit tiers (preset splat) keep only base color + alpha: detach the other
   // PBR maps up front so the prune() below drops their textures before the
   // (expensive) resize + KTX2 encode ever sees them.
@@ -228,17 +250,31 @@ async function optimizeFile(io, inPath, outPath, opts) {
     }
   }
 
-  await document.transform(
-    dedup(),
-    weld(),
-    simplify({ simplifier: MeshoptSimplifier, ratio, error: opts.error }),
-    prune(),
-  );
+  const simplifyOpts = { simplifier: MeshoptSimplifier, ratio, error: opts.error };
+  // Proxy: keep open boundaries pinned so floor/wall perimeters and the open
+  // edges of non-watertight Trellis shells can't collapse inward into gaps.
+  if (opts.proxy) simplifyOpts.lockBorder = true;
+
+  await document.transform(dedup(), weld(), simplify(simplifyOpts), prune());
 
   // Measure on un-quantized geometry; meshopt quantization would shift bounds
   // by sub-millimetre amounts, well under the rescale step's 1e-3 tolerance.
   const outTris = triangleCount(document);
   const bounds = sceneBounds(document);
+
+  // Proxy: emit a PLAIN GLB regardless of how the source was compressed — undo
+  // quantization and detach any geometry/texture-compression extensions so the
+  // /pano walkthrough loads it with a bare GLTFLoader (no Meshopt/KTX2/Draco).
+  if (opts.proxy) {
+    await document.transform(dequantize());
+    for (const ext of document.getRoot().listExtensionsUsed()) {
+      if (/meshopt|quantization|basisu|draco/i.test(ext.extensionName)) {
+        ext.dispose();
+      }
+    }
+    await io.write(outPath, document);
+    return { srcTris, outTris, bounds };
+  }
 
   // Downscale every texture, then (default) re-encode to GPU-compressed KTX2.
   // For the KTX2 path the resize target is lossless PNG so ETC1S isn't stacked

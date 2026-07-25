@@ -434,6 +434,24 @@ def pull_samples(cell_dir: Path) -> list[str]:
     return sorted(p.name for p in local.glob("*.png"))
 
 
+def read_cell_artifact(run: str, slot: str, model: str, relpath: str) -> bytes:
+    """Read ONE file from a cell's `splat/` dir on the Volume → bytes (e.g.
+    `refs/transforms.json` or `refs/frames/cam00001_ball.szf`). Lets the server
+    stream remote reference frames to the debug viewer ON DEMAND — one SZF per
+    request — WITHOUT syncing the thousands of frames locally (refs otherwise
+    never leave the datacenter). Raises FileNotFoundError when the file is absent
+    on the Volume (the caller maps that to a 404)."""
+    rel = str(relpath).strip("/")
+    if not rel or ".." in rel.split("/"):
+        raise ValueError(f"illegal artifact relpath: {relpath!r}")
+    remote = f"cells/{run}/{slot}/{model}/splat/{rel}"
+    vol = _volume()
+    try:
+        return b"".join(vol.read_file(remote))
+    except Exception as exc:  # missing file / volume error → 404 upstream
+        raise FileNotFoundError(remote) from exc
+
+
 def pull_cell(cell_dir: Path, include_ply: bool = True, quiet: bool = False) -> list[str]:
     """Download the run's artifacts into the local `splat/` dir: plan + status
     + every `.sqz`, plus the plys unless `include_ply` is off — the RAW Stage-6

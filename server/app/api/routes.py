@@ -24,6 +24,7 @@ import asyncio
 import contextlib
 import difflib
 import json
+import logging
 import os
 import re
 import secrets
@@ -31,6 +32,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import time
 from collections import deque
 from urllib.parse import quote
@@ -43,7 +45,7 @@ from typing import Any, Literal
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from app.core import prompt_store, scene_context, schemas
@@ -59,7 +61,10 @@ from app.core.slots import (
 )
 from app.core.types import BoundingBox, Node, Orientation, ProxyShape
 from app.pipeline import committed, divider, generation, object_wipe
+from app.services import anchors as anchors_svc
 from app.services import llm, prefabs, refcapture, threed
+from app.services import proxy as proxy_svc
+from app.services import publish as publish_svc
 from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
@@ -134,6 +139,49 @@ def _capture_origins(request: Request | None) -> tuple[str, str]:
 # "objects" for any cell that hasn't been migrated.
 OBJECTS_SUBDIR = os.environ.get("STARSHOT_OBJECTS_SUBDIR", "objects")
 
+# Best-effort auto-publish: once a headless tour capture finalizes, push the
+# cell's preview (vertex-colored dollhouse) + tour (panos + proxy + minimaps) to
+# Cloudflare R2 and upsert the D1 catalog in the background so the prod client
+# (prod_client/) sees the new scene. Detached from the request, and failures
+# (missing R2/D1 creds, network) are only logged — they never block capture. A
+# live task set keeps references so the GC can't drop a publish mid-flight.
+_autopublish_log = logging.getLogger("starshot.autopublish")
+_autopublish_tasks: set[asyncio.Task[None]] = set()
+
+# LOCAL (no-Cloudflare) mode: bake the dollhouse + serve the tour artifacts straight
+# off disk (via /artifacts) instead of uploading to R2 / cataloging in D1 — so the
+# whole matterport delivery can run offline for testing (point the prod client at
+# this server with NEXT_PUBLIC_LOCAL_API). The `/tour/scenes` catalog reads disk
+# regardless of this flag; it only switches the auto-publish from R2/D1 to a local
+# bake, so no Cloudflare credentials are ever needed.
+_LOCAL_PUBLISH = os.environ.get("STARSHOT_LOCAL_PUBLISH", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
+
+async def _auto_publish_cell(run: str, slot: str, model: str) -> None:
+    try:
+        if _LOCAL_PUBLISH:
+            rec = await publish_svc.publish_cell_local(RUNS_DIR, run, slot, model)
+            _autopublish_log.info(
+                "locally published %s/%s/%s (%s panos)", run, slot, model, rec.get("pano_count")
+            )
+        else:
+            rec = await publish_svc.publish_cell(RUNS_DIR, run, slot, model)
+            _autopublish_log.info(
+                "published %s/%s/%s (%s panos)", run, slot, model, rec["pano_count"]
+            )
+    except Exception as e:  # noqa: BLE001 - best-effort; never fail capture on publish
+        _autopublish_log.warning(
+            "publish failed for %s/%s/%s: %s: %s", run, slot, model, type(e).__name__, e
+        )
+
+
+def _schedule_auto_publish(run: str, slot: str, model: str) -> None:
+    task = asyncio.create_task(_auto_publish_cell(run, slot, model))
+    _autopublish_tasks.add(task)
+    task.add_done_callback(_autopublish_tasks.discard)
+
 # Per-cell (run × slot × model) LLM spend cap, in USD — the DEFAULT ceiling a
 # cell starts with. When a cell's settled OpenRouter spend crosses its effective
 # cap the backfill sweep auto-pauses it ("spend cap reached"); it stays there
@@ -149,6 +197,10 @@ SPEND_CAP_USD = float(os.environ.get("STARSHOT_SPEND_CAP_USD", "200"))
 _ARTIFACT_MEDIA_TYPES = {
     ".glb": "model/gltf-binary",
     ".gltf": "model/gltf+json",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png": "image/png",
+    ".json": "application/json",
     # Stage-2 Gaussian clouds + Stage-3 free-voxel packs — raw bytes the splat
     # viewer fetches (.ply cloud, .bin voxel field).
     ".ply": "application/octet-stream",
@@ -3383,6 +3435,153 @@ async def _run_splat_stage5_cell(
         _splat_stage5_tasks.pop(key, None)
 
 
+# --- tour capture (headless matterport walkthrough) --------------------------
+# The prod matterport walkthrough (prod_client/) needs, per cell: 360° panoramas
+# at LLM-planned anchor points, bird's-eye minimap slices, and a low-poly
+# projection proxy. These USED to be rendered client-side in the interactive
+# viewer (an operator drove the camera to each anchor). This captures them the
+# SAME way Stage 5 renders its references — a headless browser
+# (client/public/tourcapture.html) running the shared LIT WebGL stack against the
+# cell's mesh tier, driven over plain HTTP — so capture is server-side, GPU-fast,
+# and high-resolution, with no operator. The page uploads each artifact as it is
+# produced and POSTs the tour manifest; the /finish endpoint writes tour.json and
+# schedules the R2/D1 publish.
+_tour_capture_jobs: dict[tuple[str, str, str], dict[str, Any]] = {}
+_tour_capture_state: dict[tuple[str, str, str], dict[str, Any]] = {}
+_tour_capture_tasks: dict[tuple[str, str, str], asyncio.Task[None]] = {}
+
+# Overall wall-clock budget for one cell's capture, and the max quiet gap (no
+# pano/minimap/proxy landing and no heartbeat) before the session is judged
+# stalled — the first frame includes the scene load + shadow/reflection bakes, so
+# this is generous.
+_TOUR_CAPTURE_TIMEOUT_S = float(os.environ.get("STARSHOT_TOUR_CAPTURE_TIMEOUT", "1800"))
+_TOUR_CAPTURE_STALL_S = float(os.environ.get("STARSHOT_TOUR_CAPTURE_STALL", "300"))
+
+
+def _cell_tour_dir(run: str, slot: str, model: str) -> Path:
+    """Where a cell's captured walkthrough lands (panos + minimaps + proxy +
+    tour.json) — the exact set services/publish.py uploads to R2."""
+    return _slot_dir(run, slot, model) / "tour"
+
+
+def _tour_bundle_url(run: str, slot: str, model: str) -> str:
+    """The mesh bundle the capture page loads: the cell's selected splat tier —
+    the highest-quality generated build available (lite → optimized → raw), else
+    the library set — streamed UNfiltered exactly as the splat stages read it, so
+    the panos render precisely the composed scene."""
+    return (
+        f"/slots/{quote(slot, safe='')}/{quote(model, safe='')}/meshes"
+        f"?run={quote(run, safe='')}&variant=splat"
+    )
+
+
+def _tour_beat(run: str, slot: str, model: str) -> None:
+    """Mark capture progress for a live session (each uploaded artifact is a
+    heartbeat), so the supervisor's stall timer only fires on a truly quiet wire."""
+    st = _tour_capture_state.get((run, slot, model))
+    if st is not None:
+        st["last_beat"] = time.monotonic()
+
+
+async def _run_tour_capture(
+    run: str, slot: str, model: str, api_origin: str, client_origin: str
+) -> None:
+    """Supervise ONE cell's headless matterport capture: plan the 360° anchors,
+    launch the capture browser at the worker page, and watch the session the
+    capture manifest/beat/finish endpoints drive until it finishes (or stalls /
+    dies). The page renders + uploads the panos/minimaps/proxy and POSTs the tour
+    manifest through /finish, which writes tour.json and schedules the publish.
+    `api_origin`/`client_origin` come from `_capture_origins` at start time."""
+    key = (run, slot, model)
+    job = _tour_capture_jobs[key]
+    proc = None
+    profile = None
+    try:
+        job["phase"] = "plan"
+        slot_log = _require_slot_log(run, slot, model)
+        if _splat_source(run, slot, model) is None:
+            raise RuntimeError("cell has no meshes to capture (generate the scene first)")
+        nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
+        if not nodes:
+            raise RuntimeError("scene has no placed nodes to plan anchors from")
+        anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
+        if not anchors:
+            raise RuntimeError("anchor planner returned no anchors")
+        anchor_dicts = [
+            {"id": f"anchor-{i:03d}", "name": names.get(i), **a.model_dump()}
+            for i, a in enumerate(anchors)
+        ]
+        job["total"] = len(anchor_dicts)
+
+        # Fresh tour dir — supersede any prior capture for this cell.
+        tour_dir = _cell_tour_dir(run, slot, model)
+        await asyncio.to_thread(shutil.rmtree, tour_dir, True)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+
+        token = secrets.token_urlsafe(16)
+        state: dict[str, Any] = {
+            "token": token,
+            "bundle_url": _tour_bundle_url(run, slot, model),
+            "lighting": splat_stage5.LIGHTING,
+            "background": list(splat_stage5.BACKGROUND_RGB),
+            "anchors": anchor_dicts,
+            "connectors": [c.model_dump() for c in connectors],
+            "planner_model": anchors_svc.ANCHOR_PLANNER_MODEL,
+            "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
+            "planner_reasoning": reasoning,
+            "finished": asyncio.Event(),
+            "client_error": None,
+            "renderer": None,
+            "summary": None,
+            "last_beat": time.monotonic(),
+        }
+        _tour_capture_state[key] = state
+
+        capture_url = (
+            f"{client_origin}/tourcapture.html?api={quote(api_origin, safe='')}"
+            f"&run={quote(run, safe='')}&slot={quote(slot, safe='')}"
+            f"&model={quote(model, safe='')}&token={token}"
+        )
+        job["capture_url"] = capture_url
+        job["phase"] = "render"
+        proc, profile = refcapture.launch_capture_browser(capture_url)
+
+        start = time.monotonic()
+        while not state["finished"].is_set():
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(state["finished"].wait(), timeout=5.0)
+                break
+            now = time.monotonic()
+            if proc.poll() is not None and now - state["last_beat"] > 30.0:
+                raise RuntimeError(
+                    f"capture browser exited (code {proc.returncode}) before finishing — "
+                    f"open {capture_url} in a normal browser to render manually"
+                )
+            if now - state["last_beat"] > _TOUR_CAPTURE_STALL_S:
+                raise RuntimeError(
+                    f"tour capture stalled ({int(now - state['last_beat'])}s without progress) "
+                    f"— check the headless browser's GPU/WebGL, or open {capture_url} manually"
+                )
+            if now - start > _TOUR_CAPTURE_TIMEOUT_S:
+                raise RuntimeError(f"tour capture timed out after {int(now - start)}s")
+        if state["client_error"]:
+            raise RuntimeError(f"capture page: {state['client_error']}")
+
+        job["phase"] = "done"
+        job["status"] = "done"
+        job["renderer"] = state["renderer"]
+        job["summary"] = state["summary"]
+    except Exception as exc:  # noqa: BLE001 - surfaced through the job status
+        job["status"] = "error"
+        job["error"] = f"{type(exc).__name__}: {exc}"
+    finally:
+        refcapture.terminate_browser(proc, profile)
+        _tour_capture_state.pop(key, None)
+        job["running"] = False
+        job["finished_at"] = datetime.now().isoformat(timespec="seconds")
+        _tour_capture_tasks.pop(key, None)
+
+
 def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -4252,6 +4451,45 @@ def create_app() -> FastAPI:
             "total": len(state["views"]),
         }
 
+    # --- Modal-hosted reference frames (browse remote refs without syncing) ------
+    # A cell trained on Modal keeps its Stage-5 refs on the Volume (thousands of SZF
+    # frames that never sync locally). These two endpoints let the refs viewer's
+    # "modal" toggle read them ON DEMAND: the transforms.json once, then one SZF per
+    # thumbnail as it scrolls into view — so the several-thousand-frame set is never
+    # downloaded in bulk.
+    @app.get("/runs/{run}/splat/modal-refs/{slot}/{model}/transforms.json")
+    async def splat_modal_refs_transforms(run: str, slot: str, model: str):  # pyright: ignore[reportUnusedFunction]
+        """The Modal-hosted Stage-5 `transforms.json`, read straight off the Volume."""
+        if splat_modal is None:
+            raise HTTPException(status_code=503, detail="Modal client not configured on this server")
+        try:
+            data = await asyncio.to_thread(
+                splat_modal.read_cell_artifact, run, slot, model, "refs/transforms.json"
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail="no remote references — run Stage 5 on Modal first")
+        except Exception as e:  # noqa: BLE001 - surface volume/credential errors as 502
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+        return Response(content=data, media_type="application/json")
+
+    @app.get("/runs/{run}/splat/modal-refs/{slot}/{model}/frames/{name}")
+    async def splat_modal_refs_frame(run: str, slot: str, model: str, name: str):  # pyright: ignore[reportUnusedFunction]
+        """One Modal-hosted SZF reference frame, streamed from the Volume on demand
+        (raw `.szf` bytes; the client decodes them). One fetch per visible thumbnail."""
+        if splat_modal is None:
+            raise HTTPException(status_code=503, detail="Modal client not configured on this server")
+        if "/" in name or "\\" in name or ".." in name or not name.endswith(".szf"):
+            raise HTTPException(status_code=400, detail="bad frame name")
+        try:
+            data = await asyncio.to_thread(
+                splat_modal.read_cell_artifact, run, slot, model, f"refs/frames/{name}"
+            )
+        except FileNotFoundError:
+            raise HTTPException(status_code=404, detail=f"no such remote frame: {name}")
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"{type(e).__name__}: {e}")
+        return Response(content=data, media_type="application/octet-stream")
+
     @app.post("/runs/{run}/splat/stage5/{slot}/{model}/frames")
     async def splat_stage5_frames(run: str, slot: str, model: str, request: Request, token: str = "") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
         """Ingest one binary SRF1 frame batch (optionally gzip-wrapped as SZC1) from
@@ -4356,6 +4594,258 @@ def create_app() -> FastAPI:
             state["finished"].set()
         missing = len(state["pending"])
         return {"ok": missing == 0 and not state["encode_errors"], "missing": missing}
+
+    # --- matterport tour capture (headless) ----------------------------------
+    # The prod walkthrough's per-cell artifacts — 360 panoramas, bird's-eye
+    # minimap slices, and a low-poly projection proxy — are captured by a headless
+    # browser running the shared LIT stack (see _run_tour_capture). These endpoints
+    # are (a) the persistence sinks the capture page uploads to, (b) the
+    # start/status controls, and (c) the page's token-authed manifest/beat/finish
+    # protocol. Finalizing writes tour.json and schedules the R2/D1 publish that
+    # the prod client (prod_client/) reads.
+
+    @app.post("/proxy")
+    async def build_scene_proxy(request: Request) -> Response:  # pyright: ignore[reportUnusedFunction]
+        # Decimate a merged, world-space scene GLB into a geometry-only low-poly
+        # proxy for the /pano walkthrough's projection mode. Stateless: bytes in,
+        # smaller bytes out.
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty request body (expected a binary GLB)")
+        with tempfile.TemporaryDirectory(prefix="proxy-") as td:
+            src = Path(td) / "scene.glb"
+            dst = Path(td) / "proxy.glb"
+            src.write_bytes(body)
+            try:
+                await proxy_svc.build_proxy(src, dst)
+            except Exception as e:  # surface decimation failures as 502
+                raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+            data = dst.read_bytes()
+        return Response(content=data, media_type="model/gltf-binary")
+
+    @app.get("/tour/scenes")
+    async def tour_scenes() -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Local (no-Cloudflare) scene catalog — the on-disk twin of the D1 `scenes`
+        table the prod client reads. Lists every cell whose dollhouse is baked, with
+        artifact-relative keys the client resolves against /artifacts. For local
+        testing, point the prod client here (NEXT_PUBLIC_LOCAL_API) so it reads
+        scenes + assets straight off this server with no R2/D1."""
+        scenes = await asyncio.to_thread(publish_svc.list_local_scenes, RUNS_DIR)
+        return {"scenes": scenes}
+
+    @app.post("/slots/{slot_id}/{model_alias}/anchors")
+    async def slot_anchors(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # Plan 360 capture anchors for this cell's scene with the fixed planner
+        # model. Read-only: reconstructs the Node tree from the cell's log.
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
+        if not nodes:
+            raise HTTPException(400, "scene has no placed nodes to plan anchors from")
+        try:
+            anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
+        except Exception as e:  # surface provider failures as 502
+            raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+        return {
+            # `id` is the anchor's aggregate list index — the join key the namer
+            # echoed back; `name` is None for any anchor the namer skipped.
+            "anchors": [
+                {"id": i, "name": names.get(i), **a.model_dump()}
+                for i, a in enumerate(anchors)
+            ],
+            "connectors": [c.model_dump() for c in connectors],
+            "reasoning": reasoning,
+            "model": anchors_svc.ANCHOR_PLANNER_MODEL,
+            "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/tour/reset")
+    async def tour_reset(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        tour_dir = _cell_tour_dir(run, slot_id, model_alias)
+        shutil.rmtree(tour_dir, ignore_errors=True)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        return {"ok": True}
+
+    @app.put("/slots/{slot_id}/{model_alias}/tour/pano/{pano_id}")
+    async def tour_pano(slot_id: str, model_alias: str, pano_id: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty pano body")
+        tour_dir = _cell_tour_dir(run, slot_id, model_alias)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(pano_id).name  # defend against path traversal
+        (tour_dir / f"{stem}.jpg").write_bytes(body)
+        _tour_beat(run, slot_id, model_alias)
+        return {"ok": True}
+
+    @app.put("/slots/{slot_id}/{model_alias}/tour/minimap/{minimap_id}")
+    async def tour_minimap(slot_id: str, model_alias: str, minimap_id: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        # One top-down bird's-eye slice per Y level, stored beside the panos as a
+        # PNG (distinct from the `*.jpg` pano glob the publisher reads).
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty minimap body")
+        tour_dir = _cell_tour_dir(run, slot_id, model_alias)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(minimap_id).name  # defend against path traversal
+        (tour_dir / f"{stem}.png").write_bytes(body)
+        _tour_beat(run, slot_id, model_alias)
+        return {"ok": True}
+
+    @app.post("/slots/{slot_id}/{model_alias}/tour/proxy")
+    async def tour_proxy(slot_id: str, model_alias: str, request: Request, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        # Body is the capture page's merged, world-space scene GLB; decimate it
+        # into the stored proxy.glb via the same pass the /proxy route uses.
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        body = await request.body()
+        if not body:
+            raise HTTPException(400, "empty scene body")
+        tour_dir = _cell_tour_dir(run, slot_id, model_alias)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix="tourproxy-") as td:
+            src = Path(td) / "scene.glb"
+            src.write_bytes(body)
+            try:
+                await proxy_svc.build_proxy(src, tour_dir / "proxy.glb")
+            except Exception as e:
+                raise HTTPException(502, f"{type(e).__name__}: {e}") from e
+        _tour_beat(run, slot_id, model_alias)
+        return {"ok": True}
+
+    def _tour_capture_status(run: str, slot: str, model: str) -> dict[str, object]:
+        # Always attach the captured tour.json url (when present) so the client's
+        # anchor overlay can read the ACTUAL captured points, and a done job links
+        # to its result.
+        tour_json = _cell_tour_dir(run, slot, model) / "tour.json"
+        url = _artifact_url(tour_json)
+        job = _tour_capture_jobs.get((run, slot, model))
+        if job is not None:
+            return {**job, "url": url}
+        done = tour_json.is_file()
+        return {
+            "run": run, "slot": slot, "model": model, "running": False,
+            "status": "done" if done else "idle",
+            "phase": "done" if done else "idle",
+            "error": None, "summary": None, "url": url,
+        }
+
+    @app.post("/slots/{slot_id}/{model_alias}/tour/capture")
+    async def tour_capture_start(slot_id: str, model_alias: str, request: Request, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        # Start the headless capture for this cell: plan anchors, launch the
+        # capture browser, render + upload panos/minimaps/proxy, write tour.json,
+        # and publish to R2/D1. Idempotent while running (returns the live job).
+        run = _resolve_run(run)
+        _require_slot_log(run, slot_id, model_alias)
+        if _splat_source(run, slot_id, model_alias) is None:
+            raise HTTPException(409, "cell has no meshes to capture (generate the scene first)")
+        key = (run, slot_id, model_alias)
+        existing = _tour_capture_jobs.get(key)
+        if existing is not None and existing.get("running"):
+            return dict(existing)
+        job: dict[str, Any] = {
+            "run": run, "slot": slot_id, "model": model_alias,
+            "total": 0, "running": True, "status": "pending", "phase": "pending",
+            "error": None, "summary": None, "capture_url": None, "renderer": None,
+            "started_at": datetime.now().isoformat(timespec="seconds"),
+            "finished_at": None,
+        }
+        _tour_capture_jobs[key] = job
+        api_origin, client_origin = _capture_origins(request)
+        _tour_capture_tasks[key] = asyncio.create_task(
+            _run_tour_capture(run, slot_id, model_alias, api_origin, client_origin)
+        )
+        return dict(job)
+
+    @app.get("/slots/{slot_id}/{model_alias}/tour/capture")
+    async def tour_capture_get_status(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        run = _resolve_run(run)
+        return _tour_capture_status(run, slot_id, model_alias)
+
+    # The capture page authenticates with the per-session token minted by the
+    # runner, so a stale page from a superseded job can never write into a fresh one.
+    def _tour_state_for(run: str, slot: str, model: str, token: str) -> dict[str, Any]:
+        state = _tour_capture_state.get((run, slot, model))
+        if state is None or token != state["token"]:
+            raise HTTPException(
+                status_code=409,
+                detail="no live tour-capture session for this cell (stale token?)",
+            )
+        return state
+
+    @app.get("/runs/{run}/tour/capture/{slot}/{model}/manifest")
+    async def tour_capture_manifest(run: str, slot: str, model: str, token: str = "") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The capture page's work order: the mesh bundle URL, the fixed light rig
+        (shared with Stage 5), the planned anchors + connectors, and the
+        pano/minimap knobs."""
+        state = _tour_state_for(run, slot, model, token)
+        state["last_beat"] = time.monotonic()
+        return {
+            "run": run, "slot": slot, "model": model,
+            "bundle_url": state["bundle_url"],
+            "lighting": state["lighting"],
+            "background": state["background"],
+            "anchors": state["anchors"],
+            "connectors": state["connectors"],
+            "planner_model": state["planner_model"],
+            "namer_model": state["namer_model"],
+            "planner_reasoning": state["planner_reasoning"],
+            # High-res 360 capture: 6 cube faces at `face_size`² → equirect `width`.
+            "pano": {"face_size": 1024, "width": 4096, "quality": 0.92},
+            "minimap": {"res": 1024, "level_eps": 1.5, "pad_frac": 0.04, "slice_below": 2.0},
+        }
+
+    @app.post("/runs/{run}/tour/capture/{slot}/{model}/beat")
+    async def tour_capture_beat(run: str, slot: str, model: str, token: str = "") -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
+        # Heartbeat during long phases (scene load, shadow/reflection bakes) so the
+        # supervisor's stall timer doesn't fire between uploaded artifacts.
+        state = _tour_state_for(run, slot, model, token)
+        state["last_beat"] = time.monotonic()
+        return {"ok": True}
+
+    @app.post("/runs/{run}/tour/capture/{slot}/{model}/finish")
+    async def tour_capture_finish(run: str, slot: str, model: str, request: Request, token: str = "") -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """The capture page's sign-off. On success the body is `{manifest, renderer}`
+        — we write the manifest as tour.json and schedule the R2/D1 publish. A body
+        `{error}` marks the session failed (partial artifacts stay on disk)."""
+        state = _tour_state_for(run, slot, model, token)
+        state["last_beat"] = time.monotonic()
+        body = await request.body()
+        try:
+            payload = json.loads(body) if body else {}
+        except ValueError as e:
+            raise HTTPException(400, f"finish body is not valid JSON: {e}") from e
+        if not isinstance(payload, dict):
+            raise HTTPException(400, "finish body must be a JSON object")
+        if payload.get("renderer"):
+            state["renderer"] = str(payload["renderer"])[:200]
+        if payload.get("error"):
+            state["client_error"] = str(payload["error"])[:500]
+            state["finished"].set()
+            return {"ok": False}
+        manifest = payload.get("manifest")
+        if not isinstance(manifest, dict):
+            raise HTTPException(400, "finish body needs a `manifest` object (or an `error`)")
+        tour_dir = _cell_tour_dir(run, slot, model)
+        tour_dir.mkdir(parents=True, exist_ok=True)
+        (tour_dir / "tour.json").write_bytes(json.dumps(manifest).encode("utf-8"))
+        state["summary"] = {
+            "panos": len(manifest.get("panos") or []),
+            "minimaps": len(manifest.get("minimaps") or []),
+            "proxy": bool(manifest.get("proxy")),
+        }
+        # A finalized tour = a publishable scene; push it to R2 + D1 in the
+        # background (best-effort) so the prod client's catalog picks it up.
+        _schedule_auto_publish(run, slot, model)
+        state["finished"].set()
+        tour_url = f"/artifacts/{quote(run)}/{quote(slot)}/{quote(model)}/tour/tour.json"
+        return {"ok": True, "tour_url": tour_url}
 
     @app.post("/runs/{run}/splat/colmap/{slot}/{model}")
     async def splat_colmap_export(run: str, slot: str, model: str) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]

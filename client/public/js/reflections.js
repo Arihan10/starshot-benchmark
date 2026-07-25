@@ -6,7 +6,7 @@
 // RoomEnvironment IBL (a studio that isn't in the scene). This module bakes a REAL
 // reflection of the scene into each reflective object:
 //
-//   * find reflective meshes (roughness ≤ maxRough) grouped per top-level object,
+//   * find the curated reflective objects (reflective.js name discriminator),
 //   * bake a cube map of the surrounding OPAQUE scene from the object's reflective
 //     centroid — the object hidden so it doesn't occlude/reflect itself — under
 //     the SAME fixed rig (sun + shadows + RoomEnvironment IBL) the frames use,
@@ -23,12 +23,13 @@
 
 import * as THREE from "three";
 import { OIT_LAYER, OIT_PASS_OPAQUE } from "./oit.js";
+import { isReflectiveName } from "./reflective.js";
 
 // Defaults mirrored by splat/stage5.py LIGHTING["reflections"] (the server-side
 // twin recorded in capture.json for stale-frame invalidation).
 export const REFLECTION_DEFAULTS = {
 	enabled: true,
-	maxRough: 0.5, // a material reflects the scene when its roughness is ≤ this
+	maxRough: 0.5, // legacy — reflectivity is now name-gated (reflective.js); kept for stage5/capture.json parity
 	cubeSize: 256, // per-probe cube-face resolution (PMREM prefilters/downsamples)
 	maxProbes: 24, // cap probes (each = 6 opaque scene renders + one PMREM)
 	intensity: 1.0, // envMapIntensity applied to the reflective materials
@@ -36,27 +37,25 @@ export const REFLECTION_DEFAULTS = {
 	far: 2000,
 };
 
-// A material shows a meaningful (non-blurred) scene reflection when it is smooth
-// enough — roughness gates sharpness; a rough surface reflects a heavily blurred
-// environment the RoomEnvironment IBL already approximates. metalness only scales
-// the reflection, it doesn't gate it (and glTF's default metalness=1/roughness=1
-// would otherwise flag every untuned material), so gate on roughness alone.
-function isReflective(mat, maxRough) {
-	return !!mat && mat.isMeshStandardMaterial && (mat.roughness ?? 1) <= maxRough;
-}
-
-// The reflective materials on one object subtree + their shared world-space bbox
-// (the probe is centered on the reflective geometry, not the whole object).
-function scanObject(root, maxRough) {
+// The MeshStandard materials on one (curated reflective) object subtree + their
+// shared world-space bbox. NO roughness gate: Trellis writes scalar
+// metalness=roughness=1 on everything, so reflectivity is decided per-object by
+// NAME (reflective.js) upstream; each kept material's own metallic-roughness map
+// then modulates how sharply it mirrors the baked scene probe.
+function scanObject(root) {
 	const mats = new Set();
 	const box = new THREE.Box3();
 	root.traverse((o) => {
 		if (!o.isMesh || !o.material) return;
 		const list = Array.isArray(o.material) ? o.material : [o.material];
-		const refl = list.filter((m) => isReflective(m, maxRough));
-		if (refl.length === 0) return;
-		for (const m of refl) mats.add(m);
-		box.expandByObject(o);
+		let any = false;
+		for (const m of list) {
+			if (m && m.isMeshStandardMaterial) {
+				mats.add(m);
+				any = true;
+			}
+		}
+		if (any) box.expandByObject(o);
 	});
 	if (mats.size === 0 || box.isEmpty()) return null;
 	return { mats, center: box.getCenter(new THREE.Vector3()) };
@@ -82,7 +81,8 @@ export function bakeReflectionProbes(renderer, scene, opts = {}) {
 	const targets = [];
 	for (const child of objectsRoot.children) {
 		if (child.isLight || child.isCamera) continue;
-		const found = scanObject(child, o.maxRough);
+		if (!isReflectiveName(child.userData?.objectId)) continue; // curated reflective only
+		const found = scanObject(child);
 		if (found) targets.push({ object: child, ...found });
 		if (targets.length >= o.maxProbes) break;
 	}

@@ -114,17 +114,11 @@ export function setOITBlend(m, accum) {
     m.blendDstAlpha = m.blendDst;
 }
 
-// Roughness at/below which a surface is treated as REFLECTIVE — it keeps its
-// metalness and earns a cube probe (reflections.js). ABOVE it, a metalness=1
-// surface is almost certainly a Trellis mis-tag of a matte dielectric and is
-// demoted (see prepareOITScene). Matches reflections.js REFLECTION_DEFAULTS.maxRough.
-export const REFLECTIVE_MAX_ROUGHNESS = 0.5;
-
 // In-place lit-scene prep: generate missing normals, cast/receive shadows, force
-// DoubleSide with back-face shadowing (Trellis winding is unreliable), demote the
-// metalness of MATTE surfaces (see below), and route transparent meshes onto the
-// OIT layer with the weighted-blend patch. Glossy/mirror materials keep their
-// metalness so they still reflect; opaque materials keep their default depth write.
+// DoubleSide with back-face shadowing (Trellis winding is unreliable), and route
+// transparent meshes onto the OIT layer with the weighted-blend patch. Material
+// reflectivity is decided elsewhere (reflective.js: keep the curated reflective
+// surfaces, force everything else matte) BEFORE this runs.
 export function prepareOITScene(root, oitPass) {
     root.traverse((child) => {
         if (!child.isMesh || !child.material) return;
@@ -138,20 +132,6 @@ export function prepareOITScene(root, oitPass) {
         for (const m of mats) {
             m.side = THREE.DoubleSide;
             m.shadowSide = THREE.BackSide;
-            // Trellis mis-tags nearly every surface metalness=1. A fully-metallic
-            // surface has NO diffuse term — its whole look is its env reflection, so
-            // with the neutral (hotspot-free) env it just goes BLACK. A MATTE surface
-            // (rough) is almost certainly a dielectric, so demote its metalness and
-            // let the sun + ambient light its albedo normally. Glossy/mirror surfaces
-            // (roughness ≤ REFLECTIVE_MAX_ROUGHNESS) keep metalness and reflect via
-            // the cube probes.
-            if (
-                m.isMeshStandardMaterial &&
-                m.metalness > 0.5 &&
-                m.roughness > REFLECTIVE_MAX_ROUGHNESS
-            ) {
-                m.metalness = 0;
-            }
             if (m.transparent) oit = true;
         }
         if (oit) {

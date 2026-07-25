@@ -59,6 +59,7 @@ import { MeshoptDecoder } from "three/addons/libs/meshopt_decoder.module.js";
 import { normalizeLighting, createLightRig } from "./splatlight.js";
 import { bakeReflectionProbes } from "./reflections.js";
 import { applyEmissiveLighting } from "./emissive.js";
+import { matteNonReflective } from "./reflective.js";
 import {
     OIT_LAYER,
     TONEMAP_GLSL,
@@ -618,8 +619,9 @@ async function loadScene(renderer, bundleUrl) {
         const p = (async () => {
             try {
                 const gltf = await parseGlb(glbB.buffer);
+                gltf.scene.userData.objectId = id; // emissive.js / reflective.js name matching
+                matteNonReflective(gltf.scene, id); // keep curated reflective; matte the rest
                 prepareOITScene(gltf.scene, oitPass);
-                gltf.scene.userData.objectId = id; // for emissive.js name matching
                 scene.add(gltf.scene);
                 loaded += 1;
             } catch (e) {
@@ -721,9 +723,9 @@ async function runCapture() {
             `${lighting.elevation}° · ${rawLighting.tone_mapping || "aces_filmic"} exposure ${lighting.exposure}`,
     );
 
-    // Real scene reflections, baked ONCE (scene + lighting are static): reflective
-    // objects (roughness ≤ maxRough) reflect the actual opaque scene via per-object
-    // PMREM cube probes instead of the generic RoomEnvironment IBL — the view-
+    // Real scene reflections, baked ONCE (scene + lighting are static): the curated
+    // reflective objects (reflective.js names) reflect the actual opaque scene via
+    // per-object PMREM cube probes instead of the generic RoomEnvironment IBL — the view-
     // dependent signal Stage-6 degree-3 SH learns. The shadow map is rendered by
     // the first bake pass (needsUpdate set above) and reused by every view.
     const refl = bakeReflectionProbes(renderer, scene, { background: manifest.background, oitPass });
