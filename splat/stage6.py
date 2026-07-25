@@ -51,20 +51,26 @@ CONTRACT (locked, shared with Stages 4/5 — see overview §12):
     training (`sh_degree` / `sh_degree_interval`). Set `sh_degree=0` for the old
     flat / view-independent model.
 
-LOSSES (per view):
+LOSSES (per view). The photometric pair is the objective; everything else is a
+weak prior on top of it, at the reference trainer's weights — the capture's extra
+channels are worth having, but only as a nudge on geometry the images already
+determine:
   * photometric — full-frame L1 + D-SSIM on RGB vs the reference. Both
     sides are premultiplied-over-black (the reference alpha-blends over a black
     clear colour; gsplat composites with no background), so glass/MASK pixels
     compare like-with-like and background pixels directly penalize floater
     energy;
   * alpha (mask) — L1(render α, reference α): the renderer's exact coverage
-    masks make empty space stay empty and glass stay see-through;
-  * depth — alpha-gated L1 on the median depth (the transmittance-0.5 crossing,
-    which lands on the nearest opaque surface and so leaves transmissive glass
-    untouched; `depth_mode="expected"` instead hunts front floaters at the cost of
-    razing glass — see TrainParams.depth_mode);
-  * 2DGS regularizers — normal consistency (render normals vs normals-from-depth)
-    and optional depth distortion.
+    masks make empty space stay empty and glass stay see-through. Only informative
+    on views that see the void — an enclosed interior view is α≡1 everywhere;
+  * depth — L1 in DISPARITY space (× scene_scale) on the median depth (the
+    transmittance-0.5 crossing, which lands on the nearest opaque surface and so
+    leaves transmissive glass untouched; `depth_mode="expected"` instead hunts
+    front floaters at the cost of razing glass — see TrainParams.depth_mode),
+    gated to pixels where BOTH the reference and the render hold a surface;
+  * 2DGS regularizers — normal consistency (render normals vs normals-from-depth,
+    the latter scaled by rendered alpha as in the reference) and optional depth
+    distortion.
 
 RESUMABLE: every `ckpt_every` steps the full training state (params + per-param
 Adam + means LR schedule + densification-strategy accumulators + step) is written
@@ -73,7 +79,7 @@ from the latest checkpoint and continues to `iterations`; the checkpoints are
 deleted once trained.ply is written. Pass `resume=False` to force a fresh run.
 
 TILED TRAINING (scenes past the single-GPU VRAM wall): a seed larger than the
-tile budget (default 2/3 of `cap_max`, leaving densification headroom) trains as
+tile budget (`tile_max`, default `_TILE_BUDGET_DEFAULT`) trains as
 GROUND-PLANE TILES instead of one frozen over-budget run — the smallest (x,z)
 grid whose largest expanded tile (core + margin ring) fits the budget. Each tile
 trains sequentially in this process with the FULL budget to itself: views are
@@ -82,13 +88,29 @@ tile's expanded box), every loss is masked to pixels the tile OWNS (its surface
 + true background, so boundary Gaussians never chase foreign content), and
 depth-seeding is clipped to the box. Merge keeps each Gaussian iff its mean lies
 in its tile's CORE cell — cores partition space exactly, so overlaps never
-double-ship and there is no seam by construction. Per-tile results are cached
-(`splat/ckpt/tiles/`) with a params signature: an interrupted tiled run resumes
-at the first unfinished tile (and inside it, from its own checkpoint). This is
-strictly MORE capacity than a monolithic run: n tiles × cap_max total, on the
-same GPU. Because the references are exact synthetic renders (posed, unlit,
-depth-true), the classic tiling artifacts (exposure seams, mis-assigned cameras)
-don't apply.
+double-ship. Per-tile results are cached (`splat/ckpt/tiles/`) with a params
+signature: an interrupted tiled run resumes at the first unfinished tile (and
+inside it, from its own checkpoint). Because the references are exact synthetic
+renders (posed, depth-true), the classic tiling artifacts of photogrammetry
+(exposure seams, mis-assigned cameras) don't apply.
+
+TILING IS A FALLBACK, NOT A FREE WIN — prefer a single run whenever the seed
+fits. Exact core ownership rules out DUPLICATION, not appearance discontinuity:
+two Gaussians either side of a core boundary are optimized in different runs,
+under different masked context, and are never evaluated together, so their SH can
+disagree. Two further limits follow from the per-tile loss mask:
+  * A pixel whose reference surface lies outside a tile's expanded box is masked
+    OUT for that tile, so geometry occluded by another tile's content receives no
+    supervision at all and keeps its init.
+  * TRANSMISSIVE content spanning a boundary is baked wrong. Glass writes no
+    depth, so a window pixel's reference depth is the opaque surface BEHIND the
+    pane. If that surface sits outside the pane's tile, the pane is unsupervised
+    there; and the tile owning the surface fits it WITHOUT the pane in front, so
+    it converges to the already-attenuated reference colour. Compositing the two
+    at merge attenuates twice. Only bites when pane and backing surface land in
+    different expanded boxes (the margin ring covers the common case), so it is a
+    boundary defect, not a pervasive one — but it is a reason to raise the budget
+    rather than tile eagerly.
 
 LOD EXPORT (wide shots / progressive delivery): beside trained.ply, an octave
 ladder `trained.lod1.ply`, `trained.lod2.ply`, … — each level ~4× fewer
@@ -172,6 +194,11 @@ TRAINED_NAME = "trained.ply"
 # seeded Gaussian's albedo → f_dc = (rgb − 0.5)/C0.
 _SH_C0 = 0.28209479177387814
 
+# Lower bound on the rendered depth entering the DISPARITY loss, as a fraction of
+# the reference depth for that pixel — the singularity guard for 1/d. See the depth
+# term in `_supervision_loss`; 0.1 caps the residual at 9× the true disparity.
+_DEPTH_DISP_FLOOR_FRAC = 0.1
+
 # progress(done, total, message) — called periodically during training.
 ProgressCb = Callable[[int, int, str], None]
 
@@ -179,39 +206,90 @@ ProgressCb = Callable[[int, int, str], None]
 # even a tiny epoch/budget still runs enough steps to seat the LR schedule.
 _MIN_STEPS = 200
 
+# Sampling period for the in-loop speed profile (`_profile_report`). The GPU
+# sections need a `cuda.synchronize()` on each side to be attributed correctly,
+# which would distort the run if done every step — so they are measured on 1 step
+# in this many. The loader-wait figure, which is the one that decides the verdict,
+# is exact and measured on every step.
+_PROFILE_EVERY = 250
+
+# Default single-run seed ceiling: clouds larger than this train as ground-plane
+# TILES (module docstring §TILED TRAINING). Deliberately HIGH, because tiling is a
+# fallback for seeds that cannot train monolithically AT ALL — not a routine path.
+# It costs n_tiles × the run, bakes transmissive content wrongly where a pane and
+# its backing surface straddle a boundary, and can leave appearance
+# discontinuities across core edges, none of which a single run has. It has also
+# never fired on any recorded run (the largest cloud trained so far is 281k), so
+# the whole path is unvalidated in production — one more reason to reach it late.
+#
+# Sized for the A100-40GB `modal_app.py` provisions: 4M seeds is ~3.8 GB of
+# persistent state (59 floats/Gaussian for params, ×4 for the two Adam moments and
+# the gradient), leaving the bulk of the card for rasterization activations, which
+# are the real consumer — the tile-intersection buffers scale with projected AREA,
+# not count. Growth PAST this point is bounded reactively by `vram_min_free_gb`
+# rather than by any count, now that `cap_max` is off by default; this number only
+# decides whether the SEED gets one run or several. Confirm against the training
+# heartbeat's `vram used / free` line before raising it further.
+#
+# (It used to be derived as 2/3 of `cap_max`, which coupled a scene's tiling
+# structure to an unrelated knob: lowering the count ceiling silently re-tiled the
+# scene, changing the grid, the view assignment and the cache signature.)
+_TILE_BUDGET_DEFAULT = 4_000_000
+
 
 @dataclass(frozen=True)
 class TrainParams:
     """Stage-6 knobs. Learning rates follow the gsplat/3DGS defaults; the means LR
     is scaled by the scene extent at runtime and decayed exponentially.
 
-    SCHEDULE (resolved per run by `resolve_schedule`, against the plan's view
-    count + `batch`): `iterations` is a VIEW-DRAW budget — the number of
-    reference-image presentations, i.e. optimizer_steps × batch — so the actual
-    step count is `budget // batch`. Raising `batch` therefore SPEEDS a run at
-    constant work (fewer, fuller optimizer steps) instead of multiplying it, and
-    the step-denominated cadences below (refine/densify windows, `ckpt_every`,
-    the regularizer start iters, …) are written at batch-1 and divided by
-    `batch` here so densification stays view-consistent across batch sizes.
-    `epochs`, when set, OVERRIDES the budget as whole passes over the view set
-    (`epochs × n_views`) — the scene-size-independent way to dial training
-    length, since a bigger scene has proportionally more views (Stage 4 places
-    cameras by surface area), and a mesh-exact init needs far fewer epochs than
-    photogrammetry's ~16.
+    SCHEDULE (resolved per run/tile by `resolve_schedule`): `iterations` is the
+    OPTIMIZER-STEP count — what gsplat's `max_steps` and PostShot's step box both
+    mean — and `batch` is how many reference images each of those steps averages,
+    so raising `batch` MULTIPLIES the work per step and leaves the number of Adam
+    updates alone. (An iterative optimizer's progress is bounded by its update
+    count, and every densification cadence below is denominated in updates, so
+    dividing steps by `batch` — as this class used to — silently shortened a run
+    by that factor: a `batch=16` job spec turned a nominal 30k into 1.5k.) Every
+    cadence here is written against the reference 30k-step length.
 
-    `refine_stop_iter` defaults to None → resolved to 50% of the (post-batch)
-    step count, so densification scales automatically with training length."""
+    `epochs`, when set, instead sizes the run as whole passes over the view set
+    (`steps = epochs × n_views / batch`) — the scene-size-independent way to dial
+    training length, since a bigger scene has proportionally more views (Stage 4
+    places cameras by surface area). Shortening a run that way rescales EVERY
+    cadence by the same factor (gsplat's `adjust_steps`), so the densify window,
+    the SH warm-up and the regularizer starts keep a full-length run's
+    proportions instead of eating the whole budget.
 
-    # VIEW-DRAW budget (optimizer steps × batch); `epochs` overrides it when set.
-    # See the class docstring + `resolve_schedule` — `iterations // batch` is the
-    # step count the loop actually runs.
+    `refine_stop_iter` defaults to None → 50% of the step count, the reference's
+    15k/30k."""
+
+    # OPTIMIZER STEPS (gsplat `max_steps` / PostShot's step box), and the length
+    # every cadence below is written against. `epochs` overrides it when set.
     iterations: int = 30_000
     epochs: float | None = None
 
     # Loss weights.
     ssim_lambda: float = 0.2           # photometric = (1-λ)·L1 + λ·(1-SSIM)
-    alpha_lambda: float = 0.5          # L1(render α, reference α)
-    depth_lambda: float = 0.5          # alpha-gated depth L1 (metres) — median vs the opaque plane
+    # L1(render α, reference α). The capture's alpha is renderer COVERAGE, not an
+    # object matte, so an enclosed interior view is α≡1 everywhere and this term
+    # degenerates into a uniform "fill the frame" push. It carries real
+    # information only on the shell views that see the black void, where it
+    # penalizes floater coverage the photometric L1 can miss (a BLACK floater over
+    # black background). Kept at regularizer strength for exactly that: at the old
+    # 0.5 it outweighed the photometric term through the whole densification
+    # window, so Gaussians were sized to cover rather than to match.
+    alpha_lambda: float = 0.05
+    # Depth L1 in DISPARITY space (× scene_scale, so the term is dimensionless and
+    # a far wall's metric error no longer outweighs a near surface's) — the
+    # reference trainer's formulation and weight. Deliberately small: under
+    # `depth_mode="median"` gsplat's 2DGS backward hands the whole per-pixel depth
+    # gradient to the ONE Gaussian that crossed transmittance 0.5, unweighted by
+    # its blend weight (`RasterizeToPixels2DGSBwd.cu`: `v_rgb_local[CDIM-1] +=
+    # v_median`), so this is a nudge on geometry the photometric terms already
+    # place — not a term to converge on. At the old metric 0.5 it was ~70% of the
+    # converged loss and every pixel yanked one Gaussian along its ray at full
+    # strength.
+    depth_lambda: float = 0.01
     # "Record both" — the SECOND depth target, the glass-maker. The stored depth
     # plane is the nearest OPAQUE surface, so `depth_lambda` (median) pins the wall
     # but says nothing about a transmissive pane in front of it. This term
@@ -229,9 +307,13 @@ class TrainParams:
     alpha_gate: float = 0.5            # reference α above this = opaque pixel (depth/normal masks)
     normal_lambda: float = 0.05        # 2DGS normal consistency
     dist_lambda: float = 0.0           # 2DGS depth distortion (off by default; over-flattens bounded scenes)
-    normal_start_iter: int = 2000      # let geometry settle before the regularizers bite
-    dist_start_iter: int = 1000
-    # Depth-loss warm-up (view-draws, batch-scaled like the other cadences): the
+    # Let geometry settle before the regularizers bite — the reference's 7k/30k
+    # and 3k/30k. Normal consistency in particular ties the rendered normals to
+    # the render's OWN depth, so it locks in whatever surface exists when it
+    # switches on; starting it at 2k (7%) froze half-built geometry.
+    normal_start_iter: int = 7000
+    dist_start_iter: int = 3000
+    # Depth-loss warm-up (optimizer steps, like every cadence here): the
     # point-cloud init starts translucent (init_opa), so the early rendered depth
     # (expected blends through surfaces; median sits behind them until transmittance
     # crosses 0.5) is unreliable; let opacity saturate before the metric term bites.
@@ -255,10 +337,9 @@ class TrainParams:
     # RGB coefficients (15 at degree 3) on top of the DC term, so the specular
     # highlights + reflections the LIT Stage-5 capture bakes per view are
     # reconstructed as f(view direction) instead of averaged into one flat colour.
-    # The ACTIVE degree WARMS UP from 0, +1 every `sh_degree_interval` image-draws
-    # (INRIA/3DGS schedule — the interval is written at batch-1 and divided by
-    # `batch` in `resolve_schedule`, like the other cadences), so geometry settles
-    # before the view-dependent bands switch on. sh_degree=0 = flat model (the old
+    # The ACTIVE degree WARMS UP from 0, +1 every `sh_degree_interval` optimizer
+    # steps (the INRIA/3DGS schedule), so geometry settles before the
+    # view-dependent bands switch on. sh_degree=0 = flat model (the old
     # view-independent behaviour), degree 3 = PostShot's default.
     sh_degree: int = 3
     sh_degree_interval: int = 1000
@@ -290,25 +371,62 @@ class TrainParams:
     # Periodic opacity resets (the reference 3DGS/2DGS floater purge: clamp every
     # opacity to 2·prune_opa + zero its Adam moments, so only image-justified
     # Gaussians re-earn visibility) — DISABLED by default, deliberately:
-    #   * The cadence is draw-denominated, so passes-between-resets =
-    #     reset_every / n_views. Our plans carry THOUSANDS of views (swamp-land:
-    #     4212 → a reset every 0.71 passes at the reference 3000), so the clamp
-    #     outruns recovery and ships a half-transparent scene — measured on the
-    #     2026-07-23 runs (hotel 24.5 dB, swamp healed to 9.7k splats, vs the
-    #     old loop's 33 dB). Raising epochs does NOT fix this: the spacing is
-    #     set by view count alone; longer runs just reset more often.
+    #   * Passes between resets = reset_every·batch / n_views. Our plans carry
+    #     THOUSANDS of views (swamp-land: 4212 → 0.7 passes between resets at the
+    #     reference 3000/batch 1, against the ~10 the reference's few-hundred-view
+    #     scenes get), so the clamp outruns recovery and ships a half-transparent
+    #     scene — measured on the 2026-07-23 runs (hotel 24.5 dB, swamp healed to
+    #     9.7k splats, vs the old loop's 33 dB).
     #   * This pipeline doesn't need the amnesty cycle to kill floaters: Stage 7
     #     settles them GEOMETRICALLY — the Stage-3 cloud sits exactly on the
     #     true mesh surfaces, so heal's `surface_max_dist` cull deletes airborne
     #     Gaussians decidably, and its measured-contribution cull + opacity
     #     prune handle near-surface haze.
-    # Setting a value > 0 re-enables the reference behavior for reference-shaped
-    # runs (hundreds of views × tens of passes): view-draw units like every
-    # other cadence (resolve_schedule divides by `batch`), firing only inside
-    # the refine window via the in-loop reset in _train_one — the pinned gsplat
-    # 1.5.3 wheel's own trigger is dead code (`== 0 & step` precedence bug;
-    # 1.5.3 is still the newest release everywhere, the fix unreleased on main).
-    reset_every: int = 0
+    # ^ THAT MEASUREMENT IS VOID. It was taken under the schedule bug: `reset_every`
+    # was denominated in view-draws and divided by `batch`, so on those runs a reset
+    # fired every ~375 optimizer steps of a ~2,000-step run. Nothing could recover
+    # from that, and resets were blamed for what the schedule was doing. At the
+    # reference 3000 STEPS inside a 30,000-step run there are ten resets with 3,000
+    # steps of recovery each; a Gaussian visible in 10% of views gets ~300 updates
+    # to re-earn its opacity, which is ample. (Recovery is governed by updates per
+    # Gaussian, not by passes over the view set — the old note measured the wrong
+    # quantity.)
+    #
+    # It is back ON because `DefaultStrategy` has NO opacity regularizer: the reset
+    # IS the regularizer. Without it opacity only ever ratchets up, and it did —
+    # measured on the 30k run, trained opacity was p50 0.997 / p90 1.000, so
+    # transmittance after ONE Gaussian was 0.003. That makes the frontmost surfel
+    # own each pixel outright while its ~5 overlapping neighbours keep near-init
+    # (2.1x too bright) colour, which is both the blotchy shading and why the
+    # trained DC luma was still 0.512 against a 0.285 reference after 30,000 steps.
+    #
+    # Fires inside the refine window via the in-loop reset in `_train_one`, because
+    # the pinned gsplat 1.5.3 wheel's own trigger is dead code
+    # (`step % reset_every == 0 & step > 0` parses as
+    # `(step % reset_every == 0) and (0 > 0)`; 1.5.3 is still the newest release
+    # everywhere and the fix is unreleased on main). 0 disables it; size pruning is
+    # independent either way (see `prune_scale_start_iter`).
+    reset_every: int = 3000
+    # Opacity ceiling a reset clamps to — NOT `2·prune_opa`, which is what gsplat's
+    # own trainer uses and what this loop used to pass. That coupling is a trap
+    # here: `prune_opa` is 0.005 (set from the glass-stacking math), so the reset
+    # would clamp every Gaussian to 0.01 and black the scene out for thousands of
+    # steps. 0.1 is the value the reference actually lands on (its prune_opa is
+    # 0.05). `reset_opa` CLAMPS rather than assigns, so anything already below this
+    # — glass at ~0.012 — passes through untouched.
+    reset_opa_value: float = 0.1
+    # Step after which the STRATEGY's size prune goes live. gsplat gates
+    # `prune_scale3d·scene_scale` (and `prune_scale2d`) behind
+    # `step > strategy.reset_every` in `DefaultStrategy._prune_gs`, so the old
+    # reset_every=0 sentinel (which passed `iterations + 1` to keep the reset from
+    # firing) also removed the ONLY bound on Gaussian size for the entire run —
+    # the measured result was disc radii up to 2.74 m in a 9.4 m room and 1.2% of
+    # Gaussians carrying a third of all rendered opacity·area, i.e. the bloom.
+    # `_train_one` passes THIS in that slot instead, so the bound holds whether or
+    # not opacity resets are on. The reference's own gate lands at 3000/30k: a
+    # warm-up long enough that a legitimately large surfel isn't culled before it
+    # has been supervised.
+    prune_scale_start_iter: int = 3000
     # Mean (non-absolute) 2D-gradient split threshold — gsplat's default value.
     # AbsGS (absgrad) is deliberately NOT used: in the pinned gsplat 1.5.3 the
     # 2DGS backward attaches `.absgrad` to `means2d`, but DefaultStrategy densifies
@@ -319,16 +437,65 @@ class TrainParams:
     # the mean-gradient criterion (which is what trained every working run).
     grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
-    # Keep pruning BELOW the glass init: glass.py panes seed opacity at
-    # GLASS_ALPHA = 0.065 (logit −2.67), and the old 0.05 threshold left only
-    # ~0.3 logits of drift before a pane surfel was permanently pruned.
-    prune_opa: float = 0.03
-    # Hard densification ceiling (VRAM guard). A mild cap curbs both the VRAM
-    # peak and the delivered file size (both ~linear in Gaussian count). Kept high
-    # because quality is primary and the main box (A100) has ample VRAM; big
-    # scenes are unaffected — they TILE (n_tiles × cap_max total), and the derived
-    # tile budget just makes them tile a little sooner.
-    cap_max: int = 2_500_000
+    # SCREEN-SPACE split. `grow_scale3d` is scene-relative, so it asks "is this
+    # Gaussian large compared to the scene?" — at scene_scale 12.8 the clone/split
+    # boundary is 12.8 cm, which 95.9% of a room's surfels sit under. They
+    # therefore only ever CLONE (exact duplicates at the same size), and the
+    # measured 30k run came out COARSER than its init: median tangent radius 2.81
+    # -> 5.28 cm, median projected 64 -> 83 px. Nothing in the loop can make a
+    # Gaussian smaller, so detail finer than ~80 px is unrepresentable no matter
+    # how long it trains.
+    #
+    # This criterion asks the question that matters instead — "is it large on
+    # SCREEN?" — splitting (scale/1.6, two children) anything whose projected
+    # radius exceeds `grow_scale2d` of the image's long side. gsplat gates it
+    # behind `refine_scale2d_stop_iter`, 0 = OFF, which is why it never ran.
+    #
+    # `prune_scale2d` is deliberately neutralized at 1.0 (a radius larger than the
+    # whole frame, so it never fires). The same gate arms BOTH, and the prune arm
+    # at gsplat's 0.15 default would delete rather than subdivide: a 5 cm Gaussian
+    # seen by a 0.12 m detail camera projects to ~0.30 normalized, so most of the
+    # model would be pruned the moment this switched on. Split, don't delete.
+    #
+    # Enabling this multiplies the count (~2^k for k rounds down to threshold), so
+    # give it a window that ENDS well before `refine_stop_iter` and leave the VRAM
+    # guard (or a `cap_max`) as the backstop.
+    refine_scale2d_stop_iter: int = 0
+    grow_scale2d: float = 0.05
+    prune_scale2d: float = 1.0
+    # Keep pruning below the opacity a CORRECT glass pane converges to — which is
+    # NOT the authored GLASS_ALPHA. Stage 3 writes 0.065 onto every surfel of a
+    # pane, but surfels overlap (radius = 0.9 × spacing), so a ray blends through
+    # ~5-6 of them: measured stack depth 5.3 (hotel) / 6.1 (test-SH), rendering the
+    # pane at 1−(1−0.065)^5.3 = 0.31 instead of 0.065. Per-surfel opacity for a
+    # correct pane is therefore 1−(1−0.065)^(1/N) ≈ 0.012, and the old 0.03 floor
+    # sat ABOVE that — a pane converging toward the right answer was pruned on the
+    # way there, both by DefaultStrategy inside the refine window and again by
+    # `_final_prune` in Stage 7. 0.005 (also the gsplat/INRIA default) leaves the
+    # same ~0.8 logits of headroom below that target that 0.03 left below the init.
+    # Low-opacity junk is culled better downstream regardless: Stage 7's
+    # `compact_eps` measures each Gaussian's ACTUAL rendered blend weight, so it is
+    # stack-aware — it drops a lone invisible splat while keeping a pane whose six
+    # layers sum to something visible, a distinction a flat opacity threshold
+    # cannot make.
+    # (If `reset_every` > 0: gsplat's reset clamps to 2·prune_opa, so at 0.005 a
+    # reset lands on 0.01 — far deeper than the reference's 0.1. Raise prune_opa or
+    # lengthen the reset cadence before enabling resets.)
+    prune_opa: float = 0.005
+    # OPTIONAL Gaussian-count ceiling — None (the default) means UNCAPPED.
+    # Densification is how the model earns detail, so a count ceiling is a direct
+    # cap on quality, and neither thing it used to justify still holds: delivered
+    # size is decided entirely by Stage 7's compaction (Stage 6 emits the raw
+    # model), and VRAM is guarded properly by `vram_min_free_gb`, which reacts to
+    # MEASURED free memory rather than guessing a count that cannot know the
+    # scene's resolution, batch size or SH degree. At the old 2.5M it never fired
+    # on the A100 anyway, so its only real effect was deriving the tile budget —
+    # which is now `_TILE_BUDGET_DEFAULT` / `tile_max` instead, so changing this
+    # can no longer restructure a scene's tiles as a side effect.
+    # Set an int only to bound per-step runtime on a small GPU. Exceeding it pauses
+    # GROWTH (and growth RESUMES if pruning brings the count back under) while
+    # pruning keeps running the whole time — see the growth guards in `_train_one`.
+    cap_max: int | None = None
     # Final cleanup prune (once, before eval + export). Densification/pruning stop at
     # refine_stop (50% of iters), so opacity that drifts below prune_opa in the back
     # half — the low-opacity floaters stranded at silhouette/depth edges — otherwise
@@ -369,11 +536,13 @@ class TrainParams:
     compact_heal_steps: int = 500
     compact_heal_means_lr_frac: float = 0.1
 
-    # Adaptive VRAM guard. cap_max is the hard ceiling; additionally freeze
+    # Adaptive VRAM guard — the PRIMARY protection now that `cap_max` is off by
+    # default, and the only one that reacts to what the GPU is actually doing. Freeze
     # densification (and pause depth-seeding) when free VRAM drops below this many
     # GB — after one empty_cache retry to release reusable cached blocks — so an
     # 8 GB card can't densify itself over the WDDM shared-memory cliff that
-    # collapsed a real run to 0.05 it/s. 0 disables (rely on cap_max alone).
+    # collapsed a real run to 0.05 it/s. 0 disables it (leaving NO growth guard
+    # unless `cap_max` is set).
     # (`expandable_segments` would fight fragmentation on Linux/Modal but is a
     # no-op on Windows, so this free-margin freeze is the portable mechanism.)
     # A near-full floor, so it never triggers where VRAM is plentiful (the A100)
@@ -402,7 +571,17 @@ class TrainParams:
     # and it grows surface rather than the edge floaters densification-at-silhouettes
     # produces. Capped at `depth_densify_max` per pass, paused under VRAM pressure,
     # and only inside the densification window.
-    depth_densify: bool = True
+    #
+    # OFF by default. A seed's disc faces the SEEDING CAMERA, not the surface, so
+    # it is per-view private geometry: near-invisible edge-on from anywhere else,
+    # it flatters the seeding view's PSNR and disintegrates under free-fly, and
+    # PostShot has no analogue. It also misfires badly from a translucent init —
+    # at `init_opa` = 0.1 nearly every foreground pixel reads as a "hole", so the
+    # first passes dump `depth_densify_max` Gaussians at arbitrary surface points
+    # (a measured 270k of 523k on one from-points run). With the surfels init the
+    # surface is already covered and gradient-driven densification has the budget
+    # to itself. Re-enable only for inits that genuinely start with holes.
+    depth_densify: bool = False
     depth_densify_every: int = 500
     depth_densify_start: int = 500
     depth_densify_max: int = 20_000
@@ -437,14 +616,15 @@ class TrainParams:
     seed: int = 0
     eval_max_views: int = 128          # cap final-metric renders (plans can have thousands of views)
     log_every: int = 50                # emit a progress line every N steps
-    # Views per optimizer step. The schedule holds VIEW-DRAWS constant
-    # (steps = iterations // batch), so this is a pure SPEED knob — it fills the
-    # A100's idle SMs by amortizing per-step overhead, at constant total work.
-    # Conservative default: rasterization activation memory (esp. the tile-
-    # intersection buffer) scales ~linearly with batch and is scene-dependent, so
-    # 3 keeps a dense/large cell well clear of the VRAM ceiling and the single-
-    # step OOM the free-margin guard can't catch (it only throttles growth).
-    batch: int = 3
+    # Views averaged per optimizer step (gsplat `batch_size`). This MULTIPLIES the
+    # work — `iterations` Adam updates happen either way — so it buys lower
+    # gradient noise and better GPU utilization, never a shorter run. Every LR is
+    # scaled by sqrt(batch) at runtime, the reference's variance-matching rule.
+    # 1 is exact reference / PostShot parity; raise it only with VRAM to spare,
+    # since rasterization activation memory (esp. the tile-intersection buffer)
+    # grows ~linearly with batch and can OOM in a single step the free-margin
+    # guard can't catch (it only throttles growth).
+    batch: int = 1
     prefetch: bool = True              # decode/stack the next batch on a background thread (hide disk I/O)
 
     # Resumable checkpoints: every `ckpt_every` steps write the full training state
@@ -456,8 +636,8 @@ class TrainParams:
 
     # Tiled training (module docstring §TILED TRAINING). Seeds beyond the budget
     # train as ground-plane tiles, each with the full budget of densification
-    # headroom, merged by core ownership. None → 2/3 of cap_max (room to grow to
-    # the cap); 0 disables tiling (a huge seed then trains frozen, as before).
+    # headroom, merged by core ownership. None → `_TILE_BUDGET_DEFAULT`; 0 disables
+    # tiling (a huge seed then trains as one over-budget run, as before).
     tile_max: int | None = None
     tile_margin_frac: float = 0.10       # context ring, fraction of the tile side
     tile_margin_min_m: float = 0.5       # … clamped to physical bounds (metres)
@@ -480,53 +660,57 @@ class TrainParams:
         """Seed count above which the run tiles (0 = tiling disabled)."""
         if self.tile_max is not None:
             return max(int(self.tile_max), 0)
-        return max(int(self.cap_max * 2 / 3), 1)
+        return _TILE_BUDGET_DEFAULT
 
     def resolve_schedule(self, n_views: int) -> "TrainParams":
-        """Concrete per-run (or per-TILE) schedule for `n_views` reference images
-        at this `batch`, in actual optimizer-STEP units. `epochs`, when set, is
-        the training length as whole passes over the view set — `iterations` is
-        derived as `epochs × n_views` view-draws — else the `iterations` field is
-        used directly as that budget. The step count is then `budget // batch`
-        (batch is a pure speed knob at constant work), and the step-denominated
-        cadences (refine/densify windows, `ckpt_every`, regularizer starts, …)
-        are divided by `batch` so densification stays view-consistent. Returns a
-        NEW TrainParams whose `iterations` + cadences are the step counts the
-        trainer runs, so every downstream consumer (the loop, `resolved_refine_stop`,
-        the LR schedule) is unchanged. Called per TILE with the tile's own view
-        count, so each tile trains `epochs` passes over the views that supervise
-        it."""
+        """Concrete per-run (or per-TILE) schedule for `n_views` reference images,
+        in optimizer-STEP units.
+
+        With `epochs` unset this is the IDENTITY: `iterations` is already the step
+        count and every cadence is already written against it. With `epochs` set
+        the run is sized as whole passes over the view set
+        (`epochs × n_views / batch` steps) and every cadence is rescaled by
+        `steps / iterations` — gsplat's `adjust_steps` — so a short run is a
+        proportionally compressed full run rather than a truncated one. Returns a
+        NEW TrainParams, so every downstream consumer (the loop,
+        `resolved_refine_stop`, the LR schedule) reads step counts unchanged.
+        Called per TILE with the tile's own view count, so each tile trains
+        `epochs` passes over the views that supervise it."""
         from dataclasses import replace
 
-        b = max(int(self.batch), 1)
-        budget = (
-            max(1, round(self.epochs * max(n_views, 1)))
-            if self.epochs is not None
-            else max(1, int(self.iterations))
-        )
-        steps = max(_MIN_STEPS, round(budget / b))
+        if self.epochs is None:
+            return self
 
-        def per_batch(v: int, floor: int = 1) -> int:
-            return max(floor, round(v / b))
+        b = max(int(self.batch), 1)
+        base = max(1, int(self.iterations))
+        steps = max(_MIN_STEPS, round(self.epochs * max(n_views, 1) / b))
+        factor = steps / base
+
+        def scaled(v: int, floor: int = 1) -> int:
+            return max(floor, round(v * factor))
 
         return replace(
             self,
             iterations=steps,
-            refine_start_iter=per_batch(self.refine_start_iter),
-            refine_every=per_batch(self.refine_every),
+            refine_start_iter=scaled(self.refine_start_iter),
+            refine_every=scaled(self.refine_every),
             refine_stop_iter=(
-                None if self.refine_stop_iter is None
-                else per_batch(self.refine_stop_iter)
+                None if self.refine_stop_iter is None else scaled(self.refine_stop_iter)
             ),
-            depth_densify_every=per_batch(self.depth_densify_every),
-            depth_densify_start=per_batch(self.depth_densify_start),
-            depth_start_iter=per_batch(self.depth_start_iter),
-            normal_start_iter=per_batch(self.normal_start_iter),
-            dist_start_iter=per_batch(self.dist_start_iter),
-            aa_every=per_batch(self.aa_every),
-            sh_degree_interval=per_batch(self.sh_degree_interval),
-            reset_every=(0 if self.reset_every == 0 else per_batch(self.reset_every)),
-            ckpt_every=(0 if self.ckpt_every == 0 else per_batch(self.ckpt_every)),
+            prune_scale_start_iter=scaled(self.prune_scale_start_iter, 0),
+            refine_scale2d_stop_iter=(
+                0 if self.refine_scale2d_stop_iter <= 0
+                else scaled(self.refine_scale2d_stop_iter)
+            ),
+            depth_densify_every=scaled(self.depth_densify_every),
+            depth_densify_start=scaled(self.depth_densify_start),
+            depth_start_iter=scaled(self.depth_start_iter, 0),
+            normal_start_iter=scaled(self.normal_start_iter, 0),
+            dist_start_iter=scaled(self.dist_start_iter, 0),
+            aa_every=scaled(self.aa_every),
+            sh_degree_interval=scaled(self.sh_degree_interval),
+            reset_every=(0 if self.reset_every == 0 else scaled(self.reset_every)),
+            ckpt_every=(0 if self.ckpt_every == 0 else scaled(self.ckpt_every)),
         )
 
     def as_summary(self) -> dict[str, Any]:
@@ -546,10 +730,16 @@ class TrainParams:
             "depth_mode": self.depth_mode,
             "alpha_gate": self.alpha_gate,
             "normal_lambda": self.normal_lambda,
+            "normal_start_iter": self.normal_start_iter,
             "dist_lambda": self.dist_lambda,
             "refine": self.refine,
             "refine_stop_iter": self.resolved_refine_stop,
             "reset_every": self.reset_every,
+            "reset_opa_value": self.reset_opa_value,
+            "prune_scale_start_iter": self.prune_scale_start_iter,
+            "refine_scale2d_stop_iter": self.refine_scale2d_stop_iter,
+            "grow_scale2d": self.grow_scale2d,
+            "prune_scale2d": self.prune_scale2d,
             "grow_grad2d": self.grow_grad2d,
             "prune_opa": self.prune_opa,
             "final_prune": self.final_prune,
@@ -560,6 +750,7 @@ class TrainParams:
             "compact_max_db_drop": self.compact_max_db_drop,
             "compact_keep_frac": self.compact_keep_frac,
             "compact_heal_steps": self.compact_heal_steps,
+            "cap_max": self.cap_max,
             "vram_min_free_gb": self.vram_min_free_gb,
             "antialias": self.antialias,
             "aa_min_scale_px": self.aa_min_scale_px,
@@ -765,7 +956,13 @@ def _init_from_points(xyz: np.ndarray, rgb: np.ndarray, params: TrainParams) -> 
     else:
         dist_avg = np.full(n, 0.01, dtype=np.float64)
     log_scale = np.log(np.maximum(dist_avg * params.init_scale, 1e-9)).astype(np.float32)
-    scales = np.repeat(log_scale[:, None], 3, axis=1)
+    # Two in-plane axes + a TINY third, exactly as `_load_cloud` synthesizes for a
+    # 2DGS cloud: the rasterizer ignores the third and the strategy's grow/prune
+    # thresholds take max() over the three (unchanged, since these are isotropic),
+    # but DefaultStrategy's split() displaces children along ALL three scaled axes
+    # — an equal third would eject every child a full disc radius off its own plane.
+    third = (log_scale + np.float32(np.log(0.01)))
+    scales = np.stack([log_scale, log_scale, third], axis=1)
 
     rng = np.random.default_rng(params.seed)
     quats = rng.standard_normal((n, 4)).astype(np.float32)
@@ -1186,7 +1383,10 @@ def _append_gaussians(torch, splats, optimizers, strat_state, new):  # noqa: ANN
                 if len(g["params"]) == 1 and g["params"][0] is p_old:
                     g["params"] = [p_new]
         splats[name] = p_new
-    for key in ("grad2d", "count"):
+    # `radii` only exists when the screen-space criterion is armed
+    # (`refine_scale2d_stop_iter` > 0); it must grow with the others or the
+    # strategy indexes a stale-length tensor on the next refine.
+    for key in ("grad2d", "count", "radii"):
         v = strat_state.get(key)
         if torch.is_tensor(v):
             strat_state[key] = torch.cat([v, torch.zeros(m, device=v.device, dtype=v.dtype)], dim=0)
@@ -1501,13 +1701,13 @@ def _train_tiled(  # noqa: ANN001
     supervises pass their init through untouched (exactly what an unsupervised
     region does in a single run — no gradient ever reaches it).
 
-    Per-tile ITERATIONS scale with the tile's supervision share (2× its fraction
-    of the plan's views, floored at 20%, capped at 100% of `params.iterations`):
-    a tile that sees a twentieth of the views converges in far fewer steps than
-    the whole scene needs, so total wall clock stays a few × a single run rather
-    than n_tiles ×, while every tile keeps full densification headroom. All
-    step-derived schedules (refine window, LR decay, depth-seed window) ride the
-    scaled count automatically."""
+    Each tile resolves its OWN schedule against the views assigned to it
+    (`TrainParams.resolve_schedule`), so an `epochs`-sized run gives a tile that
+    sees a twentieth of the plan a twentieth of the steps — total wall clock stays
+    a few × a single run rather than n_tiles × — while every tile keeps full
+    densification headroom. An `iterations`-sized run gives every tile the full
+    step count, since that is what the field means. All step-derived schedules
+    (refine window, LR decay, SH warm-up) ride the resolved count automatically."""
     import gc
     import shutil
 
@@ -1878,6 +2078,12 @@ def train_splat(
     n_init = int(init["means"].shape[0])
     scene_scale = _scene_scale(centers, init["means"])
 
+    # The schedule the single-run loop actually executes — reported below so the
+    # recorded summary can't disagree with the run (it used to echo the unresolved
+    # fields, so a 1,532-step run recorded `iterations: 30000`). Tiled runs resolve
+    # per tile against their own view counts; `tiles_summary` carries those.
+    resolved = params.resolve_schedule(n_views)
+
     # Single run when the seed fits the budget; otherwise plan the tile grid.
     ckpt_root = _ckpt_dir(out_path)
     budget = params.resolved_tile_budget
@@ -1894,12 +2100,13 @@ def train_splat(
     if grid is None:
         arrays, one = _train_one(
             torch, F, views, K, width, height, init, scene_scale, centers,
-            params.resolve_schedule(n_views), resume, ckpt_root, progress, tile_box=None,
+            resolved, resume, ckpt_root, progress, tile_box=None,
         )
         tiles_summary = None
         n_seeded, n_pruned = one["seeded"], one["pruned"]
         n_compacted = one.get("compacted", 0)
         compact_search = one.get("compact_search")
+        speed_profile = one.get("profile")
     else:
         if progress is not None:
             progress(
@@ -1915,6 +2122,7 @@ def train_splat(
         n_pruned = int(sum(t["pruned"] for t in tiles_summary))
         n_compacted = int(sum(t.get("compacted", 0) for t in tiles_summary))
         compact_search = None  # per-tile searches live in tiles_summary entries
+        speed_profile = None   # per-tile profiles live in tiles_summary entries
 
     n_final = int(arrays["means"].shape[0])
 
@@ -1976,7 +2184,22 @@ def train_splat(
         "splats_compacted": n_compacted,
         "compact_search": compact_search,
         "splats_depth_seeded": n_seeded,
-        "iterations": params.iterations,
+        "iterations": resolved.iterations,
+        "schedule": {
+            "steps": resolved.iterations,
+            "batch": resolved.batch,
+            "view_draws": resolved.iterations * max(resolved.batch, 1),
+            "refine_start_iter": resolved.refine_start_iter,
+            "refine_stop_iter": resolved.resolved_refine_stop,
+            "refine_every": resolved.refine_every,
+            "reset_every": resolved.reset_every,
+            "prune_scale_start_iter": resolved.prune_scale_start_iter,
+            "sh_degree_interval": resolved.sh_degree_interval,
+            "normal_start_iter": resolved.normal_start_iter,
+            "depth_start_iter": resolved.depth_start_iter,
+            "tiled": tiles_summary is not None,
+        },
+        "speed_profile": speed_profile,
         "views": n_views,
         "resolution": width,
         "scene_scale": round(scene_scale, 4),
@@ -2153,6 +2376,7 @@ def _compact_and_heal(  # noqa: ANN001
                     kmask = _select_keep(
                         torch, weights, splats["sh0"], splats["opacities"], splats["means"],
                         None, params.compact_eps, 0.0, max(1, round(mid * n0)),
+                        alpha_floor=params.prune_opa,
                     )
                     probe = {
                         k: torch.nn.Parameter(v.detach()[kmask].clone()) for k, v in splats.items()
@@ -2194,6 +2418,7 @@ def _compact_and_heal(  # noqa: ANN001
                 chosen = _select_keep(
                     torch, weights, splats["sh0"], splats["opacities"], splats["means"],
                     None, params.compact_eps, 0.0, max(1, round(params.compact_keep_frac * n0)),
+                    alpha_floor=params.prune_opa,
                 )
 
         if chosen is not None:
@@ -2364,15 +2589,15 @@ def _render_batch(torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K
 def _supervision_loss(  # noqa: ANN001
     torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
     pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
-    normals_active, dist_active, depth_active=True,
+    normals_active, dist_active, depth_active=True, scene_scale=1.0,
     pred_expected=None, ed_target=None, ed_gate=None,
 ):
     """Combined per-view supervision loss — photometric L1 + D-SSIM, alpha
-    (coverage), alpha-gated depth L1, 2DGS normal consistency, and optional depth
-    distortion — shared by the training loop and the compaction pass. Both RGB
-    sides are premultiplied-over-black. `mask` (a tile's owned-pixel mask, or None
-    for a single run) restricts every term to owned pixels; `normals_active` /
-    `dist_active` / `depth_active` gate the terms that only switch on partway
+    (coverage), disparity-space depth L1, 2DGS normal consistency, and optional
+    depth distortion — shared by the training loop and the compaction pass. Both
+    RGB sides are premultiplied-over-black. `mask` (a tile's owned-pixel mask, or
+    None for a single run) restricts every term to owned pixels; `normals_active`
+    / `dist_active` / `depth_active` gate the terms that only switch on partway
     through a run (`depth_active` defaults True for the heal/compact callers,
     whose models are already opaque)."""
     if mask is None:
@@ -2382,6 +2607,11 @@ def _supervision_loss(  # noqa: ANN001
         msum = mask.sum().clamp_min(1.0)
         l1 = ((pred_rgb - gt_rgb).abs() * mask).sum() / (msum * 3.0)
         ssim_rgb = torch.where(mask > 0, pred_rgb, gt_rgb.detach())
+    # Clamp the prediction into display range before SSIM. This costs the gradient
+    # on over-bright pixels (the L1 term still supplies it), but `_ssim` forms
+    # variances as E[x²] − E[x]², which catastrophically cancels once x is large,
+    # and the denominator carries only c2 = 9e-4 of protection before it crosses
+    # zero and produces NaN. Not worth removing for the marginal gradient.
     ssim = _ssim(F, ssim_rgb.clamp(0, 1).permute(0, 3, 1, 2), gt_rgb.permute(0, 3, 1, 2), window)
     loss = (1.0 - params.ssim_lambda) * l1 + params.ssim_lambda * (1.0 - ssim)
 
@@ -2391,12 +2621,38 @@ def _supervision_loss(  # noqa: ANN001
         loss = loss + params.alpha_lambda * aloss
 
     if gt_depth is not None and params.depth_lambda > 0.0 and depth_active:
-        gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
+        # Gate on the RENDER as well as the reference: where nothing crossed
+        # transmittance 0.5 the median depth is 0, and comparing that against a
+        # metres-away reference is a full-strength pull on whichever Gaussian the
+        # kernel names the median — pure noise during the window when coverage is
+        # still being built. Surface is the photometric/alpha terms' job; depth
+        # only positions surface that already renders.
+        gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0) & (pred_depth.detach() > 0)
         if mask is not None:
             gate = gate & (mask > 0)
         if gate.any():
-            dl = ((pred_depth - gt_depth).abs() * gate).sum() / (gate.sum() + 1e-8)
-            loss = loss + params.depth_lambda * dl
+            # Disparity space × scene_scale (the reference trainer's form): a
+            # dimensionless residual whose gradient falls off as 1/d², so the far
+            # wall stops outvoting the near table.
+            #
+            # FLOOR pred at a fraction of the reference depth, or 1/d is a
+            # SINGULARITY. gsplat's median depth is the frontmost thing on the ray
+            # (`RasterizeToPixels2DGSFwd.cu` overwrites it while T > 0.5), and one
+            # Gaussian that drifts near a camera projects to a huge screen radius —
+            # at 4 cm from a 1024² camera a 3 cm surfel covers the WHOLE frame, so
+            # every pixel's median depth collapses to 4 cm at once. Metric L1 saw a
+            # bounded ~3 m error there; raw disparity sees 25 and diverges (measured:
+            # loss 2.77 at step 1151, then non-finite means). Flooring at 0.1·gt caps
+            # the residual at 9·disp_gt — scale-free, and still a strong pull toward
+            # the truth — while leaving genuinely-nearer-than-truth surfaces the
+            # photometric term's job, which is where floater removal belongs.
+            pred = torch.maximum(pred_depth, _DEPTH_DISP_FLOOR_FRAC * gt_depth)
+            disp = torch.where(
+                pred > 0, 1.0 / pred.clamp_min(1e-6), torch.zeros_like(pred)
+            )
+            disp_gt = 1.0 / gt_depth.clamp_min(1e-6)
+            dl = ((disp - disp_gt).abs() * gate).sum() / (gate.sum() + 1e-8)
+            loss = loss + params.depth_lambda * scene_scale * dl
 
     # "Record both" glass-maker: the splat's EXPECTED depth vs the frozen cloud's
     # two-layer expected depth, over opaque-covered pixels where the cloud target
@@ -2417,7 +2673,13 @@ def _supervision_loss(  # noqa: ANN001
             loss = loss + params.depth_expected_lambda * el
 
     if params.normal_lambda > 0.0 and normals_active:
-        nerr = 1.0 - (normals * normals_from_depth).sum(dim=-1)
+        # Scale the depth-derived normal by the RENDERED alpha, as the reference
+        # trainer does: at a pixel the splat hasn't covered yet the depth patch is
+        # empty and its normal is arbitrary, so without this the term pulls the
+        # rendered normals toward garbage over exactly the pixels still being
+        # filled in. Zeroed there, the error is a constant 1 with no gradient.
+        nfd = normals_from_depth * pred_alpha.detach()
+        nerr = 1.0 - (normals * nfd).sum(dim=-1)
         fg_mask = gt_alpha.squeeze(-1) > params.alpha_gate
         if mask is not None:
             fg_mask = fg_mask & (mask.squeeze(-1) > 0)
@@ -2478,7 +2740,10 @@ def _blind_mask(torch, sh0):  # noqa: ANN001
     return (rgb < 0).all(dim=1)
 
 
-def _select_keep(torch, weights, sh0, opacities, means, init_means, eps, surface_max_dist, keep_count):  # noqa: ANN001
+def _select_keep(  # noqa: ANN001
+    torch, weights, sh0, opacities, means, init_means, eps, surface_max_dist, keep_count,
+    alpha_floor=0.005,
+):
     """Boolean keep-mask for compaction (module docstring §COMPACTION), composing
     up to three signals from the measured contribution `weights`:
       * LOSSLESS — keep every Gaussian with contribution > `eps` (below it it
@@ -2503,9 +2768,13 @@ def _select_keep(torch, weights, sh0, opacities, means, init_means, eps, surface
         d, _ = cKDTree(np.asarray(init_means)).query(means.detach().cpu().numpy(), k=1, workers=-1)
         keep = keep & torch.from_numpy(d <= float(surface_max_dist)).to(keep.device)
     if keep_count is not None and int(keep_count) < int(keep.sum()):
-        # α floor well below prune_opa: a near-dead Gaussian must not be promoted
-        # 50x by the normalization.
-        alpha = torch.sigmoid(opacities.detach().flatten()).clamp_min(0.02)
+        # Normalization floor = `prune_opa`, the lowest opacity a survivor can have.
+        # It bounds how far a near-dead Gaussian can be promoted (≤ 1/prune_opa)
+        # WITHOUT clamping anything that legitimately lives down there: a correct
+        # glass pane converges to ≈0.012 per surfel (see TrainParams.prune_opa), so
+        # the old fixed 0.02 floor under-ranked panes by ~1.7× — penalizing exactly
+        # the translucent-by-design content this normalization exists to protect.
+        alpha = torch.sigmoid(opacities.detach().flatten()).clamp_min(alpha_floor)
         rank = weights / alpha
         forced = blind & keep                         # blind survivors can't be ranked
         rankable = keep & ~forced
@@ -2567,6 +2836,7 @@ def _heal(  # noqa: ANN001
                 torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
                 pred_rgb, pred_alpha, pred_depth, normals, nfd, distort, mask,
                 normals_active=True, dist_active=(params.dist_lambda > 0.0),
+                scene_scale=scene_scale,
             )
             loss.backward()
             for opt in optimizers.values():
@@ -2580,6 +2850,134 @@ def _heal(  # noqa: ANN001
                 )
     finally:
         stop_ev.set()
+
+
+def _profile_report(prof, n_sampled, n_steps, wall_s, radii_px, params, n_final):  # noqa: ANN001
+    """Turn the in-loop timings into a RANKED, actionable speed report.
+
+    Returns `(summary, lines)` — `summary` lands in the run summary (status.json),
+    `lines` are logged so the bottleneck is visible without digging. Every
+    recommendation is gated on its own measurement, so this reports what THIS run
+    was actually limited by instead of listing generic advice. Two clocks are
+    involved: `data` is wall time the training thread spent BLOCKED waiting for the
+    prefetcher (measured every step, exact, no sync needed), while the GPU sections
+    are sync-bracketed on 1 step in `_PROFILE_EVERY` — accurate but only sampled,
+    since a per-step `cuda.synchronize()` would itself distort the run."""
+    step_ms = wall_s / max(n_steps, 1) * 1000.0
+    data_ms = prof["data"] / max(n_steps, 1) * 1000.0
+    s = max(n_sampled, 1)
+    gpu = {k: prof[k] / s * 1000.0 for k in ("render", "loss", "backward", "optim", "strategy")}
+    sampled_ms = max(sum(gpu.values()), 1e-9)
+    aa_ms = prof["aa"] / max(n_steps, 1) * 1000.0
+    ckpt_ms = prof["ckpt"] / max(n_steps, 1) * 1000.0
+    data_frac = data_ms / max(step_ms, 1e-9)
+    rad = {}
+    if radii_px:
+        a = np.asarray(radii_px, dtype=np.float64)
+        rad = {"median_px": float(np.median(a)), "p90_px": float(np.percentile(a, 90))}
+
+    summary = {
+        "step_ms": round(step_ms, 2),
+        "views_per_s": round(n_steps * max(params.batch, 1) / max(wall_s, 1e-9), 2),
+        "data_wait_ms": round(data_ms, 2),
+        "data_wait_frac": round(data_frac, 3),
+        "gpu_ms_sampled": {k: round(v, 2) for k, v in gpu.items()},
+        "aa_ms": round(aa_ms, 3),
+        "ckpt_ms": round(ckpt_ms, 3),
+        "projected_radius": {k: round(v, 1) for k, v in rad.items()},
+        "samples": n_sampled,
+    }
+
+    L = [
+        "=" * 72,
+        f"SPEED PROFILE — {n_steps:,} steps in {_fmt_hms(wall_s)} "
+        f"({step_ms:.1f} ms/step, {summary['views_per_s']:.1f} views/s, n={n_final:,})",
+        f"  data wait (blocked on loader) {data_ms:7.1f} ms/step  {data_frac * 100:5.1f}% of wall",
+        f"  --- GPU sections, sampled every {_PROFILE_EVERY} steps ({n_sampled} samples) ---",
+    ]
+    for k, v in sorted(gpu.items(), key=lambda kv: -kv[1]):
+        L.append(f"  {k:<29}{v:7.1f} ms/step  {v / sampled_ms * 100:5.1f}% of GPU time")
+    L.append(f"  anti-alias floor (amortized)  {aa_ms:7.1f} ms/step")
+    L.append(f"  checkpointing (amortized)     {ckpt_ms:7.1f} ms/step")
+    if rad:
+        L.append(
+            f"  projected Gaussian radius: median {rad['median_px']:.0f} px, "
+            f"p90 {rad['p90_px']:.0f} px (tile size 16 px)"
+        )
+
+    recs: list[str] = []
+    # 1. Loader. `data` is exact, so this verdict is not a guess.
+    if data_frac > 0.25:
+        recs.append(
+            f"LOADER-BOUND ({data_frac * 100:.0f}% of wall clock blocked on the prefetcher). "
+            f"`_view_stream` runs ONE decode thread; a pool of 4 should recover most of "
+            f"{data_ms:.0f} ms/step, i.e. ~{data_ms * 0.75 * n_steps / 1000 / 60:.0f} min of this run."
+        )
+    else:
+        recs.append(
+            f"Loader is NOT the bottleneck ({data_frac * 100:.0f}% of wall). Parallelizing the "
+            f"prefetch decode would buy at most {data_ms * n_steps / 1000 / 60:.1f} min — skip it."
+        )
+    # 2. Waste in the input path — only worth naming if the input path costs
+    #    anything. Listing these under a "loader is not the bottleneck" verdict
+    #    would contradict the line above and send someone optimizing 0.6% of a run.
+    if data_frac > 0.05:
+        if params.depth_lambda <= 0.0 and not params.depth_densify:
+            recs.append(
+                "FREE: the depth plane is decoded + uploaded every view but NOTHING consumes it "
+                "(depth_lambda=0, depth_densify off). Skipping it saves ~2.7 ms/view of CPU and "
+                "4.2 MB/view of PCIe."
+            )
+        recs.append(
+            "FREE: reference planes are cast to float32 on the CPU before upload (21.0 MB/view). "
+            "Uploading uint8 RGBA + uint16 depth codes and casting on the GPU is 3.3x less PCIe "
+            "and bit-identical for colour."
+        )
+    # 3. Rasterization, and the quality lever that shares its fix.
+    raster_frac = (gpu["render"] + gpu["backward"]) / sampled_ms
+    if raster_frac > 0.5:
+        # Qualify the headline: "most of GPU time" only means "most of the run"
+        # when the GPU is what the run is waiting on.
+        lead = (
+            f"RASTERIZATION-BOUND ({raster_frac * 100:.0f}% of GPU time in render+backward)"
+            if data_frac <= 0.25
+            else f"Within GPU time (only {(1 - data_frac) * 100:.0f}% of wall here), "
+                 f"render+backward is {raster_frac * 100:.0f}% — this becomes the ceiling "
+                 "once the loader is fixed"
+        )
+        msg = (
+            f"{lead}. 2DGS cost scales with covered pixels x blend depth, not primitive count."
+        )
+        if rad and rad["median_px"] > 16.0:
+            msg += (
+                f" The median Gaussian covers {rad['median_px']:.0f} px vs a 16 px tile, so each "
+                "one touches many tiles. `refine_scale2d_stop_iter` (gsplat's screen-space split "
+                "criterion) is currently 0 = OFF, so oversized Gaussians can only CLONE at the "
+                "same size. Enabling it makes them smaller: faster AND sharper."
+            )
+        recs.append(msg)
+    if gpu["optim"] / sampled_ms > 0.15:
+        recs.append(
+            f"Optimizer is {gpu['optim'] / sampled_ms * 100:.0f}% of GPU time — Adam over "
+            f"{n_final:,} x 59 floats. Degree-3 SH is 45 of those 59; sh_degree=2 would cut the "
+            "parameter state ~40% if the scene's view-dependence allows it."
+        )
+    if gpu["strategy"] / sampled_ms > 0.10:
+        recs.append(
+            f"Densification bookkeeping is {gpu['strategy'] / sampled_ms * 100:.0f}% of GPU time; "
+            "raising `refine_every` above 100 trades a little adaptivity for it."
+        )
+    if aa_ms > 2.0:
+        recs.append(
+            f"The anti-alias floor costs {aa_ms:.1f} ms/step amortized — it round-trips every mean "
+            "to the CPU for a KD-tree query. Raise `aa_every` or move it to the GPU."
+        )
+
+    L.append("  --- what to change ---")
+    L += [f"  {i + 1}. {r}" for i, r in enumerate(recs)]
+    L.append("=" * 72)
+    summary["recommendations"] = recs
+    return summary, L
 
 
 def _train_one(  # noqa: ANN001
@@ -2659,19 +3057,28 @@ def _train_one(  # noqa: ANN001
         optimizers["means"], gamma=0.01 ** (1.0 / max(params.iterations, 1))
     )
 
-    # The strategy gets the REAL reset cadence: besides gating the (in-loop)
-    # opacity reset below, `reset_every` also activates the strategy's scale-based
-    # prune (`step > reset_every` → prune_scale3d·scene_scale), matching the
-    # reference loop. reset_every=0 disables both by pushing the trigger past the
-    # last step. The reset itself fires in OUR loop — the pinned 1.5.3 wheel's
-    # internal trigger is dead code (see TrainParams.reset_every).
+    # `DefaultStrategy.reset_every` is NOT the opacity-reset cadence here: in the
+    # pinned gsplat 1.5.3 its only live use is `_prune_gs`'s `step > reset_every`
+    # gate on the scale prune (the wheel's own reset trigger is dead code — see
+    # TrainParams.reset_every), so we pass the size-prune warm-up in that slot and
+    # run the reset ourselves below. Gaussian size is therefore bounded for the
+    # whole refine window whether or not resets are enabled. It must stay ≥ 1: the
+    # dead trigger still evaluates `step % reset_every`.
     strategy = DefaultStrategy(
         prune_opa=params.prune_opa,
         grow_grad2d=params.grow_grad2d,
         grow_scale3d=params.grow_scale3d,
+        prune_scale3d=params.prune_scale3d,
+        # Screen-space split (see TrainParams). `refine_scale2d_stop_iter` arms
+        # both the split and the prune arm, so `prune_scale2d` is passed
+        # neutralized — subdividing oversized Gaussians is the point, deleting
+        # them is not.
+        refine_scale2d_stop_iter=params.refine_scale2d_stop_iter,
+        grow_scale2d=params.grow_scale2d,
+        prune_scale2d=params.prune_scale2d,
         refine_start_iter=params.refine_start_iter,
         refine_stop_iter=params.resolved_refine_stop,
-        reset_every=params.reset_every if params.reset_every > 0 else params.iterations + 1,
+        reset_every=max(params.prune_scale_start_iter, 1),
         refine_every=params.refine_every,
         # absgrad stays off: gsplat 1.5.3 never writes `.absgrad` on the 2DGS
         # `gradient_2dgs` tensor this strategy reads (see grow_grad2d note above).
@@ -2708,6 +3115,24 @@ def _train_one(  # noqa: ANN001
 
         cam_tree = cKDTree(centers)
     n_seeded = 0
+    # Latch for the reversible growth guards below, so the pause/resume transition
+    # is logged once instead of every step it holds.
+    growth_frozen = False
+
+    # Speed profile (see `_profile_report`). `data` is exact per-step wall time
+    # blocked on the prefetcher; the GPU sections are sync-bracketed on 1 step in
+    # `_PROFILE_EVERY`. `_lap` is only ever called on those sampled steps.
+    prof = dict.fromkeys(("data", "render", "loss", "backward", "optim", "strategy", "aa", "ckpt"), 0.0)
+    prof_n = 0
+    radii_px: list[float] = []
+    _mark = 0.0
+
+    def _lap(key: str) -> None:
+        nonlocal _mark
+        torch.cuda.synchronize()
+        now = time.perf_counter()
+        prof[key] += now - _mark
+        _mark = now
 
     n_last = int(splats["means"].shape[0])
     if progress is not None:
@@ -2748,7 +3173,13 @@ def _train_one(  # noqa: ANN001
         ref_colors, _ = _render_inputs(torch, ref_splats, 0)
 
     for step in range(start_step, params.iterations):
+        _t_data = time.perf_counter()
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
+        prof["data"] += time.perf_counter() - _t_data
+        sample = (step - start_step) % _PROFILE_EVERY == 0
+        if sample:
+            torch.cuda.synchronize()
+            _mark = time.perf_counter()
 
         # Tiled runs supervise only pixels this tile OWNS: its surface + true
         # background (exact ownership from the reference depth).
@@ -2762,6 +3193,16 @@ def _train_one(  # noqa: ANN001
         renders, pred_alpha, normals, normals_from_depth, distort, median_depth, info = _render_batch(
             torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on
         )
+        if sample:
+            _lap("render")
+            # Screen-space size drives 2DGS cost (covered pixels x blend depth) and
+            # is also what decides clone-vs-split, so it feeds both halves of the
+            # report. `info["radii"]` is [C,N,2] in pixels; 0 = not visible.
+            with torch.no_grad():
+                r = info["radii"].detach().amax(dim=-1).flatten()
+                r = r[r > 0]
+                if r.numel():
+                    radii_px.append(float(r.median()))
         pred_rgb = renders[..., :3]
         pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
         # Expected-depth channel (ED) + the frozen-cloud target for the glass-maker
@@ -2792,14 +3233,21 @@ def _train_one(  # noqa: ANN001
             normals_active=step >= params.normal_start_iter,
             dist_active=dist_on and step >= params.dist_start_iter,
             depth_active=step >= params.depth_start_iter,
+            scene_scale=scene_scale,
             pred_expected=pred_expected, ed_target=ed_target, ed_gate=ed_gate,
         )
+        if sample:
+            _lap("loss")
 
         loss.backward()
+        if sample:
+            _lap("backward")
         for opt in optimizers.values():
             opt.step()
             opt.zero_grad(set_to_none=True)
         means_sched.step()
+        if sample:
+            _lap("optim")
 
         if params.refine:
             strategy.step_post_backward(splats, optimizers, strat_state, step, info, packed=False)
@@ -2819,34 +3267,51 @@ def _train_one(  # noqa: ANN001
             ):
                 reset_opa(
                     params=splats, optimizers=optimizers, state=strat_state,
-                    value=params.prune_opa * 2.0,
+                    value=params.reset_opa_value,
                 )
                 if progress is not None:
                     progress(
                         step + 1, params.iterations,
-                        f"opacity reset @{step} (ceiling {2 * params.prune_opa:.2f}) "
+                        f"opacity reset @{step} (ceiling {params.reset_opa_value:.2f}) "
                         f"n={len(splats['means'])}",
                     )
-            # Adaptive VRAM: cap_max is the hard ceiling; also freeze densification
-            # when free VRAM nears the WDDM shared-memory cliff (after one empty_cache
-            # retry to release reusable cached blocks), so growth can't collapse
-            # throughput into PCIe paging.
-            if len(splats["means"]) > params.cap_max:
-                strategy.refine_stop_iter = step
-            elif params.vram_min_free_gb > 0.0 and step < strategy.refine_stop_iter:
-                need = params.vram_min_free_gb * 1e9
-                free_b = torch.cuda.mem_get_info()[0]
-                if free_b < need:
-                    torch.cuda.empty_cache()
-                    free_b = torch.cuda.mem_get_info()[0]
-                    if free_b < need:
-                        strategy.refine_stop_iter = step
-                        if progress is not None:
-                            progress(
-                                step + 1, params.iterations,
-                                f"VRAM guard: {free_b / 1e9:.2f}GB free < {params.vram_min_free_gb}GB - "
-                                f"froze densification at n={len(splats['means'])}",
-                            )
+            # GROWTH guards — the optional count ceiling and the VRAM free-margin
+            # (the latter after one empty_cache retry to release reusable cached
+            # blocks, so growth can't collapse throughput into PCIe paging).
+            # Neither may end refinement outright: gsplat's `step_post_backward`
+            # returns early once `step >= refine_stop_iter`, so moving that (what
+            # this used to do) stops PRUNING as well and freezes the model around
+            # whatever it was holding — including the size prune, leaving runaway
+            # Gaussians permanently. Raising the growth threshold out of reach
+            # instead leaves `_prune_gs` running every `refine_every`, which is
+            # precisely what you want under pressure since pruning gives memory
+            # back. Both guards are REVERSIBLE: growth resumes once the count or
+            # the free margin recovers.
+            if step < strategy.refine_stop_iter:
+                over_cap = params.cap_max is not None and len(splats["means"]) > params.cap_max
+                tight_vram = False
+                if not over_cap and params.vram_min_free_gb > 0.0:
+                    need = params.vram_min_free_gb * 1e9
+                    if torch.cuda.mem_get_info()[0] < need:
+                        torch.cuda.empty_cache()
+                        tight_vram = torch.cuda.mem_get_info()[0] < need
+                freeze_growth = over_cap or tight_vram
+                strategy.grow_grad2d = float("inf") if freeze_growth else params.grow_grad2d
+                if freeze_growth != growth_frozen and progress is not None:
+                    why = (
+                        f"count ceiling {params.cap_max:,} reached" if over_cap
+                        else f"free VRAM < {params.vram_min_free_gb}GB" if tight_vram
+                        else "pressure cleared"
+                    )
+                    progress(
+                        step + 1, params.iterations,
+                        f"{'pausing' if freeze_growth else 'resuming'} densification "
+                        f"@{step} ({why}) n={len(splats['means'])} - pruning stays on",
+                    )
+                growth_frozen = freeze_growth
+        if sample:
+            _lap("strategy")
+            prof_n += 1
 
         # Depth-guided densification: seed Gaussians at reference surfaces the splat
         # is missing (holes / too-far). After the strategy so this step's `info` is
@@ -2856,7 +3321,7 @@ def _train_one(  # noqa: ANN001
             params.depth_densify
             and params.depth_densify_start <= step < strategy.refine_stop_iter
             and (step + 1) % max(params.depth_densify_every, 1) == 0
-            and len(splats["means"]) < params.cap_max
+            and (params.cap_max is None or len(splats["means"]) < params.cap_max)
         ):
             tight = (
                 params.vram_min_free_gb > 0.0
@@ -2877,7 +3342,22 @@ def _train_one(  # noqa: ANN001
         # Anti-aliasing floor: keep every Gaussian resolvable by its nearest camera
         # so it can't shimmer across the scale-ladder octaves under free-fly.
         if params.antialias and cam_tree is not None and (step + 1) % max(params.aa_every, 1) == 0:
+            _t_aa = time.perf_counter()
             _aa_scale_floor(torch, splats, cam_tree, focal, params.aa_min_scale_px)
+            prof["aa"] += time.perf_counter() - _t_aa
+
+        # Divergence guard — free, because the log below already syncs on the loss.
+        # Without it a NaN propagates silently into the params and surfaces much
+        # later somewhere unrelated (a non-finite mean crashes `_aa_scale_floor`'s
+        # KD-tree up to `aa_every` steps on), which hides both the step it began and
+        # the term responsible.
+        if step % log_every == 0 and not np.isfinite(float(loss)):
+            raise RuntimeError(
+                f"stage6: loss went non-finite at step {step} "
+                f"(n={len(splats['means'])}, scene_scale={scene_scale:.2f}) — training "
+                "diverged. Bisect the loss terms: depth_lambda first (1/d is the only "
+                "term with a singularity), then alpha_lambda, then the LRs."
+            )
 
         if progress is not None and (step % log_every == 0 or step == params.iterations - 1):
             now = time.perf_counter()
@@ -2902,10 +3382,12 @@ def _train_one(  # noqa: ANN001
             and (step + 1) % params.ckpt_every == 0
             and step + 1 < params.iterations
         ):
+            _t_ck = time.perf_counter()
             _save_checkpoint(
                 torch, ckpt_dir, step, splats, optimizers, means_sched,
                 strat_state, meta, params.ckpt_keep,
             )
+            prof["ckpt"] += time.perf_counter() - _t_ck
 
     # Release the prefetch worker (tiled runs create one stream per tile).
     stop_ev.set()
@@ -2917,6 +3399,19 @@ def _train_one(  # noqa: ANN001
     # used to run here is gone with the fold-out; Stage 7 heals globally.)
     with torch.no_grad():
         arrays = {k: v.detach().cpu().numpy() for k, v in splats.items()}
+
+    # Where the wall clock actually went, and what to do about it. Logged as well
+    # as returned, so it is readable in the live heartbeat and durable in the
+    # recorded summary.
+    train_s = time.perf_counter() - t_start
+    n_ran = max(params.iterations - start_step, 1)
+    profile, lines = _profile_report(
+        prof, prof_n, n_ran, train_s, radii_px, params, int(arrays["means"].shape[0])
+    )
+    if progress is not None:
+        for line in lines:
+            progress(params.iterations, params.iterations, line)
+
     info = {
         "init": n_init,
         "final": int(arrays["means"].shape[0]),
@@ -2925,7 +3420,8 @@ def _train_one(  # noqa: ANN001
         "compacted": 0,          # moved to Stage 7 (heal_splat)
         "compact_search": None,
         "views": n_views,
-        "train_s": round(time.perf_counter() - t_start, 1),
+        "train_s": round(train_s, 1),
+        "profile": profile,
     }
     return arrays, info
 
@@ -3028,12 +3524,13 @@ def _main() -> None:
     )
     ap.add_argument(
         "--iterations", type=int, default=TrainParams.iterations,
-        help="VIEW-DRAW budget (optimizer steps × batch); steps run = iterations // batch",
+        help="OPTIMIZER STEPS (gsplat max_steps / PostShot's step box), and the "
+             "length every cadence is written against",
     )
     ap.add_argument(
         "--epochs", type=float, default=TrainParams.epochs,
-        help="passes over the view set; overrides --iterations "
-             "(budget = epochs × n_views, steps = budget // batch)",
+        help="size the run as passes over the view set instead "
+             "(steps = epochs × n_views / batch); rescales every cadence to match",
     )
     ap.add_argument(
         "--refine-stop-iter", type=int, default=None,
@@ -3041,8 +3538,8 @@ def _main() -> None:
     )
     ap.add_argument(
         "--batch", type=int, default=TrainParams.batch,
-        help="views per optimizer step (fills the GPU); steps = budget // batch, "
-             "so it's a speed knob at CONSTANT work (no need to adjust iterations)",
+        help="views averaged per optimizer step (gsplat batch_size); MULTIPLIES "
+             "work — the step count is --iterations either way",
     )
     ap.add_argument(
         "--init-opa", type=float, default=TrainParams.init_opa,
@@ -3072,7 +3569,7 @@ def _main() -> None:
     ap.add_argument(
         "--tile-max", type=int, default=None,
         help="max init Gaussians for a single run; larger clouds train as ground-"
-             "plane tiles and merge (default: 2/3 of cap_max; 0 disables tiling)",
+             f"plane tiles and merge (default {_TILE_BUDGET_DEFAULT:,}; 0 disables tiling)",
     )
     ap.add_argument(
         "--resume", action=argparse.BooleanOptionalAction, default=True,

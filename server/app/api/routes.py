@@ -2458,10 +2458,12 @@ class ModalTrainRequest(BaseModel):
     """Remote-train knobs — ALL optional and ALL owned by the CLIENT. The server
     forwards whatever is set straight through to the Stage-6 trainer and injects
     no training-length policy of its own (defaults live in the client UI; the
-    library's TrainParams only carries mechanism fallbacks). `epochs` sets the
-    training length as passes over the view set (iterations = epochs × n_views);
-    `iterations` is the raw view-draw budget fallback; `batch` is the GPU-fill
-    speed knob. `restart` forces a from-scratch remote run (drop the checkpoint +
+    library's TrainParams only carries mechanism fallbacks). `iterations` is the
+    OPTIMIZER-STEP count (gsplat `max_steps` / PostShot's step box); `epochs`
+    overrides it with a view-set-relative length (steps = epochs × n_views /
+    batch, rescaling every cadence to match); `batch` is how many views each step
+    averages, which multiplies work per step rather than shortening the run.
+    `restart` forces a from-scratch remote run (drop the checkpoint +
     trained.ply for this cell) instead of resuming."""
 
     epochs: float | None = None
