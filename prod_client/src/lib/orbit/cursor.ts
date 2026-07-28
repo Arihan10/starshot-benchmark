@@ -81,6 +81,10 @@ export class SurfaceCursor {
 		this.ring.visible = false;
 	}
 
+	setColor(color: number) {
+		(this.ring.material as MeshBasicMaterial).color.setHex(color);
+	}
+
 	dispose() {
 		this.scene.remove(this.ring);
 		this.ring.geometry.dispose();

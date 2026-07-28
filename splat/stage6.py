@@ -1,4 +1,27 @@
-"""Stage 6 — Splat fine-tune (the training run) via gsplat 2DGS.
+"""Stage 6 — Splat fine-tune (the training run) via gsplat.
+
+REPRESENTATION (`TrainParams.representation`) selects which gsplat rasterizer —
+and therefore which primitive — the whole stage trains, exports and heals:
+
+  * **"2dgs"** (default) — `rasterization_2dgs`: flat, surface-aligned surfels
+    (two tangent scales, the third axis a splitter decoy). The render operator
+    matches Stage 3's init exactly, its MEDIAN depth lands on the nearest opaque
+    surface (the glass-safe depth target), and it carries the normal-consistency
+    + distortion regularizers. Best geometry; the historical path, unchanged.
+  * **"3dgs"** — `rasterization`: full 3D Gaussians (three real scales). Gains
+    what gsplat only implements on the 3DGS path — AbsGS densification
+    (`absgrad`), the Mip-Splatting 2D opacity compensation
+    (`rasterize_mode="antialiased"`), and the packed projection — and matches
+    what every DELIVERY renderer actually is (PlayCanvas / mkkellogg gsplat both
+    rasterize 3D Gaussians; the SOG/ksplat encoders currently have to fake a
+    third scale). Costs the three 2DGS-only rasterizer outputs: median depth
+    (→ expected depth, see `depth_mode`), rendered normals (→ the `flat_lambda` /
+    `aniso_lambda` parameter-space surface priors) and distortion (unused here).
+
+Everything else in the stage — the view stream, the tiling, depth-guided
+densification, the compaction measure, the LOD ladder, the checkpoints — is
+shared, and the on-disk `.ply` differs only in its scale-column count (two vs
+three), which every downstream consumer already handles.
 
 Takes a **COLMAP model** as its ONLY input — the same (point cloud + camera poses
 + reference images) triple Postshot ingests and gsplat's `simple_trainer_2dgs`
@@ -19,17 +42,22 @@ machinery below is retained because Stage 7 `heal_splat` still consumes the
 alpha+depth Stage-5 references.)
 
 WHAT THE FINE-TUNE FIXES (all lighting-independent of the loss's own): render-
-operator errors that only appear once flat disks are depth-sorted + alpha-blended
-through the real rasterizer — silhouettes, thin geometry, zoom-in detail, alpha
-edges — plus floaters. The surfel init is ~90% there; this polishes the rest.
+operator errors that only appear once the primitives are depth-sorted +
+alpha-blended through the real rasterizer — silhouettes, thin geometry, zoom-in
+detail, alpha edges — plus floaters. The surfel init is ~90% there; this polishes
+the rest.
 
 CONTRACT (locked, shared with Stages 4/5 — see overview §12):
   * Init map (`cloud.ply`, a Stage-3 2DGS `.ply`, SH degree 0):
       means = xyz; quats = rot_0..3 (wxyz); opacity = logit (pre-sigmoid);
       scale_0/1 = log tangent radii (isotropic); f_dc_0..2 = SH0 colour coeffs.
-      gsplat 2DGS wants 3 scales, so a third log-scale = the tangent one is
-      synthesized (rendering uses only the two in-plane axes; the third only
-      feeds the strategy's scene-scale-normalized grow/prune thresholds).
+      Both rasterizers take 3 scales, so a third log-scale is synthesized off the
+      smaller tangent radius — and since Stage 3 aligns the quaternion's local +Z
+      to the surface normal, that axis IS the thickness. Under 2DGS it is a
+      training-only decoy at `_THIN_AXIS_FRAC` (nothing renders it; it exists so
+      the strategy's split doesn't eject children off the surface plane, and it
+      never ships). Under 3DGS it is real geometry at
+      `TrainParams.init_thickness_frac`, and it ships.
   * Poses: `transform_matrix` is OpenCV camera-to-world → `viewmats = inv(c2w)`.
     Intrinsics: pinhole `K = [[fl_x,0,cx],[0,fl_y,cy],[0,0,1]]`.
   * Depth: planar camera-space Z (metres), decoded from the SZF frame's log-uint16
@@ -67,10 +95,14 @@ determine:
     transmittance-0.5 crossing, which lands on the nearest opaque surface and so
     leaves transmissive glass untouched; `depth_mode="expected"` instead hunts
     front floaters at the cost of razing glass — see TrainParams.depth_mode),
-    gated to pixels where BOTH the reference and the render hold a surface;
-  * 2DGS regularizers — normal consistency (render normals vs normals-from-depth,
-    the latter scaled by rendered alpha as in the reference) and optional depth
-    distortion.
+    gated to pixels where BOTH the reference and the render hold a surface. On the
+    3DGS path only expected depth exists, so the gate additionally EXCLUDES the
+    pixels the init cloud says hold a transmissive layer (`glass_guard`);
+  * geometry prior, per representation — 2DGS: normal consistency (render normals
+    vs normals-from-depth, the latter scaled by rendered alpha as in the reference)
+    plus optional depth distortion. 3DGS: flatness and bounded anisotropy on the
+    scale parameters (`flat_lambda` / `aniso_lambda`), since that rasterizer
+    returns neither a normal nor a distortion map to tie a loss to.
 
 RESUMABLE: every `ckpt_every` steps the full training state (params + per-param
 Adam + means LR schedule + densification-strategy accumulators + step) is written
@@ -118,8 +150,8 @@ Gaussians, built by opacity·area-weighted MOMENT MATCHING (cluster mean/
 covariance → tangent frame via eigendecomposition; opacity preserves the
 cluster's opacity·area within the new disk). A pulled-back camera renders the
 coarse level as a prefiltered anti-aliased average instead of shimmering
-sub-pixel splats, and the same 2DGS `.ply` layout means every existing viewer /
-compressor reads the levels unchanged.
+sub-pixel splats, and the same `.ply` layout (and representation) as the base
+model means every existing viewer / compressor reads the levels unchanged.
 
 COMPACTION (delivered-size cleanup): after the optimization, a measured pass
 deletes Gaussians the delivered splat doesn't need, then briefly re-tunes the
@@ -172,7 +204,7 @@ import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 import numpy as np
 
@@ -186,8 +218,9 @@ from splat.stage5 import (
 
 logging.getLogger("PIL").setLevel(logging.ERROR)
 
-# The optimized splat written under a cell's `splat/` dir (a 2DGS `.ply`, the
-# same layout Stage 3 emits so Stage 7/8 + the viewer read it identically).
+# The optimized splat written under a cell's `splat/` dir (the same `.ply` layout
+# Stage 3 emits, so Stage 7/8 + the viewer read it identically; the scale-column
+# count records which representation trained it — see `_ply_representation`).
 TRAINED_NAME = "trained.ply"
 
 # SH degree-0 basis constant (matches Stage 3/4): colour = 0.5 + C0·f_dc, so a
@@ -198,6 +231,24 @@ _SH_C0 = 0.28209479177387814
 # the reference depth for that pixel — the singularity guard for 1/d. See the depth
 # term in `_supervision_loss`; 0.1 caps the residual at 9× the true disparity.
 _DEPTH_DISP_FLOOR_FRAC = 0.1
+
+# The two primitives this stage can train (see the module docstring).
+REPRESENTATIONS = ("2dgs", "3dgs")
+
+# 2DGS third-scale fraction. On the 2DGS path the normal axis is NOT rendered, so
+# this is purely a splitter guard: `DefaultStrategy.split` displaces children along
+# all three scaled axes, and a normal-axis scale equal to the tangent radius would
+# eject every child a full radius off its own plane. 1% of the smaller tangent
+# radius keeps splits in-plane. (On the 3DGS path the third axis is real geometry,
+# sized by `TrainParams.init_thickness_frac` instead.)
+_THIN_AXIS_FRAC = 0.01
+
+# Tolerance (fraction of reference depth) below which the init cloud's two-layer
+# EXPECTED depth is taken to agree with the stored opaque plane — i.e. the pixel
+# holds no transmissive layer. Used only when the depth statistic is `expected`
+# (always, on the 3DGS path), to keep the opaque-plane depth loss off glass; see
+# the depth term in `_supervision_loss`.
+_ED_GLASS_TOL_FRAC = 0.02
 
 # progress(done, total, message) — called periodically during training.
 ProgressCb = Callable[[int, int, str], None]
@@ -263,6 +314,78 @@ class TrainParams:
     `refine_stop_iter` defaults to None → 50% of the step count, the reference's
     15k/30k."""
 
+    # PRIMITIVE — "2dgs" (surfels, the default) or "3dgs" (full 3D Gaussians).
+    # See the module docstring §REPRESENTATION. This one field selects the gsplat
+    # rasterizer, which regularizers are available, the third-scale semantics, the
+    # densification gradient key and the exported `.ply` scale-column count, so it
+    # is part of every cache signature (`as_summary`, `_TileGrid.signature`) and of
+    # the checkpoint metadata — a run can never resume another representation's
+    # state.
+    representation: str = "2dgs"
+
+    # --- 3DGS-ONLY quality knobs (ignored, and inert, under "2dgs") ------------
+    # AbsGS densification (arXiv:2404.10484): densify on the ABSOLUTE per-view 2D
+    # gradient instead of its signed mean, so a Gaussian straddling two edges that
+    # pull opposite ways still registers as under-fitted. It is the single biggest
+    # quality lever gsplat offers that the 2DGS path CANNOT use — the 2DGS backward
+    # attaches `.absgrad` to `means2d` while `DefaultStrategy` densifies off the
+    # separate `gradient_2dgs` tensor, which never receives one (see `grow_grad2d`).
+    # None = auto: ON for 3dgs, forced OFF for 2dgs. Absolute gradients are
+    # strictly larger than signed means, so the split threshold must rise with it —
+    # `grow_grad2d_abs` replaces `grow_grad2d` whenever absgrad is active (0.0008
+    # is gsplat's own recommendation for the swap).
+    absgrad: bool | None = None
+    grow_grad2d_abs: float = 0.0008
+    # Screen-space filter (gsplat `rasterize_mode`). "antialiased" applies the
+    # Mip-Splatting 2D compensation: the rasterizer dilates every projected 2D
+    # covariance by `eps2d` to keep sub-pixel Gaussians from vanishing between
+    # samples, and this scales opacity by sqrt(det(Σ)/det(Σ+eps2d)) so a Gaussian
+    # the camera cannot resolve gets DIMMER instead of being smeared over a full
+    # pixel at full strength. Together with the `antialias` scale floor below (the
+    # Mip-Splatting 3D filter) this is the complete Mip-Splatting pair, and it is
+    # the right answer to the free-fly shimmer the scale ladder otherwise fights.
+    # "classic" = the original 3DGS dilation, no compensation.
+    rasterize_mode: str = "antialiased"
+    # gsplat's packed projection: keep only the (camera, Gaussian) pairs that
+    # actually intersect, instead of a dense [C,N] buffer. Big VRAM saving on wide
+    # plans — which is what decides whether a scene needs TILING at all — at a
+    # small indexing cost. 3DGS-only: gsplat's packed 2DGS RGB+ED path is broken
+    # (its SH branch mis-broadcasts and the precomputed-colour path skips the
+    # visible-subset gather), so it is forced off under "2dgs".
+    packed: bool = False
+    # Init thickness of the third (normal) axis, as a fraction of the tangent
+    # radius, when a 3DGS run seeds from a 2-scale Stage-3 cloud. Matches Stage 3's
+    # own `_FLATNESS`, i.e. a ~3 mm shell on a 3 cm surfel: thin enough to read as
+    # a surface from step 0, thick enough that the axis carries real gradient
+    # (the 2DGS decoy `_THIN_AXIS_FRAC` of 1% is 10x below that and would start the
+    # normal axis effectively frozen).
+    init_thickness_frac: float = 0.1
+    # SURFACE PRIOR, the 3DGS stand-in for 2DGS normal consistency. 3DGS has no
+    # rendered normal to tie to the depth, so flatness is imposed in PARAMETER
+    # space instead. Every surface in these scenes comes from a mesh, so "stay a
+    # disk" is exactly the right prior — it is what keeps a 3D Gaussian from
+    # fattening off-surface once the photometric loss is satisfied.
+    #
+    # A CONSTRAINT, not a standing pressure: the penalty is relu(smallest/largest −
+    # `flat_max`), so anything already flatter than that ratio costs nothing (the
+    # init, at `init_thickness_frac`, starts free). A plain ratio penalty would
+    # instead push every Gaussian toward zero thickness for the whole run — and
+    # since Adam sizes its step by gradient CONSISTENCY rather than magnitude, even
+    # a tiny constant pressure on an axis the render barely depends on walks that
+    # axis down ~lr per step, i.e. to collapse. The denominator is detached either
+    # way, so the term can only THIN a Gaussian, never inflate its footprint to
+    # satisfy the ratio. Shares `normal_start_iter`'s warm-up: like normal
+    # consistency, it must not lock in half-built geometry.
+    flat_lambda: float = 0.05
+    flat_max: float = 0.25
+    # NEEDLE guard: penalize (largest / middle scale) above `aniso_max`. Measured
+    # on a real run, unbounded 3D Gaussians reached 256:1 anisotropy, which is the
+    # classic 3DGS spike artifact — invisible from the training views that made it
+    # and a bright sliver from anywhere else. Unlike `flat_lambda` this term is
+    # two-sided by design (shrink the long axis, grow the middle one).
+    aniso_lambda: float = 0.01
+    aniso_max: float = 10.0
+
     # OPTIMIZER STEPS (gsplat `max_steps` / PostShot's step box), and the length
     # every cadence below is written against. `epochs` overrides it when set.
     iterations: int = 30_000
@@ -304,7 +427,22 @@ class TrainParams:
     # init cloud, so NO capture change / re-render is needed. 0 disables (default
     # off until validated); only meaningful with the surfels init.
     depth_expected_lambda: float = 0.0
+    # Keep the opaque-plane depth term OFF transmissive pixels when the depth
+    # statistic is EXPECTED (i.e. always, on the 3DGS path — see `depth_mode`).
+    # Expected depth cannot distinguish a correctly-reconstructed pane from a
+    # floater, so supervising it against the stored opaque plane is a standing
+    # instruction to delete the pane; this renders the frozen init cloud's own
+    # two-layer expected depth and drops the pixels where the two disagree. It is
+    # what stops the 3DGS path from repeating the measured 2DGS `depth_mode=
+    # "expected"` result (glass razed). Costs ONE extra no-grad degree-0 forward
+    # per step — and nothing at all when `depth_expected_lambda` > 0, which already
+    # renders that cloud, or when `depth_lambda` is 0. Turn it off for a scene with
+    # no transmissive materials.
+    glass_guard: bool = True
     alpha_gate: float = 0.5            # reference α above this = opaque pixel (depth/normal masks)
+    # 2DGS-ONLY (the 3DGS rasterizer returns neither a rendered normal nor a
+    # distortion map): normal consistency and depth distortion. Under "3dgs" both
+    # are inert and `flat_lambda` / `aniso_lambda` stand in for the first.
     normal_lambda: float = 0.05        # 2DGS normal consistency
     dist_lambda: float = 0.0           # 2DGS depth distortion (off by default; over-flattens bounded scenes)
     # Let geometry settle before the regularizers bite — the reference's 7k/30k
@@ -433,8 +571,10 @@ class TrainParams:
     # the 2DGS path off a SEPARATE `gradient_2dgs` tensor (`rendering.py` densify)
     # that never receives an `.absgrad` — so `absgrad=True` + key_for_gradient=
     # "gradient_2dgs" raises `'Tensor' object has no attribute 'absgrad'` in
-    # `_update_state`. AbsGS is a 3DGS-`means2d`-only feature here, so we stay on
-    # the mean-gradient criterion (which is what trained every working run).
+    # `_update_state`. AbsGS is therefore a `means2d`-only feature, i.e. the 3DGS
+    # path — where it IS enabled by default and this threshold is superseded by
+    # `grow_grad2d_abs`. Under "2dgs" we stay on the mean-gradient criterion
+    # (which is what trained every working run).
     grow_grad2d: float = 0.0002
     grow_scale3d: float = 0.01
     # SCREEN-SPACE split. `grow_scale3d` is scene-relative, so it asks "is this
@@ -565,6 +705,11 @@ class TrainParams:
     # would alias — shimmer across the scale ladder's octaves under free-fly. The
     # floor scales with distance, so close-viewed detail and large surfaces are
     # untouched; only genuinely sub-pixel Gaussians are inflated.
+    #
+    # Under "3dgs" the floor applies to each Gaussian's two LARGEST axes rather
+    # than to columns 0/1, so it guarantees screen footprint without inflating the
+    # thin (normal) axis and undoing `flat_lambda`. It is the 3D half of
+    # Mip-Splatting; `rasterize_mode="antialiased"` is the 2D half.
     antialias: bool = True
     aa_min_scale_px: float = 1.0
     aa_every: int = 200
@@ -598,10 +743,9 @@ class TrainParams:
     depth_densify_opacity: float = 0.5
     depth_densify_scale_px: float = 1.0
 
-    # Runtime. (2DGS renders non-packed: gsplat's packed depth path is broken —
-    # its SH branch mis-broadcasts and its precomputed-colour path skips the
-    # visible-subset gather, so RGB+ED crashes once a view sees only part of the
-    # cloud. Non-packed is also cheap at our per-cell Gaussian counts.)
+    # Runtime. (The 2DGS path always renders non-packed — gsplat's packed 2DGS depth
+    # path is broken, and non-packed is cheap at our per-cell counts anyway. The
+    # 3DGS path can pack; see `packed`.)
     near_plane: float = 0.01
     far_plane: float = 1e10
     # Depth statistic the depth loss (and normals-from-depth) compares. "median"
@@ -620,6 +764,15 @@ class TrainParams:
     # plus a measured-contribution + opacity prune. Choose "expected" only for a
     # run whose geometric post-cull is disabled and that has no transmissive
     # surfaces to protect.
+    #
+    # 2DGS-ONLY CHOICE. The 3DGS rasterizer renders no median depth (gsplat's
+    # `rasterization` offers accumulated "D" and expected "ED" and nothing else),
+    # so `resolved_depth_mode` forces "expected" there. Because expected depth
+    # cannot tell a real pane from a floater in front of a wall, the depth term
+    # then EXCLUDES pixels where the init cloud's own two-layer expected depth
+    # disagrees with the stored opaque plane (`_ED_GLASS_TOL_FRAC`) — glass is left
+    # to the photometric terms and to `depth_expected_lambda`, which is the one
+    # depth target already formulated in expected-depth space.
     depth_mode: str = "median"
     seed: int = 0
     eval_max_views: int = 128          # cap final-metric renders (plans can have thousands of views)
@@ -658,6 +811,78 @@ class TrainParams:
     # levels stop early once a level would hold ≤ `lod_min_count`. 0 disables.
     lod_levels: int = 3
     lod_min_count: int = 150_000
+
+    def __post_init__(self) -> None:
+        """Reject unknown enum values at construction. These arrive from JSON job
+        specs (`TrainParams(**spec["train"])`), and a typo like "3DGS" would
+        otherwise fall through every `== "3dgs"` test and silently train the other
+        representation for hours."""
+        if self.representation not in REPRESENTATIONS:
+            raise ValueError(
+                f"representation must be one of {REPRESENTATIONS}, got {self.representation!r}"
+            )
+        if self.rasterize_mode not in ("classic", "antialiased"):
+            raise ValueError(
+                f"rasterize_mode must be 'classic' or 'antialiased', got {self.rasterize_mode!r}"
+            )
+        if self.depth_mode not in ("median", "expected"):
+            raise ValueError(
+                f"depth_mode must be 'median' or 'expected', got {self.depth_mode!r}"
+            )
+
+    @property
+    def is_3dgs(self) -> bool:
+        return self.representation == "3dgs"
+
+    @property
+    def n_scales(self) -> int:
+        """Scale columns in the exported `.ply`: 3 real axes for 3DGS, the two
+        tangent radii for 2DGS (whose third axis is a training-only decoy)."""
+        return 3 if self.is_3dgs else 2
+
+    @property
+    def resolved_absgrad(self) -> bool:
+        """AbsGS densification. Forced OFF on 2DGS (gsplat never writes `.absgrad`
+        on that path's densification tensor — it would raise mid-run); defaults ON
+        for 3DGS, where it is the biggest available quality win."""
+        if not self.is_3dgs:
+            return False
+        return True if self.absgrad is None else bool(self.absgrad)
+
+    @property
+    def resolved_grow_grad2d(self) -> float:
+        """Split threshold matched to the gradient statistic in use — absolute
+        gradients are larger than signed means, so they need a higher bar."""
+        return self.grow_grad2d_abs if self.resolved_absgrad else self.grow_grad2d
+
+    @property
+    def resolved_depth_mode(self) -> str:
+        """The depth statistic the loss compares. 3DGS has no median depth, so the
+        expected-depth channel is the only option there (see `depth_mode`)."""
+        return "expected" if self.is_3dgs else self.depth_mode
+
+    @property
+    def resolved_glass_guard(self) -> bool:
+        """Whether the transmissive-pixel exclusion actually engages: only the
+        EXPECTED depth statistic needs it, and only if there is a depth term to
+        exclude pixels from (see `glass_guard`)."""
+        return (
+            bool(self.glass_guard)
+            and self.resolved_depth_mode == "expected"
+            and self.depth_lambda > 0.0
+        )
+
+    @property
+    def resolved_packed(self) -> bool:
+        """gsplat's packed projection — 3DGS only (its packed 2DGS RGB+ED path is
+        broken upstream)."""
+        return bool(self.packed) and self.is_3dgs
+
+    @property
+    def resolved_thickness_frac(self) -> float:
+        """Third-scale fraction for a seed built from two tangent radii: real
+        thickness on the 3DGS path, splitter decoy on the 2DGS one."""
+        return self.init_thickness_frac if self.is_3dgs else _THIN_AXIS_FRAC
 
     @property
     def resolved_refine_stop(self) -> int:
@@ -722,7 +947,14 @@ class TrainParams:
         )
 
     def as_summary(self) -> dict[str, Any]:
-        return {
+        """The knobs that define a run — recorded in `status.json` AND hashed into
+        the Modal stage-6/7 idempotency signature, so anything omitted here can
+        silently skip a re-run that should have happened. Representation-specific
+        knobs are reported only for the representation they act on (RESOLVED, i.e.
+        what the loop will actually execute), so flipping an inert one can't
+        invalidate an unrelated cell's cache."""
+        s: dict[str, Any] = {
+            "representation": self.representation,
             "iterations": self.iterations,
             "epochs": self.epochs,
             "batch": self.batch,
@@ -735,11 +967,10 @@ class TrainParams:
             "depth_lambda": self.depth_lambda,
             "depth_expected_lambda": self.depth_expected_lambda,
             "depth_start_iter": self.depth_start_iter,
-            "depth_mode": self.depth_mode,
+            "depth_mode": self.resolved_depth_mode,
+            "glass_guard": self.resolved_glass_guard,
             "alpha_gate": self.alpha_gate,
-            "normal_lambda": self.normal_lambda,
             "normal_start_iter": self.normal_start_iter,
-            "dist_lambda": self.dist_lambda,
             "refine": self.refine,
             "refine_stop_iter": self.resolved_refine_stop,
             "reset_every": self.reset_every,
@@ -748,7 +979,8 @@ class TrainParams:
             "refine_scale2d_stop_iter": self.refine_scale2d_stop_iter,
             "grow_scale2d": self.grow_scale2d,
             "prune_scale2d": self.prune_scale2d,
-            "grow_grad2d": self.grow_grad2d,
+            "grow_grad2d": self.resolved_grow_grad2d,
+            "absgrad": self.resolved_absgrad,
             "prune_opa": self.prune_opa,
             "final_prune": self.final_prune,
             "prune_scale3d": self.prune_scale3d,
@@ -773,18 +1005,40 @@ class TrainParams:
             "tile_margin_frac": self.tile_margin_frac,
             "lod_levels": self.lod_levels,
         }
+        if self.is_3dgs:
+            s.update({
+                "rasterize_mode": self.rasterize_mode,
+                "packed": self.resolved_packed,
+                "init_thickness_frac": self.resolved_thickness_frac,
+                "flat_lambda": self.flat_lambda,
+                "flat_max": self.flat_max,
+                "aniso_lambda": self.aniso_lambda,
+                "aniso_max": self.aniso_max,
+            })
+        else:
+            s.update({
+                "normal_lambda": self.normal_lambda,
+                "dist_lambda": self.dist_lambda,
+                "dist_start_iter": self.dist_start_iter,
+            })
+        return s
 
 
 # --- torch-free layer (PLY / pose / image IO — runs anywhere) ------------------
 
 
-def _load_cloud(path: Path) -> dict[str, np.ndarray]:
-    """Parse a binary-little-endian float `.ply` into gsplat 2DGS init arrays:
-    means [N,3], quats [N,4] (wxyz), opacities [N] (logit), sh0 [N,1,3] (SH DC
-    colour coeffs), shN [N,15,3] (the degree-1..3 view-dependent coeffs decoded
-    from `f_rest_*`, always degree-3-sized; zeros for a degree-0 cloud like the
-    Stage-3 init, so the SH-degree warmup grows them from flat), scales [N,3]
-    (log; a synthesized third axis when the cloud is the 2-scale 2DGS format)."""
+def _load_cloud(path: Path, *, thickness_frac: float = _THIN_AXIS_FRAC) -> dict[str, np.ndarray]:
+    """Parse a binary-little-endian float `.ply` into gsplat init arrays: means
+    [N,3], quats [N,4] (wxyz), opacities [N] (logit), sh0 [N,1,3] (SH DC colour
+    coeffs), shN [N,15,3] (the degree-1..3 view-dependent coeffs decoded from
+    `f_rest_*`, always degree-3-sized; zeros for a degree-0 cloud like the Stage-3
+    init, so the SH-degree warmup grows them from flat), scales [N,3] (log).
+
+    Both rasterizers take three scales, so a 2-scale (2DGS) `.ply` gets a third
+    synthesized at `thickness_frac` of its smaller tangent radius. The caller owns
+    that fraction because its MEANING depends on the representation being trained:
+    the 2DGS default (`_THIN_AXIS_FRAC`) is an unrendered splitter decoy, while a
+    3DGS run passes `TrainParams.resolved_thickness_frac` and gets real geometry."""
     raw = Path(path).read_bytes()
     marker = b"end_header\n"
     cut = raw.find(marker)
@@ -839,14 +1093,12 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
     if "scale_2" in col:
         scales = stack("scale_0", "scale_1", "scale_2")
     else:
-        # 2DGS cloud: synthesize a TINY third log-scale. Rendering ignores it and
-        # the strategy's grow/prune thresholds take max() over scales (unchanged),
-        # but DefaultStrategy's split() displaces children along ALL three scaled
-        # axes — a normal-axis scale equal to the tangent radius would eject every
-        # child a full radius off the surface. 1% of the smaller tangent radius
-        # keeps splits in-plane.
+        # 2-scale cloud: synthesize the third log-scale off the smaller tangent
+        # radius. Stage 3 aligns the quaternion's local +Z to the surface normal, so
+        # this axis IS the thickness — which is why the same construction serves as
+        # a 2DGS splitter decoy at 1% and as a real 3DGS shell at 10%.
         two = stack("scale_0", "scale_1")
-        third = (two.min(axis=1, keepdims=True) + np.log(0.01)).astype(np.float32)
+        third = (two.min(axis=1, keepdims=True) + np.log(thickness_frac)).astype(np.float32)
         scales = np.concatenate([two, third], axis=1)
     return {
         "means": means,
@@ -856,6 +1108,24 @@ def _load_cloud(path: Path) -> dict[str, np.ndarray]:
         "shN": shN,
         "scales": scales,
     }
+
+
+def _ply_representation(path: Path) -> str:
+    """Which primitive a splat `.ply` on disk holds, read from its scale columns
+    alone: "3dgs" when it carries a `scale_2` property, else "2dgs".
+
+    Header-only (the body is never touched), so it is cheap enough to guard every
+    stage that consumes a model someone ELSE trained. That guard matters: Stage 7
+    and the compaction runners must render with the same rasterizer the file was
+    optimized under — heal a 2-scale surfel model through the 3DGS rasterizer and
+    every disk becomes an invisible sliver, so the measured contribution is noise
+    and the heal optimizes against it."""
+    with Path(path).open("rb") as f:
+        head = f.read(1 << 16)
+    cut = head.find(b"end_header")
+    if cut < 0:
+        raise ValueError(f"{path}: not a PLY (no end_header in the first 64 KiB)")
+    return "3dgs" if b"scale_2" in head[:cut] else "2dgs"
 
 
 # --- COLMAP text model (the Postshot-style input: points3D + cameras + images) --
@@ -950,9 +1220,11 @@ def _init_from_points(xyz: np.ndarray, rgb: np.ndarray, params: TrainParams) -> 
     """gsplat `create_splats_with_optimizers`-style init from a bare point cloud
     (xyz + rgb) — the same recipe simple_trainer uses for an SfM cloud, so a
     Postshot-style input trains identically. means = xyz; each scale =
-    log(mean-distance-to-3-nearest-neighbours × init_scale), isotropic over 3 axes;
-    quats random (rasterizer normalizes); opacity = logit(init_opa); colour = the
-    points3D RGB mapped to the SH0 DC term ((rgb−0.5)/C0, matching Stage 3)."""
+    log(mean-distance-to-3-nearest-neighbours × init_scale) — isotropic over all
+    three axes for 3DGS, over the two tangent axes for 2DGS (whose third stays the
+    unrendered decoy); quats random (rasterizer normalizes); opacity =
+    logit(init_opa); colour = the points3D RGB mapped to the SH0 DC term
+    ((rgb−0.5)/C0, matching Stage 3)."""
     from scipy.spatial import cKDTree
 
     means = np.ascontiguousarray(xyz, dtype=np.float32)
@@ -964,13 +1236,21 @@ def _init_from_points(xyz: np.ndarray, rgb: np.ndarray, params: TrainParams) -> 
     else:
         dist_avg = np.full(n, 0.01, dtype=np.float64)
     log_scale = np.log(np.maximum(dist_avg * params.init_scale, 1e-9)).astype(np.float32)
-    # Two in-plane axes + a TINY third, exactly as `_load_cloud` synthesizes for a
-    # 2DGS cloud: the rasterizer ignores the third and the strategy's grow/prune
-    # thresholds take max() over the three (unchanged, since these are isotropic),
-    # but DefaultStrategy's split() displaces children along ALL three scaled axes
-    # — an equal third would eject every child a full disc radius off its own plane.
-    third = (log_scale + np.float32(np.log(0.01)))
-    scales = np.stack([log_scale, log_scale, third], axis=1)
+    if params.is_3dgs:
+        # ISOTROPIC on all three axes — gsplat's own from-points recipe, so this
+        # really is the reference baseline it exists to be. A 3D Gaussian has a
+        # thickness to learn, and starting it at the KNN radius lets the images
+        # decide it; there is no plane to keep splits inside.
+        scales = np.repeat(log_scale[:, None], 3, axis=1)
+    else:
+        # Two in-plane axes + a TINY third, exactly as `_load_cloud` synthesizes for
+        # a 2-scale cloud: the 2DGS rasterizer ignores the third and the strategy's
+        # grow/prune thresholds take max() over the three (unchanged, since these
+        # are isotropic), but DefaultStrategy's split() displaces children along ALL
+        # three scaled axes — an equal third would eject every child a full disc
+        # radius off its own plane.
+        third = log_scale + np.float32(np.log(_THIN_AXIS_FRAC))
+        scales = np.stack([log_scale, log_scale, third], axis=1)
 
     rng = np.random.default_rng(params.seed)
     quats = rng.standard_normal((n, 4)).astype(np.float32)
@@ -1059,12 +1339,25 @@ def _encode_trained_ply(
     quats: np.ndarray,
     f_dc: np.ndarray,
     opacity: np.ndarray,
-    scales2: np.ndarray,
+    scales: np.ndarray,
     out_path: Path,
     sh_rest: np.ndarray | None = None,
 ) -> None:
-    """Write the trained model as a Stage-3-compatible 2DGS `.ply` (two tangent
-    log-scales). Values are stored raw (opacity as logit, scales as log, colour as
+    """Write the trained model as a Stage-3-compatible splat `.ply`, with as many
+    `scale_*` columns as `scales` has: TWO for a 2DGS surfel model (the tangent
+    radii; its third training axis is an unrendered decoy and must not ship), THREE
+    for a 3DGS one. That count is the ONLY on-disk difference between the two
+    representations, and every consumer already keys off it — `_load_cloud` and
+    `splat/quantize.py` read whatever is present, and the client's SOG/ksplat
+    encoders skip their synthetic-third-scale flatten when `scale_2` is there.
+
+    `nx,ny,nz` stay the local +Z axis of the quaternion, which is the surface
+    normal Stage 3 aligned and (for 3DGS) the thin axis at init. They are
+    decorative — no viewer reads them and `quantize.py` drops and recomputes them
+    from the quaternion on decode — so the convention is kept identical across
+    representations to keep that round-trip exact.
+
+    Values are stored raw (opacity as logit, scales as log, colour as
     `f_dc`) exactly as the viewers/Stage 7 expect. The DC colour (`f_dc`) is always
     written; when `sh_rest` (gsplat coeff-major degree-1..3 coeffs [N,K,3]) is
     given and non-empty its K·3 `f_rest_*` view-dependent coefficients are written
@@ -1086,11 +1379,10 @@ def _encode_trained_ply(
         )
         cols.extend(rest[:, j] for j in range(rest.shape[1]))
         rest_props = "".join(f"property float f_rest_{j}\n" for j in range(rest.shape[1]))
-    cols += [
-        opacity,
-        scales2[:, 0], scales2[:, 1],
-        quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3],
-    ]
+    n_scales = int(np.asarray(scales).shape[1])
+    cols.append(opacity)
+    cols.extend(scales[:, j] for j in range(n_scales))
+    cols += [quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]]
     data = np.stack(cols, axis=1).astype("<f4")
     header = (
         "ply\n"
@@ -1101,8 +1393,8 @@ def _encode_trained_ply(
         "property float f_dc_0\n" "property float f_dc_1\n" "property float f_dc_2\n"
         + rest_props
         + "property float opacity\n"
-        "property float scale_0\n" "property float scale_1\n"
-        "property float rot_0\n" "property float rot_1\n"
+        + "".join(f"property float scale_{j}\n" for j in range(n_scales))
+        + "property float rot_0\n" "property float rot_1\n"
         "property float rot_2\n" "property float rot_3\n"
         "end_header\n"
     )
@@ -1133,6 +1425,22 @@ def _require_cuda_trainer():  # noqa: ANN202 - returns (torch, torch.nn.function
     if not torch.cuda.is_available():
         raise RuntimeError("Stage 6 needs a CUDA GPU; torch reports none available.")
     return torch, F, gsplat
+
+
+def _rasterizer(params: TrainParams):  # noqa: ANN202 - the gsplat entrypoint for this representation
+    """The gsplat rasterizer this run trains through — `rasterization` for 3DGS,
+    `rasterization_2dgs` for surfels. Imported lazily (gsplat is CUDA-only, and the
+    server imports this module for the route + the torch-free IO) and passed down
+    explicitly rather than looked up per call, so every helper renders through the
+    same operator the loop does. Callers go through `_render_batch`, which
+    normalizes the two different return shapes."""
+    if params.is_3dgs:
+        from gsplat import rasterization
+
+        return rasterization
+    from gsplat import rasterization_2dgs
+
+    return rasterization_2dgs
 
 
 def _gaussian_window(torch, ksize: int, sigma: float, device, channels: int):  # noqa: ANN001
@@ -1168,16 +1476,17 @@ def _read_transforms(refs_dir: Path) -> dict[str, Any]:
 
 
 def _render_inputs(torch, splats, sh_degree):  # noqa: ANN001
-    """SH coefficients [N,16,3] + the ACTIVE `sh_degree` for `rasterization_2dgs`.
+    """SH coefficients [N,16,3] + the ACTIVE `sh_degree`, for either rasterizer.
     Concatenates the DC term (`sh0` [N,1,3]) with the higher-order bands (`shN`
     [N,15,3]) so gsplat evaluates colour as f(view direction) up to the active
     degree — the SH-degree warmup passes a degree below the stored 3 early on, and
     gsplat uses only the first (degree+1)² bands (higher bands keep zero gradient
-    until unlocked). Rendered via gsplat's NON-PACKED SH path: its packed SH branch
-    mis-broadcasts and its precomputed-colour path never gathers colours to the
-    visible subset, so both crash on RGB+ED once a view sees only part of the cloud
-    (nnz < N) — but the non-packed SH path is degree-agnostic and produces depth
-    correctly. gsplat applies the +0.5 offset, matching Stage-3's f_dc."""
+    until unlocked). On the 2DGS path this must be rendered NON-PACKED: gsplat's
+    packed SH branch mis-broadcasts and its precomputed-colour path never gathers
+    colours to the visible subset, so both crash on RGB+ED once a view sees only
+    part of the cloud (nnz < N). The 3DGS path has no such bug, which is why
+    `TrainParams.packed` is available there. gsplat applies the +0.5 offset,
+    matching Stage-3's f_dc."""
     return torch.cat([splats["sh0"], splats["shN"]], dim=1), int(sh_degree)
 
 
@@ -1400,20 +1709,30 @@ def _append_gaussians(torch, splats, optimizers, strat_state, new):  # noqa: ANN
             strat_state[key] = torch.cat([v, torch.zeros(m, device=v.device, dtype=v.dtype)], dim=0)
 
 
-def _aa_scale_floor(torch, splats, cam_tree, focal, aa_min_px):  # noqa: ANN001
-    """Lower-bound each Gaussian's two in-plane log-scales so its projected std is
+def _aa_scale_floor(torch, splats, cam_tree, focal, aa_min_px, tangent_only=True):  # noqa: ANN001
+    """Lower-bound each Gaussian's FOOTPRINT log-scales so its projected std is
     ≥ `aa_min_px` from the NEAREST camera (radius floor = aa_min_px·d_nn/focal). Only
     inflates Gaussians a close camera would render sub-pixel; larger/close-viewed
     ones are untouched (the floor shrinks with camera distance). Returns the median
-    floor radius in metres, for logging."""
+    floor radius in metres, for logging.
+
+    `tangent_only` (2DGS) floors columns 0 and 1, the two axes that rasterizer
+    renders. For 3DGS it floors each Gaussian's two LARGEST axes instead, whichever
+    columns those are: those are what set its screen footprint, and leaving the
+    smallest alone is what keeps this from silently inflating thin surfaces into
+    blobs and undoing `flat_lambda`."""
     means_np = splats["means"].detach().cpu().numpy()
     d_nn = np.asarray(cam_tree.query(means_np, k=1, workers=-1)[0], dtype=np.float64)
     floor_r = (aa_min_px * np.maximum(d_nn, 1e-6) / max(float(focal), 1e-6)).astype(np.float32)
     log_floor = torch.from_numpy(np.log(np.maximum(floor_r, 1e-9))).to(splats["scales"].device)
     with torch.no_grad():
         s = splats["scales"]
-        s[:, 0] = torch.maximum(s[:, 0], log_floor)
-        s[:, 1] = torch.maximum(s[:, 1], log_floor)
+        if tangent_only:
+            s[:, 0] = torch.maximum(s[:, 0], log_floor)
+            s[:, 1] = torch.maximum(s[:, 1], log_floor)
+        else:
+            idx = torch.topk(s, 2, dim=1).indices
+            s.scatter_(1, idx, torch.maximum(s.gather(1, idx), log_floor[:, None]))
     return float(np.median(floor_r))
 
 
@@ -1473,7 +1792,8 @@ def _depth_seed(torch, gt_rgb, gt_alpha, gt_depth, pred_alpha, pred_depth, viewm
     quats = _quat_from_normal(torch, normals).float()
     radius = (params.depth_densify_scale_px * depths / max(focal, 1e-6)).clamp_min(1e-6)
     log_r = torch.log(radius)
-    scales = torch.stack([log_r, log_r, log_r + float(np.log(0.01))], dim=1).float()
+    third = log_r + float(np.log(params.resolved_thickness_frac))
+    scales = torch.stack([log_r, log_r, third], dim=1).float()
     a = float(np.clip(params.depth_densify_opacity, 1e-3, 1.0 - 1e-3))
     opac = torch.full((m,), float(np.log(a / (1.0 - a))), device=device).float()
     return {"means": means, "scales": scales, "quats": quats, "opacities": opac, "sh0": sh0}
@@ -1522,11 +1842,15 @@ class _TileGrid:
 
     def signature(self, n_init: int, params: TrainParams) -> str:
         """Cache key for per-tile results: any change to the cloud, the grid, the
-        training length, or the SH degree invalidates cached tiles (the last so a
-        degree-0 cache never merges into a degree-3 run without the shN column)."""
+        training length, the SH degree or the REPRESENTATION invalidates cached
+        tiles (the SH degree so a degree-0 cache never merges into a degree-3 run
+        without the shN column; the representation so 2DGS tiles — whose third
+        scale is an unrendered decoy — can never be merged into a 3DGS model,
+        where that column is real thickness)."""
         return (
             f"{n_init}:{self.k[0]}x{self.k[1]}:{self.margin:.3f}"
             f":{params.iterations}:{params.resolved_tile_budget}:sh{params.sh_degree}"
+            f":{params.representation}"
         )
 
 
@@ -1832,19 +2156,29 @@ def _train_tiled(  # noqa: ANN001
     return merged, infos
 
 
-def _lod_aggregate(arrays: dict[str, np.ndarray], voxel: float) -> dict[str, np.ndarray]:
+def _lod_aggregate(
+    arrays: dict[str, np.ndarray], voxel: float, n_scales: int = 2
+) -> dict[str, np.ndarray]:
     """One LOD octave: Gaussians sharing a `voxel` collapse to ONE whose first two
     moments match the cluster's opacity·area-weighted mixture — mean and covariance
-    (each disk's R·diag(s²)·Rᵀ plus the spread of the means) — with the tangent
-    frame recovered by eigendecomposition. Colour is the same weighted mean, and
-    opacity preserves the cluster's opacity·area within the new disk (a fully
+    (each primitive's R·diag(s²)·Rᵀ plus the spread of the means) — with the frame
+    recovered by eigendecomposition. Colour is the same weighted mean, and opacity
+    preserves the cluster's opacity·cross-section within the new primitive (a fully
     covered patch stays opaque; sparse glass stays translucent). Sub-pixel detail
     thereby collapses to its prefiltered average — the same reason mip maps beat
-    point-sampling minified textures."""
+    point-sampling minified textures.
+
+    `n_scales` is the representation's axis count. At 2 the input covariance is
+    rank-2 (a disk: `diag(s0², s1², 0)`) and the output carries two radii plus the
+    decoy third — the surfel behaviour, unchanged. At 3 all three axes participate
+    in both directions, so an aggregate is as thick as the patch it replaces is
+    curved, which is exactly the volumetric average a 3D Gaussian should hold.
+    Either way the WEIGHT is opacity × the CROSS-SECTION (the two largest axes),
+    since that is what a pixel sees and what the new opacity has to conserve."""
     means = arrays["means"].astype(np.float64)
     q = arrays["quats"].astype(np.float64)
     q /= np.linalg.norm(q, axis=1, keepdims=True) + 1e-12
-    s = np.exp(arrays["scales"].astype(np.float64)[:, :2])
+    s = np.exp(arrays["scales"].astype(np.float64)[:, :max(n_scales, 2)])
     alpha = 1.0 / (1.0 + np.exp(-arrays["opacities"].astype(np.float64)))
     col = arrays["sh0"].reshape(-1, 3).astype(np.float64)
 
@@ -1852,7 +2186,9 @@ def _lod_aggregate(arrays: dict[str, np.ndarray], voxel: float) -> dict[str, np.
     _, inv = np.unique(ids, axis=0, return_inverse=True)
     m = int(inv.max()) + 1
 
-    w = np.maximum(alpha * s[:, 0] * s[:, 1], 1e-12)  # opacity·area
+    # opacity·cross-section: the two largest axes (for a disk, its area).
+    two_largest = np.sort(s, axis=1)[:, ::-1][:, :2] if s.shape[1] > 2 else s
+    w = np.maximum(alpha * two_largest[:, 0] * two_largest[:, 1], 1e-12)
     wsum = np.bincount(inv, weights=w, minlength=m)
 
     def wmean(v: np.ndarray) -> np.ndarray:
@@ -1864,7 +2200,8 @@ def _lod_aggregate(arrays: dict[str, np.ndarray], voxel: float) -> dict[str, np.
     mu = wmean(means)
     color = wmean(col)
 
-    # Per-Gaussian covariance R·diag(s1²,s2²,0)·Rᵀ from the (wxyz) quats.
+    # Per-Gaussian covariance R·diag(s²)·Rᵀ from the (wxyz) quats — the unused
+    # third eigenvalue stays 0 for a two-scale disk, giving the rank-2 surfel form.
     ww, xx, yy, zz = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
     R = np.empty((len(q), 3, 3))
     R[:, 0, 0] = 1 - 2 * (yy * yy + zz * zz)
@@ -1877,8 +2214,7 @@ def _lod_aggregate(arrays: dict[str, np.ndarray], voxel: float) -> dict[str, np.
     R[:, 2, 1] = 2 * (yy * zz + ww * xx)
     R[:, 2, 2] = 1 - 2 * (xx * xx + yy * yy)
     lam = np.zeros((len(q), 3))
-    lam[:, 0] = s[:, 0] ** 2
-    lam[:, 1] = s[:, 1] ** 2
+    lam[:, : s.shape[1]] = s ** 2
     cov = np.einsum("nij,nj,nkj->nik", R, lam, R)
 
     # Cluster covariance = E[C + μμᵀ] − μ̄μ̄ᵀ (moment matching), accumulated per
@@ -1907,7 +2243,13 @@ def _lod_aggregate(arrays: dict[str, np.ndarray], voxel: float) -> dict[str, np.
     alpha_new = np.clip(wsum / np.maximum(r1 * r2, 1e-12), 0.02, 0.995)
     logit = np.log(alpha_new / (1.0 - alpha_new))
     log_r = np.log(np.stack([r1, r2], axis=1))
-    third = log_r.min(axis=1, keepdims=True) + np.log(0.01)
+    if n_scales >= 3:
+        # The cluster covariance already carries the patch's out-of-plane spread, so
+        # the smallest eigenvalue IS the aggregate's thickness — no decoy needed.
+        r3 = np.sqrt(np.maximum(evals[:, 0], 1e-12))
+        third = np.log(r3)[:, None]
+    else:
+        third = log_r.min(axis=1, keepdims=True) + np.log(_THIN_AXIS_FRAC)
     return {
         "means": mu.astype(np.float32),
         "quats": quats.astype(np.float32),
@@ -1925,9 +2267,9 @@ def _export_lod(  # noqa: ANN001
 ) -> list[dict[str, Any]] | None:
     """Write the LOD ladder beside the trained splat (`trained.lod1.ply`, …): each
     level ~4× fewer via `_lod_aggregate` at a doubling voxel, stopping once a level
-    reaches `lod_min_count`. Same 2DGS layout as trained.ply, so every existing
-    viewer/compressor reads the levels unchanged (SH0 — the ladder is unlit like
-    the base). Stale lod files from earlier runs are removed first."""
+    reaches `lod_min_count`. Same layout and representation as trained.ply, so
+    every existing viewer/compressor reads the levels unchanged (SH0 — the ladder
+    is unlit like the base). Stale lod files from earlier runs are removed first."""
     for old in out_path.parent.glob(f"{out_path.stem}.lod*.ply"):
         old.unlink(missing_ok=True)
     if params.lod_levels <= 0:
@@ -1936,18 +2278,18 @@ def _export_lod(  # noqa: ANN001
     cur = arrays
     # 2× the median disk radius ≈ one 2×2-neighbour cluster per voxel on a
     # surface — the ~4×-per-octave reduction the ladder documents.
-    base_voxel = 2.0 * float(np.median(np.exp(arrays["scales"][:, :2]).max(axis=1)))
+    base_voxel = 2.0 * float(np.median(np.exp(arrays["scales"]).max(axis=1)))
     for level in range(1, params.lod_levels + 1):
         if int(cur["means"].shape[0]) <= params.lod_min_count:
             break
         if progress is not None:
             progress(1, 1, f"LOD {level}: aggregating {int(cur['means'].shape[0])} splats")
-        cur = _lod_aggregate(cur, base_voxel * (2.0 ** (level - 1)))
+        cur = _lod_aggregate(cur, base_voxel * (2.0 ** (level - 1)), params.n_scales)
         path = out_path.with_name(f"{out_path.stem}.lod{level}.ply")
         quats = cur["quats"] / (np.linalg.norm(cur["quats"], axis=1, keepdims=True) + 1e-12)
         _encode_trained_ply(
             cur["means"], quats.astype(np.float32), cur["sh0"].reshape(-1, 3),
-            cur["opacities"], cur["scales"][:, :2], path,
+            cur["opacities"], cur["scales"][:, :params.n_scales], path,
         )
         out.append({
             "level": level, "splats": int(cur["means"].shape[0]),
@@ -1968,30 +2310,34 @@ def train_splat(
     resume: bool = True,
     progress: ProgressCb | None = None,
 ) -> dict[str, Any]:
-    """Fine-tune a 2DGS splat from a COLMAP model (poses + images — `colmap_dir`
+    """Fine-tune a splat, in `params.representation` (module docstring
+    §REPRESENTATION), from a COLMAP model (poses + images — `colmap_dir`
     holds `cameras.txt` / `images.txt` / `points3D.txt` + the RGB images, exactly
     as `splat_to_colmap.py` / `splat.colmap.export_colmap` writes) plus the
     init selected by `params.init` (module docstring):
 
       * "surfels" (default) — `init_ply` (the Stage-3 `cloud.ply`) seeds every
-        Gaussian at the 2DGS solution (on-surface means, mesh-true quats,
+        Gaussian on the mesh surface (on-surface means, mesh-true quats,
         tangent discs, exact texel colours), with opacity capped at
         `init_opa_max` for gradient headroom. The metric-depth warm-up
         (`depth_start_iter`) is zeroed: an opaque surface init's expected
-        depth is true from step 0.
+        depth is true from step 0. A 3DGS run gets the same seed with a real
+        third axis at `init_thickness_frac` of the disc radius, so it starts as
+        a thin shell rather than a disc.
       * "points" — `_init_from_points` from the COLMAP points3D (the gsplat
         `create_splats_with_optimizers` recipe) — the Postshot-parity A/B.
 
-    Supervision follows the data (photometric L1 + D-SSIM, 2DGS normal
-    consistency, optional distortion). When the model carries the SZF
+    Supervision follows the data (photometric L1 + D-SSIM plus the
+    representation's geometry prior). When the model carries the SZF
     SUPERVISION SIDECAR (`export_colmap` writes it for SZF refs), every view
     additionally supervises with the capture's exact alpha (coverage) +
     metric-depth planes at `alpha_lambda`/`depth_lambda`, and depth-guided
     densification seeds Gaussians at surfaces the render is missing — set
     those to 0/0/False for a Postshot-parity RGB-only run. Without the sidecar
     the terms are forced off (nothing to compare against). Writes the RAW
-    optimized 2DGS splat to `out_path` (`trained.ply`); requires a CUDA GPU +
-    gsplat (raises a clear error otherwise).
+    optimized splat to `out_path` (`trained.ply`) with two or three scale columns
+    per `params.representation`; requires a CUDA GPU + gsplat (raises a clear error
+    otherwise).
 
     STAGE 6 IS TRAIN-ONLY: compaction (delete + heal + final-prune) and the LOD
     ladder live in Stage 7 (`heal_splat`), which reads this `trained.ply`.
@@ -2018,6 +2364,25 @@ def train_splat(
     # sidecar, when present, attaches each view's exact alpha + depth planes.
     views, K, width, height, centers, pts_xyz, pts_rgb = _load_colmap(torch, colmap_dir, device)
     n_views = len(views)
+
+    # ALWAYS announce the representation and the knobs it resolved, for the same
+    # reason the supervision mode is announced below: these decide which rasterizer,
+    # which regularizers and which densification criterion ran, and reading them off
+    # the heartbeat is how a surprising result gets attributed to the right path.
+    if progress is not None:
+        if params.is_3dgs:
+            detail = (
+                f"absgrad={params.resolved_absgrad} (grow_grad2d={params.resolved_grow_grad2d:g}) "
+                f"rasterize={params.rasterize_mode} packed={params.resolved_packed} "
+                f"depth={params.resolved_depth_mode} glass_guard={params.resolved_glass_guard} "
+                f"flat={params.flat_lambda:g} aniso={params.aniso_lambda:g}"
+            )
+        else:
+            detail = (
+                f"depth={params.resolved_depth_mode} normal={params.normal_lambda:g} "
+                f"dist={params.dist_lambda:g}"
+            )
+        progress(0, 1, f"representation: {params.representation} — {detail}")
 
     # Supervision keys off the DATA: with the SZF sidecar covering EVERY view, the
     # alpha (coverage) + metric-depth losses and depth-guided densification run at
@@ -2050,7 +2415,7 @@ def train_splat(
         )
 
     # Init the splat (module docstring): the Stage-3 surfel cloud when
-    # params.init == "surfels" (geometry starts AT the 2DGS solution), else the
+    # params.init == "surfels" (geometry starts ON the mesh surfaces), else the
     # gsplat from-points recipe. scene_scale is GLOBAL even when tiled, so every
     # tile's thresholds match the single-run semantics.
     if params.init == "surfels":
@@ -2060,7 +2425,10 @@ def train_splat(
                 f"init_ply= (got {init_ply}); or set init='points' for the "
                 "from-points3D baseline"
             )
-        init = _load_cloud(Path(init_ply))
+        # A 2-scale Stage-3 cloud gets its third axis here, at the fraction this
+        # representation means by it (decoy vs real thickness); a cloud Stage 3
+        # already wrote in `3dgs` mode carries its own and is used verbatim.
+        init = _load_cloud(Path(init_ply), thickness_frac=params.resolved_thickness_frac)
         # Opacity CEILING (see TrainParams.init_opa_max): Stage 3 stores
         # near-saturated logits whose sigmoid gradient is ~1e-3 — frozen.
         # Cap the logit so opacity stays trainable (glass panes init well
@@ -2074,10 +2442,15 @@ def train_splat(
         # term for no benefit.
         params = replace(params, depth_start_iter=0)
         if progress is not None:
+            thick = (
+                f", thickness {params.resolved_thickness_frac:.0%} of radius"
+                if params.is_3dgs and _ply_representation(Path(init_ply)) == "2dgs"
+                else ""
+            )
             progress(
                 0, 1,
                 f"init: surfels ({init['means'].shape[0]:,} from {Path(init_ply).name}, "
-                f"opacity ≤ {params.init_opa_max})",
+                f"opacity ≤ {params.init_opa_max}{thick})",
             )
     else:
         init = _init_from_points(pts_xyz, pts_rgb, params)
@@ -2091,6 +2464,26 @@ def train_splat(
     # fields, so a 1,532-step run recorded `iterations: 30000`). Tiled runs resolve
     # per tile against their own view counts; `tiles_summary` carries those.
     resolved = params.resolve_schedule(n_views)
+
+    # SCHEDULE SANITY. A run whose cadences all sit past its own step count trains,
+    # scores a PSNR and ships a `.ply` — it just does none of the work, which is
+    # indistinguishable from a broken representation switch when you look only at
+    # the output. Announce it before the GPU spends the hour (`_inert_cadences`).
+    inert = _inert_cadences(resolved)
+    if inert:
+        head = (
+            f"schedule warning: {resolved.iterations} steps is too few for the "
+            "default cadences (they are written against 30,000) — "
+        )
+        tail = (
+            f" Raise `iterations` past the thresholds above (30,000 reaches all of "
+            f"them; densification alone needs > {2 * resolved.refine_start_iter}), or "
+            "size the run with `epochs`, which rescales every cadence to match."
+        )
+        logging.getLogger(__name__).warning("stage6: %s%s%s", head, "; ".join(inert), tail)
+        if progress is not None:
+            for line in (head.rstrip("— "), *(f"  - {i}" for i in inert), tail.strip()):
+                progress(0, 1, line)
 
     # Single run when the seed fits the budget; otherwise plan the tile grid.
     ckpt_root = _ckpt_dir(out_path)
@@ -2145,11 +2538,9 @@ def train_splat(
         )
     metrics = None
     try:
-        from gsplat import rasterization_2dgs
-
         splats_t = {k: torch.from_numpy(v).to(device) for k, v in arrays.items()}
         metrics = _evaluate(
-            torch, rasterization_2dgs, splats_t, views, K, width, height, params, device
+            torch, _rasterizer(params), splats_t, views, K, width, height, params, device
         )
         del splats_t
     except (torch.cuda.OutOfMemoryError, MemoryError) as exc:
@@ -2163,7 +2554,7 @@ def train_splat(
     quats = arrays["quats"] / (np.linalg.norm(arrays["quats"], axis=1, keepdims=True) + 1e-12)
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
-        arrays["opacities"], arrays["scales"][:, :2], out_path,
+        arrays["opacities"], arrays["scales"][:, :params.n_scales], out_path,
         sh_rest=arrays["shN"],
     )
     # No LOD ladder here: trained.ply is the RAW model. The delivered LODs are
@@ -2186,6 +2577,7 @@ def train_splat(
         "run": run,
         "slot": slot,
         "model": model,
+        "representation": params.representation,
         "splats_init": n_init,
         "splats_final": n_final,
         "splats_pruned_final": n_pruned,
@@ -2206,6 +2598,10 @@ def train_splat(
             "normal_start_iter": resolved.normal_start_iter,
             "depth_start_iter": resolved.depth_start_iter,
             "tiled": tiles_summary is not None,
+            # Machinery this run's step count put out of reach (`_inert_cadences`),
+            # recorded so a disappointing model can be attributed from the summary
+            # alone instead of re-deriving the cadences by hand.
+            "inert": inert or None,
         },
         "speed_profile": speed_profile,
         "views": n_views,
@@ -2320,6 +2716,63 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
     return views, K, width, height, np.stack(centers, axis=0), pts_xyz, pts_rgb
 
 
+def _inert_cadences(params: TrainParams) -> list[str]:
+    """The parts of the loop a RESOLVED schedule can never reach, as human-readable
+    strings (empty = everything fires at least once).
+
+    Every cadence in `TrainParams` is written against the reference 30,000-step
+    length, so shortening a run by lowering `iterations` alone silently switches
+    machinery OFF rather than compressing it — and the result still trains, still
+    reports a PSNR, and still ships a `.ply`, so nothing announces the loss.
+
+    The densification window is the trap that bites first, because
+    `resolved_refine_stop` defaults to HALF the step count while
+    `refine_start_iter` is absolute: at `iterations` ≤ 2·refine_start_iter the two
+    cross and gsplat's `step_post_backward` returns before it can ever grow OR
+    prune. A 1,000-step run then emits exactly its init cloud, re-fitted — which
+    for a 3DGS run reads as "the surfels came back", since Stage 3's layout and
+    count are all that is left.
+
+    The fix is to give the run enough steps: the reference 30,000 reaches every
+    cadence, and `iterations` has to clear each threshold named below for that part
+    of the loop to fire at all. (`epochs` also works — `resolve_schedule` rescales
+    every cadence with the step count — but it is a library/API field, not a
+    dashboard knob, and it REPLACES `iterations` as the run length while reusing it
+    as the reference denominator, so setting both is its own trap.)"""
+    out: list[str] = []
+    n = params.iterations
+    if params.refine and params.resolved_refine_stop <= params.refine_start_iter:
+        out.append(
+            f"DENSIFICATION never runs (window is empty: refine_start_iter="
+            f"{params.refine_start_iter} >= refine_stop={params.resolved_refine_stop}), "
+            "so the model cannot grow or prune a single Gaussian — it will be your "
+            "init cloud, re-fitted"
+        )
+    if params.sh_degree > 0 and n <= params.sh_degree_interval:
+        out.append(
+            f"VIEW-DEPENDENT COLOUR never activates (sh_degree_interval="
+            f"{params.sh_degree_interval} >= {n} steps), so the model stays flat "
+            "degree-0 no matter what `sh_degree` says"
+        )
+    prior = params.flat_lambda if params.is_3dgs else params.normal_lambda
+    if prior > 0.0 and params.normal_start_iter >= n:
+        out.append(
+            f"the GEOMETRY PRIOR never engages (normal_start_iter="
+            f"{params.normal_start_iter} >= {n} steps)"
+        )
+    if params.prune_scale_start_iter >= n:
+        out.append(
+            f"the SIZE PRUNE never arms (prune_scale_start_iter="
+            f"{params.prune_scale_start_iter} >= {n} steps), so nothing bounds "
+            "Gaussian size"
+        )
+    if params.reset_every > 0 and params.reset_every >= n:
+        out.append(
+            f"the OPACITY RESET never fires (reset_every={params.reset_every} >= {n} steps)"
+        )
+    return out
+
+
 def _scene_scale(centers: np.ndarray, fallback_means: np.ndarray) -> float:
     """Camera-cloud radius (× 1.1), the 3DGS spatial-LR / density unit — the same
     value Stage 6 trained with, so the heal's LRs and the prune-scale threshold
@@ -2332,7 +2785,7 @@ def _scene_scale(centers: np.ndarray, fallback_means: np.ndarray) -> float:
 
 
 def _compact_and_heal(  # noqa: ANN001
-    torch, F, rasterization_2dgs, splats, views, K, width: int, height: int,
+    torch, F, raster, splats, views, K, width: int, height: int,
     params: "TrainParams", scene_scale: float, device, init_means: np.ndarray,
     cam_tree, focal: float, progress: ProgressCb | None,
 ):
@@ -2351,7 +2804,7 @@ def _compact_and_heal(  # noqa: ANN001
     compact_search = None
     if params.compact:
         weights = _contribution_weights(
-            torch, rasterization_2dgs, splats, views, K, width, height, params, progress,
+            torch, raster, splats, views, K, width, height, params, progress,
         )
         with torch.no_grad():
             keep = _select_keep(
@@ -2372,7 +2825,7 @@ def _compact_and_heal(  # noqa: ANN001
         chosen = None
         if params.compact_max_db_drop is not None and n0 > 0:
             ev0 = _evaluate(
-                torch, rasterization_2dgs, {k: v.detach() for k, v in splats.items()},
+                torch, raster, {k: v.detach() for k, v in splats.items()},
                 views, K, width, height, params, device,
             )
             psnr0 = float(ev0["psnr"])
@@ -2391,12 +2844,12 @@ def _compact_and_heal(  # noqa: ANN001
                     }
                 if params.compact_probe_heal_steps > 0:
                     _heal(
-                        torch, F, rasterization_2dgs, probe, views, K, width, height, params,
+                        torch, F, raster, probe, views, K, width, height, params,
                         scene_scale, params.compact_probe_heal_steps,
                         box_lo, box_hi, px_grid, py_grid, None,
                     )
                 ev = _evaluate(
-                    torch, rasterization_2dgs, {k: v.detach() for k, v in probe.items()},
+                    torch, raster, {k: v.detach() for k, v in probe.items()},
                     views, K, width, height, params, device,
                 )
                 drop = psnr0 - float(ev["psnr"])
@@ -2443,11 +2896,14 @@ def _compact_and_heal(  # noqa: ANN001
         n_compacted = n_before - int(splats["means"].shape[0])
         if params.compact_heal_steps > 0 and n_compacted > 0:
             _heal(
-                torch, F, rasterization_2dgs, splats, views, K, width, height, params,
+                torch, F, raster, splats, views, K, width, height, params,
                 scene_scale, params.compact_heal_steps, box_lo, box_hi, px_grid, py_grid, progress,
             )
             if params.antialias and cam_tree is not None:
-                _aa_scale_floor(torch, splats, cam_tree, focal, params.aa_min_scale_px)
+                _aa_scale_floor(
+                    torch, splats, cam_tree, focal, params.aa_min_scale_px,
+                    tangent_only=not params.is_3dgs,
+                )
 
     n_pruned = (
         _final_prune(torch, splats, params.prune_opa, params.prune_scale3d, scene_scale)
@@ -2489,9 +2945,14 @@ def heal_splat(
     compaction that used to be folded into training's `trained.ply`; split out so
     `trained.ply` is the raw optimization output and `healed.ply` is the cleaned
     deliverable, viewable side by side. Global (whole merged model, all views) —
-    the per-tile compaction is gone with the fold-out. Requires CUDA + gsplat."""
+    the per-tile compaction is gone with the fold-out. Requires CUDA + gsplat.
+
+    `params.representation` must match what `trained.ply` actually holds: this
+    stage RE-RENDERS the model to measure each Gaussian's contribution and then
+    re-optimizes the survivors, so the wrong rasterizer would both mis-measure and
+    mis-heal. The file is self-describing (`_ply_representation`), so the mismatch
+    is caught up front instead of shipping a quietly wrong `healed.ply`."""
     torch, F, _ = _require_cuda_trainer()
-    from gsplat import rasterization_2dgs
     from scipy.spatial import cKDTree
 
     trained_path, cloud_path = Path(trained_path), Path(cloud_path)
@@ -2500,7 +2961,16 @@ def heal_splat(
         raise FileNotFoundError(f"trained splat not found: {trained_path} (run Stage 6)")
     if not cloud_path.is_file():
         raise FileNotFoundError(f"surfel cloud not found: {cloud_path} (run Stage 3)")
+    on_disk = _ply_representation(trained_path)
+    if on_disk != params.representation:
+        raise ValueError(
+            f"{trained_path.name} is a {on_disk} model but params.representation is "
+            f"{params.representation!r} — heal renders and re-optimizes the model, so "
+            f"the two must agree. Re-run Stage 6 with representation={params.representation!r}, "
+            f"or heal with representation={on_disk!r}."
+        )
 
+    raster = _rasterizer(params)
     device = torch.device("cuda")
     torch.manual_seed(params.seed)
     views, K, width, height, centers = _load_scene(torch, refs_dir, device)
@@ -2521,7 +2991,7 @@ def heal_splat(
     if progress is not None:
         progress(0, 1, f"heal: {n_before} splats, {n_views} views, scale={scene_scale:.2f}")
     arrays, hinfo = _compact_and_heal(
-        torch, F, rasterization_2dgs, splats, views, K, width, height, params,
+        torch, F, raster, splats, views, K, width, height, params,
         scene_scale, device, init["means"], cam_tree, focal, progress,
     )
     n_final = int(arrays["means"].shape[0])
@@ -2530,7 +3000,7 @@ def heal_splat(
     try:
         splats_t = {k: torch.from_numpy(v).to(device) for k, v in arrays.items()}
         metrics = _evaluate(
-            torch, rasterization_2dgs, splats_t, views, K, width, height, params, device
+            torch, raster, splats_t, views, K, width, height, params, device
         )
         del splats_t
     except (torch.cuda.OutOfMemoryError, MemoryError):
@@ -2541,7 +3011,7 @@ def heal_splat(
     quats = arrays["quats"] / (np.linalg.norm(arrays["quats"], axis=1, keepdims=True) + 1e-12)
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
-        arrays["opacities"], arrays["scales"][:, :2], out_path,
+        arrays["opacities"], arrays["scales"][:, :params.n_scales], out_path,
         sh_rest=arrays["shN"],
     )
     lod_summary = _export_lod(arrays, out_path, params, progress)
@@ -2550,6 +3020,7 @@ def heal_splat(
         "run": run,
         "slot": slot,
         "model": model,
+        "representation": params.representation,
         "splats_in": n_before,
         "splats_final": n_final,
         "splats_compacted": hinfo["compacted"],
@@ -2566,12 +3037,31 @@ def heal_splat(
     }
 
 
-def _render_batch(torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on):  # noqa: ANN001
-    """One gsplat 2DGS forward for a batch of views — the shared render call used
-    by both the training loop and the compaction pass. Returns the raw
-    `rasterization_2dgs` tuple (renders, alpha, normals, normals_from_depth,
-    distort, median_depth, info)."""
-    return rasterization_2dgs(
+class _Render(NamedTuple):
+    """One rasterizer forward, normalized across representations so nothing
+    downstream has to know which one ran. The three 2DGS-only buffers are None on
+    the 3DGS path (`rasterization` returns no rendered normal, no normals-from-
+    depth and no distortion map), and every consumer of them is gated accordingly."""
+
+    rgb: Any                 # [B,H,W,3], premultiplied over black
+    alpha: Any               # [B,H,W,1] accumulated coverage
+    depth: Any               # [B,H,W,1] the statistic the depth loss compares
+    expected: Any            # [B,H,W,1] the ED channel (both paths)
+    normals: Any             # [B,H,W,3] rendered normals — 2DGS only
+    normals_from_depth: Any  # [B,H,W,3] normals of the rendered depth — 2DGS only
+    distort: Any             # [B,H,W,1] depth distortion — 2DGS only
+    info: dict               # the rasterizer's meta dict (densification reads it)
+
+
+def _render_batch(torch, raster, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on):  # noqa: ANN001
+    """One gsplat forward for a batch of views — the single render call every part
+    of the stage goes through (training loop, heal, contribution measure, eval), so
+    all of them necessarily agree on the operator.
+
+    `raster` is `_rasterizer(params)`. The two entrypoints differ in their return
+    arity (3 vs 7) and in three kwargs each doesn't accept, which is the whole
+    reason this wrapper exists: it hands back a `_Render` either way."""
+    common = dict(
         means=splats["means"],
         quats=splats["quats"],
         scales=torch.exp(splats["scales"]),
@@ -2582,32 +3072,64 @@ def _render_batch(torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K
         width=width,
         height=height,
         sh_degree=sh_deg,
-        packed=False,
         near_plane=params.near_plane,
         far_plane=params.far_plane,
         render_mode="RGB+ED",
+    )
+    if params.is_3dgs:
+        renders, alpha, info = raster(
+            **common,
+            packed=params.resolved_packed,
+            # AbsGS: the backward hangs `.absgrad` on `info["means2d"]`, which is
+            # exactly the tensor DefaultStrategy densifies off here — so unlike the
+            # 2DGS path this actually works (see TrainParams.absgrad).
+            absgrad=params.resolved_absgrad,
+            rasterize_mode=params.rasterize_mode,
+        )
+        # No median depth exists on this path, so the ED channel IS the depth the
+        # loss compares (TrainParams.resolved_depth_mode pins it to "expected").
+        expected = renders[..., 3:4]
+        return _Render(renders[..., :3], alpha, expected, expected, None, None, None, info)
+
+    renders, alpha, normals, nfd, distort, median, info = raster(
+        **common,
+        # Non-packed: gsplat's packed 2DGS depth path is broken — its SH branch
+        # mis-broadcasts and its precomputed-colour path skips the visible-subset
+        # gather, so RGB+ED crashes once a view sees only part of the cloud.
+        packed=False,
         distloss=dist_on,
-        depth_mode=params.depth_mode,
+        depth_mode=params.resolved_depth_mode,
         # absgrad is unsupported on gsplat 1.5.3's 2DGS densification path
         # (`gradient_2dgs` never gets `.absgrad`; see grow_grad2d in TrainParams).
         absgrad=False,
     )
+    expected = renders[..., 3:4]
+    depth = median if params.resolved_depth_mode == "median" else expected
+    return _Render(renders[..., :3], alpha, depth, expected, normals, nfd, distort, info)
 
 
 def _supervision_loss(  # noqa: ANN001
-    torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
-    pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
+    torch, F, params, window, gt_rgb, gt_alpha, gt_depth, render, scales, mask,
     normals_active, dist_active, depth_active=True, scene_scale=1.0,
-    pred_expected=None, ed_target=None, ed_gate=None,
+    ed_target=None, ed_gate=None,
 ):
     """Combined per-view supervision loss — photometric L1 + D-SSIM, alpha
-    (coverage), disparity-space depth L1, 2DGS normal consistency, and optional
-    depth distortion — shared by the training loop and the compaction pass. Both
-    RGB sides are premultiplied-over-black. `mask` (a tile's owned-pixel mask, or
-    None for a single run) restricts every term to owned pixels; `normals_active`
-    / `dist_active` / `depth_active` gate the terms that only switch on partway
-    through a run (`depth_active` defaults True for the heal/compact callers,
-    whose models are already opaque)."""
+    (coverage), disparity-space depth L1, and the GEOMETRY prior for whichever
+    representation is training — shared by the training loop and the compaction
+    pass. Both RGB sides are premultiplied-over-black. `mask` (a tile's
+    owned-pixel mask, or None for a single run) restricts every term to owned
+    pixels; `normals_active` / `dist_active` / `depth_active` gate the terms that
+    only switch on partway through a run (`depth_active` defaults True for the
+    heal/compact callers, whose models are already opaque).
+
+    The photometric, alpha and depth terms are representation-independent — they
+    compare rendered pixels against the capture, and `_Render` has already
+    normalized those. Only the geometry prior differs, and `normals_active` gates
+    both variants because both exist for the same reason (don't freeze half-built
+    geometry): 2DGS ties rendered normals to the render's own depth, while 3DGS —
+    which has no rendered normal — imposes flatness and bounded anisotropy on the
+    scale parameters directly (`params.flat_lambda` / `aniso_lambda`)."""
+    pred_rgb, pred_alpha, pred_depth = render.rgb, render.alpha, render.depth
     if mask is None:
         l1 = (pred_rgb - gt_rgb).abs().mean()
         ssim_rgb = pred_rgb
@@ -2638,6 +3160,19 @@ def _supervision_loss(  # noqa: ANN001
         gate = (gt_alpha > params.alpha_gate) & (gt_depth > 0) & (pred_depth.detach() > 0)
         if mask is not None:
             gate = gate & (mask > 0)
+        if params.resolved_glass_guard and ed_target is not None:
+            # GLASS EXCLUSION. The stored plane is the nearest OPAQUE surface, and
+            # expected depth (the only statistic 3DGS renders) is the α-weighted
+            # mean along the ray — so at a pixel with a transmissive pane in front
+            # of a wall, pulling expected depth onto the wall is a demand to DELETE
+            # the pane. The init cloud renders the true two-layer expected depth
+            # (its glass surfels sit on the panes), so wherever that disagrees with
+            # the stored plane there is a transmissive layer, and this term has
+            # nothing correct to say: drop those pixels and leave them to the
+            # photometric loss and `depth_expected_lambda`. Median depth needs none
+            # of this — it already lands on the opaque surface — so the 2DGS default
+            # keeps the full gate.
+            gate = gate & ((ed_target - gt_depth).abs() <= _ED_GLASS_TOL_FRAC * gt_depth)
         if gate.any():
             # Disparity space × scene_scale (the reference trainer's form): a
             # dimensionless residual whose gradient falls off as 1/d², so the far
@@ -2668,7 +3203,7 @@ def _supervision_loss(  # noqa: ANN001
     # target), so this requires the transmissive layer; the median term above keeps
     # the wall pinned so the pair can't be faked by sliding the wall forward.
     if (
-        ed_target is not None and pred_expected is not None and gt_depth is not None
+        ed_target is not None and gt_depth is not None
         and params.depth_expected_lambda > 0.0 and depth_active
     ):
         eg = (gt_alpha > params.alpha_gate) & (gt_depth > 0)
@@ -2677,30 +3212,54 @@ def _supervision_loss(  # noqa: ANN001
         if mask is not None:
             eg = eg & (mask > 0)
         if eg.any():
-            el = ((pred_expected - ed_target).abs() * eg).sum() / (eg.sum() + 1e-8)
+            el = ((render.expected - ed_target).abs() * eg).sum() / (eg.sum() + 1e-8)
             loss = loss + params.depth_expected_lambda * el
 
-    if params.normal_lambda > 0.0 and normals_active:
+    if params.normal_lambda > 0.0 and normals_active and render.normals is not None:
         # Scale the depth-derived normal by the RENDERED alpha, as the reference
         # trainer does: at a pixel the splat hasn't covered yet the depth patch is
         # empty and its normal is arbitrary, so without this the term pulls the
         # rendered normals toward garbage over exactly the pixels still being
         # filled in. Zeroed there, the error is a constant 1 with no gradient.
-        nfd = normals_from_depth * pred_alpha.detach()
-        nerr = 1.0 - (normals * nfd).sum(dim=-1)
+        nfd = render.normals_from_depth * pred_alpha.detach()
+        nerr = 1.0 - (render.normals * nfd).sum(dim=-1)
         fg_mask = gt_alpha.squeeze(-1) > params.alpha_gate
         if mask is not None:
             fg_mask = fg_mask & (mask.squeeze(-1) > 0)
         if fg_mask.any():
             loss = loss + params.normal_lambda * nerr[fg_mask].mean()
 
-    if dist_active and params.dist_lambda > 0.0:
-        loss = loss + params.dist_lambda * distort.mean()
+    if dist_active and params.dist_lambda > 0.0 and render.distort is not None:
+        loss = loss + params.dist_lambda * render.distort.mean()
+
+    # 3DGS geometry priors, in PARAMETER space — the stand-in for the normal
+    # consistency this rasterizer can't provide (TrainParams.flat_lambda). Both are
+    # ratios of a Gaussian's own axes, so they are scale-free and cost one [N,3]
+    # sort; neither looks at the reference, so a masked tile pays nothing extra.
+    if (
+        params.is_3dgs and normals_active and scales is not None
+        and (params.flat_lambda > 0.0 or params.aniso_lambda > 0.0)
+    ):
+        s = torch.sort(torch.exp(scales), dim=-1, descending=True).values   # [N,3]
+        if params.flat_lambda > 0.0:
+            # FLATNESS: smallest/largest above `flat_max`, denominator DETACHED so
+            # the only way to satisfy it is to thin the normal axis — never to widen
+            # the footprint, which an undetached quotient would reward equally.
+            # Bounded by the relu, so a Gaussian already flatter than the target is
+            # left alone instead of being walked toward a degenerate covariance.
+            flat = s[:, 2] / s[:, 0].detach().clamp_min(1e-12)
+            loss = loss + params.flat_lambda * (flat - params.flat_max).clamp_min(0.0).mean()
+        if params.aniso_lambda > 0.0:
+            # NEEDLES: largest/middle above `aniso_max`. A disk is 1.0 and free, a
+            # spike is unbounded. Two-sided on purpose — shortening the long axis
+            # and fattening the middle one both fix it.
+            ratio = s[:, 0] / s[:, 1].clamp_min(1e-12)
+            loss = loss + params.aniso_lambda * (ratio - params.aniso_max).clamp_min(0.0).mean()
     return loss
 
 
 def _contribution_weights(  # noqa: ANN001
-    torch, rasterization_2dgs, splats, views, K, width: int, height: int, params, progress=None,
+    torch, raster, splats, views, K, width: int, height: int, params, progress=None,
 ):
     """EXACT per-Gaussian rendered contribution, measured through the rasterizer:
     a pixel is Σᵢ wᵢ·cᵢ with wᵢ the blend weight (opacity × kernel ×
@@ -2727,11 +3286,11 @@ def _contribution_weights(  # noqa: ANN001
             [views[i]["viewmat"] for i in range(lo, min(lo + b, len(views)))]
         ).to(device)
         colors, sh_deg = _render_inputs(torch, shadow, params.sh_degree)
-        renders, *_ = _render_batch(
-            torch, rasterization_2dgs, shadow, colors, sh_deg, viewmats, K,
+        render = _render_batch(
+            torch, raster, shadow, colors, sh_deg, viewmats, K,
             width, height, params, dist_on=False,
         )
-        renders[..., :3].sum().backward()
+        render.rgb.sum().backward()
         if progress is not None and (bi % 50 == 0 or bi == n_batches - 1):
             progress(bi + 1, n_batches, f"compact: measuring contribution ({bi + 1}/{n_batches} batches)")
     if sh0_leaf.grad is None:
@@ -2798,7 +3357,7 @@ def _select_keep(  # noqa: ANN001
 
 
 def _heal(  # noqa: ANN001
-    torch, F, rasterization_2dgs, splats, views, K, width, height, params,
+    torch, F, raster, splats, views, K, width, height, params,
     scene_scale, steps, box_lo, box_hi, px_grid, py_grid, progress,
 ):
     """Short fine-tune of the compaction SURVIVORS (no densification) so
@@ -2834,16 +3393,14 @@ def _heal(  # noqa: ANN001
                 world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
                 mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
             colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
-            renders, pred_alpha, normals, nfd, distort, median_depth, _info = _render_batch(
-                torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K,
+            render = _render_batch(
+                torch, raster, splats, colors, sh_deg, viewmats, K,
                 width, height, params, dist_on=False,
             )
-            pred_rgb = renders[..., :3]
-            pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
             loss = _supervision_loss(
                 torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
-                pred_rgb, pred_alpha, pred_depth, normals, nfd, distort, mask,
-                normals_active=True, dist_active=(params.dist_lambda > 0.0),
+                render, splats["scales"], mask,
+                normals_active=True, dist_active=False,
                 scene_scale=scene_scale,
             )
             loss.backward()
@@ -2954,7 +3511,8 @@ def _profile_report(prof, n_sampled, n_steps, wall_s, radii_px, params, n_final)
                  "once the loader is fixed"
         )
         msg = (
-            f"{lead}. 2DGS cost scales with covered pixels x blend depth, not primitive count."
+            f"{lead}. {params.representation.upper()} cost scales with covered pixels x "
+            "blend depth, not primitive count."
         )
         if rad and rad["median_px"] > 16.0:
             msg += (
@@ -3004,26 +3562,34 @@ def _train_one(  # noqa: ANN001
     progress: ProgressCb | None,
     tile_box=None,
 ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
-    """ONE gsplat 2DGS optimization — the whole scene, or one tile — returning
+    """ONE gsplat optimization, in `params.representation` — the whole scene, or one
+    tile — returning
     `(trained arrays as numpy, counters)`. `tile_box` ((lo, hi) world corners of
     the tile's expanded region) masks every loss to pixels this run OWNS (its own
     surface + true background — `_tile_mask`) and clips depth-seeding to the box;
     None trains unmasked, the single-run behavior. Checkpoints under `ckpt_dir`
     (the caller owns cleanup)."""
-    from gsplat import DefaultStrategy, rasterization_2dgs
+    from gsplat import DefaultStrategy
     from gsplat.strategy.ops import reset_opa
 
+    raster = _rasterizer(params)
     device = torch.device("cuda")
     n_views = len(views)
     n_init = int(init["means"].shape[0])
 
     # Resume from the latest checkpoint when present + compatible, else build from
-    # the surfel init. This model is degree-3 (SH): a legacy FLAT checkpoint (one
-    # with no `shN` param) is incompatible, so it's rejected and the run starts
-    # fresh rather than crashing on the missing SH param/optimizer.
-    meta = {"n_init": n_init}
+    # the surfel init. Two incompatibilities are rejected rather than crashed on:
+    #   * a legacy FLAT checkpoint (no `shN` param) against this degree-3 model;
+    #   * a checkpoint from the OTHER representation — which no shape check could
+    #     catch, since the parameter tensors are identically shaped and only the
+    #     MEANING of the third scale column differs (1% decoy vs real thickness).
+    #     Checkpoints written before this field existed are 2DGS by definition.
+    meta = {"n_init": n_init, "representation": params.representation}
     ckpt = _load_checkpoint(torch, ckpt_dir, device) if resume else None
-    if ckpt is not None and "shN" not in ckpt.get("params", {}):
+    if ckpt is not None and (
+        "shN" not in ckpt.get("params", {})
+        or (ckpt.get("meta") or {}).get("representation", "2dgs") != params.representation
+    ):
         ckpt = None
 
     if ckpt is not None:
@@ -3074,7 +3640,7 @@ def _train_one(  # noqa: ANN001
     # dead trigger still evaluates `step % reset_every`.
     strategy = DefaultStrategy(
         prune_opa=params.prune_opa,
-        grow_grad2d=params.grow_grad2d,
+        grow_grad2d=params.resolved_grow_grad2d,
         grow_scale3d=params.grow_scale3d,
         prune_scale3d=params.prune_scale3d,
         # Screen-space split (see TrainParams). `refine_scale2d_stop_iter` arms
@@ -3088,10 +3654,14 @@ def _train_one(  # noqa: ANN001
         refine_stop_iter=params.resolved_refine_stop,
         reset_every=max(params.prune_scale_start_iter, 1),
         refine_every=params.refine_every,
-        # absgrad stays off: gsplat 1.5.3 never writes `.absgrad` on the 2DGS
-        # `gradient_2dgs` tensor this strategy reads (see grow_grad2d note above).
-        absgrad=False,
-        key_for_gradient="gradient_2dgs",
+        # WHICH 2D GRADIENT densification reads, and whether it may use the
+        # ABSOLUTE one. The 3DGS rasterizer's densification tensor is `means2d`,
+        # which its backward also decorates with `.absgrad` — so AbsGS is live
+        # there. The 2DGS path densifies off a separate `gradient_2dgs` tensor that
+        # never receives one, so absgrad resolves to False and would raise if forced
+        # (see TrainParams.absgrad / grow_grad2d).
+        absgrad=params.resolved_absgrad,
+        key_for_gradient="means2d" if params.is_3dgs else "gradient_2dgs",
         verbose=False,
     )
     strategy.check_sanity(splats, optimizers)
@@ -3112,7 +3682,10 @@ def _train_one(  # noqa: ANN001
         start_step = int(ckpt["step"]) + 1
 
     window = _gaussian_window(torch, 11, 1.5, device, channels=3)
-    dist_on = params.dist_lambda > 0.0
+    # The distortion map is a 2DGS-only rasterizer output, and asking for it costs
+    # an extra buffer — so the request itself is gated on the representation, not
+    # just the weight.
+    dist_on = params.dist_lambda > 0.0 and not params.is_3dgs
 
     # Nearest-camera KD-tree for the anti-aliasing scale floor (cameras are fixed,
     # so build once); `focal` (= fl_x) converts a camera distance to a pixel span.
@@ -3170,10 +3743,14 @@ def _train_one(  # noqa: ANN001
 
     # "Record both" reference: a FROZEN copy of the init cloud, whose EXPECTED
     # depth is the true two-layer α-weighted depth (it sits on the glass panes at
-    # α≈0.065). Rendered per batch (no grad) as the target for the expected-depth
-    # term — see TrainParams.depth_expected_lambda. Built only when the term is on.
+    # α≈0.065). Rendered per batch (no grad) and used two ways, so it is built when
+    # EITHER wants it: as the positive target of the expected-depth term
+    # (`depth_expected_lambda`), and as the transmissive-pixel detector that keeps
+    # the opaque-plane depth term off glass when the depth statistic is expected
+    # (`resolved_glass_guard` — i.e. always on the 3DGS path). One render serves
+    # both.
     ref_splats = ref_colors = None
-    if params.depth_expected_lambda > 0.0:
+    if params.depth_expected_lambda > 0.0 or params.resolved_glass_guard:
         ref_splats = {
             k: torch.from_numpy(np.ascontiguousarray(init[k])).to(device)
             for k in ("means", "scales", "quats", "opacities", "sh0", "shN")
@@ -3198,51 +3775,49 @@ def _train_one(  # noqa: ANN001
 
         active_sh = min(params.sh_degree, step // max(params.sh_degree_interval, 1))
         colors, sh_deg = _render_inputs(torch, splats, active_sh)
-        renders, pred_alpha, normals, normals_from_depth, distort, median_depth, info = _render_batch(
-            torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on
+        render = _render_batch(
+            torch, raster, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on
         )
+        info = render.info
         if sample:
             _lap("render")
-            # Screen-space size drives 2DGS cost (covered pixels x blend depth) and
-            # is also what decides clone-vs-split, so it feeds both halves of the
-            # report. `info["radii"]` is [C,N,2] in pixels; 0 = not visible.
+            # Screen-space size drives rasterizer cost (covered pixels x blend
+            # depth) and is also what decides clone-vs-split, so it feeds both halves
+            # of the report. `info["radii"]` is [...,2] in pixels; 0 = not visible.
             with torch.no_grad():
                 r = info["radii"].detach().amax(dim=-1).flatten()
                 r = r[r > 0]
                 if r.numel():
                     radii_px.append(float(r.median()))
-        pred_rgb = renders[..., :3]
-        pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
-        # Expected-depth channel (ED) + the frozen-cloud target for the glass-maker
-        # term. The cloud's own rendered alpha gates out its sampling holes, where
-        # its expected depth would be ill-defined.
-        pred_expected = renders[..., 3:4]
+        # The frozen-cloud target for the glass-maker term / the glass guard. The
+        # cloud's own rendered alpha gates out its sampling holes, where its expected
+        # depth would be ill-defined.
         ed_target = ed_gate = None
         if ref_splats is not None and gt_depth is not None:
             with torch.no_grad():
-                r_ren, r_alpha, *_ = _render_batch(
-                    torch, rasterization_2dgs, ref_splats, ref_colors, 0,
+                ref = _render_batch(
+                    torch, raster, ref_splats, ref_colors, 0,
                     viewmats, K, width, height, params, False,
                 )
-            ed_target = r_ren[..., 3:4]
-            ed_gate = r_alpha > 0.5
+            ed_target = ref.expected
+            ed_gate = ref.alpha > 0.5
 
         if params.refine:
             strategy.step_pre_backward(splats, optimizers, strat_state, step, info)
 
-        # Photometric L1 + D-SSIM, alpha, alpha-gated depth (median vs the opaque
-        # plane + expected vs the two-layer cloud target), normal consistency, and
-        # optional distortion — the shared supervision loss. Under a tile mask every
-        # term is restricted to pixels this tile OWNS (its surface + true
-        # background), so boundary Gaussians never chase content a neighbour owns.
+        # Photometric L1 + D-SSIM, alpha, alpha-gated depth (the opaque plane +
+        # expected vs the two-layer cloud target), and the representation's geometry
+        # prior — the shared supervision loss. Under a tile mask every term is
+        # restricted to pixels this tile OWNS (its surface + true background), so
+        # boundary Gaussians never chase content a neighbour owns.
         loss = _supervision_loss(
             torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
-            pred_rgb, pred_alpha, pred_depth, normals, normals_from_depth, distort, mask,
+            render, splats["scales"], mask,
             normals_active=step >= params.normal_start_iter,
             dist_active=dist_on and step >= params.dist_start_iter,
             depth_active=step >= params.depth_start_iter,
             scene_scale=scene_scale,
-            pred_expected=pred_expected, ed_target=ed_target, ed_gate=ed_gate,
+            ed_target=ed_target, ed_gate=ed_gate,
         )
         if sample:
             _lap("loss")
@@ -3258,7 +3833,9 @@ def _train_one(  # noqa: ANN001
             _lap("optim")
 
         if params.refine:
-            strategy.step_post_backward(splats, optimizers, strat_state, step, info, packed=False)
+            strategy.step_post_backward(
+                splats, optimizers, strat_state, step, info, packed=params.resolved_packed
+            )
             # Opacity reset at the reference cadence, under upstream's FIXED
             # trigger (`step % reset_every == 0 and step > 0`, refine window
             # only) — executed here because the pinned gsplat 1.5.3 wheel's own
@@ -3304,7 +3881,9 @@ def _train_one(  # noqa: ANN001
                         torch.cuda.empty_cache()
                         tight_vram = torch.cuda.mem_get_info()[0] < need
                 freeze_growth = over_cap or tight_vram
-                strategy.grow_grad2d = float("inf") if freeze_growth else params.grow_grad2d
+                strategy.grow_grad2d = (
+                    float("inf") if freeze_growth else params.resolved_grow_grad2d
+                )
                 if freeze_growth != growth_frozen and progress is not None:
                     why = (
                         f"count ceiling {params.cap_max:,} reached" if over_cap
@@ -3338,8 +3917,8 @@ def _train_one(  # noqa: ANN001
             new = (
                 None if tight
                 else _depth_seed(
-                    torch, gt_rgb, gt_alpha, gt_depth, pred_alpha.detach(),
-                    pred_depth.detach(), viewmats, K, params, int(params.depth_densify_max),
+                    torch, gt_rgb, gt_alpha, gt_depth, render.alpha.detach(),
+                    render.depth.detach(), viewmats, K, params, int(params.depth_densify_max),
                     box=(box_lo, box_hi) if box_lo is not None else None,
                 )
             )
@@ -3351,7 +3930,10 @@ def _train_one(  # noqa: ANN001
         # so it can't shimmer across the scale-ladder octaves under free-fly.
         if params.antialias and cam_tree is not None and (step + 1) % max(params.aa_every, 1) == 0:
             _t_aa = time.perf_counter()
-            _aa_scale_floor(torch, splats, cam_tree, focal, params.aa_min_scale_px)
+            _aa_scale_floor(
+                torch, splats, cam_tree, focal, params.aa_min_scale_px,
+                tangent_only=not params.is_3dgs,
+            )
             prof["aa"] += time.perf_counter() - _t_aa
 
         # Divergence guard — free, because the log below already syncs on the loss.
@@ -3437,7 +4019,7 @@ def _train_one(  # noqa: ANN001
 def _final_prune(torch, splats, prune_opa: float, prune_scale3d: float, scene_scale: float) -> int:  # noqa: ANN001
     """One-shot cleanup before export: drop Gaussians below `prune_opa` opacity (the
     low-opacity floaters left after densification stopped) and, when `prune_scale3d
-    > 0`, any whose max tangent radius exceeds `prune_scale3d·scene_scale` (runaway
+    > 0`, any whose largest axis exceeds `prune_scale3d·scene_scale` (runaway
     blobs). Mutates `splats` in place — the optimizer is done, so the pruned
     parameters need no grad or Adam state — and returns the count removed."""
     with torch.no_grad():
@@ -3452,9 +4034,12 @@ def _final_prune(torch, splats, prune_opa: float, prune_scale3d: float, scene_sc
     return removed
 
 
-def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params, device):  # noqa: ANN001
+def _evaluate(torch, raster, splats, views, K, width, height, params, device):  # noqa: ANN001
     """Mean PSNR (foreground), RGB L1, and alpha-gated depth L1 over a random
-    subset of views (capped by `eval_max_views` — plans can have thousands)."""
+    subset of views (capped by `eval_max_views` — plans can have thousands). Renders
+    through `_render_batch`, so the metric is measured with the exact operator the
+    model was trained under — which is also what makes the compaction pass's dB
+    gate meaningful, since it bisects on this number."""
     colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
     n_eval = min(len(views), params.eval_max_views)
     sel = (
@@ -3468,25 +4053,13 @@ def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params
         for i in sel:
             v = views[int(i)]
             gt_rgb, gt_alpha, gt_depth = _load_view(torch, v, device)
-            renders, _alpha, _normals, _nfd, _distort, median_depth, _info = rasterization_2dgs(
-                means=splats["means"],
-                quats=splats["quats"],
-                scales=torch.exp(splats["scales"]),
-                opacities=torch.sigmoid(splats["opacities"]),
-                colors=colors,
-                viewmats=v["viewmat"].to(device).unsqueeze(0),
-                Ks=K.unsqueeze(0),
-                width=width,
-                height=height,
-                sh_degree=sh_deg,
-                packed=False,
-                near_plane=params.near_plane,
-                far_plane=params.far_plane,
-                render_mode="RGB+ED",
-                depth_mode=params.depth_mode,
+            render = _render_batch(
+                torch, raster, splats, colors, sh_deg,
+                v["viewmat"].to(device).unsqueeze(0), K, width, height, params,
+                dist_on=False,
             )
-            pred_rgb = renders[..., :3].clamp(0, 1)
-            pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
+            pred_rgb = render.rgb.clamp(0, 1)
+            pred_depth = render.depth
             fg = gt_alpha > params.alpha_gate
             fg3 = fg.expand_as(gt_rgb)
             if fg3.any():
@@ -3508,12 +4081,19 @@ def _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params
 
 
 def _main() -> None:
-    """Standalone CLI for the GPU box: fine-tune a 2DGS splat from a COLMAP model —
+    """Standalone CLI for the GPU box: fine-tune a splat from a COLMAP model —
     the Postshot-style (point cloud + poses + images) folder that
     `splat_to_colmap.py` / `splat.colmap.export_colmap` writes."""
     import argparse
 
-    ap = argparse.ArgumentParser(description="Stage 6 — gsplat 2DGS fine-tune from a COLMAP model")
+    ap = argparse.ArgumentParser(description="Stage 6 — gsplat fine-tune from a COLMAP model")
+    ap.add_argument(
+        "--representation", choices=REPRESENTATIONS, default=TrainParams.representation,
+        help="primitive to train: '2dgs' = surface-aligned surfels (best geometry, "
+             "median-depth + normal-consistency supervision); '3dgs' = full 3D "
+             "Gaussians (AbsGS densification, antialiased rasterization, and the "
+             "primitive every delivery viewer actually renders)",
+    )
     ap.add_argument(
         "--colmap", required=True, type=Path,
         help="COLMAP model dir (cameras.txt / images.txt / points3D.txt + RGB "
@@ -3600,6 +4180,7 @@ def _main() -> None:
         out_path=args.out,
         init_ply=args.init_ply,
         params=TrainParams(
+            representation=args.representation,
             init=args.init,
             iterations=args.iterations,
             epochs=args.epochs,

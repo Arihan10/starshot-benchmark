@@ -1,19 +1,26 @@
 // ply-utils.mjs — shared binary-PLY helpers for the splat side-scripts.
 //
-// The trained splat is 2DGS (scale_0/scale_1 only); the SOG and ksplat encoders
-// are both 3DGS (three-scale) formats and don't recognize a 2-scale PLY as
-// gaussians. `flattenTo3dgs` inserts a thin scale_2 (= ln(flatScale)) so the PLY
-// reads as a valid, near-flat 3DGS splat (the overview §12 flatten).
+// A 2DGS-trained splat is scale_0/scale_1 only; the SOG and ksplat encoders are
+// both 3DGS (three-scale) formats and don't recognize a 2-scale PLY as gaussians.
+// `flattenFileIfNeeded` inserts a thin scale_2 (= ln(flatScale)) so the PLY reads
+// as a valid, near-flat 3DGS splat (the overview §12 flatten).
+//
+// Both helpers work without the PLY resident: fs.readFileSync throws over 2 GiB,
+// and a trained 3DGS scene clears that easily (13.5M gaussians × 62 float props =
+// 3.3 GB). splat-transform reads the PLY lazily too, so nothing here needs more
+// than the header plus one batch of gaussians.
 
 import * as fs from "node:fs";
 
-// A clean, 4-byte-aligned ArrayBuffer of exactly this Buffer's bytes.
-export function toArrayBuffer(buf) {
-    return buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength);
-}
+// parsePlyHeader never scans past this, so reading this much off the front sees
+// exactly what a whole-file read would.
+const HEADER_SCAN_BYTES = 1 << 16;
+
+// Gaussians per flatten batch (~16 MB in, ~16 MB out at 62 properties).
+const FLATTEN_BATCH = 1 << 16;
 
 export function parsePlyHeader(buf) {
-    const scan = buf.toString("latin1", 0, Math.min(buf.length, 1 << 16));
+    const scan = buf.toString("latin1", 0, Math.min(buf.length, HEADER_SCAN_BYTES));
     const end = scan.indexOf("end_header\n");
     if (end < 0) throw new Error("not a PLY (no end_header)");
     const headerBytes = end + "end_header\n".length;
@@ -38,46 +45,73 @@ export function parsePlyHeader(buf) {
     return { count, props, headerBytes };
 }
 
+// The header of the PLY at `inPath`, read off the front of the file.
+export function readPlyHeader(inPath) {
+    const fd = fs.openSync(inPath, "r");
+    try {
+        const buf = Buffer.alloc(HEADER_SCAN_BYTES);
+        const read = fs.readSync(fd, buf, 0, HEADER_SCAN_BYTES, 0);
+        return parsePlyHeader(buf.subarray(0, read));
+    } finally {
+        fs.closeSync(fd);
+    }
+}
+
 export function isTwoDgs(header) {
     return header.props.includes("scale_1") && !header.props.includes("scale_2");
 }
 
-// Insert a thin scale_2 (= ln(flatScale)) after scale_1, turning a 2DGS PLY into
-// a valid 3DGS PLY the SOG/ksplat encoders accept. Returns a new Buffer.
-export function flattenTo3dgs(buf, header, flatScale = 1e-4) {
+// If `inPath` is 2DGS, stream a flattened 3DGS copy to `outPath` — scale_2
+// (= ln(flatScale)) inserted after scale_1 — and return { flattened: true,
+// header }. If it's already 3DGS, return { flattened: false } without writing
+// anything (the caller uses the original file).
+export function flattenFileIfNeeded(inPath, outPath, flatScale = 1e-4) {
+    const header = readPlyHeader(inPath);
+    if (!isTwoDgs(header)) return { flattened: false, header };
+
     const { count, props, headerBytes } = header;
     const P = props.length;
-    const insertAt = props.indexOf("scale_1") + 1;
-    const src = new Float32Array(toArrayBuffer(buf.subarray(headerBytes)), 0, count * P);
     const Pn = P + 1;
-    const out = new Float32Array(count * Pn);
-    const logFlat = Math.log(flatScale);
-    for (let i = 0; i < count; i++) {
-        const s = i * P;
-        const d = i * Pn;
-        out.set(src.subarray(s, s + insertAt), d);
-        out[d + insertAt] = logFlat;
-        out.set(src.subarray(s + insertAt, s + P), d + insertAt + 1);
-    }
+    const insertAt = props.indexOf("scale_1") + 1;
     const newProps = [...props.slice(0, insertAt), "scale_2", ...props.slice(insertAt)];
-    const headerStr =
-        "ply\nformat binary_little_endian 1.0\n" +
-        `element vertex ${count}\n` +
-        newProps.map((n) => `property float ${n}\n`).join("") +
-        "end_header\n";
-    return Buffer.concat([
-        Buffer.from(headerStr, "ascii"),
-        Buffer.from(out.buffer, out.byteOffset, out.byteLength),
-    ]);
-}
+    const logFlat = Math.log(flatScale);
+    const src = new Float32Array(FLATTEN_BATCH * P);
+    const dst = new Float32Array(FLATTEN_BATCH * Pn);
+    const srcBytes = Buffer.from(src.buffer);
+    const dstBytes = Buffer.from(dst.buffer);
 
-// Read `inPath`; if it's 2DGS, write a flattened 3DGS copy to `outPath` and
-// return { flattened: true, header }. If already 3DGS, return { flattened: false }
-// without writing (the caller uses the original file).
-export function flattenFileIfNeeded(inPath, outPath, flatScale = 1e-4) {
-    const buf = fs.readFileSync(inPath);
-    const header = parsePlyHeader(buf);
-    if (!isTwoDgs(header)) return { flattened: false, header };
-    fs.writeFileSync(outPath, flattenTo3dgs(buf, header, flatScale));
+    const inFd = fs.openSync(inPath, "r");
+    const outFd = fs.openSync(outPath, "w");
+    try {
+        fs.writeSync(
+            outFd,
+            Buffer.from(
+                "ply\nformat binary_little_endian 1.0\n" +
+                    `element vertex ${count}\n` +
+                    newProps.map((p) => `property float ${p}\n`).join("") +
+                    "end_header\n",
+                "ascii",
+            ),
+        );
+        for (let base = 0; base < count; base += FLATTEN_BATCH) {
+            const batch = Math.min(FLATTEN_BATCH, count - base);
+            const wanted = batch * P * 4;
+            const read = fs.readSync(inFd, srcBytes, 0, wanted, headerBytes + base * P * 4);
+            if (read !== wanted) {
+                throw new Error(`PLY truncated at gaussian ${base}: read ${read}/${wanted} bytes`);
+            }
+            for (let i = 0; i < batch; i++) {
+                const s = i * P;
+                const d = i * Pn;
+                dst.set(src.subarray(s, s + insertAt), d);
+                dst[d + insertAt] = logFlat;
+                dst.set(src.subarray(s + insertAt, s + P), d + insertAt + 1);
+            }
+            fs.writeSync(outFd, dstBytes, 0, batch * Pn * 4);
+        }
+    } finally {
+        fs.closeSync(inFd);
+        fs.closeSync(outFd);
+    }
     return { flattened: true, header };
 }

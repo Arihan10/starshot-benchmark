@@ -1,13 +1,15 @@
 import {
+	BoxGeometry,
 	BufferGeometry,
-	CircleGeometry,
 	ConeGeometry,
 	DoubleSide,
+	EdgesGeometry,
 	Group,
 	Line,
 	LineBasicMaterial,
 	LineDashedMaterial,
 	LineLoop,
+	LineSegments,
 	MathUtils,
 	Mesh,
 	MeshBasicMaterial,
@@ -23,10 +25,8 @@ export const HOTSPOT_FLOOR_DROP = 1.3; // meters below eye level (markers sit on
 export const CAPTURE_EYE_HEIGHT = 1.6; // panos are shot at eye height; floor sits this far below
 export const PEEK_ROTATE_SPEED = 0.5; // rad/s the dollhouse spins while locating
 export const LOCATE_SLICE_ABOVE_EYE = 0.3; // m above the eye where hold-to-locate slices the roof off
-export const ENTRY_TARGET_PX = 5; // overview entry discs render as small dots
-export const ENTRY_AIM_PX = 26; // pick radius for the small entry discs
 export const NAV_AIM_PX = 44; // interior affordance pick/hover magnetism radius
-export const HOTSPOT_BASE_RADIUS = 0.16; // the entry-disc geometry's world radius
+export const HOTSPOT_BASE_RADIUS = 0.16; // default world radius for on-screen size scaling
 
 // WASD graph-walk gates (nearest edge inside a forward cone).
 export const WASD_MAX_Y_STEP = 2.0; // m: max |Δy| a WASD step will cross (keeps you on-floor)
@@ -51,42 +51,6 @@ export const NAV_REST_OPACITY = 0.62; // affordances rest here, brightening towa
 export const NAV_GAZE_RAD = (55 * Math.PI) / 180; // within this bearing of the gaze → full brightness
 export const NAV_TARGET_PX = 15; // affordances never shrink below ~this on-screen size (distant points stay visible)
 export const SONAR_DURATION = 3200; // ms the reveal front takes to sweep + fade
-
-// A flat floor disc + ring (overview "enter" markers). Lies flat (normal up);
-// screen-space auto-aim (pickByScreen) handles forgiving picking.
-export function makeDisc(targetIndex: number, color: number, ringColor: number): Group {
-	const group = new Group();
-	const disc = new Mesh(
-		new CircleGeometry(HOTSPOT_BASE_RADIUS, 40),
-		new MeshBasicMaterial({
-			color,
-			transparent: true,
-			opacity: 0.55,
-			side: DoubleSide,
-			depthTest: false,
-			depthWrite: false,
-		}),
-	);
-	const ring = new Mesh(
-		new RingGeometry(HOTSPOT_BASE_RADIUS * 1.38, HOTSPOT_BASE_RADIUS * 1.69, 48),
-		new MeshBasicMaterial({
-			color: ringColor,
-			transparent: true,
-			opacity: 0.9,
-			side: DoubleSide,
-			depthTest: false,
-			depthWrite: false,
-		}),
-	);
-	disc.rotation.x = -Math.PI / 2;
-	ring.rotation.x = -Math.PI / 2;
-	disc.renderOrder = 2;
-	ring.renderOrder = 2;
-	group.add(disc, ring);
-	group.renderOrder = 2;
-	group.userData.targetIndex = targetIndex;
-	return group;
-}
 
 export type YouMarker = { group: Group; sphere: Mesh; ring: Mesh; line: Line };
 
@@ -188,9 +152,13 @@ function makeChevron(color: number, down: boolean, overlay = true, size = 1): Me
 
 // Build the affordance group for one typed edge, anchored at the destination's
 // floor. `userData.edge` carries the edge so hover/click read straight off it.
+// `forceChevron` gives a type that normally goes bare (the walk puck) the same
+// upward arrow a portal wears — the auto-home ghost sets it so the destination
+// always reads as a pointer rather than a ring lying flat on the floor.
 export function makeNavMarker(
 	edge: { to: number; type: EdgeType; dy: number },
 	floorPos: Vector3,
+	forceChevron = false,
 ): Group {
 	const group = new Group();
 	const color = NAV_COLORS[edge.type];
@@ -204,8 +172,13 @@ export function makeNavMarker(
 	} else {
 		parts.push(makeFloorRing(color, overlay));
 	}
-	if (edge.type === "portal") parts.push(makeChevron(color, false));
-	if (edge.type === "vertical") parts.push(makeChevron(color, edge.dy < 0, true, 1.6));
+	if (edge.type === "vertical") {
+		parts.push(makeChevron(color, edge.dy < 0, true, 1.6));
+	} else if (edge.type === "portal" || forceChevron) {
+		// Match the ring's depth behaviour so a walk ghost's arrow doesn't float
+		// through furniture while its ring is correctly occluded.
+		parts.push(makeChevron(color, false, overlay));
+	}
 	for (const p of parts) p.renderOrder = overlay ? 6 : 3;
 	group.add(...parts);
 	group.position.copy(floorPos);
@@ -213,6 +186,94 @@ export function makeNavMarker(
 	group.userData.to = edge.to;
 	group.userData.type = edge.type;
 	group.userData.overlay = overlay;
+	return group;
+}
+
+// --- level waypoints --------------------------------------------------------
+// One red monolith per reachable floor, standing at that floor's most central
+// capture. It draws as an overlay — through the ceiling or floor that separates
+// you from it — so a single slab says "another storey is over there" without the
+// scene filling up with per-anchor markers. Deliberately monolithic: one shape,
+// one hue, a low-fill body, with crisp edges doing the legibility work so it
+// stays unmistakable without ever becoming visual clutter.
+export const LEVEL_COLOR = 0xff3b47;
+export const LEVEL_WIDTH = 0.62;
+export const LEVEL_HEIGHT = 2.15;
+export const LEVEL_DEPTH = 0.16;
+export const LEVEL_REST_FACTOR = 0.72; // resting fraction of each part's own opacity
+export const LEVEL_TARGET_PX = 70; // never reads smaller than roughly this on screen…
+export const LEVEL_MAX_SCALE = 2.2; // …and never balloons past this either
+
+// Each part keeps its own resting opacity in userData, so hover and the breathe
+// pulse can scale the whole slab by ONE factor without flattening the design to a
+// single uniform alpha (see MarkerLayer's setRelativeOpacity).
+function levelPart<T extends Object3D>(part: T, baseOpacity: number): T {
+	part.userData.baseOpacity = baseOpacity;
+	part.renderOrder = 7; // over every nav affordance (3/6), under sonar + the cursor
+	return part;
+}
+
+export function makeLevelWaypoint(up: boolean): Group {
+	const group = new Group();
+	const body = new Mesh(
+		new BoxGeometry(LEVEL_WIDTH, LEVEL_HEIGHT, LEVEL_DEPTH),
+		new MeshBasicMaterial({
+			color: LEVEL_COLOR,
+			transparent: true,
+			opacity: 0.24,
+			side: DoubleSide,
+			depthTest: false,
+			depthWrite: false,
+		}),
+	);
+	body.position.y = LEVEL_HEIGHT / 2;
+	const edges = new LineSegments(
+		new EdgesGeometry(body.geometry),
+		new LineBasicMaterial({
+			color: LEVEL_COLOR,
+			transparent: true,
+			opacity: 0.95,
+			depthTest: false,
+		}),
+	);
+	edges.position.y = LEVEL_HEIGHT / 2;
+	// A ring on the destination floor: proof the slab stands somewhere real.
+	const base = new Mesh(
+		new RingGeometry(LEVEL_WIDTH * 0.74, LEVEL_WIDTH, 48),
+		new MeshBasicMaterial({
+			color: LEVEL_COLOR,
+			transparent: true,
+			opacity: 0.8,
+			side: DoubleSide,
+			depthTest: false,
+			depthWrite: false,
+		}),
+	);
+	base.rotation.x = -Math.PI / 2;
+	// Which way that floor lies. It sits just off the broad face, and the slab
+	// yaws to face the eye every frame (MarkerLayer.updateLevels), so the glyph is
+	// never caught edge-on.
+	const glyph = new Mesh(
+		new ConeGeometry(LEVEL_WIDTH * 0.3, LEVEL_WIDTH * 0.5, 4),
+		new MeshBasicMaterial({
+			color: LEVEL_COLOR,
+			transparent: true,
+			opacity: 0.95,
+			side: DoubleSide,
+			depthTest: false,
+			depthWrite: false,
+		}),
+	);
+	glyph.rotation.y = Math.PI / 4; // present a flat face rather than an edge
+	if (!up) glyph.rotation.z = Math.PI;
+	glyph.position.set(0, LEVEL_HEIGHT * (up ? 0.68 : 0.32), LEVEL_DEPTH * 0.5 + 0.03);
+	group.add(
+		levelPart(body, 0.24),
+		levelPart(edges, 0.95),
+		levelPart(base, 0.8),
+		levelPart(glyph, 0.95),
+	);
+	group.renderOrder = 7;
 	return group;
 }
 

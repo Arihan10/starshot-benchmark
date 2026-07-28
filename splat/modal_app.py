@@ -7,10 +7,11 @@ Deploy with `modal deploy splat/modal_app.py` from the repo root; drive it with
   * MODAL (one A100-40GB container): stage 4 (camera plan — zone-driven
     single-shot field, pure CPU; lives here only to keep the stage chain in
     one place), stage 5 (reference renders — headless Chromium against the
-    loopback host in `splat/modal_capture.py`), stage 6 (gsplat 2DGS
-    fine-tune → RAW `trained.ply`), stage 7 (delete + heal + final-prune →
-    delivered `healed.ply` + LOD ladder, then `splat/quantize.py` →
-    `healed.sqz`).
+    loopback host in `splat/modal_capture.py`), stage 6 (gsplat fine-tune in
+    whichever representation `spec["train"]["representation"]` selects — 2DGS
+    surfels by default, 3DGS with `"3dgs"` — → RAW `trained.ply`), stage 7
+    (delete + heal + final-prune → delivered `healed.ply` + LOD ladder, then
+    `splat/quantize.py` → `healed.sqz`).
 
 DATA MODEL — one `modal.Volume` ("starshot-splat-cells"):
 
@@ -536,7 +537,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             summary["stages_run"].append(5)
             summary["refs"] = s5
 
-    # ---- stage 6: gsplat 2DGS fine-tune -----------------------------------------
+    # ---- stage 6: gsplat fine-tune (2DGS | 3DGS per train.representation) --------
     trained = out / "trained.ply"
     if 6 in stages:
         if not transforms.is_file():
@@ -573,8 +574,9 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                 colmap_dir=colmap_scratch,
                 out_path=trained,
                 # Stage-3 surfel cloud: the default init (params.init="surfels")
-                # seeds every Gaussian at the 2DGS solution; from-points A/Bs
-                # pass train={"init": "points"} and ignore it.
+                # seeds every Gaussian on the mesh surface (a 3DGS run gets the same
+                # seed with a real thickness axis); from-points A/Bs pass
+                # train={"init": "points"} and ignore it.
                 init_ply=cloud,
                 params=train_params,
                 resume=not force,
@@ -658,13 +660,19 @@ def eval_cross(spec: dict[str, Any]) -> dict[str, Any]:
     Returns {model_label: {ref_label: metrics}}.
     """
     import torch
-    from gsplat import rasterization_2dgs
 
-    from splat.stage6 import TrainParams, _evaluate, _load_cloud, _load_scene
+    from splat.stage6 import (
+        TrainParams,
+        _evaluate,
+        _load_cloud,
+        _load_scene,
+        _ply_representation,
+        _rasterizer,
+    )
 
     volume.reload()
     device = torch.device("cuda")
-    params = TrainParams(eval_max_views=int(spec.get("eval_max_views", 96)))
+    eval_max_views = int(spec.get("eval_max_views", 96))
 
     scenes: dict[str, Any] = {}
     for label, key in spec["refs"].items():
@@ -680,10 +688,21 @@ def eval_cross(spec: dict[str, Any]) -> dict[str, Any]:
         ply_path = Path(VOL) / "cells" / "/".join(parts[:3]) / "splat" / ply
         arrays = _load_cloud(ply_path)
         splats = {k: torch.from_numpy(v).to(device) for k, v in arrays.items()}
-        out[label] = {"splats": int(arrays["means"].shape[0])}
+        # Per-MODEL representation, read off each `.ply`: a cross-eval is exactly the
+        # place where a 2DGS baseline and a 3DGS candidate get scored on the same
+        # views, so each must be rendered through its own rasterizer.
+        params = TrainParams(
+            eval_max_views=eval_max_views,
+            representation=_ply_representation(ply_path),
+        )
+        raster = _rasterizer(params)
+        out[label] = {
+            "splats": int(arrays["means"].shape[0]),
+            "representation": params.representation,
+        }
         for rlabel, (views, K, width, height) in scenes.items():
             m = _evaluate(
-                torch, rasterization_2dgs, splats, views, K, width, height,
+                torch, raster, splats, views, K, width, height,
                 params, device,
             )
             out[label][rlabel] = m

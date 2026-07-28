@@ -118,7 +118,14 @@ let modalPlanShown = false; // one-time: revealed the camera overlay when the pl
 // 30k is reference/PostShot parity. Shorter runs are better expressed as
 // `epochs` (passes over the view set) on the request, which rescales every
 // cadence with the step count instead of truncating the schedule.
+// `representation` picks the PRIMITIVE the whole splat chain trains, exports and
+// heals: "2dgs" (surface-aligned surfels — best geometry, median-depth and
+// normal-consistency supervision) or "3dgs" (full 3D Gaussians, which also turns
+// on the 3DGS-only quality path: AbsGS densification + antialiased
+// rasterization). It is part of the stage-6/7 cache signature, so flipping it
+// re-runs training and heal rather than reusing the other path's artifacts.
 let modalTrainCfg = {
+    representation: "2dgs",
     iterations: 30000,
     batch: 1,
 };
@@ -3139,9 +3146,30 @@ function modalCfgControls(disabled) {
             input,
         );
     };
+    const repTitle =
+        "primitive to train: 2dgs = surface-aligned surfels (best geometry, " +
+        "median-depth + normal-consistency supervision); 3dgs = full 3D Gaussians " +
+        "(AbsGS densification, antialiased rasterization, and the primitive every " +
+        "delivery viewer actually renders). Changing it re-runs stages 6–7.";
+    const repSel = el("select", { class: "svc-num", title: repTitle, disabled });
+    for (const v of ["2dgs", "3dgs"]) {
+        const opt = el("option", { value: v, text: v });
+        if (modalTrainCfg.representation === v) opt.selected = true;
+        repSel.appendChild(opt);
+    }
+    repSel.style.width = "72px";
+    repSel.onchange = () => {
+        modalTrainCfg.representation = repSel.value;
+    };
     return el(
         "div",
         { class: "svc-modal-cfg" },
+        el(
+            "div",
+            { class: "svc-row" },
+            el("span", { class: "svc-lab", text: "splat", title: repTitle }),
+            repSel,
+        ),
         numRow(
             "steps",
             "iterations",
@@ -3348,6 +3376,7 @@ async function startModalTrain(restart = false, mode = "train") {
         await api.splatModalStart(current.run, current.slot, current.model, {
             restart,
             mode,
+            representation: modalTrainCfg.representation,
             iterations: modalTrainCfg.iterations,
             batch: modalTrainCfg.batch,
         });

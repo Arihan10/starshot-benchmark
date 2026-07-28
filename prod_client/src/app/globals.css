@@ -24,3 +24,16 @@ body {
   color: var(--foreground);
   font-family: Arial, Helvetica, sans-serif;
 }
+
+/* Continuous 360° pan for the floor-waypoint preview. The equirect is tiled
+   horizontally (background-repeat: repeat-x), so shifting by exactly one tile
+   width lands on an identical frame and the wrap is invisible. The element sets
+   --pano-tile to its own tile width. */
+@keyframes pano-pan {
+  from {
+    background-position-x: 0;
+  }
+  to {
+    background-position-x: calc(-1 * var(--pano-tile, 1800px));
+  }
+}

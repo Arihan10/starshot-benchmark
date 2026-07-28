@@ -2516,11 +2516,16 @@ class ModalTrainRequest(BaseModel):
     batch, rescaling every cadence to match); `batch` is how many views each step
     averages, which multiplies work per step rather than shortening the run.
     `restart` forces a from-scratch remote run (drop the checkpoint +
-    trained.ply for this cell) instead of resuming."""
+    trained.ply for this cell) instead of resuming. `representation` picks the
+    primitive the whole splat chain trains, exports and heals — "2dgs" (surfels,
+    the trainer default) or "3dgs" (full 3D Gaussians, which also switches on the
+    3DGS-only quality path: AbsGS densification and antialiased rasterization).
+    It flows into the stage-6/7 signature, so changing it re-runs both."""
 
     epochs: float | None = None
     iterations: int | None = None
     batch: int | None = None
+    representation: str | None = None
     restart: bool = False
     # "train"    → Modal (re)plans cameras (stage 4) and OVERWRITES the local
     #              plan, then renders + fine-tunes (stages 4-7).
@@ -2531,8 +2536,10 @@ class ModalTrainRequest(BaseModel):
 
     def train_overrides(self) -> dict[str, Any]:
         """The set TrainParams overrides (drops unset fields so the server injects
-        no defaults — the trainer's own fallbacks apply to anything omitted)."""
-        fields = ("epochs", "iterations", "batch")
+        no defaults — the trainer's own fallbacks apply to anything omitted).
+        `TrainParams.__post_init__` validates `representation`, so a typo fails the
+        job fast in the container rather than silently training the other path."""
+        fields = ("epochs", "iterations", "batch", "representation")
         return {k: v for k in fields if (v := getattr(self, k)) is not None}
 
 

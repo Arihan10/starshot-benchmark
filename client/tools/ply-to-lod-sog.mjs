@@ -30,7 +30,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { flattenFileIfNeeded, parsePlyHeader } from "./ply-utils.mjs";
+import { flattenFileIfNeeded, readPlyHeader } from "./ply-utils.mjs";
 
 const CLI = fileURLToPath(
     new URL("../node_modules/@playcanvas/splat-transform/bin/cli.mjs", import.meta.url),
@@ -216,7 +216,7 @@ async function main() {
             {
                 in: inPath,
                 out: manifest,
-                representation_in: parsePlyHeader(fs.readFileSync(inPath)).props.includes("scale_2")
+                representation_in: readPlyHeader(inPath).props.includes("scale_2")
                     ? "3dgs"
                     : "2dgs",
                 harmonics: opt.harmonics,

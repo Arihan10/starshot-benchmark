@@ -71,7 +71,7 @@ def _build_views(torch, np, doc: dict[str, Any], refs_dir: Path):  # noqa: ANN00
     return views, K, width, height
 
 
-def _diff_models(torch, np, rasterization_2dgs, model_a, model_b, views, K, width, height, params, n_sample):  # noqa: ANN001
+def _diff_models(torch, np, raster, model_a, model_b, views, K, width, height, params, n_sample):  # noqa: ANN001
     """Render two splat models on the same seeded view sample and measure how
     differently they draw: max per-pixel |ΔRGB| / |Δalpha| and the PSNR between
     the two render sets. This is the model-vs-model fidelity check (needs no
@@ -89,11 +89,11 @@ def _diff_models(torch, np, rasterization_2dgs, model_a, model_b, views, K, widt
             outs = []
             for model_splats in (model_a, model_b):
                 colors, sh_deg = _render_inputs(torch, model_splats, params.sh_degree)
-                renders, alpha, *_ = _render_batch(
-                    torch, rasterization_2dgs, model_splats, colors, sh_deg,
+                render = _render_batch(
+                    torch, raster, model_splats, colors, sh_deg,
                     viewmats, K, width, height, params, dist_on=False,
                 )
-                outs.append((renders[..., :3].clamp(0, 1), alpha))
+                outs.append((render.rgb.clamp(0, 1), render.alpha))
             d_rgb = (outs[0][0] - outs[1][0]).abs()
             d_alpha = (outs[0][1] - outs[1][1]).abs()
             max_rgb = max(max_rgb, float(d_rgb.max()))
@@ -125,7 +125,6 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
 
     import numpy as np
     import torch
-    from gsplat import rasterization_2dgs
 
     from splat.stage6 import (
         TrainParams,
@@ -134,6 +133,8 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
         _encode_trained_ply,
         _evaluate,
         _load_cloud,
+        _ply_representation,
+        _rasterizer,
         _read_transforms,
     )
 
@@ -156,7 +157,11 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
     init = _load_cloud(trained)
     splats = {k: torch.from_numpy(v).to(device) for k, v in init.items()}
     n = int(splats["means"].shape[0])
-    params = TrainParams()
+    # The model on disk decides the representation, not a default: this pass MEASURES
+    # rendered contribution, so it has to render through the rasterizer the model was
+    # trained under or every weight is wrong.
+    params = TrainParams(representation=_ply_representation(trained))
+    raster = _rasterizer(params)
 
     def log(done: int, total: int, msg: str) -> None:
         print(f"[compact {run}/{slot}/{model}] {done}/{total} {msg}", flush=True)
@@ -164,7 +169,7 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
     # --- measure ------------------------------------------------------------
     t0 = time.perf_counter()
     weights = _contribution_weights(
-        torch, rasterization_2dgs, splats, views, K, width, height, params, log
+        torch, raster, splats, views, K, width, height, params, log
     )
     blind = _blind_mask(torch, splats["sh0"])
     measure_s = time.perf_counter() - t0
@@ -186,22 +191,23 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
     out_path = cell / "trained.compact.ply"
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
-        arrays["opacities"], arrays["scales"][:, :2], out_path,
+        arrays["opacities"], arrays["scales"][:, :params.n_scales], out_path,
     )
 
     # --- verify A: original vs compacted, same poses --------------------------
     t1 = time.perf_counter()
     diff = _diff_models(
-        torch, np, rasterization_2dgs, splats, kept, views, K, width, height, params, diff_views
+        torch, np, raster, splats, kept, views, K, width, height, params, diff_views
     )
 
     # --- verify B: both models against the reference frames -------------------
-    ev_before = _evaluate(torch, rasterization_2dgs, splats, views, K, width, height, params, device)
-    ev_after = _evaluate(torch, rasterization_2dgs, kept, views, K, width, height, params, device)
+    ev_before = _evaluate(torch, raster, splats, views, K, width, height, params, device)
+    ev_after = _evaluate(torch, raster, kept, views, K, width, height, params, device)
     verify_s = time.perf_counter() - t1
 
     summary = {
         "cell": f"{run}/{slot}/{model}",
+        "representation": params.representation,
         "eps": eps,
         "views": len(views),
         "splats_in": n,
@@ -258,7 +264,6 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     import numpy as np
     import torch
     import torch.nn.functional as F
-    from gsplat import rasterization_2dgs
 
     from splat.stage6 import (
         TrainParams,
@@ -268,6 +273,8 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
         _evaluate,
         _gaussian_window,
         _load_cloud,
+        _ply_representation,
+        _rasterizer,
         _read_transforms,
         _render_batch,
         _render_inputs,
@@ -297,7 +304,10 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     device = torch.device("cuda")
     views, K, width, height = _build_views(torch, np, _read_transforms(refs_dir), refs_dir)
     K = K.to(device)
-    params = TrainParams()
+    # As in `compact_cell`: the file decides the representation, since this both
+    # measures rendered contribution and re-optimizes the survivors.
+    params = TrainParams(representation=_ply_representation(trained))
+    raster = _rasterizer(params)
 
     init = _load_cloud(trained)
     original = {k: torch.from_numpy(v).to(device) for k, v in init.items()}
@@ -323,7 +333,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     # --- 1. measure + 2. select (shared with the Stage-6 pipeline) ------------
     t0 = time.perf_counter()
     weights = _contribution_weights(
-        torch, rasterization_2dgs, original, views, K, width, height, params, log
+        torch, raster, original, views, K, width, height, params, log
     )
     keep = _select_keep(
         torch, weights, original["sh0"], original["opacities"], original["means"],
@@ -364,6 +374,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
         "quats": params.quats_lr * lr_scale,
         "opacities": params.opacities_lr * lr_scale,
         "sh0": params.sh0_lr * lr_scale,
+        "shN": params.shN_lr * lr_scale,
     }
     optimizers = {
         name: torch.optim.Adam([{"params": [splats[name]], "lr": lrs[name]}], eps=1e-15)
@@ -378,15 +389,13 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     for step in range(heal_steps):
         viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
         colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
-        renders, pred_alpha, normals, nfd, distort, median_depth, _info = _render_batch(
-            torch, rasterization_2dgs, splats, colors, sh_deg, viewmats, K,
+        render = _render_batch(
+            torch, raster, splats, colors, sh_deg, viewmats, K,
             width, height, params, dist_on=False,
         )
-        pred_rgb = renders[..., :3]
-        pred_depth = median_depth if params.depth_mode == "median" else renders[..., 3:4]
         loss = _supervision_loss(
             torch, F, params, window, gt_rgb, gt_alpha, gt_depth,
-            pred_rgb, pred_alpha, pred_depth, normals, nfd, distort, None,
+            render, splats["scales"], None,
             normals_active=True, dist_active=False, scene_scale=scene_scale,
         )
         loss.backward()
@@ -405,19 +414,20 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
     out_path = cell / "trained.slim.ply"
     _encode_trained_ply(
         arrays["means"], quats.astype(np.float32), arrays["sh0"].reshape(-1, 3),
-        arrays["opacities"], arrays["scales"][:, :2], out_path,
+        arrays["opacities"], arrays["scales"][:, :params.n_scales], out_path,
     )
 
     t2 = time.perf_counter()
     diff = _diff_models(
-        torch, np, rasterization_2dgs, original, slim, views, K, width, height, params, diff_views
+        torch, np, raster, original, slim, views, K, width, height, params, diff_views
     )
-    ev_before = _evaluate(torch, rasterization_2dgs, original, views, K, width, height, params, device)
-    ev_after = _evaluate(torch, rasterization_2dgs, slim, views, K, width, height, params, device)
+    ev_before = _evaluate(torch, raster, original, views, K, width, height, params, device)
+    ev_after = _evaluate(torch, raster, slim, views, K, width, height, params, device)
     verify_s = time.perf_counter() - t2
 
     summary = {
         "cell": f"{run}/{slot}/{model}",
+        "representation": params.representation,
         "keep_target": keep_target,
         "heal_steps": heal_steps,
         "means_lr_frac": means_lr_frac,

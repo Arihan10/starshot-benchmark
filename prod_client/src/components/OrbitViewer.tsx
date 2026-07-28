@@ -6,6 +6,7 @@ import {
 	useMemo,
 	useRef,
 	useState,
+	type CSSProperties,
 	type ReactNode,
 	type RefObject,
 } from "react";
@@ -15,6 +16,7 @@ import {
 	INITIAL_ORBIT_STATE,
 	type Chapter,
 	type HoverPreview,
+	type LevelPreview,
 	type NavExit,
 	type OrbitState,
 } from "@/lib/orbit/types";
@@ -23,7 +25,10 @@ import { tourSource, type Scene } from "@/lib/scenes";
 // One palette + vocabulary for the five edge types, shared by every affordance,
 // the exits panel, the preview card, and the minimap — so the grammar reads the
 // same everywhere (that consistency is the whole point).
-const EDGE_META: Record<EdgeType, { label: string; verb: string; color: string }> = {
+const EDGE_META: Record<
+	EdgeType,
+	{ label: string; verb: string; color: string }
+> = {
 	walk: { label: "Walk", verb: "walk over", color: "#8fd0ff" },
 	portal: { label: "Doorway", verb: "step through", color: "#ffc46b" },
 	vertical: { label: "Level", verb: "change level", color: "#7ef2c2" },
@@ -90,7 +95,8 @@ export default function OrbitViewer({
 	useEffect(() => {
 		if (!state.contextMenu) return;
 		const onDocPointerDown = (e: PointerEvent) => {
-			if (!menuRef.current?.contains(e.target as Node)) engineRef.current?.closeMenu();
+			if (!menuRef.current?.contains(e.target as Node))
+				engineRef.current?.closeMenu();
 		};
 		const onKeyDown = (e: KeyboardEvent) => {
 			if (e.key === "Escape") engineRef.current?.closeMenu();
@@ -243,9 +249,16 @@ export default function OrbitViewer({
 			)}
 
 			{mode === "interior" && drawer && (
-				<PlacesDrawer state={state} engine={engineRef} onClose={() => setDrawer(false)} />
+				<PlacesDrawer
+					state={state}
+					engine={engineRef}
+					onClose={() => setDrawer(false)}
+				/>
 			)}
 
+			{state.levelPreview && (
+				<LevelPreviewPanel preview={state.levelPreview} />
+			)}
 			{state.preview && <HoverCard preview={state.preview} />}
 			{mode === "interior" && state.arrival && (
 				<ArrivalToast
@@ -262,14 +275,20 @@ export default function OrbitViewer({
 					{overlay.spinner && (
 						<span className='h-5 w-5 animate-spin rounded-full border-2 border-white/15 border-t-cyan-400' />
 					)}
-					<span className={`text-xs ${overlay.err ? "text-red-400" : "text-neutral-300"}`}>
+					<span
+						className={`text-xs ${overlay.err ? "text-red-400" : "text-neutral-300"}`}
+					>
 						{overlay.msg}
 					</span>
 				</div>
 			)}
 
 			{state.contextMenu && (
-				<ObjectMenu menu={state.contextMenu} menuRef={menuRef} engine={engineRef} />
+				<ObjectMenu
+					menu={state.contextMenu}
+					menuRef={menuRef}
+					engine={engineRef}
+				/>
 			)}
 		</div>
 	);
@@ -321,7 +340,9 @@ function ExitsPanel({
 	const spin = useCallback((facingDeg: number) => {
 		const el = containerRef.current;
 		if (!el) return;
-		for (const arrow of el.querySelectorAll<HTMLElement>("[data-bearing]")) {
+		for (const arrow of el.querySelectorAll<HTMLElement>(
+			"[data-bearing]",
+		)) {
 			const bearing = Number(arrow.dataset.bearing);
 			arrow.style.transform = `rotate(${bearing - facingDeg}deg)`;
 		}
@@ -362,7 +383,10 @@ function ExitsPanel({
 							</span>
 							<span
 								className='shrink-0 rounded px-1 py-0.5 text-[8px] uppercase tracking-wide'
-								style={{ color: meta.color, background: `${meta.color}1f` }}
+								style={{
+									color: meta.color,
+									background: `${meta.color}1f`,
+								}}
 							>
 								{meta.label}
 							</span>
@@ -385,7 +409,11 @@ function HoverCard({ preview }: { preview: HoverPreview }) {
 	return (
 		<div
 			className='pointer-events-none absolute z-20 w-48 -translate-x-1/2 -translate-y-[calc(100%+14px)] overflow-hidden rounded-lg border bg-neutral-950/85 shadow-2xl backdrop-blur'
-			style={{ left: preview.screenX, top: preview.screenY, borderColor: `${meta.color}66` }}
+			style={{
+				left: preview.screenX,
+				top: preview.screenY,
+				borderColor: `${meta.color}66`,
+			}}
 		>
 			<div className='relative h-26 w-full bg-neutral-800'>
 				{/* eslint-disable-next-line @next/next/no-img-element -- runtime R2 thumbnail via /r2 proxy */}
@@ -410,6 +438,60 @@ function HoverCard({ preview }: { preview: HoverPreview }) {
 				<span className='shrink-0 text-[10px] tabular-nums text-neutral-400'>
 					{preview.dist < 100 ? `${preview.dist.toFixed(0)} m` : ""}
 				</span>
+			</div>
+		</div>
+	);
+}
+
+const PANO_SCREEN_H = 240; // px: the preview "screen" height
+// One full 360 is drawn this wide. Being well past the panel's own width means at
+// most a third of the panorama is on screen at once, so the frame reads as a view
+// into the room rather than a whole equirect flattened out — and the wrap seam is
+// never visible twice in the same frame. Height follows the 2:1 aspect (900px) and
+// gets cropped to the screen, which lands the visible band on the horizon.
+const PANO_TILE_W = 1800;
+
+// The floor-waypoint preview: a wide "screen" that pans continuously through the
+// destination panorama rather than squashing a whole equirect into one frame, so
+// you read the room you're about to drop into instead of a warped strip. The pano
+// is tiled horizontally and shifted by exactly one tile width (see the pano-pan
+// keyframes), which is what makes the 360 loop seamlessly. Pointer-transparent, so
+// it never swallows the click it is previewing.
+function LevelPreviewPanel({ preview }: { preview: LevelPreview }) {
+	return (
+		<div className='pointer-events-none absolute left-1/2 top-1/2 z-30 w-[min(600px,70vw)] -translate-x-1/2 -translate-y-1/2'>
+			<div className='overflow-hidden rounded-xl border border-red-400/50 bg-neutral-950/85 shadow-2xl backdrop-blur'>
+				<div
+					className='relative overflow-hidden bg-neutral-900'
+					style={{ height: PANO_SCREEN_H }}
+				>
+					<div
+						className='absolute inset-0 animate-[pano-pan_28s_linear_infinite]'
+						style={
+							{
+								// Full pano over the blurred placeholder, so the frame is filled
+								// the instant it opens and both layers pan together.
+								backgroundImage: `url(${preview.url}), url(${preview.placeholderUrl})`,
+								backgroundRepeat: "repeat-x",
+								backgroundSize: `${PANO_TILE_W}px auto`,
+								backgroundPositionY: "50%",
+								"--pano-tile": `${PANO_TILE_W}px`,
+							} as CSSProperties
+						}
+					/>
+					<div className='pointer-events-none absolute inset-x-0 top-0 h-14 bg-linear-to-b from-black/70 to-transparent' />
+					<span className='absolute left-3 top-3 rounded bg-red-500 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-neutral-950'>
+						{preview.up ? "▲" : "▼"} floor {preview.level + 1}
+					</span>
+				</div>
+				<div className='flex items-center justify-between gap-3 px-3 py-2'>
+					<span className='min-w-0 truncate text-sm font-semibold text-white'>
+						{preview.name ?? `floor ${preview.level + 1}`}
+					</span>
+					<span className='shrink-0 text-[10px] uppercase tracking-wider text-red-300'>
+						click to go {preview.up ? "up" : "down"}
+					</span>
+				</div>
 			</div>
 		</div>
 	);
@@ -491,12 +573,17 @@ function PlacesDrawer({
 							>
 								{n.name ?? `node ${n.index + 1}`}
 								{n.zone ? (
-									<span className='text-neutral-500'> · {n.zone}</span>
+									<span className='text-neutral-500'>
+										{" "}
+										· {n.zone}
+									</span>
 								) : null}
 							</button>
 						))
 					) : (
-						<div className='px-2 py-1.5 text-xs text-neutral-500'>no matches</div>
+						<div className='px-2 py-1.5 text-xs text-neutral-500'>
+							no matches
+						</div>
 					)
 				) : (
 					<ChapterList chapters={state.chapters} onGo={go} />
@@ -514,7 +601,9 @@ function ChapterList({
 	onGo: (index: number) => void;
 }) {
 	if (chapters.length === 0)
-		return <div className='px-2 py-1.5 text-xs text-neutral-500'>no zones</div>;
+		return (
+			<div className='px-2 py-1.5 text-xs text-neutral-500'>no zones</div>
+		);
 	return (
 		<>
 			<div className='mb-1 px-1 text-[9px] uppercase tracking-wider text-neutral-500'>
@@ -527,7 +616,9 @@ function ChapterList({
 					onClick={() => onGo(c.firstIndex)}
 					className='flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs text-neutral-200 transition hover:bg-cyan-500/20 hover:text-white'
 				>
-					<span className='min-w-0 truncate'>{c.zone || "unzoned"}</span>
+					<span className='min-w-0 truncate'>
+						{c.zone || "unzoned"}
+					</span>
 					<span className='shrink-0 text-[9px] tabular-nums text-neutral-500'>
 						{c.count}
 					</span>
@@ -562,16 +653,22 @@ function ObjectMenu({
 				</div>
 			)}
 			{menu.label && (
-				<MenuButton onClick={() => engine.current?.toggleMenuTargetHidden()}>
+				<MenuButton
+					onClick={() => engine.current?.toggleMenuTargetHidden()}
+				>
 					{menu.hidden ? "show" : "hide"}
 				</MenuButton>
 			)}
 			{menu.label && (
-				<MenuButton onClick={() => engine.current?.toggleMenuTargetOutline()}>
+				<MenuButton
+					onClick={() => engine.current?.toggleMenuTargetOutline()}
+				>
 					{menu.outlined ? "remove outline" : "highlight outline"}
 				</MenuButton>
 			)}
-			{menu.label && hasExtras && <div className='my-1 h-px bg-white/10' />}
+			{menu.label && hasExtras && (
+				<div className='my-1 h-px bg-white/10' />
+			)}
 			{menu.hiddenCount > 0 && (
 				<MenuButton onClick={() => engine.current?.showAllHidden()}>
 					show all ({menu.hiddenCount})
@@ -586,7 +683,13 @@ function ObjectMenu({
 	);
 }
 
-function MenuButton({ onClick, children }: { onClick: () => void; children: ReactNode }) {
+function MenuButton({
+	onClick,
+	children,
+}: {
+	onClick: () => void;
+	children: ReactNode;
+}) {
 	return (
 		<button
 			type='button'
@@ -652,7 +755,9 @@ function Minimap({
 	const visitedSet = useMemo(() => new Set(visited), [visited]);
 	const ptByIndex = useMemo(() => {
 		const m = new Map<number, { left: number; top: number }>();
-		if (view) for (const p of view.points) m.set(p.index, { left: p.leftPct, top: p.topPct });
+		if (view)
+			for (const p of view.points)
+				m.set(p.index, { left: p.leftPct, top: p.topPct });
 		return m;
 	}, [view]);
 	if (!view) return null;
@@ -665,7 +770,10 @@ function Minimap({
 				<span>minimap</span>
 				<div className='flex items-center gap-1'>
 					{levels.length > 1 && (
-						<div className='flex items-center gap-0.5' title="switch floor (doesn't move you)">
+						<div
+							className='flex items-center gap-0.5'
+							title="switch floor (doesn't move you)"
+						>
 							{levels.map((lv) => {
 								const isViewed = lv.level === viewedLevel;
 								const isCurrent = lv.level === currentLevel;
@@ -691,7 +799,9 @@ function Minimap({
 						type='button'
 						onClick={() => setExpanded((v) => !v)}
 						title={expanded ? "collapse minimap" : "expand minimap"}
-						aria-label={expanded ? "collapse minimap" : "expand minimap"}
+						aria-label={
+							expanded ? "collapse minimap" : "expand minimap"
+						}
 						className='rounded px-1 text-[11px] leading-none text-neutral-300 transition hover:bg-white/10 hover:text-white'
 					>
 						{expanded ? "✕" : "⤢"}
@@ -700,7 +810,10 @@ function Minimap({
 			</div>
 			<div
 				className='relative overflow-hidden rounded'
-				style={{ width: minimapWidth(view.aspect, caps.w, caps.h), aspectRatio: view.aspect }}
+				style={{
+					width: minimapWidth(view.aspect, caps.w, caps.h),
+					aspectRatio: view.aspect,
+				}}
 			>
 				{/* eslint-disable-next-line @next/next/no-img-element -- runtime R2 slice via /r2 proxy */}
 				<img
@@ -731,7 +844,9 @@ function Minimap({
 								stroke={EDGE_META[e.type].color}
 								strokeWidth={0.5}
 								strokeOpacity={0.5}
-								strokeDasharray={e.type === "phase" ? "2 2" : undefined}
+								strokeDasharray={
+									e.type === "phase" ? "2 2" : undefined
+								}
 								vectorEffect='non-scaling-stroke'
 							/>
 						);
@@ -745,11 +860,16 @@ function Minimap({
 							type='button'
 							title={pt.name ?? pt.id}
 							onClick={() => engine.current?.traverseTo(pt.index)}
-							style={{ left: `${pt.leftPct}%`, top: `${pt.topPct}%` }}
+							style={{
+								left: `${pt.leftPct}%`,
+								top: `${pt.topPct}%`,
+							}}
 							className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full border transition ${
 								pt.current
 									? `${expanded ? "h-3.5 w-3.5" : "h-2.5 w-2.5"} border-white bg-cyan-400 ${
-											flash ? "shadow-[0_0_10px_4px_rgba(34,211,238,0.95)]" : "shadow-[0_0_6px_2px_rgba(34,211,238,0.7)]"
+											flash
+												? "shadow-[0_0_10px_4px_rgba(34,211,238,0.95)]"
+												: "shadow-[0_0_6px_2px_rgba(34,211,238,0.7)]"
 										}`
 									: seen
 										? `${expanded ? "h-3 w-3" : "h-2 w-2"} border-white/70 bg-cyan-300/70 hover:scale-125`
@@ -824,7 +944,15 @@ function Hud({ state }: { state: OrbitState }) {
 }
 
 function hudContent(state: OrbitState): ReactNode {
-	const { mode, hover, objectHover, currentName, currentId, panoCount, tour } = state;
+	const {
+		mode,
+		hover,
+		objectHover,
+		currentName,
+		currentId,
+		panoCount,
+		tour,
+	} = state;
 	if (mode === "overview") {
 		if (hover)
 			return (
@@ -835,13 +963,17 @@ function hudContent(state: OrbitState): ReactNode {
 		if (objectHover)
 			return (
 				<>
-					object <strong>{objectHover}</strong> · right-click to hide / outline
+					object <strong>{objectHover}</strong> · right-click to hide
+					/ outline
 				</>
 			);
-		if (panoCount === 0) return <>drag to orbit · scroll to zoom · no walkthrough published</>;
+		if (panoCount === 0)
+			return (
+				<>drag to orbit · scroll to zoom · no walkthrough published</>
+			);
 		return (
 			<>
-				drag to orbit · click a marker or <strong>enter interior</strong>
+				drag to orbit · click the scene to <strong>step inside</strong>
 			</>
 		);
 	}
@@ -849,8 +981,9 @@ function hudContent(state: OrbitState): ReactNode {
 		if (tour)
 			return (
 				<>
-					touring <strong>{tour.zone || "the scene"}</strong> · zone {tour.stop} of{" "}
-					{tour.stops} · move or press <strong>stop tour</strong> to take over
+					touring <strong>{tour.zone || "the scene"}</strong> · zone{" "}
+					{tour.stop} of {tour.stops} · move or press{" "}
+					<strong>stop tour</strong> to take over
 				</>
 			);
 		if (hover)
@@ -862,8 +995,9 @@ function hudContent(state: OrbitState): ReactNode {
 			);
 		return (
 			<>
-				<strong>{currentName ?? currentId}</strong> · <strong>WASD</strong> move ·{" "}
-				<strong>Q/E</strong> turn · <strong>Tab</strong> ping · <strong>M</strong> places
+				<strong>{currentName ?? currentId}</strong> ·{" "}
+				<strong>WASD</strong> move · <strong>Q/E</strong> turn ·{" "}
+				<strong>Tab</strong> ping · <strong>M</strong> places
 			</>
 		);
 	}

@@ -11,7 +11,7 @@
 //
 //   walk     (A) same level, clear line of sight, within reach   → floor puck
 //   portal   (B) same level, occluded (around a wall / doorway)   → portal glow
-//   vertical (D) different floor, small plan distance             → up/down halo
+//   vertical (D) adjacent floor, small plan distance              → up/down halo
 //   far      (E) beyond reach / a different cluster               → map / search only
 //   phase    (C) no walkable path — DERIVED from connectivity     → ghost puck
 //
@@ -121,6 +121,15 @@ export function buildNavGraph(
 		return Math.abs(pos[j].y - pos[i].y) < VERTICAL_DY;
 	};
 
+	// Whether j sits exactly ONE storey from i. Only decidable when both panos have
+	// a known level; a tour with no minimap slices carries no level indices to
+	// count, so there the Y-based cross-level test above stands on its own.
+	const adjacentLevel = (i: number, j: number): boolean => {
+		if (panoLevel && panoLevel[i] >= 0 && panoLevel[j] >= 0)
+			return Math.abs(panoLevel[i] - panoLevel[j]) === 1;
+		return true;
+	};
+
 	// Per ordered pair, classify everything *except* phase (which is connectivity-
 	// derived below). LOS is only raycast for the nearest same-level candidates
 	// within reach, so the whole build stays ~O(n · LOS_CANDIDATES) raycasts.
@@ -158,8 +167,15 @@ export function buildNavGraph(
 				// whenever it's within the far cutoff — so floor-to-floor links stay
 				// visible in-view even across the room, not only when stacked directly
 				// overhead. Only genuinely distant cross-level links fall to map-only far.
+				//
+				// ADJACENT FLOORS ONLY: a beacon promises one storey of travel, and no
+				// staircase skips a floor, so a link spanning more than one level
+				// (0 → 2) is never vertical. It falls to `far`, still reachable from the
+				// map/search or by routing through the floor in between.
 				type =
-					Math.abs(dy) >= VERTICAL_DY && dist <= FAR_DIST
+					Math.abs(dy) >= VERTICAL_DY &&
+					dist <= FAR_DIST &&
+					adjacentLevel(i, j)
 						? "vertical"
 						: "far";
 			} else if (dist > FAR_DIST || plan > REACH) {
@@ -235,6 +251,13 @@ export function buildNavGraph(
 		addPhase(bi, bj);
 	}
 
+	// Walk-only reachability: which nodes an unbroken chain of clear-line-of-sight
+	// hops connects. If B lands in A's walk component then A can get to B on foot
+	// without cutting through anything — what the portal filter below reads.
+	const walkDsu = new DSU(n);
+	for (let i = 0; i < n; i++)
+		for (const e of all[i]) if (e.type === "walk") walkDsu.union(i, e.to);
+
 	// Per-node selection of the rendered affordances.
 	const nodes: NavNode[] = [];
 	for (let i = 0; i < n; i++) {
@@ -246,6 +269,16 @@ export function buildNavGraph(
 				e.type === "vertical",
 		);
 		const trapped = real.length === 0;
+		// A portal claims "the way there is around or through this wall" — untrue when
+		// the destination already sits in our walk component, because a chain of
+		// clear-LOS hops reaches it. Drop those so an orange spot never marks a place
+		// you can simply walk to. `trapped` is still judged on the unfiltered set (the
+		// edge does exist) and `all` is untouched, so hover, the exits panel, the
+		// sonar reveal and click-anywhere routing all still see it.
+		const shown = real.filter(
+			(e) =>
+				!(e.type === "portal" && walkDsu.find(i) === walkDsu.find(e.to)),
+		);
 		const rendered: NavEdge[] = [];
 		const takenBearings: number[] = [];
 		const add = (e: NavEdge) => {
@@ -255,13 +288,13 @@ export function buildNavGraph(
 		};
 		// 1) Always show the closest few, regardless of bearing — a nearby point must
 		//    never be suppressed just because something else lies the same way.
-		for (const e of [...real].sort((a, b) => a.dist - b.dist)) {
+		for (const e of [...shown].sort((a, b) => a.dist - b.dist)) {
 			if (rendered.length >= NEAREST_GUARANTEED) break;
 			add(e);
 		}
 		// 2) Fill to the cap by priority (walk < portal < vertical) then distance,
 		//    fanning out by bearing so they don't stack in one direction.
-		const ordered = [...real].sort(
+		const ordered = [...shown].sort(
 			(a, b) => PRIORITY[a.type] - PRIORITY[b.type] || a.dist - b.dist,
 		);
 		for (const e of ordered) {
@@ -278,10 +311,11 @@ export function buildNavGraph(
 		// 3) ALWAYS surface a level-change beacon toward EACH reachable floor — the
 		//    nearest vertical to each distinct destination level. Without this, a
 		//    middle floor shows only the beacons to whichever floor is CLOSER (down,
-		//    usually), and "the way up" never makes the cut. One beacon per other
-		//    floor, nearest first, capped.
+		//    usually), and "the way up" never makes the cut. One beacon per adjacent
+		//    floor, nearest first, capped — since verticals span a single storey, a
+		//    middle floor surfaces exactly two: the storey above and the one below.
 		const vSeen = new Set<number>();
-		for (const e of real
+		for (const e of shown
 			.filter((e) => e.type === "vertical")
 			.sort((a, b) => a.dist - b.dist)) {
 			if (vSeen.size >= VERTICAL_CAP) break;

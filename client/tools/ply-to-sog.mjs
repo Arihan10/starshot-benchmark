@@ -5,7 +5,7 @@
 //
 // Our trained.ply is 2DGS (scale_0/scale_1 only); SOG is a 3DGS format, so a
 // 2DGS input is first flattened to 3DGS by inserting a thin scale_2 into a temp
-// PLY (see ply-utils.flattenTo3dgs). The temp file is deleted after encoding.
+// PLY (see ply-utils.flattenFileIfNeeded). The temp file is deleted after encoding.
 //
 // OPTIONAL --prune (see prune.mjs): a modular, conservative cleanup layered on
 // top of the encode — kill sub-~2% opacity splats and remove floaters (which
@@ -30,7 +30,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { flattenFileIfNeeded, parsePlyHeader } from "./ply-utils.mjs";
+import { flattenFileIfNeeded, readPlyHeader } from "./ply-utils.mjs";
 import { PRUNE_DEFAULTS, buildPruneActions, parseCropBox } from "./prune.mjs";
 
 const CLI = fileURLToPath(
@@ -126,7 +126,7 @@ async function main() {
             tempPath = null;
         }
     } else {
-        header = parsePlyHeader(fs.readFileSync(inPath));
+        header = readPlyHeader(inPath);
     }
 
     // Conservative pruning (opt-in): opacity + floaters, with an optional explicit

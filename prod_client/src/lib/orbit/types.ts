@@ -91,6 +91,18 @@ export type HoverPreview = {
 	headingU: number;
 };
 
+// The big preview shown while hovering a floor waypoint: the capture that click
+// will drop you into, panned continuously through its 360 rather than squashed
+// into one frame, so the destination reads as a room instead of a warped strip.
+export type LevelPreview = {
+	index: number; // destination pano
+	level: number; // destination floor, 0-based
+	up: boolean; // whether that floor is above the one you're standing on
+	name: string | null;
+	url: string; // full equirect — the layer that pans
+	placeholderUrl: string; // instant blurred backdrop while the full image loads
+};
+
 // The node directory (stable per scene) that powers chapters + "take me to".
 export type NodeDir = {
 	index: number;
@@ -136,6 +148,8 @@ export type OrbitState = {
 	exits: NavExit[];
 	// Rich destination preview for the affordance the cursor is over.
 	preview: HoverPreview | null;
+	// The 360-panning preview for the floor waypoint the cursor is over.
+	levelPreview: LevelPreview | null;
 	// Arrival narration ("Archive · phased through the wall"); a rising `ts` lets
 	// the toast re-fire for repeat arrivals at the same node.
 	arrival: { name: string; verb: string; ts: number } | null;
@@ -191,6 +205,7 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	overlay: null,
 	exits: [],
 	preview: null,
+	levelPreview: null,
 	arrival: null,
 	sonarActive: false,
 	tour: null,

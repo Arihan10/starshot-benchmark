@@ -33,6 +33,11 @@ export function lookTargetFrom(pos: Vector3, lon: number, lat: number): Vector3 
 		);
 }
 
+// Pitch limit for the yaw/pitch rig — just shy of straight up/down, where a
+// lookAt with a +Y up vector degenerates. Exported so a camera flight can aim at
+// a pre-clamped pitch and land on exactly the pose the rig will then hold.
+export const MAX_PITCH = 1.55;
+
 // Clamp pitch and aim the camera; returns the clamped lat so the caller keeps
 // its stored value in range.
 export function applyLook(
@@ -40,7 +45,7 @@ export function applyLook(
 	lon: number,
 	lat: number,
 ): number {
-	const clamped = MathUtils.clamp(lat, -1.55, 1.55);
+	const clamped = MathUtils.clamp(lat, -MAX_PITCH, MAX_PITCH);
 	camera.lookAt(lookTargetFrom(camera.position, lon, clamped));
 	return clamped;
 }
