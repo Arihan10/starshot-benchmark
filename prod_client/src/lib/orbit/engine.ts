@@ -1,6 +1,7 @@
 import {
 	Box3,
 	Color,
+	DirectionalLight,
 	Group,
 	type Intersection,
 	type Material,
@@ -10,6 +11,7 @@ import {
 	type Object3D,
 	PerspectiveCamera,
 	Plane,
+	HemisphereLight,
 	type Quaternion,
 	Raycaster,
 	Scene,
@@ -34,9 +36,9 @@ import {
 	SPHERE_RADIUS,
 } from "./materials";
 import {
+	CURSOR_CLEAR,
 	HOTSPOT_FLOOR_DROP,
 	LOCATE_SLICE_ABOVE_EYE,
-	NAV_COLORS,
 	PEEK_ROTATE_SPEED,
 	WASD_DIR_COS,
 	WASD_MAX_STEP,
@@ -124,6 +126,19 @@ const PORTAL_SPAN_GAP = 1.2;
 // the wall rather than buried in it.
 const PORTAL_CLEARANCE = 0.4;
 
+// Look up more steeply than this at something over your head and a click reads as
+// "take me through it" — see the engine's targetFloorFor.
+const CEILING_PITCH = (40 * Math.PI) / 180;
+
+// Rest the cursor on one object this long and the walkthrough offers a proper look
+// at it. Long enough that sweeping the room never triggers it, short enough to feel
+// like an answer to a question you were already asking.
+const INSPECT_DWELL_MS = 1750;
+const INSPECT_SIZE = 190; // px — the inset's square edge
+const INSPECT_GAP = 18; // px between the cursor and the inset
+const INSPECT_MARGIN = 12; // px it keeps clear of the viewport edges
+const INSPECT_SPIN = 0.55; // rad/s — a slow turn, not a spin
+
 const _cursorNdc = new Vector2();
 const _bez = new Vector3();
 const _flyDir = new Vector3();
@@ -194,6 +209,11 @@ type Move = {
 	sphere: boolean;
 	pass: boolean;
 };
+// A destination the cursor can reach but the eye cannot see: the capture it lands
+// on, the storey that capture is on, and how many storeys that is from here (0 =
+// this floor, so the move is through geometry rather than up or down).
+type ReachTarget = { index: number; level: number; levelDelta: number };
+
 type SavedInterior = {
 	pos: Vector3;
 	lon: number;
@@ -262,6 +282,18 @@ export class OrbitEngine {
 	private proxyView = false;
 	private proxyColorMats: Material[] = [];
 	private connectors: Connector[] = []; // parsed but not surfaced (highlights hidden for now)
+	// --- dwell inspection ---
+	// Which ids are discrete objects worth looking at (from the manifest), the
+	// dollhouse copy of each (the only per-object geometry that is BOTH published
+	// and coloured — the proxy is untextured and position-only), and the live inset.
+	private inspectable = new Set<string>();
+	private liteByLabel = new Map<string, Object3D>();
+	private inspectScene: Scene | null = null;
+	private inspectCam = new PerspectiveCamera(45, 1, 0.01, 100);
+	private inspectPivot: Group | null = null;
+	private inspect: OrbitState["inspect"] = null;
+	private hoverLabel: string | null = null;
+	private hoverSince = 0;
 	private rcDownX = 0;
 	private rcDownY = 0;
 
@@ -305,11 +337,11 @@ export class OrbitEngine {
 	private readonly locateClip = new Plane(new Vector3(0, -1, 0), 0);
 
 	private hoveredNavIndex = -1;
-	// The floor waypoint under the cursor (its destination capture + which floor it
-	// leads to), plus one representative capture per floor to stand them on.
-	private hoveredLevel: { index: number; level: number; up: boolean } | null =
-		null;
-	private levelReps: Array<{ level: number; index: number }> = [];
+	// What the cursor currently REACHES: the destination a click would take you to
+	// whenever you cannot see it from here — behind geometry, or on another floor.
+	// Recomputed every frame in updateCursorRing; null whenever the destination is
+	// in plain sight, which is the state that needs no explaining.
+	private cursorReach: ReachTarget | null = null;
 	private lastInputAt = 0;
 	private dwellPulsed = false;
 	private readonly reducedMotion =
@@ -556,10 +588,11 @@ export class OrbitEngine {
 			overlay: this.overlay,
 			exits,
 			preview: this.mode === "interior" ? this.buildPreview() : null,
-			levelPreview:
-				this.mode === "interior" ? this.buildLevelPreview() : null,
+			reachPreview:
+				this.mode === "interior" ? this.buildReachPreview() : null,
 			arrival: this.mode === "interior" ? this.arrival : null,
 			sonarActive: this.markers.sonarActive,
+			inspect: this.mode === "interior" ? this.inspect : null,
 			tour: this.director.progress,
 			canGoBack: this.mode === "interior" && this.history.length > 0,
 			trapped: !!node?.trapped,
@@ -605,21 +638,29 @@ export class OrbitEngine {
 		};
 	}
 
-	// The floor-waypoint preview payload: the capture the monolith will drop you
-	// into. The chrome pans it through a full 360 rather than showing the equirect
-	// flat, so what you read is the room and not a warped strip.
-	private buildLevelPreview(): OrbitState["levelPreview"] {
-		const lvl = this.hoveredLevel;
-		if (!lvl) return null;
-		const p = this.panos[lvl.index];
+	// The preview payload for an out-of-sight destination. The chrome pans it
+	// through a full 360 rather than showing the equirect flat, so what you read is
+	// the room and not a warped strip.
+	// The out-of-sight destination to preview: a hovered floor waypoint if there is
+	// one (it names an exact capture), else whatever the cursor currently reaches.
+	//
+	// Titled with that CAPTURE's own name. It used to carry a floor-wide name
+	// instead, to stop the title churning as the auto-home target changed under the
+	// cursor — but the panel now dissolves between destinations instead of cutting,
+	// so it can track the actual destination and stay readable.
+	private buildReachPreview(): OrbitState["reachPreview"] {
+		const target = this.cursorReach;
+		if (!target) return null;
+		const p = this.panos[target.index];
 		if (!p) return null;
 		return {
-			index: lvl.index,
-			level: lvl.level,
-			up: lvl.up,
+			index: target.index,
 			name: p.name ?? null,
 			url: p.url,
 			placeholderUrl: p.placeholderUrl,
+			dist: this.camera.position.distanceTo(v3(p.position)),
+			level: target.level,
+			levelDelta: target.levelDelta,
 		};
 	}
 
@@ -794,11 +835,9 @@ export class OrbitEngine {
 				Math.hypot(ev.clientX - this.downX, ev.clientY - this.downY),
 			);
 			// Drop any stale hover preview once the look starts moving.
-			if (this.hoveredNavIndex !== -1 || this.hoveredLevel) {
+			if (this.hoveredNavIndex !== -1) {
 				this.hoveredNavIndex = -1;
-				this.hoveredLevel = null;
 				this.markers.setNavHover(null);
-				this.markers.setLevelHover(null);
 				this.emit();
 			}
 		} else if (!this.interiorBusy) {
@@ -812,19 +851,8 @@ export class OrbitEngine {
 		this.canvas.style.cursor = "";
 		if (this.dragMoved >= 5) return;
 		this.noteInput();
-		// A floor monolith takes the click first (it's the big overlay target and it
-		// changes storey); then an affordance traverses its edge; else click-anywhere
+		// An affordance under the cursor traverses its edge; otherwise click-anywhere
 		// routing snaps to the node minimizing graph cost + angular deviation.
-		const slab = this.markers.pickLevel(
-			ev.clientX,
-			ev.clientY,
-			this.camera,
-			this.canvas,
-		);
-		if (slab) {
-			this.traverse(slab.userData.to as number);
-			return;
-		}
 		const spot = this.markers.pickNav(
 			ev.clientX,
 			ev.clientY,
@@ -861,11 +889,6 @@ export class OrbitEngine {
 	private onPointerLeave = () => {
 		this.pointerInside = false;
 		this.cursor.hide();
-		if (this.hoveredLevel) {
-			this.hoveredLevel = null;
-			this.markers.setLevelHover(null);
-			this.emit();
-		}
 	};
 	private onWindowPointerUp = () => this.peekUp();
 
@@ -945,33 +968,6 @@ export class OrbitEngine {
 	// Interior hover: light the affordance under the cursor + surface its preview.
 	private updateHover(ev: PointerEvent) {
 		if (this.currentIndex < 0) return;
-		// The floor monolith is a large, deliberate target drawn over the scene, so
-		// it claims the hover ahead of the smaller affordances behind it.
-		const slab = this.markers.pickLevel(
-			ev.clientX,
-			ev.clientY,
-			this.camera,
-			this.canvas,
-		);
-		this.markers.setLevelHover(slab);
-		const level = slab
-			? {
-					index: slab.userData.to as number,
-					level: slab.userData.level as number,
-					up: slab.userData.up as boolean,
-				}
-			: null;
-		let changed = (this.hoveredLevel?.index ?? -1) !== (level?.index ?? -1);
-		this.hoveredLevel = level;
-		if (level) {
-			this.requestPano(level.index); // warm the pano the preview pans through
-			this.markers.setNavHover(null);
-			this.canvas.style.cursor = "pointer";
-			changed = changed || this.hoveredNavIndex !== -1;
-			this.hoveredNavIndex = -1;
-			if (this.addressing.setHover(null) || changed) this.emit();
-			return;
-		}
 		const spot = this.markers.pickNav(
 			ev.clientX,
 			ev.clientY,
@@ -1005,7 +1001,7 @@ export class OrbitEngine {
 				? ""
 				: "zoom-out";
 		}
-		changed = changed || idx !== this.hoveredNavIndex;
+		const changed = idx !== this.hoveredNavIndex;
 		this.hoveredNavIndex = idx;
 		if (this.addressing.setHover(obj) || changed) this.emit();
 	}
@@ -1075,30 +1071,108 @@ export class OrbitEngine {
 		return null;
 	}
 
+	// Which storey a click on `hit` should go to.
+	//
+	// Normally that is simply the storey the geometry belongs to. The exception is
+	// looking UP: a ceiling belongs to the room beneath it, so testing the hit point
+	// alone answers "your own floor" and scopes the click back onto the storey you
+	// are already standing on — which is exactly what stopped clicking the ceiling
+	// from taking you upstairs. Pointing steeply above your own head is a request to
+	// go through the thing over your head, so it resolves to the storey above.
+	//
+	// Decided on the ray's PITCH rather than the surface normal: proxy normals are
+	// recomputed after decimation and the source winding is unreliable (the surface
+	// cursor already flips them toward the camera for exactly that reason), so
+	// "is this face pointing down at me" is not a question the geometry can answer.
+	// How steeply you are looking is not in doubt.
+	private targetFloorFor(hit: Intersection): number {
+		if (!this.hasFloorVolumes) return -1;
+		const cur = this.panoLevel[this.currentIndex] ?? -1;
+		if (cur >= 0) {
+			const plan = Math.hypot(
+				hit.point.x - this.camera.position.x,
+				hit.point.z - this.camera.position.z,
+			);
+			const pitch = Math.atan2(hit.point.y - this.camera.position.y, plan);
+			if (pitch > CEILING_PITCH && this.panoLevel.includes(cur + 1))
+				return cur + 1;
+		}
+		return this.floorAt(hit.point);
+	}
+
+	// Whether this tour's floors carry described volumes at all. Older captures
+	// don't, and everything that reads a floor from geometry falls back to the
+	// nearest-capture-point reading when they don't.
+	private get hasFloorVolumes(): boolean {
+		return this.minimaps.some((m) => !!m.volume);
+	}
+
+	// Which floor a world point is ON, by testing it against the floors' described
+	// volumes (smallest wins where they overlap, so a mezzanine inside a taller
+	// storey claims its own space). -1 means the point is on NO floor — terrain, a
+	// cliff face, scenery, the slab between two storeys — which is a real answer,
+	// not a failure: those things belong to no storey and the walkthrough must not
+	// offer to travel to one on their behalf.
+	private floorAt(p: Vector3): number {
+		let best = -1;
+		let bestVolume = Infinity;
+		for (const mm of this.minimaps) {
+			const v = mm.volume;
+			if (!v) continue;
+			const [ox, oy, oz] = v.origin;
+			const [dx, dy, dz] = v.dimensions;
+			if (p.x < ox || p.x > ox + dx) continue;
+			if (p.y < oy || p.y > oy + dy) continue;
+			if (p.z < oz || p.z > oz + dz) continue;
+			const volume = dx * dy * dz;
+			if (volume < bestVolume) {
+				bestVolume = volume;
+				best = mm.level;
+			}
+		}
+		return best;
+	}
+
 	// The pano that a floor click would snap to: the node minimizing (distance to
 	// the hit point + angular deviation from the click bearing). Shared by
 	// clickAnywhere (the actual traversal) and updateCursorRing (the live preview).
-	private autoHomeTarget(hit: Intersection): number {
+	//
+	// `floor`, when given, SCOPES the search to anchors on that storey — the floor
+	// the geometry under the cursor actually belongs to. Without it, clicking the
+	// ground of the storey below through a gap could still resolve to an anchor on
+	// your own floor (or vice versa) purely because it was closer in space, so the
+	// preview and the destination could name different floors. A storey with no
+	// eligible anchor of its own falls back to the whole set rather than making the
+	// click do nothing.
+	private autoHomeTarget(hit: Intersection, floor = -1): number {
 		const cam = this.camera.position;
 		const clickBearing = Math.atan2(
 			hit.point.z - cam.z,
 			hit.point.x - cam.x,
 		);
+		// Straight up or straight down, the hit point sits on top of the eye in plan
+		// and that bearing is atan2 of two near-zeroes — noise. Weighting it then
+		// silently drags the choice toward whichever anchor happens to lie at bearing
+		// zero, which is what made looking at the ceiling feel erratic. Fall back to
+		// pure distance when there is no horizontal direction to read.
+		const directional =
+			Math.hypot(hit.point.x - cam.x, hit.point.z - cam.z) > 0.5;
 		let best = -1;
 		let bestCost = Infinity;
 		for (let i = 0; i < this.panos.length; i++) {
 			if (i === this.currentIndex) continue;
+			if (floor >= 0 && this.panoLevel[i] !== floor) continue;
 			const pp = v3(this.panos[i].position);
 			const d = pp.distanceTo(hit.point);
 			const bearing = Math.atan2(pp.z - cam.z, pp.x - cam.x);
 			const ang = Math.abs(angleDelta(clickBearing, bearing));
-			const cost = d + ang * 3; // 1 rad off ≈ 3 m of detour
+			const cost = d + (directional ? ang * 3 : 0); // 1 rad off ≈ 3 m of detour
 			if (cost < bestCost) {
 				bestCost = cost;
 				best = i;
 			}
 		}
-		return best;
+		return best < 0 && floor >= 0 ? this.autoHomeTarget(hit) : best;
 	}
 
 	// Where to DRAW the waypoint for a hop that cuts through geometry.
@@ -1171,7 +1245,9 @@ export class OrbitEngine {
 			this.exit();
 			return;
 		}
-		const best = this.autoHomeTarget(hit);
+		// Scoped by the floor the clicked geometry is on, exactly as the live preview
+		// scopes it — so what the cursor promised is what the click delivers.
+		const best = this.autoHomeTarget(hit, this.targetFloorFor(hit));
 		if (best >= 0) this.traverse(best);
 	}
 
@@ -1221,7 +1297,6 @@ export class OrbitEngine {
 		this.sphereB.visible = false;
 		this.markers.navGroup.visible = false;
 		this.markers.hideSonar();
-		this.markers.levelGroup.visible = false;
 		this.markers.you.group.visible = false;
 		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
@@ -1247,7 +1322,6 @@ export class OrbitEngine {
 			this.sphereA.position.copy(this.camera.position);
 		}
 		this.markers.navGroup.visible = true;
-		this.markers.levelGroup.visible = true;
 		this.markers.you.group.visible = false;
 		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
@@ -1267,7 +1341,6 @@ export class OrbitEngine {
 		this.sphereB.visible = false;
 		this.markers.navGroup.visible = false;
 		this.markers.hideSonar();
-		this.markers.levelGroup.visible = false;
 		this.markers.you.group.visible = true;
 		this.projection.syncBase(!!this.proxyGroup?.visible);
 	}
@@ -1413,12 +1486,11 @@ export class OrbitEngine {
 		// A crossfading flight never dims, so clear any dip left by an earlier one.
 		if (cbs.crossfade) this.travelFade.style.opacity = "0";
 		this.mode = "transition";
+		this.closeInspect();
 		this.controls.enabled = false;
 		this.controls.autoRotate = false;
 		this.hoveredNavIndex = -1;
-		this.hoveredLevel = null;
 		this.markers.setNavHover(null);
-		this.markers.setLevelHover(null);
 		this.markers.hideSonar();
 		this.addressing.setHover(null);
 		this.addressing.closeMenu();
@@ -1449,12 +1521,10 @@ export class OrbitEngine {
 
 	private beginMove(index: number, type: EdgeType, dy: number, pass = false) {
 		this.interiorBusy = true;
+		this.closeInspect();
 		this.hoveredNavIndex = -1;
-		this.hoveredLevel = null;
 		this.markers.setNavHover(null);
-		this.markers.setLevelHover(null);
 		this.markers.navGroup.visible = false;
-		this.markers.levelGroup.visible = false;
 		this.markers.hideSonar();
 		this.requestPano(index);
 		const fromPos = this.camera.position.clone();
@@ -1585,7 +1655,6 @@ export class OrbitEngine {
 		const node = this.navNode(index);
 		this.markers.buildNav(node, this.panos);
 		this.markers.navGroup.visible = this.mode === "interior";
-		this.refreshLevelWaypoints();
 		if (node?.trapped) this.markers.pulseExits(performance.now(), 2200);
 		this.noteInput();
 		this.emit();
@@ -1663,9 +1732,7 @@ export class OrbitEngine {
 		if (this.mode !== "interior" || this.interiorBusy) return;
 		this.director.abort();
 		this.hoveredNavIndex = -1;
-		this.hoveredLevel = null;
 		this.markers.setNavHover(null);
-		this.markers.setLevelHover(null);
 		this.markers.hideSonar();
 		this.addressing.setHover(null);
 		this.addressing.closeMenu();
@@ -1987,8 +2054,7 @@ export class OrbitEngine {
 		this.savedInterior = null;
 		this.renderer.clippingPlanes = [];
 		this.hoveredNavIndex = -1;
-		this.hoveredLevel = null;
-		this.levelReps = [];
+		this.cursorReach = null;
 		this.proxyView = false;
 		this.addressing.reset();
 		this.canvas.style.cursor = "";
@@ -2049,6 +2115,8 @@ export class OrbitEngine {
 				manifest && Array.isArray(manifest.connectors)
 					? manifest.connectors
 					: [];
+			const objectIds =
+				manifest && Array.isArray(manifest.objects) ? manifest.objects : [];
 
 			let proxyRoot: Group | null = null;
 			if (manifest?.proxy) {
@@ -2069,7 +2137,7 @@ export class OrbitEngine {
 				}
 			}
 			if (token !== this.loadToken || this.disposed) return;
-			this.applyScene(entries, proxyRoot, lite, connectors);
+			this.applyScene(entries, proxyRoot, lite, connectors, objectIds);
 		} catch (e) {
 			if (token !== this.loadToken || this.disposed) return;
 			this.mode = "empty";
@@ -2085,8 +2153,10 @@ export class OrbitEngine {
 		proxyRoot: Group | null,
 		lite: Group | null,
 		connectors: Connector[],
+		objectIds: string[] = [],
 	) {
 		this.connectors = connectors;
+		this.inspectable = new Set(objectIds);
 		this.streamer.reset(entries);
 		this.panoLevel = entries.map((p) =>
 			levelForY(this.minimaps, p.position[1]),
@@ -2122,7 +2192,17 @@ export class OrbitEngine {
 
 		// Object addressing on both roots. Connector highlights are intentionally
 		// NOT pinned (hidden for now) — travel is driven entirely by the nav graph.
-		if (this.liteRoot) this.addressing.register(this.liteRoot);
+		if (this.liteRoot) {
+			this.addressing.register(this.liteRoot);
+			// The hovered object is a PROXY node, but the proxy is untextured
+			// geometry; the dollhouse is the only published per-object mesh carrying
+			// colour. Both name their nodes with the same pipeline id, which is what
+			// lets one stand in for the other.
+			for (const o of collectObjects(this.liteRoot)) {
+				const label = o.userData.objLabel as string | undefined;
+				if (label) this.liteByLabel.set(label, o);
+			}
+		}
 		if (this.proxyGroup) {
 			this.addressing.register(this.proxyGroup);
 			this.colorProxyObjects();
@@ -2146,7 +2226,6 @@ export class OrbitEngine {
 			(a, b) => this.segmentBlocked(a, b),
 		);
 		this.buildSceneDirectory(entries);
-		this.buildLevelReps();
 
 		this.markers.build(this.sceneMaxDim);
 
@@ -2258,70 +2337,118 @@ export class OrbitEngine {
 		this.mapEdges = edges;
 	}
 
-	// --- level waypoints ------------------------------------------------------
+	// --- dwell inspection ------------------------------------------------------
 
-	// One representative capture per floor: the anchor nearest that floor's own
-	// centroid. The raw centroid itself is no good — on an L-shaped floor or one
-	// wrapped around a stairwell it lands inside a wall — and this marker has to
-	// name a spot you can actually stand, because it is BOTH the thing you click
-	// and the thing the hover preview shows. Floors come from `panoLevel`, so a
-	// tour captured without minimap slices simply has no storeys and no waypoints.
-	private buildLevelReps() {
-		const byLevel = new Map<number, number[]>();
-		for (let i = 0; i < this.panoLevel.length; i++) {
-			const lv = this.panoLevel[i];
-			if (lv < 0) continue;
-			const members = byLevel.get(lv);
-			if (members) members.push(i);
-			else byLevel.set(lv, [i]);
+	// Watch how long the cursor has rested on one object. Tracked here rather than
+	// in the pointer handler because dwelling is precisely the absence of pointer
+	// events — the hover is already resolved, what we are timing is the stillness.
+	private tickInspect(now: number) {
+		const obj = this.addressing.hoveredObject;
+		const label = obj ? ((obj.userData.objLabel as string) ?? null) : null;
+		if (label !== this.hoverLabel) {
+			this.hoverLabel = label;
+			this.hoverSince = now;
+			if (this.inspect) this.closeInspect();
 		}
-		const reps: Array<{ level: number; index: number }> = [];
-		for (const [level, members] of byLevel) {
-			const centroid = new Vector3();
-			for (const i of members) centroid.add(v3(this.panos[i].position));
-			centroid.divideScalar(members.length);
-			let best = members[0];
-			let bestD = Infinity;
-			for (const i of members) {
-				const d = centroid.distanceToSquared(
-					v3(this.panos[i].position),
-				);
-				if (d < bestD) {
-					bestD = d;
-					best = i;
-				}
-			}
-			reps.push({ level, index: best });
-		}
-		reps.sort((a, b) => a.level - b.level);
-		this.levelReps = reps;
+		if (
+			!label ||
+			this.inspect ||
+			!this.inspectable.has(label) ||
+			!this.liteByLabel.has(label) ||
+			now - this.hoverSince < INSPECT_DWELL_MS
+		)
+			return;
+		this.openInspect(label);
 	}
 
-	// Stand a monolith on the floor directly above and the floor directly below —
-	// the two moves the waypoint promises. Floors further off are reached one
-	// storey at a time, which is what keeps a tall scene from filling with slabs.
-	private refreshLevelWaypoints() {
-		const cur =
-			this.currentIndex >= 0 ? this.panoLevel[this.currentIndex] : -1;
-		if (cur < 0 || this.levelReps.length < 2) {
-			this.markers.clearLevels();
-			return;
-		}
-		this.markers.buildLevels(
-			this.levelReps
-				.filter((r) => Math.abs(r.level - cur) === 1)
-				.map((r) => {
-					const floorPos = v3(this.panos[r.index].position);
-					floorPos.y -= HOTSPOT_FLOOR_DROP;
-					return {
-						level: r.level,
-						index: r.index,
-						floorPos,
-						up: r.level > cur,
-					};
-				}),
+	// Build the inset: a clone of the dollhouse copy of this object, recentred on a
+	// pivot so it turns about itself, framed by its own bounding sphere, lit by a
+	// small rig of its own. The clone shares geometry and materials with the scene
+	// copy — only the transform is ours — so opening one costs no upload.
+	private openInspect(label: string) {
+		const src = this.liteByLabel.get(label);
+		if (!src) return;
+		const scene = new Scene();
+		scene.add(new HemisphereLight(0xffffff, 0x2a2f38, 1.5));
+		const key = new DirectionalLight(0xffffff, 1.8);
+		key.position.set(2, 3, 2.5);
+		scene.add(key);
+		const clone = src.clone(true);
+		clone.visible = true;
+		clone.traverse((o) => {
+			o.visible = true;
+		});
+		clone.updateMatrixWorld(true);
+		const box = new Box3().setFromObject(clone);
+		if (box.isEmpty()) return;
+		const centre = box.getCenter(new Vector3());
+		const radius = Math.max(1e-3, box.getSize(new Vector3()).length() * 0.5);
+		clone.position.sub(centre);
+		const pivot = new Group();
+		pivot.add(clone);
+		scene.add(pivot);
+		// Pull back far enough that the whole silhouette fits at every angle of the
+		// turn — the bounding SPHERE, not the box, since the box's footprint changes
+		// as it rotates and the object must never clip its own frame.
+		this.inspectCam.position.set(0.62, 0.42, 1).normalize().multiplyScalar(
+			(radius / Math.sin((this.inspectCam.fov * Math.PI) / 360)) * 1.12,
 		);
-		this.markers.levelGroup.visible = this.mode === "interior";
+		this.inspectCam.near = Math.max(0.01, radius * 0.05);
+		this.inspectCam.far = radius * 20;
+		this.inspectCam.lookAt(0, 0, 0);
+		this.inspectCam.updateProjectionMatrix();
+		this.inspectScene = scene;
+		this.inspectPivot = pivot;
+		const rect = this.canvas.getBoundingClientRect();
+		const m = INSPECT_MARGIN;
+		this.inspect = {
+			label,
+			x: Math.min(
+				Math.max(this.pointerClientX + INSPECT_GAP, rect.left + m),
+				rect.right - INSPECT_SIZE - m,
+			),
+			y: Math.min(
+				Math.max(this.pointerClientY - INSPECT_SIZE - INSPECT_GAP, rect.top + m),
+				rect.bottom - INSPECT_SIZE - m,
+			),
+			w: INSPECT_SIZE,
+			h: INSPECT_SIZE,
+		};
+		this.emit();
+	}
+
+	private closeInspect() {
+		if (!this.inspect) return;
+		// Geometry and materials belong to the dollhouse; only the wrapper is ours.
+		this.inspectScene = null;
+		this.inspectPivot = null;
+		this.inspect = null;
+		this.emit();
+	}
+
+	// Draw the inset into its own rectangle of the main canvas, AFTER the composer
+	// has presented the frame. A scissored viewport rather than a second canvas: a
+	// third and fourth WebGL context (the workspace runs two engines side by side)
+	// to spin one small object is not a trade worth making.
+	private renderInspect(dt: number) {
+		const ins = this.inspect;
+		if (!ins || !this.inspectScene || !this.inspectPivot) return;
+		this.inspectPivot.rotation.y += dt * INSPECT_SPIN;
+		const rect = this.canvas.getBoundingClientRect();
+		const x = ins.x - rect.left;
+		// GL's viewport origin is bottom-left; the rect is measured from the top.
+		const y = rect.height - (ins.y - rect.top) - ins.h;
+		const prevAutoClear = this.renderer.autoClear;
+		this.renderer.autoClear = false;
+		this.renderer.setScissorTest(true);
+		this.renderer.setViewport(x, y, ins.w, ins.h);
+		this.renderer.setScissor(x, y, ins.w, ins.h);
+		this.renderer.setClearColor(0x0b0d12, 1);
+		this.renderer.clear(true, true, false);
+		this.renderer.render(this.inspectScene, this.inspectCam);
+		this.renderer.setScissorTest(false);
+		this.renderer.setViewport(0, 0, rect.width, rect.height);
+		this.renderer.autoClear = prevAutoClear;
 	}
 
 	// --- render loop ----------------------------------------------------------
@@ -2418,11 +2545,6 @@ export class OrbitEngine {
 					now,
 					this.host.clientHeight,
 				);
-				this.markers.updateLevels(
-					this.camera,
-					now,
-					this.host.clientHeight,
-				);
 				if (this.markers.sonarActive) {
 					this.markers.updateSonar(
 						now,
@@ -2436,6 +2558,7 @@ export class OrbitEngine {
 				) {
 					for (const l of this.sonarLabels) l.style.display = "none";
 				}
+				this.tickInspect(now);
 				// Never let stillness become stuckness: pulse the exits once on dwell.
 				if (!this.dwellPulsed && now - this.lastInputAt > DWELL_MS) {
 					this.dwellPulsed = true;
@@ -2455,6 +2578,7 @@ export class OrbitEngine {
 		this.updateCursorRing();
 		this.addressing.updateOutlines();
 		this.composer.render();
+		this.renderInspect(dt);
 	};
 
 	// Parked dissolve between dollhouse and capture pano, entirely on the GPU.
@@ -2506,51 +2630,92 @@ export class OrbitEngine {
 			this.mode === "interior" &&
 			!this.interiorBusy &&
 			this.pointerInside &&
-			!this.markers.hoveredNav &&
-			!this.markers.hoveredLevel;
+			!this.markers.hoveredNav;
 		const hits = active
 			? this.raycastInteriorAll(this.pointerClientX, this.pointerClientY)
 			: [];
 		const hit = hits[0] ?? null;
 		let ghosted = false;
+		let hideCursor = false;
+		let reach: ReachTarget | null = null;
+		// Where a click from here would carry the eye. The cursor turns this into its
+		// direction arrow — but only where the surface it is lying on can express it
+		// (see SurfaceCursor.aimArrow).
+		let travel: Vector3 | null = null;
 		if (hit && this.currentIndex >= 0) {
-			const targetIdx = this.autoHomeTarget(hit);
+			const curLevel = this.panoLevel[this.currentIndex] ?? -1;
+			// Ask the GEOMETRY which floor it is on, by testing the point against the
+			// floors' described volumes — not the nearest capture point, which is what
+			// this used to do and why pointing at a cliff face offered to send you to
+			// whichever storey happened to have an anchor near the rock. Terrain and
+			// the slab between storeys land in no volume at all, and -1 (on no floor)
+			// is the right answer for them. Tours captured before floors carried
+			// volumes keep the old nearest-anchor reading.
+			const hitLevel = this.targetFloorFor(hit);
+			// The floor under the cursor also SCOPES the destination, so the click
+			// cannot land on a storey the preview didn't name.
+			const targetIdx = this.autoHomeTarget(hit, hitLevel);
 			if (targetIdx >= 0) {
-				// One classification drives BOTH the cursor tint and the waypoint: a
-				// visible level change reads vertical (green); otherwise a live LOS
-				// test splits a clear walk (blue) from a hop that cuts through
-				// geometry (orange).
-				const rendered = this.navNode(this.currentIndex)?.rendered;
-				const isVisibleVertical = rendered?.some(
-					(e) => e.to === targetIdx && e.type === "vertical",
+				const destLevel = this.hasFloorVolumes
+					? hitLevel
+					: (this.panoLevel[targetIdx] ?? -1);
+				const crossesLevel =
+					curLevel >= 0 && destLevel >= 0 && destLevel !== curLevel;
+				const occluded = !this.isTargetClear(
+					v3(this.panos[targetIdx].position),
 				);
-				const targetPos = v3(this.panos[targetIdx].position);
-				const type: EdgeType = isVisibleVertical
-					? "vertical"
-					: this.isTargetClear(targetPos)
-						? "walk"
-						: "portal";
-				this.cursor.setColor(NAV_COLORS[type]);
-				// Only a through-geometry hop grows a waypoint. A clear walk needs none
-				// (you can already see the spot) and a level change has its monolith —
-				// so the pointer sprouts an affordance exactly when the click would
-				// take you somewhere you CAN'T see, and it's drawn under the cursor
-				// past the obstruction rather than out at the hidden destination.
-				if (type === "portal") {
+				// ONE question decides everything here: can you SEE where this click
+				// would put you? Being behind a wall and being on another storey were
+				// separate states (an amber cursor with a waypoint, and a red floor
+				// panel) until it became clear they are the same situation with
+				// different geometry in the way — so they now share one treatment.
+				//
+				// Out of sight: the ring is hidden, a waypoint grows on the cursor ray
+				// past the obstruction to say WHERE the click lands, and the preview
+				// panel says WHAT is there. In plain sight: a quiet grey ring and
+				// nothing else, because the view has already answered both questions.
+				if (occluded || crossesLevel) {
+					hideCursor = true;
+					reach = {
+						index: targetIdx,
+						level: destLevel,
+						levelDelta: crossesLevel ? destLevel - curLevel : 0,
+					};
 					this.markers.showGhost(
 						this.portalWaypoint(hits, targetIdx),
-						{ to: targetIdx, type, dy: 0 },
+						{ to: targetIdx, type: "portal", dy: 0 },
 						this.camera,
 						this.host.clientHeight,
 					);
 					ghosted = true;
+				} else {
+					this.cursor.setColor(CURSOR_CLEAR);
+					travel = v3(this.panos[targetIdx].position).sub(
+						this.camera.position,
+					);
 				}
 			} else {
-				this.cursor.setColor(NAV_COLORS.walk);
+				this.cursor.setColor(CURSOR_CLEAR);
 			}
 		}
 		if (!ghosted) this.markers.hideGhost();
-		this.cursor.update(hit, this.camera, this.host.clientHeight);
+		// Emit only when the DESTINATION changes, never per pixel of pointer travel —
+		// the panel tracks the cursor itself (see OrbitViewer's ReachPreviewPanel), so
+		// moving within one destination's catchment costs nothing. Re-targeting is
+		// frequent by design now, but the panel cross-dissolves rather than remounting,
+		// so a re-render here is a change of contents, not a rebuild of the window.
+		const changed = (this.cursorReach?.index ?? -1) !== (reach?.index ?? -1);
+		this.cursorReach = reach;
+		if (changed) {
+			if (reach) this.requestPano(reach.index); // warm the pano it pans through
+			this.emit();
+		}
+		this.cursor.update(
+			hideCursor ? null : hit,
+			this.camera,
+			this.host.clientHeight,
+			travel,
+		);
 	}
 
 	// X-ray name tags for the nearest sonar nodes (engine-owned DOM pool, so the

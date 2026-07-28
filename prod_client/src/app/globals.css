@@ -25,15 +25,48 @@ body {
   font-family: Arial, Helvetica, sans-serif;
 }
 
-/* Continuous 360° pan for the floor-waypoint preview. The equirect is tiled
-   horizontally (background-repeat: repeat-x), so shifting by exactly one tile
-   width lands on an identical frame and the wrap is invisible. The element sets
-   --pano-tile to its own tile width. */
+/* Continuous 360° pan for the reach preview. The equirect is tiled horizontally
+   (background-repeat: repeat-x), so shifting by exactly one tile width lands on an
+   identical frame and the wrap is invisible. The element sets --pano-tile to its
+   own tile width. */
 @keyframes pano-pan {
   from {
     background-position-x: 0;
   }
   to {
     background-position-x: calc(-1 * var(--pano-tile, 1800px));
+  }
+}
+
+/* Cross-dissolve for the reach preview's panorama. Moving the cursor changes which
+   anchor is being previewed continuously, so a new layer fades in OVER the outgoing
+   one inside a panel that never unmounts — the destination changes without the
+   window itself ever blinking. Both layers run pano-pan at a shared phase (the
+   element sets a negative animation-delay), so nothing slides relative to anything
+   else mid-dissolve. */
+/* An unvisited storey's chip in the minimap. Inter-floor travel goes through the
+   minimap — nothing in the scene itself can offer it, since the floor you stand on
+   hides everything below and a generated scene cannot be assumed to model stairs —
+   so the one place that CAN offer it has to ask for attention. It breathes in the
+   reach accent, the same amber the interface already uses for "somewhere you can
+   go that you cannot currently see", and stops the moment you set foot there. */
+@keyframes floor-unvisited {
+  0%,
+  100% {
+    background-color: rgb(255 196 107 / 0.1);
+    box-shadow: 0 0 0 0 rgb(255 196 107 / 0);
+  }
+  50% {
+    background-color: rgb(255 196 107 / 0.26);
+    box-shadow: 0 0 9px 2px rgb(255 196 107 / 0.5);
+  }
+}
+
+@keyframes reach-layer-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
   }
 }

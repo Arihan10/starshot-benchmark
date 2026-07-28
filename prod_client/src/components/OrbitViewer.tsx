@@ -16,8 +16,8 @@ import {
 	INITIAL_ORBIT_STATE,
 	type Chapter,
 	type HoverPreview,
-	type LevelPreview,
-	type NavExit,
+	type ReachPreview,
+	type ObjectInspect,
 	type OrbitState,
 } from "@/lib/orbit/types";
 import { tourSource, type Scene } from "@/lib/scenes";
@@ -67,6 +67,15 @@ export default function OrbitViewer({
 	const [state, setState] = useState<OrbitState>(INITIAL_ORBIT_STATE);
 	const [holding, setHolding] = useState(false);
 	const [drawer, setDrawer] = useState(false);
+	// Which storey's plan the minimap is showing. Lifted out of the minimap because
+	// the floor control now lives apart from it and drives it: hovering a floor over
+	// there previews its plan over here.
+	// Deliberately NOT reset when the pointer leaves the control: the rail and the
+	// minimap sit apart, so moving from one to the other would snap the plan back
+	// before you reached it. A previewed floor sticks until you preview another or
+	// arrive somewhere, and the map's own "you are on N" badge covers the mismatch.
+	const [viewedLevel, setViewedLevel] = useState(0);
+	const [prevLevel, setPrevLevel] = useState(-1);
 
 	useEffect(() => {
 		const host = hostRef.current;
@@ -123,6 +132,11 @@ export default function OrbitViewer({
 	}, [state.mode]);
 
 	const { mode, overlay, minimap } = state;
+	const currentLevel = minimap?.currentLevel ?? -1;
+	if (currentLevel !== prevLevel) {
+		setPrevLevel(currentLevel);
+		setViewedLevel(currentLevel);
+	}
 
 	return (
 		<div className='relative h-full w-full'>
@@ -136,6 +150,7 @@ export default function OrbitViewer({
 							mapEdges={state.mapEdges}
 							visited={state.visited}
 							currentIndex={state.currentIndex}
+							viewedLevel={viewedLevel}
 							engine={engineRef}
 						/>
 					)}
@@ -244,8 +259,14 @@ export default function OrbitViewer({
 				)}
 			</div>
 
-			{mode === "interior" && state.exits.length > 0 && (
-				<ExitsPanel exits={state.exits} engine={engineRef} />
+			{mode === "interior" && minimap && minimap.levels.length > 1 && (
+				<FloorRail
+					minimap={minimap}
+					visited={state.visited}
+					viewedLevel={viewedLevel}
+					setViewedLevel={setViewedLevel}
+					engine={engineRef}
+				/>
 			)}
 
 			{mode === "interior" && drawer && (
@@ -256,10 +277,12 @@ export default function OrbitViewer({
 				/>
 			)}
 
-			{state.levelPreview && (
-				<LevelPreviewPanel preview={state.levelPreview} />
-			)}
+			{/* Always mounted, even with nothing to show: it fades and re-targets in
+			    place, so re-aiming across a doorway edge can never blink the window
+			    out and back. */}
+			<ReachPreviewPanel preview={state.reachPreview} />
 			{state.preview && <HoverCard preview={state.preview} />}
+			{state.inspect && <InspectFrame inspect={state.inspect} />}
 			{mode === "interior" && state.arrival && (
 				<ArrivalToast
 					key={state.arrival.ts}
@@ -326,81 +349,6 @@ function ToolButton({
 	);
 }
 
-// The exits panel (affordance layer, in text): every in-view exit of the node,
-// with a live arrow that always points true (rotates with the camera) and a
-// verb — this is also what a screen reader would read on arrival.
-function ExitsPanel({
-	exits,
-	engine,
-}: {
-	exits: NavExit[];
-	engine: RefObject<OrbitEngine | null>;
-}) {
-	const containerRef = useRef<HTMLDivElement>(null);
-	const spin = useCallback((facingDeg: number) => {
-		const el = containerRef.current;
-		if (!el) return;
-		for (const arrow of el.querySelectorAll<HTMLElement>(
-			"[data-bearing]",
-		)) {
-			const bearing = Number(arrow.dataset.bearing);
-			arrow.style.transform = `rotate(${bearing - facingDeg}deg)`;
-		}
-	}, []);
-	useFacingLoop(engine, spin);
-
-	return (
-		<div
-			ref={containerRef}
-			className='absolute bottom-4 right-4 z-10 w-56 rounded-lg border border-white/10 bg-black/60 p-2 backdrop-blur'
-		>
-			<div className='mb-1 px-1 text-[9px] uppercase tracking-wider text-neutral-400'>
-				exits
-			</div>
-			<div className='flex flex-col gap-0.5'>
-				{exits.map((e) => {
-					const meta = EDGE_META[e.type];
-					return (
-						<button
-							key={e.index}
-							type='button'
-							onClick={() => engine.current?.traverseTo(e.index)}
-							className='group flex items-center gap-2 rounded px-1.5 py-1 text-left text-xs text-neutral-200 transition hover:bg-white/10'
-						>
-							<span
-								className='flex h-4 w-4 shrink-0 items-center justify-center'
-								data-bearing={e.bearingDeg}
-							>
-								<span
-									className='text-[11px] leading-none'
-									style={{ color: meta.color }}
-								>
-									▲
-								</span>
-							</span>
-							<span className='min-w-0 flex-1 truncate'>
-								{e.name ?? `node ${e.index + 1}`}
-							</span>
-							<span
-								className='shrink-0 rounded px-1 py-0.5 text-[8px] uppercase tracking-wide'
-								style={{
-									color: meta.color,
-									background: `${meta.color}1f`,
-								}}
-							>
-								{meta.label}
-							</span>
-							<span className='shrink-0 text-[9px] tabular-nums text-neutral-500'>
-								{e.dist < 100 ? `${e.dist.toFixed(0)}m` : ""}
-							</span>
-						</button>
-					);
-				})}
-			</div>
-		</div>
-	);
-}
-
 // The hover preview: destination thumbnail panned to its arrival heading, plus
 // the LLM-authored name + distance + the transition verb. Floats at the
 // affordance's screen point; pointer-transparent so it never blocks a click.
@@ -443,6 +391,7 @@ function HoverCard({ preview }: { preview: HoverPreview }) {
 	);
 }
 
+const REACH_ACCENT = "#ffc46b"; // one hue for every out-of-sight destination
 const PANO_SCREEN_H = 240; // px: the preview "screen" height
 // One full 360 is drawn this wide. Being well past the panel's own width means at
 // most a third of the panorama is on screen at once, so the frame reads as a view
@@ -451,50 +400,340 @@ const PANO_SCREEN_H = 240; // px: the preview "screen" height
 // gets cropped to the screen, which lands the visible band on the horizon.
 const PANO_TILE_W = 1800;
 
-// The floor-waypoint preview: a wide "screen" that pans continuously through the
+const PANO_PAN_MS = 28000; // one full revolution of the panning 360
+const REACH_PANEL_GAP = 16; // px between the cursor and the panel's bottom edge
+const REACH_PANEL_MARGIN = 12; // px it always keeps clear of the viewport edges
+const REACH_XFADE_MS = 260; // dissolve between two destinations
+const REACH_FADE_MS = 160; // the panel's own show / hide
+
+// One panorama layer inside the panel. Layers stack and cross-dissolve, so `key`
+// has to be unique per *appearance* rather than per pano — re-aiming back at a
+// destination you just left is a new dissolve, not the same element.
+type ReachLayer = {
+	key: number;
+	url: string;
+	placeholderUrl: string;
+	panPhase: number; // ms into pano-pan when this layer was born
+};
+
+// The floor-change preview: a wide "screen" that pans continuously through the
 // destination panorama rather than squashing a whole equirect into one frame, so
 // you read the room you're about to drop into instead of a warped strip. The pano
 // is tiled horizontally and shifted by exactly one tile width (see the pano-pan
 // keyframes), which is what makes the 360 loop seamlessly. Pointer-transparent, so
 // it never swallows the click it is previewing.
-function LevelPreviewPanel({ preview }: { preview: LevelPreview }) {
+//
+// It RIDES THE CURSOR, and it is NEVER UNMOUNTED — it fades to nothing instead.
+// Both matter for the same reason: re-aiming the cursor changes the destination
+// continuously, so anything that rebuilt the window would make it strobe as you
+// swept across a room. Position is written as a transform straight onto the node
+// rather than through state (same reason the minimap cone and exit arrows are
+// driven that way: a re-render per mousemove would change nothing visually and
+// cost everything), and a new destination fades in OVER the outgoing one.
+// Positioned in VIEWPORT coords, so it stays correct in the side-by-side
+// workspace where the panel is not at the window origin.
+function ReachPreviewPanel({ preview }: { preview: ReachPreview | null }) {
+	const ref = useRef<HTMLDivElement>(null);
+	// The last destination worth showing. The panel keeps rendering it while it
+	// fades out, so dismissal is a fade rather than an abrupt blanking.
+	const [shown, setShown] = useState<ReachPreview | null>(null);
+	const [layers, setLayers] = useState<ReachLayer[]>([]);
+
+	// A new destination pushes a layer that fades in OVER the outgoing one, and
+	// `shown` keeps the caption alive through the fade-out. Adjusted during render
+	// rather than in an effect (the pattern the minimap's arrival flash uses), so
+	// the panel never paints a frame of stale content — and guarded on the
+	// destination, so it settles immediately instead of looping.
+	if (preview && preview.index !== shown?.index) {
+		setShown(preview);
+		setLayers((prev) => {
+			const last = prev[prev.length - 1];
+			if (last && last.url === preview.url) return prev;
+			return [
+				...prev,
+				{
+					key: (last?.key ?? 0) + 1,
+					url: preview.url,
+					placeholderUrl: preview.placeholderUrl,
+					// Shared clock, so the incoming layer pans in step with the one it
+					// is covering: the dissolve changes the room, not the framing.
+					panPhase: performance.now() % PANO_PAN_MS,
+				},
+			].slice(-2);
+		});
+	}
+
+	// Placement is owned entirely by pointermove, bound once — the node outlives
+	// every individual destination. No initial seed is needed: a reach only ever
+	// appears because the pointer just moved, so this has already run for that move
+	// by the time the panel is asked to show anything.
+	useEffect(() => {
+		const place = (x: number, y: number) => {
+			const el = ref.current;
+			if (!el) return;
+			const { offsetWidth: w, offsetHeight: h } = el;
+			const m = REACH_PANEL_MARGIN;
+			// Centred above the cursor, then held inside the viewport — a 600px card
+			// hung off a pointer near an edge would otherwise run off-screen.
+			const left = Math.min(
+				Math.max(x - w / 2, m),
+				Math.max(m, window.innerWidth - w - m),
+			);
+			const top = Math.min(
+				Math.max(y - h - REACH_PANEL_GAP, m),
+				Math.max(m, window.innerHeight - h - m),
+			);
+			el.style.transform = `translate3d(${left}px, ${top}px, 0)`;
+		};
+		const onMove = (e: PointerEvent) => place(e.clientX, e.clientY);
+		window.addEventListener("pointermove", onMove);
+		return () => window.removeEventListener("pointermove", onMove);
+	}, []);
+
+	// Drop the outgoing layer once it is fully covered.
+	useEffect(() => {
+		if (layers.length < 2) return;
+		const t = setTimeout(
+			() => setLayers((l) => l.slice(-1)),
+			REACH_XFADE_MS + 40,
+		);
+		return () => clearTimeout(t);
+	}, [layers]);
+
+	const open = !!preview;
+	const level = shown ? shown.level + 1 : 1;
+	const delta = shown?.levelDelta ?? 0;
+
 	return (
-		<div className='pointer-events-none absolute left-1/2 top-1/2 z-30 w-[min(600px,70vw)] -translate-x-1/2 -translate-y-1/2'>
-			<div className='overflow-hidden rounded-xl border border-red-400/50 bg-neutral-950/85 shadow-2xl backdrop-blur'>
+		<div
+			ref={ref}
+			aria-hidden={!open}
+			className='pointer-events-none fixed left-0 top-0 z-30 w-[min(600px,70vw)] will-change-transform'
+			style={{
+				opacity: open ? 1 : 0,
+				transition: `opacity ${REACH_FADE_MS}ms ease-out`,
+			}}
+		>
+			<div
+				className='overflow-hidden rounded-xl bg-neutral-950/85 shadow-2xl backdrop-blur'
+				style={{ border: `1px solid ${REACH_ACCENT}80` }}
+			>
 				<div
 					className='relative overflow-hidden bg-neutral-900'
 					style={{ height: PANO_SCREEN_H }}
 				>
-					<div
-						className='absolute inset-0 animate-[pano-pan_28s_linear_infinite]'
-						style={
-							{
-								// Full pano over the blurred placeholder, so the frame is filled
-								// the instant it opens and both layers pan together.
-								backgroundImage: `url(${preview.url}), url(${preview.placeholderUrl})`,
-								backgroundRepeat: "repeat-x",
-								backgroundSize: `${PANO_TILE_W}px auto`,
-								backgroundPositionY: "50%",
-								"--pano-tile": `${PANO_TILE_W}px`,
-							} as CSSProperties
-						}
-					/>
+					{layers.map((layer) => (
+						<div
+							key={layer.key}
+							className='absolute inset-0'
+							style={
+								{
+									// Full pano over the blurred placeholder, so the frame is
+									// filled the instant it opens and both pan together.
+									backgroundImage: `url(${layer.url}), url(${layer.placeholderUrl})`,
+									backgroundRepeat: "repeat-x",
+									backgroundSize: `${PANO_TILE_W}px auto`,
+									backgroundPositionY: "50%",
+									"--pano-tile": `${PANO_TILE_W}px`,
+									animationName: "pano-pan, reach-layer-in",
+									animationDuration: `${PANO_PAN_MS}ms, ${REACH_XFADE_MS}ms`,
+									animationTimingFunction: "linear, ease-out",
+									animationIterationCount: "infinite, 1",
+									animationFillMode: "none, forwards",
+									// Negative delay starts pano-pan mid-cycle, matching the
+									// layer below it.
+									animationDelay: `-${layer.panPhase}ms, 0ms`,
+								} as CSSProperties
+							}
+						/>
+					))}
 					<div className='pointer-events-none absolute inset-x-0 top-0 h-14 bg-linear-to-b from-black/70 to-transparent' />
-					<span className='absolute left-3 top-3 rounded bg-red-500 px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-neutral-950'>
-						{preview.up ? "▲" : "▼"} floor {preview.level + 1}
+					<span
+						className='absolute left-3 top-3 rounded px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-neutral-950'
+						style={{ background: REACH_ACCENT }}
+					>
+						{delta > 0
+							? `▲ floor ${level}`
+							: delta < 0
+								? `▼ floor ${level}`
+								: "out of sight"}
 					</span>
 				</div>
 				<div className='flex items-center justify-between gap-3 px-3 py-2'>
 					<span className='min-w-0 truncate text-sm font-semibold text-white'>
-						{preview.name ?? `floor ${preview.level + 1}`}
+						{shown?.name ?? "unnamed"}
 					</span>
-					<span className='shrink-0 text-[10px] uppercase tracking-wider text-red-300'>
-						click to go {preview.up ? "up" : "down"}
+					<span
+						className='shrink-0 text-[10px] uppercase tracking-wider'
+						style={{ color: REACH_ACCENT }}
+					>
+						click to go
+						{shown && shown.dist < 100
+							? ` · ${shown.dist.toFixed(0)} m`
+							: ""}
 					</span>
 				</div>
 			</div>
 		</div>
 	);
+}
+
+// The floor control. Inter-floor travel is the one move the scene itself cannot
+// offer — the floor you stand on hides everything below it, and a generated scene
+// cannot be assumed to model stairs — so the control that CAN offer it gets a
+// corner to itself rather than a row of digits tucked into the minimap's header,
+// where it read as a view toggle and was easy to never notice.
+//
+// It rests as a bare column of storey numbers and opens on hover into the full
+// list with names. That split is the point: at rest it costs the 3D almost
+// nothing, and it only takes the room needed to read a floor name at the moment
+// you are actually reading one.
+//
+// Laid out HIGHEST STOREY AT THE TOP (flex-col-reverse), so the control is a
+// section through the building: moving up the list moves up the scene. Hover a row
+// to preview that floor's plan in the minimap, click to go. Unvisited floors
+// breathe (the floor-unvisited keyframes) until you have actually stood on them.
+//
+// Anchored bottom-RIGHT (the exits panel's old corner, and the only free one —
+// the HUD holds bottom-left), so the pinned edge is the right one and opening
+// grows the panel leftward and upward: out of its corner, never across the middle
+// of the view.
+// Collapsed width is the chip (32) + the button's own padding (12) + the panel's
+// (24). That panel padding is deliberately generous: the unvisited pulse is a
+// box-shadow reaching ~11px past each button, and the panel clips its overflow to
+// keep the names from spilling out while narrow — too tight a padding and the glow
+// would be shaved off exactly where it is meant to draw the eye.
+const RAIL_COLLAPSED = "w-[68px]";
+const RAIL_EXPANDED = "w-72";
+
+function FloorRail({
+	minimap,
+	visited,
+	viewedLevel,
+	setViewedLevel,
+	engine,
+}: {
+	minimap: NonNullable<OrbitState["minimap"]>;
+	visited: number[];
+	viewedLevel: number;
+	setViewedLevel: (level: number) => void;
+	engine: RefObject<OrbitEngine | null>;
+}) {
+	const [open, setOpen] = useState(false);
+	const { currentLevel, levels } = minimap;
+	const visitedSet = useMemo(() => new Set(visited), [visited]);
+	const unvisited = useMemo(() => {
+		const out = new Set<number>();
+		for (const lv of levels)
+			if (!lv.points.some((p) => visitedSet.has(p.index))) out.add(lv.level);
+		return out;
+	}, [levels, visitedSet]);
+
+	return (
+		<div
+			onPointerEnter={() => setOpen(true)}
+			onPointerLeave={() => setOpen(false)}
+			className={`absolute bottom-4 right-4 z-10 overflow-hidden rounded-lg border border-white/10 bg-black/60 p-3 backdrop-blur transition-[width] duration-200 ease-out ${
+				open ? RAIL_EXPANDED : RAIL_COLLAPSED
+			}`}
+		>
+			<div
+				className={`overflow-hidden whitespace-nowrap text-[10px] uppercase tracking-wider text-neutral-400 transition-all duration-200 ${
+					open ? "mb-1.5 h-4 opacity-100" : "mb-0 h-0 opacity-0"
+				}`}
+			>
+				floors
+			</div>
+			<div className='flex flex-col-reverse gap-0.5'>
+				{levels.map((lv) => {
+					const isCurrent = lv.level === currentLevel;
+					const isViewed = lv.level === viewedLevel;
+					// Viewing is not visiting: the pulse holds until you go.
+					const isUnvisited = unvisited.has(lv.level);
+					return (
+						<button
+							key={lv.level}
+							type='button'
+							title={
+								isCurrent
+									? "you are on this floor"
+									: `go to ${lv.name ?? `floor ${lv.level + 1}`}`
+							}
+							onPointerEnter={() => setViewedLevel(lv.level)}
+							onFocus={() => {
+								setOpen(true);
+								setViewedLevel(lv.level);
+							}}
+							onClick={() => engine.current?.jumpToLevel(lv.level)}
+							className={`flex items-center gap-2.5 overflow-hidden whitespace-nowrap rounded-md p-1.5 text-left transition ${
+								isUnvisited
+									? "animate-[floor-unvisited_2s_ease-in-out_infinite] text-amber-100"
+									: isCurrent
+										? "bg-cyan-500/20 text-cyan-100"
+										: "text-neutral-300 hover:bg-white/10 hover:text-white"
+							} ${
+								isViewed && !isCurrent
+									? "ring-1 ring-inset ring-white/25"
+									: ""
+							}`}
+						>
+							<span
+								className={`flex h-8 w-8 shrink-0 items-center justify-center rounded-md text-[13px] font-semibold tabular-nums ${
+									isCurrent
+										? "bg-cyan-400 text-neutral-950"
+										: "bg-white/10"
+								}`}
+							>
+								{lv.level + 1}
+							</span>
+							<span
+								className={`min-w-0 flex-1 truncate text-[12px] transition-opacity duration-150 ${
+									open ? "opacity-100" : "opacity-0"
+								}`}
+							>
+								{lv.name ?? `Floor ${lv.level + 1}`}
+							</span>
+							{isCurrent && (
+								<span
+									className={`shrink-0 text-[9px] uppercase tracking-wider text-cyan-300/80 transition-opacity duration-150 ${
+										open ? "opacity-100" : "opacity-0"
+									}`}
+								>
+									here
+								</span>
+							)}
+						</button>
+					);
+				})}
+			</div>
+		</div>
+	);
+}
+
+// The dwell inspection: a frame and a caption around the rectangle the ENGINE is
+// drawing the orbiting object into (a scissored viewport of the main canvas, see
+// renderInspect). Deliberately has no background of its own — anything opaque here
+// would paint over the 3D underneath it. Pointer-transparent, so resting the cursor
+// to summon it never blocks the click that follows.
+function InspectFrame({ inspect }: { inspect: ObjectInspect }) {
+	return (
+		<div
+			className='pointer-events-none fixed z-30'
+			style={{ left: inspect.x, top: inspect.y, width: inspect.w, height: inspect.h }}
+		>
+			<div className='h-full w-full rounded-lg border border-white/25 shadow-2xl' />
+			<div className='absolute inset-x-0 -bottom-6 truncate rounded bg-black/75 px-2 py-1 text-center text-[10px] font-medium text-neutral-100 backdrop-blur'>
+				{prettyLabel(inspect.label)}
+			</div>
+		</div>
+	);
+}
+
+// `antique_display_sextant` → "Antique display sextant". The ids are authored by
+// the pipeline, so they read as words already — they just need unpicking.
+function prettyLabel(id: string): string {
+	const words = id.replace(/[_-]+/g, " ").trim();
+	return words ? words[0].toUpperCase() + words.slice(1) : id;
 }
 
 // Arrival narration ("Archive · sealed room, phased through the wall") — invariant
@@ -714,22 +953,19 @@ function Minimap({
 	mapEdges,
 	visited,
 	currentIndex,
+	viewedLevel,
 	engine,
 }: {
 	minimap: NonNullable<OrbitState["minimap"]>;
 	mapEdges: OrbitState["mapEdges"];
 	visited: number[];
 	currentIndex: number;
+	// Read-only here: the floor rail owns which storey is being shown.
+	viewedLevel: number;
 	engine: RefObject<OrbitEngine | null>;
 }) {
 	const [expanded, setExpanded] = useState(false);
 	const { currentLevel, levels } = minimap;
-	const [viewedLevel, setViewedLevel] = useState(currentLevel);
-	const [prevLevel, setPrevLevel] = useState(currentLevel);
-	if (currentLevel !== prevLevel) {
-		setPrevLevel(currentLevel);
-		setViewedLevel(currentLevel);
-	}
 
 	// Re-anchoring flash: pulse the current dot briefly after each arrival.
 	const [flash, setFlash] = useState(0);
@@ -767,34 +1003,10 @@ function Minimap({
 	return (
 		<div className='rounded-md border border-white/10 bg-black/60 p-1.5 backdrop-blur'>
 			<div className='mb-1 flex items-center justify-between gap-2 px-0.5 text-[9px] uppercase tracking-wider text-neutral-400'>
-				<span>minimap</span>
+				<span className='truncate'>
+					{view.name ?? `floor ${view.level + 1}`}
+				</span>
 				<div className='flex items-center gap-1'>
-					{levels.length > 1 && (
-						<div
-							className='flex items-center gap-0.5'
-							title="switch floor (doesn't move you)"
-						>
-							{levels.map((lv) => {
-								const isViewed = lv.level === viewedLevel;
-								const isCurrent = lv.level === currentLevel;
-								return (
-									<button
-										key={lv.level}
-										type='button'
-										title={`floor ${lv.level + 1}${isCurrent ? " · you are here" : ""}`}
-										onClick={() => setViewedLevel(lv.level)}
-										className={`rounded px-1 py-0.5 text-[9px] leading-none tabular-nums transition ${
-											isViewed
-												? "bg-cyan-500/30 text-cyan-100"
-												: "text-neutral-400 hover:bg-white/10 hover:text-white"
-										} ${isCurrent ? "ring-1 ring-inset ring-cyan-300/70" : ""}`}
-									>
-										{lv.level + 1}
-									</button>
-								);
-							})}
-						</div>
-					)}
 					<button
 						type='button'
 						onClick={() => setExpanded((v) => !v)}

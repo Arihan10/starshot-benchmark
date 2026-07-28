@@ -3535,6 +3535,18 @@ def _plan_from_tour(run: str, slot: str, model: str) -> dict[str, Any] | None:
             if isinstance(p, dict) and p.get("position")
         ],
         "connectors": tour.get("connectors") or [],
+        # The capture's minimap slices ARE the floors, carrying whatever name +
+        # volume the describer gave them — so a plan rebuilt from a tour keeps them.
+        "floors": [
+            {
+                "level": m.get("level"),
+                "y": m.get("y"),
+                "name": m.get("name"),
+                "volume": m.get("volume"),
+            }
+            for m in (tour.get("minimaps") or [])
+            if isinstance(m, dict) and m.get("level") is not None
+        ],
     }
 
 
@@ -3567,10 +3579,12 @@ def _plan_payload(
     connectors: list[anchors_svc.PlacedConnector],
     reasoning: str,
     names: dict[int, str],
+    floors: list[anchors_svc.Floor],
 ) -> dict[str, Any]:
     """The canonical plan shape, shared by the standalone planner and the capture.
     Anchor ids are the CAPTURE ids (`anchor-NNN`) so a saved plan drops straight
-    into the capture manifest with no re-shaping."""
+    into the capture manifest with no re-shaping. `floors` carry only identity —
+    the member indices are re-derived by the capture from the anchors themselves."""
     return {
         "planner_model": anchors_svc.ANCHOR_PLANNER_MODEL,
         "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
@@ -3580,7 +3594,97 @@ def _plan_payload(
             for i, a in enumerate(anchors)
         ],
         "connectors": [c.model_dump() for c in connectors],
+        "floors": [_floor_dict(f) for f in floors],
     }
+
+
+def _inspectable_object_ids(slot_log: SlotLog) -> list[str]:
+    """The scene's DISCRETE objects — the ids a visitor can meaningfully inspect
+    on their own.
+
+    A cell's nodes come in three flavours, recorded as `node_kind` on each `bbox`
+    event: `zone` (abstract regions, no mesh), `frame` (whatever the encapsulating
+    pass produced — the shell and ground geometry that wraps a zone: cliff faces,
+    backdrops, floors, perimeter walls), and `object` (everything else). Only the
+    last is worth showing on its own: a "frame" has no outside to look at, and
+    orbiting one would show the inside of the room you are standing in.
+
+    `node_kind` exists ONLY in the event log — it is not carried on `Node` — so it
+    has to be read here and published, or the viewer has no way to tell a chair
+    from the cliff behind it. Published as an ALLOW-list rather than an exclusion
+    list, so an id we cannot classify simply never offers an inspection rather
+    than wrongly offering one."""
+    ids: list[str] = []
+    seen: set[str] = set()
+    for e in slot_log.state["events"]:
+        if e.get("kind") != "bbox" or e.get("node_kind") != "object":
+            continue
+        nid = e.get("id")
+        if isinstance(nid, str) and nid not in seen:
+            seen.add(nid)
+            ids.append(nid)
+    return ids
+
+
+def _apply_objects(run: str, slot: str, model: str, objects: list[str]) -> bool:
+    """Write the inspectable-object list into an already-captured tour.json, so a
+    tour rendered before object kinds were published picks them up without a GPU
+    re-capture."""
+    tour_json = _cell_tour_dir(run, slot, model) / "tour.json"
+    if not tour_json.is_file():
+        return False
+    try:
+        tour = json.loads(tour_json.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a torn tour.json is simply not patchable
+        return False
+    tour["objects"] = objects
+    tmp = tour_json.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(tour), encoding="utf-8")
+    tmp.replace(tour_json)
+    return True
+
+
+def _floor_dict(f: anchors_svc.Floor) -> dict[str, Any]:
+    """One floor as it travels: identity, the describer's name, and its volume as
+    an {origin, dimensions} pair (absent when the describer gave nothing usable —
+    the viewer then falls back to its nearest-anchor floor reading)."""
+    out: dict[str, Any] = {"level": f.level, "y": f.y, "name": f.name}
+    if f.origin is not None and f.dimensions is not None:
+        out["volume"] = {"origin": list(f.origin), "dimensions": list(f.dimensions)}
+    return out
+
+
+def _apply_floor_specs(
+    run: str, slot: str, model: str, floors: list[anchors_svc.Floor]
+) -> bool:
+    """Write floor names + volumes into an ALREADY-captured tour.json, matching each
+    described storey onto a bird's-eye slice by nearest Y (the same match the viewer
+    makes). Lets a tour rendered before floor description existed pick both up
+    without re-running the GPU capture. False when there's nothing to patch."""
+    tour_json = _cell_tour_dir(run, slot, model) / "tour.json"
+    if not tour_json.is_file() or not floors:
+        return False
+    try:
+        tour = json.loads(tour_json.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a torn tour.json is simply not patchable
+        return False
+    minimaps = tour.get("minimaps") or []
+    if not minimaps:
+        return False
+    for m in minimaps:
+        if not isinstance(m, dict) or m.get("y") is None:
+            continue
+        nearest = min(floors, key=lambda f: abs(f.y - float(m["y"])))
+        spec = _floor_dict(nearest)
+        m["name"] = spec["name"]
+        if "volume" in spec:
+            m["volume"] = spec["volume"]
+        else:
+            m.pop("volume", None)
+    tmp = tour_json.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(tour), encoding="utf-8")
+    tmp.replace(tour_json)
+    return True
 
 
 def _clear_tour_renders(run: str, slot: str, model: str) -> None:
@@ -3644,10 +3748,12 @@ async def _run_tour_capture(
             nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
             if not nodes:
                 raise RuntimeError("scene has no placed nodes to plan anchors from")
-            anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
+            anchors, connectors, reasoning, names, floors = (
+                await anchors_svc.generate_anchors(nodes)
+            )
             if not anchors:
                 raise RuntimeError("anchor planner returned no anchors")
-            plan = _plan_payload(anchors, connectors, reasoning, names)
+            plan = _plan_payload(anchors, connectors, reasoning, names, floors)
         anchor_dicts = plan["anchors"]
         job["total"] = len(anchor_dicts)
 
@@ -3667,6 +3773,8 @@ async def _run_tour_capture(
             "background": list(splat_stage5.BACKGROUND_RGB),
             "anchors": anchor_dicts,
             "connectors": plan.get("connectors") or [],
+            "floors": plan.get("floors") or [],
+            "objects": _inspectable_object_ids(_require_slot_log(run, slot, model)),
             "planner_model": plan.get("planner_model"),
             "namer_model": plan.get("namer_model"),
             "planner_reasoning": plan.get("reasoning"),
@@ -3731,16 +3839,19 @@ async def _run_anchor_plan(run: str, slot: str, model: str, nodes: list[Node]) -
     job = _anchor_jobs[key]
     try:
         job["status"] = "planning"
-        anchors, connectors, reasoning, names = await anchors_svc.generate_anchors(nodes)
+        anchors, connectors, reasoning, names, floors = (
+            await anchors_svc.generate_anchors(nodes)
+        )
         if not anchors:
             raise RuntimeError("anchor planner returned no anchors")
-        plan = _plan_payload(anchors, connectors, reasoning, names)
+        plan = _plan_payload(anchors, connectors, reasoning, names, floors)
         # Persist the moment planning succeeds: it's the expensive half, and from
         # here on it's a durable artifact a capture can render from later — even if
         # this process dies before anything is rendered.
         await asyncio.to_thread(_save_anchor_plan, run, slot, model, plan)
         job["anchors"] = plan["anchors"]
         job["connectors"] = plan["connectors"]
+        job["floors"] = plan["floors"]
         job["reasoning"] = plan["reasoning"]
         job["total"] = len(plan["anchors"])
         job["status"] = "done"
@@ -4960,6 +5071,7 @@ def create_app() -> FastAPI:
             "saved": saved,
             "anchors": plan.get("anchors") or [],
             "connectors": plan.get("connectors") or [],
+            "floors": plan.get("floors") or [],
             "reasoning": plan.get("reasoning") or "",
             "total": len(plan.get("anchors") or []),
             "planner_model": plan.get("planner_model") or anchors_svc.ANCHOR_PLANNER_MODEL,
@@ -4991,7 +5103,7 @@ def create_app() -> FastAPI:
         job: dict[str, Any] = {
             "run": run, "slot": slot_id, "model": model_alias,
             "running": True, "status": "pending", "error": None,
-            "anchors": [], "connectors": [], "reasoning": "", "total": 0,
+            "anchors": [], "connectors": [], "floors": [], "reasoning": "", "total": 0,
             "planner_model": anchors_svc.ANCHOR_PLANNER_MODEL,
             "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
             "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -5009,6 +5121,44 @@ def create_app() -> FastAPI:
         reasoning, error}."""
         run = _resolve_run(run)
         return _anchor_status(run, slot_id, model_alias)
+
+    @app.post("/slots/{slot_id}/{model_alias}/tour/floors")
+    async def tour_describe_floors(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Describe (or re-describe) this cell's floors from its SAVED plan — name +
+        world-space volume — and write them into both the plan and any captured
+        tour.json. One cheap LLM call over artifacts that already exist: no
+        planning, no rendering, so a tour captured before floors were described
+        gains them without a GPU re-capture. A fresh plan describes its floors
+        already, so this is the backfill / redo path. Re-publish afterwards to push
+        them to the viewer."""
+        run = _resolve_run(run)
+        slot_log = _require_slot_log(run, slot_id, model_alias)
+        plan = await asyncio.to_thread(_load_anchor_plan, run, slot_id, model_alias)
+        if not plan or not plan.get("anchors"):
+            raise HTTPException(409, "plan this cell's anchors first")
+        nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
+        if not nodes:
+            raise HTTPException(400, "scene has no placed nodes to name floors from")
+        planned = [a for a in plan["anchors"] if a.get("position")]
+        anchors = [
+            anchors_svc.PlacedAnchor(position=a["position"], zone=a.get("zone") or "")
+            for a in planned
+        ]
+        names = {i: a["name"] for i, a in enumerate(planned) if a.get("name")}
+        floors = anchors_svc.group_floors(anchors)
+        await anchors_svc.describe_floors(nodes, anchors, floors, names)
+        plan["floors"] = [_floor_dict(f) for f in floors]
+        await asyncio.to_thread(_save_anchor_plan, run, slot_id, model_alias, plan)
+        patched = await asyncio.to_thread(
+            _apply_floor_specs, run, slot_id, model_alias, floors
+        )
+        objects = _inspectable_object_ids(slot_log)
+        await asyncio.to_thread(_apply_objects, run, slot_id, model_alias, objects)
+        return {
+            "floors": plan["floors"],
+            "objects": len(objects),
+            "tour_updated": patched,
+        }
 
     @app.post("/slots/{slot_id}/{model_alias}/tour/reset")
     async def tour_reset(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, bool]:  # pyright: ignore[reportUnusedFunction]
@@ -5145,6 +5295,12 @@ def create_app() -> FastAPI:
             "background": state["background"],
             "anchors": state["anchors"],
             "connectors": state["connectors"],
+            # Named storeys, matched onto the capture's own bird's-eye slices by
+            # nearest Y (see tourcapture.js `floorNameFor`).
+            "floors": state["floors"],
+            # Discrete objects (not zone shells / frames) — the viewer only offers
+            # to inspect something that is genuinely a thing.
+            "objects": state["objects"],
             "planner_model": state["planner_model"],
             "namer_model": state["namer_model"],
             "planner_reasoning": state["planner_reasoning"],

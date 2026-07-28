@@ -1,11 +1,15 @@
 import {
+	BufferAttribute,
+	BufferGeometry,
 	DoubleSide,
+	Group,
 	type Intersection,
-	type Material,
+	MathUtils,
 	Matrix3,
 	Mesh,
 	MeshBasicMaterial,
 	type PerspectiveCamera,
+	Quaternion,
 	RingGeometry,
 	type Scene,
 	Vector3,
@@ -16,17 +20,67 @@ import {
 const _normal = new Vector3();
 const _normalMat = new Matrix3();
 const _toCam = new Vector3();
+const _travel = new Vector3();
+const _tangent = new Vector3();
+const _local = new Vector3();
+const _inv = new Quaternion();
 const Z_AXIS = new Vector3(0, 0, 1);
 const RING_OUTER_PX = 18; // constant on-screen outer radius
+const CURSOR_OPACITY = 0.9;
+
+// --- the direction arrow ------------------------------------------------------
+//
+// The arrow says which way a click will move you, drawn IN THE SURFACE the cursor
+// is lying on. That only means something when the move can actually be expressed
+// as a direction along that surface — which is a question about geometry, not
+// about what the surface "is".
+//
+// Take the travel direction, strip the component along the surface normal, and see
+// what survives. On a floor almost all of it does: you move across the floor, and
+// the arrow points the way. On a surface square to your path — a wall, the side of
+// a crate, a cliff face, the hull of a ship — the travel direction is nearly
+// parallel to the normal, so what survives is a near-zero residue whose direction
+// is numerical noise. An arrow there would be worse than none: it would point
+// somewhere, confidently, at random. So below a floor the arrow is dropped and the
+// bare ring stands. The click still works; it simply moves you toward that surface
+// rather than along it, which is the thing an arrow cannot say.
+//
+// The surviving fraction is |sin θ| between the travel direction and the surface
+// normal, so these thresholds read as angles: full arrow once the move is more than
+// ~33° off the normal, gone below ~20°, fading between so sweeping the cursor across
+// a corner doesn't make it blink.
+const ARROW_MIN_TANGENT = 0.35;
+const ARROW_FULL_TANGENT = 0.55;
+
+// A flat triangle just outside the ring, pointing along +X in the ring's own plane
+// (RingGeometry is built in XY facing +Z, so the arrow shares that frame and one Z
+// rotation aims it).
+function makeArrowGeometry(): BufferGeometry {
+	const g = new BufferGeometry();
+	g.setAttribute(
+		"position",
+		new BufferAttribute(
+			new Float32Array([
+				1.12, -0.38, 0, 1.12, 0.38, 0, 1.8, 0.0, 0,
+			]),
+			3,
+		),
+	);
+	return g;
+}
 
 // Surface-adhering ring cursor (interior only): a flat ring laid on the point
 // under the native cursor, oriented to the hit surface's normal so it sits flush
-// on floors / walls / objects (and foreshortens with them). Drawn over everything
-// (depthTest off) and kept a constant on-screen size; the OS cursor is never
-// hidden — this rides on top of it. The interior raycast that finds the point is
-// owned by the engine (it's shared with click auto-aim) and the hit is fed in.
+// on floors / walls / objects (and foreshortens with them), plus a direction arrow
+// whenever the click's movement can be drawn on that surface (see above). Drawn
+// over everything (depthTest off) and kept a constant on-screen size; the OS cursor
+// is never hidden — this rides on top of it. The interior raycast that finds the
+// point is owned by the engine (it's shared with click auto-aim) and the hit is fed
+// in, along with the travel a click from here would take.
 export class SurfaceCursor {
+	private readonly group = new Group();
 	private readonly ring: Mesh;
+	private readonly arrow: Mesh;
 
 	constructor(private readonly scene: Scene) {
 		this.ring = new Mesh(
@@ -34,30 +88,48 @@ export class SurfaceCursor {
 			new MeshBasicMaterial({
 				color: 0x7fe9ff,
 				transparent: true,
-				opacity: 0.9,
+				opacity: CURSOR_OPACITY,
 				side: DoubleSide,
 				depthTest: false,
 				depthWrite: false,
 			}),
 		);
-		this.ring.renderOrder = 1000;
-		this.ring.frustumCulled = false;
-		this.ring.visible = false;
-		scene.add(this.ring);
+		this.arrow = new Mesh(
+			makeArrowGeometry(),
+			new MeshBasicMaterial({
+				color: 0x7fe9ff,
+				transparent: true,
+				opacity: CURSOR_OPACITY,
+				side: DoubleSide,
+				depthTest: false,
+				depthWrite: false,
+			}),
+		);
+		this.arrow.visible = false;
+		this.group.add(this.ring, this.arrow);
+		for (const o of [this.group, this.ring, this.arrow]) {
+			o.renderOrder = 1000;
+			o.frustumCulled = false;
+		}
+		this.group.visible = false;
+		scene.add(this.group);
 	}
 
-	// Lay the ring on `hit` (null hides it), scaled to a constant on-screen radius.
-	// The hit point lies on the cursor ray, so its projection IS the pointer — the
-	// ring is centered on the cursor. It is deliberately not pushed along the normal:
-	// depth testing is off (nothing to z-fight), and that offset only shoved the ring
-	// off the pointer at grazing angles.
+	// Lay the cursor on `hit` (null hides it), scaled to a constant on-screen
+	// radius, and aim its arrow along `travel` — the world vector from the eye to
+	// where this click would land (null when there is no destination). The hit point
+	// lies on the cursor ray, so its projection IS the pointer — the ring is centered
+	// on the cursor. It is deliberately not pushed along the normal: depth testing is
+	// off (nothing to z-fight), and that offset only shoved the ring off the pointer
+	// at grazing angles.
 	update(
 		hit: Intersection | null,
 		camera: PerspectiveCamera,
 		viewportHeight: number,
+		travel: Vector3 | null = null,
 	) {
 		if (!hit) {
-			this.ring.visible = false;
+			this.group.visible = false;
 			return;
 		}
 		if (hit.face) {
@@ -68,26 +140,62 @@ export class SurfaceCursor {
 		}
 		_toCam.copy(camera.position).sub(hit.point);
 		if (_normal.dot(_toCam) < 0) _normal.negate();
-		this.ring.position.copy(hit.point);
-		this.ring.quaternion.setFromUnitVectors(Z_AXIS, _normal);
+		this.group.position.copy(hit.point);
+		this.group.quaternion.setFromUnitVectors(Z_AXIS, _normal);
 		const tan = Math.tan((camera.fov * Math.PI) / 360);
-		this.ring.scale.setScalar(
+		this.group.scale.setScalar(
 			(RING_OUTER_PX * 2 * hit.distance * tan) / (viewportHeight || 1),
 		);
-		this.ring.visible = true;
+		this.aimArrow(travel);
+		this.group.visible = true;
+	}
+
+	// Point the arrow along the part of `travel` that lies IN the surface, or hide
+	// it when too little of it does. `_normal` is the surface normal `update` just
+	// resolved (already flipped to face the camera).
+	private aimArrow(travel: Vector3 | null) {
+		if (!travel || travel.lengthSq() < 1e-8) {
+			this.arrow.visible = false;
+			return;
+		}
+		_travel.copy(travel).normalize();
+		_tangent.copy(_travel).addScaledVector(_normal, -_travel.dot(_normal));
+		const strength = _tangent.length(); // |sin θ| between travel and the normal
+		if (strength < ARROW_MIN_TANGENT) {
+			this.arrow.visible = false;
+			return;
+		}
+		_tangent.divideScalar(strength);
+		// Into the ring's own plane, where a single Z rotation aims the triangle.
+		_local
+			.copy(_tangent)
+			.applyQuaternion(_inv.copy(this.group.quaternion).invert());
+		this.arrow.rotation.z = Math.atan2(_local.y, _local.x);
+		(this.arrow.material as MeshBasicMaterial).opacity =
+			CURSOR_OPACITY *
+			MathUtils.clamp(
+				(strength - ARROW_MIN_TANGENT) /
+					(ARROW_FULL_TANGENT - ARROW_MIN_TANGENT),
+				0,
+				1,
+			);
+		this.arrow.visible = true;
 	}
 
 	hide() {
-		this.ring.visible = false;
+		this.group.visible = false;
 	}
 
 	setColor(color: number) {
 		(this.ring.material as MeshBasicMaterial).color.setHex(color);
+		(this.arrow.material as MeshBasicMaterial).color.setHex(color);
 	}
 
 	dispose() {
-		this.scene.remove(this.ring);
-		this.ring.geometry.dispose();
-		(this.ring.material as Material).dispose();
+		this.scene.remove(this.group);
+		for (const m of [this.ring, this.arrow]) {
+			m.geometry.dispose();
+			(m.material as MeshBasicMaterial).dispose();
+		}
 	}
 }

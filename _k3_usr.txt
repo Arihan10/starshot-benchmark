@@ -1,0 +1,288 @@
+You are the step in the SpatialBench pipeline responsible for describing a particular subregion within the larger overall scene. This is a pipeline that generates an entire 3D scene based on a text prompt input. During the generation of the 3D scene, the pipeline breaks down the scene into individual regions to allow downstream steps to recurse into them and focus on each one individually, then subdivides them further. You author the description for one such region, which further downstream steps then expand on, decompose, and populate.
+
+Here is the overall scene that is being built by the pipeline:
+
+prompt: "A modern house"
+description: "This scene is a single-family modern house set on a gently sloping residential lot, the home of a young creative couple who value light, openness, and a seamless connection between indoors and the surrounding landscape. The architecture follows a contemporary idiom: clean rectilinear volumes, a flat or low-pitched roof, generous floor-to-ceiling glazing, and a palette mixing exposed concrete, warm wood cladding, and slim steel or dark metal accents. The main structure reads as two interlocking volumes, roughly two stories, with the ground level given over to open, flowing communal space — an integrated living, dining, and kitchen area that opens through large sliding glass walls onto an exterior deck and yard — while the upper level holds the more private rooms (bedrooms, a study or work space, bathrooms) and may step back or cantilever slightly to create covered outdoor space below. An attached garage and a paved driveway anchor the front of the lot, approached from the street, with a landscaped front yard, a clean entry path, and a defined main entrance threshold. The rear of the property faces a more secluded backyard containing a patio or wooden deck continuous with the interior floor, a small swimming pool or water feature, low planters and ornamental landscaping, and a perimeter of fencing or hedging that sets the home within a calm suburban or semi-natural neighborhood context. The composition should feel lived-in and intentional, with the building positioned toward the front-center of the lot so that the social spaces and openings orient toward the private rear garden, establishing a clear progression from public street edge, through the house, to the sheltered outdoor living area behind."
+Overall scene (root) bounding box: 26.00m by 9.00m by 36.00m, with its origin corner at (-13.00, 0.00, -18.00) m
+
+Here's a list of objects that belong to the root region:
+
+{
+    {
+        Name: rear_privacy_fence
+        prompt: "A tall modern privacy fence forming one long straight run: horizontal warm cedar wood slats with thin shadow gaps between slim matte-black powder-coated steel posts, flat clean cap rail, about 1.8 meters tall, contemporary minimal residential fencing matching a modern house with wood cladding."
+        noun_phrase/description: "a continuous long straight modern privacy fence section, horizontal warm cedar wood slats separated by thin vertical shadow gaps, slim matte-black powder-coated steel posts, flat clean top cap rail, contemporary minimal architectural design"
+        parent: {
+            parent_id: root
+            parent_relationship_kind: ATTACHED
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+        placement: "Standing vertically directly along the rear property line, flush against the inside of the lot's rear boundary, spanning the entire rear width of the lot from the left side boundary to the right side boundary, corner to corner, screening the backyard and pool area from the property behind."
+        relationships: [rear_pool_area: BESIDE, left_side_fence: BESIDE, right_side_fence: BESIDE]
+        proxy_shape: BOX
+        orientation: "Faces inward toward the rear garden, the rear_pool_area and the glazed back of the house; its outer face backs onto the neighboring property behind the lot."
+        global yaw: 0deg
+        Dimensions: (26.00, 1.80, 0.15) m
+        Global origin corner: (-13.00, 0.00, -18.00) m
+        Local origin corner (relative to root, measured from its min corner): (0.00, 0.00, 0.00) m
+    },
+
+    {
+        Name: left_side_fence
+        prompt: "A tall modern privacy fence forming one long straight run down the side of a suburban lot: horizontal warm cedar wood slats with thin shadow gaps between slim matte-black powder-coated steel posts, flat clean cap rail, about 1.8 meters tall, contemporary minimal residential fencing."
+        noun_phrase/description: "Modern privacy fence featuring horizontal warm cedar wood slats with thin shadow gaps, framed by slim matte-black powder-coated steel posts, topped with a flat clean cap rail, contemporary minimal design, 1.8 meters tall"
+        parent: {
+            parent_id: root
+            parent_relationship_kind: ATTACHED
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+        placement: "Running along the left property line, flush against the inside of the lot's left side boundary, stretching from the front property line at the street edge all the way back until its rear end butts flush into the side face of the rear privacy fence, enclosing the left flank of the front yard, the house and the rear garden."
+        relationships: [rear_privacy_fence: BESIDE, attached_garage: BESIDE, rear_pool_area: BESIDE]
+        proxy_shape: BOX
+        orientation: "Faces inward across the side yard toward the house, the driveway and the pool area; its outer face fronts the neighboring lot on the left."
+        global yaw: 90deg
+        Dimensions: (0.15, 1.80, 35.85) m
+        Global origin corner: (-13.00, 0.00, -17.85) m
+        Local origin corner (relative to root, measured from its min corner): (0.00, 0.00, 0.15) m
+    },
+
+    {
+        Name: right_side_fence
+        prompt: "A tall modern privacy fence forming one long straight run down the side of a suburban lot: horizontal warm cedar wood slats with thin shadow gaps between slim matte-black powder-coated steel posts, flat clean cap rail, about 1.8 meters tall, contemporary minimal residential fencing."
+        noun_phrase/description: "Modern privacy fence featuring horizontal warm cedar wood slats with thin shadow gaps, framed by slim matte-black powder-coated steel posts, topped with a flat clean cap rail, contemporary minimal design, 1.8 meters tall"
+        parent: {
+            parent_id: root
+            parent_relationship_kind: ATTACHED
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+        placement: "Running along the right property line, flush against the inside of the lot's right side boundary, stretching from the front property line at the street edge all the way back until its rear end butts flush into the side face of the rear privacy fence, enclosing the right flank of the front yard, the house and the rear garden."
+        relationships: [rear_privacy_fence: BESIDE, ground_floor_living_volume: BESIDE, rear_pool_area: BESIDE]
+        proxy_shape: BOX
+        orientation: "Faces inward across the side yard toward the house, the deck and the pool area; its outer face fronts the neighboring lot on the right."
+        global yaw: -90deg
+        Dimensions: (0.15, 1.80, 35.85) m
+        Global origin corner: (12.85, 0.00, -17.85) m
+        Local origin corner (relative to root, measured from its min corner): (25.85, 0.00, 0.15) m
+    },
+
+    {
+        Name: front_fence_left_segment
+        prompt: "A low modern front-yard fence, a short straight run: horizontal warm cedar wood slats between slim matte-black steel posts with a flat cap rail, about waist height (roughly 1 meter tall), matching the taller privacy fencing of the same property, crisp contemporary curb appeal."
+        noun_phrase/description: "A low modern straight-run fence featuring horizontal warm cedar wood slats between slim matte-black steel posts, topped with a flat matte-black cap rail, 1 meter tall."
+        parent: {
+            parent_id: root
+            parent_relationship_kind: ATTACHED
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+        placement: "Standing along the front property line at the street edge, flush against the inside of the lot's front boundary, filling the frontage between the front end of the left side fence and the left edge of the driveway, leaving the driveway crossing completely open so vehicles can pass from the street onto the lot."
+        relationships: [left_side_fence: BESIDE, driveway: BESIDE]
+        proxy_shape: BOX
+        orientation: "Faces the street at the front of the lot, with the front lawn and the driveway directly behind it."
+        global yaw: 0deg
+        Dimensions: (2.85, 1.00, 0.15) m
+        Global origin corner: (-12.85, 0.00, 17.85) m
+        Local origin corner (relative to root, measured from its min corner): (0.15, 0.00, 35.85) m
+    },
+
+    {
+        Name: front_fence_middle_segment
+        prompt: "A low modern front-yard fence, a short straight run: horizontal warm cedar wood slats between slim matte-black steel posts with a flat cap rail, about waist height (roughly 1 meter tall), matching the taller privacy fencing of the same property, crisp contemporary curb appeal."
+        noun_phrase/description: "A modern fence section with horizontal warm cedar wood slats, slim matte-black steel vertical posts, and a flat black metal cap rail, minimalist contemporary architectural style, 6 meters wide, 1 meter tall, clean crisp lines"
+        parent: {
+            parent_id: root
+            parent_relationship_kind: ATTACHED
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+        placement: "Standing along the front property line at the street edge, flush against the inside of the lot's front boundary, filling the frontage between the right edge of the driveway and the left edge of the front entry path, leaving both the driveway crossing and the pedestrian path crossing completely open."
+        relationships: [driveway: BESIDE, front_entry_path: BESIDE]
+        proxy_shape: BOX
+        orientation: "Faces the street at the front of the lot, with the landscaped front lawn directly behind it."
+        global yaw: 0deg
+        Dimensions: (6.00, 1.00, 0.15) m
+        Global origin corner: (-4.00, 0.00, 17.85) m
+        Local origin corner (relative to root, measured from its min corner): (9.00, 0.00, 35.85) m
+    },
+
+    {
+        Name: front_fence_right_segment
+        prompt: "A low modern front-yard fence, a short straight run: horizontal warm cedar wood slats between slim matte-black steel posts with a flat cap rail, about waist height (roughly 1 meter tall), matching the taller privacy fencing of the same property, crisp contemporary curb appeal."
+        noun_phrase/description: "A modern fence with horizontal warm cedar wood slats set between slim matte-black steel posts and capped with a flat top rail."
+        parent: {
+            parent_id: root
+            parent_relationship_kind: ATTACHED
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+        placement: "Standing along the front property line at the street edge, flush against the inside of the lot's front boundary, filling the frontage between the right edge of the front entry path and the front end of the right side fence, leaving the pedestrian path crossing completely open so people can walk in from the street."
+        relationships: [front_entry_path: BESIDE, right_side_fence: BESIDE]
+        proxy_shape: BOX
+        orientation: "Faces the street at the front of the lot, with the landscaped front lawn directly behind it."
+        global yaw: 0deg
+        Dimensions: (8.85, 1.00, 0.15) m
+        Global origin corner: (4.00, 0.00, 17.85) m
+        Local origin corner (relative to root, measured from its min corner): (17.00, 0.00, 35.85) m
+    }
+}
+
+This is the region that you are to describe:
+
+region baseline idea: "ground_floor_living_volume:The social heart of the home: an open, light-filled communal level for cooking, dining, and everyday living that flows seamlessly out to the rear garden."
+region dimensions: (14.00, 3.40, 11.00) m
+region global origin corner: (-4.00, 0.00, -1.00) m
+region placement: "Sits at ground level toward the front-center of the lot, set back from the street behind the front yard. Its long rear face is largely glazed with sliding glass walls that open directly onto the rear deck, its front face carries the recessed main entrance where the entry path arrives, and the garage block abuts one of its side flanks."
+
+Here's the list of other regions that have been planned for this scene so far, with the objects placed inside each region listed inline beneath it. Each region has a description for how it should be built (or just its prompt for what it is if a description hasn't been authored for it yet in the pipeline), a sentence describing its placement in the scene, a list of spatial relationships it has with other objects or regions in the scene, its overall proxy shape, and its dimensions. Each object carries its prompt, a `parent` block (the object or region in the scene that the current object is structurally anchored to), a `parent_region`, and `parent_region_dimensions` (that region's size). Additionally, each region and object mentioned will also have a set of local coordinates that define its position relative to its parent (not to be confused with parent_region for objects), where the origin is the actual minimum corner of the parent's bounding box.
+
+{
+    {
+        Subregion name: ground_floor_living_volume   <-- TARGET: This is the region you are to plan and flesh out from.
+        prompt: "The social heart of the home: an open, light-filled communal level for cooking, dining, and everyday living that flows seamlessly out to the rear garden."
+        placement: "Sits at ground level toward the front-center of the lot, set back from the street behind the front yard. Its long rear face is largely glazed with sliding glass walls that open directly onto the rear deck, its front face carries the recessed main entrance where the entry path arrives, and the garage block abuts one of its side flanks."
+        relationships: []
+        proxy_shape: BOX
+        Dimensions: (14.00, 3.40, 11.00) m
+        Global origin corner: (-4.00, 0.00, -1.00) m
+        Local origin corner (relative to root, measured from its min corner): (9.00, 0.00, 17.00) m
+        parent_region: {
+            parent_name: root
+            parent_placement: (none)
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+    },
+
+    {
+        Subregion name: upper_floor_private_volume
+        prompt: "The private upper level of the home — a quieter retreat for rest, bathing, and focused work, lifted above and slightly apart from the social spaces below."
+        placement: "Stacked directly above the ground-floor communal volume but shifted slightly toward the rear garden: it cantilevers out a short distance beyond the ground floor's rear edge to shelter a strip of the deck below, while its front face steps back a little from the ground floor's front facade, so it reads as a distinct, lighter volume resting on the glazed base."
+        relationships: [ground_floor_living_volume: ABOVE]
+        proxy_shape: BOX
+        Dimensions: (12.00, 3.60, 11.50) m
+        Global origin corner: (-3.00, 3.40, -2.50) m
+        Local origin corner (relative to root, measured from its min corner): (10.00, 3.40, 15.50) m
+        parent_region: {
+            parent_name: root
+            parent_placement: (none)
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+    },
+
+    {
+        Subregion name: attached_garage
+        prompt: "The home's sheltered parking and utility space, forming the functional, vehicle-oriented part of the street-facing front composition."
+        placement: "A single-story, flat-roofed block attached to the street-side flank of the ground-floor volume at the front of the house, sitting slightly forward so it helps anchor the front of the lot; its street-facing elevation carries the garage doors, with the driveway running straight up to it."
+        relationships: [ground_floor_living_volume: ATTACHED]
+        proxy_shape: BOX
+        Dimensions: (6.00, 3.20, 7.00) m
+        Global origin corner: (-10.00, 0.00, 4.50) m
+        Local origin corner (relative to root, measured from its min corner): (3.00, 0.00, 22.50) m
+        parent_region: {
+            parent_name: root
+            parent_placement: (none)
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+    },
+
+    {
+        Subregion name: driveway
+        prompt: "The paved vehicular approach from the street to the garage — the arrival sequence of the property as first read from the public edge."
+        placement: "A paved strip occupying one side of the front yard, running straight from the street edge at the front property line back to the garage doors, sitting beside the front entry path with a band of lawn or low planting separating the two."
+        relationships: [attached_garage: BESIDE, front_entry_path: BESIDE]
+        proxy_shape: BOX
+        Dimensions: (6.00, 2.20, 6.50) m
+        Global origin corner: (-10.00, 0.00, 11.50) m
+        Local origin corner (relative to root, measured from its min corner): (3.00, 0.00, 29.50) m
+        parent_region: {
+            parent_name: root
+            parent_placement: (none)
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+    },
+
+    {
+        Subregion name: front_entry_path
+        prompt: "The pedestrian approach from the street to the front door — a clean, landscaped entry sequence marking the threshold between the public street and the private home."
+        placement: "A narrow, clean-lined path crossing the front yard from the street edge to the recessed main entrance on the ground floor's front face, flanked by low ornamental planting and running roughly parallel to the driveway on the opposite side of the front lawn."
+        relationships: [driveway: BESIDE, ground_floor_living_volume: ATTACHED]
+        proxy_shape: BOX
+        Dimensions: (2.00, 1.20, 8.00) m
+        Global origin corner: (2.00, 0.00, 10.00) m
+        Local origin corner (relative to root, measured from its min corner): (15.00, 0.00, 28.00) m
+        parent_region: {
+            parent_name: root
+            parent_placement: (none)
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+    },
+
+    {
+        Subregion name: rear_deck
+        prompt: "The outdoor living room of the house — a wooden platform continuous with the interior floor where the couple dines, entertains, and relaxes, mediating between the communal interior and the rear garden."
+        placement: "A low wooden platform running along the rear face of the ground-floor living volume, flush and continuous with the interior floor so the sliding glass walls open straight onto it; the stretch nearest the house slips beneath the upper floor's rear cantilever as a covered outdoor strip, while the outer stretch is open to the garden, with the pool area just beyond it in the lawn."
+        relationships: [ground_floor_living_volume: ATTACHED, rear_pool_area: BESIDE]
+        proxy_shape: BOX
+        Dimensions: (16.00, 3.40, 5.00) m
+        Global origin corner: (-5.00, 0.00, -6.00) m
+        Local origin corner (relative to root, measured from its min corner): (8.00, 0.00, 12.00) m
+        parent_region: {
+            parent_name: root
+            parent_placement: (none)
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+    },
+
+    {
+        Subregion name: rear_pool_area
+        prompt: "A small private swimming pool set into the rear garden — the secluded recreational focus of the backyard, for swimming and lounging in the sun."
+        placement: "Set into the rear garden lawn a short distance beyond the deck, in the back half of the lot with open lawn and planting around it; oriented parallel to the house's rear facade so it faces the glazed living spaces across the deck, and kept comfortably clear of the side and rear property lines where fencing and hedging enclose the garden."
+        relationships: [rear_deck: BESIDE]
+        proxy_shape: BOX
+        Dimensions: (23.00, 2.50, 11.00) m
+        Global origin corner: (-11.50, 0.00, -17.00) m
+        Local origin corner (relative to root, measured from its min corner): (1.50, 0.00, 1.00) m
+        parent_region: {
+            parent_name: root
+            parent_placement: (none)
+            parent_dimensions: (26.00, 9.00, 36.00) m
+            parent_global_origin_corner: (-13.00, 0.00, -18.00) m
+        }
+    }
+}
+
+<VERY_IMPORTANT_INSTRUCTIONS>
+firstly take into account all the scene context and information given to you about the subregion. commit to memory the dimensions: (14.00, 3.40, 11.00) m, and ground all your output in the knowledge of the spaces size, always contrast the usage of your space to the size of the space itself. 
+
+your job is to come up with a paragraph that will inform downstream steps about what is within this region and what this region is. downstream steps get all the same information you do, so it is pointless to reiterate it; your role within the pipeline is to take the (14.00, 3.40, 11.00) m space you have been given and a very loose baseline idea, and to extrapolate spatially, an entire scene from it. 
+
+you must be able to perfectly articulate the scene you are imagining, describe the placement of everything within the scene relative to existing objects and eachother and build your mental model of the scene from there. imagine you are within the scene, what kinds of things do you see, where are they placed, how are they arranged. it's incredibly important that the region's baseline idea is not the end-all-be-all, ignore it completely if you need. if the ideas you have aren't enough to fill in a (14.00, 3.40, 11.00) m region, come up with more functions out of thin air, if your ideas are too much for such a small region, simplify your ideas down. everything you come up with MUST be grounding in this spatial thinking, you are a spatial planner, not a semantic describer; ex. if the baseline idea is a living room but the space is humongous, you might add a grand piano section or a proper landing area into the backyard; if the baseline idea talks about a complex platforming section in a game level involving several platforms in a very narrow section, you might cut most of the jumps. 
+
+Broadly, there are two kinds of scenes - representational (where realism is the goal) and designed / gameplay-first (where a realistic theme is a visual skin over a hyper-intentional/purpose built layout). you must decide which kind of scene this one is, because it decides the way you will then further flesh out this region in the scene. 
+
+for representational scenes, your descriptions might be more detailed in terms of creating the most realistic scene possible, adding objects where it would seem to by empty. for gameplay-first scenes, your goal is to be more instructional to be efficient in the placement of gameplay elements, making everything feel deserved and intentional. 
+
+it is essential that you DO NOT just list out objects that make sense in the region based on the baseline idea. you MUST fundamentally consider the spatial layout and size of the scene, visualize what it would look like and use the space respectively. think about the types of objects you are planning for the region, there are large anchoring centerpiece objects that draw more attention and are necessary for filling out a large space while there are also small detail objects that make the scene feel complete. A larger region may call for several centerpieces to effectively use the space or a more intricate region may call for way more detail objects. 
+
+in your description DO NOT use flowery language, do not adjectivize every object. you should be concise and direct with your wording, coveying the layout efficiently by semantically placing objects relative to eachother and existing geometry. do not be meta about the prompt and pipeline as a whole, though good within your reasoning, DO NOT enumerate things the prompt tells you focus on (ex. representational vs gameplay first scene), DO NOT output meta quantities like the mood or atmosphere, DO NOT output numerical quantities like coordinates or dimensions. finally, your role is to expand a description of the scene, there is no need to reiterate qualities that all downstream steps will recieve as well; ex. surrounding regions' positions, what other objects already exist, transition points, etc. remember at the end of the day you are informing downstream steps, not instructing them
+
+<region_decomposition>
+AFTER you've decided the contents of the region and completed the region description, you must also decide whether is_atomic - whether the given region's volume can be broken down further into distinct subareas that serve the various functions of the region. each object within a region should be part of a generalizable category. remember that regions are defined at minimum as a collection of objects, we should never decompose into individual objects. 
+
+a common misconception is that the subdivision of this region will result in it looking disjoint or not cohesive, destroying the intended feel of areas where continuity is important, like open spaces. however, our pipeline is built in a way that this does not happen - trust that sibling subregions will be cohesive when put together; cohesion or having a "unified feel" should not be a concern. if this regions truly deserves to breakdown as evaluated by the aforementioned criteria then it should. 
+</region_decomposition>
+
+<thinking> 
+before and after EVERY SINGLE decision, ask yourself "is this region complete?". think of the realistic approximate size of all the objects you're placing and how they fit into the space and how you can add anchoring or detail objects to make a more cohesive, balanced scene or remove existing objects to make the scene more intentional.
+</thinking>
+
+</VERY_IMPORTANT_INSTRUCTIONS>

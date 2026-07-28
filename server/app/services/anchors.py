@@ -24,9 +24,32 @@ call reads the full scene context plus the planned coordinates and labels each
 point of interest. Naming is split from planning on purpose — the planner emits
 raw coordinates only, so it's never biased toward producing fewer points just to
 label them.
+
+A third pass DESCRIBES the FLOORS: it gives each storey a name and a world-space
+bounding volume.
+
+The anchors cluster by height into storeys (the same Y-gap clustering the capture
+uses for its bird's-eye slices), but that clustering is one-dimensional — it knows
+a floor's height and nothing about where the floor stops. The walkthrough needs
+both:
+
+  * the NAME previews a floor before you travel to it, and must not name one room:
+    the click auto-homes to whichever anchor is nearest the cursor, so a floor
+    labelled "Master Bedroom" that drops you in the ensuite reads as a broken
+    promise. The namer characterizes the storey AS A WHOLE.
+  * the VOLUME answers "is this point on a floor, and which one" for arbitrary
+    geometry under the cursor. Without it the viewer had to infer a floor from the
+    nearest capture point, so pointing at a cliff face — terrain belonging to no
+    storey — resolved to whichever anchor sat closest and offered to send you
+    there. Terrain must be allowed to belong to NO floor, which is a judgement
+    about what the scene is, not a distance computation.
+
+See SYSTEM_FLOOR_DESCRIBER for both instructions.
 """
 
 from __future__ import annotations
+
+from collections import Counter
 
 from pydantic import BaseModel
 
@@ -57,6 +80,35 @@ SYSTEM_ANCHOR_NAMER = """\
 You are the point of interest namer for a text-to-3D scene pipeline. A scene tree has already been fully built from a text prompt (made up of zones and objects) and a planner has picked a list of coordinates for certain points of interest within this scene. Your job is to injest the tree context, understand where the points of interest have been placed; Based on the zone it is in, the objects surrounding it and the overall scene context, provide a name for each point of interest
 
 Output ONLY the JSON object matching the schema: each point of interest is its numeric `id` and string `name`."""
+
+
+SYSTEM_FLOOR_DESCRIBER = """\
+You are the floor describer for a text-to-3D scene pipeline. A scene tree has already been fully built from a text prompt (made up of zones and objects), a planner has placed 360° camera capture points throughout it, and those points have been grouped by height into FLOORS (storeys / levels / decks / terraces). You are given the scene tree plus, for each floor, the zones and points of interest that sit on it. For each floor you produce two things — its NAME and its BOUNDING BOX.
+
+NAME — NAME THE WHOLE FLOOR, NEVER ONE PLACE ON IT. The name is shown to a visitor as the label on a preview BEFORE they travel to that floor — and when they go, they arrive at whichever capture point is nearest where they clicked, which can be ANY point on that floor. So a name that promises one specific room betrays them: label a floor of bedrooms "Upper Bedroom Level", never "Master Bedroom", because the visitor who lands in the ensuite or the hallway was told something untrue. The test to apply to every name: would this name still be honest if the visitor arrived at the LEAST representative point on this floor? If not, make it broader. When a floor has one clear use, name it for that use; when it mixes uses, name it for its character or its two dominant uses ("Living & Dining Level", "Shoreline & Dock Level", "Arrival & Parking Level"). Aim for 2-4 words. Use the vocabulary the scene itself implies — a house has floors, a cliffside has terraces or levels, a ship has decks, a tower has storeys — rather than forcing the word "Floor". Do not include the floor number; the interface already shows it. Every floor must get a distinct name.
+
+BOUNDING BOX — the world-space volume A VISITOR ON THIS FLOOR OCCUPIES: the ground they can stand on, the rooms and outdoor decks that belong to this storey, and the headroom above it. The interface uses this box to answer "the user is pointing at this piece of geometry — which floor is that?", so what you include is what it will offer to travel to.
+
+  * EXCLUDE anything that merely PASSES THROUGH this floor's height without being part of it: a cliff face, a rock wall, the sea or a lake surface, a tall tree, the outer skin of the building, the void beside a balcony. This is the single most important thing you do here. If a point on the cliff below the top storey falls inside the top storey's box, the interface will offer to send a visitor "to the top floor" because they pointed at rock — that failure is exactly what this box exists to prevent.
+  * A point belonging to NO floor is a correct and expected outcome. Terrain, scenery and structure between storeys should fall outside every box. Do NOT try to cover the whole scene; the boxes together will and should leave gaps.
+  * Floors STACK: their vertical ranges must not overlap each other. Leave the slab/void between two storeys outside both boxes.
+  * Horizontally, cover only where a visitor can actually be on this floor. A storey that occupies one wing of a large site gets a box around that wing, not around the site.
+  * Every capture point listed for a floor must fall inside that floor's box — they are cameras standing on it.
+
+Coordinate convention (identical to the scene's): right-handed, Y-up, meters.
+  +X = right, +Y = up, +Z = toward the viewer (front), -Z = away (back).
+Give the box as `origin` — its minimum corner (x, y, z) — and `dimensions` (width, height, depth); the box spans from that corner along +X/+Y/+Z by the dimensions.
+
+Output ONLY the JSON object matching the schema: each floor is its numeric `level`, string `name`, `origin` and `dimensions`."""
+
+
+# Anchors within this vertical gap (metres) belong to the same floor. MUST match
+# MINIMAP_LEVEL_EPS in client/public/js/tourcapture.js: the capture re-derives the
+# storeys independently (to cut its bird's-eye slices), and the two groupings have
+# to agree or a floor's name would land on the wrong slice. The names are matched
+# back by nearest Y rather than by index, so a drift degrades to a mislabel rather
+# than a crash — but keep them equal.
+FLOOR_LEVEL_EPS = 1.5
 
 
 class Anchor(BaseModel):
@@ -98,6 +150,55 @@ class PointName(BaseModel):
 
 class PointNames(BaseModel):
     points: list[PointName]
+
+
+class FloorSpec(BaseModel):
+    level: int
+    name: str
+    origin: Vec3Tuple  # minimum corner of the floor's world-space box
+    dimensions: Vec3Tuple  # width, height, depth from that corner along +X/+Y/+Z
+
+
+class FloorSpecs(BaseModel):
+    floors: list[FloorSpec]
+
+
+class Floor(BaseModel):
+    """One storey of the capture: the anchors that share a height band, its
+    representative camera height, and the describer's name + world-space volume.
+    `level` counts from the bottom (0 = lowest), matching the capture's minimap
+    slice indices. `y` is what the client matches back by, so it must stay the SAME
+    median the capture computes. `origin`/`dimensions` are None when the describer
+    gave nothing usable — the viewer then falls back to its old nearest-anchor
+    reading rather than trusting a broken box."""
+
+    level: int
+    y: float
+    anchors: list[int]  # indices into the aggregated anchor list
+    name: str | None = None
+    origin: Vec3Tuple | None = None
+    dimensions: Vec3Tuple | None = None
+
+
+def group_floors(anchors: list[PlacedAnchor]) -> list[Floor]:
+    """Cluster the planned anchors into floors by vertical gap, low to high — the
+    Python twin of tourcapture.js `groupAnchorLevels`, kept identical (sort by Y,
+    cut when the gap exceeds FLOOR_LEVEL_EPS, representative Y = the group's lower
+    median) so the floors named here are the floors the capture slices."""
+    order = sorted(range(len(anchors)), key=lambda i: anchors[i].position[1])
+    groups: list[list[int]] = []
+    last_y = 0.0
+    for i in order:
+        y = anchors[i].position[1]
+        if not groups or y - last_y > FLOOR_LEVEL_EPS:
+            groups.append([])
+        groups[-1].append(i)
+        last_y = y
+    floors: list[Floor] = []
+    for level, members in enumerate(groups):
+        ys = sorted(anchors[i].position[1] for i in members)
+        floors.append(Floor(level=level, y=ys[(len(ys) - 1) // 2], anchors=members))
+    return floors
 
 
 def _scene_aabb(nodes: list[Node]) -> tuple[Vec3Tuple, Vec3Tuple]:
@@ -318,6 +419,164 @@ async def name_anchors(nodes: list[Node], anchors: list[PlacedAnchor]) -> dict[i
     return {p.id: p.name for p in result.points}
 
 
+def _floor_entry(
+    floor: Floor,
+    anchors: list[PlacedAnchor],
+    names: dict[int, str],
+    total: int,
+) -> str:
+    """One floor's evidence: how big it is, which zones own it (by capture count,
+    so the namer can weigh a dominant use against a mixed one), and every point of
+    interest already named on it."""
+    counts = Counter(anchors[i].zone for i in floor.anchors)
+    zones = ", ".join(f"{z} ({c} capture points)" for z, c in counts.most_common())
+    pois = [names[i] for i in floor.anchors if names.get(i)]
+    lines = [
+        f"level: {floor.level}   (floor {floor.level + 1} of {total}, counting from the bottom)",
+        f"Camera height on this floor: y = {floor.y:.2f} m",
+        f"Capture points on this floor: {len(floor.anchors)}",
+        f"Zones on this floor: {zones or 'none'}",
+    ]
+    if pois:
+        lines.append("Points of interest on this floor: " + ", ".join(pois))
+    return util.braces("\n".join(lines))
+
+
+def build_floor_describer_prompt(
+    nodes: list[Node],
+    anchors: list[PlacedAnchor],
+    floors: list[Floor],
+    names: dict[int, str],
+) -> str:
+    """The same scene context the point namer reads — every zone and object with
+    its world-space box, which is what the describer measures a floor's extent
+    against — plus one block per floor describing everything that sits on it."""
+    context = _render_scene_context(nodes)
+    (lo_x, lo_y, lo_z), (hi_x, hi_y, hi_z) = _scene_aabb(nodes)
+    return (
+        "Name and bound the floors of the scene below. Each floor is a height band "
+        "holding some of the scene's 360° capture points; a visitor previews a "
+        "floor by its name and may then arrive at ANY capture point on it, and the "
+        "interface decides which floor a piece of geometry belongs to by testing "
+        "the point against your boxes.\n\n"
+        f"Scene world bounds: min corner ({lo_x:.2f}, {lo_y:.2f}, {lo_z:.2f}) m, "
+        f"max corner ({hi_x:.2f}, {hi_y:.2f}, {hi_z:.2f}) m.\n\n"
+        "=== SCENE HIERARCHY ===\n"
+        f"{context}\n"
+        "=== END SCENE HIERARCHY ===\n\n"
+        "=== FLOORS ===\n"
+        f"{util.brace_group([_floor_entry(f, anchors, names, len(floors)) for f in floors])}\n"
+        "=== END FLOORS ===\n\n"
+        "Now give every floor its name and bounding box, by level."
+    )
+
+
+# Anchors sit at eye height, so a box grown to contain them would cut the floor off
+# at the visitor's eyes; this pads that safety expansion out to a plausible room.
+_ANCHOR_PAD = 0.5
+
+
+def _floor_bands(
+    floors: list[Floor], scene_lo_y: float, scene_hi_y: float
+) -> list[tuple[float, float]]:
+    """The vertical slab each storey owns: halfway down to the storey below,
+    halfway up to the one above, and out to the scene's own bounds at the bottom
+    and top.
+
+    The VERTICAL split is derived, not asked for — the height clustering already
+    knows where the storeys separate — which caps how wrong a box can be. Without
+    it a single bad response could span the whole scene height, so every point in
+    the world would read as that floor: strictly worse than the nearest-anchor
+    behaviour this replaces. What's left for the model is the HORIZONTAL extent,
+    the part that genuinely needs judgement, since no amount of clustering can tell
+    you the cliff beside the top storey isn't part of it.
+
+    This BOUNDS the boxes but does not make them disjoint: `_apply_floor_box` then
+    grows each box around its own capture points, which wins over the band, and a
+    chained cluster can carry an anchor past the midpoint (a scene here has a
+    y=5.7 anchor on a floor whose band ends at 5.0). So adjacent storeys may
+    overlap by a little, and the viewer's `floorAt` resolves that deterministically
+    by taking the smallest containing volume."""
+    bands: list[tuple[float, float]] = []
+    for i, f in enumerate(floors):
+        lo = scene_lo_y if i == 0 else (floors[i - 1].y + f.y) / 2
+        hi = scene_hi_y if i == len(floors) - 1 else (f.y + floors[i + 1].y) / 2
+        bands.append((lo, hi))
+    return bands
+
+
+def _apply_floor_box(
+    floor: Floor,
+    spec: FloorSpec,
+    anchors: list[PlacedAnchor],
+    scene_lo: Vec3Tuple,
+    scene_hi: Vec3Tuple,
+    band: tuple[float, float],
+) -> None:
+    """Validate one described box onto its floor. The model is trusted for
+    JUDGEMENT (which ground belongs to a storey and which is passing scenery) but
+    not for arithmetic or for the vertical split: inverted corners are un-inverted,
+    the box is clipped to the scene's own bounds so a floor can never claim empty
+    space, its height is clipped to the storey's derived band (see `_floor_bands`),
+    and it is finally grown to contain that floor's own capture points — a box that
+    excluded its own camera would classify the visitor standing on it as being on
+    no floor. A box left degenerate is dropped, which downgrades that floor to the
+    nearest-anchor reading."""
+    lo = [float(spec.origin[i]) for i in range(3)]
+    hi = [lo[i] + float(spec.dimensions[i]) for i in range(3)]
+    for i in range(3):
+        if hi[i] < lo[i]:
+            lo[i], hi[i] = hi[i], lo[i]
+        lo[i] = max(lo[i], scene_lo[i])
+        hi[i] = min(hi[i], scene_hi[i])
+    lo[1] = max(lo[1], band[0])
+    hi[1] = min(hi[1], band[1])
+    for idx in floor.anchors:
+        p = anchors[idx].position
+        for i in range(3):
+            lo[i] = min(lo[i], p[i] - _ANCHOR_PAD)
+            hi[i] = max(hi[i], p[i] + _ANCHOR_PAD)
+    if any(hi[i] <= lo[i] for i in range(3)):
+        return
+    floor.origin = (lo[0], lo[1], lo[2])
+    floor.dimensions = (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
+
+
+async def describe_floors(
+    nodes: list[Node],
+    anchors: list[PlacedAnchor],
+    floors: list[Floor],
+    names: dict[int, str],
+) -> None:
+    """Name and bound each floor IN PLACE with the fixed namer model. Runs after
+    the point namer so it can see what each storey actually holds. A floor the
+    model omits keeps `name = None` and no box — the client renders a plain ordinal
+    and falls back to its nearest-anchor floor reading, both of which beat a wrong
+    answer. Standalone: no SlotLog binding, no cache, retries unlogged."""
+    if not floors:
+        return
+    llm.set_model(ANCHOR_NAMER_MODEL)
+    result, _reasoning, _usage, _raw, _gen_ids = await llm.call_llm_once(
+        system=SYSTEM_FLOOR_DESCRIBER,
+        user=build_floor_describer_prompt(nodes, anchors, floors, names),
+        output_schema=FloorSpecs,
+        model=ANCHOR_NAMER_MODEL,
+        step="floor_describe",
+        log_retries=False,
+    )
+    scene_lo, scene_hi = _scene_aabb(nodes)
+    bands = _floor_bands(floors, scene_lo[1], scene_hi[1])
+    by_level = {f.level: (f, bands[i]) for i, f in enumerate(floors)}
+    for spec in result.floors:
+        entry = by_level.get(spec.level)
+        if entry is None:
+            continue
+        floor, band = entry
+        if spec.name.strip():
+            floor.name = spec.name.strip()
+        _apply_floor_box(floor, spec, anchors, scene_lo, scene_hi, band)
+
+
 async def _plan_zone(
     nodes: list[Node],
     zone: Node,
@@ -381,7 +640,7 @@ def _inhabiting_zone(
 
 async def generate_anchors(
     nodes: list[Node],
-) -> tuple[list[PlacedAnchor], list[PlacedConnector], str, dict[int, str]]:
+) -> tuple[list[PlacedAnchor], list[PlacedConnector], str, dict[int, str], list[Floor]]:
     """Plan capture anchors + connectors one zone at a time (a fixed-planner call
     per zone, run sequentially), then name the aggregated anchors with the fixed
     namer model. Each zone call sees only its own objects, every zone's identity,
@@ -391,11 +650,12 @@ async def generate_anchors(
     mathematically inhabits (the deepest region whose bbox contains it), and each
     connector with the `starting_zone` that emitted it (both assigned here, not by
     the planner). Standalone: no SlotLog binding, no cache, retries unlogged.
-    Returns (anchors, connectors, reasoning, names); `names` maps each anchor's
-    aggregate list index to its point-of-interest name."""
+    Returns (anchors, connectors, reasoning, names, floors); `names` maps each
+    anchor's aggregate list index to its point-of-interest name, and `floors` are
+    the height-clustered storeys, each carrying the describer's name + volume."""
     root = util.find_root(nodes)
     if root is None:
-        return [], [], "", {}
+        return [], [], "", {}, []
     regions = [n for n in nodes if util.is_region(n)]
     # The root is always a zone (its objects are the scene's shared shell / ground
     # geometry); guarantee it's planned even if it wasn't flagged as a region.
@@ -414,7 +674,7 @@ async def generate_anchors(
         concrete = [n for n in nodes if not util.is_region(n)]
         targets = [(root, concrete)] if concrete else []
     if not targets:
-        return [], [], "", {}
+        return [], [], "", {}, []
     # Plan deepest zones first: the innermost spaces claim their anchors, then the
     # shallower / shared zones fill the gaps around what's already placed.
     targets.sort(key=lambda t: depth_of[t[0].id], reverse=True)
@@ -441,4 +701,8 @@ async def generate_anchors(
         if reasoning:
             reasoning_parts.append(f"[{zone.id}]\n{reasoning}")
     names = await name_anchors(nodes, anchors)
-    return anchors, connectors, "\n\n".join(reasoning_parts), names
+    # Floors last: clustering needs every anchor placed, and the describer reads
+    # the point names to judge what each storey is FOR.
+    floors = group_floors(anchors)
+    await describe_floors(nodes, anchors, floors, names)
+    return anchors, connectors, "\n\n".join(reasoning_parts), names, floors

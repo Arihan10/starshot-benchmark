@@ -26,6 +26,20 @@ export type MinimapLevel = {
 	y: number; // the level's representative camera height (its match key)
 	file: string;
 	bounds: MinimapBounds;
+	// The floor describer's name for this storey (server/app/services/anchors.py).
+	// Deliberately characterizes the WHOLE floor — travel to a floor auto-homes to
+	// whichever anchor is nearest the cursor, so a name that promised one room
+	// would be a lie. Absent on tours captured before floors were described; the
+	// chrome falls back to a plain ordinal, which is honest.
+	name?: string;
+	// The world-space volume the storey occupies, as a minimum corner + extent.
+	// This is what makes "which floor is this piece of geometry on?" answerable at
+	// all: floors are otherwise a 1-D clustering of camera heights with no extent,
+	// so the question could only be answered indirectly, via the nearest capture
+	// point — which happily assigned a cliff face to whichever storey had an anchor
+	// near it. Geometry inside NO floor volume (terrain, scenery, the void between
+	// storeys) is on no floor, which is a correct answer. Absent on older tours.
+	volume?: { origin: [number, number, number]; dimensions: [number, number, number] };
 };
 
 // A cross-zone connector (door / stair / ...). `id` matches a proxy object's
@@ -49,6 +63,11 @@ export type TourManifest = {
 	}>;
 	proxy?: string;
 	minimaps?: MinimapLevel[];
+	// Ids of the scene's DISCRETE objects — `node_kind: "object"` in the pipeline
+	// log, as opposed to the `frame` nodes the encapsulating pass produces (zone
+	// shells, ground, cliff backdrops). An allow-list: an id absent from it is
+	// never offered for inspection, so an unclassifiable node fails closed.
+	objects?: string[];
 	// Cross-zone connectors from the anchor planner (doors, stairs, ...): each
 	// names an object `id`, the `starting_zone` it sits in, and the `target_zone`
 	// it leads into. The matching proxy object is highlighted + click-to-traverse.
@@ -91,16 +110,41 @@ export type HoverPreview = {
 	headingU: number;
 };
 
-// The big preview shown while hovering a floor waypoint: the capture that click
-// will drop you into, panned continuously through its 360 rather than squashed
-// into one frame, so the destination reads as a room instead of a warped strip.
-export type LevelPreview = {
+// The big preview for a destination you CANNOT currently see — whether it is
+// behind a wall or on another storey. Those two were separate affordances (an
+// orange cursor with a waypoint, and a red floor panel) until it became clear they
+// answer the same question: the click reaches somewhere out of sight, so show what
+// is there. One preview now serves both.
+//
+// It follows the nearest anchor to the cursor, so it re-targets continuously as the
+// pointer moves; the panel itself never unmounts and cross-dissolves between
+// destinations (see ReachPreviewPanel). The capture is panned continuously through
+// its 360 rather than squashed into one frame, so the destination reads as a room
+// instead of a warped strip.
+export type ReachPreview = {
 	index: number; // destination pano
-	level: number; // destination floor, 0-based
-	up: boolean; // whether that floor is above the one you're standing on
-	name: string | null;
+	name: string | null; // that capture's own point-of-interest name
 	url: string; // full equirect — the layer that pans
 	placeholderUrl: string; // instant blurred backdrop while the full image loads
+	dist: number; // metres from the eye to the destination
+	level: number; // destination floor, 0-based (-1 when unknown)
+	levelDelta: number; // storeys crossed, signed; 0 when staying on this floor
+	// No screen position: the panel tracks pointermove itself, and a reach only ever
+	// appears in response to the pointer having just moved, so it is already in the
+	// right place by the time this arrives.
+};
+
+// A dwell-revealed look at one object, rendered as a slowly orbiting inset so you
+// can read a shape the room only ever shows you one side of. The engine draws the
+// 3D into this exact rectangle of its own canvas (a scissored viewport, so no
+// second WebGL context); the chrome frames it and captions it. Rect is in viewport
+// CSS px.
+export type ObjectInspect = {
+	label: string;
+	x: number;
+	y: number;
+	w: number;
+	h: number;
 };
 
 // The node directory (stable per scene) that powers chapters + "take me to".
@@ -148,12 +192,16 @@ export type OrbitState = {
 	exits: NavExit[];
 	// Rich destination preview for the affordance the cursor is over.
 	preview: HoverPreview | null;
-	// The 360-panning preview for the floor waypoint the cursor is over.
-	levelPreview: LevelPreview | null;
+	// The 360-panning preview of where the cursor would take you, shown whenever
+	// that destination is out of sight — behind geometry or on another storey.
+	reachPreview: ReachPreview | null;
 	// Arrival narration ("Archive · phased through the wall"); a rising `ts` lets
 	// the toast re-fire for repeat arrivals at the same node.
 	arrival: { name: string; verb: string; ts: number } | null;
 	sonarActive: boolean;
+	// Set once the cursor has rested on a discrete object long enough to ask what
+	// it is; null the moment the cursor moves off it.
+	inspect: ObjectInspect | null;
 	// Auto tour progress — which zone's centrepoint is being shown, out of how
 	// many. Null whenever the tour isn't running.
 	tour: { stop: number; stops: number; zone: string } | null;
@@ -174,6 +222,7 @@ export type OrbitState = {
 		currentLevel: number;
 		levels: Array<{
 			level: number;
+			name: string | null;
 			url: string;
 			aspect: number;
 			points: Array<{
@@ -205,9 +254,10 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	overlay: null,
 	exits: [],
 	preview: null,
-	levelPreview: null,
+	reachPreview: null,
 	arrival: null,
 	sonarActive: false,
+	inspect: null,
 	tour: null,
 	canGoBack: false,
 	trapped: false,

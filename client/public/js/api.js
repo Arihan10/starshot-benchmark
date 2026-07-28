@@ -242,6 +242,13 @@ export const api = {
         request(cellPath(slot, model, "/anchors"), { method: "POST", params: { run } }),
     tourAnchorsStatus: (run, slot, model) =>
         request(cellPath(slot, model, "/anchors"), { params: { run } }),
+    // Name (or re-name) a cell's FLOORS from its saved plan and write the names
+    // into the plan + any captured tour.json. One cheap LLM call over artifacts
+    // that already exist — a fresh plan names its floors itself, so this is the
+    // backfill path for tours captured before floor naming (no GPU re-capture).
+    // Re-publish afterwards to push the names to the viewer.
+    tourNameFloors: (run, slot, model) =>
+        request(cellPath(slot, model, "/tour/floors"), { method: "POST", params: { run } }),
     tourCaptureStart: (run, slot, model) =>
         request(cellPath(slot, model, "/tour/capture"), { method: "POST", params: { run } }),
     tourCaptureStatus: (run, slot, model) =>

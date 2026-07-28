@@ -1,15 +1,12 @@
 import {
-	BoxGeometry,
 	BufferGeometry,
 	ConeGeometry,
 	DoubleSide,
-	EdgesGeometry,
 	Group,
 	Line,
 	LineBasicMaterial,
 	LineDashedMaterial,
 	LineLoop,
-	LineSegments,
 	MathUtils,
 	Mesh,
 	MeshBasicMaterial,
@@ -45,6 +42,14 @@ export const NAV_COLORS: Record<EdgeType, number> = {
 	phase: 0xc9a6ff,
 	far: 0x9aa7b4,
 };
+// The surface cursor's colour when the destination is in PLAIN SIGHT — a neutral
+// light grey rather than the walk hue. The ring is on screen constantly, tracking
+// every surface under the pointer, so the one state that means "nothing to explain,
+// you can see the place you're about to go" should be the quietest thing in the
+// frame. Reaching an occluded destination doesn't recolour it: the ring is hidden
+// outright and the reach preview takes over (see the engine's updateCursorRing).
+export const CURSOR_CLEAR = 0xc4ccd6;
+
 export const NAV_RING_INNER = 0.2;
 export const NAV_RING_OUTER = 0.3;
 export const NAV_REST_OPACITY = 0.62; // affordances rest here, brightening toward the gaze — high enough to be findable off-axis
@@ -186,94 +191,6 @@ export function makeNavMarker(
 	group.userData.to = edge.to;
 	group.userData.type = edge.type;
 	group.userData.overlay = overlay;
-	return group;
-}
-
-// --- level waypoints --------------------------------------------------------
-// One red monolith per reachable floor, standing at that floor's most central
-// capture. It draws as an overlay — through the ceiling or floor that separates
-// you from it — so a single slab says "another storey is over there" without the
-// scene filling up with per-anchor markers. Deliberately monolithic: one shape,
-// one hue, a low-fill body, with crisp edges doing the legibility work so it
-// stays unmistakable without ever becoming visual clutter.
-export const LEVEL_COLOR = 0xff3b47;
-export const LEVEL_WIDTH = 0.62;
-export const LEVEL_HEIGHT = 2.15;
-export const LEVEL_DEPTH = 0.16;
-export const LEVEL_REST_FACTOR = 0.72; // resting fraction of each part's own opacity
-export const LEVEL_TARGET_PX = 70; // never reads smaller than roughly this on screen…
-export const LEVEL_MAX_SCALE = 2.2; // …and never balloons past this either
-
-// Each part keeps its own resting opacity in userData, so hover and the breathe
-// pulse can scale the whole slab by ONE factor without flattening the design to a
-// single uniform alpha (see MarkerLayer's setRelativeOpacity).
-function levelPart<T extends Object3D>(part: T, baseOpacity: number): T {
-	part.userData.baseOpacity = baseOpacity;
-	part.renderOrder = 7; // over every nav affordance (3/6), under sonar + the cursor
-	return part;
-}
-
-export function makeLevelWaypoint(up: boolean): Group {
-	const group = new Group();
-	const body = new Mesh(
-		new BoxGeometry(LEVEL_WIDTH, LEVEL_HEIGHT, LEVEL_DEPTH),
-		new MeshBasicMaterial({
-			color: LEVEL_COLOR,
-			transparent: true,
-			opacity: 0.24,
-			side: DoubleSide,
-			depthTest: false,
-			depthWrite: false,
-		}),
-	);
-	body.position.y = LEVEL_HEIGHT / 2;
-	const edges = new LineSegments(
-		new EdgesGeometry(body.geometry),
-		new LineBasicMaterial({
-			color: LEVEL_COLOR,
-			transparent: true,
-			opacity: 0.95,
-			depthTest: false,
-		}),
-	);
-	edges.position.y = LEVEL_HEIGHT / 2;
-	// A ring on the destination floor: proof the slab stands somewhere real.
-	const base = new Mesh(
-		new RingGeometry(LEVEL_WIDTH * 0.74, LEVEL_WIDTH, 48),
-		new MeshBasicMaterial({
-			color: LEVEL_COLOR,
-			transparent: true,
-			opacity: 0.8,
-			side: DoubleSide,
-			depthTest: false,
-			depthWrite: false,
-		}),
-	);
-	base.rotation.x = -Math.PI / 2;
-	// Which way that floor lies. It sits just off the broad face, and the slab
-	// yaws to face the eye every frame (MarkerLayer.updateLevels), so the glyph is
-	// never caught edge-on.
-	const glyph = new Mesh(
-		new ConeGeometry(LEVEL_WIDTH * 0.3, LEVEL_WIDTH * 0.5, 4),
-		new MeshBasicMaterial({
-			color: LEVEL_COLOR,
-			transparent: true,
-			opacity: 0.95,
-			side: DoubleSide,
-			depthTest: false,
-			depthWrite: false,
-		}),
-	);
-	glyph.rotation.y = Math.PI / 4; // present a flat face rather than an edge
-	if (!up) glyph.rotation.z = Math.PI;
-	glyph.position.set(0, LEVEL_HEIGHT * (up ? 0.68 : 0.32), LEVEL_DEPTH * 0.5 + 0.03);
-	group.add(
-		levelPart(body, 0.24),
-		levelPart(edges, 0.95),
-		levelPart(base, 0.8),
-		levelPart(glyph, 0.95),
-	);
-	group.renderOrder = 7;
 	return group;
 }
 

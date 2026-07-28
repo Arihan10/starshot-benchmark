@@ -61,6 +61,10 @@ export function buildMinimapState(args: {
 		}
 		return {
 			level: idx,
+			// The describer's name for this storey, so the floor control can say
+			// "Living & Pool Terrace" rather than "2" (see anchors.py). Null on tours
+			// captured before floors were described.
+			name: mm.name ?? null,
 			url: mm.url,
 			aspect: d > 0 ? w / d : 1,
 			points,

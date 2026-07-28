@@ -453,9 +453,37 @@ async function captureMinimapBlob(
     );
 }
 
+// The plan's described storey at height `y` — its name and its world-space volume
+// — matched by NEAREST Y rather than by index: the server clusters the planned
+// anchors into floors with the same rule used here (see anchors.py `group_floors` /
+// FLOOR_LEVEL_EPS), so the two groupings agree — but matching on height means a
+// drift degrades to one mislabelled slice instead of silently shifting every floor
+// by one. Empty when the plan carries no floors (an older plan) or the model
+// skipped this one; the viewer then falls back to its nearest-anchor reading.
+function floorSpecFor(floors, y) {
+    if (!Array.isArray(floors) || floors.length === 0) return {};
+    let best = null;
+    let bestD = Infinity;
+    for (const f of floors) {
+        const d = Math.abs((f?.y ?? 0) - y);
+        if (d < bestD) {
+            bestD = d;
+            best = f;
+        }
+    }
+    if (!best) return {};
+    const out = {};
+    if (typeof best.name === "string" && best.name) out.name = best.name;
+    const v = best.volume;
+    if (v && Array.isArray(v.origin) && Array.isArray(v.dimensions)) {
+        out.volume = { origin: v.origin, dimensions: v.dimensions };
+    }
+    return out;
+}
+
 // Group anchors by level, render + upload one slice per level, and return the
 // manifest `minimaps` array (empty on any failure — the tour stays valid).
-async function buildMinimaps(renderer, scene, positions, background, exposure, onLevel) {
+async function buildMinimaps(renderer, scene, positions, background, exposure, floors, onLevel) {
     if (positions.length === 0) return [];
     const box = new THREE.Box3().setFromObject(scene);
     if (box.isEmpty()) return [];
@@ -482,7 +510,16 @@ async function buildMinimaps(renderer, scene, positions, background, exposure, o
             exposure,
         );
         await uploadMinimap(`minimap-${li}`, blob);
-        minimaps.push({ level: li, y: levels[li].y, file: `minimap-${li}.png`, bounds });
+        minimaps.push({
+            level: li,
+            y: levels[li].y,
+            file: `minimap-${li}.png`,
+            bounds,
+            // The floor's name + world-space volume, so the walkthrough can title a
+            // storey rather than calling it "floor 2", and can decide which floor an
+            // arbitrary point belongs to (see the describer in anchors.py).
+            ...floorSpecFor(floors, levels[li].y),
+        });
     }
     return minimaps;
 }
@@ -846,6 +883,7 @@ async function runCapture() {
             panoMeta.map((p) => p.position),
             background,
             lighting.exposure ?? 1.0,
+            Array.isArray(manifest.floors) ? manifest.floors : [],
             (li, n) => progress(`rendering minimap ${li + 1}/${n}…`),
         );
         status(`minimaps: ${minimaps.length} level(s)`);
@@ -877,6 +915,10 @@ async function runCapture() {
         panos: panoMeta,
         minimaps,
         connectors: Array.isArray(manifest.connectors) ? manifest.connectors : [],
+        // Ids of the scene's DISCRETE objects (node_kind "object"), as opposed to
+        // the zone shells / ground geometry the encapsulating pass produced. The
+        // walkthrough only offers to inspect something on this list.
+        objects: Array.isArray(manifest.objects) ? manifest.objects : [],
     };
     const fin = await postFinish({ manifest: tourManifest, renderer: glName });
     if (fin.ok) {
