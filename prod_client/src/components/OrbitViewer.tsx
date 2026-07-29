@@ -143,12 +143,10 @@ export default function OrbitViewer({
 			<div ref={hostRef} className='absolute inset-0 bg-[#0c0d10]' />
 
 			{mode !== "empty" && mode !== "loading" && (
-				<div className='absolute left-4 top-4 z-10 flex flex-col gap-2'>
+				<div className='absolute left-4 top-4 z-20 flex flex-col gap-2'>
 					{minimap && (
 						<Minimap
 							minimap={minimap}
-							mapEdges={state.mapEdges}
-							visited={state.visited}
 							currentIndex={state.currentIndex}
 							viewedLevel={viewedLevel}
 							engine={engineRef}
@@ -160,7 +158,11 @@ export default function OrbitViewer({
 				</div>
 			)}
 
-			<div className='absolute right-4 top-4 z-10 flex flex-wrap justify-end gap-2'>
+			{/* The row wraps and is far wider than the buttons in it, so its empty
+			    space used to swallow clicks aimed at whatever lay underneath —
+			    notably the expanded minimap's collapse button. Only the buttons
+			    themselves take the pointer now. */}
+			<div className='pointer-events-none absolute right-4 top-4 z-10 flex flex-wrap justify-end gap-2 [&>*]:pointer-events-auto'>
 				{state.canProxyView && (
 					<ToolButton
 						active={state.proxyView}
@@ -391,20 +393,28 @@ function HoverCard({ preview }: { preview: HoverPreview }) {
 	);
 }
 
-const REACH_ACCENT = "#ffc46b"; // one hue for every out-of-sight destination
-const PANO_SCREEN_H = 240; // px: the preview "screen" height
-// One full 360 is drawn this wide. Being well past the panel's own width means at
-// most a third of the panorama is on screen at once, so the frame reads as a view
-// into the room rather than a whole equirect flattened out — and the wrap seam is
-// never visible twice in the same frame. Height follows the 2:1 aspect (900px) and
-// gets cropped to the screen, which lands the visible band on the horizon.
-const PANO_TILE_W = 1800;
+// The panel takes the hue of whatever opened it, so it always reads as an
+// extension of that affordance rather than as a third thing.
+const REACH_ACCENT = "#ffc46b"; // amber: out of sight on THIS floor
+const FLOOR_ACCENT = "#7ef2c2"; // green: a change of storey
+// Viewport-scaled, like the minimap: docked in a corner it can afford real size,
+// and a preview of a room you cannot see is the one thing here worth looking at.
+const PANO_SCREEN_W = "clamp(420px, 36vw, 760px)";
+const PANO_SCREEN_ASPECT = 2.4; // the "screen" is sized from the width, not fixed
+// One full 360 is drawn this many times the screen's own width, so only a slice of
+// the panorama is visible at once — 1/4.5, about 80° across — and the frame reads as
+// a wide view INTO the room rather than a whole equirect flattened out. Expressed as
+// a RATIO rather than a pixel width so the visible angle is the same at every panel
+// size: scale the panel and you get more pixels, not more panorama. The pan shifts
+// by exactly one tile (in cqw, against the card), which is what makes the wrap
+// invisible. Equirects are linear in angle, so the slice keeps the screen's aspect
+// and nothing is stretched.
+const PANO_TILE_RATIO = 4.5;
 
 const PANO_PAN_MS = 28000; // one full revolution of the panning 360
-const REACH_PANEL_GAP = 16; // px between the cursor and the panel's bottom edge
-const REACH_PANEL_MARGIN = 12; // px it always keeps clear of the viewport edges
+const REACH_DOCK_INSET = 16; // px from the top-right corner when docked
+const REACH_SLIDE_MS = 300; // the docked slide in / out
 const REACH_XFADE_MS = 260; // dissolve between two destinations
-const REACH_FADE_MS = 160; // the panel's own show / hide
 
 // One panorama layer inside the panel. Layers stack and cross-dissolve, so `key`
 // has to be unique per *appearance* rather than per pano — re-aiming back at a
@@ -463,32 +473,14 @@ function ReachPreviewPanel({ preview }: { preview: ReachPreview | null }) {
 		});
 	}
 
-	// Placement is owned entirely by pointermove, bound once — the node outlives
-	// every individual destination. No initial seed is needed: a reach only ever
-	// appears because the pointer just moved, so this has already run for that move
-	// by the time the panel is asked to show anything.
-	useEffect(() => {
-		const place = (x: number, y: number) => {
-			const el = ref.current;
-			if (!el) return;
-			const { offsetWidth: w, offsetHeight: h } = el;
-			const m = REACH_PANEL_MARGIN;
-			// Centred above the cursor, then held inside the viewport — a 600px card
-			// hung off a pointer near an edge would otherwise run off-screen.
-			const left = Math.min(
-				Math.max(x - w / 2, m),
-				Math.max(m, window.innerWidth - w - m),
-			);
-			const top = Math.min(
-				Math.max(y - h - REACH_PANEL_GAP, m),
-				Math.max(m, window.innerHeight - h - m),
-			);
-			el.style.transform = `translate3d(${left}px, ${top}px, 0)`;
-		};
-		const onMove = (e: PointerEvent) => place(e.clientX, e.clientY);
-		window.addEventListener("pointermove", onMove);
-		return () => window.removeEventListener("pointermove", onMove);
-	}, []);
+	// One place, whoever asked. Both the cursor's out-of-sight previews and the
+	// green floor arrows' dock to the same corner and slide in from off-frame: WHERE
+	// the panel appears should not depend on which affordance summoned it, or the eye
+	// has to re-find it every time. Only the accent differs, tying it back to the
+	// thing that opened it.
+	//
+	// Nothing here writes to the DOM directly, so nothing races React for the
+	// transform — the slide is a plain style toggle on `open`.
 
 	// Drop the outgoing layer once it is fully covered.
 	useEffect(() => {
@@ -503,24 +495,40 @@ function ReachPreviewPanel({ preview }: { preview: ReachPreview | null }) {
 	const open = !!preview;
 	const level = shown ? shown.level + 1 : 1;
 	const delta = shown?.levelDelta ?? 0;
+	// Keyed on the move, not on what opened the panel: green whenever the click
+	// changes storey, amber when it only goes somewhere you cannot see on this one.
+	const accent = delta !== 0 ? FLOOR_ACCENT : REACH_ACCENT;
 
 	return (
 		<div
 			ref={ref}
 			aria-hidden={!open}
-			className='pointer-events-none fixed left-0 top-0 z-30 w-[min(600px,70vw)] will-change-transform'
+			className='pointer-events-none fixed z-30 will-change-transform'
 			style={{
+				width: PANO_SCREEN_W,
+				right: REACH_DOCK_INSET,
+				top: REACH_DOCK_INSET,
 				opacity: open ? 1 : 0,
-				transition: `opacity ${REACH_FADE_MS}ms ease-out`,
+				// Slides clear of its own corner when closed, so it leaves the way it
+				// arrived rather than blinking out.
+				transform: open
+					? "translateX(0)"
+					: `translateX(calc(100% + ${REACH_DOCK_INSET * 2}px))`,
+				transition: `transform ${REACH_SLIDE_MS}ms cubic-bezier(0.22, 0.61, 0.36, 1), opacity ${REACH_SLIDE_MS}ms ease-out`,
 			}}
 		>
 			<div
 				className='overflow-hidden rounded-xl bg-neutral-950/85 shadow-2xl backdrop-blur'
-				style={{ border: `1px solid ${REACH_ACCENT}80` }}
+				style={{
+					border: `1px solid ${accent}80`,
+					// Everything inside sizes off the card's own width, so the panorama
+					// slice and the caption stay in proportion at any panel size.
+					containerType: "inline-size",
+				}}
 			>
 				<div
 					className='relative overflow-hidden bg-neutral-900'
-					style={{ height: PANO_SCREEN_H }}
+					style={{ aspectRatio: PANO_SCREEN_ASPECT }}
 				>
 					{layers.map((layer) => (
 						<div
@@ -532,9 +540,9 @@ function ReachPreviewPanel({ preview }: { preview: ReachPreview | null }) {
 									// filled the instant it opens and both pan together.
 									backgroundImage: `url(${layer.url}), url(${layer.placeholderUrl})`,
 									backgroundRepeat: "repeat-x",
-									backgroundSize: `${PANO_TILE_W}px auto`,
+									backgroundSize: `${PANO_TILE_RATIO * 100}% auto`,
 									backgroundPositionY: "50%",
-									"--pano-tile": `${PANO_TILE_W}px`,
+									"--pano-tile": `${PANO_TILE_RATIO * 100}cqw`,
 									animationName: "pano-pan, reach-layer-in",
 									animationDuration: `${PANO_PAN_MS}ms, ${REACH_XFADE_MS}ms`,
 									animationTimingFunction: "linear, ease-out",
@@ -550,22 +558,23 @@ function ReachPreviewPanel({ preview }: { preview: ReachPreview | null }) {
 					<div className='pointer-events-none absolute inset-x-0 top-0 h-14 bg-linear-to-b from-black/70 to-transparent' />
 					<span
 						className='absolute left-3 top-3 rounded px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-neutral-950'
-						style={{ background: REACH_ACCENT }}
+						style={{ background: accent }}
 					>
-						{delta > 0
-							? `▲ floor ${level}`
-							: delta < 0
-								? `▼ floor ${level}`
-								: "out of sight"}
+						{delta === 0
+							? "out of sight"
+							: `${delta > 0 ? "▲" : "▼"} floor ${level}`}
 					</span>
 				</div>
-				<div className='flex items-center justify-between gap-3 px-3 py-2'>
-					<span className='min-w-0 truncate text-sm font-semibold text-white'>
+				<div
+					className='flex items-center justify-between gap-2 px-3 py-2'
+					style={{ fontSize: "clamp(11px, 2.6cqw, 17px)" }}
+				>
+					<span className='min-w-0 truncate font-semibold text-white'>
 						{shown?.name ?? "unnamed"}
 					</span>
 					<span
-						className='shrink-0 text-[10px] uppercase tracking-wider'
-						style={{ color: REACH_ACCENT }}
+						className='shrink-0 text-[0.8em] uppercase tracking-wider'
+						style={{ color: accent }}
 					>
 						click to go
 						{shown && shown.dist < 100
@@ -812,10 +821,7 @@ function PlacesDrawer({
 							>
 								{n.name ?? `node ${n.index + 1}`}
 								{n.zone ? (
-									<span className='text-neutral-500'>
-										{" "}
-										· {n.zone}
-									</span>
+									<span className='text-neutral-500'> · {n.zone}</span>
 								) : null}
 							</button>
 						))
@@ -840,9 +846,7 @@ function ChapterList({
 	onGo: (index: number) => void;
 }) {
 	if (chapters.length === 0)
-		return (
-			<div className='px-2 py-1.5 text-xs text-neutral-500'>no zones</div>
-		);
+		return <div className='px-2 py-1.5 text-xs text-neutral-500'>no zones</div>;
 	return (
 		<>
 			<div className='mb-1 px-1 text-[9px] uppercase tracking-wider text-neutral-500'>
@@ -855,9 +859,7 @@ function ChapterList({
 					onClick={() => onGo(c.firstIndex)}
 					className='flex w-full items-center justify-between gap-2 rounded px-2 py-1.5 text-left text-xs text-neutral-200 transition hover:bg-cyan-500/20 hover:text-white'
 				>
-					<span className='min-w-0 truncate'>
-						{c.zone || "unzoned"}
-					</span>
+					<span className='min-w-0 truncate'>{c.zone || "unzoned"}</span>
 					<span className='shrink-0 text-[9px] tabular-nums text-neutral-500'>
 						{c.count}
 					</span>
@@ -892,22 +894,16 @@ function ObjectMenu({
 				</div>
 			)}
 			{menu.label && (
-				<MenuButton
-					onClick={() => engine.current?.toggleMenuTargetHidden()}
-				>
+				<MenuButton onClick={() => engine.current?.toggleMenuTargetHidden()}>
 					{menu.hidden ? "show" : "hide"}
 				</MenuButton>
 			)}
 			{menu.label && (
-				<MenuButton
-					onClick={() => engine.current?.toggleMenuTargetOutline()}
-				>
+				<MenuButton onClick={() => engine.current?.toggleMenuTargetOutline()}>
 					{menu.outlined ? "remove outline" : "highlight outline"}
 				</MenuButton>
 			)}
-			{menu.label && hasExtras && (
-				<div className='my-1 h-px bg-white/10' />
-			)}
+			{menu.label && hasExtras && <div className='my-1 h-px bg-white/10' />}
 			{menu.hiddenCount > 0 && (
 				<MenuButton onClick={() => engine.current?.showAllHidden()}>
 					show all ({menu.hiddenCount})
@@ -940,25 +936,49 @@ function MenuButton({
 	);
 }
 
+// The you-are-here view cone. Half-angle roughly matches what the walkthrough
+// actually shows, and the span is a multiple of the panel width so the gradient
+// fades out well before the element does — the cone reads as scattering off into
+// the distance rather than stopping at a boundary.
+const CONE_HALF_ANGLE = 33; // degrees either side of the facing direction
+const CONE_SPAN = 260; // % of the panel width; the wedge is square in px
+// Apex at the centre, opening toward +X (rotation 0 = world +X = map right, which
+// is the convention `facingDeg` is already in).
+const CONE_CLIP = `polygon(50% 50%, 100% ${
+	50 - 50 * Math.tan((CONE_HALF_ANGLE * Math.PI) / 180)
+}%, 100% ${50 + 50 * Math.tan((CONE_HALF_ANGLE * Math.PI) / 180)}%)`;
+
+// The map is fitted inside a box: it takes the smaller of the width cap and the
+// width its own aspect implies from the height cap, so a tall floor plan and a wide
+// one both sit inside the same envelope without either being cropped or stretched.
 const minimapWidth = (aspect: number, maxW: string, maxH: string) =>
 	`min(${maxW}, calc(${maxH} * ${aspect}))`;
-const MINIMAP_COMPACT = { w: "200px", h: "170px" };
-const MINIMAP_EXPANDED = { w: "min(48vw, 640px)", h: "min(66vh, 640px)" };
 
-// Layer 3: the bird's-eye minimap. Now with a live you-are-here facing cone,
-// visited/unvisited fills, dashed phase edge lines (the map never lies), and a
-// re-anchoring flash after every arrival.
+// Both envelopes are viewport-relative rather than fixed, so the map keeps its
+// share of the frame instead of shrinking into irrelevance on a large display and
+// crowding out the scene on a small one. Clamped at both ends: below the floor the
+// zone names stop being readable, and above the ceiling a "small" map is no longer
+// small. Note vw/vh are WINDOW units, so in the side-by-side workspace both viewers
+// size to the window rather than to their own half — which is what you want, since
+// entering one expands it to the full width anyway.
+const MINIMAP_COMPACT = {
+	w: "clamp(240px, 24vw, 460px)",
+	h: "clamp(200px, 26vh, 400px)",
+};
+const MINIMAP_EXPANDED = {
+	w: "clamp(420px, 56vw, 900px)",
+	h: "clamp(340px, 72vh, 820px)",
+};
+
+// Layer 3: the bird's-eye minimap — the storey's slice, the zone names printed on
+// it, a live you-are-here facing cone, and a re-anchoring flash after arrival.
 function Minimap({
 	minimap,
-	mapEdges,
-	visited,
 	currentIndex,
 	viewedLevel,
 	engine,
 }: {
 	minimap: NonNullable<OrbitState["minimap"]>;
-	mapEdges: OrbitState["mapEdges"];
-	visited: number[];
 	currentIndex: number;
 	// Read-only here: the floor rail owns which storey is being shown.
 	viewedLevel: number;
@@ -988,14 +1008,6 @@ function Minimap({
 	useFacingLoop(engine, spin);
 
 	const view = levels[viewedLevel] ?? levels[currentLevel];
-	const visitedSet = useMemo(() => new Set(visited), [visited]);
-	const ptByIndex = useMemo(() => {
-		const m = new Map<number, { left: number; top: number }>();
-		if (view)
-			for (const p of view.points)
-				m.set(p.index, { left: p.leftPct, top: p.topPct });
-		return m;
-	}, [view]);
 	if (!view) return null;
 	const caps = expanded ? MINIMAP_EXPANDED : MINIMAP_COMPACT;
 	const onCurrentFloor = view.level === currentLevel;
@@ -1020,76 +1032,64 @@ function Minimap({
 					</button>
 				</div>
 			</div>
+			{/* The whole slice is a travel surface: click anywhere and you go to the
+			    nearest capture to that spot on the floor being shown. The map already
+			    reads as a plan of somewhere you can be, so making only the labels
+			    clickable meant most of it looked live and wasn't. */}
 			<div
-				className='relative overflow-hidden rounded'
+				onClick={(e) => {
+					const r = e.currentTarget.getBoundingClientRect();
+					if (!r.width || !r.height) return;
+					const left = ((e.clientX - r.left) / r.width) * 100;
+					const top = ((e.clientY - r.top) / r.height) * 100;
+					// Nearest capture in PERCENT space, with the horizontal axis
+					// weighted by the slice's aspect. The two axes span different
+					// numbers of metres, so comparing raw percentages would bias the
+					// pick along whichever axis the floor happens to be longer in;
+					// scaling by width/depth restores the true ordering without the
+					// state needing to carry world bounds at all.
+					let index = -1;
+					let best = Infinity;
+					for (const pt of view.points) {
+						const dx = (pt.leftPct - left) * view.aspect;
+						const dy = pt.topPct - top;
+						const d = dx * dx + dy * dy;
+						if (d < best) {
+							best = d;
+							index = pt.index;
+						}
+					}
+					if (index >= 0) engine.current?.traverseTo(index);
+				}}
+				title='click anywhere to travel there'
+				className='relative cursor-pointer overflow-hidden rounded'
 				style={{
 					width: minimapWidth(view.aspect, caps.w, caps.h),
 					aspectRatio: view.aspect,
+					// Names size off the MAP, not the window: the box is aspect-fitted
+					// inside its envelope, so its real width is often the height cap
+					// times the floor's aspect and has no fixed relation to vw. A query
+					// container lets the labels read that resolved width directly, and
+					// keeps them proportional through the expand as well.
+					containerType: "inline-size",
 				}}
 			>
+				{/* Blown up and offset so the storey's own crop rect exactly fills the
+				    box; the container clips the rest. Same stretch-to-fit semantics as
+				    the old object-fill, just applied to a sub-rectangle. */}
 				{/* eslint-disable-next-line @next/next/no-img-element -- runtime R2 slice via /r2 proxy */}
 				<img
 					src={view.url}
 					alt='scene from above'
 					draggable={false}
-					className='absolute inset-0 h-full w-full object-fill'
+					className='absolute max-w-none'
+					style={{
+						width: `${100 / (view.crop.u1 - view.crop.u0)}%`,
+						height: `${100 / (view.crop.v1 - view.crop.v0)}%`,
+						left: `${(-100 * view.crop.u0) / (view.crop.u1 - view.crop.u0)}%`,
+						top: `${(-100 * view.crop.v0) / (view.crop.v1 - view.crop.v0)}%`,
+					}}
 				/>
-				<svg
-					className='pointer-events-none absolute inset-0 h-full w-full'
-					viewBox='0 0 100 100'
-					preserveAspectRatio='none'
-				>
-					{mapEdges.map((e, i) => {
-						// Portal (orange) edges swamp the minimap into unreadability; the
-						// doorway affordance already lives in-scene, so keep it off the map.
-						if (e.type === "portal") return null;
-						const a = ptByIndex.get(e.a);
-						const b = ptByIndex.get(e.b);
-						if (!a || !b) return null;
-						return (
-							<line
-								key={i}
-								x1={a.left}
-								y1={a.top}
-								x2={b.left}
-								y2={b.top}
-								stroke={EDGE_META[e.type].color}
-								strokeWidth={0.5}
-								strokeOpacity={0.5}
-								strokeDasharray={
-									e.type === "phase" ? "2 2" : undefined
-								}
-								vectorEffect='non-scaling-stroke'
-							/>
-						);
-					})}
-				</svg>
-				{view.points.map((pt) => {
-					const seen = visitedSet.has(pt.index);
-					return (
-						<button
-							key={pt.index}
-							type='button'
-							title={pt.name ?? pt.id}
-							onClick={() => engine.current?.traverseTo(pt.index)}
-							style={{
-								left: `${pt.leftPct}%`,
-								top: `${pt.topPct}%`,
-							}}
-							className={`absolute -translate-x-1/2 -translate-y-1/2 rounded-full border transition ${
-								pt.current
-									? `${expanded ? "h-3.5 w-3.5" : "h-2.5 w-2.5"} border-white bg-cyan-400 ${
-											flash
-												? "shadow-[0_0_10px_4px_rgba(34,211,238,0.95)]"
-												: "shadow-[0_0_6px_2px_rgba(34,211,238,0.7)]"
-										}`
-									: seen
-										? `${expanded ? "h-3 w-3" : "h-2 w-2"} border-white/70 bg-cyan-300/70 hover:scale-125`
-										: `${expanded ? "h-3 w-3" : "h-2 w-2"} border-white/50 bg-transparent hover:scale-125 hover:bg-cyan-300/60`
-							}`}
-						/>
-					);
-				})}
 				{onCurrentFloor && (
 					<div
 						ref={coneRef}
@@ -1097,14 +1097,73 @@ function Minimap({
 						style={{
 							left: `${view.points.find((p) => p.current)?.leftPct ?? 50}%`,
 							top: `${view.points.find((p) => p.current)?.topPct ?? 50}%`,
-							width: 0,
-							height: 0,
-							borderTop: "7px solid transparent",
-							borderBottom: "7px solid transparent",
-							borderLeft: "13px solid rgba(34,211,238,0.7)",
+							// A view cone cast from the marker rather than a glyph beside
+							// it. The old solid triangle stated a length the camera does
+							// not have — sight runs until something stops it — so this is
+							// a wedge whose light simply thins out with distance and never
+							// resolves into an edge. Sized well past the panel so the
+							// falloff, not the element, is what ends it.
+							width: `${CONE_SPAN}%`,
+							aspectRatio: 1,
+							clipPath: CONE_CLIP,
+							background:
+								"radial-gradient(circle at 50% 50%, rgba(214,222,232,0.50) 0%, rgba(214,222,232,0.28) 18%, rgba(214,222,232,0.10) 42%, rgba(214,222,232,0) 72%)",
+							// Screen, so the cone BRIGHTENS the plan under it instead of
+							// laying an opaque wash over it — the floor stays readable
+							// through the thing describing where you are looking.
+							mixBlendMode: "screen",
+							transform: "translate(-50%, -50%)",
 						}}
 					/>
 				)}
+				{/* Zone NAMES, not a web of dots. The dots were one marker per
+				    capture with a line to every neighbour — on a 200px map that is a
+				    tangle nobody can read a room out of. A handful of names answers
+				    the only question the map is actually asked ("what is over
+				    there?"), and clicking one travels to the nearest capture in it.
+				    Which zones get named is decided upstream by the map labeller, so
+				    no label ever sits inside another (see anchors.py). */}
+				{view.labels.map((lab) => (
+					<button
+						key={lab.id}
+						type='button'
+						title={`go to ${lab.label}`}
+						onClick={(e) => {
+							e.stopPropagation(); // the surface below would re-resolve it
+							engine.current?.traverseTo(lab.index);
+						}}
+						style={{
+							left: `${lab.leftPct}%`,
+							top: `${lab.topPct}%`,
+							// Floors so a crowded compact map stays legible, ceiling so an
+							// expanded one doesn't turn into signage.
+							fontSize: "clamp(9px, 4.2cqw, 17px)",
+							// A slice is a lit render, so a name over it needs its own
+							// contrast rather than borrowing the map's.
+							textShadow: "0 1px 3px rgba(0,0,0,0.95), 0 0 8px rgba(0,0,0,0.8)",
+						}}
+						className='absolute -translate-x-1/2 -translate-y-1/2 whitespace-nowrap rounded px-1 py-0.5 text-center font-medium leading-tight text-white/95 transition hover:bg-cyan-400/25 hover:text-white'
+					>
+						{lab.label}
+					</button>
+				))}
+				{/* Only the capture you are standing on keeps a dot: it is the one
+				    thing on the map that is about you rather than about the scene. */}
+				{view.points
+					.filter((pt) => pt.current)
+					.map((pt) => (
+						<span
+							key={pt.index}
+							style={{ left: `${pt.leftPct}%`, top: `${pt.topPct}%` }}
+							className={`pointer-events-none absolute -translate-x-1/2 -translate-y-1/2 rounded-full border border-white bg-cyan-400 ${
+								expanded ? "h-3.5 w-3.5" : "h-2.5 w-2.5"
+							} ${
+								flash
+									? "shadow-[0_0_10px_4px_rgba(34,211,238,0.95)]"
+									: "shadow-[0_0_6px_2px_rgba(34,211,238,0.7)]"
+							}`}
+						/>
+					))}
 				{!onCurrentFloor && (
 					<div className='pointer-events-none absolute bottom-1 left-1 rounded bg-black/65 px-1 py-0.5 text-[8px] uppercase tracking-wider text-cyan-200'>
 						floor {view.level + 1} · you are on {currentLevel + 1}

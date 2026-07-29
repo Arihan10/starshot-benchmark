@@ -60,6 +60,11 @@ export type TourManifest = {
 		file: string;
 		name?: string; // POI label from the anchor namer; absent for unnamed anchors
 		zone?: string; // the zone this capture point belongs to (assigned server-side)
+		// Which storey this capture stands on, decided once by the floor planner
+		// (anchors.py) and carried through the capture. Absent on tours captured
+		// before the split was planned, where the engine falls back to matching the
+		// nearest slice by height.
+		level?: number;
 	}>;
 	proxy?: string;
 	minimaps?: MinimapLevel[];
@@ -68,6 +73,10 @@ export type TourManifest = {
 	// shells, ground, cliff backdrops). An allow-list: an id absent from it is
 	// never offered for inspection, so an unclassifiable node fails closed.
 	objects?: string[];
+	// Zone names to print on the bird's-eye map, chosen by the map labeller and
+	// already pruned so no label sits inside another (see anchors.py
+	// `label_map_zones`). `center` is the world centre of the zone's bbox.
+	map_labels?: Array<{ id: string; label: string; center: [number, number, number] }>;
 	// Cross-zone connectors from the anchor planner (doors, stairs, ...): each
 	// names an object `id`, the `starting_zone` it sits in, and the `target_zone`
 	// it leads into. The matching proxy object is highlighted + click-to-traverse.
@@ -110,11 +119,13 @@ export type HoverPreview = {
 	headingU: number;
 };
 
-// The big preview for a destination you CANNOT currently see — whether it is
-// behind a wall or on another storey. Those two were separate affordances (an
-// orange cursor with a waypoint, and a red floor panel) until it became clear they
-// answer the same question: the click reaches somewhere out of sight, so show what
-// is there. One preview now serves both.
+// The big preview, shown ONLY for a click that changes storey.
+//
+// It briefly covered every out-of-sight destination, walls included, which was too
+// much: not being able to see round a wall is a small question you can answer by
+// looking, and a panel opening over the view to answer it outweighed the problem.
+// A floor change is different — you have no way to picture where you are about to
+// be — so the panel is spent there, and the amber cursor handles the rest.
 //
 // It follows the nearest anchor to the cursor, so it re-targets continuously as the
 // pointer moves; the panel itself never unmounts and cross-dissolves between
@@ -128,10 +139,12 @@ export type ReachPreview = {
 	placeholderUrl: string; // instant blurred backdrop while the full image loads
 	dist: number; // metres from the eye to the destination
 	level: number; // destination floor, 0-based (-1 when unknown)
-	levelDelta: number; // storeys crossed, signed; 0 when staying on this floor
-	// No screen position: the panel tracks pointermove itself, and a reach only ever
-	// appears in response to the pointer having just moved, so it is already in the
-	// right place by the time this arrives.
+	levelDelta: number; // storeys crossed, signed; never 0 (this only shows for floors)
+	// There is deliberately no record of WHAT opened this. Everything docks in the
+	// same corner, and the colour follows `levelDelta` — the kind of MOVE — rather
+	// than the affordance, so a floor change is green whether you found it by
+	// pointing or by hovering an arrow, and a hop through a wall is amber either
+	// way. One idea, one colour.
 };
 
 // A dwell-revealed look at one object, rendered as a slowly orbiting inset so you
@@ -224,7 +237,15 @@ export type OrbitState = {
 			level: number;
 			name: string | null;
 			url: string;
+			// Aspect and every percentage below are relative to the CROP, not to the
+			// whole slice — see `crop`.
 			aspect: number;
+			// The sub-rectangle of the slice image this storey actually occupies, as
+			// image fractions. Slices are all rendered over the whole scene footprint,
+			// so a floor that fills one wing was drawn adrift in a sea of the storeys
+			// around it (the top floor here used 26% of its own map). The floor's
+			// described volume gives its real extent, so the chrome shows just that.
+			crop: { u0: number; v0: number; u1: number; v1: number };
 			points: Array<{
 				index: number;
 				id: string;
@@ -232,6 +253,16 @@ export type OrbitState = {
 				leftPct: number;
 				topPct: number;
 				current: boolean;
+			}>;
+			// Zone names printed on this storey's slice, placed as 0-100% offsets.
+			// `index` is the nearest capture to that zone's centre, so a label is
+			// also the way to travel there.
+			labels: Array<{
+				id: string;
+				label: string;
+				leftPct: number;
+				topPct: number;
+				index: number;
 			}>;
 		}>;
 	} | null;

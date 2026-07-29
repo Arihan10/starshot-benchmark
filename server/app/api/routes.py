@@ -3537,11 +3537,18 @@ def _plan_from_tour(run: str, slot: str, model: str) -> dict[str, Any] | None:
         "connectors": tour.get("connectors") or [],
         # The capture's minimap slices ARE the floors, carrying whatever name +
         # volume the describer gave them — so a plan rebuilt from a tour keeps them.
+        "map_labels": tour.get("map_labels") or [],
+        # `cut` is the height each slice was actually rendered at, recorded by the
+        # capture — so a plan rebuilt here re-cuts where the last one did. The
+        # anchor MEMBERSHIP can't be recovered this way (a slice doesn't record
+        # which captures stood on it), so a rebuilt plan carries none and the
+        # capture falls back to clustering for its grouping.
         "floors": [
             {
                 "level": m.get("level"),
                 "y": m.get("y"),
                 "name": m.get("name"),
+                "cut": m.get("cut"),
                 "volume": m.get("volume"),
             }
             for m in (tour.get("minimaps") or [])
@@ -3580,6 +3587,7 @@ def _plan_payload(
     reasoning: str,
     names: dict[int, str],
     floors: list[anchors_svc.Floor],
+    map_labels: list[anchors_svc.MapLabel],
 ) -> dict[str, Any]:
     """The canonical plan shape, shared by the standalone planner and the capture.
     Anchor ids are the CAPTURE ids (`anchor-NNN`) so a saved plan drops straight
@@ -3595,6 +3603,7 @@ def _plan_payload(
         ],
         "connectors": [c.model_dump() for c in connectors],
         "floors": [_floor_dict(f) for f in floors],
+        "map_labels": [m.model_dump() for m in map_labels],
     }
 
 
@@ -3626,6 +3635,23 @@ def _inspectable_object_ids(slot_log: SlotLog) -> list[str]:
     return ids
 
 
+def _apply_map_labels(run: str, slot: str, model: str, labels: list[dict[str, Any]]) -> bool:
+    """Write the map's zone labels into an already-captured tour.json, so a tour
+    rendered before they existed picks them up without a GPU re-capture."""
+    tour_json = _cell_tour_dir(run, slot, model) / "tour.json"
+    if not tour_json.is_file():
+        return False
+    try:
+        tour = json.loads(tour_json.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 - a torn tour.json is simply not patchable
+        return False
+    tour["map_labels"] = labels
+    tmp = tour_json.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(tour), encoding="utf-8")
+    tmp.replace(tour_json)
+    return True
+
+
 def _apply_objects(run: str, slot: str, model: str, objects: list[str]) -> bool:
     """Write the inspectable-object list into an already-captured tour.json, so a
     tour rendered before object kinds were published picks them up without a GPU
@@ -3645,10 +3671,21 @@ def _apply_objects(run: str, slot: str, model: str, objects: list[str]) -> bool:
 
 
 def _floor_dict(f: anchors_svc.Floor) -> dict[str, Any]:
-    """One floor as it travels: identity, the describer's name, and its volume as
-    an {origin, dimensions} pair (absent when the describer gave nothing usable —
-    the viewer then falls back to its nearest-anchor floor reading)."""
-    out: dict[str, Any] = {"level": f.level, "y": f.y, "name": f.name}
+    """One floor as it travels: identity, the planner's name, the height its map is
+    cut at, WHICH captures stand on it, and its volume as an {origin, dimensions}
+    pair (absent when the planner gave nothing usable and the clustering fallback
+    ran — the viewer then falls back to its nearest-anchor floor reading).
+
+    `anchors` is what lets the capture stop re-deriving the grouping: the split is
+    decided once, here, and shipped. A plan rebuilt from an old tour.json carries no
+    membership, and the capture falls back to clustering for those."""
+    out: dict[str, Any] = {
+        "level": f.level,
+        "y": f.y,
+        "name": f.name,
+        "cut": f.cut,
+        "anchors": list(f.anchors),
+    }
     if f.origin is not None and f.dimensions is not None:
         out["volume"] = {"origin": list(f.origin), "dimensions": list(f.dimensions)}
     return out
@@ -3660,7 +3697,12 @@ def _apply_floor_specs(
     """Write floor names + volumes into an ALREADY-captured tour.json, matching each
     described storey onto a bird's-eye slice by nearest Y (the same match the viewer
     makes). Lets a tour rendered before floor description existed pick both up
-    without re-running the GPU capture. False when there's nothing to patch."""
+    without re-running the GPU capture. False when there's nothing to patch.
+
+    The map CUT is deliberately left alone. A name and a volume are facts about the
+    storey and can be corrected on an old tour; the cut is a fact about how the
+    slice IMAGE was rendered, and writing a new one over an image made at the old
+    height would simply be untrue. It changes on the next capture, which re-renders."""
     tour_json = _cell_tour_dir(run, slot, model) / "tour.json"
     if not tour_json.is_file() or not floors:
         return False
@@ -3753,7 +3795,8 @@ async def _run_tour_capture(
             )
             if not anchors:
                 raise RuntimeError("anchor planner returned no anchors")
-            plan = _plan_payload(anchors, connectors, reasoning, names, floors)
+            labels = await anchors_svc.label_map_zones(nodes)
+            plan = _plan_payload(anchors, connectors, reasoning, names, floors, labels)
         anchor_dicts = plan["anchors"]
         job["total"] = len(anchor_dicts)
 
@@ -3775,6 +3818,7 @@ async def _run_tour_capture(
             "connectors": plan.get("connectors") or [],
             "floors": plan.get("floors") or [],
             "objects": _inspectable_object_ids(_require_slot_log(run, slot, model)),
+            "map_labels": plan.get("map_labels") or [],
             "planner_model": plan.get("planner_model"),
             "namer_model": plan.get("namer_model"),
             "planner_reasoning": plan.get("reasoning"),
@@ -3844,7 +3888,8 @@ async def _run_anchor_plan(run: str, slot: str, model: str, nodes: list[Node]) -
         )
         if not anchors:
             raise RuntimeError("anchor planner returned no anchors")
-        plan = _plan_payload(anchors, connectors, reasoning, names, floors)
+        labels = await anchors_svc.label_map_zones(nodes)
+        plan = _plan_payload(anchors, connectors, reasoning, names, floors, labels)
         # Persist the moment planning succeeds: it's the expensive half, and from
         # here on it's a durable artifact a capture can render from later — even if
         # this process dies before anything is rendered.
@@ -5123,14 +5168,18 @@ def create_app() -> FastAPI:
         return _anchor_status(run, slot_id, model_alias)
 
     @app.post("/slots/{slot_id}/{model_alias}/tour/floors")
-    async def tour_describe_floors(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
-        """Describe (or re-describe) this cell's floors from its SAVED plan — name +
-        world-space volume — and write them into both the plan and any captured
-        tour.json. One cheap LLM call over artifacts that already exist: no
-        planning, no rendering, so a tour captured before floors were described
-        gains them without a GPU re-capture. A fresh plan describes its floors
-        already, so this is the backfill / redo path. Re-publish afterwards to push
-        them to the viewer."""
+    async def tour_plan_floors(slot_id: str, model_alias: str, run: str | None = None) -> dict[str, object]:  # pyright: ignore[reportUnusedFunction]
+        """Re-plan this cell's floors from its SAVED anchor plan: where the scene
+        divides into storeys, each one's name, box and map cut, and which captures
+        stand on it. Written into both the plan and any captured tour.json.
+
+        One cheap LLM call over artifacts that already exist — no anchor planning,
+        no rendering — so a tour captured before any of this gains it without a GPU
+        re-capture. A fresh plan does this itself, so this is the backfill / redo
+        path, and the one to run after changing anything about how floors are
+        decided. Note the map CUTS only take effect on the next capture, since the
+        existing slice images were rendered at the old heights. Re-publish
+        afterwards to push the rest to the viewer."""
         run = _resolve_run(run)
         slot_log = _require_slot_log(run, slot_id, model_alias)
         plan = await asyncio.to_thread(_load_anchor_plan, run, slot_id, model_alias)
@@ -5145,8 +5194,7 @@ def create_app() -> FastAPI:
             for a in planned
         ]
         names = {i: a["name"] for i, a in enumerate(planned) if a.get("name")}
-        floors = anchors_svc.group_floors(anchors)
-        await anchors_svc.describe_floors(nodes, anchors, floors, names)
+        floors = await anchors_svc.plan_floors(nodes, anchors, names)
         plan["floors"] = [_floor_dict(f) for f in floors]
         await asyncio.to_thread(_save_anchor_plan, run, slot_id, model_alias, plan)
         patched = await asyncio.to_thread(
@@ -5154,9 +5202,14 @@ def create_app() -> FastAPI:
         )
         objects = _inspectable_object_ids(slot_log)
         await asyncio.to_thread(_apply_objects, run, slot_id, model_alias, objects)
+        labels = [m.model_dump() for m in await anchors_svc.label_map_zones(nodes)]
+        plan["map_labels"] = labels
+        await asyncio.to_thread(_save_anchor_plan, run, slot_id, model_alias, plan)
+        await asyncio.to_thread(_apply_map_labels, run, slot_id, model_alias, labels)
         return {
             "floors": plan["floors"],
             "objects": len(objects),
+            "map_labels": labels,
             "tour_updated": patched,
         }
 
@@ -5301,12 +5354,24 @@ def create_app() -> FastAPI:
             # Discrete objects (not zone shells / frames) — the viewer only offers
             # to inspect something that is genuinely a thing.
             "objects": state["objects"],
+            # Zone names to print on the bird's-eye map, already pruned so no label
+            # sits inside another (see anchors.py label_map_zones).
+            "map_labels": state["map_labels"],
             "planner_model": state["planner_model"],
             "namer_model": state["namer_model"],
             "planner_reasoning": state["planner_reasoning"],
             # High-res 360 capture: 6 cube faces at `face_size`² → equirect `width`.
             "pano": {"face_size": 1024, "width": 4096, "quality": 0.92},
-            "minimap": {"res": 1024, "level_eps": 1.5, "pad_frac": 0.04, "slice_below": 2.0},
+            # Bird's-eye slice knobs. `level_eps` is the SAME constant the floor
+            # clustering above used (anchors_svc.FLOOR_LEVEL_EPS), not a copy of its
+            # value — the capture groups anchors into slices independently, so if the
+            # two numbers ever differed a floor's name would land on the wrong slice.
+            "minimap": {
+                "res": 1024,
+                "level_eps": anchors_svc.FLOOR_LEVEL_EPS,
+                "pad_frac": 0.04,
+                "slice_below": 2.0,
+            },
         }
 
     @app.post("/runs/{run}/tour/capture/{slot}/{model}/beat")

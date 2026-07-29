@@ -60,10 +60,34 @@ const MESH_BUNDLE_MAGIC = "SMB1";
 const DEFAULT_FACE_SIZE = 1024; // device px per cube face
 const DEFAULT_PANO_WIDTH = 4096; // equirect output width cap (height = width / 2)
 const DEFAULT_JPEG_QUALITY = 0.92;
-const MINIMAP_LEVEL_EPS = 1.5; // metres; anchors within this Y gap share a level
-const MINIMAP_RES = 1024; // longest output side in device px
-const MINIMAP_PAD_FRAC = 0.04; // breathing room around the scene footprint
-const MINIMAP_SLICE_BELOW = 2; // metres below the level's lowest anchor for the floor cut
+// Bird's-eye minimap knobs. These are FALLBACKS only: the manifest carries the
+// values the server actually used, and `readMinimapOpts` prefers those. In
+// particular the level gap is the server's own FLOOR_LEVEL_EPS (anchors.py), so
+// the floors it named and the slices we cut here can no longer drift apart —
+// which is what the old hardcoded twin of that constant risked every time either
+// side was retuned.
+const DEFAULT_MINIMAP_LEVEL_EPS = 1.5; // metres; anchors within this Y gap share a level
+const DEFAULT_MINIMAP_RES = 1024; // longest output side in device px
+const DEFAULT_MINIMAP_PAD_FRAC = 0.04; // breathing room around the scene footprint
+const DEFAULT_MINIMAP_SLICE_BELOW = 2; // metres below the level's lowest anchor for the floor cut
+
+// One numeric manifest knob, with its fallback. Deliberately not `||`: a
+// legitimate 0 (slice_below: 0 cuts exactly at the lowest anchor) must survive,
+// while a missing or non-numeric field from a partial manifest still falls back.
+function num(value, fallback) {
+    return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+// The manifest's `minimap` block, resolved against the defaults above.
+function readMinimapOpts(manifest) {
+    const m = manifest.minimap || {};
+    return {
+        levelEps: num(m.level_eps, DEFAULT_MINIMAP_LEVEL_EPS),
+        res: num(m.res, DEFAULT_MINIMAP_RES),
+        padFrac: num(m.pad_frac, DEFAULT_MINIMAP_PAD_FRAC),
+        sliceBelow: num(m.slice_below, DEFAULT_MINIMAP_SLICE_BELOW),
+    };
+}
 
 // forward/up per face; right = cross(forward, up) — matches what lookAt builds,
 // so the analytic projection in the stitch agrees with the render exactly.
@@ -355,7 +379,9 @@ async function stitchPanoBlob(faces, faceSize, widthCap, quality, onProgress) {
 // --- bird's-eye minimap slices (one per Y level) -----------------------------
 
 // Cluster anchor Ys into levels by gap; returns [{ y, minY, indices }] low→high.
-function groupAnchorLevels(positions) {
+// `levelEps` is the server's own floor-clustering gap (see readMinimapOpts), so
+// these slices match the floors it named.
+function groupAnchorLevels(positions, levelEps) {
     const order = positions
         .map((_, i) => i)
         .sort((a, b) => positions[a][1] - positions[b][1]);
@@ -363,7 +389,7 @@ function groupAnchorLevels(positions) {
     let cur = null;
     for (const i of order) {
         const y = positions[i][1];
-        if (!cur || y - cur.lastY > MINIMAP_LEVEL_EPS) {
+        if (!cur || y - cur.lastY > levelEps) {
             cur = { indices: [], ys: [], lastY: y };
             groups.push(cur);
         }
@@ -390,6 +416,7 @@ async function captureMinimapBlob(
     yBot,
     background,
     exposure,
+    res,
 ) {
     const W = bounds.maxX - bounds.minX;
     const D = bounds.maxZ - bounds.minZ;
@@ -399,11 +426,11 @@ async function captureMinimapBlob(
     let pw;
     let ph;
     if (W >= D) {
-        pw = MINIMAP_RES;
-        ph = Math.max(1, Math.round((MINIMAP_RES * D) / W));
+        pw = res;
+        ph = Math.max(1, Math.round((res * D) / W));
     } else {
-        ph = MINIMAP_RES;
-        pw = Math.max(1, Math.round((MINIMAP_RES * W) / D));
+        ph = res;
+        pw = Math.max(1, Math.round((res * W) / D));
     }
 
     const cam = new THREE.OrthographicCamera(-W / 2, W / 2, D / 2, -D / 2, 0.1, yTop - yBot + 4);
@@ -453,13 +480,24 @@ async function captureMinimapBlob(
     );
 }
 
-// The plan's described storey at height `y` — its name and its world-space volume
-// — matched by NEAREST Y rather than by index: the server clusters the planned
-// anchors into floors with the same rule used here (see anchors.py `group_floors` /
-// FLOOR_LEVEL_EPS), so the two groupings agree — but matching on height means a
-// drift degrades to one mislabelled slice instead of silently shifting every floor
-// by one. Empty when the plan carries no floors (an older plan) or the model
-// skipped this one; the viewer then falls back to its nearest-anchor reading.
+// The storey's published fields — its name and world-space volume — pulled off one
+// of the plan's floors. Empty when the plan has none (an older plan) or the model
+// skipped it; the viewer then falls back to its nearest-anchor reading.
+function floorFields(floor) {
+    const out = {};
+    if (!floor) return out;
+    if (typeof floor.name === "string" && floor.name) out.name = floor.name;
+    const v = floor.volume;
+    if (v && Array.isArray(v.origin) && Array.isArray(v.dimensions)) {
+        out.volume = { origin: v.origin, dimensions: v.dimensions };
+    }
+    return out;
+}
+
+// The plan's storey nearest height `y`. Only needed on the FALLBACK path, where we
+// had to cluster the anchors ourselves and so have no direct link from a slice back
+// to the floor it came from. Matching on height means a drift degrades to one
+// mislabelled slice rather than silently shifting every floor by one.
 function floorSpecFor(floors, y) {
     if (!Array.isArray(floors) || floors.length === 0) return {};
     let best = null;
@@ -471,54 +509,98 @@ function floorSpecFor(floors, y) {
             best = f;
         }
     }
-    if (!best) return {};
-    const out = {};
-    if (typeof best.name === "string" && best.name) out.name = best.name;
-    const v = best.volume;
-    if (v && Array.isArray(v.origin) && Array.isArray(v.dimensions)) {
-        out.volume = { origin: v.origin, dimensions: v.dimensions };
+    return floorFields(best);
+}
+
+// The levels to slice, TAKEN FROM THE PLAN. The server decides where the scene
+// divides into storeys (anchors.py `plan_floors`, a model call reading the scene
+// rather than a gap threshold), assigns every capture to one, and ships both — so
+// there is one grouping in the system instead of the same rule implemented twice
+// and kept in step by hand.
+//
+// Returns null when the plan can't drive this: it has no floors, or it was rebuilt
+// from an old tour.json and so carries no membership. The caller then clusters, as
+// it always did.
+function planLevels(floors, positions, sliceBelow) {
+    if (!Array.isArray(floors) || floors.length === 0) return null;
+    const out = [];
+    for (const f of floors) {
+        if (!f || !Array.isArray(f.anchors)) return null;
+        const indices = f.anchors.filter(
+            (i) => Number.isInteger(i) && i >= 0 && i < positions.length,
+        );
+        if (indices.length === 0) return null; // a storey with no captures can't be sliced
+        const ys = indices.map((i) => positions[i][1]).sort((a, b) => a - b);
+        const y = num(f.y, ys[(ys.length - 1) >> 1]);
+        out.push({
+            y,
+            // Where to cut. The plan's `cut` sits under the storey's ceiling; the
+            // old behaviour (cut at the representative camera height) is the
+            // fallback for a plan that predates it.
+            cutTop: num(f.cut, y),
+            cutBottom: ys[0] - sliceBelow,
+            indices,
+            floor: f,
+        });
     }
+    out.sort((a, b) => a.y - b.y);
     return out;
 }
 
-// Group anchors by level, render + upload one slice per level, and return the
-// manifest `minimaps` array (empty on any failure — the tour stays valid).
-async function buildMinimaps(renderer, scene, positions, background, exposure, floors, onLevel) {
-    if (positions.length === 0) return [];
+// Render + upload one slice per storey and return the manifest `minimaps` array
+// (empty on any failure — the tour stays valid). Also stamps each pano with the
+// level it stands on, so the viewer reads the grouping rather than re-deriving it.
+async function buildMinimaps(renderer, scene, panos, background, exposure, floors, opts, onLevel) {
+    if (panos.length === 0) return [];
+    const positions = panos.map((p) => p.position);
     const box = new THREE.Box3().setFromObject(scene);
     if (box.isEmpty()) return [];
-    const pad = MINIMAP_PAD_FRAC * Math.max(box.max.x - box.min.x, box.max.z - box.min.z, 1);
+    const pad = opts.padFrac * Math.max(box.max.x - box.min.x, box.max.z - box.min.z, 1);
     const bounds = {
         minX: box.min.x - pad,
         maxX: box.max.x + pad,
         minZ: box.min.z - pad,
         maxZ: box.max.z + pad,
     };
-    const levels = groupAnchorLevels(positions);
+    const levels =
+        planLevels(floors, positions, opts.sliceBelow) ??
+        groupAnchorLevels(positions, opts.levelEps).map((g) => ({
+            y: g.y,
+            cutTop: g.y,
+            cutBottom: g.minY - opts.sliceBelow,
+            indices: g.indices,
+            floor: null,
+        }));
     const minimaps = [];
     for (let li = 0; li < levels.length; li++) {
         onLevel?.(li, levels.length);
+        const lv = levels[li];
         const blob = await captureMinimapBlob(
             renderer,
             scene,
             bounds,
-            levels[li].y,
-            levels[li].minY - MINIMAP_SLICE_BELOW,
+            lv.cutTop,
+            lv.cutBottom,
             box.max.y,
             box.min.y,
             background,
             exposure,
+            opts.res,
         );
         await uploadMinimap(`minimap-${li}`, blob);
+        for (const i of lv.indices) panos[i].level = li;
         minimaps.push({
             level: li,
-            y: levels[li].y,
+            y: lv.y,
             file: `minimap-${li}.png`,
             bounds,
+            // The height this image was actually cut at, so a plan rebuilt from
+            // this tour re-cuts where this one did (routes.py `_plan_from_tour`).
+            cut: lv.cutTop,
             // The floor's name + world-space volume, so the walkthrough can title a
             // storey rather than calling it "floor 2", and can decide which floor an
-            // arbitrary point belongs to (see the describer in anchors.py).
-            ...floorSpecFor(floors, levels[li].y),
+            // arbitrary point belongs to (see the planner in anchors.py).
+            ...(lv.floor ? floorFields(lv.floor) : floorSpecFor(floors, lv.y)),
         });
     }
     return minimaps;
@@ -797,6 +879,7 @@ async function runCapture() {
     const faceSize = manifest.pano?.face_size || DEFAULT_FACE_SIZE;
     const panoWidth = manifest.pano?.width || DEFAULT_PANO_WIDTH;
     const quality = manifest.pano?.quality || DEFAULT_JPEG_QUALITY;
+    const minimapOpts = readMinimapOpts(manifest);
     status(`job: ${RUN}/${SLOT}/${MODEL} — ${anchors.length} anchors @ ${faceSize}² faces`);
 
     const renderer = createCaptureRenderer({ onContextLost: fail });
@@ -880,13 +963,21 @@ async function runCapture() {
         minimaps = await buildMinimaps(
             renderer,
             scene,
-            panoMeta.map((p) => p.position),
+            panoMeta, // stamped with each pano's level on the way through
             background,
             lighting.exposure ?? 1.0,
             Array.isArray(manifest.floors) ? manifest.floors : [],
+            minimapOpts,
             (li, n) => progress(`rendering minimap ${li + 1}/${n}…`),
         );
-        status(`minimaps: ${minimaps.length} level(s)`);
+        // Report the cut heights, not just the count. Capture is headless, so this
+        // log is the only view into it — and a cut that landed above a ceiling
+        // produces a blank slice that looks like a render failure until you can see
+        // the number it was taken at.
+        status(
+            `minimaps: ${minimaps.length} level(s) @ ${minimapOpts.res}px, cut at ` +
+                minimaps.map((m) => `${m.cut.toFixed(2)}m`).join(" / "),
+        );
     } catch (e) {
         minimaps = [];
         status(`minimaps failed (tour saved without them): ${e.message}`, "err");
@@ -919,6 +1010,9 @@ async function runCapture() {
         // the zone shells / ground geometry the encapsulating pass produced. The
         // walkthrough only offers to inspect something on this list.
         objects: Array.isArray(manifest.objects) ? manifest.objects : [],
+        // Zone names for the bird's-eye map, already pruned so none nests inside
+        // another (see anchors.py label_map_zones).
+        map_labels: Array.isArray(manifest.map_labels) ? manifest.map_labels : [],
     };
     const fin = await postFinish({ manifest: tourManifest, renderer: glName });
     if (fin.ok) {

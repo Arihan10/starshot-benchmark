@@ -25,7 +25,18 @@ const _tangent = new Vector3();
 const _local = new Vector3();
 const _inv = new Quaternion();
 const Z_AXIS = new Vector3(0, 0, 1);
-const RING_OUTER_PX = 18; // constant on-screen outer radius
+// The cursor is a thing LYING ON a surface, so it takes its size from the world
+// and lets perspective do the rest: near the floor at your feet it is large, across
+// the room it is small. It used to hold a constant on-screen radius instead, which
+// meant its physical footprint grew with distance and shrank as you approached —
+// backwards, and close up it collapsed to a sliver that read as cut into the ground
+// rather than resting on it.
+const CURSOR_WORLD_R = 0.22; // metres — the ring's outer radius in the scene
+// Perspective is only honest over a useful range. Past these the cursor would
+// either swallow the frame underfoot or vanish across a large scene, so the
+// on-screen radius is held between them and world size follows from that.
+const CURSOR_MIN_PX = 8;
+const CURSOR_MAX_PX = 64;
 const CURSOR_OPACITY = 0.9;
 
 // --- the direction arrow ------------------------------------------------------
@@ -73,8 +84,8 @@ function makeArrowGeometry(): BufferGeometry {
 // under the native cursor, oriented to the hit surface's normal so it sits flush
 // on floors / walls / objects (and foreshortens with them), plus a direction arrow
 // whenever the click's movement can be drawn on that surface (see above). Drawn
-// over everything (depthTest off) and kept a constant on-screen size; the OS cursor
-// is never hidden — this rides on top of it. The interior raycast that finds the
+// over everything (depthTest off) and sized in WORLD units, so perspective grows it
+// as you approach; the OS cursor is never hidden — this rides on top of it. The interior raycast that finds the
 // point is owned by the engine (it's shared with click auto-aim) and the hit is fed
 // in, along with the travel a click from here would take.
 export class SurfaceCursor {
@@ -115,8 +126,8 @@ export class SurfaceCursor {
 		scene.add(this.group);
 	}
 
-	// Lay the cursor on `hit` (null hides it), scaled to a constant on-screen
-	// radius, and aim its arrow along `travel` — the world vector from the eye to
+	// Lay the cursor on `hit` (null hides it), sized from the world so it grows as
+	// the surface comes nearer, and aim its arrow along `travel` — the world vector from the eye to
 	// where this click would land (null when there is no destination). The hit point
 	// lies on the cursor ray, so its projection IS the pointer — the ring is centered
 	// on the cursor. It is deliberately not pushed along the normal: depth testing is
@@ -142,10 +153,18 @@ export class SurfaceCursor {
 		if (_normal.dot(_toCam) < 0) _normal.negate();
 		this.group.position.copy(hit.point);
 		this.group.quaternion.setFromUnitVectors(Z_AXIS, _normal);
+		// Fixed world size, expressed as the on-screen radius it works out to, so it
+		// can be clamped in the units the limits are actually about, then converted
+		// back. Inside the clamps this is exactly `scale = CURSOR_WORLD_R`.
+		const h = viewportHeight || 1;
 		const tan = Math.tan((camera.fov * Math.PI) / 360);
-		this.group.scale.setScalar(
-			(RING_OUTER_PX * 2 * hit.distance * tan) / (viewportHeight || 1),
+		const perPx = (2 * hit.distance * tan) / h; // world metres per screen pixel
+		const px = MathUtils.clamp(
+			CURSOR_WORLD_R / perPx,
+			CURSOR_MIN_PX,
+			CURSOR_MAX_PX,
 		);
+		this.group.scale.setScalar(px * perPx);
 		this.aimArrow(travel);
 		this.group.visible = true;
 	}

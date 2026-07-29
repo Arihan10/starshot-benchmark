@@ -1,18 +1,30 @@
 import {
+	type BufferAttribute,
 	Group,
+	LineBasicMaterial,
 	type Material,
 	Mesh,
 	type MeshBasicMaterial,
 	type Object3D,
 	type PerspectiveCamera,
+	Raycaster,
 	RingGeometry,
 	type Scene,
 	SphereGeometry,
+	Vector2,
 	Vector3,
 } from "three";
 import {
 	CAPTURE_EYE_HEIGHT,
+	FLOOR_ARROW_BOB,
+	FLOOR_ARROW_GLOW,
+	FLOOR_ARROW_GLOW_TAU,
+	FLOOR_ARROW_HOVER_LIFT,
+	FLOOR_ARROW_PULSE_RATE,
+	FLOOR_ARROW_RATE,
 	HOTSPOT_FLOOR_DROP,
+	makeFloorArrow,
+	makeGhostTether,
 	makeNavMarker,
 	makeSonarDot,
 	makeYouMarker,
@@ -34,11 +46,28 @@ import type { PanoEntry } from "./panoTextures";
 // preview of where a click would land rather than another button to press.
 const GHOST_OPACITY = 0.4;
 
+// --- the ghost tether ---------------------------------------------------------
+//
+// The ghost stands on the anchor a click actually lands on, which is the only
+// placement that can't lie about the destination — but the anchor is behind
+// geometry and usually off to one side, so on its own it is a second mark on
+// screen with nothing connecting it to the pointer that summoned it. The tether
+// is that connection: cursor at one end, destination at the other, so the pair
+// reads as one sentence — click HERE, arrive THERE.
+//
+// It doubles as the off-screen cue. When the anchor falls outside the frustum the
+// line still leaves the frame pointing at it, which is why no edge indicator is
+// needed (see makeGhostTether for why it survives being partly off-camera).
+//
+// Below TETHER_MIN_DIST the ghost is already sitting on the cursor and the line
+// would be a nub inside the ring, so it's dropped.
+const TETHER_MIN_DIST = 0.4;
+
 // --- suppressed STANDING affordances -----------------------------------------
 //
 // An edge type in this set renders no standing marker in buildNav(). It says
-// nothing about the on-demand waypoint the cursor grows while homing — whether and
-// where to draw that is the engine's call (updateCursorRing / portalWaypoint).
+// nothing about the on-demand waypoint the cursor grows while homing — whether to
+// draw that is the engine's call (updateCursorRing / destinationFloor).
 //
 // TO RE-ENABLE a type, delete its entry — nothing else needs touching. The
 // builders in markers.ts still handle all five types, so it comes straight back.
@@ -48,13 +77,11 @@ const GHOST_OPACITY = 0.4;
 //     where you stand, so its puck spends attention on what the view already told
 //     you. With navGraph's nearest-3 guarantee most nodes drew several at once and
 //     the floor filled with near-identical blue rings.
-//   vertical (green) — level changes are made through the minimap now (its floor
-//     chips are the sanctioned route between storeys), so an in-scene chevron is a
-//     second, competing wayfinding layer saying the same thing.
-//   portal (orange) — a STANDING marker for a destination behind a wall sits
-//     somewhere you cannot see, and rarely where you are actually pointing. The
-//     engine draws it on demand instead, on the cursor ray just past the surface
-//     you are aiming at, so it answers "what happens if I click HERE".
+//   portal (orange) — a STANDING marker for every destination behind a wall fills
+//     the room with rings for places you cannot see and are not asking about. The
+//     engine draws ONE on demand instead, on the destination the cursor currently
+//     resolves to, tethered back to the cursor so it still answers "what happens if
+//     I click HERE" without having to lie about where that is.
 // That leaves phase (violet), and only on a sealed node with no other way out.
 //
 // NOTHING BECOMES UNREACHABLE. Suppressed destinations keep every other route in:
@@ -63,13 +90,18 @@ const GHOST_OPACITY = 0.4;
 // still tints by type while one is the homing target, and they stay in the exits
 // panel, the minimap and the sonar ping. This hides scene geometry only — the nav
 // graph, routing costs and traversal FX are all untouched.
+//   vertical (green) — still very much ON, just not from here: floor changes are
+//     drawn by the dedicated arrow layer below, which places them in your view on
+//     arrival instead of at the destination (a point on another storey, i.e. the
+//     one place you are guaranteed not to be looking).
 const HIDDEN_AFFORDANCES: ReadonlySet<EdgeType> = new Set<EdgeType>([
 	"walk",
-	"vertical",
 	"portal",
+	"vertical",
 ]);
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
+const _ndc = new Vector2();
 
 // The interior navigation overlay. Renders the CURRENT node's typed affordances
 // (every type except those in HIDDEN_AFFORDANCES), fades them by gaze bearing,
@@ -80,19 +112,30 @@ export class MarkerLayer {
 	readonly navGroup = new Group(); // interior: the current node's typed affordances
 	readonly sonarGroup = new Group(); // interior: x-ray reveal of every node
 	readonly ghostGroup = new Group(); // interior: the auto-home destination preview
+	readonly arrowGroup = new Group(); // interior: the in-view floor-change arrows
 	readonly you: YouMarker = makeYouMarker();
 
 	private hovered: Object3D | null = null;
+	private hoveredArrowMarker: Object3D | null = null;
+	private readonly arrowRay = new Raycaster();
+	private lastArrowTick = 0;
 	private ghostType: EdgeType | null = null; // rebuild key: the ghost's current edge type
+	// The ghost's ring/chevron, held rather than read back off ghostGroup.children:
+	// the tether shares that group and is never rebuilt, so an index would be
+	// whichever of the two happened to be added first.
+	private ghostMarker: Object3D | null = null;
+	private readonly ghostTether = makeGhostTether();
 	private pulseUntil = 0; // dwell/never-trapped: briefly boost every affordance
 	private sonarStart = 0;
 	private sonarReach = 1;
 
 	constructor(private readonly scene: Scene) {
+		this.ghostGroup.add(this.ghostTether);
 		scene.add(
 			this.navGroup,
 			this.sonarGroup,
 			this.ghostGroup,
+			this.arrowGroup,
 			this.you.group,
 		);
 	}
@@ -107,7 +150,7 @@ export class MarkerLayer {
 	// Rebuild the affordances for the node the user is standing on. Each rendered
 	// edge becomes one marker at the destination's floor, except the types listed in
 	// HIDDEN_AFFORDANCES — see that set for why they're off and how to restore them.
-	// In practice that leaves portal spots plus a trapped node's phase ring.
+	// In practice that leaves a trapped node's phase ring.
 	buildNav(node: NavNode | null, panos: PanoEntry[]) {
 		this.clearNav();
 		if (!node) return;
@@ -129,25 +172,34 @@ export class MarkerLayer {
 	}
 
 	// The auto-home waypoint: a translucent affordance marking what a click would
-	// do. The caller decides both WHETHER to draw one and WHERE — a through-geometry
-	// hop is placed on the cursor ray rather than at its hidden destination. Rebuilt
-	// only when the edge type changes (cheap); re-placed and screen-scaled every
-	// frame so it tracks the pointer exactly like a live marker.
+	// do, standing ON the destination anchor — `floorPos` is that capture's floor
+	// point, so the marker and the place you land are the same spot and cannot drift
+	// apart. `from` is the surface point under the cursor; the tether runs between
+	// the two, which is what keeps a marker you may not be pointing at legible as an
+	// answer to where you ARE pointing. Pass null for no tether.
+	//
+	// Rebuilt only when the edge type changes (cheap); re-placed and screen-scaled
+	// every frame, so the ring holds its on-screen size as the destination's distance
+	// changes under a moving cursor.
 	showGhost(
 		floorPos: Vector3,
 		edge: { to: number; type: EdgeType; dy: number },
 		camera: PerspectiveCamera,
 		viewportHeight: number,
+		from: Vector3 | null = null,
 	) {
 		if (this.ghostType !== edge.type) {
-			for (const m of this.ghostGroup.children) disposeGroup(m);
-			this.ghostGroup.clear();
+			this.clearGhostMarker();
 			const marker = makeNavMarker(edge, floorPos, true);
 			setGroupOpacity(marker, GHOST_OPACITY);
 			this.ghostGroup.add(marker);
+			this.ghostMarker = marker;
+			(this.ghostTether.material as LineBasicMaterial).color.setHex(
+				NAV_COLORS[edge.type],
+			);
 			this.ghostType = edge.type;
 		}
-		const marker = this.ghostGroup.children[0];
+		const marker = this.ghostMarker;
 		if (!marker) return;
 		marker.position.copy(floorPos);
 		marker.position.y += 0.02; // lift a hair so a ghost never z-fights a coincident marker
@@ -158,11 +210,31 @@ export class MarkerLayer {
 				screenScaleForDistance(d, NAV_TARGET_PX, camera.fov, viewportHeight, NAV_RING_OUTER),
 			),
 		);
+		const tethered =
+			!!from && from.distanceTo(marker.position) > TETHER_MIN_DIST;
+		if (tethered && from) {
+			const pts = this.ghostTether.geometry.getAttribute(
+				"position",
+			) as BufferAttribute;
+			pts.setXYZ(0, from.x, from.y, from.z);
+			pts.setXYZ(1, marker.position.x, marker.position.y, marker.position.z);
+			pts.needsUpdate = true;
+		}
+		this.ghostTether.visible = tethered;
 		this.ghostGroup.visible = true;
 	}
 
 	hideGhost() {
 		if (this.ghostGroup.visible) this.ghostGroup.visible = false;
+	}
+
+	// Drop the ghost's marker while KEEPING the tether, which lives in the same group
+	// but is built once and reused.
+	private clearGhostMarker() {
+		if (!this.ghostMarker) return;
+		disposeGroup(this.ghostMarker);
+		this.ghostGroup.remove(this.ghostMarker);
+		this.ghostMarker = null;
 	}
 
 	// Gaze-contingent disclosure: affordances rest bright enough to FIND off-axis
@@ -221,6 +293,107 @@ export class MarkerLayer {
 	// Briefly pulse every exit (idle-dwell nudge, or a trapped node on arrival).
 	pulseExits(now: number, ms = 1400) {
 		this.pulseUntil = now + ms;
+	}
+
+	// --- floor arrows --------------------------------------------------------
+
+	// Rebuild the pair of floor arrows for the node just arrived at. `pos` is
+	// already placed by the engine, on your arrival heading — see refreshFloorArrows
+	// for why that, and not the destination, is where these live.
+	buildFloorArrows(items: Array<{ index: number; up: boolean; pos: Vector3 }>) {
+		this.clearFloorArrows();
+		for (const it of items) {
+			const marker = makeFloorArrow(it.up);
+			marker.position.copy(it.pos);
+			marker.userData.to = it.index;
+			marker.userData.up = it.up;
+			marker.userData.baseY = it.pos.y;
+			// The up and down arrows drift out of step with each other — they are
+			// separate objects and reading as such costs nothing, whereas the two
+			// halves of ONE arrow must never do that.
+			marker.userData.phase = it.up ? 0 : Math.PI / 2;
+			this.arrowGroup.add(marker);
+		}
+	}
+
+	clearFloorArrows() {
+		for (const m of this.arrowGroup.children) disposeGroup(m);
+		this.arrowGroup.clear();
+		this.hoveredArrowMarker = null;
+	}
+
+	// Drift each arrow as ONE rigid object. The chevrons inside it never move
+	// relative to each other — that was what made a single arrow read as two.
+	updateFloorArrows(now: number) {
+		if (!this.arrowGroup.visible) return;
+		// Clamped so a backgrounded tab returning after seconds eases rather than
+		// teleporting; seeded so the first frame is a sane step, not a jump.
+		const dt = this.lastArrowTick ? Math.min(100, now - this.lastArrowTick) : 16;
+		this.lastArrowTick = now;
+		const k = 1 - Math.exp(-dt / FLOOR_ARROW_GLOW_TAU);
+		for (const marker of this.arrowGroup.children) {
+			const baseY = marker.userData.baseY as number;
+			const phase = marker.userData.phase as number;
+			marker.position.y =
+				baseY + Math.sin(now * FLOOR_ARROW_RATE + phase) * FLOOR_ARROW_BOB;
+			// Hover level EASES toward its target rather than jumping, so the glow
+			// arrives and leaves instead of switching. Exponential approach, driven by
+			// real elapsed time, so it looks the same at any frame rate.
+			const target = marker === this.hoveredArrowMarker ? 1 : 0;
+			const level =
+				((marker.userData.glow as number) ?? 0) +
+				(target - ((marker.userData.glow as number) ?? 0)) * k;
+			marker.userData.glow = level;
+			// One scalar drives the whole hover response, so the rim and the body
+			// swell together instead of beating against each other.
+			const glow =
+				level * (0.72 + 0.28 * Math.sin(now * FLOOR_ARROW_PULSE_RATE));
+			for (const part of marker.children) {
+				const base = part.userData.baseOpacity as number;
+				const mat = (part as Mesh).material as MeshBasicMaterial;
+				mat.opacity = part.userData.halo
+					? FLOOR_ARROW_GLOW * glow
+					: Math.min(1, base * (1 + FLOOR_ARROW_HOVER_LIFT * glow));
+			}
+		}
+	}
+
+	// Picked by a REAL raycast first, then by screen magnetism as a fallback.
+	//
+	// Magnetism alone measured from the arrow's centre, so anywhere past its radius
+	// stopped counting as "on the arrow" even though the arrow was plainly under the
+	// cursor — and the proxy surface behind it took over instead. An arrow is drawn
+	// over everything, so if the ray meets its geometry you ARE pointing at it, and
+	// it wins. The magnetism stays underneath to keep near-misses forgiving.
+	pickFloorArrow(
+		clientX: number,
+		clientY: number,
+		camera: PerspectiveCamera,
+		canvas: HTMLCanvasElement,
+	): Object3D | null {
+		if (!this.arrowGroup.visible || this.arrowGroup.children.length === 0)
+			return null;
+		const rect = canvas.getBoundingClientRect();
+		_ndc.set(
+			((clientX - rect.left) / rect.width) * 2 - 1,
+			-((clientY - rect.top) / rect.height) * 2 + 1,
+		);
+		camera.updateMatrixWorld();
+		this.arrowRay.setFromCamera(_ndc, camera);
+		for (const h of this.arrowRay.intersectObject(this.arrowGroup, true)) {
+			for (let o: Object3D | null = h.object; o; o = o.parent) {
+				if (o.parent === this.arrowGroup) return o;
+			}
+		}
+		return pickByScreen(clientX, clientY, this.arrowGroup, NAV_AIM_PX, camera, canvas);
+	}
+
+	setArrowHover(marker: Object3D | null) {
+		this.hoveredArrowMarker = marker;
+	}
+
+	get hoveredArrow(): Object3D | null {
+		return this.hoveredArrowMarker;
 	}
 
 	// --- sonar reveal --------------------------------------------------------
@@ -334,20 +507,26 @@ export class MarkerLayer {
 		for (const d of this.sonarGroup.children) disposeMesh(d as Mesh);
 		this.sonarGroup.clear();
 		this.sonarGroup.visible = false;
-		for (const m of this.ghostGroup.children) disposeGroup(m);
-		this.ghostGroup.clear();
+		this.clearGhostMarker();
 		this.ghostGroup.visible = false;
+		this.ghostTether.visible = false;
 		this.ghostType = null;
+		this.clearFloorArrows();
+		this.arrowGroup.visible = false;
 		this.you.group.visible = false;
 		this.pulseUntil = 0;
 	}
 
 	dispose() {
 		this.clear();
+		// clear() keeps the tether alive for the next scene; teardown owns it.
+		disposeGroup(this.ghostTether);
+		this.ghostGroup.remove(this.ghostTether);
 		this.scene.remove(
 			this.navGroup,
 			this.sonarGroup,
 			this.ghostGroup,
+			this.arrowGroup,
 			this.you.group,
 		);
 	}

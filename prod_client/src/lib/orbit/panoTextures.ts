@@ -9,6 +9,7 @@ export type PanoEntry = {
 	id: string;
 	name?: string;
 	zone?: string; // which manifest zone this capture sits in (connector travel)
+	level?: number; // the storey it stands on, per the manifest; absent on older tours
 	position: [number, number, number];
 	forward?: [number, number, number];
 	url: string;

@@ -1,7 +1,9 @@
 import {
+	AdditiveBlending,
 	BufferGeometry,
 	ConeGeometry,
 	DoubleSide,
+	GreaterDepth,
 	Group,
 	Line,
 	LineBasicMaterial,
@@ -192,6 +194,159 @@ export function makeNavMarker(
 	group.userData.type = edge.type;
 	group.userData.overlay = overlay;
 	return group;
+}
+
+// --- floor arrows -------------------------------------------------------------
+// The way to the storey above or below, drawn as a pair of drifting chevrons
+// placed IN FRONT OF YOU rather than at the destination.
+//
+// Placing it at the destination was the problem with every earlier attempt: that
+// point is on another floor, which is by definition the one place you cannot see,
+// so the marker had to be hunted for. Placing it on the arrival heading means it
+// is simply there when you land — no looking around — and clicking it snaps to the
+// nearest capture on that floor.
+//
+// Two chevrons rather than one — a lead and a smaller, fainter trailing one — so
+// the glyph has a direction built into its silhouette. They drift as a RIGID PAIR:
+// the two sit only ~1cm apart, so bobbing them on offset phases (which is what the
+// first version did, to suggest flow) pulled them up to 7cm apart and back, and an
+// arrow that comes apart and reassembles reads as two objects rather than one.
+// Overlay-drawn (depthTest off), because a way out of the room must not be hidden
+// by the room.
+export const FLOOR_ARROW_COLOR = NAV_COLORS.vertical;
+export const FLOOR_ARROW_DIST = 3.2; // m ahead of the eye
+// How far toward the top / bottom edge of the frame the arrows sit, as an ANGLE
+// from the view axis — the honest parameter, since that is what "near the border"
+// actually means. The interior FOV is 75° vertical, so half the frame is 37.5°:
+// this puts them ~78% of the way out, clear of where you are looking without
+// risking the edge.
+export const FLOOR_ARROW_PITCH = (29 * Math.PI) / 180;
+export const FLOOR_ARROW_R = 0.17;
+export const FLOOR_ARROW_H = 0.34;
+export const FLOOR_ARROW_GAP = 0.3; // spacing between lead and trailing chevron
+export const FLOOR_ARROW_BOB = 0.1; // m of drift, each way — the whole arrow, together
+export const FLOOR_ARROW_RATE = 0.0018; // rad/ms — a drift, not a bounce
+export const FLOOR_ARROW_REST = 0.85; // resting opacity of the lead chevron
+// What survives of an arrow where the scene is in front of it. Not zero: a way out
+// of the room has to stay findable through the floor between you and it. Not full
+// either, which is what it was — an arrow as bright through a ceiling as in open
+// air reads as pasted onto the screen rather than standing in the world, and tells
+// you nothing about whether the way there is clear.
+export const FLOOR_ARROW_OCCLUDED = 0.22;
+// Hover glow. A halo of the same shape, scaled up and blended ADDITIVELY, so it
+// reads as the arrow giving off light rather than as a bigger arrow behind it.
+// Drawn without a depth test on purpose, unlike the body: hover feedback has to
+// arrive even when what you are pointing at is behind a slab, or pointing at it
+// feels broken.
+//
+// It has to hug the SILHOUETTE. Scaled well up it stops being light and becomes a
+// second, larger arrow behind the first — which is what 1.35x was. Just over 1
+// leaves a thin rim standing proud of the body, and additive light on that rim is
+// what reads as glow.
+export const FLOOR_ARROW_GLOW_SCALE = 1.12;
+// Kept DELIBERATELY faint. Additive light on an already-bright teal climbs fast,
+// and it is confirming attention you have already given — you only ever see this
+// because you pointed at the thing.
+export const FLOOR_ARROW_GLOW = 0.16; // peak additive alpha
+export const FLOOR_ARROW_PULSE_RATE = 0.0021; // rad/ms — a ~3s breath
+export const FLOOR_ARROW_HOVER_LIFT = 0.18; // how much the body itself brightens
+// Time constant for the glow rising and falling. Without it the whole effect
+// switched on at full strength the instant the cursor crossed the arrow, so what
+// you noticed was the STEP, not the light — a slow pulse that arrives by snapping
+// on is still a snap.
+export const FLOOR_ARROW_GLOW_TAU = 260; // ms
+
+export function makeFloorArrow(up: boolean): Group {
+	const group = new Group();
+	for (let i = 0; i < 2; i++) {
+		const scale = 1 - i * 0.3;
+		const opacity = i === 0 ? FLOOR_ARROW_REST : FLOOR_ARROW_REST * 0.45;
+		const geometry = new ConeGeometry(
+			FLOOR_ARROW_R * scale,
+			FLOOR_ARROW_H * scale,
+			4,
+		);
+		// Two draws of the SAME geometry, split by depth test, so occlusion reads
+		// PER FRAGMENT: the part of the arrow standing in open air stays solid while
+		// the part buried in a slab goes faint, cut on the real silhouette of
+		// whatever is in the way. `GreaterDepth` makes the faint pass draw ONLY where
+		// something is nearer than the arrow, and the solid pass only where nothing
+		// is — each fragment is drawn exactly once, so there is no double-blending
+		// seam along the boundary. With nothing writing depth (sphere mode) the
+		// solid pass covers everything and the arrow simply reads as unoccluded.
+		for (const occluded of [false, true]) {
+			const alpha = occluded ? opacity * FLOOR_ARROW_OCCLUDED : opacity;
+			const cone = new Mesh(
+				geometry,
+				new MeshBasicMaterial({
+					color: FLOOR_ARROW_COLOR,
+					transparent: true,
+					opacity: alpha,
+					side: DoubleSide,
+					depthWrite: false,
+					...(occluded ? { depthFunc: GreaterDepth } : {}),
+				}),
+			);
+			cone.rotation.y = Math.PI / 4; // present a flat face, not an edge
+			if (!up) cone.rotation.z = Math.PI;
+			// The trailing chevron sits BEHIND the lead one along the travel
+			// direction, so the pair points the way it drifts. Fixed relative to its
+			// partner — only the GROUP drifts, so the pair holds its shape.
+			cone.position.y = (up ? -1 : 1) * i * FLOOR_ARROW_GAP;
+			cone.userData.baseOpacity = alpha;
+			cone.renderOrder = 7;
+			group.add(cone);
+		}
+		const halo = new Mesh(
+			geometry,
+			new MeshBasicMaterial({
+				color: FLOOR_ARROW_COLOR,
+				transparent: true,
+				opacity: 0, // invisible until hovered
+				side: DoubleSide,
+				depthWrite: false,
+				depthTest: false,
+				blending: AdditiveBlending,
+			}),
+		);
+		halo.rotation.y = Math.PI / 4;
+		if (!up) halo.rotation.z = Math.PI;
+		halo.position.y = (up ? -1 : 1) * i * FLOOR_ARROW_GAP;
+		halo.scale.setScalar(FLOOR_ARROW_GLOW_SCALE);
+		halo.userData.halo = true;
+		halo.userData.baseOpacity = 0;
+		halo.renderOrder = 6; // behind the body it surrounds
+		group.add(halo);
+	}
+	group.renderOrder = 7;
+	return group;
+}
+
+// The leader line from the surface cursor to the auto-home ghost — see the tether
+// note in markerLayer.ts for what it's for. Two points the caller rewrites every
+// frame; solid rather than dashed, because dashes are this grammar's word for a
+// phase (sealed) link and a leader line is not that.
+//
+// frustumCulled is off deliberately: the line's endpoints move every frame while
+// its bounding sphere does not, and an anchor outside the view is exactly the case
+// where the tether has to keep drawing — culling it would take the pointer away at
+// the moment it's the only thing saying which way the destination lies.
+export const TETHER_OPACITY = 0.3;
+
+export function makeGhostTether(): Line {
+	const line = new Line(
+		new BufferGeometry().setFromPoints([new Vector3(), new Vector3()]),
+		new LineBasicMaterial({
+			color: NAV_COLORS.portal,
+			transparent: true,
+			opacity: TETHER_OPACITY,
+			depthTest: false, // the destination is behind a wall; so is most of the line
+			depthWrite: false,
+		}),
+	);
+	line.frustumCulled = false;
+	line.renderOrder = 5; // under the ghost's own parts (6), over the scene
+	return line;
 }
 
 // A single sonar dot (x-ray, always over the scene) colored by its edge type.
