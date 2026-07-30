@@ -153,6 +153,67 @@ const SPLAT_REVEAL_MAX_MS = 700;
 // means the common case (no zoom applied) needs no reconciliation at all.
 const FREEFLY_FOV = INTERIOR_FOV;
 
+// --- EXPERIMENTAL: where the cursor aims ------------------------------------
+//
+// true  — FIRST PERSON. The reticle is pinned to the centre of the viewport and you
+//         aim it by turning the view, like a head-mounted sight. What you are looking
+//         at and what you would act on are the same thing by construction, so the
+//         "where will this click send me" question the ghost and tether exist to
+//         answer stops needing to be asked at all.
+// false — POINTING, the original: the reticle tracks the pointer and you aim it by
+//         moving the mouse, Google-Maps style.
+//
+// This is a single switch on purpose. Four separate things read the aim point — the
+// surface reticle, the click routing, the affordance hover, and the dwell inset — and
+// they have to agree or the thing you are looking at and the thing you would click
+// are different. Flip this one constant and all four move together.
+//
+// Note the structural consequence: with the reticle centred, hover becomes a function
+// of the CAMERA rather than of pointer events, so it has to be resolved every frame
+// instead of on pointermove. See the interior branch of the tick.
+const CENTER_CURSOR = true;
+const _aim = { x: 0, y: 0 };
+
+// --- aim reticle ------------------------------------------------------------
+//
+// A small crosshair at the aim point, drawn WHATEVER the ray finds — including
+// nothing. The surface ring only exists where there is a surface for it to lie on, so
+// sighting on open sky, or out past the edge of the scene, left the screen with no
+// indication of where "here" even was.
+//
+// DOM rather than a three.js object, because what is being marked is a SCREEN
+// position and not a place in the world: it needs no projection, stays pixel-crisp at
+// any device ratio, and cannot be occluded by geometry or pushed through the
+// composer's tone mapping. It also costs nothing per frame — centred by CSS, so
+// nothing is written unless its opacity changes.
+const RETICLE_ARM = 5; // px per tick
+const RETICLE_GAP = 3; // px of clear space each side of centre
+const RETICLE_THICK = 1;
+// Full strength when the ray lands on something clickable, faint when it is out in
+// the void — so the reticle answers "where am I pointing" and "is there anything
+// there" with one mark instead of appearing and disappearing.
+const RETICLE_ON_SURFACE = 0.9;
+const RETICLE_IN_VOID = 0.32;
+
+// --- mouse look (pointer lock) ----------------------------------------------
+//
+// Looking should not cost a held button. That needs POINTER LOCK: without it the
+// pointer runs out of window after a quarter-turn, which is why the drag rig existed
+// in the first place.
+//
+// The lock is an ENHANCEMENT, not a requirement. Held, the mouse turns the view
+// directly and the centred reticle is the sight. Released, everything falls back to
+// exactly the old drag-to-look — which is what keeps the chrome usable, because a
+// locked pointer has no cursor to click a minimap or a floor rail with. Esc therefore
+// means "give me my cursor back", not "leave", and it takes a second Esc to actually
+// go anywhere.
+const LOOK_SENSITIVITY = 0.002; // rad per pixel of locked movement — matches sogviewer.js
+// Esc is the browser's OWN pointer-lock exit, so by the time our keydown runs the lock
+// may already be gone and `locked` already false. Without a grace window that Esc
+// would fall through and also leave free flight — one keypress doing two things. Same
+// trick sogviewer.js uses for the same reason.
+const ESCAPE_GRACE_MS = 250;
+
 // --- zoom -------------------------------------------------------------------
 //
 // Zoom is MULTIPLICATIVE on the half-angle tangent — i.e. on focal length — because
@@ -171,8 +232,12 @@ const ZOOM_PER_NOTCH = 0.12;
 // W already flies forward, so a dolly would be a slower duplicate of a key the user
 // is already holding. Speed is the axis a free camera actually wants, and keeping FOV
 // out of free flight is what leaves exactly one place where zoom has to be reconciled.
-const FREEFLY_SPEED_MIN = 0.25;
-const FREEFLY_SPEED_MAX = 4;
+// Kept NARROW on purpose. A 16x span (the first attempt was 0.25-4) means the floor
+// is a crawl, and a control that can quietly leave the camera four times slower than
+// its default is one that reads as a performance bug rather than a setting. Within
+// this range even the slow end is usable.
+const FREEFLY_SPEED_MIN = 0.5;
+const FREEFLY_SPEED_MAX = 2;
 // Coming back IS a flight (you are in open space, the destination is a capture
 // point), so it reuses the enter() path wholesale — arc, FOV opening, arrival
 // crossfade and all. A touch quicker than entering from the dollhouse, since the
@@ -232,17 +297,24 @@ const DOCK_STILL_MS = 500;
 const DOCK_RADIUS_FRAC = 0.08; // of the scene's extent...
 const DOCK_RADIUS_MIN = 2.0; // ...clamped, so scale can't make it absurd
 const DOCK_RADIUS_MAX = 5.0;
-// Vertical tolerance, deliberately TIGHTER than the horizontal radius rather than
-// equal to it.
+// Vertical offset is treated as EXPENSIVE, not as a cliff.
 //
-// It does two jobs. It keeps the dock on one storey without needing the floor plan,
-// so it holds on tours whose floors carry no volumes. And it caps how far the camera
-// can be moved DOWNWARD against the user's wishes — an unasked-for pull reads far
-// worse vertically than horizontally, because it feels like gravity taking the
-// controls. At this width you have to be within roughly a standing height of the
-// anchor for it to claim you, so hovering deliberately above a viewpoint leaves you
-// hovering.
-const DOCK_MAX_DY = 1.0;
+// It was a hard clamp at 1 m, and that was wrong in a way that read as broken
+// distance detection: half a metre horizontally from an anchor — visually right on
+// it — was rejected outright for being 1.1 m above, at a total distance of 1.2 m
+// inside a 2.8 m radius. Nothing about that rejection is a distance, so no amount of
+// standing in the right place fixed it.
+//
+// So vertical offset now costs WEIGHT inside the distance instead: being level with
+// an anchor buys you the full radius horizontally, and rising above it spends that
+// budget smoothly rather than falling off an edge. Anchors you are level with still
+// win over ones you are above, which is the behaviour the clamp was reaching for.
+//
+// The hard cap survives, but only as a backstop against the original worry — being
+// dragged down out of real mid-air. At weight 1.5 the metric rejects 2 m of rise on
+// its own, so the cap almost never decides anything.
+const DOCK_DY_WEIGHT = 1.5;
+const DOCK_MAX_DY = 2.0;
 const DOCK_SEEK_GAIN = 2.6; // 1/s — the pull toward the anchor; the integrator damps it
 const DOCK_ARRIVE = 0.12; // m — close enough to hand over without visible motion
 const DOCK_REVEAL_DIST = 2.2; // m — the interior is fully faded in by here
@@ -289,6 +361,47 @@ const FREEFLY_ENTER_KEYS = new Set([
 	"Space",
 	"Shift",
 ]);
+
+// Four ticks around a clear centre, so the exact pixel being aimed at is left
+// visible rather than covered by the mark describing it. Centred by CSS at 50%/50%,
+// which is where the aim point is in first-person mode and costs nothing to maintain.
+//
+// The dark drop-shadow is not decoration: a white reticle on a white wall is invisible
+// otherwise, and this scene has plenty of both.
+function buildReticle(): HTMLDivElement {
+	const el = document.createElement("div");
+	Object.assign(el.style, {
+		position: "absolute",
+		left: "50%",
+		top: "50%",
+		width: "0",
+		height: "0",
+		pointerEvents: "none",
+		zIndex: "4", // above the travel fades, below the React chrome
+		opacity: "0",
+		filter: "drop-shadow(0 0 1px rgba(0,0,0,0.9))",
+		transition: "opacity 120ms linear",
+	});
+	const off = RETICLE_GAP + RETICLE_ARM / 2; // centre of each tick, from the middle
+	const ticks: Array<[number, number, number, number]> = [
+		[RETICLE_THICK, RETICLE_ARM, 0, -off],
+		[RETICLE_THICK, RETICLE_ARM, 0, off],
+		[RETICLE_ARM, RETICLE_THICK, -off, 0],
+		[RETICLE_ARM, RETICLE_THICK, off, 0],
+	];
+	for (const [w, h, x, y] of ticks) {
+		const tick = document.createElement("div");
+		Object.assign(tick.style, {
+			position: "absolute",
+			width: `${w}px`,
+			height: `${h}px`,
+			background: "#fff",
+			transform: `translate(calc(-50% + ${x}px), calc(-50% + ${y}px))`,
+		});
+		el.appendChild(tick);
+	}
+	return el;
+}
 
 // One name per control, so the two physical Shift keys cannot leave each other
 // latched down, and so the enter/track paths agree on what a key is called.
@@ -440,6 +553,7 @@ export class OrbitEngine {
 	private readonly canvas: HTMLCanvasElement;
 	private readonly travelFade: HTMLDivElement;
 	private readonly iris: HTMLDivElement; // vertical-shaft "hatch" wipe overlay
+	private readonly reticle: HTMLDivElement; // the aim crosshair
 	private readonly sonarLabels: HTMLDivElement[] = []; // pooled x-ray name tags
 	private readonly scene: Scene;
 	private readonly camera: PerspectiveCamera;
@@ -467,6 +581,12 @@ export class OrbitEngine {
 	private readonly cursor: SurfaceCursor;
 	private readonly cursorRay = new Raycaster();
 	private readonly occluder = new Raycaster(); // LOS tests for the nav graph
+	// Pointer-lock state. `unlockedAt` timestamps the release so the Esc that caused
+	// it can be told apart from a later, deliberate one — see ESCAPE_GRACE_MS.
+	private locked = false;
+	private unlockedAt = 0;
+	// This click was spent taking hold of the pointer, so it must not also travel.
+	private lockClickPending = false;
 	private pointerClientX = 0;
 	private pointerClientY = 0;
 	private pointerInside = false;
@@ -506,9 +626,11 @@ export class OrbitEngine {
 	// because the dissolve stretches to absorb however much zoom has to be unwound.
 	private splatRevealMs = SPLAT_REVEAL_MS;
 	private revealFovFrom = FREEFLY_FOV;
-	// Flight-speed multiplier, driven by the wheel in free flight. Persists across
-	// free-flight sessions within a scene — it is a property of how the visitor wants
-	// to travel, not of one excursion.
+	// Flight-speed multiplier, driven by the wheel in free flight. Deliberately reset
+	// on every entry rather than persisted: it used to carry over, which meant a scroll
+	// made while looking at something else left every later excursion slower with
+	// nothing on screen to explain why. A speed you did not set on this trip is
+	// indistinguishable from the viewer being broken.
 	private freeflySpeed = 1;
 	// Held movement keys + the eased velocity they drive, in world units/sec.
 	private readonly freeflyKeys = new Set<string>();
@@ -521,13 +643,20 @@ export class OrbitEngine {
 	// The anchor the glide is currently settling onto (-1 = none), how far the
 	// interior has faded in for it, and whether docking is allowed to fire at all.
 	//
-	// `dockArmed` exists because free flight BEGINS standing on an anchor at zero
-	// velocity — every dock condition is already satisfied the instant you arrive, so
-	// without it you would be pulled straight back and free flight would be
-	// impossible to enter. It arms only once you have genuinely left.
+	// `freeflyFrom` is the anchor free flight began on, and it is excluded from docking
+	// until the camera has left its radius.
+	//
+	// This replaces a global "armed" flag that disabled docking entirely until you had
+	// travelled more than one dock radius from where you started. That flag solved the
+	// right problem — free flight begins standing ON an anchor with every dock
+	// condition already satisfied, so without something you would be snapped straight
+	// back and could never leave — but it solved it far too broadly: adjusting your
+	// position slightly never docked you to ANY anchor, including ones you had moved
+	// deliberately towards. Excluding one anchor is the narrow version of the same
+	// guarantee.
 	private dockTarget = -1;
 	private dockReveal = 0;
-	private dockArmed = false;
+	private freeflyFrom = -1;
 	private dockStaged = false; // the interior is mounted behind the fade
 	// When the camera came to rest (0 = it hasn't). Docking waits for this to have
 	// held for `dockDelayMs`, so a momentary pause between two moves doesn't grab you.
@@ -536,7 +665,6 @@ export class OrbitEngine {
 	// judged by feel rather than guessed. Fold the chosen value into DOCK_STILL_MS
 	// and delete this along with the key handling.
 	private dockDelayMs = DOCK_STILL_MS;
-	private readonly freeflyEntry = new Vector3();
 	// --- dwell inspection ---
 	// Which ids are discrete objects worth looking at (from the manifest), the
 	// dollhouse copy of each (the only per-object geometry that is BOTH published
@@ -667,6 +795,9 @@ export class OrbitEngine {
 		});
 		host.appendChild(this.iris);
 
+		this.reticle = buildReticle();
+		host.appendChild(this.reticle);
+
 		this.scene = new Scene();
 		this.scene.background = this.bgColor;
 		// Neutral IBL + hemisphere fill + a shadow-casting sun, on the same numbers
@@ -754,6 +885,8 @@ export class OrbitEngine {
 		window.addEventListener("keydown", this.onKeyDown);
 		window.addEventListener("keyup", this.onKeyUp);
 		window.addEventListener("blur", this.onWindowBlur);
+		document.addEventListener("pointerlockchange", this.onPointerLockChange);
+		document.addEventListener("mousemove", this.onLockedMouseMove);
 
 		this.ro = new ResizeObserver(() => this.resize());
 		this.ro.observe(host);
@@ -781,6 +914,9 @@ export class OrbitEngine {
 		window.removeEventListener("keydown", this.onKeyDown);
 		window.removeEventListener("keyup", this.onKeyUp);
 		window.removeEventListener("blur", this.onWindowBlur);
+		document.removeEventListener("pointerlockchange", this.onPointerLockChange);
+		document.removeEventListener("mousemove", this.onLockedMouseMove);
+		this.releaseLock();
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
 		this.clearScene();
 		this.splat.dispose();
@@ -793,6 +929,7 @@ export class OrbitEngine {
 		this.canvas.remove();
 		this.travelFade.remove();
 		this.iris.remove();
+		this.reticle.remove();
 		for (const l of this.sonarLabels) l.remove();
 	}
 
@@ -814,6 +951,81 @@ export class OrbitEngine {
 	private noteInput() {
 		this.lastInputAt = performance.now();
 		this.dwellPulsed = false;
+	}
+
+	// --- pointer lock ---------------------------------------------------------
+
+	// Requested only from real user gestures (a click, a movement key, a peek
+	// release), because browsers refuse it otherwise. A refusal is not an error: the
+	// drag rig is still there, so the worst case is the old behaviour.
+	// Deliberately does NOT gate on the mode. The gestures that buy a lock all fire
+	// while the mode is still something else — stepping inside is requested from the
+	// overview, releasing a peek from `peek` — so a mode guard here would reject
+	// exactly the calls that matter. onLockedMouseMove gates the effect instead, so a
+	// lock held across a flight moves nothing.
+	private requestLock() {
+		if (this.locked) return;
+		const pending = this.canvas.requestPointerLock?.() as unknown;
+		if (pending instanceof Promise) pending.catch(() => {});
+	}
+
+	private releaseLock() {
+		if (this.locked) document.exitPointerLock?.();
+	}
+
+	private onPointerLockChange = () => {
+		const locked = document.pointerLockElement === this.canvas;
+		if (locked === this.locked) return;
+		this.locked = locked;
+		if (locked) {
+			// A drag cannot survive into a locked look: clientX/Y freeze the moment the
+			// lock takes, so pinLook would keep solving against a stale pointer.
+			this.dragging = false;
+			this.canvas.style.cursor = "";
+		} else {
+			this.unlockedAt = performance.now();
+		}
+		this.stopLookInertia(); // 1:1 mouse look has no coast, and neither does taking hold
+		this.emit();
+	};
+
+	// Turn the view by raw pointer deltas. On `document` rather than the canvas
+	// because that is where the browser delivers movement for a locked pointer, and
+	// mirroring PointerLockControls here keeps it working across browsers.
+	//
+	// Signs follow the rig: lon increases toward the "right" basis vector used by the
+	// movement code, and lat is elevation, so pushing the mouse down looks down.
+	private onLockedMouseMove = (ev: MouseEvent) => {
+		if (!this.locked || !this.isLookMode || this.interiorBusy) return;
+		this.lon += (ev.movementX || 0) * LOOK_SENSITIVITY;
+		this.lat -= (ev.movementY || 0) * LOOK_SENSITIVITY;
+		this.noteInput();
+	};
+
+	// Whether this Escape was spent releasing the pointer. Returns true when it was,
+	// so the caller leaves the mode alone — the first Esc buys back the cursor, and
+	// only a second one actually goes anywhere.
+	private consumeEscape(): boolean {
+		if (this.locked) {
+			this.releaseLock();
+			return true;
+		}
+		return performance.now() - this.unlockedAt < ESCAPE_GRACE_MS;
+	}
+
+	// Where the reticle sits and what a click acts on. Centred, it is the middle of
+	// the viewport regardless of the pointer; otherwise it is the pointer itself.
+	// Returns a shared scratch object — read it, don't keep it.
+	private aim(): { x: number; y: number } {
+		if (!CENTER_CURSOR) {
+			_aim.x = this.pointerClientX;
+			_aim.y = this.pointerClientY;
+			return _aim;
+		}
+		const r = this.canvas.getBoundingClientRect();
+		_aim.x = r.left + r.width / 2;
+		_aim.y = r.top + r.height / 2;
+		return _aim;
 	}
 
 	// The two first-person modes. Both are a yaw/pitch rig driven by the same
@@ -907,6 +1119,7 @@ export class OrbitEngine {
 			splatView: this.splatEnabled,
 			canSplatView: this.canToggleSplatView(),
 			splatTransform: this.splat.ready ? this.splatTransform : null,
+			mouseLook: this.locked,
 			// TEMPORARY, surfaced only so the settle delay can be read while tuning it.
 			dockDelayMs: this.dockDelayMs,
 			freeflySpeed: this.freeflySpeed,
@@ -1115,6 +1328,13 @@ export class OrbitEngine {
 		this.downX = ev.clientX;
 		this.downY = ev.clientY;
 		if (!this.isLookMode) return;
+		// Clicking the view is how you take hold of it again after Esc handed the cursor
+		// back. That click is spent on the lock and nothing else — travelling as well
+		// would send you somewhere you were only trying to look.
+		if (!this.locked) {
+			this.requestLock();
+			this.lockClickPending = true;
+		}
 		this.yieldTour(); // before the busy gate, so a click lands mid-hop too
 		if (this.interiorBusy) return;
 		this.noteInput();
@@ -1160,7 +1380,10 @@ export class OrbitEngine {
 			return;
 		}
 		if (!this.isLookMode) return;
-		if (this.dragging) {
+		// A locked pointer reports frozen clientX/Y — only movementX/Y move — so pinLook
+		// would solve against a stale position forever. onLockedMouseMove owns the look
+		// while the lock is held.
+		if (this.dragging && !this.locked) {
 			this.noteInput();
 			const look = pinLook(
 				this.camera,
@@ -1194,21 +1417,35 @@ export class OrbitEngine {
 				this.markers.setNavHover(null);
 				this.emit();
 			}
-		} else if (this.mode === "interior" && !this.interiorBusy) {
-			// Free flight has no standing affordances to hover; its cursor is
-			// resolved per-frame in updateCursorRing instead.
-			this.updateHover(ev);
+		} else if (
+			this.mode === "interior" &&
+			!this.interiorBusy &&
+			!CENTER_CURSOR
+		) {
+			// Pointer-driven hover only. With a centred reticle what you are sighted on
+			// changes when the CAMERA turns, not when the mouse moves, so resolving it
+			// here would leave it stale through every look — the tick owns it instead.
+			// Free flight has no standing affordances to hover either way.
+			this.updateHover(ev.clientX, ev.clientY);
 		}
 	};
 
-	private onPointerUp = (ev: PointerEvent) => {
+	private onPointerUp = () => {
 		if (!this.isLookMode) return;
 		this.dragging = false;
 		this.canvas.style.cursor = "";
+		if (this.lockClickPending) {
+			this.lockClickPending = false;
+			return;
+		}
 		if (this.dragMoved >= 5) return;
 		this.noteInput();
+		// Everything a click resolves against comes from the same aim point the reticle
+		// is drawn at, so you can never act on something other than what you are sighted
+		// on. With CENTER_CURSOR that is the middle of the frame; otherwise the pointer.
+		const at = this.aim();
 		if (this.mode === "freefly") {
-			this.clickFromFreefly(ev.clientX, ev.clientY);
+			this.clickFromFreefly(at.x, at.y);
 			return;
 		}
 		// A floor arrow takes the click first: it is the only thing under the cursor
@@ -1216,8 +1453,8 @@ export class OrbitEngine {
 		// click-anywhere routing snaps to the node minimizing graph cost + angular
 		// deviation.
 		const arrow = this.markers.pickFloorArrow(
-			ev.clientX,
-			ev.clientY,
+			at.x,
+			at.y,
 			this.camera,
 			this.canvas,
 		);
@@ -1225,17 +1462,12 @@ export class OrbitEngine {
 			this.traverse(arrow.userData.to as number);
 			return;
 		}
-		const spot = this.markers.pickNav(
-			ev.clientX,
-			ev.clientY,
-			this.camera,
-			this.canvas,
-		);
+		const spot = this.markers.pickNav(at.x, at.y, this.camera, this.canvas);
 		if (spot) {
 			this.traverse(spot.userData.to as number);
 			return;
 		}
-		this.clickAnywhere(ev.clientX, ev.clientY);
+		this.clickAnywhere(at.x, at.y);
 	};
 
 	private setFov(deg: number) {
@@ -1249,7 +1481,20 @@ export class OrbitEngine {
 	// makes the same gesture zoom the same amount everywhere, and the clamp stops one
 	// violent trackpad flick from crossing the whole range in a single event.
 	private wheelNotches(ev: WheelEvent): number {
-		const perNotch = ev.deltaMode === 1 ? 3 : ev.deltaMode === 2 ? 1 : 100;
+		// Normalizing the UNITS is not enough — the densities differ too. A mouse emits
+		// ONE large discrete delta per detent (~100-120 px); a trackpad emits a stream
+		// of small ones, so the same physical gesture arrives as roughly ten times the
+		// total. Treating them alike is what let a single swipe cross an entire range.
+		// Magnitude is the only signal that separates them, since both report
+		// deltaMode 0.
+		const perNotch =
+			ev.deltaMode === 1
+				? 3
+				: ev.deltaMode === 2
+					? 1
+					: Math.abs(ev.deltaY) >= 40
+						? 100 // discrete wheel detent
+						: 400; // continuous trackpad stream
 		return MathUtils.clamp(ev.deltaY / perNotch, -3, 3);
 	}
 
@@ -1293,7 +1538,9 @@ export class OrbitEngine {
 
 	private onPointerLeave = () => {
 		this.pointerInside = false;
-		this.cursor.hide();
+		// A centred reticle is not the pointer's, so the pointer leaving says nothing
+		// about whether it should be shown — updateCursorRing keeps owning it.
+		if (!CENTER_CURSOR) this.cursor.hide();
 	};
 	private onWindowPointerUp = () => this.peekUp();
 
@@ -1336,10 +1583,17 @@ export class OrbitEngine {
 			}
 			if (ev.code === "Escape") {
 				ev.preventDefault();
+				// Two-stage exit: the first Esc hands the cursor back so the chrome is
+				// reachable, and only a second one leaves free flight. Without this the
+				// browser's own lock exit and our handler would both fire on one keypress.
+				if (this.consumeEscape()) return;
 				// Always a way back to the walkthrough, whatever the cursor is over.
 				this.returnToInterior(this.nearestPanoTo(this.camera.position));
 				return;
 			}
+			// Asking to move is asking to look: a movement key re-takes the pointer if
+			// Esc had released it.
+			this.requestLock();
 			this.trackFreeflyKey(ev, true);
 			return;
 		}
@@ -1351,6 +1605,8 @@ export class OrbitEngine {
 			return;
 		}
 		if (ev.code === "Escape") {
+			// Same two-stage rule as free flight: the cursor comes back first.
+			if (this.consumeEscape()) return;
 			this.yieldTour();
 			if (this.markers.sonarActive) {
 				this.markers.hideSonar();
@@ -1383,6 +1639,7 @@ export class OrbitEngine {
 		const flyKey = freeflyKey(ev.code);
 		if (flyKey !== null && FREEFLY_ENTER_KEYS.has(flyKey) && this.canEnterFreefly()) {
 			ev.preventDefault();
+			this.requestLock(); // this keypress is the gesture that buys the lock
 			this.freeflyKeys.add(flyKey);
 			this.enterFreefly();
 			return;
@@ -1440,12 +1697,14 @@ export class OrbitEngine {
 		this.stopLookInertia();
 	};
 
-	// Interior hover: light the affordance under the cursor + surface its preview.
-	private updateHover(ev: PointerEvent) {
+	// Interior hover: light the affordance under the aim point + surface its preview.
+	// Takes coordinates rather than an event because the aim point has two possible
+	// sources — the pointer, or the centre of the frame (see `aim`).
+	private updateHover(aimX: number, aimY: number) {
 		if (this.currentIndex < 0) return;
 		const arrow = this.markers.pickFloorArrow(
-			ev.clientX,
-			ev.clientY,
+			aimX,
+			aimY,
 			this.camera,
 			this.canvas,
 		);
@@ -1471,8 +1730,8 @@ export class OrbitEngine {
 			this.emit();
 		}
 		const spot = this.markers.pickNav(
-			ev.clientX,
-			ev.clientY,
+			aimX,
+			aimY,
 			this.camera,
 			this.canvas,
 		);
@@ -1480,8 +1739,8 @@ export class OrbitEngine {
 		const idx = spot ? (spot.userData.to as number) : -1;
 		const obj = this.highlightEnabled
 			? this.addressing.pickAt(
-					ev.clientX,
-					ev.clientY,
+					aimX,
+					aimY,
 					this.activeObjectRoot(),
 				)
 			: null;
@@ -1499,7 +1758,7 @@ export class OrbitEngine {
 			// Nothing to aim at here. If the ray leaves the scene entirely, this click
 			// pulls back out to the orbit (see clickAnywhere) — advertise that instead
 			// of letting it happen by surprise.
-			this.canvas.style.cursor = this.raycastInterior(ev.clientX, ev.clientY)
+			this.canvas.style.cursor = this.raycastInterior(aimX, aimY)
 				? ""
 				: "zoom-out";
 		}
@@ -2329,6 +2588,10 @@ export class OrbitEngine {
 		if (this.mode !== "overview" || this.panos.length === 0) return;
 		const idx = index ?? this.nearestPanoTo(this.controls.target);
 		this.history = []; // a fresh interior session
+		// Requested HERE, inside the click or button press that asked to step inside,
+		// because that is the gesture the browser will honour — by the time the fly-in
+		// lands there is no activation left to spend.
+		this.requestLock();
 		this.flyIntoInterior(idx, 1100);
 	}
 
@@ -2408,9 +2671,10 @@ export class OrbitEngine {
 		this.dockTarget = -1;
 		this.dockReveal = 0;
 		this.dockStaged = false;
-		this.dockArmed = false;
 		this.dockStillSince = 0;
-		this.freeflyEntry.copy(this.camera.position);
+		this.freeflySpeed = 1; // every excursion starts at a speed you can predict
+		// The anchor being left. Held off from docking only while still beside it.
+		this.freeflyFrom = this.currentIndex;
 
 		const tex =
 			this.currentIndex >= 0 ? this.panos[this.currentIndex]?.texture : null;
@@ -2510,13 +2774,25 @@ export class OrbitEngine {
 	private dockCandidate(): number {
 		const cam = this.camera.position;
 		const camLevel = this.hasFloorVolumes ? this.floorAt(cam) : -1;
+		// The anchor free flight started on is off-limits only while you are still
+		// standing around it. Step outside its radius and it becomes an ordinary
+		// candidate again, so flying away and coming back does settle.
+		const from = this.freeflyFrom;
+		const holdingOff =
+			from >= 0 &&
+			cam.distanceTo(v3(this.panos[from].position)) <= this.dockRadius;
 		let best = -1;
 		let bestD = this.dockRadius;
 		for (let i = 0; i < this.panos.length; i++) {
+			if (holdingOff && i === from) continue;
 			const p = v3(this.panos[i].position);
-			if (Math.abs(p.y - cam.y) > DOCK_MAX_DY) continue;
+			const dy = p.y - cam.y;
+			if (Math.abs(dy) > DOCK_MAX_DY) continue;
 			if (camLevel >= 0 && this.panoLevel[i] !== camLevel) continue;
-			const d = cam.distanceTo(p);
+			// Vertical offset costs more than horizontal — see DOCK_DY_WEIGHT. This is
+			// the value ranked on as well as gated on, so being level with an anchor
+			// beats being above a nearer one.
+			const d = Math.hypot(p.x - cam.x, dy * DOCK_DY_WEIGHT, p.z - cam.z);
 			if (d >= bestD) continue;
 			// No texture yet means the projection would fade in black, so leave it be;
 			// requesting it now makes the next pass eligible.
@@ -2607,6 +2883,8 @@ export class OrbitEngine {
 	// the camera pulled away, then the dollhouse appeared underneath it.
 	exit() {
 		if (this.mode !== "interior" || this.interiorBusy) return;
+		// The overview is orbited and clicked, so it needs a cursor.
+		this.releaseLock();
 		this.director.abort();
 		this.hoveredNavIndex = -1;
 		this.markers.setNavHover(null);
@@ -2791,6 +3069,8 @@ export class OrbitEngine {
 
 	private peekStart() {
 		if (this.mode !== "interior" || this.interiorBusy) return;
+		// Locating is an orbit view; hand the cursor back for it.
+		this.releaseLock();
 		this.savedInterior = {
 			pos: this.camera.position.clone(),
 			lon: this.lon,
@@ -2853,6 +3133,8 @@ export class OrbitEngine {
 		if (!this.peekHeld) return;
 		this.peekHeld = false;
 		this.onHold?.(false);
+		// The release is the gesture, so take the pointer back on the way in.
+		this.requestLock();
 		if (this.mode === "peek") this.peekEnd();
 	}
 
@@ -2941,7 +3223,7 @@ export class OrbitEngine {
 		this.dockTarget = -1;
 		this.dockReveal = 0;
 		this.dockStaged = false;
-		this.dockArmed = false;
+		this.freeflyFrom = -1;
 		this.dockStillSince = 0;
 		this.stopLookInertia(); // a new scene must not inherit the last one's spin
 		this.scene.background = this.bgColor;
@@ -2949,6 +3231,8 @@ export class OrbitEngine {
 		// canvas and render washed out for the rest of the session.
 		this.canvas.style.opacity = "1";
 		this.addressing.reset();
+		this.releaseLock(); // a new scene starts in the overview, which needs a cursor
+		this.lockClickPending = false;
 		this.canvas.style.cursor = "";
 		this.clearFx();
 		for (const l of this.sonarLabels) l.style.display = "none";
@@ -3318,14 +3602,17 @@ export class OrbitEngine {
 		this.inspectPivot = pivot;
 		const rect = this.canvas.getBoundingClientRect();
 		const m = INSPECT_MARGIN;
+		// Offset from the AIM point, so the inset appears beside whatever summoned it —
+		// the pointer when pointing, the reticle when sighted.
+		const at = this.aim();
 		this.inspect = {
 			label,
 			x: Math.min(
-				Math.max(this.pointerClientX + INSPECT_GAP, rect.left + m),
+				Math.max(at.x + INSPECT_GAP, rect.left + m),
 				rect.right - INSPECT_SIZE - m,
 			),
 			y: Math.min(
-				Math.max(this.pointerClientY - INSPECT_SIZE - INSPECT_GAP, rect.top + m),
+				Math.max(at.y - INSPECT_SIZE - INSPECT_GAP, rect.top + m),
 				rect.bottom - INSPECT_SIZE - m,
 			),
 			w: INSPECT_SIZE,
@@ -3547,6 +3834,14 @@ export class OrbitEngine {
 			this.director.tick(now);
 			this.tickLook(dt);
 			if (!this.interiorBusy) {
+				// A centred reticle is aimed by TURNING, so what it is sighted on changes
+				// on camera motion rather than on pointer events — which makes hover a
+				// per-frame question. (In pointer mode onPointerMove still owns it, and
+				// resolving it again here would be wasted work every frame.)
+				if (CENTER_CURSOR) {
+					const at = this.aim();
+					this.updateHover(at.x, at.y);
+				}
 				this.markers.updateNav(
 					this.camera,
 					this.lon,
@@ -3632,13 +3927,10 @@ export class OrbitEngine {
 			this.sceneMaxDim * FREEFLY_SPEED_FRAC * this.freeflySpeed,
 		);
 		// --- docking ---------------------------------------------------------
+		// No global arming gate: the only anchor that has to be held off is the one this
+		// excursion started on, and dockCandidate excludes just that one, just while you
+		// are still beside it.
 		const topSpeed = this.sceneMaxDim * FREEFLY_SPEED_FRAC;
-		if (
-			!this.dockArmed &&
-			this.camera.position.distanceTo(this.freeflyEntry) > this.dockRadius
-		) {
-			this.dockArmed = true; // you have genuinely left; docking may now fire
-		}
 		// Stillness is tracked as a HELD state, not sampled at an instant: the clock
 		// starts when the camera comes to rest and is thrown away the moment it moves
 		// again, so a pause on the way between two places never counts as arriving.
@@ -3656,7 +3948,6 @@ export class OrbitEngine {
 			this.cancelDock();
 		} else if (
 			this.dockTarget < 0 &&
-			this.dockArmed &&
 			this.projectionMode &&
 			this.splat.isActive &&
 			this.dockStillSince > 0 &&
@@ -3781,12 +4072,23 @@ export class OrbitEngine {
 		const active =
 			this.isLookMode &&
 			!this.interiorBusy &&
-			this.pointerInside &&
+			// A centred reticle belongs to the camera, not the mouse, so it must stay up
+			// whether or not the pointer happens to be over the canvas — the alternative
+			// is a sight that blinks out when you move your hand off the viewport.
+			(CENTER_CURSOR || this.pointerInside) &&
 			!this.markers.hoveredNav &&
 			!this.markers.hoveredArrow;
-		const hit = active
-			? this.raycastInterior(this.pointerClientX, this.pointerClientY)
-			: null;
+		const at = this.aim();
+		const hit = active ? this.raycastInterior(at.x, at.y) : null;
+		// One reticle, not two — but ONLY while the pointer is locked, where there is no
+		// OS cursor to conflict with anyway. Released, the cursor must come back: Esc's
+		// whole job is handing it over so the chrome can be reached, and hiding it here
+		// would take back the thing that keypress just gave. (The pointer-relative
+		// cursor hints updateHover sets are meaningless with a centred aim point, so
+		// clearing them is the honest default.)
+		if (CENTER_CURSOR && this.isLookMode) {
+			this.canvas.style.cursor = this.locked ? "none" : "";
+		}
 		let ghosted = false;
 		let reach: ReachTarget | null = null;
 		// Where a click from here would carry the eye. The cursor turns this into its
@@ -3952,6 +4254,23 @@ export class OrbitEngine {
 			this.emit();
 		}
 		this.cursor.update(hit, this.camera, this.host.clientHeight, travel);
+		// Deliberately NOT gated on `active`: that also goes false when an affordance is
+		// hovered, and since affordances are picked at the aim point too, the reticle
+		// would blink out exactly when it is sighted on something worth clicking.
+		this.setReticle(this.isLookMode && !this.interiorBusy, !!hit);
+	}
+
+	// Show the crosshair, and say whether it found anything. Writes only on change, so
+	// a per-frame call costs nothing and can never thrash layout against the
+	// getBoundingClientRect reads elsewhere in the frame.
+	private setReticle(show: boolean, onSurface: boolean) {
+		const want =
+			!CENTER_CURSOR || !show
+				? "0"
+				: onSurface
+					? String(RETICLE_ON_SURFACE)
+					: String(RETICLE_IN_VOID);
+		if (this.reticle.style.opacity !== want) this.reticle.style.opacity = want;
 	}
 
 	// X-ray name tags for the nearest sonar nodes (engine-owned DOM pool, so the

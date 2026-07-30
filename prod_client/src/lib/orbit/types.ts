@@ -225,6 +225,10 @@ export type OrbitState = {
 	// walkthrough instead, where the camera is pinned and cannot travel). Surfaced so
 	// the HUD can show what the wheel just changed.
 	freeflySpeed: number;
+	// Whether the pointer is locked, i.e. the mouse turns the view directly. Drives the
+	// hint, because Escape means something different either side of it: released, it
+	// leaves the mode; held, it only hands the cursor back.
+	mouseLook: boolean;
 	highlightEnabled: boolean; // hover-highlight the object under the cursor (toggleable)
 	canHighlight: boolean; // hover-highlight applies in this mode (overview / interior w/ objects)
 	contextMenu: ObjectMenu | null;
@@ -313,6 +317,7 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	splatTransform: null,
 	dockDelayMs: 500,
 	freeflySpeed: 1,
+	mouseLook: false,
 	highlightEnabled: true,
 	canHighlight: false,
 	contextMenu: null,

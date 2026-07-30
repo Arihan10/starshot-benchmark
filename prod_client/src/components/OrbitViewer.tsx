@@ -1454,6 +1454,17 @@ function hudContent(state: OrbitState): ReactNode {
 				<strong>{currentName ?? currentId}</strong> ·{" "}
 				<strong>WASD</strong> move · <strong>Space/Shift</strong> fly ·{" "}
 				<strong>Tab</strong> ping · <strong>M</strong> places
+				{state.mouseLook ? (
+					<>
+						{" "}
+						· <strong>Esc</strong> for cursor
+					</>
+				) : (
+					<>
+						{" "}
+						· <strong>click</strong> to look
+					</>
+				)}
 			</>
 		);
 	}
@@ -1464,7 +1475,7 @@ function hudContent(state: OrbitState): ReactNode {
 				<strong>wheel</strong> speed{" "}
 				<strong>{state.freeflySpeed.toFixed(2)}×</strong> ·{" "}
 				<strong>click</strong> or <strong>stop</strong> near a viewpoint to land ·{" "}
-				<strong>Esc</strong> back
+				<strong>Esc</strong> {state.mouseLook ? "for cursor" : "back"}
 				{/* TEMPORARY: readout for the settle delay while it is tuned by feel. */}
 				<span className='text-neutral-500'>
 					{" "}
