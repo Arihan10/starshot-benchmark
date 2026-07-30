@@ -217,6 +217,14 @@ export type OrbitState = {
 		rotation: [number, number, number];
 		scale: number;
 	} | null;
+	// TEMPORARY. How long free flight must sit still before it settles onto a nearby
+	// viewpoint, surfaced only so the value can be read while it is tuned by feel
+	// ([ and ] adjust it). Delete once a number is locked into DOCK_STILL_MS.
+	dockDelayMs: number;
+	// Free flight's speed multiplier, driven by the wheel there (the wheel zooms in the
+	// walkthrough instead, where the camera is pinned and cannot travel). Surfaced so
+	// the HUD can show what the wheel just changed.
+	freeflySpeed: number;
 	highlightEnabled: boolean; // hover-highlight the object under the cursor (toggleable)
 	canHighlight: boolean; // hover-highlight applies in this mode (overview / interior w/ objects)
 	contextMenu: ObjectMenu | null;
@@ -303,6 +311,8 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	splatView: false,
 	canSplatView: false,
 	splatTransform: null,
+	dockDelayMs: 500,
+	freeflySpeed: 1,
 	highlightEnabled: true,
 	canHighlight: false,
 	contextMenu: null,

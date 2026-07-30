@@ -136,6 +136,43 @@ const HANDOVER_WAIT_MS = 1000;
 // reasoning `enter()` uses for the dollhouse handover. Short, because unlike that
 // handover there is nothing to stream and waiting would just read as lag.
 const SPLAT_REVEAL_MS = 320;
+// ...but stretched when there is a ZOOM to unwind as well.
+//
+// Every other handover in the engine animates the field of view through startFly —
+// entering the interior, exiting to the overview, and both halves of hold-to-locate
+// all lerp it. This dissolve is the one that cannot, because it is the only handover
+// with no flight to carry it: the camera is already exactly where it belongs.
+//
+// So the dissolve absorbs the lens change instead, and buys itself the room to do it
+// by lasting longer in proportion to how far the lens has to travel. Unzoomed, there
+// is nothing to reconcile and it stays as snappy as it is now; zoomed right in, it
+// takes about twice as long — the transition costs time only when it has work to do.
+const REVEAL_FOV_MS_PER_DEG = 10;
+const SPLAT_REVEAL_MAX_MS = 700;
+// The lens free flight settles at. Equal to INTERIOR_FOV on purpose: matching them
+// means the common case (no zoom applied) needs no reconciliation at all.
+const FREEFLY_FOV = INTERIOR_FOV;
+
+// --- zoom -------------------------------------------------------------------
+//
+// Zoom is MULTIPLICATIVE on the half-angle tangent — i.e. on focal length — because
+// that is how zoom is perceived. The old code added degrees linearly, which is
+// imperceptible at the wide end and violent at the narrow end of the same range.
+//
+// The range is bounded by what the panoramas can actually support, not by what the
+// projection matrix allows. They are 4096x2048, so 180 degrees vertical is 2048 px:
+// past roughly 45 degrees you are magnifying under 600 pano pixels across the whole
+// viewport and zooming IN makes the image softer, which reads as a bug. 90 degrees is
+// the other end, where rectilinear stretch at the frame edges starts to look wrong.
+const ZOOM_MIN_FOV = 45;
+const ZOOM_MAX_FOV = 90;
+const ZOOM_PER_NOTCH = 0.12;
+// Flight-speed range for the wheel in free flight. The wheel does NOT dolly there:
+// W already flies forward, so a dolly would be a slower duplicate of a key the user
+// is already holding. Speed is the axis a free camera actually wants, and keeping FOV
+// out of free flight is what leaves exactly one place where zoom has to be reconciled.
+const FREEFLY_SPEED_MIN = 0.25;
+const FREEFLY_SPEED_MAX = 4;
 // Coming back IS a flight (you are in open space, the destination is a capture
 // point), so it reuses the enter() path wholesale — arc, FOV opening, arrival
 // crossfade and all. A touch quicker than entering from the dollhouse, since the
@@ -150,10 +187,83 @@ const DISSOLVE_START = 0.32;
 // Flight speed as a fraction of the scene's largest dimension per second, so a
 // cathedral and a bathroom both take a sensible time to cross.
 const FREEFLY_SPEED_FRAC = 0.18;
-const FREEFLY_SPRINT = 3;
-// Velocity easing. Enough to take the edge off starting and stopping without
-// feeling like ice — the movement should read as deliberate, not floaty.
-const FREEFLY_ACCEL_TAU = 90; // ms
+// There is no sprint modifier: Shift now descends. At this fraction a building-scale
+// scene crosses in a few seconds anyway, so the multiplier was a convenience rather
+// than a necessity — but if it is wanted back it needs a key that is safe to hold
+// alongside WASD, which rules out Ctrl (Ctrl+W closes the tab).
+// Velocity easing — ONE time constant, deliberately short, for both pressing and
+// releasing.
+//
+// A long release tail was tried and removed: it gives the camera a pleasant weight
+// but makes it impossible to put the eye exactly where you want it, because the
+// camera keeps travelling after you have stopped asking. In a tool whose whole
+// purpose is choosing a vantage, precision beats momentum. Short enough to feel
+// direct, long enough not to be a hard edge.
+//
+// Docking therefore triggers on a genuine STOP rather than on a slow glide — with
+// this curve, "stopped" is a real state that arrives promptly instead of something
+// asymptotic you have to threshold.
+const FREEFLY_VEL_TAU = 90; // ms
+
+// --- docking ----------------------------------------------------------------
+//
+// Catching the glide as it SLOWS, not once it stops: a visitor almost never comes to
+// a genuine halt before setting off again, so a zero-velocity trigger would nearly
+// never fire. Slowing down near a viewpoint is the real signal that someone wants to
+// look at something rather than travel past it.
+//
+// It is a DRIFT, not a flight. The dock only replaces the velocity TARGET the
+// free-flight integrator is already easing toward, so the camera curves into the
+// anchor with its velocity unbroken. Triggering a scripted flight instead would zero
+// the glide and restart from a standstill — a hitch precisely where the motion is
+// supposed to be seamless. It also means a keypress cancels by simply becoming the
+// target again: there is no animation to interrupt.
+// What counts as STOPPED, as a fraction of base top speed. With the short velocity
+// tau above, the camera crosses this within a few hundred ms of the last keypress,
+// so it reads as "the user has actually finished moving" rather than "the user is
+// still travelling slowly".
+const DOCK_STILL_SPEED_FRAC = 0.01;
+// How long that stillness has to HOLD before the settle begins. This is the number
+// that decides whether docking feels attentive or impatient, and it can only be
+// judged by feel — so it is live-adjustable in free flight with [ and ] while a
+// value is being chosen (see `dockDelayMs`). Once settled, lock it here and remove
+// the keys.
+const DOCK_STILL_MS = 500;
+const DOCK_RADIUS_FRAC = 0.08; // of the scene's extent...
+const DOCK_RADIUS_MIN = 2.0; // ...clamped, so scale can't make it absurd
+const DOCK_RADIUS_MAX = 5.0;
+// Vertical tolerance, deliberately TIGHTER than the horizontal radius rather than
+// equal to it.
+//
+// It does two jobs. It keeps the dock on one storey without needing the floor plan,
+// so it holds on tours whose floors carry no volumes. And it caps how far the camera
+// can be moved DOWNWARD against the user's wishes — an unasked-for pull reads far
+// worse vertically than horizontally, because it feels like gravity taking the
+// controls. At this width you have to be within roughly a standing height of the
+// anchor for it to claim you, so hovering deliberately above a viewpoint leaves you
+// hovering.
+const DOCK_MAX_DY = 1.0;
+const DOCK_SEEK_GAIN = 2.6; // 1/s — the pull toward the anchor; the integrator damps it
+const DOCK_ARRIVE = 0.12; // m — close enough to hand over without visible motion
+const DOCK_REVEAL_DIST = 2.2; // m — the interior is fully faded in by here
+const DOCK_REVEAL_TAU = 150; // ms — eases the reveal BOTH ways, so a cancel fades out
+
+// --- look inertia -----------------------------------------------------------
+//
+// The look rig is DIRECT MANIPULATION: pinLook solves for the angles that keep the
+// grabbed point under the cursor, so lon/lat track the pointer exactly and stop the
+// instant it does. That is right while dragging and wrong on release — a flick should
+// coast. So the drag's angular rate is estimated as it happens and, once released,
+// integrated with an exponential decay.
+//
+// Two time constants, because they answer different questions. GLIDE is how long a
+// released flick coasts. SAMPLE is how fast the rate ESTIMATE goes stale while still
+// dragging, and it is what separates a flick from a drag-and-hold: hold the pointer
+// still for a moment before letting go and the estimate has already decayed to
+// nothing, so the camera stays exactly where you put it.
+const LOOK_GLIDE_TAU = 420; // ms
+const LOOK_SAMPLE_TAU = 90; // ms
+const LOOK_VEL_MIN = 0.012; // rad/s — below this, stop rather than creep forever
 // What flies the camera once you are out there. Q/E are vertical here, where in
 // the walkthrough they snap-turn — a rig pinned to an anchor has nowhere to rise
 // to, and a rig in open space has no need to turn in 45° steps.
@@ -164,10 +274,29 @@ const FREEFLY_MOVE_KEYS = new Set([
 	"KeyD",
 	"KeyQ",
 	"KeyE",
+	"Space",
+	"Shift",
 ]);
-// ...and which of them, pressed inside the walkthrough, mean "let me fly". Only
-// the four horizontal ones: Q/E still belong to snap-turning until you have left.
-const FREEFLY_ENTER_KEYS = new Set(["KeyW", "KeyA", "KeyS", "KeyD"]);
+// ...and which of them, pressed inside the walkthrough, mean "let me fly". The four
+// horizontal ones plus the primary vertical pair: asking to move in any direction is
+// asking to leave. Q/E are deliberately NOT here — they are aliases for people
+// already on the left of the keyboard, and they do nothing at all in the walkthrough.
+const FREEFLY_ENTER_KEYS = new Set([
+	"KeyW",
+	"KeyA",
+	"KeyS",
+	"KeyD",
+	"Space",
+	"Shift",
+]);
+
+// One name per control, so the two physical Shift keys cannot leave each other
+// latched down, and so the enter/track paths agree on what a key is called.
+// Returns null for anything that is not a movement control.
+function freeflyKey(code: string): string | null {
+	if (code === "ShiftLeft" || code === "ShiftRight") return "Shift";
+	return FREEFLY_MOVE_KEYS.has(code) ? code : null;
+}
 
 // There is deliberately NO default splat transform here.
 //
@@ -373,9 +502,41 @@ export class OrbitEngine {
 	// than blocking it, so movement responds from the first frame.
 	private splatReveal = 0;
 	private splatRevealing = false;
+	// Duration and starting lens of the current reveal. Both are per-transition
+	// because the dissolve stretches to absorb however much zoom has to be unwound.
+	private splatRevealMs = SPLAT_REVEAL_MS;
+	private revealFovFrom = FREEFLY_FOV;
+	// Flight-speed multiplier, driven by the wheel in free flight. Persists across
+	// free-flight sessions within a scene — it is a property of how the visitor wants
+	// to travel, not of one excursion.
+	private freeflySpeed = 1;
 	// Held movement keys + the eased velocity they drive, in world units/sec.
 	private readonly freeflyKeys = new Set<string>();
 	private readonly freeflyVel = new Vector3();
+	// Angular velocity of the look rig, rad/sec, shared by BOTH first-person modes —
+	// they are one yaw/pitch rig, so a flick coasts the same way inside the
+	// walkthrough as it does in flight. Sampled from the drag, integrated on release.
+	private readonly lookVel = { lon: 0, lat: 0 };
+	private lookSampledAt = 0;
+	// The anchor the glide is currently settling onto (-1 = none), how far the
+	// interior has faded in for it, and whether docking is allowed to fire at all.
+	//
+	// `dockArmed` exists because free flight BEGINS standing on an anchor at zero
+	// velocity — every dock condition is already satisfied the instant you arrive, so
+	// without it you would be pulled straight back and free flight would be
+	// impossible to enter. It arms only once you have genuinely left.
+	private dockTarget = -1;
+	private dockReveal = 0;
+	private dockArmed = false;
+	private dockStaged = false; // the interior is mounted behind the fade
+	// When the camera came to rest (0 = it hasn't). Docking waits for this to have
+	// held for `dockDelayMs`, so a momentary pause between two moves doesn't grab you.
+	private dockStillSince = 0;
+	// TEMPORARY tuning knob: [ and ] adjust it in free flight so the delay can be
+	// judged by feel rather than guessed. Fold the chosen value into DOCK_STILL_MS
+	// and delete this along with the key handling.
+	private dockDelayMs = DOCK_STILL_MS;
+	private readonly freeflyEntry = new Vector3();
 	// --- dwell inspection ---
 	// Which ids are discrete objects worth looking at (from the manifest), the
 	// dollhouse copy of each (the only per-object geometry that is BOTH published
@@ -662,6 +823,48 @@ export class OrbitEngine {
 		return this.mode === "interior" || this.mode === "freefly";
 	}
 
+	// Drop the coast. Called wherever the SYSTEM takes the camera — a flight, a hop,
+	// a snap turn, the auto tour — because a leftover flick would either fight the
+	// pose being animated to or, worse, wait out the flight frozen and then rotate
+	// the view a moment after arrival, which reads as the scene twitching on its own.
+	private stopLookInertia() {
+		this.lookVel.lon = 0;
+		this.lookVel.lat = 0;
+		this.lookSampledAt = 0;
+	}
+
+	// Advance the look rig one frame and aim the camera.
+	//
+	// While DRAGGING, lon/lat are already exact (pinLook solved them from the
+	// pointer), so nothing is integrated — but the rate estimate is decayed, which is
+	// what makes holding still before release let go cleanly instead of flicking.
+	// Once released the stored rate is integrated and decayed, so the view coasts.
+	private tickLook(dt: number) {
+		if (this.dragging) {
+			const stale = Math.exp(-(dt * 1000) / LOOK_SAMPLE_TAU);
+			this.lookVel.lon *= stale;
+			this.lookVel.lat *= stale;
+		} else if (!this.reducedMotion && !this.director.active) {
+			// The tour writes these angles itself, so coasting during one would be two
+			// authors fighting over the same rig.
+			if (Math.hypot(this.lookVel.lon, this.lookVel.lat) > LOOK_VEL_MIN) {
+				this.lon += this.lookVel.lon * dt;
+				this.lat += this.lookVel.lat * dt;
+				const decay = Math.exp(-(dt * 1000) / LOOK_GLIDE_TAU);
+				this.lookVel.lon *= decay;
+				this.lookVel.lat *= decay;
+			} else {
+				this.lookVel.lon = 0;
+				this.lookVel.lat = 0;
+			}
+		}
+		const wanted = this.lat;
+		this.lat = applyLook(this.camera, this.lon, this.lat);
+		// Pressed against the pitch limit: kill that component so the coast doesn't
+		// sit there straining against a clamp it can never pass.
+		if (this.lat !== wanted) this.lookVel.lat = 0;
+	}
+
 	// --- state emission (gated so chrome holds through camera flights) --------
 
 	private emit() {
@@ -704,6 +907,9 @@ export class OrbitEngine {
 			splatView: this.splatEnabled,
 			canSplatView: this.canToggleSplatView(),
 			splatTransform: this.splat.ready ? this.splatTransform : null,
+			// TEMPORARY, surfaced only so the settle delay can be read while tuning it.
+			dockDelayMs: this.dockDelayMs,
+			freeflySpeed: this.freeflySpeed,
 			highlightEnabled: this.highlightEnabled,
 			canHighlight:
 				(this.mode === "overview" || this.mode === "interior") &&
@@ -912,6 +1118,11 @@ export class OrbitEngine {
 		this.yieldTour(); // before the busy gate, so a click lands mid-hop too
 		if (this.interiorBusy) return;
 		this.noteInput();
+		// Grabbing catches the coast, the way putting a hand on a spinning globe
+		// stops it. Continuing to drift under a held pointer would fight pinLook,
+		// which is solving for the angles that keep the grabbed point exactly under
+		// the cursor.
+		this.stopLookInertia();
 		this.dragging = true;
 		this.dragMoved = 0;
 		this.grabDir.copy(
@@ -958,6 +1169,19 @@ export class OrbitEngine {
 				ev.clientY,
 				this.grabDir,
 			);
+			// Angular rate of the drag, kept for the coast on release. angleDelta
+			// keeps the yaw honest across pinLook's atan2 wrap: a raw subtraction
+			// there reads as a ~2π-per-frame flick and would hurl the camera.
+			const at = performance.now();
+			const step = (at - this.lookSampledAt) / 1000;
+			if (this.lookSampledAt > 0 && step > 0.001) {
+				const k = 1 - Math.exp(-(step * 1000) / LOOK_SAMPLE_TAU);
+				this.lookVel.lon +=
+					(angleDelta(this.lon, look.lon) / step - this.lookVel.lon) * k;
+				this.lookVel.lat +=
+					((look.lat - this.lat) / step - this.lookVel.lat) * k;
+			}
+			this.lookSampledAt = at;
 			this.lon = look.lon;
 			this.lat = look.lat;
 			this.dragMoved = Math.max(
@@ -1014,15 +1238,48 @@ export class OrbitEngine {
 		this.clickAnywhere(ev.clientX, ev.clientY);
 	};
 
+	private setFov(deg: number) {
+		this.camera.fov = deg;
+		this.camera.updateProjectionMatrix();
+	}
+
+	// Wheel deltas are not comparable between devices: a mouse notch is ~100 px, a
+	// Firefox line-mode notch is ~3, a trackpad emits a continuous stream of small
+	// fractions, and a page-mode notch is ~1. Normalizing to "notches" first is what
+	// makes the same gesture zoom the same amount everywhere, and the clamp stops one
+	// violent trackpad flick from crossing the whole range in a single event.
+	private wheelNotches(ev: WheelEvent): number {
+		const perNotch = ev.deltaMode === 1 ? 3 : ev.deltaMode === 2 ? 1 : 100;
+		return MathUtils.clamp(ev.deltaY / perNotch, -3, 3);
+	}
+
 	private onWheel = (ev: WheelEvent) => {
 		if (!this.isLookMode) return;
 		ev.preventDefault();
-		this.camera.fov = MathUtils.clamp(
-			this.camera.fov + ev.deltaY * 0.05,
-			25,
-			120,
+		const notches = this.wheelNotches(ev);
+		if (this.mode === "freefly") {
+			// Flight speed, not zoom. See the note by FREEFLY_SPEED_MIN for why the
+			// wheel does not dolly here.
+			this.freeflySpeed = MathUtils.clamp(
+				this.freeflySpeed * Math.exp(-notches * 0.18),
+				FREEFLY_SPEED_MIN,
+				FREEFLY_SPEED_MAX,
+			);
+			this.emit();
+			return;
+		}
+		// Multiplicative on the half-angle tangent — that is focal length, which is
+		// what zoom actually is. Adding degrees linearly (the old behaviour) changes
+		// almost nothing at the wide end and lurches at the narrow end.
+		const half = Math.tan((this.camera.fov * Math.PI) / 360);
+		const next = half * Math.exp(notches * ZOOM_PER_NOTCH);
+		this.setFov(
+			MathUtils.clamp(
+				(Math.atan(next) * 360) / Math.PI,
+				ZOOM_MIN_FOV,
+				ZOOM_MAX_FOV,
+			),
 		);
-		this.camera.updateProjectionMatrix();
 	};
 
 	private onClick = (ev: MouseEvent) => {
@@ -1041,12 +1298,42 @@ export class OrbitEngine {
 	private onWindowPointerUp = () => this.peekUp();
 
 	private onKeyDown = (ev: KeyboardEvent) => {
-		if (ev.code === "Space" && !ev.repeat) {
+		// These listeners are on `window`, so a focused text field would otherwise have
+		// its keystrokes flown into the camera — the "take me to" search box is one, and
+		// with Shift now a movement control every capital letter typed there would break
+		// the user out into free flight.
+		const focused = document.activeElement;
+		if (
+			focused instanceof HTMLInputElement ||
+			focused instanceof HTMLTextAreaElement ||
+			(focused instanceof HTMLElement && focused.isContentEditable)
+		)
+			return;
+		// Space is hold-to-locate, EXCEPT where it now means "fly up" — either already
+		// in flight, or in the walkthrough where it breaks out into flight. On a scene
+		// with no splat to fly through there is nothing to break out to, so the shortcut
+		// survives untouched there; where it is taken, the ⤢ locate button still carries
+		// peek.
+		const spaceFlies =
+			this.mode === "freefly" ||
+			(this.mode === "interior" && this.canEnterFreefly());
+		if (ev.code === "Space" && !ev.repeat && !spaceFlies) {
 			ev.preventDefault();
 			this.peekDown();
 			return;
 		}
 		if (this.mode === "freefly") {
+			// TEMPORARY: tune the settle delay by feel. Remove with `dockDelayMs`.
+			if (ev.code === "BracketLeft" || ev.code === "BracketRight") {
+				ev.preventDefault();
+				this.dockDelayMs = MathUtils.clamp(
+					this.dockDelayMs + (ev.code === "BracketRight" ? 50 : -50),
+					0,
+					3000,
+				);
+				this.emit();
+				return;
+			}
 			if (ev.code === "Escape") {
 				ev.preventDefault();
 				// Always a way back to the walkthrough, whatever the cursor is over.
@@ -1077,16 +1364,10 @@ export class OrbitEngine {
 			this.goBack();
 			return;
 		}
-		if (ev.code === "KeyQ") {
-			ev.preventDefault();
-			this.snapTurn(-45);
-			return;
-		}
-		if (ev.code === "KeyE") {
-			ev.preventDefault();
-			this.snapTurn(45);
-			return;
-		}
+		// Q/E are unbound in the walkthrough. They used to snap-turn 45°, which the
+		// drag-look rig makes redundant, and they are vertical-movement aliases in
+		// flight — so leaving them bound here meant one key doing two unrelated things
+		// either side of a mode change.
 		if (ev.code.startsWith("Digit")) {
 			const n = Number(ev.code.slice(5));
 			if (n >= 1) {
@@ -1095,12 +1376,14 @@ export class OrbitEngine {
 			}
 			return;
 		}
-		// A movement key is how you leave the walkthrough for the splat. With no
-		// splat to fly through it keeps its original meaning below: step to the
+		// A movement key is how you leave the walkthrough for the splat — horizontal or
+		// vertical, since asking to move in any direction is asking to fly. With no
+		// splat to fly through, WASD keeps its original meaning below: step to the
 		// neighbouring capture point along the look bearing.
-		if (FREEFLY_ENTER_KEYS.has(ev.code) && this.canEnterFreefly()) {
+		const flyKey = freeflyKey(ev.code);
+		if (flyKey !== null && FREEFLY_ENTER_KEYS.has(flyKey) && this.canEnterFreefly()) {
 			ev.preventDefault();
-			this.freeflyKeys.add(ev.code);
+			this.freeflyKeys.add(flyKey);
 			this.enterFreefly();
 			return;
 		}
@@ -1135,16 +1418,16 @@ export class OrbitEngine {
 		this.trackFreeflyKey(ev, false);
 	};
 
-	// The held-key set behind free flight. Shift is folded to one name so the two
-	// physical keys can't leave each other latched.
+	// The held-key set behind free flight, keyed by `freeflyKey`'s canonical names.
 	private trackFreeflyKey(ev: KeyboardEvent, down: boolean) {
-		const shift = ev.code === "ShiftLeft" || ev.code === "ShiftRight";
-		if (!shift && !FREEFLY_MOVE_KEYS.has(ev.code)) return;
-		const code = shift ? "Shift" : ev.code;
+		const code = freeflyKey(ev.code);
+		if (code === null) return;
 		if (!down) {
 			this.freeflyKeys.delete(code);
 			return;
 		}
+		// Space in particular MUST be swallowed, or the page scrolls under the viewer
+		// every time you rise.
 		ev.preventDefault();
 		this.freeflyKeys.add(code);
 		this.noteInput();
@@ -1154,6 +1437,7 @@ export class OrbitEngine {
 	private onWindowBlur = () => {
 		this.freeflyKeys.clear();
 		this.freeflyVel.set(0, 0, 0);
+		this.stopLookInertia();
 	};
 
 	// Interior hover: light the affordance under the cursor + surface its preview.
@@ -1816,6 +2100,7 @@ export class OrbitEngine {
 		// A crossfading flight never dims, so clear any dip left by an earlier one.
 		if (cbs.crossfade) this.travelFade.style.opacity = "0";
 		this.mode = "transition";
+		this.stopLookInertia(); // the flight owns the pose from here
 		this.closeInspect();
 		this.arrowReach = null;
 		this.markers.setArrowHover(null);
@@ -1853,6 +2138,10 @@ export class OrbitEngine {
 
 	private beginMove(index: number, type: EdgeType, dy: number, pass = false) {
 		this.interiorBusy = true;
+		// Heading carries across a hop by design, but a leftover flick is not heading
+		// — it would keep turning you through the traversal and land you somewhere you
+		// never aimed.
+		this.stopLookInertia();
 		this.closeInspect();
 		this.arrowReach = null;
 		this.cursorReach = null;
@@ -2113,6 +2402,15 @@ export class OrbitEngine {
 		this.addressing.setHover(null);
 		this.addressing.closeMenu();
 		this.freeflyVel.set(0, 0, 0);
+		// Free flight begins standing ON an anchor, which satisfies every dock
+		// condition at once — so docking stays disarmed until the camera has actually
+		// left, or you could never get out of the anchor you just left.
+		this.dockTarget = -1;
+		this.dockReveal = 0;
+		this.dockStaged = false;
+		this.dockArmed = false;
+		this.dockStillSince = 0;
+		this.freeflyEntry.copy(this.camera.position);
 
 		const tex =
 			this.currentIndex >= 0 ? this.panos[this.currentIndex]?.texture : null;
@@ -2129,10 +2427,21 @@ export class OrbitEngine {
 			this.sphereB.position.copy(this.camera.position);
 			this.splatReveal = 0;
 			this.splatRevealing = true;
+			// Buy room for the lens change in proportion to its size, so an unzoomed
+			// exit stays as immediate as it is today and only a zoomed one slows down.
+			this.revealFovFrom = this.camera.fov;
+			this.splatRevealMs = Math.min(
+				SPLAT_REVEAL_MAX_MS,
+				SPLAT_REVEAL_MS +
+					Math.abs(this.camera.fov - FREEFLY_FOV) * REVEAL_FOV_MS_PER_DEG,
+			);
 		} else {
 			this.clearPanoOverlay();
 			this.splatReveal = 1;
 			this.splatRevealing = false;
+			// No dissolve to hide it in (no texture, or reduced motion): take the lens
+			// straight there rather than leaving free flight on a borrowed zoom.
+			this.setFov(FREEFLY_FOV);
 		}
 		this.noteInput();
 		this.emit();
@@ -2153,6 +2462,12 @@ export class OrbitEngine {
 	// knows how to wait.
 	private returnToInterior(index: number) {
 		if (this.mode !== "freefly" || !this.panos[index]) return;
+		// Already settling onto exactly this anchor: let the drift finish rather than
+		// abandoning it for a flight to the same place.
+		if (this.dockTarget === index) return;
+		this.dockTarget = -1;
+		this.dockReveal = 0;
+		this.dockStaged = false;
 		this.freeflyKeys.clear();
 		this.freeflyVel.set(0, 0, 0);
 		this.splatRevealing = false;
@@ -2171,6 +2486,101 @@ export class OrbitEngine {
 		this.projection.syncBase(true);
 		this.canvas.style.opacity = "0";
 		this.flyIntoInterior(index, FREEFLY_RETURN_MS, { dissolve: true });
+	}
+
+	private get dockRadius(): number {
+		return MathUtils.clamp(
+			this.sceneMaxDim * DOCK_RADIUS_FRAC,
+			DOCK_RADIUS_MIN,
+			DOCK_RADIUS_MAX,
+		);
+	}
+
+	// The anchor the glide should settle onto, or -1 for none.
+	//
+	// Two exclusions matter more than proximity. An OCCLUDED anchor would pull the
+	// camera through whatever is between — a wall, a slab — which is the one thing
+	// free flight must never appear to do on its own. And an anchor on ANOTHER STOREY
+	// would drop you through the floor you are looking at; height is tested directly
+	// rather than through the floor plan so it still holds on tours whose floors carry
+	// no volumes.
+	//
+	// The line-of-sight raycast is deliberately LAST: it is the only expensive test,
+	// and by then at most a couple of anchors are still in the running.
+	private dockCandidate(): number {
+		const cam = this.camera.position;
+		const camLevel = this.hasFloorVolumes ? this.floorAt(cam) : -1;
+		let best = -1;
+		let bestD = this.dockRadius;
+		for (let i = 0; i < this.panos.length; i++) {
+			const p = v3(this.panos[i].position);
+			if (Math.abs(p.y - cam.y) > DOCK_MAX_DY) continue;
+			if (camLevel >= 0 && this.panoLevel[i] !== camLevel) continue;
+			const d = cam.distanceTo(p);
+			if (d >= bestD) continue;
+			// No texture yet means the projection would fade in black, so leave it be;
+			// requesting it now makes the next pass eligible.
+			if (!this.panos[i].texture) {
+				this.requestPano(i);
+				continue;
+			}
+			if (!this.isTargetClear(p)) continue;
+			bestD = d;
+			best = i;
+		}
+		return best;
+	}
+
+	// Stage or unstage the interior behind the dock, and set how much of it shows.
+	//
+	// The proxy re-skin only happens on the transition, not every frame — it walks the
+	// whole scene graph reassigning materials, which is not a per-frame cost worth
+	// paying for a value that changes nothing about the staging.
+	private applyDockReveal() {
+		const on = this.dockReveal > 0.001;
+		if (on !== this.dockStaged) {
+			this.dockStaged = on;
+			if (on) {
+				this.reskinProxy(this.projection.material);
+				if (this.proxyGroup) this.proxyGroup.visible = true;
+				this.projection.syncBase(true);
+			} else {
+				// Back to splat-only. setFreeflyView owns exactly this state, including
+				// hiding the projection backdrop that would otherwise sit over the splat.
+				this.setFreeflyView();
+			}
+		}
+		if (on) this.updateProjection();
+		this.canvas.style.opacity = on
+			? easeInOut(MathUtils.clamp(this.dockReveal, 0, 1)).toFixed(3)
+			: "1";
+	}
+
+	// Give the glide back to the user. Nothing is animated out: the dock only ever
+	// changed the velocity TARGET, so releasing it hands the camera straight back to
+	// whatever the keys are asking for, and the interior fades out on its own tau.
+	private cancelDock() {
+		if (this.dockTarget < 0) return;
+		this.dockTarget = -1;
+		this.flyTarget = -1;
+	}
+
+	// Arrived. There is no motion left to play — the drift has already put the camera
+	// on the anchor and faded the interior all the way in — so this is bookkeeping.
+	private commitDock(index: number) {
+		this.dockTarget = -1;
+		this.dockReveal = 0;
+		this.freeflyKeys.clear();
+		this.freeflyVel.set(0, 0, 0);
+		this.splatRevealing = false;
+		this.clearPanoOverlay();
+		this.canvas.style.opacity = "1";
+		this.cursor.hide();
+		this.markers.hideGhost();
+		this.mode = "interior";
+		this.arrival = null;
+		this.setInteriorView();
+		this.activate(index);
 	}
 
 	// A click in free flight means what a click means everywhere else here: take me
@@ -2280,13 +2690,6 @@ export class OrbitEngine {
 		this.traverse(prev, true);
 	}
 
-	snapTurn(deg: number) {
-		if (this.mode !== "interior") return;
-		this.yieldTour();
-		this.noteInput();
-		this.lon += (deg * Math.PI) / 180;
-	}
-
 	// Start / stop the zone-by-zone auto tour. Stopping leaves the camera exactly
 	// where it is — the itinerary is simply dropped.
 	toggleTour() {
@@ -2296,6 +2699,7 @@ export class OrbitEngine {
 			return;
 		}
 		if (!this.navGraph || this.currentIndex < 0) return;
+		this.stopLookInertia(); // the director writes these angles itself
 		this.director.start(
 			planZoneTour(
 				this.navGraph,
@@ -2529,8 +2933,17 @@ export class OrbitEngine {
 		this.splatTransform = { ...IDENTITY_TRANSFORM };
 		this.splatReveal = 0;
 		this.splatRevealing = false;
+		this.splatRevealMs = SPLAT_REVEAL_MS;
+		this.revealFovFrom = FREEFLY_FOV;
+		this.freeflySpeed = 1;
 		this.freeflyKeys.clear();
 		this.freeflyVel.set(0, 0, 0);
+		this.dockTarget = -1;
+		this.dockReveal = 0;
+		this.dockStaged = false;
+		this.dockArmed = false;
+		this.dockStillSince = 0;
+		this.stopLookInertia(); // a new scene must not inherit the last one's spin
 		this.scene.background = this.bgColor;
 		// A scene swapped in mid-dissolve would otherwise inherit a part-transparent
 		// canvas and render washed out for the rest of the session.
@@ -3132,7 +3545,7 @@ export class OrbitEngine {
 			// The tour drives the same yaw/pitch drag-look writes, so it has to run
 			// before the look is applied.
 			this.director.tick(now);
-			this.lat = applyLook(this.camera, this.lon, this.lat);
+			this.tickLook(dt);
 			if (!this.interiorBusy) {
 				this.markers.updateNav(
 					this.camera,
@@ -3162,7 +3575,7 @@ export class OrbitEngine {
 				}
 			}
 		} else if (this.mode === "freefly") {
-			this.tickFreefly(dt);
+			this.tickFreefly(now, dt);
 		} else if (this.mode === "peek") {
 			const off = this.camera.position.clone().sub(this.sceneCenter);
 			const a = PEEK_ROTATE_SPEED * dt;
@@ -3187,7 +3600,7 @@ export class OrbitEngine {
 	// One frame of free flight. Velocity EASES toward what the held keys ask for
 	// rather than snapping to it, which is most of what separates flying from
 	// teleporting; the ramp is short enough to still feel deliberate.
-	private tickFreefly(dt: number) {
+	private tickFreefly(now: number, dt: number) {
 		const cl = Math.cos(this.lat);
 		const fx = cl * Math.cos(this.lon);
 		const fy = Math.sin(this.lat);
@@ -3198,8 +3611,9 @@ export class OrbitEngine {
 		_moveWish.set(0, 0, 0);
 		// W/S fly along the FULL look direction, pitch included — looking up and
 		// pressing forward should climb, which is the difference between flying and
-		// walking. Q/E stay on world up, so you can rise without changing where you
-		// are looking.
+		// walking. The vertical controls stay on world up, so you can rise and fall
+		// without changing where you are looking: Space/Shift as the primary pair,
+		// Q/E as aliases for anyone already holding the left of the keyboard.
 		if (keys.has("KeyW")) _moveWish.set(fx, fy, fz);
 		if (keys.has("KeyS")) _moveWish.set(-fx, -fy, -fz);
 		if (keys.has("KeyD")) {
@@ -3210,26 +3624,109 @@ export class OrbitEngine {
 			_moveWish.x -= rx;
 			_moveWish.z -= rz;
 		}
-		if (keys.has("KeyE")) _moveWish.y += 1;
-		if (keys.has("KeyQ")) _moveWish.y -= 1;
-		if (_moveWish.lengthSq() > 0) _moveWish.normalize();
+		if (keys.has("Space") || keys.has("KeyE")) _moveWish.y += 1;
+		if (keys.has("Shift") || keys.has("KeyQ")) _moveWish.y -= 1;
+		const asking = _moveWish.lengthSq() > 0;
+		if (asking) _moveWish.normalize();
 		_moveWish.multiplyScalar(
-			this.sceneMaxDim *
-				FREEFLY_SPEED_FRAC *
-				(keys.has("Shift") ? FREEFLY_SPRINT : 1),
+			this.sceneMaxDim * FREEFLY_SPEED_FRAC * this.freeflySpeed,
 		);
-		// Frame-rate independent approach, so the feel is the same at 60 and 144.
-		this.freeflyVel.lerp(_moveWish, 1 - Math.exp(-(dt * 1000) / FREEFLY_ACCEL_TAU));
+		// --- docking ---------------------------------------------------------
+		const topSpeed = this.sceneMaxDim * FREEFLY_SPEED_FRAC;
+		if (
+			!this.dockArmed &&
+			this.camera.position.distanceTo(this.freeflyEntry) > this.dockRadius
+		) {
+			this.dockArmed = true; // you have genuinely left; docking may now fire
+		}
+		// Stillness is tracked as a HELD state, not sampled at an instant: the clock
+		// starts when the camera comes to rest and is thrown away the moment it moves
+		// again, so a pause on the way between two places never counts as arriving.
+		const still =
+			!asking &&
+			this.dockTarget < 0 &&
+			this.freeflyVel.length() < topSpeed * DOCK_STILL_SPEED_FRAC;
+		if (!still) this.dockStillSince = 0;
+		else if (this.dockStillSince === 0) this.dockStillSince = now;
+
+		if (asking) {
+			// Any request to move outranks a dock in progress. This is the whole veto:
+			// nothing is animating, so releasing the target hands the camera straight
+			// back with its velocity intact.
+			this.cancelDock();
+		} else if (
+			this.dockTarget < 0 &&
+			this.dockArmed &&
+			this.projectionMode &&
+			this.splat.isActive &&
+			this.dockStillSince > 0 &&
+			now - this.dockStillSince >= this.dockDelayMs
+		) {
+			const cand = this.dockCandidate();
+			if (cand >= 0) {
+				this.dockTarget = cand;
+				this.flyTarget = cand; // so activeCaptures projects THIS anchor
+			}
+		}
+		let dockDist = Infinity;
+		if (this.dockTarget >= 0) {
+			const to = v3(this.panos[this.dockTarget].position).sub(
+				this.camera.position,
+			);
+			dockDist = to.length();
+			// Replace only the velocity TARGET. The integrator below is unchanged, so
+			// the glide curves into the anchor without its velocity ever breaking.
+			_moveWish.copy(to).multiplyScalar(DOCK_SEEK_GAIN);
+			if (_moveWish.length() > topSpeed) _moveWish.setLength(topSpeed);
+		}
+
+		// One short time constant for press, release and dock alike. A dock needs no
+		// special easing: its target SHRINKS as the camera closes on the anchor, so the
+		// approach decelerates itself. Frame-rate independent, so the feel is the same
+		// at 60 and 144.
+		this.freeflyVel.lerp(
+			_moveWish,
+			1 - Math.exp(-(dt * 1000) / FREEFLY_VEL_TAU),
+		);
 		this.camera.position.addScaledVector(this.freeflyVel, dt);
-		this.lat = applyLook(this.camera, this.lon, this.lat);
+		this.tickLook(dt);
+
+		// Fidelity fades in with PROXIMITY, not with a clock, and the ease runs both
+		// ways so a cancelled dock fades back out instead of snapping off.
+		const wanted =
+			this.dockTarget >= 0
+				? MathUtils.clamp(1 - dockDist / DOCK_REVEAL_DIST, 0, 1)
+				: 0;
+		if (wanted > 0 || this.dockReveal > 0.001) {
+			this.dockReveal +=
+				(wanted - this.dockReveal) *
+				(1 - Math.exp(-(dt * 1000) / DOCK_REVEAL_TAU));
+			this.applyDockReveal();
+		}
+		if (this.dockTarget >= 0 && dockDist < DOCK_ARRIVE) {
+			this.commitDock(this.dockTarget);
+			return;
+		}
 
 		if (!this.splatRevealing) return;
 		// The departing panorama rides the camera while it fades, so the dissolve
 		// changes only opacity — a backdrop left behind would parallax against the
 		// splat and read as two rooms sliding apart.
-		this.splatReveal = Math.min(1, this.splatReveal + (dt * 1000) / SPLAT_REVEAL_MS);
+		this.splatReveal = Math.min(
+			1,
+			this.splatReveal + (dt * 1000) / this.splatRevealMs,
+		);
+		const e = easeInOut(this.splatReveal);
 		this.sphereB.position.copy(this.camera.position);
-		this.sphereBMat.uniforms.opacity.value = 1 - easeInOut(this.splatReveal);
+		this.sphereBMat.uniforms.opacity.value = 1 - e;
+		// The lens travels on the same curve as the dissolve, so any zoom applied
+		// inside the walkthrough is unwound by the time free flight has the picture.
+		// This is the handover that startFly cannot do for us — see REVEAL_FOV_MS_PER_DEG.
+		if (this.revealFovFrom !== FREEFLY_FOV) {
+			this.setFov(
+				this.revealFovFrom + (FREEFLY_FOV - this.revealFovFrom) * e,
+			);
+		}
 		if (this.splatReveal >= 1) {
 			this.splatRevealing = false;
 			this.clearPanoOverlay();
@@ -3296,7 +3793,20 @@ export class OrbitEngine {
 		// direction arrow — but only where the surface it is lying on can express it
 		// (see SurfaceCursor.aimArrow).
 		let travel: Vector3 | null = null;
-		if (hit && this.mode === "freefly") {
+		if (this.mode === "freefly" && this.dockTarget >= 0) {
+			// A dock in progress OWNS the waypoint. Showing where the glide is settling
+			// is what makes it read as a settle rather than a snatch — the destination
+			// is on screen, growing, before the camera ever gets there. No tether: the
+			// pointer did not ask for this, so drawing a line from it would be a lie.
+			this.markers.showGhost(
+				this.destinationFloor(this.dockTarget),
+				{ to: this.dockTarget, type: "walk", dy: 0 },
+				this.camera,
+				this.host.clientHeight,
+				null,
+			);
+			ghosted = true;
+		} else if (hit && this.mode === "freefly") {
 			// In flight the only question a cursor can answer is "where would this
 			// put me down", so it answers exactly that: a waypoint standing on the
 			// capture a click would land on, tethered back to the surface under the

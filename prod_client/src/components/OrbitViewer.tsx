@@ -1452,7 +1452,7 @@ function hudContent(state: OrbitState): ReactNode {
 		return (
 			<>
 				<strong>{currentName ?? currentId}</strong> ·{" "}
-				<strong>WASD</strong> move · <strong>Q/E</strong> turn ·{" "}
+				<strong>WASD</strong> move · <strong>Space/Shift</strong> fly ·{" "}
 				<strong>Tab</strong> ping · <strong>M</strong> places
 			</>
 		);
@@ -1460,9 +1460,16 @@ function hudContent(state: OrbitState): ReactNode {
 	if (mode === "freefly")
 		return (
 			<>
-				<strong>WASD</strong> fly · <strong>Q/E</strong> down/up ·{" "}
-				<strong>shift</strong> faster · <strong>click</strong> to land ·{" "}
+				<strong>WASD</strong> fly · <strong>Space/Shift</strong> up/down ·{" "}
+				<strong>wheel</strong> speed{" "}
+				<strong>{state.freeflySpeed.toFixed(2)}×</strong> ·{" "}
+				<strong>click</strong> or <strong>stop</strong> near a viewpoint to land ·{" "}
 				<strong>Esc</strong> back
+				{/* TEMPORARY: readout for the settle delay while it is tuned by feel. */}
+				<span className='text-neutral-500'>
+					{" "}
+					· settle <strong>{state.dockDelayMs}ms</strong> ([ / ])
+				</span>
 			</>
 		);
 	if (mode === "peek")
