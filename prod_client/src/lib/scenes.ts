@@ -14,6 +14,10 @@ export type Scene = {
 	tourKey: string | null; // tours/.../tour.json (the walkthrough plan; null = no tour)
 	proxyKey: string | null; // proxies/.../proxy.glb (projection proxy; null = none)
 	panoPrefix: string | null; // panoramas/.../  (panos hang under here; null = none)
+	// The cell's trained Gaussian splat, SOG-encoded. Null on every cell that has
+	// never been trained — which is most of them — so the viewer treats a splat as
+	// an optional upgrade to the scene rather than something it can assume.
+	splatKey: string | null;
 	panoCount: number;
 	publishedAt: string;
 };
@@ -39,6 +43,9 @@ export async function fetchScenes(): Promise<Scene[]> {
 
 export const previewUrl = (s: Scene): string => assetUrl(s.previewKey);
 
+export const splatUrl = (s: Scene): string | null =>
+	s.splatKey ? assetUrl(s.splatKey) : null;
+
 export const panoUrl = (s: Scene, file: string): string => assetUrl(`${s.panoPrefix ?? ""}${file}`);
 
 export const panoPlaceholderUrl = (s: Scene, file: string): string =>
@@ -56,6 +63,7 @@ export function tourSource(s: Scene): TourSource {
 	return {
 		dollhouseUrl: previewUrl(s),
 		manifestUrl: s.tourKey ? assetUrl(s.tourKey) : null,
+		splatUrl: splatUrl(s),
 		resolvePano: (file) => ({ url: panoUrl(s, file), placeholderUrl: panoPlaceholderUrl(s, file) }),
 		resolveProxy: () => assetUrl(s.proxyKey ?? ""),
 		// Minimap slices are published under the same prefix as the panos.

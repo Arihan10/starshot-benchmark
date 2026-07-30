@@ -6,6 +6,10 @@
 export type TourSource = {
 	dollhouseUrl: string | null;
 	manifestUrl: string | null;
+	// The cell's SOG-encoded Gaussian splat, or null when it has none. When present
+	// it REPLACES the dollhouse as the scene's appearance (overview + free flight);
+	// the dollhouse stays loaded as the fallback and as the addressable geometry.
+	splatUrl: string | null;
 	resolvePano: (file: string) => { url: string; placeholderUrl: string };
 	resolveProxy: (file: string) => string;
 	resolveMinimap: (file: string) => string;
@@ -90,6 +94,10 @@ export type OrbitMode =
 	| "loading"
 	| "overview"
 	| "interior"
+	// Free flight through the Gaussian splat. Reached by pressing a movement key
+	// inside the walkthrough, left by clicking anywhere — which lands on a capture
+	// point and hands control back to the walkthrough's own traversal.
+	| "freefly"
 	| "peek"
 	| "transition";
 
@@ -195,6 +203,20 @@ export type OrbitState = {
 	objectHover: string | null; // label of the object under the cursor (overview)
 	proxyView: boolean; // overview shows the low-poly proxy instead of the lite dollhouse
 	canProxyView: boolean; // the proxy/lite swap is available (overview + both loaded)
+	// The Gaussian splat stands in for the scene's appearance. Orthogonal to
+	// `proxyView`: turning it off falls back to the mesh views, which is both the
+	// escape hatch for a scene with no splat and the way to reach the addressable
+	// dollhouse geometry.
+	splatView: boolean;
+	canSplatView: boolean;
+	// Live splat placement, surfaced ONLY so a misframed splat can be nudged into
+	// register against the proxy without a rebuild. Temporary by construction: a
+	// confirmed correction gets baked into the asset and this returns to identity.
+	splatTransform: {
+		position: [number, number, number];
+		rotation: [number, number, number];
+		scale: number;
+	} | null;
 	highlightEnabled: boolean; // hover-highlight the object under the cursor (toggleable)
 	canHighlight: boolean; // hover-highlight applies in this mode (overview / interior w/ objects)
 	contextMenu: ObjectMenu | null;
@@ -278,6 +300,9 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	objectHover: null,
 	proxyView: false,
 	canProxyView: false,
+	splatView: false,
+	canSplatView: false,
+	splatTransform: null,
 	highlightEnabled: true,
 	canHighlight: false,
 	contextMenu: null,

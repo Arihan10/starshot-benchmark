@@ -31,6 +31,9 @@ function toScene(r: Record<string, unknown>): Scene {
 		tourKey: nullable(r.tour_key),
 		proxyKey: nullable(r.proxy_key),
 		panoPrefix: nullable(r.pano_prefix),
+		// Local-only for now: the D1 catalog has no splat column, so a cloud row
+		// leaves this undefined and `nullable` reads it as "no splat".
+		splatKey: nullable(r.splat_key),
 		panoCount: Number(r.pano_count ?? 0),
 		publishedAt: str(r.published_at),
 	};

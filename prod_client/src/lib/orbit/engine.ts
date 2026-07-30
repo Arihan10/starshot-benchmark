@@ -51,6 +51,7 @@ import { SurfaceCursor } from "./cursor";
 import { LightRig } from "./lighting";
 import { prepareLitScene } from "./prepare";
 import { MarkerLayer } from "./markerLayer";
+import { IDENTITY_TRANSFORM, SplatLayer, type SplatTransform } from "./splatLayer";
 import { collectObjects, ObjectAddressing } from "./objectAddressing";
 import { type PanoEntry, PanoStreamer } from "./panoTextures";
 import { Projection } from "./projection";
@@ -126,6 +127,65 @@ const ENTER_CROSSFADE_MS = 450;
 // ahead anyway — the camera is parked, so waiting is invisible, but never hang.
 const HANDOVER_WAIT_MS = 1000;
 
+// --- free flight ------------------------------------------------------------
+//
+// Leaving the walkthrough for the splat is a DISSOLVE IN PLACE, not a flight: the
+// camera is already exactly where it belongs, and the splat and the panorama are
+// two renderings of the same room from the same point. So the departing pano is
+// ramped off and the splat is simply already behind it — the same parked-dissolve
+// reasoning `enter()` uses for the dollhouse handover. Short, because unlike that
+// handover there is nothing to stream and waiting would just read as lag.
+const SPLAT_REVEAL_MS = 320;
+// Coming back IS a flight (you are in open space, the destination is a capture
+// point), so it reuses the enter() path wholesale — arc, FOV opening, arrival
+// crossfade and all. A touch quicker than entering from the dollhouse, since the
+// distances involved are usually a room rather than a whole scene.
+const FREEFLY_RETURN_MS = 1150;
+// Where in the return flight the interior starts asserting itself, as a fraction of
+// the move. Not a taste knob: before this the camera is still far enough from the
+// anchor that its panorama projects onto the proxy badly stretched, so showing it
+// early would trade one artefact for another. Landing the dissolve in the final
+// stretch means it is only ever visible while it is nearly correct.
+const DISSOLVE_START = 0.32;
+// Flight speed as a fraction of the scene's largest dimension per second, so a
+// cathedral and a bathroom both take a sensible time to cross.
+const FREEFLY_SPEED_FRAC = 0.18;
+const FREEFLY_SPRINT = 3;
+// Velocity easing. Enough to take the edge off starting and stopping without
+// feeling like ice — the movement should read as deliberate, not floaty.
+const FREEFLY_ACCEL_TAU = 90; // ms
+// What flies the camera once you are out there. Q/E are vertical here, where in
+// the walkthrough they snap-turn — a rig pinned to an anchor has nowhere to rise
+// to, and a rig in open space has no need to turn in 45° steps.
+const FREEFLY_MOVE_KEYS = new Set([
+	"KeyW",
+	"KeyA",
+	"KeyS",
+	"KeyD",
+	"KeyQ",
+	"KeyE",
+]);
+// ...and which of them, pressed inside the walkthrough, mean "let me fly". Only
+// the four horizontal ones: Q/E still belong to snap-turning until you have left.
+const FREEFLY_ENTER_KEYS = new Set(["KeyW", "KeyA", "KeyS", "KeyD"]);
+
+// There is deliberately NO default splat transform here.
+//
+// The pipeline hands Postshot a COLMAP model that is already in the repo-native
+// world frame — stage5 locks it ("World: Y-up, right-handed, metres"), colmap.py
+// writes `w2c = inv(c2w)` with no flip and copies cloud.ply's xyz verbatim — and
+// Postshot trains from those exact poses and that exact point cloud. A splat built
+// that way lands in world space, so the viewer's job is to draw it where it says it
+// is, not to guess a correction.
+//
+// A fitted offset used to live here. It was wrong on three counts: it belonged to
+// the ASSET rather than to one renderer, it was eyeballed from bounding boxes
+// (which cannot even distinguish a translation from an axis flip), and it hid a
+// defect in the handoff instead of fixing it. If a splat ever genuinely needs
+// moving, the transform is computable in closed form against the point cloud it was
+// initialized from and belongs baked into the file
+// (tools/splat-to-web-sog.mjs --translate).
+
 // Look up more steeply than this at something over your head and a click reads as
 // "take me through it" — see the engine's targetFloorFor.
 const CEILING_PITCH = (40 * Math.PI) / 180;
@@ -148,6 +208,8 @@ const INSPECT_SPIN = 0.55; // rad/s — a slow turn, not a spin
 const _cursorNdc = new Vector2();
 const _bez = new Vector3();
 const _flyDir = new Vector3();
+const _moveWish = new Vector3();
+const _prevClear = new Color();
 const _ghostFloor = new Vector3();
 const _losFrom = new Vector3();
 const _losDir = new Vector3();
@@ -179,6 +241,13 @@ type Transition = {
 	// black. Only worth it when the flight lands somewhere both representations
 	// agree on, i.e. a capture point. See tickCrossfade.
 	crossfade: boolean;
+	// Dissolve the interior in DURING the flight instead of parking at the end to do
+	// it. Only legal when the two representations sit on DIFFERENT canvases — the
+	// splat below, three.js above — because the dissolve is then a compositing
+	// operation between two independently parallax-correct images. The dollhouse
+	// paths cannot use it: their departure image is drawn by three.js too, so fading
+	// that canvas would fade away the very thing being dissolved from.
+	dissolveInterior: boolean;
 	onMid?: () => void;
 	onEnd?: () => void;
 	midDone: boolean;
@@ -288,6 +357,25 @@ export class OrbitEngine {
 	private proxyView = false;
 	private proxyColorMats: Material[] = [];
 	private connectors: Connector[] = []; // parsed but not surfaced (highlights hidden for now)
+
+	// --- Gaussian splat ---
+	// The splat renders on its OWN canvas beneath this one (see splatLayer.ts), so
+	// nothing here shares a context with it — the engine only feeds it a camera and
+	// decides when it is on screen. `splatView` is the user-facing switch; when it
+	// is off every mesh view behaves exactly as it did before the splat existed.
+	private readonly splat: SplatLayer;
+	private splatView = true;
+	// Where the splat sits in world space while its true placement is still being
+	// established — see SplatLayer.setTransform. Baked away once confirmed.
+	private splatTransform: SplatTransform = { ...IDENTITY_TRANSFORM };
+	// The pano-to-splat dissolve: 0 = the walkthrough's panorama still covers the
+	// view, 1 = the splat is fully uncovered. Runs alongside free flight rather
+	// than blocking it, so movement responds from the first frame.
+	private splatReveal = 0;
+	private splatRevealing = false;
+	// Held movement keys + the eased velocity they drive, in world units/sec.
+	private readonly freeflyKeys = new Set<string>();
+	private readonly freeflyVel = new Vector3();
 	// --- dwell inspection ---
 	// Which ids are discrete objects worth looking at (from the manifest), the
 	// dollhouse copy of each (the only per-object geometry that is BOTH published
@@ -319,6 +407,9 @@ export class OrbitEngine {
 	private arrival: OrbitState["arrival"] = null;
 
 	private mode: OrbitMode = "empty";
+	// Restored whenever the splat is not behind this layer; matches the host's CSS
+	// backdrop so dropping to a transparent background never changes what you see.
+	private readonly bgColor = new Color(0x0c0d10);
 	private readonly sceneCenter = new Vector3();
 	private sceneMaxDim = 1;
 	private readonly browsePos = new Vector3();
@@ -373,7 +464,11 @@ export class OrbitEngine {
 		this.onState = onState;
 		this.onHold = onHold;
 
-		this.renderer = new WebGLRenderer({ antialias: false });
+		// `alpha` so this canvas can be drawn OVER the splat's: when the splat is
+		// showing, the scene background is dropped and everything three.js renders
+		// — markers, cursor, the pano dissolve — composites onto it. With no splat
+		// the opaque background is restored and this is byte-for-byte the old path.
+		this.renderer = new WebGLRenderer({ antialias: false, alpha: true });
 		this.renderer.setPixelRatio(window.devicePixelRatio);
 		// The display transform (ACES + sRGB + shadows) is owned by LightRig below.
 		this.canvas = this.renderer.domElement;
@@ -381,8 +476,14 @@ export class OrbitEngine {
 			display: "block",
 			width: "100%",
 			height: "100%",
+			// Explicit stacking: the splat canvas is absolutely positioned, and a
+			// positioned element would otherwise paint over this one whatever the
+			// DOM order.
+			position: "relative",
+			zIndex: "1",
 		});
 		host.appendChild(this.canvas);
+		this.splat = new SplatLayer(host);
 
 		this.travelFade = document.createElement("div");
 		Object.assign(this.travelFade.style, {
@@ -406,7 +507,7 @@ export class OrbitEngine {
 		host.appendChild(this.iris);
 
 		this.scene = new Scene();
-		this.scene.background = new Color(0x0c0d10);
+		this.scene.background = this.bgColor;
 		// Neutral IBL + hemisphere fill + a shadow-casting sun, on the same numbers
 		// the panos were baked with (see lighting.ts) so the dollhouse and the
 		// interior agree.
@@ -491,6 +592,7 @@ export class OrbitEngine {
 		window.addEventListener("pointerup", this.onWindowPointerUp);
 		window.addEventListener("keydown", this.onKeyDown);
 		window.addEventListener("keyup", this.onKeyUp);
+		window.addEventListener("blur", this.onWindowBlur);
 
 		this.ro = new ResizeObserver(() => this.resize());
 		this.ro.observe(host);
@@ -517,8 +619,10 @@ export class OrbitEngine {
 		window.removeEventListener("pointerup", this.onWindowPointerUp);
 		window.removeEventListener("keydown", this.onKeyDown);
 		window.removeEventListener("keyup", this.onKeyUp);
+		window.removeEventListener("blur", this.onWindowBlur);
 		if (this.autoRotateTimer) clearTimeout(this.autoRotateTimer);
 		this.clearScene();
+		this.splat.dispose();
 		this.cursor.dispose();
 		this.markers.dispose();
 		this.rig.dispose();
@@ -549,6 +653,13 @@ export class OrbitEngine {
 	private noteInput() {
 		this.lastInputAt = performance.now();
 		this.dwellPulsed = false;
+	}
+
+	// The two first-person modes. Both are a yaw/pitch rig driven by the same
+	// drag-to-look and both resolve a click through the same surface raycast — they
+	// differ only in whether the camera is pinned to a capture point.
+	private get isLookMode(): boolean {
+		return this.mode === "interior" || this.mode === "freefly";
 	}
 
 	// --- state emission (gated so chrome holds through camera flights) --------
@@ -588,6 +699,11 @@ export class OrbitEngine {
 			objectHover: this.addressing.hoverLabel,
 			proxyView: this.proxyView,
 			canProxyView: this.canToggleProxyView(),
+			// The EFFECTIVE state, not the raw switch: with no splat loaded the
+			// control has nothing to turn on and should not read as active.
+			splatView: this.splatEnabled,
+			canSplatView: this.canToggleSplatView(),
+			splatTransform: this.splat.ready ? this.splatTransform : null,
 			highlightEnabled: this.highlightEnabled,
 			canHighlight:
 				(this.mode === "overview" || this.mode === "interior") &&
@@ -748,6 +864,7 @@ export class OrbitEngine {
 		if (w === 0 || h === 0) return;
 		this.renderer.setSize(w, h, false);
 		this.composer.setSize(w, h);
+		this.splat.resize(); // its canvas is a sibling, not a child — size it too
 		this.camera.aspect = w / h;
 		this.camera.updateProjectionMatrix();
 	}
@@ -791,7 +908,7 @@ export class OrbitEngine {
 		// tap from the tail of a drag (overview enter-on-click; interior look-drag).
 		this.downX = ev.clientX;
 		this.downY = ev.clientY;
-		if (this.mode !== "interior") return;
+		if (!this.isLookMode) return;
 		this.yieldTour(); // before the busy gate, so a click lands mid-hop too
 		if (this.interiorBusy) return;
 		this.noteInput();
@@ -831,7 +948,7 @@ export class OrbitEngine {
 			if (this.addressing.setHover(obj)) this.emit();
 			return;
 		}
-		if (this.mode !== "interior") return;
+		if (!this.isLookMode) return;
 		if (this.dragging) {
 			this.noteInput();
 			const look = pinLook(
@@ -853,17 +970,23 @@ export class OrbitEngine {
 				this.markers.setNavHover(null);
 				this.emit();
 			}
-		} else if (!this.interiorBusy) {
+		} else if (this.mode === "interior" && !this.interiorBusy) {
+			// Free flight has no standing affordances to hover; its cursor is
+			// resolved per-frame in updateCursorRing instead.
 			this.updateHover(ev);
 		}
 	};
 
 	private onPointerUp = (ev: PointerEvent) => {
-		if (this.mode !== "interior") return;
+		if (!this.isLookMode) return;
 		this.dragging = false;
 		this.canvas.style.cursor = "";
 		if (this.dragMoved >= 5) return;
 		this.noteInput();
+		if (this.mode === "freefly") {
+			this.clickFromFreefly(ev.clientX, ev.clientY);
+			return;
+		}
 		// A floor arrow takes the click first: it is the only thing under the cursor
 		// that changes storey. Then an affordance traverses its edge; else
 		// click-anywhere routing snaps to the node minimizing graph cost + angular
@@ -892,7 +1015,7 @@ export class OrbitEngine {
 	};
 
 	private onWheel = (ev: WheelEvent) => {
-		if (this.mode !== "interior") return;
+		if (!this.isLookMode) return;
 		ev.preventDefault();
 		this.camera.fov = MathUtils.clamp(
 			this.camera.fov + ev.deltaY * 0.05,
@@ -921,6 +1044,16 @@ export class OrbitEngine {
 		if (ev.code === "Space" && !ev.repeat) {
 			ev.preventDefault();
 			this.peekDown();
+			return;
+		}
+		if (this.mode === "freefly") {
+			if (ev.code === "Escape") {
+				ev.preventDefault();
+				// Always a way back to the walkthrough, whatever the cursor is over.
+				this.returnToInterior(this.nearestPanoTo(this.camera.position));
+				return;
+			}
+			this.trackFreeflyKey(ev, true);
 			return;
 		}
 		if (this.mode !== "interior") return;
@@ -962,6 +1095,15 @@ export class OrbitEngine {
 			}
 			return;
 		}
+		// A movement key is how you leave the walkthrough for the splat. With no
+		// splat to fly through it keeps its original meaning below: step to the
+		// neighbouring capture point along the look bearing.
+		if (FREEFLY_ENTER_KEYS.has(ev.code) && this.canEnterFreefly()) {
+			ev.preventDefault();
+			this.freeflyKeys.add(ev.code);
+			this.enterFreefly();
+			return;
+		}
 		// WASD walks the graph edge nearest the look bearing.
 		const fx = Math.cos(this.lon);
 		const fz = Math.sin(this.lon);
@@ -988,6 +1130,30 @@ export class OrbitEngine {
 	};
 	private onKeyUp = (ev: KeyboardEvent) => {
 		if (ev.code === "Space") this.peekUp();
+		// Released in EVERY mode, not just free flight: a key held across the
+		// transition out would otherwise stay latched and fly the camera on its own.
+		this.trackFreeflyKey(ev, false);
+	};
+
+	// The held-key set behind free flight. Shift is folded to one name so the two
+	// physical keys can't leave each other latched.
+	private trackFreeflyKey(ev: KeyboardEvent, down: boolean) {
+		const shift = ev.code === "ShiftLeft" || ev.code === "ShiftRight";
+		if (!shift && !FREEFLY_MOVE_KEYS.has(ev.code)) return;
+		const code = shift ? "Shift" : ev.code;
+		if (!down) {
+			this.freeflyKeys.delete(code);
+			return;
+		}
+		ev.preventDefault();
+		this.freeflyKeys.add(code);
+		this.noteInput();
+	}
+
+	// Focus loss can't be seen as a key-up, so anything held becomes stuck down.
+	private onWindowBlur = () => {
+		this.freeflyKeys.clear();
+		this.freeflyVel.set(0, 0, 0);
 	};
 
 	// Interior hover: light the affordance under the cursor + surface its preview.
@@ -1082,8 +1248,21 @@ export class OrbitEngine {
 		);
 		this.camera.updateMatrixWorld();
 		this.cursorRay.setFromCamera(_cursorNdc, this.camera);
+		// While the splat provides the picture, the proxy is hidden — but the cursor
+		// still needs it, because it is the only thing in the scene that knows where
+		// the surfaces are. The visibility walk therefore STOPS at the roots we hid
+		// ourselves, which keeps an object the USER hid inside the proxy correctly
+		// skipped: that check still runs, it just never reaches the group above it.
+		// Keyed on the splat being ON SCREEN, not merely switched on: inside the
+		// walkthrough the proxy is genuinely visible and carries the projection, and
+		// exempting it there would quietly stop honouring a proxy the user hid.
+		const forced = new Set<Object3D>();
+		if (this.splat.isActive) {
+			if (this.proxyGroup) forced.add(this.proxyGroup);
+			if (this.projection.proxyBase) forced.add(this.projection.proxyBase);
+		}
 		return this.cursorRay.intersectObjects(targets, true).filter((h) => {
-			for (let o: Object3D | null = h.object; o; o = o.parent)
+			for (let o: Object3D | null = h.object; o && !forced.has(o); o = o.parent)
 				if (!o.visible) return false;
 			return true;
 		});
@@ -1212,7 +1391,15 @@ export class OrbitEngine {
 	// preview and the destination could name different floors. A storey with no
 	// eligible anchor of its own falls back to the whole set rather than making the
 	// click do nothing.
-	private autoHomeTarget(hit: Intersection, floor = -1): number {
+	// `exclude` is the anchor a click may not resolve to — the one you are standing
+	// on, since "travel to where you already are" is not an answer. Free flight
+	// passes -1: you have left that anchor behind, and flying back to it is a
+	// perfectly reasonable thing to ask for.
+	private autoHomeTarget(
+		hit: Intersection,
+		floor = -1,
+		exclude: number = this.currentIndex,
+	): number {
 		const cam = this.camera.position;
 		const clickBearing = Math.atan2(
 			hit.point.z - cam.z,
@@ -1228,7 +1415,7 @@ export class OrbitEngine {
 		let best = -1;
 		let bestCost = Infinity;
 		for (let i = 0; i < this.panos.length; i++) {
-			if (i === this.currentIndex) continue;
+			if (i === exclude) continue;
 			if (floor >= 0 && this.panoLevel[i] !== floor) continue;
 			const pp = v3(this.panos[i].position);
 			const d = pp.distanceTo(hit.point);
@@ -1240,7 +1427,9 @@ export class OrbitEngine {
 				best = i;
 			}
 		}
-		return best < 0 && floor >= 0 ? this.autoHomeTarget(hit) : best;
+		return best < 0 && floor >= 0
+			? this.autoHomeTarget(hit, -1, exclude)
+			: best;
 	}
 
 	// The floor point of a destination capture — where its affordance is drawn, and
@@ -1311,9 +1500,29 @@ export class OrbitEngine {
 		return this.sharedOverview || (this.proxyView && !!this.proxyGroup);
 	}
 
+	// A splat is loaded AND switched on — i.e. it should stand in for the scene's
+	// appearance wherever a mode chooses to show it. Not the same as being on
+	// screen: the walkthrough turns it off regardless (see setInteriorView), so
+	// anything asking "is it visible right now" wants `splat.isActive` instead.
+	private get splatEnabled(): boolean {
+		return this.splat.ready && this.splatView;
+	}
+
+	// Put the splat on or off screen. The background has to move with it: the splat
+	// renders on the canvas BEHIND this one, so it is only visible while this layer
+	// clears to transparent.
+	private setSplatShowing(on: boolean) {
+		this.splat.setActive(on);
+		this.scene.background = on ? null : this.bgColor;
+	}
+
 	private setOverviewView() {
-		const proxyDoll = this.proxyAsDollhouse();
-		if (this.liteRoot) this.liteRoot.visible = !proxyDoll;
+		// The splat IS the dollhouse when the cell has one. The lite mesh stays
+		// loaded underneath it — it is the addressable geometry and the fallback —
+		// but nothing renders it while the splat is doing that job.
+		const useSplat = this.splatEnabled;
+		const proxyDoll = !useSplat && this.proxyAsDollhouse();
+		if (this.liteRoot) this.liteRoot.visible = !useSplat && !proxyDoll;
 		if (this.proxyGroup) {
 			if (proxyDoll) {
 				this.reskinProxy(this.polyMaterial);
@@ -1322,6 +1531,7 @@ export class OrbitEngine {
 				this.proxyGroup.visible = false;
 			}
 		}
+		this.setSplatShowing(useSplat);
 		this.sphereA.visible = false;
 		this.sphereB.visible = false;
 		this.markers.navGroup.visible = false;
@@ -1329,6 +1539,27 @@ export class OrbitEngine {
 		this.markers.hideSonar();
 		this.markers.you.group.visible = false;
 		this.projection.syncBase(!!this.proxyGroup?.visible);
+	}
+
+	// Free flight: the splat carries the whole picture, and the proxy is hidden but
+	// NOT removed — it is the only geometry that knows where the surfaces are, so
+	// the cursor keeps raycasting it (see raycastInteriorAll) and a click still
+	// resolves to a real place. With the splat switched off it renders as bare
+	// polygons instead, which is also how you check the two are in register.
+	private setFreeflyView() {
+		const useSplat = this.splatEnabled;
+		if (this.liteRoot) this.liteRoot.visible = false;
+		if (this.proxyGroup) {
+			if (!useSplat) this.reskinProxy(this.polyMaterial);
+			this.proxyGroup.visible = !useSplat;
+		}
+		this.setSplatShowing(useSplat);
+		this.sphereA.visible = false;
+		this.markers.navGroup.visible = false;
+		this.markers.arrowGroup.visible = false;
+		this.markers.hideSonar();
+		this.markers.you.group.visible = false;
+		this.projection.syncBase(false);
 	}
 
 	private setInteriorProxyView() {
@@ -1341,6 +1572,11 @@ export class OrbitEngine {
 	}
 
 	private setInteriorView() {
+		// Inside the walkthrough the panoramas ARE the picture — they are a
+		// higher-fidelity rendering of the same room than the splat is, and showing
+		// both would just double-expose it. The splat context idles until free
+		// flight or the overview asks for it again.
+		this.setSplatShowing(false);
 		if (this.liteRoot) this.liteRoot.visible = false;
 		if (this.proxyGroup) this.proxyGroup.visible = this.projectionMode;
 		if (this.projectionMode) {
@@ -1358,6 +1594,11 @@ export class OrbitEngine {
 	}
 
 	private setPeekView() {
+		// Hold-to-locate slices the roof off with a renderer clipping plane, which
+		// belongs to three.js and means nothing to the splat's own context — a splat
+		// here would keep its ceiling and bury the "you are here" pin under it. So
+		// locating is always done on the mesh.
+		this.setSplatShowing(false);
 		const proxyDoll = this.proxyAsDollhouse();
 		if (this.liteRoot) this.liteRoot.visible = !proxyDoll;
 		if (this.proxyGroup) {
@@ -1378,10 +1619,27 @@ export class OrbitEngine {
 	}
 
 	private canToggleProxyView(): boolean {
+		// While the splat is ON SCREEN the mesh views are not, so the proxy/lite swap
+		// has nothing to swap — turn the splat off first. Deliberately not keyed on
+		// the splat merely being loaded: inside the walkthrough the splat is off
+		// screen and the interior's own proxy/projection toggle must keep working.
+		if (this.splat.isActive) return false;
 		if (this.mode === "overview")
 			return !!this.liteRoot && !!this.proxyGroup;
 		if (this.mode === "interior") return this.projectionMode;
 		return false;
+	}
+
+	// Only where the switch actually changes what is on screen. It deliberately
+	// EXCLUDES the walkthrough: the panoramas are the picture in there and the splat
+	// is off by design, so offering the control would put a live-looking button in
+	// front of you that does nothing when pressed — which reads as the splat being
+	// broken rather than as the control being inapplicable.
+	private canToggleSplatView(): boolean {
+		return (
+			this.splat.ready &&
+			(this.mode === "overview" || this.mode === "freefly")
+		);
 	}
 
 	toggleProxyView() {
@@ -1393,6 +1651,38 @@ export class OrbitEngine {
 		if (this.mode === "overview") this.setOverviewView();
 		else if (this.mode === "interior") this.setInteriorProxyView();
 		this.emit();
+	}
+
+	// Swap between the Gaussian splat and the mesh views. Off is the escape hatch:
+	// it restores the dollhouse/proxy exactly as they behaved before a splat
+	// existed, which is both the fallback for a broken splat and the way to reach
+	// the addressable per-object geometry.
+	toggleSplatView() {
+		if (!this.canToggleSplatView()) return;
+		this.splatView = !this.splatView;
+		this.addressing.setHover(null);
+		this.addressing.closeMenu();
+		this.canvas.style.cursor = "";
+		if (this.mode === "overview") this.setOverviewView();
+		else if (this.mode === "freefly") this.setFreeflyView();
+		this.emit();
+	}
+
+	/**
+	 * Move the splat in world space. This exists to settle a splat whose trainer
+	 * renormalized the scene: nudge it until it registers against the proxy, then
+	 * bake the numbers into the asset (tools/splat-to-web-sog.mjs --translate) and
+	 * drop this back to identity. Deliberately not persisted — a correction that
+	 * lives only in the viewer is one every other consumer gets wrong.
+	 */
+	setSplatTransform(patch: Partial<SplatTransform>) {
+		this.splatTransform = { ...this.splatTransform, ...patch };
+		this.splat.setTransform(this.splatTransform);
+		this.emit();
+	}
+
+	getSplatTransform(): SplatTransform {
+		return this.splatTransform;
 	}
 
 	toggleHighlight() {
@@ -1479,8 +1769,14 @@ export class OrbitEngine {
 				[to, e],
 			];
 		}
-		if (this.currentIndex >= 0) return [[this.currentIndex, 1]];
+		// The fly target OUTRANKS where we currently stand. It is only ever set while
+		// a fly-in is committed to an arrival, and it is the more specific answer:
+		// stepping in from the dollhouse leaves `currentIndex` at -1 so either works,
+		// but landing out of free flight leaves it pointing at the anchor we
+		// DEPARTED — and reading that projects the wrong capture onto the proxy for
+		// the frame between setInteriorView() and activate().
 		if (this.flyTarget >= 0) return [[this.flyTarget, 1]];
+		if (this.currentIndex >= 0) return [[this.currentIndex, 1]];
 		return [];
 	}
 
@@ -1493,6 +1789,7 @@ export class OrbitEngine {
 		cbs: {
 			toFov?: number;
 			crossfade?: boolean;
+			dissolveInterior?: boolean;
 			onMid?: () => void;
 			onEnd?: () => void;
 		} = {},
@@ -1511,6 +1808,7 @@ export class OrbitEngine {
 			start: performance.now(),
 			dur: this.reducedMotion ? REDUCED_DUR : dur,
 			crossfade: !!cbs.crossfade,
+			dissolveInterior: !!cbs.dissolveInterior,
 			onMid: cbs.onMid,
 			onEnd: cbs.onEnd,
 			midDone: false,
@@ -1741,21 +2039,39 @@ export class OrbitEngine {
 	enter(index: number | null = null) {
 		if (this.mode !== "overview" || this.panos.length === 0) return;
 		const idx = index ?? this.nearestPanoTo(this.controls.target);
+		this.history = []; // a fresh interior session
+		this.flyIntoInterior(idx, 1100);
+	}
+
+	// Fly from wherever the camera happens to be onto a capture point, then hand
+	// over to the walkthrough. Shared by stepping in from the dollhouse and by
+	// landing out of free flight, because they are the same journey: you are in
+	// open space, and a capture point is where the walkthrough can take over.
+	//
+	// The walkthrough is a yaw/pitch rig, so the live look direction is read back
+	// as lon/lat and the pitch pre-clamped to what applyLook enforces. The pose the
+	// flight lands on is then exactly the pose the rig holds afterwards, so the
+	// handover doesn't snap the view a single degree — and because the heading
+	// carries across, the room you were looking at is the room you arrive facing.
+	private flyIntoInterior(
+		idx: number,
+		dur: number,
+		{ dissolve = false }: { dissolve?: boolean } = {},
+	) {
 		this.requestPano(idx);
 		const toPos = v3(this.panos[idx].position);
-		// The walkthrough is a yaw/pitch rig, so read the live orbit direction back
-		// as lon/lat and pre-clamp the pitch to the limit applyLook enforces. The
-		// pose the flight lands on is then exactly the pose the rig holds afterwards,
-		// so the handover doesn't snap the view a single degree.
 		const dir = this.camera.getWorldDirection(_flyDir);
 		const look = forwardToLonLat([dir.x, dir.y, dir.z]);
 		const lon = look.lon;
 		const lat = MathUtils.clamp(look.lat, -MAX_PITCH, MAX_PITCH);
-		this.history = []; // a fresh interior session
 		this.flyTarget = idx; // project the arrival during the fly-in (pre-activate)
-		this.startFly(toPos, lookTargetFrom(toPos, lon, lat), 1100, {
+		this.startFly(toPos, lookTargetFrom(toPos, lon, lat), dur, {
 			toFov: INTERIOR_FOV,
-			crossfade: true,
+			// One or the other: dissolve DURING the move, or park at the end and
+			// crossfade there. Never both — they are two answers to the same handover
+			// and would fight over the same panorama.
+			crossfade: !dissolve,
+			dissolveInterior: dissolve,
 			onEnd: () => {
 				this.mode = "interior";
 				this.lon = lon;
@@ -1765,6 +2081,113 @@ export class OrbitEngine {
 				this.activate(idx);
 			},
 		});
+	}
+
+	// --- free flight ----------------------------------------------------------
+
+	private canEnterFreefly(): boolean {
+		// The proxy is the requirement, not a nicety: without it the cursor has
+		// nothing to raycast, and a mode you can fly into but not click your way
+		// out of is a trap.
+		return this.splatEnabled && this.projectionMode && !this.interiorBusy;
+	}
+
+	// Leave the walkthrough for the splat WITHOUT moving. The camera already stands
+	// exactly where the splat says the room is, so the two renderings agree at this
+	// pose and the handover is a dissolve rather than a transition — the same
+	// reasoning enter() uses to hand the dollhouse over to a panorama.
+	//
+	// Movement is live from the first frame: the ramp is cosmetic and never gates
+	// input, so the keypress that asked for free flight is already moving you.
+	private enterFreefly() {
+		if (this.mode !== "interior" || !this.canEnterFreefly()) return;
+		this.yieldTour();
+		this.closeInspect();
+		this.hoveredNavIndex = -1;
+		this.arrowReach = null;
+		this.cursorReach = null;
+		this.markers.setNavHover(null);
+		this.markers.setArrowHover(null);
+		this.markers.hideGhost();
+		this.markers.hideSonar();
+		this.addressing.setHover(null);
+		this.addressing.closeMenu();
+		this.freeflyVel.set(0, 0, 0);
+
+		const tex =
+			this.currentIndex >= 0 ? this.panos[this.currentIndex]?.texture : null;
+		this.mode = "freefly";
+		this.setFreeflyView();
+		if (tex && !this.reducedMotion) {
+			// Stage the panorama we are standing in as a camera-locked overlay at
+			// full strength; the tick ramps it away to uncover the splat behind.
+			this.sphereBMat.uniforms.map.value = tex;
+			this.sphereBMat.uniforms.opacity.value = 1;
+			this.sphereBMat.depthTest = false;
+			this.sphereB.renderOrder = 20;
+			this.sphereB.visible = true;
+			this.sphereB.position.copy(this.camera.position);
+			this.splatReveal = 0;
+			this.splatRevealing = true;
+		} else {
+			this.clearPanoOverlay();
+			this.splatReveal = 1;
+			this.splatRevealing = false;
+		}
+		this.noteInput();
+		this.emit();
+	}
+
+	// Land out of free flight onto a capture point and give the walkthrough back.
+	//
+	// The interior is brought up BEFORE the flight and dissolved into during it, so
+	// the move and the handover are one gesture rather than a glide followed by a
+	// swap. That is only possible here: the departure image is the splat, on its own
+	// canvas, so the two can be composited while both are moving. Stepping in from
+	// the dollhouse cannot do this — see the note on Transition.dissolveInterior.
+	//
+	// It needs the destination panorama ALREADY resident, because the projection
+	// shader renders black with no texture bound and dissolving into black is worse
+	// than the old behaviour. The cursor pre-warms it while you aim, so this is the
+	// normal case; when it isn't ready we fall back to the parked crossfade, which
+	// knows how to wait.
+	private returnToInterior(index: number) {
+		if (this.mode !== "freefly" || !this.panos[index]) return;
+		this.freeflyKeys.clear();
+		this.freeflyVel.set(0, 0, 0);
+		this.splatRevealing = false;
+		this.clearPanoOverlay();
+		this.cursor.hide();
+		this.markers.hideGhost();
+
+		const resident = !!this.panos[index].texture;
+		if (!resident || !this.projectionMode || this.reducedMotion) {
+			this.flyIntoInterior(index, FREEFLY_RETURN_MS);
+			return;
+		}
+		// Stage the interior invisible, then let the tick ramp it up over the flight.
+		this.reskinProxy(this.projection.material);
+		if (this.proxyGroup) this.proxyGroup.visible = true;
+		this.projection.syncBase(true);
+		this.canvas.style.opacity = "0";
+		this.flyIntoInterior(index, FREEFLY_RETURN_MS, { dissolve: true });
+	}
+
+	// A click in free flight means what a click means everywhere else here: take me
+	// there. It runs the walkthrough's own resolution — the surface under the
+	// cursor, the floor that surface belongs to, the anchor that best answers it —
+	// so both modes agree about where a click lands. The floor comes straight from
+	// the geometry rather than from targetFloorFor's look-up/look-down heuristics,
+	// which are about a visitor rooted at one anchor and mean nothing in flight.
+	//
+	// Nothing under the cursor (aimed past the scene) falls back to the nearest
+	// capture, so a click always has somewhere to put you.
+	private clickFromFreefly(clientX: number, clientY: number) {
+		const hit = this.raycastInterior(clientX, clientY);
+		const best = hit
+			? this.autoHomeTarget(hit, this.floorAt(hit.point), -1)
+			: this.nearestPanoTo(this.camera.position);
+		if (best >= 0) this.returnToInterior(best);
 	}
 
 	// Step back out. The capture image is dissolved away WHILE still parked at the
@@ -2101,6 +2524,17 @@ export class OrbitEngine {
 		this.hoveredNavIndex = -1;
 		this.cursorReach = null;
 		this.proxyView = false;
+		this.splat.clear();
+		this.splatView = true; // a scene that ships a splat leads with it
+		this.splatTransform = { ...IDENTITY_TRANSFORM };
+		this.splatReveal = 0;
+		this.splatRevealing = false;
+		this.freeflyKeys.clear();
+		this.freeflyVel.set(0, 0, 0);
+		this.scene.background = this.bgColor;
+		// A scene swapped in mid-dissolve would otherwise inherit a part-transparent
+		// canvas and render washed out for the rest of the session.
+		this.canvas.style.opacity = "1";
 		this.addressing.reset();
 		this.canvas.style.cursor = "";
 		this.clearFx();
@@ -2189,6 +2623,14 @@ export class OrbitEngine {
 					lite = null;
 				}
 			}
+			// Loaded BEFORE the first frame rather than popped in afterwards: the
+			// splat IS the scene's appearance when it has one, and showing the
+			// dollhouse only to swap it out a second later reads as a glitch.
+			// Failure is non-fatal — the dollhouse and the walkthrough are each
+			// complete without it, so a broken splat costs the feature, not the scene.
+			// Drawn exactly where the file says it is — see the note by
+			// IDENTITY_TRANSFORM for why no correction is applied here.
+			if (source.splatUrl) await this.splat.load(source.splatUrl);
 			if (token !== this.loadToken || this.disposed) return;
 			this.applyScene(entries, proxyRoot, lite, connectors, objectIds);
 		} catch (e) {
@@ -2501,6 +2943,15 @@ export class OrbitEngine {
 		// GL's viewport origin is bottom-left; the rect is measured from the top.
 		const y = rect.height - (ins.y - rect.top) - ins.h;
 		const prevAutoClear = this.renderer.autoClear;
+		// The clear state has to be PUT BACK, not just overwritten. The inset needs
+		// an opaque backdrop of its own, but the main pass clears to transparent so
+		// the splat layer behind this canvas can show through — and leaving alpha at
+		// 1 here turns the whole canvas opaque for every subsequent frame, hiding the
+		// splat behind a wall of flat colour while the markers drawn on top of it
+		// carry on working. That reads as "the splat stopped loading" and survives
+		// until reload, which is exactly as confusing as it sounds.
+		this.renderer.getClearColor(_prevClear);
+		const prevClearAlpha = this.renderer.getClearAlpha();
 		this.renderer.autoClear = false;
 		this.renderer.setScissorTest(true);
 		this.renderer.setViewport(x, y, ins.w, ins.h);
@@ -2510,6 +2961,7 @@ export class OrbitEngine {
 		this.renderer.render(this.inspectScene, this.inspectCam);
 		this.renderer.setScissorTest(false);
 		this.renderer.setViewport(0, 0, rect.width, rect.height);
+		this.renderer.setClearColor(_prevClear, prevClearAlpha);
 		this.renderer.autoClear = prevAutoClear;
 	}
 
@@ -2589,10 +3041,30 @@ export class OrbitEngine {
 				this.camera.updateProjectionMatrix();
 			}
 			this.camera.updateMatrixWorld();
+			// Dissolve the interior in WHILE moving. Both layers parallax correctly —
+			// the splat on its own canvas, the panorama projected onto the proxy on
+			// this one — so there is nothing to smear and no reason to stop first.
+			//
+			// The weight ramps LATE on purpose. A capture projected from far off its
+			// own vantage is badly stretched, and that error shrinks to nothing as the
+			// camera converges on the anchor. So the splat carries the opening of the
+			// move and the interior asserts itself exactly as it becomes correct: the
+			// dissolve is scheduled by fidelity, not by the clock.
+			if (tr.dissolveInterior) {
+				this.updateProjection();
+				const d = MathUtils.clamp(
+					(t - DISSOLVE_START) / (1 - DISSOLVE_START),
+					0,
+					1,
+				);
+				this.canvas.style.opacity = easeInOut(d).toFixed(3);
+			}
 			// A crossfading flight stays fully visible the whole way in — there is
 			// nothing to hide, because the swap happens at the far end where the two
 			// renders already agree.
-			if (!tr.crossfade)
+			// A dissolving flight must not dip either: the whole point is that the
+			// picture never goes away, it only changes hands.
+			if (!tr.crossfade && !tr.dissolveInterior)
 				this.travelFade.style.opacity = (
 					Math.sin(Math.PI * t) * 0.5
 				).toFixed(3);
@@ -2600,10 +3072,12 @@ export class OrbitEngine {
 				tr.midDone = true;
 				tr.onMid?.();
 			}
-			// Never project during a flight. The enter path is still on the dollhouse,
-			// and the exit path has already dissolved the capture away — projecting
-			// here would re-glue the pano to the proxy and ride it out with the camera
-			// (the duplicated-room look).
+			// Never project during a flight, EXCEPT a dissolving one (handled above).
+			// The enter path is still on the dollhouse and the exit path has already
+			// dissolved the capture away, so projecting on either would re-glue the
+			// pano to the proxy and ride it out with the camera — the duplicated-room
+			// look. A dissolving flight is the one case where projecting is the point:
+			// it lands on a capture point and its departure image is a different canvas.
 			if (t >= 1) {
 				const cb = tr.onEnd;
 				const crossfade = tr.crossfade;
@@ -2621,6 +3095,9 @@ export class OrbitEngine {
 					};
 				} else {
 					this.travelFade.style.opacity = "0";
+					// Defensive: a dissolve leaves this mid-ramp, and a canvas stuck
+					// part-transparent would quietly wash out every later frame.
+					this.canvas.style.opacity = "1";
 					cb?.();
 				}
 			}
@@ -2684,6 +3161,8 @@ export class OrbitEngine {
 					this.markers.pulseExits(now, 1600);
 				}
 			}
+		} else if (this.mode === "freefly") {
+			this.tickFreefly(dt);
 		} else if (this.mode === "peek") {
 			const off = this.camera.position.clone().sub(this.sceneCenter);
 			const a = PEEK_ROTATE_SPEED * dt;
@@ -2696,9 +3175,66 @@ export class OrbitEngine {
 
 		this.updateCursorRing();
 		this.addressing.updateOutlines();
+		// The splat draws FIRST, from the camera this frame just settled on, so the
+		// two canvases present the same pose. Anything three.js puts on top — the
+		// cursor, a waypoint, the dissolving panorama — is then glued to it rather
+		// than trailing it by a frame. A no-op whenever the splat is off screen.
+		this.splat.render(this.camera);
 		this.composer.render();
 		this.renderInspect(dt);
 	};
+
+	// One frame of free flight. Velocity EASES toward what the held keys ask for
+	// rather than snapping to it, which is most of what separates flying from
+	// teleporting; the ramp is short enough to still feel deliberate.
+	private tickFreefly(dt: number) {
+		const cl = Math.cos(this.lat);
+		const fx = cl * Math.cos(this.lon);
+		const fy = Math.sin(this.lat);
+		const fz = cl * Math.sin(this.lon);
+		const rx = -Math.sin(this.lon);
+		const rz = Math.cos(this.lon);
+		const keys = this.freeflyKeys;
+		_moveWish.set(0, 0, 0);
+		// W/S fly along the FULL look direction, pitch included — looking up and
+		// pressing forward should climb, which is the difference between flying and
+		// walking. Q/E stay on world up, so you can rise without changing where you
+		// are looking.
+		if (keys.has("KeyW")) _moveWish.set(fx, fy, fz);
+		if (keys.has("KeyS")) _moveWish.set(-fx, -fy, -fz);
+		if (keys.has("KeyD")) {
+			_moveWish.x += rx;
+			_moveWish.z += rz;
+		}
+		if (keys.has("KeyA")) {
+			_moveWish.x -= rx;
+			_moveWish.z -= rz;
+		}
+		if (keys.has("KeyE")) _moveWish.y += 1;
+		if (keys.has("KeyQ")) _moveWish.y -= 1;
+		if (_moveWish.lengthSq() > 0) _moveWish.normalize();
+		_moveWish.multiplyScalar(
+			this.sceneMaxDim *
+				FREEFLY_SPEED_FRAC *
+				(keys.has("Shift") ? FREEFLY_SPRINT : 1),
+		);
+		// Frame-rate independent approach, so the feel is the same at 60 and 144.
+		this.freeflyVel.lerp(_moveWish, 1 - Math.exp(-(dt * 1000) / FREEFLY_ACCEL_TAU));
+		this.camera.position.addScaledVector(this.freeflyVel, dt);
+		this.lat = applyLook(this.camera, this.lon, this.lat);
+
+		if (!this.splatRevealing) return;
+		// The departing panorama rides the camera while it fades, so the dissolve
+		// changes only opacity — a backdrop left behind would parallax against the
+		// splat and read as two rooms sliding apart.
+		this.splatReveal = Math.min(1, this.splatReveal + (dt * 1000) / SPLAT_REVEAL_MS);
+		this.sphereB.position.copy(this.camera.position);
+		this.sphereBMat.uniforms.opacity.value = 1 - easeInOut(this.splatReveal);
+		if (this.splatReveal >= 1) {
+			this.splatRevealing = false;
+			this.clearPanoOverlay();
+		}
+	}
 
 	// Parked dissolve between dollhouse and capture pano, entirely on the GPU.
 	// "in" (enter): wait for the texture, then ramp the equirect over the dollhouse.
@@ -2746,7 +3282,7 @@ export class OrbitEngine {
 
 	private updateCursorRing() {
 		const active =
-			this.mode === "interior" &&
+			this.isLookMode &&
 			!this.interiorBusy &&
 			this.pointerInside &&
 			!this.markers.hoveredNav &&
@@ -2760,7 +3296,41 @@ export class OrbitEngine {
 		// direction arrow — but only where the surface it is lying on can express it
 		// (see SurfaceCursor.aimArrow).
 		let travel: Vector3 | null = null;
-		if (hit && this.currentIndex >= 0) {
+		if (hit && this.mode === "freefly") {
+			// In flight the only question a cursor can answer is "where would this
+			// put me down", so it answers exactly that: a waypoint standing on the
+			// capture a click would land on, tethered back to the surface under the
+			// pointer. None of the interior's floor scoping or occlusion tinting
+			// applies — those describe a visitor rooted at one anchor, and you are
+			// not rooted at one.
+			const targetIdx = this.autoHomeTarget(hit, this.floorAt(hit.point), -1);
+			if (targetIdx >= 0) {
+				this.cursor.setColor(CURSOR_CLEAR);
+				this.markers.showGhost(
+					this.destinationFloor(targetIdx),
+					{ to: targetIdx, type: "walk", dy: 0 },
+					this.camera,
+					this.host.clientHeight,
+					hit.point,
+				);
+				ghosted = true;
+				// Recorded so the shared change-detection below STREAMS this pano
+				// while you are still deciding. Without it the first request happens
+				// at click time, and the arrival then parks at the anchor waiting up
+				// to a second for a 4k equirect to decode before the dissolve can
+				// even begin — which is the flight landing and then visibly
+				// re-settling. The walkthrough pre-warms the same way on hover; free
+				// flight has to as well, and for the same reason.
+				//
+				// It drives nothing else here: the 360 preview panel this feeds in
+				// the walkthrough is gated to interior mode (see emit).
+				reach = {
+					index: targetIdx,
+					level: this.panoLevel[targetIdx] ?? -1,
+					levelDelta: 0,
+				};
+			}
+		} else if (hit && this.currentIndex >= 0) {
 			const curLevel = this.panoLevel[this.currentIndex] ?? -1;
 			// Ask the GEOMETRY which floor it is on, by testing the point against the
 			// floors' described volumes — not the nearest capture point, which is what

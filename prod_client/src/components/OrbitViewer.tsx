@@ -76,6 +76,9 @@ export default function OrbitViewer({
 	// arrive somewhere, and the map's own "you are on N" badge covers the mismatch.
 	const [viewedLevel, setViewedLevel] = useState(0);
 	const [prevLevel, setPrevLevel] = useState(-1);
+	// The splat alignment nudger, off unless asked for — it exists to find a
+	// placement, not to be part of the walkthrough.
+	const [aligning, setAligning] = useState(false);
 
 	useEffect(() => {
 		const host = hostRef.current;
@@ -94,6 +97,7 @@ export default function OrbitViewer({
 
 	const focused =
 		state.mode === "interior" ||
+		state.mode === "freefly" ||
 		state.mode === "transition" ||
 		state.mode === "peek";
 	useEffect(() => {
@@ -163,6 +167,26 @@ export default function OrbitViewer({
 			    notably the expanded minimap's collapse button. Only the buttons
 			    themselves take the pointer now. */}
 			<div className='pointer-events-none absolute right-4 top-4 z-10 flex flex-wrap justify-end gap-2 [&>*]:pointer-events-auto'>
+				{state.canSplatView && (
+					<ToolButton
+						active={state.splatView}
+						activeClass='border-fuchsia-400/70 bg-fuchsia-500/20 text-fuchsia-200'
+						title='Show the Gaussian splat instead of the mesh — press WASD inside to fly through it'
+						onClick={() => engineRef.current?.toggleSplatView()}
+					>
+						splat
+					</ToolButton>
+				)}
+				{state.splatTransform && (
+					<ToolButton
+						active={aligning}
+						activeClass='border-amber-400/70 bg-amber-500/20 text-amber-200'
+						title='Nudge the splat into register with the scene'
+						onClick={() => setAligning((v) => !v)}
+					>
+						align
+					</ToolButton>
+				)}
 				{state.canProxyView && (
 					<ToolButton
 						active={state.proxyView}
@@ -282,6 +306,10 @@ export default function OrbitViewer({
 			{/* Always mounted, even with nothing to show: it fades and re-targets in
 			    place, so re-aiming across a doorway edge can never blink the window
 			    out and back. */}
+			{aligning && state.splatTransform && (
+				<SplatAlign transform={state.splatTransform} engine={engineRef} />
+			)}
+
 			<ReachPreviewPanel preview={state.reachPreview} />
 			{state.preview && <HoverCard preview={state.preview} />}
 			{state.inspect && <InspectFrame inspect={state.inspect} />}
@@ -348,6 +376,153 @@ function ToolButton({
 		>
 			{children}
 		</button>
+	);
+}
+
+// The splat alignment nudger.
+//
+// A trainer that renormalizes the scene on ingest (Postshot does) returns a splat
+// whose origin is nowhere near the world the walkthrough occupies, and no amount
+// of arithmetic settles it from the outside: matching bounding boxes cannot tell a
+// translation from an axis flip, because both move an AABB's corners the same way.
+// Looking at it can. So this exists to FIND the placement by eye — turn the splat
+// off and on against the proxy until they register — and then to hand the numbers
+// over to the encoder, which bakes them into the asset so that no viewer has to
+// carry a correction at all. It is scaffolding, and it should be deleted with the
+// offset it was used to find.
+//
+// The rotation row is not decoration: a 180° flip about an axis is the single most
+// likely thing to be wrong here, and it is the one thing translation alone can
+// never fix.
+function SplatAlign({
+	transform,
+	engine,
+}: {
+	transform: NonNullable<OrbitState["splatTransform"]>;
+	engine: RefObject<OrbitEngine | null>;
+}) {
+	const [step, setStep] = useState(1);
+	const { position, rotation, scale } = transform;
+	const nudge = (axis: 0 | 1 | 2, dir: number) => {
+		const next = [...position] as [number, number, number];
+		next[axis] = +(next[axis] + dir * step).toFixed(3);
+		engine.current?.setSplatTransform({ position: next });
+	};
+	const spin = (axis: 0 | 1 | 2, deg: number) => {
+		const next = [...rotation] as [number, number, number];
+		next[axis] = (((next[axis] + deg) % 360) + 360) % 360;
+		engine.current?.setSplatTransform({ rotation: next });
+	};
+	const reset = () =>
+		engine.current?.setSplatTransform({
+			position: [0, 0, 0],
+			rotation: [0, 0, 0],
+			scale: 1,
+		});
+	// What the found placement becomes. World-space, matching the encoder's flags —
+	// which do the coordinate-convention conversion internally, so these numbers go
+	// in exactly as they read here.
+	const cli =
+		`--translate ${position.join(",")}` +
+		(rotation.some((r) => r !== 0) ? ` --rotate ${rotation.join(",")}` : "") +
+		(scale !== 1 ? ` --scale ${scale}` : "");
+
+	return (
+		<div className='absolute right-4 top-16 z-30 w-72 rounded-lg border border-amber-400/30 bg-neutral-950/90 p-3 text-xs shadow-2xl backdrop-blur'>
+			<div className='mb-2 flex items-center justify-between'>
+				<span className='text-[10px] uppercase tracking-wider text-amber-200/80'>
+					splat alignment
+				</span>
+				<button
+					type='button'
+					onClick={reset}
+					className='rounded px-1.5 py-0.5 text-[10px] text-neutral-400 transition hover:bg-white/10 hover:text-white'
+				>
+					reset
+				</button>
+			</div>
+
+			{(["x", "y", "z"] as const).map((label, axis) => (
+				<div key={label} className='mb-1 flex items-center gap-2'>
+					<span className='w-3 text-neutral-500'>{label}</span>
+					<button
+						type='button'
+						onClick={() => nudge(axis as 0 | 1 | 2, -1)}
+						className='h-6 w-6 rounded bg-white/10 text-neutral-200 transition hover:bg-white/20'
+					>
+						−
+					</button>
+					<input
+						value={position[axis]}
+						onChange={(e) => {
+							const v = Number(e.target.value);
+							if (!Number.isFinite(v)) return;
+							const next = [...position] as [number, number, number];
+							next[axis] = v;
+							engine.current?.setSplatTransform({ position: next });
+						}}
+						className='w-full min-w-0 rounded border border-white/15 bg-black/50 px-1.5 py-0.5 text-right tabular-nums text-neutral-100 outline-none focus:border-amber-400'
+					/>
+					<button
+						type='button'
+						onClick={() => nudge(axis as 0 | 1 | 2, 1)}
+						className='h-6 w-6 rounded bg-white/10 text-neutral-200 transition hover:bg-white/20'
+					>
+						+
+					</button>
+				</div>
+			))}
+
+			<div className='mb-2 mt-2 flex items-center gap-2'>
+				<span className='text-[10px] uppercase tracking-wider text-neutral-500'>
+					step
+				</span>
+				{[0.1, 1, 5].map((s) => (
+					<button
+						key={s}
+						type='button'
+						onClick={() => setStep(s)}
+						className={`rounded px-1.5 py-0.5 tabular-nums transition ${
+							step === s
+								? "bg-amber-400/25 text-amber-100"
+								: "text-neutral-400 hover:bg-white/10"
+						}`}
+					>
+						{s}
+					</button>
+				))}
+			</div>
+
+			<div className='mb-2 flex items-center gap-2'>
+				<span className='text-[10px] uppercase tracking-wider text-neutral-500'>
+					flip
+				</span>
+				{(["x", "y", "z"] as const).map((label, axis) => (
+					<button
+						key={label}
+						type='button'
+						title={`rotate 180° about ${label}`}
+						onClick={() => spin(axis as 0 | 1 | 2, 180)}
+						className={`rounded px-1.5 py-0.5 transition ${
+							rotation[axis] !== 0
+								? "bg-amber-400/25 text-amber-100"
+								: "text-neutral-400 hover:bg-white/10"
+						}`}
+					>
+						{label}180
+					</button>
+				))}
+			</div>
+
+			<code className='block w-full overflow-x-auto whitespace-nowrap rounded bg-black/60 px-2 py-1 text-[10px] text-emerald-300/90'>
+				{cli}
+			</code>
+			<p className='mt-1.5 text-[10px] leading-snug text-neutral-500'>
+				Bake with{" "}
+				<span className='text-neutral-400'>splat-to-web-sog.mjs</span>, then
+				clear this offset.
+			</p>
+		</div>
 	);
 }
 
@@ -1174,9 +1349,19 @@ function Minimap({
 	);
 }
 
-function modeLabel({ mode, proxyView }: OrbitState): ReactNode {
+function modeLabel({ mode, proxyView, splatView }: OrbitState): ReactNode {
+	if (mode === "freefly")
+		return (
+			<>
+				<strong>free flight</strong> · splat
+			</>
+		);
 	if (mode === "overview")
-		return proxyView ? (
+		return splatView ? (
+			<>
+				<strong>splat</strong> · orbit
+			</>
+		) : proxyView ? (
 			<>
 				<strong>proxy</strong> · orbit
 			</>
@@ -1272,6 +1457,14 @@ function hudContent(state: OrbitState): ReactNode {
 			</>
 		);
 	}
+	if (mode === "freefly")
+		return (
+			<>
+				<strong>WASD</strong> fly · <strong>Q/E</strong> down/up ·{" "}
+				<strong>shift</strong> faster · <strong>click</strong> to land ·{" "}
+				<strong>Esc</strong> back
+			</>
+		);
 	if (mode === "peek")
 		return (
 			<>

@@ -35,6 +35,14 @@ _RAW_SUBDIR = "objects-generated"
 _LIBRARY_SUBDIR = "objects"
 _LEGACY_GENERATED_DIR = "generated"
 _PUBLISHED_DIR = "published"  # baked preview cached under the cell
+# The SOG-encoded trained splat the viewer loads, in PREFERENCE ORDER.
+#
+# `trained.web.sog` is the delivery encode (client/tools/splat-to-web-sog.mjs): it
+# carries any baked frame correction and is sized for streaming, so it wins whenever
+# it exists. A bare `trained.sog` is the trainer's own export — usable, but it is
+# whatever frame that trainer chose to write, which is not necessarily the world the
+# rest of the cell lives in.
+_SPLAT_NAMES = ("trained.web.sog", "trained.sog")
 
 # The cell's mesh-source choice (persisted in splat/source.json by the pipeline).
 # 'auto' = generated build else library; an explicit value pins exactly one set.
@@ -184,6 +192,19 @@ def local_scene_keys(run: str, slot: str, model: str) -> dict[str, str]:
     }
 
 
+def local_splat_key(cell: Path, run: str, slot: str, model: str) -> str | None:
+    """The artifact key for the cell's Gaussian splat, or None when it has none.
+
+    Lives at the cell ROOT rather than under a stage folder because it is delivered
+    ALONGSIDE the pipeline rather than produced by it — an external trainer writes
+    it, so no stage directory owns it. Most cells have never been trained, so None
+    is the common answer and the viewer treats a splat as an optional upgrade."""
+    for name in _SPLAT_NAMES:
+        if (cell / name).is_file():
+            return f"{run}/{slot}/{model}/{name}"
+    return None
+
+
 def local_scene_row(runs_dir: Path, run: str, slot: str, model: str) -> dict[str, Any] | None:
     """The catalog row for one locally-published cell, built from disk — the local
     twin of a D1 `scenes` row (same snake_case fields). None until the dollhouse is
@@ -206,6 +227,7 @@ def local_scene_row(runs_dir: Path, run: str, slot: str, model: str) -> dict[str
         "tour_key": keys["tour_key"] if tour_json.is_file() else None,
         "proxy_key": keys["proxy_key"] if proxy_glb.is_file() else None,
         "pano_prefix": keys["pano_prefix"] if panos else None,
+        "splat_key": local_splat_key(cell, run, slot, model),
         "pano_count": len(panos),
         "published_at": datetime.fromtimestamp(stamp.stat().st_mtime, UTC).isoformat(),
     }
