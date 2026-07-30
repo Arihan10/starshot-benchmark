@@ -32,10 +32,14 @@ import argparse
 import json
 import math
 import struct
+import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from starshot_paths import runs_root
+
 DEFAULT_CELL = "v3-iter5/modern-house/opus-new"
-RUNS = Path(__file__).resolve().parent.parent / "runs"
+RUNS = runs_root()
 
 # wall classification + collision tolerances (meters)
 WALL_THIN = 0.6        # a "wall" frame is thin (<this) on X or Z ...

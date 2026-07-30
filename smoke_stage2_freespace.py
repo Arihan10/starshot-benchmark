@@ -37,8 +37,9 @@ from splat.stage2 import (
     compute_free_space,
     load_free_space,
 )
+from starshot_paths import runs_root
 
-LEGACY_GRID = Path("runs/good_opus_new_hotel2/hotel-room/opus-new/splat/freespace.npz")
+LEGACY_GRID = runs_root() / "good_opus_new_hotel2/hotel-room/opus-new/splat/freespace.npz"
 NPZ_SCHEMA = {
     "origin", "pitch", "dims", "occ_lin", "occ_lin_glass",
     "skin_lin", "zone_lin",

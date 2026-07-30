@@ -56,7 +56,11 @@ from app.services import library  # noqa: E402
 from app.utils import glb_place, logging  # noqa: E402
 
 _REPO_ROOT = _SERVER_DIR.parent
-DEFAULT_RUNS_DIR = _REPO_ROOT / "runs" / "collection-gemini-flash"
+sys.path.insert(0, str(_REPO_ROOT))
+
+from starshot_paths import runs_root  # noqa: E402
+
+DEFAULT_RUNS_DIR = runs_root() / "collection-gemini-flash"
 OBJECTS_SUBDIR = "objects"
 
 # Match the live fan-out cap (generation.LIBRARY_MATCH_CONCURRENCY) so a

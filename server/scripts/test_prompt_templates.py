@@ -47,7 +47,9 @@ from pathlib import Path
 SERVER = Path(__file__).resolve().parent.parent
 REPO = SERVER.parent
 sys.path.insert(0, str(SERVER))
+sys.path.insert(0, str(REPO))
 
+from starshot_paths import runs_root  # noqa: E402
 from app.core import prompt_store, scene_context  # noqa: E402
 from app.core.schemas import ChildNodeSpec, ObjectSpec  # noqa: E402
 from app.core.types import (  # noqa: E402
@@ -709,18 +711,18 @@ def skeleton_match(template: str, rendered: str) -> dict[str, list[str]] | None:
     return fills
 
 
-def iter_logged_calls(runs_root: Path, wanted: set[str]):
+def iter_logged_calls(runs_dir: Path, wanted: set[str]):
     """Yield (run, step, event) for cache.llm events of `wanted` steps across
     recent runs, newest first, lightly capped per cell to bound the scan."""
-    if not runs_root.is_dir():
+    if not runs_dir.is_dir():
         return
     run_dirs = sorted(
-        (p for p in runs_root.iterdir() if p.is_dir()),
+        (p for p in runs_dir.iterdir() if p.is_dir()),
         key=lambda p: p.stat().st_mtime, reverse=True,
     )
     forced = os.environ.get("STARSHOT_PARITY_RUN")
     if forced:
-        run_dirs = [runs_root / forced]
+        run_dirs = [runs_dir / forced]
     for run_dir in run_dirs[:_MAX_RUNS]:
         for ev_path in sorted(run_dir.glob("*/*/events.jsonl")):
             if "_branches" in ev_path.parts:
@@ -772,7 +774,7 @@ def add_ground_truth_checks() -> None:
         # recent-run budget is exhausted; root and nested variants are
         # verified independently.
         pending = {(s, c) for s, cands in EVENT_STEP_TEMPLATES.items() for c in cands}
-        for run, step, e in iter_logged_calls(REPO / "runs", set(EVENT_STEP_TEMPLATES)):
+        for run, step, e in iter_logged_calls(runs_root(), set(EVENT_STEP_TEMPLATES)):
             if not any(p[0] == step for p in pending):
                 continue
             seen_steps.add(step)

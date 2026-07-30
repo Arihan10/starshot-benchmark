@@ -27,8 +27,9 @@ from splat.stage6 import (
     _load_cloud,
     train_splat,
 )
+from starshot_paths import runs_root
 
-OUT = Path(__file__).parent / "runs" / "_smoke" / "stage6_tiled"
+OUT = runs_root() / "_smoke" / "stage6_tiled"
 RES = 200
 FOCAL = 160.0
 

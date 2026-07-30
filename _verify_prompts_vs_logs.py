@@ -25,8 +25,10 @@ import re
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from starshot_paths import runs_root
+
 VERSION_DIR = Path("versions/pre-reclass-frame")
-RUNS_ROOT = Path("runs/against-the-gods")
+RUNS_ROOT = runs_root() / "against-the-gods"
 
 # event-log step id -> candidate template names (root/nested share a step id)
 EVENT_STEP_TEMPLATES = {

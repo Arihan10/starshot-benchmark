@@ -58,10 +58,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]  # server/scripts -> server -> repo
+sys.path.insert(0, str(_REPO_ROOT))
+
+from starshot_paths import runs_root  # noqa: E402
+
 _OPTIMIZE_DIR = _REPO_ROOT / "server" / "tools" / "optimize-assets"
 _OPTIMIZE_SCRIPT = _OPTIMIZE_DIR / "optimize.mjs"
 _NODE_BIN = os.environ.get("STARSHOT_NODE_BIN", "node")
-_DEFAULT_RUNS = os.environ.get("STARSHOT_RUNS_DIR", str(_REPO_ROOT / "runs"))
+_DEFAULT_RUNS = str(runs_root())
 
 
 @dataclass
@@ -208,7 +212,10 @@ def _gather_targets(args: argparse.Namespace) -> list[Target]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Build the lite asset tier for runs.")
-    parser.add_argument("--runs", default=_DEFAULT_RUNS, help="runs root (default: repo/runs)")
+    parser.add_argument(
+        "--runs", default=_DEFAULT_RUNS,
+        help="runs root (default: $STARSHOT_RUNS_DIR, else repo/runs)",
+    )
     parser.add_argument("--filter", help="single cell as <run>/<slot>/<model>")
     parser.add_argument("--version", default="library",
                         help='asset set: "library" or a generated version number (default: library)')

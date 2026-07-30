@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import os
 import shutil
 import sys
 import tempfile
@@ -46,7 +45,10 @@ import trimesh
 from pxr import Gf, Sdf, Tf, Usd, UsdGeom, UsdShade, UsdUtils, Vt
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", str(REPO_ROOT / "runs")))
+sys.path.insert(0, str(REPO_ROOT))
+from starshot_paths import runs_root  # noqa: E402
+
+DEFAULT_RUNS_DIR = runs_root()
 
 # The unoptimized, world-placed generated meshes (generation.GENERATED_RAW_SUBDIR).
 # `<id>.raw.glb` siblings are the pre-rescale Trellis intermediates — never placed.

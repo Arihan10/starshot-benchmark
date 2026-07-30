@@ -1,4 +1,6 @@
-import json, struct, collections, pathlib
+import json, struct, collections
+
+from starshot_paths import runs_root
 
 def glb_chunks(path):
     with open(path, "rb") as f:
@@ -17,7 +19,7 @@ def glb_chunks(path):
         off += clen
     return js, data, bin_off
 
-d = pathlib.Path(r"runs/good_opus_new_hotel2/hotel-room/gemini-pro/generated/1/objects-generated-optimized")
+d = runs_root() / "good_opus_new_hotel2/hotel-room/gemini-pro/generated/1/objects-generated-optimized"
 
 alphamode = collections.Counter()
 alpha_lt = 0

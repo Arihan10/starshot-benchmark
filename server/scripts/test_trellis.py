@@ -25,7 +25,11 @@ BASE_URL = os.environ.get(
     "https://starshot-aitools--starshot-assets-router-fastapi-app.modal.run",
 )
 
-DEFAULT_IMAGE = Path(__file__).resolve().parent.parent / "runs" / "modern-house" / "objects" / "pavilion_roof.png"
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from starshot_paths import runs_root  # noqa: E402
+
+DEFAULT_IMAGE = runs_root() / "modern-house" / "objects" / "pavilion_roof.png"
 
 POLL_INTERVAL_SECONDS = 2.0
 POLL_TIMEOUT_SECONDS = 600.0

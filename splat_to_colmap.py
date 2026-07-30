@@ -14,8 +14,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from splat import colmap, stage5
+from starshot_paths import runs_root
 
-DEFAULT_SPLAT = Path("runs/ahhhhhhhh/test-SH/gemini-flash-lite/splat")
+DEFAULT_SPLAT = runs_root() / "ahhhhhhhh/test-SH/gemini-flash-lite/splat"
 
 
 def main() -> None:

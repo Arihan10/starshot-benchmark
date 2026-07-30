@@ -8,8 +8,8 @@ artifacts, and SSE streams. The viewer picks the active run at runtime via
 
 For each (run, slot, model) cell: fresh ones sit idle, interrupted ones
 come back as paused, completed ones stay done. Nothing auto-launches;
-the viewer drives start/resume/reset per cell. Runs are hydrated lazily
-on activation; the initial active run is the newest subdir of RUNS_DIR.
+the viewer drives start/resume/reset per cell. Runs are hydrated lazily only
+after an explicit run selection; server startup never parses a run's event logs.
 
 Every asyncio task is bound to its SlotLog via a ContextVar so
 concurrent pipeline work routes events to the right cell without
@@ -69,18 +69,21 @@ from app.services import symmetry as sym_svc
 from app.utils import logging as rlog
 from app.utils.logging import SlotLog
 
-# Parent directory holding many named runs. Each immediate subdirectory
-# is one run; cells live at RUNS_DIR/<run>/<slot>/<model>. Anchored to the
-# repo root (this file is server/app/api/routes.py) rather than the launch
-# CWD, mirroring prompt_store.VERSIONS_DIR.
+# The repo root (this file is server/app/api/routes.py). It holds both the
+# top-level `splat/` package and `starshot_paths`, outside the server's `app`
+# package — put it on sys.path so they import cleanly.
 _REPO_ROOT = Path(__file__).resolve().parents[3]
-RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", _REPO_ROOT / "runs"))
-
-# The splat pipeline lives in the top-level `splat/` package (repo root), outside
-# the server's `app` package — put the repo root on sys.path so it imports
-# cleanly, mirroring how _REPO_ROOT anchors RUNS_DIR above.
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from starshot_paths import runs_root  # noqa: E402
+
+# Parent directory holding many named runs. Each immediate subdirectory
+# is one run; cells live at RUNS_DIR/<run>/<slot>/<model>. Resolved from
+# STARSHOT_RUNS_DIR (server/.env) and anchored to the repo root rather than the
+# launch CWD, mirroring prompt_store.VERSIONS_DIR.
+RUNS_DIR = runs_root()
+
 from splat import stage1 as splat_stage1  # noqa: E402
 from splat import stage2 as splat_stage2  # noqa: E402
 from splat import stage3 as splat_stage3  # noqa: E402
@@ -244,6 +247,7 @@ _generate_tasks: dict[GenKey, asyncio.Task[None]] = {}
 _regen_tasks: dict[GenKey, asyncio.Task[None]] = {}
 _regen_queues: dict[GenKey, asyncio.Queue["RegenJob"]] = {}
 _hydrated_runs: set[str] = set()
+_hydration_errors: dict[str, str] = {}
 
 # --- Stage 1 splat conversion jobs (background, one per CELL) ----------------
 # Keyed by (run, slot, model): selecting a run lists cells; clicking a cell
@@ -1174,20 +1178,24 @@ def _generated_image_prompts(events_path: Path) -> dict[str, str]:
 
 
 def _ensure_run_hydrated(run: str) -> None:
-    """Lazily hydrate a run that exists on disk but isn't in memory yet.
+    """Hydrate an existing run on first data access, never during startup.
 
-    Only the three reserved version runs hydrate at boot; saved/named runs
-    hydrate on explicit activation. But the client also reaches a run directly
-    via `?run=` — a persisted tab, an archived run in the picker, or any cell
-    after a server restart — without re-activating it. Without this, every cell
-    endpoint for such a run 404s (`_require_slot_log`) and `/slots` reports its
-    cells as empty/idle, so the client's gate poll silently bails and a finished
-    regen/build never swaps in. Hydrating on first touch makes cell access
-    self-healing; it's idempotent and cheap once done (guarded by
-    `_hydrated_runs`), and a genuinely unknown run (no dir) is left alone so the
-    downstream 404 still fires."""
-    if run and run not in _hydrated_runs and _run_dir(run).is_dir():
-        _hydrate_run(run)
+    A failed hydration is converted into a per-run 503 rather than an unhandled
+    exception. This keeps the process and every other run usable even when one
+    legacy run is too large or has a damaged event log."""
+    if not run or not _run_dir(run).is_dir():
+        return
+    if run not in _hydrated_runs:
+        try:
+            _hydrate_run(run)
+        except (MemoryError, OSError, UnicodeError, json.JSONDecodeError) as exc:
+            _hydration_errors[run] = f"{type(exc).__name__}: {exc}"
+    error = _hydration_errors.get(run)
+    if error is not None:
+        raise HTTPException(
+            status_code=503,
+            detail=f"run {run!r} could not be loaded: {error}",
+        )
 
 
 def _slug(text: str) -> str:
@@ -1676,26 +1684,43 @@ def _build_run_prompts(run: str, compare: str | None) -> dict[str, object]:
 
 def _hydrate_run(run: str) -> None:
     """Build SlotLogs for every (slot, model) cell under RUNS_DIR/<run>/.
-    Idempotent — calling twice is a no-op. Hydration is per-run so the
-    /runs/ parent can hold many old run sets without paying their startup
-    cost until the user clicks one."""
+
+    Idempotent and transactional at the registry level: a failed cell/branch
+    parse leaves no half-hydrated run behind, so other runs remain independent
+    and a later retry starts cleanly."""
     if run in _hydrated_runs:
         return
     run_dir = _run_dir(run)
     run_dir.mkdir(parents=True, exist_ok=True)
-    for slot in SLOTS:
-        for alias in MODEL_ALIASES:
-            slot_dir = _slot_dir(run, slot.id, alias)
-            slot_dir.mkdir(parents=True, exist_ok=True)
-            slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
-            slot_log.hydrate_from_disk()
-            _slot_logs[(run, slot.id, alias)] = slot_log
-            # Restore stepped mode from its on-disk marker so a stepped run
-            # comes back steppable after a restart instead of a dead paused cell.
-            if (slot_dir / ".stepped").exists():
-                _stepped_cells.add((run, slot.id, alias))
-            _maybe_launch(slot, alias, slot_log)
-    _hydrate_branches(run)
+    added_keys: list[RunKey] = []
+    try:
+        for slot in SLOTS:
+            for alias in MODEL_ALIASES:
+                slot_dir = _slot_dir(run, slot.id, alias)
+                slot_dir.mkdir(parents=True, exist_ok=True)
+                slot_log = SlotLog(_run_id(run, slot.id, alias), slot_dir / "events.jsonl")
+                slot_log.hydrate_from_disk()
+                key: RunKey = (run, slot.id, alias)
+                _slot_logs[key] = slot_log
+                added_keys.append(key)
+                # Restore stepped mode from its on-disk marker so a stepped run
+                # comes back steppable after a restart instead of a dead paused cell.
+                if (slot_dir / ".stepped").exists():
+                    _stepped_cells.add(key)
+                _maybe_launch(slot, alias, slot_log)
+        _hydrate_branches(run)
+    except BaseException:
+        for key in added_keys:
+            slot_log = _slot_logs.pop(key, None)
+            if slot_log is not None:
+                slot_log.close()
+            _stepped_cells.discard(key)
+        for branch_id, branch in list(_branches.items()):
+            if branch.run == run:
+                branch.log.close()
+                _branches.pop(branch_id, None)
+        raise
+    _hydration_errors.pop(run, None)
     _hydrated_runs.add(run)
 
 
@@ -3782,20 +3807,26 @@ def create_app() -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         RUNS_DIR.mkdir(parents=True, exist_ok=True)
         global _current_run
-        # Open on the most recently touched run (if any); other runs hydrate
-        # lazily on activation. Nothing is seeded — runs only exist when the
-        # user creates them.
-        run_dirs = sorted(
-            (p for p in RUNS_DIR.iterdir() if p.is_dir()),
-            key=lambda p: p.stat().st_mtime,
-            reverse=True,
-        )
-        if run_dirs:
-            _current_run = run_dirs[0].name
-            _hydrate_run(_current_run)
-        # Resolve LLM costs off the pipeline, forever — including a backlog left
-        # unpriced by a prior process that exited mid-lookup (the resumed run's
-        # cells hydrate above, so this sweep recovers them).
+        # Pick a lightweight default for legacy callers, but never hydrate a run
+        # during startup. Event logs can be multi-gigabyte JSONL files and the
+        # browser may restore a different run anyway; coupling process readiness
+        # to the newest run made startup depend on whichever scene was touched
+        # last. The first request naming a run hydrates it through `_resolve_run`.
+        newest: Path | None = None
+        newest_mtime = float("-inf")
+        for candidate in RUNS_DIR.iterdir():
+            if not candidate.is_dir():
+                continue
+            try:
+                mtime = candidate.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > newest_mtime:
+                newest = candidate
+                newest_mtime = mtime
+        _current_run = newest.name if newest is not None else ""
+        # Resolve LLM costs off the pipeline, forever. The sweep sees only runs
+        # that have been hydrated on demand, so it is also independent of boot.
         cost_task = asyncio.create_task(_cost_backfill_loop())
         # Sticky hook: re-attach to any Modal train a prior process left running
         # (call id persisted per cell in splat/modal-job.json), so a server
@@ -3957,10 +3988,11 @@ def create_app() -> FastAPI:
 
     @app.post("/runs/{name}/activate")
     async def activate_run(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
-        run_dir = _run_dir(name)
-        if not run_dir.is_dir():
+        if not _run_dir(name).is_dir():
             raise HTTPException(status_code=404, detail=f"unknown run: {name}")
-        _hydrate_run(name)
+        # Selection is metadata-only. Loading the run's event logs is deferred to
+        # the first endpoint that actually needs them, so even selecting a huge
+        # or damaged run cannot take down the server.
         global _current_run
         _current_run = name
         return {"current": name}
@@ -3969,12 +4001,10 @@ def create_app() -> FastAPI:
     async def hydrate_run(name: str) -> dict[str, str]:  # pyright: ignore[reportUnusedFunction]
         """Load a run's SlotLogs into memory WITHOUT activating it, so its
         cells' /scene + /meshes become readable alongside the active run — the
-        run-compare view reads a SECOND run next to run A. Idempotent and
-        launches nothing (see _maybe_launch), so it never disturbs the active
-        run's board, cost, or pipelines."""
+        run-compare view reads a SECOND run next to run A."""
         if not _run_dir(name).is_dir():
             raise HTTPException(status_code=404, detail=f"unknown run: {name}")
-        _hydrate_run(name)
+        _ensure_run_hydrated(name)
         return {"run": name}
 
     @app.get("/prompt-runs")
@@ -4159,7 +4189,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=f"unknown step: {step}")
         if not _run_dir(run).is_dir():
             raise HTTPException(status_code=404, detail=f"unknown run: {run}")
-        _hydrate_run(run)
+        _ensure_run_hydrated(run)
         items: list[dict[str, object]] = []
         for (r, slot_id, alias), slot_log in _slot_logs.items():
             if r != run:
@@ -6577,7 +6607,6 @@ def create_app() -> FastAPI:
         children excluded) — the prompt lab's sims list. Rehydrated branches
         come back paused/resumable."""
         run = _resolve_run(run)
-        _hydrate_run(run)
         return {
             "run": run,
             "branches": [
@@ -6932,7 +6961,7 @@ def create_app() -> FastAPI:
         if not _run_dir(run).is_dir():
             raise HTTPException(status_code=404, detail=f"unknown run: {run}")
         _require_run_prompts(run)
-        _hydrate_run(run)
+        _ensure_run_hydrated(run)
         wanted: set[tuple[str, str]] | None = None
         if req.cells is not None:
             wanted = {(str(c.get("slot", "")), str(c.get("model", ""))) for c in req.cells}
@@ -7098,9 +7127,9 @@ def create_app() -> FastAPI:
         run_dir = _run_dir(name)
         if run_dir.exists():
             raise HTTPException(status_code=409, detail=f"run already exists: {name}")
-        # Read source cells from memory (idempotent hydrate) so a still-running
-        # source run's live log can't hand us a torn final line.
-        _hydrate_run(req.source_run)
+        # Read source cells from memory so a still-running source run's live log
+        # can't hand us a torn final line.
+        _ensure_run_hydrated(req.source_run)
 
         run_dir.mkdir(parents=True)
         try:
@@ -7190,8 +7219,8 @@ def create_app() -> FastAPI:
             (src_slot_dir / alias / "events.jsonl").is_file() for alias in MODEL_ALIASES
         ):
             raise HTTPException(status_code=400, detail=f"slot {slot.id!r} has no data in run {source_run!r}")
-        _hydrate_run(source_run)
-        _hydrate_run(dest_run)
+        _ensure_run_hydrated(source_run)
+        _ensure_run_hydrated(dest_run)
         # Tear down every destination cell under this slot so nothing writes into
         # the dir we're about to replace (same teardown reset does, applied to the
         # whole slot row), and note which had data — the "replaced" report.
@@ -7280,8 +7309,8 @@ def create_app() -> FastAPI:
                 status_code=400,
                 detail=f"cell {slot.id}/{req.source_model} has no data in run {source_run!r}",
             )
-        _hydrate_run(source_run)
-        _hydrate_run(dest_run)
+        _ensure_run_hydrated(source_run)
+        _ensure_run_hydrated(dest_run)
         # Tear down the destination cell so nothing writes into the dir we're about
         # to replace (the same teardown reset does), noting whether it held data.
         dest_key: RunKey = (dest_run, slot.id, req.dest_model)

@@ -28,16 +28,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+_SERVER_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_SERVER_DIR))
+sys.path.insert(0, str(_SERVER_DIR.parent))
 
 from dotenv import find_dotenv, load_dotenv
 
-# Load .env before any module-level code reads from os.environ
-# (DEFAULT_RUNS_DIR below).
+# Load .env before any module-level code reads from os.environ.
 load_dotenv(find_dotenv(usecwd=True))
 
 from app.core.scene_context import wrap_image_prompt
@@ -45,13 +45,9 @@ from app.core.types import BoundingBox, ProxyShape
 from app.services import nano_banana, threed
 from app.utils import logging as rlog, resumable
 from app.utils.logging import SlotLog
+from starshot_paths import runs_root
 
-DEFAULT_RUNS_DIR = Path(
-    os.environ.get(
-        "STARSHOT_RUNS_DIR",
-        str(Path(__file__).resolve().parent.parent / "runs"),
-    )
-)
+DEFAULT_RUNS_DIR = runs_root()
 
 
 _SUBMIT_KINDS = ("google.banana.submit", "trellis.submit", "mesh.submit")
@@ -239,7 +235,7 @@ if __name__ == "__main__":
         default=DEFAULT_RUNS_DIR,
         help=(
             "runs directory of the pipeline instance to recover. "
-            "Defaults to $STARSHOT_RUNS_DIR or server/runs."
+            "Defaults to $STARSHOT_RUNS_DIR or <repo>/runs."
         ),
     )
     parser.add_argument(

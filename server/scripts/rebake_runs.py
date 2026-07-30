@@ -41,7 +41,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -54,7 +53,11 @@ from app.services import library  # noqa: E402
 from app.utils import glb_place  # noqa: E402
 
 _REPO_ROOT = _SERVER_DIR.parent
-DEFAULT_RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", str(_REPO_ROOT / "runs")))
+sys.path.insert(0, str(_REPO_ROOT))
+
+from starshot_paths import runs_root  # noqa: E402
+
+DEFAULT_RUNS_DIR = runs_root()
 OPTIMIZED_SUBDIR = "objects-optimized"
 
 

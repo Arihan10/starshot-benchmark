@@ -13,6 +13,8 @@ from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
+from starshot_paths import runs_root
+
 DEFAULT_RUNS = ["against-the-gods", "against-the-shooters", "compare"]
 
 # Abbreviations whose trailing period must not be treated as a sentence end.
@@ -82,7 +84,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("runs", nargs="*", default=DEFAULT_RUNS,
                         help="Run folder names under the runs directory.")
-    parser.add_argument("--runs-dir", type=Path, default=script_dir / "runs",
+    parser.add_argument("--runs-dir", type=Path, default=runs_root(),
                         help="Directory that contains the run folders.")
     parser.add_argument("--out", type=Path,
                         default=script_dir / "reasoning_number_sentences.json",

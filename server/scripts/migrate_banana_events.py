@@ -31,20 +31,18 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from starshot_paths import runs_root
+
 LEGACY_KINDS = ("nano_banana.done", "runware.banana.done")
 NEW_KIND = "google.banana.done"
 
-DEFAULT_RUNS_DIR = Path(
-    os.environ.get(
-        "STARSHOT_RUNS_DIR",
-        str(Path(__file__).resolve().parent.parent / "runs"),
-    )
-)
+DEFAULT_RUNS_DIR = runs_root()
 
 _MIME_BY_EXT = {
     ".png": "image/png",
@@ -175,7 +173,7 @@ def main() -> None:
         "--runs-dir",
         type=Path,
         default=DEFAULT_RUNS_DIR,
-        help="runs directory to migrate. Defaults to $STARSHOT_RUNS_DIR or server/runs.",
+        help="runs directory to migrate. Defaults to $STARSHOT_RUNS_DIR or <repo>/runs.",
     )
     parser.add_argument(
         "--dry-run",

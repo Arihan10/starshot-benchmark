@@ -25,7 +25,6 @@ Usage (from server/):
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import sys
 from pathlib import Path
@@ -33,6 +32,9 @@ from pathlib import Path
 _SCRIPTS_DIR = Path(__file__).resolve().parent
 _SERVER_DIR = _SCRIPTS_DIR.parent
 _REPO_ROOT = _SERVER_DIR.parent
+sys.path.insert(0, str(_REPO_ROOT))
+
+from starshot_paths import runs_root  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
@@ -48,7 +50,7 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument(
         "--runs-dir",
         type=Path,
-        default=Path(os.environ.get("STARSHOT_RUNS_DIR", str(_REPO_ROOT / "runs"))),
+        default=runs_root(),
         help="destination runs dir (default: $STARSHOT_RUNS_DIR or <repo>/runs)",
     )
     p.add_argument(

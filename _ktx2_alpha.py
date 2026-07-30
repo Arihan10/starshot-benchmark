@@ -1,4 +1,6 @@
-import json, struct, collections, pathlib
+import json, struct, collections
+
+from starshot_paths import runs_root
 
 def glb_chunks(path):
     b = open(path, "rb").read()
@@ -31,7 +33,7 @@ def ktx2_info(raw):
     return {"supercomp": supercomp, "colorModel": colorModel, "nSamples": nSamples, "chans": chans}
 
 # ETC1S channel ids: 0=RGB, 15=AAA(alpha). UASTC: 3=RGBA. colorModel 163=ETC1S,166=UASTC
-d = pathlib.Path(r"runs/good_opus_new_hotel2/hotel-room/gemini-pro/generated/1/objects-generated-optimized")
+d = runs_root() / "good_opus_new_hotel2/hotel-room/gemini-pro/generated/1/objects-generated-optimized"
 base_alpha = collections.Counter()
 models = collections.Counter()
 samples_dist = collections.Counter()

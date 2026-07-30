@@ -34,8 +34,8 @@ import contextlib
 import hashlib
 import json
 import mimetypes
-import os
 import re
+import sys
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
@@ -99,9 +99,13 @@ VENDOR_THREE_DIR = _REPO_ROOT / "client" / "node_modules" / "three"
 
 # The main pipeline's runs tree. The prefab inspector reads each built scene's
 # events.jsonl to reconstruct its objects, and writes its saved matching versions
-# under <run>/<slot>/<model>/prefab-tests/. Honors the same STARSHOT_RUNS_DIR the
-# API server uses (default: the repo's runs/).
-RUNS_DIR = Path(os.environ.get("STARSHOT_RUNS_DIR", str(_REPO_ROOT / "runs"))).resolve()
+# under <run>/<slot>/<model>/prefab-tests/. Resolved exactly like the API
+# server's, via the repo-root helper.
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from starshot_paths import runs_root  # noqa: E402
+
+RUNS_DIR = runs_root().resolve()
 
 # Maps the UI's proxy-shape strings to the pipeline's ProxyShape enum.
 # `rectangular_prism` is the bare AABB (None), matching the rest of the

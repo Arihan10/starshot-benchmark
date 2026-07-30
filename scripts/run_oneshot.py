@@ -27,6 +27,11 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_DIR = REPO_ROOT / "server"
 CLIENT_DIR = REPO_ROOT / "client"
 
+# Shared runs-root resolver ($STARSHOT_RUNS_DIR from server/.env, else <repo>/runs),
+# so the dir we hand the server is the one it would have picked on its own.
+sys.path.insert(0, str(REPO_ROOT))
+from starshot_paths import runs_root  # noqa: E402
+
 SERVER_HOST = "127.0.0.1"
 
 
@@ -156,8 +161,9 @@ def main() -> int:
         "--run",
         dest="run",
         default=None,
-        help="Subfolder name under <repo>/runs/ to write per-slot artifacts into. "
-             "Omit to use <repo>/runs/ directly.",
+        help="Subfolder name under the runs root ($STARSHOT_RUNS_DIR, default "
+             "<repo>/runs) to write per-slot artifacts into. Omit to use the "
+             "runs root directly.",
     )
     parser.add_argument(
         "--promote",
@@ -169,8 +175,8 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    runs_root = REPO_ROOT / "runs"
-    runs_dir = (runs_root / args.run if args.run else runs_root).resolve()
+    runs_base = runs_root()
+    runs_dir = (runs_base / args.run if args.run else runs_base).resolve()
 
     if args.promote:
         return _promote_runs_dir(runs_dir)

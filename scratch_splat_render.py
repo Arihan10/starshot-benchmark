@@ -10,8 +10,9 @@ from PIL import Image, ImageDraw
 
 sys.path.insert(0, ".")
 from splat.stage5 import load_reference_frame
+from starshot_paths import runs_root
 
-BASE = Path("runs/good_opus_new_hotel2/hotel-room/gemini-pro/splat")
+BASE = runs_root() / "good_opus_new_hotel2/hotel-room/gemini-pro/splat"
 OUT = Path("scratch_out")
 C0 = 0.28209479177387814
 

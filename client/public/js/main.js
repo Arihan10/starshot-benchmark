@@ -68,7 +68,7 @@ function resetLabSession() {
 }
 
 async function switchRun(name) {
-    if (!name || name === state.run) return;
+    if (!name || (name === state.run && !bootSelectionPending)) return;
     try {
         await api.activateRun(name);
     } catch (e) {
@@ -77,6 +77,7 @@ async function switchRun(name) {
         return;
     }
     state.run = name;
+    bootSelectionPending = false;
     try {
         localStorage.setItem(LAST_RUN_KEY, name);
     } catch {
@@ -111,9 +112,10 @@ on("switch-run", async (name) => {
 // --- slots polling -----------------------------------------------------------------
 
 let pollTimer = null;
+let bootSelectionPending = true;
 
 async function refreshSlots() {
-    if (!state.run) {
+    if (!state.run || bootSelectionPending) {
         state.slots = [];
         emit("slots");
         updateStatusText();
@@ -148,6 +150,13 @@ async function refreshSlots() {
 
 function updateStatusText() {
     const stepAllBtn = document.getElementById("btn-step-all");
+    if (bootSelectionPending && state.run) {
+        statusTextEl.textContent = `${state.run} — select a run to load its scenes`;
+        stepAllBtn.style.display = "none";
+        stepAllUntilEl.style.display = "none";
+        exitSteppingEl.style.display = "none";
+        return;
+    }
     if (!state.run) {
         statusTextEl.textContent = "no runs yet — create one with “+ new run”";
         stepAllBtn.style.display = "none";
@@ -357,6 +366,7 @@ async function newRunModal() {
                         );
                         await refreshRuns();
                         state.run = payload.current;
+                        bootSelectionPending = false;
                         // A brand-new run starts with a clean prompt lab — reset the session
                         // so a draft left over from the previously-active run isn't compared
                         // against the new run's snapshot and flagged as a phantom edit.
@@ -655,6 +665,7 @@ async function abTestModal() {
                         );
                         await refreshRuns();
                         state.run = payload.current;
+                        bootSelectionPending = false;
                         // Brand-new run → clean prompt lab + no stale board selection.
                         resetLabSession();
                         state.selection.clear();
@@ -1035,34 +1046,24 @@ document
     initSplat();
 
     try {
-        const payload = await refreshRuns();
-        // Land on the run we were on last time this browser quit, falling back
-        // to the server's current (newest) run.
+        await refreshRuns();
+        // Choose the browser's last run locally, but leave it unhydrated until
+        // the user explicitly picks a run. This makes the run picker usable even
+        // when the previous run contains multi-gigabyte event logs.
         let saved = null;
         try {
             saved = localStorage.getItem(LAST_RUN_KEY);
         } catch {
             /* ignore */
         }
-        if (
-            saved &&
-            saved !== state.run &&
-            state.runs.some((r) => r.name === saved)
-        ) {
-            await api.activateRun(saved).catch(() => {});
+        if (saved && state.runs.some((r) => r.name === saved)) {
             state.run = saved;
             renderRunPicker();
-        } else if (payload.current) {
-            try {
-                localStorage.setItem(LAST_RUN_KEY, payload.current);
-            } catch {
-                /* ignore */
-            }
         }
     } catch (e) {
         statusTextEl.textContent = `server unreachable: ${e.message}`;
     }
-    await refreshSlots();
+    updateStatusText();
     renderBoard();
     startPolling();
 })();

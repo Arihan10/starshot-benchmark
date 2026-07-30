@@ -13,8 +13,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from splat import colmap
+from starshot_paths import runs_root
 
-_REFS = Path("runs/ahhhhhhhh/test-SH/gemini-flash-lite/splat/refs")
+_REFS = runs_root() / "ahhhhhhhh/test-SH/gemini-flash-lite/splat/refs"
 DEFAULT_SRC = _REFS / "frames"
 DEFAULT_DST = _REFS / "frames-1"
 

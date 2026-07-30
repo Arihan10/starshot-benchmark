@@ -8,11 +8,11 @@ Run on the GPU box, AFTER smoke_stage6_tiled.py:  python smoke_stage6_resume.py
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 from splat.stage6 import TrainParams, train_splat
+from starshot_paths import runs_root
 
-OUT = Path(__file__).parent / "runs" / "_smoke" / "stage6_tiled"
+OUT = runs_root() / "_smoke" / "stage6_tiled"
 PARAMS = TrainParams(
     iterations=300, refine_start_iter=100, tile_max=6000, lod_levels=0,
     ckpt_every=0, eval_max_views=6, log_every=200,
