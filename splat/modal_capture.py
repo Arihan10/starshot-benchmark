@@ -17,19 +17,23 @@ render conventions locked to the debug-viewer stack never fork. Frames are
 encoded on a thread pool via `stage5.write_reference_frame` into a LOCAL
 scratch dir (the caller syncs them to the Volume afterwards).
 
-RENDERER: stage 5 is a WebGL/three.js workload (NOT CUDA), GPU-accelerated on the
-local machine's display GPU. Modal's GPU containers expose CUDA but not the
-Vulkan ICD / GL userspace headless Chrome needs for HARDWARE WebGL (the
-`modal_app.probe_webgl` result: the ANGLE/Vulkan path resolves to Mesa
-`llvmpipe` and the fallback to SwiftShader — both CPU rasterizers). For this
-UNLIT pipeline (albedo + planar-Z depth + coverage alpha, antialias off) the CPU
-output is functionally identical to the local hardware render — same page, same
-stack, same locked conventions — so we render on the fastest available backend
-and pass `&force=1` (the capture page refuses software WebGL otherwise). We try
-the ANGLE/Vulkan backend first (Mesa `llvmpipe` today, and transparently the
-NVIDIA device if a container ever exposes the ICD — `force=1` is then a no-op),
-then SwiftShader as a fallback. The achieved renderer string is reported in the
-summary, so whether a run was hardware- or CPU-rendered is always visible.
+RENDERER: stage 5 is a WebGL/three.js workload (NOT CUDA), so it needs the
+GRAPHICS half of the driver, not just compute. It now gets it: `modal_app`
+registers the NVIDIA Vulkan ICD + EGL vendor itself (the driver ships the libs
+but not the loader JSONs), and `modal_app.probe_webgl` measures HARDWARE WebGL
+on the L40S — `ANGLE (NVIDIA, Vulkan ..., NVIDIA)`, no context loss.
+
+That was not always true. On the earlier A100 image the ANGLE/Vulkan path
+resolved to Mesa `llvmpipe` and the fallback to SwiftShader, both CPU
+rasterizers, and this stage rendered every frame on the CPU. The pipeline is
+written to be indifferent to which it gets: for an UNLIT render (albedo +
+planar-Z depth + coverage alpha, antialias off) the CPU output is functionally
+identical — same page, same stack, same locked conventions — so we simply take
+the fastest backend available. We try ANGLE/Vulkan first and fall back to
+SwiftShader. `&force=1` rides along because the capture page refuses software
+WebGL otherwise; on a hardware backend it is a no-op. The achieved renderer
+string is reported in the summary, so whether a run was hardware- or CPU-rendered
+is always visible — check it before attributing a slow stage 5 to anything else.
 
 Single-tenant by construction: one job, one fixed token, loopback only.
 """
@@ -352,7 +356,7 @@ _COMMON_FLAGS = [
 # default framebuffer, which needs a Vulkan surface; disabling it loses the
 # WebGL context ~immediately on init (that flag is only safe for pure-offscreen
 # WebGPU that never touches a canvas). On a container without the NVIDIA
-# graphics libs this resolves to Mesa llvmpipe (CPU); with them it uses the A100.
+# graphics libs this resolves to Mesa llvmpipe (CPU); with them it uses the GPU.
 _GPU_FLAGS = [
     "--use-angle=vulkan",
     "--enable-features=Vulkan",

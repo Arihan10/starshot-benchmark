@@ -4,7 +4,7 @@ Deploy with `modal deploy splat/modal_app.py` from the repo root; drive it with
 `splat/modal_sync.py` (CLI or from the server). The split:
 
   * LOCAL (Mac): stages 1-3 — scene manifest, free-space grid, surfel cloud.
-  * MODAL (one A100-40GB container): stage 4 (camera plan — zone-driven
+  * MODAL (one L40S container): stage 4 (camera plan — zone-driven
     single-shot field, pure CPU; lives here only to keep the stage chain in
     one place), stage 5 (reference renders — headless Chromium against the
     loopback host in `splat/modal_capture.py`), stage 6 (gsplat fine-tune in
@@ -62,9 +62,40 @@ import modal
 APP_NAME = "starshot-splat"
 VOLUME_NAME = "starshot-splat-cells"
 STATUS_DICT_NAME = "starshot-splat-status"
+
+# The GPU every function in this app (and modal_compact's) runs on — one constant
+# so the fleet can't drift apart.
+#
+# L40S (Ada, sm_89) rather than the A100-40GB this started on: cheaper per hour,
+# 48 GB instead of 40, and a much better fit for the WORK. Gaussian splatting is
+# bound by FP32 shading, the per-tile radix sort and the alpha-blend rasterizer —
+# none of which touch tensor cores or saturate HBM, which is where the A100's
+# advantage lives. The A100 stays the better card only for a tensor-core or
+# bandwidth-bound job; this pipeline is neither.
+#
+# ARCH NOTE: the pinned `gsplat` wheel is PREBUILT, so the gsplat trainer only
+# works here if that wheel carries sm_89 SASS (or PTX to JIT from) — verified by
+# the `gsplat` section of `probe_gpu_stack`, not assumed. Brush is wgpu/Vulkan
+# and is architecture-agnostic by construction.
+GPU = "L40S"
 VOL = "/vol"
 _SCRATCH = Path("/tmp/cells")
 _ASSETS = "/assets"                      # capture page + three.js (baked below)
+
+# Brush (github.com/ArthurBrussee/brush) — the wgpu/Vulkan splat trainer stage 6
+# can run INSTEAD of the in-house gsplat loop (`train.trainer`). Pinned to a
+# release tarball + the digest GitHub publishes beside it, so the image is
+# reproducible and a tampered/truncated download fails the build rather than the
+# run. The v0.3.0 CLI is what `splat/brush.py` targets — its flags differ from
+# the repo's main branch (`--total-steps`, not `--total-train-iters`), so the
+# version and the flag set move together.
+BRUSH_VERSION = "v0.3.0"
+_BRUSH_URL = (
+    "https://github.com/ArthurBrussee/brush/releases/download/"
+    f"{BRUSH_VERSION}/brush-app-x86_64-unknown-linux-gnu.tar.xz"
+)
+_BRUSH_SHA256 = "4f0f9a8785d1951c62df26aae247c02c5bba32b00f40b06df4e1c9b867399e20"
+BRUSH_BIN = "/usr/local/bin/brush"
 
 _REPO = Path(__file__).resolve().parent.parent
 
@@ -91,7 +122,7 @@ image = (
     # makes Modal MOUNT the graphics driver libs (libEGL_nvidia / libGLX_nvidia /
     # libnvidia-glcore …, confirmed by probe_gpu_stack), but the driver does NOT
     # ship the loader registration JSONs — so the Vulkan/EGL loaders never see the
-    # A100 and Chrome falls back to Mesa llvmpipe (software), which then crash-loops
+    # GPU and Chrome falls back to Mesa llvmpipe (software), which then crash-loops
     # Skia. We write the JSONs ourselves, pointing at libEGL_nvidia.so.0 (the ICD
     # to use headless, where X11 libs are absent — per the NVIDIA driver README).
     # The library soname resolves at runtime against the mounted driver.
@@ -111,7 +142,7 @@ image = (
         "NVIDIA_DRIVER_CAPABILITIES": "all",
         "NVIDIA_VISIBLE_DEVICES": "all",
         # Point the loaders at ONLY the NVIDIA ICD/vendor we wrote, so Vulkan
-        # enumerates the A100 (not Mesa llvmpipe). SwiftShader is unaffected (it's
+        # enumerates the L40S (not Mesa llvmpipe). SwiftShader is unaffected (it's
         # Chrome's own, not a system Vulkan ICD), so the CPU fallback still works.
         "VK_ICD_FILENAMES": "/usr/share/vulkan/icd.d/nvidia_icd.json",
         "VK_DRIVER_FILES": "/usr/share/vulkan/icd.d/nvidia_icd.json",
@@ -149,6 +180,42 @@ image = (
         "gsplat==1.5.3+pt24cu124",
         extra_index_url="https://docs.gsplat.studio/whl",
     )
+    # --- Brush (the alternative stage-6 trainer) --------------------------------
+    # A single static Rust binary, so nothing here can perturb the torch/gsplat
+    # resolution above. It talks to the GPU through wgpu -> Vulkan, which the
+    # NVIDIA ICD written near the top of this image already makes reachable
+    # (`probe_gpu_stack` enumerates the L40S as the only Vulkan device), so no
+    # extra driver plumbing is needed — only the loader (`libvulkan1`, installed
+    # with chromium above) and the tools to unpack an `.xz` release archive.
+    #
+    # APPENDED AFTER the heavy pip layers on purpose: Modal rebuilds every layer
+    # from the first change onward, so bumping Brush must not re-resolve torch.
+    .apt_install("curl", "xz-utils")
+    .run_commands(
+        f"curl -fsSL {_BRUSH_URL} -o /tmp/brush.tar.xz",
+        f'echo "{_BRUSH_SHA256}  /tmp/brush.tar.xz" | sha256sum -c -',
+        "mkdir -p /tmp/brush-dl && tar -xJf /tmp/brush.tar.xz -C /tmp/brush-dl"
+        " && find /tmp/brush-dl -type f -printf '%M %10s %p\\n'",
+        # cargo-dist nests the payload under an archive-named dir beside the
+        # README/LICENSE, and the bin target has been renamed across releases —
+        # so select the one EXECUTABLE file rather than guessing either.
+        'install -m 0755 "$(find /tmp/brush-dl -type f -perm -u+x'
+        " ! -iname '*.md' ! -iname 'LICENSE*' | head -n1)\" "
+        f"{BRUSH_BIN}",
+        f"rm -rf /tmp/brush.tar.xz /tmp/brush-dl && {BRUSH_BIN} --version",
+    )
+    .env({
+        # Pin wgpu to Vulkan. The loader is already restricted to the NVIDIA ICD
+        # (VK_DRIVER_FILES above), but Mesa's lavapipe/intel/radeon ICDs are on
+        # disk as chromium dependencies — an unset backend plus a future loader
+        # change could silently land training on a CPU rasterizer, which reads as
+        # a ~40x slowdown rather than an error.
+        "WGPU_BACKEND": "vulkan",
+        # Brush reports progress (`Refine iter N, M splats.`, eval PSNR/SSIM)
+        # through `log`, which env_logger gates at `error` by default — without
+        # this the heartbeat in splat/brush.py has nothing to parse.
+        "RUST_LOG": "info",
+    })
     # Capture page assets, served by the loopback host: the page + workers
     # verbatim, and the SAME three.js the debug viewer runs (importmap paths
     # /vendor/three/... map here).
@@ -345,15 +412,15 @@ def _record(
 
 @app.function(
     image=image,
-    gpu="A100-40GB",
+    gpu=GPU,
     # COST NOTE: Modal bills CPU + memory on max(reservation, actual use) for the
     # WHOLE container lifetime, ON TOP of the GPU. This run is GPU-bound — stage 6
     # training dominates the wall time and uses only ~1-2 cores — so we RESERVE
     # little and let the CPU-heavy stage-5 SZF encode BURST (the soft CPU limit is
     # reservation + 16 cores; memory can grow past the reservation when the worker
     # has room, still billed for actual use). Reserving 16 cores + 50 GiB instead
-    # would pay for them idle through the whole train (~$3.25/hr vs ~$2.4/hr here,
-    # against the A100-40GB floor of $2.10/hr).
+    # would pay for them idle through the whole train, adding over a dollar an
+    # hour on top of the L40S floor this sits just above.
     cpu=4.0,
     memory=8192,            # 8 GiB guaranteed floor; bursts higher on demand, billed for use
     timeout=12 * 3600,
@@ -371,17 +438,35 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
       run, slot, model: str,
       stages: [4,5,6,7] (any contiguous or sparse subset),
       input_sha: {freespace, skin, cloud, scene, tier: str},  # uncompressed
-      plan / train / quant: {} param overrides (dataclass field names),
+      trainer: "brush" | "gsplat",     # which stage-6 back-end (default brush)
+      plan / train / brush / quant: {} param overrides (dataclass field names),
       force: bool,
     }
+
+    TRAINER. Stage 6 has two interchangeable back-ends behind one seam (both
+    consume the COLMAP model and emit `trained.ply`): "brush" runs the upstream
+    Brush binary (`splat/brush.py`, params from `spec["brush"]`), "gsplat" runs
+    the in-house loop (`splat.stage6.train_splat`, params from `spec["train"]`).
+    They are kept side by side because comparing them IS the benchmark; the
+    trainer and its params are part of the stage-6 signature, so switching
+    re-trains instead of reusing the other back-end's model.
+
+    Brush owns delivered size itself (`--max-splats`) and its output has had no
+    gsplat pass over it, so the Brush path runs stages 4-6 and quantizes inside
+    stage 6; stage 7 (heal/compact, which re-optimizes through the gsplat
+    rasterizer) applies to the gsplat path only and is skipped, not silently
+    applied, if it lands in the window.
     """
-    from splat import colmap as splat_colmap, modal_capture, quantize
+    from splat import brush as splat_brush, colmap as splat_colmap, modal_capture, quantize
     from splat.stage4 import PlanParams, plan_cameras
     from splat.stage6 import TrainParams, heal_splat, train_splat
 
     run, slot, model = spec["run"], spec["slot"], spec["model"]
     stages = set(spec.get("stages") or [4, 5, 6, 7])
     force = bool(spec.get("force"))
+    trainer = spec.get("trainer") or "brush"
+    if trainer not in ("brush", "gsplat"):
+        raise ValueError(f"unknown trainer {trainer!r} (expected 'brush' or 'gsplat')")
     key = f"{run}/{slot}/{model}"
     heart = _Heartbeat(key)
 
@@ -391,7 +476,8 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     # differ only by plan/train config are told apart too.
     print(
         f"=== run_cell START {key} | stages={sorted(stages)} force={force} "
-        f"| plan={spec.get('plan') or {}} train={spec.get('train') or {}} "
+        f"trainer={trainer} | plan={spec.get('plan') or {}} "
+        f"train={spec.get('train') or {}} brush={spec.get('brush') or {}} "
         f"quant={spec.get('quant') or {}} ===",
         flush=True,
     )
@@ -444,7 +530,12 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     )
     # Stage 6 now trains from the COLMAP export, so its code sig folds in colmap.py
     # too — editing the exporter re-runs stage 6 rather than reusing a stale model.
-    code6 = _src_sig(Path(_stage6.__file__), Path(splat_colmap.__file__))
+    # BOTH back-ends' sources go in regardless of which one runs, so the signature
+    # is a property of the deployed pipeline rather than of this invocation.
+    code6 = _src_sig(
+        Path(_stage6.__file__), Path(splat_colmap.__file__),
+        Path(splat_brush.__file__),
+    )
     # (stage 7 = heal + quantize folds its own source hash inline — both stage6.py
     # and quantize.py — so no standalone code7 here.)
 
@@ -537,15 +628,34 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             summary["stages_run"].append(5)
             summary["refs"] = s5
 
-    # ---- stage 6: gsplat fine-tune (2DGS | 3DGS per train.representation) --------
+    # ---- stage 6: fine-tune — Brush, or the in-house gsplat loop (2DGS | 3DGS
+    # per train.representation). Both read the SAME COLMAP model built below and
+    # write the SAME trained.ply; see the `TRAINER` note in the docstring.
     trained = out / "trained.ply"
+    trained_sqz = out / "trained.sqz"
     if 6 in stages:
         if not transforms.is_file():
             raise FileNotFoundError("refs/transforms.json missing — run stage 5 first")
         train_params = TrainParams(**(spec.get("train") or {}))
-        sig6 = _sig({"cloud": in_sha["cloud"], "refs": _sha256(transforms),
-                     "params": train_params.as_summary(), "code": code6})
-        if not force and _fresh(status, "6", sig6, [trained]):
+        brush_params = splat_brush.BrushParams(**(spec.get("brush") or {}))
+        quant = quantize.QuantConfig(**(spec.get("quant") or {}))
+        # The trainer, ITS params and (for Brush) the pinned binary version are all
+        # in the key: switching back-end, changing max-splats, or bumping the Brush
+        # release each has to re-train rather than serve the previous model.
+        sig6 = _sig({
+            "cloud": in_sha["cloud"], "refs": _sha256(transforms),
+            "trainer": trainer, "code": code6,
+            "params": (
+                brush_params.as_summary() if trainer == "brush"
+                else train_params.as_summary()
+            ),
+            "brush_version": BRUSH_VERSION if trainer == "brush" else None,
+            # Brush quantizes inside this stage (it has no stage 7), so the .sqz
+            # config belongs to the key and the artifact list.
+            "quant": quant.as_summary() if trainer == "brush" else None,
+        })
+        art6 = [trained, trained_sqz] if trainer == "brush" else [trained]
+        if not force and _fresh(status, "6", sig6, art6):
             summary["stages_skipped"].append(6)
         else:
             refs_scratch = scratch / "refs"
@@ -569,19 +679,43 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
             # drop stale checkpoints or train_splat would resume a dead run.
             if force:
                 shutil.rmtree(out / "ckpt", ignore_errors=True)
-            s6 = train_splat(
-                run=run, slot=slot, model=model,
-                colmap_dir=colmap_scratch,
-                out_path=trained,
-                # Stage-3 surfel cloud: the default init (params.init="surfels")
-                # seeds every Gaussian on the mesh surface (a 3DGS run gets the same
-                # seed with a real thickness axis); from-points A/Bs pass
-                # train={"init": "points"} and ignore it.
-                init_ply=cloud,
-                params=train_params,
-                resume=not force,
-                progress=heart.stage("train", commit=True),
-            )
+                (out / splat_brush.PROGRESS_NAME).unlink(missing_ok=True)
+            if trainer == "brush":
+                s6 = splat_brush.train_brush(
+                    run=run, slot=slot, model=model,
+                    colmap_dir=colmap_scratch,
+                    # Brush writes the Volume copy DIRECTLY, every export_every
+                    # steps — so a preempted retry finds a partial model to warm
+                    # restart from, and the client can pull one mid-run.
+                    out_path=trained,
+                    params=brush_params,
+                    brush_bin=BRUSH_BIN,
+                    resume=not force,
+                    progress=heart.stage("train", commit=True),
+                )
+                # No stage 7 on this path, so the shippable .sqz is produced here.
+                s6["quantize"] = quantize.quantize_ply(trained, trained_sqz, quant)
+                # A cell trained with gsplat BEFORE this run still has that path's
+                # stage-7 deliverables on the Volume, and nothing here overwrites
+                # them — so drop them, or `pull_cell` brings a stale healed.ply
+                # back to sit beside the fresh trained.ply as if it belonged to it.
+                for old in out.glob("healed*"):
+                    old.unlink()
+            else:
+                s6 = train_splat(
+                    run=run, slot=slot, model=model,
+                    colmap_dir=colmap_scratch,
+                    out_path=trained,
+                    # Stage-3 surfel cloud: the default init (params.init="surfels")
+                    # seeds every Gaussian on the mesh surface (a 3DGS run gets the
+                    # same seed with a real thickness axis); from-points A/Bs pass
+                    # train={"init": "points"} and ignore it. Brush ignores this
+                    # entirely — it seeds from the COLMAP points3D.
+                    init_ply=cloud,
+                    params=train_params,
+                    resume=not force,
+                    progress=heart.stage("train", commit=True),
+                )
             _record(status, status_path, "6", sig6, s6)
             summary["stages_run"].append(6)
             summary["train"] = s6
@@ -591,7 +725,15 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
     # emits the raw trained.ply; this is where the cleaned, shippable healed.ply /
     # healed.lodK.ply / healed.sqz are produced, so the two are viewable apart.
     healed = out / "healed.ply"
-    if 7 in stages:
+    if 7 in stages and trainer == "brush":
+        # Heal/compact MEASURES each Gaussian's contribution and re-optimizes the
+        # survivors through the gsplat rasterizer — the loop Brush was chosen over.
+        # Brush also bounds delivered size itself (`--max-splats`), so the pass has
+        # nothing to add here and could undo the quality it was picked for. Skipped
+        # explicitly (and visibly in the summary) rather than quietly applied.
+        heart.stage("heal")(1, 1, "skipped — stage 7 compaction is the gsplat path's")
+        summary["stages_skipped"].append(7)
+    elif 7 in stages:
         if not trained.is_file():
             raise FileNotFoundError("trained.ply missing — run stage 6 first")
         if not transforms.is_file():
@@ -639,7 +781,7 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
 
 @app.function(
     image=image,
-    gpu="A100-40GB",
+    gpu=GPU,
     cpu=4.0,
     memory=8192,
     timeout=3600,
@@ -761,7 +903,7 @@ _PROBE_HTML = """<!doctype html><html><body><script>
 """
 
 
-@app.function(image=image, gpu="A100-40GB", timeout=300)
+@app.function(image=image, gpu=GPU, timeout=300)
 def probe_webgl() -> dict[str, Any]:
     """Report the WebGL renderer headless Chromium gets on this GPU class, for
     both launch modes — run after deploy to learn whether stage 5 renders on the
@@ -806,7 +948,151 @@ def probe_webgl() -> dict[str, Any]:
     return out
 
 
-@app.function(image=image, gpu="A100-40GB", timeout=300)
+@app.function(image=image, gpu=GPU, timeout=900)
+def probe_brush() -> dict[str, Any]:
+    """END-TO-END smoke test of the Brush trainer on this image: synthesize a tiny
+    COLMAP model (8 posed 64px views around a point cube), train it for a handful
+    of steps, and report what happened.
+
+    It answers, in one run, every question that can only be settled inside the
+    container: does the pinned release binary LINK here (its glibc vs the image's
+    — the one real risk of shipping a prebuilt), does wgpu land on the GPU rather
+    than a Mesa CPU rasterizer, does Brush parse the FLAT COLMAP layout
+    `splat.colmap.export_colmap` writes (no `sparse/0`, capital-D `points3D.txt`),
+    and does it export a `.ply` where we point it. `train.device` is the decisive
+    field: `train_brush` refuses to return a model trained on a CPU rasterizer, so
+    an `ok: true` here means the GPU path really ran."""
+    import subprocess
+    import tempfile
+
+    import numpy as np
+    from PIL import Image
+
+    from splat import brush
+    from splat.colmap import rotmat2qvec
+
+    root = Path(tempfile.mkdtemp(prefix="brush-probe-"))
+    scene, out = root / "scene", root / "out"
+    scene.mkdir(parents=True, exist_ok=True)
+
+    w = h = 64
+    focal = 60.0
+    (scene / "cameras.txt").write_text(
+        f"1 PINHOLE {w} {h} {focal:.10g} {focal:.10g} {w / 2:.10g} {h / 2:.10g}\n",
+        encoding="utf-8",
+    )
+
+    # 8 views on a ring, each looking at the origin, in the OpenCV camera frame
+    # (+x right, +y down, +z forward) COLMAP and `export_colmap` both use.
+    img_lines: list[str] = []
+    for i in range(8):
+        th = 2.0 * np.pi * i / 8.0
+        eye = np.array([3.0 * np.cos(th), 1.0, 3.0 * np.sin(th)])
+        fwd = -eye / np.linalg.norm(eye)
+        right = np.cross(fwd, [0.0, 1.0, 0.0])
+        right /= np.linalg.norm(right)
+        c2w = np.eye(4)
+        c2w[:3, :3] = np.stack([right, np.cross(fwd, right), fwd], axis=1)
+        c2w[:3, 3] = eye
+        w2c = np.linalg.inv(c2w)
+        q, t = rotmat2qvec(w2c[:3, :3]), w2c[:3, 3]
+        name = f"cam{i:03d}.png"
+        # A per-view gradient: enough signal that the optimizer has something to
+        # fit, and RGBA so the alpha path (`match_alpha_weight`) is exercised too.
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32) / max(w - 1, 1)
+        rgba = np.zeros((h, w, 4), dtype=np.uint8)
+        rgba[..., 0] = (255 * xx).astype(np.uint8)
+        rgba[..., 1] = (255 * yy).astype(np.uint8)
+        rgba[..., 2] = np.uint8(255 * i / 8.0)
+        rgba[..., 3] = 255
+        Image.fromarray(rgba).save(scene / name)
+        img_lines.append(
+            f"{i + 1} {q[0]:.10g} {q[1]:.10g} {q[2]:.10g} {q[3]:.10g} "
+            f"{t[0]:.10g} {t[1]:.10g} {t[2]:.10g} 1 {name}\n\n"
+        )
+    (scene / "images.txt").write_text("".join(img_lines), encoding="utf-8")
+
+    rng = np.random.default_rng(0)
+    pts = rng.uniform(-0.5, 0.5, size=(512, 3))
+    (scene / "points3D.txt").write_text(
+        "".join(
+            f"{j} {p[0]:.6f} {p[1]:.6f} {p[2]:.6f} 200 180 160 1.0\n"
+            for j, p in enumerate(pts, 1)
+        ),
+        encoding="utf-8",
+    )
+
+    # Drive the REAL trainer rather than a hand-rolled subprocess, so the probe
+    # covers what production runs: the argv, the log parsing, the preflight
+    # guards and the export contract. These 64px frames encode to well under
+    # Brush's 16 KB header-sniff buffer, so they also exercise `_pad_small_images`
+    # — without it this load dies with "early eof".
+    ver = subprocess.run(
+        [BRUSH_BIN, "--version"], capture_output=True, text=True, timeout=60
+    )
+    steps = 60
+    params = brush.BrushParams(
+        iterations=steps, export_every=steps, max_resolution=w, sh_degree=1
+    )
+    result: dict[str, Any] = {
+        "binary": BRUSH_BIN,
+        "pinned": BRUSH_VERSION,
+        "version": (ver.stdout or ver.stderr).strip(),
+    }
+    ply = out / "probe.ply"
+    try:
+        summary = brush.train_brush(
+            run="probe", slot="probe", model="probe",
+            colmap_dir=scene, out_path=ply,
+            params=params, brush_bin=BRUSH_BIN, resume=False,
+            progress=lambda d, t, m: print(f"[probe] {d}/{t} {m}", flush=True),
+        )
+        # Brush's `.ply` has to survive the DELIVERY path too, which is the other
+        # half of "does this trainer drop in": `_ply_representation` must read it
+        # as 3dgs (it carries a real `scale_2`), and the quantizer must parse it
+        # into the `.sqz` the client fetches. Failing here would mean a model that
+        # trains fine and can't be shipped.
+        from splat import quantize
+        from splat.stage6 import _ply_representation
+
+        result |= {
+            "ok": True,
+            "train": summary,
+            "representation": _ply_representation(ply),
+            "quantize": quantize.quantize_ply(ply, out / "probe.sqz"),
+        }
+
+        # The warm-restart leg. It only ever fires after a preemption, so a bug
+        # here would never show up in a normal run and would then break every
+        # retry — and it is the one path that puts a `.ply` INSIDE the dataset
+        # dir, which is otherwise a hard error. Fake the marker a killed run
+        # leaves behind and check the relaunch picks up from it and cleans up.
+        resume_params = brush.BrushParams(
+            iterations=120, export_every=60, max_resolution=w, sh_degree=1
+        )
+        (out / brush.PROGRESS_NAME).write_text(
+            json.dumps({"iter": 60, "total": 120, "params": resume_params.as_summary()}),
+            encoding="utf-8",
+        )
+        resumed = brush.train_brush(
+            run="probe", slot="probe", model="probe",
+            colmap_dir=scene, out_path=ply,
+            params=resume_params, brush_bin=BRUSH_BIN, resume=True,
+            progress=lambda d, t, m: print(f"[probe:resume] {d}/{t} {m}", flush=True),
+        )
+        result["resume"] = {
+            "resumed_from": resumed["resumed_from"],
+            "ok": resumed["resumed_from"] == 60,
+            "init_cleaned": not (scene / "init.ply").exists(),
+            "marker_cleared": not (out / brush.PROGRESS_NAME).exists(),
+        }
+    except Exception as exc:  # a probe reports failures, it doesn't raise them
+        result |= {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    print(json.dumps(result, indent=1))
+    return result
+
+
+@app.function(image=image, gpu=GPU, timeout=300)
 def probe_gpu_stack() -> dict[str, Any]:
     """Inventory the container's GRAPHICS stack (not just CUDA), so we know
     whether headless Chrome can reach the NVIDIA device for hardware WebGL and,
@@ -815,7 +1101,15 @@ def probe_gpu_stack() -> dict[str, Any]:
     libs on the loader path, and the `vulkaninfo` device summary (does an NVIDIA
     device appear, or only llvmpipe?). Run after `modal:up`; the output tells us
     whether `NVIDIA_DRIVER_CAPABILITIES=all` sufficed or a version-matched
-    `libnvidia-gl` install is needed."""
+    `libnvidia-gl` install is needed.
+
+    It also reports a `gsplat` section, because the OTHER thing a GPU change can
+    break is silent: the pinned gsplat wheel is PREBUILT, so it only runs on
+    architectures it was compiled for (plus any it can JIT from embedded PTX). A
+    card whose compute capability is missing from the wheel fails at the first
+    kernel launch with "no kernel image is available for execution on the device"
+    — deep inside a paid training run. This launches both rasterizers on a
+    two-Gaussian scene up front so that shows up in a 30-second probe instead."""
     import glob
     import os
     import subprocess
@@ -846,8 +1140,8 @@ def probe_gpu_stack() -> dict[str, Any]:
             ["bash", "-lc", "ldconfig -p | grep -iE 'nvidia|libGLX|libEGL|vulkan' || true"]
         ),
         # The decisive line: which physical devices the Vulkan loader enumerates.
-        # "NVIDIA A100" here = hardware WebGL is reachable; only "llvmpipe" = still
-        # software.
+        # The NVIDIA card here = the GPU is reachable for Brush (and for hardware
+        # WebGL); only "llvmpipe" = still software.
         "vulkan_devices": run(
             ["bash", "-lc",
              "vulkaninfo 2>/dev/null | grep -iE 'deviceName|driverName' | head -n 12 "
@@ -856,6 +1150,69 @@ def probe_gpu_stack() -> dict[str, Any]:
         "vulkaninfo": run(
             ["bash", "-lc", "vulkaninfo --summary 2>&1 | sed -n '1,70p' || echo missing"]
         ),
+        "gsplat": _probe_gsplat(),
     }
     print(json.dumps(out, indent=1))
+    # Round-trip through JSON before returning. The caller is a LOCAL machine with
+    # no torch installed, and torch leaks str/tuple SUBCLASSES (`torch.__version__`,
+    # `torch.Size`) that pickle by reference — they serialize to JSON invisibly but
+    # blow up on unpickle with "No module named 'torch'". This makes the payload
+    # plain by construction instead of relying on casting every field.
+    return json.loads(json.dumps(out, default=str))
+
+
+def _probe_gsplat() -> dict[str, Any]:
+    """Launch both gsplat rasterizers on a trivial scene and report what happened
+    — the compiled-arch check described in `probe_gpu_stack`. Returns the device's
+    compute capability alongside a per-rasterizer ok/error, so a wheel that lacks
+    this card's arch is named as such rather than surfacing mid-train.
+
+    Every value is coerced to a plain str/int/bool: the caller is the LOCAL
+    machine, which has no torch, and a `torch.__version__` (a str subclass) or a
+    `torch.Size` in the payload fails to unpickle there."""
+    out: dict[str, Any] = {}
+    try:
+        import torch
+
+        out["torch"] = str(torch.__version__)
+        out["capability"] = "sm_%d%d" % torch.cuda.get_device_capability()
+        out["device_name"] = str(torch.cuda.get_device_name())
+        out["arch_list"] = [str(a) for a in torch.cuda.get_arch_list()]
+    except Exception as exc:
+        return {"ok": False, "error": f"torch unavailable: {type(exc).__name__}: {exc}"}
+
+    try:
+        import gsplat
+        from gsplat import rasterization, rasterization_2dgs
+
+        out["gsplat"] = str(getattr(gsplat, "__version__", "?"))
+    except Exception as exc:
+        return {**out, "ok": False, "error": f"gsplat import: {type(exc).__name__}: {exc}"}
+
+    dev = torch.device("cuda")
+    n = 2
+    means = torch.zeros(n, 3, device=dev)
+    means[:, 2] = 2.0
+    quats = torch.zeros(n, 4, device=dev)
+    quats[:, 0] = 1.0
+    scales = torch.full((n, 3), 0.1, device=dev)
+    opacities = torch.full((n,), 0.9, device=dev)
+    colors = torch.ones(n, 1, 3, device=dev)          # SH degree 0
+    viewmats = torch.eye(4, device=dev)[None]
+    k = torch.tensor([[[64.0, 0, 32.0], [0, 64.0, 32.0], [0, 0, 1.0]]], device=dev)
+
+    for name, fn in (("3dgs", rasterization), ("2dgs", rasterization_2dgs)):
+        try:
+            res = fn(
+                means=means, quats=quats, scales=scales, opacities=opacities,
+                colors=colors, viewmats=viewmats, Ks=k, width=64, height=64,
+                sh_degree=0,
+            )
+            img = res[0]
+            torch.cuda.synchronize()
+            out[name] = {"ok": True, "shape": [int(d) for d in img.shape]}
+        except Exception as exc:
+            out[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+    out["ok"] = all(out[k].get("ok") for k in ("3dgs", "2dgs") if isinstance(out.get(k), dict))
     return out

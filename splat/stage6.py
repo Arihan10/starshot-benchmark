@@ -273,7 +273,8 @@ _PROFILE_EVERY = 250
 # never fired on any recorded run (the largest cloud trained so far is 281k), so
 # the whole path is unvalidated in production — one more reason to reach it late.
 #
-# Sized for the A100-40GB `modal_app.py` provisions: 4M seeds is ~3.8 GB of
+# Sized for the 48 GB L40S `modal_app.py` provisions (it was set against a 40 GB
+# A100, so the move only added headroom): 4M seeds is ~3.8 GB of
 # persistent state (59 floats/Gaussian for params, ×4 for the two Adam moments and
 # the gradient), leaving the bulk of the card for rasterization activations, which
 # are the real consumer — the tile-intersection buffers scale with projected AREA,
@@ -637,7 +638,8 @@ class TrainParams:
     # model), and VRAM is guarded properly by `vram_min_free_gb`, which reacts to
     # MEASURED free memory rather than guessing a count that cannot know the
     # scene's resolution, batch size or SH degree. At the old 2.5M it never fired
-    # on the A100 anyway, so its only real effect was deriving the tile budget —
+    # on the 40 GB A100 of the time (and the L40S since has more), so its only
+    # real effect was deriving the tile budget —
     # which is now `_TILE_BUDGET_DEFAULT` / `tile_max` instead, so changing this
     # can no longer restructure a scene's tiles as a side effect.
     # Set an int only to bound per-step runtime on a small GPU. Exceeding it pauses
@@ -693,8 +695,8 @@ class TrainParams:
     # unless `cap_max` is set).
     # (`expandable_segments` would fight fragmentation on Linux/Modal but is a
     # no-op on Windows, so this free-margin freeze is the portable mechanism.)
-    # A near-full floor, so it never triggers where VRAM is plentiful (the A100)
-    # — no quality cost there — but on a small card it catches the cliff before a
+    # A near-full floor, so it never triggers where VRAM is plentiful (the 48 GB
+    # L40S) — no quality cost there — but on a small card it catches the cliff before a
     # densification growth step overshoots it.
     vram_min_free_gb: float = 1.5
 

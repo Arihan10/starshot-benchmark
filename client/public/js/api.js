@@ -272,15 +272,19 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/sog/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
-    // Modal remote splat (stages 4-7 on an A100): renders references, builds the
-    // COLMAP model, and fine-tunes on the GPU box, then pulls trained.ply
-    // back so the "trained" viewer toggle lights up. `body.mode` is "continue"
-    // (from the LOCAL Stage-4 plan, stages 5–7; needs a local camera plan) or
-    // "train" (Modal replans cameras too, stages 4–7). `body` may also carry
-    // `{ representation, epochs, iterations, batch, restart }` —
-    // `representation` being "2dgs" (surfels, default) or "3dgs" (full 3D
-    // Gaussians + the 3DGS-only quality path). Status returns the live phase +
-    // heartbeat.
+    // Modal remote splat on the GPU box: renders references, builds the COLMAP
+    // model, and fine-tunes on the GPU box, then pulls trained.ply back so the
+    // "trained" viewer toggle lights up. `body.mode` is "continue" (from the
+    // LOCAL Stage-4 plan, skipping stage 4; needs a local camera plan) or
+    // "train" (Modal replans cameras too).
+    // `body.trainer` picks the stage-6 back-end and the stage window with it:
+    //   "brush"  — the upstream Rust/wgpu trainer (default). Stages 4-6, tuned
+    //              by `iterations` + `max_splats`; delivers trained.ply +
+    //              trained.sqz with no stage-7 heal.
+    //   "gsplat" — the in-house loop. Stages 4-7, tuned by `representation`
+    //              ("2dgs" surfels / "3dgs" full 3D Gaussians), `epochs`,
+    //              `iterations`, `batch`.
+    // `body` may also carry `restart`. Status returns the live phase + heartbeat.
     splatModalStart: (run, slot, model, body) =>
         request(
             `/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
@@ -290,7 +294,7 @@ export const api = {
         request(
             `/runs/${encodeURIComponent(run)}/splat/modal/${encodeURIComponent(slot)}/${encodeURIComponent(model)}`,
         ),
-    // Detach + cancel a cell's remote train: terminates the A100 container and
+    // Detach + cancel a cell's remote train: terminates the GPU container and
     // clears the job so the cell returns to idle and can be re-launched fresh.
     splatModalCancel: (run, slot, model) =>
         request(

@@ -124,11 +124,35 @@ let modalPlanShown = false; // one-time: revealed the camera overlay when the pl
 // on the 3DGS-only quality path: AbsGS densification + antialiased
 // rasterization). It is part of the stage-6/7 cache signature, so flipping it
 // re-runs training and heal rather than reusing the other path's artifacts.
+// `trainer` picks the stage-6 BACK-END, and with it which of the two param sets
+// above/below actually applies:
+//   "brush"  — the upstream Rust/wgpu trainer (ArthurBrussee/brush), pinned in
+//              the Modal image. Uses `iterations` + `maxSplats`; ignores
+//              `representation`/`batch` (it always trains 3D Gaussians, one view
+//              per step). It seeds from the COLMAP points and delivers
+//              trained.ply + trained.sqz directly, with no stage-7 heal.
+//   "gsplat" — the in-house loop, kept as the benchmark baseline. Uses
+//              `representation`/`iterations`/`batch` and runs stages 4-7.
+// The trainer is part of the stage-6 cache signature, so switching re-trains
+// rather than serving the other back-end's model.
+//
+// `maxSplats` is Brush's Gaussian ceiling (`--max-splats`). It is an upper
+// bound the run may finish under — but it ALSO subsamples the init: Brush thins
+// the COLMAP point cloud to this count before step 0, so setting it below the
+// Stage-3 surfel count silently discards part of the mesh-exact surface prior.
+// That is what MAX_SPLATS_MIN and the warning in the control guard against.
 let modalTrainCfg = {
+    trainer: "brush",
     representation: "2dgs",
     iterations: 30000,
     batch: 1,
+    maxSplats: 2000000,
 };
+
+// Below this, Brush's init subsampling starts throwing away surface prior on a
+// typical room-scale cell (Stage-3 clouds land in the 10^5-10^6 range), so the
+// control flags it rather than silently accepting the number.
+const MAX_SPLATS_MIN = 200000;
 
 // Camera rig (splatcam.js) — the same orbit + first-person controls as the main
 // dashboard viewer. mkkellogg's built-in OrbitControls are disabled (see
@@ -2714,7 +2738,7 @@ function showPatchModal(index) {
 // (server-side). Stages 4 (cameras) and 5 (references) run LOCALLY here too —
 // camera planning is CPU-only and references render through the headless WebGL
 // capture (no GPU) — so each has its own row for iterating without Modal. The
-// Modal "train" job (see renderModal) still runs 4-6 together on an A100 for the
+// Modal "train" job (see renderModal) still runs 4-6 together on the GPU box for the
 // full GPU fine-tune; "run all" runs local 1-3 then hands off to it.
 const STAGES = [
     { n: 1, label: "assemble", verb: "convert" },
@@ -2824,7 +2848,7 @@ async function waitStageDone(n, seq) {
 
 // Run local stages 1→3 in order, from the first not-yet-done through surfels,
 // waiting for each before the next, then launch the remote train (stages 4→6) on
-// the A100. Skips completed stages; stops (and reports) on the first error. Drives
+// the GPU box. Skips completed stages; stops (and reports) on the first error. Drives
 // its own polling, so the interval poll is paused meanwhile.
 async function runAll() {
     if (!current || runningAll) return;
@@ -2865,7 +2889,7 @@ async function runAll() {
         }
         if (seq !== openSeq || !current) return;
         // Local stages 1–3 done → launch the remote train (stages 4–6) on the
-        // A100. pollStages (below) then streams its phase + training heartbeat
+        // GPU box. pollStages (below) then streams its phase + training heartbeat
         // through the cells status; the run continues on Modal on its own.
         setStatus(
             "run all: stages 1–3 done — training on Modal (stages 4–6)…",
@@ -3095,7 +3119,7 @@ function renderStepper() {
 }
 
 // "run all" control row: runs local stages 1→3 in order from the first
-// not-yet-done, then launches the remote train (stages 4-6) on the A100.
+// not-yet-done, then launches the remote train (stages 4-6) on the GPU box.
 // Disabled while anything is running, or once trained.ply exists.
 function renderRunAll(cell) {
     const busy = runningAll || anyStageRunning(cell);
@@ -3123,7 +3147,14 @@ function renderRunAll(cell) {
 // are read by `startModalTrain`; defaults live here (client), never on the
 // server. `disabled` greys them out until Stage 3 is ready.
 function modalCfgControls(disabled) {
-    const numRow = (label, key, step, min, max, title) => {
+    // Every control declares which back-end(s) it applies to. Switching the
+    // trainer greys the inapplicable ones out IN PLACE (rather than waiting for
+    // the next poll to re-render), so the panel always shows which knobs the run
+    // about to be launched will actually read.
+    const scoped = [];
+    const applies = (trainers) => trainers.includes(modalTrainCfg.trainer);
+
+    const numRow = (label, key, step, min, max, title, trainers, onInput) => {
         const input = el("input", {
             type: "number",
             value: modalTrainCfg[key],
@@ -3135,62 +3166,128 @@ function modalCfgControls(disabled) {
             disabled,
             oninput: () => {
                 const v = Number(input.value);
-                if (!Number.isNaN(v)) modalTrainCfg[key] = v;
+                if (Number.isNaN(v)) return;
+                modalTrainCfg[key] = v;
+                if (onInput) onInput(v);
             },
         });
         input.style.width = "60px";
-        return el(
+        const row = el(
             "div",
             { class: "svc-row" },
             el("span", { class: "svc-lab", text: label, title }),
             input,
         );
+        scoped.push({ row, input, trainers });
+        return row;
     };
+
+    const select = (key, values, title, trainers, onChange) => {
+        const sel = el("select", { class: "svc-num", title, disabled });
+        for (const v of values) {
+            const opt = el("option", { value: v, text: v });
+            if (modalTrainCfg[key] === v) opt.selected = true;
+            sel.appendChild(opt);
+        }
+        sel.style.width = "72px";
+        sel.onchange = () => {
+            modalTrainCfg[key] = sel.value;
+            if (onChange) onChange(sel.value);
+        };
+        const row = el(
+            "div",
+            { class: "svc-row" },
+            el("span", { class: "svc-lab", text: key === "trainer" ? "trainer" : "splat", title }),
+            sel,
+        );
+        scoped.push({ row, input: sel, trainers });
+        return row;
+    };
+
+    const trainerTitle =
+        "stage-6 back-end. brush = the upstream Rust/wgpu trainer, pinned in the " +
+        "Modal image: seeds from the COLMAP points, caps count with max splats, " +
+        "and delivers trained.ply + .sqz with no stage-7 heal. gsplat = the " +
+        "in-house loop (the benchmark baseline), which runs stages 4–7 and uses " +
+        "the splat/batch knobs. Changing it re-trains rather than reusing the " +
+        "other back-end's model.";
     const repTitle =
         "primitive to train: 2dgs = surface-aligned surfels (best geometry, " +
         "median-depth + normal-consistency supervision); 3dgs = full 3D Gaussians " +
         "(AbsGS densification, antialiased rasterization, and the primitive every " +
-        "delivery viewer actually renders). Changing it re-runs stages 6–7.";
-    const repSel = el("select", { class: "svc-num", title: repTitle, disabled });
-    for (const v of ["2dgs", "3dgs"]) {
-        const opt = el("option", { value: v, text: v });
-        if (modalTrainCfg.representation === v) opt.selected = true;
-        repSel.appendChild(opt);
-    }
-    repSel.style.width = "72px";
-    repSel.onchange = () => {
-        modalTrainCfg.representation = repSel.value;
+        "delivery viewer actually renders). Changing it re-runs stages 6–7. " +
+        "gsplat only — brush always trains 3D Gaussians.";
+    const maxSplatsTitle =
+        "brush --max-splats: upper bound on the Gaussian count (the run may " +
+        "finish under it). It ALSO thins the init — brush subsamples the COLMAP " +
+        "point cloud to this count before step 0 — so going below the Stage-3 " +
+        "surfel count throws away part of the mesh-exact surface prior.";
+
+    // Sits under the max-splats row; only speaks up when the value is low enough
+    // that the init subsampling above becomes the binding effect.
+    const warn = el("div", { class: "svc-row muted" });
+    warn.style.fontSize = "11px";
+    const syncWarn = () => {
+        const low =
+            modalTrainCfg.trainer === "brush" &&
+            modalTrainCfg.maxSplats < MAX_SPLATS_MIN;
+        warn.textContent = low
+            ? `⚠ under ${MAX_SPLATS_MIN.toLocaleString()} brush also thins the init cloud`
+            : "";
     };
-    return el(
+
+    const syncScope = () => {
+        for (const { row, input, trainers } of scoped) {
+            const on = applies(trainers);
+            input.disabled = disabled || !on;
+            row.style.opacity = on ? "" : "0.4";
+        }
+        syncWarn();
+    };
+
+    const box = el(
         "div",
         { class: "svc-modal-cfg" },
-        el(
-            "div",
-            { class: "svc-row" },
-            el("span", { class: "svc-lab", text: "splat", title: repTitle }),
-            repSel,
-        ),
+        select("trainer", ["brush", "gsplat"], trainerTitle, ["brush", "gsplat"], syncScope),
+        select("representation", ["2dgs", "3dgs"], repTitle, ["gsplat"]),
         numRow(
             "steps",
             "iterations",
             1000,
             200,
             200000,
-            "optimizer steps (PostShot's step box / gsplat max_steps); 30k is reference parity",
+            "optimizer steps — brush --total-steps / gsplat max_steps (PostShot's " +
+                "step box); 30k is reference parity for both",
+            ["brush", "gsplat"],
         ),
+        numRow(
+            "max splats",
+            "maxSplats",
+            100000,
+            1000,
+            20000000,
+            maxSplatsTitle,
+            ["brush"],
+            syncWarn,
+        ),
+        warn,
         numRow(
             "batch",
             "batch",
             1,
             1,
             32,
-            "views averaged per optimizer step — multiplies work per step, does not shorten the run",
+            "views averaged per optimizer step — multiplies work per step, does not " +
+                "shorten the run. gsplat only.",
+            ["gsplat"],
         ),
     );
+    syncScope();
+    return box;
 }
 
 // Remote-train row + live log. One "train on modal" button runs stages 4-6 on
-// the A100 (cameras → references → fine-tune) and pulls trained.ply back; its
+// the GPU box (cameras → references → fine-tune) and pulls trained.ply back; its
 // live phase (push / spawn / plan / refs / train / pull) + the training
 // heartbeat (`stage · step/total · loss=… it/s`) arrive through the same cells
 // poll, and on completion the "trained" view auto-opens.
@@ -3222,7 +3319,7 @@ function renderModal(cell) {
             class: "splat-stage2-btn",
             disabled: true,
             text: prog,
-            title: "training on the A100 — see the live log below",
+            title: "training on the GPU box — see the live log below",
         });
     } else {
         // Two placements. "continue on modal" renders + trains from the LOCAL
@@ -3234,7 +3331,7 @@ function renderModal(cell) {
             disabled: !s4done || runningAll,
             text: "continue on modal",
             title: s4done
-                ? "render references + build the COLMAP model + 2DGS fine-tune on the A100 from the LOCAL camera plan (stages 5–7); keeps cameras.json"
+                ? "render references + build the COLMAP model + 2DGS fine-tune on the GPU box from the LOCAL camera plan (stages 5–7); keeps cameras.json"
                 : "plan cameras locally first (Stage 4)",
             onclick: () => startModalTrain(true, "continue"),
         });
@@ -3244,7 +3341,7 @@ function renderModal(cell) {
             disabled: !s3done || runningAll,
             text: status === "done" ? "re-train" : "train on modal",
             title: s3done
-                ? "(re)plan cameras + render references + 2DGS fine-tune on the A100 (stages 4–7), overwriting the local plan"
+                ? "(re)plan cameras + render references + 2DGS fine-tune on the GPU box (stages 4–7), overwriting the local plan"
                 : "sample the surfel cloud first (Stage 3)",
             onclick: () => startModalTrain(status === "done", "train"),
         });
@@ -3269,7 +3366,7 @@ function renderModal(cell) {
               : running
                 ? `${st.phase || "running"}${st.msg ? ` — ${st.msg}` : ""}`
                 : s3done
-                  ? "ready — runs stages 4–6 on the A100"
+                  ? "ready — runs stages 4–6 on the GPU box"
                   : "needs the surfel cloud (Stage 3)";
     const sub = el("div", { class: "muted", text: info });
     sub.style.fontSize = "12px";
@@ -3373,12 +3470,17 @@ async function startModalTrain(restart = false, mode = "train") {
         "var(--purple)",
     );
     try {
+        // Send both back-ends' knobs and let the server route on `trainer` — the
+        // container keys its cache on the selected set only, so the unused ones
+        // can't perturb the run or its signature.
         await api.splatModalStart(current.run, current.slot, current.model, {
             restart,
             mode,
+            trainer: modalTrainCfg.trainer,
             representation: modalTrainCfg.representation,
             iterations: modalTrainCfg.iterations,
             batch: modalTrainCfg.batch,
+            max_splats: modalTrainCfg.maxSplats,
         });
     } catch (e) {
         setStatus(`remote splat failed to start: ${e.message}`, "var(--red)");
@@ -3403,13 +3505,19 @@ function renderCoverage() {
     const targets = sum.targets || {};
     const culls = sum.culls || {};
     const standoff = sum.standoff_m || {};
+    const orb = sum.orb || {};
 
     box.appendChild(el("div", { class: "svc-title", text: "camera plan" }));
     const rows = [
         ["cameras (single shots)", fmtInt(sum.cameras), null],
         [
-            "ball · shell",
-            `${fmtInt(kinds.ball)} · ${fmtInt(kinds.shell)}`,
+            "ball · shell · flood",
+            `${fmtInt(kinds.ball)} · ${fmtInt(kinds.shell)} · ${fmtInt(kinds.flood)}`,
+            null,
+        ],
+        [
+            "sweep · orb",
+            `${fmtInt(kinds.sweep)} · ${fmtInt(kinds.orb)}`,
             null,
         ],
         [
@@ -3434,6 +3542,20 @@ function renderCoverage() {
             null,
         ],
     ];
+    // Measured surface coverage (the orb layer's stopping rule): the share of
+    // reachable surface seeing at least `target_views` cameras, before and
+    // after the orbs. Amber when the run stopped on its view cap rather than
+    // on the target — the plan is then budget-limited, not coverage-complete.
+    if (orb.target_bricks) {
+        const pct = (v) => `${(100 * (v ?? 0)).toFixed(0)}%`;
+        const short = (orb.reached_after ?? 0) < (orb.target_frac ?? 1);
+        rows.push([
+            `surface ≥${fmtInt(orb.target_views)} views (was → now)`,
+            `${pct(orb.reached_before)} → ${pct(orb.reached_after)} of ${pct(orb.target_frac)}`,
+            short ? "#d0a020" : null,
+        ]);
+        rows.push(["orbs placed · median views", `${fmtInt(orb.orbs)} · ${fmtInt(orb.median_views)}`, null]);
+    }
     for (const [k, v, color] of rows) {
         const row = el("div");
         Object.assign(row.style, {

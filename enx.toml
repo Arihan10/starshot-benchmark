@@ -54,7 +54,7 @@ description = "Run test suite"
 command = "uv run --script scripts/run_playground.py"
 description = "Boot the prompt → Nano Banana → Trellis 2 dev playground"
 
-# --- Modal splat trainer (stages 4-6 on an A100; see splat/modal_app.py) ------
+# --- Modal splat trainer (stages 4-6 on an L40S; see splat/modal_app.py) ------
 # Modal is SERVERLESS, so there is no always-on box to pay for: an idle deployed
 # app costs $0 (only Volume storage, free under 1 TiB), and every train job spins
 # a container up and back down on its own. So the session model is really:
@@ -76,11 +76,15 @@ description = "Stop the Modal splat app (terminates any running container). Opti
 
 [tasks."modal:probe"]
 command = "uv run --project server modal run splat/modal_app.py::probe_webgl"
-description = "Check the A100's headless-WebGL renderer (GPU vs SwiftShader) — run once before trusting stage 5"
+description = "Check the GPU container's headless-WebGL renderer (GPU vs SwiftShader) — run once before trusting stage 5"
 
 [tasks."modal:probe-gpu"]
 command = "uv run --project server modal run splat/modal_app.py::probe_gpu_stack"
-description = "Inventory the A100 container's graphics stack (driver, Vulkan ICDs, NVIDIA GL libs) to see if hardware WebGL is reachable"
+description = "Inventory the GPU container's graphics + CUDA stack (driver, Vulkan ICDs, NVIDIA GL libs, and whether the prebuilt gsplat wheel has kernels for this card's arch) — run after changing the GPU type"
+
+[tasks."modal:probe-brush"]
+command = "uv run --project server modal run splat/modal_app.py::probe_brush"
+description = "End-to-end smoke test of the Brush stage-6 trainer (binary loads, wgpu picks the GPU, COLMAP parses, .ply exports, quantizes, and warm-restarts) — run after changing splat/brush.py or bumping the pinned Brush release"
 
 [tasks."modal:logs"]
 command = "uv run --project server modal app logs starshot-splat"

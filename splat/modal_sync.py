@@ -3,7 +3,7 @@
 Everything the Mac does to run stages 4-7 remotely, importable by the server
 and usable standalone:
 
-    python -m splat.modal_sync probe                          # WebGL renderer on the A100
+    python -m splat.modal_sync probe                          # WebGL renderer on the GPU box
     python -m splat.modal_sync run    --cell runs/R/S/M       # push + spawn + record job
     python -m splat.modal_sync watch  --cell runs/R/S/M       # follow heartbeat, pull when done
     python -m splat.modal_sync status --cell runs/R/S/M
@@ -194,7 +194,7 @@ def push_cell(
     `include_cameras` ALSO uploads the LOCAL Stage-4 plan (`splat/cameras.json`)
     to the cell's `splat/` dir on the Volume — where `run_cell`'s stage 5 reads
     it — so a locally-planned camera set drives the remote render and stage 4 is
-    skipped ('continue on modal'). Without it, stage 4 (re)plans on the A100."""
+    skipped ('continue on modal'). Without it, stage 4 (re)plans on the GPU box."""
     zstandard = _zstd()
     run, slot, model = _cell_parts(cell_dir)
     cell_key = f"{run}/{slot}/{model}"
@@ -332,15 +332,24 @@ def spawn_cell(
     train: dict[str, Any] | None = None,
     quant: dict[str, Any] | None = None,
     force: bool = False,
+    trainer: str = "brush",
+    brush: dict[str, Any] | None = None,
 ) -> str:
     """Spawn `run_cell` for a pushed cell; record the call id beside the local
-    splat artifacts. Returns the Modal function-call id."""
+    splat artifacts. Returns the Modal function-call id.
+
+    `trainer` picks the stage-6 back-end: "brush" (the upstream binary, tuned by
+    `brush`) or "gsplat" (the in-house loop, tuned by `train`). The unused
+    back-end's params ride along harmlessly — `run_cell` keys its cache on the
+    selected one only."""
     spec = {
         "run": pushed["run"], "slot": pushed["slot"], "model": pushed["model"],
         "stages": stages,
         "input_sha": pushed["input_sha"],
+        "trainer": trainer,
         "plan": plan or {},
         "train": train or {},
+        "brush": brush or {},
         "quant": quant or {},
         "force": force,
     }
@@ -384,7 +393,7 @@ def job_status(cell_dir: Path) -> dict[str, Any]:
 
 def cancel_cell(cell_dir: Path) -> str | None:
     """Cancel the cell's recorded Modal function call, TERMINATING its container
-    so the A100 stops billing immediately (not just draining its input queue).
+    so the GPU box stops billing immediately (not just draining its input queue).
     Returns the cancelled call id, or None when there's no job record / call id.
     The local `modal-job.json` is left in place for the caller to remove — the
     detach flow drops it so the cell reads idle and re-launches clean."""
@@ -531,15 +540,18 @@ def _main() -> None:
     p = sub.add_parser("push", help="upload inputs (deduped) without running")
     add_cell(p, tier=True)
 
-    p = sub.add_parser("run", help="push + spawn stages on the A100")
+    p = sub.add_parser("run", help="push + spawn stages on the GPU box")
     add_cell(p, tier=True)
     p.add_argument("--stages", type=_parse_stages, default=[4, 5, 6, 7],
                    help="e.g. 4-7, 4, or 6,7 (default 4-7)")
     p.add_argument("--with-cameras", action="store_true",
                    help="upload the LOCAL splat/cameras.json and skip stage 4 "
                         "('continue on modal'); pair with --stages 5-7")
+    p.add_argument("--trainer", choices=("brush", "gsplat"), default="brush",
+                   help="stage-6 back-end (default brush)")
     p.add_argument("--plan-json", default="{}", help="PlanParams overrides")
-    p.add_argument("--train-json", default="{}", help="TrainParams overrides")
+    p.add_argument("--train-json", default="{}", help="TrainParams overrides (gsplat)")
+    p.add_argument("--brush-json", default="{}", help="BrushParams overrides (brush)")
     p.add_argument("--quant-json", default="{}", help="QuantConfig overrides")
     p.add_argument("--force", action="store_true",
                    help="re-run the stage window even when signatures match")
@@ -558,11 +570,11 @@ def _main() -> None:
     p.add_argument("--no-ply", action="store_true")
 
     p = sub.add_parser(
-        "cancel", help="cancel the cell's running Modal job (terminates the A100 container)"
+        "cancel", help="cancel the cell's running Modal job (terminates the GPU container)"
     )
     add_cell(p)
 
-    sub.add_parser("probe", help="report the A100 container's WebGL renderer")
+    sub.add_parser("probe", help="report the GPU container's WebGL renderer")
 
     args = ap.parse_args()
 
@@ -583,6 +595,8 @@ def _main() -> None:
             train=json.loads(args.train_json),
             quant=json.loads(args.quant_json),
             force=args.force,
+            trainer=args.trainer,
+            brush=json.loads(args.brush_json),
         )
         print(f"spawned {call_id} (stages {args.stages}) — "
               f"`watch --cell {args.cell}` to follow")

@@ -1,4 +1,4 @@
-"""Stage 4 — Camera planner (per-object shells + detail rings + root shell + interior flood-fill).
+"""Stage 4 — Camera planner (per-object shells + detail rings + root shell + outward orbs + interior flood-fill).
 
 Plans the single-shot reference cameras Stage 5 renders and the splat trainer
 consumes. WE OWN THE GEOMETRY, so the plan is built object-by-object from the
@@ -55,6 +55,35 @@ scene's own construction record instead of scattering undirected views:
     its per-object standoff can't fit the room and its room-side darts get culled
     — it would otherwise train into a cloud. The sweep grids the face and views
     each cell perpendicular + oblique (parallax) at a room-fitted standoff.
+  * ORBS — the DUAL of the per-object balls, and the layer interiors live or die
+    by. A ball sits on an offset shell around a SURFACE and looks IN; an orb sits
+    in FREE SPACE and looks OUT in every direction. The distinction matters
+    because the two supervise different things: inward views establish what a
+    surface looks like, but only a ray that PASSES THROUGH a volume and lands on
+    something else can prove that volume is empty — and an unproven volume is
+    exactly where the optimizer parks the low-opacity haze that makes interiors
+    read as cloudy. Orbs are placed by FARTHEST-POINT sampling over
+    camera-admissible free space (measured against the free-space distance
+    field), so coverage is uniform in SPACE rather than tied to any lattice
+    pitch, and an isolated pocket — being far from everything already placed —
+    is claimed early instead of falling between lattice nodes. Directions are a
+    per-orb ROTATED Fibonacci fan (neighbouring orbs therefore sample different
+    directions, so the union densifies instead of moving in lockstep), minus the
+    ones whose first hit is point-blank: a frame filled edge to edge by one wall
+    patch 15 cm away carries no geometry, only texture. The layer's budget is
+    MEASURED, not guessed — see below.
+
+BUDGET BY MEASUREMENT (the orb layer only). Every other layer emits what its
+formula derives and hopes. The orb layer instead marches the plan against the
+grid and counts, per REACHABLE cover brick, how many cameras actually see it —
+in frustum and unoccluded — then keeps adding orbs until `orb_target_frac` of
+that surface reaches `orb_target_views`, or `orb_max_views` stops it. Two
+properties make this honest rather than circular: the target set EXCLUDES
+surface with less than a camera's clearance beside it (crack linings and
+interpenetration seams, which no viewpoint can ever reach, so a coverage goal
+defined over them is unsatisfiable by construction), and the measurement uses a
+coarse ray grid, so it UNDERSTATES true coverage and the loop errs toward
+planning more rather than stopping early.
 
 GEOMETRY STILL DISPOSES. Every candidate passes scene-agnostic filters
 against the Stage-2 grid: POSITION (outside the grid is provably open air;
@@ -72,14 +101,14 @@ frame covers at the standoff ((2·tan(fov/2)·d)²) — dimensionless and
 self-normalizing. `ball_min` floors the per-object guarantee;
 `min_ball_views`/`max_ball_views` bound the SCENE total by proportional
 rescale (a budget guard, not a modeling statement). Deterministic (Halton +
-seeded cursors, no RNG state), pure CPU (numpy only), independent of the
-surfel cloud.
+seeded cursors, no RNG state), pure CPU (numpy + one scipy distance transform
+for the orb layer's free-space field), independent of the surfel cloud.
 
 Consumes `freespace.npz` (Stage 2) + `scene.json` (Stage 1). Emits
 `cameras.json` (plan_version 3): shared pinhole `intrinsics` + a flat
-`cameras` list, each `{pos, forward, up, kind: ball|shell, zone}`. Stage 5
-renders one image per entry (it accepts plan_version ≥ 2); poses convert via
-`opencv_c2w`.
+`cameras` list, each `{pos, forward, up, kind: ball|shell|flood|sweep|orb,
+zone}`. Stage 5 renders one image per entry (it accepts plan_version ≥ 2);
+poses convert via `opencv_c2w`.
 """
 
 from __future__ import annotations
@@ -156,6 +185,34 @@ _SHELL_STANDOFF_MIN = 3.0
 _SHELL_RADIUS_MULT = 0.9
 _SHELL_FLOOR_FRAC = 0.05
 
+# ORBS (module docstring). Orbs are placed and budgeted in whole BALLS — a
+# fan's directions are never subsampled independently, because one ray from a
+# viewpoint is worth a small fraction of a look-around from it, and striding a
+# position-major (origin × direction) list silently collapses every fan to its
+# first direction.
+#
+# Orbs are emitted in batches so the measured stopping rule is re-evaluated
+# without re-marching what is already placed. Farthest-point sampling is
+# PREFIX-OPTIMAL — the first k of the sequence is itself a well-spread set —
+# so consuming it incrementally costs nothing in placement quality.
+_ORB_BATCH = 32
+# Candidates come from the brick grid, so free space is enumerated at its own
+# resolution rather than through a lattice pitch. A candidate must hold at
+# least `_ORB_CAND_EMPTY_FRAC` air to be a plausible viewpoint.
+_ORB_CAND_EMPTY_FRAC = 0.5
+# Rotation of each orb's direction fan: golden angle about Y, plus a
+# Halton-derived tilt, so no two neighbouring fans coincide. Deterministic.
+_ORB_GOLDEN_RAD = 2.399963229728653
+# The measurement's ray grid must be fine enough that neighbouring rays land
+# less than a BRICK apart at the range interiors are actually viewed from,
+# otherwise the count is not conservative but simply wrong: at 10 m a 12×12
+# grid over 70° spaces rays a full metre apart — four brick edges — so most of
+# the surface a camera genuinely resolves goes uncounted and no coverage target
+# can ever be met. The density that matters is therefore set by the brick edge
+# and the FOV, not by scene size (`orb_measure_rays` overrides; 0 = derive).
+_ORB_MEASURE_REF_M = 4.0
+_ORB_MEASURE_CLAMP = (12, 40)
+
 ProgressCb = Callable[[int, int, str], None]
 
 
@@ -221,6 +278,26 @@ class PlanParams:
     sweep_standoff: float = 1.5
     sweep_oblique: float = 0.6
     sweep_max_views: int = 512
+    # OUTWARD ORBS (module docstring) — the free-space dual of the object balls,
+    # and the only layer whose size is decided by MEASUREMENT. `orb_dirs` is the
+    # fan size (never subsampled: the orb, not the view, is the budget unit);
+    # `orb_min_clear` is the room a viewpoint needs (a camera body, not the
+    # 0.3 m sphere the flood demands, which rejects every position near a floor);
+    # `orb_min_content` drops directions whose first hit is point-blank;
+    # `orb_max_clear` keeps the open sky outside a building from counting as
+    # free space worth standing in. The loop runs until `orb_target_frac` of the
+    # reachable cover bricks see `orb_target_views` cameras, or `orb_max_views`
+    # stops it; `orb_measure_rays`² rays per view do the counting (0 = derive
+    # the density from the brick edge and FOV — see the constants block).
+    orb: bool = True
+    orb_dirs: int = 24
+    orb_min_clear: float = 0.22
+    orb_min_content: float = 0.35
+    orb_max_clear: float = 4.0
+    orb_target_views: int = 16
+    orb_target_frac: float = 0.9
+    orb_max_views: int = 8000
+    orb_measure_rays: int = 0
     # Shared pinhole intrinsics (one FOV for every camera, square frames).
     fov_deg: float = 70.0
     render_resolution: int = 1024
@@ -253,6 +330,15 @@ class PlanParams:
             "sweep_standoff": self.sweep_standoff,
             "sweep_oblique": self.sweep_oblique,
             "sweep_max_views": self.sweep_max_views,
+            "orb": self.orb,
+            "orb_dirs": self.orb_dirs,
+            "orb_min_clear": self.orb_min_clear,
+            "orb_min_content": self.orb_min_content,
+            "orb_max_clear": self.orb_max_clear,
+            "orb_target_views": self.orb_target_views,
+            "orb_target_frac": self.orb_target_frac,
+            "orb_max_views": self.orb_max_views,
+            "orb_measure_rays": self.orb_measure_rays,
             "fov_deg": self.fov_deg,
             "render_resolution": self.render_resolution,
             "seed": self.seed,
@@ -871,6 +957,302 @@ def _surface_sweep_cameras(
     return cams
 
 
+# --- outward orbs: free-space viewpoints + the measured stopping rule -------------
+
+
+def _brick_fields(fs: FreeSpace) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """(cover, opaque, empty) dense flat bool arrays over the brick grid, plus
+    `bdims`. The brick grid is volume/512, so it always holds dense even when
+    the fine grid cannot — which is what makes a free-space distance field and
+    a brick-resolution ray march affordable at any scene size."""
+    bd = fs.bdims
+    n = int(bd[0] * bd[1] * bd[2])
+    nyz = int(fs.dims[1]) * int(fs.dims[2])
+    nz = int(fs.dims[2])
+
+    def to_bricks(lin: np.ndarray) -> np.ndarray:
+        out = np.zeros(n, dtype=bool)
+        for i in range(0, lin.size, 1 << 24):
+            s = lin[i : i + (1 << 24)]
+            x = s // nyz
+            rem = s % nyz
+            out[((x >> 3) * bd[1] + ((rem // nz) >> 3)) * bd[2] + ((rem % nz) >> 3)] = True
+        return out
+
+    empty = np.zeros(n, dtype=bool)
+    if fs.skin_lin.size:
+        # A skin brick is part air, part surface; it is only a plausible
+        # VIEWPOINT if it is mostly air (a brick that is 90% solid is not a
+        # place a camera stands, but it is still air a ray may cross).
+        frac = np.unpackbits(np.asarray(fs.skin_empty), axis=1).sum(axis=1)
+        empty[fs.skin_lin[frac > 0]] = True
+    if fs.zone_lin.size:
+        empty[fs.zone_lin] = True
+    return to_bricks(fs.occ_lin), to_bricks(fs.occ_lin_opaque), empty, bd
+
+
+def _clearance_field(cover: np.ndarray, empty: np.ndarray, bd: np.ndarray, edge: float) -> np.ndarray:
+    """Metres from every cover-free reachable brick to the nearest brick that is
+    not one — the free-space distance field the orb placement reads. This is
+    what replaces a lattice pitch: it is a property of the SCENE's own geometry,
+    so a 0.9 m stall and a 12 m hall are both described in the same units and
+    neither needs a scene-diagonal parameter to be found."""
+    from scipy import ndimage
+
+    shape = (int(bd[0]), int(bd[1]), int(bd[2]))
+    free = (empty & ~cover).reshape(shape)
+    return ndimage.distance_transform_edt(free, sampling=edge).ravel().astype(np.float32)
+
+
+def _brick_centers_at(blin: np.ndarray, bd: np.ndarray, fs: FreeSpace) -> np.ndarray:
+    """(N,3) world centres of brick linear ids."""
+    bx = blin // (bd[1] * bd[2])
+    by = (blin // bd[2]) % bd[1]
+    bz = blin % bd[2]
+    cells = np.stack([bx, by, bz], axis=1).astype(np.float64) * _BRICK + _BRICK / 2.0
+    return fs.origin + cells * fs.pitch
+
+
+def _orb_origins(
+    clear: np.ndarray, bd: np.ndarray, fs: FreeSpace,
+    lo: np.ndarray, hi: np.ndarray, n_max: int, params: PlanParams,
+) -> np.ndarray:
+    """Up to `n_max` orb origins by FARTHEST-POINT sampling of the admissible
+    free space, returned in pick order.
+
+    Why farthest-point and not the obvious alternatives: a LATTICE has a pitch,
+    and any pitch that suits a hall is blind inside a shower stall (while one
+    that suits the stall is unaffordable in the hall). Ordering candidates by
+    CLEARANCE instead — most open first — spends the whole budget on the
+    largest volumes before it ever reaches a room, because the biggest spaces
+    are also the ones that suppress the largest neighbourhoods. Farthest-point
+    has neither failure: each pick maximizes distance to everything already
+    placed, which is uniform in space by construction, and an isolated pocket
+    is by definition far from the rest and so gets claimed early rather than
+    falling between nodes."""
+    cand = np.nonzero(
+        (clear >= params.orb_min_clear) & (clear <= params.orb_max_clear)
+    )[0]
+    if not cand.size:
+        return np.zeros(0, dtype=np.int64)
+    xyz = _brick_centers_at(cand, bd, fs)
+    inside = np.all((xyz >= lo) & (xyz <= hi), axis=1)
+    cand, xyz = cand[inside], xyz[inside]
+    if not cand.size:
+        return np.zeros(0, dtype=np.int64)
+    # Seed at the most open admissible point, then pure farthest-point.
+    picks = [int(np.argmax(clear[cand]))]
+    d2 = ((xyz - xyz[picks[0]]) ** 2).sum(axis=1)
+    while len(picks) < min(n_max, len(cand)):
+        nxt = int(np.argmax(d2))
+        if d2[nxt] <= 0.0:
+            break
+        picks.append(nxt)
+        np.minimum(d2, ((xyz - xyz[nxt]) ** 2).sum(axis=1), out=d2)
+    return cand[np.asarray(picks, dtype=np.int64)]
+
+
+def _rotate_fan(dirs: np.ndarray, seed: int) -> np.ndarray:
+    """`dirs` rotated by a deterministic per-orb amount (golden angle about Y
+    plus a Halton tilt). Without it every orb fires the SAME direction set, so
+    the union over orbs samples direction space in lockstep and leaves an
+    identical angular gap at every viewpoint."""
+    g = _ORB_GOLDEN_RAD * seed
+    ca, sa = np.cos(g), np.sin(g)
+    b = 0.7 * float(_radical_inverse(np.array([seed + 1]), 3)[0])
+    cb, sb = np.cos(b), np.sin(b)
+    rot_y = np.array([[ca, 0.0, sa], [0.0, 1.0, 0.0], [-sa, 0.0, ca]])
+    rot_x = np.array([[1.0, 0.0, 0.0], [0.0, cb, -sb], [0.0, sb, cb]])
+    return dirs @ (rot_x @ rot_y).T
+
+
+def _march_bricks(
+    fs: FreeSpace, bd: np.ndarray, opaque: np.ndarray,
+    pos: np.ndarray, fwd: np.ndarray, up: np.ndarray, params: PlanParams, k: int,
+) -> np.ndarray:
+    """Cameras that SEE each brick: cast a k×k grid of rays through every
+    camera's frustum and stop each at the first opaque brick. A brick counts a
+    camera ONCE however many of its rays landed there, so the result is a view
+    count, not a ray count. Brick resolution is the right granularity — the
+    question is "does this camera resolve this patch of surface", not which
+    texel — and it makes the march an array index instead of a binary search."""
+    nb = int(bd[0] * bd[1] * bd[2])
+    seen = np.zeros(nb, dtype=np.int32)
+    if not len(pos):
+        return seen
+    step = _BRICK * fs.pitch * 0.5
+    n_steps = int(float(np.linalg.norm(fs.dims.astype(np.float64) * fs.pitch)) / step) + 2
+    s1, s2 = int(bd[1]), int(bd[2])
+    t_half = np.tan(np.radians(params.fov_deg) / 2.0)
+    a = ((np.arange(k) + 0.5) / k * 2.0 - 1.0) * t_half
+    uu, vv = np.meshgrid(a, a, indexing="ij")
+    uu, vv = uu.reshape(-1, 1), vv.reshape(-1, 1)
+
+    chunk = max(1, int(1_200_000 / (k * k)))
+    for c0 in range(0, len(pos), chunk):
+        c1 = min(c0 + chunk, len(pos))
+        d_parts = []
+        for ci in range(c0, c1):
+            # The same OpenCV basis Stage 5 renders with: +Z forward, +Y image-down.
+            z = fwd[ci] / np.linalg.norm(fwd[ci])
+            y = -up[ci] / np.linalg.norm(up[ci])
+            x = np.cross(y, z)
+            x /= np.linalg.norm(x)
+            y = np.cross(z, x)
+            d = z[None, :] + uu * x[None, :] + vv * y[None, :]
+            d_parts.append(d / np.linalg.norm(d, axis=1, keepdims=True))
+        org = np.repeat(pos[c0:c1], k * k, axis=0)
+        dr = np.concatenate(d_parts)
+        cid = np.repeat(np.arange(c0, c1, dtype=np.int64), k * k)
+
+        alive = np.ones(len(dr), dtype=bool)
+        hit_b = np.full(len(dr), -1, dtype=np.int64)
+        t = step
+        for _ in range(n_steps):
+            live = np.nonzero(alive)[0]
+            if not live.size:
+                break
+            cell = np.floor((org[live] + dr[live] * t) / fs.pitch).astype(np.int64) - fs.imin
+            inb = np.all((cell >= 0) & (cell < fs.dims), axis=1)
+            alive[live[~inb]] = False  # beyond the grid is provably open air
+            live = live[inb]
+            if live.size:
+                b = cell[inb] >> 3
+                blin = (b[:, 0] * s1 + b[:, 1]) * s2 + b[:, 2]
+                h = opaque[blin]
+                hit_b[live[h]] = blin[h]
+                alive[live[h]] = False
+            t += step
+        got = hit_b >= 0
+        if got.any():
+            uniq = np.unique(hit_b[got] * len(pos) + cid[got])
+            np.add.at(seen, uniq // len(pos), 1)
+    return seen
+
+
+def _orb_fan_views(
+    fs: FreeSpace, bd: np.ndarray, opaque: np.ndarray,
+    origins: np.ndarray, first: int, params: PlanParams,
+) -> tuple[np.ndarray, np.ndarray]:
+    """(positions, forwards) for a batch of orbs: each origin's full rotated fan
+    minus the directions whose first opaque hit is nearer than
+    `orb_min_content`. A point-blank frame is one wall patch filling the image —
+    all texture, no geometry, and it displaces a view that could have carried
+    both. Directions that hit NOTHING are kept: a ray that leaves the scene
+    without meeting a surface is the only evidence the trainer ever gets that
+    the volume along it is empty."""
+    base = _fib_sphere(max(int(params.orb_dirs), 1))
+    xyz = _brick_centers_at(origins, bd, fs)
+    pos = np.repeat(xyz, len(base), axis=0)
+    fwd = np.concatenate([_rotate_fan(base, first + i) for i in range(len(origins))])
+
+    step = fs.pitch
+    t_max = params.orb_min_content
+    close = np.zeros(len(fwd), dtype=bool)
+    t = step
+    while t <= t_max:
+        cell = np.floor((pos + fwd * t) / fs.pitch).astype(np.int64) - fs.imin
+        inb = np.all((cell >= 0) & (cell < fs.dims), axis=1)
+        idx = np.nonzero(inb & ~close)[0]
+        if idx.size:
+            b = cell[idx] >> 3
+            blin = (b[:, 0] * int(bd[1]) + b[:, 1]) * int(bd[2]) + b[:, 2]
+            close[idx[opaque[blin]]] = True
+        t += step
+    keep = ~close
+    return pos[keep], fwd[keep]
+
+
+def _plan_orbs(
+    fs: FreeSpace, lo: np.ndarray, hi: np.ndarray, placed: list[dict[str, Any]],
+    params: PlanParams, progress: ProgressCb | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """The outward-orb layer and its MEASURED budget (module docstring).
+
+    Marches the already-planned cameras to see what they actually cover, then
+    adds orbs in batches — re-measuring only the new ones — until the reachable
+    surface hits its view target or the cap stops it. Returns the orb cameras
+    and a stats block recording what coverage was achieved, so a plan is never
+    silently under-covered: the number is in the summary either way."""
+    if not params.orb:
+        return [], {}
+    cover, opaque, empty, bd = _brick_fields(fs)
+    edge = _BRICK * fs.pitch
+    clear = _clearance_field(cover, empty, bd, edge)
+
+    # The TARGET set: cover bricks with a camera's worth of room somewhere in
+    # their neighbourhood. Surface lining a crack narrower than a camera is
+    # excluded — not because it does not matter, but because no viewpoint can
+    # reach it, and a goal defined over unreachable surface can never be met
+    # (the loop would run to its cap on every scene and report failure).
+    from scipy import ndimage
+
+    shape = (int(bd[0]), int(bd[1]), int(bd[2]))
+    reach = ndimage.maximum_filter(clear.reshape(shape), size=3).ravel()
+    target = cover & (reach >= params.orb_min_clear)
+    n_target = int(target.sum())
+    k = int(params.orb_measure_rays)
+    if k <= 0:
+        k = int(np.clip(
+            round(2.0 * np.tan(np.radians(params.fov_deg) / 2.0) * _ORB_MEASURE_REF_M / edge),
+            *_ORB_MEASURE_CLAMP,
+        ))
+
+    if progress is not None:
+        progress(0, 0, "orb-measure")
+    seen = _march_bricks(
+        fs, bd, opaque,
+        np.asarray([c["pos"] for c in placed], dtype=np.float64),
+        np.asarray([c["forward"] for c in placed], dtype=np.float64),
+        _up_for(np.asarray([c["forward"] for c in placed], dtype=np.float64)),
+        params, k,
+    ) if placed else np.zeros(len(cover), dtype=np.int32)
+
+    def hit_frac() -> float:
+        if not n_target:
+            return 1.0
+        return float((seen[target] >= params.orb_target_views).sum()) / n_target
+
+    start_frac = hit_frac()
+    n_orbs_max = max(1, params.orb_max_views // max(params.orb_dirs, 1))
+    origins = _orb_origins(clear, bd, fs, lo, hi, n_orbs_max, params)
+
+    cams: list[dict[str, Any]] = []
+    used = 0
+    n_orbs = 0
+    for b0 in range(0, len(origins), _ORB_BATCH):
+        if hit_frac() >= params.orb_target_frac or used >= params.orb_max_views:
+            break
+        batch = origins[b0 : b0 + _ORB_BATCH]
+        pos, fwd = _orb_fan_views(fs, bd, opaque, batch, b0 + params.seed * 7919, params)
+        room = params.orb_max_views - used
+        if len(pos) > room:
+            pos, fwd = pos[:room], fwd[:room]
+        if not len(pos):
+            continue
+        seen += _march_bricks(fs, bd, opaque, pos, fwd, _up_for(fwd), params, k)
+        used += len(pos)
+        n_orbs += len(batch)
+        for p, d in zip(pos, fwd):
+            cams.append({"pos": p, "forward": d, "kind": "orb", "zone": None})
+        if progress is not None:
+            progress(b0 + len(batch), len(origins), "orb")
+
+    stats = {
+        "orbs": n_orbs,
+        "orbs_available": int(len(origins)),
+        "views": len(cams),
+        "target_bricks": n_target,
+        "target_views": params.orb_target_views,
+        "reached_before": round(start_frac, 4),
+        "reached_after": round(hit_frac(), 4),
+        "target_frac": params.orb_target_frac,
+        "median_views": int(np.median(seen[target])) if n_target else 0,
+        "measure_rays": k,
+    }
+    return cams, stats
+
+
 def _up_for(forward: np.ndarray) -> np.ndarray:
     """A non-degenerate image-up per forward direction: world +Y, except near
     the poles where ±Z takes over (straight-down lawn views stay well-posed)."""
@@ -956,6 +1338,12 @@ def plan_cameras(
     sweep_cams = _surface_sweep_cameras(fs, targets, lo, hi, params, scene_diag, culls)
     cams.extend(sweep_cams)
 
+    # 5) ORBS — the free-space dual of the balls, sized by MEASUREMENT against
+    # everything planned above (module docstring). Runs last so it only pays for
+    # the surface the other layers left thin.
+    orb_cams, orb_stats = _plan_orbs(fs, lo, hi, cams, params, progress)
+    cams.extend(orb_cams)
+
     fwd_all = np.asarray([c["forward"] for c in cams], dtype=np.float64)
     up_all = _up_for(fwd_all) if len(cams) else np.zeros((0, 3))
 
@@ -998,7 +1386,9 @@ def plan_cameras(
             "shell": int(len(shell_pos)),
             "flood": int(len(flood_pos)),
             "sweep": len(sweep_cams),
+            "orb": len(orb_cams),
         },
+        "orb": orb_stats,
         "targets": {
             "total": len(targets),
             "framed": len(framed),

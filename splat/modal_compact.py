@@ -1,4 +1,4 @@
-"""Post-hoc occlusion compaction of an EXISTING trained cell, on Modal (A100).
+"""Post-hoc occlusion compaction of an EXISTING trained cell, on Modal.
 
 Runs the Stage-6 §COMPACTION measurement against a cell that already finished
 training: every Gaussian's TOTAL rendered blend weight is accumulated over ALL
@@ -112,7 +112,7 @@ def _diff_models(torch, np, raster, model_a, model_b, views, K, width, height, p
 
 @app.function(
     image=modal_app.image,
-    gpu="A100-40GB",
+    gpu=modal_app.GPU,
     cpu=4.0,
     memory=8192,
     timeout=3600,
@@ -232,7 +232,7 @@ def compact_cell(spec: dict[str, Any]) -> dict[str, Any]:
 
 @app.function(
     image=modal_app.image,
-    gpu="A100-40GB",
+    gpu=modal_app.GPU,
     cpu=4.0,
     memory=8192,
     timeout=7200,
@@ -454,7 +454,7 @@ def slim_cell(spec: dict[str, Any]) -> dict[str, Any]:
 
 @app.function(
     image=modal_app.image,
-    gpu="A100-40GB",
+    gpu=modal_app.GPU,
     cpu=4.0,
     memory=8192,
     timeout=1800,

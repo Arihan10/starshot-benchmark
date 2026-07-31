@@ -92,7 +92,7 @@ from splat import stage5 as splat_stage5  # noqa: E402  (torch-free contract mod
 from splat import stage6 as splat_stage6  # noqa: E402  (torch/gsplat lazy inside)
 from splat import colmap as splat_colmap  # noqa: E402  (torch-free; reuses stage5 codec)
 
-# Client for the Modal GPU pipeline (stages 4-6 on an A100; see splat/modal_app.py).
+# Client for the Modal GPU pipeline (stages 4-6 on the GPU box; see splat/modal_app.py).
 # Guarded: the Modal SDK is a server dep, but a host without it (or without Modal
 # credentials) should still boot — the /splat/modal endpoints then report a clear
 # 'unavailable' instead of 500ing at import.
@@ -313,7 +313,7 @@ _splat_stage6_procs: dict[tuple[str, str, str], dict[str, Any]] = {}
 # Modal pipeline. Same poll-via-`popen.poll()` lifecycle as _splat_stage6_procs.
 _splat_sog_procs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
-# --- Modal remote splat jobs (stages 4-7 on the A100) ------------------------
+# --- Modal remote splat jobs (stages 4-7 on the GPU box) ------------------------
 # One asyncio SUPERVISOR task per cell mirrors the stage-job pattern: it pushes
 # the cell's local inputs to the Modal Volume (content-deduped), spawns
 # `run_cell` over the stage window for the chosen mode ('train' → 4-7 replanning
@@ -2500,7 +2500,7 @@ def _spawn_sog(run: str, slot: str, model: str, which: str) -> dict[str, Any]:
     """Encode one model's .ply → .sog on THIS host via client/tools/ply-to-sog.mjs
     (PlayCanvas' @playcanvas/splat-transform), as a detached, polled child — the
     same async lifecycle as `_spawn_stage6`. Runs on demand from the client, never
-    on the Modal A100."""
+    on the Modal GPU box."""
     src = _sog_source_path(run, slot, model, which)
     if not src.is_file():
         raise HTTPException(status_code=409, detail=f"{which}.ply not on disk — produce it first")
@@ -2551,6 +2551,15 @@ class ModalTrainRequest(BaseModel):
     iterations: int | None = None
     batch: int | None = None
     representation: str | None = None
+    # Stage-6 back-end: "brush" (the upstream Rust/wgpu trainer, the default) or
+    # "gsplat" (the in-house loop). It selects which of the two param sets below
+    # applies — `epochs`/`batch`/`representation` are gsplat-only, `max_splats` is
+    # Brush-only, and `iterations` means the same thing to both (optimizer steps).
+    trainer: str | None = None
+    # Brush's Gaussian ceiling (`--max-splats`). ALSO caps the init: Brush
+    # subsamples the COLMAP point cloud to this count before step 0, so a value
+    # under the Stage-3 surfel count discards part of the surface prior.
+    max_splats: int | None = None
     restart: bool = False
     # "train"    → Modal (re)plans cameras (stage 4) and OVERWRITES the local
     #              plan, then renders + fine-tunes (stages 4-7).
@@ -2567,9 +2576,16 @@ class ModalTrainRequest(BaseModel):
         fields = ("epochs", "iterations", "batch", "representation")
         return {k: v for k in fields if (v := getattr(self, k)) is not None}
 
+    def brush_overrides(self) -> dict[str, Any]:
+        """The set BrushParams overrides, same drop-unset rule as above.
+        `BrushParams.__post_init__` bounds them in the container, so an
+        out-of-range value fails the job rather than being clamped silently."""
+        fields = ("iterations", "max_splats")
+        return {k: v for k in fields if (v := getattr(self, k)) is not None}
+
 
 def _splat_modal_status(run: str, slot: str, model: str) -> dict[str, Any]:
-    """Public state of a cell's Modal train job (stages 4-6 on the A100). Reports
+    """Public state of a cell's Modal train job (stages 4-6 on the GPU box). Reports
     the supervisor's live phase (push / spawn / run / pull) and the container's
     last heartbeat (stage + step/total + message — during training the message is
     the live `loss=… | X it/s` line), or a disk-only view when no job is tracked
@@ -2666,15 +2682,20 @@ async def _run_splat_modal_cell(
             )
 
             job["phase"] = "spawn"
-            job["msg"] = "spawning the A100 job…"
-            # 'continue' feeds the LOCAL plan and runs 5-7; 'train' (re)plans on
-            # the A100 across the full 4-7 window.
-            stages = [5, 6, 7] if continue_mode else _MODAL_STAGES
-            # Forward the client's train overrides VERBATIM — the server adds nothing.
-            train: dict[str, Any] = dict(opts.get("train") or {})
+            job["msg"] = "spawning the GPU job…"
+            trainer = (opts.get("trainer") or "brush")
+            # 'continue' feeds the LOCAL plan and skips stage 4; 'train' (re)plans
+            # on the GPU box. Stage 7 (heal/compact) is the GSPLAT path's delivery
+            # step — it re-optimizes through that rasterizer — so the Brush window
+            # stops at 6, which quantizes its own `.sqz` in place of it.
+            last = 6 if trainer == "brush" else 7
+            first = 5 if continue_mode else _MODAL_STAGES[0]
+            stages = list(range(first, last + 1))
+            # Forward the client's overrides VERBATIM — the server adds nothing.
             call_id = await asyncio.to_thread(
                 splat_modal.spawn_cell, cell_dir, pushed, stages,
-                None, train, None, bool(opts.get("restart")),
+                None, dict(opts.get("train") or {}), None,
+                bool(opts.get("restart")), trainer, dict(opts.get("brush") or {}),
             )
         else:
             # Re-attach: adopt the call the prior process spawned; the job record
@@ -2692,7 +2713,7 @@ async def _run_splat_modal_cell(
         # pulling artifacts as each remote stage commits them to the Volume — so
         # the camera-position + patch overlays and the coverage panel become
         # viewable over the surfel cloud the moment stage 4 finishes, WHILE
-        # stages 5/6 keep running on the A100. run_cell commits at every stage
+        # stages 5/6 keep running on the GPU box. run_cell commits at every stage
         # boundary, and the heartbeat `stage` marks which stage is now live
         # (plan → refs → train → done), so `stage` past "plan" means the camera
         # plan is on the Volume.
@@ -2901,7 +2922,7 @@ async def _reattach_modal_job(run: str, slot: str, model: str) -> bool:
 async def _reattach_all_modal_jobs() -> None:
     """Scan every cell for a persisted Modal job record and re-attach any a prior
     process left running (`_reattach_modal_job`). Run once at startup so a
-    restarted server re-hooks live A100 trains across ALL runs, not just the
+    restarted server re-hooks live GPU trains across ALL runs, not just the
     open one — the container keeps training regardless; this resumes streaming +
     the auto-pull of its result."""
     if splat_modal is None or not RUNS_DIR.exists():
@@ -2990,7 +3011,14 @@ class Stage4Request(BaseModel):
     clamps the scene total (the cost dial); `standoff_min` floors the base
     camera distance (the descent ladder handles tight spaces); `shell_views`
     sizes the root establishing orbit. `fov_deg`/`render_resolution` are the
-    shared single-shot intrinsics."""
+    shared single-shot intrinsics.
+
+    The ORB layer (outward-facing free-space viewpoints — the interior dual of
+    the object shells) sizes itself by MEASUREMENT: it adds orbs until
+    `orb_target_frac` of the reachable surface sees `orb_target_views` cameras,
+    so `orb_max_views` is a ceiling rather than a quota. On a large scene the
+    ceiling is what binds, and the plan summary reports the coverage actually
+    reached either way."""
 
     coverage: float | None = None
     detail_px: float | None = None
@@ -2999,6 +3027,11 @@ class Stage4Request(BaseModel):
     standoff_min: float | None = None
     dedupe_spacing: float | None = None
     shell_views: int | None = None
+    orb: bool | None = None
+    orb_dirs: int | None = None
+    orb_target_views: int | None = None
+    orb_target_frac: float | None = None
+    orb_max_views: int | None = None
     fov_deg: float | None = None
     render_resolution: int | None = None
     seed: int | None = None
@@ -3021,6 +3054,11 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         standoff_min=pick(req.standoff_min, 0.1, 5.0, d.standoff_min),
         dedupe_spacing=pick(req.dedupe_spacing, 0.1, 3.0, d.dedupe_spacing),
         shell_views=int(pick(req.shell_views, 0, 1024, d.shell_views)),
+        orb=d.orb if req.orb is None else bool(req.orb),
+        orb_dirs=int(pick(req.orb_dirs, 6, 128, d.orb_dirs)),
+        orb_target_views=int(pick(req.orb_target_views, 1, 256, d.orb_target_views)),
+        orb_target_frac=pick(req.orb_target_frac, 0.0, 1.0, d.orb_target_frac),
+        orb_max_views=int(pick(req.orb_max_views, 0, 100_000, d.orb_max_views)),
         fov_deg=pick(req.fov_deg, 30.0, 120.0, d.fov_deg),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
         seed=int(pick(req.seed, 0, 2**31 - 1, d.seed)),
@@ -3831,7 +3869,7 @@ def create_app() -> FastAPI:
         # Sticky hook: re-attach to any Modal train a prior process left running
         # (call id persisted per cell in splat/modal-job.json), so a server
         # restart resumes streaming + auto-pulls results instead of orphaning the
-        # live A100 containers. Backgrounded so startup never blocks on Modal.
+        # live GPU containers. Backgrounded so startup never blocks on Modal.
         reattach_task = asyncio.create_task(_reattach_all_modal_jobs())
         try:
             yield
@@ -4323,7 +4361,7 @@ def create_app() -> FastAPI:
             cell["stage4"] = _splat_stage4_status(run, slot, model)
             cell["stage5"] = _splat_stage5_status(run, slot, model)
             cell["stage6"] = _splat_stage6_status(run, slot, model)
-            # The Modal remote-train job (stages 4-6 on the A100). Carried on the
+            # The Modal remote-train job (stages 4-6 on the GPU box). Carried on the
             # same poll the viewer already runs, so its live phase/heartbeat and
             # completion (trained.ply pulled → stage6.url set) flow with no extra
             # client polling.
@@ -5317,7 +5355,7 @@ def create_app() -> FastAPI:
     async def splat_modal_start(  # pyright: ignore[reportUnusedFunction]
         run: str, slot: str, model: str, body: ModalTrainRequest | None = None
     ) -> dict[str, object]:
-        """Splat ONE cell on the Modal A100, in one of two modes (body `mode`):
+        """Splat ONE cell on the Modal GPU box, in one of two modes (body `mode`):
 
           * "train" (default) — Modal (re)plans cameras (stage 4) and OVERWRITES
             the local plan, then renders references, builds the COLMAP model, and
@@ -5377,7 +5415,9 @@ def create_app() -> FastAPI:
             run, slot, model, drop_job_record=True, keep_plan=(mode == "continue")
         )
         opts = {
+            "trainer": (body.trainer if body is not None else None) or "brush",
             "train": body.train_overrides() if body is not None else {},
+            "brush": body.brush_overrides() if body is not None else {},
             "restart": True,  # explicit button press = force fresh
             "mode": mode,
         }
