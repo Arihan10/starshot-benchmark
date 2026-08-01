@@ -37,8 +37,12 @@ export const IDENTITY_TRANSFORM: SplatTransform = {
 	scale: 1,
 };
 
-// Matches the host's CSS backdrop, so the splat's empty space and the page agree.
-const CLEAR = [0.047, 0.051, 0.063] as const;
+// Pure black, matching the host's CSS backdrop so the splat's empty space and the
+// page agree. Four surfaces have to hold the same value for the seam to stay
+// invisible — this canvas, the three.js scene background and inspect clear
+// (engine.ts), and the viewer's own CSS (OrbitViewer / LoadingOverlay). Change one
+// and you change them all.
+const CLEAR = [0, 0, 0] as const;
 
 type Pc = typeof import("playcanvas");
 
@@ -60,6 +64,17 @@ export class SplatLayer {
 	/** Whether a splat is loaded and can be shown. */
 	get ready(): boolean {
 		return !!this.entity;
+	}
+
+	/**
+	 * The layer's own canvas, for compositing a still of the panel.
+	 *
+	 * Readable ONLY inside the frame that drew it: the context is created without
+	 * `preserveDrawingBuffer`, so the backbuffer is undefined once the browser has
+	 * composited. See OrbitEngine.capture, which is why this is exposed at all.
+	 */
+	get canvasEl(): HTMLCanvasElement | null {
+		return this.canvas;
 	}
 
 	get url(): string | null {

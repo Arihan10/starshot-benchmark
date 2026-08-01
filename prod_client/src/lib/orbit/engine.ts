@@ -585,6 +585,8 @@ export class OrbitEngine {
 
 	private readonly renderer: WebGLRenderer;
 	private readonly canvas: HTMLCanvasElement;
+	// Pending `capture()` request, served at the end of the next drawn frame.
+	private captureWaiting: ((c: HTMLCanvasElement | null) => void) | null = null;
 	private readonly travelFade: HTMLDivElement;
 	private readonly iris: HTMLDivElement; // vertical-shaft "hatch" wipe overlay
 	private readonly reticle: HTMLDivElement; // the aim crosshair
@@ -746,7 +748,9 @@ export class OrbitEngine {
 	private mode: OrbitMode = "empty";
 	// Restored whenever the splat is not behind this layer; matches the host's CSS
 	// backdrop so dropping to a transparent background never changes what you see.
-	private readonly bgColor = new Color(0x0c0d10);
+	// See the note by SplatLayer's CLEAR — the same black is spelled out in four
+	// places and they have to agree.
+	private readonly bgColor = new Color(0x000000);
 	private readonly sceneCenter = new Vector3();
 	private sceneMaxDim = 1;
 	// Vertical bounds of the loaded scene, so the waypoint's column cast starts
@@ -958,6 +962,9 @@ export class OrbitEngine {
 	dispose() {
 		this.disposed = true;
 		this.loadToken++;
+		// No further frames will run, so anything awaiting a capture would hang.
+		this.captureWaiting?.(null);
+		this.captureWaiting = null;
 		this.renderer.setAnimationLoop(null);
 		this.ro.disconnect();
 		this.controls.removeEventListener("start", this.onControlsStart);
@@ -4272,7 +4279,7 @@ export class OrbitEngine {
 		this.renderer.setScissorTest(true);
 		this.renderer.setViewport(x, y, ins.w, ins.h);
 		this.renderer.setScissor(x, y, ins.w, ins.h);
-		this.renderer.setClearColor(0x0b0d12, 1);
+		this.renderer.setClearColor(0x000000, 1);
 		this.renderer.clear(true, true, false);
 		this.renderer.render(this.inspectScene, this.inspectCam);
 		this.renderer.setScissorTest(false);
@@ -4514,7 +4521,56 @@ export class OrbitEngine {
 		this.splat.render(this.camera);
 		this.composer.render();
 		this.renderInspect(dt);
+
+		// Served here, at the END of the frame that drew it, because that is the
+		// only moment the pixels exist to be read. Neither context is created with
+		// `preserveDrawingBuffer`, so a caller reading the canvas at an arbitrary
+		// time gets an undefined (usually blank) buffer — and turning that flag on
+		// to make reads work anywhere costs every frame to serve the rare one.
+		if (this.captureWaiting) {
+			const done = this.captureWaiting;
+			this.captureWaiting = null;
+			done(this.composite());
+		}
 	};
+
+	/**
+	 * A still of the panel exactly as drawn — both layers flattened, splat under
+	 * three.js — resolved on the next frame. Used by the arena's shatter, which
+	 * needs real pixels to break into shards; without it the effect degrades to
+	 * anonymous grey tiles.
+	 *
+	 * Resolves null if the engine is disposed before the frame lands, so a caller
+	 * awaiting it during teardown gets an answer rather than hanging.
+	 */
+	capture(): Promise<HTMLCanvasElement | null> {
+		if (this.disposed) return Promise.resolve(null);
+		return new Promise((resolve) => {
+			this.captureWaiting?.(null); // a superseded request never resolves otherwise
+			this.captureWaiting = resolve;
+		});
+	}
+
+	private composite(): HTMLCanvasElement | null {
+		const w = this.canvas.width;
+		const h = this.canvas.height;
+		if (!w || !h) return null;
+		const out = document.createElement("canvas");
+		out.width = w;
+		out.height = h;
+		const ctx = out.getContext("2d");
+		if (!ctx) return null;
+		// The splat sits UNDER the three.js canvas on screen, so it is drawn first
+		// here; three.js renders on a transparent background and lands on top. Its
+		// canvas is sized independently, so both are stretched to one box rather
+		// than blitted 1:1.
+		const splatCanvas = this.splat.canvasEl;
+		if (splatCanvas && this.splatEnabled && splatCanvas.width > 0) {
+			ctx.drawImage(splatCanvas, 0, 0, w, h);
+		}
+		ctx.drawImage(this.canvas, 0, 0, w, h);
+		return out;
+	}
 
 	// One frame of free flight. Velocity EASES toward what the held keys ask for
 	// rather than snapping to it, which is most of what separates flying from

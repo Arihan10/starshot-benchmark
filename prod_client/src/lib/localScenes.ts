@@ -45,6 +45,13 @@ export type LocalCell = {
 	slot: string;
 	/** The LLM that orchestrated this build — the thing under comparison. */
 	model: string;
+	/**
+	 * The model's rating going into this matchup, revealed only after a vote.
+	 * #TODO: hard-coded alongside the cells. Ratings are a property of the
+	 * leaderboard, not of a scene, and they move every time anyone votes — so this
+	 * belongs to whatever serves the pairing, and the vote has to post back to it.
+	 */
+	elo: number;
 	source: TourSource;
 };
 
@@ -55,13 +62,22 @@ export const LOCAL_CELLS: readonly LocalCell[] = [
 	{
 		id: "modern-house-gemini-flash",
 		slot: "modern-house",
-		model: "gemini-flash",
+		model: "Gemini Flash",
+		elo: 2091,
 		source: cellSource("modern-house-gemini-flash"),
 	},
 	{
 		id: "platformer-level-opus-new",
 		slot: "platformer-level",
-		model: "opus-new",
+		model: "Claude Opus",
+		elo: 2108,
 		source: cellSource("platformer-level-opus-new"),
 	},
 ];
+
+/**
+ * What share of previous voters picked the LEFT build, revealed after you vote.
+ * #TODO: hard-coded, and the same shape of lie as `elo` — it comes from the vote
+ * tally for this pairing and should arrive with it.
+ */
+export const LEFT_VOTE_SHARE = 38;

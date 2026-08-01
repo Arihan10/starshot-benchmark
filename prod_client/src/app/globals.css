@@ -10,14 +10,55 @@
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+  /* Named for the ROLE, not the face: markup asks for `font-display` or
+     `font-sans` and the typefaces behind them can change here without touching a
+     single call site. These two are the whole system — there is no third. */
+  --font-display: var(--font-archivo);
+  --font-sans: var(--font-figtree);
 }
 
+/* No font-family here — the `font-sans` utility on <body> sets it, so the
+   document default and the utilities read from one token. This rule used to
+   hard-code Arial (a leftover from the Next starter), which quietly overrode the
+   loaded webfont for every piece of body copy on the site. */
 body {
   background: var(--background);
   color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Arena: the vote result rising into place — the percentage and the reveal cards
+   both arrive this way, so the two readouts read as one moment. */
+@keyframes arena-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* The vote button's chevron, nudging toward the scene it would pick. */
+@keyframes arena-chev-up {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+/* The masthead moon's surface, turning behind the navbar. Only the crater layer
+   spins — see components/Moon.tsx for why the lit disc underneath must not. */
+@keyframes moon-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 /* Continuous 360° pan for the reach preview. The equirect is tiled horizontally

@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useImperativeHandle, useRef, useState, type Ref } from "react";
 import type { TourSource } from "@/lib/orbit/types";
 import type { Scene } from "@/lib/scenes";
 import ArrivalToast from "./orbit/ArrivalToast";
@@ -34,11 +34,22 @@ import { useOrbitEngine } from "./orbit/useOrbitEngine";
  * This component is deliberately only lifecycle + layout. The engine wiring lives
  * in useOrbitEngine; every visual piece owns its own behaviour.
  */
+export type OrbitViewerHandle = {
+	/**
+	 * A still of what the panel is currently showing, both layers flattened.
+	 * Resolves on the next drawn frame — see OrbitEngine.capture for why it cannot
+	 * be synchronous — or null if there is nothing to draw.
+	 */
+	capture: () => Promise<HTMLCanvasElement | null>;
+};
+
 export default function OrbitViewer({
 	scene = null,
 	source = null,
 	onFocusedChange,
+	ref,
 }: {
+	ref?: Ref<OrbitViewerHandle>;
 	// The published path: a catalog row, whose assets resolve through /r2.
 	scene?: Scene | null;
 	// The local path: a source the caller assembled itself (see lib/localScenes).
@@ -51,6 +62,17 @@ export default function OrbitViewer({
 	const rootRef = useRef<HTMLDivElement>(null);
 	const { hostRef, engineRef, state } = useOrbitEngine({ scene, source, onFocusedChange });
 	const { isFullscreen, supported, toggle } = useFullscreen(rootRef);
+
+	// The one thing the outside can ask the engine to DO. Everything else the
+	// viewer exposes is declarative (a scene in, focus out); a still of the current
+	// frame is a request, not a state, so it comes through a handle instead.
+	useImperativeHandle(
+		ref,
+		() => ({
+			capture: () => engineRef.current?.capture() ?? Promise.resolve(null),
+		}),
+		[engineRef],
+	);
 	const [drawer, setDrawer] = useState(false);
 
 	const { mode, minimap, overlay } = state;
@@ -96,7 +118,7 @@ export default function OrbitViewer({
 	}
 
 	return (
-		<div ref={rootRef} className='group relative h-full w-full bg-[#0c0d10]'>
+		<div ref={rootRef} className='group relative h-full w-full bg-black'>
 			<div ref={hostRef} className='absolute inset-0' />
 
 			{supported && <FullscreenButton isFullscreen={isFullscreen} onToggle={toggle} />}

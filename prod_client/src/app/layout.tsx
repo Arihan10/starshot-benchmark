@@ -1,14 +1,21 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Archivo, Figtree } from "next/font/google";
 import "./globals.css";
 
-const geistSans = Geist({
-	variable: "--font-geist-sans",
+// TWO FAMILIES, AND ONLY TWO. Archivo sets anything that is meant to be read as
+// a title; Figtree sets everything else. Neither takes a `weight` because both
+// ship as variable fonts — one file covers the whole range, and asking for named
+// cuts would download more, not less.
+
+// The display face: headings and the wordmark, never body copy.
+const archivo = Archivo({
+	variable: "--font-archivo",
 	subsets: ["latin"],
 });
 
-const geistMono = Geist_Mono({
-	variable: "--font-geist-mono",
+// The text face, and the document default.
+const figtree = Figtree({
+	variable: "--font-figtree",
 	subsets: ["latin"],
 });
 
@@ -28,9 +35,12 @@ export default function RootLayout({
 	return (
 		<html
 			lang="en"
-			className={`${geistSans.variable} ${geistMono.variable} h-full antialiased`}
+			className={`${archivo.variable} ${figtree.variable} h-full antialiased`}
 		>
-			<body className="min-h-full">{children}</body>
+			{/* `font-sans` here rather than a rule in globals.css: it resolves through
+			    the same theme token every `font-sans` utility uses, so the document
+			    default and the utilities can never disagree. */}
+			<body className="min-h-full font-sans">{children}</body>
 		</html>
 	);
 }
