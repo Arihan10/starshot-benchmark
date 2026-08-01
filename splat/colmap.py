@@ -156,15 +156,16 @@ def export_colmap(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     w, h = int(doc["w"]), int(doc["h"])
-    fx, fy, cx, cy = doc["fl_x"], doc["fl_y"], doc["cx"], doc["cy"]
-    (out_dir / CAMERAS_TXT).write_text(
-        "# Camera list with one line of data per camera:\n"
-        "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n"
-        "# Number of cameras: 1\n"
-        f"1 PINHOLE {w} {h} {fx:.10g} {fy:.10g} {cx:.10g} {cy:.10g}\n",
-        encoding="utf-8",
-    )
+    doc_intr = (doc["fl_x"], doc["fl_y"], doc["cx"], doc["cy"])
 
+    # MULTIPLE CAMERAS. Stage 4 derives the FOV per camera from the distance to
+    # what that camera frames, so a plan carries a range of focal lengths and one
+    # shared record would be wrong for most frames. COLMAP models this natively —
+    # each image line names its own CAMERA_ID — so intrinsics are deduped into as
+    # many records as the plan actually uses and each frame points at its own.
+    # A frame with no per-frame intrinsics falls back to the document's, which is
+    # what keeps a pre-per-camera refs dir exporting unchanged.
+    cam_ids: dict[tuple, int] = {}
     records = []
     for i, fr in enumerate(frames, 1):
         src = fr.get("frame_path") or fr.get("file_path")
@@ -174,7 +175,23 @@ def export_colmap(
         w2c = np.linalg.inv(np.asarray(fr["transform_matrix"], dtype=np.float64))
         q = rotmat2qvec(w2c[:3, :3])
         t = w2c[:3, 3]
-        records.append((i, stem, q, t, fr))
+        key = tuple(
+            round(float(fr.get(k, d)), 4)
+            for k, d in zip(("fl_x", "fl_y", "cx", "cy"), doc_intr)
+        )
+        cid = cam_ids.setdefault(key, len(cam_ids) + 1)
+        records.append((i, stem, q, t, fr, cid))
+
+    cam_lines = [
+        "# Camera list with one line of data per camera:\n",
+        "#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n",
+        f"# Number of cameras: {len(cam_ids)}\n",
+    ]
+    for (fx, fy, cx, cy), cid in sorted(cam_ids.items(), key=lambda kv: kv[1]):
+        cam_lines.append(
+            f"{cid} PINHOLE {w} {h} {fx:.10g} {fy:.10g} {cx:.10g} {cy:.10g}\n"
+        )
+    (out_dir / CAMERAS_TXT).write_text("".join(cam_lines), encoding="utf-8")
 
     def _decode(rec: tuple) -> None:
         stem, fr = rec[1], rec[4]
@@ -197,10 +214,10 @@ def export_colmap(
         "#   POINTS2D[] as (X, Y, POINT3D_ID)\n",
         f"# Number of images: {len(records)}, mean observations per image: 0\n",
     ]
-    for i, stem, q, t, _fr in records:
+    for i, stem, q, t, _fr, cid in records:
         img_lines.append(
             f"{i} {q[0]:.10g} {q[1]:.10g} {q[2]:.10g} {q[3]:.10g} "
-            f"{t[0]:.10g} {t[1]:.10g} {t[2]:.10g} 1 {stem}.png\n\n"
+            f"{t[0]:.10g} {t[1]:.10g} {t[2]:.10g} {cid} {stem}.png\n\n"
         )
     (out_dir / IMAGES_TXT).write_text("".join(img_lines), encoding="utf-8")
 
@@ -238,6 +255,6 @@ def export_colmap(
         )
 
     return {
-        "cameras": 1, "images": len(records), "points": int(len(xyz)),
+        "cameras": len(cam_ids), "images": len(records), "points": int(len(xyz)),
         "sidecar": sidecar, "dir": str(out_dir),
     }

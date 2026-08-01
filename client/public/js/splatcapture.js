@@ -423,7 +423,15 @@ async function runCapture() {
         if (!m) throw new Error(`unparseable view id from server: ${vid}`);
         const cam = plan.cameras[Number(m[1])];
         if (!cam || !cam.forward) throw new Error(`view ${vid} not in the camera plan`);
-        queue.push({ id: vid, pos: cam.pos, face: { forward: cam.forward, up: cam.up } });
+        // `cam.fov` is Stage 4's per-camera angle (derived from that camera's own
+        // subject distance); absent on older plans, where the manifest's shared
+        // value the capture was constructed with still applies.
+        queue.push({
+            id: vid,
+            pos: cam.pos,
+            face: { forward: cam.forward, up: cam.up },
+            fov: cam.fov,
+        });
     }
 
     // The render thread does ONLY GPU work + PBO copies; the depth swizzle, SRF1
@@ -474,7 +482,7 @@ async function runCapture() {
         if (queue.length && ring.canEnqueue() && renderedViews - postedViews < maxOutstanding) {
             const v = queue.shift();
             const tr = performance.now();
-            capture.renderView(scene, v.pos, v.face);
+            capture.renderView(scene, v.pos, v.face, v.fov);
             ring.enqueue(v, capture.rtColor, capture.rtDepth);
             buckets.render += performance.now() - tr;
             renderedViews += 1;

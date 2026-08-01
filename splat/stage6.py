@@ -1155,16 +1155,24 @@ def _qvec_to_rotmat(q: np.ndarray) -> np.ndarray:
     )
 
 
-def _read_colmap_cameras(path: Path) -> tuple[np.ndarray, int, int]:
-    """Parse `cameras.txt` → (K [3,3], width, height). Assumes a single shared
-    pinhole camera (what `export_colmap` writes and what the trainer's one shared
-    `K` expects); the first camera record wins if several are present."""
+def _read_colmap_cameras(path: Path) -> tuple[dict[int, np.ndarray], int, int]:
+    """Parse `cameras.txt` → ({camera_id: K [3,3]}, width, height).
+
+    A model can declare MANY cameras, and ours does: Stage 4 derives FOV per
+    camera from the distance to what each one frames, so `export_colmap` dedupes
+    the plan's intrinsics into one record per distinct focal length and every
+    image line names its own. Reading only the first record — which is what this
+    did while one shared `K` was the contract — would silently render most frames
+    at the wrong focal length. All records must share a resolution, since the
+    trainer rasterizes one width/height per batch."""
+    cams: dict[int, np.ndarray] = {}
+    size: tuple[int, int] | None = None
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         parts = line.split()
-        model, w, h = parts[1], int(parts[2]), int(parts[3])
+        cid, model, w, h = int(parts[0]), parts[1], int(parts[2]), int(parts[3])
         p = [float(v) for v in parts[4:]]
         if model in ("PINHOLE", "OPENCV"):
             fx, fy, cx, cy = p[0], p[1], p[2], p[3]
@@ -1172,17 +1180,29 @@ def _read_colmap_cameras(path: Path) -> tuple[np.ndarray, int, int]:
             fx, fy, cx, cy = p[0], p[0], p[1], p[2]
         else:
             raise ValueError(f"{path}: unsupported COLMAP camera model {model!r} (need PINHOLE)")
-        K = np.array([[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64)
-        return K, w, h
-    raise ValueError(f"{path}: no camera record")
+        if size is None:
+            size = (w, h)
+        elif size != (w, h):
+            raise ValueError(
+                f"{path}: cameras disagree on resolution ({size} vs {(w, h)}); the "
+                "trainer rasterizes one frame size per batch"
+            )
+        cams[cid] = np.array(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=np.float64
+        )
+    if not cams or size is None:
+        raise ValueError(f"{path}: no camera record")
+    return cams, size[0], size[1]
 
 
-def _read_colmap_images(path: Path) -> list[tuple[str, np.ndarray]]:
-    """Parse `images.txt` → [(image_name, c2w [4,4]), …] in file order. Each image's
-    pose line is `ID QW QX QY QZ TX TY TZ CAMERA_ID NAME` (world-to-camera); the
-    optional POINTS2D line (empty in our export) is identified by NOT ending in an
-    image name and skipped, so both our export and a standard model parse."""
-    out: list[tuple[str, np.ndarray]] = []
+def _read_colmap_images(path: Path) -> list[tuple[str, np.ndarray, int]]:
+    """Parse `images.txt` → [(image_name, c2w [4,4], camera_id), …] in file order.
+    Each image's pose line is `ID QW QX QY QZ TX TY TZ CAMERA_ID NAME`
+    (world-to-camera); the optional POINTS2D line (empty in our export) is
+    identified by NOT ending in an image name and skipped, so both our export and
+    a standard model parse. The CAMERA_ID is carried because a model may declare
+    several intrinsics and each image names the one it was shot with."""
+    out: list[tuple[str, np.ndarray, int]] = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
         s = line.strip()
         if not s or s.startswith("#"):
@@ -1195,7 +1215,7 @@ def _read_colmap_images(path: Path) -> list[tuple[str, np.ndarray]]:
         w2c = np.eye(4, dtype=np.float64)
         w2c[:3, :3] = _qvec_to_rotmat(q)
         w2c[:3, 3] = t
-        out.append((parts[9], np.linalg.inv(w2c)))
+        out.append((parts[9], np.linalg.inv(w2c), int(parts[8])))
     return out
 
 
@@ -1546,11 +1566,16 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, st
             d += 1
 
     def decode_batch(idx_gen) -> tuple:  # noqa: ANN001 - CPU tensors, stacked to [B,...]
-        vms, rgbs, alphas, depths = [], [], [], []
+        vms, ks, rgbs, alphas, depths = [], [], [], [], []
         for _ in range(batch):
             v = views[next(idx_gen)]
             rgb, alpha, d = _view_arrays(v)
             vms.append(v["viewmat"])
+            # Intrinsics travel WITH the view, not beside the batch: Stage 4
+            # derives each camera's FOV from the distance to what it frames, so
+            # the focal length varies frame to frame and one shared K would be
+            # wrong for most of them.
+            ks.append(v["K"])
             rgbs.append(torch.from_numpy(np.ascontiguousarray(rgb)))
             alphas.append(torch.from_numpy(np.ascontiguousarray(alpha)))
             if d is not None:
@@ -1564,12 +1589,16 @@ def _view_stream(torch, views, device, batch: int, prefetch: bool, seed: int, st
         def _fin(t):  # noqa: ANN001, ANN202
             return t.pin_memory() if (pin and t is not None) else t
 
-        return _fin(torch.stack(vms)), _fin(torch.stack(rgbs)), _fin(torch.stack(alphas)), _fin(depth)
+        return (
+            _fin(torch.stack(vms)), _fin(torch.stack(ks)),
+            _fin(torch.stack(rgbs)), _fin(torch.stack(alphas)), _fin(depth),
+        )
 
     def to_dev(b) -> tuple:  # noqa: ANN001
-        vm, rgb, alpha, depth = b
+        vm, ks, rgb, alpha, depth = b
         return (
             vm.to(device, non_blocking=True),
+            ks.to(device, non_blocking=True),
             rgb.to(device, non_blocking=True),
             alpha.to(device, non_blocking=True),
             depth.to(device, non_blocking=True) if depth is not None else None,
@@ -1987,13 +2016,19 @@ def _assign_views(  # noqa: ANN001
     return assigned
 
 
-def _unproject_depth(torch, gt_depth, viewmats, K, px, py):  # noqa: ANN001
+def _unproject_depth(torch, gt_depth, viewmats, Ks, px, py):  # noqa: ANN001
     """Reference depth → world points [B,H,W,3] (OpenCV pinhole; `px`/`py` are the
     precomputed pixel-centre grids). Zero-depth (background) pixels land at the
-    camera centre — callers gate on depth > 0."""
+    camera centre — callers gate on depth > 0. `Ks` is PER VIEW [B,3,3]: focal
+    length varies frame to frame (Stage 4 derives FOV per camera), so unprojecting
+    a batch through one shared K would place most of it at the wrong scale."""
     d = gt_depth[..., 0]
-    x = (px[None] - K[0, 2]) / K[0, 0] * d
-    y = (py[None] - K[1, 2]) / K[1, 1] * d
+    fx = Ks[:, 0, 0][:, None, None]
+    fy = Ks[:, 1, 1][:, None, None]
+    cx = Ks[:, 0, 2][:, None, None]
+    cy = Ks[:, 1, 2][:, None, None]
+    x = (px[None] - cx) / fx * d
+    y = (py[None] - cy) / fy * d
     p_cam = torch.stack([x, y, d], dim=-1)
     c2w = torch.linalg.inv(viewmats)
     return torch.einsum("bhwc,brc->bhwr", p_cam, c2w[:, :3, :3]) + c2w[:, None, None, :3, 3]
@@ -2635,6 +2670,20 @@ def _load_scene(torch, refs_dir: Path, device):  # noqa: ANN001
         dtype=torch.float32,
         device=device,
     )
+
+    def _frame_K(fr: dict[str, Any]):  # noqa: ANN202 - CPU [3,3], stacked per batch
+        """That frame's own intrinsics, falling back to the document's. Stage 5
+        writes per-frame `fl_x`/`fl_y`/`cx`/`cy` because Stage 4 derives FOV per
+        camera; a refs dir written before that carries none and every frame
+        resolves to the shared values, so old sets train exactly as before."""
+        fx = float(fr.get("fl_x", doc["fl_x"]))
+        fy = float(fr.get("fl_y", doc["fl_y"]))
+        cx = float(fr.get("cx", doc["cx"]))
+        cy = float(fr.get("cy", doc["cy"]))
+        return torch.tensor(
+            [[fx, 0.0, cx], [0.0, fy, cy], [0.0, 0.0, 1.0]], dtype=torch.float32
+        )
+
     depth_near = float(doc["near"]) if "near" in doc else None
     depth_far = float(doc["far"]) if "far" in doc else None
     views: list[dict[str, Any]] = []
@@ -2652,6 +2701,7 @@ def _load_scene(torch, refs_dir: Path, device):  # noqa: ANN001
         views.append(
             {
                 "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
+                "K": _frame_K(fr),
                 "c2w": c2w,
                 "frame": refs_dir / frame_rel if frame_rel else None,
                 "rgb": refs_dir / rgb_rel if rgb_rel else None,
@@ -2674,10 +2724,22 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
     Image names resolve against the model dir (flat, as `export_colmap` writes) or
     an `images/` subdir (a standard COLMAP layout)."""
     colmap_dir = Path(colmap_dir)
-    K_np, width, height = _read_colmap_cameras(colmap_dir / "cameras.txt")
+    cams_np, width, height = _read_colmap_cameras(colmap_dir / "cameras.txt")
     images = _read_colmap_images(colmap_dir / "images.txt")
     pts_xyz, pts_rgb = _read_colmap_points(colmap_dir / "points3D.txt")
-    K = torch.tensor(K_np, dtype=torch.float32, device=device)
+    cam_K = {
+        cid: torch.tensor(m, dtype=torch.float32) for cid, m in cams_np.items()
+    }
+    # The representative K, for the scene-scale and anti-aliasing arithmetic that
+    # wants ONE focal length. The median rather than the first record, so a plan
+    # with a range of angles is characterized by its middle instead of by whichever
+    # camera happened to be written first.
+    med = float(np.median([m[0, 0] for m in cams_np.values()]))
+    K = torch.tensor(
+        np.array([[med, 0.0, width / 2.0], [0.0, med, height / 2.0], [0.0, 0.0, 1.0]]),
+        dtype=torch.float32,
+        device=device,
+    )
 
     frames_dir = suffix = near = far = None
     sidecar_path = colmap_dir / _SIDECAR_NAME
@@ -2689,12 +2751,17 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
 
     views: list[dict[str, Any]] = []
     centers: list[np.ndarray] = []
-    for name, c2w in images:
+    for name, c2w, cid in images:
         img = colmap_dir / name
         if not img.is_file():
             img = colmap_dir / "images" / name
         if not img.is_file():
             raise FileNotFoundError(f"{colmap_dir}: image '{name}' from images.txt not found")
+        if cid not in cam_K:
+            raise ValueError(
+                f"{colmap_dir}: image '{name}' names CAMERA_ID {cid}, which cameras.txt "
+                "does not declare"
+            )
         frame = None
         if frames_dir is not None:
             f = frames_dir / (Path(name).stem + suffix)
@@ -2704,6 +2771,7 @@ def _load_colmap(torch, colmap_dir: Path, device):  # noqa: ANN001, ANN202
         views.append(
             {
                 "viewmat": torch.from_numpy(np.linalg.inv(c2w).astype(np.float32)),
+                "K": cam_K[cid],
                 "c2w": c2w,
                 "frame": frame,
                 "rgb": img,
@@ -3055,14 +3123,17 @@ class _Render(NamedTuple):
     info: dict               # the rasterizer's meta dict (densification reads it)
 
 
-def _render_batch(torch, raster, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on):  # noqa: ANN001
+def _render_batch(torch, raster, splats, colors, sh_deg, viewmats, Ks, width, height, params, dist_on):  # noqa: ANN001
     """One gsplat forward for a batch of views — the single render call every part
     of the stage goes through (training loop, heal, contribution measure, eval), so
     all of them necessarily agree on the operator.
 
     `raster` is `_rasterizer(params)`. The two entrypoints differ in their return
     arity (3 vs 7) and in three kwargs each doesn't accept, which is the whole
-    reason this wrapper exists: it hands back a `_Render` either way."""
+    reason this wrapper exists: it hands back a `_Render` either way.
+
+    `Ks` is PER VIEW [B,3,3], matching `viewmats` — gsplat takes per-camera
+    intrinsics natively, and Stage 4 varies FOV per camera."""
     common = dict(
         means=splats["means"],
         quats=splats["quats"],
@@ -3070,7 +3141,7 @@ def _render_batch(torch, raster, splats, colors, sh_deg, viewmats, K, width, hei
         opacities=torch.sigmoid(splats["opacities"]),
         colors=colors,
         viewmats=viewmats,
-        Ks=K.unsqueeze(0).expand(viewmats.shape[0], -1, -1),
+        Ks=Ks,
         width=width,
         height=height,
         sh_degree=sh_deg,
@@ -3284,12 +3355,12 @@ def _contribution_weights(  # noqa: ANN001
     b = max(int(params.batch), 1)
     n_batches = (len(views) + b - 1) // b
     for bi, lo in enumerate(range(0, len(views), b)):
-        viewmats = torch.stack(
-            [views[i]["viewmat"] for i in range(lo, min(lo + b, len(views)))]
-        ).to(device)
+        sel = range(lo, min(lo + b, len(views)))
+        viewmats = torch.stack([views[i]["viewmat"] for i in sel]).to(device)
+        Ks = torch.stack([views[i]["K"] for i in sel]).to(device)
         colors, sh_deg = _render_inputs(torch, shadow, params.sh_degree)
         render = _render_batch(
-            torch, raster, shadow, colors, sh_deg, viewmats, K,
+            torch, raster, shadow, colors, sh_deg, viewmats, Ks,
             width, height, params, dist_on=False,
         )
         render.rgb.sum().backward()
@@ -3389,14 +3460,14 @@ def _heal(  # noqa: ANN001
     stream = _view_stream(torch, views, device, b, params.prefetch, params.seed, 0, stop=stop_ev)
     try:
         for step in range(int(steps)):
-            viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
+            viewmats, Ks, gt_rgb, gt_alpha, gt_depth = next(stream)
             mask = None
             if box_lo is not None and gt_depth is not None:
-                world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
+                world = _unproject_depth(torch, gt_depth, viewmats, Ks, px_grid, py_grid)
                 mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
             colors, sh_deg = _render_inputs(torch, splats, params.sh_degree)
             render = _render_batch(
-                torch, raster, splats, colors, sh_deg, viewmats, K,
+                torch, raster, splats, colors, sh_deg, viewmats, Ks,
                 width, height, params, dist_on=False,
             )
             loss = _supervision_loss(
@@ -3761,7 +3832,7 @@ def _train_one(  # noqa: ANN001
 
     for step in range(start_step, params.iterations):
         _t_data = time.perf_counter()
-        viewmats, gt_rgb, gt_alpha, gt_depth = next(stream)
+        viewmats, Ks, gt_rgb, gt_alpha, gt_depth = next(stream)
         prof["data"] += time.perf_counter() - _t_data
         sample = (step - start_step) % _PROFILE_EVERY == 0
         if sample:
@@ -3772,13 +3843,13 @@ def _train_one(  # noqa: ANN001
         # background (exact ownership from the reference depth).
         mask = None
         if box_lo is not None and gt_depth is not None:
-            world = _unproject_depth(torch, gt_depth, viewmats, K, px_grid, py_grid)
+            world = _unproject_depth(torch, gt_depth, viewmats, Ks, px_grid, py_grid)
             mask = _tile_mask(torch, box_lo, box_hi, gt_alpha, gt_depth, world)
 
         active_sh = min(params.sh_degree, step // max(params.sh_degree_interval, 1))
         colors, sh_deg = _render_inputs(torch, splats, active_sh)
         render = _render_batch(
-            torch, raster, splats, colors, sh_deg, viewmats, K, width, height, params, dist_on
+            torch, raster, splats, colors, sh_deg, viewmats, Ks, width, height, params, dist_on
         )
         info = render.info
         if sample:
@@ -3799,7 +3870,7 @@ def _train_one(  # noqa: ANN001
             with torch.no_grad():
                 ref = _render_batch(
                     torch, raster, ref_splats, ref_colors, 0,
-                    viewmats, K, width, height, params, False,
+                    viewmats, Ks, width, height, params, False,
                 )
             ed_target = ref.expected
             ed_gate = ref.alpha > 0.5
@@ -4057,7 +4128,8 @@ def _evaluate(torch, raster, splats, views, K, width, height, params, device):  
             gt_rgb, gt_alpha, gt_depth = _load_view(torch, v, device)
             render = _render_batch(
                 torch, raster, splats, colors, sh_deg,
-                v["viewmat"].to(device).unsqueeze(0), K, width, height, params,
+                v["viewmat"].to(device).unsqueeze(0),
+                v["K"].to(device).unsqueeze(0), width, height, params,
                 dist_on=False,
             )
             pred_rgb = render.rgb.clamp(0, 1)

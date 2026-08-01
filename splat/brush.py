@@ -19,11 +19,22 @@ branch (v0.3.0 spells the step count `--total-steps`; main renamed it
 `--total-train-iters`), so `modal_app.BRUSH_VERSION` and this module move
 together and the version is folded into the stage-6 cache signature.
 
-INIT: Brush seeds from the COLMAP `points3D.txt` - position + colour only, with
-its own KNN scale init. It does NOT read the Stage-3 surfel orientations,
-opacities or glass alphas the way `stage6.train_splat`'s "surfels" init does.
-That is deliberate (it reproduces the validated standalone Brush result), and it
-is why `_assert_no_ply` below is load-bearing rather than paranoia.
+INIT: either seed, selected by `BrushParams.init`, exactly as on the gsplat path.
+
+  * "points" (the DEFAULT) takes the COLMAP `points3D.txt`, which carries only
+    xyz + 8-bit RGB, so Brush KNN-guesses isotropic scales, random rotations and
+    a flat opacity. This is the configuration validated standalone.
+  * "surfels" hands Brush the Stage-3 cloud itself, keeping the mesh-exact disc
+    orientation, per-surfel radius, full-precision SH0 colour and the authored
+    opacity (glass included, at alpha ~0.065). `_write_surfel_init` CONVERTS
+    rather than copies, because a Stage-3 cloud is 2DGS.
+
+The seed reaches Brush as a file literally named `init.ply` inside the dataset
+dir, which its loader prefers over `points3D.txt` - the very hijack
+`_assert_no_ply` exists to catch. That is why the guard runs BEFORE the
+deliberate write and the file is cleared again afterwards: an intentional seed
+and a stray export from a previous run are indistinguishable to Brush, so the
+only safe arrangement is for this module to own that filename outright.
 
 TWO SHARP EDGES in v0.3.0, both handled as preflight rather than found mid-run:
 
@@ -89,13 +100,43 @@ class BrushParams:
     # quantity `stage6.TrainParams.iterations` and PostShot's step box mean.
     iterations: int = 30_000
 
+    # GROWTH WINDOW, as a fraction of the run. Brush's own knob is the ABSOLUTE
+    # step `--growth-stop-iter`, default 15000 against its 30000-step default --
+    # i.e. a 50/50 split between GROWING the model (new Gaussians spawned every
+    # `refine_every` steps where screen-space gradients ask for detail) and
+    # SETTLING it (positions/colour/opacity converging, population frozen).
+    #
+    # Because it is absolute, it does not follow `iterations`, and both ends of
+    # that break badly. A 15k run grows for every single step and never settles.
+    # A 100k run stops growing at 15% and spends the other 85k steps in pure
+    # relocation churn -- pruning and MCMC relocation keep firing every 200 steps
+    # with nothing growing back, and since relocation samples WEIGHTED BY OPACITY
+    # and splits what it picks (`new_opac = 1 - sqrt(1 - opac)`), it bleeds
+    # opacity out of exactly the large opaque surfaces. Measured on
+    # compare/modern-house at 100k steps: median splat opacity 0.298 and 45% of
+    # surface area compositing below alpha 0.9, i.e. visibly see-through walls
+    # and floors, with coverage otherwise healthy.
+    #
+    # Deriving it from `iterations` keeps the reference proportion at any length,
+    # so the step count is safe to turn in either direction. `growth_stop_iter`
+    # pins an absolute step instead, for reproducing an upstream run exactly.
+    growth_stop_frac: float = 0.5
+    growth_stop_iter: int | None = None
+
     # Gaussian ceiling -> `--max-splats`. Brush's MCMC-style refinement treats it
     # as an upper bound and may finish under it.
     #
-    # IT ALSO SUBSAMPLES THE INIT: `train_stream.rs` runs `data.subsample(max_splats)`
-    # on the point cloud BEFORE the first step, so a value below the Stage-3
-    # surfel count silently discards part of the mesh-exact surface prior. The
-    # client warns at that boundary rather than the number being a free knob.
+    # IT ONLY BOUNDS GROWTH, AND ONLY WHILE THE MODEL IS UNDER IT. v0.3.0 feeds
+    # the COLMAP points straight in as the init with no ceiling of its own (that
+    # subsample landed on `main` later), and the growth clamp in `refine_if_needed`
+    # is `sample_high_grad.min(max_splats - cur_splats)` over u32 -- so once the
+    # count is ALREADY above the ceiling that subtraction wraps to ~4.29e9 in a
+    # release build and the clamp silently becomes a no-op. An init larger than
+    # this value therefore doesn't just start over budget, it REMOVES the budget:
+    # measured on compare/modern-house, a 1,060,020-surfel init against
+    # max_splats=1,000,000 grew unchecked to 3,281,637 until `growth_stop_iter`
+    # stopped it. `_init_subsample` thins the init under the ceiling before launch,
+    # which is what makes this a real cap (and so a real cost lever).
     max_splats: int = 10_000_000
 
     # View-dependent colour. Capped at 3 because the downstream reader
@@ -118,22 +159,70 @@ class BrushParams:
     eval_split_every: int | None = None
     eval_every: int = 2_000
 
-    # Keep every Nth init point. Thins a dense Stage-3 cloud without touching
-    # `max_splats` (which also caps the trained model).
+    # Keep every Nth init point. None = derive it from `max_splats` (see
+    # `_init_subsample`); set an int to thin the init explicitly regardless.
     subsample_points: int | None = None
+
+    # SEED. "points" (default) hands Brush the COLMAP `points3D.txt`, which is
+    # only xyz + 8-bit RGB -- Brush then KNN-guesses isotropic scales, random
+    # rotations and a flat opacity. "surfels" instead hands it the Stage-3 cloud
+    # itself as `init.ply`, keeping the mesh-exact disc orientation, per-surfel
+    # radius, full-precision SH0 colour and the authored opacity (including glass
+    # at alpha ~0.065). See `_write_surfel_init` for why that needs a conversion
+    # rather than a copy.
+    #
+    # "points" stays the default because it is the configuration validated
+    # standalone; "surfels" is the A/B, mirroring `stage6.TrainParams.init`.
+    init: str = "points"
+
+    # Third-axis thickness for the surfel seed, as a fraction of the tangent
+    # radius (Stage-3 clouds are FLAT -- two scales). Matches
+    # `TrainParams.init_thickness_frac`: a ~3 mm shell on a 3 cm surfel, thin
+    # enough to read as a surface from step 0, thick enough to carry gradient.
+    init_thickness_frac: float = 0.1
+
+    # Opacity ceiling for the surfel seed. Stage 3 clamps alpha at 1-1e-3, i.e.
+    # logit ~6.9, where the sigmoid gradient is ~1e-3 and opacity is effectively
+    # FROZEN. That matters more to Brush than it did to gsplat: its MCMC prunes
+    # below 2/255, gates the exploration noise on low opacity, and regularizes
+    # opacity downward -- all of which need opacity to actually move. 0.9
+    # (logit ~2.2) renders solid from step 0 while staying trainable, and being a
+    # ceiling it leaves authored glass untouched.
+    init_opa_max: float = 0.9
 
     seed: int = 42
 
     def __post_init__(self) -> None:
         if self.iterations < 1:
             raise ValueError(f"iterations must be >= 1, got {self.iterations}")
+        if not 0.0 < self.growth_stop_frac <= 1.0:
+            raise ValueError(
+                f"growth_stop_frac must be in (0, 1], got {self.growth_stop_frac}"
+            )
+        if self.growth_stop_iter is not None and self.growth_stop_iter < 1:
+            raise ValueError(
+                f"growth_stop_iter must be >= 1 when set, got {self.growth_stop_iter}"
+            )
         if self.max_splats < 1:
             raise ValueError(f"max_splats must be >= 1, got {self.max_splats}")
+        if self.init not in ("points", "surfels"):
+            raise ValueError(
+                f"init must be 'points' or 'surfels', got {self.init!r}"
+            )
+        if not 0 < self.init_opa_max < 1:
+            raise ValueError(f"init_opa_max must be in (0, 1), got {self.init_opa_max}")
         if not 0 <= self.sh_degree <= 3:
             raise ValueError(
                 f"sh_degree must be within 0..3 (the downstream .ply reader decodes "
                 f"degree 3 at most), got {self.sh_degree}"
             )
+
+    def resolved_growth_stop_iter(self) -> int:
+        """The absolute step Brush should stop growing at: the explicit override
+        when set, else `growth_stop_frac` of the run (see the field docs)."""
+        if self.growth_stop_iter is not None:
+            return self.growth_stop_iter
+        return max(1, round(self.iterations * self.growth_stop_frac))
 
     def as_summary(self) -> dict[str, Any]:
         return asdict(self)
@@ -172,6 +261,78 @@ def _pad_small_images(colmap_dir: Path) -> int:
             img.save(p, format="PNG", compress_level=1, pnginfo=meta)
         padded += 1
     return padded
+
+
+def _points3d_count(colmap_dir: Path) -> int:
+    """Number of init points in the COLMAP model (data lines of `points3D.txt`)."""
+    path = colmap_dir / "points3D.txt"
+    if not path.is_file():
+        return 0
+    n = 0
+    with path.open("rb") as f:
+        for line in f:
+            if line.strip() and not line.startswith(b"#"):
+                n += 1
+    return n
+
+
+def _init_subsample(colmap_dir: Path, params: BrushParams) -> int | None:
+    """The `--subsample-points` stride needed to bring the init under
+    `max_splats`, or None when it already fits (or the caller pinned a stride).
+
+    This exists because `max_splats` cannot defend itself. Brush v0.3.0 loads the
+    COLMAP points uncapped and its growth clamp underflows once the count is over
+    the ceiling (see `BrushParams.max_splats`), so an oversized init doesn't just
+    ignore the cap, it disables it. Thinning here is the only point at which the
+    ceiling can still be made true, and it keeps the requested count meaningful as
+    a cost lever rather than a suggestion.
+
+    Brush thins with `step_by`, so this trades surface-prior density for a
+    reachable budget. Raising `max_splats` above the Stage-3 cloud size is the way
+    to keep every seed."""
+    if params.subsample_points is not None:
+        return params.subsample_points
+    n = _points3d_count(colmap_dir)
+    if n <= params.max_splats:
+        return None
+    return -(-n // params.max_splats)  # ceil, so the kept count lands under the cap
+
+
+def _write_surfel_init(cloud_ply: Path, out_ply: Path, params: BrushParams) -> int:
+    """Convert the Stage-3 surfel cloud into the `init.ply` Brush adopts as its
+    seed, returning the surfel count.
+
+    This is a CONVERSION, not a copy, for one reason: a Stage-3 cloud is 2DGS and
+    carries only `scale_0`/`scale_1`, while Brush's `PlyGaussian` declares
+    `scale_2` as `#[serde(default)]`. A missing third scale therefore reads as
+    0.0 -- and scales are stored as LOGS, so every surfel would arrive as a
+    1-metre-thick slab. `_load_cloud` synthesizes that axis off the smaller
+    tangent radius (Stage 3 aligns the quaternion's local +Z to the surface
+    normal, so it IS the thickness direction), and the opacity ceiling keeps the
+    seed trainable -- see `BrushParams.init_opa_max`.
+
+    Everything else transfers as-is: means, quaternions, log tangent radii and
+    the degree-0 `f_dc` colour. Brush expands SH to `sh_degree` with zeros in the
+    higher bands, so the seed starts view-independent and learns from there."""
+    import math
+
+    import numpy as np
+
+    from splat.stage6 import _encode_trained_ply, _load_cloud
+
+    arrays = _load_cloud(cloud_ply, thickness_frac=params.init_thickness_frac)
+    ceiling = math.log(params.init_opa_max / (1.0 - params.init_opa_max))
+    opacity = np.minimum(arrays["opacities"], np.float32(ceiling))
+    out_ply.parent.mkdir(parents=True, exist_ok=True)
+    _encode_trained_ply(
+        arrays["means"],
+        arrays["quats"],
+        arrays["sh0"][:, 0, :],
+        opacity,
+        arrays["scales"],
+        out_ply,
+    )
+    return int(arrays["means"].shape[0])
 
 
 def _progress_path(out_path: Path) -> Path:
@@ -229,6 +390,7 @@ def train_brush(
     model: str,
     colmap_dir: Path,
     out_path: Path,
+    init_ply: Path | None = None,
     params: BrushParams = BrushParams(),
     brush_bin: str = "/usr/local/bin/brush",
     resume: bool = True,
@@ -260,6 +422,27 @@ def train_brush(
     if padded := _pad_small_images(colmap_dir):
         emit(0, params.iterations, f"padded {padded} undersized reference image(s)")
 
+    # The surfel seed is written INTO the dataset dir, which is the very hijack
+    # `_assert_no_ply` guards -- so it goes in deliberately, after that check.
+    # A resume overwrites it below: a partially trained model is a strictly
+    # better seed than the raw surfels.
+    if params.init == "surfels":
+        if init_ply is None or not Path(init_ply).is_file():
+            raise FileNotFoundError(
+                f"init='surfels' needs the Stage-3 cloud, got {init_ply!r}"
+            )
+        n = _write_surfel_init(Path(init_ply), colmap_dir / _INIT_PLY, params)
+        emit(0, params.iterations, f"seeding from {n:,} Stage-3 surfels")
+
+    subsample = _init_subsample(colmap_dir, params)
+    if subsample is not None and params.subsample_points is None:
+        kept = _points3d_count(colmap_dir) // subsample
+        emit(
+            0, params.iterations,
+            f"init cloud exceeds max_splats -- keeping every {subsample}th point "
+            f"(~{kept:,} of {_points3d_count(colmap_dir):,})",
+        )
+
     start_iter = _resume_from(out_path, colmap_dir, params) if resume else 0
     if not resume:
         _progress_path(out_path).unlink(missing_ok=True)
@@ -269,6 +452,8 @@ def train_brush(
     cmd = [
         brush_bin, str(colmap_dir),
         "--total-steps", str(params.iterations),
+        # Derived, not Brush's absolute default -- see BrushParams.growth_stop_frac.
+        "--growth-stop-iter", str(params.resolved_growth_stop_iter()),
         "--max-splats", str(params.max_splats),
         "--sh-degree", str(params.sh_degree),
         "--max-resolution", str(params.max_resolution),
@@ -282,8 +467,8 @@ def train_brush(
         cmd += ["--start-iter", str(start_iter)]
     if params.eval_split_every is not None:
         cmd += ["--eval-split-every", str(params.eval_split_every)]
-    if params.subsample_points is not None:
-        cmd += ["--subsample-points", str(params.subsample_points)]
+    if subsample is not None:
+        cmd += ["--subsample-points", str(subsample)]
     print(f"$ {' '.join(cmd)}", flush=True)
 
     state: dict[str, Any] = {
@@ -372,6 +557,10 @@ def train_brush(
         "cell": f"{run}/{slot}/{model}",
         "iterations": params.iterations,
         "resumed_from": start_iter,
+        "init": params.init,
+        "growth_stop_iter": params.resolved_growth_stop_iter(),
+        "max_splats": params.max_splats,
+        "init_subsample": subsample,
         "splats": splats,
         "views": state["views"],
         "eval_views": state["eval_views"],

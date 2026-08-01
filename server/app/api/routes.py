@@ -2556,10 +2556,14 @@ class ModalTrainRequest(BaseModel):
     # applies — `epochs`/`batch`/`representation` are gsplat-only, `max_splats` is
     # Brush-only, and `iterations` means the same thing to both (optimizer steps).
     trainer: str | None = None
-    # Brush's Gaussian ceiling (`--max-splats`). ALSO caps the init: Brush
-    # subsamples the COLMAP point cloud to this count before step 0, so a value
-    # under the Stage-3 surfel count discards part of the surface prior.
+    # Brush's Gaussian ceiling (`--max-splats`). Brush enforces it on growth
+    # only, so an init already above it is thinned server-side to keep the cap
+    # meaningful — a value under the Stage-3 surfel count costs surface prior.
     max_splats: int | None = None
+    # Brush's seed: "points" (the COLMAP points3D — xyz + 8-bit colour, the
+    # validated default) or "surfels" (the Stage-3 cloud itself, keeping disc
+    # orientation, radius, full-precision colour and authored glass opacity).
+    init: str | None = None
     restart: bool = False
     # "train"    → Modal (re)plans cameras (stage 4) and OVERWRITES the local
     #              plan, then renders + fine-tunes (stages 4-7).
@@ -2580,7 +2584,7 @@ class ModalTrainRequest(BaseModel):
         """The set BrushParams overrides, same drop-unset rule as above.
         `BrushParams.__post_init__` bounds them in the container, so an
         out-of-range value fails the job rather than being clamped silently."""
-        fields = ("iterations", "max_splats")
+        fields = ("iterations", "max_splats", "init")
         return {k: v for k in fields if (v := getattr(self, k)) is not None}
 
 
@@ -3013,12 +3017,11 @@ class Stage4Request(BaseModel):
     sizes the root establishing orbit. `fov_deg`/`render_resolution` are the
     shared single-shot intrinsics.
 
-    The ORB layer (outward-facing free-space viewpoints — the interior dual of
-    the object shells) sizes itself by MEASUREMENT: it adds orbs until
-    `orb_target_frac` of the reachable surface sees `orb_target_views` cameras,
-    so `orb_max_views` is a ceiling rather than a quota. On a large scene the
-    ceiling is what binds, and the plan summary reports the coverage actually
-    reached either way."""
+    The ORB layer is the interior dual of the object shells: geometrically
+    enclosed free-space stations proposing six 90° cube faces. It optimizes
+    residual DISTINCT-STATION coverage left after BALL/SWEEP/SHELL, retaining
+    only faces with marginal value; `orb_max_views` is a safety ceiling rather
+    than the ordinary stopping condition."""
 
     coverage: float | None = None
     detail_px: float | None = None
@@ -3028,10 +3031,21 @@ class Stage4Request(BaseModel):
     dedupe_spacing: float | None = None
     shell_views: int | None = None
     orb: bool | None = None
-    orb_dirs: int | None = None
-    orb_target_views: int | None = None
-    orb_target_frac: float | None = None
+    orb_min_clear: float | None = None
+    orb_candidate_spacing: float | None = None
+    orb_candidate_cap: int | None = None
+    orb_enclosure_min: float | None = None
+    orb_escape_dirs: int | None = None
+    orb_target_stations: int | None = None
+    orb_min_face_gain: float | None = None
     orb_max_views: int | None = None
+    # FOV is DERIVED per camera from the distance to what that camera frames
+    # (wide for a wall a metre off, narrow for a facade thirty metres out).
+    # `fov_deg` is only used when `fov_derive` is false.
+    fov_derive: bool | None = None
+    fov_min_deg: float | None = None
+    fov_max_deg: float | None = None
+    fov_ref_px: float | None = None
     fov_deg: float | None = None
     render_resolution: int | None = None
     seed: int | None = None
@@ -3055,10 +3069,22 @@ def _stage4_params(req: Stage4Request | None) -> splat_stage4.PlanParams:
         dedupe_spacing=pick(req.dedupe_spacing, 0.1, 3.0, d.dedupe_spacing),
         shell_views=int(pick(req.shell_views, 0, 1024, d.shell_views)),
         orb=d.orb if req.orb is None else bool(req.orb),
-        orb_dirs=int(pick(req.orb_dirs, 6, 128, d.orb_dirs)),
-        orb_target_views=int(pick(req.orb_target_views, 1, 256, d.orb_target_views)),
-        orb_target_frac=pick(req.orb_target_frac, 0.0, 1.0, d.orb_target_frac),
+        orb_min_clear=pick(req.orb_min_clear, 0.03, 2.0, d.orb_min_clear),
+        orb_candidate_spacing=pick(
+            req.orb_candidate_spacing, 0.25, 5.0, d.orb_candidate_spacing
+        ),
+        orb_candidate_cap=int(pick(req.orb_candidate_cap, 64, 50_000, d.orb_candidate_cap)),
+        orb_enclosure_min=pick(req.orb_enclosure_min, 0.0, 1.0, d.orb_enclosure_min),
+        orb_escape_dirs=int(pick(req.orb_escape_dirs, 6, 128, d.orb_escape_dirs)),
+        orb_target_stations=int(
+            pick(req.orb_target_stations, 1, 16, d.orb_target_stations)
+        ),
+        orb_min_face_gain=pick(req.orb_min_face_gain, 0.0, 1e9, d.orb_min_face_gain),
         orb_max_views=int(pick(req.orb_max_views, 0, 100_000, d.orb_max_views)),
+        fov_derive=d.fov_derive if req.fov_derive is None else bool(req.fov_derive),
+        fov_min_deg=pick(req.fov_min_deg, 20.0, 120.0, d.fov_min_deg),
+        fov_max_deg=pick(req.fov_max_deg, 20.0, 150.0, d.fov_max_deg),
+        fov_ref_px=pick(req.fov_ref_px, 2.0, 128.0, d.fov_ref_px),
         fov_deg=pick(req.fov_deg, 30.0, 120.0, d.fov_deg),
         render_resolution=int(pick(req.render_resolution, 128, 2048, d.render_resolution)),
         seed=int(pick(req.seed, 0, 2**31 - 1, d.seed)),
@@ -3331,7 +3357,7 @@ def _write_stage5_transforms(out_dir: Path, plan: dict[str, Any], views: list[di
     K = splat_stage5.intrinsics_matrix(resolution, float(intr["fov_deg"]))
     splat_stage5.write_transforms(
         out_dir, K, resolution, float(intr["near"]), float(intr["far"]),
-        splat_stage5.reference_frames(views),
+        splat_stage5.reference_frames(views, resolution),
     )
 
 

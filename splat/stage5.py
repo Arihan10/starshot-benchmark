@@ -273,8 +273,16 @@ def intrinsics_matrix(resolution: int, fov_deg: float) -> np.ndarray:
 
 def enumerate_views(plan: dict[str, Any]) -> list[dict[str, Any]]:
     """One render entry per plan camera (single-shot): the render id, camera
-    index, rig kind, world position, and the OpenCV camera-to-world derived
-    from the camera's own forward/up."""
+    index, rig kind, world position, the OpenCV camera-to-world derived from the
+    camera's own forward/up, and that camera's FOV.
+
+    Stage 4 derives the FOV PER CAMERA from the distance to whatever the camera
+    frames — wide for a wall a metre away, narrow for a facade thirty metres off
+    — so a plan carries a range of angles rather than one. A camera with no `fov`
+    of its own (a hand-built plan, or a plan from before the field existed) falls
+    back to the shared `intrinsics.fov_deg`, which keeps every older plan
+    renderable unchanged."""
+    default_fov = float(plan["intrinsics"]["fov_deg"])
     views: list[dict[str, Any]] = []
     for ci, cam in enumerate(plan["cameras"]):
         pos = np.asarray(cam["pos"], dtype=np.float64)
@@ -286,6 +294,7 @@ def enumerate_views(plan: dict[str, Any]) -> list[dict[str, Any]]:
                 "kind": cam.get("kind"),
                 "pos": pos,
                 "c2w": c2w,
+                "fov_deg": float(cam.get("fov") or default_fov),
             }
         )
     return views
@@ -504,20 +513,36 @@ def frame_preview_png(path: Path) -> bytes:
 # --- transforms.json -------------------------------------------------------------
 
 
-def reference_frames(views: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def reference_frames(
+    views: list[dict[str, Any]], resolution: int | None = None
+) -> list[dict[str, Any]]:
     """The `transforms.json` frame entries for a plan's views — deterministic from
     the plan alone, so a resumed/multi-session render reproduces the identical
     file once every view is on disk. `frame_path` points at the SZF container
-    holding all three planes (rgb + alpha + depth)."""
-    return [
-        {
+    holding all three planes (rgb + alpha + depth).
+
+    With `resolution`, each frame also carries its OWN `fl_x`/`fl_y`/`cx`/`cy`,
+    which override the document-level intrinsics for that frame. Stage 4 varies
+    the FOV per camera, so a single shared focal length is no longer the truth;
+    the document-level values remain as the fallback for readers that don't look
+    for the per-frame ones."""
+    out: list[dict[str, Any]] = []
+    for v in views:
+        entry = {
             "frame_path": f"{FRAMES_DIRNAME}/{v['id']}{FRAME_SUFFIX}",
             "camera_index": v["camera_index"],
             "kind": v.get("kind"),
             "transform_matrix": v["c2w"].tolist(),
         }
-        for v in views
-    ]
+        if resolution is not None and v.get("fov_deg") is not None:
+            k = intrinsics_matrix(int(resolution), float(v["fov_deg"]))
+            entry["fov_deg"] = round(float(v["fov_deg"]), 4)
+            entry["fl_x"] = float(k[0, 0])
+            entry["fl_y"] = float(k[1, 1])
+            entry["cx"] = float(k[0, 2])
+            entry["cy"] = float(k[1, 2])
+        out.append(entry)
+    return out
 
 
 def write_transforms(
@@ -530,8 +555,10 @@ def write_transforms(
     depth_encoding: str = DEPTH_ENCODING,
     lighting: dict[str, Any] | None = None,
 ) -> Path:
-    """Write `transforms.json`: shared pinhole intrinsics + per-frame OpenCV
-    camera-to-world and SZF frame paths. `convention` is tagged so Stage 6 knows
+    """Write `transforms.json`: pinhole intrinsics + per-frame OpenCV
+    camera-to-world and SZF frame paths. The document-level `fl_x`/`fl_y`/`cx`/`cy`
+    are the plan's representative values; a frame carrying its own overrides them
+    (Stage 4 derives FOV per camera). `convention` is tagged so Stage 6 knows
     to take `viewmats = inv(transform_matrix)` (gsplat OpenCV), NOT the Nerfstudio
     OpenGL c2w; `frame_format` names the container; `depth` names the value
     encoding (log-uint16 codes, decoded with `near`/`far`). `lighting` (when the

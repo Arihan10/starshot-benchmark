@@ -136,17 +136,27 @@ let modalPlanShown = false; // one-time: revealed the camera overlay when the pl
 // The trainer is part of the stage-6 cache signature, so switching re-trains
 // rather than serving the other back-end's model.
 //
-// `maxSplats` is Brush's Gaussian ceiling (`--max-splats`). It is an upper
-// bound the run may finish under — but it ALSO subsamples the init: Brush thins
-// the COLMAP point cloud to this count before step 0, so setting it below the
-// Stage-3 surfel count silently discards part of the mesh-exact surface prior.
-// That is what MAX_SPLATS_MIN and the warning in the control guard against.
+// `maxSplats` is Brush's Gaussian ceiling (`--max-splats`) — an upper bound the
+// run may finish under. Brush only enforces it on GROWTH, and only while the
+// model is under it, so when the Stage-3 cloud is already larger the server
+// thins the init (`--subsample-points`) to bring it back within budget. Setting
+// this below the surfel count therefore does cost surface prior — deliberately,
+// because the alternative is a cap that silently stops applying at all. That is
+// what MAX_SPLATS_MIN and the warning in the control flag.
+// `init` picks what Brush SEEDS from. "points" hands it the COLMAP points3D,
+// which is only xyz + 8-bit colour — Brush then KNN-guesses scales, randomizes
+// rotations and flattens opacity. "surfels" hands it the Stage-3 cloud itself,
+// keeping the mesh-exact disc orientation, per-surfel radius, full-precision
+// colour and authored opacity (glass included). "points" is the default because
+// it's the configuration validated standalone; "surfels" is the A/B, and the
+// same split `gsplat`'s TrainParams.init already offers.
 let modalTrainCfg = {
     trainer: "brush",
     representation: "2dgs",
     iterations: 30000,
     batch: 1,
     maxSplats: 2000000,
+    init: "points",
 };
 
 // Below this, Brush's init subsampling starts throwing away surface prior on a
@@ -3197,7 +3207,11 @@ function modalCfgControls(disabled) {
         const row = el(
             "div",
             { class: "svc-row" },
-            el("span", { class: "svc-lab", text: key === "trainer" ? "trainer" : "splat", title }),
+            el("span", {
+                class: "svc-lab",
+                text: { trainer: "trainer", init: "init" }[key] || "splat",
+                title,
+            }),
             sel,
         );
         scoped.push({ row, input: sel, trainers });
@@ -3211,6 +3225,12 @@ function modalCfgControls(disabled) {
         "in-house loop (the benchmark baseline), which runs stages 4–7 and uses " +
         "the splat/batch knobs. Changing it re-trains rather than reusing the " +
         "other back-end's model.";
+    const initTitle =
+        "what brush seeds from. points = the COLMAP points3D (xyz + 8-bit " +
+        "colour only; brush KNN-guesses scale, randomizes rotation, flattens " +
+        "opacity) — the validated default. surfels = the Stage-3 cloud itself, " +
+        "keeping mesh-exact disc orientation, per-surfel radius, full-precision " +
+        "colour and authored glass opacity. brush only.";
     const repTitle =
         "primitive to train: 2dgs = surface-aligned surfels (best geometry, " +
         "median-depth + normal-consistency supervision); 3dgs = full 3D Gaussians " +
@@ -3219,9 +3239,9 @@ function modalCfgControls(disabled) {
         "gsplat only — brush always trains 3D Gaussians.";
     const maxSplatsTitle =
         "brush --max-splats: upper bound on the Gaussian count (the run may " +
-        "finish under it). It ALSO thins the init — brush subsamples the COLMAP " +
-        "point cloud to this count before step 0 — so going below the Stage-3 " +
-        "surfel count throws away part of the mesh-exact surface prior.";
+        "finish under it). Brush only enforces it on growth, so when the Stage-3 " +
+        "cloud is already larger the server thins the init to fit — going below " +
+        "the surfel count trades away surface prior to keep the cap real.";
 
     // Sits under the max-splats row; only speaks up when the value is low enough
     // that the init subsampling above becomes the binding effect.
@@ -3232,7 +3252,7 @@ function modalCfgControls(disabled) {
             modalTrainCfg.trainer === "brush" &&
             modalTrainCfg.maxSplats < MAX_SPLATS_MIN;
         warn.textContent = low
-            ? `⚠ under ${MAX_SPLATS_MIN.toLocaleString()} brush also thins the init cloud`
+            ? `⚠ under ${MAX_SPLATS_MIN.toLocaleString()} the init cloud gets thinned to fit`
             : "";
     };
 
@@ -3249,6 +3269,7 @@ function modalCfgControls(disabled) {
         "div",
         { class: "svc-modal-cfg" },
         select("trainer", ["brush", "gsplat"], trainerTitle, ["brush", "gsplat"], syncScope),
+        select("init", ["points", "surfels"], initTitle, ["brush"]),
         select("representation", ["2dgs", "3dgs"], repTitle, ["gsplat"]),
         numRow(
             "steps",
@@ -3257,7 +3278,9 @@ function modalCfgControls(disabled) {
             200,
             200000,
             "optimizer steps — brush --total-steps / gsplat max_steps (PostShot's " +
-                "step box); 30k is reference parity for both",
+                "step box); 30k is reference parity for both. Both trainers scale " +
+                "their densification window with this (brush grows for the first " +
+                "half, then settles), so it is safe to turn either way.",
             ["brush", "gsplat"],
         ),
         numRow(
@@ -3477,6 +3500,7 @@ async function startModalTrain(restart = false, mode = "train") {
             restart,
             mode,
             trainer: modalTrainCfg.trainer,
+            init: modalTrainCfg.init,
             representation: modalTrainCfg.representation,
             iterations: modalTrainCfg.iterations,
             batch: modalTrainCfg.batch,
@@ -3542,19 +3566,26 @@ function renderCoverage() {
             null,
         ],
     ];
-    // Measured surface coverage (the orb layer's stopping rule): the share of
-    // reachable surface seeing at least `target_views` cameras, before and
-    // after the orbs. Amber when the run stopped on its view cap rather than
-    // on the target — the plan is then budget-limited, not coverage-complete.
+    // ORB v2 counts DISTINCT optical centres, not overlapping images. The
+    // station-aware target is the quantity that constrains geometry; six cube
+    // faces from one centre remain one spatial observation.
     if (orb.target_bricks) {
         const pct = (v) => `${(100 * (v ?? 0)).toFixed(0)}%`;
-        const short = (orb.reached_after ?? 0) < (orb.target_frac ?? 1);
         rows.push([
-            `surface ≥${fmtInt(orb.target_views)} views (was → now)`,
-            `${pct(orb.reached_before)} → ${pct(orb.reached_after)} of ${pct(orb.target_frac)}`,
-            short ? "#d0a020" : null,
+            `surface ≥${fmtInt(orb.target_stations)} stations (was → now)`,
+            `${pct(orb.reached_before)} → ${pct(orb.reached_after)}`,
+            null,
         ]);
-        rows.push(["orbs placed · median views", `${fmtInt(orb.orbs)} · ${fmtInt(orb.median_views)}`, null]);
+        rows.push([
+            "ORB stations · retained faces",
+            `${fmtInt(orb.stations)} · ${fmtInt(orb.views)}`,
+            null,
+        ]);
+        rows.push([
+            "ORB candidates · median stations",
+            `${fmtInt(orb.candidates)} · ${fmtInt(orb.median_stations)}`,
+            null,
+        ]);
     }
     for (const [k, v, color] of rows) {
         const row = el("div");

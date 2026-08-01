@@ -41,6 +41,7 @@ Single-tenant by construction: one job, one fixed token, loopback only.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import glob
 import gzip
 import mimetypes
@@ -79,8 +80,26 @@ _SZC1_MAGIC = b"SZC1"  # gzip-wrapped SRF1 (client-side wire compression; see re
 # zstd + the numpy filter release the GIL, so threads parallelize fine.
 _ENCODE_WORKERS = 8
 _ENCODE_BACKLOG = 8
-# Watchdog: the first frame waits out the bundle fetch + GLB parse of a ~1 GB
-# tier; after frames start, a long silence means a wedged renderer.
+# WATCHDOG. There is no single "is it stuck?" deadline, because the capture goes
+# through three phases with completely different expected durations, and only the
+# host knows which one it is in. Timing all of them from one clock started at
+# browser launch is what makes a big scene indistinguishable from a hung one: a
+# 2 GB / 800-mesh tier can legitimately spend many minutes streaming and parsing
+# before frame 1, and a flat grace kills it mid-download — then reports the same
+# "renderer stalled" as a genuinely dead browser.
+#
+# So each phase is timed from its own last sign of life:
+#   boot    — launched, hasn't asked for /bundle yet. Page + three.js modules +
+#             manifest + cameras.json. Size-independent, so a fixed budget is right.
+#   load    — /bundle is streaming. The liveness signal is BYTES MOVING, not
+#             frames; aiohttp's write backpressure means the timestamp tracks what
+#             the client actually consumed. Unbounded in total, bounded in silence.
+#   build   — bundle fully delivered; the client is finishing GLB parses, KTX2
+#             transcodes and the one-off shadow bake. NOW a first-frame grace is
+#             meaningful, because it measures work of a knowable size.
+# After the first frame, a long silence is a wedged renderer as before.
+_BOOT_GRACE_S = 180.0
+_BUNDLE_STALL_S = 120.0
 _FIRST_FRAME_GRACE_S = 420.0
 _STALL_S = 180.0
 _POLL_S = 2.0
@@ -181,12 +200,24 @@ def _make_app(state: dict[str, Any]):
 
     async def bundle(request):
         """Stream the tier as one SMB1 bundle straight from the CAS files —
-        the same framing as the server's `_mesh_bundle`."""
+        the same framing as the server's `_mesh_bundle`.
+
+        Records delivery progress as it goes. That is what lets the watchdog tell
+        "still loading a large scene" from "hung": every successful write is proof
+        the client is alive and consuming, because aiohttp's write backpressures
+        against the transport rather than buffering the whole bundle."""
         resp = web.StreamResponse()
         resp.content_type = "application/octet-stream"
         await resp.prepare(request)
         await resp.write(_SMB1_MAGIC)
         cas: Path = state["cas_dir"]
+        # Authoritative reset: a re-fetch (page reload / retried request) starts
+        # the delivery over, so the counters must too or the watchdog would read a
+        # half-sent bundle as further along than it is.
+        state["bundle_bytes"] = 0
+        state["bundle_meshes"] = 0
+        state["bundle_done_at"] = None
+        state["bundle_last_write_at"] = time.monotonic()
         for node_id, sha in sorted(state["tier"].items()):
             data = await asyncio.to_thread(
                 (cas / sha[:2] / f"{sha}.glb").read_bytes
@@ -195,7 +226,11 @@ def _make_app(state: dict[str, Any]):
             await resp.write(struct.pack("<I", len(id_bytes)) + id_bytes)
             await resp.write(struct.pack("<I", len(data)))
             await resp.write(data)
+            state["bundle_bytes"] += len(data)
+            state["bundle_meshes"] += 1
+            state["bundle_last_write_at"] = time.monotonic()
         await resp.write_eof()
+        state["bundle_done_at"] = time.monotonic()
         return resp
 
     async def frames(request):
@@ -392,6 +427,47 @@ def _launch(url: str, gpu: bool, profile_dir: Path) -> subprocess.Popen:
 # --- orchestrator ------------------------------------------------------------------
 
 
+def _tier_bytes(cas_dir: Path, tier: dict[str, str]) -> int:
+    """Total size of the tier's CAS blobs — the denominator for the load
+    heartbeat, and a number worth having in the log BEFORE a render starts: it is
+    the single best predictor of how long the client will sit loading, and an
+    outlier tier is then visible immediately rather than as a timeout."""
+    total = 0
+    for sha in tier.values():
+        with contextlib.suppress(OSError):
+            total += (cas_dir / sha[:2] / f"{sha}.glb").stat().st_size
+    return total
+
+
+def _phase(state: dict[str, Any]) -> str:
+    """Which of the watchdog's phases the capture is in (see the constants)."""
+    if state["last_frame_at"] is not None or state["done"]:
+        return "render"
+    if state["bundle_done_at"] is not None:
+        return "build"
+    if state["bundle_last_write_at"] is not None:
+        return "load"
+    return "boot"
+
+
+def _phase_msg(state: dict[str, Any], mode: str) -> str:
+    """Heartbeat text for the current phase. Before the first frame the useful
+    number is how much of the SCENE has arrived — `0/N views` is constant through
+    the entire load and reads as a hang."""
+    phase = _phase(state)
+    if phase == "load":
+        got, total = state["bundle_bytes"], state["bundle_total_bytes"]
+        span = (
+            f"{got / 1e9:.2f}/{total / 1e9:.2f} GB" if total else f"{got / 1e9:.2f} GB"
+        )
+        return (
+            f"load[{mode}] {state['bundle_meshes']}/{len(state['tier'])} meshes · {span}"
+        )
+    if phase == "build":
+        return f"build[{mode}] scene delivered, parsing + baking"
+    return f"{phase}[{mode}]"
+
+
 def _publish_samples(
     state: dict[str, Any], sample_dir: Path, commit: Callable[[], None] | None
 ) -> None:
@@ -482,7 +558,21 @@ def capture_refs(
             "client_error": None,
             "stats": None,
             "sampled": set(),  # frame filenames already published as PNG samples
+            # Bundle delivery, written by the /bundle handler and read by the
+            # watchdog — the difference between "loading a big scene" and "hung".
+            "bundle_total_bytes": _tier_bytes(cas_dir, tier),
+            "bundle_bytes": 0,
+            "bundle_meshes": 0,
+            "bundle_last_write_at": None,
+            "bundle_done_at": None,
+            "timeout": None,
         }
+        if progress is not None:
+            progress(
+                0, len(views),
+                f"tier: {len(tier)} meshes · "
+                f"{state['bundle_total_bytes'] / 1e9:.2f} GB",
+            )
         stop = _serve(state)
         try:
             for mode in _RENDER_MODES:
@@ -490,8 +580,16 @@ def capture_refs(
                     break
                 state["finished"] = False
                 state["client_error"] = None
-                # force=1 always: the page would otherwise refuse the CPU backend,
-                # and there's no hardware WebGL to prefer here (see the docstring).
+                # Each launch fetches the bundle again, so the delivery clock and
+                # counters restart with it.
+                state["bundle_bytes"] = 0
+                state["bundle_meshes"] = 0
+                state["bundle_last_write_at"] = None
+                state["bundle_done_at"] = None
+                state["timeout"] = None
+                # force=1 always: the page refuses a software backend otherwise,
+                # which would break the SwiftShader fallback. A no-op on the
+                # hardware path (see the docstring).
                 url = (
                     f"http://127.0.0.1:{_PORT}/splatcapture.html"
                     f"?api=http://127.0.0.1:{_PORT}&run={run}&slot={slot}"
@@ -505,7 +603,9 @@ def capture_refs(
                     while True:
                         time.sleep(_POLL_S)
                         if progress is not None:
-                            progress(state["done"], state["total"], f"render[{mode}]")
+                            progress(
+                                state["done"], state["total"], _phase_msg(state, mode)
+                            )
                         if sample_dir is not None:
                             _publish_samples(state, sample_dir, commit)
                         if state["encode_errors"]:
@@ -518,9 +618,27 @@ def capture_refs(
                             break  # page bailed (e.g. software GL refusal) — next mode
                         if proc.poll() is not None:
                             break  # browser died — next mode
-                        last = state["last_frame_at"]
-                        idle = time.monotonic() - (last if last else started)
-                        if idle > (_STALL_S if last else _FIRST_FRAME_GRACE_S):
+                        # Time the CURRENT phase from its own last sign of life
+                        # (see the watchdog constants). While the bundle streams,
+                        # every write is proof of a live client, so a big scene can
+                        # take as long as it needs as long as bytes keep moving.
+                        phase = _phase(state)
+                        since, limit = {
+                            "render": (state["last_frame_at"], _STALL_S),
+                            "build": (state["bundle_done_at"], _FIRST_FRAME_GRACE_S),
+                            "load": (state["bundle_last_write_at"], _BUNDLE_STALL_S),
+                            "boot": (started, _BOOT_GRACE_S),
+                        }[phase]
+                        idle = time.monotonic() - (since if since else started)
+                        if idle > limit:
+                            state["timeout"] = (
+                                f"{phase} phase made no progress for "
+                                f"{idle:.0f}s (limit {limit:.0f}s)"
+                            )
+                            print(
+                                f"[host] watchdog: {mode} — {state['timeout']}",
+                                flush=True,
+                            )
                             break  # wedged — next mode
                 finally:
                     if proc.poll() is None:
@@ -537,9 +655,19 @@ def capture_refs(
         rendered = state["done"]
         stats = state["stats"]
         if state["pending"]:
-            why = state["client_error"] or "renderer stalled/died on both GPU and SwiftShader"
+            # Name the PHASE that gave up and how much of the scene had landed.
+            # "stalled on both backends" alone reads like a capacity wall no
+            # matter which of boot / load / build actually ran out of patience.
+            why = (
+                state["client_error"]
+                or state["timeout"]
+                or "renderer died before finishing"
+            )
             raise RuntimeError(
-                f"stage 5: {len(state['pending'])} view(s) still missing — {why}"
+                f"stage 5: {len(state['pending'])} view(s) still missing — {why} "
+                f"[tier {len(tier)} meshes / "
+                f"{state['bundle_total_bytes'] / 1e9:.2f} GB, "
+                f"{state['bundle_meshes']} delivered on the last attempt]"
             )
 
     # Deterministic from the plan alone (mirrors the server's finalize).
@@ -547,7 +675,7 @@ def capture_refs(
     stage5.write_transforms(
         refs_dir, K, int(intr["resolution"]),
         float(intr["near"]), float(intr["far"]),
-        stage5.reference_frames(views),
+        stage5.reference_frames(views, int(intr["resolution"])),
     )
     return {
         "views": len(views),

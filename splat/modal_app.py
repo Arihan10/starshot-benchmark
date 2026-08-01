@@ -688,6 +688,11 @@ def run_cell(spec: dict[str, Any]) -> dict[str, Any]:
                     # steps — so a preempted retry finds a partial model to warm
                     # restart from, and the client can pull one mid-run.
                     out_path=trained,
+                    # Only read when brush.init == "surfels": the Stage-3 cloud
+                    # becomes Brush's init.ply instead of the COLMAP points3D,
+                    # keeping the mesh-exact orientation/scale/opacity that the
+                    # points3D export flattens away.
+                    init_ply=cloud,
                     params=brush_params,
                     brush_bin=BRUSH_BIN,
                     resume=not force,
@@ -1086,6 +1091,40 @@ def probe_brush() -> dict[str, Any]:
             "init_cleaned": not (scene / "init.ply").exists(),
             "marker_cleared": not (out / brush.PROGRESS_NAME).exists(),
         }
+
+        # The surfel-seed leg. Stage-3 clouds are 2DGS (two scale columns) and
+        # Brush defaults a missing `scale_2` to 0.0 — a LOG scale, so an
+        # unconverted cloud would arrive as 1-metre slabs. Build a 2-scale cloud
+        # here and check the conversion + handoff survive in-container.
+        from splat.stage6 import _encode_trained_ply
+
+        cloud = root / "cloud.ply"
+        quats = np.zeros((len(pts), 4), dtype=np.float32)
+        quats[:, 0] = 1.0
+        _encode_trained_ply(
+            pts.astype(np.float32),
+            quats,
+            np.full((len(pts), 3), 0.5, dtype=np.float32),
+            np.full((len(pts),), 6.9, dtype=np.float32),      # saturated, as Stage 3 writes
+            np.full((len(pts), 2), np.log(0.03), dtype=np.float32),
+            cloud,
+        )
+        seeded = brush.train_brush(
+            run="probe", slot="probe", model="probe",
+            colmap_dir=scene, out_path=out / "probe_surfels.ply", init_ply=cloud,
+            params=brush.BrushParams(
+                iterations=steps, export_every=steps, max_resolution=w,
+                sh_degree=1, init="surfels",
+            ),
+            brush_bin=BRUSH_BIN, resume=False,
+            progress=lambda d, t, m: print(f"[probe:surfels] {d}/{t} {m}", flush=True),
+        )
+        result["surfel_init"] = {
+            "ok": (out / "probe_surfels.ply").is_file(),
+            "splats": seeded["splats"],
+            "init": seeded["init"],
+            "cleaned": not (scene / "init.ply").exists(),
+        }
     except Exception as exc:  # a probe reports failures, it doesn't raise them
         result |= {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
     print(json.dumps(result, indent=1))
@@ -1151,6 +1190,7 @@ def probe_gpu_stack() -> dict[str, Any]:
             ["bash", "-lc", "vulkaninfo --summary 2>&1 | sed -n '1,70p' || echo missing"]
         ),
         "gsplat": _probe_gsplat(),
+        "host": _probe_host(),
     }
     print(json.dumps(out, indent=1))
     # Round-trip through JSON before returning. The caller is a LOCAL machine with
@@ -1159,6 +1199,63 @@ def probe_gpu_stack() -> dict[str, Any]:
     # blow up on unpickle with "No module named 'torch'". This makes the payload
     # plain by construction instead of relying on casting every field.
     return json.loads(json.dumps(out, default=str))
+
+
+def _probe_host() -> dict[str, Any]:
+    """The container's actual CPU / RAM / shm / disk envelope, read from cgroup v2
+    rather than from what we asked Modal for.
+
+    Stage 5 loads a cell's whole mesh tier into one headless Chromium, so its
+    ceiling is HOST memory and core count — not the GPU. When a big scene dies
+    before rendering a frame, the question is whether the tier is unreasonable or
+    the container is simply small, and only these numbers answer it. `cpu_quota`
+    matters too: Chromium sizes its worker pools from the visible core count, so a
+    low quota makes KTX2 transcode of a few hundred meshes crawl into the
+    first-frame timeout."""
+    import os
+
+    def read(path: str) -> str:
+        try:
+            return Path(path).read_text().strip()
+        except OSError:
+            return "(unreadable)"
+
+    def meminfo(key: str) -> str:
+        for line in read("/proc/meminfo").splitlines():
+            if line.startswith(key):
+                return line.split(":", 1)[1].strip()
+        return "?"
+
+    shm = ""
+    try:
+        st = os.statvfs("/dev/shm")
+        shm = f"{st.f_blocks * st.f_frsize / 1e9:.2f} GB"
+    except OSError:
+        shm = "(unreadable)"
+    try:
+        st = os.statvfs("/tmp")
+        tmp_free = f"{st.f_bavail * st.f_frsize / 1e9:.1f} GB free"
+    except OSError:
+        tmp_free = "(unreadable)"
+
+    return {
+        # cgroup v2: "max" means no hard cap, so the container can use whatever
+        # the worker has spare; a number is a real ceiling the OOM killer enforces.
+        "cgroup_memory_max": read("/sys/fs/cgroup/memory.max"),
+        "cgroup_memory_high": read("/sys/fs/cgroup/memory.high"),
+        "cgroup_memory_current_gb": (
+            round(int(c) / 1e9, 2)
+            if (c := read("/sys/fs/cgroup/memory.current")).isdigit() else c
+        ),
+        "cgroup_cpu_max": read("/sys/fs/cgroup/cpu.max"),
+        "mem_total": meminfo("MemTotal"),
+        "mem_available": meminfo("MemAvailable"),
+        # What Chromium/Rust actually see when sizing worker pools.
+        "cpu_affinity": len(os.sched_getaffinity(0)),
+        "cpu_count": os.cpu_count(),
+        "dev_shm": shm,
+        "tmp": tmp_free,
+    }
 
 
 def _probe_gsplat() -> dict[str, Any]:

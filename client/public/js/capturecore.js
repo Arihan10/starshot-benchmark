@@ -372,7 +372,17 @@ export function createCapture(
     }
 
     const lookTarget = new THREE.Vector3();
-    function renderView(scene, pos, face) {
+    // `viewFov` (degrees) renders this one view at its own angle. Stage 4 derives
+    // FOV per camera from how far away its subject is, so a plan carries a range
+    // rather than one value. Only near/far reach the depth-pack shader
+    // (`z = 2·n·f / (f + n − zndc·(f − n))` is FOV-independent), so nothing but
+    // the projection matrix has to change — and it is only rebuilt when the angle
+    // actually differs, since consecutive views often share one.
+    function renderView(scene, pos, face, viewFov) {
+        if (viewFov && Math.abs(viewFov - camera.fov) > 1e-6) {
+            camera.fov = viewFov;
+            camera.updateProjectionMatrix();
+        }
         camera.position.set(pos[0], pos[1], pos[2]);
         camera.up.set(face.up[0], face.up[1], face.up[2]);
         lookTarget
