@@ -43,14 +43,19 @@
 // --translate / --rotate / --scale BAKE A FRAME CORRECTION into the output. Trainers
 // that renormalize the scene on ingest (Postshot does) hand back a splat whose origin
 // is nowhere near the world the rest of the pipeline works in, and the fix belongs in
-// the asset rather than in every viewer that loads it. Derive the numbers by nudging
-// the splat at runtime against known world geometry first — bounding-box arithmetic
-// alone cannot tell a translation from an axis flip, since both move an AABB's corners
-// the same way — then bake what you confirmed.
+// the asset rather than in every viewer that loads it.
+//
+// --fit SOLVES that correction instead of being told it, against the `cloud.ply` the
+// trainer was initialized from (fit-splat-transform.mjs). Prefer it: bounding-box
+// arithmetic cannot tell a translation from an axis flip, since both move an AABB's
+// corners the same way, and eyeballing a runtime nudge is good to maybe a decimetre.
+// The solve runs PER INPUT — each cell is fitted against its own cloud — and a result
+// the solver does not vouch for aborts that file rather than baking a wrong frame into
+// an asset every downstream consumer then inherits silently.
 //
 // Usage:
 //   node tools/splat-to-web-sog.mjs <file | folder> [--out <file | folder>]
-//        [--translate x,y,z] [--rotate x,y,z] [--scale f]
+//        [--fit | --fit-to <cloud.ply>] [--translate x,y,z] [--rotate x,y,z] [--scale f]
 //        [--max-splats N | --target-mb M | --no-decimate] [--sh 0|1|2|3] [--no-prune]
 //        [--min-opacity V] [--no-floaters] [--morton] [--gpu <n|cpu>]
 //        [--iterations N] [--suffix .web.sog] [--force] [--dry-run] [--keep-temp]
@@ -64,6 +69,7 @@ import { fileURLToPath } from "node:url";
 
 import { flattenFileIfNeeded, readPlyHeader } from "./ply-utils.mjs";
 import { PRUNE_DEFAULTS, buildPruneActions } from "./prune.mjs";
+import { fitTranslation, fitVerdict } from "./fit-splat-transform.mjs";
 
 const CLI = fileURLToPath(
     new URL("../node_modules/@playcanvas/splat-transform/bin/cli.mjs", import.meta.url),
@@ -78,6 +84,12 @@ const SPLAT_EXTS = [".ply", ".sog", ".spz", ".ksplat", ".splat"];
 // splat is never what a folder sweep means — the ladder belongs to the streamed
 // LOD bundle (ply-to-lod-sog.mjs), not here.
 const LOD_SIBLING = /\.lod\d+\.ply$/i;
+
+// The stage-3 init surfel cloud (splat/colmap.py) sits beside trained.ply in every
+// cell, and `cloud.old.ply` / `cloud.new.ply` turn up when one is being replaced. It
+// is a training INPUT, not a model — encoding it produces a junk delivery asset per
+// cell, and under --fit it gets fitted against itself for 30 s to conclude nothing.
+const INIT_CLOUD = /^cloud(\.[^.]+)?\.ply$/i;
 
 // Which container to read when several in one folder are the SAME model — a cell
 // routinely holds both `trained.ply` and `trained.sog`, and both resolve to the
@@ -111,6 +123,10 @@ const DEFAULTS = {
     translate: null,
     rotate: null,
     scale: null,
+    // Solve the frame correction instead of being told it — see fit-splat-transform.mjs.
+    // Per INPUT, not per run, so a folder sweep fits each cell against its own cloud.
+    fit: false,
+    fitTo: null,
     prune: true,
     minOpacity: PRUNE_DEFAULTS.minOpacity,
     floaters: PRUNE_DEFAULTS.floaters,
@@ -135,6 +151,11 @@ function parseArgs(argv) {
         else if (a === "--translate" || a === "-t") opt.translate = argv[++i];
         else if (a === "--rotate" || a === "-r") opt.rotate = argv[++i];
         else if (a === "--scale") opt.scale = argv[++i];
+        else if (a === "--fit") opt.fit = true;
+        else if (a === "--fit-to") {
+            opt.fitTo = argv[++i];
+            opt.fit = true;
+        }
         else if (a === "--max-splats") opt.maxSplats = parseInt(argv[++i], 10);
         else if (a === "--target-mb") opt.targetMb = parseFloat(argv[++i]);
         else if (a === "--sh") opt.sh = parseInt(argv[++i], 10);
@@ -159,6 +180,7 @@ function parseArgs(argv) {
 const USAGE =
     "Usage: node tools/splat-to-web-sog.mjs <file | folder> [--out <file | folder>]\n" +
     "       [--translate x,y,z] [--rotate x,y,z] [--scale f]\n" +
+    "       [--fit | --fit-to cloud.ply]   (solve the placement, then bake it)\n" +
     "       [--max-splats N | --target-mb M] [--no-decimate] [--sh 0|1|2|3]\n" +
     "       [--no-prune] [--min-opacity V] [--no-floaters] [--floaters size,op,min]\n" +
     "       [--morton] [--gpu <n|cpu>] [--iterations N] [--suffix .web.sog]\n" +
@@ -184,7 +206,8 @@ function walk(dir, suffix, found = []) {
             e.isFile() &&
             isSplatFile(e.name) &&
             !e.name.toLowerCase().endsWith(suffix.toLowerCase()) &&
-            !LOD_SIBLING.test(e.name)
+            !LOD_SIBLING.test(e.name) &&
+            !INIT_CLOUD.test(e.name)
         ) {
             found.push(p);
         }
@@ -420,8 +443,10 @@ async function encodeOne(input, root, opt) {
     const inBytes = fs.statSync(input).size;
 
     // A folder sweep is re-run constantly (a new cell trains, the rest are done),
-    // so an output already newer than its input is left alone unless forced.
-    if (!opt.force && fs.existsSync(output)) {
+    // so an output already newer than its input is left alone unless forced. Not
+    // under --dry-run: nothing is written there, so the question being asked is
+    // "what WOULD this do", and "nothing, it's current" is not the answer to it.
+    if (!opt.force && !opt.dryRun && fs.existsSync(output)) {
         if (fs.statSync(output).mtimeMs >= fs.statSync(input).mtimeMs) {
             return { in: input, out: output, skipped: "up to date" };
         }
@@ -450,6 +475,32 @@ async function encodeOne(input, root, opt) {
         if (info) sourceBands = info.sh_bands ?? 0;
     }
 
+    // Solve the placement against this input's own init cloud, and refuse to bake a
+    // result the solver itself does not trust — a wrong correction baked into an asset
+    // is worse than no correction, because every consumer then inherits it silently.
+    let fit = null;
+    if (opt.fit) {
+        if (!lower.endsWith(".ply") && !lower.endsWith(".sog")) {
+            throw new Error(`--fit cannot read positions out of ${path.extname(input)} — .ply or .sog only`);
+        }
+        if (opt.translate) {
+            throw new Error("--fit and --translate both set — solve it or state it, not both");
+        }
+        fit = fitTranslation(input, {
+            to: opt.fitTo,
+            onLog: (m) => console.error(`    [fit] ${m}`),
+        });
+        const verdict = fitVerdict(fit);
+        console.error(
+            `    [fit] ${fit.translate.join(",")}  on-surface ${(fit.score * 100).toFixed(1)}%` +
+                ` vs identity ${(fit.identity * 100).toFixed(1)}%  (${fit.ratio.toFixed(1)}x)`,
+        );
+        if (!verdict.ok) throw new Error(`fit rejected — ${verdict.problems.join("; ")}`);
+        opt = { ...opt, translate: fit.translate.join(",") };
+    }
+    // Built once and reused by both passes; it was previously recomputed per pass.
+    const xform = transformActions(opt);
+
     let target = Number.isFinite(opt.maxSplats) ? opt.maxSplats : null;
     let clamped = false;
     if (opt.targetMb != null) {
@@ -470,6 +521,7 @@ async function encodeOne(input, root, opt) {
             dry_run: true,
             count_in: sourceCount,
             decimate_to: decimating ? target : null,
+            fit: fit ? { solved: fit.translate, ratio: +fit.ratio.toFixed(1) } : null,
         };
     }
 
@@ -501,7 +553,7 @@ async function encodeOne(input, root, opt) {
             const src = source;
             await runStage(
                 ({ gpu, floaters }) => {
-                    const args = [src, ...transformActions(opt), ...filterActions(opt, floaters)];
+                    const args = [src, ...xform, ...filterActions(opt, floaters)];
                     args.push("--decimate", String(target), decimated, "-w");
                     args.push("--scratch-dir", tmpDir);
                     if (gpu) args.push("-g", gpu);
@@ -524,7 +576,7 @@ async function encodeOne(input, root, opt) {
                 // again here would apply the frame correction twice.
                 const args = [
                     src,
-                    ...(decimating ? [] : transformActions(opt)),
+                    ...(decimating ? [] : xform),
                     ...(encodeFilters ?? filterActions(opt, floaters)),
                 ];
                 if (opt.morton) args.push("--morton-order");
@@ -555,6 +607,15 @@ async function encodeOne(input, root, opt) {
                 opt.translate || opt.rotate || opt.scale
                     ? { translate: opt.translate, rotate: opt.rotate, scale: opt.scale }
                     : null,
+            fit: fit
+                ? {
+                      solved: fit.translate,
+                      on_surface_pct: +(fit.score * 100).toFixed(1),
+                      identity_pct: +(fit.identity * 100).toFixed(1),
+                      ratio: +fit.ratio.toFixed(1),
+                      cloud: fit.cloud,
+                  }
+                : null,
             in_bytes: inBytes,
             out_bytes: outBytes,
             out_mb: +(outBytes / 1024 / 1024).toFixed(2),

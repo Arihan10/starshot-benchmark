@@ -94,7 +94,16 @@ export class SplatLayer {
 				asset.unload();
 				return false;
 			}
-			const entity = new pc.Entity("splat");
+			// `app` EXPLICITLY. `new pc.Entity(name)` defaults its owning app to
+			// PlayCanvas' module-global "current application" — the last one
+			// constructed anywhere on the page — and `addComponent` resolves the
+			// component system off THAT app. With two viewers side by side the
+			// awaits above interleave: both apps exist by the time either asset
+			// finishes, so one splat ends up with a gsplat component belonging to
+			// the other viewer's app while sitting in this one's scene graph, and
+			// silently never draws. Naming the app removes the global from the
+			// path entirely. Same reason the camera below passes it.
+			const entity = new pc.Entity("splat", app);
 			entity.addComponent("gsplat", { asset });
 			app.root.addChild(entity);
 			this.entity = entity;
@@ -142,7 +151,7 @@ export class SplatLayer {
 		// See the lockstep note at the top: the engine drives render() itself.
 		app.autoRender = false;
 
-		const camera = new pc.Entity("splat-camera");
+		const camera = new pc.Entity("splat-camera", app);
 		camera.addComponent("camera", {
 			clearColor: new pc.Color(CLEAR[0], CLEAR[1], CLEAR[2], 1),
 			fov: 75,

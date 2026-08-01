@@ -33,6 +33,16 @@ from app.services import d1, r2, scene_lite
 # this stays off the heavy generation import path.
 _RAW_SUBDIR = "objects-generated"
 _LIBRARY_SUBDIR = "objects"
+# The COMPRESSED twins of each build. The dollhouse bake decodes PNG textures and
+# these are KTX2/Basis, so a bake from one keeps the geometry and loses the
+# colour — every object comes out a flat debug hue instead of its texture (see
+# bake-vertex-color.mjs). That is a poor preview but a perfectly good DEBUG one,
+# and it is the difference between a cell being viewable at all and not: a cell
+# whose raw meshes were pruned could not be published before, so its captured
+# walkthrough could never be opened. Tried strictly AFTER the raw set, so a cell
+# that has raw meshes is completely unaffected.
+_GENERATED_FALLBACKS = ("objects-generated-optimized", "objects-generated-lite")
+_LIBRARY_FALLBACK = "objects-optimized"
 _LEGACY_GENERATED_DIR = "generated"
 _PUBLISHED_DIR = "published"  # baked preview cached under the cell
 # The SOG-encoded trained splat the viewer loads, in PREFERENCE ORDER.
@@ -43,6 +53,8 @@ _PUBLISHED_DIR = "published"  # baked preview cached under the cell
 # whatever frame that trainer chose to write, which is not necessarily the world the
 # rest of the cell lives in.
 _SPLAT_NAMES = ("trained.web.sog", "trained.sog")
+# Where the pipeline's own encode writes; see local_splat_key.
+_SPLAT_DIR = "splat"
 
 # The cell's mesh-source choice (persisted in splat/source.json by the pipeline).
 # 'auto' = generated build else library; an explicit value pins exactly one set.
@@ -86,10 +98,11 @@ def _source_pref(cell: Path) -> str:
 
 
 def _generated_objects_dir(cell: Path) -> Path | None:
-    """The generated build's RAW (PNG-textured) meshes — the current single build
-    (<cell>/objects-generated/), else the newest legacy
-    <cell>/generated/<n>/objects-generated/. None when neither has rendered
-    meshes."""
+    """The generated build's meshes for the bake: the RAW (PNG-textured) set
+    first — <cell>/objects-generated/, else the newest legacy
+    <cell>/generated/<n>/objects-generated/ — and only if there is none, a
+    compressed twin (see _GENERATED_FALLBACKS). None when the build has no meshes
+    at all."""
     single = cell / _RAW_SUBDIR
     if _scene_glbs(single):
         return single
@@ -103,24 +116,36 @@ def _generated_objects_dir(cell: Path) -> Path | None:
             d = legacy_root / v / _RAW_SUBDIR
             if _scene_glbs(d):
                 return d
+    for name in _GENERATED_FALLBACKS:
+        d = cell / name
+        if _scene_glbs(d):
+            return d
     return None
 
 
 def _library_objects_dir(cell: Path) -> Path | None:
-    """The asset-library build's RAW (PNG-textured) meshes (<cell>/objects/). None
-    when absent or migrated to the KTX2-only `objects-optimized/` twin (which the
-    vertex-color bake can't decode)."""
+    """The asset-library build's meshes for the bake: the RAW (PNG-textured) set
+    (<cell>/objects/) first, else the migrated KTX2 twin
+    (<cell>/objects-optimized/) as a debug-grade fallback. None when neither
+    exists."""
     d = cell / _LIBRARY_SUBDIR
-    return d if _scene_glbs(d) else None
+    if _scene_glbs(d):
+        return d
+    alt = cell / _LIBRARY_FALLBACK
+    return alt if _scene_glbs(alt) else None
 
 
 def _bake_objects_dir(cell: Path) -> Path | None:
-    """The RAW mesh set the dollhouse preview bakes from, honouring the cell's
-    source preference — the same generated-or-library choice the splat/tour
-    pipeline resolves: 'generated'/'library' pin one set, 'auto' prefers the
-    generated build then falls back to the library. None when the chosen set has
-    no PNG-textured meshes on disk. (scene_lite decodes PNG textures, so this is
-    always a raw set, never a KTX2/Basis optimized twin.)"""
+    """The mesh set the dollhouse preview bakes from, honouring the cell's source
+    preference — the same generated-or-library choice the splat/tour pipeline
+    resolves: 'generated'/'library' pin one set, 'auto' prefers the generated
+    build then falls back to the library.
+
+    Within whichever build is chosen, RAW (PNG-textured) meshes are preferred and
+    a compressed KTX2 twin is accepted only if there are none. The bake cannot
+    decode KTX2, so that fallback keeps the geometry and loses the texture colour
+    — a debug-grade preview rather than a real one, reported as such by
+    `_preview_report`. None when the chosen build has no meshes at all."""
     pref = _source_pref(cell)
     if pref == "generated":
         return _generated_objects_dir(cell)
@@ -130,8 +155,9 @@ def _bake_objects_dir(cell: Path) -> Path | None:
 
 
 def has_publishable_meshes(cell: Path) -> bool:
-    """Whether the cell has a raw mesh set (generated or library, per its source
-    preference) the dollhouse preview can bake from."""
+    """Whether the cell has any mesh set (generated or library, per its source
+    preference) the dollhouse preview can bake from — raw for a full-colour bake,
+    a compressed twin for a debug-grade one."""
     return _bake_objects_dir(cell) is not None
 
 
@@ -143,19 +169,37 @@ def _stale(dst: Path, *sources: Path) -> bool:
     return dst.stat().st_mtime < floor
 
 
-async def _ensure_preview(cell: Path) -> Path:
-    """Bake (or reuse the cached) vertex-colored dollhouse and return its path.
-    Bakes from whichever raw set the cell's source preference selects (generated
-    or library). Cached under the cell, invalidated when a source mesh or the bake
-    script changes."""
+async def _ensure_preview(cell: Path) -> tuple[Path, dict[str, Any]]:
+    """Bake (or reuse the cached) vertex-colored dollhouse. Returns its path and
+    the bake's stats — empty when the cached copy was reused, since no bake ran.
+
+    Bakes from whichever set the cell's source preference selects (generated or
+    library), preferring raw meshes and falling back to a compressed twin. Cached
+    under the cell, invalidated when a source mesh or the bake script changes."""
     raw_dir = _bake_objects_dir(cell)
     if raw_dir is None:
         raise FileNotFoundError("cell has no meshes to publish")
     sources = _scene_glbs(raw_dir)
     out = cell / _PUBLISHED_DIR / "scene-lite.glb"
+    stats: dict[str, Any] = {}
     if _stale(out, *sources, scene_lite.BAKE_SCRIPT):
-        await scene_lite.build_scene_vcolor(raw_dir, out)
-    return out
+        stats = await scene_lite.build_scene_vcolor(raw_dir, out)
+    return out, stats
+
+
+def _preview_report(cell: Path, stats: dict[str, Any]) -> dict[str, Any]:
+    """Which mesh set the dollhouse came from, and how much of its colour
+    survived. `flat_objects` counts objects baked as a debug hue because their
+    texture could not be decoded — greater than zero means this is a debug-grade
+    preview, which is worth saying rather than leaving someone to wonder why the
+    dollhouse looks like a colour chart."""
+    d = _bake_objects_dir(cell)
+    flat = stats.get("flatObjects")
+    return {
+        "preview_source": d.name if d is not None else None,
+        "preview_flat_objects": flat,
+        "preview_debug": bool(flat),
+    }
 
 
 def scene_keys(run: str, slot: str, model: str) -> dict[str, str]:
@@ -195,13 +239,27 @@ def local_scene_keys(run: str, slot: str, model: str) -> dict[str, str]:
 def local_splat_key(cell: Path, run: str, slot: str, model: str) -> str | None:
     """The artifact key for the cell's Gaussian splat, or None when it has none.
 
-    Lives at the cell ROOT rather than under a stage folder because it is delivered
-    ALONGSIDE the pipeline rather than produced by it — an external trainer writes
-    it, so no stage directory owns it. Most cells have never been trained, so None
-    is the common answer and the viewer treats a splat as an optional upgrade."""
-    for name in _SPLAT_NAMES:
-        if (cell / name).is_file():
-            return f"{run}/{slot}/{model}/{name}"
+    TWO locations, because two things produce one. A splat delivered ALONGSIDE the
+    pipeline by an external trainer lands at the cell ROOT; a splat produced BY the
+    pipeline lands beside the .ply it was encoded from, under `splat/` (the
+    /splat/sog route writes `_sog_source_path(...).with_suffix(".sog")`, and the
+    source .ply lives at `splat/trained.ply`).
+
+    Only the root was checked, which meant every splat the encode route has ever
+    produced was invisible to the viewer while the one hand-placed at a cell root
+    worked — so the feature looked like it worked and silently didn't for the cells
+    that actually went through the pipeline.
+
+    The root still WINS on a tie: `trained.web.sog` there is the delivery encode,
+    which carries any baked frame correction, and a bare `trained.sog` is whatever
+    frame its trainer happened to choose. Most cells have never been trained, so
+    None is the common answer and the viewer treats a splat as an optional
+    upgrade."""
+    for base in (cell, cell / _SPLAT_DIR):
+        for name in _SPLAT_NAMES:
+            if (base / name).is_file():
+                rel = name if base == cell else f"{_SPLAT_DIR}/{name}"
+                return f"{run}/{slot}/{model}/{rel}"
     return None
 
 
@@ -267,9 +325,14 @@ async def publish_cell_local(
         raise FileNotFoundError(f"no such cell: {run}/{slot}/{model}")
     if not has_publishable_meshes(cell):
         raise FileNotFoundError("cell has no meshes to publish")
-    await _ensure_preview(cell)
-    row = local_scene_row(runs_dir, run, slot, model)
-    return row or {"run": run, "slot": slot, "model": model, "pano_count": 0}
+    _preview, stats = await _ensure_preview(cell)
+    row = local_scene_row(runs_dir, run, slot, model) or {
+        "run": run,
+        "slot": slot,
+        "model": model,
+        "pano_count": 0,
+    }
+    return {**row, **_preview_report(cell, stats)}
 
 
 async def publish_cell(
@@ -320,7 +383,7 @@ async def publish_cell(
             "dry_run": True,
         }
 
-    preview = await _ensure_preview(cell)
+    preview, preview_stats = await _ensure_preview(cell)
 
     uploads = [r2.put_file(preview_key, preview, _content_type(preview))]
     if tour_key:
@@ -359,4 +422,5 @@ async def publish_cell(
         "minimap_count": len(minimaps),
         "published_at": published_at,
         "base_url": _PUBLIC_BASE,
+        **_preview_report(cell, preview_stats),
     }

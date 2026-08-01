@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
-import ScenePicker from "@/components/ScenePicker";
+import ScenePicker from "./ScenePicker";
 
 // Local (no-Cloudflare) testing mode reads scenes + assets straight off the
 // orchestrator; surface that in the header so it's obvious which source is live.
@@ -24,13 +24,13 @@ export default function ViewerHeader() {
 				<ScenePicker />
 			</div>
 			<div className="flex rounded-lg border border-white/10 bg-white/5 p-0.5 text-sm">
-				<NavLink href="/" active={pathname === "/"}>
+				<NavLink href="/debug" active={pathname === "/debug"}>
 					3D scene
 				</NavLink>
-				<NavLink href="/panorama" active={pathname === "/panorama"}>
+				<NavLink href="/debug/panorama" active={pathname === "/debug/panorama"}>
 					Panoramas
 				</NavLink>
-				<NavLink href="/orbit" active={pathname === "/orbit"}>
+				<NavLink href="/debug/orbit" active={pathname === "/debug/orbit"}>
 					Orbit
 				</NavLink>
 			</div>

@@ -54,18 +54,6 @@ description = "Run test suite"
 command = "uv run --script scripts/run_playground.py"
 description = "Boot the prompt → Nano Banana → Trellis 2 dev playground"
 
-# --- Modal splat trainer (stages 4-6 on an A100; see splat/modal_app.py) ------
-# Modal is SERVERLESS, so there is no always-on box to pay for: an idle deployed
-# app costs $0 (only Volume storage, free under 1 TiB), and every train job spins
-# a container up and back down on its own. So the session model is really:
-#   `enx modal:up`   ONCE per session (or after you change stage/modal code) to
-#                    publish the app so the "train on modal" button can call it;
-#   train as many cells as you like (each auto-scales; you pay only per job-second);
-#   `enx modal:down` when you're done — OPTIONAL, a teardown, not a cost saver.
-# Commands run from the repo root via the pinned server env (`uv run --project
-# server`), so `add_local_python_source("splat")` resolves and the client version
-# is reproducible. NOTE: don't run `modal:down` mid-training — it terminates the
-# running container (the run resumes from its Volume checkpoint after a redeploy).
 [tasks."modal:up"]
 command = "uv run --project server modal deploy splat/modal_app.py"
 description = "Deploy/refresh the Modal splat trainer — run before a training session (and after code changes)"
@@ -90,6 +78,24 @@ description = "Fetch recent logs from the Modal splat app (append -f manually to
 command = "uv run --project server modal app list"
 description = "List Modal apps — see whether starshot-splat is deployed / running / stopped"
 
+# Both take a cell directory, its splat/, or the trained.ply itself, resolved from the
+# repo root: `enx run splat:fit runs/<run>/<slot>/<model>`. They read cloud.ply beside
+# the trained model, so a cell missing its stage-3 cloud will say so rather than guess.
+[tasks."splat:fit"]
+command = "node client/tools/fit-splat-transform.mjs"
+description = "Solve a trained splat's world placement against its init cloud, and report whether it is trustworthy — read-only, writes nothing"
+
+[tasks."splat:web"]
+command = "node client/tools/splat-to-web-sog.mjs"
+description = "Encode trained splat(s) into web-sized .web.sog beside each input. Add --fit to solve and bake the placement in one pass, --dry-run to see the plan first"
+
+[tasks."prod:server"]
+command = "cd server && uv run uvicorn app.main:app --port 8765"
+description = "Run production server."
+
+[tasks."prod:client"]
+command = "cd prod_client && bun dev"
+description = "Run production client."
 # [open] maps target name -> URL or shell command for `enx open <target>`.
 [open]
 repo = "https://github.com/enxilium/starshot-benchmark"

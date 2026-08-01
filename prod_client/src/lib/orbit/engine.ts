@@ -37,27 +37,32 @@ import {
 } from "./materials";
 import {
 	CURSOR_CLEAR,
-	HOTSPOT_FLOOR_DROP,
-	FLOOR_ARROW_DIST,
-	FLOOR_ARROW_PITCH,
-	LOCATE_SLICE_ABOVE_EYE,
 	NAV_COLORS,
 	PEEK_ROTATE_SPEED,
 	WASD_DIR_COS,
-	WASD_MAX_STEP,
-	WASD_MAX_Y_STEP,
 } from "./markers";
+import {
+	DEFAULT_METRICS,
+	DEFAULT_SCALE,
+	describeScale,
+	measureSceneScale,
+	type NavMetrics,
+	navMetrics,
+	type SceneScale,
+} from "./scale";
 import { SurfaceCursor } from "./cursor";
 import { LightRig } from "./lighting";
 import { prepareLitScene } from "./prepare";
 import { MarkerLayer } from "./markerLayer";
-import { IDENTITY_TRANSFORM, SplatLayer, type SplatTransform } from "./splatLayer";
+import { SplatLayer } from "./splatLayer";
 import { collectObjects, ObjectAddressing } from "./objectAddressing";
 import { type PanoEntry, PanoStreamer } from "./panoTextures";
 import { Projection } from "./projection";
 import {
 	buildMinimapState,
-	levelForY,
+	levelForPosition,
+	readBasis,
+	toMap,
 	type MapLabel,
 	type MinimapSlice,
 } from "./minimap";
@@ -82,7 +87,6 @@ import {
 import type {
 	Chapter,
 	Connector,
-	MapEdge,
 	NodeDir,
 	OrbitMode,
 	OrbitState,
@@ -91,6 +95,20 @@ import type {
 } from "./types";
 
 const v3 = (a: [number, number, number]) => new Vector3().fromArray(a);
+
+// TEMPORARY (debug). Whatever identifies a mesh well enough to find it again in the
+// proxy: its own name, else the pipeline object id the addressing layer stamps on it,
+// else the nearest named ancestor. Used only by `logAim`.
+const describeObject = (o: Object3D): string => {
+	for (let n: Object3D | null = o; n; n = n.parent) {
+		const label = n.userData?.objLabel as string | undefined;
+		if (n.name) return label && label !== n.name ? `${n.name} [${label}]` : n.name;
+		if (label) return `[${label}]`;
+	}
+	return o.type;
+};
+const fmt3 = (v: ArrayLike<number>) =>
+	`(${v[0].toFixed(2)}, ${v[1].toFixed(2)}, ${v[2].toFixed(2)})`;
 const easeInOut = (t: number) =>
 	t < 0.5 ? 4 * t * t * t : 1 - (-2 * t + 2) ** 3 / 2;
 
@@ -158,8 +176,8 @@ const FREEFLY_FOV = INTERIOR_FOV;
 // true  — FIRST PERSON. The reticle is pinned to the centre of the viewport and you
 //         aim it by turning the view, like a head-mounted sight. What you are looking
 //         at and what you would act on are the same thing by construction, so the
-//         "where will this click send me" question the ghost and tether exist to
-//         answer stops needing to be asked at all.
+//         "where will this click send me" question the ghost exists to answer
+//         stops needing to be asked at all.
 // false — POINTING, the original: the reticle tracks the pointer and you aim it by
 //         moving the mouse, Google-Maps style.
 //
@@ -294,9 +312,12 @@ const DOCK_STILL_SPEED_FRAC = 0.01;
 // value is being chosen (see `dockDelayMs`). Once settled, lock it here and remove
 // the keys.
 const DOCK_STILL_MS = 500;
-const DOCK_RADIUS_FRAC = 0.08; // of the scene's extent...
-const DOCK_RADIUS_MIN = 2.0; // ...clamped, so scale can't make it absurd
-const DOCK_RADIUS_MAX = 5.0;
+// How near an anchor has to be to catch a glide is now `metrics.dockRadius` — a
+// multiple of the distance between neighbouring captures (see scale.ts). It used to
+// be a fraction of the whole scene's extent, clamped to 2..5 m, and the clamp did
+// all the work at both ends: a bathroom got the 2 m floor and a 200 m level got the
+// 5 m ceiling, so neither actually scaled. What "near a viewpoint" means depends on
+// how far apart the viewpoints are, which is the thing now being measured.
 // Vertical offset is treated as EXPENSIVE, not as a cliff.
 //
 // It was a hard clamp at 1 m, and that was wrong in a way that read as broken
@@ -314,10 +335,10 @@ const DOCK_RADIUS_MAX = 5.0;
 // dragged down out of real mid-air. At weight 1.5 the metric rejects 2 m of rise on
 // its own, so the cap almost never decides anything.
 const DOCK_DY_WEIGHT = 1.5;
-const DOCK_MAX_DY = 2.0;
+// The hard cap on docking to something above or below you is `metrics.dockMaxDy`.
 const DOCK_SEEK_GAIN = 2.6; // 1/s — the pull toward the anchor; the integrator damps it
-const DOCK_ARRIVE = 0.12; // m — close enough to hand over without visible motion
-const DOCK_REVEAL_DIST = 2.2; // m — the interior is fully faded in by here
+// `metrics.dockArrive` — close enough to hand over without visible motion.
+// `metrics.dockReveal` — the distance by which the interior has fully faded in.
 const DOCK_REVEAL_TAU = 150; // ms — eases the reveal BOTH ways, so a cancel fades out
 
 // --- look inertia -----------------------------------------------------------
@@ -428,15 +449,13 @@ function freeflyKey(code: string): string | null {
 // initialized from and belongs baked into the file
 // (tools/splat-to-web-sog.mjs --translate).
 
-// Look up more steeply than this at something over your head and a click reads as
-// "take me through it" — see the engine's targetFloorFor.
-const CEILING_PITCH = (40 * Math.PI) / 180;
-
-// ...and how close to your own feet the ground has to be for a click on it to read
-// as "down through here" instead of "walk over there". Kept tight: this overrides
-// the floor you are standing on, so it has to be somewhere you would never aim
-// while picking a spot to walk to.
-const UNDERFOOT_RADIUS = 1.6;
+// Which storey a click resolves to is no longer a judgement call, because the cursor
+// no longer decides it. It used to try — looking steeply UP meant "take me through
+// the ceiling", looking at the ground within arm's reach meant "take me down through
+// the floor" — and both were guesses at an intent nobody had expressed, read off a
+// pitch angle. Floor changes belong to the arrows overhead and underfoot, which say
+// what they do. The cursor moves you around the floor you are on, and crosses to
+// another only when you can SEE where you would land. See `resolveAim`.
 
 // Rest the cursor on one object this long and the walkthrough offers a proper look
 // at it. Long enough that sweeping the room never triggers it, short enough to feel
@@ -453,6 +472,21 @@ const _flyDir = new Vector3();
 const _moveWish = new Vector3();
 const _prevClear = new Color();
 const _ghostFloor = new Vector3();
+const _wpDir = new Vector3();
+const _wpOut = new Vector3();
+const _wpEye = new Vector3();
+const _dropFrom = new Vector3();
+const _walkDir = new Vector3();
+const _walkPt = new Vector3();
+const _walkOut = new Vector3();
+const _walkNrm = new Vector3();
+const _walkFrom = new Vector3();
+const _walkAlt = new Vector3();
+// The heights the walk is sampled at, as fractions of the eye height above the
+// destination's floor: shin, waist, brow. Enough to tell a doorway from a door and a
+// counter from a wall, few enough to stay cheap. See `walkBackFrom`.
+const WALK_HEIGHTS = [0.15, 0.5, 0.9] as const;
+const _DOWN = new Vector3(0, -1, 0);
 const _losFrom = new Vector3();
 const _losDir = new Vector3();
 const quadBezier = (
@@ -581,6 +615,19 @@ export class OrbitEngine {
 	private readonly cursor: SurfaceCursor;
 	private readonly cursorRay = new Raycaster();
 	private readonly occluder = new Raycaster(); // LOS tests for the nav graph
+	private readonly dropRay = new Raycaster(); // settles a waypoint onto the floor
+	private readonly walkRay = new Raycaster(); // destination -> cursor, for the marker
+	// TEMPORARY (debug). The last aim the walkthrough resolved, kept so a jerk can be
+	// reported with the exact numbers and the exact triangles that produced it — see
+	// `logAim`, the L key, and the "log aim" button. Delete all four together.
+	private aimBlock: {
+		source: string;
+		object: string;
+		face: number;
+		dist: number;
+		point: [number, number, number];
+		planNormal: [number, number, number] | null;
+	} | null = null;
 	// Pointer-lock state. `unlockedAt` timestamps the release so the Esc that caused
 	// it can be told apart from a later, deliberate one — see ESCAPE_GRACE_MS.
 	private locked = false;
@@ -597,6 +644,11 @@ export class OrbitEngine {
 	private flyTarget = -1;
 	private projectionMode = false;
 	private minimaps: MinimapSlice[] = [];
+	// The frame this scene's map is drawn in, and the word its storeys go by. Both
+	// come from the capture profile; a tour without one is a plan view of a
+	// building, which is what every tour was before the profile existed.
+	private mapBasis = readBasis(undefined);
+	private levelWord = "floor";
 	private mapLabels: MapLabel[] = [];
 	private panoLevel: number[] = [];
 	private minimapPrefetch: HTMLImageElement[] = [];
@@ -614,9 +666,6 @@ export class OrbitEngine {
 	// is off every mesh view behaves exactly as it did before the splat existed.
 	private readonly splat: SplatLayer;
 	private splatView = true;
-	// Where the splat sits in world space while its true placement is still being
-	// established — see SplatLayer.setTransform. Baked away once confirmed.
-	private splatTransform: SplatTransform = { ...IDENTITY_TRANSFORM };
 	// The pano-to-splat dissolve: 0 = the walkthrough's panorama still covers the
 	// view, 1 = the splat is fully uncovered. Runs alongside free flight rather
 	// than blocking it, so movement responds from the first frame.
@@ -685,7 +734,6 @@ export class OrbitEngine {
 	private navGraph: NavGraph | null = null;
 	private nodeDir: NodeDir[] = [];
 	private chapters: Chapter[] = [];
-	private mapEdges: MapEdge[] = [];
 
 	// Invariants: a back-stack that retraces the exact path (never blocked), the
 	// set of nodes stood on (minimap fill), and a one-slot input buffer so
@@ -701,6 +749,14 @@ export class OrbitEngine {
 	private readonly bgColor = new Color(0x0c0d10);
 	private readonly sceneCenter = new Vector3();
 	private sceneMaxDim = 1;
+	// Vertical bounds of the loaded scene, so the waypoint's column cast starts
+	// above everything and reaches below it.
+	private sceneTopY = 0;
+	private sceneBottomY = 0;
+	// The scene's measured scale and every distance derived from it. Replaced on each
+	// scene load; the fallback keeps a not-yet-loaded engine self-consistent.
+	private sceneScale: SceneScale = DEFAULT_SCALE;
+	private metrics: NavMetrics = DEFAULT_METRICS;
 	private readonly browsePos = new Vector3();
 
 	private transition: Transition | null = null;
@@ -720,6 +776,10 @@ export class OrbitEngine {
 	private interiorBusy = false;
 	private savedInterior: SavedInterior | null = null;
 	private peekHeld = false;
+	// Hold-to-locate cuts the scene open along the same axis the map does — the
+	// roof off a building, the front off a diorama — so what you see while locating
+	// is the view the map is a drawing of. Its normal is set per scene, since the
+	// axis is not known until one is loaded.
 	private readonly locateClip = new Plane(new Vector3(0, -1, 0), 0);
 
 	private hoveredNavIndex = -1;
@@ -1114,19 +1174,10 @@ export class OrbitEngine {
 			objectHover: this.addressing.hoverLabel,
 			proxyView: this.proxyView,
 			canProxyView: this.canToggleProxyView(),
-			// The EFFECTIVE state, not the raw switch: with no splat loaded the
-			// control has nothing to turn on and should not read as active.
-			splatView: this.splatEnabled,
-			canSplatView: this.canToggleSplatView(),
-			splatTransform: this.splat.ready ? this.splatTransform : null,
 			mouseLook: this.locked,
 			// TEMPORARY, surfaced only so the settle delay can be read while tuning it.
 			dockDelayMs: this.dockDelayMs,
 			freeflySpeed: this.freeflySpeed,
-			highlightEnabled: this.highlightEnabled,
-			canHighlight:
-				(this.mode === "overview" || this.mode === "interior") &&
-				!!this.activeObjectRoot(),
 			contextMenu: this.addressing.menu,
 			busy: this.interiorBusy,
 			overlay: this.overlay,
@@ -1144,7 +1195,7 @@ export class OrbitEngine {
 			visited: [...this.visited],
 			nodes: this.nodeDir,
 			chapters: this.chapters,
-			mapEdges: this.mapEdges,
+			levelWord: this.levelWord,
 			minimap: buildMinimapState({
 				minimaps: this.minimaps,
 				panos: this.panos,
@@ -1152,6 +1203,11 @@ export class OrbitEngine {
 				currentIndex: this.currentIndex,
 				mode: this.mode,
 				labels: this.mapLabels,
+				// The window's unit: past a certain size the map stops fitting the
+				// whole storey and starts following you, measured in capture
+				// spacings so it holds the same number of reachable points on any
+				// scene. See buildMinimapState.
+				step: this.sceneScale.step,
 			}),
 		};
 		this.onState(state);
@@ -1605,16 +1661,34 @@ export class OrbitEngine {
 			return;
 		}
 		if (ev.code === "Escape") {
-			// Same two-stage rule as free flight: the cursor comes back first.
+			// Escape unwinds the walkthrough one layer at a time: the pointer lock
+			// first (same two-stage rule as free flight), then whatever transient
+			// thing is running, and only once nothing is left, the walkthrough
+			// itself.
+			//
+			// That last step is what makes the interior two-way. Clicking the scene
+			// is the way IN and this is the only way OUT — the chrome that used to
+			// carry an "overview" button is gone, and no other key leaves the mode,
+			// so without this an entered scene is a trap.
 			if (this.consumeEscape()) return;
+			const sonar = this.markers.sonarActive;
+			const touring = !!this.director.progress;
 			this.yieldTour();
-			if (this.markers.sonarActive) {
+			if (sonar) {
 				this.markers.hideSonar();
 				this.emit();
 			}
+			if (!sonar && !touring) this.exit();
 			return;
 		}
 		if (this.interiorBusy || ev.repeat) return;
+		// TEMPORARY (debug). The same dump the "log aim" button does, reachable while the
+		// pointer is captured by mouse-look. See `logAim`.
+		if (ev.code === "KeyL") {
+			ev.preventDefault();
+			this.logAim();
+			return;
+		}
 		if (ev.code === "Backspace") {
 			ev.preventDefault();
 			this.goBack();
@@ -1770,10 +1844,11 @@ export class OrbitEngine {
 	// Every visible interior surface under a screen point, nearest first. The
 	// intersect call computes and sorts the whole list anyway, so handing it all
 	// back costs nothing over returning just the first.
-	private raycastInteriorAll(
-		clientX: number,
-		clientY: number,
-	): Intersection[] {
+	// What the interior rays are cast against: the proxy (plus the floor slab that
+	// backs its leaks) while projecting, or the backdrop sphere in a sphere-only
+	// tour. Shared by the cursor ray and the waypoint's downward drop so the two can
+	// never disagree about what counts as a surface.
+	private interiorTargets(): Object3D[] {
 		const targets: Object3D[] = [];
 		if (this.projectionMode) {
 			if (this.proxyGroup) targets.push(this.proxyGroup);
@@ -1783,6 +1858,14 @@ export class OrbitEngine {
 			this.sphereA.updateMatrixWorld();
 			targets.push(this.sphereA);
 		}
+		return targets;
+	}
+
+	private raycastInteriorAll(
+		clientX: number,
+		clientY: number,
+	): Intersection[] {
+		const targets = this.interiorTargets();
 		if (targets.length === 0) return [];
 		const rect = this.canvas.getBoundingClientRect();
 		_cursorNdc.set(
@@ -1791,24 +1874,31 @@ export class OrbitEngine {
 		);
 		this.camera.updateMatrixWorld();
 		this.cursorRay.setFromCamera(_cursorNdc, this.camera);
-		// While the splat provides the picture, the proxy is hidden — but the cursor
-		// still needs it, because it is the only thing in the scene that knows where
-		// the surfaces are. The visibility walk therefore STOPS at the roots we hid
-		// ourselves, which keeps an object the USER hid inside the proxy correctly
-		// skipped: that check still runs, it just never reaches the group above it.
-		// Keyed on the splat being ON SCREEN, not merely switched on: inside the
-		// walkthrough the proxy is genuinely visible and carries the projection, and
-		// exempting it there would quietly stop honouring a proxy the user hid.
-		const forced = new Set<Object3D>();
-		if (this.splat.isActive) {
-			if (this.proxyGroup) forced.add(this.proxyGroup);
-			if (this.projection.proxyBase) forced.add(this.projection.proxyBase);
+		return this.cursorRay
+			.intersectObjects(targets, true)
+			.filter((h) => this.hitIsPickable(h));
+	}
+
+	// Shared by every ray that asks "what is in the way": the cursor, and the walk that
+	// places the marker. They have to agree — a surface the user hid is one the cursor
+	// sees straight through, and a marker that stopped at it would be resting against
+	// something invisible.
+	private hitIsPickable(h: Intersection): boolean {
+		const splat = this.splat.isActive;
+		for (let o: Object3D | null = h.object; o; o = o.parent) {
+			// While the splat provides the picture, the proxy is hidden — but the
+			// cursor still needs it, because it is the only thing in the scene that
+			// knows where the surfaces are. The walk STOPS at the roots we hid
+			// ourselves, which keeps an object the USER hid inside the proxy correctly
+			// skipped: that check still runs, it just never reaches the group above it.
+			// Keyed on the splat being ON SCREEN, not merely switched on: inside the
+			// walkthrough the proxy is genuinely visible and carries the projection,
+			// and exempting it there would quietly stop honouring a proxy the user hid.
+			if (splat && (o === this.proxyGroup || o === this.projection.proxyBase))
+				return true;
+			if (!o.visible) return false;
 		}
-		return this.cursorRay.intersectObjects(targets, true).filter((h) => {
-			for (let o: Object3D | null = h.object; o && !forced.has(o); o = o.parent)
-				if (!o.visible) return false;
-			return true;
-		});
+		return true;
 	}
 
 	// Interior geometry under a screen point (proxy + floor base, or the sphere).
@@ -1842,52 +1932,6 @@ export class OrbitEngine {
 			if (visible) return h.point.clone();
 		}
 		return null;
-	}
-
-	// Which storey a click on `hit` should go to.
-	//
-	// Normally that is simply the storey the geometry belongs to. The exception is
-	// looking UP: a ceiling belongs to the room beneath it, so testing the hit point
-	// alone answers "your own floor" and scopes the click back onto the storey you
-	// are already standing on — which is exactly what stopped clicking the ceiling
-	// from taking you upstairs. Pointing steeply above your own head is a request to
-	// go through the thing over your head, so it resolves to the storey above.
-	//
-	// Decided on the ray's PITCH rather than the surface normal: proxy normals are
-	// recomputed after decimation and the source winding is unreliable (the surface
-	// cursor already flips them toward the camera for exactly that reason), so
-	// "is this face pointing down at me" is not a question the geometry can answer.
-	// How steeply you are looking is not in doubt.
-	private targetFloorFor(hit: Intersection): number {
-		if (!this.hasFloorVolumes) return -1;
-		const cur = this.panoLevel[this.currentIndex] ?? -1;
-		if (cur >= 0) {
-			const plan = Math.hypot(
-				hit.point.x - this.camera.position.x,
-				hit.point.z - this.camera.position.z,
-			);
-			const pitch = Math.atan2(hit.point.y - this.camera.position.y, plan);
-			if (pitch > CEILING_PITCH && this.panoLevel.includes(cur + 1))
-				return cur + 1;
-			// The mirror of that, and the reason it needs its own rule rather than
-			// falling out of the geometry: looking DOWN, the thing you hit is the
-			// floor you are standing on, which belongs to your own storey — so the
-			// honest answer is "you are already here" and there is no way to ask for
-			// the storey below by pointing.
-			//
-			// Aiming at the ground WITHIN ARM'S REACH of where you stand is that ask.
-			// Radius rather than pitch does the work: past a step or two away, looking
-			// down means walking over there, and only right at your feet does it mean
-			// going through. (Inside this radius the pitch is steep anyway — the floor
-			// sits ~1.3m below the eye, so the far edge is already past 40°.)
-			if (
-				hit.point.y < this.camera.position.y &&
-				plan <= UNDERFOOT_RADIUS &&
-				this.panoLevel.includes(cur - 1)
-			)
-				return cur - 1;
-		}
-		return this.floorAt(hit.point);
 	}
 
 	// Whether this tour's floors carry described volumes at all. Older captures
@@ -1975,10 +2019,551 @@ export class OrbitEngine {
 			: best;
 	}
 
+	// WHICH CAPTURE DID THEY MEAN. Two things, and neither is a guess: the point the
+	// pointer is resting on, settled onto the floor, and WHICH WAY IS THROUGH — the
+	// surface's own plan normal turned away from the camera, or null where the surface
+	// is level and has no through.
+	//
+	// It used to displace the point instead: a stride along that normal, on the theory
+	// that aiming at a wall means the room beyond it. The theory is right and the
+	// method was not. Moving the measuring point throws away the one fact that
+	// discriminates between captures — how near each is to what the pointer is on — and
+	// replaces it with proximity to a spot a stride inside the masonry, where
+	// everything within a metre becomes a tie. Measured on this house: displaced, "Upper
+	// Hall Gallery" sat at 1.043 m and "Upper Circulation Spine" at 1.064 m, ELEVEN
+	// MILLIMETRES apart, and a two-centimetre twitch of the pointer threw the
+	// destination two metres across the house. From the pointer itself those two are
+	// 0.87 m and 2.63 m away — a margin nothing can twitch across.
+	//
+	// So the direction is handed back AS a direction, and `resolveAim` uses it to
+	// prefer the far side rather than to move the ruler.
+	private aimQuery(
+		hits: Intersection[],
+	): { point: Vector3; through: Vector3 | null } | null {
+		if (hits.length === 0) return null;
+		const near = hits[0];
+		const m = this.metrics;
+		// Which side of the surface we are asking about. Looking UP at something means
+		// we want to be UNDER it — aim at a carport roof and the answer is the floor
+		// beneath, not the roof — so the probe goes below the hit; anything else stays
+		// on top of what was aimed at.
+		const lookingUp = near.point.y > this.camera.position.y;
+		const probeY = near.point.y + (lookingUp ? -m.probeEps : m.probeEps);
+		// The surface's own normal, flattened into plan and turned to point AWAY from
+		// the camera — the direction "through" it. Its length is how lateral the
+		// surface is, and so how much of a stride the step is worth.
+		let step = 0;
+		_wpDir.set(0, 0, 0);
+		if (near.face) {
+			_wpDir
+				.copy(near.face.normal)
+				.transformDirection(near.object.matrixWorld);
+			// Turned to point along the view rather than back at it, using the ray that
+			// actually found this surface — not the camera's forward axis, which is only
+			// the same thing while the aim sits dead centre.
+			const c = this.camera.position;
+			if (
+				_wpDir.x * (near.point.x - c.x) +
+					_wpDir.y * (near.point.y - c.y) +
+					_wpDir.z * (near.point.z - c.z) <
+				0
+			)
+				_wpDir.negate();
+			_wpDir.y = 0;
+			const lateral = Math.min(1, _wpDir.length());
+			step = lateral * m.wpStandoff;
+			if (lateral > 1e-4) _wpDir.divideScalar(_wpDir.length());
+			else _wpDir.set(0, 0, 0);
+		}
+		_wpOut.set(
+			near.point.x,
+			this.settleAt(near.point.x, near.point.z, probeY),
+			near.point.z,
+		);
+		return { point: _wpOut, through: step > 1e-4 ? _wpDir : null };
+	}
+
+	// The height a waypoint settles to at one spot: the surface a person would be
+	// standing on there, read off the column of solids above and below it.
+	private settleAt(
+		x: number,
+		z: number,
+		probeY: number,
+		known?: ReturnType<OrbitEngine["columnAt"]>,
+	): number {
+		const spans = known ?? this.columnAt(x, z);
+		// Buried in something — stand on top of it rather than inside it.
+		const inside = spans.find((sp) => probeY > sp.bottom && probeY < sp.top);
+		if (inside) return inside.top;
+		// Otherwise the highest surface you could stand on at or below the probe.
+		// `probeY` is already nudged to the correct side, so one comparison covers
+		// both looking up and looking down.
+		for (const sp of spans) if (sp.standable && sp.top <= probeY) return sp.top;
+		// Nothing beneath: take the LOWEST standable surface above instead, and
+		// failing even that leave the point floating — the honest answer off the
+		// edge of a level.
+		let above: number | null = null;
+		for (const sp of spans) if (sp.standable) above = sp.top;
+		return above ?? probeY;
+	}
+
+	// Everything one aim resolves to: which capture a click lands on, whether you can
+	// see it, and where to draw the marker. ONE function, because the live cursor and
+	// the click have to agree exactly — two ways of choosing a destination is two
+	// answers that can differ, and the one on screen would be the wrong one.
+	//
+	// THE ORDER IS THE WHOLE DESIGN. The destination is chosen FIRST, and the marker is
+	// then derived from it. Every version of this that drew the marker independently —
+	// at the point past the surface under the pointer — eventually put it somewhere the
+	// click did not go, because two things chosen separately drift apart no matter how
+	// many tests are stacked on top. Resting on a bed marked one storey while the click
+	// crossed a room on another. Derivation is not a stricter test; it removes the
+	// second decision entirely.
+	//
+	// So: pick the capture, then WALK BACK from it toward the cursor and stop where the
+	// geometry does. See `walkBackFrom`. The marker still tracks the pointer, because
+	// the walk aims at the pointer, but it can only ever come to rest in the
+	// destination's own space — it started there and never crossed a surface to leave.
+	//
+	// Nothing here can refuse. A marker that is not drawn and a click that does nothing
+	// is the worst answer available: the pointer is over real geometry, the user has
+	// asked to go there, and silence reads as broken. Every aim at a surface resolves
+	// to some capture; when the first choice is disallowed the rule that disallowed it
+	// picks the replacement.
+	//
+	// `occluded` — the amber cursor, and whether the marker is drawn — means exactly
+	// one thing: the capture this click lands on is not currently in view.
+	//
+	// The returned marker is shared scratch — valid until the next aim is resolved,
+	// never to be retained.
+	private resolveAim(hits: Intersection[]): {
+		marker: Vector3;
+		occluded: boolean;
+		index: number;
+	} | null {
+		if (hits.length === 0) return null;
+		// WHICH CAPTURE. Measured from the pointer's own position — see `aimQuery` for
+		// why nothing is displaced — at the height a visitor standing there would be,
+		// since captures are recorded at eye height and measuring from a floor point
+		// handicaps your own storey by that height while the one below pays nothing.
+		//
+		// AIMING AT A SURFACE MEANS THE FAR SIDE OF IT, so a capture through the surface
+		// is preferred over a nearer one on this side. Preferred, not forced: it may be
+		// at most one typical hop further away (`wpThrough`), because past that it is
+		// not what the pointer meant, only the first thing the far half of the world
+		// happened to contain. Aiming at the back wall of a study, the far side holds
+		// the garden — 4.33 m out and a storey down — against 1.64 m for the landing
+		// behind you, and the landing is the honest answer.
+		const query = this.aimQuery(hits);
+		if (!query) return null;
+		const eye = this.standingEye(query.point);
+		let index = this.nearestPanoTo(eye, this.currentIndex);
+		if (index >= 0 && query.through) {
+			const far = this.nearestPanoBeyond(
+				eye,
+				query.point,
+				query.through,
+				this.currentIndex,
+			);
+			if (
+				far >= 0 &&
+				eye.distanceTo(v3(this.panos[far].position)) <=
+					eye.distanceTo(v3(this.panos[index].position)) +
+						this.metrics.wpThrough
+			)
+				index = far;
+		}
+		if (index < 0) return null;
+		let clear = this.isTargetClear(v3(this.panos[index].position));
+
+		// THE FLOOR RULE. Cross a storey only when you can SEE the spot you would land
+		// on — an open mezzanine below, a gallery above. Otherwise this is the arrows'
+		// job, and the click stays on the floor you are standing on. Re-picked, never
+		// refused. A floor holding no capture but the one under your feet keeps the
+		// original answer rather than leaving the click inert.
+		const curLevel =
+			this.currentIndex >= 0 ? (this.panoLevel[this.currentIndex] ?? -1) : -1;
+		if (!clear && curLevel >= 0 && (this.panoLevel[index] ?? -1) !== curLevel) {
+			const pinned = this.nearestPanoTo(
+				eye,
+				this.currentIndex,
+				curLevel,
+			);
+			if (pinned >= 0) {
+				index = pinned;
+				clear = this.isTargetClear(v3(this.panos[index].position));
+			}
+		}
+		return {
+			marker: this.walkBackFrom(index, hits[0]),
+			occluded: !clear,
+			index,
+		};
+	}
+
+	// A hit's face normal, flattened into plan and turned to face the walker, written
+	// into `out`. False when the face is level — it has no plan normal, so there is
+	// nothing for it to push the marker along.
+	private planNormal(h: Intersection, dir: Vector3, out: Vector3): boolean {
+		if (!h.face) return false;
+		out.copy(h.face.normal).transformDirection(h.object.matrixWorld);
+		if (out.dot(dir) > 0) out.negate();
+		out.y = 0;
+		if (out.lengthSq() < 1e-8) return false;
+		out.normalize();
+		return true;
+	}
+
+	// WHERE THE MARKER STANDS: walk from the destination toward the cursor and stop
+	// where the geometry stops you.
+	//
+	// This is what keeps the marker honest without pinning it to the capture and losing
+	// the tracking. It begins inside the destination's own space and moves toward the
+	// pointer, so it can only leave that space by passing through a surface — and it
+	// never does, because a surface is exactly what ends the walk. Whatever it settles
+	// on is somewhere a person standing at that capture could walk to in a straight
+	// line, which is the strongest sense in which a marker can be "where you are going"
+	// while still following your cursor.
+	//
+	// It also solves the case that broke the old placement outright. Your cursor is on
+	// the SIDE of the next platform. Stepping past that side face lands the marker
+	// inside the platform, or out the far end of it twenty metres away. Walking back
+	// from the capture — which stands on TOP — the first thing met is the platform's
+	// top surface, near the edge you are pointing at. Which is the answer a person
+	// would give.
+	//
+	// THE MARKER MUST NOT KNOW WHICH CAPTURE IT CAME FROM. The walk starts at one, but
+	// where it comes to rest has to be a fact about the geometry and the pointer alone,
+	// because the capture underneath changes discretely — three captures on a carpet
+	// behind one glass pane, and the nearest one flips as the pointer moves. Anything
+	// in the answer that depends on which capture is current becomes a jump with
+	// nothing on screen to explain it. Only a real edge in the geometry may move the
+	// marker abruptly: the end of a wall, the lip of a platform, a doorway.
+	//
+	// The capture therefore decides WHICH surface stops the walk, and the surface
+	// decides everything after that. See the clearance below, which is where this was
+	// getting broken.
+	private walkBackFrom(index: number, cursorHit: Intersection): Vector3 {
+		const m = this.metrics;
+		const from = v3(this.panos[index].position);
+		const ground = from.y - m.eyeHeight; // the destination's own floor
+		// THE WALK IS TAKEN IN PLAN, at the destination's own height. Following the
+		// line to the cursor in 3D lets the walk climb or dive: aiming down through a
+		// stairwell opening, nothing stops a descending ray and the marker comes to
+		// rest a storey below the capture it was supposed to be describing. Held level,
+		// the walk can only ever end somewhere on the destination's own floor, which is
+		// the property the marker needs. (`aimQuery` steps in plan for the same reason;
+		// it is the same mistake in both places.)
+		_walkDir.copy(cursorHit.point).sub(from);
+		_walkDir.y = 0;
+		const dist = _walkDir.length();
+		if (dist < 1e-6) return _walkOut.copy(from).setY(ground);
+		_walkDir.divideScalar(dist);
+
+		// A PERSON, NOT A LINE. One ray at the destination's eye asks whether a pencil
+		// could reach the pointer, which is not the question — and it answers
+		// differently from one pixel to the next. A doorway is open at head height and
+		// shut at waist height; a counter is the reverse. Sampled at one height only,
+		// detection flickers as the pointer creeps along a surface, and the whole
+		// clearance flickers with it: 8.6 cm of pointer travel measured 47.5 cm of
+		// marker. Sampling the height a walker actually occupies and taking the NEAREST
+		// hit makes the answer a property of the geometry rather than of which slice of
+		// it one ray happened to catch.
+		const targets = this.interiorTargets();
+		let blocked: Intersection | undefined;
+		for (let i = 0; targets.length > 0 && i < WALK_HEIGHTS.length; i++) {
+			_walkFrom.set(from.x, ground + m.eyeHeight * WALK_HEIGHTS[i], from.z);
+			this.walkRay.set(_walkFrom, _walkDir);
+			this.walkRay.near = 0;
+			this.walkRay.far = dist;
+			const h = this.walkRay
+				.intersectObjects(targets, true)
+				.find((x) => this.hitIsPickable(x));
+			if (h && (!blocked || h.distance < blocked.distance)) blocked = h;
+		}
+		// The blocking surface's normal, FLATTENED INTO PLAN and pointed back the way
+		// the walk came. Flattened because the walk is level and the height is locked,
+		// so only the horizontal part of a surface can push the marker anywhere; a
+		// sloped face otherwise contributes a shortened sideways push and a vertical
+		// one that is thrown away, which quietly under-clears the surface. A face with
+		// no horizontal part at all — the walk grazing a floor along its length — is
+		// not a barrier in plan and does not move the marker.
+		// WHAT THE MARKER HAS TO STAND CLEAR OF. Whatever stopped the walk — and
+		// failing that, the surface under the pointer itself, which is a barrier every
+		// bit as real: point at a door and the marker belongs on the destination's side
+		// of it, whether or not a level ray happened to catch it on the way.
+		//
+		// That fallback is the whole fix for a jerk that was trivial to trigger. The
+		// walk is one thin ray at the DESTINATION's height, while the pointer is
+		// somewhere else on the same surface — low on a door, high on a wall — so at
+		// head height it can sail clean through a doorway the pointer is nowhere near.
+		// Detection then flickers on and off between adjacent pixels and the whole
+		// clearance flickers with it: a measured 8.6 cm of pointer travel threw the
+		// marker 47.5 cm, which is the clearance exactly. With the fallback both
+		// answers describe the SAME barrier, so they differ by that surface's thickness
+		// — centimetres — instead of by all or nothing.
+		// ONLY WHAT THE WALK MET may move the marker. Treating the surface under the
+		// pointer as a barrier in its own right — a stopgap for the flickering above —
+		// is wrong, and worse than the flicker it was patching: the pointer lands on
+		// whatever happens to be under it, and most of that is not a barrier at all. A
+		// studio area rug two centimetres off the floor and a tray on a hall console
+		// each threw the marker a full clearance along the arbitrary horizontal normal
+		// of a sliver on their edge, planting it in front of the pointer while the
+		// click carried on into the next room. You walk over a rug. Sampling the walk
+		// properly is what that stopgap was standing in for.
+		const pushable = !!blocked && this.planNormal(blocked, _walkDir, _walkNrm);
+		// The pointer's own plan position, which is where the marker goes when nothing
+		// stands in the way.
+		_walkPt.copy(from).addScaledVector(_walkDir, dist);
+		let planNormal: [number, number, number] | null = null;
+		if (pushable) {
+			// Dropped perpendicularly onto the blocking surface and held a clearance
+			// clear of it. Measured off the POINTER rather than off the spot the walk
+			// happened to cross, because those differ by the surface's thickness and
+			// two captures on different bearings cross it at different points — which
+			// is the marker jumping sideways for no reason you can see.
+			// How far the pointer sits on the walker's side of the barrier, and how far
+			// the DESTINATION does. Same measure, same plane, directly comparable.
+			const q = _walkNrm.dot((blocked as Intersection).point);
+			const destDepth = _walkNrm.dot(from) - q;
+			if (destDepth < m.wpClearance) {
+				// THE CLEARANCE IS A PROMISE THAT CANNOT ALWAYS BE KEPT, and when it
+				// cannot, the destination itself is the only honest answer.
+				//
+				// The marker is meant to stand a clearance clear of the barrier, on the
+				// path from the destination to the pointer. If the DESTINATION is nearer
+				// to that barrier than the clearance is, no point on that path qualifies
+				// — walk the segment and the furthest point that clears the barrier sits
+				// at a NEGATIVE distance. There is nothing to place.
+				//
+				// This is not a rare corner; it is what a barrier crossed at a shallow
+				// angle looks like. A capture 0.74 m from the pointer, in open hallway,
+				// measures only 0.20 m from a wall its path grazes at 18 degrees — and
+				// 0.20 is less than the 0.48 promised. Pushing perpendicular anyway put
+				// the marker 0.70 m from that capture, hugging the wall it was meant to
+				// be clear of, while the click went to the capture. The perpendicular
+				// push assumes there is room to retreat into; here there is none.
+				//
+				// So it goes to the capture: the one position known to be valid, where
+				// the click lands, and what the marker claims to mark.
+				_walkPt.copy(from);
+			} else {
+				// Room to place it. Push the pointer perpendicular onto the clearance
+				// line — and only ever push, so a pointer already clear is left where it
+				// is rather than dragged back toward the barrier.
+				const depth = _walkNrm.dot(_walkPt) - q;
+				_walkPt.addScaledVector(
+					_walkNrm,
+					Math.max(0, m.wpClearance - depth),
+				);
+				// AND THEN WALK TO IT, because the push moved the marker sideways off the
+				// line the first walk proved clear, and nothing has vouched for where it
+				// landed. Clearing one surface says nothing about the rest of the room: a
+				// pointer on the near face of a wall, pushed half a metre off it, can come
+				// to rest inside the wardrobe behind. Measured on this house, exactly that
+				// — 0.49 m of clearance, and the marker buried in geometry.
+				//
+				// The same walk as before, at the same heights, now aimed at the marker
+				// rather than the pointer. If anything stands in the way the marker comes
+				// back down that line to a clearance short of it — a place the walk has
+				// just shown can be reached.
+				_walkAlt.set(_walkPt.x - from.x, 0, _walkPt.z - from.z);
+				const span = _walkAlt.length();
+				if (span > 1e-6) {
+					_walkAlt.divideScalar(span);
+					let stop = span;
+					for (let i = 0; targets.length > 0 && i < WALK_HEIGHTS.length; i++) {
+						_walkFrom.set(
+							from.x,
+							ground + m.eyeHeight * WALK_HEIGHTS[i],
+							from.z,
+						);
+						this.walkRay.set(_walkFrom, _walkAlt);
+						this.walkRay.near = 0;
+						this.walkRay.far = span;
+						const h = this.walkRay
+							.intersectObjects(targets, true)
+							.find((x) => this.hitIsPickable(x));
+						if (h && h.distance < stop) stop = h.distance;
+					}
+					if (stop < span) {
+						const t = Math.max(0, stop - m.wpClearance);
+						_walkPt.set(
+							from.x + _walkAlt.x * t,
+							_walkPt.y,
+							from.z + _walkAlt.z * t,
+						);
+					}
+				}
+			}
+			planNormal = _walkNrm.toArray() as [number, number, number];
+		}
+		// THE HEIGHT IS THE DESTINATION'S, FULL STOP. Not settled onto whatever happens
+		// to lie under the walk's end, which is where the last of the jerk was coming
+		// from: a drop is discrete, so sliding the pointer over the lip of a step, a
+		// table, or a hole in a decimated proxy snapped the marker up or down half a
+		// metre with nothing to justify it. Worse, it could put the marker on a surface
+		// at a different height from the one the click actually lands on — the marker
+		// standing on the bed while you arrive on the floor beside it.
+		//
+		// A capture stands an eye height above its own floor; that is what `eye`
+		// measures. So the floor it stands on is exactly this, and it is the only
+		// height the marker is ever allowed to have.
+		this.aimBlock = blocked
+			? {
+					source: "walk",
+					object: describeObject(blocked.object),
+					face: blocked.faceIndex ?? -1,
+					dist: blocked.distance,
+					point: blocked.point.toArray() as [number, number, number],
+					planNormal,
+				}
+			: null;
+		return _walkOut.set(_walkPt.x, ground, _walkPt.z);
+	}
+
+	// TEMPORARY (debug). Freeze one aim into a plain object, flat enough to read in a
+	// console and complete enough to go looking for the triangle afterwards.
+	private recordAim(
+		cursor: Intersection,
+		aim: { marker: Vector3; occluded: boolean; index: number },
+	): Record<string, unknown> {
+		const pano = this.panos[aim.index];
+		const b = this.aimBlock;
+		const cursorAt = cursor.point.toArray() as [number, number, number];
+		const markerAt = aim.marker.toArray() as [number, number, number];
+		// Is the marker standing INSIDE something? Tested at chest height in the column
+		// under it, which is the one thing the numbers alone never reveal and the first
+		// thing to know when a marker "looks like it is in front of the door".
+		const chest = markerAt[1] + this.metrics.eyeHeight * 0.5;
+		const buried = this.columnAt(markerAt[0], markerAt[2]).some(
+			(sp) => chest > sp.bottom && chest < sp.top,
+		);
+		const toDest = pano
+			? Math.hypot(
+					markerAt[0] - pano.position[0],
+					markerAt[2] - pano.position[2],
+				)
+			: -1;
+		return {
+			summary:
+				`cursor ${fmt3(cursorAt)} on ${describeObject(cursor.object)}` +
+				` face ${cursor.faceIndex ?? -1}\n` +
+				`      marker ${fmt3(markerAt)} — ${aim.occluded ? "SHOWN (destination out of view)" : "hidden (destination in view)"}\n` +
+				`      dest   #${aim.index} ${pano?.id ?? "?"} ${fmt3(pano?.position ?? [0, 0, 0])}` +
+				` level ${this.panoLevel[aim.index] ?? -1}\n` +
+				`      walk   ${b ? `clears ${b.object} face ${b.face} (${b.source}) at ${b.dist.toFixed(2)}m, plan normal ${b.planNormal ? fmt3(b.planNormal) : "none — level face, no push"}` : "nothing to clear"}\n` +
+				`      marker ${buried ? "IS BURIED in geometry" : "stands in open air"}` +
+				` · ${toDest.toFixed(2)} m from the capture in plan\n` +
+				`      camera ${fmt3(this.camera.position.toArray())}`,
+			cursor: cursorAt,
+			cursorObject: describeObject(cursor.object),
+			cursorFace: cursor.faceIndex ?? -1,
+			markerBuried: buried,
+			markerToDestPlan: toDest,
+			marker: markerAt,
+			occluded: aim.occluded,
+			destIndex: aim.index,
+			destId: pano?.id ?? null,
+			destName: pano?.name ?? null,
+			destPosition: pano?.position ?? null,
+			destLevel: this.panoLevel[aim.index] ?? -1,
+			currentIndex: this.currentIndex,
+			currentLevel: this.panoLevel[this.currentIndex] ?? -1,
+			blocker: b,
+			camera: this.camera.position.toArray(),
+			metrics: {
+				eye: this.metrics.eyeHeight,
+				wpClearance: this.metrics.wpClearance,
+				wpStandoff: this.metrics.wpStandoff,
+			},
+		};
+	}
+
+	// TEMPORARY (debug). Print everything behind the marker currently on screen: what
+	// the pointer is on, which capture the click resolves to, and — the part that
+	// matters for a jerk — the exact triangle that stopped the walk.
+	//
+	// Resolves the aim fresh at the moment it is called rather than reading a record
+	// kept per frame, so nothing is formatted or allocated until you ask. The answer is
+	// identical either way: the aim point is the viewport centre (`CENTER_CURSOR`), so
+	// it does not move when you reach for the button.
+	//
+	// Bound to L as well, because in mouse-look the pointer is captured and there is no
+	// cursor to click a button with.
+	logAim() {
+		const at = this.aim();
+		const hits = this.raycastInteriorAll(at.x, at.y);
+		const aim = hits.length > 0 ? this.resolveAim(hits) : null;
+		if (!aim) {
+			console.log(
+				`[aim] nothing resolved — ${hits.length === 0 ? "no scene geometry under the aim point" : "no capture to travel to"}`,
+			);
+			return;
+		}
+		const record = this.recordAim(hits[0], aim);
+		console.log(`[aim] ${record.summary}`, record);
+	}
+
+	// Where a visitor STANDING at `waypoint` would have their eyes.
+	//
+	// This is the frame every capture is recorded in — the anchor planner stands its
+	// cameras an eye height above a surface — so it is the frame a waypoint has to be
+	// compared in. A waypoint is a place to stand, i.e. a point on a floor, and
+	// matching a floor point against a set of eye-height points quietly handicaps
+	// your OWN storey by that eye height while the storey below pays nothing: its
+	// captures are simply below you, not offset. Near a stairwell that is enough to
+	// tip the answer downstairs.
+	//
+	// Fills a shared scratch vector; callers must not retain it.
+	private standingEye(waypoint: Vector3): Vector3 {
+		return _wpEye
+			.copy(waypoint)
+			.setY(waypoint.y + this.metrics.eyeHeight);
+	}
+
+	// The solids stacked in one vertical column, top-down, by casting a ray straight
+	// down through the whole scene.
+	//
+	// Faces arrive in pairs — entering a solid, then leaving it — so pairing them
+	// gives spans, and the gap between one span's bottom and the next span's top is
+	// clear air. `standable` is that gap measured against a person's height: a floor
+	// has a room above it, the underside of a slab has 40 cm of slab.
+	//
+	// Deliberately uses no surface normals. The proxy is decimated and its winding is
+	// unreliable — the surface cursor already flips normals toward the camera for
+	// exactly that reason — so "is this face pointing up" is not a question this
+	// geometry can answer, while "how much room is above it" is.
+	private columnAt(
+		x: number,
+		z: number,
+	): Array<{ top: number; bottom: number; standable: boolean }> {
+		const targets = this.interiorTargets();
+		if (targets.length === 0) return [];
+		const from = this.sceneTopY + 1;
+		this.dropRay.set(_dropFrom.set(x, from, z), _DOWN);
+		this.dropRay.near = 0;
+		this.dropRay.far = Math.max(1, from - this.sceneBottomY) + 1;
+		const ys = this.dropRay
+			.intersectObjects(targets, true)
+			.map((h) => h.point.y);
+		const out: Array<{ top: number; bottom: number; standable: boolean }> = [];
+		for (let i = 0; i < ys.length; i += 2) {
+			const top = ys[i];
+			// An unpaired trailing face is an open shell (a single-sided ground
+			// plane); treat it as a surface with nothing under it rather than
+			// discarding it, since it is usually the floor.
+			const bottom = i + 1 < ys.length ? ys[i + 1] : top;
+			const air = out.length === 0 ? Infinity : out[out.length - 1].bottom - top;
+			out.push({ top, bottom, standable: air >= this.metrics.standHeadroom });
+		}
+		return out;
+	}
+
 	// The floor point of a destination capture — where its affordance is drawn, and
-	// the same placement buildNav uses for a standing marker. The waypoint sits HERE,
-	// on the anchor a click actually lands on, and the tether from the cursor to it
-	// carries the "if I click here" part (see MarkerLayer.showGhost).
+	// the same placement buildNav uses for a standing marker. Free flight still uses
+	// this: out there the question is "where would this put me down", and a landing
+	// spot genuinely is a capture point rather than a spot on a wall.
 	//
 	// It used to be drawn on the cursor's own bearing instead — keeping the pointer's
 	// screen column and pinning only the height to the destination's floor — so that
@@ -1992,7 +2577,7 @@ export class OrbitEngine {
 	private destinationFloor(targetIdx: number): Vector3 {
 		// Scratch: showGhost copies this straight into the marker, never retains it.
 		const p = this.panos[targetIdx].position;
-		return _ghostFloor.set(p[0], p[1] - HOTSPOT_FLOOR_DROP, p[2]);
+		return _ghostFloor.set(p[0], p[1] - this.metrics.floorDrop, p[2]);
 	}
 
 	// Click-anywhere floor routing: raycast into the scene, then travel to the
@@ -2001,15 +2586,17 @@ export class OrbitEngine {
 	// of the scene into the void, which reads as "back out of here" — so it pulls
 	// up to the orbit rather than quietly doing nothing.
 	private clickAnywhere(clientX: number, clientY: number) {
-		const hit = this.raycastInterior(clientX, clientY);
-		if (!hit) {
+		const hits = this.raycastInteriorAll(clientX, clientY);
+		if (hits.length === 0) {
 			this.exit();
 			return;
 		}
-		// Scoped by the floor the clicked geometry is on, exactly as the live preview
-		// scopes it — so what the cursor promised is what the click delivers.
-		const best = this.autoHomeTarget(hit, this.targetFloorFor(hit));
-		if (best >= 0) this.traverse(best);
+		// The SAME function the live cursor drew with, floor rule and all, so the click
+		// lands exactly where the marker said it would. Sharing it is the point: any
+		// second way of picking a destination is a second answer that can disagree with
+		// the one on screen.
+		const aim = this.resolveAim(hits);
+		if (aim) this.traverse(aim.index);
 	}
 
 	// --- view toggles (which geometry each mode shows) ------------------------
@@ -2178,13 +2765,6 @@ export class OrbitEngine {
 	// is off by design, so offering the control would put a live-looking button in
 	// front of you that does nothing when pressed — which reads as the splat being
 	// broken rather than as the control being inapplicable.
-	private canToggleSplatView(): boolean {
-		return (
-			this.splat.ready &&
-			(this.mode === "overview" || this.mode === "freefly")
-		);
-	}
-
 	toggleProxyView() {
 		if (!this.canToggleProxyView()) return;
 		this.proxyView = !this.proxyView;
@@ -2193,45 +2773,6 @@ export class OrbitEngine {
 		this.canvas.style.cursor = "";
 		if (this.mode === "overview") this.setOverviewView();
 		else if (this.mode === "interior") this.setInteriorProxyView();
-		this.emit();
-	}
-
-	// Swap between the Gaussian splat and the mesh views. Off is the escape hatch:
-	// it restores the dollhouse/proxy exactly as they behaved before a splat
-	// existed, which is both the fallback for a broken splat and the way to reach
-	// the addressable per-object geometry.
-	toggleSplatView() {
-		if (!this.canToggleSplatView()) return;
-		this.splatView = !this.splatView;
-		this.addressing.setHover(null);
-		this.addressing.closeMenu();
-		this.canvas.style.cursor = "";
-		if (this.mode === "overview") this.setOverviewView();
-		else if (this.mode === "freefly") this.setFreeflyView();
-		this.emit();
-	}
-
-	/**
-	 * Move the splat in world space. This exists to settle a splat whose trainer
-	 * renormalized the scene: nudge it until it registers against the proxy, then
-	 * bake the numbers into the asset (tools/splat-to-web-sog.mjs --translate) and
-	 * drop this back to identity. Deliberately not persisted — a correction that
-	 * lives only in the viewer is one every other consumer gets wrong.
-	 */
-	setSplatTransform(patch: Partial<SplatTransform>) {
-		this.splatTransform = { ...this.splatTransform, ...patch };
-		this.splat.setTransform(this.splatTransform);
-		this.emit();
-	}
-
-	getSplatTransform(): SplatTransform {
-		return this.splatTransform;
-	}
-
-	toggleHighlight() {
-		this.highlightEnabled = !this.highlightEnabled;
-		if (!this.highlightEnabled) this.addressing.setHover(null);
-		this.canvas.style.cursor = "";
 		this.emit();
 	}
 
@@ -2472,9 +3013,15 @@ export class OrbitEngine {
 	): Vector3 | null {
 		if (type === "vertical") {
 			const c = from.clone().add(to).multiplyScalar(0.5);
+			// The floor on the arc's height keeps a short hop from reading as a
+			// straight line. Scale-derived: a fixed half-metre is a shallow bump in a
+			// cathedral and a vault over the ceiling in a doll's house.
 			c.y =
 				Math.max(from.y, to.y) +
-				Math.max(0.5, Math.abs(to.y - from.y) * 0.3);
+				Math.max(
+					this.metrics.eyeHeight * 0.3,
+					Math.abs(to.y - from.y) * 0.3,
+				);
 			return c;
 		}
 		if (type === "far") {
@@ -2560,17 +3107,52 @@ export class OrbitEngine {
 
 	// --- mode transitions -----------------------------------------------------
 
-	private nearestPanoTo(point: Vector3): number {
-		let best = 0;
-		let bestD = Infinity;
+	// The nearest capture on the FAR side of the plane through `at` with normal
+	// `through` — the half of the world the pointer is aiming into. -1 when that side
+	// holds nothing, which is the ordinary answer for the outward face of an exterior
+	// wall.
+	private nearestPanoBeyond(
+		point: Vector3,
+		at: Vector3,
+		through: Vector3,
+		exclude: number,
+	): number {
+		let best = -1;
+		let bestD = Number.POSITIVE_INFINITY;
 		for (let i = 0; i < this.panos.length; i++) {
-			const d = point.distanceToSquared(v3(this.panos[i].position));
+			if (i === exclude) continue;
+			const p = this.panos[i].position;
+			if ((p[0] - at.x) * through.x + (p[2] - at.z) * through.z <= 0)
+				continue;
+			const d = point.distanceToSquared(v3(p));
 			if (d < bestD) {
 				bestD = d;
 				best = i;
 			}
 		}
 		return best;
+	}
+
+	private nearestPanoTo(
+		point: Vector3,
+		exclude = -1,
+		onlyLevel = -1,
+	): number {
+		let best = -1;
+		let bestD = Infinity;
+		for (let i = 0; i < this.panos.length; i++) {
+			if (i === exclude) continue;
+			if (onlyLevel >= 0 && this.panoLevel[i] !== onlyLevel) continue;
+			const d = point.distanceToSquared(v3(this.panos[i].position));
+			if (d < bestD) {
+				bestD = d;
+				best = i;
+			}
+		}
+		// Callers that pass no exclusion always have at least one capture to find, so
+		// falling back to 0 keeps their old contract; an excluding caller genuinely
+		// can come up empty (a one-capture scene) and is checked for -1.
+		return best < 0 && exclude < 0 ? 0 : best;
 	}
 
 	private currentUserWorldPos(): Vector3 {
@@ -2753,11 +3335,7 @@ export class OrbitEngine {
 	}
 
 	private get dockRadius(): number {
-		return MathUtils.clamp(
-			this.sceneMaxDim * DOCK_RADIUS_FRAC,
-			DOCK_RADIUS_MIN,
-			DOCK_RADIUS_MAX,
-		);
+		return this.metrics.dockRadius;
 	}
 
 	// The anchor the glide should settle onto, or -1 for none.
@@ -2787,7 +3365,7 @@ export class OrbitEngine {
 			if (holdingOff && i === from) continue;
 			const p = v3(this.panos[i].position);
 			const dy = p.y - cam.y;
-			if (Math.abs(dy) > DOCK_MAX_DY) continue;
+			if (Math.abs(dy) > this.metrics.dockMaxDy) continue;
 			if (camLevel >= 0 && this.panoLevel[i] !== camLevel) continue;
 			// Vertical offset costs more than horizontal — see DOCK_DY_WEIGHT. This is
 			// the value ranked on as well as gated on, so being level with an anchor
@@ -2863,7 +3441,7 @@ export class OrbitEngine {
 	// there. It runs the walkthrough's own resolution — the surface under the
 	// cursor, the floor that surface belongs to, the anchor that best answers it —
 	// so both modes agree about where a click lands. The floor comes straight from
-	// the geometry rather than from targetFloorFor's look-up/look-down heuristics,
+	// the geometry rather than from any look-up/look-down heuristic,
 	// which are about a visitor rooted at one anchor and mean nothing in flight.
 	//
 	// Nothing under the cursor (aimed past the scene) falls back to the nearest
@@ -3033,8 +3611,20 @@ export class OrbitEngine {
 		if (best >= 0) this.traverse(best);
 	}
 
+	// Which way the you-are-here cone points ON THE MAP — an angle in the map's own
+	// frame, measured from "across the page" toward "down the page".
+	//
+	// It used to return the yaw straight out, which is right only while the map is
+	// a plan view: there, across the page IS world +X and down the page IS world
+	// +Z, so the yaw already was the map angle. On an elevation the same number
+	// would spin the cone about an axis the map does not have.
 	getFacingDeg(): number {
-		return (this.lon * 180) / Math.PI;
+		this.camera.getWorldDirection(_flyDir);
+		const f = toMap(this.mapBasis, [_flyDir.x, _flyDir.y, _flyDir.z]);
+		// Looking straight along the flattened axis leaves nothing to point at, so
+		// hold the last readable heading rather than snapping to an arbitrary one.
+		if (Math.hypot(f.u, f.v) < 1e-4) return (this.lon * 180) / Math.PI;
+		return (Math.atan2(f.v, f.u) * 180) / Math.PI;
 	}
 
 	// WASD: nearest graph neighbour inside a forward cone, one floor only.
@@ -3052,11 +3642,12 @@ export class OrbitEngine {
 		for (let i = 0; i < this.panos.length; i++) {
 			if (i === this.currentIndex) continue;
 			const p = this.panos[i].position;
-			if (Math.abs(p[1] - cur[1]) > WASD_MAX_Y_STEP) continue;
+			if (Math.abs(p[1] - cur[1]) > this.metrics.wasdRise) continue;
 			const dx = p[0] - cur[0];
 			const dz = p[2] - cur[2];
 			const dist2 = dx * dx + dz * dz;
-			if (dist2 < 1e-6 || dist2 > WASD_MAX_STEP * WASD_MAX_STEP) continue;
+			const stride = this.metrics.wasdStep;
+			if (dist2 < 1e-6 || dist2 > stride * stride) continue;
 			if ((dx * dirX + dz * dirZ) / Math.sqrt(dist2) < WASD_DIR_COS)
 				continue;
 			if (dist2 < bestDist2) {
@@ -3080,7 +3671,13 @@ export class OrbitEngine {
 		};
 		const userPos = this.currentUserWorldPos();
 		this.markers.positionYouMarker(userPos);
-		this.locateClip.constant = userPos.y + LOCATE_SLICE_ABOVE_EYE;
+		// Cut along the map's own axis: the roof off a building, the front off a
+		// diorama. `sign` says which side the map camera stands on, and the plane
+		// keeps everything on the far side of the cut from it.
+		const { axis, sign } = this.mapBasis;
+		this.locateClip.normal.set(0, 0, 0).setComponent(axis, -sign);
+		this.locateClip.constant =
+			sign * (userPos.getComponent(axis) + sign * this.metrics.sliceAboveEye);
 		this.renderer.clippingPlanes = [this.locateClip];
 		const flat = userPos.clone().sub(this.sceneCenter);
 		flat.y = 0;
@@ -3178,13 +3775,19 @@ export class OrbitEngine {
 		this.navGraph = null;
 		this.nodeDir = [];
 		this.chapters = [];
-		this.mapEdges = [];
 		this.history = [];
 		this.visited.clear();
 		this.pendingTravel = null;
 		this.arrival = null;
+		// Back to the fallback scale until the next scene is measured. Without this a
+		// load that bails out early ("nothing to show for this scene") would leave the
+		// previous scene's distances in force for whatever is shown next.
+		this.sceneScale = DEFAULT_SCALE;
+		this.metrics = DEFAULT_METRICS;
 		this.minimaps = [];
 		this.mapLabels = [];
+		this.mapBasis = readBasis(undefined);
+		this.levelWord = "floor";
 		this.panoLevel = [];
 		this.minimapPrefetch = [];
 		this.sphereAMat.uniforms.map.value = DUMMY_TEX;
@@ -3212,7 +3815,6 @@ export class OrbitEngine {
 		this.proxyView = false;
 		this.splat.clear();
 		this.splatView = true; // a scene that ships a splat leads with it
-		this.splatTransform = { ...IDENTITY_TRANSFORM };
 		this.splatReveal = 0;
 		this.splatRevealing = false;
 		this.splatRevealMs = SPLAT_REVEAL_MS;
@@ -3301,6 +3903,12 @@ export class OrbitEngine {
 				manifest && Array.isArray(manifest.map_labels)
 					? manifest.map_labels
 					: [];
+			// The map's frame comes from the slices themselves (the capture stamps
+			// each with the basis it drew that image in), so the viewer places
+			// captures with exactly the mapping that produced the picture.
+			this.mapBasis = readBasis(this.minimaps[0]?.basis);
+			const word = manifest?.profile?.level_word;
+			this.levelWord = typeof word === "string" && word ? word : "floor";
 
 			let proxyRoot: Group | null = null;
 			if (manifest?.proxy) {
@@ -3360,7 +3968,7 @@ export class OrbitEngine {
 			p.level >= 0 &&
 			p.level < this.minimaps.length
 				? p.level
-				: levelForY(this.minimaps, p.position[1]),
+				: levelForPosition(this.minimaps, p.position),
 		);
 		this.projectionMode = !!proxyRoot;
 		this.sharedOverview = !lite && !!proxyRoot;
@@ -3415,20 +4023,41 @@ export class OrbitEngine {
 		const size = box.getSize(new Vector3());
 		box.getCenter(this.sceneCenter);
 		this.sceneMaxDim = Math.max(size.x, size.y, size.z) || 1;
+		this.sceneTopY = box.max.y;
+		this.sceneBottomY = box.min.y;
 		this.rig.fit(box); // spend the shadow frustum's precision on this scene
 
-		this.camera.near = Math.max(0.02, this.sceneMaxDim * 0.002);
-		this.camera.far = Math.max(500, this.sceneMaxDim * 60);
+		// MEASURE THE SCENE BEFORE ANYTHING READS A DISTANCE FROM IT. Every metre
+		// value below — the clip planes, the nav graph's reach, the marker sizes, the
+		// line-of-sight trims — is derived from these three numbers, so this has to
+		// land first. See scale.ts for what is measured and why.
+		//
+		// The proxy is passed because the eye height is found by dropping a ray from
+		// each capture onto it; a tour without one falls back, and both are handled
+		// inside measureSceneScale.
+		this.sceneScale = measureSceneScale(
+			this.sceneMaxDim,
+			entries.map((p) => p.position),
+			this.proxyGroup,
+		);
+		this.metrics = navMetrics(this.sceneScale);
+		console.info(`[orbit] scene scale — ${describeScale(this.sceneScale)}`);
+
+		this.camera.near = this.metrics.cameraNear;
+		this.camera.far = this.metrics.cameraFar;
 
 		// Build the typed navigation graph now that geometry + panos are placed.
+		// `segmentBlocked` reads `metrics.losTrim`, so the measurement above is a
+		// hard prerequisite rather than a nicety.
 		this.navGraph = buildNavGraph(
 			entries.map((p) => ({ position: p.position, zone: p.zone })),
 			this.panoLevel,
 			(a, b) => this.segmentBlocked(a, b),
+			this.metrics,
 		);
 		this.buildSceneDirectory(entries);
 
-		this.markers.build(this.sceneMaxDim);
+		this.markers.build(this.sceneMaxDim, this.metrics);
 
 		const dist = this.sceneMaxDim * 1.6;
 		this.browsePos
@@ -3462,9 +4091,10 @@ export class OrbitEngine {
 		const dist = d.length();
 		if (dist < 1e-3) return false;
 		d.divideScalar(dist);
+		const trim = this.metrics.losTrim;
 		this.occluder.set(from, d);
-		this.occluder.near = 0.2;
-		this.occluder.far = dist - 0.2;
+		this.occluder.near = trim;
+		this.occluder.far = dist - trim;
 		if (this.occluder.far <= this.occluder.near) return false;
 		return this.occluder.intersectObject(this.proxyGroup, true).length > 0;
 	}
@@ -3478,21 +4108,23 @@ export class OrbitEngine {
 		const cx = this.camera.position.x;
 		const cy = this.camera.position.y;
 		const cz = this.camera.position.z;
+		const spread = this.metrics.aimSpread;
+		const trim = this.metrics.aimTrim;
 		for (const [ox, oz] of [
 			[0, 0],
-			[0.2, 0],
-			[-0.2, 0],
-			[0, 0.2],
-			[0, -0.2],
-		] as const) {
+			[spread, 0],
+			[-spread, 0],
+			[0, spread],
+			[0, -spread],
+		]) {
 			_losFrom.set(cx + ox, cy, cz + oz);
 			_losDir.copy(target).sub(_losFrom);
 			const dist = _losDir.length();
-			if (dist < 0.5) return true;
+			if (dist < this.metrics.aimMinDist) return true;
 			_losDir.divideScalar(dist);
 			this.occluder.set(_losFrom, _losDir);
-			this.occluder.near = 0.15;
-			this.occluder.far = dist - 0.15;
+			this.occluder.near = trim;
+			this.occluder.far = dist - trim;
 			if (this.occluder.far <= this.occluder.near) continue;
 			if (
 				this.occluder.intersectObject(this.proxyGroup, true).length ===
@@ -3520,22 +4152,6 @@ export class OrbitEngine {
 			else chapters.push({ zone, count: 1, firstIndex: i });
 		}
 		this.chapters = chapters;
-		const seen = new Set<string>();
-		const edges: MapEdge[] = [];
-		if (this.navGraph) {
-			for (const node of this.navGraph.nodes) {
-				for (const e of node.all) {
-					if (e.type === "far") continue;
-					const a = Math.min(node.index, e.to);
-					const b = Math.max(node.index, e.to);
-					const key = `${a}-${b}`;
-					if (seen.has(key)) continue;
-					seen.add(key);
-					edges.push({ a, b, type: e.type });
-				}
-			}
-		}
-		this.mapEdges = edges;
 	}
 
 	// --- dwell inspection ------------------------------------------------------
@@ -3690,10 +4306,6 @@ export class OrbitEngine {
 			return;
 		}
 		const here = v3(this.panos[this.currentIndex].position);
-		const ahead = new Vector3(Math.cos(this.lon), 0, Math.sin(this.lon));
-		// Out toward the top / bottom of the frame, from the angle rather than a
-		// hard-coded height, so the two stay put if the distance is ever retuned.
-		const rise = FLOOR_ARROW_DIST * Math.tan(FLOOR_ARROW_PITCH);
 		const items: Array<{ index: number; up: boolean; pos: Vector3 }> = [];
 		for (const step of [1, -1]) {
 			const level = cur + step;
@@ -3708,13 +4320,25 @@ export class OrbitEngine {
 				}
 			}
 			if (index < 0) continue;
+			// DIRECTLY OVERHEAD AND UNDERFOOT, on your own spot.
+			//
+			// They used to be planted out on the arrival heading, near the top and
+			// bottom edges of the frame, so they were in view without having to look
+			// for them. The cost was that they sat somewhere you were not, and turning
+			// around left them behind you.
+			//
+			// Straight up and straight down is where the way out of a storey actually
+			// is, and it is also exactly where the old look-up / look-at-your-feet
+			// gesture used to point — that gesture was invisible and had to be
+			// discovered, and this is the same idea made into something you can see
+			// and click. Drawn through the ceiling or the floor by the depth split, so
+			// "the way up is through there" reads directly.
 			items.push({
 				index,
 				up: step > 0,
 				pos: here
 					.clone()
-					.addScaledVector(ahead, FLOOR_ARROW_DIST)
-					.setY(here.y + step * rise),
+					.setY(here.y + step * this.metrics.arrowDist),
 			});
 		}
 		this.markers.buildFloorArrows(items);
@@ -3986,7 +4610,7 @@ export class OrbitEngine {
 		// ways so a cancelled dock fades back out instead of snapping off.
 		const wanted =
 			this.dockTarget >= 0
-				? MathUtils.clamp(1 - dockDist / DOCK_REVEAL_DIST, 0, 1)
+				? MathUtils.clamp(1 - dockDist / this.metrics.dockReveal, 0, 1)
 				: 0;
 		if (wanted > 0 || this.dockReveal > 0.001) {
 			this.dockReveal +=
@@ -3994,7 +4618,7 @@ export class OrbitEngine {
 				(1 - Math.exp(-(dt * 1000) / DOCK_REVEAL_TAU));
 			this.applyDockReveal();
 		}
-		if (this.dockTarget >= 0 && dockDist < DOCK_ARRIVE) {
+		if (this.dockTarget >= 0 && dockDist < this.metrics.dockArrive) {
 			this.commitDock(this.dockTarget);
 			return;
 		}
@@ -4079,7 +4703,10 @@ export class OrbitEngine {
 			!this.markers.hoveredNav &&
 			!this.markers.hoveredArrow;
 		const at = this.aim();
-		const hit = active ? this.raycastInterior(at.x, at.y) : null;
+		// The whole list, not just the nearest surface: the waypoint has to know where
+		// the thing under the cursor ENDS, which takes the hits behind the first one.
+		const hits = active ? this.raycastInteriorAll(at.x, at.y) : [];
+		const hit = hits[0] ?? null;
 		// One reticle, not two — but ONLY while the pointer is locked, where there is no
 		// OS cursor to conflict with anyway. Released, the cursor must come back: Esc's
 		// whole job is handing it over so the chrome can be reached, and hiding it here
@@ -4098,23 +4725,20 @@ export class OrbitEngine {
 		if (this.mode === "freefly" && this.dockTarget >= 0) {
 			// A dock in progress OWNS the waypoint. Showing where the glide is settling
 			// is what makes it read as a settle rather than a snatch — the destination
-			// is on screen, growing, before the camera ever gets there. No tether: the
-			// pointer did not ask for this, so drawing a line from it would be a lie.
+			// is on screen, growing, before the camera ever gets there.
 			this.markers.showGhost(
 				this.destinationFloor(this.dockTarget),
 				{ to: this.dockTarget, type: "walk", dy: 0 },
 				this.camera,
 				this.host.clientHeight,
-				null,
 			);
 			ghosted = true;
 		} else if (hit && this.mode === "freefly") {
 			// In flight the only question a cursor can answer is "where would this
 			// put me down", so it answers exactly that: a waypoint standing on the
-			// capture a click would land on, tethered back to the surface under the
-			// pointer. None of the interior's floor scoping or occlusion tinting
-			// applies — those describe a visitor rooted at one anchor, and you are
-			// not rooted at one.
+			// capture a click would land on. None of the interior's floor scoping or
+			// occlusion tinting applies — those describe a visitor rooted at one
+			// anchor, and you are not rooted at one.
 			const targetIdx = this.autoHomeTarget(hit, this.floorAt(hit.point), -1);
 			if (targetIdx >= 0) {
 				this.cursor.setColor(CURSOR_CLEAR);
@@ -4123,7 +4747,6 @@ export class OrbitEngine {
 					{ to: targetIdx, type: "walk", dy: 0 },
 					this.camera,
 					this.host.clientHeight,
-					hit.point,
 				);
 				ghosted = true;
 				// Recorded so the shared change-detection below STREAMS this pano
@@ -4144,100 +4767,50 @@ export class OrbitEngine {
 			}
 		} else if (hit && this.currentIndex >= 0) {
 			const curLevel = this.panoLevel[this.currentIndex] ?? -1;
-			// Ask the GEOMETRY which floor it is on, by testing the point against the
-			// floors' described volumes — not the nearest capture point, which is what
-			// this used to do and why pointing at a cliff face offered to send you to
-			// whichever storey happened to have an anchor near the rock. Terrain and
-			// the slab between storeys land in no volume at all, and -1 (on no floor)
-			// is the right answer for them. Tours captured before floors carried
-			// volumes keep the old nearest-anchor reading.
-			const hitLevel = this.targetFloorFor(hit);
-			// The floor under the cursor also SCOPES the destination, so the click
-			// cannot land on a storey the preview didn't name.
-			const targetIdx = this.autoHomeTarget(hit, hitLevel);
-			if (targetIdx >= 0) {
-				// Read the destination's OWN storey, never the storey of the geometry
-				// under the cursor. They agree whenever the hit resolved to a floor,
-				// because that floor then scoped the search — but they part company in
-				// two cases, and both were reachable:
-				//   • the hit is on no floor at all (terrain, a cliff, the slab between
-				//     storeys — 56% of this scene's volume), so the search ran
-				//     unscoped and could land anywhere;
-				//   • the scoped search found nothing on that floor and fell back to
-				//     the unscoped one.
-				// In both, `hitLevel` is -1 or stale, `crossesLevel` reads false, and a
-				// hop to another storey came up amber with no floor preview. What the
-				// colour promises is where you END UP, so it has to be read from there.
+			// `resolveAim` picks the destination, places the marker ON it, and decides
+			// whether to draw it at all. The click path calls the very same function, so
+			// what you are shown and where you go cannot drift apart.
+			const aim = this.resolveAim(hits);
+			if (aim) {
+				const { marker, occluded, index: targetIdx } = aim;
 				const destLevel = this.panoLevel[targetIdx] ?? -1;
-				const crossesLevel =
-					curLevel >= 0 && destLevel >= 0 && destLevel !== curLevel;
-				const occluded = !this.isTargetClear(
-					v3(this.panos[targetIdx].position),
-				);
-				// Out of sight is out of sight: BOTH cases wear the amber ring, so the
-				// cursor answers one question only — can you see where this click puts
-				// you? What differs is the second thing shown, and that follows from
-				// how far the answer is from you.
-				//
-				// Behind geometry on THIS floor gets a waypoint ON the destination
-				// anchor, tethered back to the cursor — the marker is the place you
-				// land, the line is the "if I click here" that summoned it.
-				//
-				// Changing storey gets the same treatment plus the 360 preview, and its
-				// waypoint is green with an up/down chevron. Placing the marker on the
-				// destination is what makes this work across floors: it lands where you
-				// will actually be, over your head or under your feet, and the tether
-				// running to it through the slab is the honest picture of the move.
-				//
-				// In plain sight needs neither: a quiet grey ring, and the directional
-				// arrow wherever the surface can carry one.
-				if (crossesLevel) {
-					// Green, matching the floor arrows: changing storey is one idea and
-					// it should wear one colour wherever it is offered, whether you
-					// reached it by pointing or by hovering an arrow.
-					this.cursor.setColor(NAV_COLORS.vertical);
-					const dy = destLevel - curLevel;
-					reach = {
-						index: targetIdx,
-						level: destLevel,
-						levelDelta: dy,
-					};
-					this.markers.showGhost(
-						this.destinationFloor(targetIdx),
-						// `vertical` gives it the green ring and the taller chevron, and
-						// `dy` points that chevron the way you are going.
-						{ to: targetIdx, type: "vertical", dy },
-						this.camera,
-						this.host.clientHeight,
-						hit.point,
-					);
-					ghosted = true;
-				} else if (occluded) {
+				if (occluded) {
+					// The click carries you somewhere you cannot see, so draw the marker —
+					// through whatever is hiding it, which is what the markers' two-pass
+					// depth split is for. It is on the floor you are already on, because
+					// an unseen storey change is re-picked back onto it in `resolveAim`,
+					// so there is nothing to announce and the marker is the amber portal
+					// rather than the green chevron.
 					this.cursor.setColor(NAV_COLORS.portal);
-					// Same storey, but still out of sight — so it previews too. The
-					// waypoint says WHERE the click lands; the panel says what is
-					// there. levelDelta 0 is what tells the panel this is a hop
-					// through geometry rather than a change of floor.
-					reach = {
-						index: targetIdx,
-						level: destLevel,
-						levelDelta: 0,
-					};
+					reach = { index: targetIdx, level: destLevel, levelDelta: 0 };
 					this.markers.showGhost(
-						this.destinationFloor(targetIdx),
+						marker,
 						{ to: targetIdx, type: "portal", dy: 0 },
 						this.camera,
 						this.host.clientHeight,
-						hit.point,
 					);
 					ghosted = true;
 				} else {
-					this.cursor.setColor(CURSOR_CLEAR);
+					// You can already see where this lands, so there is nothing a marker
+					// would add — you are looking straight at the spot. Pointing at the
+					// near wall of a small room and being sent to the capture beside you
+					// arrives here too, and honestly: no passage, so no promise of one.
+					//
+					// This is also the ONE path that may change storey, and the reason
+					// visibility is what licenses it — an open mezzanine you can see down
+					// onto. The cursor wears the green of the floor arrows to say so.
+					const crossesLevel =
+						curLevel >= 0 && destLevel >= 0 && destLevel !== curLevel;
+					this.cursor.setColor(
+						crossesLevel ? NAV_COLORS.vertical : CURSOR_CLEAR,
+					);
 					travel = v3(this.panos[targetIdx].position).sub(
 						this.camera.position,
 					);
 				}
 			} else {
+				// A tour of one capture, with nowhere else to go. Every other aim at real
+				// geometry resolves; `resolveAim` has no refusal in it.
 				this.cursor.setColor(CURSOR_CLEAR);
 			}
 		}

@@ -15,21 +15,38 @@ export type TourSource = {
 	resolveMinimap: (file: string) => string;
 };
 
-// One bird's-eye slice: the scene rendered top-down, cut at a Y "level" (storey)
-// the panos were captured on. `bounds` is the world-space XZ rectangle the image
-// spans, so a pano at world (x,z) maps to image fractions ((x-minX)/W, (z-minZ)/D)
-// — image +x is world +X, image +y (downward) is world +Z.
+// The rectangle a slice image spans, in the MAP's own frame: u runs across the
+// page, v runs down it. Which world axes those are is the basis's business, so
+// nothing here has to care. Tours captured before the map could look any way but
+// down carry `minX/maxX/minZ/maxZ` instead, which is the same rectangle for a plan
+// view; `readBounds` in minimap.ts accepts either.
 export type MinimapBounds = {
-	minX: number;
-	maxX: number;
-	minZ: number;
-	maxZ: number;
+	minU?: number;
+	maxU?: number;
+	minV?: number;
+	maxV?: number;
+	minX?: number;
+	maxX?: number;
+	minZ?: number;
+	maxZ?: number;
 };
+// Where the map camera stood and which way up the picture is. `view_from` names
+// the axis it sat on looking back at the scene — so that axis is the one flattened
+// away, and also the one storeys are stacked along. Absent on older tours, which
+// were all plan views.
+export type MinimapBasis = { view_from: string; image_down: string };
 export type MinimapLevel = {
 	level: number;
-	y: number; // the level's representative camera height (its match key)
+	// Where this storey sits along the flattened axis. `y` is the old name for the
+	// same number, kept because every tour captured so far carries it.
+	coord?: number;
+	y: number;
 	file: string;
 	bounds: MinimapBounds;
+	basis?: MinimapBasis;
+	// The two planes this slice was cut between, along the flattened axis.
+	cut?: number;
+	cut_far?: number;
 	// The floor describer's name for this storey (server/app/services/anchors.py).
 	// Deliberately characterizes the WHOLE floor — travel to a floor auto-homes to
 	// whichever anchor is nearest the cursor, so a name that promised one room
@@ -77,6 +94,17 @@ export type TourManifest = {
 	// shells, ground, cliff backdrops). An allow-list: an id absent from it is
 	// never offered for inspection, so an unclassifiable node fails closed.
 	objects?: string[];
+	// What kind of place this is (server/app/services/anchors.py `choose_profile`):
+	// which way its map looks, how tall whoever moves through it is, and the word
+	// its storeys go by. Absent on tours captured before it existed, where every
+	// scene was assumed to be a building seen from above.
+	profile?: {
+		form?: string;
+		view_from?: string;
+		image_down?: string;
+		inhabitant_height_m?: number;
+		level_word?: string;
+	};
 	// Zone names to print on the bird's-eye map, chosen by the map labeller and
 	// already pruned so no label sits inside another (see anchors.py
 	// `label_map_zones`). `center` is the world centre of the zone's bbox.
@@ -127,13 +155,15 @@ export type HoverPreview = {
 	headingU: number;
 };
 
-// The big preview, shown ONLY for a click that changes storey.
+// The big preview for a destination you cannot see from here — either behind
+// geometry on this storey, or on another one.
 //
-// It briefly covered every out-of-sight destination, walls included, which was too
-// much: not being able to see round a wall is a small question you can answer by
-// looking, and a panel opening over the view to answer it outweighed the problem.
-// A floor change is different — you have no way to picture where you are about to
-// be — so the panel is spent there, and the amber cursor handles the rest.
+// It was briefly restricted to floor changes alone, on the argument that not being
+// able to see round a wall is a small question you can answer by looking. In
+// practice the amber cursor answers WHERE the click lands and this answers WHAT is
+// there, and both questions are worth answering in both cases; `levelDelta` is what
+// tells them apart (0 means a hop through geometry rather than a change of
+// storey).
 //
 // It follows the nearest anchor to the cursor, so it re-targets continuously as the
 // pointer moves; the panel itself never unmounts and cross-dissolves between
@@ -147,7 +177,7 @@ export type ReachPreview = {
 	placeholderUrl: string; // instant blurred backdrop while the full image loads
 	dist: number; // metres from the eye to the destination
 	level: number; // destination floor, 0-based (-1 when unknown)
-	levelDelta: number; // storeys crossed, signed; never 0 (this only shows for floors)
+	levelDelta: number; // storeys crossed, signed; 0 for a hop through geometry
 	// There is deliberately no record of WHAT opened this. Everything docks in the
 	// same corner, and the colour follows `levelDelta` — the kind of MOVE — rather
 	// than the affordance, so a floor change is green whether you found it by
@@ -176,9 +206,6 @@ export type NodeDir = {
 	level: number;
 };
 export type Chapter = { zone: string; count: number; firstIndex: number };
-// Undirected edge for the minimap/dollhouse overlay — dashed when it's a phase
-// link so the map never lies.
-export type MapEdge = { a: number; b: number; type: EdgeType };
 
 // The right-click per-object menu, positioned in viewport coords. `label` is
 // null when opened over empty space (only the recovery actions show then).
@@ -203,20 +230,6 @@ export type OrbitState = {
 	objectHover: string | null; // label of the object under the cursor (overview)
 	proxyView: boolean; // overview shows the low-poly proxy instead of the lite dollhouse
 	canProxyView: boolean; // the proxy/lite swap is available (overview + both loaded)
-	// The Gaussian splat stands in for the scene's appearance. Orthogonal to
-	// `proxyView`: turning it off falls back to the mesh views, which is both the
-	// escape hatch for a scene with no splat and the way to reach the addressable
-	// dollhouse geometry.
-	splatView: boolean;
-	canSplatView: boolean;
-	// Live splat placement, surfaced ONLY so a misframed splat can be nudged into
-	// register against the proxy without a rebuild. Temporary by construction: a
-	// confirmed correction gets baked into the asset and this returns to identity.
-	splatTransform: {
-		position: [number, number, number];
-		rotation: [number, number, number];
-		scale: number;
-	} | null;
 	// TEMPORARY. How long free flight must sit still before it settles onto a nearby
 	// viewpoint, surfaced only so the value can be read while it is tuned by feel
 	// ([ and ] adjust it). Delete once a number is locked into DOCK_STILL_MS.
@@ -229,8 +242,6 @@ export type OrbitState = {
 	// hint, because Escape means something different either side of it: released, it
 	// leaves the mode; held, it only hands the cursor back.
 	mouseLook: boolean;
-	highlightEnabled: boolean; // hover-highlight the object under the cursor (toggleable)
-	canHighlight: boolean; // hover-highlight applies in this mode (overview / interior w/ objects)
 	contextMenu: ObjectMenu | null;
 	busy: boolean;
 	overlay: { msg: string; spinner: boolean; err: boolean } | null;
@@ -259,7 +270,10 @@ export type OrbitState = {
 	// Stable-per-scene directory + groupings for search / chapters / map lines.
 	nodes: NodeDir[];
 	chapters: Chapter[];
-	mapEdges: MapEdge[];
+	// The word this scene's storeys go by — "floor", "deck", "section" (see the
+	// capture profile in anchors.py). The chrome writes "deck 2" from it, so a ship
+	// stops being described as having floors.
+	levelWord: string;
 	// The bird's-eye minimap (interior / peek only). Every captured floor level is
 	// surfaced so the chrome can page between floors without moving the camera;
 	// `currentLevel` is the level the character is actually on. Per level, `points`
@@ -312,14 +326,9 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	objectHover: null,
 	proxyView: false,
 	canProxyView: false,
-	splatView: false,
-	canSplatView: false,
-	splatTransform: null,
 	dockDelayMs: 500,
 	freeflySpeed: 1,
 	mouseLook: false,
-	highlightEnabled: true,
-	canHighlight: false,
 	contextMenu: null,
 	busy: false,
 	overlay: null,
@@ -336,6 +345,6 @@ export const INITIAL_ORBIT_STATE: OrbitState = {
 	visited: [],
 	nodes: [],
 	chapters: [],
-	mapEdges: [],
+	levelWord: "floor",
 	minimap: null,
 };

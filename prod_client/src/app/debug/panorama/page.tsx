@@ -3,7 +3,7 @@
 import { useState, type ReactNode } from "react";
 import PanoramaImage from "@/components/PanoramaImage";
 import SceneGate from "@/components/SceneGate";
-import ViewerHeader from "@/components/ViewerHeader";
+import ViewerHeader from "../ViewerHeader";
 import { panoFiles, panoPlaceholderUrl, panoUrl, sceneId, type Scene } from "@/lib/scenes";
 
 export default function PanoramaPage() {

@@ -2388,7 +2388,22 @@ async function planAnchors(cell, seq) {
     }
     if (!job || job.status === "error")
         throw new Error((job && job.error) || "planning failed");
-    return Array.isArray(job.anchors) ? job.anchors : [];
+    return job;
+}
+
+// One line describing what the profiler decided this scene is (anchors.py
+// `choose_profile`). Worth surfacing rather than burying in the plan file: the map
+// axis is the one field here that visibly changes the walkthrough, and a scene
+// classified wrongly is far easier to spot from a word than from a wrong-looking
+// map three steps later.
+function describeProfile(p) {
+    if (!p || !p.view_from) return "profile: default (plan view)";
+    const view = p.view_from === "+Y" ? "plan view" : `viewed from ${p.view_from}`;
+    return `${p.form || "?"} · ${view} · ${p.level_word || "floor"}s · eye ${
+        typeof p.inhabitant_height_m === "number"
+            ? p.inhabitant_height_m.toFixed(2)
+            : "?"
+    }m`;
 }
 
 // Step 1 on its own: plan the anchors and let the server persist them. The plan is
@@ -2406,9 +2421,10 @@ async function planOnly() {
     }
     setTourStatus("planning anchors…");
     try {
-        const anchors = await planAnchors(c, seq);
-        if (anchors === null) return; // cell changed under us
-        setTourStatus(`${anchors.length} anchors planned`);
+        const job = await planAnchors(c, seq);
+        if (job === null) return; // cell changed under us
+        const anchors = Array.isArray(job.anchors) ? job.anchors : [];
+        setTourStatus(`${anchors.length} anchors planned · ${describeProfile(job.profile)}`);
         // Drop the cached overlay so it rebuilds from the new plan, then show it.
         if (anchorPoints) {
             viewer?.threeScene?.remove(anchorPoints);
@@ -2458,7 +2474,8 @@ async function ensureAnchors() {
         source = "planned";
         setOverlay("planning anchors (LLM)…");
         try {
-            anchors = await planAnchors(c, seq);
+            const job = await planAnchors(c, seq);
+            anchors = job && Array.isArray(job.anchors) ? job.anchors : [];
         } catch (e) {
             setOverlay(`anchor plan failed: ${e.message}`);
             return false;

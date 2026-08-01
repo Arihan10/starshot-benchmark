@@ -12,8 +12,16 @@
  * at all (just vertex colors), so it stays small; the only loss is per-vertex
  * (Gouraud) shading instead of full-resolution texture.
  *
- * Reads the RAW objects (PNG textures sharp can decode); the optimized twins are
- * KTX2/Basis, which would need a transcoder we don't have.
+ * PREFERS the RAW objects, whose PNG textures sharp can decode. The optimized
+ * twins are KTX2/Basis and sharp cannot read them — but the bake still runs on
+ * them, and publish.py will fall back to them so a cell with no raw meshes can
+ * still be looked at. What you lose is the COLOUR: with no decodable texture the
+ * old fallback was the material's base-colour factor, which Trellis leaves white
+ * on essentially every mesh, so the whole dollhouse came out one white mass with
+ * nothing to tell one object from another. An object whose texture could not be
+ * read is therefore given a flat DEBUG HUE instead, distinct from its neighbours,
+ * and the count of those is reported in the stats so a degraded bake announces
+ * itself rather than looking like a lighting bug.
  *
  * Usage:
  *   node bake-vertex-color.mjs --inputs-dir <raw dir> --out-file <scene.glb>
@@ -114,10 +122,32 @@ function sampleLinear(img, u, v, out) {
   }
 }
 
+// A flat colour for an object whose texture could not be decoded. Golden-ratio
+// hue stepping keeps consecutive objects far apart in hue without a palette that
+// can run out — the same trick the viewer uses to tint proxy objects.
+const DEBUG_SAT = 0.55;
+const DEBUG_LIGHT = 0.62;
+
+function hslToRgb(h, s, l) {
+  const a = s * Math.min(l, 1 - l);
+  const f = (n) => {
+    const k = (n + h * 12) % 12;
+    return l - a * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+
+// COLOR_0 is written in LINEAR space (see sampleLinear), so the hue is converted
+// on the way in or the dollhouse would come out washed out.
+function debugColor(index) {
+  return hslToRgb((index * 0.6180339887) % 1, DEBUG_SAT, DEBUG_LIGHT).map(srgbToLinear);
+}
+
 // Sample each primitive's base-color texture into a COLOR_0 attribute, then
 // strip the texture + UVs and matte the material so the vertex colors show.
-async function bakeColors(doc, sampleSize) {
+async function bakeColors(doc, sampleSize, debugRgb) {
   const cache = new Map(); // texture -> decoded image
+  let undecodable = 0; // primitives that HAD a texture we could not read
   for (const mesh of doc.getRoot().listMeshes()) {
     for (const prim of mesh.listPrimitives()) {
       const position = prim.getAttribute("POSITION");
@@ -139,15 +169,32 @@ async function bakeColors(doc, sampleSize) {
         }
         img = cache.get(tex);
       }
+      // Three cases, and they want different colours. A decoded texture is
+      // sampled per vertex. A material with no texture at all keeps its own
+      // base-colour factor, which is the honest answer for it. A material that
+      // HAS a texture we could not decode (the KTX2 case) gets the debug hue —
+      // its factor is almost always white and would render it invisible.
+      const unreadable = !!tex && !img;
+      if (unreadable) undecodable++;
+      const flat = unreadable
+        ? debugRgb
+        : [factor[0], factor[1], factor[2]];
 
       const colors = new Uint8Array(count * 4);
       const uvArr = uv ? uv.getArray() : null;
-      const rgb = [factor[0], factor[1], factor[2]];
+      const rgb = [0, 0, 0];
+      const sampled = !!(img && uvArr);
       for (let v = 0; v < count; v++) {
-        if (img && uvArr) sampleLinear(img, uvArr[v * 2], uvArr[v * 2 + 1], rgb);
-        colors[v * 4] = Math.round(Math.min(1, rgb[0] * factor[0]) * 255);
-        colors[v * 4 + 1] = Math.round(Math.min(1, rgb[1] * factor[1]) * 255);
-        colors[v * 4 + 2] = Math.round(Math.min(1, rgb[2] * factor[2]) * 255);
+        if (sampled) {
+          sampleLinear(img, uvArr[v * 2], uvArr[v * 2 + 1], rgb);
+          colors[v * 4] = Math.round(Math.min(1, rgb[0] * factor[0]) * 255);
+          colors[v * 4 + 1] = Math.round(Math.min(1, rgb[1] * factor[1]) * 255);
+          colors[v * 4 + 2] = Math.round(Math.min(1, rgb[2] * factor[2]) * 255);
+        } else {
+          colors[v * 4] = Math.round(Math.min(1, Math.max(0, flat[0])) * 255);
+          colors[v * 4 + 1] = Math.round(Math.min(1, Math.max(0, flat[1])) * 255);
+          colors[v * 4 + 2] = Math.round(Math.min(1, Math.max(0, flat[2])) * 255);
+        }
         colors[v * 4 + 3] = 255;
       }
       const buffer = doc.getRoot().listBuffers()[0] ?? doc.createBuffer();
@@ -177,6 +224,7 @@ async function bakeColors(doc, sampleSize) {
       }
     }
   }
+  return undecodable;
 }
 
 // Sloppy-decimate each primitive (geometry only) to at most `cap` triangles,
@@ -270,13 +318,14 @@ async function main() {
   const target = new Document();
   target.setLogger(QUIET);
   let skipped = 0;
-  for (const file of files) {
+  let flatObjects = 0; // objects whose texture could not be decoded
+  for (const [index, file] of files.entries()) {
     try {
       const src = await io.read(file);
       src.setLogger(QUIET);
       await src.transform(dequantize()); // float positions/UVs for sampling + simplify
       srcTris += triangleCount(src);
-      await bakeColors(src, SAMPLE_SIZE);
+      if (await bakeColors(src, SAMPLE_SIZE, debugColor(index))) flatObjects++;
       decimateObject(src, cap);
       labelObject(src, path.basename(file).replace(/\.glb$/i, ""));
       mergeDocuments(target, src);
@@ -309,9 +358,12 @@ async function main() {
   const outBytes = (await stat(opts.outFile)).size;
   const baked = files.length - skipped;
   console.error(
-    `[vcolor] ${baked}/${files.length} objects -> ${MB(outBytes)}, ${(srcTris / 1000).toFixed(0)}k -> ${(outTris / 1000).toFixed(0)}k tris`,
+    `[vcolor] ${baked}/${files.length} objects -> ${MB(outBytes)}, ${(srcTris / 1000).toFixed(0)}k -> ${(outTris / 1000).toFixed(0)}k tris` +
+      (flatObjects ? `, ${flatObjects} untextured (debug hues)` : ""),
   );
-  console.log(JSON.stringify({ objects: baked, skipped, srcTris, outTris, outBytes }));
+  console.log(
+    JSON.stringify({ objects: baked, skipped, flatObjects, srcTris, outTris, outBytes }),
+  );
 }
 
 main().catch((err) => {

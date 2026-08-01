@@ -78,6 +78,63 @@ function num(value, fallback) {
     return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
+// --- the map's frame ---------------------------------------------------------
+//
+// The bird's-eye map used to be exactly that: look straight down, keep X and Z,
+// throw away Y. That is right for a building and wrong for anything shaped
+// differently — a side-on level is 200 m wide, 60 m tall and 10 m deep, and
+// flattening it from above discards the only axis that says where you are.
+//
+// So the capture profile (anchors.py `choose_profile`) names WHERE THE MAP CAMERA
+// STANDS — `view_from`, the axis it sits on looking back — and WHICH WAY IS DOWN
+// the page. Everything else follows: the third direction is fixed by those two, the
+// axis named by `view_from` is the one flattened away, and it is also the axis
+// storeys are stacked along.
+//
+// A manifest without a profile gets the plan view every scene had before this,
+// so nothing about an existing tour changes.
+const AXIS_OF = { X: 0, Y: 1, Z: 2 };
+
+function axisVec(a) {
+    const v = [0, 0, 0];
+    v[AXIS_OF[a.slice(-1).toUpperCase()]] = a.trim().startsWith("-") ? -1 : 1;
+    return v;
+}
+
+function readBasis(profile) {
+    const viewFrom =
+        typeof profile?.view_from === "string" ? profile.view_from : "+Y";
+    const imageDown =
+        typeof profile?.image_down === "string" ? profile.image_down : "+Z";
+    let from;
+    let down;
+    try {
+        from = axisVec(viewFrom);
+        down = axisVec(imageDown);
+    } catch {
+        from = [0, 1, 0];
+        down = [0, 0, 1];
+    }
+    const forward = from.map((v) => -v); // the camera looks back at the scene
+    const up = down.map((v) => -v);
+    const right = [
+        forward[1] * up[2] - forward[2] * up[1],
+        forward[2] * up[0] - forward[0] * up[2],
+        forward[0] * up[1] - forward[1] * up[0],
+    ];
+    const axis = from[0] !== 0 ? 0 : from[1] !== 0 ? 1 : 2;
+    return {
+        viewFrom,
+        imageDown,
+        axis, // world component the map flattens away
+        sign: from[axis], // which side of it the camera stands on
+        right,
+        down,
+        up,
+        forward,
+    };
+}
+
 // The manifest's `minimap` block, resolved against the defaults above.
 function readMinimapOpts(manifest) {
     const m = manifest.minimap || {};
@@ -378,17 +435,22 @@ async function stitchPanoBlob(faces, faceSize, widthCap, quality, onProgress) {
 
 // --- bird's-eye minimap slices (one per Y level) -----------------------------
 
-// Cluster anchor Ys into levels by gap; returns [{ y, minY, indices }] low→high.
-// `levelEps` is the server's own floor-clustering gap (see readMinimapOpts), so
-// these slices match the floors it named.
-function groupAnchorLevels(positions, levelEps) {
+// Cluster captures into levels by gap ALONG THE MAP'S FLATTENED AXIS; returns
+// [{ y, minY, indices }] low→high. `levelEps` is the server's own clustering gap
+// (see readMinimapOpts), so these slices match the floors it named.
+//
+// Only the fallback path reaches this — a plan with floors ships its own grouping
+// — but a plan rebuilt from a captured tour.json loses the membership while KEEPING
+// the profile, so the axis has to be honoured here too or such a re-capture would
+// cluster a diorama by height.
+function groupAnchorLevels(positions, levelEps, axis = 1) {
     const order = positions
         .map((_, i) => i)
-        .sort((a, b) => positions[a][1] - positions[b][1]);
+        .sort((a, b) => positions[a][axis] - positions[b][axis]);
     const groups = [];
     let cur = null;
     for (const i of order) {
-        const y = positions[i][1];
+        const y = positions[i][axis];
         if (!cur || y - cur.lastY > levelEps) {
             cur = { indices: [], ys: [], lastY: y };
             groups.push(cur);
@@ -403,25 +465,34 @@ function groupAnchorLevels(positions, levelEps) {
     });
 }
 
-// Render one top-down orthographic slice (a horizontal slab at camera level, roof
-// cut open) into a PNG blob. The ortho camera looks straight down with -Z "up" in
-// the image, so the stored `bounds` map world (x,z) → image (left,top).
+// Render one orthographic slice of the scene into a PNG blob: a slab bounded by
+// two planes perpendicular to the map's flattened axis, seen from `basis`.
+//
+// For a plan view that is the familiar thing — a horizontal slab at camera height
+// with the roof cut open. For an elevation it is a slab of DEPTH with the near
+// face cut away, which is the same idea pointed sideways: remove what is between
+// the camera and the scene so you can see in.
+//
+// `bounds` is in the map's own (u, v) frame — u across the page, v down it — so
+// the stored rectangle maps world positions to image positions without the viewer
+// needing to know which world axes those were.
 async function captureMinimapBlob(
     renderer,
     scene,
     bounds,
-    cutTop,
-    cutBottom,
-    yTop,
-    yBot,
+    basis,
+    cutNear,
+    cutFar,
+    sliceLo,
+    sliceHi,
     background,
     exposure,
     res,
 ) {
-    const W = bounds.maxX - bounds.minX;
-    const D = bounds.maxZ - bounds.minZ;
-    const cx = (bounds.minX + bounds.maxX) / 2;
-    const cz = (bounds.minZ + bounds.maxZ) / 2;
+    const W = bounds.maxU - bounds.minU;
+    const D = bounds.maxV - bounds.minV;
+    const cu = (bounds.minU + bounds.maxU) / 2;
+    const cv = (bounds.minV + bounds.maxV) / 2;
 
     let pw;
     let ph;
@@ -433,15 +504,40 @@ async function captureMinimapBlob(
         pw = Math.max(1, Math.round((res * W) / D));
     }
 
-    const cam = new THREE.OrthographicCamera(-W / 2, W / 2, D / 2, -D / 2, 0.1, yTop - yBot + 4);
-    cam.position.set(cx, yTop + 2, cz);
-    cam.up.set(0, 0, -1);
-    cam.lookAt(cx, yBot, cz);
+    // Stand the camera clear of the near face, looking back along the flattened
+    // axis. An orthographic projection doesn't care how far back it is, so the
+    // margin only has to keep the near plane off the geometry.
+    const span = Math.max(1, sliceHi - sliceLo);
+    const margin = Math.max(2, span * 0.02);
+    const depth = span + 2 * margin;
+    const camSlice = (basis.sign > 0 ? sliceHi : sliceLo) + basis.sign * margin;
+    const centre = new THREE.Vector3();
+    for (let i = 0; i < 3; i++) {
+        centre.setComponent(
+            i,
+            centre.getComponent(i) + basis.right[i] * cu + basis.down[i] * cv,
+        );
+    }
+    centre.setComponent(basis.axis, (sliceLo + sliceHi) / 2);
+
+    const cam = new THREE.OrthographicCamera(-W / 2, W / 2, D / 2, -D / 2, 0.1, depth);
+    cam.position.copy(centre);
+    cam.position.setComponent(basis.axis, camSlice);
+    cam.up.set(basis.up[0], basis.up[1], basis.up[2]);
+    cam.lookAt(centre);
     cam.updateProjectionMatrix();
 
-    // World clip planes bounding a horizontal SLAB: keep cutBottom <= y <= cutTop.
-    const planeTop = new THREE.Plane(new THREE.Vector3(0, -1, 0), cutTop);
-    const planeBottom = new THREE.Plane(new THREE.Vector3(0, 1, 0), -cutBottom);
+    // The slab, as two world clip planes perpendicular to the flattened axis. A
+    // three.js plane keeps the half-space where `normal . p + constant >= 0`, so
+    // these read as: no nearer to the camera than `cutNear`, no further than
+    // `cutFar`, both measured along the axis in the direction the camera stands.
+    const n = new THREE.Vector3();
+    n.setComponent(basis.axis, -basis.sign);
+    const planeNear = new THREE.Plane(n.clone(), basis.sign * cutNear);
+    const planeFar = new THREE.Plane(
+        n.clone().negate(),
+        -basis.sign * cutFar,
+    );
     const prevClip = renderer.clippingPlanes;
     // The slice needs its own capture instance (it isn't square like a cube face),
     // but it runs the SAME pipeline — so the slab is lit, glazed and tone-mapped
@@ -453,14 +549,14 @@ async function captureMinimapBlob(
         pw,
         ph,
         0.1,
-        Math.max(1, yTop - yBot + 4),
+        Math.max(1, depth),
         50,
         background,
         exposure,
     );
     let data;
     try {
-        renderer.clippingPlanes = [planeTop, planeBottom];
+        renderer.clippingPlanes = [planeNear, planeFar];
         mini.renderCamera(scene, cam);
         data = readTargetTopDown(renderer, mini.rtColor, pw, ph, true);
     } finally {
@@ -503,7 +599,7 @@ function floorSpecFor(floors, y) {
     let best = null;
     let bestD = Infinity;
     for (const f of floors) {
-        const d = Math.abs((f?.y ?? 0) - y);
+        const d = Math.abs((f?.coord ?? f?.y ?? 0) - y);
         if (d < bestD) {
             bestD = d;
             best = f;
@@ -513,15 +609,14 @@ function floorSpecFor(floors, y) {
 }
 
 // The levels to slice, TAKEN FROM THE PLAN. The server decides where the scene
-// divides into storeys (anchors.py `plan_floors`, a model call reading the scene
-// rather than a gap threshold), assigns every capture to one, and ships both — so
-// there is one grouping in the system instead of the same rule implemented twice
-// and kept in step by hand.
+// divides into storeys (anchors.py `plan_floors`), assigns every capture to one,
+// and picks the two planes each slice is cut between — so there is one grouping in
+// the system instead of the same rule implemented twice and kept in step by hand.
 //
 // Returns null when the plan can't drive this: it has no floors, or it was rebuilt
 // from an old tour.json and so carries no membership. The caller then clusters, as
 // it always did.
-function planLevels(floors, positions, sliceBelow) {
+function planLevels(floors, positions, opts, basis) {
     if (!Array.isArray(floors) || floors.length === 0) return null;
     const out = [];
     for (const f of floors) {
@@ -530,44 +625,76 @@ function planLevels(floors, positions, sliceBelow) {
             (i) => Number.isInteger(i) && i >= 0 && i < positions.length,
         );
         if (indices.length === 0) return null; // a storey with no captures can't be sliced
-        const ys = indices.map((i) => positions[i][1]).sort((a, b) => a - b);
-        const y = num(f.y, ys[(ys.length - 1) >> 1]);
+        const cs = indices
+            .map((i) => positions[i][basis.axis])
+            .sort((a, b) => a - b);
+        const coord = num(f.coord, num(f.y, cs[(cs.length - 1) >> 1]));
         out.push({
-            y,
-            // Where to cut. The plan's `cut` sits under the storey's ceiling; the
-            // old behaviour (cut at the representative camera height) is the
-            // fallback for a plan that predates it.
-            cutTop: num(f.cut, y),
-            cutBottom: ys[0] - sliceBelow,
+            coord,
+            // Where to cut. `cut` is the near plane, the one that opens the scene
+            // up; `cut_far` is the back of the slab. Both come from the plan, which
+            // is the only place that knows whether this is a floor being opened at
+            // head height or a diorama being opened at its front face. The
+            // fallbacks are the pre-profile behaviour, for a plan that predates it.
+            cutNear: num(f.cut, coord),
+            cutFar: num(f.cut_far, cs[0] - opts.sliceBelow),
             indices,
             floor: f,
         });
     }
-    out.sort((a, b) => a.y - b.y);
+    // Ordered along the flattened axis in the direction the camera looks, so level
+    // 0 is the far side — the bottom floor of a building, the back of a diorama.
+    out.sort((a, b) => (a.coord - b.coord) * basis.sign);
     return out;
+}
+
+// The scene box's extent along one signed unit axis.
+function axisRange(box, vec) {
+    const i = vec[0] !== 0 ? 0 : vec[1] !== 0 ? 1 : 2;
+    const a = vec[i] * box.min.getComponent(i);
+    const b = vec[i] * box.max.getComponent(i);
+    return a <= b ? [a, b] : [b, a];
 }
 
 // Render + upload one slice per storey and return the manifest `minimaps` array
 // (empty on any failure — the tour stays valid). Also stamps each pano with the
 // level it stands on, so the viewer reads the grouping rather than re-deriving it.
-async function buildMinimaps(renderer, scene, panos, background, exposure, floors, opts, onLevel) {
+async function buildMinimaps(
+    renderer,
+    scene,
+    panos,
+    background,
+    exposure,
+    floors,
+    opts,
+    basis,
+    onLevel,
+) {
     if (panos.length === 0) return [];
     const positions = panos.map((p) => p.position);
     const box = new THREE.Box3().setFromObject(scene);
     if (box.isEmpty()) return [];
-    const pad = opts.padFrac * Math.max(box.max.x - box.min.x, box.max.z - box.min.z, 1);
+    // The footprint in the MAP's own frame: u across the page, v down it. Stored
+    // that way so the viewer can place a capture on the image without knowing
+    // which world axes those turned out to be.
+    const [u0, u1] = axisRange(box, basis.right);
+    const [v0, v1] = axisRange(box, basis.down);
+    const pad = opts.padFrac * Math.max(u1 - u0, v1 - v0, 1);
     const bounds = {
-        minX: box.min.x - pad,
-        maxX: box.max.x + pad,
-        minZ: box.min.z - pad,
-        maxZ: box.max.z + pad,
+        minU: u0 - pad,
+        maxU: u1 + pad,
+        minV: v0 - pad,
+        maxV: v1 + pad,
     };
+    const sliceLo = box.min.getComponent(basis.axis);
+    const sliceHi = box.max.getComponent(basis.axis);
+
     const levels =
-        planLevels(floors, positions, opts.sliceBelow) ??
-        groupAnchorLevels(positions, opts.levelEps).map((g) => ({
-            y: g.y,
-            cutTop: g.y,
-            cutBottom: g.minY - opts.sliceBelow,
+        planLevels(floors, positions, opts, basis) ??
+        groupAnchorLevels(positions, opts.levelEps, basis.axis).map((g) => ({
+            coord: g.y,
+            cutNear: g.y,
+            cutFar: g.minY - opts.sliceBelow,
             indices: g.indices,
             floor: null,
         }));
@@ -579,10 +706,11 @@ async function buildMinimaps(renderer, scene, panos, background, exposure, floor
             renderer,
             scene,
             bounds,
-            lv.cutTop,
-            lv.cutBottom,
-            box.max.y,
-            box.min.y,
+            basis,
+            lv.cutNear,
+            lv.cutFar,
+            sliceLo,
+            sliceHi,
             background,
             exposure,
             opts.res,
@@ -591,16 +719,24 @@ async function buildMinimaps(renderer, scene, panos, background, exposure, floor
         for (const i of lv.indices) panos[i].level = li;
         minimaps.push({
             level: li,
-            y: lv.y,
+            // Where this storey sits along the flattened axis. `y` is kept as an
+            // alias so a viewer written before the map could look any way but down
+            // still reads it.
+            coord: lv.coord,
+            y: lv.coord,
             file: `minimap-${li}.png`,
             bounds,
-            // The height this image was actually cut at, so a plan rebuilt from
-            // this tour re-cuts where this one did (routes.py `_plan_from_tour`).
-            cut: lv.cutTop,
+            // The frame this image was drawn in, so the viewer places captures and
+            // labels on it with the same mapping that produced it.
+            basis: { view_from: basis.viewFrom, image_down: basis.imageDown },
+            // The planes it was actually cut between, so a plan rebuilt from this
+            // tour re-cuts where this one did (routes.py `_plan_from_tour`).
+            cut: lv.cutNear,
+            cut_far: lv.cutFar,
             // The floor's name + world-space volume, so the walkthrough can title a
             // storey rather than calling it "floor 2", and can decide which floor an
             // arbitrary point belongs to (see the planner in anchors.py).
-            ...(lv.floor ? floorFields(lv.floor) : floorSpecFor(floors, lv.y)),
+            ...(lv.floor ? floorFields(lv.floor) : floorSpecFor(floors, lv.coord)),
         });
     }
     return minimaps;
@@ -880,6 +1016,7 @@ async function runCapture() {
     const panoWidth = manifest.pano?.width || DEFAULT_PANO_WIDTH;
     const quality = manifest.pano?.quality || DEFAULT_JPEG_QUALITY;
     const minimapOpts = readMinimapOpts(manifest);
+    const mapBasis = readBasis(manifest.profile);
     status(`job: ${RUN}/${SLOT}/${MODEL} — ${anchors.length} anchors @ ${faceSize}² faces`);
 
     const renderer = createCaptureRenderer({ onContextLost: fail });
@@ -968,6 +1105,7 @@ async function runCapture() {
             lighting.exposure ?? 1.0,
             Array.isArray(manifest.floors) ? manifest.floors : [],
             minimapOpts,
+            mapBasis,
             (li, n) => progress(`rendering minimap ${li + 1}/${n}…`),
         );
         // Report the cut heights, not just the count. Capture is headless, so this
@@ -975,8 +1113,10 @@ async function runCapture() {
         // produces a blank slice that looks like a render failure until you can see
         // the number it was taken at.
         status(
-            `minimaps: ${minimaps.length} level(s) @ ${minimapOpts.res}px, cut at ` +
-                minimaps.map((m) => `${m.cut.toFixed(2)}m`).join(" / "),
+            `minimaps: ${minimaps.length} level(s) @ ${minimapOpts.res}px, ` +
+                `viewed from ${mapBasis.viewFrom} (down ${mapBasis.imageDown}), cut at ` +
+                minimaps.map((m) => `${m.cut.toFixed(2)}`).join(" / ") +
+                "m",
         );
     } catch (e) {
         minimaps = [];
@@ -1013,6 +1153,9 @@ async function runCapture() {
         // Zone names for the bird's-eye map, already pruned so none nests inside
         // another (see anchors.py label_map_zones).
         map_labels: Array.isArray(manifest.map_labels) ? manifest.map_labels : [],
+        // What kind of place this is: the map's frame, the inhabitant's size, the
+        // word its storeys go by. The viewer reads all three.
+        profile: manifest.profile ?? null,
     };
     const fin = await postFinish({ manifest: tourManifest, renderer: glName });
     if (fin.ok) {

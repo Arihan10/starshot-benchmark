@@ -3,7 +3,7 @@
 import { Loader } from "@react-three/drei";
 import SceneCanvas from "@/components/SceneCanvas";
 import SceneGate from "@/components/SceneGate";
-import ViewerHeader from "@/components/ViewerHeader";
+import ViewerHeader from "./ViewerHeader";
 import { previewUrl } from "@/lib/scenes";
 
 export default function Page() {

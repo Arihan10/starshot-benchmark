@@ -85,7 +85,13 @@ ANCHOR_NAMER_MODEL = MODELS["gemini-flash-lite"]  # google/gemini-3.1-flash-lite
 SYSTEM_ANCHOR_PLANNER = """\
 You are the capture planner for a text-to-3D scene pipeline. A scene has already been built as a tree of regions (zones) and objects, each with an axis-aligned world-space bounding box. You plan the capture for ONE zone at a time: you are given that zone's own objects, plus every other zone that lives within the scene. For the given zone you produce two things — the camera "anchor points" for a 360° walkthrough of the zone, and the "connectors" that lead out of it into adjacent zones.
 
-ANCHORS - Produce as THOROUGH of a set as possible for THIS zone, optimizing for full spatial coverage of the zone. Imagine you are a human walking physically through the zone at discrete points: where do those points need to be to experience the zone fully without the jumps being jarring but remember each point of movement incurs a delay that may ruin the user experience if there are too many, as a general rule of thumb, don't space points closer than 2m together. Transitionatory points are just as important as key highlight points: moving from key location A -> key location B involves one or more important intermediate points even if the image is less interesting there. Try to anchor the camera to object top faces. DO NOT place an anchor inside an object's bounding box. Place anchors at a realistic viewing height above a surface. You may also be given a list of anchors ALREADY PLACED in other zones; treat those positions as taken: do NOT place a new anchor at or near any of them, and instead fill the gaps they leave.
+ANCHORS — cover the zone THOROUGHLY, and err on the side of MORE points. Imagine walking physically through the zone and stopping to look around: where do you have to stand to see all of it, with every step short enough that the jump is not jarring?
+
+The MINIMUM SPACING given with the zone below is both the closest two anchors may sit AND roughly how far apart they should actually be. Treat it as the spacing to AIM FOR wherever there is something to see — not merely a limit to stay outside of. Meeting the COVERAGE FLOOR given with the zone is a requirement, not a target to stop at: a zone with more to see deserves more points than its floor.
+
+Sparseness is the failure that matters here. A visitor who crosses a whole room in one jump, or who cannot get near enough to something to look at it, has lost the walkthrough — while an extra point costs only a little time to render. Transitionary points count as much as highlights: moving from key location A to key location B needs one or more intermediate points even where the view along the way is less interesting.
+
+Try to anchor the camera to object top faces. DO NOT place an anchor inside an object's bounding box. Place anchors at the EYE HEIGHT given with the zone below, above a surface. You may also be given a list of anchors ALREADY PLACED in other zones; treat those positions as taken — do NOT place a new anchor at or near any of them, and fill the gaps they leave instead.
 
 CONNECTORS — Some objects in this zone are how a visitor LEAVES it for an adjacent zone: doors, gates, staircases, ladders, elevators, etc. For each such object emit a connector with the object's `id` and the `target_zone` it leads into. `target_zone` MUST be the id of one of the zones in the provided zone list. Connectors are ALL-ENCOMPASSING: when a transition is a composite assembly, emit a connector for EVERY object that makes it up — e.g. for a staircase emit one for the steps/treads, one for each handrail, and one for the stringers/supports, all pointing at the SAME target_zone. all connectors and connector composite objects will be specially highlighted in the envronment, reason about what makes sense to include in the composite objects to make the highlights elegant, for example if a door has a header piece, ignore it as it doesn't need to shown as "part of the door". Only reference object ids from THIS zone's object list. If the zone has no way out, return an empty connectors list.
 
@@ -155,6 +161,34 @@ The `label` is what gets printed, so write it for a reader, not for the pipeline
 Output ONLY the JSON object matching the schema: each entry is an existing zone `id` and the `label` to print for it."""
 
 
+SYSTEM_CAPTURE_PROFILE = """\
+You are the capture profiler for a text-to-3D scene pipeline. A scene has been built from a text prompt as a tree of zones and objects with world-space bounding boxes. Before anything is captured you answer four questions about WHAT KIND OF PLACE this is. You are given the scene tree and, for each world axis, how far the scene runs along it and how much the objects actually vary along it.
+
+Coordinate convention: right-handed, Y-up, metres. +X = right, +Y = up, +Z = toward the viewer (front), -Z = away (back). Gravity pulls along -Y in every scene.
+
+1. FORM — one word for the shape of the place, from exactly this list:
+   volumetric   — a building or interior you move through in all three directions: a house, a hotel, an office, a ship.
+   flat         — a place spread out over the ground with little stacked above it: an arena, a campsite, a car park, a street.
+   diorama      — a scene built to be seen from ONE side, thin in the direction you look through it: a side-on game level, a stage set, a shop window, a display case.
+   terrain      — open landscape whose ground rises and falls continuously: a hillside, a shoreline, a canyon, a swamp.
+
+2. MAP VIEW — a visitor gets a small map of the storey they are standing on, drawn by pointing a camera at the scene, throwing away everything behind the near side, and flattening what is left. You choose where that camera stands and which way up the picture is.
+
+   `view_from` is the axis the camera sits on, looking back at the scene. `image_down` is the world direction that ends up pointing DOWN the page. They must name different axes; the third direction follows from them.
+
+   FOR ALMOST EVERY SCENE THE ANSWER IS THE PLAN VIEW: `view_from` "+Y", `image_down` "+Z" — looking straight down, with north-ish up the page. A building, a landscape, an arena, anything you walk around on the ground: the useful map is a floor plan, and the axis worth throwing away is the vertical one.
+
+   THE EXCEPTION IS A SCENE THAT IS THIN IN ONE HORIZONTAL DIRECTION AND TALL. Look at the axis figures: when one horizontal axis has a small extent AND the objects barely vary along it, while the vertical axis carries real structure, looking down that thin axis is the map — an ELEVATION, a section through the scene, exactly the way a side-on level is drawn. For a scene thin in Z and seen from the front that is `view_from` "+Z", `image_down` "-Y", which puts world up at the top of the page where a reader expects it.
+
+   The test to apply: if you flatten the scene along `view_from`, does what is left still tell a visitor where they are? Flattening a side-on level from above leaves a strip of platform tops with the whole climb thrown away, and that map is worthless however large it is drawn.
+
+3. INHABITANT HEIGHT — how tall, in metres, whoever moves through this scene is. This sets how far apart the 360° camera points are placed and how high above the floor they stand, so it is asking about the scale the scene is BUILT at, not about who is looking at it on a screen. A house, a street, a game level built for a human-sized character: about 1.6. A doll's house, a model railway, a tabletop diorama: a few centimetres. A scene built for something much larger: proportionally more. When the scene gives no reason to think otherwise, say 1.6.
+
+4. LEVEL WORD — the singular noun this scene's storeys go by, lower case, shown in the interface as "floor 2" or "deck 2". A building has floors, a ship has decks, a tower has storeys, a cliffside has terraces, a game level has sections, a landscape has levels. One word.
+
+Output ONLY the JSON object matching the schema."""
+
+
 # Anchors within this vertical gap (metres) belong to the same floor. The capture
 # re-derives the storeys independently (to cut its bird's-eye slices), so the two
 # groupings have to agree or a floor's name would land on the wrong slice — which
@@ -163,6 +197,128 @@ Output ONLY the JSON object matching the schema: each entry is an existing zone 
 # lacks the field, but a live capture always clusters with the number below. Edit
 # it here and both sides follow.
 FLOOR_LEVEL_EPS = 1.5
+
+
+# --- the capture profile ------------------------------------------------------
+#
+# Three facts about a scene that the rest of the capture cannot work out for
+# itself, decided once, up front, before any anchor is placed.
+#
+# WHICH WAY THE MAP LOOKS is the one that matters most. The bird's-eye map has
+# always projected out Y and kept X and Z, which is right for a building and wrong
+# for anything else. A side-scrolling level is 200 m wide, 60 m tall and 10 m deep:
+# looking down at it throws away the only axis that distinguishes position and
+# keeps the one that barely varies, and squeezes the result into a strip eight
+# times wider than it is tall. The fix is not a bigger map, it is a different
+# projection — and which axis to drop is a judgement about what the scene IS, not
+# a measurement, which is why it is asked for here.
+#
+# HOW BIG THE INHABITANT IS cannot be measured before the captures exist, and the
+# planner needs it to space them and to stand them at a viewing height. The viewer
+# measures the same quantity off the finished proxy (see prod_client scale.ts);
+# this is the half of that story which has to come first.
+#
+# WHAT A STOREY IS CALLED is pure vocabulary — "floor" is wrong for a ship, a
+# cliffside or a level — and costs nothing to get right.
+
+# The six signed axes, as they appear in the profile.
+_AXES = ("+X", "-X", "+Y", "-Y", "+Z", "-Z")
+
+
+def axis_index(a: str) -> int:
+    """0/1/2 for the X/Y/Z component a signed axis names."""
+    return {"X": 0, "Y": 1, "Z": 2}[a[-1].upper()]
+
+
+def axis_sign(a: str) -> float:
+    return -1.0 if a.strip().startswith("-") else 1.0
+
+
+def _axis_vec(a: str) -> tuple[float, float, float]:
+    v = [0.0, 0.0, 0.0]
+    v[axis_index(a)] = axis_sign(a)
+    return (v[0], v[1], v[2])
+
+
+def basis_right(view_from: str, image_down: str) -> tuple[float, float, float]:
+    """The world direction that points RIGHT across the map image.
+
+    Derived rather than asked for: with the camera looking back along `view_from`
+    and `image_down` pointing down the page, the third axis is fixed by the other
+    two (right = forward x up). Asking for it as well would only create a way for a
+    response to contradict itself."""
+    fx, fy, fz = _axis_vec(view_from)
+    forward = (-fx, -fy, -fz)  # the camera looks back toward the scene
+    dx, dy, dz = _axis_vec(image_down)
+    up = (-dx, -dy, -dz)
+    # `+ 0.0` normalises the -0.0 a cross product produces, so the value that
+    # crosses the wire is plain 0 and nothing downstream has to think about sign.
+    return (
+        forward[1] * up[2] - forward[2] * up[1] + 0.0,
+        forward[2] * up[0] - forward[0] * up[2] + 0.0,
+        forward[0] * up[1] - forward[1] * up[0] + 0.0,
+    )
+
+
+class CaptureProfile(BaseModel):
+    """What kind of scene this is, in the few respects the capture has to know.
+
+    `view_from` is the signed world axis the map camera sits on, looking back at
+    the scene: "+Y" is the bird's-eye view every scene used to get, "+Z" looks at
+    the front of a diorama. `image_down` is the world direction that points down
+    the page. Together they fix the map's whole frame — the third direction falls
+    out of them (see basis_right), and the axis named by `view_from` is the one
+    projected away, which is also the axis storeys are stacked along."""
+
+    form: str = "volumetric"
+    view_from: str = "+Y"
+    image_down: str = "+Z"
+    inhabitant_height_m: float = 1.6
+    level_word: str = "floor"
+
+    @property
+    def slice_axis(self) -> int:
+        """Index of the component the map projects out — and the one floors are
+        clustered along. 1 (Y) for a building, which is what every scene assumed
+        before this existed."""
+        return axis_index(self.view_from)
+
+
+# Every scene got this before the profile existed, so it is also what a scene with
+# no usable profile falls back to: look down, storeys stack in Y, a person is 1.6 m
+# tall, and a storey is called a floor.
+DEFAULT_PROFILE = CaptureProfile()
+
+
+# Server-side lengths, as multiples of the inhabitant's height. The same discipline
+# the viewer uses (prod_client/src/lib/orbit/scale.ts): the ratios are chosen so a
+# 1.6 m inhabitant reproduces the numbers these replace exactly, so nothing moves
+# on a human-scale scene and everything moves on a scene that is not.
+_PAD_RATIO = 0.3125  # was a flat 0.5 m
+_CUT_CLEARANCE_RATIO = 0.15625  # was a flat 0.25 m
+_SPACING_RATIO = 1.25  # was the planner prompt's flat "2 m"
+_SLICE_BELOW_RATIO = 1.25  # was the capture manifest's flat 2.0 m
+_LEVEL_EPS_RATIO = 0.9375  # was FLOOR_LEVEL_EPS, a flat 1.5 m
+
+
+def anchor_pad(p: CaptureProfile) -> float:
+    return p.inhabitant_height_m * _PAD_RATIO
+
+
+def plan_cut_clearance(p: CaptureProfile) -> float:
+    return p.inhabitant_height_m * _CUT_CLEARANCE_RATIO
+
+
+def anchor_spacing(p: CaptureProfile) -> float:
+    return p.inhabitant_height_m * _SPACING_RATIO
+
+
+def slice_below(p: CaptureProfile) -> float:
+    return p.inhabitant_height_m * _SLICE_BELOW_RATIO
+
+
+def level_eps(p: CaptureProfile) -> float:
+    return p.inhabitant_height_m * _LEVEL_EPS_RATIO
 
 
 class Anchor(BaseModel):
@@ -239,37 +395,54 @@ class Floor(BaseModel):
     floor that leaves this module."""
 
     level: int
-    y: float
+    # Where this storey sits along the map's SLICE AXIS — the axis the map projects
+    # out, which is Y for a plan view and something else for an elevation. Named
+    # `coord` rather than `y` because it stopped always being a height.
+    coord: float
     anchors: list[int]  # indices into the aggregated anchor list
     name: str | None = None
     origin: Vec3Tuple | None = None
     dimensions: Vec3Tuple | None = None
+    # The two planes the map slice is taken between, along the slice axis. `cut` is
+    # the NEAR one (everything nearer to the map camera than this is thrown away, so
+    # you can see in); `cut_far` is the BACK one. Both are decided here rather than
+    # by the capture, because "how far behind me should the slab reach" has opposite
+    # answers for a plan (just under the floor, so the storey below is excluded) and
+    # for an elevation (all the way to the back, so the scene's own ground and
+    # backdrop are kept).
     cut: float | None = None
+    cut_far: float | None = None
 
 
-def group_floors(anchors: list[PlacedAnchor]) -> list[Floor]:
-    """Cluster the planned anchors into floors by vertical gap, low to high: sort
-    by Y, cut when the gap exceeds FLOOR_LEVEL_EPS, representative Y = the group's
-    lower median.
+def group_floors(
+    anchors: list[PlacedAnchor],
+    axis: int = 1,
+    eps: float = FLOOR_LEVEL_EPS,
+) -> list[Floor]:
+    """Cluster the planned anchors into floors by gap along `axis`, low to high:
+    sort, cut when the gap exceeds `eps`, representative coordinate = the group's
+    lower median. `axis` is the map's slice axis — 1 (Y) for a plan view.
 
     This is now the FALLBACK, not the primary path — `plan_floors` asks the model
     where the scene divides and only lands here when the response can't be used.
     The floors it returns carry no name and no box, which is the same degraded
     state a failed describe pass used to leave behind: the client renders a plain
     ordinal and falls back to its nearest-anchor floor reading."""
-    order = sorted(range(len(anchors)), key=lambda i: anchors[i].position[1])
+    order = sorted(range(len(anchors)), key=lambda i: anchors[i].position[axis])
     groups: list[list[int]] = []
-    last_y = 0.0
+    last = 0.0
     for i in order:
-        y = anchors[i].position[1]
-        if not groups or y - last_y > FLOOR_LEVEL_EPS:
+        c = anchors[i].position[axis]
+        if not groups or c - last > eps:
             groups.append([])
         groups[-1].append(i)
-        last_y = y
+        last = c
     floors: list[Floor] = []
     for level, members in enumerate(groups):
-        ys = sorted(anchors[i].position[1] for i in members)
-        floors.append(Floor(level=level, y=ys[(len(ys) - 1) // 2], anchors=members))
+        cs = sorted(anchors[i].position[axis] for i in members)
+        floors.append(
+            Floor(level=level, coord=cs[(len(cs) - 1) // 2], anchors=members)
+        )
     return floors
 
 
@@ -394,6 +567,153 @@ def _render_scene_context(nodes: list[Node]) -> str:
     return "\n\n".join(parts)
 
 
+class ProfileSpec(BaseModel):
+    """The capture profiler's raw answer, before validation."""
+
+    form: str
+    view_from: str
+    image_down: str
+    inhabitant_height_m: float
+    level_word: str
+
+
+def _axis_extents(nodes: list[Node]) -> tuple[float, float, float]:
+    lo, hi = _scene_aabb(nodes)
+    return (hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2])
+
+
+def _axis_evidence(nodes: list[Node]) -> str:
+    """Per-axis extent and object spread — the measurements the map view is chosen
+    against, so the answer is read off the scene instead of guessed from its prose.
+
+    TWO numbers per axis, because they say different things. EXTENT is how far the
+    scene runs along the axis. SPREAD is the standard deviation of where its objects
+    actually sit. A backdrop plane or a ground slab can give an axis a large extent
+    while every real object hugs one value — and an axis with a big extent but a
+    tiny spread is the signature of a scene meant to be seen from one side, which
+    is exactly what a plan view would throw away."""
+    concrete = [n for n in nodes if not util.is_region(n)] or nodes
+    extents = _axis_extents(nodes)
+    rows: list[str] = []
+    for i, name in enumerate("XYZ"):
+        centres = [
+            (n.bbox.min_corner[i] + n.bbox.max_corner[i]) / 2 for n in concrete
+        ]
+        mean = sum(centres) / len(centres)
+        spread = math.sqrt(sum((c - mean) ** 2 for c in centres) / len(centres))
+        rows.append(
+            f"{name}: scene runs {extents[i]:8.2f} m along this axis;  "
+            f"objects are spread {spread:7.2f} m about their centre"
+        )
+    return "\n".join(rows)
+
+
+def build_profile_prompt(nodes: list[Node]) -> str:
+    """The scene hierarchy the other passes read, plus the per-axis measurements —
+    so the map view is a judgement made against evidence rather than against a
+    description of the scene."""
+    return (
+        "Profile the scene below: its form, how its map should be drawn, how big "
+        "whoever moves through it is, and what its storeys are called.\n\n"
+        "=== AXIS MEASUREMENTS ===\n"
+        f"{_axis_evidence(nodes)}\n"
+        "=== END AXIS MEASUREMENTS ===\n\n"
+        "=== SCENE HIERARCHY ===\n"
+        f"{_render_scene_context(nodes)}\n"
+        "=== END SCENE HIERARCHY ===\n\n"
+        "Now give this scene's profile."
+    )
+
+
+_FORMS = ("volumetric", "flat", "diorama", "terrain")
+
+
+def _validate_profile(spec: ProfileSpec, nodes: list[Node]) -> CaptureProfile:
+    """Turn one raw answer into a profile that cannot break the capture.
+
+    The map view is the field with teeth, so it gets the one real test. THE PLAN
+    VIEW IS ALWAYS ALLOWED — it is the default, it is right for almost every scene,
+    and nothing is risked by accepting it. Any OTHER choice has to be earned
+    against the measurements: the axis being thrown away must be genuinely the thin
+    one, at most half the smaller of the other two. That single rule keeps a
+    side-on level's elevation (10 m of depth against 60 m and 200 m) and refuses to
+    flatten a house through a wall (37.8 m of depth against 20 m and 34.5 m), which
+    is the failure that would cost the most: a map of a building drawn as a section
+    through it is not a worse map, it is not a map."""
+    form = spec.form.strip().lower()
+    if form not in _FORMS:
+        form = DEFAULT_PROFILE.form
+
+    view_from = spec.view_from.strip().upper().replace(" ", "")
+    image_down = spec.image_down.strip().upper().replace(" ", "")
+    if len(view_from) == 1:
+        view_from = "+" + view_from  # a bare "Y" means "+Y"
+    if len(image_down) == 1:
+        image_down = "+" + image_down
+    ok = (
+        view_from in _AXES
+        and image_down in _AXES
+        and axis_index(view_from) != axis_index(image_down)
+    )
+    if ok and axis_index(view_from) != 1:
+        extents = _axis_extents(nodes)
+        a = axis_index(view_from)
+        others = [extents[i] for i in range(3) if i != a]
+        ok = extents[a] <= 0.5 * min(others)
+    if not ok:
+        view_from = DEFAULT_PROFILE.view_from
+        image_down = DEFAULT_PROFILE.image_down
+
+    # An inhabitant cannot be a sizeable fraction of the scene's own height, and a
+    # non-positive one would divide the whole derived-scale table by zero.
+    vertical = _axis_extents(nodes)[1]
+    ceiling = max(0.02, vertical * 0.5) if vertical > 0 else 50.0
+    height = spec.inhabitant_height_m
+    if not math.isfinite(height) or height <= 0:
+        height = DEFAULT_PROFILE.inhabitant_height_m
+    height = min(max(height, 0.01), ceiling)
+
+    # One lower-case word; the interface writes "deck 2" straight from it.
+    word = spec.level_word.strip().lower().split()
+    first = word[0] if word else ""
+    level_word = (
+        first[:16] if first.isalpha() and len(first) >= 3 else DEFAULT_PROFILE.level_word
+    )
+
+    return CaptureProfile(
+        form=form,
+        view_from=view_from,
+        image_down=image_down,
+        inhabitant_height_m=height,
+        level_word=level_word,
+    )
+
+
+async def choose_profile(nodes: list[Node]) -> CaptureProfile:
+    """Profile the scene with the fixed namer model, BEFORE any anchor is planned —
+    the planner needs the inhabitant's height to space its captures, and the floor
+    pass needs the map axis to know which way storeys stack.
+
+    Any failure falls back to the plan-view profile every scene had before this
+    existed, so the worst case is exactly the old behaviour. Standalone: no SlotLog
+    binding, no cache, retries unlogged."""
+    if not nodes:
+        return DEFAULT_PROFILE
+    llm.set_model(ANCHOR_NAMER_MODEL)
+    try:
+        result, _reasoning, _usage, _raw, _gen_ids = await llm.call_llm_once(
+            system=SYSTEM_CAPTURE_PROFILE,
+            user=build_profile_prompt(nodes),
+            output_schema=ProfileSpec,
+            model=ANCHOR_NAMER_MODEL,
+            step="capture_profile",
+            log_retries=False,
+        )
+    except Exception:  # noqa: BLE001 - a plan is worth far more than its profile
+        return DEFAULT_PROFILE
+    return _validate_profile(result, nodes)
+
+
 def _zone_brief(region: Node) -> str:
     """Identity-only entry for the connector target list: id + description + bbox,
     no objects (a zone's objects are shown only when it is the zone being
@@ -406,12 +726,76 @@ def _zone_brief(region: Node) -> str:
     return util.braces("\n".join(lines))
 
 
+def _content_extent(zone: Node, zone_objects: list[Node]) -> float:
+    """How far the zone's actual CONTENT reaches, along its longest axis.
+
+    Measured from the objects rather than the zone's declared box, for the same
+    reason the depth limit is: a zone box is a generous volume the generator was
+    free to fill, and its size says nothing about how much is in it. A zone whose
+    objects huddle in one corner of a large box should not be asked for the
+    coverage a large box implies."""
+    lo = [math.inf] * 3
+    hi = [-math.inf] * 3
+    for o in zone_objects:
+        for k in range(3):
+            lo[k] = min(lo[k], o.bbox.min_corner[k])
+            hi[k] = max(hi[k], o.bbox.max_corner[k])
+    if lo[0] == math.inf:  # a zone with no objects of its own
+        return max(zone.bbox.size)
+    return max(hi[k] - lo[k] for k in range(3))
+
+
+def _coverage_floor(zone: Node, zone_objects: list[Node], spacing: float) -> int:
+    """The fewest anchors this zone should come back with.
+
+    Its content's longest run divided by the spacing — i.e. how many stops it takes
+    to walk the length of what is there. Deliberately a LOWER bound and a crude
+    one: it counts a single line through the zone and ignores everything to either
+    side, so a zone with any real width should exceed it comfortably.
+
+    Calibrated against two planned scenes. The modern house, whose coverage reads
+    well, sits at or above this figure in almost every zone. The platformer, which
+    reads sparse, sits below it in every large one — 8 anchors for a 30 m stretch
+    against a floor of 15, 6 for a 20 m stretch against 10. So the number
+    separates the two cases it needs to separate, which is all a floor has to do.
+
+    CAPPED BY HOW MUCH IS THERE. Distance alone over-reaches badly on a zone that
+    owns a few large things: the root pass owns a level's shared ground and shell,
+    so its content "runs" the whole 120 m and a pure distance floor demands sixty
+    anchors for ten objects. Two anchors per object is the other end of the same
+    question — how much is there to look at — and taking the smaller of the two
+    keeps a long thin zone honest without asking a mostly-empty one for a crowd."""
+    reach = round(_content_extent(zone, zone_objects) / max(spacing, 1e-6))
+    return max(3, min(reach, 2 * len(zone_objects)) if zone_objects else reach)
+
+
+def _inhabited_band(nodes: list[Node], axis: int) -> tuple[float, float]:
+    """How far the scene's actual GEOMETRY reaches along one axis — the concrete
+    objects only, ignoring the zone boxes.
+
+    Those two differ, and the difference is the bug this exists for. A zone's
+    declared box is a generous volume the generator was free to fill; the geometry
+    inside it may occupy a fraction of that. On a side-on level the zones are
+    metres deep while everything playable sits in a slab a couple of metres thick,
+    and a planner told to cover the ZONE dutifully places capture points out in
+    the empty part of it — in front of the scene, looking back at it from the
+    void."""
+    lo, hi = math.inf, -math.inf
+    for n in nodes:
+        if util.is_region(n):
+            continue
+        lo = min(lo, n.bbox.min_corner[axis])
+        hi = max(hi, n.bbox.max_corner[axis])
+    return (lo, hi) if lo <= hi else (0.0, 0.0)
+
+
 def build_zone_prompt(
     nodes: list[Node],
     zone: Node,
     zone_objects: list[Node],
     regions: list[Node],
     placed_anchors: list[PlacedAnchor],
+    profile: CaptureProfile = DEFAULT_PROFILE,
 ) -> str:
     """Descoped planner context for ONE zone: the scene header + the identity of
     every zone (so connectors can name a `target_zone`), object detail for only
@@ -463,7 +847,44 @@ def build_zone_prompt(
         f"{objects_block}\n"
         "=== END ZONE TO PLAN ===\n\n"
         f"{placed_block}"
+        # The two figures the system prompt defers to. They are per-scene, not
+        # universal: a scene built at doll scale wants captures centimetres apart at
+        # a few centimetres' height, and the same words with the old hard-coded "2 m"
+        # would have produced a plan for a house laid over a dolls' house.
+        f"MINIMUM SPACING between anchors: {anchor_spacing(profile):.2f} m\n"
+        f"COVERAGE FLOOR for this zone: at least "
+        f"{_coverage_floor(zone, zone_objects, anchor_spacing(profile))} anchors "
+        f"(its content runs {_content_extent(zone, zone_objects):.1f} m at that "
+        f"spacing). Return fewer only if the zone is genuinely almost empty.\n"
+        f"EYE HEIGHT to stand anchors at above a surface: "
+        f"{profile.inhabitant_height_m:.2f} m\n"
+        f"{_depth_clause(nodes, profile)}\n"
         "Now produce the anchors and connectors for THIS zone."
+    )
+
+
+def _depth_clause(nodes: list[Node], profile: CaptureProfile) -> str:
+    """For a scene built to be seen from one side, the hard limit on how deep a
+    capture may sit. Empty for an ordinary scene, which is walked in all three
+    directions and needs no such rule.
+
+    Stated as a measured interval rather than as advice, because "stay in the
+    scene" is exactly the kind of instruction that reads as satisfied while being
+    ignored — the zone boxes say there is room, and there is, it is just empty."""
+    if profile.slice_axis == 1:
+        return ""
+    axis = "XYZ"[profile.slice_axis]
+    lo, hi = _inhabited_band(nodes, profile.slice_axis)
+    return (
+        f"DEPTH LIMIT — this scene is built to be seen from one side, and every "
+        f"capture point must sit INSIDE it. Its geometry occupies {axis} from "
+        f"{lo:.2f} m to {hi:.2f} m, and every anchor's {axis} must fall in that "
+        f"range. The zones are declared deeper than the scene is actually built, "
+        f"so there is empty space inside them: an anchor placed out there stands "
+        f"in front of the scene looking back at it across a void, and its 360° "
+        f"capture shows the level from outside instead of from within. Vary the "
+        f"other two axes freely to cover the zone; do not vary {axis} to fill "
+        f"depth that has nothing in it.\n"
     )
 
 
@@ -548,6 +969,7 @@ def build_floor_planner_prompt(
     nodes: list[Node],
     anchors: list[PlacedAnchor],
     names: dict[int, str],
+    profile: CaptureProfile = DEFAULT_PROFILE,
 ) -> str:
     """The same scene context the point namer reads — every zone and object with
     its world-space box, which is what a floor's extent gets measured against —
@@ -569,20 +991,44 @@ def build_floor_planner_prompt(
         "=== CAPTURE HEIGHTS (low to high) ===\n"
         f"{_height_ladder(anchors, names)}\n"
         "=== END CAPTURE HEIGHTS ===\n\n"
+        f"This scene's storeys are called {profile.level_word}s; the interface "
+        f"writes \"{profile.level_word} 2\", so name them in keeping with that.\n"
+        f"{_cut_axis_clause(nodes, profile)}\n"
         "Now give the scene's floors, lowest first."
     )
 
 
-# Anchors sit at eye height, so a box grown to contain them would cut the floor off
-# at the visitor's eyes; this pads that safety expansion out to a plausible room.
-_ANCHOR_PAD = 0.5
+def _cut_axis_clause(nodes: list[Node], profile: CaptureProfile) -> str:
+    """What `plan_cut` means when the map is NOT drawn from above.
 
-# How far under a storey's ceiling the map cut is forced to sit. The top of a
-# floor's box IS its ceiling — the box is the headroom a visitor has — so a cut
-# level with it keeps the ceiling and the map renders as a blank lid. This is the
-# backstop for the single most likely way to get that number wrong: handing back
-# the top of the box.
-_PLAN_CUT_CLEARANCE = 0.25
+    The MAP CUT section of the system prompt is written in the language of a plan
+    — a height, under the ceiling, above head height — because that is what almost
+    every scene gets. When the map is an elevation the cut is still a plane, but a
+    plane of DEPTH, and asking for a height would get one: a number that is
+    perfectly sensible and applied to the wrong axis.
+
+    Note this changes nothing about the storeys themselves. They stack vertically
+    here as everywhere; only the plane the map is sliced on has moved."""
+    if profile.slice_axis == 1:
+        return ""
+    axis = "XYZ"[profile.slice_axis]
+    lo, hi = _inhabited_band(nodes, profile.slice_axis)
+    return (
+        f"THE MAP OF THIS SCENE IS AN ELEVATION, not a plan: it is drawn looking "
+        f"along {profile.view_from}, so `plan_cut` is a {axis} value and not a "
+        f"height. Give it as the {axis} of a plane just in FRONT of the scene, so "
+        f"the map sees the storey face-on with nothing standing between. The "
+        f"geometry occupies {axis} from {lo:.2f} m to {hi:.2f} m, so a little "
+        f"beyond {hi:.2f} m is right. Everything behind the cut is kept. The "
+        f"storeys themselves still stack vertically and their boxes are still "
+        f"world-space boxes — only the cut has moved to another axis.\n"
+    )
+
+
+# The two lengths below are now derived from the profile's inhabitant height
+# (see anchor_pad / plan_cut_clearance); they are passed in per call.
+
+
 
 # A runaway guard, not a policy. A real scene can genuinely have many storeys, so
 # this sits far above any plausible answer; a response past it is not a reading of
@@ -658,6 +1104,7 @@ def _assemble_floors(
     anchors: list[PlacedAnchor],
     scene_lo: Vec3Tuple,
     scene_hi: Vec3Tuple,
+    pad: float,
 ) -> list[Floor]:
     """Turn the model's proposed storeys into the scene's floors.
 
@@ -690,8 +1137,8 @@ def _assemble_floors(
         ys = [anchors[j].position[1] for j in idxs]
         room_lo = boxes[i - 1][1][1] if i > 0 else scene_lo[1]
         room_hi = boxes[i + 1][0][1] if i + 1 < len(boxes) else scene_hi[1]
-        boxes[i][0][1] = max(room_lo, min(boxes[i][0][1], min(ys) - _ANCHOR_PAD))
-        boxes[i][1][1] = min(room_hi, max(boxes[i][1][1], max(ys) + _ANCHOR_PAD))
+        boxes[i][0][1] = max(room_lo, min(boxes[i][0][1], min(ys) - pad))
+        boxes[i][1][1] = min(room_hi, max(boxes[i][1][1], max(ys) + pad))
 
     floors: list[Floor] = []
     for (lo, hi), spec, idxs in zip(boxes, ordered_specs, members):
@@ -703,8 +1150,8 @@ def _assemble_floors(
         for j in idxs:
             p = anchors[j].position
             for ax in (0, 2):
-                lo[ax] = min(lo[ax], p[ax] - _ANCHOR_PAD)
-                hi[ax] = max(hi[ax], p[ax] + _ANCHOR_PAD)
+                lo[ax] = min(lo[ax], p[ax] - pad)
+                hi[ax] = max(hi[ax], p[ax] + pad)
                 lo[ax] = max(lo[ax], scene_lo[ax])
                 hi[ax] = min(hi[ax], scene_hi[ax])
         if any(hi[ax] <= lo[ax] for ax in range(3)):
@@ -713,7 +1160,7 @@ def _assemble_floors(
         floors.append(
             Floor(
                 level=len(floors),
-                y=ys[(len(ys) - 1) // 2],
+                coord=ys[(len(ys) - 1) // 2],
                 anchors=idxs,
                 name=spec.name.strip() or None,
                 origin=(lo[0], lo[1], lo[2]),
@@ -724,7 +1171,9 @@ def _assemble_floors(
     return floors
 
 
-def _resolve_plan_cut(floor: Floor, anchors: list[PlacedAnchor]) -> None:
+def _resolve_plan_cut(
+    floor: Floor, anchors: list[PlacedAnchor], clearance: float, axis: int = 1
+) -> None:
     """Settle one floor's map cut, IN PLACE.
 
     The model's number is a judgement about what roofs this storey, so it is kept
@@ -733,7 +1182,7 @@ def _resolve_plan_cut(floor: Floor, anchors: list[PlacedAnchor]) -> None:
 
       * TOO HIGH and the slice keeps the ceiling, so the map renders as a lid with
         the whole storey hidden under it. The cut is forced to clear the top of the
-        floor's own box by `_PLAN_CUT_CLEARANCE`.
+        floor's own box by `clearance`.
       * TOO LOW and the slice passes beneath the floor's own cameras, throwing away
         the furniture and walls the map exists to show. It is never dropped below
         the lowest capture standing on this storey.
@@ -741,9 +1190,9 @@ def _resolve_plan_cut(floor: Floor, anchors: list[PlacedAnchor]) -> None:
     With no usable number — the clustering fallback, or a response that omitted it
     — this falls back to the median camera height on the floor, which is exactly
     where the capture used to cut before the cut was asked for at all."""
-    ys = sorted(anchors[i].position[1] for i in floor.anchors)
+    ys = sorted(anchors[i].position[axis] for i in floor.anchors)
     if not ys:
-        floor.cut = floor.y
+        floor.cut = floor.coord
         return
     lowest = ys[0]
     cut = floor.cut
@@ -751,7 +1200,7 @@ def _resolve_plan_cut(floor: Floor, anchors: list[PlacedAnchor]) -> None:
         cut = ys[(len(ys) - 1) // 2]  # the median camera — the pre-cut behaviour
     ceiling = math.inf
     if floor.origin is not None and floor.dimensions is not None:
-        ceiling = floor.origin[1] + floor.dimensions[1] - _PLAN_CUT_CLEARANCE
+        ceiling = floor.origin[axis] + floor.dimensions[axis] - clearance
     # The storey's own cameras win a fight with a degenerate box: a band shorter
     # than the clearance would otherwise drive the cut below the floor entirely.
     floor.cut = min(max(cut, lowest), max(lowest, ceiling))
@@ -761,25 +1210,34 @@ async def plan_floors(
     nodes: list[Node],
     anchors: list[PlacedAnchor],
     names: dict[int, str],
+    profile: CaptureProfile = DEFAULT_PROFILE,
 ) -> list[Floor]:
     """Decide the scene's floors with the fixed namer model: where it divides, what
     each storey is called, how far each reaches, and where each one's map is cut.
     Runs after the point namer so it can read what each storey actually holds.
 
-    Falls back to the height clustering (`group_floors`) whenever the response
-    can't be used — the call failed, it named no floors, it named absurdly many, or
-    nothing survived validation. That fallback yields unnamed, unbounded floors,
-    which is precisely what a failed describe pass yielded before, so this can
-    never be worse than the behaviour it replaces. Standalone: no SlotLog binding,
-    no cache, retries unlogged."""
+    Falls back to clustering whenever the response can't be used — the call failed,
+    it named no floors, it named absurdly many, or nothing survived validation. That
+    fallback yields unnamed, unbounded floors, which is precisely what a failed
+    describe pass yielded before, so this can never be worse than the behaviour it
+    replaces.
+
+    The model is asked for EVERY scene, whatever its map looks like. Storeys and
+    the map's axis are independent: a cutaway building, a ship in section and a
+    tiered level are all drawn as elevations and all have real floors, so deciding
+    the storeys from the map's projection is answering the wrong question with the
+    wrong tool. Storeys stack vertically; the map is drawn however it reads best.
+    Standalone: no SlotLog binding, no cache, retries unlogged."""
     if not anchors:
         return []
+    scene_lo, scene_hi = _scene_aabb(nodes)
+    pad = anchor_pad(profile)
     floors: list[Floor] = []
     llm.set_model(ANCHOR_NAMER_MODEL)
     try:
         result, _reasoning, _usage, _raw, _gen_ids = await llm.call_llm_once(
             system=SYSTEM_FLOOR_PLANNER,
-            user=build_floor_planner_prompt(nodes, anchors, names),
+            user=build_floor_planner_prompt(nodes, anchors, names, profile),
             output_schema=FloorSpecs,
             model=ANCHOR_NAMER_MODEL,
             step="floor_plan",
@@ -788,12 +1246,28 @@ async def plan_floors(
     except Exception:  # noqa: BLE001 - an anchor plan is worth far more than its floor names
         result = None
     if result is not None and 0 < len(result.floors) <= _MAX_FLOORS:
-        scene_lo, scene_hi = _scene_aabb(nodes)
-        floors = _assemble_floors(result.floors, anchors, scene_lo, scene_hi)
+        floors = _assemble_floors(result.floors, anchors, scene_lo, scene_hi, pad)
     if not floors:
-        floors = group_floors(anchors)
+        floors = group_floors(anchors, 1, level_eps(profile))
+    # The CUT is along the map's axis, which is NOT the storey axis. Storeys stack
+    # vertically whatever the map does; the cut is a plane perpendicular to
+    # whichever axis the map flattens, so it is a height on a plan and a depth on
+    # an elevation.
+    axis = profile.slice_axis
+    below = slice_below(profile)
     for f in floors:
-        _resolve_plan_cut(f, anchors)
+        _resolve_plan_cut(f, anchors, plan_cut_clearance(profile), axis)
+        cs = sorted(anchors[i].position[axis] for i in f.anchors)
+        if axis == 1:
+            # A plan: the far plane sits just under the storey's lowest camera,
+            # which puts it below the floor they stand on and above the storey
+            # underneath, so one storey's map never shows the one below.
+            f.cut_far = (cs[0] if cs else f.coord) - below
+        else:
+            # An elevation: everything BEHIND is wanted. The scene's own ground,
+            # walls and backdrop sit behind the captures, and cutting them away
+            # would leave the storey floating in nothing.
+            f.cut_far = scene_lo[axis]
     return floors
 
 
@@ -891,6 +1365,7 @@ async def _plan_zone(
     zone_objects: list[Node],
     regions: list[Node],
     placed_anchors: list[PlacedAnchor],
+    profile: CaptureProfile = DEFAULT_PROFILE,
 ) -> tuple[ZoneAnchorPlan, str]:
     """Plan anchors + connectors for a single zone. `placed_anchors` are the
     anchors already chosen for earlier zones, passed in so the planner doesn't
@@ -899,7 +1374,9 @@ async def _plan_zone(
     llm.set_model(ANCHOR_PLANNER_MODEL)
     plan, reasoning, _usage, _raw, _gen_ids = await llm.call_llm_once(
         system=SYSTEM_ANCHOR_PLANNER,
-        user=build_zone_prompt(nodes, zone, zone_objects, regions, placed_anchors),
+        user=build_zone_prompt(
+            nodes, zone, zone_objects, regions, placed_anchors, profile
+        ),
         output_schema=ZoneAnchorPlan,
         model=ANCHOR_PLANNER_MODEL,
         step="anchor_plan",
@@ -948,7 +1425,14 @@ def _inhabiting_zone(
 
 async def generate_anchors(
     nodes: list[Node],
-) -> tuple[list[PlacedAnchor], list[PlacedConnector], str, dict[int, str], list[Floor]]:
+) -> tuple[
+    list[PlacedAnchor],
+    list[PlacedConnector],
+    str,
+    dict[int, str],
+    list[Floor],
+    CaptureProfile,
+]:
     """Plan capture anchors + connectors one zone at a time (a fixed-planner call
     per zone, run sequentially), then name the aggregated anchors with the fixed
     namer model. Each zone call sees only its own objects, every zone's identity,
@@ -963,7 +1447,12 @@ async def generate_anchors(
     the height-clustered storeys, each carrying the describer's name + volume."""
     root = util.find_root(nodes)
     if root is None:
-        return [], [], "", {}, []
+        return [], [], "", {}, [], DEFAULT_PROFILE
+    # FIRST, before a single anchor is placed: what kind of place is this? The
+    # planner below needs the inhabitant's height to space its captures and to stand
+    # them at a viewing height, and the floor pass needs to know which way the map
+    # looks. Both are decided here, once.
+    profile = await choose_profile(nodes)
     regions = [n for n in nodes if util.is_region(n)]
     # The root is always a zone (its objects are the scene's shared shell / ground
     # geometry); guarantee it's planned even if it wasn't flagged as a region.
@@ -982,7 +1471,7 @@ async def generate_anchors(
         concrete = [n for n in nodes if not util.is_region(n)]
         targets = [(root, concrete)] if concrete else []
     if not targets:
-        return [], [], "", {}, []
+        return [], [], "", {}, [], profile
     # Plan deepest zones first: the innermost spaces claim their anchors, then the
     # shallower / shared zones fill the gaps around what's already placed.
     targets.sort(key=lambda t: depth_of[t[0].id], reverse=True)
@@ -993,7 +1482,9 @@ async def generate_anchors(
     connectors: list[PlacedConnector] = []
     reasoning_parts: list[str] = []
     for zone, objs in targets:
-        plan, reasoning = await _plan_zone(nodes, zone, objs, regions, anchors)
+        plan, reasoning = await _plan_zone(
+            nodes, zone, objs, regions, anchors, profile
+        )
         # Anchors: assign each to the zone it mathematically INHABITS (the deepest
         # region whose bbox contains it), not merely the zone that emitted it;
         # fall back to the emitting zone if the point lands outside every bbox.
@@ -1011,5 +1502,12 @@ async def generate_anchors(
     names = await name_anchors(nodes, anchors)
     # Floors last: the split needs every anchor placed, and the floor planner reads
     # the point names to judge what each storey is FOR.
-    floors = await plan_floors(nodes, anchors, names)
-    return anchors, connectors, "\n\n".join(reasoning_parts), names, floors
+    floors = await plan_floors(nodes, anchors, names, profile)
+    return (
+        anchors,
+        connectors,
+        "\n\n".join(reasoning_parts),
+        names,
+        floors,
+        profile,
+    )

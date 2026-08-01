@@ -1,5 +1,5 @@
 import OrbitWorkspace from "@/components/OrbitWorkspace";
-import ViewerHeader from "@/components/ViewerHeader";
+import ViewerHeader from "../ViewerHeader";
 
 export default function OrbitPage() {
 	return (

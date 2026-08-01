@@ -3543,12 +3543,15 @@ def _plan_from_tour(run: str, slot: str, model: str) -> dict[str, Any] | None:
         # anchor MEMBERSHIP can't be recovered this way (a slice doesn't record
         # which captures stood on it), so a rebuilt plan carries none and the
         # capture falls back to clustering for its grouping.
+        "profile": tour.get("profile"),
         "floors": [
             {
                 "level": m.get("level"),
-                "y": m.get("y"),
+                "coord": m.get("coord", m.get("y")),
+                "y": m.get("coord", m.get("y")),
                 "name": m.get("name"),
                 "cut": m.get("cut"),
+                "cut_far": m.get("cut_far"),
                 "volume": m.get("volume"),
             }
             for m in (tour.get("minimaps") or [])
@@ -3588,6 +3591,7 @@ def _plan_payload(
     names: dict[int, str],
     floors: list[anchors_svc.Floor],
     map_labels: list[anchors_svc.MapLabel],
+    profile: anchors_svc.CaptureProfile,
 ) -> dict[str, Any]:
     """The canonical plan shape, shared by the standalone planner and the capture.
     Anchor ids are the CAPTURE ids (`anchor-NNN`) so a saved plan drops straight
@@ -3604,6 +3608,10 @@ def _plan_payload(
         "connectors": [c.model_dump() for c in connectors],
         "floors": [_floor_dict(f) for f in floors],
         "map_labels": [m.model_dump() for m in map_labels],
+        # What kind of place this is: which way its map looks, how big its
+        # inhabitant is, what its storeys are called. Decided once, before any
+        # anchor was placed, and read by the capture AND the viewer.
+        "profile": profile.model_dump(),
     }
 
 
@@ -3670,6 +3678,18 @@ def _apply_objects(run: str, slot: str, model: str, objects: list[str]) -> bool:
     return True
 
 
+def _profile_of(raw: Any) -> anchors_svc.CaptureProfile:
+    """A saved plan's profile, or the plan-view default. Plans written before the
+    profile existed carry none, and a torn one is no better than none — both land
+    on the same defaults every scene had before any of this."""
+    if isinstance(raw, dict) and raw:
+        try:
+            return anchors_svc.CaptureProfile.model_validate(raw)
+        except Exception:  # noqa: BLE001 - a bad profile is simply not a profile
+            pass
+    return anchors_svc.DEFAULT_PROFILE
+
+
 def _floor_dict(f: anchors_svc.Floor) -> dict[str, Any]:
     """One floor as it travels: identity, the planner's name, the height its map is
     cut at, WHICH captures stand on it, and its volume as an {origin, dimensions}
@@ -3681,9 +3701,14 @@ def _floor_dict(f: anchors_svc.Floor) -> dict[str, Any]:
     membership, and the capture falls back to clustering for those."""
     out: dict[str, Any] = {
         "level": f.level,
-        "y": f.y,
+        # Where the storey sits along the map's SLICE AXIS. Still written as `y` as
+        # well, so a viewer or a plan from before the map could look any way but
+        # down keeps reading it.
+        "coord": f.coord,
+        "y": f.coord,
         "name": f.name,
         "cut": f.cut,
+        "cut_far": f.cut_far,
         "anchors": list(f.anchors),
     }
     if f.origin is not None and f.dimensions is not None:
@@ -3716,7 +3741,7 @@ def _apply_floor_specs(
     for m in minimaps:
         if not isinstance(m, dict) or m.get("y") is None:
             continue
-        nearest = min(floors, key=lambda f: abs(f.y - float(m["y"])))
+        nearest = min(floors, key=lambda f: abs(f.coord - float(m["y"])))
         spec = _floor_dict(nearest)
         m["name"] = spec["name"]
         if "volume" in spec:
@@ -3790,13 +3815,15 @@ async def _run_tour_capture(
             nodes = await asyncio.to_thread(_scene_nodes_full, slot_log)
             if not nodes:
                 raise RuntimeError("scene has no placed nodes to plan anchors from")
-            anchors, connectors, reasoning, names, floors = (
+            anchors, connectors, reasoning, names, floors, profile = (
                 await anchors_svc.generate_anchors(nodes)
             )
             if not anchors:
                 raise RuntimeError("anchor planner returned no anchors")
             labels = await anchors_svc.label_map_zones(nodes)
-            plan = _plan_payload(anchors, connectors, reasoning, names, floors, labels)
+            plan = _plan_payload(
+                anchors, connectors, reasoning, names, floors, labels, profile
+            )
         anchor_dicts = plan["anchors"]
         job["total"] = len(anchor_dicts)
 
@@ -3817,6 +3844,7 @@ async def _run_tour_capture(
             "anchors": anchor_dicts,
             "connectors": plan.get("connectors") or [],
             "floors": plan.get("floors") or [],
+            "profile": plan.get("profile") or {},
             "objects": _inspectable_object_ids(_require_slot_log(run, slot, model)),
             "map_labels": plan.get("map_labels") or [],
             "planner_model": plan.get("planner_model"),
@@ -3883,13 +3911,15 @@ async def _run_anchor_plan(run: str, slot: str, model: str, nodes: list[Node]) -
     job = _anchor_jobs[key]
     try:
         job["status"] = "planning"
-        anchors, connectors, reasoning, names, floors = (
+        anchors, connectors, reasoning, names, floors, profile = (
             await anchors_svc.generate_anchors(nodes)
         )
         if not anchors:
             raise RuntimeError("anchor planner returned no anchors")
         labels = await anchors_svc.label_map_zones(nodes)
-        plan = _plan_payload(anchors, connectors, reasoning, names, floors, labels)
+        plan = _plan_payload(
+            anchors, connectors, reasoning, names, floors, labels, profile
+        )
         # Persist the moment planning succeeds: it's the expensive half, and from
         # here on it's a durable artifact a capture can render from later — even if
         # this process dies before anything is rendered.
@@ -3897,6 +3927,7 @@ async def _run_anchor_plan(run: str, slot: str, model: str, nodes: list[Node]) -
         job["anchors"] = plan["anchors"]
         job["connectors"] = plan["connectors"]
         job["floors"] = plan["floors"]
+        job["profile"] = plan["profile"]
         job["reasoning"] = plan["reasoning"]
         job["total"] = len(plan["anchors"])
         job["status"] = "done"
@@ -5117,6 +5148,7 @@ def create_app() -> FastAPI:
             "anchors": plan.get("anchors") or [],
             "connectors": plan.get("connectors") or [],
             "floors": plan.get("floors") or [],
+            "profile": plan.get("profile") or {},
             "reasoning": plan.get("reasoning") or "",
             "total": len(plan.get("anchors") or []),
             "planner_model": plan.get("planner_model") or anchors_svc.ANCHOR_PLANNER_MODEL,
@@ -5148,7 +5180,8 @@ def create_app() -> FastAPI:
         job: dict[str, Any] = {
             "run": run, "slot": slot_id, "model": model_alias,
             "running": True, "status": "pending", "error": None,
-            "anchors": [], "connectors": [], "floors": [], "reasoning": "", "total": 0,
+            "anchors": [], "connectors": [], "floors": [], "profile": {},
+            "reasoning": "", "total": 0,
             "planner_model": anchors_svc.ANCHOR_PLANNER_MODEL,
             "namer_model": anchors_svc.ANCHOR_NAMER_MODEL,
             "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -5194,7 +5227,12 @@ def create_app() -> FastAPI:
             for a in planned
         ]
         names = {i: a["name"] for i, a in enumerate(planned) if a.get("name")}
-        floors = await anchors_svc.plan_floors(nodes, anchors, names)
+        # Re-profile too. The map's axis, the inhabitant's height and the storey
+        # vocabulary are what the floor pass is decided against, so backfilling
+        # floors from a stale profile would just re-derive the old answer.
+        profile = await anchors_svc.choose_profile(nodes)
+        plan["profile"] = profile.model_dump()
+        floors = await anchors_svc.plan_floors(nodes, anchors, names, profile)
         plan["floors"] = [_floor_dict(f) for f in floors]
         await asyncio.to_thread(_save_anchor_plan, run, slot_id, model_alias, plan)
         patched = await asyncio.to_thread(
@@ -5208,6 +5246,7 @@ def create_app() -> FastAPI:
         await asyncio.to_thread(_apply_map_labels, run, slot_id, model_alias, labels)
         return {
             "floors": plan["floors"],
+            "profile": plan["profile"],
             "objects": len(objects),
             "map_labels": labels,
             "tour_updated": patched,
@@ -5357,6 +5396,10 @@ def create_app() -> FastAPI:
             # Zone names to print on the bird's-eye map, already pruned so no label
             # sits inside another (see anchors.py label_map_zones).
             "map_labels": state["map_labels"],
+            # Which way this scene's map looks, how big its inhabitant is, and what
+            # its storeys are called. The capture reads the first of those to point
+            # its overhead camera; the rest ride through to the viewer.
+            "profile": state["profile"],
             "planner_model": state["planner_model"],
             "namer_model": state["namer_model"],
             "planner_reasoning": state["planner_reasoning"],
@@ -5366,11 +5409,16 @@ def create_app() -> FastAPI:
             # clustering above used (anchors_svc.FLOOR_LEVEL_EPS), not a copy of its
             # value — the capture groups anchors into slices independently, so if the
             # two numbers ever differed a floor's name would land on the wrong slice.
+            # `level_eps` and `slice_below` are lengths, so they follow the
+            # profile's inhabitant height rather than a fixed number of metres. Both
+            # are only reached on the fallback path now — a plan with floors ships
+            # its own membership and its own two cut planes — but a plan rebuilt
+            # from an old tour.json still needs them.
             "minimap": {
                 "res": 1024,
-                "level_eps": anchors_svc.FLOOR_LEVEL_EPS,
+                "level_eps": anchors_svc.level_eps(_profile_of(state["profile"])),
                 "pad_frac": 0.04,
-                "slice_below": 2.0,
+                "slice_below": anchors_svc.slice_below(_profile_of(state["profile"])),
             },
         }
 
@@ -7879,6 +7927,37 @@ def _scene_nodes_full(slot_log: SlotLog, *, image_log: SlotLog | None = None) ->
     obj_specs: dict[str, Any] = {}
     obj_region: dict[str, str] = {}
     image_subj: dict[str, str] = {}
+
+    def _own_emitted(o: Any, zone: Any) -> None:
+        """Record one object emitted by a generation step: which zone owns it, and
+        its spec when the log carries one.
+
+        TWO LOG FORMATS, and only one of them was read. Current logs store the full
+        spec per object; LEGACY logs store a bare id string and no spec at all.
+        Skipping the legacy form left every object in those cells with no owning
+        zone — and `generate_anchors` reads exactly that to decide which zones to
+        plan, so a scene with no owners fell through to its "plan the whole thing
+        in one call" fallback. The result looked fine (anchors are stamped with a
+        zone afterwards, geometrically) while being a fraction of the intended
+        planning effort: one pass over a whole level instead of one per zone.
+
+        Ownership is recorded even when the spec fails to validate. The spec is a
+        bonus — placement prose, parent kind, referenced ids — but the id alone is
+        all that ownership needs, and losing a zone over an unparseable spec is the
+        expensive half of the failure."""
+        if isinstance(o, str):
+            if o and isinstance(zone, str):
+                obj_region[o] = zone
+            return
+        if not isinstance(o, dict) or not isinstance(o.get("id"), str):
+            return
+        nid = o["id"]
+        try:
+            obj_specs[nid] = schemas.ObjectSpec.model_validate(o)
+        except Exception:  # noqa: BLE001 - a bad spec still has a usable id
+            pass
+        if isinstance(zone, str):
+            obj_region[nid] = zone
     for e in events:
         kind = e.get("kind")
         if kind == "divider.zone_plan":
@@ -7895,22 +7974,13 @@ def _scene_nodes_full(slot_log: SlotLog, *, image_log: SlotLog | None = None) ->
         elif kind == "generation.decompose":
             zone = e.get("zone")
             for o in e.get("objects") or []:
-                if isinstance(o, dict) and isinstance(o.get("id"), str):
-                    try:
-                        obj_specs[o["id"]] = schemas.ObjectSpec.model_validate(o)
-                        if isinstance(zone, str):
-                            obj_region[o["id"]] = zone
-                    except Exception:
-                        pass
+                _own_emitted(o, zone)
         elif kind == "generation.next":
-            zone, o = e.get("zone"), e.get("object")
-            if isinstance(o, dict) and isinstance(o.get("id"), str):
-                try:
-                    obj_specs[o["id"]] = schemas.ObjectSpec.model_validate(o)
-                    if isinstance(zone, str):
-                        obj_region[o["id"]] = zone
-                except Exception:
-                    pass
+            # Two log formats name the object differently. The current one carries
+            # the whole spec under `object`; the legacy one has no `object` at all
+            # and names it with a top-level `id`. Where both exist they agree, so
+            # preferring `object` keeps the spec and loses nothing.
+            _own_emitted(e.get("object") or e.get("id"), e.get("zone"))
         elif kind == "image":
             nid, p = e.get("id"), e.get("prompt")
             if isinstance(nid, str) and isinstance(p, str):

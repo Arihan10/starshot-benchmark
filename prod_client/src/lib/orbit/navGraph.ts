@@ -45,9 +45,26 @@ export type NavNode = {
 	trapped: boolean; // no walk/portal/vertical exit → the ghost puck must always show
 };
 
+// The scene-scale distances this graph is built against, in metres. Measured per
+// scene rather than fixed (see scale.ts): a 200 m side-scrolling level and a
+// bathroom cannot share a reach. Carried ON the graph because routing needs the hop
+// penalty too, and `routeCosts` / `shortestPath` are called from elsewhere with
+// nothing but the graph in hand.
+//
+// Deliberately a narrow shape rather than an import of scale.ts's `NavMetrics`:
+// this module needs four numbers, and saying so keeps it independent of how they
+// were arrived at.
+export type NavTuning = {
+	reach: number; // furthest an in-view walk/portal reaches
+	farDist: number; // beyond this a link is "far" (map/search, not in-view)
+	verticalDy: number; // min |Δy| to read as a floor change
+	hopPenalty: number; // per-hop routing charge, in metres-equivalent
+};
+
 export type NavGraph = {
 	nodes: NavNode[];
 	zones: string[]; // unique zone labels, in first-seen order
+	tuning: NavTuning;
 };
 
 export type NavPano = {
@@ -55,10 +72,7 @@ export type NavPano = {
 	zone?: string;
 };
 
-// Tunables. Distances are in world meters; the scene is authored at real scale.
-const REACH = 30; // furthest an in-view walk/portal reaches (matches HOTSPOT_REACH)
-const FAR_DIST = 20; // beyond this a link is "far" (lives in map/search, not in-view)
-const VERTICAL_DY = 2.0; // min |Δy| to read as a floor change
+// Counts and angles — scale-free, so these stay fixed.
 const LOS_CANDIDATES = 14; // nearest same-level neighbors per node that get an LOS raycast
 const DEGREE_CAP = 8; // max rendered affordances per node
 const NEAREST_GUARANTEED = 3; // the closest few ALWAYS render, whatever their bearing
@@ -107,7 +121,9 @@ export function buildNavGraph(
 		a: [number, number, number],
 		b: [number, number, number],
 	) => boolean,
+	tuning: NavTuning,
 ): NavGraph {
+	const { reach: REACH, farDist: FAR_DIST, verticalDy: VERTICAL_DY } = tuning;
 	const n = panos.length;
 	const pos = panos.map((p) => new Vector3().fromArray(p.position));
 	const zones: string[] = [];
@@ -329,7 +345,7 @@ export function buildNavGraph(
 		nodes.push({ index: i, rendered, all: edges, trapped });
 	}
 
-	return { nodes, zones };
+	return { nodes, zones, tuning };
 }
 
 // Signed smallest angle between two azimuths, in (-π, π].
@@ -377,13 +393,17 @@ const ROUTE_COST: Partial<Record<EdgeType, number>> = {
 	vertical: 1.4,
 	phase: 8,
 };
-const HOP_PENALTY = 1.5; // per hop, in meters-equivalent
+// The per-hop charge is in metres-equivalent, so it scales with the scene: it has
+// to be worth something against a typical edge length or it stops discouraging
+// zigzags (on a 200 m level) and starts forbidding them (in a bathroom). It lives
+// on the graph — see NavTuning.
 
 // Dense Dijkstra — n is in the tens, so an array scan beats carrying a heap.
 function dijkstra(
 	graph: NavGraph,
 	from: number,
 ): { dist: number[]; prev: number[] } {
+	const hopPenalty = graph.tuning.hopPenalty;
 	const n = graph.nodes.length;
 	const dist = new Array<number>(n).fill(Infinity);
 	const prev = new Array<number>(n).fill(-1);
@@ -404,7 +424,7 @@ function dijkstra(
 		for (const e of graph.nodes[u].all) {
 			const scale = ROUTE_COST[e.type];
 			if (scale === undefined) continue;
-			const d = dist[u] + e.dist * scale + HOP_PENALTY;
+			const d = dist[u] + e.dist * scale + hopPenalty;
 			if (d < dist[e.to]) {
 				dist[e.to] = d;
 				prev[e.to] = u;

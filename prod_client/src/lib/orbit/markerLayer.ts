@@ -1,7 +1,5 @@
 import {
-	type BufferAttribute,
 	Group,
-	LineBasicMaterial,
 	type Material,
 	Mesh,
 	type MeshBasicMaterial,
@@ -15,16 +13,12 @@ import {
 	Vector3,
 } from "three";
 import {
-	CAPTURE_EYE_HEIGHT,
-	FLOOR_ARROW_BOB,
 	FLOOR_ARROW_GLOW,
 	FLOOR_ARROW_GLOW_TAU,
 	FLOOR_ARROW_HOVER_LIFT,
 	FLOOR_ARROW_PULSE_RATE,
 	FLOOR_ARROW_RATE,
-	HOTSPOT_FLOOR_DROP,
 	makeFloorArrow,
-	makeGhostTether,
 	makeNavMarker,
 	makeSonarDot,
 	makeYouMarker,
@@ -32,7 +26,6 @@ import {
 	NAV_COLORS,
 	NAV_GAZE_RAD,
 	NAV_REST_OPACITY,
-	NAV_RING_OUTER,
 	NAV_TARGET_PX,
 	pickByScreen,
 	screenScaleForDistance,
@@ -41,27 +34,17 @@ import {
 } from "./markers";
 import { angleDelta, type EdgeType, type NavNode } from "./navGraph";
 import type { PanoEntry } from "./panoTextures";
+import { DEFAULT_METRICS, type NavMetrics } from "./scale";
 
 // The auto-home ghost rests fainter than a live affordance, so it reads as a
 // preview of where a click would land rather than another button to press.
 const GHOST_OPACITY = 0.4;
 
-// --- the ghost tether ---------------------------------------------------------
-//
-// The ghost stands on the anchor a click actually lands on, which is the only
-// placement that can't lie about the destination — but the anchor is behind
-// geometry and usually off to one side, so on its own it is a second mark on
-// screen with nothing connecting it to the pointer that summoned it. The tether
-// is that connection: cursor at one end, destination at the other, so the pair
-// reads as one sentence — click HERE, arrive THERE.
-//
-// It doubles as the off-screen cue. When the anchor falls outside the frustum the
-// line still leaves the frame pointing at it, which is why no edge indicator is
-// needed (see makeGhostTether for why it survives being partly off-camera).
-//
-// Below TETHER_MIN_DIST the ghost is already sitting on the cursor and the line
-// would be a nub inside the ring, so it's dropped.
-const TETHER_MIN_DIST = 0.4;
+// A LEADER LINE from the cursor to the ghost used to be drawn here, because the
+// ghost stood on the destination anchor — somewhere off to one side, behind
+// geometry — and needed something tying it back to the pointer that summoned it.
+// The line went when the ghost did: the waypoint no longer sits on the anchor, so
+// there is nothing to lead the eye to. See `showGhost`.
 
 // --- suppressed STANDING affordances -----------------------------------------
 //
@@ -79,9 +62,8 @@ const TETHER_MIN_DIST = 0.4;
 //     the floor filled with near-identical blue rings.
 //   portal (orange) — a STANDING marker for every destination behind a wall fills
 //     the room with rings for places you cannot see and are not asking about. The
-//     engine draws ONE on demand instead, on the destination the cursor currently
-//     resolves to, tethered back to the cursor so it still answers "what happens if
-//     I click HERE" without having to lie about where that is.
+//     engine draws ONE on demand instead, where the cursor is pointing, so it
+//     answers "what happens if I click HERE".
 // That leaves phase (violet), and only on a sealed node with no other way out.
 //
 // NOTHING BECOMES UNREACHABLE. Suppressed destinations keep every other route in:
@@ -115,22 +97,24 @@ export class MarkerLayer {
 	readonly arrowGroup = new Group(); // interior: the in-view floor-change arrows
 	readonly you: YouMarker = makeYouMarker();
 
+	// The scene's measured distances. Held per LAYER rather than in module state
+	// because the A/B workspace runs two engines side by side over two different
+	// scenes — one global would let the second scene's load silently resize the
+	// first's markers. Set in build(); the default is the fallback scale.
+	private metrics: NavMetrics = DEFAULT_METRICS;
+
 	private hovered: Object3D | null = null;
 	private hoveredArrowMarker: Object3D | null = null;
 	private readonly arrowRay = new Raycaster();
 	private lastArrowTick = 0;
 	private ghostType: EdgeType | null = null; // rebuild key: the ghost's current edge type
-	// The ghost's ring/chevron, held rather than read back off ghostGroup.children:
-	// the tether shares that group and is never rebuilt, so an index would be
-	// whichever of the two happened to be added first.
+	// The ghost's ring/chevron, held rather than read back off ghostGroup.children.
 	private ghostMarker: Object3D | null = null;
-	private readonly ghostTether = makeGhostTether();
 	private pulseUntil = 0; // dwell/never-trapped: briefly boost every affordance
 	private sonarStart = 0;
 	private sonarReach = 1;
 
 	constructor(private readonly scene: Scene) {
-		this.ghostGroup.add(this.ghostTether);
 		scene.add(
 			this.navGroup,
 			this.sonarGroup,
@@ -140,8 +124,10 @@ export class MarkerLayer {
 		);
 	}
 
-	// Per-scene build: size the you-marker to the scene extent.
-	build(sceneMaxDim: number) {
+	// Per-scene build: adopt the scene's measured scale and size the you-marker to
+	// the scene extent.
+	build(sceneMaxDim: number, metrics: NavMetrics) {
+		this.metrics = metrics;
 		this.sizeYouMarker(sceneMaxDim);
 	}
 
@@ -157,8 +143,8 @@ export class MarkerLayer {
 		for (const edge of node.rendered) {
 			if (HIDDEN_AFFORDANCES.has(edge.type)) continue;
 			const floor = v3(panos[edge.to].position);
-			floor.y -= HOTSPOT_FLOOR_DROP;
-			const marker = makeNavMarker(edge, floor);
+			floor.y -= this.metrics.floorDrop;
+			const marker = makeNavMarker(edge, floor, this.metrics);
 			marker.userData.bearing = edge.bearing;
 			marker.userData.pulse = edge.type === "phase"; // trapped ghost never stops pulsing
 			this.navGroup.add(marker);
@@ -172,55 +158,38 @@ export class MarkerLayer {
 	}
 
 	// The auto-home waypoint: a translucent affordance marking what a click would
-	// do, standing ON the destination anchor — `floorPos` is that capture's floor
-	// point, so the marker and the place you land are the same spot and cannot drift
-	// apart. `from` is the surface point under the cursor; the tether runs between
-	// the two, which is what keeps a marker you may not be pointing at legible as an
-	// answer to where you ARE pointing. Pass null for no tether.
+	// do. `floorPos` is where to DRAW it, which the caller decides.
 	//
 	// Rebuilt only when the edge type changes (cheap); re-placed and screen-scaled
-	// every frame, so the ring holds its on-screen size as the destination's distance
+	// every frame, so the ring holds its on-screen size as the distance to it
 	// changes under a moving cursor.
 	showGhost(
 		floorPos: Vector3,
 		edge: { to: number; type: EdgeType; dy: number },
 		camera: PerspectiveCamera,
 		viewportHeight: number,
-		from: Vector3 | null = null,
 	) {
 		if (this.ghostType !== edge.type) {
 			this.clearGhostMarker();
-			const marker = makeNavMarker(edge, floorPos, true);
+			const marker = makeNavMarker(edge, floorPos, this.metrics, true);
 			setGroupOpacity(marker, GHOST_OPACITY);
 			this.ghostGroup.add(marker);
 			this.ghostMarker = marker;
-			(this.ghostTether.material as LineBasicMaterial).color.setHex(
-				NAV_COLORS[edge.type],
-			);
 			this.ghostType = edge.type;
 		}
 		const marker = this.ghostMarker;
 		if (!marker) return;
 		marker.position.copy(floorPos);
-		marker.position.y += 0.02; // lift a hair so a ghost never z-fights a coincident marker
+		// Lift a hair so a ghost never z-fights a coincident marker. Scale-derived:
+		// "a hair" is a fraction of the marker it is standing on, not 2 cm.
+		marker.position.y += this.metrics.ghostLift;
 		const d = camera.position.distanceTo(marker.position);
 		marker.scale.setScalar(
 			Math.max(
 				1,
-				screenScaleForDistance(d, NAV_TARGET_PX, camera.fov, viewportHeight, NAV_RING_OUTER),
+				screenScaleForDistance(d, NAV_TARGET_PX, camera.fov, viewportHeight, this.metrics.ringOuter),
 			),
 		);
-		const tethered =
-			!!from && from.distanceTo(marker.position) > TETHER_MIN_DIST;
-		if (tethered && from) {
-			const pts = this.ghostTether.geometry.getAttribute(
-				"position",
-			) as BufferAttribute;
-			pts.setXYZ(0, from.x, from.y, from.z);
-			pts.setXYZ(1, marker.position.x, marker.position.y, marker.position.z);
-			pts.needsUpdate = true;
-		}
-		this.ghostTether.visible = tethered;
 		this.ghostGroup.visible = true;
 	}
 
@@ -228,8 +197,6 @@ export class MarkerLayer {
 		if (this.ghostGroup.visible) this.ghostGroup.visible = false;
 	}
 
-	// Drop the ghost's marker while KEEPING the tether, which lives in the same group
-	// but is built once and reused.
 	private clearGhostMarker() {
 		if (!this.ghostMarker) return;
 		disposeGroup(this.ghostMarker);
@@ -265,7 +232,7 @@ export class MarkerLayer {
 			marker.scale.setScalar(
 				Math.max(
 					1,
-					screenScaleForDistance(d, NAV_TARGET_PX, camera.fov, viewportHeight, NAV_RING_OUTER),
+					screenScaleForDistance(d, NAV_TARGET_PX, camera.fov, viewportHeight, this.metrics.ringOuter),
 				),
 			);
 		}
@@ -303,7 +270,7 @@ export class MarkerLayer {
 	buildFloorArrows(items: Array<{ index: number; up: boolean; pos: Vector3 }>) {
 		this.clearFloorArrows();
 		for (const it of items) {
-			const marker = makeFloorArrow(it.up);
+			const marker = makeFloorArrow(it.up, this.metrics);
 			marker.position.copy(it.pos);
 			marker.userData.to = it.index;
 			marker.userData.up = it.up;
@@ -335,7 +302,7 @@ export class MarkerLayer {
 			const baseY = marker.userData.baseY as number;
 			const phase = marker.userData.phase as number;
 			marker.position.y =
-				baseY + Math.sin(now * FLOOR_ARROW_RATE + phase) * FLOOR_ARROW_BOB;
+				baseY + Math.sin(now * FLOOR_ARROW_RATE + phase) * this.metrics.arrowBob;
 			// Hover level EASES toward its target rather than jumping, so the glow
 			// arrives and leaves instead of switching. Exponential approach, driven by
 			// real elapsed time, so it looks the same at any frame rate.
@@ -496,7 +463,7 @@ export class MarkerLayer {
 	// --- peek "you are here" -------------------------------------------------
 
 	positionYouMarker(p: Vector3) {
-		const floorY = p.y - CAPTURE_EYE_HEIGHT;
+		const floorY = p.y - this.metrics.eyeHeight;
 		this.you.sphere.position.copy(p);
 		this.you.ring.position.set(p.x, floorY, p.z);
 		this.you.line.geometry.setFromPoints([new Vector3(p.x, floorY, p.z), p.clone()]);
@@ -509,7 +476,6 @@ export class MarkerLayer {
 		this.sonarGroup.visible = false;
 		this.clearGhostMarker();
 		this.ghostGroup.visible = false;
-		this.ghostTether.visible = false;
 		this.ghostType = null;
 		this.clearFloorArrows();
 		this.arrowGroup.visible = false;
@@ -519,9 +485,6 @@ export class MarkerLayer {
 
 	dispose() {
 		this.clear();
-		// clear() keeps the tether alive for the next scene; teardown owns it.
-		disposeGroup(this.ghostTether);
-		this.ghostGroup.remove(this.ghostTether);
 		this.scene.remove(
 			this.navGroup,
 			this.sonarGroup,
@@ -541,12 +504,18 @@ export class MarkerLayer {
 }
 
 // Set a uniform opacity across every material in an affordance group.
+// Set a uniform opacity across an affordance group, PRESERVING the depth split: the
+// copy drawn where the scene is in front of the marker carries `occludedFactor` and
+// keeps its share of whatever brightness it is given, so gaze fade and the dwell
+// pulse scale both passes together rather than flattening them into one.
 function setGroupOpacity(marker: Object3D, opacity: number) {
 	marker.traverse((o) => {
 		const m = (o as Mesh).material as Material | Material[] | undefined;
 		if (!m) return;
-		for (const mat of Array.isArray(m) ? m : [m])
-			(mat as MeshBasicMaterial).opacity = opacity;
+		for (const mat of Array.isArray(m) ? m : [m]) {
+			const factor = (mat.userData?.occludedFactor as number) ?? 1;
+			(mat as MeshBasicMaterial).opacity = opacity * factor;
+		}
 	});
 }
 
